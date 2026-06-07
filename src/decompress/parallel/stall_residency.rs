@@ -29,11 +29,19 @@ pub static STALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Stalls at offset 0 (startup / first chunk — unavoidable, excluded from the
 /// majority verdict).
 pub static STALLS_STARTUP: AtomicU64 = AtomicU64::new(0);
-/// A DECODED chunk resident in the prefetch_cache or main cache has a range
-/// `[encoded_offset_bits, max_acceptable_start_bit]` that STRICTLY CONTAINS the
-/// stalled `decode_start` (decode_start > encoded_offset_bits) → interior reuse
-/// could emit `[confirmed, end]` from it. The best case for the placement port.
+/// A DECODED chunk resident in the prefetch_cache or main cache spans the
+/// stalled `decode_start` in its ENCODED range `[encoded_offset_bits,
+/// encoded_offset_bits + encoded_size_bits)` AND starts strictly before it
+/// (decode_start > encoded_offset_bits) → interior reuse could emit
+/// `[confirmed, end]` from it. (Advisor fix: this uses the encoded END, NOT
+/// max_acceptable_start_bit which is the speculative start-tolerance window that
+/// collapses to enc==max after re-anchor and could never match a real parent.)
 pub static CONTAINING_CACHED: AtomicU64 = AtomicU64::new(0);
+/// A resident chunk merely STARTS at/below decode_start (the NECESSARY condition
+/// for a containing parent — the bug-free discriminating channel the advisor
+/// endorsed). If this is 0 across non-startup stalls, no resident chunk could
+/// possibly contain the stalled offset (parent never retained / consumed-ahead).
+pub static HAS_NEAREST_LE_START: AtomicU64 = AtomicU64::new(0);
 /// No decoded resident chunk contains it, but an IN-FLIGHT prefetch key ≤
 /// decode_start exists whose partition spans it (the eventual range MAY contain
 /// it; the Arc is not yet decoded so the range is unknowable — keyed estimate).
@@ -52,7 +60,7 @@ pub static NOT_RESIDENT: AtomicU64 = AtomicU64::new(0);
 /// whether an in-flight prefetch's partition could span `decode_start`).
 pub fn classify_stall(
     decode_start: usize,
-    cached: &[(usize, usize)],
+    cached: &[(usize, usize, usize)], // (encoded_start, max_start_tolerance, encoded_end)
     in_flight_keys: &[usize],
     partition_span: usize,
 ) {
@@ -64,14 +72,18 @@ pub fn classify_stall(
         STALLS_STARTUP.fetch_add(1, Ordering::Relaxed);
     }
 
-    // (1) A decoded resident chunk whose range strictly contains decode_start.
-    let resident_contains = cached.iter().any(|&(enc, max)| {
-        // matches_encoded_offset semantics: enc <= decode_start <= max,
-        // AND strictly interior (decode_start > enc) — an exact-start match
-        // would already have been accepted upstream, so the stall implies
-        // either interior or absent.
-        enc <= decode_start && decode_start <= max && decode_start > enc
-    });
+    // NECESSARY-condition channel (advisor-endorsed, bug-free): does ANY resident
+    // chunk start strictly before decode_start? A containing parent must.
+    if cached.iter().any(|&(enc, _max, _end)| enc < decode_start) {
+        HAS_NEAREST_LE_START.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // (1) A decoded resident chunk whose ENCODED range spans decode_start as an
+    // interior offset (enc < decode_start < encoded_end). Uses the encoded END,
+    // not the speculative start-tolerance `max` (advisor fix).
+    let resident_contains = cached
+        .iter()
+        .any(|&(enc, _max, end)| enc < decode_start && decode_start < end);
     if resident_contains {
         CONTAINING_CACHED.fetch_add(1, Ordering::Relaxed);
         emit_trace(decode_start, "CONTAINING_CACHED", cached, in_flight_keys);
@@ -95,25 +107,30 @@ pub fn classify_stall(
     emit_trace(decode_start, "NOT_RESIDENT", cached, in_flight_keys);
 }
 
-fn emit_trace(decode_start: usize, class: &str, cached: &[(usize, usize)], in_flight: &[usize]) {
+fn emit_trace(
+    decode_start: usize,
+    class: &str,
+    cached: &[(usize, usize, usize)],
+    in_flight: &[usize],
+) {
     if crate::decompress::parallel::trace::is_enabled() {
-        // Dump the resident ranges + in-flight keys so a NOT_RESIDENT verdict is
-        // auditable: did a containing chunk genuinely not exist, or did the
-        // containment test miss it? Also report the NEAREST resident chunk whose
-        // start ≤ decode_start (the candidate parent had the consumer kept pace).
+        // Dump the resident ranges (enc..end) + in-flight keys so a NOT_RESIDENT
+        // verdict is auditable. nearest_le_start = nearest resident chunk that
+        // STARTS ≤ decode_start (the candidate containing parent); -1 ⇒ no
+        // resident chunk even starts at/below the stalled offset (never retained).
         let ranges: String = cached
             .iter()
-            .map(|&(e, m)| format!("[{e},{m}]"))
+            .map(|&(e, _m, end)| format!("[{e},{end})"))
             .collect::<Vec<_>>()
             .join(" ");
         let nearest = cached
             .iter()
-            .filter(|&&(e, _)| e <= decode_start)
-            .max_by_key(|&&(e, _)| e);
+            .filter(|&&(e, _, _)| e <= decode_start)
+            .max_by_key(|&&(e, _, _)| e);
         let nearest_s = match nearest {
-            Some(&(e, m)) => format!(
-                r#","nearest_le_start":{e},"nearest_le_max":{m},"nearest_gap_to_max":{}"#,
-                decode_start as i64 - m as i64
+            Some(&(e, _m, end)) => format!(
+                r#","nearest_le_start":{e},"nearest_le_end":{end},"contains":{}"#,
+                e < decode_start && decode_start < end
             ),
             None => r#","nearest_le_start":-1"#.to_string(),
         };
@@ -141,6 +158,7 @@ pub fn report() {
     let cached = CONTAINING_CACHED.load(Ordering::Relaxed);
     let inflight = CONTAINING_IN_FLIGHT.load(Ordering::Relaxed);
     let absent = NOT_RESIDENT.load(Ordering::Relaxed);
+    let has_le = HAS_NEAREST_LE_START.load(Ordering::Relaxed);
     let non_startup = total.saturating_sub(startup);
     let resident = cached + inflight;
     let resident_pct = if non_startup > 0 {
@@ -155,6 +173,7 @@ pub fn report() {
     eprintln!(
         "  STALL_RESIDENCY_PROBE: total={total} startup={startup} \
          CONTAINING_CACHED={cached} CONTAINING_IN_FLIGHT={inflight} NOT_RESIDENT={absent} \
+         has_nearest_le_start={has_le} \
          | non_startup={non_startup} resident(non-startup-est)={resident} ({resident_pct:.1}% of non-startup) \
          | conservation_ok={}",
         cached + inflight + absent == total,

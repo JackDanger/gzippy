@@ -958,7 +958,53 @@ pump) / consumer.dispatch_recv (chunk_fetcher.rs:3051 rx.recv()); everything els
   the SLOW-knob positive control (decode slow-injection must inflate DECODE-WAIT while SERIAL
   stays flat — pre-registered) + N≥7 robustness, from a fresh locked guest run.
 
-### DISCRIMINATOR (a) — PARENT-CACHED-AT-STALL [building probe]
-Needs a small byte-exact env-gated probe (GZIPPY_STALL_RESIDENCY_PROBE) at the cold-get stall
-site (chunk_fetcher.rs:1342) classifying the CONTAINING chunk's residency. Building next; will
-run on the guest in the SAME locked session as (b)'s positive control.
+### DISCRIMINATOR (a) — PARENT-CACHED-AT-STALL [DONE — locked guest] → NO (NOT_RESIDENT) ⇒ RE-SCOPE placement
+Probe GZIPPY_STALL_RESIDENCY_PROBE (commit 76e9dc9d, stall_residency.rs) at the cold-get None
+branch. Locked guest 199, silesia-large 503MB, T8, host-lock GATE PASS, RESTORE VERIFIED.
+Byte-exact every run (sha=OK == ref e114dd2b…); OFF==identity match=YES.
+- VERDICT RUN (default caps): total=4 startup=1 CONTAINING_CACHED=0 CONTAINING_IN_FLIGHT=0
+  NOT_RESIDENT=4 → 0% of non-startup stalls have a resident containing parent.
+- Per-stall detail (auditable, nearest_le_start = nearest cached start ≤ decode_start): EVERY
+  non-startup stall has nearest_le_start:-1 — NO cached/in-flight chunk has a start ≤ the stalled
+  offset; ALL resident + in-flight chunks are AHEAD of decode_start. The consumer is BEHIND its
+  prefetch frontier; the containing chunk was already consumed/passed. Genuinely EVICTED/absent.
+- POSITIVE CONTROL passes (probe tracks residency): cap=1 (tiny) total 4→9 NOT_RESIDENT 4→9 (more
+  eviction → more cold-get stalls); cap=256 (huge) stays total=4, still 0% resident — proving this
+  is NOT a cache-CAPACITY problem (default cap 16 already holds the set); it is consumer-PACE/overshoot.
+- ANSWER = NO. Per the pre-registered verdict rule, NOT_RESIDENT majority ⇒ the gap is
+  cache-residency/consumer-pace, NOT interior-reuse-fixable. The getIndexedChunk/interior-EMIT port
+  (tier1-design-v2 §1.2) presupposes a resident parent it does NOT have ⇒ that placement recipe must
+  be RE-SCOPED: the fix is UPSTREAM of interior reuse (make the consumer keep pace / keep the
+  containing chunk in-flight that rapidgzip keeps). Chicken-and-egg the advisor flagged. Confirms
+  [[project_confirmed_offset_prefetch_gap]] ROOT CAUSE (consumer lags prefetcher ~318ms).
+
+### DISCRIMINATOR (b) — CONSUMER-BLOCK DECOMPOSE [DONE — locked guest] → PASS (floor ~0.015s ≪ 0.54s)
+Locked guest, clean-only oracle (GZIPPY_SEED_WINDOWS = placement-perfect operating point),
+GZIPPY_TIMELINE trace_v2 spans, output→/dev/null (T-invariant sink), 3 baselines + SLOW control.
+consumer_block_decompose.py self-time (no double-count); WAIT spans = block_fetcher_get/future_recv/
+ttp.rx_recv_block/dispatch_recv (source-classified). sha=OK byte-exact every run.
+| trace | consumer_wall | DECODE-WAIT | SERIAL-BOOKKEEPING (floor) |
+|---|---|---|---|
+| clean  | 0.506s | 0.493s (97.5%) | 0.0127s |
+| clean2 | 0.507s | 0.492s (97.0%) | 0.0151s |
+| clean3 | 0.500s | 0.482s (96.5%) | 0.0176s |
+| SLOW+100% | 5.142s | 5.097s (99.1%) | 0.0448s |
+- non-decode SERIAL floor = 0.013–0.018s (mean ~0.015s, spread ~0.005s) ≪ 0.54s ⇒ HARD GATE PASSES
+  with ~36× margin. The consumer does NOT structurally forbid the tie.
+- POSITIVE CONTROL passes the pre-registered falsifier: decode +100% (78.7M clean-loop inject hits
+  confirmed) inflated DECODE-WAIT 0.49→5.10s while SERIAL stayed 0.013→0.045s (FLAT) ⇒ the decompose
+  correctly isolates decode-wait from serial.
+- CONFOUND CAUGHT + FIXED: an interim run had output→disk(mktemp), inflating consumer.writev to a
+  fake 0.267s "floor". Streaming output→/dev/null removed it. The advisor's feared ~225ms
+  consumer-serial term was the decode-WAIT spans (rx_recv_block/dispatch_recv) mis-bucketed as
+  serial — dissolved by source-reading the span semantics.
+
+### STEP-0 CHECKPOINT (STOP for supervisor gate)
+- (a) parent-cached = NO (0% resident, 318ms-lag eviction confirmed) ⇒ tier1-design-v2 §1.2
+  interior-reuse/getIndexedChunk port is NOT the fix as written; placement must be RE-SCOPED to a
+  consumer-pace fix (faithful: rapidgzip's consumer stays ~0-17ms behind its prefetcher; gzippy lags
+  ~318ms). NOT a "wire dead code" port.
+- (b) non-decode floor = ~0.015s ≤ 0.54s ⇒ CONTINUE (no escalation; consumer does not forbid the
+  tie). The ENGINE front remains gated by §2.3's isolation bench (not run this turn).
+- NEXT: independent disproof advisor (read-only) → plans/step0-advisor-verdict.md, then STOP for the
+  supervisor gate. NO placement port, NO engine work started. Host RESTORE VERIFIED; no orphan procs.
