@@ -28,21 +28,29 @@ thread_local! {
     static STAGING_POOL: RefCell<Vec<StagingBox>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Cap on retained pooled boxes per thread (bounds idle RSS).
-const STAGING_POOL_CAP: usize = 4;
-
 #[inline]
 fn take_staging_box() -> StagingBox {
-    STAGING_POOL
-        .with(|p| p.borrow_mut().pop())
-        .unwrap_or_else(|| Box::new([0; INPUT_STAGING_BYTES]))
+    match STAGING_POOL.with(|p| p.borrow_mut().pop()) {
+        Some(b) => {
+            super::mem_stats::on_take(true);
+            b
+        }
+        None => {
+            super::mem_stats::on_take(false);
+            Box::new([0; INPUT_STAGING_BYTES])
+        }
+    }
 }
 
 #[inline]
 fn return_staging_box(b: StagingBox) {
+    super::mem_stats::on_return();
+    // Cap on retained pooled boxes per thread (bounds idle RSS). Default 4 ==
+    // production; `GZIPPY_STAGING_POOL_CAP=0` disables pooling (D3 finding).
+    let cap = super::mem_stats::staging_pool_cap();
     STAGING_POOL.with(|p| {
         let mut pool = p.borrow_mut();
-        if pool.len() < STAGING_POOL_CAP {
+        if pool.len() < cap {
             pool.push(b);
         }
         // else: drop (free) — keeps idle pool bounded.

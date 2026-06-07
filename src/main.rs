@@ -116,6 +116,10 @@ fn main() {
 
     let result = run();
 
+    // Debug-only memory accounting (no-op unless GZIPPY_MEM_STATS is set).
+    // Emitted here because `process::exit` below skips destructors.
+    decompress::inflate::mem_stats::report();
+
     match result {
         Ok(exit_code) => process::exit(exit_code),
         Err(e) => {
