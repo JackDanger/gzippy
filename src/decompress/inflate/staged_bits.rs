@@ -5,12 +5,49 @@
 //! `isal_inflate` call. Decoding multi-MiB mmap'd input without chunking is
 //! ~4× slower per the vendor comment at `isal.hpp:205-206`.
 
+use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result};
+use std::mem::ManuallyDrop;
 
 use super::consume_first_decode::Bits;
 
 /// Vendor `m_buffer` capacity (`gzip/isal.hpp:207`).
 pub const INPUT_STAGING_BYTES: usize = 128 * 1024;
+
+type StagingBox = Box<[u8; INPUT_STAGING_BYTES]>;
+
+thread_local! {
+    /// Per-thread free-list of 128 KiB staging boxes. The parallel-SM clean
+    /// tail constructs one `StagedBitInput` per chunk; without pooling that is
+    /// ~128 KiB of `Box` alloc/free churn per chunk per thread. Reusing the
+    /// box keeps the per-thread working set fixed (cache-residency mandate,
+    /// plans/gzippy-native-design-mandate.md) and is byte-transparent: the box
+    /// content is ALWAYS fully overwritten by the constructor's first
+    /// `reload_at_bit` (copy_from_slice + zero-pad tail) before any read, so a
+    /// recycled box needs no zeroing.
+    static STAGING_POOL: RefCell<Vec<StagingBox>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cap on retained pooled boxes per thread (bounds idle RSS).
+const STAGING_POOL_CAP: usize = 4;
+
+#[inline]
+fn take_staging_box() -> StagingBox {
+    STAGING_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| Box::new([0; INPUT_STAGING_BYTES]))
+}
+
+#[inline]
+fn return_staging_box(b: StagingBox) {
+    STAGING_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < STAGING_POOL_CAP {
+            pool.push(b);
+        }
+        // else: drop (free) — keeps idle pool bounded.
+    });
+}
 
 /// Bit reader backed by a fixed 128 KiB staging window into a larger input.
 pub struct StagedBitInput<'a> {
@@ -19,7 +56,9 @@ pub struct StagedBitInput<'a> {
     // Heap-backed: 128 KiB on the worker stack regressed x86 CLI decode
     // (BTYPE=11 / InvalidLookback) while lib tests passed — see
     // test_silesia_parallel_sm_mmap_fd_cli_shape vs gzippy binary.
-    buf: Box<[u8; INPUT_STAGING_BYTES]>,
+    // `ManuallyDrop` so the `Drop` impl can return the box to the per-thread
+    // pool instead of freeing it (suppresses the implicit field free).
+    buf: ManuallyDrop<StagingBox>,
     buf_len: usize,
     /// Absolute byte offset in `full` where `buf[0]` lives.
     buf_base_byte: usize,
@@ -38,7 +77,10 @@ impl<'a> StagedBitInput<'a> {
         let mut s = Self {
             full,
             until_bits,
-            buf: Box::new([0; INPUT_STAGING_BYTES]),
+            // Reused from a per-thread pool; `buf_len = 0` forces the first
+            // `reload_at_bit` below to fully overwrite the recycled bytes
+            // before any read (the skip-memcpy fast path requires buf_len > 0).
+            buf: ManuallyDrop::new(take_staging_box()),
             buf_len: 0,
             buf_base_byte: 0,
             inner: Bits::new(&[]),
@@ -273,6 +315,21 @@ impl<'a> StagedBitInput<'a> {
     }
 }
 
+impl Drop for StagedBitInput<'_> {
+    fn drop(&mut self) {
+        // Return the 128 KiB staging box to the per-thread pool instead of
+        // freeing it. `inner.data` transmutes a slice into `buf`; after this
+        // point `inner` is never read again (we are dropping), so moving `buf`
+        // out is sound. `Bits` holds only a shared ref (no Drop), so the
+        // dangling slice in `self.inner` is inert.
+        // SAFETY: `buf` is `ManuallyDrop`, so taking it here is the box's only
+        // destructor path — no implicit field free runs afterward, so there is
+        // no double free.
+        let b: StagingBox = unsafe { ManuallyDrop::take(&mut self.buf) };
+        return_staging_box(b);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,9 +485,13 @@ mod tests {
             }
             let mut staged = StagedBitInput::with_until_bits(&deflate, bit_pos, until).unwrap();
             let oracle = Bits::at_bit_offset(&deflate, bit_pos);
-            let buf_snapshot = *staged.buf;
+            let buf_snapshot: Vec<u8> = staged.buf.to_vec();
             staged.reload_at_bit(bit_pos).unwrap();
-            assert_eq!(*staged.buf, buf_snapshot, "memcpy at bit_pos {bit_pos}");
+            assert_eq!(
+                staged.buf.as_slice(),
+                buf_snapshot.as_slice(),
+                "memcpy at bit_pos {bit_pos}"
+            );
             assert_eq!(staged.bit_position(), oracle.bit_position());
             assert_eq!(staged.bitbuf(), oracle.bitbuf);
         }
