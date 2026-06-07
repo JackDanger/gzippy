@@ -1288,7 +1288,23 @@ impl Block {
             }};
         }
 
+        // Causal-perturbation slow-injection knob (clean mode ONLY). Snapshot
+        // the resolved per-decode-event spin count + kind ONCE here, before the
+        // loop, so the per-iteration cost when OFF is a single hoistable branch
+        // on a local `== 0`. `CONTAINS_MARKERS` ⇒ const-fold the snapshot to 0,
+        // so the injection is compiled away entirely on the marker path.
+        // Byte-transparent (DUAL-SHA gate). See `slow_knob.rs`.
+        let slow_spin: u64 = if CONTAINS_MARKERS {
+            0
+        } else {
+            super::slow_knob::spin_iters()
+        };
+        let slow_yield: bool = !CONTAINS_MARKERS && super::slow_knob::yield_kind();
+
         while emitted < n_max_to_decode {
+            // One slow-knob injection per decode event (this outer iteration =
+            // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
+            super::slow_knob::inject(slow_spin, slow_yield);
             // Single refill at the top of the outer iteration. After
             // `bits.refill()` returns, `bits.available()` is in
             // [56, 63] (libdeflate-style refill rounds DOWN to a
@@ -1515,7 +1531,19 @@ impl Block {
                     }};
                 }
 
+                // Causal-perturbation slow-injection knob (clean mode ONLY) —
+                // see the ISA-L sibling for the contract. Snapshot once before
+                // the loop; const-folded to 0 when CONTAINS_MARKERS.
+                let slow_spin: u64 = if CONTAINS_MARKERS {
+                    0
+                } else {
+                    super::slow_knob::spin_iters()
+                };
+                let slow_yield: bool = !CONTAINS_MARKERS && super::slow_knob::yield_kind();
+
                 while emitted < n_max_to_decode {
+                    // One injection per decode event. No-op when slow_spin == 0.
+                    super::slow_knob::inject(slow_spin, slow_yield);
                     let sym = match $decode_litlen(bits) {
                         Some(s) => s,
                         None => commit!(Err(BlockError::InvalidHuffmanCode)),
