@@ -101,6 +101,27 @@ fn seed_path() -> Option<&'static str> {
         .as_deref()
 }
 
+/// DECOMPOSE knob (GZIPPY_SEED_NO_WINDOWS=1, measurement-only): suppress the
+/// seeded-window fallback so `seed_window_for` always misses, forcing every chunk
+/// onto the speculative/marker path even though the block_finder is pre-seeded with
+/// the REAL boundaries. Isolates the boundary-ALIGNMENT sub-lever (chunks land on
+/// real deflate boundaries but still pay the u16 marker decode). OFF==identity.
+/// Byte-correct (the speculative path is the normal, correct production path).
+pub fn seed_no_windows() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("GZIPPY_SEED_NO_WINDOWS").is_ok_and(|v| v == "1"))
+}
+
+/// DECOMPOSE knob (GZIPPY_SEED_NO_BOUNDARIES=1, measurement-only): skip the
+/// block_finder pre-seed so dispatch uses prod partition-GUESS boundaries while
+/// windows ARE still seeded. Isolates the marker-COMPUTE sub-lever (correct windows
+/// handed to chunks, but at partition-guess offsets so the head-of-line stalls /
+/// re-decodes of the prod scheduling remain). OFF==identity.
+pub fn seed_no_boundaries() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("GZIPPY_SEED_NO_BOUNDARIES").is_ok_and(|v| v == "1"))
+}
+
 /// True if capture mode is active (record windows at drive end).
 pub fn capture_enabled() -> bool {
     capture_path().is_some()
@@ -258,6 +279,12 @@ pub fn seedable_chunk_starts() -> Vec<usize> {
 /// shadows a real published window.
 pub fn seed_window_for(start_bit: usize) -> Option<Vec<u8>> {
     if !seed_enabled() {
+        return None;
+    }
+    // DECOMPOSE: seed-only-boundaries mode suppresses the window fallback so every
+    // chunk takes the speculative/marker path at its (pre-seeded) real boundary.
+    if seed_no_windows() {
+        SEED_MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let store = load_store();

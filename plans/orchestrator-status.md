@@ -1,5 +1,48 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## BUNDLE DECOMPOSED → T8 SUB-LEVER = marker-COMPUTE (gzippy window-absent u16 decode ~2× slower than rg) [2026-06-07, OWNER turn, HEAD 5e9905c8 +decompose-knobs]
+Decomposed the GZIPPY_SEED_WINDOWS bundle (advisor's 3-removal confound) on the whole-system T8
+wall. Charter CURRENT STATE updated. Advisor: plans/t8-decompose-advisor-verdict.md. Pre-reg:
+plans/t8-decompose-prereg.md. Findings: plans/t8-decompose-findings.md. **SUPERVISOR GATE — fix
+build NOT started (bound-ceiling-first; one owed measurement remains).**
+
+WHAT: 2 measurement-only env knobs (OFF==identity, byte-exact, NOT committed): GZIPPY_SEED_NO_WINDOWS=1
+(suppress seeded-window fallback ⇒ seed-only-boundaries) + GZIPPY_SEED_NO_BOUNDARIES=1 (skip
+block_finder pre-seed ⇒ seed-only-windows). src/decompress/parallel/seed_windows.rs + chunk_fetcher.rs.
+
+MEASURED (locked guest REDACTED_IP double-ssh, 16c gov=perf turbo-on load 1.3-2.0, measure.sh
+interleaved N=11 CPUS=0,2,4,6,8,10,12,14 RAW=68229982 sha-OK=028bd002…cb410f every cell, 2 runs):
+  rg 0.132s 1.000 | seedfull(both) 0.126-0.134s ~1.00× TIE | onlywin(windows) 0.199s 0.66× LOSS |
+  onlybnd(boundaries) 0.198-0.205s 0.66× LOSS | prod(none) 0.198-0.203s 0.66× LOSS.
+KEY: onlywin ≈ onlybnd ≈ prod (Δ<spread); ONLY seedfull (BOTH windows+boundaries) ties. f_windows≈0,
+f_boundary≈0, yet seedfull ties ⇒ SUPER-ADDITIVE/COUPLED (pre-reg branch-4).
+MECHANISM (GZIPPY_VERBOSE counters): seedfull window_seeded=17 spec-fail=0 Fill=91% decodeBlock=0.846s
+(CLEAN). onlywin seed_hits=0 (windows UNUSABLE at partition-guess offsets) ≡ prod. onlybnd spec-fail
+13→0 (real boundaries kill spec-failures) BUT body still 170MB/s u16 decodeBlock=1.106s ≈ prod ⇒
+WALL-NEUTRAL. APPLES-TO-APPLES rg --verbose (both window-absent, same 34.5% markers): rg decodeBlock
+0.542s vs gzippy prod 1.067s ⇒ rg's u16 marker decode ~2× FASTER per byte. rg ties WITHOUT seeding.
+
+ADVISOR: core UPHELD-WITH-CAVEATS. Q1 the 2×2 knobs CANNOT separate marker-compute from boundary-
+alignment — onlywin is DEGENERATE (windows unusable without boundaries by construction ⇒ ≡ prod,
+pre-reg self-test FAILED ⇒ the COUPLED branch); re-attribute to onlybnd + rg-comparison. Q2 onlybnd
+UPHELD-W-CAVEATS (spec-failures not the cost, wall-neutral). Q3 the 2× rate gap is FAIR (denominator-
+matched, applyWindow separate in both, survives spec-failure removal) = STRONGEST pillar. Q4 (MOST
+IMPORTANT) ceiling OPTIMISTIC: seedfull removes marker-premium AND applyWindow ⇒ bounds route-(ii)
+not the faithful route-(i) (fast u16 marker decode KEEPS applyWindow); route-(i) ceiling rests on the
+rapidgzip existence proof (rg 0.54 decode + ~0.113s applyWindow → 0.13 wall), conditional on
+gzippy's applyWindow ≈ rg's.
+
+PINPOINTED: T8 sub-lever = marker-COMPUTE (window-absent u16 decode ~2× rg). NOT boundary-alignment
+(secondary precondition, wall-neutral) NOT spec-failures (wall-neutral). CEILING ≤ T8 1.0× TIE
+CONDITIONAL on apply_window parity vs rg's ~0.113s.
+NEXT (next loop, do NOT start now): igzip-class u16 marker-decode kernel (asm/inner-kernel techniques
+adapted to u16 marker output — in scope HERE, Phase-0 ISA-L oracle never tested the marker path).
+PLUS the OWED measurement: time gzippy's apply_window/marker-resolution vs rg's ~0.113s (needs a
+fast-marker prototype or direct timer; no existing cell isolates it).
+GUEST: /root/gzippy src @7bf26096 + oracle overlay + this turn's 2 decompose knobs (applied on guest,
+NOT committed locally). Build /tmp/gzbuild-isal (gzippy-isal target-cpu=native byte-exact). Seeds
+/tmp/seeds.bin (16 windows). Driver /tmp/decompose_measure.sh (use bash). NO orphan processes.
+
 ## PHASE-0 WALL ORACLE DONE → T8 BINDER IS THE WINDOW-ABSENT MARKER PATH, NOT THE ENGINE [2026-06-07, OWNER turn, HEAD 3895a23c +oracle]
 PHASE-0 of the asm-port project: dropped a REAL ISA-L engine into the PRODUCTION parallel-SM
 pipeline (pool/consumer/ring/CRC/window-publish kept) and measured the T8 WALL vs rapidgzip on the

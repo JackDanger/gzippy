@@ -65,7 +65,26 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, HEAD 3895a23c +oracle) — PHASE-0 WALL ORACLE DONE → **THE T8 WALL BINDER IS THE WINDOW-ABSENT MARKER/SPECULATION PATH, NOT THE ENGINE** (advisor-UPHELD). An igzip-class engine ALONE does NOT close the prod T8 gap; the asm port is NOT the T8 lever. **SUPERVISOR GATE — do NOT start Phase 1 until the bundle is decomposed.**
+## CURRENT STATE (2026-06-07, HEAD 5e9905c8 +decompose-knobs) — BUNDLE DECOMPOSED → **THE T8 SUB-LEVER IS marker-COMPUTE: gzippy's window-absent u16 marker decode is ~2× SLOWER per byte than rapidgzip's** (advisor UPHELD-WITH-CAVEATS). Boundary-alignment + spec-failures are NOT the cost. CEILING = ≤ T8 1.0× TIE, conditional on applyWindow parity. **SUPERVISOR GATE — do NOT start the fix build (bound-ceiling-first; one owed measurement remains).**
+
+### THIS TURN — DECOMPOSED the GZIPPY_SEED_WINDOWS bundle (advisor's 3-removal confound: a=marker-compute, b=boundary-alignment, c=spec-failure re-decodes). Added 2 measurement-only env knobs (OFF==identity, byte-exact, NOT committed): `GZIPPY_SEED_NO_WINDOWS=1` (suppress seeded-window fallback ⇒ seed-only-boundaries) + `GZIPPY_SEED_NO_BOUNDARIES=1` (skip block_finder pre-seed ⇒ seed-only-windows). seed_windows.rs + chunk_fetcher.rs.
+- **MEASURED (locked guest REDACTED_IP double-ssh, 16c gov=perf turbo-on load 1.3-2.0, measure.sh interleaved N=11 CPUS=0,2,4,6,8,10,12,14 RAW=68229982 sha-OK=028bd002…cb410f every cell, 2 runs):**
+    | cell | what's seeded | wall | vs rg |
+    | rg (rapidgzip 0.16.0)              | —          | 0.132s | 1.000 |
+    | seedfull (windows+boundaries)      | both       | 0.126-0.134s | **~1.00× TIE** |
+    | onlywin (NO_BOUNDARIES, windows)   | windows    | 0.199s | 0.66× LOSS |
+    | onlybnd (NO_WINDOWS, boundaries)   | boundaries | 0.198-0.205s | 0.66× LOSS |
+    | prod (no seeding)                  | nothing    | 0.198-0.203s | 0.66× LOSS |
+  **onlywin ≈ onlybnd ≈ prod (Δ<spread); only seedfull (BOTH) ties.** Pre-reg formula: f_windows≈0, f_boundary≈0, yet seedfull ties ⇒ SUPER-ADDITIVE/COUPLED (pre-reg branch-4).
+- **MECHANISM (per-cell counters, GZIPPY_VERBOSE):** seedfull window_seeded=17 spec-fail=0 Fill=91% decodeBlock=0.846s (chunks go CLEAN). onlywin seed_hits=**0** (windows UNUSABLE at partition-guess offsets) window_seeded=2 spec-fail=13 decodeBlock=1.06s ≡ prod. onlybnd spec-fail **13→0** (real boundaries kill spec-failures) BUT body still 170MB/s u16, decodeBlock=1.106s ≈ prod ⇒ WALL-NEUTRAL.
+- **APPLES-TO-APPLES vs rg (--verbose, both window-absent, SAME 34.5% replaced markers):** rg decodeBlock **0.542s** / Theo-Opt 0.068-0.074s vs gzippy prod **1.067s** / 0.133s ⇒ **rg's u16 marker decode is ~2× FASTER per byte.** rg ties WITHOUT seeding because its marker decode is fast; gzippy ties only by cheating (seedfull = clean, no applyWindow). Even seedfull's CLEAN decode (0.846s) is 1.57× slower than rg's MARKER decode (0.542s).
+- **PINPOINTED T8 SUB-LEVER = marker-COMPUTE** (the slow window-absent u16 decode itself, ~2× rg). NOT boundary-alignment (secondary precondition, wall-neutral), NOT spec-failures (wall-neutral). The Phase-0 ISA-L oracle could not see this — ISA-L can't emit u16 markers, so the marker path was never replaced. ⇒ asm/igzip-class inner-kernel work IS in scope HERE, adapted to u16 marker output.
+- **INDEPENDENT DISPROOF ADVISOR (synchronous read-only, plans/t8-decompose-advisor-verdict.md):** core verdict UPHELD-WITH-CAVEATS. (Q1) the 2×2 knobs CANNOT separate (a) from (b) — onlywin is DEGENERATE (windows unusable without boundaries by construction ⇒ ≡ prod; its pre-reg self-test FAILED ⇒ void as a windows-only cell, = the COUPLED branch); re-attribute the verdict to **onlybnd + the rg comparison**, not the decomposition. (Q2) onlybnd UPHELD-W-CAVEATS — spec-failures not the cost (clean isolation, wall-neutral). (Q3) the 2× rate gap is FAIR (denominator-matched decodeBlockTotalTime/parallelization, applyWindow separate in both, survives spec-failure removal) — the STRONGEST pillar. (Q4, MOST IMPORTANT) the CEILING is OPTIMISTIC: seedfull removes TWO things — marker decode premium AND the applyWindow serial pass — so it bounds route-(ii) (more clean windows), NOT the faithful route-(i) (fast u16 marker decode, which KEEPS applyWindow like rg). The route-(i) ceiling rests on the **rapidgzip existence proof** (rg: 0.54 decode + ~0.113s applyWindow → 0.13 wall), conditional on gzippy's applyWindow ≈ rg's.
+- **BOUNDED CEILING: ≤ T8 1.0× TIE (rapidgzip existence proof), CONDITIONAL on gzippy's apply_window/marker-resolution pass ≈ rg's ~0.113s.** seedfull achieved the TIE but over-removes applyWindow ⇒ optimistic; the conditional bound is the honest one.
+- **SCOPED FIX FOR NEXT LOOP (do NOT start — bound-ceiling-first):** an igzip-class u16 marker-decode kernel (asm/inner-kernel techniques adapted to u16 marker output). PLUS the OWED prerequisite measurement before claiming TIE-reachable: time gzippy's apply_window/marker-resolution vs rg's ~0.113s (no existing cell isolates it — needs a fast-marker prototype or a direct apply_window timer). If gzippy's applyWindow ≫ rg's, a marker-COMPUTE-only fix lands SHORT.
+- **GUEST STATE:** /root/gzippy src @7bf26096 + oracle overlay + this turn's 2 decompose knobs (seed_windows.rs + chunk_fetcher.rs, applied on guest, NOT committed locally yet). Build /tmp/gzbuild-isal (gzippy-isal, target-cpu=native, byte-exact). Seeds /tmp/seeds.bin (16 windows). Driver /tmp/decompose_measure.sh (use `bash`). No orphan processes.
+
+### SUPERSEDED — PHASE-0 (HEAD 3895a23c +oracle) — T8 BINDER = WINDOW-ABSENT MARKER/SPECULATION PATH, NOT THE ENGINE
 
 ### THIS TURN — PHASE-0: dropped a REAL ISA-L engine into the PRODUCTION parallel-SM pipeline and measured the T8 WALL (Measurement PROCESS #3 — engine REPLACEMENT oracle, not isolation-slope extrapolation). This converts the 0.6× engine-PRIMITIVE plateau into an airtight T8 WALL bound.
 - **ORACLE (measurement-only, byte-exact, env-gated, NOT production):** `GZIPPY_ISAL_ENGINE_ORACLE=1`
@@ -342,3 +361,20 @@ ASM-PORT PROJECT PLAN (the owner owns; phased, prove-before-the-big-build):
 - **PHASE 1+ (the transliteration):** port igzip_decode_block_stateless_{01,04}.asm → inline Rust
   asm, integrated per Phase-0's finding (flatten the path if needed), in byte-exact + wall-measured
   phases, each advisor-gated. Target: production T8 wall ties rapidgzip (~0.13s same-host).
+
+---
+## PHASE-0 RESULT 2026-06-07 (advisor-upheld) — ASM PORT IS NOT THE T8 LEVER; RE-SCOPE
+ISA-L-in-pipeline wall oracle (commit 5e9905c8, proven ISA-L ran 16/18 chunks, byte-exact):
+T8 seeded — pure-Rust 0.97-1.00× TIE, ISA-L 0.90× TIE (TIE-vs-TIE); unseeded production
+0.65-0.69× LOSS. ⇒ The pure-Rust ENGINE ALREADY TIES T8 once windows are seeded; the engine
+plateau (0.6× isolation) does NOT bind the T8 wall. **The T8 lever is the WINDOW-ABSENT
+marker/speculation path** (16/18 chunks window-absent @168 MB/s + 13 header-speculation
+failures; rapidgzip runs the same ~34.5% marker workload without the penalty). The T8 1.0× tie
+is reachable in PURE-RUST, no FFI, WITHOUT the asm transliteration.
+RE-SCOPE (no constraint fork — same goal, pure-Rust): the asm engine port is the **T1 lever**
+(T1 has no scheduling slack ⇒ engine binds directly, ~83% of T1 wall) — keep for T1, defer for
+T8. The **T8 lever is the window/marker/boundary path**. Advisor caveat: "seeding" BUNDLES three
+removals — (1) u16 marker-compute, (2) block-finder real-boundary vs partition-guess ALIGNMENT,
+(3) 13 speculation-failure re-decodes. NEXT: DECOMPOSE the bundle (seed-only-boundaries vs
+seed-only-windows) to pinpoint the precise T8 sub-lever before fixing — likely boundary-ALIGNMENT
+= block-finder / prefetch-horizon (project_confirmed_offset_prefetch_gap), faithfully ported.
