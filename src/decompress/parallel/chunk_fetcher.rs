@@ -944,9 +944,9 @@ fn drive_impl<W: std::io::Write>(
         } else {
             0.0
         };
-        let bs_postflip = gc::BOOTSTRAP_POST_FLIP_U16_BYTES.load(Ordering::Relaxed);
-        let postflip_pct = if bs_b_bytes > 0 {
-            100.0 * bs_postflip as f64 / bs_b_bytes as f64
+        let bs_clean_flipped = gc::BOOTSTRAP_CLEAN_FLIPPED_BYTES.load(Ordering::Relaxed);
+        let clean_flipped_pct = if bs_b_bytes > 0 {
+            100.0 * bs_clean_flipped as f64 / bs_b_bytes as f64
         } else {
             0.0
         };
@@ -968,11 +968,12 @@ fn drive_impl<W: std::io::Write>(
             0.0
         };
         eprintln!(
-            "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0} post_flip_u16_bytes={bs_postflip} ({postflip_pct:.1}% of body = Design-B1 prize)",
+            "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0} clean_flipped_bytes={bs_clean_flipped} ({clean_flipped_pct:.1}% of body = marker-FREE complement; marker loop owns the other {:.1}%)",
             bs_h_us as f64 / 1000.0,
             bs_h_avg,
             bs_b_us as f64 / 1000.0,
             bs_b_rate,
+            100.0 - clean_flipped_pct,
         );
         eprintln!(
             "  Bootstrap ring split: huffman_ms={:.1} ({ring_h_pct:.1}% of body) drain_ms={:.1} ({ring_d_pct:.1}% of body) drain_u16_bytes={ring_d_bytes}",
