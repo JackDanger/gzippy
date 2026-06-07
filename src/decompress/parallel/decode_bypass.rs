@@ -599,6 +599,22 @@ fn prebuilt_map() -> &'static Mutex<HashMap<Key, Option<ChunkData>>> {
     })
 }
 
+/// ORACLE-C contamination fix: eagerly build the prebuilt replay map (capture
+/// load + ~656MB ChunkData reconstruction) BEFORE the timed drive, so that
+/// one-time cost is not charged to the decode-floor wall. Reports the build
+/// duration to stderr so the harness can subtract it (floor = wall − warm).
+/// No-op unless `GZIPPY_BYPASS_DECODE` replay is enabled (and not the per-call
+/// rebuild variant, which intentionally measures reconstruction in-wall).
+pub fn warm_prebuilt() {
+    if !replay_enabled() || rebuild_each_call() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let n = prebuilt_map().lock().unwrap().len();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("BYPASS_DECODE warm_prebuilt: built {n} chunks in {ms:.1}ms (out-of-wall)");
+}
+
 pub static REPLAY_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static REPLAY_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

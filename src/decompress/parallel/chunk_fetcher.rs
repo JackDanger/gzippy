@@ -571,6 +571,14 @@ fn drive_impl<W: std::io::Write>(
         );
     }
 
+    // ORACLE-C (decode-bypass FLOOR): warm the prebuilt replay map BEFORE the
+    // timed drive so the one-time capture-load + ChunkData reconstruction (the
+    // ~656MB rebuild that CONTAMINATED the prior leverB floor at 3.667s, see
+    // plans/leverB-ceiling.md) is NOT counted as decode-floor time. Emits the
+    // build duration to stderr (GZIPPY_BYPASS_DECODE replay only) so the harness
+    // can report floor = wall − warm. No-op unless replay is enabled.
+    crate::decompress::parallel::decode_bypass::warm_prebuilt();
+
     let drive_t0 = std::time::Instant::now();
     let consumer_result = consumer_loop(
         input_view,
