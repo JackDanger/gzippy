@@ -126,8 +126,10 @@ cap_clean_trace() { # <label> <slow-env...>  -> clean-only trace at placement-pe
   local label="$1"; shift
   drop_caches
   local out; out="$(mktemp)"
+  # GZIPPY_TIMELINE = trace_v2 Chrome B/E spans (self-time decomposable), the
+  # format consumer_block_decompose.py consumes (NOT GZIPPY_LOG_FILE/trace.rs).
   env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_SEED_WINDOWS="$SEEDF" \
-    GZIPPY_LOG_FILE="$ARTDIR/b_${label}_trace.json" "$@" \
+    GZIPPY_TIMELINE="$ARTDIR/b_${label}_trace.json" "$@" \
     taskset -c "$mask" "$GZIPPY" -d -c -p "$T" "$CORPUS" >"$out" 2>"$ARTDIR/b_${label}.err" || true
   local sha; sha="$(sha_of "$out")"; rm -f "$out"
   local ok="MISMATCH"; [ "$sha" = "$REF_SHA" ] && ok="sha=OK"
@@ -136,7 +138,10 @@ cap_clean_trace() { # <label> <slow-env...>  -> clean-only trace at placement-pe
 
 # baseline clean-only (the decompose verdict input)
 cap_clean_trace "clean"
-# SLOW positive control: decode compute +100% (spin). DECODE-WAIT must rise.
-cap_clean_trace "slow100" GZIPPY_SLOW_MODE=100 GZIPPY_SLOW_KIND=spin
+# SLOW positive control: decode compute +100% (spin). DECODE-WAIT must rise,
+# SERIAL stay flat. GZIPPY_SLOW_HITS=1 prints the clean-loop hit count so we
+# confirm the injection actually fired on the native clean path.
+cap_clean_trace "slow100" GZIPPY_SLOW_MODE=100 GZIPPY_SLOW_KIND=spin GZIPPY_SLOW_HITS=1
+say "[b:slow100] $(grep -m1 -i 'SLOW_HITS\|slow.*hits\|clean decode events' "$ARTDIR/b_slow100.err" || echo 'no hit line')"
 
 say ""; say "STEP0_GUEST_DONE"
