@@ -13,7 +13,7 @@
 ))]
 mod bench {
     use gzippy::decompress::inflate::resumable::ResumableInflate2;
-    use gzippy::decompress::parallel::inflate_wrapper::IsalInflateWrapper;
+    use gzippy::decompress::parallel::inflate_wrapper::StreamingInflateWrapper;
     use std::time::Instant;
 
     fn bench_throughput<F: FnMut() -> usize>(mut f: F) -> f64 {
@@ -54,7 +54,7 @@ mod bench {
         };
 
         let isal_mbps = bench_throughput(|| {
-            let mut w = IsalInflateWrapper::new(&deflate, 0).expect("isal init");
+            let mut w = StreamingInflateWrapper::new(&deflate, 0).expect("isal init");
             w.set_window(&[]).expect("window");
             let mut out = vec![0u8; deflate.len() * 16];
             let mut total = 0usize;

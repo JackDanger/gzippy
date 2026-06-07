@@ -57,7 +57,7 @@ fn decode_consume_first(deflate: &[u8], out: &mut [u8]) -> usize {
 // Window-absent BOOTSTRAP decoder (`marker_inflate::Block`) — the marker-path
 // inner loop that decodes ~31% of silesia (the speculative window-absent
 // chunks) at ~175 MB/s in production. Decoding from offset 0 with no window
-// exercises the SAME per-symbol decode (IsalLitLenCodePure litlen +
+// exercises the SAME per-symbol decode (LutLitLenCode litlen +
 // get_distance_dynamic/apply_distance_extra + u16-ring writes) that runs on
 // the marker path, isolating its instructions/byte from the parallel pipeline.
 // This is the measurement gate for the bootstrap-unification lever.
@@ -88,7 +88,7 @@ fn decode_bootstrap(deflate: &[u8], out16: &mut Vec<u16>) -> usize {
 // ── Candidate-discriminating decoders ─────────────────────────────────────
 //
 // These two modes replicate the PRODUCTION window-absent per-symbol loop
-// (`deflate_block.rs::run_multi_cached_loop!`) — same IsalLitLenCodePure
+// (`deflate_block.rs::run_multi_cached_loop!`) — same LutLitLenCode
 // litlen decode, same HuffmanCodingReversedBitsCached dist decode, same
 // `get_distance_dynamic`, same multi-symbol unpack — but vary ONLY the store
 // backend, so the A/B isolates the three candidates:
@@ -127,7 +127,7 @@ fn flat_copy_u8(out: &mut [u8], out_pos: usize, distance: usize, length: usize) 
 fn decode_tbl_isal_u8(deflate: &[u8], out: &mut [u8]) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
     use gzippy::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
-    use gzippy::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
+    use gzippy::decompress::parallel::lut_huffman::LutLitLenCode;
     use gzippy::decompress::parallel::marker_inflate::{Block, END_OF_BLOCK_SYMBOL};
     use gzippy::decompress::parallel::rfc_tables::get_distance_dynamic;
 
@@ -136,7 +136,7 @@ fn decode_tbl_isal_u8(deflate: &[u8], out: &mut [u8]) -> usize {
     let mut header = Block::new();
     header.reset(None, None);
     let mut out_pos = 0usize;
-    let mut litlen_hc = IsalLitLenCodePure::new_empty();
+    let mut litlen_hc = LutLitLenCode::new_empty();
 
     loop {
         if header.read_header(&mut bits, false).is_err() {
@@ -210,7 +210,7 @@ fn decode_tbl_isal_u8(deflate: &[u8], out: &mut [u8]) -> usize {
 fn decode_tbl_isal_u16(deflate: &[u8], _out: &mut [u8]) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
     use gzippy::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
-    use gzippy::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
+    use gzippy::decompress::parallel::lut_huffman::LutLitLenCode;
     use gzippy::decompress::parallel::marker_inflate::{Block, END_OF_BLOCK_SYMBOL};
     use gzippy::decompress::parallel::rfc_tables::get_distance_dynamic;
 
@@ -226,7 +226,7 @@ fn decode_tbl_isal_u16(deflate: &[u8], _out: &mut [u8]) -> usize {
     let ring_ptr = ring.as_mut_ptr();
     let mut pos: usize = 0; // monotonic logical
     let mut out_pos = 0usize;
-    let mut litlen_hc = IsalLitLenCodePure::new_empty();
+    let mut litlen_hc = LutLitLenCode::new_empty();
 
     #[inline(always)]
     unsafe fn ring_backref(ring_ptr: *mut u16, pos: usize, distance: usize, length: usize) {

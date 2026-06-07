@@ -43,9 +43,9 @@ pub mod huffman_symbols_per_length;
 #[cfg(parallel_sm)]
 pub mod inflate_wrapper;
 #[cfg(parallel_sm)]
-pub mod isal_huffman_pure;
+pub mod lut_bulk_inflate;
 #[cfg(parallel_sm)]
-pub mod isal_lut_bulk;
+pub mod lut_huffman;
 #[cfg(parallel_sm)]
 pub mod marker_inflate;
 #[cfg(parallel_sm)]

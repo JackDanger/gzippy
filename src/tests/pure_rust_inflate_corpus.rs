@@ -11,7 +11,7 @@
 //!
 //! All cases run the parallel-SM pipeline end-to-end via
 //! `decompress::decompress_single_member` (T > 1, > 10 MiB compressed,
-//! which forces the routing into `IsalParallelSM`). Output is compared
+//! which forces the routing into `ParallelSM`). Output is compared
 //! byte-for-byte against a flate2 reference decode of the same input.
 //! Final CRC32 + ISIZE are verified inside the pipeline itself; a
 //! mismatch surfaces as `Err`.

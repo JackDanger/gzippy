@@ -344,7 +344,7 @@ pub struct Block {
     /// Pure-Rust ISA-L LUT tables (byte-matched to igzip; same decode loop
     /// as the C `IsalLitLenCode` / `IsalDistCode` fields above).
     #[cfg(pure_inflate_decode)]
-    isal_litlen_pure: crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
+    lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode,
     /// Distance Huffman decoder. Vendor rapidgzip explicitly REJECTED ISA-L
     /// for distance and uses `HuffmanCodingReversedBitsCached` (gzip/deflate.hpp:336;
     /// ISA-L distance commented out :338). Faithful transliteration of that choice —
@@ -426,8 +426,8 @@ impl Block {
             distance_to_last_marker_byte: 0,
             contains_marker_bytes: true,
             #[cfg(pure_inflate_decode)]
-            isal_litlen_pure:
-                crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure::new_empty(),
+            lut_litlen:
+                crate::decompress::parallel::lut_huffman::LutLitLenCode::new_empty(),
             #[cfg(pure_inflate_decode)]
             dist_hc:
                 crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached::new(),
@@ -843,7 +843,7 @@ impl Block {
     fn build_huffman_luts_for_block(&mut self) -> Result<(), BlockError> {
         match self.compression_type {
             CompressionType::FixedHuffman => {
-                if !self.isal_lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
+                if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
                 // Vendor parity (gzip/deflate.hpp:336): distance via the cached
@@ -864,7 +864,7 @@ impl Block {
                 let mut dist_stack = [0u8; MAX_DISTANCE_SYMBOL_COUNT + 2];
                 lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
                 dist_stack[..end - split].copy_from_slice(&self.literal_cl[split..end]);
-                if !self.isal_lut_litlen_rebuild(&lit_stack[..split]) {
+                if !self.lut_litlen_rebuild(&lit_stack[..split]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
                 // Vendor parity (gzip/deflate.hpp:336): distance via the cached
@@ -1132,10 +1132,10 @@ impl Block {
         pure_inflate_decode
     ))]
     #[inline(always)]
-    fn isal_lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
+    fn lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
         #[cfg(pure_inflate_decode)]
         {
-            self.isal_litlen_pure.rebuild_from(litlen_lens)
+            self.lut_litlen.rebuild_from(litlen_lens)
         }
         #[cfg(not(any(
             all(
@@ -1160,10 +1160,10 @@ impl Block {
         pure_inflate_decode
     ))]
     #[inline(always)]
-    fn isal_lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
+    fn lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
         #[cfg(pure_inflate_decode)]
         {
-            let d = self.isal_litlen_pure.decode(bits);
+            let d = self.lut_litlen.decode(bits);
             (d.symbol, d.sym_count, d.bit_count)
         }
         #[cfg(not(any(
@@ -1306,7 +1306,7 @@ impl Block {
             // `refill` advances `pos` by 0 when `bitsleft >= 56`
             // (see consume_first_decode.rs:259).
             bits.refill();
-            let (symbol, sym_count, bit_count) = self.isal_lut_litlen_decode(bits);
+            let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
             if bit_count == 0 {
                 // Inside `IsalLitLenCode::decode`, `symbol` is set to
                 // `INVALID_SYMBOL` (0x1FFF) exactly when

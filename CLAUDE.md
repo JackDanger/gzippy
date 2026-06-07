@@ -58,7 +58,7 @@ conclude a lever from attribution. The only verdict is a CAUSAL PERTURBATION:
    region, frequency-neutral variant, instrument self-test). Only what survives a
    genuine disproof attempt is real. Δ < inter-run spread ⇒ TIE, full stop.
 6. **Always, mechanically:** assert the production path (`GZIPPY_DEBUG=1` →
-   `path=IsalParallelSM`; build `--no-default-features --features pure-rust-inflate`;
+   `path=ParallelSM`; build `--no-default-features --features pure-rust-inflate`;
    `GZIPPY_FORCE_PARALLEL_SM=1` to exercise the engine at every T); frozen host;
    interleaved best-of-N≥7; sha-verified output (a speed win with wrong bytes is a
    loss).

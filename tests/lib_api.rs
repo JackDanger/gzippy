@@ -232,7 +232,7 @@ fn classify_single_member_t1() {
     assert!(
         matches!(
             path,
-            DecodePath::IsalParallelSM
+            DecodePath::ParallelSM
                 | DecodePath::StoredParallel
                 | DecodePath::StreamingSingle
                 | DecodePath::LibdeflateSingle
@@ -249,7 +249,7 @@ fn classify_single_member_t4() {
     assert!(
         matches!(
             path,
-            DecodePath::IsalParallelSM
+            DecodePath::ParallelSM
                 | DecodePath::StoredParallel
                 | DecodePath::StreamingSingle
                 | DecodePath::LibdeflateSingle

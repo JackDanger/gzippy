@@ -894,12 +894,13 @@ fn drive_impl<W: std::io::Write>(
         } else {
             0.0
         };
-        let ring_h_us = crate::decompress::parallel::isal_lut_bulk::BOOTSTRAP_RING_HUFFMAN_US
+        let ring_h_us = crate::decompress::parallel::lut_bulk_inflate::BOOTSTRAP_RING_HUFFMAN_US
             .load(Ordering::Relaxed);
-        let ring_d_us = crate::decompress::parallel::isal_lut_bulk::BOOTSTRAP_RING_DRAIN_US
+        let ring_d_us = crate::decompress::parallel::lut_bulk_inflate::BOOTSTRAP_RING_DRAIN_US
             .load(Ordering::Relaxed);
-        let ring_d_bytes = crate::decompress::parallel::isal_lut_bulk::BOOTSTRAP_RING_DRAIN_BYTES
-            .load(Ordering::Relaxed);
+        let ring_d_bytes =
+            crate::decompress::parallel::lut_bulk_inflate::BOOTSTRAP_RING_DRAIN_BYTES
+                .load(Ordering::Relaxed);
         let ring_h_pct = if bs_b_us > 0 {
             100.0 * ring_h_us as f64 / bs_b_us as f64
         } else {
@@ -1461,7 +1462,7 @@ fn consumer_loop<W: std::io::Write>(
                 // on EVERY consumed chunk): full sorted scan of the prefetch cache,
                 // each chunk checked against ITS OWN predecessor independently. gzippy
                 // diverged with `Some(chunk_end_bit)` — a single chain-follow that
-                // SKIPS any chunk whose key ≠ the running handoff (isal_lut_bulk.rs
+                // SKIPS any chunk whose key ≠ the running handoff (lut_bulk_inflate.rs
                 // :2551 `continue`), so the chain breaks at the first speculative/
                 // overshoot mismatch (resolved 5/12). `None` = vendor's robust full
                 // scan; it still propagates the chain (publishes each end-window as it
@@ -3099,7 +3100,7 @@ fn try_speculative_decode_candidate(
     //                  precode pre-pass (CountAllocatedLeaves port)
     //   body_fail    → "deflate body at bit X" — mid-stream Huffman
     //                  decode failed; precode wouldn't catch it
-    //   inflate_fail → phase-2 IsalInflateWrapper / ResumableInflate2
+    //   inflate_fail → phase-2 StreamingInflateWrapper / ResumableInflate2
     //   stop_missed  → chunk size cap hit (not really a "failure")
     if let Err(ref e) = result {
         use std::sync::atomic::Ordering;

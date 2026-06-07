@@ -55,7 +55,7 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 ///   GzippyParallel   — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
 ///   MultiMemberPar   — pigz-style multi-member, Tmax threads
 ///   MultiMemberSeq   — pigz-style multi-member, T1
-///   IsalParallelSM   — single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
+///   ParallelSM   — single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
 ///                      (x86_64: ISA-L or pure-Rust; aarch64: pure-Rust inner decoder).
 ///                      Gated by `parallel::sm_cfg::PARALLEL_SM`; name is historical.
 ///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
@@ -72,7 +72,7 @@ pub enum DecodePath {
     // Constructed only under `parallel_sm` (the pure-rust-inflate build);
     // dead in the legacy default build, alive in production.
     #[allow(dead_code)]
-    IsalParallelSM,
+    ParallelSM,
     /// Stored-block-dominated (incompressible) single-member, decoded in
     /// parallel WITHOUT speculation by splitting on explicit stored-block
     /// `LEN` fields. See [`crate::decompress::parallel::stored_split`]. The
@@ -177,7 +177,7 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         {
             return DecodePath::StoredParallel;
         }
-        DecodePath::IsalParallelSM
+        DecodePath::ParallelSM
     }
     #[cfg(not(parallel_sm))]
     {
@@ -267,7 +267,7 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
             }
         }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
-        DecodePath::IsalParallelSM
+        DecodePath::ParallelSM
         | DecodePath::StoredParallel
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
@@ -297,7 +297,7 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
         }
-        DecodePath::IsalParallelSM
+        DecodePath::ParallelSM
         | DecodePath::StoredParallel
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
@@ -366,7 +366,7 @@ pub(crate) fn decompress_single_member<W: Write>(
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
         }
-        DecodePath::IsalParallelSM
+        DecodePath::ParallelSM
         | DecodePath::StoredParallel
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
@@ -392,7 +392,7 @@ fn decompress_single_member_for<W: Write>(
     num_threads: usize,
 ) -> GzippyResult<u64> {
     match path {
-        DecodePath::IsalParallelSM => {
+        DecodePath::ParallelSM => {
             // The parallel pipeline runs and verifies CRC + ISIZE — or
             // returns an error. No fallback. This is the production
             // hot path on x86_64 + ISA-L for inputs ≥ MIN_PARALLEL_COMPRESSED
@@ -733,9 +733,9 @@ mod tests {
 
     /// The classifier — not an in-body fallback — is the only place that
     /// decides whether parallel SM runs. An input that satisfies the
-    /// gate must classify to `IsalParallelSM` wherever the parallel-SM
+    /// gate must classify to `ParallelSM` wherever the parallel-SM
     /// pipeline is compiled in (`PARALLEL_SM`) and to
-    /// `IsalSingle`/`LibdeflateSingle` otherwise — never silently switch
+    /// `SingleMember`/`LibdeflateSingle` otherwise — never silently switch
     /// backends inside `decompress_single_member`.
     ///
     /// `PARALLEL_SM` is true on x86_64 (isal-compression | pure-rust-inflate)
@@ -749,13 +749,13 @@ mod tests {
         if crate::decompress::parallel::sm_cfg::PARALLEL_SM {
             assert_eq!(
                 path,
-                DecodePath::IsalParallelSM,
+                DecodePath::ParallelSM,
                 "size+ratio-eligible input must classify parallel where PARALLEL_SM is on"
             );
         } else {
             assert_ne!(
                 path,
-                DecodePath::IsalParallelSM,
+                DecodePath::ParallelSM,
                 "host without the parallel-SM pipeline must not classify parallel"
             );
         }
@@ -777,15 +777,15 @@ mod tests {
         for t in [1usize, 2, 3, 4] {
             assert_eq!(
                 classify_gzip(&payload, t),
-                DecodePath::IsalParallelSM,
+                DecodePath::ParallelSM,
                 "T={t} must take the pure-Rust pipeline (sole single-member path)"
             );
         }
         #[cfg(not(parallel_sm))]
         {
-            assert_ne!(classify_gzip(&payload, 2), DecodePath::IsalParallelSM);
-            assert_ne!(classify_gzip(&payload, 3), DecodePath::IsalParallelSM);
-            assert_eq!(classify_gzip(&payload, 4), DecodePath::IsalParallelSM);
+            assert_ne!(classify_gzip(&payload, 2), DecodePath::ParallelSM);
+            assert_ne!(classify_gzip(&payload, 3), DecodePath::ParallelSM);
+            assert_eq!(classify_gzip(&payload, 4), DecodePath::ParallelSM);
         }
     }
 
@@ -797,7 +797,7 @@ mod tests {
     /// instead such input (a stored stream) is routed to the NON-speculative
     /// `StoredParallel` split path on x86_64 + ISA-L/pure-rust, which decodes
     /// the explicit stored-block lengths in parallel. Either way the speculative
-    /// `IsalParallelSM` path is never chosen, and the output is byte-exact.
+    /// `ParallelSM` path is never chosen, and the output is byte-exact.
     #[test]
     fn test_incompressible_single_member_avoids_speculative_pipeline() {
         // 16 MiB of high-entropy bytes -> compressed ~= raw, ratio ~1.0.
@@ -826,7 +826,7 @@ mod tests {
         // data), at any thread count.
         assert_ne!(
             classify_gzip(&compressed, 4),
-            DecodePath::IsalParallelSM,
+            DecodePath::ParallelSM,
             "incompressible single-member must avoid the speculative pipeline"
         );
         // On parallel-SM builds it takes the non-speculative stored split
@@ -854,7 +854,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         // Compressible fixture above MIN_PARALLEL_COMPRESSED so the
-        // classifier returns IsalParallelSM (incompressible would now bail
+        // classifier returns ParallelSM (incompressible would now bail
         // to one-shot via parallel_sm_unprofitable).
         let (original, compressed) = compressible_parallel_fixture();
         let before_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
@@ -913,16 +913,13 @@ mod tests {
         let path = classify_gzip(&compressed, 4);
         #[cfg(parallel_sm)]
         assert!(
-            matches!(
-                path,
-                DecodePath::IsalParallelSM | DecodePath::StoredParallel
-            ),
+            matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
             "below-gate single-member must route pure-Rust under parallel_sm, got {path:?}"
         );
         #[cfg(not(parallel_sm))]
         assert_ne!(
             path,
-            DecodePath::IsalParallelSM,
+            DecodePath::ParallelSM,
             "legacy build routes below-gate to the C-FFI one-shot"
         );
         // Whatever sub-path the classifier picks, it must decode.

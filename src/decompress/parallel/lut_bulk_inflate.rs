@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 // task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 //! Stateless windowed-bulk DEFLATE decoder using the ISA-L LUT format
-//! from `isal_huffman_pure.rs`.
+//! from `lut_huffman.rs`.
 //!
 //! ## Why this exists
 //!
@@ -50,9 +50,7 @@
 
 use crate::decompress::inflate::consume_first_decode::Bits;
 use crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
-use crate::decompress::parallel::isal_huffman_pure::{
-    IsalDistCodePure, IsalLitLenCodePure, LIT_LEN,
-};
+use crate::decompress::parallel::lut_huffman::{LutDistCode, LutLitLenCode, LIT_LEN};
 
 const MAX_WINDOW_SIZE: usize = 32 * 1024;
 const MAX_MATCH_LENGTH: usize = 258;
@@ -91,8 +89,8 @@ pub struct BulkBlockResult {
 /// stream. Owns the two decoder structs PLUS the code-length scratch
 /// arrays that would otherwise be `vec![0u8; N]` per block.
 pub struct DecoderScratch {
-    pub litlen: IsalLitLenCodePure,
-    pub dist: IsalDistCodePure,
+    pub litlen: LutLitLenCode,
+    pub dist: LutDistCode,
     dist_lens: [u8; 32],
     cl_lens: [u8; 19],
     all_lens: [u8; LIT_LEN + 30],
@@ -101,8 +99,8 @@ pub struct DecoderScratch {
 impl DecoderScratch {
     pub fn new() -> Self {
         Self {
-            litlen: IsalLitLenCodePure::new_empty(),
-            dist: IsalDistCodePure::new_empty(),
+            litlen: LutLitLenCode::new_empty(),
+            dist: LutDistCode::new_empty(),
             dist_lens: [0u8; 32],
             cl_lens: [0u8; 19],
             all_lens: [0u8; LIT_LEN + 30],

@@ -1,7 +1,7 @@
 //! Parallel single-member gzip decompression — rapidgzip-shaped port.
 //!
 //! Production path on x86_64/arm64 with `pure-rust-inflate` when the classifier
-//! returns [`crate::decompress::DecodePath::IsalParallelSM`] (parallel SM
+//! returns [`crate::decompress::DecodePath::ParallelSM`] (parallel SM
 //! enabled and compressed size > `MIN_PARALLEL_COMPRESSED`). Routing lives in
 //! [`crate::decompress::classify_gzip`]; this module never makes its
 //! own routing decisions — every error variant is terminal.
@@ -234,7 +234,7 @@ pub enum ParallelError {
     /// is too short for the parallel pipeline's invariants (e.g. the
     /// classifier sent a stream below `MIN_PARALLEL_SIZE`). Treat as
     /// a routing bug — the dispatcher must have classified this as
-    /// `IsalSingle`, not `IsalParallelSM`.
+    /// `SingleMember`, not `ParallelSM`.
     InvalidGzipFormat,
     /// One or more chunk decodes failed inside the worker pool.
     /// Carries `sm_driver` / `chunk_fetcher` `Debug` detail (e.g.

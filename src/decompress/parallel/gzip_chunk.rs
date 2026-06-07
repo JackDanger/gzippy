@@ -19,7 +19,7 @@ use crate::decompress::parallel::chunk_data::{ChunkConfiguration, ChunkData};
 use crate::decompress::parallel::inflate_wrapper::InflateError;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::inflate_wrapper::{
-    DeflateCompressionType, IsalInflateWrapper, StoppingPoints,
+    DeflateCompressionType, StoppingPoints, StreamingInflateWrapper,
 };
 
 #[derive(Debug)]
@@ -164,8 +164,8 @@ pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 #[cfg(pure_inflate_decode)]
 #[allow(dead_code)]
-fn record_bulk_decline(err: crate::decompress::parallel::isal_lut_bulk::BulkDecodeError) {
-    use crate::decompress::parallel::isal_lut_bulk::BulkDecodeError;
+fn record_bulk_decline(err: crate::decompress::parallel::lut_bulk_inflate::BulkDecodeError) {
+    use crate::decompress::parallel::lut_bulk_inflate::BulkDecodeError;
     use std::sync::atomic::Ordering;
     let c = match err {
         BulkDecodeError::InvalidHuffmanCode => &BULK_DECLINE_INVALID_HUFFMAN,
@@ -376,7 +376,7 @@ fn finish_decode_chunk_impl(
     } else {
         input.len() * 8
     };
-    let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
+    let mut wrapper = StreamingInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
     wrapper.set_window(initial_window)?;
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
@@ -1017,7 +1017,7 @@ fn marker_decode_step(
     marker_decode_step_vendor_block(ctx, data, stop_hint_bits, initial_window, output)
 }
 
-/// Legacy fast-LUT bootstrap (`isal_lut_bulk::MarkerRing`). `GZIPPY_MARKER_RING=1` only.
+/// Legacy fast-LUT bootstrap (`lut_bulk_inflate::MarkerRing`). `GZIPPY_MARKER_RING=1` only.
 #[cfg(parallel_sm)]
 fn marker_decode_step_marker_ring(
     ctx: &mut MarkerDecodeCtx,
@@ -1026,7 +1026,7 @@ fn marker_decode_step_marker_ring(
     initial_window: &[u8],
     output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
 ) -> Result<(MarkerStep, bool), ChunkDecodeError> {
-    use crate::decompress::parallel::isal_lut_bulk::MarkerRing;
+    use crate::decompress::parallel::lut_bulk_inflate::MarkerRing;
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
     use std::cell::RefCell;
 
@@ -1052,7 +1052,7 @@ fn marker_decode_step_marker_ring(
             |block, bits| block.read_header(bits),
             |block, bits, output| block.read(bits, output),
             |e| {
-                use crate::decompress::parallel::isal_lut_bulk::BulkDecodeError;
+                use crate::decompress::parallel::lut_bulk_inflate::BulkDecodeError;
                 use std::sync::atomic::Ordering;
                 match e {
                     BulkDecodeError::InvalidHuffmanCode => {
@@ -1138,7 +1138,7 @@ impl BootstrapEngine for crate::decompress::parallel::marker_inflate::Block {
 }
 
 #[cfg(parallel_sm)]
-impl BootstrapEngine for crate::decompress::parallel::isal_lut_bulk::MarkerRing {
+impl BootstrapEngine for crate::decompress::parallel::lut_bulk_inflate::MarkerRing {
     fn contains_marker_bytes(&self) -> bool {
         self.contains_marker_bytes()
     }
@@ -1419,7 +1419,7 @@ mod tests {
 
     /// MICROBENCH (advisor-prescribed disambiguation): is the ISA-L multi-symbol
     /// bulk-LUT (`decode_block`) actually faster than the single-symbol resumable
-    /// (`ResumableInflate2` via `IsalInflateWrapper`) on THIS code state, over a
+    /// (`ResumableInflate2` via `StreamingInflateWrapper`) on THIS code state, over a
     /// REAL silesia clean span (dynamic Huffman)? The locked-Fulcrum lever says
     /// the clean decode tail is the wall (798ms gzippy vs 305ms rapidgzip, T8);
     /// the FlipToClean tail currently runs 100% through resumable. Only integrate
@@ -1432,8 +1432,10 @@ mod tests {
     #[ignore = "manual perf microbench; needs /tmp/ref_silesia.bin"]
     fn clean_tail_engine_microbench() {
         use crate::decompress::inflate::consume_first_decode::Bits;
-        use crate::decompress::parallel::inflate_wrapper::{IsalInflateWrapper, StoppingPoints};
-        use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+        use crate::decompress::parallel::inflate_wrapper::{
+            StoppingPoints, StreamingInflateWrapper,
+        };
+        use crate::decompress::parallel::lut_bulk_inflate::{decode_block, DecoderScratch};
         use std::time::Instant;
 
         let raw = match std::fs::read("/tmp/ref_silesia.bin") {
@@ -1481,7 +1483,8 @@ mod tests {
         let mut best_res = f64::MAX;
         for _ in 0..iters {
             let mut wrapper =
-                IsalInflateWrapper::with_until_bits(&deflate_mb, 0, deflate_mb.len() * 8).unwrap();
+                StreamingInflateWrapper::with_until_bits(&deflate_mb, 0, deflate_mb.len() * 8)
+                    .unwrap();
             wrapper.set_window(&[]).unwrap();
             let mut out_pos = 0usize;
             let t = Instant::now();
@@ -1509,7 +1512,8 @@ mod tests {
         let mut block_stops = 0u64;
         for it in 0..iters {
             let mut wrapper =
-                IsalInflateWrapper::with_until_bits(&deflate_mb, 0, deflate_mb.len() * 8).unwrap();
+                StreamingInflateWrapper::with_until_bits(&deflate_mb, 0, deflate_mb.len() * 8)
+                    .unwrap();
             wrapper.set_window(&[]).unwrap();
             wrapper.set_stopping_points(
                 StoppingPoints::END_OF_BLOCK
