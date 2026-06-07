@@ -869,6 +869,10 @@ enum MarkerStep {
     /// 32 KiB of clean output reached at a block boundary — FLIP to the u8 clean
     /// tail (vendor setInitialWindow). The clean 32 KiB window is the tail of
     /// `data_with_markers`; the caller decodes the rest as u8 into `chunk.data`.
+    /// Constructed only on the `isal_clean_tail` (gzippy-isal) build; on
+    /// gzippy-native the fold keeps Engine M decoding in-place, so this variant
+    /// is never returned (the match arm stays live for the isal build).
+    #[allow(dead_code)]
     FlipToClean {
         end_bit_offset: usize,
         window_len: usize,
@@ -1186,19 +1190,33 @@ where
         let mut bits = ctx.open_bits(data);
         let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
-        // Vendor GzipChunk.hpp:520-525 — hand off when clean u8 in `data`
-        // reaches 32 KiB (include not-yet-flushed post-flip drains).
+        // Vendor GzipChunk.hpp:520-525 — at 32 KiB of clean u8 the engine
+        // strategy forks by build:
+        //   * gzippy-isal (`isal_clean_tail`): two-phase Design-A handoff —
+        //     return `FlipToClean` so Engine C (`StreamingInflateWrapper`)
+        //     decodes the clean tail from the 32 KiB window. UNCHANGED.
+        //   * gzippy-native (`not(isal_clean_tail)`): FOLD — Engine M
+        //     (`marker_inflate::Block`) keeps decoding this and subsequent
+        //     blocks in-place on the SAME `ctx` cursor. `read()` already drains
+        //     clean u8 directly (marker_inflate.rs:1011 -> push_clean_u8 once
+        //     `contains_marker_bytes()==false`). The loop terminates naturally
+        //     at BFINAL (`Finished`, :1293) or stop_hint (:1222).
+        // `ctx.flipped` is set once so this check fires a single time per chunk.
         if output.clean_appended_len() >= MAX_WINDOW_SIZE && !ctx.flipped {
             ctx.flipped = true;
-            let end_bit_offset = next_block_offset;
-            ctx.current_bit_offset = end_bit_offset;
-            return Ok((
-                MarkerStep::FlipToClean {
-                    end_bit_offset,
-                    window_len: MAX_WINDOW_SIZE,
-                },
-                false,
-            ));
+            #[cfg(isal_clean_tail)]
+            {
+                let end_bit_offset = next_block_offset;
+                ctx.current_bit_offset = end_bit_offset;
+                return Ok((
+                    MarkerStep::FlipToClean {
+                        end_bit_offset,
+                        window_len: MAX_WINDOW_SIZE,
+                    },
+                    false,
+                ));
+            }
+            // gzippy-native: fall through — no handoff, Engine M continues.
         }
 
         let header_res = {
@@ -2092,6 +2110,299 @@ mod isal_tail_parity {
             diverged, 0,
             "ISA-L tail diverged from pure tail on {diverged}/{total} chunk-decodes \
              (see [gate] lines above for the exact field + mechanism)"
+        );
+    }
+}
+
+/// NATIVE fold gate (gzippy-native, `not(isal_clean_tail)`).
+///
+/// Permanent catch for the flip-in-place fold. It drives the REAL production
+/// path — `decode_chunk_window_absent` — on real silesia chunks: Engine M
+/// (`marker_inflate::Block`) emits u16 markers for the early blocks, flips to
+/// clean at 32 KiB, and on native FOLDS (continues decoding in-place to
+/// `Finished` instead of returning `FlipToClean` to Engine C). The chunk's
+/// markers are then resolved against the true predecessor 32 KiB window
+/// (vendor applyWindow) and merged, yielding the chunk's complete payload,
+/// which is asserted byte-for-byte (and CRC) against the INDEPENDENT
+/// whole-member ground-truth decode (`enumerate`). Run for both `until_exact`
+/// true (exact-boundary stop hint) and false (mid-block hint).
+///
+/// The gate also asserts the fold was actually exercised (markers present AND
+/// a clean in-place tail > 32 KiB), and that `final_bit` lands on a real EOB
+/// boundary at-or-past the stop hint.
+///
+/// NOTE on the stop point: Engine M stops at the first block whose header
+/// starts at-or-past stop_hint (the faithful rapidgzip behavior). The pre-fold
+/// two-phase tail (`StreamingInflateWrapper`, kept on `isal_clean_tail`) has an
+/// ISA-L-emulation rewind that can keep/skip one fixed-vs-dynamic block at a
+/// header straddle (gzip_chunk.rs:481-486). That is a *speculative* stop-point
+/// difference only — the consumer reconciles it exactly via `furthest_decoded_
+/// bit` and `block_finder.insert(chunk_end_bit)` (chunk_fetcher.rs:1074, 2663),
+/// so concatenated output is byte-identical either way (proven end-to-end by
+/// the silesia DUAL-SHA gate). Hence this gate asserts correctness against
+/// ground truth, not stop-point equality with the retired two-phase tail.
+#[cfg(all(test, parallel_sm, not(isal_clean_tail)))]
+mod native_fold_parity {
+    use super::*;
+    use crate::decompress::parallel::crc32::crc32 as crc32_of;
+
+    const WINDOW: usize = 32 * 1024;
+
+    struct Boundary {
+        bit: usize,
+        out_off: usize,
+    }
+
+    /// Decode the whole raw-deflate member once with the pure wrapper,
+    /// recording every END_OF_BLOCK boundary (bit = start of next header,
+    /// out_off = decoded bytes just past the finished block).
+    fn enumerate(input: &[u8]) -> (Vec<u8>, Vec<Boundary>) {
+        let mut wrapper =
+            StreamingInflateWrapper::with_until_bits(input, 0, input.len() * 8).expect("init");
+        wrapper.set_window(&[]).expect("empty window");
+        wrapper.set_stopping_points(
+            StoppingPoints::END_OF_BLOCK
+                | StoppingPoints::END_OF_BLOCK_HEADER
+                | StoppingPoints::END_OF_STREAM_HEADER,
+        );
+        let mut decoded: Vec<u8> = Vec::new();
+        let mut bounds: Vec<Boundary> = Vec::new();
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut last_bit = 0usize;
+        loop {
+            let r = wrapper.read_stream(&mut buf).expect("read_stream");
+            decoded.extend_from_slice(&buf[..r.bytes_written]);
+            if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+                bounds.push(Boundary {
+                    bit: r.bit_position,
+                    out_off: decoded.len(),
+                });
+            }
+            if r.finished {
+                break;
+            }
+            if r.bytes_written == 0
+                && r.stopped_at == StoppingPoints::NONE
+                && r.bit_position == last_bit
+            {
+                break;
+            }
+            last_bit = r.bit_position;
+        }
+        (decoded, bounds)
+    }
+
+    /// Result of a folded window-absent chunk decode + marker resolution.
+    struct Folded {
+        /// Fully resolved decoded bytes (markers resolved against `window`,
+        /// then the clean tail) — the chunk's complete payload.
+        full: Vec<u8>,
+        /// Decoded length of the marker (pre-flip) region.
+        markers_len: usize,
+        /// Decoded length of the clean (post-flip, in-place fold) tail.
+        clean_len: usize,
+        /// Bit position where the chunk decode stopped.
+        final_bit: usize,
+    }
+
+    /// THE PRODUCTION FOLD PATH: window-absent decode via
+    /// `decode_chunk_window_absent` (Engine M emits u16 markers for the early
+    /// blocks, flips to clean at 32 KiB, and on native FOLDS — continuing
+    /// in-place to `Finished`). Then resolve the markers against the true
+    /// predecessor `window` and merge into one buffer. This is exactly what a
+    /// real chunk goes through; the only test-supplied input is the known-good
+    /// 32 KiB predecessor window for marker resolution.
+    fn folded_window_absent(
+        input: &[u8],
+        start_bit: usize,
+        stop_hint: usize,
+        window: &[u8],
+    ) -> Folded {
+        assert_eq!(window.len(), WINDOW, "resolution window must be 32 KiB");
+        let cfg = ChunkConfiguration::default();
+        let mut chunk = super::decode_chunk_window_absent(input, start_bit, stop_hint, cfg)
+            .expect("folded window-absent decode");
+        assert_eq!(chunk.data_prefix_len, 0, "unexpected window-image prefix");
+        let final_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        let markers_len = chunk.data_with_markers.len();
+        let clean_len = chunk.data.len();
+        // Resolve the u16 markers against the real predecessor window and fold
+        // them into `data` (vendor applyWindow).
+        chunk.resolve_and_narrow_markers_in_place(window);
+        chunk.merge_resolved_markers_into_data();
+        assert!(
+            chunk.data_with_markers.is_empty(),
+            "markers not consumed by resolve+merge"
+        );
+        let full = chunk.data.to_contiguous();
+        assert_eq!(
+            full.len(),
+            markers_len + clean_len,
+            "resolve length mismatch"
+        );
+        Folded {
+            full,
+            markers_len,
+            clean_len,
+            final_bit,
+        }
+    }
+
+    #[test]
+    fn folded_native_decode_matches_ground_truth_on_real_silesia_chunks() {
+        let gz = std::fs::read("benchmark_data/silesia-gzip.tar.gz")
+            .expect("benchmark_data/silesia-gzip.tar.gz must exist");
+        let hdr =
+            crate::decompress::parallel::single_member::skip_gzip_header(&gz).expect("gzip header");
+        let input = &gz[hdr..gz.len() - 8];
+
+        let (decoded, bounds) = enumerate(input);
+        assert!(
+            bounds.len() > 40,
+            "need many real deflate boundaries, got {}",
+            bounds.len()
+        );
+        eprintln!(
+            "[fold-gate] raw deflate {} bytes -> {} decoded bytes, {} EOB boundaries",
+            input.len(),
+            decoded.len(),
+            bounds.len()
+        );
+
+        // Large spans (K blocks) so a chunk has room to accumulate 32 KiB of
+        // contiguous clean output and FLIP — the fold branch under test. Note
+        // markers propagate forward via long-range copies of pre-resolution
+        // markers, so not every chunk flips (data-dependent); we sample many
+        // starts and REQUIRE a healthy number of flips below.
+        const K: usize = 24;
+        let n = bounds.len();
+        let mut starts: Vec<usize> = Vec::new();
+        for f in 1..=16usize {
+            let idx = (n * f) / 17;
+            if idx >= 1 && idx + K + 1 < n {
+                starts.push(idx);
+            }
+        }
+        starts.dedup();
+        assert!(!starts.is_empty(), "no usable chunk starts");
+
+        // Set of every legal EOB bit position, so a final_bit can be checked
+        // for landing on a real block boundary (not mid-block).
+        let boundary_bits: std::collections::HashSet<usize> =
+            bounds.iter().map(|b| b.bit).collect();
+
+        let mut total = 0usize;
+        let mut diverged = 0usize;
+        let mut flips = 0usize;
+
+        for &si in &starts {
+            for until_exact in [false, true] {
+                let start_b = &bounds[si];
+                let start_bit = start_b.bit;
+                let start_off = start_b.out_off;
+                let win_lo = start_off.saturating_sub(WINDOW);
+                if start_off - win_lo != WINDOW {
+                    // Need a full 32 KiB window for Engine M priming.
+                    continue;
+                }
+                let window = &decoded[win_lo..start_off];
+
+                let stop_hint = if until_exact {
+                    bounds[si + K].bit
+                } else {
+                    let a = bounds[si + K - 1].bit;
+                    let b = bounds[si + K].bit;
+                    a + (b - a) / 2
+                };
+
+                total += 1;
+                let label = format!(
+                    "start_idx={si} start_bit={start_bit} stop_hint={stop_hint} \
+                     until_exact={until_exact}"
+                );
+
+                let f = folded_window_absent(input, start_bit, stop_hint, window);
+
+                // GROUND TRUTH: the folded chunk's fully-resolved payload must
+                // equal exactly what the independent whole-member decode
+                // produced for the same span [start_off, start_off+len). This
+                // holds whether or not the chunk flipped.
+                let truth = &decoded[start_off..start_off + f.full.len()];
+                let bytes_ok = f.full == truth;
+                // CRC of resolved output == CRC of ground truth (superset of the
+                // per-chunk CRC check; equal-by-construction when bytes match,
+                // but asserted explicitly to satisfy the gate contract).
+                let crc_ok = crc32_of(&f.full) == crc32_of(truth);
+                // final_bit must land on a real EOB boundary, at/after the stop
+                // hint (Engine M stops at first block-start >= hint).
+                let bit_ok = boundary_bits.contains(&f.final_bit) && f.final_bit >= stop_hint;
+                // Did this chunk exercise the FOLD branch? (>32 KiB clean tail
+                // means it flipped and Engine M continued in-place.)
+                let flipped = f.clean_len > WINDOW;
+                if flipped {
+                    flips += 1;
+                }
+
+                let ok = bytes_ok && crc_ok && bit_ok;
+
+                if ok {
+                    eprintln!(
+                        "[fold-gate] OK ({label}): full_len={} markers={} clean_tail={} \
+                         final_bit={} flipped={} crc={:#010x}",
+                        f.full.len(),
+                        f.markers_len,
+                        f.clean_len,
+                        f.final_bit,
+                        flipped,
+                        crc32_of(&f.full)
+                    );
+                } else {
+                    diverged += 1;
+                    eprintln!("[fold-gate] DIVERGE ({label}): flipped={flipped}");
+                    eprintln!(
+                        "    bytes vs truth : {}",
+                        if bytes_ok {
+                            "match".into()
+                        } else {
+                            format!(
+                                "CORRUPT (full {} bytes; first diff at {:?})",
+                                f.full.len(),
+                                f.full.iter().zip(truth.iter()).position(|(x, y)| x != y)
+                            )
+                        }
+                    );
+                    eprintln!("    crc            : {}", if crc_ok { "ok" } else { "BAD" });
+                    eprintln!(
+                        "    final_bit      : {} (on_boundary={}, >=hint={})",
+                        f.final_bit,
+                        boundary_bits.contains(&f.final_bit),
+                        f.final_bit >= stop_hint
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "[fold-gate] SUMMARY: {} chunk-decodes, {} correct, {} diverged, {} FLIPPED \
+             (exercised the fold branch)",
+            total,
+            total - diverged,
+            diverged,
+            flips
+        );
+        assert!(total > 0, "fold gate ran zero comparisons");
+        assert_eq!(
+            diverged, 0,
+            "FOLDED native decode produced incorrect output vs ground truth on \
+             {diverged}/{total} chunk-decodes (see [fold-gate] lines)"
+        );
+        // The whole point is the FOLD branch; require it was actually taken on a
+        // meaningful number of real chunks (else the gate proves nothing about
+        // Engine M continuing in-place past the 32 KiB flip).
+        assert!(
+            flips >= 3,
+            "fold branch exercised on only {flips}/{total} chunks — too few to \
+             trust the gate; widen K or the start sampling"
         );
     }
 }
