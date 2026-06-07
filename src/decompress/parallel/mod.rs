@@ -56,6 +56,10 @@ pub mod replace_markers;
 pub mod rfc_tables;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;
+/// CLEAN-ONLY ENGINE ORACLE — force every chunk through the clean decode path
+/// via captured predecessor windows (campaign instrument). See `seed_windows.rs`.
+#[cfg(parallel_sm)]
+pub mod seed_windows;
 pub mod segmented_buffer;
 #[cfg(parallel_sm)]
 pub mod segmented_markers;
