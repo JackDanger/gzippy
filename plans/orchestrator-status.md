@@ -533,3 +533,25 @@ interleaved best-of-9). Both arms byte-exact (sha e114dd2b... == gzip ref) via p
   TIE verdict (median not best-of-N), (3) the redirect from per-symbol-ALU grafts to the cache/MPKI
   surface. If corroborated, PHASE 3's 3-way Fulcrum should center on RSS/working-set/MPKI (the
   mandate), with the BMI2/LUT/refill graft recorded as rejected-with-mechanism (no work spent).
+
+### MILESTONE RESIDUAL — DONE [committed 6388e0b] seam stop-point reconciliation assertion
+- native_fold_parity now asserts the consumer-level STOP-POINT seam reconciliation IN-FILE (the
+  advisor residual). Decodes a SECOND folded chunk at the first chunk's final_bit (windowed by the
+  first's resolved tail) and asserts byte-continuity from the seam offset. 32 seams checked, all
+  byte-continuous; 32/32 chunks correct, 12 flipped. Test-only (not(isal_clean_tail)); native sha
+  028bd002...cb410f unchanged. A future graft now can't regress the seam silently.
+
+### STRETCH STATUS / NEXT (pending advisor corroboration of the BMI2 rejection)
+- DONE: falsifier pre-registered; ceiling BOUNDED by byte-exact A/B (NOT extrapolated) — BMI2 lever
+  (a) rejected w/ mechanism (TIE; already-on; memory-bound wall); (b)/(c) already present +
+  same-mechanism-covered. Guest routing assert fixed for the rename. Milestone seam residual closed.
+- PENDING SUPERVISOR ADVISOR: corroborate (1) BMI2-already-on, (2) median-TIE verdict, (3) redirect
+  to cache/MPKI. The graft step (charter item 2) is ANSWERED by the ceiling-bound: there is NO
+  per-symbol-ALU wall to graft into on the perf build; spending the stretch on BMI2/LUT/refill would
+  violate "bound the ceiling before committing" — the bound says no-op.
+- PROPOSED NEXT (if corroborated): pivot to the cache mandate the wall lives in — (i) re-hook the
+  byte-accounting instrument to the NATIVE per-thread working set (BOOTSTRAP_BLOCK / Block.output_ring
+  128KiB u16 ring; the staged_bits hook is dead post-fold), validate via GZIPPY_MEM_BALLAST_MIB
+  positive control; (ii) PHASE 3 3-way locked Fulcrum reporting wall + RSS + per-thread working-set +
+  L2/L3 MPKI to locate rapidgzip's real advantage (window-apply / ring layout / copy = cache surface,
+  NOT inner ALU); (iii) gzippy-isal Design-A tail before PHASE 3 per the charter sequence.
