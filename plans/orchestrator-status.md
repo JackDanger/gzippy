@@ -867,3 +867,98 @@ silesia-large 503MB, T8 (guest 199, locked, sha e114dd2b…):
 NEXT: spawn ONE independent disproof advisor (read-only) → plans/step-a2-advisor-verdict.md to
 attack the oracle's validity (engine isolated? publish-chain preserved? ramp consistent?), then
 STOP for supervisor gate.
+
+## TIER-2 STEP C — REVISED DESIGN [DONE 2026-06-07, STEP-C leader, fresh instance]
+CHARTER plans/step-c-revised-design.md. TIER-2 PROVE complete; this synthesizes the proven
+ceilings into the revised TIER-1 design (the TIER-3 gate). HEAD b8a38e64. No guest measurement
+run this turn (design synthesis + read-only subagents only); no host state touched.
+
+### DELIVERABLE — plans/tier1-design-v2.md (the revised single coherent architecture)
+- §1 PLACEMENT (faithful port): read-only subagent mapped rapidgzip's 5 scheduler mechanisms
+  to gzippy two-column, source-cited (/tmp/scheduler-vendor-map.md). FINDING: 3 already FAITHFUL
+  (prefetch strategy, window propagation, consumer-overlap join), 1 PORTED-BUT-DEFEATED
+  (confirmed-boundary dispatch), 1 MISSING = the prime defect: INTERIOR/SUBCHUNK REUSE
+  (getIndexedChunk, vendor GzipChunkFetcher.hpp:254-309). gzippy BUILDS unsplit_blocks
+  (chunk_fetcher.rs:2752) + block_map.find_data_offset (block_map.rs:135) but NEVER READS them.
+  Corrects a STALE memory note: matches_encoded_offset IS a range check (chunk_data.rs:461-469),
+  not == equality — the blocker is missing interior-EMIT, not the accept predicate.
+- §2 ENGINE (inner-loop open territory): E1 u8-direct clean write (the 1b sub-lever, low-risk
+  first), E2 wide SIMD back-ref copy, E3 packed multi-literal store (ca52389 non-binding), E4
+  wide refill — each isolation-benchmarked vs an in-bench ISA-L positive control (guest ratio,
+  NOT Frankensystem absolutes) BEFORE integration. Governing-tension resolution STANDS: one
+  no-FFI engine, inner loop reimplemented igzip-class; inner-loop divergence accepted, arch
+  faithful (needs supervisor ratification).
+- §3 REACHABILITY (coupled, not additive): placement-alone ⇒ ~0.61s (A.2 MEASURED, not rescaled);
+  placement+engine-at-igzip-class ⇒ decode stops binding, wall ⇒ shared pipeline floor.
+- §4 STRUCTURE mandate sequenced; §5 TIER-3 sequence; §6 checkpoint.
+
+### INDEPENDENT DISPROOF ADVISOR [DONE] → plans/step-c-design-advisor-verdict.md
+VERDICT: ratify the METHOD, not the CONCLUSION. All 3 targets CORROBORATE-WITH-CAVEATS:
+- §3: coupled-not-additive is sound + double-count-free; 0.61s is measured. BUT the 0.61→0.54
+  "TIE" step assumes gzippy's NON-decode floor = rg 0.54s — contradicted by a MEASURED ~225ms
+  consumer-serial term + 0.497s consumer block (neither shrinks with engine speed). Read §3 as
+  ≥0.54s, plausibly 0.54-0.62s, TIE only at the optimistic edge.
+- §1: range-check correction right + Subchunk.decoded_offset exists; BUT "just wire dead code"
+  too glib — find_data_offset is DECODED-BYTE-keyed for a consumer gzippy doesn't have (gzippy
+  is encoded-BIT-keyed), unsplit_blocks only built for subchunks>1, AND the parent-cached
+  precondition was MEASURED TO FAIL (318ms lag → eviction) + left as an UNANSWERED discriminator.
+- §2: E1/E3 genuinely unbuilt (re-attempt justified); guest-ratio ISA-L control is a sound ENGINE
+  gate; BUT 2.1× pure-decoder ceiling is a hard headwind + the bench gates engine, not wall.
+- BOTTOM LINE: safe to authorize TIER-3 as a MEASUREMENT-GATED INVESTIGATION; do NOT ratify the
+  headline "1.0× tie reachable." ONE thing most likely to break it: gzippy's non-decode
+  consumer-serial floor is structurally higher than rg's. Add a 3rd pre-registered measurement
+  (decompose the 0.61s consumer block into decode-wait vs serial) BEFORE the engine build.
+
+### CAVEATS FOLDED BACK INTO plans/tier1-design-v2.md (design ⇄ verdict now consistent)
+- §1.2: added THREE port pre-conditions (coordinate-system mismatch; single-subchunk map gap;
+  parent-cached discriminator — answer FIRST). The faithful port is getIndexedChunk's LOGIC in
+  gzippy's encoded-bit offset space, NOT changing the consumer request model (that = forbidden
+  redesign).
+- §3: added the NON-DECODE FLOOR caveat (≥0.54s) + the OWED THIRD MEASUREMENT (consumer-block
+  decompose). Verdict now: tie reachable CONDITIONAL on TWO floors (engine ≤39-45ms AND
+  non-decode floor ≤0.54s); else add a 4th off-critical-path consumer lever or revisit the bar.
+- §5: added SEQUENCE step 0 = the two cheap byte-exact discriminators (parent-cached probe +
+  consumer-block decompose) run FIRST, before any port/build.
+
+### CHECKPOINT REACHED — STOP for supervisor ratification (TIER-3 gate). NO TIER-3 started.
+Subagents (vendor map + advisor) were READ-ONLY, synchronous, collected in-turn; both process
+trees explicitly killed (no orphans). No guest run, no host state change, no build this turn.
+Supervisor to ratify: (1) the method + sequence; (2) the governing-tension resolution (§2.1);
+(3) that TIER-3 is authorized as a measurement-gated investigation (not a ratified tie claim),
+with step-0 discriminators run before the placement port and before the engine build.
+
+## TIER-3 STEP 0 — TWO DISCRIMINATORS [IN PROGRESS 2026-06-07, STEP-0 leader, fresh instance]
+CHARTER plans/tier3-step0-authorization.md. STEP 0 ONLY (two cheap discriminators); NO placement
+port, NO engine work. HEAD b8a38e64. Falsifiers PRE-REGISTERED BEFORE any run:
+plans/step0-discriminator-a-falsifier.md (parent-cached) + plans/step0-discriminator-b-falsifier.md
+(consumer-block decompose + HARD ESCALATION GATE >0.54s).
+Guest 199 verified idle (load 0.51 falling, no stray procs, /dev/shm only stale debug files,
+no_turbo=0 = unlocked). Leader-lock: none held (supervisor enforces singleton; NO sleep sentinel
+per the 2026-06-06 23:24 lock-hygiene note). Disk 30Gi free (94%) — watching df around builds.
+
+### DISCRIMINATOR (b) — CONSUMER-BLOCK DECOMPOSE [PRELIMINARY from existing A.2 trace] → PASS (floor ≈18ms ≪ 0.54s)
+Instrument: scripts/bench/consumer_block_decompose.py — per-span SELF-time on the consumer tid
+(tid=1) with no-double-count (nested children subtracted, CLAUDE.md rule 8). WAIT vs SERIAL
+classification done by READING THE SOURCE (not guessing): blocking-wait spans are
+wait.block_fetcher_get / wait.future_recv / ttp.rx_recv_block (block_fetcher.rs:247 rx.recv_timeout
+pump) / consumer.dispatch_recv (chunk_fetcher.rs:3051 rx.recv()); everything else = serial CPU.
+- PHANTOM-LEVER CAUGHT: a first (wrong) classification with only {block_fetcher_get, future_recv}
+  in the wait set put NORMAL-path SERIAL at 0.515s — but ttp.rx_recv_block (0.26s) + dispatch_recv
+  (0.19s) are BLOCKING WAITS, not CPU. The advisor's "~225ms consumer-serial" is this same
+  misattribution: those spans are decode-wait, not bookkeeping. Source-read dissolved it.
+- Operating point = the A.2 CLEAN-ONLY oracle trace (trace_seed_T8.json, GZIPPY_SEED_WINDOWS,
+  every chunk clean at a confirmed boundary = the placement-PERFECT operating point §3 prices the
+  0.61s consumer block at). Conservation PASSES (sum-self vs wall gap 0.46%).
+  | trace | consumer_wall | DECODE-WAIT | SERIAL-BOOKKEEPING (the floor) |
+  |---|---|---|---|
+  | clean-only (placement-perfect) | 0.506s | 0.489s (96.5%) | **0.0178s (3.5%)** |
+  | normal (marker baseline)       | 1.048s | 0.979s (93.4%) | 0.069s (6.6%) |
+- VERDICT (preliminary): non-decode SERIAL floor ≈ 0.018s ≪ 0.54s ⇒ HARD GATE PASSES with a
+  huge margin; the consumer does NOT structurally forbid the tie. STILL OWED before final:
+  the SLOW-knob positive control (decode slow-injection must inflate DECODE-WAIT while SERIAL
+  stays flat — pre-registered) + N≥7 robustness, from a fresh locked guest run.
+
+### DISCRIMINATOR (a) — PARENT-CACHED-AT-STALL [building probe]
+Needs a small byte-exact env-gated probe (GZIPPY_STALL_RESIDENCY_PROBE) at the cold-get stall
+site (chunk_fetcher.rs:1342) classifying the CONTAINING chunk's residency. Building next; will
+run on the guest in the SAME locked session as (b)'s positive control.
