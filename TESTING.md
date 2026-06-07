@@ -91,7 +91,7 @@ Runs after the host has locked + gated. Enforces provenance-or-no-numbers:
 1. Provenance gate — aborts if the working tree is dirty (gzippy's own tracked files + submodule pointers; edits inside vendor submodules like the rapidgzip trace patch are ignored via --ignore-submodules=dirty, but the exact submodule commit
 is recorded). --allow-dirty overrides but forces RUN_TRUSTWORTHY=false.
 2. Build the production binary: cargo build --release --no-default-features --features pure-rust-inflate (the pure-Rust inflate as the sole decode path).
-3. Assert routing: GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c -p 8 ... must print path=IsalParallelSM, else abort. (GZIPPY_FORCE_PARALLEL_SM=1 forces the parallel-SM engine at every thread count.)
+3. Assert routing: GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c -p 8 ... must print path=ParallelSM, else abort. (GZIPPY_FORCE_PARALLEL_SM=1 forces the parallel-SM engine at every thread count.)
 4. Reference sha: gzip -dc corpus | sha256sum is the correctness oracle; corpus prewarmed into page cache.
 5. Interleaved engine: per thread count, each iteration runs gzippy-baseline, gzippy-ORACLE, then rapidgzip back-to-back (so all three see identical per-trial contention; the ratio is jitter-immune). taskset pins to physical P-cores:
 T4=0,2,4,6, T8=0,2,4,6,8,10,12,14 (1 thread/P-core, the "headline cell"), T16=0-15 (SMT/oversubscribed). Iteration 0 is dropped (warmup), output to /dev/null, every run's sha must match the gzip(1) reference — one divergence makes the whole

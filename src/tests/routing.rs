@@ -650,7 +650,7 @@ mod tests {
     // =========================================================================
     // Unified-decoder routing trap — paired with `UNIFIED_INFLATE_RUNS`.
     //
-    // Phase 2 of `plans/unified-decoder.md` switches `IsalInflateWrapper`
+    // Phase 2 of `plans/unified-decoder.md` switches `StreamingInflateWrapper`
     // (the parallel-SM chunk decoder) from `ResumableInflate2` to
     // `Inflate<Clean, Generic, Streaming>`. Every chunk `read_stream` on
     // the production path now passes through the unified surface and
@@ -1471,7 +1471,7 @@ mod tests {
         assert!(
             matches!(
                 path,
-                DecodePath::IsalParallelSM
+                DecodePath::ParallelSM
                     | DecodePath::StoredParallel
                     | DecodePath::StreamingSingle
                     | DecodePath::LibdeflateSingle

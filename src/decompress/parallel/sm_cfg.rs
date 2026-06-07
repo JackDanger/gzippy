@@ -21,6 +21,6 @@ pub const PURE_RUST_INFLATE_DECODE: bool = cfg!(pure_inflate_decode);
 /// The `parallel_sm` cfg is emitted by `build.rs::emit_parallel_sm_cfgs` and is
 /// true when EITHER `x86_64 + (isal-compression | pure-rust-inflate)` OR
 /// `aarch64 + pure-rust-inflate`. arm64 always uses the pure-Rust inner decoder
-/// (ISA-L's C library is x86-only); see `inflate_wrapper::IsalInflateWrapper`'s
+/// (ISA-L's C library is x86-only); see `inflate_wrapper::StreamingInflateWrapper`'s
 /// `#[cfg(pure_inflate_decode)]` backend.
 pub const PARALLEL_SM: bool = cfg!(parallel_sm);

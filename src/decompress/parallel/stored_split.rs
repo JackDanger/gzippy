@@ -23,7 +23,7 @@
 //!   * Stored prefix + Huffman tail (the real `random100.gz`: ~65% stored then
 //!     a dynamic-Huffman tail): the prefix is parallel-copied; the tail — which
 //!     has no explicit length — is decoded sequentially by the ISA-L bulk
-//!     decoder (`isal_lut_bulk`). The sequential tail is an Amdahl ceiling:
+//!     decoder (`lut_bulk_inflate`). The sequential tail is an Amdahl ceiling:
 //!     measured random100 p8 +12% vs libdeflate, ~0.77× rapidgzip (the
 //!     un-parallelised Huffman tail is the remaining gap; parallelising it
 //!     needs the window-map machinery the speculative pipeline already has).
@@ -31,7 +31,7 @@
 //! Safety contract (correctness is sacred — see CLAUDE.md Rule 4 / Rule 5):
 //!   * The stored-chain walk is byte-exact: every stored block's extent comes
 //!     from its explicit `LEN`, never a guess. The Huffman tail is decoded by
-//!     the proven `isal_lut_bulk` per-block decoder into the SAME output buffer
+//!     the proven `lut_bulk_inflate` per-block decoder into the SAME output buffer
 //!     so its back-references resolve directly against the materialised prefix
 //!     (no separate 32 KiB window). On targets without that bulk decoder
 //!     (non-x86 / no isal-pure-rust) a Huffman tail makes us return
@@ -378,7 +378,7 @@ fn decode_with_huffman_tail<W: Write>(
         });
     }
 
-    // The ISA-L bulk per-block decoder (`isal_lut_bulk`) is available exactly
+    // The ISA-L bulk per-block decoder (`lut_bulk_inflate`) is available exactly
     // when the `parallel_sm` cfg is set (x86_64 + isal/pure-rust, OR aarch64 +
     // pure-rust). Where it is not, decline so the safe one-shot path decodes the
     // whole stream — same bytes, just not parallel.
@@ -557,7 +557,7 @@ fn decode_tail_into(
     pred: &[u8],
 ) -> Result<(usize, u32), StoredSplitError> {
     use crate::decompress::inflate::consume_first_decode::Bits;
-    use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+    use crate::decompress::parallel::lut_bulk_inflate::{decode_block, DecoderScratch};
 
     let mut bits = Bits::new(tail);
     let mut out_pos = 0usize;
@@ -587,7 +587,7 @@ fn decode_tail_blocks(
     start: usize,
 ) -> Result<(), StoredSplitError> {
     use crate::decompress::inflate::consume_first_decode::Bits;
-    use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+    use crate::decompress::parallel::lut_bulk_inflate::{decode_block, DecoderScratch};
 
     let mut bits = Bits::new(tail);
     let mut out_pos = start;

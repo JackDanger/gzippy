@@ -39,7 +39,7 @@
 // only by the unit tests below or by configuration-gated callers.
 
 /// Vendor `m_buffer` capacity at `gzip/isal.hpp:207` (`std::array<char, 128_Ki>`).
-#[allow(dead_code)] // used by the x86_64+isal-compression IsalInflateWrapper
+#[allow(dead_code)] // used by the x86_64+isal-compression StreamingInflateWrapper
 const STAGING_BUFFER_BYTES: usize = 128 * 1024;
 
 /// Bit-flag set matching the patched ISA-L's `ISAL_STOPPING_POINT_*`
@@ -151,7 +151,7 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
 // route stays live.
 
 #[cfg(pure_inflate_decode)]
-pub struct IsalInflateWrapper<'a> {
+pub struct StreamingInflateWrapper<'a> {
     inner: crate::decompress::inflate::unified::Inflate<
         'a,
         crate::decompress::inflate::unified::Clean,
@@ -161,7 +161,7 @@ pub struct IsalInflateWrapper<'a> {
 }
 
 #[cfg(pure_inflate_decode)]
-impl<'a> IsalInflateWrapper<'a> {
+impl<'a> StreamingInflateWrapper<'a> {
     #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self, InflateError> {
         Self::with_until_bits(input, bit_offset, input.len() * 8)
@@ -337,12 +337,12 @@ impl<'a> IsalInflateWrapper<'a> {
 
 // On non-x86_64 / no parallel-SM feature builds, the wrapper is unavailable.
 #[cfg(not(parallel_sm))]
-pub struct IsalInflateWrapper<'a> {
+pub struct StreamingInflateWrapper<'a> {
     _phantom: std::marker::PhantomData<&'a [u8]>,
 }
 
 #[cfg(not(parallel_sm))]
-impl<'a> IsalInflateWrapper<'a> {
+impl<'a> StreamingInflateWrapper<'a> {
     pub fn new(_input: &'a [u8], _bit_offset: usize) -> Result<Self, InflateError> {
         Err(InflateError::UnsupportedPlatform)
     }
@@ -442,7 +442,7 @@ mod tests {
     fn round_trip_decode_no_stopping_points() {
         let payload = b"hello world hello world hello world".repeat(1000);
         let deflate = make_deflate(&payload);
-        let mut wrapper = IsalInflateWrapper::new(&deflate, 0).expect("init");
+        let mut wrapper = StreamingInflateWrapper::new(&deflate, 0).expect("init");
         wrapper.set_window(&[]).expect("set_window with empty dict");
         let mut output = vec![0u8; payload.len() + 1024];
         let mut total = 0usize;
@@ -466,7 +466,7 @@ mod tests {
     fn stopping_at_end_of_block_records_a_bit_position() {
         let payload = vec![b'x'; 200_000];
         let deflate = make_deflate(&payload);
-        let mut wrapper = IsalInflateWrapper::new(&deflate, 0).expect("init");
+        let mut wrapper = StreamingInflateWrapper::new(&deflate, 0).expect("init");
         wrapper.set_window(&[]).expect("set_window");
         wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK);
         let mut output = vec![0u8; payload.len() + 1024];
@@ -502,7 +502,7 @@ mod tests {
     fn tell_compressed_matches_input_length_at_end() {
         let payload = b"abc".repeat(10_000);
         let deflate = make_deflate(&payload);
-        let mut wrapper = IsalInflateWrapper::new(&deflate, 0).expect("init");
+        let mut wrapper = StreamingInflateWrapper::new(&deflate, 0).expect("init");
         wrapper.set_window(&[]).expect("set_window");
         let mut output = vec![0u8; payload.len() + 1024];
         let mut total = 0usize;
@@ -553,7 +553,7 @@ mod tests {
         // END_OF_BLOCK stops and recording bit_position at each stop.
         let mut block_ends: Vec<usize> = Vec::new();
         {
-            let mut probe = IsalInflateWrapper::new(&deflate, 0).expect("probe init");
+            let mut probe = StreamingInflateWrapper::new(&deflate, 0).expect("probe init");
             probe.set_window(&[]).expect("probe set_window");
             probe.set_stopping_points(StoppingPoints::END_OF_BLOCK);
             let mut buf = vec![0u8; payload.len() + 1024];
@@ -583,7 +583,7 @@ mod tests {
         let idx_choices = [0usize, block_ends.len() / 2, block_ends.len() - 1];
         for &i in &idx_choices {
             let until = block_ends[i];
-            let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, until)
+            let mut w = StreamingInflateWrapper::with_until_bits(&deflate, 0, until)
                 .expect("with_until_bits init");
             w.set_window(&[]).expect("set_window");
             let mut buf = vec![0u8; payload.len() + 1024];
@@ -634,7 +634,7 @@ mod tests {
     fn with_until_bits_zero_cap_decodes_nothing() {
         let payload = b"abcdefg".repeat(1000);
         let deflate = make_deflate(&payload);
-        let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, 0).expect("init");
+        let mut w = StreamingInflateWrapper::with_until_bits(&deflate, 0, 0).expect("init");
         w.set_window(&[]).expect("set_window");
         let mut buf = vec![0u8; 4096];
         let r = w.read_stream(&mut buf).expect("read_stream");
@@ -650,7 +650,8 @@ mod tests {
         let deflate = make_deflate(&payload);
         let read_cap = deflate.len() * 8;
 
-        let mut wrapper = IsalInflateWrapper::with_until_bits(&deflate, 0, read_cap).expect("init");
+        let mut wrapper =
+            StreamingInflateWrapper::with_until_bits(&deflate, 0, read_cap).expect("init");
         wrapper.set_window(&[]).expect("set_window");
         wrapper.set_stopping_points(
             StoppingPoints::END_OF_BLOCK
@@ -698,7 +699,8 @@ mod tests {
         let deflate = make_deflate(&payload);
         let read_cap = deflate.len() * 8;
 
-        let mut wrapper = IsalInflateWrapper::with_until_bits(&deflate, 0, read_cap).expect("init");
+        let mut wrapper =
+            StreamingInflateWrapper::with_until_bits(&deflate, 0, read_cap).expect("init");
         wrapper.set_window(&[]).expect("set_window");
         wrapper.set_stopping_points(
             StoppingPoints::END_OF_BLOCK
@@ -750,7 +752,7 @@ mod tests {
 
         let mut block_ends: Vec<usize> = Vec::new();
         {
-            let mut probe = IsalInflateWrapper::new(&deflate, 0).expect("probe");
+            let mut probe = StreamingInflateWrapper::new(&deflate, 0).expect("probe");
             probe.set_window(&[]).expect("set_window");
             probe.set_stopping_points(StoppingPoints::END_OF_BLOCK);
             let mut buf = vec![0u8; payload.len() + 1024];
@@ -780,7 +782,7 @@ mod tests {
         let mut n1 = 0usize;
         {
             let mut first =
-                IsalInflateWrapper::with_until_bits(&deflate, 0, resume_at).expect("init");
+                StreamingInflateWrapper::with_until_bits(&deflate, 0, resume_at).expect("init");
             first.set_window(&[]).expect("set_window");
             first.set_stopping_points(StoppingPoints::END_OF_BLOCK);
             loop {
@@ -801,7 +803,7 @@ mod tests {
         let window = &out1[window_start..n1];
 
         let mut second =
-            IsalInflateWrapper::with_until_bits(&deflate, resume_at, deflate.len() * 8)
+            StreamingInflateWrapper::with_until_bits(&deflate, resume_at, deflate.len() * 8)
                 .expect("resume init");
         second.set_window(window).expect("set_window");
         let mut out2 = vec![0u8; payload.len()];
@@ -839,7 +841,7 @@ mod tests {
         use crate::decompress::inflate::stopping_point::StoppingPoint;
 
         fn collect_block_ends(deflate: &[u8]) -> Vec<usize> {
-            let mut probe = IsalInflateWrapper::new(deflate, 0).expect("probe");
+            let mut probe = StreamingInflateWrapper::new(deflate, 0).expect("probe");
             probe.set_window(&[]).expect("set_window");
             probe.set_stopping_points(StoppingPoints::END_OF_BLOCK);
             let mut buf = vec![0u8; deflate.len() * 16];
@@ -869,8 +871,8 @@ mod tests {
             window: &[u8],
             stop: StoppingPoints,
         ) -> ReadStreamResult {
-            let mut w =
-                IsalInflateWrapper::with_until_bits(deflate, bit_offset, until_bits).expect("isal");
+            let mut w = StreamingInflateWrapper::with_until_bits(deflate, bit_offset, until_bits)
+                .expect("streaming");
             w.set_window(window).expect("window");
             w.set_stopping_points(stop);
             let mut buf = vec![0u8; deflate.len() * 16];
@@ -945,7 +947,8 @@ mod tests {
 
             let mut prefix = vec![0u8; payload.len()];
             {
-                let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, resume_at).unwrap();
+                let mut w =
+                    StreamingInflateWrapper::with_until_bits(&deflate, 0, resume_at).unwrap();
                 w.set_window(&[]).unwrap();
                 let r = w.read_stream(&mut prefix).unwrap();
                 prefix.truncate(r.bytes_written);
@@ -1012,7 +1015,7 @@ mod tests {
         // events are guaranteed.
         let payload = vec![b'x'; 200_000];
         let deflate = make_multi_block_deflate(&payload);
-        let mut wrapper = IsalInflateWrapper::new(&deflate, 0).expect("init");
+        let mut wrapper = StreamingInflateWrapper::new(&deflate, 0).expect("init");
         wrapper.set_window(&[]).expect("window");
         wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK);
 
@@ -1070,7 +1073,7 @@ mod tests {
         // remaining input is < 8 bytes → Internal(-1).
         let payload = b"hello world".repeat(8);
         let deflate = make_deflate(&payload);
-        let mut wrapper = IsalInflateWrapper::new(&deflate, 0).expect("init");
+        let mut wrapper = StreamingInflateWrapper::new(&deflate, 0).expect("init");
         wrapper.set_window(&[]).expect("window");
         let mut out = vec![0u8; payload.len() + 1024];
         let mut total = 0;

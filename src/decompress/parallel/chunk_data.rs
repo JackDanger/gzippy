@@ -166,7 +166,7 @@ pub struct ChunkData {
     // `chunk_buffer_pool::{take,return}_std_u16` retained pool.
     pub data_with_markers: SegmentedU16,
     /// Clean byte suffix. All bytes here were decoded with a known
-    /// window (set via IsalInflateWrapper::set_window) so no markers
+    /// window (set via StreamingInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
     ///
     /// CONTIGUOUS (2026-06-04): the clean decoded bytes live in ONE
@@ -717,7 +717,7 @@ impl ChunkData {
     }
 
     /// Append clean output that arrives as u16 ring values from a
-    /// post-flip [`MarkerRing`](crate::decompress::parallel::isal_lut_bulk::MarkerRing)
+    /// post-flip [`MarkerRing`](crate::decompress::parallel::lut_bulk_inflate::MarkerRing)
     /// drain. After the flip (`!contains_marker_bytes()`) every value is
     /// guaranteed `< 256`, so narrowing to u8 is lossless — this is the
     /// unified-decoder analogue of [`append_clean`] for the merged clean

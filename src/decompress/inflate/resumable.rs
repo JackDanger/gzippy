@@ -14,7 +14,7 @@
 //! sequential decompress) run a block to completion in one shot and
 //! pay no yield-check tax; this module's resumable variants exist
 //! ONLY for `ResumableInflate2` and, via
-//! [`crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper`],
+//! [`crate::decompress::parallel::inflate_wrapper::StreamingInflateWrapper`],
 //! the parallel-SM hot path.
 //!
 //! Plan progress (`plans/rust-rapidgzip.md §5`): all 7 steps complete.
@@ -1475,7 +1475,7 @@ fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
 /// libdeflate LUT without re-parsing the header.
 ///
 /// `litlen_lens` is sized 288 (RFC 1951 §3.2.6 includes reserved symbols
-/// 286/287 — see the fixed-Huffman fix in `isal_lut_bulk::build_fixed_huffman`).
+/// 286/287 — see the fixed-Huffman fix in `lut_bulk_inflate::build_fixed_huffman`).
 /// `dist_lens` is sized 32 (RFC reserved 30/31).
 /// The caller must zero them; this function only writes the indices
 /// actually parsed from the header.

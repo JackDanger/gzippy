@@ -908,14 +908,14 @@ pub struct DecodedSymbol {
 /// decode body is identical (already pure Rust); the rebuild path uses
 /// pure-rust `set_and_expand_lit_len_huffcode` +
 /// `make_inflate_huff_code_lit_len` instead of ISA-L FFI.
-pub struct IsalLitLenCodePure {
+pub struct LutLitLenCode {
     pub table: Box<InflateHuffCodeLarge>,
     lit_and_dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
     code_list: Box<[u32; LIT_LEN_ELEMS + 2]>,
     valid: bool,
 }
 
-impl IsalLitLenCodePure {
+impl LutLitLenCode {
     pub fn new_empty() -> Self {
         Self {
             table: Box::new(InflateHuffCodeLarge::default()),
@@ -1068,13 +1068,13 @@ impl IsalLitLenCodePure {
 /// LIT_LEN_ELEMS to match the C, which uses the same buffer for both
 /// lit/len and dist phases (the dist phase uses only the first 30
 /// entries — `ISAL_DEF_DIST_SYMBOLS`).
-pub struct IsalDistCodePure {
+pub struct LutDistCode {
     pub table: Box<InflateHuffCodeSmall>,
     dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
     valid: bool,
 }
 
-impl IsalDistCodePure {
+impl LutDistCode {
     pub fn new_empty() -> Self {
         Self {
             table: Box::new(InflateHuffCodeSmall::default()),
@@ -1265,7 +1265,7 @@ mod tests {
     ///
     /// Only runs when BOTH the `isal-compression` and `pure-rust-inflate`
     /// features are enabled (which means ISA-L is linked AND we
-    /// constructed `IsalLitLenCodePure`). Use:
+    /// constructed `LutLitLenCode`). Use:
     ///
     ///     cargo test --release --features isal-compression \
     ///         --features pure-rust-inflate --lib \
@@ -1302,7 +1302,7 @@ mod tests {
             code_lengths[sym] = 8;
         }
 
-        let mut decoder = IsalLitLenCodePure::new_empty();
+        let mut decoder = LutLitLenCode::new_empty();
         assert!(
             decoder.rebuild_from(&code_lengths),
             "fixed-Huffman code lengths must build"
@@ -1352,7 +1352,7 @@ mod tests {
         for sym in 280..286 {
             code_lengths[sym] = 8;
         }
-        let mut decoder = IsalLitLenCodePure::new_empty();
+        let mut decoder = LutLitLenCode::new_empty();
         assert!(
             decoder.rebuild_from(&code_lengths),
             "fixed-Huffman code lengths must build"
@@ -1397,7 +1397,7 @@ mod tests {
         code_lengths[0] = 1;
         code_lengths[1] = 1;
 
-        let mut decoder = IsalDistCodePure::new_empty();
+        let mut decoder = LutDistCode::new_empty();
         assert!(decoder.rebuild_from(&code_lengths));
         // Bit 0 -> symbol 0.
         let bytes = [0u8; 16];
