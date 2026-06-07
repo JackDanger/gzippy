@@ -65,7 +65,57 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, HEAD f8260aa8 +bench) — PURE-RUST ENGINE CEILING BOUNDED → **PLATEAU** (≈0.6× ISA-L in isolation, advisor UPHELD); the 1.0×-vs-no-FFI FORK is REAL but its WALL hard-bound is OWED one parallel-wall engine-removal perturbation (advisor caveat)
+## CURRENT STATE (2026-06-07, HEAD 3895a23c +oracle) — PHASE-0 WALL ORACLE DONE → **THE T8 WALL BINDER IS THE WINDOW-ABSENT MARKER/SPECULATION PATH, NOT THE ENGINE** (advisor-UPHELD). An igzip-class engine ALONE does NOT close the prod T8 gap; the asm port is NOT the T8 lever. **SUPERVISOR GATE — do NOT start Phase 1 until the bundle is decomposed.**
+
+### THIS TURN — PHASE-0: dropped a REAL ISA-L engine into the PRODUCTION parallel-SM pipeline and measured the T8 WALL (Measurement PROCESS #3 — engine REPLACEMENT oracle, not isolation-slope extrapolation). This converts the 0.6× engine-PRIMITIVE plateau into an airtight T8 WALL bound.
+- **ORACLE (measurement-only, byte-exact, env-gated, NOT production):** `GZIPPY_ISAL_ENGINE_ORACLE=1`
+  routes the clean-tail decode in `finish_decode_chunk_impl` through REAL ISA-L FFI
+  (`decompress_deflate_from_bit_with_boundaries`, patched igzip), feeding ISA-L bytes/boundaries/
+  end-bit through the SAME ChunkData primitives (commit + per-byte CRC + append_block_boundary_at +
+  finalize). Pool/consumer/ring/window-publish/scheduling UNCHANGED. ISA-L input bounded to
+  `[..stop_hint/8+256KiB]` so each worker decodes only ITS chunk. To run the bulk on ISA-L, windows
+  are SEEDED (`GZIPPY_SEED_WINDOWS`, captured at T1) so all 18 chunks are window-PRESENT and reach
+  the oracle. PROVEN ISA-L ran: T8 `isal_oracle_chunks=16 isal_oracle_fallbacks=1` (94% real ISA-L).
+- **MEASURED (locked guest 10.30.0.199 double-ssh, 16c gov=perf turbo-on load 2.7-4.2, measure.sh
+  interleaved N=11 CPUS=0,2,4,6,8,10,12,14 RAW=68229982 sha-OK=028bd002…cb410f every run, 2 runs):**
+    | contender | T8 wall | vs rg | verdict |
+    | rg (rapidgzip 0.16.0)        | 0.134s | 1.000 | — |
+    | isal (ISA-L engine, seeded)  | 0.148s | 0.905/0.892 | **TIE** |
+    | pure (pure-Rust eng, seeded) | 0.134s | 1.002/0.968 | **TIE** |
+    | prod (pure-Rust, NO seed)    | 0.194s | 0.690/0.652 | LOSS |
+- **THE LOAD-BEARING RESULT: `pure` (the SLOWER engine) ALREADY TIES rg once windows are seeded;
+  `isal` also ties → engine swap is TIE-vs-TIE. The per-thread engine is NOT the T8 wall binder.**
+  The whole ~1.5× prod gap collapses to a TIE when the window-absent path is removed. Per-stage
+  --verbose: prod decodeBlock SUM 1.048s / Real Decode 0.169s / Fill 77% / body_rate 168 MB/s /
+  13 header-speculation failures; pure-seed 0.781s / 0.108s / Fill 90.55% / 0 failures / 0 bootstrap.
+  rapidgzip runs the SAME 34.5% replaced-marker workload WITHOUT seeding yet ties (verified rg
+  --verbose) → gzippy's window-absent path is the SLOW one, apples-to-apples (NOT a seeding artifact).
+- **INDEPENDENT DISPROOF ADVISOR (synchronous read-only, plans/asmport-phase0-advisor-verdict.md):**
+  Claim1 (oracle measures igzip-class engine in real pipeline, byte-exact) UPHELD-W-CAVEATS (clean-
+  tail only; 1-chunk fallback impurity). Claim2 (engine alone doesn't close T8, TIE-vs-TIE) UPHELD-W-
+  CAVEATS (T8-only; engine gap 1.51× is REAL but slack-masked at Fill 90% — NOT at parity). Claim3
+  (binder is window-absent path) UPHELD as COARSE localization — sound + not unfair, BUT the seeding
+  knob bundles THREE removals: (a) u16 marker decode+resolution, (b) block_finder REAL-boundary
+  pre-seed (vs prod partition-GUESS — the project_confirmed_offset_prefetch_gap head-of-line stalls),
+  (c) the 13 speculation-failure re-decodes. CANNOT attribute the gain to marker-COMPUTE vs
+  boundary-ALIGNMENT vs re-decode. Claim4 (asm port can't move prod wall) directional rec UPHELD at
+  T8, strong inference REFUTED: marker-phase decode rate is ON the binding path and was NEVER replaced
+  (ISA-L can't emit u16 markers), and T1 (no Fill slack ⇒ engine binds directly) is unaddressed.
+
+### SCOPED TARGET FOR PHASE 1 (the supervisor gate — pick AFTER decomposing the bundle):
+- An igzip-class engine ALONE does NOT close the prod T8 wall (pure-Rust already ties seeded). So
+  the asm engine port is **NOT the T8 lever** — at T8. It remains plausibly the **T1 lever** (no
+  Fill slack, the 1.51× engine gap binds directly) and helps the **marker-phase decode rate** (168
+  MB/s, on the binding path, never tested by this oracle). Do NOT abandon it; re-scope it.
+- **NEXT PERTURBATION (decompose the Claim-3 bundle BEFORE choosing Phase 1):** seed ONLY the
+  block_finder boundaries (no windows) vs seed ONLY windows (prod boundaries). If most of the
+  0.69→1.00 delta is boundary-ALIGNMENT, the lever is the block finder / prefetch horizon
+  (project_confirmed_offset_prefetch_gap), NOT the asm engine NOR a marker-kernel rewrite. If it's
+  marker-COMPUTE, a faster u16 marker kernel (the asm techniques adapted to u16 output) is the lever.
+- **HARD WALL BOUND (owed by prior charter, now PAID):** the engine-PRIMITIVE 0.6×-ISA-L plateau
+  does NOT bind the T8 WALL — proven by replacing the engine with REAL ISA-L in the production
+  pipeline and STILL only tying (engine slack-masked at Fill 90%). The 1.0×-vs-no-FFI FORK is
+  NOT forced by the engine at T8 (pure-Rust already ties T8 seeded). The fork may still bite at T1.
 
 ### THIS TURN — step (B) executed: built+measured the faithful-u8 engine CEILING vs ISA-L (isolation, bounded)
 - **VAR_VI added to benches/engine_isolation.rs** (`decode_var_vi`, x86_64) = VAR_V (faithful-u8
@@ -271,3 +321,24 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   (B) the pool-scheduling/serial-tail SERIAL-WORK vs DECODE-WAIT decomposition. Keep the inner
   kernel as the confirmed T1 lever (not abandoned), but it is NOT the T8 path to 1.0×.
 - NO new build this turn (perception + causal ID + advisor only). Tree clean, no orphans.
+
+---
+## USER DECISION 2026-06-07 (fork resolved): TRANSLITERATE igzip's FULL AVX2 ASM KERNEL
+The pure-Rust engine ceiling is bounded (advisor-upheld): faithful-u8 + the FULL igzip technique
+stack + inline-ASM intrinsics (BMI2 BZHI, AVX2/SSE overlap copy, packed-u32 table, speculative
+pipeline) = VAR_VI ~0.60× ISA-L in isolation (~515 vs ~849 MB/s) — high-level techniques do NOT
+reach hand-tuned igzip asm. User chose: pursue **pure-Rust no-FFI 1.0× by transliterating igzip's
+ACTUAL assembly instruction-for-instruction** (our own inline Rust asm — NOT C-FFI). Honors 1.0× +
+no-FFI + faithfulness if it lands. This is a MULTI-SESSION project; own it in byte-exact phases.
+
+ASM-PORT PROJECT PLAN (the owner owns; phased, prove-before-the-big-build):
+- **PHASE 0 (scope the target — do FIRST, cheap):** an ISA-L-in-pipeline WALL oracle — drop an
+  igzip-class engine (real ISA-L FFI, MEASUREMENT-only) into gzippy's PRODUCTION pipeline and
+  measure the T8 WALL vs rapidgzip. Tells us: does an igzip-class engine ALONE tie in gzippy's
+  real pipeline (⇒ the asm port is sufficient, target = match igzip rate), or do production
+  overheads (ring/wrap/resumable/CRC — which absorbed VAR_V) ALSO cap it (⇒ the port must
+  integrate into a FLATTENED clean path)? This converts the 0.60× engine-primitive plateau into an
+  airtight WALL bound (PROCESS #3) AND scopes the transliteration so it can't be absorbed like VAR_V.
+- **PHASE 1+ (the transliteration):** port igzip_decode_block_stateless_{01,04}.asm → inline Rust
+  asm, integrated per Phase-0's finding (flatten the path if needed), in byte-exact + wall-measured
+  phases, each advisor-gated. Target: production T8 wall ties rapidgzip (~0.13s same-host).

@@ -122,6 +122,172 @@ pub static BAD_SEED_RESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Chunks that entered `finish_decode_chunk_impl` (ISA-L / ResumableInflate2 tail).
 pub static FINISH_DECODE_ENTRIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// PHASE-0 WALL ORACLE (measurement-only, NOT production): chunks whose clean
+/// tail was decoded by REAL ISA-L FFI via `decompress_deflate_from_bit_with_boundaries`
+/// instead of the pure-Rust engine, when `GZIPPY_ISAL_ENGINE_ORACLE=1`. Proves the
+/// engine actually ran ISA-L (assert this counter == clean-chunk count post-run).
+pub static ISAL_ENGINE_ORACLE_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// PHASE-0 WALL ORACLE: clean tails that fell through to the pure-Rust engine
+/// because the ISA-L oracle could not satisfy the contract (no exact boundary,
+/// FFI unavailable). Non-zero ⇒ the oracle did NOT fully cover the bulk decode;
+/// the wall number is contaminated by pure-Rust decode and must be discarded.
+pub static ISAL_ENGINE_ORACLE_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(parallel_sm)]
+#[inline]
+fn isal_engine_oracle_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").is_ok_and(|v| v == "1"))
+}
+
+/// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
+///
+/// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
+/// patched-boundary FFI, then feed ISA-L's bytes / boundaries / end-bit through
+/// the SAME `ChunkData` accounting primitives `finish_decode_chunk_impl` uses
+/// (commit + per-byte CRC + `append_block_boundary_at` + `finalize_with_deflate`),
+/// trimmed to the chunk's natural stop. Returns `Ok(true)` if ISA-L produced the
+/// chunk; `Ok(false)` to fall back to the pure-Rust engine (uncovered contract).
+///
+/// This drops an igzip-class engine into the REAL parallel-SM pipeline (the pool,
+/// consumer, window-publish, ring, and CRC all stay) to bound the T8 WALL.
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+fn finish_decode_chunk_isal_oracle(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    until_exact: bool,
+) -> Result<bool, ChunkDecodeError> {
+    use crate::backends::isal_decompress;
+    use std::sync::atomic::Ordering;
+
+    if !isal_decompress::is_available() {
+        return Ok(false);
+    }
+    // The oracle only covers a clean 32 KiB-window continuation (the bulk path
+    // once windows are seeded). A non-full window means marker bootstrap is
+    // needed — not ISA-L's job; fall back.
+    if initial_window.len() != crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE {
+        return Ok(false);
+    }
+
+    // ISA-L decodes from `inflate_start_bit` over the available input, recording
+    // every deflate block boundary. We use a throwaway hasher; CRC is recomputed
+    // below over the EXACT kept region so the chunk's running CRC stays correct.
+    let mut throwaway = crc32fast::Hasher::new();
+    // BOUND THE DECODE TO THIS CHUNK (else ISA-L runs to BFINAL of the WHOLE
+    // member per worker — a 200 MB per-chunk decode + ~500 MB alloc, which would
+    // make the oracle measure the wrong thing). Slice `input` to end a few bytes
+    // past `stop_hint_bits` so ISA-L decodes only this chunk's blocks then runs
+    // out of input at a block boundary. A clean DEFLATE block boundary is the
+    // natural stop the pipeline already trims to. Cap output at a per-chunk bound.
+    let stop_byte = stop_hint_bits.div_ceil(8);
+    // Slack must cover the block that STRADDLES stop_hint (the chunk's natural
+    // stop is the first boundary AT-OR-PAST stop_hint, which can be a full block
+    // past it) plus ISA-L's read-ahead. 256 KiB is ample for a deflate block yet
+    // tiny vs the whole-member input — bounds the per-chunk decode without risking
+    // an input-exhaustion mid-block (which returns None ⇒ fall back to pure).
+    let slice_end = (stop_byte + 256 * 1024).min(input.len());
+    let bounded = &input[..slice_end];
+    // Per-chunk output cap: chunk_target decoded bytes are a few MiB; give 64 MiB
+    // headroom so the alloc is tiny vs the whole-member alloc. The decoder grows
+    // if needed (it won't, given the bounded input).
+    let max_output: usize = 64 * 1024 * 1024;
+    let Some((output, end_bit, boundaries)) =
+        isal_decompress::decompress_deflate_from_bit_with_boundaries(
+            bounded,
+            inflate_start_bit,
+            initial_window,
+            max_output,
+            &mut throwaway,
+        )
+    else {
+        return Ok(false);
+    };
+
+    // Pick the natural stop: first boundary at-or-past stop_hint (inexact), or
+    // the exact boundary == stop_hint (exact). Boundaries record (bit_offset,
+    // output_offset) measured from the start of THIS decode.
+    let (final_bit, keep_len) = if until_exact {
+        // Exact: a boundary must land exactly on stop_hint_bits.
+        let mut found = None;
+        for b in &boundaries {
+            if b.bit_offset == stop_hint_bits {
+                found = Some((b.bit_offset, b.output_offset));
+                break;
+            }
+        }
+        match found {
+            Some(v) => v,
+            None => return Ok(false), // oracle can't honor exact stop ⇒ fall back
+        }
+    } else {
+        // Inexact: first boundary at-or-past stop_hint_bits; else whole decode.
+        let mut chosen = None;
+        for b in &boundaries {
+            if b.bit_offset >= stop_hint_bits {
+                chosen = Some((b.bit_offset, b.output_offset));
+                break;
+            }
+        }
+        chosen.unwrap_or((end_bit, output.len()))
+    };
+
+    let keep_len = keep_len.min(output.len());
+    let kept = &output[..keep_len];
+
+    // Commit bytes into the chunk's u8 data buffer (same as the pure path).
+    let mut written = 0usize;
+    while written < kept.len() {
+        let tail = chunk.data.writable_tail();
+        let n = tail.len().min(kept.len() - written);
+        tail[..n].copy_from_slice(&kept[written..written + n]);
+        chunk.data.commit(n);
+        chunk.note_inner_decoded_bytes(n);
+        written += n;
+    }
+    // CRC over the exact kept region (mirrors finish_decode_chunk_impl:512-517).
+    if chunk.configuration.crc32_enabled {
+        if let Some(last_crc) = chunk.crc32s.last_mut() {
+            last_crc.update(kept);
+        }
+    }
+    chunk.statistics.non_marker_count += kept.len() as u64;
+
+    // Replay boundaries up to (and not past) the natural stop, mirroring the
+    // pure path's `append_block_boundary_at` calls.
+    let base_decoded = 0usize;
+    for b in &boundaries {
+        if b.bit_offset > final_bit {
+            break;
+        }
+        let decoded_offset = base_decoded + b.output_offset.min(keep_len);
+        if decoded_offset > 0 {
+            chunk.append_block_boundary_at(b.bit_offset, decoded_offset, Some(input));
+        }
+    }
+
+    chunk.finalize_with_deflate(final_bit, Some(input));
+    ISAL_ENGINE_ORACLE_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+#[cfg(not(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64")))]
+fn finish_decode_chunk_isal_oracle(
+    _chunk: &mut ChunkData,
+    _input: &[u8],
+    _inflate_start_bit: usize,
+    _stop_hint_bits: usize,
+    _initial_window: &[u8],
+    _until_exact: bool,
+) -> Result<bool, ChunkDecodeError> {
+    Ok(false)
+}
 /// Chunks that took vendor `decodeChunkWithInflateWrapper` (exact window + until_exact).
 pub static INFLATE_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -361,6 +527,29 @@ fn finish_decode_chunk_impl(
     until_exact: bool,
 ) -> Result<(), ChunkDecodeError> {
     FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // PHASE-0 WALL ORACLE (GZIPPY_ISAL_ENGINE_ORACLE=1, measurement-only): decode
+    // this clean tail with REAL ISA-L instead of the pure-Rust engine, keeping the
+    // entire production pipeline. Falls back to the pure path on any uncovered
+    // contract (counted in ISAL_ENGINE_ORACLE_FALLBACKS so a contaminated run is
+    // detectable). NOT a production path.
+    if isal_engine_oracle_enabled() {
+        match finish_decode_chunk_isal_oracle(
+            chunk,
+            input,
+            inflate_start_bit,
+            stop_hint_bits,
+            initial_window,
+            until_exact,
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                ISAL_ENGINE_ORACLE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     let t_decode = std::time::Instant::now();
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
         "worker.isal_stream_inflate",

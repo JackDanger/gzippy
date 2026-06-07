@@ -1,5 +1,47 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## PHASE-0 WALL ORACLE DONE → T8 BINDER IS THE WINDOW-ABSENT MARKER PATH, NOT THE ENGINE [2026-06-07, OWNER turn, HEAD 3895a23c +oracle]
+PHASE-0 of the asm-port project: dropped a REAL ISA-L engine into the PRODUCTION parallel-SM
+pipeline (pool/consumer/ring/CRC/window-publish kept) and measured the T8 WALL vs rapidgzip on the
+locked guest. Charter CURRENT STATE updated. Advisor: plans/asmport-phase0-advisor-verdict.md.
+Pre-reg + results: plans/asmport-phase0-prereg.md. Brief: plans/asmport-phase0-advisor-brief.md.
+**SUPERVISOR GATE reached — Phase 1 (asm transliteration) NOT started, per the prompt.**
+
+WHAT: `GZIPPY_ISAL_ENGINE_ORACLE=1` (measurement-only, env-gated, byte-exact, NOT production) routes
+`finish_decode_chunk_impl`'s clean-tail decode through REAL ISA-L FFI
+(`decompress_deflate_from_bit_with_boundaries`), feeding bytes/boundaries/end-bit through the SAME
+ChunkData primitives. ISA-L input bounded to `[..stop_hint/8+256KiB]` (per-chunk, not whole-member —
+the FIRST cut decoded the whole member per worker → 0.42s; bounding fixed it). Windows SEEDED
+(`GZIPPY_SEED_WINDOWS`, captured T1) so all 18 chunks are window-present → reach the oracle. PROVEN
+ISA-L ran: `isal_oracle_chunks=16 isal_oracle_fallbacks=1`.
+
+MEASURED (locked guest 10.30.0.199 double-ssh, 16c gov=perf turbo-on load 2.7-4.2, measure.sh
+interleaved N=11 CPUS=0,2,4,6,8,10,12,14 RAW=68229982 sha-OK=028bd002…cb410f, 2 runs):
+  rg 0.134s 1.000 | isal(ISA-L,seeded) 0.148s 0.905/0.892 TIE | pure(pure-Rust,seeded) 0.134s
+  1.002/0.968 TIE | prod(pure-Rust,no-seed) 0.194s 0.690/0.652 LOSS.
+KEY: `pure` (the SLOWER engine) ALREADY ties rg when seeded; engine swap is TIE-vs-TIE ⇒ the engine
+is NOT the T8 binder. The ~1.5× prod gap collapses to TIE when the window-absent path is removed.
+Per-stage: prod decodeBlock SUM 1.048s/Real 0.169s/Fill 77%/body 168MB/s/13 spec-fails; pure-seed
+0.781s/0.108s/Fill 90.55%/0/0. rapidgzip runs the SAME 34.5% marker workload WITHOUT seeding yet
+ties (rg --verbose) ⇒ gzippy's window-absent path is the slow one (apples-to-apples).
+
+ADVISOR: C1 UPHELD-W-CAVEATS (oracle real, clean-tail only, 1-chunk impurity). C2 UPHELD-W-CAVEATS
+(engine not the T8 binder; but 1.51× engine gap is REAL + slack-masked at Fill 90%, NOT at parity).
+C3 UPHELD as COARSE localization — seeding is a valid causal removal + NOT unfair, BUT bundles 3
+removals (u16 marker decode, block_finder real-boundary pre-seed vs partition GUESS, 13 spec-fail
+re-decodes) ⇒ cannot isolate marker-COMPUTE from boundary-ALIGNMENT. C4 directional rec UPHELD at
+T8, strong inference REFUTED (marker-phase rate is on the binding path + never replaced; T1 unaddressed).
+
+NEXT (supervisor gate): DECOMPOSE the bundle before choosing Phase 1 — seed-ONLY-boundaries (no
+windows) vs seed-ONLY-windows (prod boundaries). If the delta is boundary-ALIGNMENT, the lever is
+the block finder / prefetch horizon (project_confirmed_offset_prefetch_gap), NOT the asm engine. If
+marker-COMPUTE, a faster u16 marker kernel. The asm engine port is NOT the T8 lever (pure ties T8
+seeded) but remains the plausible T1 lever + helps marker-phase rate — re-scope, don't abandon.
+GUEST: /root/gzippy src @7bf2609 + this turn's overlay (oracle in gzip_chunk.rs + chunk_fetcher.rs);
+builds /tmp/gzbuild-isal (gzippy-isal) + /tmp/gzbuild-native (gzippy-native), both byte-exact;
+seeds /tmp/seeds.bin; driver /tmp/phase0_measure.sh (use `bash`, not sh — measure.sh needs bash).
+Tree: oracle committed this turn; NO orphan processes (advisor + polls killed; guest clean).
+
 ## PURE-RUST ENGINE CEILING BOUNDED → PLATEAU (~0.6× ISA-L isolation); FORK real, WALL bound owed [2026-06-07, OWNER turn, HEAD f8260aa8 +bench]
 Loop step (B) executed: built + measured the faithful-u8 engine CEILING vs ISA-L (isolation, bounded).
 Charter CURRENT STATE updated. Advisor: plans/engine-ceiling-advisor-verdict.md (PLATEAU UPHELD-WITH-
