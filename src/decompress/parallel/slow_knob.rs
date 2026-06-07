@@ -95,6 +95,26 @@ fn slow_factor() -> f64 {
     })
 }
 
+/// MARKER-mode slow factor (`GZIPPY_SLOW_MARKER_MODE`, percent/100). `0.0` ⇒ OFF.
+/// Read once. This is the u16 `<true>`-path twin of [`slow_factor`]: it perturbs
+/// ONLY the per-decode-event time of the u16 marker (`CONTAINS_MARKERS`) inner
+/// loop, so the u16-path-gates-the-wall question can be answered by the same
+/// causal-perturbation method that established the clean-path (`<false>`) ceiling.
+/// Byte-transparent (the injected work touches only a black-boxed accumulator).
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the feature-gated decode loops
+fn slow_marker_factor() -> f64 {
+    static F: OnceLock<f64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_MARKER_MODE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|pct| pct / 100.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// `false` ⇒ busy ALU spin (default). `true` ⇒ frequency-neutral yield control.
 /// Read once.
 #[inline]
@@ -115,6 +135,20 @@ fn sleep_kind() -> bool {
 #[inline]
 pub fn spin_iters() -> u64 {
     let f = slow_factor();
+    if f <= 0.0 {
+        return 0;
+    }
+    (BASE_SPIN as f64 * f) as u64
+}
+
+/// MARKER-mode resolved per-decode-event spin count (`GZIPPY_SLOW_MARKER_MODE`),
+/// or `0` when OFF. The u16 `<true>`-path twin of [`spin_iters`]. Snapshot once
+/// before the marker careful loop; `GZIPPY_SLOW_KIND=sleep` selects the same
+/// frequency-neutral control via [`yield_kind`].
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the feature-gated decode loops
+pub fn marker_spin_iters() -> u64 {
+    let f = slow_marker_factor();
     if f <= 0.0 {
         return 0;
     }

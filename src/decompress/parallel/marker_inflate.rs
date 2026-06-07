@@ -1438,18 +1438,31 @@ impl Block {
             }};
         }
 
-        // Causal-perturbation slow-injection knob (clean mode ONLY). Snapshot
-        // the resolved per-decode-event spin count + kind ONCE here, before the
-        // loop, so the per-iteration cost when OFF is a single hoistable branch
-        // on a local `== 0`. `CONTAINS_MARKERS` ⇒ const-fold the snapshot to 0,
-        // so the injection is compiled away entirely on the marker path.
+        // Causal-perturbation slow-injection knob. Snapshot the resolved
+        // per-decode-event spin count + kind ONCE here, before the loop, so the
+        // per-iteration cost when OFF is a single hoistable branch on a local
+        // `== 0`. There are TWO independent knobs, selected by the const generic:
+        //   * `<false>` clean path  → `GZIPPY_SLOW_MODE`        (spin_iters)
+        //   * `<true>`  u16 marker  → `GZIPPY_SLOW_MARKER_MODE` (marker_spin_iters)
+        // Each const-folds to 0 on the OTHER specialization, so the clean knob is
+        // compiled away on the marker path and vice-versa — a clean-path slow-down
+        // cannot leak into the u16-path measurement, and the u16-path knob fires at
+        // the careful-loop inject site below (the `<true>` path always uses the
+        // careful loop; the VAR_V fast loop is `!CONTAINS_MARKERS`-gated).
         // Byte-transparent (DUAL-SHA gate). See `slow_knob.rs`.
         let slow_spin: u64 = if CONTAINS_MARKERS {
-            0
+            super::slow_knob::marker_spin_iters()
         } else {
             super::slow_knob::spin_iters()
         };
-        let slow_yield: bool = !CONTAINS_MARKERS && super::slow_knob::yield_kind();
+        // Gate the sleep-control kind on THIS specialization actually injecting
+        // (`slow_spin != 0`). `GZIPPY_SLOW_KIND` is global, so without this gate a
+        // MARKER+SLEEP run would set `slow_yield = true` on the `<false>` clean
+        // instantiation too and knock it off the VAR_V fast loop (the `:1484`
+        // gate is `... && !slow_yield`) even though the clean injection is zero —
+        // contaminating the clean wall during a marker-only measurement (advisor
+        // D2). With the gate, the control only affects the path it injects into.
+        let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
 
         // ── VAR_V SPECULATIVE SOFTWARE-PIPELINED FAST LOOP (clean path only) ──
         // igzip trick #2 ported faithfully ONTO the production wrapping u8 ring
@@ -2077,15 +2090,15 @@ impl Block {
                     }};
                 }
 
-                // Causal-perturbation slow-injection knob (clean mode ONLY) —
-                // see the ISA-L sibling for the contract. Snapshot once before
-                // the loop; const-folded to 0 when CONTAINS_MARKERS.
+                // Causal-perturbation slow-injection knob — see the ISA-L
+                // sibling for the two-knob contract. Snapshot once before the
+                // loop; each knob const-folds to 0 on the other specialization.
                 let slow_spin: u64 = if CONTAINS_MARKERS {
-                    0
+                    super::slow_knob::marker_spin_iters()
                 } else {
                     super::slow_knob::spin_iters()
                 };
-                let slow_yield: bool = !CONTAINS_MARKERS && super::slow_knob::yield_kind();
+                let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
 
                 while emitted < n_max_to_decode {
                     // One injection per decode event. No-op when slow_spin == 0.
