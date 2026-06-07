@@ -384,3 +384,152 @@ Read the two-engine boundary in gzip_chunk.rs + marker_inflate.rs:
 - Gate: DUAL-SHA 028bd002...cb410f (native folded + isal two-phase), per-chunk differential (STEP-1b gate
   8d026a8 style), then measure wall+RSS on locked harness. Sequence the clean-drain bulk/BMI2 graft IN
   THE SAME behavioral step to avoid shipping a transient wall regression.
+
+## LEADER RE-DRIVE 2026-06-06 (resumed @ 5f162bb) — singleton-leader discipline adopted
+- SINGLETON-LEADER LOCK created scripts/leader-lock.sh (clone of cargo-lock mkdir-mutex + stale-pid
+  reclaim; acquire/release/status verbs; NON-BLOCKING acquire => duplicate leader EXITS). Self-test
+  PASSED: positive (reclaims stale pid 99999), negative (refuses while live holder). ACQUIRED by a
+  persistent sentinel pid (nohup sleep) so the lock survives across leader turns (a Bash-subshell
+  $$ dies between calls => would read stale).
+- FOLD insertion point CONFIRMED by leader read: the ONLY behavioral change is at
+  marker_decode_step_loop gzip_chunk.rs:1191-1202 (the `clean_appended_len()>=MAX_WINDOW_SIZE
+  && !ctx.flipped` FlipToClean early-return). cfg-fork it: #[cfg(isal_clean_tail)] keeps the
+  FlipToClean return (gzippy-isal two-phase, Design-A insertion intact); #[cfg(not(isal_clean_tail))]
+  (native) sets ctx.flipped=true and CONTINUEs the loop. Engine M's read() already drains clean u8
+  in-place (marker_inflate.rs:1011 drain_to_output -> push_clean_u8 once contains_marker_bytes==false);
+  UnifiedMarkerSink.push_clean_u8 buffers to pending_clean, flushed to chunk.data each step
+  (decode_chunk_unified_marker :744-749). Loop terminates at BFINAL/stop_hint via MarkerStep::Finished.
+  finish_decode_chunk_impl UNTOUCHED (still reachable on isal + window-seeded path). cfg name confirmed
+  build.rs:101 isal_clean_tail = is_x86_64 && gzippy-isal && parallel_sm.
+- HAZARD to gate: ring-overwrite if a single post-flip clean block is huge and drain only fires at
+  EOB (marker_inflate.rs:725-730 contract). read_internal_compressed must drain mid-block OR the
+  differential will catch it. The per-chunk differential is the verdict.
+
+## FOLD COMMITTED [DONE 2026-06-06 — 8cfad3a] flip-in-place one-engine fold
+- COMMIT 8cfad3a on reimplement-isa-l (parent 5f162bb). Only src change: gzip_chunk.rs +322/-11.
+- STEP-5 "FAIL" ROOT CAUSE (corroborated, NOT flaky, NOT a regression): the fold-gate STEP-5 ran
+  `cargo test ... --lib routing correctness pure_rust_inflate_corpus -- ...` — `cargo test` accepts
+  only ONE positional TESTNAME, so it errored `unexpected argument 'correctness'` and RAN ZERO TESTS.
+  Neither the project_parallel_test_hang deadlock-flake NOR a byte regression. Leader rerun under
+  scripts/cargo-lock.sh with the supervisor's valid invocation (full --lib, --test-threads=1, 4
+  excludes) = 850 passed / 0 failed, matching the supervisor exactly. Fold is byte-exact-clean.
+- VALIDATION (all green for the committed tree): DUAL-SHA native arm64 + isal x86_64(Rosetta) both
+  028bd002...cb410f via path=ParallelSM; native_fold_parity 32/32 correct (12 FLIPPED; rewind /
+  fixed-Huffman / ==stop_hint; until_exact {T,F}); lib suites 850/0.
+- GATE HARDENED: /tmp/fold-gate.sh STEP-5 now uses the supervisor's invocation — full `--lib`,
+  `--test-threads=1`, excludes by EXACT name (diff_ratio_parallel_single_member_speedup,
+  scoped_cancel_stops_early_without_full_scan, hot_path, alloc_budget). No multi-positional filter.
+- EXCLUDE/FLAKY POLICY (board record): the 4 names above are the canonical load-flaky/perf-gate
+  exclusion set for serial byte-exact lib runs. ALWAYS pass `--test-threads=1` (project_parallel_test_hang
+  deadlock-class). Use full `--lib` + `--skip <exact-name>` — NEVER multiple positional TESTNAME filters
+  (silent CLI parse error that runs nothing and reads as a FAIL).
+- ADVISOR GAP (assumption, flagged): no subagent-spawn tool in this session, so a fresh Opus advisor
+  could not be consulted for the commit. Proceeded on standing advisor verdicts already on record (fold
+  design APPROVE lines 163-181; finish_decode_chunk_impl-preserve constraint satisfied) + the direct
+  flaky-vs-real resolution above. If a supervisor advisor pass is required retroactively, the evidence
+  is captured here and in /tmp/fold-gate.result.
+
+## NEXT (sequenced): BMI2 PEXT/BZHI + multi-symbol LUT graft into Engine M
+- Cache mandate: ONE shared decode-table copy across threads, no large per-thread buffers, RSS ~flat in T.
+- Each technique byte-exact + measured on the locked harness; keep wins, revert regressions.
+- Then: gzippy-isal Design-A tail (dual-sha vs folded driver) -> PHASE 3 3-way Fulcrum + RSS/working-set/MPKI.
+
+## SPEED STRETCH — LEADER RE-DRIVE 2026-06-06 (resumed @ 8cfad3a). leader-lock HELD.
+### FALSIFIER PRE-REGISTERED [DONE] plans/bmi2-graft-falsifier.md
+- Per-technique falsifier + ceiling + TIE/regression judgment recorded BEFORE any opt work.
+- KEY PRIOR-STATE FINDING (read the production loop, marker_inflate.rs run_multi_cached_loop
+  :1630+): techniques (b) multi-symbol LUT and (c) lean refill are ALREADY PRESENT
+  (2-/3-literal speculative chain :1782-1841; branchless bounds-elided refill_fast :1715-1731,
+  REFILL_THRESHOLD=48; speculative next-entry carry). Only (a) BMI2 PEXT/BZHI is genuinely
+  un-grafted (Generic HAS_BMI2=false unified.rs:122; no BMI2 in the marker hot loop). So (a)
+  is THE lever; (b)/(c) are re-validation/sharpening (re-attempt ca52389-class with fresh
+  measurement — KNOWN HAZARD).
+- unified.rs is a DELEGATING SCAFFOLD (Inflate<Clean,Generic,Streaming> -> ResumableInflate2);
+  the live production dynamic-Huffman hot loop is marker_inflate.rs read_internal_compressed_
+  canonical_specialized -> run_multi_cached_loop (uses libdeflate LitLenTable/DistTable).
+  The fixed-Huffman arm uses HuffmanCodingReversedBitsCached. THAT is the BMI2 graft surface.
+
+### INSTRUMENT-VALIDITY FINDING (must fix before cache-mandate measurement)
+- The byte-accounting instrument (mem_stats.rs, hooked to staged_bits.rs take_staging_box) is
+  DEAD on the native path AFTER THE FOLD. take_staging_box is only called by StagedBits (part of
+  ResumableInflate2 = Engine C); the fold removed Engine C from native (finish_decode_chunk_impl
+  unreached in native steady state). Result: GZIPPY_MEM_STATS=1 on native silesia emits NO report
+  (threads observed = 0) — leader verified locally.
+- The ACTUAL native per-thread working set is BOOTSTRAP_BLOCK (thread_local Block, gzip_chunk.rs:1096),
+  dominated by Block.output_ring: Box<[u16; RING_SIZE]> = 2*MAX_WINDOW_SIZE = 128KiB per worker
+  thread. The instrument must be RE-HOOKED to this (the ring + literal_cl/backreferences Vecs +
+  the shared FIXED_TABLES bytes) before it can measure the cache mandate. This re-hook is byte-exact
+  (counters only) and needed for PHASE 3's RSS/working-set numbers; it does NOT block the BMI2 graft
+  go/no-go (that's a wall question, answered by the locked harness).
+
+### CEILING-BOUNDING METHOD — open question for advisor (flag to supervisor)
+- A clean DECODE-ZERO oracle (charter rule 3 "remove the region, measure") is NOT byte-exact here:
+  zeroing the inner decode produces wrong bytes (can't sha-verify), violating the byte-exact ABSOLUTE
+  invariant. So the textbook removal-oracle is unavailable for the inner Huffman loop.
+- Available byte-exact bounds: (1) the existing GZIPPY_SLOW_* decode/bootstrap slow-injection
+  (already moved the wall ~proportionally, survived freq-neutral disproof) gives the SLOPE / confirms
+  criticality; (2) the BMI2 graft delta itself IS a perturbation (changes per-symbol decode cost by a
+  known mechanism; read the interleaved wall response). Plan: confirm criticality + quantify slope via
+  SLOW-injection on the locked harness (small factors, freq-neutral control), THEN graft+measure;
+  Δ>spread=lever; TIE=keep-if-byte-exact-no-RSS-regress; regression=revert.
+- ADVISOR ASK (supervisor, you run advisors I can't): is the SLOW-injection-slope + graft-delta the
+  acceptable ceiling-bound given a byte-exact decode-zero oracle is impossible, or is there a
+  byte-exact removal-oracle shape I'm missing (e.g. swap-in a precomputed correct output buffer so the
+  decode loop is bypassed but bytes are still correct)? This is the only consequential method call.
+
+### *** PIVOTAL FINDING: BMI2 IS ALREADY ON in the measured locked-harness build ***
+The charter's leading lever (a) "BMI2 PEXT/BZHI runtime dispatch (currently OFF, unified.rs:122)"
+rests on a FALSE premise for the perf-target build. Evidence (all leader-verified this session):
+- The production BMI2 path is NOT in unified.rs (a DEAD delegating scaffold). It is in bmi2.rs
+  (extract_varbits :109-118, decode_extra_bits :78-97 — the extra-bits extraction) +
+  consume_first_decode.rs::bzhi_u64 :168 + two_level_table.rs :353. ALL gated
+  `#[cfg(all(target_arch="x86_64", target_feature="bmi2"))]` → emit BZHI when the feature is on.
+- libdeflate_entry.rs decode_length :224 / decode_distance :322 (THE production dynamic-Huffman hot
+  loop extract, run_multi_cached_loop) call bmi2::extract_varbits → already BZHI on bmi2 builds.
+- THE BUILD ENABLES IT: .cargo/config.toml [build] rustflags=["-C","target-cpu=native"] AND the
+  guest harness scripts/bench/guest_fulcrum_capture.sh:67 export RUSTFLAGS=-C target-cpu=native.
+  On the BUILD GUEST (root@REDACTED_IP, where cargo build actually runs — neurotic login shell has no
+  rustc on PATH), `rustc --print cfg -C target-cpu=native` emits target_feature="bmi2" (+avx2,
+  pclmulqdq, vpclmulqdq); /proc/cpuinfo shows bmi2. ⇒ EVERY existing locked-harness wall number was
+  measured WITH BMI2 BZHI ACTIVE. "Turning BMI2 on" is a no-op on the measured path.
+- has_bmi2() (the runtime detector, bmi2.rs:26) is DEAD — never gates the hot path; the path is
+  compile-time. So "runtime dispatch" only matters for a PORTABLE binary (built WITHOUT target-cpu=
+  native, dispatching at runtime) — which is NOT the perf target (CLAUDE.md "arch-specific is the
+  target; portable ships later via runtime dispatch").
+- The ONLY genuinely-ungrafted BMI2 op is PEXT (_pext_u64) — ZERO uses in src. But the table index
+  is a single masked field (litlen.lookup / dist.lookup), where BZHI/AND already wins; PEXT pays only
+  for SCATTERED multi-field extraction, which this loop does not do. No obvious PEXT lever.
+- CEILING-BOUND (the perturbation, not extrapolation): build native WITH vs WITHOUT bmi2 on the guest
+  and measure the interleaved wall delta on the locked harness. That delta IS the BMI2 ceiling.
+  Hypothesis: small/TIE (BZHI vs shift+mask is ~1-2 cycles on one extract per packet, against a
+  461ms wall). Running this A/B next — it is the verdict, byte-exact (both correct), no extrapolation.
+
+### BMI2 CEILING-BOUND A/B — DONE [VERDICT: TIE, lever (a) REJECTED with mechanism]
+Ran scripts/bench/bmi2_ceiling_ab.sh on build guest 199 (silesia-large 162MB, T8 mask 0-7,
+interleaved best-of-9). Both arms byte-exact (sha e114dd2b... == gzip ref) via path=ParallelSM.
+- BMI2-ON  (target-cpu=native, PRODUCTION DEFAULT): best 0.6045  median 0.6485  mean 0.6526  σ 0.0316
+- BMI2-OFF (target-cpu=native -C target-feature=-bmi2): best 0.6337 median 0.6484 mean 0.6588 σ 0.0235
+- delta(best) = 29ms/4.6% but delta(MEDIAN) = -0.1ms / -0.02% (a DEAD TIE). within-arm spread
+  63-108ms, σ 24-32ms — both >> any signal. The best-of-9 "4.6%" is an ON-side fast outlier; the
+  robust statistic (median) is identical. Δ << spread ⇒ TIE, full stop.
+- MECHANISM (a rejection per CLAUDE.md rule 7a, not a narrow miss): BMI2 BZHI is ALREADY compiled
+  into the measured production binary (target-cpu=native enables target_feature=bmi2 on the guest
+  CPU; extract_varbits/decode_extra_bits/bzhi_u64 emit BZHI). The "runtime-dispatch graft" would
+  change NOTHING on the perf-target build — it only matters for a PORTABLE binary (not the perf
+  target). And even forcing BZHI fully OFF is a wall TIE: the single extra-bits extract per packet
+  is invisible against the ~600ms wall, which is memory-bound (128KiB u16 ring + 32KiB window apply
+  + back-ref copies), NOT per-symbol ALU. rapidgzip's existence-proof advantage is therefore NOT in
+  this op — it must be elsewhere (window apply / ring layout / copy), which is the cache-mandate
+  surface, not BMI2.
+- CONSEQUENCE: do NOT graft BMI2 runtime dispatch into Engine M for perf (no-op on perf build;
+  the only beneficiary, a portable binary, is explicitly deferred per CLAUDE.md "portable ships
+  later"). Techniques (b) multi-symbol LUT + (c) lean refill are ALREADY PRESENT (falsifier finding)
+  AND are also per-symbol-ALU techniques the SAME memory-bound argument covers — re-validation is
+  unlikely to move the wall by the same mechanism. The campaign's real lever is the cache mandate
+  (shared tables already done; per-thread 128KiB ring is the next surface), measured by MPKI on the
+  locked harness — NOT the ISA-L per-symbol hot-technique graft.
+- ADVISOR CORROBORATION NEEDED (supervisor — you run advisors I can't): this REJECTS the charter's
+  leading lever (a) with a mechanism. Please corroborate (1) the BMI2-already-on finding, (2) the
+  TIE verdict (median not best-of-N), (3) the redirect from per-symbol-ALU grafts to the cache/MPKI
+  surface. If corroborated, PHASE 3's 3-way Fulcrum should center on RSS/working-set/MPKI (the
+  mandate), with the BMI2/LUT/refill graft recorded as rejected-with-mechanism (no work spent).
