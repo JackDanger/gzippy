@@ -1,5 +1,173 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## T8 BINDER LOCATED = SERIAL/CONSUMER-WAIT; u16-path premise FALSIFIED [2026-06-07, OWNER turn, HEAD fb3baec0]
+Loop step (A) executed in full (perceive → causal-ID → advisor → instrument committed).
+Charter CURRENT STATE updated. Advisor: plans/u16-ceiling-advisor-verdict.md (UPHELD /
+UPHELD-WITH-CAVEATS). Brief: plans/u16-ceiling-advisor-brief.md.
+
+PREMISE CORRECTION (source + advisor UPHELD): the charter's "58.6% of bytes take the slow u16
+path = biggest prize" was a MIS-READING of the mis-named counter BOOTSTRAP_POST_FLIP_U16_BYTES
+(gzip_chunk.rs:97/:1302 increments on marker-FREE blocks, which since fc1c965b decode u8-DIRECT).
+Genuine u16-<true> fraction ≈ 42.5% inverse (the pre-flip prefix), NOT the bulk-on-a-slow-path.
+
+CAUSAL (new GZIPPY_SLOW_MARKER_MODE u16-path knob, commit fb3baec0, byte-exact 028bd002…cb410f
+all knob modes; locked guest REDACTED_IP double-ssh, 16c gov=perf, measure.sh interleaved sha-OK,
+RAW=211968000, T8 N=11; box load 3-5 ⇒ trust interleaved-relative only):
+- CLEAN +100% spin → +27%; CLEAN +100% SLEEP → +27% (IDENTICAL = not turbo); +200% SLEEP → +55%.
+  ⇒ clean u8 decode genuinely gates ~27% of T8 wall (freq-neutral).
+- MARKER +200% spin → +21%; SLEEP control → +7% (collapses). ⇒ u16 marker = MINORITY ~3.5-14%.
+- T1 MARKER → near-flat (validates: u16 barely runs at T1, knob fires ∝ u16 bytes).
+
+BINDER LOCATED (pool trace, first-hand): decodeBlock 0.936s → Theoretical-Optimal(÷8)=0.117s;
+Real Decode span 0.147s (Fill 79%); std::future::get in-order consumer wait = 0.077s; header_ms
+24.0 (~2.6%). gzippy's perfectly-parallel decode FLOOR (0.117s) ALREADY ≈ rapidgzip's ENTIRE wall
+(0.130s). The whole 1.70× gap = scheduling/serial: pool-fill gap ~0.030s + consumer head-of-line
+future::get ~0.077s ≈ ~0.10s. rapidgzip ties DESPITE the same engine gap by overlapping decode.
+
+NEXT: FIX the in-order consumer future::get head-of-line wait + pool-fill gap (charter binder #2 /
+project_confirmed_offset_prefetch_gap). Bound the ceiling FIRST with a consumer-wait-removal oracle
+(Rule 3). The prior placement-port gate FAILED on offset-supply (a non-divergence); the OPEN
+distinct question is prefetch-HORIZON/dispatch-depth, not offset supply. Kernel stays the T1 lever
++ a real ~27% T8 term but is NOT the T8 path to 1.0×.
+
+GUEST BUILD NOTE (next owner): guest src build needs a `/tmp/fulcrum` stub crate (Cargo.toml
+optional dep `fulcrum = {path="../fulcrum"}` — cargo reads its manifest even with coz OFF) AND the
+tarball must include crates/ + examples/ (workspace member + [[example]] coz_bench). Build dir
+/tmp/gzbuild on guest; binary gzippy-mk2 (D2-fixed) byte-exact. silesia.gz is at /root/silesia.gz.
+
+## T8 BINDER RE-IDENTIFIED — kernel REFUTED as the T8 lever; u16-path + scheduling bind [2026-06-07, OWNER turn] [u16 part SUPERSEDED above]
+Full perceive→causal-ID→advisor loop. Charter CURRENT STATE updated. Advisor:
+plans/t8-binder-advisor-verdict.md (UPHELD-WITH-CAVEATS). Brief: plans/t8-binder-advisor-brief.md.
+
+WHOLE-SYSTEM WALL (locked guest REDACTED_IP -J neurotic, 16c gov=perf no_turbo=1, measure.sh
+interleaved sha-verified, RAW=211968000): T8 gzippy-varv ~0.226s vs rapidgzip ~0.137s = 1.655×;
+varv vs base TIE; sha 028bd002…cb410f OK. (gzippy-base 16:19 + gzippy-varv 16:18 on guest /tmp,
+source /root/gzippy @ 7bf26096 + VAR_V worktree; rapidgzip 0.16.0.)
+
+CAUSAL PERTURBATION (slow_knob, byte-transparent, freq-neutral sleep control, site fires ∝ clean
+bytes; reproduced 3×, sha OK every run):
+- T1 spin100 (doubles per-thread decode-compute) → +83% wall ⇒ decode GATES ~83% of T1 wall
+  (kernel = confirmed T1 lever).
+- T8 spin100 → +14–22%; spin200 → +45%; sleep100 control +20% (≥ spin, not a turbo artifact)
+  ⇒ clean decode-compute gates only ~18–22% of T8 wall.
+- COVERAGE CONFOUND (advisor Angle-4, reconciled first-hand): slow_knob is CLEAN-only (const-folds
+  to 0 on marker <true>). clean hits T1=38.7M vs T8=28.4M (73% coverage) ⇒ ~27% of T8 events run
+  MARKER mode uncovered. Coverage-corrected T8 decode ceiling ≈ 25–30% (advisor: ≤~45% w/ Rule-3
+  unbind slack). Decode-compute is a MINORITY of the T8 wall regardless.
+
+T8 BINDER (the ≥55–75% that is NOT clean decode-compute), GZIPPY_VERBOSE trace first-hand:
+1. **u16 post-flip/marker path = 58.6% of decoded BODY bytes** (post_flip_u16_bytes=118.6M, trace
+   labels it "Design-B1 prize"). Bulk of T≥2 bytes flow through the slow u16 marker→drain path,
+   NOT the clean u8 fast path VAR_V/kernel optimized — why the clean gain was absorbed + slow_knob
+   barely moved T8. Speculation header-failures 14/19; body_rate blended 286 MB/s.
+2. **Pool sched + serial tail:** Theoretical-Optimal 0.127s → Real-Decode 0.162s (~28% pool
+   inefficiency, fill 73–83%, dispatch saturated ~51/60) → wall ~0.22s (~0.06s SERIAL outside the
+   pool: in-order publish / drain / CRC). Corroborates project_confirmed_offset_prefetch_gap.
+
+RE-POINT (per PROCESS — bottleneck moved off the clean kernel at T8): NEXT = (A) ORACLE-bound the
+u16-path ceiling (if 58.6% u16 body ran at clean-path rate, how much wall drops? likely the bigger
+prize — rapidgzip ties DESPITE the same engine gap via in-flight overlap); (B) pool-sched/serial-
+tail SERIAL-WORK-vs-DECODE-WAIT decomposition. Inner kernel KEPT as confirmed T1 lever, NOT the T8
+path to 1.0×. No build this turn (perception + causal ID + advisor only). Tree clean; no orphans.
+NOTE for next owner: guest reachable ONLY as `ssh neurotic 'ssh REDACTED_IP "…"'` (local key not
+authorized on guest; -J neurotic from local FAILS the final hop). Watch leftover `timeout` sleep
+watchdogs after claude -p / measurements — kill -P the wrapper pid.
+
+## WINDOW-DISCARD LEVER — SOURCE-VERIFIED + QUANTIFIED → **FALSIFIED** [2026-06-07, leader fresh instance]
+Charter: plans/window-discard-and-overhead-diagnosis.md. The advisor flagged
+`reset(None, window_opt)` (gzip_chunk.rs:1107) as discarding an available predecessor window.
+**FULL CALL-GRAPH TRACE REFUTES IT.** No window is discarded.
+
+STEP 0: VAR_V committed as 9b674651 (byte-exact TIE kept per rule 7a, gain latent).
+
+WHY NO DISCARD (source, first-hand):
+- gzip_chunk.rs:1107 `block.reset(None, window_opt)` — `output=None` makes the seed guard
+  (`marker_inflate.rs:590 if let (Some(out),Some(window))`) false. BUT its ONLY caller,
+  `decode_chunk_unified_marker` (gzip_chunk.rs:743), hard-codes `marker_decode_step(..., &[], ...)`.
+  So `initial_window=&[]` → `window_opt=None` ALWAYS at :1107. It discards nothing — there is no
+  window on that path to begin with. (The seed `output` param is only a precondition gate; the
+  seed actually writes the predecessor into `output_ring`, marker_inflate.rs:709 — not into output.)
+- The window-PRESENT case is handled SEPARATELY + EARLIER: `decode_chunk_with_rapidgzip_impl`
+  (gzip_chunk.rs:598) `if initial_window.len()==MAX_WINDOW_SIZE` → finish_decode_chunk_impl /
+  _with_inexact_offset WITH the window = the clean seeded fast path (vendor setInitialWindow). It
+  NEVER reaches the marker bootstrap. Worker dispatch (chunk_fetcher.rs:2323) routes a
+  `window_map.get(start_bit)==Some` chunk straight there with materialized window bytes.
+- The +8.7% window-seed (commit 9949d2f0) is LIVE for window-present chunks via this :598 path;
+  it was implemented in MarkerRing (now `GZIPPY_MARKER_RING=1` legacy only) but the production
+  vendor-Block path has its OWN equivalent seeded route at :598. Not regressed.
+
+QUANTIFIED (silesia 68MB, pure-rust-inflate, GZIPPY_VERBOSE, path=ParallelSM, ~18 chunks):
+- T1: window_seeded=16, finished_no_flip=0  → EVERY non-zero chunk seeds its window.
+- T2/T4: window_seeded=2, finished_no_flip=15 → ~89% window-absent.
+- T8: window_seeded=2, finished_no_flip=16 → ~89% window-absent.
+The T1→T8 collapse is the CAUSE: at T1 the in-order consumer publishes each window before the
+single worker needs the next chunk; at T≥2 workers race AHEAD of in-order publication →
+`window_map.get` returns None → speculative marker bootstrap. This is the FAITHFUL vendor model
+(rapidgzip is also ~97% window-absent at runtime, chunk_fetcher.rs:2235-2250 non-blocking get).
+The 16 absent chunks at T8 had NO predecessor window AVAILABLE-AND-DISCARDED — they were
+genuinely not-yet-published. **No discard. No lever here.**
+
+FALSIFIER (pre-registered, then RESOLVED): "If a window were discarded, T1 and T8 would BOTH
+show high finished_no_flip (the seed never fires regardless of availability)." MEASURED: T1
+shows finished_no_flip=0 / window_seeded=16. The seed DOES fire whenever a window is available.
+Falsifier triggered ⇒ window-discard claim REJECTED.
+
+NEXT (per charter step 2, NOT yet started — gated): the real binder is production clean-path
+OVERHEADS that absorbed VAR_V's +48% isolation gain (ring %U8_RING_SIZE / reversed-bits dist /
+backref arms / resumable cap). The only window-related angle that remains FAITHFUL is closing the
+worker-vs-consumer publication race so MORE chunks seed at high T — but rapidgzip has the same race,
+so that is parity-matching not a gzippy-only fix. STOPPED at supervisor gate before any large build.
+
+
+
+## VAR_V INTEGRATION + REAL-WALL MEASUREMENT — DONE [2026-06-07, leader fresh instance]
+Charter: plans/varv-integrate-and-measure.md. VERDICT: byte-exact, WALL TIE, decode STILL binds.
+
+### INTEGRATION (faithful, real overheads kept — NO shortcut)
+- VAR_V speculative software-pipelined fast loop ported INTO production
+  `read_internal_compressed_specialized::<false>` (marker_inflate.rs ~:1454), the clean
+  post-flip path = 89% of production (trace: finished_no_flip=16/18 chunks). Ported ONTO the
+  REAL production wrapping u8 ring (`% U8_RING_SIZE`) — NOT a flat buffer. Kept ALL the overheads
+  the bench elided: ring modulo + wrap-straddle (back-ref via the EXISTING `emit_backref_ring_u8`),
+  the resumable `n_max_to_decode` cap (top-of-loop guard `emitted+FAST_OUT_SLOP < n_max_to_decode`),
+  drain, CRC (downstream sink unchanged). Distance via production's `self.dist_hc` (cached
+  reversed-bits), NOT the bench's LutDistCode — faithful + byte-exact. Fast loop runs only while
+  the physical dst region won't wrap (`dst_phys+FAST_OUT_SLOP<=U8_RING_SIZE`) + input slop; falls
+  to the unchanged careful per-symbol loop near wrap / resumable boundary / block tail. Const-folds
+  away entirely on the marker `<true>` path. (No commit yet — STOPPED at supervisor gate.)
+- BYTE-EXACT (dual-feature, dual-arch): gzippy-native arm64 AND gzippy-isal x86_64 (Rosetta
+  cross-compile) BOTH emit silesia sha 028bd002...cb410f via path=ParallelSM, T1 AND T8. Guest
+  (x86_64) native build also sha-exact. Tests: routing 37/0, pure_rust_inflate_corpus, the
+  adversarial seam test (faithful_u8_flip_seam_max_distance_backref_vs_flate2) + native_fold_parity
+  all GREEN (--features gzippy-native, --test-threads=1).
+
+### MEASUREMENT (leader-run, locked guest trainer=REDACTED_IP -J neurotic, 16c, gov=performance)
+- Built base (fa9fd73c, VAR_V reverted via patch -R) + varv (HEAD+VAR_V) on guest,
+  RUSTFLAGS=-C target-cpu=native, both sha-exact. rapidgzip 0.16.0 same sha. RAW=211968000.
+  measure.sh interleaved N=11, taskset-pinned, output-sha-verified=OK every run.
+- T8 (CPUS=0,2,4,6,8,10,12,14): run1 varv 0.2145s vs base 0.2220s = 1.035x TIE (spread 10%);
+  run2 varv 0.2213s vs base 0.2137s = 0.966x TIE (spread 31%). Sign FLIPS between runs ⇒
+  noise-dominated TIE, mean ≈ 1.00x. rapidgzip 1.62–1.71x vs base (gap UNCHANGED).
+- T1 (CPUS=0): varv 0.5165s vs base 0.5256s = 1.018x TIE (spread 7%). rapidgzip 1.702x vs base
+  (gap UNCHANGED — identical to the pre-VAR_V faithful-u8 measurement's 1.702/1.704x).
+- PER-STAGE TRACE (GZIPPY_VERBOSE, T8): decodeBlock base 1.227s vs varv 1.248s (= same, +1.7%
+  noise); Pool Fill Factor 82.25% (base) / 82.65% (varv) — workers ~83% busy DECODING, placement
+  overhead only ~17%. finished_no_flip=16 (VAR_V IS on the production bulk path).
+
+### VERDICT — decode STILL binds; VAR_V's 0.555 did NOT survive integration
+- The wall is a TIE at BOTH T1 and T8; the rapidgzip gap is CONSTANT ~1.70x (unchanged from the
+  prior faithful-u8 TIE). The §3 projection (decode_wall 0.410s, "decode stops binding") is
+  FALSIFIED on the real wall: producer-side `decodeBlock` is UNCHANGED (1.227→1.248s) — the
+  speculative-store gain measured in the flat-buffer bench (+48% vs scalar, 0.555x ISA-L) was
+  ABSORBED by the real ring/wrap/resumable overheads the bench elided (exactly the advisor's
+  "0.555 is optimistic, real integration ≤ 0.555" caution, now confirmed quantitatively).
+- CONTINGENT NEXT LEVER (per charter): decode STILL binds ⇒ the inline-asm/BMI2 spike to push the
+  rate is the live direction (NOT placement — placement is ~17% slack here, fill-factor 83%).
+  Do NOT start it this turn. The byte-exact VAR_V integration is a TIE — KEEP per rule 7a
+  (correct + faithful inner-loop port) but it is NOT itself the wall lever.
+- Independent disproof advisor: plans/varv-integration-advisor-verdict.md (synchronous, read-only).
+- STOPPED for supervisor gate.
+
 ## FAITHFUL u8 NATIVE REWRITE — IN PROGRESS [2026-06-07, leader fresh instance]
 Charter: plans/faithful-u8-native-rewrite.md. Leader-lock held (pid in /tmp).
 ### STEP 1 DONE — production clean path ESTABLISHED (source-map subagent, exit 0, all file:line first-hand)
@@ -1455,3 +1623,81 @@ rapidgzip_same_sink: min=0.5960 med=0.6042 sd=1.8%
 ### SECOND bench round (sweep chunks + prototype E2-E4 in-bench) to settle the plateau falsifier,
 ### OR re-confront placement. No production code was changed (bench files uncommitted; lib.rs has a
 ### measurement-only re-export). HEAD unchanged at 249f25b5.
+
+## INNER HUFFMAN KERNEL — speculative-pipeline isolation bench [2026-06-07, leader fresh instance]
+Charter: plans/inner-huffman-kernel.md. State (causal, advisor-upheld): faithful u8 LANDED
+byte-exact (fa9fd73c), wall TIE, gap constant ~1.70x at T1+T8 => binder is per-symbol Huffman
+LUT-decode COMPUTE. Traffic/ring/placement all SLACK.
+
+### SOURCE-VERIFIED FIRST-HAND (before any code):
+- igzip trick #1 (packed-flat-short-code table, one u32 retires up to 3 literals + bit-length)
+  is ALREADY BUILT + PRODUCTION-LIVE: lut_huffman.rs make_inflate_huff_code_lit_len builds with
+  TRIPLE_SYM_FLAG=0 (=> triples ENABLED); LutLitLenCode::rebuild_from (lut_huffman.rs:998) passes
+  it; the production clean loop read_internal_compressed_specialized<false> (marker_inflate.rs:1475)
+  decodes via lut_litlen_decode -> (symbol, sym_count, bit_count) and unpacks up to 3 packed
+  literals (marker_inflate.rs:1492-1524). So trick #1 is NOT the remaining lever.
+- igzip trick #2 (speculative software-pipelined loop) is NOT present in production: the clean
+  loop (a) stores ONE u8 per inner iter with `pos % U8_RING_SIZE` (marker_inflate.rs:1504), NOT an
+  unconditional 8-byte packed store advanced by actual count; (b) does NOT preload next lit/len +
+  dist before knowing current symbol type; (c) refills every outer iter. THIS is the remaining
+  lever: the speculative pipeline (igzip asm:507-627) on the flat-u8 path.
+
+### PRE-REGISTERED FALSIFIER (set BEFORE building/measuring):
+- BUILD: a new flat-u8 bench variant in benches/engine_isolation.rs (VAR_V) that decodes the SAME
+  clean silesia chunk via the EXISTING packed-flat-short-code table (LutLitLenCode/LutDistCode,
+  trick #1) + a NEW speculative software-pipelined loop (trick #2): unconditional 8-byte packed-
+  literal store into a flat linear u8 buffer advanced by actual sym_count, slop-margin headroom
+  guard (no per-symbol bounds check inside the fast region), preload of next litlen+dist, branchless
+  multi-literal output, MOVDQU/word back-ref copy on the flat buffer. Pure-Rust first; inline-asm
+  only where Rust codegen demonstrably lags (measured, not assumed).
+- BYTE-EXACT GATE (absolute): VAR_V SHA-equal vs VAR_I scalar AND vs VAR_III ISA-L over the swept
+  clean chunks, all 5. A wrong-bytes oracle is VOID.
+- SELF-TEST: VAR_III/VAR_I (iii/i) in [2.5,3.6] on the guest (existing band) must still hold —
+  validates the ISA-L oracle denominator.
+- PASS  = VAR_V clean MB/s (guest, median-of-per-chunk-medians) gives (V)/(iii ISA-L) >= 0.85,
+  i.e. via tier1-design v2 §3 (anchored 92.7ms<->104MB/s, 39 chunks, ramp 1.36, T8) projects
+  decode_wall that RE-BINDS off decode (<= 0.604s same-sink bar + spread), closing the ~1.70x.
+- PLATEAU = (V)/(iii) stays ~pure class (<= 0.65, the round-2 plateau line) with residual to 0.85
+  > inter-chunk spread (round-2 sd ~0.036). Per the standing falsifier this re-opens the FFI/bar
+  fork (is igzip-class reachable in pure-Rust+asm AT ALL once BOTH tricks are present).
+- Numbers ONLY from the locked guest (interleaved, taskset-pinned, sha-verified). Rosetta gives
+  byte-exact validation but NOT authoritative MB/s.
+
+### RESULT — AUTHORITATIVE GUEST (freq-locked, AVX2 live, SHA_ALL_EQUAL=yes, N=11 interleaved, taskset core0)
+Host driver run_engine_isolation.sh -> host_lock_and_bench.sh (no_turbo pin + RESTORE VERIFIED).
+ALL 8 variants BYTE-EXACT on all 5 swept clean silesia chunks (SHA_ALL_EQUAL=yes incl VAR_V; the
+VAR_IV/VAR_V Rosetta VOIDs during local iteration were Rosetta-x86-64-v2 artifacts, NOT real —
+the guest native run is byte-clean). Self-test PASS (iii/i=2.76, in [2.5,3.6]).
+
+AGGREGATE (median-of-per-chunk-medians, MB/s):
+  VAR_I scalar (production clean loop)              105   vs_isal 0.374
+  VAR_IV_E234 (round-2 grafts, u16 ring)           116   vs_isal 0.413
+  VAR_V packed-table + SPECULATIVE PIPELINE flat-u8 156   vs_isal 0.555  <-- THE LEVER
+  VAR_III ISA-L oracle                             281   vs_isal 1.000
+Per-chunk VAR_V vs_isal: 0.554 0.551 0.555 0.555 0.511 (median 0.554, sd ~0.018, tight).
+
+VERDICT = PLATEAU (by the PRE-REGISTERED structural falsifier).
+- PASS line (pre-registered) = (V)/(iii) >= 0.85 so decode RE-BINDS off the shared pipeline floor.
+  Measured 0.554. Residual to 0.85 = 0.296 ~= 16 sd. FALSIFIER FIRES -> PLATEAU.
+- BUT a MATERIAL ADVANCE over the round-2 plateau: 0.413 -> 0.554 (+34% over E234, +48% over
+  scalar). The speculative software-pipelined loop (trick #2) on flat-u8 is the single biggest
+  inner-loop gain measured this campaign. It confirms (a) trick #1 packed-table was ALREADY
+  production-live (so the round-2 "grafts" weren't the table), and (b) the genuine remaining
+  lever was trick #2 + flat-u8 linear buffer, which VAR_V isolates and DELIVERS — but to 0.55x,
+  not igzip-class.
+- §3 projection (anchored 92.7ms<->104MB/s, 39 chunks, ramp 1.36, T8): VAR_V projects decode_wall
+  ~0.410s. This is NUMERICALLY < the 0.604s tie bar, AND now also < the ~0.54s placement-laden
+  consumer floor -> at 0.55x ISA-L the decode term FALLS BELOW the floor, so decode would stop
+  being the SOLE binder and the wall would RE-BIND on the ~0.54s floor. This is exactly the round-2
+  "numeric pass is an artifact while the RATIO criterion governs" situation — the pre-registered
+  RATIO criterion (0.85) GOVERNS -> PLATEAU. (The decode-falls-below-floor observation is a real
+  shift worth the advisor + supervisor's attention: it suggests at VAR_V's rate the BINDER may move
+  from engine to the placement/consumer floor — the co-primary from project_pregate.)
+- Per the standing falsifier, PLATEAU re-opens the FFI/bar fork: igzip-class (0.85) is NOT reached
+  in pure-Rust even with BOTH tricks (packed table + speculative pipeline) on flat-u8. Remaining
+  gap to ISA-L (0.55->1.0) is plausibly the inline-ASM/BMI2-specific codegen + the unchecked
+  over-read/write the safe-Rust headroom guard only partially exploits. Inline-asm is authorized
+  but is the next, larger increment; this checkpoint settles the PURE-RUST ceiling of the lever.
+- DECISION: do NOT integrate yet (pre-registered: integrate only on PASS). Report the achievable
+  pure-Rust ceiling (0.55x) + the decode-falls-below-floor nuance to the supervisor. inline-asm
+  spike + the placement co-primary are the two named next directions.
