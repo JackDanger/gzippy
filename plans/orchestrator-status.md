@@ -1008,3 +1008,39 @@ ttp.rx_recv_block/dispatch_recv (source-classified). sha=OK byte-exact every run
   tie). The ENGINE front remains gated by §2.3's isolation bench (not run this turn).
 - NEXT: independent disproof advisor (read-only) → plans/step0-advisor-verdict.md, then STOP for the
   supervisor gate. NO placement port, NO engine work started. Host RESTORE VERIFIED; no orphan procs.
+
+### INDEPENDENT DISPROOF ADVISOR [DONE] → both conclusions SAFE (CORROBORATE-WITH-CAVEATS)
+plans/step0-advisor-verdict.md (independent Opus, read-only, re-derived from source).
+- (a) CORROBORATE-WITH-CAVEATS. PRIME SUSPECT CONFIRMED: my original CONTAINING_CACHED counter
+  was VACUOUS — [enc,max] is the speculative START-tolerance window (decoded bytes BEGIN at max,
+  chunk_data.rs:143-145; re-anchored chunks have enc==max), so it could never fire for a real
+  containing parent. BUT the NO verdict SURVIVES on the bug-free channels: nearest_le_start:-1 on
+  every stall (correct necessary-condition test) + CONTAINING_IN_FLIGHT=0 (keyed). The port reads
+  the parent from cache(); nearest_le_start:-1 proves it isn't there. Advisor's owed item ANSWERED.
+- (b) CORROBORATE-WITH-CAVEATS. Honest; source dissolves the ~225ms fear (apply_window runs on the
+  POOL, the consumer blocks on a future wrapped as wait.future_recv NESTED inside
+  dispatch_post_process — correctly bucketed DECODE-WAIT). Robust across operating points (even
+  NORMAL marker-heavy trace serial=0.069s ≪ 0.54s). CAVEAT: /dev/null excludes production output-
+  write (writev ~0.245s on a real sink) — the real floor is ~0.015s + output-write; still passes,
+  fair only if rapidgzip's 0.54s is same-sink. Keep the tie contingent on engine ≤39-45ms AND a
+  same-sink floor ≤0.54s.
+
+### CORRECTION RUN (commit d764734c, locked guest) — advisor fix applied, verdict HELD
+Re-snapshot the encoded END (enc+encoded_size_bits); test enc<decode_start<encoded_end; added the
+bug-free has_nearest_le_start channel. Byte-exact OFF==identity (028bd002…cb410f / e114dd2b…).
+RESULT (all sha=OK): **has_nearest_le_start=0 at ALL cap settings — default(16), cap1, AND cap256
+(huge).** Even with an effectively unbounded cache NO resident chunk starts at/below the stalled
+offset ⇒ rules OUT capacity-eviction, CONFIRMS never-retained / consumer-pace (containing chunk
+consumed+passed before the consumer reached it; lags the frontier ~318ms). The interior-reuse port
+has no resident parent to reuse REGARDLESS of cache size. NO verdict now on bug-free, cap-swept evidence.
+
+### STEP-0 FINAL (STOP for supervisor)
+(a) parent-cached = **NO** (consumer-pace / never-retained, cap-swept, advisor-confirmed) ⇒
+   tier1-design-v2 §1.2 interior-reuse/getIndexedChunk port is NOT the fix as written; placement
+   RE-SCOPES to a consumer-pace fix (keep the containing chunk in-flight; rapidgzip's consumer stays
+   ~0-17ms behind its prefetcher vs gzippy ~318ms). Faithful (rapidgzip does this), just a different
+   mechanism than interior-EMIT.
+(b) non-decode floor = **~0.015s (≪ 0.54s)** ⇒ CONTINUE; consumer does NOT structurally forbid the
+   tie. Caveat: re-quote with production output-write for the true same-sink margin.
+No placement port / engine work started. Both subagents (advisor) read-only, synchronous, no orphans.
+Host freq RESTORE VERIFIED after every guest run. Awaiting supervisor gate.

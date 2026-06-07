@@ -76,3 +76,14 @@ sha-verified), after the positive control passes:
 
 DISCIPLINE: this probe answers ONLY the residency question. It does NOT license writing the
 port. A YES means "placement port direction valid"; building it is gated by the supervisor.
+
+## POST-RUN CORRECTION (advisor-caught, applied commit d764734c)
+The original CONTAINING_CACHED test used `[encoded_offset_bits, max_acceptable_start_bit]`,
+but that is the speculative START-tolerance window (decoded bytes BEGIN at
+`max_acceptable_start_bit`, chunk_data.rs:143-145; a re-anchored chunk collapses to
+enc==max) — so that counter could NEVER fire for a real containing parent (vacuous). FIX:
+snapshot the encoded END (`enc + encoded_size_bits`) and test `enc < decode_start <
+encoded_end`; ADD the bug-free necessary-condition channel `has_nearest_le_start` (does any
+resident chunk START below the stalled offset — the minimum a containing parent must satisfy).
+The NO verdict held on the corrected, cap-swept evidence: has_nearest_le_start=0 at default,
+cap1, AND cap256 (huge cache) ⇒ never-retained / consumer-pace, NOT capacity-eviction.
