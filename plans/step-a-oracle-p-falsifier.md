@@ -183,3 +183,27 @@ the pre-gate's class-C bracket (11-29%) for the CLEAN decode — but the recover
 is the speculation, not the clean engine. CLAUDE.md: attribution (the arbiter) is a
 hypothesis generator, NOT the verdict; the single-pass decomposition (a removal-style
 bound) is the verdict. This is THE item for the disproof advisor to adjudicate.
+
+---
+## ADVISOR REFUTATION [2026-06-07] — "PLACEMENT SUFFICIENT" is STRUCK → NECESSARY-BUT-INSUFFICIENT
+Independent disproof advisor (plans/step-a-oracle-advisor-verdict.md) re-derived every
+number first-hand (all reproduce) and REFUTED the inference. ACCEPTED corrections:
+1. RAMP SELF-REFUTATION (decisive): I compared gzippy's NO-ramp floor (0.41-0.49) to
+   rapidgzip's WITH-ramp wall (0.524). Applied consistently (both ×1.36): gzippy
+   0.56-0.66s vs rapidgzip 0.524s = 7-26% LOSS — squarely my OWN pre-registered
+   NECESSARY-BUT-INSUFFICIENT band (0.55, 0.75]. Floor↔floor: 0.41-0.49 vs rapidgzip 0.385
+   (gzippy also higher). "Sufficient" was a floor-vs-wall mismatch. STRUCK.
+2. "redundant re-decode" MISCHARACTERIZED: scan_candidate = 4378ms of genuine FIRST-PASS
+   block_body decode (7720 blocks, each chunk decoded ONCE via the expensive MARKER path,
+   not twice). T1=3.734s is the CLEAN rate (~89ms/chunk); T8=6.33s is the MARKER rate
+   (168ms/chunk); the 2.6s gap is the marker PREMIUM (~77ms/chunk), PARTLY STRUCTURAL
+   (rapidgzip marker-decodes too, 31.25% replaced markers) — only partly placement-recoverable.
+3. ENGINE RESIDUAL survives perfect placement: gzippy CLEAN rate 91ms/chunk vs rapidgzip
+   CLEAN 39ms/chunk = 2.3× slower ENGINE. All-clean idealized → ~0.65s with ramp, still
+   > 0.524. ⇒ class-C/engine is CO-PRIMARY, NOT bounded-secondary.
+CORRECTED VERDICT: PLACEMENT NECESSARY-BUT-INSUFFICIENT (largest single lever,
+~1.12→~0.65-0.79s, the faithful-port first step) + a CO-PRIMARY engine clean-rate gap.
+OWED before STEP-C: a CLEAN-ONLY T8 removal oracle (force all chunks through
+isal_stream_inflate with predecessor windows, measure busy) to set the true engine ceiling
+— the cleanest least-entangled signal, which both Oracle-C (over-removed) and Oracle-P
+(assumed-away) missed.
