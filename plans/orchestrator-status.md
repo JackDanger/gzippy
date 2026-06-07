@@ -1,5 +1,48 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## MARKER FAST LOOP LANDED → rg's multi-cached u16 marker loop ported; T8 wall = TIE (no move), byte-exact, KEPT per 7a. Advisor C1 UPHELD / C3 REFUTED my mechanism [2026-06-07, OWNER turn, HEAD 04fda86d]
+Ported step (i) of the bounded plan: rg's multi-cached u16 marker FAST LOOP
+(vendor `readInternalCompressedMultiCached` deflate.hpp:1585-1666). Added a
+speculative software-pipelined fast loop to the u16 MARKER path
+(`read_internal_compressed_specialized::<true>`, marker_inflate.rs `'mfast` loop),
+mirroring the clean path. rg runs the SAME tight multi-cached loop for u16 markers
+as u8 clean; gzippy's marker path was stuck on the careful per-symbol loop. Three
+faithful u16 deltas (widened-u16 speculative store, distance_marker += lit_prefix +
+emit_backref_ring::<true>, no marker-window range check). Charter CURRENT STATE
+updated. Advisor: plans/marker-loop-port-advisor-verdict.md. Brief:
+plans/marker-loop-port-brief.md.
+
+BYTE-EXACT: gzippy-native arm64 + gzippy-isal guest x86_64, sha 028bd002…cb410f
+T1/T8/T16 path=ParallelSM. 856 lib tests (1 fail = pre-existing flaky diff_ratio).
+Seam + native_fold_parity green.
+
+REMOVE-AND-MEASURE (locked guest 10.30.0.199 double-ssh, 16c gov=perf turbo-on,
+taskset 0,2,4,6,8,10,12,14, T8, measure.sh interleaved N=11, RAW=68229982, sha-OK):
+markerfast vs mergefix(prior HEAD) = +1.2% / +3.0% / +0.0% over 3 runs = TIE
+(spread 10-38%). decodeBlock 0.9568→0.9485s (~0.9%); rg decodeBlock 0.500s ⇒ gzippy
+still ~1.9× but SLACK-MASKED (Fill 87%, Total Real Decode 0.137s, wall 0.175s =
+0.73× rg, unchanged). KEPT per rule 7a (faithful TIE, gain latent behind binder).
+
+ADVISOR: C1 UPHELD (widening + wrap-safety + no-desync + faithful range-check drop
+all source-verified; emit_backref_ring is one shared fn). C2 UPHELD-WITH-CAVEATS
+(honest TIE + interleaved freq-neutral, but spread can't see ≤10-20%). C3 REFUTED
+(LOAD-BEARING): I read BOOTSTRAP_POST_FLIP_U16_BYTES BACKWARDS — it counts CLEAN
+flipped bytes (gzip_chunk.rs:1489), so 2.0% is the sliver the loop does NOT touch;
+the loop owns the ~98% marker COMPLEMENT. The exact counter-inversion the charter
+warns about. Commit msg corrected.
+
+CORRECTED PREMISE: "decodeBlock 1.69× = the marker loop" is now suspect — the loop
+owns ~98% of bootstrap body yet barely moved decodeBlock and did NOT move the wall.
+The engine SUM (~1.9×) is real but SLACK-MASKED at Fill 87% (Phase-0 already showed
+engine TIE-vs-TIE seeded). The T8 binder is NOT the per-thread engine compute. NEXT
+(do NOT start — supervisor gate): re-perceive the wall; the gap is the SCHEDULING/
+SERIAL term (pool-fill + in-order consumer head-of-line wait =
+project_confirmed_offset_prefetch_gap) — bound THAT with a removal oracle, not the
+slack-masked engine. GUEST: /root/gzippy tree RESTORED to baseline (marker patch
+reversed) + mergefix overlay; builds /tmp/gzbuild-{base,mergefix,markerfast} (all
+sha 028bd002…cb410f); drivers /tmp/markerfast_{measure,trace}.sh + /tmp/sha_markerfast.sh
+(bash); patch /tmp/marker_fastloop.patch. NO orphan processes.
+
 ## MERGE-REMOVAL LANDED → rg's view-based applyWindow ported; T8 wall MOVED +12% (0.65×→0.73× rg), byte-exact, advisor-UPHELD [2026-06-07, OWNER turn, branch reimplement-isa-l]
 Executed step 1 of the bounded plan: port (ii) rg's view-based applyWindow = drop the redundant
 full-output memcpy in `merge_resolved_markers_into_data`. Charter CURRENT STATE updated. Advisor:
