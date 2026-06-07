@@ -7,10 +7,9 @@
 //! bench rate.
 //!
 //! Both code paths use multi-symbol Huffman caching (bench uses
-//! libdeflate-style scalar; bootstrap uses
-//! `HuffmanCodingShortBitsMultiCached` TRIPLE_SYM). So the gap is NOT
-//! scalar-vs-SIMD as `plans/rust-rapidgzip.md` work item #1(b) framed
-//! it.
+//! libdeflate-style scalar; bootstrap used a vendor MultiCached.hpp-style
+//! TRIPLE_SYM cache). So the gap is NOT scalar-vs-SIMD as
+//! `plans/rust-rapidgzip.md` work item #1(b) framed it.
 //!
 //! This bench monomorphizes the `read_internal_compressed_specialized
 //! <CONTAINS_MARKERS>` template on identical input:
