@@ -124,20 +124,28 @@ say "[b] seed capture windows=$CAP_WINS"
 
 cap_clean_trace() { # <label> <slow-env...>  -> clean-only trace at placement-perfect op-point
   local label="$1"; shift
+  # TRACE run: output to /dev/null (T-invariant, small sink) so consumer.writev
+  # self-time reflects the production streamed sink, NOT a 162MB disk write that
+  # would inflate the serial bucket (charter: stream output to /dev/null).
+  # GZIPPY_TIMELINE = trace_v2 Chrome B/E spans (self-time decomposable).
   drop_caches
-  local out; out="$(mktemp)"
-  # GZIPPY_TIMELINE = trace_v2 Chrome B/E spans (self-time decomposable), the
-  # format consumer_block_decompose.py consumes (NOT GZIPPY_LOG_FILE/trace.rs).
   env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_SEED_WINDOWS="$SEEDF" \
     GZIPPY_TIMELINE="$ARTDIR/b_${label}_trace.json" "$@" \
-    taskset -c "$mask" "$GZIPPY" -d -c -p "$T" "$CORPUS" >"$out" 2>"$ARTDIR/b_${label}.err" || true
+    taskset -c "$mask" "$GZIPPY" -d -c -p "$T" "$CORPUS" >/dev/null 2>"$ARTDIR/b_${label}.err" || true
+  # SHA-VERIFY run (separate, no trace overhead): prove this op-point is byte-exact.
+  drop_caches
+  local out; out="$(mktemp)"
+  env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_SEED_WINDOWS="$SEEDF" "$@" \
+    taskset -c "$mask" "$GZIPPY" -d -c -p "$T" "$CORPUS" >"$out" 2>>"$ARTDIR/b_${label}.err" || true
   local sha; sha="$(sha_of "$out")"; rm -f "$out"
   local ok="MISMATCH"; [ "$sha" = "$REF_SHA" ] && ok="sha=OK"
-  say "[b:$label] $ok trace -> b_${label}_trace.json"
+  say "[b:$label] $ok trace -> b_${label}_trace.json (output->/dev/null for trace, separate sha-verify)"
 }
 
-# baseline clean-only (the decompose verdict input)
+# baseline clean-only (the decompose verdict input) — 3 traces for spread.
 cap_clean_trace "clean"
+cap_clean_trace "clean2"
+cap_clean_trace "clean3"
 # SLOW positive control: decode compute +100% (spin). DECODE-WAIT must rise,
 # SERIAL stay flat. GZIPPY_SLOW_HITS=1 prints the clean-loop hit count so we
 # confirm the injection actually fired on the native clean path.
