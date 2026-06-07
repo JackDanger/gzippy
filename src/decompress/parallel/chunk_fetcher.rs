@@ -483,6 +483,26 @@ fn drive_impl<W: std::io::Write>(
             crate::decompress::parallel::compressed_vector::CompressionType::None,
         )
     });
+    // CLEAN-ONLY ENGINE ORACLE: eagerly load the seed side store (if
+    // GZIPPY_SEED_WINDOWS is set) so the on-disk read is out of the workers'
+    // decode time. No-op otherwise.
+    crate::decompress::parallel::seed_windows::preload();
+    // CLEAN-ONLY ENGINE ORACLE: pre-seed the block_finder with the REAL per-chunk
+    // boundaries that have a captured predecessor window, so every dispatch lands
+    // on a boundary whose window is seedable. A clean decode is only possible at a
+    // real boundary; this + the seeded-window fallback forces every chunk down the
+    // CLEAN path while the production consumer / publish chain runs unchanged.
+    // No-op unless seed mode is on. Skip boundaries within one chunk of EOF (an
+    // EOF-adjacent window key is a stream-end artifact, not a real chunk start).
+    {
+        let starts = crate::decompress::parallel::seed_windows::seedable_chunk_starts();
+        for off in starts {
+            if off + (32 * 1024 * 8) < total_bits {
+                block_finder.insert(off);
+            }
+        }
+    }
+
     // Chunk 0's input window is empty by definition (start of stream).
     // Vendor pattern: insert an empty / zero window so subsequent
     // get(0) lookups return a valid SharedWindow rather than nullptr.
@@ -967,6 +987,12 @@ fn drive_impl<W: std::io::Write>(
     trace_v2::flush_all();
     // DECODE-BYPASS: serialize the capture map (no-op unless capture on).
     crate::decompress::parallel::decode_bypass::flush_capture();
+    // CLEAN-ONLY ENGINE ORACLE: snapshot every published window (capture mode) /
+    // report seed hit-miss (seed mode). Both no-ops unless the env vars are set.
+    if crate::decompress::parallel::seed_windows::capture_enabled() {
+        crate::decompress::parallel::seed_windows::write_capture();
+    }
+    crate::decompress::parallel::seed_windows::report_seed_stats();
     Ok((total_crc.crc32(), total_size))
 }
 
@@ -2149,9 +2175,22 @@ fn run_decode_task(
     } else {
         window_map.get(params.start_bit)
     };
-    let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
+    // CLEAN-ONLY ENGINE ORACLE (GZIPPY_SEED_WINDOWS): when the live WindowMap has
+    // NOT yet published this chunk's predecessor window, fall back to the captured
+    // correct window from the seed store (forcing the CLEAN decode path) instead of
+    // speculation. No-op (None) unless seed mode is on; on a seed miss this returns
+    // None and the chunk takes its normal path (output stays byte-correct). Does NOT
+    // shadow a real window: only consulted when window_at_offset is None.
+    let seeded_window: Option<Vec<u8>> = if params.start_bit != 0 && window_at_offset.is_none() {
+        crate::decompress::parallel::seed_windows::seed_window_for(params.start_bit)
+    } else {
+        None
+    };
+    let until_exact =
+        (window_at_offset.is_some() || seeded_window.is_some()) && params.stop_hint_is_exact;
 
-    let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
+    let decode_mode_clean =
+        params.start_bit == 0 || window_at_offset.is_some() || seeded_window.is_some();
     // Fulcrum `model` reads `worker.decode` span mode tags (rapidgzip patch uses
     // clean | window_absent). Keep boundary_search on causal instants only.
     let worker_decode_mode = if decode_mode_clean {
@@ -2204,11 +2243,31 @@ fn run_decode_task(
         )
     } else if let Some(w) = window_at_offset.as_ref() {
         let bytes = materialize_window(w);
+        // CLEAN-ONLY ENGINE ORACLE capture: this is the NATURAL clean path — the
+        // window is correctly aligned to this real boundary. Record the aligned
+        // (start_bit -> window) pair (no-op unless capture mode is on). A p=1
+        // capture records every chunk this way → perfectly-aligned seed.
+        crate::decompress::parallel::seed_windows::record_clean_window(
+            params.start_bit,
+            bytes.as_ref(),
+        );
         decode_chunk_with_until_exact(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
             &bytes,
+            until_exact,
+            configuration,
+        )
+    } else if let Some(seed_bytes) = seeded_window.as_ref() {
+        // CLEAN-ONLY ENGINE ORACLE: decode with the captured correct predecessor
+        // window — same clean path the published-window arm takes, just sourced
+        // from the seed store instead of the live WindowMap.
+        decode_chunk_with_until_exact(
+            input_bytes,
+            params.start_bit,
+            params.stop_hint_bit,
+            seed_bytes.as_slice(),
             until_exact,
             configuration,
         )
