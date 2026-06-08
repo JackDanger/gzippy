@@ -1,6 +1,37 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## DECODE-vs-STORE LOCALIZATION + PLATEAU/FORK GATE → not separable by slow-injection; PLATEAU/FORK NOT VALIDATED, REFUTED at the engine (ocl_cf 0.925× < 1.0 ⇒ ≥0.075× of the gap is OUTSIDE the engine = placement) [2026-06-07, OWNER turn, HEAD 25846265]
+## OUTPUT IS THE T8 BINDER (fulcrum_total + validated writev-removal oracle) → faithful overlap-writer LANDED (byte-exact, +3.7-6% sign-stable, rule-7a KEEP) [2026-06-07, OWNER turn, branch reimplement-isa-l]
+fulcrum_total on the production T8 trace (consumer = wall-critical thread, captured to a regular tmpfs
+file = measure.sh's sink; piping to sha256sum was a backpressure phantom that inflated writev 58→135ms):
+consumer split = 64-67% WAIT-on-workers, **32-34% OUTPUT (consumer.writev)**, 0.8% serial compute.
+
+CAUSAL writev-removal oracle (NEW GZIPPY_SKIP_WRITEV_SYSCALL, byte-transparent OFF==identity): gz_off
+0.1653s (0.79× rg), gz_skip 0.1310s, rg 0.1311s ⇒ **removing output ≈ ties rg ⇒ OUTPUT is the single
+largest T8 binder, NOT the engine.** REVISES the prior "0.135× engine table-load + 0.075× placement"
+split: engine is the T1 binder (T1 skip helps only +10%, gzippy 0.615× rg), SLACK-MASKED at T8
+(parallelized ~8×); the un-parallelizable serial 211 MiB output copy is the Amdahl T8 tail.
+
+Granularity REFUTED (GZIPPY_WRITEV_CAP_KIB {2048,256,95} all TIE/worse) ⇒ lever is write TIMING not
+size. Instant-feed discriminator REFUTED the advisor's "feed-rate-masked" phantom (exposure 35→31ms when
+engine sped 38ms ⇒ engine-INDEPENDENT). Advisor synchronous (plans/output-binder-advisor-verdict.md):
+A UPHELD-W-CAVEATS (~14ms irreducible memory-bandwidth floor rg also pays; ~20ms addressable exposure),
+B REFUTED-as-stated (skip 0.98× rg not 1.0×, ~2% engine/sched residual), E REFUTED by the discriminator.
+Brief: plans/output-binder-decomposition-brief.md.
+
+LANDED (rule-7a, byte-exact 028bd002…cb410f T1+T8 stdout/pipe/file, 864 lib pass / only 2 missing-fixture
+env fails + the load-flake): src/decompress/parallel/output_writer.rs — single in-order background
+writer thread (GZIPPY_OVERLAP_WRITER=1, Linux+regular-fd, OFF==inline identity); consumer hands the
+owned chunk to it AFTER window-publish+CRC-combine so the writev overlaps the next decode WAIT (faithful
+rg writeFunctor ParallelGzipReader.hpp:521); joined+error-propagated before the trailer check. MEASURED
+(5 interleaved passes): gz_overlap/gz_off 1.06/1.01/1.045/1.042/1.037× = sign-stable +3.7-6%
+(0.79×→~0.81× rg), TIE-by-spread, captures ~6ms of the ~20ms ceiling (rest = shared memory-bandwidth floor).
+
+**SUPERVISOR GATE — output localized as the T8 binder (validated removal oracle, advisor-vetted); a
+faithful partial tooth banked; NEXT = the residual ~14ms memory-bandwidth floor (likely shared/irreducible),
+the ~2% engine/sched residual, + the window-absent marker bootstrap. Do NOT re-open the engine table-load
+fork (it's the T1 binder, slack-masked at T8).** GUEST artifacts in charter CURRENT STATE. NO orphan processes.
+
+## SUPERSEDED — DECODE-vs-STORE LOCALIZATION + PLATEAU/FORK GATE → not separable by slow-injection; PLATEAU/FORK NOT VALIDATED, REFUTED at the engine (ocl_cf 0.925× < 1.0 ⇒ ≥0.075× of the gap is OUTSIDE the engine = placement) [2026-06-07, OWNER turn, HEAD 25846265]
 Built + committed (25846265) two byte-transparent localization knobs (GZIPPY_SLOW_DECODE /
 GZIPPY_SLOW_STORE) wired into the fast (VAR_V) + careful loops of decode_clean_into_contig — decode
 injects after lut_litlen.decode + dist_hc.decode, store injects after literal-store +

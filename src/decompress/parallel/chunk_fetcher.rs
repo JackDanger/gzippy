@@ -72,6 +72,8 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::gzip_chunk::{decode_chunk, decode_chunk_window_absent};
+#[cfg(all(unix, parallel_sm))]
+use crate::decompress::parallel::output_writer;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
@@ -679,6 +681,13 @@ fn drive_impl<W: std::io::Write>(
     // from `~GzipChunkFetcher` before member destruction (line 686).
     thread_pool.stop();
 
+    // Faithful overlap writer: drain + join the background output writer so
+    // ALL bytes are on the fd and any write error becomes terminal BEFORE the
+    // trailer CRC/ISIZE is returned for verification. No-op when the overlap
+    // writer was never used (inline writev path). Join even on a consumer
+    // error so the writer thread does not outlive the run.
+    #[cfg(all(unix, parallel_sm))]
+    let writer_result = crate::decompress::parallel::output_writer::finish();
     // Report replay stats even on a (CRC) error so the bypass experiment
     // can see hit/miss counts when the run aborts.
     crate::decompress::parallel::decode_bypass::report_replay_stats();
@@ -690,6 +699,11 @@ fn drive_impl<W: std::io::Write>(
         crate::decompress::parallel::perfect_overlap::report_stats();
     }
     consumer_result?;
+    // Surface any background-writer error as a terminal decode error (the
+    // bytes are on the fd / partially written, same contract as the inline
+    // writev path which returns Err on a failed write).
+    #[cfg(all(unix, parallel_sm))]
+    writer_result.map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
 
     if trace::is_enabled() {
         trace::emit(
@@ -3832,10 +3846,31 @@ fn drain_one_pending<W: std::io::Write>(
                 total_crc.append(stream_crc);
             }
             let mut iovs = fd_vectored_write::to_io_vec(parts.iter().copied(), &[]);
+            // MEASUREMENT-ONLY output-removal oracle. GZIPPY_SKIP_WRITEV_SYSCALL=1
+            // skips ONLY the kernel writev (the 211 MB tmpfs page-cache copy on the
+            // serial in-order consumer thread) while keeping CRC combine, recycle,
+            // and all accounting. WRONG bytes ON (terminal trailer CRC still
+            // verifies the decode ran) -> the off->on wall delta is the CAUSAL
+            // removable share of the OUTPUT term that fulcrum_total localized on the
+            // consumer timeline. OFF == identity (byte-exact). Never on a prod build.
+            let skip_writev = std::env::var_os("GZIPPY_SKIP_WRITEV_SYSCALL").is_some();
             #[cfg(target_os = "linux")]
-            if fd_vectored_write::is_pipe_fd(fd) {
+            if skip_writev {
+                defer_chunk_recycle(recycle_deferral, chunk);
+            } else if fd_vectored_write::is_pipe_fd(fd) {
                 fd_vectored_write::write_chunk_payload_to_fd(fd, &mut iovs, chunk)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            } else if output_writer::enabled() {
+                // FAITHFUL OVERLAP (rapidgzip writeFunctor, ParallelGzipReader.hpp:521):
+                // hand the owned chunk to a single in-order writer thread so the
+                // 211 MiB serial writev overlaps the next chunk's decode WAIT. Windows
+                // are already published and the CRC already combined above, so output
+                // order + trailer correctness are preserved. The writer owns the chunk
+                // for the write lifetime (iovecs stay valid) and recycles it after.
+                // `iovs`/`parts` borrow `chunk`; drop them before moving it.
+                drop(iovs);
+                drop(parts);
+                output_writer::submit_chunk(fd, chunk);
             } else {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;

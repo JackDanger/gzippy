@@ -48,6 +48,8 @@ pub mod lut_huffman;
 pub mod marker_inflate;
 #[cfg(parallel_sm)]
 pub mod memlife;
+#[cfg(all(unix, parallel_sm))]
+pub mod output_writer;
 pub mod perfect_overlap;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
