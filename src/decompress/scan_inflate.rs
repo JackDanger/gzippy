@@ -228,6 +228,132 @@ pub fn scan_deflate_fast(
     })
 }
 
+/// Walk a single deflate stream block-by-block to its `BFINAL` end and report
+/// how many input bytes that one stream occupies (byte-aligned, EXCLUDING any
+/// gzip trailer). Used by the multi-member splitter to find exactly where one
+/// member's deflate body ends so the next member's gzip header can be located.
+///
+/// This is a boundary-finder, not a decoder: it reuses the production block
+/// decoders (so the byte cursor advances identically to a real decode) but
+/// keeps output in a bounded circular buffer (≤8 MiB) — it never materializes
+/// the full member, so it stays cheap even for a large first member.
+///
+/// Returns `Ok(byte_len)` where `deflate_data[..byte_len]` is exactly the
+/// deflate stream of the first member (the byte after the last block,
+/// byte-aligned). The 8-byte gzip trailer follows at `byte_len`.
+pub fn deflate_stream_byte_len(deflate_data: &[u8]) -> Result<usize> {
+    const INITIAL_BUF: usize = 8 * 1024 * 1024;
+    const RESET_THRESHOLD: usize = 4 * 1024 * 1024;
+
+    let mut bits = Bits::new(deflate_data);
+    let mut output = vec![0u8; INITIAL_BUF];
+    let mut out_pos: usize = 0;
+
+    // Termination guard. This function runs on the FAILURE path with UNTRUSTED
+    // trailing bytes (the multi-member splitter probes garbage after a valid
+    // member), so it MUST be DoS-safe: a stream that never reaches BFINAL must
+    // become a terminal Err, never an infinite loop. The walk below exits only
+    // on BFINAL or Err, but a zero-length stored block synthesized from
+    // refill-past-EOF zero bytes returns Ok WITHOUT advancing the bit cursor
+    // and WITHOUT setting bfinal (consume_first_decode.rs:1409-1410), which would
+    // spin forever. We bound the walk two ways:
+    //   1. non-advancement: if a block consumes zero bits, the cursor is stuck.
+    //   2. EOF-without-BFINAL: if we've consumed all input and never saw bfinal.
+    //   3. hard iteration ceiling: a final backstop in case the underflow-wrapped
+    //      bit cursor oscillates rather than monotonically stalling. The smallest
+    //      possible deflate block is a few bits, so the real block count cannot
+    //      exceed (input bits) and we cap generously at input_len blocks + slack.
+    let mut last_bit_pos = bits.bit_position();
+    let max_iters = deflate_data.len().saturating_add(16);
+    let mut iters: usize = 0;
+
+    loop {
+        iters += 1;
+        if iters > max_iters {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "deflate stream exceeded block-count bound (no BFINAL / corrupt member)",
+            ));
+        }
+        // Keep only the last 32 KiB (the LZ77 window) so memory stays bounded
+        // regardless of member size.
+        if out_pos > RESET_THRESHOLD {
+            let keep = WINDOW_SIZE.min(out_pos);
+            output.copy_within(out_pos - keep..out_pos, 0);
+            out_pos = keep;
+        }
+        if out_pos + 4 * 1024 * 1024 > output.len() {
+            output.resize((output.len() * 2).max(out_pos + 8 * 1024 * 1024), 0);
+        }
+
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        out_pos = match btype {
+            0 => crate::decompress::inflate::consume_first_decode::decode_stored_pub(
+                &mut bits,
+                &mut output,
+                out_pos,
+            )?,
+            1 => crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
+                &mut bits,
+                &mut output,
+                out_pos,
+            )?,
+            2 => crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
+                &mut bits,
+                &mut output,
+                out_pos,
+            )?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        };
+
+        if bfinal {
+            break;
+        }
+
+        // Non-advancement / EOF-without-BFINAL guard (DoS protection on the
+        // untrusted-trailing-bytes failure path). A real intermediate block
+        // always advances the bit cursor; if it didn't, the decoder is stuck on
+        // refill-past-EOF zeros (a synthesized zero-length stored block) and
+        // would loop forever. Likewise, if we've consumed all the real input
+        // without ever hitting BFINAL, the member is truncated. Both are terminal.
+        let bit_pos_now = bits.bit_position();
+        if bit_pos_now <= last_bit_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "deflate stream made no progress (no BFINAL / truncated member)",
+            ));
+        }
+        if bit_pos_now.div_ceil(8) >= deflate_data.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "deflate stream ran past end of input without BFINAL (truncated member)",
+            ));
+        }
+        last_bit_pos = bit_pos_now;
+    }
+
+    // Align to the byte boundary that follows the final block; the gzip trailer
+    // starts there. `bit_position()` is the absolute bit cursor; rounding up to
+    // the next byte gives the deflate stream's byte length.
+    bits.align_to_byte();
+    let bit_pos = bits.bit_position();
+    let byte_len = bit_pos.div_ceil(8);
+    if byte_len > deflate_data.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "deflate stream overran input",
+        ));
+    }
+    Ok(byte_len)
+}
+
 /// Decompress from a scan checkpoint to the end of the deflate stream.
 ///
 /// Uses the same `consume_first` bit reader that built the index, so

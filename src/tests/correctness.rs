@@ -1437,13 +1437,13 @@ mod tests {
     /// consume-and-loop residual members so the FULL output is produced — not
     /// silently truncated to member 1. Real-world shape: `cat big.gz small.gz`.
     /// Before the fix this produced member 1 only (silent corruption).
-    // TEMPORARILY IGNORED (task #8 step 2): ISA-L FFI decode was deleted from
-    // the decode graph; it was silently the multi-member fallback for
-    // concatenated streams that `is_likely_multi_member` misses. The pure-Rust
-    // SM path does not yet decode trailing members — that handling is being
-    // ported faithfully from rapidgzip's multi-stream decode. Un-ignore once
-    // the SM driver loops over members.
-    #[ignore = "pending pure-Rust trailing-member handling (task #8 step 2)"]
+    // (Fixed, task #8 step 2): the pure-Rust SM path now resumes trailing
+    // members of a misrouted multi-member stream. When the single-stream decode
+    // fails at member 1's gzip footer (the second member begins past the 16 MiB
+    // `is_likely_multi_member` window), `decompress_parallel` walks each member's
+    // deflate boundary (pure-Rust, no C-FFI) and decodes the remaining members
+    // with per-member CRC32 + ISIZE verification, resuming past the prefix
+    // already streamed — faithful to gzip(1) multi-member semantics.
     #[test]
     fn test_concatenated_members_large_first_member_no_truncation() {
         // member 1: 17 MiB incompressible → > 16 MiB compressed → the 2nd
@@ -1474,6 +1474,177 @@ mod tests {
                 "T{t}: multi-member output truncated (silent corruption regression)"
             );
             assert_eq!(out, expected, "T{t}: multi-member output mismatch");
+        }
+    }
+
+    /// Companion to the truncation test: a first member whose COMPRESSED size
+    /// exceeds the 16 MiB detection window, followed by SEVERAL trailing members
+    /// (compressible + incompressible). Exercises (a) more than one resumed
+    /// member and (b) per-member CRC32/ISIZE verification across the member loop.
+    /// Decoded through BOTH the Vec entry and the writer-based
+    /// `decompress_single_member` entry (the streaming/out_fd sink).
+    #[test]
+    fn test_concatenated_members_past_window_multiple_trailing() {
+        // Member 1: 17 MiB incompressible → compressed > 16 MiB so the second
+        // member's magic falls outside the scan window (misroute to single).
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x243f6a8885a308d3u64;
+        for b in &mut m1 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        let m2 = b"middle member: short compressible text payload, repeated. \
+                   short compressible text payload, repeated."
+            .to_vec();
+        let mut m3 = vec![0u8; 700 * 1024];
+        let mut s3 = 0xdeadbeefcafef00du64;
+        for b in &mut m3 {
+            s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s3 >> 33) as u8; // incompressible
+        }
+
+        let mut gz = compress_single_member(&m1);
+        gz.extend_from_slice(&compress_single_member(&m2));
+        gz.extend_from_slice(&compress_single_member(&m3));
+
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (members past 16 MiB)"
+        );
+
+        let mut expected = m1.clone();
+        expected.extend_from_slice(&m2);
+        expected.extend_from_slice(&m3);
+
+        for t in [1usize, 4] {
+            // Vec entry.
+            let out = crate::decompress::decompress_gzip_to_vec(&gz, t).unwrap();
+            assert_eq!(out.len(), expected.len(), "T{t}: Vec entry length");
+            assert_eq!(out, expected, "T{t}: Vec entry bytes");
+
+            // Writer-based single-member entry (streaming sink).
+            let mut wout = Vec::new();
+            crate::decompress::decompress_single_member(&gz, &mut wout, t).unwrap();
+            assert_eq!(wout.len(), expected.len(), "T{t}: writer entry length");
+            assert_eq!(wout, expected, "T{t}: writer entry bytes");
+        }
+    }
+
+    /// A genuinely CORRUPT single-member stream (truncated deflate body, no
+    /// valid trailing member) must surface a terminal error — the multi-member
+    /// resume must NOT silently swallow corruption or loop forever.
+    #[test]
+    fn test_corrupt_single_member_is_terminal_error_not_resumed() {
+        let data = make_mixed(6 * 1024 * 1024);
+        let mut gz = compress_single_member(&data);
+        // Corrupt the middle of the deflate body so the decode fails but there
+        // is no second gzip member to resume into.
+        let mid = gz.len() / 2;
+        for b in &mut gz[mid..mid + 64] {
+            *b ^= 0xff;
+        }
+        let mut out = Vec::new();
+        let r = crate::decompress::decompress_single_member(&gz, &mut out, 4);
+        assert!(
+            r.is_err(),
+            "corrupt single-member stream must be a terminal error, not silently resumed"
+        );
+    }
+
+    /// DoS termination guard (2026-06-08): `deflate_stream_byte_len` runs on the
+    /// multi-member FAILURE path over UNTRUSTED trailing bytes. Adversarial
+    /// garbage (`0xaa` ⇒ bfinal=0/btype=01) used to drive an INFINITE LOOP —
+    /// the shared decoder synthesizes zero-length stored blocks from
+    /// refill-past-EOF zeros that return Ok without BFINAL and without advancing
+    /// the bit cursor, and the walk loop (exits only on BFINAL/Err) spun forever.
+    /// The fix converts non-advancement / EOF-without-BFINAL into a terminal Err.
+    /// Wrapped in a 5s watchdog so a regression FAILS (panics) instead of hanging
+    /// CI forever.
+    #[test]
+    fn test_deflate_stream_byte_len_terminates_on_adversarial_garbage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let r = crate::decompress::scan_inflate::deflate_stream_byte_len(&[0xaa; 4096]);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(is_err) => {
+                handle.join().ok();
+                assert!(
+                    is_err,
+                    "deflate_stream_byte_len on adversarial 0xaa garbage must return Err"
+                );
+            }
+            Err(_) => panic!(
+                "deflate_stream_byte_len HUNG on adversarial 0xaa garbage \
+                 (DoS termination guard regression)"
+            ),
+        }
+    }
+
+    /// End-to-end companion to the watchdog unit test: a VALID large single
+    /// member (>16 MiB so it routes to the pure-Rust single-member path),
+    /// followed by gzip magic + 0xaa garbage that is NOT a real second member.
+    /// The trailing-member resume must surface a terminal Err — NOT hang and NOT
+    /// silently truncate. Wrapped in a 30s watchdog (the member is large) so a
+    /// hang regression fails rather than wedging CI.
+    ///
+    /// Gated on `parallel_sm`: the multi-member trailing-byte RESUME (and thus
+    /// the `deflate_stream_byte_len` boundary walk where the hang lived) only
+    /// exists on the pure-Rust parallel-SM single-member path. Under the
+    /// non-parallel-SM routing this input takes a different backend that decodes
+    /// member 1 and ignores the non-member trailing bytes (no resume, no hang),
+    /// so the terminal-Err invariant asserted here applies only when the resume
+    /// path is compiled in. The config-independent guard is covered by
+    /// `test_deflate_stream_byte_len_terminates_on_adversarial_garbage`.
+    #[cfg(parallel_sm)]
+    #[test]
+    fn test_big_member_plus_gzip_magic_garbage_is_terminal_not_hang() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 17 MiB incompressible member → compressed > 16 MiB → routes single.
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x51ed270b8e1d2a3fu64;
+        for b in &mut m1 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let mut gz = compress_single_member(&m1);
+        // gzip magic + flags that look like a member header, then pure garbage
+        // (NOT a valid deflate member / no real trailer).
+        gz.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00]);
+        gz.extend_from_slice(&[0xaa; 4096]);
+
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (garbage past 16 MiB)"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let r = crate::decompress::decompress_single_member(&gz, &mut out, 4);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(is_err) => {
+                handle.join().ok();
+                assert!(
+                    is_err,
+                    "valid big.gz + gzip-magic + 0xaa garbage must be a terminal Err, \
+                     not silent truncation"
+                );
+            }
+            Err(_) => panic!(
+                "decompress_single_member HUNG on big.gz + gzip-magic + 0xaa garbage \
+                 (DoS termination guard regression)"
+            ),
         }
     }
 
