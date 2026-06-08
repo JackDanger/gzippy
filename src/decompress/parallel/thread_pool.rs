@@ -430,6 +430,10 @@ fn worker_main(
     pin: Option<u32>,
 ) {
     crate::decompress::parallel::chunk_buffer_pool::bind_worker_pool_index(thread_index);
+    // Rule-#3 page-warmth oracle (GZIPPY_PREFAULT_ARENA, default OFF, byte-transparent):
+    // pre-touch this worker's marker/data arena so first-touch faults are paid off the
+    // wall-critical decode path. Falsifies whether the excess faults are on the wall.
+    crate::decompress::parallel::chunk_buffer_pool::prefault_worker_arena();
     if let Some(core_id) = pin {
         // Mirror of `pinThreadToLogicalCore(static_cast<int>(pinning->second))`
         // (ThreadPool.hpp:199). `core_affinity` is portable across the

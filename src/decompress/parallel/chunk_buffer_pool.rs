@@ -205,6 +205,52 @@ pub fn current_worker_pool_index() -> Option<usize> {
     WORKER_POOL_INDEX.with(|c| c.get())
 }
 
+/// MEASUREMENT-ONLY rule-#3 oracle (`GZIPPY_PREFAULT_ARENA=<MiB>`, default OFF):
+/// pre-touch a per-worker arena of rpmalloc-backed pages at worker startup so the
+/// chunk decode's first-touch page faults are PAID ONCE here, OFF the wall-critical
+/// decode path, instead of cold on the hot path. Byte-transparent (allocates +
+/// memsets + frees scratch; rpmalloc retains the freed pages warm in this thread's
+/// cache). Used to falsify the page-warmth thesis: if faults drop toward rg's but
+/// the MATCHED gz_null wall does not move, the excess faults were slack (advisor
+/// arithmetic: fault-work ~33-55ms >> matched wall gap 17ms at depth-14).
+pub fn prefault_worker_arena() {
+    static MIB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let mib = *MIB.get_or_init(|| {
+        std::env::var("GZIPPY_PREFAULT_ARENA")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    if mib == 0 {
+        return;
+    }
+    // Touch `mib` MiB of u16 + `mib` MiB of u8 scratch in 128 KiB spans (the
+    // marker/data segment size) so every page is faulted+zeroed once, then drop
+    // them so rpmalloc's per-thread cache keeps the warm pages for the next
+    // real take_marker_segment / take_u8 on THIS worker.
+    let spans = (mib * 1024) / 128; // 128 KiB spans
+    let mut keep_u16: Vec<U16> = Vec::with_capacity(spans);
+    let mut keep_u8: Vec<U8> = Vec::with_capacity(spans);
+    for _ in 0..spans {
+        let mut v16 = types::u16_with_capacity(MARKER_SEGMENT_ELEMENTS);
+        // Touch every page of the allocation (write forces the fault now).
+        v16.resize(MARKER_SEGMENT_ELEMENTS, 0);
+        for i in (0..v16.len()).step_by(2048) {
+            v16[i] = 1;
+        }
+        keep_u16.push(v16);
+        let mut v8 = types::u8_with_capacity(128 * 1024);
+        v8.resize(128 * 1024, 0);
+        for i in (0..v8.len()).step_by(4096) {
+            v8[i] = 1;
+        }
+        keep_u8.push(v8);
+    }
+    // Drop all at once → rpmalloc returns these warm pages to THIS thread's cache.
+    drop(keep_u16);
+    drop(keep_u8);
+}
+
 fn pool_index_for_take() -> usize {
     current_worker_pool_index().unwrap_or(0)
 }

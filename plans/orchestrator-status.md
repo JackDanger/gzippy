@@ -1,6 +1,46 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## OUTPUT-BINDER RECONCILIATION (matched /dev/null comparator + rg output exposure measured) → PROMPT PREMISE REFUTED: there are TWO T8 binders, NOT one; output-overlap is NON-FAITHFUL + sub-parity; the unified root = PAGE WARMTH (gzippy faults 2× rg). Advisor disproof, vendor-source-verified [2026-06-07, OWNER turn, branch reimplement-isa-l, HEAD 20084c91]
+## PAGE-WARMTH CLEAN ORACLE RAN → MARKER-segment warmth sub-lever REFUTED (−12% fault ceiling); CLASS not refuted; TRIAGE to engine. Advisor disproof ×3 [2026-06-07, OWNER turn, branch reimplement-isa-l, HEAD f80294ae]
+Attacked the page-warmth root the prior turn named. Source-verified rg's in-place narrowing + perf-localized gzippy's fault sites + ran the rule-#3 fault-removal oracles + advisor ×3.
+
+ROOT-CAUSE LOCALIZED (`perf record -e page-faults --call-graph fp`, symboled build, byte-exact 028bd002…cb410f):
+the DOMINANT fault site is **`SegmentedU16::push_slice` = 44.52% of faults** (the u16 MARKER buffer write), NOT
+the clean-tail chunk.data (decode_huffman_body_resumable 18.8%). The prior advisor verdict's "clean tail into a
+separate cold chunk.data" MISLOCATED the primary term. perf stat (file sink p8): gzippy 110,617 vs rg 55,790 = 1.98×.
+
+THREE ORACLES (locked guest, interleaved N=15, byte-exact):
+- (a) GZIPPY_PREFAULT_ARENA (pre-touch+free per-worker arena): FAILED — faults UP to 193K/333K (rpmalloc handed the
+  decode DIFFERENT pages; failed instrument, no counterfactual).
+- (b) GZIPPY_SLAB_ALLOC (≥3 MiB resident-retain): faults −10%, matched wall WORSE 0.971× — BUT its ≥3 MiB threshold
+  MISSED the 128 KiB marker segments entirely (only retained big chunk.data).
+- (c) NEW GZIPPY_SLAB_THRESHOLD_KIB=64 (lowers resident-retain to capture the 128 KiB u16 marker segments; sub-MiB
+  rounds to 128 KiB; FIRST oracle to target the 44% fault site): faults 110,619→97,377 (−12%, STILL 1.77× rg, FAR
+  from the 55K floor); matched wall gz_s64 0.1314 vs gz_null 0.1324 = **1.008× FLAT**; rg_null 0.1132 (1.17×).
+
+ADVISOR DISPROOF ×3 (synchronous, plans/page-warmth-rootcause-advisor-verdict.md):
+- EARNED (narrow): resident-retain of u16 MARKER segments CANNOT reach rg's floor (−12% CEILING, confound-independent —
+  a perfect zero-overhead version still only retains marker segments). The marker warmth sub-lever is DEAD; rely on
+  the CEILING, not the flat wall.
+- NOT EARNED (broad): "page-warmth refuted as a CLASS" OVERCLAIMS — the 211 MiB OUTPUT materialization (~56% of faults,
+  the site rg avoids via windowed/recycled append DecodedData.hpp:344-388) was NEVER warmth-oracle'd.
+- The FLAT matched wall proves NOTHING: underpowered TIE (max plausible warmth win single-digit ms is 5-10× below the
+  13-18ms harness spread; rule 5/7). Drop it as evidence either way.
+- rg faults half NOT only via ISA-L (engine) but via its windowed/recycled MATERIALIZATION (data structure —
+  pure-Rust-portable, NOT forbidden by goal #1; = the rule-7a worker-side recycle already owed). The prior 3.26× DTLB
+  regression was FRESH segmentation; RECYCLED warm-TLB windows are a DIFFERENT unrun experiment.
+- rapidgzip --verbose: rg has the SAME 34.5% replaced markers (73.1M) + 0.0338s apply-window narrow ⇒ u16 footprint
+  NOT gzippy-unique.
+
+**SUPERVISOR GATE — page-warmth MARKER sub-lever dead; CLASS not refuted; NO production fix landed (3 measurement
+knobs KEPT 7a, byte-exact, OFF-default, NOT promoted: GZIPPY_PREFAULT_ARENA, GZIPPY_SLAB_THRESHOLD_KIB + sub-MiB slab
+granularity). NEXT (triage, advisor-endorsed): the CLEAN-ONLY ENGINE ORACLE — the 2.3× clean-rate gap ≫ warmth's
+hidden few-ms, owed anyway (project_pregate_placement_is_dominant_lever); then sched slow-inject if engine bounds
+short. STILL OWED for page-warmth (rule-7a convergence, the untested 56%): a recycled-window oracle on the OUTPUT
+materialization (faithful DecodedData.hpp:344-388, reused 128 KiB append windows, warm-TLB).** GUEST: /tmp/gz-ft-src
+build (native, sha 028bd002…cb410f OFF) + /tmp/gz-ft-sym/release/gzippy (symboled); drivers /tmp/measure_devnull.sh.
+NO orphan processes. Briefs: plans/page-warmth-{rootcause,final}-brief.md.
+
+## SUPERSEDED — OUTPUT-BINDER RECONCILIATION (matched /dev/null comparator + rg output exposure measured) → PROMPT PREMISE REFUTED: there are TWO T8 binders, NOT one; output-overlap is NON-FAITHFUL + sub-parity; the unified root = PAGE WARMTH (gzippy faults 2× rg). Advisor disproof, vendor-source-verified [2026-06-07, OWNER turn, branch reimplement-isa-l, HEAD 20084c91]
 The prompt's headline ("removing gzippy's serial output writev ≈ ties rg ⇒ output is THE single T8 binder")
 was a Rule-6 MISPAIRING: it compared gzippy-output-REMOVED (0.131) vs rg-output-PRESENT (0.130). Ran the
 MATCHED comparator (BOTH tools output-neutralized to /dev/null) on the locked guest:
