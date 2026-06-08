@@ -166,6 +166,10 @@ cc = "1"
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+# Property-based + fuzz-loop differential testing of the pure-Rust inflate path
+# (src/tests/inflate_proptest.rs, src/tests/inflate_fuzz_loop.rs). Default
+# features (rand-based generation + shrinking); no extra transitive C deps.
+proptest = "1"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 gzippy-inflate = { path = "crates/gzippy-inflate", features = ["route-c-dynasm"] }
 # Phase 0.6 spike: iai-callgrind for SIMD-fidelity test.
