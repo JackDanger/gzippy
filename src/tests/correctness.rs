@@ -1553,6 +1553,101 @@ mod tests {
         );
     }
 
+    /// DoS termination guard (2026-06-08): `deflate_stream_byte_len` runs on the
+    /// multi-member FAILURE path over UNTRUSTED trailing bytes. Adversarial
+    /// garbage (`0xaa` ⇒ bfinal=0/btype=01) used to drive an INFINITE LOOP —
+    /// the shared decoder synthesizes zero-length stored blocks from
+    /// refill-past-EOF zeros that return Ok without BFINAL and without advancing
+    /// the bit cursor, and the walk loop (exits only on BFINAL/Err) spun forever.
+    /// The fix converts non-advancement / EOF-without-BFINAL into a terminal Err.
+    /// Wrapped in a 5s watchdog so a regression FAILS (panics) instead of hanging
+    /// CI forever.
+    #[test]
+    fn test_deflate_stream_byte_len_terminates_on_adversarial_garbage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let r = crate::decompress::scan_inflate::deflate_stream_byte_len(&[0xaa; 4096]);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(is_err) => {
+                handle.join().ok();
+                assert!(
+                    is_err,
+                    "deflate_stream_byte_len on adversarial 0xaa garbage must return Err"
+                );
+            }
+            Err(_) => panic!(
+                "deflate_stream_byte_len HUNG on adversarial 0xaa garbage \
+                 (DoS termination guard regression)"
+            ),
+        }
+    }
+
+    /// End-to-end companion to the watchdog unit test: a VALID large single
+    /// member (>16 MiB so it routes to the pure-Rust single-member path),
+    /// followed by gzip magic + 0xaa garbage that is NOT a real second member.
+    /// The trailing-member resume must surface a terminal Err — NOT hang and NOT
+    /// silently truncate. Wrapped in a 30s watchdog (the member is large) so a
+    /// hang regression fails rather than wedging CI.
+    ///
+    /// Gated on `parallel_sm`: the multi-member trailing-byte RESUME (and thus
+    /// the `deflate_stream_byte_len` boundary walk where the hang lived) only
+    /// exists on the pure-Rust parallel-SM single-member path. Under the
+    /// non-parallel-SM routing this input takes a different backend that decodes
+    /// member 1 and ignores the non-member trailing bytes (no resume, no hang),
+    /// so the terminal-Err invariant asserted here applies only when the resume
+    /// path is compiled in. The config-independent guard is covered by
+    /// `test_deflate_stream_byte_len_terminates_on_adversarial_garbage`.
+    #[cfg(parallel_sm)]
+    #[test]
+    fn test_big_member_plus_gzip_magic_garbage_is_terminal_not_hang() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 17 MiB incompressible member → compressed > 16 MiB → routes single.
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x51ed270b8e1d2a3fu64;
+        for b in &mut m1 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let mut gz = compress_single_member(&m1);
+        // gzip magic + flags that look like a member header, then pure garbage
+        // (NOT a valid deflate member / no real trailer).
+        gz.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00]);
+        gz.extend_from_slice(&[0xaa; 4096]);
+
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (garbage past 16 MiB)"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let r = crate::decompress::decompress_single_member(&gz, &mut out, 4);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(is_err) => {
+                handle.join().ok();
+                assert!(
+                    is_err,
+                    "valid big.gz + gzip-magic + 0xaa garbage must be a terminal Err, \
+                     not silent truncation"
+                );
+            }
+            Err(_) => panic!(
+                "decompress_single_member HUNG on big.gz + gzip-magic + 0xaa garbage \
+                 (DoS termination guard regression)"
+            ),
+        }
+    }
+
     #[test]
     fn test_routing_single_member_parallel_thread_independence_large() {
         let data = make_mixed(6 * 1024 * 1024);
