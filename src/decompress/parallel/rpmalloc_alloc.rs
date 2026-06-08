@@ -44,7 +44,23 @@ mod arena {
     // the bug in the earlier reverted retain-list that broke multimember.)
     // `grow`/`shrink` are overridden so a resident block whose true size
     // already fits is reused in place (no copy/realloc churn).
-    const SLAB_THRESHOLD: usize = 3 * 1024 * 1024;
+    // MEASUREMENT-ONLY override (GZIPPY_SLAB_THRESHOLD_KIB): lower the slab
+    // threshold so the 128 KiB u16 marker segments (the dominant page-fault
+    // site, SegmentedU16::push_slice = 44% of faults) ALSO get the resident-
+    // retain treatment instead of rpmalloc cross-thread-free + re-fault. Used
+    // by the clean page-warmth oracle (advisor pass 2): drive marker faults to
+    // ~rg's floor with a never-munmap resident slab and watch the matched wall.
+    fn slab_threshold() -> usize {
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("GZIPPY_SLAB_THRESHOLD_KIB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .map(|kib| kib * 1024)
+                .unwrap_or(3 * 1024 * 1024)
+        })
+    }
     /// True block sizes are rounded up to this granularity so a few size
     /// classes cover the (near-constant) chunk-buffer sizes for high reuse.
     const SLAB_GRANULARITY: usize = 1024 * 1024;
@@ -103,7 +119,15 @@ mod arena {
 
     impl SlabAlloc {
         fn alloc_huge(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-            let bs = layout.size().div_ceil(SLAB_GRANULARITY) * SLAB_GRANULARITY;
+            // Sub-MiB blocks (the 128 KiB marker/data segments under a lowered
+            // threshold) round to 128 KiB so they don't waste 8x via the 1 MiB
+            // granularity (which would itself inflate faults).
+            let gran = if layout.size() < SLAB_GRANULARITY {
+                128 * 1024
+            } else {
+                SLAB_GRANULARITY
+            };
+            let bs = layout.size().div_ceil(gran) * gran;
             let align = layout.align().max(16);
             {
                 let mut s = slab_state().lock().unwrap();
@@ -169,7 +193,7 @@ mod arena {
             if layout.size() == 0 {
                 return Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0));
             }
-            if layout.size() >= SLAB_THRESHOLD {
+            if layout.size() >= slab_threshold() {
                 return self.alloc_huge(layout);
             }
             ensure_thread_initialized();
