@@ -1,6 +1,26 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## PHASE 1 (source-map) + PHASE 2 (isolation prototype + measure) of the INLINE-ASM igzip fork → DECISIVE NO-GO; user-fork escalated (advisor disproof ×2, pass-2 signed off) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 690941f3]
+## TOOLING-AUDIT FIXES LANDED + A-vs-B DECISION INPUTS RE-MEASURED (hardened oracle path, interleaved RATIO, advisor UPHELD-W-CAVEATS) → ocl_cf was PESSIMISTIC, now ≈TIE/≥0.945×; low-T LOSS is real+engine-bound but "engine-CLOSABLE" not yet measurement-clean; absolute split BLOCKED-on-load [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD f216c691]
+
+Owned the audit's job: harden the under-guarded oracle.sh path to the parity.sh bar, fix the 64MiB-reserve confound, clean the guest disk, then re-measure the A-vs-B decision inputs on a quiet box.
+
+HARDENED (commit e4389f05 + f216c691, scripts measurement-only): _oracle_guest.sh now matches the parity spine — env-scrub ALLOWLIST, content-fingerprint stale-binary guard (oracle.sh --build stamps it), host-freeze HARD-FAIL on a readable thaw (was WARN-only = the source of ocl_cf's 0.945↔0.989 drift), loadavg readback HARD-FAIL >2.0 (ALLOW_LOAD=1 → ratio-only), IN-SCRIPT isal_oracle_fallbacks==0 assert from the GZIPPY_VERBOSE sidecar (was hand-checked). The host-freeze guard CAUGHT the box THAWED (no_turbo=0, watchdog expired) — re-froze.
+
+RESERVE-CONFOUND FIX (audit A5 / number #2): the ISA-L oracle reserved a flat 64MiB/chunk where production grows incrementally to ~chunk size; now (compressed_span × 8).max(4MiB).min(64MiB) ⇒ ~38MiB for a 4.7MiB T8 chunk. Under-reserve is SAFE (FFI None → pure-Rust fallback → counter → assert VOIDs loud — proven at T1 where the assert VOIDed on the window-absent bootstrap chunk). Byte-exact (gated GZIPPY_ISAL_ENGINE_ORACLE, OFF==identity).
+
+GUEST DISK: 90% (3.4G free) → 81% (6.4G free). Removed /root/gzippy/{target,benchmark_data} (non-pin, rebuildable), stale /tmp build trees + ~6G decoded-output dumps. Pin /root/gzippy-bench + corpus untouched.
+
+RE-MEASURE — BLOCKED-on-load for ABSOLUTES; RATIO captured (interleaved jitter-immune, sha-OK, fallbacks==0 in-script): the host (neurotic) was Plex-loaded the whole turn (loadavg bouncing 1.6↔11 as transcodes arrived; polled bounded ~25min, never reliably quiet; Plex runs on the host, outside clock_freeze's reach). RATIO results:
+- ocl_cf T8 = **≈0.99× / ≥0.945× rg** (14/0 clean; one run 0.997×@load1.63; reproduced 0.98-1.00× ×3) — UP from banked 0.945× PESSIMISTIC, confirming the audit prediction.
+- gzippy-NATIVE (production): T8 0.885× (TIE, 19% spread), **T4 0.755× LOSS (3% spread, tight)**, **T1 0.608× LOSS (4% spread, ==inner-loop 0.55-0.60× ⇒ ENGINE-BOUND)**.
+- ocl_cf low-T: T4 ~0.900× (16% spread, LOOSE), T1 VOID (bootstrap chunk window-absent ⇒ no ISA-L ceiling).
+- 36/21 split: NOT re-measured (needs a quiet box; still OWED). Do NOT bank 36/21.
+
+ADVISOR (synchronous disproof, plans/oracle-hardening-advisor-verdict.md): UPHELD-WITH-CAVEATS — hardening+reserve fix byte-exact+safe; bank ocl_cf "≈TIE/≥0.945×" not "0.997×"; **the low-T LOSS is real+engine-bound (strong), but "a better engine CLOSES it" is NOT established — ocl_cf-T4's 16% spread admits "engine swap does nothing, residual non-engine"; T1 ocl_cf VOID ⇒ T1 can't prove closability.** OWED to make option-B clean: ONE tight (≤5% spread, quiet box) ocl_cf-T4.
+
+**SUPERVISOR GATE — A-vs-B inputs VALIDATED in direction with ONE owed tightening. ocl_cf is NOT 0.945× (≈TIES rg) ⇒ option B's T8 upside is ~nil. The case FOR B rests ENTIRELY on the LOW-T cells: native LOSES at T1 (0.608×, engine-bound) + T4 (0.755×) where the engine is NOT slack-masked. BUT the advisor REFUTED "engine-closable" as not-yet-clean at T4. NEXT OWED before (B) is authorizable: ONE tight (≤5%, quiet box) ocl_cf-T4 vs native-T4 vs rg — if ocl_cf-T4 ties rg with native losing ⇒ B justified at low-T; if ocl_cf-T4 ≈ native ⇒ low-T gap is NON-engine, close the engine chapter + attack low-T scheduling. The owner could not get a quiet box (active Plex). Do NOT start the full-kernel asm — user's call.** GUEST: /root/gzippy-bench (pin), gzippy-isal bin b3d9435587186f27 (factor-8) / gzippy-native bin 9790e8f3. Hardened drivers scripts/bench/{oracle.sh,_oracle_guest.sh}. Host re-frozen (no_turbo=1, watchdog ttl 3600s). NO orphan processes. Verdict: plans/oracle-hardening-advisor-verdict.md.
+
+## SUPERSEDED — PHASE 1 (source-map) + PHASE 2 (isolation prototype + measure) of the INLINE-ASM igzip fork → DECISIVE NO-GO; user-fork escalated (advisor disproof ×2, pass-2 signed off) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 690941f3]
 
 Executed the charter's TIERED Phase-1+Phase-2 (prove-before-the-big-build).
 
