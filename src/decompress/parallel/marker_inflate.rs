@@ -2082,7 +2082,14 @@ impl Block {
         // interleaved T8 wall answers it causally. Snapshot once before the loop.
         let slow_spin: u64 = super::slow_knob::spin_iters();
         let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
-
+        // DECODE-COMPUTE vs STORE-BANDWIDTH localization knobs (measurement-only,
+        // byte-transparent; see slow_knob.rs). These do NOT force the careful loop
+        // (the fast-loop gate stays `slow_spin == 0` only) so the perturbation
+        // lands on the PRODUCTION fast path. Snapshot once before the loop.
+        let dec_spin: u64 = super::slow_knob::decode_spin_iters();
+        let dec_yield: bool = super::slow_knob::localize_yield_kind(dec_spin);
+        let st_spin: u64 = super::slow_knob::store_spin_iters();
+        let st_yield: bool = super::slow_knob::localize_yield_kind(st_spin);
         macro_rules! commit {
             ($result:expr) => {{
                 self.decoded_bytes += emitted;
@@ -2118,6 +2125,7 @@ impl Block {
             let in_end = bits.data.len();
             bits.refill();
             let mut pre = self.lut_litlen.decode(bits);
+            super::slow_knob::inject_localize(dec_spin, dec_yield);
             'fast: loop {
                 // Out headroom: keep `*pos + FAST_OUT_SLOP` within the reserved
                 // word-copy region (out_room already reserves MAX_RUN_LENGTH+8 so
@@ -2161,6 +2169,7 @@ impl Block {
                         }
                         *pos += 1;
                         emitted += 1;
+                        super::slow_knob::inject_localize(st_spin, st_yield);
                     } else {
                         trailing_code = code;
                         have_trailing = true;
@@ -2192,6 +2201,7 @@ impl Block {
                     }
                     *pos += lit_prefix;
                     emitted += lit_prefix;
+                    super::slow_knob::inject_localize(st_spin, st_yield);
                 }
 
                 if have_trailing {
@@ -2209,6 +2219,7 @@ impl Block {
                             Some(d) => d,
                             None => commit!(Err(BlockError::InvalidHuffmanCode)),
                         };
+                        super::slow_knob::inject_localize(dec_spin, dec_yield);
                         if dsym as usize >= DISTANCE_BASE.len() {
                             commit!(Err(BlockError::InvalidHuffmanCode));
                         }
@@ -2240,6 +2251,7 @@ impl Block {
                         unsafe {
                             emit_backref_contig(base, pos, distance, length);
                         }
+                        super::slow_knob::inject_localize(st_spin, st_yield);
                         self.record_backreference_for_sparsity(distance, length, emitted);
                         emitted += length;
                     }
@@ -2249,6 +2261,7 @@ impl Block {
                 // any subsequent dist-extra reads have headroom.
                 bits.refill();
                 pre = self.lut_litlen.decode(bits);
+                super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
             // a fresh un-consumed `pre`), so the bit cursor sits exactly before
@@ -2260,6 +2273,7 @@ impl Block {
             super::slow_knob::inject(slow_spin, slow_yield);
             bits.refill();
             let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
+            super::slow_knob::inject_localize(dec_spin, dec_yield);
             if bit_count == 0 {
                 commit!(Err(BlockError::InvalidHuffmanCode));
             }
@@ -2276,6 +2290,7 @@ impl Block {
                     }
                     *pos += 1;
                     emitted += 1;
+                    super::slow_knob::inject_localize(st_spin, st_yield);
                     sym_count -= 1;
                     if sym_count == 0 {
                         break;
@@ -2299,6 +2314,7 @@ impl Block {
                     Some(d) => d,
                     None => commit!(Err(BlockError::InvalidHuffmanCode)),
                 };
+                super::slow_knob::inject_localize(dec_spin, dec_yield);
                 if dsym as usize >= DISTANCE_BASE.len() {
                     commit!(Err(BlockError::InvalidHuffmanCode));
                 }
@@ -2334,6 +2350,7 @@ impl Block {
                 unsafe {
                     emit_backref_contig(base, pos, distance, length);
                 }
+                super::slow_knob::inject_localize(st_spin, st_yield);
                 self.record_backreference_for_sparsity(distance, length, emitted);
                 emitted += length;
                 break;
