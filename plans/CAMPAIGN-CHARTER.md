@@ -65,7 +65,66 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD c224aaad→<this commit> = 512a389d + copy-free-to-final Stage 1) — **COPY-FREE-TO-FINAL REFACTOR, STAGE 1 LANDED byte-exact (the ~0.067× drain-memcpy tooth's hardest MECHANICAL risk retired; wall NOT yet banked — Stage 2 wiring is gated). Two synchronous disproof advisors: the first vetted the SCOPING decision (CHECKPOINT-STAGE-1, NOT one-pass — gated full-wire cannot bank the wall safely this turn because OFF==identity isolates COMMIT risk but not MEASUREMENT risk: the data_prefix_len-nonzero activation + CRC-prefix-exclusion + decode_bypass serialization round-trip is an uncontained byte-exactness landmine; realistic one-pass outcome = a dead ON path and NOTHING banked); the second (plans/copyfree-stage1-advisor-verdict.md) UPHELD the LANDED Stage 1 (A/B/C/E UPHELD, D upheld-w-caveats, NOTHING to revert).**
+## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 0f5bc85b = d77a173b + copy-free-to-final Stage 2) — **STAGE 2 WIRED + LANDED BYTE-EXACT + MEASURED: the ~0.067× drain-memcpy tooth is BANKED at +0.05× (advisor-UPHELD-WITH-CAVEATS). native_fold ~0.74× → ~0.79× rg.**
+
+The gzippy-native FOLD post-flip clean tail now decodes DIRECTLY into chunk.data's reserved
+contiguous tail (`finish_decode_chunk_contig_native` + `decode_clean_into_contig`), DELETING the
+ring→chunk.data drain memcpy (the bulk clean tail no longer touches the u8 ring). **FAITHFUL
+PREPEND, no landmine:** at the ctx-flip (clean_appended≥32768) the engine has ALREADY flipped and
+≥32 KiB contiguous clean output is in chunk.data, so the 32 KiB predecessor window IS that
+contiguous tail (real, already-CRC'd, already-counted prior output) ⇒ `data_prefix_len` stays 0,
+back-refs resolve from chunk.data[*pos-d], CRC covers only real output (no prefix to exclude),
+decode_bypass round-trip is identical to today's post-drain state. This is vendor setInitialWindow's
+prepend (DecodedData.hpp:278-289), NOT the forbidden window-in-scratch dual-region shortcut. The
+one-time transition-narrow seam drain (≤few KiB, faithful to vendor's flip) remains; only the BULK
+drain is gone.
+
+**MECHANISM (commit 0f5bc85b):** new `MarkerStep::FlipToContig` (native, `not(isal_clean_tail)`):
+at the ctx-flip the driver resumes the SAME thread-local Block in a dedicated contig loop (no ring,
+no drain). The shared generic `marker_decode_step_loop` AND the gzippy-isal FlipToClean/Engine-C
+two-phase path are UNCHANGED. + `SegmentedU8::contig_decode_window` (re-fetched base/cap/len every
+outer iter, grow-between-calls pointer-move safety) + `Block::decode_clean_stored_into_contig`
+(post-flip STORED block). 5 advisor hazards handled: H1 release-mode headroom guard (contig has no
+ring modulo ⇒ a violation would be heap OOB not a CRC-catchable wrong byte); H2 stored-block; H3
+commit-before-decoded_range + multi-call-per-block accounting; H4 base re-fetch (a real regrow-past-
+16MiB bug was CAUGHT by the H1 guard during testing and fixed — Vec::reserve(min_spare) not the
+wrong delta); H5 native-only.
+
+**BYTE-EXACT:** gzippy-native sha 028bd002…cb410f == system gzip == rapidgzip on /root/silesia.gz
+(211,968,000 decoded) at T1+T8, x86_64 guest AND arm64 host; gzippy-isal UNCHANGED (isal_clean_tail
+gated out, x86_64 Rosetta lib tests pass). flip_to_clean=12 (16 chunks: 12 flip-to-contig + 4
+finished_no_flip + 2 window_seeded) confirms the contig route is production. 862 lib tests +
+native_fold_parity + flip-seam + 3 Stage-1 differentials + 3 NEW owed-case tests
+(contig_native_multiblock_clean_and_crc_prefix_excluded, _regrow_past_reserve_clamp,
+_stored_block_after_flip) green (only the pre-existing load-sensitive diff_ratio timing flake fails,
+passes in isolation).
+
+**MEASURED (locked guest 10.30.0.199, taskset 0,2,4,6,8,10,12,14, gov=perf, interleaved measure.sh
+N=11 best-of-11/pass, sha-OK every run, RAW=211968000, P=8, 10 passes, A/B vs prior banked
+copy-free-DRAIN baseline /tmp/gzbuild-native@9cde0b4f vs rapidgzip 0.16.0):** priornative/stage2 ∈
+{0.954,0.972,0.989,0.929,1.011,0.876,0.805,0.969,0.818,0.969} ⇒ stage2 strictly faster 9/10 (the
+1.011 inversion had a 66% spread). stage2/rg mean ~0.79×, priornative/rg mean ~0.72×; paired delta
+mean +0.058×, median +0.044×, SE±0.020. **BANKED +0.05× (drop the +0.07 edge).** Magnitude
+load-confounded (loadavg 2.2→5.0 across the campaign, autocorrelated ⇒ ~2-SE) but SIGN-stable and
+TRIANGULATED by the same-binary GZIPPY_FOLD_NODRAIN knob (+0.067× wrong-bytes, last turn) = the
+methodologically clean drain isolation. Provenance VERIFIED: 9cde0b4f→0f5bc85b production-decode
+delta is ONLY the Stage 2 wiring (Stage 1 additive-unwired, nodrain OFF, fulcrum additive).
+
+**ADVISOR (synchronous ×2, plans/copyfree-stage2-advisor-verdict.md):** pre-impl source-verify
+UPHELD the key realization + landmine-sidestep; post-impl measurement UPHELD-WITH-CAVEATS (record
++0.05× not +0.05-0.07×; sign-confident, magnitude soft/load-confounded; cross-binary layout is a
+residual confound but the same-binary nodrain knob corroborates).
+
+**RESIDUAL / SCOPED NEXT (gate, do NOT start): the ≤0.11× UPPER-BOUND intrinsic symbol-rate gap**
+(native_fold ~0.79× → ocl_cf 0.925× ≈ 0.13×, of which ≤0.11× is inner-Huffman symbol rate + the
+remaining placement/scheduler term to 1.0×). The drain tooth is banked; the next binder is the
+inner-Huffman RATE on the `<false>` clean path (BMI2 PEXT/BZHI, wider multi-literal, ISA-L-class
+packed-u32 LUT — CLAUDE.md-authorized), bounded by ocl_cf 0.925× (engine-removed ceiling), never the
+VAR_VI slope. GUEST: /tmp/gz-ft-src (source synced to 0f5bc85b's 3 changed files + symlink
+vendor→/root/gzippy/vendor), build /tmp/gz-ft-src/target/release/gzippy (native, target-cpu=native,
+sha 028bd002…cb410f); prior baseline /tmp/gzbuild-native@9cde0b4f. rg 0.16.0. NO orphan processes.
+
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD c224aaad→512a389d + copy-free-to-final Stage 1) — **COPY-FREE-TO-FINAL REFACTOR, STAGE 1 LANDED byte-exact (the ~0.067× drain-memcpy tooth's hardest MECHANICAL risk retired; wall NOT yet banked — Stage 2 wiring is gated). Two synchronous disproof advisors: the first vetted the SCOPING decision (CHECKPOINT-STAGE-1, NOT one-pass — gated full-wire cannot bank the wall safely this turn because OFF==identity isolates COMMIT risk but not MEASUREMENT risk: the data_prefix_len-nonzero activation + CRC-prefix-exclusion + decode_bypass serialization round-trip is an uncontained byte-exactness landmine; realistic one-pass outcome = a dead ON path and NOTHING banked); the second (plans/copyfree-stage1-advisor-verdict.md) UPHELD the LANDED Stage 1 (A/B/C/E UPHELD, D upheld-w-caveats, NOTHING to revert).**
 
 **WHAT LANDED (commit c224aaad, +453/-0, ONE file marker_inflate.rs, PURELY ADDITIVE, ZERO production callers ⇒ byte-exact by construction on BOTH features + BOTH archs):** (1) `emit_backref_contig` — non-wrapping clean back-ref copy, the sibling of `emit_backref_ring_u8` with NO `% U8_RING_SIZE` (contiguous ⇒ the 3 wrap-aware arms collapse to word-copy / RLE-fill / overlap; the secondary win on top of the drain). (2) `Block::decode_clean_into_contig` — clean (`<false>`) body decoded straight into a caller-supplied CONTIGUOUS buffer with the 32 KiB predecessor window installed as a DICTIONARY PREFIX at base[0..window_len) (vendor setInitialWindow model, DecodedData.hpp:278-289 + deflate.hpp:1778); first-clean-byte back-refs of distance ≤ 32768 resolve contiguously into that prefix; range check `distance > *pos` ≡ ring's `distance > decoded_bytes+emitted` (advisor C UPHELD: *pos and decoded_bytes both start at window_len); per-call cap = spare-(MAX_RUN_LENGTH+8) with the Engine-C grow-BETWEEN-calls contract (no mid-block realloc). (3) 3 ring-vs-CONTIG differential tests driving the REAL production `read()` loop on the SAME window-seeded clean DEFLATE body, asserting byte-equal — back-ref into the 32 KiB prefix (distance==*pos==32768 → base[0] boundary), multi-call resumable (per_call=4096, ~10 calls, cross-call back-ref source), RLE+short-distance. All 3 pass (Rosetta x86_64 x86-64-v2). Full lib suite 855 pass; the only failures are the 6 PRE-EXISTING Rosetta/timing artifacts (stash A/B confirmed identical to HEAD baseline). arm64 native release builds clean; round-trip sha verified.
 

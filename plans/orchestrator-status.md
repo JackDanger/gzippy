@@ -1,5 +1,37 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## COPY-FREE-TO-FINAL STAGE 2 — WIRED + LANDED BYTE-EXACT + MEASURED → drain-memcpy tooth BANKED +0.05× (advisor UPHELD-WITH-CAVEATS); native_fold ~0.74×→~0.79× rg [2026-06-07, OWNER turn, HEAD 0f5bc85b]
+Wired Stage-1's `decode_clean_into_contig` into the gzippy-native FOLD seam: the post-flip clean
+tail now decodes DIRECTLY into chunk.data's reserved contiguous tail, DELETING the ring→chunk.data
+bulk drain memcpy. FAITHFUL PREPEND (the 32 KiB window is already the contiguous tail of chunk.data
+⇒ data_prefix_len stays 0, CRC-prefix-exclusion + decode_bypass landmine SIDESTEPPED; NOT the
+forbidden window-in-scratch shortcut). Two synchronous advisors: pre-impl source-verify UPHELD the
+key realization + landmine-sidestep + named 5 hazards; post-impl measurement UPHELD-WITH-CAVEATS.
+Advisor verdict: plans/copyfree-stage2-advisor-verdict.md. **SUPERVISOR GATE — drain tooth banked
++0.05×; next = the ≤0.11× intrinsic symbol-rate inner-Huffman work bounded by ocl_cf 0.925×.**
+
+MECHANISM (commit 0f5bc85b, +415 net over 3 files): new `MarkerStep::FlipToContig` (native,
+`not(isal_clean_tail)`) → driver resumes the SAME thread-local Block in `finish_decode_chunk_contig_native`
+(no ring, no drain); shared generic loop + gzippy-isal two-phase path UNCHANGED. +
+`SegmentedU8::contig_decode_window` (base/cap/len re-fetched every iter, grow-safe) +
+`Block::decode_clean_stored_into_contig` (post-flip stored block). Hazards: H1 release headroom
+guard (contig has no ring modulo ⇒ violation = heap OOB not CRC-catchable — a real regrow-past-16MiB
+bug was CAUGHT by it during testing + fixed: Vec::reserve(min_spare)); H2 stored-block; H3
+commit-before-decoded_range + multi-call accounting; H4 base re-fetch; H5 native-only.
+
+BYTE-EXACT: gzippy-native sha 028bd002…cb410f == gzip == rapidgzip on /root/silesia.gz (211968000)
+T1+T8, x86_64 guest + arm64 host; gzippy-isal UNCHANGED (x86_64 Rosetta). flip_to_clean=12 (contig
+route is production). 862 lib + native_fold_parity + flip-seam + 3 Stage-1 diff + 3 NEW owed-case
+tests green (only pre-existing diff_ratio timing flake fails, passes isolated).
+
+MEASURED (locked guest, interleaved measure.sh N=11/pass, sha-OK, 10 passes, A/B vs prior banked
+copy-free-DRAIN baseline /tmp/gzbuild-native@9cde0b4f vs rg): stage2 strictly faster than priornative
+9/10 passes; paired delta mean +0.058× median +0.044× SE±0.020 ⇒ BANKED +0.05× (advisor: drop the
++0.07 edge). Sign-stable + TRIANGULATED by the same-binary GZIPPY_FOLD_NODRAIN +0.067× (clean
+isolation). Magnitude load-confounded (loadavg 2.2→5.0, autocorrelated ⇒ ~2-SE). Provenance verified:
+only-delta is the Stage 2 wiring. GUEST: /tmp/gz-ft-src build (native, sha 028bd002…cb410f). NO
+orphan processes.
+
 ## COPY-FREE-TO-FINAL REFACTOR — STAGE 1 LANDED byte-exact (the ~0.067× drain-memcpy tooth's hardest MECHANICAL risk retired; wall NOT yet banked, Stage 2 wiring gated) [2026-06-07, OWNER turn, HEAD c224aaad + this commit]
 Two synchronous disproof advisors. The first vetted the SCOPING decision: CHECKPOINT-STAGE-1,
 NOT one-pass — a gated full-wire (engine writes contiguous into chunk.data when ON, ring+drain
