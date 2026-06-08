@@ -1,5 +1,44 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## CACHE-RESIDENCY MANDATE — MEASURED (the never-measured DECISIVE clause closed) [2026-06-08, OWNER turn, branch reimplement-isa-l]
+The instrument-dead admission at :1804-1815 is RESOLVED. mem_stats RE-HOOKED to the
+real native per-thread working set (`marker_inflate::Block`/`BOOTSTRAP_BLOCK`, via
+`on_block_active(block.heap_bytes())` in `marker_decode_step_vendor_block`) — the
+old hook (staged_bits `take_staging_box`) was DEAD on native after the fold and read
+threads=0. New `Block::heap_bytes()` + `LutLitLenCode::heap_bytes()` +
+`HuffmanCodingReversedBitsCached::heap_bytes()` (counters only, byte-transparent).
+Built `scripts/bench/rss_vs_t.sh` + `_rss_vs_t_guest.sh` (the missing deliverable
+at :1662): host-freeze bracket, sha-verify EVERY run, path=ParallelSM assert,
+RSS-vs-T + per-thread byte accounting + ballast positive-control + perf MPKI
+(validated-instrument-first).
+MEASURED (frozen guest 10.30.0.199, 16-core RaptorLake i7-13700T, gov=performance
+no_turbo=1 runnable_avg=1.75, gzippy bin_sha 8a3524088d47fcd9, feature=gzippy-native,
+every decode sha == 028bd002…cb410f):
+- INSTRUMENT VALID: threads=16 (was 0); OFF==identity; 881 lib tests pass; ballast
+  positive control recovers per-thread slope LINEARLY (16.16/15.80/16.01
+  threads-recovered per +1 MiB at 0→8→16→32) == the 16 worker threads; perf ballast
+  control moved cache-misses 1.23× / LLC 1.09× monotonically.
+- PER-THREAD working set = 278.8 KiB: output_ring 128 KiB + dist_hc.code_cache
+  128 KiB + lut_litlen 22.5 KiB + misc 0.3 KiB. SHARED read-only tables only 18 KB.
+- RSS-vs-T (min-of-5, KiB): gzippy 122800/322160/388072 @T1/8/16 vs rapidgzip
+  67164/211444/312136 = 1.83×/1.52×/1.24×. gzippy RSS +216% T1→T16 (NOT flat).
+  (The wall-progress 3× @T8 reading is PRE-fold; post-fold the gap is 1.24–1.52×.)
+- MPKI @T16: gzippy LLC-miss 0.205 / L1d-miss 4.547 / cache-miss 1.942 — BELOW
+  rapidgzip's 0.379 / 5.766 / 2.520, though gzippy runs 1.48× more instructions.
+VERDICT: mandate NOT fully met on the working-set-size / RSS-flatness clauses
+(278 KiB/thread, +216% RSS-vs-T), but its PURPOSE — hot-in-cache / low MPKI — is
+ALREADY satisfied (gzippy MPKI < rapidgzip; the 278 KiB streams with locality, no
+measured miss penalty). Shared-tables clause PARTIAL (fixed-Huffman shared;
+per-block dynamic tables + the 128 KiB dist cache are per-thread). Cross-checks the
+banked 5-refutation x86 STOP: footprint is wall-SLACK, so the architecture work is
+mandate-justified (design goal), wall-no-regress-guarded.
+SCOPED for NEXT turn (do NOT start): (1) shrink/share dist_hc.code_cache (CACHE-LEN
+2^15=32K entries vs ~30 dist symbols → 2-level / smaller cache, 278→~150 KiB); (2)
+re-land the SegmentedU8 DecodedData (commit 2b8bfae, −29% RSS @T8, wall-TIE) for
+RSS-flatness; (3) output_ring is a faithful vendor floor (m_window16) — do NOT
+shrink. Each byte-exact + re-measured on rss_vs_t.sh. Full verdict:
+plans/cache-residency-verdict.md.
+
 ## GOAL #2 SHIPPED — gzippy-isal NOW ROUTES THE PRODUCTION CLEAN TAIL THROUGH REAL ISA-L FFI (faithful rapidgzip WITH_ISAL), no longer env-gated. Byte-exact both features; full suite + net + differential gate green; advisor UPHELD-W-CAVEATS. TIES rg at T8 (1.030×), far closer than native at low-T [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 19add96c]
 
 The /goal mandates TWO shipped implementations. gzippy-native (pure-Rust, no-FFI) was done; gzippy-isal existed ONLY as the GZIPPY_ISAL_ENGINE_ORACLE measurement knob. THIS TURN promoted it to a PRODUCTION path.

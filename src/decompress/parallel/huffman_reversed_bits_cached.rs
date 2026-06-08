@@ -34,6 +34,15 @@ impl<const MAX_SYMBOL_COUNT: usize> HuffmanCodingReversedBitsCached<MAX_SYMBOL_C
         self.base.is_valid()
     }
 
+    /// Resident per-thread footprint of the reversed-bits `code_cache`
+    /// (`[(u8, Symbol); 1<<MAX_CODE_LENGTH]` = 128 KiB at MAX_CODE_LENGTH=15).
+    /// Inline in the struct (the owning `Block` lives in thread-local storage),
+    /// but it is a real per-thread resident working-set component, so the
+    /// cache-mandate instrument counts it. Counters only.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.code_cache)
+    }
+
     pub fn max_code_length(&self) -> u8 {
         self.base.base.max_code_length
     }
