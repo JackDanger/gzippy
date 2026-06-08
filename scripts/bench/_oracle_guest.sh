@@ -136,22 +136,37 @@ case "$gov_state/$trb_state" in
     fi;;
 esac
 
-# ---- 5b. LOADAVG readback (audit A1 defect 2) -------------------------------
-# A frozen box can still be Plex-loaded (loadavg 8 during the audit). A loaded box
-# inflates the ABSOLUTE wall and its spread (the audit saw 31%/22% vs single-digit
-# quiet). RATIO survives but the ABSOLUTE ocl_cf/split numbers do NOT. Hard-fail
-# above MAX_LOADAVG so a loaded-box absolute can never be banked; ALLOW_LOAD=1
-# acknowledges a deliberately loaded run (ratio-only).
+# ---- 5b. QUIET-BOX readback (instantaneous runnable; audit A1 defect 2) ------
+# A frozen box can still be loaded if a neighbor escaped the host freeze (audit:
+# Plex 600% CPU manufactured the 36/21 artifact). A loaded box inflates the
+# ABSOLUTE wall + spread (31%/22% vs single-digit quiet); the RATIO survives but
+# the ABSOLUTE ocl_cf/split numbers do NOT. We gate on INSTANTANEOUS procs_running
+# (averaged briefly), NOT the 1-min loadavg: loadavg is a ~60s EMA that carries
+# pre-freeze neighbor load for a full minute after the freeze (a FALSE not-quiet
+# signal). procs_running (/proc/stat) is the live runnable count (~1-2 quiet).
+# Hard-fail above the threshold; ALLOW_LOAD=1 acknowledges a ratio-only run.
+QUIET_MAX_RUNNABLE="${QUIET_MAX_RUNNABLE:-2.0}"; QUIET_SAMPLES="${QUIET_SAMPLES:-4}"
 LOAD1="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo NA)"
-if [ "$LOAD1" != NA ]; then
-  load_hot="$(awk -v l="$LOAD1" -v m="$MAX_LOADAVG" 'BEGIN{print (l+0>m+0)?1:0}')"
-  if [ "$load_hot" = 1 ]; then
+RUN_SUM=0; RUN_CNT=0
+for _qs in $(seq 1 "$QUIET_SAMPLES"); do
+  _r="$(awk '/^procs_running/{print $2}' /proc/stat 2>/dev/null || echo NA)"
+  [ "$_r" = NA ] && break
+  RUN_SUM=$((RUN_SUM + _r)); RUN_CNT=$((RUN_CNT + 1))
+  [ "$_qs" -lt "$QUIET_SAMPLES" ] && sleep 1
+done
+if [ "$RUN_CNT" -gt 0 ]; then
+  RUN_AVG="$(awk -v s="$RUN_SUM" -v c="$RUN_CNT" 'BEGIN{printf "%.2f", s/c}')"
+  run_hot="$(awk -v a="$RUN_AVG" -v m="$QUIET_MAX_RUNNABLE" 'BEGIN{print (a+0>m+0)?1:0}')"
+  echo "## quiet-gate: runnable_avg=$RUN_AVG (max=$QUIET_MAX_RUNNABLE) loadavg1=$LOAD1(EMA,context)"
+  if [ "$run_hot" = 1 ]; then
     if [ "$ALLOW_LOAD" = 1 ]; then
-      echo "## WARN: loadavg=$LOAD1 > $MAX_LOADAVG but ALLOW_LOAD=1 — proceeding; ABSOLUTE numbers are contention-inflated, trust RATIO only."
+      echo "## WARN: runnable_avg=$RUN_AVG > $QUIET_MAX_RUNNABLE but ALLOW_LOAD=1 — ABSOLUTE numbers contention-inflated, trust RATIO only."
     else
-      fail "host-loaded loadavg=$LOAD1 > MAX_LOADAVG=$MAX_LOADAVG — a loaded-box ABSOLUTE number is contention-inflated (audit: Plex 600% CPU manufactured the 36/21 artifact). WAIT for the box to quiet, or pass ALLOW_LOAD=1 for a ratio-only run." 13
+      fail "host-loaded runnable_avg=$RUN_AVG > $QUIET_MAX_RUNNABLE — a neighbor escaped the freeze; a loaded-box ABSOLUTE number is contention-inflated. Run with --lock (freezes neighbors), wait for quiet, or pass ALLOW_LOAD=1 for ratio-only." 13
     fi
   fi
+else
+  RUN_AVG=NA
 fi
 
 RG_CMD=""
@@ -195,7 +210,7 @@ echo "guest_src=$GUEST_SRC head=$(git rev-parse --short HEAD 2>/dev/null || echo
 echo "binary=$GZIPPY_BIN bin_sha=$BIN_SHA inputs_fp=$CUR_FP(==stamp)  <- stale-binary guard PASSED"
 echo "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 echo "gz_env='$GZ_ENV'  check_sha=$CHECK_SHA production=$PRODUCTION assert_no_fallback=$ASSERT_NO_FALLBACK"
-echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN loadavg=$LOAD1 host_frozen=$HOST_FROZEN"
+echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN runnable_avg=${RUN_AVG:-NA} loadavg1=$LOAD1 host_frozen=$HOST_FROZEN"
 [ "$PRODUCTION" = 1 ] || echo "## NOTE: this is an ORACLE/PERTURBATION run — NOT a production parity number."
 echo "=================================================="
 
