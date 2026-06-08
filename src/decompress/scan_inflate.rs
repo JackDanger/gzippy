@@ -228,6 +228,86 @@ pub fn scan_deflate_fast(
     })
 }
 
+/// Walk a single deflate stream block-by-block to its `BFINAL` end and report
+/// how many input bytes that one stream occupies (byte-aligned, EXCLUDING any
+/// gzip trailer). Used by the multi-member splitter to find exactly where one
+/// member's deflate body ends so the next member's gzip header can be located.
+///
+/// This is a boundary-finder, not a decoder: it reuses the production block
+/// decoders (so the byte cursor advances identically to a real decode) but
+/// keeps output in a bounded circular buffer (≤8 MiB) — it never materializes
+/// the full member, so it stays cheap even for a large first member.
+///
+/// Returns `Ok(byte_len)` where `deflate_data[..byte_len]` is exactly the
+/// deflate stream of the first member (the byte after the last block,
+/// byte-aligned). The 8-byte gzip trailer follows at `byte_len`.
+pub fn deflate_stream_byte_len(deflate_data: &[u8]) -> Result<usize> {
+    const INITIAL_BUF: usize = 8 * 1024 * 1024;
+    const RESET_THRESHOLD: usize = 4 * 1024 * 1024;
+
+    let mut bits = Bits::new(deflate_data);
+    let mut output = vec![0u8; INITIAL_BUF];
+    let mut out_pos: usize = 0;
+
+    loop {
+        // Keep only the last 32 KiB (the LZ77 window) so memory stays bounded
+        // regardless of member size.
+        if out_pos > RESET_THRESHOLD {
+            let keep = WINDOW_SIZE.min(out_pos);
+            output.copy_within(out_pos - keep..out_pos, 0);
+            out_pos = keep;
+        }
+        if out_pos + 4 * 1024 * 1024 > output.len() {
+            output.resize((output.len() * 2).max(out_pos + 8 * 1024 * 1024), 0);
+        }
+
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        out_pos = match btype {
+            0 => crate::decompress::inflate::consume_first_decode::decode_stored_pub(
+                &mut bits,
+                &mut output,
+                out_pos,
+            )?,
+            1 => crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
+                &mut bits,
+                &mut output,
+                out_pos,
+            )?,
+            2 => crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
+                &mut bits,
+                &mut output,
+                out_pos,
+            )?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        };
+
+        if bfinal {
+            break;
+        }
+    }
+
+    // Align to the byte boundary that follows the final block; the gzip trailer
+    // starts there. `bit_position()` is the absolute bit cursor; rounding up to
+    // the next byte gives the deflate stream's byte length.
+    bits.align_to_byte();
+    let bit_pos = bits.bit_position();
+    let byte_len = bit_pos.div_ceil(8);
+    if byte_len > deflate_data.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "deflate stream overran input",
+        ));
+    }
+    Ok(byte_len)
+}
+
 /// Decompress from a scan checkpoint to the end of the deflate stream.
 ///
 /// Uses the same `consume_first` bit reader that built the index, so

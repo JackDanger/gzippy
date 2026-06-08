@@ -15,6 +15,52 @@ pub fn read_parallel_sm<W: std::io::Write>(
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
 ) -> Result<ReadResult, ReadParallelSmError> {
+    read_parallel_sm_inner(
+        gzip_data,
+        writer,
+        out_fd,
+        parallelization,
+        target_compressed_chunk_bytes,
+        None,
+    )
+}
+
+/// Single-member parallel decode that also reports how many output bytes were
+/// streamed — even on the error path. The single-member driver uses the count
+/// to resume the remaining members of a misrouted multi-member stream past the
+/// validated prefix already written.
+#[cfg(parallel_sm)]
+pub fn read_parallel_sm_capturing<W: std::io::Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    parallelization: usize,
+    target_compressed_chunk_bytes: usize,
+    bytes_written_out: &mut usize,
+) -> Result<ReadResult, ReadParallelSmError> {
+    read_parallel_sm_inner(
+        gzip_data,
+        writer,
+        out_fd,
+        parallelization,
+        target_compressed_chunk_bytes,
+        Some(bytes_written_out),
+    )
+}
+
+/// Single-member parallel decode, optionally reporting how many output bytes
+/// were streamed even on the error path (`bytes_written_out`). The multi-member
+/// driver uses that count to resume past an already-streamed prefix when a
+/// misrouted multi-member stream fails the single-stream decode.
+#[cfg(parallel_sm)]
+fn read_parallel_sm_inner<W: std::io::Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    parallelization: usize,
+    target_compressed_chunk_bytes: usize,
+    bytes_written_out: Option<&mut usize>,
+) -> Result<ReadResult, ReadParallelSmError> {
     use crate::decompress::parallel::chunk_data::ChunkConfiguration;
     use crate::decompress::parallel::chunk_fetcher;
     use crate::decompress::parallel::gzip_format;
@@ -45,17 +91,29 @@ pub fn read_parallel_sm<W: std::io::Write>(
     // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
     // whether the marker pipeline is the rapidgzip gap. CRC/size still verified
     // below, so the known-window path's correctness is checked too.
-    let (total_crc, total_size) = if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
+    let drive_result = if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
         chunk_fetcher::drive_clean_window_oracle(
             deflate_data,
             writer,
             parallelization,
             configuration,
         )
+    } else if let Some(out) = bytes_written_out {
+        // Multi-member resume support: capture bytes streamed even on error so
+        // a misrouted multi-member stream can resume past the prefix.
+        chunk_fetcher::drive_capturing(
+            deflate_data,
+            writer,
+            out_fd,
+            parallelization,
+            configuration,
+            out,
+        )
     } else {
         chunk_fetcher::drive(deflate_data, writer, out_fd, parallelization, configuration)
-    }
-    .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
+    };
+    let (total_crc, total_size) =
+        drive_result.map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
     // FIXED-SLEEP coordination-isolation mode produces GARBAGE output (zeros)
     // by design — it is a wall-only measurement of the coordination chain
@@ -96,6 +154,128 @@ pub fn read_parallel_sm<W: std::io::Write>(
 pub struct ReadResult {
     pub total_crc: u32,
     pub total_size: usize,
+}
+
+/// A `Write` that discards the first `skip` bytes handed to it, then forwards
+/// the rest to the inner writer. Used by the multi-member RESUME path: after a
+/// misrouted multi-member stream fails the single-stream decode, the first
+/// member's already-streamed prefix (`skip` bytes) must NOT be re-emitted when
+/// the whole stream is re-decoded member-by-member.
+#[cfg(parallel_sm)]
+struct SkipWriter<'a, W: std::io::Write> {
+    inner: &'a mut W,
+    skip: usize,
+}
+
+#[cfg(parallel_sm)]
+impl<W: std::io::Write> std::io::Write for SkipWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.skip == 0 {
+            return self.inner.write(buf);
+        }
+        if buf.len() <= self.skip {
+            self.skip -= buf.len();
+            return Ok(buf.len());
+        }
+        let drop = self.skip;
+        self.skip = 0;
+        self.inner.write_all(&buf[drop..])?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Decode a possibly-multi-member gzip stream, RESUMING past `already_written`
+/// output bytes already streamed by a failed single-member attempt.
+///
+/// gzip multi-member semantics (RFC 1952 §2.2; `cat a.gz b.gz`, pigz, log
+/// rotation): the classifier's `is_likely_multi_member` only scans the first
+/// 16 MiB, so a stream whose SECOND member begins past that window is misrouted
+/// to the single-member parallel path. That path treats the whole buffer as one
+/// deflate stream and errors near the member boundary (the block finder cannot
+/// cross member 1's gzip footer into member 2's header). This driver walks each
+/// member's deflate body to its boundary, decodes each member with the SAME
+/// pure-Rust parallel engine (per-member CRC32 + ISIZE verified), and
+/// concatenates output in order — no C-FFI, faithful to gzip(1).
+///
+/// `already_written` is the contiguous, validated prefix the failed attempt
+/// streamed (chunks are written in order only after they validate); a
+/// `SkipWriter` drops exactly that many bytes so the prefix is not duplicated.
+/// Output streams through the `Write` trait (the resume path does not use the
+/// zero-copy `out_fd` writev — correctness over speed on this rare path).
+#[cfg(parallel_sm)]
+pub fn read_parallel_sm_resume_multi<W: std::io::Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    already_written: usize,
+    parallelization: usize,
+    target_compressed_chunk_bytes: usize,
+) -> Result<ReadResult, ReadParallelSmError> {
+    use crate::decompress::parallel::gzip_format;
+    use crate::decompress::scan_inflate;
+    use std::io::Write as _;
+
+    let mut skip = SkipWriter {
+        inner: writer,
+        skip: already_written,
+    };
+
+    let mut offset = 0usize;
+    let mut total_size = 0usize;
+    let mut members = 0usize;
+
+    while offset < gzip_data.len() {
+        let remaining = &gzip_data[offset..];
+        // Stop cleanly at the end (no trailing junk) — fewer than the minimum
+        // header+trailer bytes, or no gzip magic, means we have consumed every
+        // member.
+        if remaining.len() < 18 || remaining[0] != 0x1f || remaining[1] != 0x8b {
+            break;
+        }
+
+        // Header → start of this member's deflate body.
+        let (_hdr, header_size) =
+            gzip_format::read_header(remaining).map_err(|_| ReadParallelSmError::InvalidHeader)?;
+        if remaining.len() < header_size + 8 {
+            return Err(ReadParallelSmError::InvalidFormat);
+        }
+
+        // Walk this member's deflate stream to its BFINAL end (byte-aligned),
+        // pure-Rust, bounded memory. The 8-byte gzip trailer follows.
+        let deflate_len = scan_inflate::deflate_stream_byte_len(&remaining[header_size..])
+            .map_err(|e| ReadParallelSmError::DecodeFailed(format!("member boundary: {e}")))?;
+        let member_end = header_size + deflate_len + 8;
+        if member_end > remaining.len() {
+            return Err(ReadParallelSmError::InvalidFormat);
+        }
+        let member = &remaining[..member_end];
+
+        // Decode exactly this one member with the parallel engine; it parses
+        // the member's own trailer and verifies CRC32 + ISIZE.
+        let r = read_parallel_sm(
+            member,
+            &mut skip,
+            None,
+            parallelization,
+            target_compressed_chunk_bytes,
+        )?;
+        total_size += r.total_size;
+        members += 1;
+        offset += member_end;
+    }
+
+    if members == 0 {
+        return Err(ReadParallelSmError::InvalidFormat);
+    }
+    skip.flush()
+        .map_err(|_| ReadParallelSmError::InvalidFormat)?;
+
+    Ok(ReadResult {
+        total_crc: 0,
+        total_size,
+    })
 }
 
 #[cfg_attr(
