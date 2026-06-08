@@ -65,7 +65,52 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 0f5bc85b = d77a173b + copy-free-to-final Stage 2) — **STAGE 2 WIRED + LANDED BYTE-EXACT + MEASURED: the ~0.067× drain-memcpy tooth is BANKED at +0.05× (advisor-UPHELD-WITH-CAVEATS). native_fold ~0.74× → ~0.79× rg.**
+## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 2ff19ac6) — **CORRECTNESS NET ADOPTED (poison-on, Stage-2 seam VALIDATED, no bug); the ≤0.11× residual LOCATED on the T8 critical path (causal perturbation, advisor-UPHELD); inner-Huffman STORE-side technique TIE'd (kept 7a) ⇒ the loop's binding sub-resource is the DECODE-COMPUTE, owed a decode-only localization before BMI2/packed-LUT. native_fold ~0.77-0.79× rg (banked teeth UNCHANGED).**
+
+### STEP 0 — CORRECTNESS NET MERGED + STAGE-2 VALIDATED UNDER POISON (commit 24c3a04)
+Merged test/inflate-correctness-net (ae454e0f): 4 test files (seam_crossing, diff_multi_oracle,
+inflate_proptest, inflate_fuzz_loop), mod.rs wiring, proptest dev-dep, cfg(test) 0xCD reserve-poison
+gated on GZIPPY_POISON_RESERVE. Merge auto-resolved clean. ADDITIONALLY poisoned the Stage-2 copy-free
+contig spare [len,cap) in SegmentedU8::contig_decode_window so the gzippy-native FOLD copy-free clean
+tail (the seam the net guards) is stress-tested too. VALIDATION (pure-rust-inflate, arm64,
+GZIPPY_POISON_RESERVE=1): full lib suite 892 pass /1 pre-existing load-sensitive diff_ratio timing flake
+(fails in isolation too; orthogonal perf micro-assert); all 11 seam_crossing tests incl. both
+reserve-clamp regimes + 20/30 MiB max-distance fold decodes; 3-oracle + multi-oracle differentials;
+proptest; fuzz_loop_differential 5000 iters byte-exact. NO latent Stage-2 seam/back-ref/regrow bug.
+
+### STEP 1a — WHERE THE ≤0.11× IS: contig clean symbol-decode IS on the T8 critical path (commit + advisor)
+The Stage-2 FOLD clean tail decodes via decode_clean_into_contig (NO ring — Stage 2 removed the clean-path
+ring-write), which the pre-existing GZIPPY_SLOW_MODE knob (ring-path-only) did NOT perturb. Wired the same
+clean knob into decode_clean_into_contig (byte-transparent, OFF==ON==028bd002…cb410f, ~24-27M inject hits
+confirm the contig loop fires). CAUSAL PERTURBATION (locked guest, interleaved measure.sh N=11, T8, sha-OK,
+2 passes): off < spin50 < spin100 < sleep100 MONOTONIC both passes; the freq-neutral SLEEP control
+preserves/exceeds the spin delta ⇒ the contig clean symbol-decode is on the critical path (not slack-masked,
+not a turbo artifact). off/rg ~0.77× sign-stable. Advisor UPHELD-WITH-CAVEATS: loop is on-path, but the
+per-loop-body inject cannot isolate Huffman-decode COMPUTE from store/copy bandwidth — the "BMI2 will pay"
+leap is unproven until the binder WITHIN the loop is localized.
+
+### STEP 1b — STORE-SIDE TECHNIQUE (packed multi-literal fast loop) TIE'd, KEPT 7a (commit 2ff19ac6)
+Ported the ring VAR_V speculative fast loop (igzip asm:518 — packed multi-literal store + decode pipeline)
+onto the contig clean tail; gated the 8-byte store on sym_count>1 (advisor Q3 — lean single-byte path for
+the dominant sym_count==1 literal so the wide store never wastes bandwidth). BYTE-EXACT (sha 028bd002…cb410f
+T1+T8 guest x86_64 + arm64; full suite + poison + 5000-iter fuzz green). REMOVE-AND-MEASURE (locked guest,
+3 interleaved passes, baseline=pre-fastloop vs fastloop2): 1.001×/1.018×/0.994× baseline = TIE (sign-neutral;
+the ungated first cut was weakly negative 0.974-0.998×, fixed by the gate). Fast loop handles ~69% of clean
+decode events (careful-loop hits 27M→8.3M) so the path IS exercised — the STORE side is simply NOT the
+binding sub-resource. KEPT per 7a. Advisor UPHELD-WITH-CAVEATS: store technique exhausted; binding
+sub-resource UNIDENTIFIED; redirect to decode-compute is UNPROVEN.
+
+### NEXT (owed, NOT started — fresh measurement arc; do NOT jump to BMI2)
+Localize the loop's binding sub-resource: (1) a CLEAN-ONLY oracle (ISA-L for clean chunks only, marker path
+intact) to tighten the speed-up ceiling below the whole-engine ocl_cf 0.925× to a clean-loop-only number;
+(2) a decode-ONLY perturbation (slow ONLY lut_litlen_decode/dist_hc.decode, not the stores/copies) to test
+whether Huffman decode-compute is the binder. Only if (2) confirms decode-compute on-path → BMI2 PEXT/BZHI /
+packed-u32 LUT. If un-improvable in pure-Rust (plateau) → escalate the 1.0×-vs-FFI fork with the bounded
+number. GUEST: /tmp/gz-ft-src (source @2ff19ac6 marker_inflate.rs), binaries /tmp/gz-baseline (pre-fastloop)
++ /tmp/gz-fastloop2 (gated, sha 028bd002…cb410f); drivers /tmp/{contig_perturb,fastloop2_ab}.sh. rg 0.16.0.
+NO orphan processes.
+
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 0f5bc85b = d77a173b + copy-free-to-final Stage 2) — **STAGE 2 WIRED + LANDED BYTE-EXACT + MEASURED: the ~0.067× drain-memcpy tooth is BANKED at +0.05× (advisor-UPHELD-WITH-CAVEATS). native_fold ~0.74× → ~0.79× rg.**
 
 The gzippy-native FOLD post-flip clean tail now decodes DIRECTLY into chunk.data's reserved
 contiguous tail (`finish_decode_chunk_contig_native` + `decode_clean_into_contig`), DELETING the
