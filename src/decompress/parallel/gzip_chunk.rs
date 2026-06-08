@@ -1031,6 +1031,26 @@ fn decode_chunk_unified_marker(
         }
         match step {
             MarkerStep::Continue => {}
+            #[cfg(not(isal_clean_tail))]
+            MarkerStep::FlipToContig { end_bit_offset } => {
+                FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "worker.chunk_phase",
+                    &format!(
+                        r#""start_bit":{encoded_offset_bits},"phase":"flip_to_contig","end_bit":{end_bit_offset}"#
+                    ),
+                    "t",
+                );
+                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                finish_decode_chunk_contig_native(
+                    &mut chunk,
+                    &mut marker_ctx,
+                    input,
+                    end_bit_offset,
+                    stop_hint_bits,
+                )?;
+                return Ok(chunk);
+            }
             MarkerStep::FlipToClean { end_bit_offset, .. } => {
                 FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::decompress::parallel::trace_v2::emit_instant(
@@ -1072,6 +1092,157 @@ fn decode_chunk_unified_marker(
             }
         }
     }
+}
+
+/// gzippy-native copy-free-to-final clean tail. Resumes the SAME thread-local
+/// `Block` (already flipped to clean) and decodes every subsequent deflate block
+/// DIRECTLY into `chunk.data`'s reserved contiguous tail — no u8 ring, no
+/// ring->chunk.data drain memcpy. Back-refs resolve from `chunk.data[*pos-d]`,
+/// the already-committed contiguous clean output (the faithful vendor
+/// `setInitialWindow` prepend; `data_prefix_len` stays 0 because the 32 KiB
+/// predecessor window is real prior output). Replicates `marker_decode_step_loop`'s
+/// per-block bookkeeping (header parse, stop-hint early-out, BFINAL stop, EOB
+/// block-boundary recording, CRC + subchunk + non_marker accounting) for the
+/// clean phase only. The isal two-phase path (`finish_decode_chunk_with_inexact_offset`)
+/// is unchanged.
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn finish_decode_chunk_contig_native(
+    chunk: &mut ChunkData,
+    marker_ctx: &mut MarkerDecodeCtx,
+    input: &[u8],
+    start_bit_offset: usize,
+    stop_hint_bits: usize,
+) -> Result<(), ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
+
+    // Per-call contig headroom: one max-length back-ref (258) + the 8-byte
+    // word-copy overshoot (matches `decode_clean_into_contig`'s `out_room`
+    // reservation `cap - (MAX_RUN_LENGTH + 8)`, MAX_RUN_LENGTH == 258).
+    const HEADROOM: usize = 258 + 8;
+
+    marker_ctx.current_bit_offset = start_bit_offset;
+    let crc32_enabled = chunk.configuration.crc32_enabled;
+
+    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
+        let mut block = cell_block.borrow_mut();
+        debug_assert!(
+            !block.contains_marker_bytes(),
+            "contig native tail requires a flipped (clean) Block"
+        );
+
+        loop {
+            let slice_byte = marker_ctx.current_bit_offset / 8;
+            let mut bits = marker_ctx.open_bits(input);
+            let next_block_offset = absolute_bit_pos(slice_byte, &bits);
+
+            // Header parse (mirror marker_decode_step_loop:1499-1515).
+            {
+                let _tv2 =
+                    crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_header");
+                if let Err(e) = block.read_header(&mut bits, false) {
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("deflate header at bit {next_block_offset}: {e:?}"),
+                    )));
+                }
+            }
+
+            // Stop-hint early-out at a block boundary (mirror :1517-1527).
+            if next_block_offset >= stop_hint_bits && !block.is_last_block() {
+                marker_ctx.current_bit_offset = next_block_offset;
+                chunk.finalize_with_deflate(next_block_offset, Some(input));
+                return Ok(());
+            }
+
+            // Decode the whole block body into chunk.data's contiguous tail.
+            // One deflate block may span MULTIPLE contig calls (a block bigger
+            // than the per-call out_room); accounting accumulates across them and
+            // the block boundary fires only at real EOB.
+            let _tv2_body =
+                crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_body");
+            let comp_type = block.compression_type();
+            while !block.eob() {
+                // H4: re-fetch (base, cap, pos) every iteration — a grow inside
+                // `contig_decode_window` may have moved the allocation.
+                let (base, cap, pos_before) = chunk.data.contig_decode_window(HEADROOM);
+                let mut pos = pos_before;
+                // H1: release-mode guard — never let the decoder write past the
+                // reserved headroom (a contract violation here is a heap OOB,
+                // not a CRC-catchable wrong byte, because the contig path has no
+                // ring modulo).
+                let out_room = cap.saturating_sub(HEADROOM);
+                assert!(
+                    pos <= out_room && cap >= pos_before + HEADROOM,
+                    "contig native tail: insufficient headroom (pos {pos} cap {cap})"
+                );
+
+                let body_res = match comp_type {
+                    CompressionType::Uncompressed => block.decode_clean_stored_into_contig(
+                        &mut bits,
+                        base,
+                        cap,
+                        &mut pos,
+                        usize::MAX,
+                    ),
+                    CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                        block.decode_clean_into_contig(&mut bits, base, cap, &mut pos, usize::MAX)
+                    }
+                    CompressionType::Reserved => Err(BlockError::InvalidCompression),
+                };
+                let emitted = match body_res {
+                    Ok(n) => n,
+                    Err(e) => {
+                        record_block_body_fail(&e);
+                        // Commit whatever was written before the failure so the
+                        // logical length stays consistent, then surface the error.
+                        chunk.data.commit(pos - pos_before);
+                        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("deflate body at bit {next_block_offset}: {e:?}"),
+                        )));
+                    }
+                };
+                debug_assert_eq!(emitted, pos - pos_before);
+                // H3: commit BEFORE reading the bytes back for CRC (decoded_range
+                // indexes the committed region).
+                chunk.data.commit(emitted);
+                if emitted > 0 {
+                    if crc32_enabled {
+                        if let Some(last_crc) = chunk.crc32s.last_mut() {
+                            last_crc.update(chunk.data.decoded_range(pos_before, emitted));
+                        }
+                    }
+                    chunk.statistics.non_marker_count += emitted as u64;
+                    if let Some(last) = chunk.subchunks.last_mut() {
+                        last.decoded_size += emitted;
+                    }
+                    marker_ctx.clean_data_count += emitted;
+                    UNIFIED_ROUTE_CLEAN_U8_BYTES
+                        .fetch_add(emitted as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                // No forward progress AND not at EOB ⇒ the buffer can't grow
+                // enough (degenerate); bail rather than spin.
+                if emitted == 0 && !block.eob() {
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "contig native tail: no progress",
+                    )));
+                }
+            }
+
+            let end_bit_offset = absolute_bit_pos(slice_byte, &bits);
+            marker_ctx.current_bit_offset = end_bit_offset;
+
+            if block.is_last_block() {
+                chunk.finalize_with_deflate(end_bit_offset, Some(input));
+                return Ok(());
+            }
+            // Record the block boundary at the real EOB (decoded_offset = total
+            // decoded bytes = markers + clean), mirror :1597.
+            let decoded_offset = chunk.data_with_markers.len() + chunk.data.len();
+            chunk.append_block_boundary_at(end_bit_offset, decoded_offset, Some(input));
+        }
+    })
 }
 
 /// Counter: chunks that took the window-present clean-from-block-0 fast path
@@ -1154,6 +1325,18 @@ enum MarkerStep {
         end_bit_offset: usize,
         window_len: usize,
     },
+    /// gzippy-native FOLD copy-free-to-final tail. At the ctx-flip point
+    /// (`clean_appended_len() >= 32768`) the engine has ALREADY flipped to clean
+    /// (`contains_marker_bytes==false`) and ≥32 KiB of contiguous clean output
+    /// is in `chunk.data` — the 32 KiB predecessor window is that contiguous
+    /// tail. Instead of continuing the ring engine + draining (the
+    /// ring->chunk.data memcpy), the driver resumes the SAME thread-local
+    /// `Block` and decodes subsequent clean blocks DIRECTLY into `chunk.data`'s
+    /// reserved tail via `decode_clean_into_contig` (faithful vendor prepend;
+    /// `data_prefix_len` stays 0 because the window is real prior output).
+    /// Returned only on the `not(isal_clean_tail)` (gzippy-native) build.
+    #[cfg(not(isal_clean_tail))]
+    FlipToContig { end_bit_offset: usize },
     /// Chunk ends in the marker path (BFINAL, stop hint, or no clean dict).
     Finished {
         end_bit_offset: usize,
@@ -1357,6 +1540,17 @@ fn marker_decode_step_marker_ring(
     })
 }
 
+// The per-thread vendor `deflate::Block` engine, persistent across the
+// `marker_decode_step` calls of ONE chunk (primed once via `ctx.block_primed`)
+// and reused across chunks (reset on the next chunk's first call). Module-scoped
+// so the gzippy-native copy-free-to-final tail (`finish_decode_chunk_contig_native`)
+// can re-borrow the SAME engine to continue the post-flip clean decode in-place.
+#[cfg(parallel_sm)]
+thread_local! {
+    static BOOTSTRAP_BLOCK: std::cell::RefCell<crate::decompress::parallel::marker_inflate::Block> =
+        std::cell::RefCell::new(crate::decompress::parallel::marker_inflate::Block::new());
+}
+
 /// Vendor `deflate::Block` bootstrap (rapidgzip `decodeChunkWithRapidgzip`).
 #[cfg(parallel_sm)]
 fn marker_decode_step_vendor_block(
@@ -1366,12 +1560,7 @@ fn marker_decode_step_vendor_block(
     initial_window: &[u8],
     output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
 ) -> Result<(MarkerStep, bool), ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::{Block, MAX_WINDOW_SIZE};
-    use std::cell::RefCell;
-
-    thread_local! {
-        static BOOTSTRAP_BLOCK: RefCell<Block> = RefCell::new(Block::new());
-    }
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
     BOOTSTRAP_BLOCK.with(|cell_block| {
         let mut block = cell_block.borrow_mut();
@@ -1493,7 +1682,21 @@ where
                     false,
                 ));
             }
-            // gzippy-native: fall through — no handoff, Engine M continues.
+            // gzippy-native: copy-free-to-final. The engine has already flipped
+            // (clean_appended only grows post-engine-flip) and ≥32 KiB clean is
+            // contiguous in chunk.data; hand the contig tail to the driver, which
+            // resumes THIS Block decoding straight into chunk.data (no ring, no
+            // drain memcpy). The driver re-borrows the same thread-local Block.
+            #[cfg(not(isal_clean_tail))]
+            {
+                ctx.current_bit_offset = next_block_offset;
+                return Ok((
+                    MarkerStep::FlipToContig {
+                        end_bit_offset: next_block_offset,
+                    },
+                    false,
+                ));
+            }
         }
 
         let header_res = {
@@ -2822,5 +3025,131 @@ mod native_fold_parity {
             "fold branch exercised on only {flips}/{total} chunks — too few to \
              trust the gate; widen K or the start sampling"
         );
+    }
+
+    // ── Stage-2 copy-free-to-final owed cases (advisor D + landmine) ─────────
+    //
+    // These drive the REAL production native contig tail
+    // (`finish_decode_chunk_contig_native`) via `decode_chunk_window_absent` on
+    // a window-ABSENT stream that flips at 32 KiB, then assert byte-exactness
+    // against an independent flate2 decode of the same payload.
+
+    /// Build a raw-deflate stream from `payload` and decode the FIRST chunk
+    /// (window-absent, start_bit 0, stop_hint = end) via the production native
+    /// path. Returns (resolved_full_bytes, chunk.data_prefix_len, decoded_crc).
+    /// Since start is the stream head there is NO predecessor window, so the
+    /// flip resolves entirely from in-chunk output (data_prefix_len stays 0).
+    fn decode_first_chunk_native(deflate: &[u8]) -> (Vec<u8>, usize, u32) {
+        let cfg = ChunkConfiguration::default();
+        let stop = deflate.len() * 8;
+        let mut chunk = super::decode_chunk_window_absent(deflate, 0, stop, cfg)
+            .expect("native window-absent decode");
+        let prefix_len = chunk.data_prefix_len;
+        // Resolve any pre-flip markers against an EMPTY window (head of stream
+        // has no predecessor — back-refs cannot legally reach before byte 0).
+        let empty = [0u8; WINDOW];
+        chunk.resolve_and_narrow_markers_in_place(&empty);
+        chunk.merge_resolved_markers_into_data();
+        let full = chunk.data.to_contiguous();
+        let crc = crc32_of(&full[prefix_len..]);
+        (full[prefix_len..].to_vec(), prefix_len, crc)
+    }
+
+    fn flate2_inflate(deflate: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::DeflateDecoder::new(deflate)
+            .read_to_end(&mut out)
+            .expect("flate2 inflate");
+        out
+    }
+
+    fn deflate_of(payload: &[u8], level: u32) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// MULTI-BLOCK clean phase across deflate-block boundaries + CRC-prefix
+    /// exclusion. A multi-MiB compressible payload forces a flip at 32 KiB and
+    /// then many post-flip blocks; the contig tail must continue across each
+    /// EOB (read_header + resume with the same `*pos`). data_prefix_len MUST be
+    /// 0 (faithful prepend uses real prior output, no imported window image), so
+    /// CRC covers only real output.
+    #[test]
+    fn contig_native_multiblock_clean_and_crc_prefix_excluded() {
+        // Mildly compressible, several MiB → flips early, many clean blocks.
+        let mut payload = Vec::with_capacity(4 * 1024 * 1024);
+        let mut x: u32 = 0x1234_5678;
+        for i in 0..(4 * 1024 * 1024u32) {
+            // Repetitive-with-noise so it compresses (forces back-refs) but
+            // spans many blocks.
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            payload.push(((i / 64) as u8) ^ ((x >> 24) as u8 & 0x07));
+        }
+        let deflate = deflate_of(&payload, 6);
+        let (got, prefix_len, crc) = decode_first_chunk_native(&deflate);
+        assert_eq!(prefix_len, 0, "FOLD must keep data_prefix_len == 0");
+        assert_eq!(got, payload, "multi-block clean tail bytes diverged");
+        assert_eq!(
+            crc,
+            crc32_of(&payload),
+            "CRC over real output (prefix excluded) wrong"
+        );
+    }
+
+    /// REGROW past the 16 MiB reserve clamp. A >16 MiB clean payload forces the
+    /// contig buffer to grow BETWEEN calls (Engine-C contract); the loop must
+    /// re-fetch `base`/`cap` after each grow (no stale pointer / no OOB).
+    #[test]
+    fn contig_native_regrow_past_reserve_clamp() {
+        // 20 MiB highly-compressible (long RLE-ish runs) → one chunk, decoded
+        // size far exceeds the 16 MiB RESERVE_CLAMP, driving real regrows.
+        let block = b"The quick brown fox jumps over the lazy dog. 0123456789ABCDEF\n";
+        let target = 20 * 1024 * 1024usize;
+        let mut payload = Vec::with_capacity(target + block.len());
+        while payload.len() < target {
+            payload.extend_from_slice(block);
+        }
+        let deflate = deflate_of(&payload, 6);
+        let (got, prefix_len, crc) = decode_first_chunk_native(&deflate);
+        assert_eq!(prefix_len, 0);
+        assert_eq!(got.len(), payload.len(), "regrow truncated/extended output");
+        assert!(got == payload, "regrow corrupted output bytes");
+        assert_eq!(crc, crc32_of(&payload));
+    }
+
+    /// STORED (uncompressed) block AFTER the flip. The contig primitive can't
+    /// decode a stored block (returns InvalidCompression); the native tail must
+    /// route it through `decode_clean_stored_into_contig`. Build: a compressible
+    /// lead (forces a flip) followed by an incompressible (random) tail that the
+    /// encoder emits as a STORED block.
+    #[test]
+    fn contig_native_stored_block_after_flip() {
+        // Compressible lead well over 32 KiB to guarantee the flip.
+        let mut payload = Vec::new();
+        for i in 0..200_000u32 {
+            payload.push((i / 97) as u8);
+        }
+        // Incompressible tail (LCG random) — flate2 at level 0 stores it; even at
+        // higher levels a random run yields stored blocks. Use level 0 to FORCE
+        // stored blocks across the whole stream (which includes post-flip stored
+        // blocks once the 32 KiB clean window is established).
+        let mut x: u32 = 0xDEAD_BEEF;
+        for _ in 0..300_000u32 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            payload.push((x >> 24) as u8);
+        }
+        // Level 0 = all stored blocks → guarantees the contig tail must handle
+        // stored blocks post-flip (the flip can fire mid stored-stream once
+        // 32 KiB of clean literals accumulate).
+        let deflate = deflate_of(&payload, 0);
+        let truth = flate2_inflate(&deflate);
+        assert_eq!(truth, payload, "fixture self-check");
+        let (got, prefix_len, _crc) = decode_first_chunk_native(&deflate);
+        assert_eq!(prefix_len, 0);
+        assert_eq!(got, payload, "stored-block-after-flip diverged");
     }
 }

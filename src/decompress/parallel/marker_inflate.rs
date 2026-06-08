@@ -2164,6 +2164,61 @@ impl Block {
         Ok(emitted)
     }
 
+    /// Copy-free-to-final STORED (uncompressed) clean block: drain the
+    /// (already-headered) uncompressed payload byte-for-byte straight into the
+    /// caller's contiguous buffer at `base[*pos..]`. Stored blocks have no
+    /// back-refs and no markers (deflate spec §3.2.4), so this is a pure byte
+    /// copy — the contig sibling of `read_internal_uncompressed`'s clean branch
+    /// (marker_inflate.rs:1195). Sets `at_end_of_block` when the full payload is
+    /// consumed; advances `*pos`/`decoded_bytes`. Caps at `n_max_to_decode` AND
+    /// the spare in `[*pos, cap)`. Requires clean mode (post-flip).
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    pub fn decode_clean_stored_into_contig(
+        &mut self,
+        bits: &mut Bits,
+        base: *mut u8,
+        cap: usize,
+        pos: &mut usize,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        debug_assert!(
+            !self.contains_marker_bytes,
+            "decode_clean_stored_into_contig requires clean mode"
+        );
+        debug_assert!(self.compression_type == CompressionType::Uncompressed);
+        let spare = cap.saturating_sub(*pos);
+        let to_read = self.uncompressed_size.min(n_max_to_decode).min(spare);
+        let mut read_count: usize = 0;
+        for _ in 0..to_read {
+            if let Err(e) = ensure_bits(bits, 8) {
+                self.uncompressed_size -= read_count;
+                self.decoded_bytes += read_count;
+                return Err(e);
+            }
+            let byte = (bits.peek() & 0xFF) as u8;
+            bits.consume(8);
+            // SAFETY: `*pos < cap` (bounded by `spare`); `base` valid for [0, cap).
+            unsafe {
+                base.add(*pos).write(byte);
+            }
+            *pos += 1;
+            read_count += 1;
+        }
+        self.uncompressed_size -= read_count;
+        self.decoded_bytes += read_count;
+        if self.uncompressed_size == 0 {
+            self.at_end_of_block = true;
+        }
+        Ok(read_count)
+    }
+
     /// BENCH-ONLY clean-mode sibling of
     /// `read_internal_compressed_specialized::<false>` with the round-2
     /// inner-Huffman techniques layered in behind const-generic flags so the

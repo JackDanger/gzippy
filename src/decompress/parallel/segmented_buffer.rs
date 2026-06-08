@@ -216,6 +216,39 @@ impl SegmentedU8 {
         unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), spare) }
     }
 
+    /// Copy-free-to-final contig decode window (gzippy-native FOLD post-flip
+    /// tail). Ensures at least `min_spare` bytes of CONTIGUOUS spare past the
+    /// current logical length, then returns `(base, cap, len)` where `base` is
+    /// the FULL backing pointer (offset 0), `cap` the allocation capacity, and
+    /// `len` the current committed length (= the contig write head `*pos`). The
+    /// decoder writes at `base.add(len..)` and resolves back-refs from
+    /// `base[*pos - distance]` — the already-committed clean tail (the faithful
+    /// vendor `setInitialWindow` prepend, where prior real output precedes new).
+    ///
+    /// The full base (not the tail) is returned BECAUSE `decode_clean_into_contig`
+    /// addresses back-refs against `base[0..*pos)`, not a tail window.
+    ///
+    /// SAFETY contract: the caller writes only at indices `>= len` (uninitialized
+    /// spare), within `[0, cap)`, then calls [`Self::commit`]. The returned
+    /// `base` is INVALIDATED by any subsequent grow (`reserve`/`extend`/this
+    /// method when it grows) — re-fetch every outer decode iteration (H4).
+    pub fn contig_decode_window(&mut self, min_spare: usize) -> (*mut u8, usize, usize) {
+        self.ensure_buf(self.buf.len() + min_spare);
+        let len = self.buf.len();
+        if self.buf.capacity() - len < min_spare {
+            // `Vec::reserve(min_spare)` guarantees `capacity >= len + min_spare`
+            // (it reserves min_spare MORE than the current length), so the spare
+            // is at least `min_spare` after this call.
+            self.buf.reserve(min_spare);
+        }
+        debug_assert!(
+            self.buf.capacity() - len >= min_spare,
+            "contig_decode_window: spare {} < min_spare {min_spare}",
+            self.buf.capacity() - len
+        );
+        (self.buf.as_mut_ptr(), self.buf.capacity(), len)
+    }
+
     /// Record `n` bytes written into the slice returned by
     /// [`Self::writable_tail`] (or the A3 window). Bumps the logical
     /// length. Panics in debug if `n` overflows spare capacity.
