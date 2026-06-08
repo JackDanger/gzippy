@@ -43,7 +43,10 @@
 mod bench {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
     use gzippy::decompress::parallel::lut_huffman::MAX_LIT_LEN_SYM;
-    use gzippy::decompress::parallel::lut_huffman::{LutDistCode, LutLitLenCode};
+    use gzippy::decompress::parallel::lut_huffman::{
+        LutDistCode, LutLitLenCode, ISAL_DECODE_LONG_BITS, LARGE_FLAG_BIT, LARGE_SHORT_SYM_MASK,
+        LARGE_SYM_COUNT_MASK, LARGE_SYM_COUNT_OFFSET,
+    };
     use gzippy::decompress::parallel::marker_inflate::{
         Block, CompressionType, MarkerSink, DISTANCE_BASE, DISTANCE_EXTRA, END_OF_BLOCK_SYMBOL,
         MAX_WINDOW_SIZE,
@@ -993,6 +996,421 @@ mod bench {
         out[base..end].to_vec()
     }
 
+    // Decode the distance for a length code and copy the `length`-byte back-ref
+    // into the flat u8 buffer (byte-identical to VAR_VI's careful-tail back-ref).
+    // Returns false on a malformed distance (caller bails). Used by VAR_VII to
+    // resolve the trailing length code the asm hot loop hands back.
+    #[cfg(target_arch = "x86_64")]
+    fn emit_one_backref(
+        dist: &LutDistCode,
+        bits: &mut Bits<'_>,
+        out_ptr: *mut u8,
+        out_pos: &mut usize,
+        cap: usize,
+        length: usize,
+    ) -> bool {
+        let (dsym, dbits) = match dist.decode(bits) {
+            Some(d) => d,
+            None => return false,
+        };
+        bits.consume(dbits);
+        if dsym as usize >= DISTANCE_BASE.len() {
+            return false;
+        }
+        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+        let distance = if extra > 0 {
+            if bits.available() < extra {
+                bits.refill();
+            }
+            let v = unsafe { bzhi64(bits.peek(), extra) } as usize;
+            bits.consume(extra);
+            DISTANCE_BASE[dsym as usize] as usize + v
+        } else {
+            DISTANCE_BASE[dsym as usize] as usize
+        };
+        if distance == 0 || distance > *out_pos {
+            return false;
+        }
+        if *out_pos + length + 32 > cap {
+            for i in 0..length {
+                if *out_pos + i >= cap {
+                    break;
+                }
+                unsafe {
+                    let v = *out_ptr.add(*out_pos + i - distance);
+                    *out_ptr.add(*out_pos + i) = v;
+                }
+            }
+        } else {
+            unsafe {
+                avx_backref_copy(out_ptr, *out_pos, distance, length);
+            }
+        }
+        *out_pos += length;
+        true
+    }
+
+    // VAR_VI's per-symbol careful tail, factored out so VAR_VII re-enters it after
+    // the asm loop exits. Decodes via litlen.decode (the validated Rust short/long
+    // path) until EOB, target_end, or out-of-room. Returns false to signal the
+    // caller should bail (malformed / truncated) — true on clean EOB/target.
+    #[cfg(target_arch = "x86_64")]
+    fn run_careful_tail(
+        litlen: &LutLitLenCode,
+        dist: &LutDistCode,
+        bits: &mut Bits<'_>,
+        out_ptr: *mut u8,
+        out_pos: &mut usize,
+        cap: usize,
+        target_end: usize,
+    ) -> bool {
+        let mut cur = litlen.decode(bits);
+        loop {
+            if *out_pos >= target_end {
+                return true;
+            }
+            let sym = cur.symbol;
+            let sym_count = cur.sym_count;
+            if cur.bit_count == 0 {
+                return false;
+            }
+            bits.consume(cur.bit_count);
+            let mut s = sym;
+            let mut remaining = sym_count;
+            while remaining > 0 {
+                let code = (s & 0xFFFF) as u16;
+                if code <= 255 || remaining > 1 {
+                    if remaining == 1 && code > 255 {
+                        break;
+                    }
+                    if *out_pos >= cap {
+                        return false;
+                    }
+                    unsafe {
+                        *out_ptr.add(*out_pos) = (code & 0xFF) as u8;
+                    }
+                    *out_pos += 1;
+                    remaining -= 1;
+                    s >>= 8;
+                    continue;
+                }
+                break;
+            }
+            if remaining == 1 {
+                let code = (s & 0xFFFF) as u16;
+                if code == END_OF_BLOCK_SYMBOL {
+                    return true;
+                }
+                if (code as u32) > MAX_LIT_LEN_SYM {
+                    return false;
+                }
+                let length = (code as usize).wrapping_sub(254);
+                if length != 0 && !emit_one_backref(dist, bits, out_ptr, out_pos, cap, length) {
+                    return false;
+                }
+            }
+            bits.refill();
+            cur = litlen.decode(bits);
+        }
+    }
+
+    // ── Variant (vii): INLINE-ASM literal-run hot loop (igzip transliteration) ─
+    //
+    // This is the CHARTER Phase-2 prototype: an inline `core::arch::asm!` hot loop
+    // that transliterates the part of igzip's AVX2 clean-decode loop LLVM provably
+    // does NOT emit from idiomatic Rust (source-map plans/phase1-source-map, asm
+    // igzip_decode_block_stateless.asm:507-556):
+    //
+    //   F1 — ONE-ITERATION-AHEAD literal-table gather hoisted ACROSS the back-edge
+    //        (asm:540): the next symbol's short_code_lookup[12-bit] load is issued
+    //        BEFORE the current symbol is retired, behind the loop-carried read_in
+    //        dependency LLVM serializes on.
+    //   F3 — UNCONDITIONAL, FLAG-FREE refill + consume via SHLX/SHRX (asm:528-531,
+    //        543-547, 370): read_in is topped to 57-64 bits every iteration with NO
+    //        branch on read_in_length (the IN_BUFFER_SLOP=8 invariant, asm:489).
+    //   F4 — all loop-carried state PINNED in registers (read_in, read_in_length,
+    //        next_in, next_out, the preloaded next_sym): no spill between symbols.
+    //   C  — the 8-byte SPECULATIVE PACKED-LITERAL store + advance-by-count
+    //        (asm:518-519).
+    //
+    // SCOPE (Phase-2 isolation): the asm handles ONLY the literal-dominant run —
+    // short-code, flag-clear, last-symbol <= 255 (pure literals). On the FIRST
+    // length code / long code / boundary it EXITS to the Rust careful tail
+    // (decode_var_vi's exact tail logic), which resolves the back-ref, then
+    // re-enters the asm loop. This isolates F1/F3/F4/C (the table-gather hoist +
+    // branchless refill + packed store) WITHOUT a full-kernel asm rewrite, and is
+    // byte-exact by construction: every byte the asm emits is a literal it decoded
+    // identically to LutLitLenCode::decode's short path, and all len/dist/long/EOB
+    // handling stays in the validated Rust path.
+    //
+    // Byte-exactness is the absolute gate: VAR_VII must be SHA-equal to VAR_I
+    // scalar AND VAR_III ISA-L over the swept clean chunks, or the rate is VOID.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unused_assignments)]
+    fn decode_var_vii(deflate: &[u8], start_bit: usize, window: &[u8], target_n: usize) -> Vec<u8> {
+        let base = MAX_WINDOW_SIZE;
+        let out_slop = OUT_SLOP + 32;
+        let cap = base + target_n + out_slop + 4096;
+        let mut out: Vec<u8> = vec![0u8; cap];
+        out[..base].copy_from_slice(&window[..base.min(window.len())]);
+        let out_ptr = out.as_mut_ptr();
+
+        let mut block = Block::new();
+        {
+            let mut dummy: Vec<u16> = Vec::new();
+            block
+                .set_initial_window(&mut dummy, window)
+                .expect("prime window (vii)");
+        }
+
+        let mut bits = Bits::at_bit_offset(deflate, start_bit);
+        let in_end = deflate.len();
+        let mut out_pos = base;
+        let target_end = base + target_n;
+
+        const LONG_MASK: u64 = (1u64 << ISAL_DECODE_LONG_BITS) - 1;
+
+        'blocks: loop {
+            if block.read_header(&mut bits, false).is_err() {
+                break;
+            }
+            match block.compression_type() {
+                CompressionType::Uncompressed => {
+                    bits.align_to_byte();
+                    let len = bits.read_u16() as usize;
+                    let _nlen = bits.read_u16();
+                    for _ in 0..len {
+                        if bits.available() < 8 {
+                            bits.refill();
+                        }
+                        let b = (bits.peek() & 0xFF) as u8;
+                        bits.consume(8);
+                        unsafe {
+                            *out_ptr.add(out_pos) = b;
+                        }
+                        out_pos += 1;
+                    }
+                    if block.is_last_block() || out_pos >= target_end {
+                        break 'blocks;
+                    }
+                    continue 'blocks;
+                }
+                CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {}
+                CompressionType::Reserved => break 'blocks,
+            }
+
+            let (litlen, dist) = match build_block_tables(&block) {
+                Some(t) => t,
+                None => break 'blocks,
+            };
+            let short_tbl = litlen.table.short_code_lookup.as_ptr();
+
+            let mut at_eob = false;
+
+            // ── INLINE-ASM literal-run loop ───────────────────────────────────
+            // Loop-carried regs (mirror igzip's pinning, asm:108-136):
+            //   read_in        = bits.bitbuf       (r9 in igzip)
+            //   read_in_length = bits.bitsleft     (r10)
+            //   next_in_pos    = bits.pos          (rbx, byte index)
+            //   next_out       = out_pos           (r12)
+            // The asm exits via `exit_code`:
+            //   0 = hit a non-literal short symbol (len/EOB) — `pre_sym` holds the
+            //       fresh (un-consumed) packed entry; bits already point at it.
+            //   1 = hit the LONG-code flag — exit, let Rust `decode()` redo it.
+            //   2 = boundary (out/in slop) — exit to careful tail.
+            let mut exit_code: u64;
+            let mut pre_sym: u64; // the packed short_code_lookup entry that stopped us
+            {
+                let mut read_in: u64 = bits.bitbuf;
+                let mut read_in_length: i64 = bits.bitsleft as i64;
+                let mut next_in_pos: u64 = bits.pos as u64;
+                let mut next_out: u64 = out_pos as u64;
+                let in_ptr = deflate.as_ptr();
+                // slop-adjusted ends (igzip asm:488-489): stop the unchecked loop
+                // while there is < OUT_SLOP output headroom or < IN_SLOP input.
+                let mut out_limit = (cap - out_slop) as u64;
+                let in_limit = (in_end - IN_SLOP) as u64;
+                // DEBUG knob: force the asm fast loop to exit at the top guard so
+                // the careful tail decodes EVERYTHING — isolates careful-vs-asm.
+                // Self-test knob: force the asm fast loop to exit at the top guard
+                // so the careful tail decodes EVERYTHING. Used to prove the careful
+                // machinery (window-prefix + back-ref + dist decode) is byte-exact
+                // in isolation from the asm (it is). OFF==identity.
+                if std::env::var_os("GZIPPY_VII_CAREFUL_ONLY").is_some() {
+                    out_limit = out_pos as u64; // next_out(==out_pos) >= out_limit -> jae 9f
+                }
+
+                let _ = LONG_MASK; // documented constant; encoded as an immediate below
+                unsafe {
+                    core::arch::asm!(
+                        // ---- top guard (igzip asm:508-512): ONE check per iter ----
+                        "2:",
+                        "cmp {next_out}, {out_limit}",
+                        "jae 9f",                       // out slop -> boundary exit (code 2)
+                        "cmp {next_in_pos}, {in_limit}",
+                        "jae 9f",
+                        // ---- F3 unconditional refill — MATCHES Bits::refill (the
+                        // libdeflate convention, consume_first_decode.rs:255-263):
+                        //   bitbuf |= word << len ; pos += 7 - ((len>>3)&7) ;
+                        //   bitsleft = len | 56   (NOTE: NOT len + bytes*8 — gzippy's
+                        //   Bits keeps the real bit-count in the low byte and uses 56
+                        //   as a high marker; consume does bitsleft -= n, available()
+                        //   reads (bitsleft as u8)). This DIFFERS from igzip's own
+                        //   read_in_length accounting; we mirror Bits, not igzip, so
+                        //   the byte-exact gate vs LutLitLenCode::decode holds.
+                        // {ril} holds the ORIGINAL len on entry; {cnt} is a scratch
+                        // for the byte-advance (cnt is dead here, reused below).
+                        "mov {tmp}, qword ptr [{in_ptr} + {next_in_pos}]",
+                        "shlx {tmp}, {tmp}, {ril}",     // word << len (BMI2, no flags)
+                        "or {read_in}, {tmp}",
+                        "mov {cnt}, 63",
+                        "sub {cnt}, {ril}",
+                        "shr {cnt}, 3",                 // bytes = (63-len)/8 == 7-((len>>3)&7) for len in [0,56]
+                        "add {next_in_pos}, {cnt}",
+                        "or {ril}, 56",                 // bitsleft = ORIGINAL len | 56
+                        // ---- table gather: idx = read_in & 0xFFF; sym=short[idx] ----
+                        // (igzip asm:524-525,540; F1 = this load feeds NEXT iter too)
+                        "mov {tmp}, {read_in}",
+                        "and {tmp}, 0xFFF",             // LONG_MASK = (1<<12)-1
+                        "mov {sym:e}, dword ptr [{short_tbl} + {tmp}*4]",
+                        // ---- long-code flag? (LARGE_FLAG_BIT = 1<<25) -> exit 1 ----
+                        "test {sym:e}, 0x2000000",
+                        "jnz 7f",
+                        // ---- bit_count (sym>>28); 0 => invalid -> exit 1 ----
+                        "mov {tmp}, {sym}",
+                        "shr {tmp}, 28",                // bit_count
+                        "jz 7f",                        // bit_count==0 -> invalid, let Rust handle
+                        // consume bit_count: read_in >>= bc (SHRX, F3); len -= bc
+                        "shrx {read_in}, {read_in}, {tmp}",
+                        "sub {ril}, {tmp}",
+                        // ---- count = (sym>>26)&3 ; keep in {cnt} for the advance ----
+                        "mov {cnt}, {sym}",
+                        "shr {cnt}, 26",
+                        "and {cnt}, 3",
+                        // ---- last element = (sym & 0x00FF_FFFF) >> (8*(count-1)) ----
+                        // CRITICAL: mask sym to the 24-bit packed field FIRST, else
+                        // the high bits (bitcount/count/flag at bits 24-31) leak into
+                        // the shifted result and a literal mis-tests as a length code.
+                        // shift = 8*(count-1) in {tmp} (bit_count is dead, reuse {tmp}).
+                        "lea {tmp}, [{cnt} - 1]",
+                        "shl {tmp}, 3",                 // 8*(count-1)
+                        "mov {exit_code}, {sym}",       // scratch copy (exit_code dead here)
+                        "and {exit_code}, 0x1FFFFFF",   // LARGE_SHORT_SYM_MASK (25-bit packed)
+                        "shrx {tmp}, {exit_code}, {tmp}", // tmp = packed >> shift
+                        "and {tmp}, 0xFFFF",            // last element (matches careful tail `s & 0xFFFF`)
+                        // if last > 255 => length/EOB code -> exit 0 (Rust resolves it)
+                        "cmp {tmp}, 255",
+                        "ja 8f",
+                        // ---- C: speculative 8-byte packed-literal store (asm:518) ----
+                        "mov qword ptr [{out_ptr} + {next_out}], {sym}",
+                        "add {next_out}, {cnt}",        // advance by ACTUAL count
+                        "jmp 2b",
+                        // ---- exits (exit_code reuses {cnt}, written back via mov) ----
+                        "7:",                            // long code / invalid
+                        "mov {cnt}, 1",
+                        "jmp 3f",
+                        "8:",                            // non-literal (len/EOB) short:
+                        // bit_count already consumed; packed entry is in {sym}
+                        // (== pre_sym output). Rust emits leading literals + resolves
+                        // the trailing length code. Do NOT re-decode the litlen.
+                        "mov {cnt}, 0",
+                        "jmp 3f",
+                        "9:",                            // boundary
+                        "mov {cnt}, 2",
+                        "3:",
+                        "mov {exit_code}, {cnt}",
+                        in_ptr = in(reg) in_ptr,
+                        short_tbl = in(reg) short_tbl,
+                        out_ptr = in(reg) out_ptr,
+                        out_limit = in(reg) out_limit,
+                        in_limit = in(reg) in_limit,
+                        read_in = inout(reg) read_in,
+                        ril = inout(reg) read_in_length,
+                        next_in_pos = inout(reg) next_in_pos,
+                        next_out = inout(reg) next_out,
+                        sym = out(reg) pre_sym,
+                        tmp = out(reg) _,
+                        cnt = out(reg) _,
+                        exit_code = out(reg) exit_code,
+                        options(nostack),
+                    );
+                }
+
+                // Write the loop-carried bit state back into `bits`.
+                bits.bitbuf = read_in;
+                bits.bitsleft = read_in_length as u32;
+                bits.pos = next_in_pos as usize;
+                out_pos = next_out as usize;
+            }
+
+            // ── Resolve the asm exit in Rust, then run the careful tail ───────
+            // exit_code 0: a packet whose LAST element is a length/EOB code stopped
+            //   the fast loop. The asm took the `ja 8f` branch BEFORE the store, so
+            //   it did NOT store any bytes and did NOT advance out_pos — but it DID
+            //   consume bit_count. So here we (a) emit the `cnt-1` LEADING literals
+            //   from the packed entry, then (b) resolve the trailing length code as
+            //   a back-ref. (The bits are already past the litlen code.)
+            // exit_code 1: long-code / invalid. The asm jumped BEFORE the shrx, so
+            //   it did NOT consume — bits still point at this symbol; the careful
+            //   tail re-decodes it cleanly via litlen.decode.
+            // exit_code 2: boundary. Drop straight into the careful tail.
+            if exit_code == 0 {
+                let sym = pre_sym as u32;
+                let cnt = ((sym >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK).max(1) as usize;
+                let packed = sym & LARGE_SHORT_SYM_MASK;
+                // (a) emit the cnt-1 leading literals (low bytes of `packed`).
+                let mut s = packed;
+                for _ in 0..(cnt - 1) {
+                    if out_pos >= cap {
+                        return out[base..out_pos.min(target_end)].to_vec();
+                    }
+                    unsafe {
+                        *out_ptr.add(out_pos) = (s & 0xFF) as u8;
+                    }
+                    out_pos += 1;
+                    s >>= 8;
+                }
+                // (b) the last element is the length/EOB code.
+                let last = (s & 0xFFFF) as u16;
+                if last == END_OF_BLOCK_SYMBOL {
+                    at_eob = true;
+                } else if (last as u32) > MAX_LIT_LEN_SYM {
+                    return out[base..out_pos.min(target_end)].to_vec();
+                } else {
+                    let length = (last as usize).wrapping_sub(254);
+                    if length != 0
+                        && !emit_one_backref(&dist, &mut bits, out_ptr, &mut out_pos, cap, length)
+                    {
+                        return out[base..out_pos.min(target_end)].to_vec();
+                    }
+                }
+            }
+
+            // Careful tail: per-symbol, bounds-checked, to the block boundary (or
+            // target_end). Identical decode/back-ref logic to VAR_VI's tail.
+            if !at_eob && out_pos < target_end {
+                if !run_careful_tail(
+                    &litlen,
+                    &dist,
+                    &mut bits,
+                    out_ptr,
+                    &mut out_pos,
+                    cap,
+                    target_end,
+                ) {
+                    return out[base..out_pos.min(target_end)].to_vec();
+                }
+            }
+
+            if block.is_last_block() || out_pos >= target_end {
+                break 'blocks;
+            }
+        }
+
+        let end = out_pos.min(target_end);
+        out[base..end].to_vec()
+    }
+
     fn crc32(b: &[u8]) -> u32 {
         let mut h = crc32fast::Hasher::new();
         h.update(b);
@@ -1016,7 +1434,8 @@ mod bench {
     // interleaved timing + byte-exact gate. Order matters: index 0 = scalar
     // reference, index 2 = ISA-L oracle (both used as byte-exact denominators).
     type DecodeFn = fn(&[u8], usize, &[u8], usize) -> Vec<u8>;
-    const VARIANTS: [(&str, DecodeFn); 9] = [
+    const NV: usize = 10;
+    const VARIANTS: [(&str, DecodeFn); NV] = [
         ("VAR_I_scalar_u16", decode_var_i),
         ("VAR_II_E1u8_part", decode_var_ii),
         ("VAR_III_isal", decode_var_iii),
@@ -1039,13 +1458,22 @@ mod bench {
         // overlap-copy back-ref. This is the variant the ceiling falsifier gates:
         // PASS (pure-Rust IS igzip-class) if (VI)/(III isal) >= 0.85.
         ("VAR_VI_specbmi2avx", decode_var_vi),
+        // VAR_VII = the CHARTER Phase-2 INLINE-ASM transliteration: igzip's
+        // literal-run hot loop as a `core::arch::asm!` block (one-iteration-ahead
+        // table-gather hoist + unconditional flag-free SHLX/SHRX refill+consume +
+        // register-pinned loop state + 8-byte packed-literal store), exiting to the
+        // validated Rust careful tail on any length/long/boundary. This is the
+        // variant the GO/NO-GO gate measures: GO if (VII)/(III isal) materially
+        // exceeds (VI)/(III isal) toward igzip-class (~0.945 ocl_cf); PLATEAU if
+        // (VII) ≈ (VI) (inline asm cannot beat LLVM here).
+        ("VAR_VII_asm", decode_var_vii),
     ];
 
     /// Per-chunk result: median MB/s per variant (index-aligned with VARIANTS)
     /// and whether every variant was byte-exact vs scalar AND scalar vs ISA-L.
     struct ChunkResult {
-        med_mbps: [f64; 9],
-        exact: [bool; 9],
+        med_mbps: [f64; NV],
+        exact: [bool; NV],
         all_equal: bool,
         r_iii_i: f64,
     }
@@ -1080,7 +1508,7 @@ mod bench {
         let scalar_eq_isal = scalar == isal;
         // Length-safe exact check: variant must be >= n_actual long AND match
         // scalar over [0, n_actual) AND scalar must match ISA-L.
-        let mut exact = [false; 9];
+        let mut exact = [false; NV];
         for (k, o) in outs.iter().enumerate() {
             exact[k] = o.len() >= n_actual && &o[..n_actual] == scalar && scalar_eq_isal;
         }
@@ -1116,7 +1544,7 @@ mod bench {
         for (_, f) in VARIANTS.iter() {
             let _ = f(deflate, start_bit, window, n_actual);
         }
-        let mut times: [Vec<f64>; 9] = Default::default();
+        let mut times: [Vec<f64>; NV] = Default::default();
         for _ in 0..ITERS {
             for (k, (_, f)) in VARIANTS.iter().enumerate() {
                 let s = Instant::now();
@@ -1127,8 +1555,8 @@ mod bench {
         }
 
         let mbps = |secs: f64| (n_actual as f64) / secs / 1e6;
-        let mut med_mbps = [0.0f64; 9];
-        for k in 0..9 {
+        let mut med_mbps = [0.0f64; NV];
+        for k in 0..NV {
             let (_min, med, _sig) = stats(&times[k]);
             med_mbps[k] = mbps(med);
         }
