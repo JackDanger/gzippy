@@ -80,6 +80,48 @@ ACTUAL oracles, not arithmetic:
 3. **The engine premium ALSO reaches the wall** (HEAD→seedfull A/B): wall moved 0.046s
    while future::get held ~fixed; ~0.040s moved on the engine-mode axis.
 
+## RESOLUTION #2 (2026-06-07, owner turn — GZIPPY_PERFECT_OVERLAP FINALLY BUILT + RUN; advisor REFUTED my read)
+
+The registered decider oracle was built (src/decompress/parallel/perfect_overlap.rs),
+self-tested (Rule 4: sha 028bd002…cb410f byte-identical w/ and w/o the oracle on
+arm64 + x86_64; warm_hit_frac 0.88-0.96, the 2 misses are offset-0 stream-start
+chunks), and run on the locked guest. Advisor verdict: plans/perfect-overlap-advisor-verdict.md.
+
+**THE ORACLE AS BUILT IS WRONG (advisor, load-bearing):** it runs warm (decode-ALL)
+fully THEN drain (resolve-chain+write) — it SERIALIZES the two phases production
+already OVERLAPS. So its wall is a pessimistic SUM and comes out **SLOWER than
+production** (oracle 0.183-0.225s > HEAD 0.177s). A "perfect overlap" config slower
+than the un-optimized scheduler is an ANTI-overlap; its LOSS verdict says NOTHING
+about F1 (an upper bound built by DESTROYING overlap cannot falsify a TIE claim
+about the BEST overlap — the symmetric of last turn's upper-bound-can't-fire-F2).
+
+**THE GENUINE FINDING (advisor-corrected, the real lower bound):** the warm phase
+alone = **0.117s** is a TRUE LOWER bound on any schedule's wall (every chunk must
+decode; drain 0.066 < warm so it hides under decode). And **0.117 < rg WALL 0.131 <
+tie threshold 0.138** — the lower bound is INSIDE the tie zone. I reported "lower
+bound above the tie" only by mis-comparing 0.117 to rg's decode FLOOR (0.085)
+instead of rg's WALL (0.131). Read correctly with the right denominator: **the
+decode floor says the T8 TIE IS REACHABLE by better decode↔drain overlap** — the
+scheduling/overlap direction is NOT refuted; this oracle FAILED TO TEST it.
+
+NUMBERS (locked guest, T8, measure.sh interleaved N=11, sha-OK, 2 runs):
+rg 0.131-0.132s (1.000) | HEAD 0.177s (0.740-0.745× LOSS) | perfovl 0.225-0.227s
+(0.581-0.583× LOSS). Warm/drain split: warm (full-parallel decode-all, real marker
+engine, Fill→100%) 0.117s; drain 0.066s. rg --verbose: Theoretical-Optimal 0.085s,
+Real Decode 0.104s. Matched floor-to-floor = warm 0.117 vs rg Real Decode 0.104 =
+**1.13×** (NOT my brief's denominator-mismatched 1.38×).
+
+**STILL OPEN (the decider question this oracle did NOT answer):** can a REAL
+OVERLAPPED schedule (decode overlapping resolve+write, NOT serialized) collapse
+production's 0.177s toward the 0.117-0.13 floor? That needs a CORRECTED oracle —
+one that overlaps warm with drain (e.g. pipeline the drain to start as soon as each
+chunk's predecessor window is ready, while later chunks still decode), NOT
+warm-all-then-drain. My implementation was backwards. F1 remains UNDECIDED; do NOT
+declare STOP/TIE (Rule 3 + PROCESS FIX #3).
+
+---
+## RESOLUTION #1 (SUPERSEDED by #2 — its seedfull/coupling argument stands; its "ceiling bounded" framing was premature, the decider was unrun)
+
 **BOUNDED CEILING:** the T8 TIE IS reachable (seedfull proves it, F1) but BOTH the
 scheduling overlap AND the window-absent marker-engine rate are live, COUPLED terms.
 The faithful path to the tie WITHOUT seeding (rg ties unseeded at 34.5% markers) is:
