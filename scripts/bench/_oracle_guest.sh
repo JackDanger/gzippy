@@ -91,6 +91,12 @@ echo "governor=$ACT_GOV no_turbo=$ACT_TURBO"
 echo "=================================================="
 
 SINK_GZ="$ARTDIR/sink_gz.bin"; SINK_RG="$ARTDIR/sink_rg.bin"
+# Defend the sink path (same pipe-phantom risk as parity.sh): drop any planted
+# FIFO/symlink, assert a plain regular file.
+for s in "$SINK_GZ" "$SINK_RG"; do
+  rm -f "$s" 2>/dev/null || true; : > "$s" || fail "cannot-create-sink:$s" 14
+  [ -f "$s" ] && [ ! -L "$s" ] && [ ! -p "$s" ] || fail "sink-not-regular-file:$s (symlink/FIFO)" 14
+done
 timed() { local sink="$1"; shift; local s e secs sha rc
   s=$(date +%s.%N); set +e; taskset -c "$MASK" "$@" >"$sink" 2>>"$ARTDIR/run.stderr"; rc=$?; set -e 2>/dev/null||true; e=$(date +%s.%N)
   secs=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.4f", b-a}'); sha=$(sha256sum "$sink" | cut -d' ' -f1)
