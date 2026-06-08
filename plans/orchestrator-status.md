@@ -1,6 +1,53 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## CADENCE/INTRINSIC SPLIT RUN (advisor's owed symmetric control) → CADENCE TAX IS REAL + RECOVERED + LANDED: copy-free FOLD clean drain, native_fold 0.678× → 0.737× rg = +0.059× banked ratchet tooth; residual ≤0.188× UPPER BOUND on intrinsic rate [2026-06-07, OWNER turn, HEAD 9cde0b4f]
+## RING→DATA DRAIN ISOLATION RAN (fold-contig advisor's owed same-engine pure-Rust ring-copy oracle) → the 0.188× residual SPLITS: ~0.067× ring→data drain MEMCPY (recoverable free tooth) + ≤0.11× UPPER BOUND intrinsic symbol rate + ring-write; CRC is NOT a lever. NO production fix landed (banking needs the byte-exact copy-free-to-final refactor, prompt-gated) [2026-06-07, OWNER turn, HEAD 7ae5903]
+Captured the gzippy-native T8 whole-system picture with the merged fulcrum_total (built native @ HEAD
+fc7336c3, target-cpu=native, on /tmp/gz-ft-src), then BUILT + RAN the fold-contig advisor's owed
+same-engine pure-Rust ring-copy-free isolation oracle (GZIPPY_FOLD_NODRAIN/NOCRC — measurement-only,
+OFF==identity, committed 7ae5903). Synchronous disproof advisor UPHELD (C1/C3/C5 UPHELD, C2 upheld-w-
+caveats; the no-op-drain is CONSERVATIVE). Charter CURRENT STATE updated. Brief:
+plans/ring-drain-isolation-brief.md; verdict: plans/ring-drain-isolation-advisor-verdict.md.
+**SUPERVISOR GATE — drain memcpy isolated as ~0.067× recoverable; intrinsic symbol-rate sharpened to
+≤0.11× UPPER BOUND; NEXT = (1) byte-exact copy-free-to-final engine refactor to BANK ~0.067×, then
+(2) the ≤0.11× inner-Huffman rate work bounded by ocl_cf 0.925×. Do NOT start without supervisor.**
+
+fulcrum_total (native T8, trace byte-exact): routing flip_to_clean=0 finished_no_flip=16
+window_seeded=2 (natural propagation, NOT the seed oracle; isal_oracle_chunks=0). The binary
+routing-guard REFUSES on window_seeded>0 (advisor-flagged C4 caveat-2 brittleness — 2/16 naturally
+seeded ≠ GZIPPY_SEED_WINDOWS), so read DESCRIPTIVELY with that caveat: worker.block_body 658ms SELF
+(dominant = marker-engine inner decode @262 MB/s/168MB), apply_window 90ms, writev 60.8ms; consumer
+61% WAIT ⇒ engine-rate-bound. The ring-write + ring→data drain are folded INSIDE block_body/drain (no
+separate spans) ⇒ fulcrum_total can't split them — hence the isolation oracle.
+
+ISOLATION (locked guest 10.30.0.199, taskset 0,2,4,6,8,10,12,14, gov=perf, interleaved measure.sh
+N=11, RAW=211968000, best-of-N over 4 NON-OVERLAPPING passes, load-invariant 1.2→2.3):
+native_fold ∈[0.1807,0.1831] vs nodrain ∈[0.1645,0.1684] = nodrain/native 1.083-1.109×; nodrain_nocrc
+≈ nodrain; rg 0.1358-0.1464. ⇒ removing the ring→data drain memcpy moves native_fold ~0.745×→~0.812×
+rg = ~+0.067× recoverable; CRC ≈ free. SELF-TEST: OFF==rg==028bd002…cb410f (x86_64 guest + arm64);
+NODRAIN sha differs (fires), exits 1 only at the terminal trailer CRC32 (full decode ran first). 857
+lib tests green.
+
+ADVISOR: C1 UPHELD-W-CAVEATS (best-of-N on one-sided noise = correct estimator; interleaved +
+load-invariant = freq-neutral; small turbo component not fully excluded w/o pinned-freq pass). C2
+UPHELD-W-CAVEATS (≤0.11× still confounds ring-write + ISA-L-vs-pure-Rust engine diff = UPPER BOUND on
+symbol rate; safe unconditional = intrinsic ≤0.188×). C3 UPHELD (CRC reads ring slice, drain-
+independent). C5 UPHELD (copy-free-to-final is FAITHFUL: vendor decodes clean BULK to contiguous u8
+with no u16 ring, DecodedData.hpp:278-289 — gzippy's clean-phase drain has no vendor counterpart;
+nuance: vendor concatenates at merge, so claim "no clean-phase ring/narrow" not "zero copies"). KEY:
+no-op-drain is CONSERVATIVE (cold chunk.data reads in writev + window-publish cost nodrain EXTRA) ⇒
+true drain ≥ +0.067×.
+
+NEXT (gate, do NOT start): (1) BANK ~0.067× — pure-Rust clean (`<false>`) phase writes u8 DIRECTLY
+into chunk.data's reserved tail (reuse writable_tail_reserve+commit), back-refs from that tail, NO
+output_ring for the clean phase; non-trivial engine rewrite (clean-phase addressing + back-ref resolve
++ flip-seam + >16MiB reserve-clamp fallback), correctness-sensitive at the flip seam; bound by the
+nodrain knob, byte-exact dual-sha, remove-and-measure. (2) THEN ≤0.11× inner-Huffman rate (BMI2 PEXT/
+BZHI, wider multi-literal, ISA-L-class packed-u32 LUT) bounded by ocl_cf 0.925×, never the VAR_VI slope.
+GUEST: /tmp/gz-ft-src (source @fc7336c3 + knobs; symlinks vendor→/root/gzippy/vendor, /tmp/fulcrum→
+/root/fulcrum), build /tmp/gz-ft-src/target/release/gzippy (native, sha 028bd002…cb410f OFF). Driver
+/tmp/isolation_wall.sh. Trace /tmp/ft-art/. NO orphan processes.
+
+## SUPERSEDED — CADENCE/INTRINSIC SPLIT RUN (advisor's owed symmetric control) → CADENCE TAX IS REAL + RECOVERED + LANDED: copy-free FOLD clean drain, native_fold 0.678× → 0.737× rg = +0.059× banked ratchet tooth; residual ≤0.188× UPPER BOUND on intrinsic rate [2026-06-07, OWNER turn, HEAD 9cde0b4f]
 Ran the symmetric control (give the gzippy-native FOLD `<false>` clean tail one contiguous output
 region, no per-block refetch/grow). The FIRST control (pending_clean-only) TIE'd — disproof advisor
 caught I'd left the DOMINANT per-block ring→u8buf copy (fresh Vec::with_capacity + byte loop in
