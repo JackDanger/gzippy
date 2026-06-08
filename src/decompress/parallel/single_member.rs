@@ -126,6 +126,32 @@ pub(crate) fn skip_gzip_header(data: &[u8]) -> io::Result<usize> {
     crate::decompress::parallel::gzip_format::read_header(data).map(|(_h, off)| off)
 }
 
+/// Cheap, sound guard for the multi-member resume path: does a SECOND gzip
+/// member actually begin right after the first member's deflate body + trailer?
+///
+/// Walks the first member's deflate stream to its byte-aligned `BFINAL` end
+/// (pure-Rust, bounded memory), then checks whether `[member1_end + 8..]` starts
+/// with a gzip magic. Returns `false` for a genuinely-corrupt single member (the
+/// walk errors) so the caller surfaces the original decode error instead of
+/// attempting a pointless resume. Only invoked on the error path (rare).
+#[cfg(parallel_sm)]
+fn trailing_member_after_first(gzip_data: &[u8]) -> bool {
+    let header_size = match skip_gzip_header(gzip_data) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    if gzip_data.len() < header_size + 8 {
+        return false;
+    }
+    let deflate_len =
+        match crate::decompress::scan_inflate::deflate_stream_byte_len(&gzip_data[header_size..]) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+    let next = header_size + deflate_len + 8;
+    next + 2 <= gzip_data.len() && gzip_data[next] == 0x1f && gzip_data[next + 1] == 0x8b
+}
+
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
@@ -151,7 +177,9 @@ pub fn decompress_parallel<W: Write>(
 
     #[cfg(parallel_sm)]
     {
-        use crate::decompress::parallel::sm_driver::{read_parallel_sm, ReadParallelSmError};
+        use crate::decompress::parallel::sm_driver::{
+            read_parallel_sm_capturing, read_parallel_sm_resume_multi, ReadParallelSmError,
+        };
 
         // Production driver: `sm_driver::read_parallel_sm` → `chunk_fetcher::drive`.
         // `single_member::decompress_parallel` is now a thin classifier-
@@ -183,21 +211,70 @@ pub fn decompress_parallel<W: Write>(
         // real per-Vec allocator (allocator-api2 + rpmalloc-rs) or
         // daemon-mode CLI to close; not a pre-touch loop. See module
         // docs at `chunk_buffer_pool.rs:57-77`.
-        let result =
-            read_parallel_sm(gzip_data, writer, out_fd, num_threads, chunk_size).map_err(|e| {
+        // Decode as a single member, capturing the bytes streamed so far so the
+        // multi-member resume can pick up past them on a boundary error.
+        let mut bytes_written = 0usize;
+        let sm_result = read_parallel_sm_capturing(
+            gzip_data,
+            writer,
+            out_fd,
+            num_threads,
+            chunk_size,
+            &mut bytes_written,
+        );
+
+        let result = match sm_result {
+            Ok(r) => r,
+            Err(e) => {
                 if debug_enabled() {
                     eprintln!("[parallel_sm] driver error: {e}");
                 }
-                match e {
-                    ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
-                    ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
-                    ReadParallelSmError::DecodeFailed(detail) => {
-                        ParallelError::DecodeFailed(detail)
+                // A decode/size/CRC failure on a stream the classifier called
+                // single-member is the multi-member-misroute signature: the
+                // second member begins past the 16 MiB detection window, so the
+                // single-stream finder cannot cross member 1's gzip footer.
+                // Resume the remaining members (pure-Rust, per-member CRC+ISIZE
+                // verified), skipping the validated prefix already streamed.
+                // `InvalidHeader`/`InvalidFormat` are genuine malformation — not
+                // resumable. (Truly corrupt single-member input also lands here;
+                // the resume then finds no further valid member and surfaces the
+                // original failure, never silently truncating.)
+                let resumable = matches!(
+                    e,
+                    ReadParallelSmError::DecodeFailed(_)
+                        | ReadParallelSmError::SizeMismatch { .. }
+                        | ReadParallelSmError::CrcMismatch { .. }
+                );
+                if resumable && trailing_member_after_first(gzip_data) {
+                    if debug_enabled() {
+                        eprintln!(
+                            "[parallel_sm] single-member decode failed at multi-member \
+                             boundary; resuming members past {bytes_written} streamed bytes"
+                        );
                     }
-                    ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
-                    ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+                    read_parallel_sm_resume_multi(
+                        gzip_data,
+                        writer,
+                        bytes_written,
+                        num_threads,
+                        chunk_size,
+                    )
+                    .map_err(|me| {
+                        ParallelError::DecodeFailed(format!("multi-member resume: {me}"))
+                    })?
+                } else {
+                    return Err(match e {
+                        ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+                        ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+                        ReadParallelSmError::DecodeFailed(detail) => {
+                            ParallelError::DecodeFailed(detail)
+                        }
+                        ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+                        ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+                    });
                 }
-            })?;
+            }
+        };
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
         if debug_enabled() {
