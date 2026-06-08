@@ -38,6 +38,40 @@ use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 /// boundary. The clean buffer is one contiguous allocation.
 pub const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
+/// TEST-ONLY reserved-tail poison (OPT-IN via `GZIPPY_POISON_RESERVE`). The
+/// clean-tail copy-free path writes u8 DIRECTLY into this reserved
+/// (uninitialized) spare and back-refs may resolve from it; a read-BEFORE-write
+/// bug (e.g. an off-by-one seam address, or a reserve-clamp that under-sizes the
+/// contiguous tail) reads garbage. In a release build that garbage is allocator
+/// memory — often nonzero, so a differential CATCHES it, but on freshly-zeroed
+/// pages it can read as the correct byte and slip. Filling the spare with a
+/// non-zero sentinel makes any read-before-write deterministically corrupt the
+/// output, so the seam/diff nets fail every run rather than flakily
+/// (advisor item (b)).
+///
+/// Compiled ONLY under `cfg(test)`, and even then gated behind the
+/// `GZIPPY_POISON_RESERVE` env var so it is OPT-IN: the seam-correctness nets
+/// (`seam_crossing`) set it; the default test suite (and any perf-timed test)
+/// leaves the reserve memset-free so the poison's memset cost never perturbs a
+/// timing gate. Production binaries (no `cfg(test)`) get a no-op that inlines
+/// away — byte- and cost-transparent to the shipped decode.
+#[inline(always)]
+fn poison_reserved_tail(_spare: &mut [u8]) {
+    #[cfg(test)]
+    {
+        thread_local! {
+            static ENABLED: bool = std::env::var_os("GZIPPY_POISON_RESERVE").is_some();
+        }
+        if ENABLED.with(|e| *e) {
+            // 0xCD: the classic "uninitialized" sentinel; any byte read before
+            // being overwritten by a real decoded value surfaces as a miss.
+            for b in _spare.iter_mut() {
+                *b = 0xCD;
+            }
+        }
+    }
+}
+
 /// Vec<u8>-shaped contiguous buffer. Backed by a single
 /// `Vec<u8, RpmallocAlloc>` sourced from the worker buffer pool on first
 /// write and grown by amortized `reserve`.
@@ -194,7 +228,10 @@ impl SegmentedU8 {
         debug_assert!(window > 0, "writable_tail: no spare capacity");
         // SAFETY: `[len, len+window)` lies within the allocation; the
         // caller writes before any read, then calls `commit`.
-        unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), window) }
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), window) };
+        poison_reserved_tail(slice);
+        slice
     }
 
     /// Like [`Self::writable_tail`] but guarantees AT LEAST `min_spare` bytes of
@@ -213,7 +250,10 @@ impl SegmentedU8 {
         debug_assert!(spare >= min_spare, "writable_tail_reserve: short spare");
         // SAFETY: `[len, len+spare)` lies within the allocation; caller writes
         // before any read, then calls `commit`.
-        unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), spare) }
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), spare) };
+        poison_reserved_tail(slice);
+        slice
     }
 
     /// Copy-free-to-final contig decode window (gzippy-native FOLD post-flip
@@ -246,7 +286,19 @@ impl SegmentedU8 {
             "contig_decode_window: spare {} < min_spare {min_spare}",
             self.buf.capacity() - len
         );
-        (self.buf.as_mut_ptr(), self.buf.capacity(), len)
+        let cap = self.buf.capacity();
+        // TEST-ONLY: poison the uninitialized contig spare `[len, cap)` so the
+        // Stage-2 copy-free clean tail (which writes u8 DIRECTLY here and resolves
+        // back-refs from the committed prefix) deterministically corrupts output
+        // on any read-before-write seam/regrow bug, instead of flakily passing on
+        // freshly-zeroed pages. No-op (inlines away) outside `cfg(test)` and
+        // unless `GZIPPY_POISON_RESERVE` is set — byte/cost-transparent shipped.
+        // SAFETY: `[len, cap)` is allocated-but-uninitialized backing memory; the
+        // decoder overwrites it before any read (same contract as the return).
+        let spare =
+            unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), cap - len) };
+        poison_reserved_tail(spare);
+        (self.buf.as_mut_ptr(), cap, len)
     }
 
     /// Record `n` bytes written into the slice returned by
