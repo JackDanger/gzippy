@@ -28,6 +28,9 @@
 #   -N M         best-of-N trials (default 11; warmup iter0 is dropped).
 #   --fulcrum    additionally capture a window-absent trace and print the analyze cmd.
 #   --no-sync    skip the rsync (build/measure the tree already on the guest).
+#   --lock/--no-lock  bracket the run with the host freeze (default --lock): pause
+#                Plex + ALL noisy LXCs, verify QUIET (procs_running), arm a watchdog,
+#                and always thaw on exit. --no-lock = an external manager owns it.
 #   --host-frozen  acknowledge the host is frozen when sysfs governor/no_turbo can't
 #                  be read back (e.g. an LXC guest); without it a thawed/NA readback
 #                  is a HARD FAIL (a thawed-host number is contaminated).
@@ -38,10 +41,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=/dev/null
 . "$HERE/guest.env"
+# shellcheck source=/dev/null
+. "$HERE/lib_hostlock.sh"
 
 usage() { sed -n '2,34p' "${BASH_SOURCE[0]}"; }
 
 DO_BUILD=0; DO_FULCRUM=0; DO_SYNC=1; DRY=0
+# --lock (default ON): bracket the measure with the host freeze (bench-lock) so
+# Plex + the noisy neighbors are paused and the box is verified-quiet. With the
+# freeze held, the guest-side host-frozen readback (LXC sysfs hidden) is
+# acknowledged automatically (HOST_FROZEN=1). --no-lock leaves freezing to an
+# external manager (then YOU must pass --host-frozen and ensure quiet).
+DO_LOCK=1
 HOST_FROZEN="${HOST_FROZEN:-0}"
 FEATURE="${DEFAULT_FEATURE:-gzippy-native}"
 T=8; N=11
@@ -57,6 +68,8 @@ while [ "$#" -gt 0 ]; do
     -N*) N="${1#-N}";;
     --fulcrum|--decompose) DO_FULCRUM=1;;
     --no-sync) DO_SYNC=0;;
+    --lock) DO_LOCK=1;;
+    --no-lock) DO_LOCK=0;;
     --host-frozen) HOST_FROZEN=1;;
     --dry-run) DRY=1;;
     *) echo "parity.sh: unknown arg '$1'" >&2; usage; exit 2;;
@@ -93,6 +106,7 @@ GUEST_SRC='$GUEST_SRC' GZIPPY_BIN='$GZIPPY_BIN' CORPUS='$CORPUS' \
 CORPUS_RAW_SHA256='$CORPUS_RAW_SHA256' CORPUS_GZ_SHA256='${CORPUS_GZ_SHA256:-}' \
 RG='$RG' RG_TRACE='$RG_TRACE' FEATURE='$FEATURE' T='$T' N='$N' MASK='$MASK' \
 GOV='$GOV' NO_TURBO='$NO_TURBO' HOST_FROZEN='$HOST_FROZEN' RUSTFLAGS_PIN='$RUSTFLAGS_PIN' \
+ALLOW_LOAD='${ALLOW_LOAD:-0}' MAX_LOADAVG='${MAX_LOADAVG:-2.0}' \
 DO_BUILD='$DO_BUILD' DO_FULCRUM='$DO_FULCRUM' ARTDIR='${ARTDIR_BASE}/parity'
 EOF
 }
@@ -156,5 +170,21 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
+# Acquire the host freeze BEFORE syncing/measuring so the build+measure both run
+# on a quiet box; release ALWAYS (trap in lib_hostlock). With the freeze held the
+# guest's sysfs readback is hidden (LXC), so we acknowledge frozen automatically.
+if [ "$DO_LOCK" = 1 ]; then
+  if hostlock_acquire; then
+    echo "## host is QUIET — proceeding."
+  else
+    echo "## WARN: host freeze did not reach the quiet threshold (a neighbor escaped, or a VM is busy)."
+    echo "##       The RELATIVE ratio is jitter-immune (both contenders share the pin), but do NOT bank the ABSOLUTE number."
+  fi
+  HOST_FROZEN=1   # the freeze is held out-of-band from the guest's view
+fi
+
 [ "$DO_SYNC" = 1 ] && do_sync
 run_remote
+RC=$?
+hostlock_release
+exit "$RC"

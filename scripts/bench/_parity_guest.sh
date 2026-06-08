@@ -165,6 +165,41 @@ case "$gov_state/$trb_state" in
     fi;;
 esac
 
+# ---- 5b. QUIET-BOX readback (instantaneous runnable; mirrors _oracle_guest.sh) -
+# A freq-frozen box can STILL be loaded if a noisy neighbor escaped the host
+# freeze (the failure this consolidation fixes: Plex/transmission ran free and
+# bounced loadavg). We gate on INSTANTANEOUS procs_running (averaged briefly), NOT
+# the 1-min loadavg — loadavg is a ~60s EMA that carries pre-freeze neighbor load
+# for a full minute after the freeze, a FALSE not-quiet signal. procs_running
+# (/proc/stat, visible to the LXC) is the live runnable count: ~1-2 on a quiet
+# frozen box. Hard-fail above the threshold so a loaded-box absolute is never
+# banked. ALLOW_LOAD=1 acknowledges a deliberately-loaded ratio-only run.
+ALLOW_LOAD="${ALLOW_LOAD:-0}"; MAX_LOADAVG="${MAX_LOADAVG:-2.0}"
+QUIET_MAX_RUNNABLE="${QUIET_MAX_RUNNABLE:-2.0}"; QUIET_SAMPLES="${QUIET_SAMPLES:-4}"
+LOAD1="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo NA)"
+RUN_SUM=0; RUN_CNT=0
+for _qs in $(seq 1 "$QUIET_SAMPLES"); do
+  _r="$(awk '/^procs_running/{print $2}' /proc/stat 2>/dev/null || echo NA)"
+  [ "$_r" = NA ] && break
+  RUN_SUM=$((RUN_SUM + _r)); RUN_CNT=$((RUN_CNT + 1))
+  [ "$_qs" -lt "$QUIET_SAMPLES" ] && sleep 1
+done
+if [ "$RUN_CNT" -gt 0 ]; then
+  RUN_AVG="$(awk -v s="$RUN_SUM" -v c="$RUN_CNT" 'BEGIN{printf "%.2f", s/c}')"
+  run_hot="$(awk -v a="$RUN_AVG" -v m="$QUIET_MAX_RUNNABLE" 'BEGIN{print (a+0>m+0)?1:0}')"
+  echo "## quiet-gate: runnable_avg=$RUN_AVG (max=$QUIET_MAX_RUNNABLE) loadavg1=$LOAD1(EMA,context)"
+  if [ "$run_hot" = 1 ]; then
+    if [ "$ALLOW_LOAD" = 1 ]; then
+      echo "## WARN: runnable_avg=$RUN_AVG > $QUIET_MAX_RUNNABLE but ALLOW_LOAD=1 — ABSOLUTE numbers contention-inflated; trust RATIO only."
+    else
+      fail "host-loaded runnable_avg=$RUN_AVG > $QUIET_MAX_RUNNABLE — a neighbor escaped the freeze; a loaded-box ABSOLUTE number is contention-inflated. Run with --lock (freezes neighbors), wait for quiet, or pass ALLOW_LOAD=1 for ratio-only." 13
+    fi
+  fi
+else
+  RUN_AVG=NA
+  echo "## quiet-gate: procs_running unreadable; falling back to loadavg1=$LOAD1 (context only)"
+fi
+
 # rapidgzip presence (the comparison target).
 RG_CMD=""
 if command -v "$RG" >/dev/null 2>&1; then RG_CMD="$RG"
@@ -182,7 +217,7 @@ echo "guest_src=$GUEST_SRC git_head=$GIT_HEAD(UNRELIABLE: .git excluded from syn
 echo "binary=$GZIPPY_BIN bin_sha=$BIN_SHA mtime=$(date -r "$GZIPPY_BIN" '+%F %T' 2>/dev/null || echo NA)  <- the load-bearing build identity"
 echo "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 echo "rapidgzip=$("$RG_CMD" --version 2>&1 | head -1)"
-echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN host_frozen=$HOST_FROZEN"
+echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN runnable_avg=${RUN_AVG:-NA} loadavg1=$LOAD1 host_frozen=$HOST_FROZEN"
 echo "=================================================="
 
 # ---- 6. interleaved best-of-N, REGULAR-FILE sink, sha-verify EVERY run -------
