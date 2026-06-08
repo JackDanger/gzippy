@@ -1,6 +1,35 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## CORRECTNESS NET ADOPTED (poison-on, Stage-2 seam VALIDATED) + ≤0.11× RESIDUAL LOCATED on the T8 critical path (causal perturbation, advisor-UPHELD) + inner-Huffman STORE-side technique TIE'd (kept 7a) [2026-06-07, OWNER turn, HEAD 2ff19ac6]
+## DECODE-vs-STORE LOCALIZATION + PLATEAU/FORK GATE → not separable by slow-injection; PLATEAU/FORK NOT VALIDATED, REFUTED at the engine (ocl_cf 0.925× < 1.0 ⇒ ≥0.075× of the gap is OUTSIDE the engine = placement) [2026-06-07, OWNER turn, HEAD 25846265]
+Built + committed (25846265) two byte-transparent localization knobs (GZIPPY_SLOW_DECODE /
+GZIPPY_SLOW_STORE) wired into the fast (VAR_V) + careful loops of decode_clean_into_contig — decode
+injects after lut_litlen.decode + dist_hc.decode, store injects after literal-store +
+emit_backref_contig; neither forces the careful loop (perturbation hits the PRODUCTION fast path).
+Byte-exact (OFF==DEC==STORE==028bd002…cb410f x86_64 guest + arm64; 886 lib tests; net under
+GZIPPY_POISON_RESERVE=1 passes bar the documented load-flake). MEASURED (locked guest, interleaved,
+3 passes): both knobs monotone + on-path, dec100≈store100 (~0.81-0.83×), sleep controls survive.
+
+ADVISOR ×2 (synchronous; plans/decode-store-localization-advisor-verdict{,-pass2}.md): PASS 1 REFUTED
+"decode-compute is the more-robust binder" — the two knobs inject ADJACENT delays in ONE serial
+dependency chain ⇒ they re-prove "loop on-path" but cannot separate microarch sub-resources; the
+sleep discriminator is confounded by nanosleep granularity + event-count cadence. PROBES: (a) BMI2
+A/B via disasm — native binary already emits 433 BZHI/PEXT (mask idioms already lower to bzhi) ⇒
+bit-extraction at the BMI2 ceiling, manual PEXT/BZHI has NO headroom; (b) decode-free oracle
+CONTAMINATED — wrong synthetic bytes corrupt window seeds ⇒ flip_to_clean=874, Spec other=857
+re-decodes mask the wall; reverted. PASS 2 REFUTED the plateau/fork: BMI2 bounds bit-extraction NOT
+the dependent TABLE-LOAD latency (unexamined); 4 authorized techniques untried (table _mm_prefetch,
+static-Huffman specialization, FASTLOOP_OUTPUT_MARGIN yield-elision, single-level L1 table geometry);
+DECISIVE — ocl_cf 0.925× < 1.0 ⇒ the engine fully removed is sub-parity ⇒ ≥0.075× of the gap is
+OUTSIDE the engine; forking at the engine mislocates the gap.
+
+**SUPERVISOR GATE — plateau/fork NOT validated; do NOT escalate the fork. NEXT (owed, not started):
+(1) disasm a specific hot call site → FASTLOOP_OUTPUT_MARGIN yield-elision if a per-symbol branch
+exists; (2) single-level L1-resident decode table (table-load-latency); (3) CORRECT-bytes replay
+decode-free oracle for a validated decode-compute bound; CO-PRIMARY: the ≥0.075× non-engine
+placement deficit (project_confirmed_offset_prefetch_gap).** Banked teeth UNCHANGED native_fold
+~0.77-0.79× rg. GUEST artifacts in charter CURRENT STATE. NO orphan processes.
+
+## SUPERSEDED — CORRECTNESS NET ADOPTED (poison-on, Stage-2 seam VALIDATED) + ≤0.11× RESIDUAL LOCATED on the T8 critical path (causal perturbation, advisor-UPHELD) + inner-Huffman STORE-side technique TIE'd (kept 7a) [2026-06-07, OWNER turn, HEAD 2ff19ac6]
 STEP 0 (commit 24c3a04): merged test/inflate-correctness-net (seam_crossing, diff_multi_oracle,
 inflate_proptest, inflate_fuzz_loop + cfg(test) 0xCD reserve-poison). Poisoned the Stage-2 contig
 copy-free spare too so the FOLD copy-free clean seam is stress-tested. VALIDATED with

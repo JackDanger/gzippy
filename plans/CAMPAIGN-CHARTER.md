@@ -65,7 +65,56 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 2ff19ac6) — **CORRECTNESS NET ADOPTED (poison-on, Stage-2 seam VALIDATED, no bug); the ≤0.11× residual LOCATED on the T8 critical path (causal perturbation, advisor-UPHELD); inner-Huffman STORE-side technique TIE'd (kept 7a) ⇒ the loop's binding sub-resource is the DECODE-COMPUTE, owed a decode-only localization before BMI2/packed-LUT. native_fold ~0.77-0.79× rg (banked teeth UNCHANGED).**
+## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 25846265) — **DECODE-vs-STORE LOCALIZATION RAN (decode-only + store-only knobs, byte-exact, committed) → both on-path but NOT SEPARABLE by slow-injection (one serial dependency chain; advisor-vetted ×2); decode-free oracle CONTAMINATED by the spec-failure re-decode net; PLATEAU/FORK is NOT VALIDATED and is REFUTED at the engine. DECISIVE: ocl_cf 0.925× < 1.0 ⇒ even fully removing the clean engine is sub-parity ⇒ ≥0.075× of the parity gap is OUTSIDE the engine (placement/scheduling). native_fold ~0.77-0.79× rg (banked teeth UNCHANGED).**
+
+### STEP 2 — DECODE-vs-STORE LOCALIZATION + PLATEAU/FORK GATE (commit 25846265, advisor ×2)
+Built two byte-transparent knobs (GZIPPY_SLOW_DECODE / GZIPPY_SLOW_STORE) wired into BOTH the fast
+(VAR_V) and careful loops of decode_clean_into_contig — decode-only injects after lut_litlen.decode
++ dist_hc.decode (table-lookup+bit-extract compute), store-only injects after literal-store +
+emit_backref_contig (store/copy bandwidth); neither forces the careful loop so the perturbation
+lands on the PRODUCTION fast path. Byte-exact (OFF==DEC==STORE==028bd002…cb410f, x86_64 guest +
+arm64; 886 lib tests pass; the merged net under GZIPPY_POISON_RESERVE=1 passes bar the documented
+load-sensitive diff_ratio timing flake which fails in isolation too).
+
+MEASURED (locked guest, interleaved measure.sh, 3 passes, sha-OK): off ≈0.165s; dec50 ~0.91× dec100
+~0.77-0.82× decsleep ~0.74-0.76×; store50 ~0.92× store100 ~0.81-0.83× storesleep ~0.80-0.83×; rg
+~1.25×. Both knobs monotone + on-path; dec100 ≈ store100.
+
+ADVISOR PASS 1 (plans/decode-store-localization-advisor-verdict.md): REFUTED "decode-compute is the
+more-robust binder" — the two knobs inject ADJACENT delays in ONE serial dependency chain, so they
+re-prove "loop on-path" (already known) but CANNOT separate microarchitectural sub-resources;
+dec100≈store100 is the PREDICTED output, not evidence; the sleep discriminator is confounded by
+nanosleep granularity + event-count cadence. Owed: a decode-compute-removed oracle OR a BMI2 on/off A/B.
+
+PROBES RAN: (a) BMI2 A/B via disasm — the native (target-cpu=native) binary already emits 433
+BZHI/PEXT (the mask idioms already lower to bzhi) ⇒ bit-extraction is at the BMI2 ceiling, a manual
+PEXT/BZHI technique has NO headroom. (b) decode-free oracle (GZIPPY_DECODE_FREE, built + run) is
+CONTAMINATED: wrong synthetic bytes corrupt per-chunk window seeds ⇒ flip_to_clean=874,
+Speculation other=857 re-decodes through the safety net ⇒ correct output, masked wall. Reverted.
+
+ADVISOR PASS 2 (plans/decode-store-localization-advisor-verdict-pass2.md) — REFUTED the plateau/fork:
+(1) BMI2-optimal bounds bit-extraction, NOT the dependent TABLE-LOAD latency (the real Huffman
+binder, unexamined; the pipelined preload hides bit-refill, NOT the table cache line). (2) The
+"exhaustion" list omits 4 authorized techniques: table _mm_prefetch, static-Huffman specialization,
+FASTLOOP_OUTPUT_MARGIN yield-elision, single-level L1-resident table geometry. (3) DECISIVE: ocl_cf
+0.925× < 1.0 ⇒ the clean engine fully removed is still sub-parity ⇒ ≥0.075× of the gap is OUTSIDE the
+engine; forking AT the engine mislocates the gap. NO STOP/TIE/FORK without a validated removal bound.
+
+### NEXT (owed, NOT started — supervisor gate; do NOT jump to the fork)
+The decode-side technique arc per advisor pass 2, in priority order: (1) disassemble the SPECIFIC hot
+function (under fat-LTO it inlines everywhere — isolate one call site) to confirm whether a
+per-symbol margin/resumable branch exists; if so implement FASTLOOP_OUTPUT_MARGIN single-check tight
+inner loop. (2) widen the first-level decode table to a single L1-resident lookup (ISA-L DECODE_LOOKUP
+geometry) — the direct attack on dependent-load latency BMI2 cannot touch; (3) build a CORRECT-bytes
+replay decode-free oracle (decode once, cache symbol/len/dist stream, replay with decode() free,
+correct seeds ⇒ no spec-failure net) for a VALIDATED decode-compute share. PARALLEL/CO-PRIMARY: the
+≥0.075× non-engine (placement/scheduling) deficit ocl_cf exposes — bound + attack it
+(project_confirmed_offset_prefetch_gap). GUEST: /tmp/gz-ft-src (source @25846265 + knobs; symlink
+vendor→/root/gzippy/vendor), build /tmp/gz-ft-src/target/release/gzippy (native, sha 028bd002…cb410f
+OFF); symbol build /tmp/gz-ft-dbg (strip=false). drivers /tmp/{localize_perturb,localize_tight}.sh.
+rg 0.16.0. NO orphan processes.
+
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 2ff19ac6) — **CORRECTNESS NET ADOPTED (poison-on, Stage-2 seam VALIDATED, no bug); the ≤0.11× residual LOCATED on the T8 critical path (causal perturbation, advisor-UPHELD); inner-Huffman STORE-side technique TIE'd (kept 7a) ⇒ the loop's binding sub-resource is the DECODE-COMPUTE, owed a decode-only localization before BMI2/packed-LUT. native_fold ~0.77-0.79× rg (banked teeth UNCHANGED).**
 
 ### STEP 0 — CORRECTNESS NET MERGED + STAGE-2 VALIDATED UNDER POISON (commit 24c3a04)
 Merged test/inflate-correctness-net (ae454e0f): 4 test files (seam_crossing, diff_multi_oracle,
