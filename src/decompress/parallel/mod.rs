@@ -48,6 +48,7 @@ pub mod lut_huffman;
 pub mod marker_inflate;
 #[cfg(parallel_sm)]
 pub mod memlife;
+pub mod perfect_overlap;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod raw_block_finder;

@@ -95,9 +95,18 @@ fn emit_parallel_sm_cfgs() {
     let pure_inflate_decode = parallel_sm;
     let _ = has_isal_compression;
 
-    // gzippy-isal: route the chunk's clean tail through REAL ISA-L FFI instead of
-    // the pure-Rust StreamingInflateWrapper. x86_64 only (guarded above). When OFF
-    // (gzippy-native, and arm64 always), the clean tail stays pure-Rust.
+    // gzippy-isal clean-tail TOPOLOGY selector (NOT an ISA-L FFI switch — see below).
+    // When ON (x86_64 + gzippy-isal, guarded above): the chunk uses the TWO-PHASE
+    // Design-A handoff — Engine M (`marker_inflate::Block`, u16) bootstraps until
+    // 32 KiB clean, then `FlipToClean` hands the clean tail to Engine C =
+    // `StreamingInflateWrapper` = pure-Rust `unified::Inflate<Clean>` (resumable.rs).
+    // When OFF (gzippy-native, and arm64 always): the FOLD — Engine M keeps decoding
+    // the clean tail in-place via `read_internal_compressed_specialized::<false>`.
+    // BOTH topologies decode the clean tail in PURE RUST. Real ISA-L FFI for the
+    // clean tail is reachable ONLY under the measurement-only env oracle
+    // `GZIPPY_ISAL_ENGINE_ORACLE=1` (gzip_chunk.rs:539) — it is NOT on any production
+    // path. (Prior comment claimed this cfg routed through "REAL ISA-L FFI"; that was
+    // stale/aspirational and contradicted the wiring at gzip_chunk.rs:1399-1410.)
     let isal_clean_tail = is_x86_64 && has_gzippy_isal && parallel_sm;
 
     if parallel_sm {

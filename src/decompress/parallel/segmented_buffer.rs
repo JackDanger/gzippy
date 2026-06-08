@@ -197,6 +197,25 @@ impl SegmentedU8 {
         unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), window) }
     }
 
+    /// Like [`Self::writable_tail`] but guarantees AT LEAST `min_spare` bytes of
+    /// CONTIGUOUS spare capacity and returns the WHOLE spare region (not capped
+    /// at [`ALLOCATION_CHUNK_SIZE`]). Used by the copy-free ISA-L oracle to give
+    /// the FFI decoder one contiguous output buffer to write directly into, so
+    /// no intermediate `Vec` + `copy_from_slice` confounds the WALL measurement.
+    /// SAFETY contract identical to [`Self::writable_tail`]: write-then-`commit`.
+    pub fn writable_tail_reserve(&mut self, min_spare: usize) -> &mut [u8] {
+        self.ensure_buf(self.buf.len() + min_spare);
+        let len = self.buf.len();
+        if self.buf.capacity() - len < min_spare {
+            self.buf.reserve(min_spare - (self.buf.capacity() - len));
+        }
+        let spare = self.buf.capacity() - len;
+        debug_assert!(spare >= min_spare, "writable_tail_reserve: short spare");
+        // SAFETY: `[len, len+spare)` lies within the allocation; caller writes
+        // before any read, then calls `commit`.
+        unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(len), spare) }
+    }
+
     /// Record `n` bytes written into the slice returned by
     /// [`Self::writable_tail`] (or the A3 window). Bumps the logical
     /// length. Panics in debug if `n` overflows spare capacity.
@@ -216,6 +235,13 @@ impl SegmentedU8 {
         unsafe {
             self.buf.set_len(new_len);
         }
+    }
+
+    /// Zero-copy view of the committed bytes `[start, start+len)`. Used by the
+    /// copy-free ISA-L oracle to CRC the exact kept region without re-copying.
+    #[inline]
+    pub fn decoded_range(&self, start: usize, len: usize) -> &[u8] {
+        &self.buf[start..start + len]
     }
 
     /// Iterate over the logical contents as byte slices (one contiguous

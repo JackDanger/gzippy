@@ -179,45 +179,48 @@ fn finish_decode_chunk_isal_oracle(
         return Ok(false);
     }
 
-    // ISA-L decodes from `inflate_start_bit` over the available input, recording
-    // every deflate block boundary. We use a throwaway hasher; CRC is recomputed
-    // below over the EXACT kept region so the chunk's running CRC stays correct.
-    let mut throwaway = crc32fast::Hasher::new();
     // BOUND THE DECODE TO THIS CHUNK (else ISA-L runs to BFINAL of the WHOLE
-    // member per worker — a 200 MB per-chunk decode + ~500 MB alloc, which would
-    // make the oracle measure the wrong thing). Slice `input` to end a few bytes
-    // past `stop_hint_bits` so ISA-L decodes only this chunk's blocks then runs
-    // out of input at a block boundary. A clean DEFLATE block boundary is the
-    // natural stop the pipeline already trims to. Cap output at a per-chunk bound.
+    // member per worker). Slice `input` to end a few bytes past `stop_hint_bits`
+    // so ISA-L decodes only this chunk's blocks then runs out of input at a block
+    // boundary. A clean DEFLATE block boundary is the natural stop the pipeline
+    // already trims to.
     let stop_byte = stop_hint_bits.div_ceil(8);
-    // Slack must cover the block that STRADDLES stop_hint (the chunk's natural
-    // stop is the first boundary AT-OR-PAST stop_hint, which can be a full block
-    // past it) plus ISA-L's read-ahead. 256 KiB is ample for a deflate block yet
-    // tiny vs the whole-member input — bounds the per-chunk decode without risking
-    // an input-exhaustion mid-block (which returns None ⇒ fall back to pure).
     let slice_end = (stop_byte + 256 * 1024).min(input.len());
     let bounded = &input[..slice_end];
-    // Per-chunk output cap: chunk_target decoded bytes are a few MiB; give 64 MiB
-    // headroom so the alloc is tiny vs the whole-member alloc. The decoder grows
-    // if needed (it won't, given the bounded input).
-    let max_output: usize = 64 * 1024 * 1024;
-    let Some((output, end_bit, boundaries)) =
-        isal_decompress::decompress_deflate_from_bit_with_boundaries(
+
+    // COPY-FREE: decode ISA-L DIRECTLY into the chunk's u8 data buffer. Reserve a
+    // contiguous spare region (sized to the chunk decode bound) and hand its raw
+    // pointer to the FFI — no intermediate 64 MiB `Vec`, no `copy_from_slice`.
+    // This removes the per-chunk alloc+copy confound the prior oracle paid that
+    // production's direct-to-`writable_tail()` stream never pays, so the
+    // ISA-L clean-engine WALL ceiling becomes readable (advisor Q1 fix).
+    //
+    // Reserve enough for the chunk: target bytes + slack for the straddling block
+    // (a boundary AT-OR-PAST stop_hint can be a full block beyond it). 64 MiB of
+    // RESERVED (not allocated-and-filled) contiguous capacity is ample; ISA-L
+    // stops at a boundary long before exhausting it. Reserve happens ONCE per
+    // chunk (amortized into the chunk's own buffer, recycled by the pool) — it is
+    // NOT a fresh per-chunk heap alloc+memset the way the old `Vec` was.
+    let reserve_len: usize = 64 * 1024 * 1024;
+    let decode_start = chunk.data.len();
+    let (written, end_bit, boundaries) = {
+        let out = chunk.data.writable_tail_reserve(reserve_len);
+        match isal_decompress::decompress_deflate_from_bit_into(
             bounded,
             inflate_start_bit,
             initial_window,
-            max_output,
-            &mut throwaway,
-        )
-    else {
-        return Ok(false);
+            out,
+        ) {
+            Some(v) => v,
+            None => return Ok(false),
+        }
     };
 
     // Pick the natural stop: first boundary at-or-past stop_hint (inexact), or
     // the exact boundary == stop_hint (exact). Boundaries record (bit_offset,
-    // output_offset) measured from the start of THIS decode.
+    // output_offset) measured from the start of THIS decode (offset into the
+    // reserved region == offset from `decode_start`).
     let (final_bit, keep_len) = if until_exact {
-        // Exact: a boundary must land exactly on stop_hint_bits.
         let mut found = None;
         for b in &boundaries {
             if b.bit_offset == stop_hint_bits {
@@ -230,7 +233,6 @@ fn finish_decode_chunk_isal_oracle(
             None => return Ok(false), // oracle can't honor exact stop ⇒ fall back
         }
     } else {
-        // Inexact: first boundary at-or-past stop_hint_bits; else whole decode.
         let mut chosen = None;
         for b in &boundaries {
             if b.bit_offset >= stop_hint_bits {
@@ -238,38 +240,37 @@ fn finish_decode_chunk_isal_oracle(
                 break;
             }
         }
-        chosen.unwrap_or((end_bit, output.len()))
+        chosen.unwrap_or((end_bit, written))
     };
 
-    let keep_len = keep_len.min(output.len());
-    let kept = &output[..keep_len];
+    let keep_len = keep_len.min(written);
 
-    // Commit bytes into the chunk's u8 data buffer (same as the pure path).
-    let mut written = 0usize;
-    while written < kept.len() {
-        let tail = chunk.data.writable_tail();
-        let n = tail.len().min(kept.len() - written);
-        tail[..n].copy_from_slice(&kept[written..written + n]);
-        chunk.data.commit(n);
-        chunk.note_inner_decoded_bytes(n);
-        written += n;
-    }
+    // Commit ONLY the kept region into the chunk's u8 data buffer. The bytes are
+    // already physically present in the reserved spare (ISA-L wrote them); commit
+    // bumps the logical length with zero copies.
+    chunk.data.commit(keep_len);
+    chunk.note_inner_decoded_bytes(keep_len);
+
     // CRC over the exact kept region (mirrors finish_decode_chunk_impl:512-517).
+    // The kept bytes are now the contiguous slice `data[decode_start..decode_start+keep_len]`.
     if chunk.configuration.crc32_enabled {
+        // Re-borrow the committed region as a slice for hashing (zero-copy view).
+        let kept_view = chunk.data.decoded_range(decode_start, keep_len);
         if let Some(last_crc) = chunk.crc32s.last_mut() {
-            last_crc.update(kept);
+            last_crc.update(kept_view);
         }
     }
-    chunk.statistics.non_marker_count += kept.len() as u64;
+    chunk.statistics.non_marker_count += keep_len as u64;
 
     // Replay boundaries up to (and not past) the natural stop, mirroring the
-    // pure path's `append_block_boundary_at` calls.
-    let base_decoded = 0usize;
+    // pure path's `append_block_boundary_at` calls. Boundary output offsets are
+    // relative to this decode's start; the chunk's absolute decoded offset is
+    // `decode_start + output_offset` (== production's `decode_base + rel_off`).
     for b in &boundaries {
         if b.bit_offset > final_bit {
             break;
         }
-        let decoded_offset = base_decoded + b.output_offset.min(keep_len);
+        let decoded_offset = decode_start + b.output_offset.min(keep_len);
         if decoded_offset > 0 {
             chunk.append_block_boundary_at(b.bit_offset, decoded_offset, Some(input));
         }
@@ -828,39 +829,69 @@ fn decode_chunk_with_rapidgzip_impl(
     Ok(chunk)
 }
 
-/// Vendor `decodeChunkWithRapidgzip` append path: u16 markers into
-/// `dataWithMarkers`, clean u8 buffered then flushed to `data`
-/// (GzipChunk.hpp:576-580 `cleanDataCount += bufferViews.dataSize()`).
+/// Clean-fold sink (gzippy-native FOLD production path): writes post-flip clean
+/// u8 bytes DIRECTLY into the pre-reserved contiguous `chunk.data`, replicating
+/// `ChunkData::append_clean`'s exact accounting (CRC + subchunk decoded_size +
+/// non_marker_count) — NO intermediate `pending_clean` Vec, NO second copy, NO
+/// per-run regrow. Together with the copy-free ring drain
+/// (`marker_inflate::drain_to_output`) the post-flip clean tail is fully
+/// copy-free (ring slice -> chunk.data in one memcpy). Holds disjoint field
+/// borrows so `push_slice` (markers) and `push_clean_u8` (clean data) never
+/// alias. This recovered +0.059× of the T8 wall (native_fold 0.678× -> 0.737× rg,
+/// quiet-box banked, sha-exact; the loaded 6-pass split showed the same recovery
+/// monotonic across copy#1 + copy#2/3/grow but load-inflated, so the banked
+/// number is +0.059×). Vendor decodes the clean tail straight into one contiguous
+/// DecodedData buffer (DecodedData.hpp:278-289). NOTE: "copy-free" here means no
+/// `u8buf`/`pending_clean` middle-man — the engine ring write + the ring->data
+/// drain memcpy remain (the ISA-L `ocl_cf` ceiling pays neither), so the residual
+/// to that 0.925× ceiling is an UPPER BOUND on intrinsic symbol rate, not pure rate.
 #[cfg(parallel_sm)]
-struct UnifiedMarkerSink<'a> {
+struct ContigFoldSink<'a> {
     markers: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
-    committed_clean_len: usize,
-    pending_clean: &'a mut Vec<u8>,
+    data: &'a mut crate::decompress::parallel::segmented_buffer::SegmentedU8,
+    crc32s: &'a mut Vec<crate::decompress::parallel::crc32::CRC32Calculator>,
+    subchunks: &'a mut Vec<crate::decompress::parallel::chunk_data::Subchunk>,
+    non_marker_count: &'a mut u64,
+    clean_appended: &'a mut usize,
+    crc32_enabled: bool,
     boundaries: &'a mut Vec<(usize, usize)>,
 }
 
 #[cfg(parallel_sm)]
-impl crate::decompress::parallel::marker_inflate::MarkerSink for UnifiedMarkerSink<'_> {
+impl crate::decompress::parallel::marker_inflate::MarkerSink for ContigFoldSink<'_> {
     fn push_slice(&mut self, values: &[u16]) {
         self.markers.push_slice(values);
     }
     fn push_clean_u8(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.pending_clean.extend_from_slice(bytes);
+        if bytes.is_empty() {
+            return;
         }
+        // Identical accounting to ChunkData::append_clean, but the bytes land
+        // straight in the pre-reserved contiguous tail (single copy, no regrow).
+        if self.crc32_enabled {
+            if let Some(last_crc) = self.crc32s.last_mut() {
+                last_crc.update(bytes);
+            }
+        }
+        *self.non_marker_count += bytes.len() as u64;
+        self.data.extend_from_slice(bytes);
+        if let Some(last) = self.subchunks.last_mut() {
+            last.decoded_size += bytes.len();
+        }
+        *self.clean_appended += bytes.len();
     }
     fn clean_appended_len(&self) -> usize {
-        self.committed_clean_len + self.pending_clean.len()
+        *self.clean_appended
     }
     fn sink_len(&self) -> usize {
-        self.markers.sink_len() + self.committed_clean_len + self.pending_clean.len()
+        self.markers.sink_len() + *self.clean_appended
     }
     fn as_slice(&self) -> &[u16] {
         self.markers.as_slice()
     }
     fn trailing_clean_since(&self, from: usize) -> usize {
         let marker_len = self.markers.sink_len();
-        let clean_len = self.committed_clean_len + self.pending_clean.len();
+        let clean_len = *self.clean_appended;
         if from >= marker_len + clean_len {
             return 0;
         }
@@ -871,24 +902,13 @@ impl crate::decompress::parallel::marker_inflate::MarkerSink for UnifiedMarkerSi
         }
     }
     fn copy_last_n_clean_u8(&self, n: usize, out: &mut Vec<u8>) -> bool {
-        let pending = self.pending_clean.len();
-        let total_clean = self.committed_clean_len + pending;
-        if total_clean < n {
+        // Clean bytes already live contiguously in chunk.data; the marker
+        // path only needs this BEFORE the flip (clean tail < window), at which
+        // point clean_appended is 0 and the marker sink serves the request.
+        if *self.clean_appended < n {
             return self.markers.copy_last_n_clean_u8(n, out);
         }
-        let mut need = n;
-        if pending > 0 && need > 0 {
-            let take = need.min(pending);
-            let start = pending - take;
-            out.extend_from_slice(&self.pending_clean[start..]);
-            need -= take;
-        }
-        if need > 0 && self.committed_clean_len >= need {
-            // Committed clean bytes live in chunk.data; caller uses this
-            // only after flush in practice — marker path falls back.
-            return false;
-        }
-        !out.is_empty()
+        false
     }
     fn note_block_boundary(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
         self.boundaries.push((encoded_offset_bits, decoded_offset));
@@ -922,23 +942,51 @@ fn decode_chunk_unified_marker(
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
     chunk.data_with_markers.reserve(128 * 1024);
+    // Pre-reserve ONE contiguous clean-data region up-front so the post-flip
+    // clean tail lands without per-run amortized regrow. Estimate the decoded
+    // size as compressed × 8 (a typical-ratio HEURISTIC, NOT DEFLATE's worst-case
+    // ~1032:1 expansion) clamped to a sane ceiling; an under-reserve on a
+    // highly-compressible chunk just falls back to amortized regrow (safe — the
+    // sink writes via `extend_from_slice`), it never corrupts. The clamp bounds
+    // the high-T × large-chunk RSS bump. With the copy-free ring drain
+    // (`marker_inflate::drain_to_output`'s clean branch pushes the ≤2 contiguous
+    // ring slices straight to the sink) and `ContigFoldSink` (writes those slices
+    // DIRECTLY into `chunk.data`, no `pending_clean` middle-man, no second
+    // `append_clean` copy), the post-flip clean tail drops the per-block u8buf
+    // alloc + the pending_clean double-copy. This recovered +0.059× of the T8
+    // wall (native_fold 0.678× -> 0.737× rg, quiet-box banked, sha-exact; the
+    // loaded 6-pass split confirmed the recovery is monotonic across copy#1 +
+    // copy#2/3/grow but load-inflated). The residual to the engine-removed
+    // ceiling (ocl_cf 0.925×) is ~0.188×, an UPPER BOUND on the intrinsic
+    // symbol-rate gap that still includes the ring-write + ring->data drain
+    // memcpy `ocl_cf` does not pay — not pure symbol rate.
+    {
+        const RESERVE_CLAMP: usize = 16 * 1024 * 1024;
+        let compressed_bytes = stop_hint_bits.saturating_sub(encoded_offset_bits) / 8;
+        let estimate = compressed_bytes
+            .saturating_mul(8)
+            .saturating_add(1024 * 1024);
+        chunk.reserve_clean(estimate.min(RESERVE_CLAMP));
+    }
     let mut pending_boundaries: Vec<(usize, usize)> = Vec::new();
     loop {
-        let mut pending_clean: Vec<u8> = Vec::new();
-        let mut sink = UnifiedMarkerSink {
+        let mut clean_appended = marker_ctx.clean_data_count;
+        let crc32_enabled = chunk.configuration.crc32_enabled;
+        let mut sink = ContigFoldSink {
             markers: &mut chunk.data_with_markers,
-            committed_clean_len: marker_ctx.clean_data_count,
-            pending_clean: &mut pending_clean,
+            data: &mut chunk.data,
+            crc32s: &mut chunk.crc32s,
+            subchunks: &mut chunk.subchunks,
+            non_marker_count: &mut chunk.statistics.non_marker_count,
+            clean_appended: &mut clean_appended,
+            crc32_enabled,
             boundaries: &mut pending_boundaries,
         };
         let (step, flipped_clean) =
             marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &[], &mut sink)?;
-        if !pending_clean.is_empty() {
-            let n = pending_clean.len();
-            chunk.append_clean(&pending_clean);
-            marker_ctx.clean_data_count += n;
-            UNIFIED_ROUTE_CLEAN_U8_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        }
+        let n = clean_appended - marker_ctx.clean_data_count;
+        marker_ctx.clean_data_count = clean_appended;
+        UNIFIED_ROUTE_CLEAN_U8_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         apply_recorded_block_boundaries(&mut chunk, input, &pending_boundaries);
         pending_boundaries.clear();
         if flipped_clean {
