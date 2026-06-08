@@ -87,9 +87,14 @@ echo "=== GUEST orphan sweep (via $SSH_GUEST) ==="
 GUEST_KILL=""
 [ "$KILL" = 1 ] && GUEST_KILL='for p in $(pgrep -f "gzippy -d|rapidgzip|measure.sh|fulcrum_total_capture" 2>/dev/null); do kill "$p" 2>/dev/null && echo "  -> killed guest $p"; done'
 REMOTE='
+  self=$$
   found=0
   for pat in "gzippy -d" "rapidgzip" "measure.sh" "fulcrum_total_capture" "sleep 86400"; do
-    out="$(pgrep -fl "$pat" 2>/dev/null || true)"
+    # -a prints the cmdline; drop our OWN sweep shell + any pgrep/sed/bash wrapper
+    # whose cmdline merely CONTAINS the pattern (the self-detection race that
+    # flagged the sweep'\''s own ssh subshells as offenders). Keep only lines whose
+    # process is the actual binary, not a shell mentioning it.
+    out="$(pgrep -af "$pat" 2>/dev/null | awk -v me="$self" '\''$1!=me && $0 !~ /pgrep|orphan-check|GUEST stray|[ =]for pat/'\'' || true)"
     [ -n "$out" ] && { echo "$out" | sed "s/^/  GUEST stray: /"; found=1; }
   done
   '"$GUEST_KILL"'
