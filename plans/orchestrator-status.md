@@ -1,6 +1,41 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## CLEAN ENGINE-RATE CEILING MEASURED + VALIDATED (matched comparator) → engine plateau REAL & bounded; FORK NOT escalated (advisor: KEEP-GRINDING C2, not inline-asm) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD a884fa7b+wt]
+## C2 NON-ENGINE RESIDUAL LOCALIZED + BOUNDED on ocl_cf → ALL C2 SUB-TERMS FLAT-OR-SMALL; the 21ms is NOT a faithful low-risk scheduling tooth (3 removal oracles, advisor signed off ×2) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD f98af1f]
+
+Owned the supervisor's job: localize the 21ms non-engine residual on the ocl_cf (ISA-L engine) path,
+bound it with a removal oracle, faithful-fix if found. Froze the host (was thawed on arrival), built
+gzippy-isal @ f98af1f, re-confirmed ocl_cf 0.966-0.989× rg (residual ~5-14ms; banked 21ms reproduces
+structurally, smaller absolute on this loaded host).
+
+LOCALIZED (fulcrum_total + consumer_block_decompose.py, consumer tid=1, native + ocl_cf): swapping the
+clean engine to ISA-L barely moves consumer_wall (~5ms) and does NOT shrink DECODE_WAIT (~64% both).
+consumer.writev (~0.12-0.13s) dominates SERIAL; resolve/publish spans ~0ms (apply_window already off the
+consumer crit path = faithful).
+
+BOUNDED (3 removal oracles on ocl_cf, pre-registered falsifiers, interleaved, byte-exact A):
+1. PERFECT_OVERLAP (dispatch-DEPTH): A→B −0.2% FLAT (warm_hit_frac 0.882) ⇒ head-of-line DEPTH DEAD.
+2. warm_miss cause: guard-rejects=1 of 2 misses ⇒ interior-reuse/overshoot fires on 1 chunk, negligible.
+3. SEEDFULL bootstrap-removal (masks-binder CEILING): A−B ≤8ms; ocl_cf+seedfull STILL 0.983-0.985× not
+   1.0× ⇒ ~6ms output-floor residual SURVIVES full bootstrap removal (fresh removal confirmation).
+
+VERDICT (advisor disproof ×2, plans/c2-residual-disproof-verdict.md — SIGNED OFF, "argued→removed",
+EARNED leg-by-leg): scheduling NULL, interior-reuse 1-chunk, bootstrap ≤8ms engine-class, dominant
+residual = the (prior-established) shared writev/bandwidth OUTPUT FLOOR. project_confirmed_offset_prefetch_gap
+is REFUTED as the 21ms (DEPTH dead by removal; TARGETING 1-chunk).
+
+**SUPERVISOR GATE — C2 located + bounded NON-CLOSEABLE-FAITHFULLY (prompt case-4: validated removal +
+no faithful wall-moving mechanism). NO production fix landed (Rule-3 removals + plan docs only; no src/
+change, byte-exact preserved). FORK INPUT UPDATES: C2 removed as the cheaper faithful alternative — the
+"KEEP-GRINDING C2" premise is substantially weakened; remaining levers are (a) the engine inline-asm fork
+(~36ms) + (b) a small shared/irreducible output floor. Does NOT by itself escalate the engine fork
+(residual small + partly shared, not provably engine-only at loadavg ~4). NEXT (owed): quiet-box re-measure
+to tighten the bootstrap/floor split + turbo-freq confirmation of the 36/21 split → then the fork is a clean
+"inline-asm-or-accept-0.945-0.98×" decision.** Briefs: plans/c2-residual-localization-brief.md; verdict:
+plans/c2-residual-disproof-verdict.md. Drivers: scripts/bench/{_oclcf_overlap_bound,_c2_advisor_owed}.sh.
+GUEST /root/gzippy-bench, gzippy-isal bin sha 2f86676. Host left frozen (watchdog auto-restores +5400s).
+NO orphan processes.
+
+## SUPERSEDED — CLEAN ENGINE-RATE CEILING MEASURED + VALIDATED (matched comparator) → engine plateau REAL & bounded; FORK NOT escalated (advisor: KEEP-GRINDING C2, not inline-asm) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD a884fa7b+wt]
 
 MERGE green (886 lib pass, poison-on; 3 prior failures fixed). Fixed the merged parity.sh/oracle.sh
 which could NOT build (4 script fixes: rsync --delete-excluded→--delete for macOS openrsync;
