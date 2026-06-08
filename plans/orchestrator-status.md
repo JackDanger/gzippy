@@ -1,6 +1,273 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## COUNTER RENAMED (anti-inversion) + SCHEDULING/SERIAL CEILING BOUNDED via real oracles; advisor REFUTED my arithmetic F2 over-reach [2026-06-07, OWNER turn, HEAD f1aceee1]
+## CADENCE/INTRINSIC SPLIT RUN (advisor's owed symmetric control) → CADENCE TAX IS REAL + RECOVERED + LANDED: copy-free FOLD clean drain, native_fold 0.678× → 0.737× rg = +0.059× banked ratchet tooth; residual ≤0.188× UPPER BOUND on intrinsic rate [2026-06-07, OWNER turn, HEAD 9cde0b4f]
+Ran the symmetric control (give the gzippy-native FOLD `<false>` clean tail one contiguous output
+region, no per-block refetch/grow). The FIRST control (pending_clean-only) TIE'd — disproof advisor
+caught I'd left the DOMINANT per-block ring→u8buf copy (fresh Vec::with_capacity + byte loop in
+marker_inflate::drain_to_output) untouched. Ran the advisor's owed copy-free-drain control: it MOVED
+the wall, proving a free cadence component was mis-booked as intrinsic. LANDED the fix (commit 9cde0b4f,
+byte-exact). Synchronous disproof advisor ×2 (PASS 1 REFUTED under-scoped C1; PASS 2 CONFIRMED the
+landed fix, 3 corrections applied). Charter CURRENT STATE updated. Advisors:
+plans/fold-contig-split-advisor-verdict.md + plans/fold-contig-landed-advisor-verdict.md.
+**SUPERVISOR GATE — cadence tax RECOVERED + banked (+0.059×); next = inner-Huffman RATE work on the
+`<false>` clean path, bounded by ocl_cf 0.925× (engine-removed), never the VAR_VI slope.**
+
+THE FIX (production default, byte-exact, advisor-CONFIRMED): marker_inflate::drain_to_output clean
+branch pushes ≤2 CONTIGUOUS u8 ring slices straight to the sink (no per-block u8buf alloc + byte loop);
+new ContigFoldSink (replaced+DELETED UnifiedMarkerSink) writes them DIRECTLY into a pre-reserved
+contiguous chunk.data (no pending_clean middle-man, no second append_clean copy, no regrow);
+ChunkData::reserve_clean (clamped 16 MiB).
+
+SELF-TEST (Rule 4): rg == native_FINAL == isal_FINAL sha 028bd002…cb410f (byte-exact, OFF==identity);
+flip_to_clean=0 finished_no_flip=16 (FOLD preserved, window-absent bootstrap preserved, did NOT seed);
+857 lib + native_fold_parity + flip-seam differentials green (Rosetta x86_64 + arm64).
+
+THE SPLIT (locked guest, interleaved measure.sh, sha-OK, 6 passes): old(triple-buffer) 0.634× <
+new_off(copy-free drain) 0.674× < new_contig(fully copy-free) 0.717× rg means, MONOTONIC every pass.
+copy#1 (ring→u8buf) +0.040×, copy#2/3/grow +0.043×. BANKED (quiet box, default binary, 3-pass):
+native_fold 0.678× → 0.737× rg = +0.059× (the +0.083× split-sum is load-inflated, sign/monotonicity
+evidence only). isal_prod also improved to ~0.80× (shares the copy-free drain in its marker bootstrap).
+
+ADVISOR: L1 mechanism CONFIRMED (copy-free drain + contig sink, byte-exact even on the ring wrap split);
+L1 magnitude OVERSTATED → banked is +0.059× not +0.083×; L2 (residual = intrinsic symbol rate) NOT
+LICENSED → ≤0.188× is an UPPER BOUND (ocl_cf is ring-free + copy-free-to-final + a different engine, so
+it confounds symbol rate + ring-write + ring→data drain memcpy); L3 (ContigFoldSink default + delete
+UnifiedMarkerSink) CONFIRMED (no live caller, two-phase CleanTailSink untouched, sink overrides correct,
+blast radius bounded). 3 corrections (re-label +0.059×, residual upper bound, reserve heuristic + clamp)
+ALL APPLIED.
+
+NEXT (gate, do NOT start): inner-Huffman RATE on the `<false>` clean path (BMI2 PEXT/BZHI, wider
+multi-literal, ISA-L-class packed-u32 LUT — CLAUDE.md-authorized), bounded by ocl_cf 0.925×, never the
+slope. A clean intrinsic-rate isolation needs a same-engine pure-Rust ring-based copy-free-to-final
+oracle (does not exist yet) to strip the residual ring-drain memcpy from the 0.188×. GUEST:
+/tmp/gzbuild-native (FINAL) + /tmp/gzbuild-head (FINAL) + /tmp/gzippy-old-drain (pre-fix baseline), all
+relevant sha 028bd002…cb410f; drivers /tmp/{baseline,contig,contig2,split}_wall.sh + contig_selftest.sh
+(bash). NO orphan processes.
+
+## SUPERSEDED — COPY-FREE CLEAN-TAIL ORACLE RAN → prior INCONCLUSIVE REVERSED: clean-decode subsystem IS a wall lever (copy-free ISA-L 0.87–0.925× TIE vs pure-Rust 0.73–0.755×). UNIFIED single-primitive engine ALREADY EXISTS (gzippy-native FOLD, byte-exact) but is the SLOWEST pure-Rust at the wall (0.68×); next lever bounded < 0.14× = cadence-tax + intrinsic clean rate [2026-06-07, OWNER turn, HEAD 7aae6c4a + copy-free overlay, measured /tmp/gzbuild-head + /tmp/gzbuild-native]
+Made the clean-tail oracle COPY-FREE (the advisor-OWED fix): new `decompress_deflate_from_bit_into`
+(ISA-L decodes DIRECTLY into the chunk buffer — no 64 MiB Vec, no copy) + `writable_tail_reserve` +
+`decoded_range`. The copy-free ISA-L clean tail (unseeded, window-absent preserved) hits 0.87–0.925× rg
+= TIE vs production pure-Rust 0.73–0.755× — Δ ~0.14× ≫ spread, sign-stable ×3, freq-neutral. Then
+source-verified + measured that the UNIFIED single-primitive engine ALREADY EXISTS as gzippy-native (the
+FOLD: marker_inflate Engine M flips in-place via `flip_repack_to_u8` = vendor setInitialWindow and
+continues the clean tail on the SAME cursor — the governing one-engine memory), byte-exact sha
+028bd002…cb410f, flip_to_clean=0 finished_no_flip=16. The unified PURE-RUST engine is the SLOWEST at the
+wall (native_fold 0.68× rg) — marker_inflate `<false>` clean rate trails resumable AND ISA-L. Synchronous
+disproof advisor (plans/copy-free-oracle-advisor-verdict.md) UPHELD-WITH-CAVEATS. Charter CURRENT STATE
+updated. Brief: plans/copy-free-oracle-brief.md.
+**SUPERVISOR GATE — clean-engine question SETTLED (subsystem is a lever, ceiling readable = 0.925×); the
+unified-engine PORT is DONE structurally (gzippy-native is the production unified path); NO production fix
+landed (oracle measurement-only, byte-transparent); next = the clean-RATE fix on the unified engine,
+scoped + bounded.**
+
+SELF-TEST (Rule 4): PROD == copy-free ORACLE == rg sha 028bd002…cb410f (byte-exact, OFF==identity);
+isal_oracle_chunks=14 isal_oracle_fallbacks=0; routing = prod unseeded (window-absent preserved). 877 lib
++ seam + 10 segmented_buffer tests green (Rosetta x86_64).
+
+WALL (locked guest, interleaved N=11, sha-OK, gov=perf): rg 1.000 | ocl_cf (copy-free ISA-L unified)
+0.895/0.892/0.870/0.925/0.905× = TIE | isal_prod (two-engine, pure-Rust clean) 0.735/0.755/0.746/0.733× |
+native_fold (unified pure-Rust FOLD) 0.685/0.676× = SLOWEST.
+
+ADVISOR: C1 UPHELD-WITH-CAVEATS (subsystem is a real lever, Δ≫spread, copy gone, reverses INCONCLUSIVE;
+but 0.14× bundles ISA-L symbol rate + per-128-KiB resumable yield/refetch tax + one-shot reserve vs grow —
+"RATE is the lever" over-attributes). C2 UPHELD (residual = window-absent structure). C3 DIRECTION UPHELD
+(unify right), COROLLARY REFUTED (pure-Rust gap to close < 0.14×; cadence+grow are recoverable WITHOUT
+raising symbol rate; VAR_VI 0.6× does NOT bound a tax-shedding primitive). MOST ACTIONABLE: run the
+symmetric control — give the PURE-RUST `<false>` clean tail one large contiguous window (no per-128-KiB
+refetch/yield) and re-measure native_fold; recovered portion = cadence/grow (free), remainder = intrinsic
+rate that sets the real no-FFI 1.0× bar.
+
+NEXT (gate, do NOT start): the CLEAN-RATE fix on gzippy-native FOLD. (1) symmetric control = large
+contiguous window for the `<false>` tail; (2) close the intrinsic-rate remainder (BMI2/multi-literal/
+packed-u32 LUT) up to the < 0.14× bound; ceiling = copy-free ocl_cf 0.925× (engine-removed), never the
+slope. GUEST: /tmp/gzbuild-head (isal+copy-free oracle) + /tmp/gzbuild-native (FOLD), both sha
+028bd002…cb410f; drivers /tmp/oracle_{selftest,wall}.sh (bash); 3 modified files overlaid on guest tree.
+NO orphan processes.
+
+## SUPERSEDED — DECISIVE WALL ORACLE RAN (window-absent-PRESERVING ISA-L clean-tail removal) → clean-engine binder INCONCLUSIVE (instrument contaminated by its own copy); RECONCILIATION SOLID (gap = window-absent STRUCTURE, not the clean engine); NO FORK established [2026-06-07, OWNER turn, HEAD 7aae6c4a, measured /tmp/gzbuild-head]
+Ran the decisive WALL-level removal oracle the prior advisor OWED: `GZIPPY_ISAL_ENGINE_ORACLE=1`
+UNSEEDED (window-absent routing preserved per the charter OSCILLATION rule) replaces ONLY the
+post-flip clean tail with real ISA-L. Plus the seedfull↔production reconciliation (engine held
+constant). Synchronous disproof advisor REFUTED my Conclusion-1 framing. Charter CURRENT STATE
+updated. Advisor verdict: plans/clean-tail-wall-oracle-advisor-verdict.md. Brief:
+plans/clean-tail-wall-oracle-brief.md. Pre-reg: plans/clean-tail-wall-oracle-prereg.md.
+**SUPERVISOR GATE — clean-engine binder UNDECIDED (copy-free oracle owed); NO fix landed; NO
+fork escalated; the user-constraint fork is NOT forced (advisor: no fork — unify the two engines).**
+
+SELF-TEST (Rule 4): OFF==ON==rg sha 028bd002…cb410f (byte-exact); isal_oracle_chunks=14
+isal_oracle_fallbacks=0; routing flip_to_clean=12 finished_no_flip=4 window_seeded=2 = prod
+unseeded ⇒ 89% window-absent bootstrap preserved.
+
+RESULT 1 — WALL (3 interleaved N=11, sha-OK, locked guest, gov=perf): prod 0.744/0.754/0.755× rg;
+ocl (ISA-L clean tail, unseeded) 0.698/0.686/0.702× rg. The ISA-L clean-tail oracle did NOT beat
+production. ADVISOR (load-bearing, CORRECT): INCONCLUSIVE — the oracle's per-chunk 64 MiB
+alloc+to_vec copy (gzip_chunk.rs:203,247-256) costs ~0.17× (= the prod→ocl gap AND the
+gap-to-threshold); my own model implies S≈C≈0.17×, i.e. the clean engine may SAVE ~0.17× of wall
+exactly masked by the copy. A handicapped contender failing to win is uninformative about a
+speed-UP ceiling (Rule 3). CANNOT declare engine slack NOR engine binder.
+
+RESULT 2 — RECONCILIATION (UPHELD, engine constant = ISA-L both, 2 runs): ocl_unseed (bootstrap
+preserved) 0.697/0.701× vs ocl_seed (seeded, no bootstrap) 0.860/0.857× rg. The seedfull↔production
+gap is the WINDOW-ABSENT STRUCTURE (~0.16× of wall), NOT the clean engine. CAVEAT: do NOT
+sub-credit to marker RATE specifically — seeding also removes 13→0 spec-fail re-decodes
+(project_confirmed_offset_prefetch_gap) + flip machinery; the 0.120s≈0.322s match is the SUM-vs-wall
+trap. Structure-level cause solid; rate-vs-spec-fail split NOT isolated.
+
+Q4 NO FORK (advisor, vendor deflate.hpp:1277/1285/1452-1453/1585-1666/1600): rg uses ONE
+width-templated `readInternalCompressedMultiCached` for BOTH u16 markers and u8 clean; gzippy's
+two-engine split (marker_inflate u16 + resumable u8) is the divergence. The marker rate is likely
+bounded by the SAME primitive ceiling as the clean (VAR_VI 0.6×). The faithful move is to COLLAPSE
+marker+clean into ONE primitive ([[project_faithful_unified_decoder_over_perf]]) — not a fork.
+
+NEXT (gate, do NOT start): (1) make the oracle copy-free (decode ISA-L into writable_tail) so the
+clean-engine ceiling becomes readable; THEN (2) the UNIFIED single-primitive engine. GUEST:
+/tmp/gzbuild-head; drivers /tmp/oracle_{selftest,wall,reconcile,verbose}.sh (bash); seeds
+/tmp/seeds.bin. NO orphan processes.
+
+## SUPERSEDED — 1.6× WINDOW-ABSENT decodeBlock GAP ATTRIBUTED → it's the CLEAN u8 TAIL decoder (pure-Rust ~2.3× slower than ISA-L), NOT the u16 marker loop [2026-06-07, OWNER turn, HEAD 7aae6c4a + overlay]
+Source-diffed the window-absent decode path vs vendor, ran apples-to-apples --verbose
+(gzippy + rg, T8 unseeded, locked guest) + a causal SLOW_MODE A/B (freq-neutral),
+synchronous disproof advisor. STOPPED at attribution + scoped fix (NO fix landed, per
+prompt). Charter CURRENT STATE updated. Advisor: plans/window-absent-attribution-advisor-verdict.md.
+Attribution: plans/window-absent-attribution.md. Brief: plans/window-absent-attribution-brief.md.
+**SUPERVISOR GATE — attribution advisor-vetted; NO fix landed; next = run the Phase-0
+ISA-L removal oracle on the FlipToClean clean tail to bound the wall payoff (Rule 3),
+then the scoped clean-engine fix.**
+
+NUMBERS (T8 unseeded, locked guest 10.30.0.199, taskset 0,2,4,6,8,10,12,14, gov=perf):
+gzippy decodeBlock SUM 0.805-0.831s vs rg 0.4995s = 1.61-1.66×. Per-engine: gzippy
+marker bootstrap body 0.323s (73.0M @ 226-235 MB/s) vs rg "custom inflate" 0.4748s =
+gzippy 0.68× FASTER; gzippy clean tail ≈0.48s (≈139M @ ≈290 MB/s, subtraction) vs rg
+"ISA-L" 0.2065s = ≈2.3× SLOWER. Routing: flip_to_clean=12 finished_no_flip=4
+window_seeded=2.
+
+CAUSAL (ΔdecodeBlock SUM, freq-neutral sleep control, baseline 0.831s): MARKER+100%
+→0.965 (+134ms); CLEAN+100% →1.025 (+194ms, marker body UNCHANGED). Sleep: marker +142,
+clean +248. CLEAN inject lands in resumable.rs:1199 (the post-flip clean engine), marker
+body untouched, yet adds the LARGER ΔdecodeBlock ⇒ the clean tail is the dominant
+decodeBlock term, NOT the marker loop.
+
+ROOT CAUSE (source): flip threshold byte-identical to vendor (marker_inflate.rs:1116-1119
+↔ deflate.hpp:1282-1284). Two-phase routing (gzip_chunk.rs:1397-1410, isal_clean_tail):
+Engine M u16 bootstrap → FlipToClean → Engine C = StreamingInflateWrapper =
+unified::Inflate<Clean> = pure-Rust resumable.rs. The measured gzippy-ISAL build's clean
+tail is PURE-RUST, NOT ISA-L FFI (resumable.rs:1182-1192; build.rs:98 "REAL ISA-L FFI"
+comment was STALE — FIXED, comment-only/byte-transparent). rg WITH_ISAL uses real ISA-L
+(deflate.hpp:1452-1453). So the 1.6× = gzippy's pure-Rust clean engine (~0.6× ISA-L
+primitive plateau) decoding the clean BULK ~2.3× slower than ISA-L.
+
+ATTRIBUTION among prompt's 3 candidates: (a) marker inner loop REFUTED-as-prime (gzippy
+marker FASTER than rg); (b) u16-over-clean-bulk REFUTED (flip byte-identical; post-flip
+bulk is u8); (c) table-build REFUTED (shared, seedfull ties). CAUSE = pure-Rust clean
+tail slower than ISA-L.
+
+ADVISOR: core UPHELD (causally airtight); CONFIRMED the build.rs stale-comment risk;
+REFUTED "actionable now" (Δwall payoff needs the Phase-0 ISA-L removal oracle, Rule 3,
+SUM slack-masked at Fill 85%); 0.68×/2.3× are subtraction hedges (proven claim = "clean
+tail is the bigger decodeBlock term"); candidate-1 ISA-L FFI = goal #2 (re-adds FFI),
+candidate-2 faster pure-Rust clean engine = goal #1 advance.
+
+SCOPED FIX (gate, do NOT start): (1) goal#2 route FlipToClean clean tail through ISA-L
+FFI (= rg WITH_ISAL); (2) goal#1 faster pure-Rust clean u8 engine (BMI2/multi-literal/
+ISA-L-LUT). Bound with GZIPPY_ISAL_ENGINE_ORACLE on the clean tail (FALLBACKS==0) FIRST.
+GUEST: /tmp/gzbuild-head/release/gzippy (measured, clean HEAD isal native); rg 0.16.0;
+captures /tmp/{rg_verbose,gz_verbose,m100,c100,cs,ms}.txt. NO orphan processes.
+
+## CORRECTED overlap oracle RUN → OVERLAP DEAD AS A LEVER; all 3 scheduling levers causally exhausted; binder RELOCATED to the marker-engine decode rate [2026-06-07, OWNER turn, HEAD 7aae6c4a + corrected-oracle overlay]
+Corrected the backwards overlap oracle (warm-all-then-drain → real in-flight
+overlap dispatch via `submit_prefetch`, non-blocking), measured the registered
+decider on the locked guest, removed the advisor-flagged 4096 retention confound,
+and tested the two remaining scheduling sub-levers. Two synchronous disproof-advisor
+passes (PASS 2 reversed PASS 1's own "F1 likely holds via overlap"). Charter CURRENT
+STATE updated. Advisor: plans/corrected-overlap-advisor-verdict.md (+FOLLOW-UP
+VERDICT section). Brief: plans/corrected-overlap-advisor-brief.md.
+**SUPERVISOR GATE — overlap REFUTED, engine relocation advisor-vetted (direction),
+NO engine fix landed; next loop = faithful engine direction (u8-direct clean path).**
+
+THE CORRECTION (perfect_overlap.rs + chunk_fetcher.rs perfect_overlap_warm): dispatch
+EVERY chunk's decode as an IN-FLIGHT prefetch up-front (`submit_prefetch(part_key,rx)`
+= vendor m_prefetching.emplace, BlockFetcher.hpp:558), NON-BLOCKING, return immediately
+so the in-order consumer_loop runs CONCURRENTLY with the still-running decodes = real
+decode↔drain overlap. Removed the 4096 cache-cap bump (retention confound).
+
+SELF-TEST (Rule 4): OFF==identity AND ON byte-exact sha 028bd002…cb410f on arm64-native
+(local) + x86_64 gzippy-isal native (guest); path=ParallelSM; dispatch phase 0.0007s
+(non-blocking); warm_hit_frac 0.882 (15/17, 2 offset-0 misses).
+
+DECIDER NUMBER (T8, measure.sh interleaved N=11, sha-OK, locked guest, gov=perf, 5 runs):
+perfovl CORRECTED+retention-fixed = 0.187-0.192s = 0.684-0.695× rg vs HEAD 0.174-0.177s
+= 0.730-0.754× (rg 0.130s). **The corrected overlap oracle is sign-stably ~5-7% SLOWER
+than production — does NOT reach the tie; retention fix did NOT rescue it.**
+
+RESOLVE-AHEAD SATURATED (verbose): Worker resolve-ahead ok=13/13 (head), 14/14 (perfovl)
+= drain-hiding LIVE on the production path ~82% coverage; std::future::get is a wait on
+the DECODE future, not resolve (resolve runs earlier on the pool). Drain already hidden.
+
+FINER-CHUNKING REFUTED (GZIPPY_CHUNK_KIB sweep, byte-exact, interleaved vs rg, 2 runs):
+k4096(17 chunks)≈k2048(34)≈k1024(68) all 0.68-0.72× rg, FLAT-to-WORSE. decodeBlock SUM
+stays ~1.1s, Fill DROPS 87%→77% (per-chunk bootstrap overhead cancels the tail-wave gain).
+The advisor's ~0.04s tail-wave-quantization hypothesis did NOT materialize.
+
+ADVISOR ×2: PASS 1 REFUTED my decider C1 (retention confound + the real lever is
+resolve-ahead), said F1 likely holds via overlap. PASS 2 (after resolve-ahead-saturated
++ retention-fixed + finer-chunking evidence) REVERSED: F1-via-overlap/drain REFUTED;
+binder relocates to the per-thread decode floor (engine) — DIRECTION upheld, 1.6×
+magnitude UNVERIFIED; target the u8-DIRECT clean path (governing memory), not just a
+faster u16 ring.
+
+CONCLUSION (causal, advisor-vetted): the T8 wall is NOT scheduling-bound. All three
+scheduling levers exhausted (dispatch-depth null/worse, drain-hiding saturated, tail-wave
+flat-to-worse). Residual ~0.70× gap = per-thread MARKER-ENGINE decode rate. NEXT (gate):
+source-diff window-absent decode_chunk_unified_marker vs vendor to attribute the gap
+(marker inner loop / u16-vs-u8 width / table-build), faithful target = u8-direct clean
+path + readInternalCompressedMultiCached marker port; bound any engine fix with the
+Phase-0 ISA-L engine-removal oracle (already ties seeded), never the slope.
+GUEST: src overlaid to HEAD+corrected-oracle, build /tmp/gzbuild-po (sha 028bd002…cb410f),
+drivers /tmp/po_measure.sh + /tmp/chunk_sweep.sh. NO orphan processes.
+
+## SUPERSEDED — GZIPPY_PERFECT_OVERLAP (the registered decider, NEVER-BEFORE-RUN) BUILT + SELF-TESTED + RUN; advisor REFUTED my read (oracle built BACKWARDS) [2026-06-07, OWNER turn, HEAD 7aae6c4a + oracle overlay]
+Closed the live Rule-3 violation flagged by the supervisor coach (PROCESS FIX #1):
+the registered decider `GZIPPY_PERFECT_OVERLAP` had NEVER been run. Built it
+byte-exact (src/decompress/parallel/perfect_overlap.rs + perfect_overlap_warm in
+chunk_fetcher.rs), self-tested (Rule 4), measured on the locked guest, ran the
+synchronous disproof advisor. Advisor caught a LOAD-BEARING error. Charter CURRENT
+STATE + prereg RESOLUTION #2 updated. Advisor: plans/perfect-overlap-advisor-verdict.md.
+Brief: plans/perfect-overlap-advisor-brief.md. **SUPERVISOR GATE — decider RUN, but
+F1 UNDECIDED (my oracle tested the wrong schedule); do NOT declare STOP/TIE.**
+
+DECIDER NUMBER (lead with the causal oracle, T8, measure.sh interleaved N=11, sha-OK,
+2 runs): perfovl 0.225-0.227s = 0.581-0.583× rg; HEAD 0.177s = 0.740×; rg 0.131s.
+**The oracle is SLOWER than production.**
+
+WHY (advisor, load-bearing): my oracle runs warm (decode-ALL) FULLY then drain
+(resolve-chain+write) — it SERIALIZES the two phases production already OVERLAPS =
+an ANTI-overlap. Its wall is a pessimistic SUM (warm 0.117 + drain 0.066). An
+upper bound built by DESTROYING overlap cannot falsify F1 (the TIE claim) — the
+symmetric of last turn's upper-bound-can't-fire-F2. My C1/C3/C4 REFUTED.
+
+GENUINE FINDING (advisor-corrected): warm alone = 0.117s is a TRUE LOWER bound on
+any schedule's wall (all chunks must decode; drain 0.066 < warm hides under it).
+**0.117 < rg WALL 0.131 < tie threshold 0.138** = INSIDE the tie zone. I mis-read it
+"above the tie" only by comparing 0.117 to rg's decode FLOOR (0.085) not rg's WALL
+(0.131). Matched floor-to-floor = warm 0.117 vs rg Real Decode 0.104 = 1.13×. **Read
+correctly: the T8 TIE IS REACHABLE by better decode↔drain OVERLAP — the scheduling
+direction is NOT refuted; this oracle FAILED TO TEST it.**
+
+SELF-TEST (Rule 4): sha 028bd002…cb410f byte-identical w/ and w/o the oracle on
+arm64 + x86_64 guest; warm_hit_frac 0.88-0.96 (2 misses = offset-0 stream-start).
+Byte-transparent; the warm cache really removed the head-of-line wait.
+
+STILL OPEN: can a REAL OVERLAPPED schedule collapse production 0.177 toward the
+0.117-0.13 floor? Needs a CORRECTED oracle (warm OVERLAPPING drain, pipelined
+per-chunk as predecessor windows land), NOT warm-all-then-drain. F1 UNDECIDED.
+SCOPED NEXT (gate): build the corrected overlap oracle to decide F1, OR (lower bound
+already says reachable) go to the faithful decode↔drain overlap fix
+(project_confirmed_offset_prefetch_gap dispatch-TIMING) bounded by that corrected
+oracle first. GUEST: src overlaid to HEAD+oracle, build /tmp/gzbuild-po, driver
+/tmp/po_measure.sh. NO orphan processes.
+
+## SUPERSEDED — COUNTER RENAMED (anti-inversion) + SCHEDULING/SERIAL CEILING BOUNDED via real oracles; advisor REFUTED my arithmetic F2 over-reach [2026-06-07, OWNER turn, HEAD f1aceee1]
 Renamed the inversion-prone counter byte-exact (commit f1aceee1:
 `BOOTSTRAP_POST_FLIP_U16_BYTES` → `BOOTSTRAP_CLEAN_FLIPPED_BYTES`; it counts the
 marker-FREE CLEAN-flipped complement, NOT marker-ring bytes — the exact inversion
