@@ -1,5 +1,43 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## COPY-FREE-TO-FINAL REFACTOR — STAGE 1 LANDED byte-exact (the ~0.067× drain-memcpy tooth's hardest MECHANICAL risk retired; wall NOT yet banked, Stage 2 wiring gated) [2026-06-07, OWNER turn, HEAD c224aaad + this commit]
+Two synchronous disproof advisors. The first vetted the SCOPING decision: CHECKPOINT-STAGE-1,
+NOT one-pass — a gated full-wire (engine writes contiguous into chunk.data when ON, ring+drain
+when OFF) CANNOT bank the wall safely this turn, because OFF==identity isolates COMMIT risk but
+NOT MEASUREMENT risk: to bank you must run ON, and ON's correctness rests on the uncontained
+data_prefix_len-nonzero activation + CRC-prefix-exclusion + decode_bypass serialization
+round-trip; realistic one-pass outcome = a dead ON path + nothing banked (strictly worse than a
+clean checkpoint). The second advisor (plans/copyfree-stage1-advisor-verdict.md) UPHELD the
+LANDED Stage 1 — A (additive, zero prod caller) UPHELD, B (contig back-ref byte-equiv + proven
+266-byte headroom) UPHELD, C (range-check `distance > *pos` ≡ ring's `> decoded_bytes+emitted`)
+UPHELD, D (differential adequacy) UPHELD-W-CAVEATS, E (correct checkpoint, nothing to revert)
+UPHELD. **SUPERVISOR GATE — Stage 1 mechanical risk retired byte-exact; Stage 2 (wire FOLD seam +
+flip default + delete drain + remove-and-measure) is the next gated turn.**
+
+LANDED (commit c224aaad, +453/-0, ONE file marker_inflate.rs, PURELY ADDITIVE, ZERO production
+callers ⇒ byte-exact by construction on BOTH features + BOTH archs): (1) emit_backref_contig —
+non-wrapping clean back-ref (no % U8_RING_SIZE; the 3 wrap arms collapse to word/RLE/overlap).
+(2) Block::decode_clean_into_contig — clean (<false>) body → caller-supplied CONTIGUOUS buffer
+with the 32 KiB window as a DICTIONARY PREFIX at base[0..window_len) (vendor setInitialWindow,
+DecodedData.hpp:278-289); per-call cap to spare-(MAX_RUN_LENGTH+8), Engine-C grow-between-calls
+contract. (3) 3 ring-vs-CONTIG differentials driving the REAL production read() loop, byte-equal:
+window-prefix back-ref (distance==*pos==32768 → base[0]), multi-call resumable (per_call=4096),
+RLE+short-distance. 3/3 pass (Rosetta x86_64 x86-64-v2); full lib 855 pass = 6 pre-existing
+Rosetta/timing failures only (stash A/B == HEAD baseline); arm64 native release clean; round-trip
+sha verified.
+
+OWED FOR STAGE 2 (advisor D — do NOT assume retired): (1) stored/uncompressed clean block (contig
+fn Errs; ring read() decodes it) ⇒ route/extend. (2) multi-deflate-block clean phase across a
+block boundary (read_header advance with persisted *pos/decoded_bytes) UNTESTED. (3) actual
+out_room-saturating REGROW UNTESTED (math present, no test drives it). PLUS the deferred landmine:
+data_prefix_len=32768 activation (audit decoded_size / window-publish / consumer iovecs /
+apply_window readers — FOLD has only ever run prefix==0) + CRC-prefix exclusion + decode_bypass
+serialize/deserialize round-trip. FORBIDDEN shortcut: dual-region back-ref (window in scratch,
+chunk.data prefix==0) — diverges from vendor prepend ⇒ violates faithful-port. Decide the FAITHFUL
+PREPEND model now. RESIDUAL: banked teeth UNCHANGED at native_fold 0.737× rg; the ~0.067× tooth is
+de-risked, banked by Stage 2; then ≤0.11× UPPER-BOUND intrinsic symbol rate bounded by ocl_cf
+0.925×. NO orphan processes (research + 2 advisor subagents completed; no sleep sentinels).
+
 ## RING→DATA DRAIN ISOLATION RAN (fold-contig advisor's owed same-engine pure-Rust ring-copy oracle) → the 0.188× residual SPLITS: ~0.067× ring→data drain MEMCPY (recoverable free tooth) + ≤0.11× UPPER BOUND intrinsic symbol rate + ring-write; CRC is NOT a lever. NO production fix landed (banking needs the byte-exact copy-free-to-final refactor, prompt-gated) [2026-06-07, OWNER turn, HEAD 7ae5903]
 Captured the gzippy-native T8 whole-system picture with the merged fulcrum_total (built native @ HEAD
 fc7336c3, target-cpu=native, on /tmp/gz-ft-src), then BUILT + RAN the fold-contig advisor's owed
