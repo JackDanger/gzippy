@@ -291,9 +291,7 @@ pub fn report() {
             agg.total as f64 / (1024.0 * 1024.0)
         );
     } else {
-        eprintln!(
-            "  (no native Block primed — wrong path? assert GZIPPY_DEBUG path=ParallelSM)"
-        );
+        eprintln!("  (no native Block primed — wrong path? assert GZIPPY_DEBUG path=ParallelSM)");
     }
     eprintln!("SHARED read-only (ONE copy, all threads — fixed-Huffman tables):");
     eprintln!("  LitLenTable: {shared_litlen} bytes  DistTable: {shared_dist} bytes  total: {shared_total} bytes");
