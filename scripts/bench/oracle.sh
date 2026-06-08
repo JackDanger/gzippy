@@ -30,6 +30,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 usage() { sed -n '2,28p' "${BASH_SOURCE[0]}"; }
 
 KIND=""; DO_BUILD=0; DO_SYNC=1; DRY=0
+HOST_FROZEN="${HOST_FROZEN:-0}"; ALLOW_LOAD="${ALLOW_LOAD:-0}"; MAX_LOADAVG="${MAX_LOADAVG:-2.0}"
 FEATURE="${DEFAULT_FEATURE:-gzippy-native}"
 T=8; N=9; SLOW_KNOB=""; SLOW_PCT=""
 while [ "$#" -gt 0 ]; do
@@ -45,6 +46,10 @@ while [ "$#" -gt 0 ]; do
     --slow) SLOW_KNOB="${2%%=*}"; SLOW_PCT="${2#*=}"; shift;;
     --slow=*) v="${1#*=}"; SLOW_KNOB="${v%%=*}"; SLOW_PCT="${v#*=}";;
     --no-sync) DO_SYNC=0;;
+    --host-frozen) HOST_FROZEN=1;;
+    --allow-load) ALLOW_LOAD=1;;
+    --max-loadavg) MAX_LOADAVG="$2"; shift;;
+    --max-loadavg=*) MAX_LOADAVG="${1#*=}";;
     --dry-run) DRY=1;;
     *) echo "oracle.sh: unknown arg '$1'" >&2; usage; exit 2;;
   esac
@@ -82,6 +87,7 @@ remote_env() {
 GUEST_SRC='$GUEST_SRC' GZIPPY_BIN='$GZIPPY_BIN' CORPUS='$CORPUS' \
 CORPUS_RAW_SHA256='$CORPUS_RAW_SHA256' RG='$RG' RG_TRACE='$RG_TRACE' \
 T='$T' N='$N' MASK='$MASK' GOV='$GOV' NO_TURBO='$NO_TURBO' \
+HOST_FROZEN='$HOST_FROZEN' ALLOW_LOAD='$ALLOW_LOAD' MAX_LOADAVG='$MAX_LOADAVG' \
 KIND='$KIND' SLOW_KNOB='$SLOW_KNOB' SLOW_PCT='$SLOW_PCT' CAP='$CAP' \
 ARTDIR='$ARTDIR'
 EOF
@@ -105,8 +111,10 @@ fi
 if [ "$DO_SYNC" = 1 ]; then
   echo "=== rsync working tree -> $GUEST_USER@$GUEST:$GUEST_SRC ==="
   timeout 30 $SSH_GUEST "mkdir -p '$GUEST_SRC'"
+  # --delete (NOT --delete-excluded) to match parity.sh: keeps the excluded target/
+  # build cache warm while removing tracked files that vanished from the tree.
   # shellcheck disable=SC2086
-  timeout 600 rsync -az --exclude 'target/' --exclude '.git/' \
+  timeout 600 rsync -az --delete --exclude 'target/' --exclude '.git/' \
     -e "ssh -o ConnectTimeout=15 -J $JUMP" \
     "$ROOT/src" "$ROOT/crates" "$ROOT/examples" "$ROOT/build.rs" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" \
     "$ROOT/benches" "$ROOT/scripts" "$ROOT/vendor" \
@@ -115,9 +123,16 @@ fi
 
 if [ "$DO_BUILD" = 1 ]; then
   echo "=== build on guest (feature=$FEATURE) ==="
+  # Build, THEN stamp the content fingerprint $GZIPPY_BIN.inputs.sha that the guest
+  # runner's stale-binary guard reads (same fingerprint algorithm as
+  # _parity_guest.sh). Without the stamp the hardened _oracle_guest.sh would abort
+  # "no-build-fingerprint". The stamp covers all rsync'd build inputs.
   timeout 1200 $SSH_GUEST "cd '$GUEST_SRC' && RUSTFLAGS='$RUSTFLAGS_PIN' \
     sh scripts/cargo-lock.sh cargo build --release --no-default-features --features '$FEATURE' \
-    2>&1 | grep -E 'Compiling gzippy|Finished|error' | tail -5"
+    2>&1 | grep -E 'Compiling gzippy|Finished|error' | tail -5; \
+    { find src crates examples build.rs Cargo.toml Cargo.lock vendor benches -type f 2>/dev/null \
+        | LC_ALL=C sort | xargs sha256sum 2>/dev/null; } | sha256sum | cut -d' ' -f1 \
+        > '$GZIPPY_BIN.inputs.sha'"
 fi
 
 echo "=== ensure corpus on guest ==="

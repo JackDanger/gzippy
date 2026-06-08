@@ -223,13 +223,33 @@ fn finish_decode_chunk_isal_oracle(
     // production's direct-to-`writable_tail()` stream never pays, so the
     // ISA-L clean-engine WALL ceiling becomes readable (advisor Q1 fix).
     //
-    // Reserve enough for the chunk: target bytes + slack for the straddling block
-    // (a boundary AT-OR-PAST stop_hint can be a full block beyond it). 64 MiB of
-    // RESERVED (not allocated-and-filled) contiguous capacity is ample; ISA-L
-    // stops at a boundary long before exhausting it. Reserve happens ONCE per
-    // chunk (amortized into the chunk's own buffer, recycled by the pool) — it is
-    // NOT a fresh per-chunk heap alloc+memset the way the old `Vec` was.
-    let reserve_len: usize = 64 * 1024 * 1024;
+    // RESERVE SIZING — CHUNK-PROPORTIONAL (TOOLING-AUDIT A5 reserve-confound fix).
+    // The prior flat 64 MiB-per-chunk `reserve` was a residual confound: production
+    // grows its u8 buffer INCREMENTALLY (`contig_decode_window(HEADROOM)`, the Vec
+    // doubling to ~chunk size, ~13-16 MiB for a 4 MiB silesia chunk), so a flat
+    // 64 MiB allocator request per chunk pays a per-chunk alloc 4× larger than
+    // production ever does. That made ocl_cf PESSIMISTIC (audit A5 / number #2).
+    // Fix: size the reserve to THIS chunk's decode bound = the compressed input
+    // span (`slice_end - byte_start`) × a generous-but-chunk-proportional max
+    // expansion factor, so the allocator footprint mirrors production's final
+    // capacity instead of the whole-member worst case. A floor keeps tiny chunks
+    // safe; the cap keeps a pathological compressible run bounded. Under-reserve is
+    // SAFE: `decompress_deflate_from_bit_into` returns `None` when it runs out of
+    // output room (it does NOT realloc/copy — that would re-introduce the confound),
+    // which falls back to pure-Rust and is COUNTED in ISAL_ENGINE_ORACLE_FALLBACKS.
+    // The hardened oracle.sh asserts isal_oracle_fallbacks==0, so any chunk this
+    // tighter bound under-reserves VOIDS the measurement loudly rather than silently
+    // contaminating the ceiling — the bound can then be widened. (Silesia's ~3.3×
+    // ratio is covered ~5× over by EXPAND_FACTOR=16.)
+    let byte_start = inflate_start_bit / 8;
+    let compressed_span = slice_end.saturating_sub(byte_start);
+    const EXPAND_FACTOR: usize = 16;
+    const RESERVE_FLOOR: usize = 1024 * 1024; // never reserve below 1 MiB
+    const RESERVE_CAP: usize = 64 * 1024 * 1024; // never reserve above the old ceiling
+    let reserve_len: usize = compressed_span
+        .saturating_mul(EXPAND_FACTOR)
+        .max(RESERVE_FLOOR)
+        .min(RESERVE_CAP);
     let decode_start = chunk.data.len();
     let (written, end_bit, boundaries) = {
         let out = chunk.data.writable_tail_reserve(reserve_len);
