@@ -227,24 +227,26 @@ fn finish_decode_chunk_isal_oracle(
     // The prior flat 64 MiB-per-chunk `reserve` was a residual confound: production
     // grows its u8 buffer INCREMENTALLY (`contig_decode_window(HEADROOM)`, the Vec
     // doubling to ~chunk size, ~13-16 MiB for a 4 MiB silesia chunk), so a flat
-    // 64 MiB allocator request per chunk pays a per-chunk alloc 4× larger than
-    // production ever does. That made ocl_cf PESSIMISTIC (audit A5 / number #2).
-    // Fix: size the reserve to THIS chunk's decode bound = the compressed input
-    // span (`slice_end - byte_start`) × a generous-but-chunk-proportional max
-    // expansion factor, so the allocator footprint mirrors production's final
-    // capacity instead of the whole-member worst case. A floor keeps tiny chunks
-    // safe; the cap keeps a pathological compressible run bounded. Under-reserve is
-    // SAFE: `decompress_deflate_from_bit_into` returns `None` when it runs out of
-    // output room (it does NOT realloc/copy — that would re-introduce the confound),
-    // which falls back to pure-Rust and is COUNTED in ISAL_ENGINE_ORACLE_FALLBACKS.
-    // The hardened oracle.sh asserts isal_oracle_fallbacks==0, so any chunk this
-    // tighter bound under-reserves VOIDS the measurement loudly rather than silently
-    // contaminating the ceiling — the bound can then be widened. (Silesia's ~3.3×
-    // ratio is covered ~5× over by EXPAND_FACTOR=16.)
+    // 64 MiB allocator request per chunk pays a per-chunk alloc several× larger than
+    // production's final footprint. That made ocl_cf PESSIMISTIC (audit A5 / #2).
+    // Fix: size the reserve to THIS chunk's REALISTIC decode bound = the compressed
+    // input span (`slice_end - byte_start`, ≈ the chunk's compressed size + straddle)
+    // × an expansion factor tracking the actual decoded ratio (silesia ~3.3×) with
+    // headroom for a compressible chunk, so the allocator footprint MIRRORS
+    // production's ~chunk-sized final capacity (~28 MiB for a ~4.7 MiB T8 chunk at
+    // factor 8 vs the old flat 64 MiB) instead of the whole-member worst case.
+    // EXPAND_FACTOR=8 covers silesia's ratio ~2.4× over; FLOOR keeps small chunks
+    // safe; CAP bounds a pathological run. Under-reserve is SAFE:
+    // `decompress_deflate_from_bit_into` returns `None` (it does NOT realloc/copy —
+    // that would re-introduce the confound), falling back to pure-Rust COUNTED in
+    // ISAL_ENGINE_ORACLE_FALLBACKS, which the hardened oracle.sh asserts ==0 — so a
+    // too-tight bound VOIDs the measurement loudly. (A window-absent bootstrap chunk
+    // legitimately falls back at some T — a real property of the ISA-L ceiling that
+    // the assert correctly surfaces, not a sizing bug.)
     let byte_start = inflate_start_bit / 8;
     let compressed_span = slice_end.saturating_sub(byte_start);
-    const EXPAND_FACTOR: usize = 16;
-    const RESERVE_FLOOR: usize = 1024 * 1024; // never reserve below 1 MiB
+    const EXPAND_FACTOR: usize = 8;
+    const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never reserve below 4 MiB
     const RESERVE_CAP: usize = 64 * 1024 * 1024; // never reserve above the old ceiling
     let reserve_len: usize = compressed_span
         .saturating_mul(EXPAND_FACTOR)
