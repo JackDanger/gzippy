@@ -65,7 +65,48 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 25846265) — **DECODE-vs-STORE LOCALIZATION RAN (decode-only + store-only knobs, byte-exact, committed) → both on-path but NOT SEPARABLE by slow-injection (one serial dependency chain; advisor-vetted ×2); decode-free oracle CONTAMINATED by the spec-failure re-decode net; PLATEAU/FORK is NOT VALIDATED and is REFUTED at the engine. DECISIVE: ocl_cf 0.925× < 1.0 ⇒ even fully removing the clean engine is sub-parity ⇒ ≥0.075× of the parity gap is OUTSIDE the engine (placement/scheduling). native_fold ~0.77-0.79× rg (banked teeth UNCHANGED).**
+## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l) — **OUTPUT IS THE T8 BINDER (fulcrum_total + validated writev-removal oracle): removing gzippy's serial output writev moves T8 0.79×→~0.98× rg ⇒ OUTPUT (the serial 211 MiB page-cache materialization on the in-order consumer) is the SINGLE LARGEST T8 binder, NOT the engine. The prior "0.135× engine table-load + 0.075× placement" split is REVISED — the engine is the T1 binder, SLACK-MASKED at T8 (parallelized ~8×); the un-parallelizable serial output copy is the Amdahl T8 tail. The instant-feed discriminator REFUTED the advisor's "feed-rate-masked" phantom (output exposure stayed 35→31ms when the engine sped up 38ms ⇒ engine-INDEPENDENT). FAITHFUL TECHNIQUE LANDED (byte-exact, rule-7a KEEP): background overlap writer (mirrors rg writeFunctor) takes the writev off the consumer crit-path → +3.7-6% sign-stable over 5 passes (0.79×→~0.81× rg), TIE-by-spread, partial (~6ms of the ~20ms ceiling; the rest is the irreducible ~14ms memory-bandwidth floor rg also pays).**
+
+### THIS TURN — fulcrum_total decomposition + writev-removal oracle + instant-feed discriminator + overlap-writer technique (advisor synchronous, plans/output-binder-advisor-verdict.md; brief plans/output-binder-decomposition-brief.md)
+- **fulcrum_total (production T8 trace, byte-exact 028bd002…cb410f, consumer = wall-critical thread):**
+  split = 64-67% WAIT-on-workers, **32-34% OUTPUT (consumer.writev)**, 0.8% serial compute. CRITICAL
+  capture lesson: piping `-c` to sha256sum (a pipe) inflated writev 58→135ms (backpressure phantom);
+  re-captured to a regular tmpfs file (exactly measure.sh's mktemp sink) for the trustworthy split.
+- **writev-removal oracle (NEW knob GZIPPY_SKIP_WRITEV_SYSCALL=1, byte-transparent OFF==identity,
+  wrong-bytes ON via terminal trailer CRC):** interleaved measure.sh same tmpfs sink — gz_off 0.1653s
+  (0.79× rg), gz_skip 0.1310s, rg 0.1311s ⇒ **removing output ≈ ties rg.** Same-batch skip-vs-rg is
+  ~0.98× (advisor B: not a perfect 1.0×, a ~2% engine/sched residual remains).
+- **granularity REFUTED (NEW knob GZIPPY_WRITEV_CAP_KIB, byte-exact all caps):** caps {2048,256,95}
+  (gzippy 17×12.5MiB writev vs rg 2223×95KiB write) all TIE-or-worse ⇒ cost is the intrinsic 211 MiB
+  page-cache COPY, NOT syscall shape; the lever is write TIMING/overlap, not size.
+- **instant-feed discriminator (advisor's owed oracle, tmpfs file sink, seeded vs unseeded × skip):**
+  output exposure (off−skip) = 35.5ms (unseeded slow feed) vs 30.7ms (seeded fast feed, −38ms engine)
+  ⇒ exposure engine-INDEPENDENT ⇒ E phantom REFUTED. (Seeded gzippy 0.124s BEATS rg 0.129s WITH full
+  output; seed_skip 0.093s ≪ rg — the clean engine is excellent; prod gap = window-absent bootstrap +
+  output exposure.)
+- **T1 control:** T1 gz_off 0.513 / skip 0.465 (+10%) / rg 0.315 — at T1 the ENGINE binds (output
+  removal does NOT close it), confirming the engine is the T1 binder, output the T8 (Amdahl) binder.
+- **LANDED (rule-7a KEEP, byte-exact 028bd002…cb410f T1+T8 stdout/pipe/file, arm64 build clean, 864
+  lib tests pass — only 2 missing-fixture env failures + the known load-flake diff_ratio):** new
+  src/decompress/parallel/output_writer.rs — a single in-order background writer thread (GZIPPY_OVERLAP_WRITER=1,
+  Linux+regular-fd only, OFF==inline writev identity) that the consumer hands the owned chunk to AFTER
+  window-publish + CRC-combine, so the 211 MiB writev overlaps the next chunk's decode WAIT (faithful to
+  rg writeFunctor ParallelGzipReader.hpp:521); joined+error-propagated before the trailer check.
+- **MEASURED (locked guest, interleaved measure.sh, 5 passes):** gz_overlap/gz_off = 1.06/1.01/1.045/1.042/1.037×
+  = sign-stable **+3.7-6%** (0.79×→~0.81× rg), TIE-by-spread (Δ<spread). Captures ~6ms of the ~20ms
+  ceiling; the residual ~14ms is the irreducible memory-bandwidth floor (rg pays it too — advisor A).
+
+### NEXT (owed, gate)
+The overlap writer banks ~6ms; the remaining output ceiling (~14ms) is the shared memory-bandwidth
+floor (likely not reducible without O_DIRECT/madvise tricks rg doesn't use). The ~2% engine/sched
+residual (skip 0.98× rg, not 1.0×) + the window-absent marker bootstrap (a known separate term,
+seedfull ties at 1.029×) are the next targets. Do NOT re-open the engine table-load fork — it is the
+T1 binder, slack-masked at T8. GUEST: /tmp/gz-ft-src (source + 3 knobs: GZIPPY_SKIP_WRITEV_SYSCALL,
+GZIPPY_WRITEV_CAP_KIB, GZIPPY_OVERLAP_WRITER), build /tmp/gz-ft-src/target/release/gzippy (native, sha
+028bd002…cb410f OFF). Driver /tmp/measure_devnull.sh + /root/gzippy/scripts/measure.sh. seeds
+/tmp/seeds.bin. rg 0.16.0. NO orphan processes.
+
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 25846265) — **DECODE-vs-STORE LOCALIZATION RAN (decode-only + store-only knobs, byte-exact, committed) → both on-path but NOT SEPARABLE by slow-injection (one serial dependency chain; advisor-vetted ×2); decode-free oracle CONTAMINATED by the spec-failure re-decode net; PLATEAU/FORK is NOT VALIDATED and is REFUTED at the engine. DECISIVE: ocl_cf 0.925× < 1.0 ⇒ even fully removing the clean engine is sub-parity ⇒ ≥0.075× of the parity gap is OUTSIDE the engine (placement/scheduling). native_fold ~0.77-0.79× rg (banked teeth UNCHANGED).**
 
 ### STEP 2 — DECODE-vs-STORE LOCALIZATION + PLATEAU/FORK GATE (commit 25846265, advisor ×2)
 Built two byte-transparent knobs (GZIPPY_SLOW_DECODE / GZIPPY_SLOW_STORE) wired into BOTH the fast
