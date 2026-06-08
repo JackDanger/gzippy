@@ -812,8 +812,13 @@ fn drive_impl<W: std::io::Write>(
             BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
             HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
         );
+            // On gzippy-isal (`isal_clean_tail`) these are PRODUCTION counters: the
+            // ISA-L clean-tail engine (faithful rapidgzip WITH_ISAL). On gzippy-native
+            // they are non-zero only under the GZIPPY_ISAL_ENGINE_ORACLE measurement
+            // knob. `isal_oracle_fallbacks` MUST be 0 — any non-zero means a clean tail
+            // fell back to pure-Rust (a counted correctness net, not a silent diverge).
             eprintln!(
-                "  ISA-L ENGINE ORACLE (measurement-only): isal_oracle_chunks={} isal_oracle_fallbacks={}",
+                "  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks={} isal_fallbacks={}",
                 ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed),
                 ISAL_ENGINE_ORACLE_FALLBACKS.load(Ordering::Relaxed),
             );

@@ -138,12 +138,29 @@ pub static ISAL_ENGINE_ORACLE_CHUNKS: std::sync::atomic::AtomicU64 =
 pub static ISAL_ENGINE_ORACLE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Whether the clean-tail decode routes through REAL ISA-L FFI.
+///
+/// PRODUCTION DEFAULT is the build: on `gzippy-isal` (`isal_clean_tail`) the clean
+/// tail is decoded by ISA-L (faithful rapidgzip WITH_ISAL,
+/// `finishDecodeChunkWithInexactOffset<IsalInflateWrapper>`, GzipChunk.hpp:440-444 +
+/// :520-526); on `gzippy-native` it stays pure-Rust. The env var is an OVERRIDE:
+///   * `GZIPPY_ISAL_ENGINE_ORACLE=1` — force ISA-L ON (the measurement oracle on the
+///     native build; OFF==pure-Rust identity there).
+///   * `GZIPPY_ISAL_ENGINE_ORACLE=0` — force ISA-L OFF (used by the differential gate
+///     to obtain a genuine pure-Rust comparison decode on the isal build).
+///   * unset — the build default (`cfg!(isal_clean_tail)`).
 #[cfg(parallel_sm)]
 #[inline]
 fn isal_engine_oracle_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(
+        || match std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => cfg!(isal_clean_tail),
+        },
+    )
 }
 
 /// ISOLATION ORACLE (measurement-only, NOT production; produces WRONG BYTES when ON).
@@ -290,7 +307,29 @@ fn finish_decode_chunk_isal_oracle(
                 break;
             }
         }
-        chosen.unwrap_or((end_bit, written))
+        match chosen {
+            Some(v) => v,
+            None => {
+                // No recorded block boundary at-or-past the stop hint. Accepting
+                // `(end_bit, written)` is correct ONLY when the stream genuinely
+                // ENDED (BFINAL) at-or-before the stop hint — the member's last
+                // chunk — so `end_bit <= stop_hint`. If instead the decode ran PAST
+                // the stop hint with no usable boundary there, ISA-L's END_OF_BLOCK
+                // stopping did NOT fire for this chunk (observed on stored/fixed-block
+                // input: a multi-MiB decode recorded ZERO boundaries), so committing
+                // `end_bit` would OVER-DECODE past the chunk's natural stop and
+                // mis-seed the next chunk's start bit (a "Stored block len/nlen
+                // mismatch" downstream). DECLINE to the byte-exact pure-Rust engine
+                // (counted in ISAL_ENGINE_ORACLE_FALLBACKS). On the all-dynamic parity
+                // corpus ISA-L always records a boundary at-or-past the hint, so this
+                // never fires there.
+                if end_bit <= stop_hint_bits {
+                    (end_bit, written)
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
     };
 
     let keep_len = keep_len.min(written);
@@ -299,7 +338,6 @@ fn finish_decode_chunk_isal_oracle(
     // already physically present in the reserved spare (ISA-L wrote them); commit
     // bumps the logical length with zero copies.
     chunk.data.commit(keep_len);
-    chunk.note_inner_decoded_bytes(keep_len);
 
     // CRC over the exact kept region (mirrors finish_decode_chunk_impl:512-517).
     // The kept bytes are now the contiguous slice `data[decode_start..decode_start+keep_len]`.
@@ -312,18 +350,36 @@ fn finish_decode_chunk_isal_oracle(
     }
     chunk.statistics.non_marker_count += keep_len as u64;
 
-    // Replay boundaries up to (and not past) the natural stop, mirroring the
-    // pure path's `append_block_boundary_at` calls. Boundary output offsets are
-    // relative to this decode's start; the chunk's absolute decoded offset is
-    // `decode_start + output_offset` (== production's `decode_base + rel_off`).
+    // Replay boundaries WITH INCREMENTAL byte accounting so on-the-fly subchunk
+    // splitting fires exactly as the pure streaming loop's per-EOB path does.
+    // `ChunkData::append_block_boundary_at` only starts a new subchunk once the
+    // OPEN subchunk's `decoded_size` has crossed `split_chunk_size`; that size is
+    // grown by `note_inner_decoded_bytes`. The pure path interleaves
+    // note+append per read, so crediting the full `keep_len` up front (the old
+    // shape) hid the per-segment growth and produced ONE subchunk for the whole
+    // ISA-L tail (the `UNSPLIT_BLOCKS_EMPLACED` deletion trap caught this). Here we
+    // credit each [prev_off, b.output_offset) segment to the current subchunk
+    // BEFORE recording its boundary, then the final [last_off, keep_len) tail —
+    // byte-transparent (the committed bytes and total decoded_size are unchanged;
+    // only the subchunk split metadata now matches the pure path / vendor
+    // GzipChunk.hpp:321 + appendDeflateBlockBoundary).
+    let mut prev_off = 0usize;
     for b in &boundaries {
         if b.bit_offset > final_bit {
             break;
         }
-        let decoded_offset = decode_start + b.output_offset.min(keep_len);
+        let off = b.output_offset.min(keep_len);
+        if off > prev_off {
+            chunk.note_inner_decoded_bytes(off - prev_off);
+            prev_off = off;
+        }
+        let decoded_offset = decode_start + off;
         if decoded_offset > 0 {
             chunk.append_block_boundary_at(b.bit_offset, decoded_offset, Some(input));
         }
+    }
+    if keep_len > prev_off {
+        chunk.note_inner_decoded_bytes(keep_len - prev_off);
     }
 
     chunk.finalize_with_deflate(final_bit, Some(input));
@@ -543,6 +599,8 @@ fn decode_chunk_with_inflate_wrapper(
         initial_window,
         true,
         true,
+        // PRODUCTION: allow the ISA-L clean-tail engine.
+        true,
     )?;
     Ok(chunk)
 }
@@ -567,6 +625,9 @@ fn finish_decode_chunk_with_inexact_offset(
         initial_window,
         record_decode_duration,
         false,
+        // PRODUCTION: allow the ISA-L clean-tail engine (the build decides whether it
+        // actually fires — see `isal_engine_oracle_enabled`).
+        true,
     )
 }
 
@@ -579,15 +640,33 @@ fn finish_decode_chunk_impl(
     initial_window: &[u8],
     record_decode_duration: bool,
     until_exact: bool,
+    // When false, FORCE the pure-Rust clean tail regardless of build/env. Used only
+    // by the differential gate's LEFT (pure) decode so it can compare against the
+    // ISA-L RIGHT on the `isal_clean_tail` build (where ISA-L is the default).
+    allow_isal: bool,
 ) -> Result<(), ChunkDecodeError> {
     FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // PHASE-0 WALL ORACLE (GZIPPY_ISAL_ENGINE_ORACLE=1, measurement-only): decode
-    // this clean tail with REAL ISA-L instead of the pure-Rust engine, keeping the
-    // entire production pipeline. Falls back to the pure path on any uncovered
-    // contract (counted in ISAL_ENGINE_ORACLE_FALLBACKS so a contaminated run is
-    // detectable). NOT a production path.
-    if isal_engine_oracle_enabled() {
+    // gzippy-isal PRODUCTION clean-tail routing (faithful rapidgzip WITH_ISAL,
+    // GzipChunk.hpp:440-444 known-window + :520-526 post-32 KiB-flip clean bulk):
+    // decode the clean tail through REAL ISA-L FFI (copy-free
+    // `decompress_deflate_from_bit_into`), exactly as rapidgzip's
+    // `finishDecodeChunkWithInexactOffset<IsalInflateWrapper>`. The <=32 KiB markered
+    // prefix already ran on the pure-Rust marker engine (`deflate::Block`) before the
+    // flip — faithful (rapidgzip uses `deflate::Block` there too). On gzippy-native
+    // this routes ISA-L only under the measurement env oracle (OFF==pure-Rust identity).
+    //
+    // FALLBACK (`Ok(false)`): the SAME clean tail decodes byte-exact through the
+    // pure-Rust engine below, and the event is COUNTED in ISAL_ENGINE_ORACLE_FALLBACKS.
+    // This is a correctness safety net for the cases ISA-L genuinely cannot honor (an
+    // `until_exact` stop with no exact ISA-L boundary, or a pathologically compressible
+    // chunk overrunning the chunk-proportional reserve), NOT a silent divergence: the
+    // bytes emitted are identical to what ISA-L would emit — only the emitting engine
+    // differs. The differential gate + parity.sh assert this counter ==0 on the corpus
+    // so a real fallback surfaces loudly. On window-absent bootstrap chunks the body
+    // stays u16 markers and returns `Finished` WITHOUT reaching here (faithful: rapidgzip
+    // also marker-decodes a sub-32 KiB body) — so those never count as a fallback.
+    if allow_isal && isal_engine_oracle_enabled() {
         match finish_decode_chunk_isal_oracle(
             chunk,
             input,
@@ -856,6 +935,8 @@ fn decode_chunk_with_rapidgzip_impl(
                 stop_hint_bits,
                 initial_window,
                 false,
+                true,
+                // PRODUCTION: allow the ISA-L clean-tail engine.
                 true,
             )?;
         } else {
@@ -2469,6 +2550,10 @@ mod isal_tail_parity {
             window,
             false,
             until_exact,
+            // FORCE pure-Rust: this is the differential gate's LEFT (pure) decode,
+            // compared against the ISA-L RIGHT below. On the isal_clean_tail build
+            // ISA-L is the production default, so the gate must explicitly opt out.
+            false,
         )
         .expect("pure tail decode");
 
