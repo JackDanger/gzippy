@@ -100,13 +100,19 @@ EOF
 # rsync the working tree (tracked+modified) to the ONE canonical $GUEST_SRC over
 # the -J jump in a single command. Only the files the build needs; exclude target
 # and .git so a stale-object/huge-artifact transfer can't happen.
-RSYNC_PATHS=(src build.rs Cargo.toml Cargo.lock benches scripts vendor)
+RSYNC_PATHS=(src crates examples build.rs Cargo.toml Cargo.lock benches scripts vendor)
 do_sync() {
   echo "=== rsync working tree -> $GUEST_USER@$GUEST:$GUEST_SRC (via -J $JUMP) ==="
   # ensure the dest root exists
   timeout 30 $SSH_GUEST "mkdir -p '$GUEST_SRC'"
+  # NOTE: --delete (NOT --delete-excluded). openrsync (macOS /usr/bin/rsync) aborts
+  # with a recv_rules buffer overflow on --delete-excluded + multiple --exclude; and
+  # --delete-excluded would purge the dest's target/ build cache (forcing a cold
+  # rebuild every turn). Plain --delete keeps the excluded target/ intact (warm
+  # incremental builds) while still removing tracked files that vanished from the
+  # working tree. Excluded dirs are never transferred so they are never deleted.
   # shellcheck disable=SC2086
-  timeout 600 rsync -az --delete-excluded \
+  timeout 600 rsync -az --delete \
     --exclude 'target/' --exclude '.git/' \
     -e "ssh -o ConnectTimeout=15 -J $JUMP" \
     "${RSYNC_PATHS[@]/#/$ROOT/}" \
