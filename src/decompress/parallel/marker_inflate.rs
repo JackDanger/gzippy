@@ -358,13 +358,16 @@ pub struct Block {
     lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode,
     /// Distance Huffman decoder. Vendor rapidgzip explicitly REJECTED ISA-L
     /// for distance and uses `HuffmanCodingReversedBitsCached` (gzip/deflate.hpp:336;
-    /// ISA-L distance commented out :338). Faithful transliteration of that choice —
-    /// mirrors the canonical fallback path's distance decode (see :1514-1586).
+    /// ISA-L distance commented out :338) — with `Symbol = uint8_t`, a 64 KiB
+    /// cache (deflate.hpp:668). gzippy uses the vendor's bounded-LUT sibling
+    /// `HuffmanCodingShortBitsCached` (`LUT_BITS_COUNT = 12`, `Symbol = u8`):
+    /// byte-identical (decode_long fallback for the rare >12-bit distance code)
+    /// at an 8 KiB/thread cache instead of 128 KiB. Faithful transliteration of
+    /// the distance-decode choice (mirrors the canonical fallback path :1514-1586).
     #[cfg(pure_inflate_decode)]
-    dist_hc:
-        crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached<
-            MAX_DISTANCE_SYMBOL_COUNT,
-        >,
+    dist_hc: crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached<
+        MAX_DISTANCE_SYMBOL_COUNT,
+    >,
     /// True after `read_header` built ISA-L LUTs for this block (vendor
     /// `m_literalHC` / `m_distanceHC` at deflate.hpp:1137-1141). Cleared
     /// on each new header so `read()` in the `while !eob` loop reuses them.
@@ -437,11 +440,11 @@ impl Block {
             distance_to_last_marker_byte: 0,
             contains_marker_bytes: true,
             #[cfg(pure_inflate_decode)]
-            lut_litlen:
-                crate::decompress::parallel::lut_huffman::LutLitLenCode::new_empty(),
+            lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode::new_empty(),
             #[cfg(pure_inflate_decode)]
             dist_hc:
-                crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached::new(),
+                crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached::new(
+                ),
             #[cfg(any(
                 all(
                     feature = "isal-compression",
