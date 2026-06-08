@@ -830,3 +830,28 @@ on the native FOLD clean path (≤0.188× upper bound, but still bundles ring-wr
 memcpy that the ISA-L oracle doesn't pay). Build a same-engine pure-Rust ring-copy-free-to-final
 oracle to cleanly isolate symbol-rate from ring/drain, THEN the inner-Huffman rate work
 (BMI2/multi-literal/packed-u32 LUT) bounded by ocl_cf 0.925×, never the VAR_VI 0.6× slope.
+
+---
+## USER DECISION 2026-06-08 (fork resolved): INLINE-ASM igzip HOT-LOOP TRANSLITERATION
+Campaign converged (advisor-signed-off, removal-oracle-bounded): all structural/scheduling/
+output/page-warmth levers exhausted-or-shared. gzippy-native ~0.86× rg; the ONLY remaining
+substantial pure-Rust lever is inline-asm transliteration of igzip's AVX2 clean-decode hot loop
+(the ~36ms native→ocl_cf intrinsic hand-asm-vs-LLVM gap; all high-level techniques maxed). Ideal
+ceiling ~0.945–0.985× (a small partly-SHARED output floor caps true 1.0×). USER CHOSE the asm
+port (pure-Rust, no-FFI). Honors 1.0×-intent + no-FFI; high-risk, multi-session.
+
+EXECUTE TIERED (prove-before-the-big-build — do NOT transliterate the whole kernel into the
+byte-exact decoder blind):
+- **Phase 1 — source-map** igzip's EXACT clean hot loop (igzip_decode_block_stateless_01/04.asm +
+  igzip_inflate.c) and DISASM gzippy's current pure-Rust clean loop (target-cpu=native) → what does
+  igzip's hand-asm do that LLVM doesn't emit (the 36ms)? Cite asm line ↔ Rust site.
+- **Phase 2 — ISOLATION PROTOTYPE + MEASURE (the gate):** prototype the inline-asm hot loop in the
+  standalone engine bench (benches/engine_isolation.rs — VAR_VII), decode a clean chunk, measure vs
+  the ISA-L oracle on the MATCHED comparator via parity.sh. PRE-REGISTER the falsifier: does inline
+  asm close the 36ms toward igzip-class (ocl_cf 0.945× ceiling)? If it PLATEAUS (asm ≈ LLVM, no
+  headroom), that is a decisive finding — even hand-asm-in-Rust can't match ISA-L → report it (the
+  ceiling is then ~0.86× and the user re-decides). If it reaches igzip-class, proceed.
+- **Phase 3 — production integration** (multi-session, ONLY if Phase 2 proves it): transliterate
+  into the production clean <false> loop, byte-exact phases (dual-sha + the merged correctness net
+  GZIPPY_POISON_RESERVE=1 guards the seam/back-ref), each remove-and-measured on the matched
+  comparator. x86_64/AVX2-gated; arm64 keeps the scalar path.
