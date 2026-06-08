@@ -54,17 +54,30 @@ flag_one() { # <pid> <descr>
   fi
 }
 
-# 1+2: explicit campaign signatures (claude -p, the long-sentinel sleep).
-for pat in 'claude -p' 'sleep 86400' 'nohup sleep'; do
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    flag_one "${line%% *}" "${line#* }"
-  done < <(pgrep -fl "$pat" 2>/dev/null || true)
-done
+# 1: `claude -p` advisor processes left running. (We match the binary `claude`
+# with arg `-p` via pgrep, then drop any self/own-wrapper match whose cmdline is
+# this very sweep — orphan-check's source mentions these patterns literally, so a
+# `-f` full-cmdline match would self-flag the timeout/ssh wrapper running us.)
+SELF_PGID="$(ps -o pgid= -p "$SELF" 2>/dev/null | tr -d ' ')"
+in_self_tree() { # <pid> -> 0 if it shares our process group (our own wrapper)
+  local p="$1" pg; pg="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')"
+  [ -n "$pg" ] && [ "$pg" = "$SELF_PGID" ]
+}
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  pid="${line%% *}"
+  in_self_tree "$pid" && continue          # our own ssh/timeout wrapper, not an orphan
+  flag_one "$pid" "${line#* }"
+done < <(pgrep -fl 'claude -p' 2>/dev/null || true)
 
-# 3: sleeps reparented to init (ppid==1) — genuinely orphaned, regardless of duration.
+# 2: sleeps reparented to init (ppid==1) — genuinely orphaned, regardless of
+# duration. This single ppid==1 rule replaces the brittle full-cmdline `sleep
+# 86400`/`nohup sleep` patterns (which self-matched the sweep's own wrappers): a
+# detached sentinel that outlives its launcher IS reparented to init, so ppid==1
+# catches the real orphan without the false positive.
 while IFS= read -r pid; do
   [ -z "$pid" ] && continue
+  in_self_tree "$pid" && continue
   ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
   if [ "$ppid" = "1" ]; then
     flag_one "$pid" "$(ps -o command= -p "$pid" 2>/dev/null) [reparented to init]"
