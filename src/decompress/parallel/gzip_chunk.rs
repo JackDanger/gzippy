@@ -146,6 +146,34 @@ fn isal_engine_oracle_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").is_ok_and(|v| v == "1"))
 }
 
+/// ISOLATION ORACLE (measurement-only, NOT production; produces WRONG BYTES when ON).
+///
+/// `GZIPPY_FOLD_NODRAIN=1` makes `ContigFoldSink::push_clean_u8` SKIP the
+/// ring->`chunk.data` drain memcpy (the `extend_from_slice` second-touch of every
+/// clean byte) while still advancing `chunk.data`'s logical length (via
+/// `writable_tail_reserve` + `commit` over UNINITIALIZED reserved space) so all
+/// downstream length accounting (subchunk decoded_size, writev iovecs,
+/// window-publish) stays panic-free. The decode itself (engine `block_body` +
+/// ring write + back-ref resolution from `output_ring`) is UNCHANGED, so the wall
+/// delta vs production native_fold isolates the cost of the ring->data drain copy
+/// — the exact term the advisor said `ocl_cf` (ISA-L decode straight into the
+/// final buffer) does not pay, confounding the 0.188× residual.
+///
+/// `GZIPPY_FOLD_NOCRC=1` additionally skips the per-clean-byte CRC `update` (the
+/// CRC IS paid by `ocl_cf`, so this is the symmetric second knob to attribute the
+/// total clean-byte second-touch). Both knobs OFF => byte-exact production.
+fn fold_nodrain_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_FOLD_NODRAIN").is_ok_and(|v| v == "1"))
+}
+
+fn fold_nocrc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_FOLD_NOCRC").is_ok_and(|v| v == "1"))
+}
+
 /// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
 ///
 /// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
@@ -868,13 +896,22 @@ impl crate::decompress::parallel::marker_inflate::MarkerSink for ContigFoldSink<
         }
         // Identical accounting to ChunkData::append_clean, but the bytes land
         // straight in the pre-reserved contiguous tail (single copy, no regrow).
-        if self.crc32_enabled {
+        if self.crc32_enabled && !fold_nocrc_enabled() {
             if let Some(last_crc) = self.crc32s.last_mut() {
                 last_crc.update(bytes);
             }
         }
         *self.non_marker_count += bytes.len() as u64;
-        self.data.extend_from_slice(bytes);
+        if fold_nodrain_enabled() {
+            // MEASUREMENT-ONLY: skip the ring->data drain memcpy. Advance the
+            // logical length over uninitialized reserved space so accounting
+            // stays consistent (WRONG bytes; never a production path).
+            let n = bytes.len();
+            let _ = self.data.writable_tail_reserve(n);
+            self.data.commit(n);
+        } else {
+            self.data.extend_from_slice(bytes);
+        }
         if let Some(last) = self.subchunks.last_mut() {
             last.decoded_size += bytes.len();
         }
