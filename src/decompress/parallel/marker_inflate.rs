@@ -454,6 +454,45 @@ impl Block {
         }
     }
 
+    /// Resident PER-THREAD working-set byte breakdown for the gzippy-native
+    /// cache-residency mandate (`plans/gzippy-native-design-mandate.md`). This
+    /// is the persistent thread-local engine state (`BOOTSTRAP_BLOCK`,
+    /// `gzip_chunk.rs`) — the real native working set after the flip-in-place
+    /// fold removed Engine C. Counters only; never mutates decode state.
+    ///
+    /// Components (native `pure_inflate_decode` build):
+    /// - `output_ring`: `Box<[u16; RING_SIZE]>` = 128 KiB.
+    /// - `lut_litlen` (`LutLitLenCode`): the per-thread ISA-L-style lit/len LUT
+    ///   (`InflateHuffCodeLarge` short+long lookup + code lists), rebuilt
+    ///   in-place per block — persistent allocation, not shared.
+    /// - `dist_hc` (`HuffmanCodingReversedBitsCached`): the distance
+    ///   `code_cache` = `[(u8, u16); 1<<15]` = 128 KiB.
+    /// - `literal_cl` / `backreferences` Vecs (heap), `precode_cl` is inline.
+    ///
+    /// Returns `(total, ring, litlen_lut, dist_cache, misc_vecs)`.
+    #[cfg(parallel_sm)]
+    pub fn heap_bytes(&self) -> super::super::inflate::mem_stats::BlockHeapBytes {
+        use std::mem::size_of;
+        let ring = size_of::<[u16; RING_SIZE]>();
+        #[cfg(pure_inflate_decode)]
+        let litlen_lut = self.lut_litlen.heap_bytes();
+        #[cfg(not(pure_inflate_decode))]
+        let litlen_lut = 0usize;
+        #[cfg(pure_inflate_decode)]
+        let dist_cache = self.dist_hc.heap_bytes();
+        #[cfg(not(pure_inflate_decode))]
+        let dist_cache = 0usize;
+        let misc_vecs = self.literal_cl.capacity()
+            + self.backreferences.capacity() * size_of::<Backreference>();
+        super::super::inflate::mem_stats::BlockHeapBytes {
+            total: ring + litlen_lut + dist_cache + misc_vecs,
+            ring,
+            litlen_lut,
+            dist_cache,
+            misc_vecs,
+        }
+    }
+
     // ── Accessors (deflate.hpp:526-561) ─────────────────────────────────────
 
     pub fn eob(&self) -> bool {

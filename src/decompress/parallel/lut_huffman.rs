@@ -915,6 +915,15 @@ pub struct LutLitLenCode {
 }
 
 impl LutLitLenCode {
+    /// Resident heap footprint (boxed LUT + code-length buffers). Used by the
+    /// debug-only `mem_stats` instrument for the cache-residency mandate.
+    /// Counters only; never mutates decode state.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<InflateHuffCodeLarge>()
+            + LIT_LEN_ELEMS * std::mem::size_of::<HuffCode>()
+            + (LIT_LEN_ELEMS + 2) * std::mem::size_of::<u32>()
+    }
+
     pub fn new_empty() -> Self {
         Self {
             table: Box::new(InflateHuffCodeLarge::default()),
