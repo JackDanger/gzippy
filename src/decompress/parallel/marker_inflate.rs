@@ -2071,6 +2071,18 @@ impl Block {
 
         let mut emitted: usize = 0;
 
+        // Causal-perturbation slow-injection (measurement-only, byte-transparent;
+        // OFF==identity, DUAL-SHA gated). This is the PRODUCTION gzippy-native FOLD
+        // clean loop (post-flip contig tail) — the prior `GZIPPY_SLOW_MODE` knob
+        // lived only on the ring-based `read_internal_compressed_specialized::<false>`
+        // path and did NOT perturb this contig loop, so a clean-path perturbation
+        // could not test where the residual native_fold→ocl_cf gap actually is.
+        // Wire the SAME clean knob (`GZIPPY_SLOW_MODE` / `GZIPPY_SLOW_KIND`) here so
+        // slowing the contig symbol-decode by a known factor and watching the
+        // interleaved T8 wall answers it causally. Snapshot once before the loop.
+        let slow_spin: u64 = super::slow_knob::spin_iters();
+        let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
+
         macro_rules! commit {
             ($result:expr) => {{
                 self.decoded_bytes += emitted;
@@ -2079,6 +2091,7 @@ impl Block {
         }
 
         while emitted < local_cap {
+            super::slow_knob::inject(slow_spin, slow_yield);
             bits.refill();
             let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
             if bit_count == 0 {
