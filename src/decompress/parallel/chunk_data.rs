@@ -726,6 +726,18 @@ impl ChunkData {
         }
     }
 
+    /// Reserve `n` bytes of CONTIGUOUS spare capacity in the clean `data`
+    /// buffer up-front (one allocation), so subsequent [`Self::append_clean`]
+    /// runs land in one region without per-run amortized regrow. Used by the
+    /// gzippy-native FOLD path (`decode_chunk_unified_marker`) to give the
+    /// post-flip clean tail a single contiguous output region (vendor decodes the
+    /// clean tail into one `DecodedData` buffer, DecodedData.hpp:278-289).
+    /// Byte-transparent — only affects allocation cadence, never the decoded
+    /// bytes; an under-reserve is a safe amortized regrow, never corruption.
+    pub fn reserve_clean(&mut self, n: usize) {
+        self.data.reserve(n);
+    }
+
     /// Append clean output that arrives as u16 ring values from a
     /// post-flip [`MarkerRing`](crate::decompress::parallel::lut_bulk_inflate::MarkerRing)
     /// drain. After the flip (`!contains_marker_bytes()`) every value is

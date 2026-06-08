@@ -791,6 +791,137 @@ pub fn decompress_deflate_from_bit_with_boundaries(
     Some((output, end_bit, boundaries))
 }
 
+/// COPY-FREE variant of [`decompress_deflate_from_bit_with_boundaries`]: decode
+/// ISA-L DIRECTLY into the caller's contiguous output buffer `out` (no internal
+/// 64 MiB `Vec` alloc, no `to_vec`/`copy_from_slice`). The caller pre-reserves
+/// `out` (e.g. a chunk's `writable_tail` spare capacity) sized to the chunk's
+/// decoded bytes; ISA-L writes into `out[..]` and stops at a block boundary
+/// before exhausting it. Returns `(written, end_bit, boundaries)` where
+/// `output_offset` in each boundary is the byte offset into `out` (i.e. relative
+/// to the start of THIS decode). No CRC is computed here — the caller hashes the
+/// exact kept region (mirroring the pure path), so this performs ZERO copies.
+///
+/// Returns `None` (caller falls back) if: input is exhausted mid-block, the
+/// stream needs more than `out.len()` bytes (the caller under-reserved), or any
+/// ISA-L error. This is the oracle's clean-tail engine with the copy confound
+/// removed so the clean-engine WALL ceiling is readable.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_into(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    out: &mut [u8],
+) -> Option<(usize, usize, Vec<BlockBoundary>)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    let cap = out.len();
+    let mut out_pos: usize = 0;
+    let mut boundaries: Vec<BlockBoundary> = Vec::new();
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            // Caller under-reserved — fall back rather than realloc/copy (that
+            // would re-introduce the very confound this variant removes).
+            return None;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { out.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        out_pos += written;
+
+        match ret {
+            0 => {}
+            1 => {
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue,
+            _ => return None,
+        }
+
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            let bit_pos =
+                data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+            boundaries.push(BlockBoundary {
+                bit_offset: bit_pos,
+                output_offset: out_pos,
+            });
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((out_pos, end_bit, boundaries))
+}
+
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_boundaries(
@@ -800,6 +931,17 @@ pub fn decompress_deflate_from_bit_with_boundaries(
     _max_output: usize,
     _crc: &mut crc32fast::Hasher,
 ) -> Option<(Vec<u8>, usize, Vec<BlockBoundary>)> {
+    None
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_into(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _out: &mut [u8],
+) -> Option<(usize, usize, Vec<BlockBoundary>)> {
     None
 }
 

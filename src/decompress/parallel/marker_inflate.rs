@@ -751,14 +751,24 @@ impl Block {
             // POST-FLIP clean tail: `output_ring` is the u8 view, positions
             // are u8-LOGICAL (`% U8_RING_SIZE`). Plain u8 copy — no u16->u8
             // narrow. Vendor `result.data` u8 path (deflate.hpp:1285-1292).
-            // SAFETY: `ring8` valid for [0, U8_RING_SIZE); each index masks.
+            //
+            // COPY-FREE DRAIN: push the (≤2) CONTIGUOUS u8 ring slices DIRECTLY
+            // to the sink — no per-block `Vec::with_capacity` + byte-by-byte
+            // fill (the symmetric of the marker branch's `push_slice` below).
+            // The sink's `push_clean_u8` does ONE `extend_from_slice` memcpy.
+            // Byte-identical to the prior `u8buf` materialization.
+            // SAFETY: `ring8` valid for [0, U8_RING_SIZE); slices stay within it.
             let ring8 = self.output_ring.as_ptr() as *const u8;
-            let mut u8buf = Vec::with_capacity(new_bytes);
-            for i in 0..new_bytes {
-                let b = unsafe { *ring8.add((self.ring_drained + i) % U8_RING_SIZE) };
-                u8buf.push(b);
+            let start = self.ring_drained % U8_RING_SIZE;
+            unsafe {
+                if start + new_bytes <= U8_RING_SIZE {
+                    output.push_clean_u8(std::slice::from_raw_parts(ring8.add(start), new_bytes));
+                } else {
+                    let first = U8_RING_SIZE - start;
+                    output.push_clean_u8(std::slice::from_raw_parts(ring8.add(start), first));
+                    output.push_clean_u8(std::slice::from_raw_parts(ring8, new_bytes - first));
+                }
             }
-            output.push_clean_u8(&u8buf);
         } else {
             let start_idx = self.ring_drained % RING_SIZE;
             let end_idx_excl = (self.ring_drained + new_bytes) % RING_SIZE;

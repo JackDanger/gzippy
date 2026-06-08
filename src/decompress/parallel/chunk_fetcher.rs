@@ -532,6 +532,15 @@ fn drive_impl<W: std::io::Write>(
     // no vendor counterpart. Both deleted; sizing now matches vendor.
     let mut cache_capacity = std::cmp::max(16, pool_size);
     let mut prefetch_capacity = pool_size * 2;
+    // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): NO cache-cap bump.
+    // The corrected overlap dispatch parks IN-FLIGHT receivers in the unbounded
+    // `prefetching` map (submit_prefetch), NOT in the size-capped caches, so the
+    // oracle does not need a larger cache. The PRIOR (backwards) oracle bumped
+    // BOTH caps to 4096 with no eviction, which held the whole member's u16
+    // (2×-width) markered working set resident (~400MB vs production's ~190MB) —
+    // an advisor-identified memory-bandwidth CONFOUND that added ~5-7% wall
+    // (plans/corrected-overlap-advisor-verdict.md §C1.2). Vendor sizing kept so
+    // the oracle is production-shaped and isolates ONLY the dispatch-depth term.
     // STEP-0 discriminator (a) POSITIVE CONTROL (gated on the probe being on, so
     // production is untouched / OFF==identity): GZIPPY_PREFETCH_CACHE_CAP=N
     // overrides BOTH cache capacities. Shrinking to a tiny value MUST force the
@@ -622,6 +631,31 @@ fn drive_impl<W: std::io::Write>(
     crate::decompress::parallel::decode_bypass::warm_prebuilt();
 
     let drive_t0 = std::time::Instant::now();
+    // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): CORRECTED overlap
+    // dispatch — submit EVERY chunk's decode as an in-flight prefetch
+    // (non-blocking) so they decode CONCURRENTLY with the timed consumer below.
+    // The consumer drains in order (resolve + write) while later chunks still
+    // decode = decode↔drain OVERLAP (the schedule production / rg use). Removes
+    // ONLY the prefetch-dispatch-DEPTH gap; KEEPS the marker engine, serial
+    // resolve chain, drain, write. This dispatch is cheap (no recv); the whole
+    // wall is timed by drive_t0 below. No-op unless enabled.
+    let warm_t0 = std::time::Instant::now();
+    if crate::decompress::parallel::perfect_overlap::enabled() {
+        perfect_overlap_warm(
+            input_view,
+            total_bits,
+            &block_finder,
+            &block_fetcher,
+            &window_map,
+            &thread_pool,
+            pool_size,
+            configuration,
+        );
+        eprintln!(
+            "  PERFECT_OVERLAP: dispatch phase {:.4}s (all chunks in flight; consumer overlaps)",
+            warm_t0.elapsed().as_secs_f64()
+        );
+    }
     let consumer_result = consumer_loop(
         input_view,
         writer,
@@ -648,6 +682,13 @@ fn drive_impl<W: std::io::Write>(
     // Report replay stats even on a (CRC) error so the bypass experiment
     // can see hit/miss counts when the run aborts.
     crate::decompress::parallel::decode_bypass::report_replay_stats();
+    if crate::decompress::parallel::perfect_overlap::enabled() {
+        eprintln!(
+            "  PERFECT_OVERLAP: overlapped wall (dispatch+consumer) {:.4}s",
+            drive_t0.elapsed().as_secs_f64()
+        );
+        crate::decompress::parallel::perfect_overlap::report_stats();
+    }
     consumer_result?;
 
     if trace::is_enabled() {
@@ -1329,6 +1370,12 @@ fn consumer_loop<W: std::io::Write>(
                         );
                     }
                     // ACCEPT: move the `Arc` (no extra refcount) into the consumer path.
+                    // PERFECT_OVERLAP self-test: a warm-cache hit = head-of-line
+                    // decode wait removed for this chunk. Gated so production is
+                    // perf-transparent (OFF == identity).
+                    if crate::decompress::parallel::perfect_overlap::enabled() {
+                        crate::decompress::parallel::perfect_overlap::record_warm_hit();
+                    }
                     chunk_arc_from_partition = Some(arc);
                 } else {
                     // Vendor GzipChunkFetcher.hpp:646-648 — partition-keyed
@@ -1369,6 +1416,13 @@ fn consumer_loop<W: std::io::Write>(
         let chunk_arc = match chunk_arc_from_partition {
             Some(arc) => arc,
             None => {
+                // PERFECT_OVERLAP self-test: a warm-cache MISS = a residual
+                // head-of-line decode wait the oracle failed to remove. If this
+                // fires often the warm_hit_frac drops below 1.0 and the number
+                // is void (Rule 4). No-op unless the oracle is enabled.
+                if crate::decompress::parallel::perfect_overlap::enabled() {
+                    crate::decompress::parallel::perfect_overlap::record_warm_miss();
+                }
                 // STEP-0 discriminator (a): PARENT-CACHED-AT-STALL probe
                 // (plans/step0-discriminator-a-falsifier.md). This `None`
                 // branch IS the genuine head-of-line cold-get stall. Before
@@ -2037,6 +2091,112 @@ fn decode_chunk_with_until_exact(
 /// whose `std::future<BlockData>` the caller waits on. Vendor calls
 /// `m_threadPool.submit([this, ...] () { return decodeAndMeasureBlock(...); }, 0)`;
 /// we mirror that with `thread_pool.submit(run_decode_task, /* priority */ 0)`.
+#[cfg(parallel_sm)]
+/// PERFECT_OVERLAP oracle dispatch phase (GZIPPY_PERFECT_OVERLAP=1).
+///
+/// CORRECTED (2026-06-07): dispatch EVERY chunk's decode as an IN-FLIGHT
+/// prefetch up-front (non-blocking — `submit_prefetch`, NOT `recv()`),
+/// then return IMMEDIATELY so the timed `consumer_loop` runs CONCURRENTLY
+/// with the still-running decodes. The consumer drains chunk i in order
+/// (resolve markers off chunk i-1's published window + write) WHILE chunks
+/// i+1.. are still decoding on the pool. That is decode↔drain OVERLAP — the
+/// schedule production and rapidgzip actually use.
+///
+/// The PRIOR version (warm-all-then-drain) blocked on `recv()` for every
+/// chunk before the consumer started, SERIALIZING the two phases production
+/// overlaps — an ANTI-overlap whose wall was a pessimistic SUM (advisor
+/// REFUTED it: plans/perfect-overlap-advisor-verdict.md). It could not
+/// decide F1. This version removes ONLY the prefetch-DEPTH gap (every chunk
+/// is in flight from t0, so the consumer never head-of-line stalls on a
+/// not-yet-DISPATCHED chunk — the named project_confirmed_offset_prefetch_gap
+/// dispatch-TIMING term), while KEEPING the real marker engine, the serial
+/// marker-resolution window chain, drain, and write.
+///
+/// Faithfulness: each dispatched decode is the SAME `submit_decode_to_pool`
+/// task the prefetcher would have run, at the SAME partition-guess start
+/// (`is_speculative_prefetch=true`), keyed in the in-flight map under the
+/// SAME partition offset the consumer queries (`submit_prefetch` mirrors
+/// vendor `m_prefetching.emplace`, BlockFetcher.hpp:558). The window map is
+/// NOT pre-seeded, so each chunk decodes markered at its true rate.
+/// Output is therefore byte-identical (self-test: sha unchanged).
+#[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
+fn perfect_overlap_warm(
+    input: InputSlice,
+    total_bits: usize,
+    block_finder: &GzipBlockFinder,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
+    window_map: &WindowMap,
+    thread_pool: &Arc<ThreadPool>,
+    _pool_size: usize,
+    configuration: ChunkConfiguration,
+) {
+    use crate::decompress::parallel::perfect_overlap;
+
+    let spacing = block_finder.spacing_in_bits().max(1);
+    let mut block_index: usize = 0;
+    let mut guess_offset: usize = 0;
+
+    loop {
+        // Partition-guess offset for this index. The block_finder yields the
+        // confirmed offset once known, else the partition spacing multiple.
+        let start = match block_finder.get(block_index) {
+            (Some(off), GetReturnCode::Success) => off,
+            _ => guess_offset,
+        };
+        if start >= total_bits || total_bits.saturating_sub(start) < 8 {
+            break;
+        }
+        let part_key = block_finder.partition_offset_containing_offset(start);
+        // Skip if a prefetch for this partition key is already in flight
+        // (e.g. a confirmed offset and its partition-guess collapse to the
+        // same key) — avoid clobbering an existing receiver.
+        if block_fetcher.prefetch_in_flight(&part_key) {
+            block_index += 1;
+            guess_offset = guess_offset.saturating_add(spacing);
+            if guess_offset >= total_bits {
+                break;
+            }
+            continue;
+        }
+        // Worker stop hint: next partition boundary (or EOF). Same derivation
+        // as the prefetch path (next_offset.max(offset)).
+        let next_guess = guess_offset.saturating_add(spacing).min(total_bits);
+        let stop_hint = next_guess.max(start);
+        let params = DecodeParams {
+            start_bit: start,
+            stop_hint_bit: stop_hint,
+            stop_hint_is_exact: false,
+            is_speculative_prefetch: true,
+            partition_idx: usize::MAX,
+        };
+        let rx = submit_decode_to_pool(
+            thread_pool,
+            input,
+            params,
+            window_map,
+            block_fetcher,
+            configuration,
+        );
+        // OVERLAP: park the IN-FLIGHT receiver (do NOT block on recv). The
+        // consumer's `try_take_prefetched_pumping(&part_key)` will
+        // `take_prefetch` it and block on the head chunk while the rest keep
+        // decoding on the pool. Mirror of vendor `m_prefetching.emplace`.
+        block_fetcher.submit_prefetch(part_key, rx);
+        perfect_overlap::record_warm_chunk();
+
+        block_index += 1;
+        guess_offset = guess_offset.saturating_add(spacing);
+        if guess_offset >= total_bits {
+            break;
+        }
+        // Safety bound: never loop past a reasonable chunk count.
+        if block_index > (total_bits / spacing) + 64 {
+            break;
+        }
+    }
+}
+
 #[cfg(parallel_sm)]
 fn submit_decode_to_pool(
     thread_pool: &Arc<ThreadPool>,
