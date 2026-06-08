@@ -1,5 +1,29 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## CORRECTNESS NET ADOPTED (poison-on, Stage-2 seam VALIDATED) + ≤0.11× RESIDUAL LOCATED on the T8 critical path (causal perturbation, advisor-UPHELD) + inner-Huffman STORE-side technique TIE'd (kept 7a) [2026-06-07, OWNER turn, HEAD 2ff19ac6]
+STEP 0 (commit 24c3a04): merged test/inflate-correctness-net (seam_crossing, diff_multi_oracle,
+inflate_proptest, inflate_fuzz_loop + cfg(test) 0xCD reserve-poison). Poisoned the Stage-2 contig
+copy-free spare too so the FOLD copy-free clean seam is stress-tested. VALIDATED with
+GZIPPY_POISON_RESERVE=1: full suite 892 pass /1 pre-existing diff_ratio flake; all 11 seam tests +
+3-oracle/multi-oracle differentials + proptest + 5000-iter fuzz byte-exact. NO Stage-2 seam bug.
+
+STEP 1a (slow-knob wire + perturbation, advisor UPHELD-WITH-CAVEATS): the Stage-2 FOLD clean tail decodes
+via decode_clean_into_contig (NO ring — Stage 2 removed the clean ring-write), unperturbed by the old
+ring-only GZIPPY_SLOW_MODE. Wired the clean knob into the contig loop (byte-transparent, ~24-27M hits).
+CAUSAL PERTURBATION (locked guest, interleaved N=11, T8, 2 passes): off<spin50<spin100<sleep100 MONOTONIC
+both passes, freq-neutral sleep preserves the delta ⇒ contig clean symbol-decode IS on the T8 critical path.
+Advisor: on-path UPHELD, but a per-loop-body inject can't isolate decode-COMPUTE from store/copy bandwidth.
+
+STEP 1b (commit 2ff19ac6, advisor UPHELD-WITH-CAVEATS): ported the ring VAR_V speculative packed
+multi-literal fast loop (igzip asm:518) onto the contig clean tail, gated on sym_count>1. BYTE-EXACT
+(028bd002…cb410f T1+T8 x86_64+arm64; full suite+poison+5000 fuzz green). REMOVE-AND-MEASURE (3 interleaved
+passes, baseline vs fastloop2): 1.001×/1.018×/0.994× = TIE. Fast loop covers ~69% of clean events (careful
+hits 27M→8.3M) ⇒ the STORE side is NOT the binding sub-resource. KEPT 7a. SUPERVISOR GATE — store technique
+exhausted; binding sub-resource UNIDENTIFIED; NEXT (owed, not started) = clean-only oracle + decode-ONLY
+perturbation to localize before any BMI2/packed-LUT. Banked teeth UNCHANGED; native_fold ~0.77-0.79× rg.
+Briefs/verdicts: plans/contig-clean-perturbation-{brief,advisor-verdict}.md +
+plans/contig-fastloop-advisor-{brief,verdict}.md. NO orphan processes.
+
 ## COPY-FREE-TO-FINAL STAGE 2 — WIRED + LANDED BYTE-EXACT + MEASURED → drain-memcpy tooth BANKED +0.05× (advisor UPHELD-WITH-CAVEATS); native_fold ~0.74×→~0.79× rg [2026-06-07, OWNER turn, HEAD 0f5bc85b]
 Wired Stage-1's `decode_clean_into_contig` into the gzippy-native FOLD seam: the post-flip clean
 tail now decodes DIRECTLY into chunk.data's reserved contiguous tail, DELETING the ring→chunk.data
