@@ -63,7 +63,21 @@ if [ -n "$SCRUBBED" ]; then
   esac
 fi
 
-# ---- 2. build (under cargo-lock) --------------------------------------------
+# ---- 2. build (under cargo-lock) + content fingerprint -----------------------
+# The stale-binary guard uses a CONTENT fingerprint, not mtime: mtime comparison
+# was both incomplete (missed vendor/benches) and unsound across hosts (the binary
+# carries the guest clock, sources the owner clock — rsync -a preserves owner
+# mtimes, so a clock-skew false-negative could measure a stale binary). A sha of
+# ALL build inputs is clock-independent and complete.
+FPRINT="$GZIPPY_BIN.inputs.sha"
+# The complete set of build inputs (everything rsync ships that can change the bin).
+input_fingerprint() {
+  # Deterministic: sorted file list, sha each, sha the digest stream. Quiet on
+  # missing optional dirs.
+  { find src build.rs Cargo.toml Cargo.lock vendor benches -type f 2>/dev/null \
+      | LC_ALL=C sort | xargs sha256sum 2>/dev/null; } | sha256sum | cut -d' ' -f1
+}
+
 CARGO_LOCK="${CARGO_LOCK:-scripts/cargo-lock.sh}"
 if [ "$DO_BUILD" = 1 ]; then
   echo "## build feature=$FEATURE RUSTFLAGS='$RUSTFLAGS_PIN' (cargo-lock serialized)"
@@ -79,18 +93,25 @@ if [ "$DO_BUILD" = 1 ]; then
     fail "build rc=$brc (see $ARTDIR/build.log)" 8
   fi
   grep -E 'Compiling gzippy|Finished' "$ARTDIR/build.log" | tail -3 || true
+  # Stamp the fingerprint of the inputs THIS binary was built from.
+  input_fingerprint > "$FPRINT" 2>/dev/null || true
 fi
 [ -x "$GZIPPY_BIN" ] || fail "no-binary:$GZIPPY_BIN (run with --build)" 5
 
 # ---- 2b. STALE-BINARY guard (only matters when we did NOT just build) --------
-# Without --build we measure whatever binary is sitting at $GZIPPY_BIN. Guard
-# against measuring a binary OLDER than the synced sources: if any tracked source
-# is newer than the binary, the binary is stale — abort rather than print a number
-# for the wrong build. (When DO_BUILD=1 the binary is by construction the freshest.)
+# Without --build we measure whatever binary is at $GZIPPY_BIN. Compare the CURRENT
+# build-input fingerprint to the one stamped at build time. Mismatch ⇒ the synced
+# sources differ from what the binary was built from ⇒ stale ⇒ abort. Absent stamp
+# ⇒ we cannot prove freshness ⇒ abort (require --build). Clock-independent; covers
+# src/build.rs/Cargo.*/vendor/benches.
 if [ "$DO_BUILD" != 1 ]; then
-  NEWER="$(find src build.rs Cargo.toml Cargo.lock -type f -newer "$GZIPPY_BIN" -print 2>/dev/null | head -1)"
-  if [ -n "$NEWER" ]; then
-    fail "stale-binary:$GZIPPY_BIN is OLDER than source ($NEWER) — re-run with --build (measuring the wrong build)" 6
+  if [ ! -f "$FPRINT" ]; then
+    fail "no-build-fingerprint:$FPRINT absent — cannot prove $GZIPPY_BIN matches the synced sources; re-run with --build" 6
+  fi
+  CUR_FP="$(input_fingerprint)"
+  STAMP_FP="$(cat "$FPRINT" 2>/dev/null)"
+  if [ "$CUR_FP" != "$STAMP_FP" ]; then
+    fail "stale-binary:$GZIPPY_BIN built from different inputs (stamp=$STAMP_FP cur=$CUR_FP) — re-run with --build" 6
   fi
 fi
 
@@ -122,16 +143,24 @@ ACT_TURBO="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || ec
 # Read back effective affinity too (offline cores would already sha-miss, but an
 # unhonored mask is worth surfacing).
 ACT_AFFIN="$(taskset -pc $$ 2>/dev/null | sed 's/.*: //' || echo NA)"
-host_thawed=0
-[ "$ACT_GOV" = "$GOV" ] || host_thawed=1
-[ "$ACT_TURBO" = "$NO_TURBO" ] || host_thawed=1
-if [ "$host_thawed" = 1 ]; then
-  if [ "$HOST_FROZEN" = 1 ]; then
-    echo "## WARN: host readback governor=$ACT_GOV no_turbo=$ACT_TURBO (expected $GOV/$NO_TURBO) but HOST_FROZEN=1 acknowledged — proceeding."
-  else
-    fail "host-not-frozen governor=$ACT_GOV no_turbo=$ACT_TURBO (expected $GOV/$NO_TURBO). Freeze the box, or pass HOST_FROZEN=1 to acknowledge (e.g. LXC sysfs hidden). A thawed-host number is contaminated." 13
-  fi
-fi
+# A readback is one of: MATCH (frozen), NA (unreadable — e.g. LXC sysfs hidden), or
+# a CONCRETE-WRONG value (genuinely thawed, readable). HOST_FROZEN=1 may ONLY
+# rescue the NA case (nothing to verify against) — it must NOT be able to override a
+# CONCRETE-WRONG readback (a box we can see is thawed). That closes the "operator
+# asserts frozen on an actually-thawed readable host" residual.
+gov_state=MATCH; [ "$ACT_GOV" = "$GOV" ] || gov_state=$([ "$ACT_GOV" = NA ] && echo NA || echo WRONG)
+trb_state=MATCH; [ "$ACT_TURBO" = "$NO_TURBO" ] || trb_state=$([ "$ACT_TURBO" = NA ] && echo NA || echo WRONG)
+case "$gov_state/$trb_state" in
+  MATCH/MATCH) ;;  # frozen, proceed
+  *WRONG*)
+    fail "host-not-frozen governor=$ACT_GOV no_turbo=$ACT_TURBO (expected $GOV/$NO_TURBO) — a READABLE thawed value cannot be overridden. Freeze the box." 13;;
+  *) # one or both are NA (unreadable) and the rest MATCH — allow ONLY with ack.
+    if [ "$HOST_FROZEN" = 1 ]; then
+      echo "## WARN: host freeze unreadable (governor=$ACT_GOV no_turbo=$ACT_TURBO) but HOST_FROZEN=1 acknowledged — proceeding (auditable in provenance)."
+    else
+      fail "host-freeze-unreadable governor=$ACT_GOV no_turbo=$ACT_TURBO (LXC sysfs hidden?). Pass HOST_FROZEN=1 to acknowledge the box is frozen out-of-band. A thawed-host number is contaminated." 13
+    fi;;
+esac
 
 # rapidgzip presence (the comparison target).
 RG_CMD=""
