@@ -1,6 +1,48 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## C2 NON-ENGINE RESIDUAL LOCALIZED + BOUNDED on ocl_cf → ALL C2 SUB-TERMS FLAT-OR-SMALL; the 21ms is NOT a faithful low-risk scheduling tooth (3 removal oracles, advisor signed off ×2) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD f98af1f]
+## PHASE 1 (source-map) + PHASE 2 (isolation prototype + measure) of the INLINE-ASM igzip fork → DECISIVE NO-GO; user-fork escalated (advisor disproof ×2, pass-2 signed off) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 690941f3]
+
+Executed the charter's TIERED Phase-1+Phase-2 (prove-before-the-big-build).
+
+PHASE 1 SOURCE-MAP (read-only subagent, cited igsip_decode_block_stateless.asm:507-627): what
+the hand-asm does that LLVM does NOT emit — F1 one-iteration-ahead literal-table gather across the
+back-edge (asm:540), F2 speculative dist gather before the lit/len branch (asm:550-552), F3
+unconditional flag-free SHLX/SHRX refill+consume (IN_BUFFER_SLOP=8, asm:528-547), F4 loop state
+pinned in callee-saved GPRs (asm:108-136), C 8-byte speculative packed-literal store (asm:518), D
+16-byte MOVDQU + distance-doubling copy (asm:603-627), E one slop-gate per iter (asm:488-512).
+VAR_V/VAR_VI already do C/D/E + a Rust PRELOAD; VAR_VII targets F1/F3/F4/C in `core::arch::asm!`.
+
+PHASE 2 PROTOTYPE (benches/engine_isolation.rs VAR_VII, committed 0c769c14→690941f3): inline-asm
+literal-run hot loop, regs pinned, unconditional SHLX refill (mirrors gzippy Bits bitsleft=len|56),
+12-bit gather, 8-byte packed store, one slop-gate; exits to Rust per back-ref/long-code then
+RE-ENTERS the asm. BYTE-EXACT SHA_ALL_EQUAL=yes on all 5 swept clean silesia chunks vs scalar AND
+ISA-L. GZIPPY_VII_COVERAGE: asm emits 57-99% of bytes (median ~0.65-0.74).
+
+PHASE 2 MEASURE (GUEST native x86_64, frozen host, taskset core 0, interleaved best-of-11, vs ISA-L
+oracle): ISA-L 283 MB/s (1.000×) | VAR_VI LLVM 168 (0.594× = LLVM ceiling) | VAR_VII asm 78
+(0.276×, ~0.75× of NAIVE SCALAR). TWO brackets: leading-run-only 0.55×, re-enter-per-symbol 0.28× —
+rate FALLS as asm coverage rises ⇒ the per-symbol asm↔Rust re-entry (LLVM barrier ×300-460K/chunk,
+4 regs spilled to `bits`) dominates. FALSIFIER ⇒ PLATEAU/NO-GO.
+
+ADVISOR ×2 (independent disproof, synchronous): pass-1 broke the first cut (asm ran once/block over
+the leading run, 0.89% coverage = under-powered) → OWED a coverage counter + dominant-path asm; owner
+delivered both. pass-2 tried 3 breaks, all FAILED → NO-GO EARNED, escalation correctly triggered;
+REVERSED its own pass-1 "full-kernel VAR_VIII before escalating" — the full-kernel upside is already
+bounded by the ocl_cf 0.945× removal oracle, so VAR_VIII can only CAPTURE not re-decide the fork.
+SHARPENING: T8 engine slack-masked → accept; but goal #1 = no-FFI parity across thread-count incl.
+LOW-T where the engine is NOT masked (0.55-0.60× ISA-L) — full-kernel asm justified IFF a low-T
+engine-bound CLOSABLE cell loses to rapidgzip.
+
+**SUPERVISOR GATE — INLINE-ASM FORK RESOLVED (NO-GO on the transliteration approach, advisor-signed).
+The only remaining engine lever is a full-kernel asm (re-write ISA-L by hand) bounded by ocl_cf 0.945×.
+ESCALATE: (A) ACCEPT ~0.86-0.945× pure-Rust and close the engine chapter, OR (B) authorize a
+multi-session full-kernel asm — justified ONLY if a LOW-T engine-bound CLOSABLE cell loses to rg
+(T8 is slack-masked, does NOT justify it). NEXT OWED before (B): a T1/T4 parity.sh whole-system cell
+vs rg to test for a closable-and-losing engine-bound cell. NO production change (bench VAR_VII + plan
+docs; byte-exact preserved). Briefs/verdicts: plans/phase2-inline-asm-brief.md +
+plans/phase2-inline-asm-advisor-verdict{,-pass2}.md. Host auto-restored frozen. NO orphan processes.**
+
+## SUPERSEDED — C2 NON-ENGINE RESIDUAL LOCALIZED + BOUNDED on ocl_cf → ALL C2 SUB-TERMS FLAT-OR-SMALL; the 21ms is NOT a faithful low-risk scheduling tooth (3 removal oracles, advisor signed off ×2) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD f98af1f]
 
 Owned the supervisor's job: localize the 21ms non-engine residual on the ocl_cf (ISA-L engine) path,
 bound it with a removal oracle, faithful-fix if found. Froze the host (was thawed on arrival), built
