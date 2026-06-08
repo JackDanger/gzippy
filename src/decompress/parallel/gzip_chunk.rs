@@ -869,10 +869,14 @@ fn decode_chunk_with_rapidgzip_impl(
 /// quiet-box banked, sha-exact; the loaded 6-pass split showed the same recovery
 /// monotonic across copy#1 + copy#2/3/grow but load-inflated, so the banked
 /// number is +0.059×). Vendor decodes the clean tail straight into one contiguous
-/// DecodedData buffer (DecodedData.hpp:278-289). NOTE: "copy-free" here means no
-/// `u8buf`/`pending_clean` middle-man — the engine ring write + the ring->data
-/// drain memcpy remain (the ISA-L `ocl_cf` ceiling pays neither), so the residual
-/// to that 0.925× ceiling is an UPPER BOUND on intrinsic symbol rate, not pure rate.
+/// DecodedData buffer (DecodedData.hpp:278-289). NOTE: this ContigFoldSink ring
+/// path is the ~1% marker-loop dribble on gzippy-native; the BULK clean tail is
+/// u8-direct via `decode_clean_into_contig` (no ring, no drain). The
+/// GZIPPY_FOLD_NODRAIN/NOCRC split measured the remaining drain+CRC second-touch at
+/// ~0-1ms (frozen host N=21), so the gap to the ISA-L `ocl_cf` ceiling
+/// (matched-comparator 0.945× rg) is ~36ms of essentially PURE symbol rate on the
+/// SAME covered chunks — NOT an upper bound padded by ring cost (that earlier
+/// caveat is STALE for the contig bulk). See plans/fold-drain-split-result.md.
 #[cfg(parallel_sm)]
 struct ContigFoldSink<'a> {
     markers: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
@@ -993,10 +997,18 @@ fn decode_chunk_unified_marker(
     // alloc + the pending_clean double-copy. This recovered +0.059× of the T8
     // wall (native_fold 0.678× -> 0.737× rg, quiet-box banked, sha-exact; the
     // loaded 6-pass split confirmed the recovery is monotonic across copy#1 +
-    // copy#2/3/grow but load-inflated). The residual to the engine-removed
-    // ceiling (ocl_cf 0.925×) is ~0.188×, an UPPER BOUND on the intrinsic
-    // symbol-rate gap that still includes the ring-write + ring->data drain
-    // memcpy `ocl_cf` does not pay — not pure symbol rate.
+    // copy#2/3/grow but load-inflated). NOTE (2026-06-08, measured): on the
+    // gzippy-native build the BULK clean tail does NOT take this ContigFoldSink
+    // ring path at all — it takes `finish_decode_chunk_contig_native` ->
+    // `decode_clean_into_contig` (u8-DIRECT into chunk.data, no ring, no drain;
+    // this sink governs only the ~1% marker-loop dribble). The
+    // GZIPPY_FOLD_NODRAIN/NOCRC split measured the remaining drain+CRC
+    // second-touch at ~0-1ms (frozen host, N=21), so the gap to the engine-removed
+    // ceiling (ocl_cf, matched-comparator 0.945× rg) is ~36ms of essentially PURE
+    // pure-Rust-vs-ISA-L SYMBOL RATE on the SAME covered chunks (coverage symmetry
+    // confirmed: native flip_to_clean=12 finished_no_flip=4 window_seeded=2 ==
+    // ocl_cf's 14 covered). The earlier "ring-write+drain remain, upper bound only"
+    // caveat is STALE for the contig bulk path. See plans/fold-drain-split-result.md.
     {
         const RESERVE_CLAMP: usize = 16 * 1024 * 1024;
         let compressed_bytes = stop_hint_bits.saturating_sub(encoded_offset_bits) / 8;

@@ -108,7 +108,7 @@ if [ "$DO_SYNC" = 1 ]; then
   # shellcheck disable=SC2086
   timeout 600 rsync -az --exclude 'target/' --exclude '.git/' \
     -e "ssh -o ConnectTimeout=15 -J $JUMP" \
-    "$ROOT/src" "$ROOT/build.rs" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" \
+    "$ROOT/src" "$ROOT/crates" "$ROOT/examples" "$ROOT/build.rs" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" \
     "$ROOT/benches" "$ROOT/scripts" "$ROOT/vendor" \
     "$GUEST_USER@$GUEST:$GUEST_SRC/"
 fi
