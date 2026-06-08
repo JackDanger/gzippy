@@ -86,9 +86,23 @@ binary is the one you think it is.
 
 ---
 
-## Host-lock convention (Rule 6: frozen host)
+## Host-lock convention (Rule 6: frozen host) — see plans/BENCH.md "THE FREEZE"
 
-A trustworthy number requires a frozen host:
+A trustworthy number requires a **genuinely quiet** frozen host. The spine now
+DELIVERS that automatically: `parity.sh` / `oracle.sh` bracket every run with the
+host freeze (`--lock`, default ON) via `scripts/bench/lib_hostlock.sh` →
+`neurotic:/root/bench-lock.sh`. That host script:
+
+- **Freezes ALL noisy LXCs**, not just plex+frigate. The OLD
+  `/root/clock_freeze.sh` froze only 105+111 and left transmission(170)/
+  sabnzbd(166)/llama(211)/immich(212) running free — the loadavg bounce that
+  blocked every absolute number. `bench-lock` freezes `running − KEEP_ALLOWLIST`
+  so every neighbor is paused and a NEW one is frozen by default.
+- **Verifies QUIET** via instantaneous `procs_running` (NOT the lagging 1-min
+  loadavg), arms a self-restoring systemd watchdog, and always thaws on release
+  (Plex never left paused).
+
+Per-run invariants the freeze + readback enforce:
 
 - **CPU pin:** `taskset -c $TASKSET` (`0,2,4,6,8,10,12,14` for T8 — even cores,
   no SMT-sibling contention). Both contenders see the same pin so the
@@ -97,10 +111,11 @@ A trustworthy number requires a frozen host:
 - **Turbo:** `intel_pstate/no_turbo == 1` (`$NO_TURBO`) — neutralizes the
   busy-vs-sleep turbo-deflation artifact (Measurement PROCESS rule 2).
 
-`parity.sh` reads these back and **warns loudly** if the host is not frozen, so a
-number is never silently taken on a thawed box. (Setting the governor/no_turbo is
-a privileged write done by the host-lock harness on `neurotic`; `parity.sh` only
-asserts the state, it does not change it.)
+The guest runners read governor/no_turbo back and **HARD-FAIL on a readable
+thaw**, and HARD-FAIL on a loaded box (`procs_running` above threshold), so a
+number is never silently taken on a thawed OR loaded box. With `--no-lock` an
+external manager owns the freeze (then pass `--host-frozen` and ensure quiet).
+The legacy `/root/clock_freeze.sh` + `freeze_*.sh` are superseded by `bench-lock`.
 
 ---
 
