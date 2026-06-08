@@ -2051,6 +2051,20 @@ impl Block {
         const MAX_LIT_LEN_SYM: u32 = 512;
         const MAX_RUN_LENGTH: usize = 258;
         // Contiguous-buffer cap: leave room for one max back-ref + word overshoot.
+        //
+        // Headroom proof (advisor-required): one outer iteration writes EITHER
+        // ≤3 packed literals OR exactly one back-ref of length ≤ MAX_RUN_LENGTH,
+        // NEVER both — the ISA-L LUT's multi-symbol packing (sym_count ∈ {1,2,3})
+        // stops at any symbol ≥ 256, so a pair/triple slot is all literals and a
+        // back-ref appears only at sym_count == 1 (igzip_inflate.c:473-476, see
+        // the multi-symbol notes on read_internal_compressed_specialized). The
+        // outer guard keeps `*pos ≤ out_room - 1 = cap - (MAX_RUN_LENGTH+8) - 1`
+        // at any back-ref, and `emit_backref_contig`'s word path touches up to
+        // `*pos + ((MAX_RUN_LENGTH+7)&!7) = *pos + 264`, max end `= cap - 3 < cap`.
+        // The literal-triple path ends at `≤ cap - 264`. So MAX_RUN_LENGTH+8 is
+        // provably sufficient — but the proof DEPENDS on `MAX sym_count == 3` and
+        // "multi-symbol ⇒ all literals"; a LUT change that packed a length code
+        // into a multi-symbol slot would invalidate it.
         let out_room = cap.saturating_sub(MAX_RUN_LENGTH + 8);
         debug_assert!(*pos <= out_room, "decode_clean_into_contig: no spare");
         let local_cap = n_max_to_decode.min(out_room.saturating_sub(*pos));
