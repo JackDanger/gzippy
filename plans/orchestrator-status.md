@@ -1,5 +1,38 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## CLEAN ENGINE-RATE CEILING MEASURED + VALIDATED (matched comparator) → engine plateau REAL & bounded; FORK NOT escalated (advisor: KEEP-GRINDING C2, not inline-asm) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD a884fa7b+wt]
+
+MERGE green (886 lib pass, poison-on; 3 prior failures fixed). Fixed the merged parity.sh/oracle.sh
+which could NOT build (4 script fixes: rsync --delete-excluded→--delete for macOS openrsync;
+RSYNC_PATHS += crates examples; un-scrub GZIPPY_BIN in the contamination allowlist; fingerprint +=
+crates examples). Froze host via neurotic /root/clock_freeze.sh. Killed a stale 970MB orphan test
+binary before measuring.
+
+DECISIVE (frozen host, MATCHED comparator both→/dev/shm regular-file sink, interleaved best-of-N min,
+sha-verified, window-absent-preserving):
+- rapidgzip 0.16.0          376-383 ms  1.000×
+- ocl_cf (ISA-L clean eng)  404 ms      0.945×  ← validated CEILING (coverage 14/0, symmetry ✓, drain-split ✓)
+- production native (rust)   434-440 ms  0.857-0.870×
+
+The 36ms native→ocl_cf gap is ~97% pure-Rust-vs-ISA-L SYMBOL RATE (GZIPPY_FOLD_NODRAIN/NOCRC N=21:
+drain+CRC second-touch ~0-1ms; bulk is u8-direct, banked 0f5bc85b). Advisor ×3 (synchronous): ceiling
+UPHELD-W-CAVEATS twice (it corrected its own 10-20ms drain estimate after the split refuted it),
+plateau VALIDATED (all STEP-2 techniques done/inapplicable; 36ms = intrinsic hand-asm-vs-LLVM gap;
+table-prefetch no-headroom because the 16KiB table is L1-resident; only inline-asm transliteration
+remains, highest-risk).
+
+**SUPERVISOR GATE — FORK NOT ESCALATED.** Advisor disproof: the fork is mis-framed as engine-bound —
+the engine is only ~63% of the gap (36ms); the C2 non-engine residual (ocl_cf 0.945×→rg = 21ms) is
+present EVEN with real ISA-L FFI ⇒ NOT an engine problem; it's scheduling/marker-region/bootstrap =
+faithful-port territory, LOWER-risk, helps BOTH goals, with a located lever
+(project_confirmed_offset_prefetch_gap, ~40% of T8 wall). Escalate inline-asm ONLY when the residual is
+provably engine-only (ocl_cf within noise of rg). NEXT (fresh arc, pre-register falsifier): attack C2
+via parity.sh matched comparator, bounded by removal-oracle; bring a turbo-freq confirmation of the
+36/21 split to the eventual escalation. NO production fix landed (measurements + byte-transparent
+tooling/doc fixes only). Verdicts: plans/clean-rate-ceiling-advisor-verdict{,-recheck}.md,
+plans/plateau-fork-advisor-verdict.md. Briefs: plans/clean-rate-ceiling-brief.md,
+plans/fold-drain-split-result.md, plans/plateau-fork-brief.md. NO orphan processes.
+
 ## PAGE-WARMTH CLEAN ORACLE RAN → MARKER-segment warmth sub-lever REFUTED (−12% fault ceiling); CLASS not refuted; TRIAGE to engine. Advisor disproof ×3 [2026-06-07, OWNER turn, branch reimplement-isa-l, HEAD f80294ae]
 Attacked the page-warmth root the prior turn named. Source-verified rg's in-place narrowing + perf-localized gzippy's fault sites + ran the rule-#3 fault-removal oracles + advisor ×3.
 

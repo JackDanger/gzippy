@@ -49,7 +49,10 @@ cd "$GUEST_SRC" || fail "no-guest-src:$GUEST_SRC" 5
 SCRUBBED=""
 for v in $(env | sed -n 's/^\(GZIPPY_[A-Z_0-9]*\)=.*/\1/p'); do
   case "$v" in
-    GZIPPY_FORCE_PARALLEL_SM|GZIPPY_DEBUG) ;;   # the only two we set ourselves
+    # The two runtime knobs we set ourselves, PLUS GZIPPY_BIN — the parity.sh
+    # CONFIG path (where the binary lives), NOT a gzippy runtime knob. Scrubbing it
+    # would unset the variable the runner itself dereferences (set -u abort).
+    GZIPPY_FORCE_PARALLEL_SM|GZIPPY_DEBUG|GZIPPY_BIN) ;;
     *) SCRUBBED="$SCRUBBED $v=${!v}"; unset "$v";;
   esac
 done
@@ -74,7 +77,7 @@ FPRINT="$GZIPPY_BIN.inputs.sha"
 input_fingerprint() {
   # Deterministic: sorted file list, sha each, sha the digest stream. Quiet on
   # missing optional dirs.
-  { find src build.rs Cargo.toml Cargo.lock vendor benches -type f 2>/dev/null \
+  { find src crates examples build.rs Cargo.toml Cargo.lock vendor benches -type f 2>/dev/null \
       | LC_ALL=C sort | xargs sha256sum 2>/dev/null; } | sha256sum | cut -d' ' -f1
 }
 
