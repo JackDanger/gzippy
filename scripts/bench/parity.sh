@@ -28,6 +28,9 @@
 #   -N M         best-of-N trials (default 11; warmup iter0 is dropped).
 #   --fulcrum    additionally capture a window-absent trace and print the analyze cmd.
 #   --no-sync    skip the rsync (build/measure the tree already on the guest).
+#   --host-frozen  acknowledge the host is frozen when sysfs governor/no_turbo can't
+#                  be read back (e.g. an LXC guest); without it a thawed/NA readback
+#                  is a HARD FAIL (a thawed-host number is contaminated).
 #   --dry-run    print the plan + the exact remote commands, run nothing.
 set -euo pipefail
 
@@ -36,9 +39,10 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=/dev/null
 . "$HERE/guest.env"
 
-usage() { sed -n '2,33p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,34p' "${BASH_SOURCE[0]}"; }
 
 DO_BUILD=0; DO_FULCRUM=0; DO_SYNC=1; DRY=0
+HOST_FROZEN="${HOST_FROZEN:-0}"
 FEATURE="${DEFAULT_FEATURE:-gzippy-native}"
 T=8; N=11
 while [ "$#" -gt 0 ]; do
@@ -53,6 +57,7 @@ while [ "$#" -gt 0 ]; do
     -N*) N="${1#-N}";;
     --fulcrum|--decompose) DO_FULCRUM=1;;
     --no-sync) DO_SYNC=0;;
+    --host-frozen) HOST_FROZEN=1;;
     --dry-run) DRY=1;;
     *) echo "parity.sh: unknown arg '$1'" >&2; usage; exit 2;;
   esac
@@ -87,7 +92,7 @@ remote_env() {
 GUEST_SRC='$GUEST_SRC' GZIPPY_BIN='$GZIPPY_BIN' CORPUS='$CORPUS' \
 CORPUS_RAW_SHA256='$CORPUS_RAW_SHA256' CORPUS_GZ_SHA256='${CORPUS_GZ_SHA256:-}' \
 RG='$RG' RG_TRACE='$RG_TRACE' FEATURE='$FEATURE' T='$T' N='$N' MASK='$MASK' \
-GOV='$GOV' NO_TURBO='$NO_TURBO' RUSTFLAGS_PIN='$RUSTFLAGS_PIN' \
+GOV='$GOV' NO_TURBO='$NO_TURBO' HOST_FROZEN='$HOST_FROZEN' RUSTFLAGS_PIN='$RUSTFLAGS_PIN' \
 DO_BUILD='$DO_BUILD' DO_FULCRUM='$DO_FULCRUM' ARTDIR='${ARTDIR_BASE}/parity'
 EOF
 }

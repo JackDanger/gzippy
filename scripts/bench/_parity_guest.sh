@@ -37,16 +37,31 @@ NO_TURBO="${NO_TURBO:-1}"
 mkdir -p "$ARTDIR"
 cd "$GUEST_SRC" || fail "no-guest-src:$GUEST_SRC" 5
 
-# ---- 1. CONTAMINATION GUARD: refuse any leaked seeding / oracle env ----------
-# These would route off the production (window-absent marker bootstrap) path.
-for bad in GZIPPY_SEED_WINDOWS GZIPPY_SEED_WINDOWS_CAPTURE GZIPPY_SEED_NO_WINDOWS \
-           GZIPPY_SEED_NO_BOUNDARIES GZIPPY_ISAL_ENGINE_ORACLE \
-           GZIPPY_CLEAN_WINDOW_ORACLE GZIPPY_BYPASS_DECODE GZIPPY_BYPASS_CAPTURE \
-           GZIPPY_SLEEP_DECODE_NS GZIPPY_SLOW_MODE; do
-  if [ -n "${!bad:-}" ]; then
-    fail "contaminated-env:$bad=${!bad} (not production — would mask the binder)" 2
-  fi
+# ---- 1. CONTAMINATION GUARD: ALLOWLIST scrub of GZIPPY_* env ------------------
+# A denylist of known seeding/oracle vars can be defeated by a renamed/new oracle
+# or anything inherited via the shell profile / ssh SendEnv-AcceptEnv. So we
+# ALLOWLIST: any GZIPPY_* the operator did not explicitly intend is UNSET before
+# we measure. Only GZIPPY_FORCE_PARALLEL_SM and GZIPPY_DEBUG (set per-command
+# below) survive into the measured process. This makes a seeded/binder-masked run
+# structurally impossible, not merely deny-checked. We still LOG what we scrub so
+# a leaked var is visible, then we report any seeding/oracle leak as a hard fail
+# (it should never have been in the environment of a production parity run).
+SCRUBBED=""
+for v in $(env | sed -n 's/^\(GZIPPY_[A-Z_0-9]*\)=.*/\1/p'); do
+  case "$v" in
+    GZIPPY_FORCE_PARALLEL_SM|GZIPPY_DEBUG) ;;   # the only two we set ourselves
+    *) SCRUBBED="$SCRUBBED $v=${!v}"; unset "$v";;
+  esac
 done
+if [ -n "$SCRUBBED" ]; then
+  echo "## SCRUBBED non-production GZIPPY_* env before measuring:$SCRUBBED"
+  # If any scrubbed var is a known binder-masker, refuse outright: its mere
+  # presence means this invocation was set up as an oracle, not production.
+  case "$SCRUBBED" in
+    *GZIPPY_SEED*|*GZIPPY_*ORACLE*|*GZIPPY_BYPASS*|*GZIPPY_SLEEP_DECODE*|*GZIPPY_SLOW*)
+      fail "contaminated-env (seeding/oracle var present:$SCRUBBED — not a production parity run)" 2;;
+  esac
+fi
 
 # ---- 2. build (under cargo-lock) --------------------------------------------
 CARGO_LOCK="${CARGO_LOCK:-scripts/cargo-lock.sh}"
@@ -67,6 +82,18 @@ if [ "$DO_BUILD" = 1 ]; then
 fi
 [ -x "$GZIPPY_BIN" ] || fail "no-binary:$GZIPPY_BIN (run with --build)" 5
 
+# ---- 2b. STALE-BINARY guard (only matters when we did NOT just build) --------
+# Without --build we measure whatever binary is sitting at $GZIPPY_BIN. Guard
+# against measuring a binary OLDER than the synced sources: if any tracked source
+# is newer than the binary, the binary is stale — abort rather than print a number
+# for the wrong build. (When DO_BUILD=1 the binary is by construction the freshest.)
+if [ "$DO_BUILD" != 1 ]; then
+  NEWER="$(find src build.rs Cargo.toml Cargo.lock -type f -newer "$GZIPPY_BIN" -print 2>/dev/null | head -1)"
+  if [ -n "$NEWER" ]; then
+    fail "stale-binary:$GZIPPY_BIN is OLDER than source ($NEWER) — re-run with --build (measuring the wrong build)" 6
+  fi
+fi
+
 # ---- 3. corpus + correctness oracle -----------------------------------------
 [ -f "$CORPUS" ] || fail "no-corpus:$CORPUS" 7
 REF_SHA="$(gzip -dc "$CORPUS" | sha256sum | cut -d' ' -f1)"
@@ -82,11 +109,29 @@ case "$DBG" in
   *) fail "routing not ParallelSM: ${DBG:-<no path= line>}" 9;;
 esac
 
-# ---- 5. host-lock READBACK (warn, don't change — Rule 6 frozen host) ---------
+# ---- 5. host-lock READBACK (ABORT on thaw — Rule 6 frozen host) --------------
+# A thawed host must NOT silently print a number. Mismatch (or an NA readback on an
+# LXC where the sysfs is hidden) is a HARD FAIL unless the operator explicitly
+# acknowledges with HOST_FROZEN=1 (e.g. the host-lock harness on the jump host
+# froze the box but the guest cannot read it back). With HOST_FROZEN=1 we still
+# print what we read so the acknowledgement is auditable. We do NOT change the
+# governor here (that is a privileged write owned by the host-lock harness).
+HOST_FROZEN="${HOST_FROZEN:-0}"
 ACT_GOV="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo NA)"
 ACT_TURBO="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo NA)"
-[ "$ACT_GOV" = "$GOV" ] || echo "## WARN: governor=$ACT_GOV (expected $GOV) — host not frozen; absolutes are noise."
-[ "$ACT_TURBO" = "$NO_TURBO" ] || echo "## WARN: no_turbo=$ACT_TURBO (expected $NO_TURBO) — turbo not pinned; spin/sleep delta suspect."
+# Read back effective affinity too (offline cores would already sha-miss, but an
+# unhonored mask is worth surfacing).
+ACT_AFFIN="$(taskset -pc $$ 2>/dev/null | sed 's/.*: //' || echo NA)"
+host_thawed=0
+[ "$ACT_GOV" = "$GOV" ] || host_thawed=1
+[ "$ACT_TURBO" = "$NO_TURBO" ] || host_thawed=1
+if [ "$host_thawed" = 1 ]; then
+  if [ "$HOST_FROZEN" = 1 ]; then
+    echo "## WARN: host readback governor=$ACT_GOV no_turbo=$ACT_TURBO (expected $GOV/$NO_TURBO) but HOST_FROZEN=1 acknowledged — proceeding."
+  else
+    fail "host-not-frozen governor=$ACT_GOV no_turbo=$ACT_TURBO (expected $GOV/$NO_TURBO). Freeze the box, or pass HOST_FROZEN=1 to acknowledge (e.g. LXC sysfs hidden). A thawed-host number is contaminated." 13
+  fi
+fi
 
 # rapidgzip presence (the comparison target).
 RG_CMD=""
@@ -94,13 +139,18 @@ if command -v "$RG" >/dev/null 2>&1; then RG_CMD="$RG"
 elif [ -n "$RG_TRACE" ] && [ -x "$RG_TRACE" ]; then RG_CMD="$RG_TRACE"
 else fail "no-rapidgzip (not in PATH and RG_TRACE absent) — cannot measure parity" 12; fi
 
-GZIPPY_SHA="$(git rev-parse HEAD 2>/dev/null || echo NA)"
+# NOTE: parity.sh rsyncs with --exclude '.git/', so a guest-side `git rev-parse`
+# would read a STALE clone hash, not the synced working tree — it does NOT describe
+# the measured bytes. We therefore report the BINARY's mtime+sha as the load-bearing
+# provenance, and label the git line as unreliable.
+GIT_HEAD="$(git rev-parse --short HEAD 2>/dev/null || echo NA)"
+BIN_SHA="$(sha256sum "$GZIPPY_BIN" | cut -c1-16)"
 echo "================ PARITY PROVENANCE ================"
-echo "guest_src=$GUEST_SRC head=$GZIPPY_SHA feature=$FEATURE T=$T N=$N mask=$MASK"
-echo "binary=$GZIPPY_BIN mtime=$(date -r "$GZIPPY_BIN" '+%F %T' 2>/dev/null || echo NA)"
+echo "guest_src=$GUEST_SRC git_head=$GIT_HEAD(UNRELIABLE: .git excluded from sync) feature=$FEATURE T=$T N=$N mask=$MASK"
+echo "binary=$GZIPPY_BIN bin_sha=$BIN_SHA mtime=$(date -r "$GZIPPY_BIN" '+%F %T' 2>/dev/null || echo NA)  <- the load-bearing build identity"
 echo "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 echo "rapidgzip=$("$RG_CMD" --version 2>&1 | head -1)"
-echo "governor=$ACT_GOV no_turbo=$ACT_TURBO"
+echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN host_frozen=$HOST_FROZEN"
 echo "=================================================="
 
 # ---- 6. interleaved best-of-N, REGULAR-FILE sink, sha-verify EVERY run -------
@@ -109,6 +159,19 @@ echo "=================================================="
 # wrapper exists to kill.
 SINK_GZ="$ARTDIR/sink_gzippy.bin"
 SINK_RG="$ARTDIR/sink_rapidgzip.bin"
+
+# Defend the sink path: remove any pre-existing node (a planted FIFO/symlink from a
+# prior or hostile run would otherwise survive into the first iterations), then
+# assert each sink is a plain regular file — never a symlink or FIFO. A FIFO with a
+# draining reader is exactly the writev phantom this wrapper exists to prevent.
+assert_regular_sink() { # <path>
+  local p="$1"
+  rm -f "$p" 2>/dev/null || true
+  : > "$p" || fail "cannot-create-sink:$p" 14
+  [ -f "$p" ] && [ ! -L "$p" ] && [ ! -p "$p" ] || fail "sink-not-regular-file:$p (symlink/FIFO — pipe-phantom risk)" 14
+}
+assert_regular_sink "$SINK_GZ"
+assert_regular_sink "$SINK_RG"
 
 timed() { # <sink> <cmd...> -> echoes "secs sha"
   local sink="$1"; shift
