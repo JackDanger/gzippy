@@ -267,7 +267,41 @@ pub fn drive<W: std::io::Write>(
     parallelization: usize,
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
-    drive_impl(input, writer, out_fd, parallelization, configuration, None)
+    drive_impl(
+        input,
+        writer,
+        out_fd,
+        parallelization,
+        configuration,
+        None,
+        None,
+    )
+}
+
+/// Like [`drive`] but also reports how many output bytes were written to the
+/// sink — even when the decode fails. The multi-member driver
+/// ([`crate::decompress::parallel::sm_driver::read_parallel_sm_multi`]) uses
+/// the byte count to RESUME the remaining members past the prefix already
+/// streamed, so a misrouted multi-member stream (second member past the 16 MiB
+/// detection window) decodes in full instead of erroring/truncating.
+#[cfg(parallel_sm)]
+pub fn drive_capturing<W: std::io::Write>(
+    input: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    parallelization: usize,
+    configuration: ChunkConfiguration,
+    bytes_written_out: &mut usize,
+) -> Result<(u32, usize), FetchError> {
+    drive_impl(
+        input,
+        writer,
+        out_fd,
+        parallelization,
+        configuration,
+        None,
+        Some(bytes_written_out),
+    )
 }
 
 /// Clean-window oracle (advisor 2026-05-29): the cheapest experiment that
@@ -303,6 +337,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
         parallelization,
         configuration,
         Some(seed.clone()),
+        None,
     )?;
 
     let _ = &seed; // (pass-1 window keys are NOT trusted for boundaries; see below)
@@ -453,6 +488,14 @@ fn drive_impl<W: std::io::Write>(
     parallelization: usize,
     configuration: ChunkConfiguration,
     seed_window_map: Option<WindowMap>,
+    // Multi-member trailing-member support: when `Some`, the count of output
+    // bytes already written to the sink is stored here even on the ERROR path.
+    // A misrouted multi-member stream (member 2 past the 16 MiB detection
+    // window) makes the single-stream finder error near the member boundary;
+    // the driver uses this count to resume the remaining members past the
+    // bytes already streamed, instead of silently truncating. `None` for every
+    // existing caller (zero behavior change).
+    mut bytes_written_out: Option<&mut usize>,
 ) -> Result<(u32, usize), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin_with(
         "drive",
@@ -697,6 +740,13 @@ fn drive_impl<W: std::io::Write>(
             drive_t0.elapsed().as_secs_f64()
         );
         crate::decompress::parallel::perfect_overlap::report_stats();
+    }
+    // Record bytes streamed so far for the multi-member resume path. The
+    // consumer writes chunks in order and only after they fully validate, so on
+    // a finder/decode error at a member boundary this count is exactly the
+    // contiguous, correct prefix already on the sink. Set on BOTH paths.
+    if let Some(out) = bytes_written_out.as_deref_mut() {
+        *out = total_size;
     }
     consumer_result?;
     // Surface any background-writer error as a terminal decode error (the
