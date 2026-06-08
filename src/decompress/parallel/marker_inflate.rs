@@ -1984,6 +1984,172 @@ impl Block {
         Ok(emitted)
     }
 
+    /// COPY-FREE-TO-FINAL (Stage 1) clean-phase decode into a CONTIGUOUS buffer.
+    ///
+    /// The faithful vendor `setInitialWindow` model: the post-flip clean
+    /// (`<false>`) DEFLATE body is decoded straight into one contiguous output
+    /// buffer (`chunk.data`'s reserved tail) with the 32 KiB predecessor window
+    /// installed as a DICTIONARY PREFIX at `base[0..window_len)` — so back-refs
+    /// of distance ≤ 32768 at the first clean byte resolve contiguously into that
+    /// prefix (DecodedData.hpp:278-289 + deflate.hpp:1778), with NO u8 ring and
+    /// NO ring→data drain memcpy. This is the byte-exact reference for the wired
+    /// path (Stage 2); for Stage 1 it is exercised by the ring-vs-contiguous
+    /// differential test (`contig_clean_matches_ring_clean_on_*`) to retire the
+    /// addressing-retarget + contiguous-back-ref correctness risk.
+    ///
+    /// Semantics mirror `read_internal_compressed_specialized::<false>`'s CAREFUL
+    /// loop exactly (the byte-exact reference; the VAR_V fast loop is a perf
+    /// optimization that is byte-identical to it). Self-contained — it does NOT
+    /// touch `self.output_ring`/`ring_pos`/`ring_drained`; it advances
+    /// `self.decoded_bytes` and `self.at_end_of_block` so the EOB/last-block
+    /// contract is unchanged, and tracks the contiguous write index in `*pos`.
+    ///
+    /// Caller contract (the Engine-C grow-between-calls discipline):
+    ///   * `base` valid for `[0, cap)`; `base[0..*pos)` already populated
+    ///     (window prefix + prior output of THIS chunk).
+    ///   * `*pos` is the logical write index (starts at `window_len` on the
+    ///     first call after the flip).
+    ///   * The buffer must NOT be reallocated while a returned `*pos` is live;
+    ///     grow + re-fetch `base`/`cap` only BETWEEN calls.
+    /// Caps writes at `cap - MAX_RUN_LENGTH - 8` so a single max-length back-ref
+    /// plus the 8-byte word-copy overshoot can never exceed `cap`.
+    ///
+    /// # Errors
+    /// Same `BlockError` set as the ring path (invalid code, exceeded window
+    /// range, EOF). On error `*pos`/`decoded_bytes` reflect the bytes written
+    /// before the failing symbol.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    pub fn decode_clean_into_contig(
+        &mut self,
+        bits: &mut Bits,
+        base: *mut u8,
+        cap: usize,
+        pos: &mut usize,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        debug_assert!(
+            !self.contains_marker_bytes,
+            "decode_clean_into_contig requires clean (window-primed) mode"
+        );
+        match self.compression_type {
+            CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                if !self.block_huffman_luts_ready {
+                    self.build_huffman_luts_for_block()?;
+                    self.block_huffman_luts_ready = true;
+                }
+            }
+            _ => return Err(BlockError::InvalidCompression),
+        }
+
+        const MAX_LIT_LEN_SYM: u32 = 512;
+        const MAX_RUN_LENGTH: usize = 258;
+        // Contiguous-buffer cap: leave room for one max back-ref + word overshoot.
+        let out_room = cap.saturating_sub(MAX_RUN_LENGTH + 8);
+        debug_assert!(*pos <= out_room, "decode_clean_into_contig: no spare");
+        let local_cap = n_max_to_decode.min(out_room.saturating_sub(*pos));
+
+        let mut emitted: usize = 0;
+
+        macro_rules! commit {
+            ($result:expr) => {{
+                self.decoded_bytes += emitted;
+                return $result;
+            }};
+        }
+
+        while emitted < local_cap {
+            bits.refill();
+            let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
+            if bit_count == 0 {
+                commit!(Err(BlockError::InvalidHuffmanCode));
+            }
+            bits.consume(bit_count);
+            let mut sym = symbol;
+            let mut sym_count = sym_count;
+
+            loop {
+                let code = (sym & 0xFFFF) as u16;
+                if code <= 255 || sym_count > 1 {
+                    // SAFETY: `*pos < out_room <= cap`; `base` valid for [0, cap).
+                    unsafe {
+                        base.add(*pos).write((code & 0xFF) as u8);
+                    }
+                    *pos += 1;
+                    emitted += 1;
+                    sym_count -= 1;
+                    if sym_count == 0 {
+                        break;
+                    }
+                    sym >>= 8;
+                    continue;
+                }
+                // sym_count == 1: EOB, length code, or out-of-range.
+                if code == END_OF_BLOCK_SYMBOL {
+                    self.at_end_of_block = true;
+                    commit!(Ok(emitted));
+                }
+                if (code as u32) > MAX_LIT_LEN_SYM {
+                    commit!(Err(BlockError::InvalidHuffmanCode));
+                }
+                let length = (code as usize).wrapping_sub(254);
+                if length == 0 {
+                    break;
+                }
+                let dsym = match self.dist_hc.decode(bits) {
+                    Some(d) => d,
+                    None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                };
+                if dsym as usize >= DISTANCE_BASE.len() {
+                    commit!(Err(BlockError::InvalidHuffmanCode));
+                }
+                let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                let distance = if extra > 0 {
+                    if bits.available() < extra {
+                        bits.refill();
+                        if bits.available() < extra {
+                            commit!(Err(BlockError::EndOfFile));
+                        }
+                    }
+                    let mask = (1u64 << extra) - 1;
+                    let v = (bits.peek() & mask) as usize;
+                    bits.consume(extra);
+                    DISTANCE_BASE[dsym as usize] as usize + v
+                } else {
+                    DISTANCE_BASE[dsym as usize] as usize
+                };
+                if distance == 0 || distance > MAX_WINDOW_SIZE {
+                    commit!(Err(BlockError::ExceededWindowRange));
+                }
+                // Clean-mode range check — mirror of vendor deflate.hpp:1652-1655.
+                // The window prefix occupies `base[0..window_len)`, so a distance
+                // reaching into it is valid iff `distance <= *pos` (the contiguous
+                // index). `self.decoded_bytes + emitted` equals `*pos - window_len`
+                // by construction; the prefix adds the extra `window_len` reach,
+                // which is exactly what `distance <= *pos` permits.
+                if distance > *pos {
+                    commit!(Err(BlockError::ExceededWindowRange));
+                }
+                // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
+                // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
+                unsafe {
+                    emit_backref_contig(base, pos, distance, length);
+                }
+                self.record_backreference_for_sparsity(distance, length, emitted);
+                emitted += length;
+                break;
+            }
+        }
+        self.decoded_bytes += emitted;
+        Ok(emitted)
+    }
+
     /// BENCH-ONLY clean-mode sibling of
     /// `read_internal_compressed_specialized::<false>` with the round-2
     /// inner-Huffman techniques layered in behind const-generic flags so the
@@ -3038,6 +3204,86 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     }
 }
 
+/// CONTIGUOUS (non-wrapping) clean-mode back-ref copy — the copy-free-to-final
+/// (Stage 1) sibling of [`emit_backref_ring_u8`]. The output is a single
+/// CONTIGUOUS buffer (`chunk.data`'s reserved tail with the 32 KiB predecessor
+/// window prepended at `[0, window_len)`), so positions NEVER wrap: `*pos` is a
+/// plain index into `base`, `src = base + (*pos - distance)`, `dst = base +
+/// *pos`. This is the vendor `setInitialWindow` model — clean bulk decoded
+/// straight into one contiguous buffer (DecodedData.hpp:278-289), window
+/// installed as a dictionary prefix (deflate.hpp:1778). Eliminating the ring's
+/// `% U8_RING_SIZE` modulus collapses `emit_backref_ring_u8`'s three wrap-aware
+/// arms (src/dst round-fit + wrap-straddle fallback) to: non-overlap word copy,
+/// `distance == 1` RLE fill, general overlap sequential — fewer branches, half
+/// the index arithmetic (the secondary win on top of the dropped drain memcpy).
+///
+/// The caller GUARANTEES, before each call, that `*pos + length + 7 <= cap`
+/// (the per-`read()` cap to contiguous spare, the Engine-C contract: never grow
+/// mid-block, only between calls). So the ≤7-byte word-copy overshoot is always
+/// in-bounds. Back-refs of `distance <= 32768` at the first clean byte
+/// (`*pos == window_len`) resolve into the prepended window prefix; the caller
+/// enforces `distance <= *pos` (== vendor's `distance <= decodedBytes`,
+/// deflate.hpp:1652-1655) so `*pos - distance` never underflows.
+///
+/// SAFETY: `base` must be valid for `[0, cap)`; `*pos < cap`; `distance <= *pos`;
+/// `*pos + ((length + 7) & !7) <= cap`. `*pos` is the logical write index.
+#[cfg(any(
+    all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ),
+    pure_inflate_decode
+))]
+#[inline]
+pub(crate) unsafe fn emit_backref_contig(
+    base: *mut u8,
+    pos: &mut usize,
+    distance: usize,
+    length: usize,
+) {
+    let dst = base.add(*pos);
+    let src = base.add(*pos - distance);
+    if distance >= length {
+        // Non-overlap. 8-byte unaligned word copy; run rounded up to 8. The
+        // ≤7-byte overshoot is ahead of the advanced `*pos`, never sourced by a
+        // later back-ref, and overwritten — invisible. Caller guarantees the
+        // rounded run fits `cap`. The `distance >= 8` guard keeps the 8-byte
+        // stride non-aliasing (same invariant as the ring path).
+        if distance >= 8 {
+            let rounded = (length + 7) & !7;
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            if length > 8 {
+                let mut s = src.add(8);
+                let mut d = dst.add(8);
+                let dend = dst.add(rounded);
+                while d < dend {
+                    (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                    s = s.add(8);
+                    d = d.add(8);
+                }
+            }
+        } else {
+            // distance < 8 (would alias the word stride): exact byte copy.
+            for i in 0..length {
+                dst.add(i).write(*src.add(i));
+            }
+        }
+        *pos += length;
+    } else if distance == 1 {
+        // RLE memset (deflate.hpp:1393-1398).
+        let v = *src;
+        std::slice::from_raw_parts_mut(dst, length).fill(v);
+        *pos += length;
+    } else {
+        // General overlap (1 < distance < length): sequential per-byte copy.
+        for i in 0..length {
+            dst.add(i).write(*src.add(i));
+        }
+        *pos += length;
+    }
+}
+
 /// PRODUCTION post-flip clean-mode back-ref copy — **u8-direct** into the u8
 /// view of `output_ring` (vendor `getWindow()` reinterpret, deflate.hpp:893).
 /// Faithful port of `readInternal<false>`'s back-ref (deflate.hpp:1367-1399)
@@ -3589,6 +3835,213 @@ mod tests {
                 .collect();
             assert_eq!(resolved, *payload);
         }
+    }
+
+    // ── Copy-free-to-final (Stage 1) ring-vs-contiguous differential ──
+    //
+    // Decode the SAME window-seeded clean (`<false>`) DEFLATE body two ways and
+    // assert byte-equal output:
+    //   * RING path: `set_initial_window` + `read()` into a `Vec<u16>` (the
+    //     production FOLD clean engine — back-refs resolve in `output_ring`,
+    //     output drained to the Vec).
+    //   * CONTIG path: `decode_clean_into_contig` — window prepended into a
+    //     contiguous buffer at `[0, window_len)`, clean body decoded straight
+    //     into the tail, back-refs resolving from that contiguous buffer (the
+    //     vendor `setInitialWindow` model the wired Stage-2 path will use).
+    // This retires the addressing-retarget + contiguous-back-ref correctness
+    // risk independently of wiring (the advisor-required differential).
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    fn deflate_with_dictionary(payload: &[u8], dict: &[u8]) -> Vec<u8> {
+        // Raw DEFLATE with a preset dictionary, so the encoder emits back-refs
+        // reaching into the dictionary window (distance up to dict.len()).
+        use flate2::{Compress, Compression, FlushCompress};
+        let mut c = Compress::new(Compression::default(), false);
+        c.set_dictionary(dict).expect("set_dictionary");
+        let mut out = vec![0u8; payload.len() + 1024];
+        let status = c
+            .compress(payload, &mut out, FlushCompress::Finish)
+            .expect("compress");
+        assert_eq!(status, flate2::Status::StreamEnd, "deflate did not finish");
+        let n = c.total_out() as usize;
+        out.truncate(n);
+        out
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    fn decode_ring_clean(deflate_bytes: &[u8], window: &[u8], n_max: usize) -> Vec<u8> {
+        let boxed: &'static [u8] = Box::leak(deflate_bytes.to_vec().into_boxed_slice());
+        let mut bits = Bits::new(boxed);
+        let mut b = Block::new();
+        let mut output: Vec<u16> = Vec::new();
+        b.set_initial_window(&mut output, window).unwrap();
+        b.read_header(&mut bits, false).unwrap();
+        // Loop read() until end-of-block (resumable cap may split the body).
+        while !b.eob() {
+            let n = b.read(&mut bits, &mut output, n_max).unwrap();
+            if n == 0 && !b.eob() {
+                panic!("ring decode stalled before EOB");
+            }
+        }
+        output
+            .iter()
+            .map(|&v| {
+                assert!(v < 256, "window-seeded clean decode must not emit markers");
+                v as u8
+            })
+            .collect()
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    fn decode_contig_clean(
+        deflate_bytes: &[u8],
+        window: &[u8],
+        cap: usize,
+        per_call: usize,
+    ) -> Vec<u8> {
+        let boxed: &'static [u8] = Box::leak(deflate_bytes.to_vec().into_boxed_slice());
+        let mut bits = Bits::new(boxed);
+        let mut b = Block::new();
+        // Prime clean (window-primed) mode WITHOUT touching the ring: the contig
+        // path owns its output. Mirror set_initial_window's clean-mode state.
+        let mut sink: Vec<u16> = Vec::new();
+        b.set_initial_window(&mut sink, window).unwrap();
+        // Contiguous buffer: [window prefix][clean tail].
+        let mut buf = vec![0u8; cap];
+        buf[..window.len()].copy_from_slice(window);
+        let base = buf.as_mut_ptr();
+        let mut pos = window.len();
+        b.read_header(&mut bits, false).unwrap();
+        while !b.eob() {
+            let before = pos;
+            let n = b
+                .decode_clean_into_contig(&mut bits, base, cap, &mut pos, per_call)
+                .unwrap();
+            assert_eq!(n, pos - before, "contig: emitted != pos delta");
+            if n == 0 && !b.eob() {
+                panic!("contig decode stalled before EOB (cap too small?)");
+            }
+        }
+        buf[window.len()..pos].to_vec()
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[test]
+    fn contig_clean_matches_ring_clean_backref_into_window() {
+        // A window whose tail the payload references (back-refs into the prefix).
+        let window: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
+            .repeat(800) // ~36 KiB, clamped to 32 KiB by the dictionary path
+            .into_iter()
+            .collect();
+        let window = &window[window.len() - 32768..]; // exactly 32 KiB
+                                                      // Payload that repeats window content (forces back-refs into the dict)
+                                                      // plus fresh content (forces in-block back-refs + literals).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&window[..4096]); // copy of the window head
+        payload.extend_from_slice(&b"NEW DATA ".repeat(2000)); // fresh + RLE-ish
+        payload.extend_from_slice(&window[16384..16384 + 8192]); // mid-window ref
+
+        let deflate_bytes = deflate_with_dictionary(&payload, window);
+        let n_max = payload.len() + 16;
+        let cap = window.len() + payload.len() + 512;
+
+        let ring = decode_ring_clean(&deflate_bytes, window, n_max);
+        let contig = decode_contig_clean(&deflate_bytes, window, cap, n_max);
+
+        assert_eq!(ring.len(), payload.len(), "ring decoded wrong length");
+        assert_eq!(ring, payload, "ring decode != payload");
+        assert_eq!(
+            contig,
+            ring,
+            "CONTIG decode diverged from RING decode (len contig={}, ring={})",
+            contig.len(),
+            ring.len()
+        );
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[test]
+    fn contig_clean_matches_ring_clean_multi_call_resumable() {
+        // Force the resumable cap to split the body across MANY contig calls
+        // (per_call small) — exercises the grow-between-calls boundary without
+        // a regrow (cap is large enough; the per-call cap is the only split).
+        let window: Vec<u8> = (0u32..32768)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&window[..20000]); // long dict back-ref
+        payload.extend_from_slice(&b"abcdefghijklmnop".repeat(4000));
+        payload.extend_from_slice(&window[1000..1000 + 12000]);
+
+        let deflate_bytes = deflate_with_dictionary(&payload, &window);
+        let cap = window.len() + payload.len() + 512;
+        let ring = decode_ring_clean(&deflate_bytes, &window, payload.len() + 16);
+        // Small per-call cap (4 KiB) splits the body into ~10 calls.
+        let contig = decode_contig_clean(&deflate_bytes, &window, cap, 4096);
+        assert_eq!(ring, payload, "ring decode != payload");
+        assert_eq!(contig, ring, "multi-call contig decode diverged from ring");
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[test]
+    fn contig_clean_matches_ring_clean_rle_and_short_distance() {
+        // distance==1 RLE + short distances (<8) exercise emit_backref_contig's
+        // RLE-fill and exact-byte-copy arms.
+        let window: Vec<u8> = b"PREFIX-".repeat(4682).into_iter().collect(); // ~32 KiB
+        let window = &window[..32768.min(window.len())];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&b"X".repeat(5000)); // long distance==1 RLE
+        payload.extend_from_slice(b"abab"); // distance==2 overlap
+        payload.extend_from_slice(&b"ababab".repeat(500));
+        payload.extend_from_slice(&window[..1000]);
+
+        let deflate_bytes = deflate_with_dictionary(&payload, window);
+        let cap = window.len() + payload.len() + 512;
+        let ring = decode_ring_clean(&deflate_bytes, window, payload.len() + 16);
+        let contig = decode_contig_clean(&deflate_bytes, window, cap, payload.len() + 16);
+        assert_eq!(ring, payload, "ring decode != payload");
+        assert_eq!(contig, ring, "rle/short-distance contig decode diverged");
     }
 
     #[test]
