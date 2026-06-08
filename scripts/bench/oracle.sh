@@ -26,10 +26,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=/dev/null
 . "$HERE/guest.env"
+# shellcheck source=/dev/null
+. "$HERE/lib_hostlock.sh"
 
 usage() { sed -n '2,28p' "${BASH_SOURCE[0]}"; }
 
-KIND=""; DO_BUILD=0; DO_SYNC=1; DRY=0
+KIND=""; DO_BUILD=0; DO_SYNC=1; DRY=0; DO_LOCK=1
 HOST_FROZEN="${HOST_FROZEN:-0}"; ALLOW_LOAD="${ALLOW_LOAD:-0}"; MAX_LOADAVG="${MAX_LOADAVG:-2.0}"
 FEATURE="${DEFAULT_FEATURE:-gzippy-native}"
 T=8; N=9; SLOW_KNOB=""; SLOW_PCT=""
@@ -46,6 +48,8 @@ while [ "$#" -gt 0 ]; do
     --slow) SLOW_KNOB="${2%%=*}"; SLOW_PCT="${2#*=}"; shift;;
     --slow=*) v="${1#*=}"; SLOW_KNOB="${v%%=*}"; SLOW_PCT="${v#*=}";;
     --no-sync) DO_SYNC=0;;
+    --lock) DO_LOCK=1;;
+    --no-lock) DO_LOCK=0;;
     --host-frozen) HOST_FROZEN=1;;
     --allow-load) ALLOW_LOAD=1;;
     --max-loadavg) MAX_LOADAVG="$2"; shift;;
@@ -104,6 +108,15 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
+# Acquire the host freeze (pause Plex + noisy neighbors, verify quiet) BEFORE
+# build/measure; release ALWAYS via the lib_hostlock trap. With the freeze held
+# the guest sysfs readback is hidden, so acknowledge frozen automatically.
+if [ "$DO_LOCK" = 1 ]; then
+  if hostlock_acquire; then echo "## host is QUIET — proceeding.";
+  else echo "## WARN: host did not reach quiet — RATIO is jitter-immune, do NOT bank the ABSOLUTE oracle number."; fi
+  HOST_FROZEN=1
+fi
+
 # If a build is requested, reuse parity.sh's sync+build path (DRY would not build);
 # we run parity.sh --build --no-... only to sync+build, then run the oracle. To
 # keep this self-contained and avoid a double measure, we replicate the sync+build
@@ -119,6 +132,15 @@ if [ "$DO_SYNC" = 1 ]; then
     "$ROOT/src" "$ROOT/crates" "$ROOT/examples" "$ROOT/build.rs" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" \
     "$ROOT/benches" "$ROOT/scripts" "$ROOT/vendor" \
     "$GUEST_USER@$GUEST:$GUEST_SRC/"
+else
+  # --no-sync: the rsync did NOT carry the guest runner, so push the current
+  # _oracle_guest.sh + ensure-corpus.sh + guest.env explicitly (mirrors parity.sh)
+  # — otherwise a stale guest runner (e.g. the pre-quiet-gate version) runs.
+  echo "=== ship guest scripts to $GUEST_SRC/scripts/bench/ (--no-sync) ==="
+  timeout 60 $SSH_GUEST "mkdir -p '$GUEST_SRC/scripts/bench'"
+  timeout 60 scp -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -J "$JUMP" \
+    "$HERE/_oracle_guest.sh" "$HERE/ensure-corpus.sh" "$HERE/guest.env" \
+    "$GUEST_USER@$GUEST:$GUEST_SRC/scripts/bench/"
 fi
 
 if [ "$DO_BUILD" = 1 ]; then
@@ -142,3 +164,6 @@ echo "=== oracle run (kind=$KIND T=$T N=$N) ==="
 timeout 1200 $SSH_GUEST \
   "mkdir -p '$ARTDIR'; cd '$GUEST_SRC'; chmod +x scripts/bench/_oracle_guest.sh; \
    $remote_setup_cap $(remote_env) bash scripts/bench/_oracle_guest.sh"
+RC=$?
+hostlock_release
+exit "$RC"
