@@ -1,6 +1,55 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## OUTPUT IS THE T8 BINDER (fulcrum_total + validated writev-removal oracle) → faithful overlap-writer LANDED (byte-exact, +3.7-6% sign-stable, rule-7a KEEP) [2026-06-07, OWNER turn, branch reimplement-isa-l]
+## OUTPUT-BINDER RECONCILIATION (matched /dev/null comparator + rg output exposure measured) → PROMPT PREMISE REFUTED: there are TWO T8 binders, NOT one; output-overlap is NON-FAITHFUL + sub-parity; the unified root = PAGE WARMTH (gzippy faults 2× rg). Advisor disproof, vendor-source-verified [2026-06-07, OWNER turn, branch reimplement-isa-l, HEAD 20084c91]
+The prompt's headline ("removing gzippy's serial output writev ≈ ties rg ⇒ output is THE single T8 binder")
+was a Rule-6 MISPAIRING: it compared gzippy-output-REMOVED (0.131) vs rg-output-PRESENT (0.130). Ran the
+MATCHED comparator (BOTH tools output-neutralized to /dev/null) on the locked guest:
+
+NUMBERS (locked guest 10.30.0.199, taskset 0,2,4,6,8,10,12,14, gov=perf, interleaved best-of-N, silesia
+RAW=211968000, gzippy native sha 028bd002…cb410f OFF byte-exact vs rg; Battery 3 N=15, contention-paired):
+gz_file 0.1677 | gz_null 0.1324 | gz_skip(null) 0.1318 | gz_ovl(file) 0.1600 | rg_file 0.1305 | rg_null 0.1148.
+
+**RECONCILIATION (the owed split, rg's output exposure MEASURED):**
+- Output exposure (file−null): gzippy **35.3ms**, rapidgzip **15.7ms** ⇒ rg ALSO pays a serial output exposure.
+- Split of gzippy's 35.3ms: ~15.7ms = SHARED memory-bandwidth floor (rg pays it too, NOT a gzippy deficit);
+  ~19.6ms = gzippy-SPECIFIC excess.
+- **SECOND binder, survives output removal on BOTH sides: gz_null − rg_null = 17.6ms = engine+sched residual.**
+  ⇒ TWO binders (output-excess + engine residual), the prompt collapsed them into one.
+
+**ADVISOR DISPROOF (synchronous, plans/output-reconciliation-advisor-verdict.md), vendor-source-VERIFIED first-hand:**
+- C1 (matched gate ⇒ two binders) UPHELD-W-CAVEATS (two MASKS of one root, not two independent levers).
+- C2 (output-overlap ceiling 0.88×) REFUTED-AS-DERIVED: 0.88× is a construction, not measured; /dev/null's
+  write_null skips copy_from_user so file−null bundles the SOURCE READ ⇒ the "19.6ms output excess" is largely
+  the SAME cold-page tax in the 17.6ms residual — overlap (a timing change) CANNOT fix a cold-source copy. Only
+  the shipped overlap writer's measured 0.81× is real; beyond is bandwidth-bound/unknown.
+- C3 (rg 15.7ms = shared floor) UPHELD as a LOWER BOUND, REFUTED as "gzippy already pays it" (gzippy must EARN
+  it by fixing page warmth).
+- C4 (next lever = engine/page-warmth, not overlap) UPHELD (strongest claim), MECHANISM corrected.
+- **KILL-SHOTS (both verified against vendor THIS turn):** (1) the "u16→u8 second pass is gzippy's deficit" is
+  FALSE — rg runs the SAME applyWindow narrowing (DecodedData.hpp:164,306; MarkerVector=FasterVector<u16>);
+  and rg narrows IN PLACE reusing the u16 buffer's pages (DecodedData.hpp:344-388 reinterpret_cast + reusedDataBuffers),
+  gzippy decodes the clean tail into a SEPARATE chunk.data ⇒ extra allocation+faults. (2) The OVERLAP WRITER IS
+  NON-FAITHFUL — rg's writeFunctor is INLINE-SYNCHRONOUS in the consumer read() loop (ParallelGzipReader.hpp:621,
+  verified), NO background thread; gzippy's output_writer.rs OverlapWriter is a structural DIVERGENCE, rejectable
+  under the bias guardrails regardless of ceiling. It stays OFF-by-default (experiment knob), NOT promoted to production.
+
+**PERF EVIDENCE (root cause = page warmth):** perf stat on the CURRENT arena-wired binary —
+gzippy 110,301 page-faults / 894ms task-clock vs rg 58,211 / 622ms ⇒ gzippy faults ~1.9× rg DESPITE the rpmalloc
+arena already being wired (pure-rust-inflate→rpmalloc-caches→arena-allocator; U8/U16=Vec<_,RpmallocAlloc>). Faults
+stay ~110K under overlap-writer AND manual-pool (topology-invariant) ⇒ intrinsic to gzippy's per-chunk allocation
+FOOTPRINT (separate u16 ring + u8 contig data, cross-thread free), not pool topology. This is the unified root of
+BOTH binders.
+
+**SUPERVISOR GATE — reconciliation DONE + advisor-vetted; T8 is NOT at candidate-parity (matched 1.16×, two binders);
+the output-overlap lever is REFUTED as the path (non-faithful + sub-parity ceiling). NO production fix landed this
+turn (overlap writer already landed/gated last turn, KEPT OFF-default per 7a; not promoted). NEXT (faithful, gated,
+do NOT start without supervisor) = the PAGE-WARMTH root: faithful in-place u16→u8 narrowing reusing the marker
+buffer's pages (rg DecodedData.hpp:344-388) + cross-thread arena warmth, gated on the MATCHED gz_null-vs-rg_null
+comparator (NOT skip-vs-rg-file), pre-registered falsifier. Do NOT re-open the output-overlap fork.** GUEST:
+/tmp/gz-ft-src build (native, sha 028bd002…cb410f), drivers /tmp/_split_driver.sh + /tmp/measure_devnull.sh +
+/root/gzippy/scripts/measure.sh. rg 0.16.0. NO orphan processes.
+
+## SUPERSEDED — OUTPUT IS THE T8 BINDER (fulcrum_total + validated writev-removal oracle) → faithful overlap-writer LANDED (byte-exact, +3.7-6% sign-stable, rule-7a KEEP) [2026-06-07, OWNER turn, branch reimplement-isa-l]
 fulcrum_total on the production T8 trace (consumer = wall-critical thread, captured to a regular tmpfs
 file = measure.sh's sink; piping to sha256sum was a backpressure phantom that inflated writev 58→135ms):
 consumer split = 64-67% WAIT-on-workers, **32-34% OUTPUT (consumer.writev)**, 0.8% serial compute.
