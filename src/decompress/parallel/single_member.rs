@@ -334,6 +334,14 @@ mod tests {
         ));
     }
 
+    // Gated on `parallel_sm`: this asserts a SUCCESSFUL decode, which only
+    // the `parallel_sm` body of `decompress_parallel` can produce. In the
+    // default (`not(parallel_sm)`) build the function is a cfg-stub that
+    // returns `UnsupportedPlatform` by design (no pure-Rust engine compiled
+    // in), so an ungated test would fail on every default `cargo test` even
+    // though nothing is wrong. The correctness assertions (byte-exact output,
+    // ISIZE) are unchanged — they run in full wherever the engine exists.
+    #[cfg(parallel_sm)]
     #[test]
     fn single_thread_decodes_small_input() {
         // Pure-Rust-sole (task #8): the engine is the ONLY single-member

@@ -2806,8 +2806,19 @@ mod native_fold_parity {
 
     #[test]
     fn folded_native_decode_matches_ground_truth_on_real_silesia_chunks() {
-        let gz = std::fs::read("benchmark_data/silesia-gzip.tar.gz")
-            .expect("benchmark_data/silesia-gzip.tar.gz must exist");
+        // Real-corpus fixture, large (~67 MiB) and not committed — present on
+        // bench boxes / the owner tree but absent in a fresh worktree. Skip
+        // gracefully when missing (same convention as
+        // `three_oracle_silesia_if_available`) rather than hard-failing on a
+        // tree that simply hasn't fetched the corpus. When the fixture IS
+        // present every byte-exact ground-truth assertion below runs in full.
+        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("[fold-gate] benchmark_data/silesia-gzip.tar.gz not present, skipping");
+                return;
+            }
+        };
         let hdr =
             crate::decompress::parallel::single_member::skip_gzip_header(&gz).expect("gzip header");
         let input = &gz[hdr..gz.len() - 8];
