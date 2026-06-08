@@ -155,6 +155,125 @@ pub fn marker_spin_iters() -> u64 {
     (BASE_SPIN as f64 * f) as u64
 }
 
+// ── DECODE-COMPUTE vs STORE-BANDWIDTH LOCALIZATION KNOBS ────────────────────
+//
+// The whole-loop-body knob (`GZIPPY_SLOW_MODE`) proved the contig clean loop is
+// on the T8 critical path, but a per-loop-body inject CANNOT separate the
+// Huffman table-lookup + bit-extraction COMPUTE from the literal-store /
+// back-ref-copy STORE bandwidth (advisor verdict on contig-clean-perturbation).
+// These two SEPARATE knobs each perturb exactly one sub-resource so a causal
+// perturbation can tell WHICH one binds:
+//
+//   * `GZIPPY_SLOW_DECODE` — injects ONLY at Huffman decode events (after each
+//     `lut_litlen.decode()` and each `dist_hc.decode()`), perturbing the pure
+//     table-lookup + bit-extraction compute. If THIS moves the wall and STORE
+//     does NOT, decode-compute is the binder ⇒ BMI2 PEXT/BZHI / packed-u32 LUT.
+//   * `GZIPPY_SLOW_STORE` — injects ONLY at literal-store / back-ref-copy events,
+//     perturbing store/copy bandwidth. If THIS moves the wall and DECODE does
+//     not, the binder is store bandwidth (and the already-TIE'd packed
+//     multi-literal store is the relevant lever, exhausted).
+//
+// Unlike `GZIPPY_SLOW_MODE`, these knobs do NOT force the careful loop — the
+// production VAR_V fast loop stays gated on `slow_spin == 0` only — so the
+// perturbation lands on the PRODUCTION fast path (which handles ~69% of clean
+// decode events) as well as the careful tail. `GZIPPY_SLOW_KIND=sleep` selects
+// the same frequency-neutral control. Byte-transparent (DUAL-SHA gate): the
+// injected work touches only a black-boxed accumulator / a ns-debt cell.
+
+#[inline]
+fn slow_decode_factor() -> f64 {
+    static F: OnceLock<f64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_DECODE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|pct| pct / 100.0)
+            .unwrap_or(0.0)
+    })
+}
+
+#[inline]
+fn slow_store_factor() -> f64 {
+    static F: OnceLock<f64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_STORE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|pct| pct / 100.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Resolved per-decode-event spin count for the DECODE-COMPUTE knob
+/// (`GZIPPY_SLOW_DECODE`), or `0` when OFF. Snapshot once before the loop.
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the feature-gated decode loops
+pub fn decode_spin_iters() -> u64 {
+    let f = slow_decode_factor();
+    if f <= 0.0 {
+        return 0;
+    }
+    (BASE_SPIN as f64 * f) as u64
+}
+
+/// Resolved per-store-event spin count for the STORE-BANDWIDTH knob
+/// (`GZIPPY_SLOW_STORE`), or `0` when OFF. Snapshot once before the loop.
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the feature-gated decode loops
+pub fn store_spin_iters() -> u64 {
+    let f = slow_store_factor();
+    if f <= 0.0 {
+        return 0;
+    }
+    (BASE_SPIN as f64 * f) as u64
+}
+
+/// `true` when EITHER localization knob is active AND the sleep control kind is
+/// selected. Snapshot alongside the per-knob spin counts before the loop. Gated
+/// on a non-zero localization spin so a `GZIPPY_SLOW_KIND=sleep` set for the
+/// OLD whole-body knob does not leak into a localization measurement.
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the feature-gated decode loops
+pub fn localize_yield_kind(spin: u64) -> bool {
+    spin != 0 && sleep_kind()
+}
+
+/// Inject one event's worth of extra work for a LOCALIZATION knob (decode-only
+/// or store-only). Same mechanism as [`inject`] but WITHOUT the
+/// `GZIPPY_SLOW_HITS` site-validity counter (that counter belongs to the
+/// whole-body clean knob). `spin == 0` (OFF) returns immediately —
+/// byte-transparent, a single hoistable branch on the production path.
+#[inline(always)]
+#[allow(dead_code)] // instrument: only reached from the feature-gated decode loops
+pub fn inject_localize(spin: u64, yield_hint: bool) {
+    if spin == 0 {
+        return;
+    }
+    if yield_hint {
+        thread_local! {
+            static SLEEP_DEBT_NS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+        }
+        SLEEP_DEBT_NS.with(|debt| {
+            let owed = (spin as f64 * NS_PER_SPIN_ITER) as u64;
+            let total = debt.get() + owed;
+            if total >= SLEEP_BATCH_NS {
+                std::thread::sleep(std::time::Duration::from_nanos(total));
+                debt.set(0);
+            } else {
+                debt.set(total);
+            }
+        });
+    } else {
+        let mut acc: u64 = black_box(0);
+        for i in 0..spin {
+            acc = acc.wrapping_add(black_box(i).wrapping_mul(0x9E37_79B9));
+        }
+        black_box(acc);
+    }
+}
+
 /// `true` when the frequency-neutral CONTROL kind (`GZIPPY_SLOW_KIND=sleep`) is
 /// selected. Snapshot alongside [`spin_iters`] before the loop.
 ///
