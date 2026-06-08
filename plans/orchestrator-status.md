@@ -1,5 +1,38 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## CACHE-RESIDENCY LITERAL ARCHITECTURE — MET (the two SCOPED items closed, byte-exact, re-measured) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 8d4f20f7+]
+Completes the cache-residency clause's literal architecture from the prior turn's
+SCOPED list (plans/cache-residency-verdict.md §SCOPED). Full verdict:
+plans/cache-residency-architecture-met.md.
+- (1) DIST CACHE SHRUNK 128 KiB→8 KiB/thread (commit 8d4f20f7, byte-exact). Ported
+  vendor's bounded-LUT `HuffmanCodingShortBitsCached` (huffman/…ShortBitsCached.hpp)
+  for the production distance path: LUT_BITS_COUNT=12, Symbol=u8 ⇒ (u8,u8)*2^12 =
+  8 KiB (was [(u8,u16);1<<15] = 128 KiB, itself 2× the vendor 64 KiB Symbol=uint8_t
+  cache). decode_long fallback for >12-bit codes. New file
+  src/decompress/parallel/huffman_short_bits_cached.rs. PER-THREAD 278.8→158.8 KiB
+  (target ~150 → MET).
+- (2) SegmentedU8 DecodedData: BOTH levers of the original port (2b8bfae/442e93e2)
+  ALREADY in tree (data:SegmentedU8 + in-place narrowed_len). The only un-landed
+  piece — physical segment-list backing — was DELIBERATELY/FAITHFULLY superseded by
+  e8c03110 (contiguous DecodedData, DecodedData.hpp:278-289); re-landing it would
+  REGRESS the ContigFold copy-free tooth (decode_clean_into_contig's base+cap
+  write) the verdict forbids regressing AND diverge from vendor. REJECTED with
+  mechanism (charter rule #7b). Item closed: landed where compatible, rejected where
+  it conflicts.
+- (3) output_ring 128 KiB KEPT (faithful vendor m_window16 floor).
+RE-MEASURED (frozen guest REDACTED_IP, gzippy bin_sha e32829a8, sha==028bd002…):
+  RSS-vs-T +204.5% (was +216%); per-thread 158.8 KiB; MPKI LLC-miss 0.204 (was
+  0.205, < rapidgzip 0.367), L1d-miss 4.03 (was 4.55, < rg 5.89) — NO regress,
+  improved; ballast control linear 16.0/16.0/15.8 thr/MiB; WALL parity.sh
+  T8=0.899× TIE / T16=0.921× TIE (sha=OK) — NO wall regress. Dual-sha both builds:
+  gzippy-native + gzippy-isal (x86 via Rosetta) byte-exact @L1/L6/L9, path=ParallelSM.
+ADVISOR: claude -p (Opus) SPAWNED OK — synchronous disproof on dist-cache
+byte-exactness (5 attack vectors) → claim SURVIVES, no falsification (new≡base≡old;
+only error-timing on truncated streams differs, outside legal-stream scope).
+HARNESS CAVEAT: rss_vs_t.sh MPKI label prints `-nan` (awk divisor formatting bug
+with cpu_core/-prefixed counter under paranoid=4); RAW counters valid, MPKI
+computed from them. Follow-up: fix the awk label.
+
 ## CACHE-RESIDENCY MANDATE — MEASURED (the never-measured DECISIVE clause closed) [2026-06-08, OWNER turn, branch reimplement-isa-l]
 The instrument-dead admission at :1804-1815 is RESOLVED. mem_stats RE-HOOKED to the
 real native per-thread working set (`marker_inflate::Block`/`BOOTSTRAP_BLOCK`, via
