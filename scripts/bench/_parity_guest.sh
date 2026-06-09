@@ -25,6 +25,10 @@ fail() { echo "PARITY_FAIL=$1"; echo "PARITY_GUEST_DONE"; exit "${2:-1}"; }
 
 : "${GUEST_SRC:?}"; : "${GZIPPY_BIN:?}"; : "${CORPUS:?}"; : "${CORPUS_RAW_SHA256:?}"
 : "${FEATURE:?}"; : "${T:?}"; : "${N:?}"; : "${MASK:?}"
+# Optional second binary for three-way interleave (rg vs gz1 vs gz2).
+# When unset/empty, behavior is byte-identical to the two-way path.
+GZIPPY_BIN2="${GZIPPY_BIN2:-}"
+FEATURE2="${FEATURE2:-}"
 RG="${RG:-rapidgzip}"
 RG_TRACE="${RG_TRACE:-}"
 RUSTFLAGS_PIN="${RUSTFLAGS_PIN:--C target-cpu=native}"
@@ -49,10 +53,10 @@ cd "$GUEST_SRC" || fail "no-guest-src:$GUEST_SRC" 5
 SCRUBBED=""
 for v in $(env | sed -n 's/^\(GZIPPY_[A-Z_0-9]*\)=.*/\1/p'); do
   case "$v" in
-    # The two runtime knobs we set ourselves, PLUS GZIPPY_BIN — the parity.sh
-    # CONFIG path (where the binary lives), NOT a gzippy runtime knob. Scrubbing it
-    # would unset the variable the runner itself dereferences (set -u abort).
-    GZIPPY_FORCE_PARALLEL_SM|GZIPPY_DEBUG|GZIPPY_BIN) ;;
+    # The two runtime knobs we set ourselves, PLUS GZIPPY_BIN / GZIPPY_BIN2 — the
+    # parity.sh CONFIG paths (where the binaries live), NOT gzippy runtime knobs.
+    # Scrubbing them would unset variables the runner itself dereferences (set -u).
+    GZIPPY_FORCE_PARALLEL_SM|GZIPPY_DEBUG|GZIPPY_BIN|GZIPPY_BIN2) ;;
     *) SCRUBBED="$SCRUBBED $v=${!v}"; unset "$v";;
   esac
 done
@@ -118,6 +122,22 @@ if [ "$DO_BUILD" != 1 ]; then
   fi
 fi
 
+# ---- 2c. GZIPPY_BIN2 existence + stale-binary guard (only when BIN2 set) ----
+if [ -n "$GZIPPY_BIN2" ]; then
+  [ -x "$GZIPPY_BIN2" ] || fail "no-binary-2:$GZIPPY_BIN2 (not executable — ensure --bin2 points to a built binary)" 5
+  FPRINT2="$GZIPPY_BIN2.inputs.sha"
+  if [ "$DO_BUILD" != 1 ]; then
+    if [ ! -f "$FPRINT2" ]; then
+      fail "no-build-fingerprint-2:$FPRINT2 absent — cannot prove $GZIPPY_BIN2 matches the synced sources; create the stamp or re-run with --build" 6
+    fi
+    CUR_FP2="$(input_fingerprint)"
+    STAMP_FP2="$(cat "$FPRINT2" 2>/dev/null)"
+    if [ "$CUR_FP2" != "$STAMP_FP2" ]; then
+      fail "stale-binary-2:$GZIPPY_BIN2 built from different inputs (stamp=$STAMP_FP2 cur=$CUR_FP2) — re-run with --build" 6
+    fi
+  fi
+fi
+
 # ---- 3. corpus + correctness oracle -----------------------------------------
 [ -f "$CORPUS" ] || fail "no-corpus:$CORPUS" 7
 REF_SHA="$(gzip -dc "$CORPUS" | sha256sum | cut -d' ' -f1)"
@@ -140,6 +160,15 @@ case "$DBG" in
   *path=$EXPECT_PATH*) ;;
   *) fail "routing not $EXPECT_PATH (got: ${DBG:-<no path= line>})" 9;;
 esac
+
+# ---- 4b. production-path assertion for GZIPPY_BIN2 (only when set) ----------
+if [ -n "$GZIPPY_BIN2" ]; then
+  DBG2="$(GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 "$GZIPPY_BIN2" -d -c -p "$T" "$CORPUS" 2>&1 >/dev/null | grep -m1 'path=' || true)"
+  case "$DBG2" in
+    *path=$EXPECT_PATH*) ;;
+    *) fail "routing-2 not $EXPECT_PATH (got: ${DBG2:-<no path= line>})" 9;;
+  esac
+fi
 
 # ---- 5. host-lock READBACK (ABORT on thaw — Rule 6 frozen host) --------------
 # A thawed host must NOT silently print a number. Mismatch (or an NA readback on an
@@ -223,6 +252,10 @@ BIN_SHA="$(sha256sum "$GZIPPY_BIN" | cut -c1-16)"
 echo "================ PARITY PROVENANCE ================"
 echo "guest_src=$GUEST_SRC git_head=$GIT_HEAD(UNRELIABLE: .git excluded from sync) feature=$FEATURE T=$T N=$N mask=$MASK"
 echo "binary=$GZIPPY_BIN bin_sha=$BIN_SHA mtime=$(date -r "$GZIPPY_BIN" '+%F %T' 2>/dev/null || echo NA)  <- the load-bearing build identity"
+if [ -n "$GZIPPY_BIN2" ]; then
+  BIN2_SHA="$(sha256sum "$GZIPPY_BIN2" | cut -c1-16)"
+  echo "binary2=$GZIPPY_BIN2 feature2=$FEATURE2 bin2_sha=$BIN2_SHA mtime=$(date -r "$GZIPPY_BIN2" '+%F %T' 2>/dev/null || echo NA)  <- second binary identity"
+fi
 echo "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 echo "rapidgzip=$("$RG_CMD" --version 2>&1 | head -1)"
 echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN runnable_avg=${RUN_AVG:-NA} loadavg1=$LOAD1 host_frozen=$HOST_FROZEN"
@@ -234,6 +267,7 @@ echo "=================================================="
 # wrapper exists to kill.
 SINK_GZ="$ARTDIR/sink_gzippy.bin"
 SINK_RG="$ARTDIR/sink_rapidgzip.bin"
+SINK_GZ2=""   # populated below only when GZIPPY_BIN2 is set
 
 # Defend the sink path: remove any pre-existing node (a planted FIFO/symlink from a
 # prior or hostile run would otherwise survive into the first iterations), then
@@ -247,6 +281,10 @@ assert_regular_sink() { # <path>
 }
 assert_regular_sink "$SINK_GZ"
 assert_regular_sink "$SINK_RG"
+if [ -n "$GZIPPY_BIN2" ]; then
+  SINK_GZ2="$ARTDIR/sink_gz2.bin"
+  assert_regular_sink "$SINK_GZ2"
+fi
 
 timed() { # <sink> <cmd...> -> echoes "secs sha"
   local sink="$1"; shift
@@ -262,17 +300,23 @@ timed() { # <sink> <cmd...> -> echoes "secs sha"
   echo "$secs $sha"
 }
 
-GZT=""; RGT=""; DIVERGED=0
+GZT=""; GZ2T=""; RGT=""; DIVERGED=0
 echo "## interleave (N=$N, drop warmup iter0)"
 for ((i=0;i<=N;i++)); do
   read gsec gsha < <(timed "$SINK_GZ" env GZIPPY_FORCE_PARALLEL_SM=1 "$GZIPPY_BIN" -d -c -p "$T" "$CORPUS")
   read rsec rsha < <(timed "$SINK_RG" "$RG_CMD" -d -c -f -P "$T" "$CORPUS")
+  if [ -n "$GZIPPY_BIN2" ]; then
+    read g2sec g2sha < <(timed "$SINK_GZ2" env GZIPPY_FORCE_PARALLEL_SM=1 "$GZIPPY_BIN2" -d -c -p "$T" "$CORPUS")
+  fi
   if [ "$i" -eq 0 ]; then continue; fi
   GZT="$GZT $gsec"; RGT="$RGT $rsec"
+  if [ -n "$GZIPPY_BIN2" ]; then GZ2T="$GZ2T $g2sec"; fi
   if [ "$gsha" != "$REF_SHA" ]; then echo "!! SHA DIVERGENCE gzippy i=$i sha=$gsha"; DIVERGED=1; fi
   if [ "$rsha" != "$REF_SHA" ]; then echo "!! SHA DIVERGENCE rapidgzip i=$i sha=$rsha"; DIVERGED=1; fi
+  if [ -n "$GZIPPY_BIN2" ] && [ "$g2sha" != "$REF_SHA" ]; then echo "!! SHA DIVERGENCE gzippy2 i=$i sha=$g2sha"; DIVERGED=1; fi
 done
 rm -f "$SINK_GZ" "$SINK_RG"
+[ -n "$SINK_GZ2" ] && rm -f "$SINK_GZ2"
 
 # ABORT on any wrong bytes (Rule 4) — the number is VOID.
 if [ "$DIVERGED" -ne 0 ]; then
@@ -306,6 +350,28 @@ printf "gzippy=%sms  rg=%sms  ratio=%s  sha=OK  verdict=%s\n" \
   "$(awk -v t="$gmin" 'BEGIN{printf "%.0f", t*1000}')" \
   "$(awk -v t="$rmin" 'BEGIN{printf "%.0f", t*1000}')" \
   "$RATIO" "$VERDICT"
+
+# ---- three-way summary (only when BIN2 set) -----------------------------------
+if [ -n "$GZIPPY_BIN2" ]; then
+  read g2min g2med g2sp < <(stats "$GZ2T")
+  RATIO_RG_GZ2="$(awk -v g="$g2min" -v r="$rmin" 'BEGIN{printf "%.3f", (g>0)?r/g:0}')"
+  RATIO_GZ1_GZ2="$(awk -v g="$g2min" -v g1="$gmin" 'BEGIN{printf "%.3f", (g>0)?g1/g:0}')"
+  MARGIN2="$(awk -v a="$g2sp" -v b="$rsp" 'BEGIN{m=(a>b)?a:b; print m/100.0}')"
+  VERDICT2="$(awk -v x="$RATIO_RG_GZ2" -v m="$MARGIN2" 'BEGIN{d=x-1; if(d>m)print "WIN(gz2)"; else if(d<-m)print "LOSS"; else print "TIE"}')"
+  echo ""
+  echo "================ THREE-WAY SUMMARY (T=$T) ================"
+  printf "gz1 (%s)  min=%.4fs (%s MB/s) med=%.4f spread=%s%%\n" "$FEATURE"  "$gmin"  "$(mbps "$gmin")"  "$gmed"  "$gsp"
+  printf "gz2 (%s)  min=%.4fs (%s MB/s) med=%.4f spread=%s%%\n" "$FEATURE2" "$g2min" "$(mbps "$g2min")" "$g2med" "$g2sp"
+  printf "rg            min=%.4fs (%s MB/s) med=%.4f spread=%s%%\n" "$rmin" "$(mbps "$rmin")" "$rmed" "$rsp"
+  echo "RATIO rg/gz1=${RATIO}x  rg/gz2=${RATIO_RG_GZ2}x  gz1_wall/gz2_wall=${RATIO_GZ1_GZ2}x (>1 means gz2 faster)"
+  echo "verdict gz2-vs-rg: $VERDICT2"
+  printf "gz1=%sms  gz2=%sms  rg=%sms  ratio_rg_gz1=%s  ratio_rg_gz2=%s  ratio_gz1_gz2=%s  sha=OK\n" \
+    "$(awk -v t="$gmin"  'BEGIN{printf "%.0f", t*1000}')" \
+    "$(awk -v t="$g2min" 'BEGIN{printf "%.0f", t*1000}')" \
+    "$(awk -v t="$rmin"  'BEGIN{printf "%.0f", t*1000}')" \
+    "$RATIO" "$RATIO_RG_GZ2" "$RATIO_GZ1_GZ2"
+  echo "========================================================="
+fi
 
 # ---- 7. optional --fulcrum decompose ----------------------------------------
 if [ "$DO_FULCRUM" = 1 ]; then

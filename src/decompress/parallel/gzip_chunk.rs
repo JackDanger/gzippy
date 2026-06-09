@@ -137,6 +137,21 @@ pub static ISAL_ENGINE_ORACLE_CHUNKS: std::sync::atomic::AtomicU64 =
 /// the wall number is contaminated by pure-Rust decode and must be discarded.
 pub static ISAL_ENGINE_ORACLE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Chunks accepted via the BFINAL exact-landing fix: `until_exact=true`,
+/// no recorded EOB boundary at stop_hint_bits, but ISA-L's `end_bit` is
+/// within 1 bit of stop_hint_bits (delta 0 = ISA-L exact; delta 1 = the
+/// 1-bit coordinate discrepancy between ISA-L's chunk-decode context and
+/// the block_finder's canonical scan position — diagnosed on NASA Jul95
+/// start_bit=150999587, stop_hint=156360208, end_bit=156360207, 3–5/30 runs).
+pub static ISAL_BFINAL_EXACT_LANDING_ACCEPTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// `until_exact=true` fallbacks: no boundary within 1 bit of stop_hint AND
+/// end_bit is more than 1 bit away from stop_hint (genuine decline).
+pub static ISAL_UNTIL_EXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// `until_exact=false` fallbacks (no boundary at-or-past stop_hint AND end_bit > stop_hint).
+pub static ISAL_INEXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the clean-tail decode routes through REAL ISA-L FFI.
 ///
@@ -385,7 +400,51 @@ fn finish_decode_chunk_isal_oracle(
         }
         match found {
             Some(v) => v,
-            None => return Ok(false), // oracle can't honor exact stop ⇒ fall back
+            None => {
+                // BFINAL exact-landing: the member's final block ends with no
+                // recorded EOB boundary AT stop_hint_bits. Two sub-cases:
+                //
+                // (a) ISA-L exited via ISAL_BLOCK_FINISH before setting
+                //     stopped_at — no boundary recorded at all for this block.
+                //     `end_bit == stop_hint_bits` (same ISA-L coordinate system
+                //     used to derive stop_hint in tests/measurement).
+                //
+                // (b) Production: ISA-L DID record the BFINAL EOB boundary via
+                //     stopped_at, but at `stop_hint_bits - 1` instead of
+                //     `stop_hint_bits` (a 1-bit coordinate discrepancy between
+                //     ISA-L's chunk-decode context and the block_finder's
+                //     canonical scan — ISA-L's `data.len()*8 - avail_in*8 -
+                //     read_in_length` tracks bit consumption from a different
+                //     internal-buffering state). Diagnosed on NASA Jul95:
+                //     start_bit=150999587, stop_hint=156360208, end_bit=156360207,
+                //     boundaries=25, delta=-1, wrapper_ok=true, 3–5/30 runs.
+                //
+                // In both cases `end_bit` is within 1 bit of `stop_hint_bits`
+                // and below it, confirming ISA-L reached and decoded the final
+                // BFINAL block. The until_exact contract is satisfied — the
+                // decode stopped at or within 1 bit of the exact requested
+                // position, with the 1-bit slack being a coordinate convention
+                // difference, not a data difference. Vendor GzipChunk.hpp
+                // decodeChunkWithInflateWrapper tracks the end position directly
+                // rather than requiring a recorded boundary; accepting an
+                // exact or within-1 landing here converges to that behavior.
+                // LOAD-BEARING: `end_bit <= stop_hint_bits` — not the <=1 slack —
+                // is what structurally excludes INTERIOR chunks from this accept:
+                // an interior decode is input-bounded at stop_byte + 256 KiB and
+                // always runs PAST stop_hint (end_bit >> stop_hint), so reaching
+                // end_bit <= stop_hint means the decode genuinely hit the member's
+                // BFINAL stream end. Do not "simplify" the guard away.
+                let end_within_1 = end_bit <= stop_hint_bits && stop_hint_bits - end_bit <= 1;
+                if end_within_1 {
+                    ISAL_BFINAL_EXACT_LANDING_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                    // Use stop_hint_bits as the canonical final_bit so the
+                    // chunk records its end at the block_finder's coordinate.
+                    (stop_hint_bits, written)
+                } else {
+                    ISAL_UNTIL_EXACT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    return Ok(false); // oracle can't honor exact stop ⇒ fall back
+                }
+            }
         }
     } else {
         let mut chosen = None;
@@ -414,6 +473,7 @@ fn finish_decode_chunk_isal_oracle(
                 if end_bit <= stop_hint_bits {
                     (end_bit, written)
                 } else {
+                    ISAL_INEXACT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                     return Ok(false);
                 }
             }
@@ -2878,6 +2938,113 @@ mod isal_tail_parity {
             chunks_delta >= 1,
             "ISA-L engine decoded no chunks on a >8x corpus — the reserve-overflow \
              fallback storm is back (DIS-29)"
+        );
+    }
+
+    /// BFINAL exact-landing gate: `finish_decode_chunk_isal_oracle` with
+    /// `until_exact=true` must return `Ok(true)` when no recorded EOB boundary
+    /// matches stop_hint_bits exactly BUT ISA-L's `end_bit` is within 1 bit of
+    /// stop_hint_bits. Two diagnosed sub-cases:
+    ///
+    /// (a) ISA-L exits via ISAL_BLOCK_FINISH without setting stopped_at for the
+    ///     BFINAL block — no EOB boundary recorded, `end_bit == stop_hint_bits`.
+    ///
+    /// (b) ISA-L records the BFINAL EOB boundary via stopped_at but at
+    ///     `stop_hint_bits - 1` (1-bit coordinate discrepancy between ISA-L's
+    ///     chunk-decode buffering state and the block_finder's canonical scan).
+    ///     Diagnosed on NASA Jul95: start_bit=150999587, stop_hint=156360208,
+    ///     end_bit=156360207, boundaries=25, delta=-1, 3–5/30 runs at T8/T12.
+    ///
+    /// Pre-fix: the `None` arm of the boundary search returns `Ok(false)`.
+    /// Post-fix: `end_bit` within 1 bit of stop_hint_bits ⇒ accept.
+    #[test]
+    fn isal_until_exact_accepts_bfinal_exact_landing() {
+        use crate::backends::isal_decompress;
+        use crate::decompress::parallel::segmented_buffer::SegmentedU8;
+
+        let gz = synthetic_dynamic_gz();
+        let hdr =
+            crate::decompress::parallel::single_member::skip_gzip_header(&gz).expect("gzip header");
+        // Raw deflate payload: strip gzip header and 8-byte trailer.
+        let input = &gz[hdr..gz.len() - 8];
+
+        // Full-member reference decode via the pure wrapper: decoded bytes + EOB boundaries.
+        let (decoded, bounds) = enumerate(input);
+        assert!(
+            bounds.len() >= 2,
+            "synthetic member must have at least 2 EOB boundaries (got {})",
+            bounds.len()
+        );
+
+        // Get the stream end bit from a full ISA-L decode of the whole member.
+        let mut sink = SegmentedU8::default();
+        let (_, stream_end_bit, _) = isal_decompress::decompress_deflate_from_bit_into_growable(
+            input,
+            0,
+            &[],
+            &mut sink,
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("full ISA-L member decode must succeed");
+
+        // Pick the last interior EOB boundary that has at least 32 KiB of decoded
+        // output before it, so we can seed a full 32 KiB window. This boundary is
+        // the simulated "chunk start" — from here to stream_end_bit is the member's
+        // tail chunk, whose only remaining block is the BFINAL block.
+        let start_b = bounds
+            .iter()
+            .rev()
+            .find(|b| b.out_off >= WINDOW && b.bit < stream_end_bit)
+            .expect("synthetic member must have a boundary with >= 32 KiB of preceding output");
+
+        let start_bit = start_b.bit;
+        let window_end = start_b.out_off;
+        let window = &decoded[window_end - WINDOW..window_end];
+
+        // stop_hint == stream_end_bit: this is the until_exact BFINAL exact case.
+        let stop_hint_bits = stream_end_bit;
+
+        // Construct a fresh ChunkData and call finish_decode_chunk_isal_oracle directly.
+        // The test module lives in the same file so the private function is in scope.
+        let cfg = ChunkConfiguration::default();
+        let mut chunk = ChunkData::new(start_bit, cfg);
+        let result = finish_decode_chunk_isal_oracle(
+            &mut chunk,
+            input,
+            start_bit,
+            stop_hint_bits,
+            window,
+            true, // until_exact — exercises the BFINAL exact-landing branch
+        );
+
+        assert!(
+            result.is_ok(),
+            "finish_decode_chunk_isal_oracle returned Err on BFINAL tail: {:?}",
+            result
+        );
+        assert!(
+            result.unwrap(),
+            "finish_decode_chunk_isal_oracle returned Ok(false) on BFINAL exact landing \
+             (start_bit={start_bit} stop_hint={stop_hint_bits}): the None arm should \
+             accept when end_bit is within 1 bit of stop_hint_bits (pre-fix behavior: \
+             exact equality check missed the 1-bit ISA-L coordinate discrepancy)"
+        );
+
+        // Verify decoded bytes match the ground-truth reference.
+        let chunk_bytes = chunk.data.to_contiguous();
+        let reference = &decoded[window_end..];
+        assert_eq!(
+            chunk_bytes.len(),
+            reference.len(),
+            "BFINAL tail length mismatch: ISA-L={} pure={} \
+             (start_bit={start_bit} stop_hint={stop_hint_bits})",
+            chunk_bytes.len(),
+            reference.len()
+        );
+        assert_eq!(
+            chunk_bytes, reference,
+            "BFINAL tail bytes mismatch at start_bit={start_bit} stop_hint={stop_hint_bits}"
         );
     }
 
