@@ -1,5 +1,48 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## JOB-2 SYNC_FLUSH RESYNC PORT — OWNER checkpoint: the gap's ROOT CAUSE was a RESERVE UNDER-SIZING bug (writable_tail_reserve), NOT the coalesce accept (the inexact path was already a faithful readStream port; the exact-bit decline is faithful). FIXED byte-transparent; dual-sha both features byte-IDENTICAL; differential gate 10/10; coverage declines reduced (44→37 @T8) + a worker PANIC removed. Built+ran the REAL ISA-L path LOCALLY via Rosetta (NO neurotic — Plex window honored). [2026-06-08, OWNER turn, worktree isal-resync, branch isal-resync-stored-fixed @ 7695463d+]
+
+LOCAL ENABLER: `git submodule update --init vendor/isa-l vendor/isal-rs` + `cargo {build,test}
+--target x86_64-apple-darwin --features gzippy-isal` (nasm, RUSTFLAGS=-C target-cpu=x86-64-v2)
+BUILDS+RUNS the real ISA-L FFI clean-tail under Rosetta — full byte-exact + coverage iteration
+without the box (extends reference_local_x86_tests_rosetta to the isal feature). NO neurotic
+ssh/rsync/freeze this turn.
+
+TWO-COLUMN MAP (source-verified first-hand, vendor isal.hpp:253-385 readStream +
+GzipChunk.hpp:282-385): rapidgzip INEXACT coalesces FORWARD to the first clean block start at/past
+untilOffset (skips final/FIXED). gzippy's PURE-Rust StreamingInflateWrapper (gzip_chunk.rs:800-810)
+is ALREADY a byte-for-byte port of that. The ISA-L-oracle accept (gzip_chunk.rs:290-333) mirrors it:
+inexact picks first recorded boundary >= stop_hint and NEVER over-decodes (declines if none + end_bit
+> stop_hint — charter rule honored); exact requires a boundary == stop_hint else declines to bit-exact
+pure-Rust, mirroring vendor decodeChunkWithInflateWrapper's land-exactly-or-fail contract. So there
+was NO non-faithful accept to "port".
+
+ROOT CAUSE: `SegmentedU8::writable_tail_reserve` did `reserve(min_spare - (cap-len))`; Vec::reserve
+measures from len, so that UNDER-requests and no-ops when min_spare>cap but the delta<existing spare
+(len=49 KiB, cap=16.6 MiB, min_spare=16.5 MiB → reserve(704 KiB) no-ops → SHORT). The copy-free ISA-L
+FFI then got a too-small slice on dense tiny-block SYNC_FLUSH input. FIX = `reserve(min_spare)`.
+- DEBUG/TEST: debug_assert FIRED → worker PANIC → pipeline HANG (headline correctness win: removed).
+- RELEASE: assert out; under-reserve returns None (decline, SAFE byte-exact) ⇒ SPURIOUS DECLINES.
+- Only production caller is the ISA-L oracle (gzip_chunk.rs:274); the other (:1017) is the OFF
+  fold_nodrain knob ⇒ gzippy-NATIVE byte-UNAFFECTED (isal_chunks=0; native_fold_parity 4/4 green).
+
+PROOF (LOCAL Rosetta x86 release binaries, tinyblocks 10.7-10.9 MiB > parallel gate, path=ParallelSM):
+- DUAL-SHA both features × T1/T4/T8 ALL == raw `3af314a4…51d18` (native ≡ isal, byte-identical).
+- COVERAGE A/B (flate2 fixture, both byte-exact): T8 isal_chunks=22 fallbacks 44(OLD)→37(NEW);
+  T4 10/17→10/15. Declines reduced; surviving ones are the FAITHFUL exact-bit case. In DEBUG/TEST
+  the delta is HANG/PANIC → byte-exact isal_chunks=37.
+- isal_tail_parity differential gate 10/10 MATCH 0 diverged (both until_exact values); routing 28/28;
+  native_fold_parity 4/4; isal_stored_fixed_probe 4/4 (new isal_coverage_on_tiny_blocks gate green).
+  7 full-suite fails are PRE-EXISTING Rosetta/env flakes (reproduced on a stash-baseline).
+
+DELIVERED (production): segmented_buffer.rs reserve fix (byte-transparent native, correctness+coverage
+isal). TEST: gzip_chunk.rs synthetic-corpus fallback so the silesia differential runs locally too;
+isal_stored_fixed_probe.rs coverage gate + portable materializer. NOT advisor-vetted (Agent tool
+absent in owner env) — OWES supervisor's Opus advisor + correctness gate. NO neurotic touched, NO
+wall runs. Orphans: my hung test binaries (parallel-test-hang deadlock) KILLED; pgrep clean for my
+procs. Findings: plans/isal-resync-findings.md (JOB-2 PORT TURN section).
+
+
 ## CACHE-RESIDENCY LITERAL ARCHITECTURE — MET (the two SCOPED items closed, byte-exact, re-measured) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 8d4f20f7+]
 Completes the cache-residency clause's literal architecture from the prior turn's
 SCOPED list (plans/cache-residency-verdict.md §SCOPED). Full verdict:
