@@ -1,5 +1,480 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## DIS-29 [2026-06-09, owner/isal-incremental-growth @ 153da9d1, gzippy-isal bin 99d5758e] — the owed DIS-23 FORCE-REGROW byte-exact test + corpus-reframe-gate STORM FIX, on >8x compressible corpora that ACTUALLY force the regrow
+VERDICT: GZIPPY_ISAL_INCREMENTAL_GROWTH fixes the >8x reserve-overflow storm at LOW-T, BYTE-EXACT, recovers T1 ~+20-30% — but it is a LOW-T-ONLY lever with a sub-8x REGRESSION, NOT a clean default-ON.
+- BUILD TRAP CAUGHT: first build = stale warm-target b9eb0a73 (== DIS-28 no-growth bin), cargo declined to recompile the rsync'd 153da9d1; smoke test falsely showed "growth does nothing". Forced 37s recompile → true growth bin 99d5758e. (assert fresh Compiling + new bin_sha; never trust 0.18s Finished.)
+- STORM MECHANISM (first-hand per-Ok(false)-site diag): T1 storm = 100% reserve-overflow (out_pos==cap, compressed_span×8 too small for 10x) — corpus-reframe-gate mechanism CORRECT at low-T. T8+ OFF fallbacks are MIXED: reserve-overflow + ISA-L ret=-1/-2 (INVALID_BLOCK/SYMBOL) after 78/367B on un-decodable speculative-seed chunks (present in OFF too, NOT a growth defect — separate seeding bug).
+- STORM FIX (counters, default f4): T1 nasa 0/5→4/1, bignasa(820MB,20ch) 0/20→19/1, small 0/2→1/1; ghcn 7.77x (sub-8x control) 7/1→7/1 UNCHANGED (no storm below 8x). Residual T1 fb = window-absent bootstrap chunk.
+- BYTE-EXACT (owed DIS-23 gate SATISFIED): every sweep arm sha=OK (OFF==ON==REF). Forced-regrow (f1, grow=1MiB): silesia 14ch fb=0 byte-exact (~12 regrows/chunk), nasa byte-exact. Grow-across-realloc IS byte-exact on the real >8x path silesia never exercised.
+- WALL (frozen min-of-5, rg/gz): nasa T1 0.554→0.662 (+19.5%, 0.92→0.77s), bignasa T1 0.439→0.572 (+30%, 3.71→2.85s); T8/T16 OFF≈ON for ALL (bignasa T8 0.893→0.893) => storm does NOT tax parallel-T even at 20ch≫16T (high-T chunks are finished_no_flip clean, bypass the storm-prone oracle). ghcn 7.77x T1 0.941→0.800 (−18% REGRESS: f4 initial under-covers 7.77x → regrow churn with no storm to fix).
+- RECOMMENDATION for Opus gate: KEEP gated (byte-exact, fixes >8x low-T storm + DIS-23 dTLB win). Do NOT flip CURRENT always-small-f4 knob default-ON (ghcn −18%, ~0 parallel-T gain). PREFERRED: RETRY-ON-None-WITH-GROWTH (keep 8x first attempt → no sub-8x regression; grow only on overflow → rescue >8x byte-exact). Strictly dominates both arms; owner-turnable. SEPARATE owed: the T8+ ISA-L seed-error chunks (un-decodable speculative window).
+- Box released clean (RESTORE VERIFIED no_turbo=0, wd inactive), guest+neurotic pgrep-clean, leaked local timeout-ssh wrappers reaped (broken multi-word $SSH_JUMP via dotfiles timeout shim → acquired bench-lock.sh DIRECTLY). NEW tooling→Steward: scripts/bench/{storm.sh,_storm_build.sh,_storm_guest.sh}; WORKTREE-ONLY env-gated GZIPPY_STORM_DIAG instrumentation (STRIP before merge). OWES supervisor Opus gate. See plans/disproof-ledger.md DIS-29.
+
+## DIS-28 [2026-06-09, owner/corpus-general] — CORPUS-GENERALITY cross-check (the owed DIS-24/25/26/27 Q5): engine-W ROOT is corpus-general, but the "T8-win/T16-loss" CONCLUSION is SILESIA-SPECIFIC and INVERTS across the ratio axis
+The squishy-variety cross-check all four prior gates flagged "owed; silesia is rg's tuning corpus." New host-locked driver scripts/bench/{corpusgen.sh,_corpusgen_guest.sh,_corpusgen_build.sh} (parity/hicurve spine: env-scrub, frozen+quiet readback, regular-file sink, interleaved best-of-N=5, sha-OK EVERY run, per-cell path+counter capture; PINS the exact conclusion binary b9eb0a73 by bin_sha, NO rebuild). Production routing path-asserted; T16=T16-SMT (mask 0-15, container NEVER expanded). 4 squishy corpora (ratio 1.26x→10x, size 6MB→269MB) + silesia control.
+**PRE-FINDING: the task's "T1→IsalSingleShot" premise is FALSE for this binary — `classify_gzip` routes EVERY single-member stream to ParallelSM at all T/size (no IsalSingleShot path exists here; that's owner/t1-singleshot-route). Near-incompressible `model` did NOT route to StoredParallel — it has real Huffman (51 chunks, flip_to_clean=49), refuting the gate's "near-incomp = stored = little Huffman = different" structurally.**
+**THE CURVE (ratio=rg/gz, >1=gz wins, TIE=≥0.99):**
+| corpus | T1 | T8 | T16 |
+|--------|-----|-----|-----|
+| silesia 3.11x (home-field) | 0.904 | **1.022 WIN** | **0.918 LOSS** |
+| model 1.26x near-INCOMP | 0.888 | **0.685 LOSS** | **0.677 LOSS** |
+| nasa 9.93x web-log | **0.566 LOSS** | **1.044 WIN** | **1.048 WIN** |
+| ghcn 7.77x CSV | 0.945 | 1.009 TIE | 0.963 LOSS* |
+| small 6MB 10x | **1.887 WIN** | **1.862 WIN** | **1.742 WIN** |
+**READS:** (1) silesia REPRODUCES DIS-24 (T8≈1.02, T16-SMT 0.918≈0.912) → instrument validated. (2) The "T8-win/T16-loss" SHAPE does NOT generalize: on near-incompressible `model` gz loses ALL cells WORST at high-T (0.68 — engine-W exercised HARDER); on highly-compressible nasa/small gz WINS high-T. (3) Single-core engine-W deficit (T1 loss) is corpus-general in SIGN (0.57-0.95) but magnitude is dominated by a NEW corpus-general term — the FALLBACK STORM: on ≥~8x-compressible corpora isal_chunks=0, ALL chunks fall back (DIS-14 ~7.5x spike), crushing T1 nasa to 0.566. (4) Unifying mechanism: gz's deficit scales with COMPRESSED-SIZE/CHUNK-COUNT (model 213MB→51ch=worst 0.68; nasa 20MB→3ch=win) — the SAME DIS-24 chunk-count→engine-W binder, producing a high-T loss ONLY when compressed-size spawns many chunks. (5) Small inputs: gz WINS 1.7-1.9x (rg's ~64ms fixed startup >> gz's ~34ms).
+**VERDICT: engine-W is the corpus-general ROOT (heaviest where marker-decode is heaviest = model); but DIS-24/25/26/27's "T8-win/T16-loss" is SILESIA-SPECIFIC — the high-T loss DEEPENS on near-incompressible and REVERSES to a WIN on highly-compressible/small. Real-world picture DIFFERS from the silesia headline: gz is a strong WIN on small+highly-compressible, TIE/marginal on mixed text, DECISIVE LOSS only on large near-incompressible — the INVERSE of a "stored=easy" intuition.** CAVEATS: N=5 (signs robust; nasa/ghcn high-T wins on wide 7-12% spread = TIE-or-WIN); T16-SMT not T16-Ephys (no E-core re-measure per corpus). Full record+table: disproof-ledger.md DIS-28. NEW tooling flag to Steward. NO Opus advisor in env => self-disproof + silesia control only; OWES supervisor Opus gate (NOT advisor-vetted). Clean: bench-lock RELEASED (RESTORE VERIFIED no_turbo=0), container nproc=16 throughout, local+guest+neurotic pgrep-clean, leaked timeout-wrappers reaped.
+
+## DIS-27 [2026-06-09, owner/dis27-ecore-busy] — THE un-run discriminator: high-T E-core workers are BUSY (engine-W), NOT idle => (B) under-feeding REFUTED, OVERTURNS DIS-25
+The cheap decisive measurement the B-vs-b-reconcile-gate (Q1/Q4) said was OWED before "only user decisions remain":
+at the high-T LOSS cell T16-Ephys (8 P-core SMT threads + 8 E-cores, mask 0,2..14,16..23) split the per-core-type
+WORKER busy/idle that DIS-26 never measured. Tools: mpstat -P per-CPU %busy + perf -a per-PMU (cpu_core=P / cpu_atom=E,
+HARDWARE-EXACT on the i7-13700T hybrid) instructions+cycles. Instrument VALIDATED (Rule 4): frozen-idle baseline ~idle;
+T8-Pphys control E-cores ~2% (out-of-mask => no leakage). DIS-24/25/26 binary b9eb0a73 (no rebuild, READ-ONLY harness),
+frozen guest BENCH_LOCK=quiet, container LIVE-expanded 16->24 then RESTORED to 16 (taskset16 fails, VERIFIED), sha=OK
+both tools, ParallelSM-asserted, 2 reproducible runs.
+**RESULT: gz's E-cores are BUSY — 72% (run1 71.9 / run2 72.8), the BUSIEST resource (busier than gz's own P-cores 67%),
+retiring ~1.59x MORE instructions than rg's E-cores (gz 4.5e10 vs rg 2.85e10) for IDENTICAL decoded bytes; gz E-IPC 2.34
+> rg 2.13 (NOT memory-stalled).** rg's E-cores are LESS busy (53%). **VERDICT: ENGINE-BUSY (terminal, user-gated). (B)
+under-feeding/work-distribution REFUTED — gz's E-cores are over-subscribed (the long pole), NOT starved.** This OVERTURNS
+DIS-25's (B) verdict by direct worker measurement and VINDICATES DIS-26's "high-T DECODE-WAIT = the engine" at T16-Ephys.
+**Reconciles DIS-25's 1.91x:** the ~3/4 "parallel-only, not single-core-rate" E-core extraction gap is NOT feeding — it is
+the ~1.59x HEAVIER ENGINE-W amplified through the IN-ORDER pipeline (gz's E-core chunks carry 1.59x more work => each
+takes longer on the low-IPC E-core => the slow E-core chunk becomes the long pole and head-of-line-stalls the in-order
+consumer while BUSY decoding, capping gz's incremental E-core benefit at ~half rg's). Exactly the gate's
+"engine-W-under-in-order-contention" reading, which it said "would still be the asm/clean-rate lever." Mechanism
+(source): gz worker = pure-Rust u16 marker-decode (chunk_fetcher.rs flip_to_clean:855 + src/decompress/inflate/, DIS-18
+~57% instrs); rg counterpart leaner Block::read (vendor/rapidgzip/src/rapidgzip/GzipChunkFetcher.hpp+ChunkData.hpp, fed by
+src/core/{BlockFetcher,Prefetcher}.hpp). Converges B-vs-b onto engine-W-user-gated for high-T. STILL OWED (NOT this gate):
+the per-chunk/ParallelSM T1 removal oracle (var8-gate 124ms) + squishy corpus cross-check (DIS-24/25/26 Q5). Full record +
+tables: disproof-ledger.md DIS-27. NEW tooling scripts/bench/_dis27_ecore_busy_guest.sh (READ-ONLY) flag to Steward. NO
+Opus advisor in env => self-disproof + validated controls only; OWES supervisor Opus gate (NOT advisor-vetted).
+
+## DIS-25 [2026-06-09, owner/high-t-discriminate] — HIGH-T A/B GATE CLOSED: chunk-count binder DEAD, verdict = (B) heterogeneous work-distribution lever
+**[SUPERSEDED by DIS-27 2026-06-09: the (B) under-feeding verdict below is OVERTURNED — direct T16-Ephys worker measurement
+shows gz's E-cores are the BUSIEST resource (72%, NOT under-fed); the high-T loss is engine-W (1.59x heavier on E-cores),
+user-gated. DIS-25's P1/P2/roofline data stand; only its (B) feeding INTERPRETATION is refuted.]**
+Host-locked discriminator (scripts/bench/hitgate.sh + _hitgate_guest.sh; DIS-24 binary b9eb0a73, no rebuild, frozen,
+best-of-7, sha-OK, ParallelSM-asserted; silesia). Guest config finding: LXC 199 is Proxmox `cores:16` => cpuset 0-15
+(P-core SMT threads only, E-cores OUT); expanded live to `--cores 24` for the run, RESTORED to 16 (verified).
+**P1 rg chunk count (FREE confirm):** rg `--verbose` Total Fetched GROWS with -P: 17(T4/8)->27(T9/10)->33(T12/14)->
+44(T16)->66(T24/32) — NOT "~17 constant"; rg partitions MORE than gz (gz 14->34) yet wins => chunk-count over-partition
+binder DEAD (doubly: gz partitions FEWER). **P2 per-core split:** gz 205.8/129.7 MB/s (P/E), rg 229.3/147.5; gz/rg
+ratio 0.90(P)≈0.88(E) — engine-W deficit real but NOT E-amplified; E/P IPC deficit (~0.63) identical both tools.
+**P3 roofline:** T8-Pphys gz WINS 1.026 (effGZ 0.350 > effRG 0.306) despite the 10% engine deficit; T16-Ephys gz LOSES
+0.934. Adding 8 E-cores: gz +35ms (captures 5.9% of E roofline), rg +67ms (10.3%) — rg extracts ~2x more from the same
+E-cores. **VERDICT = (B): a faithful high-T work-distribution lever** (gz under-feeds slow E-cores; in-order publish-
+chain head-of-line-stalls on a slow-core chunk). NOT (A): engine-W is masked at homogeneous T8 (gz wins there) so it
+is not the high-T-specific cause. rg counterpart = BlockFetcher prefetch cache + ParallelGzipReader work distribution +
+deeper reorder window. Caveat: silesia-only (rg's tuning corpus). Full table: disproof-ledger.md DIS-25. NEW tooling
+scripts/bench/{hitgate.sh,_hitgate_guest.sh} flag to Steward. NO Opus advisor in env => self-disproof only; OWES Opus gate.
+
+## DIS-23 [2026-06-09, owner/isal-incremental-growth] — FAITHFUL INCREMENTAL OUTPUT GROWTH: dTLB half CLOSED (below rg), RSS half NOT (lazy-faulting)
+The cache-locality / small-memory DESIGN drive (DIS-17 owed footprint falsifier). SOURCE-VERIFIED first-hand that
+DIS-14's "rg feeds the WHOLE buffer (isal.hpp:258), same as gz" is WRONG: rg's `finishDecodeChunkWithInexactOffset`
+(GzipChunk.hpp:309-379) allocates a FRESH 128 KiB `DecodedVector` per loop iter, fills via readStream, `resize`+
+`append`s into a segmented DecodedData, repeats — it grows INCREMENTALLY in 128 KiB segments and NEVER reserves the
+8x-compressed chunk output upfront like gzippy does. Built a gated faithful port (`GZIPPY_ISAL_INCREMENTAL_GROWTH=1`,
+OFF==identity): small initial reserve + grow-on-demand inside the ISA-L loop (`decompress_deflate_from_bit_into_growable`
++ `IncrementalOutSink`). Growth DISSOLVES DIS-14's sub-8 fallback constraint (even FACTOR=1 is 0-fallback).
+MEASURED (frozen guest, bin 908a9629, T4+T8, vs rg 0.16.0, full lib suite 893/0 OFF+ON, dual-sha byte-exact,
+isal_chunks=14 fb=0 every arm): **dTLB-miss MPKI T4 0.0623->0.0366 / T8 0.0685->0.0396 (factor-4, -41/-42%, lands
+BELOW rg 0.0466/0.0502)**; page-faults -8..11%; **wall TIE (no-regress)**; **peak RSS NOT improved** (f4≈OFF; f2/f1
+WORSE). VERDICT SPLIT: the user's named-unmet TLB half is CLOSED (wall-neutral, 0-fb, byte-exact); the RSS +21-25%
+half is NOT — lazy faulting means RSS tracks TOUCHED bytes + realloc transients, not the lazy over-reserve (this
+REFUTES DIS-17's "the +25% RSS is mostly the D1 8x over-reserve"). KEEP gated (rule 7a — correct + helps dTLB);
+recommend the Opus gate flip default to ON factor-4. Full record + table: disproof-ledger.md DIS-23. Branch
+owner/isal-incremental-growth (uncommitted-then-committed on the worktree); NEW tooling scripts/bench/{incr_growth.sh,
+_incr_growth_guest.sh} flag to Steward. OWES: supervisor Opus gate.
+
+## DIS-21 [2026-06-09, owner/defrag-flat-convergence] — the de-frag FLAT-BUFFER lever is a PHANTOM (CLOSES the DIS-20 owed speed-up bound)
+DIS-20 left OWED: the rule-3 flat-buffer REMOVAL oracle (does flattening the u16 marker output recover the
+~70ms T4 gap?). RESOLVED on two grounds:
+1. **SOURCE (first-hand vendor read, the rg-marker gate's owed `m_window16` check):** rg's `m_window16` is
+   `std::array<uint16_t, 2*MAX_WINDOW_SIZE>` (deflate.hpp:805) — the SAME 65536-u16 modulo-by-AND RING as
+   gzippy's `output_ring`, NOT a flat per-chunk buffer. `resolveBackreference` (:1369-1390) ≡ `emit_backref_ring`
+   (same offset-modulo, same single-memcpy :1376, same marker scan). rg drains `m_window16`->`dataWithMarkers`
+   via `lastBuffers`+`appendToEquallySizedChunks` (DecodedData.hpp:266-275) into 128KiB/64Ki-u16 SEGMENTS ≡
+   gzippy `drain_to_output`->`SegmentedU16::push_slice`. **gzippy is ALREADY structurally convergent. There is
+   no flat buffer in rg to converge to; building one would DIVERGE.** The "flat m_window16" premise (DIS-19/
+   defrag-charter) was a MISREAD. (rule-7(a) rejection: rg does the de-frag the SAME way.)
+2. **MEASURED (the one faithful byte-exact convergence available):** `GZIPPY_FLAT_BACKREF=1` swaps
+   emit_backref_ring's non-overlap word-copy (a gzippy innovation over vendor) for rg's EXACT
+   `copy_nonoverlapping(length)` memcpy. Interleaved OFF/ON/rg N=15, frozen guest runnable 1.00, byte-exact
+   (OFF sha==ON sha==ref), isal_chunks=14/0, path=ParallelSM: OFF 552.4ms / ON 549.7ms => **delta -3ms (min),
+   -1ms (med), within ±30ms spread = CLEAN TIE.** instr-count: ON cuts ~96M (~1.5%) yet wall flat = textbook
+   rule-3 (instr win does NOT translate to wall; the copy is off-critical-path / mem-latency-hidden).
+VERDICT: **LOW-CEILING; the de-frag flat-buffer port is NOT worth funding.** DIS-20 criticality stands (slope),
+but the convergence SPEED-UP ceiling is ~0. The isal T4 gap is NOT the u16 output/backref fragmentation — it is
+the marker-prefix Huffman SYMBOL-RATE half (asm-bounded, user-gated) and/or parallel scheduling (DIS-16/17).
+Full raw + provenance in plans/disproof-ledger.md DIS-21. New tooling (flat-backref KIND, flat_ab_interleave.sh,
+GZIPPY_FLAT_BACKREF knob) FLAG TO STEWARD.
+
+
+## RG-MARKER-ATTR — apples-to-apples split of the +1.54e9 isal excess [2026-06-09, rg-marker-attr worktree, DIS-19] — COMPLETES the isal attribution
+The OWED counterpart of DIS-18: perf-record rapidgzip's OWN marker decode (the campaign always ASSUMED
+rg-marker ~= 0). The installed rapidgzip 0.16.0 .so is ALREADY symboled (BuildID 67cd8b7e, debug_info, not
+stripped) — NO build needed. Bench-locked frozen guest T4 mask 0,2,4,6, REPS=6, sha=OK, rg 4.7078e9 instr:u
+(reconfirms DIS-18 exactly). FINDINGS:
+- **rg NEVER takes the u8-direct ISA-L path (decodeChunkWithInflateWrapper = 0 samples)** for streaming -d -c;
+  it marker-decodes EVERY chunk via decodeChunkWithRapidgzip->Block<false>::read, using the SHARED igzip AVX2
+  kernel (address-confirmed ..@37.end/..@42.end inside decode_huffman_code_block_stateless_04) as its Huffman
+  primitive, then resolves via DecodedData::applyWindow. gzippy's flip_to_clean (12/14 -> real ISA-L FFI) is a
+  DIVERGENCE from rg, not a convergence.
+- **PER-AXIS split of the +1.54e9 excess: ~71% marker INNER LOOP (+1.09e9) / ~25% resolution-SCAFFOLD (+0.38e9);
+  shared igzip kernel ~equal (gz 1.88e9 ~= rg 1.68e9).** gz inner-loop 3.338e9 vs rg 2.246e9; gz resolution
+  0.715e9 vs rg 0.335e9. The pre-registered FALSIFIER resolves to the **INNER-LOOP branch** (open inner-loop-
+  engine, VAR_VIII plateau ~0.667x PREDICTED) — NOT pure-scaffold-faithful-convergeable.
+- Inner-loop excess decomposed: ~1.70e9 is the u16 OUTPUT/BACKREF ABSTRACTION (push_slice 0.706e9 SegmentedU16 +
+  emit_backref_ring 0.993e9 u16-ring) that rg FUSES into inlined flat m_window16[pos++] writes — the largest
+  tractable sub-lever (flatten+inline+fuse like rg's single Block::read; architectural). ~1.61e9 is pure-Rust
+  Huffman where rg uses the ISA-L kernel — the inner-loop-asm question (plateau-predicted).
+- BAR-1: closing isal T4 0.91x->0.99 by converging the marker engine alone is UNLIKELY to clear the bar.
+  gzippy-NATIVE shares this marker engine + its 0.667x clean floor. NEW tooling (flag to Steward):
+  scripts/bench/{rg_marker_attr.sh,_rg_marker_attr_guest.sh}. Full numbers: disproof-ledger.md DIS-19.
+
+## LOCATE-+40% — per-symbol attribution of the DIS-17 instruction excess [2026-06-09, owner/locate-plus40, DIS-18]
+perf record -e instructions on a SYMBOLED gzippy-isal (HEAD d56cb0f5; production codegen fat-LTO cgu=1 +
+`-C strip=none -C debuginfo=2`, instruction count unchanged) DECISIVELY LOCATES the +40%: it is the
+pure-Rust **u16-MARKER DECODE ENGINE (~57% of user instructions, ~3.56e9)** — `marker_inflate::Block::
+read_internal_compressed` 19.6% + `emit_backref_ring` 15.9% + `SegmentedU16::push_slice` 11.3% +
+`resolve_chunk_markers_on_chunk` 3.5% + `decode_chunk_unified_marker`/`marker_decode_step` 2.5% — NOT the
+suspected wrapping. Frozen bench-locked guest, mask 0,2,4,6 (T4), cpu_core PMU, REPS=6, sha=OK, isal_chunks=14
+fb=0 path=ParallelSM asserted. gz 6.252e9 instr:u vs rg 4.708e9 = **+32.7% user** (~1.54e9; DIS-17's +40%
+total = this + the kernel/page-fault footprint); wall gz 0.531 / rg 0.470 = **0.885x**.
+REFUTED suspects: u16->u8 narrow <0.01% (already fused in-place, converged), per-chunk CRC 0.78%, scaffold
+~9.5% (finalize_with_deflate 7.9%), consumer scans/window-map <0.1%. ISA-L decode kernel ~30% is SHARED w/ rg.
+Falsifier PASSES: the marker engine owns the excess — gzippy decodes 12/14 chunk PREFIXES through u16 markers
+(window-absent at speculative decode start, flip_to_clean=12) where rapidgzip decodes window-PRESENT chunks
+u8-DIRECT via ISA-L. The engine MODEL is faithful (m_window16 ring/set_initial_window); the divergence is the
+marker-decoded FRACTION. CONVERGENCE (ranked, supervisor-gated, NOT attempted — architectural not byte-
+transparent): (1) decode window-present chunks u8-direct via ISA-L from the start (vendor GzipChunk.hpp
+decodeChunkWithInflateWrapper) to shrink flip_to_clean toward rg's bootstrap-only == governing-memory "faithful
+u8 native clean path" + confirmed-offset-prefetch-gap; (2) residual marker-engine per-symbol efficiency.
+Tooling for Steward: scripts/bench/{perf_attr.sh,_perf_attr_guest.sh}. NOTE: guest target/release/gzippy is now
+the symboled gzippy-isal (next --build rebuilds). Full raw in plans/disproof-ledger.md DIS-18. OWES Opus gate.
+
+## LEAN-CONSUMER — T4 sizing checkpoint [2026-06-09, owner/t4-lean-consumer, DIS-16]
+SIZED the T4 0.911x gzippy-ISAL parallel-pipeline lever the single-shot oracle (DIS-15)
+could not probe. Built a BYTE-TRANSPARENT removal oracle `GZIPPY_LEAN_CONSUMER=1` that
+skips the non-vendor consumer-top overheads (pipeline-fidelity-verdict.md D2 unconditional
+per-iter process_ready_prefetches+harvest; D3 clean-branch full prefetch-cache scan; D4
+throwaway format! trace Strings) + a `[LIFECYCLE]` GZIPPY_VERBOSE per-chunk self-time
+decomposition. Measured ON-vs-OFF, frozen bench-locked guest (no_turbo=1, gov=performance,
+runnable≈1.25, QUIET), gzippy-isal, interleaved N=13 ×2 runs, same-sink /dev/shm regular
+file, vs rapidgzip 0.16.0; STEP-0 path=ParallelSM + isal_chunks=14/14 fb=0 asserted BOTH arms;
+sha=028bd002…=OK every arm (lean byte-transparent T1+T4); bin 378788924ace0381;
+raw_bytes=211,968,000.
+
+VERDICT — NULL BRANCH (TIE): the faithful consumer-lean is NOT the T4 BAR-1 lever; the
+T4 gap is DEEPER parallel-scheduling.
+- T4 wall (mask 0,2,4,6): run1 gz-prod 0.5470s/0.902x · gz-lean 0.5524s/0.894x · rg 0.4936s;
+  run2 gz-prod 0.5517s/0.892x · gz-lean 0.5471s/0.899x · rg 0.4921s.
+- lean RECOVERY = gz-prod−gz-lean = −5ms (run1) / +5ms (run2): sign FLIPS, |Δ|≈5ms ≪ the
+  17–36% gzippy spreads (~90–200ms) ⇒ recovers ~0. (No work-displacement: gz-prod and gz-lean
+  iter_sum/postproc are identical to within noise; nothing moved to another stage.)
+- LIFECYCLE decomposition (the deliverable, why it's null): the removed D2/D3/D4 are µs-scale —
+  prefetch_promote 1→0 µs, window_publish ~0.5ms total, D4 format! sub-µs — 2–3 orders below the
+  ~55ms wall gap. Consumer self-time is dominated by fetcher_get (productive ISA-L decode-wait
+  ≈115ms cumulative/17 iters) + postproc_dispatch (≈74ms), NEITHER touched by the lean.
+- OWED next: the T4 ~0.90x gap lives in the productive parallel decode + post-process /
+  scheduling path (head-of-line stalls, window-publish serialization) — the parallel-scheduling
+  oracle DIS-15 flagged. gzippy-NATIVE untouched (separate 0.667x engine floor).
+- Artifacts: worktree .claude/worktrees/t4-lean-consumer @ 1642cb58; chunk_fetcher.rs
+  `lean_consumer_enabled`+`[LIFECYCLE]`; scripts/bench/{lean.sh,_lean_guest.sh}. Code KEPT
+  (byte-transparent dev oracle, useful instrumentation; not merged — sizing turn). Box released
+  clean, no orphans (guest+jump+local pgrep clean, freeze thawed).
+
+## PIPELINE-FIDELITY AUDIT — lead-auditor checkpoint [2026-06-09, SOURCE-ONLY, READ-only on parallel/]
+Compared gzippy coordination + serial tail first-hand vs ACTUAL rapidgzip headers. VERDICT in
+`plans/pipeline-fidelity-verdict.md`. HEADLINE: the coordination/serial STRUCTURE is LARGELY
+FAITHFUL — the hunch ("we introduced a coordination/serial deviation") is only WEAKLY borne out.
+No single large divergence found; deviations are real but small/diffuse. KEY CORRECTION: the
+"per-chunk FFI handoff" residual term is NOT a gzippy deviation — vendor's IsalInflateWrapper
+(WITH_ISAL) pays the identical per-chunk setup, so it can't explain the gap vs rg. Ranked
+deviations (vendor↔gzippy file:line + runtime work + converge target in the verdict): D1 ISA-L
+output over-reserve 8× vs vendor incremental growth (footprint/page-fault gap; gzip_chunk.rs:263-274
+↔ IsalInflateWrapper); D2 unconditional per-iter process_ready_prefetches+harvest at consumer top
+(chunk_fetcher.rs:1213,1218 ↔ none in ParallelGzipReader.hpp:575-643); D3 full prefetch-cache scan
+on CLEAN branch (1715 ↔ vendor marker-only GzipChunkFetcher.hpp:513); D4 per-chunk throwaway
+format! trace Strings with tracing OFF (1690,1697,1578); D5 chunk-0 full 32KiB zero window vs vendor
+empty {} (560-561 ↔ GzipChunkFetcher.hpp:105); D6 ungated Instant::now() on hot path; D7
+recycle_deferral 2-deep (CRC-race workaround, fragility signal). NEGATIVE/FAITHFUL (ruled out):
+writev output, OverlapWriter OFF, CRC combine (no rescan), WindowMap.get zero-alloc, prefetch sizing
+max(16,pool)/2×pool, ThreadPool T1 inline-deferred, window-publish handoff. Source-only by discipline
+(box held by residual oracle); rankings reasoned not measured; Agent tool ABSENT ⇒ self-disproof only.
+OWES Supervisor Opus gate + a measured perturbation of the cheap D2-D6 bundle. NOT advisor-vetted.
+
+
+## VAR_VIII FULL-KERNEL INLINE-ASM ISOLATION BENCH — OWNER checkpoint [2026-06-09, worktree bench/var8-fullkernel, BENCH-ONLY]
+Built the OWED full-kernel asm (back-edge `jmp 2b` INSIDE asm; F2 dist-gather + D AVX copy + F4 register-pin; Rust only at long-code/EOB/boundary) as `VAR_VIII_fullkernel` in `benches/engine_isolation.rs` (NO src/production touched). Frozen guest REDACTED_IP (bench-lock quiet, no_turbo=1, taskset -c 0, N=11 interleaved; released clean, NO orphans local+guest+neurotic). Built at origin tip 7bf26096 (d56cb0f5 local-only/unpushed; ancestor, every bench-relevant primitive byte-identical). **BYTE-EXACT: SHA_ALL_EQUAL=yes all 5 chunks vs scalar AND ISA-L; SELFTEST=PASS.** asm_frac 0.929-0.999 (median 0.938), reentries 3.4-4.3K vs VAR_VII 372-446K ⇒ DIS-1 spill confound REFUTED. RATE (med-of-med /ISA-L): VAR_VIII **0.667x** (188 MB/s; per-chunk 0.66-0.72), VAR_VI(LLVM) 0.582x, VAR_VII 0.29x. VERDICT = THIRD outcome: VAR_VIII MATERIALLY beats VAR_VI (+14.6%, sign-stable ⇒ KILL/plateau REFUTED, register-pinning IS a lever) BUT FAILS the 0.85 PASS bar (closes only ~20% of the VAR_VI→ISA-L gap). Production integration NOT authorized; engine does NOT reach ISA-L-class rate in pure-Rust+asm; BAR-1 not cleared. Detail in disproof-ledger.md (bottom). OWES Steward/Opus gate.
+
+## OPEN-1 DISENTANGLEMENT (faithful-placement SIZED, ENGINE HELD) — OWNER checkpoint: the faithful runtime-placement slice at T4 is ~0 / TIE-to-WORSE (−34ms); the low-T lever is the GATED ISA-L engine swap, NOT placement. New byte-transparent oracle `--kind placement-marker` (seed REAL boundaries via inline p=1 capture + GZIPPY_SEED_NO_WINDOWS=1 → window-absent prefix HELD on pure-Rust marker engine; isal_chunks<=14 asserted, NO 14→17 leak). STEP-0 proof-of-binary: gzippy-isal HEAD, env-unset isal_chunks=14/14/16 T4/T8/T1, fallbacks=0/0/1, path=ParallelSM, bin b9eb0a73. Box frozen (bench-lock host-freeze, quiet-gate runnable<=2.0, no_turbo=1) + released clean (guest no_turbo=0, wd inactive); NO orphans (local+guest+neurotic pgrep clean). Self-disproof + pre-registered falsifier only (Agent tool absent) ⇒ OWES Steward/Opus gate. [2026-06-08, OWNER turn, worktree owner/disentangle-placement @ d56cb0f5]
+
+**FROZEN-GUEST MEASUREMENTS** (REDACTED_IP, bench-lock --lock, no_turbo=1, governor=performance,
+interleaved N=11, same-sink /dev/shm regular file, rg 0.16.0):
+
+| config | T4 gzippy | rg | ratio | T1 gzippy | rg | ratio | invariant |
+|---|---|---|---|---|---|---|---|
+| production (same-sink, env-unset) | 546ms | 494ms | **0.906x** | 1022ms | 917ms | 0.898x | isal_chunks=14 sha=OK |
+| placement-marker (boundaries seeded, ENGINE HELD) | 580ms | 490ms | **0.845x** | 1023ms | 918ms | 0.897x | isal_chunks=12-13 (≤14, NO leak), seed hits=0, sha=OK |
+
+**FAITHFUL-PLACEMENT SLICE = production − oracle = 546 − 580 = −34ms (TIE-to-WORSE, within spread).**
+FALSIFIER FIRES: placement (engine held) is NOT a faithful low-T lever at T4. The 231ms seed-all
+gain was the GATED engine swap (14→17) + the uncounted free pre-pass — NOT runtime placement. The
+oracle's 580ms independently reproduces the prior no-windows leg (581ms). T1 is IDENTITY (oracle ==
+production; seed is a no-op when windows always present) = instrument self-test PASS. a-fortiori:
+placement here was FREE (uncounted p=1 capture); the "counted at runtime" version is only slower, so
+the verdict holds with margin. **CONCLUSION: the T4 low-T lever is the user-GATED ISA-L engine swap
+on the window-absent prefix (LEV-4 clean-rate generalized), not a schedulable placement gap.** No
+production code changed (only a measurement-harness `--kind`). OWES Steward/Opus sign-off.
+
+## LOW-T RESIDUAL DECOMPOSITION (OPEN-1) — OWNER checkpoint: on the VERIFIED isal binary (STEP-0: isal_chunks=14/14/16 T4/T8/T1, fallbacks=0, env-unset, path=ParallelSM) the T4 residual SPLITS as DOMINANT marker-bootstrap COMPUTE(A)+alignment(C) [seed-all ceiling 549->318ms = 1.55x, sha-verified byte-perfect], NEGLIGIBLE FFI-handoff(B) [seed-all still routes 17 ISA-L chunks yet beats rg]. FOUND a harness bug: oracle.sh --kind clean-only is a NO-OP (SEED_WINDOWS=1 => open("1") ENOENT => silent production fallback) — prior "clean-only TIE" numbers are PRODUCTION-vs-PRODUCTION. NO production code changed; box frozen via driver --lock + released clean (no_turbo=0, LXCs thawed, wd inactive); NO orphans (local+guest+neurotic pgrep clean). Self-disproof only (Agent tool absent) => OWES supervisor Steward/Opus gate. [2026-06-08, OWNER turn, worktree owner/lowt-residual-decomp @ d56cb0f5, bin b9eb0a73]
+
+**FROZEN-GUEST MEASUREMENTS** (REDACTED_IP, driver --lock, runnable_avg 1.00-1.75 <=2.0,
+no_turbo=1, interleaved N=11, same-sink /dev/shm regular file, rg 0.16.0, T4 mask 0,2,4,6):
+
+| config (T4) | gzippy | rg | ratio | coverage / sha |
+|---|---|---|---|---|
+| production (env-unset) | 549ms | 495ms | **0.902-0.904x** (x2) | isal_chunks=14 fb=0, sha=OK |
+| seed-all clean-only (REAL capture+replay) | 318-325ms | 495ms | **1.486-1.555x** | seed hits=16 miss=0 flip=0 isal=17, **sha=028bd002…cb410f byte-perfect** |
+| no-windows (boundaries only; A still paid) | 581ms | 497ms | 0.855x | marker-compute NOT elided |
+| no-bounds (windows only; guess offsets) | 555ms | 495ms | 0.891x | ≈ production |
+
+**THE SPLIT {marker-prefix(A) / FFI(B) / scheduling(C)}:**
+- DOMINANT = (A) marker-bootstrap COMPUTE (pure-Rust u16 marker decode+resolve of the
+  window-absent prefix), ENTANGLED with (C) alignment as the enabler — CO-PRIMARY. The whole
+  231ms seed-all ceiling needs BOTH (no-windows AND no-bounds each give ~0 alone). Matches
+  project_pregate_placement_is_dominant_lever.
+- (B) FFI-handoff = NEGLIGIBLE: the 318ms seed-all run still hands ALL 17 chunks to ISA-L FFI
+  yet beats rg — FFI cannot be a big term.
+- (C) alignment alone = 0 (no-windows no help); matters only as A's enabler.
+- **T1 (0.899x) is DIFFERENT**: seed is a NO-OP (sequential => windows always present => clean
+  path already taken, inflate_wrapper=16, hits=0) => NO marker bootstrap at T1. T1's residual is
+  the ENGINE symbol-rate + per-chunk FFI + serial output floor, bounded by REAL ISA-L (ocl_cf
+  0.899x zero-margin). The low-T residual is THREAD-COUNT-STRUCTURED: T1 = engine/FFI/output floor
+  (NOT bootstrap-closable); T4 = ADDS the large removable bootstrap term.
+
+**FAITHFULNESS CAVEAT (load-bearing, rule 3):** seed-all is a masks-binder CEILING that
+OVER-removes — it hands gzippy precomputed correct windows from an UNCOUNTED p=1 pre-pass, work rg
+ALSO does at runtime (rg carries the SAME u16 marker machinery). So 1.55x is an UPPER BOUND, NOT a
+reachable target. The FAITHFULLY-CLOSABLE mechanism = rg's window-map + in-place marker narrowing
+(DecodedData.hpp) being faster/more-precise than gzippy's bootstrap — a faithful port, NOT a new
+divergent path. This does NOT prove T4 reaches 0.99x by closing the bootstrap; it proves the
+bootstrap is the DOMINANT low-T-at-T4 term and FFI is NOT, redirecting the lever from FFI/scheduling
+to the marker-bootstrap engine+placement (additive to, independent of, the user-gated clean-tail asm).
+Verdict: plans/lowt-residual-falsifier.md (self-disproof; OWES Opus + Steward sign-off).
+
+## ISA-L DORMANCY RECONCILIATION — OWNER checkpoint: the contradiction is RESOLVED in favor of the BANKED picture. ISA-L is ACTIVE (14/14 fallbacks=0) in env-unset gzippy-isal PRODUCTION at HEAD; the "runtime-dormant / isal==native" fresh number MEASURED A MISLABELED NATIVE BINARY (DIS-13). Scorecard re-established first-hand. NO production code changed; box frozen+released clean, NO orphans [2026-06-08, OWNER turn, worktree isal-dormancy-reconciliation @ d56cb0f5]
+
+**FROZEN-GUEST MEASUREMENTS** (REDACTED_IP, no_turbo=1, BENCH_LOCK=quiet runnable_avg 1.00-1.25,
+watchdog armed→released clean; N=11 interleaved, same-sink /dev/shm regular file, sha==028bd002…cb410f,
+path=ParallelSM asserted, env-scrubbed/oracle-UNSET, rg 0.16.0):
+
+| cell | gzippy-ISAL (bin 2d317027) | gzippy-NATIVE (bin a42d4600) | rg |
+|------|----------------------------|------------------------------|----|
+| T1 | **1032ms = 0.899x** (1% spread) | 1525ms = 0.608x (1%) | 927ms |
+| T4 | **547ms = 0.900x** (3%) | 652ms = 0.761x (3%) | 493-496ms |
+| T8 | **361ms = 0.990x = TIE** (9%) | 410ms = 0.915x (6%) | 358-376ms |
+
+**RUNTIME COVERAGE (GZIPPY_VERBOSE, env-unset, same binaries, sha=OK):** gzippy-ISAL
+isal_chunks=16/14/14 (T1/T4/T8) fallbacks=1/0/0 — **ISA-L FIRES ON THE BULK OF 14 CHUNKS**.
+gzippy-NATIVE isal_chunks=0 (structurally impossible to be non-zero — the native stub returns
+Ok(false), gzip_chunk.rs:390-408). clean_flipped 1.9-2.0% on BOTH (it counts only marker-loop
+pre-handoff clean bytes; the post-flip clean TAIL — the bulk — goes to ISA-L AFTER FlipToClean and
+is NOT in that counter; "98% marker bootstrap" was a MISREAD).
+
+**WHAT THIS OVERTURNS (the prior RESIDUAL-ATTRIBUTION checkpoint below is REFUTED on its load-bearing
+facts):**
+1. "ISA-L is RUNTIME-DORMANT (isal_chunks=0)" — WRONG. That was a gzippy-NATIVE binary mislabeled as
+   gzippy-isal: the fresh "isal" counters (isal_chunks=0 flip_to_clean=12 finished_no_flip=4
+   window_seeded=2) and wall (654ms=0.757x) are byte-for-byte the gzippy-NATIVE signature I reproduced
+   (native T4 = 652ms=0.761x, identical counters). Mislabeled-binary class (rule 4 / DIS-13).
+2. "isal T4 0.757x == native" — WRONG: isal T4 = 0.900x, native = 0.761x; isal is 14-48% faster at
+   EVERY T. The banked ocl_cf 0.899x REPRODUCES (env-unset isal 0.900x).
+3. "the asm target is the marker bootstrap for BOTH builds" — WRONG framing. The builds DIVERGE: the
+   NATIVE clean tail is the pure-Rust inner loop (target = that loop, to capture what ISA-L proves
+   capturable); the ISAL clean tail is already ISA-L (its residual is bounded by REAL ISA-L 0.899x,
+   not closable by a better engine — its lever is the marker-prefix/FFI/scheduling residual, OPEN-1).
+4. "placement/OPEN-2 within-spread (clean-only 10ms TIE)" — its baseline (654ms=0.757x) was the
+   NATIVE wall; the oracle must be RE-RUN on the verified isal binary (OPEN-2 RE-OPENED).
+
+**PIVOTAL ANSWER (supervisor):** the BANKED GOAL #2 picture is REAL — gzippy-isal ties rg at T8
+(0.990x), loses 0.90x at T4 / 0.899x at T1, far closer than native (0.608/0.761/0.915). ISA-L is
+NOT dormant. GOAL #2 is NOT overstated as to ISA-L activity (it IS overstated under BAR-1, which
+requires >=0.99x at EVERY T — isal still loses T1/T4). The asm decision input: gzippy-NATIVE's
+clean-tail inner loop is the engine target (LEV-1 ~0.14-0.16x at T4, now corroborated by the
+env-unset isal-vs-native A/B); gzippy-ISAL is engine-bounded by real ISA-L and needs the
+marker-prefix/FFI/scheduling residual instead. NO production code changed (the only edits are
+plan docs + the disproof-ledger; the byte-transparent build.rs/comment fixes were already in the
+tree). NO asm started. Verdict: plans/isal-dormancy-advisor-verdict.md (self-disproof; OWES a real
+synchronous Opus pass + Steward sign-off — the Agent/subagent tool was NOT available this env).
+
+## RESIDUAL-ATTRIBUTION + OPEN-2 — OWNER checkpoint: the "56ms non-engine residual" does NOT exist at HEAD; ISA-L is RUNTIME-DORMANT on silesia (isal_chunks=0); the T4 deficit is engine-dominated (marker bootstrap, 98% of body); placement/OPEN-2 is within-spread (clean-only TIE); build.rs lying comment FIXED [2026-06-08, OWNER turn, branch reimplement-isa-l @ d56cb0f5; box frozen+released, no orphans] [SUPERSEDED 2026-06-08 by ISA-L DORMANCY RECONCILIATION above — this checkpoint's core facts (isal_chunks=0, isal==native, marker-bootstrap-for-both) were a MISLABELED NATIVE BINARY; see DIS-13]
+
+**FROZEN-BOX MEASUREMENTS** (guest REDACTED_IP, no_turbo=1, BENCH_LOCK=quiet, runnable_avg
+1.25-1.50, watchdog armed then RELEASED clean; N=9 interleaved, same-sink regular file,
+sha=028bd002...cb410f, path=ParallelSM; gzippy-isal binary bin_sha=ea36c8a3, HEAD d56cb0f5):
+- gzippy-isal PRODUCTION (env unset = ISA-L build default) **T4 = 654ms vs rg 495ms = 0.757x**
+  (spread 2%); **T8 = 406ms vs rg 373ms = 0.919x** (spread 3%).
+- clean-only (GZIPPY_SEED_WINDOWS=1, ALL windows seeded) **T4 = 644ms = 0.767x** = +10ms TIE.
+- engine-isolation (ocl_cf, GZIPPY_ISAL_ENGINE_ORACLE=1) **ABORTS coverage-zero**: isal_chunks=0.
+
+**RUNTIME COVERAGE (the reframe):** flip_to_clean=12 finished_no_flip=4; window_present=2/18
+(11.11%), window_absent=16 (88.89%); **isal_chunks=0 isal_fallbacks=2 — ISA-L FIRES ON ZERO
+CHUNKS**; clean_flipped_bytes = **2.0% of body**; marker bootstrap owns **98%** at 85-87 MB/s.
+
+**WHAT THIS OVERTURNS:**
+1. The charter's CORRECTED PICTURE ("gzippy-isal clean tail already runs ISA-L, matches rg, low-T
+   deficit is the residual-only at 0.885x") is REFUTED AT RUNTIME: ISA-L is dormant; gzippy-isal
+   T4 = 0.757x == native (within spread). The SOURCE routes the clean tail to ISA-L (verified;
+   build.rs comment fixed to say so), but at runtime there is almost no clean tail (2%) and ISA-L
+   declines the few window-present chunks ⇒ runtime-vacuous on silesia.
+2. The banked ocl_cf 0.899x / native 0.740x gate and its 0.159/0.101 SPLIT do NOT reproduce
+   (isal_chunks 14→0). OPEN-5 FIRED. LEV-1/LEV-2 split STALE-AT-HEAD (ledger updated).
+3. OPEN-2 (consumer-imminent eviction) is MOOT: clean-only removes the entire window-absent
+   region and is a 10ms TIE ⇒ placement is slack; the eviction-discriminator instrument is NOT
+   owed. (Even a window-present chunk is 98% marker work.)
+
+**RESIDUAL ATTRIBUTION (T4, silesia, removal-oracle-backed):** deficit 0.757x→1.0 (~240ms) is
+DOMINATED by the pure-Rust MARKER-BOOTSTRAP ENGINE (98% of body). Placement/window-absent/
+FFI-handoff/clean-tail are each WITHIN-SPREAD (placement bounded <=10ms by clean-only). This is
+LEV-4 (2.3x clean-rate) generalized to the marker body — the USER-GATED inner-loop asm question
+for BOTH builds.
+
+**PIVOTAL ANSWER (supervisor):** gzippy-ISAL CANNOT reach T4 0.99x by closing a residual alone.
+There is no large non-engine residual at HEAD; ISA-L on the clean tail is runtime-vacuous (2%,
+dormant). The asm target is the MARKER BOOTSTRAP (the 98%), not merely the clean tail. No
+faithful non-asm convergence was landable (the dominant divergence is the gated inner loop; no
+within-spread non-engine lever exists to faithfully port). NO production code changed; the only
+edit is the byte-transparent build.rs comment fix (branch fix/buildrs-isal-comment) + ledger.
+Host frozen for the window then RELEASED clean (no_turbo=0, frozen_now=[], wd inactive). Orphans:
+verified clean local+guest+neurotic. Owes: a real synchronous Opus disproof pass + Steward
+bankability sign-off (the Agent/subagent tool was NOT available this environment — self-disproof
+recorded in plans/residual-attribution-advisor-verdict.md).
+
+
+## CONVERGE-BOOTSTRAP-DIVERGENCE — LEADER checkpoint: the located window-absent divergence IS the USER-GATED inner-loop engine; the one NON-inner-loop candidate (OPEN-2 consumer-imminent eviction) is NOT-yet-actionable (decisive discriminator unrun); NO code changed [2026-06-08, LEADER turn, branch reimplement-isa-l @ d56cb0f5]
+LOCATE (source-verified first-hand at HEAD d56cb0f5, no new measurement — bench guest perception was
+NOT bench-locked this turn: procs_running=3, Plex+neighbors live, neurotic frozen_now=[] => any number
+would be EXPLORATORY-only, not bankable):
+- The dominant window-absent-bootstrap residual = the CLEAN u8 TAIL DECODER, the pure-Rust inner
+  Huffman loop. NATIVE build (the 0.740x T4 1.0x-bar): FlipToClean -> `finish_decode_chunk_contig_native`
+  (gzip_chunk.rs:1169-1193, :1223) -> `block.decode_clean_into_contig` (marker_inflate.rs:2071) =
+  the ISA-L-LUT-ported multi-symbol fast loop. ISAL build: FlipToClean ->
+  `finish_decode_chunk_with_inexact_offset` -> `StreamingInflateWrapper` = pure-Rust resumable.rs
+  (DESPITE the name `isal_clean_tail`; build.rs:98-101 comment is STALE — the clean tail is pure-Rust,
+  NOT ISA-L FFI; advisor-confirmed). The u16 marker PREFIX is already FASTER than rg (0.68x). This is
+  the SAME divergence the window-absent-attribution turn proved causally (SLOW_MODE A/B +194/+248ms in
+  the clean engine, freq-neutral, marker body unchanged) and the advisor UPHELD.
+- => the located instruction divergence is the INNER-LOOP ENGINE INSTRUCTION RATE (pure-Rust symbol
+  decode emitting more instructions than rg's ISA-L). Per charter USER-GATED BOUNDARY: converging it =
+  the inner-loop asm rewrite = the USER'S GATED CALL. STOP-and-report.
+- ASM-SUFFICIENCY READ (advisor-vetted asm-kernel-feasibility-advisor-verdict.md): engine alone is
+  NOT sufficient for T4 0.99 — bounded by ocl_cf == ISA-L == 0.899x (LEV-1). A perfect igzip-class
+  engine projects to a TIE only if PLACEMENT is ALSO closed (co-primary, LEV-5). So the 56ms residual
+  is NOT purely engine-instruction; a full-engine asm port is NECESSARY-but-NOT-SUFFICIENT for T4.
+- NON-INNER-LOOP candidate examined (charter job-b discriminate): OPEN-2 = consumer-imminent chunk
+  eviction (prefetch-horizon-advisor-verdict.md), DISTINCT from DIS-6 (not offset-supply): a free
+  worker exists at every stall yet the covering chunk is neither in-flight nor resident
+  (NOT_RESIDENT=4, has_nearest_le_start=0, idle_cap 1.67-2.67 != 0). The DECISIVE discriminator
+  (never-dispatched vs dispatched-then-EVICTED; parked-vs-unspawned idle; N>>3) is UNRUN => the
+  faithful fix (retention-protect the imminent chunk vs deepen horizon) is NOT yet identified. This is
+  a MEASUREMENT turn requiring a frozen box + new instrument, not a convergence I can land this turn;
+  and it is co-primary, NOT alone-sufficient. NOT started (no half-baked EXPLORATORY build on a
+  thawed box).
+NO production code changed. No worktree needed (no edit). Orphans: NONE (local + perception + neurotic
+pgrep clean; neurotic watchdog inactive, frozen_now=[]). Host left as-found (thawed, not locked).
+
+## JOB 2 — ISA-L STORED/FIXED CLEAN-TAIL COVERAGE: gap MAPPED + advisor-vetted x2 => gap is REAL on small-block-dense input but the CITED port is DOUBLY WRONG; real fix = gzip_chunk until_exact accept (a NEW gated turn). NO production code changed; probes+fixtures committed in worktree [2026-06-08, OWNER turn, worktree isal-resync-stored-fixed @ d56cb0f5, commits 8c87cc24+7695463d]
+SOURCE-VERIFIED first-hand: (1) the cited rapidgzip isal.hpp:392-405 is readBytes() (byte-aligned
+FOOTER reader), NOT a block resync — the real rapidgzip mechanism is readStream() (isal.hpp:255-360,
+a loop of isal_inflate to BFINAL). (2) The gzippy-VENDORED patched ISA-L (igzip_inflate.c:2386-2389
++ 2507-2510) ALREADY emits stopped_at=END_OF_BLOCK after decode_literal_block (stored) AND
+decode_huffman_code_block_stateless (fixed). (3) gzippy decline site gzip_chunk.rs:302-333: the
+until_exact path needs a boundary whose bit_offset == stop_hint EXACTLY; the inexact path needs one
+at-or-past stop_hint else accepts only on end_bit<=stop_hint (BFINAL guard, 19add96c).
+
+EMPIRICAL (guest x86_64 /tmp scratch — NOT the JOB-1 pinned bench root; gzippy-isal release binary
++ wrapper probes; src/tests/isal_stored_fixed_probe.rs):
+- WRAPPER records boundaries on stored (6/6, 64/64) AND fixed (== block count), incl. the production
+  copy-free _into path. NO nbounds=0.
+- The ADVERSARIAL tiny-block fixture (40 MB make_btype01_heavy_data, flate2 L1 + SYNC_FLUSH every
+  2 KiB => 18.2 MB gz, ~20,480 blocks): full production gzippy-isal byte-exact EVERY run, but
+  isal_fallbacks = 1 / 11 / 46-48 / 101-104 at T2/T4/T8/T16 (STABLE x3; fallbacks EXCEED isal_chunks
+  at T4+ => MAJORITY of tail chunks decline). The "common degrade" reproduces THERE.
+- BENIGN on ordinary fixed-Huffman (flate2 L6: isal_fallbacks 0, one-off 1) and irrelevant to
+  silesia (JOB 1: 0 fallbacks). ALL-STORED routes to a separate path=StoredParallel (never the
+  clean-tail engine).
+- ROOT-CAUSE probe on the EXACT tiny-block stream: decompress_deflate_from_bit_with_boundaries
+  records **40,960 boundaries** (2048-byte cadence) => the production comment's "ZERO boundaries on
+  stored/fixed" is EMPIRICALLY FALSE for SYNC_FLUSH input. The decline is the until_exact EXACT-match
+  accept (stop_hint rarely == a boundary bit with dense blocks), NOT absent boundaries, NOT isal.hpp.
+
+ADVISOR x2 (synchronous Opus disproof, plans/isal-resync-advisor-verdict.md): PASS-1 UPHELD-W-CAVEATS
+my lean-to-reject but OWED an adversarial fixture (the until_exact tiny-block regime). PASS-2 (after I
+built+measured it) UPHELD the DECISION but flagged "biggest risk = mislocated root cause" (production
+comment says zero boundaries) — RESOLVED by the 40,960-boundary probe (my accept-logic map is
+CORRECT; the comment is outdated for SYNC_FLUSH).
+
+**SUPERVISOR — JOB 2: the coverage gap is REAL on small-block-dense (SYNC_FLUSH/flush-dense
+streaming) fixed/stored input — NOT the phantom an early read suggested — but the user-cited fix
+(isal.hpp:392-405 read_in resync) is DOUBLY WRONG: wrong function (footer reader) AND the FFI wrapper
+already records boundaries (40,960 on the repro). The real fix = relax gzip_chunk's until_exact
+EXACT-match accept to coalesce to the nearest clean EOB (faithful rapidgzip readStream), a
+correctness-sensitive seed-path change (risks re-introducing the 19add96c over-decode mis-seed) that
+warrants its OWN gated turn with byte-exact dual-sha + fuzz + the committed adversarial fixture as the
+coverage gate. THIS turn DELIVERS: the source refutation, the gap-location map, and the adversarial
+fixture that PROVES the gap (the repro the prior GOAL#2 advisor caveat asserted but never measured).
+No production code changed (probes + fixtures only, worktree commits 8c87cc24 + 7695463d). Findings:
+plans/isal-resync-findings.md. Host restored. NO orphan processes.**
+
+## JOB 1 — LOW-T (T4) ENGINE GATE: the owed TIGHT quiet-box ocl_cf-T4 — MEASURED, advisor UPHELD-W-CAVEATS => PARTIAL (engine share >=0.159x, non-engine residual <=0.101x); NEITHER asm-rewrite started [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD d56cb0f5]
+The owed <=5%-spread quiet-box ocl_cf-T4 vs native-T4 vs rg (the disambiguator the
+prior turns could not get on a Plex-loaded box). Box bench-locked QUIET (Plex+7 noisy
+LXCs frozen, INSTANTANEOUS procs_running gate 1.00-1.50 <=2.0). FIXED a measurement-only
+harness bug first: _oracle_guest.sh's fallback-assert grepped `isal_oracle_chunks=` but
+the binary emits `isal_chunks=N isal_fallbacks=M` (chunk_fetcher.rs:870-874) => the
+engine-isolation kind hard-failed coverage-unreadable on EVERY prior attempt. Script-only
+fix (binary untouched). Harness friction noted: the build-stamp inputs-fingerprint is only
+stable immediately after `--build` (a bare rsync re-run yields a different fingerprint over
+the 13172-file vendor set) => always pass `--build` (cache-hit ~0.11s).
+
+MEASURED (frozen quiet guest REDACTED_IP, T4, interleaved best-of-N, same-sink ->/dev/shm
+regular file, path=ParallelSM asserted, sha==028bd002...cb410f):
+- ocl_cf-T4 (ISA-L engine oracle, bin b9eb0a73, isal_chunks=14 fallbacks=0): 545ms vs
+  rg 490ms = **0.899x**, spread 3% (rg 4%) — TIGHT.
+- native-T4 (pure-Rust production, bin 710a6dc): 652ms vs rg 482ms = **0.740x**, spread
+  4% (rg 6%) — TIGHT.
+
+VERDICT (PARTIAL, pre-registered tie-break #2; falsifier plans/low-t-gate-falsifier.md):
+ocl_cf 0.899 < 0.99 => F-ENGINE-CLOSABLE NOT met (the engine ALONE does not reach parity
+at T4 — even REAL ISA-L, the fastest engine, loses 0.899x). But ocl_cf-native = 0.159 >>
+spread (~5x) => NOT F-NON-ENGINE (the two are decisively unequal). => PARTIAL: the engine
+swap pure-Rust->ISA-L recovers a large share of native's deficit. ADVISOR-CORRECTED SPLIT
+(synchronous Opus disproof, plans/low-t-gate-advisor-verdict.md, UPHELD-W-CAVEATS; the
+ocl_cf "ISA-L ceiling" is a BLEND, source-confirmed gzip_chunk.rs:128-131,196-223 — only
+the clean 32KiB-window continuation goes through ISA-L FFI, the markered prefix + chunk-0
+bootstrap STAY pure-Rust): **engine share >= 0.159x (UNDERESTIMATE)**, **non-engine residual
+<= 0.101x / ~55ms (UPPER BOUND — contains marker-prefix pure-Rust engine + per-chunk ISA-L
+FFI/handoff, NOT pure scheduling)**. ZERO-MARGIN RISK: an asm engine's best case == ISA-L
+== 0.899x at T4 (never 0.99 alone) => parity needs BOTH levers fully realized to land ~1.0.
+
+NAMED NEXT LEVERS (both gated, NEITHER started — asm is user's call):
+(1) full-kernel hand-asm engine rewrite to CAPTURE in pure-Rust the >=0.159x share ISA-L
+    proves capturable (justified by the FFI-off-decode-graph goal, NOT because only asm can
+    close it). Bounded by ocl_cf 0.899x — cannot reach 1.0 alone.
+(2) the <=0.101x non-engine residual = scheduling/bootstrap/FFI-handoff; LOWER-RISK, helps
+    BOTH builds. Candidate project_confirmed_offset_prefetch_gap CANNOT be sized from 0.101
+    until the marker-prefix-engine + FFI buckets are separated (advisor-owed: an oracle that
+    also ISA-Ls the marker prefix, or an FFI-overhead null run).
+
+**SUPERVISOR — JOB 1 gate CLOSED: the low-T deficit is PARTIALLY engine (>=0.159x) +
+PARTIALLY non-engine (<=0.101x, upper bound). The full-kernel asm rewrite remains GATED on
+your call; it can only CAPTURE the engine share, not reach 1.0 alone (zero-margin). NO
+production change landed (measurement-only script fix). Verdict: plans/low-t-gate-advisor-verdict.md;
+falsifier: plans/low-t-gate-falsifier.md. Host auto-restored thawed. NO orphan processes.**
+
+
 ## CACHE-RESIDENCY LITERAL ARCHITECTURE — MET (the two SCOPED items closed, byte-exact, re-measured) [2026-06-08, OWNER turn, branch reimplement-isa-l, HEAD 8d4f20f7+]
 Completes the cache-residency clause's literal architecture from the prior turn's
 SCOPED list (plans/cache-residency-verdict.md §SCOPED). Full verdict:
@@ -2780,3 +3255,301 @@ VERDICT = PLATEAU (by the PRE-REGISTERED structural falsifier).
 - DECISION: do NOT integrate yet (pre-registered: integrate only on PASS). Report the achievable
   pure-Rust ceiling (0.55x) + the decode-falls-below-floor nuance to the supervisor. inline-asm
   spike + the placement co-primary are the two named next directions.
+
+## [2026-06-09] STRUCTURAL-RESIDUAL SIZING CHECKPOINT (owner/structural-residual-sizing @ d56cb0f5, bin 2d317027)
+Full detail + raw numbers appended to plans/disproof-ledger.md (same date). Summary:
+- STEP-0: gzippy-isal at HEAD, isal_chunks=14@T4 / 16@T1 fb=0/1, path=ParallelSM, bin_sha 2d317027
+  (== BAR-2 banked binary). Frozen guest, interleaved N=13-15, sha-verified.
+- (b) SERIAL-OUTPUT = PROVED SHARED FLOOR (dual-removal oracle: gz 51/86ms ≈ rg 44/85ms @T4/T1;
+  removing output from both leaves ratio unchanged 0.86-0.88). NOT a lever (~0% gz-excess).
+- (a) MARKER-BOOTSTRAP = ON the T4 critical path (slow-inject spin 68/155ms @50/100%, sleep control
+  23/67ms, T1 self-test FLAT 16/8ms) but SHARED with rg (gz marker compute ~59-139ms > the ~51ms gap
+  => removing it overshoots rg; T4 output-removed ratio ≈ T1's). NOT the net gz-excess lever.
+- (c) CHUNK-0/PER-CHUNK/PIPELINE = the gzippy-SPECIFIC excess: T1 engine-matched(ISA-L) output-removed
+  gz 932 vs rg 808 = 124ms/0.867x (~100% of the output-removed gap). CANDIDATE FAITHFUL-PORT LEVER
+  (rg per-chunk window-map + consumer pipeline), NOT removal-proved irreducible. Owes its own oracle.
+- VERDICT: BAR-1 low-T is NOT a single proved floor; output+marker are shared/non-levers; the per-chunk
+  pipeline is the live lever. "native >=0.99 every T unreachable" stays LEADING HYPOTHESIS, not proven.
+- Tooling: scripts/bench/{residual.sh,_residual_guest.sh} (new; flag to Steward). Box released clean,
+  no orphans (local+guest+neurotic swept). OWES supervisor Opus gate + Steward bankability.
+
+## D1 OUTPUT-OVER-RESERVE CONVERGENCE — MEASURED, REFUTED as the per-byte lever [2026-06-09, owner/isal-d1-reserve, branch perf/isal-d1-reserve @ dc14ba36, bin cebb7a43]
+
+CHARTER: plans/isal-perbyte-convergence.md (JOB-1 D1 over-reserve + JOB-2 glue). The
+capstone (structural-residual-capstone-verdict.md) named D1 "8× output over-reserve"
+as one of two suspects for the ~13% per-byte T1 gap (gz 226 vs rg 261 MB/s, identical
+ISA-L kernel).
+
+STEP-0 PREMISE (rg uses ISA-L at T1) — VERIFIED FIRST-HAND: rapidgzip 0.16.0's
+compiled `rapidgzip.cpython-313-x86_64-linux-gnu.so` STATICALLY links ISA-L —
+`nm` shows `decode_huffman_code_block_stateless_01`/`_04` (the AVX2/AVX512 igzip
+inflate kernels) + the string "Time spent decoding with ISA-L". So rg's T1 inflate
+IS the same igzip kernel gzippy's FFI calls — engine-matched premise HOLDS.
+
+STEP-0 PROOF-OF-BINARY: freshly built gzippy-isal at HEAD (feature gzippy-isal,
+x86_64, RUSTFLAGS target-cpu=native, cargo-lock serialized), env-unset:
+path=ParallelSM, isal_chunks=14 fb=0 @T4 / 16 fb=1 @T1, sha=028bd002… == pin.
+Real-ISA-L fingerprint (native stub can never increment). bin_sha cebb7a43.
+
+CHANGE: env-gated `GZIPPY_ISAL_RESERVE_FACTOR` (gzip_chunk.rs `isal_reserve_factor`),
+DEFAULT 8 == byte-/cost-identity to HEAD; harness scripts/bench/{d1.sh,_d1_guest.sh}
+(interleaved, freeze-locked, per-factor isal_chunks/fb readback, sha-verified every
+arm, + perf-stat page-fault pass). Reuses the parity/residual contamination bar.
+
+NUMBERS (frozen guest "trainer" REDACTED_IP, bench-lock no_turbo=1 gov=performance,
+quiet-gate runnable_avg<=2.0, interleaved N=11, /dev/shm regular-file sink, sha=OK
+every arm, vs rg 0.16.0):
+
+  T4 (mask 0,2,4,6), rg 498ms:
+    factor= 8 (HEAD): wall 551ms  ratio_vs_rg 0.903  faults 105,246  fb 0
+    factor=12       : wall 570ms  ratio_vs_rg 0.874  faults 133,822  fb 0  (+18ms,+27% faults)
+    factor=16       : wall 558ms  ratio_vs_rg 0.891  faults 133,849  fb 0  (+7ms)
+  T1 (mask 0), rg 925ms, gz spreads 0.8-1.8% (TIGHT):
+    factor= 8 (HEAD): wall 1025ms ratio_vs_rg 0.903  faults 56,946   fb 1*
+    factor=12       : wall 1024ms ratio_vs_rg 0.904  faults 56,947   fb 1*  (-1ms, faults IDENTICAL)
+    factor=16       : wall 1024ms ratio_vs_rg 0.903  faults 56,944   fb 1*  (-1ms, faults IDENTICAL)
+  (* T1 fb=1 is pre-existing HEAD behavior — one window-absent bootstrap chunk
+     legitimately declines; SAME for all factors => my change is identity at default.)
+
+FALLBACK FLOOR (the load-bearing structural fact): factors 5/6/7 EACH force exactly
+1 ISA-L->pure-Rust fallback (isal_chunks 14->13) — one silesia chunk genuinely
+decodes at ~7.5× its compressed span. So **factor 8 is the TIGHTEST 0-fallback
+UNIFORM factor**: the reserve is NOT freely reducible without per-chunk fallbacks
+(which void engine-matching). The "8× over-reserve" is real on AVERAGE chunks
+(~3.3× ratio => 2.4× over) but is pinned by the worst chunk.
+
+VERDICT — D1 is NOT the per-byte lever (REJECTED with mechanism, rule 7b):
+1. T1 (the clean per-byte cell: engine-matched ISA-L, no marker bootstrap, single
+   reused buffer): reserve size is wall- AND fault-NEUTRAL — page-faults IDENTICAL
+   to the byte (56,946/56,947/56,944), wall Δ≤1ms across 8/12/16. Lazy faulting
+   touches only WRITTEN pages; the written footprint == decoded bytes regardless of
+   capacity. The over-reserve costs nothing here. The capstone "over-reserve =>
+   cache/TLB pressure => slows the kernel even at T1" hypothesis is DIRECTLY REFUTED.
+2. T4: bigger reserve ADDS faults (105k->134k, rpmalloc multi-buffer span-cache
+   spill when 48-64MB spans exceed the per-thread cache) but buys only +7..18ms wall
+   => faults are largely SLACK (~sub-ms wall per 1000 faults). Going below 8 is
+   impossible (fallbacks). So even the FAITHFUL incremental-growth fix (per-chunk
+   adaptive: avg chunk reserves ~its 13MB decoded not 32MB) has a CEILING of a few
+   ms (T1 fault-neutral + T4 low fault->wall slope) — far below the ~50ms T4 / ~97ms
+   T1 gaps. Not worth the invasive regrow-resume change.
+=> Converging D1 does NOT move isal T1/T4 toward 0.99.
+
+JOB-2 GLUE (source+disasm-verified; tractable attempts assessed):
+- INNER KERNEL IDENTICAL: gzippy vendor/isa-l vs rg vendor/.../external/isa-l
+  igzip_inflate.c differ only cosmetically (const qualifiers, NO_CHECKSUM ifdefs);
+  the stopping-point patch is byte-for-byte identical. The inflate HOT LOOP is
+  hand-written NASM (igzip_decode_block_stateless_01/04.asm) — same in both.
+- avail_out FEED: REFUTED as a divergence. rg's IsalInflateWrapper::readInto
+  (isal.hpp:258) sets avail_out to the WHOLE output buffer and loops, same as
+  gzippy hands the whole reserve. "rg refills in small BitReader chunks" is FALSE
+  (that's input-side). avail_out-amortization is NOT a real lever.
+- CROSS-LANGUAGE LTO: WRONG TOOL + high-effort/low-payoff => NOT attempted (per
+  charter "if LTO is a yak-shave, STOP+report"). The hot kernel is NASM; LTO/IPO
+  cannot optimize asm. LTO could at most inline the C `isal_inflate` dispatcher
+  into the caller — a per-CALL saving (~thousands of ns total), NOT per-byte. AND
+  gzippy's ISA-L is built by isal-sys via autotools ./configure+make (a separate
+  .a, NASM .o + gcc C); emitting LLVM bitcode for cross-lang LTO would be a
+  multi-hour autotools->cc-rs+bitcode rewrite for a per-call-only payoff. Feasibility:
+  HIGH effort, ~ZERO per-byte payoff. STOP.
+- RESIDUAL per-byte (~0.097x @T1): the inner asm kernel is identical and the
+  per-call/per-block FFI deltas are sub-ms, so the gap is NOT glue/reserve/LTO. It
+  lives in the broader PER-CHUNK + ParallelSM PIPELINE that gzippy runs even at T1
+  (16 separate ISA-L invocations w/ init+set_dict(32KB window copy)+boundary loop,
+  ring/window-map/CRC/handoff) vs rg's leaner per-chunk consumer. This == the
+  capstone's "per-chunk/pipeline" term = an ARCHITECTURE-port lever (faithful port
+  of rg's consumer/window-map), NOT a glue/reserve/LTO quick fix.
+
+ARTIFACTS: /tmp/d1_T1.log, /tmp/d1_T4.log, /tmp/d1_build_parity.log (host side).
+Branch perf/isal-d1-reserve @ dc14ba36 (worktree). Box released clean, no orphans
+(local/guest/neurotic pgrep clean). OWES: supervisor Opus gate on the D1-rejection
+inference + the per-chunk/pipeline-is-the-residual attribution (NOT removal-proved
+here — only D1 + glue eliminated; the pipeline term still owes its own oracle).
+
+## [2026-06-09] PER-CHUNK / PARALLELSM-PIPELINE ISOLATION — REMOVAL-ORACLE VERDICT (owner/perchunk-singleshot, branch perf/perchunk-singleshot, bin 9c466f67, worktree .claude/worktrees/perchunk-singleshot)
+CHARTER: plans/perchunk-pipeline-isolation.md. The last isal low-T suspect after DIS-14
+removal-eliminated D1+glue and RE-LOCALIZED to the per-chunk ParallelSM pipeline (which
+still owed its own oracle). This run SUPPLIES that oracle and CLOSES the isal low-T attribution.
+
+ORACLE (existing single-shot path — source-verified first): `isal_decompress::decompress_gzip_stream`
+(isal_decompress.rs:25) already decodes a WHOLE gzip stream in ONE ISA-L call (no chunking, no
+per-chunk set_dict(32KB), no ring/window-map/handoff/per-chunk-CRC). Wired a MEASUREMENT-ONLY env
+gate `GZIPPY_ISAL_SINGLESHOT=1` (`try_isal_singleshot_oracle`, src/decompress/mod.rs) at all three
+CLI single-member entries (decompress_gzip_libdeflate, decompress_single_member, _fd). NOT
+production (env-gated, isal-only, byte-exact). Harness scripts/bench/{perchunk.sh,_perchunk_guest.sh}
+(reuses parity/residual contamination bar: GZIPPY_* scrub, stale-binary fingerprint, ParallelSM
+assert + isal_chunks readback for gz-prod, IsalSingleShot path assert for the oracle, same-sink
+regular file, interleaved, sha-verify every arm).
+
+STEP-0 proof-of-binary: gzippy-isal at HEAD-equiv (worktree), RUSTFLAGS target-cpu=native,
+cargo-lock serialized. gz-prod env-unset-but-FORCE_PARALLEL_SM=1: path=ParallelSM,
+isal_chunks=16 fb=1 @T1 / 14 fb=0 @T4. gz-singleshot: path=IsalSingleShot(oracle). sha=028bd002… OK.
+
+NUMBERS (frozen guest REDACTED_IP, bench-lock no_turbo=1 gov=performance, quiet runnable_avg=1.00,
+interleaved N=15, /dev/shm regular-file same-sink, sha=OK every arm, vs rg 0.16.0):
+  T1 (mask 0, spreads 0.6-1.0% — TIGHT):
+    gz-prod (ParallelSM 16-chunk) : 1.0131s  209 MB/s  ratio_vs_rg 0.905
+    gz-singleshot (1 ISA-L call)  : 0.7659s  277 MB/s  ratio_vs_rg 1.197   <== BEATS rg
+    rg-file                       : 0.9164s  231 MB/s
+    => per-chunk pipeline cost = gz-prod - gz-singleshot = 247 ms (~24% of T1 wall)
+    => component: perchunk init+set_dict = 124 us over 17 calls = 0.05% of the 247 ms
+  T4 (mask 0,2,4,6, spreads 23-29% — jittery):
+    gz-prod (ParallelSM 14-chunk) : 0.5387s  393 MB/s  ratio_vs_rg 0.911
+    gz-singleshot (single-thread) : 0.7543s  281 MB/s  ratio_vs_rg 0.651  (can't use 4 cores)
+    rg-file                       : 0.4910s  432 MB/s
+    => pipeline is net-POSITIVE +216 ms at T4 (it BUYS the parallelism)
+
+DECOMPOSITION (GZIPPY_VERBOSE counters @T1, gz-prod): markers are ZERO (flip_to_clean=0
+finished_no_flip=0), window_seeded=16, finish_decode=17, inflate_wrapper=1, isal_fallbacks=1.
+So the 247 ms is NOT init/set_dict (124 us) and NOT marker resolution (0 markers) — it is the
+chunk-LIFECYCLE: 1 pure-Rust fallback re-decode + ring/window-map/CRC-per-chunk/handoff + the T1
+SERIALIZATION (each chunk waits the prior chunk's 32 KB tail-window before ISA-L can decode =>
+fully serial with handoff latency, and ZERO parallelism benefit at T1).
+
+VERDICT (pre-registered falsifier RESOLVED): single-shot ISA-L @T1 = 1.197x rg => the per-chunk
+ParallelSM pipeline IS the entire isal low-T gap (an ARCHITECTURE/ROUTING lever; rg = existence
+proof, and the lever's CEILING overshoots rg by 20%). The competing "isal low-T is a proved FLOOR /
+the in-process ISA-L call" hypothesis is REFUTED (DIS-15) — single-shot uses the SAME igzip kernel
+and is the FASTEST arm. This COMPLETES the isal low-T attribution: output (DIS shared floor) +
+marker bootstrap (shared) + D1/glue (DIS-14) + per-chunk pipeline (DIS-15, THIS) — only the last is
+the gzippy-specific low-T excess, and it is a real, sized lever. The cheapest realization is a
+ROUTING fix: at T1 route to single-shot ISA-L instead of forcing chunking. The T4 0.911x residual is
+a SEPARATE parallel-scheduling gap (single-shot can't help there).
+
+CAVEAT owed to the gate: gz-prod is FORCE_PARALLEL_SM=1 (the campaign's standing T1 convention,
+apples-to-apples with prior BAR-1 0.903x); whether real-production `-p1` forces ParallelSM is a
+routing question to confirm before banking the routing fix. gzippy-native UNTOUCHED (separate 0.667x
+engine floor). Box released clean, no orphans (local+guest+neurotic swept; neurotic no_turbo=0,
+watchdog inactive). OWES supervisor Opus gate. Tooling flag to Steward: perchunk.sh/_perchunk_guest.sh.
+
+## T4/T8 CONTENTION + CACHE-RESIDENCY INVESTIGATION — STEP 0 disasm CLOSED, STEP 1 contention REFUTED [2026-06-09, owner/t4-contention @ d56cb0f5, bin 378788924ace0381]
+
+Charter plans/t4-contention-cache-residency.md. Frozen guest REDACTED_IP (bench-lock, no_turbo=1
+~1.394 GHz, released clean; orphan find/ from a STEP-0 search reaped on guest+neurotic+local). Agent
+tool absent => self-disproof only; OWES supervisor Opus gate. Full numbers/mechanism in disproof-ledger.md
+(STEP-0 DISASM section + DIS-17).
+
+- STEP 0: proof-of-binary isal_chunks=16/14/14 fb=1/0/0 path=ParallelSM. DISASM ISA-L Level-2 CLOSED:
+  gzippy's igzip_decode_block_stateless_04.o = AVX2/BMI2 nasm kernel (5 VEX + 17 BMI2, 0 SSE; _01.o=SSE);
+  a contiguous _04 byte-run is verbatim in BOTH the stripped gzippy binary AND rapidgzip's .cpython .so
+  => gzippy & rg execute the IDENTICAL AVX2/BMI2 igzip kernel byte-for-byte. (rapidgzip CLI = python
+  wrapper; real ELF is the .so.)
+- STEP 1: DIS-17 — the contention/variance hypothesis REFUTED. Wall T4 0.898x (gz/rg spread 4%/4%),
+  T8 0.985x TIE (10%/9%) — gz & rg variance MATCHED; the "17-36% gz" disparity does NOT reproduce frozen
+  (thaw artifact). perf: gz +40% INSTRUCTIONS (the dominant gap = WORK, re-confirms LEV-4/VAR_VIII engine
+  story); LLC & L1 MPKI EQUAL-OR-BETTER (not cache-contended); false-sharing c2c HITM=6 (noise); ctx-sw
+  2.3x but tiny. ONE located memory diff = TLB/page-fault FOOTPRINT (RSS +25%, page-faults 2x, dTLB MPKI
+  ~2x; on the user north star) but a SMALL wall term (~9-10ms vs 56-72ms gap) + DIS-14 already sized it
+  wall-slack. STEP 2 NOT entered (no contention to converge; footprint = DIS-14 re-litigation w/o new
+  mechanism => owed its own gated turn). NEW tooling for Steward: scripts/analysis/disasm_proof.sh,
+  scripts/bench/{perf_contention.sh,_perf_contention_guest.sh}.
+
+## DIS-20 (2026-06-09): DE-FRAG WALL A/B — de-frag is ON the T4 critical path (NOT wall-slack), near-slack at T1
+The owed causal perturbation for DIS-19's ~1.70e9 u16 OUTPUT/BACKREF FRAGMENTATION sub-lever (the
+rg-marker gate's CLAIM B FIX-NEEDED). Byte-transparent SLOW-injection (GZIPPY_SLOW_DEFRAG) at the EXACT
+de-frag sites (emit_backref_ring u16-ring + marker drain push_slice), frozen guest, interleaved N=15,
+sha=OK every arm, path=ParallelSM, isal_chunks=14/0@T4. CLEAN (hit-counter atomic confound caught+removed):
+- T4 (OFF 551ms/0.891): DEFRAG 100/200/400% spin => 794/982/1323ms (+243/+431/+772ms, 6-19x spread);
+  200% SLEEP control => 728ms (+177ms) => criticality SURVIVES freq-neutral swap. ON THE CRITICAL PATH.
+- T1 (OFF 1026ms/0.898): DEFRAG 200% spin => 1063ms (+37ms) => NEAR-SLACK (T1 serialization-bound, DIS-15).
+VERDICT: REFUTES "de-frag is wall-slack" AT T4 (TIE-6 footprint-slack does NOT extend to data-movement).
+de-frag flat-buffer PORT is WARRANTED at T4 (largest faithful sub-lever). Rule 3: slow-slope sizes
+CRITICALITY not the speed-up ceiling => flat-buffer REMOVAL oracle (or direct faithful port + measure vs
+rg) is the OWED next step to size the recovered fraction of the ~60ms T4 gap. Do NOT touch flip-to-clean.
+See plans/disproof-ledger.md DIS-20. OWES supervisor Opus gate. NEW tooling -> Steward.
+
+## T1 SINGLE-SHOT ROUTE — LANDED + VERIFIED (2026-06-09, owner/t1-singleshot-route)
+
+Production routing change: gzippy-isal + single-member + num_threads<=1 -> new
+DecodePath::IsalSingleShot (one ISA-L `decompress_gzip_stream` call; CRC32+ISIZE
+verified, no fallback). T>1-isal and ALL native stay ParallelSM. BGZF/multi-member
+classified earlier (unaffected). This turns DIS-15's measured lever into routing.
+
+FROZEN-GUEST PARITY (interleaved, sha-verified every trial, path-asserted; full DIS-22):
+  T1  IsalSingleShot  0.766s vs rg 0.919s = 1.200x  WIN   (N=15)
+  T4  ParallelSM      0.549s vs rg 0.498s = 0.906x  LOSS  (N=11, pre-existing gap, UNCHANGED)
+  T8  ParallelSM      0.361s vs rg 0.374s = 1.038x  TIE   (N=11, UNCHANGED)
+CORRECTNESS: 887 lib tests pass (0 fail); multi-member-at-T1 -> MultiMemberSeq byte-exact
+(not swallowed); dual-sha both features at T1/T4/T8 OK; native byte-transparent.
+See plans/disproof-ledger.md DIS-22. OWES supervisor Opus gate. EXPECT_PATH knob added to
+parity.sh/_parity_guest.sh -> flag to Steward.
+
+## T4-vs-T8 FULL CURVE + S/W fit + engine-vs-machinery verdict (DIS-18) [2026-06-09, owner/t4-curve @ d56cb0f5, bin b9eb0a733b4ccb6d, gzippy-isal]
+
+QUESTION: why is gz LESS competitive at T4 (0.90x) than T8 (1.01x)? Filled the missing
+thread counts; ran the H1/H2/H3 discriminators in the same campaign. Frozen guest
+(no_turbo=1 gov=perf), N=13 interleaved, sha=OK every cell, path=ParallelSM asserted.
+
+CURVE (ratio = rg_wall/gz_wall, gz forced-SM vs rg 0.16.0):
+  T1 0.899 | T2 0.864(trough) | T3 0.887 | T4 0.901 | T5 0.936 | T6 0.968 |
+  T7 1.002(crossover) | T8 1.011 | T9 0.873(chunk-count jump + SMT-spill confound)
+  Monotonic climb, single crossover at T≈7. Scaling-to-T8: gz 2.835x vs rg 2.522x.
+
+FIT wall=S+W/T (scripts/analysis/sw_fit.py), T3..T8 r²=.996/.986:
+  W_gz=1607ms > W_rg=1188ms (+35%); S_gz=161ms < S_rg=217ms (−26%); crossover T*=7.49 ∈ (4,8).
+  => H1 (Amdahl crossover) CONFIRMED on all 3 clauses. (T1..T8 fit r²=.82 — T1/T2 are
+  DIS-15 serial-startup, anti-Amdahl, distort the intercept; valid only in steady regime.)
+
+DISCRIMINATOR (CPU busy-fraction, freeze-insensitive): gz T2/T4/T8 = 94/91/72%;
+  rg = 91/82/59%. At the T4 trough gz workers are 91% BUSY (not idle) and gz is MORE
+  utilized than rg at EVERY T. => H2 (pool contention) and H3 (prefetch starvation)
+  REFUTED (starvation would show LOW utilization). rg --verbose: 17 chunks CONSTANT
+  T2/T4/T8 => H4 tail-wave REFUTED. T9 gz-regression-on-more-chunks corroborates gz is
+  S-floor-bound at high T (SMT-spill co-confound flagged).
+
+VERDICT: the T4 trough is ENGINE-W (Amdahl, asm-bounded pure-Rust marker/inner-loop
+  symbol rate), NOT a machinery defect. The MACHINERY (serial floor S, scheduler
+  utilization) is BETTER than vendor; the ENGINE (W) is worse. LEVER = close W
+  (inner-loop symbol rate); S already at-or-below rg. Matches MEMORY's standing verdict.
+  T1-bypass single-shot (DIS-15 0.766s/1.197x) NOT in d56cb0f5 (lives on owner/t1-singleshot-route).
+  See plans/disproof-ledger.md DIS-18. OWES supervisor Opus gate. NEW tooling (flag to
+  Steward): parity.sh pin_mask T2/3/5/6/7/9 + --bypass; _cpu_discriminator.sh; sw_fit.py.
+
+## HIGH-T CURVE + TOPOLOGY CONTROL + per-T fb/flip counters — VERDICT: LOSS at 16+ (DIS-24) [2026-06-09, owner/t4-curve @ d56cb0f5, bin b9eb0a733b4ccb6d]
+
+The amdahl-verdict-gate.md CLAIM-3(a) owed measurement — the goal's OWN 16+-thread regime — is RESOLVED.
+One frozen-snapshot multi-T topology sweep (NEW tooling scripts/bench/hicurve.sh + _hicurve_guest.sh,
+faithful parity-spine extension; build ONCE, freeze ONCE, loop cells; per-cell GZIPPY_VERBOSE counters).
+i7-13700T topology VERIFIED: 8 P-cores w/ SMT (logical 0-1..14-15) + 8 E-cores no-SMT (16-23) = 24 logical
+=> the old "T16=0..15" mask is SMT-oversubscribed on 8 P-cores, NOT 16 physical cores (the gate's confound).
+
+CURVE (ratio=rg/gz, >1=gz wins; gz forced-SM vs rg 0.16.0; N=9 interleaved, sha=OK, ParallelSM):
+  T8-Pphys 1.001 TIE | T9-E 0.938 | T9-SMT 0.890 | T10-E 0.855 | T12-E 0.790 | T14-E 0.768(trough) |
+  T16-Ephys(16 PHYSICAL) 0.861 | T16-SMT(old mask) 0.912 | T24-all 0.889 | T32-oversub 0.893
+  PEAKS at T7/T8, then TURNS OVER — gz LOSES every cell T9..T32.
+
+PER-T COUNTERS (the gate's owed fb/flip firm-up — fb is NOT 0 and flip does NOT plateau above T8):
+  chunks(finish_decode): 14→19→19→19→23→23→28→28→34→34 (T-PROPORTIONAL; rg holds ~17 CONSTANT)
+  isal_fallbacks:        0 → 1 (T9..T16) → 2 (T24/T32)
+  flip_to_clean:         12→18→18→18→20→20→25→25→31→31 (marker fraction RISES 12→31)
+
+VERDICT: the goal's 16+-thread regime is a LOSS for gzippy-isal. The S-floor "gz keeps winning as T→∞"
+story INVERTS past T8. HIGH-T BINDER = gz's T-proportional chunk-count growth (14→34) vs rg's constant ~17:
+each added chunk raises W (more speculative marker-decode), S (longer serial publish-chain), and fb risk
+(~7.5× re-decode spikes). gz over-partitions for E-cores (low IPC) / SMT siblings (shared ports) that don't
+deliver P-core-equivalent throughput, while rg's wall stays FLAT (saturated/floored). gz WINS/TIES rg ONLY
+in the narrow T7-T8 window. The fixed-W Amdahl fit (DIS-18) is MEASURED-contaminated above T8 and must NOT
+be extrapolated to high-T. T9 dip DISENTANGLED: real machinery knee (T9-E=0.938, no SMT spill) + SMT-spill
+penalty (T9-SMT=0.890) — the dip survives clean physical placement => chunk-count machinery, not topology.
+
+OWES supervisor Opus gate (no advisor in owner env => self-disproof only). Box released clean (RESTORE
+VERIFIED, watchdog inactive); leaked timeout wrappers reaped; guest+neurotic lock-free. NEW tooling ->
+Steward: scripts/bench/{hicurve.sh,_hicurve_guest.sh}. See plans/disproof-ledger.md DIS-24.
+
+## DIS-26 [2026-06-09, owner/dis26-consumer-decompose] — the pre-registered DIS-6 item (i) consumer
+## decompose + CAUSAL oracle at HIGH-T (T16-Ephys, container live-expanded cores:16->24 then RESTORED).
+VERDICT = (b): the high-T in-order CONSUMER is DECODE-WAIT-bound, NOT window-publish/post-process
+SERIAL-WORK-bound. fulcrum_total decompose of the wall-critical consumer thread (production, sha=OK,
+selftest PASS): DECODE-WAIT (blocked on worker decodes) 66%/50%/54% @ T8/T16/T24; serial writev OUTPUT
+31%/43%/36%; the NAMED serial-work (window-publish + post-process on the consumer) only 1.7%/3.6%/6.9%
+— and post_process.apply_window (heavy) ALREADY runs on the POOL, not the consumer; window_publish_* is
+sub-ms. CAUSAL oracle (per-chunk delay knob at the publish site, gated off==identity, patched-rebuild
+restored after): sleep 0/500/1000/2000us => 328/343/361/398ms (~1:1 with chunks*delay, ~20% compounding;
+spin==sleep => freq-neutral). Per rule 3 the ~1:1 slope is the in-order-consumer-IS-the-wall tautology, NOT
+publish-gating dominance; removable lean-consumer budget = the 2-7% serial bucket = ~5/10/23ms (grows with
+chunk count, the DIS-24 mechanism) — REAL + faithful but BOUNDED, cannot close the ~22ms T16-Ephys gap
+alone, ~0 at T7-T8. Dominant high-T binder = DECODE-WAIT (the gated asm engine; LEV-4 2.3x clean-rate) +
+serial writev OUTPUT (DIS-5 surface). Owed-separately (NOT done): squishy cross-check (silesia = rg's
+tuning corpus). Box restored cores:16/cpuset 0-15 (taskset16 fails, VERIFIED), thawed (no_turbo=0, wd
+inactive), all-host pgrep-clean. OWES supervisor Opus gate. NEW tooling -> Steward: scripts/bench/
+{_dis26_capture_guest.sh,_dis26_oracle_guest.sh} + worktree-only chunk_fetcher.rs:1665 delay knob. See
+plans/disproof-ledger.md DIS-26.
