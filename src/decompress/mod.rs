@@ -81,6 +81,21 @@ pub enum DecodePath {
     /// stored streams are trivially, bandwidth-bound parallelizable.
     #[allow(dead_code)] // constructed only under parallel_sm (production)
     StoredParallel,
+    /// Single-threaded (`num_threads <= 1`) single-member decode on the
+    /// gzippy-isal build (`isal_clean_tail`): the WHOLE stream through ONE
+    /// ISA-L `isal_inflate` call (`isal_decompress::decompress_gzip_stream`),
+    /// no chunking. The 16-chunk ParallelSM pipeline buys ZERO parallelism at
+    /// one thread — each chunk waits the prior's 32 KiB tail window before it
+    /// can ISA-L-decode, so it runs fully serial WITH handoff/ring/window-map
+    /// overhead (DIS-15: that lifecycle costs ~247 ms / ~24% of the T1 wall;
+    /// single-shot = 1.197x rapidgzip vs ParallelSM 0.905x, byte-exact —
+    /// `decompress_gzip_stream` verifies the gzip CRC32+ISIZE via ISA-L's
+    /// `IGZIP_GZIP` crc_flag, a non-zero `isal_inflate` ret => terminal Err,
+    /// no fallback). Constructed ONLY under `isal_clean_tail` for true
+    /// single-member streams (multi-member/BGZF are classified earlier and
+    /// never reach here); on the gzippy-native build T1 stays ParallelSM.
+    #[allow(dead_code)] // constructed only under isal_clean_tail (production)
+    IsalSingleShot,
     // Only constructed in the legacy `not(parallel_sm)` build; under
     // `parallel_sm` (production) single-member never routes to C-FFI.
     #[allow(dead_code)]
@@ -163,6 +178,26 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     // feature as fuzz oracles; production never routes to them.
     #[cfg(parallel_sm)]
     {
+        // T1 ROUTE (gzippy-isal only): single-threaded single-member decode
+        // goes to ONE ISA-L call, not the 16-chunk ParallelSM pipeline. At one
+        // thread the pipeline's chunking buys NO parallelism (each chunk waits
+        // the prior's 32 KiB tail window before it can ISA-L-decode → fully
+        // serial) yet still pays ring/window-map/CRC/handoff — ~247 ms / ~24%
+        // of the T1 wall (DIS-15). Single-shot ISA-L (same igzip kernel) =
+        // 1.197x rapidgzip vs the pipeline's 0.905x, byte-exact. This is the
+        // gzippy-isal charter literally ("hand off to ISA-L at the right spot"
+        // — at T1 the right spot is one ISA-L call). gzippy-NATIVE has no ISA-L
+        // (`isal_clean_tail` false) so it stays ParallelSM at every T.
+        // Multi-member/BGZF are classified above and never reach here; and
+        // `decompress_gzip_stream` itself loops over trailing gzip members, so
+        // a multi-member stream that slipped past the detection window still
+        // decodes fully (no truncation).
+        #[cfg(isal_clean_tail)]
+        {
+            if num_threads <= 1 {
+                return DecodePath::IsalSingleShot;
+            }
+        }
         // No thread/size floor: correctness-wise the pure-Rust pipeline
         // handles any size/T (verified byte-exact for tiny / T1 /
         // incompressible / stored), and FFI is no longer an option, so
@@ -269,6 +304,7 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
         DecodePath::ParallelSM
         | DecodePath::StoredParallel
+        | DecodePath::IsalSingleShot
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
             decompress_single_member_for(path, data, writer, None, num_threads)
@@ -299,6 +335,7 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
         }
         DecodePath::ParallelSM
         | DecodePath::StoredParallel
+        | DecodePath::IsalSingleShot
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
             decompress_single_member_for(path, data, writer, out_fd, num_threads)
@@ -368,6 +405,7 @@ pub(crate) fn decompress_single_member<W: Write>(
         }
         DecodePath::ParallelSM
         | DecodePath::StoredParallel
+        | DecodePath::IsalSingleShot
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
             decompress_single_member_for(path, data, writer, None, num_threads)
@@ -457,6 +495,30 @@ fn decompress_single_member_for<W: Write>(
             #[cfg(test)]
             LIBDEFLATE_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             decompress_single_member_libdeflate(data, writer)
+        }
+        // T1 single-threaded single-member on the gzippy-isal build: ONE ISA-L
+        // `isal_inflate` over the whole stream (no chunking pipeline). Verifies
+        // the gzip CRC32 + ISIZE via ISA-L's IGZIP_GZIP crc_flag — a non-zero
+        // ret => `decompress_gzip_stream` returns None => terminal Err here,
+        // NO fallback (rule 5). Constructed only under `isal_clean_tail`; on
+        // other builds the variant is never produced by `classify_gzip`, and
+        // `decompress_gzip_stream` resolves to the no-op stub. `out_fd` is
+        // unused (the writer is the sink; single-shot needs no zero-copy
+        // writev plumbing at one thread).
+        DecodePath::IsalSingleShot => {
+            let _ = out_fd;
+            if crate::utils::debug_enabled() {
+                eprintln!(
+                    "[gzippy] IsalSingleShot: one ISA-L call, {} bytes",
+                    data.len()
+                );
+            }
+            let n = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
+                .ok_or_else(|| {
+                    GzippyError::decompression("isal single-shot decode failed".to_string())
+                })?;
+            writer.flush()?;
+            Ok(n)
         }
         // unreachable on well-formed callers — `decompress_gzip_libdeflate`
         // routes multi-member / bgzf paths before calling here.
@@ -769,11 +831,28 @@ mod tests {
     #[test]
     fn test_parallel_sm_thread_gate() {
         let (_raw, payload) = compressible_parallel_fixture();
-        // Pure-Rust-sole (task #8): the engine is the only single-member
-        // path at EVERY thread count — no thread gate, because there is no
-        // C-FFI one-shot to gate toward. (Legacy `not(parallel_sm)` build
-        // keeps the T>=4 gate that fed the FFI one-shot below it.)
-        #[cfg(parallel_sm)]
+        // ParallelSM is the single-member path at EVERY thread count on
+        // gzippy-native (no C-FFI one-shot to gate toward, task #8). On the
+        // gzippy-isal build (`isal_clean_tail`) T1 routes to single-shot ISA-L
+        // (DIS-15: the 16-chunk pipeline buys no parallelism at one thread),
+        // while T>=2 stays ParallelSM. (Legacy `not(parallel_sm)` build keeps
+        // the T>=4 gate that fed the FFI one-shot below it.)
+        #[cfg(all(parallel_sm, isal_clean_tail))]
+        {
+            assert_eq!(
+                classify_gzip(&payload, 1),
+                DecodePath::IsalSingleShot,
+                "T=1 on gzippy-isal must take single-shot ISA-L"
+            );
+            for t in [2usize, 3, 4] {
+                assert_eq!(
+                    classify_gzip(&payload, t),
+                    DecodePath::ParallelSM,
+                    "T={t} on gzippy-isal must take the ParallelSM pipeline"
+                );
+            }
+        }
+        #[cfg(all(parallel_sm, not(isal_clean_tail)))]
         for t in [1usize, 2, 3, 4] {
             assert_eq!(
                 classify_gzip(&payload, t),

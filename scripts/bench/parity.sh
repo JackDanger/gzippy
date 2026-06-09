@@ -55,6 +55,10 @@ DO_BUILD=0; DO_FULCRUM=0; DO_SYNC=1; DRY=0
 DO_LOCK=1
 HOST_FROZEN="${HOST_FROZEN:-0}"
 FEATURE="${DEFAULT_FEATURE:-gzippy-native}"
+# EXPECT_PATH — the production DecodePath this cell must take (Rule 6 routing
+# assertion). Default ParallelSM. The gzippy-isal T1 cell routes to single-shot
+# ISA-L, so measure it with `--expect-path IsalSingleShot` (DIS-15).
+EXPECT_PATH="${EXPECT_PATH:-ParallelSM}"
 T=8; N=11
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -66,6 +70,8 @@ while [ "$#" -gt 0 ]; do
     -T*) T="${1#-T}";;
     -N) N="$2"; shift;;
     -N*) N="${1#-N}";;
+    --expect-path) EXPECT_PATH="$2"; shift;;
+    --expect-path=*) EXPECT_PATH="${1#*=}";;
     --fulcrum|--decompose) DO_FULCRUM=1;;
     --no-sync) DO_SYNC=0;;
     --lock) DO_LOCK=1;;
@@ -107,6 +113,7 @@ CORPUS_RAW_SHA256='$CORPUS_RAW_SHA256' CORPUS_GZ_SHA256='${CORPUS_GZ_SHA256:-}' 
 RG='$RG' RG_TRACE='$RG_TRACE' FEATURE='$FEATURE' T='$T' N='$N' MASK='$MASK' \
 GOV='$GOV' NO_TURBO='$NO_TURBO' HOST_FROZEN='$HOST_FROZEN' RUSTFLAGS_PIN='$RUSTFLAGS_PIN' \
 ALLOW_LOAD='${ALLOW_LOAD:-0}' MAX_LOADAVG='${MAX_LOADAVG:-2.0}' \
+EXPECT_PATH='$EXPECT_PATH' \
 DO_BUILD='$DO_BUILD' DO_FULCRUM='$DO_FULCRUM' ARTDIR='${ARTDIR_BASE}/parity'
 EOF
 }
