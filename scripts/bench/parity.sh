@@ -55,6 +55,9 @@ DO_BUILD=0; DO_FULCRUM=0; DO_SYNC=1; DRY=0
 DO_LOCK=1
 HOST_FROZEN="${HOST_FROZEN:-0}"
 FEATURE="${DEFAULT_FEATURE:-gzippy-native}"
+# Optional second binary for three-way interleave (rg vs gz1 vs gz2).
+GZIPPY_BIN2="${GZIPPY_BIN2:-}"
+FEATURE2="${FEATURE2:-}"
 # EXPECT_PATH — the production DecodePath this cell must take (Rule 6 routing
 # assertion). Default ParallelSM. The gzippy-isal T1 cell routes to single-shot
 # ISA-L, so measure it with `--expect-path IsalSingleShot` (DIS-15).
@@ -78,6 +81,10 @@ while [ "$#" -gt 0 ]; do
     --no-lock) DO_LOCK=0;;
     --host-frozen) HOST_FROZEN=1;;
     --dry-run) DRY=1;;
+    --bin2) GZIPPY_BIN2="$2"; shift;;
+    --bin2=*) GZIPPY_BIN2="${1#*=}";;
+    --feature2) FEATURE2="$2"; shift;;
+    --feature2=*) FEATURE2="${1#*=}";;
     *) echo "parity.sh: unknown arg '$1'" >&2; usage; exit 2;;
   esac
   shift
@@ -113,6 +120,7 @@ CORPUS_RAW_SHA256='$CORPUS_RAW_SHA256' CORPUS_GZ_SHA256='${CORPUS_GZ_SHA256:-}' 
 RG='$RG' RG_TRACE='$RG_TRACE' FEATURE='$FEATURE' T='$T' N='$N' MASK='$MASK' \
 GOV='$GOV' NO_TURBO='$NO_TURBO' HOST_FROZEN='$HOST_FROZEN' RUSTFLAGS_PIN='$RUSTFLAGS_PIN' \
 ALLOW_LOAD='${ALLOW_LOAD:-0}' MAX_LOADAVG='${MAX_LOADAVG:-2.0}' \
+GZIPPY_BIN2='$GZIPPY_BIN2' FEATURE2='$FEATURE2' \
 EXPECT_PATH='$EXPECT_PATH' \
 DO_BUILD='$DO_BUILD' DO_FULCRUM='$DO_FULCRUM' ARTDIR='${ARTDIR_BASE}/parity'
 EOF
