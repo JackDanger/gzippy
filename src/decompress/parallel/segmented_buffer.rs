@@ -544,6 +544,26 @@ impl SegmentedU8 {
     }
 }
 
+/// Sink for the incremental (growable) copy-free ISA-L decode. Grows the single
+/// contiguous backing `Vec` on demand so the steady-state footprint tracks the
+/// ACTUAL decoded size rather than an 8x-compressed-span over-reserve — the
+/// faithful analogue of rapidgzip's fixed-`ALLOCATION_CHUNK_SIZE` segment append
+/// (GzipChunk.hpp:309-379), done on one contiguous Vec.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+impl crate::backends::isal_decompress::IncrementalOutSink for SegmentedU8 {
+    #[inline]
+    fn commit_and_reserve(&mut self, just_written: usize, min_spare: usize) -> (*mut u8, usize) {
+        self.commit(just_written);
+        if min_spare == 0 {
+            // Final flush: commit only; the returned region is unused.
+            return (self.buf.as_mut_ptr(), 0);
+        }
+        let spare = self.writable_tail_reserve(min_spare);
+        let len = spare.len();
+        (spare.as_mut_ptr(), len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
