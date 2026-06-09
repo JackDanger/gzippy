@@ -156,17 +156,24 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         };
     }
     // SINGLE-MEMBER. When the pure-Rust engine is compiled (`parallel_sm`,
-    // i.e. the `pure-rust-inflate` build), it is the SOLE single-member
-    // decode path — NO C-FFI in the decode graph (/goal part 1, task #8).
-    // The C-FFI backends (ISA-L / libdeflate / zlib-ng) remain compiled
-    // ONLY in the `not(parallel_sm)` legacy build and behind the dev/oracle
-    // feature as fuzz oracles; production never routes to them.
+    // i.e. the `pure-rust-inflate` build), single-member always routes to the
+    // ParallelSM pipeline — never a C-FFI one-shot dispatch (libdeflate/zlib-ng
+    // one-shot). On the gzippy-native build the ParallelSM pipeline is pure-Rust
+    // end-to-end (NO C-FFI in the decode graph, /goal part 1, task #8). On the
+    // gzippy-isal build (x86_64 + `isal-compression`, sets `isal_clean_tail`)
+    // the SAME ParallelSM pipeline decodes the clean tail through REAL ISA-L FFI
+    // (gzip_chunk.rs `finish_decode_chunk_impl` -> `decompress_deflate_from_bit_into`,
+    // faithful rapidgzip WITH_ISAL) — so on that build C-FFI IS on the decode
+    // graph by design. The one-shot C-FFI backends remain compiled ONLY in the
+    // `not(parallel_sm)` legacy build and behind the dev/oracle feature as fuzz
+    // oracles; production single-member never routes to a one-shot.
     #[cfg(parallel_sm)]
     {
-        // No thread/size floor: correctness-wise the pure-Rust pipeline
+        // No thread/size floor: correctness-wise the ParallelSM pipeline
         // handles any size/T (verified byte-exact for tiny / T1 /
-        // incompressible / stored), and FFI is no longer an option, so
-        // EVERY single-member stream routes to a pure-Rust decoder.
+        // incompressible / stored), and the C-FFI one-shot is no longer an
+        // option, so EVERY single-member stream routes to the ParallelSM
+        // pipeline (pure-Rust on gzippy-native; ISA-L clean tail on gzippy-isal).
         // Stored-dominated streams have sparse deflate boundaries; the
         // speculative marker pipeline thrashes on them, so use the explicit
         // stored-block parallel decoder (also pure-Rust). It re-validates
@@ -425,8 +432,9 @@ fn decompress_single_member_for<W: Write>(
                             "[gzippy] StoredParallel declined (not pure-stored) → pure-Rust SM"
                         );
                     }
-                    // Pure-Rust marker pipeline (NOT a C-FFI one-shot): the
-                    // decode graph stays FFI-free under `parallel_sm`.
+                    // ParallelSM marker pipeline (NOT a C-FFI one-shot). On
+                    // gzippy-native the decode graph stays FFI-free; on
+                    // gzippy-isal the clean tail uses ISA-L FFI.
                     #[cfg(parallel_sm)]
                     {
                         let n = crate::decompress::parallel::single_member::decompress_parallel(
@@ -473,8 +481,9 @@ fn decompress_single_member_for<W: Write>(
 /// available, zlib-ng streaming for >1 GiB, else libdeflate one-shot.
 ///
 /// Legacy-build only: under `parallel_sm` (the default/production build) the
-/// pure-Rust pipeline is the sole single-member path and this C-FFI one-shot is
-/// off the decode graph.
+/// ParallelSM pipeline is the sole single-member path and this C-FFI one-shot
+/// is off the decode graph. (The pipeline is pure-Rust on gzippy-native; on
+/// gzippy-isal its clean tail uses ISA-L FFI — but never this one-shot.)
 #[cfg(not(parallel_sm))]
 fn decompress_single_member_one_shot<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() > 1024 * 1024 * 1024 {
@@ -769,10 +778,12 @@ mod tests {
     #[test]
     fn test_parallel_sm_thread_gate() {
         let (_raw, payload) = compressible_parallel_fixture();
-        // Pure-Rust-sole (task #8): the engine is the only single-member
-        // path at EVERY thread count — no thread gate, because there is no
-        // C-FFI one-shot to gate toward. (Legacy `not(parallel_sm)` build
-        // keeps the T>=4 gate that fed the FFI one-shot below it.)
+        // ParallelSM-sole (task #8): the ParallelSM pipeline is the only
+        // single-member path at EVERY thread count — no thread gate, because
+        // there is no C-FFI one-shot to gate toward. (Pipeline is pure-Rust on
+        // gzippy-native; ISA-L clean tail on gzippy-isal. Legacy
+        // `not(parallel_sm)` build keeps the T>=4 gate that fed the FFI
+        // one-shot below it.)
         #[cfg(parallel_sm)]
         for t in [1usize, 2, 3, 4] {
             assert_eq!(
@@ -896,9 +907,11 @@ mod tests {
 
     /// A single-member input *below* the old 10 MiB parallel gate routes
     /// deterministically. Under `parallel_sm` (the production build) the
-    /// pure-Rust engine is the SOLE single-member path — below-gate inputs
-    /// route to a pure-Rust decoder, NEVER C-FFI (task #8). Under the legacy
-    /// `not(parallel_sm)` build they route to the C-FFI one-shot.
+    /// ParallelSM pipeline is the SOLE single-member path — below-gate inputs
+    /// route to it, NEVER to a C-FFI one-shot (task #8). That pipeline is
+    /// pure-Rust on gzippy-native; on gzippy-isal its clean tail uses ISA-L
+    /// FFI. Under the legacy `not(parallel_sm)` build they route to the C-FFI
+    /// one-shot.
     #[test]
     fn test_parallel_sm_routes_below_10mib() {
         let small: Vec<u8> = vec![0u8; 1024 * 1024]; // 1 MiB original

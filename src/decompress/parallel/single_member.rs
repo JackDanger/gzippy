@@ -28,9 +28,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 // (Removed 2026-06-04, task #8) `MIN_PARALLEL_SIZE`: was a 4 MiB floor below
-// which a C-FFI one-shot decoded small inputs. Pure-Rust is now the SOLE
-// single-member path at any size (verified byte-exact for tiny / incompressible
-// / stored at T1+T4), so there is no floor and no FFI fallback.
+// which a C-FFI one-shot decoded small inputs. The ParallelSM pipeline is now
+// the SOLE single-member path at any size (verified byte-exact for tiny /
+// incompressible / stored at T1+T4), so there is no floor and no one-shot FFI
+// fallback. (That pipeline is pure-Rust on gzippy-native; on gzippy-isal its
+// clean tail decodes via ISA-L FFI — see gzip_chunk.rs `finish_decode_chunk_impl`.)
 // 1 (was 2, 2026-05-31): the parallel-SM engine is the production path at EVERY
 // thread count (MIN_PARALLEL_SM_THREADS=0, user directive). At num_threads=1 the
 // pool has one worker and the consumer runs on the calling thread (2 OS threads,
@@ -169,8 +171,9 @@ pub fn decompress_parallel<W: Write>(
         return Err(ParallelError::InvalidGzipFormat);
     }
     let _deflate_data_len = gzip_data.len().saturating_sub(header_size + trailer_size);
-    // No size floor (task #8: pure-Rust is the sole single-member path at any
-    // size). Only num_threads is gated — T=0 is a caller bug.
+    // No size floor (task #8: the ParallelSM pipeline is the sole single-member
+    // path at any size — pure-Rust on gzippy-native, ISA-L clean tail on
+    // gzippy-isal). Only num_threads is gated — T=0 is a caller bug.
     if num_threads < MIN_THREADS_FOR_PARALLEL {
         return Err(ParallelError::InvalidGzipFormat);
     }

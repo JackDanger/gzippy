@@ -223,11 +223,15 @@ if [ "$ASSERT_NO_FALLBACK" = 1 ]; then
   # shellcheck disable=SC2086
   env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 $GZ_ENV \
     taskset -c "$MASK" "$GZIPPY_BIN" -d -c -p "$T" "$CORPUS" >/dev/null 2>"$COVLOG" || true
-  COVLINE="$(grep -m1 'isal_oracle_chunks=' "$COVLOG" || true)"
-  OC_CHUNKS="$(printf '%s' "$COVLINE" | sed -n 's/.*isal_oracle_chunks=\([0-9]*\).*/\1/p')"
-  OC_FALLBACKS="$(printf '%s' "$COVLINE" | sed -n 's/.*isal_oracle_fallbacks=\([0-9]*\).*/\1/p')"
-  echo "## coverage: isal_oracle_chunks=${OC_CHUNKS:-NA} isal_oracle_fallbacks=${OC_FALLBACKS:-NA}  (from $COVLINE)"
-  [ -n "$OC_CHUNKS" ] || fail "coverage-unreadable: no isal_oracle_chunks= line in GZIPPY_VERBOSE — cannot certify the ceiling (engine oracle did not run?)" 15
+  # The binary's GZIPPY_VERBOSE line is "... isal_chunks=N isal_fallbacks=M"
+  # (chunk_fetcher.rs:870-874). Match that exact label (the old grep looked for
+  # isal_oracle_chunks=, a label that never existed in the output -> false
+  # coverage-unreadable abort).
+  COVLINE="$(grep -m1 'isal_chunks=' "$COVLOG" || true)"
+  OC_CHUNKS="$(printf '%s' "$COVLINE" | sed -n 's/.*isal_chunks=\([0-9]*\).*/\1/p')"
+  OC_FALLBACKS="$(printf '%s' "$COVLINE" | sed -n 's/.*isal_fallbacks=\([0-9]*\).*/\1/p')"
+  echo "## coverage: isal_chunks=${OC_CHUNKS:-NA} isal_fallbacks=${OC_FALLBACKS:-NA}  (from $COVLINE)"
+  [ -n "$OC_CHUNKS" ] || fail "coverage-unreadable: no isal_chunks= line in GZIPPY_VERBOSE — cannot certify the ceiling (engine oracle did not run?)" 15
   [ "${OC_CHUNKS:-0}" -gt 0 ] || fail "coverage-zero: isal_oracle_chunks=0 — the ISA-L engine never ran; ceiling MEANINGLESS" 15
   [ "${OC_FALLBACKS:-1}" -eq 0 ] || fail "coverage-contaminated: isal_oracle_fallbacks=$OC_FALLBACKS>0 — pure-Rust blended into the ISA-L ceiling (Rule 4); ceiling VOID. Widen the oracle reserve bound or fix the uncovered chunk." 15
 fi

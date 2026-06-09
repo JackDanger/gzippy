@@ -116,6 +116,7 @@ thread_local! {
 /// thread (subsequent calls early-return on the thread-local flag). Counters
 /// only — does not touch decode state.
 #[inline]
+#[allow(dead_code)] // sole caller is under cfg(parallel_sm) (gzip_chunk.rs)
 pub fn on_block_active(bytes: BlockHeapBytes) {
     // Ballast (positive control) is on its OWN switch, independent of
     // GZIPPY_MEM_STATS, so the RSS-vs-T guard can drive it without accounting
