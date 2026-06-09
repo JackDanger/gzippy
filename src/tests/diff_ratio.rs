@@ -196,7 +196,18 @@ mod tests {
                     );
                 },
                 || {
-                    let _ = crate::decompress::decompress_gzip_to_vec(data, 1).unwrap();
+                    // The pipeline's OWN T1 decode (NOT the production router):
+                    // this guard measures "ParallelSM pipeline at T4 vs the same
+                    // pipeline at T1." On gzippy-isal the production T1 route is
+                    // now single-shot ISA-L (DIS-15), which would make this a
+                    // pipeline-vs-single-shot comparison (ratio ~10x) and defeat
+                    // the guard's purpose. Calling `decompress_parallel(..., 1)`
+                    // directly keeps it a true, build-independent
+                    // pipeline-vs-itself regression check.
+                    let mut out = Vec::new();
+                    let _ = crate::decompress::parallel::single_member::decompress_parallel(
+                        data, &mut out, None, 1,
+                    );
                 },
             );
             parallel_batches[batch] = p;
