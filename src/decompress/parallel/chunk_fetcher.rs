@@ -848,8 +848,9 @@ fn drive_impl<W: std::io::Write>(
             use crate::decompress::parallel::gzip_chunk::{
                 BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, FINISHED_NO_FLIP_CHUNKS,
                 FINISH_DECODE_ENTRIES, FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS,
-                INFLATE_WRAPPER_CHUNKS, ISAL_ENGINE_ORACLE_CHUNKS, ISAL_ENGINE_ORACLE_FALLBACKS,
-                WINDOW_SEEDED_CHUNKS,
+                INFLATE_WRAPPER_CHUNKS, ISAL_BFINAL_EXACT_LANDING_ACCEPTED,
+                ISAL_ENGINE_ORACLE_CHUNKS, ISAL_ENGINE_ORACLE_FALLBACKS, ISAL_INEXACT_FALLBACKS,
+                ISAL_UNTIL_EXACT_FALLBACKS, WINDOW_SEEDED_CHUNKS,
             };
             eprintln!(
             "  Unified decoder: flip_to_clean={} finished_no_flip={} finish_decode={} inflate_wrapper={} window_seeded={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
@@ -868,9 +869,12 @@ fn drive_impl<W: std::io::Write>(
             // knob. `isal_oracle_fallbacks` MUST be 0 — any non-zero means a clean tail
             // fell back to pure-Rust (a counted correctness net, not a silent diverge).
             eprintln!(
-                "  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks={} isal_fallbacks={}",
+                "  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks={} isal_fallbacks={} bfinal_exact_accepted={} until_exact_fb={} inexact_fb={}",
                 ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed),
                 ISAL_ENGINE_ORACLE_FALLBACKS.load(Ordering::Relaxed),
+                ISAL_BFINAL_EXACT_LANDING_ACCEPTED.load(Ordering::Relaxed),
+                ISAL_UNTIL_EXACT_FALLBACKS.load(Ordering::Relaxed),
+                ISAL_INEXACT_FALLBACKS.load(Ordering::Relaxed),
             );
         }
         use crate::decompress::parallel::chunk_buffer_pool::*;
