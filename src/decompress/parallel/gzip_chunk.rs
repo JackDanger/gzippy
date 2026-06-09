@@ -163,6 +163,41 @@ fn isal_engine_oracle_enabled() -> bool {
     )
 }
 
+/// INCREMENTAL OUTPUT GROWTH — the footprint / cache-locality design lever
+/// (DIS-14/DIS-17: gzippy RSS +21-25% / dTLB MPKI ~2x vs rapidgzip, traced to
+/// the 8x-compressed-span UPFRONT output reserve below). Default OFF == identity
+/// (the single 8x reserve). When `GZIPPY_ISAL_INCREMENTAL_GROWTH=1`, the copy-free
+/// ISA-L decode reserves a SMALL initial buffer and GROWS it on demand as ISA-L
+/// fills it — a faithful port of rapidgzip's fixed-`ALLOCATION_CHUNK_SIZE`
+/// segment-append loop (`GzipChunk.hpp:309-379`: `DecodedVector(128 KiB)` ->
+/// `readStream` -> `resize` -> `append`, repeat), done on gzippy's one
+/// contiguous Vec. Because growth never fails on under-reserve (it just
+/// allocates more), the factor-5/6/7 fallbacks DIS-14 hit are gone, so the
+/// initial can sit FAR below 8x and the per-worker pooled buffer tracks the
+/// ACTUAL decoded size. Returns `Some((initial_factor, grow_bytes))` when ON.
+/// Both tunable for the footprint sweep: `GZIPPY_ISAL_INITIAL_FACTOR` (default 4),
+/// `GZIPPY_ISAL_GROW_MIB` (default 4).
+fn isal_incremental_growth() -> Option<(usize, usize)> {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *CFG.get_or_init(|| {
+        if !std::env::var("GZIPPY_ISAL_INCREMENTAL_GROWTH").is_ok_and(|v| v == "1") {
+            return None;
+        }
+        let factor = std::env::var("GZIPPY_ISAL_INITIAL_FACTOR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&f| f >= 1)
+            .unwrap_or(4);
+        let grow_mib = std::env::var("GZIPPY_ISAL_GROW_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&m| m >= 1)
+            .unwrap_or(4);
+        Some((factor, grow_mib * 1024 * 1024))
+    })
+}
+
 /// ISOLATION ORACLE (measurement-only, NOT production; produces WRONG BYTES when ON).
 ///
 /// `GZIPPY_FOLD_NODRAIN=1` makes `ContigFoldSink::push_clean_u8` SKIP the
@@ -262,26 +297,67 @@ fn finish_decode_chunk_isal_oracle(
     // the assert correctly surfaces, not a sizing bug.)
     let byte_start = inflate_start_bit / 8;
     let compressed_span = slice_end.saturating_sub(byte_start);
-    const EXPAND_FACTOR: usize = 8;
-    const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never reserve below 4 MiB
-    const RESERVE_CAP: usize = 64 * 1024 * 1024; // never reserve above the old ceiling
-    let reserve_len: usize = compressed_span
-        .saturating_mul(EXPAND_FACTOR)
-        .max(RESERVE_FLOOR)
-        .min(RESERVE_CAP);
     let decode_start = chunk.data.len();
-    let (written, end_bit, boundaries) = {
-        let out = chunk.data.writable_tail_reserve(reserve_len);
-        match isal_decompress::decompress_deflate_from_bit_into(
-            bounded,
-            inflate_start_bit,
-            initial_window,
-            out,
-        ) {
-            Some(v) => v,
-            None => return Ok(false),
-        }
-    };
+    let (written, end_bit, boundaries) =
+        if let Some((initial_factor, grow_bytes)) = isal_incremental_growth() {
+            // INCREMENTAL GROWTH (footprint lever): small initial reserve, grow on
+            // demand inside the ISA-L loop. Growth means an under-sized initial NEVER
+            // forces a fallback, so we start FAR below the 8x reserve and let the
+            // steady-state footprint track the actual decoded size.
+            const INCR_FLOOR: usize = 512 * 1024; // never start below 512 KiB
+            let initial = compressed_span
+                .saturating_mul(initial_factor)
+                .max(INCR_FLOOR);
+            match isal_decompress::decompress_deflate_from_bit_into_growable(
+                bounded,
+                inflate_start_bit,
+                initial_window,
+                &mut chunk.data,
+                initial,
+                grow_bytes,
+            ) {
+                Some(v) => {
+                    // All decoded bytes were committed during growth; reset the
+                    // LOGICAL length back to decode_start while the bytes REMAIN
+                    // physically present in the buffer's spare (Vec::truncate keeps
+                    // capacity + contents). This makes the post-decode state
+                    // IDENTICAL to the fixed-buffer path (len == decode_start, the
+                    // `written` bytes sitting in spare), so the shared commit/CRC/
+                    // boundary/fallback logic below — including its several
+                    // `return Ok(false)` exits — runs byte-for-byte the same. (The
+                    // exits must leave chunk.data at decode_start; the fixed path got
+                    // that for free by committing only at the very end.)
+                    chunk.data.truncate(decode_start);
+                    v
+                }
+                None => {
+                    // The growable decode may have committed bytes during growth
+                    // before bailing; reset to the pre-decode length before falling
+                    // back to the byte-exact pure-Rust engine.
+                    chunk.data.truncate(decode_start);
+                    return Ok(false);
+                }
+            }
+        } else {
+            // IDENTITY (production default): single 8x-compressed-span UPFRONT reserve.
+            const EXPAND_FACTOR: usize = 8;
+            const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never reserve below 4 MiB
+            const RESERVE_CAP: usize = 64 * 1024 * 1024; // never reserve above the old ceiling
+            let reserve_len: usize = compressed_span
+                .saturating_mul(EXPAND_FACTOR)
+                .max(RESERVE_FLOOR)
+                .min(RESERVE_CAP);
+            let out = chunk.data.writable_tail_reserve(reserve_len);
+            match isal_decompress::decompress_deflate_from_bit_into(
+                bounded,
+                inflate_start_bit,
+                initial_window,
+                out,
+            ) {
+                Some(v) => v,
+                None => return Ok(false),
+            }
+        };
 
     // Pick the natural stop: first boundary at-or-past stop_hint (inexact), or
     // the exact boundary == stop_hint (exact). Boundaries record (bit_offset,
@@ -335,7 +411,9 @@ fn finish_decode_chunk_isal_oracle(
     let keep_len = keep_len.min(written);
 
     // Commit ONLY the kept region into the chunk's u8 data buffer. The bytes are
-    // already physically present in the reserved spare (ISA-L wrote them); commit
+    // already physically present in the reserved spare (ISA-L wrote them, in BOTH
+    // the fixed-buffer and incremental paths — the latter truncated its logical
+    // length back to decode_start above while keeping the bytes in spare); commit
     // bumps the logical length with zero copies.
     chunk.data.commit(keep_len);
 
