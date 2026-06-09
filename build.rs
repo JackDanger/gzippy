@@ -95,18 +95,22 @@ fn emit_parallel_sm_cfgs() {
     let pure_inflate_decode = parallel_sm;
     let _ = has_isal_compression;
 
-    // gzippy-isal clean-tail TOPOLOGY selector (NOT an ISA-L FFI switch — see below).
+    // gzippy-isal clean-tail ENGINE selector.
     // When ON (x86_64 + gzippy-isal, guarded above): the chunk uses the TWO-PHASE
-    // Design-A handoff — Engine M (`marker_inflate::Block`, u16) bootstraps until
-    // 32 KiB clean, then `FlipToClean` hands the clean tail to Engine C =
-    // `StreamingInflateWrapper` = pure-Rust `unified::Inflate<Clean>` (resumable.rs).
+    // handoff — Engine M (`marker_inflate::Block`, u16) bootstraps until 32 KiB clean,
+    // then `FlipToClean` hands the clean tail to REAL ISA-L FFI **in PRODUCTION**
+    // (`finish_decode_chunk_isal_oracle` -> `isal_inflate`), faithful rapidgzip
+    // WITH_ISAL. This is the DEFAULT: `isal_engine_oracle_enabled()` returns
+    // `cfg!(isal_clean_tail)` (true here) when `GZIPPY_ISAL_ENGINE_ORACLE` is unset;
+    // the env var only FORCES on(1)/off(0). The pure-Rust `StreamingInflateWrapper`
+    // (`unified::Inflate<Clean>`, resumable.rs) is the decline-FALLBACK (rare on
+    // dynamic corpora; fires on flush-dense input). So C-FFI IS on the gzippy-isal
+    // decode graph BY DESIGN (faithful WITH_ISAL); `isal_chunks>0` is its fingerprint.
     // When OFF (gzippy-native, and arm64 always): the FOLD — Engine M keeps decoding
-    // the clean tail in-place via `read_internal_compressed_specialized::<false>`.
-    // BOTH topologies decode the clean tail in PURE RUST. Real ISA-L FFI for the
-    // clean tail is reachable ONLY under the measurement-only env oracle
-    // `GZIPPY_ISAL_ENGINE_ORACLE=1` (gzip_chunk.rs:539) — it is NOT on any production
-    // path. (Prior comment claimed this cfg routed through "REAL ISA-L FFI"; that was
-    // stale/aspirational and contradicted the wiring at gzip_chunk.rs:1399-1410.)
+    // the clean tail in-place via `read_internal_compressed_specialized::<false>`,
+    // PURE RUST, NO C-FFI. (NB: the `*_oracle` naming on this PRODUCTION ISA-L path is
+    // a stale misnomer from when it was a measurement knob — pending rename; it is NOT
+    // measurement-only on gzippy-isal.)
     let isal_clean_tail = is_x86_64 && has_gzippy_isal && parallel_sm;
 
     if parallel_sm {
