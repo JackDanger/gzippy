@@ -922,6 +922,179 @@ pub fn decompress_deflate_from_bit_into(
     Some((out_pos, end_bit, boundaries))
 }
 
+/// Output sink for the INCREMENTAL (growable) copy-free ISA-L decode. Lets the
+/// FFI loop GROW the output buffer ON DEMAND mid-decode instead of pre-reserving
+/// the whole chunk's worst-case output up front — a faithful structural port of
+/// rapidgzip's `finishDecodeChunkWithInexactOffset` loop (GzipChunk.hpp:309-379),
+/// which allocates a fresh fixed-size `DecodedVector` (`ALLOCATION_CHUNK_SIZE` =
+/// 128 KiB) per iteration, fills it via `readStream`, then `resize` + `append`s
+/// it into a segmented `DecodedData` and loops with a new buffer. gzippy keeps a
+/// single contiguous `Vec` so it grows that Vec instead of appending segments,
+/// but the principle is identical: the steady-state footprint tracks the ACTUAL
+/// decoded size, not an 8x-compressed-span over-reserve.
+///
+/// CORRECTNESS / ISA-L STREAMING CONTRACT: `isal_inflate` keeps its own 32 KiB
+/// history in `state.tmp_out_buffer`, so `next_out` may point to a FRESH region
+/// each call (including after a `Vec` realloc that MOVED the prior bytes). This
+/// is exactly what rapidgzip relies on (it hands a brand-new buffer each
+/// iteration). Therefore growing/moving the output buffer between
+/// `commit_and_reserve` calls is byte-exact.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub trait IncrementalOutSink {
+    /// (1) Commit `just_written` bytes from the PREVIOUS spare into the buffer
+    /// (bump its logical length), then (2) ensure at least `min_spare` bytes of
+    /// CONTIGUOUS spare past the new length and return `(ptr, spare_len)` for the
+    /// NEXT decode region. The returned `ptr` is INVALIDATED by the next call (a
+    /// grow may realloc + move). When `min_spare == 0` this performs the commit
+    /// only (final flush) and the returned `(ptr, len)` is unused.
+    fn commit_and_reserve(&mut self, just_written: usize, min_spare: usize) -> (*mut u8, usize);
+}
+
+/// Incremental / growable sibling of [`decompress_deflate_from_bit_into`]. Same
+/// ISA-L state-machine and boundary semantics, but instead of returning `None`
+/// the instant a FIXED `out` buffer fills, it COMMITS progress, GROWS the sink,
+/// and CONTINUES decoding (`isal_inflate` resumes against the new `next_out`).
+/// On success ALL `total_written` bytes are committed into the sink (the caller
+/// then trims to the kept region); on a `None` return the sink may hold the
+/// bytes committed so far during growth, so the caller MUST reset the buffer's
+/// length back to its pre-call value before falling back.
+///
+/// `output_offset` in each [`BlockBoundary`] is the CUMULATIVE byte offset from
+/// the start of THIS decode (i.e. from the buffer length at entry) — identical
+/// to the fixed-buffer variant's semantics because all committed bytes are
+/// contiguous in the sink.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub fn decompress_deflate_from_bit_into_growable(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    sink: &mut dyn IncrementalOutSink,
+    initial_spare: usize,
+    grow_increment: usize,
+) -> Option<(usize, usize, Vec<BlockBoundary>)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    let mut boundaries: Vec<BlockBoundary> = Vec::new();
+    // Cumulative bytes decoded across ALL spares == offset from the sink's entry
+    // length (all committed bytes are contiguous).
+    let mut total_written: usize = 0;
+    // Acquire the first spare (commit 0).
+    let (mut base, mut cap) = sink.commit_and_reserve(0, initial_spare.max(1));
+    // Bytes written into the CURRENT (uncommitted) spare.
+    let mut cur_pos: usize = 0;
+
+    loop {
+        let remaining = cap - cur_pos;
+        if remaining == 0 {
+            // Spare exhausted mid-decode: commit what we wrote into it, grow, and
+            // continue (the faithful rg fixed-segment append, as a single-Vec
+            // grow). ISA-L resumes against the new next_out (history is internal).
+            let (nb, nc) = sink.commit_and_reserve(cur_pos, grow_increment.max(1));
+            base = nb;
+            cap = nc;
+            cur_pos = 0;
+            continue;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { base.add(cur_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        cur_pos += written;
+        total_written += written;
+
+        match ret {
+            0 => {}
+            1 => {
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue,
+            _ => return None,
+        }
+
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            let bit_pos =
+                data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+            boundaries.push(BlockBoundary {
+                bit_offset: bit_pos,
+                output_offset: total_written,
+            });
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+    }
+
+    // Commit the final partial spare (min_spare=0 => commit-only).
+    sink.commit_and_reserve(cur_pos, 0);
+
+    if total_written == 0 {
+        return None;
+    }
+
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((total_written, end_bit, boundaries))
+}
+
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_boundaries(
