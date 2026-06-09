@@ -244,7 +244,17 @@ impl SegmentedU8 {
         self.ensure_buf(self.buf.len() + min_spare);
         let len = self.buf.len();
         if self.buf.capacity() - len < min_spare {
-            self.buf.reserve(min_spare - (self.buf.capacity() - len));
+            // `Vec::reserve(additional)` guarantees `capacity >= len + additional`,
+            // so to obtain `min_spare` bytes of spare PAST the current `len` we must
+            // request `min_spare` directly — NOT `min_spare - (capacity - len)`. The
+            // latter under-requests: `reserve` measures from `len`, so subtracting the
+            // already-available spare made it a no-op whenever `min_spare` exceeded the
+            // current capacity but the *delta* was smaller than the existing spare
+            // (e.g. len=49 KiB, cap=16.6 MiB, min_spare=16.5 MiB → reserve(704 KiB)
+            // no-ops because 704 KiB < 16.6 MiB spare, leaving the buffer SHORT). That
+            // mis-sizing handed the copy-free ISA-L FFI a too-small slice on dense
+            // tiny-block input. Reserve `min_spare` so the post-condition holds.
+            self.buf.reserve(min_spare);
         }
         let spare = self.buf.capacity() - len;
         debug_assert!(spare >= min_spare, "writable_tail_reserve: short spare");

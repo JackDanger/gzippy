@@ -137,3 +137,73 @@ accepts, so the surviving declines are the exact-match (until_exact) ones.
    This turn DELIVERS: the source refutation of the cited line-range, the empirical map of WHERE
    the gap is/isn't, and the adversarial fixture that PROVES the gap (the missing repro the prior
    advisor caveat asserted but never measured). No production code changed (probes + fixtures only).
+
+## JOB-2 PORT TURN (OWNER, 2026-06-08, worktree isal-resync, branch isal-resync-stored-fixed)
+### Built+ran the ISA-L path LOCALLY via Rosetta x86 (NO neurotic — Plex window honored)
+
+KEY ENABLER: `git submodule update --init vendor/isa-l vendor/isal-rs` checks out the
+patched ISA-L locally; `cargo {build,test} --target x86_64-apple-darwin --no-default-features
+--features gzippy-isal` (nasm present, `RUSTFLAGS=-C target-cpu=x86-64-v2`) BUILDS + RUNS the
+real ISA-L FFI clean-tail path under Rosetta. So byte-exact + coverage iteration is fully local.
+
+### TWO-COLUMN MAP (source-verified first-hand)
+| rapidgzip `finishDecodeChunkWithInexactOffset` (GzipChunk.hpp:282-385) + readStream (isal.hpp:253-385) | gzippy |
+|---|---|
+| `readStream` LOOPS isal_inflate, `break`s when `stopped_at != NONE` (isal.hpp:348-350); records EOB/EOB_HEADER. | ISA-L `decompress_deflate_from_bit_into` (isal_decompress.rs:810) loops isal_inflate, records `BlockBoundary{bit_offset,output_offset}` on each END_OF_BLOCK. |
+| INEXACT: on EOB_HEADER stop when `(nextBlockOffset>=untilOffset && !final && !FIXED_HUFFMAN) \|\| nextBlockOffset==untilOffset` (GzipChunk.hpp:339-342) — coalesce FORWARD to nearest clean dynamic boundary at/past the guess. | **Pure-Rust `StreamingInflateWrapper` path (gzip_chunk.rs:800-810) is ALREADY a byte-for-byte port of this.** ISA-L-oracle path (gzip_chunk.rs:303-309) picks first recorded boundary `bit_offset>=stop_hint`; declines only if NONE and `end_bit>stop_hint` (never over-decodes — charter rule honored). |
+| EXACT: SEPARATE fn `decodeChunkWithInflateWrapper` (GzipChunk.hpp:191-266) decodes to `exactUntilOffset` and asserts `tellCompressed()==exactUntilOffset` (252) — does NOT require a recorded boundary, but DOES require the decode to land exactly there (else throws). | ISA-L-oracle (gzip_chunk.rs:290-301): requires a recorded boundary `==stop_hint`; else DECLINE to pure-Rust (bit-exact). This MIRRORS vendor's exact-path contract (land-exactly-or-fail) but declines instead of throwing — pure-Rust then lands bit-exactly. FAITHFUL. |
+
+### ROOT CAUSE was NOT the coalesce accept — it was a RESERVE UNDER-SIZING bug
+`SegmentedU8::writable_tail_reserve` (segmented_buffer.rs:243) computed
+`self.buf.reserve(min_spare - (capacity - len))`. `Vec::reserve(additional)` guarantees
+`capacity >= len + additional`, so subtracting the already-available spare UNDER-requests:
+e.g. len=49 KiB, cap=16.6 MiB, min_spare=16.5 MiB → `reserve(704 KiB)` NO-OPS (704 KiB <
+16.6 MiB existing spare) → buffer stays SHORT of min_spare. The copy-free ISA-L FFI then got
+a too-small slice on dense tiny-block input. FIX: `self.buf.reserve(min_spare)`.
+- DEBUG/TEST builds: the `debug_assert!(spare>=min_spare)` FIRED → worker-thread PANIC →
+  parallel pipeline HANG (the in-memory coverage gate panicked at writable_tail_reserve before
+  the fix). This is the headline CORRECTNESS win (panic removal in any assertion-enabled build).
+- RELEASE builds: assert compiled out; the under-reserve path returns `None` (decline, SAFE,
+  byte-exact) so it caused SPURIOUS DECLINES, not corruption. Fix recovers them.
+- ONLY production caller of writable_tail_reserve is the ISA-L oracle (gzip_chunk.rs:274);
+  the other (:1017) is inside the OFF-by-default `fold_nodrain` measurement knob. gzippy-NATIVE
+  never reaches it ⇒ native byte-UNAFFECTED (verified: isal_chunks=0, native_fold_parity 4/4 green).
+
+### BYTE-EXACT PROOF (local Rosetta x86 release binaries; gen via /tmp/gen_fixtures.py)
+Fixture: 24 MiB make_btype01_heavy + SYNC_FLUSH every 2 KiB → tinyblocks.gz (10.7-10.9 MiB,
+over the 10 MiB parallel gate). raw sha `3af314a4…51d18`.
+DUAL-SHA both features × T1/T4/T8, `path=ParallelSM` asserted, ALL == raw sha:
+  native T1/T4/T8 = 3af314a4…51d18 ; isal T1/T4/T8 = 3af314a4…51d18 (byte-IDENTICAL).
+gzippy-NATIVE coverage on it: isal_chunks=0 isal_fallbacks=0 (structurally pure-Rust, UNCHANGED).
+
+### COVERAGE DELTA (BEFORE/AFTER release A/B on the flate2-shaped fixture, both byte-exact)
+| T | OLD (pre-fix isal release) | NEW (fixed isal release) |
+|---|---|---|
+| T4 | isal_chunks=10 fallbacks=17 | isal_chunks=10 **fallbacks=15** |
+| T8 | isal_chunks=22 fallbacks=44 | isal_chunks=22 **fallbacks=37** |
+- ISA-L coverage is POSITIVE both before and after (the premise's "ZERO coverage on SYNC_FLUSH"
+  was an OVERSTATEMENT — already noted in this doc's flate2-L6 section). The fix MONOTONICALLY
+  REDUCES spurious declines (44→37 @T8) and, in DEBUG/TEST builds, turns a HANG/PANIC into a
+  byte-exact decode with isal_chunks=37 (the true "0/hung → 37" delta for assertion-enabled builds).
+- The SURVIVING declines are the `until_exact` exact-bit case (stop_hint lands ~16 bits past
+  ISA-L's last clean EOB; e.g. stop_hint=91500808 vs recorded EOBs 91500750/91500792). Declining
+  to bit-exact pure-Rust there is FAITHFUL (vendor's exact path also can't coalesce — it asserts
+  exact-landing). NOT a closable gap without making ISA-L bit-precise (which is pure-Rust's domain).
+
+### GATES (all LOCAL, Rosetta x86)
+- isal_tail_parity differential gate (LEFT pure vs RIGHT isal, both until_exact values): **10/10
+  MATCH, 0 diverged** — bytes/len/final_bit/crc/boundaries identical with the fix. (Made the
+  silesia gate fall back to a synthetic dynamic member so it runs locally too; real-corpus path
+  unchanged on the bench box. This IS the "ship the silesia differential" gate.)
+- routing tests under gzippy-isal: 28/28 (incl. test_coalesce_fixed_huffman_multithread_byte_exact
+  + btype01 marker-pipeline traps).
+- native_fold_parity under gzippy-native: 4/4 (shared segmented_buffer change no native regress).
+- isal_stored_fixed_probe module: 4/4 (incl. the new isal_coverage_on_tiny_blocks gate:
+  isal_chunks=37>0, byte-exact). Full isal lib suite: 882 pass; the 7 fails are PRE-EXISTING
+  env/Rosetta flakes (AVX2-detect, system-gzip, resumable-asserts, parallel-test-hang) — REPRODUCED
+  IDENTICALLY on a stash-baseline (5/6 fail without my change; the others are load/AVX2-gated).
+
+### DELIVERED (production code): segmented_buffer.rs reserve fix (load-bearing, byte-transparent
+to native, correctness+coverage to isal) + gzip_chunk.rs TEST-only synthetic-corpus fallback +
+isal_stored_fixed_probe.rs coverage gate & portable materializer. Owes supervisor: Opus advisor +
+correctness gate (self-disproof recorded here; NOT advisor-vetted — Agent tool absent in owner env).

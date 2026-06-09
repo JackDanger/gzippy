@@ -258,6 +258,126 @@ fn materialize_tiny_block_gz() {
     eprintln!("[materialize-tiny] wrote /dev/shm/tinyblocks.gz + .raw");
 }
 
+/// Build an in-memory tiny-block SYNC_FLUSH gzip member that exceeds the 10 MiB
+/// parallel gate, dense with fixed/stored blocks (a SYNC_FLUSH every `STEP`
+/// bytes => one data block + one empty stored block per flush). This is the
+/// adversarial regime where the ISA-L clean-tail `until_exact` accept declines.
+fn build_tiny_block_gz(raw_size: usize, step: usize) -> (Vec<u8>, Vec<u8>) {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let original = make_btype01_heavy_data(raw_size);
+    let mut enc = GzEncoder::new(Vec::new(), Compression::new(1));
+    let mut off = 0usize;
+    while off < original.len() {
+        let end = (off + step).min(original.len());
+        enc.write_all(&original[off..end]).unwrap();
+        enc.flush().unwrap(); // Z_SYNC_FLUSH -> ends the block, empty stored block
+        off = end;
+    }
+    let gz = enc.finish().unwrap();
+    (original, gz)
+}
+
+/// Portable materializer for the BEFORE/AFTER release-binary coverage A/B:
+/// writes the flate2-shaped tiny-block fixture (the exact shape the in-memory
+/// coverage gate uses) + its raw to /tmp so two release binaries can be run on
+/// it. Run: cargo test ... materialize_tiny_block_tmp -- --ignored --nocapture
+#[test]
+#[ignore = "writes /tmp/job2_tinyblocks.gz + .raw for the release-binary A/B"]
+fn materialize_tiny_block_tmp() {
+    let (raw, gz) = build_tiny_block_gz(24 * 1024 * 1024, 2048);
+    std::fs::write("/tmp/job2_tinyblocks.gz", &gz).unwrap();
+    std::fs::write("/tmp/job2_tinyblocks.raw", &raw).unwrap();
+    eprintln!(
+        "[materialize-tmp] gz={} ({:.1} MiB) raw={}",
+        gz.len(),
+        gz.len() as f64 / 1048576.0,
+        raw.len()
+    );
+}
+
+/// COVERAGE GATE (JOB 2): drive the FULL production `finish_decode_chunk_impl`
+/// ISA-L clean-tail path on the adversarial tiny-block SYNC_FLUSH fixture and
+/// read the live coverage counters. BEFORE the `writable_tail_reserve` fix this
+/// fixture PANICKED a worker thread in any assertion-enabled build (the reserve
+/// under-sized the copy-free ISA-L slice, tripping `debug_assert!(spare >=
+/// min_spare)` → pipeline hang) and, in release, caused spurious declines
+/// (`isal_fallbacks` inflated). AFTER the fix: byte-exact, no panic, ISA-L
+/// coverage POSITIVE, fewer declines. This test asserts the invariant: ISA-L
+/// coverage is POSITIVE on this fixture and the decode is byte-exact at every
+/// thread count. (The residual declines are the FAITHFUL `until_exact` exact-bit
+/// case — stop_hint lands a few bits past ISA-L's last clean EOB, so the chunk
+/// declines to the bit-precise pure-Rust engine, mirroring rapidgzip's exact
+/// path; NEVER an over-decode.) Counters are process-global atomics, so this runs
+/// serially (single-test harness here) and snapshots deltas.
+///
+/// Run: cargo test --target x86_64-apple-darwin --no-default-features
+///        --features gzippy-isal isal_coverage_on_tiny_blocks -- --nocapture
+#[cfg(all(parallel_sm, target_arch = "x86_64"))]
+#[test]
+fn isal_coverage_on_tiny_blocks() {
+    use crate::decompress::parallel::gzip_chunk::{
+        ISAL_ENGINE_ORACLE_CHUNKS, ISAL_ENGINE_ORACLE_FALLBACKS,
+    };
+    use std::sync::atomic::Ordering;
+
+    // 24 MiB raw => comfortably over the 10 MiB compressed parallel gate after
+    // level-1 + frequent SYNC_FLUSH (low-redundancy data barely compresses).
+    let (original, gz) = build_tiny_block_gz(24 * 1024 * 1024, 2048);
+    assert!(
+        gz.len() > 10 * 1024 * 1024,
+        "tiny-block fixture must exceed the 10 MiB parallel gate (got {} bytes)",
+        gz.len()
+    );
+
+    let mut total_isal = 0u64;
+    let mut total_fallback = 0u64;
+    for threads in [2usize, 4, 8] {
+        let chunks_before = ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed);
+        let fb_before = ISAL_ENGINE_ORACLE_FALLBACKS.load(Ordering::Relaxed);
+
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&gz, &mut output, threads)
+            .unwrap_or_else(|e| panic!("tiny-block decode failed at T={threads}: {e:?}"));
+
+        let isal = ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed) - chunks_before;
+        let fb = ISAL_ENGINE_ORACLE_FALLBACKS.load(Ordering::Relaxed) - fb_before;
+        total_isal += isal;
+        total_fallback += fb;
+        eprintln!(
+            "[isal-coverage T={threads}] isal_chunks={isal} isal_fallbacks={fb} \
+             decoded={} (expected {})",
+            output.len(),
+            original.len()
+        );
+
+        // CORRECTNESS (always, regardless of coverage): byte-exact.
+        assert_eq!(
+            output.len(),
+            original.len(),
+            "tiny-block T={threads} length mismatch"
+        );
+        assert_eq!(
+            output, original,
+            "tiny-block T={threads} byte mismatch (ISA-L coalesce mis-seeded a successor?)"
+        );
+    }
+
+    eprintln!(
+        "[isal-coverage TOTAL] isal_chunks={total_isal} isal_fallbacks={total_fallback}"
+    );
+    // COVERAGE GATE: ISA-L must fire on the tail of this fixture. Before the
+    // readStream coalesce port this was ~0 ISA-L chunks (all declines); the port
+    // is what makes this assertion pass.
+    assert!(
+        total_isal > 0,
+        "ISA-L coverage collapsed to ZERO on the tiny-block fixture \
+         (isal_chunks={total_isal}, isal_fallbacks={total_fallback}) — the \
+         readStream coalesce regressed; gzippy-isal degraded to pure-Rust"
+    );
+}
+
 /// ROOT-CAUSE disambiguation (pass-2 advisor-owed): on the ACTUAL tiny-block
 /// SYNC_FLUSH stream, does `decompress_deflate_from_bit_with_boundaries` record
 /// per-block boundaries (=> decline is accept-logic) or ZERO boundaries (=> decline
