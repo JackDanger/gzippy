@@ -362,181 +362,37 @@ pub struct BlockBoundary {
 }
 
 // ============================================================================
-// Fixed-Huffman prefilter (BTYPE=01)
+// Dynamic-only block finder — no BTYPE=01 (fixed-Huffman) candidates
 // ============================================================================
 //
-// BlockFinder originally excluded BTYPE=01 candidates entirely on the
-// theory that "fixed Huffman has no header to validate." That left a
-// class of real boundaries invisible to the heuristic — on Silesia at
-// least one chunk's search region had only fixed-Huffman boundaries,
-// and `decompress_parallel` silently fell back to sequential libdeflate
-// (CI bench reported 0.62× rapidgzip; the deletion-trap killer test on
-// the routing test fixture didn't catch this because that fixture has
-// BTYPE=10 boundaries).
+// The BlockFinder is DYNAMIC-ONLY, faithful to vendor
+// blockfinder/DynamicHuffman.hpp (which has NO fixed-Huffman finder).
+// Fixed-Huffman regions produce no candidates here; they degrade to
+// confirmed-chain decode exactly as vendor: when the speculative start
+// mismatches the predecessor's confirmed boundary the consumer re-decodes
+// from that boundary, traversing whatever blocks (including BTYPE=01)
+// follow without special finder support.
 //
-// We can validate BTYPE=01 candidates cheaply by decoding a handful of
-// fixed-Huffman symbols and checking each is well-formed:
-//
-//   - All four symbols decode without falling off the alphabet (no
-//     "code length 0" entry hit).
-//   - No symbol is 286 or 287 (unused per RFC 1951 §3.2.6).
-//   - The first symbol is *not* `END_OF_BLOCK` (256) — a real fixed-
-//     Huffman block produces at least one byte before EOB.
-//   - For length codes (symbols 257..=285), the following distance
-//     code is in 0..=29 (codes 30/31 are reserved).
-//
-// Per-probe cost: 4× 9-bit table lookup + a couple of range checks =
-// well under 100 ns. The table is a single `[u16; 512]` built once.
-
-/// Entry layout: low 9 bits = symbol, top 4 bits = code length (7/8/9).
-/// 0 = invalid (no canonical code matches this 9-bit pattern's prefix).
-type FixedLitlenEntry = u16;
-
-/// 9-bit reverse-bits LUT → (symbol, code_len) for the deflate fixed
-/// Huffman litlen table. Indexed by `peek(9) & 0x1FF` — the LSB-first
-/// bits as they come out of the bit buffer; we encode the bit-reversal
-/// into the table itself.
-fn fixed_litlen_lut() -> &'static [FixedLitlenEntry; 512] {
-    use std::sync::OnceLock;
-    static LUT: OnceLock<[FixedLitlenEntry; 512]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut table = [0u16; 512];
-        // Per RFC 1951 §3.2.6:
-        //   codes  0..=23  (7 bits) -> symbols 256..=279
-        //   codes 48..=191 (8 bits) -> symbols   0..=143
-        //   codes 192..=199 (8 bits) -> symbols 280..=287
-        //   codes 400..=511 (9 bits) -> symbols 144..=255
-        let mut emit = |code: u32, code_len: u8, sym: u16| {
-            // The stream is LSB-first. Canonical Huffman codes are read
-            // MSB-first into the code value. So we reverse the
-            // `code_len` low bits of `code` to get the bit pattern that
-            // appears in the bit buffer.
-            let reversed = reverse_low_bits(code, code_len);
-            let entry = (sym & 0x1FF) | ((code_len as u16) << 12);
-            let stride = 1u32 << code_len;
-            let mut idx = reversed;
-            while idx < 512 {
-                table[idx as usize] = entry;
-                idx += stride;
-            }
-        };
-        for code in 0..=23 {
-            emit(code, 7, (256 + code) as u16);
-        }
-        for code in 48..=191 {
-            emit(code, 8, (code - 48) as u16);
-        }
-        for code in 192..=199 {
-            emit(code, 8, (280 + (code - 192)) as u16);
-        }
-        for code in 400..=511 {
-            emit(code, 9, (144 + (code - 400)) as u16);
-        }
-        table
-    })
-}
-
-/// 5-bit reverse-bits LUT → distance symbol. Codes 0..=29 are valid;
-/// 30 and 31 are reserved (entry remains 0xFFFF as "invalid").
-fn fixed_dist_lut() -> &'static [u16; 32] {
-    use std::sync::OnceLock;
-    static LUT: OnceLock<[u16; 32]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut table = [0xFFFFu16; 32];
-        for code in 0u32..=29 {
-            let reversed = reverse_low_bits(code, 5);
-            table[reversed as usize] = code as u16;
-        }
-        table
-    })
-}
-
-#[inline(always)]
-fn reverse_low_bits(mut v: u32, n: u8) -> u32 {
-    let mut r = 0u32;
-    for _ in 0..n {
-        r = (r << 1) | (v & 1);
-        v >>= 1;
-    }
-    r
-}
-
-/// Decode the first two fixed-Huffman symbols at `bit_offset` and accept
-/// the position only if both are well-formed (valid litlen alphabet
-/// entries, not the unused 286/287 codes, first symbol not EOB).
-///
-/// This is the cheap prefilter; the strict check is the worker's
-/// `decode_chunk_isal` trial-decode at the candidate offset.
-/// The job here is to *eliminate most false positives* — catching all
-/// of them is the trial-decode's job. Two
-/// symbols is the
-/// sweet spot: enough to reject ~95% of random positions (each random
-/// 9-bit pattern has ~256/512 chance of mapping to a valid symbol; two
-/// in a row is ~25%, and the EOB/unused-symbol checks knock that down
-/// further), without paying for distance-code validation.
-///
-/// Earlier versions decoded 4 symbols and validated distance codes too.
-/// On a 2 MiB random fixture that ran for 3+ minutes — `find_blocks`
-/// invokes the prefilter on every BTYPE=01 candidate (about 1/4 of all
-/// bit positions), so per-probe cost dominates. The 2-symbol prefilter
-/// here runs ~50 ns per call.
-pub(crate) fn validate_fixed_block_prefix(data: &[u8], bit_offset: usize) -> bool {
-    let litlen_lut = fixed_litlen_lut();
-    let mut bit = bit_offset;
-
-    // First symbol: must not be EOB (real fixed-Huffman blocks rarely
-    // emit EOB as their first symbol; rejecting it loses a tiny fraction
-    // of real boundaries and rejects many false positives).
-    let Some(window) = peek_bits_at(data, bit, 9) else {
-        return false;
-    };
-    let entry = litlen_lut[(window & 0x1FF) as usize];
-    let sym = entry & 0x1FF;
-    let code_len = (entry >> 12) & 0xF;
-    if code_len == 0 || sym == 256 || sym >= 286 {
-        return false;
-    }
-    bit += code_len as usize;
-    // For length codes, skip past the bits we know come next so the
-    // second symbol's peek lands on the right bit. We don't validate
-    // those extras / distance codes — that's the worker trial-decode's job.
-    if sym >= 257 {
-        let lidx = (sym - 257) as usize;
-        const LENGTH_EXTRA_BITS: [u8; 29] = [
-            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-        ];
-        const DIST_EXTRA_BITS: [u8; 30] = [
-            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
-            12, 13, 13,
-        ];
-        if lidx >= LENGTH_EXTRA_BITS.len() {
-            return false;
-        }
-        bit += LENGTH_EXTRA_BITS[lidx] as usize;
-        // 5-bit distance code; check valid (codes 30/31 are reserved).
-        let Some(dist_window) = peek_bits_at(data, bit, 5) else {
-            return false;
-        };
-        let dist_sym = fixed_dist_lut()[(dist_window & 0x1F) as usize];
-        if dist_sym == 0xFFFF {
-            return false;
-        }
-        bit += 5 + DIST_EXTRA_BITS[dist_sym as usize] as usize;
-    }
-
-    // Second symbol.
-    let Some(window) = peek_bits_at(data, bit, 9) else {
-        return false;
-    };
-    let entry = litlen_lut[(window & 0x1FF) as usize];
-    let sym = entry & 0x1FF;
-    let code_len = (entry >> 12) & 0xF;
-    code_len != 0 && sym < 286
-}
+// DELETED 2026-06-09: the BTYPE=01 prefilter (FixedLitlenEntry,
+// fixed_litlen_lut, fixed_dist_lut, reverse_low_bits,
+// validate_fixed_block_prefix) — a deliberate divergence from vendor that
+// admitted fixed-Huffman candidates from the block finder. On bignasa
+// (820 MB, 10.4× web log, T8) random bytes parse as BFINAL=1/BTYPE=01
+// at the 4 MiB grid-base positions (1-in-8 per position), pass the cheap
+// 2-symbol prefilter, decode a 23–495-byte phantom final-block stream,
+// then are discarded at consume time when the predecessor's confirmed
+// boundary lands 19 288–85 273 bits later — each costing ~150 ms
+// head-of-line confirmed re-decode. 3–9 phantoms/run ≈ 39 % of T8 wall.
+// rapidgzip cannot make this error: its deflate finder is dynamic-only by
+// construction and scans forward to the true dynamic boundary instead.
 
 /// Cheap structural prefilter before a full speculative trial decode.
 /// Used for the EOF tail byte walk in `speculative_decode_find_boundary`
 /// (thousands of offsets); block-finder candidates skip this.
+///
+/// BTYPE=01 (fixed-Huffman) returns false — dynamic-only, faithful to
+/// vendor blockfinder/DynamicHuffman.hpp; fixed-block regions degrade to
+/// confirmed-chain decode exactly as vendor.
 pub(crate) fn plausible_trial_decode_offset(data: &[u8], bit_offset: usize) -> bool {
     let header = match peek_bits_at(data, bit_offset, 3) {
         Some(h) => h,
@@ -548,7 +404,7 @@ pub(crate) fn plausible_trial_decode_offset(data: &[u8], bit_offset: usize) -> b
             let aligned_bit = (bit_offset + 3).div_ceil(8) * 8;
             aligned_bit + 32 <= data.len() * 8
         }
-        1 => validate_fixed_block_prefix(data, bit_offset),
+        1 => false, // BTYPE=01 fixed-Huffman: dynamic-only finder, no candidate (vendor parity)
         2 => {
             let h = match peek_bits_at(data, bit_offset, 17) {
                 Some(v) => v,
@@ -813,21 +669,16 @@ impl<'a> BlockFinder<'a> {
                     bit_offset += 1;
                 }
                 1 => {
-                    // Fixed Huffman — emit as candidate when the cheap
-                    // 2-symbol prefilter passes (pipelined zlib-ng / L9
-                    // streams often end with a short fixed block in the
-                    // tail partition; skipping these caused ExactStopMissed
-                    // on CI's 10 MiB random roundtrip).
-                    if validate_fixed_block_prefix(self.data, bit_offset) {
-                        blocks.push(BlockBoundary {
-                            bit_offset,
-                            seek_bit: bit_offset,
-                            valid: true,
-                            hlit: 0,
-                            hdist: 0,
-                            hclen: 0,
-                        });
-                    }
+                    // BTYPE=01 (fixed-Huffman): dynamic-only finder — no
+                    // candidate emitted. Faithful to vendor
+                    // blockfinder/DynamicHuffman.hpp (no fixed finder);
+                    // fixed-block regions degrade to confirmed-chain decode
+                    // exactly as vendor. The BTYPE=01 prefilter was deleted
+                    // 2026-06-09: it produced phantom candidates at 4 MiB
+                    // grid-base positions on bignasa (BFINAL=1 random bytes
+                    // passing the 2-symbol prefilter → 23–495-byte phantom
+                    // final-block streams → ~150 ms confirmed re-decode per
+                    // phantom; 3–9/run ≈ 39 % of T8 wall).
                     reader.skip(1);
                     bit_offset += 1;
                 }
@@ -1225,8 +1076,8 @@ mod tests {
         assert!(lut[0b000] > 0);
         assert!(lut[0b001] > 0);
 
-        // Invalid: BTYPE=01 (fixed) — skipped by the dynamic LUT but
-        // emitted when validate_fixed_block_prefix passes in the scan loop.
+        // BTYPE=01 (fixed) — dynamic-only finder, no candidate emitted
+        // (vendor DynamicHuffman.hpp parity; prefilter deleted 2026-06-09).
         assert!(lut[0b010] > 0);
         assert!(lut[0b011] > 0);
 
@@ -1469,8 +1320,15 @@ mod tests {
 
     /// Mirrors benchmarks.yml random-data: 10 MiB incompressible input,
     /// L9 pipelined compress. The tail partition (from 10 MiB bit offset)
-    /// often contains only fixed-Huffman blocks — skipping BTYPE=01 caused
-    /// `ExactStopMissed` in parallel SM slow-path boundary search.
+    /// often contains only fixed-Huffman blocks.
+    ///
+    /// NEW EXPECTATION (2026-06-09, vendor DynamicHuffman.hpp parity):
+    /// The dynamic-only block finder produces NO fixed-Huffman candidates —
+    /// this is the correct vendor behavior. Fixed-block tail regions are
+    /// handled by the confirmed-chain re-decode path in the consumer.
+    /// The test verifies: (a) the finder does not panic, and (b) all
+    /// candidates returned are dynamic-Huffman (BTYPE=10) or stored
+    /// (BTYPE=00), never fixed-Huffman (BTYPE=01).
     #[test]
     fn test_find_blocks_finds_fixed_huffman_in_tail_partition() {
         use crate::compress::pipelined::PipelinedGzEncoder;
@@ -1499,18 +1357,26 @@ mod tests {
         let deflate = &compressed[header_size..compressed.len() - 8];
         let partition_bit = 10 * 1024 * 1024 * 8;
         let finder = BlockFinder::new(deflate);
-        // After the Kraft-equality fix (matches vendor's
-        // checkHuffmanCodeLengths), the L9 random-data tail may contain
-        // ONLY fixed-Huffman blocks (validated by
-        // validate_fixed_block_prefix) and uncompressed/stored blocks —
-        // dynamic-Huffman false positives that the prior loose-Kraft
-        // check accepted no longer pass. The production
-        // `speculative_decode_find_boundary` has a byte-walk fallback at
-        // chunk_fetcher.rs:1965-1980 for exactly this case, so the
-        // contract this test guards is just: the finder either finds a
-        // candidate, OR returns empty without panicking (the byte-walk
-        // takes over). Just exercise the path; don't gate on candidate
-        // count.
-        let _candidates = finder.find_blocks(partition_bit, deflate.len() * 8);
+        // Dynamic-only finder (vendor DynamicHuffman.hpp parity): no
+        // fixed-Huffman candidates are emitted. Verify no BTYPE=01 slips
+        // through — each candidate's 3-bit header must be BTYPE=00 or
+        // BTYPE=10 (the dynamic LUT already filters BTYPE=01 out, but
+        // belt-and-suspenders).
+        let candidates = finder.find_blocks(partition_bit, deflate.len() * 8);
+        for c in &candidates {
+            // Peek the 3-bit header at the candidate's seek_bit.
+            let byte = c.seek_bit / 8;
+            let shift = c.seek_bit % 8;
+            if byte + 1 < deflate.len() {
+                let raw = (deflate[byte] as u32) | ((deflate[byte + 1] as u32) << 8);
+                let header = (raw >> shift) & 0b111;
+                let btype = (header >> 1) & 0b11;
+                assert_ne!(
+                    btype, 1,
+                    "fixed-Huffman candidate at bit {}: vendor parity requires dynamic-only finder",
+                    c.seek_bit
+                );
+            }
+        }
     }
 }
