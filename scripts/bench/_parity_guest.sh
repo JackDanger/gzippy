@@ -127,10 +127,18 @@ fi
 RAW_BYTES="$(gzip -dc "$CORPUS" | wc -c)"
 
 # ---- 4. production-path assertion (Rule 6) -----------------------------------
+# EXPECT_PATH (default ParallelSM) is the production DecodePath this cell must
+# take. On the gzippy-isal build, single-threaded single-member decode routes to
+# IsalSingleShot (one ISA-L call — DIS-15), NOT ParallelSM, so the T1-isal cell
+# is measured with EXPECT_PATH=IsalSingleShot. NOTE: GZIPPY_FORCE_PARALLEL_SM is
+# a DEAD no-op in the binary (zero source refs; morning-brief-confirmed), so it
+# neither forces nor masks routing — the measured run below follows production
+# classify_gzip exactly. We keep setting it only for provenance continuity.
+EXPECT_PATH="${EXPECT_PATH:-ParallelSM}"
 DBG="$(GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 "$GZIPPY_BIN" -d -c -p "$T" "$CORPUS" 2>&1 >/dev/null | grep -m1 'path=' || true)"
 case "$DBG" in
-  *ParallelSM*) ;;
-  *) fail "routing not ParallelSM: ${DBG:-<no path= line>}" 9;;
+  *path=$EXPECT_PATH*) ;;
+  *) fail "routing not $EXPECT_PATH (got: ${DBG:-<no path= line>})" 9;;
 esac
 
 # ---- 5. host-lock READBACK (ABORT on thaw — Rule 6 frozen host) --------------
