@@ -163,19 +163,21 @@ fn isal_engine_oracle_enabled() -> bool {
     )
 }
 
-/// INCREMENTAL OUTPUT GROWTH — the footprint / cache-locality design lever
-/// (DIS-14/DIS-17: gzippy RSS +21-25% / dTLB MPKI ~2x vs rapidgzip, traced to
-/// the 8x-compressed-span UPFRONT output reserve below). Default OFF == identity
-/// (the single 8x reserve). When `GZIPPY_ISAL_INCREMENTAL_GROWTH=1`, the copy-free
-/// ISA-L decode reserves a SMALL initial buffer and GROWS it on demand as ISA-L
-/// fills it — a faithful port of rapidgzip's fixed-`ALLOCATION_CHUNK_SIZE`
+/// ALWAYS-SMALL INCREMENTAL GROWTH (measurement arm) — the footprint /
+/// cache-locality sweep knob (DIS-14/DIS-17: gzippy RSS +21-25% / dTLB MPKI ~2x
+/// vs rapidgzip, traced to the 8x-compressed-span UPFRONT output reserve).
+/// When `GZIPPY_ISAL_INCREMENTAL_GROWTH=1`, the copy-free ISA-L decode reserves
+/// a SMALL initial buffer (FAR below 8x) and GROWS it on demand as ISA-L fills
+/// it — a faithful port of rapidgzip's fixed-`ALLOCATION_CHUNK_SIZE`
 /// segment-append loop (`GzipChunk.hpp:309-379`: `DecodedVector(128 KiB)` ->
 /// `readStream` -> `resize` -> `append`, repeat), done on gzippy's one
-/// contiguous Vec. Because growth never fails on under-reserve (it just
-/// allocates more), the factor-5/6/7 fallbacks DIS-14 hit are gone, so the
-/// initial can sit FAR below 8x and the per-worker pooled buffer tracks the
-/// ACTUAL decoded size. Returns `Some((initial_factor, grow_bytes))` when ON.
-/// Both tunable for the footprint sweep: `GZIPPY_ISAL_INITIAL_FACTOR` (default 4),
+/// contiguous Vec, so the per-worker pooled buffer tracks the ACTUAL decoded
+/// size. Default OFF == production: the SAME growable decode but with the
+/// historical 8x upfront reserve as the initial (zero regrows sub-8x; growth
+/// engages only on >8x overflow — the DIS-29 storm fix). Do NOT default this
+/// knob ON: the small initial regresses sub-8x corpora at low-T (ghcn T1 -18%,
+/// DIS-29). Returns `Some((initial_factor, grow_bytes))` when ON. Both tunable
+/// for the footprint sweep: `GZIPPY_ISAL_INITIAL_FACTOR` (default 4),
 /// `GZIPPY_ISAL_GROW_MIB` (default 4).
 fn isal_incremental_growth() -> Option<(usize, usize)> {
     use std::sync::OnceLock;
@@ -288,76 +290,86 @@ fn finish_decode_chunk_isal_oracle(
     // production's ~chunk-sized final capacity (~28 MiB for a ~4.7 MiB T8 chunk at
     // factor 8 vs the old flat 64 MiB) instead of the whole-member worst case.
     // EXPAND_FACTOR=8 covers silesia's ratio ~2.4× over; FLOOR keeps small chunks
-    // safe; CAP bounds a pathological run. Under-reserve is SAFE:
-    // `decompress_deflate_from_bit_into` returns `None` (it does NOT realloc/copy —
-    // that would re-introduce the confound), falling back to pure-Rust COUNTED in
-    // ISAL_ENGINE_ORACLE_FALLBACKS, which the hardened oracle.sh asserts ==0 — so a
-    // too-tight bound VOIDs the measurement loudly. (A window-absent bootstrap chunk
-    // legitimately falls back at some T — a real property of the ISA-L ceiling that
-    // the assert correctly surfaces, not a sizing bug.)
+    // safe; CAP bounds a pathological upfront request. Under-reserve no longer
+    // falls back: the GROWABLE decode below grows the buffer on demand when the
+    // chunk expands past the reserve (DIS-29 storm fix), so a >8x-compressible
+    // chunk stays on ISA-L instead of storming to the ~7.5x pure-Rust fallback.
+    // (A window-absent bootstrap chunk still legitimately falls back at some T —
+    // a real property of the ISA-L ceiling, not a sizing bug.)
     let byte_start = inflate_start_bit / 8;
     let compressed_span = slice_end.saturating_sub(byte_start);
     let decode_start = chunk.data.len();
-    let (written, end_bit, boundaries) =
-        if let Some((initial_factor, grow_bytes)) = isal_incremental_growth() {
-            // INCREMENTAL GROWTH (footprint lever): small initial reserve, grow on
-            // demand inside the ISA-L loop. Growth means an under-sized initial NEVER
-            // forces a fallback, so we start FAR below the 8x reserve and let the
-            // steady-state footprint track the actual decoded size.
+    let (written, end_bit, boundaries) = {
+        // PRODUCTION DEFAULT: the historical 8x-compressed-span UPFRONT reserve
+        // (sub-8x corpora pay ZERO regrow churn — identical allocation to the
+        // old fixed buffer), decoded through the GROWABLE ISA-L loop so a chunk
+        // that expands past the reserve GROWS on demand instead of overflowing
+        // and storming EVERY chunk to the ~7.5x pure-Rust fallback (DIS-29: the
+        // storm threshold was exactly the 8x factor — nasa 9.9x crushed T1 to
+        // 0.57x rg; growth fixes it byte-exact, T1 +20-30%, T8/T16 neutral).
+        // This is HANDOFF item (i)'s "retry-on-None-with-growth" with the
+        // retry's wasted first decode removed: growth only engages on overflow,
+        // identity elsewhere. RESERVE_CAP bounds only the UPFRONT reserve (a
+        // pathological span no longer needs the cap to protect the fallback —
+        // growth past it is on-demand and tracks the actual decoded size).
+        //
+        // GZIPPY_ISAL_INCREMENTAL_GROWTH=1 keeps the ALWAYS-SMALL measurement
+        // arm (footprint sweeps; DIS-23): small initial far below 8x. Do NOT
+        // default it on — it regresses sub-8x corpora at low-T (ghcn T1 -18%,
+        // regrow churn with no storm to fix; DIS-29).
+        let (initial, grow_bytes) = if let Some((initial_factor, grow)) = isal_incremental_growth()
+        {
             const INCR_FLOOR: usize = 512 * 1024; // never start below 512 KiB
-            let initial = compressed_span
-                .saturating_mul(initial_factor)
-                .max(INCR_FLOOR);
-            match isal_decompress::decompress_deflate_from_bit_into_growable(
-                bounded,
-                inflate_start_bit,
-                initial_window,
-                &mut chunk.data,
-                initial,
-                grow_bytes,
-            ) {
-                Some(v) => {
-                    // All decoded bytes were committed during growth; reset the
-                    // LOGICAL length back to decode_start while the bytes REMAIN
-                    // physically present in the buffer's spare (Vec::truncate keeps
-                    // capacity + contents). This makes the post-decode state
-                    // IDENTICAL to the fixed-buffer path (len == decode_start, the
-                    // `written` bytes sitting in spare), so the shared commit/CRC/
-                    // boundary/fallback logic below — including its several
-                    // `return Ok(false)` exits — runs byte-for-byte the same. (The
-                    // exits must leave chunk.data at decode_start; the fixed path got
-                    // that for free by committing only at the very end.)
-                    chunk.data.truncate(decode_start);
-                    v
-                }
-                None => {
-                    // The growable decode may have committed bytes during growth
-                    // before bailing; reset to the pre-decode length before falling
-                    // back to the byte-exact pure-Rust engine.
-                    chunk.data.truncate(decode_start);
-                    return Ok(false);
-                }
-            }
+            (
+                compressed_span
+                    .saturating_mul(initial_factor)
+                    .max(INCR_FLOOR),
+                grow,
+            )
         } else {
-            // IDENTITY (production default): single 8x-compressed-span UPFRONT reserve.
             const EXPAND_FACTOR: usize = 8;
             const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never reserve below 4 MiB
-            const RESERVE_CAP: usize = 64 * 1024 * 1024; // never reserve above the old ceiling
-            let reserve_len: usize = compressed_span
-                .saturating_mul(EXPAND_FACTOR)
-                .max(RESERVE_FLOOR)
-                .min(RESERVE_CAP);
-            let out = chunk.data.writable_tail_reserve(reserve_len);
-            match isal_decompress::decompress_deflate_from_bit_into(
-                bounded,
-                inflate_start_bit,
-                initial_window,
-                out,
-            ) {
-                Some(v) => v,
-                None => return Ok(false),
-            }
+            const RESERVE_CAP: usize = 64 * 1024 * 1024; // upfront-reserve ceiling (growth may exceed on demand)
+            const GROW_BYTES: usize = 4 * 1024 * 1024; // per-grow increment on overflow
+            (
+                compressed_span
+                    .saturating_mul(EXPAND_FACTOR)
+                    .max(RESERVE_FLOOR)
+                    .min(RESERVE_CAP),
+                GROW_BYTES,
+            )
         };
+        match isal_decompress::decompress_deflate_from_bit_into_growable(
+            bounded,
+            inflate_start_bit,
+            initial_window,
+            &mut chunk.data,
+            initial,
+            grow_bytes,
+        ) {
+            Some(v) => {
+                // All decoded bytes were committed during the decode; reset the
+                // LOGICAL length back to decode_start while the bytes REMAIN
+                // physically present in the buffer's spare (Vec::truncate keeps
+                // capacity + contents). This leaves the state the old fixed-buffer
+                // path produced (len == decode_start, the `written` bytes sitting
+                // in spare), so the shared commit/CRC/boundary/fallback logic
+                // below — including its several `return Ok(false)` exits — runs
+                // byte-for-byte the same. (The exits must leave chunk.data at
+                // decode_start; the fixed path got that for free by committing
+                // only at the very end.)
+                chunk.data.truncate(decode_start);
+                v
+            }
+            None => {
+                // The growable decode may have committed bytes during growth
+                // before bailing; reset to the pre-decode length before falling
+                // back to the byte-exact pure-Rust engine.
+                chunk.data.truncate(decode_start);
+                return Ok(false);
+            }
+        }
+    };
 
     // Pick the natural stop: first boundary at-or-past stop_hint (inexact), or
     // the exact boundary == stop_hint (exact). Boundaries record (bit_offset,
@@ -2758,6 +2770,115 @@ mod isal_tail_parity {
         let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
         enc.write_all(&data).unwrap();
         enc.finish().unwrap()
+    }
+
+    /// GROWTH-PAST-THE-OLD-CAP gate (advisor follow-up to the DIS-29 storm
+    /// fix). The 64 MiB RESERVE_CAP now bounds only the UPFRONT reserve; a
+    /// chunk whose decoded size exceeds it must GROW past the cap on demand
+    /// (previously such a chunk ALWAYS fell back to pure-Rust). A multi-GB
+    /// end-to-end fixture is too heavy for the suite, so exercise the exact
+    /// production code path directly: the growable FFI decode into a
+    /// `SegmentedU8` sink with initial == the 64 MiB cap, on a raw-deflate
+    /// stream decoding to ~90 MiB. Asserts full decode + byte-exact output.
+    #[test]
+    fn isal_growable_decode_grows_past_64mib_cap() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // ~90 MiB of a repeating 512-byte pattern -> tiny compressed stream
+        // with extreme expansion (the regime that blows past the cap).
+        let mut pattern = [0u8; 512];
+        for (i, b) in pattern.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        const RAW_LEN: usize = 90 * 1024 * 1024;
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+        let mut remaining = RAW_LEN;
+        while remaining > 0 {
+            let n = remaining.min(pattern.len());
+            enc.write_all(&pattern[..n]).unwrap();
+            remaining -= n;
+        }
+        let deflate = enc.finish().unwrap();
+
+        const OLD_CAP: usize = 64 * 1024 * 1024; // the production upfront-reserve cap
+        let mut sink = crate::decompress::parallel::segmented_buffer::SegmentedU8::default();
+        let (written, _end_bit, _boundaries) =
+            crate::backends::isal_decompress::decompress_deflate_from_bit_into_growable(
+                &deflate,
+                0,
+                &[],
+                &mut sink,
+                OLD_CAP,
+                4 * 1024 * 1024,
+            )
+            .expect("growable decode must not fail past the old 64 MiB cap");
+        assert_eq!(written, RAW_LEN, "must decode past the 64 MiB initial");
+        assert_eq!(sink.len(), RAW_LEN);
+        let out = sink.to_contiguous();
+        assert!(
+            out.chunks(pattern.len()).all(|c| c == &pattern[..c.len()]),
+            "decoded bytes must match the source pattern"
+        );
+    }
+
+    /// FALLBACK-STORM regression gate (DIS-29 / HANDOFF item i). On a
+    /// >8x-compressible corpus the old FIXED 8x-compressed-span reserve
+    /// overflowed on EVERY chunk: `decompress_deflate_from_bit_into` returned
+    /// `None` at buffer-full, so ALL chunks fell back to the ~7.5x-slower
+    /// pure-Rust engine (isal_chunks=0 — nasa 9.9x crushed T1 to 0.57x rg).
+    /// The growable production decode keeps the same 8x upfront reserve but
+    /// GROWS on overflow, so chunks stay on ISA-L. This test builds a ~10x
+    /// web-log-like member, decodes it through the REAL ParallelSM pipeline at
+    /// T=4, and asserts (a) byte-exact output and (b) at least one chunk
+    /// decoded on the ISA-L engine (the pre-fix binary storms: chunks=0).
+    #[test]
+    fn isal_engine_survives_8x_expansion_no_storm() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+
+        // ~48 MiB of repetitive log lines -> ratio >10x at level 9.
+        let mut raw: Vec<u8> = Vec::with_capacity(48 * 1024 * 1024);
+        let mut rng: u64 = 0x2545f4914f6cdd1d;
+        while raw.len() < 48 * 1024 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let host = (rng >> 33) % 50;
+            let path = (rng >> 13) % 200;
+            let code = 100 + ((rng >> 5) % 65000);
+            raw.extend_from_slice(
+                format!(
+                    "host{host:03}.example.com - - [01/Jul/1995:00:00:{:02} -0400] \
+                     \"GET /path/to/resource/{path} HTTP/1.0\" 200 {code}\n",
+                    rng % 60
+                )
+                .as_bytes(),
+            );
+        }
+        let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
+        enc.write_all(&raw).unwrap();
+        let gz = enc.finish().unwrap();
+        let ratio = raw.len() as f64 / gz.len() as f64;
+        assert!(
+            ratio > 8.5,
+            "fixture must exceed the 8x storm threshold, got {ratio:.2}x"
+        );
+
+        let chunks_before = ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed);
+        let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+        let n =
+            crate::decompress::parallel::single_member::decompress_parallel(&gz, &mut out, None, 4)
+                .expect("parallel decode of >8x member");
+        assert_eq!(n as usize, raw.len());
+        assert_eq!(out, raw, "output must be byte-exact");
+        let chunks_delta = ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed) - chunks_before;
+        assert!(
+            chunks_delta >= 1,
+            "ISA-L engine decoded no chunks on a >8x corpus — the reserve-overflow \
+             fallback storm is back (DIS-29)"
+        );
     }
 
     #[test]
