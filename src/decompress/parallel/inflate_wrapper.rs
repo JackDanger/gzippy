@@ -144,11 +144,14 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
 // ── Pure-Rust backend (Track B3) ─────────────────────────────────────────
 //
 // Routes through `Inflate<Clean, Generic, Streaming>` — the unified-decoder
-// surface (`plans/unified-decoder.md`, phase 2). Every parallel-SM chunk
-// decode goes through this wrapper, so `UNIFIED_INFLATE_RUNS` counts each
-// `read_stream` call and the deletion-trap test
-// `tests::routing::unified_inflate_path_runs_on_parallel_sm` ensures the
-// route stays live.
+// surface (`plans/unified-decoder.md`, phase 2). M3 (DIV-1 part 1) removed
+// this SECOND engine from the gzippy-native window-seeded INEXACT route
+// (those chunks now decode on the ONE `deflate::Block`; see
+// `gzip_chunk::finish_decode_chunk_seeded_block_native` and the
+// `tests::routing::seeded_block_engine_runs_on_parallel_sm` trap). The
+// wrapper remains the engine for the until-exact paths (M4 pre-registered
+// contract), the `GZIPPY_SEEDED_BLOCK=0` kill-switch arm, and the
+// gzippy-isal build's ISA-L-backed variant.
 
 #[cfg(pure_inflate_decode)]
 pub struct StreamingInflateWrapper<'a> {

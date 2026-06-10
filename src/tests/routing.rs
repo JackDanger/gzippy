@@ -648,20 +648,23 @@ mod tests {
     }
 
     // =========================================================================
-    // Unified-decoder routing trap — paired with `UNIFIED_INFLATE_RUNS`.
+    // ONE-engine routing trap (M3, DIV-1 part 1) — paired with
+    // `SEEDED_BLOCK_CHUNKS` / `SEEDED_WRAPPER_CHUNKS`.
     //
-    // Phase 2 of `plans/unified-decoder.md` switches `StreamingInflateWrapper`
-    // (the parallel-SM chunk decoder) from `ResumableInflate2` to
-    // `Inflate<Clean, Generic, Streaming>`. Every chunk `read_stream` on
-    // the production path now passes through the unified surface and
-    // bumps `UNIFIED_INFLATE_RUNS`.
+    // Pre-M3 this trap asserted `UNIFIED_INFLATE_RUNS` moved: every seeded
+    // chunk's clean tail ran the SECOND engine (`StreamingInflateWrapper` →
+    // `Inflate<Clean, Generic, Streaming>`). M3 reverses that contract on
+    // gzippy-native: window-seeded INEXACT chunks (and chunk 0) decode on the
+    // ONE `deflate::Block` engine (vendor GzipChunk.hpp:454-458), seeded via
+    // `set_initial_window` → `decode_clean_into_contig`. The mark of "the
+    // Block route is wired into production" is `SEEDED_BLOCK_CHUNKS` moving
+    // on a real CLI-shaped decode — and NO seeded chunk silently taking the
+    // wrapper arm (`SEEDED_WRAPPER_CHUNKS` unchanged; that arm exists only
+    // for `GZIPPY_SEEDED_BLOCK=0`, the isal build, and the ISA-L oracle).
     //
-    // Without this test, a future refactor could revert the wrapper to
-    // `ResumableInflate2` and leave `Inflate` dead — the silesia tests
-    // and the marker-pipeline trap would still pass because output bytes
-    // would still be correct. The mark of "the unified surface is wired
-    // into production" is *this counter moving on a real CLI-shaped
-    // decode*.
+    // `unified::Inflate` remains reachable from the until-exact paths until
+    // M4 re-routes them (its exact-stop contract is pre-registered there);
+    // its counter is no longer asserted here.
     //
     // Same lock + same fixture as `test_marker_pipeline_actually_runs...`
     // so the two traps don't race each other under parallel test
@@ -669,7 +672,7 @@ mod tests {
     // =========================================================================
     #[test]
     #[cfg(all(pure_inflate_decode, not(feature = "isal-compression")))]
-    fn unified_inflate_path_runs_on_parallel_sm() {
+    fn seeded_block_engine_runs_on_parallel_sm() {
         use std::sync::atomic::Ordering;
 
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -684,18 +687,29 @@ mod tests {
             compressed.len()
         );
 
-        let unified_before =
-            crate::decompress::inflate::unified::UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
+        let block_before =
+            crate::decompress::parallel::gzip_chunk::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
+        let wrapper_before =
+            crate::decompress::parallel::gzip_chunk::SEEDED_WRAPPER_CHUNKS.load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
-        let unified_after =
-            crate::decompress::inflate::unified::UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
+        let block_after =
+            crate::decompress::parallel::gzip_chunk::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
+        let wrapper_after =
+            crate::decompress::parallel::gzip_chunk::SEEDED_WRAPPER_CHUNKS.load(Ordering::Relaxed);
 
         assert!(
-            unified_after > unified_before,
-            "UNIFIED_INFLATE_RUNS did not increment ({unified_before} -> {unified_after}); \
-             chunk clean-tail decode must go through `Inflate<Clean, Generic, Streaming>`"
+            block_after > block_before,
+            "SEEDED_BLOCK_CHUNKS did not increment ({block_before} -> {block_after}); \
+             window-seeded inexact chunks must decode on the ONE `deflate::Block` \
+             engine (M3, vendor GzipChunk.hpp:454-458)"
+        );
+        assert_eq!(
+            wrapper_after, wrapper_before,
+            "SEEDED_WRAPPER_CHUNKS moved ({wrapper_before} -> {wrapper_after}); a seeded \
+             inexact chunk took the second engine (`StreamingInflateWrapper`) on \
+             gzippy-native without the kill-switch"
         );
     }
 

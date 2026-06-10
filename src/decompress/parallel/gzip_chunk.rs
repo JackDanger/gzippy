@@ -249,6 +249,34 @@ fn fold_nocrc_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("GZIPPY_FOLD_NOCRC").is_ok_and(|v| v == "1"))
 }
 
+/// M3 kill-switch (DIV-1 part 1): `GZIPPY_SEEDED_BLOCK=0` restores the
+/// pre-M3 wrapper path (`StreamingInflateWrapper`/`unified::Inflate`) for
+/// window-seeded INEXACT chunks on gzippy-native. Default ON (Block engine).
+/// Production proof of which engine decoded each seeded chunk:
+/// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn seeded_block_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_SEEDED_BLOCK").map_or(true, |v| v != "0"))
+}
+
+/// Whether the M3 seeded-Block route is taken for a window-seeded inexact
+/// chunk. gzippy-native: ON unless `GZIPPY_SEEDED_BLOCK=0` or the ISA-L
+/// measurement oracle is enabled (`GZIPPY_ISAL_ENGINE_ORACLE` must keep
+/// observing the wrapper-entry path it instruments). gzippy-isal: constant
+/// FALSE — the faithful rapidgzip WITH_ISAL clean-tail handoff
+/// (GzipChunk.hpp:440-444) stays untouched.
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn seeded_block_route_enabled() -> bool {
+    seeded_block_enabled() && !isal_engine_oracle_enabled()
+}
+
+#[cfg(all(parallel_sm, isal_clean_tail))]
+fn seeded_block_route_enabled() -> bool {
+    false
+}
+
 /// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
 ///
 /// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
@@ -1126,7 +1154,20 @@ fn decode_chunk_with_rapidgzip_impl(
                 // PRODUCTION: allow the ISA-L clean-tail engine.
                 true,
             )?;
+        } else if seeded_block_route_enabled() {
+            // M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
+            // `deflate::Block` engine (vendor GzipChunk.hpp:454-458, non-ISAL
+            // build) instead of the second clean engine
+            // (`StreamingInflateWrapper`/`unified::Inflate`).
+            finish_decode_chunk_seeded_block_native(
+                &mut chunk,
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                initial_window,
+            )?;
         } else {
+            SEEDED_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             finish_decode_chunk_with_inexact_offset(
                 &mut chunk,
                 input,
@@ -1466,7 +1507,16 @@ fn finish_decode_chunk_contig_native(
             while !block.eob() {
                 // H4: re-fetch (base, cap, pos) every iteration — a grow inside
                 // `contig_decode_window` may have moved the allocation.
-                let (base, cap, pos_before) = chunk.data.contig_decode_window(HEADROOM);
+                //
+                // Request HEADROOM + 1, not HEADROOM: the decoders cap their
+                // write budget at `out_room = cap - HEADROOM`, so a returned
+                // spare of EXACTLY HEADROOM makes `out_room == pos` → zero
+                // budget → `Ok(0)` → a spurious "no progress" error below.
+                // (Observed on the M3 seeded route at spare == 266 after the
+                // reserve estimate was outgrown; latent on the FOLD path too.)
+                // Vec growth is amortized, so the +1 only changes the moment a
+                // doubling fires, never the decoded bytes.
+                let (base, cap, pos_before) = chunk.data.contig_decode_window(HEADROOM + 1);
                 let mut pos = pos_before;
                 // H1: release-mode guard — never let the decoder write past the
                 // reserved headroom (a contract violation here is a heap OOB,
@@ -1540,17 +1590,156 @@ fn finish_decode_chunk_contig_native(
                 return Ok(());
             }
             // Record the block boundary at the real EOB (decoded_offset = total
-            // decoded bytes = markers + clean), mirror :1597.
-            let decoded_offset = chunk.data_with_markers.len() + chunk.data.len();
+            // decoded bytes = markers + clean), mirror :1597. `data_prefix_len`
+            // is 0 on the FOLD path (the 32 KiB window is real prior output);
+            // on the M3 seeded path the dictionary prefix at `data[0..32768)`
+            // is NOT chunk output and must not shift boundary keys.
+            let decoded_offset =
+                chunk.data_with_markers.len() + chunk.data.len() - chunk.data_prefix_len;
             chunk.append_block_boundary_at(end_bit_offset, decoded_offset, Some(input));
         }
     })
+}
+
+/// M3 (DIV-1 part 1) — vendor `GzipChunk.hpp:454-458` (non-ISAL build):
+///
+/// ```c++
+/// auto block = std::make_shared<deflate::Block</* CRC32 */ false,
+///                                              /* enable analysis */ false>>();
+/// if ( initialWindow ) {
+///     block->setInitialWindow( *initialWindow );
+/// }
+/// ```
+///
+/// A window-KNOWN chunk decodes on the SAME ONE `deflate::Block` engine,
+/// seeded clean-from-byte-0 — vendor-native has NO second engine for this
+/// path (the ISA-L fork at GzipChunk.hpp:440-444 is compiled out). gzippy
+/// mirror: seed the thread-local [`BOOTSTRAP_BLOCK`] (`Block::reset` +
+/// `set_initial_window` → `WidthRing::seed_window`, deflate.hpp:1750-1759)
+/// and decode every deflate block u8-DIRECT into `chunk.data`'s contiguous
+/// tail via `decode_clean_into_contig` — the design's single clean-destination
+/// contract (plans/engine-u8-design.md §4.3), the same machinery the FOLD
+/// post-flip tail already runs ([`finish_decode_chunk_contig_native`]).
+///
+/// The 32 KiB seed is installed as a NON-OUTPUT dictionary prefix at
+/// `chunk.data[0..32768)` (`prefill_window_prefix`, `data_prefix_len` =
+/// 32 KiB — the A3/A4 scaffolding: `decoded_size()`, boundary keys, window
+/// extraction and the consumer write all skip it), so back-refs resolve as
+/// pure `base[*pos - d]` — byte-equal to vendor's ring-window reads because
+/// the prefix bytes ARE the predecessor window (deflate.hpp:1750-1759 prime
+/// + DecodedData.hpp:278-289 contiguous clean storage).
+///
+/// This REPLACES `StreamingInflateWrapper`/`unified::Inflate`
+/// (inflate_wrapper.rs:153-161) on the gzippy-native window-seeded INEXACT
+/// path — the DIV-1 second clean engine. The until-exact path stays on the
+/// wrapper until M4 (its stopping-point/footer contract is pre-registered
+/// there); the gzippy-isal clean-tail handoff is untouched (faithful
+/// rapidgzip WITH_ISAL, GzipChunk.hpp:440-444/520-526).
+///
+/// Kill-switch: `GZIPPY_SEEDED_BLOCK=0` restores the wrapper arm exactly
+/// (see [`seeded_block_route_enabled`]).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn finish_decode_chunk_seeded_block_native(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+) -> Result<(), ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+    debug_assert_eq!(
+        initial_window.len(),
+        MAX_WINDOW_SIZE,
+        "seeded-Block route requires a full 32 KiB window (caller gate)"
+    );
+    SEEDED_BLOCK_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::decompress::parallel::trace_v2::emit_instant(
+        "worker.chunk_phase",
+        &format!(r#""start_bit":{inflate_start_bit},"phase":"window_seeded_block""#),
+        "t",
+    );
+
+    // Dictionary prefix: the predecessor window at `data[0..32768)`, excluded
+    // from output/boundary accounting via `data_prefix_len`.
+    chunk.prefill_window_prefix(initial_window);
+
+    // Pre-reserve ONE contiguous clean-data region (mirror of
+    // `decode_chunk_unified_marker`'s reserve — same heuristic, same clamp;
+    // an under-reserve falls back to safe amortized regrow between calls).
+    {
+        const RESERVE_CLAMP: usize = 16 * 1024 * 1024;
+        let compressed_bytes = stop_hint_bits.saturating_sub(inflate_start_bit) / 8;
+        let estimate = compressed_bytes
+            .saturating_mul(8)
+            .saturating_add(1024 * 1024);
+        chunk.reserve_clean(estimate.min(RESERVE_CLAMP));
+    }
+
+    let mut marker_ctx = MarkerDecodeCtx::new(input, inflate_start_bit)?;
+
+    // Seed the ONE engine (vendor GzipChunk.hpp:456-458 →
+    // `Block::setInitialWindow`, deflate.hpp:1750-1759): reset the thread-local
+    // Block, then prime CLEAN mode from byte 0 with the predecessor window.
+    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
+        let mut block = cell_block.borrow_mut();
+        block.reset(None, None);
+        let mut unused: Vec<u16> = Vec::new();
+        block
+            .set_initial_window(&mut unused, initial_window)
+            .map_err(|e| {
+                ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("seeded-Block set_initial_window: {e:?}"),
+                ))
+            })?;
+        debug_assert!(unused.is_empty(), "seed must not drain into output");
+        Ok(())
+    })?;
+    marker_ctx.block_primed = true;
+
+    // Same per-block driver the FOLD post-flip tail uses: header parse,
+    // stop-hint early-out at block boundaries, `decode_clean_into_contig`
+    // bodies, EOB boundary recording, BFINAL finalize.
+    finish_decode_chunk_contig_native(
+        chunk,
+        &mut marker_ctx,
+        input,
+        inflate_start_bit,
+        stop_hint_bits,
+    )
+}
+
+/// gzippy-isal stub: [`seeded_block_route_enabled`] is constant `false` on the
+/// `isal_clean_tail` build (the faithful WITH_ISAL clean-tail handoff stays the
+/// production seeded path, GzipChunk.hpp:440-444), so this is statically
+/// unreachable — it exists only so the route call site compiles on both builds.
+#[cfg(all(parallel_sm, isal_clean_tail))]
+fn finish_decode_chunk_seeded_block_native(
+    _chunk: &mut ChunkData,
+    _input: &[u8],
+    _inflate_start_bit: usize,
+    _stop_hint_bits: usize,
+    _initial_window: &[u8],
+) -> Result<(), ChunkDecodeError> {
+    unreachable!("seeded-Block route is gzippy-native only (seeded_block_route_enabled() == false on isal_clean_tail)")
 }
 
 /// Counter: chunks that took the window-present clean-from-block-0 fast path
 /// (vendor `setInitialWindow`) instead of full marker decode.
 #[cfg(parallel_sm)]
 pub static WINDOW_SEEDED_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// M3 engine proof: window-seeded INEXACT chunks decoded on the ONE
+/// `deflate::Block` engine (`finish_decode_chunk_seeded_block_native`).
+#[cfg(parallel_sm)]
+pub static SEEDED_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// M3 engine proof (complement): window-seeded INEXACT chunks decoded on the
+/// pre-M3 wrapper arm (`GZIPPY_SEEDED_BLOCK=0` kill-switch, the gzippy-isal
+/// build, or the ISA-L measurement oracle).
+#[cfg(parallel_sm)]
+pub static SEEDED_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Clean-tail [`MarkerSink`] for the merged phase-2 decode: narrows the
@@ -3850,5 +4039,531 @@ mod native_fold_parity {
         let (got, prefix_len, _crc) = decode_first_chunk_native(&deflate);
         assert_eq!(prefix_len, 0);
         assert_eq!(got, payload, "stored-block-after-flip diverged");
+    }
+}
+
+// =========================================================================
+// M3 differential gate (DIV-1 part 1): seeded-Block vs seeded-wrapper
+// =========================================================================
+// For window-seeded INEXACT chunks the gzippy-native production route moved
+// from `StreamingInflateWrapper`/`unified::Inflate` onto the ONE
+// `deflate::Block` engine (vendor GzipChunk.hpp:454-458). This gate nets the
+// two arms — `finish_decode_chunk_seeded_block_native` (new production) vs
+// `finish_decode_chunk_with_inexact_offset` (the `GZIPPY_SEEDED_BLOCK=0`
+// kill-switch arm) — on generated corpora, asserting:
+//   (a) decoded bytes        (b) decoded_size / data_prefix_len accounting
+//   (c) final bit (encoded_size_bits)   (d) per-stream CRC32 values
+//   (e) subchunk keys (encoded_offset, encoded_size, decoded_offset, size)
+//   (f) published windows: get_last_window / last_32kib_window /
+//       per-subchunk windows (populate_subchunk_windows), plus a brute-force
+//       window check against `pred ‖ payload` (the stale-window-key scar net:
+//       trailing/last-window content must equal ground truth, not just match
+//       the other arm).
+#[cfg(all(test, parallel_sm, not(isal_clean_tail)))]
+mod seeded_block_parity {
+    use super::*;
+
+    const WINDOW: usize = 32 * 1024;
+
+    /// Raw DEFLATE of `payload` with a 32 KiB preset dictionary so the
+    /// encoder emits back-refs reaching into the predecessor window.
+    fn deflate_with_dict(payload: &[u8], dict: &[u8], level: u32) -> Vec<u8> {
+        use flate2::{Compress, Compression, FlushCompress};
+        let mut c = Compress::new(Compression::new(level), false);
+        c.set_dictionary(dict).expect("set_dictionary");
+        let mut out = vec![0u8; payload.len() * 2 + 4096];
+        let status = c
+            .compress(payload, &mut out, FlushCompress::Finish)
+            .expect("compress");
+        assert_eq!(status, flate2::Status::StreamEnd, "deflate did not finish");
+        out.truncate(c.total_out() as usize);
+        out
+    }
+
+    /// Raw DEFLATE with a preset dictionary and a SYNC FLUSH every
+    /// `flush_every` payload bytes (empty stored blocks + dense boundaries).
+    fn deflate_with_dict_flushes(
+        payload: &[u8],
+        dict: &[u8],
+        level: u32,
+        flush_every: usize,
+    ) -> Vec<u8> {
+        use flate2::{Compress, Compression, FlushCompress};
+        let mut c = Compress::new(Compression::new(level), false);
+        c.set_dictionary(dict).expect("set_dictionary");
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; payload.len() + 64 * 1024];
+        let mut fed = 0usize;
+        loop {
+            let end = (fed + flush_every).min(payload.len());
+            let flush = if end == payload.len() {
+                FlushCompress::Finish
+            } else {
+                FlushCompress::Sync
+            };
+            let before_out = c.total_out() as usize;
+            let status = c
+                .compress(&payload[fed..end], &mut buf, flush)
+                .expect("compress");
+            out.extend_from_slice(&buf[..c.total_out() as usize - before_out]);
+            fed = c.total_in() as usize;
+            if end == payload.len() && status == flate2::Status::StreamEnd {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 32 KiB deterministic text-like dictionary.
+    fn make_dict() -> Vec<u8> {
+        let mut d = b"the quick brown fox jumps over the lazy dog. ".repeat(800);
+        d.truncate(WINDOW.max(32768));
+        let cut = d.len() - WINDOW;
+        d[cut..].to_vec()
+    }
+
+    fn lcg_bytes(n: usize, mut x: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            v.push((x >> 24) as u8);
+        }
+        v
+    }
+
+    fn flate2_inflate_with_dict(deflate: &[u8], dict: &[u8]) -> Vec<u8> {
+        use flate2::{Decompress, FlushDecompress};
+        let mut d = Decompress::new(false);
+        d.set_dictionary(dict).expect("set_dictionary");
+        let mut out = vec![0u8; 64 * 1024 * 1024];
+        let status = d
+            .decompress(deflate, &mut out, FlushDecompress::Finish)
+            .expect("inflate");
+        assert!(
+            matches!(status, flate2::Status::StreamEnd),
+            "truth inflate did not reach stream end"
+        );
+        out.truncate(d.total_out() as usize);
+        out
+    }
+
+    /// NEW production arm: ONE Block engine, seeded.
+    fn arm_block(
+        input: &[u8],
+        stop_hint_bits: usize,
+        window: &[u8],
+        cfg: ChunkConfiguration,
+    ) -> ChunkData {
+        let mut chunk = ChunkData::new(0, cfg);
+        finish_decode_chunk_seeded_block_native(&mut chunk, input, 0, stop_hint_bits, window)
+            .expect("seeded Block decode");
+        chunk
+    }
+
+    /// Kill-switch arm: pre-M3 wrapper path, byte/key reference.
+    fn arm_wrapper(
+        input: &[u8],
+        stop_hint_bits: usize,
+        window: &[u8],
+        cfg: ChunkConfiguration,
+    ) -> ChunkData {
+        let mut chunk = ChunkData::new(0, cfg);
+        finish_decode_chunk_with_inexact_offset(
+            &mut chunk,
+            input,
+            0,
+            stop_hint_bits,
+            window,
+            false,
+        )
+        .expect("seeded wrapper decode");
+        chunk
+    }
+
+    /// Full cross-arm equality net (a)-(f). `truth` = full-stream ground truth
+    /// (decoded bytes must be a prefix of it; equal when stop = stream end).
+    fn assert_arms_equal(
+        mut b: ChunkData,
+        mut w: ChunkData,
+        pred: &[u8],
+        truth: &[u8],
+        total_bits: usize,
+        label: &str,
+    ) {
+        // (b) prefix accounting: Block arm carries the dictionary prefix.
+        assert_eq!(b.data_prefix_len, WINDOW, "{label}: Block arm prefix len");
+        assert_eq!(w.data_prefix_len, 0, "{label}: wrapper arm prefix len");
+        assert!(
+            b.data_with_markers.is_empty() && w.data_with_markers.is_empty(),
+            "{label}: seeded decode must emit no markers"
+        );
+
+        // (a) decoded bytes.
+        let bb = b.data.to_contiguous()[WINDOW..].to_vec();
+        let wb = w.data.to_contiguous();
+        if bb != wb {
+            let first_diff = bb.iter().zip(wb.iter()).position(|(x, y)| x != y);
+            panic!(
+                "{label}: decoded bytes diverged (block_len={} wrapper_len={} first_diff={first_diff:?})",
+                bb.len(),
+                wb.len()
+            );
+        }
+        assert!(!bb.is_empty(), "{label}: decoded nothing");
+        assert!(
+            bb.len() <= truth.len() && bb[..] == truth[..bb.len()],
+            "{label}: decoded bytes are not a prefix of ground truth"
+        );
+        assert_eq!(b.decoded_size(), w.decoded_size(), "{label}: decoded_size");
+        assert_eq!(
+            b.decoded_size(),
+            bb.len(),
+            "{label}: decoded_size accounting"
+        );
+
+        // (c) final bit. Strict equality, with exactly TWO measured, documented
+        // exceptions where the WRAPPER (kill-switch arm) semantics differ:
+        //
+        //   1. STREAM END (BFINAL decoded; bb == truth): the wrapper reports
+        //      `tell_compressed()` after `finished` — the byte-aligned input
+        //      end (= total_bits; the <=7 padding bits are consumed). The
+        //      Block arm reports the exact bit after the final EOB symbol —
+        //      identical to the production-proven native FOLD semantics
+        //      (`finish_decode_chunk_contig_native` / `MarkerStep::Finished`).
+        //
+        //   2. WRAPPER ACCOUNTING HOLE (pre-existing, found by this gate): if
+        //      the inexact stop hint lands BETWEEN an EOB and the engine's
+        //      next END_OF_BLOCK_HEADER stop, the coalescing engine never
+        //      surfaces an END_OF_BLOCK stop (interior EOBs are reported only
+        //      via take_block_boundaries), so `last_eob_pos` keeps its init
+        //      value (`inflate_start_bit`) and the header-arm stop finalizes
+        //      at `last_end_bit = last_eob_pos = chunk start` →
+        //      `encoded_size_bits == 0` despite all bytes being emitted. The
+        //      Block arm reports the contract value (first block boundary
+        //      at-or-past the hint). If the wrapper hole is ever fixed, the
+        //      `wrapper_final == 0` guard below fails loudly — remove the
+        //      exception then.
+        let full_stream = bb.len() == truth.len();
+        let block_final = b.encoded_offset_bits + b.encoded_size_bits;
+        let wrapper_final = w.encoded_offset_bits + w.encoded_size_bits;
+        let final_bit_exception = if b.encoded_size_bits == w.encoded_size_bits {
+            None
+        } else if full_stream && wrapper_final == total_bits && wrapper_final - block_final < 8 {
+            eprintln!(
+                "[m3-gate] {label}: stream-end final-bit policy (block exact-EOB {block_final}, wrapper byte-aligned {wrapper_final})"
+            );
+            Some("stream_end")
+        } else if w.encoded_size_bits == 0 && b.encoded_size_bits > 0 {
+            eprintln!(
+                "[m3-gate] {label}: wrapper final-bit accounting hole (wrapper 0, block {block_final}) — pre-existing wrapper bug, Block arm reports the contract value"
+            );
+            Some("wrapper_hole")
+        } else {
+            panic!(
+                "{label}: final bit diverged outside the two documented policies (block {block_final}, wrapper {wrapper_final})"
+            );
+        };
+
+        // (d) CRCs.
+        assert_eq!(b.crc32s.len(), w.crc32s.len(), "{label}: crc32s count");
+        for (i, (x, y)) in b.crc32s.iter().zip(w.crc32s.iter()).enumerate() {
+            assert_eq!(x.crc32(), y.crc32(), "{label}: crc32s[{i}]");
+        }
+        assert_eq!(
+            b.crc32s[0].crc32(),
+            crate::decompress::parallel::crc32::crc32(&bb),
+            "{label}: CRC accumulator != crc32(decoded)"
+        );
+
+        // (e) subchunk keys. The trailing subchunk's `encoded_size_bits` is
+        // derived from the chunk-final bit (`finalize_with_deflate`), so under
+        // a documented final-bit exception it differs by exactly the same
+        // mechanism — compare it via per-arm self-consistency instead; all
+        // other key fields stay strictly equal.
+        let keys = |c: &ChunkData| {
+            let n = c.subchunks.len();
+            c.subchunks
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let trailing = i + 1 == n;
+                    (
+                        s.encoded_offset_bits,
+                        if trailing && final_bit_exception.is_some() {
+                            0 // normalized; checked via self-consistency below
+                        } else {
+                            s.encoded_size_bits
+                        },
+                        s.decoded_offset,
+                        s.decoded_size,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&b), keys(&w), "{label}: subchunk keys");
+        for (c, final_bit, arm) in [(&b, block_final, "block"), (&w, wrapper_final, "wrapper")] {
+            if let Some(last) = c.subchunks.last() {
+                assert_eq!(
+                    last.encoded_offset_bits + last.encoded_size_bits,
+                    final_bit,
+                    "{label}: {arm} trailing subchunk encoded_size inconsistent with final bit"
+                );
+            }
+        }
+
+        // (f) published windows: cross-arm AND vs brute-force ground truth
+        // (`pred ‖ decoded`) — the stale-window-key scar net.
+        let mut hist = Vec::with_capacity(pred.len() + bb.len());
+        hist.extend_from_slice(pred);
+        hist.extend_from_slice(&bb);
+        let brute = |chunk_off: usize| -> Vec<u8> {
+            let end = pred.len() + chunk_off;
+            hist[end - WINDOW..end].to_vec()
+        };
+
+        let lb = b.get_last_window_vec(pred);
+        let lw = w.get_last_window_vec(pred);
+        assert_eq!(lb, lw, "{label}: get_last_window");
+        assert_eq!(
+            lb,
+            brute(bb.len()),
+            "{label}: get_last_window vs brute force"
+        );
+        assert_eq!(
+            b.last_32kib_window_vec(),
+            w.last_32kib_window_vec(),
+            "{label}: last_32kib_window"
+        );
+
+        b.populate_subchunk_windows(pred);
+        w.populate_subchunk_windows(pred);
+        assert_eq!(
+            b.subchunks.len(),
+            w.subchunks.len(),
+            "{label}: subchunk count"
+        );
+        for (i, (sb, sw)) in b.subchunks.iter().zip(w.subchunks.iter()).enumerate() {
+            let wbts = sb.window.as_ref().map(|v| v.decompress());
+            let wwts = sw.window.as_ref().map(|v| v.decompress());
+            // Cross-arm window equality — strict, except under the documented
+            // wrapper accounting hole, where the wrapper's trailing
+            // `encoded_size_bits == 0` makes its sparsity pass
+            // (`get_used_window_symbols`) scan from the WRONG bit (chunk
+            // start instead of the real continuation bit), mis-zeroing its
+            // window. The Block arm's window is still netted against the
+            // brute-force ground truth below.
+            if final_bit_exception != Some("wrapper_hole") {
+                assert_eq!(wbts, wwts, "{label}: subchunk[{i}] window bytes");
+            }
+            // Sparsity may zero unused symbols (identically in both arms, since
+            // keys are equal) — so only check the NON-sparsified brute window
+            // when sparsity left the window intact.
+            if let Some(got) = &wbts {
+                let bf = brute(sb.decoded_offset);
+                if sb.used_window_symbols.is_empty() && got != &bf {
+                    // Window was sparsified (zeros at unused offsets) or truly
+                    // wrong. Verify every NON-zero byte matches ground truth —
+                    // a stale/shifted window would mismatch on non-zeros too.
+                    assert_eq!(got.len(), bf.len(), "{label}: subchunk[{i}] window len");
+                    for (j, (g, t)) in got.iter().zip(bf.iter()).enumerate() {
+                        assert!(
+                            *g == 0 || g == t,
+                            "{label}: subchunk[{i}] window byte {j} stale (got {g}, truth {t})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_case(payload: &[u8], deflate: &[u8], dict: &[u8], cfg: ChunkConfiguration, label: &str) {
+        let truth = flate2_inflate_with_dict(deflate, dict);
+        assert_eq!(truth, payload, "{label}: fixture self-check");
+        let stop = deflate.len() * 8;
+        let b = arm_block(deflate, stop, dict, cfg);
+        let w = arm_wrapper(deflate, stop, dict, cfg);
+        assert_arms_equal(b, w, dict, &truth, deflate.len() * 8, label);
+    }
+
+    #[test]
+    fn seeded_dynamic_heavy_multi_subchunk() {
+        // Text-like, dynamic-Huffman-heavy, > several split thresholds so the
+        // subchunk-split machinery runs (the silesia-T4-class key zone).
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&dict[..8 * 1024]); // dict back-refs up front
+        for i in 0..6000u32 {
+            payload.extend_from_slice(
+                format!(
+                    "line {i}: the quick brown fox jumps over the lazy dog #{}\n",
+                    i % 97
+                )
+                .as_bytes(),
+            );
+        }
+        payload.extend_from_slice(&dict[16 * 1024..24 * 1024]); // mid-dict refs late
+                                                                // Flush every 16 KiB so the stream carries REAL deflate block
+                                                                // boundaries (zlib otherwise emits very large blocks), letting the
+                                                                // 48 KiB split threshold produce a multi-subchunk shape.
+        let deflate = deflate_with_dict_flushes(&payload, &dict, 6, 16 * 1024);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 48 * 1024, // force multiple subchunks locally
+            ..ChunkConfiguration::default()
+        };
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        assert_eq!(truth, payload, "fixture self-check");
+        let stop = deflate.len() * 8;
+        let b = arm_block(&deflate, stop, &dict, cfg);
+        assert!(
+            b.subchunks.len() >= 3,
+            "expected a multi-subchunk shape, got {}",
+            b.subchunks.len()
+        );
+        let w = arm_wrapper(&deflate, stop, &dict, cfg);
+        assert_arms_equal(b, w, &dict, &truth, stop, "dynamic_heavy");
+    }
+
+    #[test]
+    fn seeded_stored_mixed() {
+        // Alternating compressible / incompressible 24 KiB segments at level 1
+        // → mixed STORED + Huffman blocks (zlib stores incompressible runs).
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        for k in 0..8usize {
+            if k % 2 == 0 {
+                payload.extend_from_slice(&b"compressible compressible! ".repeat(900));
+            } else {
+                payload.extend_from_slice(&lcg_bytes(24 * 1024, 0xC0FF_EE00 + k as u32));
+            }
+        }
+        let deflate = deflate_with_dict(&payload, &dict, 1);
+        run_case(
+            &payload,
+            &deflate,
+            &dict,
+            ChunkConfiguration::default(),
+            "stored_mixed_l1",
+        );
+
+        // Level 0: ALL stored blocks (the pure `decode_clean_stored_into_contig`
+        // route on the Block arm).
+        let deflate0 = deflate_with_dict(&payload, &dict, 0);
+        run_case(
+            &payload,
+            &deflate0,
+            &dict,
+            ChunkConfiguration::default(),
+            "stored_only_l0",
+        );
+    }
+
+    #[test]
+    fn seeded_flush_dense() {
+        // SYNC flush every 2 KiB → dense empty stored blocks + boundaries.
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&dict[1..4097]); // offset-1 dict ref shape
+        for i in 0..2000u32 {
+            payload.extend_from_slice(format!("flushy line {i} {}\n", i % 13).as_bytes());
+        }
+        let deflate = deflate_with_dict_flushes(&payload, &dict, 6, 2048);
+        run_case(
+            &payload,
+            &deflate,
+            &dict,
+            ChunkConfiguration::default(),
+            "flush_dense",
+        );
+    }
+
+    #[test]
+    fn seeded_window_boundary_backrefs() {
+        // Payload BEGINS with a copy of the dictionary head → the encoder emits
+        // a distance-32768 back-ref at output offset 0 (and offset-1 variants),
+        // crossing the contig prefix seam at its extreme reach.
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&dict[..4096]); // distance == 32768 at offset 0
+        payload.extend_from_slice(b"X");
+        payload.extend_from_slice(&dict[..4096]); // re-reference after 1 byte
+        payload.extend_from_slice(&lcg_bytes(8 * 1024, 0xBEEF_CAFE));
+        payload.extend_from_slice(&dict[WINDOW - 4096..]); // dict tail refs
+        let deflate = deflate_with_dict(&payload, &dict, 9);
+        run_case(
+            &payload,
+            &deflate,
+            &dict,
+            ChunkConfiguration::default(),
+            "window_boundary",
+        );
+    }
+
+    #[test]
+    fn seeded_stop_hint_parity() {
+        // Inexact stop hints: at a real block boundary, just before one, and
+        // mid-block — both arms must stop at the SAME first boundary >= hint.
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        for i in 0..4000u32 {
+            payload.extend_from_slice(format!("stop-hint line {i} {}\n", i % 31).as_bytes());
+        }
+        // Dense flushes give plenty of in-stream boundaries to aim at.
+        let deflate = deflate_with_dict_flushes(&payload, &dict, 6, 4096);
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        assert_eq!(truth, payload, "fixture self-check");
+        let cfg = ChunkConfiguration::default();
+
+        // Take boundary positions from a wrapper enumeration pass.
+        let total_bits = deflate.len() * 8;
+        let probe = arm_wrapper(&deflate, total_bits / 2, &dict, cfg);
+        let mid_stop = probe.encoded_offset_bits + probe.encoded_size_bits;
+        assert!(
+            mid_stop > 0 && mid_stop < total_bits,
+            "probe stop in-stream"
+        );
+
+        for (delta, name) in [
+            (0isize, "at_boundary"),
+            (-3, "before_boundary"),
+            (5, "past_boundary"),
+        ] {
+            let hint = (mid_stop as isize + delta) as usize;
+            let b = arm_block(&deflate, hint, &dict, cfg);
+            let w = arm_wrapper(&deflate, hint, &dict, cfg);
+            eprintln!(
+                "[m3-gate] stop_hint_{name}: hint={hint} block(final={}, decoded={}, subchunks={}) wrapper(final={}, decoded={}, subchunks={})",
+                b.encoded_size_bits,
+                b.decoded_size(),
+                b.subchunks.len(),
+                w.encoded_size_bits,
+                w.decoded_size(),
+                w.subchunks.len()
+            );
+            assert_arms_equal(
+                b,
+                w,
+                &dict,
+                &truth,
+                total_bits,
+                &format!("stop_hint_{name}"),
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_block_counter_increments() {
+        // Engine-proof counter: the Block arm increments SEEDED_BLOCK_CHUNKS.
+        let dict = make_dict();
+        let payload = b"counter payload ".repeat(1024);
+        let deflate = deflate_with_dict(&payload, &dict, 6);
+        let before = SEEDED_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = arm_block(
+            &deflate,
+            deflate.len() * 8,
+            &dict,
+            ChunkConfiguration::default(),
+        );
+        let after = SEEDED_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "SEEDED_BLOCK_CHUNKS did not increment");
     }
 }

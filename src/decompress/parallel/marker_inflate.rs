@@ -716,9 +716,14 @@ impl Block {
     /// early-return at deflate.hpp:1751 — "before decoding has started").
     ///
     /// # Empty window
-    /// Mirrors rapidgzip's behavior: an empty `initial_window` is a no-op
-    /// (`m_decodedBytes` stays 0). Useful when the caller knows the chunk
-    /// starts at a stream boundary (BFINAL=1 successor or chunk 0).
+    /// Vendor-faithful (M3, deflate.hpp:1750-1759): an EMPTY `initial_window`
+    /// still flips the ring to CLEAN mode (`m_containsMarkerBytes = false` at
+    /// `:1757` is written OUTSIDE the `!initialWindow.empty()` arm). Used at
+    /// stream starts where no history can be referenced — back-refs past the
+    /// (zero-length) history then ERROR via the clean-mode range check, exactly
+    /// like vendor's `distance > m_decodedBytes + nBytesRead` check
+    /// (deflate.hpp:1652-1655). The historical pre-M3 no-op (stay in marker
+    /// mode) was the recorded divergence resolved here.
     #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn set_initial_window(
         &mut self,
@@ -755,18 +760,14 @@ impl Block {
         if initial_window.len() > MAX_WINDOW_SIZE {
             return Err(BlockError::ExceededWindowRange);
         }
-        // Empty window: Block's PRE-M2 contract — a no-op that stays in
-        // marker-emitting mode. NOTE (recorded for M3, zero-behavior-change
-        // M2 bar): vendor `setInitialWindow` flips `m_containsMarkerBytes =
-        // false` even for an EMPTY initial window (deflate.hpp:1751-1758,
-        // the `:1757` flag write is outside the `!initialWindow.empty()`
-        // arm), and `WidthRing::seed_window` follows vendor. Block keeps its
-        // historical no-op here so M2 changes no behavior; reconciling the
-        // empty-seed semantics belongs to M3 (the seeded-chunk rewire),
-        // where the callers move onto Block.
-        if initial_window.is_empty() {
-            return Ok(());
-        }
+        // Empty window: vendor-faithful as of M3 — fall through to
+        // `WidthRing::seed_window`, which flips the ring CLEAN even for a
+        // zero-length seed (vendor deflate.hpp:1751-1758: the `:1757`
+        // `m_containsMarkerBytes = false` write is OUTSIDE the
+        // `!initialWindow.empty()` arm). The pre-M3 early-return no-op
+        // (stay in marker mode) was the recorded divergence; it is resolved
+        // here because M3 moves the seeded-chunk callers onto Block.
+        //
         // Seed the u8 VIEW of the ring with the initial window
         // (`WidthRing::seed_window` — vendor's pre-decode prime path,
         // deflate.hpp:1748-1759: memcpy into the u8 view at [0, len),
@@ -4483,14 +4484,70 @@ mod tests {
     }
 
     #[test]
-    fn set_initial_window_empty_is_noop() {
+    fn set_initial_window_empty_arms_clean() {
+        // Vendor deflate.hpp:1750-1759 (M3 adoption): an EMPTY initial window
+        // still flips to CLEAN mode (`m_containsMarkerBytes = false` at :1757
+        // is outside the `!initialWindow.empty()` arm). The pre-M3 no-op
+        // (stay in marker mode) was the recorded divergence.
         let mut b = Block::new();
         let mut output: Vec<u16> = Vec::new();
+        assert!(b.contains_marker_bytes(), "fresh Block starts marker-mode");
         assert!(b.set_initial_window(&mut output, &[]).is_ok());
         assert!(output.is_empty());
-        // decoded_bytes counters are private; observe indirectly: a
-        // follow-on read with an empty stream should still treat us as
-        // pre-decode.
+        assert!(
+            !b.contains_marker_bytes(),
+            "empty seed must arm CLEAN mode (vendor :1757)"
+        );
+    }
+
+    #[test]
+    fn set_initial_window_empty_decodes_no_backref_stream_byte_exact() {
+        // Gauntlet net: a zero-length window seed arms Clean and a stream with
+        // NO back-refs (incompressible random bytes are stored/literal-coded)
+        // decodes byte-exact through the seeded-clean engine.
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Deterministic pseudo-random payload — no repeats long enough for
+        // back-refs at this scale, and even if the encoder emits one its
+        // distance stays within already-decoded output (still valid clean).
+        let mut payload = Vec::with_capacity(4096);
+        let mut x: u32 = 0x9E37_79B9;
+        for _ in 0..4096 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            payload.push((x >> 24) as u8);
+        }
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).unwrap();
+        let deflate_bytes = enc.finish().unwrap();
+
+        let boxed: &'static [u8] = Box::leak(deflate_bytes.into_boxed_slice());
+        let mut bits = Bits::new(boxed);
+        let mut b = Block::new();
+        let mut output: Vec<u16> = Vec::new();
+        b.set_initial_window(&mut output, &[]).unwrap();
+        assert!(!b.contains_marker_bytes());
+        loop {
+            b.read_header(&mut bits, false).unwrap();
+            while !b.eob() {
+                let n = b.read(&mut bits, &mut output, usize::MAX).unwrap();
+                if n == 0 && !b.eob() {
+                    panic!("empty-seed clean decode stalled before EOB");
+                }
+            }
+            if b.is_last_block() {
+                break;
+            }
+        }
+        let decoded: Vec<u8> = output
+            .iter()
+            .map(|&v| {
+                assert!(v < 256, "clean decode must not emit markers");
+                v as u8
+            })
+            .collect();
+        assert_eq!(decoded, payload, "empty-seed clean decode != payload");
     }
 
     #[test]
