@@ -78,12 +78,32 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let expected_crc = footer.crc32;
     let expected_size = footer.uncompressed_size as usize;
 
+    // Ratio-informed upfront reserve (DIS-14/DIS-17 / box-proven +41% model-T8).
+    // ratio_ceiling = ceil((ISIZE / compressed_len) × 1.25), minimum 2.
+    // = ceil(ISIZE × 5 / (compressed_len × 4)), minimum 2.
+    // ISIZE is mod 2^32 so files >4 GiB raw may wrap → under-ratio → safe
+    // regrow via GROW_BYTES; no correctness risk, just a few extra grows.
+    // 0 = unknown (compressed_len == 0 or ISIZE == 0) → 8× fallback in
+    // finish_decode_chunk_isal_oracle.
+    let expansion_ratio_ceil: u16 = {
+        let isize_bytes = footer.uncompressed_size as u64;
+        let compressed_bytes = deflate_data.len() as u64;
+        if compressed_bytes == 0 || isize_bytes == 0 {
+            0
+        } else {
+            let numer = isize_bytes.saturating_mul(5);
+            let denom = compressed_bytes.saturating_mul(4);
+            ((numer + denom - 1) / denom).max(2).min(u16::MAX as u64) as u16
+        }
+    };
+
     let configuration = ChunkConfiguration {
         split_chunk_size: target_compressed_chunk_bytes,
         max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
         crc32_enabled: true,
         window_sparsity: true,
         window_compression_type: None,
+        expansion_ratio_ceil,
     };
 
     // Clean-window oracle (GZIPPY_CLEAN_WINDOW_ORACLE=1, default OFF): decode

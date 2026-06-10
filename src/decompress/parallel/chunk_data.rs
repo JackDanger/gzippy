@@ -81,6 +81,24 @@ pub struct ChunkConfiguration {
     pub window_sparsity: bool,
     /// Vendor `Configuration::windowCompressionType` (ChunkData.hpp:103).
     pub window_compression_type: Option<CompressionType>,
+    /// Member-level output/compressed expansion ceiling: `ceil((ISIZE /
+    /// compressed_len) × 1.25)` as an integer factor, minimum 2. Set once per
+    /// gzip stream from the footer ISIZE and total compressed length in
+    /// `sm_driver`; 0 = unknown → `finish_decode_chunk_isal_oracle` falls back
+    /// to the historical 8× factor.
+    ///
+    /// Purpose: size the ISA-L clean-tail upfront output reserve proportionally
+    /// to the actual data ratio instead of a fixed 8×. On near-incompressible
+    /// corpora (model: ~1.3×) the 8× reserve over-allocates ~6× per chunk;
+    /// with O(T) concurrent workers the excess page-fault/dTLB pressure
+    /// collapses per-worker ISA-L throughput under concurrency. Sizing from the
+    /// known ratio eliminates the over-reservation while preserving a 1.25×
+    /// headroom margin for intra-member chunk variation.
+    ///
+    /// ISIZE is mod 2^32: for raw output > 4 GiB the ratio may under-estimate
+    /// (ISIZE wraps). That is safe — the initial just under-sizes and the
+    /// GROW_BYTES loop fills the gap incrementally with no correctness risk.
+    pub expansion_ratio_ceil: u16,
 }
 
 impl Default for ChunkConfiguration {
@@ -92,6 +110,7 @@ impl Default for ChunkConfiguration {
             crc32_enabled: true,
             window_sparsity: true,
             window_compression_type: None,
+            expansion_ratio_ceil: 0, // unknown — falls back to 8× in finish_decode_chunk_isal_oracle
         }
     }
 }
