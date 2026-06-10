@@ -662,9 +662,10 @@ mod tests {
     // wrapper arm (`SEEDED_WRAPPER_CHUNKS` unchanged; that arm exists only
     // for `GZIPPY_SEEDED_BLOCK=0`, the isal build, and the ISA-L oracle).
     //
-    // `unified::Inflate` remains reachable from the until-exact paths until
-    // M4 re-routes them (its exact-stop contract is pre-registered there);
-    // its counter is no longer asserted here.
+    // M4 re-routed the until-exact paths onto the same ONE Block engine
+    // (see `exact_block_engine_owns_until_exact_on_parallel_sm` below);
+    // `unified::Inflate` remains compiled as the kill-switch / isal-build /
+    // ISA-L-oracle arm only.
     //
     // Same lock + same fixture as `test_marker_pipeline_actually_runs...`
     // so the two traps don't race each other under parallel test
@@ -710,6 +711,49 @@ mod tests {
             "SEEDED_WRAPPER_CHUNKS moved ({wrapper_before} -> {wrapper_after}); a seeded \
              inexact chunk took the second engine (`StreamingInflateWrapper`) on \
              gzippy-native without the kill-switch"
+        );
+    }
+
+    // =========================================================================
+    // M4 (DIV-1 part 2) deletion trap: UNTIL-EXACT decodes never take the
+    // wrapper engine on gzippy-native.
+    //
+    // Whether a given production decode schedules any until-exact chunk is
+    // timing-dependent (it needs an on-demand decode with a published window
+    // AND a confirmed stop boundary), so `EXACT_BLOCK_CHUNKS > 0` cannot be
+    // asserted deterministically here (the exact_block_parity nets and the
+    // guest-corpus counter dump prove that side). What IS deterministic: on
+    // gzippy-native with the kill-switch at its default, NO until-exact chunk
+    // may decode on the wrapper (`EXACT_WRAPPER_CHUNKS` unchanged — that arm
+    // exists only for `GZIPPY_EXACT_BLOCK=0`, the isal build, and the ISA-L
+    // oracle).
+    // =========================================================================
+    #[test]
+    #[cfg(all(pure_inflate_decode, not(feature = "isal-compression")))]
+    fn exact_block_engine_owns_until_exact_on_parallel_sm() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let wrapper_before =
+            crate::decompress::parallel::gzip_chunk::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original, "byte-perfect output");
+        let wrapper_after =
+            crate::decompress::parallel::gzip_chunk::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
+
+        assert_eq!(
+            wrapper_after, wrapper_before,
+            "EXACT_WRAPPER_CHUNKS moved ({wrapper_before} -> {wrapper_after}); an until-exact \
+             chunk took the second engine (`StreamingInflateWrapper`) on gzippy-native \
+             without the kill-switch (M4, labeled deviation — see \
+             `finish_decode_chunk_exact_block_native`)"
         );
     }
 
