@@ -1,3 +1,18 @@
+## PIN-WORKERS KNOB: +15-29% same-loop frozen on every T4/T8 cell (UNMERGED; canonical re-measure owed) [2026-06-10]
+Branch perf/pin-workers-knob @ 234285db (worktree removed; /root/bin-pin kept): GZIPPY_PIN_WORKERS=1
+pins decode workers round-robin to distinct PHYSICAL cores (sysfs thread_siblings_list; T>phys-count
+guard => no-op; non-Linux no-op; default OFF). Frozen same-loop A/B: silesia T4 +29.2%, model T8
++20.9%, silesia T8 +20.2%, bignasa T8 +14.8%, T16 TIE (guard). Suite 904/1-preexisting.
+CAVEAT (do NOT bank the bar ratios from this run): the worker REWROTE the bench loop inline (spine's
+process-substitution hung for it); its absolute gz1 baselines are 30-60% slower than canonical-spine
+banked cells => only the RELATIVE pin deltas are valid. NEXT SESSION, IN ORDER: (1) canonical-spine
+frozen re-measure of the pin knob (gz1=HEAD unset vs gz2=HEAD pinned via GZ2_EXTRA_ENV, now in
+_parity_guest.sh); if the deltas hold, the T4/T8 band cells likely CROSS or approach the 0.99 bar;
+(2) advisor-gate the default-ON policy (vendor does NOT pin — justify as converging rg's EFFECTIVE
+1-thread/core spread under the same scheduler; heterogeneous/E-core topology care; consumer/post
+threads unpinned); (3) merge; (4) re-run the full silesia+squishy bar matrix both builds (native
+benefits identically — same pool); (5) then the residual ~22% pipeline-vs-rg gap at pinned placement
+(1527 vs 1944 MB/s) is the LAST structural term before the engine question.
 ## SMT PLACEMENT IS THE RESIDUAL — and a PIPELINE PLACEMENT LEVER FOUND [2026-06-10]
 Placement probe (bare FFI, 8 spans, masks): A(0-15 free)=2189 agg w/ EXACTLY 2 slow threads/run
 (SMT co-schedule roulette); B(one/physical core)=2766 agg (357/worker — ABOVE rg's 1989-2102);
