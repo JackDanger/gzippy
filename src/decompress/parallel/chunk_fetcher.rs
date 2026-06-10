@@ -1491,7 +1491,38 @@ fn consumer_loop<W: std::io::Write>(
 
         drop(_tv2_specf);
         let chunk_arc = match chunk_arc_from_partition {
-            Some(arc) => arc,
+            Some(arc) => {
+                // Vendor BlockFetcher.hpp:297-299 — `prefetchNewBlocks` runs on
+                // EVERY index-changed `get()`, INCLUDING when the result was
+                // already cached/prefetched: vendor's call sits BEFORE the
+                // cached-result return at BlockFetcher.hpp:302-309. gzippy's
+                // hit path (the partition-keyed take above) previously skipped
+                // it — the dispatch drive only existed on the miss path
+                // (inside `get_with_prefetch`) and in the 1ms blocked-pump
+                // ticks — so during a drain of already-ready prefetched chunks
+                // the dispatcher went COMPLETELY silent (masked trace
+                // 2026-06-09, model.gz T8: zero dispatch calls for 53ms of
+                // drain, then a ~17ms on-demand stall at the first
+                // un-prefetched partition, repeating every ~13 chunks; 5
+                // on-demand fetches == the 5 consumer stalls; pool fill
+                // factor 53%). Driving here keeps the prefetch horizon
+                // advancing one call per consumed chunk, exactly like vendor.
+                // Miss-path ordering is untouched: on-demand submit still
+                // precedes the dispatch drive (vendor BlockFetcher.hpp:276
+                // before :297), so the head-of-line task cannot queue behind
+                // fresh prefetches.
+                if should_drive_prefetch {
+                    let _tv2 = trace_v2::SpanGuard::begin("consumer.drive_prefetch_on_hit");
+                    block_fetcher.prefetch_new_blocks(
+                        &lookup_block_offset,
+                        &lookup_next_block_offset,
+                        &prefetch_submit,
+                        &is_finalized_too_high,
+                        &partition_offset_for,
+                    );
+                }
+                arc
+            }
             None => {
                 // PERFECT_OVERLAP self-test: a warm-cache MISS = a residual
                 // head-of-line decode wait the oracle failed to remove. If this
