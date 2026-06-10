@@ -277,6 +277,35 @@ fn seeded_block_route_enabled() -> bool {
     false
 }
 
+/// M4 kill-switch (DIV-1 part 2): `GZIPPY_EXACT_BLOCK=0` restores the
+/// pre-M4 wrapper path (`StreamingInflateWrapper`/`unified::Inflate`) for
+/// window-seeded UNTIL-EXACT chunks on gzippy-native. Default ON (Block
+/// engine). Production proof of which engine decoded each exact chunk:
+/// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn exact_block_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_EXACT_BLOCK").map_or(true, |v| v != "0"))
+}
+
+/// Whether the M4 exact-Block route is taken for a window-seeded UNTIL-EXACT
+/// chunk. gzippy-native: ON unless `GZIPPY_EXACT_BLOCK=0` or the ISA-L
+/// measurement oracle is enabled (`GZIPPY_ISAL_ENGINE_ORACLE` must keep
+/// observing the wrapper-entry path it instruments, including its
+/// BFINAL-exact-landing accept). gzippy-isal: constant FALSE — the faithful
+/// rapidgzip WITH_ISAL `decodeChunkWithInflateWrapper<IsalInflateWrapper>`
+/// path (GzipChunk.hpp:192-265) stays untouched.
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn exact_block_route_enabled() -> bool {
+    exact_block_enabled() && !isal_engine_oracle_enabled()
+}
+
+#[cfg(all(parallel_sm, isal_clean_tail))]
+fn exact_block_route_enabled() -> bool {
+    false
+}
+
 /// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
 ///
 /// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
@@ -775,6 +804,18 @@ pub fn decode_chunk_until_exact(
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
     if initial_window.len() == MAX_WINDOW_SIZE && until_exact {
+        // M4 (DIV-1 part 2): window-seeded UNTIL-EXACT chunks decode on the
+        // ONE `deflate::Block` engine on gzippy-native (kill-switch
+        // `GZIPPY_EXACT_BLOCK=0` restores the wrapper arm below exactly).
+        if exact_block_route_enabled() {
+            return decode_chunk_exact_block_native(
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                initial_window,
+                configuration,
+            );
+        }
         return decode_chunk_with_inflate_wrapper(
             input,
             encoded_offset_bits,
@@ -805,6 +846,10 @@ fn decode_chunk_with_inflate_wrapper(
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     INFLATE_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // M4 kill-switch complement proof: an until-exact chunk decoded on the
+    // wrapper engine (gzippy-isal production, `GZIPPY_EXACT_BLOCK=0`, or the
+    // ISA-L measurement oracle).
+    EXACT_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     finish_decode_chunk_impl(
         &mut chunk,
@@ -1143,17 +1188,32 @@ fn decode_chunk_with_rapidgzip_impl(
         );
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
-            finish_decode_chunk_impl(
-                &mut chunk,
-                input,
-                encoded_offset_bits,
-                stop_hint_bits,
-                initial_window,
-                false,
-                true,
-                // PRODUCTION: allow the ISA-L clean-tail engine.
-                true,
-            )?;
+            if exact_block_route_enabled() {
+                // M4 (DIV-1 part 2): until-exact decodes on the ONE
+                // `deflate::Block` engine (see
+                // `finish_decode_chunk_exact_block_native` for the labeled
+                // deviation + pre-registered contract).
+                finish_decode_chunk_exact_block_native(
+                    &mut chunk,
+                    input,
+                    encoded_offset_bits,
+                    stop_hint_bits,
+                    initial_window,
+                )?;
+            } else {
+                EXACT_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                finish_decode_chunk_impl(
+                    &mut chunk,
+                    input,
+                    encoded_offset_bits,
+                    stop_hint_bits,
+                    initial_window,
+                    false,
+                    true,
+                    // PRODUCTION: allow the ISA-L clean-tail engine.
+                    true,
+                )?;
+            }
         } else if seeded_block_route_enabled() {
             // M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
             // `deflate::Block` engine (vendor GzipChunk.hpp:454-458, non-ISAL
@@ -1391,6 +1451,7 @@ fn decode_chunk_unified_marker(
                     input,
                     end_bit_offset,
                     stop_hint_bits,
+                    false,
                 )?;
                 return Ok(chunk);
             }
@@ -1448,6 +1509,36 @@ fn decode_chunk_unified_marker(
 /// block-boundary recording, CRC + subchunk + non_marker accounting) for the
 /// clean phase only. The isal two-phase path (`finish_decode_chunk_with_inexact_offset`)
 /// is unchanged.
+///
+/// `until_exact` (M4, DIV-1 part 2) switches the stop condition from the
+/// inexact "first block boundary at-or-past `stop_hint_bits`" to the EXACT
+/// contract of the wrapper arm (`finish_decode_chunk_impl` with
+/// `until_exact=true`, whose bit reader is hard-capped at `stop_hint_bits`
+/// via `with_until_bits`):
+///
+///   - SUCCESS iff the decode lands EXACTLY at `stop_hint_bits`: either the
+///     bit cursor reaches `stop_hint_bits` at a block-header boundary (the
+///     wrapper's `try_enter_next_block` cap stop), or the member's BFINAL
+///     block ends with its BYTE-ALIGNED post-EOB bit == `stop_hint_bits`.
+///   - Otherwise `ChunkDecodeError::ExactStopMissed { requested, actual }`,
+///     replicating gzip_chunk.rs `finish_decode_chunk_impl`'s
+///     `final_bit != stop_hint_bits` assertion with the same coordinates.
+///
+/// END-BIT COORDINATE CONVENTION (explicit, the BFINAL scar-class lesson):
+///   - interior stop: the exact (possibly non-byte-aligned) bit of the
+///     confirmed boundary — identical to the wrapper's read-cap cursor.
+///   - member-final stop: the post-EOB bit rounded UP to the next byte
+///     boundary. The wrapper consumes the RFC 1952 zero padding via
+///     `finish_current_block`'s `align_to_byte()` (resumable.rs:823-842),
+///     so its `tell_compressed()` at stream end is byte-aligned; the Block
+///     arm replicates that by aligning `end_bit_offset` explicitly. The
+///     8-byte gzip footer is NOT consumed by either arm (`sm_driver`
+///     slices it off the input; production `stop_hint == total_bits` is
+///     the padded deflate end, footer excluded). NOTE this differs from
+///     the INEXACT Block arm (M3), which reports the UNALIGNED post-EOB
+///     bit (documented M3 stream-end exception) — for the exact arm the
+///     aligned convention is REQUIRED so the production
+///     `stop_hint == total_bits` member-final chunk lands exactly.
 #[cfg(all(parallel_sm, not(isal_clean_tail)))]
 fn finish_decode_chunk_contig_native(
     chunk: &mut ChunkData,
@@ -1455,6 +1546,7 @@ fn finish_decode_chunk_contig_native(
     input: &[u8],
     start_bit_offset: usize,
     stop_hint_bits: usize,
+    until_exact: bool,
 ) -> Result<(), ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
 
@@ -1478,6 +1570,29 @@ fn finish_decode_chunk_contig_native(
             let mut bits = marker_ctx.open_bits(input);
             let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
+            // M4 exact stop at a block-header boundary. Wrapper analog: the
+            // bit reader is capped at `stop_hint_bits` (`with_until_bits`),
+            // so `try_enter_next_block` returns false the moment the cursor
+            // reaches the cap and `final_bit = tell_compressed() ==
+            // stop_hint_bits` — success without parsing the next header.
+            // A cursor PAST the cap is impossible for the wrapper (the
+            // reader refuses those bits) and means a mis-registered stop
+            // hint here (never a confirmed boundary) — error with the same
+            // ExactStopMissed coordinates the wrapper's final assertion uses.
+            if until_exact {
+                if next_block_offset == stop_hint_bits {
+                    marker_ctx.current_bit_offset = next_block_offset;
+                    chunk.finalize_with_deflate(next_block_offset, Some(input));
+                    return Ok(());
+                }
+                if next_block_offset > stop_hint_bits {
+                    return Err(ChunkDecodeError::ExactStopMissed {
+                        requested: stop_hint_bits,
+                        actual: next_block_offset,
+                    });
+                }
+            }
+
             // Header parse (mirror marker_decode_step_loop:1499-1515).
             {
                 let _tv2 =
@@ -1491,7 +1606,9 @@ fn finish_decode_chunk_contig_native(
             }
 
             // Stop-hint early-out at a block boundary (mirror :1517-1527).
-            if next_block_offset >= stop_hint_bits && !block.is_last_block() {
+            // INEXACT arm only — the exact arm stops solely on the
+            // `next_block_offset == stop_hint_bits` cap check above.
+            if !until_exact && next_block_offset >= stop_hint_bits && !block.is_last_block() {
                 marker_ctx.current_bit_offset = next_block_offset;
                 chunk.finalize_with_deflate(next_block_offset, Some(input));
                 return Ok(());
@@ -1586,6 +1703,28 @@ fn finish_decode_chunk_contig_native(
             marker_ctx.current_bit_offset = end_bit_offset;
 
             if block.is_last_block() {
+                if until_exact {
+                    // Member-final exact stop: byte-align the post-EOB bit
+                    // (the wrapper consumes the RFC 1952 padding via
+                    // `align_to_byte`, resumable.rs:823-842) and require it
+                    // to equal the requested stop — the wrapper's
+                    // `final_bit != stop_hint_bits` assertion with identical
+                    // coordinates. The footer is NOT consumed (input slice
+                    // excludes it); a multi-member-crossing stop hint
+                    // therefore errors here exactly like the wrapper arm
+                    // (no `read_footer_at_current`/`reset_for_next_stream`
+                    // call exists on the production until-exact path).
+                    let aligned_end = end_bit_offset.div_ceil(8) * 8;
+                    marker_ctx.current_bit_offset = aligned_end;
+                    if aligned_end != stop_hint_bits {
+                        return Err(ChunkDecodeError::ExactStopMissed {
+                            requested: stop_hint_bits,
+                            actual: aligned_end,
+                        });
+                    }
+                    chunk.finalize_with_deflate(aligned_end, Some(input));
+                    return Ok(());
+                }
                 chunk.finalize_with_deflate(end_bit_offset, Some(input));
                 return Ok(());
             }
@@ -1646,17 +1785,51 @@ fn finish_decode_chunk_seeded_block_native(
     stop_hint_bits: usize,
     initial_window: &[u8],
 ) -> Result<(), ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-    debug_assert_eq!(
-        initial_window.len(),
-        MAX_WINDOW_SIZE,
-        "seeded-Block route requires a full 32 KiB window (caller gate)"
-    );
     SEEDED_BLOCK_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::decompress::parallel::trace_v2::emit_instant(
         "worker.chunk_phase",
         &format!(r#""start_bit":{inflate_start_bit},"phase":"window_seeded_block""#),
         "t",
+    );
+
+    let mut marker_ctx = seed_block_for_contig_native(
+        chunk,
+        input,
+        inflate_start_bit,
+        stop_hint_bits,
+        initial_window,
+    )?;
+
+    // Same per-block driver the FOLD post-flip tail uses: header parse,
+    // stop-hint early-out at block boundaries, `decode_clean_into_contig`
+    // bodies, EOB boundary recording, BFINAL finalize.
+    finish_decode_chunk_contig_native(
+        chunk,
+        &mut marker_ctx,
+        input,
+        inflate_start_bit,
+        stop_hint_bits,
+        false,
+    )
+}
+
+/// Shared M3/M4 seeding: dictionary prefix + contig reserve + priming the
+/// thread-local [`BOOTSTRAP_BLOCK`] clean-from-byte-0 with the predecessor
+/// window (vendor GzipChunk.hpp:456-458 → `Block::setInitialWindow`,
+/// deflate.hpp:1750-1759).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn seed_block_for_contig_native(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+) -> Result<MarkerDecodeCtx, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+    debug_assert_eq!(
+        initial_window.len(),
+        MAX_WINDOW_SIZE,
+        "seeded-Block route requires a full 32 KiB window (caller gate)"
     );
 
     // Dictionary prefix: the predecessor window at `data[0..32768)`, excluded
@@ -1677,9 +1850,8 @@ fn finish_decode_chunk_seeded_block_native(
 
     let mut marker_ctx = MarkerDecodeCtx::new(input, inflate_start_bit)?;
 
-    // Seed the ONE engine (vendor GzipChunk.hpp:456-458 →
-    // `Block::setInitialWindow`, deflate.hpp:1750-1759): reset the thread-local
-    // Block, then prime CLEAN mode from byte 0 with the predecessor window.
+    // Seed the ONE engine: reset the thread-local Block, then prime CLEAN
+    // mode from byte 0 with the predecessor window.
     BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
         let mut block = cell_block.borrow_mut();
         block.reset(None, None);
@@ -1696,17 +1868,139 @@ fn finish_decode_chunk_seeded_block_native(
         Ok(())
     })?;
     marker_ctx.block_primed = true;
+    Ok(marker_ctx)
+}
 
-    // Same per-block driver the FOLD post-flip tail uses: header parse,
-    // stop-hint early-out at block boundaries, `decode_clean_into_contig`
-    // bodies, EOB boundary recording, BFINAL finalize.
+/// M4 (DIV-1 part 2) — LABELED DEVIATION from the vendor blueprint.
+///
+/// Vendor's exact-stop path is `decodeChunkWithInflateWrapper<ZlibInflateWrapper/
+/// IsalInflateWrapper>` (GzipChunk.hpp:192-265) — a C-FFI inflate wrapper, NOT
+/// `deflate::Block`. Putting the until-exact decode on Block-with-exact-stop is
+/// justified SOLELY by gzippy-native's no-C-FFI charter (the pure-Rust build has
+/// no faithful wrapper engine to hand the chunk to; gzippy-isal keeps the
+/// faithful wrapper path untouched, see `exact_block_route_enabled`).
+///
+/// PRE-REGISTERED CONTRACT (plans/engine-u8-design.md GATE AMENDMENTS §2) —
+/// Block must replicate from the `unified::Inflate` wrapper arm
+/// (`finish_decode_chunk_impl`, until_exact=true):
+///
+///  (a) stopping-point reactions: END_OF_BLOCK → every non-final EOB records
+///      a block boundary (`append_block_boundary_at`; here at the driver's
+///      EOB recording site). END_OF_STREAM_HEADER → on the wrapper arm this
+///      stop fires only after `reset_for_next_stream`, which NO production
+///      parallel-SM caller invokes (first-hand verified; see
+///      inflate_wrapper.rs:1058-1065) — it is unreachable on the until-exact
+///      arm, and Block replicates that observable: decode ends at the
+///      member's BFINAL EOB with no next-stream continuation.
+///  (b) the exact `final_bit != stop_hint_bits => ExactStopMissed` assertion
+///      (`finish_decode_chunk_impl`'s final check), same `requested`/`actual`
+///      coordinates — enforced in `finish_decode_chunk_contig_native`'s
+///      until_exact arm at both stop sites.
+///  (c) footer/multi-stream (`read_footer_at_current`/`reset_for_next_stream`):
+///      these wrapper APIs are NEVER called by the production until-exact
+///      arm — the wrapper stops at the BFINAL EOB (byte-aligned via
+///      `align_to_byte`, resumable.rs:823-842) and asserts against
+///      `stop_hint_bits` WITHOUT consuming the footer (sm_driver slices the
+///      footer off `input`; vendor's wrapper DOES read footers,
+///      GzipChunk.hpp:246-251, because its chunks may span members — gzippy's
+///      single-member slice cannot). Block replicates the wrapper arm's
+///      observable exactly: member-final success iff the byte-aligned
+///      post-EOB bit == stop_hint_bits; a member-crossing stop hint errors
+///      `ExactStopMissed` identically on both arms (pinned by the
+///      `exact_block_parity::exact_multi_member_trailing` net).
+///  (d) block-boundary recording (`take_block_boundaries` replay →
+///      `append_block_boundary_at`): the driver records every non-final EOB
+///      boundary with decoded offsets excluding the dictionary prefix
+///      (`data_prefix_len`), key-identical to the wrapper's
+///      `decode_base + n_bytes_read` accounting (pinned by the parity nets'
+///      subchunk-key equality).
+///
+/// Kill-switch: `GZIPPY_EXACT_BLOCK=0` restores the wrapper arm exactly
+/// (see [`exact_block_route_enabled`]). Engine proof: [`EXACT_BLOCK_CHUNKS`]
+/// vs [`EXACT_WRAPPER_CHUNKS`].
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn finish_decode_chunk_exact_block_native(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+) -> Result<(), ChunkDecodeError> {
+    EXACT_BLOCK_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::decompress::parallel::trace_v2::emit_instant(
+        "worker.chunk_phase",
+        &format!(r#""start_bit":{inflate_start_bit},"phase":"window_seeded_block_exact""#),
+        "t",
+    );
+
+    let mut marker_ctx = seed_block_for_contig_native(
+        chunk,
+        input,
+        inflate_start_bit,
+        stop_hint_bits,
+        initial_window,
+    )?;
+
     finish_decode_chunk_contig_native(
         chunk,
         &mut marker_ctx,
         input,
         inflate_start_bit,
         stop_hint_bits,
+        true,
     )
+}
+
+/// gzippy-isal stub: [`exact_block_route_enabled`] is constant `false` on the
+/// `isal_clean_tail` build (the faithful WITH_ISAL
+/// `decodeChunkWithInflateWrapper` path stays production, GzipChunk.hpp:192-265),
+/// so this is statically unreachable — it exists only so the route call site
+/// compiles on both builds.
+#[cfg(all(parallel_sm, isal_clean_tail))]
+fn finish_decode_chunk_exact_block_native(
+    _chunk: &mut ChunkData,
+    _input: &[u8],
+    _inflate_start_bit: usize,
+    _stop_hint_bits: usize,
+    _initial_window: &[u8],
+) -> Result<(), ChunkDecodeError> {
+    unreachable!("exact-Block route is gzippy-native only (exact_block_route_enabled() == false on isal_clean_tail)")
+}
+
+/// Vendor `decodeChunkWithInflateWrapper`-shaped envelope for the M4 Block
+/// route: fresh `ChunkData` + window-seeded exact decode + decode-duration
+/// accounting (mirror of `decode_chunk_with_inflate_wrapper`'s envelope).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn decode_chunk_exact_block_native(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let t_decode = std::time::Instant::now();
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+    finish_decode_chunk_exact_block_native(
+        &mut chunk,
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+    )?;
+    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    Ok(chunk)
+}
+
+/// gzippy-isal stub (see [`finish_decode_chunk_exact_block_native`]'s stub).
+#[cfg(all(parallel_sm, isal_clean_tail))]
+fn decode_chunk_exact_block_native(
+    _input: &[u8],
+    _encoded_offset_bits: usize,
+    _stop_hint_bits: usize,
+    _initial_window: &[u8],
+    _configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    unreachable!("exact-Block route is gzippy-native only (exact_block_route_enabled() == false on isal_clean_tail)")
 }
 
 /// gzippy-isal stub: [`seeded_block_route_enabled`] is constant `false` on the
@@ -1740,6 +2034,18 @@ pub static SEEDED_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// build, or the ISA-L measurement oracle).
 #[cfg(parallel_sm)]
 pub static SEEDED_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// M4 engine proof: UNTIL-EXACT chunks decoded on the ONE `deflate::Block`
+/// engine (`finish_decode_chunk_exact_block_native`).
+#[cfg(parallel_sm)]
+pub static EXACT_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// M4 engine proof (complement): UNTIL-EXACT chunks decoded on the wrapper
+/// arm (`GZIPPY_EXACT_BLOCK=0` kill-switch, the gzippy-isal build, or the
+/// ISA-L measurement oracle).
+#[cfg(parallel_sm)]
+pub static EXACT_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Clean-tail [`MarkerSink`] for the merged phase-2 decode: narrows the
@@ -4067,7 +4373,7 @@ mod seeded_block_parity {
 
     /// Raw DEFLATE of `payload` with a 32 KiB preset dictionary so the
     /// encoder emits back-refs reaching into the predecessor window.
-    fn deflate_with_dict(payload: &[u8], dict: &[u8], level: u32) -> Vec<u8> {
+    pub(super) fn deflate_with_dict(payload: &[u8], dict: &[u8], level: u32) -> Vec<u8> {
         use flate2::{Compress, Compression, FlushCompress};
         let mut c = Compress::new(Compression::new(level), false);
         c.set_dictionary(dict).expect("set_dictionary");
@@ -4082,7 +4388,7 @@ mod seeded_block_parity {
 
     /// Raw DEFLATE with a preset dictionary and a SYNC FLUSH every
     /// `flush_every` payload bytes (empty stored blocks + dense boundaries).
-    fn deflate_with_dict_flushes(
+    pub(super) fn deflate_with_dict_flushes(
         payload: &[u8],
         dict: &[u8],
         level: u32,
@@ -4115,14 +4421,14 @@ mod seeded_block_parity {
     }
 
     /// 32 KiB deterministic text-like dictionary.
-    fn make_dict() -> Vec<u8> {
+    pub(super) fn make_dict() -> Vec<u8> {
         let mut d = b"the quick brown fox jumps over the lazy dog. ".repeat(800);
         d.truncate(WINDOW.max(32768));
         let cut = d.len() - WINDOW;
         d[cut..].to_vec()
     }
 
-    fn lcg_bytes(n: usize, mut x: u32) -> Vec<u8> {
+    pub(super) fn lcg_bytes(n: usize, mut x: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
             x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -4131,7 +4437,7 @@ mod seeded_block_parity {
         v
     }
 
-    fn flate2_inflate_with_dict(deflate: &[u8], dict: &[u8]) -> Vec<u8> {
+    pub(super) fn flate2_inflate_with_dict(deflate: &[u8], dict: &[u8]) -> Vec<u8> {
         use flate2::{Decompress, FlushDecompress};
         let mut d = Decompress::new(false);
         d.set_dictionary(dict).expect("set_dictionary");
@@ -4565,5 +4871,582 @@ mod seeded_block_parity {
         );
         let after = SEEDED_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "SEEDED_BLOCK_CHUNKS did not increment");
+    }
+}
+
+// =========================================================================
+// M4 differential gate (DIV-1 part 2): exact-Block vs exact-wrapper
+// =========================================================================
+// For window-seeded UNTIL-EXACT chunks the gzippy-native production route
+// moved from `StreamingInflateWrapper`/`unified::Inflate` onto the ONE
+// `deflate::Block` engine (LABELED DEVIATION — vendor's exact path is the
+// C-FFI `decodeChunkWithInflateWrapper`, GzipChunk.hpp:192-265; see
+// `finish_decode_chunk_exact_block_native`). This gate nets the two arms —
+// `finish_decode_chunk_exact_block_native` (new production) vs
+// `finish_decode_chunk_impl(until_exact=true)` (the `GZIPPY_EXACT_BLOCK=0`
+// kill-switch arm) — on generated corpora, asserting STRICT equality (no
+// M3-style final-bit exceptions: on success both arms must land EXACTLY at
+// stop_hint_bits by the until-exact contract):
+//   (a) decoded bytes      (b) decoded_size / data_prefix_len accounting
+//   (c) final bit == stop_hint_bits on BOTH arms
+//   (d) per-stream CRC32 values
+//   (e) subchunk keys (encoded_offset, encoded_size, decoded_offset, size)
+//   (f) published windows incl. brute-force `pred ‖ payload` ground truth
+//   (g) ERROR equality: when the stop cannot be honored (member-final
+//       misaligned hint, multi-member-crossing hint) both arms must return
+//       ExactStopMissed with IDENTICAL requested/actual coordinates.
+#[cfg(all(test, parallel_sm, not(isal_clean_tail)))]
+mod exact_block_parity {
+    use super::seeded_block_parity::{
+        deflate_with_dict, deflate_with_dict_flushes, flate2_inflate_with_dict, lcg_bytes,
+        make_dict,
+    };
+    use super::*;
+
+    const WINDOW: usize = 32 * 1024;
+
+    /// NEW production arm: ONE Block engine, seeded, exact stop.
+    fn arm_block_exact(
+        input: &[u8],
+        stop_hint_bits: usize,
+        window: &[u8],
+        cfg: ChunkConfiguration,
+    ) -> Result<ChunkData, ChunkDecodeError> {
+        let mut chunk = ChunkData::new(0, cfg);
+        finish_decode_chunk_exact_block_native(&mut chunk, input, 0, stop_hint_bits, window)
+            .map(|()| chunk)
+    }
+
+    /// Kill-switch arm: pre-M4 wrapper path (`finish_decode_chunk_impl`
+    /// with `until_exact=true`), byte/key/error reference.
+    fn arm_wrapper_exact(
+        input: &[u8],
+        stop_hint_bits: usize,
+        window: &[u8],
+        cfg: ChunkConfiguration,
+    ) -> Result<ChunkData, ChunkDecodeError> {
+        let mut chunk = ChunkData::new(0, cfg);
+        finish_decode_chunk_impl(
+            &mut chunk,
+            input,
+            0,
+            stop_hint_bits,
+            window,
+            false,
+            true,
+            true,
+        )
+        .map(|()| chunk)
+    }
+
+    /// Enumerate non-final EOB boundaries `(bit, decoded_offset)` via the
+    /// long-vetted wrapper engine (independent of both arms' stop logic).
+    fn enumerate_boundaries(input: &[u8], dict: &[u8]) -> Vec<(usize, usize)> {
+        let mut w = StreamingInflateWrapper::with_until_bits(input, 0, input.len() * 8)
+            .expect("wrapper construct");
+        w.set_window(dict).expect("set_window");
+        w.set_stopping_points(StoppingPoints::END_OF_BLOCK);
+        let mut out = vec![0u8; 1 << 20];
+        let mut total = 0usize;
+        let mut bounds = Vec::new();
+        loop {
+            let r = w.read_stream(&mut out).expect("read_stream");
+            total += r.bytes_written;
+            if r.finished {
+                break;
+            }
+            if r.stopped_at == StoppingPoints::END_OF_BLOCK && !w.is_final_block() {
+                bounds.push((r.bit_position, total));
+                continue;
+            }
+            if r.stopped_at == StoppingPoints::NONE && r.bytes_written == 0 {
+                break;
+            }
+        }
+        bounds
+    }
+
+    /// Strict cross-arm equality net (a)-(f) for SUCCESSFUL exact stops.
+    fn assert_arms_equal_exact(
+        mut b: ChunkData,
+        mut w: ChunkData,
+        pred: &[u8],
+        truth: &[u8],
+        stop_hint_bits: usize,
+        label: &str,
+    ) {
+        // (b) prefix accounting: Block arm carries the dictionary prefix.
+        assert_eq!(b.data_prefix_len, WINDOW, "{label}: Block arm prefix len");
+        assert_eq!(w.data_prefix_len, 0, "{label}: wrapper arm prefix len");
+        assert!(
+            b.data_with_markers.is_empty() && w.data_with_markers.is_empty(),
+            "{label}: exact decode must emit no markers"
+        );
+
+        // (a) decoded bytes.
+        let bb = b.data.to_contiguous()[WINDOW..].to_vec();
+        let wb = w.data.to_contiguous();
+        if bb != wb {
+            let first_diff = bb.iter().zip(wb.iter()).position(|(x, y)| x != y);
+            panic!(
+                "{label}: decoded bytes diverged (block_len={} wrapper_len={} first_diff={first_diff:?})",
+                bb.len(),
+                wb.len()
+            );
+        }
+        assert!(!bb.is_empty(), "{label}: decoded nothing");
+        assert!(
+            bb.len() <= truth.len() && bb[..] == truth[..bb.len()],
+            "{label}: decoded bytes are not a prefix of ground truth"
+        );
+        assert_eq!(b.decoded_size(), w.decoded_size(), "{label}: decoded_size");
+        assert_eq!(
+            b.decoded_size(),
+            bb.len(),
+            "{label}: decoded_size accounting"
+        );
+
+        // (c) final bit: the until-exact contract REQUIRES both arms to land
+        // exactly on stop_hint_bits — strict, no exceptions.
+        assert_eq!(
+            b.encoded_offset_bits + b.encoded_size_bits,
+            stop_hint_bits,
+            "{label}: Block arm final bit != stop_hint"
+        );
+        assert_eq!(
+            w.encoded_offset_bits + w.encoded_size_bits,
+            stop_hint_bits,
+            "{label}: wrapper arm final bit != stop_hint"
+        );
+
+        // (d) CRCs.
+        assert_eq!(b.crc32s.len(), w.crc32s.len(), "{label}: crc32s count");
+        for (i, (x, y)) in b.crc32s.iter().zip(w.crc32s.iter()).enumerate() {
+            assert_eq!(x.crc32(), y.crc32(), "{label}: crc32s[{i}]");
+        }
+        assert_eq!(
+            b.crc32s[0].crc32(),
+            crate::decompress::parallel::crc32::crc32(&bb),
+            "{label}: CRC accumulator != crc32(decoded)"
+        );
+
+        // (e) subchunk keys — strictly equal (both arms end at stop_hint).
+        let keys = |c: &ChunkData| {
+            c.subchunks
+                .iter()
+                .map(|s| {
+                    (
+                        s.encoded_offset_bits,
+                        s.encoded_size_bits,
+                        s.decoded_offset,
+                        s.decoded_size,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&b), keys(&w), "{label}: subchunk keys");
+
+        // (f) published windows: cross-arm AND vs brute-force ground truth.
+        let mut hist = Vec::with_capacity(pred.len() + bb.len());
+        hist.extend_from_slice(pred);
+        hist.extend_from_slice(&bb);
+        let brute = |chunk_off: usize| -> Vec<u8> {
+            let end = pred.len() + chunk_off;
+            hist[end - WINDOW..end].to_vec()
+        };
+
+        let lb = b.get_last_window_vec(pred);
+        let lw = w.get_last_window_vec(pred);
+        assert_eq!(lb, lw, "{label}: get_last_window");
+        assert_eq!(
+            lb,
+            brute(bb.len()),
+            "{label}: get_last_window vs brute force"
+        );
+        assert_eq!(
+            b.last_32kib_window_vec(),
+            w.last_32kib_window_vec(),
+            "{label}: last_32kib_window"
+        );
+
+        b.populate_subchunk_windows(pred);
+        w.populate_subchunk_windows(pred);
+        assert_eq!(
+            b.subchunks.len(),
+            w.subchunks.len(),
+            "{label}: subchunk count"
+        );
+        for (i, (sb, sw)) in b.subchunks.iter().zip(w.subchunks.iter()).enumerate() {
+            let wbts = sb.window.as_ref().map(|v| v.decompress());
+            let wwts = sw.window.as_ref().map(|v| v.decompress());
+            assert_eq!(wbts, wwts, "{label}: subchunk[{i}] window bytes");
+            if let Some(got) = &wbts {
+                let bf = brute(sb.decoded_offset);
+                if sb.used_window_symbols.is_empty() && got != &bf {
+                    assert_eq!(got.len(), bf.len(), "{label}: subchunk[{i}] window len");
+                    for (j, (g, t)) in got.iter().zip(bf.iter()).enumerate() {
+                        assert!(
+                            *g == 0 || g == t,
+                            "{label}: subchunk[{i}] window byte {j} stale (got {g}, truth {t})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// (g) ERROR equality: both arms must fail with ExactStopMissed carrying
+    /// IDENTICAL requested/actual coordinates.
+    fn assert_same_exact_miss(
+        be: Result<ChunkData, ChunkDecodeError>,
+        we: Result<ChunkData, ChunkDecodeError>,
+        label: &str,
+    ) -> (usize, usize) {
+        let b = match be {
+            Err(ChunkDecodeError::ExactStopMissed { requested, actual }) => (requested, actual),
+            Err(other) => {
+                panic!("{label}: Block arm error variant {other:?}, want ExactStopMissed")
+            }
+            Ok(c) => panic!(
+                "{label}: Block arm unexpectedly SUCCEEDED (decoded {} final_bit {})",
+                c.decoded_size(),
+                c.encoded_offset_bits + c.encoded_size_bits
+            ),
+        };
+        let w = match we {
+            Err(ChunkDecodeError::ExactStopMissed { requested, actual }) => (requested, actual),
+            Err(other) => {
+                panic!("{label}: wrapper arm error variant {other:?}, want ExactStopMissed")
+            }
+            Ok(c) => panic!(
+                "{label}: wrapper arm unexpectedly SUCCEEDED (decoded {} final_bit {})",
+                c.decoded_size(),
+                c.encoded_offset_bits + c.encoded_size_bits
+            ),
+        };
+        assert_eq!(
+            b, w,
+            "{label}: ExactStopMissed (requested, actual) coordinates"
+        );
+        b
+    }
+
+    fn run_exact_case(
+        deflate: &[u8],
+        stop: usize,
+        dict: &[u8],
+        truth: &[u8],
+        cfg: ChunkConfiguration,
+        label: &str,
+    ) {
+        let b = arm_block_exact(deflate, stop, dict, cfg).unwrap_or_else(|e| {
+            panic!("{label}: Block arm failed: {e:?}");
+        });
+        let w = arm_wrapper_exact(deflate, stop, dict, cfg).unwrap_or_else(|e| {
+            panic!("{label}: wrapper arm failed: {e:?}");
+        });
+        assert_arms_equal_exact(b, w, dict, truth, stop, label);
+    }
+
+    /// Interior confirmed-boundary stops: byte-aligned AND non-byte-aligned
+    /// bit offsets, from a flush-dense + dynamic corpus.
+    #[test]
+    fn exact_interior_boundary_stops() {
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&dict[..4 * 1024]); // dict back-refs up front
+        for i in 0..4000u32 {
+            payload.extend_from_slice(format!("interior line {i} {}\n", i % 53).as_bytes());
+        }
+        let deflate = deflate_with_dict_flushes(&payload, &dict, 6, 4096);
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        assert_eq!(truth, payload, "fixture self-check");
+        let cfg = ChunkConfiguration::default();
+
+        let bounds = enumerate_boundaries(&deflate, &dict);
+        assert!(
+            bounds.len() >= 8,
+            "need many boundaries, got {}",
+            bounds.len()
+        );
+
+        let aligned: Vec<usize> = bounds
+            .iter()
+            .map(|&(bit, _)| bit)
+            .filter(|bit| bit % 8 == 0)
+            .take(3)
+            .collect();
+        let unaligned: Vec<usize> = bounds
+            .iter()
+            .map(|&(bit, _)| bit)
+            .filter(|bit| bit % 8 != 0)
+            .take(3)
+            .collect();
+        assert!(!aligned.is_empty(), "no byte-aligned boundaries in fixture");
+        assert!(
+            !unaligned.is_empty(),
+            "no non-byte-aligned boundaries in fixture"
+        );
+
+        for (kind, stops) in [("aligned", &aligned), ("unaligned", &unaligned)] {
+            for &stop in stops {
+                run_exact_case(
+                    &deflate,
+                    stop,
+                    &dict,
+                    &truth,
+                    cfg,
+                    &format!("interior_{kind}_bit{stop}"),
+                );
+            }
+        }
+    }
+
+    /// Member-final stop: BFINAL block decoded to the byte-aligned stream end
+    /// (the RFC 1952 padding consumed; the 8-byte footer is OUTSIDE the input
+    /// slice exactly like production `sm_driver` slicing).
+    #[test]
+    fn exact_member_final_stop() {
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&dict[..8 * 1024]);
+        for i in 0..3000u32 {
+            payload.extend_from_slice(format!("member final line {i} {}\n", i % 17).as_bytes());
+        }
+        let deflate = deflate_with_dict(&payload, &dict, 6);
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        assert_eq!(truth, payload, "fixture self-check");
+        let stop = deflate.len() * 8; // byte-aligned padded deflate end (production total_bits)
+        run_exact_case(
+            &deflate,
+            stop,
+            &dict,
+            &truth,
+            ChunkConfiguration::default(),
+            "member_final",
+        );
+
+        // Misaligned member-final hints: one byte PAST and one byte SHORT of
+        // the padded stream end. Both arms must reject with IDENTICAL
+        // ExactStopMissed coordinates; `actual` is the byte-aligned post-EOB
+        // bit on both arms (the M4 end-bit coordinate convention).
+        let be = arm_block_exact(&deflate, stop + 8, &dict, ChunkConfiguration::default());
+        let we = arm_wrapper_exact(&deflate, stop + 8, &dict, ChunkConfiguration::default());
+        let (req, actual) = assert_same_exact_miss(be, we, "member_final_past");
+        assert_eq!(req, stop + 8);
+        assert_eq!(actual, stop, "actual must be the byte-aligned stream end");
+    }
+
+    /// Multi-member trailing shape (contract (c)): the input slice continues
+    /// past member 1's padded deflate end with a gzip footer + next member's
+    /// header + deflate body. NEITHER arm consumes the footer or resets for
+    /// the next stream on the until-exact path (`read_footer_at_current` /
+    /// `reset_for_next_stream` have no production caller there): a stop hint
+    /// pointing past member 1 must fail on BOTH arms with IDENTICAL
+    /// ExactStopMissed coordinates, `actual` = member 1's byte-aligned end.
+    #[test]
+    fn exact_multi_member_trailing() {
+        let dict = make_dict();
+        let payload1: Vec<u8> = b"member one payload ".repeat(3000);
+        let payload2: Vec<u8> = b"member two payload ".repeat(3000);
+        let deflate1 = deflate_with_dict(&payload1, &dict, 6);
+        // Member 2 is a STANDALONE gzip member (fresh window, as on disk).
+        let deflate2 = {
+            use flate2::{Compress, Compression, FlushCompress};
+            let mut c = Compress::new(Compression::new(6), false);
+            let mut out = vec![0u8; payload2.len() * 2 + 4096];
+            let status = c
+                .compress(&payload2, &mut out, FlushCompress::Finish)
+                .expect("compress");
+            assert_eq!(status, flate2::Status::StreamEnd);
+            out.truncate(c.total_out() as usize);
+            out
+        };
+
+        let member1_end_bits = deflate1.len() * 8;
+        let mut input = deflate1.clone();
+        // gzip footer of member 1 (CRC32 + ISIZE) ...
+        input
+            .extend_from_slice(&crate::decompress::parallel::crc32::crc32(&payload1).to_le_bytes());
+        input.extend_from_slice(&(payload1.len() as u32).to_le_bytes());
+        // ... then member 2's 10-byte header + deflate body.
+        input.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0x03]);
+        input.extend_from_slice(&deflate2);
+
+        // Stop hint deep inside member 2's bit-space.
+        let stop = input.len() * 8;
+        let be = arm_block_exact(&input, stop, &dict, ChunkConfiguration::default());
+        let we = arm_wrapper_exact(&input, stop, &dict, ChunkConfiguration::default());
+        let (req, actual) = assert_same_exact_miss(be, we, "multi_member_trailing");
+        assert_eq!(req, stop);
+        assert_eq!(
+            actual, member1_end_bits,
+            "both arms must stop at member 1's byte-aligned deflate end"
+        );
+
+        // Member 1's padded end IS an honorable exact stop on the same slice.
+        let truth1 = flate2_inflate_with_dict(&deflate1, &dict);
+        run_exact_case(
+            &input,
+            member1_end_bits,
+            &dict,
+            &truth1,
+            ChunkConfiguration::default(),
+            "multi_member_member1_end",
+        );
+    }
+
+    /// Stop hint exactly at a subchunk-split boundary: small split threshold
+    /// forces multi-subchunk shapes; the exact stop lands on a recorded
+    /// boundary at-or-after a split — keys must match strictly.
+    #[test]
+    fn exact_stop_at_subchunk_split() {
+        let dict = make_dict();
+        let mut payload = Vec::new();
+        for i in 0..6000u32 {
+            payload.extend_from_slice(
+                format!("split line {i}: the quick brown fox #{}\n", i % 97).as_bytes(),
+            );
+        }
+        let deflate = deflate_with_dict_flushes(&payload, &dict, 6, 16 * 1024);
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        assert_eq!(truth, payload, "fixture self-check");
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 48 * 1024,
+            ..ChunkConfiguration::default()
+        };
+
+        let bounds = enumerate_boundaries(&deflate, &dict);
+        // First boundary whose decoded offset crosses the split threshold —
+        // the boundary where the split machinery fires — plus a later one.
+        let split_bit = bounds
+            .iter()
+            .find(|&&(_, off)| off >= 48 * 1024)
+            .map(|&(bit, _)| bit)
+            .expect("no boundary past the split threshold");
+        let late_bit = bounds
+            .iter()
+            .find(|&&(_, off)| off >= 160 * 1024)
+            .map(|&(bit, _)| bit)
+            .expect("no late boundary");
+
+        for (stop, label) in [(split_bit, "at_split"), (late_bit, "late_split")] {
+            let b = arm_block_exact(&deflate, stop, &dict, cfg)
+                .unwrap_or_else(|e| panic!("{label}: Block arm failed: {e:?}"));
+            let w = arm_wrapper_exact(&deflate, stop, &dict, cfg)
+                .unwrap_or_else(|e| panic!("{label}: wrapper arm failed: {e:?}"));
+            if label == "late_split" {
+                assert!(
+                    b.subchunks.len() >= 2,
+                    "{label}: expected multi-subchunk shape, got {}",
+                    b.subchunks.len()
+                );
+            }
+            assert_arms_equal_exact(b, w, &dict, &truth, stop, label);
+        }
+    }
+
+    /// Flush-dense + stored-mixed corpora, member-final exact stops (stored
+    /// blocks end byte-aligned; level-0 is ALL stored — the
+    /// `decode_clean_stored_into_contig` route on the Block arm).
+    #[test]
+    fn exact_flush_dense_and_stored() {
+        let dict = make_dict();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&dict[1..4097]);
+        for i in 0..2000u32 {
+            payload.extend_from_slice(format!("flushy exact line {i} {}\n", i % 13).as_bytes());
+        }
+        let deflate = deflate_with_dict_flushes(&payload, &dict, 6, 2048);
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        assert_eq!(truth, payload, "fixture self-check");
+        run_exact_case(
+            &deflate,
+            deflate.len() * 8,
+            &dict,
+            &truth,
+            ChunkConfiguration::default(),
+            "flush_dense_final",
+        );
+        // Interior exact stop inside the flush-dense stream too.
+        let bounds = enumerate_boundaries(&deflate, &dict);
+        if let Some(&(bit, _)) = bounds.get(bounds.len() / 2) {
+            run_exact_case(
+                &deflate,
+                bit,
+                &dict,
+                &truth,
+                ChunkConfiguration::default(),
+                "flush_dense_interior",
+            );
+        }
+
+        let mut payload2 = Vec::new();
+        for k in 0..6usize {
+            if k % 2 == 0 {
+                payload2.extend_from_slice(&b"compressible compressible! ".repeat(900));
+            } else {
+                payload2.extend_from_slice(&lcg_bytes(24 * 1024, 0xD00D_0000 + k as u32));
+            }
+        }
+        for level in [1u32, 0u32] {
+            let d = deflate_with_dict(&payload2, &dict, level);
+            let t = flate2_inflate_with_dict(&d, &dict);
+            assert_eq!(t, payload2, "stored fixture self-check");
+            run_exact_case(
+                &d,
+                d.len() * 8,
+                &dict,
+                &t,
+                ChunkConfiguration::default(),
+                &format!("stored_final_l{level}"),
+            );
+        }
+    }
+
+    /// Engine-proof counter: the Block arm increments EXACT_BLOCK_CHUNKS.
+    #[test]
+    fn exact_block_counter_increments() {
+        let dict = make_dict();
+        let payload = b"exact counter payload ".repeat(1024);
+        let deflate = deflate_with_dict(&payload, &dict, 6);
+        let before = EXACT_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = arm_block_exact(
+            &deflate,
+            deflate.len() * 8,
+            &dict,
+            ChunkConfiguration::default(),
+        )
+        .expect("exact Block decode");
+        let after = EXACT_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "EXACT_BLOCK_CHUNKS did not increment");
+    }
+
+    /// Default route proof: `decode_chunk_until_exact` with a full window and
+    /// `until_exact=true` takes the Block engine (kill-switch arm untouched).
+    #[test]
+    fn exact_route_defaults_to_block() {
+        let dict = make_dict();
+        let payload = b"route proof payload ".repeat(2048);
+        let deflate = deflate_with_dict(&payload, &dict, 6);
+        let truth = flate2_inflate_with_dict(&deflate, &dict);
+        let before_b = EXACT_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
+        let chunk = decode_chunk_until_exact(
+            &deflate,
+            0,
+            deflate.len() * 8,
+            &dict,
+            ChunkConfiguration::default(),
+            true,
+        )
+        .expect("until-exact route decode");
+        let after_b = EXACT_BLOCK_CHUNKS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_b > before_b,
+            "decode_chunk_until_exact did not take the Block engine by default"
+        );
+        let bytes = chunk.data.to_contiguous()[chunk.data_prefix_len..].to_vec();
+        assert_eq!(bytes, truth, "route decode bytes");
     }
 }
