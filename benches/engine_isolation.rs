@@ -199,48 +199,6 @@ mod bench {
             .expect("(iii) isal decode")
     }
 
-    // ── Variant (iv): clean E2/E3/E4 engine via read_clean_e234 ────────────────
-    // Drives the new `Block::read_clean_e234` clean-only sibling (const-generic
-    // E2/E3/E4 flags) and drains via `drain_clean_u8` into a Vec<u8> directly —
-    // same u8-direct sink as variant (ii), so the E-deltas isolate the inner
-    // technique, not the output-traffic component already in (ii).
-    fn decode_var_iv<const E2: bool, const E3: bool, const E4: bool>(
-        deflate: &[u8],
-        start_bit: usize,
-        window: &[u8],
-        target_n: usize,
-    ) -> Vec<u8> {
-        let mut block = Block::new();
-        let mut dummy: Vec<u16> = Vec::new();
-        block
-            .set_initial_window(&mut dummy, window)
-            .expect("prime window (iv)");
-        debug_assert!(
-            !block.contains_marker_bytes(),
-            "(iv) window-primed block must be clean"
-        );
-        let mut sink: Vec<u8> = Vec::with_capacity(target_n + 4096);
-        let mut bits = Bits::at_bit_offset(deflate, start_bit);
-        loop {
-            if block.read_header(&mut bits, false).is_err() {
-                break;
-            }
-            while !block.eob() {
-                if block
-                    .read_clean_e234::<E2, E3, E4>(&mut bits, usize::MAX)
-                    .is_err()
-                {
-                    return sink;
-                }
-                block.drain_clean_u8(&mut sink);
-            }
-            if block.is_last_block() || sink.len() >= target_n {
-                break;
-            }
-        }
-        sink
-    }
-
     // ── Variant (v): FLAT-u8 packed-table + SPECULATIVE SOFTWARE-PIPELINED loop ─
     //
     // This is the inner-Huffman-kernel LEVER (plans/inner-huffman-kernel.md): igzip's
@@ -1567,25 +1525,18 @@ mod bench {
         (min, median, 100.0 * sigma / mean.max(1e-12))
     }
 
-    // Decode-variant table. Every entry has the SAME signature, so (i)/(ii)/
-    // (iii) and the const-generic (iv) stacks live in one array and share the
-    // interleaved timing + byte-exact gate. Order matters: index 0 = scalar
-    // reference, index 2 = ISA-L oracle (both used as byte-exact denominators).
+    // Decode-variant table. Every entry has the SAME signature, so all the
+    // variants live in one array and share the interleaved timing + byte-exact
+    // gate. Order matters: index 0 = scalar reference, index 2 = ISA-L oracle
+    // (both used as byte-exact denominators).
     type DecodeFn = fn(&[u8], usize, &[u8], usize) -> Vec<u8>;
-    const NV: usize = 10;
+    const NV: usize = 6;
     const VARIANTS: [(&str, DecodeFn); NV] = [
         ("VAR_I_scalar_u16", decode_var_i),
         ("VAR_II_E1u8_part", decode_var_ii),
         ("VAR_III_isal", decode_var_iii),
-        // VAR_IV_E000 is the engine WITH NO TECHNIQUE ON (E2=E3=E4=false). It
-        // is the byte-exactness anchor required by the round-2 charter: it must
-        // be SHA-identical to (i) scalar AND (iii) ISA-L, proving the new
-        // read_clean_e234 entry decodes byte-for-byte like the production
-        // <false> path before any technique can be trusted.
-        ("VAR_IV_E000", decode_var_iv::<false, false, false>),
-        ("VAR_IV_E2", decode_var_iv::<true, false, false>),
-        ("VAR_IV_E23", decode_var_iv::<true, true, false>),
-        ("VAR_IV_E234", decode_var_iv::<true, true, true>),
+        // (VAR_IV read_clean_e234 stacks deleted in M5 with the bench-only
+        // `read_clean_e234` / `drain_clean_u8` engine entry points.)
         // VAR_V is the inner-Huffman-kernel LEVER: igzip packed-flat-short-code
         // table (trick #1) + the speculative software-pipelined loop (trick #2) on
         // a FLAT-u8 linear buffer (the missing piece — production stores one u8 per
