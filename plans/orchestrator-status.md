@@ -1,3 +1,27 @@
+## PHANTOM-EOS REJECTION — the bignasa/compressible high-T stall mechanism FOUND + FIXED (+15.6%/+16.6% wall, box-banked) [2026-06-09, SUPERVISOR session, HEAD 65dbcff9]
+THE CHAIN (each step box-verified, advisor-gated): bignasa T8 loss 0.79x traced NOT to engine-W but to
+PHANTOM SPECULATION: window-absent seed-first decodes at 4MiB partition-grid bases parse random bytes as
+BFINAL=1/BTYPE=01 (1-in-8/position), tiny-decode 23-495B to a phantom EOS, get ACCEPTED (vendor rejects these
+structurally via footer+next-member-header validation, GzipChunk.hpp:481,491-498,626-645 + tryToDecode catch
+:728-732 — gzippy lacked the validation), then discard at consume = ~150ms head-of-line re-decode x3-9/run.
+- FIX 65dbcff9: (a) dynamic-only finder (BTYPE=01 prefilter DELETED, vendor DynamicHuffman.hpp parity —
+  box-verified wall-NEUTRAL alone, layered per guardrails); (b) phantom-EOS rejection in
+  try_speculative_decode_candidate (+ CM=8 hardening). Counter SPECULATIVE_PHANTOM_EOS_REJECTS.
+- WALLS (frozen, interleaved N=9, 3-way co-located rg+PRE+POST, sha-verified): bignasa T8 1269->1098ms
+  (rg ratio 0.799->0.923), T16 1165->998ms (0.821->0.958). Mismatches 3/4 -> 0/0. silesia T4/T8 within
+  spread (no regression). STILL BELOW the 0.99 bar — but the largest single move of the campaign.
+- LEDGER CORRECTIONS: DIS-29's "T8+ ISA-L ret=-1/-2 seeding bug" = MISDIAGNOSIS (never observed in 30
+  instrumented runs; the residual fallback was the BFINAL until_exact 1-bit coordinate decline, fixed
+  d9a4f996 advisor-SOUND). A probe worker's "symbol 286/287 LUT bug" = ARTIFACT of probing raw partition
+  bases (count[8]-=2 is ISA-L's own igzip_inflate.c:322; marker LUT is faithful). The apply_window pass is
+  6-way PARALLEL (fulcrum flat-SELF was cross-thread sum, not wall) — serialized-apply hypothesis DEAD.
+- ALSO THIS SESSION: T1 single-shot route merged (silesia T1 1.19x WIN), >8x growable storm fix (nasa T1
+  0.57->1.57), JOB-2 reserve fix, BFINAL exact-landing fix, all pushed; 3-way parity runner (--bin2) +
+  _parity_guest.sh stats() printf fix shipped.
+- OPEN (bar = >=0.99 EVERY T): isal silesia T4 0.874 / T16 0.914; bignasa T8 0.923 / T16 0.958; model T8
+  0.658 PRE-phantom-fix (re-measure owed); gzippy-native ALL cells (shares the fix — re-measure owed).
+  Guest binaries: /root/bin-isal=PRE ab8babe5, /root/bin-post=65dbcff9 ba788312, /root/bin-native=37feb342.
+
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
 ## DIS-29 [2026-06-09, owner/isal-incremental-growth @ 153da9d1, gzippy-isal bin 99d5758e] — the owed DIS-23 FORCE-REGROW byte-exact test + corpus-reframe-gate STORM FIX, on >8x compressible corpora that ACTUALLY force the regrow
