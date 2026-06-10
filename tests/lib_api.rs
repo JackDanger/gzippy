@@ -228,15 +228,20 @@ fn decompress_multi_member_parallel() {
 fn classify_single_member_t1() {
     let compressed = gzip_encode_with_flate2(&make_text(4096), 6);
     let path = gzippy::classify(&compressed, 1);
-    // ISA-L on x86_64, LibdeflateSingle elsewhere.
+    // gzippy-native: ParallelSM (or the non-parallel_sm fallbacks elsewhere).
+    // gzippy-isal (`isal_clean_tail`): T1 single-member routes to ONE ISA-L
+    // call — `DecodePath::IsalSingleShot` (decompress/mod.rs, the
+    // `#[cfg(isal_clean_tail)] if num_threads <= 1` branch, since 0e57d8d9).
+    let isal_single_shot_ok = cfg!(isal_clean_tail) && matches!(path, DecodePath::IsalSingleShot);
     assert!(
-        matches!(
-            path,
-            DecodePath::ParallelSM
-                | DecodePath::StoredParallel
-                | DecodePath::StreamingSingle
-                | DecodePath::LibdeflateSingle
-        ),
+        isal_single_shot_ok
+            || matches!(
+                path,
+                DecodePath::ParallelSM
+                    | DecodePath::StoredParallel
+                    | DecodePath::StreamingSingle
+                    | DecodePath::LibdeflateSingle
+            ),
         "unexpected path {path:?} for T1 single-member"
     );
 }
