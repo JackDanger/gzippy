@@ -3110,7 +3110,7 @@ fn publish_subchunk_windows(window_map: &WindowMap, chunk: &ChunkData) {
             continue;
         };
         let existing = window_map.get(sc_end_bit);
-        let may_insert = match existing {
+        let may_insert = match &existing {
             None => true,
             Some(ex) => !ex.is_empty(),
         };
@@ -3820,12 +3820,22 @@ fn defer_chunk_recycle(deferral: &mut std::collections::VecDeque<ChunkData>, chu
     }
 }
 
-/// Drain consecutive `Ready` entries at the FIFO head when two or more
-/// are queued (including `[Ready, Async]`). A sole `Ready` is flushed
-/// only via the marker-branch `wait_replaced_markers` drain (predecessor
-/// window needed), cap pressure, or the final flush — NOT at iteration
-/// end, post-`block_finder.get`, post-`block_fetcher.get`, or when
-/// eager-idle (all CRC-fail at T≥2; not buffer-pool UAF).
+/// Drain every `Ready` entry at the FIFO head — including a sole one.
+/// Vendor writes each chunk inline as soon as `postProcessChunk` returns
+/// (GzipChunkFetcher.hpp:333-342); deferring a lone finished chunk until
+/// its successor queued was the measured ~188ms head-of-line gap per
+/// chunk on the model corpus.
+///
+/// HISTORY: lone-drain used to CRC-fail at T≥2. The mechanism (fixed in
+/// this commit, chunk_data.rs) was the stale last-subchunk window:
+/// `populate_subchunk_windows` computed each subchunk's window at its
+/// START (and the marker path's lone whole-chunk subchunk carried
+/// `decoded_size == 0`), so the window published at the chunk-END key
+/// held the chunk-START window. The vendor-sanctioned overwrite of the
+/// publish-ahead end window (GzipChunkFetcher.hpp:429-441) then poisoned
+/// the successor's predecessor lookup — but only when the lone drain ran
+/// before that lookup. The pair-drain gate ordered the overwrite after
+/// the read, masking the corruption.
 /// Stops when the head is `Async` (post-process still in flight on a worker).
 #[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
@@ -3843,12 +3853,7 @@ fn drain_ready_pending_heads<W: std::io::Write>(
     recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
 ) -> Result<(), FetchError> {
     use std::sync::atomic::Ordering;
-    let debug_lone = std::env::var_os("GZIPPY_DRAIN_LONE").is_some();
-    while matches!(pending.front(), Some(PendingWrite::Ready { .. }))
-        && (debug_lone
-            || pending.len() >= 2
-            || matches!(pending.get(1), Some(PendingWrite::Async { .. })))
-    {
+    while matches!(pending.front(), Some(PendingWrite::Ready { .. })) {
         DRAIN_READY_IMMEDIATE.fetch_add(1, Ordering::Relaxed);
         drain_one_pending(
             pending,
