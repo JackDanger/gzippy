@@ -1360,9 +1360,8 @@ fn apply_recorded_block_boundaries(
     }
 }
 
-/// The ONE unified decode driver — vendor `deflate::Block` by default (see
-/// `marker_decode_step`; `GZIPPY_MARKER_RING=1` selects legacy `MarkerRing`).
-/// Once 32 KiB of clean output exist at a block boundary, control hands off to
+/// The ONE unified decode driver — vendor `deflate::Block` (see
+/// `marker_decode_step`). Once 32 KiB of clean output exist at a block boundary, control hands off to
 /// `finish_decode_chunk_with_inexact_offset` with that clean window.
 #[cfg(parallel_sm)]
 fn decode_chunk_unified_marker(
@@ -2272,69 +2271,7 @@ fn marker_decode_step(
     initial_window: &[u8],
     output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
 ) -> Result<(MarkerStep, bool), ChunkDecodeError> {
-    if std::env::var_os("GZIPPY_MARKER_RING").is_some() {
-        return marker_decode_step_marker_ring(ctx, data, stop_hint_bits, initial_window, output);
-    }
     marker_decode_step_vendor_block(ctx, data, stop_hint_bits, initial_window, output)
-}
-
-/// Legacy fast-LUT bootstrap (`lut_bulk_inflate::MarkerRing`). `GZIPPY_MARKER_RING=1` only.
-#[cfg(parallel_sm)]
-fn marker_decode_step_marker_ring(
-    ctx: &mut MarkerDecodeCtx,
-    data: &[u8],
-    stop_hint_bits: usize,
-    initial_window: &[u8],
-    output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
-) -> Result<(MarkerStep, bool), ChunkDecodeError> {
-    use crate::decompress::parallel::lut_bulk_inflate::MarkerRing;
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-    use std::cell::RefCell;
-
-    thread_local! {
-        static BOOTSTRAP_RING: RefCell<MarkerRing> = RefCell::new(MarkerRing::new());
-    }
-
-    BOOTSTRAP_RING.with(|cell_block| {
-        let mut block = cell_block.borrow_mut();
-        if !ctx.block_primed {
-            block.reset();
-            if initial_window.len() == MAX_WINDOW_SIZE {
-                block.set_initial_window_u8(initial_window);
-            }
-            ctx.block_primed = true;
-        }
-        marker_decode_step_loop(
-            ctx,
-            data,
-            stop_hint_bits,
-            output,
-            &mut *block,
-            |block, bits| block.read_header(bits),
-            |block, bits, output| block.read(bits, output),
-            |e| {
-                use crate::decompress::parallel::lut_bulk_inflate::BulkDecodeError;
-                use std::sync::atomic::Ordering;
-                match e {
-                    BulkDecodeError::InvalidHuffmanCode => {
-                        BODY_FAIL_INVALID_HUFFMAN.fetch_add(1, Ordering::Relaxed);
-                    }
-                    BulkDecodeError::InvalidLookback => {
-                        BODY_FAIL_EXCEEDED_WINDOW.fetch_add(1, Ordering::Relaxed);
-                    }
-                    BulkDecodeError::BlockTypeReserved => {
-                        BODY_FAIL_INVALID_COMPRESSION.fetch_add(1, Ordering::Relaxed);
-                    }
-                    BulkDecodeError::InvalidCodeLengths => {
-                        BODY_FAIL_INVALID_CODE_LENGTHS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {
-                        BODY_FAIL_OTHER_VARIANT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            },
-        )
-    })
 }
 
 // The per-thread vendor `deflate::Block` engine, persistent across the
@@ -2388,7 +2325,8 @@ fn marker_decode_step_vendor_block(
     })
 }
 
-/// Engine surface shared by vendor `Block` and legacy `MarkerRing`.
+/// Engine surface of the ONE vendor `Block` engine, consumed by
+/// `marker_decode_step_loop` (the legacy `MarkerRing` impl was deleted in M5).
 #[cfg(parallel_sm)]
 trait BootstrapEngine {
     fn contains_marker_bytes(&self) -> bool;
@@ -2409,20 +2347,7 @@ impl BootstrapEngine for crate::decompress::parallel::marker_inflate::Block {
     }
 }
 
-#[cfg(parallel_sm)]
-impl BootstrapEngine for crate::decompress::parallel::lut_bulk_inflate::MarkerRing {
-    fn contains_marker_bytes(&self) -> bool {
-        self.contains_marker_bytes()
-    }
-    fn eob(&self) -> bool {
-        self.eob()
-    }
-    fn is_last_block(&self) -> bool {
-        self.is_last_block()
-    }
-}
-
-/// Shared per-iteration body for vendor `Block` and legacy `MarkerRing`.
+/// Per-iteration body of the vendor `Block` bootstrap loop.
 #[cfg(parallel_sm)]
 fn marker_decode_step_loop<B, S, EH, RH, E, R, F>(
     ctx: &mut MarkerDecodeCtx,

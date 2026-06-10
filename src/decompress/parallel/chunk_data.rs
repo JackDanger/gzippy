@@ -758,8 +758,7 @@ impl ChunkData {
     }
 
     /// Append clean output that arrives as u16 ring values from a
-    /// post-flip [`MarkerRing`](crate::decompress::parallel::lut_bulk_inflate::MarkerRing)
-    /// drain. After the flip (`!contains_marker_bytes()`) every value is
+    /// post-flip `Block` drain. After the flip (`!contains_marker_bytes()`) every value is
     /// guaranteed `< 256`, so narrowing to u8 is lossless — this is the
     /// unified-decoder analogue of [`append_clean`] for the merged clean
     /// tail (the same `crc32s.last_mut()` + `subchunks.last` accounting,
