@@ -1,3 +1,25 @@
+## SUPERVISOR CORRECTION to the KEY-MISMATCH framing — DIS-19 tension [2026-06-10, IMPORTANT]
+The previous entry's "fix (2): re-key prefetches => window-SEEDED clean decodes" is PROBABLY A
+PHANTOM and must NOT be implemented as framed: banked DIS-19 says rapidgzip marker-decodes the
+SAME ~34.5% byte fraction — rg's prefetched chunks are equally window-less (speculation WITHOUT
+windows is the architecture, vendor tryToDecode decodes with markers from guessed offsets).
+Re-keying gzippy's prefetches to wait for predecessor windows would SERIALIZE the pipeline =
+unfaithful + likely slower. The causal tool's "KEY-MISMATCH 94-98%" is a true FACT about lookup
+keys but a WRONG lever inference — rg has no such lookup succeeding either.
+WHAT SURVIVES of the decomposition:
+1. SCAN-OVERLAP divergence (REAL, vendor-anchored): gz consumer blocks on block-finder scanning
+   (scan_candidate wall-critical 82-120ms; rg 0-27ms — rg overlaps scan with decode). FIRST lever
+   next session; read vendor's alternating findNext/tryToDecode loop ordering vs gzippy's
+   with_sync_boundary_search (the sync-ification comment at chunk_fetcher.rs:3618-3633 traded
+   overlap away deliberately — re-examine THAT decision under the canonical mask).
+2. The WINDOW-ABSENT MARKER-PATH ENGINE SHAPE: rg decodes marker chunks with its (fast) marker
+   engine then ONE cache-friendly u8 LUT apply pass over the whole output; gzippy runs the
+   bootstrap flip-hybrid (marker loop at 158-224MB/s + flip + ISA-L tail + small apply). On
+   marker-heavy spans rg's shape wins. This is the ENGINE-W question in its true form — the
+   user-gated decision now has its precise target: the window-absent bootstrap rate + the
+   one-pass-apply architecture, NOT the clean-tail (which is already ISA-L/at-rate).
+Next session order: scan-overlap (1) -> masked A/B; then present the engine shape decision to the
+user with these numbers.
 ## MASKED PIPELINE DECOMPOSITION — the residual gap has TWO NAMED OWNERS [2026-06-10]
 Masked (0,2,..,14) traced decomposition, bin-head-isal vs rg, model+silesia T8 (gz:rg 1.23x/1.09x
 best-of-3): serial output NEGLIGIBLE (<0.1ms delta); the gap = (a) per-worker decode rate (~37ms/
