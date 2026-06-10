@@ -1,3 +1,16 @@
+## MODEL-T8 DECOMPOSITION (post-phantom-fix) — not engine-W-full-stop either [2026-06-09 late, SUPERVISOR]
+model T8 (isal-POST 0.677x): traced wall 827ms (untraced median 733; rg 410). Speculation CLEAN (48-50
+accepts, 0 mismatches; phantom fix fires 1x). The gap: (a) TWO slow-decode outliers (277/294ms vs p50
+104ms) whose PAIR-DRAIN (consumer needs chunk K+1 resolved to consume K) blocks ~377ms combined — at T4
+zero outliers exist; (b) 2 timing-dependent speculative_missing stalls (+107ms fetcher_get anti-scaling
+62->170ms); (c) marker bootstrap body_rate on model = 38 MB/s (vs bignasa ~300) — near-incompressible
+data is ~10x slower PER BYTE in the u16 marker loop, though only 7.7MB total goes through it; flip
+arms fine (flip_to_clean=51/51, isal_chunks=51). decode p50 104ms/chunk x51/8 workers = 663ms floor >
+rg's whole 410ms wall => per-chunk decode RATE is the structural term on this corpus, AMPLIFIED by
+pair-drain head-of-line. NEXT HYPOTHESES (unverified): outlier chunks = long window-absent prefixes at
+38MB/s; pair-drain (K+1 gate) may be a divergence vs vendor (rg consumes K when K is ready?) — VENDOR
+CHECK OWED before any change. gzippy-native bignasa lift banked: T8 0.698->0.894, T16 0.710->0.909
+(same fix); native model 0.574 = worst native cell. /root/bin-native-post=ff4615dd kept; model.gz kept.
 ## PHANTOM-EOS REJECTION — the bignasa/compressible high-T stall mechanism FOUND + FIXED (+15.6%/+16.6% wall, box-banked) [2026-06-09, SUPERVISOR session, HEAD 65dbcff9]
 THE CHAIN (each step box-verified, advisor-gated): bignasa T8 loss 0.79x traced NOT to engine-W but to
 PHANTOM SPECULATION: window-absent seed-first decodes at 4MiB partition-grid bases parse random bytes as
