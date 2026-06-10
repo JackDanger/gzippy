@@ -1,3 +1,12 @@
+## ENGINE M2 MERGED (advisor-SOUND) — Block on WidthRing, DIV-4 closed [2026-06-10]
+Mechanical migration landed: 911/0 guest suite, 30/30 byte-exact grid both builds, masked perf
+TIE-or-better (silesia T4 0.203->0.195). The gauntlet caught + fixed an M1 skeleton contract bug
+(32KiB-only flip conflate; vendor = FULL ring, deflate.hpp:1772, seam can reach RING_SIZE-258).
+DIV-4 closed en passant (seam = u8 view, temp Vec deleted). Empty-seed vendor divergence recorded
+for M3 (vendor flips Clean on empty window :1757; gzippy preserves historical no-op until callers
+move onto Block). Guest bins /root/bin-m2-{native,isal} staged. NEXT: M2b (stored early-flip
+DIV-5, own kill-switched step) then M3 (seeded chunks onto Block — the DIV-1 deletion, the
+campaign's payload step; GZIPPY_SEEDED_BLOCK kill-switch; masked A/B native T1/T4/T8).
 ## ENGINE DESIGN GATED: SOUND-WITH-CHANGES — execution-ready [2026-06-10]
 Opus gate verified the P1 headline + all 6 divergences FIRST-HAND (the campaign's vendor-misread
 history made this the critical check): DIV-1 confirmed on the hot path (every window-resolved chunk
