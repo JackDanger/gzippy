@@ -1318,11 +1318,44 @@ impl ChunkData {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
         let compression = self.window_compression_type();
-        let offsets: Vec<usize> = self.subchunks.iter().map(|sc| sc.decoded_offset).collect();
+        // Vendor ChunkData.hpp:334-339: `decodedOffsetInBlock += subchunk.decodedSize`
+        // BEFORE `getWindowAt(window, decodedOffsetInBlock)` — each subchunk's
+        // `window` field is the window it PROVIDES at its END (the window
+        // required to resume decode at `sc.encoded_offset_bits +
+        // sc.encoded_size_bits`, the key `publish_subchunk_windows` /
+        // vendor `appendSubchunksToIndexes` emplaces it under). Using the
+        // subchunk START offset here was an off-by-one-subchunk bug: the
+        // published window at each sc-end key held the PREVIOUS boundary's
+        // window, and the end-of-chunk key got overwritten with a stale
+        // window — masked only while the pair-drain gate ordered the
+        // overwrite after the successor's predecessor-window lookup.
+        //
+        // Vendor derives the end offset by accumulating `decodedSize`, whose
+        // correctness `split()` self-validates (ChunkData.hpp:736-744:
+        // subchunk decodedSize sum MUST equal decodedSizeInBytes). gzippy
+        // builds subchunks incrementally and the speculative/marker decode
+        // path does not maintain `decoded_size` (it stays 0 on the single
+        // whole-chunk subchunk), so the equivalent-by-vendor's-own-invariant
+        // derivation here is the NEXT subchunk's explicit push-time
+        // `decoded_offset` (vendor split() line 699: decodedOffset ==
+        // previous decodedOffset + decodedSize), and the chunk's total
+        // decoded size for the trailing subchunk (vendor split() line 715:
+        // trailing decodedSize = decodedSizeInBytes - lastBoundary offset).
+        if self.subchunks.is_empty() {
+            return;
+        }
+        let total_decoded = self.decoded_size();
+        let offsets: Vec<usize> = self
+            .subchunks
+            .iter()
+            .skip(1)
+            .map(|sc| sc.decoded_offset)
+            .chain(std::iter::once(total_decoded))
+            .collect();
 
-        for (i, &decoded_offset) in offsets.iter().enumerate() {
+        for (i, &decoded_end_offset) in offsets.iter().enumerate() {
             let mut window = [0u8; W];
-            self.copy_window_at_chunk_offset(predecessor_window, decoded_offset, &mut window);
+            self.copy_window_at_chunk_offset(predecessor_window, decoded_end_offset, &mut window);
 
             // Vendor `ChunkData::applyWindow` sparsity (ChunkData.hpp:341-345).
             let sc = &mut self.subchunks[i];
@@ -1429,6 +1462,21 @@ impl ChunkData {
                 self.subchunks.pop();
             } else {
                 break;
+            }
+        }
+        // Close out the trailing (open) subchunk's decoded size — vendor
+        // `split()` (ChunkData.hpp:715): trailing `decodedSize =
+        // decodedSizeInBytes - lastBoundary.decodedOffset`. The
+        // speculative/marker decode path never grows `decoded_size` via
+        // `note_inner_decoded_bytes`, so without this the whole-chunk
+        // subchunk reports decoded_size 0, which (a) fed a stale window
+        // into `populate_subchunk_windows`' cumulative-end derivation and
+        // (b) makes `merge_small_trailing_subchunk_if_needed` treat every
+        // trailing subchunk as below the merge threshold.
+        let total_decoded = self.decoded_size();
+        if let Some(last) = self.subchunks.last_mut() {
+            if last.decoded_size == 0 {
+                last.decoded_size = total_decoded.saturating_sub(last.decoded_offset);
             }
         }
         self.merge_small_trailing_subchunk_if_needed();
@@ -2172,6 +2220,64 @@ mod tests {
         assert_eq!(flat[1], prev[5]);
         assert_eq!(flat[2], 0x22);
         assert_eq!(flat[3], 0xAA);
+    }
+
+    /// REGRESSION (lone-drain CRC corruption): the trailing subchunk's
+    /// `window` must be the window at the chunk's decoded END — the same
+    /// bytes `get_last_window_vec` produces — because
+    /// `publish_subchunk_windows` emplaces it at the chunk-end key,
+    /// OVERWRITING the consumer's publish-ahead end window (vendor
+    /// GzipChunkFetcher.hpp:429-441, "overwriting windows is ... a
+    /// required feature"). It used to be the window at the subchunk's
+    /// START (worse: with the marker path's `decoded_size == 0`
+    /// whole-chunk subchunk, the chunk-START window), which poisoned the
+    /// successor's predecessor lookup whenever the drain ran before it.
+    /// Vendor: ChunkData.hpp:334-339 (`decodedOffsetInBlock +=
+    /// subchunk.decodedSize` BEFORE `getWindowAt`).
+    #[test]
+    fn trailing_subchunk_window_equals_last_window() {
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = ((i * 31) & 0xff) as u8;
+        }
+
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_markered(&[0x11, MARKER_BASE + 5, 0x22]);
+        // Distinct non-repeating payload so a start-window vs end-window
+        // mix-up changes bytes.
+        let clean: Vec<u8> = (0..(W * 2 + 777)).map(|i| ((i * 7) & 0xff) as u8).collect();
+        chunk.append_clean(&clean);
+        chunk.finalize(10_000);
+
+        // The marker decode path leaves the whole-chunk subchunk's
+        // decoded_size unmaintained pre-finalize; finalize must close it.
+        assert_eq!(
+            chunk
+                .subchunks
+                .iter()
+                .map(|sc| sc.decoded_size)
+                .sum::<usize>(),
+            chunk.decoded_size(),
+            "subchunk decoded_size sum must equal chunk decoded size \
+             (vendor split() invariant, ChunkData.hpp:736-744)"
+        );
+
+        chunk.resolve_and_narrow_markers_in_place(&prev);
+        chunk.update_narrowed_crc();
+        chunk.populate_subchunk_windows(&prev);
+
+        let expected = chunk.get_last_window_vec(&prev);
+        let last_window = chunk
+            .subchunks
+            .last()
+            .and_then(|sc| sc.window.as_ref())
+            .expect("trailing subchunk window populated")
+            .decompress();
+        assert_eq!(
+            last_window, expected,
+            "trailing subchunk window must be the chunk-END window"
+        );
     }
 
     #[test]
