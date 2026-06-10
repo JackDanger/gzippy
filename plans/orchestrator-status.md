@@ -1,3 +1,16 @@
+## ENGINE M6 BANKED — structural arc wall-neutral; ONE engine ready for P3 [2026-06-10]
+Frozen 3-way vs official baselines (sanity gates 6/6): native T4/T8/model TIE within spread
+(gz1/gz2 0.985-0.998); isal regression-free (silesia T8 1.006 still PASS; model 0.859 ==
+baseline). ONE FLAG: native T1 -4% vs baseline (1528->1593ms, outside 2% spread; seeded_block=16
+is the active path) — P3 ITEM #1: profile the seeded-block T1 path (suspects: 32KiB dict-prefix
+copy x16 chunks, fold-driver vs wrapper loop deltas), recover then exceed.
+THE ARC'S VERDICT: M1-M6 delivered the STRUCTURE (one vendor-shaped engine, six divergences
+resolved, -1778 LOC dead graph, every step byte-exact) at zero wall cost — exactly the
+preparation the funded rewrite needed. The WALL gains now come from P3: the symbol-rate arsenal
+on the one engine (multi-literal lookahead, BMI2 PEXT/BZHI dispatch, table prefetch, asm hot
+loops — CLAUDE.md authorizes full reimplementation; prior falsifications non-binding; targets
+native T1 0.578, model 0.577/0.859, the T4 band).
+Guest production-candidate bins: /root/bin-m6-{native 1114b5c1, isal fef579bc}.
 ## ENGINE M5 MERGED (advisor-SOUND) — the dead graph is gone; structural phase COMPLETE [2026-06-10]
 -1778 LOC: MarkerRing engine+fork, canonical family (dead-by-cfg proven), DIV-6 helper, orphans.
 DIV LEDGER FINAL: DIV-1 closed (M3+M4), DIV-2 kept-by-design, DIV-3 closed (M5), DIV-4 closed
