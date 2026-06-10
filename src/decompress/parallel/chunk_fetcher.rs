@@ -846,15 +846,15 @@ fn drive_impl<W: std::io::Write>(
         //     slow ResumableInflate2).
         {
             use crate::decompress::parallel::gzip_chunk::{
-                BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, FINISHED_NO_FLIP_CHUNKS,
-                FINISH_DECODE_ENTRIES, FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS,
-                INFLATE_WRAPPER_CHUNKS, ISAL_BFINAL_EXACT_LANDING_ACCEPTED,
-                ISAL_ENGINE_ORACLE_CHUNKS, ISAL_ENGINE_ORACLE_FALLBACKS, ISAL_INEXACT_FALLBACKS,
-                ISAL_UNTIL_EXACT_FALLBACKS, SEEDED_BLOCK_CHUNKS, SEEDED_WRAPPER_CHUNKS,
-                WINDOW_SEEDED_CHUNKS,
+                BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, EXACT_BLOCK_CHUNKS,
+                EXACT_WRAPPER_CHUNKS, FINISHED_NO_FLIP_CHUNKS, FINISH_DECODE_ENTRIES,
+                FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS, INFLATE_WRAPPER_CHUNKS,
+                ISAL_BFINAL_EXACT_LANDING_ACCEPTED, ISAL_ENGINE_ORACLE_CHUNKS,
+                ISAL_ENGINE_ORACLE_FALLBACKS, ISAL_INEXACT_FALLBACKS, ISAL_UNTIL_EXACT_FALLBACKS,
+                SEEDED_BLOCK_CHUNKS, SEEDED_WRAPPER_CHUNKS, WINDOW_SEEDED_CHUNKS,
             };
             eprintln!(
-            "  Unified decoder: flip_to_clean={} finished_no_flip={} finish_decode={} inflate_wrapper={} window_seeded={} seeded_block={} seeded_wrapper={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
+            "  Unified decoder: flip_to_clean={} finished_no_flip={} finish_decode={} inflate_wrapper={} window_seeded={} seeded_block={} seeded_wrapper={} exact_block={} exact_wrapper={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
             FLIP_TO_CLEAN_CHUNKS.load(Ordering::Relaxed),
             FINISHED_NO_FLIP_CHUNKS.load(Ordering::Relaxed),
             FINISH_DECODE_ENTRIES.load(Ordering::Relaxed),
@@ -862,6 +862,8 @@ fn drive_impl<W: std::io::Write>(
             WINDOW_SEEDED_CHUNKS.load(Ordering::Relaxed),
             SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed),
             SEEDED_WRAPPER_CHUNKS.load(Ordering::Relaxed),
+            EXACT_BLOCK_CHUNKS.load(Ordering::Relaxed),
+            EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed),
             BAD_SEED_RESYNC.load(Ordering::Relaxed),
             BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
             HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
