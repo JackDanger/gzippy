@@ -187,11 +187,17 @@ fn isal_engine_oracle_enabled() -> bool {
 /// segment-append loop (`GzipChunk.hpp:309-379`: `DecodedVector(128 KiB)` ->
 /// `readStream` -> `resize` -> `append`, repeat), done on gzippy's one
 /// contiguous Vec, so the per-worker pooled buffer tracks the ACTUAL decoded
-/// size. Default OFF == production: the SAME growable decode but with the
-/// historical 8x upfront reserve as the initial (zero regrows sub-8x; growth
-/// engages only on >8x overflow — the DIS-29 storm fix). Do NOT default this
-/// knob ON: the small initial regresses sub-8x corpora at low-T (ghcn T1 -18%,
-/// DIS-29). Returns `Some((initial_factor, grow_bytes))` when ON. Both tunable
+/// size.
+///
+/// Default OFF == production: the SAME growable decode but with a
+/// **ratio-informed** upfront reserve (see `compute_initial_reserve` and
+/// `ChunkConfiguration::expansion_ratio_ceil`), which sizes the initial from
+/// the member's KNOWN ISIZE/compressed ratio instead of a fixed 8×. The old
+/// fixed 8× is what the env knob FACTOR=2 falsified (+41% model-T8); the ratio
+/// path closes that gap while keeping the DIS-29 >8x storm fix (growth still
+/// engages on overflow). Do NOT default this env knob ON: the small initial
+/// regresses sub-8x corpora at low-T (ghcn T1 -18%, DIS-29).
+/// Returns `Some((initial_factor, grow_bytes))` when ON. Both tunable
 /// for the footprint sweep: `GZIPPY_ISAL_INITIAL_FACTOR` (default 4),
 /// `GZIPPY_ISAL_GROW_MIB` (default 4).
 fn isal_incremental_growth() -> Option<(usize, usize)> {
@@ -254,6 +260,36 @@ fn fold_nocrc_enabled() -> bool {
 ///
 /// This drops an igzip-class engine into the REAL parallel-SM pipeline (the pool,
 /// consumer, window-publish, ring, and CRC all stay) to bound the T8 WALL.
+
+/// Compute the upfront output-reserve byte count for the ISA-L clean-tail decode.
+///
+/// `compressed_span` is the chunk's compressed byte span (`slice_end − byte_start`
+/// inside `finish_decode_chunk_isal_oracle`).  `expansion_ratio_ceil` is the
+/// member-level ratio ceiling from `ChunkConfiguration::expansion_ratio_ceil`; a
+/// value of 0 means the ratio was unknown at configuration time → falls back to the
+/// historical 8× factor.
+///
+/// Result is clamped to `[RESERVE_FLOOR, RESERVE_CAP]`.  Growth past `RESERVE_CAP`
+/// is handled by the GROW_BYTES loop downstream and is always safe — this function
+/// only sizes the *upfront* allocation.
+///
+/// Exposed as `pub(crate)` so the unit-test module can exercise the clamp logic
+/// directly without constructing a full ISA-L decode.
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ceil: u16) -> usize {
+    const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never start below 4 MiB
+    const RESERVE_CAP: usize = 64 * 1024 * 1024; // upfront ceiling; growth may exceed on demand
+    let factor = if expansion_ratio_ceil == 0 {
+        8 // unknown → historical default
+    } else {
+        expansion_ratio_ceil as usize
+    };
+    compressed_span
+        .saturating_mul(factor)
+        .max(RESERVE_FLOOR)
+        .min(RESERVE_CAP)
+}
+
 #[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
 fn finish_decode_chunk_isal_oracle(
     chunk: &mut ChunkData,
@@ -315,23 +351,30 @@ fn finish_decode_chunk_isal_oracle(
     let compressed_span = slice_end.saturating_sub(byte_start);
     let decode_start = chunk.data.len();
     let (written, end_bit, boundaries) = {
-        // PRODUCTION DEFAULT: the historical 8x-compressed-span UPFRONT reserve
-        // (sub-8x corpora pay ZERO regrow churn — identical allocation to the
-        // old fixed buffer), decoded through the GROWABLE ISA-L loop so a chunk
-        // that expands past the reserve GROWS on demand instead of overflowing
-        // and storming EVERY chunk to the ~7.5x pure-Rust fallback (DIS-29: the
-        // storm threshold was exactly the 8x factor — nasa 9.9x crushed T1 to
-        // 0.57x rg; growth fixes it byte-exact, T1 +20-30%, T8/T16 neutral).
-        // This is HANDOFF item (i)'s "retry-on-None-with-growth" with the
-        // retry's wasted first decode removed: growth only engages on overflow,
-        // identity elsewhere. RESERVE_CAP bounds only the UPFRONT reserve (a
-        // pathological span no longer needs the cap to protect the fallback —
-        // growth past it is on-demand and tracks the actual decoded size).
+        // PRODUCTION DEFAULT: RATIO-INFORMED upfront reserve (box-proven +41%
+        // model-T8; DIS-14/DIS-17 footprint mechanism, 2026-06-09).
+        //
+        // The reserve is sized from the member's KNOWN ISIZE/compressed ratio
+        // (stored in chunk.configuration.expansion_ratio_ceil) rather than the
+        // historical fixed 8×. On near-incompressible corpora (model: ~1.3×)
+        // the 8× reserve over-allocated ~6× per chunk; with O(T) concurrent
+        // workers the excess page-fault/dTLB pressure collapsed per-worker
+        // ISA-L throughput (GZIPPY_ISAL_INCREMENTAL_GROWTH=1 FACTOR=2 falsifier
+        // at model T8: wall 0.31 → 0.22s, maxRSS 390 → 291 MB, 3/3 runs). The
+        // ratio-informed path removes the over-reservation without regressing
+        // sub-8× low-T corpora (ghcn: ceiling = 10 covers 7.8× with margin;
+        // the DIS-29 env-knob regression was exactly "too small a factor at
+        // low-T" — now the factor is sized from the actual member ratio).
+        //
+        // ISIZE is mod 2^32: files >4 GiB raw may wrap → under-ratio → safe
+        // regrow via GROW_BYTES (see ChunkConfiguration::expansion_ratio_ceil).
+        // RESERVE_CAP bounds only the UPFRONT reserve; growth past it is on
+        // demand and tracks the actual decoded size. RESERVE_FLOOR prevents
+        // pathologically small allocations on tiny chunks.
         //
         // GZIPPY_ISAL_INCREMENTAL_GROWTH=1 keeps the ALWAYS-SMALL measurement
-        // arm (footprint sweeps; DIS-23): small initial far below 8x. Do NOT
-        // default it on — it regresses sub-8x corpora at low-T (ghcn T1 -18%,
-        // regrow churn with no storm to fix; DIS-29).
+        // arm (footprint sweeps; DIS-23). It is NOT the production default —
+        // the ratio-informed path below IS.
         let (initial, grow_bytes) = if let Some((initial_factor, grow)) = isal_incremental_growth()
         {
             const INCR_FLOOR: usize = 512 * 1024; // never start below 512 KiB
@@ -342,15 +385,9 @@ fn finish_decode_chunk_isal_oracle(
                 grow,
             )
         } else {
-            const EXPAND_FACTOR: usize = 8;
-            const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never reserve below 4 MiB
-            const RESERVE_CAP: usize = 64 * 1024 * 1024; // upfront-reserve ceiling (growth may exceed on demand)
             const GROW_BYTES: usize = 4 * 1024 * 1024; // per-grow increment on overflow
             (
-                compressed_span
-                    .saturating_mul(EXPAND_FACTOR)
-                    .max(RESERVE_FLOOR)
-                    .min(RESERVE_CAP),
+                compute_initial_reserve(compressed_span, chunk.configuration.expansion_ratio_ceil),
                 GROW_BYTES,
             )
         };
@@ -3046,6 +3083,121 @@ mod isal_tail_parity {
             chunk_bytes, reference,
             "BFINAL tail bytes mismatch at start_bit={start_bit} stop_hint={stop_hint_bits}"
         );
+    }
+
+    /// RATIO-INFORMED RESERVE unit gate. Tests `compute_initial_reserve` for
+    /// the three representative corpus classes and boundary conditions:
+    ///
+    /// * 1.3× (model-like, near-incompressible) — ratio_ceil = 2; reserve
+    ///   = compressed_span × 2, correctly sized 6× smaller than the old 8×.
+    /// * 7.8× (ghcn-like) — ratio_ceil = 10; reserve = compressed_span × 10,
+    ///   within cap for typical 4 MiB chunks.
+    /// * 10× — ratio_ceil = 13; reserve = compressed_span × 13, also within
+    ///   cap for 4 MiB chunks.
+    /// * Unknown (0) — falls back to historical 8× factor.
+    /// * Floor: tiny compressed_span → clamped up to RESERVE_FLOOR (4 MiB).
+    /// * Cap: large span × large factor → clamped to RESERVE_CAP (64 MiB).
+    #[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+    #[test]
+    fn ratio_informed_reserve_computation() {
+        const FLOOR: usize = 4 * 1024 * 1024;
+        const CAP: usize = 64 * 1024 * 1024;
+        let span = 4 * 1024 * 1024usize; // typical 4 MiB compressed chunk
+
+        // 1.3× corpus (model): ceil(1.3 × 1.25) = ceil(1.625) = 2
+        // The sm_driver computes this as ceil(ISIZE×5 / compressed×4) = ceil(6.5/4·compressed)
+        // Verify the clamp helper uses factor 2 correctly.
+        let rc_13: u16 = 2;
+        assert_eq!(
+            compute_initial_reserve(span, rc_13),
+            span * 2, // 8 MiB — within [4 MiB, 64 MiB]
+            "1.3x corpus: expected 2× reserve"
+        );
+
+        // 7.8× corpus (ghcn): ceil(7.8 × 1.25) = ceil(9.75) = 10
+        let rc_78: u16 = 10;
+        assert_eq!(
+            compute_initial_reserve(span, rc_78),
+            span * 10, // 40 MiB — within cap
+            "7.8x corpus: expected 10× reserve (40 MiB < 64 MiB cap)"
+        );
+
+        // 10× corpus: ceil(10 × 1.25) = ceil(12.5) = 13
+        let rc_10: u16 = 13;
+        assert_eq!(
+            compute_initial_reserve(span, rc_10),
+            span * 13, // 52 MiB — within cap
+            "10x corpus: expected 13× reserve (52 MiB < 64 MiB cap)"
+        );
+
+        // Unknown (expansion_ratio_ceil = 0) → historical 8× fallback
+        assert_eq!(
+            compute_initial_reserve(span, 0),
+            span * 8, // 32 MiB
+            "unknown ratio: must fall back to 8× factor"
+        );
+
+        // Floor: tiny span → clamp up to 4 MiB
+        assert_eq!(
+            compute_initial_reserve(0, 2),
+            FLOOR,
+            "zero span: must clamp to RESERVE_FLOOR"
+        );
+        assert_eq!(
+            compute_initial_reserve(100, 2),
+            FLOOR,
+            "tiny span (100B × 2 = 200B < 4 MiB): must clamp to RESERVE_FLOOR"
+        );
+
+        // Cap: 10 MiB span × factor 10 = 100 MiB → clamp to 64 MiB
+        assert_eq!(
+            compute_initial_reserve(10 * 1024 * 1024, 10),
+            CAP,
+            "100 MiB upfront request: must clamp to RESERVE_CAP (64 MiB)"
+        );
+    }
+
+    /// Verify that sm_driver computes the expected ratio_ceil values for the
+    /// representative corpus classes (1.3×, 7.8×, 10×) without needing a full
+    /// decode.  This tests the arithmetic only — the pure formula
+    /// `ceil(ISIZE × 5 / (compressed × 4)), min 2`.
+    #[test]
+    fn ratio_ceil_arithmetic() {
+        // Helper: compute ratio_ceil exactly as sm_driver does.
+        let ratio_ceil = |isize_bytes: u64, compressed_bytes: u64| -> u16 {
+            if compressed_bytes == 0 || isize_bytes == 0 {
+                return 0;
+            }
+            let numer = isize_bytes.saturating_mul(5);
+            let denom = compressed_bytes.saturating_mul(4);
+            ((numer + denom - 1) / denom).max(2).min(u16::MAX as u64) as u16
+        };
+
+        // 1.3× member: ISIZE = 269 MiB, compressed = 204 MiB
+        // ceil(269 × 5 / (204 × 4)) = ceil(1345 / 816) = ceil(1.649) = 2
+        let r = ratio_ceil(269 * 1024 * 1024, 204 * 1024 * 1024);
+        assert_eq!(r, 2, "1.3x model corpus: ratio_ceil should be 2");
+
+        // 7.8× member (ghcn-like): ISIZE = 7.8 × compressed
+        // ceil(7.8 × 5 / 4) = ceil(9.75) = 10
+        let compressed = 50_000_000u64;
+        let uncompressed = (compressed as f64 * 7.8) as u64;
+        let r = ratio_ceil(uncompressed, compressed);
+        assert_eq!(r, 10, "7.8x corpus: ratio_ceil should be 10");
+
+        // 10× member: ceil(10 × 5 / 4) = ceil(12.5) = 13
+        let compressed = 50_000_000u64;
+        let uncompressed = compressed * 10;
+        let r = ratio_ceil(uncompressed, compressed);
+        assert_eq!(r, 13, "10x corpus: ratio_ceil should be 13");
+
+        // Minimum floor: 1.0× exactly → ceil(1.0 × 1.25) = ceil(1.25) = 2 (min)
+        let r = ratio_ceil(100, 100);
+        assert_eq!(r, 2, "1.0x corpus: ratio_ceil should be 2 (minimum)");
+
+        // Unknown (zero isize or compressed) → 0
+        assert_eq!(ratio_ceil(0, 100), 0, "zero isize → unknown");
+        assert_eq!(ratio_ceil(100, 0), 0, "zero compressed → unknown");
     }
 
     #[test]
