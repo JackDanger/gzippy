@@ -1,3 +1,15 @@
+## SLAB RETENTION POLICY: implemented, default stays OFF (RSS criterion) [2026-06-10 early]
+Branch perf/slab-retention-policy @ a1ecc834 (UNMERGED, worktree /tmp/gz-slab): bytes-budget
+largest-first eviction (GZIPPY_SLAB_BUDGET_MIB, default 64MiB free-list cap vs old possible 576MiB),
+GZIPPY_SLAB_ALLOC=0 now correctly disables. Budget sweep: model T8 +5-10% wall at 64MiB budget; but
+silesia RSS +35% with slab on => default-ON criterion FAILED => stays opt-in. CAVEATS: the worker's
+"frozen" table was NOT actually frozen (no lock acquired; LXC denied no_turbo write) — its rg ratios
+are UNBANKABLE; only slab-vs-head same-session deltas are directional. NEXT SESSION ITEM: gate +
+merge the branch (policy improvement, default-off, low risk) with a REAL frozen verification; ALSO
+fix pre-existing test classify_single_member_t1 (expects ParallelSM at T1; IsalSingleShot since
+0e57d8d9 — only fails under some feature sets).
+The mid-T band lever now needs a DIFFERENT shape than process-level slab: per-worker retention or
+rg-faithful thread-cache spans (rg keeps RSS LOWER than gzippy while reusing) — design next session.
 ## MID-T BAND DECOMPOSED (concurrent-oracle probe + two env falsifiers) [2026-06-10 early]
 Isolated-oracle scaling probe (8 distinct model spans, no pipeline): ORACLE T8 agg 1292MB/s ==
 pipeline T8 (~1268) => at T8 the pipeline structure adds ~NOTHING; the whole gap is per-chunk
