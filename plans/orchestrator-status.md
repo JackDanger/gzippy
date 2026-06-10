@@ -1,3 +1,13 @@
+## MODEL-CELL MECHANISM FOUND: 8x UPFRONT RESERVE under 8-way concurrency (env-knob falsifier +41% wall) [2026-06-09 night]
+Probe ladder exonerated FFI (~400MB/s all stop-configs), oracle accounting (~350MB/s full path
+single-threaded), bootstrap (1.4ms/chunk). The 132MB/s/worker collapse appears ONLY concurrent =>
+memory system. FALSIFIER (3/3 reproducible, unfrozen same-conditions A/B, /root/bin-post model T8):
+GZIPPY_ISAL_INCREMENTAL_GROWTH=1 FACTOR=2: wall 0.31-0.34 -> 0.22s (+41%), maxRSS 390 -> 291MB.
+Mechanism: 8x-compressed-span upfront reserve allocates ~6x actual output on near-incompressible
+data (32MB reserve / 5MB output per chunk x8 workers => allocation+fault+dTLB pressure = DIS-14/17's
+footprint thesis, now CAUSALLY tied to the worst cell). FIX DIRECTION (queued): ratio-informed
+initial = clamp(span x ceil(ISIZE/compressed x 1.25), 4MiB, 64MiB) — model ~1.7x, ghcn ~9.8x (no
+DIS-29 churn regression), growable remains the underestimate safety net. sha-verify owed in the A/B.
 ## LONE-DRAIN LEVER: FALSIFIED + REVERTED (wrong bytes at silesia T4; wall TIE everywhere it ran) [2026-06-09 night, SUPERVISOR]
 The pair-drain-gate removal + trailing-subchunk END-window change (0f0f9fb6, advisor-gated SOUND,
 899/899 native box tests, bignasa 9/9 byte-exact T2/4/8) produced DETERMINISTIC WRONG BYTES on
