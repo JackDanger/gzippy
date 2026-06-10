@@ -1,3 +1,17 @@
+## MID-T BAND DECOMPOSED (concurrent-oracle probe + two env falsifiers) [2026-06-10 early]
+Isolated-oracle scaling probe (8 distinct model spans, no pipeline): ORACLE T8 agg 1292MB/s ==
+pipeline T8 (~1268) => at T8 the pipeline structure adds ~NOTHING; the whole gap is per-chunk
+decode+ChunkData lifecycle. BARE FFI T8 = 1879MB/s (per-worker 298 > rg's 263 — raw ISA-L is NOT
+the problem); ORACLE vs BARE = 31% ChunkData-lifecycle overhead, page faults 1.25M vs 86K per sweep
+(fresh SegmentedU8 huge allocations: rpmalloc munmaps >3.94MiB on free, refaults on next chunk —
+rpmalloc_alloc.rs:30). Residual BARE-vs-rg ~11% at T8 = memory-bus/L3 class.
+FALSIFIERS (bin-head-isal, unfrozen same-conditions x3):
+- GZIPPY_MANUAL_BUFFER_POOL=1: WORSE (model 0.21->0.26s, RSS +80MB) — legacy mutex pool DEAD.
+- GZIPPY_SLAB_ALLOC=1: model 0.21->0.19s (+10%, churn mechanism CONFIRMED) but RSS +200-300MB on
+  silesia/bignasa for neutral wall — needs CAP/POLICY TUNING before production (per-worker-sized
+  retention, or rg-faithful thread-cache config), not default-ON.
+NEXT SESSION: tune slab retention policy (cap to ~per-worker chunk size), frozen A/B all band
+cells, then the residual ~11% BARE gap (bus/L3) + native engine decision.
 ## RATIO-RESERVE BANKED (frozen, 59573be9 = /root/bin-head-isal da52c5d1): EVERY cell lifted; silesia T8 PASSES bar [2026-06-09 late night]
 Frozen 3-way N=9 sha-verified: model T8 0.684->0.846 (+16pp); silesia T4 0.851->0.906; T16 0.915->0.939;
 T8 0.949->0.993 PASS(>=0.99); bignasa T8 ~0.90 (19%/12% spread, TIE band). The ratio-informed initial
