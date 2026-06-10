@@ -1,3 +1,14 @@
+## ENGINE M2b MERGED (advisor-SOUND) — stored early-flip ported, DIV-5 closed [2026-06-10]
+54/54 byte-exact both kill-switch arms; storedmix +8.7%; silesia 1.000; purely additive diff
+(913/0). Gate proved case-2 unreachability + case-1 marker-drop byte-safety from the arming
+arithmetic. Worker also fixed a Bits bitbuf/bitsleft invariant in the new bulk reads (caught by
+its own nets) and flagged STALE MEMORY: GZIPPY_FORCE_PARALLEL_SM no longer exists in src (parity
+scripts still set it as a no-op — cleanup item). Map refinement: case 1 is width-independent.
+DIVERGENCE LEDGER: DIV-2 kept (meets-or-beats), DIV-4 closed (M2), DIV-5 closed (M2b);
+remaining: DIV-1 (M3 — THE payload step), DIV-3/DIV-6 (M5 deletions).
+NEXT: M3 — seeded/until-exact chunks onto Block, unified::Inflate off the native graph
+(GZIPPY_SEEDED_BLOCK kill-switch; M4 contract pre-registered in the gate amendments; masked A/B
+native T1/T4/T8 = the engine cells; empty-seed vendor divergence resolves here too).
 ## ENGINE M2 MERGED (advisor-SOUND) — Block on WidthRing, DIV-4 closed [2026-06-10]
 Mechanical migration landed: 911/0 guest suite, 30/30 byte-exact grid both builds, masked perf
 TIE-or-better (silesia T4 0.203->0.195). The gauntlet caught + fixed an M1 skeleton contract bug
