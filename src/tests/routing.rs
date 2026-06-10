@@ -375,59 +375,6 @@ mod tests {
         }
     }
 
-    /// Manual bisect: compare byte-exact output with vs without `GZIPPY_DRAIN_LONE`.
-    /// Run: `cargo test --release --lib diagnose_lone_drain_byte_diff -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn diagnose_lone_drain_byte_diff_coalesce() {
-        // Match `test_coalesce_fixed_huffman_multithread_byte_exact` shape.
-        let original = make_btype01_heavy_data(32 * 1024 * 1024);
-        let compressed = compress_single_member_gzip(&original);
-        let threads = 2usize;
-
-        eprintln!("--- pair-drain trace ---");
-        let mut good = Vec::new();
-        std::env::remove_var("GZIPPY_DRAIN_LONE");
-        std::env::set_var("GZIPPY_TRACE_DRAIN", "1");
-        crate::decompress::decompress_single_member(&compressed, &mut good, threads)
-            .expect("pair-drain decode");
-
-        eprintln!("--- lone-drain trace ---");
-        std::env::set_var("GZIPPY_DRAIN_LONE", "1");
-        let mut bad = Vec::new();
-        let err = crate::decompress::decompress_single_member(&compressed, &mut bad, threads);
-        std::env::remove_var("GZIPPY_DRAIN_LONE");
-        std::env::remove_var("GZIPPY_TRACE_DRAIN");
-
-        if err.is_ok() && bad == good {
-            eprintln!("GZIPPY_DRAIN_LONE: byte-identical to pair drain (unexpected)");
-            return;
-        }
-
-        eprintln!("good_len={} bad_len={} err={err:?}", good.len(), bad.len());
-        let n = good.len().min(bad.len());
-        for i in 0..n {
-            if good[i] != bad[i] {
-                eprintln!(
-                    "first byte diff at offset {i}: good={:#04x} bad={:#04x} \
-                     (good context {:?}, bad context {:?})",
-                    good[i],
-                    bad[i],
-                    &good[i.saturating_sub(8)..i.min(good.len()).saturating_add(8).min(good.len())],
-                    &bad[i.saturating_sub(8)..i.min(bad.len()).saturating_add(8).min(bad.len())],
-                );
-                break;
-            }
-        }
-        if bad.len() != good.len() {
-            eprintln!("length delta: {}", bad.len() as i64 - good.len() as i64);
-        }
-        assert!(
-            err.is_err() || bad != good,
-            "expected lone-drain divergence for diagnosis"
-        );
-    }
-
     /// Pure incompressible bytes (PRNG), compressed into STORED deflate blocks
     /// via `Compression::none()` — what `gzip` produces on random data.
     fn make_high_entropy_data(size: usize) -> Vec<u8> {
