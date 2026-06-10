@@ -1,3 +1,13 @@
+## ENGINE DESIGN GATED: SOUND-WITH-CHANGES — execution-ready [2026-06-10]
+Opus gate verified the P1 headline + all 6 divergences FIRST-HAND (the campaign's vendor-misread
+history made this the critical check): DIV-1 confirmed on the hot path (every window-resolved chunk
+takes the second engine, chunk_fetcher.rs:2564); the apply-trace contradiction RECONCILED (vendor
+applyWindow iterates ONLY dataWithMarkers; on silesia that's ~the whole chunk => the lever is
+marker-loop symbol rate). Binding amendments appended to plans/engine-u8-design.md: DIV-5 split
+out of M2 (own kill-switched step M2b); M4 relabeled a no-C-FFI-justified deviation with the
+unified::Inflate contract pre-registered. THE CAMPAIGN IS EXECUTION-READY: next session runs
+M2 (WidthRing member migration) -> M2b (stored early-flip) -> M3 (seeded chunks onto Block,
+GZIPPY_SEEDED_BLOCK kill-switch, the DIV-1 deletion) with the full verification gauntlet per step.
 ## ENGINE P1 MERGED — the rewrite target is the GRAPH, not the loop [2026-06-10]
 P1 (engine/u8-arch-p1 -> merged): first-hand vendor audit found the u8-flip-in-place INTERNALS
 already converged since 2026-06-07 (Block flips u16->u8 in place, clean bulk u8-direct, storage
