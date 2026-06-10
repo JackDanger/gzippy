@@ -1,3 +1,16 @@
+## PER-WORKER RETENTION REVERTED — canonical-mask regression + broken kill-switch [2026-06-10]
+Under the spine mask (taskset 0,2,..,14) model T8: bin-head-isal (pre-retention) 0.17-0.18s/285MB;
+retention build 0.24-0.25s/380MB (-29% wall, +90MB RSS); GZIPPY_PW_RETAIN=0 changes NOTHING (wall
+AND RSS identical => the PwHeader over-allocation/trim path runs even when disabled — the gate is
+broken). Independently confirmed by the canonical frozen re-measure sanity-gate FAIL (gz1@HEAD 608ms
+vs banked 466-498, rg exactly on banked). The retention worker's own A/B used FREE-PLACEMENT
+conditions (SMT roulette baseline 0.22s) where it showed +10%; under physical-core placement the
+baseline is 0.17s and retention destroys it. REVERTED from HEAD. Lesson banked: condition-match
+A/Bs to the CANONICAL MASK before accepting allocator levers; verify kill-switches actually
+disable the whole path.
+PIN KNOB verdict (canonical re-measure): redundant under the spine mask (the harness already pins
+physical cores at T4/T8 — TIE all 5 cells); REAL +23% for unmasked real-world invocations =>
+worth merging as a UX win (default-policy decision pending) but NOT a bar lever.
 ## PIN-WORKERS KNOB: +15-29% same-loop frozen on every T4/T8 cell (UNMERGED; canonical re-measure owed) [2026-06-10]
 Branch perf/pin-workers-knob @ 234285db (worktree removed; /root/bin-pin kept): GZIPPY_PIN_WORKERS=1
 pins decode workers round-robin to distinct PHYSICAL cores (sysfs thread_siblings_list; T>phys-count
