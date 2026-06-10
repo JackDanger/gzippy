@@ -1,8 +1,11 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// P1 skeleton (plans/engine-campaign.md, plans/engine-u8-design.md §2): NOT wired
-// into any production path yet. Block migrates onto this type in P2/M2; until
-// then the only callers are the unit tests below.
+// M2 (plans/engine-campaign.md, plans/engine-u8-design.md §5): `marker_inflate::Block`
+// owns a `WidthRing` member and its fast loops write through raw pointers obtained
+// from `window16` (pub(crate) fields — the type is an ownership/contract boundary,
+// not a call-virtualization layer; codegen of the hot loops is unchanged). The
+// per-element emit methods (`push_literal` / `copy_backref` / `drain_*`) remain
+// contract-test surface only.
 
 //! `WidthRing` — the ONE dual-width decode window, extracted as a type.
 //!
@@ -23,13 +26,19 @@
 //!   each back-ref copy (deflate.hpp:1379-1389).
 //! - Clean-window arming (deflate.hpp:1282-1284) in [`WidthRing::should_flip`].
 //! - Flip mechanics `setInitialWindow` (deflate.hpp:1740-1785) in
-//!   [`WidthRing::flip_in_place`]: conflate the surviving 32 KiB through a
-//!   scratch buffer (vendor `conflatedBuffer`, :1772-1776), place it at the
-//!   TAIL of the u8 view (:1778-1780), re-base the cursor (vendor
-//!   `m_windowPosition = 0`, :1782). The seam bytes (this call's undrained
-//!   output) are returned as u8 — vendor emits them as u8 views into the
-//!   just-conflated window (deflate.hpp:1285-1286), i.e. no u16 re-read after
-//!   the flip (fixes map DIV-4 relative to `Block::drain_transition_narrow_u16`).
+//!   [`WidthRing::flip_in_place`]: zero the not-yet-decoded ring remainder
+//!   (:1762-1764), value-downcast the WHOLE rotated 64 Ki-element u16 ring
+//!   through a scratch buffer (vendor `conflatedBuffer` is
+//!   `std::array<uint8_t, m_window16.size()>` — the FULL ring, :1772-1776),
+//!   place it at the TAIL of the u8 view (:1778-1780), re-base the cursor
+//!   (vendor `m_windowPosition = 0`, :1782). The full-ring conflate is what
+//!   lets the seam (the flip call's undrained output, up to
+//!   `RING_SIZE - MAX_RUN_LENGTH` bytes — vendor `nMaxToDecode` cap,
+//!   :1602) be emitted as u8 views into the just-conflated window
+//!   (deflate.hpp:1285-1286, `lastBuffers(window, m_windowPosition,
+//!   nBytesRead)`): [`WidthRing::flipped_seam`]. No u16 re-read after the
+//!   flip (fixes map DIV-4 relative to the pre-M2
+//!   `Block::drain_transition_narrow_u16` temp-Vec narrow).
 //! - Pre-decode window seed (deflate.hpp:1750-1759) in [`WidthRing::seed_window`]:
 //!   clean from byte 0.
 //!
@@ -72,26 +81,37 @@ pub enum RingError {
 }
 
 /// The one dual-width decode window. See module docs for the vendor mapping.
+///
+/// Fields are `pub(crate)` because `marker_inflate::Block`'s optimized fast
+/// loops (M2, plans/engine-u8-design.md §2/§5) pull `pos` /
+/// `distance_to_last_marker` into locals and write through raw pointers
+/// derived from `window16` — identical codegen to the pre-M2 inline fields.
 pub struct WidthRing {
     /// Single backing allocation (vendor `m_window16`, deflate.hpp:926).
     /// Boxed for stack-pressure parity with vendor's heap'd Block
     /// (deflate.hpp:802-803 / GzipChunk.hpp:454-456).
-    ring: Box<[u16; RING_SIZE]>,
+    pub(crate) window16: Box<[u16; RING_SIZE]>,
     /// Logical write cursor (vendor `m_windowPosition`, deflate.hpp:933).
     /// Units are u16 slots in `Marker` width, u8 slots in `Clean` width;
     /// the flip re-bases it (deflate.hpp:1782 sets it to 0; we use
-    /// `U8_RING_SIZE` ≡ physical 0 so `pos - distance` cannot underflow,
-    /// mirroring `Block::flip_repack_to_u8`).
-    pos: usize,
+    /// `U8_RING_SIZE` ≡ physical 0 so `pos - distance` cannot underflow).
+    pub(crate) pos: usize,
     /// Logical position up to which output has been handed to the caller.
-    drained: usize,
-    width: RingWidth,
+    pub(crate) drained: usize,
+    pub(crate) width: RingWidth,
     /// Vendor `m_distanceToLastMarkerByte` (deflate.hpp:944-951). Undefined
     /// once `width == Clean` (vendor: "the exact value does not matter and
     /// is undefined when m_containsMarkerBytes is false").
-    distance_to_last_marker: usize,
+    pub(crate) distance_to_last_marker: usize,
     /// Vendor `m_decodedBytes` (deflate.hpp:940-944): total decoded bytes,
     /// including a seeded window's length (deflate.hpp:1755).
+    ///
+    /// NOTE (M2): maintained ONLY by this type's standalone per-element emit
+    /// API (`push_literal` / `copy_backref` / `seed_window`) for the contract
+    /// tests. `Block` keeps the authoritative `m_decodedBytes` as its own
+    /// `decoded_bytes` field (vendor keeps it on `Block`, not the window) and
+    /// passes it explicitly to [`WidthRing::should_flip`] /
+    /// [`WidthRing::flip_in_place`] — the design-doc §2 signature.
     decoded: usize,
 }
 
@@ -109,7 +129,7 @@ impl WidthRing {
             .expect("RING_SIZE-sized box");
         Self::init_marker_zone(&mut ring);
         WidthRing {
-            ring,
+            window16: ring,
             pos: 0,
             drained: 0,
             width: RingWidth::Marker,
@@ -139,11 +159,23 @@ impl WidthRing {
         self.width = RingWidth::Marker;
         self.distance_to_last_marker = 0;
         self.decoded = 0;
-        Self::init_marker_zone(&mut self.ring);
+        Self::init_marker_zone(&mut self.window16);
     }
 
     pub fn width(&self) -> RingWidth {
         self.width
+    }
+
+    /// Vendor `m_containsMarkerBytes == true` (deflate.hpp:936-939).
+    #[inline(always)]
+    pub(crate) fn is_marker(&self) -> bool {
+        matches!(self.width, RingWidth::Marker)
+    }
+
+    /// Vendor `m_containsMarkerBytes == false`.
+    #[inline(always)]
+    pub(crate) fn is_clean(&self) -> bool {
+        !self.is_marker()
     }
 
     pub fn decoded_bytes(&self) -> usize {
@@ -157,12 +189,14 @@ impl WidthRing {
         // SAFETY: u8 has alignment 1 ≤ align_of::<u16>; the region is the
         // ring's own allocation, length U8_RING_SIZE == RING_SIZE * 2 bytes;
         // shared borrow of self prevents aliasing mutation.
-        unsafe { std::slice::from_raw_parts(self.ring.as_ptr() as *const u8, U8_RING_SIZE) }
+        unsafe { std::slice::from_raw_parts(self.window16.as_ptr() as *const u8, U8_RING_SIZE) }
     }
 
     fn ring8_mut(&mut self) -> &mut [u8] {
         // SAFETY: as `ring8`, with the exclusive borrow of self.
-        unsafe { std::slice::from_raw_parts_mut(self.ring.as_mut_ptr() as *mut u8, U8_RING_SIZE) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.window16.as_mut_ptr() as *mut u8, U8_RING_SIZE)
+        }
     }
 
     /// Pre-decode window seed — vendor `setInitialWindow`'s
@@ -193,7 +227,7 @@ impl WidthRing {
         match self.width {
             RingWidth::Marker => {
                 let slot = self.pos % RING_SIZE;
-                self.ring[slot] = byte as u16;
+                self.window16[slot] = byte as u16;
                 self.distance_to_last_marker += 1;
             }
             RingWidth::Clean => {
@@ -225,9 +259,9 @@ impl WidthRing {
             RingWidth::Marker => {
                 for _ in 0..length {
                     let src = (self.pos % RING_SIZE + RING_SIZE - distance) % RING_SIZE;
-                    let v = self.ring[src];
+                    let v = self.window16[src];
                     let dst = self.pos % RING_SIZE;
-                    self.ring[dst] = v;
+                    self.window16[dst] = v;
                     self.pos += 1;
                 }
                 // Vendor backward scan (deflate.hpp:1379-1389): if the copied
@@ -237,7 +271,7 @@ impl WidthRing {
                 let mut found_marker = false;
                 for k in 0..length {
                     let slot = (self.pos + RING_SIZE - 1 - k) % RING_SIZE;
-                    if self.ring[slot] >= MARKER_BASE {
+                    if self.window16[slot] >= MARKER_BASE {
                         found_marker = true;
                         break;
                     }
@@ -272,52 +306,87 @@ impl WidthRing {
     /// including the pre-init zone, has been overwritten clean) OR
     /// (`>= MAX_WINDOW_SIZE` AND `== m_decodedBytes`: the chunk has ONLY ever
     /// emitted clean bytes and 32 KiB of them exist).
-    pub fn should_flip(&self) -> bool {
+    ///
+    /// `decoded_bytes` is the caller's authoritative `m_decodedBytes`
+    /// (`Block` owns it, mirroring vendor; see the `decoded` field note).
+    pub fn should_flip(&self, decoded_bytes: usize) -> bool {
         self.width == RingWidth::Marker
             && (self.distance_to_last_marker >= RING_SIZE
                 || (self.distance_to_last_marker >= MAX_WINDOW_SIZE
-                    && self.distance_to_last_marker == self.decoded))
+                    && self.distance_to_last_marker == decoded_bytes))
     }
 
     /// Flip the ring width in place — vendor `setInitialWindow`'s mid-decode
-    /// arm (deflate.hpp:1762-1784): value-downcast the rotated last-32 KiB
-    /// window through a scratch buffer (`conflatedBuffer`, :1772-1776; scratch
-    /// is mandatory — the u8 destination tail physically overlaps the u16
-    /// source slots), place it at the TAIL of the u8 view (:1778-1780), and
-    /// re-base the cursor (:1782).
+    /// arm (deflate.hpp:1762-1784), exactly:
     ///
-    /// The still-undrained seam bytes are appended to `seam_out` as u8 — the
-    /// analog of vendor returning the flip call's output as u8 views into the
-    /// conflated window (deflate.hpp:1285-1286).
+    /// 1. zero the not-yet-decoded ring remainder (:1762-1764) — only runs
+    ///    when `decoded_bytes < RING_SIZE` (arming condition 2), where the
+    ///    untouched slots still hold pre-init marker-zone values;
+    /// 2. value-downcast the WHOLE rotated u16 ring through a scratch buffer
+    ///    (vendor `conflatedBuffer` is `std::array<uint8_t,
+    ///    m_window16.size()>`, i.e. the FULL 64 Ki elements, :1772-1776;
+    ///    scratch is mandatory — the u8 destination tail physically overlaps
+    ///    the u16 source slots). Vendor's `replaceMarkerBytes` pass (:1765)
+    ///    runs against an EMPTY window at the flip site (:1285 calls
+    ///    `setInitialWindow()` with no argument) and the arming guarantee
+    ///    means no marker can survive in the conflated span — kept here as
+    ///    the `debug_assert` instead of a release-mode pass;
+    /// 3. place it at the TAIL of the u8 view (:1778-1780) — dest offset
+    ///    `window.size() - conflatedBuffer.size()` = `U8_RING_SIZE -
+    ///    RING_SIZE`;
+    /// 4. re-base the cursor (:1782).
     ///
-    /// Precondition: `should_flip()` — which guarantees ≥ 32 KiB decoded and
-    /// the last `MAX_WINDOW_SIZE` outputs clean (hence the undrained span,
-    /// bounded by the drain contract at ≤ 32 KiB, is clean too).
-    pub fn flip_in_place(&mut self, seam_out: &mut Vec<u8>) {
-        debug_assert!(self.should_flip(), "flip_in_place without arming");
-        debug_assert!(self.decoded >= MAX_WINDOW_SIZE);
-        debug_assert!(self.pos - self.drained <= RING_SIZE - MAX_WINDOW_SIZE);
+    /// Returns the seam length (`pos - drained`, the flip call's still-
+    /// undrained output): the caller emits [`WidthRing::flipped_seam`] as u8,
+    /// the analog of vendor's `result.data = lastBuffers(window,
+    /// m_windowPosition, nBytesRead)` over the just-conflated window
+    /// (deflate.hpp:1285-1286). The seam can be up to `RING_SIZE -
+    /// MAX_RUN_LENGTH` bytes (the marker-mode `nMaxToDecode` cap, :1602) —
+    /// this is WHY vendor conflates the full ring, not just the last 32 KiB
+    /// (and why the per-call check uses `m_windowPosition`-anchored
+    /// `lastBuffers`; see vendor's own comment at :1279-1281).
+    ///
+    /// Precondition: `should_flip(decoded_bytes)`.
+    pub fn flip_in_place(&mut self, decoded_bytes: usize) -> usize {
+        debug_assert!(
+            self.should_flip(decoded_bytes),
+            "flip_in_place without arming"
+        );
+        debug_assert!(decoded_bytes >= MAX_WINDOW_SIZE);
+        let undrained = self.pos - self.drained;
+        // One read() call's output: `nMaxToDecode` is capped at
+        // `RING_SIZE - MAX_RUN_LENGTH` and the last symbol may overshoot by
+        // up to MAX_RUN_LENGTH - 1, so the seam is strictly < RING_SIZE.
+        debug_assert!(undrained < RING_SIZE);
 
-        // 1. Conflate: value-downcast logical [pos - 32 Ki, pos) in order.
-        let mut conflated = vec![0u8; MAX_WINDOW_SIZE];
+        // 1. Zero the not-yet-decoded remainder (vendor :1762-1764:
+        //    `for (i; m_decodedBytes + i < m_window16.size(); ++i)
+        //         m_window16[(m_windowPosition + i) % size] = 0;`).
+        let mut i = 0usize;
+        while decoded_bytes + i < RING_SIZE {
+            let slot = (self.pos + i) % RING_SIZE;
+            self.window16[slot] = 0;
+            i += 1;
+        }
+
+        // 2. Conflate the FULL rotated ring (vendor :1772-1776):
+        //    conflated[i] = ring[(pos + i) % RING_SIZE] — newest byte lands at
+        //    conflated[RING_SIZE - 1]. After step 1 every slot is clean
+        //    (arming cond 1 ⇒ all 64 Ki slots are the last 64 Ki outputs, all
+        //    clean; cond 2 ⇒ decoded slots clean + remainder zeroed).
+        //    64 KiB stack scratch, same as vendor's `conflatedBuffer`.
+        let mut conflated = [0u8; RING_SIZE];
+        let pos_phys = self.pos % RING_SIZE;
         for (k, out) in conflated.iter_mut().enumerate() {
-            let slot = (self.pos % RING_SIZE + RING_SIZE - MAX_WINDOW_SIZE + k) % RING_SIZE;
-            let v = self.ring[slot];
-            debug_assert!(v < MARKER_BASE, "marker {v:#x} in window being flipped");
+            let v = self.window16[(pos_phys + k) % RING_SIZE];
+            debug_assert!(v < 256, "marker {v:#x} in ring being flipped");
             *out = (v & 0xFF) as u8;
         }
 
-        // 2. Seam: the undrained tail is the newest `pos - drained` bytes of
-        //    the conflated window (clean by the arming guarantee).
-        let undrained = self.pos - self.drained;
-        debug_assert!(undrained <= MAX_WINDOW_SIZE);
-        seam_out.extend_from_slice(&conflated[MAX_WINDOW_SIZE - undrained..]);
-
-        // 3. Place the window at the u8 view's tail so a post-flip back-ref of
-        //    distance d reads u8 slot `U8_RING_SIZE - d` — the byte logically
-        //    `d` before the seam (vendor dest offset `window.size() -
-        //    conflatedBuffer.size()`, deflate.hpp:1778-1780).
-        self.ring8_mut()[U8_RING_SIZE - MAX_WINDOW_SIZE..].copy_from_slice(&conflated);
+        // 3. Place at the u8 view's tail (vendor :1778-1780): a post-flip
+        //    back-ref of distance d reads u8 slot `U8_RING_SIZE - d` — the
+        //    byte logically `d` before the seam.
+        self.ring8_mut()[U8_RING_SIZE - RING_SIZE..].copy_from_slice(&conflated);
 
         // 4. Re-base the cursor to u8-logical. Vendor sets m_windowPosition = 0
         //    (deflate.hpp:1782); we use U8_RING_SIZE (≡ physical slot 0) so
@@ -325,14 +394,29 @@ impl WidthRing {
         self.pos = U8_RING_SIZE;
         self.drained = U8_RING_SIZE;
         self.width = RingWidth::Clean;
+        undrained
     }
 
-    /// Flip if armed; returns whether the flip happened. Mirrors the per-call
-    /// hook in `Block::read` (marker_inflate.rs `just_flipped`) / vendor's
-    /// post-`readInternal` check (deflate.hpp:1279-1289).
-    pub fn maybe_flip(&mut self, seam_out: &mut Vec<u8>) -> bool {
-        if self.should_flip() {
-            self.flip_in_place(seam_out);
+    /// The flip call's own output as a u8 view into the just-conflated window
+    /// — vendor `lastBuffers(window, m_windowPosition = 0, nBytesRead)`
+    /// (deflate.hpp:1286 after :1285's `setInitialWindow()`): the last
+    /// `seam_len` bytes of the u8 view. Valid immediately after
+    /// [`WidthRing::flip_in_place`] returned `seam_len`, before any further
+    /// writes.
+    pub fn flipped_seam(&self, seam_len: usize) -> &[u8] {
+        debug_assert_eq!(self.width, RingWidth::Clean);
+        debug_assert!(seam_len <= RING_SIZE);
+        &self.ring8()[U8_RING_SIZE - seam_len..]
+    }
+
+    /// Flip if armed; returns whether the flip happened, appending the seam
+    /// bytes to `seam_out`. Contract-test convenience mirroring the per-call
+    /// hook in `Block::read` / vendor's post-`readInternal` check
+    /// (deflate.hpp:1279-1289).
+    pub fn maybe_flip(&mut self, decoded_bytes: usize, seam_out: &mut Vec<u8>) -> bool {
+        if self.should_flip(decoded_bytes) {
+            let seam_len = self.flip_in_place(decoded_bytes);
+            seam_out.extend_from_slice(self.flipped_seam(seam_len));
             true
         } else {
             false
@@ -352,7 +436,7 @@ impl WidthRing {
         }
         out.reserve(n);
         for i in 0..n {
-            out.push(self.ring[(self.drained + i) % RING_SIZE]);
+            out.push(self.window16[(self.drained + i) % RING_SIZE]);
         }
         self.drained = self.pos;
         Ok(n)
@@ -471,7 +555,7 @@ mod tests {
             // is checked at the same drain-safe points, output is identical).
             if ring.width() == RingWidth::Marker {
                 ring.drain_u16(&mut u16_out).unwrap();
-                ring.maybe_flip(&mut u8_out);
+                ring.maybe_flip(ring.decoded_bytes(), &mut u8_out);
             }
         }
         match ring.width() {
@@ -575,10 +659,16 @@ mod tests {
         let mut ring = WidthRing::new();
         for i in 0..MAX_WINDOW_SIZE - 1 {
             ring.push_literal((i % 256) as u8);
-            assert!(!ring.should_flip(), "armed too early at {i}");
+            assert!(
+                !ring.should_flip(ring.decoded_bytes()),
+                "armed too early at {i}"
+            );
         }
         ring.push_literal(0xAB);
-        assert!(ring.should_flip(), "must arm at exactly 32 KiB all-clean");
+        assert!(
+            ring.should_flip(ring.decoded_bytes()),
+            "must arm at exactly 32 KiB all-clean"
+        );
     }
 
     #[test]
@@ -595,10 +685,16 @@ mod tests {
             if ring.pos - ring.drained > 16 * 1024 {
                 ring.drain_u16(&mut sink16).unwrap();
             }
-            assert!(!ring.should_flip(), "armed too early at {i}");
+            assert!(
+                !ring.should_flip(ring.decoded_bytes()),
+                "armed too early at {i}"
+            );
         }
         ring.push_literal(0xCD);
-        assert!(ring.should_flip(), "must arm after 64 Ki consecutive clean");
+        assert!(
+            ring.should_flip(ring.decoded_bytes()),
+            "must arm after 64 Ki consecutive clean"
+        );
     }
 
     #[test]
@@ -612,9 +708,9 @@ mod tests {
                 ring.drain_u16(&mut sink16).unwrap();
             }
         }
-        assert!(ring.should_flip());
-        let mut seam = Vec::new();
-        ring.flip_in_place(&mut seam);
+        assert!(ring.should_flip(ring.decoded_bytes()));
+        let seam_len = ring.flip_in_place(ring.decoded_bytes());
+        let seam: Vec<u8> = ring.flipped_seam(seam_len).to_vec();
         assert_eq!(ring.width(), RingWidth::Clean);
         assert_eq!(ring.pos, U8_RING_SIZE);
         assert_eq!(ring.drained, U8_RING_SIZE);
