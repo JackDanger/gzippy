@@ -1,3 +1,17 @@
+## ENGINE M4 MERGED (advisor-SOUND) — DIV-1 COMPLETE: gzippy-native is a ONE-ENGINE decoder [2026-06-10]
+until-exact on Block (labeled no-C-FFI deviation; contract proven file:line incl. the corrected
+footer observable; member-final byte-aligned convention explicit + tested — the BFINAL scar paid
+forward). 80/80 grid, multi-member exact, suites green, masked perf -0.7..-2.5% (faster).
+unified::Inflate now off EVERY native production decode arm. Gate notes: deletion trap's negative
+assertion backed by exact_route_defaults_to_block; optional hardening = short/mid-block error-
+coordinate nets. Pre-existing cleanup item CONFIRMED unrelated: tests/lib_api.rs
+classify_single_member_t1 lacks IsalSingleShot in its accepted set (fails on isal build since
+0e57d8d9) — fix in M5.
+LEDGER: DIV-1 CLOSED. Remaining: M5 (delete dead engines/graph: unified::Inflate native arm,
+legacy MarkerRing, canonical loops, drain_clean_u8 DIV-3/DIV-6 + the lib_api test fix), M6
+(masked+frozen engine-cell A/B vs the official baseline), then P3 (symbol-rate arsenal on the
+ONE engine: multi-literal, BMI2, prefetch, asm — the native T1 0.609 / model 0.577 cells).
+Guest staged: /root/bin-m4-{native ae0586ea, isal 3d181b38}.
 ## ENGINE M3 MERGED (advisor-SOUND) — DIV-1 part 1: seeded chunks on the ONE engine [2026-06-10]
 gzippy-native seeded-inexact decodes on Block (16/16 at T1 silesia); unified::Inflate off that
 path; empty-seed vendor semantics adopted; 80/80 sha grid; suites 921/928 zero fails; wall TIE
