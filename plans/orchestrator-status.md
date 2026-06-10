@@ -1,3 +1,14 @@
+## RATIO-RESERVE BANKED (frozen, 59573be9 = /root/bin-head-isal da52c5d1): EVERY cell lifted; silesia T8 PASSES bar [2026-06-09 late night]
+Frozen 3-way N=9 sha-verified: model T8 0.684->0.846 (+16pp); silesia T4 0.851->0.906; T16 0.915->0.939;
+T8 0.949->0.993 PASS(>=0.99); bignasa T8 ~0.90 (19%/12% spread, TIE band). The ratio-informed initial
+helps EVERY corpus (allocation pressure was corpus-general, worst on near-incompressible).
+DAY TRAJECTORY (isal, frozen): silesia T1 0.90->1.19 WIN | T4 0.874->0.906 | T8 ->0.993 PASS | T16
+0.914->0.939 | nasa T1 0.57->1.57 WIN | bignasa T8 0.79->0.90 | model T8 0.658->0.846.
+STILL BELOW BAR: model 0.846, silesia T4 0.906, T16 0.939, bignasa ~0.90.
+NEXT-LEVER CANDIDATE (unverified): "Buffer pool u8: hits=0 misses=0" on the clean-tail path — the
+chunk output Vecs are NOT pooled (fresh alloc per chunk); rg reuses. Diagnose the pool wiring gap.
+Guest binaries: PRODUCTION=/root/bin-head-isal (59573be9); /root/bin-post (65dbcff9) = prior;
+bin-ld-*/bin-ratio deleted; /root/gzippy-head = source@HEAD (no target).
 ## MODEL-CELL MECHANISM FOUND: 8x UPFRONT RESERVE under 8-way concurrency (env-knob falsifier +41% wall) [2026-06-09 night]
 Probe ladder exonerated FFI (~400MB/s all stop-configs), oracle accounting (~350MB/s full path
 single-threaded), bootstrap (1.4ms/chunk). The 132MB/s/worker collapse appears ONLY concurrent =>
