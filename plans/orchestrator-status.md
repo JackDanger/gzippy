@@ -1,3 +1,14 @@
+## SMT PLACEMENT IS THE RESIDUAL — and a PIPELINE PLACEMENT LEVER FOUND [2026-06-10]
+Placement probe (bare FFI, 8 spans, masks): A(0-15 free)=2189 agg w/ EXACTLY 2 slow threads/run
+(SMT co-schedule roulette); B(one/physical core)=2766 agg (357/worker — ABOVE rg's 1989-2102);
+C(forced SMT pairs)=-27%/thread; D(4 phys)=B/2 exactly => COMPUTE/PORT-bound, NOT DRAM/L3.
+PIPELINE under same masks: gzippy A=1006-1216 -> B=1527-1555 MB/s (+30-50%!) while rg A=1989 ~=
+B=1944 — rg's runtime achieves near-1/core spread under the same scheduler; gzippy's doesn't
+(8 workers + consumer + post threads co-land on SMT siblings). REMAINING pipeline-vs-rg gap at
+B-pinning ~22% (1527 vs 1944) = the true pipeline overhead, now isolated from engine+SMT+alloc.
+LEVER QUEUED: GZIPPY_PIN_WORKERS knob — round-robin workers onto distinct physical cores within
+the allowed mask; frozen A/B; if cells jump, advisor-gate default-ON policy (heterogeneous-CPU
+care: E-cores excluded here; production default needs topology detection).
 ## PER-WORKER RETENTION MERGED, DEFAULT ON (81690afb, advisor-SOUND) [2026-06-10]
 The mid-T allocation lever landed: lock-free one-slot-per-worker huge-block retention + 4MiB
 MADV_DONTNEED trim budget (VMA kept, residency capped — the trick that passes BOTH wall and RSS
