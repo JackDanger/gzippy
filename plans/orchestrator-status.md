@@ -1,3 +1,13 @@
+## ENGINE P1 MERGED — the rewrite target is the GRAPH, not the loop [2026-06-10]
+P1 (engine/u8-arch-p1 -> merged): first-hand vendor audit found the u8-flip-in-place INTERNALS
+already converged since 2026-06-07 (Block flips u16->u8 in place, clean bulk u8-direct, storage
+mirrors vendor). The funded rewrite's real targets (plans/engine-u8-map.md): DIV-1 native's SECOND
+clean engine (unified::Inflate on seeded/until-exact paths; vendor seeds the SAME Block —
+GzipChunk.hpp:456-458) — M-plan deletes it from the native graph; DIV-3 dead alternate engines;
+DIV-4 seam temp copy; DIV-5 vendor stored-block early-flip cases. DIV-2 contig-direct KEPT
+(meets-or-beats, one store pass vs vendor two). Design: plans/engine-u8-design.md (M1-M6, each
+byte-exact-gated + kill-switched); WidthRing skeleton 12/12 tests, unwired. NEXT: gate the design,
+then M1/M2 execution; P2 masked A/B on native T1/T4/T8 (the engine cells).
 ## USER DECISION: NATIVE ENGINE REWRITE FUNDED + N=21 close-band resolution [2026-06-10]
 THE GATE IS RESOLVED (user): fund the native rewrite. Charter: plans/engine-campaign.md (u8-faithful
 arch first per banked memories; asm arsenal after; rg decode-all-then-apply shape to evaluate).
