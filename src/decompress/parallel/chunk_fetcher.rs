@@ -975,6 +975,10 @@ fn drive_impl<W: std::io::Write>(
             SPEC_FAIL_STOP_MISSED.load(Ordering::Relaxed),
             SPEC_FAIL_OTHER.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  Speculation phantom-EOS rejects: {}",
+            SPECULATIVE_PHANTOM_EOS_REJECTS.load(Ordering::Relaxed),
+        );
         // Post-process path mix: tells us if the AVX2 narrow re-enable
         // is bench-relevant for this fixture. Small-markers path is the
         // only one that calls `narrow_u16_to_u8`.
@@ -3138,6 +3142,21 @@ pub static SPEC_FAIL_INFLATE: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub static SPEC_FAIL_STOP_MISSED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static SPEC_FAIL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Counter: speculative candidates rejected because the DEFLATE stream ended at a
+/// BFINAL block mid-input and the bytes after the gzip footer (8 bytes: CRC32 + ISIZE)
+/// are not EOF and do not start with valid gzip magic (0x1f 0x8b).
+///
+/// Vendor equivalent: after `block->isLastBlock()` in `decodeChunkWithRapidgzip`,
+/// the code reads the gzip footer (GzipChunk.hpp:626-627), sets `isAtStreamEnd=true`
+/// (GzipChunk.hpp:645), and on the next loop iteration calls `gzip::readHeader` at
+/// GzipChunk.hpp:481. A non-EOF header-read error throws `std::domain_error`
+/// (GzipChunk.hpp:491-498), which `tryToDecode`'s catch (GzipChunk.hpp:728-732)
+/// turns into a `std::nullopt` — the candidate is silently discarded and the next
+/// candidate is tried. `SPECULATIVE_PHANTOM_EOS_REJECTS` counts the gzippy-side
+/// equivalent rejections, observable in `GZIPPY_VERBOSE` output.
+#[cfg(parallel_sm)]
+pub static SPECULATIVE_PHANTOM_EOS_REJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Early-window-publish telemetry (run_decode_task). PUBLISHED: worker
 /// published a provably-clean 32 KiB tail at chunk_end_bit, off the
@@ -3561,6 +3580,49 @@ fn try_speculative_decode_candidate(
         decode_start
     );
     let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+
+    // Vendor GzipChunk.hpp:470-499 + tryToDecode catch GzipChunk.hpp:728-732:
+    // after the BFINAL block `decodeChunkWithRapidgzip` reads the gzip footer
+    // (GzipChunk.hpp:626-627 `gzip::readFooter`), sets `isAtStreamEnd=true`
+    // (GzipChunk.hpp:645), and on the next iteration tries `gzip::readHeader`
+    // (GzipChunk.hpp:481). A non-EOF failure throws `std::domain_error`
+    // (GzipChunk.hpp:491-498), which the `tryToDecode` catch at
+    // GzipChunk.hpp:728-732 catches and returns `std::nullopt` — the candidate
+    // is discarded. We replicate that rejection here: if the chunk ended early
+    // (BFINAL before stop_hint_bit) and the bytes immediately after the 8-byte
+    // gzip footer are neither EOF nor valid gzip magic (0x1f 0x8b), reject.
+    // The check is SPECULATIVE PATH ONLY — confirmed/window-seeded paths do not
+    // call this function.
+    if encoded_end < stop_hint_bit {
+        // Byte-align: deflate pads to a byte boundary before the gzip footer.
+        let end_byte = (encoded_end + 7) / 8;
+        // Gzip footer is 8 bytes (CRC32 LE + ISIZE LE, RFC 1952 §2.3.1).
+        let footer_end = end_byte.saturating_add(8);
+        if footer_end + 2 <= input.len() {
+            // At least 2 bytes after the footer — check for valid gzip magic,
+            // and when a 3rd byte is in-bounds also require CM=8 (deflate),
+            // matching vendor readHeader more closely (advisor hardening:
+            // cuts magic false-accept odds 256x; false-accept only reverts
+            // to the pre-fix consume-time discard, so this is perf-only).
+            let looks_like_gzip = input[footer_end] == 0x1f
+                && input[footer_end + 1] == 0x8b
+                && input.get(footer_end + 2).is_none_or(|&cm| cm == 0x08);
+            if !looks_like_gzip {
+                SPECULATIVE_PHANTOM_EOS_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "phantom EOS at bit {encoded_end} (< stop_hint {stop_hint_bit}): \
+                         post-footer bytes are not gzip magic \
+                         (vendor GzipChunk.hpp:481,491-498,728-732)"
+                    ),
+                )));
+            }
+            // Bytes are 0x1f 0x8b: genuine multi-member stream — accept.
+        }
+        // footer_end + 2 > input.len(): near EOF, legitimate stream end — accept.
+    }
+
     let first_sc_upper = chunk
         .subchunks
         .get(1)
@@ -3574,6 +3636,28 @@ fn try_speculative_decode_candidate(
         first_sc.encoded_size_bits = first_sc_upper - partition_seed;
     }
     Ok(chunk)
+}
+
+/// Test-only re-export of `try_speculative_decode_candidate` so that
+/// `src/tests/phantom_eos_probe.rs` can call the speculative path directly.
+/// Not a public API — compiled only in `#[cfg(test)]` builds.
+#[cfg(all(parallel_sm, test))]
+pub(crate) fn try_speculative_decode_candidate_test_hook(
+    input: &[u8],
+    decode_start: usize,
+    partition_seed: usize,
+    stop_hint_bit: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let wm = WindowMap::new();
+    try_speculative_decode_candidate(
+        input,
+        decode_start,
+        partition_seed,
+        stop_hint_bit,
+        configuration,
+        &wm,
+    )
 }
 
 #[cfg(parallel_sm)]
