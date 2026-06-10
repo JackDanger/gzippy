@@ -1,3 +1,21 @@
+## LONE-DRAIN LEVER: FALSIFIED + REVERTED (wrong bytes at silesia T4; wall TIE everywhere it ran) [2026-06-09 night, SUPERVISOR]
+The pair-drain-gate removal + trailing-subchunk END-window change (0f0f9fb6, advisor-gated SOUND,
+899/899 native box tests, bignasa 9/9 byte-exact T2/4/8) produced DETERMINISTIC WRONG BYTES on
+silesia T4 (CRC32 mismatch f9acf2fe!=a49e7187, exit 1, all 9 iterations) -> REVERTED (6e015b44).
+TWO lessons banked:
+1. CORRECTNESS: the interior-subchunk window semantics (window-at-START stored per subchunk) are
+   load-bearing somewhere the gate's 7-surface analysis + the whole test suite missed; silesia@T4
+   (multi-subchunk chunks at low T) is the discriminating shape. NO test covers it — OWED: a
+   silesia-shaped multi-subchunk low-T byte-exact gate before any retry of this lever.
+2. WALL: even where POST ran byte-exact, NO win materialized (model T8 gz1/gz2=0.994 TIE; native
+   model 1.004 TIE; silesia T16 0.986; bignasa T8 0.970 slight-regress-in-noise). The model-trace
+   "pair-drain gaps ~377ms" attribution did NOT convert at the wall — Rule 3 strikes again
+   (attribution != verdict; the gaps overlap other critical-path work). Lever = DEAD unless a
+   future trace shows otherwise on a corpus where it converts.
+GUEST STATE: /root/bin-ld-isal + /root/bin-ld-native are the BROKEN 0f0f9fb6 binaries — DO NOT
+measure with them; safe production binaries remain /root/bin-post (isal 65dbcff9 ba788312) and
+/root/bin-native-post (03072e73 ff4615dd). Native-suite-on-box workflow validated (avx2 test
+passes natively; 92s suite) — keep using it.
 ## MODEL-T8 DECOMPOSITION (post-phantom-fix) — not engine-W-full-stop either [2026-06-09 late, SUPERVISOR]
 model T8 (isal-POST 0.677x): traced wall 827ms (untraced median 733; rg 410). Speculation CLEAN (48-50
 accepts, 0 mismatches; phantom fix fires 1x). The gap: (a) TWO slow-decode outliers (277/294ms vs p50
