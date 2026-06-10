@@ -1,3 +1,11 @@
+## USER DECISION: NATIVE ENGINE REWRITE FUNDED + N=21 close-band resolution [2026-06-10]
+THE GATE IS RESOLVED (user): fund the native rewrite. Charter: plans/engine-campaign.md (u8-faithful
+arch first per banked memories; asm arsenal after; rg decode-all-then-apply shape to evaluate).
+N=21 frozen resolution: nasa T4 RESOLVED-PASS both builds (med/med 0.9998!); bignasa T8
+RESOLVED-FAIL 0.951 both; silesia T16 RESOLVED-FAIL 0.861-0.863 — BUT native tied rg in 1/21 runs
+(0.3165 vs 0.3148: the fast state EXISTS; scheduling reaches it 5% — the silesia-T16 lever is a
+SCHEDULING-STATE question, not raw rate). rg distributions: bimodal on nasa T4 + silesia T16,
+4-level quantized on bignasa (anomalies banked verbatim in the worker report).
 ## OFFICIAL BAR MATRIX @ b8e4fe58 (frozen, canonical, sha-verified; bins 247a6087/d288ef9c on guest as bin-bar-*) [2026-06-10]
 | cell | rg/isal | rg/native | verdicts |
 |---|---|---|---|
