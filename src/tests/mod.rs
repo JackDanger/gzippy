@@ -20,6 +20,7 @@ pub mod inflate_fuzz_loop;
 pub mod inflate_oracle;
 pub mod inflate_proptest;
 pub mod isal_stored_fixed_probe;
+pub mod phantom_eos_probe;
 pub mod pure_rust_inflate_corpus;
 pub mod resumable_correctness;
 pub mod routing;
