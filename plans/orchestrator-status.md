@@ -1,3 +1,20 @@
+## MASKED PIPELINE DECOMPOSITION — the residual gap has TWO NAMED OWNERS [2026-06-10]
+Masked (0,2,..,14) traced decomposition, bin-head-isal vs rg, model+silesia T8 (gz:rg 1.23x/1.09x
+best-of-3): serial output NEGLIGIBLE (<0.1ms delta); the gap = (a) per-worker decode rate (~37ms/
+worker on model: gz's bootstrap block_body 51-361ms + scan_candidate excess vs rg=0 block_body —
+rg NEVER runs a flip-to-clean bootstrap loop: it marker-decodes the chunk then ONE cache-friendly
+u8 LUT apply pass over the WHOLE output (rg apply SUM 964ms model/4320ms silesia, 38-100x ours,
+parallel + cheap/byte, NOT its bottleneck)); (b) scheduling waste ~12ms (gz pool fill 79-87% vs
+rg ~91%). TWO STRUCTURAL DIVERGENCES NAMED:
+1. SCAN NOT OVERLAPPED: worker.scan_candidate is WALL-CRITICAL in gz (120ms model / 82ms silesia;
+   consumer blocks on the block-finder scan) vs rg 0/27ms — rg overlaps scan with decode.
+2. KEY-MISMATCH (the old confirmed-offset-prefetch-gap memory, caught in the act): 94-98% of
+   chunks decode window-ABSENT with ZERO timing causes — the speculative prefetch looks up the
+   PARTITION-SEED key while predecessors publish windows at BOUNDARY keys. Re-keying/re-issuing
+   prefetches at confirmed offsets would convert marker-bootstrap chunks into window-SEEDED clean
+   (ISA-L whole-chunk) decodes — the single highest-leverage faithful-port convergence remaining.
+NEXT SESSION: implement (2) first (chunk_fetcher prefetch re-key at confirmed offsets, vendor
+GzipChunkFetcher prefetch semantics), then (1); all A/Bs MASKED + canonical spine.
 ## PER-WORKER RETENTION REVERTED — canonical-mask regression + broken kill-switch [2026-06-10]
 Under the spine mask (taskset 0,2,..,14) model T8: bin-head-isal (pre-retention) 0.17-0.18s/285MB;
 retention build 0.24-0.25s/380MB (-29% wall, +90MB RSS); GZIPPY_PW_RETAIN=0 changes NOTHING (wall
