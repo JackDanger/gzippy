@@ -1145,6 +1145,16 @@ fn drive_impl<W: std::io::Write>(
 
 // ── Consumer: processNextChunk port ──────────────────────────────────────
 
+/// Kill-switch for the cache-hit-path prefetch drive (vendor
+/// BlockFetcher.hpp:297-299 parity). `GZIPPY_NO_HIT_DRIVE=1` reverts to
+/// the pre-fix cadence (drive on miss + blocked-pump only) so the drive
+/// can be A/B'd within a single binary (constant code layout). Read once.
+#[cfg(parallel_sm)]
+fn hit_drive_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("GZIPPY_NO_HIT_DRIVE").is_some_and(|v| v == "1"))
+}
+
 /// Vendor-faithful port of `GzipChunkFetcher::processNextChunk`
 /// (vendor/.../GzipChunkFetcher.hpp:311-362), wrapped in a `loop` that
 /// plays the role of `ParallelGzipReader::read`'s outer loop
@@ -1511,7 +1521,13 @@ fn consumer_loop<W: std::io::Write>(
                 // precedes the dispatch drive (vendor BlockFetcher.hpp:276
                 // before :297), so the head-of-line task cannot queue behind
                 // fresh prefetches.
-                if should_drive_prefetch {
+                // Kill-switch (A/B discriminator): GZIPPY_NO_HIT_DRIVE=1
+                // disables ONLY this hit-path drive, reverting to the prior
+                // miss-only/blocked-pump cadence. Verifiable: with the switch
+                // set, the consumer.drive_prefetch_on_hit span count is 0 and
+                // the unfrozen model-T8 Fetched-On-demand counter reverts to
+                // its pre-fix value (~5).
+                if should_drive_prefetch && !hit_drive_disabled() {
                     let _tv2 = trace_v2::SpanGuard::begin("consumer.drive_prefetch_on_hit");
                     block_fetcher.prefetch_new_blocks(
                         &lookup_block_offset,
