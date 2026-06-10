@@ -328,9 +328,9 @@ stats() { # echoes "min med spreadpct"
     { v[NR]=$1 } END {
       n=NR; if(n==0){print "0 0 0"; exit}
       min=v[1]; max=v[n]; mid=(n%2)?v[(n+1)/2]:(v[n/2]+v[n/2+1])/2;
-      printf "%.4f %.4f %.0f", min, mid, (min>0)?(max-min)/min*100:0 }'
+      printf "%.4f %.4f %.0f\n", min, mid, (min>0)?(max-min)/min*100:0 }'
 }
-mbps() { awk -v r="$RAW_BYTES" -v t="$1" 'BEGIN{printf "%.0f", (t>0)?r/t/1e6:0}'; }
+mbps() { awk -v r="$RAW_BYTES" -v t="$1" 'BEGIN{printf "%.0f\n", (t>0)?r/t/1e6:0}'; }
 
 read gmin gmed gsp < <(stats "$GZT")
 read rmin rmed rsp < <(stats "$RGT")
