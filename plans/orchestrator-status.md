@@ -1,3 +1,18 @@
+## ALLOCATION-CLASS FORK RESOLVED: (c) DEAD, (a) DEAD, (b) survives [2026-06-10]
+(c) rpmalloc config: DEAD with mechanism — huge-class (>3.94MiB) frees call _rpmalloc_unmap
+UNCONDITIONALLY (rpmalloc.c:2470-2491); no cache feature reaches them (unlimited_cache A/B: TIE,
+pgfaults 140K==140K); rpmalloc-sys 0.2.3 comments out rpmalloc_initialize_config (span size locked).
+(a) segment SegmentedU8: DEAD — 3 LOAD-BEARING-HARD consumers (ISA-L FFI contiguous sink;
+decoded_range &[u8] borrows; contig_decode_window raw-ptr backref decode), PLUS the prior measured
+loss (segmented clean = 3.26x dTLB-walks / 1.42x cycles, recorded in segmented_buffer.rs:1-30),
+PLUS vendor stores CLEAN data contiguously (DecodedData.hpp:278-281) — the 128KiB ALLOCATION_CHUNK
+segments are the marker-path/append granularity, not the clean store. Full constraint table in the
+2026-06-10 worker report.
+(b) PER-WORKER BOUNDED REUSE: the survivor. Existence proof = GZIPPY_SLAB_ALLOC (-72% pgfaults,
++13% model-T8 wall; cost +20% RSS from PROCESS-wide retention). Design next session: retain ~1
+buffer per worker sized to its last chunk (caps added RSS at ~the live working set), lock-free
+cross-thread return (consumer frees → owner worker reclaims), or recycle via the existing
+defer_chunk_recycle seam with the slab's size-keyed lookup. Frozen verification owed on land.
 ## SLAB RETENTION POLICY: implemented, default stays OFF (RSS criterion) [2026-06-10 early]
 Branch perf/slab-retention-policy @ a1ecc834 (UNMERGED, worktree /tmp/gz-slab): bytes-budget
 largest-first eviction (GZIPPY_SLAB_BUDGET_MIB, default 64MiB free-list cap vs old possible 576MiB),
