@@ -136,3 +136,32 @@ and gzippy already mirrors that layering.**
 3. Whether the canonical (non-LUT) loop retains any caller after M5 (vendor has no such
    fallback; gzippy keeps it for non-x86 unit tests — decide whether aarch64 production uses
    the LUT path unconditionally).
+
+---
+
+## GATE AMENDMENTS (2026-06-10, Opus disproof gate — BINDING on M2+)
+
+Verdict: SOUND-WITH-CHANGES. Headline + all 6 divergences verified first-hand
+(flip/arming byte-identical to vendor; DIV-1 confirmed on the full-file hot path:
+every window-resolved chunk takes the second engine via chunk_fetcher.rs:2564;
+applyWindow-is-marker-only RECONCILES the 964/4320ms trace — on silesia the
+marker region ≈ the whole chunk, which is WHY the lever is marker-loop symbol
+rate, not a shape change).
+
+1. **M2 SPLIT (required):** DIV-5 (vendor stored-block early-flip, three cases,
+   deflate.hpp:1212-1256) is a BEHAVIOR change, not a mechanical refactor — it
+   moves OUT of the M2 WidthRing-member migration into its own kill-switched,
+   byte-exact-gated step (new M2b), so a stored-block regression cannot hide
+   inside the migration commit.
+2. **M4 RELABEL + CONTRACT (required before M4):** vendor's exact-stop path is
+   decodeChunkWithInflateWrapper<Zlib/IsalInflateWrapper> (GzipChunk.hpp:192-265)
+   — a C-FFI wrapper, NOT Block. Block-with-exact-stop is a DEVIATION justified
+   solely by gzippy-native's no-C-FFI charter; label it so. Pre-registered
+   contract Block must replicate from unified::Inflate (finish_decode_chunk_impl:
+   890-1062): stopping-point reactions (END_OF_BLOCK / END_OF_STREAM_HEADER),
+   the exact final_bit != stop_hint_bits => error assertion (gzip_chunk.rs:1062),
+   footer/multi-stream (read_footer_at_current / reset_for_next_stream), and
+   block-boundary recording (take_block_boundaries).
+3. **§3 note (non-blocking, adopted):** vendor applyWindow iterates ONLY
+   dataWithMarkers; the "marker prefix" is corpus-dependent and ≈100% of output
+   on silesia-class corpora.
