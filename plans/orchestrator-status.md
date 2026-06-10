@@ -1,3 +1,20 @@
+## OFFICIAL BAR MATRIX @ b8e4fe58 (frozen, canonical, sha-verified; bins 247a6087/d288ef9c on guest as bin-bar-*) [2026-06-10]
+| cell | rg/isal | rg/native | verdicts |
+|---|---|---|---|
+| silesia T1 | 1.199 | 0.609 | isal PASS / native FAIL(engine, user-gated) |
+| silesia T4 | 0.906 | 0.790 | FAIL / FAIL |
+| silesia T8 | 1.013 | 0.952 | isal PASS / native FAIL |
+| silesia T16 | 0.924 | 0.981 | FAIL / FAIL(close) |
+| model T8 | 0.870 | 0.577 | FAIL / FAIL |
+| model T16 | 0.864 | 0.588 | FAIL / FAIL |
+| bignasa T8 | 0.958 | 0.967 | FAIL(close) / FAIL(close) |
+| nasa T4 | 0.971 | 0.935 | FAIL(close) / FAIL |
+| nasa T16 | 1.127 | 1.142 | PASS / PASS — native's FIRST bar passes |
+| ghcn T8 | 1.017 | 1.036 | PASS / PASS |
+isal 4/10 PASS, native 2/10 (first ever). Hit-drive merged; suite 899/1-infra. The close-to-bar
+band (0.92-0.97: bignasa, nasa T4, silesia T16, native silesia T16) suggests remaining shared
+structure; the deep fails are model (engine shape) + low-T (T4) + native-T1 (engine, user-gated).
+Superseded guest bins cleaned; production = /root/bin-bar-isal + /root/bin-bar-native.
 ## SUPERVISOR CORRECTION to the KEY-MISMATCH framing — DIS-19 tension [2026-06-10, IMPORTANT]
 The previous entry's "fix (2): re-key prefetches => window-SEEDED clean decodes" is PROBABLY A
 PHANTOM and must NOT be implemented as framed: banked DIS-19 says rapidgzip marker-decodes the
