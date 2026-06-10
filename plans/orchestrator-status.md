@@ -1,3 +1,14 @@
+## ENGINE M5 MERGED (advisor-SOUND) — the dead graph is gone; structural phase COMPLETE [2026-06-10]
+-1778 LOC: MarkerRing engine+fork, canonical family (dead-by-cfg proven), DIV-6 helper, orphans.
+DIV LEDGER FINAL: DIV-1 closed (M3+M4), DIV-2 kept-by-design, DIV-3 closed (M5), DIV-4 closed
+(M2), DIV-5 closed (M2b), DIV-6 closed (M5). gzippy-native = ONE Block engine, vendor-shaped,
+40/40 sha, wall-neutral-to-slightly-faster through the whole arc. lib_api T1 test gap fixed.
+Cleanup item (pre-existing): benches/{bootstrap_marker_overhead,inflate_block}.rs import the old
+deflate_block::Block path — cargo bench broken independent of M5; fix in passing next session.
+NEXT: M6 — the engine-cell measurement (masked + FROZEN canonical 3-way at the official baselines:
+native silesia T1 0.609 / T4 0.790 / model 0.577 vs /root/bin-bar-native d288ef9c + rg), then P3:
+the symbol-rate arsenal on the ONE engine (multi-literal, BMI2 dispatch, prefetch, asm — CLAUDE.md
+authorizes full reimplementation; prior falsifications non-binding). Guest staged: bin-m5-{native,isal}.
 ## ENGINE M4 MERGED (advisor-SOUND) — DIV-1 COMPLETE: gzippy-native is a ONE-ENGINE decoder [2026-06-10]
 until-exact on Block (labeled no-C-FFI deviation; contract proven file:line incl. the corrected
 footer observable; member-final byte-aligned convention explicit + tested — the BFINAL scar paid
