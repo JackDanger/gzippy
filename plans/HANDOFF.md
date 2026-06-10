@@ -1,3 +1,55 @@
+# ⚡ 2026-06-09 SESSION UPDATE (supersedes §2-§4 below where they conflict)
+
+HEAD d04f24fd (pushed; origin current). PRODUCTION GUEST BINARY /root/bin-head-isal (59573be9, da52c5d1).
+
+## MERGED TODAY (all advisor-gated, frozen-box-verified, sha-exact):
+1. T1 single-shot route (silesia T1 0.90 -> 1.19 WIN).
+2. >8x growable storm fix (nasa T1 0.57 -> 1.57 WIN; threshold-8x storm gone).
+3. JOB-2 writable_tail_reserve fix; BFINAL until_exact exact-landing fix (fallbacks 0).
+4. Phantom-EOS speculative rejection + dynamic-only finder (bignasa T8 0.79->0.92, T16 0.82->0.96;
+   native bignasa T8 0.70->0.89; vendor tryToDecode parity).
+5. Ratio-informed initial reserve (model T8 0.66->0.846; lifts EVERY cell; DIS-14/17 footprint
+   mechanism CAUSALLY closed: 8x over-reserve under 8-way concurrency was crushing per-worker
+   ISA-L 437->132 MB/s).
+
+## SCORECARD (gzippy-isal, frozen N=9, bar >=0.99 every T):
+silesia: T1 1.19 PASS | T4 0.906 | T8 0.993 PASS | T16 0.939
+nasa T1 1.57 PASS | bignasa T8 ~0.90 (19% spread) | model T8 0.846
+gzippy-native (one fix behind — pre-ratio): silesia T4 0.77 / T8 0.91; bignasa T8 0.894 / T16 0.909;
+model 0.556. NOTE: the ratio fix is ISAL-CFG-ONLY (finish_decode_chunk_isal_oracle) — native's fold
+path reserve was NOT changed; check whether native has an analogous over-reserve (likely lever).
+
+## DEAD/FALSIFIED TODAY (mechanisms, do not re-chase):
+- DIS-29's "ISA-L ret=-1/-2 seeding bug": never existed (BFINAL coordinate decline; fixed).
+- "symbol 286/287 LUT bug": probe artifact (count[8]-=2 IS ISA-L's own igzip_inflate.c:322).
+- Serialized apply_window: it's 6-way parallel (fulcrum flat-SELF = cross-thread sum).
+- ISA-L per-EOB stopping-point cost: ~0 (probe: 128-stop == 2-stop == 437MB/s single-thread).
+- Pair-drain/lone-Ready gate removal: WRONG BYTES at silesia T4 (reverted 6e015b44) AND wall-TIE
+  where correct. The latent stale-trailing-subchunk-window bug it exposed is REAL but un-landed —
+  see branch fix/lone-ready-drain (2b73454f) + the silesia-T4-shape coverage gap (no test catches it).
+
+## NEXT-LEVER QUEUE (in order):
+1. Native build: port the ratio-informed reserve idea to the native fold path (or verify N/A) +
+   re-baseline native on the new HEAD (it lacks today's last fix).
+2. model residual (0.846): allocator path — chunk Vecs go through arena-allocator (rpmalloc-sys,
+   vendor FasterVector-shaped, Cargo features rpmalloc-caches); "Buffer pool u8 hits=0" is EXPECTED
+   (manual pool off by design, GZIPPY_MANUAL_BUFFER_POOL=1 restores for A/B). Next probe: rpmalloc
+   cache-knob A/B + 8-thread concurrent oracle probe (1/4/8-thread scaling of the isolated full
+   oracle) to size remaining concurrency tax vs rg's 263MB/s/worker.
+3. bignasa T8 high spread (12-19%) — needs more N or a bigger fixed corpus to resolve vs the bar.
+4. silesia T4 0.906 residual + T16 0.939: low-T lifecycle + SMT region; OPEN-1 oracle still owed.
+5. Squishy coverage: corpora used today (nasa/bignasa/model) were hand-derived; pull the canonical
+   squishy set (https://squishy.jackdanger.com) for the bar matrix.
+6. The 3-way parity runner (--bin2) + stats() printf fix are UNCOMMITTED in scripts/bench/ — commit
+   them (measurement-only) so workers stop re-deriving.
+
+## PROCESS NOTES THAT PAID TODAY: workers = Sonnet w/ precise pre-figured briefs (Fable for complex,
+user-gated); suites run NATIVELY on LXC 199 (Rosetta lacks AVX2; local = smoke only); every
+consequential number gated; attribution NEVER trusted without a causal A/B (two attributions died
+today: pair-drain 377ms and stop-points); local /tmp + guest disk both run near-full — df first.
+
+---
+
 # gzippy decode campaign — HANDOFF (2026-06-09)
 
 Branch `reimplement-isa-l`, HEAD `d56cb0f5`. **GOTCHA: `d56cb0f5` is LOCAL-ONLY / UNPUSHED** —
