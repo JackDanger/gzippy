@@ -31,6 +31,16 @@ path reserve was NOT changed; check whether native has an analogous over-reserve
 ## NEXT-LEVER QUEUE (in order):
 1. Native build: port the ratio-informed reserve idea to the native fold path (or verify N/A) +
    re-baseline native on the new HEAD (it lacks today's last fix).
+2-PRE. MID-T DESIGN FORK (the sharpened mechanism, 2026-06-10): vendor allocates ALL decode output
+   in 128 KiB segments (DecodedData.hpp:241 / ChunkData.hpp:65 ALLOCATION_CHUNK_SIZE = 128_Ki) —
+   BELOW rpmalloc's ~3.94 MiB huge threshold, so every free stays in rpmalloc's per-thread span
+   cache and pages stay warm across chunks. gzippy allocates ONE contiguous multi-MB Vec per chunk
+   => rpmalloc huge class => munmap-on-free => 1.25M refaults => the 31% ChunkData tax. The
+   divergence is allocation CLASS, not pooling. Fork to decide fresh-context: (a) sub-threshold
+   segmentation inside SegmentedU8 (vendor-faithful; but contiguity is load-bearing for copy-free
+   FFI + writev — check what actually requires it); (b) per-worker contiguous-buffer reuse (keeps
+   contiguity; cross-thread return path must be lock-free); (c) rpmalloc-sys huge-threshold/span
+   config raise. Probes available: GZIPPY_SLAB_ALLOC (+10% model, RSS cost), manual pool (dead).
 2. model residual (0.846): allocator path — chunk Vecs go through arena-allocator (rpmalloc-sys,
    vendor FasterVector-shaped, Cargo features rpmalloc-caches); "Buffer pool u8 hits=0" is EXPECTED
    (manual pool off by design, GZIPPY_MANUAL_BUFFER_POOL=1 restores for A/B). Next probe: rpmalloc
