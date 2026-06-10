@@ -94,4 +94,6 @@ pub mod trace;
 pub mod trace_v2;
 #[cfg(parallel_sm)]
 pub mod used_window_symbols;
+#[cfg(parallel_sm)]
+pub mod width_ring;
 pub mod window_map;
