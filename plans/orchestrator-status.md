@@ -1,3 +1,14 @@
+## GLOBAL-BUDGET SLAB FALSIFIED AT EVERY BUDGET — fork (b) shape pinned [2026-06-10]
+Budget sweep B in {8,16,32}MiB (unfrozen grid, sha-verified): B8 passes RSS but is a NO-OP (one
+model chunk = 12-25MiB > budget => free-list never hits); B16/B32 bloat silesia RSS +24%/+15%.
+There is NO budget window between useful and bloated for a PROCESS-GLOBAL byte budget. Slab stays
+opt-in; no commit. => FORK (b) FINAL SHAPE: PER-WORKER retention of EXACTLY ONE huge block, sized
+to that worker's last chunk (retained == live working set => RSS-neutral BY CONSTRUCTION; cache
+hit rate == chunk cadence). Implementation seam: rpmalloc_alloc.rs slab keyed per-thread (or the
+defer_chunk_recycle/return path with thread-affine reclaim). FIRST task of next session: implement
++ frozen-verify (expected: the slab's +13% model / -72% pgfault class of win, zero RSS cost).
+Branch perf/slab-retention-policy (a1ecc834) remains unmerged (bytes-budget policy improvement,
+default-off) — merge alongside or fold into the per-worker change.
 ## ALLOCATION-CLASS FORK RESOLVED: (c) DEAD, (a) DEAD, (b) survives [2026-06-10]
 (c) rpmalloc config: DEAD with mechanism — huge-class (>3.94MiB) frees call _rpmalloc_unmap
 UNCONDITIONALLY (rpmalloc.c:2470-2491); no cache feature reaches them (unlimited_cache A/B: TIE,
