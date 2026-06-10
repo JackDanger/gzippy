@@ -43,6 +43,22 @@ path reserve was NOT changed; check whether native has an analogous over-reserve
 6. The 3-way parity runner (--bin2) + stats() printf fix are UNCOMMITTED in scripts/bench/ — commit
    them (measurement-only) so workers stop re-deriving.
 
+## SQUISHY CANONICAL MATRIX (2026-06-09 night, frozen, 60 cells, all sha-OK; gz1=bin-head-isal da52c5d1, gz2=bin-native-post ff4615dd)
+| corpus | T1 isal/native | T4 | T8 | T16 |
+|---|---|---|---|---|
+| small 10x | 4.54 P / 2.08 P | 2.90 P / 2.02 P | 2.88 P / 2.00 P | 2.60 P / 1.86 P |
+| nasa 9.9x | 1.64 P / 0.58 F | 0.945 F / 0.916 F | 0.903 F / 0.920 F | 1.05 P / 1.08 P |
+| ghcn 7.8x | 1.48 P / 0.64 F | 0.928 F / 0.934 F | 0.972 F / 0.990 F | 1.02 P / 1.00 P |
+| model 1.26x | 1.10 P / 0.63 F | 0.794 F / 0.522 F | 0.846 F / 0.556 F | 0.833 F / 0.574 F |
+| silesia 3.1x | 1.20 P / 0.60 F | 0.841 F / 0.759 F | 0.993 P / ~0.91 | 0.915-0.939 F / 0.974 F |
+THE REMAINING GAPS, sharply: (1) MID-T BAND T4-T8 on all large corpora, both builds (0.79-0.97) —
+the systematic residual; (2) model at any parallel T (isal 0.79-0.85, native 0.52-0.57); (3) native
+T1 universal FAIL (no single-shot by charter; needs the pure-Rust engine rate — the user-gated
+engine question); (4) flagged: nasa T8 1.04(DIS-28)->0.90 inversion, but that cell is 2-3 chunks
+(granularity junk per the earlier gate) — re-derive with bignasa-class size before trusting.
+T16 PASSES on compressible (nasa/ghcn) both builds. small PASSES everywhere (startup win).
+New runner: scripts/bench/_squishy_guest.sh.
+
 ## PROCESS NOTES THAT PAID TODAY: workers = Sonnet w/ precise pre-figured briefs (Fable for complex,
 user-gated); suites run NATIVELY on LXC 199 (Rosetta lacks AVX2; local = smoke only); every
 consequential number gated; attribution NEVER trusted without a causal A/B (two attributions died
