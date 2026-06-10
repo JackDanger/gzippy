@@ -268,6 +268,97 @@ pub(crate) fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
     }
 }
 
+// ── M2b (DIV-5): vendor stored-block special cases — counters + kill-switch ──
+//
+// Proof-of-path counters for the three vendor stored-block special cases
+// (deflate.hpp:1212-1256) plus the contig sibling of the clean bulk read.
+// Relaxed; test + GZIPPY_DEBUG observability only — never decode logic.
+
+/// Case 1: `uncompressedSize >= MAX_WINDOW_SIZE` ⇒ straight u8 read + flip
+/// (deflate.hpp:1214-1219).
+pub static STORED_FLIP_GE_WINDOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Case 2: markers + `distanceToLastMarkerByte + uncompressedSize >=
+/// MAX_WINDOW_SIZE` ⇒ downcast surviving prefix + read + flip
+/// (deflate.hpp:1220-1242).
+pub static STORED_FLIP_CROSSING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Case 3: already clean ⇒ bulk byte read into the u8 ring
+/// (deflate.hpp:1243-1255).
+pub static STORED_CLEAN_BULK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Contig sibling of case 3: bulk byte read straight into `chunk.data`
+/// (`decode_clean_stored_into_contig`).
+pub static STORED_CONTIG_BULK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only override for the kill-switch: -1 = follow the env var,
+/// 0 = force-enabled, 1 = force-disabled. Lets one test process exercise
+/// BOTH arms (the env-var read is `OnceLock`-cached). One relaxed load per
+/// stored BLOCK (not per byte) — negligible.
+pub(crate) static STORED_FLIP_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+/// M2b kill-switch: `GZIPPY_NO_STORED_FLIP=1` restores the exact pre-M2b
+/// stored-block behavior (per-byte decode, generic arming only) in both the
+/// ring path (`try_read_stored_special`) and the contig path
+/// (`decode_clean_stored_into_contig`'s bulk read).
+fn stored_flip_disabled() -> bool {
+    let ov = STORED_FLIP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov >= 0 {
+        return ov == 1;
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_NO_STORED_FLIP").is_ok_and(|v| v == "1"))
+}
+
+/// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
+/// new path active/inactive on a shipped binary without counters plumbing).
+fn stored_flip_debug_log(case: &str, n: usize) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok_and(|v| v == "1")) {
+        eprintln!("gzippy: stored-flip {case} uncompressed_size={n}");
+    }
+}
+
+/// Bulk byte read for stored-block payloads — the analog of vendor
+/// `BitReader::read(char*, size)` used by all three special cases
+/// (deflate.hpp:1219, :1241, :1253) and the same pattern as the existing
+/// stored fast path in `consume_first_decode::decode_stored`: drain whole
+/// already-buffered bytes from the bit buffer, then memcpy the remainder
+/// straight from the input slice. Requires byte alignment (guaranteed after
+/// `read_uncompressed_header`'s padding drain + 32-bit LEN/NLEN read).
+/// Returns the number of bytes written (== `dst.len()` when the caller's
+/// availability gate held).
+fn read_stored_bytes_aligned(bits: &mut Bits, dst: &mut [u8]) -> usize {
+    debug_assert_eq!(
+        bits.available() % 8,
+        0,
+        "stored payload must be byte-aligned"
+    );
+    let mut i = 0usize;
+    while i < dst.len() && bits.available() >= 8 {
+        dst[i] = (bits.peek() & 0xFF) as u8;
+        bits.consume(8);
+        i += 1;
+    }
+    let rest = (dst.len() - i).min(bits.data.len() - bits.pos);
+    if rest > 0 {
+        dst[i..i + rest].copy_from_slice(&bits.data[bits.pos..bits.pos + rest]);
+        bits.pos += rest;
+        // Moving `pos` past bytes that never went through the bit buffer
+        // invalidates the refill invariant (the fast refill keeps the next
+        // byte's bits ABOVE `bitsleft` in `bitbuf` and relies on re-OR-ing
+        // the SAME byte at `pos`); reset like `decode_stored` does
+        // (consume_first_decode.rs:1462-1464). The drain loop above already
+        // emptied every credited bit (aligned ⇒ available() hit 0), so
+        // nothing valid is discarded.
+        bits.bitbuf = 0;
+        bits.bitsleft = 0;
+    }
+    i + rest
+}
+
 /// Literal port of rapidgzip `deflate::Block` — production bootstrap session
 /// (vendor `decodeChunkWithRapidgzip`, GzipChunk.hpp:468-654). `MarkerRing`
 /// remains available via `GZIPPY_MARKER_RING=1` for A/B only.
@@ -1044,17 +1135,164 @@ impl Block {
         result
     }
 
+    /// M2b (DIV-5): vendor's three stored-block special cases in `Block::read`
+    /// (deflate.hpp:1212-1256), verified first-hand 2026-06-10:
+    ///
+    /// 1. `m_uncompressedSize >= MAX_WINDOW_SIZE` (:1214-1219), ANY width:
+    ///    `m_windowPosition = m_uncompressedSize`, read the whole payload
+    ///    straight into the u8 window at offset 0 — the >=32 KiB stored block
+    ///    supersedes the entire back-reference window, so markers are dropped
+    ///    (`m_containsMarkerBytes = false` at :1259) and the flip arms HERE,
+    ///    not after 64 Ki clean symbols of generic arming.
+    /// 2. markers present AND `m_distanceToLastMarkerByte +
+    ///    m_uncompressedSize >= MAX_WINDOW_SIZE` (:1220-1242): downcast the last
+    ///    `MAX_WINDOW_SIZE - uncompressedSize` clean u16 elements (vendor
+    ///    throws `logic_error` if a marker survives — impossible because the
+    ///    condition guarantees `remainingData.size() <=
+    ///    m_distanceToLastMarkerByte`), place them at u8 offset 0, read the
+    ///    payload after them, `m_windowPosition = MAX_WINDOW_SIZE`, flip.
+    ///    Only the NEW stored bytes are emitted (`lastBuffers(window, 32768,
+    ///    nBytesRead)` at :1263); the downcast prefix is prior output.
+    ///    Applies to `uncompressedSize == 0` too (sync-flush empty stored
+    ///    block after >=32 KiB of trailing clean ⇒ flip, zero bytes emitted).
+    /// 3. already clean (:1243-1255): bulk `bitReader.read` into the u8 ring
+    ///    via up-to-2 wraparound segments — vendor's "~400 MB/s → ~6 GB/s"
+    ///    speedup over per-byte `appendToWindow`. No arming change (already
+    ///    clean).
+    ///
+    /// All three consume the WHOLE payload (ignoring `nMaxToDecode`, exactly
+    /// as vendor does — vendor's only finite-`nMaxToDecode` caller of stored
+    /// blocks tolerates overshoot, and so does gzippy's
+    /// `used_window_symbols`), set `m_atEndOfBlock = true`, and return only
+    /// the new bytes. The fall-through (markers + `dist + size <
+    /// MAX_WINDOW_SIZE`) stays the per-byte u16 path with generic arming.
+    ///
+    /// DEVIATION (documented): vendor reads a PARTIAL payload at EOF and
+    /// still flips, returning `Error::EOF_UNCOMPRESSED` (:1269) — chunk-fatal
+    /// in vendor's driver. gzippy instead takes the special cases only when
+    /// the full payload is available and otherwise falls through to the
+    /// per-byte path, preserving the existing commit-then-`Err` resumable
+    /// truncation semantics byte-for-byte. Both arms reject the chunk on a
+    /// truncated stored block, so output is unaffected.
+    ///
+    /// KILL-SWITCH: `GZIPPY_NO_STORED_FLIP=1` restores the exact pre-M2b
+    /// behavior (per-byte path, generic arming only).
+    ///
+    /// Returns `Some(bytes_emitted)` when a special case ran.
+    fn try_read_stored_special(&mut self, bits: &mut Bits) -> Option<usize> {
+        use super::width_ring::RingWidth;
+
+        if stored_flip_disabled() {
+            return None;
+        }
+        let n = self.uncompressed_size;
+        // Whole bytes immediately readable: aligned bytes still in the bit
+        // buffer plus the unread remainder of the slice.
+        let avail = (bits.available() / 8) as usize + (bits.data.len() - bits.pos);
+        if avail < n {
+            return None; // truncated payload: keep the per-byte error path
+        }
+        if n >= MAX_WINDOW_SIZE {
+            // Case 1 (deflate.hpp:1214-1219). n <= 65535 < U8_RING_SIZE.
+            // SAFETY: ring8 valid for [0, U8_RING_SIZE); n < U8_RING_SIZE;
+            // `bits.data` and the ring never alias. Pointer derived
+            // immediately before use (no intervening safe ring access).
+            let ring8 = self.ring.window16.as_mut_ptr() as *mut u8;
+            let dst = unsafe { std::slice::from_raw_parts_mut(ring8, n) };
+            let got = read_stored_bytes_aligned(bits, dst);
+            debug_assert_eq!(got, n, "avail gate guaranteed the full payload");
+            self.ring.width = RingWidth::Clean;
+            // Vendor `m_windowPosition = m_uncompressedSize` over the u8 view
+            // (:1218); u8-logical re-base as in `WidthRing::flip_in_place`
+            // (U8_RING_SIZE ≡ physical 0 so `pos - distance` cannot
+            // underflow). Emit window = [drained, pos) = physical [0, n).
+            self.ring.pos = U8_RING_SIZE + n;
+            self.ring.drained = U8_RING_SIZE;
+            STORED_FLIP_GE_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stored_flip_debug_log("case1-ge-window", n);
+        } else if self.ring.is_marker() && self.ring.distance_to_last_marker + n >= MAX_WINDOW_SIZE
+        {
+            // Case 2 (deflate.hpp:1220-1242).
+            debug_assert!(self.ring.distance_to_last_marker <= self.decoded_bytes);
+            let rem = MAX_WINDOW_SIZE - n; // > 0 here (n < MAX_WINDOW_SIZE)
+                                           // Downcast the last `rem` u16 elements before the cursor through
+                                           // a scratch buffer FIRST (the u8 destination [0, rem) physically
+                                           // overlaps u16 source slots [0, rem/2)) — vendor's
+                                           // `remainingData` vector (:1226-1236), stack here like the
+                                           // flip's `conflatedBuffer`.
+            let mut scratch = [0u8; MAX_WINDOW_SIZE];
+            let pos_phys = self.ring.pos % RING_SIZE;
+            for (k, out) in scratch.iter_mut().take(rem).enumerate() {
+                let v = self.ring.window16[(pos_phys + RING_SIZE - rem + k) % RING_SIZE];
+                // Vendor throws logic_error on a surviving marker (:1229-1231);
+                // unreachable: rem <= distance_to_last_marker by the case
+                // condition, so the last `rem` elements are clean.
+                debug_assert!(v < 256, "marker {v:#x} in stored-flip prefix");
+                *out = (v & 0xFF) as u8;
+            }
+            // SAFETY: as case 1; rem + n == MAX_WINDOW_SIZE < U8_RING_SIZE.
+            // Pointer derived AFTER the safe `window16` reads above (stacked-
+            // borrows: a safe access would invalidate an earlier raw borrow).
+            let ring8 = self.ring.window16.as_mut_ptr() as *mut u8;
+            unsafe { std::slice::from_raw_parts_mut(ring8, rem) }.copy_from_slice(&scratch[..rem]);
+            let dst = unsafe { std::slice::from_raw_parts_mut(ring8.add(rem), n) };
+            let got = read_stored_bytes_aligned(bits, dst);
+            debug_assert_eq!(got, n, "avail gate guaranteed the full payload");
+            self.ring.width = RingWidth::Clean;
+            // Vendor `m_windowPosition = MAX_WINDOW_SIZE` (:1238); only the
+            // new stored bytes drain: [drained, pos) = physical [rem, 32768).
+            self.ring.pos = U8_RING_SIZE + MAX_WINDOW_SIZE;
+            self.ring.drained = U8_RING_SIZE + rem;
+            STORED_FLIP_CROSSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stored_flip_debug_log("case2-crossing", n);
+        } else if self.ring.is_clean() {
+            // Case 3 (deflate.hpp:1243-1255): bulk read into the u8 ring at
+            // the cursor, <=2 wraparound segments (vendor `lastBuffers` over
+            // the PRE-advanced position). Output drains via the standard
+            // clean-mode `[drained, pos)` wrap-aware drain.
+            let start = self.ring.pos % U8_RING_SIZE;
+            let first = n.min(U8_RING_SIZE - start);
+            // SAFETY: as case 1; [start, start+first) and [0, n-first) are
+            // in-bounds; first <= n <= 65535 < U8_RING_SIZE.
+            let ring8 = self.ring.window16.as_mut_ptr() as *mut u8;
+            let dst = unsafe { std::slice::from_raw_parts_mut(ring8.add(start), first) };
+            let mut got = read_stored_bytes_aligned(bits, dst);
+            if first < n {
+                let dst2 = unsafe { std::slice::from_raw_parts_mut(ring8, n - first) };
+                got += read_stored_bytes_aligned(bits, dst2);
+            }
+            debug_assert_eq!(got, n, "avail gate guaranteed the full payload");
+            self.ring.pos += n;
+            STORED_CLEAN_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            return None; // markers + dist + n < MAX_WINDOW_SIZE: per-byte path
+        }
+        // Common tail (vendor :1258-1261): whole payload consumed.
+        self.uncompressed_size = 0;
+        self.decoded_bytes += n;
+        self.at_end_of_block = true;
+        Some(n)
+    }
+
     /// Literal port of `Block::readInternalUncompressed` semantics
     /// (deflate.hpp:1212-1278): consume `uncompressed_size` bytes from
     /// the bit stream (which are byte-aligned per the deflate spec)
     /// and emit them as literal u16 values into `output`. Caps at
     /// `n_max_to_decode`; sets `at_end_of_block` when the full payload
     /// is consumed.
+    ///
+    /// M2b: the vendor stored-block special cases (early flips + clean bulk
+    /// read, deflate.hpp:1212-1256) are tried first — see
+    /// [`Block::try_read_stored_special`]. `GZIPPY_NO_STORED_FLIP=1` disables
+    /// them, restoring this per-byte path exactly.
     pub fn read_internal_uncompressed(
         &mut self,
         bits: &mut Bits,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
+        if let Some(n) = self.try_read_stored_special(bits) {
+            return Ok(n);
+        }
         // Stored blocks have no back-refs and no markers — every output
         // is a pure literal byte. We still write to the ring so the
         // public `read()` wrapper's drain emits these bytes in order
@@ -2290,6 +2528,32 @@ impl Block {
         debug_assert!(self.compression_type == CompressionType::Uncompressed);
         let spare = cap.saturating_sub(*pos);
         let to_read = self.uncompressed_size.min(n_max_to_decode).min(spare);
+        // M2b (DIV-5 case 3, contig sibling): bulk byte read straight into the
+        // contiguous destination — byte-identical to the per-byte loop below
+        // (same `to_read` bytes, same cursor advance), just one memcpy instead
+        // of per-byte bit-buffer pulls. Vendor's clean stored read is the same
+        // bulk `bitReader.read` (deflate.hpp:1243-1255); the destination here
+        // is gzippy's kept DIV-2 contig deviation. Same kill-switch + full-
+        // availability gate as the ring path (short payloads keep the
+        // per-byte commit-then-`Err` truncation semantics).
+        if !stored_flip_disabled() {
+            let avail = (bits.available() / 8) as usize + (bits.data.len() - bits.pos);
+            if avail >= to_read {
+                // SAFETY: `base` valid for [0, cap); `to_read <= spare = cap -
+                // *pos`; `bits.data` and the chunk buffer never alias.
+                let dst = unsafe { std::slice::from_raw_parts_mut(base.add(*pos), to_read) };
+                let got = read_stored_bytes_aligned(bits, dst);
+                debug_assert_eq!(got, to_read, "avail gate guaranteed the payload");
+                *pos += to_read;
+                self.uncompressed_size -= to_read;
+                self.decoded_bytes += to_read;
+                if self.uncompressed_size == 0 {
+                    self.at_end_of_block = true;
+                }
+                STORED_CONTIG_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(to_read);
+            }
+        }
         let mut read_count: usize = 0;
         for _ in 0..to_read {
             if let Err(e) = ensure_bits(bits, 8) {
@@ -4603,5 +4867,654 @@ mod tests {
             distance_marker, 0,
             "every byte was a marker; counter should be 0"
         );
+    }
+
+    // ── M2b (DIV-5): vendor stored-block special cases ───────────────────
+    //
+    // Each test runs BOTH kill-switch arms (via STORED_FLIP_OVERRIDE, since
+    // the env read is OnceLock-cached) and asserts byte-identical resolved
+    // output plus the per-case proof counters. Serialized by a mutex: while
+    // the override forces DISABLED, no thread in the process can increment
+    // the counters (every increment is behind `!stored_flip_disabled()`), so
+    // exact-zero deltas are safe there; ENABLED-arm deltas use `>=` because
+    // unrelated concurrent tests may also decode stored blocks.
+    mod stored_flip {
+        use super::*;
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Mutex;
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                STORED_FLIP_OVERRIDE.store(-1, Relaxed);
+            }
+        }
+
+        fn with_stored_flip<T>(disabled: bool, f: impl FnOnce() -> T) -> T {
+            let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            STORED_FLIP_OVERRIDE.store(if disabled { 1 } else { 0 }, Relaxed);
+            let _restore = OverrideGuard;
+            f()
+        }
+
+        fn counters() -> (u64, u64, u64, u64) {
+            (
+                STORED_FLIP_GE_WINDOW.load(Relaxed),
+                STORED_FLIP_CROSSING.load(Relaxed),
+                STORED_CLEAN_BULK.load(Relaxed),
+                STORED_CONTIG_BULK.load(Relaxed),
+            )
+        }
+
+        /// Hand-built stored block. Valid only at a byte-aligned position
+        /// (stream start, after another stored block, or after a sync flush).
+        fn stored_block(payload: &[u8], bfinal: bool) -> Vec<u8> {
+            assert!(payload.len() <= 65535);
+            let mut v = Vec::with_capacity(payload.len() + 5);
+            v.push(u8::from(bfinal)); // BFINAL bit, BTYPE=00, zero padding
+            let len = payload.len() as u16;
+            v.extend_from_slice(&len.to_le_bytes());
+            v.extend_from_slice(&(!len).to_le_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
+
+        fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (s >> 33) as u8
+                })
+                .collect()
+        }
+
+        fn test_dict() -> Vec<u8> {
+            lcg_bytes(7, MAX_WINDOW_SIZE)
+        }
+
+        /// Raw DEFLATE of `payload` with preset `dict`, ending in a SYNC
+        /// flush (compressed block(s) + the empty stored block, byte-aligned
+        /// end) so hand-built stored blocks can be appended.
+        fn deflate_with_dict_sync(payload: &[u8], dict: &[u8]) -> Vec<u8> {
+            use flate2::{Compress, Compression, FlushCompress};
+            let mut c = Compress::new(Compression::default(), false);
+            c.set_dictionary(dict).expect("set_dictionary");
+            let mut out = vec![0u8; payload.len() + 4096];
+            c.compress(payload, &mut out, FlushCompress::Sync)
+                .expect("compress+sync");
+            assert_eq!(c.total_in() as usize, payload.len(), "sync consumed all");
+            out.truncate(c.total_out() as usize);
+            out
+        }
+
+        /// Ground truth: flate2 raw-inflate with dictionary.
+        fn inflate_with_dict(stream: &[u8], dict: &[u8], expect_len: usize) -> Vec<u8> {
+            use flate2::{Decompress, FlushDecompress};
+            let mut d = Decompress::new(false);
+            d.set_dictionary(dict).expect("set_dictionary");
+            let mut out = vec![0u8; expect_len + 4096];
+            d.decompress(stream, &mut out, FlushDecompress::Finish)
+                .expect("ground-truth inflate");
+            out.truncate(d.total_out() as usize);
+            out
+        }
+
+        /// Decode a full raw-deflate stream windowless through the production
+        /// `Block::read` ring path. Returns (sink, block-at-end).
+        fn decode_windowless(stream: &[u8]) -> (Vec<u16>, Block) {
+            let mut bits = make_bits(stream);
+            let mut b = Block::new();
+            let mut out: Vec<u16> = Vec::new();
+            loop {
+                b.read_header(&mut bits, false).expect("header");
+                let mut guard = 0usize;
+                while !b.eob() {
+                    let before = out.len();
+                    b.read(&mut bits, &mut out, usize::MAX).expect("read");
+                    if out.len() == before {
+                        guard += 1;
+                        assert!(guard < 4, "no decode progress");
+                    }
+                }
+                if b.is_last_block() {
+                    break;
+                }
+            }
+            (out, b)
+        }
+
+        fn resolve(sink: &[u16], dict: &[u8]) -> Vec<u8> {
+            sink.iter()
+                .map(|&v| {
+                    if v < 256 {
+                        v as u8
+                    } else {
+                        assert!(v >= MARKER_BASE, "invalid 2B code {v:#x}");
+                        dict[(v - MARKER_BASE) as usize]
+                    }
+                })
+                .collect()
+        }
+
+        /// Case 1, pure-stored stream (gzip-on-incompressible shape):
+        /// 40000-byte stored blocks fire the >=window early flip; both arms
+        /// produce identical bytes (the disabled arm flips at the same read()
+        /// boundary via generic arming cond 2 — all-clean chunk).
+        #[test]
+        fn case1_pure_stored_stream_both_arms() {
+            let payload = lcg_bytes(11, 80_020);
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&stored_block(&payload[..40_000], false));
+            stream.extend_from_slice(&stored_block(&payload[40_000..80_000], false));
+            stream.extend_from_slice(&stored_block(&payload[80_000..], true));
+
+            let (enabled, dis) = with_stored_flip(false, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                let c1 = counters();
+                assert!(!b.contains_marker_bytes(), "must be clean at end");
+                assert!(
+                    c1.0 - c0.0 >= 1,
+                    "case 1 must fire on a 40000-byte stored block"
+                );
+                (sink, ())
+            });
+            let _ = dis;
+            let disabled = with_stored_flip(true, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                let c1 = counters();
+                assert_eq!(c0, c1, "kill-switch arm must not touch any special case");
+                assert!(
+                    !b.contains_marker_bytes(),
+                    "pure-clean stream still flips via generic arming"
+                );
+                sink
+            });
+            let e: Vec<u8> = enabled.iter().map(|&v| v as u8).collect();
+            let d: Vec<u8> = disabled.iter().map(|&v| v as u8).collect();
+            assert_eq!(e, payload, "enabled arm bytes");
+            assert_eq!(d, payload, "disabled arm bytes");
+        }
+
+        /// Case 1 after MARKERS — the arming-divergence shape: vendor flips
+        /// at the >=32 KiB stored block; the pre-M2b path stays in marker
+        /// mode (needs 64 Ki consecutive clean after a marker). Resolved
+        /// bytes must be identical; the width at end differs.
+        #[test]
+        fn case1_after_markers_flips_early_same_bytes() {
+            let dict = test_dict();
+            // Dict-referencing prefix => markers when decoded windowless.
+            let mut p1 = Vec::new();
+            for k in 0..8 {
+                let s = (k * 1013) % (MAX_WINDOW_SIZE - 400);
+                p1.extend_from_slice(&dict[s..s + 300]);
+            }
+            let prefix = deflate_with_dict_sync(&p1, &dict);
+            let stored_a = lcg_bytes(13, 40_000);
+            let stored_b = lcg_bytes(17, 10);
+            let mut stream = prefix.clone();
+            stream.extend_from_slice(&stored_block(&stored_a, false));
+            stream.extend_from_slice(&stored_block(&stored_b, true));
+
+            let mut truth = p1.clone();
+            truth.extend_from_slice(&stored_a);
+            truth.extend_from_slice(&stored_b);
+            assert_eq!(
+                inflate_with_dict(&stream, &dict, truth.len()),
+                truth,
+                "stream self-check vs flate2"
+            );
+
+            let enabled = with_stored_flip(false, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                let c1 = counters();
+                assert!(
+                    c1.0 - c0.0 >= 1,
+                    "case 1 must fire (40000 >= MAX_WINDOW_SIZE)"
+                );
+                assert!(
+                    !b.contains_marker_bytes(),
+                    "M2b: >=window stored block must flip even after markers"
+                );
+                sink
+            });
+            let disabled = with_stored_flip(true, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                assert_eq!(c0, counters(), "kill-switch arm inert");
+                assert!(
+                    b.contains_marker_bytes(),
+                    "pre-M2b arming (64 Ki clean after marker) must NOT have flipped"
+                );
+                sink
+            });
+            assert!(
+                enabled.len() == disabled.len() && enabled.len() == truth.len(),
+                "lengths: enabled {} disabled {} truth {}",
+                enabled.len(),
+                disabled.len(),
+                truth.len()
+            );
+            assert_eq!(resolve(&enabled, &dict), truth, "enabled arm resolved");
+            assert_eq!(resolve(&disabled, &dict), truth, "disabled arm resolved");
+        }
+
+        /// Case 2 at the EXACT boundary: markers, then stored blocks sized at
+        /// runtime so `distance_to_last_marker + uncompressed_size` hits
+        /// 32767 (no fire) then 32768 (fires). Covers the window-crossing
+        /// downcast + the tiny-stored-run fall-through, plus a trailing
+        /// clean-bulk (case 3) block.
+        #[test]
+        fn case2_crossing_at_exact_boundary() {
+            let dict = test_dict();
+            let mut p1 = Vec::new();
+            for k in 0..4 {
+                let s = (k * 911) % (MAX_WINDOW_SIZE - 400);
+                p1.extend_from_slice(&dict[s..s + 250]);
+            }
+            let prefix = deflate_with_dict_sync(&p1, &dict);
+
+            // Measure the post-prefix marker distance d0 on a throwaway decode.
+            let d0 = with_stored_flip(true, || {
+                let (_, b) = decode_windowless(&{
+                    let mut s = prefix.clone();
+                    s.extend_from_slice(&stored_block(&[], true));
+                    s
+                });
+                assert!(b.contains_marker_bytes(), "prefix must leave markers");
+                b.ring.distance_to_last_marker
+            });
+            assert!(d0 < 16_000, "prefix trailing-clean too large: {d0}");
+
+            // Block A: brings dist to exactly 32767 (falls through, per-byte).
+            let a = lcg_bytes(19, MAX_WINDOW_SIZE - 1 - d0);
+            // Block B: 1 byte => dist 32767 + 1 == 32768 fires case 2.
+            let b_payload = lcg_bytes(23, 1);
+            // Block C: clean bulk (case 3) after the flip.
+            let c_payload = lcg_bytes(29, 5_000);
+            let mut stream = prefix.clone();
+            stream.extend_from_slice(&stored_block(&a, false));
+            stream.extend_from_slice(&stored_block(&b_payload, false));
+            stream.extend_from_slice(&stored_block(&c_payload, true));
+
+            let mut truth = p1.clone();
+            truth.extend_from_slice(&a);
+            truth.extend_from_slice(&b_payload);
+            truth.extend_from_slice(&c_payload);
+            assert_eq!(
+                inflate_with_dict(&stream, &dict, truth.len()),
+                truth,
+                "stream self-check vs flate2"
+            );
+
+            let enabled = with_stored_flip(false, || {
+                // Step through manually to pin WHICH block fires.
+                let mut bits = make_bits(&stream);
+                let mut blk = Block::new();
+                let mut out: Vec<u16> = Vec::new();
+                // Prefix blocks + sync stored + block A: no case-2 fire.
+                loop {
+                    blk.read_header(&mut bits, false).expect("header");
+                    while !blk.eob() {
+                        blk.read(&mut bits, &mut out, usize::MAX).expect("read");
+                    }
+                    if out.len() >= p1.len() + a.len() {
+                        break; // block A consumed
+                    }
+                }
+                assert!(blk.contains_marker_bytes(), "dist 32767: no flip yet");
+                assert_eq!(blk.ring.distance_to_last_marker, MAX_WINDOW_SIZE - 1);
+                let c0 = counters();
+                // Block B (1 byte): crossing fires.
+                blk.read_header(&mut bits, false).expect("header B");
+                while !blk.eob() {
+                    blk.read(&mut bits, &mut out, usize::MAX).expect("read B");
+                }
+                let c1 = counters();
+                assert!(c1.1 - c0.1 >= 1, "case 2 must fire at dist+n == 32768");
+                assert!(!blk.contains_marker_bytes(), "flipped by case 2");
+                // Block C: clean bulk.
+                blk.read_header(&mut bits, false).expect("header C");
+                while !blk.eob() {
+                    blk.read(&mut bits, &mut out, usize::MAX).expect("read C");
+                }
+                let c2 = counters();
+                assert!(c2.2 - c1.2 >= 1, "case 3 must take the clean bulk read");
+                assert!(blk.is_last_block());
+                out
+            });
+            let disabled = with_stored_flip(true, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                assert_eq!(c0, counters(), "kill-switch arm inert");
+                assert!(b.contains_marker_bytes(), "pre-M2b stays in marker mode");
+                sink
+            });
+            assert_eq!(resolve(&enabled, &dict), truth, "enabled arm resolved");
+            assert_eq!(resolve(&disabled, &dict), truth, "disabled arm resolved");
+        }
+
+        /// Case 2 with `uncompressed_size == 0`: the sync-flush empty stored
+        /// block flips once >=32 KiB of trailing clean exists (markers
+        /// earlier), emitting ZERO bytes.
+        #[test]
+        fn case2_empty_stored_block_flips_after_32k_clean() {
+            let dict = test_dict();
+            let mut p1 = Vec::new();
+            for k in 0..4 {
+                let s = (k * 700) % (MAX_WINDOW_SIZE - 300);
+                p1.extend_from_slice(&dict[s..s + 200]);
+            }
+            let prefix = deflate_with_dict_sync(&p1, &dict);
+            let d0 = with_stored_flip(true, || {
+                let (_, b) = decode_windowless(&{
+                    let mut s = prefix.clone();
+                    s.extend_from_slice(&stored_block(&[], true));
+                    s
+                });
+                b.ring.distance_to_last_marker
+            });
+            // Clean run to dist exactly 32768 via two fall-through stored
+            // blocks (each keeps dist + n < 32768 BEFORE it completes —
+            // sizes chosen so neither fires case 2)…
+            assert!(d0 < 10_000);
+            let a = lcg_bytes(31, 20_000 - d0); // dist -> 20000
+            let b_pay = lcg_bytes(37, 12_767); // dist+n = 32767: no fire
+            let mut stream = prefix.clone();
+            stream.extend_from_slice(&stored_block(&a, false));
+            stream.extend_from_slice(&stored_block(&b_pay, false));
+            // dist is now 32767. An EMPTY stored block here is a fall-through
+            // (32767 + 0 < 32768). The next 1-byte block hits dist + n ==
+            // 32768 exactly ⇒ case 2 fires with n == 1 (any clean stored byte
+            // that completes the window fires first — the n == 0 crossing is
+            // only reachable after compressed clean output, covered by
+            // case2_crossing_after_compressed_clean). The empty block AFTER
+            // the flip then exercises the clean n == 0 path (case 3, zero
+            // bytes emitted).
+            stream.extend_from_slice(&stored_block(&[], false)); // fall-through at 32767
+            let one = lcg_bytes(41, 1);
+            stream.extend_from_slice(&stored_block(&one, false)); // case 2 fires (n=1)
+            stream.extend_from_slice(&stored_block(&[], false)); // clean n=0 (case 3)
+            let tail = lcg_bytes(43, 64);
+            stream.extend_from_slice(&stored_block(&tail, true));
+
+            let mut truth = p1.clone();
+            truth.extend_from_slice(&a);
+            truth.extend_from_slice(&b_pay);
+            truth.extend_from_slice(&one);
+            truth.extend_from_slice(&tail);
+            assert_eq!(
+                inflate_with_dict(&stream, &dict, truth.len()),
+                truth,
+                "stream self-check vs flate2"
+            );
+
+            let enabled = with_stored_flip(false, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                let c1 = counters();
+                assert!(c1.1 - c0.1 >= 1, "case 2 fires at the 1-byte block");
+                assert!(!b.contains_marker_bytes());
+                sink
+            });
+            let disabled = with_stored_flip(true, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                assert_eq!(c0, counters(), "kill-switch arm inert");
+                assert!(b.contains_marker_bytes());
+                sink
+            });
+            assert_eq!(resolve(&enabled, &dict), truth);
+            assert_eq!(resolve(&disabled, &dict), truth);
+        }
+
+        /// Case 2 fired by an EMPTY (n=0) stored block after >=32 KiB of
+        /// clean output from COMPRESSED blocks (the sync-flush resync shape):
+        /// markers first, then ~34 KiB of literal-ish data, then a sync
+        /// flush whose empty stored block must flip with zero bytes emitted.
+        #[test]
+        fn case2_crossing_after_compressed_clean() {
+            let dict = test_dict();
+            let mut p1 = Vec::new();
+            for k in 0..3 {
+                let s = (k * 1100) % (MAX_WINDOW_SIZE - 400);
+                p1.extend_from_slice(&dict[s..s + 200]);
+            }
+            // One continuing flate2 stream: P1 (dict-reaching) SYNC, then P2
+            // (independent random — no dict reach) SYNC.
+            use flate2::{Compress, Compression, FlushCompress};
+            let p2 = lcg_bytes(53, 35_000);
+            let mut c = Compress::new(Compression::default(), false);
+            c.set_dictionary(&dict).expect("set_dictionary");
+            let mut out = vec![0u8; p1.len() + p2.len() + 8192];
+            c.compress(&p1, &mut out, FlushCompress::Sync).unwrap();
+            let n1 = c.total_out() as usize;
+            let mut out2 = vec![0u8; p2.len() + 8192];
+            c.compress(&p2, &mut out2, FlushCompress::Sync).unwrap();
+            let n2 = c.total_out() as usize - n1;
+            let mut stream = out[..n1].to_vec();
+            stream.extend_from_slice(&out2[..n2]);
+            let tail = lcg_bytes(59, 32);
+            stream.extend_from_slice(&stored_block(&tail, true));
+
+            let mut truth = p1.clone();
+            truth.extend_from_slice(&p2);
+            truth.extend_from_slice(&tail);
+            assert_eq!(
+                inflate_with_dict(&stream, &dict, truth.len()),
+                truth,
+                "stream self-check vs flate2"
+            );
+
+            let enabled = with_stored_flip(false, || {
+                let c0 = counters();
+                let (sink, b) = decode_windowless(&stream);
+                let c1 = counters();
+                assert!(!b.contains_marker_bytes(), "must flip by stream end");
+                // The P2 sync's empty stored block (or a stored block zlib
+                // chose for incompressible P2) fires the crossing case.
+                assert!(
+                    c1.1 - c0.1 >= 1,
+                    "case 2 must fire after >=32 KiB compressed clean"
+                );
+                sink
+            });
+            let disabled = with_stored_flip(true, || {
+                let c0 = counters();
+                let (sink, _b) = decode_windowless(&stream);
+                assert_eq!(c0, counters(), "kill-switch arm inert");
+                sink
+            });
+            assert_eq!(resolve(&enabled, &dict), truth);
+            assert_eq!(resolve(&disabled, &dict), truth);
+        }
+
+        /// Case 3: window-seeded (clean from byte 0) decode of stored blocks,
+        /// including ring wrap-around (>131072 bytes total via sub-window
+        /// blocks) and tiny stored runs. Also pins that a >=32 KiB stored
+        /// block in CLEAN width takes case 1 (vendor's first branch is
+        /// width-independent), not case 3.
+        #[test]
+        fn case3_seeded_bulk_wrap_and_tiny_runs() {
+            let dict = test_dict();
+            // 30000-byte blocks stay under MAX_WINDOW_SIZE ⇒ case 3 for every
+            // block; total 245000 wraps the 131072-slot u8 ring twice.
+            let payload = lcg_bytes(61, 245_000);
+            let mut stream = Vec::new();
+            let mut off = 0usize;
+            while off < payload.len() {
+                let n = (payload.len() - off).min(30_000);
+                stream.extend_from_slice(&stored_block(
+                    &payload[off..off + n],
+                    off + n == payload.len(),
+                ));
+                off += n;
+            }
+            // Tiny stored runs appendix (1..64-byte blocks).
+            let tiny = lcg_bytes(67, 300);
+            let mut tiny_stream = Vec::new();
+            let mut t = 0usize;
+            let mut k = 0usize;
+            while t < tiny.len() {
+                let n = (tiny.len() - t).min(1 + (k % 64));
+                tiny_stream.extend_from_slice(&stored_block(&tiny[t..t + n], t + n == tiny.len()));
+                t += n;
+                k += 1;
+            }
+
+            let run = |stream: &[u8], dict: &[u8]| -> Vec<u8> {
+                let mut bits = make_bits(stream);
+                let mut b = Block::new();
+                let mut out: Vec<u16> = Vec::new();
+                b.set_initial_window(&mut out, dict).expect("seed");
+                loop {
+                    b.read_header(&mut bits, false).expect("header");
+                    while !b.eob() {
+                        b.read(&mut bits, &mut out, usize::MAX).expect("read");
+                    }
+                    if b.is_last_block() {
+                        break;
+                    }
+                }
+                out.iter()
+                    .map(|&v| {
+                        assert!(v < 256, "seeded clean decode must stay clean");
+                        v as u8
+                    })
+                    .collect()
+            };
+
+            // Clean-width >=window stored block: case 1, not case 3.
+            let big_payload = lcg_bytes(79, 40_000 + 12);
+            let mut big_stream = stored_block(&big_payload[..40_000], false).to_vec();
+            big_stream.extend_from_slice(&stored_block(&big_payload[40_000..], true));
+
+            let (e_big, e_tiny, e_case1) = with_stored_flip(false, || {
+                let c0 = counters();
+                let big = run(&stream, &dict);
+                let c1 = counters();
+                assert!(
+                    c1.2 - c0.2 >= 8,
+                    "case 3 must take every sub-window seeded stored block (got {})",
+                    c1.2 - c0.2
+                );
+                let tiny_out = run(&tiny_stream, &dict);
+                let c2 = counters();
+                let case1_out = run(&big_stream, &dict);
+                let c3 = counters();
+                assert!(
+                    c3.0 - c2.0 >= 1,
+                    "clean-width >=window stored block must take case 1"
+                );
+                (big, tiny_out, case1_out)
+            });
+            let (d_big, d_tiny, d_case1) = with_stored_flip(true, || {
+                let c0 = counters();
+                let r = (
+                    run(&stream, &dict),
+                    run(&tiny_stream, &dict),
+                    run(&big_stream, &dict),
+                );
+                assert_eq!(c0, counters(), "kill-switch arm inert");
+                r
+            });
+            assert_eq!(e_big, payload, "enabled big");
+            assert_eq!(d_big, payload, "disabled big");
+            assert_eq!(e_tiny, tiny, "enabled tiny runs");
+            assert_eq!(d_tiny, tiny, "disabled tiny runs");
+            assert_eq!(e_case1, big_payload, "enabled clean-width case 1");
+            assert_eq!(d_case1, big_payload, "disabled clean-width case 1");
+        }
+
+        /// Contig sibling (`decode_clean_stored_into_contig`): bulk read is
+        /// byte-identical to the per-byte arm, respects `n_max_to_decode`
+        /// partial reads, and bumps the contig counter.
+        #[test]
+        fn contig_stored_bulk_matches_per_byte() {
+            let dict = test_dict();
+            let payload = lcg_bytes(71, 50_000);
+            let stream = stored_block(&payload, true);
+
+            let run = |_label: &str| -> Vec<u8> {
+                let mut b = Block::new();
+                let mut sink: Vec<u16> = Vec::new();
+                b.set_initial_window(&mut sink, &dict).expect("seed");
+                let mut bits = make_bits(&stream);
+                b.read_header(&mut bits, false).expect("header");
+                let mut buf = vec![0u8; payload.len() + 512];
+                let base = buf.as_mut_ptr();
+                let cap = buf.len();
+                let mut pos = 0usize;
+                // Partial first call exercises the n_max cap.
+                let n1 = b
+                    .decode_clean_stored_into_contig(&mut bits, base, cap, &mut pos, 100)
+                    .expect("partial");
+                assert_eq!(n1, 100);
+                assert!(!b.eob());
+                let n2 = b
+                    .decode_clean_stored_into_contig(&mut bits, base, cap, &mut pos, usize::MAX)
+                    .expect("rest");
+                assert_eq!(n1 + n2, payload.len());
+                assert!(b.eob());
+                buf.truncate(pos);
+                buf
+            };
+
+            let enabled = with_stored_flip(false, || {
+                let c0 = counters();
+                let out = run("enabled");
+                let c1 = counters();
+                assert!(c1.3 - c0.3 >= 2, "contig bulk must fire on both calls");
+                out
+            });
+            let disabled = with_stored_flip(true, || {
+                let c0 = counters();
+                let out = run("disabled");
+                assert_eq!(c0, counters(), "kill-switch arm inert");
+                out
+            });
+            assert_eq!(enabled, payload);
+            assert_eq!(disabled, payload);
+        }
+
+        /// Truncated stored payload: the availability gate must keep the
+        /// pre-M2b per-byte commit-then-Err semantics in BOTH arms (same
+        /// partial output, same residual state, same error).
+        #[test]
+        fn truncated_stored_keeps_per_byte_error_path() {
+            let payload = lcg_bytes(73, 10);
+            let mut stream = vec![0u8]; // BFINAL=0 BTYPE=00
+            stream.extend_from_slice(&1000u16.to_le_bytes());
+            stream.extend_from_slice(&(!1000u16).to_le_bytes());
+            stream.extend_from_slice(&payload); // only 10 of 1000 bytes
+
+            let run = || {
+                let mut bits = make_bits(&stream);
+                let mut b = Block::new();
+                b.read_header(&mut bits, false).expect("header");
+                let mut out: Vec<u16> = Vec::new();
+                let err = b.read(&mut bits, &mut out, usize::MAX).unwrap_err();
+                (out, err, b.uncompressed_size(), b.eob())
+            };
+            let (e_out, e_err, e_left, e_eob) = with_stored_flip(false, run);
+            let (d_out, d_err, d_left, d_eob) = with_stored_flip(true, run);
+            assert_eq!(e_out, d_out, "partial output identical");
+            assert_eq!(
+                e_out,
+                payload.iter().map(|&b| b as u16).collect::<Vec<u16>>()
+            );
+            assert_eq!(e_err, d_err, "same error");
+            assert_eq!((e_left, e_eob), (d_left, d_eob));
+            assert_eq!(e_left, 990, "residual size committed");
+            assert!(!e_eob);
+        }
     }
 }
