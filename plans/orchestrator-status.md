@@ -1,3 +1,17 @@
+## PER-WORKER RETENTION MERGED, DEFAULT ON (81690afb, advisor-SOUND) [2026-06-10]
+The mid-T allocation lever landed: lock-free one-slot-per-worker huge-block retention + 4MiB
+MADV_DONTNEED trim budget (VMA kept, residency capped — the trick that passes BOTH wall and RSS
+criteria; uncapped retention failed silesia RSS +52%). Criteria PASS: model T8 +10% wall/-34%
+faults, worst RSS +5%; frozen co-located +6.9% on model vs prior HEAD; 907/0 guest suite; 135
+frozen sha-verified runs. Design fenced by this session's falsifiers (global budgets dead at every
+size; mutex pool dead; segmentation dead). Gate verdict SOUND across 7 surfaces (swap-only
+transfers => no ABA; header-below-user safe; dispatch invariant: huge blocks can never reach the
+small-class free path).
+Frozen scorecard with the lever (model T8 rg/gz 0.878, silesia T4 0.890, T8 0.963, T16 0.925,
+bignasa T8 0.92-class): band cells all improved again but bar still unmet. REMAINING: (1) ~11%
+BARE-FFI-vs-rg concurrency residual (bus/L3 class — characterize); (2) low-T lifecycle share of
+silesia T4; (3) native T1 engine decision (USER-GATED). Pre-existing notes: vmsplice test hang on
+guest (environmental); T>64 worker panic pre-exists (MAX_WORKERS=64).
 ## GLOBAL-BUDGET SLAB FALSIFIED AT EVERY BUDGET — fork (b) shape pinned [2026-06-10]
 Budget sweep B in {8,16,32}MiB (unfrozen grid, sha-verified): B8 passes RSS but is a NO-OP (one
 model chunk = 12-25MiB > budget => free-list never hits); B16/B32 bloat silesia RSS +24%/+15%.
