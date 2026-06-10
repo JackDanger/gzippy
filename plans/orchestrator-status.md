@@ -1,3 +1,13 @@
+## ENGINE M3 MERGED (advisor-SOUND) — DIV-1 part 1: seeded chunks on the ONE engine [2026-06-10]
+gzippy-native seeded-inexact decodes on Block (16/16 at T1 silesia); unified::Inflate off that
+path; empty-seed vendor semantics adopted; 80/80 sha grid; suites 921/928 zero fails; wall TIE
+(layered per rule 7 — the T1 residual is SYMBOL RATE, P3's territory, now cleanly isolated on
+ONE engine). Gate confirmed prefix accounting across every production consumer (M3 is the FIRST
+production user of data_prefix_len) + one non-blocking advisory (clean-window oracle from-0 read,
+measurement-only). Bonus: contig HEADROOM+1 latent fix; wrapper encoded_size_bits=0 hole documented.
+LEDGER: DIV-1 part 1 CLOSED (inexact-seeded); remaining: M4 until-exact (pre-registered contract,
+labeled deviation), M5 dead-engine deletions (DIV-3/DIV-6 + unified::Inflate off the graph
+entirely), M6 masked+frozen engine-cell A/B, then P3 (the symbol-rate arsenal on the one engine).
 ## ENGINE M2b MERGED (advisor-SOUND) — stored early-flip ported, DIV-5 closed [2026-06-10]
 54/54 byte-exact both kill-switch arms; storedmix +8.7%; silesia 1.000; purely additive diff
 (913/0). Gate proved case-2 unreachability + case-1 marker-drop byte-safety from the arming
