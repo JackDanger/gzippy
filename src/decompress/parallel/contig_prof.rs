@@ -26,16 +26,19 @@ use std::sync::OnceLock;
 // ── contig (Block::decode_clean_into_contig) ───────────────────────────────
 pub static C_CYC_LIT1: AtomicU64 = AtomicU64::new(0); // single-literal iters
 pub static C_CYC_LITPACK: AtomicU64 = AtomicU64::new(0); // multi-literal-pack iters
+pub static C_CYC_LITCHAIN: AtomicU64 = AtomicU64::new(0); // runtime-chained literal iters (P3.2)
 pub static C_CYC_BACKREF: AtomicU64 = AtomicU64::new(0); // iters ending in a back-ref
 pub static C_CYC_CAREFUL: AtomicU64 = AtomicU64::new(0); // whole careful tail loop
 pub static C_CYC_CALL: AtomicU64 = AtomicU64::new(0); // whole fn body
 pub static C_N_LIT1: AtomicU64 = AtomicU64::new(0);
 pub static C_N_LITPACK: AtomicU64 = AtomicU64::new(0);
+pub static C_N_LITCHAIN: AtomicU64 = AtomicU64::new(0);
 pub static C_N_BACKREF: AtomicU64 = AtomicU64::new(0);
 pub static C_N_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static C_N_DIST_LONG: AtomicU64 = AtomicU64::new(0); // dist_hc long-path decodes
 pub static C_BYTES_BACKREF: AtomicU64 = AtomicU64::new(0);
 pub static C_BYTES_LITPACK: AtomicU64 = AtomicU64::new(0);
+pub static C_BYTES_LITCHAIN: AtomicU64 = AtomicU64::new(0);
 pub static C_BYTES_CAREFUL: AtomicU64 = AtomicU64::new(0);
 
 // ── wrapper (decode_huffman_body_resumable) ────────────────────────────────
@@ -50,6 +53,7 @@ pub const CLASS_NONE: usize = 0;
 pub const CLASS_LIT1: usize = 1;
 pub const CLASS_LITPACK: usize = 2;
 pub const CLASS_BACKREF: usize = 3;
+pub const CLASS_LITCHAIN: usize = 4; // P3.2: lit1 + >=1 runtime-chained literals
 
 #[inline(always)]
 pub fn enabled() -> bool {
@@ -79,12 +83,13 @@ pub fn rdtsc(on: bool) -> u64 {
 pub struct ContigFlush {
     pub on: bool,
     pub t_entry: u64,
-    pub cyc: [u64; 4], // indexed by CLASS_*; [0] unused
-    pub n: [u64; 4],
+    pub cyc: [u64; 5], // indexed by CLASS_*; [0] unused
+    pub n: [u64; 5],
     pub cyc_careful: u64,
     pub n_lit1: u64,
     pub bytes_backref: u64,
     pub bytes_litpack: u64,
+    pub bytes_litchain: u64,
     pub bytes_careful: u64,
 }
 
@@ -94,12 +99,13 @@ impl ContigFlush {
         Self {
             on,
             t_entry: rdtsc(on),
-            cyc: [0; 4],
-            n: [0; 4],
+            cyc: [0; 5],
+            n: [0; 5],
             cyc_careful: 0,
             n_lit1: 0,
             bytes_backref: 0,
             bytes_litpack: 0,
+            bytes_litchain: 0,
             bytes_careful: 0,
         }
     }
@@ -115,13 +121,16 @@ impl Drop for ContigFlush {
         C_N_CALLS.fetch_add(1, Ordering::Relaxed);
         C_CYC_LIT1.fetch_add(self.cyc[CLASS_LIT1], Ordering::Relaxed);
         C_CYC_LITPACK.fetch_add(self.cyc[CLASS_LITPACK], Ordering::Relaxed);
+        C_CYC_LITCHAIN.fetch_add(self.cyc[CLASS_LITCHAIN], Ordering::Relaxed);
         C_CYC_BACKREF.fetch_add(self.cyc[CLASS_BACKREF], Ordering::Relaxed);
         C_N_LIT1.fetch_add(self.n[CLASS_LIT1], Ordering::Relaxed);
         C_N_LITPACK.fetch_add(self.n[CLASS_LITPACK], Ordering::Relaxed);
+        C_N_LITCHAIN.fetch_add(self.n[CLASS_LITCHAIN], Ordering::Relaxed);
         C_N_BACKREF.fetch_add(self.n[CLASS_BACKREF], Ordering::Relaxed);
         C_CYC_CAREFUL.fetch_add(self.cyc_careful, Ordering::Relaxed);
         C_BYTES_BACKREF.fetch_add(self.bytes_backref, Ordering::Relaxed);
         C_BYTES_LITPACK.fetch_add(self.bytes_litpack, Ordering::Relaxed);
+        C_BYTES_LITCHAIN.fetch_add(self.bytes_litchain, Ordering::Relaxed);
         C_BYTES_CAREFUL.fetch_add(self.bytes_careful, Ordering::Relaxed);
     }
 }
@@ -185,20 +194,22 @@ pub fn dump_if_enabled() {
     if !enabled() {
         return;
     }
-    let (cl1, clp, cbr, cca, ctot) = (
+    let (cl1, clp, clc, cbr, cca, ctot) = (
         C_CYC_LIT1.load(Ordering::Relaxed),
         C_CYC_LITPACK.load(Ordering::Relaxed),
+        C_CYC_LITCHAIN.load(Ordering::Relaxed),
         C_CYC_BACKREF.load(Ordering::Relaxed),
         C_CYC_CAREFUL.load(Ordering::Relaxed),
         C_CYC_CALL.load(Ordering::Relaxed),
     );
-    let (nl1, nlp, nbr, ncall) = (
+    let (nl1, nlp, nlc, nbr, ncall) = (
         C_N_LIT1.load(Ordering::Relaxed),
         C_N_LITPACK.load(Ordering::Relaxed),
+        C_N_LITCHAIN.load(Ordering::Relaxed),
         C_N_BACKREF.load(Ordering::Relaxed),
         C_N_CALLS.load(Ordering::Relaxed),
     );
-    let classed = cl1 + clp + cbr;
+    let classed = cl1 + clp + clc + cbr;
     eprintln!("[contig-prof] CONTIG (Block::decode_clean_into_contig):");
     eprintln!(
         "  calls={} total_cyc={} classed_cyc={} ({:.1}% of total; rest=careful+entry/exit+unchained tail)",
@@ -221,6 +232,14 @@ pub fn dump_if_enabled() {
         pct(clp, classed),
         per(clp, nlp),
         C_BYTES_LITPACK.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  litchn : iters={:>12} cyc={:>14} {:>5.1}% of classed, {:>6.1} cyc/iter, lits={}",
+        nlc,
+        clc,
+        pct(clc, classed),
+        per(clc, nlc),
+        C_BYTES_LITCHAIN.load(Ordering::Relaxed)
     );
     eprintln!(
         "  backref: iters={:>12} cyc={:>14} {:>5.1}% of classed, {:>6.1} cyc/iter, bytes={} dist_long={}",
