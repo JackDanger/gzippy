@@ -66,6 +66,15 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
 pure-rust-inflate = ["rpmalloc-caches"]
+# ── ASM campaign (plans/asm-campaign.md) ─────────────────────────────────────
+# Rung (c): the contig clean fast loop's per-symbol hot path as ONE asm!
+# region (asm_kernel.rs) — seam amortized to ~once per fast-loop run (the
+# increment-(a) falsifier's mechanism). x86_64-only (compile-gated per call
+# site); runtime-dispatched (BMI2 detect) with the GZIPPY_ASM_KERNEL=0
+# kill-switch; the pure-Rust loop is ALWAYS compiled and is the sole path on
+# every other arch/CPU. OFF by default per the charter §4 — default flips
+# only via its own reviewed commit after the frozen ship gate.
+asm-kernel = []
 # ── Phase-2 two-path decode (2026-06-06) ──────────────────────────────────────
 # gzippy-native (intended DEFAULT production once parallel-module lint debt is
 # cleared): ONE unified pure-Rust decode engine, NO C-FFI in the DECODE graph, on

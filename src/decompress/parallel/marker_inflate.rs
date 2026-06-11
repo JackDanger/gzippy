@@ -2429,6 +2429,45 @@ impl Block {
             let dist_tbl: Option<
                 &crate::decompress::inflate::libdeflate_entry::DistTable,
             > = None;
+            // ── ASM-campaign rung (c) dispatch (asm_kernel.rs; charter §4) ──
+            // One OnceLock env/CPU read + the pure knob-exclusion predicate
+            // (charter §3.5 — any measurement knob forces the pure-Rust
+            // loop). OFF ⇒ the loop below is the sole path; it is ALWAYS
+            // compiled regardless.
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            let mut asm_on: bool = super::asm_kernel::enabled()
+                && super::asm_kernel::dispatch_allowed(
+                    prof_on,
+                    oracle_nostore,
+                    orec.is_some(),
+                    dec_spin,
+                    st_spin,
+                    track_backrefs,
+                    local_cap,
+                    FAST_OUT_SLOP,
+                )
+                && dist_tbl.is_some();
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            let asm_stats: bool = super::asm_kernel::stats_enabled();
+            // Loop-invariant kernel context (contract E4/E5). Limits are
+            // computed as integers (no `ptr::add` on speculative values);
+            // `*pos` here is the call-entry position (`emitted == 0`), so
+            // `out_lim` encodes exactly the Rust out guard.
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            let mut asm_ctx = super::asm_kernel::KernCtx {
+                in_ptr: lb.data.as_ptr() as u64,
+                in_lim: in_end.saturating_sub(super::asm_kernel::IN_MARGIN) as u64,
+                out_lim: (base as u64)
+                    .wrapping_add(*pos as u64)
+                    .wrapping_add(local_cap as u64)
+                    .wrapping_sub(FAST_OUT_SLOP as u64),
+                out_base: base as u64,
+                long_tbl: self.lut_litlen.table.long_code_lookup.as_ptr() as u64,
+                dist_tbl: dist_tbl.map(|t| t.entries_ptr() as u64).unwrap_or(0),
+                save_bitbuf: 0,
+                save_bitsleft: 0,
+                short_tbl: self.lut_litlen.table.short_code_lookup.as_ptr() as u64,
+            };
             macro_rules! sync_local_bits {
                 () => {{
                     bits.pos = lb.pos;
@@ -2472,6 +2511,38 @@ impl Block {
                     }
                     prof_last_t = t;
                     prof_pending = super::contig_prof::CLASS_NONE;
+                }
+                // ── ASM-campaign rung (c): the asm region owns the
+                // per-symbol hot path; Rust handles boundary/rare packets
+                // (asm_kernel.rs EXIT-STATE CONTRACT). Re-entry via
+                // `continue 'fast`. `prof_on` true ⇒ `asm_on` false, so the
+                // profiler block above never brackets asm iterations.
+                #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+                if asm_on {
+                    // SAFETY: contract E1-E6 hold here — this IS the Rust
+                    // loop's iteration top (fresh un-consumed packet, clean
+                    // bitsleft, lockstep cursors, validated tables, knobs
+                    // excluded by dispatch).
+                    let dst0 = unsafe { base.add(*pos) };
+                    let (exit, dst1) =
+                        unsafe { super::asm_kernel::run_contig(&mut asm_ctx, &mut lb, dst0) };
+                    let delta = (dst1 as usize) - (dst0 as usize);
+                    if asm_stats {
+                        super::asm_kernel::note_exit(exit, delta);
+                    }
+                    if delta != 0 {
+                        *pos += delta;
+                        emitted += delta;
+                        // X5/X6: re-derive the carried packet from the
+                        // identical cursor (decode purity + ≤21-bit backing
+                        // — contract doc); skipped when nothing changed.
+                        pre = self.lut_litlen.decode_prefilled(&lb);
+                    }
+                    if exit == super::asm_kernel::EXIT_BOUNDARY {
+                        // Monotone guard failure — the Rust loop owns the
+                        // tail under its own (looser) guards.
+                        asm_on = false;
+                    }
                 }
                 // Out headroom: keep `*pos + FAST_OUT_SLOP` within the reserved
                 // word-copy region (out_room already reserves MAX_RUN_LENGTH+8 so
