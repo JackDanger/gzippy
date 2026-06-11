@@ -1,3 +1,18 @@
+## RG-ANCHOR RESOLVED: sink-protocol artifact; CORRECTED BAR TABLE — NATIVE PASSES T8 [2026-06-11]
+The 810-vs-917 rg discrepancy = the flip session's flip_3way.sh used /dev/null while the spine's
+canonical rule is regular-file-on-/dev/shm (rg pays ~108ms@T1/~50ms@T8 real write cost there;
+gzippy's streaming pipeline already hides its own — /dev/null denies gzippy its streaming
+advantage; the spine's comment exists for exactly this phantom class). HISTORICAL ANCHORS VALID;
+the canonical file protocol is the bar denominator (the wall users experience includes output).
+CORRECTED BAR TABLE @ asm-on HEAD (rg=file-protocol, frozen): silesia T1 0.973 (2.7% from bar!) /
+T4 0.957 / T8 1.075 WIN PASS / T16 ~1.14 WIN (extrapolated, banking owed) / bignasa T8 ~1.025 WIN
+(extrapolated) / model T8 0.785. GZIPPY-NATIVE NOW PASSES silesia T8 — its first canonical-protocol
+silesia pass — with T16+bignasa likely (bank them), T1 at -2.7%, T4 -4.3%, model the deep cell.
+Other hypotheses ruled out with evidence (pycache 43-vs-15ms; uncore 0x82b stable; freeze eras).
+NATIVE T1 HONEST TRAJECTORY: 0.578 (M6) -> 0.973 (asm-on, canonical protocol).
+QUEUE: bank T16/bignasa file-protocol cells; full canonical bar matrix BOTH builds at this HEAD;
+fix flip_3way-class scripts to the spine sink rule (instrument-registry note); Squishy refresh;
+then the last levers: T1 -2.7%, T4 -4.3%, model 0.785.
 ## ASM DEFAULT-ON MERGED — all cells improve; RG ANCHOR RE-BASED (integrity correction) [2026-06-11]
 The four flip preconditions landed + verified on real BMI2; kernel default-ON for production
 native builds (kill-switch + BMI2 fallback intact; non-x86 untouched). Frozen 3-way: gz2 improves
