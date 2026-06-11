@@ -1,3 +1,13 @@
+## P3.1 MERGED — T1 regression recovered, native beats pre-arc baseline [2026-06-10]
+Bisect: M3's contig distance chain owned the -4%; DistTable single-lookup in the fast loop fixes
+it (frozen T1 1387 vs baseline 1402; T4/T8 clean). Gate ran the missing table-level differential
+itself (238+ sets x 200k patterns) — now a permanent test; lazy build adopted (no marker-mode
+alloc). Profiler module landed (GZIPPY_CONTIG_PROF). P3.2 ARSENAL TARGETS (measured): backref
+73 cyc/iter (wrapper 61.5) = 61% of classed cycles; lit chaining 21.7M iterations vs wrapper's
+14.2M for identical 27.8M literals (multi-literal LUT packing underused in contig); litpack only
+fires 1.23M times. Next: P3.2 = close the lit-chaining gap (multi-literal emission in the contig
+fast loop) + the remaining backref delta; then model-corpus + T4-band re-measure; then asm if
+still short of the cells (native T1 0.578-class, model 0.577).
 ## ENGINE M6 BANKED — structural arc wall-neutral; ONE engine ready for P3 [2026-06-10]
 Frozen 3-way vs official baselines (sanity gates 6/6): native T4/T8/model TIE within spread
 (gz1/gz2 0.985-0.998); isal regression-free (silesia T8 1.006 still PASS; model 0.859 ==
