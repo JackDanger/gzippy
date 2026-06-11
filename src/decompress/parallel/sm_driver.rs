@@ -65,6 +65,10 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     use crate::decompress::parallel::chunk_fetcher;
     use crate::decompress::parallel::gzip_format;
 
+    // Slab auto-gate input: stored at EVERY decode entry (atomic, never
+    // once-cached) so consecutive decodes with different T re-gate correctly.
+    crate::decompress::parallel::rpmalloc_alloc::set_decode_threads(parallelization);
+
     let (_hdr, header_size) =
         gzip_format::read_header(gzip_data).map_err(|_| ReadParallelSmError::InvalidHeader)?;
     let trailer_size = 8;

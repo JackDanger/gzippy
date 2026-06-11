@@ -82,6 +82,7 @@ seeded_block|GZIPPY_SEEDED_BLOCK=0|verbose_seeded
 exact_block|GZIPPY_EXACT_BLOCK=0|verbose_exact
 hit_drive|GZIPPY_NO_HIT_DRIVE=1|none
 slab_alloc|GZIPPY_SLAB_ALLOC=1|rpmalloc_stats
+slab_off|GZIPPY_SLAB_ALLOC=0|rpmalloc_stats_off
 eager_postproc|GZIPPY_EAGER_POSTPROC=1|none
 "
 
