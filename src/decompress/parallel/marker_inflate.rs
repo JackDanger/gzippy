@@ -360,6 +360,94 @@ pub(crate) mod marker_dist_stats {
     }
 }
 
+/// `GZIPPY_MFAST_PROF=1` — rdtsc cycle/event profiler for the `'mfast` marker
+/// fast loop and the careful marker loop. Zero-cost when off (one OnceLock bool
+/// branch per `read_internal_compressed_specialized::<true>` call). x86_64 only
+/// (rdtsc); on other arches `rdtsc` always returns 0 and all counters stay 0.
+///
+/// Reports at decode-end via [`mfast_prof::dump_if_enabled`] (called from the
+/// GZIPPY_VERBOSE block in chunk_fetcher.rs). Key output:
+///   mfast  cyc / total   ← share of marker-decode cycles in the fast loop
+///   careful cyc / total  ← share in the careful loop
+///   cyc/ev for each      ← cost-per-event ratio (fast-loop efficiency)
+pub(crate) mod mfast_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// Total rdtsc cycles inside the `'mfast` block (from the rdtsc taken just
+    /// before `'mfast: loop {` to the one taken after the loop exits). Includes
+    /// the fast-loop setup (dist-table amortization check, initial preload refill)
+    /// — both are amortized per block and are negligible vs the loop itself.
+    pub static MFAST_CYC: AtomicU64 = AtomicU64::new(0);
+    /// Total decode events handled by `'mfast` (iterations that passed the guard
+    /// check). One event = one ISA-L LUT litlen decode that emits 1-3 symbols.
+    pub static MFAST_EVENTS: AtomicU64 = AtomicU64::new(0);
+    /// Total rdtsc cycles in the careful marker loop
+    /// (`while emitted < n_max_to_decode`, CONTAINS_MARKERS=true path only).
+    pub static CAREFUL_CYC: AtomicU64 = AtomicU64::new(0);
+    /// Total decode events handled by the careful marker loop (outer iterations).
+    pub static CAREFUL_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GZIPPY_MFAST_PROF").is_ok_and(|v| v == "1"))
+    }
+
+    /// Read TSC on x86_64; return 0 on other arches.
+    #[inline(always)]
+    pub fn rdtsc(on: bool) -> u64 {
+        crate::decompress::parallel::contig_prof::rdtsc(on)
+    }
+
+    pub fn dump_if_enabled() {
+        if !enabled() {
+            return;
+        }
+        use Ordering::Relaxed;
+        let mf_cyc = MFAST_CYC.load(Relaxed);
+        let mf_ev = MFAST_EVENTS.load(Relaxed);
+        let ca_cyc = CAREFUL_CYC.load(Relaxed);
+        let ca_ev = CAREFUL_EVENTS.load(Relaxed);
+        let total_cyc = mf_cyc + ca_cyc;
+        let total_ev = mf_ev + ca_ev;
+        let pct = |part: u64, whole: u64| -> f64 {
+            if whole == 0 {
+                0.0
+            } else {
+                part as f64 * 100.0 / whole as f64
+            }
+        };
+        let cpe = |cyc: u64, ev: u64| -> f64 {
+            if ev == 0 {
+                0.0
+            } else {
+                cyc as f64 / ev as f64
+            }
+        };
+        eprintln!("[mfast-prof] marker-decode breakdown (GZIPPY_MFAST_PROF=1):");
+        eprintln!(
+            "  mfast  : cyc={:>16}  events={:>12}  {:>5.1}% of total  {:>6.1} cyc/ev",
+            mf_cyc,
+            mf_ev,
+            pct(mf_cyc, total_cyc),
+            cpe(mf_cyc, mf_ev)
+        );
+        eprintln!(
+            "  careful: cyc={:>16}  events={:>12}  {:>5.1}% of total  {:>6.1} cyc/ev",
+            ca_cyc,
+            ca_ev,
+            pct(ca_cyc, total_cyc),
+            cpe(ca_cyc, ca_ev)
+        );
+        eprintln!("  total  : cyc={:>16}  events={:>12}", total_cyc, total_ev);
+        eprintln!(
+            "  mfast-share: {:.3}  (hypothesis: wall delta ≈ inject_pct × this)",
+            pct(mf_cyc, total_cyc) / 100.0
+        );
+    }
+}
+
 /// Rung-(d) increment 1 kill-switch (plans/asm-rung-d-eval.md §5, F-d1):
 /// `GZIPPY_MARKER_DIST_TABLE=0` restores the exact pre-change marker-fast-loop
 /// distance decode (the `dist_hc` → DISTANCE_EXTRA → refill-check →
@@ -1697,6 +1785,31 @@ impl Block {
         // D2). With the gate, the control only affects the path it injects into.
         let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
 
+        // ── MFAST PROBE KNOBS (probe/mfast-phase0) ────────────────────────────
+        // Snapshot once per function call (OnceLock, cost ≈ one predicted branch
+        // each). Const-folded to their OFF defaults on the clean path because:
+        //   `mfast_disabled` = `CONTAINS_MARKERS && ...` → `false && ...` = false
+        //   `mfast_spin`     = `if false { ... } else { 0 }` = 0
+        //   `mfast_yield`    = `localize_yield_kind(0)` = false
+        //   `mfast_prof_on`  = `false && ...` = false
+        // So these are zero-cost on the clean specialization (<false>) and only
+        // active on the marker specialization (<true>).
+        //
+        // GZIPPY_MFAST_DISABLE=1:    mfast_disabled=true ⇒ skip `'mfast` entry.
+        // GZIPPY_SLOW_MFAST_MODE=N:  mfast_spin>0 ⇒ inject per iter INSIDE `'mfast`.
+        //   Unlike GZIPPY_SLOW_MARKER_MODE (which sets slow_spin != 0 and DISABLES
+        //   the fast loop entry), this knob does NOT gate entry — it fires inside the
+        //   loop body, after the guard. GZIPPY_SLOW_KIND=sleep ⇒ frequency-neutral.
+        // GZIPPY_MFAST_PROF=1:       rdtsc cycle/event accounting (x86_64 only).
+        let mfast_disabled: bool = CONTAINS_MARKERS && super::slow_knob::mfast_disabled();
+        let mfast_spin: u64 = if CONTAINS_MARKERS {
+            super::slow_knob::mfast_spin_iters()
+        } else {
+            0
+        };
+        let mfast_yield: bool = super::slow_knob::localize_yield_kind(mfast_spin);
+        let mfast_prof_on: bool = CONTAINS_MARKERS && mfast_prof::enabled();
+
         // ── VAR_V SPECULATIVE SOFTWARE-PIPELINED FAST LOOP (clean path only) ──
         // igzip trick #2 ported faithfully ONTO the production wrapping u8 ring
         // (NOT a flat buffer — the real `% U8_RING_SIZE` modulus, wrap-straddle
@@ -1908,7 +2021,11 @@ impl Block {
         // and the careful loop below re-decodes from there — no state carried, no
         // desync (identical contract to the clean fast loop). Const-folded away
         // entirely on the clean path (`!CONTAINS_MARKERS`).
-        if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield {
+        // MFAST_DISABLE gate: when true, fall through to the careful loop for 100%
+        // of marker decode. Byte-identical output, different code path. This is the
+        // DISCRIMINATOR arm of the mfast-phase0 probe — if wall is flat vs arm0
+        // (knobs off), aggregate marker decode is SLACK on this cell.
+        if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield && !mfast_disabled {
             // ── Rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1) ──────
             // The fast loop's distance decode goes through the libdeflate-shape
             // `DistTable` — ONE entry load + in-register `consume_entry` /
@@ -1957,6 +2074,13 @@ impl Block {
             let in_end = bits.data.len();
             bits.refill();
             let mut pre = self.lut_litlen.decode(bits);
+            // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
+            // above (dist-table amortization + initial preload) which is amortized
+            // per block and is negligible vs the loop body in aggregate.
+            // Declared here (not before the `if CONTAINS_MARKERS` block) so
+            // there is no "initial value never read" warning on the clean path.
+            let mfast_t0: u64 = mfast_prof::rdtsc(mfast_prof_on);
+            let mut mfast_ev: u64 = 0;
             'mfast: loop {
                 // Resumable cap + wrap headroom + input slop. Headroom is in u16
                 // SLOTS (ring modulus is RING_SIZE = 65536 slots = 128 KiB).
@@ -1967,6 +2091,12 @@ impl Block {
                 if !(out_ok && in_ok) {
                     break 'mfast;
                 }
+                // MFAST_PROF: count events that passed the guard (actual work).
+                // SLOW_MFAST_MODE: localized per-event inject WITHOUT gating entry.
+                if mfast_prof_on {
+                    mfast_ev += 1;
+                }
+                super::slow_knob::inject_localize(mfast_spin, mfast_yield);
                 let sym0 = pre.symbol;
                 let sym_count0 = pre.sym_count;
                 let bit_count0 = pre.bit_count;
@@ -2155,9 +2285,31 @@ impl Block {
                 bits.refill();
                 pre = self.lut_litlen.decode(bits);
             }
+            // MFAST_PROF: flush mfast cycles + event count to global atomics.
+            if mfast_prof_on {
+                use std::sync::atomic::Ordering;
+                let cyc = mfast_prof::rdtsc(true).wrapping_sub(mfast_t0);
+                mfast_prof::MFAST_CYC.fetch_add(cyc, Ordering::Relaxed);
+                mfast_prof::MFAST_EVENTS.fetch_add(mfast_ev, Ordering::Relaxed);
+            }
         }
 
+        // MFAST_PROF: careful-loop cycle measurement. Declared here so the end
+        // rdtsc fires after the loop exits naturally. `commit!()` early-return
+        // paths skip this rdtsc — they are edge cases (EOB, errors) and don't
+        // contribute meaningfully to the aggregate. Const-folds to 0 on the
+        // clean path (mfast_prof_on = false there).
+        let careful_t0: u64 = if mfast_prof_on {
+            mfast_prof::rdtsc(true)
+        } else {
+            0
+        };
+        let mut careful_ev: u64 = 0;
         while emitted < n_max_to_decode {
+            // MFAST_PROF: count careful-loop events (outer iterations).
+            if mfast_prof_on {
+                careful_ev += 1;
+            }
             // One slow-knob injection per decode event (this outer iteration =
             // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
             super::slow_knob::inject(slow_spin, slow_yield);
@@ -2307,6 +2459,15 @@ impl Block {
                 emitted += length;
                 break;
             }
+        }
+        // MFAST_PROF: flush careful-loop cycles + events. Only fires when
+        // mfast_prof_on=true (marker path + GZIPPY_MFAST_PROF=1). commit!()
+        // paths skip this flush (edge cases: EOB mid-block, errors).
+        if mfast_prof_on {
+            use std::sync::atomic::Ordering;
+            let cyc = mfast_prof::rdtsc(true).wrapping_sub(careful_t0);
+            mfast_prof::CAREFUL_CYC.fetch_add(cyc, Ordering::Relaxed);
+            mfast_prof::CAREFUL_EVENTS.fetch_add(careful_ev, Ordering::Relaxed);
         }
         self.ring.pos = pos;
         self.decoded_bytes += emitted;
