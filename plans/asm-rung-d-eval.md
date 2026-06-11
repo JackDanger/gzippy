@@ -188,3 +188,85 @@ condition is evaluated.
 - Counter check: `flip_to_clean`/`isal_chunks` on bignasa-isal must be
   UNCHANGED by the lever (0 flips / 1 isal chunk) — the lever must not be a
   routing change in disguise.
+
+---
+
+## 6. F-d1 VERDICT (2026-06-11, same session): TIE-KEEP + the bignasa attribution CAUSALLY REFUTED
+
+Increment 1 built, gauntleted, frozen-measured (commit `67431727`,
+branch `engine/asm-rung-d`).
+
+### Gauntlet (all green)
+- fmt clean; clippy: default-features 0 errors; pure-rust-inflate 9 == 9 at
+  base (pre-existing lint debt, count unchanged).
+- Suites: local pure-rust-inflate **947/0** (incl. the new differential +
+  corpus_silesia_if_available + resumable_decodes_real_silesia); local
+  default-features **674/0**; guest gzippy-isal **939 pass / 2
+  contention-flakes** (`diff_ratio_parallel_single_member_speedup` — the
+  documented charter-§10 load-flake class — and `bench_production_inflate`,
+  a perf-guard sibling; BOTH pass in isolation on the same box).
+- Differential: `marker_fast_loop_dist_table_matches_dist_hc_and_payload` —
+  5 payload classes × 2 resumable caps, ON/OFF arms byte+cursor+
+  distance_marker equality, marker-resolved output == payload ground truth,
+  engagement counter ON>0 / OFF==0.
+- Sha grid: **72/72** byte-identical — {silesia, model, bignasa, storedmix}
+  × T{1,4,8} × {nat-on, nat-off, nat-base, isal-on, isal-off, isal-base};
+  silesia == the pinned corpus sha.
+- Effect verification (`GZIPPY_MARKER_DIST_STATS=1`, production binaries):
+  bignasa-isal T8 **lut_backrefs=11,591,490 / hc=0** (ON) ↔ **0 / 11,591,490**
+  (kill-switch) — the lever is live and the kill-switch real; silesia T4
+  4,352,108 on BOTH builds (deterministic, identical counts).
+
+### Frozen interleaved A/B (bench-lock, n=9, file sink on /dev/shm both arms,
+### sha-verified 81/81 + 27/27 reps, RESTORE verified after each bracket)
+| cell | ON | OFF (same-bin kill) | base (cross-bin) | ON-vs-OFF | sign |
+|------|----|----|----|-----------|------|
+| bignasa-isal T8 | 1098 | 1086 | 1095 | +1.1% | 3/9 — TIE (spread 991-1109) |
+| silesia-isal T4 | 571 | 574 | 570 | -0.5% | 5/9 — TIE |
+| silesia-native T4 | 573 | 584 | 575 | **-1.9%** | **8/9** — consistent, below the 2% bar |
+| bignasa-isal T1 (follow-up) | 1350 | 1348 | 1347 | +0.15% | 4/9 — TIE (tight ±5ms) — and VACUOUS, see below |
+
+(Frozen walls are no_turbo-pinned — ~4x the turbo walls; arms within each
+bracket are like-for-like.)
+
+### The mechanism chain (causal probes, not attribution)
+1. **T1 is vacuous for ANY marker-loop lever**: `GZIPPY_SLOW_HITS=1` +
+   marker knob at T1 → **inject hits = 0**; no marker-dist stats line at T1.
+   Sequential (T1) chunk decode gives every chunk its predecessor window —
+   window-absent marker decode only exists under T>1 speculation. (The
+   marker-knob comment in `read_internal_compressed_specialized` saying the
+   `<true>` path "always uses the careful loop" is STALE since the mfast
+   port; the knob now also de-selects the fast loop — perturbations include
+   that shape change.)
+2. **At T8 the marker loop has ≥2x slack under the wall on bignasa-isal**:
+   inject site alive (36,171,210 hits), and the interleaved wall response is
+   FLAT at f100 (≈100% per-event slow + careful-loop forcing): 426/419/454 →
+   413/416/505 ms; only f400 moves it (798/828/818 ≈ 2x). A region whose 2x
+   slowdown is wall-free cannot pay for a speedup (slow-down slope ≠ speed-up
+   ceiling — here even the slope is flat at moderate scale).
+3. Therefore the isal-decide "bignasa-isal = 100% marker bytes at 166 MB/s ⇒
+   the marker loop owns the cell" read was the ANALYST-BIASED attribution
+   class the measurement process warns about: the marker loop is huge in
+   byte-share and WALL-NEUTRAL on that cell. The bignasa-isal deficit
+   (0.918-0.940) lives in the SERIAL residue: T1 1350 → T8 1086 frozen is a
+   1.24x speedup on 8 workers — drain/apply-window/writer, not decode.
+4. silesia-native T4 (-1.9%, 8/9) is the one cell with a consistent
+   direction: marker share ~1/3 of bytes, less pipeline slack at T4 than T8.
+   Real but sub-bar.
+
+### Disposition (rule 7a)
+- **KEEP, default-ON**: byte-exact everywhere (72/72 + differential), TIE-or-
+  slightly-better on every measured cell, kill-switch + effect counters are
+  permanent A/B instrumentation, and it makes the marker loop structurally
+  MORE like the contig loop (one dist-decode shape across the engine).
+- **The N2-N5 ladder is DEPRIORITIZED, not refuted**: the same slack
+  mechanism that nulls N1 on bignasa-isal T8 bounds every marker-loop
+  micro-lever there; silesia-native T4 (the only responsive cell) caps the
+  ladder's value at low single-digit %. Before ANY further marker-loop
+  spend, the rung-(d) charter premise must be re-aimed: the next causal
+  target on bignasa-isal is the SERIAL residue (the 1.24x scaling wall —
+  drain/apply-window/markers-replacement/writer chain), which this session's
+  probes localized for free.
+- The marker NOSTORE oracle (eval §3) is NOT needed for this verdict — the
+  slow-injection knee (flat at 2x, responsive at 4x+) already bounds the
+  speed-up ceiling at ~zero for the T8 cell.
