@@ -1,0 +1,251 @@
+====================================================================================================
+fulcrum decide — ONE-RUN decision table (plans/fulcrum2-charter.md)
+====================================================================================================
+run        : decide_20260611T052041Z  bin=/root/bin-p35-native sha=aed7fd8303348b58 feature=gzippy-native
+box        : freeze=frozen quiet=quiet governor=performance no_turbo=1 runnable_avg=1.50
+rapidgzip  : rapidgzip, CLI to the parallelized, indexed, and seekable gzip decoding library rapidgzip version 0.16.0
+sha-verify : every measured run checked against the corpus pin (guest aborts on mismatch); cells_done=5
+
+-- CELL SCOREBOARD (wall, interleaved, sha-verified; bar = 0.99x EVERY T) --
+  model:T8      gz=  675.4ms rg=  412.5ms ratio=0.611 FAIL RESOLVED spread gz=3.0%/rg=1.6%
+  silesia:T1    gz= 1402.1ms rg=  918.9ms ratio=0.655 FAIL RESOLVED spread gz=0.4%/rg=0.8% BIMODAL[+rg]
+  silesia:T4    gz=  608.7ms rg=  492.7ms ratio=0.809 FAIL RESOLVED spread gz=3.1%/rg=6.4%
+  silesia:T8    gz=  397.3ms rg=  357.0ms ratio=0.899 FAIL RESOLVED spread gz=9.5%/rg=5.9% BIMODAL[+rg]
+  silesia:T16   gz=  352.3ms rg=  336.5ms ratio=0.955 FAIL UNRESOLVED(N->16) spread gz=2.6%/rg=7.0% BIMODAL[+rg]
+
+-- RANKED COMPONENTS (tier 1 causal-COSTS > tier 2 hypotheses > tier 3 confirms > tier 4 null) --
+
+[ 1] knob.slab_alloc (slab allocator (opt-in; the reverted lever))   cells: silesia:T1
+     attribution : Δ(alt-base)=-103.2ms @ canonical mask
+     status      : CAUSAL-VERIFIED: shipped default COSTS 103.2ms ±11.1 here (alt arm faster) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=0.2%] knob[n=5 spread=0.8%] RESOLVED
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs slab_alloc --knob-n 21 --bin /root/bin-p35-native
+
+[ 2] pipeline.consumer.compute   cells: model:T8,silesia:T1,silesia:T4,silesia:T8,silesia:T16
+     attribution : worst silesia:T1: 1274.5ms (93% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_silesia_T1/trace.json --feature gzippy-native
+
+[ 3] engine.backref   cells: silesia:T1
+     attribution : 60.5% of classed cyc, 63.2 cyc/iter, iters=17,971,348
+     status      : HYPOTHESIS: bounded ≤292ms ESTIMATE (= cell rg-gap 483ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[ 4] pipeline.consumer.output   cells: model:T8,silesia:T1,silesia:T4,silesia:T8,silesia:T16
+     attribution : worst model:T8: 120.7ms (19% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: GZIPPY_SKIP_WRITEV_SYSCALL=1 A/B (output-stage removal probe)
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_model_T8/trace.json --feature gzippy-native
+
+[ 5] pipeline.consumer.wait   cells: model:T8,silesia:T1,silesia:T4,silesia:T8,silesia:T16
+     attribution : worst model:T8: 467.7ms (74% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: worker-side lever — perturb the ENGINE (slow_knob) and watch this wait shrink/grow; the wait itself is not the cause
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_model_T8/trace.json --feature gzippy-native
+
+[ 6] engine.litchn   cells: model:T8
+     attribution : 42.6% of classed cyc, 56.1 cyc/iter, iters=43,720,878
+     status      : HYPOTHESIS: bounded ≤112ms ESTIMATE (= cell rg-gap 263ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/model.gz >/dev/null
+
+[ 7] engine.litchn   cells: silesia:T1
+     attribution : 22.2% of classed cyc, 65.8 cyc/iter, iters=6,319,731
+     status      : HYPOTHESIS: bounded ≤107ms ESTIMATE (= cell rg-gap 483ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[ 8] engine.backref   cells: model:T8
+     attribution : 33.3% of classed cyc, 69.7 cyc/iter, iters=27,497,462
+     status      : HYPOTHESIS: bounded ≤88ms ESTIMATE (= cell rg-gap 263ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/model.gz >/dev/null
+
+[ 9] engine.backref   cells: silesia:T4
+     attribution : 59.7% of classed cyc, 65.6 cyc/iter, iters=10,841,757
+     status      : HYPOTHESIS: bounded ≤69ms ESTIMATE (= cell rg-gap 116ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 4 /root/silesia.gz >/dev/null
+
+[10] engine.lit1   cells: silesia:T1
+     attribution : 12.3% of classed cyc, 69.7 cyc/iter, iters=3,303,758
+     status      : HYPOTHESIS: bounded ≤59ms ESTIMATE (= cell rg-gap 483ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[11] engine.lit1   cells: model:T8
+     attribution : 12.1% of classed cyc, 71.6 cyc/iter, iters=9,684,115
+     status      : HYPOTHESIS: bounded ≤32ms ESTIMATE (= cell rg-gap 263ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/model.gz >/dev/null
+
+[12] engine.litpack   cells: model:T8
+     attribution : 12.0% of classed cyc, 70.1 cyc/iter, iters=9,821,333
+     status      : HYPOTHESIS: bounded ≤32ms ESTIMATE (= cell rg-gap 263ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/model.gz >/dev/null
+
+[13] engine.litchn   cells: silesia:T4
+     attribution : 23.5% of classed cyc, 65.1 cyc/iter, iters=4,310,114
+     status      : HYPOTHESIS: bounded ≤27ms ESTIMATE (= cell rg-gap 116ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 4 /root/silesia.gz >/dev/null
+
+[14] engine.litpack   cells: silesia:T1
+     attribution : 5.0% of classed cyc, 76.6 cyc/iter, iters=1,227,631
+     status      : HYPOTHESIS: bounded ≤24ms ESTIMATE (= cell rg-gap 483ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[15] engine.backref   cells: silesia:T8
+     attribution : 59.7% of classed cyc, 65.6 cyc/iter, iters=10,841,757
+     status      : HYPOTHESIS: bounded ≤24ms ESTIMATE (= cell rg-gap 40ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/silesia.gz >/dev/null
+
+[16] engine.lit1   cells: silesia:T4
+     attribution : 12.9% of classed cyc, 68.6 cyc/iter, iters=2,240,400
+     status      : HYPOTHESIS: bounded ≤15ms ESTIMATE (= cell rg-gap 116ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 4 /root/silesia.gz >/dev/null
+
+[17] engine.backref   cells: silesia:T16
+     attribution : 63.5% of classed cyc, 98.2 cyc/iter, iters=7,104,754
+     status      : HYPOTHESIS: bounded ≤10ms ESTIMATE (= cell rg-gap 16ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 16 /root/silesia.gz >/dev/null
+
+[18] engine.litchn   cells: silesia:T8
+     attribution : 23.6% of classed cyc, 65.3 cyc/iter, iters=4,310,114
+     status      : HYPOTHESIS: bounded ≤10ms ESTIMATE (= cell rg-gap 40ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/silesia.gz >/dev/null
+
+[19] engine.lit1   cells: silesia:T8
+     attribution : 12.8% of classed cyc, 68.2 cyc/iter, iters=2,240,400
+     status      : HYPOTHESIS: bounded ≤5ms ESTIMATE (= cell rg-gap 40ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/silesia.gz >/dev/null
+
+[20] engine.litpack   cells: silesia:T4
+     attribution : 3.9% of classed cyc, 76.1 cyc/iter, iters=615,530
+     status      : HYPOTHESIS: bounded ≤5ms ESTIMATE (= cell rg-gap 116ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 4 /root/silesia.gz >/dev/null
+
+[21] engine.litchn   cells: silesia:T16
+     attribution : 20.9% of classed cyc, 101.5 cyc/iter, iters=2,261,163
+     status      : HYPOTHESIS: bounded ≤3ms ESTIMATE (= cell rg-gap 16ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 16 /root/silesia.gz >/dev/null
+
+[22] engine.lit1   cells: silesia:T16
+     attribution : 12.7% of classed cyc, 86.0 cyc/iter, iters=1,617,308
+     status      : HYPOTHESIS: bounded ≤2ms ESTIMATE (= cell rg-gap 16ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 16 /root/silesia.gz >/dev/null
+
+[23] engine.litpack   cells: silesia:T8
+     attribution : 3.9% of classed cyc, 76.3 cyc/iter, iters=615,530
+     status      : HYPOTHESIS: bounded ≤2ms ESTIMATE (= cell rg-gap 40ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 8 /root/silesia.gz >/dev/null
+
+[24] engine.litpack   cells: silesia:T16
+     attribution : 3.0% of classed cyc, 106.4 cyc/iter, iters=310,834
+     status      : HYPOTHESIS: bounded ≤0ms ESTIMATE (= cell rg-gap 16ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 16 /root/silesia.gz >/dev/null
+
+[25] pipeline.consumer.idle   cells: model:T8,silesia:T1,silesia:T4,silesia:T8,silesia:T16
+     attribution : worst silesia:T16: 0.0ms (0% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: scheduling-state probe: N=21 re-measure (bimodal check) before anything
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_silesia_T16/trace.json --feature gzippy-native
+
+[26] knob.seeded_block (M3 seeded chunks on Block)   cells: silesia:T1
+     attribution : Δ(alt-base)=+128.0ms @ canonical mask
+     status      : CAUSAL-VERIFIED: feature PAYS 128.0ms ±24.0 (disabling it loses) [effect-verified: knob arm: seeded_block=0, seeded_wrapper=16 (switch effective)]
+     distribution: base[n=5 spread=0.4% BIMODAL] knob[n=5 spread=1.7%] RESOLVED
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs seeded_block --knob-n 21 --bin /root/bin-p35-native
+
+[27] knob.exact_block (M4 until-exact on Block)   cells: silesia:T1
+     attribution : Δ(alt-base)=+13.2ms @ canonical mask
+     status      : CAUSAL-VERIFIED: feature PAYS 13.2ms ±13.0 (disabling it loses) [effect-verified: knob arm: exact_block=0, exact_wrapper=1 (switch effective)]
+     distribution: base[n=5 spread=0.9%] knob[n=5 spread=0.8%] RESOLVED
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs exact_block --knob-n 21 --bin /root/bin-p35-native
+
+[28] knob.hit_drive (confirmed-offset hit-drive prefetch)   cells: silesia:T16
+     attribution : Δ(alt-base)=+11.1ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=11.1ms ≤ spread 15.0ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=4.3%] knob[n=5 spread=1.1%] UNRESOLVED(N->10)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs hit_drive --knob-n 21 --bin /root/bin-p35-native
+
+[29] knob.dist_amort (P3.4 DistTable amortization)   cells: silesia:T1
+     attribution : Δ(alt-base)=+8.7ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=8.7ms ≤ spread 15.4ms (bounded) [effect-verified: base builds=2790/reuses=7 alive, knob arm counters dead (P3.4 path bypassed — switch effective)]
+     distribution: base[n=5 spread=1.1%] knob[n=5 spread=0.3% BIMODAL] UNRESOLVED(N->16)
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs dist_amort --knob-n 21 --bin /root/bin-p35-native
+
+[30] knob.eager_postproc (eager consumer post-processing (opt-in))   cells: silesia:T16
+     attribution : Δ(alt-base)=+4.9ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=4.9ms ≤ spread 20.2ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=5.7%] knob[n=5 spread=1.9%] UNRESOLVED(N->85)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs eager_postproc --knob-n 21 --bin /root/bin-p35-native
+
+[31] knob.stored_flip (M2b stored early-flip)   cells: silesia:T1
+     attribution : Δ(alt-base)=+4.4ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=4.4ms ≤ spread 11.3ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=0.6%] knob[n=5 spread=0.8%] UNRESOLVED(N->33)
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs stored_flip --knob-n 21 --bin /root/bin-p35-native
+
+[32] knob.seeded_block (M3 seeded chunks on Block)   cells: silesia:T16
+     attribution : Δ(alt-base)=-4.0ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=4.0ms ≤ spread 22.4ms (bounded) [effect-verified: knob arm: seeded_block=0, seeded_wrapper=16 (switch effective)]
+     distribution: base[n=5 spread=2.1%] knob[n=5 spread=6.3%] UNRESOLVED(N->99)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs seeded_block --knob-n 21 --bin /root/bin-p35-native
+
+[33] knob.stored_flip (M2b stored early-flip)   cells: silesia:T16
+     attribution : Δ(alt-base)=+3.9ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=3.9ms ≤ spread 6.8ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=1.9%] knob[n=5 spread=1.4%] UNRESOLVED(N->16)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs stored_flip --knob-n 21 --bin /root/bin-p35-native
+
+[34] knob.hit_drive (confirmed-offset hit-drive prefetch)   cells: silesia:T1
+     attribution : Δ(alt-base)=+3.3ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=3.3ms ≤ spread 8.5ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=0.4%] knob[n=5 spread=0.6% BIMODAL] UNRESOLVED(N->34)
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs hit_drive --knob-n 21 --bin /root/bin-p35-native
+
+[35] knob.dist_amort (P3.4 DistTable amortization)   cells: silesia:T16
+     attribution : Δ(alt-base)=-2.8ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=2.8ms ≤ spread 11.9ms (bounded) [effect-verified: base builds=2790/reuses=7 alive, knob arm counters dead (P3.4 path bypassed — switch effective)]
+     distribution: base[n=5 spread=2.2%] knob[n=5 spread=3.4%] UNRESOLVED(N->91)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs dist_amort --knob-n 21 --bin /root/bin-p35-native
+
+[36] knob.exact_block (M4 until-exact on Block)   cells: silesia:T16
+     attribution : Δ(alt-base)=+2.7ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=2.7ms ≤ spread 18.1ms (bounded) [effect-verified: knob arm: exact_block=0, exact_wrapper=1 (switch effective)]
+     distribution: base[n=5 spread=5.1%] knob[n=5 spread=0.6%] UNRESOLVED(N->99)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs exact_block --knob-n 21 --bin /root/bin-p35-native
+
+[37] knob.eager_postproc (eager consumer post-processing (opt-in))   cells: silesia:T1
+     attribution : Δ(alt-base)=-1.1ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=1.1ms ≤ spread 4.2ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=0.3% BIMODAL] knob[n=5 spread=0.3% BIMODAL] UNRESOLVED(N->74)
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs eager_postproc --knob-n 21 --bin /root/bin-p35-native
+
+[38] knob.slab_alloc (slab allocator (opt-in; the reverted lever))   cells: silesia:T16
+     attribution : Δ(alt-base)=-0.7ms @ canonical mask
+     status      : CAUSAL-NULL: |Δ|=0.7ms ≤ spread 20.9ms (bounded) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=5 spread=4.7%] knob[n=5 spread=6.0%] UNRESOLVED(N->99)
+     re-verify   : scripts/bench/decide.sh --cells silesia:16 --knob-cells silesia:16 --knobs slab_alloc --knob-n 21 --bin /root/bin-p35-native
+
+-- ANOMALIES (verbatim; investigate before trusting affected rows) --
+  !! silesia:T8: backref.cyc_iter=65.6 vs banked 34.9 (>±25%) — DIVERGES-FROM-BANK [shares MATCH the bank => structure consistent; absolute TSC-cyc/iter scales with core-clock state (TSC is fixed-rate) — suspect a frequency-state mismatch between captures (frozen no_turbo here vs the bank's capture), not a code change]
+
+====================================================================================================
+DO THIS NEXT: knob.slab_alloc (slab allocator (opt-in; the reverted lever)) on silesia:T1 — the shipped default measurably COSTS wall (shipped default COSTS 103.2ms ±11.1 here (alt arm faster) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]). Re-verify at N=21 then fix/condition the feature: scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs slab_alloc --knob-n 21 --bin /root/bin-p35-native
+====================================================================================================

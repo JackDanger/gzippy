@@ -1,0 +1,6 @@
+knob=exact_block
+env=GZIPPY_EXACT_BLOCK=0
+pred=verbose_exact
+cell=silesia:1
+mask=0
+sha_ok=1
