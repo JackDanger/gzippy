@@ -2507,6 +2507,18 @@ impl Block {
                 // `base` valid for `[0, cap)`.
                 let mut trailing_code: u16 = 0;
                 let mut have_trailing = false;
+                // P3.5 c2: fused litlen→dist lookahead (lone-length arm).
+                // Carries the dist short-LUT entry loaded EARLY — at the
+                // point the litlen packet is known to be a lone non-literal,
+                // before the EOB/MAX/length branch tree resolves — so the
+                // dependent dist-table load issues sooner. Same index
+                // (`lb.bitbuf` is post-consume and untouched until the
+                // backref arm), same table ⇒ same value as the in-place
+                // lookup it replaces; a wasted load on an EOB/invalid code
+                // reads always-valid table memory. Byte-exact by
+                // construction.
+                let mut spec_dist: Option<crate::decompress::inflate::libdeflate_entry::DistEntry> =
+                    None;
                 if sym_count0 == 1 {
                     let code = (sym0 & 0xFFFF) as u16;
                     if code <= 255 {
@@ -2605,6 +2617,10 @@ impl Block {
                     } else {
                         trailing_code = code;
                         have_trailing = true;
+                        // P3.5 c2: issue the dist load now (see decl above).
+                        if let Some(dt) = dist_tbl {
+                            spec_dist = Some(dt.lookup(lb.bitbuf));
+                        }
                     }
                 } else {
                     // ORACLE NOSTORE: elide the packed store, keep the accounting.
@@ -2667,7 +2683,13 @@ impl Block {
                             // <= 15-bit code + <= 5 packed length-extra), so
                             // >= 28 remain >= 9 main + 6 subtable + 13 extra.
                             use crate::decompress::inflate::libdeflate_entry::DistTable;
-                            let mut dist_entry = dt.lookup(lb.bitbuf);
+                            // P3.5 c2: use the early-issued entry when the
+                            // lone-length arm already loaded it (identical
+                            // index — no consumes between the sites).
+                            let mut dist_entry = match spec_dist {
+                                Some(e) => e,
+                                None => dt.lookup(lb.bitbuf),
+                            };
                             if dist_entry.is_subtable_ptr() {
                                 lb.consume(DistTable::TABLE_BITS as u32);
                                 dist_entry = dt.lookup_subtable_direct(dist_entry, lb.bitbuf);
