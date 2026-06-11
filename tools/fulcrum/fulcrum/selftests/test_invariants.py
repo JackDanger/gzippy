@@ -187,6 +187,73 @@ def run():
     check(any("CONTRADICTS-LEDGER" in a for a in rep_l2["anomalies"]),
           "e2e ledger: drifted comparator wall (the rg-anchor case) surfaces "
           "CONTRADICTS-LEDGER in the report")
+    # The contradicting live row is NOT auto-banked as an anchor: it lands
+    # pending-reconcile; the un-contradicted gz row of the same run banks
+    # active.
+    led_rt = Ledger(lpath)
+    rg_rows = [r for r in led_rt.rows()
+               if r.get("key") == "silesia:T1:rg" and r.get("runid") == "st2"]
+    check(len(rg_rows) == 1 and rg_rows[0].get("status") == "pending-reconcile",
+          "e2e ledger: contradicting live rg row banked pending-reconcile, "
+          "not as an anchor")
+    check(any("pending-reconcile" in a and "supersede" in a
+              for a in rep_l2["anomalies"]),
+          "e2e ledger: report names the pending-reconcile banking + the "
+          "supersede resolution path")
+    rg_anchors = led_rt.anchors(key="silesia:T1:rg")
+    check([r.get("runid") for r in rg_anchors] == ["st"],
+          "e2e ledger: anchor set for the contested key is still ONLY the "
+          "original banked row (pending never anchors)")
+
+    # ------------------------------------------------------------------
+    # POISON-THEN-SUPERSEDE (the P2 gate case): a contested anchor is
+    # retired by an explicit supersede record; the pending row is promoted;
+    # subsequent runs compare against the NEW anchor only.
+    # ------------------------------------------------------------------
+    # A third drifted run still contradicts the ORIGINAL anchor — never the
+    # pending row (a contested number must not become the next run's truth).
+    live3 = make_record("st3", "gzippy", "cell", "silesia:T1:rg",
+                        728.0, 7, 1.0, "comparator",
+                        Fingerprint.from_dict(rg_anchors[0]["fingerprint"]))
+    c3 = led_rt.contradictions(live3)
+    check(len(c3) == 1 and "918.0ms banked" in c3[0],
+          f"poison: 3rd drifted run contradicts ONLY the original anchor "
+          f"(pending row never used as an anchor) — got {len(c3)} "
+          f"contradiction(s)")
+    # Resolve: supersede the original rg row, promoting the pending st2 row.
+    led_rt.supersede("silesia:T1:rg", retire_runid="st",
+                     reason="comparator rebuilt; old anchor measured a stale "
+                            "binary", promote_runid="st2")
+    rg_anchors2 = led_rt.anchors(key="silesia:T1:rg")
+    check([r.get("runid") for r in rg_anchors2] == ["st2"],
+          "supersede: retired row stops anchoring; promoted pending row IS "
+          "the new anchor")
+    check(led_rt.contradictions(live3) == [],
+          "supersede: post-resolution drifted value agrees with the new "
+          "anchor — no contradiction")
+    # The file is append-only: the retired row is still IN the ledger.
+    check(any(r.get("runid") == "st" and r.get("key") == "silesia:T1:rg"
+              for r in led_rt.rows()),
+          "supersede: retired row remains in the file (append-only — "
+          "retired, not rewritten)")
+    # has_run counts only measurement rows (a supersede carries no runid).
+    check(led_rt.has_run("st2") and not led_rt.has_run("no-such-run"),
+          "has_run: measurement rows only, unaffected by resolution records")
+
+    # invalidate: a measurement-error row is retired outright, nothing
+    # promoted.
+    led_inv = Ledger(os.path.join(ltmp, "ledger_inv.jsonl"))
+    led_inv.append(make_record("run_X", "gzippy", "cell", "model:T8:rg",
+                               500.0, 7, 1.0, "comparator", FP))
+    live_inv = make_record("run_Y", "gzippy", "cell", "model:T8:rg",
+                           600.0, 7, 1.0, "comparator", FP)
+    check(len(led_inv.contradictions(live_inv)) == 1,
+          "invalidate setup: live contradicts the to-be-invalidated row")
+    led_inv.invalidate("model:T8:rg", target_runid="run_X",
+                       reason="mislabeled binary (native run as isal)")
+    check(led_inv.contradictions(live_inv) == []
+          and led_inv.anchors(key="model:T8:rg") == [],
+          "invalidate: target row retired as an anchor; no promotion")
 
     # ------------------------------------------------------------------
     # SHA-OR-VOID: a cell whose manifest row lacks sha_ok=1 is voided.

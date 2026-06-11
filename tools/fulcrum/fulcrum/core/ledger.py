@@ -1,26 +1,39 @@
 """Append-only results ledger + automatic contradiction detection.
 
-Scar (generalized here): the stale rg-anchor — a '0.98x' parity claim measured
-against a banked comparator wall of 926.6ms while the live co-located
-comparator ran ~810ms; ALL intermediate ratios needed a re-base lens. And the
-cyc/iter clock confound — a banked TSC-cyc number contradicted a live one
-because the captures' frequency states differed, not the code.
-
 The ledger makes bank-drift detection automatic and fingerprint-aware:
   - every analyzed number is APPENDED (never rewritten) with its fingerprint;
-  - before banking, the tool scans prior rows with a COMPATIBLE fingerprint and
-    the same identity key and emits CONTRADICTS-LEDGER when the live number
-    diverges beyond tolerance — either the tool or the bank is wrong, and the
-    report says so instead of silently ranking;
+  - before banking, the tool scans prior ACTIVE rows with a COMPATIBLE
+    fingerprint and the same identity key and emits CONTRADICTS-LEDGER when
+    the live number diverges beyond tolerance — either the tool or the bank
+    is wrong, and the report says so instead of silently ranking;
+  - a CONTRADICTING live number is NOT auto-banked as an anchor: it lands
+    with status "pending-reconcile" and stays out of the anchor set until a
+    `supersede` record resolves the conflict (see below);
   - rows with incompatible/unknown fingerprints are NEVER compared (that
-    comparison is the phantom class itself).
+    comparison is the phantom class itself — see docs/CASE-STUDIES.md for the
+    stale-anchor and clock-confound histories that made these rules law).
 
-Record schema (jsonl, one object per line):
-  {"ts": iso8601, "runid": str, "project": str, "kind": "cell"|"knob",
-   "key": str,                      # e.g. "silesia:T8:gz" or "silesia:T1:knob.slab_off"
-   "value_ms": float, "n": int, "spread_pct": float,
-   "tool": str,                     # "gzippy" | "rapidgzip" | knob name
-   "fingerprint": {...}}
+Record kinds (jsonl, one object per line, append-only):
+
+  measurement ("cell" | "knob"):
+    {"ts": iso8601, "runid": str, "project": str, "kind": "cell"|"knob",
+     "key": str,                  # e.g. "silesia:T8:gz" or "silesia:T1:knob.slab_off"
+     "value_ms": float, "n": int, "spread_pct": float,
+     "tool": str,                 # "gzippy" | "comparator" | knob name
+     "fingerprint": {...},
+     "status": "pending-reconcile"  # OPTIONAL; absent == active}
+
+  supersede — retires a prior measurement row (it was honest then, but is no
+  longer the anchor: comparator upgraded, protocol corrected, box changed);
+  may simultaneously PROMOTE a pending-reconcile row to active:
+    {"ts": ..., "kind": "supersede", "key": str, "retire_runid": str,
+     "promote_runid": str|null, "reason": str}
+
+  invalid — retires a prior measurement row that was NEVER right
+  (measurement error, broken instrument); nothing is promoted by it:
+    {"ts": ..., "kind": "invalid", "key": str, "target_runid": str,
+     "reason": str}
+
 """
 
 import json
@@ -32,6 +45,9 @@ from .fingerprint import Fingerprint, compatible
 # A live number contradicts a banked one when the relative divergence exceeds
 # BOTH arms' spreads and this floor (so quiet cells don't false-positive).
 REL_TOL_FLOOR = 0.03
+
+MEASUREMENT_KINDS = ("cell", "knob")
+PENDING = "pending-reconcile"
 
 
 class Ledger:
@@ -57,17 +73,56 @@ class Ledger:
         return out
 
     def has_run(self, runid):
-        return any(r.get("runid") == runid for r in self.rows())
+        return any(r.get("runid") == runid for r in self.rows()
+                   if r.get("kind") in MEASUREMENT_KINDS)
+
+    # -- supersede / invalidate bookkeeping --------------------------------
+    @staticmethod
+    def _resolution_sets(rows):
+        """(retired, promoted): sets of (key, runid) named by supersede /
+        invalid records. Retired rows are out of the anchor set forever;
+        promoted rows are pending-reconcile rows accepted as the new anchor."""
+        retired, promoted = set(), set()
+        for r in rows:
+            if r.get("_corrupt"):
+                continue
+            if r.get("kind") == "supersede":
+                retired.add((r.get("key"), r.get("retire_runid")))
+                if r.get("promote_runid"):
+                    promoted.add((r.get("key"), r.get("promote_runid")))
+            elif r.get("kind") == "invalid":
+                retired.add((r.get("key"), r.get("target_runid")))
+        return retired, promoted
+
+    def anchors(self, key=None):
+        """Measurement rows usable as contradiction anchors: not corrupt, not
+        retired by a supersede/invalid record, and not pending-reconcile
+        (unless promoted). A pending row is a RECORD, never an anchor — using
+        a contested number as the next run's truth is how a stale anchor
+        becomes two stale anchors."""
+        rows = self.rows()
+        retired, promoted = self._resolution_sets(rows)
+        out = []
+        for r in rows:
+            if r.get("_corrupt") or r.get("kind") not in MEASUREMENT_KINDS:
+                continue
+            if key is not None and r.get("key") != key:
+                continue
+            ident = (r.get("key"), r.get("runid"))
+            if ident in retired:
+                continue
+            if r.get("status") == PENDING and ident not in promoted:
+                continue
+            out.append(r)
+        return out
 
     # -- contradiction scan (the generalized bank-drift detector) ----------
     def contradictions(self, record):
-        """Compare `record` against prior compatible rows with the same key.
-        Returns a list of human-readable CONTRADICTS-LEDGER strings."""
+        """Compare `record` against prior ACTIVE (anchor) rows with the same
+        key. Returns a list of human-readable CONTRADICTS-LEDGER strings."""
         fp_new = Fingerprint.from_dict(record.get("fingerprint", {}))
         out = []
-        for r in self.rows():
-            if r.get("_corrupt") or r.get("key") != record.get("key"):
-                continue
+        for r in self.anchors(key=record.get("key")):
             if r.get("runid") == record.get("runid"):
                 continue
             fp_old = Fingerprint.from_dict(r.get("fingerprint", {}))
@@ -91,8 +146,9 @@ class Ledger:
                     f"vs {v_old:.1f}ms banked ({r.get('runid')}, "
                     f"{r.get('ts', '?')[:10]}) — {rel:.1%} divergence > "
                     f"tol {tol:.1%} under a COMPATIBLE fingerprint. Either the "
-                    f"tool or the bank is wrong; reconcile before trusting "
-                    f"either (the stale-anchor class).")
+                    f"tool or the bank is wrong; the live row is banked "
+                    f"PENDING-RECONCILE (never an anchor) until a `supersede` "
+                    f"record resolves which one (the stale-anchor class).")
         return out
 
     # -- writing ------------------------------------------------------------
@@ -106,6 +162,18 @@ class Ledger:
         with open(self.path, "a") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
+    def supersede(self, key, retire_runid, reason, promote_runid=None):
+        """Append a supersede record retiring (key, retire_runid) as an
+        anchor, optionally promoting a pending-reconcile row to active."""
+        self.append({"kind": "supersede", "key": key,
+                     "retire_runid": retire_runid,
+                     "promote_runid": promote_runid, "reason": reason})
+
+    def invalidate(self, key, target_runid, reason):
+        """Append an invalid record retiring (key, target_runid) — the row
+        was a measurement error and is never an anchor again."""
+        self.append({"kind": "invalid", "key": key,
+                     "target_runid": target_runid, "reason": reason})
 
 def make_record(runid, project, kind, key, value_ms, n, spread_pct, tool, fp):
     return {"runid": runid, "project": project, "kind": kind, "key": key,
