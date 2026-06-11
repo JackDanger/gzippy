@@ -479,3 +479,58 @@ kill-switch + knob exclusion + the pure-Rust loop always compiled and the
 sole path elsewhere). Non-x86_64 builds bit-for-bit unaffected (call sites
 compile-gated). Gauntlet + frozen 3-way (rg / asm-off base / flipped
 build): recorded below after the re-measure.
+
+### Flip gauntlet + frozen 3-way re-measure (2026-06-11, this branch)
+
+**Builds**: gz2 = /root/bin-flip-native, built `--no-default-features
+--features pure-rust-inflate` (NO explicit asm-kernel — the default wire
+itself delivers the kernel: effect counters on gz2 read entries=24,128 /
+asm_bytes=211,602,230, byte-identical to §9; kill-switch still proves
+enabled=false / 0 entries). gz1 = /root/bin-asmc-base (asm-off baseline
+class). rapidgzip 0.16.0.
+
+**Suites (guest, real BMI2, flipped feature set)**: lib 946/0
+(+ fd_vectored_write 9/0 single-threaded; parallel hang pre-existing,
+documented). One load-flake observed in a 16-way-parallel run:
+`diff_ratio_parallel_single_member_speedup` (a wall-ratio perf guard,
+parallel_T4/sequential_T1 = 1.612 vs 1.5 cap under full test-host
+contention) — passes in isolation and in 2 of 3 full runs; pre-existing
+sensitivity class, not a flip regression. The four precondition tests all
+ran REAL: control 1484/2000 cursor-assert fires (bias-0 clean), c3 floors
+hold (counts == local exactly), fuzz 96/96 + 4,546 engagement calls.
+
+**Sha grid**: {silesia, model, bignasa, storedmix, storedheavy} ×
+T{1,4,8,16} × {gz2-on, gz2-kill, gz1}: **60/60 byte-identical**; rg's
+silesia T1 output sha matches the same value.
+
+**Frozen 3-way walls** (bench-lock, no_turbo=1, interleaved rg/gz1/gz2,
+sha-verified arms, medians; T1 n=11, others n=9; masks: T1 cpu0, T4
+0,2,4,6, T8 0,2,4,6,8,10,12,14, T16 0-15):
+
+| cell | rg | gz1 (asm-off) | gz2 (flipped) | rg/gz2 | gz2 vs gz1 |
+|------|-----|------|------|--------|------------|
+| silesia T1  | 810 | 1170 | 939 | **0.863** | **-19.7%** |
+| silesia T4  | 437 | 545  | 508 | **0.860** | -6.8% |
+| silesia T8  | 323 | 342  | 332 | **0.973** | -2.9% |
+| silesia T16 | 264 | 276  | 266 | **0.992 PASS** | -3.6% |
+| model T8    | 368 | 654  | 517 | **0.712** | -20.9% |
+| bignasa T8  | 871 | 904  | 899 | **0.969** | -0.6% |
+
+- **gz2 regresses vs gz1 in NO cell** (improves all six) — the >2%
+  investigate-trigger never fires. The flip is strictly favorable for
+  production.
+- **Bar (rg/gz2 >= 0.99): 1 of 6 cells passes (silesia T16).** T8/bignasa
+  sit at 0.97-class; T1/T4 at 0.86; model at 0.71.
+
+**ANOMALY, reported verbatim (the §9 "0.98x / ~17 ms from rg" expectation
+does NOT reproduce):** that figure was COMPUTED against the banked rg T1
+~926.6 ms (removal-oracle era, when gzippy base measured 1263 ms at
+8fa2042f). Under today's frozen interleaved protocol rapidgzip measures
+**809-814 ms** (n=11 + 3 confirm reps, sha-verified output, stable;
+--verify 816 / --no-verify 792 — CRC is not the difference; same rapidgzip
+0.16.0). gzippy's own banked numbers DO reproduce today (base 1170 vs §9's
+1169; ON 939-940 vs §9's 944), so the discrepancy is specific to the stale
+rg comparator, whose session conditions are not reconstructible from the
+plans. Consequence: the real T1 gap to rg at HEAD is ~129 ms (0.863x), not
+~17 ms; every rg-relative claim derived from the 926.6 anchor needs
+re-basing against a live interleaved rg arm (this table is the first).
