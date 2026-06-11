@@ -249,9 +249,31 @@ mod imp {
     pub static KERN_RECLASS_MULTI_TRAIL: AtomicU64 = AtomicU64::new(0);
     pub static KERN_RECLASS_DIST: AtomicU64 = AtomicU64::new(0);
 
+    /// Flip-precondition 3 (the permanent ON-vs-OFF fuzz net): in-process
+    /// dispatch override. The env kill-switch is a process-wide OnceLock
+    /// read, so a same-binary ON/OFF differential cannot toggle it; the
+    /// fuzz test toggles HERE instead. 0 = no override (production
+    /// semantics), 1 = force-disabled, 2 = force-enabled (still requires
+    /// BMI2 — the asm cannot execute without it). Compiled ONLY into the
+    /// lib test harness (`cfg(test)`); production binaries carry no trace.
+    #[cfg(test)]
+    pub static TEST_FORCE: AtomicU64 = AtomicU64::new(0);
+    /// Engagement counter for the fuzz net (cfg(test) only): incremented at
+    /// every `run_contig` entry, independent of `GZIPPY_ASM_STATS`, so the
+    /// ON arm can PROVE the asm actually executed (effect-verified, not
+    /// assumed) and the OFF arm can prove it did not.
+    #[cfg(test)]
+    pub static TEST_RUN_CONTIG_CALLS: AtomicU64 = AtomicU64::new(0);
+
     /// Runtime dispatch: ON when compiled in, unless `GZIPPY_ASM_KERNEL=0`
     /// (kill-switch) or the CPU lacks BMI2 (`shrx`/`shlx`/`bzhi`).
     pub fn enabled() -> bool {
+        #[cfg(test)]
+        match TEST_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return std::arch::is_x86_feature_detected!("bmi2"),
+            _ => {}
+        }
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
             let killed = std::env::var("GZIPPY_ASM_KERNEL").is_ok_and(|v| v == "0");
@@ -330,6 +352,8 @@ mod imp {
     /// amortized by the in-asm back-edge.
     #[inline(never)]
     pub unsafe fn run_contig(ctx: &mut KernCtx, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
+        #[cfg(test)]
+        TEST_RUN_CONTIG_CALLS.fetch_add(1, Ordering::Relaxed);
         let mut bitbuf = lb.bitbuf;
         let mut bitsleft: u64 = lb.bitsleft as u64;
         let mut pos: u64 = lb.pos as u64;
@@ -822,6 +846,8 @@ mod imp {
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 pub use imp::{dump_if_enabled, enabled, note_exit, run_contig, stats_enabled};
+#[cfg(all(test, feature = "asm-kernel", target_arch = "x86_64"))]
+pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
 
 /// Non-asm builds: constant-false dispatch, no-op dump — call sites fold away.
 #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
@@ -845,6 +871,58 @@ pub fn run_contig_ref(
     dst: &mut usize,
     out_lim: usize,
     in_lim: usize,
+) -> u64 {
+    let mut stats = RefArmStats::default();
+    run_contig_ref_biased::<0>(lut, dist, lb, out, dst, out_lim, in_lim, &mut stats)
+}
+
+/// Arm-level coverage counters for the REFERENCE model — flip-precondition 2
+/// (campaign §9 gate): the differential must PROVE it exercises the asm's
+/// `25:` multi-literal+trailing-LENGTH arm (99.6% of c3a crossings — the
+/// make-or-break arm of the F-c coverage gate), not silently degrade to
+/// literals-only/lone-backref traffic after a refactor.
+///
+/// The ref counts are a valid proxy for the ASM arm: the differential pins
+/// asm == ref on (exit class, full cursor, dst, bytes), so any asm misroute
+/// of a packet the ref runs through this arm (e.g. `25:` redirected to a
+/// bail) diverges in exit/dst/cursor and fails the equality asserts first.
+/// (The asm-side KERN_RECLASS_MULTI_TRAIL counter tags only the BAIL
+/// crossings; completions never cross the seam — they are countable only on
+/// the ref side.)
+#[derive(Default)]
+pub struct RefArmStats {
+    /// Packets entering the multi-with-trailing-length path past the
+    /// EOB/oversize gates (the asm `25:` X2-spill point).
+    pub multi_trail: u64,
+    /// Those whose dist decode + copy completed in-region (the asm
+    /// `25:` → `58:` → copy success route).
+    pub multi_trail_completed: u64,
+}
+
+/// `run_contig_ref` with a test-injected CONSUME BIAS — the flip-precondition
+/// positive control for the bit-consume failure class (asm-campaign §9 flip
+/// gate, precondition 1).
+///
+/// `CONSUME_BIAS` is added to the lone-literal arm's litlen consume count
+/// (`lb.consume(pre.bit_count + BIAS)`), modeling exactly an off-by-one in
+/// the asm's consume pair (`shrx {bitbuf}, {bitbuf}, {t2}` +
+/// `sub {bitsleft}, {t2}`). The differential harness compares the REF cursor
+/// against the ASM cursor field-for-field, so a consume off-by-one on EITHER
+/// side produces the same inequality — biasing the ref proves the harness's
+/// cursor-equality asserts fire on this failure class without duplicating
+/// the 450-line asm region. `BIAS = 0` is bit-for-bit the production
+/// reference model (the wrapper above delegates here), so the control shares
+/// every instruction with the real harness.
+#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
+    lut: &super::lut_huffman::LutLitLenCode,
+    dist: &crate::decompress::inflate::libdeflate_entry::DistTable,
+    lb: &mut Bits<'_>,
+    out: &mut [u8],
+    dst: &mut usize,
+    out_lim: usize,
+    in_lim: usize,
+    stats: &mut RefArmStats,
 ) -> u64 {
     loop {
         if *dst >= out_lim || lb.pos >= in_lim {
@@ -893,7 +971,9 @@ pub fn run_contig_ref(
                 }
                 continue;
             }
-            lb.consume(pre.bit_count);
+            // CONSUME_BIAS != 0 only in the positive-control test (off-by-one
+            // model of a wrong asm consume count); 0 == production reference.
+            lb.consume(pre.bit_count + CONSUME_BIAS);
             out[*dst] = code as u8;
             *dst += 1;
             // P3.2 chain: two gated steps + one always-carry decode.
@@ -928,6 +1008,7 @@ pub fn run_contig_ref(
                 if last == 256 || last > super::lut_huffman::MAX_LIT_LEN_SYM {
                     return EXIT_RECLASS;
                 }
+                stats.multi_trail += 1; // asm `25:` X2-spill point
                 let (sb, sl, sd) = (lb.bitbuf, lb.bitsleft, *dst);
                 lb.consume(pre.bit_count);
                 let packed = (pre.symbol & 0x00FF_FFFF) as u64;
@@ -964,6 +1045,7 @@ pub fn run_contig_ref(
                     *dst = sd;
                     return EXIT_RECLASS;
                 }
+                stats.multi_trail_completed += 1; // asm `25:`→`58:` success
                 continue;
             }
             lb.consume(pre.bit_count);
@@ -1191,6 +1273,149 @@ mod tests {
         }
     }
 
+    /// Flip-precondition 1 (campaign §9 gate): POSITIVE CONTROL for the
+    /// bit-consume failure class. A test-injected off-by-one in the
+    /// lone-literal consume count (`run_contig_ref_biased::<1>` — the ref
+    /// mirror of corrupting the asm's `shrx`/`sub bitsleft` pair) MUST trip
+    /// the differential's cursor-equality asserts; the bias-0 arm on the
+    /// SAME inputs must stay divergence-free (so the divergence is caused
+    /// by the mutation, not the inputs). Proves the harness is live for
+    /// consume-count drift — the one failure class the three c3 controls
+    /// (lit store, dist base shift, multi advance) did not cover.
+    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[test]
+    fn positive_control_consume_off_by_one_trips_cursor_asserts() {
+        use crate::decompress::inflate::libdeflate_entry::DistTable;
+        use crate::decompress::parallel::lut_huffman::LutLitLenCode;
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            eprintln!("SKIP consume-bias control: no BMI2 on this host (run on guest)");
+            return;
+        }
+        // Fixed-Huffman litlen (8-9-bit literal codes → lone-literal-dominant,
+        // the arm the bias mutates) + all-holes dist (every backref candidate
+        // RECLASSes pre-consume — c2 envelope).
+        let mut fixed = vec![8u8; 288];
+        fixed[144..256].iter_mut().for_each(|x| *x = 9);
+        fixed[256..280].iter_mut().for_each(|x| *x = 7);
+        let mut lut = LutLitLenCode::new_empty();
+        assert!(lut.rebuild_from(&fixed), "fixed table lens must be valid");
+        let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
+
+        let mut x: u64 = 0xD1B54A32D192ED03;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        const TRIALS: usize = 2000;
+        let mut cursor_diverged = 0usize;
+        for trial in 0..TRIALS {
+            let n = 96 + (next() as usize % 400);
+            let data: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let in_lim = data.len().saturating_sub(IN_MARGIN);
+            let out_lim = 4 + (next() as usize % 240);
+            let buf_len = out_lim + 16;
+
+            // Arm A: asm (the system under test in the real harness).
+            let mut out_asm = vec![0u8; buf_len];
+            let mut lb_asm = Bits::new(&data);
+            let dst0 = out_asm.as_mut_ptr();
+            let mut ctx = KernCtx {
+                in_ptr: data.as_ptr() as u64,
+                in_lim: in_lim as u64,
+                out_lim: dst0 as u64 + out_lim as u64,
+                out_base: dst0 as u64,
+                long_tbl: lut.table.long_code_lookup.as_ptr() as u64,
+                dist_tbl: dist_holes.entries_ptr() as u64,
+                save_bitbuf: 0,
+                save_bitsleft: 0,
+                save_dst: 0,
+                short_tbl: lut.table.short_code_lookup.as_ptr() as u64,
+            };
+            let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
+            let dasm = (dst1 as usize) - (dst0 as usize);
+
+            // Arm B (negative control): bias-0 ref — MUST match the asm on
+            // every compared field (the live harness, unmutated).
+            let mut out_ref0 = vec![0u8; buf_len];
+            let mut lb_ref0 = Bits::new(&data);
+            let mut dref0 = 0usize;
+            let mut st0 = RefArmStats::default();
+            let ref0_exit = run_contig_ref_biased::<0>(
+                &lut,
+                &dist_holes,
+                &mut lb_ref0,
+                &mut out_ref0,
+                &mut dref0,
+                out_lim,
+                in_lim,
+                &mut st0,
+            );
+            let asm_class = if asm_exit == EXIT_BOUNDARY {
+                EXIT_BOUNDARY
+            } else {
+                EXIT_RECLASS
+            };
+            assert_eq!(ref0_exit, asm_class, "bias-0 exit diverged (trial {trial})");
+            assert_eq!(dref0, dasm, "bias-0 dst diverged (trial {trial})");
+            assert_eq!(
+                lb_ref0.pos, lb_asm.pos,
+                "bias-0 pos diverged (trial {trial})"
+            );
+            assert_eq!(
+                lb_ref0.bitbuf, lb_asm.bitbuf,
+                "bias-0 bitbuf diverged (trial {trial})"
+            );
+            assert_eq!(
+                lb_ref0.bitsleft, lb_asm.bitsleft,
+                "bias-0 bitsleft diverged (trial {trial})"
+            );
+            assert_eq!(
+                &out_ref0[..dref0],
+                &out_asm[..dasm],
+                "bias-0 bytes diverged (trial {trial})"
+            );
+
+            // Arm C (positive control): bias-1 ref — the injected off-by-one.
+            // Count trials where the CURSOR-equality fields (pos/bitbuf/
+            // bitsleft) detect it.
+            let mut out_ref1 = vec![0u8; buf_len];
+            let mut lb_ref1 = Bits::new(&data);
+            let mut dref1 = 0usize;
+            let mut st1 = RefArmStats::default();
+            let _ = run_contig_ref_biased::<1>(
+                &lut,
+                &dist_holes,
+                &mut lb_ref1,
+                &mut out_ref1,
+                &mut dref1,
+                out_lim,
+                in_lim,
+                &mut st1,
+            );
+            if lb_ref1.pos != lb_asm.pos
+                || lb_ref1.bitbuf != lb_asm.bitbuf
+                || lb_ref1.bitsleft != lb_asm.bitsleft
+            {
+                cursor_diverged += 1;
+            }
+        }
+        // Trials whose region exits before any lone literal (first packet is
+        // a length/EOB candidate, ~22% on the fixed table) consume nothing
+        // and legitimately cannot diverge; every trial that consumes a
+        // literal must. Floor at 50% — observed rate is ~78%+.
+        assert!(
+            cursor_diverged >= TRIALS / 2,
+            "positive control DEAD: consume off-by-one tripped the cursor \
+             asserts in only {cursor_diverged}/{TRIALS} trials"
+        );
+        eprintln!(
+            "[control] consume off-by-one: cursor asserts fired in \
+             {cursor_diverged}/{TRIALS} trials (bias-0 arm clean)"
+        );
+    }
+
     /// Stage c3 differential: asm vs ref over WINDOWED buffers (32 KiB
     /// random prefill shared by both arms, dst starting at the window
     /// edge so distances <= 32768 are valid) × litlen tables WITH length
@@ -1274,6 +1499,10 @@ mod tests {
         let window: Vec<u8> = (0..WIN).map(|_| next() as u8).collect();
         let mut small_pair_bytes = 0u64;
         let mut small_pair_trials = 0u64;
+        // Flip-precondition 2: per-cell arm coverage (see RefArmStats doc —
+        // ref counts are a valid proxy for the asm arms under the equality
+        // asserts below).
+        let mut cell_stats: [RefArmStats; 5] = Default::default();
         for (pi, (tbl, dt, tag0)) in pairs.iter().enumerate() {
             for trial in 0..3000 {
                 let n = 150 + (next() as usize % 450);
@@ -1297,7 +1526,7 @@ mod tests {
                 };
 
                 let mut dref = WIN;
-                let ref_exit = run_contig_ref(
+                let ref_exit = run_contig_ref_biased::<0>(
                     tbl,
                     dt,
                     &mut lb_ref,
@@ -1305,6 +1534,7 @@ mod tests {
                     &mut dref,
                     out_lim,
                     in_lim,
+                    &mut cell_stats[pi],
                 );
 
                 let base0 = out_asm.as_mut_ptr();
@@ -1358,6 +1588,35 @@ mod tests {
         assert!(
             avg > 30.0,
             "c3 coverage degraded: lenny×small avg bytes/run = {avg:.1}"
+        );
+        // Flip-precondition 2 (campaign §9 gate): the `25:` multi-literal+
+        // trailing-LENGTH arm — 99.6% of c3a crossings, the F-c coverage
+        // make-or-break — must be PROVEN exercised, both the completion
+        // route (`25:`→`58:`→copy) and the X2 dst-rollback bail route. The
+        // floors are ~25% of the observed counts (lenny×small completes
+        // 7,735; bails total 373 — lenny×fixed5 344 + lenny×sub 29), so a
+        // refactor that silently starves the arm fails loudly while seed/
+        // table tweaks within reason pass.
+        for (pi, st) in cell_stats.iter().enumerate() {
+            eprintln!(
+                "[c3 coverage] cell {pi} ({}): multi_trail={} completed={}",
+                pairs[pi].2, st.multi_trail, st.multi_trail_completed
+            );
+        }
+        assert!(
+            cell_stats[0].multi_trail_completed >= 2_000,
+            "25:-arm coverage degraded: lenny×small completed only {} \
+             multi-with-trailing-length backrefs (floor 2000)",
+            cell_stats[0].multi_trail_completed
+        );
+        let bails: u64 = cell_stats
+            .iter()
+            .map(|s| s.multi_trail - s.multi_trail_completed)
+            .sum();
+        assert!(
+            bails >= 90,
+            "25:-arm bail (X2 dst-rollback) coverage degraded: only {bails} \
+             multi-trailing dist bails across all cells (floor 90)"
         );
     }
 }

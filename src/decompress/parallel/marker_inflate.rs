@@ -2503,6 +2503,35 @@ impl Block {
             // completed iteration recorded in `prof_pending`.
             let mut prof_last_t: u64 = super::contig_prof::rdtsc(prof_on);
             let mut prof_pending: usize = super::contig_prof::CLASS_NONE;
+            // ── TWO LOOP VARIANTS (flip-precondition 4, campaign §9 gate) ──
+            // The fast loop is instantiated twice from one macro source:
+            // the `false` instantiation const-folds the asm dispatch away
+            // (`if false && asm_on` is statically dead), so a binary built
+            // WITH the asm-kernel feature but dispatch-disabled (kill-switch
+            // / no BMI2 / knobs) runs a loop with ZERO asm-related code in
+            // its body — the c3 OFF-vs-base ~+44 ms layout tax was the
+            // per-iteration dispatch test + asm_ctx liveness in the shared
+            // loop. The variant is selected ONCE per region run, before the
+            // loop; the `true` variant keeps the runtime `asm_on` test so
+            // an EXIT_BOUNDARY can still hand the tail to the Rust arms
+            // (identical to the pre-split behavior).
+            //
+            // MEASURED VERDICT (frozen guest, §10): the split cuts the
+            // disabled-arm tax 44 → 12 ms (1.0%) on T1 silesia and to a
+            // TIE on model T8 (643 vs 645 ms). The residual is NOT in the
+            // loop: the false variant's body contains zero asm code
+            // (objdump: exactly ONE run_contig call site in this whole
+            // function — the true variant's), and the per-call costs
+            // (enabled() + dispatch_allowed + KernCtx init) are bounded
+            // ≤ ~2 ms by the 24,128 region calls. What remains is
+            // cross-binary code layout of the doubled function body —
+            // the campaign's documented layout-phantom class, irreducible
+            // here without outlining/PGO. Production-irrelevant post-flip:
+            // the disabled arm exists only under the GZIPPY_ASM_KERNEL=0
+            // measurement control or on pre-BMI2 x86 (pre-2013 Haswell
+            // class).
+            macro_rules! fast_loop_run {
+                ($use_asm:literal) => {
             'fast: loop {
                 if prof_on {
                     let t = super::contig_prof::rdtsc(true);
@@ -2519,7 +2548,7 @@ impl Block {
                 // `continue 'fast`. `prof_on` true ⇒ `asm_on` false, so the
                 // profiler block above never brackets asm iterations.
                 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-                if asm_on {
+                if $use_asm && asm_on {
                     // SAFETY: contract E1-E6 hold here — this IS the Rust
                     // loop's iteration top (fresh un-consumed packet, clean
                     // bitsleft, lockstep cursors, validated tables, knobs
@@ -2897,6 +2926,19 @@ impl Block {
                 pre = self.lut_litlen.decode_prefilled(&lb);
                 super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
+                };
+            }
+            // Variant selection — once per region run (see macro doc above).
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            {
+                if asm_on {
+                    fast_loop_run!(true);
+                } else {
+                    fast_loop_run!(false);
+                }
+            }
+            #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
+            fast_loop_run!(false);
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
             // a fresh un-consumed `pre`), so the bit cursor sits exactly before
             // `pre`'s bits. The careful loop below re-decodes from here — no state
@@ -4150,6 +4192,30 @@ mod tests {
         cap: usize,
         per_call: usize,
     ) -> Vec<u8> {
+        decode_contig_clean_with_state(deflate_bytes, window, cap, per_call).0
+    }
+
+    /// `decode_contig_clean` + MULTI-BLOCK support (loops `read_header`
+    /// until BFINAL, routes stored blocks through
+    /// `decode_clean_stored_into_contig` — the `contig_multi` driver shape)
+    /// + the FINAL bit-cursor state `(pos, bitbuf, bitsleft)`. The asm-ON/OFF
+    /// fuzz net (flip-precondition 3) asserts state equality, not just byte
+    /// equality. Single-block streams behave exactly as the old single-header
+    /// driver (the loop exits after the first block's EOB).
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    fn decode_contig_clean_with_state(
+        deflate_bytes: &[u8],
+        window: &[u8],
+        cap: usize,
+        per_call: usize,
+    ) -> (Vec<u8>, (usize, u64, u32)) {
         let boxed: &'static [u8] = Box::leak(deflate_bytes.to_vec().into_boxed_slice());
         let mut bits = Bits::new(boxed);
         let mut b = Block::new();
@@ -4162,18 +4228,30 @@ mod tests {
         buf[..window.len()].copy_from_slice(window);
         let base = buf.as_mut_ptr();
         let mut pos = window.len();
-        b.read_header(&mut bits, false).unwrap();
-        while !b.eob() {
-            let before = pos;
-            let n = b
-                .decode_clean_into_contig(&mut bits, base, cap, &mut pos, per_call)
-                .unwrap();
-            assert_eq!(n, pos - before, "contig: emitted != pos delta");
-            if n == 0 && !b.eob() {
-                panic!("contig decode stalled before EOB (cap too small?)");
+        loop {
+            b.read_header(&mut bits, false).unwrap();
+            while !b.eob() {
+                let before = pos;
+                let n = if b.compression_type() == CompressionType::Uncompressed {
+                    b.decode_clean_stored_into_contig(&mut bits, base, cap, &mut pos, per_call)
+                        .unwrap()
+                } else {
+                    b.decode_clean_into_contig(&mut bits, base, cap, &mut pos, per_call)
+                        .unwrap()
+                };
+                assert_eq!(n, pos - before, "contig: emitted != pos delta");
+                if n == 0 && !b.eob() {
+                    panic!("contig decode stalled before EOB (cap too small?)");
+                }
+            }
+            if b.is_last_block() {
+                break;
             }
         }
-        buf[window.len()..pos].to_vec()
+        (
+            buf[window.len()..pos].to_vec(),
+            (bits.pos, bits.bitbuf, bits.bitsleft),
+        )
     }
 
     #[cfg(any(
@@ -4273,6 +4351,192 @@ mod tests {
         let contig = decode_contig_clean(&deflate_bytes, window, cap, payload.len() + 16);
         assert_eq!(ring, payload, "ring decode != payload");
         assert_eq!(contig, ring, "rle/short-distance contig decode diverged");
+    }
+
+    /// Flip-precondition 3 (campaign §9 gate): the PERMANENT asm-ON-vs-OFF
+    /// fuzz differential over random VALID GZIP MEMBERS — the stream-level
+    /// net binding the asm kernel and the pure-Rust loop forever (charter
+    /// §4: "bound by the differential suite FOREVER").
+    ///
+    /// Seeded + bounded: 96 members, payloads 1 KiB–128 KiB of mixed
+    /// segments (uniform random → stored-prone; skewed random → dynamic
+    /// all-literal; text → backrefs; RLE runs → dist==1; self-copies →
+    /// long distances; zeros), flate2-gzip'd at levels {0 (stored), 1, 6, 9}
+    /// with occasional mid-stream sync flushes (extra stored-block
+    /// boundaries). Each member is validity-checked by a flate2 round-trip,
+    /// then its DEFLATE body is decoded twice through the production
+    /// contig-clean path — kernel force-ENABLED vs force-DISABLED (same
+    /// binary; the in-process `TEST_FORCE` override stands in for the
+    /// process-wide `GZIPPY_ASM_KERNEL` OnceLock) — asserting byte equality,
+    /// equality to the payload, and final bit-cursor equality
+    /// (pos/bitbuf/bitsleft — the X1 contract at stream end). ON-arm
+    /// engagement is effect-verified via `TEST_RUN_CONTIG_CALLS`, never
+    /// assumed. Skips gracefully without BMI2 (local Rosetta); the guest
+    /// run is authoritative.
+    #[cfg(all(pure_inflate_decode, feature = "asm-kernel", target_arch = "x86_64"))]
+    #[test]
+    fn asm_kernel_on_off_fuzz_random_gzip_members() {
+        use crate::decompress::parallel::asm_kernel::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            eprintln!("SKIP asm on/off fuzz: no BMI2 on this host (run on guest)");
+            return;
+        }
+        // Restore production dispatch semantics for the rest of the test
+        // process on every exit path (including assert panics).
+        struct ForceGuard;
+        impl Drop for ForceGuard {
+            fn drop(&mut self) {
+                TEST_FORCE.store(0, Ordering::Relaxed);
+            }
+        }
+        let _guard = ForceGuard;
+
+        let mut x: u64 = 0x5851_F42D_4C95_7F2D;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+
+        const TRIALS: usize = 96;
+        let mut on_hits_total = 0u64;
+        let mut huffman_trials = 0u64;
+        for trial in 0..TRIALS {
+            // ── payload: mixed segments until the target size ──
+            let target = 1usize << (10 + (next() as usize % 8)); // 1 KiB..128 KiB
+            let mut payload: Vec<u8> = Vec::with_capacity(target + 4096);
+            while payload.len() < target {
+                match next() % 6 {
+                    0 => {
+                        // uniform random (stored-prone at every level)
+                        let n = 64 + (next() as usize % 4096);
+                        for _ in 0..n {
+                            payload.push(next() as u8);
+                        }
+                    }
+                    1 => {
+                        // skewed random (~6-bit entropy → dynamic all-literal)
+                        let n = 64 + (next() as usize % 4096);
+                        for _ in 0..n {
+                            payload.push((next() as u8) & (next() as u8));
+                        }
+                    }
+                    2 => {
+                        // repeated text (in-block backrefs, length variety)
+                        let reps = 4 + (next() as usize % 200);
+                        payload
+                            .extend(b"the quick brown fox jumps over the lazy dog. ".repeat(reps));
+                    }
+                    3 => {
+                        // RLE run (dist==1 broadcast arm)
+                        let b = next() as u8;
+                        let n = 16 + (next() as usize % 2048);
+                        payload.extend(std::iter::repeat(b).take(n));
+                    }
+                    4 => {
+                        // self-copy of an earlier slice (long distances)
+                        if payload.is_empty() {
+                            payload.extend_from_slice(b"seed material for copies ");
+                        } else {
+                            let start = next() as usize % payload.len();
+                            let len = (1 + (next() as usize % 8192)).min(payload.len() - start);
+                            let slice = payload[start..start + len].to_vec();
+                            payload.extend_from_slice(&slice);
+                        }
+                    }
+                    _ => {
+                        // zeros (max-length RLE backrefs)
+                        let n = 16 + (next() as usize % 2048);
+                        payload.extend(std::iter::repeat(0u8).take(n));
+                    }
+                }
+            }
+            // ── a VALID gzip member: mixed levels; occasional sync flush ──
+            let level = match next() % 4 {
+                0 => 0u32,
+                1 => 1,
+                2 => 6,
+                _ => 9,
+            };
+            if level > 0 {
+                huffman_trials += 1;
+            }
+            let mut enc =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+            if payload.len() > 8192 && next() % 2 == 0 {
+                let cut = payload.len() / 2;
+                enc.write_all(&payload[..cut]).unwrap();
+                enc.flush().unwrap(); // sync flush: extra block boundary
+                enc.write_all(&payload[cut..]).unwrap();
+            } else {
+                enc.write_all(&payload).unwrap();
+            }
+            let gz = enc.finish().unwrap();
+            // gzip-member validity oracle: flate2's own decoder round-trips.
+            let mut rt = Vec::new();
+            flate2::read::GzDecoder::new(&gz[..])
+                .read_to_end(&mut rt)
+                .unwrap();
+            assert_eq!(rt, payload, "trial {trial}: flate2 gzip round-trip");
+            // The member's raw DEFLATE body (header is 10 bytes when FLG==0
+            // — flate2 sets no name/extra/comment; trailer is CRC32+ISIZE).
+            assert_eq!(&gz[..2], b"\x1f\x8b", "trial {trial}: gzip magic");
+            assert_eq!(gz[3], 0, "trial {trial}: FLG != 0 (10-byte header)");
+            let deflate = &gz[10..gz.len() - 8];
+
+            let cap = payload.len() + 1024;
+            let per_call = match next() % 3 {
+                0 => cap,
+                1 => 4096,
+                _ => 65536,
+            };
+
+            // ── ON arm (engagement effect-verified) ──
+            TEST_FORCE.store(2, Ordering::Relaxed);
+            let h0 = TEST_RUN_CONTIG_CALLS.load(Ordering::Relaxed);
+            let (on_bytes, on_state) = decode_contig_clean_with_state(deflate, &[], cap, per_call);
+            on_hits_total += TEST_RUN_CONTIG_CALLS.load(Ordering::Relaxed) - h0;
+            // ── OFF arm: every dispatch inside this decode reads the
+            //    override, so the pure-Rust loop is the sole path ──
+            TEST_FORCE.store(1, Ordering::Relaxed);
+            let (off_bytes, off_state) =
+                decode_contig_clean_with_state(deflate, &[], cap, per_call);
+            TEST_FORCE.store(0, Ordering::Relaxed);
+
+            assert_eq!(
+                on_bytes, payload,
+                "trial {trial}: ON output != payload (level {level})"
+            );
+            assert_eq!(
+                off_bytes, payload,
+                "trial {trial}: OFF output != payload (level {level})"
+            );
+            assert_eq!(
+                on_state, off_state,
+                "trial {trial}: final (pos, bitbuf, bitsleft) diverged ON vs OFF"
+            );
+        }
+        // Engagement floor: Huffman-bearing members must drive the kernel.
+        // (A level>0 member CAN still be all-stored if its payload segments
+        // came out incompressible, so the floor is half the Huffman trials,
+        // not all of them; seed-stable either way.)
+        assert!(
+            huffman_trials > 0,
+            "seed produced no Huffman members — generator broken"
+        );
+        assert!(
+            on_hits_total >= huffman_trials / 2,
+            "asm engagement too low: {on_hits_total} run_contig calls across \
+             {huffman_trials} Huffman members — ON arm not exercising the kernel"
+        );
+        eprintln!(
+            "[fuzz] {TRIALS} gzip members ON==OFF==payload; \
+             run_contig calls in ON windows: {on_hits_total} \
+             ({huffman_trials} Huffman members)"
+        );
     }
 
     /// P3.2 stream-level differential for the runtime literal chain: an
