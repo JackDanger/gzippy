@@ -2413,13 +2413,6 @@ impl Block {
             // call re-loaded the flag from memory inside the hot loop; the flag
             // cannot change mid-decode).
             let track_backrefs = self.track_backreferences;
-            // ASM-campaign increment (a): dispatch + stats snapshots (OnceLock
-            // env reads, once per contig call — the slow_knob pattern). See
-            // asm_kernel.rs / plans/asm-campaign.md §2(a),§4.
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-            let asm_chain: bool = super::asm_kernel::enabled();
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-            let asm_stats: bool = super::asm_kernel::stats_enabled();
             // Hoisted single-lookup distance table (see `dist_table` field doc).
             // Field-disjoint from every `self` mutation inside the loop
             // (`at_end_of_block`, `backreferences`, `decoded_bytes`), so the
@@ -2574,44 +2567,6 @@ impl Block {
                         // bottom-of-loop preload.
                         let mut chained = 0usize;
                         loop {
-                            // ── ASM-campaign increment (a) (asm_kernel.rs;
-                            // plans/asm-campaign.md §2(a)): the fused
-                            // gather+gate+consume step in one asm! block.
-                            // HIT = exactly the consume+store the Rust arm
-                            // below performs (asm gate ⊆ Rust gate, so every
-                            // hit is one the Rust arm would also take).
-                            // BAIL = no state change; falls THROUGH to the
-                            // unchanged Rust body, which re-reads the same
-                            // L1-hot entry from the same cursor and applies
-                            // the full gate (refill + long-code path) —
-                            // byte-exact with zero arm-distribution change.
-                            // Dispatch (`asm_chain`) is snapshotted before
-                            // the fast loop; OFF == this block folds away.
-                            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-                            if asm_chain && chained < LIT_CHAIN_MAX {
-                                if let Some(b) = super::asm_kernel::litlen_chain_step(
-                                    &self.lut_litlen.table.short_code_lookup,
-                                    &mut lb,
-                                    asm_stats,
-                                ) {
-                                    // SAFETY: same bound as the Rust arm —
-                                    // iteration-top guard + the compile
-                                    // assert keep every chained write
-                                    // < out_room < cap.
-                                    if !oracle_nostore {
-                                        unsafe {
-                                            base.add(*pos).write(b);
-                                        }
-                                    }
-                                    if let Some(r) = orec.as_mut() {
-                                        r.lit(b);
-                                    }
-                                    *pos += 1;
-                                    emitted += 1;
-                                    chained += 1;
-                                    continue;
-                                }
-                            }
                             let nxt = self.lut_litlen.decode(&mut lb);
                             let ncode = (nxt.symbol & 0xFFFF) as u16;
                             if chained < LIT_CHAIN_MAX
