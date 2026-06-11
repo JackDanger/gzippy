@@ -255,3 +255,70 @@ rewritten to the P3.4/P3.5 shapes they must be byte-identical to anyway.
   in-process plateau EARNED ⇒ phase ends, conclusion gate fires.
 - Any increment that is byte-exact and TIEs is KEPT behind its default-OFF
   gate (rule 7a) — the falsification record stays honest either way.
+
+---
+
+## 8. F-a VERDICT (2026-06-11, same session): NO-SHIP — the per-symbol asm boundary tax is real and quantified
+
+Increment (a) built, differential-gated, and frozen-measured (commit
+`b5c3f7c4`). **NO-SHIP**: the asm micro-step makes the wall WORSE.
+
+- **Correctness (all green):** step differential asm==ref over 400k random
+  states × {fixed, skewed} tables ON REAL BMI2 (guest; local Rosetta exposes
+  no BMI2 — the asm half only executes on the box); sha grid 12/12
+  byte-identical across {silesia, model} × T{1,8} × {on, off, base}, silesia
+  == the pinned corpus sha; kill-switch proven (enabled=false, 0 hits);
+  effect counters prove engagement (T1 silesia 10.89M hits / 5.05M bails =
+  68% of chain candidates consumed in asm).
+- **Frozen interleaved A/B** (bench-lock acquired, no_turbo=1 readback,
+  RESTORE VERIFIED after; arms on/off/base interleaved, n=9, sink /dev/null;
+  display truncation lost T1 reps 1-3 — medians below are over the captured
+  reps, sign-stable on every captured rep):
+  - T1 silesia (taskset -c 0): ON ~1214-1217 ms vs same-binary OFF
+    ~1197-1198 ms → **ON +16 ms (-1.3%)**; cross-binary base 1181-1186 ms.
+  - T8 model (masked): ON ~671 vs OFF ~656.5 vs base ~658 → **ON +14 ms
+    (-2.2%)**; OFF≈base TIE.
+- **Mechanism (the latency analysis the campaign rules require):** ~15.9M
+  step invocations at T1 silesia carry the asm-block boundary each —
+  operand setup (bitbuf/bitsleft copied to fresh locals + written back), an
+  LLVM scheduling barrier inside the chain loop (breaks the P3.5 c2/c4
+  placements' freedom), and a duplicated short-LUT probe on every bail
+  (32%). +16 ms / 15.9M ≈ 1.0 ns ≈ **~1.4 cycles of tax per step at the
+  frozen 1.4 GHz** — with ZERO latency recovered, because the same
+  load→extract→branch chain executes either way. The hand-written
+  instructions are not better than LLVM's; the per-symbol seam is pure cost.
+- **Banked finding (F-a, pre-registered):** micro-asm scheduling is NOT the
+  lever. This is the DIS-1 lesson re-confirmed on the NEW loop with a
+  10×-finer instrument: the asm seam costs ~1-2 cycles per crossing, so any
+  winning asm construct must amortize the boundary to ~once-per-block —
+  exactly rung (c)'s back-edge-inside-asm shape (VAR_VIII's +14.6% was
+  measured with ~3.4-4.3K reentries/chunk vs the ~15.9M here, a ~4000×
+  difference in crossings).
+- **Disposition (rule 7a):** byte-exact code KEPT behind the default-OFF
+  `asm-kernel` feature (release builds unaffected — base binary measured
+  identical-class to P3.5); the scaffolding (feature gate, kill-switch,
+  effect counters, differential harness, guest A/B driver) is the permanent
+  asset rungs (b)/(c) reuse. Rung (b) remains worth one attempt ONLY in a
+  shape that does not add a per-symbol seam to the lit path (the dist-side
+  fusion fires ~once per backref, ~5× rarer than chain steps); otherwise
+  proceed directly to the rung-(c) entry decision with F-a as evidence that
+  the boundary, not the headroom, killed (a).
+
+
+---
+
+## INCREMENT (a) FALSIFIED — banked record (2026-06-11)
+
+Built byte-exact (commit b5c3f7c4, REVERTED from the branch per the no-dead-code
+rule; recoverable from history). Frozen A/B: +16ms T1 / +14ms model-T8 — a
+REGRESSION. MECHANISM: the Rust<->asm! boundary seam tax (~1.4 cyc/crossing x
+15.9M crossings) exceeds any micro-step latency gain; LLVM cannot schedule
+across the asm! boundary, so the seam re-serializes the very chain the kernel
+tried to shorten. This is VAR_VIII's re-entry-spill lesson at micro scale and
+CONFIRMS the ladder's design premise: the asm must OWN a region large enough
+to amortize crossings — rung (c) (the full symbol loop, one entry/exit per
+fast-loop run) is the only shape with a chance. Rung (b) (fused pair) is
+likely seam-bound too; evaluate analytically before building.
+NEXT: rung (c) per the charter — full-symbol-loop asm with the VAR_VIII
+salvage (register contract rewritten for the P3.1-P3.5 loop state), the
+~620ms budget, and the seam amortized to ~once per chunk.
