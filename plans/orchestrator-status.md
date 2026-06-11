@@ -1,3 +1,14 @@
+## ASM RUNG (c) MERGED DEFAULT-OFF (advisor-SOUND) — NATIVE T1 0.98x UNDER THE FEATURE [2026-06-11]
+THE FUNDED CAMPAIGN'S PAYLOAD LANDED: full-symbol-loop asm kernel, byte-exact (30/30 shas, 27k
+differential trials on real BMI2, 3 live positive controls), asm_frac 0.998, frozen T1 silesia
+-19.2% (944 vs 1169ms) => ~17ms from rapidgzip (0.98x); model T8 -20%. ~35% of the decode ceiling
+captured in one rung. The c3 contract discovery (multi-literal+trailing-length = 99.6% of
+crossings) was the make-or-break. Feature asm-kernel default-OFF; production builds bit-for-bit
+unaffected. FLIP PRECONDITIONS (gate): consume-off-by-one control; 25:-arm coverage assert;
+asm-ON/OFF random-gzip fuzz net; the +44ms OFF-arm layout tax (hoist or document).
+NATIVE T1 FULL TRAJECTORY: M6 0.578 -> slab 0.712 -> chain ~0.72 -> ASM(feature) ~0.98.
+NEXT: the four flip preconditions, then the default-flip frozen re-measure, then the bar matrix
+both builds with asm-on native (isal untouched by this path), then Squishy refresh.
 ## ASM PHASE OPENED — charter merged; increment (a) falsified; rung (c) is the shape [2026-06-11]
 Charter (plans/asm-campaign.md): budget math + 3-rung ladder + gauntlet + VAR_VIII salvage verdict
 (prototype banked at bench/var8-fullkernel @ 922d6cbe). Increment (a) micro-kernel: byte-exact,
