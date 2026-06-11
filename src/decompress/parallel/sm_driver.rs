@@ -69,6 +69,25 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // once-cached) so consecutive decodes with different T re-gate correctly.
     crate::decompress::parallel::rpmalloc_alloc::set_decode_threads(parallelization);
 
+    // REMOVAL-ORACLE NOSTORE produces GARBAGE output bytes by design. Refuse to
+    // write them to a REGULAR FILE so a forgotten env var can never leave a
+    // plausible-looking corrupt artifact on disk — the sanctioned shape is
+    // `-c ... > /dev/null` (char device / pipe). No-op when the knob is unset.
+    if crate::decompress::parallel::removal_oracle::nostore_enabled() {
+        if let Some(fd) = out_fd {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } == 0
+                && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+            {
+                return Err(ReadParallelSmError::DecodeFailed(
+                    "GZIPPY_ORACLE_NOSTORE refuses regular-file output (bytes are \
+                     garbage); redirect to /dev/null"
+                        .into(),
+                ));
+            }
+        }
+    }
+
     let (_hdr, header_size) =
         gzip_format::read_header(gzip_data).map_err(|_| ReadParallelSmError::InvalidHeader)?;
     let trailer_size = 8;
@@ -144,7 +163,12 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // with decode replaced by a fixed sleep. Skip CRC/size verification in
     // that mode only (zero production change when unset).
     let sleep_mode = crate::decompress::parallel::decode_bypass::sleep_decode_enabled();
-    if !sleep_mode {
+    // REMOVAL-ORACLE NOSTORE: output bytes are garbage (stores elided) — CRC and
+    // ISIZE cannot match. Skip verification in that mode only. NODECODE replay
+    // stays VERIFIED: its replay hits are byte-correct by construction and its
+    // misses run the real decode, so verification doubles as the honesty check.
+    let nostore_mode = crate::decompress::parallel::removal_oracle::nostore_enabled();
+    if !sleep_mode && !nostore_mode {
         if total_size != expected_size {
             return Err(ReadParallelSmError::SizeMismatch {
                 expected: expected_size,
