@@ -1,3 +1,12 @@
+## P3.5 OFFICIAL MATRIX @ a9fe662c — arsenal trajectory banked [2026-06-10]
+4 WIN / 6 TIE / 1 noise-REG vs baselines. NATIVE rg-ratios now: silesia T1 0.648 (was 0.578 at
+M6 — arsenal moved it -116ms), T4 0.808, T8 0.959 (16ms from rg!), T16 0.956, model 0.610 (was
+0.577), bignasa 0.915. ISAL stable (T1 1.20 PASS, others unchanged). CONTIG_PROF @ T8: backref
+62.6% of cycles (34.9 cyc/iter), litchn 22.9%, wrapper=0 calls (contig = sole production path),
+disttbl reuse 3/1768 (memcmp arm ~dead as predicted), bootstrap body 171MB/s with 98% of bytes
+through the marker loop on silesia.
+ASM-MEMO INPUTS: T8 native is 16ms from rg; T1 remains 1.54x (raw single-core symbol rate);
+backref kernel + marker-loop rate are the two named残 structures.
 ## P3.4 MERGED (advisor-SOUND) — the copy-shape lever: T1 -87ms, T16 recovered [2026-06-10]
 Backref copy ported to libdeflate shape (overlap-correct for dist>=8 burst+stride, hand-proven at
 the gate; envelope 264 < 266 reservation): silesia T1 frozen 1462->1375 (0.941 NEW-OWNS); T16 back
