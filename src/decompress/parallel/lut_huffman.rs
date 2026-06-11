@@ -1056,6 +1056,14 @@ impl LutLitLenCode {
         &self,
         bits: &crate::decompress::inflate::consume_first_decode::Bits<'_>,
     ) -> DecodedSymbol {
+        // PRECONDITION (gate hardening): callers must invoke this only
+        // immediately after a refill — post-refill, available() < 32 implies
+        // pos == data.len() (a backstop refill would append nothing). A call
+        // site violating this reads short bits silently; catch it in debug.
+        debug_assert!(
+            bits.available() >= 32 || bits.pos == bits.data.len(),
+            "decode_prefilled called without the post-refill precondition"
+        );
         let next_bits = bits.peek();
         let next_12_bits = (next_bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
         let mut next_sym = self.table.short_code_lookup[next_12_bits];

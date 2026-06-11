@@ -114,3 +114,12 @@ finding that the T1 gap is whole-loop, not class-concentrated.
 - rsync to the guest reported `cannot delete non-empty directory:
   vendor/rapidgzip/...` — pre-existing guest-side build artifacts
   (build-trace) intentionally left in place; not part of the build.
+
+
+## FROZEN CORRECTION (gate-mandated, 2026-06-11)
+The ladder's -6.3% (1262->1183) used an UNFROZEN noisy baseline. The honest
+frozen magnitude: silesia T1 1183 -> 1162ms = +1.8% of wall (~21ms) = ~3.3%
+of the 642.6ms decode ceiling. Memo phrasing: Rust-level chain rescheduling
+yields low-single-digit percent of the ceiling and is near exhaustion;
+closing the rest requires a microarchitectural attack on per-symbol
+dependency LATENCY (asm/scheduling), not more reordering.
