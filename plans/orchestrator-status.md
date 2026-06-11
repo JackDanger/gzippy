@@ -1,3 +1,32 @@
+## P3.4 INNER-LOOP PASS — backref copy is the headline (T1 -93ms); DistTable amortized; BMI2 dispatch refuted by asm [2026-06-11]
+Branch engine/p34-inner-pass @ 02e6f962 (worktree /tmp/gz-p34; bins /root/bin-p34*-native).
+THREE items, each separately committed + frozen-measured vs its predecessor bin:
+1. a3401a58 DistTable amortization (SHIP): static fixed-dist table (OnceLock) + same-lens reuse
+   + allocation-reusing rebuild + GZIPPY_DIST_AMORT=0 kill-switch. T16 -3..-4ms cross-binary AND
+   -2.9ms same-binary ON/OFF (0.991) — recovers ~half the P3.3b 8.6ms; T1 1.0016 TIE; model
+   same-binary 0.9984 TIE (the cross-binary +6-8ms there is LAYOUT, proven by the kill-switch
+   instrument). Counters: silesia 1051 builds/2 reuses — the lens-memcmp arm ~never fires;
+   the levers are alloc reuse + fixed-table sharing.
+2. 181d7c25 libdeflate-shape backref copy (SHIP, the headline): 5-word burst for dist>=8 (ANY
+   length incl. overlap — old shape per-byte'd dist>=8 overlaps), stride-dist trick for 2..7
+   (old: per-byte), broadcast RLE. Envelope <= *pos+265 inside the existing 266 reservation.
+   silesia T1 -93.3ms (1472.7->1379.5, 0.937, NEW-OWNS decisively); T16 -1.8ms; model TIE.
+   Permanent differential: dist 1..258 x len x 8 alignments + canary envelope assert.
+3. 02e6f962 long-match source prefetch len>40 (SHIP: T1 -12.4ms 0.9911 NEW-OWNS; T16/model TIE)
+   + TWO NO-SHIPS WITH MECHANISM: (a) BMI2 PEXT/BZHI runtime dispatch — REFUTED BY ASM: the
+   native-pinned build already emits BMI2 throughout the contig loop (16 shrx/46 shlx/8 bzhi,
+   ZERO %cl shifts; PEXT has no non-contiguous-mask site); dispatch is provably instruction-
+   identical on every measured cell. (b) wrapper-style pos-32 prefetch: T1 +5.6/T16 +3.5ms —
+   the contig loop's recent-output line is already L1-hot from its own stores.
+NET P3.4 (frozen 3-cell, p33 -> p34 final, interleaved sha-verified): silesia T1 1462.0->1375.2
+(0.9406 NEW-OWNS, iqr 2-3ms — the engine cell's biggest single-session step of P3); silesia T16
+332.7->326.9 (0.9826; p33 reproduced P3.3b's 332.9 and p34's p25=323.6 sits AT the bar-native
+325.0 class — the P3.3b regression is recovered); model T8 1.0036 TIE. Suite 941/0 on guest;
+sha grid 16/16 {silesia,model,bignasa,storedmix} x T{1,4,8,16}. Guest staged:
+/root/bin-p34-{native,isal} (+.feature/.sha256). ANOMALY log:
+one A/B ran 3x fast — bench-lock TTL lapse (watchdog thaw); caught by absolute-level sanity,
+re-frozen + re-measured. model T8 carries +-1.5% BINARY-LAYOUT wobble across all P3.4 bins —
+same-binary kill-switch A/B is the disproof instrument that separated it from behavior.
 ## P3.3b T16 TRIAGE — P3.1's DistTable owns the -3%; P3.2 clean [2026-06-10]
 4-way frozen interleave n=15 (bar/m6/p31/p33): bar med 325.0 / m6 329.5 / p31 333.6 / p33 332.9.
 P3.1 carries +8.6ms (distributions barely touch: bar p75 331.0 < p31 p25 332.2); P3.2 = +0.7ms TIE.
