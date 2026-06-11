@@ -1,3 +1,12 @@
+## SLAB T-CONDITIONAL MERGED (advisor SOUND+SHIP) — native T1 0.712, best recorded [2026-06-11]
+The fulcrum-decide loop closed end-to-end: tool surfaced the lever -> iter-1 NO-SHIP (criteria
+held; cap-neuter mechanism pinned) -> iter-2 CAUSAL-VERIFIED +108ms n=21 -> gate SOUND+SHIP ->
+merged. Native T1 trajectory: M6 0.578 -> P3.1 0.66 -> P3.4 0.655-0.712 -> NOW 0.712 (1296.6ms vs
+rg 926.6). T>2 zero-engagement (cache-residency regime untouched). RSS trade documented + gated.
+NATIVE CELLS NOW (latest frozen): T1 0.712 / T4 0.812 / T8 0.948 / T16 0.969(UNRESOLVED band) /
+model 0.633. Tool's remaining queued action: engine.backref perturbation (60.5% of classed
+cycles, pre-registered GZIPPY_SLOW_MODE perturb). Embedder hardening items (non-blocking):
+DECODE_THREADS reset on exit; warm-process dealloc mutex tax.
 ## SLAB RECONCILIATION ITER-1: NO-SHIP (criteria held) + the contradiction pinned [2026-06-11]
 Branch perf/slab-t-conditional @ 9bebcada (committed, UNMERGED): T-conditional gate + bytes-budget
 implemented; suite 942/0; sha 16/16; effect-verified (kill-switch works). NO-SHIP: T8 RSS max-run
