@@ -2466,6 +2466,7 @@ impl Block {
                 dist_tbl: dist_tbl.map(|t| t.entries_ptr() as u64).unwrap_or(0),
                 save_bitbuf: 0,
                 save_bitsleft: 0,
+                save_dst: 0,
                 short_tbl: self.lut_litlen.table.short_code_lookup.as_ptr() as u64,
             };
             macro_rules! sync_local_bits {

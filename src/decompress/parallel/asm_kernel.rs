@@ -63,10 +63,12 @@
 //!      mid-packet. Rare/exceptional packets are handed to Rust UN-consumed
 //!      (EXIT_RECLASS) and re-executed there from the identical state, so
 //!      error/EOB commits inherit byte-exact state by re-execution. The
-//!      backref arm consumes litlen bits before its rare checks; it spills
-//!      `(bitbuf, bitsleft)` at arm entry and RESTORES them before
-//!      EXIT_RECLASS (`pos`/`dst` untouched by then — first refill in that
-//!      arm comes after all rare checks).
+//!      backref arms consume litlen bits (and the multi-with-trailing arm
+//!      also stores the packed prefix and advances dst) before the dist
+//!      decode can bail; they spill `(bitbuf, bitsleft, dst)` at arm entry
+//!      and RESTORE all three before EXIT_RECLASS (`pos` untouched by then
+//!      — the first refill in the arm comes after all rare checks; rolled-
+//!      back packed-store bytes are X3 garbage above the exit dst).
 //!  X3. Every byte in `[entry dst, exit dst)` is final, byte-identical
 //!      output; bytes at/above the exit `dst` may hold speculative garbage
 //!      exactly like the Rust loop's packed-store overshoot (never read
@@ -88,12 +90,13 @@
 //!    `pos >= in_lim`). Both are monotone within one call, so the caller
 //!    disables re-entry (`asm_on = false`) and the Rust loop finishes the
 //!    tail under its own (looser) guards.
-//!  * `EXIT_RECLASS` (0): the next packet needs Rust — lone EOB,
-//!    `bit_count == 0` (invalid), symbol > MAX_LIT_LEN_SYM, a multi-symbol
-//!    packet whose trailing element is non-literal (builder-impossible,
-//!    kept for defense), a backref whose dist decode hit `raw == 0` /
-//!    `distance > 32768` / `distance > *pos` (restored, X2), and — until
-//!    stage c3 lands the backref arm — every lone length code. The caller
+//!  * `EXIT_RECLASS` (0, and reason-tagged 2/3/4 — semantically
+//!    identical): the next packet needs Rust — EOB (lone or trailing,
+//!    tag 2), `bit_count == 0` (invalid), symbol > MAX_LIT_LEN_SYM (lone
+//!    plain, trailing tag 3), a backref (lone OR multi-with-trailing)
+//!    whose dist decode hit a subtable pointer (rare; charter §5-R1) or
+//!    `raw == 0` / `distance == 0` / `distance > 32768` /
+//!    `distance > *pos` (restored incl. dst, X2; tag 4). The caller
 //!    leaves `asm_on = true`; the Rust loop handles exactly that packet and
 //!    the next `continue 'fast` re-enters the asm.
 //!
@@ -132,9 +135,16 @@ use crate::decompress::inflate::consume_first_decode::Bits;
 /// doc. The Rust loop's own guard is `FAST_IN_SLOP = 8`.
 pub const IN_MARGIN: usize = 40;
 
-/// Exit codes (module doc "Exit codes").
-pub const EXIT_RECLASS: u64 = 0;
+/// Exit codes (module doc "Exit codes"). The caller's contract tests ONLY
+/// `== EXIT_BOUNDARY`; every other value is a RECLASS. Values >= 2 are
+/// reason-tagged RECLASSes for the effect/coverage instrument (decide.sh
+/// EFFECT predicate + the F-c asm_frac diagnosis) — semantically identical
+/// to `EXIT_RECLASS`.
+pub const EXIT_RECLASS: u64 = 0; // invalid / oversize / lone EOB-class top bail
 pub const EXIT_BOUNDARY: u64 = 1;
+pub const EXIT_RECLASS_EOB: u64 = 2; // lone EOB packet
+pub const EXIT_RECLASS_MULTI_TRAIL: u64 = 3; // multi-literal packet with trailing non-literal
+pub const EXIT_RECLASS_DIST: u64 = 4; // backref arm dist-side bail (subtable/raw0/validity)
 
 /// The single dispatch predicate for the knob-exclusion rule (charter §3.5)
 /// — pure so it is unit-testable. `enabled()` (env + CPU) is checked
@@ -187,6 +197,11 @@ pub struct KernCtx {
     /// +64: litlen short table (`short_code_lookup.as_ptr()`) — passed to
     /// the asm as a pinned REGISTER; kept here so the ctx is self-contained.
     pub short_tbl: u64,
+    /// +72: backref-arm spill: saved dst (X2 restore — the multi-with-
+    /// trailing path advances dst by the literal prefix BEFORE the dist
+    /// decode can bail; the restore rolls dst back, and the already-stored
+    /// packed bytes become X3 overshoot garbage above the exit dst).
+    pub save_dst: u64,
 }
 
 const _: () = assert!(std::mem::offset_of!(KernCtx, in_ptr) == 0);
@@ -198,6 +213,7 @@ const _: () = assert!(std::mem::offset_of!(KernCtx, dist_tbl) == 40);
 const _: () = assert!(std::mem::offset_of!(KernCtx, save_bitbuf) == 48);
 const _: () = assert!(std::mem::offset_of!(KernCtx, save_bitsleft) == 56);
 const _: () = assert!(std::mem::offset_of!(KernCtx, short_tbl) == 64);
+const _: () = assert!(std::mem::offset_of!(KernCtx, save_dst) == 72);
 
 /// LUT-layout constants mirrored from `lut_huffman.rs` / `libdeflate_entry.rs`
 /// (compile-checked so drift between the asm immediates and the table
@@ -218,7 +234,7 @@ const _: () = assert!(crate::decompress::inflate::libdeflate_entry::DistTable::T
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 mod imp {
-    use super::{Bits, KernCtx, EXIT_BOUNDARY};
+    use super::{Bits, KernCtx};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
 
@@ -229,6 +245,9 @@ mod imp {
     pub static KERN_EXIT_BOUNDARY: AtomicU64 = AtomicU64::new(0);
     pub static KERN_EXIT_RECLASS: AtomicU64 = AtomicU64::new(0);
     pub static KERN_ASM_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static KERN_RECLASS_EOB: AtomicU64 = AtomicU64::new(0);
+    pub static KERN_RECLASS_MULTI_TRAIL: AtomicU64 = AtomicU64::new(0);
+    pub static KERN_RECLASS_DIST: AtomicU64 = AtomicU64::new(0);
 
     /// Runtime dispatch: ON when compiled in, unless `GZIPPY_ASM_KERNEL=0`
     /// (kill-switch) or the CPU lacks BMI2 (`shrx`/`shlx`/`bzhi`).
@@ -248,18 +267,36 @@ mod imp {
 
     /// The rung-(c) kernel region.
     ///
-    /// STAGE c2 (this commit): the LITERAL hot path lives inside the asm —
+    /// STAGE c2: the LITERAL hot path lives inside the asm —
     /// iteration-top guards, raw short-LUT gather, long-code resolution
     /// (X1: required in-asm so LIT_CHAIN_MAX accounting and hence refill
     /// placement match the Rust loop exactly), the lone-literal arm with the
     /// exact P3.2 runtime chain (two gated steps + one always-carry decode,
     /// each `decode()` preceded by the bit-exact `< 32` backstop refill),
     /// the packed multi-literal arm, the post-chain / bottom `< 48`
-    /// threshold refills, and the back-edge. Every NON-literal packet (lone
-    /// length/EOB/oversize, multi-with-trailing) exits `EXIT_RECLASS`
-    /// PRE-CONSUME at an iteration top — Rust re-executes it from the
-    /// identical cursor and the next `continue 'fast` re-enters. Stage c3
-    /// moves the backref arm inside.
+    /// threshold refills, and the back-edge.
+    ///
+    /// STAGE c3 (this commit): the BACKREF arm lives inside too (`50:`) —
+    /// a lone length code (short or long path) consumes the litlen packet,
+    /// decodes the distance from the libdeflate-shape `DistTable` (ONE load
+    /// + in-register entry decode: `consume_entry` == `shrx` by the entry
+    /// low byte, `decode_distance` == `bzhi(saved, total_bits) >> cw_bits`
+    /// + base), validates (raw==0 / subtable / dist==0 / >32768 / > *pos),
+    /// runs the X1 pre-copy `< 48` refill + carried-packet preload (the
+    /// P3.5 c1 hoist), and copies with the P3.4 `emit_backref_contig`
+    /// shape transliterated verbatim (dist>=8 burst-5 + stride-8 words;
+    /// dist==1 RLE broadcast word; 2..=7 stride-dist words; `length > 40`
+    /// prefetch). The X2 spill/restore (`80:`) makes every rare bail
+    /// pre-consume. Remaining `EXIT_RECLASS` packets: lone EOB, invalid,
+    /// oversize (>512), dist-subtable (rare; charter §5-R1), dist validity
+    /// errors (Rust re-executes to the identical error commit), and
+    /// multi-with-trailing (builder-impossible, kept for defense) — all at
+    /// an iteration top, cursor before a fresh un-consumed packet.
+    /// Bit-budget proof (E2 stays clean inside the arm): an iteration top
+    /// holds >= 48 bits, the litlen packet consumes <= 21, a main-table
+    /// dist entry consumes <= 9 + 13 = 22 <= the >= 27 remaining — no
+    /// underflow; the subtable case (the only one that could) exits to
+    /// Rust.
     ///
     /// Asm↔Rust line map (byte-exactness audit):
     ///   top guards        ↔ marker_inflate.rs `out_ok`/`in_ok` (E4 limits)
@@ -271,15 +308,27 @@ mod imp {
     ///                       backstop = `31:`/`41:`/`62:` refills)
     ///   post-chain `7:` / bottom `6:` ↔ the `< 48` threshold refills
     ///   multi arm `22:`   ↔ packed 8-byte store of `sym0 & 0x00FF_FFFF`
+    ///   backref arm `50:` ↔ marker_inflate.rs trailing handler (EOB/MAX
+    ///                       gates, dist single-lookup :2747-2778, validity
+    ///                       :2810-2817, pre-copy refill+preload :2834-2839)
+    ///   copy `52:`-`59:`  ↔ marker_inflate.rs `emit_backref_contig` (:3560)
     ///   REFILL sequence   ↔ consume_first_decode.rs `Bits::refill` fast
     ///                       form (`pos + 8 <= len` structural via
     ///                       IN_MARGIN; `>64` underflow check dead via E2)
     ///
     /// # Safety
-    /// Caller upholds E1-E6 (module doc). The asm reads `ctx`, the litlen
-    /// tables and the input window; it writes only `[dst, exit dst + 8)`
-    /// inside the reserved out_room envelope (E4) and the pinned registers.
-    #[inline]
+    /// Caller upholds E1-E6 (module doc). The asm reads `ctx`, the litlen +
+    /// dist tables and the input window; it writes only `[entry dst,
+    /// exit dst + copy-overshoot)` inside the reserved out_room envelope
+    /// (E4; the copy overshoot <= max(40, length+7) <= 265 < the
+    /// MAX_RUN_LENGTH + 8 = 266 reservation, the P3.4 envelope) and the
+    /// pinned registers.
+    ///
+    /// `#[inline(never)]`: c2's frozen A/B measured OFF-vs-base +36 ms —
+    /// inlining the (cold-when-disabled) region into the hot Rust loop
+    /// taxes its layout even when killed. One CALL per region run is
+    /// amortized by the in-asm back-edge.
+    #[inline(never)]
     pub unsafe fn run_contig(ctx: &mut KernCtx, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
         let mut bitbuf = lb.bitbuf;
         let mut bitsleft: u64 = lb.bitsleft as u64;
@@ -314,7 +363,7 @@ mod imp {
                 "jne 22f",                            // multi-literal pack
                 "movzx {t4:e}, {t1:x}",               // code = sym0 & 0xFFFF
                 "cmp {t4:e}, 255",
-                "ja 8f",                              // c2: lone non-literal → Rust
+                "ja 50f",                             // lone non-literal → backref arm (t4=code, t2=bc)
                 // ── lone literal: consume + 1-byte store (Q3) ───────────
                 "shrx {bitbuf}, {bitbuf}, {t2}",
                 "sub {bitsleft}, {t2}",
@@ -507,13 +556,33 @@ mod imp {
                 "shrx {t4:e}, {ret:e}, {t4:e}",
                 "and {t4:e}, 0xFFFF",                 // trailing element
                 "cmp {t4:e}, 255",
-                "ja 8f",                              // trailing non-literal → Rust
+                "ja 25f",                             // multi-with-trailing → in-asm backref (c3)
                 "shrx {bitbuf}, {bitbuf}, {t2}",      // consume whole packet
                 "sub {bitsleft}, {t2}",
                 "and {ret:e}, 0xFFFFFF",              // sym0 & 0x00FF_FFFF
                 "mov qword ptr [{dst}], {ret}",       // speculative 8-byte store
                 "add {dst}, {t3}",                    // advance by sym_count
                 "jmp 6b",
+                // ── multi-with-trailing-length (c3: the DOMINANT backref
+                //    carrier — 99.6% of c3a RECLASSes): packed store +
+                //    literal-prefix advance, then the shared backref body.
+                //    t1=raw entry t2=bc t3=cnt t4=trailing code {ret}=packed
+                "25:",
+                "cmp {t4:e}, 256",
+                "je 82f",                             // trailing EOB → Rust (pre-consume, tag 2)
+                "cmp {t4:e}, 512",                    // MAX_LIT_LEN_SYM
+                "ja 83f",                             // trailing oversize → Rust (pre-consume, tag 3)
+                "mov qword ptr [{ctx} + 48], {bitbuf}",   // X2 spill (incl. dst)
+                "mov qword ptr [{ctx} + 56], {bitsleft}",
+                "mov qword ptr [{ctx} + 72], {dst}",
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume whole packet
+                "sub {bitsleft}, {t2}",
+                "and {ret:e}, 0xFFFFFF",              // sym0 & 0x00FF_FFFF
+                "mov qword ptr [{dst}], {ret}",       // speculative 8-byte store
+                "lea {t3:e}, [{t3:e} - 1]",           // lit_prefix = cnt - 1
+                "add {dst}, {t3}",
+                "lea {t2:e}, [{t4:e} - 254]",         // length = code - 254
+                "jmp 58f",                            // → shared dist+copy body
                 // ── long code at top (decode_prefilled long path) ───────
                 "20:",
                 "mov {t2:e}, {t1:e}",
@@ -529,12 +598,168 @@ mod imp {
                 "jz 8f",                              // invalid → Rust
                 "and {t1:e}, 0x3FF",                  // symbol
                 "cmp {t1:e}, 255",
-                "ja 8f",                              // c2: lone non-literal → Rust
+                "ja 21f",                             // lone non-literal → backref arm
                 "shrx {bitbuf}, {bitbuf}, {t2}",      // lone literal via long path
                 "sub {bitsleft}, {t2}",
                 "mov byte ptr [{dst}], {t1:l}",
                 "inc {dst}",
                 "jmp 30b",                            // → chain
+                "21:",
+                "mov {t4:e}, {t1:e}",                 // code → t4 (arm reg contract)
+                "jmp 50f",
+                // ── backref arm (c3): t4:e = code (>255), t2 = bc ───────
+                //    X2: spill the pre-consume cursor; every rare bail
+                //    (`80:`) restores it and RECLASSes with pos/dst
+                //    untouched (first refill comes after all rare checks).
+                "50:",
+                "cmp {t4:e}, 256",
+                "je 82f",                             // lone EOB → Rust (pre-consume, tag 2)
+                "cmp {t4:e}, 512",                    // MAX_LIT_LEN_SYM
+                "ja 8f",                              // oversize → Rust (pre-consume)
+                "mov qword ptr [{ctx} + 48], {bitbuf}",   // X2 spill (incl. dst:
+                "mov qword ptr [{ctx} + 56], {bitsleft}", //  shared restore 80:)
+                "mov qword ptr [{ctx} + 72], {dst}",
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the litlen packet
+                "sub {bitsleft}, {t2}",
+                "lea {t2:e}, [{t4:e} - 254]",         // length = code - 254 (3..=258)
+                // ── shared backref body: t2 = length; X2 state spilled ──
+                "58:",
+                // dist decode: ONE main-table load + in-register entry decode
+                // (libdeflate DistTable shape; subtable → Rust, §5-R1).
+                "mov {t3}, qword ptr [{ctx} + 40]",   // dist entries base
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0x1FF",                  // DistTable::TABLE_BITS = 9
+                "mov {t1:e}, dword ptr [{t3} + {t1}*4]",
+                "test {t1:e}, {t1:e}",
+                "jz 80f",                             // raw == 0 (hole/code 30/31) → restore
+                "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
+                "jnz 80f",                            // subtable dist → restore
+                "mov {t3}, {bitbuf}",                 // saved_bitbuf
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry: >>= raw as u8 (= total_bits <= 31)
+                "mov {t4:e}, {t1:e}",
+                "and {t4:e}, 0x1F",
+                "sub {bitsleft}, {t4}",               // -= raw & 0x1F (no underflow: budget proof)
+                "bzhi {t3}, {t3}, {t1}",              // saved & ((1 << total_bits) - 1)
+                "mov {t4:e}, {t1:e}",
+                "shr {t4:e}, 8",
+                "and {t4:e}, 0xF",                    // codeword_bits
+                "shrx {t3}, {t3}, {t4}",              // extra value
+                "shr {t1:e}, 16",                     // distance base
+                "add {t1:e}, {t3:e}",                 // distance
+                "jz 80f",                             // distance == 0 → restore
+                "cmp {t1:e}, 32768",
+                "ja 80f",                             // > MAX_WINDOW_SIZE → restore
+                "mov {t4}, {dst}",
+                "sub {t4}, {t1}",                     // src = dst - distance
+                "cmp {t4}, qword ptr [{ctx} + 24]",
+                "jb 80f",                             // src < out_base ⇔ distance > *pos → restore
+                // X1 pre-copy `< 48` refill (production refills BEFORE the
+                // copy — P3.5 c1; the carried gather below is pure).
+                "cmp {bitsleft}, 48",
+                "jae 51f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
+                "or {bitsleft}, 56",
+                "51:",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
+                "mov {t3:e}, dword ptr [{short_tbl} + {t3}*4]",  // carried preload
+                // ── copy: emit_backref_contig transliterated ────────────
+                //    t1=distance t2=length t4=src {ret}=cursor t5=word
+                //    {t3}=carried entry (LIVE across the copy)
+                "mov {ret}, {dst}",
+                "cmp {t2}, 40",
+                "jbe 52f",
+                "prefetcht0 byte ptr [{t4} + 40]",    // length > 40 (P3.4 item 3B)
+                "52:",
+                "add {t2}, {dst}",                    // t2 = end = dst + length
+                "cmp {t1}, 8",
+                "jb 55f",
+                // dist >= 8: unconditional 5-word burst, then stride-8
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "mov {t5}, qword ptr [{t4} + 8]",
+                "mov qword ptr [{ret} + 8], {t5}",
+                "mov {t5}, qword ptr [{t4} + 16]",
+                "mov qword ptr [{ret} + 16], {t5}",
+                "mov {t5}, qword ptr [{t4} + 24]",
+                "mov qword ptr [{ret} + 24], {t5}",
+                "mov {t5}, qword ptr [{t4} + 32]",
+                "mov qword ptr [{ret} + 32], {t5}",
+                "add {ret}, 40",
+                "cmp {ret}, {t2}",
+                "jae 59f",                            // length <= 40 → done
+                "add {t4}, 40",
+                "53:",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, 8",
+                "add {ret}, 8",
+                "cmp {ret}, {t2}",
+                "jb 53b",
+                "jmp 59f",
+                "55:",
+                "cmp {t1:e}, 1",
+                "jne 56f",
+                // dist == 1: RLE broadcast-word fill while dst < end
+                "movzx {t5:e}, byte ptr [{t4}]",
+                "mov {t1}, 0x0101010101010101",
+                "imul {t5}, {t1}",
+                "54:",
+                "mov qword ptr [{ret}], {t5}",
+                "add {ret}, 8",
+                "cmp {ret}, {t2}",
+                "jb 54b",
+                "jmp 59f",
+                // 2 <= dist <= 7: stride-dist words, 4 unconditional then
+                // while dst < end
+                "56:",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "57:",
+                "cmp {ret}, {t2}",
+                "jae 59f",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "jmp 57b",
+                "59:",
+                "mov {dst}, {t2}",                    // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                // ── restore + RECLASS (X2: un-consume the whole packet) ─
+                "80:",
+                "mov {bitbuf}, qword ptr [{ctx} + 48]",
+                "mov {bitsleft}, qword ptr [{ctx} + 56]",
+                "mov {dst}, qword ptr [{ctx} + 72]",  // multi path: rolls back lit_prefix
+                "mov {ret}, 4",                       // RECLASS, dist-bail tag
+                "jmp 9f",
+                "82:",
+                "mov {ret}, 2",                       // RECLASS, lone-EOB tag
+                "jmp 9f",
+                "83:",
+                "mov {ret}, 3",                       // RECLASS, multi-trailing tag
+                "jmp 9f",
                 // ── exits ───────────────────────────────────────────────
                 "8:",
                 "mov {ret}, 0",                       // RECLASS (pre-consume)
@@ -551,6 +776,7 @@ mod imp {
                 t2 = out(reg) _,
                 t3 = out(reg) _,
                 t4 = out(reg) _,
+                t5 = out(reg) _,
                 options(nostack),
             );
         }
@@ -566,11 +792,14 @@ mod imp {
         }
         KERN_ENTRIES.fetch_add(1, Ordering::Relaxed);
         KERN_ASM_BYTES.fetch_add(delta as u64, Ordering::Relaxed);
-        if exit == EXIT_BOUNDARY {
-            KERN_EXIT_BOUNDARY.fetch_add(1, Ordering::Relaxed);
-        } else {
-            KERN_EXIT_RECLASS.fetch_add(1, Ordering::Relaxed);
+        match exit {
+            super::EXIT_BOUNDARY => &KERN_EXIT_BOUNDARY,
+            super::EXIT_RECLASS_EOB => &KERN_RECLASS_EOB,
+            super::EXIT_RECLASS_MULTI_TRAIL => &KERN_RECLASS_MULTI_TRAIL,
+            super::EXIT_RECLASS_DIST => &KERN_RECLASS_DIST,
+            _ => &KERN_EXIT_RECLASS,
         }
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn dump_if_enabled() {
@@ -578,11 +807,14 @@ mod imp {
             return;
         }
         eprintln!(
-            "[asm-kernel:c] enabled={} entries={} exit_boundary={} exit_reclass={} asm_bytes={}",
+            "[asm-kernel:c] enabled={} entries={} exit_boundary={} exit_reclass={} reclass_eob={} reclass_multi_trail={} reclass_dist={} asm_bytes={}",
             enabled(),
             KERN_ENTRIES.load(Ordering::Relaxed),
             KERN_EXIT_BOUNDARY.load(Ordering::Relaxed),
             KERN_EXIT_RECLASS.load(Ordering::Relaxed),
+            KERN_RECLASS_EOB.load(Ordering::Relaxed),
+            KERN_RECLASS_MULTI_TRAIL.load(Ordering::Relaxed),
+            KERN_RECLASS_DIST.load(Ordering::Relaxed),
             KERN_ASM_BYTES.load(Ordering::Relaxed),
         );
     }
@@ -595,17 +827,19 @@ pub use imp::{dump_if_enabled, enabled, note_exit, run_contig, stats_enabled};
 #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
 pub fn dump_if_enabled() {}
 
-/// Pure-Rust REFERENCE MODEL of the asm region's c2 contract — the exact
-/// literal-arm subset of `decode_clean_into_contig`'s fast loop (same
+/// Pure-Rust REFERENCE MODEL of the asm region's contract — the exact
+/// fast-loop subset of `decode_clean_into_contig` the asm owns (same
 /// guards, same decode/backstop/threshold refill placement, same stores,
-/// same RECLASS rules), expressed through the production primitives
-/// (`LutLitLenCode::{decode, decode_prefilled}`, `Bits`). The differential
-/// test pins asm == ref on (exit, bit cursor, dst, output bytes); the
-/// ref's own equivalence to the production loop is by line-map inspection
-/// (see `run_contig` doc) and by the guest suite/sha grid.
+/// same copy shape via the production `emit_backref_contig`, same
+/// RECLASS/restore rules), expressed through the production primitives
+/// (`LutLitLenCode::{decode, decode_prefilled}`, `DistTable`, `Bits`). The
+/// differential test pins asm == ref on (exit, bit cursor, dst, output
+/// bytes); the ref's own equivalence to the production loop is by line-map
+/// inspection (see `run_contig` doc) and by the guest suite/sha grid.
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 pub fn run_contig_ref(
     lut: &super::lut_huffman::LutLitLenCode,
+    dist: &crate::decompress::inflate::libdeflate_entry::DistTable,
     lb: &mut Bits<'_>,
     out: &mut [u8],
     dst: &mut usize,
@@ -623,7 +857,41 @@ pub fn run_contig_ref(
         if pre.sym_count == 1 {
             let code = pre.symbol & 0xFFFF;
             if code > 255 {
-                return EXIT_RECLASS; // c2: lone non-literal → Rust
+                // c3 backref arm (asm `50:`): EOB/oversize pre-consume; all
+                // dist-side bails restore the spilled cursor (X2).
+                if code == 256 || code > super::lut_huffman::MAX_LIT_LEN_SYM {
+                    return EXIT_RECLASS;
+                }
+                let (sb, sl) = (lb.bitbuf, lb.bitsleft);
+                lb.consume(pre.bit_count);
+                let length = code as usize - 254;
+                let e = dist.lookup(lb.bitbuf);
+                if e.raw() == 0 || e.is_subtable_ptr() {
+                    lb.bitbuf = sb;
+                    lb.bitsleft = sl;
+                    return EXIT_RECLASS;
+                }
+                let saved = lb.bitbuf;
+                lb.consume_entry(e.raw());
+                let distance = e.decode_distance(saved) as usize;
+                if distance == 0 || distance > 32768 || distance > *dst {
+                    lb.bitbuf = sb;
+                    lb.bitsleft = sl;
+                    return EXIT_RECLASS;
+                }
+                // X1 pre-copy refill, then the production copy shape.
+                if (lb.bitsleft as u8) < 48 {
+                    lb.refill();
+                }
+                unsafe {
+                    super::marker_inflate::emit_backref_contig(
+                        out.as_mut_ptr(),
+                        dst,
+                        distance,
+                        length,
+                    );
+                }
+                continue;
             }
             lb.consume(pre.bit_count);
             out[*dst] = code as u8;
@@ -653,7 +921,50 @@ pub fn run_contig_ref(
         } else {
             let last = (pre.symbol >> (8 * (pre.sym_count - 1))) & 0xFFFF;
             if last > 255 {
-                return EXIT_RECLASS; // trailing non-literal → Rust
+                // c3 multi-with-trailing-length (asm `25:`): EOB/oversize
+                // pre-consume; otherwise packed store + lit-prefix advance,
+                // then the shared backref body; dist bails restore the
+                // cursor AND dst.
+                if last == 256 || last > super::lut_huffman::MAX_LIT_LEN_SYM {
+                    return EXIT_RECLASS;
+                }
+                let (sb, sl, sd) = (lb.bitbuf, lb.bitsleft, *dst);
+                lb.consume(pre.bit_count);
+                let packed = (pre.symbol & 0x00FF_FFFF) as u64;
+                out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
+                *dst += pre.sym_count as usize - 1;
+                let length = last as usize - 254;
+                let e = dist.lookup(lb.bitbuf);
+                let bail = if e.raw() == 0 || e.is_subtable_ptr() {
+                    true
+                } else {
+                    let saved = lb.bitbuf;
+                    lb.consume_entry(e.raw());
+                    let distance = e.decode_distance(saved) as usize;
+                    if distance == 0 || distance > 32768 || distance > *dst {
+                        true
+                    } else {
+                        if (lb.bitsleft as u8) < 48 {
+                            lb.refill();
+                        }
+                        unsafe {
+                            super::marker_inflate::emit_backref_contig(
+                                out.as_mut_ptr(),
+                                dst,
+                                distance,
+                                length,
+                            );
+                        }
+                        false
+                    }
+                };
+                if bail {
+                    lb.bitbuf = sb;
+                    lb.bitsleft = sl;
+                    *dst = sd;
+                    return EXIT_RECLASS;
+                }
+                continue;
             }
             lb.consume(pre.bit_count);
             let packed = (pre.symbol & 0x00FF_FFFF) as u64;
@@ -712,6 +1023,7 @@ mod tests {
             dist_tbl: 0,
             save_bitbuf: 0,
             save_bitsleft: 0,
+            save_dst: 0,
             short_tbl: short.as_ptr() as u64,
         };
         // Guards pass → RECLASS, state unchanged.
@@ -801,6 +1113,12 @@ mod tests {
             x ^= x >> 27;
             x.wrapping_mul(0x2545F4914F6CDD1D)
         };
+        // All-holes dist table: every lone length code takes the c3
+        // spill/restore path and RECLASSes (preserves this test's c2
+        // literal-only semantics and small-buffer envelope, while now
+        // covering the X2 restore on every backref candidate).
+        use crate::decompress::inflate::libdeflate_entry::DistTable;
+        let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
         for (ti, tbl) in tables.iter().enumerate() {
             for trial in 0..4000 {
                 // Random input stream, long enough for the margin scheme.
@@ -822,8 +1140,15 @@ mod tests {
                 };
 
                 let mut dref = 0usize;
-                let ref_exit =
-                    run_contig_ref(tbl, &mut lb_ref, &mut out_ref, &mut dref, out_lim, in_lim);
+                let ref_exit = run_contig_ref(
+                    tbl,
+                    &dist_holes,
+                    &mut lb_ref,
+                    &mut out_ref,
+                    &mut dref,
+                    out_lim,
+                    in_lim,
+                );
 
                 let dst0 = out_asm.as_mut_ptr();
                 let mut ctx = KernCtx {
@@ -832,16 +1157,24 @@ mod tests {
                     out_lim: dst0 as u64 + out_lim as u64,
                     out_base: dst0 as u64,
                     long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
-                    dist_tbl: 0,
+                    dist_tbl: dist_holes.entries_ptr() as u64,
                     save_bitbuf: 0,
                     save_bitsleft: 0,
+                    save_dst: 0,
                     short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
                 };
                 let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
                 let dasm = (dst1 as usize) - (dst0 as usize);
 
                 let tag = format!("table {ti} trial {trial}");
-                assert_eq!(ref_exit, asm_exit, "exit diverged ({tag})");
+                // Ref reports the exit CLASS; the asm additionally tags
+                // RECLASS reasons (codes >= 2) for the effect instrument.
+                let asm_class = if asm_exit == EXIT_BOUNDARY {
+                    EXIT_BOUNDARY
+                } else {
+                    EXIT_RECLASS
+                };
+                assert_eq!(ref_exit, asm_class, "exit diverged ({tag})");
                 assert_eq!(dref, dasm, "dst advance diverged ({tag})");
                 assert_eq!(lb_ref.pos, lb_asm.pos, "pos diverged ({tag})");
                 assert_eq!(lb_ref.bitbuf, lb_asm.bitbuf, "bitbuf diverged ({tag})");
@@ -856,5 +1189,175 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Stage c3 differential: asm vs ref over WINDOWED buffers (32 KiB
+    /// random prefill shared by both arms, dst starting at the window
+    /// edge so distances <= 32768 are valid) × litlen tables WITH length
+    /// codes × dist-table shapes chosen for arm coverage:
+    ///   * `lenny` litlen (≈half length codes; 281..284 @8 + 4-5 extra
+    ///     bits exceed the 12-bit short table → LONG-path length codes,
+    ///     covering the `21:` → `50:` route) — heavy backref traffic;
+    ///   * `dist_small` (complete, dsym 0..7) — dist 1..16: RLE (dist 1),
+    ///     stride (2..7), burst overlap (8+), short lengths;
+    ///   * `dist_fixed5` ([5;30], 2/32 holes) — full distance range: most
+    ///     backrefs invalid-dist or > *pos → restore/RECLASS coverage;
+    ///   * `dist_sub` (complete, 10-bit tails) — subtable-pointer bails.
+    /// Compares exit, full cursor, dst advance, and every byte above the
+    /// shared window. Coverage floor asserted on the (lenny × small) cell
+    /// so the test cannot silently degrade to literals-only.
+    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[test]
+    fn c3_differential_asm_vs_ref_windowed_backrefs() {
+        use crate::decompress::inflate::libdeflate_entry::DistTable;
+        use crate::decompress::parallel::lut_huffman::LutLitLenCode;
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            eprintln!("SKIP c3 differential: no BMI2 on this host (run on guest)");
+            return;
+        }
+        const WIN: usize = 32 * 1024;
+        // Litlen with length codes (Kraft-complete):
+        //   lits 0..3 @3, lengths 257..264 @5, 265..272 @6, 273..280 @7,
+        //   281..284 @8, EOB @8, lits 10..31 @9.
+        let mut lenny = vec![0u8; 286];
+        for s in 0..4 {
+            lenny[s] = 3;
+        }
+        for s in 257..265 {
+            lenny[s] = 5;
+        }
+        for s in 265..273 {
+            lenny[s] = 6;
+        }
+        for s in 273..281 {
+            lenny[s] = 7;
+        }
+        for s in 281..285 {
+            lenny[s] = 8;
+        }
+        lenny[256] = 8;
+        for s in 10..32 {
+            lenny[s] = 9;
+        }
+        // RFC-fixed-shape litlen (lengths via 7-8-bit codes).
+        let mut fixed = vec![8u8; 288];
+        fixed[144..256].iter_mut().for_each(|x| *x = 9);
+        fixed[256..280].iter_mut().for_each(|x| *x = 7);
+        let build = |lens: &[u8]| -> LutLitLenCode {
+            let mut c = LutLitLenCode::new_empty();
+            assert!(c.rebuild_from(lens), "test table lens must be valid");
+            c
+        };
+        let lut_lenny = build(&lenny);
+        let lut_fixed = build(&fixed);
+        // Dist tables.
+        let dist_small = DistTable::build(&[2, 2, 2, 3, 4, 5, 6, 6]).expect("small dist table");
+        let dist_fixed5 = DistTable::build(&[5u8; 30]).expect("fixed5 dist table");
+        let dist_sub = DistTable::build(&[1, 2, 3, 4, 5, 6, 7, 8, 10, 10, 10, 10])
+            .expect("subtable dist table");
+        let pairs: [(&LutLitLenCode, &DistTable, &str); 5] = [
+            (&lut_lenny, &dist_small, "lenny×small"),
+            (&lut_lenny, &dist_fixed5, "lenny×fixed5"),
+            (&lut_lenny, &dist_sub, "lenny×sub"),
+            (&lut_fixed, &dist_fixed5, "fixed×fixed5"),
+            (&lut_fixed, &dist_small, "fixed×small"),
+        ];
+
+        let mut x: u64 = 0x243F6A8885A308D3;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        // Shared window prefill (identical in both arms).
+        let window: Vec<u8> = (0..WIN).map(|_| next() as u8).collect();
+        let mut small_pair_bytes = 0u64;
+        let mut small_pair_trials = 0u64;
+        for (pi, (tbl, dt, tag0)) in pairs.iter().enumerate() {
+            for trial in 0..3000 {
+                let n = 150 + (next() as usize % 450);
+                let data: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                let in_lim = data.len().saturating_sub(IN_MARGIN);
+                let budget = 16 + (next() as usize % 368);
+                let out_lim = WIN + budget;
+                // Envelope: copy overshoot <= max(40, length+7) <= 265.
+                let buf_len = out_lim + 300;
+                let mut out_ref = vec![0u8; buf_len];
+                let mut out_asm = vec![0u8; buf_len];
+                out_ref[..WIN].copy_from_slice(&window);
+                out_asm[..WIN].copy_from_slice(&window);
+
+                let mut lb_ref = Bits::new(&data);
+                let mut lb_asm = Bits {
+                    data: &data,
+                    pos: lb_ref.pos,
+                    bitbuf: lb_ref.bitbuf,
+                    bitsleft: lb_ref.bitsleft,
+                };
+
+                let mut dref = WIN;
+                let ref_exit = run_contig_ref(
+                    tbl,
+                    dt,
+                    &mut lb_ref,
+                    &mut out_ref,
+                    &mut dref,
+                    out_lim,
+                    in_lim,
+                );
+
+                let base0 = out_asm.as_mut_ptr();
+                let dst0 = unsafe { base0.add(WIN) };
+                let mut ctx = KernCtx {
+                    in_ptr: data.as_ptr() as u64,
+                    in_lim: in_lim as u64,
+                    out_lim: base0 as u64 + out_lim as u64,
+                    out_base: base0 as u64,
+                    long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
+                    dist_tbl: dt.entries_ptr() as u64,
+                    save_bitbuf: 0,
+                    save_bitsleft: 0,
+                    save_dst: 0,
+                    short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
+                };
+                let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
+                let dasm = WIN + ((dst1 as usize) - (dst0 as usize));
+
+                let tag = format!("pair {pi} ({tag0}) trial {trial}");
+                // Ref reports the exit CLASS; the asm additionally tags
+                // RECLASS reasons (codes >= 2) for the effect instrument.
+                let asm_class = if asm_exit == EXIT_BOUNDARY {
+                    EXIT_BOUNDARY
+                } else {
+                    EXIT_RECLASS
+                };
+                assert_eq!(ref_exit, asm_class, "exit diverged ({tag})");
+                assert_eq!(dref, dasm, "dst advance diverged ({tag})");
+                assert_eq!(lb_ref.pos, lb_asm.pos, "pos diverged ({tag})");
+                assert_eq!(lb_ref.bitbuf, lb_asm.bitbuf, "bitbuf diverged ({tag})");
+                assert_eq!(
+                    lb_ref.bitsleft, lb_asm.bitsleft,
+                    "bitsleft diverged ({tag})"
+                );
+                assert_eq!(
+                    &out_ref[WIN..dref],
+                    &out_asm[WIN..dasm],
+                    "output bytes diverged ({tag})"
+                );
+                if pi == 0 {
+                    small_pair_bytes += (dasm - WIN) as u64;
+                    small_pair_trials += 1;
+                }
+            }
+        }
+        // Coverage floor: the lenny×small cell must emit real backref
+        // volume (literal-only c2 averaged ~1.3 B/exit on silesia; with
+        // valid small distances the average must far exceed that).
+        let avg = small_pair_bytes as f64 / small_pair_trials as f64;
+        assert!(
+            avg > 30.0,
+            "c3 coverage degraded: lenny×small avg bytes/run = {avg:.1}"
+        );
     }
 }
