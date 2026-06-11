@@ -311,6 +311,72 @@ fn stored_flip_disabled() -> bool {
     *ON.get_or_init(|| std::env::var("GZIPPY_NO_STORED_FLIP").is_ok_and(|v| v == "1"))
 }
 
+/// Rung-(d) increment 1 test override (mirror of `STORED_FLIP_OVERRIDE`):
+/// -1 = follow the env kill-switch; 0 = force the DistTable path ON;
+/// 1 = force it OFF (the exact pre-change `dist_hc` chain). Tests flip both
+/// arms on the same stream and assert u16 + cursor equality. The env read is
+/// OnceLock-cached, so tests must use the override, not set_var.
+#[cfg(pure_inflate_decode)]
+pub(crate) static MARKER_DIST_LUT_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+/// Test-only liveness counter for the rung-(d) DistTable arm (compiled out of
+/// production builds): proves the differential's ON arm actually routed
+/// marker-fast-loop distance decodes through the DistTable path (and that the
+/// OFF arm routed zero through it).
+#[cfg(all(test, pure_inflate_decode))]
+pub(crate) static MARKER_DIST_LUT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Effect-verification counters for the rung-(d) marker-loop DistTable arm
+/// (`GZIPPY_MARKER_DIST_STATS=1` — the GZIPPY_ASM_STATS pattern): proves on a
+/// PRODUCTION binary which distance-decode arm the marker fast loop took
+/// (EFFECT-VERIFIED, not assumed — the decide.sh knob rule). Hot-path cost
+/// when OFF: one hoisted predictable branch per backref (the bool is
+/// snapshotted once per decode call). Dumped from the chunk fetcher's
+/// `--verbose` block alongside the asm-kernel counters.
+#[cfg(pure_inflate_decode)]
+pub(crate) mod marker_dist_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    /// Backrefs decoded via the DistTable arm in the marker fast loop.
+    pub static LUT_BACKREFS: AtomicU64 = AtomicU64::new(0);
+    /// Backrefs decoded via the dist_hc chain in the marker fast loop
+    /// (kill-switch arm or builder-declined block).
+    pub static HC_BACKREFS: AtomicU64 = AtomicU64::new(0);
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GZIPPY_MARKER_DIST_STATS").is_ok_and(|v| v == "1"))
+    }
+    pub fn dump_if_enabled() {
+        if !enabled() {
+            return;
+        }
+        eprintln!(
+            "[marker-dist:d1] lut_backrefs={} hc_backrefs={}",
+            LUT_BACKREFS.load(Ordering::Relaxed),
+            HC_BACKREFS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Rung-(d) increment 1 kill-switch (plans/asm-rung-d-eval.md §5, F-d1):
+/// `GZIPPY_MARKER_DIST_TABLE=0` restores the exact pre-change marker-fast-loop
+/// distance decode (the `dist_hc` → DISTANCE_EXTRA → refill-check →
+/// DISTANCE_BASE dependent chain) — the same-binary causal A/B arm the
+/// campaign measurement protocol requires. One OnceLock read per
+/// `read_internal_compressed_specialized::<true>` call.
+#[cfg(pure_inflate_decode)]
+fn marker_dist_lut_disabled() -> bool {
+    let ov = MARKER_DIST_LUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov >= 0 {
+        return ov == 1;
+    }
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_MARKER_DIST_TABLE").is_ok_and(|v| v == "0"))
+}
+
 /// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
 /// new path active/inactive on a shipped binary without counters plumbing).
 fn stored_flip_debug_log(case: &str, n: usize) {
@@ -1843,6 +1909,51 @@ impl Block {
         // desync (identical contract to the clean fast loop). Const-folded away
         // entirely on the clean path (`!CONTAINS_MARKERS`).
         if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield {
+            // ── Rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1) ──────
+            // The fast loop's distance decode goes through the libdeflate-shape
+            // `DistTable` — ONE entry load + in-register `consume_entry` /
+            // `decode_distance` — replacing the dist_hc → DISTANCE_EXTRA →
+            // refill-check → DISTANCE_BASE dependent chain (the P3.1-measured
+            // 84.8→61.5 cyc/backref mechanism; see the `dist_table` field doc).
+            // Byte-exact by the same P3.1 equivalence already differentialed on
+            // the contig loop: identical symbols ⇒ identical distance +
+            // identical bit consumption; unassigned/invalid code ⇒ raw==0
+            // entry ⇒ `InvalidHuffmanCode`, exactly dist_hc's `None`. The
+            // careful loop below keeps dist_hc verbatim (rare tail/edge path).
+            //
+            // Kill-switch `GZIPPY_MARKER_DIST_TABLE=0` (same-binary causal A/B
+            // arm, F-d1): the table is neither built nor used here — the
+            // else-arm below is the exact pre-change chain.
+            #[cfg(pure_inflate_decode)]
+            let marker_dist_lut: bool = !marker_dist_lut_disabled();
+            // Effect-verification snapshot (one OnceLock read per call; the
+            // per-backref increment below is a predictable branch when OFF).
+            #[cfg(pure_inflate_decode)]
+            let md_stats: bool = marker_dist_stats::enabled();
+            #[cfg(pure_inflate_decode)]
+            if marker_dist_lut {
+                // P3.4-amortized: fixed blocks use the process-wide static
+                // table (no per-block work); dynamic blocks memcmp-reuse.
+                // Latched per block (`dist_table_checked`), shared with the
+                // contig clean loop's call site.
+                self.ensure_dist_table();
+            }
+            // FixedHuffman + amortization ON ⇒ the process-wide static table,
+            // hoisted here as `&'static` (no `self` borrow held across the
+            // loop). The dynamic-block table is re-borrowed per backref below
+            // (the field-path borrow ends before the `&mut self` sparsity
+            // call, so it cannot be hoisted across the loop body).
+            #[cfg(pure_inflate_decode)]
+            let marker_fixed_tbl: Option<
+                &'static crate::decompress::inflate::libdeflate_entry::DistTable,
+            > = if marker_dist_lut
+                && self.compression_type == CompressionType::FixedHuffman
+                && !dist_amort_disabled()
+            {
+                fixed_dist_table()
+            } else {
+                None
+            };
             let in_end = bits.data.len();
             bits.refill();
             let mut pre = self.lut_litlen.decode(bits);
@@ -1921,38 +2032,100 @@ impl Block {
                     }
                     let length = (code as usize).wrapping_sub(254);
                     if length != 0 {
-                        let dsym = match self.dist_hc.decode(bits) {
-                            Some(d) => d,
-                            None => {
+                        // Rung (d) N1: per-backref table select (see the hoist
+                        // comment above the loop). `None` ⇔ kill-switch OFF
+                        // arm or a builder-declined block — both take the
+                        // pre-change dist_hc chain below.
+                        #[cfg(pure_inflate_decode)]
+                        let marker_dt: Option<
+                            &crate::decompress::inflate::libdeflate_entry::DistTable,
+                        > = if !marker_dist_lut {
+                            None
+                        } else if marker_fixed_tbl.is_some() {
+                            marker_fixed_tbl
+                        } else {
+                            self.dist_table.as_ref()
+                        };
+                        #[cfg(not(pure_inflate_decode))]
+                        let marker_dt: Option<
+                            &crate::decompress::inflate::libdeflate_entry::DistTable,
+                        > = None;
+                        let distance = if let Some(dt) = marker_dt {
+                            // Single-lookup path — mirror of the contig fast
+                            // loop's dist decode (incl. subtable + raw==0
+                            // handling). Bit-budget proof: the bottom
+                            // `bits.refill()` is fast-form whenever the top
+                            // `in_ok` guard holds (a slow refill ends with
+                            // `pos == data.len()`, which fails `in_ok`), so
+                            // iteration tops have >= 56 real bits; the litlen
+                            // consume is <= 20 ⇒ >= 36 here >= the 28-bit
+                            // worst case (15-bit dist code + 13 extra).
+                            use crate::decompress::inflate::libdeflate_entry::DistTable;
+                            #[cfg(all(test, pure_inflate_decode))]
+                            MARKER_DIST_LUT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            #[cfg(pure_inflate_decode)]
+                            if md_stats {
+                                marker_dist_stats::LUT_BACKREFS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let mut dist_entry = dt.lookup(bits.bitbuf);
+                            if dist_entry.is_subtable_ptr() {
+                                bits.consume(DistTable::TABLE_BITS as u32);
+                                dist_entry = dt.lookup_subtable_direct(dist_entry, bits.bitbuf);
+                            }
+                            let dist_raw = dist_entry.raw();
+                            // raw == 0 is the unassigned/invalid-code marker
+                            // (codes 30/31 and incomplete-code holes) — the
+                            // exact set `dist_hc.decode` returns `None` for.
+                            if dist_raw == 0 {
                                 self.ring.pos = pos;
                                 self.decoded_bytes += emitted;
                                 self.ring.distance_to_last_marker = distance_marker;
                                 return Err(BlockError::InvalidHuffmanCode);
                             }
-                        };
-                        if dsym as usize >= DISTANCE_BASE.len() {
-                            self.ring.pos = pos;
-                            self.decoded_bytes += emitted;
-                            self.ring.distance_to_last_marker = distance_marker;
-                            return Err(BlockError::InvalidHuffmanCode);
-                        }
-                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
-                        let distance = if extra > 0 {
-                            if bits.available() < extra {
-                                bits.refill();
-                                if bits.available() < extra {
+                            let dist_extra_saved = bits.bitbuf;
+                            bits.consume_entry(dist_raw);
+                            dist_entry.decode_distance(dist_extra_saved) as usize
+                        } else {
+                            // Pre-change chain VERBATIM (kill-switch arm).
+                            #[cfg(pure_inflate_decode)]
+                            if md_stats {
+                                marker_dist_stats::HC_BACKREFS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let dsym = match self.dist_hc.decode(bits) {
+                                Some(d) => d,
+                                None => {
                                     self.ring.pos = pos;
                                     self.decoded_bytes += emitted;
                                     self.ring.distance_to_last_marker = distance_marker;
-                                    return Err(BlockError::EndOfFile);
+                                    return Err(BlockError::InvalidHuffmanCode);
                                 }
+                            };
+                            if dsym as usize >= DISTANCE_BASE.len() {
+                                self.ring.pos = pos;
+                                self.decoded_bytes += emitted;
+                                self.ring.distance_to_last_marker = distance_marker;
+                                return Err(BlockError::InvalidHuffmanCode);
                             }
-                            let mask = (1u64 << extra) - 1;
-                            let v = (bits.peek() & mask) as usize;
-                            bits.consume(extra);
-                            DISTANCE_BASE[dsym as usize] as usize + v
-                        } else {
-                            DISTANCE_BASE[dsym as usize] as usize
+                            let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                            if extra > 0 {
+                                if bits.available() < extra {
+                                    bits.refill();
+                                    if bits.available() < extra {
+                                        self.ring.pos = pos;
+                                        self.decoded_bytes += emitted;
+                                        self.ring.distance_to_last_marker = distance_marker;
+                                        return Err(BlockError::EndOfFile);
+                                    }
+                                }
+                                let mask = (1u64 << extra) - 1;
+                                let v = (bits.peek() & mask) as usize;
+                                bits.consume(extra);
+                                DISTANCE_BASE[dsym as usize] as usize + v
+                            } else {
+                                DISTANCE_BASE[dsym as usize] as usize
+                            }
                         };
                         if distance == 0 || distance > MAX_WINDOW_SIZE {
                             self.ring.pos = pos;
@@ -2141,6 +2314,69 @@ impl Block {
         Ok(emitted)
     }
 
+    /// P3.1/P3.4 dist-table ensure, factored out of `decode_clean_into_contig`
+    /// for rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1): the
+    /// libdeflate-shape `DistTable` build with the P3.4 amortization scheme —
+    /// FixedHuffman + amortization ON never touches this cache (callers use the
+    /// process-wide `fixed_dist_table()`); DynamicHuffman blocks memcmp the
+    /// (≤30-byte) lens and REUSE the live table on a match, else rebuild in
+    /// place. Latched per block by `dist_table_checked` (reset in
+    /// `read_header`), so the contig clean loop and the marker fast loop can
+    /// both call it and the work runs at most once per block.
+    /// `GZIPPY_DIST_AMORT=0` kill-switch behavior preserved verbatim.
+    #[cfg(pure_inflate_decode)]
+    fn ensure_dist_table(&mut self) {
+        if self.dist_table_checked {
+            return;
+        }
+        self.dist_table_checked = true;
+        if dist_amort_disabled() {
+            // KILL-SWITCH (GZIPPY_DIST_AMORT=0): the exact pre-P3.4 lazy
+            // build — fresh Vec alloc per block, fixed blocks included.
+            // Same binary, same code layout; only the behavior toggles —
+            // the disproof instrument for layout-phantom vs behavioral
+            // deltas (and the standard campaign kill-switch).
+            self.dist_table = match self.compression_type {
+                CompressionType::FixedHuffman => {
+                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                        &FIXED_DIST_LENGTHS[..],
+                    )
+                }
+                CompressionType::DynamicHuffman => {
+                    let split = self.literal_code_count;
+                    let end = split + self.distance_code_count;
+                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                        &self.literal_cl[split..end],
+                    )
+                }
+                _ => None,
+            };
+        } else if self.compression_type == CompressionType::DynamicHuffman {
+            let split = self.literal_code_count;
+            let end = split + self.distance_code_count;
+            let lens = &self.literal_cl[split..end];
+            let reusable =
+                self.dist_table.is_some() && &self.dist_table_lens[..self.dist_table_nlens] == lens;
+            if !reusable {
+                if let Some(t) = self.dist_table.as_mut() {
+                    t.rebuild(lens);
+                } else {
+                    self.dist_table =
+                        crate::decompress::inflate::libdeflate_entry::DistTable::build(lens);
+                }
+                self.dist_table_lens[..lens.len()].copy_from_slice(lens);
+                self.dist_table_nlens = lens.len();
+                if super::contig_prof::enabled() {
+                    super::contig_prof::C_N_DISTBUILD
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if super::contig_prof::enabled() {
+                super::contig_prof::C_N_DISTREUSE
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// COPY-FREE-TO-FINAL (Stage 1) clean-phase decode into a CONTIGUOUS buffer.
     ///
     /// The faithful vendor `setInitialWindow` model: the post-flip clean
@@ -2240,54 +2476,7 @@ impl Block {
         // identical decodes (differentials: `dist_table_rebuild_matches_
         // fresh_build`, `contig_clean_stream_multi_block_dist_reuse`).
         #[cfg(pure_inflate_decode)]
-        if !self.dist_table_checked {
-            self.dist_table_checked = true;
-            if dist_amort_disabled() {
-                // KILL-SWITCH (GZIPPY_DIST_AMORT=0): the exact pre-P3.4 lazy
-                // build — fresh Vec alloc per block, fixed blocks included.
-                // Same binary, same code layout; only the behavior toggles —
-                // the disproof instrument for layout-phantom vs behavioral
-                // deltas (and the standard campaign kill-switch).
-                self.dist_table = match self.compression_type {
-                    CompressionType::FixedHuffman => {
-                        crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                            &FIXED_DIST_LENGTHS[..],
-                        )
-                    }
-                    CompressionType::DynamicHuffman => {
-                        let split = self.literal_code_count;
-                        let end = split + self.distance_code_count;
-                        crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                            &self.literal_cl[split..end],
-                        )
-                    }
-                    _ => None,
-                };
-            } else if self.compression_type == CompressionType::DynamicHuffman {
-                let split = self.literal_code_count;
-                let end = split + self.distance_code_count;
-                let lens = &self.literal_cl[split..end];
-                let reusable = self.dist_table.is_some()
-                    && &self.dist_table_lens[..self.dist_table_nlens] == lens;
-                if !reusable {
-                    if let Some(t) = self.dist_table.as_mut() {
-                        t.rebuild(lens);
-                    } else {
-                        self.dist_table =
-                            crate::decompress::inflate::libdeflate_entry::DistTable::build(lens);
-                    }
-                    self.dist_table_lens[..lens.len()].copy_from_slice(lens);
-                    self.dist_table_nlens = lens.len();
-                    if super::contig_prof::enabled() {
-                        super::contig_prof::C_N_DISTBUILD
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                } else if super::contig_prof::enabled() {
-                    super::contig_prof::C_N_DISTREUSE
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
+        self.ensure_dist_table();
 
         const MAX_LIT_LEN_SYM: u32 = 512;
         const MAX_RUN_LENGTH: usize = 258;
@@ -5114,6 +5303,224 @@ mod tests {
             distance_marker, 0,
             "every byte was a marker; counter should be 0"
         );
+    }
+
+    // ── Rung (d) increment 1 differential (plans/asm-rung-d-eval.md §5) ──
+    //
+    // The marker fast loop's DistTable distance decode (ON arm) vs the exact
+    // pre-change dist_hc chain (OFF arm, via MARKER_DIST_LUT_OVERRIDE) on the
+    // SAME window-absent streams: raw u16 output (markers included), final
+    // bit cursor, decoded_bytes, and distance_to_last_marker must all be
+    // equal, and the marker-resolved output must equal the original payload
+    // (ground truth — catches both-arms-wrong). Arm engagement is proven by
+    // the test-only MARKER_DIST_LUT_HITS counter (ON > 0; OFF window must add
+    // ZERO process-wide — the override forces every thread off the arm).
+    #[cfg(pure_inflate_decode)]
+    mod marker_dist_lut_diff {
+        use super::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Mutex;
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                MARKER_DIST_LUT_OVERRIDE.store(-1, Relaxed);
+            }
+        }
+
+        fn with_marker_dist_lut<T>(disabled: bool, f: impl FnOnce() -> T) -> T {
+            let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            MARKER_DIST_LUT_OVERRIDE.store(if disabled { 1 } else { 0 }, Relaxed);
+            let _restore = OverrideGuard;
+            f()
+        }
+
+        fn xorshift(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        fn make_rand(mut seed: u64, len: usize) -> Vec<u8> {
+            (0..len).map(|_| xorshift(&mut seed) as u8).collect()
+        }
+
+        fn make_text(mut seed: u64, len: usize) -> Vec<u8> {
+            const WORDS: &[&str] = &[
+                "marker",
+                "window",
+                "deflate",
+                "huffman",
+                "distance",
+                "table",
+                "ring",
+                "chunk",
+                "decode",
+                "bootstrap",
+                "speculative",
+                "clean",
+            ];
+            let mut out = Vec::with_capacity(len + 16);
+            while out.len() < len {
+                let w = WORDS[(xorshift(&mut seed) as usize) % WORDS.len()];
+                out.extend_from_slice(w.as_bytes());
+                out.push(b' ');
+                if xorshift(&mut seed) % 13 == 0 {
+                    out.push(b'0' + (xorshift(&mut seed) % 10) as u8);
+                }
+            }
+            out.truncate(len);
+            out
+        }
+
+        fn payload_rle(mut seed: u64, len: usize) -> Vec<u8> {
+            // Long single-byte runs (dist==1 backrefs) separated by noise.
+            let mut out = Vec::with_capacity(len + 512);
+            while out.len() < len {
+                let b = xorshift(&mut seed) as u8;
+                let run = 20 + (xorshift(&mut seed) as usize) % 400;
+                out.extend(std::iter::repeat_n(b, run));
+                for _ in 0..4 {
+                    out.push(xorshift(&mut seed) as u8);
+                }
+            }
+            out.truncate(len);
+            out
+        }
+
+        /// Payload that interleaves slices OF the dictionary with fresh
+        /// separator bytes — the encoder emits distance-into-dictionary
+        /// back-refs at the very start of the stream, i.e. cross-chunk
+        /// MARKERS, exercising the marker-emission + marker-scan paths
+        /// around the new dist decode.
+        fn payload_dict_refs(dict: &[u8], len: usize) -> Vec<u8> {
+            let mut out = Vec::with_capacity(len + 256);
+            let mut seed = 0x5EED_0001u64;
+            while out.len() < len {
+                let off = (xorshift(&mut seed) as usize) % dict.len();
+                let take = 32 + (xorshift(&mut seed) as usize) % 200;
+                let end = (off + take).min(dict.len());
+                out.extend_from_slice(&dict[off..end]);
+                for _ in 0..8 {
+                    out.push(xorshift(&mut seed) as u8);
+                }
+            }
+            out.truncate(len);
+            out
+        }
+
+        /// Window-absent (marker-mode) multi-block decode driver. Returns the
+        /// raw u16 sink (markers included) + final state
+        /// `(bits.pos, bitbuf, bitsleft, decoded_bytes, distance_to_last_marker)`.
+        #[allow(clippy::type_complexity)]
+        fn decode_marker_u16(
+            deflate_bytes: &[u8],
+            n_max: usize,
+        ) -> (Vec<u16>, (usize, u64, u32, usize, usize)) {
+            let boxed: &'static [u8] = Box::leak(deflate_bytes.to_vec().into_boxed_slice());
+            let mut bits = Bits::new(boxed);
+            let mut b = Block::new();
+            let mut output: Vec<u16> = Vec::new();
+            loop {
+                b.read_header(&mut bits, false).expect("header");
+                while !b.eob() {
+                    let n = b.read(&mut bits, &mut output, n_max).expect("read");
+                    if n == 0 && !b.eob() {
+                        panic!("marker decode stalled before EOB");
+                    }
+                }
+                if b.is_last_block() {
+                    break;
+                }
+            }
+            let dm = b.ring.distance_to_last_marker;
+            (
+                output,
+                (bits.pos, bits.bitbuf, bits.bitsleft, b.decoded_bytes, dm),
+            )
+        }
+
+        /// Resolve markers against the (≤32 KiB, right-aligned) dictionary
+        /// window and assert byte equality with the original payload.
+        fn resolve_and_check(out: &[u16], dict: &[u8], payload: &[u8], label: &str) {
+            let mut w = vec![0u8; 32768];
+            if !dict.is_empty() {
+                let n = dict.len().min(32768);
+                w[32768 - n..].copy_from_slice(&dict[dict.len() - n..]);
+            }
+            let mut data = out.to_vec();
+            crate::decompress::parallel::replace_markers::replace_markers(&mut data, &w);
+            assert_eq!(data.len(), payload.len(), "{label}: length mismatch");
+            for (i, (&v, &p)) in data.iter().zip(payload).enumerate() {
+                assert!(v < 256, "{label}: unresolved marker at {i}: {v:#x}");
+                assert_eq!(v as u8, p, "{label}: byte {i} mismatch");
+            }
+        }
+
+        #[test]
+        fn marker_fast_loop_dist_table_matches_dist_hc_and_payload() {
+            let dict_text = make_text(0xD1C7, 32768);
+            let dict_rand = make_rand(0xFEED, 8192);
+            let empty: Vec<u8> = Vec::new();
+
+            // (payload, dict, must_engage): sizes cross the 64 Ki-slot ring
+            // wrap, multi-block boundaries, and the mid-stream clean flip.
+            let cases: [(&str, Vec<u8>, &[u8], bool); 5] = [
+                (
+                    "dict-text",
+                    payload_dict_refs(&dict_text, 150_000),
+                    &dict_text,
+                    true,
+                ),
+                (
+                    "dict-rand",
+                    payload_dict_refs(&dict_rand, 90_000),
+                    &dict_rand,
+                    true,
+                ),
+                ("random", make_rand(0xABCD, 130_000), &empty, false),
+                ("rle", payload_rle(0x42, 120_000), &empty, true),
+                (
+                    "text-nodict-refs",
+                    make_text(0x7777, 140_000),
+                    &dict_text,
+                    true,
+                ),
+            ];
+
+            for (label, payload, dict, must_engage) in &cases {
+                let stream = deflate_with_dictionary(payload, dict);
+                for &n_max in &[100_000usize, 1499] {
+                    let tag = format!("{label} n_max={n_max}");
+                    let (hits_on, on) = with_marker_dist_lut(false, || {
+                        let h0 = MARKER_DIST_LUT_HITS.load(Relaxed);
+                        let r = decode_marker_u16(&stream, n_max);
+                        (MARKER_DIST_LUT_HITS.load(Relaxed) - h0, r)
+                    });
+                    let (hits_off, off) = with_marker_dist_lut(true, || {
+                        let h0 = MARKER_DIST_LUT_HITS.load(Relaxed);
+                        let r = decode_marker_u16(&stream, n_max);
+                        (MARKER_DIST_LUT_HITS.load(Relaxed) - h0, r)
+                    });
+                    assert_eq!(on.0, off.0, "{tag}: u16 output diverged");
+                    assert_eq!(on.1, off.1, "{tag}: cursor/state diverged");
+                    assert_eq!(
+                        hits_off, 0,
+                        "{tag}: OFF arm must route zero decodes through the DistTable path"
+                    );
+                    if *must_engage {
+                        assert!(
+                            hits_on > 0,
+                            "{tag}: ON arm never engaged the DistTable path"
+                        );
+                    }
+                    resolve_and_check(&on.0, dict, payload, &tag);
+                }
+            }
+        }
     }
 
     // ── M2b (DIV-5): vendor stored-block special cases ───────────────────
