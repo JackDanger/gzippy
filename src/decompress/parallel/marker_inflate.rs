@@ -2454,7 +2454,9 @@ impl Block {
                 }};
             }
             lb.refill();
-            let mut pre = self.lut_litlen.decode(&mut lb);
+            // P3.5 c4: immediately after a refill — backstop-free decode
+            // (byte-exact proof on `decode_prefilled`).
+            let mut pre = self.lut_litlen.decode_prefilled(&lb);
             super::slow_knob::inject_localize(dec_spin, dec_yield);
             // P3.1 profiler chaining state: ONE rdtsc per iteration; the delta
             // between consecutive iteration tops is charged to the class the
@@ -2739,7 +2741,9 @@ impl Block {
                         if (lb.bitsleft as u8) < 48 {
                             lb.refill();
                         }
-                        pre = self.lut_litlen.decode(&mut lb);
+                        // P3.5 c4: threshold-refill site — backstop-free
+                        // decode (byte-exact proof on `decode_prefilled`).
+                        pre = self.lut_litlen.decode_prefilled(&lb);
                         super::slow_knob::inject_localize(dec_spin, dec_yield);
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
@@ -2794,7 +2798,9 @@ impl Block {
                 if (lb.bitsleft as u8) < 48 {
                     lb.refill();
                 }
-                pre = self.lut_litlen.decode(&mut lb);
+                // P3.5 c4: threshold-refill site — backstop-free decode
+                // (byte-exact proof on `decode_prefilled`).
+                pre = self.lut_litlen.decode_prefilled(&lb);
                 super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
