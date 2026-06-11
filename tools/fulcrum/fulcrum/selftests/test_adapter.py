@@ -168,4 +168,47 @@ def run():
           "default ProjectAdapter.load_run delegates to the documented-"
           "schema loader (cells + knob dirs found)")
 
+    _t_toy_mixed_sink_refusal(check)
+    _t_empty_reason_rejected(check)
+
     return check.finish("adapter-pluggability selftest")
+
+
+def _t_toy_mixed_sink_refusal(check):
+    """Gate rec: invariant enforcement must be adapter-independent — a toy-
+    adapter run with mismatched sink classes between arms must REFUSE the
+    ratio (SINK-LAW through a non-gzippy adapter)."""
+    import copy
+    from fulcrum.core.fingerprint import Fingerprint, assert_comparable, IncomparableError
+    a = Fingerprint(sink="regular-file", mask="0", freeze="frozen",
+                    bin_sha="aa", corpus_sha="cc", protocol="fulcrum-v3",
+                    comparator="toy 1.0", host="cpu|k|h")
+    b = copy.replace(a, sink="devnull") if hasattr(copy, "replace") else None
+    if b is None:
+        d = a.__dict__.copy(); d["sink"] = "devnull"; b = Fingerprint(**d)
+    fired = False
+    try:
+        assert_comparable(a, b)
+    except IncomparableError as e:
+        fired = "SINK" in str(e).upper() or "sink" in str(e)
+    check(fired, "toy-adapter mixed-sink comparison refuses via SINK-LAW")
+
+
+def _t_empty_reason_rejected(check):
+    """Gate req: blank/whitespace supersede reasons are rejected at the core."""
+    import tempfile, os
+    from fulcrum.core.ledger import Ledger
+    with tempfile.TemporaryDirectory() as d:
+        led = Ledger(os.path.join(d, "ledger.jsonl"))
+        fired = False
+        try:
+            led.supersede("k", "r1", "   ")
+        except ValueError:
+            fired = True
+        check(fired, "core rejects whitespace-only supersede reason")
+        fired2 = False
+        try:
+            led.invalidate("k", "r1", "")
+        except ValueError:
+            fired2 = True
+        check(fired2, "core rejects empty invalidate reason")
