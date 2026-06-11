@@ -1,3 +1,14 @@
+## RUNG-D INC-1 MERGED (advisor-PASS) — marker attribution refuted; SERIAL RESIDUE is the next target [2026-06-11]
+Marker DistTable TIE-KEPT (one dist-decode shape engine-wide; 72/72 grid; trajectory-complete
+differential incl. flip-arming). THE PROBE REFUTED the isal-decide attribution: marker loop has
+>=2x slack under bignasa-isal T8 (flat at +100% inject; conservative — careful-loop-forced);
+T1 marker injection vacuous. RELOCATED TARGET: the serial residue chain at high-T isal —
+T1 1350 -> T8 1086 = 1.24x scaling (drain / apply-window / marker-replace / writer). NEXT:
+causal decomposition of that chain (fulcrum trace under the canonical mask; perturb/remove the
+chain stages — apply-window has the parallel machinery, is it engaged on isal? marker-replace
+volume on bignasa = 100% of bytes...), then the lever. N2-N5 marker Rust passes deprioritized
+(slack). Doc-hygiene notes from the gate applied to the eval doc in a follow-up if rung-d
+continues.
 ## RUNG (d) EVAL + INCREMENT 1: TIE-KEEP — the bignasa marker-loop premise CAUSALLY REFUTED [2026-06-11]
 Branch engine/asm-rung-d (worktree /tmp/gz-asmd, NOT merged). Phase 1 eval (plans/asm-rung-d-eval.md):
 kernel-extend REJECTED w/ mechanism (contig-u8 contract + register envelope + asm-before-Rust-plateau
