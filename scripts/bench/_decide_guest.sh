@@ -81,7 +81,7 @@ stored_flip|GZIPPY_NO_STORED_FLIP=1|none
 seeded_block|GZIPPY_SEEDED_BLOCK=0|verbose_seeded
 exact_block|GZIPPY_EXACT_BLOCK=0|verbose_exact
 hit_drive|GZIPPY_NO_HIT_DRIVE=1|none
-slab_alloc|GZIPPY_SLAB_ALLOC=1|none
+slab_alloc|GZIPPY_SLAB_ALLOC=1|rpmalloc_stats
 eager_postproc|GZIPPY_EAGER_POSTPROC=1|none
 "
 
@@ -179,17 +179,21 @@ run_knobs_for_cell() { # <corpus> <T>
     if [ -n "$KNOB_FILTER" ]; then
       case ",$KNOB_FILTER," in *",$name,"*) ;; *) continue;; esac
     fi
-    local kdir="$cdir/knob_${name}" i bsec bsha ksec ksha BS="" KS="" DIV=0
+    local kdir="$cdir/knob_${name}" i bsec bsha brss ksec ksha krss BS="" KS="" DIV=0
+    local RSS_BASE=0 RSS_KNOB=0 RSS_N=0
     mkdir -p "$kdir"
     local kvar="${envkv%%=*}" kval="${envkv#*=}"
     echo "## knob $name ($envkv) on $c:T$t — same-binary A/B, KNOB_N=$KNOB_N pairs"
     for ((i=0;i<=KNOB_N;i++)); do
-      read -r bsec bsha < <(timed_masked "$mask" "$SINK_A" "$BIN" -d -c -p "$t" "$f")
-      read -r ksec ksha < <(timed_masked "$mask" "$SINK_B" env "$kvar=$kval" "$BIN" -d -c -p "$t" "$f")
+      read -r bsec bsha brss < <(timed_masked "$mask" "$SINK_A" "$BIN" -d -c -p "$t" "$f")
+      read -r ksec ksha krss < <(timed_masked "$mask" "$SINK_B" env "$kvar=$kval" "$BIN" -d -c -p "$t" "$f")
       [ "$i" -eq 0 ] && continue
       BS="$BS $bsec"; KS="$KS $ksec"
       [ "$bsha" = "${REFSHA[$c]}" ] || { echo "!! SHA base $name i=$i"; DIV=1; }
       [ "$ksha" = "${REFSHA[$c]}" ] || { echo "!! SHA knob $name i=$i sha=$ksha"; DIV=1; }
+      # Accumulate RSS (last value wins — peak RSS is stable across iterations).
+      [ "${brss:-0}" -gt 0 ] && RSS_BASE="$brss"
+      [ "${krss:-0}" -gt 0 ] && RSS_KNOB="$krss"
     done
     if [ "$DIV" -ne 0 ]; then
       # A knob arm with wrong bytes is its own finding (the switch is NOT
@@ -203,6 +207,7 @@ run_knobs_for_cell() { # <corpus> <T>
     {
       echo "knob=$name"; echo "env=$envkv"; echo "pred=$pred"
       echo "cell=$c:$t"; echo "mask=$mask"; echo "sha_ok=1"
+      echo "rss_base_mb=$RSS_BASE"; echo "rss_knob_mb=$RSS_KNOB"
     } > "$kdir/meta.txt"
     mf "knob_done=$c:$t:$name"
   done <<< "$KNOB_REGISTRY"
@@ -222,12 +227,16 @@ run_knob_effects() { # <corpus> <T>
     local kvar="${envkv%%=*}" kval="${envkv#*=}" sha
     echo "## knob-effect capture $name ($envkv) on $c:T$t"
     assert_regular_sink "$SINK_A"
-    GZIPPY_VERBOSE=1 GZIPPY_CONTIG_PROF=1 taskset -c "$mask" \
+    # GZIPPY_RPMALLOC_STATS=1 is always set so the rpmalloc_stats predicate can
+    # verify slab_alloc engagement (rpmalloc_alloc.rs:523 prints stats only when
+    # this env var is set; it is a no-op for non-rpmalloc knobs).
+    GZIPPY_VERBOSE=1 GZIPPY_CONTIG_PROF=1 GZIPPY_RPMALLOC_STATS=1 taskset -c "$mask" \
       "$BIN" -d -c -p "$t" "$f" >"$SINK_A" 2>"$edir/effect_base_${name}.txt"
     sha="$(sha256sum "$SINK_A" | cut -d' ' -f1)"
     [ "$sha" = "${REFSHA[$c]}" ] || echo "effect_base_sha_fail=$name" >> "$edir/fails.txt"
     assert_regular_sink "$SINK_A"
-    GZIPPY_VERBOSE=1 GZIPPY_CONTIG_PROF=1 env "$kvar=$kval" taskset -c "$mask" \
+    GZIPPY_VERBOSE=1 GZIPPY_CONTIG_PROF=1 GZIPPY_RPMALLOC_STATS=1 env "$kvar=$kval" \
+      taskset -c "$mask" \
       "$BIN" -d -c -p "$t" "$f" >"$SINK_A" 2>"$edir/effect_knob_${name}.txt"
     sha="$(sha256sum "$SINK_A" | cut -d' ' -f1)"
     [ "$sha" = "${REFSHA[$c]}" ] || echo "effect_knob_sha_fail=$name" >> "$edir/fails.txt"

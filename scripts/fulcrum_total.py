@@ -432,6 +432,11 @@ COUNTER_PATTERNS = {
     # ONLY printed when GZIPPY_SEED_WINDOWS replay mode is ON (seed_windows.rs
     # report_seed_stats is a no-op off seed) — THE oracle-seeding tell.
     "seed_replay_hits": r"SEED_WINDOWS replay: hits=(\d+)",
+    # ONLY printed when GZIPPY_BYPASS_DECODE replay is active
+    # (decode_bypass.rs:628 report_replay_stats; no-ops when replay_enabled()==false).
+    # A bypass-replay run replays pre-computed decode results, masking the real
+    # engine cost — the same binder-masking failure class as SEED_WINDOWS.
+    "bypass_replay_hits": r"BYPASS_DECODE replay: hits=(\d+)",
 }
 
 
@@ -488,6 +493,7 @@ def seeding_guard(counters, feature=None):
                       "measurement.")
     feat = (feature or "").replace("gzippy-", "")
     replay = counters.get("seed_replay_hits", 0)
+    bypass = counters.get("bypass_replay_hits", 0)
     oracle = max(counters.get("isal_chunks", 0),
                  counters.get("isal_oracle_chunks", 0))
     seeded = counters.get("window_seeded", 0)
@@ -500,6 +506,10 @@ def seeding_guard(counters, feature=None):
                        f"seed store forced clean-engine decodes at boundaries "
                        f"production would marker-bootstrap. This measures the "
                        f"clean-engine ceiling, NOT production.")
+    if bypass > 0:
+        return (False, f"BYPASS_DECODE REPLAY ACTIVE (hits={bypass}). Pre-computed "
+                       f"decode results replayed — real engine cost masked. "
+                       f"This is a measurement contaminant, NOT production.")
     if oracle > 0 and feat != "isal":
         if feat == "native":
             return (False, f"ISA-L ENGINE ORACLE RAN (isal_chunks={oracle} on a "
@@ -885,6 +895,10 @@ def selftest():
                                   "seed_replay_hits": 17})
     check(is_prodb is False and "ORACLE-SEEDED" in rb,
           "guard REFUSES an oracle-seeded run (SEED_WINDOWS replay hits>0)")
+    # 6b2. BYPASS_DECODE replay contamination (decode_bypass.rs:628).
+    is_prodb2, rb2 = seeding_guard({"finished_no_flip": 4, "bypass_replay_hits": 12})
+    check(is_prodb2 is False and "BYPASS_DECODE" in rb2,
+          "guard REFUSES BYPASS_DECODE replay run (hits>0, pre-computed results mask engine)")
     is_prod2, _ = seeding_guard({"window_seeded": 0, "finished_no_flip": 16,
                                  "flip_to_clean": 1})
     check(is_prod2 is True,
@@ -962,6 +976,15 @@ def selftest():
     bundle = analyze(pc, counter_path=pcc)
     check(bundle["is_production"] is False,
           "analyze() marks an oracle-seeded contaminated run NON-PRODUCTION")
+    # 9b. BYPASS_DECODE replay contamination also refused by analyze().
+    pcc2 = os.path.join(d, "verbose_contam_bypass.txt")
+    with open(pcc2, "w") as f:
+        f.write("Unified decoder: flip_to_clean=0 finished_no_flip=4 "
+                "window_seeded=0 bad_seed_resync=0\n"
+                "BYPASS_DECODE replay: hits=12 misses=0 (misses fall back to real decode)\n")
+    bundle2 = analyze(pc, counter_path=pcc2)
+    check(bundle2["is_production"] is False,
+          "analyze() marks BYPASS_DECODE replay run NON-PRODUCTION")
 
     # --- 10. end-to-end analyze() on a clean production-shaped trace passes all
     #         assertions and certifies production ---
