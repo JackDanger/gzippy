@@ -1,3 +1,19 @@
+## SLAB RECONCILIATION ITER-1: NO-SHIP (criteria held) + the contradiction pinned [2026-06-11]
+Branch perf/slab-t-conditional @ 9bebcada (committed, UNMERGED): T-conditional gate + bytes-budget
+implemented; suite 942/0; sha 16/16; effect-verified (kill-switch works). NO-SHIP: T8 RSS max-run
++16.8% and T8 wall +2.6% (unfrozen, borderline) — AND the headline T1 win VANISHED (+0.4ms
+CAUSAL-NULL vs the uncapped slab's -99.9ms N=21). PINNED MECHANISM HYPOTHESIS for iter-2: the
+16MiB effective_budget hard cap EXCLUDES the chunk-class blocks (T1 buffers are tens of MB) that
+produced the win — the reconciliation neutered its own lever; and T8 RSS movement implies the
+T-gate engaged above its intended K (read the diff's K + budget interplay first).
+ITER-2 SPEC: gate strictly num_threads<=2; budget at low T must admit the chunk-class block
+(budget ≈ max-block-size x workers, NOT a fixed 16MiB); T>2 = slab fully off (then T8 RSS/wall
+criteria are untouched by construction); re-verify with decide.sh (the T1 knob row must return to
+CAUSAL-VERIFIED ~-100ms with effect counters; T8 rows must show zero delta both metrics).
+NOTE the instrument ALSO matters here: the earlier -99.9ms was measured uncapped on bin-p35; the
+decide T1 base in THIS run was already faster (1416ms vs p35's 1402-1543 band) — keep same-binary
+A/Bs as the only causal currency. The tool's second queued action (engine.backref perturbation)
+remains open.
 ## FULCRUM DECIDE MERGED (user directive delivered; advisor-gated, live-verified) [2026-06-11]
 One run -> ranked causal table. Proven end-to-end THREE times on the box: (1) first run reproduced
 banked findings + surfaced slab_alloc PAYS ~100ms @ native T1 (N=21 RESOLVED — the lever an earlier
