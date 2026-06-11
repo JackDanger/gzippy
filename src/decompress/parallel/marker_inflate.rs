@@ -3248,46 +3248,84 @@ pub(crate) unsafe fn emit_backref_contig(
     distance: usize,
     length: usize,
 ) {
-    let dst = base.add(*pos);
-    let src = base.add(*pos - distance);
-    if distance >= length {
-        // Non-overlap. 8-byte unaligned word copy; run rounded up to 8. The
-        // ≤7-byte overshoot is ahead of the advanced `*pos`, never sourced by a
-        // later back-ref, and overwritten — invisible. Caller guarantees the
-        // rounded run fits `cap`. The `distance >= 8` guard keeps the 8-byte
-        // stride non-aliasing (same invariant as the ring path).
-        if distance >= 8 {
-            let rounded = (length + 7) & !7;
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            if length > 8 {
-                let mut s = src.add(8);
-                let mut d = dst.add(8);
-                let dend = dst.add(rounded);
-                while d < dend {
-                    (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
-                    s = s.add(8);
-                    d = d.add(8);
-                }
-            }
-        } else {
-            // distance < 8 (would alias the word stride): exact byte copy.
-            for i in 0..length {
-                dst.add(i).write(*src.add(i));
+    // P3.4 item 2 (backref-arm polish): libdeflate fastloop copy shape, ported
+    // from `copy_match_fast` (consume_first_decode.rs:479-553, itself the
+    // libdeflate decompress_template.h match copy). Three arms by DISTANCE
+    // only — the old `distance >= length` non-overlap pre-branch is gone:
+    //
+    //  * `distance >= 8`: unconditional 5-word (40-byte) burst, then a stride-8
+    //    word loop. Correct for ANY length INCLUDING overlap (`length >
+    //    distance`): every 8-byte load reads bytes that sit >= 8 positions
+    //    behind the store frontier, hence already FINAL. (The old shape sent
+    //    dist>=8 overlap — e.g. dist=10,len=100 — to a PER-BYTE loop.)
+    //  * `distance == 1`: RLE broadcast-word fill (vendor memset arm,
+    //    deflate.hpp:1393-1398, as words instead of a libc call).
+    //  * `2 <= distance <= 7`: stride-`distance` word trick (libdeflate's
+    //    small-offset arm): each 8-byte store advances by `distance`; its
+    //    first `distance` bytes are correct (loaded from the final region one
+    //    period behind) and its garbage tail is overwritten by the NEXT store;
+    //    the final store's first `distance` bytes reach `end`. The old shape
+    //    per-byte-copied every small-distance backref.
+    //
+    // OVERSHOOT ENVELOPE (headroom proof dependency): worst touch is
+    // `*pos + max(40, ((3*7)+8), length + 7) = *pos + max(40, length+7)
+    // <= *pos + 265` — strictly inside the `MAX_RUN_LENGTH + 8 = 266` byte
+    // reservation BOTH contig loops already hold below `cap` (the same
+    // envelope the old word path used: `*pos + 264`). Overshoot bytes lie
+    // ahead of the advanced `*pos`, are never sourced by a later back-ref,
+    // and get overwritten — invisible. Byte-exactness of `[*pos, *pos+length)`
+    // is locked by the permanent `emit_backref_contig_differential` test
+    // (dist 1..258 x len 3..258 x alignments vs a sequential-copy reference).
+    let mut dst = base.add(*pos);
+    let mut src = base.add(*pos - distance);
+    let end = dst.add(length);
+    if distance >= 8 {
+        // 5-word unconditional burst (covers the common short match without a
+        // length branch), then the stride-8 loop for long matches.
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        (dst.add(8) as *mut u64).write_unaligned((src.add(8) as *const u64).read_unaligned());
+        (dst.add(16) as *mut u64).write_unaligned((src.add(16) as *const u64).read_unaligned());
+        (dst.add(24) as *mut u64).write_unaligned((src.add(24) as *const u64).read_unaligned());
+        (dst.add(32) as *mut u64).write_unaligned((src.add(32) as *const u64).read_unaligned());
+        if length > 40 {
+            src = src.add(40);
+            dst = dst.add(40);
+            while dst < end {
+                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                src = src.add(8);
+                dst = dst.add(8);
             }
         }
-        *pos += length;
     } else if distance == 1 {
-        // RLE memset (deflate.hpp:1393-1398).
-        let v = *src;
-        std::slice::from_raw_parts_mut(dst, length).fill(v);
-        *pos += length;
-    } else {
-        // General overlap (1 < distance < length): sequential per-byte copy.
-        for i in 0..length {
-            dst.add(i).write(*src.add(i));
+        // RLE: broadcast the byte into a word and store words to `end`
+        // (<= 7-byte overshoot).
+        let v = 0x0101_0101_0101_0101u64.wrapping_mul(*src as u64);
+        while dst < end {
+            (dst as *mut u64).write_unaligned(v);
+            dst = dst.add(8);
         }
-        *pos += length;
+    } else {
+        // 2 <= distance <= 7: stride-`distance` word stores. 4 unconditional
+        // (touch <= dst + 3*7 + 8 = dst+29), then loop to `end`.
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        while dst < end {
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(distance);
+            dst = dst.add(distance);
+        }
     }
+    *pos += length;
 }
 
 /// PRODUCTION post-flip clean-mode back-ref copy — **u8-direct** into the u8
@@ -5511,6 +5549,74 @@ mod tests {
             out, oracle,
             "multi-block contig decode diverged from flate2 oracle"
         );
+    }
+
+    /// P3.4 item 2 differential (permanent): `emit_backref_contig` (the
+    /// libdeflate-shape copy: 5-word burst for dist>=8, broadcast RLE for
+    /// dist==1, stride-dist word trick for dist 2..7) must write EXACTLY the
+    /// sequential-copy reference bytes in `[*pos, *pos+length)` and touch
+    /// NOTHING beyond the documented overshoot envelope
+    /// (`*pos + max(40, length+7) <= *pos + 265`), for every overlap distance
+    /// x length x alignment combination.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[test]
+    fn emit_backref_contig_differential() {
+        const HISTORY: usize = 300; // > max distance 258
+        const ENVELOPE: usize = 265; // documented worst-case touch past *pos
+        const TAIL: usize = ENVELOPE + 64; // envelope + canary slack
+        const CANARY: u8 = 0xA5;
+
+        // Lengths: all short (the burst/stride boundary cases) + stepped long.
+        let lens: Vec<usize> = (3..=48).chain((49..=258).step_by(3)).chain([258]).collect();
+
+        let mut buf = vec![0u8; HISTORY + 8 + 258 + TAIL];
+        let mut reference = vec![0u8; buf.len()];
+        for align in 0..8usize {
+            let start = HISTORY + align;
+            for distance in 1..=258usize {
+                for &length in &lens {
+                    // Pseudo-random history (deterministic per case).
+                    let mut s = (align as u64) << 32 | (distance as u64) << 16 | length as u64;
+                    for (i, b) in buf[..start].iter_mut().enumerate() {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        *b = (s >> 56) as u8 ^ i as u8;
+                    }
+                    for b in buf[start..].iter_mut() {
+                        *b = CANARY;
+                    }
+                    // Reference: strict sequential byte copy.
+                    reference[..start].copy_from_slice(&buf[..start]);
+                    for i in 0..length {
+                        reference[start + i] = reference[start + i - distance];
+                    }
+
+                    let mut pos = start;
+                    unsafe {
+                        emit_backref_contig(buf.as_mut_ptr(), &mut pos, distance, length);
+                    }
+                    assert_eq!(pos, start + length, "pos advance d={distance} l={length}");
+                    assert_eq!(
+                        &buf[..start + length],
+                        &reference[..start + length],
+                        "bytes diverged: d={distance} l={length} align={align}"
+                    );
+                    // No touch beyond the envelope.
+                    assert!(
+                        buf[start + ENVELOPE..].iter().all(|&b| b == CANARY),
+                        "wrote past the {ENVELOPE}-byte envelope: d={distance} l={length} align={align}"
+                    );
+                }
+            }
+        }
     }
 
     /// P3.2 differential (permanent, modeled on
