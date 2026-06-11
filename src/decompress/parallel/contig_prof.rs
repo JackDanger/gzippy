@@ -36,6 +36,8 @@ pub static C_N_LITCHAIN: AtomicU64 = AtomicU64::new(0);
 pub static C_N_BACKREF: AtomicU64 = AtomicU64::new(0);
 pub static C_N_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static C_N_DIST_LONG: AtomicU64 = AtomicU64::new(0); // dist_hc long-path decodes
+pub static C_N_DISTBUILD: AtomicU64 = AtomicU64::new(0); // P3.4: dynamic dist_table (re)builds
+pub static C_N_DISTREUSE: AtomicU64 = AtomicU64::new(0); // P3.4: same-lens reuse hits
 pub static C_BYTES_BACKREF: AtomicU64 = AtomicU64::new(0);
 pub static C_BYTES_LITPACK: AtomicU64 = AtomicU64::new(0);
 pub static C_BYTES_LITCHAIN: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +257,11 @@ pub fn dump_if_enabled() {
         cca,
         pct(cca, ctot),
         C_BYTES_CAREFUL.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  disttbl: builds={} reuses={} (P3.4 dynamic-block dist_table amortization)",
+        C_N_DISTBUILD.load(Ordering::Relaxed),
+        C_N_DISTREUSE.load(Ordering::Relaxed)
     );
     let (wl, wm, wtot) = (
         W_CYC_LIT.load(Ordering::Relaxed),

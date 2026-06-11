@@ -440,6 +440,23 @@ pub struct Block {
     /// `InvalidHuffmanCode`, exactly `dist_hc`'s `None`.
     #[cfg(pure_inflate_decode)]
     dist_table: Option<crate::decompress::inflate::libdeflate_entry::DistTable>,
+    /// P3.4 item 1 (DistTable build amortization): the distance code lengths
+    /// `dist_table` was last built from (`dist_table_nlens == 0` ⇒ never
+    /// built). The table is a pure function of the lens, so when a new
+    /// dynamic block's dist lens memcmp-equal the cached ones the table is
+    /// REUSED verbatim instead of rebuilt — the per-block build cadence is
+    /// what the P3.3b T16 triage measured (+8.6ms at 16 threads). Fixed-
+    /// Huffman blocks never touch this cache (they use the process-wide
+    /// static `fixed_dist_table()`).
+    #[cfg(pure_inflate_decode)]
+    dist_table_lens: [u8; MAX_DISTANCE_SYMBOL_COUNT],
+    #[cfg(pure_inflate_decode)]
+    dist_table_nlens: usize,
+    /// Per-block "lens verified for the current block" latch — replaces the
+    /// old `dist_table = None` reset in `read_header` so the table (and its
+    /// allocation) survives across blocks.
+    #[cfg(pure_inflate_decode)]
+    dist_table_checked: bool,
     /// True after `read_header` built ISA-L LUTs for this block (vendor
     /// `m_literalHC` / `m_distanceHC` at deflate.hpp:1137-1141). Cleared
     /// on each new header so `read()` in the `while !eob` loop reuses them.
@@ -508,6 +525,12 @@ impl Block {
                 ),
             #[cfg(pure_inflate_decode)]
             dist_table: None,
+            #[cfg(pure_inflate_decode)]
+            dist_table_lens: [0u8; MAX_DISTANCE_SYMBOL_COUNT],
+            #[cfg(pure_inflate_decode)]
+            dist_table_nlens: 0,
+            #[cfg(pure_inflate_decode)]
+            dist_table_checked: false,
             #[cfg(any(
                 all(
                     feature = "isal-compression",
@@ -889,12 +912,14 @@ impl Block {
         {
             self.block_huffman_luts_ready = false;
         }
-        // Reset dist_table to None for each new block so decode_clean_into_contig
-        // triggers a fresh lazy build (marker-mode blocks that never flip clean
-        // skip the allocation entirely).
+        // P3.4 item 1: drop the per-block lens-verified latch (was
+        // `dist_table = None`, forcing a fresh alloc+build every block) so
+        // decode_clean_into_contig re-validates lazily — marker-mode blocks
+        // that never flip clean still skip the build entirely, and a dynamic
+        // block whose dist lens match the cached ones reuses the table.
         #[cfg(pure_inflate_decode)]
         {
-            self.dist_table = None;
+            self.dist_table_checked = false;
         }
         if treat_last_block_as_error && bfinal {
             return Err(BlockError::UnexpectedLastBlock);
@@ -2180,27 +2205,68 @@ impl Block {
             _ => return Err(BlockError::InvalidCompression),
         }
         // P3.1 lazy dist_table: only needed in the contig fast loop, so skip
-        // the Vec alloc for marker-mode blocks that never flip clean.
-        // read_header resets dist_table to None for each new block.
+        // the build for marker-mode blocks that never flip clean.
         // After build_huffman_luts_for_block, dist_hc holds the validated lens,
         // and literal_cl / FIXED_DIST_LENGTHS still hold the same raw lengths.
+        //
+        // P3.4 item 1 (build amortization — the P3.3b T16 +8.6ms): the table
+        // is a pure function of the dist code lengths, so
+        //   * FixedHuffman blocks share ONE process-wide static table
+        //     (`fixed_dist_table()`) — zero per-block builds;
+        //   * DynamicHuffman blocks memcmp the (≤30-byte) lens against the
+        //     ones the live table was built from and REUSE it on a match;
+        //   * a rebuild reuses the entries allocation (`DistTable::rebuild`).
+        // Byte-exact by construction: identical lens ⇒ identical table ⇒
+        // identical decodes (differentials: `dist_table_rebuild_matches_
+        // fresh_build`, `contig_clean_stream_multi_block_dist_reuse`).
         #[cfg(pure_inflate_decode)]
-        if self.dist_table.is_none() {
-            self.dist_table = match self.compression_type {
-                CompressionType::FixedHuffman => {
-                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                        &FIXED_DIST_LENGTHS[..],
-                    )
+        if !self.dist_table_checked {
+            self.dist_table_checked = true;
+            if dist_amort_disabled() {
+                // KILL-SWITCH (GZIPPY_DIST_AMORT=0): the exact pre-P3.4 lazy
+                // build — fresh Vec alloc per block, fixed blocks included.
+                // Same binary, same code layout; only the behavior toggles —
+                // the disproof instrument for layout-phantom vs behavioral
+                // deltas (and the standard campaign kill-switch).
+                self.dist_table = match self.compression_type {
+                    CompressionType::FixedHuffman => {
+                        crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                            &FIXED_DIST_LENGTHS[..],
+                        )
+                    }
+                    CompressionType::DynamicHuffman => {
+                        let split = self.literal_code_count;
+                        let end = split + self.distance_code_count;
+                        crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                            &self.literal_cl[split..end],
+                        )
+                    }
+                    _ => None,
+                };
+            } else if self.compression_type == CompressionType::DynamicHuffman {
+                let split = self.literal_code_count;
+                let end = split + self.distance_code_count;
+                let lens = &self.literal_cl[split..end];
+                let reusable = self.dist_table.is_some()
+                    && &self.dist_table_lens[..self.dist_table_nlens] == lens;
+                if !reusable {
+                    if let Some(t) = self.dist_table.as_mut() {
+                        t.rebuild(lens);
+                    } else {
+                        self.dist_table =
+                            crate::decompress::inflate::libdeflate_entry::DistTable::build(lens);
+                    }
+                    self.dist_table_lens[..lens.len()].copy_from_slice(lens);
+                    self.dist_table_nlens = lens.len();
+                    if super::contig_prof::enabled() {
+                        super::contig_prof::C_N_DISTBUILD
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else if super::contig_prof::enabled() {
+                    super::contig_prof::C_N_DISTREUSE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                CompressionType::DynamicHuffman => {
-                    let split = self.literal_code_count;
-                    let end = split + self.distance_code_count;
-                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                        &self.literal_cl[split..end],
-                    )
-                }
-                _ => None,
-            };
+            }
         }
 
         const MAX_LIT_LEN_SYM: u32 = 512;
@@ -2320,9 +2386,15 @@ impl Block {
             // Hoisted single-lookup distance table (see `dist_table` field doc).
             // Field-disjoint from every `self` mutation inside the loop
             // (`at_end_of_block`, `backreferences`, `decoded_bytes`), so the
-            // borrow is legal across them.
+            // borrow is legal across them. FixedHuffman blocks borrow the
+            // process-wide static table (P3.4 item 1) — same 5-bit lens every
+            // time, so the table is identical to the per-block build it
+            // replaces.
             #[cfg(pure_inflate_decode)]
-            let dist_tbl = self.dist_table.as_ref();
+            let dist_tbl = match self.compression_type {
+                CompressionType::FixedHuffman if !dist_amort_disabled() => fixed_dist_table(),
+                _ => self.dist_table.as_ref(),
+            };
             #[cfg(not(pure_inflate_decode))]
             let dist_tbl: Option<
                 &crate::decompress::inflate::libdeflate_entry::DistTable,
@@ -2912,6 +2984,29 @@ const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
 #[cfg(parallel_sm)]
 const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_SYMBOL_COUNT];
 
+/// P3.4 item 1 kill-switch: `GZIPPY_DIST_AMORT=0` restores the exact
+/// pre-P3.4 per-block fresh-build behavior (fresh Vec per block, fixed
+/// blocks build too, no reuse) inside the same binary. Read once.
+#[cfg(pure_inflate_decode)]
+fn dist_amort_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_DIST_AMORT").is_ok_and(|v| v == "0"))
+}
+
+/// P3.4 item 1: process-wide single-lookup distance table for FixedHuffman
+/// blocks. The fixed dist lens are the RFC 1951 §3.2.6 constants, so every
+/// per-block build produced the identical table — build it once and share.
+/// (`DistTable` is `Sync`: lookups take `&self` and never mutate.)
+#[cfg(pure_inflate_decode)]
+fn fixed_dist_table() -> Option<&'static crate::decompress::inflate::libdeflate_entry::DistTable> {
+    static T: std::sync::OnceLock<Option<crate::decompress::inflate::libdeflate_entry::DistTable>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        crate::decompress::inflate::libdeflate_entry::DistTable::build(&FIXED_DIST_LENGTHS[..])
+    })
+    .as_ref()
+}
+
 /// Ring-buffer back-reference emit. Mirror of vendor's
 /// `resolveBackreference` (vendor/.../gzip/deflate.hpp:1349-1410):
 /// non-overlap is a single `memcpy`, RLE (distance=1) is a tight
@@ -3153,46 +3248,91 @@ pub(crate) unsafe fn emit_backref_contig(
     distance: usize,
     length: usize,
 ) {
-    let dst = base.add(*pos);
-    let src = base.add(*pos - distance);
-    if distance >= length {
-        // Non-overlap. 8-byte unaligned word copy; run rounded up to 8. The
-        // ≤7-byte overshoot is ahead of the advanced `*pos`, never sourced by a
-        // later back-ref, and overwritten — invisible. Caller guarantees the
-        // rounded run fits `cap`. The `distance >= 8` guard keeps the 8-byte
-        // stride non-aliasing (same invariant as the ring path).
-        if distance >= 8 {
-            let rounded = (length + 7) & !7;
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            if length > 8 {
-                let mut s = src.add(8);
-                let mut d = dst.add(8);
-                let dend = dst.add(rounded);
-                while d < dend {
-                    (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
-                    s = s.add(8);
-                    d = d.add(8);
-                }
-            }
-        } else {
-            // distance < 8 (would alias the word stride): exact byte copy.
-            for i in 0..length {
-                dst.add(i).write(*src.add(i));
-            }
-        }
-        *pos += length;
-    } else if distance == 1 {
-        // RLE memset (deflate.hpp:1393-1398).
-        let v = *src;
-        std::slice::from_raw_parts_mut(dst, length).fill(v);
-        *pos += length;
-    } else {
-        // General overlap (1 < distance < length): sequential per-byte copy.
-        for i in 0..length {
-            dst.add(i).write(*src.add(i));
-        }
-        *pos += length;
+    // P3.4 item 2 (backref-arm polish): libdeflate fastloop copy shape, ported
+    // from `copy_match_fast` (consume_first_decode.rs:479-553, itself the
+    // libdeflate decompress_template.h match copy). Three arms by DISTANCE
+    // only — the old `distance >= length` non-overlap pre-branch is gone:
+    //
+    //  * `distance >= 8`: unconditional 5-word (40-byte) burst, then a stride-8
+    //    word loop. Correct for ANY length INCLUDING overlap (`length >
+    //    distance`): every 8-byte load reads bytes that sit >= 8 positions
+    //    behind the store frontier, hence already FINAL. (The old shape sent
+    //    dist>=8 overlap — e.g. dist=10,len=100 — to a PER-BYTE loop.)
+    //  * `distance == 1`: RLE broadcast-word fill (vendor memset arm,
+    //    deflate.hpp:1393-1398, as words instead of a libc call).
+    //  * `2 <= distance <= 7`: stride-`distance` word trick (libdeflate's
+    //    small-offset arm): each 8-byte store advances by `distance`; its
+    //    first `distance` bytes are correct (loaded from the final region one
+    //    period behind) and its garbage tail is overwritten by the NEXT store;
+    //    the final store's first `distance` bytes reach `end`. The old shape
+    //    per-byte-copied every small-distance backref.
+    //
+    // OVERSHOOT ENVELOPE (headroom proof dependency): worst touch is
+    // `*pos + max(40, ((3*7)+8), length + 7) = *pos + max(40, length+7)
+    // <= *pos + 265` — strictly inside the `MAX_RUN_LENGTH + 8 = 266` byte
+    // reservation BOTH contig loops already hold below `cap` (the same
+    // envelope the old word path used: `*pos + 264`). Overshoot bytes lie
+    // ahead of the advanced `*pos`, are never sourced by a later back-ref,
+    // and get overwritten — invisible. Byte-exactness of `[*pos, *pos+length)`
+    // is locked by the permanent `emit_backref_contig_differential` test
+    // (dist 1..258 x len 3..258 x alignments vs a sequential-copy reference).
+    let mut dst = base.add(*pos);
+    let mut src = base.add(*pos - distance);
+    let end = dst.add(length);
+    // P3.4 item 3 (variant B): long matches walk well past the head of the
+    // source — prefetch one line ahead before the copy loop reaches it
+    // (libdeflate analog, copy_match_fast:430-433).
+    #[cfg(target_arch = "x86_64")]
+    if length > 40 {
+        std::arch::x86_64::_mm_prefetch(src.add(40) as *const i8, std::arch::x86_64::_MM_HINT_T0);
     }
+    if distance >= 8 {
+        // 5-word unconditional burst (covers the common short match without a
+        // length branch), then the stride-8 loop for long matches.
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        (dst.add(8) as *mut u64).write_unaligned((src.add(8) as *const u64).read_unaligned());
+        (dst.add(16) as *mut u64).write_unaligned((src.add(16) as *const u64).read_unaligned());
+        (dst.add(24) as *mut u64).write_unaligned((src.add(24) as *const u64).read_unaligned());
+        (dst.add(32) as *mut u64).write_unaligned((src.add(32) as *const u64).read_unaligned());
+        if length > 40 {
+            src = src.add(40);
+            dst = dst.add(40);
+            while dst < end {
+                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                src = src.add(8);
+                dst = dst.add(8);
+            }
+        }
+    } else if distance == 1 {
+        // RLE: broadcast the byte into a word and store words to `end`
+        // (<= 7-byte overshoot).
+        let v = 0x0101_0101_0101_0101u64.wrapping_mul(*src as u64);
+        while dst < end {
+            (dst as *mut u64).write_unaligned(v);
+            dst = dst.add(8);
+        }
+    } else {
+        // 2 <= distance <= 7: stride-`distance` word stores. 4 unconditional
+        // (touch <= dst + 3*7 + 8 = dst+29), then loop to `end`.
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(distance);
+        dst = dst.add(distance);
+        while dst < end {
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(distance);
+            dst = dst.add(distance);
+        }
+    }
+    *pos += length;
 }
 
 /// PRODUCTION post-flip clean-mode back-ref copy — **u8-direct** into the u8
@@ -5228,6 +5368,262 @@ mod tests {
             accepted >= 238,
             "expected ≥238 accepted code-length sets out of 405 tried, got {accepted}"
         );
+    }
+
+    /// P3.4 item 1 differential (permanent): `DistTable::rebuild` (allocation
+    /// reuse) must produce a table BEHAVIORALLY IDENTICAL to a fresh
+    /// `DistTable::build` for every code-length set, in any rebuild ORDER
+    /// (shallow→deep grows the entries Vec, deep→shallow exercises the
+    /// truncate-shrink with stale memory beyond the new length). The 15-bit
+    /// pattern space is exhaustive: the main lookup reads the low 9 bits and a
+    /// subtable lookup the next 6, so 2^15 patterns cover every reachable
+    /// (main entry, final entry) pair.
+    #[test]
+    #[cfg(pure_inflate_decode)]
+    fn dist_table_rebuild_matches_fresh_build() {
+        use crate::decompress::inflate::libdeflate_entry::DistTable;
+
+        fn assert_tables_equal(fresh: &DistTable, reused: &DistTable, tag: &str) {
+            for p in 0..(1u64 << 15) {
+                let mf = fresh.lookup(p);
+                let mr = reused.lookup(p);
+                assert_eq!(
+                    mf.is_subtable_ptr(),
+                    mr.is_subtable_ptr(),
+                    "{tag}: subtable-ness diverged at pattern {p:#x}"
+                );
+                let (ff, fr) = if mf.is_subtable_ptr() {
+                    let shifted = p >> (DistTable::TABLE_BITS as u32);
+                    (
+                        fresh.lookup_subtable_direct(mf, shifted).raw(),
+                        reused.lookup_subtable_direct(mr, shifted).raw(),
+                    )
+                } else {
+                    (mf.raw(), mr.raw())
+                };
+                assert_eq!(ff, fr, "{tag}: final entry diverged at pattern {p:#x}");
+            }
+        }
+
+        // Set sequence: the same shapes the dist_hc differential uses, ordered
+        // to force grow AND shrink transitions of the reused allocation.
+        let mut sets: Vec<[u8; 30]> = Vec::new();
+        sets.push([5u8; 30]); // flat (no subtables)
+        let mut deep = [0u8; 30]; // deep ladder (subtables)
+        for (i, d) in deep.iter_mut().enumerate().take(13) {
+            *d = (i + 1) as u8;
+        }
+        deep[13] = 14;
+        deep[14] = 14;
+        sets.push(deep);
+        sets.push(FIXED_DIST_LENGTHS); // back to shallow (shrink)
+        let mut single = [0u8; 30];
+        single[0] = 1;
+        sets.push(single); // degenerate
+        sets.push(deep); // grow again
+                         // ~60 pseudo-random sets (same generator family as the dist_hc
+                         // differential; unaccepted-by-dist_hc shapes are fine here — rebuild
+                         // equality is a pure table property).
+        let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..60 {
+            let mut lens = [0u8; 30];
+            for b in &mut lens {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let raw = (rng >> 48) as u8;
+                *b = if raw < 77 { 0 } else { 4 + (raw - 77) % 12 };
+            }
+            sets.push(lens);
+        }
+
+        let mut reused = DistTable::build(&sets[0]).expect("first build");
+        assert_tables_equal(
+            &DistTable::build(&sets[0]).unwrap(),
+            &reused,
+            "set 0 (fresh==fresh sanity)",
+        );
+        for (i, lens) in sets.iter().enumerate().skip(1) {
+            reused.rebuild(lens);
+            let fresh = DistTable::build(lens).expect("fresh build");
+            assert_tables_equal(&fresh, &reused, &format!("set {i}"));
+        }
+    }
+
+    /// P3.4 item 1 stream-level differential (permanent): a MULTI-BLOCK raw
+    /// DEFLATE stream decoded through ONE `Block` instance on the contig clean
+    /// path must match the flate2 oracle byte-for-byte. Full-flush chunk
+    /// boundaries force separate dynamic blocks; the repeated chunk content
+    /// makes consecutive blocks carry IDENTICAL dist lens (exercising the
+    /// same-lens REUSE arm) while the distinct chunks force REBUILDS, and the
+    /// sync-flush padding blocks exercise the stored-block path between them.
+    #[cfg(pure_inflate_decode)]
+    #[test]
+    fn contig_clean_stream_multi_block_dist_reuse() {
+        use flate2::{Compress, Compression, FlushCompress, Status};
+
+        // Three chunk contents: A, A again (same lens → reuse), B (rebuild),
+        // then A once more (rebuild back). Sizes large enough for dynamic
+        // blocks, small enough to stay single-block per chunk.
+        let chunk_a: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
+            .repeat(700)
+            .to_vec();
+        let chunk_b: Vec<u8> = (0u32..32000)
+            .map(|i| ((i.wrapping_mul(2654435761) >> 13) & 0x3f) as u8 + 0x20)
+            .collect();
+        let plan: [&[u8]; 4] = [&chunk_a, &chunk_a, &chunk_b, &chunk_a];
+
+        let mut c = Compress::new(Compression::default(), false);
+        let mut deflate = Vec::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        for (i, chunk) in plan.iter().enumerate() {
+            let flush = if i + 1 == plan.len() {
+                FlushCompress::Finish
+            } else {
+                FlushCompress::Full // resets window → blocks are independent
+            };
+            let before_in = c.total_in();
+            let before_out = c.total_out() as usize;
+            let status = c.compress(chunk, &mut buf, flush).expect("compress");
+            assert_eq!(c.total_in() - before_in, chunk.len() as u64);
+            if i + 1 == plan.len() {
+                assert_eq!(status, Status::StreamEnd);
+            }
+            deflate.extend_from_slice(&buf[..c.total_out() as usize - before_out]);
+        }
+        let payload: Vec<u8> = plan.concat();
+
+        // Oracle: flate2 raw-deflate decode of the same stream.
+        let mut oracle = Vec::with_capacity(payload.len());
+        {
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+            DeflateDecoder::new(&deflate[..])
+                .read_to_end(&mut oracle)
+                .expect("oracle inflate");
+        }
+        assert_eq!(oracle, payload, "oracle decode != payload");
+
+        // Contig decode: ONE Block across all blocks (the dist_table
+        // reuse/rebuild cache lives in the Block), empty-window clean seed.
+        let boxed: &'static [u8] = Box::leak(deflate.clone().into_boxed_slice());
+        let mut bits = Bits::new(boxed);
+        let mut b = Block::new();
+        let mut sink: Vec<u16> = Vec::new();
+        b.set_initial_window(&mut sink, &[]).unwrap();
+        let cap = payload.len() + 1024;
+        let mut out = vec![0u8; cap];
+        let base = out.as_mut_ptr();
+        let mut pos = 0usize;
+        let mut saw_dynamic = 0u32;
+        loop {
+            b.read_header(&mut bits, false).unwrap();
+            match b.compression_type() {
+                CompressionType::Uncompressed => {
+                    // Sync/full-flush padding blocks (len may be 0).
+                    while !b.eob() {
+                        b.decode_clean_stored_into_contig(&mut bits, base, cap, &mut pos, cap)
+                            .unwrap();
+                    }
+                }
+                CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                    if b.compression_type() == CompressionType::DynamicHuffman {
+                        saw_dynamic += 1;
+                    }
+                    while !b.eob() {
+                        // Small per-call cap splits blocks across resumable
+                        // re-entries (the lazy-build site runs once per block).
+                        let n = b
+                            .decode_clean_into_contig(&mut bits, base, cap, &mut pos, 8192)
+                            .unwrap();
+                        if n == 0 && !b.eob() {
+                            panic!("contig stream decode stalled");
+                        }
+                    }
+                }
+                other => panic!("unexpected block type {other:?}"),
+            }
+            if b.is_last_block() {
+                break;
+            }
+        }
+        assert!(
+            saw_dynamic >= 3,
+            "expected ≥3 dynamic blocks (got {saw_dynamic}) — chunk sizes no longer force them?"
+        );
+        out.truncate(pos);
+        assert_eq!(
+            out, oracle,
+            "multi-block contig decode diverged from flate2 oracle"
+        );
+    }
+
+    /// P3.4 item 2 differential (permanent): `emit_backref_contig` (the
+    /// libdeflate-shape copy: 5-word burst for dist>=8, broadcast RLE for
+    /// dist==1, stride-dist word trick for dist 2..7) must write EXACTLY the
+    /// sequential-copy reference bytes in `[*pos, *pos+length)` and touch
+    /// NOTHING beyond the documented overshoot envelope
+    /// (`*pos + max(40, length+7) <= *pos + 265`), for every overlap distance
+    /// x length x alignment combination.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[test]
+    fn emit_backref_contig_differential() {
+        const HISTORY: usize = 300; // > max distance 258
+        const ENVELOPE: usize = 265; // documented worst-case touch past *pos
+        const TAIL: usize = ENVELOPE + 64; // envelope + canary slack
+        const CANARY: u8 = 0xA5;
+
+        // Lengths: all short (the burst/stride boundary cases) + stepped long.
+        let lens: Vec<usize> = (3..=48).chain((49..=258).step_by(3)).chain([258]).collect();
+
+        let mut buf = vec![0u8; HISTORY + 8 + 258 + TAIL];
+        let mut reference = vec![0u8; buf.len()];
+        for align in 0..8usize {
+            let start = HISTORY + align;
+            for distance in 1..=258usize {
+                for &length in &lens {
+                    // Pseudo-random history (deterministic per case).
+                    let mut s = (align as u64) << 32 | (distance as u64) << 16 | length as u64;
+                    for (i, b) in buf[..start].iter_mut().enumerate() {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        *b = (s >> 56) as u8 ^ i as u8;
+                    }
+                    for b in buf[start..].iter_mut() {
+                        *b = CANARY;
+                    }
+                    // Reference: strict sequential byte copy.
+                    reference[..start].copy_from_slice(&buf[..start]);
+                    for i in 0..length {
+                        reference[start + i] = reference[start + i - distance];
+                    }
+
+                    let mut pos = start;
+                    unsafe {
+                        emit_backref_contig(buf.as_mut_ptr(), &mut pos, distance, length);
+                    }
+                    assert_eq!(pos, start + length, "pos advance d={distance} l={length}");
+                    assert_eq!(
+                        &buf[..start + length],
+                        &reference[..start + length],
+                        "bytes diverged: d={distance} l={length} align={align}"
+                    );
+                    // No touch beyond the envelope.
+                    assert!(
+                        buf[start + ENVELOPE..].iter().all(|&b| b == CANARY),
+                        "wrote past the {ENVELOPE}-byte envelope: d={distance} l={length} align={align}"
+                    );
+                }
+            }
+        }
     }
 
     /// P3.2 differential (permanent, modeled on
