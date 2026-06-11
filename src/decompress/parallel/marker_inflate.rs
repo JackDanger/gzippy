@@ -2454,7 +2454,9 @@ impl Block {
                 }};
             }
             lb.refill();
-            let mut pre = self.lut_litlen.decode(&mut lb);
+            // P3.5 c4: immediately after a refill — backstop-free decode
+            // (byte-exact proof on `decode_prefilled`).
+            let mut pre = self.lut_litlen.decode_prefilled(&lb);
             super::slow_knob::inject_localize(dec_spin, dec_yield);
             // P3.1 profiler chaining state: ONE rdtsc per iteration; the delta
             // between consecutive iteration tops is charged to the class the
@@ -2505,6 +2507,18 @@ impl Block {
                 // `base` valid for `[0, cap)`.
                 let mut trailing_code: u16 = 0;
                 let mut have_trailing = false;
+                // P3.5 c2: fused litlen→dist lookahead (lone-length arm).
+                // Carries the dist short-LUT entry loaded EARLY — at the
+                // point the litlen packet is known to be a lone non-literal,
+                // before the EOB/MAX/length branch tree resolves — so the
+                // dependent dist-table load issues sooner. Same index
+                // (`lb.bitbuf` is post-consume and untouched until the
+                // backref arm), same table ⇒ same value as the in-place
+                // lookup it replaces; a wasted load on an EOB/invalid code
+                // reads always-valid table memory. Byte-exact by
+                // construction.
+                let mut spec_dist: Option<crate::decompress::inflate::libdeflate_entry::DistEntry> =
+                    None;
                 if sym_count0 == 1 {
                     let code = (sym0 & 0xFFFF) as u16;
                     if code <= 255 {
@@ -2603,6 +2617,10 @@ impl Block {
                     } else {
                         trailing_code = code;
                         have_trailing = true;
+                        // P3.5 c2: issue the dist load now (see decl above).
+                        if let Some(dt) = dist_tbl {
+                            spec_dist = Some(dt.lookup(lb.bitbuf));
+                        }
                     }
                 } else {
                     // ORACLE NOSTORE: elide the packed store, keep the accounting.
@@ -2665,7 +2683,13 @@ impl Block {
                             // <= 15-bit code + <= 5 packed length-extra), so
                             // >= 28 remain >= 9 main + 6 subtable + 13 extra.
                             use crate::decompress::inflate::libdeflate_entry::DistTable;
-                            let mut dist_entry = dt.lookup(lb.bitbuf);
+                            // P3.5 c2: use the early-issued entry when the
+                            // lone-length arm already loaded it (identical
+                            // index — no consumes between the sites).
+                            let mut dist_entry = match spec_dist {
+                                Some(e) => e,
+                                None => dt.lookup(lb.bitbuf),
+                            };
                             if dist_entry.is_subtable_ptr() {
                                 lb.consume(DistTable::TABLE_BITS as u32);
                                 dist_entry = dt.lookup_subtable_direct(dist_entry, lb.bitbuf);
@@ -2720,6 +2744,29 @@ impl Block {
                         if distance > *pos {
                             commit_fast!(Err(BlockError::ExceededWindowRange));
                         }
+                        // ── P3.5 c1: NEXT-SYMBOL PRELOAD BEFORE THE COPY ─────
+                        // libdeflate decompress_template.h:555-572 — "Before
+                        // starting to issue the instructions to copy the match,
+                        // refill the bitbuffer and preload the litlen decode
+                        // table entry for the next loop iteration … allowing
+                        // the latency of the match copy to overlap with these
+                        // other operations." The refill + LUT load read ONLY
+                        // input-side state (`lb`, `lut_litlen`); the copy and
+                        // the sparsity bookkeeping below touch ONLY the output
+                        // buffer and `self` fields — disjoint, so hoisting the
+                        // bottom-of-loop preload above the copy is byte-exact
+                        // by construction (identical refill threshold,
+                        // identical decode, identical bit consumption; only
+                        // instruction SCHEDULING changes). The iteration ends
+                        // with `continue 'fast` so the bottom preload (which
+                        // now serves the literal-pack arm only) is not re-run.
+                        if (lb.bitsleft as u8) < 48 {
+                            lb.refill();
+                        }
+                        // P3.5 c4: threshold-refill site — backstop-free
+                        // decode (byte-exact proof on `decode_prefilled`).
+                        pre = self.lut_litlen.decode_prefilled(&lb);
+                        super::slow_knob::inject_localize(dec_spin, dec_yield);
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
                         // ORACLE NOSTORE: elide the copy (loads+stores), keep
@@ -2757,6 +2804,9 @@ impl Block {
                             prof_pending = super::contig_prof::CLASS_BACKREF;
                             pf.bytes_backref += length as u64;
                         }
+                        // P3.5 c1: `pre` already preloaded above (before the
+                        // copy) — skip the bottom-of-loop preload.
+                        continue 'fast;
                     }
                 }
 
@@ -2770,7 +2820,9 @@ impl Block {
                 if (lb.bitsleft as u8) < 48 {
                     lb.refill();
                 }
-                pre = self.lut_litlen.decode(&mut lb);
+                // P3.5 c4: threshold-refill site — backstop-free decode
+                // (byte-exact proof on `decode_prefilled`).
+                pre = self.lut_litlen.decode_prefilled(&lb);
                 super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
