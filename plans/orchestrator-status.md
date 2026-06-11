@@ -1,3 +1,17 @@
+## ASM DEFAULT-ON MERGED — all cells improve; RG ANCHOR RE-BASED (integrity correction) [2026-06-11]
+The four flip preconditions landed + verified on real BMI2; kernel default-ON for production
+native builds (kill-switch + BMI2 fallback intact; non-x86 untouched). Frozen 3-way: gz2 improves
+ALL SIX cells vs asm-off, zero regressions (T1 1170->939, T4 545->508, T8 342->332, T16 276->266,
+model 654->517, bignasa 904->899). 60/60 shas, suites 946/0.
+INTEGRITY CORRECTION: live co-located rg T1 = 809-814ms (sha-verified, verify/no-verify ruled out
+CRC), NOT the banked 926.6 — the '0.98x' claim was stale-anchored. HONEST CURRENT BAR TABLE
+(rg/gz2): T16 0.992 PASS-adjacent, T8 0.973, bignasa 0.969, T1 0.863, T4 0.86, model 0.71.
+QUEUED: (1) rg-anchor investigation (why 810 now vs 905-927 across all prior sessions — rg-side
+state? prior-condition artifact? ALL historical rg-relative numbers suspect until resolved);
+(2) full bar matrix both builds at this HEAD with live rg arms; (3) Squishy refresh; (4) the
+remaining cells' levers with fulcrum decide on the new HEAD.
+NATIVE TRAJECTORY (honest): M6 0.578-vs-stale-anchor -> TODAY 0.863-vs-live-anchor, with every
+intermediate ratio needing the same re-base lens.
 ## ASM RUNG (c) MERGED DEFAULT-OFF (advisor-SOUND) — NATIVE T1 0.98x UNDER THE FEATURE [2026-06-11]
 THE FUNDED CAMPAIGN'S PAYLOAD LANDED: full-symbol-loop asm kernel, byte-exact (30/30 shas, 27k
 differential trials on real BMI2, 3 live positive controls), asm_frac 0.998, frozen T1 silesia
