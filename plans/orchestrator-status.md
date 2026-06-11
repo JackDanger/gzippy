@@ -1,3 +1,18 @@
+## THE FULLY-HONEST MATRIX @ cb269664 — both arms file-sink; two attribution errors corrected [2026-06-11]
+CORRECTION-OF-THE-CORRECTION: the interim 'corrected' table (T1 0.973/T8 1.075) was HALF-phantom —
+rg re-based to file-sink but gz kept /dev/null numbers (the anchor worker's 'gzippy is
+sink-insensitive' claim FALSIFIED: native pays ~110ms@T1 for real output too). ALSO the bar2
+worker's 'regression from uncommitted mod.rs changes' attribution is UNSUPPORTED — the tree is
+CLEAN (only its own runner script, removed). The new matrix (both arms regular-file, canonical,
+frozen, sha-verified) is the FIRST fully-honest table:
+ISAL 6/14 PASS (silesia T1 1.210!, T8 1.011; nasa T1 1.595, T16 1.104; ghcn 1.005; small 2.754).
+NATIVE 3/14 PASS (nasa T16 1.132, ghcn 1.029, small 2.211); silesia T1 0.877 / T4 0.870 /
+T8 0.966 / T16 0.973; model 0.727-0.763; bignasa 0.925.
+ASM VALUE AT HONEST PROTOCOL: native silesia T1 1528ms (pre-campaign file-sink) -> 1050ms now =
+-31% total; the kernel's relative -19.7% (same-sink A/B) stands. SINK LAW (now absolute): BOTH
+arms SAME regular-file sink, ALWAYS — half-rebased tables are phantoms too.
+REMAINING (native): silesia T1 -12.3%, T4 -13%, T8 -3.4%, T16 -2.7%, model -24-27%, bignasa -7.5%.
+REMAINING (isal): silesia T4 -9.5%, T16 -7.6%, model -14%, bignasa -8%, nasa T4 -2.1%.
 ## RG-ANCHOR RESOLVED: sink-protocol artifact; CORRECTED BAR TABLE — NATIVE PASSES T8 [2026-06-11]
 The 810-vs-917 rg discrepancy = the flip session's flip_3way.sh used /dev/null while the spine's
 canonical rule is regular-file-on-/dev/shm (rg pays ~108ms@T1/~50ms@T8 real write cost there;
