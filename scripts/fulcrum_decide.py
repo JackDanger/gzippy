@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""fulcrum_decide — thin shim; the engine lives in tools/fulcrum
-(fulcrum.core.decide + fulcrum.adapters.gzippy).
+"""fulcrum_decide — thin shim; the engine lives in the fulcrum OSS repo's
+decide/ package (fulcrum.core.decide + fulcrum.adapters.gzippy), located
+via $FULCRUM_HOME (default: ~/www/fulcrum).
 
 Byte-compatible CLI of the original monolith:
   python3 scripts/fulcrum_decide.py <artifact-dir> [--allow-thaw]
@@ -14,7 +15,12 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PKG = os.path.abspath(os.path.join(_HERE, "..", "tools", "fulcrum"))
+_FULCRUM_HOME = os.environ.get(
+    "FULCRUM_HOME", os.path.join(os.path.expanduser("~"), "www", "fulcrum"))
+_PKG = os.path.abspath(os.path.join(_FULCRUM_HOME, "decide"))
+if not os.path.isdir(os.path.join(_PKG, "fulcrum")):
+    sys.exit(f"fulcrum_decide: decision engine not found at {_PKG} "
+             "(set FULCRUM_HOME; default ~/www/fulcrum)")
 sys.path.insert(0, _PKG)
 
 # Default the ledger next to the repo (decide.sh runs from anywhere).

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# fulcrum — the campaign's instrument front door (engine: tools/fulcrum).
+# fulcrum — the campaign's instrument front door.
+# Engine: the fulcrum OSS repo's decide/ package ($FULCRUM_HOME/decide;
+# FULCRUM_HOME defaults to $HOME/www/fulcrum).
 #
 #   fulcrum decide [args]      ONE-RUN decision table on the bench box
 #                              (scripts/bench/decide.sh; plans/fulcrum-product.md)
@@ -11,7 +13,12 @@
 #   fulcrum ledger [path]      banked results + fingerprints
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PKG="$HERE/../tools/fulcrum"
+FULCRUM_HOME="${FULCRUM_HOME:-$HOME/www/fulcrum}"
+PKG="$FULCRUM_HOME/decide"
+if [ ! -d "$PKG/fulcrum" ]; then
+  echo "fulcrum: decision engine not found at $PKG (set FULCRUM_HOME; default \$HOME/www/fulcrum)" >&2
+  exit 1
+fi
 export FULCRUM_LEDGER="${FULCRUM_LEDGER:-$HERE/../artifacts/fulcrum/ledger.jsonl}"
 
 cmd="${1:-help}"; shift || true
@@ -22,5 +29,5 @@ case "$cmd" in
   selftest|invariants|ledger)
     exec env PYTHONPATH="$PKG${PYTHONPATH:+:$PYTHONPATH}" \
       python3 -m fulcrum.cli "$cmd" "$@";;
-  *) sed -n '2,12p' "${BASH_SOURCE[0]}";;
+  *) sed -n '2,13p' "${BASH_SOURCE[0]}";;
 esac
