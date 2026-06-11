@@ -56,6 +56,9 @@ pub mod perfect_overlap;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod raw_block_finder;
+/// Removal oracles for the contig clean loop (STORE-removal + symbol-stream
+/// NODECODE replay) — Rule-3 ceiling instruments. See `removal_oracle.rs`.
+pub mod removal_oracle;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
 pub mod rfc_tables;

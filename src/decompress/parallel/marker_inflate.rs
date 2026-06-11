@@ -2195,6 +2195,26 @@ impl Block {
             self.ring.is_clean(),
             "decode_clean_into_contig requires clean (window-primed) mode"
         );
+        // ── REMOVAL ORACLES (measurement-only; see removal_oracle.rs) ───────
+        // NODECODE replay: replace THIS call's Huffman decode + bit reads +
+        // per-block LUT builds with a recorded symbol-stream replay whose
+        // stores go through the production kernels (byte-correct on a hit).
+        // A miss or room-bail falls through to the real decode below. OFF is
+        // one OnceLock-bool branch at function entry.
+        if super::removal_oracle::replay_enabled() {
+            if let Some(n) = self.oracle_nodecode_replay(bits, base, cap, pos, n_max_to_decode) {
+                return Ok(n);
+            }
+        }
+        // STORE-removal knob snapshot (one predictable branch per store site
+        // when OFF) + symbol-stream recorder (None unless GZIPPY_ORACLE_RECORD).
+        let oracle_nostore = super::removal_oracle::nostore_enabled();
+        let mut orec = super::removal_oracle::record_begin(
+            bits.data,
+            bits.bit_position(),
+            *pos,
+            n_max_to_decode,
+        );
         match self.compression_type {
             CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
                 if !self.block_huffman_luts_ready {
@@ -2324,8 +2344,18 @@ impl Block {
         let st_yield: bool = super::slow_knob::localize_yield_kind(st_spin);
         macro_rules! commit {
             ($result:expr) => {{
+                let __r: Result<usize, BlockError> = $result;
+                super::removal_oracle::record_end(
+                    orec.take(),
+                    __r.is_ok(),
+                    bits.pos,
+                    bits.bitbuf,
+                    bits.bitsleft,
+                    emitted,
+                    self.at_end_of_block,
+                );
                 self.decoded_bytes += emitted;
-                return $result;
+                return __r;
             }};
         }
 
@@ -2409,8 +2439,18 @@ impl Block {
             macro_rules! commit_fast {
                 ($result:expr) => {{
                     sync_local_bits!();
+                    let __r: Result<usize, BlockError> = $result;
+                    super::removal_oracle::record_end(
+                        orec.take(),
+                        __r.is_ok(),
+                        bits.pos,
+                        bits.bitbuf,
+                        bits.bitsleft,
+                        emitted,
+                        self.at_end_of_block,
+                    );
                     self.decoded_bytes += emitted;
-                    return $result;
+                    return __r;
                 }};
             }
             lb.refill();
@@ -2468,8 +2508,14 @@ impl Block {
                 if sym_count0 == 1 {
                     let code = (sym0 & 0xFFFF) as u16;
                     if code <= 255 {
-                        unsafe {
-                            base.add(*pos).write(code as u8);
+                        // ORACLE NOSTORE: elide the store, keep the accounting.
+                        if !oracle_nostore {
+                            unsafe {
+                                base.add(*pos).write(code as u8);
+                            }
+                        }
+                        if let Some(r) = orec.as_mut() {
+                            r.lit(code as u8);
                         }
                         *pos += 1;
                         emitted += 1;
@@ -2520,8 +2566,13 @@ impl Block {
                                 // FAST_OUT_SLOP < local_cap` + the compile
                                 // assert `1+LIT_CHAIN_MAX <= FAST_OUT_SLOP`
                                 // keep every chained write < out_room < cap.
-                                unsafe {
-                                    base.add(*pos).write(ncode as u8);
+                                if !oracle_nostore {
+                                    unsafe {
+                                        base.add(*pos).write(ncode as u8);
+                                    }
+                                }
+                                if let Some(r) = orec.as_mut() {
+                                    r.lit(ncode as u8);
                                 }
                                 *pos += 1;
                                 emitted += 1;
@@ -2554,9 +2605,12 @@ impl Block {
                         have_trailing = true;
                     }
                 } else {
-                    unsafe {
-                        let packed = (sym0 & 0x00FF_FFFF) as u64;
-                        (base.add(*pos) as *mut u64).write_unaligned(packed);
+                    // ORACLE NOSTORE: elide the packed store, keep the accounting.
+                    if !oracle_nostore {
+                        unsafe {
+                            let packed = (sym0 & 0x00FF_FFFF) as u64;
+                            (base.add(*pos) as *mut u64).write_unaligned(packed);
+                        }
                     }
                     let mut s = sym0;
                     let mut remaining = sym_count0;
@@ -2577,6 +2631,9 @@ impl Block {
                         trailing_code = code;
                         have_trailing = true;
                         break;
+                    }
+                    if let Some(r) = orec.as_mut() {
+                        r.lits_from_packed(sym0, lit_prefix);
                     }
                     *pos += lit_prefix;
                     emitted += lit_prefix;
@@ -2665,8 +2722,17 @@ impl Block {
                         }
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
-                        unsafe {
-                            emit_backref_contig(base, pos, distance, length);
+                        // ORACLE NOSTORE: elide the copy (loads+stores), keep
+                        // the position accounting identical.
+                        if oracle_nostore {
+                            *pos += length;
+                        } else {
+                            unsafe {
+                                emit_backref_contig(base, pos, distance, length);
+                            }
+                        }
+                        if let Some(r) = orec.as_mut() {
+                            r.backref(length, distance);
                         }
                         super::slow_knob::inject_localize(st_spin, st_yield);
                         if track_backrefs {
@@ -2744,8 +2810,14 @@ impl Block {
                 let code = (sym & 0xFFFF) as u16;
                 if code <= 255 || sym_count > 1 {
                     // SAFETY: `*pos < out_room <= cap`; `base` valid for [0, cap).
-                    unsafe {
-                        base.add(*pos).write((code & 0xFF) as u8);
+                    // ORACLE NOSTORE: elide the store, keep the accounting.
+                    if !oracle_nostore {
+                        unsafe {
+                            base.add(*pos).write((code & 0xFF) as u8);
+                        }
+                    }
+                    if let Some(r) = orec.as_mut() {
+                        r.lit((code & 0xFF) as u8);
                     }
                     *pos += 1;
                     emitted += 1;
@@ -2806,8 +2878,16 @@ impl Block {
                 }
                 // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                 // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
-                unsafe {
-                    emit_backref_contig(base, pos, distance, length);
+                // ORACLE NOSTORE: elide the copy, keep the position accounting.
+                if oracle_nostore {
+                    *pos += length;
+                } else {
+                    unsafe {
+                        emit_backref_contig(base, pos, distance, length);
+                    }
+                }
+                if let Some(r) = orec.as_mut() {
+                    r.backref(length, distance);
                 }
                 super::slow_knob::inject_localize(st_spin, st_yield);
                 self.record_backreference_for_sparsity(distance, length, emitted);
@@ -2815,8 +2895,120 @@ impl Block {
                 break;
             }
         }
+        super::removal_oracle::record_end(
+            orec.take(),
+            true,
+            bits.pos,
+            bits.bitbuf,
+            bits.bitsleft,
+            emitted,
+            self.at_end_of_block,
+        );
         self.decoded_bytes += emitted;
         Ok(emitted)
+    }
+
+    /// REMOVAL-ORACLE NODECODE replay of ONE `decode_clean_into_contig` call
+    /// (measurement-only; see `removal_oracle.rs`). Performs the recorded
+    /// symbol stream's STORES — single-byte literal writes + the production
+    /// [`emit_backref_contig`] kernel — WITHOUT Huffman decode, bit reads, or
+    /// LUT builds, then restores the recorded bit-cursor end state and the
+    /// block/byte accounting so the caller's block state machine (header
+    /// parses, EOB transitions, CRC, commit) runs genuinely. Byte-correct on a
+    /// hit (real literals, real copy positions). Returns `None` on a key miss
+    /// or a room-guard bail (this run's `cap` smaller than the recorded run's
+    /// envelope) — the caller then runs the REAL decode; nothing observable
+    /// has been mutated on the bail path (any bytes already stored before a
+    /// bail are impossible: the room precheck runs before any store).
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    fn oracle_nodecode_replay(
+        &mut self,
+        bits: &mut Bits,
+        base: *mut u8,
+        cap: usize,
+        pos: &mut usize,
+        n_max_to_decode: usize,
+    ) -> Option<usize> {
+        use super::removal_oracle as ro;
+        let key = ro::call_key(bits.data, bits.bit_position(), *pos, n_max_to_decode);
+        let rec = ro::replay_lookup(&key)?;
+        // ROOM PRECHECK (no state mutation): the replayed stores need the same
+        // envelope the production loop proves — every backref starts at
+        // `cur + 266 <= cap` (one max back-ref + word overshoot, the out_room
+        // reservation) and every literal write stays `< cap` (+8 slack mirrors
+        // FAST_OUT_SLOP). Also re-derive the recorded totals so a corrupt or
+        // colliding record can never drive an out-of-bounds store.
+        {
+            let mut cur = *pos;
+            let mut lit_total = 0usize;
+            for op in &rec.ops {
+                let run = op.lit_run();
+                if cur + run + 8 > cap {
+                    ro::count_replay_bail();
+                    return None;
+                }
+                cur += run;
+                lit_total += run;
+                let len = op.match_len();
+                if len > 0 {
+                    let dist = op.dist();
+                    if cur + 266 > cap || dist == 0 || dist > cur {
+                        ro::count_replay_bail();
+                        return None;
+                    }
+                    cur += len;
+                }
+            }
+            if cur != *pos + rec.emitted as usize || lit_total != rec.lits.len() {
+                ro::count_replay_bail();
+                return None;
+            }
+        }
+        // REPLAY STORES: per-symbol-faithful — literals one byte at a time
+        // (the dominant lit1/chain production shape; byte count identical to
+        // the litpack packed-store arm), back-refs via the exact production
+        // copy kernel. Sparsity bookkeeping recomputed with the production
+        // formula (`record_backreference_for_sparsity` checks the flag).
+        let entry_pos = *pos;
+        let mut lit_off = 0usize;
+        for op in &rec.ops {
+            let run = op.lit_run();
+            for i in 0..run {
+                // SAFETY: precheck proved every literal write index `< cap`.
+                unsafe {
+                    base.add(*pos).write(rec.lits[lit_off + i]);
+                }
+                *pos += 1;
+            }
+            lit_off += run;
+            let len = op.match_len();
+            if len > 0 {
+                let dist = op.dist();
+                // SAFETY: precheck proved `dist <= *pos` and
+                // `*pos + ((len+7)&!7) <= *pos + 264 <= cap` at this point.
+                unsafe {
+                    emit_backref_contig(base, pos, dist, len);
+                }
+                let emitted_before = *pos - len - entry_pos;
+                self.record_backreference_for_sparsity(dist, len, emitted_before);
+            }
+        }
+        // Restore the recorded end state: bit cursor exactly where the real
+        // decode left it (header parses continue genuinely), EOB flag, and the
+        // decoded-byte accounting the commit paths would have applied.
+        bits.pos = rec.end_pos as usize;
+        bits.bitbuf = rec.end_bitbuf;
+        bits.bitsleft = rec.end_bitsleft;
+        self.at_end_of_block = rec.at_eob;
+        self.decoded_bytes += rec.emitted as usize;
+        Some(rec.emitted as usize)
     }
 
     /// Copy-free-to-final STORED (uncompressed) clean block: drain the
