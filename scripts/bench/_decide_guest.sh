@@ -109,6 +109,7 @@ slab_alloc|GZIPPY_SLAB_ALLOC=1|rpmalloc_stats
 slab_off|GZIPPY_SLAB_ALLOC=0|rpmalloc_stats_off
 slab_bigbudget|GZIPPY_SLAB_BUDGET_MIB=600|none
 eager_postproc|GZIPPY_EAGER_POSTPROC=1|none
+isal_incremental_growth|GZIPPY_ISAL_INCREMENTAL_GROWTH=1|none
 "
 
 # ---- corpus reference oracles -------------------------------------------------
