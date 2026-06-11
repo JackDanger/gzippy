@@ -34,7 +34,9 @@ from .test_decide import RG, make_artifact, write_samples
 AD = GzippyAdapter()
 
 FP = Fingerprint(sink="regular-file", mask="0", freeze="frozen",
-                 bin_sha="deadbeef", corpus_sha="028bd002", protocol="fulcrum-v3")
+                 bin_sha="deadbeef", corpus_sha="028bd002",
+                 protocol="fulcrum-v3", comparator="rapidgzip 0.16.0",
+                 host="testcpu-13700T|6.0-test|abc123def456")
 
 
 def run():
@@ -109,6 +111,58 @@ def run():
     fp_othermask = Fingerprint(**{**FP.to_dict(), "mask": "0,2,4,6"})
     check(any("mask" in r for r in incompatibilities(FP, fp_othermask)),
           "mask mismatch surfaced by name (free-placement numbers lie)")
+
+    # ------------------------------------------------------------------
+    # COMPARATOR-VERSION + HOST-IDENTITY fields (P2 item 2 — the
+    # rapidgzip-version-drift and cross-host scenarios).
+    # ------------------------------------------------------------------
+    fp_rg17 = Fingerprint(**{**FP.to_dict(), "comparator": "rapidgzip 0.17.0"})
+    check(any("comparator" in r for r in incompatibilities(FP, fp_rg17)),
+          "comparator-version drift (0.16.0 vs 0.17.0) => incompatible, "
+          "reason names the comparator field")
+    fp_otherbox = Fingerprint(**{**FP.to_dict(),
+                                 "host": "otherCPU|6.1|deadbeef0000"})
+    check(any("host" in r for r in incompatibilities(FP, fp_otherbox)),
+          "host-identity mismatch => incompatible, reason names host "
+          "(same binary on a different box is a different experiment)")
+    # The rapidgzip-version-drift ledger scenario: an rg wall banked under
+    # 0.16.0 must NOT read as bank drift when 0.17.0 measures differently.
+    led_v = Ledger(os.path.join(tempfile.mkdtemp(prefix="fulcrum_inv_vdrift_"),
+                                "ledger.jsonl"))
+    led_v.append(make_record("run_v16", "gzippy", "cell", "silesia:T1:rg",
+                             917.0, 7, 1.0, "comparator", FP))
+    live_v17 = make_record("run_v17", "gzippy", "cell", "silesia:T1:rg",
+                           810.0, 7, 1.0, "comparator", fp_rg17)
+    check(led_v.contradictions(live_v17) == [],
+          "rapidgzip-version-drift: 0.17.0 wall differing from the banked "
+          "0.16.0 wall is NOT a contradiction (different experiment, "
+          "never compared)")
+    live_same16 = make_record("run_v16b", "gzippy", "cell", "silesia:T1:rg",
+                              810.0, 7, 1.0, "comparator", FP)
+    check(len(led_v.contradictions(live_same16)) == 1,
+          "control: the SAME comparator version drifting -21% DOES "
+          "contradict (real bank drift still caught)")
+    # comparator_version() probe: full banner, short form, absent.
+    full_banner = ("rapidgzip, CLI to the parallelized, indexed, and seekable "
+                   "gzip decoding library rapidgzip version 0.16.0")
+    check(AD.comparator_version({"rg_version": full_banner})
+          == "rapidgzip 0.16.0",
+          "comparator_version probe normalizes the full --version banner")
+    check(AD.comparator_version({"rg_version": "rapidgzip 0.16.0"})
+          == "rapidgzip 0.16.0",
+          "comparator_version probe accepts the short form")
+    check(AD.comparator_version({}) == "unknown",
+          "comparator_version probe: absent rg_version => unknown "
+          "(never compares)")
+    # host_identity(): all three fields or nothing.
+    from ..core.decide import host_identity
+    check(host_identity({"host_cpu_model": "c", "host_kernel": "k",
+                         "host_id": "i"}) == "c|k|i",
+          "host_identity composes cpu|kernel|id")
+    check(host_identity({"host_cpu_model": "c", "host_kernel": "k"})
+          == "unknown",
+          "host_identity: partial identity => unknown (cannot certify "
+          "same-host)")
 
     # SINK-LAW via assert_comparable: sink mismatch names SINK-LAW, not the
     # generic invariant.

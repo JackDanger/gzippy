@@ -37,6 +37,17 @@ class ProjectAdapter:
     knobs = {}              # name -> Knob
     perturbations = {}      # trace-class -> suggested perturbation command
 
+    # -- comparator identity ------------------------------------------------
+    def comparator_version(self, manifest):
+        """Normalized comparator tool version for the fingerprint's
+        `comparator` field (e.g. "rapidgzip 0.16.0"). The default reads the
+        documented manifest key; an adapter may parse its comparator's raw
+        --version banner instead. Return "unknown" when it cannot be
+        certified — an unknown comparator never compares (a comparator
+        upgrade moves its numbers; cross-version ratios are different
+        experiments)."""
+        return manifest.get("comparator_version", "unknown")
+
     # -- counters / routing guard ------------------------------------------
     def parse_counters(self, text):
         """Counter-sidecar text -> {counter: int}."""

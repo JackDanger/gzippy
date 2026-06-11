@@ -130,22 +130,38 @@ def load_run(art_dir, adapter):
 # Fingerprints (SINK-LAW / FINGERPRINT-OR-NO-COMPARE enforcement points).
 # ---------------------------------------------------------------------------
 
-def cell_fingerprints(man, ck):
+def host_identity(man):
+    """Compose the host-identity fingerprint field from the manifest's
+    derived host fields: "cpu-model|kernel|host-id". ALL three must be known
+    (a partial identity cannot certify same-host); otherwise 'unknown'."""
+    cpu = (man.get("host_cpu_model") or "").strip()
+    kernel = (man.get("host_kernel") or "").strip()
+    hid = (man.get("host_id") or "").strip()
+    if cpu and kernel and hid:
+        return f"{cpu}|{kernel}|{hid}"
+    return "unknown"
+
+
+def cell_fingerprints(man, ck, adapter):
     """Build the (tool-under-test, comparator) fingerprints for one cell from
-    the manifest. Pre-v3 manifests lack sink/protocol fields -> 'unknown'
+    the manifest. Manifests predating a fingerprint field -> 'unknown'
     (label, never silently compatible)."""
     proto = man.get("protocol", "unknown")
     freeze = man.get("freeze_state", "unknown")
     corpus_sha = man.get(f"corpus_{ck[0]}_sha", "unknown")
     mask = man["cell_meta"].get(ck, {}).get("mask", "unknown")
     sink_default = man.get("sink_class", "unknown")
+    comparator = adapter.comparator_version(man)
+    host = host_identity(man)
     fp_gz = Fingerprint(sink=man.get("sink_gz", sink_default), mask=mask,
                         freeze=freeze, bin_sha=man.get("bin_sha", "unknown"),
-                        corpus_sha=corpus_sha, protocol=proto)
+                        corpus_sha=corpus_sha, protocol=proto,
+                        comparator=comparator, host=host)
     fp_rg = Fingerprint(sink=man.get("sink_rg", sink_default), mask=mask,
                         freeze=freeze,
                         bin_sha="comparator:" + man.get("rg_version", "unknown"),
-                        corpus_sha=corpus_sha, protocol=proto)
+                        corpus_sha=corpus_sha, protocol=proto,
+                        comparator=comparator, host=host)
     return fp_gz, fp_rg
 
 
@@ -154,14 +170,15 @@ def check_cell_comparable(fp_gz, fp_rg, ck):
 
     A CONCRETE mismatch (both sides known, different — e.g. one arm /dev/null,
     one arm file) is REFUSED outright: that is the half-rebased-table phantom.
-    Unknown-only gaps (pre-v3 artifact) downgrade to a label so old artifact
-    dirs stay analyzable — but are never banked.
+    Unknown-only gaps (an artifact predating a fingerprint field) downgrade to
+    a label so old artifact dirs stay analyzable — but are never banked.
     Returns the label string ('' == fully comparable)."""
     inc = incompatibilities(fp_gz, fp_rg)
     if any("mismatch" in r for r in inc):
         assert_comparable(fp_gz, fp_rg, what=f"cell ratio {fmt_cell(ck)}")
     if inc:
-        return " FP-INCOMPLETE(pre-v3 fields missing: not banked)"
+        missing = ",".join(sorted({r.split()[0] for r in inc}))
+        return f" FP-INCOMPLETE(fields unknown: {missing} — not banked)"
     return ""
 
 
@@ -202,10 +219,12 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                   f"quiet={man.get('quiet_state')} governor={man.get('governor')} "
                   f"no_turbo={man.get('no_turbo')} "
                   f"runnable_avg={man.get('runnable_avg')}{unfrozen_tag}")
-    header.append(f"comparator : {man.get('rg_version')}")
+    header.append(f"comparator : {man.get('rg_version')} "
+                  f"[fingerprint: {adapter.comparator_version(man)}]")
     header.append(f"fingerprint: protocol={proto}{proto_tag} "
                   f"sink_gz={man.get('sink_gz', man.get('sink_class', 'unknown'))} "
                   f"sink_rg={man.get('sink_rg', man.get('sink_class', 'unknown'))} "
+                  f"host={host_identity(man)} "
                   f"(per-cell mask + corpus pin in each row's fingerprint)")
     header.append(f"sha-verify : every measured run checked against the corpus "
                   f"pin (guest aborts on mismatch); "
@@ -225,7 +244,7 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
             anomalies.append(f"{fmt_cell(ck)}: cell present but sha_ok!=1 in "
                              f"manifest — VOID (SHA-OR-VOID), not ranked")
             continue
-        fp_gz, fp_rg = cell_fingerprints(man, ck)
+        fp_gz, fp_rg = cell_fingerprints(man, ck, adapter)
         fp_label = check_cell_comparable(fp_gz, fp_rg, ck)  # may raise
         ratio = sr["min"] / sg["min"] if sg["min"] else 0.0
         delta_s = sg["min"] - sr["min"]
