@@ -414,9 +414,29 @@ COUNTER_PATTERNS = {
     "window_seeded": r"window_seeded=(\d+)",
     "flip_to_clean": r"flip_to_clean=(\d+)",
     "finished_no_flip": r"finished_no_flip=(\d+)",
+    "seeded_block": r"seeded_block=(\d+)",
+    "seeded_wrapper": r"seeded_wrapper=(\d+)",
+    "exact_block": r"exact_block=(\d+)",
+    "exact_wrapper": r"exact_wrapper=(\d+)",
+    # The binary emits `isal_chunks=` / `isal_fallbacks=` (chunk_fetcher.rs:870-871,
+    # the ISA-L clean-tail line). The OLD pattern here was `isal_oracle_chunks=` — a
+    # label the binary NEVER prints (the same historical grep-bug the instrument
+    # registry documents for _oracle_guest.sh), so the oracle arm of the guard
+    # could never fire on a real sidecar. Keep the legacy key for old synthetic
+    # sidecars; the lookbehind keeps the two patterns disjoint.
+    "isal_chunks": r"(?<!oracle_)isal_chunks=(\d+)",
+    "isal_fallbacks": r"(?<!oracle_)isal_fallbacks=(\d+)",
     "isal_oracle_chunks": r"isal_oracle_chunks=(\d+)",
     "isal_oracle_fallbacks": r"isal_oracle_fallbacks=(\d+)",
     "bad_seed_resync": r"bad_seed_resync=(\d+)",
+    # ONLY printed when GZIPPY_SEED_WINDOWS replay mode is ON (seed_windows.rs
+    # report_seed_stats is a no-op off seed) — THE oracle-seeding tell.
+    "seed_replay_hits": r"SEED_WINDOWS replay: hits=(\d+)",
+    # ONLY printed when GZIPPY_BYPASS_DECODE replay is active
+    # (decode_bypass.rs:628 report_replay_stats; no-ops when replay_enabled()==false).
+    # A bypass-replay run replays pre-computed decode results, masking the real
+    # engine cost — the same binder-masking failure class as SEED_WINDOWS.
+    "bypass_replay_hits": r"BYPASS_DECODE replay: hits=(\d+)",
 }
 
 
@@ -442,41 +462,80 @@ def auto_counter_path(trace_path):
     return None
 
 
-def seeding_guard(counters):
-    """Return (is_production, reason). A run is NOT production (binder-masking) if
-    windows were seeded or the ISA-L engine oracle ran -- both route to the clean
-    engine and HIDE the window-absent marker bootstrap that is the real binder.
+def seeding_guard(counters, feature=None):
+    """Return (is_production, reason). A run is NOT production (binder-masking) iff
+    an ACTUAL oracle contaminated it. RE-DERIVED 2026-06-10 (fulcrum2 charter):
 
-    This is the single most important guard in the tool. It makes the
-    seeded-vs-unseeded distinction impossible to confuse.
+    The OLD rule refused on window_seeded>0. That counter (WINDOW_SEEDED_CHUNKS,
+    gzip_chunk.rs:1181) increments for ANY full-32KiB-initial-window decode --
+    which since M3 includes PRODUCTION chunks whose predecessor window the live
+    WindowMap published (chunk_fetcher.rs:2545 materialize path). So the old guard
+    OVER-FIRED on every healthy native/isal production run. window_seeded>0 alone
+    is production-seeded routing, not contamination.
+
+    The ACTUAL contamination signals (each individually sufficient to refuse):
+      1. seed_replay_hits>0 -- the `SEED_WINDOWS replay: hits=` line is printed
+         ONLY when the GZIPPY_SEED_WINDOWS oracle store is active
+         (seed_windows.rs report_seed_stats no-ops off seed). Oracle-seeded
+         windows force the clean engine at boundaries production would have to
+         marker-bootstrap -- the binder-masking this guard exists to catch.
+      2. ISA-L engine chunks on a NATIVE build: isal_chunks>0 is PRODUCTION on
+         gzippy-isal (the clean-tail engine) but oracle-only on gzippy-native
+         (GZIPPY_ISAL_ENGINE_ORACLE). `feature` disambiguates; with feature
+         unknown we stay conservative and refuse, telling the caller to declare.
+
+    `feature`: 'gzippy-native'/'native', 'gzippy-isal'/'isal', or None (unknown).
     """
     if not counters:
-        return (None, "NO COUNTER SIDECAR -- cannot verify window-absent routing. "
+        return (None, "NO COUNTER SIDECAR -- cannot verify production routing. "
                       "Capture with GZIPPY_VERBOSE=1 2> verbose_<label>.txt and pass "
                       "--counters. REFUSING to certify this as a production-routing "
                       "measurement.")
+    feat = (feature or "").replace("gzippy-", "")
+    replay = counters.get("seed_replay_hits", 0)
+    bypass = counters.get("bypass_replay_hits", 0)
+    oracle = max(counters.get("isal_chunks", 0),
+                 counters.get("isal_oracle_chunks", 0))
     seeded = counters.get("window_seeded", 0)
-    oracle = counters.get("isal_oracle_chunks", 0)
     flips = counters.get("flip_to_clean", 0)
     no_flip = counters.get("finished_no_flip", 0)
-    if seeded > 0:
-        return (False, f"SEEDED RUN (window_seeded={seeded}). Seeded chunks route to "
-                       f"the CLEAN engine and MASK the window-absent marker binder. "
-                       f"This measures the clean-engine ceiling, NOT production. Do "
-                       f"NOT read its wall as the production binder.")
-    if oracle > 0:
-        return (False, f"ISA-L ENGINE ORACLE RAN (isal_oracle_chunks={oracle}). This "
-                       f"replaces the per-thread engine and is a CEILING oracle, not "
-                       f"production. Not a production-routing measurement.")
-    # Production = chunks went through the window-absent path (finished_no_flip
-    # dominant, or flips present but no seeding). Confirm the bootstrap actually ran.
-    if no_flip == 0 and flips == 0:
-        return (None, "Neither finished_no_flip nor flip_to_clean fired -- cannot "
-                      "confirm the window-absent bootstrap ran. (The 'oracle silently "
+    seeded_block = counters.get("seeded_block", 0)
+    exact_block = counters.get("exact_block", 0)
+    if replay > 0:
+        return (False, f"ORACLE-SEEDED RUN (SEED_WINDOWS replay hits={replay}). The "
+                       f"seed store forced clean-engine decodes at boundaries "
+                       f"production would marker-bootstrap. This measures the "
+                       f"clean-engine ceiling, NOT production.")
+    if bypass > 0:
+        return (False, f"BYPASS_DECODE REPLAY ACTIVE (hits={bypass}). Pre-computed "
+                       f"decode results replayed — real engine cost masked. "
+                       f"This is a measurement contaminant, NOT production.")
+    if oracle > 0 and feat != "isal":
+        if feat == "native":
+            return (False, f"ISA-L ENGINE ORACLE RAN (isal_chunks={oracle} on a "
+                           f"gzippy-native build -- only GZIPPY_ISAL_ENGINE_ORACLE "
+                           f"reaches that engine there). A CEILING oracle, not "
+                           f"production.")
+        return (False, f"isal_chunks={oracle} with build feature UNDECLARED -- "
+                       f"production on gzippy-isal, an engine oracle on native. "
+                       f"Pass --feature to disambiguate; refusing conservatively.")
+    # Production confirmation: SOME decode-path counter must have fired, else we
+    # cannot rule out the silently-skipped/re-ran-bootstrap instrument class.
+    if no_flip == 0 and flips == 0 and seeded == 0 and seeded_block == 0 \
+            and exact_block == 0:
+        return (None, "No decode-path counter fired (finished_no_flip, flip_to_clean, "
+                      "window_seeded, seeded_block, exact_block all 0) -- cannot "
+                      "confirm the production pipeline ran. (The 'oracle silently "
                       "re-ran/skipped the bootstrap' failure class.) Inconclusive.")
-    return (True, f"PRODUCTION routing confirmed: window_seeded=0, no engine oracle, "
-                  f"window-absent bootstrap ran (finished_no_flip={no_flip}, "
-                  f"flip_to_clean={flips}).")
+    seeded_note = (f"window_seeded={seeded} is PRODUCTION-SEEDED routing "
+                   f"(WindowMap-published predecessor windows, M3+), "
+                   if seeded > 0 else "window_seeded=0, ")
+    isal_note = (f"isal_chunks={oracle} (PRODUCTION clean-tail on gzippy-isal), "
+                 if oracle > 0 else "")
+    return (True, f"PRODUCTION routing confirmed: no SEED_WINDOWS replay, no engine "
+                  f"oracle ({seeded_note}{isal_note}finished_no_flip={no_flip}, "
+                  f"flip_to_clean={flips}, seeded_block={seeded_block}, "
+                  f"exact_block={exact_block}).")
 
 
 def oracle_overhead_guard(counters, trace_self):
@@ -489,8 +548,10 @@ def oracle_overhead_guard(counters, trace_self):
     """
     warns = []
     if counters:
-        fb = counters.get("isal_oracle_fallbacks", 0)
-        oc = counters.get("isal_oracle_chunks", 0)
+        fb = max(counters.get("isal_fallbacks", 0),
+                 counters.get("isal_oracle_fallbacks", 0))
+        oc = max(counters.get("isal_chunks", 0),
+                 counters.get("isal_oracle_chunks", 0))
         if oc > 0 and fb > 0:
             warns.append(f"ORACLE IMPURE: {fb}/{oc+fb} chunks fell back to the real "
                          f"engine -- the oracle did NOT replace 100% of decode; its "
@@ -519,7 +580,7 @@ def fmt(us):
     return f"{us * 1000:.0f}ns"
 
 
-def analyze(trace_path, counter_path=None, declared_T=None):
+def analyze(trace_path, counter_path=None, declared_T=None, feature=None):
     """Build the validated bundle for one trace. Raises InstrumentError on a
     precondition violation; returns a dict bundle otherwise."""
     events = load_events(trace_path)
@@ -553,7 +614,7 @@ def analyze(trace_path, counter_path=None, declared_T=None):
     if counter_path and os.path.exists(counter_path):
         with open(counter_path) as f:
             counters = parse_counters(f.read())
-    is_prod, seed_reason = seeding_guard(counters)
+    is_prod, seed_reason = seeding_guard(counters, feature=feature)
     oracle_warns = oracle_overhead_guard(counters, self_by_name)
 
     # ---- consumer (wall-critical) thread breakdown ----
@@ -819,20 +880,68 @@ def selftest():
     check(all(abs(sb[n][1] - nr[n][1]) < 1e-6 for n in sb),
           "NEGATIVE control: identical run -> zero delta on every stage")
 
-    # --- 6. SEEDING guard: window_seeded>0 => REFUSE (not production) ---
-    is_prod, reason = seeding_guard({"window_seeded": 17, "finished_no_flip": 0})
-    check(is_prod is False and "SEEDED" in reason,
-          "seeding guard REFUSES a window-seeded run (binder-masking caught)")
+    # --- 6. SEEDING guard (RE-DERIVED, fulcrum2 charter): refuse only on ACTUAL
+    #        oracle contamination; production-seeded routing (M3+) is ACCEPTED. ---
+    # 6a. The over-fire fix: window_seeded>0 WITHOUT a seed-replay line is
+    #     production (WindowMap-published predecessor windows) -> ACCEPT.
+    is_prod, reason = seeding_guard({"window_seeded": 17, "finished_no_flip": 4,
+                                     "flip_to_clean": 12, "seeded_block": 16},
+                                    feature="gzippy-native")
+    check(is_prod is True and "PRODUCTION-SEEDED" in reason,
+          "guard ACCEPTS production-seeded run (window_seeded>0, no replay) -- "
+          "the over-fire is fixed")
+    # 6b. The contamination it must STILL catch: GZIPPY_SEED_WINDOWS replay.
+    is_prodb, rb = seeding_guard({"window_seeded": 17, "finished_no_flip": 0,
+                                  "seed_replay_hits": 17})
+    check(is_prodb is False and "ORACLE-SEEDED" in rb,
+          "guard REFUSES an oracle-seeded run (SEED_WINDOWS replay hits>0)")
+    # 6b2. BYPASS_DECODE replay contamination (decode_bypass.rs:628).
+    is_prodb2, rb2 = seeding_guard({"finished_no_flip": 4, "bypass_replay_hits": 12})
+    check(is_prodb2 is False and "BYPASS_DECODE" in rb2,
+          "guard REFUSES BYPASS_DECODE replay run (hits>0, pre-computed results mask engine)")
     is_prod2, _ = seeding_guard({"window_seeded": 0, "finished_no_flip": 16,
                                  "flip_to_clean": 1})
     check(is_prod2 is True,
-          "seeding guard ACCEPTS an unseeded window-absent production run")
-    is_prod3, r3 = seeding_guard({"isal_oracle_chunks": 16})
+          "guard ACCEPTS an unseeded window-absent production run")
+    # 6c. ISA-L engine chunks: oracle on native, PRODUCTION on isal.
+    is_prod3, r3 = seeding_guard({"isal_chunks": 16, "finished_no_flip": 4},
+                                 feature="gzippy-native")
     check(is_prod3 is False and "ORACLE" in r3,
-          "seeding guard REFUSES an ISA-L-engine-oracle run (ceiling, not prod)")
+          "guard REFUSES isal_chunks>0 on a NATIVE build (engine oracle)")
+    is_prod3b, r3b = seeding_guard({"isal_chunks": 16, "finished_no_flip": 4,
+                                    "window_seeded": 12},
+                                   feature="gzippy-isal")
+    check(is_prod3b is True and "PRODUCTION clean-tail" in r3b,
+          "guard ACCEPTS isal_chunks>0 on the ISAL build (production clean-tail)")
+    is_prod3c, _ = seeding_guard({"isal_chunks": 16, "finished_no_flip": 4})
+    check(is_prod3c is False,
+          "guard refuses isal_chunks>0 with feature UNDECLARED (conservative)")
+    # 6d. Legacy synthetic sidecars with the old label still refuse.
+    is_prod3d, _ = seeding_guard({"isal_oracle_chunks": 16}, feature="native")
+    check(is_prod3d is False,
+          "guard still REFUSES legacy isal_oracle_chunks label on native")
     is_prod4, r4 = seeding_guard({})
     check(is_prod4 is None,
-          "seeding guard is INCONCLUSIVE with no counter sidecar (refuses to certify)")
+          "guard is INCONCLUSIVE with no counter sidecar (refuses to certify)")
+    # 6e. No decode-path counter at all -> INCONCLUSIVE (skipped-bootstrap class).
+    is_prod5, _ = seeding_guard({"window_seeded": 0, "finished_no_flip": 0,
+                                 "flip_to_clean": 0})
+    check(is_prod5 is None,
+          "guard INCONCLUSIVE when no decode-path counter fired")
+    # 6f. The real-sidecar label parses: `isal_chunks=` (what the binary emits,
+    #     chunk_fetcher.rs:870) -- the OLD pattern (isal_oracle_chunks=) never
+    #     matched a real sidecar; prove the fixed pattern does, disjointly.
+    parsed = parse_counters(
+        "  Unified decoder: flip_to_clean=12 finished_no_flip=4 finish_decode=16 "
+        "inflate_wrapper=0 window_seeded=2 seeded_block=16 seeded_wrapper=0 "
+        "exact_block=3 exact_wrapper=0 bad_seed_resync=0 resumable_resync_calls=0 "
+        "handoff_window_grows=8\n"
+        "  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks=14 "
+        "isal_fallbacks=0 bfinal_exact_accepted=2 until_exact_fb=0 inexact_fb=0\n")
+    check(parsed.get("isal_chunks") == 14 and parsed.get("window_seeded") == 2
+          and parsed.get("seeded_block") == 16
+          and "isal_oracle_chunks" not in parsed,
+          "parse_counters reads the REAL binary labels (isal_chunks=, seeded_block=)")
 
     # --- 7. ORACLE contamination: fallbacks => impure-blend warning ---
     warns = oracle_overhead_guard({"isal_oracle_chunks": 14, "isal_oracle_fallbacks": 2},
@@ -862,10 +971,20 @@ def selftest():
     _write_json(contam, pc)
     with open(pcc, "w") as f:
         f.write("Unified decoder: flip_to_clean=0 finished_no_flip=0 "
-                "window_seeded=17 bad_seed_resync=0\n")
+                "window_seeded=17 bad_seed_resync=0\n"
+                "SEED_WINDOWS replay: hits=17 misses=0\n")
     bundle = analyze(pc, counter_path=pcc)
     check(bundle["is_production"] is False,
-          "analyze() marks a seeded contaminated run NON-PRODUCTION")
+          "analyze() marks an oracle-seeded contaminated run NON-PRODUCTION")
+    # 9b. BYPASS_DECODE replay contamination also refused by analyze().
+    pcc2 = os.path.join(d, "verbose_contam_bypass.txt")
+    with open(pcc2, "w") as f:
+        f.write("Unified decoder: flip_to_clean=0 finished_no_flip=4 "
+                "window_seeded=0 bad_seed_resync=0\n"
+                "BYPASS_DECODE replay: hits=12 misses=0 (misses fall back to real decode)\n")
+    bundle2 = analyze(pc, counter_path=pcc2)
+    check(bundle2["is_production"] is False,
+          "analyze() marks BYPASS_DECODE replay run NON-PRODUCTION")
 
     # --- 10. end-to-end analyze() on a clean production-shaped trace passes all
     #         assertions and certifies production ---
@@ -918,6 +1037,7 @@ def main():
 
     counters = None
     declared_T = None
+    feature = None
     files = []
     i = 0
     while i < len(argv):
@@ -926,6 +1046,8 @@ def main():
             counters = argv[i + 1]; i += 2; continue
         if a == "--T":
             declared_T = argv[i + 1]; i += 2; continue
+        if a == "--feature":
+            feature = argv[i + 1]; i += 2; continue
         if a.startswith("--"):
             i += 1; continue
         files.append(a); i += 1
@@ -936,7 +1058,8 @@ def main():
         sys.exit(1)
 
     try:
-        bundles = [analyze(files[0], counter_path=counters, declared_T=declared_T)]
+        bundles = [analyze(files[0], counter_path=counters, declared_T=declared_T,
+                           feature=feature)]
         if len(files) >= 2:
             bundles.append(analyze(files[1]))
     except InstrumentError as e:

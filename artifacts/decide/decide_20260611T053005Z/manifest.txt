@@ -1,0 +1,23 @@
+runid=decide_20260611T053005Z
+bin=/root/bin-p35-native
+bin_sha=aed7fd8303348b580917eecbb077622c9c0512e56ce73dc495c99d9b67dd89c4
+feature=gzippy-native
+rg_version=rapidgzip, CLI to the parallelized, indexed, and seekable gzip decoding library rapidgzip version 0.16.0
+freeze_state=frozen
+quiet_state=quiet
+governor=performance
+no_turbo=1
+runnable_avg=1.00
+host_frozen_ack=1
+n=9
+knob_n=21
+do_knobs=1
+knob_cells=silesia:1
+cells=silesia:1
+started=2026-06-11T05:30:19Z
+corpus_silesia_sha=028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f
+corpus_silesia_raw_bytes=211968000
+cell_done=silesia:1:mask=0:sha_ok=1
+knob_done=silesia:1:slab_alloc
+knob_effects=silesia:1
+finished=2026-06-11T05:32:22Z

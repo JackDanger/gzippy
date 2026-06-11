@@ -1,0 +1,52 @@
+[gzippy --verbose] BlockFetcher statistics:
+        Total Existing                : 59
+        Total Fetched                 : 44
+        Prefetched                    : 43
+        Fetched On-demand             : 1
+    Prefetch Stall by BlockFinder     : 0
+    Time spent in:
+        decodeBlock                   : 3.272507 s
+        std::future::get              : 0.035945 s
+        get                           : 0.041756 s
+    Thread Pool Utilization:
+        Total Real Decode Duration    : 0.242765 s
+        Theoretical Optimal Duration  : 0.204532 s
+        Pool Efficiency (Fill Factor) : 84.25 %
+    Prefetch Cache:
+        Hits                          : 41
+        Misses                        : 3
+        Unused Entries                : 0
+    Cache Hit Rate                    : 93.18 %
+    Useless Prefetches                : 0.00 %
+
+  Preemptive stops: 0
+  Time queuing post-processing: 0.000000 s
+  Adjusted chunk size applied: 1
+  Prefetch next-offset filesize-accepts: 2
+  Unsplit blocks emplaced: 32
+  Eager post-process: runs=412 runs_nonempty=9 inspected=6512 submitted=41 max/run=14 reused=1
+  Eager harvest ready: 40
+  Prefetch post-process promoted: 0 harvest-promoted: 0 already-resolved take: 0
+  Unified decoder: flip_to_clean=26 finished_no_flip=19 finish_decode=0 inflate_wrapper=0 window_seeded=1 seeded_block=1 seeded_wrapper=0 exact_block=0 exact_wrapper=0 bad_seed_resync=0 resumable_resync_calls=0 handoff_window_grows=0
+  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks=0 isal_fallbacks=0 bfinal_exact_accepted=0 until_exact_fb=0 inexact_fb=0
+  Max concurrently-live ChunkData (in-flight depth): 36  (live now: 0)
+  Buffer pool u8: hits=0 misses=0 returns=0
+  Buffer pool u16: hits=0 misses=0 returns=0
+  Per-worker buffer pool activity (worker: u8 h/m/r | u16 h/m/r):
+  Bootstrap pool: takes=0 allocs=0 returns=0 dropped=0 reused_MB=0.0 reuse_rate=0.0%
+  Slow-path decode: ok=43 fail=4 no_candidate=0
+  Early window publish: published=44 handoff_key=41 tail_not_clean=0 range_speculative=0
+  BlockFinder coordinator spawns: 43
+  Speculation failure modes: header=38 body=8 inflate=0 stop_missed=0 other=0
+  Speculation phantom-EOS rejects: 1
+  Post-process path: fused_lut=43 small_markers=0
+  Prefetch dispatch: called=124 saturated=67 zero_submitted=33 any_submitted=24 total_submitted=43 pollution_stops=0
+  Body-fail forensics: count=7 wasted_bytes=1828 avg_waste=261B avg_bits_into_body=292
+    by variant: invalid_huffman=8 exceeded_window=0 invalid_compression=0 invalid_code_lengths=0 other=0
+  BlockFinder spawn breakdown: calls=0 total_ms=0.0 scan_ms=0.0 consumer_ms=0.0 avg_total_us=0
+  Bootstrap per-block: header_calls=1819 header_ms=40.2 avg_header_us=22.1 body_ms=2060.5 body_bytes=133068255 body_rate_MB/s=65 clean_flipped_bytes=2837278 (2.1% of body = marker-FREE complement; marker loop owns the other 97.9%)
+  Prefetch guard-rejects: 0
+  Clean decode (pred@key / pred@seed / handoff@stop / boundary@seed / candidate): 0 / 0 / 0 / 0 / 0
+  Worker resolve-ahead: ok=41 / attempts=41
+  Arc::try_unwrap hits/misses: 43 / 0
+  Consumer pair-ready drains: 43

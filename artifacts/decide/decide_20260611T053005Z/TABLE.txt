@@ -1,0 +1,70 @@
+====================================================================================================
+fulcrum decide — ONE-RUN decision table (plans/fulcrum2-charter.md)
+====================================================================================================
+run        : decide_20260611T053005Z  bin=/root/bin-p35-native sha=aed7fd8303348b58 feature=gzippy-native
+box        : freeze=frozen quiet=quiet governor=performance no_turbo=1 runnable_avg=1.00
+rapidgzip  : rapidgzip, CLI to the parallelized, indexed, and seekable gzip decoding library rapidgzip version 0.16.0
+sha-verify : every measured run checked against the corpus pin (guest aborts on mismatch); cells_done=1
+
+-- CELL SCOREBOARD (wall, interleaved, sha-verified; bar = 0.99x EVERY T) --
+  silesia:T1    gz= 1402.5ms rg=  923.6ms ratio=0.659 FAIL RESOLVED spread gz=1.0%/rg=1.5%
+
+-- RANKED COMPONENTS (tier 1 causal-COSTS > tier 2 hypotheses > tier 3 confirms > tier 4 null) --
+
+[ 1] knob.slab_alloc (slab allocator (opt-in; the reverted lever))   cells: silesia:T1
+     attribution : Δ(alt-base)=-99.9ms @ canonical mask
+     status      : CAUSAL-VERIFIED: shipped default COSTS 99.9ms ±31.8 here (alt arm faster) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]
+     distribution: base[n=21 spread=0.8%] knob[n=21 spread=2.3%] RESOLVED
+     re-verify   : scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs slab_alloc --knob-n 21 --bin /root/bin-p35-native
+
+[ 2] pipeline.consumer.compute   cells: silesia:T1
+     attribution : worst silesia:T1: 1279.1ms (93% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_silesia_T1/trace.json --feature gzippy-native
+
+[ 3] engine.backref   cells: silesia:T1
+     attribution : 60.6% of classed cyc, 63.3 cyc/iter, iters=17,971,348
+     status      : HYPOTHESIS: bounded ≤290ms ESTIMATE (= cell rg-gap 479ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[ 4] engine.litchn   cells: silesia:T1
+     attribution : 22.1% of classed cyc, 65.8 cyc/iter, iters=6,319,731
+     status      : HYPOTHESIS: bounded ≤106ms ESTIMATE (= cell rg-gap 479ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[ 5] pipeline.consumer.output   cells: silesia:T1
+     attribution : worst silesia:T1: 98.6ms (7% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: GZIPPY_SKIP_WRITEV_SYSCALL=1 A/B (output-stage removal probe)
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_silesia_T1/trace.json --feature gzippy-native
+
+[ 6] engine.lit1   cells: silesia:T1
+     attribution : 12.3% of classed cyc, 69.8 cyc/iter, iters=3,303,758
+     status      : HYPOTHESIS: bounded ≤59ms ESTIMATE (= cell rg-gap 479ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[ 7] engine.litpack   cells: silesia:T1
+     attribution : 5.0% of classed cyc, 76.9 cyc/iter, iters=1,227,631
+     status      : HYPOTHESIS: bounded ≤24ms ESTIMATE (= cell rg-gap 479ms × class share; a partition, not a promise). Perturb: GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, slow_knob.rs)
+     distribution: prof=1-shot counters (unfrozen-counters label)
+     re-verify   : GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> /root/bin-p35-native -d -c -p 1 /root/silesia.gz >/dev/null
+
+[ 8] pipeline.consumer.wait   cells: silesia:T1
+     attribution : worst silesia:T1: 0.1ms (0% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: worker-side lever — perturb the ENGINE (slow_knob) and watch this wait shrink/grow; the wait itself is not the cause
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_silesia_T1/trace.json --feature gzippy-native
+
+[ 9] pipeline.consumer.idle   cells: silesia:T1
+     attribution : worst silesia:T1: 0.0ms (0% of wall-critical span)
+     status      : HYPOTHESIS (attribution only — NOT causal). Perturb: scheduling-state probe: N=21 re-measure (bimodal check) before anything
+     distribution: trace=1-shot (unfrozen-counters label)
+     re-verify   : python3 scripts/fulcrum_total.py <artdir>/cell_silesia_T1/trace.json --feature gzippy-native
+
+====================================================================================================
+DO THIS NEXT: knob.slab_alloc (slab allocator (opt-in; the reverted lever)) on silesia:T1 — the shipped default measurably COSTS wall (shipped default COSTS 99.9ms ±31.8 here (alt arm faster) [no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)]). Re-verify at N=21 then fix/condition the feature: scripts/bench/decide.sh --cells silesia:1 --knob-cells silesia:1 --knobs slab_alloc --knob-n 21 --bin /root/bin-p35-native
+====================================================================================================

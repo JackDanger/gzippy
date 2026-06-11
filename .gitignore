@@ -44,3 +44,14 @@ __pycache__/
 
 # GPG private key — export to 1Password, never commit
 gzippy-apt-signing-key.asc
+
+# Fulcrum decide artifacts: raw trace JSON files are regenerable; exclude to keep
+# the repo lean. Keep TABLE.txt/manifest/wall_*/verbose/prof/effect_* artifacts.
+artifacts/decide/**/*.json
+# fulcrum decide run artifacts: keep only small text evidence; traces/sinks regenerable
+artifacts/decide/**/*.bin
+artifacts/decide/**/trace.json
+artifacts/decide/decide_*/
+!artifacts/decide/decide_20260611T052041Z/
+!artifacts/decide/decide_20260611T052041Z/**/
+!artifacts/decide/decide_20260611T052041Z/**/*.txt

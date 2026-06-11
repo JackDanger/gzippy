@@ -1,0 +1,6 @@
+knob=stored_flip
+env=GZIPPY_NO_STORED_FLIP=1
+pred=none
+cell=silesia:1
+mask=0
+sha_ok=1

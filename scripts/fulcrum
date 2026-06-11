@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# fulcrum — the campaign's instrument front door.
+#
+#   fulcrum decide [args]     ONE-RUN decision table on the bench box
+#                             (scripts/bench/decide.sh; see plans/fulcrum2-charter.md)
+#   fulcrum analyze <dir>     re-render the table from a pulled artifact dir
+#   fulcrum total <trace...>  the validated whole-system trace analyzer
+#   fulcrum selftest          run BOTH analyzers' self-tests (must pass before
+#                             any number from this tool is trusted)
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  decide)   exec "$HERE/bench/decide.sh" "$@";;
+  analyze)  exec python3 "$HERE/fulcrum_decide.py" "$@";;
+  total)    exec python3 "$HERE/fulcrum_total.py" "$@";;
+  selftest)
+    python3 "$HERE/fulcrum_total.py" --selftest
+    python3 "$HERE/fulcrum_decide.py" --selftest
+    ;;
+  *) sed -n '2,10p' "${BASH_SOURCE[0]}";;
+esac
