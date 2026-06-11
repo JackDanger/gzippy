@@ -5,9 +5,13 @@
 # Output is plain text; every line prefixed for machine grep.
 set -u
 
-NEW="${NEW:-/root/bin-slabrec-native}"
+NEW="${NEW:-/root/bin-slabrec2-native}"
 BASE="${BASE:-/root/bin-f2-native}"
 RUNS="${RUNS:-3}"
+# iter-2 spec cells: {silesia, model} x T{1,8,16}. T1 may rise modestly
+# (criterion <= +15%: the single retained chunk block ~ working set);
+# T8/T16 delta must be ~0 (gate off by construction at T > 2).
+CELLS="${CELLS:-silesia:1 silesia:8 silesia:16 model:1 model:8 model:16}"
 
 pin_mask() {
   case "$1" in
@@ -31,7 +35,7 @@ run_rss() { # <bin> <corpus> <T> -> "secs rss_mb"
 }
 
 echo "== RSS GRID (unfrozen, x${RUNS}, canonical masks) new=$NEW base=$BASE =="
-for cell in silesia:1 silesia:4 silesia:8 silesia:16 model:8; do
+for cell in $CELLS; do
   c="${cell%%:*}"; t="${cell##*:}"
   for ((i=1;i<=RUNS;i++)); do
     read -r bs brss < <(run_rss "$BASE" "$c" "$t")
