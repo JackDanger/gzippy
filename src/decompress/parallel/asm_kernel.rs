@@ -249,9 +249,31 @@ mod imp {
     pub static KERN_RECLASS_MULTI_TRAIL: AtomicU64 = AtomicU64::new(0);
     pub static KERN_RECLASS_DIST: AtomicU64 = AtomicU64::new(0);
 
+    /// Flip-precondition 3 (the permanent ON-vs-OFF fuzz net): in-process
+    /// dispatch override. The env kill-switch is a process-wide OnceLock
+    /// read, so a same-binary ON/OFF differential cannot toggle it; the
+    /// fuzz test toggles HERE instead. 0 = no override (production
+    /// semantics), 1 = force-disabled, 2 = force-enabled (still requires
+    /// BMI2 — the asm cannot execute without it). Compiled ONLY into the
+    /// lib test harness (`cfg(test)`); production binaries carry no trace.
+    #[cfg(test)]
+    pub static TEST_FORCE: AtomicU64 = AtomicU64::new(0);
+    /// Engagement counter for the fuzz net (cfg(test) only): incremented at
+    /// every `run_contig` entry, independent of `GZIPPY_ASM_STATS`, so the
+    /// ON arm can PROVE the asm actually executed (effect-verified, not
+    /// assumed) and the OFF arm can prove it did not.
+    #[cfg(test)]
+    pub static TEST_RUN_CONTIG_CALLS: AtomicU64 = AtomicU64::new(0);
+
     /// Runtime dispatch: ON when compiled in, unless `GZIPPY_ASM_KERNEL=0`
     /// (kill-switch) or the CPU lacks BMI2 (`shrx`/`shlx`/`bzhi`).
     pub fn enabled() -> bool {
+        #[cfg(test)]
+        match TEST_FORCE.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return std::arch::is_x86_feature_detected!("bmi2"),
+            _ => {}
+        }
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
             let killed = std::env::var("GZIPPY_ASM_KERNEL").is_ok_and(|v| v == "0");
@@ -330,6 +352,8 @@ mod imp {
     /// amortized by the in-asm back-edge.
     #[inline(never)]
     pub unsafe fn run_contig(ctx: &mut KernCtx, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
+        #[cfg(test)]
+        TEST_RUN_CONTIG_CALLS.fetch_add(1, Ordering::Relaxed);
         let mut bitbuf = lb.bitbuf;
         let mut bitsleft: u64 = lb.bitsleft as u64;
         let mut pos: u64 = lb.pos as u64;
@@ -822,6 +846,8 @@ mod imp {
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 pub use imp::{dump_if_enabled, enabled, note_exit, run_contig, stats_enabled};
+#[cfg(all(test, feature = "asm-kernel", target_arch = "x86_64"))]
+pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
 
 /// Non-asm builds: constant-false dispatch, no-op dump — call sites fold away.
 #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
