@@ -1,3 +1,18 @@
+## LOCALIZATION SPLIT BANKED — DECODE ~= STORE, both critical; whole-loop profile [2026-06-11]
+Frozen 9-arm T1 silesia (sleep controls survived both knobs; Rules 1+2 satisfied; super-linear
+slopes noted as cache-pressure compounding): STORE +526ms / DECODE +576ms at N=50 spin
+(DECODE/STORE=1.095, ~8x noise but small). NEITHER sub-region dominates => the T1 symbol-rate gap
+is WHOLE-LOOP, not concentrated — the profile where per-arm micro-fixes exhaust and the funded
+campaign's remaining levers are: (a) the pre-registered REMOVAL ORACLES to size each ceiling
+(emit_backref_contig prefilled for STORE; zero-decode oracle for DECODE — build both, the larger
+ceiling = the lever); (b) the whole-loop asm rewrite decision with those ceilings as the data.
+Knob calibration note: NS_PER_SPIN_ITER=0.32ns is arm64-calibrated; x86@1.4GHz actual ~1.05ns
+(sleep/spin 0.51-0.62 explained); sleep signal unambiguous regardless. contig_prof cycle-shares
+(backref 62.6%) do NOT translate to wall share — the perturbation is the load-bearing number
+(another attribution!=wall lesson, instrument-confirmed).
+QUEUE: removal oracles (next); oracle.sh env-dup fix; isal model/bignasa cells (the isal-side
+band: ratio-reserve land helped, ISA-L-path levers unexplored since); Squishy full-matrix re-run
+on current HEADs (the standing bar evidence refresh).
 ## BACKREF PERTURBATION (tool-queued action 2) — engine ON critical path; localization knobs found [2026-06-11]
 Frozen 4-arm T1 silesia: sleep-control injection +0.678s (+53.6%, 100x noise) => the clean decode
 loop IS the T1 critical path (Rule 1+2 satisfied; spin artifact confirmed sleep/spin=0.71 —
