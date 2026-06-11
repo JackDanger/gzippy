@@ -2503,6 +2503,20 @@ impl Block {
             // completed iteration recorded in `prof_pending`.
             let mut prof_last_t: u64 = super::contig_prof::rdtsc(prof_on);
             let mut prof_pending: usize = super::contig_prof::CLASS_NONE;
+            // ── TWO LOOP VARIANTS (flip-precondition 4, campaign §9 gate) ──
+            // The fast loop is instantiated twice from one macro source:
+            // the `false` instantiation const-folds the asm dispatch away
+            // (`if false && asm_on` is statically dead), so a binary built
+            // WITH the asm-kernel feature but dispatch-disabled (kill-switch
+            // / no BMI2 / knobs) runs a loop with ZERO asm-related code in
+            // its body — the c3 OFF-vs-base ~+44 ms layout tax was the
+            // per-iteration dispatch test + asm_ctx liveness in the shared
+            // loop. The variant is selected ONCE per region run, before the
+            // loop; the `true` variant keeps the runtime `asm_on` test so
+            // an EXIT_BOUNDARY can still hand the tail to the Rust arms
+            // (identical to the pre-split behavior).
+            macro_rules! fast_loop_run {
+                ($use_asm:literal) => {
             'fast: loop {
                 if prof_on {
                     let t = super::contig_prof::rdtsc(true);
@@ -2519,7 +2533,7 @@ impl Block {
                 // `continue 'fast`. `prof_on` true ⇒ `asm_on` false, so the
                 // profiler block above never brackets asm iterations.
                 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-                if asm_on {
+                if $use_asm && asm_on {
                     // SAFETY: contract E1-E6 hold here — this IS the Rust
                     // loop's iteration top (fresh un-consumed packet, clean
                     // bitsleft, lockstep cursors, validated tables, knobs
@@ -2897,6 +2911,19 @@ impl Block {
                 pre = self.lut_litlen.decode_prefilled(&lb);
                 super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
+                };
+            }
+            // Variant selection — once per region run (see macro doc above).
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            {
+                if asm_on {
+                    fast_loop_run!(true);
+                } else {
+                    fast_loop_run!(false);
+                }
+            }
+            #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
+            fast_loop_run!(false);
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
             // a fresh un-consumed `pre`), so the bit cursor sits exactly before
             // `pre`'s bits. The careful loop below re-decodes from here — no state
