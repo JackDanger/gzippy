@@ -142,6 +142,36 @@ binaries are pinned by their bin_sha prefix as reported in each provenance block
   levers before (the combine_crc "62ms serial CRC" nested-span double-count). NEVER
   present a fulcrum attribution AS a verdict (charter rule; Steward refuses to bank it).
 
+## 5b. fulcrum decide — scripts/fulcrum + bench/decide.sh + bench/_decide_guest.sh + fulcrum_decide.py (2026-06-11)
+- ROLE: ONE-RUN ranked decision table (plans/fulcrum2-charter.md): per-cell
+  interleaved sha-verified walls (canonical masks), trace+contig_prof captures, and
+  the in-tree kill-switch knob A/Bs (same-binary, env-only) with effect-verification
+  predicates; distribution health (largest-gap bimodality, RESOLVED/UNRESOLVED +
+  N-needed); UNFROZEN refusal; per-row re-verify command; DO-THIS-NEXT line.
+- GUEST PRIMITIVES: VERBATIM copies of the hash-pinned _parity_guest.sh functions
+  (lib_decide_guest.sh, provenance markers per function). ANY edit to the spine's
+  primitives must be mirrored there or THIS row reverts to UNVALIDATED.
+- GUARD CHANGE (fulcrum_total.py, charter-derived): seeding guard refuses only
+  ACTUAL oracle contamination (SEED_WINDOWS replay hits>0; isal_chunks>0 on a
+  native build; legacy oracle labels). window_seeded>0 alone = production-seeded
+  routing (M3+) and is ACCEPTED. Also fixes the isal_oracle_chunks= pattern bug
+  (binary emits isal_chunks=, chunk_fetcher.rs:870).
+- GREP/ASSERT TARGETS: `path=`/ParallelSM (row 1); `seeded_block=`/`exact_block=`
+  (chunk_fetcher.rs:859 verbose line); `disttbl: builds=`/`reuses=`
+  (contig_prof.rs:261-265, knob arm DEAD by design — marker_inflate.rs:2262/2266
+  count only the amortized arm); `SEED_WINDOWS replay: hits=` (seed_windows.rs:311).
+- VALIDATION STATUS: **VALIDATED 2026-06-11** — fulcrum_total --selftest (all
+  retained + new guard matrix) and fulcrum_decide --selftest (33 asserts incl.
+  known-null-knob => CAUSAL-NULL) pass; end-to-end run decide_20260611T052041Z
+  (frozen, quiet, sha 16/16 cells+knobs) + independent N=21 re-verify
+  decide_20260611T053005Z reproduced the tier-1 finding (slab_alloc T1
+  -103.2/-99.9ms). Knob A/B deltas are CAUSAL for the knob-covered component only;
+  HYPOTHESIS rows remain hypothesis generators (charter rule).
+- CONFOUNDS: contig_prof cyc/iter is TSC-rate-bound — NOT comparable across
+  clock states (the banked 34.9 cyc/iter vs frozen 65.6 reconciliation; shares ARE
+  comparable). Knob deltas at knob-n<21 carry min-of-N bias; the re-verify command
+  on each row prescribes N=21.
+
 ## 6. The gate falsifier docs (provenance, not an instrument)
 - plans/low-t-gate-falsifier.md — pre-registered BEFORE measuring (rule 5); binding
   criteria F-ENGINE-CLOSABLE / F-NON-ENGINE / BLOCKED; measured table matches the
