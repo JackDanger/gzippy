@@ -67,6 +67,13 @@ mf "protocol=fulcrum-v3"
 mf "sink_gz=regular-file"
 mf "sink_rg=regular-file"
 mf "rg_version=$("$RG_CMD" --version 2>&1 | head -1 | tr -d '\n')"
+# ---- host identity (fingerprint `host` field: cpu|kernel|id; DERIVED, never
+# self-reported). The host id is the machine-id HASHED (stable, non-reversible);
+# cross-host comparisons refuse — same binary on a different box is a
+# different experiment.
+mf "host_cpu_model=$(awk -F': *' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+mf "host_kernel=$(uname -r 2>/dev/null || true)"
+mf "host_id=$( (cat /etc/machine-id 2>/dev/null || hostname) | sha256sum | cut -c1-12 )"
 mf "freeze_state=$FREEZE_STATE"
 mf "quiet_state=$QUIET_STATE"
 mf "governor=$ACT_GOV"

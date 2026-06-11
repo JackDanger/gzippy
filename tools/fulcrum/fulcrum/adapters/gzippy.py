@@ -250,6 +250,20 @@ class GzippyAdapter(ProjectAdapter):
                  "before anything"),
     }
 
+    # ---- comparator identity --------------------------------------------------
+    def comparator_version(self, manifest):
+        """Normalize the rapidgzip --version banner recorded by the guest
+        (`rg_version=`). Handles both the full banner ("rapidgzip, CLI to
+        the ... library rapidgzip version 0.16.0") and the short
+        "rapidgzip 0.16.0" form. Unknown stays unknown (never compares)."""
+        raw = (manifest.get("rg_version") or "").strip()
+        if not raw:
+            return "unknown"
+        m = re.search(r"(\d+\.\d+(?:\.\d+)*)\s*$", raw)
+        if m:
+            return f"rapidgzip {m.group(1)}"
+        return raw  # unrecognized shape: keep verbatim (still a known value)
+
     # ---- counters / guards --------------------------------------------------
     def parse_counters(self, text):
         out = {}

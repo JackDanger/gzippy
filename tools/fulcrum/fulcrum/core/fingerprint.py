@@ -10,16 +10,23 @@ Scars:
     captures (frozen no_turbo vs the bank's capture), not a code change.
 
 Every stored number carries a Fingerprint: {sink, mask, freeze, binary sha,
-corpus sha, protocol version}. Two numbers may form a ratio/delta ONLY if their
-fingerprints are compatible. An unknown field is never compatible with
-anything (unknown != unknown): refusing a comparison is cheap; un-publishing a
-phantom is not.
+corpus sha, protocol version, comparator version, host identity}. Two numbers
+may form a ratio/delta ONLY if their fingerprints are compatible. An unknown
+field is never compatible with anything (unknown != unknown): refusing a
+comparison is cheap; un-publishing a phantom is not.
+
+comparator: the comparator tool's identity+version (a comparator upgrade
+moves ITS numbers — a ratio against a different comparator version is a
+different experiment). host: cpu model + kernel + a stable host id (the same
+binary on a different box is a different experiment; cross-host "drift" is
+topology, not regression).
 """
 
 from dataclasses import asdict, dataclass
 
 # Fields that must MATCH (and be known) for two measurements to be comparable.
-COMPARE_FIELDS = ("sink", "mask", "freeze", "corpus_sha", "protocol")
+COMPARE_FIELDS = ("sink", "mask", "freeze", "corpus_sha", "protocol",
+                  "comparator", "host")
 
 
 @dataclass(frozen=True)
@@ -31,6 +38,11 @@ class Fingerprint:
     corpus_sha: str = "unknown"  # corpus content pin (decompressed sha256)
     # measurement-protocol version (fulcrum.PROTOCOL_VERSION)
     protocol: str = "unknown"
+    # comparator tool version, normalized (e.g. "rapidgzip 0.16.0") — the
+    # adapter supplies a comparator_version() probe.
+    comparator: str = "unknown"
+    # host identity: "cpu-model|kernel|host-id" (derived on the box).
+    host: str = "unknown"
 
     def is_complete(self):
         return all(getattr(self, f) != "unknown" for f in COMPARE_FIELDS)
