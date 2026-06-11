@@ -400,3 +400,82 @@ whole per-symbol chain (litlen gather → consume → branch tree → dist decod
   `test_inflate_byte_by_byte` once its silesia fixture is present; NOT a
   rung-(c) regression).
 - Binaries staged: /root/bin-asmc-native (`825378b3`), /root/bin-asmc-base.
+
+---
+
+## 10. FLIP PRECONDITIONS LANDED + DEFAULT FLIP (2026-06-11, branch engine/asm-default-flip)
+
+The §9 gate mandated four preconditions before the default could flip. All
+four landed as separate commits and were verified REAL on the frozen guest
+(BMI2); the flip itself is the fifth commit on this branch.
+
+### Precondition 1 — consume off-by-one positive control (`a3fdb5ac`)
+`run_contig_ref_biased::<CONSUME_BIAS>`: const-generic bias on the
+lone-literal litlen consume — the ref-side mirror of corrupting the asm's
+`shrx`/`sub bitsleft` pair (the harness compares cursors field-for-field, so
+an off-by-one on either side is the same inequality; no 450-line asm
+duplicate needed). Guest verdict: cursor asserts fired in **1484/2000**
+trials with BIAS=1 (every trial that consumes a lone literal before exit;
+~22% legitimately exit first); the BIAS=0 arm on the same inputs is
+divergence-free on every compared field. The consume failure class — the one
+the three c3 controls (lit store, dist base shift, multi advance) did not
+cover — now has a permanent liveness proof.
+
+### Precondition 2 — `25:`-arm coverage floor (`c502e1be`)
+`RefArmStats` counts the multi-literal+trailing-LENGTH arm in the reference
+model: `multi_trail` (past the EOB/oversize gates = the asm `25:` X2-spill
+point) and `multi_trail_completed` (the `25:`→`58:`→copy success route).
+Ref counts are a valid proxy under the equality asserts (any asm misroute
+diverges first); completions never cross the seam so they are countable only
+ref-side (KERN_RECLASS_MULTI_TRAIL tags only bails). Guest counts (==
+local, deterministic): lenny×small completes **7,735**; bails 373
+(lenny×fixed5 344 + lenny×sub 29). Floors asserted at ~25%: completions
+>= 2,000, bails >= 90 — a refactor that silently starves the dominant arm
+now fails the differential.
+
+### Precondition 3 — permanent asm-ON/OFF random-gzip fuzz net (`4b66ebbd`)
+`asm_kernel_on_off_fuzz_random_gzip_members`: 96 seeded members, payloads
+1 KiB–128 KiB of mixed segments (uniform random / skewed random / text /
+RLE / self-copies / zeros) × gzip levels {0 stored, 1, 6, 9} × occasional
+mid-stream sync flushes; every member validity-checked by a flate2
+round-trip, then its DEFLATE body decoded twice through the production
+contig-clean path — kernel force-ON vs force-OFF (same binary; cfg(test)
+`TEST_FORCE` override stands in for the process-wide `GZIPPY_ASM_KERNEL`
+OnceLock) — asserting byte equality, payload equality, and final
+(pos, bitbuf, bitsleft) equality. Engagement effect-verified
+(`TEST_RUN_CONTIG_CALLS`): guest run **96/96 members equal, 4,546
+run_contig calls across 75 Huffman members**. Skips without BMI2 (local
+Rosetta); production binaries carry no trace of the hooks.
+
+### Precondition 4 — the +44 ms OFF-arm tax (`c7ba9578`)
+Mechanism fixed by the gate's own suggestion: the fast loop is ONE macro
+source (`fast_loop_run!`) instantiated TWICE; the `false` instantiation's
+dispatch is `if false && asm_on` — const-folded away — so the disabled arm
+runs a loop with zero asm-related code in its body. Variant selected once
+per region run. Frozen guest re-measure (bench-lock, no_turbo=1,
+interleaved on/off/base):
+- **T1 silesia n=11: ON 940 / OFF 1182 / base 1170 — OFF-vs-base +12 ms
+  (+1.0%)**, down from c3's ~+44 ms; ON -19.7% vs base (the rung-(c) win
+  carries through the restructure; effect counters byte-identical to §9:
+  entries 24,128, asm_bytes 211,602,230).
+- **model T8 n=9: OFF 643 ≈ base 645 — TIE** (the tax is gone where it was
+  +6 ms-class in §9).
+- The residual +12 ms is NOT loop code: objdump of the symbol build shows
+  exactly ONE `run_contig` call site in the whole contig function (the true
+  variant's), and per-call dispatch costs are bounded ≤ ~2 ms by the
+  24,128 calls. It is cross-binary code layout of the doubled function
+  body — the campaign's documented layout-phantom class (cf. §8's ±16 ms
+  cross-binary band), irreducible without outlining/PGO. Documented as
+  irreducible per the gate's alternative; the BMI2-ubiquity argument
+  applies: post-flip the disabled arm exists only under the
+  GZIPPY_ASM_KERNEL=0 measurement control or on pre-2013 (pre-Haswell)
+  x86 hardware.
+
+### The flip (this commit)
+`pure-rust-inflate = ["rpmalloc-caches", "asm-kernel"]` — every production
+decode build (gzippy-native, gzippy-isal, release/ship/bench) now compiles
+the kernel; runtime dispatch unchanged (BMI2 detect + GZIPPY_ASM_KERNEL=0
+kill-switch + knob exclusion + the pure-Rust loop always compiled and the
+sole path elsewhere). Non-x86_64 builds bit-for-bit unaffected (call sites
+compile-gated). Gauntlet + frozen 3-way (rg / asm-off base / flipped
+build): recorded below after the re-measure.

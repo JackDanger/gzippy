@@ -2515,6 +2515,21 @@ impl Block {
             // loop; the `true` variant keeps the runtime `asm_on` test so
             // an EXIT_BOUNDARY can still hand the tail to the Rust arms
             // (identical to the pre-split behavior).
+            //
+            // MEASURED VERDICT (frozen guest, §10): the split cuts the
+            // disabled-arm tax 44 → 12 ms (1.0%) on T1 silesia and to a
+            // TIE on model T8 (643 vs 645 ms). The residual is NOT in the
+            // loop: the false variant's body contains zero asm code
+            // (objdump: exactly ONE run_contig call site in this whole
+            // function — the true variant's), and the per-call costs
+            // (enabled() + dispatch_allowed + KernCtx init) are bounded
+            // ≤ ~2 ms by the 24,128 region calls. What remains is
+            // cross-binary code layout of the doubled function body —
+            // the campaign's documented layout-phantom class, irreducible
+            // here without outlining/PGO. Production-irrelevant post-flip:
+            // the disabled arm exists only under the GZIPPY_ASM_KERNEL=0
+            // measurement control or on pre-BMI2 x86 (pre-2013 Haswell
+            // class).
             macro_rules! fast_loop_run {
                 ($use_asm:literal) => {
             'fast: loop {
