@@ -55,20 +55,28 @@ assert_regular_sink() { # <path>
   [ -f "$p" ] && [ ! -L "$p" ] && [ ! -p "$p" ] || decide_fail "sink-not-regular-file:$p (symlink/FIFO — pipe-phantom risk)" 14
 }
 
-# VERBATIM-FROM _parity_guest.sh:289-301 (timed run -> "secs sha"), parameterized:
-# the mask is an argument instead of the $MASK global (decide runs multiple cells).
-timed_masked() { # <mask> <sink> <cmd...> -> echoes "secs sha"
+# EXTENDED-FROM _parity_guest.sh:289-301 (timed run -> "secs sha rss_mb").
+# Extension over the spine: wraps the command in /usr/bin/time -f '%M' -o <tmp>
+# to capture peak RSS (kilobytes, converted to MB) WITHOUT mixing it into the
+# command's own stderr (the -o flag writes the time stats to a file, not stderr).
+# Callers that only read "secs sha" via `read -r sec sha` safely ignore the
+# third field. Knob callers read the third field as rss_mb for meta.txt rendering.
+timed_masked() { # <mask> <sink> <cmd...> -> echoes "secs sha rss_mb"
   local mask="$1" sink="$2"; shift 2
-  local s e secs sha rc
+  local s e secs sha rc rss_mb=0 _tfile
+  _tfile=$(mktemp /tmp/.decide_rss_XXXXXX)
   s=$(date +%s.%N)
   set +e
-  taskset -c "$mask" "$@" >"$sink" 2>>"$ARTDIR/run.stderr"; rc=$?
+  /usr/bin/time -f '%M' -o "$_tfile" taskset -c "$mask" "$@" >"$sink" 2>>"$ARTDIR/run.stderr"
+  rc=$?
   set -e 2>/dev/null || true
   e=$(date +%s.%N)
   secs=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.4f", b-a}')
   sha=$(sha256sum "$sink" | cut -d' ' -f1)
+  rss_mb=$(awk 'NR==1 && $1~/^[0-9]+$/{printf "%.0f", $1/1024}' "$_tfile" 2>/dev/null || echo 0)
+  rm -f "$_tfile"
   [ "$rc" -eq 0 ] || echo "## WARN exit=$rc: $*" >&2
-  echo "$secs $sha"
+  echo "$secs $sha $rss_mb"
 }
 
 # VERBATIM-FROM _parity_guest.sh:326-332 (min/med/spread% over a sample string).

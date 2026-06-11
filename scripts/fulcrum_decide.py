@@ -105,9 +105,12 @@ def bimodal(xs, k=BIMODAL_K):
     if not others:
         return False
     med_other = others[len(others) // 2]
-    if med_other <= 0:
-        return g > 0  # degenerate: all other samples identical
     left, right = i + 1, len(s) - (i + 1)
+    if med_other <= 0:
+        # Degenerate: all other gaps are zero (all other samples identical).
+        # Still require both sides have >=2 samples — a single-sample "mode"
+        # is not bimodal (repro: [1,1,1,1,1.01] left=4 right=1 => False).
+        return g > 0 and left >= 2 and right >= 2
     return g > k * med_other and left >= 2 and right >= 2
 
 
@@ -196,6 +199,28 @@ def effect_check(pred, base_txt, knob_txt):
                           f"dead (P3.4 path bypassed — switch effective)")
         return (False, f"knob arm still on the amortized path (builds={kb} "
                        f"reuses={kr}) — switch INEFFECTIVE")
+    if pred == "rpmalloc_stats":
+        # rpmalloc_alloc.rs:523 prints:
+        #   "[rpmalloc {tag}] mapped_peak=XM mapped_total=YM ..."
+        # ONLY when GZIPPY_RPMALLOC_STATS is set AND the arena-allocator feature
+        # is active. The effect capture for slab_alloc sets GZIPPY_RPMALLOC_STATS=1
+        # in both arms; GZIPPY_SLAB_ALLOC=1 (knob arm) activates the slab which
+        # uses rpmalloc. EFFECT-VERIFIED iff: knob arm HAS the stats line (slab
+        # engaged) AND base arm does NOT (slab disabled by default).
+        has_base = bool(re.search(r"\[rpmalloc ", base_txt))
+        has_knob = bool(re.search(r"\[rpmalloc ", knob_txt))
+        if not has_knob:
+            return (False,
+                    "no [rpmalloc] stats line in knob arm — GZIPPY_RPMALLOC_STATS "
+                    "not set in effect capture, or arena-allocator feature not built")
+        if has_base:
+            return (False,
+                    "rpmalloc stats line ALSO present in base arm — switch not "
+                    "exclusive (slab may be default-on in this build)")
+        m = re.search(r"\[rpmalloc[^\]]*\] mapped_peak=([\d.]+)M", knob_txt)
+        mp = m.group(1) if m else "?"
+        return (True, f"knob arm: rpmalloc stats present (mapped_peak={mp}M, slab "
+                      f"engaged); absent in base arm — switch effective")
     return (False, f"unknown predicate '{pred}'")
 
 
@@ -363,7 +388,7 @@ KNOB_ENV = {
                     "M4 until-exact on Block"),
     "hit_drive": ("GZIPPY_NO_HIT_DRIVE=1", "none",
                   "confirmed-offset hit-drive prefetch"),
-    "slab_alloc": ("GZIPPY_SLAB_ALLOC=1", "none",
+    "slab_alloc": ("GZIPPY_SLAB_ALLOC=1", "rpmalloc_stats",
                    "slab allocator (opt-in; the reverted lever)"),
     "eager_postproc": ("GZIPPY_EAGER_POSTPROC=1", "none",
                        "eager consumer post-processing (opt-in)"),
@@ -490,14 +515,15 @@ def analyze_run(run, allow_thaw=False, feature=None):
                 d, mg = v["delta_ms"], v["margin_ms"]
                 if v["status"] == "CAUSAL-VERIFIED-COSTS":
                     status = (f"CAUSAL-VERIFIED: shipped default COSTS "
-                              f"{-d:.1f}ms ±{mg:.1f} here (alt arm faster)")
+                              f"{-d:.1f}ms max-arm-spread={mg:.1f}ms here (alt arm faster)")
                     tier, rank = 1, -d
                 elif v["status"] == "CAUSAL-VERIFIED-PAYS":
-                    status = (f"CAUSAL-VERIFIED: feature PAYS {d:.1f}ms ±{mg:.1f} "
-                              f"(disabling it loses)")
+                    status = (f"CAUSAL-VERIFIED: feature PAYS {d:.1f}ms "
+                              f"max-arm-spread={mg:.1f}ms (disabling it loses)")
                     tier, rank = 3, d
                 else:
-                    status = f"CAUSAL-NULL: |Δ|={abs(d):.1f}ms ≤ spread {mg:.1f}ms (bounded)"
+                    status = (f"CAUSAL-NULL: |Δ|={abs(d):.1f}ms ≤ "
+                              f"max-arm-spread={mg:.1f}ms (bounded)")
                     tier, rank = 4, abs(d)
                 if ev is None:
                     status += f" [{enote}]"
@@ -507,12 +533,28 @@ def analyze_run(run, allow_thaw=False, feature=None):
                     f"knob[{dist_health_str(kdata['knob'])}] "
                     f"{v.get('resolution','')}"
                     + (f"(N->{v['n_needed']})" if v.get("n_needed") else ""))
+            # RSS per arm from meta.txt (written by timed_masked RSS extension).
+            meta = kdata.get("meta", {})
+            rss_base = meta.get("rss_base_mb", "")
+            rss_knob = meta.get("rss_knob_mb", "")
+            if rss_base and rss_knob:
+                try:
+                    rb_f, rk_f = float(rss_base), float(rss_knob)
+                    pct = (rk_f - rb_f) / rb_f * 100 if rb_f else 0.0
+                    sign = "+" if pct >= 0 else ""
+                    rss_str = (f"rss base={rb_f:.0f}MB knob={rk_f:.0f}MB "
+                               f"({sign}{pct:.0f}%)")
+                except (ValueError, ZeroDivisionError):
+                    rss_str = f"rss base={rss_base}MB knob={rss_knob}MB"
+            else:
+                rss_str = "rss N/A (pre-RSS capture run)"
             rows.append({
                 "component": f"knob.{kname} ({desc})",
                 "cells": fmt_cell(ck),
                 "attrib": f"Δ(alt-base)={v['delta_ms']:+.1f}ms @ canonical mask",
                 "status": status + unfrozen_tag,
                 "dist": dist,
+                "rss": rss_str,
                 "verify": (f"scripts/bench/decide.sh --cells {ck[0]}:{ck[1]} "
                            f"--knob-cells {ck[0]}:{ck[1]} --knobs {kname} "
                            f"--knob-n 21 --bin {run['manifest'].get('bin')}"),
@@ -577,9 +619,14 @@ def analyze_run(run, allow_thaw=False, feature=None):
     do_next = None
     for r in rows:
         if r["tier"] == 1:
+            if "reverted" in r["component"]:
+                action = ("reconcile with the prior gated revert + check RSS "
+                          "before flipping")
+            else:
+                action = "fix/condition the feature"
             do_next = (f"{r['component']} on {r['cells']} — the shipped default "
                        f"measurably COSTS wall ({r['status'].split(':')[1].strip()}). "
-                       f"Re-verify at N=21 then fix/condition the feature: {r['verify']}")
+                       f"Re-verify at N=21 then {action}: {r['verify']}")
             break
     if do_next is None:
         for r in rows:
@@ -615,6 +662,8 @@ def print_report(rep):
         print(f"     attribution : {r['attrib']}")
         print(f"     status      : {r['status']}")
         print(f"     distribution: {r['dist']}")
+        if "rss" in r:
+            print(f"     rss         : {r['rss']}")
         print(f"     re-verify   : {r['verify']}")
     if rep["anomalies"]:
         print("\n-- ANOMALIES (verbatim; investigate before trusting affected rows) --")
@@ -663,6 +712,11 @@ def selftest():
     uni = [1.00, 1.01, 1.02, 1.03, 1.015, 1.025, 1.005]
     check(bimodal(bi) is True, "bimodal sample FLAGGED")
     check(bimodal(uni) is False, "unimodal control NOT flagged")
+    # Degenerate branch: [1,1,1,1,1.01] has right-side size=1 -> NOT bimodal.
+    # (gate repro: the old code returned True here; left=4 right=1 fails >=2).
+    deg = [1, 1, 1, 1, 1.01]
+    check(bimodal(deg) is False,
+          "degenerate [1,1,1,1,1.01] NOT flagged (right side has only 1 sample)")
 
     # 3. N-needed monotone: smaller delta -> larger N; resolved -> no N.
     r1 = resolution(0.001, 0.010, 0.010, 9)
@@ -741,6 +795,24 @@ def selftest():
     check(vacd is None, "effect: no dynamic blocks => predicate vacuous (None)")
     none_v, _ = effect_check("none", "", "")
     check(none_v is None, "effect: knob without counter => EFFECT-UNVERIFIED (None)")
+    # rpmalloc_stats predicate (slab_alloc): knob arm must have [rpmalloc], base not.
+    rp_ok, rp_note = effect_check(
+        "rpmalloc_stats",
+        "some base output without rpmalloc line",
+        "[rpmalloc final] mapped_peak=48M mapped_total=192M unmapped_total=144M "
+        "cached=0.0M huge_alloc_peak=0M")
+    check(rp_ok is True and "48" in rp_note,
+          "effect: rpmalloc_stats knob-arm has stats, base absent => EFFECT-VERIFIED")
+    rp_fail_base, _ = effect_check(
+        "rpmalloc_stats",
+        "[rpmalloc final] mapped_peak=48M mapped_total=192M unmapped_total=144M "
+        "cached=0.0M huge_alloc_peak=0M",
+        "[rpmalloc final] mapped_peak=48M mapped_total=192M unmapped_total=144M "
+        "cached=0.0M huge_alloc_peak=0M")
+    check(rp_fail_base is False, "effect: rpmalloc_stats both arms have stats => CAUGHT")
+    rp_fail_missing, _ = effect_check("rpmalloc_stats", "base output", "knob output")
+    check(rp_fail_missing is False,
+          "effect: rpmalloc_stats no stats line in knob arm => CAUGHT")
 
     # 7. end-to-end on a synthetic artifact dir: ranked table + DO-THIS-NEXT.
     d = tempfile.mkdtemp(prefix="fulcrum_decide_st_")
@@ -831,6 +903,53 @@ def selftest():
     check("engine.backref" in rep4["do_next"],
           "no causal action -> DO-THIS-NEXT = top bounded engine HYPOTHESIS "
           "with its perturbation")
+
+    # 10. "reverted" knob DO-THIS-NEXT uses "reconcile" phrasing (not fix/condition).
+    d2 = tempfile.mkdtemp(prefix="fulcrum_decide_st10_")
+    cdir2 = os.path.join(d2, "cell_silesia_T1")
+    kslab = os.path.join(cdir2, "knob_slab_alloc")
+    os.makedirs(kslab)
+    with open(os.path.join(d2, "manifest.txt"), "w") as f:
+        f.write("runid=st10\nbin=/root/bin-test\nbin_sha=deadbeef\n"
+                "feature=gzippy-native\nrg_version=rapidgzip 0.16.0\n"
+                "freeze_state=frozen\nquiet_state=quiet\n"
+                "governor=performance\nno_turbo=1\nrunnable_avg=1.0\n"
+                "cell_done=silesia:1:mask=0:sha_ok=1\n")
+    gz2 = [1.380, 1.382, 1.379, 1.385, 1.381, 1.383, 1.380]
+    rg2 = [0.920, 0.922, 0.918, 0.925, 0.921, 0.919, 0.923]
+    with open(os.path.join(cdir2, "wall_gz.txt"), "w") as f:
+        f.write("\n".join(map(str, gz2)))
+    with open(os.path.join(cdir2, "wall_rg.txt"), "w") as f:
+        f.write("\n".join(map(str, rg2)))
+    # slab_alloc knob arm is 60ms FASTER (feature COSTS — enabling slab costs wall
+    # means the DEFAULT (off) costs; wait, the knob arm is GZIPPY_SLAB_ALLOC=1 which
+    # ENABLES the slab; if enabling it makes it faster, the default (off) COSTS wall).
+    with open(os.path.join(kslab, "base.txt"), "w") as f:
+        f.write("\n".join(map(str, gz2)))
+    with open(os.path.join(kslab, "knob.txt"), "w") as f:
+        f.write("\n".join(str(x - 0.060) for x in gz2))  # knob (slab ON) is faster
+    with open(os.path.join(kslab, "meta.txt"), "w") as f:
+        f.write("knob=slab_alloc\nenv=GZIPPY_SLAB_ALLOC=1\npred=rpmalloc_stats\n"
+                "cell=silesia:1\nmask=0\nsha_ok=1\n")
+    # Effect capture: knob arm has rpmalloc stats, base does not.
+    edir2 = os.path.join(d2, "knob_effects_silesia_T1")
+    os.makedirs(edir2)
+    with open(os.path.join(edir2, "effect_base_slab_alloc.txt"), "w") as f:
+        f.write("no rpmalloc output in base arm\n")
+    with open(os.path.join(edir2, "effect_knob_slab_alloc.txt"), "w") as f:
+        f.write("[rpmalloc final] mapped_peak=64M mapped_total=256M "
+                "unmapped_total=192M cached=0.1M huge_alloc_peak=0M\n")
+    rep10 = analyze_run(load_run(d2))
+    check(any("slab_alloc" in r["component"] and r["tier"] == 1
+              for r in rep10["rows"]),
+          "e2e-reverted: slab_alloc CAUSAL-VERIFIED-COSTS lands tier 1")
+    check("reconcile" in rep10["do_next"],
+          "e2e-reverted: DO-THIS-NEXT for 'reverted' knob uses 'reconcile' phrasing")
+    check("fix/condition" not in rep10["do_next"],
+          "e2e-reverted: 'fix/condition' phrasing absent for reverted knob")
+    check(any("rpmalloc" in r.get("status", "") for r in rep10["rows"]
+              if "slab_alloc" in r["component"]),
+          "e2e-reverted: rpmalloc effect-verified note in slab_alloc status")
 
     print(f"\n=== SELFTEST {'PASSED' if not failures else 'FAILED'} "
           f"({len(failures)} failure(s)) ===")

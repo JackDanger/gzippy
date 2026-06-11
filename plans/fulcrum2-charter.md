@@ -53,7 +53,7 @@ re-verify command — and a final `DO THIS NEXT:` line.
 | engine.seeded_block (M3 seeded chunks on Block) | GZIPPY_SEEDED_BLOCK=0 | ON | verbose `seeded_block=0` AND `seeded_wrapper>0` in OFF arm |
 | engine.exact_block (M4 until-exact on Block) | GZIPPY_EXACT_BLOCK=0 | ON | verbose `exact_block=0` AND `exact_wrapper>0` in OFF arm |
 | sched.hit_drive (confirmed-offset hit-drive) | GZIPPY_NO_HIT_DRIVE=1 | ON | none cheap → EFFECT-UNVERIFIED label |
-| alloc.slab (slab allocator, the reverted lever) | GZIPPY_SLAB_ALLOC=1 (ENABLES; default arm OFF) | OFF | none cheap → EFFECT-UNVERIFIED label |
+| alloc.slab (slab allocator, the reverted lever) | GZIPPY_SLAB_ALLOC=1 (ENABLES; default arm OFF) | OFF | `GZIPPY_RPMALLOC_STATS=1` in effect capture (rpmalloc_alloc.rs:523): knob arm must have `[rpmalloc …]` stats line; base arm must not → EFFECT-VERIFIED |
 | sched.eager_postproc | GZIPPY_EAGER_POSTPROC=1 (ENABLES; default arm OFF) | OFF | none cheap → EFFECT-UNVERIFIED label |
 
 NOTE (registry honesty): the directive listed `GZIPPY_PIN_WORKERS`; it does NOT
@@ -70,13 +70,14 @@ its A/B is NOT rendered as causal (the "kill-switches verified to disable fully"
 process rule).
 
 Causal statuses:
-- CAUSAL-VERIFIED(feature-COSTS Δms±spread): knob-arm (feature off) FASTER beyond
-  both arms' spread ⇒ the shipped feature hurts this cell ⇒ actionable.
-- CAUSAL-VERIFIED(feature-PAYS Δms±spread): knob-arm SLOWER beyond spread ⇒ the
-  feature's contribution is causally confirmed; not an action, but it converts
+- CAUSAL-VERIFIED(feature-COSTS Δms max-arm-spread=Xms): knob-arm (feature off) FASTER
+  beyond max(spread_base, spread_knob) ⇒ the shipped feature hurts this cell ⇒ actionable.
+- CAUSAL-VERIFIED(feature-PAYS Δms max-arm-spread=Xms): knob-arm SLOWER beyond spread ⇒
+  the feature's contribution is causally confirmed; not an action, but it converts
   attribution to causation for that component.
-- CAUSAL-NULL(bounded ≤ spread ms): |Δ| within spread ⇒ the component's wall effect
-  in this cell is bounded by the spread. Never rendered as a finding beyond the bound.
+- CAUSAL-NULL(bounded ≤ max-arm-spread=Xms): |Δ| within max(spread_base, spread_knob) ⇒
+  the component's wall effect in this cell is bounded. Never rendered as a finding beyond
+  the bound.
 - EFFECT-UNVERIFIED / EFFECT-CHECK-FAILED qualifiers as above.
 
 ### B. Trace components (attribution under the canonical mask; HYPOTHESIS unless a knob covers them)
@@ -111,8 +112,13 @@ disttbl builds/reuses and wrapper-arm counters when present. Headroom rendering:
 ## Distribution health (every wall sample set, both tools)
 
 - N, min, median, IQR, spread% ((max-min)/min).
+- RSS per arm on knob rows: `rss base=XMB knob=YMB (+Z%)` — peak RSS from
+  `/usr/bin/time -f '%M'` (kilobytes → MB); written to meta.txt by the guest
+  and rendered in the table row (timed_masked extension in lib_decide_guest.sh).
 - Bimodality: largest-gap heuristic — sort samples; if the largest internal gap
-  > BIMODAL_K (3.0) × median of the remaining gaps AND both sides have ≥2 samples,
+  > BIMODAL_K (3.0) × median of the remaining gaps AND both sides have ≥2 samples
+  (degenerate case: all other gaps zero must also pass the ≥2 check — repro:
+  [1,1,1,1,1.01] is NOT bimodal because right side has only 1 sample),
   flag BIMODAL (the N=21 silesia-T16 lesson: rg distributions are bimodal/quantized;
   a median can sit on either mode).
 - Verdict per cell vs rg: ratio = rg_min/gz_min; PASS at ≥0.99 (the binding TIE bar,
@@ -135,7 +141,11 @@ So the guard OVER-FIRES on every healthy native/isal production run.
 Re-derived contamination signals (refuse iff ANY):
 1. `SEED_WINDOWS replay: hits=H` line present with H>0 (seed_windows.rs:304-311 —
    printed ONLY when GZIPPY_SEED_WINDOWS mode is on) ⇒ oracle-seeded run.
-2. `isal_chunks>0` (ISAL_ENGINE_ORACLE_CHUNKS) on a NATIVE build ⇒ the engine
+2. `BYPASS_DECODE replay: hits=H` line present with H>0 (decode_bypass.rs:628 —
+   printed ONLY when the decode-bypass replay is active via report_replay_stats()) ⇒
+   pre-computed decode results replayed, real engine cost masked (same binder-masking
+   class as SEED_WINDOWS).
+3. `isal_chunks>0` (ISAL_ENGINE_ORACLE_CHUNKS) on a NATIVE build ⇒ the engine
    oracle ran (on gzippy-isal these are PRODUCTION counters — the guard takes a
    `feature` parameter; isal_chunks>0 on isal is healthy).
 3. The runner's env-scrub log reported a seeding/oracle/bypass/slow var.
@@ -165,11 +175,14 @@ Header: run id, binary sha, feature, corpus pins, freeze status, mask per cell,
 guard verdicts per capture.
 Rows (rank order): 1) CAUSAL-VERIFIED feature-COSTS by Δms desc; 2) HYPOTHESIS by
 bounded-ms desc; 3) CAUSAL-VERIFIED feature-PAYS (confirmations); 4) CAUSAL-NULL.
-Columns: COMPONENT | CELLS | ATTRIBUTION (wall-ms @ mask) | CAUSAL STATUS |
-DISTRIBUTION (spread/bimodal/RESOLVED-or-N-needed) | RE-VERIFY (exact command).
+Columns: COMPONENT | CELLS | ATTRIBUTION (wall-ms @ mask) | CAUSAL STATUS
+(max-arm-spread=Xms instead of ±Xms) | DISTRIBUTION (spread/bimodal/RESOLVED-or-N-needed)
+| RSS (base=XMB knob=YMB ±Z%; knob rows only) | RE-VERIFY (exact command).
 Last line:
     DO THIS NEXT: <top actionable row — the largest CAUSAL-VERIFIED feature-COSTS,
-    else the highest-bounded HYPOTHESIS with its pre-registered perturbation command>
+    else the highest-bounded HYPOTHESIS with its pre-registered perturbation command.
+    For knobs whose desc contains "reverted": action phrase is
+    "reconcile with the prior gated revert + check RSS before flipping" (not fix/condition)>
 
 ## Self-tests (fulcrum_decide.py --selftest; all must pass before any run is trusted)
 
