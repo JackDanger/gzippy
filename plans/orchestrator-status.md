@@ -1,3 +1,20 @@
+## ADVISOR GATE on the fast-path relocation: SOUND-WITH-CHANGES — honest prior LEANS AGAINST the lever [2026-06-11]
+Opus advisor (verified marker_inflate.rs:1911 + :2524-2533 in source) accepted the Phase-0 probe but
+REFRAMED the evidence: rung-d's injection forced fast->careful — i.e. a ~1.69x decode slowdown (the
+gap the mfast loop was built to close, :1889) PLUS +100% spin — and the wall stayed FLAT. That is
+AFFIRMATIVE causal evidence that AGGREGATE marker decode rate has slack at bignasa-isal T8; the
+decomposition's "6% slower per chunk" is a producer-side attribution (the analyst-biasable class).
+Quantitative crux: for fast-binds + careful-flat to coexist you'd need "careful overlaps better
+despite being slower" — strained/unevidenced. The COMPETING binder is the BANKED confirmed-offset
+HoL-stall finding (~40% of T8 wall, decode_NOT_STARTED at confirmed offsets != partition guess) which
+the decomposition never reconciled against. 5 REQUIRED changes to Phase 0: (1) fast-OFF/no-spin
+DISCRIMINATOR arm (GZIPPY_MFAST_DISABLE-style, careful at baseline cost) — wall-flat => STOP, decode
+slack, no Phase 1; (2) one-session interleaved arms + binary-self-test (the 973-vs-1350 anomaly is a
+rule-4 flag); (3) pre-registered quantitative slope falsifier, not "monotonic"; (4) Phase-0-FAIL
+pre-committed as a rule-7-valid rejection routing to the HoL-stall lever; (5) engagement-counter
+TIME breakdown (mfast vs careful-tail vs table-build) — the deficit could live in the careful TAIL
+(lever = reduce tail engagement, not speed mfast). OFF-vs-absent codegen self-test required for the
+new in-loop knob.
 ## SERIAL-RESIDUE DECOMPOSITION DONE — chain exonerated; lever RELOCATED to the marker FAST-PATH loop [2026-06-11]
 The bignasa-isal T8 serial chain is NOT the binder — every stage causally cleared: (1) WRITER:
 skip-writev removal oracle saves 92ms of pure write time but an overlap-writer A/B is a TIE — the
