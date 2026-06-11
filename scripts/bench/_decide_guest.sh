@@ -57,6 +57,15 @@ mf "runid=$RUNID"
 mf "bin=$BIN"
 mf "bin_sha=$BIN_SHA"
 mf "feature=$FEATURE"
+# ---- measurement fingerprint (FINGERPRINT-OR-NO-COMPARE / SINK-LAW) ----------
+# protocol: bumped whenever the meaning of a stored number changes; the
+# analyzer refuses ratios across protocols. Sink classes recorded PER ARM:
+# both arms are assert_regular_sink-verified regular files on the same fs —
+# a mixed-sink artifact is refused outright by the analyzer (the 2026-06-11
+# half-rebased-matrix phantom, SINK LAW).
+mf "protocol=fulcrum-v3"
+mf "sink_gz=regular-file"
+mf "sink_rg=regular-file"
 mf "rg_version=$("$RG_CMD" --version 2>&1 | head -1 | tr -d '\n')"
 mf "freeze_state=$FREEZE_STATE"
 mf "quiet_state=$QUIET_STATE"
