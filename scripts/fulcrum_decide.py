@@ -177,16 +177,25 @@ def effect_check(pred, base_txt, knob_txt):
             return (None, "no until-exact chunks in this cell (predicate vacuous)")
         return (False, f"knob arm still exact_block={blk} (switch INEFFECTIVE)")
     if pred == "prof_dist":
+        # C_N_DISTBUILD / C_N_DISTREUSE are incremented ONLY in the amortized
+        # (default) arm (marker_inflate.rs:2262/2266); the GZIPPY_DIST_AMORT=0
+        # kill-switch arm (marker_inflate.rs:2226-2247) does fresh per-block
+        # builds WITHOUT touching them. So the EFFECTIVE-switch signature is:
+        # base arm counters alive, knob arm counters DEAD (builds=0, reuses=0).
         mb = re.search(r"disttbl: builds=(\d+) reuses=(\d+)", base_txt)
         mk = re.search(r"disttbl: builds=(\d+) reuses=(\d+)", knob_txt)
         if not (mb and mk):
             return (False, "disttbl prof line absent (capture without GZIPPY_CONTIG_PROF?)")
         bb, br = map(int, mb.groups())
         kb, kr = map(int, mk.groups())
-        if kr == 0 and kb >= bb:
-            return (True, f"knob arm: builds={kb}>=base {bb}, reuses=0 (amortization off)")
-        return (False, f"knob arm builds={kb} reuses={kr} vs base builds={bb} "
-                       f"reuses={br} — amortization NOT disabled")
+        if bb == 0 and br == 0:
+            return (None, "base arm never hit the amortized build path "
+                          "(no dynamic blocks?) — predicate vacuous")
+        if kb == 0 and kr == 0:
+            return (True, f"base builds={bb}/reuses={br} alive, knob arm counters "
+                          f"dead (P3.4 path bypassed — switch effective)")
+        return (False, f"knob arm still on the amortized path (builds={kb} "
+                       f"reuses={kr}) — switch INEFFECTIVE")
     return (False, f"unknown predicate '{pred}'")
 
 
@@ -232,12 +241,21 @@ def bank_divergence(cell, prof):
     div = []
     br = prof["classes"].get("backref")
     if br:
+        share_ok = abs(br["share_pct"] - BANK["silesia_T8_backref_share"]) \
+            / BANK["silesia_T8_backref_share"] <= BANK_REL_TOL
         for key, val in (("share_pct", BANK["silesia_T8_backref_share"]),
                          ("cyc_iter", BANK["silesia_T8_backref_cyc"])):
             got = br[key]
             if val and abs(got - val) / val > BANK_REL_TOL:
-                div.append(f"backref.{key}={got:.1f} vs banked {val} "
-                           f"(>±{BANK_REL_TOL:.0%}) — DIVERGES-FROM-BANK")
+                msg = (f"backref.{key}={got:.1f} vs banked {val} "
+                       f"(>±{BANK_REL_TOL:.0%}) — DIVERGES-FROM-BANK")
+                if key == "cyc_iter" and share_ok:
+                    msg += (" [shares MATCH the bank => structure consistent; "
+                            "absolute TSC-cyc/iter scales with core-clock state "
+                            "(TSC is fixed-rate) — suspect a frequency-state "
+                            "mismatch between captures (frozen no_turbo here vs "
+                            "the bank's capture), not a code change]")
+                div.append(msg)
     lc = prof["classes"].get("litchn")
     if lc:
         val = BANK["silesia_T8_litchn_share"]
@@ -708,9 +726,19 @@ def selftest():
                           "seeded_block=16 seeded_wrapper=0 ")
     check(bad is False, "effect: ineffective switch CAUGHT")
     okd, _ = effect_check("prof_dist",
-                          "disttbl: builds=1051 reuses=2 ",
-                          "disttbl: builds=1768 reuses=0 ")
-    check(okd is True, "effect: dist_amort off => builds up, reuses 0")
+                          "disttbl: builds=2790 reuses=7 ",
+                          "disttbl: builds=0 reuses=0 ")
+    check(okd is True, "effect: dist_amort off => P3.4 counters dead "
+                       "(builds=0/reuses=0; the counting sites live only in "
+                       "the amortized arm, marker_inflate.rs:2262/2266)")
+    badd, _ = effect_check("prof_dist",
+                           "disttbl: builds=2790 reuses=7 ",
+                           "disttbl: builds=2790 reuses=7 ")
+    check(badd is False, "effect: dist_amort knob arm still amortized => CAUGHT")
+    vacd, _ = effect_check("prof_dist",
+                           "disttbl: builds=0 reuses=0 ",
+                           "disttbl: builds=0 reuses=0 ")
+    check(vacd is None, "effect: no dynamic blocks => predicate vacuous (None)")
     none_v, _ = effect_check("none", "", "")
     check(none_v is None, "effect: knob without counter => EFFECT-UNVERIFIED (None)")
 
@@ -753,9 +781,9 @@ def selftest():
     edir = os.path.join(d, "knob_effects_silesia_T1")
     os.makedirs(edir)
     with open(os.path.join(edir, "effect_base_dist_amort.txt"), "w") as f:
-        f.write("disttbl: builds=1051 reuses=2 \n")
+        f.write("disttbl: builds=2790 reuses=7 \n")
     with open(os.path.join(edir, "effect_knob_dist_amort.txt"), "w") as f:
-        f.write("disttbl: builds=1768 reuses=0 \n")
+        f.write("disttbl: builds=0 reuses=0 \n")
     run = load_run(d)
     rep = analyze_run(run)
     check(any("knob.hit_drive" in r["component"] and r["tier"] == 1
