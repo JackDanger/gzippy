@@ -21,14 +21,29 @@ from ..core.trace import Taxonomy  # noqa: F401  (re-export for adapters)
 
 class Knob(NamedTuple):
     """One same-binary kill-switch: env is the FEATURE-ALTERED arm, pred names
-    the effect predicate proving the switch engaged, desc is human-readable."""
+    the effect predicate proving the switch engaged, desc is human-readable.
+    reverted marks a knob guarding a previously-shipped-then-reverted feature
+    (the decision brief says 'reconcile with the prior revert' instead of
+    'fix/condition' — structured, not string-matched from the desc)."""
     env: str
     pred: str
     desc: str
+    reverted: bool = False
 
 
 class ProjectAdapter:
-    """Subclass per project. Attributes/methods the core engine consumes."""
+    """Subclass per project. Attributes/methods the core engine consumes.
+
+    Decision-table ROW CONTRACT (microprofile_rows and any adapter-supplied
+    rows): each row dict carries component, cells, attrib, status, dist,
+    verify, tier, rank_ms, PLUS the structured fields the brief builder
+    keys on (never string-matched from component text):
+      kind        : "knob" | "engine" | "pipeline" (row family)
+      perturb_cmd : exact pre-registered perturbation command (tier-2
+                    HYPOTHESIS rows; optional otherwise)
+      reverted    : bool (knob rows: feature was previously shipped and
+                    reverted — the brief says 'reconcile', not 'fix')
+    """
 
     # -- identity / policy -------------------------------------------------
     name = "project"
@@ -36,6 +51,16 @@ class ProjectAdapter:
     taxonomy = Taxonomy()
     knobs = {}              # name -> Knob
     perturbations = {}      # trace-class -> suggested perturbation command
+
+    # -- artifact loading -----------------------------------------------------
+    def load_run(self, art_dir):
+        """Load one measurement-run artifact directory into the run dict the
+        decision engine consumes. The default implements the documented
+        schema (tools/fulcrum/docs/SCHEMA.md); a project with its own
+        artifact layout overrides this and maps to the same run-dict shape
+        (also documented there)."""
+        from ..core.decide import load_run_documented
+        return load_run_documented(art_dir, self)
 
     # -- comparator identity ------------------------------------------------
     def comparator_version(self, manifest):

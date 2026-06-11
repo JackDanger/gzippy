@@ -14,10 +14,10 @@ from . import stamp as _stamp
 
 
 def run_all(write_stamp=True):
-    from . import test_decide, test_invariants, test_total
+    from . import test_adapter, test_decide, test_invariants, test_total
     total_fail = 0
     counts = {}
-    for mod in (test_total, test_decide, test_invariants):
+    for mod in (test_total, test_decide, test_invariants, test_adapter):
         rc, n_checks, n_fail = mod.run()
         counts[mod.__name__.rsplit(".", 1)[-1]] = {"checks": n_checks,
                                                    "failures": n_fail}
