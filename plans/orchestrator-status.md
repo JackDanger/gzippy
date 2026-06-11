@@ -1,3 +1,19 @@
+## FIRST ISAL DECIDE RUN — the marker engine owns the isal deficits too [2026-06-11]
+fulcrum decide @ isal build (frozen, fingerprinted, banked): silesia T4 0.899 / T8 0.991
+PASS-but-bimodal(N->99 owed) / T16 0.945 / model 0.858 / bignasa 0.940. ALL 20 knob A/Bs
+CAUSAL-NULL (incl. the new isal_incremental_growth knob — ratio-reserve confirmed not the
+bottleneck). THE STRUCTURAL READ: bignasa-isal has flip_to_clean=0, isal_chunks=1/22 — ISA-L
+fully idle; 100% of bytes through the pure-Rust MARKER loop at 166MB/s. Everywhere else the
+pre-flip bootstrap phase runs the same marker loop at 51-83MB/s. (COUNTER-SEMANTICS CAUTION
+banked: body_bytes = bootstrap-phase bytes only; silesia isal DOES hand ~2/3 of total volume to
+ISA-L post-flip — the worker's '2% ISA-L utilization' over-read; bignasa's 0-flip reading is
+solid.) THE SHARED LEVER: the marker bootstrap loop is the UN-ASM'D sibling of the contig clean
+loop — rung (c)'s kernel covers only clean contig. RUNG (d) CANDIDATE: extend the kernel
+techniques (or a second kernel) to the marker-mode body loop — lifts BOTH builds (bignasa-isal
+0.940 directly; T4-band pre-flip phases; model both builds; native window-absent chunks).
+Tool hygiene items found: contig_prof banks need build-tagging (native-only rows fired
+DIVERGES-FROM-BANK on isal — expected, annotate); DO-THIS-NEXT picked a vacuous engine row on
+the isal build (adapter should suppress contig classes when engine idle).
 ## FULCRUM P2 MERGED — OSS-cut ready; 147/147 across 4 suites [2026-06-11]
 All gate-ranked hardening + the verification gate's finishers (honest unkeyed-chain threat model;
 non-empty supersede reasons; toy mixed-sink refusal). Fulcrum now: fingerprinted (8 compare fields
