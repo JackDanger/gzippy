@@ -589,6 +589,26 @@ impl DistTable {
 
     /// Build a distance decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
+        let mut t = Self {
+            entries: Vec::new(),
+            table_bits: Self::TABLE_BITS,
+        };
+        t.rebuild(code_lengths);
+        Some(t)
+    }
+
+    /// Rebuild this table in place from new code lengths, REUSING the
+    /// `entries` allocation (P3.4 item 1, build-cost shave): the per-block
+    /// lazy build in the contig clean fast loop used to pay a fresh
+    /// `Vec` alloc + zero-fill + truncate + free on EVERY Huffman block;
+    /// at T16 the malloc/free cadence across 16 threads is measurable
+    /// (P3.3b: +8.6ms on silesia T16). Reusing the buffer keeps the
+    /// resulting table BYTE-IDENTICAL to a fresh `build` by construction:
+    /// the fill below writes exactly the same entries over a zeroed
+    /// prefix of the same computed size, and the table is a pure function
+    /// of `code_lengths` (differential: `dist_table_rebuild_matches_fresh
+    /// _build` in marker_inflate.rs).
+    pub fn rebuild(&mut self, code_lengths: &[u8]) {
         let table_bits = Self::TABLE_BITS;
         let main_size = 1usize << table_bits;
 
@@ -608,10 +628,14 @@ impl DistTable {
             first_code[len] = code;
         }
 
-        // Allocate table with space for subtables
+        // Allocate table with space for subtables (allocation reused across
+        // rebuilds: clear + resize re-zeroes without a malloc/free round-trip
+        // once capacity has grown to the high-water mark).
         let max_subtable_entries = (1usize << Self::MAX_SUBTABLE_BITS)
             * code_lengths.iter().filter(|&&l| l > table_bits).count();
-        let mut entries = vec![DistEntry(0); main_size + max_subtable_entries];
+        let mut entries = std::mem::take(&mut self.entries);
+        entries.clear();
+        entries.resize(main_size + max_subtable_entries, DistEntry(0));
         let mut subtable_next = main_size;
 
         // Assign codes to symbols
@@ -669,10 +693,8 @@ impl DistTable {
         }
 
         entries.truncate(subtable_next);
-        Some(Self {
-            entries,
-            table_bits,
-        })
+        self.entries = entries;
+        self.table_bits = table_bits;
     }
 
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
