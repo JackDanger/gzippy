@@ -55,3 +55,7 @@ artifacts/decide/decide_*/
 !artifacts/decide/decide_20260611T052041Z/
 !artifacts/decide/decide_20260611T052041Z/**/
 !artifacts/decide/decide_20260611T052041Z/**/*.txt
+
+# fulcrum: self-test stamp is machine-local (SELF-TEST-OR-NO-TRUST)
+tools/fulcrum/.selftest-stamp.json
+tools/fulcrum/**/__pycache__/

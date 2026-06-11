@@ -1,0 +1,77 @@
+"""ProjectAdapter — the plug surface between the fulcrum core and a project.
+
+A project adapter supplies (data > code wherever possible):
+
+  - binary/launch matrix: how the tool-under-test and its comparators run for a
+    (corpus, threads) cell, and the expected production routing per cell. The
+    actual launching lives in the project's environment-control policy (for
+    gzippy: scripts/bench/decide.sh + _decide_guest.sh — freeze, canonical pin
+    masks, regular-file sinks, per-run sha verification);
+  - corpora/workloads with integrity pins (SHA-OR-VOID);
+  - knob registry with effect predicates (EFFECT-VERIFIED-OR-FLAGGED);
+  - comparator tools + banked comparator rows;
+  - trace taxonomy (wait/compute/output classification + wall-critical frames);
+  - routing/contamination guard (production vs oracle-seeded runs).
+"""
+
+from typing import NamedTuple
+
+from ..core.trace import Taxonomy  # noqa: F401  (re-export for adapters)
+
+
+class Knob(NamedTuple):
+    """One same-binary kill-switch: env is the FEATURE-ALTERED arm, pred names
+    the effect predicate proving the switch engaged, desc is human-readable."""
+    env: str
+    pred: str
+    desc: str
+
+
+class ProjectAdapter:
+    """Subclass per project. Attributes/methods the core engine consumes."""
+
+    # -- identity / policy -------------------------------------------------
+    name = "project"
+    tie_bar = 0.99          # PASS bar for comparator ratio (project policy)
+    taxonomy = Taxonomy()
+    knobs = {}              # name -> Knob
+    perturbations = {}      # trace-class -> suggested perturbation command
+
+    # -- counters / routing guard ------------------------------------------
+    def parse_counters(self, text):
+        """Counter-sidecar text -> {counter: int}."""
+        return {}
+
+    def routing_guard(self, counters, feature=None):
+        """(is_production: bool|None, reason). False => the run is
+        oracle-contaminated and its numbers are REFUSED; None => inconclusive
+        (cannot certify production routing)."""
+        return (None, "adapter provides no routing guard")
+
+    def oracle_guard(self, counters, trace_self):
+        """Removal-oracle contamination warnings (a handicapped contender must
+        not be read as a ceiling). Returns a list of strings."""
+        return []
+
+    # -- knobs ----------------------------------------------------------------
+    def effect_check(self, pred, base_txt, knob_txt):
+        """(verified: bool|None, note). None = no in-tree counter =>
+        EFFECT-UNVERIFIED label (never silently trusted)."""
+        return (None, f"unknown predicate '{pred}'")
+
+    # -- micro-profile (optional per-project engine counters) -----------------
+    def parse_microprofile(self, text):
+        """Profile-capture text -> opaque prof object, or None."""
+        return None
+
+    def microprofile_rows(self, ck, prof, gap_ms, run):
+        """(rows, anomalies) for the decision table. Each row dict must carry:
+        component, cells, attrib, status, dist, verify, tier, rank_ms."""
+        return ([], [])
+
+    # -- re-verify command surfaces -------------------------------------------
+    def reverify_knob(self, ck, kname, run):
+        return f"re-run the {kname} A/B on {ck[0]}:T{ck[1]}"
+
+    def reverify_trace(self, ck, run, feature):
+        return f"re-analyze the {ck[0]}:T{ck[1]} trace"
