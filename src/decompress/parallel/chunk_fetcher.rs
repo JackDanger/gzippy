@@ -674,6 +674,9 @@ fn drive_impl<W: std::io::Write>(
     // build duration to stderr (GZIPPY_BYPASS_DECODE replay only) so the harness
     // can report floor = wall − warm. No-op unless replay is enabled.
     crate::decompress::parallel::decode_bypass::warm_prebuilt();
+    // REMOVAL-ORACLE NODECODE: same out-of-wall warm for the symbol-stream
+    // replay map (no-op unless GZIPPY_ORACLE_NODECODE is set).
+    crate::decompress::parallel::removal_oracle::warm_replay();
 
     let drive_t0 = std::time::Instant::now();
     // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): CORRECTED overlap
@@ -734,6 +737,7 @@ fn drive_impl<W: std::io::Write>(
     // Report replay stats even on a (CRC) error so the bypass experiment
     // can see hit/miss counts when the run aborts.
     crate::decompress::parallel::decode_bypass::report_replay_stats();
+    crate::decompress::parallel::removal_oracle::report_replay_stats();
     if crate::decompress::parallel::perfect_overlap::enabled() {
         eprintln!(
             "  PERFECT_OVERLAP: overlapped wall (dispatch+consumer) {:.4}s",
@@ -1119,6 +1123,9 @@ fn drive_impl<W: std::io::Write>(
     trace_v2::flush_all();
     // DECODE-BYPASS: serialize the capture map (no-op unless capture on).
     crate::decompress::parallel::decode_bypass::flush_capture();
+    // REMOVAL-ORACLE NODECODE: serialize the symbol-stream record (no-op
+    // unless GZIPPY_ORACLE_RECORD is set).
+    crate::decompress::parallel::removal_oracle::flush_record();
     // CLEAN-ONLY ENGINE ORACLE: snapshot every published window (capture mode) /
     // report seed hit-miss (seed mode). Both no-ops unless the env vars are set.
     if crate::decompress::parallel::seed_windows::capture_enabled() {
