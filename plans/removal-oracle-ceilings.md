@@ -137,3 +137,21 @@ lives where the asm work would go.
 - Guest suite: see commit message (run post-measurement on the box).
 - fmt clean; clippy default-features: 0 warnings; gzippy-native: 56 warnings ==
   baseline 56 (no new); gzippy-isal x86_64 compiles.
+
+
+---
+
+## GATE TRIMS (2026-06-11, Opus disproof gate — BINDING on the asm memo)
+
+Verdict SOUND-WITH-CHANGES; the decision (decode chain is the lever, 6.8-13.5x
+over store) STANDS. Three sub-claims trimmed:
+1. Cross-tool "gap entirely in decode" demoted to the INTERNAL ratio unless
+   rapidgzip is re-measured under the same freeze (turbo ~3x confound).
+2. "Store side exhausted" -> "CONTIG-CLEAN store/copy exhausted (<=94ms)";
+   marker-mode/ring stores + the flip are outside this instrument's scope.
+3. Scope: gzippy-NATIVE engine cells at T1 + masked model-T8; real-T8
+   consumer-coordinated magnitude is an extrapolation (direction holds);
+   does not address the isal-build low-T non-engine residual.
+Disjointness proof banked: nostore + nodecode - base = +526ms remainder
+(instruments don't double-count); DECODE ceiling is a conservative LOWER
+bound (replay adds streaming reads production lacks).
