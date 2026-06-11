@@ -133,8 +133,8 @@ run_cell() { # <corpus> <T>
   routing_assert "$c" "$t"
   echo "## cell $c:T$t mask=$mask — wall interleave N=$N (drop warmup iter0)"
   for ((i=0;i<=N;i++)); do
-    read -r gsec gsha < <(timed_masked "$mask" "$SINK_A" "$BIN" -d -c -p "$t" "$f")
-    read -r rsec rsha < <(timed_masked "$mask" "$SINK_B" "$RG_CMD" -d -c -f -P "$t" "$f")
+    read -r gsec gsha _grss < <(timed_masked "$mask" "$SINK_A" "$BIN" -d -c -p "$t" "$f")
+    read -r rsec rsha _rrss < <(timed_masked "$mask" "$SINK_B" "$RG_CMD" -d -c -f -P "$t" "$f")
     [ "$i" -eq 0 ] && continue
     GZT="$GZT $gsec"; RGT="$RGT $rsec"
     [ "$gsha" = "${REFSHA[$c]}" ] || { echo "!! SHA DIVERGENCE gz $c:T$t i=$i sha=$gsha"; DIVERGED=1; }
