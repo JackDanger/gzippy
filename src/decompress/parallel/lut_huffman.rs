@@ -1034,6 +1034,28 @@ impl LutLitLenCode {
         if bits.available() < 32 {
             bits.refill();
         }
+        self.decode_prefilled(bits)
+    }
+
+    /// P3.5 c4: backstop-free decode for call sites that sit IMMEDIATELY
+    /// after a refill (unconditional or `< 48`-threshold). Removes the
+    /// `available() < 32` load+branch from the per-symbol critical chain.
+    ///
+    /// Byte-exact proof (why eliding the backstop cannot change a decode):
+    /// at such a site either (a) the threshold refill was NOT taken, so
+    /// `bitsleft >= 48 >= 32` and the backstop is dead; or (b) a refill just
+    /// ran — fast path leaves `bitsleft >= 56`; slow path
+    /// (`refill_slow_with_bits`) fills until `bits > 56` or input is
+    /// exhausted, so `available() < 32` afterwards implies `pos == data.len()`
+    /// and a second (backstop) refill appends NOTHING — fast path needs
+    /// `pos + 8 <= len` (false, pos only grew) and the slow loop re-terminates
+    /// immediately. In every case the backstop is a no-op; the lookup reads
+    /// the identical `bitbuf`.
+    #[inline(always)]
+    pub fn decode_prefilled(
+        &self,
+        bits: &crate::decompress::inflate::consume_first_decode::Bits<'_>,
+    ) -> DecodedSymbol {
         let next_bits = bits.peek();
         let next_12_bits = (next_bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
         let mut next_sym = self.table.short_code_lookup[next_12_bits];
