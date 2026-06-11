@@ -846,7 +846,31 @@ pub fn run_contig_ref(
     out_lim: usize,
     in_lim: usize,
 ) -> u64 {
-    run_contig_ref_biased::<0>(lut, dist, lb, out, dst, out_lim, in_lim)
+    let mut stats = RefArmStats::default();
+    run_contig_ref_biased::<0>(lut, dist, lb, out, dst, out_lim, in_lim, &mut stats)
+}
+
+/// Arm-level coverage counters for the REFERENCE model — flip-precondition 2
+/// (campaign §9 gate): the differential must PROVE it exercises the asm's
+/// `25:` multi-literal+trailing-LENGTH arm (99.6% of c3a crossings — the
+/// make-or-break arm of the F-c coverage gate), not silently degrade to
+/// literals-only/lone-backref traffic after a refactor.
+///
+/// The ref counts are a valid proxy for the ASM arm: the differential pins
+/// asm == ref on (exit class, full cursor, dst, bytes), so any asm misroute
+/// of a packet the ref runs through this arm (e.g. `25:` redirected to a
+/// bail) diverges in exit/dst/cursor and fails the equality asserts first.
+/// (The asm-side KERN_RECLASS_MULTI_TRAIL counter tags only the BAIL
+/// crossings; completions never cross the seam — they are countable only on
+/// the ref side.)
+#[derive(Default)]
+pub struct RefArmStats {
+    /// Packets entering the multi-with-trailing-length path past the
+    /// EOB/oversize gates (the asm `25:` X2-spill point).
+    pub multi_trail: u64,
+    /// Those whose dist decode + copy completed in-region (the asm
+    /// `25:` → `58:` → copy success route).
+    pub multi_trail_completed: u64,
 }
 
 /// `run_contig_ref` with a test-injected CONSUME BIAS — the flip-precondition
@@ -872,6 +896,7 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
     dst: &mut usize,
     out_lim: usize,
     in_lim: usize,
+    stats: &mut RefArmStats,
 ) -> u64 {
     loop {
         if *dst >= out_lim || lb.pos >= in_lim {
@@ -957,6 +982,7 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
                 if last == 256 || last > super::lut_huffman::MAX_LIT_LEN_SYM {
                     return EXIT_RECLASS;
                 }
+                stats.multi_trail += 1; // asm `25:` X2-spill point
                 let (sb, sl, sd) = (lb.bitbuf, lb.bitsleft, *dst);
                 lb.consume(pre.bit_count);
                 let packed = (pre.symbol & 0x00FF_FFFF) as u64;
@@ -993,6 +1019,7 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
                     *dst = sd;
                     return EXIT_RECLASS;
                 }
+                stats.multi_trail_completed += 1; // asm `25:`→`58:` success
                 continue;
             }
             lb.consume(pre.bit_count);
@@ -1288,6 +1315,7 @@ mod tests {
             let mut out_ref0 = vec![0u8; buf_len];
             let mut lb_ref0 = Bits::new(&data);
             let mut dref0 = 0usize;
+            let mut st0 = RefArmStats::default();
             let ref0_exit = run_contig_ref_biased::<0>(
                 &lut,
                 &dist_holes,
@@ -1296,6 +1324,7 @@ mod tests {
                 &mut dref0,
                 out_lim,
                 in_lim,
+                &mut st0,
             );
             let asm_class = if asm_exit == EXIT_BOUNDARY {
                 EXIT_BOUNDARY
@@ -1328,6 +1357,7 @@ mod tests {
             let mut out_ref1 = vec![0u8; buf_len];
             let mut lb_ref1 = Bits::new(&data);
             let mut dref1 = 0usize;
+            let mut st1 = RefArmStats::default();
             let _ = run_contig_ref_biased::<1>(
                 &lut,
                 &dist_holes,
@@ -1336,6 +1366,7 @@ mod tests {
                 &mut dref1,
                 out_lim,
                 in_lim,
+                &mut st1,
             );
             if lb_ref1.pos != lb_asm.pos
                 || lb_ref1.bitbuf != lb_asm.bitbuf
@@ -1442,6 +1473,10 @@ mod tests {
         let window: Vec<u8> = (0..WIN).map(|_| next() as u8).collect();
         let mut small_pair_bytes = 0u64;
         let mut small_pair_trials = 0u64;
+        // Flip-precondition 2: per-cell arm coverage (see RefArmStats doc —
+        // ref counts are a valid proxy for the asm arms under the equality
+        // asserts below).
+        let mut cell_stats: [RefArmStats; 5] = Default::default();
         for (pi, (tbl, dt, tag0)) in pairs.iter().enumerate() {
             for trial in 0..3000 {
                 let n = 150 + (next() as usize % 450);
@@ -1465,7 +1500,7 @@ mod tests {
                 };
 
                 let mut dref = WIN;
-                let ref_exit = run_contig_ref(
+                let ref_exit = run_contig_ref_biased::<0>(
                     tbl,
                     dt,
                     &mut lb_ref,
@@ -1473,6 +1508,7 @@ mod tests {
                     &mut dref,
                     out_lim,
                     in_lim,
+                    &mut cell_stats[pi],
                 );
 
                 let base0 = out_asm.as_mut_ptr();
@@ -1526,6 +1562,35 @@ mod tests {
         assert!(
             avg > 30.0,
             "c3 coverage degraded: lenny×small avg bytes/run = {avg:.1}"
+        );
+        // Flip-precondition 2 (campaign §9 gate): the `25:` multi-literal+
+        // trailing-LENGTH arm — 99.6% of c3a crossings, the F-c coverage
+        // make-or-break — must be PROVEN exercised, both the completion
+        // route (`25:`→`58:`→copy) and the X2 dst-rollback bail route. The
+        // floors are ~25% of the observed counts (lenny×small completes
+        // 7,735; bails total 373 — lenny×fixed5 344 + lenny×sub 29), so a
+        // refactor that silently starves the arm fails loudly while seed/
+        // table tweaks within reason pass.
+        for (pi, st) in cell_stats.iter().enumerate() {
+            eprintln!(
+                "[c3 coverage] cell {pi} ({}): multi_trail={} completed={}",
+                pairs[pi].2, st.multi_trail, st.multi_trail_completed
+            );
+        }
+        assert!(
+            cell_stats[0].multi_trail_completed >= 2_000,
+            "25:-arm coverage degraded: lenny×small completed only {} \
+             multi-with-trailing-length backrefs (floor 2000)",
+            cell_stats[0].multi_trail_completed
+        );
+        let bails: u64 = cell_stats
+            .iter()
+            .map(|s| s.multi_trail - s.multi_trail_completed)
+            .sum();
+        assert!(
+            bails >= 90,
+            "25:-arm bail (X2 dst-rollback) coverage degraded: only {bails} \
+             multi-trailing dist bails across all cells (floor 90)"
         );
     }
 }
