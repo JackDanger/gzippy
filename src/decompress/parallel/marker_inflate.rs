@@ -889,6 +889,13 @@ impl Block {
         {
             self.block_huffman_luts_ready = false;
         }
+        // Reset dist_table to None for each new block so decode_clean_into_contig
+        // triggers a fresh lazy build (marker-mode blocks that never flip clean
+        // skip the allocation entirely).
+        #[cfg(pure_inflate_decode)]
+        {
+            self.dist_table = None;
+        }
         if treat_last_block_as_error && bfinal {
             return Err(BlockError::UnexpectedLastBlock);
         }
@@ -956,14 +963,6 @@ impl Block {
                 {
                     return Err(BlockError::InvalidCodeLengths);
                 }
-                // P3.1: contig-fast-loop distance table (see `dist_table` doc).
-                #[cfg(pure_inflate_decode)]
-                {
-                    self.dist_table =
-                        crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                            &FIXED_DIST_LENGTHS[..],
-                        );
-                }
             }
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
@@ -985,21 +984,8 @@ impl Block {
                 {
                     return Err(BlockError::InvalidCodeLengths);
                 }
-                // P3.1: contig-fast-loop distance table (see `dist_table` doc).
-                #[cfg(pure_inflate_decode)]
-                {
-                    self.dist_table =
-                        crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                            &dist_stack[..end - split],
-                        );
-                }
             }
-            CompressionType::Uncompressed | CompressionType::Reserved => {
-                #[cfg(pure_inflate_decode)]
-                {
-                    self.dist_table = None;
-                }
-            }
+            CompressionType::Uncompressed | CompressionType::Reserved => {}
         }
         Ok(())
     }
@@ -2192,6 +2178,29 @@ impl Block {
                 }
             }
             _ => return Err(BlockError::InvalidCompression),
+        }
+        // P3.1 lazy dist_table: only needed in the contig fast loop, so skip
+        // the Vec alloc for marker-mode blocks that never flip clean.
+        // read_header resets dist_table to None for each new block.
+        // After build_huffman_luts_for_block, dist_hc holds the validated lens,
+        // and literal_cl / FIXED_DIST_LENGTHS still hold the same raw lengths.
+        #[cfg(pure_inflate_decode)]
+        if self.dist_table.is_none() {
+            self.dist_table = match self.compression_type {
+                CompressionType::FixedHuffman => {
+                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                        &FIXED_DIST_LENGTHS[..],
+                    )
+                }
+                CompressionType::DynamicHuffman => {
+                    let split = self.literal_code_count;
+                    let end = split + self.distance_code_count;
+                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                        &self.literal_cl[split..end],
+                    )
+                }
+                _ => None,
+            };
         }
 
         const MAX_LIT_LEN_SYM: u32 = 512;
@@ -4824,5 +4833,190 @@ mod tests {
             assert_eq!(e_left, 990, "residual size committed");
             assert!(!e_eob);
         }
+    }
+
+    /// Differential: for every distance code-length set that `dist_hc` accepts,
+    /// `DistTable::build` must succeed, and for every random bit pattern the
+    /// decoded distance symbol, codeword length, base, and extra bits must agree.
+    ///
+    /// Fixed sets: [5;30], single len-1, two len-1, deep ladder (forces
+    /// subtable), incomplete/holes.  Then ~400 pseudo-random sets via seeded
+    /// LCG; the test asserts ≥238 total accepted across all tries.
+    #[test]
+    #[cfg(pure_inflate_decode)]
+    fn dist_table_matches_dist_hc_differential() {
+        /// Run the dist_hc ↔ DistTable differential for one code-length set.
+        /// Returns true iff dist_hc accepted the set (and all assertions passed).
+        fn run_set(lens: &[u8], pattern_seed: u64) -> bool {
+            use crate::decompress::inflate::consume_first_decode::Bits;
+            use crate::decompress::inflate::libdeflate_entry::{DistTable, DISTANCE_TABLE};
+            use crate::decompress::parallel::error::Error as HcError;
+            use crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached;
+
+            // 1. Production invariant: dist_table is only built after dist_hc
+            //    accepts the same lens.
+            let mut dist_hc = DistanceShortBitsCached::<30>::new();
+            if dist_hc.initialize_from_lengths(lens, false) != HcError::None {
+                return false;
+            }
+
+            // 2. DistTable::build must succeed for any lens dist_hc accepted.
+            let dt = DistTable::build(lens)
+                .expect("DistTable::build must return Some when dist_hc accepts");
+
+            // 3. ≥200k bit patterns via seeded LCG.
+            let mut s = pattern_seed;
+            for _ in 0..200_000u32 {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let bits_val: u64 = s;
+
+                // 16-byte stack buffer: two copies give ≥56 bits after Bits::new.
+                let raw = bits_val.to_le_bytes();
+                let buf: [u8; 16] = {
+                    let mut b = [0u8; 16];
+                    b[..8].copy_from_slice(&raw);
+                    b[8..].copy_from_slice(&raw);
+                    b
+                };
+
+                // --- dist_hc path (tracks codeword bits via bit_position delta) ---
+                let mut br = Bits::new(&buf);
+                let bp_before = br.bit_position();
+                let hc_result = dist_hc.decode(&mut br);
+                let hc_valid = hc_result.is_some();
+                let hc_consumed = (br.bit_position() - bp_before) as u8;
+
+                // --- DistTable path ---
+                // For subtable entries +TABLE_BITS are consumed by main lookup.
+                let main_entry = dt.lookup(bits_val);
+                let (dt_entry, dt_consumed) = if main_entry.is_subtable_ptr() {
+                    let sub = dt.lookup_subtable_direct(
+                        main_entry,
+                        bits_val >> (DistTable::TABLE_BITS as u32),
+                    );
+                    (sub, DistTable::TABLE_BITS + sub.codeword_bits())
+                } else {
+                    (main_entry, main_entry.codeword_bits())
+                };
+
+                // Invariant 1: validity must agree — raw()==0 is the
+                // unassigned/invalid-code sentinel, mirrors dist_hc None.
+                assert_eq!(
+                    hc_valid,
+                    dt_entry.raw() != 0,
+                    "validity mismatch: bits_val={bits_val:#018x} hc={hc_result:?} \
+                     dt_raw={:#010x}",
+                    dt_entry.raw()
+                );
+
+                if hc_valid {
+                    let sym = hc_result.unwrap() as usize;
+
+                    // Invariant 2: codeword bits consumed agree.
+                    assert_eq!(
+                        hc_consumed, dt_consumed,
+                        "codeword bits mismatch: sym={sym} bits_val={bits_val:#018x} \
+                         hc={hc_consumed} dt={dt_consumed}"
+                    );
+
+                    // Invariant 3: distance_base matches RFC table.
+                    assert_eq!(
+                        DISTANCE_TABLE[sym].0,
+                        dt_entry.distance_base(),
+                        "distance_base mismatch: sym={sym}"
+                    );
+
+                    // Invariant 4: extra_bits matches RFC table
+                    // (total_bits - codeword_bits for both direct and subtable entries).
+                    assert_eq!(
+                        DISTANCE_TABLE[sym].1,
+                        dt_entry.total_bits() - dt_entry.codeword_bits(),
+                        "extra_bits mismatch: sym={sym}"
+                    );
+                }
+            }
+            true
+        }
+
+        let mut accepted = 0u32;
+        // Seed stream for run_set pattern seeds (independent of set-length LCG).
+        let mut seed = 0xfeed_face_dead_beef_u64;
+        let mut next_seed = || -> u64 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+
+        // --- Fixed sets ---
+
+        // Set 1: all lengths = 5 (Kraft sum = 30/32 < 1, nearly complete).
+        if run_set(&[5u8; 30], next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 2: single symbol at length 1 (degenerate — only one valid code).
+        let mut single_len1 = [0u8; 30];
+        single_len1[0] = 1;
+        if run_set(&single_len1, next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 3: two symbols at length 1 (Kraft-complete, codes 0 and 1).
+        let mut two_len1 = [0u8; 30];
+        two_len1[0] = 1;
+        two_len1[1] = 1;
+        if run_set(&two_len1, next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 4: deep ladder 1,2,...,13,14,14 — Kraft-complete, forces subtable
+        // entries (TABLE_BITS=9; lengths 10-14 require subtable lookup).
+        let mut deep_ladder = [0u8; 30];
+        for i in 0..13usize {
+            deep_ladder[i] = (i + 1) as u8;
+        }
+        deep_ladder[13] = 14;
+        deep_ladder[14] = 14;
+        if run_set(&deep_ladder, next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 5: incomplete/holes — sparse assignment, Kraft sum 0.25 < 1.
+        let mut sparse_holes = [0u8; 30];
+        sparse_holes[0] = 3;
+        sparse_holes[5] = 4;
+        sparse_holes[10] = 5;
+        sparse_holes[15] = 5;
+        if run_set(&sparse_holes, next_seed()) {
+            accepted += 1;
+        }
+
+        // --- ~400 pseudo-random sets ---
+        // Length generation: 30% skip (L=0), 70% uniform in {4..15}.
+        // Expected Kraft sum ≈ 0.22 → acceptance rate ≈ 99%.
+        let mut rng = 0x0123_4567_89ab_cdef_u64;
+        for _ in 0..400u32 {
+            let mut lens = [0u8; 30];
+            for b in &mut lens {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let raw = (rng >> 48) as u8;
+                // 77/256 ≈ 30% → L=0 (skip); rest → L in {4..15}.
+                *b = if raw < 77 { 0 } else { 4 + (raw - 77) % 12 };
+            }
+            if run_set(&lens, next_seed()) {
+                accepted += 1;
+            }
+        }
+
+        // Sanity: verify the LCG produced a reasonable number of accepted sets.
+        assert!(
+            accepted >= 238,
+            "expected ≥238 accepted code-length sets out of 405 tried, got {accepted}"
+        );
     }
 }
