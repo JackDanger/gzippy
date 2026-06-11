@@ -248,20 +248,37 @@ mod imp {
 
     /// The rung-(c) kernel region.
     ///
-    /// STAGE c1 (this commit): the seam itself — the asm carries the FULL
-    /// pinned-operand contract (bit cursor in registers, dst cursor, ctx,
-    /// short-table base, scratch + ret) and executes ONLY the top guards,
-    /// then exits: `EXIT_BOUNDARY` when a guard fails, `EXIT_RECLASS`
-    /// otherwise, with NO state change (X6: `dst` returns unchanged). This
-    /// proves the operand/clobber contract and the caller-side state
-    /// round-trip byte-exact under the production integration — every
-    /// packet crosses the seam in the `GZIPPY_ASM_KERNEL` ON arm and output
-    /// must stay identical. Stages c2/c3 grow the body inside the SAME
-    /// contract.
+    /// STAGE c2 (this commit): the LITERAL hot path lives inside the asm —
+    /// iteration-top guards, raw short-LUT gather, long-code resolution
+    /// (X1: required in-asm so LIT_CHAIN_MAX accounting and hence refill
+    /// placement match the Rust loop exactly), the lone-literal arm with the
+    /// exact P3.2 runtime chain (two gated steps + one always-carry decode,
+    /// each `decode()` preceded by the bit-exact `< 32` backstop refill),
+    /// the packed multi-literal arm, the post-chain / bottom `< 48`
+    /// threshold refills, and the back-edge. Every NON-literal packet (lone
+    /// length/EOB/oversize, multi-with-trailing) exits `EXIT_RECLASS`
+    /// PRE-CONSUME at an iteration top — Rust re-executes it from the
+    /// identical cursor and the next `continue 'fast` re-enters. Stage c3
+    /// moves the backref arm inside.
+    ///
+    /// Asm↔Rust line map (byte-exactness audit):
+    ///   top guards        ↔ marker_inflate.rs `out_ok`/`in_ok` (E4 limits)
+    ///   prologue/carried gather + `20:` long resolve
+    ///                     ↔ lut_huffman.rs `decode_prefilled` (:1055)
+    ///   lone-literal arm  ↔ marker_inflate.rs lone-lit store (1-byte, Q3)
+    ///   chain steps `30:`/`40:`/`60:` ↔ marker_inflate.rs P3.2 chain loop
+    ///                       (gate order side-effect-free; `decode()`'s
+    ///                       backstop = `31:`/`41:`/`62:` refills)
+    ///   post-chain `7:` / bottom `6:` ↔ the `< 48` threshold refills
+    ///   multi arm `22:`   ↔ packed 8-byte store of `sym0 & 0x00FF_FFFF`
+    ///   REFILL sequence   ↔ consume_first_decode.rs `Bits::refill` fast
+    ///                       form (`pos + 8 <= len` structural via
+    ///                       IN_MARGIN; `>64` underflow check dead via E2)
     ///
     /// # Safety
-    /// Caller upholds E1-E6 (module doc). The c1 body only reads `ctx`
-    /// fields and registers.
+    /// Caller upholds E1-E6 (module doc). The asm reads `ctx`, the litlen
+    /// tables and the input window; it writes only `[dst, exit dst + 8)`
+    /// inside the reserved out_room envelope (E4) and the pinned registers.
     #[inline]
     pub unsafe fn run_contig(ctx: &mut KernCtx, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
         let mut bitbuf = lb.bitbuf;
@@ -271,6 +288,12 @@ mod imp {
         let ret: u64;
         unsafe {
             core::arch::asm!(
+                // ── prologue: speculative gather of the packet at the
+                //    cursor (no consume — harmless table read, exactly the
+                //    bits `decode_prefilled` reads).
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
                 // ── iteration top: guards (E4) ──────────────────────────
                 "2:",
                 "mov {ret}, 1",                       // speculative BOUNDARY
@@ -278,21 +301,247 @@ mod imp {
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
-                // c1: hand every in-guard packet to Rust, state unchanged.
-                "mov {ret}, 0",                       // RECLASS
-                // Dead uses pinning the FULL c2/c3 operand contract (asm!
-                // rejects unreferenced named operands; these zero scratch
-                // regs / touch flags only — state operands are not written).
-                "test {bitbuf}, {bitbuf}",
-                "test {bitsleft}, {bitsleft}",
-                "test {short_tbl}, {short_tbl}",
-                "xor {t1:e}, {t1:e}",
-                "xor {t2:e}, {t2:e}",
-                "xor {t3:e}, {t3:e}",
-                "xor {t4:e}, {t4:e}",
+                // ── classify the carried/preloaded entry {t1} ───────────
+                "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT
+                "jnz 20f",                            // long code (cold)
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",                     // bc = bit_count
+                "jz 8f",                              // invalid → Rust (pre-consume)
+                "mov {t3:e}, {t1:e}",
+                "shr {t3:e}, 26",
+                "and {t3:e}, 3",                      // cnt = sym_count
+                "cmp {t3:e}, 1",
+                "jne 22f",                            // multi-literal pack
+                "movzx {t4:e}, {t1:x}",               // code = sym0 & 0xFFFF
+                "cmp {t4:e}, 255",
+                "ja 8f",                              // c2: lone non-literal → Rust
+                // ── lone literal: consume + 1-byte store (Q3) ───────────
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t4:l}",
+                "inc {dst}",
+                // ── chain step A (P3.2; backstop refill ↔ decode()) ─────
+                "30:",
+                "cmp {bitsleft}, 32",
+                "jae 31f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "31:",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "test {t1:e}, 0x2000000",
+                "jnz 33f",                            // long candidate (cold)
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",
+                "jz 7f",                              // gate fail → carry
+                "mov {t3:e}, {t1:e}",
+                "shr {t3:e}, 26",
+                "and {t3:e}, 3",
+                "cmp {t3:e}, 1",
+                "jne 7f",
+                "movzx {t4:e}, {t1:x}",
+                "cmp {t4:e}, 255",
+                "ja 7f",
+                "cmp {t2}, {bitsleft}",
+                "ja 7f",                              // not fully backed → carry
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t4:l}",
+                "inc {dst}",
+                "jmp 40f",
+                "33:",                                // chain A: long resolve
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 26",                     // long_max_len (≤21)
+                "bzhi {t3}, {bitbuf}, {t2}",
+                "shr {t3}, 12",
+                "and {t1:e}, 0x1FFFFFF",
+                "add {t1:e}, {t3:e}",
+                "mov {t2}, qword ptr [{ctx} + 32]",   // long_tbl
+                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 10",                     // bc
+                "jz 34f",
+                "and {t1:e}, 0x3FF",
+                "cmp {t1:e}, 255",
+                "ja 34f",
+                "cmp {t2}, {bitsleft}",
+                "ja 34f",
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t1:l}",
+                "inc {dst}",
+                "jmp 40f",
+                "34:",                                // long gate-fail: reload raw
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "jmp 7f",
+                // ── chain step B (identical, success → always-carry) ────
+                "40:",
+                "cmp {bitsleft}, 32",
+                "jae 41f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "41:",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "test {t1:e}, 0x2000000",
+                "jnz 43f",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",
+                "jz 7f",
+                "mov {t3:e}, {t1:e}",
+                "shr {t3:e}, 26",
+                "and {t3:e}, 3",
+                "cmp {t3:e}, 1",
+                "jne 7f",
+                "movzx {t4:e}, {t1:x}",
+                "cmp {t4:e}, 255",
+                "ja 7f",
+                "cmp {t2}, {bitsleft}",
+                "ja 7f",
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t4:l}",
+                "inc {dst}",
+                "jmp 60f",
+                "43:",                                // chain B: long resolve
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 26",
+                "bzhi {t3}, {bitbuf}, {t2}",
+                "shr {t3}, 12",
+                "and {t1:e}, 0x1FFFFFF",
+                "add {t1:e}, {t3:e}",
+                "mov {t2}, qword ptr [{ctx} + 32]",
+                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 10",
+                "jz 44f",
+                "and {t1:e}, 0x3FF",
+                "cmp {t1:e}, 255",
+                "ja 44f",
+                "cmp {t2}, {bitsleft}",
+                "ja 44f",
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t1:l}",
+                "inc {dst}",
+                "jmp 60f",
+                "44:",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "jmp 7f",
+                // ── chain step C: third decode, ALWAYS carried (the Rust
+                //    loop's `chained < LIT_CHAIN_MAX` fails at 2) — its
+                //    backstop refill still fires (X1).
+                "60:",
+                "cmp {bitsleft}, 32",
+                "jae 62f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "62:",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                // fall through: post-chain threshold refill
+                // ── post-chain `< 48` refill + back edge (carried {t1}
+                //    stays valid: refills are append-only, low 12 bits and
+                //    the ≤21 bits a long resolve reads are unchanged).
+                "7:",
+                "cmp {bitsleft}, 48",
+                "jae 71f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "71:",
+                "jmp 2b",
+                // ── bottom (litpack path): `< 48` refill + preload ──────
+                "6:",
+                "cmp {bitsleft}, 48",
+                "jae 63f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "63:",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "jmp 2b",
+                // ── multi-literal pack ({t1}=e, {t2}=bc, {t3}=cnt) ──────
+                "22:",
+                "lea {t4:e}, [{t3:e} - 1]",
+                "shl {t4:e}, 3",                      // 8*(cnt-1)
+                "mov {ret:e}, {t1:e}",                // ret as 5th scratch here
+                "and {ret:e}, 0x1FFFFFF",             // packed syms
+                "shrx {t4:e}, {ret:e}, {t4:e}",
+                "and {t4:e}, 0xFFFF",                 // trailing element
+                "cmp {t4:e}, 255",
+                "ja 8f",                              // trailing non-literal → Rust
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume whole packet
+                "sub {bitsleft}, {t2}",
+                "and {ret:e}, 0xFFFFFF",              // sym0 & 0x00FF_FFFF
+                "mov qword ptr [{dst}], {ret}",       // speculative 8-byte store
+                "add {dst}, {t3}",                    // advance by sym_count
+                "jmp 6b",
+                // ── long code at top (decode_prefilled long path) ───────
+                "20:",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 26",                     // long_max_len (≤21)
+                "bzhi {t3}, {bitbuf}, {t2}",          // == bitbuf & ((1<<lml)-1)
+                "shr {t3}, 12",                       // >> ISAL_DECODE_LONG_BITS
+                "and {t1:e}, 0x1FFFFFF",
+                "add {t1:e}, {t3:e}",                 // long_idx
+                "mov {t2}, qword ptr [{ctx} + 32]",
+                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 10",                     // bc
+                "jz 8f",                              // invalid → Rust
+                "and {t1:e}, 0x3FF",                  // symbol
+                "cmp {t1:e}, 255",
+                "ja 8f",                              // c2: lone non-literal → Rust
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // lone literal via long path
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t1:l}",
+                "inc {dst}",
+                "jmp 30b",                            // → chain
+                // ── exits ───────────────────────────────────────────────
+                "8:",
+                "mov {ret}, 0",                       // RECLASS (pre-consume)
                 "9:",
                 ctx = in(reg) ctx as *mut KernCtx,
                 short_tbl = in(reg) ctx.short_tbl,
+                in_ptr = in(reg) ctx.in_ptr,
                 bitbuf = inout(reg) bitbuf,
                 bitsleft = inout(reg) bitsleft,
                 pos = inout(reg) pos,
@@ -345,6 +594,77 @@ pub use imp::{dump_if_enabled, enabled, note_exit, run_contig, stats_enabled};
 /// Non-asm builds: constant-false dispatch, no-op dump — call sites fold away.
 #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
 pub fn dump_if_enabled() {}
+
+/// Pure-Rust REFERENCE MODEL of the asm region's c2 contract — the exact
+/// literal-arm subset of `decode_clean_into_contig`'s fast loop (same
+/// guards, same decode/backstop/threshold refill placement, same stores,
+/// same RECLASS rules), expressed through the production primitives
+/// (`LutLitLenCode::{decode, decode_prefilled}`, `Bits`). The differential
+/// test pins asm == ref on (exit, bit cursor, dst, output bytes); the
+/// ref's own equivalence to the production loop is by line-map inspection
+/// (see `run_contig` doc) and by the guest suite/sha grid.
+#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+pub fn run_contig_ref(
+    lut: &super::lut_huffman::LutLitLenCode,
+    lb: &mut Bits<'_>,
+    out: &mut [u8],
+    dst: &mut usize,
+    out_lim: usize,
+    in_lim: usize,
+) -> u64 {
+    loop {
+        if *dst >= out_lim || lb.pos >= in_lim {
+            return EXIT_BOUNDARY;
+        }
+        let pre = lut.decode_prefilled(lb);
+        if pre.bit_count == 0 {
+            return EXIT_RECLASS;
+        }
+        if pre.sym_count == 1 {
+            let code = pre.symbol & 0xFFFF;
+            if code > 255 {
+                return EXIT_RECLASS; // c2: lone non-literal → Rust
+            }
+            lb.consume(pre.bit_count);
+            out[*dst] = code as u8;
+            *dst += 1;
+            // P3.2 chain: two gated steps + one always-carry decode.
+            let mut chained = 0usize;
+            loop {
+                let nxt = lut.decode(lb);
+                let ncode = nxt.symbol & 0xFFFF;
+                if chained < 2
+                    && nxt.sym_count == 1
+                    && nxt.bit_count != 0
+                    && ncode <= 255
+                    && nxt.bit_count <= lb.available()
+                {
+                    lb.consume(nxt.bit_count);
+                    out[*dst] = ncode as u8;
+                    *dst += 1;
+                    chained += 1;
+                    continue;
+                }
+                break;
+            }
+            if (lb.bitsleft as u8) < 48 {
+                lb.refill();
+            }
+        } else {
+            let last = (pre.symbol >> (8 * (pre.sym_count - 1))) & 0xFFFF;
+            if last > 255 {
+                return EXIT_RECLASS; // trailing non-literal → Rust
+            }
+            lb.consume(pre.bit_count);
+            let packed = (pre.symbol & 0x00FF_FFFF) as u64;
+            out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
+            *dst += pre.sym_count as usize;
+            if (lb.bitsleft as u8) < 48 {
+                lb.refill();
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -415,5 +735,126 @@ mod tests {
         let (exit, _) = unsafe { run_contig(&mut ctx, &mut lb, dst) };
         assert_eq!(exit, EXIT_BOUNDARY);
         assert_eq!(lb.bitsleft, 56);
+    }
+
+    /// Stage c2 differential: the asm region vs the pure-Rust reference
+    /// model over random bitstreams × three table shapes (fixed-Huffman
+    /// with length codes → RECLASS coverage; dense short codes → multi-sym
+    /// packing + chain coverage; 13-bit literal codes → long-path
+    /// resolution at top AND inside the chain) × varying out budgets
+    /// (BOUNDARY coverage). Compares exit code, full bit cursor
+    /// (pos/bitbuf/bitsleft — X1 state equality), dst advance, and every
+    /// output byte below dst (X3). Skips the asm half without BMI2 (local
+    /// Rosetta); the guest gauntlet is authoritative.
+    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[test]
+    fn c2_differential_asm_vs_ref_random_streams() {
+        use crate::decompress::parallel::lut_huffman::LutLitLenCode;
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            eprintln!("SKIP c2 differential: no BMI2 on this host (run on guest)");
+            return;
+        }
+        // Fixed-Huffman litlen lens (RFC1951 §3.2.6) — 7-9-bit codes,
+        // length/EOB symbols present.
+        let mut fixed = vec![8u8; 288];
+        fixed[144..256].iter_mut().for_each(|x| *x = 9);
+        fixed[256..280].iter_mut().for_each(|x| *x = 7);
+        // Dense short codes (Kraft-complete) — exercises 2-3-sym packing
+        // and the literal chain: lens {2,2,3,3,4,4,4(eob)} + 4×6.
+        let mut dense = vec![0u8; 286];
+        dense[0] = 2;
+        dense[1] = 2;
+        dense[2] = 3;
+        dense[3] = 3;
+        dense[4] = 4;
+        dense[5] = 4;
+        dense[256] = 4;
+        dense[6] = 6;
+        dense[7] = 6;
+        dense[8] = 6;
+        dense[9] = 6;
+        // Long-code-heavy (Kraft-complete): lens 1..6 for a few hot
+        // literals + EOB, remainder 1/64 as 128 literals at 13 bits —
+        // populates long_code_lookup with LITERALS (long resolve at top
+        // and inside the chain).
+        let mut longy = vec![0u8; 286];
+        longy[0] = 1;
+        longy[1] = 2;
+        longy[2] = 3;
+        longy[3] = 4;
+        longy[4] = 5;
+        longy[256] = 6;
+        for s in 5..133 {
+            longy[s] = 13;
+        }
+        let build = |lens: &[u8]| -> LutLitLenCode {
+            let mut c = LutLitLenCode::new_empty();
+            assert!(c.rebuild_from(lens), "test table lens must be valid");
+            c
+        };
+        let tables = [build(&fixed), build(&dense), build(&longy)];
+
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        for (ti, tbl) in tables.iter().enumerate() {
+            for trial in 0..4000 {
+                // Random input stream, long enough for the margin scheme.
+                let n = 96 + (next() as usize % 400);
+                let data: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                let in_lim = data.len().saturating_sub(IN_MARGIN);
+                // Varying out budget: small values force BOUNDARY exits.
+                let out_lim = 4 + (next() as usize % 240);
+                let buf_len = out_lim + 16; // FAST_OUT_SLOP-class envelope
+                let mut out_ref = vec![0u8; buf_len];
+                let mut out_asm = vec![0u8; buf_len];
+
+                let mut lb_ref = Bits::new(&data);
+                let mut lb_asm = Bits {
+                    data: &data,
+                    pos: lb_ref.pos,
+                    bitbuf: lb_ref.bitbuf,
+                    bitsleft: lb_ref.bitsleft,
+                };
+
+                let mut dref = 0usize;
+                let ref_exit =
+                    run_contig_ref(tbl, &mut lb_ref, &mut out_ref, &mut dref, out_lim, in_lim);
+
+                let dst0 = out_asm.as_mut_ptr();
+                let mut ctx = KernCtx {
+                    in_ptr: data.as_ptr() as u64,
+                    in_lim: in_lim as u64,
+                    out_lim: dst0 as u64 + out_lim as u64,
+                    out_base: dst0 as u64,
+                    long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
+                    dist_tbl: 0,
+                    save_bitbuf: 0,
+                    save_bitsleft: 0,
+                    short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
+                };
+                let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
+                let dasm = (dst1 as usize) - (dst0 as usize);
+
+                let tag = format!("table {ti} trial {trial}");
+                assert_eq!(ref_exit, asm_exit, "exit diverged ({tag})");
+                assert_eq!(dref, dasm, "dst advance diverged ({tag})");
+                assert_eq!(lb_ref.pos, lb_asm.pos, "pos diverged ({tag})");
+                assert_eq!(lb_ref.bitbuf, lb_asm.bitbuf, "bitbuf diverged ({tag})");
+                assert_eq!(
+                    lb_ref.bitsleft, lb_asm.bitsleft,
+                    "bitsleft diverged ({tag})"
+                );
+                assert_eq!(
+                    &out_ref[..dref],
+                    &out_asm[..dasm],
+                    "output bytes diverged ({tag})"
+                );
+            }
+        }
     }
 }
