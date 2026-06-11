@@ -238,6 +238,19 @@ class GzippyAdapter(ProjectAdapter):
                                "state-dependence of the -99.9ms finding"),
         "eager_postproc": Knob("GZIPPY_EAGER_POSTPROC=1", "none",
                                "eager consumer post-processing (opt-in)"),
+        # ISA-L-specific: always-small initial buffer (faithful rapidgzip
+        # ALLOCATION_CHUNK_SIZE segment-append) vs the default ratio-informed
+        # upfront reserve.  Effect predicate is "none" — no in-tree counter
+        # tracks growth mode; A/B is wall-only.  Only meaningful on
+        # gzippy-isal (the ISA-L clean-tail build); vacuous on gzippy-native
+        # (GZIPPY_ISAL_INCREMENTAL_GROWTH is read only inside the isal
+        # clean-tail code path).
+        "isal_incremental_growth": Knob(
+            "GZIPPY_ISAL_INCREMENTAL_GROWTH=1", "none",
+            "ISA-L always-small initial buffer (vs ratio-informed reserve): "
+            "faithfully ports rapidgzip ALLOCATION_CHUNK_SIZE=128KiB "
+            "append loop; knob arm = always-small; base arm = production "
+            "ratio-reserve"),
     }
 
     perturbations = {
