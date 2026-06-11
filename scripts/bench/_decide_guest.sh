@@ -59,14 +59,29 @@ mf "bin_sha=$BIN_SHA"
 mf "feature=$FEATURE"
 # ---- measurement fingerprint (FINGERPRINT-OR-NO-COMPARE / SINK-LAW) ----------
 # protocol: bumped whenever the meaning of a stored number changes; the
-# analyzer refuses ratios across protocols. Sink classes recorded PER ARM:
-# both arms are assert_regular_sink-verified regular files on the same fs —
-# a mixed-sink artifact is refused outright by the analyzer (the 2026-06-11
-# half-rebased-matrix phantom, SINK LAW).
+# analyzer refuses ratios across protocols. Sink classes recorded PER ARM and
+# DERIVED via stat (sink_class_of), never self-reported: both arms are
+# assert_regular_sink-verified regular files on the same fs — a mixed-sink
+# artifact is refused outright by the analyzer (the 2026-06-11
+# half-rebased-matrix phantom, SINK LAW). The *_derived duplicate keys let
+# the analyzer cross-check any self-report against the observation.
+SINK_A="$OUT/sink_a.bin"; SINK_B="$OUT/sink_b.bin"
+assert_regular_sink "$SINK_A"; assert_regular_sink "$SINK_B"
+SINK_GZ_CLASS="$(sink_class_of "$SINK_A")"
+SINK_RG_CLASS="$(sink_class_of "$SINK_B")"
 mf "protocol=fulcrum-v3"
-mf "sink_gz=regular-file"
-mf "sink_rg=regular-file"
+mf "sink_gz=$SINK_GZ_CLASS"
+mf "sink_rg=$SINK_RG_CLASS"
+mf "sink_gz_derived=$SINK_GZ_CLASS"
+mf "sink_rg_derived=$SINK_RG_CLASS"
 mf "rg_version=$("$RG_CMD" --version 2>&1 | head -1 | tr -d '\n')"
+# ---- host identity (fingerprint `host` field: cpu|kernel|id; DERIVED, never
+# self-reported). The host id is the machine-id HASHED (stable, non-reversible);
+# cross-host comparisons refuse — same binary on a different box is a
+# different experiment.
+mf "host_cpu_model=$(awk -F': *' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+mf "host_kernel=$(uname -r 2>/dev/null || true)"
+mf "host_id=$( (cat /etc/machine-id 2>/dev/null || hostname) | sha256sum | cut -c1-12 )"
 mf "freeze_state=$FREEZE_STATE"
 mf "quiet_state=$QUIET_STATE"
 mf "governor=$ACT_GOV"
@@ -115,9 +130,6 @@ ensure_ref() { # <corpus>
 }
 
 # ---- helpers -------------------------------------------------------------------
-SINK_A="$OUT/sink_a.bin"; SINK_B="$OUT/sink_b.bin"
-assert_regular_sink "$SINK_A"; assert_regular_sink "$SINK_B"
-
 expect_path_for() { # <T> -> the production DecodePath this cell must take
   if [ "$FEATURE" = "gzippy-isal" ] && [ "$1" = 1 ]; then echo IsalSingleShot
   else echo ParallelSM; fi
@@ -135,9 +147,12 @@ routing_assert() { # <corpus> <T>
 
 # ---- per-cell measurement -------------------------------------------------------
 run_cell() { # <corpus> <T>
-  local c="$1" t="$2" mask cdir f i gsec gsha rsec rsha GZT="" RGT="" DIVERGED=0
+  local c="$1" t="$2" mask maskd cdir f i gsec gsha rsec rsha GZT="" RGT="" DIVERGED=0
   mask="$(pin_mask "$t")"
   [ -n "$mask" ] || decide_fail "bad-T:$t (use 1,4,8,16)" 8
+  # DERIVED mask: the kernel's readback of the requested pin (a cpuset-shrunk
+  # or silently-failed pin is caught by the analyzer's canonical comparison).
+  maskd="$(mask_readback "$mask")"
   ensure_ref "$c"
   f="$(corpus_path "$c")"
   cdir="$OUT/cell_${c}_T${t}"; mkdir -p "$cdir"
@@ -154,7 +169,7 @@ run_cell() { # <corpus> <T>
   [ "$DIVERGED" -eq 0 ] || decide_fail "sha-mismatch $c:T$t (wrong-bytes — number VOID)" 11
   echo "$GZT" | tr ' ' '\n' | grep -v '^$' > "$cdir/wall_gz.txt"
   echo "$RGT" | tr ' ' '\n' | grep -v '^$' > "$cdir/wall_rg.txt"
-  mf "cell_done=$c:$t:mask=$mask:sha_ok=1"
+  mf "cell_done=$c:$t:mask=$mask:maskd=${maskd:-unreadable}:sha_ok=1"
 
   # -- trace capture (1 run; counters/trace are NOT wall numbers -> labeled).
   #    REGULAR-FILE sink, never a pipe (the writev-phantom class): the spine rule

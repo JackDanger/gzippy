@@ -118,9 +118,10 @@ INVARIANTS = (
     Invariant(
         name="FINGERPRINT-OR-NO-COMPARE",
         rule="Every stored number carries {sink, mask, freeze, binary sha, "
-             "corpus sha, protocol version}; ratios/deltas across incompatible "
-             "or unknown fingerprints are REFUSED; ledger contradiction checks "
-             "compare ONLY fingerprint-compatible rows.",
+             "corpus sha, protocol version, comparator version, host "
+             "identity}; ratios/deltas across incompatible or unknown "
+             "fingerprints are REFUSED; ledger contradiction checks compare "
+             "ONLY fingerprint-compatible rows.",
         scar="The cyc/iter 'regression' that was a TSC frequency-state mismatch "
              "between captures; the stale rg-anchor ('0.98x' vs a banked 926.6 "
              "when the live comparator ran 810).",

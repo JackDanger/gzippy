@@ -224,7 +224,8 @@ class GzippyAdapter(ProjectAdapter):
         "slab_alloc": Knob("GZIPPY_SLAB_ALLOC=1", "rpmalloc_stats",
                            "slab allocator force-on (the reverted lever, "
                            "reconciled: auto-ON at T<=GZIPPY_SLAB_MAX_T — "
-                           "expect CAUSAL-NULL at default-ON cells)"),
+                           "expect CAUSAL-NULL at default-ON cells)",
+                           reverted=True),
         "slab_off": Knob("GZIPPY_SLAB_ALLOC=0", "rpmalloc_stats_off",
                          "slab force-OFF (gate proof: at T1 default-ON the "
                          "knob arm must lose the slab win and zero the slab "
@@ -249,6 +250,20 @@ class GzippyAdapter(ProjectAdapter):
         "idle": ("scheduling-state probe: N=21 re-measure (bimodal check) "
                  "before anything"),
     }
+
+    # ---- comparator identity --------------------------------------------------
+    def comparator_version(self, manifest):
+        """Normalize the rapidgzip --version banner recorded by the guest
+        (`rg_version=`). Handles both the full banner ("rapidgzip, CLI to
+        the ... library rapidgzip version 0.16.0") and the short
+        "rapidgzip 0.16.0" form. Unknown stays unknown (never compares)."""
+        raw = (manifest.get("rg_version") or "").strip()
+        if not raw:
+            return "unknown"
+        m = re.search(r"(\d+\.\d+(?:\.\d+)*)\s*$", raw)
+        if m:
+            return f"rapidgzip {m.group(1)}"
+        return raw  # unrecognized shape: keep verbatim (still a known value)
 
     # ---- counters / guards --------------------------------------------------
     def parse_counters(self, text):
@@ -480,6 +495,8 @@ class GzippyAdapter(ProjectAdapter):
             bounded = gap_ms * c["share_pct"] / 100.0
             rows.append({
                 "component": f"engine.{cls_name}",
+                "kind": "engine",
+                "perturb_cmd": self.perturbations["compute"],
                 "cells": f"{ck[0]}:T{ck[1]}",
                 "attrib": (f"{c['share_pct']:.1f}% of classed cyc, "
                            f"{c['cyc_iter']:.1f} cyc/iter, "

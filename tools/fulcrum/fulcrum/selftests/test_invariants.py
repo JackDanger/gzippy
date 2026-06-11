@@ -34,7 +34,9 @@ from .test_decide import RG, make_artifact, write_samples
 AD = GzippyAdapter()
 
 FP = Fingerprint(sink="regular-file", mask="0", freeze="frozen",
-                 bin_sha="deadbeef", corpus_sha="028bd002", protocol="fulcrum-v3")
+                 bin_sha="deadbeef", corpus_sha="028bd002",
+                 protocol="fulcrum-v3", comparator="rapidgzip 0.16.0",
+                 host="testcpu-13700T|6.0-test|abc123def456")
 
 
 def run():
@@ -49,8 +51,10 @@ def run():
     d = tempfile.mkdtemp(prefix="fulcrum_inv_sink_")
     make_artifact(d, with_knobs=False, v3=True)
     man_path = os.path.join(d, "manifest.txt")
-    txt = open(man_path).read().replace("sink_gz=regular-file",
-                                        "sink_gz=devnull")
+    txt = (open(man_path).read()
+           .replace("sink_gz=regular-file", "sink_gz=devnull")
+           .replace("sink_gz_derived=regular-file",
+                    "sink_gz_derived=devnull"))
     open(man_path, "w").write(txt)
     raised = None
     try:
@@ -109,6 +113,110 @@ def run():
     fp_othermask = Fingerprint(**{**FP.to_dict(), "mask": "0,2,4,6"})
     check(any("mask" in r for r in incompatibilities(FP, fp_othermask)),
           "mask mismatch surfaced by name (free-placement numbers lie)")
+
+    # ------------------------------------------------------------------
+    # DERIVED-NOT-SELF-REPORTED fields (P2 item 3): a lying manifest is
+    # caught — the derivation governs the fingerprint, the self-report is
+    # cross-checked and flagged.
+    # ------------------------------------------------------------------
+    from ..core.decide import canon_mask, derived_mismatches
+    # Lying sink self-report (claim devnull, stat says regular-file): the
+    # derived value governs (analysis proceeds, complete fingerprint), and
+    # the lie is flagged verbatim.
+    d_lie = tempfile.mkdtemp(prefix="fulcrum_inv_lying_")
+    make_artifact(d_lie, with_knobs=False, v3=True)
+    man_lie = os.path.join(d_lie, "manifest.txt")
+    txt_lie = open(man_lie).read().replace("sink_gz=regular-file",
+                                           "sink_gz=devnull")
+    open(man_lie, "w").write(txt_lie)
+    rep_lie = analyze_run(load_run(d_lie, AD), AD)
+    check(any("DERIVED-MISMATCH" in a and "sink_gz=devnull" in a
+              for a in rep_lie["anomalies"]),
+          "lying manifest: self-reported sink contradicting the stat "
+          "derivation is FLAGGED (DERIVED-MISMATCH, verbatim)")
+    check(bool(rep_lie["scoreboard"]) and
+          "FP-INCOMPLETE" not in rep_lie["scoreboard"][0],
+          "lying manifest: the DERIVED value governs the fingerprint "
+          "(cell still ranks, complete fingerprint)")
+    # Lying freeze claim: frozen with NA sysfs readbacks is flagged.
+    check(any("freeze_state=frozen claimed" in a for a in derived_mismatches(
+        {"freeze_state": "frozen", "governor": "NA", "no_turbo": "1",
+         "cell_meta": {}})),
+          "lying manifest: freeze_state=frozen with an NA sysfs readback "
+          "is FLAGGED (frozen requires READ values)")
+    check(derived_mismatches(
+        {"freeze_state": "frozen", "governor": "performance", "no_turbo": "1",
+         "cell_meta": {}}) == [],
+          "control: frozen with real sysfs readbacks passes the cross-check")
+    # Mask: the taskset readback governs; a pin that did not take is flagged.
+    mm = derived_mismatches({"cell_meta": {("silesia", 1):
+                                           {"mask": "0", "maskd": "0-15"}}})
+    check(any("pin did not take" in a for a in mm),
+          "mask readback mismatch (requested 0, kernel says 0-15) FLAGGED — "
+          "the pin did not take")
+    check(derived_mismatches(
+        {"cell_meta": {("silesia", 16):
+                       {"mask": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+                        "maskd": "0-15"}}}) == [],
+          "mask canonical equivalence: '0-15' readback == the requested "
+          "16-cpu list (formatting is not a lie)")
+    check(canon_mask("0-15") == canon_mask(
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15")
+        and canon_mask("0,2,4,6") == "0,2,4,6"
+        and canon_mask("garbage") == "unknown",
+          "canon_mask: range/list equivalence + unparseable => unknown")
+
+    # ------------------------------------------------------------------
+    # COMPARATOR-VERSION + HOST-IDENTITY fields (P2 item 2 — the
+    # rapidgzip-version-drift and cross-host scenarios).
+    # ------------------------------------------------------------------
+    fp_rg17 = Fingerprint(**{**FP.to_dict(), "comparator": "rapidgzip 0.17.0"})
+    check(any("comparator" in r for r in incompatibilities(FP, fp_rg17)),
+          "comparator-version drift (0.16.0 vs 0.17.0) => incompatible, "
+          "reason names the comparator field")
+    fp_otherbox = Fingerprint(**{**FP.to_dict(),
+                                 "host": "otherCPU|6.1|deadbeef0000"})
+    check(any("host" in r for r in incompatibilities(FP, fp_otherbox)),
+          "host-identity mismatch => incompatible, reason names host "
+          "(same binary on a different box is a different experiment)")
+    # The rapidgzip-version-drift ledger scenario: an rg wall banked under
+    # 0.16.0 must NOT read as bank drift when 0.17.0 measures differently.
+    led_v = Ledger(os.path.join(tempfile.mkdtemp(prefix="fulcrum_inv_vdrift_"),
+                                "ledger.jsonl"))
+    led_v.append(make_record("run_v16", "gzippy", "cell", "silesia:T1:rg",
+                             917.0, 7, 1.0, "comparator", FP))
+    live_v17 = make_record("run_v17", "gzippy", "cell", "silesia:T1:rg",
+                           810.0, 7, 1.0, "comparator", fp_rg17)
+    check(led_v.contradictions(live_v17) == [],
+          "rapidgzip-version-drift: 0.17.0 wall differing from the banked "
+          "0.16.0 wall is NOT a contradiction (different experiment, "
+          "never compared)")
+    live_same16 = make_record("run_v16b", "gzippy", "cell", "silesia:T1:rg",
+                              810.0, 7, 1.0, "comparator", FP)
+    check(len(led_v.contradictions(live_same16)) == 1,
+          "control: the SAME comparator version drifting -21% DOES "
+          "contradict (real bank drift still caught)")
+    # comparator_version() probe: full banner, short form, absent.
+    full_banner = ("rapidgzip, CLI to the parallelized, indexed, and seekable "
+                   "gzip decoding library rapidgzip version 0.16.0")
+    check(AD.comparator_version({"rg_version": full_banner})
+          == "rapidgzip 0.16.0",
+          "comparator_version probe normalizes the full --version banner")
+    check(AD.comparator_version({"rg_version": "rapidgzip 0.16.0"})
+          == "rapidgzip 0.16.0",
+          "comparator_version probe accepts the short form")
+    check(AD.comparator_version({}) == "unknown",
+          "comparator_version probe: absent rg_version => unknown "
+          "(never compares)")
+    # host_identity(): all three fields or nothing.
+    from ..core.decide import host_identity
+    check(host_identity({"host_cpu_model": "c", "host_kernel": "k",
+                         "host_id": "i"}) == "c|k|i",
+          "host_identity composes cpu|kernel|id")
+    check(host_identity({"host_cpu_model": "c", "host_kernel": "k"})
+          == "unknown",
+          "host_identity: partial identity => unknown (cannot certify "
+          "same-host)")
 
     # SINK-LAW via assert_comparable: sink mismatch names SINK-LAW, not the
     # generic invariant.
@@ -187,6 +295,106 @@ def run():
     check(any("CONTRADICTS-LEDGER" in a for a in rep_l2["anomalies"]),
           "e2e ledger: drifted comparator wall (the rg-anchor case) surfaces "
           "CONTRADICTS-LEDGER in the report")
+    # The contradicting live row is NOT auto-banked as an anchor: it lands
+    # pending-reconcile; the un-contradicted gz row of the same run banks
+    # active.
+    led_rt = Ledger(lpath)
+    rg_rows = [r for r in led_rt.rows()
+               if r.get("key") == "silesia:T1:rg" and r.get("runid") == "st2"]
+    check(len(rg_rows) == 1 and rg_rows[0].get("status") == "pending-reconcile",
+          "e2e ledger: contradicting live rg row banked pending-reconcile, "
+          "not as an anchor")
+    check(any("pending-reconcile" in a and "supersede" in a
+              for a in rep_l2["anomalies"]),
+          "e2e ledger: report names the pending-reconcile banking + the "
+          "supersede resolution path")
+    rg_anchors = led_rt.anchors(key="silesia:T1:rg")
+    check([r.get("runid") for r in rg_anchors] == ["st"],
+          "e2e ledger: anchor set for the contested key is still ONLY the "
+          "original banked row (pending never anchors)")
+
+    # ------------------------------------------------------------------
+    # POISON-THEN-SUPERSEDE (the P2 gate case): a contested anchor is
+    # retired by an explicit supersede record; the pending row is promoted;
+    # subsequent runs compare against the NEW anchor only.
+    # ------------------------------------------------------------------
+    # A third drifted run still contradicts the ORIGINAL anchor — never the
+    # pending row (a contested number must not become the next run's truth).
+    live3 = make_record("st3", "gzippy", "cell", "silesia:T1:rg",
+                        728.0, 7, 1.0, "comparator",
+                        Fingerprint.from_dict(rg_anchors[0]["fingerprint"]))
+    c3 = led_rt.contradictions(live3)
+    check(len(c3) == 1 and "918.0ms banked" in c3[0],
+          f"poison: 3rd drifted run contradicts ONLY the original anchor "
+          f"(pending row never used as an anchor) — got {len(c3)} "
+          f"contradiction(s)")
+    # Resolve: supersede the original rg row, promoting the pending st2 row.
+    led_rt.supersede("silesia:T1:rg", retire_runid="st",
+                     reason="comparator rebuilt; old anchor measured a stale "
+                            "binary", promote_runid="st2")
+    rg_anchors2 = led_rt.anchors(key="silesia:T1:rg")
+    check([r.get("runid") for r in rg_anchors2] == ["st2"],
+          "supersede: retired row stops anchoring; promoted pending row IS "
+          "the new anchor")
+    check(led_rt.contradictions(live3) == [],
+          "supersede: post-resolution drifted value agrees with the new "
+          "anchor — no contradiction")
+    # The file is append-only: the retired row is still IN the ledger.
+    check(any(r.get("runid") == "st" and r.get("key") == "silesia:T1:rg"
+              for r in led_rt.rows()),
+          "supersede: retired row remains in the file (append-only — "
+          "retired, not rewritten)")
+    # has_run counts only measurement rows (a supersede carries no runid).
+    check(led_rt.has_run("st2") and not led_rt.has_run("no-such-run"),
+          "has_run: measurement rows only, unaffected by resolution records")
+
+    # invalidate: a measurement-error row is retired outright, nothing
+    # promoted.
+    led_inv = Ledger(os.path.join(ltmp, "ledger_inv.jsonl"))
+    led_inv.append(make_record("run_X", "gzippy", "cell", "model:T8:rg",
+                               500.0, 7, 1.0, "comparator", FP))
+    live_inv = make_record("run_Y", "gzippy", "cell", "model:T8:rg",
+                           600.0, 7, 1.0, "comparator", FP)
+    check(len(led_inv.contradictions(live_inv)) == 1,
+          "invalidate setup: live contradicts the to-be-invalidated row")
+    led_inv.invalidate("model:T8:rg", target_runid="run_X",
+                       reason="mislabeled binary (native run as isal)")
+    check(led_inv.contradictions(live_inv) == []
+          and led_inv.anchors(key="model:T8:rg") == [],
+          "invalidate: target row retired as an anchor; no promotion")
+
+    # ------------------------------------------------------------------
+    # Hash chain (tamper evidence for the append-only CONVENTION).
+    # ------------------------------------------------------------------
+    led_ch = Ledger(os.path.join(ltmp, "ledger_chain.jsonl"))
+    led_ch.append(make_record("run_1", "gzippy", "cell", "k:T1:gz",
+                              100.0, 7, 1.0, "gzippy", FP))
+    led_ch.append(make_record("run_2", "gzippy", "cell", "k:T1:gz",
+                              101.0, 7, 1.0, "gzippy", FP))
+    led_ch.supersede("k:T1:gz", retire_runid="run_1", reason="test")
+    check(all(r.get("chain") for r in led_ch.rows())
+          and led_ch.verify_chain() == [],
+          "hash chain: every appended record chained; verify_chain clean on "
+          "an untampered ledger")
+    # Tamper with a middle row's value (keeping its stored chain): caught.
+    with open(led_ch.path) as f:
+        lines = f.readlines()
+    lines[1] = lines[1].replace('"value_ms": 101.0', '"value_ms": 90.0')
+    with open(led_ch.path, "w") as f:
+        f.writelines(lines)
+    breaks = led_ch.verify_chain()
+    check(len(breaks) >= 1 and "append-only violated" in breaks[0],
+          "hash chain: edited row CAUGHT by verify_chain (tamper evidence)")
+    # Pre-chain rows (legacy ledger) are tolerated; chained suffix verifies.
+    led_old = Ledger(os.path.join(ltmp, "ledger_prechain.jsonl"))
+    with open(led_old.path, "w") as f:
+        f.write('{"kind": "cell", "key": "old:T1:gz", "runid": "r0", '
+                '"value_ms": 5.0}\n')
+    led_old.append(make_record("r1", "gzippy", "cell", "old:T1:gz",
+                               6.0, 7, 1.0, "gzippy", FP))
+    check(led_old.verify_chain() == [],
+          "hash chain: pre-chain legacy rows tolerated (chain covers the "
+          "chained suffix only — documented honestly)")
 
     # ------------------------------------------------------------------
     # SHA-OR-VOID: a cell whose manifest row lacks sha_ok=1 is voided.

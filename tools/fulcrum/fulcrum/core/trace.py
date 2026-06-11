@@ -2,15 +2,16 @@
 
 WHY THIS EXISTS
 ===============
-The gzippy->rapidgzip parity campaign was repeatedly MISLED by instruments:
-  - slack-masked decodeBlock SUMs read as wall binders (a region's SUM can be
-    huge AND wall-neutral; SUM != wall);
-  - SEEDED oracles that route to the clean engine and mask the real
-    (window-absent marker bootstrap) binder;
+Performance campaigns are repeatedly MISLED by their own trace tooling
+(docs/CASE-STUDIES.md has the originals):
+  - slack-masked SUMs read as wall binders (a region's SUM can be huge AND
+    wall-neutral; SUM != wall);
+  - seeded/oracle-contaminated runs that mask the real binder while looking
+    like production;
   - counter inversions (a misnamed counter read backwards twice);
-  - nested-span double-counts (the combine_crc "62ms" phantom);
-  - a clean-window oracle that silently re-ran the bootstrap, and another that
-    emitted EMPTY output.
+  - nested-span double-counts (a phantom "serial cost" that was an O(1) op);
+  - instruments that were themselves broken: an oracle that silently re-ran
+    the work it claimed to remove, a capture that emitted EMPTY output.
 
 Every number this module produces is backed by an assertion that FAILS LOUD if
 the precondition that makes the number meaningful is violated. It NEVER renders

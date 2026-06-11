@@ -1,10 +1,11 @@
 """Sample statistics + distribution health (the SPREAD-RESOLUTION invariant).
 
-Scar: sessions were spent measuring TIEs, and the N=21 silesia-T16 lesson —
-comparator distributions go bimodal/quantized, so a median can sit on either
-mode. Every verdict therefore carries RESOLVED/UNRESOLVED with N-needed, a
-sub-spread delta is NEVER presented as a finding, and bimodality is detected
-on every sample set.
+A delta smaller than the arms' spread is not a finding, and wall
+distributions go bimodal under scheduling regimes (a median can sit on
+either mode) — whole sessions have been spent "measuring" such ties; see
+docs/CASE-STUDIES.md ("the bimodal comparator"). Every verdict therefore
+carries RESOLVED/UNRESOLVED with N-needed, a sub-spread delta is NEVER
+presented as a finding, and bimodality is detected on every sample set.
 """
 
 import math
