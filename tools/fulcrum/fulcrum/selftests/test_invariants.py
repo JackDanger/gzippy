@@ -51,8 +51,10 @@ def run():
     d = tempfile.mkdtemp(prefix="fulcrum_inv_sink_")
     make_artifact(d, with_knobs=False, v3=True)
     man_path = os.path.join(d, "manifest.txt")
-    txt = open(man_path).read().replace("sink_gz=regular-file",
-                                        "sink_gz=devnull")
+    txt = (open(man_path).read()
+           .replace("sink_gz=regular-file", "sink_gz=devnull")
+           .replace("sink_gz_derived=regular-file",
+                    "sink_gz_derived=devnull"))
     open(man_path, "w").write(txt)
     raised = None
     try:
@@ -111,6 +113,58 @@ def run():
     fp_othermask = Fingerprint(**{**FP.to_dict(), "mask": "0,2,4,6"})
     check(any("mask" in r for r in incompatibilities(FP, fp_othermask)),
           "mask mismatch surfaced by name (free-placement numbers lie)")
+
+    # ------------------------------------------------------------------
+    # DERIVED-NOT-SELF-REPORTED fields (P2 item 3): a lying manifest is
+    # caught — the derivation governs the fingerprint, the self-report is
+    # cross-checked and flagged.
+    # ------------------------------------------------------------------
+    from ..core.decide import canon_mask, derived_mismatches
+    # Lying sink self-report (claim devnull, stat says regular-file): the
+    # derived value governs (analysis proceeds, complete fingerprint), and
+    # the lie is flagged verbatim.
+    d_lie = tempfile.mkdtemp(prefix="fulcrum_inv_lying_")
+    make_artifact(d_lie, with_knobs=False, v3=True)
+    man_lie = os.path.join(d_lie, "manifest.txt")
+    txt_lie = open(man_lie).read().replace("sink_gz=regular-file",
+                                           "sink_gz=devnull")
+    open(man_lie, "w").write(txt_lie)
+    rep_lie = analyze_run(load_run(d_lie, AD), AD)
+    check(any("DERIVED-MISMATCH" in a and "sink_gz=devnull" in a
+              for a in rep_lie["anomalies"]),
+          "lying manifest: self-reported sink contradicting the stat "
+          "derivation is FLAGGED (DERIVED-MISMATCH, verbatim)")
+    check(bool(rep_lie["scoreboard"]) and
+          "FP-INCOMPLETE" not in rep_lie["scoreboard"][0],
+          "lying manifest: the DERIVED value governs the fingerprint "
+          "(cell still ranks, complete fingerprint)")
+    # Lying freeze claim: frozen with NA sysfs readbacks is flagged.
+    check(any("freeze_state=frozen claimed" in a for a in derived_mismatches(
+        {"freeze_state": "frozen", "governor": "NA", "no_turbo": "1",
+         "cell_meta": {}})),
+          "lying manifest: freeze_state=frozen with an NA sysfs readback "
+          "is FLAGGED (frozen requires READ values)")
+    check(derived_mismatches(
+        {"freeze_state": "frozen", "governor": "performance", "no_turbo": "1",
+         "cell_meta": {}}) == [],
+          "control: frozen with real sysfs readbacks passes the cross-check")
+    # Mask: the taskset readback governs; a pin that did not take is flagged.
+    mm = derived_mismatches({"cell_meta": {("silesia", 1):
+                                           {"mask": "0", "maskd": "0-15"}}})
+    check(any("pin did not take" in a for a in mm),
+          "mask readback mismatch (requested 0, kernel says 0-15) FLAGGED — "
+          "the pin did not take")
+    check(derived_mismatches(
+        {"cell_meta": {("silesia", 16):
+                       {"mask": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+                        "maskd": "0-15"}}}) == [],
+          "mask canonical equivalence: '0-15' readback == the requested "
+          "16-cpu list (formatting is not a lie)")
+    check(canon_mask("0-15") == canon_mask(
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15")
+        and canon_mask("0,2,4,6") == "0,2,4,6"
+        and canon_mask("garbage") == "unknown",
+          "canon_mask: range/list equivalence + unparseable => unknown")
 
     # ------------------------------------------------------------------
     # COMPARATOR-VERSION + HOST-IDENTITY fields (P2 item 2 — the
