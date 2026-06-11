@@ -424,6 +424,11 @@ KNOB_ENV = {
     "slab_off": ("GZIPPY_SLAB_ALLOC=0", "rpmalloc_stats_off",
                  "slab force-OFF (gate proof: at T1 default-ON the knob arm "
                  "must lose the slab win and zero the slab counters)"),
+    "slab_bigbudget": ("GZIPPY_SLAB_BUDGET_MIB=600", "none",
+                       "budget-shape probe (evidence trail): admit-everything "
+                       "retention (~the original f2 force-on class) vs the "
+                       "default T x largest budget — separates budget-shape "
+                       "headroom from state-dependence of the -99.9ms finding"),
     "eager_postproc": ("GZIPPY_EAGER_POSTPROC=1", "none",
                        "eager consumer post-processing (opt-in)"),
 }

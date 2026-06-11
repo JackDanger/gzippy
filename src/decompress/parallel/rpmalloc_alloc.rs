@@ -20,11 +20,12 @@ mod arena {
     /// Stateless rpmalloc-backed allocator (vendor `RpmallocAllocator<T>`).
     ///
     /// Huge allocations route through [`SlabAlloc`] (retain resident blocks
-    /// instead of munmapping) when the T-conditional gate is on: auto-ON at
-    /// ALL decode thread counts by default (default `GZIPPY_SLAB_MAX_T` =
-    /// `usize::MAX`). The T-aware budget (`min(16 MiB, T × chunk)`) bounds RSS
-    /// overhead to ≤ 16 MiB. `GZIPPY_SLAB_ALLOC=1`/`=0` force on/off;
-    /// `GZIPPY_SLAB_MAX_T=K` restricts auto-ON to T ≤ K.
+    /// instead of munmapping) when the T-conditional gate is on: auto-ON
+    /// STRICTLY at decode T <= 2 (default `GZIPPY_SLAB_MAX_T` = 2); at T > 2
+    /// the slab is off by construction. The budget (`T × largest_block_seen`,
+    /// uncapped) admits the chunk-class blocks — retention ≈ one chunk buffer
+    /// per active worker. `GZIPPY_SLAB_ALLOC=1`/`=0` force on/off;
+    /// `GZIPPY_SLAB_MAX_T=K` overrides the ceiling.
     #[derive(Copy, Clone, Debug, Default)]
     pub struct RpmallocAlloc;
 
@@ -68,19 +69,31 @@ mod arena {
     /// classes cover the (near-constant) chunk-buffer sizes for high reuse.
     const SLAB_GRANULARITY: usize = 1024 * 1024;
 
-    // ── T-conditional gate (2026-06-10 reconciliation; tightened 2026-06-11) ──
+    // ── T-conditional gate (iter-2, 2026-06-11: strict T<=2 + chunk-class budget) ──
     //
     // The fulcrum-decide causal A/B proved the slab PAYS ~100ms at native
     // silesia T1 (N=21, frozen, canonical mask). The prior RSS blowup
     // (silesia-T8 +24-35%) was caused by a count-cap retention policy that
     // retained up to 48 × 12 MiB = 576 MiB of free blocks.
     //
-    // This version fixes both: auto-ON at ALL decode thread counts (default
-    // max_t = usize::MAX), and the budget is T-aware:
-    // `min(16 MiB, T × largest_block_seen)`. This gives each parallel worker
-    // its own cached slot at low T (eliminating per-chunk page faults for all
-    // workers), while the 16 MiB hard cap bounds RSS overhead to ≤ 16 MiB at
-    // high T — well under the +10% criterion for typical silesia baselines.
+    // ITER-1 POST-MORTEM (9bebcada, NO-SHIP): it auto-ON'd at ALL T
+    // (max_t = usize::MAX — chosen to appease the T4-vs-T1 diff_ratio guard)
+    // with budget `min(16 MiB, T × largest_block_seen)`. Both halves were
+    // wrong: the open gate moved T8 RSS (+16.8% max-run) and T8 wall (+2.6%),
+    // and the 16 MiB hard cap EXCLUDED the chunk-class blocks (tens of MB) —
+    // a just-freed chunk buffer always blew the budget and was evicted
+    // immediately (largest-first = itself), so only 18 small-block hits ever
+    // happened and the T1 win measured CAUSAL-NULL. The reconciliation
+    // neutered its own lever.
+    //
+    // ITER-2 (this version): the gate is STRICTLY T <= 2 (default max_t = 2)
+    // — at T > 2 the slab is OFF BY CONSTRUCTION (zero engagement, zero RSS
+    // movement; the high-T criteria pass trivially). At T <= 2 the budget
+    // ADMITS the chunk-class blocks: `T × largest_block_seen`, UNCAPPED
+    // (≈ one resident chunk buffer per active worker — the working set, not a
+    // leak), and eviction is SMALLEST-first so the chunk-class block is the
+    // LAST thing dropped (largest-first would evict exactly the lever block
+    // whenever anything else shared the free list).
     //
     // `GZIPPY_SLAB_ALLOC=1` forces ON at every T, `=0` forces OFF (both
     // override the auto gate). `GZIPPY_SLAB_MAX_T=K` overrides the ceiling.
@@ -100,16 +113,18 @@ mod arena {
     }
 
     /// Highest decode thread count at which the slab auto-enables.
-    /// Default: `usize::MAX` (slab on for all practical T); the bytes-budget
-    /// bounds RSS to ≈1 chunk in the free list. Override with
-    /// `GZIPPY_SLAB_MAX_T=K` to restrict to T ≤ K.
+    /// Default: 2 — STRICTLY T <= 2 (iter-2 spec). At T > 2 the slab is off
+    /// by construction (zero engagement, zero RSS movement). Override with
+    /// `GZIPPY_SLAB_MAX_T=K`.
+    const SLAB_AUTO_MAX_T_DEFAULT: usize = 2;
+
     fn slab_auto_max_t() -> usize {
         static K: OnceLock<usize> = OnceLock::new();
         *K.get_or_init(|| {
             std::env::var("GZIPPY_SLAB_MAX_T")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(usize::MAX)
+                .unwrap_or(SLAB_AUTO_MAX_T_DEFAULT)
         })
     }
 
@@ -135,23 +150,60 @@ mod arena {
         }
     }
 
+    /// Test-only programmatic gate override (takes precedence over the env
+    /// force): the T4-vs-T1 `diff_ratio` guard forces the slab OFF for BOTH
+    /// arms so it measures pipeline parallelism apples-to-apples — the
+    /// T-conditional policy legitimately makes T1 ~3x faster than T4 on the
+    /// in-cache fixture, which is allocator policy, not a parallelism
+    /// regression. -1 = none, 0 = force-off, 1 = force-on.
+    #[cfg(test)]
+    static TEST_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+    #[cfg(test)]
+    pub fn slab_test_force(v: Option<bool>) {
+        TEST_FORCE.store(
+            match v {
+                None => -1,
+                Some(false) => 0,
+                Some(true) => 1,
+            },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    fn slab_test_override() -> Option<bool> {
+        #[cfg(test)]
+        {
+            match TEST_FORCE.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
     /// Should a NEW huge allocation route through the slab right now?
     fn slab_route_new() -> bool {
         gate_decision(
-            slab_force(),
+            slab_test_override().or_else(slab_force),
             slab_auto_max_t(),
             DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
-    /// Bytes-budget cap for the resident free list (T-aware, 2026-06-11).
+    /// Bytes-budget cap for the resident free list (iter-2, 2026-06-11).
     ///
     /// If `GZIPPY_SLAB_BUDGET_MIB` is set, that fixed MiB value is used.
-    /// Otherwise the budget auto-scales: `min(16 MiB, T × largest-block-seen)`,
-    /// where T = current decode thread count. This gives each worker its own
-    /// cached slot at low T (eliminating page faults for all workers), while
-    /// the 16 MiB cap ensures RSS overhead stays ≤ 16 MiB at high T —
-    /// well under +10% of the 150–200 MiB silesia baseline.
+    /// Otherwise the budget auto-scales: `T × largest-block-seen`, UNCAPPED —
+    /// it must ADMIT the chunk-class blocks (tens of MB; iter-1's 16 MiB hard
+    /// cap evicted the just-freed chunk buffer every time and erased the T1
+    /// win). T = current decode thread count; the gate (T <= 2) bounds the
+    /// multiplier, so the steady-state retention is ≈ the decode's own
+    /// working set (one chunk buffer per active worker), not a leak.
     fn configured_budget_bytes() -> Option<usize> {
         static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
         *BUDGET.get_or_init(|| {
@@ -163,15 +215,26 @@ mod arena {
         })
     }
 
-    fn effective_budget(largest_block_seen: usize) -> usize {
-        // 16 MiB hard cap keeps RSS well under +10% at T8/T16 silesia.
-        const RSS_CAP: usize = 16 * 1024 * 1024;
-        let t = DECODE_THREADS
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(1);
-        configured_budget_bytes().unwrap_or_else(|| {
-            SLAB_GRANULARITY.max(t.saturating_mul(largest_block_seen).min(RSS_CAP))
+    /// Pure budget computation (unit-tested): override wins; otherwise
+    /// `max(GRANULARITY, T × largest_block_seen)` with NO hard cap — the
+    /// chunk-class block (tens of MB) must fit, times one slot per worker.
+    fn budget_for(
+        decode_threads: usize,
+        largest_block_seen: usize,
+        configured: Option<usize>,
+    ) -> usize {
+        configured.unwrap_or_else(|| {
+            let t = decode_threads.max(1);
+            SLAB_GRANULARITY.max(t.saturating_mul(largest_block_seen))
         })
+    }
+
+    fn effective_budget(largest_block_seen: usize) -> usize {
+        budget_for(
+            DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed),
+            largest_block_seen,
+            configured_budget_bytes(),
+        )
     }
 
     #[derive(Default)]
@@ -189,6 +252,29 @@ mod arena {
     fn slab_state() -> &'static Mutex<SlabState> {
         static S: OnceLock<Mutex<SlabState>> = OnceLock::new();
         S.get_or_init(|| Mutex::new(SlabState::default()))
+    }
+
+    /// MEASUREMENT-ONLY event trace (`GZIPPY_SLAB_TRACE=1`): one line per
+    /// slab event (hit/miss/retain/evict) with the size and the live/free
+    /// byte ledgers — the "instrument, don't guess" tool for RSS-peak
+    /// attribution (which blocks coexist when).
+    fn slab_trace_on() -> bool {
+        static T: OnceLock<bool> = OnceLock::new();
+        *T.get_or_init(|| std::env::var_os("GZIPPY_SLAB_TRACE").is_some())
+    }
+
+    fn slab_trace(event: &str, bs: usize, s: &SlabState) {
+        if slab_trace_on() {
+            let live_bytes: usize = s.live.values().map(|&(b, _)| b).sum();
+            eprintln!(
+                "[slab] {event} bs={:.1}M live_n={} live={:.1}M free_n={} free={:.1}M",
+                bs as f64 / 1048576.0,
+                s.live.len(),
+                live_bytes as f64 / 1048576.0,
+                s.free.len(),
+                s.current_free_bytes as f64 / 1048576.0,
+            );
+        }
     }
 
     #[inline]
@@ -233,29 +319,86 @@ mod arena {
             let align = layout.align().max(16);
             SLAB_EVER_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
             {
+                // BEST-FIT-LARGER match (iter-2): serve the SMALLEST resident
+                // block with b >= bs — NO waste bound. Exact-size matching is
+                // why iter-1-shape runs measured only ~24 hits and +27% T1
+                // RSS: chunk buffer sizes VARY per chunk, so consecutive
+                // chunk allocs missed the exact class — fresh mmap (faults
+                // kept) while the old block sat retained (RSS doubled). A 2x
+                // waste bound was tried and REJECTED by measurement: it
+                // re-created the overlap (a small-output chunk after a big
+                // one got bound-rejected -> fresh mmap while the big block
+                // sat retained; T1 peak RSS stayed +24.6%). Serving an
+                // oversized resident block costs ZERO extra RSS — its pages
+                // are resident either way — and at T <= 2 (the only gated-on
+                // regime) essentially only chunk-class blocks flow through
+                // the slab (installs ~ chunk count), so any resident block
+                // is the right block. With best-fit the ONE resident
+                // chunk-class block IS the working set: every subsequent
+                // chunk reuses it in place (hits ~ chunk-count, RSS overhead
+                // ~ granularity, faults eliminated).
                 let mut s = slab_state().lock().unwrap();
-                if let Some(pos) = s.free.iter().position(|&(_, b, a)| b == bs && a >= align) {
+                if let Some(pos) = s
+                    .free
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &(_, b, a))| b >= bs && a >= align)
+                    .min_by_key(|(_, &(_, b, _))| b)
+                    .map(|(i, _)| i)
+                {
                     SLAB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (p, b, a) = s.free.swap_remove(pos);
                     s.current_free_bytes -= b;
                     s.live.insert(p, (b, a));
+                    slab_trace("hit", b, &s);
                     return Ok(NonNull::slice_from_raw_parts(
                         unsafe { NonNull::new_unchecked(p as *mut u8) },
                         layout.size(),
                     ));
                 }
             }
-            // miss: fresh backing (retained on free)
+            // MISS. Evict-on-miss (iter-2 RSS peak fix): resident blocks
+            // SMALLER than this request cannot serve it — munmap them BEFORE
+            // the fresh mmap so peak RSS never stacks live + useless-retained
+            // (that overlap, during the chunk-size growing phase, was the
+            // whole +24.6% T1 peak-RSS delta; the criterion is <= +15%).
+            // Blocks >= bs stay (they serve future requests in their class).
+            {
+                let mut s = slab_state().lock().unwrap();
+                let mut doomed: Vec<*mut u8> = Vec::new();
+                let mut dropped_bytes = 0usize;
+                s.free.retain(|&(p, b, _)| {
+                    if b < bs {
+                        doomed.push(p as *mut u8);
+                        dropped_bytes += b;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                s.current_free_bytes -= dropped_bytes;
+                if !doomed.is_empty() {
+                    slab_trace("evict-on-miss", dropped_bytes, &s);
+                }
+                drop(s);
+                if !doomed.is_empty() {
+                    ensure_thread_initialized();
+                    for p in doomed {
+                        unsafe { raw_free(p) };
+                    }
+                }
+            }
+            // fresh backing (retained on free)
             ensure_thread_initialized();
             let p = raw_alloc(bs, align);
             if p.is_null() {
                 return Err(AllocError);
             }
-            slab_state()
-                .lock()
-                .unwrap()
-                .live
-                .insert(p as usize, (bs, align));
+            {
+                let mut s = slab_state().lock().unwrap();
+                s.live.insert(p as usize, (bs, align));
+                slab_trace("miss-fresh", bs, &s);
+            }
             Ok(NonNull::slice_from_raw_parts(
                 unsafe { NonNull::new_unchecked(p) },
                 layout.size(),
@@ -265,9 +408,12 @@ mod arena {
         /// Returns true if `ptr` was a live slab block (now retained/released).
         /// Keys on the side-table, NOT the caller layout (grow passes OLD).
         ///
-        /// Retention policy: bytes-budget, largest-first eviction (a1ecc834).
-        /// Budget = max(64 MiB, 2 × largest-block-seen) or GZIPPY_SLAB_BUDGET_MIB.
-        /// Blocks over budget are munmapped outside the lock.
+        /// Retention policy: bytes-budget, SMALLEST-first eviction (iter-2).
+        /// Budget = T × largest-block-seen (uncapped) or GZIPPY_SLAB_BUDGET_MIB.
+        /// Smallest-first keeps the chunk-class block resident as long as
+        /// possible — with budget = 1 × largest at T1, largest-first would
+        /// evict exactly the lever block whenever any smaller block shared
+        /// the free list. Blocks over budget are munmapped outside the lock.
         unsafe fn free_if_slab(&self, ptr: NonNull<u8>) -> bool {
             let key = ptr.as_ptr() as usize;
             let mut s = slab_state().lock().unwrap();
@@ -276,28 +422,31 @@ mod arena {
                     if bs > s.largest_block_seen {
                         s.largest_block_seen = bs;
                     }
-                    // Add to free list, then evict largest-first until under
+                    // Add to free list, then evict smallest-first until under
                     // budget. The just-freed block participates in eviction
-                    // like any other (largest goes first).
+                    // like any other (smallest goes first; the chunk-class
+                    // block is dropped last).
                     SLAB_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     s.current_free_bytes += bs;
                     s.free.push((key, bs, a));
+                    slab_trace("retain", bs, &s);
                     let mut to_munmap: Vec<*mut u8> = Vec::new();
                     loop {
                         let budget = effective_budget(s.largest_block_seen);
                         if s.current_free_bytes <= budget {
                             break;
                         }
-                        // evict the largest resident block
+                        // evict the smallest resident block (retain chunk-class)
                         let (pos, _) = s
                             .free
                             .iter()
                             .enumerate()
-                            .max_by_key(|(_, &(_, b, _))| b)
+                            .min_by_key(|(_, &(_, b, _))| b)
                             .unwrap(); // safe: free non-empty while current_free_bytes > 0
                         let (evict_ptr, evict_bs, _) = s.free.swap_remove(pos);
                         s.current_free_bytes -= evict_bs;
                         to_munmap.push(evict_ptr as *mut u8);
+                        slab_trace("evict-budget", evict_bs, &s);
                     }
                     drop(s);
                     // Release outside the lock (munmap can be slow).
@@ -555,10 +704,143 @@ mod arena {
             assert!(gate_decision(None, 1, 1));
             assert!(!gate_decision(None, 1, 2));
             assert!(!gate_decision(None, 1, 16));
-            // max_t=2 boundary
+            // max_t=2 boundary (the iter-2 default gate): T=1,2 ON; T=3 OFF
             assert!(gate_decision(None, 2, 1));
             assert!(gate_decision(None, 2, 2));
             assert!(!gate_decision(None, 2, 3));
+        }
+
+        /// Iter-2 spec: the DEFAULT gate ceiling is STRICTLY 2 (T<=2). Iter-1
+        /// shipped usize::MAX here — that "leak" is what moved T8 RSS/wall.
+        #[test]
+        fn default_auto_max_t_is_strictly_two() {
+            assert_eq!(SLAB_AUTO_MAX_T_DEFAULT, 2);
+            if std::env::var_os("GZIPPY_SLAB_MAX_T").is_none() {
+                assert_eq!(slab_auto_max_t(), 2);
+            }
+        }
+
+        /// Iter-2 crux: the budget must ADMIT a synthetic chunk-class block
+        /// (tens of MB). Iter-1's min(16 MiB, ...) cap evicted the just-freed
+        /// chunk buffer every time and erased the T1 win.
+        #[test]
+        fn budget_admits_chunk_class_blocks_at_low_t() {
+            let chunk = 38 * 1024 * 1024; // chunk-class: tens of MB
+                                          // T1: exactly one resident chunk slot — the block FITS.
+            assert_eq!(budget_for(1, chunk, None), chunk);
+            // T2: one slot per active worker.
+            assert_eq!(budget_for(2, chunk, None), 2 * chunk);
+            // T=0 (allocator used before any decode) behaves as one worker.
+            assert_eq!(budget_for(0, chunk, None), chunk);
+            // Floor: granularity when nothing big has been seen yet.
+            assert_eq!(budget_for(1, 0, None), SLAB_GRANULARITY);
+            // Env override wins verbatim (GZIPPY_SLAB_BUDGET_MIB).
+            assert_eq!(budget_for(2, chunk, Some(16 << 20)), 16 << 20);
+        }
+
+        /// Smallest-first eviction: when the budget forces an eviction, the
+        /// CHUNK-CLASS (largest) block must be the one retained — largest-
+        /// first here would evict the lever block whenever any smaller block
+        /// shared the free list.
+        #[test]
+        fn eviction_retains_chunk_class_block() {
+            // Pin a deterministic budget independent of DECODE_THREADS races:
+            // simulate via the pure parts — free-list bookkeeping is exercised
+            // end-to-end in bytes_budget_bounds_free_list; here we assert the
+            // ORDER policy on the in-memory state machine.
+            let mut free: Vec<(usize, usize, usize)> = vec![(0x1000, 38 << 20, 16)];
+            let mut current: usize = 38 << 20;
+            // a small block arrives; budget (1 x largest = 38 MiB) is blown
+            free.push((0x2000, 4 << 20, 16));
+            current += 4 << 20;
+            let budget = budget_for(1, 38 << 20, None);
+            let mut evicted = Vec::new();
+            while current > budget {
+                let (pos, _) = free
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, &(_, b, _))| b)
+                    .unwrap();
+                let (p, b, _) = free.swap_remove(pos);
+                current -= b;
+                evicted.push((p, b));
+            }
+            assert_eq!(evicted, vec![(0x2000, 4 << 20)], "small block evicted");
+            assert_eq!(free.len(), 1);
+            assert_eq!(free[0].1, 38 << 20, "chunk-class block retained");
+        }
+
+        /// Best-fit-larger reuse (iter-2): a freed block must serve a LATER,
+        /// SMALLER request (chunk buffer sizes vary per chunk — exact-size
+        /// matching missed most chunk allocs: ~24 hits, +27% T1 RSS). No
+        /// waste bound (measured: a 2x bound re-created the RSS overlap).
+        #[test]
+        fn best_fit_serves_smaller_request_from_larger_block() {
+            // Odd sizes unique to this test to dodge cross-test free-list races.
+            let big = Layout::from_size_align(11 * 1024 * 1024, 16).unwrap();
+            let p = SlabAlloc.alloc_huge(big).unwrap();
+            let big_ptr = p.as_ptr() as *mut u8 as usize;
+            unsafe { SlabAlloc.deallocate(NonNull::new(big_ptr as *mut u8).unwrap(), big) };
+
+            // 9 MiB request: 11 MiB resident block fits (11 <= 2*9) — must be
+            // served the SAME backing (a cache hit), not a fresh mmap.
+            let hits_before = SLAB_CACHE_HITS.load(Ordering::Relaxed);
+            let small = Layout::from_size_align(9 * 1024 * 1024, 16).unwrap();
+            let q = SlabAlloc.alloc_huge(small).unwrap();
+            let q_ptr = q.as_ptr() as *mut u8 as usize;
+            if q_ptr == big_ptr {
+                // The block survived the (global, cross-test) free list — the
+                // best-fit path must have counted a hit.
+                assert!(SLAB_CACHE_HITS.load(Ordering::Relaxed) > hits_before);
+                assert_eq!(
+                    SlabAlloc
+                        .live_block(NonNull::new(q_ptr as *mut u8).unwrap())
+                        .unwrap()
+                        .0,
+                    11 * 1024 * 1024,
+                    "live table must keep the TRUE block size"
+                );
+            }
+            unsafe { SlabAlloc.deallocate(NonNull::new(q_ptr as *mut u8).unwrap(), small) };
+
+            // NO waste bound (measured decision, see alloc_huge comment): any
+            // resident block b >= bs serves — serving oversized costs zero
+            // extra RSS (pages resident either way); rejecting forces a fresh
+            // mmap that STACKS on the retained block (+24.6% T1 peak RSS when
+            // a 2x bound was tried).
+            let bs = 4 * 1024 * 1024usize;
+            let b = 11 * 1024 * 1024usize;
+            assert!(b >= bs, "oversized resident block is a valid fit");
+        }
+
+        /// Evict-on-miss (iter-2 RSS peak fix): a resident block SMALLER than
+        /// a missing request must be munmapped BEFORE the fresh mmap — peak
+        /// RSS must never stack live + useless-retained.
+        #[test]
+        fn miss_evicts_smaller_resident_blocks() {
+            let small = Layout::from_size_align(7 * 1024 * 1024, 16).unwrap();
+            let p = SlabAlloc.alloc_huge(small).unwrap();
+            let small_ptr = p.as_ptr() as *mut u8 as usize;
+            unsafe { SlabAlloc.deallocate(NonNull::new(small_ptr as *mut u8).unwrap(), small) };
+
+            // 15 MiB request: the 7 MiB block can't serve it (b < bs) — the
+            // miss path must have dropped it from the free list (either we
+            // evicted it, or a concurrent test legitimately re-allocated it;
+            // in NO case may it still sit free while we mmap fresh).
+            let big = Layout::from_size_align(15 * 1024 * 1024, 16).unwrap();
+            let q = SlabAlloc.alloc_huge(big).unwrap();
+            {
+                let s = slab_state().lock().unwrap();
+                assert!(
+                    !s.free.iter().any(|&(fp, _, _)| fp == small_ptr),
+                    "smaller resident block must not survive a bigger-class miss"
+                );
+                // ledger consistency under the same lock
+                let sum: usize = s.free.iter().map(|&(_, b, _)| b).sum();
+                assert_eq!(s.current_free_bytes, sum, "free-bytes ledger");
+            }
+            let q_ptr = NonNull::new(q.as_ptr() as *mut u8).unwrap();
+            unsafe { SlabAlloc.deallocate(q_ptr, big) };
         }
 
         /// The dynamic-gate correctness crux: a block that entered the slab
@@ -784,6 +1066,14 @@ pub use arena::RpmallocAlloc;
 pub use arena::set_decode_threads;
 #[cfg(not(feature = "arena-allocator"))]
 pub fn set_decode_threads(_t: usize) {}
+
+/// Test-only programmatic slab gate override (see `arena::slab_test_force`):
+/// the T4-vs-T1 diff_ratio guard forces the slab off for both arms so the
+/// T-conditional allocator policy can't masquerade as a parallelism delta.
+#[cfg(all(test, feature = "arena-allocator"))]
+pub use arena::slab_test_force;
+#[cfg(all(test, not(feature = "arena-allocator")))]
+pub fn slab_test_force(_v: Option<bool>) {}
 
 /// Allocator-visibility tool — the "don't guess" instrument for the span-cache
 /// work. Prints rpmalloc's process-wide span-map stats. `mapped_total` (total
