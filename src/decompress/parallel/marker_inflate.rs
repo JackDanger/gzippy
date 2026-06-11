@@ -2208,17 +2208,22 @@ impl Block {
         // Contiguous-buffer cap: leave room for one max back-ref + word overshoot.
         //
         // Headroom proof (advisor-required): one outer iteration writes EITHER
-        // ≤3 packed literals OR exactly one back-ref of length ≤ MAX_RUN_LENGTH,
+        // ≤3 packed literals, OR ≤ 1+LIT_CHAIN_MAX = 3 runtime-chained single
+        // literals (P3.2), OR exactly one back-ref of length ≤ MAX_RUN_LENGTH,
         // NEVER both — the ISA-L LUT's multi-symbol packing (sym_count ∈ {1,2,3})
         // stops at any symbol ≥ 256, so a pair/triple slot is all literals and a
         // back-ref appears only at sym_count == 1 (igzip_inflate.c:473-476, see
-        // the multi-symbol notes on read_internal_compressed_specialized). The
+        // the multi-symbol notes on read_internal_compressed_specialized); the
+        // P3.2 literal chain emits only lone literals and CARRIES any other
+        // packet un-consumed to the next iteration. The
         // outer guard keeps `*pos ≤ out_room - 1 = cap - (MAX_RUN_LENGTH+8) - 1`
         // at any back-ref, and `emit_backref_contig`'s word path touches up to
         // `*pos + ((MAX_RUN_LENGTH+7)&!7) = *pos + 264`, max end `= cap - 3 < cap`.
-        // The literal-triple path ends at `≤ cap - 264`. So MAX_RUN_LENGTH+8 is
-        // provably sufficient — but the proof DEPENDS on `MAX sym_count == 3` and
-        // "multi-symbol ⇒ all literals"; a LUT change that packed a length code
+        // The literal-triple path (packed or chained) ends at `≤ cap - 264`. So
+        // MAX_RUN_LENGTH+8 is
+        // provably sufficient — but the proof DEPENDS on `MAX sym_count == 3`,
+        // "multi-symbol ⇒ all literals", and `1 + LIT_CHAIN_MAX ≤ FAST_OUT_SLOP`
+        // (compile-asserted below); a LUT change that packed a length code
         // into a multi-symbol slot would invalidate it.
         let out_room = cap.saturating_sub(MAX_RUN_LENGTH + 8);
         debug_assert!(*pos <= out_room, "decode_clean_into_contig: no spare");
@@ -2282,6 +2287,15 @@ impl Block {
         // block tail / resumable boundary).
         const FAST_OUT_SLOP: usize = 8;
         const FAST_IN_SLOP: usize = 8;
+        // P3.2: max EXTRA single-literal packets consumed inline after the lit1
+        // arm's first literal (3 literals/iteration total — the wrapper's
+        // measured 2-extra shape, resumable.rs:1305-1313 / vendor
+        // decompress_template.h:381 "3 extras decreases performance").
+        const LIT_CHAIN_MAX: usize = 2;
+        // Headroom-proof dependency: the chain writes ≤ 1+LIT_CHAIN_MAX bytes
+        // under the iteration-top `emitted + FAST_OUT_SLOP < local_cap` guard
+        // (clippy int_plus_one shape of `1 + LIT_CHAIN_MAX <= FAST_OUT_SLOP`).
+        const _: () = assert!(LIT_CHAIN_MAX < FAST_OUT_SLOP);
         if slow_spin == 0 && !slow_yield {
             let in_end = bits.data.len();
             // P3.1 (T1 recovery, Lever-B1 class): mirror the bit-reader into a
@@ -2387,10 +2401,82 @@ impl Block {
                         }
                         *pos += 1;
                         emitted += 1;
+                        // ── P3.2 RUNTIME LITERAL CHAIN ───────────────────────
+                        // Wrapper analog (resumable.rs:1314-1356; vendor
+                        // libdeflate decompress_template.h:354-381): after a
+                        // lone literal, speculatively decode the next packet;
+                        // while it is ALSO a lone literal, consume + emit it
+                        // inline (≤ LIT_CHAIN_MAX extras); the final un-consumed
+                        // packet becomes next iteration's `pre` (the carry that
+                        // makes the speculative decode never wasted). This is
+                        // the mechanism behind the wrapper's ~1.96 lits/iter:
+                        // the ISA-L LUT's build-time packing needs the COMBINED
+                        // codeword lengths to fit in the 12-bit short lookup
+                        // (igzip_inflate.c:386-599), which 2×(7..9)-bit silesia
+                        // literal codes almost never do — runtime chaining is
+                        // length-independent.
+                        //
+                        // Byte-exact by construction: identical symbols decoded
+                        // in identical order with identical bit consumption —
+                        // only WHICH loop arm consumes them changes. Refills
+                        // are append-only (Bits::refill ORs new bits above the
+                        // existing low bits), so the carried `pre` stays valid
+                        // across the invariant-restoring refill below.
+                        //
+                        // Consume gate `bit_count <= available()`: near the end
+                        // of input a decode can be backed by fabricated zero
+                        // bits past the real data (slow-path refill couldn't
+                        // fill); the gate ensures we only CONSUME packets fully
+                        // backed by real bits. A gate-failed packet is carried
+                        // un-consumed — the next iteration-top `in_ok` check
+                        // (pos+8 < in_end fails whenever a slow-path refill
+                        // ran) breaks to the careful loop, which re-decodes
+                        // from the same cursor. Same contract as the existing
+                        // bottom-of-loop preload.
+                        let mut chained = 0usize;
+                        loop {
+                            let nxt = self.lut_litlen.decode(&mut lb);
+                            let ncode = (nxt.symbol & 0xFFFF) as u16;
+                            if chained < LIT_CHAIN_MAX
+                                && nxt.sym_count == 1
+                                && nxt.bit_count != 0
+                                && ncode <= 255
+                                && nxt.bit_count <= lb.available()
+                            {
+                                lb.consume(nxt.bit_count);
+                                // SAFETY: iteration-top guard `emitted +
+                                // FAST_OUT_SLOP < local_cap` + the compile
+                                // assert `1+LIT_CHAIN_MAX <= FAST_OUT_SLOP`
+                                // keep every chained write < out_room < cap.
+                                unsafe {
+                                    base.add(*pos).write(ncode as u8);
+                                }
+                                *pos += 1;
+                                emitted += 1;
+                                chained += 1;
+                                continue;
+                            }
+                            pre = nxt; // carry un-consumed
+                            break;
+                        }
                         super::slow_knob::inject_localize(st_spin, st_yield);
                         if prof_on {
-                            prof_pending = super::contig_prof::CLASS_LIT1;
+                            if chained == 0 {
+                                prof_pending = super::contig_prof::CLASS_LIT1;
+                            } else {
+                                prof_pending = super::contig_prof::CLASS_LITCHAIN;
+                                pf.bytes_litchain += (1 + chained) as u64;
+                            }
                         }
+                        // Restore the ≥48-bit iteration-top invariant for the
+                        // carried packet (mirrors the wrapper's carry-site
+                        // refills, resumable.rs:1345-1348, and the bottom
+                        // preload's threshold refill).
+                        if (lb.bitsleft as u8) < 48 {
+                            lb.refill();
+                        }
+                        super::slow_knob::inject_localize(dec_spin, dec_yield);
+                        continue 'fast;
                     } else {
                         trailing_code = code;
                         have_trailing = true;
@@ -3733,6 +3819,130 @@ mod tests {
         assert_eq!(contig, ring, "rle/short-distance contig decode diverged");
     }
 
+    /// P3.2 stream-level differential for the runtime literal chain: an
+    /// incompressible (LCG) payload makes flate2 emit ~all-literal dynamic
+    /// blocks with 8-9-bit literal codes — the regime where the ISA-L LUT's
+    /// build-time multi-symbol packing ~never fires (pairs need ≤12 combined
+    /// bits) and the lit1-arm runtime chain fires constantly. The text tail
+    /// mixes in back-refs (chain→length-packet carries) and the small
+    /// `per_call` run splits chains across resumable re-entries.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[test]
+    fn contig_clean_matches_ring_clean_literal_heavy_chain() {
+        // SKEWED random bytes: non-uniform distribution (AND of two LCG
+        // bytes → ~6-bit entropy) with no repetition, so flate2 picks
+        // dynamic-Huffman all-literal blocks (NOT stored — uniform random
+        // would be stored and never exercise the Huffman loop). The payload
+        // is large enough (~250 KiB) to span MULTIPLE deflate blocks, so
+        // these drivers (unlike the single-block helpers above) loop
+        // read_header until BFINAL.
+        fn lcg_skewed(seed: u64, n: usize) -> Vec<u8> {
+            let mut s = seed;
+            let mut v = Vec::with_capacity(n);
+            let next = |s: &mut u64| {
+                *s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*s >> 56) as u8
+            };
+            for _ in 0..n {
+                let b = next(&mut s) & next(&mut s);
+                v.push(b);
+            }
+            v
+        }
+        let window: Vec<u8> = (0u32..32768)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let mut payload = lcg_skewed(0xfeed_beef_cafe_f00d, 200_000);
+        payload.extend_from_slice(&b"the quick brown fox jumps over the lazy dog. ".repeat(1000));
+        payload.extend_from_slice(&window[..2048]); // dict back-ref tail
+        let deflate_bytes = deflate_with_dictionary(&payload, &window);
+
+        fn ring_multi(deflate_bytes: &[u8], window: &[u8], n_max: usize) -> Vec<u8> {
+            let boxed: &'static [u8] = Box::leak(deflate_bytes.to_vec().into_boxed_slice());
+            let mut bits = Bits::new(boxed);
+            let mut b = Block::new();
+            let mut output: Vec<u16> = Vec::new();
+            b.set_initial_window(&mut output, window).unwrap();
+            loop {
+                b.read_header(&mut bits, false).unwrap();
+                while !b.eob() {
+                    let n = b.read(&mut bits, &mut output, n_max).unwrap();
+                    if n == 0 && !b.eob() {
+                        panic!("ring decode stalled before EOB");
+                    }
+                }
+                if b.is_last_block() {
+                    break;
+                }
+            }
+            output
+                .iter()
+                .map(|&v| {
+                    assert!(v < 256, "clean decode must not emit markers");
+                    v as u8
+                })
+                .collect()
+        }
+
+        fn contig_multi(
+            deflate_bytes: &[u8],
+            window: &[u8],
+            cap: usize,
+            per_call: usize,
+        ) -> Vec<u8> {
+            let boxed: &'static [u8] = Box::leak(deflate_bytes.to_vec().into_boxed_slice());
+            let mut bits = Bits::new(boxed);
+            let mut b = Block::new();
+            let mut sink: Vec<u16> = Vec::new();
+            b.set_initial_window(&mut sink, window).unwrap();
+            let mut buf = vec![0u8; cap];
+            buf[..window.len()].copy_from_slice(window);
+            let base = buf.as_mut_ptr();
+            let mut pos = window.len();
+            loop {
+                b.read_header(&mut bits, false).unwrap();
+                while !b.eob() {
+                    let before = pos;
+                    let n = if b.compression_type() == CompressionType::Uncompressed {
+                        b.decode_clean_stored_into_contig(&mut bits, base, cap, &mut pos, per_call)
+                            .unwrap()
+                    } else {
+                        b.decode_clean_into_contig(&mut bits, base, cap, &mut pos, per_call)
+                            .unwrap()
+                    };
+                    assert_eq!(n, pos - before, "contig: emitted != pos delta");
+                    if n == 0 && !b.eob() {
+                        panic!("contig decode stalled before EOB");
+                    }
+                }
+                if b.is_last_block() {
+                    break;
+                }
+            }
+            buf[window.len()..pos].to_vec()
+        }
+
+        let cap = window.len() + payload.len() + 512;
+        let ring = ring_multi(&deflate_bytes, &window, payload.len() + 16);
+        assert_eq!(ring.len(), payload.len(), "ring decoded wrong length");
+        assert_eq!(ring, payload, "ring decode != payload");
+        let contig_full = contig_multi(&deflate_bytes, &window, cap, payload.len() + 16);
+        assert_eq!(contig_full, ring, "literal-heavy contig (full) diverged");
+        // Odd per-call cap → ~160 re-entries, each cutting a chain at an
+        // arbitrary point (the carried packet is re-decoded on re-entry).
+        let contig_split = contig_multi(&deflate_bytes, &window, cap, 1537);
+        assert_eq!(contig_split, ring, "literal-heavy contig (split) diverged");
+    }
+
     #[test]
     fn build_precode_table_rejects_overlong_code() {
         let mut cl = [0u8; MAX_PRECODE_COUNT];
@@ -5017,6 +5227,248 @@ mod tests {
         assert!(
             accepted >= 238,
             "expected ≥238 accepted code-length sets out of 405 tried, got {accepted}"
+        );
+    }
+
+    /// P3.2 differential (permanent, modeled on
+    /// `dist_table_matches_dist_hc_differential`): the contig fast loop's
+    /// RUNTIME LITERAL CHAIN emission (lit1 arm: consume up to LIT_CHAIN_MAX
+    /// extra lone literals inline, carry the final un-consumed packet,
+    /// threshold-refill at the carry site) must emit EXACTLY the bytes and
+    /// consume EXACTLY the bits of the old one-packet-per-iteration emission
+    /// (decode at the iteration top after a `<48 → refill`), and the carried
+    /// packet must be refill-invariant — for fixed-Huffman, balanced,
+    /// short-biased (forces build-time-packed sym_count>1 carries) and
+    /// deep-biased (forces long-path/subtable codes) complete code sets, over
+    /// random bit patterns INCLUDING short buffers that exhaust input
+    /// mid-chain (the fabricated-bits regime the `bit_count <= available`
+    /// consume gate exists for).
+    #[test]
+    fn lit_chain_emission_matches_unchained_differential() {
+        use crate::decompress::inflate::consume_first_decode::Bits;
+        use crate::decompress::parallel::lut_huffman::{DecodedSymbol, LutLitLenCode};
+
+        // MUST mirror decode_clean_into_contig's LIT_CHAIN_MAX.
+        const LIT_CHAIN_MAX: usize = 2;
+        // Bound per-pattern emission in BOTH sims (same cut rule).
+        const CAP: usize = 12;
+
+        fn lcg(s: &mut u64) -> u64 {
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *s
+        }
+
+        // The production consume gate: lone literal, valid, fully backed by
+        // real bits (post any internal decode refill).
+        fn lone_backed_literal(p: &DecodedSymbol, b: &Bits) -> bool {
+            p.sym_count == 1
+                && p.bit_count != 0
+                && (p.symbol & 0xFFFF) <= 255
+                && p.bit_count <= b.available()
+        }
+
+        /// Returns (total literals emitted, patterns that emitted ≥3 — i.e.
+        /// the NEW sim's chain demonstrably consumed inline).
+        fn run_set(lut: &LutLitLenCode, pattern_seed: u64, n_patterns: u32) -> (u64, u64) {
+            let mut total_lits = 0u64;
+            let mut ge3_patterns = 0u64;
+            let mut s = pattern_seed;
+            for _ in 0..n_patterns {
+                let mut bytes = [0u8; 64];
+                for chunk in bytes.chunks_mut(8) {
+                    chunk.copy_from_slice(&lcg(&mut s).to_le_bytes());
+                }
+                // Adversarial truncation 2..=64: short buffers exhaust input
+                // mid-chain and exercise the consume gate + slow refills.
+                let len = 2 + ((lcg(&mut s) >> 32) as usize % 63);
+                let buf = &bytes[..len];
+
+                // ── OLD emission: one packet per iteration top ──
+                let mut old_lits: Vec<u8> = Vec::new();
+                let mut ob = Bits::new(buf);
+                let mut o_pre = lut.decode(&mut ob);
+                let mut o_capped = false;
+                loop {
+                    if !lone_backed_literal(&o_pre, &ob) {
+                        break;
+                    }
+                    ob.consume(o_pre.bit_count);
+                    old_lits.push((o_pre.symbol & 0xFF) as u8);
+                    if old_lits.len() >= CAP {
+                        o_capped = true;
+                        break;
+                    }
+                    if (ob.bitsleft as u8) < 48 {
+                        ob.refill();
+                    }
+                    o_pre = lut.decode(&mut ob);
+                }
+
+                // ── NEW emission: the production chain shape (decode_clean_
+                // into_contig lit1 arm, transcribed) ──
+                let mut new_lits: Vec<u8> = Vec::new();
+                let mut nb = Bits::new(buf);
+                let mut n_pre = lut.decode(&mut nb);
+                let mut n_capped = false;
+                'outer: loop {
+                    if !lone_backed_literal(&n_pre, &nb) {
+                        break;
+                    }
+                    nb.consume(n_pre.bit_count);
+                    new_lits.push((n_pre.symbol & 0xFF) as u8);
+                    if new_lits.len() >= CAP {
+                        n_capped = true;
+                        break;
+                    }
+                    let mut chained = 0usize;
+                    loop {
+                        let nxt = lut.decode(&mut nb);
+                        if chained < LIT_CHAIN_MAX && lone_backed_literal(&nxt, &nb) {
+                            nb.consume(nxt.bit_count);
+                            new_lits.push((nxt.symbol & 0xFF) as u8);
+                            chained += 1;
+                            if new_lits.len() >= CAP {
+                                n_capped = true;
+                                break 'outer;
+                            }
+                            continue;
+                        }
+                        n_pre = nxt; // carry un-consumed
+                        break;
+                    }
+                    // Carry-site refill (the chain's ≥48 restoration).
+                    if (nb.bitsleft as u8) < 48 {
+                        nb.refill();
+                    }
+                }
+
+                assert_eq!(
+                    old_lits, new_lits,
+                    "emitted literals diverge: buf={buf:02x?}"
+                );
+                assert_eq!(
+                    ob.bit_position(),
+                    nb.bit_position(),
+                    "bit cursors diverge: buf={buf:02x?}"
+                );
+                assert_eq!(o_capped, n_capped, "cap states diverge: buf={buf:02x?}");
+                if !o_capped {
+                    // Both stopped on the same un-consumed carry. OLD decoded
+                    // it post-refill, NEW (possibly) pre-refill — equality is
+                    // the carry-across-refill invariance the production carry
+                    // depends on (Bits::refill is append-only).
+                    assert_eq!(o_pre, n_pre, "carried packet diverges: buf={buf:02x?}");
+                }
+                total_lits += new_lits.len() as u64;
+                if new_lits.len() >= 3 {
+                    ge3_patterns += 1;
+                }
+            }
+            (total_lits, ge3_patterns)
+        }
+
+        // Valid-by-construction complete prefix codes via random binary
+        // splitting: start at the root; each step replaces a random leaf
+        // (len < 15) with two leaves of len+1 — Kraft stays exactly 1, so
+        // the LUT builder must accept every generated set.
+        // bias: -1 = split shallowest candidate (short codes → build-time
+        // packing fires → sym_count>1 carries in the chain), +1 = split
+        // deepest (long codes → long-path/subtable decodes), 0 = random.
+        fn gen_complete_lens(n_syms: usize, n_codes: usize, bias: i8, rng: &mut u64) -> Vec<u8> {
+            let mut leaves: Vec<u8> = vec![1, 1]; // first split done
+            while leaves.len() < n_codes {
+                let a = (lcg(rng) as usize) % leaves.len();
+                let b = (lcg(rng) as usize) % leaves.len();
+                let pick = |i: usize, j: usize| -> usize {
+                    match bias {
+                        -1 => {
+                            if leaves[i] <= leaves[j] {
+                                i
+                            } else {
+                                j
+                            }
+                        }
+                        1 => {
+                            if leaves[i] >= leaves[j] {
+                                i
+                            } else {
+                                j
+                            }
+                        }
+                        _ => i,
+                    }
+                };
+                let mut idx = pick(a, b);
+                if leaves[idx] >= 15 {
+                    // Find any splittable leaf (always exists for ≤286 codes).
+                    match leaves.iter().position(|&l| l < 15) {
+                        Some(p) => idx = p,
+                        None => break,
+                    }
+                }
+                let l = leaves[idx] + 1;
+                leaves[idx] = l;
+                leaves.push(l);
+            }
+            // Assign the lengths to distinct random symbols (partial
+            // Fisher-Yates over 0..n_syms).
+            let mut symbols: Vec<usize> = (0..n_syms).collect();
+            let mut lens = vec![0u8; n_syms];
+            for (k, &l) in leaves.iter().enumerate() {
+                let j = k + (lcg(rng) as usize) % (n_syms - k);
+                symbols.swap(k, j);
+                lens[symbols[k]] = l;
+            }
+            lens
+        }
+
+        let mut seed = 0xfeed_face_dead_beef_u64;
+
+        // Fixed-Huffman lengths: the production static table (8-bit literals
+        // 0..143, 9-bit 144..255 — chains fire, packing ~never).
+        let mut fixed_lut = LutLitLenCode::new_empty();
+        assert!(
+            fixed_lut.rebuild_from(&FIXED_LIT_LEN_LENGTHS[..]),
+            "fixed-Huffman lens must be accepted"
+        );
+        let (mut lits_total, mut ge3_total) = run_set(&fixed_lut, lcg(&mut seed), 20_000);
+
+        // Generated complete sets: balanced / short-biased / deep-biased.
+        let mut lut = LutLitLenCode::new_empty();
+        for (n_sets, bias, n_codes_lo, n_codes_hi) in [
+            (40usize, 0i8, 32usize, 286usize), // balanced
+            (40, -1, 8, 64),                   // short-biased (packing-rich)
+            (40, 1, 32, 286),                  // deep-biased (subtable/long)
+            // Lit-rich regime (the production target: silesia-class ~8-9-bit
+            // literal codes, pairs >12 bits → build-time packing ~never,
+            // runtime chains dominate).
+            (40, 0, 192, 286),
+        ] {
+            for _ in 0..n_sets {
+                let n_codes = n_codes_lo + (lcg(&mut seed) as usize) % (n_codes_hi - n_codes_lo);
+                let lens = gen_complete_lens(286, n_codes, bias, &mut seed);
+                assert!(
+                    lut.rebuild_from(&lens),
+                    "complete code set must be accepted: bias={bias} n_codes={n_codes}"
+                );
+                let (l, g) = run_set(&lut, lcg(&mut seed), 5_000);
+                lits_total += l;
+                ge3_total += g;
+            }
+        }
+
+        // Vacuity guards: the differential must actually exercise literal
+        // emission AND multi-literal chains, not stop at packet 1 everywhere.
+        // (Deterministic LCG seeds: measured 303,802 / 31,494 at authoring.)
+        assert!(
+            lits_total > 250_000,
+            "differential too vacuous: only {lits_total} literals emitted"
+        );
+        assert!(
+            ge3_total > 25_000,
+            "chain never demonstrably fired: only {ge3_total} ≥3-literal patterns"
         );
     }
 }
