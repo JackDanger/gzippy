@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fulcrum-perf"
+version = "3.0.0"
+description = "A causal performance-decision engine: ranked, re-verifiable actions with enforced measurement invariants."
+readme = "README.md"
+requires-python = ">=3.9"
+# License note (charter): MIT OR Apache-2.0 — final choice is the owner's call
+# at publication.
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Jack Danger" }]
+keywords = ["performance", "benchmarking", "causal", "profiling", "measurement"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Benchmark",
+]
+
+[project.scripts]
+fulcrum = "fulcrum.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fulcrum*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E702"]  # compact `x = v; i += 2` arg-parse idiom retained
