@@ -226,6 +226,30 @@ def effect_check(pred, base_txt, knob_txt):
                     "not exclusive or stats missing in base")
         return (True, f"knob arm slab engaged (hits+installs={kc}); base arm 0 "
                       f"— switch effective")
+    if pred == "rpmalloc_stats_off":
+        # INVERTED engagement proof for the force-off knob (slab-t-conditional
+        # gate): on a default-ON cell (T <= GZIPPY_SLAB_MAX_T) the BASE arm
+        # must show slab counters > 0 (auto gate engaged) and the knob arm
+        # (GZIPPY_SLAB_ALLOC=0) must zero them (force-off effective).
+        def slab_counts(txt):
+            m = re.search(r"slab_hits=(\d+) slab_installs=(\d+)", txt)
+            return (int(m.group(1)) + int(m.group(2))) if m else None
+        kc = slab_counts(knob_txt)
+        bc = slab_counts(base_txt)
+        if bc is None:
+            return (False,
+                    "no slab_hits=/slab_installs= counters in base arm — binary "
+                    "predates the engagement counters or stats not captured")
+        if bc == 0:
+            return (None,
+                    "slab counters ZERO in base arm — auto gate not engaged on "
+                    "this cell (T above GZIPPY_SLAB_MAX_T?) — predicate vacuous")
+        if kc is None or kc > 0:
+            return (False,
+                    f"slab counters in KNOB arm = {kc!r} (expected 0) — "
+                    "GZIPPY_SLAB_ALLOC=0 did NOT disable the slab")
+        return (True, f"base arm slab auto-engaged (hits+installs={bc}); "
+                      f"force-off arm 0 — gate + kill-switch effective")
     return (False, f"unknown predicate '{pred}'")
 
 
@@ -394,7 +418,17 @@ KNOB_ENV = {
     "hit_drive": ("GZIPPY_NO_HIT_DRIVE=1", "none",
                   "confirmed-offset hit-drive prefetch"),
     "slab_alloc": ("GZIPPY_SLAB_ALLOC=1", "rpmalloc_stats",
-                   "slab allocator (opt-in; the reverted lever)"),
+                   "slab allocator force-on (the reverted lever, reconciled: "
+                   "auto-ON at T<=GZIPPY_SLAB_MAX_T — expect CAUSAL-NULL at "
+                   "default-ON cells)"),
+    "slab_off": ("GZIPPY_SLAB_ALLOC=0", "rpmalloc_stats_off",
+                 "slab force-OFF (gate proof: at T1 default-ON the knob arm "
+                 "must lose the slab win and zero the slab counters)"),
+    "slab_bigbudget": ("GZIPPY_SLAB_BUDGET_MIB=600", "none",
+                       "budget-shape probe (evidence trail): admit-everything "
+                       "retention (~the original f2 force-on class) vs the "
+                       "default T x largest budget — separates budget-shape "
+                       "headroom from state-dependence of the -99.9ms finding"),
     "eager_postproc": ("GZIPPY_EAGER_POSTPROC=1", "none",
                        "eager consumer post-processing (opt-in)"),
 }
@@ -823,6 +857,25 @@ def selftest():
     rp_fail_missing, _ = effect_check("rpmalloc_stats", "base output", "knob output")
     check(rp_fail_missing is False,
           "effect: rpmalloc_stats no slab counters in knob arm => CAUGHT")
+    # rpmalloc_stats_off (slab-t-conditional force-off knob): INVERTED proof.
+    off_ok, off_note = effect_check(
+        "rpmalloc_stats_off",
+        "[rpmalloc final] slab_hits=14 slab_installs=15\n",
+        "[rpmalloc final] slab_hits=0 slab_installs=0\n")
+    check(off_ok is True and "29" in off_note,
+          "effect: rpmalloc_stats_off base auto-engaged, knob 0 => EFFECT-VERIFIED")
+    off_vac, _ = effect_check(
+        "rpmalloc_stats_off",
+        "[rpmalloc final] slab_hits=0 slab_installs=0\n",
+        "[rpmalloc final] slab_hits=0 slab_installs=0\n")
+    check(off_vac is None,
+          "effect: rpmalloc_stats_off base not engaged => predicate vacuous (None)")
+    off_fail, _ = effect_check(
+        "rpmalloc_stats_off",
+        "[rpmalloc final] slab_hits=14 slab_installs=15\n",
+        "[rpmalloc final] slab_hits=3 slab_installs=1\n")
+    check(off_fail is False,
+          "effect: rpmalloc_stats_off knob arm still engaged => CAUGHT")
 
     # 7. end-to-end on a synthetic artifact dir: ranked table + DO-THIS-NEXT.
     d = tempfile.mkdtemp(prefix="fulcrum_decide_st_")

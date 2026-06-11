@@ -184,6 +184,24 @@ mod tests {
         let fixture = crate::tests::fixtures::text_10mb();
         let data = &fixture.single_member_gz;
 
+        // The slab allocator policy is T-CONDITIONAL by design (auto-ON
+        // strictly at decode T <= 2): with it on, the T1 arm retains its
+        // chunk buffer resident across iterations while the T4 arm re-faults
+        // every chunk, making T1 ~3x faster on this in-cache fixture
+        // (measured 20ms vs 60ms in the iter-1 reconciliation). That is
+        // allocator POLICY, not a parallelism regression — exactly what this
+        // guard is NOT about. Force the slab OFF for BOTH arms (restored on
+        // every exit path, including assert panic) so the 1.5x regression
+        // ceiling keeps measuring pipeline-vs-itself apples-to-apples.
+        struct SlabForceOffGuard;
+        impl Drop for SlabForceOffGuard {
+            fn drop(&mut self) {
+                crate::decompress::parallel::rpmalloc_alloc::slab_test_force(None);
+            }
+        }
+        crate::decompress::parallel::rpmalloc_alloc::slab_test_force(Some(false));
+        let _slab_off = SlabForceOffGuard;
+
         let mut parallel_batches = [0u64; 3];
         let mut sequential_batches = [0u64; 3];
         for batch in 0..3 {
