@@ -1,3 +1,20 @@
+## ASM PHASE OPENED — charter banked; VAR_VIII salvaged from an uncommitted worktree; increment (a) NO-SHIP w/ quantified boundary tax [2026-06-11]
+Branch engine/asm-p1 (worktree /tmp/gz-asm). CHARTER plans/asm-campaign.md: ladder (a) litlen
+asm! micro-step -> (b) fused litlen->dist -> (c) full kernel (entered only on (a)/(b) evidence);
+budget math (decode ceiling 642.6ms/50.9% T1, entire ~235ms rg gap fits 2.7x over; ship bar >=2%);
+per-increment gauntlet + asm-kernel feature policy (x86_64-only, GZIPPY_ASM_KERNEL=0, default-OFF).
+VAR_VIII SALVAGE: prototype existed ONLY as uncommitted mods in .claude/worktrees/var8-fullkernel
+— now BANKED (bench/var8-fullkernel@922d6cbe). Salvage: F1 gather + F3 refill asm (layouts
+unchanged at HEAD), exit protocol, KernCtx, coverage gate. Rewrite: F2 dist (ISA-L small LUT ->
+libdeflate DistEntry), D copy (-> P3.4 shape), arms (+P3.2 chain, +Q3 lit1). INCREMENT (a) BUILT
++ NO-SHIP (b5c3f7c4, kept default-OFF per rule 7a): byte-exact everywhere (asm==ref 400k states
+on real BMI2; sha 12/12; kill-switch proven; 10.9M hits T1) but frozen n=9 interleaved says ON
+is WORSE: T1 silesia +16ms (-1.3%) vs same-binary OFF, T8 model +14ms; OFF~=base. MECHANISM
+BANKED (F-a): ~1.4 cyc/step asm-seam tax x 15.9M crossings, zero latency recovered — per-symbol
+asm seams are pure cost on the NEW loop too (DIS-1 re-confirmed, 10x finer); a winning asm shape
+must amortize the boundary to ~once-per-block (rung (c); VAR_VIII had ~4000x fewer crossings).
+Local trap re-hit + dodged: Rosetta exposes NO BMI2 — local "asm tests pass" was ref-only; the
+real asm differential ran on the guest. Disk 100%-full local: reused /tmp/gz-chain scratch target.
 ## P3.5 DECODE-CHAIN MERGED (advisor-SOUND) — Rust reordering near exhaustion; ASM MEMO COMPLETE [2026-06-11]
 c1+c2+c4 shipped byte-exact (T1 frozen 1183->1162, +1.8% of wall = ~3.3% of the decode ceiling;
 every prof class improved frozen); c3 NO-SHIP on hardware-counter mispredict evidence. THE ASM
