@@ -2720,6 +2720,27 @@ impl Block {
                         if distance > *pos {
                             commit_fast!(Err(BlockError::ExceededWindowRange));
                         }
+                        // ── P3.5 c1: NEXT-SYMBOL PRELOAD BEFORE THE COPY ─────
+                        // libdeflate decompress_template.h:555-572 — "Before
+                        // starting to issue the instructions to copy the match,
+                        // refill the bitbuffer and preload the litlen decode
+                        // table entry for the next loop iteration … allowing
+                        // the latency of the match copy to overlap with these
+                        // other operations." The refill + LUT load read ONLY
+                        // input-side state (`lb`, `lut_litlen`); the copy and
+                        // the sparsity bookkeeping below touch ONLY the output
+                        // buffer and `self` fields — disjoint, so hoisting the
+                        // bottom-of-loop preload above the copy is byte-exact
+                        // by construction (identical refill threshold,
+                        // identical decode, identical bit consumption; only
+                        // instruction SCHEDULING changes). The iteration ends
+                        // with `continue 'fast` so the bottom preload (which
+                        // now serves the literal-pack arm only) is not re-run.
+                        if (lb.bitsleft as u8) < 48 {
+                            lb.refill();
+                        }
+                        pre = self.lut_litlen.decode(&mut lb);
+                        super::slow_knob::inject_localize(dec_spin, dec_yield);
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
                         // ORACLE NOSTORE: elide the copy (loads+stores), keep
@@ -2757,6 +2778,9 @@ impl Block {
                             prof_pending = super::contig_prof::CLASS_BACKREF;
                             pf.bytes_backref += length as u64;
                         }
+                        // P3.5 c1: `pre` already preloaded above (before the
+                        // copy) — skip the bottom-of-loop preload.
+                        continue 'fast;
                     }
                 }
 
