@@ -1,3 +1,18 @@
+## SERIAL-RESIDUE DECOMPOSITION DONE — chain exonerated; lever RELOCATED to the marker FAST-PATH loop [2026-06-11]
+The bignasa-isal T8 serial chain is NOT the binder — every stage causally cleared: (1) WRITER:
+skip-writev removal oracle saves 92ms of pure write time but an overlap-writer A/B is a TIE — the
+write is already hidden under parallel decode; (2) APPLY_WINDOW: runs 6-way parallel, hidden by
+decode, not on the critical chain; (3) DRAIN: ~2ms; recv_us=0 on all chunks (consumer never waits
+on the channel). RELOCATED LEVER: per-chunk MARKER DECODE RATE — gzippy's marker loop is ~6%
+slower per chunk than rapidgzip's on the same chunks, and that per-chunk deficit IS the ~68ms
+(7.5%) bignasa-isal T8 gap. CRITICAL CAVEAT on the rung-d "marker slack" refutation: that probe
+injected into the CAREFUL loop only (forced careful), but ~69% of marker events take the FAST
+path — the slack finding does NOT cover the fast path; both reads are consistent: careful loop
+has slack, fast path is the binder. ANOMALY FLAGGED: this worker's frozen absolutes (T1 973 /
+T8 909ms) did not reproduce the banked 1350/1086 — frequency-state difference suspected; ratios
+and structure consistent; treat absolutes as run-local until reconciled. NEXT: port the
+deprioritized N2-N5 P3 passes (local-Bits mirror, lit-chain, c1/c2/c4 schedule, hoists — all
+proven in the clean contig loop) to the marker FAST loop, which has received none of them.
 ## RUNG-D INC-1 MERGED (advisor-PASS) — marker attribution refuted; SERIAL RESIDUE is the next target [2026-06-11]
 Marker DistTable TIE-KEPT (one dist-decode shape engine-wide; 72/72 grid; trajectory-complete
 differential incl. flip-arming). THE PROBE REFUTED the isal-decide attribution: marker loop has
