@@ -1,3 +1,15 @@
+## P3.3b T16 TRIAGE — P3.1's DistTable owns the -3%; P3.2 clean [2026-06-10]
+4-way frozen interleave n=15 (bar/m6/p31/p33): bar med 325.0 / m6 329.5 / p31 333.6 / p33 332.9.
+P3.1 carries +8.6ms (distributions barely touch: bar p75 331.0 < p31 p25 332.2); P3.2 = +0.7ms TIE.
+Formally UNRESOLVED under the strict both-IQR rule only because bar's distribution is BIMODAL
+(IQR 9.6 vs delta 8.6) — the regression exists in the data. MECHANISM (inferred, unverified): at
+T16 the per-block DistTable build cadence across 16 threads (smaller chunks => more blocks/sec)
++ second-table cache footprint outweighs the per-backref savings; at T1/model the trade nets
+strongly positive (+15ms T1, +8.4% model). FIX SHAPE for P3.4 (not a revert): amortize/condition
+the build — candidates: skip the DistTable when the block's remaining contig span is small (size
+heuristic), cheap same-lengths reuse check, or a build-cost shave; verify at T16 n>=15 + T1 + model.
+P3.4 SCOPE (one inner-loop pass): dist-build amortization + backref-arm polish (21.8 cyc/iter vs
+wrapper-class) + BMI2 PEXT/BZHI dispatch + table prefetch — then the asm decision with full data.
 ## P3.3a OFFICIAL RE-MEASURE @ 2644f8be — arsenal lever confirmed on the cells [2026-06-10]
 vs official baselines (sanity 7/7): model T8 native +8.4% REAL (rg-ratio 0.574->0.622; litchn owns
 44.9% of classed cycles there vs 20-22% silesia — corpus-dependent payoff now MEASURED); silesia
