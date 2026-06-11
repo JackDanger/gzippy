@@ -424,6 +424,22 @@ pub struct Block {
     dist_hc: crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached<
         MAX_DISTANCE_SYMBOL_COUNT,
     >,
+    /// P3.1 (T1 recovery): libdeflate-style single-lookup distance table for
+    /// the CONTIG CLEAN fast loop only. The contig-vs-wrapper cycle profile
+    /// (GZIPPY_CONTIG_PROF) measured the back-ref iteration at 84.8 vs 61.5
+    /// cyc — the dependent chain `dist_hc cache -> DISTANCE_EXTRA -> refill
+    /// check -> DISTANCE_BASE` is the gap; one `DistEntry` lookup decodes
+    /// code+extra from the already-peeked word (same technique as the
+    /// wrapper's `DistTable`, resumable.rs:1394-1405). AUTHORIZED DEVIATION
+    /// from the vendor distance-decode choice, scoped to the inner Huffman
+    /// loop (CLAUDE.md "fastest possible raw Huffman decoder": LitLenTable/
+    /// DistTable/Bits primitives are open territory). `dist_hc` stays the
+    /// engine for the careful loop and every marker/ring path (vendor-
+    /// faithful); byte-exactness: identical symbols => identical
+    /// distance/bit-consumption, unassigned/invalid code => raw==0 entry =>
+    /// `InvalidHuffmanCode`, exactly `dist_hc`'s `None`.
+    #[cfg(pure_inflate_decode)]
+    dist_table: Option<crate::decompress::inflate::libdeflate_entry::DistTable>,
     /// True after `read_header` built ISA-L LUTs for this block (vendor
     /// `m_literalHC` / `m_distanceHC` at deflate.hpp:1137-1141). Cleared
     /// on each new header so `read()` in the `while !eob` loop reuses them.
@@ -490,6 +506,8 @@ impl Block {
             dist_hc:
                 crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached::new(
                 ),
+            #[cfg(pure_inflate_decode)]
+            dist_table: None,
             #[cfg(any(
                 all(
                     feature = "isal-compression",
@@ -870,6 +888,13 @@ impl Block {
         ))]
         {
             self.block_huffman_luts_ready = false;
+        }
+        // Reset dist_table to None for each new block so decode_clean_into_contig
+        // triggers a fresh lazy build (marker-mode blocks that never flip clean
+        // skip the allocation entirely).
+        #[cfg(pure_inflate_decode)]
+        {
+            self.dist_table = None;
         }
         if treat_last_block_as_error && bfinal {
             return Err(BlockError::UnexpectedLastBlock);
@@ -2154,6 +2179,29 @@ impl Block {
             }
             _ => return Err(BlockError::InvalidCompression),
         }
+        // P3.1 lazy dist_table: only needed in the contig fast loop, so skip
+        // the Vec alloc for marker-mode blocks that never flip clean.
+        // read_header resets dist_table to None for each new block.
+        // After build_huffman_luts_for_block, dist_hc holds the validated lens,
+        // and literal_cl / FIXED_DIST_LENGTHS still hold the same raw lengths.
+        #[cfg(pure_inflate_decode)]
+        if self.dist_table.is_none() {
+            self.dist_table = match self.compression_type {
+                CompressionType::FixedHuffman => {
+                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                        &FIXED_DIST_LENGTHS[..],
+                    )
+                }
+                CompressionType::DynamicHuffman => {
+                    let split = self.literal_code_count;
+                    let end = split + self.distance_code_count;
+                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
+                        &self.literal_cl[split..end],
+                    )
+                }
+                _ => None,
+            };
+        }
 
         const MAX_LIT_LEN_SYM: u32 = 512;
         const MAX_RUN_LENGTH: usize = 258;
@@ -2177,6 +2225,12 @@ impl Block {
         let local_cap = n_max_to_decode.min(out_room.saturating_sub(*pos));
 
         let mut emitted: usize = 0;
+
+        // P3.1 cycle profiler (GZIPPY_CONTIG_PROF=1, OFF=default): per-call
+        // accumulator flushed on Drop so every `commit!`/`commit_fast!` return
+        // path is covered. See contig_prof.rs for method + caveats.
+        let prof_on = super::contig_prof::enabled();
+        let mut pf = super::contig_prof::ContigFlush::new(prof_on);
 
         // Causal-perturbation slow-injection (measurement-only, byte-transparent;
         // OFF==identity, DUAL-SHA gated). This is the PRODUCTION gzippy-native FOLD
@@ -2230,16 +2284,73 @@ impl Block {
         const FAST_IN_SLOP: usize = 8;
         if slow_spin == 0 && !slow_yield {
             let in_end = bits.data.len();
-            bits.refill();
-            let mut pre = self.lut_litlen.decode(bits);
+            // P3.1 (T1 recovery, Lever-B1 class): mirror the bit-reader into a
+            // STACK-LOCAL `Bits` for the duration of the fast loop and write it
+            // back at every exit. Through `&mut Bits` the
+            // bitbuf/bitsleft/pos round-trip memory each symbol (the raw
+            // `base: *mut u8` output stores defeat LLVM's aliasing analysis in
+            // practice — same finding as resumable.rs Lever B1, which lifted
+            // the wrapper loop's reader into locals for exactly this reason);
+            // a non-escaping local promotes them to registers. Decode order and
+            // bit consumption are IDENTICAL — byte-exact by construction.
+            let mut lb = Bits {
+                data: bits.data,
+                pos: bits.pos,
+                bitbuf: bits.bitbuf,
+                bitsleft: bits.bitsleft,
+            };
+            // Hoisted backref-tracking flag (the per-backref `&mut self` method
+            // call re-loaded the flag from memory inside the hot loop; the flag
+            // cannot change mid-decode).
+            let track_backrefs = self.track_backreferences;
+            // Hoisted single-lookup distance table (see `dist_table` field doc).
+            // Field-disjoint from every `self` mutation inside the loop
+            // (`at_end_of_block`, `backreferences`, `decoded_bytes`), so the
+            // borrow is legal across them.
+            #[cfg(pure_inflate_decode)]
+            let dist_tbl = self.dist_table.as_ref();
+            #[cfg(not(pure_inflate_decode))]
+            let dist_tbl: Option<
+                &crate::decompress::inflate::libdeflate_entry::DistTable,
+            > = None;
+            macro_rules! sync_local_bits {
+                () => {{
+                    bits.pos = lb.pos;
+                    bits.bitbuf = lb.bitbuf;
+                    bits.bitsleft = lb.bitsleft;
+                }};
+            }
+            macro_rules! commit_fast {
+                ($result:expr) => {{
+                    sync_local_bits!();
+                    self.decoded_bytes += emitted;
+                    return $result;
+                }};
+            }
+            lb.refill();
+            let mut pre = self.lut_litlen.decode(&mut lb);
             super::slow_knob::inject_localize(dec_spin, dec_yield);
+            // P3.1 profiler chaining state: ONE rdtsc per iteration; the delta
+            // between consecutive iteration tops is charged to the class the
+            // completed iteration recorded in `prof_pending`.
+            let mut prof_last_t: u64 = super::contig_prof::rdtsc(prof_on);
+            let mut prof_pending: usize = super::contig_prof::CLASS_NONE;
             'fast: loop {
+                if prof_on {
+                    let t = super::contig_prof::rdtsc(true);
+                    if prof_pending != super::contig_prof::CLASS_NONE {
+                        pf.cyc[prof_pending] += t.wrapping_sub(prof_last_t);
+                        pf.n[prof_pending] += 1;
+                    }
+                    prof_last_t = t;
+                    prof_pending = super::contig_prof::CLASS_NONE;
+                }
                 // Out headroom: keep `*pos + FAST_OUT_SLOP` within the reserved
                 // word-copy region (out_room already reserves MAX_RUN_LENGTH+8 so
                 // both the 8-byte literal store and a max back-ref fit). In slop:
                 // enough bytes ahead for the unchecked fast refill.
                 let out_ok = emitted + FAST_OUT_SLOP < local_cap;
-                let in_ok = bits.pos + FAST_IN_SLOP < in_end;
+                let in_ok = lb.pos + FAST_IN_SLOP < in_end;
                 if !(out_ok && in_ok) {
                     break 'fast;
                 }
@@ -2251,7 +2362,7 @@ impl Block {
                     // the cursor at `pre`'s start (bits not yet consumed).
                     break 'fast;
                 }
-                bits.consume(bit_count0);
+                lb.consume(bit_count0);
 
                 // Resolve leading-literal count + any trailing non-literal.
                 // Fast-path the DOMINANT single-symbol packet (sym_count==1): a
@@ -2277,6 +2388,9 @@ impl Block {
                         *pos += 1;
                         emitted += 1;
                         super::slow_knob::inject_localize(st_spin, st_yield);
+                        if prof_on {
+                            prof_pending = super::contig_prof::CLASS_LIT1;
+                        }
                     } else {
                         trailing_code = code;
                         have_trailing = true;
@@ -2309,49 +2423,87 @@ impl Block {
                     *pos += lit_prefix;
                     emitted += lit_prefix;
                     super::slow_knob::inject_localize(st_spin, st_yield);
+                    if prof_on {
+                        prof_pending = super::contig_prof::CLASS_LITPACK;
+                        pf.bytes_litpack += lit_prefix as u64;
+                    }
                 }
 
                 if have_trailing {
                     let code = trailing_code;
                     if code == END_OF_BLOCK_SYMBOL {
                         self.at_end_of_block = true;
-                        commit!(Ok(emitted));
+                        commit_fast!(Ok(emitted));
                     }
                     if (code as u32) > MAX_LIT_LEN_SYM {
-                        commit!(Err(BlockError::InvalidHuffmanCode));
+                        commit_fast!(Err(BlockError::InvalidHuffmanCode));
                     }
                     let length = (code as usize).wrapping_sub(254);
                     if length != 0 {
-                        let dsym = match self.dist_hc.decode(bits) {
-                            Some(d) => d,
-                            None => commit!(Err(BlockError::InvalidHuffmanCode)),
-                        };
-                        super::slow_knob::inject_localize(dec_spin, dec_yield);
-                        if dsym as usize >= DISTANCE_BASE.len() {
-                            commit!(Err(BlockError::InvalidHuffmanCode));
-                        }
-                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
-                        let distance = if extra > 0 {
-                            if bits.available() < extra {
-                                bits.refill();
-                                if bits.available() < extra {
-                                    commit!(Err(BlockError::EndOfFile));
-                                }
+                        let distance = if let Some(dt) = dist_tbl {
+                            // Single-lookup path (wrapper analog,
+                            // resumable.rs:1394-1405): code + extra decoded
+                            // from the already-peeked word, no mid-dist
+                            // refill. Bit budget proof: every iteration top
+                            // has >= 48 bits (bottom threshold refill);
+                            // litlen consumed <= 20 (12-bit packed slots or
+                            // <= 15-bit code + <= 5 packed length-extra), so
+                            // >= 28 remain >= 9 main + 6 subtable + 13 extra.
+                            use crate::decompress::inflate::libdeflate_entry::DistTable;
+                            let mut dist_entry = dt.lookup(lb.bitbuf);
+                            if dist_entry.is_subtable_ptr() {
+                                lb.consume(DistTable::TABLE_BITS as u32);
+                                dist_entry = dt.lookup_subtable_direct(dist_entry, lb.bitbuf);
                             }
-                            let mask = (1u64 << extra) - 1;
-                            let v = (bits.peek() & mask) as usize;
-                            bits.consume(extra);
-                            DISTANCE_BASE[dsym as usize] as usize + v
+                            let dist_raw = dist_entry.raw();
+                            // raw == 0 is the unassigned/invalid-code marker
+                            // (codes 30/31 and incomplete-code holes) — the
+                            // exact set `dist_hc.decode` returns `None` for.
+                            if dist_raw == 0 {
+                                commit_fast!(Err(BlockError::InvalidHuffmanCode));
+                            }
+                            let dist_extra_saved = lb.bitbuf;
+                            lb.consume_entry(dist_raw);
+                            super::slow_knob::inject_localize(dec_spin, dec_yield);
+                            dist_entry.decode_distance(dist_extra_saved) as usize
                         } else {
-                            DISTANCE_BASE[dsym as usize] as usize
+                            // Fallback: vendor-faithful dist_hc walk (kept
+                            // verbatim; unreachable in production — the LUT
+                            // build always populates `dist_table` for
+                            // Huffman blocks — but it keeps the loop sound
+                            // if a future builder declines a block).
+                            let dsym = match self.dist_hc.decode(&mut lb) {
+                                Some(d) => d,
+                                None => commit_fast!(Err(BlockError::InvalidHuffmanCode)),
+                            };
+                            super::slow_knob::inject_localize(dec_spin, dec_yield);
+                            if dsym as usize >= DISTANCE_BASE.len() {
+                                commit_fast!(Err(BlockError::InvalidHuffmanCode));
+                            }
+                            let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                            let d = if extra > 0 {
+                                if lb.available() < extra {
+                                    lb.refill();
+                                    if lb.available() < extra {
+                                        commit_fast!(Err(BlockError::EndOfFile));
+                                    }
+                                }
+                                let mask = (1u64 << extra) - 1;
+                                let v = (lb.peek() & mask) as usize;
+                                lb.consume(extra);
+                                DISTANCE_BASE[dsym as usize] as usize + v
+                            } else {
+                                DISTANCE_BASE[dsym as usize] as usize
+                            };
+                            d
                         };
                         if distance == 0 || distance > MAX_WINDOW_SIZE {
-                            commit!(Err(BlockError::ExceededWindowRange));
+                            commit_fast!(Err(BlockError::ExceededWindowRange));
                         }
                         // Clean-mode range check — mirror of the careful loop
                         // (deflate.hpp:1652-1655): valid iff `distance <= *pos`.
                         if distance > *pos {
-                            commit!(Err(BlockError::ExceededWindowRange));
+                            commit_fast!(Err(BlockError::ExceededWindowRange));
                         }
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
@@ -2359,24 +2511,66 @@ impl Block {
                             emit_backref_contig(base, pos, distance, length);
                         }
                         super::slow_knob::inject_localize(st_spin, st_yield);
-                        self.record_backreference_for_sparsity(distance, length, emitted);
+                        if track_backrefs {
+                            // Inlined `record_backreference_for_sparsity`
+                            // body (field-disjoint from the `dist_tbl`
+                            // borrow; a `&mut self` method call would not be).
+                            let decoded_in_block = self
+                                .decoded_bytes
+                                .saturating_sub(self.decoded_bytes_at_block_start)
+                                .saturating_add(emitted);
+                            if distance > decoded_in_block {
+                                let stored_dist = (distance - decoded_in_block) as u16;
+                                let stored_len = (length as u16).min(stored_dist);
+                                self.backreferences.push(Backreference {
+                                    distance: stored_dist,
+                                    length: stored_len,
+                                });
+                            }
+                        }
                         emitted += length;
+                        if prof_on {
+                            prof_pending = super::contig_prof::CLASS_BACKREF;
+                            pf.bytes_backref += length as u64;
+                        }
                     }
                 }
 
                 // Preload next symbol (pipeline). Refill first so the decode and
-                // any subsequent dist-extra reads have headroom.
-                bits.refill();
-                pre = self.lut_litlen.decode(bits);
+                // any subsequent dist-extra reads have headroom. Threshold-gated
+                // (one iteration consumes <= 48 bits: litlen <= 20 incl. packed
+                // length-extra, dist code <= 15, dist extra <= 13 — the same
+                // budget as resumable.rs REFILL_THRESHOLD); the LUT decodes keep
+                // their own `available() < 32` backstops, and refills never
+                // change decode results, so gating is byte-transparent.
+                if (lb.bitsleft as u8) < 48 {
+                    lb.refill();
+                }
+                pre = self.lut_litlen.decode(&mut lb);
                 super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
             // a fresh un-consumed `pre`), so the bit cursor sits exactly before
             // `pre`'s bits. The careful loop below re-decodes from here — no state
             // carried, no desync. `*pos`/`emitted`/`at_end_of_block` are all live.
+            sync_local_bits!();
         }
 
+        // P3.1 profiler: chained per-iteration accounting for the careful tail
+        // (the EOB-exit iteration's tail cycles are dropped — acceptable, the
+        // careful loop is the low-volume tail).
+        let mut prof_c_last: u64 = super::contig_prof::rdtsc(prof_on);
+        let mut prof_c_pending: bool = false;
         while emitted < local_cap {
+            if prof_on {
+                let t = super::contig_prof::rdtsc(true);
+                if prof_c_pending {
+                    pf.cyc_careful += t.wrapping_sub(prof_c_last);
+                    pf.bytes_careful += 1; // outer-iteration count, not bytes
+                }
+                prof_c_last = t;
+                prof_c_pending = true;
+            }
             super::slow_knob::inject(slow_spin, slow_yield);
             bits.refill();
             let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
@@ -4639,5 +4833,190 @@ mod tests {
             assert_eq!(e_left, 990, "residual size committed");
             assert!(!e_eob);
         }
+    }
+
+    /// Differential: for every distance code-length set that `dist_hc` accepts,
+    /// `DistTable::build` must succeed, and for every random bit pattern the
+    /// decoded distance symbol, codeword length, base, and extra bits must agree.
+    ///
+    /// Fixed sets: [5;30], single len-1, two len-1, deep ladder (forces
+    /// subtable), incomplete/holes.  Then ~400 pseudo-random sets via seeded
+    /// LCG; the test asserts ≥238 total accepted across all tries.
+    #[test]
+    #[cfg(pure_inflate_decode)]
+    fn dist_table_matches_dist_hc_differential() {
+        /// Run the dist_hc ↔ DistTable differential for one code-length set.
+        /// Returns true iff dist_hc accepted the set (and all assertions passed).
+        fn run_set(lens: &[u8], pattern_seed: u64) -> bool {
+            use crate::decompress::inflate::consume_first_decode::Bits;
+            use crate::decompress::inflate::libdeflate_entry::{DistTable, DISTANCE_TABLE};
+            use crate::decompress::parallel::error::Error as HcError;
+            use crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached;
+
+            // 1. Production invariant: dist_table is only built after dist_hc
+            //    accepts the same lens.
+            let mut dist_hc = DistanceShortBitsCached::<30>::new();
+            if dist_hc.initialize_from_lengths(lens, false) != HcError::None {
+                return false;
+            }
+
+            // 2. DistTable::build must succeed for any lens dist_hc accepted.
+            let dt = DistTable::build(lens)
+                .expect("DistTable::build must return Some when dist_hc accepts");
+
+            // 3. ≥200k bit patterns via seeded LCG.
+            let mut s = pattern_seed;
+            for _ in 0..200_000u32 {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let bits_val: u64 = s;
+
+                // 16-byte stack buffer: two copies give ≥56 bits after Bits::new.
+                let raw = bits_val.to_le_bytes();
+                let buf: [u8; 16] = {
+                    let mut b = [0u8; 16];
+                    b[..8].copy_from_slice(&raw);
+                    b[8..].copy_from_slice(&raw);
+                    b
+                };
+
+                // --- dist_hc path (tracks codeword bits via bit_position delta) ---
+                let mut br = Bits::new(&buf);
+                let bp_before = br.bit_position();
+                let hc_result = dist_hc.decode(&mut br);
+                let hc_valid = hc_result.is_some();
+                let hc_consumed = (br.bit_position() - bp_before) as u8;
+
+                // --- DistTable path ---
+                // For subtable entries +TABLE_BITS are consumed by main lookup.
+                let main_entry = dt.lookup(bits_val);
+                let (dt_entry, dt_consumed) = if main_entry.is_subtable_ptr() {
+                    let sub = dt.lookup_subtable_direct(
+                        main_entry,
+                        bits_val >> (DistTable::TABLE_BITS as u32),
+                    );
+                    (sub, DistTable::TABLE_BITS + sub.codeword_bits())
+                } else {
+                    (main_entry, main_entry.codeword_bits())
+                };
+
+                // Invariant 1: validity must agree — raw()==0 is the
+                // unassigned/invalid-code sentinel, mirrors dist_hc None.
+                assert_eq!(
+                    hc_valid,
+                    dt_entry.raw() != 0,
+                    "validity mismatch: bits_val={bits_val:#018x} hc={hc_result:?} \
+                     dt_raw={:#010x}",
+                    dt_entry.raw()
+                );
+
+                if hc_valid {
+                    let sym = hc_result.unwrap() as usize;
+
+                    // Invariant 2: codeword bits consumed agree.
+                    assert_eq!(
+                        hc_consumed, dt_consumed,
+                        "codeword bits mismatch: sym={sym} bits_val={bits_val:#018x} \
+                         hc={hc_consumed} dt={dt_consumed}"
+                    );
+
+                    // Invariant 3: distance_base matches RFC table.
+                    assert_eq!(
+                        DISTANCE_TABLE[sym].0,
+                        dt_entry.distance_base(),
+                        "distance_base mismatch: sym={sym}"
+                    );
+
+                    // Invariant 4: extra_bits matches RFC table
+                    // (total_bits - codeword_bits for both direct and subtable entries).
+                    assert_eq!(
+                        DISTANCE_TABLE[sym].1,
+                        dt_entry.total_bits() - dt_entry.codeword_bits(),
+                        "extra_bits mismatch: sym={sym}"
+                    );
+                }
+            }
+            true
+        }
+
+        let mut accepted = 0u32;
+        // Seed stream for run_set pattern seeds (independent of set-length LCG).
+        let mut seed = 0xfeed_face_dead_beef_u64;
+        let mut next_seed = || -> u64 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+
+        // --- Fixed sets ---
+
+        // Set 1: all lengths = 5 (Kraft sum = 30/32 < 1, nearly complete).
+        if run_set(&[5u8; 30], next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 2: single symbol at length 1 (degenerate — only one valid code).
+        let mut single_len1 = [0u8; 30];
+        single_len1[0] = 1;
+        if run_set(&single_len1, next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 3: two symbols at length 1 (Kraft-complete, codes 0 and 1).
+        let mut two_len1 = [0u8; 30];
+        two_len1[0] = 1;
+        two_len1[1] = 1;
+        if run_set(&two_len1, next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 4: deep ladder 1,2,...,13,14,14 — Kraft-complete, forces subtable
+        // entries (TABLE_BITS=9; lengths 10-14 require subtable lookup).
+        let mut deep_ladder = [0u8; 30];
+        for i in 0..13usize {
+            deep_ladder[i] = (i + 1) as u8;
+        }
+        deep_ladder[13] = 14;
+        deep_ladder[14] = 14;
+        if run_set(&deep_ladder, next_seed()) {
+            accepted += 1;
+        }
+
+        // Set 5: incomplete/holes — sparse assignment, Kraft sum 0.25 < 1.
+        let mut sparse_holes = [0u8; 30];
+        sparse_holes[0] = 3;
+        sparse_holes[5] = 4;
+        sparse_holes[10] = 5;
+        sparse_holes[15] = 5;
+        if run_set(&sparse_holes, next_seed()) {
+            accepted += 1;
+        }
+
+        // --- ~400 pseudo-random sets ---
+        // Length generation: 30% skip (L=0), 70% uniform in {4..15}.
+        // Expected Kraft sum ≈ 0.22 → acceptance rate ≈ 99%.
+        let mut rng = 0x0123_4567_89ab_cdef_u64;
+        for _ in 0..400u32 {
+            let mut lens = [0u8; 30];
+            for b in &mut lens {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let raw = (rng >> 48) as u8;
+                // 77/256 ≈ 30% → L=0 (skip); rest → L in {4..15}.
+                *b = if raw < 77 { 0 } else { 4 + (raw - 77) % 12 };
+            }
+            if run_set(&lens, next_seed()) {
+                accepted += 1;
+            }
+        }
+
+        // Sanity: verify the LCG produced a reasonable number of accepted sets.
+        assert!(
+            accepted >= 238,
+            "expected ≥238 accepted code-length sets out of 405 tried, got {accepted}"
+        );
     }
 }
