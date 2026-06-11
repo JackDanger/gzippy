@@ -1,3 +1,13 @@
+## FULCRUM DECIDE MERGED (user directive delivered; advisor-gated, live-verified) [2026-06-11]
+One run -> ranked causal table. Proven end-to-end THREE times on the box: (1) first run reproduced
+banked findings + surfaced slab_alloc PAYS ~100ms @ native T1 (N=21 RESOLVED — the lever an earlier
+session reverted on wrong-placement evidence); (2) the sha-field regression its own hard-fail
+caught (read-slurp; fixed + self-tested); (3) the effect-predicate non-exclusivity it caught on
+ITSELF (line-presence -> slab counters; EFFECT-VERIFIED now live). RSS per arm on knob rows;
+reverted-knob phrasing = reconcile-with-prior-gate. QUEUED BY THE TOOL: (a) slab@T1 reconciliation
+(wall PAYS ~100ms, RSS to check, prior revert was T16-mask-conditioned — likely T-conditional
+default); (b) engine.backref hypothesis w/ pre-registered perturbation (60.5% of classed cycles).
+Guest: /root/bin-f2-native has the slab counters.
 ## P3.5 OFFICIAL MATRIX @ a9fe662c — arsenal trajectory banked [2026-06-10]
 4 WIN / 6 TIE / 1 noise-REG vs baselines. NATIVE rg-ratios now: silesia T1 0.648 (was 0.578 at
 M6 — arsenal moved it -116ms), T4 0.808, T8 0.959 (16ms from rg!), T16 0.956, model 0.610 (was
