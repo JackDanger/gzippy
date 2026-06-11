@@ -26,7 +26,7 @@ from .. import PROTOCOL_VERSION
 from . import trace as tr
 from .causal import knob_verdict
 from .fingerprint import Fingerprint, assert_comparable, incompatibilities
-from .ledger import make_record
+from .ledger import PENDING, make_record
 from .stats import bimodal, dist_health_str, read_samples, resolution, sample_stats
 
 # ---------------------------------------------------------------------------
@@ -254,6 +254,7 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
     if ledger is not None:
         already = ledger.has_run(man.get("runid"))
         n_banked = 0
+        n_pending = 0
         for ck, w in sorted(cell_walls.items()):
             if w["fp_label"] or not ok_frozen:
                 continue   # incomplete fingerprint / unfrozen: never banked
@@ -268,15 +269,33 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                             "comparator", w["fp_rg"]),
             ]
             for rec in recs:
-                for c in ledger.contradictions(rec):
+                contras = ledger.contradictions(rec)
+                for c in contras:
                     anomalies.append(c)
-                if not already:
+                if already:
+                    continue
+                if contras:
+                    # A contradicting live number is NEVER auto-banked as an
+                    # anchor: it lands pending-reconcile until a supersede
+                    # record names which side was wrong.
+                    rec["status"] = PENDING
+                    ledger.append(rec)
+                    n_pending += 1
+                    anomalies.append(
+                        f"{rec['key']}: live row banked {PENDING} (not an "
+                        f"anchor). After reconciling, resolve with: "
+                        f"fulcrum ledger supersede --key '{rec['key']}' "
+                        f"--retire <banked-runid> --promote {rec['runid']} "
+                        f"--reason '<why the banked row is retired>'")
+                else:
                     ledger.append(rec)
                     n_banked += 1
         ledger_notes.append(
             f"ledger     : {ledger.path} "
             + ("(run already banked — re-analysis, nothing appended)"
-               if already else f"(banked {n_banked} rows)"))
+               if already else
+               f"(banked {n_banked} rows"
+               + (f", {n_pending} {PENDING}" if n_pending else "") + ")"))
 
     # ---- trace decomposition per cell (canonical mask) -------------------------
     trace_components = {}   # cls -> {cell: (ms, span_ms)}

@@ -16,7 +16,15 @@ scripts/fulcrum_decide.py shims):
   invariants
       Render the enforced invariant set with scars.
   ledger [path]
-      Summarize the results ledger.
+      Summarize the results ledger (anchors, pending-reconcile rows,
+      supersede/invalid resolutions).
+  ledger supersede --key K --retire RUNID [--promote RUNID] --reason R [path]
+      Retire a banked row as an anchor (and optionally promote the
+      pending-reconcile row that contradicted it). Append-only: the old row
+      stays in the file, it just stops anchoring.
+  ledger invalidate --key K --target RUNID --reason R [path]
+      Retire a banked row that was a measurement error (never an anchor
+      again; nothing is promoted).
 
 Measurement runs themselves (freeze, masks, sinks, sha pins) live in the
 project's environment-control policy — for gzippy, scripts/bench/decide.sh.
@@ -136,6 +144,79 @@ def decide_main(argv=None):
     report_mod.print_report(rep, tie_bar=adapter.tie_bar)
 
 
+def ledger_main(rest):
+    """`fulcrum ledger [path]` listing + the supersede/invalidate verbs."""
+    verb = rest[0] if rest and rest[0] in ("supersede", "invalidate") else None
+    args = rest[1:] if verb else rest
+    opts = {}
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--key", "--retire", "--promote", "--target", "--reason"):
+            if i + 1 >= len(args):
+                print(f"ledger {verb}: {a} needs a value")
+                sys.exit(2)
+            opts[a.lstrip("-")] = args[i + 1]; i += 2; continue
+        if a.startswith("--"):
+            print(f"ledger: unknown option {a}")
+            sys.exit(2)
+        positional.append(a); i += 1
+    path = positional[0] if positional else _default_ledger_path()
+    led = Ledger(path)
+
+    if verb == "supersede":
+        missing = [k for k in ("key", "retire", "reason") if k not in opts]
+        if missing:
+            print(f"ledger supersede: missing --{' --'.join(missing)}")
+            sys.exit(2)
+        led.supersede(opts["key"], opts["retire"], opts["reason"],
+                      promote_runid=opts.get("promote"))
+        print(f"superseded: key={opts['key']} retired={opts['retire']}"
+              + (f" promoted={opts['promote']}" if opts.get("promote") else "")
+              + f" (appended to {path})")
+        return
+    if verb == "invalidate":
+        missing = [k for k in ("key", "target", "reason") if k not in opts]
+        if missing:
+            print(f"ledger invalidate: missing --{' --'.join(missing)}")
+            sys.exit(2)
+        led.invalidate(opts["key"], opts["target"], opts["reason"])
+        print(f"invalidated: key={opts['key']} target={opts['target']} "
+              f"(appended to {path})")
+        return
+
+    rows = led.rows()
+    anchor_ids = {(r.get("key"), r.get("runid")) for r in led.anchors()}
+    print(f"ledger: {path} ({len(rows)} rows, {len(anchor_ids)} anchors)")
+    for r in rows:
+        if r.get("_corrupt"):
+            print(f"  [TORN ROW] {r['_corrupt']}")
+            continue
+        kind = r.get("kind", "?")
+        if kind == "supersede":
+            print(f"  {r.get('ts', '?'):20s} [SUPERSEDE] {r.get('key', '?')} "
+                  f"retired={r.get('retire_runid')} "
+                  f"promoted={r.get('promote_runid') or '-'} "
+                  f"reason={r.get('reason', '?')}")
+            continue
+        if kind == "invalid":
+            print(f"  {r.get('ts', '?'):20s} [INVALID]   {r.get('key', '?')} "
+                  f"target={r.get('target_runid')} "
+                  f"reason={r.get('reason', '?')}")
+            continue
+        fp = r.get("fingerprint", {})
+        ident = (r.get("key"), r.get("runid"))
+        tag = ("ANCHOR " if ident in anchor_ids else
+               ("PENDING" if r.get("status") == "pending-reconcile"
+                else "RETIRED"))
+        print(f"  {r.get('ts', '?'):20s} {tag:7s} {r.get('runid', '?'):28s} "
+              f"{r.get('key', '?'):24s} {r.get('value_ms', 0):9.1f}ms "
+              f"n={r.get('n', 0):<3d} sink={fp.get('sink', '?')} "
+              f"freeze={fp.get('freeze', '?')} "
+              f"bin={str(fp.get('bin_sha', '?'))[:12]}")
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     cmd = argv[0] if argv else "help"
@@ -151,19 +232,7 @@ def main(argv=None):
         from .core.invariants import render
         print(render())
     elif cmd == "ledger":
-        path = rest[0] if rest else _default_ledger_path()
-        rows = Ledger(path).rows()
-        print(f"ledger: {path} ({len(rows)} rows)")
-        for r in rows:
-            if r.get("_corrupt"):
-                print(f"  [TORN ROW] {r['_corrupt']}")
-                continue
-            fp = r.get("fingerprint", {})
-            print(f"  {r.get('ts', '?'):20s} {r.get('runid', '?'):28s} "
-                  f"{r.get('key', '?'):24s} {r.get('value_ms', 0):9.1f}ms "
-                  f"n={r.get('n', 0):<3d} sink={fp.get('sink', '?')} "
-                  f"freeze={fp.get('freeze', '?')} "
-                  f"bin={str(fp.get('bin_sha', '?'))[:12]}")
+        ledger_main(rest)
     else:
         print(__doc__)
         sys.exit(0 if cmd in ("help", "-h", "--help") else 1)
