@@ -1,3 +1,12 @@
+## ASM PHASE OPENED — charter merged; increment (a) falsified; rung (c) is the shape [2026-06-11]
+Charter (plans/asm-campaign.md): budget math + 3-rung ladder + gauntlet + VAR_VIII salvage verdict
+(prototype banked at bench/var8-fullkernel @ 922d6cbe). Increment (a) micro-kernel: byte-exact,
+frozen +16ms T1 REGRESSION, reverted — seam tax ~1.4cyc x 15.9M crossings; LLVM can't schedule
+across asm! boundaries. The falsifier CONFIRMS the design premise: rung (c) full-symbol-loop asm
+(one seam per fast-loop run) is the only shape that can spend the ~620ms decode-latency budget.
+NEXT SESSION: rung (c) — the full-kernel port against the P3.1-P3.5 loop state (local-Bits mirror,
+DistTable, lit-chain, preloads as the register contract), VAR_VIII salvage as the starting point,
+the charter's gauntlet per increment. This is the campaign's final instrument for native T1/model.
 ## ASM PHASE OPENED — charter banked; VAR_VIII salvaged from an uncommitted worktree; increment (a) NO-SHIP w/ quantified boundary tax [2026-06-11]
 Branch engine/asm-p1 (worktree /tmp/gz-asm). CHARTER plans/asm-campaign.md: ladder (a) litlen
 asm! micro-step -> (b) fused litlen->dist -> (c) full kernel (entered only on (a)/(b) evidence);
