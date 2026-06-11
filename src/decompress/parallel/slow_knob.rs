@@ -314,6 +314,62 @@ const NS_PER_SPIN_ITER: f64 = 0.32;
 /// be above nanosleep granularity, fine enough to spread evenly across decode).
 const SLEEP_BATCH_NS: u64 = 50_000;
 
+// ── MFAST-PROBE KNOBS (probe/mfast-phase0) ──────────────────────────────────
+//
+// Two new knobs for the mfast-phase0 causal probe. They follow the same
+// OnceLock-cached pattern as the existing localization knobs (`dec_spin` /
+// `st_spin`) — a single predictable branch per site when OFF, zero runtime cost
+// when OFF and the optimizer hoists the `spin == 0` check.
+//
+//   GZIPPY_MFAST_DISABLE=1   — skip `'mfast` entry (discriminator arm). The
+//                               careful loop handles 100% of marker decode at
+//                               baseline per-event cost. Wall-flat ⇒ mfast is
+//                               slack (competing binder = head-of-line stalls).
+//   GZIPPY_SLOW_MFAST_MODE=N — per-event inject INSIDE `'mfast` WITHOUT gating
+//                               its entry (unlike GZIPPY_SLOW_MARKER_MODE, which
+//                               sets slow_spin != 0 and therefore DISABLES the
+//                               fast loop entry). N% ⇒ BASE_SPIN*N/100 iters.
+//                               GZIPPY_SLOW_KIND=sleep selects the
+//                               frequency-neutral control via localize_yield_kind.
+//
+// Both are byte-transparent (inject never touches decode state; disable uses the
+// same careful-loop path that already exists). DUAL-SHA gate required before
+// any arm.
+
+/// `GZIPPY_MFAST_DISABLE=1` — skip the `'mfast` marker fast-loop entry entirely;
+/// the careful loop handles 100% of marker decode at baseline per-event cost.
+/// OnceLock-cached, `false` by default. Byte-transparent.
+#[inline]
+#[allow(dead_code)]
+pub fn mfast_disabled() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        matches!(
+            std::env::var("GZIPPY_MFAST_DISABLE").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
+/// `GZIPPY_SLOW_MFAST_MODE` — per-event spin count for the localized inject
+/// inside `'mfast` (NOT tied to the entry gate). Follows the same BASE_SPIN
+/// convention as [`spin_iters`]: N% ⇒ `(BASE_SPIN * N / 100)` iters.
+/// Returns `0` when the knob is OFF or unparseable. Snapshot once before the
+/// `'mfast` block; pass to [`inject_localize`] after the loop guard.
+#[inline]
+#[allow(dead_code)]
+pub fn mfast_spin_iters() -> u64 {
+    static F: OnceLock<u64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_MFAST_MODE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|pct| (BASE_SPIN as f64 * pct / 100.0) as u64)
+            .unwrap_or(0)
+    })
+}
+
 /// Inject one decode-event's worth of extra work. `spin` is the snapshotted
 /// [`spin_iters`] value; `yield_hint` is the snapshotted [`yield_kind`] value.
 ///
