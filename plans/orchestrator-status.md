@@ -1,3 +1,20 @@
+## RUNG (d) EVAL + INCREMENT 1: TIE-KEEP — the bignasa marker-loop premise CAUSALLY REFUTED [2026-06-11]
+Branch engine/asm-rung-d (worktree /tmp/gz-asmd, NOT merged). Phase 1 eval (plans/asm-rung-d-eval.md):
+kernel-extend REJECTED w/ mechanism (contig-u8 contract + register envelope + asm-before-Rust-plateau
+inverts the rung-c order); RECOMMENDED Rust-first N1-N5 ladder (the marker loop had ZERO P3 passes).
+Increment 1 (N1, DistTable dist decode in the u16 mfast loop, commit 67431727): full gauntlet green
+(947/0 local pure, 674/0 default, guest isal 939/2-isolation-passing-flakes, sha 72/72 across 4 corpora
+x T{1,4,8} x 6 arms, differential w/ ground truth + engagement counters, GZIPPY_MARKER_DIST_TABLE=0
+kill-switch + GZIPPY_MARKER_DIST_STATS effect probe EFFECT-VERIFIED: 11.59M backrefs swap arms on
+bignasa-isal T8). FROZEN A/B: TIE everywhere (bignasa-isal T8 +1.1% 3/9; silesia-isal T4 -0.5% 5/9;
+silesia-native T4 -1.9% 8/9 consistent-but-sub-bar). KEEP default-ON (rule 7a, byte-exact, unifies the
+dist shape engine-wide). THE REAL FINDING (causal, not attribution): (1) T1 has NO marker decode at all
+(inject hits=0 — window-absent chunks exist only under T>1 speculation); (2) bignasa-isal T8 marker
+decode has >=2x SLACK under the wall (36.17M inject hits; wall FLAT at f100 careful+inject, only f400
+moves it ~2x) — the isal-decide '166MB/s marker rate owns bignasa' read was the analyst-bias class the
+process rules name. The bignasa-isal deficit lives in the SERIAL residue (frozen T1 1350 -> T8 1086 =
+1.24x on 8 workers: drain/apply-window/markers-replace/writer). N2-N5 marker micro-levers DEPRIORITIZED
+(slack-bounded); NEXT CAUSAL TARGET: the serial chain on bignasa-isal.
 ## FIRST ISAL DECIDE RUN — the marker engine owns the isal deficits too [2026-06-11]
 fulcrum decide @ isal build (frozen, fingerprinted, banked): silesia T4 0.899 / T8 0.991
 PASS-but-bimodal(N->99 owed) / T16 0.945 / model 0.858 / bignasa 0.940. ALL 20 knob A/Bs
