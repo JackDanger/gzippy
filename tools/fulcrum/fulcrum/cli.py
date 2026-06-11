@@ -168,6 +168,9 @@ def ledger_main(rest):
 
     if verb == "supersede":
         missing = [k for k in ("key", "retire", "reason") if k not in opts]
+        if "reason" in opts and not opts["reason"].strip():
+            print("error: --reason must be a non-empty justification", file=sys.stderr)
+            return 2
         if missing:
             print(f"ledger supersede: missing --{' --'.join(missing)}")
             sys.exit(2)
@@ -179,6 +182,9 @@ def ledger_main(rest):
         return
     if verb == "invalidate":
         missing = [k for k in ("key", "target", "reason") if k not in opts]
+        if "reason" in opts and not opts["reason"].strip():
+            print("error: --reason must be a non-empty justification", file=sys.stderr)
+            return 2
         if missing:
             print(f"ledger invalidate: missing --{' --'.join(missing)}")
             sys.exit(2)
