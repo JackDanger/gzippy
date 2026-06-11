@@ -1,3 +1,12 @@
+## FULCRUM P2 MERGED — OSS-cut ready; 147/147 across 4 suites [2026-06-11]
+All gate-ranked hardening + the verification gate's finishers (honest unkeyed-chain threat model;
+non-empty supersede reasons; toy mixed-sink refusal). Fulcrum now: fingerprinted (8 compare fields
+incl. comparator-version + host), ledgered (supersede/invalidate, pending-reconcile, hash-chained),
+derived-not-self-reported environments, adapter-pluggable (SCHEMA.md + toy adapter proof),
+dual-licensed, case-studied. REMAINING for the public cut: repo extraction, a second REAL adapter
+(one of the user's other projects = the generality proof), CI, license/name = user's call.
+gzippy continues with Fulcrum as the instrument: next decide run at this HEAD ranks the remaining
+cells (isal model 0.857/bignasa 0.918/T4 0.905/T16 0.924; native T1 0.877/T4 0.870/model 0.727).
 ## FULCRUM PRODUCTIZED + MERGED (advisor SOUND-WITH-CHANGES) — the user's OSS directive, phase 1 [2026-06-11]
 tools/fulcrum: standalone causal performance-decision engine; 8 scar-named invariants enforced
 in-path (gate-traced); fingerprints; contradiction ledger; decision briefs with falsifiers;
