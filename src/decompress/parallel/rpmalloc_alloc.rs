@@ -114,6 +114,12 @@ mod arena {
     /// Slab allocator for huge buffers — keeps freed blocks resident.
     /// `RpmallocAlloc` delegates to this when `GZIPPY_SLAB_ALLOC` is set;
     /// the fuzz test exercises it directly (unconditional).
+    /// Engagement proof for the measurement A/B (fulcrum decide effect
+    /// predicate): cache hits + installs prove the slab actually ran in the
+    /// knob arm. Printed in the GZIPPY_RPMALLOC_STATS dump below.
+    pub static SLAB_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static SLAB_INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     #[derive(Copy, Clone, Debug, Default)]
     pub struct SlabAlloc;
 
@@ -132,6 +138,7 @@ mod arena {
             {
                 let mut s = slab_state().lock().unwrap();
                 if let Some(pos) = s.free.iter().position(|&(_, b, a)| b == bs && a >= align) {
+                    SLAB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (p, b, a) = s.free.swap_remove(pos);
                     s.live.insert(p, (b, a));
                     return Ok(NonNull::slice_from_raw_parts(
@@ -165,6 +172,7 @@ mod arena {
             match s.live.remove(&key) {
                 Some((bs, a)) => {
                     if s.free.len() < slab_cap() {
+                        SLAB_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         s.free.push((key, bs, a));
                     } else {
                         drop(s);
@@ -531,6 +539,11 @@ pub fn dump_global_stats(tag: &str) {
         rpmalloc_sys::rpmalloc_global_statistics(&mut s);
         s
     };
+    eprintln!(
+        "[rpmalloc {tag}] slab_hits={} slab_installs={}",
+        arena::SLAB_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        arena::SLAB_INSTALLS.load(std::sync::atomic::Ordering::Relaxed),
+    );
     eprintln!(
         "[rpmalloc {tag}] mapped_peak={:.0}M mapped_total={:.0}M unmapped_total={:.0}M cached={:.1}M huge_alloc_peak={:.0}M",
         mib(s.mapped_peak),

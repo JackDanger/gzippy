@@ -200,27 +200,32 @@ def effect_check(pred, base_txt, knob_txt):
         return (False, f"knob arm still on the amortized path (builds={kb} "
                        f"reuses={kr}) — switch INEFFECTIVE")
     if pred == "rpmalloc_stats":
-        # rpmalloc_alloc.rs:523 prints:
-        #   "[rpmalloc {tag}] mapped_peak=XM mapped_total=YM ..."
-        # ONLY when GZIPPY_RPMALLOC_STATS is set AND the arena-allocator feature
-        # is active. The effect capture for slab_alloc sets GZIPPY_RPMALLOC_STATS=1
-        # in both arms; GZIPPY_SLAB_ALLOC=1 (knob arm) activates the slab which
-        # uses rpmalloc. EFFECT-VERIFIED iff: knob arm HAS the stats line (slab
-        # engaged) AND base arm does NOT (slab disabled by default).
-        has_base = bool(re.search(r"\[rpmalloc ", base_txt))
-        has_knob = bool(re.search(r"\[rpmalloc ", knob_txt))
-        if not has_knob:
+        # The [rpmalloc] stats dump prints in BOTH arms whenever
+        # GZIPPY_RPMALLOC_STATS is set (line presence proves NOTHING about the
+        # slab — the live functional check caught exactly that). Engagement
+        # proof is the SLAB-SPECIFIC counters (rpmalloc_alloc.rs):
+        #   "[rpmalloc {tag}] slab_hits=N slab_installs=M"
+        # EFFECT-VERIFIED iff knob arm shows hits+installs > 0 AND base arm
+        # shows hits+installs == 0 (slab gated off by default).
+        def slab_counts(txt):
+            m = re.search(r"slab_hits=(\d+) slab_installs=(\d+)", txt)
+            return (int(m.group(1)) + int(m.group(2))) if m else None
+        kc = slab_counts(knob_txt)
+        bc = slab_counts(base_txt)
+        if kc is None:
             return (False,
-                    "no [rpmalloc] stats line in knob arm — GZIPPY_RPMALLOC_STATS "
-                    "not set in effect capture, or arena-allocator feature not built")
-        if has_base:
+                    "no slab_hits=/slab_installs= counters in knob arm — binary "
+                    "predates the engagement counters or stats not captured")
+        if kc == 0:
             return (False,
-                    "rpmalloc stats line ALSO present in base arm — switch not "
-                    "exclusive (slab may be default-on in this build)")
-        m = re.search(r"\[rpmalloc[^\]]*\] mapped_peak=([\d.]+)M", knob_txt)
-        mp = m.group(1) if m else "?"
-        return (True, f"knob arm: rpmalloc stats present (mapped_peak={mp}M, slab "
-                      f"engaged); absent in base arm — switch effective")
+                    "slab counters ZERO in knob arm — slab never engaged "
+                    "(threshold/feature mismatch?) — switch INEFFECTIVE")
+        if bc is None or bc > 0:
+            return (False,
+                    f"slab counters in BASE arm = {bc!r} (expected 0) — switch "
+                    "not exclusive or stats missing in base")
+        return (True, f"knob arm slab engaged (hits+installs={kc}); base arm 0 "
+                      f"— switch effective")
     return (False, f"unknown predicate '{pred}'")
 
 
@@ -795,24 +800,29 @@ def selftest():
     check(vacd is None, "effect: no dynamic blocks => predicate vacuous (None)")
     none_v, _ = effect_check("none", "", "")
     check(none_v is None, "effect: knob without counter => EFFECT-UNVERIFIED (None)")
-    # rpmalloc_stats predicate (slab_alloc): knob arm must have [rpmalloc], base not.
+    # rpmalloc_stats predicate (slab_alloc): slab-SPECIFIC counters prove
+    # engagement (line presence proves nothing — both arms print under
+    # GZIPPY_RPMALLOC_STATS; caught live by the functional check).
     rp_ok, rp_note = effect_check(
         "rpmalloc_stats",
-        "some base output without rpmalloc line",
-        "[rpmalloc final] mapped_peak=48M mapped_total=192M unmapped_total=144M "
-        "cached=0.0M huge_alloc_peak=0M")
-    check(rp_ok is True and "48" in rp_note,
-          "effect: rpmalloc_stats knob-arm has stats, base absent => EFFECT-VERIFIED")
+        "[rpmalloc final] slab_hits=0 slab_installs=0\n[rpmalloc final] mapped_peak=48M",
+        "[rpmalloc final] slab_hits=14 slab_installs=15\n[rpmalloc final] mapped_peak=48M")
+    check(rp_ok is True and "29" in rp_note,
+          "effect: rpmalloc_stats knob-arm slab counters >0, base 0 => EFFECT-VERIFIED")
     rp_fail_base, _ = effect_check(
         "rpmalloc_stats",
-        "[rpmalloc final] mapped_peak=48M mapped_total=192M unmapped_total=144M "
-        "cached=0.0M huge_alloc_peak=0M",
-        "[rpmalloc final] mapped_peak=48M mapped_total=192M unmapped_total=144M "
-        "cached=0.0M huge_alloc_peak=0M")
-    check(rp_fail_base is False, "effect: rpmalloc_stats both arms have stats => CAUGHT")
+        "[rpmalloc final] slab_hits=3 slab_installs=2\n",
+        "[rpmalloc final] slab_hits=14 slab_installs=15\n")
+    check(rp_fail_base is False, "effect: rpmalloc_stats base arm engaged too => CAUGHT")
+    rp_zero_knob, _ = effect_check(
+        "rpmalloc_stats",
+        "[rpmalloc final] slab_hits=0 slab_installs=0\n",
+        "[rpmalloc final] slab_hits=0 slab_installs=0\n")
+    check(rp_zero_knob is False,
+          "effect: rpmalloc_stats knob arm counters zero => INEFFECTIVE CAUGHT")
     rp_fail_missing, _ = effect_check("rpmalloc_stats", "base output", "knob output")
     check(rp_fail_missing is False,
-          "effect: rpmalloc_stats no stats line in knob arm => CAUGHT")
+          "effect: rpmalloc_stats no slab counters in knob arm => CAUGHT")
 
     # 7. end-to-end on a synthetic artifact dir: ranked table + DO-THIS-NEXT.
     d = tempfile.mkdtemp(prefix="fulcrum_decide_st_")
@@ -935,10 +945,10 @@ def selftest():
     edir2 = os.path.join(d2, "knob_effects_silesia_T1")
     os.makedirs(edir2)
     with open(os.path.join(edir2, "effect_base_slab_alloc.txt"), "w") as f:
-        f.write("no rpmalloc output in base arm\n")
+        f.write("[rpmalloc final] slab_hits=0 slab_installs=0\n")
     with open(os.path.join(edir2, "effect_knob_slab_alloc.txt"), "w") as f:
-        f.write("[rpmalloc final] mapped_peak=64M mapped_total=256M "
-                "unmapped_total=192M cached=0.1M huge_alloc_peak=0M\n")
+        f.write("[rpmalloc final] slab_hits=22 slab_installs=23\n"
+                "[rpmalloc final] mapped_peak=64M\n")
     rep10 = analyze_run(load_run(d2))
     check(any("slab_alloc" in r["component"] and r["tier"] == 1
               for r in rep10["rows"]),
@@ -947,9 +957,9 @@ def selftest():
           "e2e-reverted: DO-THIS-NEXT for 'reverted' knob uses 'reconcile' phrasing")
     check("fix/condition" not in rep10["do_next"],
           "e2e-reverted: 'fix/condition' phrasing absent for reverted knob")
-    check(any("rpmalloc" in r.get("status", "") for r in rep10["rows"]
+    check(any("slab engaged" in r.get("status", "") for r in rep10["rows"]
               if "slab_alloc" in r["component"]),
-          "e2e-reverted: rpmalloc effect-verified note in slab_alloc status")
+          "e2e-reverted: slab-engagement effect-verified note in slab_alloc status")
 
     print(f"\n=== SELFTEST {'PASSED' if not failures else 'FAILED'} "
           f"({len(failures)} failure(s)) ===")
