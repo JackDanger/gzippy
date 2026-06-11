@@ -802,6 +802,10 @@ fn drive_impl<W: std::io::Write>(
         crate::decompress::parallel::contig_prof::dump_if_enabled();
         // ASM-kernel effect counters (no-op unless GZIPPY_ASM_STATS=1).
         crate::decompress::parallel::asm_kernel::dump_if_enabled();
+        // Rung-(d) marker-loop dist-arm effect counters (no-op unless
+        // GZIPPY_MARKER_DIST_STATS=1).
+        #[cfg(pure_inflate_decode)]
+        crate::decompress::parallel::marker_inflate::marker_dist_stats::dump_if_enabled();
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
