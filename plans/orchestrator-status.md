@@ -1,3 +1,16 @@
+## REMOVAL ORACLES MERGED (advisor SOUND-WITH-CHANGES) — THE ASM-MEMO VERDICT IS IN [2026-06-11]
+Frozen disjointness-proven ceilings on the native engine cells: STORE 94ms (7.4% of T1 wall) /
+23ms (3.5% model-T8-masked) vs DECODE 642.6ms (50.9%) / 311.6ms (47.1%). The Huffman-decode/
+bit-read DEPENDENCY CHAIN holds ~half the wall on both engine cells — 6.8-13.5x the store side,
+which P3.4 exhausted (contig-clean scope). DECODE ceiling is a conservative LOWER bound.
+THE FUNDED REWRITE'S REMAINING LEVER IS THE DECODE CHAIN: table-lookup + bit-extraction latency
+chains (BMI2 instructions already emitted — the cost is the DEPENDENCES). Next-session arsenal,
+in order: (1) decode-chain restructuring in Rust (deeper preload/speculation across symbols,
+litlen+dist fused lookahead, branchless entry dispatch — libdeflate/ISA-L chain-shapes); (2) if
+Rust exhausts: the asm hot-loop port with the ceiling as the budget. Gate trims banked in
+plans/removal-oracle-ceilings.md (internal-ratio scope; rg-freeze cross-check owed; high-T
+magnitude extrapolated). Instruments: GZIPPY_ORACLE_NOSTORE / record-replay, OFF-state
+byte-exact, permanent.
 ## LOCALIZATION SPLIT BANKED — DECODE ~= STORE, both critical; whole-loop profile [2026-06-11]
 Frozen 9-arm T1 silesia (sleep controls survived both knobs; Rules 1+2 satisfied; super-linear
 slopes noted as cache-pressure compounding): STORE +526ms / DECODE +576ms at N=50 spin
