@@ -1,3 +1,15 @@
+## P3.3a OFFICIAL RE-MEASURE @ 2644f8be — arsenal lever confirmed on the cells [2026-06-10]
+vs official baselines (sanity 7/7): model T8 native +8.4% REAL (rg-ratio 0.574->0.622; litchn owns
+44.9% of classed cycles there vs 20-22% silesia — corpus-dependent payoff now MEASURED); silesia
+T1 native +2.4% (0.607->0.622, N=15 spread 1%); T4/T8 native TIE; isal cells ~neutral (litchn=0
+on ISA-L tails, deltas within 2-10% spreads). WATCH ITEM: silesia T16 native -3.0% (gz1/gz2 0.970,
+~11ms, spread 4-7% — borderline; suspects: chain code-size/icache at all-core saturation) —
+investigate in P3.3b before the next lever lands on top.
+GAP MAP AFTER P3.1+P3.2: native T1 0.622 (rg 1.6x single-core — raw symbol rate; BMI2/asm
+territory), T4 0.791, T8 0.927, T16 0.939-0.948, model 0.622; isal silesia T8 0.969-0.992
+(bar-adjacent), model 0.855. NEXT (order): P3.3b T16 -3% triage; backref-arm polish (21.8 vs
+wrapper-class target); BMI2 PEXT/BZHI + table prefetch; asm decision when the pure-Rust arsenal
+is exhausted. Guest: /root/bin-p33-{native 0509ecd8, isal 078f5c86}.
 ## P3.2 MERGED — runtime lit chaining: model T8 -6.8%, T1 -1.6%, lits/iter 2.57 [2026-06-10]
 The first arsenal lever pays: lit iterations halved (21.75M->10.85M silesia), chain fires 6.3M
 times at 2.72 lits/iter; model (literal-heavy) gains most. Gate: SOUND, all six surfaces; optional
