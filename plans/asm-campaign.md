@@ -400,3 +400,137 @@ whole per-symbol chain (litlen gather → consume → branch tree → dist decod
   `test_inflate_byte_by_byte` once its silesia fixture is present; NOT a
   rung-(c) regression).
 - Binaries staged: /root/bin-asmc-native (`825378b3`), /root/bin-asmc-base.
+
+---
+
+## 10. FLIP PRECONDITIONS LANDED + DEFAULT FLIP (2026-06-11, branch engine/asm-default-flip)
+
+The §9 gate mandated four preconditions before the default could flip. All
+four landed as separate commits and were verified REAL on the frozen guest
+(BMI2); the flip itself is the fifth commit on this branch.
+
+### Precondition 1 — consume off-by-one positive control (`a3fdb5ac`)
+`run_contig_ref_biased::<CONSUME_BIAS>`: const-generic bias on the
+lone-literal litlen consume — the ref-side mirror of corrupting the asm's
+`shrx`/`sub bitsleft` pair (the harness compares cursors field-for-field, so
+an off-by-one on either side is the same inequality; no 450-line asm
+duplicate needed). Guest verdict: cursor asserts fired in **1484/2000**
+trials with BIAS=1 (every trial that consumes a lone literal before exit;
+~22% legitimately exit first); the BIAS=0 arm on the same inputs is
+divergence-free on every compared field. The consume failure class — the one
+the three c3 controls (lit store, dist base shift, multi advance) did not
+cover — now has a permanent liveness proof.
+
+### Precondition 2 — `25:`-arm coverage floor (`c502e1be`)
+`RefArmStats` counts the multi-literal+trailing-LENGTH arm in the reference
+model: `multi_trail` (past the EOB/oversize gates = the asm `25:` X2-spill
+point) and `multi_trail_completed` (the `25:`→`58:`→copy success route).
+Ref counts are a valid proxy under the equality asserts (any asm misroute
+diverges first); completions never cross the seam so they are countable only
+ref-side (KERN_RECLASS_MULTI_TRAIL tags only bails). Guest counts (==
+local, deterministic): lenny×small completes **7,735**; bails 373
+(lenny×fixed5 344 + lenny×sub 29). Floors asserted at ~25%: completions
+>= 2,000, bails >= 90 — a refactor that silently starves the dominant arm
+now fails the differential.
+
+### Precondition 3 — permanent asm-ON/OFF random-gzip fuzz net (`4b66ebbd`)
+`asm_kernel_on_off_fuzz_random_gzip_members`: 96 seeded members, payloads
+1 KiB–128 KiB of mixed segments (uniform random / skewed random / text /
+RLE / self-copies / zeros) × gzip levels {0 stored, 1, 6, 9} × occasional
+mid-stream sync flushes; every member validity-checked by a flate2
+round-trip, then its DEFLATE body decoded twice through the production
+contig-clean path — kernel force-ON vs force-OFF (same binary; cfg(test)
+`TEST_FORCE` override stands in for the process-wide `GZIPPY_ASM_KERNEL`
+OnceLock) — asserting byte equality, payload equality, and final
+(pos, bitbuf, bitsleft) equality. Engagement effect-verified
+(`TEST_RUN_CONTIG_CALLS`): guest run **96/96 members equal, 4,546
+run_contig calls across 75 Huffman members**. Skips without BMI2 (local
+Rosetta); production binaries carry no trace of the hooks.
+
+### Precondition 4 — the +44 ms OFF-arm tax (`c7ba9578`)
+Mechanism fixed by the gate's own suggestion: the fast loop is ONE macro
+source (`fast_loop_run!`) instantiated TWICE; the `false` instantiation's
+dispatch is `if false && asm_on` — const-folded away — so the disabled arm
+runs a loop with zero asm-related code in its body. Variant selected once
+per region run. Frozen guest re-measure (bench-lock, no_turbo=1,
+interleaved on/off/base):
+- **T1 silesia n=11: ON 940 / OFF 1182 / base 1170 — OFF-vs-base +12 ms
+  (+1.0%)**, down from c3's ~+44 ms; ON -19.7% vs base (the rung-(c) win
+  carries through the restructure; effect counters byte-identical to §9:
+  entries 24,128, asm_bytes 211,602,230).
+- **model T8 n=9: OFF 643 ≈ base 645 — TIE** (the tax is gone where it was
+  +6 ms-class in §9).
+- The residual +12 ms is NOT loop code: objdump of the symbol build shows
+  exactly ONE `run_contig` call site in the whole contig function (the true
+  variant's), and per-call dispatch costs are bounded ≤ ~2 ms by the
+  24,128 calls. It is cross-binary code layout of the doubled function
+  body — the campaign's documented layout-phantom class (cf. §8's ±16 ms
+  cross-binary band), irreducible without outlining/PGO. Documented as
+  irreducible per the gate's alternative; the BMI2-ubiquity argument
+  applies: post-flip the disabled arm exists only under the
+  GZIPPY_ASM_KERNEL=0 measurement control or on pre-2013 (pre-Haswell)
+  x86 hardware.
+
+### The flip (this commit)
+`pure-rust-inflate = ["rpmalloc-caches", "asm-kernel"]` — every production
+decode build (gzippy-native, gzippy-isal, release/ship/bench) now compiles
+the kernel; runtime dispatch unchanged (BMI2 detect + GZIPPY_ASM_KERNEL=0
+kill-switch + knob exclusion + the pure-Rust loop always compiled and the
+sole path elsewhere). Non-x86_64 builds bit-for-bit unaffected (call sites
+compile-gated). Gauntlet + frozen 3-way (rg / asm-off base / flipped
+build): recorded below after the re-measure.
+
+### Flip gauntlet + frozen 3-way re-measure (2026-06-11, this branch)
+
+**Builds**: gz2 = /root/bin-flip-native, built `--no-default-features
+--features pure-rust-inflate` (NO explicit asm-kernel — the default wire
+itself delivers the kernel: effect counters on gz2 read entries=24,128 /
+asm_bytes=211,602,230, byte-identical to §9; kill-switch still proves
+enabled=false / 0 entries). gz1 = /root/bin-asmc-base (asm-off baseline
+class). rapidgzip 0.16.0.
+
+**Suites (guest, real BMI2, flipped feature set)**: lib 946/0
+(+ fd_vectored_write 9/0 single-threaded; parallel hang pre-existing,
+documented). One load-flake observed in a 16-way-parallel run:
+`diff_ratio_parallel_single_member_speedup` (a wall-ratio perf guard,
+parallel_T4/sequential_T1 = 1.612 vs 1.5 cap under full test-host
+contention) — passes in isolation and in 2 of 3 full runs; pre-existing
+sensitivity class, not a flip regression. The four precondition tests all
+ran REAL: control 1484/2000 cursor-assert fires (bias-0 clean), c3 floors
+hold (counts == local exactly), fuzz 96/96 + 4,546 engagement calls.
+
+**Sha grid**: {silesia, model, bignasa, storedmix, storedheavy} ×
+T{1,4,8,16} × {gz2-on, gz2-kill, gz1}: **60/60 byte-identical**; rg's
+silesia T1 output sha matches the same value.
+
+**Frozen 3-way walls** (bench-lock, no_turbo=1, interleaved rg/gz1/gz2,
+sha-verified arms, medians; T1 n=11, others n=9; masks: T1 cpu0, T4
+0,2,4,6, T8 0,2,4,6,8,10,12,14, T16 0-15):
+
+| cell | rg | gz1 (asm-off) | gz2 (flipped) | rg/gz2 | gz2 vs gz1 |
+|------|-----|------|------|--------|------------|
+| silesia T1  | 810 | 1170 | 939 | **0.863** | **-19.7%** |
+| silesia T4  | 437 | 545  | 508 | **0.860** | -6.8% |
+| silesia T8  | 323 | 342  | 332 | **0.973** | -2.9% |
+| silesia T16 | 264 | 276  | 266 | **0.992 PASS** | -3.6% |
+| model T8    | 368 | 654  | 517 | **0.712** | -20.9% |
+| bignasa T8  | 871 | 904  | 899 | **0.969** | -0.6% |
+
+- **gz2 regresses vs gz1 in NO cell** (improves all six) — the >2%
+  investigate-trigger never fires. The flip is strictly favorable for
+  production.
+- **Bar (rg/gz2 >= 0.99): 1 of 6 cells passes (silesia T16).** T8/bignasa
+  sit at 0.97-class; T1/T4 at 0.86; model at 0.71.
+
+**ANOMALY, reported verbatim (the §9 "0.98x / ~17 ms from rg" expectation
+does NOT reproduce):** that figure was COMPUTED against the banked rg T1
+~926.6 ms (removal-oracle era, when gzippy base measured 1263 ms at
+8fa2042f). Under today's frozen interleaved protocol rapidgzip measures
+**809-814 ms** (n=11 + 3 confirm reps, sha-verified output, stable;
+--verify 816 / --no-verify 792 — CRC is not the difference; same rapidgzip
+0.16.0). gzippy's own banked numbers DO reproduce today (base 1170 vs §9's
+1169; ON 939-940 vs §9's 944), so the discrepancy is specific to the stale
+rg comparator, whose session conditions are not reconstructible from the
+plans. Consequence: the real T1 gap to rg at HEAD is ~129 ms (0.863x), not
+~17 ms; every rg-relative claim derived from the 926.6 anchor needs
+re-basing against a live interleaved rg arm (this table is the first).

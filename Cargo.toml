@@ -65,15 +65,21 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # does not affect production binaries. See plan.md Phase 11.2.
 oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
-pure-rust-inflate = ["rpmalloc-caches"]
+# Pulls `asm-kernel` (DEFAULT-ON since the §9 F-c SHIP + the four flip
+# preconditions, plans/asm-campaign.md §10): every production decode build
+# enables `pure-rust-inflate`, so this is the default-flip wire. Non-x86_64
+# builds are bit-for-bit unaffected (every kernel call site is compile-gated
+# on target_arch = "x86_64").
+pure-rust-inflate = ["rpmalloc-caches", "asm-kernel"]
 # ── ASM campaign (plans/asm-campaign.md) ─────────────────────────────────────
 # Rung (c): the contig clean fast loop's per-symbol hot path as ONE asm!
 # region (asm_kernel.rs) — seam amortized to ~once per fast-loop run (the
 # increment-(a) falsifier's mechanism). x86_64-only (compile-gated per call
 # site); runtime-dispatched (BMI2 detect) with the GZIPPY_ASM_KERNEL=0
 # kill-switch; the pure-Rust loop is ALWAYS compiled and is the sole path on
-# every other arch/CPU. OFF by default per the charter §4 — default flips
-# only via its own reviewed commit after the frozen ship gate.
+# every other arch/CPU. DEFAULT-ON via `pure-rust-inflate` since the §9 F-c
+# SHIP gate + §10 flip preconditions (T1 silesia -19.2% vs base, byte-exact,
+# asm_frac 0.998); the kill-switch and the BMI2 runtime fallback stay.
 asm-kernel = []
 # ── Phase-2 two-path decode (2026-06-06) ──────────────────────────────────────
 # gzippy-native (intended DEFAULT production once parallel-module lint debt is
