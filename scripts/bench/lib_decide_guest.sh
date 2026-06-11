@@ -55,6 +55,30 @@ assert_regular_sink() { # <path>
   [ -f "$p" ] && [ ! -L "$p" ] && [ ! -p "$p" ] || decide_fail "sink-not-regular-file:$p (symlink/FIFO — pipe-phantom risk)" 14
 }
 
+# DERIVED sink class via stat (NEVER self-reported — a hardcoded
+# 'sink_gz=regular-file' line is a claim, not an observation; the manifest
+# must record what the filesystem says the sink IS).
+sink_class_of() { # <path> -> regular-file|devnull|char-device|pipe|symlink|missing|...
+  local p="$1" t
+  [ -L "$p" ] && { echo symlink; return; }
+  [ -e "$p" ] || { echo missing; return; }
+  t="$(stat -c %F "$p" 2>/dev/null || echo unknown)"
+  case "$t" in
+    "regular file"|"regular empty file") echo regular-file;;
+    "character special file") if [ "$p" = /dev/null ]; then echo devnull; else echo char-device; fi;;
+    fifo) echo pipe;;
+    *) echo "$t" | tr ' ' '-';;
+  esac
+}
+
+# DERIVED pin mask via taskset readback: launch a child under the requested
+# mask and read its ACTUAL affinity list back from the kernel. If pinning
+# silently failed (cgroup cpuset shrunk the mask, bad list), the readback —
+# not the request — is what the measurement ran under.
+mask_readback() { # <requested-mask> -> kernel-canonical affinity list (or empty)
+  taskset -c "$1" bash -c 'taskset -pc $$' 2>/dev/null | sed 's/.*: *//' | tr -d ' '
+}
+
 # EXTENDED-FROM _parity_guest.sh:289-301 (timed run -> "secs sha rss_mb").
 # Extension over the spine: wraps the command in /usr/bin/time -f '%M' -o <tmp>
 # to capture peak RSS (kilobytes, converted to MB) WITHOUT mixing it into the

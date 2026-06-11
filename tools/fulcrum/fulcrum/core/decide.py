@@ -130,6 +130,64 @@ def load_run(art_dir, adapter):
 # Fingerprints (SINK-LAW / FINGERPRINT-OR-NO-COMPARE enforcement points).
 # ---------------------------------------------------------------------------
 
+def canon_mask(mask):
+    """Canonicalize a cpu-list string ('0-15', '0,2,4,6', '0,1-3,7') to a
+    sorted comma list so a requested mask and a kernel readback compare by
+    MEANING, not formatting. Unparseable/empty -> 'unknown'."""
+    if not mask or mask == "unknown":
+        return "unknown"
+    cpus = set()
+    try:
+        for part in str(mask).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cpus.update(range(int(lo), int(hi) + 1))
+            else:
+                cpus.add(int(part))
+    except ValueError:
+        return "unknown"
+    return ",".join(str(c) for c in sorted(cpus)) if cpus else "unknown"
+
+
+def derived_mismatches(man):
+    """Cross-check self-reported manifest fields against their runner-DERIVED
+    duplicates. A field that CAN be derived (sink class via stat, mask via
+    taskset readback, freeze via sysfs) must be; a self-report contradicting
+    the derivation is a lying/stale manifest and is flagged — the DERIVED
+    value governs the fingerprint. Returns anomaly strings."""
+    out = []
+    for claim_key, derived_key in (("sink_gz", "sink_gz_derived"),
+                                   ("sink_rg", "sink_rg_derived")):
+        c, d = man.get(claim_key), man.get(derived_key)
+        if c and d and c != d:
+            out.append(
+                f"DERIVED-MISMATCH: manifest self-reports {claim_key}={c} but "
+                f"the runner derived {d} via stat — lying/stale manifest; the "
+                f"DERIVED value governs the fingerprint")
+    if man.get("freeze_state") == "frozen" and (
+            man.get("governor") in (None, "", "NA")
+            or man.get("no_turbo") in (None, "", "NA")):
+        out.append(
+            "DERIVED-MISMATCH: freeze_state=frozen claimed but the sysfs "
+            "readbacks are NA (governor="
+            f"{man.get('governor')!r}, no_turbo={man.get('no_turbo')!r}) — "
+            "'frozen' requires READ values; treat the freeze claim as "
+            "unverified")
+    for ck, meta in man["cell_meta"].items():
+        req, drv = meta.get("mask"), meta.get("maskd")
+        if req and drv and drv != "unreadable" \
+                and canon_mask(req) != canon_mask(drv):
+            out.append(
+                f"DERIVED-MISMATCH: {fmt_cell(ck)} requested mask={req} but "
+                f"the taskset readback was {drv} — the pin did not take "
+                f"(cpuset shrink / bad list); the READBACK governs the "
+                f"fingerprint")
+    return out
+
+
 def host_identity(man):
     """Compose the host-identity fingerprint field from the manifest's
     derived host fields: "cpu-model|kernel|host-id". ALL three must be known
@@ -149,15 +207,23 @@ def cell_fingerprints(man, ck, adapter):
     proto = man.get("protocol", "unknown")
     freeze = man.get("freeze_state", "unknown")
     corpus_sha = man.get(f"corpus_{ck[0]}_sha", "unknown")
-    mask = man["cell_meta"].get(ck, {}).get("mask", "unknown")
+    meta = man["cell_meta"].get(ck, {})
+    # DERIVED values govern (taskset readback / stat); self-reports are the
+    # fallback for artifacts predating derivation, cross-checked by
+    # derived_mismatches().
+    maskd = meta.get("maskd")
+    mask = canon_mask(maskd if maskd and maskd != "unreadable"
+                      else meta.get("mask", "unknown"))
     sink_default = man.get("sink_class", "unknown")
+    sink_gz = man.get("sink_gz_derived") or man.get("sink_gz", sink_default)
+    sink_rg = man.get("sink_rg_derived") or man.get("sink_rg", sink_default)
     comparator = adapter.comparator_version(man)
     host = host_identity(man)
-    fp_gz = Fingerprint(sink=man.get("sink_gz", sink_default), mask=mask,
+    fp_gz = Fingerprint(sink=sink_gz, mask=mask,
                         freeze=freeze, bin_sha=man.get("bin_sha", "unknown"),
                         corpus_sha=corpus_sha, protocol=proto,
                         comparator=comparator, host=host)
-    fp_rg = Fingerprint(sink=man.get("sink_rg", sink_default), mask=mask,
+    fp_rg = Fingerprint(sink=sink_rg, mask=mask,
                         freeze=freeze,
                         bin_sha="comparator:" + man.get("rg_version", "unknown"),
                         corpus_sha=corpus_sha, protocol=proto,
@@ -209,6 +275,10 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
             f"quiet_state={man.get('quiet_state')}) — REFUSING to rank wall "
             f"numbers. Pass --allow-thaw to label instead. [FROZEN-OR-LABELED]")
     unfrozen_tag = "" if ok_frozen else " [UNFROZEN — ratio-only, do not bank]"
+
+    # Derived-vs-self-reported cross-check (a lying manifest is caught here;
+    # the DERIVED values are the ones the fingerprints below are built from).
+    anomalies.extend(derived_mismatches(man))
 
     proto = man.get("protocol", "unknown")
     proto_tag = "" if proto == PROTOCOL_VERSION else \

@@ -39,6 +39,7 @@ RG = [0.920, 0.922, 0.918, 0.925, 0.921, 0.919, 0.923]
 
 MANIFEST_V3_EXTRA = (
     "protocol=fulcrum-v3\nsink_gz=regular-file\nsink_rg=regular-file\n"
+    "sink_gz_derived=regular-file\nsink_rg_derived=regular-file\n"
     "corpus_silesia_sha=028bd002c89c9a90\n"
     "host_cpu_model=testcpu-13700T\nhost_kernel=6.0-test\n"
     "host_id=abc123def456\n")
