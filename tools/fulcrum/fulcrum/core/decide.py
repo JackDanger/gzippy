@@ -75,6 +75,17 @@ def fmt_cell(ck):
 
 
 def load_run(art_dir, adapter):
+    """Load a run via the ADAPTER (pluggable): the default ProjectAdapter
+    delegates back to load_run_documented below (the documented schema,
+    docs/SCHEMA.md); a project with its own artifact layout overrides
+    ProjectAdapter.load_run and maps to the same run-dict shape."""
+    return adapter.load_run(art_dir)
+
+
+def load_run_documented(art_dir, adapter):
+    """The documented-schema loader (docs/SCHEMA.md): manifest.txt +
+    cell_<corpus>_T<threads>/ sample files + knob_<name>/ A/B dirs +
+    knob_effects_<corpus>_T<T>/ captures."""
     man_path = os.path.join(art_dir, "manifest.txt")
     if not os.path.exists(man_path):
         raise tr.InstrumentError(f"no manifest.txt in {art_dir} — not a decide "
@@ -468,6 +479,8 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                 rss_str = "rss N/A (pre-RSS capture run)"
             rows.append({
                 "component": f"knob.{kname} ({desc})",
+                "kind": "knob",
+                "reverted": bool(kn.reverted) if kn else False,
                 "cells": fmt_cell(ck),
                 "attrib": f"Δ(alt-base)={v['delta_ms']:+.1f}ms @ canonical mask",
                 "status": status + unfrozen_tag,
@@ -494,13 +507,16 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                                             key=lambda kv: kv[1][0])
         cells_str = ",".join(fmt_cell(c) for c in sorted(cells))
         share = 100.0 * worst_ms / span_ms if span_ms else 0
+        perturb = adapter.perturbations.get(cls, "design a knob first")
         rows.append({
             "component": f"pipeline.consumer.{cls}",
+            "kind": "pipeline",
+            "perturb_cmd": perturb,
             "cells": cells_str,
             "attrib": (f"worst {fmt_cell(worst_ck)}: {worst_ms:.1f}ms "
                        f"({share:.0f}% of wall-critical span)"),
             "status": (f"HYPOTHESIS (attribution only — NOT causal). Perturb: "
-                       f"{adapter.perturbations.get(cls, 'design a knob first')}"),
+                       f"{perturb}"),
             "dist": "trace=1-shot (unfrozen-counters label)",
             "verify": adapter.reverify_trace(worst_ck, run, feature),
             "tier": 2,
@@ -537,7 +553,7 @@ def build_brief(rows, cell_walls, man, adapter, ok_frozen):
 
     for r in rows:
         if r["tier"] == 1:
-            if "reverted" in r["component"]:
+            if r.get("reverted"):
                 action = ("reconcile with the prior gated revert + check RSS "
                           "before flipping")
             else:
@@ -564,11 +580,17 @@ def build_brief(rows, cell_walls, man, adapter, ok_frozen):
             }
             return do_next, brief
     for r in rows:
-        if r["tier"] == 2 and r["component"].startswith("engine."):
+        if r["tier"] == 2 and r.get("kind") == "engine":
+            # The exact perturbation: the row's own pre-registered command
+            # (row contract), falling back to the adapter's compute-class
+            # perturbation, then to the re-verify command — never a KeyError
+            # on an adapter without a 'compute' perturbation.
+            perturb = (r.get("perturb_cmd")
+                       or adapter.perturbations.get("compute")
+                       or r.get("verify", "design a perturbation knob first"))
             do_next = (f"{r['component']} on {r['cells']} — top bounded "
                        f"HYPOTHESIS ({r['attrib']}). Run the pre-registered "
-                       f"perturbation BEFORE any work-stretch: "
-                       f"{adapter.perturbations['compute']}")
+                       f"perturbation BEFORE any work-stretch: {perturb}")
             brief = {
                 "action": (f"causally test {r['component']} on {r['cells']} "
                            f"(top bounded HYPOTHESIS — not yet actionable)"),
@@ -578,7 +600,7 @@ def build_brief(rows, cell_walls, man, adapter, ok_frozen):
                     "CAUSAL-OR-HYPOTHESIS: no work-stretch before the "
                     "perturbation converts this to a causal verdict",
                 ],
-                "command": adapter.perturbations["compute"],
+                "command": perturb,
                 "falsifier": ("a flat (≤ inter-run spread) interleaved wall "
                               "response to the slow-injection — confirmed by "
                               "the frequency-neutral sleep control — refutes "

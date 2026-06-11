@@ -106,10 +106,11 @@ def decide_main(argv=None):
     fingerprint + ledger options."""
     argv = sys.argv[1:] if argv is None else argv
     if "--selftest" in argv:
-        from .selftests import test_decide, test_invariants
+        from .selftests import test_adapter, test_decide, test_invariants
         rc1, _, f1 = test_decide.run()
         rc2, _, f2 = test_invariants.run()
-        sys.exit(0 if (f1 + f2) == 0 else 1)
+        rc3, _, f3 = test_adapter.run()
+        sys.exit(0 if (f1 + f2 + f3) == 0 else 1)
 
     allow_thaw = "--allow-thaw" in argv
     no_ledger = "--no-ledger" in argv
