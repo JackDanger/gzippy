@@ -1,3 +1,24 @@
+## PHASE-0 mfast PROBE: Row 1 FIRED — mfast THROUGHPUT lever REJECTED with mechanism (advisor-SOUND) [2026-06-11]
+Probe branch probe/mfast-phase0 (10fda98b, merged for the re-runnable instrument). Knobs:
+GZIPPY_MFAST_DISABLE / GZIPPY_SLOW_MFAST_MODE (localized in-'mfast inject — the global marker knob
+GATES the loop off at :1911, so this is non-redundant) / GZIPPY_MFAST_PROF. Validation: V1 self-test
+1.034, V2 OFF-vs-absent codegen 0.985 (wall-neutral), V3 DUAL-SHA all pass. THE DISCRIMINATOR
+(bignasa-isal T8, frozen, interleaved N=7, all 42 runs sha-OK, arm0 1085ms spread 62ms):
+MFAST_DISABLE (ALL marker decode -> careful loop at baseline cost = a ~1.69x decode slowdown) is
+WALL-FLAT (-0.6%). Silesia-isal T4 same: +0.4%. Speedup ceiling for mfast ~ 0; cannot close the
+7.5%/10% gaps. Scoping (advisor): rejects mfast THROUGHPUT only — a future per-critical-chunk
+LATENCY hypothesis would need its own perturbation. Do NOT read the sub-spread spin slopes
+(+2.6/+5.6%) as partial criticality — noise; arm1 carries the verdict. PROF: mfast = 0.500 of
+marker-decode cycles. CAUTION for future probes: silesia-T4 spin-vs-sleep showed a 3x turbo
+artifact — SLEEP is the primary slope estimator on that cell. CONTRADICTION RECONCILED (ledger
+note): rung-d's "FLAT at f100" is a KNOB-UNITS mismatch, not a wrong number — f100 = fixed
+per-event spin; arm5's +100% = region-proportional (arm5 same config = +17.9%); both straddle the
+same slack knee, mutually consistent; f-knob != percent — label units when reusing. NEXT (advisor-
+gated): scheduling-side locate->confirm->map brief; lead with the hit-drive kill-switch A/B (the
+:1530 port postdates the banked ~40% HoL-stall finding — quantify what it already closed); wire to
+scheduling-ceiling-prereg RESOLUTION #2 (corrected overlap oracle = the open decider); treat
+bignasa T8 (flip=0, 100% marker) and silesia T4 (~2/3 ISA-L post-flip) as potentially DIFFERENT
+divergences.
 ## ADVISOR GATE on the fast-path relocation: SOUND-WITH-CHANGES — honest prior LEANS AGAINST the lever [2026-06-11]
 Opus advisor (verified marker_inflate.rs:1911 + :2524-2533 in source) accepted the Phase-0 probe but
 REFRAMED the evidence: rung-d's injection forced fast->careful — i.e. a ~1.69x decode slowdown (the
