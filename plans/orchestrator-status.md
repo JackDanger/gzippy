@@ -1,3 +1,15 @@
+## P3.4 MERGED (advisor-SOUND) — the copy-shape lever: T1 -87ms, T16 recovered [2026-06-10]
+Backref copy ported to libdeflate shape (overlap-correct for dist>=8 burst+stride, hand-proven at
+the gate; envelope 264 < 266 reservation): silesia T1 frozen 1462->1375 (0.941 NEW-OWNS); T16 back
+to bar-native class (0.983; p25 at 325ms class); model TIE (layout-wobble exposed by same-binary
+kill-switch instrument). DistTable amortized (T16 -2.9ms); copy prefetch +12ms T1. NO-SHIPs with
+proof: BMI2 dispatch (native builds already emit BMI2 — disasm), pos-32 prefetch (worse).
+NATIVE T1 TRAJECTORY (frozen, vs rg ~914-921): official 1528 (0.578) -> P3.1 1387 -> P3.4 1375
+(~0.665). The single-core gap to rg is now ~1.5x = the remaining raw symbol-rate question; the
+pure-Rust arsenal has more (backref-arm micro-delta, litpack interplay) but the ASM DECISION
+approaches with real data. NEXT: P3.5 official-cells re-measure with p34 (all native cells +
+isal regression checks) -> then the asm/portability decision memo for the user with the full
+trajectory. Guest: /root/bin-p34-{native 08817e01, isal 17112a3a}.
 ## P3.4 INNER-LOOP PASS — backref copy is the headline (T1 -93ms); DistTable amortized; BMI2 dispatch refuted by asm [2026-06-11]
 Branch engine/p34-inner-pass @ 02e6f962 (worktree /tmp/gz-p34; bins /root/bin-p34*-native).
 THREE items, each separately committed + frozen-measured vs its predecessor bin:
