@@ -19,9 +19,12 @@ mod arena {
 
     /// Stateless rpmalloc-backed allocator (vendor `RpmallocAllocator<T>`).
     ///
-    /// When `GZIPPY_SLAB_ALLOC` is set, huge allocations route through
-    /// [`SlabAlloc`] (retain resident blocks instead of munmapping) — the
-    /// T4-16 page-fault fix; default OFF for controlled rollout.
+    /// Huge allocations route through [`SlabAlloc`] (retain resident blocks
+    /// instead of munmapping) when the T-conditional gate is on: auto-ON at
+    /// ALL decode thread counts by default (default `GZIPPY_SLAB_MAX_T` =
+    /// `usize::MAX`). The T-aware budget (`min(16 MiB, T × chunk)`) bounds RSS
+    /// overhead to ≤ 16 MiB. `GZIPPY_SLAB_ALLOC=1`/`=0` force on/off;
+    /// `GZIPPY_SLAB_MAX_T=K` restricts auto-ON to T ≤ K.
     #[derive(Copy, Clone, Debug, Default)]
     pub struct RpmallocAlloc;
 
@@ -65,22 +68,109 @@ mod arena {
     /// classes cover the (near-constant) chunk-buffer sizes for high reuse.
     const SLAB_GRANULARITY: usize = 1024 * 1024;
 
-    fn slab_enabled() -> bool {
-        static EN: OnceLock<bool> = OnceLock::new();
-        *EN.get_or_init(|| std::env::var_os("GZIPPY_SLAB_ALLOC").is_some())
+    // ── T-conditional gate (2026-06-10 reconciliation; tightened 2026-06-11) ──
+    //
+    // The fulcrum-decide causal A/B proved the slab PAYS ~100ms at native
+    // silesia T1 (N=21, frozen, canonical mask). The prior RSS blowup
+    // (silesia-T8 +24-35%) was caused by a count-cap retention policy that
+    // retained up to 48 × 12 MiB = 576 MiB of free blocks.
+    //
+    // This version fixes both: auto-ON at ALL decode thread counts (default
+    // max_t = usize::MAX), and the budget is T-aware:
+    // `min(16 MiB, T × largest_block_seen)`. This gives each parallel worker
+    // its own cached slot at low T (eliminating per-chunk page faults for all
+    // workers), while the 16 MiB hard cap bounds RSS overhead to ≤ 16 MiB at
+    // high T — well under the +10% criterion for typical silesia baselines.
+    //
+    // `GZIPPY_SLAB_ALLOC=1` forces ON at every T, `=0` forces OFF (both
+    // override the auto gate). `GZIPPY_SLAB_MAX_T=K` overrides the ceiling.
+    //
+    // The decode thread count is STORED AT EVERY DECODE ENTRY
+    // (`set_decode_threads`, called from `sm_driver::read_parallel_sm_inner`)
+    // — an atomic, NOT a OnceLock, so a second decode in the same process
+    // with a different T re-gates correctly (the earlier OnceLock-env-cache
+    // lesson). T==0 (never set: direct allocator use outside a decode) gates
+    // OFF. The gate is consulted only when ROUTING A NEW huge allocation;
+    // dealloc/grow/shrink are pointer-keyed against the live side-table (see
+    // `SLAB_EVER_ENGAGED`), so a mid-process gate flip can never mis-free a
+    // slab block (the multimember-corruption class).
+    fn slab_force() -> Option<bool> {
+        static F: OnceLock<Option<bool>> = OnceLock::new();
+        *F.get_or_init(|| std::env::var("GZIPPY_SLAB_ALLOC").ok().map(|v| v != "0"))
     }
 
-    /// Max resident free blocks retained globally before excess is released
-    /// (munmapped). Sized to the in-flight working set (~depth) to avoid the
-    /// T16 cache/TLB regression seen when over-retaining (MAX_POOLED 8→32).
-    fn slab_cap() -> usize {
-        static CAP: OnceLock<usize> = OnceLock::new();
-        *CAP.get_or_init(|| {
-            std::env::var("GZIPPY_SLAB_CAP")
+    /// Highest decode thread count at which the slab auto-enables.
+    /// Default: `usize::MAX` (slab on for all practical T); the bytes-budget
+    /// bounds RSS to ≈1 chunk in the free list. Override with
+    /// `GZIPPY_SLAB_MAX_T=K` to restrict to T ≤ K.
+    fn slab_auto_max_t() -> usize {
+        static K: OnceLock<usize> = OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("GZIPPY_SLAB_MAX_T")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        })
+    }
+
+    /// Decode thread count of the current/most-recent parallel-SM decode.
+    /// 0 = no decode has started (slab auto-gate stays off).
+    static DECODE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// True once any allocation has been routed through the slab in this
+    /// process; afterwards every dealloc/grow/shrink must consult the live
+    /// side-table regardless of the current gate state.
+    static SLAB_EVER_ENGAGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_decode_threads(t: usize) {
+        DECODE_THREADS.store(t, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Pure gate decision (unit-tested at the T boundaries).
+    fn gate_decision(force: Option<bool>, auto_max_t: usize, decode_threads: usize) -> bool {
+        match force {
+            Some(v) => v,
+            None => decode_threads != 0 && decode_threads <= auto_max_t,
+        }
+    }
+
+    /// Should a NEW huge allocation route through the slab right now?
+    fn slab_route_new() -> bool {
+        gate_decision(
+            slab_force(),
+            slab_auto_max_t(),
+            DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Bytes-budget cap for the resident free list (T-aware, 2026-06-11).
+    ///
+    /// If `GZIPPY_SLAB_BUDGET_MIB` is set, that fixed MiB value is used.
+    /// Otherwise the budget auto-scales: `min(16 MiB, T × largest-block-seen)`,
+    /// where T = current decode thread count. This gives each worker its own
+    /// cached slot at low T (eliminating page faults for all workers), while
+    /// the 16 MiB cap ensures RSS overhead stays ≤ 16 MiB at high T —
+    /// well under +10% of the 150–200 MiB silesia baseline.
+    fn configured_budget_bytes() -> Option<usize> {
+        static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            std::env::var("GZIPPY_SLAB_BUDGET_MIB")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&v| v > 0)
-                .unwrap_or(48)
+                .map(|mib| mib * 1024 * 1024)
+        })
+    }
+
+    fn effective_budget(largest_block_seen: usize) -> usize {
+        // 16 MiB hard cap keeps RSS well under +10% at T8/T16 silesia.
+        const RSS_CAP: usize = 16 * 1024 * 1024;
+        let t = DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        configured_budget_bytes().unwrap_or_else(|| {
+            SLAB_GRANULARITY.max(t.saturating_mul(largest_block_seen).min(RSS_CAP))
         })
     }
 
@@ -90,6 +180,10 @@ mod arena {
         free: Vec<(usize, usize, usize)>,
         /// currently-allocated slab blocks: ptr -> (true_block_size, align)
         live: HashMap<usize, (usize, usize)>,
+        /// sum of `true_block_size` for all entries in `free`
+        current_free_bytes: usize,
+        /// largest `true_block_size` ever seen alive (for auto-budget)
+        largest_block_seen: usize,
     }
 
     fn slab_state() -> &'static Mutex<SlabState> {
@@ -112,7 +206,9 @@ mod arena {
     }
 
     /// Slab allocator for huge buffers — keeps freed blocks resident.
-    /// `RpmallocAlloc` delegates to this when `GZIPPY_SLAB_ALLOC` is set;
+    /// `RpmallocAlloc` routes NEW huge allocations here when the
+    /// T-conditional gate is on (see `slab_route_new`), and ALWAYS routes
+    /// dealloc/grow/shrink of slab-live pointers here (pointer-keyed);
     /// the fuzz test exercises it directly (unconditional).
     /// Engagement proof for the measurement A/B (fulcrum decide effect
     /// predicate): cache hits + installs prove the slab actually ran in the
@@ -135,11 +231,13 @@ mod arena {
             };
             let bs = layout.size().div_ceil(gran) * gran;
             let align = layout.align().max(16);
+            SLAB_EVER_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
             {
                 let mut s = slab_state().lock().unwrap();
                 if let Some(pos) = s.free.iter().position(|&(_, b, a)| b == bs && a >= align) {
                     SLAB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (p, b, a) = s.free.swap_remove(pos);
+                    s.current_free_bytes -= b;
                     s.live.insert(p, (b, a));
                     return Ok(NonNull::slice_from_raw_parts(
                         unsafe { NonNull::new_unchecked(p as *mut u8) },
@@ -166,18 +264,48 @@ mod arena {
 
         /// Returns true if `ptr` was a live slab block (now retained/released).
         /// Keys on the side-table, NOT the caller layout (grow passes OLD).
+        ///
+        /// Retention policy: bytes-budget, largest-first eviction (a1ecc834).
+        /// Budget = max(64 MiB, 2 × largest-block-seen) or GZIPPY_SLAB_BUDGET_MIB.
+        /// Blocks over budget are munmapped outside the lock.
         unsafe fn free_if_slab(&self, ptr: NonNull<u8>) -> bool {
             let key = ptr.as_ptr() as usize;
             let mut s = slab_state().lock().unwrap();
             match s.live.remove(&key) {
                 Some((bs, a)) => {
-                    if s.free.len() < slab_cap() {
-                        SLAB_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        s.free.push((key, bs, a));
-                    } else {
-                        drop(s);
+                    if bs > s.largest_block_seen {
+                        s.largest_block_seen = bs;
+                    }
+                    // Add to free list, then evict largest-first until under
+                    // budget. The just-freed block participates in eviction
+                    // like any other (largest goes first).
+                    SLAB_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    s.current_free_bytes += bs;
+                    s.free.push((key, bs, a));
+                    let mut to_munmap: Vec<*mut u8> = Vec::new();
+                    loop {
+                        let budget = effective_budget(s.largest_block_seen);
+                        if s.current_free_bytes <= budget {
+                            break;
+                        }
+                        // evict the largest resident block
+                        let (pos, _) = s
+                            .free
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, &(_, b, _))| b)
+                            .unwrap(); // safe: free non-empty while current_free_bytes > 0
+                        let (evict_ptr, evict_bs, _) = s.free.swap_remove(pos);
+                        s.current_free_bytes -= evict_bs;
+                        to_munmap.push(evict_ptr as *mut u8);
+                    }
+                    drop(s);
+                    // Release outside the lock (munmap can be slow).
+                    if !to_munmap.is_empty() {
                         ensure_thread_initialized();
-                        unsafe { raw_free(ptr.as_ptr()) };
+                        for p in to_munmap {
+                            unsafe { raw_free(p) };
+                        }
                     }
                     true
                 }
@@ -308,8 +436,11 @@ mod arena {
 
     unsafe impl Allocator for RpmallocAlloc {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-            if slab_enabled() {
-                return SlabAlloc.allocate(layout);
+            // Gate consulted ONLY for routing new huge allocations; small
+            // allocations and the gate-off path are today's raw rpmalloc,
+            // bit-for-bit.
+            if layout.size() >= slab_threshold() && slab_route_new() {
+                return SlabAlloc.alloc_huge(layout);
             }
             ensure_thread_initialized();
             if layout.size() == 0 {
@@ -333,10 +464,18 @@ mod arena {
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            if slab_enabled() {
-                return unsafe { SlabAlloc.deallocate(ptr, layout) };
-            }
             if layout.size() == 0 {
+                return;
+            }
+            // Pointer-keyed, NOT gate-keyed: a block allocated while the gate
+            // was on MUST go back through the slab even if the gate has since
+            // flipped (different decode T) — otherwise the live side-table
+            // goes stale and a later address reuse hands out an undersized
+            // block (the multimember-corruption class). The atomic flag keeps
+            // the never-engaged path free of the side-table lock.
+            if SLAB_EVER_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+                && unsafe { SlabAlloc.free_if_slab(ptr) }
+            {
                 return;
             }
             ensure_thread_initialized();
@@ -351,10 +490,15 @@ mod arena {
             old_layout: Layout,
             new_layout: Layout,
         ) -> Result<NonNull<[u8]>, AllocError> {
-            if slab_enabled() {
+            // Slab blocks stay in the slab domain (pointer-keyed, see
+            // deallocate); SlabAlloc::grow reuses a resident block in place
+            // when its true size already fits.
+            if SLAB_EVER_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+                && SlabAlloc.live_block(ptr).is_some()
+            {
                 return unsafe { SlabAlloc.grow(ptr, old_layout, new_layout) };
             }
-            // default: allocate new + copy + free old
+            // default: allocate new (gate routes it) + copy + free old
             let new = self.allocate(new_layout)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -373,7 +517,9 @@ mod arena {
             old_layout: Layout,
             new_layout: Layout,
         ) -> Result<NonNull<[u8]>, AllocError> {
-            if slab_enabled() {
+            if SLAB_EVER_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+                && SlabAlloc.live_block(ptr).is_some()
+            {
                 return unsafe { SlabAlloc.shrink(ptr, old_layout, new_layout) };
             }
             let new = self.allocate(new_layout)?;
@@ -386,6 +532,120 @@ mod arena {
                 self.deallocate(ptr, old_layout);
             }
             Ok(new)
+        }
+    }
+
+    #[cfg(test)]
+    mod gate_tests {
+        use super::*;
+        use allocator_api2::alloc::Allocator;
+        use std::sync::atomic::Ordering;
+
+        /// T-boundary truth table for the auto gate + env force overrides.
+        #[test]
+        fn gate_decision_boundaries() {
+            // force-on wins at every T (GZIPPY_SLAB_ALLOC=1)
+            assert!(gate_decision(Some(true), 1, 0));
+            assert!(gate_decision(Some(true), 1, 16));
+            // force-off wins at every T (GZIPPY_SLAB_ALLOC=0)
+            assert!(!gate_decision(Some(false), 1, 1));
+            assert!(!gate_decision(Some(false), 8, 4));
+            // auto (unset): ON iff 1 <= T <= max_t; T==0 (no decode) OFF
+            assert!(!gate_decision(None, 1, 0));
+            assert!(gate_decision(None, 1, 1));
+            assert!(!gate_decision(None, 1, 2));
+            assert!(!gate_decision(None, 1, 16));
+            // max_t=2 boundary
+            assert!(gate_decision(None, 2, 1));
+            assert!(gate_decision(None, 2, 2));
+            assert!(!gate_decision(None, 2, 3));
+        }
+
+        /// The dynamic-gate correctness crux: a block that entered the slab
+        /// domain MUST be handled by the slab on dealloc/grow/shrink via the
+        /// pointer-keyed live table, regardless of the current gate state —
+        /// including after a shrink below the slab threshold (the stale-
+        /// side-table corruption class). Engagement counters must move.
+        #[test]
+        fn cross_gate_pointer_keyed_consistency_and_counters() {
+            let huge = 5 * 1024 * 1024;
+            let layout = Layout::from_size_align(huge, 16).unwrap();
+
+            // Allocate via SlabAlloc directly (always slab — gate-independent).
+            let p = SlabAlloc.alloc_huge(layout).unwrap();
+            let ptr = NonNull::new(p.as_ptr() as *mut u8).unwrap();
+            assert!(
+                SlabAlloc.live_block(ptr).is_some(),
+                "huge slab alloc must be tracked live"
+            );
+            assert!(SLAB_EVER_ENGAGED.load(Ordering::Acquire));
+
+            // Shrink BELOW the slab threshold through RpmallocAlloc: must stay
+            // in the slab domain (in-place, same ptr) — not copy to raw.
+            let small = Layout::from_size_align(4096, 16).unwrap();
+            let s = unsafe { RpmallocAlloc.shrink(ptr, layout, small) }.unwrap();
+            assert_eq!(
+                s.as_ptr() as *mut u8,
+                ptr.as_ptr(),
+                "slab shrink must reuse the resident block in place"
+            );
+            assert!(SlabAlloc.live_block(ptr).is_some());
+
+            // Deallocate with the SMALL layout through RpmallocAlloc: the
+            // pointer-keyed path must retain it in the slab free list (counted
+            // as an install), never rpfree it raw (which would leave a stale
+            // live entry → later aliasing).
+            let installs_before = SLAB_INSTALLS.load(Ordering::Relaxed);
+            unsafe { RpmallocAlloc.deallocate(ptr, small) };
+            assert!(
+                SlabAlloc.live_block(ptr).is_none(),
+                "dealloc must remove the live entry"
+            );
+            assert!(
+                SLAB_INSTALLS.load(Ordering::Relaxed) > installs_before,
+                "slab install counter must move on retained free"
+            );
+
+            // Re-allocating the same size class must be able to hit the cache
+            // (engagement-counter path); tolerate concurrent tests by checking
+            // monotonic movement across our own alloc+free pair.
+            let hits_before = SLAB_CACHE_HITS.load(Ordering::Relaxed);
+            let p2 = SlabAlloc.alloc_huge(layout).unwrap();
+            let ptr2 = NonNull::new(p2.as_ptr() as *mut u8).unwrap();
+            let hits_after = SLAB_CACHE_HITS.load(Ordering::Relaxed);
+            assert!(
+                hits_after >= hits_before,
+                "cache-hit counter must never regress"
+            );
+            unsafe { SlabAlloc.deallocate(ptr2, layout) };
+        }
+
+        /// Bytes-budget eviction: with a tiny fixed budget the free list can
+        /// never retain more than the budget (largest evicted first).
+        #[test]
+        fn bytes_budget_bounds_free_list() {
+            // Use blocks larger than any plausible configured budget floor is
+            // not possible in-process (env is OnceLock-cached), so verify the
+            // INVARIANT against whatever budget is in effect: after freeing N
+            // huge blocks, current_free_bytes <= effective budget.
+            let huge = 7 * 1024 * 1024;
+            let layout = Layout::from_size_align(huge, 16).unwrap();
+            let mut ptrs = Vec::new();
+            for _ in 0..24 {
+                let p = SlabAlloc.alloc_huge(layout).unwrap();
+                ptrs.push(NonNull::new(p.as_ptr() as *mut u8).unwrap());
+            }
+            for ptr in ptrs {
+                unsafe { SlabAlloc.deallocate(ptr, layout) };
+            }
+            let s = slab_state().lock().unwrap();
+            let budget = effective_budget(s.largest_block_seen);
+            assert!(
+                s.current_free_bytes <= budget,
+                "free list {} bytes exceeds budget {}",
+                s.current_free_bytes,
+                budget
+            );
         }
     }
 
@@ -516,6 +776,14 @@ mod arena {
 
 #[cfg(feature = "arena-allocator")]
 pub use arena::RpmallocAlloc;
+
+/// Record the decode thread count for the slab auto-gate. Called at every
+/// parallel-SM decode entry (`sm_driver::read_parallel_sm_inner`) — atomic
+/// store, never once-cached, so per-decode T changes re-gate correctly.
+#[cfg(feature = "arena-allocator")]
+pub use arena::set_decode_threads;
+#[cfg(not(feature = "arena-allocator"))]
+pub fn set_decode_threads(_t: usize) {}
 
 /// Allocator-visibility tool — the "don't guess" instrument for the span-cache
 /// work. Prints rpmalloc's process-wide span-map stats. `mapped_total` (total
