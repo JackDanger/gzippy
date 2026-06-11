@@ -1,3 +1,12 @@
+## FULCRUM PRODUCTIZED + MERGED (advisor SOUND-WITH-CHANGES) — the user's OSS directive, phase 1 [2026-06-11]
+tools/fulcrum: standalone causal performance-decision engine; 8 scar-named invariants enforced
+in-path (gate-traced); fingerprints; contradiction ledger; decision briefs with falsifiers;
+105/105 self-tests; gzippy as the first adapter; live run reproduced the honest matrix + both
+drift detectors fired on real data. P2 HARDENING (gate-ranked, queued): (P1-class) ledger
+supersede/invalidate; comparator-version + host-identity fingerprint fields; (P2) derive sink/
+freeze fields (no self-report); adapter-pluggable artifact loader (the dir schema is core-coupled);
+brief robustness (perturbations key, name string-matches); (P3) LICENSE file, scar-text
+genericization, fd hygiene, append-only documentation. THEN: repo extraction for the OSS cut.
 ## THE FULLY-HONEST MATRIX @ cb269664 — both arms file-sink; two attribution errors corrected [2026-06-11]
 CORRECTION-OF-THE-CORRECTION: the interim 'corrected' table (T1 0.973/T8 1.075) was HALF-phantom —
 rg re-based to file-sink but gz kept /dev/null numbers (the anchor worker's 'gzippy is
