@@ -34,8 +34,16 @@ Record kinds (jsonl, one object per line, append-only):
     {"ts": ..., "kind": "invalid", "key": str, "target_runid": str,
      "reason": str}
 
+APPEND-ONLY is a CONVENTION this class upholds (it only ever opens the file
+in "a" mode and resolutions are new records, never edits) — it is NOT an OS
+guarantee. For tamper evidence every appended record carries a hash-chain
+field: chain = sha256(prev_chain + canonical_json(record_without_chain))[:16].
+`verify_chain()` recomputes the chain and reports any edited/reordered/
+removed-predecessor row. Rows predating the chain are tolerated (verification
+covers chained rows only — state that honestly when auditing old ledgers).
 """
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -152,6 +160,19 @@ class Ledger:
         return out
 
     # -- writing ------------------------------------------------------------
+    def _last_chain(self):
+        prev = ""
+        for r in self.rows():
+            if not r.get("_corrupt") and r.get("chain"):
+                prev = r["chain"]
+        return prev
+
+    @staticmethod
+    def _chain_hash(prev_chain, record):
+        basis = json.dumps({k: v for k, v in record.items() if k != "chain"},
+                           sort_keys=True)
+        return hashlib.sha256((prev_chain + basis).encode()).hexdigest()[:16]
+
     def append(self, record):
         if not self.path:
             return
@@ -159,6 +180,7 @@ class Ledger:
         record = dict(record)
         record.setdefault("ts", datetime.now(timezone.utc)
                           .strftime("%Y-%m-%dT%H:%M:%SZ"))
+        record["chain"] = self._chain_hash(self._last_chain(), record)
         with open(self.path, "a") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -174,6 +196,30 @@ class Ledger:
         was a measurement error and is never an anchor again."""
         self.append({"kind": "invalid", "key": key,
                      "target_runid": target_runid, "reason": reason})
+
+    # -- tamper evidence ------------------------------------------------------
+    def verify_chain(self):
+        """Recompute the hash chain over chained rows. Returns a list of
+        human-readable breaks (empty == chained rows intact). Rows without a
+        chain field predate the chain and are skipped — verification only
+        vouches for the chained rows."""
+        breaks = []
+        prev = ""
+        for i, r in enumerate(self.rows()):
+            if r.get("_corrupt"):
+                breaks.append(f"row {i}: torn/corrupt line")
+                continue
+            if not r.get("chain"):
+                continue  # pre-chain row: convention only, no evidence
+            want = self._chain_hash(prev, r)
+            if r["chain"] != want:
+                breaks.append(
+                    f"row {i} ({r.get('kind')} {r.get('key')} "
+                    f"{r.get('runid', '')}): chain {r['chain']} != expected "
+                    f"{want} — row edited, reordered, or a chained "
+                    f"predecessor removed (append-only violated)")
+            prev = r["chain"]
+        return breaks
 
 def make_record(runid, project, kind, key, value_ms, n, spread_pct, tool, fp):
     return {"runid": runid, "project": project, "kind": kind, "key": key,

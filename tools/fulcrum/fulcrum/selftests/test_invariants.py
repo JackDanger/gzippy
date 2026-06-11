@@ -364,6 +364,39 @@ def run():
           "invalidate: target row retired as an anchor; no promotion")
 
     # ------------------------------------------------------------------
+    # Hash chain (tamper evidence for the append-only CONVENTION).
+    # ------------------------------------------------------------------
+    led_ch = Ledger(os.path.join(ltmp, "ledger_chain.jsonl"))
+    led_ch.append(make_record("run_1", "gzippy", "cell", "k:T1:gz",
+                              100.0, 7, 1.0, "gzippy", FP))
+    led_ch.append(make_record("run_2", "gzippy", "cell", "k:T1:gz",
+                              101.0, 7, 1.0, "gzippy", FP))
+    led_ch.supersede("k:T1:gz", retire_runid="run_1", reason="test")
+    check(all(r.get("chain") for r in led_ch.rows())
+          and led_ch.verify_chain() == [],
+          "hash chain: every appended record chained; verify_chain clean on "
+          "an untampered ledger")
+    # Tamper with a middle row's value (keeping its stored chain): caught.
+    with open(led_ch.path) as f:
+        lines = f.readlines()
+    lines[1] = lines[1].replace('"value_ms": 101.0', '"value_ms": 90.0')
+    with open(led_ch.path, "w") as f:
+        f.writelines(lines)
+    breaks = led_ch.verify_chain()
+    check(len(breaks) >= 1 and "append-only violated" in breaks[0],
+          "hash chain: edited row CAUGHT by verify_chain (tamper evidence)")
+    # Pre-chain rows (legacy ledger) are tolerated; chained suffix verifies.
+    led_old = Ledger(os.path.join(ltmp, "ledger_prechain.jsonl"))
+    with open(led_old.path, "w") as f:
+        f.write('{"kind": "cell", "key": "old:T1:gz", "runid": "r0", '
+                '"value_ms": 5.0}\n')
+    led_old.append(make_record("r1", "gzippy", "cell", "old:T1:gz",
+                               6.0, 7, 1.0, "gzippy", FP))
+    check(led_old.verify_chain() == [],
+          "hash chain: pre-chain legacy rows tolerated (chain covers the "
+          "chained suffix only — documented honestly)")
+
+    # ------------------------------------------------------------------
     # SHA-OR-VOID: a cell whose manifest row lacks sha_ok=1 is voided.
     # ------------------------------------------------------------------
     d_s = tempfile.mkdtemp(prefix="fulcrum_inv_sha_")
