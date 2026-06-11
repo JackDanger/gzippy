@@ -1,3 +1,16 @@
+## P3.5 DECODE-CHAIN MERGED (advisor-SOUND) — Rust reordering near exhaustion; ASM MEMO COMPLETE [2026-06-11]
+c1+c2+c4 shipped byte-exact (T1 frozen 1183->1162, +1.8% of wall = ~3.3% of the decode ceiling;
+every prof class improved frozen); c3 NO-SHIP on hardware-counter mispredict evidence. THE ASM
+MEMO now has its complete, gated data chain: (1) decode chain = 50.9%/47.1% of the engine-cell
+walls (removal oracles, disjointness-proven, conservative); (2) store side exhausted (<=94ms,
+P3.4 took it); (3) BMI2 instructions already emitted (disasm) — the cost is DEPENDENCY LATENCY;
+(4) Rust-level rescheduling extracts only low-single-digit % of the ceiling (P3.5). CONCLUSION
+FOR THE USER'S FUNDED CAMPAIGN: the remaining native single-core gap (~620ms-class at T1) is a
+microarchitectural per-symbol-latency problem — the asm hot-loop port is the remaining
+instrument, with a measured budget and the one-engine architecture ready to receive it.
+NATIVE TRAJECTORY: M6 0.578 -> 0.712 (slab) -> chain +1.8% => ~0.72-0.73 class at T1.
+Cleanup notes: my own orphaned pgrep-wait loops on the guest were mutually-self-sustaining
+(pgrep -f matches sibling cmdlines) — killed; pattern documented here as a trap.
 ## REMOVAL ORACLES MERGED (advisor SOUND-WITH-CHANGES) — THE ASM-MEMO VERDICT IS IN [2026-06-11]
 Frozen disjointness-proven ceilings on the native engine cells: STORE 94ms (7.4% of T1 wall) /
 23ms (3.5% model-T8-masked) vs DECODE 642.6ms (50.9%) / 311.6ms (47.1%). The Huffman-decode/
