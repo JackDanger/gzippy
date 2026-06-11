@@ -322,3 +322,81 @@ likely seam-bound too; evaluate analytically before building.
 NEXT: rung (c) per the charter — full-symbol-loop asm with the VAR_VIII
 salvage (register contract rewritten for the P3.1-P3.5 loop state), the
 ~620ms budget, and the seam amortized to ~once per chunk.
+
+---
+
+## 9. F-c VERDICT (2026-06-11): SHIP — the full-loop asm kernel captures ~35% of the decode ceiling; T1 -19.2% vs base
+
+Rung (c) built in three gated stages on branch `engine/asm-rung-c`
+(c1 `570d3190` contract+scaffold; c2 `13b9d57e` literals-only; c3 backref arm +
+multi-trailing + P3.4 copy — this commit). All measured on the frozen guest,
+bin-asmc-native (pure-rust-inflate,asm-kernel) vs bin-asmc-base
+(pure-rust-inflate), GZIPPY_FORCE_PARALLEL_SM=1, canonical masks.
+
+### The pre-registered gate (F-c) — ALL THREE conditions MET
+- **Byte-exact**: 30/30 sha cells {silesia, model, bignasa, storedheavy,
+  storedmix} × T{1,8} × {on, off, base} identical (silesia == pinned corpus
+  sha). Differentials: c2 (12k random streams × 3 litlen shapes) + c3 (15k
+  windowed trials × 5 litlen×dist pairs incl. subtable + RLE/stride/burst
+  coverage), exit+cursor+dst+bytes equality, on real BMI2. THREE positive
+  controls (corrupted lit store, corrupted dist base shift, corrupted
+  multi-arm advance) each FAIL the differential — instrument proven live.
+  (A 4th control — dist index mask 0x1FF→0xFF — correctly CANNOT diverge:
+  entries for codes <= 8 bits replicate with period <= 256 and both halves'
+  long-code slots are subtable ptrs that bail to Rust either way.)
+- **Coverage (asm_frac)**: T1 silesia asm_bytes 211.60M / 211.94M total =
+  **0.998 >= 0.97**; entries collapsed 17.97M (c2) → 24,128 (c3) — the seam
+  is amortized to block-rate (EOB 2,796 + dist-subtable/validity 21,330 +
+  boundary 2). Kill-switch proven (enabled=false, 0 entries).
+- **Frozen wall** (interleaved on/off/base, n=11, lock quiet, RESTORE
+  VERIFIED):
+  - **T1 silesia: ON 944 ms vs same-binary OFF 1213 ms (-22.2%) vs
+    cross-binary base 1169 ms (-19.2%)** — sign-stable 11/11,
+    non-overlapping distributions. Ship bar was -2%.
+  - **model T8 (masked): ON 525 vs OFF 656 (-20.0%) vs base 650 (-19.2%)**,
+    sign-stable 11/11.
+  - **silesia T8 (masked, n=9): ON ~331 vs OFF ~347 (-4.6%) vs base ~344
+    (-3.8%)**, sign-stable 8/9 (T8 routes only ~136.8M of 211.9M bytes
+    through clean-contig; marker-mode + pipeline own the rest).
+
+### Budget capture
+~225 ms captured of the ~620 ms-class T1 decode ceiling ≈ **35-36%**. The
+T1 gap to rapidgzip (~926.6 ms) collapses from ~235 ms to **~17 ms (0.98x)**
+at 944 ms. VAR_VIII's +14.6% prior art is far exceeded: the c3 kernel
+amortizes the boundary to ~once-per-block AND beats LLVM's scheduling of the
+whole per-symbol chain (litlen gather → consume → branch tree → dist decode
+→ copy → back-edge), not just the micro-step F-a/c2 measured.
+
+### Mechanism chain banked along the way
+- F-a/c2: per-symbol seam tax ~1.4-2.6 cyc/crossing — micro-asm REGRESSES
+  (c2 T1 +33 ms at 17.97M crossings) even when the in-asm code wins
+  (c2 model-T8 -5.1% at 5.5 B/entry). The boundary, not the headroom, was
+  the constraint — confirmed by c3's collapse of crossings (202×-253× fewer)
+  flipping T1 from -2.7% to +19.2%.
+- The c3a coverage instrument (reason-tagged RECLASS counters) found
+  **multi-literal-packet-with-trailing-LENGTH = 99.6% of crossings** (4.86M
+  of 4.88M T1 silesia) — the "builder-impossible" defense assumption was
+  wrong for trailing lengths; the ISA-L builder packs lit+...+len whenever
+  combined bits fit 12. Handling it in-asm (packed store + lit-prefix
+  advance + shared backref body + dst-inclusive X2 restore) was THE step
+  that met the coverage gate.
+- c2's OFF-vs-base +36 ms: `#[inline]`-ing the region taxes the hot Rust
+  loop's layout even when killed → c3 made `run_contig` `#[inline(never)]`
+  (one call per region run, amortized by the in-asm back-edge). A ~+44 ms
+  OFF-vs-base layout tax REMAINS in the asm-feature binary (the dispatch
+  block + ctx init are live code in the loop); irrelevant to production
+  (feature default-OFF, not compiled) and to the verdict (ON beats BOTH
+  arms agreeingly).
+
+### Disposition
+- Feature stays **default-OFF** per charter §4; flipping the default (or
+  adding asm-kernel to release feature sets) is its own reviewed commit +
+  measure. decide.sh GZIPPY_ASM_KERNEL knob row: owed, charter §6.
+- Suites: guest 944/0 (+9/0 fd_vectored_write single-threaded; parallel runs
+  of those 3 tests hang on a loaded box — pre-existing, documented) with the
+  asm live; default-features 674 pass / 2 PRE-EXISTING failures
+  (`ultra_fast_inflate` experimental path, cfg'd OUT of pure-rust; both
+  reproduce at base `7b684b9c` — `test_inflate_matches_flate2` directly,
+  `test_inflate_byte_by_byte` once its silesia fixture is present; NOT a
+  rung-(c) regression).
+- Binaries staged: /root/bin-asmc-native (`825378b3`), /root/bin-asmc-base.

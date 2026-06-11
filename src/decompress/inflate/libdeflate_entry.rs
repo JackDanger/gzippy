@@ -232,7 +232,7 @@ impl LitLenEntry {
 
 /// A distance table entry
 #[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
+#[repr(transparent)] // asm-kernel also reads entries as raw u32s (asm_kernel.rs)
 pub struct DistEntry(u32);
 
 impl DistEntry {
@@ -727,6 +727,15 @@ impl DistTable {
         let idx = (shifted_bits as usize) & ((1usize << subtable_bits) - 1);
         // SAFETY: subtable entries are allocated during build
         unsafe { *self.entries.get_unchecked(subtable_start + idx) }
+    }
+
+    /// Raw entries base pointer for the asm-kernel's `[dist_tbl + idx*4]`
+    /// gathers (rung (c)); entries are `#[repr(transparent)]` u32s. The
+    /// pointer is valid for `main_size + subtables` entries for the life of
+    /// the table (contract E5: tables immutable while the asm runs).
+    #[inline(always)]
+    pub fn entries_ptr(&self) -> *const DistEntry {
+        self.entries.as_ptr()
     }
 
     /// Resolve an entry (handle subtables)
