@@ -1,3 +1,28 @@
+## SCHED-PHASE0 GATED — headline DISCARDED at vendor source; HoL RETIRED; consumer publish+dispatch partially causal [2026-06-11]
+Worker (probe/sched-phase0, 5cfb334, /tmp/gz-sched0 — byte-transparent knobs only) reported a big
+headline; advisor gate (verified in BOTH sources) split it:
+DISCARDED: "silesia T4 primary = 88% spec-failure; rg 0%; fix GzipBlockFinder::get offset
+resolution" — REFUTED: vendor GzipBlockFinder.hpp:121-137 ALSO returns partition-grid guesses for
+speculative indices (header :26); rg speculates-with-markers like gzippy (banked 31.25% replaced-
+marker symbols), so "rg 0% spec-fail" is architecturally false; the SPEC_FAIL_* counters
+(chunk_fetcher.rs:3195-3200, inc at :3586-3605) count EOF tail-walk candidate rejections, NOT
+wrong-start chunks (counter-semantics scar class again). The 1.33x decodeBlock SUM, if real, is the
+funded engine-W symbol-rate track, not a block-finder defect. ALSO DISCARDED: "apply_window runs at
+standard priority" — gzippy submits at -1 == vendor submitTaskWithHighPriority (BlockFetcher.hpp:
+608-611 <-> chunk_fetcher.rs:2445,2455; both pools pop lowest key).
+BANKED: (B) the ~40% HoL-stall finding is RETIRED at HEAD — 1 on-demand NOT_STARTED fetch/run;
+mechanism = the BTYPE=01 prefilter deletion (block_finder.rs:376-387, 2026-06-09) removed the
+phantom-decode source. (E, sign only) consumer-thread serial publish+dispatch is PARTIALLY causal
+on silesia T4 (SLOW_PUBLISH 5ms -> +28ms via the 6 consumer-path publishes; SLOW_DISPATCH 5ms ->
++41ms; 4-core mask, magnitudes unsized). Hit-drive kill-switch flat on silesia T4 (slack).
+RE-MEASURE (presumed measurement error, R1): worker's bignasa T8 "~410ms" + "CLOSED at 1.018x" —
+irreconcilable with Phase-0's sha-verified 1085ms same day/box/file AND the banked 0.918-0.940x.
+VERIFY-FIRST: "11/17 publishes on worker threads" (no thread-id instrument shown; all gzippy
+publish sites are documented consumer-thread — needs a thread-id counter before any port).
+NEXT (advisor-ordered): (1) supervisor fully-honest baseline re-measure silesia T4 + bignasa T8 vs
+rg, canonical 8-core mask, both-arms-file-sink; (2) publish-thread-id instrument; (3) IF confirmed,
+faithful consumer-publish port (vendor queueChunkForPostProcessing:557-575); (4) boundary-resolution
+CEILING oracle (reframed F) before any block-finder work; (5) engine-W stays the funded separate track.
 ## PHASE-0 mfast PROBE: Row 1 FIRED — mfast THROUGHPUT lever REJECTED with mechanism (advisor-SOUND) [2026-06-11]
 Probe branch probe/mfast-phase0 (10fda98b, merged for the re-runnable instrument). Knobs:
 GZIPPY_MFAST_DISABLE / GZIPPY_SLOW_MFAST_MODE (localized in-'mfast inject — the global marker knob
