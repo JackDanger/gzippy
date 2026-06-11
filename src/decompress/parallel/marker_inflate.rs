@@ -3279,6 +3279,13 @@ pub(crate) unsafe fn emit_backref_contig(
     let mut dst = base.add(*pos);
     let mut src = base.add(*pos - distance);
     let end = dst.add(length);
+    // P3.4 item 3 (variant B): long matches walk well past the head of the
+    // source — prefetch one line ahead before the copy loop reaches it
+    // (libdeflate analog, copy_match_fast:430-433).
+    #[cfg(target_arch = "x86_64")]
+    if length > 40 {
+        std::arch::x86_64::_mm_prefetch(src.add(40) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
     if distance >= 8 {
         // 5-word unconditional burst (covers the common short match without a
         // length branch), then the stride-8 loop for long matches.
