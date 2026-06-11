@@ -5,6 +5,10 @@
 
 #[cfg(parallel_sm)]
 pub mod apply_window;
+/// ASM-campaign increment (a): litlen decode+consume `asm!` micro-kernel
+/// (feature `asm-kernel`, x86_64-only; pure-Rust path always compiled).
+#[cfg(parallel_sm)]
+pub mod asm_kernel;
 pub mod bit_manipulation;
 #[cfg(parallel_sm)]
 pub mod block_fetcher;
