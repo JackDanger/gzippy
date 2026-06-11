@@ -1,3 +1,13 @@
+## P3.2 MERGED — runtime lit chaining: model T8 -6.8%, T1 -1.6%, lits/iter 2.57 [2026-06-10]
+The first arsenal lever pays: lit iterations halved (21.75M->10.85M silesia), chain fires 6.3M
+times at 2.72 lits/iter; model (literal-heavy) gains most. Gate: SOUND, all six surfaces; optional
+hardening noted (C_N_LITCHAIN>0 vacuity guard on the production net — fold into P3.3). REMAINING
+measured headroom in the contig loop: backref 21.8 vs old 23.6 cyc/iter (narrowed without separate
+work; wrapper-class target); litpack arm. NEXT P3.3 candidates (in order): (1) the model/T4-band
+re-measure on the official frozen cells with p32 (how much of native model 0.577 / T4 0.784 did
+P3.1+P3.2 close?); (2) backref-arm polish (the remaining ~10%-of-class delta); (3) BMI2
+PEXT/BZHI dispatch + table prefetch (arsenal items, untouched); (4) asm only if cells still short.
+Guest staged: /root/bin-p32-{native,isal}.
 ## P3.1 MERGED — T1 regression recovered, native beats pre-arc baseline [2026-06-10]
 Bisect: M3's contig distance chain owned the -4%; DistTable single-lookup in the fast loop fixes
 it (frozen T1 1387 vs baseline 1402; T4/T8 clean). Gate ran the missing table-level differential
