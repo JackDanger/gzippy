@@ -1,13 +1,11 @@
 """Measurement fingerprints — FINGERPRINT-OR-NO-COMPARE (subsumes SINK-LAW).
 
-Scars:
-  - The 2026-06-11 HALF-PHANTOM matrix: rg re-based to a file sink while gz
-    kept /dev/null numbers; "T1 0.973" was a phantom ratio across two sink
-    protocols.
-  - The stale rg-anchor: a "0.98x" claim measured against a banked 926.6ms
-    while the live co-located comparator ran 810ms.
-  - The cyc/iter "regression" that was a TSC frequency-state mismatch between
-    captures (frozen no_turbo vs the bank's capture), not a code change.
+A ratio formed across two silently different measurement protocols is a
+phantom: one arm re-based to a different output sink, a live number compared
+against a stale banked anchor, a cycle count captured under a different
+frequency state read as a regression. Each of those happened for real — see
+docs/CASE-STUDIES.md ("the half-rebased matrix", "the stale anchor", "the
+clock confound").
 
 Every stored number carries a Fingerprint: {sink, mask, freeze, binary sha,
 corpus sha, protocol version, comparator version, host identity}. Two numbers

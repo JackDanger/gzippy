@@ -103,8 +103,10 @@ def load_run_documented(art_dir, adapter):
                 "rg": read_samples(os.path.join(cdir, "wall_rg.txt")),
                 "knobs": {}}
         ptxt = os.path.join(cdir, "prof.txt")
-        cell["prof"] = (adapter.parse_microprofile(open(ptxt).read())
-                        if os.path.exists(ptxt) else None)
+        cell["prof"] = None
+        if os.path.exists(ptxt):
+            with open(ptxt) as pf:
+                cell["prof"] = adapter.parse_microprofile(pf.read())
         cell["trace"] = os.path.join(cdir, "trace.json")
         cell["verbose"] = os.path.join(cdir, "verbose.txt")
         for kn in sorted(os.listdir(cdir)):
@@ -112,14 +114,16 @@ def load_run_documented(art_dir, adapter):
             if not km:
                 continue
             kd = os.path.join(cdir, kn)
+            meta = {}
+            meta_path = os.path.join(kd, "meta.txt")
+            if os.path.exists(meta_path):
+                with open(meta_path) as mfh:
+                    meta = dict(ln.strip().split("=", 1)
+                                for ln in mfh if "=" in ln)
             cell["knobs"][km.group(1)] = {
                 "base": read_samples(os.path.join(kd, "base.txt")),
                 "knob": read_samples(os.path.join(kd, "knob.txt")),
-                "meta": dict(
-                    ln.strip().split("=", 1)
-                    for ln in open(os.path.join(kd, "meta.txt"))
-                    if "=" in ln) if os.path.exists(os.path.join(kd, "meta.txt"))
-                else {},
+                "meta": meta,
             }
         run["cells"][ck] = cell
     # knob effect captures
@@ -132,8 +136,9 @@ def load_run_documented(art_dir, adapter):
         for f in os.listdir(edir):
             fm = re.match(r"effect_(base|knob)_(\w+)\.txt$", f)
             if fm:
-                run["effects"].setdefault(fm.group(2), {})[fm.group(1)] = \
-                    open(os.path.join(edir, f)).read()
+                with open(os.path.join(edir, f)) as efh:
+                    run["effects"].setdefault(
+                        fm.group(2), {})[fm.group(1)] = efh.read()
     return run
 
 

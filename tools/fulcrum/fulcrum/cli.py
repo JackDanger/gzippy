@@ -189,7 +189,16 @@ def ledger_main(rest):
 
     rows = led.rows()
     anchor_ids = {(r.get("key"), r.get("runid")) for r in led.anchors()}
-    print(f"ledger: {path} ({len(rows)} rows, {len(anchor_ids)} anchors)")
+    breaks = led.verify_chain()
+    n_chained = sum(1 for r in rows
+                    if not r.get("_corrupt") and r.get("chain"))
+    chain_note = (f"chain BROKEN ({len(breaks)} break(s))" if breaks
+                  else f"chain intact ({n_chained}/{len(rows)} rows chained; "
+                       f"pre-chain rows are convention-only)")
+    print(f"ledger: {path} ({len(rows)} rows, {len(anchor_ids)} anchors, "
+          f"{chain_note})")
+    for b in breaks:
+        print(f"  !! TAMPER-EVIDENCE: {b}")
     for r in rows:
         if r.get("_corrupt"):
             print(f"  [TORN ROW] {r['_corrupt']}")
