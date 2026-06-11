@@ -59,7 +59,10 @@ assert_regular_sink() { # <path>
 # Extension over the spine: wraps the command in /usr/bin/time -f '%M' -o <tmp>
 # to capture peak RSS (kilobytes, converted to MB) WITHOUT mixing it into the
 # command's own stderr (the -o flag writes the time stats to a file, not stderr).
-# Callers that only read "secs sha" via `read -r sec sha` safely ignore the
+# CALLERS MUST read three fields (`read -r sec sha rss`): bash `read`'s last
+# variable slurps the REMAINDER of the line, so a two-var read corrupts sha
+# with the appended rss (caught live: false SHA DIVERGENCE on a correct pin).
+# Stale claim removed: it is NOT safe to ignore the
 # third field. Knob callers read the third field as rss_mb for meta.txt rendering.
 timed_masked() { # <mask> <sink> <cmd...> -> echoes "secs sha rss_mb"
   local mask="$1" sink="$2"; shift 2
