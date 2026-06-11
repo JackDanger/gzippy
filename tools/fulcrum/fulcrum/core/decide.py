@@ -26,7 +26,7 @@ from .. import PROTOCOL_VERSION
 from . import trace as tr
 from .causal import knob_verdict
 from .fingerprint import Fingerprint, assert_comparable, incompatibilities
-from .ledger import make_record
+from .ledger import PENDING, make_record
 from .stats import bimodal, dist_health_str, read_samples, resolution, sample_stats
 
 # ---------------------------------------------------------------------------
@@ -75,6 +75,17 @@ def fmt_cell(ck):
 
 
 def load_run(art_dir, adapter):
+    """Load a run via the ADAPTER (pluggable): the default ProjectAdapter
+    delegates back to load_run_documented below (the documented schema,
+    docs/SCHEMA.md); a project with its own artifact layout overrides
+    ProjectAdapter.load_run and maps to the same run-dict shape."""
+    return adapter.load_run(art_dir)
+
+
+def load_run_documented(art_dir, adapter):
+    """The documented-schema loader (docs/SCHEMA.md): manifest.txt +
+    cell_<corpus>_T<threads>/ sample files + knob_<name>/ A/B dirs +
+    knob_effects_<corpus>_T<T>/ captures."""
     man_path = os.path.join(art_dir, "manifest.txt")
     if not os.path.exists(man_path):
         raise tr.InstrumentError(f"no manifest.txt in {art_dir} — not a decide "
@@ -92,8 +103,10 @@ def load_run(art_dir, adapter):
                 "rg": read_samples(os.path.join(cdir, "wall_rg.txt")),
                 "knobs": {}}
         ptxt = os.path.join(cdir, "prof.txt")
-        cell["prof"] = (adapter.parse_microprofile(open(ptxt).read())
-                        if os.path.exists(ptxt) else None)
+        cell["prof"] = None
+        if os.path.exists(ptxt):
+            with open(ptxt) as pf:
+                cell["prof"] = adapter.parse_microprofile(pf.read())
         cell["trace"] = os.path.join(cdir, "trace.json")
         cell["verbose"] = os.path.join(cdir, "verbose.txt")
         for kn in sorted(os.listdir(cdir)):
@@ -101,14 +114,16 @@ def load_run(art_dir, adapter):
             if not km:
                 continue
             kd = os.path.join(cdir, kn)
+            meta = {}
+            meta_path = os.path.join(kd, "meta.txt")
+            if os.path.exists(meta_path):
+                with open(meta_path) as mfh:
+                    meta = dict(ln.strip().split("=", 1)
+                                for ln in mfh if "=" in ln)
             cell["knobs"][km.group(1)] = {
                 "base": read_samples(os.path.join(kd, "base.txt")),
                 "knob": read_samples(os.path.join(kd, "knob.txt")),
-                "meta": dict(
-                    ln.strip().split("=", 1)
-                    for ln in open(os.path.join(kd, "meta.txt"))
-                    if "=" in ln) if os.path.exists(os.path.join(kd, "meta.txt"))
-                else {},
+                "meta": meta,
             }
         run["cells"][ck] = cell
     # knob effect captures
@@ -121,8 +136,9 @@ def load_run(art_dir, adapter):
         for f in os.listdir(edir):
             fm = re.match(r"effect_(base|knob)_(\w+)\.txt$", f)
             if fm:
-                run["effects"].setdefault(fm.group(2), {})[fm.group(1)] = \
-                    open(os.path.join(edir, f)).read()
+                with open(os.path.join(edir, f)) as efh:
+                    run["effects"].setdefault(
+                        fm.group(2), {})[fm.group(1)] = efh.read()
     return run
 
 
@@ -130,22 +146,104 @@ def load_run(art_dir, adapter):
 # Fingerprints (SINK-LAW / FINGERPRINT-OR-NO-COMPARE enforcement points).
 # ---------------------------------------------------------------------------
 
-def cell_fingerprints(man, ck):
+def canon_mask(mask):
+    """Canonicalize a cpu-list string ('0-15', '0,2,4,6', '0,1-3,7') to a
+    sorted comma list so a requested mask and a kernel readback compare by
+    MEANING, not formatting. Unparseable/empty -> 'unknown'."""
+    if not mask or mask == "unknown":
+        return "unknown"
+    cpus = set()
+    try:
+        for part in str(mask).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cpus.update(range(int(lo), int(hi) + 1))
+            else:
+                cpus.add(int(part))
+    except ValueError:
+        return "unknown"
+    return ",".join(str(c) for c in sorted(cpus)) if cpus else "unknown"
+
+
+def derived_mismatches(man):
+    """Cross-check self-reported manifest fields against their runner-DERIVED
+    duplicates. A field that CAN be derived (sink class via stat, mask via
+    taskset readback, freeze via sysfs) must be; a self-report contradicting
+    the derivation is a lying/stale manifest and is flagged — the DERIVED
+    value governs the fingerprint. Returns anomaly strings."""
+    out = []
+    for claim_key, derived_key in (("sink_gz", "sink_gz_derived"),
+                                   ("sink_rg", "sink_rg_derived")):
+        c, d = man.get(claim_key), man.get(derived_key)
+        if c and d and c != d:
+            out.append(
+                f"DERIVED-MISMATCH: manifest self-reports {claim_key}={c} but "
+                f"the runner derived {d} via stat — lying/stale manifest; the "
+                f"DERIVED value governs the fingerprint")
+    if man.get("freeze_state") == "frozen" and (
+            man.get("governor") in (None, "", "NA")
+            or man.get("no_turbo") in (None, "", "NA")):
+        out.append(
+            "DERIVED-MISMATCH: freeze_state=frozen claimed but the sysfs "
+            "readbacks are NA (governor="
+            f"{man.get('governor')!r}, no_turbo={man.get('no_turbo')!r}) — "
+            "'frozen' requires READ values; treat the freeze claim as "
+            "unverified")
+    for ck, meta in man["cell_meta"].items():
+        req, drv = meta.get("mask"), meta.get("maskd")
+        if req and drv and drv != "unreadable" \
+                and canon_mask(req) != canon_mask(drv):
+            out.append(
+                f"DERIVED-MISMATCH: {fmt_cell(ck)} requested mask={req} but "
+                f"the taskset readback was {drv} — the pin did not take "
+                f"(cpuset shrink / bad list); the READBACK governs the "
+                f"fingerprint")
+    return out
+
+
+def host_identity(man):
+    """Compose the host-identity fingerprint field from the manifest's
+    derived host fields: "cpu-model|kernel|host-id". ALL three must be known
+    (a partial identity cannot certify same-host); otherwise 'unknown'."""
+    cpu = (man.get("host_cpu_model") or "").strip()
+    kernel = (man.get("host_kernel") or "").strip()
+    hid = (man.get("host_id") or "").strip()
+    if cpu and kernel and hid:
+        return f"{cpu}|{kernel}|{hid}"
+    return "unknown"
+
+
+def cell_fingerprints(man, ck, adapter):
     """Build the (tool-under-test, comparator) fingerprints for one cell from
-    the manifest. Pre-v3 manifests lack sink/protocol fields -> 'unknown'
+    the manifest. Manifests predating a fingerprint field -> 'unknown'
     (label, never silently compatible)."""
     proto = man.get("protocol", "unknown")
     freeze = man.get("freeze_state", "unknown")
     corpus_sha = man.get(f"corpus_{ck[0]}_sha", "unknown")
-    mask = man["cell_meta"].get(ck, {}).get("mask", "unknown")
+    meta = man["cell_meta"].get(ck, {})
+    # DERIVED values govern (taskset readback / stat); self-reports are the
+    # fallback for artifacts predating derivation, cross-checked by
+    # derived_mismatches().
+    maskd = meta.get("maskd")
+    mask = canon_mask(maskd if maskd and maskd != "unreadable"
+                      else meta.get("mask", "unknown"))
     sink_default = man.get("sink_class", "unknown")
-    fp_gz = Fingerprint(sink=man.get("sink_gz", sink_default), mask=mask,
+    sink_gz = man.get("sink_gz_derived") or man.get("sink_gz", sink_default)
+    sink_rg = man.get("sink_rg_derived") or man.get("sink_rg", sink_default)
+    comparator = adapter.comparator_version(man)
+    host = host_identity(man)
+    fp_gz = Fingerprint(sink=sink_gz, mask=mask,
                         freeze=freeze, bin_sha=man.get("bin_sha", "unknown"),
-                        corpus_sha=corpus_sha, protocol=proto)
-    fp_rg = Fingerprint(sink=man.get("sink_rg", sink_default), mask=mask,
+                        corpus_sha=corpus_sha, protocol=proto,
+                        comparator=comparator, host=host)
+    fp_rg = Fingerprint(sink=sink_rg, mask=mask,
                         freeze=freeze,
                         bin_sha="comparator:" + man.get("rg_version", "unknown"),
-                        corpus_sha=corpus_sha, protocol=proto)
+                        corpus_sha=corpus_sha, protocol=proto,
+                        comparator=comparator, host=host)
     return fp_gz, fp_rg
 
 
@@ -154,14 +252,15 @@ def check_cell_comparable(fp_gz, fp_rg, ck):
 
     A CONCRETE mismatch (both sides known, different — e.g. one arm /dev/null,
     one arm file) is REFUSED outright: that is the half-rebased-table phantom.
-    Unknown-only gaps (pre-v3 artifact) downgrade to a label so old artifact
-    dirs stay analyzable — but are never banked.
+    Unknown-only gaps (an artifact predating a fingerprint field) downgrade to
+    a label so old artifact dirs stay analyzable — but are never banked.
     Returns the label string ('' == fully comparable)."""
     inc = incompatibilities(fp_gz, fp_rg)
     if any("mismatch" in r for r in inc):
         assert_comparable(fp_gz, fp_rg, what=f"cell ratio {fmt_cell(ck)}")
     if inc:
-        return " FP-INCOMPLETE(pre-v3 fields missing: not banked)"
+        missing = ",".join(sorted({r.split()[0] for r in inc}))
+        return f" FP-INCOMPLETE(fields unknown: {missing} — not banked)"
     return ""
 
 
@@ -193,6 +292,10 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
             f"numbers. Pass --allow-thaw to label instead. [FROZEN-OR-LABELED]")
     unfrozen_tag = "" if ok_frozen else " [UNFROZEN — ratio-only, do not bank]"
 
+    # Derived-vs-self-reported cross-check (a lying manifest is caught here;
+    # the DERIVED values are the ones the fingerprints below are built from).
+    anomalies.extend(derived_mismatches(man))
+
     proto = man.get("protocol", "unknown")
     proto_tag = "" if proto == PROTOCOL_VERSION else \
         f" [protocol={proto} != analyzer {PROTOCOL_VERSION}]"
@@ -202,10 +305,12 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                   f"quiet={man.get('quiet_state')} governor={man.get('governor')} "
                   f"no_turbo={man.get('no_turbo')} "
                   f"runnable_avg={man.get('runnable_avg')}{unfrozen_tag}")
-    header.append(f"comparator : {man.get('rg_version')}")
+    header.append(f"comparator : {man.get('rg_version')} "
+                  f"[fingerprint: {adapter.comparator_version(man)}]")
     header.append(f"fingerprint: protocol={proto}{proto_tag} "
                   f"sink_gz={man.get('sink_gz', man.get('sink_class', 'unknown'))} "
                   f"sink_rg={man.get('sink_rg', man.get('sink_class', 'unknown'))} "
+                  f"host={host_identity(man)} "
                   f"(per-cell mask + corpus pin in each row's fingerprint)")
     header.append(f"sha-verify : every measured run checked against the corpus "
                   f"pin (guest aborts on mismatch); "
@@ -225,7 +330,7 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
             anomalies.append(f"{fmt_cell(ck)}: cell present but sha_ok!=1 in "
                              f"manifest — VOID (SHA-OR-VOID), not ranked")
             continue
-        fp_gz, fp_rg = cell_fingerprints(man, ck)
+        fp_gz, fp_rg = cell_fingerprints(man, ck, adapter)
         fp_label = check_cell_comparable(fp_gz, fp_rg, ck)  # may raise
         ratio = sr["min"] / sg["min"] if sg["min"] else 0.0
         delta_s = sg["min"] - sr["min"]
@@ -254,6 +359,7 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
     if ledger is not None:
         already = ledger.has_run(man.get("runid"))
         n_banked = 0
+        n_pending = 0
         for ck, w in sorted(cell_walls.items()):
             if w["fp_label"] or not ok_frozen:
                 continue   # incomplete fingerprint / unfrozen: never banked
@@ -268,15 +374,33 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                             "comparator", w["fp_rg"]),
             ]
             for rec in recs:
-                for c in ledger.contradictions(rec):
+                contras = ledger.contradictions(rec)
+                for c in contras:
                     anomalies.append(c)
-                if not already:
+                if already:
+                    continue
+                if contras:
+                    # A contradicting live number is NEVER auto-banked as an
+                    # anchor: it lands pending-reconcile until a supersede
+                    # record names which side was wrong.
+                    rec["status"] = PENDING
+                    ledger.append(rec)
+                    n_pending += 1
+                    anomalies.append(
+                        f"{rec['key']}: live row banked {PENDING} (not an "
+                        f"anchor). After reconciling, resolve with: "
+                        f"fulcrum ledger supersede --key '{rec['key']}' "
+                        f"--retire <banked-runid> --promote {rec['runid']} "
+                        f"--reason '<why the banked row is retired>'")
+                else:
                     ledger.append(rec)
                     n_banked += 1
         ledger_notes.append(
             f"ledger     : {ledger.path} "
             + ("(run already banked — re-analysis, nothing appended)"
-               if already else f"(banked {n_banked} rows)"))
+               if already else
+               f"(banked {n_banked} rows"
+               + (f", {n_pending} {PENDING}" if n_pending else "") + ")"))
 
     # ---- trace decomposition per cell (canonical mask) -------------------------
     trace_components = {}   # cls -> {cell: (ms, span_ms)}
@@ -360,6 +484,8 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                 rss_str = "rss N/A (pre-RSS capture run)"
             rows.append({
                 "component": f"knob.{kname} ({desc})",
+                "kind": "knob",
+                "reverted": bool(kn.reverted) if kn else False,
                 "cells": fmt_cell(ck),
                 "attrib": f"Δ(alt-base)={v['delta_ms']:+.1f}ms @ canonical mask",
                 "status": status + unfrozen_tag,
@@ -386,13 +512,16 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                                             key=lambda kv: kv[1][0])
         cells_str = ",".join(fmt_cell(c) for c in sorted(cells))
         share = 100.0 * worst_ms / span_ms if span_ms else 0
+        perturb = adapter.perturbations.get(cls, "design a knob first")
         rows.append({
             "component": f"pipeline.consumer.{cls}",
+            "kind": "pipeline",
+            "perturb_cmd": perturb,
             "cells": cells_str,
             "attrib": (f"worst {fmt_cell(worst_ck)}: {worst_ms:.1f}ms "
                        f"({share:.0f}% of wall-critical span)"),
             "status": (f"HYPOTHESIS (attribution only — NOT causal). Perturb: "
-                       f"{adapter.perturbations.get(cls, 'design a knob first')}"),
+                       f"{perturb}"),
             "dist": "trace=1-shot (unfrozen-counters label)",
             "verify": adapter.reverify_trace(worst_ck, run, feature),
             "tier": 2,
@@ -429,7 +558,7 @@ def build_brief(rows, cell_walls, man, adapter, ok_frozen):
 
     for r in rows:
         if r["tier"] == 1:
-            if "reverted" in r["component"]:
+            if r.get("reverted"):
                 action = ("reconcile with the prior gated revert + check RSS "
                           "before flipping")
             else:
@@ -456,11 +585,17 @@ def build_brief(rows, cell_walls, man, adapter, ok_frozen):
             }
             return do_next, brief
     for r in rows:
-        if r["tier"] == 2 and r["component"].startswith("engine."):
+        if r["tier"] == 2 and r.get("kind") == "engine":
+            # The exact perturbation: the row's own pre-registered command
+            # (row contract), falling back to the adapter's compute-class
+            # perturbation, then to the re-verify command — never a KeyError
+            # on an adapter without a 'compute' perturbation.
+            perturb = (r.get("perturb_cmd")
+                       or adapter.perturbations.get("compute")
+                       or r.get("verify", "design a perturbation knob first"))
             do_next = (f"{r['component']} on {r['cells']} — top bounded "
                        f"HYPOTHESIS ({r['attrib']}). Run the pre-registered "
-                       f"perturbation BEFORE any work-stretch: "
-                       f"{adapter.perturbations['compute']}")
+                       f"perturbation BEFORE any work-stretch: {perturb}")
             brief = {
                 "action": (f"causally test {r['component']} on {r['cells']} "
                            f"(top bounded HYPOTHESIS — not yet actionable)"),
@@ -470,7 +605,7 @@ def build_brief(rows, cell_walls, man, adapter, ok_frozen):
                     "CAUSAL-OR-HYPOTHESIS: no work-stretch before the "
                     "perturbation converts this to a causal verdict",
                 ],
-                "command": adapter.perturbations["compute"],
+                "command": perturb,
                 "falsifier": ("a flat (≤ inter-run spread) interleaved wall "
                               "response to the slow-injection — confirmed by "
                               "the frequency-neutral sleep control — refutes "

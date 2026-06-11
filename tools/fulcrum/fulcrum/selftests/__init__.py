@@ -1,10 +1,11 @@
 """Self-tests (SELF-TEST-OR-NO-TRUST).
 
-Scar: two instruments were silently broken (a clean-window oracle that re-ran
-the bootstrap; another that emitted EMPTY output), and the busy+idle==span
-check was once a tautology. Every guarantee therefore has a synthetic-input
-test with positive AND negative controls, including tests that CORRUPT the
-data and assert the trust assertion FIRES.
+Instruments go silently broken — an oracle that re-ran the work it claimed
+to remove, a capture that emitted empty output, a coverage assertion that
+was a tautology (docs/CASE-STUDIES.md, "the broken instruments"). Every
+guarantee therefore has a synthetic-input test with positive AND negative
+controls, including tests that CORRUPT the data and assert the trust
+assertion FIRES.
 
 `run_all()` executes every suite and, on success, writes the self-test stamp
 (keyed to a hash of the package source) that `fulcrum decide/analyze` check.
@@ -14,10 +15,10 @@ from . import stamp as _stamp
 
 
 def run_all(write_stamp=True):
-    from . import test_decide, test_invariants, test_total
+    from . import test_adapter, test_decide, test_invariants, test_total
     total_fail = 0
     counts = {}
-    for mod in (test_total, test_decide, test_invariants):
+    for mod in (test_total, test_decide, test_invariants, test_adapter):
         rc, n_checks, n_fail = mod.run()
         counts[mod.__name__.rsplit(".", 1)[-1]] = {"checks": n_checks,
                                                    "failures": n_fail}

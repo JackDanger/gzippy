@@ -1,25 +1,30 @@
 """Measurement fingerprints — FINGERPRINT-OR-NO-COMPARE (subsumes SINK-LAW).
 
-Scars:
-  - The 2026-06-11 HALF-PHANTOM matrix: rg re-based to a file sink while gz
-    kept /dev/null numbers; "T1 0.973" was a phantom ratio across two sink
-    protocols.
-  - The stale rg-anchor: a "0.98x" claim measured against a banked 926.6ms
-    while the live co-located comparator ran 810ms.
-  - The cyc/iter "regression" that was a TSC frequency-state mismatch between
-    captures (frozen no_turbo vs the bank's capture), not a code change.
+A ratio formed across two silently different measurement protocols is a
+phantom: one arm re-based to a different output sink, a live number compared
+against a stale banked anchor, a cycle count captured under a different
+frequency state read as a regression. Each of those happened for real — see
+docs/CASE-STUDIES.md ("the half-rebased matrix", "the stale anchor", "the
+clock confound").
 
 Every stored number carries a Fingerprint: {sink, mask, freeze, binary sha,
-corpus sha, protocol version}. Two numbers may form a ratio/delta ONLY if their
-fingerprints are compatible. An unknown field is never compatible with
-anything (unknown != unknown): refusing a comparison is cheap; un-publishing a
-phantom is not.
+corpus sha, protocol version, comparator version, host identity}. Two numbers
+may form a ratio/delta ONLY if their fingerprints are compatible. An unknown
+field is never compatible with anything (unknown != unknown): refusing a
+comparison is cheap; un-publishing a phantom is not.
+
+comparator: the comparator tool's identity+version (a comparator upgrade
+moves ITS numbers — a ratio against a different comparator version is a
+different experiment). host: cpu model + kernel + a stable host id (the same
+binary on a different box is a different experiment; cross-host "drift" is
+topology, not regression).
 """
 
 from dataclasses import asdict, dataclass
 
 # Fields that must MATCH (and be known) for two measurements to be comparable.
-COMPARE_FIELDS = ("sink", "mask", "freeze", "corpus_sha", "protocol")
+COMPARE_FIELDS = ("sink", "mask", "freeze", "corpus_sha", "protocol",
+                  "comparator", "host")
 
 
 @dataclass(frozen=True)
@@ -31,6 +36,11 @@ class Fingerprint:
     corpus_sha: str = "unknown"  # corpus content pin (decompressed sha256)
     # measurement-protocol version (fulcrum.PROTOCOL_VERSION)
     protocol: str = "unknown"
+    # comparator tool version, normalized (e.g. "rapidgzip 0.16.0") — the
+    # adapter supplies a comparator_version() probe.
+    comparator: str = "unknown"
+    # host identity: "cpu-model|kernel|host-id" (derived on the box).
+    host: str = "unknown"
 
     def is_complete(self):
         return all(getattr(self, f) != "unknown" for f in COMPARE_FIELDS)
