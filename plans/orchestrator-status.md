@@ -1,3 +1,17 @@
+## BACKREF PERTURBATION (tool-queued action 2) — engine ON critical path; localization knobs found [2026-06-11]
+Frozen 4-arm T1 silesia: sleep-control injection +0.678s (+53.6%, 100x noise) => the clean decode
+loop IS the T1 critical path (Rule 1+2 satisfied; spin artifact confirmed sleep/spin=0.71 —
+spin numbers void for magnitude). BACKREF-SPECIFIC verdict NOT measurable with GZIPPY_SLOW_MODE
+(loop-wide: forces the careful loop; its ~0.54s switching overhead dominates — measures the fast
+loop's structural benefit, not backref cost; Rule 3 properly applied: no ceiling claims).
+NEXT LOCALIZATION (pre-registered): GZIPPY_SLOW_STORE=N (fires at literal-store + backref-copy on
+the PRODUCTION fast path, marker_inflate.rs:2534/2583/2671/2752/2812) vs GZIPPY_SLOW_DECODE=N
+(Huffman-compute) — the clean backref-vs-decode split; ceiling needs a removal oracle
+(emit_backref_contig pre-filled), not slope extrapolation.
+INSTRUMENT BUG FOUND (fix queued): scripts/bench/oracle.sh --kind perturb builds duplicate env
+keys (GZIPPY_SLOW_MODE=50 GZIPPY_SLOW_MODE=1; env last-wins => ZERO injection) — the perturb path
+is silently broken for SLOW_KNOB=GZIPPY_SLOW_MODE; arms were run via direct env. Also: knob hit
+count 39.7M (contig+wrapper) vs contig-only 17.97M — covered-region accounting documented.
 ## SLAB T-CONDITIONAL MERGED (advisor SOUND+SHIP) — native T1 0.712, best recorded [2026-06-11]
 The fulcrum-decide loop closed end-to-end: tool surfaced the lever -> iter-1 NO-SHIP (criteria
 held; cap-neuter mechanism pinned) -> iter-2 CAUSAL-VERIFIED +108ms n=21 -> gate SOUND+SHIP ->
