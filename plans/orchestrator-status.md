@@ -1,3 +1,23 @@
+## COMPARATOR-INTEGRITY BOMBSHELL: banked rg numbers carried a ~43ms PYTHON-WHEEL STARTUP TAX — silesia T8 "parity" RE-OPENED [2026-06-12]
+Ledger-pass gate reconciled the rg 350->274 contradiction by FACTOR WALK (frozen, N=7, sha-OK):
+R0 worker-form (native-rg, /dev/null) 273ms == worker's read; +file sink => 326 (SINK +53ms);
++flags TIE; +PATH binary => 376 (BINARY +52ms, of which ~43ms = the pip WHEEL's Python console-
+script startup: wheel --version 47-48ms vs native ELF 4-5ms; residual codegen ~9ms). BOX STATE
+UNCHANGED (R3 reproduces the banked regime; "1.383GHz power-capped" = TSC base clock misread —
+does NOT strengthen the reboot ask; fd_vectored env flag stands alone). THE STING: parity.sh's
+PATH rapidgzip IS the wheel => EVERY banked rg number paid ~43ms startup. Against the NATIVE
+vendor rg (the honest wall-delta=instruction-delta bar): silesia-isal T8 = gz 379 vs rg 324 =
+~1.17x REAL LOSS — banked F1 "win-at-parity" RE-OPENED; ALL near-bar cells (bignasa 0.986,
+weights 1.03, T1 wins mostly survive at ~5% tax share) need RE-SCORING vs native rg. ACTION
+OWED: parity.sh points at the native vendor build (or dual-reports, wheel labeled startup-taxed);
+matrix re-score session. LEDGER PASS disposition: corpus was SILESIA not model (strike 4,
+corpus-vs-brief class) — model narrative VOID; BANKED silesia-labeled: ledger method; finalize =
+23% of finish_oracle, O(output)-shaped (zero on no-prefix C8), +15.5ms T8-ideal vs rg alloc+copy
+=> O(N) prepend_bytes HYPOTHESIS w/ pre-registered Finalize perturbation (3ms sleep/chunk, CRC
+control) — must run on BOTH silesia and model vs the NATIVE bar; ffi_outside bimodal = cache
+hypothesis; commit=0; gz ISA-L kernel FASTER than rg's (65.4 vs 71.5 ideal, silesia-specific).
+STRIKE-5 CLAUSE adopted for all briefs: step-0 prints BRIEF_CELL=<corpus:T> + input sha; mismatch
+with the brief's stated sha = abort CELL_MISMATCH; reports lacking the pair are void on arrival.
 ## BOOTSTRAP CRITICAL ON MODEL-ISAL T8 (first marker-loop criticality CONFIRMED) — inc-1 = N2-N5 Rust ladder [2026-06-12]
 probe/bootstrap-isal (054db213) gated. POSITIVE CONTROL: the isal build runs the bootstrap
 (header 3.8ms/2% + BODY 155ms/98% thread-summed, 7.68MB at 50MB/s — 155 not 270: keepIndex
