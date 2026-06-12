@@ -1,3 +1,24 @@
+## POST-P0 REFRESH — monorepo WINS all cells; storedheavy = ROUTING MISFIRE (named); model/weights = clean-tail economy [2026-06-12]
+(measure/post-p0-refresh c68ac933; artifact shas printed per the strike rule; routing asserts per
+cell; STALE_CONFIRMED_BLOCK_SKIP = 0 everywhere, sha-OK everywhere — the P0 fix HOLDS.)
+MONOREPO: formerly RC:1 — now WINS every cell both builds (native 0.83-0.95x; isal 0.62-0.96x).
+STOREDMIX: wins all cells (0.59-0.86x). STOREDHEAVY MECHANISM FOUND (the named lead pays off):
+first_block_is_stored sees the 8.2MB stored PREAMBLE (262 blocks, 8.2% of output) =>
+StoredParallel; but the file is 91.8% dynamic-Huffman tail which StoredParallel decodes
+SEQUENTIALLY (lut_bulk_inflate ~94ms flat at every T — phase timing: overlap_copy+tail = ~100% of
+wall) while rg speculatively parallelizes it (24 chunks, 0 false positives, 95ms wall at T8 = the
+tie target). isal T1 wins big (0.598x IsalSingleShot) then T4+ collapses to 1.53-1.60x on the
+route switch. WOULD-BE FIX (dispatched): post-walk check — stored prefix < 50% of output =>
+NotStoredDominated => ParallelSM. MODEL/WEIGHTS ECONOMY (T8 captures + traces both tools):
+speculation is NOT the problem (96.2% accept, 51/51 flips, pool eff 86-89% ~ rg's 89); the cost
+is CLEAN-TAIL decode: native pure-Rust clean ~42% more CPU than rg's ISA-L (= engine-W, the
+funded track — model/weights native cells are ENGINE cells, not scheduling); isal's ISA-L usage
+~40% more CPU than rg's ISA-L on model (per-chunk overhead — isal model T8 1.192x is the
+remaining isal loss); weights isal T8/T16 = 1.030/1.025 NEAR-BAR. Pre-registered clean-tail
+perturbation design banked in the worker report (GZIPPY_SLOW_CLEAN_PCTL + skip-oracle ceiling).
+FULL matrix rows updated in the branch file. NEXT: (a) storedheavy routing fix [dispatched,
+falsifier: T4+ flips to ~rg-class, no regression storedmix/monorepo/pure-stored]; (b) isal model
+per-chunk ISA-L overhead probe; (c) engine-W owns model/weights-native.
 ## P0 CLOSED + MERGED (b879cc4d, advisor MERGE-NOW) — ring word-copy overshoot clobbered the oldest undrained slot [2026-06-12]
 Round-2 hunt (Fable) root-caused the 1-byte corruption: emit_backref_ring's non-overlap word-copy
 arm rounds length to 4 u16 slots ((len+3)&!3; u8 twin rounds to 8 at ~:4153) — the rounded
