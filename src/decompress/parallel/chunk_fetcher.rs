@@ -921,6 +921,15 @@ fn drive_impl<W: std::io::Write>(
                 ISAL_INEXACT_FALLBACKS.load(Ordering::Relaxed),
             );
         }
+        // StoredParallel demotion counter: non-zero means a stored-prefix+Huffman-tail
+        // stream was routed back to ParallelSM because the stored prefix < 50% of output.
+        // A stored-dominated file (e.g. random100.gz with ~8% prefix) should show
+        // stored_demoted=1 per run; a pure-stored or >50% stored stream stays 0.
+        eprintln!(
+            "  StoredParallel demoted to ParallelSM (Huffman tail > 50% of output): {}",
+            crate::decompress::parallel::stored_split::STORED_DEMOTE_TO_PARALLEL_SM
+                .load(Ordering::Relaxed),
+        );
         use crate::decompress::parallel::chunk_buffer_pool::*;
         eprintln!(
             "  Max concurrently-live ChunkData (in-flight depth): {}  (live now: {})",
