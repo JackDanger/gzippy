@@ -1,3 +1,17 @@
+## N2 TIE-KEEP MERGED (1d008f71) — rate-trap untriggered; ladder dims; disk-full make scare resolved [2026-06-12]
+F-w1 verdict per pre-registration: TIE (model-isal T8 median 1.0043, on/off byte-exact 12/12
+spot-grid, counters identical, no-regression silesia 1.0043 / bignasa 0.987) => keep-if-byte-exact.
+BODY-RATE BANKED: ~48->50MB/s (1.04x) — the SECOND consecutive micro-pass (after N1) that did not
+move the marker body rate; rate-trap (>=1.5x) untriggered so the slope ceiling stands, but the
+N3-N5 ladder prospects DIM (two TIEs, flat rates) — ladder PAUSED pending the wall-conversion
+decomposition (in flight; the dominant unknown owns the next direction). Honest model-isal T8 gap
+vs native rg (oracle_c/build-native, labeled): 1.15x. INCIDENT: post-merge `make` failed
+StorageFull — local disk 99% from accumulated worktree targets; freed 3.9G (finished workers'
+target/ dirs), make green (EXIT=0); the merge was sound. LESSON (process): `make 2>&1 | tail`
+swallows make's exit code via the pipe — the push gated on tail's 0, not make's failure; always
+capture MAKE_EXIT separately (this bank is the record; the pushed merge was retroactively
+verified green). IN FLIGHT: wall-conversion decomposition silesia T8 vs native rg (the campaign's
+single dominant unknown).
 ## NATIVE-RG RE-SCORE GATED SOUND — campaign re-aims: T4+ wall-conversion is THE gap; T1-isal wins real [2026-06-12]
 measure/native-rg-rescore (db466ae5) gated. Comparator = native ELF b0397fca (4ms startup,
 self-check wired into _parity_guest.sh — wheel regression now mechanically trapped); N=7 frozen,
