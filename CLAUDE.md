@@ -190,8 +190,16 @@ Input → decompress::mod: decompress_gzip_libdeflate
   ├─ Multi-member? (trailing gzip headers detected)
   │     T1  → decompress_multi_member_sequential (libdeflate, member-by-member)
   │     Tmax → bgzf::decompress_multi_member_parallel (libdeflate FFI)
-  └─ Single-member?
-        ISA-L + T>1 + compressed > 10 MiB
+  └─ Single-member? (CORRECTED 2026-06-12 — the old "ISA-L + T>1 + >10 MiB"
+        line was STALE: MIN_PARALLEL_COMPRESSED is dead code, there is NO size
+        gate at HEAD, and a field-matrix worker re-derived the phantom
+        threshold from this table. Current truth, mod.rs:185-232:)
+        parallel_sm build (features pure-rust-inflate / gzippy-isal):
+            EVERY single-member at EVERY T → ParallelSM
+            (gzippy-isal at T1 → IsalSingleShot, mod.rs:201-205)
+        NON-parallel_sm build (default features = [] — the LEGACY SERIAL
+            binary, LibdeflateSingle for <1 GiB): NEVER bench it as the
+            product; verify with GZIPPY_DEBUG=1 → path=ParallelSM first.
             → parallel::single_member::decompress_parallel
               (parallel chunk pipeline — see `src/decompress/parallel/`.
                Output STREAMS: bytes flow to the writer as each chunk
