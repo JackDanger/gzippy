@@ -170,6 +170,28 @@ if [ -n "$GZIPPY_BIN2" ]; then
   esac
 fi
 
+# ---- 4c. BUILD_FLAVOR guard — hard fail before timing if binary reports wrong flavor ----
+# Derive the expected flavor from $FEATURE (sane default) unless overridden by
+# $EXPECTED_FLAVOR. This catches the "measured the wrong binary" footgun where a
+# gzippy-native binary is measured with --feature gzippy-isal (or vice versa).
+# Flavors (from build.rs):
+#   gzippy-isal        → "parallel-sm+isal"
+#   gzippy-native / pure-rust-inflate → "parallel-sm+pure"
+#   default / other    → "legacy-serial"
+if [ -z "${EXPECTED_FLAVOR:-}" ]; then
+  case "$FEATURE" in
+    gzippy-isal)                      EXPECTED_FLAVOR="parallel-sm+isal";;
+    gzippy-native|pure-rust-inflate)  EXPECTED_FLAVOR="parallel-sm+pure";;
+    *)                                EXPECTED_FLAVOR="legacy-serial";;
+  esac
+fi
+ACTUAL_FLAVOR="$("$GZIPPY_BIN" --version 2>/dev/null | grep -oE '\([^)]+\)' | tr -d '()' || true)"
+case "$ACTUAL_FLAVOR" in
+  "$EXPECTED_FLAVOR") ;;
+  *) fail "build-flavor mismatch: expected '$EXPECTED_FLAVOR' from feature=$FEATURE, binary reports '${ACTUAL_FLAVOR:-<no flavor>}' — rebuild with correct --features or set EXPECTED_FLAVOR" 10;;
+esac
+echo "## build-flavor=$ACTUAL_FLAVOR (matches expected=$EXPECTED_FLAVOR)"
+
 # ---- 5. host-lock READBACK (ABORT on thaw — Rule 6 frozen host) --------------
 # A thawed host must NOT silently print a number. Mismatch (or an NA readback on an
 # LXC where the sysfs is hidden) is a HARD FAIL unless the operator explicitly
