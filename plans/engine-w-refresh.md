@@ -225,3 +225,23 @@ need the reboot — it is measured at T1 and will generalize to T4+ as a consequ
    vs table-build. This decomposition belongs in the perturbation session's instrument design.
 3. Post-reboot: are silesia T4 isal and bignasa T8 isal at-bar or still-LOSS? If still-LOSS,
    the scheduling/efficiency gap (81% vs 92%) needs its own track; that is NOT engine-W.
+
+## GATE CORRECTIONS (2026-06-12, advisor-verified — supersede the matrix rows above)
+- native T1: bootstrap ABSENT-STRUCTURAL (chunk 0 stack zero-window chunk_fetcher.rs:2620-2625 +
+  bit-0 sentinel :582-585; pool_threads=0 at T1 :663 => inline-deferred after predecessor publish
+  => window_map.get always hits). Corpus-independent.
+- native T4+: **OPEN — UNTESTED** (the worker's "generalizes from T1" was WRONG: the mechanism is
+  the zero-thread pool, which is T1-only; real pool threads race the publish; asm-campaign §9
+  shows ~75M/211.9M bytes decode window-absent at native T8). Do not bank ABSENT here.
+- model-isal T8: bootstrap CRITICAL (sleep-surviving +254ms at 15.9x inject; proportional).
+  Ceiling ~16-19ms SLOPE-EXTRAPOLATED (83% sleep efficiency; removal oracle not run — rule 3).
+  Body = 98% of phase, 50MB/s at HEAD WITH N1 in (N1 didn't move this rate — dimming data point).
+  Cell gap 63ms this session / 49ms banked session (~15ms drift band on the denominator — never
+  compare falsifiers across sessions). 155ms thread-summed at HEAD (the 270 was pre-keepIndex;
+  sparsity tracking fired per-backref inside the body — attribution footnote, not load-bearing).
+- INC-1 RULING: (i) N2-N5 Rust ladder on the marker fast loop, model-isal T8 falsifier (F-w1:
+  ship >=2%; TIE => keep-if-byte-exact + bank the body-rate counter reading; rate moves >=1.5x
+  with flat wall => slope-ceiling falsified at the speed-up side, bootstrap track CLOSES with
+  mechanism). (ii) bootstrap asm DEFERRED behind rung-d entry conditions (ordering, contract,
+  economics — realistic asm-over-Rust increment single-digit ms). (iii)-as-parallel: the unnamed
+  ~47ms residual gets its own ledger pass (post-keepIndex; /tmp/gz-combined refreshed onto HEAD).
