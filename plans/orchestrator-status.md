@@ -1,3 +1,33 @@
+## CPU GATE DIES — rg measured natively on 3 binaries: gz pays 1.5-1.7x rg's decode CPU; ENGINE-W IS THE LEVER (quantified) [2026-06-12]
+Wall-conversion gate (probe/wall-conversion f9754052 gated; advisor re-measured rg itself, frozen,
+17 sha-verified runs, 3 rg binaries AGREE): rg silesia-T8 truth = wall_min 280ms (pin stream),
+CPU thread-summed ~1.50-1.53s => /8 ~= 188ms, ThOpt 166-181ms, Eff 75-82%. THE BANKED rg CPU
+2105ms (=> 263ms/8) REPRODUCES ON NO BINARY incl. the trace build it was attributed to — VOID,
+plus every downstream use: the CPU gate "gz <= rg" DIES for silesia T8, and the "ONE shared
+wall-conversion mechanism at T4+" re-aim dies with it (built on the dead gate). LOCATED (wall
+delta = instruction delta, per the governing rule): gz decodeBlock ~2.18-2.38s vs rg ~1.5s =
+~0.9-1.0s thread-summed EXCESS DECODE CPU; scheduling near-parity (gz 79.5% vs rg 75-82%) =
+non-differential. ENGINE-W RE-CONFIRMED as THE silesia/T4+ lever with the convergence metric:
+gz ThOpt 272-297ms -> 178ms on pin-silesia T8. BANKED: canonical rg verbose invocation
+`rapidgzip -d -f -o <file> -P 8 --verbose` (returns in-wall; the worker's 18-min "hang" was an
+invocation error building a seek index). bignasa T8 0.829: DIFFERENT mechanism — no ISA-L
+engagement (flip=0, isal_chunks=1), consumer/output 219ms = Wall-Real named term; the
+pre-registered Finalize/prepend perturbation aims THERE (chunk-11 finalize=208ms). DOWNGRADED:
+tail window-publish waits (193-255ms ffi_outside) — real but capped ~0-20ms differential by
+efficiency-parity; hypothesis only. FALSE ALARM RESOLVED: silesia.gz pin f16dd24b is INTACT
+(mtime 06-06); the worker used the staged repo fixture (96070b0a, same raw bytes, different
+encoder) — its 0.810 session is internally valid but NOT comparable to pin-era ratios (re-run
+owed on the pin); STRIKE-5 VIOLATION: the worker demoted the sha-mismatch abort to WARN — rule
+hardened: pin mismatch = hard abort, staged copies inherit the pin check, corpus files immutable.
+NEXT (ranked): (1) re-derive the gz verbose pair on PIN-silesia T8 (~10min, restores
+comparability) then ENGINE-W against the 0.9-1.0s excess (where does gz burn 1.5-1.7x rg's
+instructions? per-symbol rate was partially exonerated by MFAST_DISABLE-flat at T4/T8 — that
+tested the MARKER loop; the CLEAN/contig+asm path and per-chunk re-decode volume (speculation
+overlap/discards, double-decode tax) are the candidates — a decode-VOLUME audit (bytes decoded
+total vs 211MB; rg 31.25%-marker double-decode vs ours) is the cheapest discriminator BEFORE any
+kernel work); (2) Finalize/prepend perturbation on bignasa vs native bar; (3) process fixes:
+RG pinned to b0397fca in scripts (done in rescore branch — merge it), strike-5 hard abort, hunt
+the 2105ms artifact origin before trusting any RG_TRACE CPU table.
 ## N2 TIE-KEEP MERGED (1d008f71) — rate-trap untriggered; ladder dims; disk-full make scare resolved [2026-06-12]
 F-w1 verdict per pre-registration: TIE (model-isal T8 median 1.0043, on/off byte-exact 12/12
 spot-grid, counters identical, no-regression silesia 1.0043 / bignasa 0.987) => keep-if-byte-exact.
