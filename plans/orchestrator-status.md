@@ -1,3 +1,22 @@
+## ISAL COLUMN RERUN (correct build) — F1/F2/F3 ALL PASS; gz-isal wins T1 on EVERY corpus; 32W/9L vs rg [2026-06-12]
+Rebuild verified BEFORE measuring (path=ParallelSM @T8, path=IsalSingleShot @T1 — the asserts the
+voided session skipped). All three pre-registered falsifiers PASSED: F1 silesia T8 gz 340 vs rg
+350 = win-at-parity (voided session's 810 flat row proven misbuild); F2 gz-isal T1 == igzip +/-
+10ms on all 11 corpora, margin NOT size-scaling (corr -0.40) — the single-shot wrapper costs ~0;
+F3 scaling curves restored (model 2020->360ms T1->T16). THE CORRECTED PICTURE (banked,
+measure/field-matrix 1f14e4b7): gz-isal BEATS rapidgzip at T1 on ALL 11 corpora (0.36-0.91x) and
+wins 32/41 measurable cells overall. THE REAL LOSS SURFACE (named rows): storedheavy T4-T16
+(1.25-1.45x — parallel SM overhead on pure-stored; NOTE a StoredParallel route EXISTS at
+mod.rs:218-224, why didn't it fire/win? named lead), model T4-T16 (1.16-1.26x — the low-ratio
+economy gap, move 3), silesia T4/T16 (1.10-1.11x — the drift-limited terminal cell + T16),
+weights T4 (1.12x). Defaults audit: bare gzippy wins/ties 7/10 vs bare rapidgzip (model +
+storedheavy lose). monorepo FAILs RC:1 at T4+ on the isal build too — P0 is cross-build
+(stored/marker path is shared); T1 passes. WORKER-PHRASING CORRECTED AT SOURCE: small corpora
+flat at T>1 is CHUNK GEOMETRY (<=4MiB compressed = 1 chunk), NOT a "routing threshold"
+(mod.rs:208-224 has no size gate). CAMPAIGN REFRAME this enables: the goal surface is now 5
+named loss families — (1) P0 stored/marker CRC [fix in flight], (2) storedheavy stored-path
+T>1, (3) model/weights low-ratio economy, (4) silesia T4/T16 band, (5) native T1 engine rate —
+everything else WINS in product configuration.
 ## FIELD MATRIX GATED — isal column VOID (misbuilt binary); P0 CORRECTNESS BUG found (monorepo ParallelSM CRC) [2026-06-12]
 First field measurement (measure/field-matrix, plans/field-matrix-2026-06-12.md: 11 corpora x T x
 {gz-isal, gz-native, rg 0.16, rg-upstream, pigz, igzip, libdeflate, gzip}, N=5 sha-verified).
