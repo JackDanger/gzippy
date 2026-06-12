@@ -1848,6 +1848,19 @@ impl Block {
         };
         let mfast_yield: bool = super::slow_knob::localize_yield_kind(mfast_spin);
         let mfast_prof_on: bool = CONTAINS_MARKERS && mfast_prof::enabled();
+        // ── MARKER EMISSION PROBE KNOB (probe/marker-emit-crit) ───────────────
+        // `GZIPPY_SLOW_MARKER_EMIT=N` injects at each `emit_backref_ring::<true>`
+        // call (both 'mfast and careful loops), perturbing ONLY the per-backref
+        // emission cost without affecting `slow_spin` (and therefore without
+        // changing which loop runs — the mfast gate checks `slow_spin == 0`, not
+        // `marker_emit_spin == 0`). OFF (unset / 0) ⇒ a no-op single branch;
+        // the knob is const-folded away entirely on the clean path.
+        let marker_emit_spin: u64 = if CONTAINS_MARKERS {
+            super::slow_knob::marker_emit_spin_iters()
+        } else {
+            0
+        };
+        let marker_emit_yield: bool = super::slow_knob::localize_yield_kind(marker_emit_spin);
 
         // ── VAR_V SPECULATIVE SOFTWARE-PIPELINED FAST LOOP (clean path only) ──
         // igzip trick #2 ported faithfully ONTO the production wrapping u8 ring
@@ -2355,6 +2368,12 @@ impl Block {
                                         &mut distance_marker,
                                     );
                                 }
+                                // MARKER EMISSION PROBE: per-backref inject (GZIPPY_SLOW_MARKER_EMIT).
+                                // Fires only when marker_emit_spin > 0; const-folds to dead code
+                                // on the clean path (CONTAINS_MARKERS = false).
+                                if CONTAINS_MARKERS {
+                                    super::slow_knob::inject_localize(marker_emit_spin, marker_emit_yield);
+                                }
                                 self.record_backreference_for_sparsity(distance, length, emitted);
                                 emitted += length;
                             }
@@ -2577,6 +2596,11 @@ impl Block {
                         // marker scan). Vendor readInternal<false> back-ref.
                         emit_backref_ring_u8(ring8, &mut pos, drained, distance, length);
                     }
+                }
+                // MARKER EMISSION PROBE: per-backref inject (GZIPPY_SLOW_MARKER_EMIT).
+                // Const-folded to dead code on the clean path (CONTAINS_MARKERS = false).
+                if CONTAINS_MARKERS {
+                    super::slow_knob::inject_localize(marker_emit_spin, marker_emit_yield);
                 }
                 self.record_backreference_for_sparsity(distance, length, emitted);
                 emitted += length;

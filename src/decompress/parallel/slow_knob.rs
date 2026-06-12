@@ -155,6 +155,47 @@ pub fn marker_spin_iters() -> u64 {
     (BASE_SPIN as f64 * f) as u64
 }
 
+/// Marker EMISSION slow factor (`GZIPPY_SLOW_MARKER_EMIT`, percent/100). `0.0` ⇒ OFF.
+/// Read once. This knob injects at each `emit_backref_ring::<true>` call (both the
+/// `'mfast` and careful loops), perturbing ONLY the per-backref emission cost.
+/// Unlike `GZIPPY_SLOW_MARKER_MODE` (which sets `slow_spin != 0` and therefore
+/// DISABLES the mfast loop entry), this knob does NOT affect `slow_spin` and does
+/// NOT change which loop runs — enabling a causal probe of the emission cost while
+/// keeping the production loop structure intact.
+///
+/// `GZIPPY_SLOW_KIND=sleep` selects the frequency-neutral control (same batched-
+/// nanosleep mechanism as [`inject_localize`]).
+#[inline]
+#[allow(dead_code)] // instrument: only reached from marker-path emit sites
+fn marker_emit_factor() -> f64 {
+    static F: OnceLock<f64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_MARKER_EMIT")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|pct| pct / 100.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Resolved per-backref spin count for the marker EMISSION knob
+/// (`GZIPPY_SLOW_MARKER_EMIT`), or `0` when OFF. Snapshot once before the marker
+/// loops (alongside `mfast_spin`); pass to [`inject_localize`] after each
+/// `emit_backref_ring::<true>` call in both the mfast and careful marker loops.
+/// `GZIPPY_SLOW_KIND=sleep` selects the frequency-neutral control via
+/// [`localize_yield_kind`]. Byte-transparent: the injected work touches only a
+/// black-boxed accumulator / ns-debt cell.
+#[inline]
+#[allow(dead_code)] // instrument: only reached from marker-path emit sites
+pub fn marker_emit_spin_iters() -> u64 {
+    let f = marker_emit_factor();
+    if f <= 0.0 {
+        return 0;
+    }
+    (BASE_SPIN as f64 * f) as u64
+}
+
 // ── DECODE-COMPUTE vs STORE-BANDWIDTH LOCALIZATION KNOBS ────────────────────
 //
 // The whole-loop-body knob (`GZIPPY_SLOW_MODE`) proved the contig clean loop is
