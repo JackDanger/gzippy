@@ -1,3 +1,29 @@
+## RESUMED PROBE GATED — CPU gate CONFIRMED; idle DISPATCH GAPS named; ISA-L "recoverable" claim discarded (Rule 3) [2026-06-12]
+Box back (network outage, host uptime 53d — never rebooted). Frozen session, sha-OK, N=10:
+wall gz 563 / rg 498 = 0.911x. BANKED: (1) CPU GATE CONFIRMED 2nd session — gzippy thread-summed
+decode CPU 1825ms <= rg 1941.6ms (6% less/byte); finalize_with_deflate's 184ms is INSIDE that
+passing total. (2) rg ThOpt=358 RECONCILED (advisor, vendor source): subset numerator
+(decodeBlockTotalTime+applyWindow+checksum)/P — NOT the full verbose table/P (485); no two-pass
+double-count (applyWindow resolves in place, ChunkData.hpp:302). Efficiency banks ONLY
+formula-matched: gz 93.7% ~= rg 93.6%, with the HARD CAVEAT that raw 88.4% is the gap-honest
+figure — equal pool-packing does NOT imply wall parity; the +5.3pt "correction" pads exactly the
+idle-gap region. (3) GANTT four answers: 172ms marker-only tail chunk EXONERATED (finishes
+~454/502); pool-fill INSTANT (<1.3ms); NO start-time window wait (all 16/17 chunks decode
+window-absent speculatively; window needed only for apply_window); MID-RUN IDLE DISPATCH GAPS
+~40ms/worker (160ms thread-summed, largest 29.6ms) = wall-above-ideal 50-63ms = THE NAMED
+CANDIDATE. (4) finalize_with_deflate 184ms = CPU-attribution discovery; it is a FAITHFUL PORT of
+rg finalize/cleanUnmarkedData (ChunkData.hpp:418-421, GzipChunk.hpp:155-158) whose rg cost is
+BURIED inside decodeDurationIsal — the worker's "184 vs rg-append-48 = +136 divergence" is
+INVALID (different ops); watch-item only. DISCARDED: "+70ms recoverable / ISA-L 2x => beats rg"
+(Rule-3 slope->ceiling on unspeedable vendor asm); the "paradox" paragraph (apples-to-oranges
+ideals). UNCONFIRMED (cheap confirm-or-kill queued): locate's scan_candidate #1 (274ms on-path,
+from a correctly-SELF-FLAGGED run — wall-window mismatch; locate's first production self-flag
+worked). OPEN MECHANISM (the faithful-port question, next probe): is gzippy DISPATCH-DRIVEN
+(worker idles until consumer processes the finished chunk) where rg is PREFETCH-DRIVEN
+(BlockFetcher keeps the pool fed, BlockFetcher.hpp:111-114)? Falsifier: GZIPPY_SLOW_DISPATCH
+inject into consumer post-chunk processing, sleep-primary. Anomalies: Gantt chunk_id=MAX for
+window-absent (instrument bug); residual sub-conservation 85-87% (37ms unaccounted); isal_chunks
+14/17 (3 never flip); guest lacks bc.
 ## PARALLEL-EFF PROBE BLOCKED — NEUROTIC UNREACHABLE; rg --verbose semantics RESOLVED from vendor source [2026-06-12]
 The parallel-efficiency probe (probe/parallel-eff, 27b1ffcf) completed ALL instrumentation but the
 bench box is GONE: "neurotic" unresolvable (Mac DNS=8.8.8.8, search domain "home" NXDOMAIN, mDNS
