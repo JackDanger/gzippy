@@ -897,6 +897,9 @@ impl ChunkData {
         if last.encoded_size_bits == 0 {
             return;
         }
+        // Past all early exits — we are about to run the 32 KiB marker-engine scan.
+        // Count each such execution so the kill-switch effect is observable in VERBOSE.
+        SPARSITY_DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let start_bit = last
             .encoded_offset_bits
             .saturating_add(last.encoded_size_bits);
@@ -1541,6 +1544,14 @@ impl ChunkData {
 /// determines the page-fault working set and sizes a bounded-pool fix.
 pub static LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Effect counter: number of times `determine_used_window_symbols_for_last_subchunk`
+/// actually ran the 32 KiB marker-engine scan (window_sparsity=true path, not
+/// early-returned). With window_sparsity=false (default, keepIndex=false faithful port)
+/// this stays 0. With GZIPPY_WINDOW_SPARSITY=1 kill-switch it tracks sparsity work done.
+/// Read via GZIPPY_VERBOSE.
+pub static SPARSITY_DECODE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl ChunkData {
     /// Return the (now fully-resolved) `data_with_markers` buffer to the owner
