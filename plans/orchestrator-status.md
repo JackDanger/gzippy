@@ -1,3 +1,26 @@
+## P0 CLOSED + MERGED (b879cc4d, advisor MERGE-NOW) — ring word-copy overshoot clobbered the oldest undrained slot [2026-06-12]
+Round-2 hunt (Fable) root-caused the 1-byte corruption: emit_backref_ring's non-overlap word-copy
+arm rounds length to 4 u16 slots ((len+3)&!3; u8 twin rounds to 8 at ~:4153) — the rounded
+overshoot can WRAP the ring onto the FIRST UNDRAINED slot of a maximally-full read() call (cap
+65278-1 + a 258-len backref at the exact call boundary), clobbering one already-decoded byte
+before the end-of-call drain. Vendor NEVER overshoots (exact memcpy, deflate.hpp:1376) — this was
+a gzippy deviation whose "tail overwritten before read" assumption is false at call boundaries.
+FIX (41c9c9be): gate the word arm on (*pos - drained) + rounded <= RING_SIZE (both twins);
+guard-fail falls to exact-length arms. Gate verified the guard sound at edges (drained<=pos on
+every path incl. resumable re-entry + flips; ZERO conservatism — fires only when undrained span
+>= 65276/65536) and waived a wall A/B (ring emitters only, marker path causally slack; contig +
+asm kernel untouched; NOTE for the instruction ledger: +1 sub/add/cmp per ring backref).
+EVIDENCE: 3 fail-at-parent regression tests (incl. hand-built stream reproducing the geometry at
+index 65278); mono-gnu9 sha-exact T1-T16; guest grid 56/56 both builds; STALE_CONFIRMED_BLOCK_SKIP
+= 0 on this stream (98fd618c's path uninvolved — TWO distinct bugs, both now fixed). The
+"stored-flip 51542" trace line was a RED HERRING (stream has zero stored blocks; fired in a
+discarded trial decode at a false candidate offset). MERGED: 98fd618c + 9dce0b8f + 41c9c9be +
+4f252fad (record-correction docs: GzipBlockFinder has NO scanner — the raw block finder
+(block_finder.rs) is the component that hands stored-payload false positives to trial decodes).
+WATCH-ITEM filed (advisor falsifier): stored-heavy corpora w/ --verbose — STALE_CONFIRMED_BLOCK_
+SKIP>0 with sha-exact = guard benign; any CRC mismatch or published-chunk offset matching a
+never-confirmed raw-finder candidate = trial-decode leak is real. NEXT: refresh the FAIL(RC:1)
+matrix cells (monorepo now passes), then move 3 (model/weights low-ratio economy).
 ## HUNT WORKER'S "P0 CLOSED" VOIDED — supervisor re-ran the real reproducer: STILL FAILS; artifact-confusion strike 3 [2026-06-12]
 The hunt worker declared the P0 closed by 98fd618c — but its sanity line tested
 /tmp/monorepo.tar.gz (9,822,456 B = the APPLE-gzip stream, which the gate already proved 98fd618c
