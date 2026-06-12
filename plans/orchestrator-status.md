@@ -1,3 +1,22 @@
+## KEEPINDEX PORT MERGED (c31d9a07) — model-isal 1.19x -> ~1.13x; sparsity CPU deleted; RSS-neutral [2026-06-12]
+fix/keepindex-config (f60e8e3b) merged on MERGE-NOW. Port is VERBATIM vendor (only the two fields
+flip at keepIndex=false; sm_driver is the sole production constructor; Default keeping
+sparsity=true is itself faithful — vendor flips at the reader-config layer). Gate verified in
+source: nothing downstream needs masked windows (full window = strict superset; successor seeding
+via last_32kib_window unaffected); old path zlib-compressed EVERY stored window — raw-uncompressed
+at keepIndex=false is exactly rg's CLI-default behavior. RSS measured ON-BOX: TIE (model 294.0 off
+vs 292.8 on MB; silesia 274.6 vs 270.0; deltas < spread; worst-case exposure 1.6MiB) — the
+pre-existing ~2.7x model RSS gap vs rg (287 vs ~104MB) is UNTOUCHED and remains the separately-
+owned weak column. RESULTS: 80/80 sha grid; TIE-or-WIN all cells (model T4 1.039 off-faster,
+silesia T8 1.032 off-faster); 430ms thread-summed CPU deleted (=~10ms T8 wall — parallel-region
+CPU; compounds at low T). NEW model-isal standing: T8 ~424ms vs rg ~372-375 = ~1.13x (was 1.19);
+REMAINING NAMED DELTA = bootstrap/marker-prefix ~270ms = ENGINE-W TRACK (the funded rewrite is
+now the next and only named lever for that cell). Non-blocking note: decode_bypass replay uses
+ChunkConfiguration::default() (sparsity=true) — replay config now differs from production; one-
+line comment owed. Slope-recal skipped (brief cited a Dict knob that never existed in Rust).
+LOSS SURFACE NOW: silesia T4/T16 (NEEDS NEUROTIC REBOOT), model-isal residual (engine-W),
+native T1/low-ratio (engine-W), RSS column (separately owned). Plus the release-correction PR
+awaiting user nod.
 ## LEDGER CLOSED ON-BOX — model-isal gap NAMED: window-sparsity decode rg SKIPS at keepIndex=false (sm_driver.rs:127 divergence) [2026-06-12]
 Dispatch-silence probe gated; advisor ran a COMBINED instrument on the guest (both probes' counters
 one binary, frozen, sha-exact, TSC-calibrated) and reconciled the cross-probe contradiction exactly:
