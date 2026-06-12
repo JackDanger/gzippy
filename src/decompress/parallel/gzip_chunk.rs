@@ -2579,6 +2579,204 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    /// P0 REGRESSION (2026-06-12, /tmp/mono-gnu9.tar.gz: deterministic CRC32
+    /// mismatch with EXACTLY ONE wrong output byte at 35,335,338 — 'L' for '.').
+    ///
+    /// Root cause: `emit_backref_ring`'s word-copy rounds the run up to a
+    /// multiple of 4 u16; for the FINAL back-ref of a maximally-full `read()`
+    /// call (per-call cap `RING_SIZE - MAX_RUN_LENGTH` = 65278, plus up to 257
+    /// overshoot ⇒ undrained span up to RING_SIZE-1) the ≤3-slot rounding
+    /// overshoot wraps PHYSICALLY onto the OLDEST UNDRAINED slot. The
+    /// end-of-call drain then ships the clobbered u16 into
+    /// `data_with_markers`. Vendor rapidgzip cannot hit this: its back-ref is
+    /// an exact `std::memcpy(..., length * 2)` (deflate.hpp:1376).
+    ///
+    /// This test reconstructs the EXACT production geometry from the GNU-gzip
+    /// monorepo stream, with a hand-built fixed-Huffman deflate stream decoded
+    /// window-absent (marker mode) from bit 0:
+    ///   * call 1 fills to exactly the cap (65278 single-literal events);
+    ///   * periodic marker-propagating back-refs keep `distance_to_last_marker`
+    ///     below the 32 Ki flip arming (mirrors the real all-marker chunk);
+    ///   * call 2 emits 65277 literals, then a distance-1000 length-258
+    ///     back-ref: span + rounded = 65277 + 260 = 65537 > RING_SIZE — the
+    ///     overshoot's final slot aliases call 2's FIRST output byte.
+    /// Pre-fix: `data_with_markers[65278]` = the u16 at source+259 (wrong).
+    /// Post-fix: byte-exact against the reference model.
+    #[test]
+    fn marker_word_copy_overshoot_does_not_clobber_undrained_output() {
+        use crate::decompress::parallel::marker_inflate::RING_SIZE;
+
+        // ── Tiny fixed-Huffman deflate bit-writer ────────────────────────
+        struct Bw {
+            bytes: Vec<u8>,
+            cur: u64,
+            n: u32,
+        }
+        impl Bw {
+            fn lsb(&mut self, v: u64, n: u32) {
+                self.cur |= v << self.n;
+                self.n += n;
+                while self.n >= 8 {
+                    self.bytes.push((self.cur & 0xFF) as u8);
+                    self.cur >>= 8;
+                    self.n -= 8;
+                }
+            }
+            // Huffman codes are written MSB-first (RFC 1951 §3.1.1).
+            fn code(&mut self, c: u32, n: u32) {
+                for i in (0..n).rev() {
+                    self.lsb(((c >> i) & 1) as u64, 1);
+                }
+            }
+            fn finish(mut self) -> Vec<u8> {
+                if self.n > 0 {
+                    self.bytes.push((self.cur & 0xFF) as u8);
+                }
+                self.bytes
+            }
+        }
+        fn lit(bw: &mut Bw, v: u8) {
+            assert!(v < 144, "fixed-Huffman 8-bit literal range");
+            bw.code(0x30 + v as u32, 8);
+        }
+        fn backref(bw: &mut Bw, dist: usize, len: usize) {
+            match len {
+                3 => bw.code(1, 7),      // sym 257: 7-bit code 0000001
+                258 => bw.code(0xC5, 8), // sym 285: 8-bit code 11000101
+                _ => panic!("unsupported test length"),
+            }
+            let (dsym, base, extra) = match dist {
+                769..=1024 => (19u32, 769usize, 8u32),
+                24577..=32768 => (29u32, 24577usize, 13u32),
+                _ => panic!("unsupported test distance"),
+            };
+            bw.code(dsym, 5);
+            if extra > 0 {
+                bw.lsb((dist - base) as u64, extra);
+            }
+        }
+
+        // ── Event plan (output positions) ────────────────────────────────
+        #[derive(Clone, Copy)]
+        enum Ev {
+            Lit(u8),
+            Back(usize, usize),
+        }
+        let p = |i: usize| (i % 140) as u8;
+        let mut events: Vec<Ev> = Vec::new();
+        let mut out_len = 0usize;
+        let mut lits_to = |events: &mut Vec<Ev>, out_len: &mut usize, upto: usize| {
+            while *out_len < upto {
+                events.push(Ev::Lit(p(*out_len)));
+                *out_len += 1;
+            }
+        };
+        // Markers at 0..3 (distance > position ⇒ MapMarkers values), then
+        // re-propagated every 30000 bytes so the clean-run counter never arms
+        // the flip (mirrors the production all-marker chunk).
+        events.push(Ev::Back(1000, 3));
+        out_len += 3;
+        for stop in [30_000usize, 60_000, 90_000, 120_000] {
+            lits_to(&mut events, &mut out_len, stop);
+            events.push(Ev::Back(30_000, 3));
+            out_len += 3;
+        }
+        // Call 1 = [0, 65278) (cap; all single-literal events near the cap).
+        // Call 2 = [65278, ...): 65277 literals → final event starts at
+        // emitted = 65277 = cap - 1.
+        lits_to(&mut events, &mut out_len, 130_555);
+        events.push(Ev::Back(1000, 258)); // ← the clobbering back-ref
+        out_len += 258;
+        let total = out_len;
+        assert_eq!(total, 130_813);
+
+        // ── Encode: one fixed-Huffman BFINAL block ───────────────────────
+        let mut bw = Bw {
+            bytes: Vec::new(),
+            cur: 0,
+            n: 0,
+        };
+        bw.lsb(1, 1); // BFINAL
+        bw.lsb(1, 2); // BTYPE = 01 (fixed)
+        for ev in &events {
+            match *ev {
+                Ev::Lit(v) => lit(&mut bw, v),
+                Ev::Back(d, l) => backref(&mut bw, d, l),
+            }
+        }
+        bw.code(0, 7); // EOB (sym 256)
+        let deflate = bw.finish();
+
+        // ── Reference model in marker-u16 space ──────────────────────────
+        // distance > position ⇒ pre-init marker zone value RING_SIZE-(d-p)
+        // (width_ring.rs `init_marker_zone`); markers propagate via copies.
+        let mut expect: Vec<u16> = Vec::with_capacity(total);
+        for ev in &events {
+            match *ev {
+                Ev::Lit(v) => expect.push(v as u16),
+                Ev::Back(d, l) => {
+                    for _ in 0..l {
+                        let pp = expect.len();
+                        if d > pp {
+                            expect.push((RING_SIZE - (d - pp)) as u16);
+                        } else {
+                            let v = expect[pp - d];
+                            expect.push(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Decode window-absent from bit 0 (production speculative path) ─
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 64 * 1024 * 1024,
+            crc32_enabled: true,
+            ..Default::default()
+        };
+        let chunk = decode_chunk_window_absent(&deflate, 0, deflate.len() * 8, cfg)
+            .expect("window-absent decode");
+        // The drain routes output AFTER the last marker (120002) to
+        // `chunk.data` as clean u8; everything up to and including it stays
+        // in `data_with_markers` (the production split — the real chunk had
+        // marker_bytes = decoded - 1 for the same reason).
+        let dwm_len = chunk.data_with_markers.len();
+        assert_eq!(
+            dwm_len, 120_003,
+            "marker-mode output must cover through the last marker (no early flip)"
+        );
+        let mut mismatches = Vec::new();
+        for (i, &want) in expect.iter().enumerate().take(dwm_len) {
+            let got = chunk.data_with_markers.at(i);
+            if got != want {
+                mismatches.push((i, got, want));
+                if mismatches.len() > 8 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "u16 output mismatches (idx, got, want): {mismatches:?} — the back-ref \
+             word-copy rounding overshoot clobbered undrained output (mono-gnu9 P0)"
+        );
+        // Clean tail: the post-last-marker bytes, including the final
+        // 258-length back-ref's output.
+        let tail = chunk.data.to_contiguous();
+        assert_eq!(tail.len(), total - dwm_len, "clean-tail length");
+        for (k, &b) in tail.iter().enumerate() {
+            let want = expect[dwm_len + k];
+            assert!(want < 256, "tail must be clean in the reference model");
+            assert_eq!(
+                b,
+                want as u8,
+                "clean-tail byte {k} (logical {}) wrong",
+                dwm_len + k
+            );
+        }
+    }
+
     /// Force multiple deflate blocks (Sync flush every 32 KiB) so
     /// inexact-stop and END_OF_BLOCK probing tests have real boundaries.
     fn make_multi_block_deflate(payload: &[u8]) -> Vec<u8> {

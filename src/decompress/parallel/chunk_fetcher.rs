@@ -155,6 +155,30 @@ pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Counter incremented each time the consumer skips a CONFIRMED block
+/// (an entry whose start bit falls behind `furthest_decoded_bit`).
+/// COMPONENT RECORD-CORRECTION: `GzipBlockFinder` (gzip_block_finder.rs) is
+/// spacing/bookkeeping only and has NO scanner; confirmed entries enter it
+/// solely via `consumer_append_subchunks_vendor` insertions (and the
+/// test-only oracle pre-seed). The deflate-candidate scanner is the raw
+/// block finder (block_finder.rs), which can hand stored-payload false
+/// positives to trial decodes; a stale confirmed entry behind the frontier
+/// arises via subchunk insertion around such regions, not via any
+/// GzipBlockFinder scan (98fd618c's message attributed this to the wrong
+/// component).
+///
+/// Vendor divergence: rapidgzip's GzipChunkFetcher.hpp:411-427 throws a
+/// `std::logic_error` when `block_finder->get(next_unprocessed_block_index)`
+/// does not equal `blockOffsetAfterNext` after advancing the index.
+/// In gzippy the skip guard (removing `!block_is_confirmed &&`) handles this
+/// case silently and correctly — the confirmed false-positive is discarded
+/// rather than decoded.  This counter provides the same signal for
+/// diagnostics without aborting: a non-zero value means GzipBlockFinder
+/// produced at least one false-positive confirmed entry inside a stored
+/// block's raw payload.
+pub static STALE_CONFIRMED_BLOCK_SKIP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum FetchError {
@@ -963,6 +987,12 @@ fn drive_impl<W: std::io::Write>(
             SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
             SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
         );
+        // Out-of-sync confirmed-block skips (vendor GzipChunkFetcher.hpp:411-427
+        // throws std::logic_error; gzippy skips silently and counts here).
+        eprintln!(
+            "  Stale confirmed-block skips: {}",
+            STALE_CONFIRMED_BLOCK_SKIP.load(Ordering::Relaxed),
+        );
         // Early window publish: did the worker publish provably-clean
         // tail windows off the consumer's serial path (the lever)? A high
         // `published` count with `range_speculative` accounting for the
@@ -1252,9 +1282,17 @@ fn consumer_loop<W: std::io::Write>(
         }
 
         let block_is_confirmed = next_unprocessed_block_index < block_finder.size();
-        // A spacing guess behind already-emitted bytes is stale — the
-        // fast path jumped over this partition index in one chunk.
-        if !block_is_confirmed && next_block_offset < furthest_decoded_bit {
+        // Any block — confirmed or spacing-guess — whose start bit falls
+        // within already-decoded territory is stale: either a fast-path
+        // chunk consumed it as an intermediate subchunk (spacing guess)
+        // or subchunk insertion around a raw-finder (block_finder.rs)
+        // stored-payload false-positive region left a confirmed entry
+        // behind the frontier.  In both cases skip immediately.
+        // Invariant: a legitimate confirmed block is ALWAYS at or after
+        // furthest_decoded_bit when it reaches next_unprocessed_block_index,
+        // because consumer_append_subchunks_vendor's `inserted` count
+        // advances the index past every subchunk within the decoded chunk.
+        if next_block_offset < furthest_decoded_bit {
             next_unprocessed_block_index += 1;
             continue;
         }
@@ -1968,6 +2006,24 @@ fn consumer_loop<W: std::io::Write>(
                 unsplit_blocks,
             );
             next_unprocessed_block_index += inserted;
+            // Out-of-sync detection — vendor GzipChunkFetcher.hpp:411-427.
+            // rapidgzip throws std::logic_error when
+            //   block_finder->get(next_unprocessed_block_index) != blockOffsetAfterNext
+            // (where blockOffsetAfterNext = chunk.encoded_offset_bits + chunk.encoded_size_bits).
+            // gzippy diverges: the skip guard above handles confirmed false-positives
+            // silently rather than aborting.  Here we detect the out-of-sync condition
+            // and count it for diagnostics: a non-zero STALE_CONFIRMED_BLOCK_SKIP means
+            // a confirmed entry fell behind the decode frontier (subchunk
+            // insertion around a raw-finder false-positive region — NOT a
+            // GzipBlockFinder scan; that component has no scanner. See the
+            // record-correction note on STALE_CONFIRMED_BLOCK_SKIP and 98fd618c).
+            {
+                use std::sync::atomic::Ordering;
+                let (got_next, _) = block_finder.get(next_unprocessed_block_index);
+                if !block_finder.finalized() && got_next != Some(chunk_end_bit) {
+                    STALE_CONFIRMED_BLOCK_SKIP.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             pending.push_back(PendingWrite::Ready {
                 idx: partition_idx_for_trace,
                 chunk,
