@@ -1,3 +1,25 @@
+## ISA-L OVERHEAD HYPOTHESIS REFUTED (direct rdtsc) — model-isal residual UNNAMED; staging port + guards dispatched [2026-06-12]
+Probe (probe/isal-overhead 0460fcdf, sha/routing-asserted, FFI-surface instrumented): the "isal
+uses ~40% more CPU than rg's ISA-L on model" claim was an ESTIMATION ARTIFACT — direct rdtsc:
+isal_inflate kernel 2,128ms thread-summed vs rg's banked 2,064ms = small single-digit-% (CAVEAT:
+rg side is a banked figure from a different instrument — the 40% refutation is robust, the exact
+3% is not); wrapper 0.1%, CRC 1.4%, boundary 1.5%. FFI surface structurally vendor-identical
+(1 init + 1 set_dict 32KB + ~131 calls/chunk) EXCEPT ONE divergence: input staging — gzippy
+passes the whole remaining chunk as avail_in (avg 2,095KB, L3) vs rg's refillBuffer 128KB L2
+staging (isal.hpp:163-205). Causal: per-chunk decode IS on the T8 critical path (dict-site sleep
+slope 6.99 vs predicted 6.375 ms/ms, +/-10%). Worker's closing "gap = banked ~40% HoL" REJECTED —
+that finding is RETIRED; model-isal residual (~65ms/444 = 1.19x worst-best, NOT drift-band) is
+UNNAMED; the one model-specific lead = the 53ms dispatch-silence (chunk_fetcher.rs:1515 area) +
+pool-eff 86.3 vs 89.2. DISPATCHED (advisor-ordered): Worker A = faithful refillBuffer staging
+port SCOPED to the chunk clean-tail FFI site ONLY (T1 single-shot untouched — banked WIN surface,
+staging sign unknown there; separate commit if ever) + storedheavy nits (counter dump, demote
+unit fixture) + FOOTGUN GUARDS (BUILD_FLAVOR string in --version/GZIPPY_DEBUG from emitted cfgs;
+parity/measure-script hard assert on flavor; build.rs warning when neither product feature set) —
+fail-closed at the script layer is the actual strike-4 prevention. Cargo default-flip to
+pure-rust-inflate = separate PR after CI-lint-gate check. Worker B (after A): dispatch-silence
+probe, perturbation pre-registered. ANOMALY BANKED: --features isal-compression alone = silent
+legacy serial binary (no parallel_sm cfg) — cost 90min; build.rs comment says default stays []
+only due to parallel-module lint debt.
 ## STOREDHEAVY CLOSED + MERGED (c78f98b1) — routing demotion flips 1.53-1.60x LOSS to 0.50-0.65x WIN [2026-06-12]
 fix/stored-routing 36d04ca0 merged on advisor MERGE-NOW. The demotion (stored_split.rs:326-355,
 WalkEnd::HuffmanTail arm: prefix_out>0 && prefix_out*2 < expected_size => NotStoredDominated =>
@@ -32,7 +54,8 @@ NotStoredDominated => ParallelSM. MODEL/WEIGHTS ECONOMY (T8 captures + traces bo
 speculation is NOT the problem (96.2% accept, 51/51 flips, pool eff 86-89% ~ rg's 89); the cost
 is CLEAN-TAIL decode: native pure-Rust clean ~42% more CPU than rg's ISA-L (= engine-W, the
 funded track — model/weights native cells are ENGINE cells, not scheduling); isal's ISA-L usage
-~40% more CPU than rg's ISA-L on model (per-chunk overhead — isal model T8 1.192x is the
+~40% more CPU than rg's ISA-L on model [ESTIMATION ARTIFACT — REFUTED 2026-06-12 by direct rdtsc:
+kernel ~parity, see the ISA-L-overhead probe bank entry above] (isal model T8 1.192x is the
 remaining isal loss); weights isal T8/T16 = 1.030/1.025 NEAR-BAR. Pre-registered clean-tail
 perturbation design banked in the worker report (GZIPPY_SLOW_CLEAN_PCTL + skip-oracle ceiling).
 FULL matrix rows updated in the branch file. NEXT: (a) storedheavy routing fix [dispatched,
