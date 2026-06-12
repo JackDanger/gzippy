@@ -1,3 +1,25 @@
+## P0 FIX GATED: VERIFY-THEN-MERGE as hardening — but the P0 SURVIVES (distinct 1-byte bug, reproducer banked) [2026-06-12]
+Fable advisor BUILT both commits and empirically refuted the fix-closes-P0 claim: a GNU gzip 1.14
+-9 stream of the same monorepo.tar (/tmp/mono-gnu9.tar.gz, sha 5f6cc8ee..78e8c71, preserved local
+with /tmp/monorepo.tar + trace /tmp/sm-gnu9.log) STILL CRC-fails T>1 both builds IDENTICALLY pre/
+post-fix: deterministic ONE-BYTE corruption (offset 35335338, got 'L' want '.'), same stored-flip
+case1-ge-window 51542 signature, NO_STORED_FLIP no effect, all 9 speculative accepts exact-offset
+(not the acceptance-range path). THE LIVE P0 = a pre-existing 1-byte marker/window resolution bug
+on stored-bearing data. The 98fd618c skip-guard change itself is SAFE hardening (verified: only
+decoded-subchunk ends are confirmed-inserted (:3122/:3125) => confirmed entries never lead the
+frontier; skip drops only redundant work, emission contiguous from 0; BGZF/StoredParallel don't
+route here) but its commit narrative is FALSE (no "GzipBlockFinder raw scan" exists — the phantom-
+confirm mechanism is undemonstrated) and its test PASSES ON THE PARENT (240KiB fixture = single
+chunk < MIN_ADJUSTED_CHUNK_BYTES 512KiB — the skip path never fires). VENDOR: rg cannot need this
+skip — guesses strictly past last confirmed (GzipBlockFinder.hpp:286) and it ASSERTS out-of-sync
+("Next block offset index is out of sync!", appendSubchunksToIndexes) — the skip is a DIVERGENCE
+(silent-resync vs fail-loud) to document, with rg's out-of-sync check as the faithful complement.
+ALSO FLAGGED (own falsifier owed later): acceptance-range divergence — gzippy claims
+[partition_seed, decode_start] (:3686-3688) vs vendor candidate-pair-only (GzipChunk.hpp:721-722);
+exonerated by trace on THIS artifact. MERGE CHECKLIST (dispatched): amend message/test-doc; add
+rg's out-of-sync debug counter (:1977); true pre-fix-failing fixture or relabel smoke; guest grid
+with the BANKED artifact both builds; THEN merge + hunt the live 1-byte bug with the local
+reproducer. P0 REMAINS OPEN.
 ## ISAL COLUMN RERUN (correct build) — F1/F2/F3 ALL PASS; gz-isal wins T1 on EVERY corpus; 32W/9L vs rg [2026-06-12]
 Rebuild verified BEFORE measuring (path=ParallelSM @T8, path=IsalSingleShot @T1 — the asserts the
 voided session skipped). All three pre-registered falsifiers PASSED: F1 silesia T8 gz 340 vs rg
