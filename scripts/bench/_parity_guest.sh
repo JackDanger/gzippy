@@ -260,10 +260,53 @@ else
 fi
 
 # rapidgzip presence (the comparison target).
-RG_CMD=""
-if command -v "$RG" >/dev/null 2>&1; then RG_CMD="$RG"
-elif [ -n "$RG_TRACE" ] && [ -x "$RG_TRACE" ]; then RG_CMD="$RG_TRACE"
-else fail "no-rapidgzip (not in PATH and RG_TRACE absent) — cannot measure parity" 12; fi
+# RESOLUTION ORDER (all variables from guest.env / parity.sh remote_env):
+#   1. $RG_BIN  — pinned native ELF (the HONEST bar; startup ~3ms).
+#      SHA-verified on startup; WARN if absent / sha-drift (fall through to $RG).
+#   2. $RG      — fallback (historically resolved lazily via `which`; may be the
+#      pip wheel at ~48ms startup — a WARN is emitted).
+#   3. $RG_TRACE — last resort for oracle drivers; NOT the parity comparator.
+# The startup-cost self-check (--version wall < 15ms) is the wheel-suspect guard:
+#   < 15ms => native ELF (3-4ms measured); >= 15ms => WARN wheel-suspect.
+RG_BIN="${RG_BIN:-}"
+RG_BIN_SHA="${RG_BIN_SHA:-}"
+RG_WHEEL_BIN="${RG_WHEEL_BIN:-}"
+RG_CMD=""; rg_label=""
+
+# Try the pinned native binary first.
+if [ -n "$RG_BIN" ] && [ -x "$RG_BIN" ]; then
+  if [ -n "$RG_BIN_SHA" ]; then
+    _actual_sha="$(sha256sum "$RG_BIN" | cut -d' ' -f1)"
+    if [ "$_actual_sha" != "$RG_BIN_SHA" ]; then
+      echo "## WARN: RG_BIN sha mismatch (expected=$RG_BIN_SHA actual=$_actual_sha) — falling back to \$RG"
+    else
+      RG_CMD="$RG_BIN"; rg_label="native-elf"
+    fi
+  else
+    RG_CMD="$RG_BIN"; rg_label="native-elf(no-sha-pin)"
+  fi
+fi
+# Fall back to $RG (may be pip wheel).
+if [ -z "$RG_CMD" ]; then
+  if command -v "$RG" >/dev/null 2>&1; then
+    RG_CMD="$RG"; rg_label="path-resolved"
+  elif [ -n "$RG_TRACE" ] && [ -x "$RG_TRACE" ]; then
+    RG_CMD="$RG_TRACE"; rg_label="trace-fallback"
+  else
+    fail "no-rapidgzip (RG_BIN absent/sha-drift, \$RG not in PATH, RG_TRACE absent) — cannot measure parity" 12
+  fi
+fi
+# Startup-cost self-check: measure --version wall; warn if >= 15ms (wheel-suspect).
+_rg_t0="$(date +%s.%N)"
+"$RG_CMD" --version >/dev/null 2>&1 || true
+_rg_t1="$(date +%s.%N)"
+_rg_ver_ms="$(awk -v a="$_rg_t0" -v b="$_rg_t1" 'BEGIN{printf "%.0f", (b-a)*1000}')"
+if awk -v ms="$_rg_ver_ms" 'BEGIN{exit (ms+0 >= 15) ? 0 : 1}'; then
+  echo "## WARN: rapidgzip --version wall=${_rg_ver_ms}ms >= 15ms => wheel-suspect; rg times are inflated by ~43ms startup tax. Set RG_BIN to the native ELF."
+  rg_label="${rg_label}(WHEEL-SUSPECT:${_rg_ver_ms}ms)"
+else
+  echo "## rapidgzip startup-cost OK: --version wall=${_rg_ver_ms}ms < 15ms => native ELF confirmed (label=${rg_label})."
+fi
 
 # NOTE: parity.sh rsyncs with --exclude '.git/', so a guest-side `git rev-parse`
 # would read a STALE clone hash, not the synced working tree — it does NOT describe
@@ -279,7 +322,7 @@ if [ -n "$GZIPPY_BIN2" ]; then
   echo "binary2=$GZIPPY_BIN2 feature2=$FEATURE2 bin2_sha=$BIN2_SHA mtime=$(date -r "$GZIPPY_BIN2" '+%F %T' 2>/dev/null || echo NA)  <- second binary identity"
 fi
 echo "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
-echo "rapidgzip=$("$RG_CMD" --version 2>&1 | head -1)"
+echo "rapidgzip=$("$RG_CMD" --version 2>&1 | head -1) [${rg_label}] path=$RG_CMD"
 echo "governor=$ACT_GOV no_turbo=$ACT_TURBO affinity=$ACT_AFFIN runnable_avg=${RUN_AVG:-NA} loadavg1=$LOAD1 host_frozen=$HOST_FROZEN"
 echo "=================================================="
 
