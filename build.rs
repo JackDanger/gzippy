@@ -122,6 +122,33 @@ fn emit_parallel_sm_cfgs() {
     if isal_clean_tail {
         println!("cargo::rustc-cfg=isal_clean_tail");
     }
+
+    // BUILD_FLAVOR: compile-time &'static str consumed by `env!("BUILD_FLAVOR")`.
+    //   "parallel-sm+isal"  — parallel_sm + isal_clean_tail (gzippy-isal, the
+    //                         faithful WITH_ISAL rapidgzip port, x86_64 only).
+    //   "parallel-sm+pure"  — parallel_sm only (gzippy-native or pure-rust-inflate,
+    //                         pure-Rust DEFLATE engine, x86_64 + aarch64).
+    //   "legacy-serial"     — no parallel_sm (default features / no-feature build:
+    //                         the serial libdeflate/ISA-L one-shot path). This is
+    //                         NOT the product — the product uses gzippy-isal or
+    //                         gzippy-native. A `cargo::warning` is emitted below.
+    let flavor = if isal_clean_tail {
+        "parallel-sm+isal"
+    } else if parallel_sm {
+        "parallel-sm+pure"
+    } else {
+        "legacy-serial"
+    };
+    println!("cargo::rustc-env=BUILD_FLAVOR={flavor}");
+
+    if !parallel_sm {
+        println!(
+            "cargo::warning=building the legacy serial binary (no parallel_sm) — \
+             this is NOT the product binary. \
+             Use `--no-default-features --features gzippy-isal` (x86_64) or \
+             `--no-default-features --features gzippy-native` for the product build."
+        );
+    }
 }
 
 fn build_zopfli_oracle() {
