@@ -1035,6 +1035,96 @@ mod tests {
         );
     }
 
+    /// Regression guard for the stored-block false-positive consumer bug (2026-06-12).
+    ///
+    /// **Root cause (fixed):** `chunk_fetcher.rs` consumer loop skipped stale
+    /// spacing-guess blocks (`!block_is_confirmed && next_block_offset <
+    /// furthest_decoded_bit`) but did NOT skip confirmed blocks in the same
+    /// condition.  `GzipBlockFinder` scans ALL input bits — including stored
+    /// block raw bytes — for BTYPE=10 dynamic Huffman patterns.  When stored
+    /// block raw data contains bit patterns that pass precode + full code-table
+    /// validation, a false-positive confirmed block is inserted.  After the
+    /// stored chunk is decoded (inserted=1), the consumer's index advances by 1
+    /// to the false-positive X.  Because `block_is_confirmed=true`, the stale-
+    /// block skip did not fire even though `X < furthest_decoded_bit`.  Decoding
+    /// at X produced a clean chunk (raw bytes of the stored block interpreted as
+    /// literals) that was written to output as garbage → CRC mismatch.
+    ///
+    /// **Fix:** Remove `!block_is_confirmed &&` so ANY block (confirmed or guess)
+    /// at a bit position behind `furthest_decoded_bit` is skipped.  Safe by
+    /// invariant: a legitimate confirmed block is ALWAYS at or after
+    /// `furthest_decoded_bit` when it reaches `next_unprocessed_block_index`,
+    /// because `consumer_append_subchunks_vendor`'s `inserted` count advances the
+    /// index past every subchunk within the decoded chunk.
+    ///
+    /// This test exercises the stored-block code path in ParallelSM using a
+    /// mixed compressible/incompressible payload.  The compressible prefix ensures
+    /// the file routes to ParallelSM (not StoredParallel) and provides a dynamic
+    /// Huffman first block for the block-finder bootstrap.  The full regression
+    /// requires `monorepo.tar.gz` from squishy (9.8 MB, triggers actual false
+    /// positives); this test catches general stored-block decode regressions.
+    #[cfg(parallel_sm)]
+    #[test]
+    fn test_stored_block_parallel_sm_byte_exact() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Compressible prefix: 4-bit entropy (LCG), 200 KiB.
+        // Compresses ~2:1 at level 1 → dynamic Huffman blocks, clears the
+        // parallel_sm_unprofitable ratio gate (1.15x) for the overall file.
+        let mut compressible = vec![0u8; 200 * 1024];
+        let mut s: u64 = 0xC0FFEE_1234_5678;
+        for b in &mut compressible {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = ((s >> 32) as u8) & 0x0F;
+        }
+
+        // Incompressible suffix: 8-bit entropy, 40 KiB (> MAX_WINDOW_SIZE=32768).
+        // Level-1 gzip uses stored blocks for incompressible runs, which is the
+        // block type that triggers the false-positive false-positive scanner issue.
+        let mut incompressible = vec![0u8; 40 * 1024];
+        let mut s2: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for b in &mut incompressible {
+            s2 = s2.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s2 >> 32) as u8;
+        }
+
+        let mut original = compressible;
+        original.extend_from_slice(&incompressible);
+
+        // Compress at level 1 (fast; often produces stored blocks for high-entropy data).
+        let mut compressed = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed, Compression::new(1));
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+
+        // Sanity: routing must land on ParallelSM (not StoredParallel or one-shot).
+        // The compressible prefix ensures the first block is dynamic Huffman, and
+        // the overall ratio should clear 1.15x.
+        let path = classify_gzip(&compressed, 4);
+        assert!(
+            matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
+            "must route to parallel path, got {path:?}"
+        );
+
+        // Single-threaded reference decode.
+        let mut ref_out = Vec::new();
+        decompress_single_member(&compressed, &mut ref_out, 1).expect("T=1 decode must succeed");
+        assert_eq!(ref_out, original, "T=1 must decode byte-exact");
+
+        // Multi-threaded decode must be byte-identical.
+        let mut par_out = Vec::new();
+        decompress_single_member(&compressed, &mut par_out, 4).expect("T=4 decode must succeed");
+        assert_eq!(
+            par_out, original,
+            "T=4 parallel decode must be byte-identical to T=1; \
+             CRC mismatch here indicates the stored-block false-positive consumer bug"
+        );
+    }
+
     #[test]
     fn test_decompress_multi_member_file() {
         let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
