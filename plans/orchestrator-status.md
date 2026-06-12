@@ -1,3 +1,23 @@
+## VOLUME AUDIT (analytical, PROVISIONAL): volume ~parity => RATE owns the 1.54x — and NOT the marker loop [2026-06-12]
+probe/decode-volume (c2ba564: adds the one missing counter ISAL_ENGINE_ORACLE_BYTES + a
+VOLUME-AUDIT verbose line; live guest run BLOCKED — the worker's network position lost neurotic;
+live verification moves to solvency post-provisioning). ANALYTICAL DISCRIMINATOR from banked
+counters: both tools push ~284MB through inflate engines on silesia (73MB marker-mode + ~210MB
+ISA-L; the 32KiB-flip architecture is shared; spec-fail discards <5MB; apply_window is
+substitution not re-decode) => gz/rg ENGINE-VOLUME ~1.0 => the 1.54x thread-summed excess is
+RATE on equal volume. SHARPER: the marker phase is where gz is FASTER (226-269MB/s vs rg custom
+~153MB/s, ~0.3s vs ~0.48s) and the pure-Rust clean loop sees only ~1.5MB on the isal build =>
+the excess must sit in the ISA-L-path per-chunk/wrapper/pipeline term (DIS-14's T1 residual
+0.903x class) — TENSION to resolve: the model FFI-surface probe measured wrapper at ~0.1-2%
+(but on MODEL; silesia never got the FFI-surface ledger at the native bar). ALL PROVISIONAL
+until the live VOLUME-AUDIT line + a silesia per-phase cycles/byte ledger run — ON SOLVENCY,
+where bare-metal perf can count retired instructions per phase directly (the better instrument).
+GZIPPY_SLOW_MODE caveat banked: on the isal build it perturbs only the ~1.5MB pure-Rust clean
+slice — flat results there say nothing about the ISA-L path. MIGRATION: bench host moving to
+solvency root@192.168.7.222 (user-directed; AMD EPYC 7282 Zen 2 bare metal, full perf+IBS;
+provisioning in flight; Zen-2 PEXT/PDEP-microcoded caveat for the asm kernel; all banked
+absolutes are i7-specific — re-baseline owed; neurotic = legacy, reachable from supervisor shell
+but not from some worker network positions — anomaly noted).
 ## CPU GATE DIES — rg measured natively on 3 binaries: gz pays 1.5-1.7x rg's decode CPU; ENGINE-W IS THE LEVER (quantified) [2026-06-12]
 Wall-conversion gate (probe/wall-conversion f9754052 gated; advisor re-measured rg itself, frozen,
 17 sha-verified runs, 3 rg binaries AGREE): rg silesia-T8 truth = wall_min 280ms (pin stream),
