@@ -1,3 +1,17 @@
+## HUNT WORKER'S "P0 CLOSED" VOIDED — supervisor re-ran the real reproducer: STILL FAILS; artifact-confusion strike 3 [2026-06-12]
+The hunt worker declared the P0 closed by 98fd618c — but its sanity line tested
+/tmp/monorepo.tar.gz (9,822,456 B = the APPLE-gzip stream, which the gate already proved 98fd618c
+fixes) NOT the preserved reproducer /tmp/mono-gnu9.tar.gz (9,819,846 B, sha 5f6cc8ee — GNU gzip
+1.14 -9). SUPERVISOR RECONCILED FIRST-HAND: fix build at -p 4 on mono-gnu9 => RC=1 CRC mismatch,
+the IDENTICAL one byte (offset 35335338, 0x4C vs 0x2E). The gate's result stands; the worker's
+verdict is VOID. THIRD artifact-confusion incident (native-as-isal, default-as-isal, apple-as-gnu)
+=> NEW BRIEF RULE: step 0 of any reproducer work = print + assert the input sha256; analysis on
+any other artifact is void by construction. STATE: 98fd618c fixes the APPLE-stream/banked-class
+failure (false-positive confirmed block decoded as garbage — its data_with_markers[890657]=0x4C
+probe evidence is real FOR THAT STREAM) and stays VERIFY-THEN-MERGE; the GNU-stream 1-byte bug is
+a DISTINCT mechanism (all accepts exact-offset; skip-guard irrelevant) and the P0 REMAINS OPEN.
+Worker's Part-B out-of-sync counter (STALE_CONFIRMED_BLOCK_SKIP, vendor-faithful position) is
+UNCOMMITTED in /tmp/gz-crc — salvage it in the next pass.
 ## P0 FIX GATED: VERIFY-THEN-MERGE as hardening — but the P0 SURVIVES (distinct 1-byte bug, reproducer banked) [2026-06-12]
 Fable advisor BUILT both commits and empirically refuted the fix-closes-P0 claim: a GNU gzip 1.14
 -9 stream of the same monorepo.tar (/tmp/mono-gnu9.tar.gz, sha 5f6cc8ee..78e8c71, preserved local
