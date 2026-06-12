@@ -1,3 +1,33 @@
+## SOLVENCY TRUTH TABLE v1 BANKED — first DIRECT instruction counts: BOTH builds retire ~1.55x rg's instructions [2026-06-12]
+infra/solvency 9a780784 (plans/solvency-truth-v1.md on the box; canonical 19-file Squishy set
+freshly pinned, encoder gzip 1.12 -9, manifest in the doc). N=7/5 frozen interleaved, sha-OK,
+strike-5 clean, native rg comparator (5ms). FRAMING (advisor-fixed): (1) T1 isal 20/20 PASS is
+the PRODUCT-TODAY scoreboard; the GOAL-STATE (pure-Rust sole path) T1 column is native = 2/20 —
+carry BOTH, never quote "T1 solved". (2) Under the binding bar (>=0.99 at EVERY T): ZERO corpora
+pass. (3) T8: isal 3/20, native 2/20 (tiny files); silesia 0.720/0.796; markup.xml 0.373 (2MB
+file, full 8-thread spin-up — rg small-file mechanism UNVERIFIED, recon dispatched). (4) native >
+isal at T8 on Zen 2 (0.299 vs 0.330) = SUBSTRATE-SPECIFIC candidate (ISA-L kernels lean on
+PEXT/PDEP, microcoded on Zen 2; isal IPC 1.773 vs native 1.886) — do not generalize.
+THE HEADLINE: perf stat silesia T8 — gz-isal 7.709B insn / gz-native 7.611B / rg 4.897B = +2.8B
+excess (~13 insn/output-byte), BOTH builds ~1.55x, gz IPC BETTER than rg (spin-loop signature
+candidate!). Cross-substrate replication of the i7 1.5-1.7x rate verdict (ratio replicated;
+mechanism not yet). BUILD-IDENTICAL COUNTS (7.7 vs 7.6B with the clean engine swapped on ~210MB):
+either the engines retire within ~0.5 insn/byte of each other OR isal routing is mislabeled —
+STEP-0 DISCRIMINATOR OWED (VOLUME-AUDIT counters + perf stat same invocation, both builds) before
+the shared-machinery implication banks. Arithmetic pre-kill: memcpy-excess CANNOT explain 2.8B
+(~0.03 insn/byte); live suspects = scalar per-byte loops (marker flip/window substitution),
+per-symbol overhead (~50 insn x ~55M symbols), or BUSY-SPIN (IPC signature). CPU silesia T8:
+1.56/1.45/1.04s; RSS 320/296/228MB (+40%, marker-ring/u16 suspects).
+DISPATCHED: (1) perf-record instruction-diff on solvency — fp call-graphs (NO LBR on Zen 2;
+force-frame-pointers rebuild + self-test within spread), sample instructions:u fixed period,
+user/kernel split FIRST (RSS excess may be kernel page-faults), symbolized rg rebuilt and
+verified-equal to the pinned comparator, interleaved+sha-verified records, accounting closure
+~15%, two-build filter (similar-self-count = shared suspect) + spin-symbol tagging,
+PRE-REGISTERED: ">=60% of the +2.8B sits in build-shared functions" (falsified if build-divergent
+concentrates), output = RANKED CONVERGENCE LIST, hypothesis-generator only — each top entry gets
+a perturbation or delete-divergent port before banking. (2) markup.xml vendor recon (read-only:
+rg's small-input clamp mechanism, file:line; NO code change before the vendor counterpart is
+named).
 ## VOLUME AUDIT (analytical, PROVISIONAL): volume ~parity => RATE owns the 1.54x — and NOT the marker loop [2026-06-12]
 probe/decode-volume (c2ba564: adds the one missing counter ISAL_ENGINE_ORACLE_BYTES + a
 VOLUME-AUDIT verbose line; live guest run BLOCKED — the worker's network position lost neurotic;
