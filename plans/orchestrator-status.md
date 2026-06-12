@@ -1,3 +1,25 @@
+## RE-MEASURE BANKED (advisor-gated): silesia T4 0.912x / bignasa T8 0.975x; 410ms = corpus confusion; publish-thread claim REFUTED [2026-06-11]
+probe/remeasure-baselines (d87c205d). (1) FULLY-HONEST BASELINES (frozen, interleaved N>=9,
+both-arms-file-sink, sha-OK, canonical masks) SUPERSEDE the matrix rows: silesia T4 isal gz ~556 vs
+rg ~506 = 0.912x LOSS; bignasa T8 isal gz ~1094 vs rg ~1063 = 0.975x LOSS — IMPROVED from banked
+0.918-0.940 (today's merges) but below bar; PROVISIONAL pending N>=15 (2.5% margin); rg absolute
+drifted 1021->1063 between sessions (box-state flag; interleaved ratios stand). (2) The sched
+worker's "bignasa ~410ms / CLOSED 1.018x" = CORPUS CONFUSION (a silesia number mislabeled bignasa,
+likely native build); its own binary re-runs honestly at 957ms single-shot sha-OK — claim fully
+retired. (3) GZIPPY_PUBLISH_TID_STATS (DUAL-SHA pass): publishes consumer/worker = 61/0 silesia T4,
+51/0 bignasa T8 — the "11/17 worker-thread publishes" claim REFUTED; gzippy already faithful;
+consumer-publish port MOOT. (4) Worker's "two drive() impls both fire stats" attribution is FALSE —
+cfg prod/stub pair (parallel_sm vs not(parallel_sm)), mutually exclusive; note only.
+NEXT (advisor-amended order): (a)+(c) ONE frozen session — FULL consumer serial-tail decomposition
+on silesia T4 from existing trace_v2 LEAF spans (self-time, busy+idle==span; leaves:
+window_publish_clean :1747, publish_windows :3994, dispatch_post_process :1898, block_finder_get
+:1241, try_take_prefetched :1422, drain :3942, writev :4028, combine_crc :4115) with an
+OVERLAPPED-vs-TRULY-SERIAL split (fulcrum flow), PLUS bignasa T8 N>=15 hardening. PRE-REGISTERED
+(b)-rule in spread units: S(truly-serial) < sigma => serial tail not the binder, route engine-W, NO
+oracle; S > max(sigma, 0.4*G) => authorize the corrected pipelined-drain overlap oracle (prereg
+RESOLUTION #2, F1<=1.01x / F2>=1.05x / F3 between); else supervisor decides. (d) model 0.857 gets
+its OWN decomposition later (model-specific dispatch-silence, chunk_fetcher.rs:1515 — do not presume
+shared mechanism). Engine-W remains the funded separate track.
 ## SCHED-PHASE0 GATED — headline DISCARDED at vendor source; HoL RETIRED; consumer publish+dispatch partially causal [2026-06-11]
 Worker (probe/sched-phase0, 5cfb334, /tmp/gz-sched0 — byte-transparent knobs only) reported a big
 headline; advisor gate (verified in BOTH sources) split it:
