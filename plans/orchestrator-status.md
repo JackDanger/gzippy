@@ -1,3 +1,22 @@
+## STAGING+GUARDS MERGED (a53c53e0) — refill staging TIE-KEEP; flavor guards live; fd_vectored hang = PRE-EXISTING env [2026-06-12]
+fix/isal-refill-staging merged on gate PASS. (1) refillBuffer 128KiB staging port (isal.hpp:163-205,
+chunk clean-tail site only, T1 single-shot untouched): DUAL-SHA exact, falsifier TIE (435 vs 434ms
+best-of-7) => TIE-KEEP per rule 7 (the last named FFI-surface divergence is now closed). (2)
+STORED_DEMOTE counter dumped in VERBOSE + unit fixture pins the <50% demote gate. (3) FOOTGUN
+GUARDS LIVE: BUILD_FLAVOR in --version + first GZIPPY_DEBUG line; build.rs warning on
+legacy-serial; _parity_guest.sh HARD-FAILS before timing on flavor mismatch (demonstrated both
+directions). (4) AUDIT BANKED: release.yml ships LEGACY-SERIAL binaries for ALL targets today
+(isal-compression does not set parallel_sm — build.rs:94); ci.yml/benchmarks.yml same; Cargo
+default-flip BLOCKED by 8 pre-existing raw-pointer clippy errors + 45 warnings in the parallel
+module => release-correction PR = explicit per-target features NOW (x86_64: gzippy-isal; arm64:
+pure-rust-inflate — gate measured arm64 parallel 2x FASTER than legacy at default-T on
+compressible, banked 16x pathology does NOT manifest, StoredParallel catches it; forced-T1 1.85x
+slower = pre-existing classifier policy), lint-debt cleanup + default-flip deferred. SUITE-HANG
+DISCRIMINATED: all 8 fd_vectored_write (pipe/vmsplice) tests hang IDENTICALLY on base AND branch
+on the guest => PRE-EXISTING environment change (these passed green days ago — box state changed,
+possibly post-outage; ENV WATCH-ITEM, not a code defect; also killed a 20-HOUR deadlocked
+gzippy-bar2 test binary squatting since a stale session). NEXT: Worker B dispatch-silence probe
+(model-isal residual); release-correction PR (user-visible — confirm before tagging).
 ## ISA-L OVERHEAD HYPOTHESIS REFUTED (direct rdtsc) — model-isal residual UNNAMED; staging port + guards dispatched [2026-06-12]
 Probe (probe/isal-overhead 0460fcdf, sha/routing-asserted, FFI-surface instrumented): the "isal
 uses ~40% more CPU than rg's ISA-L on model" claim was an ESTIMATION ARTIFACT — direct rdtsc:
