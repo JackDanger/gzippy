@@ -1,3 +1,21 @@
+## BOOTSTRAP CRITICAL ON MODEL-ISAL T8 (first marker-loop criticality CONFIRMED) — inc-1 = N2-N5 Rust ladder [2026-06-12]
+probe/bootstrap-isal (054db213) gated. POSITIVE CONTROL: the isal build runs the bootstrap
+(header 3.8ms/2% + BODY 155ms/98% thread-summed, 7.68MB at 50MB/s — 155 not 270: keepIndex
+deleted per-backref sparsity tracking INSIDE the body; footnote not load-bearing). PERTURBATION:
+sleep-surviving +254ms at 15.9x inject, proportional 2.10 (spin 5.7x-inflated = core-blocking
+structural artifact, correctly discarded) => the FIRST cell where marker-loop criticality is
+CONFIRMED (coexists with the bignasa/silesia refutations — different slack structure; no
+contradiction). CEILING: ~16-19ms SLOPE-EXTRAPOLATED of a 63ms-this-session/49ms-banked gap
+(~15ms denominator drift band). WORKER ERROR CORRECTED AT GATE: "native T4 ABSENT (generalizes
+from T1)" is WRONG — T1's mechanism is the zero-thread inline pool (T1-only); native T8 routes
+~75M/211.9M bytes window-absent (asm-campaign §9) => native T4+ = OPEN. Matrix corrections
+appended to engine-w-refresh.md (0b054ef5). INC-1 RULING: (i) N2-N5 Rust ladder on the marker
+fast loop [DISPATCHED — F-w1: ship >=2%, TIE=>keep-if-byte-exact + bank body-rate counter; rate
+>=1.5x w/ flat wall => slope-ceiling falsified, bootstrap track CLOSES]; (ii) bootstrap asm
+DEFERRED (rung-d entry conditions; realistic increment single-digit ms); (iii) PARALLEL ledger
+pass on the UNNAMED ~47ms residual [DISPATCHED — first action: commit the uncommitted
+/tmp/gz-combined instrument tree; refresh decodeBlock ledger post-keepIndex; attribution-only
+pending perturbation]. Box serialized; builds/gauntlets are not.
 ## ENGINE-W INC-0: bootstrap STRUCTURALLY ABSENT at native T1 — inc-1 dead there; 270ms re-attributed to ISAL build [2026-06-12]
 probe/engine-inc0 (2 commits; GZIPPY_SLOW_BOOTSTRAP knob built, per-byte in marker_decode_step_loop,
 DUAL-SHA). FLAT BY CONSTRUCTION at native T1: the bootstrap path receives ZERO bytes on all 5
