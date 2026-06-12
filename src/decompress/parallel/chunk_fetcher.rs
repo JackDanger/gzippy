@@ -1252,9 +1252,16 @@ fn consumer_loop<W: std::io::Write>(
         }
 
         let block_is_confirmed = next_unprocessed_block_index < block_finder.size();
-        // A spacing guess behind already-emitted bytes is stale — the
-        // fast path jumped over this partition index in one chunk.
-        if !block_is_confirmed && next_block_offset < furthest_decoded_bit {
+        // Any block — confirmed or spacing-guess — whose start bit falls
+        // within already-decoded territory is stale: either a fast-path
+        // chunk consumed it as an intermediate subchunk (spacing guess)
+        // or the block_finder identified a false-positive inside a stored
+        // block's raw bytes (confirmed).  In both cases skip immediately.
+        // Invariant: a legitimate confirmed block is ALWAYS at or after
+        // furthest_decoded_bit when it reaches next_unprocessed_block_index,
+        // because consumer_append_subchunks_vendor's `inserted` count
+        // advances the index past every subchunk within the decoded chunk.
+        if next_block_offset < furthest_decoded_bit {
             next_unprocessed_block_index += 1;
             continue;
         }
