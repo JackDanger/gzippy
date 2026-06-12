@@ -784,6 +784,46 @@ fn partition_runs(runs: &[StoredRun], total: usize, threads: usize) -> Vec<std::
 mod tests {
     use super::*;
 
+    /// Build a gzip with `stored_data` as STORED deflate blocks (not BFINAL) followed
+    /// by `huffman_data` compressed with flate2 dynamic Huffman (BFINAL on last block).
+    /// Produces a valid gzip where the stored prefix is < 100% of total output — the
+    /// fixture shape needed to exercise the demotion gate.
+    fn gzip_stored_prefix_then_huffman(stored_data: &[u8], huffman_data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut full_payload = Vec::with_capacity(stored_data.len() + huffman_data.len());
+        full_payload.extend_from_slice(stored_data);
+        full_payload.extend_from_slice(huffman_data);
+        let crc = crc32(&full_payload);
+        let isize_val = full_payload.len() as u32;
+
+        let mut deflate = Vec::new();
+        // Non-final stored blocks for the prefix.
+        let block_size = 65535usize;
+        let mut off = 0;
+        while off < stored_data.len() {
+            let end = (off + block_size).min(stored_data.len());
+            let chunk = &stored_data[off..end];
+            deflate.push(0x00); // bfinal=0, btype=00
+            let len = chunk.len() as u16;
+            deflate.extend_from_slice(&len.to_le_bytes());
+            deflate.extend_from_slice(&(!len).to_le_bytes());
+            deflate.extend_from_slice(chunk);
+            off = end;
+        }
+        // Dynamic Huffman tail via flate2 raw deflate (BFINAL on last block).
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(huffman_data).unwrap();
+        let tail = enc.finish().unwrap();
+        deflate.extend_from_slice(&tail);
+
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        gz.extend_from_slice(&deflate);
+        gz.extend_from_slice(&crc.to_le_bytes());
+        gz.extend_from_slice(&isize_val.to_le_bytes());
+        gz
+    }
+
     /// Build a gzip stream of `payload` forced into STORED blocks of size
     /// `block` by re-framing flate2's stored output is fiddly; instead we
     /// hand-build the gzip envelope around stored deflate blocks directly.
@@ -1028,5 +1068,51 @@ mod tests {
         decompress_stored_parallel(&gz, &mut out, 8).expect("decode");
         assert_eq!(out, payload);
         assert_eq!(out, oracle);
+    }
+
+    /// Demotion gate: a stored prefix that is < 50% of total output must fire
+    /// `STORED_DEMOTE_TO_PARALLEL_SM` and return `NotStoredDominated`.
+    ///
+    /// Fixture: 40 KiB pseudo-random (→ stored blocks) + 60 KiB zeros (→ Huffman).
+    /// stored_fraction = 40_000 / 100_000 = 40% < 50% → demotion gate fires.
+    ///
+    /// Existing fixtures for context:
+    ///   `stored_prefix_then_huffman_tail`: 1.5 MB stored + 1 MB tail = 60% stored
+    ///     (above 50% threshold → NOT demoted, decodes normally).
+    ///   `huffman_first_block`: 0% stored → NotStoredDominated for a different reason.
+    #[test]
+    fn stored_prefix_below_50pct_demotes_to_parallel_sm() {
+        // 40 KiB pseudo-random stored prefix.
+        let stored_size = 40_000usize;
+        let mut stored_data = vec![0u8; stored_size];
+        let mut rng = 0xdead_beef_cafe_0123u64;
+        for b in &mut stored_data {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (rng >> 33) as u8;
+        }
+        // 60 KiB zeros → flate2 level 6 emits dynamic-Huffman blocks (highly compressible).
+        let huffman_size = 60_000usize;
+        let huffman_data = vec![0u8; huffman_size];
+
+        let gz = gzip_stored_prefix_then_huffman(&stored_data, &huffman_data);
+
+        // Sanity: the first deflate block must be stored (btype=00).
+        assert!(
+            first_block_is_stored(&gz),
+            "fixture must start with a stored block"
+        );
+
+        // The stored prefix (40_000) * 2 = 80_000 < total (100_000) → demotion gate.
+        // expected_size / 2 = 50_000; prefix_out (40_000) < 50_000 → DEMOTE.
+        let mut out = Vec::new();
+        match decompress_stored_parallel(&gz, &mut out, 4) {
+            Err(StoredSplitError::NotStoredDominated) => {} // gate fired correctly
+            other => panic!(
+                "expected NotStoredDominated (demotion gate, prefix={stored_size} < total/2={}), got {other:?}",
+                (stored_size + huffman_size) / 2
+            ),
+        }
+        // No partial output on NotStoredDominated.
+        assert!(out.is_empty(), "must not write partial output on demotion");
     }
 }
