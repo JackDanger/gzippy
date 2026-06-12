@@ -1,3 +1,23 @@
+## ENGINE-W INC-0: bootstrap STRUCTURALLY ABSENT at native T1 — inc-1 dead there; 270ms re-attributed to ISAL build [2026-06-12]
+probe/engine-inc0 (2 commits; GZIPPY_SLOW_BOOTSTRAP knob built, per-byte in marker_decode_step_loop,
+DUAL-SHA). FLAT BY CONSTRUCTION at native T1: the bootstrap path receives ZERO bytes on all 5
+corpora — advisor STRENGTHENED the mechanism (worker's stored-preamble story WRONG): chunk 0 gets
+a stack zero-window (chunk_fetcher.rs:2620-2625) + bit-0 sentinel (:582-585), AND at T1
+pool_threads=0 (:663, vendor BlockFetcher.hpp:185) => tasks run inline-deferred AFTER the
+predecessor published => window_map.get always hits. WINDOW-ABSENT IS IMPOSSIBLE AT NATIVE T1 BY
+CONSTRUCTION (corpus-independent). T1-ONLY: native T4+ bootstrap stays OPEN (real threads race
+the publish). Bootstrap asm (inc-1) DEAD at native T1 per pre-registration; may be REBORN on
+model-isal ONLY if the redirect probe shows criticality. RE-ATTRIBUTION BANKED: the rdtsc "270ms
+bootstrap/prefix" = the ISAL build's speculative window-absent phase (decode_chunk_window_absent
+:3636 -> unified marker loop — the knob sits in EXACTLY that loop on the isal build; verified no
+asm-kernel-disable confound). Fresh T1: silesia native 929 vs rg 824 = 0.888x; model 0.772x —
+worker's "gap entirely in seeded clean path" = ATTRIBUTION (provisional; oracle owed). REDIRECT
+RATIFIED (b)->(a)->(c): (b) calibrated bootstrap perturbation on model-isal T8 [DISPATCHED:
+positive control BOOTSTRAP_BODY_BYTES>0 else STOP; calibrate spin/byte; arms OFF/50/100/sleep;
+ceiling pre-registered ~34ms wall vs ~50ms cell gap; FLAT => bootstrap track CLOSED everywhere];
+(a) T1 seeded-decode removal oracle (prices the kernel grind; Oracle-C degeneracy warning);
+(c) kernel grind gated on (a) + plateau evidence. engine-w-refresh.md matrix corrections owed
+with (b)'s result.
 ## KEEPINDEX PORT MERGED (c31d9a07) — model-isal 1.19x -> ~1.13x; sparsity CPU deleted; RSS-neutral [2026-06-12]
 fix/keepindex-config (f60e8e3b) merged on MERGE-NOW. Port is VERBATIM vendor (only the two fields
 flip at keepIndex=false; sm_driver is the sole production constructor; Default keeping
