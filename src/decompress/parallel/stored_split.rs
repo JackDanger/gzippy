@@ -44,9 +44,29 @@
 //!     so verification precedes the single write.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::decompress::parallel::crc32::{combine_crc32, crc32};
 use crate::decompress::parallel::gzip_format;
+
+/// Counter: number of times StoredParallel was demoted to ParallelSM because
+/// the Huffman tail accounts for >= 50% of total output (prefix_out < 50% of
+/// expected_size). Dumped by `GZIPPY_DEBUG=1`.
+pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
+
+/// Kill-switch: when `GZIPPY_NO_STOREDPAR_DEMOTE=1` the demotion is
+/// suppressed and the Huffman tail is decoded sequentially (old behavior).
+/// Correctness-equivalent; use for A/B measurement only.
+#[inline]
+fn demotion_enabled() -> bool {
+    std::env::var_os("GZIPPY_NO_STOREDPAR_DEMOTE").is_none()
+}
+
+/// Threshold: if the stored prefix accounts for < this fraction of total
+/// output (numerator/denominator), demote to ParallelSM so the Huffman tail
+/// is decoded in parallel. Currently 50% (1/2).
+const DEMOTE_THRESHOLD_NUM: usize = 1;
+const DEMOTE_THRESHOLD_DEN: usize = 2;
 
 /// Env-gated phase timing for the stored decode path. When
 /// `GZIPPY_STORED_PHASE_TIMING=1` is set, each phase's wall time is printed to
@@ -306,17 +326,46 @@ pub fn decompress_stored_parallel<W: Write>(
         WalkEnd::HuffmanTail {
             tail_byte,
             prefix_out,
-        } => decode_with_huffman_tail(
-            writer,
-            deflate,
-            header_size,
-            &runs,
-            tail_byte,
-            prefix_out,
-            expected_crc,
-            expected_size,
-            num_threads,
-        ),
+        } => {
+            // DEMOTION GATE: if the Huffman tail is >= 50% of total output,
+            // the sequential tail decode is the wall bottleneck — ParallelSM
+            // can speculate boundaries across the tail and parallelize it.
+            // Return NotStoredDominated so the caller routes to ParallelSM.
+            //
+            // Kill-switch: GZIPPY_NO_STOREDPAR_DEMOTE=1 → old sequential path.
+            // Counter: STORED_DEMOTE_TO_PARALLEL_SM counts demotion events.
+            //
+            // Threshold: prefix_out < expected_size * (1/2).
+            // storedheavy: prefix_out ~8.2 MB, expected_size ~100 MB → 8.2% < 50%
+            // → DEMOTE. A pure-stored or >50% stored stream stays on this path.
+            if demotion_enabled()
+                && prefix_out > 0
+                && prefix_out * DEMOTE_THRESHOLD_DEN < expected_size * DEMOTE_THRESHOLD_NUM
+            {
+                STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
+                if crate::utils::debug_enabled() {
+                    eprintln!(
+                        "[gzippy] StoredParallel demote → ParallelSM: \
+                         prefix_out={prefix_out} < expected_size/2={} \
+                         (stored fraction {:.1}%)",
+                        expected_size / 2,
+                        prefix_out as f64 / expected_size as f64 * 100.0,
+                    );
+                }
+                return Err(StoredSplitError::NotStoredDominated);
+            }
+            decode_with_huffman_tail(
+                writer,
+                deflate,
+                header_size,
+                &runs,
+                tail_byte,
+                prefix_out,
+                expected_crc,
+                expected_size,
+                num_threads,
+            )
+        }
     }
 }
 
