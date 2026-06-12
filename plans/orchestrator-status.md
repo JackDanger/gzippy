@@ -1,3 +1,28 @@
+## SERIAL TAIL EXONERATED (LOW branch) — WORKER-SIDE time binds silesia T4; "route engine-W" rider STRUCK as premature [2026-06-11]
+Serial-tail worker (no patches, frozen, sha-OK). silesia T4 isal this session: gz 543 / rg 476 =
+0.877x (G=67ms, sigma=40ms) — the campaign now reads ratios as a BAND across sessions
+(0.877-0.912 on identical protocol); ADVISOR-SET MEASUREMENT-INTEGRITY GATE: pass/fail at the 0.99
+bar binds on the WORST session ([min,max] reported for transparency); inter-session drift (rg
+absolutes 506<->476, 1021<->1063) is an uncontrolled box-state variable that must be understood
+before ANY near-bar cell can be declared a PASS. DECOMPOSITION (3 traced runs, leaf self-time,
+conservation PASS): consumer TRULY-SERIAL S = 13.37ms (writev 13.2; all else ~0) < sigma=40 =>
+PRE-REGISTERED LOW BRANCH: serial tail NOT the binder; corrected-overlap oracle NOT authorized.
+"Consumer idle-wait = 0" is an instrument artifact: try_take_prefetched_pumping
+(chunk_fetcher.rs:1442) spin-pumps 283ms of SELF-time fully overlapped with workers — that IS the
+wait => WORKER DECODE THROUGHPUT is the binder. ADVISOR STRIKE: the pre-registered "route
+engine-W" action was a false dichotomy — on the ISAL build the marker body is proven SLACK
+(MFAST_DISABLE flat) and the clean tail is ISA-L FFI (gzip_chunk.rs:156-176), so engine-W has NO
+resident binding phase on this cell (consistent w/ banked "real-ISA-L => low-T deficit largely
+NON-engine"); engine-W stays funded for the NATIVE build only. bignasa T8 HARDENED: N=17, 0.986x
+(up from 0.975 provisional) — provisional LOSS row; right-skew unimodal, no bimodality; NOT a
+separate lever target (fold into whatever the worker-side decomposition names; re-separate only if
+its binder differs). NEXT DISPATCH (advisor-specified): worker-side PER-CHUNK PHASE decomposition
+on BOTH cells — extend the gzip_chunk.rs:1092 instrument to self-time {bootstrap-header,
+marker-body [control: expect slack], clean-flipped, clean-tail-ISA-L, apply_window, setup/alloc},
+conservation-asserted, summed + longest-worker tail chunk isolated; compare per-phase vs rg
+decodeBlock SUM (the discarded 1.33x SUM gap may be directionally real); then SLEEP-inject the top
+non-slack phase (spin = 3x turbo artifact on this cell) — proportional wall response names the
+binder; NO work-stretch before that confirmation.
 ## RE-MEASURE BANKED (advisor-gated): silesia T4 0.912x / bignasa T8 0.975x; 410ms = corpus confusion; publish-thread claim REFUTED [2026-06-11]
 probe/remeasure-baselines (d87c205d). (1) FULLY-HONEST BASELINES (frozen, interleaved N>=9,
 both-arms-file-sink, sha-OK, canonical masks) SUPERSEDE the matrix rows: silesia T4 isal gz ~556 vs
