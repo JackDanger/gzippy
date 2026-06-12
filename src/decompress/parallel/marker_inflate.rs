@@ -1739,6 +1739,11 @@ impl Block {
         let ring_ptr = self.ring.window16.as_mut_ptr();
         let ring8 = self.ring.window16.as_mut_ptr() as *mut u8;
         let mut pos = self.ring.pos;
+        // Drain frontier — constant for the duration of this call (the drain
+        // runs in `read()` AFTER this function returns). Passed to the
+        // back-ref copy routines so their word-copy rounding overshoot can
+        // never wrap onto undrained output (P0 stored-marker-CRC fix).
+        let drained = self.ring.drained;
         let mut emitted: usize = 0;
         // Local copy of the marker counter — pulled into a register
         // for the hot loop. Written back to self on commit. With
@@ -1972,7 +1977,7 @@ impl Block {
                         // guaranteed by the top guard (`dst_phys + FAST_OUT_SLOP
                         // <= U8_RING_SIZE`); the source straddle is handled inside.
                         unsafe {
-                            emit_backref_ring_u8(ring8_fast, &mut pos, distance, length);
+                            emit_backref_ring_u8(ring8_fast, &mut pos, drained, distance, length);
                         }
                         self.record_backreference_for_sparsity(distance, length, emitted);
                         emitted += length;
@@ -2272,6 +2277,7 @@ impl Block {
                             emit_backref_ring::<CONTAINS_MARKERS>(
                                 ring_ptr,
                                 &mut pos,
+                                drained,
                                 distance,
                                 length,
                                 &mut distance_marker,
@@ -2445,6 +2451,7 @@ impl Block {
                         emit_backref_ring::<CONTAINS_MARKERS>(
                             ring_ptr,
                             &mut pos,
+                            drained,
                             distance,
                             length,
                             &mut distance_marker,
@@ -2452,7 +2459,7 @@ impl Block {
                     } else {
                         // Clean tail: u8-direct copy (half the traffic, no
                         // marker scan). Vendor readInternal<false> back-ref.
-                        emit_backref_ring_u8(ring8, &mut pos, distance, length);
+                        emit_backref_ring_u8(ring8, &mut pos, drained, distance, length);
                     }
                 }
                 self.record_backreference_for_sparsity(distance, length, emitted);
@@ -3758,6 +3765,7 @@ fn fixed_dist_table() -> Option<&'static crate::decompress::inflate::libdeflate_
 pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     ring_ptr: *mut u16,
     pos: &mut usize,
+    drained: usize,
     distance: usize,
     length: usize,
     distance_marker: &mut usize,
@@ -3791,15 +3799,32 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         //   * The rounded copy stays inside the physical buffer (the
         //     `*_round_fits` guards below), and the overcopied tail lies
         //     AHEAD of the advanced `*pos`; no back-ref ever reads ahead of
-        //     `*pos`, and subsequent literals/copies overwrite those slots,
-        //     so the extra bytes are invisible. The marker backward-scan
-        //     below reads only the `length` bytes behind the new `*pos`.
+        //     `*pos`, and subsequent literals/copies overwrite those slots
+        //     BEFORE the next drain — guaranteed by the `span_round_fits`
+        //     guard below. The marker backward-scan below reads only the
+        //     `length` bytes behind the new `*pos`.
         // `distance < 4` non-overlap (only length-3/distance-3) is rare and
         // would alias the word stride, so it keeps the exact element copy.
+        //
+        // P0 STORED-MARKER-CRC FIX (2026-06-12, mono-gnu9 single-byte
+        // corruption at output 35,335,338): the old "subsequent writes
+        // overwrite the overshoot" invariant is FALSE for the FINAL back-ref
+        // of a maximally-full `read()` call. The per-call cap is `RING_SIZE -
+        // MAX_RUN_LENGTH` but the final event may overshoot it by up to
+        // `MAX_RUN_LENGTH - 1`, making the undrained span up to RING_SIZE-1
+        // slots. The ≤3-slot rounding overshoot then wraps PHYSICALLY onto
+        // the OLDEST UNDRAINED slot(s) (logical `pos + length + k - RING_SIZE
+        // >= drained`), which the end-of-call drain ships to the caller —
+        // one clobbered u16 in `data_with_markers`. Vendor never overshoots
+        // (exact `memcpy(length * 2)`, deflate.hpp:1376); gzippy keeps the
+        // word-copy DEVIATION but only when the rounded run also fits within
+        // the undrained window: `(*pos - drained) + rounded <= RING_SIZE`.
+        // Otherwise fall to the exact-length arms below (byte-identical).
         let rounded = (length + 3) & !3;
         let src_round_fits = src_phys + rounded <= RING_SIZE;
         let dst_round_fits = dst_phys + rounded <= RING_SIZE;
-        if distance >= 4 && src_round_fits && dst_round_fits {
+        let span_round_fits = (*pos - drained) + rounded <= RING_SIZE;
+        if distance >= 4 && src_round_fits && dst_round_fits && span_round_fits {
             // One 8-byte word covers length ≤ 4; a second covers 5–8; the
             // loop handles the rare long tail (≥ 9 u16).
             let s = ring_ptr.add(src_phys) as *const u8;
@@ -4076,6 +4101,7 @@ pub(crate) unsafe fn emit_backref_contig(
 pub(crate) unsafe fn emit_backref_ring_u8(
     ring8: *mut u8,
     pos: &mut usize,
+    drained: usize,
     distance: usize,
     length: usize,
 ) {
@@ -4085,10 +4111,19 @@ pub(crate) unsafe fn emit_backref_ring_u8(
     if distance >= length {
         // Non-overlap. Vendor: `memcpy(&window[wp], &window[off], length)`
         // (deflate.hpp:1376, sizeof==1). Word = 8 u8; round run up to 8.
+        //
+        // P0 STORED-MARKER-CRC FIX (2026-06-12): same undrained-span guard as
+        // `emit_backref_ring` (see the vendor-cited comment there). The u8
+        // twin has the identical latent clobber: a maximally-full `read()`
+        // call (cap `U8_RING_SIZE - MAX_RUN_LENGTH`, final event overshoots
+        // by up to 257) leaves an undrained span of up to U8_RING_SIZE-1
+        // bytes; the ≤7-byte rounding overshoot then wraps onto the oldest
+        // undrained byte(s), which the end-of-call drain ships to the caller.
         let rounded = (length + 7) & !7;
         let src_round_fits = src_phys + rounded <= U8_RING_SIZE;
         let dst_round_fits = dst_phys + rounded <= U8_RING_SIZE;
-        if distance >= 8 && src_round_fits && dst_round_fits {
+        let span_round_fits = (*pos - drained) + rounded <= U8_RING_SIZE;
+        if distance >= 8 && src_round_fits && dst_round_fits && span_round_fits {
             let s = ring8.add(src_phys);
             let d = ring8.add(dst_phys);
             (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
@@ -5385,6 +5420,7 @@ mod tests {
             emit_backref_ring::<false>(
                 ring_ptr,
                 &mut pos,
+                block.ring.drained,
                 MAX_WINDOW_SIZE, // distance
                 100,             // length
                 &mut distance_marker,
@@ -5419,6 +5455,100 @@ mod tests {
         );
     }
 
+    /// P0 REGRESSION (2026-06-12, /tmp/mono-gnu9.tar.gz single-byte CRC
+    /// corruption at output 35,335,338): direct contract test for the
+    /// undrained-span guard in `emit_backref_ring`'s word-copy arm.
+    ///
+    /// Production worst case: a `read()` call's per-call cap is `RING_SIZE -
+    /// MAX_RUN_LENGTH` (65278) but the FINAL back-ref of the call may
+    /// overshoot it by up to 257, leaving an undrained span of up to
+    /// RING_SIZE - 1 slots. The word copy rounds the run up to a multiple of
+    /// 4 u16; the ≤3-slot rounding overshoot then wraps PHYSICALLY onto the
+    /// OLDEST UNDRAINED slot, which the end-of-call drain ships to
+    /// `data_with_markers` — one clobbered output u16. Vendor rapidgzip
+    /// never overshoots (`std::memcpy(..., length * 2)`, deflate.hpp:1376).
+    ///
+    /// Geometry mirror of the mono-gnu9 failure: span before the final
+    /// back-ref = 65277 (= cap - 1), final back-ref length 258, distance
+    /// 1000 ⇒ rounded = 260, span + rounded = 65537 > RING_SIZE ⇒ the
+    /// overshoot's last slot aliases the first undrained element.
+    #[test]
+    fn emit_backref_ring_overshoot_must_not_clobber_undrained() {
+        let mut block = Block::new();
+        // Deterministic fill so source reads are defined.
+        for s in 0..RING_SIZE {
+            block.ring.window16[s] = (s % 251) as u16;
+        }
+        let drained = 100_000usize; // arbitrary logical drain frontier
+        let pos0 = drained + 65_277; // undrained span = cap - 1
+        let oldest_slot = drained % RING_SIZE; // slot of the FIRST undrained element
+        let sentinel = 0x002Eu16; // '.' — the byte the mono-gnu9 clobber destroyed
+        block.ring.window16[oldest_slot] = sentinel;
+
+        let ring_ptr = block.ring.window16.as_mut_ptr();
+        let mut pos = pos0;
+        let mut dm = 0usize;
+        unsafe {
+            emit_backref_ring::<true>(ring_ptr, &mut pos, drained, 1000, 258, &mut dm);
+        }
+        assert_eq!(pos, pos0 + 258);
+        // The copy itself must be exact (vendor memcpy semantics).
+        for k in 0..258usize {
+            let dst = block.ring.window16[(pos0 + k) % RING_SIZE];
+            let src_logical_slot = (pos0 + k - 1000) % RING_SIZE;
+            assert_eq!(
+                dst,
+                (src_logical_slot % 251) as u16,
+                "byte {k} of the back-ref copy is wrong"
+            );
+        }
+        // THE P0 ASSERTION: the rounding overshoot must NOT touch the oldest
+        // undrained slot (pre-fix it wrote the u16 at src+259 here — the 'L').
+        assert_eq!(
+            block.ring.window16[oldest_slot], sentinel,
+            "word-copy rounding overshoot clobbered the oldest undrained ring slot \
+             (the mono-gnu9 P0 single-byte corruption)"
+        );
+    }
+
+    /// u8 (clean-mode) twin of the test above — `emit_backref_ring_u8` has the
+    /// identical latent clobber (8-byte rounding, cap `U8_RING_SIZE -
+    /// MAX_RUN_LENGTH`, ≤7-byte overshoot onto the oldest undrained bytes).
+    #[test]
+    fn emit_backref_ring_u8_overshoot_must_not_clobber_undrained() {
+        let mut block = Block::new();
+        let ring8_len = U8_RING_SIZE;
+        // Fill the u8 view deterministically.
+        {
+            let ring8 = block.ring.window16.as_mut_ptr() as *mut u8;
+            for s in 0..ring8_len {
+                unsafe { ring8.add(s).write((s % 249) as u8) };
+            }
+        }
+        let drained = 200_000usize;
+        let pos0 = drained + 130_813; // undrained span = cap - 1 (U8 cap = 130814)
+        let oldest = drained % U8_RING_SIZE;
+        let ring8 = block.ring.window16.as_mut_ptr() as *mut u8;
+        // Sentinels across the up-to-5 clobberable bytes.
+        let sentinels: Vec<u8> = (0..5).map(|k| 0xA0 + k as u8).collect();
+        for (k, &v) in sentinels.iter().enumerate() {
+            unsafe { ring8.add((oldest + k) % U8_RING_SIZE).write(v) };
+        }
+        let mut pos = pos0;
+        unsafe {
+            emit_backref_ring_u8(ring8, &mut pos, drained, 1000, 258);
+        }
+        assert_eq!(pos, pos0 + 258);
+        for (k, &v) in sentinels.iter().enumerate() {
+            let got = unsafe { *ring8.add((oldest + k) % U8_RING_SIZE) };
+            assert_eq!(
+                got, v,
+                "u8 word-copy rounding overshoot clobbered undrained byte {k} \
+                 (clean-mode twin of the mono-gnu9 P0)"
+            );
+        }
+    }
+
     /// Companion to the test above: BEFORE the switch fires (chunk
     /// start, no prior decode), a back-ref with `distance > out_pos`
     /// MUST produce correct marker values via the pre-init pull.
@@ -5442,6 +5572,7 @@ mod tests {
             emit_backref_ring::<true>(
                 ring_ptr,
                 &mut pos,
+                0,   // drained: chunk start, nothing drained yet
                 100, // distance
                 50,  // length
                 &mut distance_marker,
