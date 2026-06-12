@@ -66,7 +66,18 @@ mod tests;
 use cli::GzippyArgs;
 use error::GzippyError;
 
-const VERSION: &str = concat!("gzippy ", env!("CARGO_PKG_VERSION"));
+/// Compile-time build flavor string: "parallel-sm+isal", "parallel-sm+pure", or
+/// "legacy-serial". Derived from cfg predicates in build.rs and surfaced via
+/// `--version` output and the first `GZIPPY_DEBUG=1` line.
+pub(crate) const BUILD_FLAVOR: &str = env!("BUILD_FLAVOR");
+
+const VERSION: &str = concat!(
+    "gzippy ",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BUILD_FLAVOR"),
+    ")",
+);
 
 /// Track the current output file so signal handlers can clean it up.
 /// When set, an incomplete output file exists that should be deleted on abort.
@@ -134,6 +145,11 @@ fn main() {
 
 fn run() -> Result<i32, GzippyError> {
     let args = GzippyArgs::parse()?;
+
+    // First GZIPPY_DEBUG=1 line: build flavor (before any routing or path prints).
+    if crate::utils::debug_enabled() {
+        eprintln!("[gzippy] build-flavor={BUILD_FLAVOR}");
+    }
 
     if args.version {
         println!("{}", VERSION);
