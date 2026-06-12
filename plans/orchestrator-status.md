@@ -1,3 +1,35 @@
+## FIELD MATRIX GATED — isal column VOID (misbuilt binary); P0 CORRECTNESS BUG found (monorepo ParallelSM CRC) [2026-06-12]
+First field measurement (measure/field-matrix, plans/field-matrix-2026-06-12.md: 11 corpora x T x
+{gz-isal, gz-native, rg 0.16, rg-upstream, pigz, igzip, libdeflate, gzip}, N=5 sha-verified).
+Fable gate verified the suspicious rows LIVE on the guest:
+ARM VOID: the gz-isal binary was built with DEFAULT features (Cargo.toml default = [] => no
+parallel_sm, no ISA-L) = the LEGACY SERIAL LibdeflateSingle build (verified path=LibdeflateSingle
+threads=8; RSS == libdeflate +/-1MiB on all 11 corpora). ALL gz-isal cells void. The worker's
+"zero scaling = 10MiB routing threshold" claim REFUTED: NO threshold exists at HEAD
+(MIN_PARALLEL_COMPRESSED dead code) — it re-derived the phantom from CLAUDE.md's STALE routing
+table (now corrected in CLAUDE.md). Mislabeled-binary scar repeat #2 — supervisor brief said
+"isal default", which was wrong; binary verification (GZIPPY_DEBUG path assert) is mandatory in
+every future brief.
+P0 CORRECTNESS BUG (real, reproduced): gzippy-native monorepo.tar.gz (9.8MB single-member,
+stored-block-bearing) exits RC:1 at T>1: CRC32 mismatch (expected 8c7ca615 got 0e0efdd5) after
+"stored-flip case1-ge-window uncompressed_size=51542"; T1 clean. GZIPPY_NO_STORED_FLIP=1 does NOT
+fix => bug is in the wider stored/marker speculative interaction, NOT confined to
+try_read_stored_special (marker_inflate.rs:1369-1419). Repro: GZIPPY_DEBUG=1 gzippy-native -d -c
+-p 4 /tmp/squishy/monorepo.tar.gz. Rule 4: this outranks all perf work.
+VALID native rows BANKED: wins/ties T8-T16 big-compressible (silesia 0.97-1.00, bignasa
+0.92-1.06, nasa 0.88-0.93 — BEATS rg outright at T16 on bignasa/nasa); loses T1 everywhere
+(1.38-2.0x, known engine rate); loses model/weights ALL T (1.14-1.70x) with CPU-s/GB +55-66% vs
+rg — LOW-RATIO CORPORA are the biggest valid non-T1 gap (too big for kernel rate alone; suspect
+excess speculation-failure/stored work); storedheavy 1.36x flat; storedmix WINS 0.64-0.67.
+P1 falsified on valid rows alone, but 58/27 contaminated — recount after isal rebuild. P2
+falsified ONLY vs rg (~19 native cells; vs pigz = the speculation-architecture class rg fails
+too — pigz decodes serially at 4.6 CPU-s/GB). P3 (RSS) confirmed for native. igzip = T1
+field-best kernel; product-isal-vs-igzip margin unmeasured (wrong binary).
+RANKED NEXT: (1) P0 stored/marker CRC fix; (2) isal rebuild --features gzippy-isal + re-run
+column/defaults-audit (falsifiers: path asserts, silesia T8 ~ rg parity, T1 within constant ms of
+igzip else open structural diagnosis); (3) model/weights low-ratio economy gap (fulcrum vs ->
+perturbation). DEFERRED: consumer-busy delta (below #3, may share mechanism); T16 fallback curve
+(GAP-2) DEPRIORITIZED — T16 is gzippy's best valid column.
 ## WAIT-PUMP DEAD + saturation hypothesis REFUTED-AT-SOURCE — silesia T4 banked DRIFT-LIMITED TERMINAL [2026-06-12]
 The first legal divergence (lever/wait-pump f951bd6b: 1ms prefetch pump inside the consumer's
 recv_post_process_blocking wait; kill-switched, effect-counted, 36/36 sha grid, no regression on
