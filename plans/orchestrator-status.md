@@ -1,3 +1,24 @@
+## PHASE DECOMP + REFRAME: gzippy decode CPU ALREADY <= rg on silesia T4 — the gap is PARALLEL EFFICIENCY (81% vs ~92%) [2026-06-11]
+Worker-phase probe (probe/worker-phase, /tmp/gz-wphase, DUAL-SHA pass). PHASE TABLES (held
+PROVISIONAL — residual 14% > 5% conservation flag): silesia T4 SUM 1763.7ms = header 19.5 / marker
+body 901.6 [proven-slack control] / ISA-L FFI 595.8 (33.8%) / apply_window 91.0 / RESIDUAL 246.8
+(CRC32-over-ISA-L-output, boundary replay, finalize, setup, reserve). Tail chunk 174ms is
+MARKER-ONLY (98% body). bignasa T8: body 95.6% slack, ISA-L 1.6%, residual 0.6% — NO actionable
+phase; 0.986 = NEAR-BAR not TIE (binding bar memory), revisit only if silesia mechanism generalizes.
+PERTURBATION (clean: sleep-primary, self-test 1.00+/-3%, linear 0.49 ratio, N=9 sha-OK): ISA-L FFI
+phase IS on the critical path (+10.6%/+21.7% at +50/+100%). RULE-3 CAP + ADVISOR REFRAME (banked as
+STRONG HYPOTHESIS gating next dispatch): speed-up ceiling ~0 — gzippy inflate-only SUM 1497.4ms vs
+rg 1781ms = 0.84x (gzippy does LESS inflate CPU than rg!); ideal wall 441 vs actual 543 => 81%
+parallel efficiency vs rg ~92%; non-ideal overhead 102ms vs 38ms, DIFFERENCE ~64ms ~= the 67ms gap.
+THE GAP IS SCHEDULING EFFICIENCY / IMBALANCE, NOT ENGINE THROUGHPUT (caveat: rg --verbose SUM
+aggregation semantics unverified — step 1 of next dispatch confirms or kills). ISA-L call
+granularity VERIFIED FAITHFUL (inflate_wrapper.rs:31-43 = vendor isal.hpp:205-207 refillBuffer,
+128KiB staging + 128KiB output segments BOTH tools; poison_reserved_tail is cfg(test)-only) — not
+a lever. NEXT DISPATCH (advisor spec): (1) GATE: cross-tool per-byte decode-CPU normalization —
+if gzippy <= rg within spread, engine/ISA-L work is DEAD for this cell; (2) parallel-efficiency
+instrument: per-worker start/finish spread, straggler location, does the 174ms marker-only tail
+chunk land on the critical tail (cross-ref confirmed_offset_prefetch_gap); (3) residual+apply
+decomposition to <5% conservation; (4) sleep-perturb the straggler/top-residual — NOT ISA-L compute.
 ## SERIAL TAIL EXONERATED (LOW branch) — WORKER-SIDE time binds silesia T4; "route engine-W" rider STRUCK as premature [2026-06-11]
 Serial-tail worker (no patches, frozen, sha-OK). silesia T4 isal this session: gz 543 / rg 476 =
 0.877x (G=67ms, sigma=40ms) — the campaign now reads ratios as a BAND across sessions
