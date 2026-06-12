@@ -1,3 +1,19 @@
+## SMALL-FILE RECON: NO vendor mechanism to port — clamp + lazy-spawn already faithful; one micro-divergence named [2026-06-12]
+Read-only vendor recon (ParallelGzipReader/ThreadPool/BlockFetcher + gzippy startup ledger):
+rapidgzip has NO sequential fast path / NO thread clamp for small inputs — its ONLY small-file
+mechanism is the chunk-size clamp (PGR.hpp:294-306, 2MB@-P8 => 512KiB chunks => 4 chunks),
+ALREADY PORTED verbatim (single_member.rs:75-88); lazy one-at-a-time thread spawn ALREADY PORTED
+(ThreadPool.hpp:157-159 == thread_pool.rs:325-349); rg's ChunkFetcher is lazily built on first
+read (gzippy builds eagerly in drive() — mild). ONE FAITHFUL MICRO-FIX NAMED: gzippy calls
+core_affinity::get_core_ids() (syscall) EAGERLY in ThreadPool::with_pinning_for_capacity per
+drive(); vendor pins lazily inside workerMain — move the query to spawn time (OnceLock global).
+Plus ~12 OnceLock env reads + per-iteration Instant::now() pairs with no vendor equivalent —
+sub-ms each, visible only at 30-80ms walls. RECON'S CONCLUSION partially CAVEATED by supervisor:
+"pure-Rust engine slower is the dominant factor" does NOT explain the ISAL build's markup.xml
+0.373 (isal uses ISA-L for clean tails) — the small-file deficit on isal must be fixed-overhead +
+per-chunk marker bootstrap at 30-80ms scale; the running instruction-diff profile owns the real
+answer. DISPOSITION: no clamp work (nothing to port); the lazy-affinity micro-fix queues behind
+the profile verdict; small-file cells fold into whatever the convergence list names.
 ## SOLVENCY TRUTH TABLE v1 BANKED — first DIRECT instruction counts: BOTH builds retire ~1.55x rg's instructions [2026-06-12]
 infra/solvency 9a780784 (plans/solvency-truth-v1.md on the box; canonical 19-file Squishy set
 freshly pinned, encoder gzip 1.12 -9, manifest in the doc). N=7/5 frozen interleaved, sha-OK,
