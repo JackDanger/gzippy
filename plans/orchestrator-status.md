@@ -1,3 +1,22 @@
+## STOREDHEAVY CLOSED + MERGED (c78f98b1) — routing demotion flips 1.53-1.60x LOSS to 0.50-0.65x WIN [2026-06-12]
+fix/stored-routing 36d04ca0 merged on advisor MERGE-NOW. The demotion (stored_split.rs:326-355,
+WalkEnd::HuffmanTail arm: prefix_out>0 && prefix_out*2 < expected_size => NotStoredDominated =>
+dispatcher falls through to ParallelSM) is CLEAN at the edges (no pre-demote output — the walk is
+a pure scan; original data slice re-parsed from byte 0; overflow-safe; ISIZE-lies => old behavior;
+boundary strict-<; multi-member unreachable). VENDOR: rg has NO stored route at all — demotion
+moves gzippy TOWARD vendor. FALSIFIER PASS with 2x margin: storedheavy T4/T8/T16 0.50-0.65x vs rg
+(was 1.53-1.60x); kill-switch + counter verified; no regression (storedmix/monorepo ~1.000 A/B,
+pure-stored takes WalkEnd::Final, isal T1 untouched). ADVISOR CLOSED THE ISAL GAP ITSELF on the
+guest: gzippy-isal build, storedheavy T4/T8 demote-on/off ALL == pin d3efb3ac, demote+routing
+prints verified, storedmix/monorepo/pure-stored byte-exact vs zcat. PERF: unfrozen absolutes
+UNBANKABLE (rg 77-81 vs banked 94-100 = box-state both directions) but the 2.9x structural A/B
+direction stands; post-merge frozen refresh re-certifies. "Beats rg 2x" physical: incompressible
+tail = literal-decode race; T8 2.57GB/s aggregate / T1 1.48GB/s credible for the BMI2 multi-lit
+fastloop; rg scales only 1.6x here (its finder pays on dense dynamic-Huffman-over-random).
+NON-BLOCKING NITS for a follow-up: STORED_DEMOTE counter is increment-only (doc says dumped);
+no unit test pins the demote gate (e2e-covered; add a <50%-stored fixture test).
+LOSS SURFACE NOW: model-isal per-chunk ISA-L overhead (1.19x), silesia T4/T16 (drift-gated,
+NEEDS NEUROTIC REBOOT), native T1/low-ratio (engine-W funded track). Everything else WINS.
 ## POST-P0 REFRESH — monorepo WINS all cells; storedheavy = ROUTING MISFIRE (named); model/weights = clean-tail economy [2026-06-12]
 (measure/post-p0-refresh c68ac933; artifact shas printed per the strike rule; routing asserts per
 cell; STALE_CONFIRMED_BLOCK_SKIP = 0 everywhere, sha-OK everywhere — the P0 fix HOLDS.)
