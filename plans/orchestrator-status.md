@@ -1,3 +1,28 @@
+## NATIVE-RG RE-SCORE GATED SOUND — campaign re-aims: T4+ wall-conversion is THE gap; T1-isal wins real [2026-06-12]
+measure/native-rg-rescore (db466ae5) gated. Comparator = native ELF b0397fca (4ms startup,
+self-check wired into _parity_guest.sh — wheel regression now mechanically trapped); N=7 frozen,
+sha-verified, strike-5 clean. CONVENTION: ratio = rg_native_min/gz_min, >=0.99 PASS. CROSS-CHECK
+PASSED: factor-walk's independent ~1.17x silesia-T8 reproduces (0.848 = 1/1.18) on different
+absolutes — two instruments agree. SCOREBOARD: PASS only at T1 (silesia-isal 1.131, model-isal
+1.108, storedheavy 1.372 isal/1.099 native); EVERY T4/T8/T16 cell LOSES 0.65-0.96. Wheel tax is
+DATA-SCALED 42-85ms (58% of rg's storedheavy time; bignasa 85ms > 48ms startup => runtime Python
+IO component — wheel invalid at any size; NO fixed-subtraction reconstruction of old numbers is
+ever valid). Six comparator-swap flips PASS->LOSS (silesia/storedheavy/storedmix T8 x both
+builds) — column is same-session swap, NOT a wheel-era reproduction (gz drifted faster since).
+SURVIVES: all same-binary causal results (perturbations, kill-switch A/Bs, CPU ledgers,
+exonerations), rg CPU tables (RG_TRACE = native build-trace, verified), CPU gate gz<=rg, all T1
+wins, all faithfulness merges (keepIndex/staging/demotion-mechanism). DIES/RE-OPENS: F1
+win-at-parity, "silesia T4 drift-limited terminal" (0.816 is not drift; reboot framing moot),
+bignasa 0.986, weights 1.03, storedheavy/storedmix T8 WIN headlines, rg-side 92% efficiency
+(wheel wall; gz-side 81% stands; re-derive natively — gap widens). RE-AIM: gz decode CPU <= rg
+yet wall 15-35% worse at T4+ UNIFORMLY across corpora => ONE shared wall-conversion mechanism
+(scheduling/overlap/output), ~50ms on silesia T8 — order of magnitude beyond the old 3pp story.
+RANKED: (1) N2 F-w1 finishes (in flight, disposes bootstrap track); (2) silesia-T8 wall-conversion
+decomposition vs native rg (Gantt+ledger, both sides native, re-derive efficiency pair natively
+same-session; piggyback bignasa N=7 re-run); (3) Finalize/prepend_bytes perturbation (pre-reg,
+both corpora, native bar). NO-LOCK: weights/monorepo re-fetch via host (squishy 403 on guest).
+PARKED: release-correction PR (user nod). NITS: T16 mask = 15 cores (T16 anomaly under-read until
+re-run); silesia-T16 native 325 < isal 364 banked as anomaly only.
 ## COMPARATOR-INTEGRITY BOMBSHELL: banked rg numbers carried a ~43ms PYTHON-WHEEL STARTUP TAX — silesia T8 "parity" RE-OPENED [2026-06-12]
 Ledger-pass gate reconciled the rg 350->274 contradiction by FACTOR WALK (frozen, N=7, sha-OK):
 R0 worker-form (native-rg, /dev/null) 273ms == worker's read; +file sink => 326 (SINK +53ms);
