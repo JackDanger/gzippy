@@ -1,3 +1,22 @@
+## PARALLEL-EFF PROBE BLOCKED — NEUROTIC UNREACHABLE; rg --verbose semantics RESOLVED from vendor source [2026-06-12]
+The parallel-efficiency probe (probe/parallel-eff, 27b1ffcf) completed ALL instrumentation but the
+bench box is GONE: "neurotic" unresolvable (Mac DNS=8.8.8.8, search domain "home" NXDOMAIN, mDNS
+dead for ALL local hosts), full 192.168.4-7.0/22 sweep finds NO Proxmox :8006, the only LAN sshd
+(192.168.7.239, OpenSSH 7.9/Debian10) has a DIFFERENT host key than known_hosts' neurotic. Worked
+hours earlier same day => box down/rebooted or network changed. USER ACTION NEEDED. Instrument
+ready to run: Gantt per-chunk/per-worker (GZIPPY_CHUNK_PHASE=1, chunk_fetcher.rs +290 lines),
+residual split into 5 named AtomicU64 subphases (gzip_chunk.rs +84), exact resume sequence in the
+worker report. BANKED FROM VENDOR SOURCE (GzipChunkFetcher.hpp:141-186, ChunkData.hpp:151-176):
+ALL rg --verbose duration fields are THREAD-SUMMED CPU (per-chunk Statistics::merge under mutex) —
+validates SUM-vs-SUM comparisons; decodeDuration=custom bootstrap, decodeDurationInflateWrapper +
+decodeDurationIsal = ISA-L path, Theoretical Optimal = (decode+wrapper+isal+append+applyWindow+
+computeChecksum)/nThreads. ASYMMETRY CAUGHT: rg's Theoretical-Optimal numerator INCLUDES
+applyWindow + CRC32; gzippy's pool_efficiency() (statistics.rs) EXCLUDES them — cross-tool
+efficiency comparisons must add those terms to gzippy's numerator. GATE verdict provisional-YES
+(gzippy decode CPU 1497 <= rg ~1781) pending a fresh same-session --verbose run when the box
+returns. MEANWHILE: Fulcrum `locate` v1 build dispatched (advisor-specified scope: critical-path
+extractor over GZIPPY_TIMELINE traces + closed wall ledger w/ residual + gated exemption probe
+design) — buildable offline with synthetic-trace selftests.
 ## PHASE DECOMP + REFRAME: gzippy decode CPU ALREADY <= rg on silesia T4 — the gap is PARALLEL EFFICIENCY (81% vs ~92%) [2026-06-11]
 Worker-phase probe (probe/worker-phase, /tmp/gz-wphase, DUAL-SHA pass). PHASE TABLES (held
 PROVISIONAL — residual 14% > 5% conservation flag): silesia T4 SUM 1763.7ms = header 19.5 / marker
