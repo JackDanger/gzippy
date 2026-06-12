@@ -1,3 +1,27 @@
+## LEDGER CLOSED ON-BOX — model-isal gap NAMED: window-sparsity decode rg SKIPS at keepIndex=false (sm_driver.rs:127 divergence) [2026-06-12]
+Dispatch-silence probe gated; advisor ran a COMBINED instrument on the guest (both probes' counters
+one binary, frozen, sha-exact, TSC-calibrated) and reconciled the cross-probe contradiction exactly:
+decodeBlock CPU 3,018ms = kernel 2,198 + wrapper 42 [refill-staging moved the 128KiB memcpy here —
+explains 3.6->42 across probes] + CRC 35 + boundary 33 + FINALIZE-SPARSITY 430 + bootstrap/prefix
+270 + ~10. BANKED: (a) the stale "53ms dispatch silence / 5 stalls" note RETIRED (fixed by the
+hit-drive port; kill-switch A/B +6.5ms FLAT at HEAD); (b) the probe worker's "consumer is
+pace-setter" REJECTED — ttp.rx_recv_block (74% of consumer wall) is the wait-for-worker-delivery
+span; WORKERS pace; FLAT slow-knobs only prove the knob-covered pure-Rust loops slack (the FFI
+bulk + finalize were never injected); (c) the "buffer lifecycle / DecodedData single-pass fix"
+localization REFUTED by measurement (truncate/commit = 0.0ms; those components ~68ms) — fix
+MIS-AIMED, not dispatched. THE NAMED DIVERGENCE (X1 = 430ms = 2/3 of the gap):
+finalize_window_for_last_subchunk -> get_used_window_symbols = a 32KiB pure-Rust marker-engine
+decode + backref tracking PER CHUNK (~8.5ms x 51) — vendor runs the identical routine ONLY when
+keeping an index (GzipChunk.hpp:61-97; ParallelGzipReader.hpp:1330 windowSparsity = m_keepIndex &&
+m_windowSparsity; CLI default keepIndex{false}, rapidgzip.cpp:47,167); gzippy HARDCODES
+window_sparsity: true (sm_driver.rs:127). X2 = 270ms bootstrap/marker-prefix = engine-W track.
+DISPATCHED: faithful keepIndex port (delete-divergence: plain-decode CLI => keep_index=false =>
+window_sparsity=false + window_compression_type=Some(None), mirroring applyChunkDataConfiguration
+ParallelGzipReader.hpp:1326-1334; sparsity path kept for future index mode) + falsifier (model
+T4/8/16 vs rg, expect tens-of-ms or TIE-KEEP) + dict-site slope recalibration at HEAD (the banked
+6.99ms/ms predates the hit-drive fix). Box note: stray gzippy-07c1cb9d test binary (fd_vectored
+class) idling 2.4% CPU — kill before banking absolutes. Combined-instrument tree preserved at
+/tmp/gz-combined (uncommitted).
 ## STAGING+GUARDS MERGED (a53c53e0) — refill staging TIE-KEEP; flavor guards live; fd_vectored hang = PRE-EXISTING env [2026-06-12]
 fix/isal-refill-staging merged on gate PASS. (1) refillBuffer 128KiB staging port (isal.hpp:163-205,
 chunk clean-tail site only, T1 single-shot untouched): DUAL-SHA exact, falsifier TIE (435 vs 434ms
