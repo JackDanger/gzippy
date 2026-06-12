@@ -1,3 +1,26 @@
+## WAIT-PUMP DEAD + saturation hypothesis REFUTED-AT-SOURCE — silesia T4 banked DRIFT-LIMITED TERMINAL [2026-06-12]
+The first legal divergence (lever/wait-pump f951bd6b: 1ms prefetch pump inside the consumer's
+recv_post_process_blocking wait; kill-switched, effect-counted, 36/36 sha grid, no regression on
+8 net cells) is DEAD per its pre-registered falsifier: silesia T4 median on 591 vs off 581ms
+(bar >=25ms). Counters told the story: drive_invocations=66, tasks_submitted=0 — every pump tick
+found the pool LEGITIMATELY full. Fable advisor REFUTED-AT-SOURCE my saturation-accounting
+hypothesis: gzippy harvests ready futures BEFORE gating (block_fetcher.rs:729-739 ==
+BlockFetcher.hpp:463-470), cap P-1 in-flight + 2P cache both vendor-exact (chunk_fetcher.rs:578-579
+== BlockFetcher.hpp:181-185); the 3 counted decodes were genuinely running (3 decodes +
+1 post-process task = 4/4 threads). rg ALSO has no prefetch driver during consumer-busy (its
+post-process wait is a bare future.get, GzipChunkFetcher.hpp:517) — the QUEUE-EMPTY gaps are a
+property of the SHARED architecture; the slow-consumer +33.9% slope = lengthening driver-less
+serial sections, shared-architecture property, not a gzippy defect. BANKED: silesia T4 isal
+queue-empty starvation is STRUCTURALLY FAITHFUL; the residual 3pp efficiency delta = rg's SHORTER
+consumer-busy phase per chunk (post-process queueing/harvest/write bookkeeping instructions) — an
+instruction-delta-to-locate-and-converge item (fulcrum vs per-chunk consumer-busy comparison),
+queued behind the field matrix. STATUS: silesia T4 = DRIFT-LIMITED TERMINAL pending field matrix
++ drift repair (neurotic reboot still owed by user). Increment-1 DISPOSITION: DISCARD unmerged —
+vendor has no pump at that wait, the change is a no-op by construction; branch lever/wait-pump
+stays as the falsification artifact (a "deeper cap" second divergence is mechanically available
+but FORBIDDEN-until: fulcrum vs locates the consumer-busy delta first; vendor explicitly bounds
+pool tasks <= P at BlockFetcher.hpp:564-568). NEXT: reflection Move 2 — the FIELD MATRIX +
+efficiency bank session.
 ## DISPATCH-STARVATION CONFIRMED (super-proportional falsifier) + FABLE REFLECTION ADOPTED — divergence LEGALIZED [2026-06-12]
 TWO landmark results. (A) MECHANISM PROBE (probe/parallel-eff 80a6670d/f3b0c050, frozen, sha-OK):
 ALL idle gaps are QUEUE-EMPTY (10/8/7 gaps across 3 runs, 128-182ms total, others_active=3 in
