@@ -1,3 +1,20 @@
+## MARKER EMISSION WALL-CRITICAL (both builds, solvency T8) — u8 SINGLE-LOOP PORT IS GO [2026-06-12]
+probe/marker-emit-crit (c459ee54 on solvency). Knob inside BOTH emit sites (mfast :2349 + careful
+:2567), loop-gates verified untouched (new marker_emit_spin var, mfast entry unaffected),
+OFF-vs-absent + DUAL-SHA clean. Pre-registered, calibrated (Zen-2 ~1.1ns/iter; N=100 ~= +1-1.4x
+emit phase). RESULTS (stable rounds, std 3.6ms): native +6.9/+18.8ms at +50/+100 sleep (1.9x/5.2x
+spread), spin +20.0 ~= sleep => NOT turbo; isal +2.6/+8.1ms (sleep) / +9.6 (spin). VERDICT:
+monotonic + proportional + frequency-neutral-surviving = MARKER EMISSION CRITICAL at T8 both
+builds. Anomalies: rounds 8-9 burst-state artifact (excluded, documented); MFAST_PROF silent on
+solvency (gate flag, uninvestigated); worker fixed 2 pre-existing clippy errors in
+crates/gzippy-inflate in-commit. THE PORT IS GO on all grounds: instruction ledger (+1.0-1.5B,
+banked), wall criticality (this probe), vendor shape (Block::read inline resolution,
+deflate.hpp), and the governing u8 clause (ONE MarkerRing, in-place u16->u8 flip — the funded
+engine-campaign core step). PRE-REGISTERED PORT FALSIFIER (banked, unchanged): marker-phase user
+insns 2,795M -> <=1.9B on the 69.7MB denominator (perf-record, solvency); >2.4B = mechanism
+FALSIFIED (intra-loop rate, not the pass split). Wall expectation: >=~12ms at solvency T8
+(emit-share arithmetic), larger on Intel. DISPATCHED: the u8 single-loop port (Fable worker —
+the campaign's funded structural rewrite, full engine-core gauntlet).
 ## INSTRUCTION-DIFF GATED (ledger REBUILT on-box): MARKER PHASE = #1 TARGET (~42%); CLEAN ENGINES AT PARITY [2026-06-12]
 Gate REJECTED the worker's categories (and the supervisor's candidate): measured denominators
 decided it. VOLUMES (measured, parity confirmed — placement converged): gz marker 69.7MB / clean
