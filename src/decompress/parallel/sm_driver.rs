@@ -5,6 +5,33 @@
 //! Parses the gzip envelope, runs [`super::chunk_fetcher::drive`] on the
 //! raw deflate body, then verifies CRC32 + ISIZE. `single_member` is a thin
 //! classifier-routed wrapper around [`read_parallel_sm`].
+//!
+//! # Window-sparsity configuration (keepIndex=false faithful port)
+//!
+//! Vendor (`ParallelGzipReader.hpp:1320-1330`, `tools/rapidgzip.cpp:47,167`):
+//! the CLI default is `keepIndex{false}`. `applyChunkDataConfiguration` then sets:
+//!   ```cpp
+//!   m_chunkConfiguration.windowSparsity = m_keepIndex && m_windowSparsity;  // → false
+//!   m_chunkConfiguration.windowCompressionType =
+//!       m_keepIndex ? m_windowCompressionType
+//!                   : std::make_optional(CompressionType::NONE);             // → Some(NONE)
+//!   ```
+//! With sparsity off the 32 KiB `getUsedWindowSymbols` scan is skipped on every
+//! chunk finalize — per mechanism measurement: ~8.5 ms × 51 chunks ~= 430 ms
+//! thread-summed at T8, ~⅔ of the decodeBlock CPU gap vs rapidgzip.
+//!
+//! Kill-switch: `GZIPPY_WINDOW_SPARSITY=1` restores the old always-on behavior
+//! (sparsity=true, compression=None/auto). Effect counter `SPARSITY_DECODE_COUNT`
+//! in `chunk_data` tracks actual executions; visible via `GZIPPY_VERBOSE`.
+
+use std::sync::OnceLock;
+
+/// Returns `true` iff the `GZIPPY_WINDOW_SPARSITY=1` kill-switch is active,
+/// restoring the pre-port always-on sparsity behavior.
+fn window_sparsity_kill_switch() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("GZIPPY_WINDOW_SPARSITY").ok().as_deref() == Some("1"))
+}
 
 /// Decompress one single-member gzip buffer with the parallel chunk pipeline.
 #[cfg(parallel_sm)]
@@ -63,6 +90,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
 ) -> Result<ReadResult, ReadParallelSmError> {
     use crate::decompress::parallel::chunk_data::ChunkConfiguration;
     use crate::decompress::parallel::chunk_fetcher;
+    use crate::decompress::parallel::compressed_vector::CompressionType;
     use crate::decompress::parallel::gzip_format;
 
     // Slab auto-gate input: stored at EVERY decode entry (atomic, never
@@ -120,12 +148,26 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         }
     };
 
+    // Faithful port of vendor `applyChunkDataConfiguration` at keepIndex=false
+    // (ParallelGzipReader.hpp:1320-1330, tools/rapidgzip.cpp:47):
+    //   windowSparsity   = keepIndex && windowSparsity = false
+    //   windowCompressionType = keepIndex ? userValue : Some(NONE) = Some(NONE)
+    // Kill-switch GZIPPY_WINDOW_SPARSITY=1 restores old always-on behavior.
+    let sparsity = window_sparsity_kill_switch();
     let configuration = ChunkConfiguration {
         split_chunk_size: target_compressed_chunk_bytes,
         max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
         crc32_enabled: true,
-        window_sparsity: true,
-        window_compression_type: None,
+        // Default (keepIndex=false, vendor benchmark): sparsity OFF — skip the
+        // 32 KiB `getUsedWindowSymbols` scan per chunk finalize.
+        window_sparsity: sparsity,
+        // Default (keepIndex=false): store windows uncompressed (CompressionType::None).
+        // Kill-switch (old behavior): None → auto-select (heuristic in window_compression_type()).
+        window_compression_type: if sparsity {
+            None
+        } else {
+            Some(CompressionType::None)
+        },
         expansion_ratio_ceil,
     };
 

@@ -930,6 +930,13 @@ fn drive_impl<W: std::io::Write>(
             crate::decompress::parallel::stored_split::STORED_DEMOTE_TO_PARALLEL_SM
                 .load(Ordering::Relaxed),
         );
+        // Window-sparsity effect counter: 0 = keepIndex=false faithful port (default),
+        // non-zero = GZIPPY_WINDOW_SPARSITY=1 kill-switch active (old always-on path).
+        // Each count = one 32 KiB getUsedWindowSymbols scan run at chunk finalize.
+        eprintln!(
+            "  Window-sparsity decode runs (0=off=vendor-default, >0=kill-switch-active): {}",
+            crate::decompress::parallel::chunk_data::SPARSITY_DECODE_COUNT.load(Ordering::Relaxed),
+        );
         use crate::decompress::parallel::chunk_buffer_pool::*;
         eprintln!(
             "  Max concurrently-live ChunkData (in-flight depth): {}  (live now: {})",
