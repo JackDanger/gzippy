@@ -950,6 +950,16 @@ pub trait IncrementalOutSink {
     fn commit_and_reserve(&mut self, just_written: usize, min_spare: usize) -> (*mut u8, usize);
 }
 
+/// Kill-switch: `GZIPPY_NO_REFILL_STAGING=1` reverts the parallel-chunk clean-tail
+/// FFI to the whole-slice `avail_in` mode (no 128 KiB staging buffer). Default OFF
+/// (staging ON — the faithful refillBuffer port).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn staging_no_refill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_REFILL_STAGING").is_ok_and(|v| v == "1"))
+}
+
 /// Incremental / growable sibling of [`decompress_deflate_from_bit_into`]. Same
 /// ISA-L state-machine and boundary semantics, but instead of returning `None`
 /// the instant a FIXED `out` buffer fills, it COMMITS progress, GROWS the sink,
@@ -963,6 +973,24 @@ pub trait IncrementalOutSink {
 /// the start of THIS decode (i.e. from the buffer length at entry) — identical
 /// to the fixed-buffer variant's semantics because all committed bytes are
 /// contiguous in the sink.
+///
+/// **INPUT STAGING** (vendor `isal.hpp:163-205` `refillBuffer` port): instead of
+/// pointing `state.next_in`/`avail_in` at the entire (potentially multi-MiB)
+/// compressed slice up front, the function maintains a 128 KiB staging buffer and
+/// feeds the compressed input in chunks. When ISA-L exhausts the current chunk
+/// (`avail_in == 0` or ret == ISAL_END_INPUT with more data available), the next
+/// 128 KiB of `data` are `copy_from_slice`d into the staging buffer and
+/// `next_in`/`avail_in` are reset to it. This keeps the hot input window in L2
+/// cache across the decode loop rather than forcing TLB/cache misses on multi-MiB
+/// random-access to the full member slice — faithfully matching rapidgzip's
+/// `finishDecodeChunkWithInexactOffset` segment loop, which hand-sizes its
+/// `DecodedVector` to exactly `ALLOCATION_CHUNK_SIZE = 128 KiB`.
+///
+/// Kill-switch: `GZIPPY_NO_REFILL_STAGING=1` bypasses staging (whole-slice avail_in,
+/// original behaviour). With staging the bit-position formula changes from
+/// `data.len()*8 - avail_in*8` to `data_pos*8 - avail_in*8` where `data_pos` is
+/// the cumulative bytes loaded from `data` into ISA-L's input; the two are
+/// equivalent when kill-switch is ON (`data_pos == data.len()` immediately).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub fn decompress_deflate_from_bit_into_growable(
     data: &[u8],
@@ -986,14 +1014,54 @@ pub fn decompress_deflate_from_bit_into_growable(
     state.crc_flag = isal_raw::ISAL_DEFLATE;
     state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
 
+    // ── INPUT STAGING SETUP (vendor isal.hpp:163-205 refillBuffer port) ──────
+    // STAGING_SIZE = 128 KiB matches rapidgzip's ALLOCATION_CHUNK_SIZE.
+    // `no_refill = true` (kill-switch) reverts to the whole-slice avail_in mode.
+    // `data_pos` tracks how many bytes of `data` have been loaded into ISA-L's
+    // input; bit positions are computed as `data_pos*8 - avail_in*8 - read_in_length`
+    // which equals `data.len()*8 - ...` when no staging (kill-switch ON).
+    const STAGING_SIZE: usize = 128 * 1024;
+    let no_refill = staging_no_refill_enabled();
+    // Staging buffer: 128 KiB heap allocation (avoid stack overflow). Unused when
+    // kill-switch is ON (Vec::new(), never written).
+    let mut staging_buf: Vec<u8> = if no_refill {
+        Vec::new()
+    } else {
+        vec![0u8; STAGING_SIZE]
+    };
+    // Total bytes loaded from `data` into ISA-L's input (cumulative).
+    let mut data_pos: usize;
+
     if bit_skip > 0 {
         state.read_in = (data[byte_idx] as u64) >> bit_skip;
         state.read_in_length = (8 - bit_skip) as i32;
-        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
-        state.avail_in = (data.len() - byte_idx - 1) as u32;
+        let data_start = byte_idx + 1;
+        if no_refill {
+            state.next_in = unsafe { data.as_ptr().add(data_start) as *mut u8 };
+            state.avail_in = (data.len() - data_start) as u32;
+            data_pos = data.len();
+        } else {
+            let fill_end = (data_start + STAGING_SIZE).min(data.len());
+            let fill_len = fill_end - data_start;
+            staging_buf[..fill_len].copy_from_slice(&data[data_start..fill_end]);
+            state.next_in = staging_buf.as_mut_ptr();
+            state.avail_in = fill_len as u32;
+            data_pos = fill_end;
+        }
     } else {
-        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
-        state.avail_in = (data.len() - byte_idx) as u32;
+        let data_start = byte_idx;
+        if no_refill {
+            state.next_in = unsafe { data.as_ptr().add(data_start) as *mut u8 };
+            state.avail_in = (data.len() - data_start) as u32;
+            data_pos = data.len();
+        } else {
+            let fill_end = (data_start + STAGING_SIZE).min(data.len());
+            let fill_len = fill_end - data_start;
+            staging_buf[..fill_len].copy_from_slice(&data[data_start..fill_end]);
+            state.next_in = staging_buf.as_mut_ptr();
+            state.avail_in = fill_len as u32;
+            data_pos = fill_end;
+        }
     }
 
     static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
@@ -1013,6 +1081,25 @@ pub fn decompress_deflate_from_bit_into_growable(
         if ret != 0 {
             return None;
         }
+    }
+
+    /// Refill the staging buffer from `data[data_pos..]` when more input is
+    /// available. Inline closure to avoid repeating the copy+reset logic.
+    /// Returns `true` if a refill was performed (caller should `continue`).
+    macro_rules! try_refill {
+        () => {{
+            if !no_refill && data_pos < data.len() {
+                let fill_end = (data_pos + STAGING_SIZE).min(data.len());
+                let fill_len = fill_end - data_pos;
+                staging_buf[..fill_len].copy_from_slice(&data[data_pos..fill_end]);
+                data_pos = fill_end;
+                state.next_in = staging_buf.as_mut_ptr();
+                state.avail_in = fill_len as u32;
+                true
+            } else {
+                false
+            }
+        }};
     }
 
     let mut boundaries: Vec<BlockBoundary> = Vec::new();
@@ -1047,6 +1134,13 @@ pub fn decompress_deflate_from_bit_into_growable(
         match ret {
             0 => {}
             1 => {
+                // ISA-L exhausted the current input window. With staging, refill from
+                // `data` before accepting "input done" as the terminal condition
+                // (vendor isal.hpp:163-205 refillBuffer: loop while reader returns data).
+                if try_refill!() {
+                    continue;
+                }
+                // No more input in `data` — apply the at-boundary guard.
                 let bs = state.block_state;
                 let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
                     || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
@@ -1061,8 +1155,10 @@ pub fn decompress_deflate_from_bit_into_growable(
         }
 
         if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            // Bit position formula: `data_pos*8 - avail_in*8 - read_in_length`.
+            // Equivalent to `data.len()*8 - ...` when kill-switch ON (data_pos==data.len()).
             let bit_pos =
-                data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+                data_pos * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
             boundaries.push(BlockBoundary {
                 bit_offset: bit_pos,
                 output_offset: total_written,
@@ -1078,6 +1174,11 @@ pub fn decompress_deflate_from_bit_into_growable(
             break;
         }
         if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            // No output and no input remaining in staging. Try refilling before
+            // treating as done (mirrors the ret==1 refill path above).
+            if try_refill!() {
+                continue;
+            }
             break;
         }
     }
@@ -1089,8 +1190,7 @@ pub fn decompress_deflate_from_bit_into_growable(
         return None;
     }
 
-    let end_bit =
-        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+    let end_bit = data_pos * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
 
     Some((total_written, end_bit, boundaries))
 }
