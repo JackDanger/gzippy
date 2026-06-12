@@ -1,3 +1,32 @@
+## DISPATCH-STARVATION CONFIRMED (super-proportional falsifier) + FABLE REFLECTION ADOPTED — divergence LEGALIZED [2026-06-12]
+TWO landmark results. (A) MECHANISM PROBE (probe/parallel-eff 80a6670d/f3b0c050, frozen, sha-OK):
+ALL idle gaps are QUEUE-EMPTY (10/8/7 gaps across 3 runs, 128-182ms total, others_active=3 in
+every gap) — workers starve because the consumer, blocked in recv_post_process_blocking (~5ms/chunk
+apply-window wait, 100us poll loop), never drives prefetch_new_blocks; the pool is a pure Condvar
+queue (workers need no consumer once a task is queued). PRE-REGISTERED FALSIFIER CONFIRMED:
+GZIPPY_SLOW_CONSUMER sleep +50% -> +8.5%, +100% -> +33.9% — SUPER-proportional, 7x/14x the 13ms
+null slope. STRUCTURAL DIFF VS VENDOR: NONE — rg ALSO blocks at future.get (GzipChunkFetcher:516)
+without prefetching; the 3pp efficiency delta is QUANTITATIVE (per-chunk post-process duration),
+not structural. Under the old unlike-rg prohibition this was a dead end; under (B) it is a LEVER.
+Also: fulcrum locate now runs unflagged-wall but FLAGS a 19.1% dark zone = finalize_with_deflate
+(10.5%) + boundary/CRC lack trace_v2 spans in run_post_process_task — scan_candidate #1 (56.4%
+on-path) still CANNOT be confirmed or killed until the dark zone is spanned; chunk_id=MAX Gantt
+bug FIXED. (B) FABLE REFLECTION (user-directed full reflection; advisors are FABLE from now on).
+ADOPTED: (1) DIVERGENCE FROM RG LEGALIZED — allowed when byte-exact + causally verified at the
+wall on >=1 cell w/ no regression cell + recorded in a DIVERGENCE LEDGER w/ vendor counterpart;
+rg = blueprint + oracle, NOT ceiling (the campaign's biggest wins were already divergences).
+(2) Tiered gates: bank/merge/direction-change get advisor; falsifier-armed probes self-gate.
+(3) Bar: pooled >=3-session 95%-CI >= 0.99 REPLACES worst-session, gated on drift repair (ASK
+USER: reboot neurotic — 53d uptime; post-reboot band <=1.5% or 2nd box). (4) Field matrix owed:
+{rg 0.16 + upstream, pigz, igzip, libdeflate, gzip} x Squishy x T + defaults-audit cell; bar =
+max(all tools); bank CPU-s/GB (already <= rg = a claimable efficiency title) + peak RSS (+21-25%
+vs rg = open item). (5) Re-synthesis obligation (the stale 0.667x anchor leaked into briefs after
+rung-c shipped — MEMORY patched this turn). (6) Compression = abandoned-by-drift (zero commits
+since 2026-05-25): owe a baseline matrix then a dated user decision. (7) Owned leads: T16
+fallback-rate curve (GAP-2: fallbacks>=chunks at T16!), model 0.857 own decomposition.
+NEXT: implement the FIRST LEGAL DIVERGENCE — pump prefetch from the consumer's blocked-wait poll
+loop (and measure); falsifier: gaps <=10ms/worker AND >=half-gap ratio recovery, else lever dead
+and silesia T4 = drift-limited terminal.
 ## RESUMED PROBE GATED — CPU gate CONFIRMED; idle DISPATCH GAPS named; ISA-L "recoverable" claim discarded (Rule 3) [2026-06-12]
 Box back (network outage, host uptime 53d — never rebooted). Frozen session, sha-OK, N=10:
 wall gz 563 / rg 498 = 0.911x. BANKED: (1) CPU GATE CONFIRMED 2nd session — gzippy thread-summed
