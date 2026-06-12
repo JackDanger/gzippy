@@ -1,3 +1,29 @@
+## INSTRUCTION-DIFF GATED (ledger REBUILT on-box): MARKER PHASE = #1 TARGET (~42%); CLEAN ENGINES AT PARITY [2026-06-12]
+Gate REJECTED the worker's categories (and the supervisor's candidate): measured denominators
+decided it. VOLUMES (measured, parity confirmed — placement converged): gz marker 69.7MB / clean
+142.3MB ~= rg 67.6 / 144.4. ISA-L CALIBRATED on this box (igzip CLI, same lib): ~10.5 insn/byte —
+instruction counts are SUBSTRATE-INDEPENDENT (PEXT microcode = cycles, not counts; the worker's
+"ISA-L 2.7/B" was a denominator hallucination — rg's ISA-L covers only ~39MB window-known chunks;
+its clean BULK is the custom u8 path inside Block::read at ~12-14.5/B, vendor flip deflate.hpp:1282).
+CORRECTED LEDGER (gz-native vs rg, +2,995M): #1 MARKER PHASE +1.0-1.5B (~42%): gz 40.1
+insn/marker-byte across THREE passes (read 15.2 + emit_backref 16.9 + segmented 8.0 = 2,795M)
+vs rg ~18-26/B in ONE loop — the u16 two-pass split ~doubles the marker rate; #2 kernel +631M
+(syscalls EXONERATED: gz 1,030 vs rg 3,244 — gz spins-not-parks; faults +46.6K explain <=20%;
+mechanism OPEN); #3 sched +490M; #4 tables +217M; #5 finalize +142M; CLEAN DECODE ~0 — gz asm
+9.97/B vs ISA-L ~10.4/B = PARITY-or-ahead: "asm-vs-ISA-L instruction parity" is ALREADY ACHIEVED
+(engine-rate arithmetic predicts the isal-native delta -61M EXACTLY); any clean-side asm grind on
+instruction grounds is REFUTED (revisit only with Intel cycle data). ANOMALY RESOLVED: the
+"unprofilable 1.57x isal" rebuild had DROPPED FEATURES (legacy-serial flavor — the guard caught
+it); truth table uncontaminated. RATES BANKED (silesia, insn/output-byte): ISA-L ~10.5, gz-asm
+9.97, rg-custom-u8 ~12-14.5, rg-marker ~18-26, gz-marker 40.1.
+THE STRUCTURAL FIX = the long-governing u8 clause (ONE MarkerRing, in-place u16->u8 flip, backref
+resolution INLINE in the read loop, deleting emit_backref + segmented_markers as separate passes
+— vendor Block::read shape): the instruction profile just gave that directive its measured
+justification. DISPATCHED: marker-phase criticality perturbation (emit_backref +50% sleep, T8,
+pre-registered) per process rules; THEN the single-loop port with the PRE-REGISTERED falsifier:
+marker-phase user insns 2,795M -> <=1.9B (<=27/marker-B) = total excess shrinks >=0.8B;
+FALSIFIED if single-loop lands >2.4B (rate gap would be intra-loop). Addendum on solvency:
+plans/instruction-diff-v1.md.
 ## SMALL-FILE RECON: NO vendor mechanism to port — clamp + lazy-spawn already faithful; one micro-divergence named [2026-06-12]
 Read-only vendor recon (ParallelGzipReader/ThreadPool/BlockFetcher + gzippy startup ledger):
 rapidgzip has NO sequential fast path / NO thread clamp for small inputs — its ONLY small-file
