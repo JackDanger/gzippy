@@ -4115,6 +4115,10 @@ fn drain_one_pending<W: std::io::Write>(
             // verifies the decode ran) -> the off->on wall delta is the CAUSAL
             // removable share of the OUTPUT term that fulcrum_total localized on the
             // consumer timeline. OFF == identity (byte-exact). Never on a prod build.
+            // The read is gated to linux because its only consumer (the `if
+            // skip_writev` branch below) is linux-only; on other targets the env
+            // var has no effect, so reading it there is dead (unused-var warning).
+            #[cfg(target_os = "linux")]
             let skip_writev = std::env::var_os("GZIPPY_SKIP_WRITEV_SYSCALL").is_some();
             #[cfg(target_os = "linux")]
             if skip_writev {
