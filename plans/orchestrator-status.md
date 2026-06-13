@@ -1,3 +1,35 @@
+## SYNTHESIS (Opus, pivotal RE-AIM) — the wall is CLEAN-DECODE-KERNEL IPC, not instructions/marker [2026-06-12]
+Four investigations + the FROZEN removal-oracle reconcile: instruction-count regions != cycle-cost
+regions. WALL LOCALIZATION (banked removal-oracle-ceilings, frozen): silesia T1 NODECODE = 642ms =
+50.9% of wall; NOSTORE = only 94ms = 7.4%. => the CLEAN DECODE KERNEL (asm/Huffman) is HALF the
+single-thread wall — low instruction-count, high cycles/insn (stall/latency-bound). Marker emit is
+the biggest INSTRUCTION region but wall-SLACK. CORRECTION: the insn-calib label "kernel 29%
+WALL-NEUTRAL" is true ONLY of the SPIN sub-component; the DECODE work is 51% of wall — do NOT write
+off the kernel. Q1 RANK: T1 wall = clean-decode/kernel IPC (DOMINANT; 3 pillars: removal-oracle 51%,
+engine-W asm-bounded 0.667x, Intel insn-parity-yet-isal-wall-wins => ISA-L higher IPC; native-T1-
+no-ISAL is a SUBSET — T1-isal WINS 1.131 on the same bytes, isolating cause to engine not pipeline).
+cache/BW WEAK at T1 (NOSTORE only 7.4%). T8 = kernel IPC + scheduling/placement (T4 81% eff; ~40%
+T8 prefetch/HoL stalls) + cache/BW (plausible, UNMEASURED at multicore) — REFUSE to over-rank T8
+from T1 data (the cross-regime extrapolation that's burned us). Q2 u8-DIRECT PORT (SegmentedU16->U8,
+kill the finalize u16->u8 narrow): NO-GO as the wall lever now — it's the 64%-INSTRUCTION-share we
+just proved doesn't predict wall, and the u8-falsifier never touched clean_unmarked_data's narrow
+(so finalize+ring is UNKNOWN-on-wall, not dead). CHEAP TEST OWED FIRST (Rule 3): GZIPPY_ORACLE_
+NOFINALIZE + ring-removal arms (removal_oracle.rs pattern) size the finalize+ring WALL ceiling in
+~a day vs the multi-week rewrite. GO on rewrite only if the oracle returns real wall; else
+faithfulness-mandate-only, never "the gap-closer," not ahead of kernel-IPC work. Q3 NEXT MEASUREMENT:
+TMA top-down stall breakdown (discriminates memory-BW (a) from core-IPC (b)) — build as `fulcrum
+cycles` with a topdown closure invariant (retiring+badspec+fe+be==slots), on silesia T8 + model T8
+NATIVE-vs-isal-vs-rg, Intel(neurotic) PRIMARY + solvency cross-check + silesia T1 cross-check.
+Q4 PHANTOM-KILLER: report TMA FRACTIONS (intensive, freq-cap & spread robust) NOT capped-wall
+absolutes; verify dominant bucket is freq-invariant (capped vs turbo on one cell); re-measure
+model-T8 isal-vs-native higher-N — if within spread, RETRACT "isal recovers on Intel". Q5 STRATEGIC:
+"drop isal, ship native" is UNSOUND on Intel TODAY — isal beats native at T8 on model(+15%)/
+monorepo(+45%) + wins all T1; native deficit is STRUCTURAL IPC near the engine-W 0.667x bound
+(maybe unreachable without deeper-than-rung-c asm). Pure-Rust as sole FAITHFUL path = OK correctness
+milestone; as sole SHIP-PERF path on x86_64 NOW = a measured regression. Do NOT drop isal until
+native matches its OWN isal sibling at T8 on model/monorepo on Intel; sequence asm/IPC first,
+re-baseline, revisit. DISPATCHED: (1) fulcrum cycles TMA + the stall profile; (2) NOFINALIZE/ring
+removal-oracle.
 ## FULCRUM insn CALIBRATED — 42% marker REFUTED (real 20% of excess); finalize+ring=64% of INSN excess; but insn != wall [2026-06-12]
 Calibrated INSN_CATEGORIES vs real solvency perf captures (313 selftests, pushed fulcrum 9808d16) —
 Rule 1 satisfied for instruction attribution. CORRECTIONS: marker_emit is 29.7% of total (NOT 42%),
