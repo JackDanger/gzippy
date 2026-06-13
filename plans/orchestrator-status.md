@@ -1,3 +1,30 @@
+## RECONCILIATION (Opus heterogeneous) — caught 2 supervisor mechanism errors; u8-width port DEAD; finalize-op-reduction is the cheap win [2026-06-12]
+The TMA-vs-NORING contradiction resolved against the CODE. My reconciliation was directionally right
+(3 frontend/core levers, consistent on not-memory) but WRONG on 2 mechanisms: (a) push_slice +
+clean_unmarked_data are memcpy/VOLUME-bound (not branch-bound) — so "memory<0.5% => width
+irrelevant" was unsound; (b) YET the u8-port still captures only ~20ms, for a BETTER reason: the
+marker ring is IRREDUCIBLY u16 (MARKER_BASE=32768; markers ARE u16 values [32768,65535] — cannot be
+stored u8; rg's dataWithMarkers is u16 TOO) AND the clean bulk is ALREADY u8-direct
+(decode_clean_into_contig -> SegmentedU8). => THERE IS NO WIDTH KNOB. **The u8-width SegmentedU8
+rewrite is a DEAD LEVER** (= the same 20ms NOFINALIZE region, which is just clean-data-mis-routed-
+through-u16). NORING's 94ms is a FANTASY ceiling (markers MUST be stored u16; rg pays it — rg
+marker_emit 1,743M ~= gz 2,234M). The achievable faithful subset = FINALIZE OP-REDUCTION (rg
+finalize 174M vs gz 924M = 5x lighter), wall ~20ms frozen / ~60ms neurotic.
+GOVERNING-MEMORY CORRECTION (surface to user): the u8-clause ("the ring should be u8; keeping it
+u16 is the SHORTCUT", project_faithful_unified_decoder) rested on a FALSE premise — vendor ALSO
+uses u16 for markers, and gzippy's clean bulk is ALREADY u8-direct. The long-standing "u8 rewrite
+owed" mandate is effectively SATISFIED/MOOT; the u16 marker ring is CORRECT, not a shortcut.
+RANKED LEVERS: #1 (NEXT) FINALIZE OP-REDUCTION — port rg's 5x-lighter cleanUnmarkedData/finalize
+chain (HIGH feasibility, faithful, wall-validated ceiling ~20-60ms), gated by the marker-byte-flow
+measurement + a pre-registered falsifier (re-confirm NOFINALIZE; reject if production wall recovers
+< spread AND name the residual sub-op). #2 (BIG BET, parity-determining) INNER-LOOP frontend/
+bad-spec = engine-W (DOMINANT: 51% of T1 wall, ~36ms symbol-rate gap to ISA-L) but asm-bounded
+0.667x — the TRUE native-parity ceiling, maybe unreachable without deeper-than-rung-c asm. DEAD:
+u8-width. OWED PRE-FUNDING MEASUREMENT: count bytes through push_slice (marker) vs
+decode_clean_into_contig (contig) on solvency T8 — resolves the "marker ~1% dribble (banked) vs
+NORING 39.5%" contradiction; decides if lever-1 is a cheap finalize port or a big marker restructure.
+STRATEGIC: these levers do NOT reach native parity; the inner-loop is the ceiling; "drop isal"
+stays UNSOUND on Intel (isal-recovers confirmed). DISPATCHED: the marker-byte-flow measurement.
 ## NOFINALIZE/NORING REMOVAL-ORACLE — ring+finalize chain is 94ms WALL; but CONTRADICTS TMA on the u8-port verdict — RECONCILE [2026-06-12]
 probe/nofinalize-oracle (pushed): frozen solvency silesia T8, 3xN=9 +/-1ms. NOFINALIZE (skip
 clean_unmarked_data's u16->u8 narrow walk) = 20ms (8.4%); NORING (push_slice no-op => ring + ALL
