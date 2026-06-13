@@ -486,16 +486,6 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
         }
-        if std::env::var_os("GZIPPY_ORACLE_TRACE").is_some() {
-            eprintln!(
-                "ORACLE_SPAN i={i} start_bit={} stop_hint={} decoded_bytes={} out_cum={total_size} end_bit={} prefix_len={}",
-                starts[i],
-                starts.get(i + 1).copied().unwrap_or(total_bits),
-                chunk.decoded_size(),
-                chunk.encoded_offset_bits + chunk.encoded_size_bits,
-                chunk.data_prefix_len,
-            );
-        }
     }
     let secs = t.elapsed().as_secs_f64();
     let mb = total_size as f64 / secs / 1e6;
@@ -4115,6 +4105,10 @@ fn drain_one_pending<W: std::io::Write>(
             // verifies the decode ran) -> the off->on wall delta is the CAUSAL
             // removable share of the OUTPUT term that fulcrum_total localized on the
             // consumer timeline. OFF == identity (byte-exact). Never on a prod build.
+            // The read is gated to linux because its only consumer (the `if
+            // skip_writev` branch below) is linux-only; on other targets the env
+            // var has no effect, so reading it there is dead (unused-var warning).
+            #[cfg(target_os = "linux")]
             let skip_writev = std::env::var_os("GZIPPY_SKIP_WRITEV_SYSCALL").is_some();
             #[cfg(target_os = "linux")]
             if skip_writev {
