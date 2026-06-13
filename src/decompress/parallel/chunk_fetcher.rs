@@ -486,16 +486,6 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
         }
-        if std::env::var_os("GZIPPY_ORACLE_TRACE").is_some() {
-            eprintln!(
-                "ORACLE_SPAN i={i} start_bit={} stop_hint={} decoded_bytes={} out_cum={total_size} end_bit={} prefix_len={}",
-                starts[i],
-                starts.get(i + 1).copied().unwrap_or(total_bits),
-                chunk.decoded_size(),
-                chunk.encoded_offset_bits + chunk.encoded_size_bits,
-                chunk.data_prefix_len,
-            );
-        }
     }
     let secs = t.elapsed().as_secs_f64();
     let mb = total_size as f64 / secs / 1e6;

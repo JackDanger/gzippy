@@ -48,7 +48,6 @@ semantics + CLASS the bare list cannot give you.
 | `GZIPPY_RPMALLOC_STATS` | rpmalloc_alloc.rs:496 | instrument | Dump rpmalloc allocator stats; normal runs pay nothing. |
 | `GZIPPY_STORED_PHASE_TIMING` | stored_split.rs:52 | instrument | Prints per-phase wall of the stored-block split path. |
 | `GZIPPY_STALL_RESIDENCY_PROBE` | stall_residency.rs:12 | instrument | Residency/stall probe; OFF is an inlined early-return (OFF==identity). |
-| `GZIPPY_ORACLE_TRACE` | chunk_fetcher.rs:430 | instrument | Traces the speculation/oracle decisions in the fetcher. |
 | `GZIPPY_SLOW_HITS` | src/main.rs:122 | instrument | Counts slow-injection hits — the instrument-validity proof that a perturbation actually fired. |
 | `GZIPPY_SLOW_MODE` | slow_knob.rs:14 | perturbation | Numeric percent string: `"25"` ⇒ +25% injected into the targeted region. The primary criticality dial (rule 1). |
 | `GZIPPY_SLOW_KIND` | slow_knob.rs:17 | perturbation | `"spin"` (busy ALU, default) vs `"sleep"` (yields the core) — the frequency-neutral control (rule 2). |
@@ -170,7 +169,6 @@ or sit in protected decode-loop files:
   `GZIPPY_FOLD_NOCRC` (fold A/B).
 - **KEEP despite no direct cite (support active machinery / are kill-switches):**
   `GZIPPY_ASM_STATS` (effect-verification for the active asm campaign),
-  `GZIPPY_ORACLE_TRACE` (inside the active clean-window oracle),
   `GZIPPY_PID` / `GZIPPY_TRACE_DETAIL` (sub-knobs of the active TIMELINE/TRACE instrument),
   `GZIPPY_NO_MFAST_LOCALBITS` (kill-switch A/B in a protected decode-loop file),
   `GZIPPY_RPMALLOC_STATS` (cited in the active fulcrum2 charter),
