@@ -1,3 +1,49 @@
+## LEADER STATUS — Phase 0 DONE+pushed; Phase 1 measurement BLOCKED (disk 93% + no spawn tool) [2026-06-13]
+PHASE 0 COMPLETE (pushed reimplement-isa-l): score/ scaffold + SCHEMA.md + regen-index.sh +
+README skeletons + CELL-TEMPLATE.md (commit ef1e86e7). regen validated end-to-end with sentinel
+cells (all 5 blindspot views correct: coverage holes, binding, cross-arch divergence, staleness,
+untrustworthy-dist, lever rollup); empty matrix is 0/50. T12 HARNESS FIX (commit 406bccd7,
+pushed): pin_mask had only 1/4/8/16 -> t12 would decide_fail; added 12 -> neurotic mask
+0,1,2,3,4,5,6,7,8,10,12,14 (8 physical P-cores + 4 SMT siblings; E-cores excluded).
+ENVIRONMENT TRUTH (corrects stale MEMORY): neurotic reachable `ssh -J 10.0.0.100 root@10.30.0.199`;
+fixed local ~/.ssh/config (added HostName 10.0.0.100 to `Host neurotic` so guest.env JUMP=neurotic
+resolves — the whole fulcrum host-orchestration chain needs it). solvency reachable root@192.168.7.222.
+Corpora ALL present at /root/<name>.gz (model,monorepo,storedheavy,silesia,bignasa) — runner maps
+corpus->/root/<c>.gz and auto-sha-verifies, so storedheavy pin is captured in manifest automatically.
+Comparator: brief says /root/oracle_c/rapidgzip-native (v0.16.0 native ELF, sha 41baa20f...); guest.env
+pins a DIFFERENT native v0.16.0 ELF (gz-p35 build) — both native (not wheel); use the brief's by
+overriding RG. neurotic container cpuset=16 logical = exactly the 8 P-cores x2 SMT (E-cores 16-23
+excluded) => all masks <=15 are contamination-free. bench-lock IS on the JUMP host /root/bench-lock.sh
+(host=neurotic 10.0.0.100), NOT the guest; no_turbo=1 already.
+PIPELINE VALIDATED to dry-run: `scripts/fulcrum decide` (host-orchestrated from this Mac: freeze via
+ssh neurotic, ship guest scripts via -J, build is PRE-STAGED BIN [runner does NOT build], captures
+gzippy+rg walls per cell, sha-verifies every run, pulls artifacts, analyzes). Build model:
+gzippy-native=[pure-rust-inflate], gzippy-isal=[pure-rust-inflate,isal-compression], via
+`cargo build --release --no-default-features --features <F>`.
+BLOCKERS (fix-plan, NOT grinding past):
+ (1) NO AGENT-SPAWN TOOL in this harness (only TaskStop/EnterWorktree/Monitor). I cannot spawn the
+     intended per-box workers. => SUPERVISOR FORK: either spawn 2 box-workers with the briefs below,
+     OR authorize me to drive the full serial multi-freeze sweep in background.
+ (2) GUEST DISK /root = 93% full (2.5G avail). A release `cargo build target/` (~1-3G) risks the
+     banked FULL-DISK write-error failure. /dev/shm has 4.9G (RAM, tight). NEED: free /root (cargo
+     clean stale worktrees) OR a sanctioned CARGO_TARGET_DIR before any build. Owner/supervisor call.
+ (3) /root/gzippy worktree is DIRTY (M src/decompress/mod.rs, isal_decompress.rs, Cargo.lock...) =>
+     would measure uncommitted code; need a clean checkout at a known committed sha to build.
+ (4) guest.env pin GUEST_SRC=/root/gzippy-bench is NOT a git repo (decide doesn't build there so
+     not fatal, but the pin is stale).
+FREEZE-WINDOW NOTE: decide hostlock TTL=1800s, guest timeout=1500s; a 25-cell N=9 run (+trace/prof
+captures) likely EXCEEDS one window -> split per-threadcount (5 cells) or per-corpus batches.
+WORKER BRIEFS (ready to hand to spawned workers, one per box): per box -> resolve disk(2), clean
+build native+isal at branch HEAD staged as /root/bin-score-{native,isal} with flavor-assert
+(native=parallel-sm+pure, isal has isal on decode path), then per build run
+`scripts/fulcrum decide --bin <BIN> --feature <F> --no-knobs -N 9 --cells <corpus:T batch>` over the
+25 corpus×{1,4,8,12,16} combos (override RG=/root/oracle_c/rapidgzip-native on neurotic / the solvency
+vendor build), parse artifacts (wall_gz/wall_rg + manifest sha/freeze/mask) into score/<arch>/<t>/<c>.md
+per SCHEMA.md (paste fulcrum analyze verbatim into ## fulcrum decide), set the SCORE: line
+(ratio=rg/build, >=0.99 PASS; blind tags src=<sha7>,dist=,lever=), sha-verified, then regen-index.sh
++ commit. neurotic FIRST (native FAILS there = decision-relevant), solvency SECOND (native WINS =
+cross-arch fork). Mask: confirm via lscpu/mask_readback per cell.
+
 ## GOAL/METHOD SET (user 2026-06-13) — MATRIX-FIRST, stop lever-grinding; the score/ build IS this method [2026-06-13]
 User restated the goal + a governing METHODOLOGY (banked feedback_operating_rules R5): "weeks
 grinding on levers — we don't do that anymore. Measure arch x threadcount x archive with Fulcrum,
