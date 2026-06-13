@@ -54,63 +54,73 @@ SCORE: <arch-os> <tN> <corpus> | native=<ratio> <PASS|FAIL> | isal=<ratio> <PASS
   - additional free tags allowed (e.g. `mask=8P4E`), comma-joined.
   - if genuinely nothing to flag beyond the required three, still emit all three.
 
-Example:
+Example format (all values below are FICTIONAL — NOT A MEASUREMENT):
+
+> **FICTIONAL EXAMPLE — NOT A MEASUREMENT.** The arch/corpus/numbers are
+> invented to show format shape only. No real cell has these values.
+> Real cells live at `score/<arch-os>/<tN>/<corpus>.md`.
+
 ```
-SCORE: intel-x86_64 t8 silesia | native=0.74 FAIL | isal=0.99 PASS | rg=247ms | N=9 frozen 2026-06-13 | blind:src=1825d17,dist=RESOLVED,lever=engine-W,mask=8P
+SCORE: example-arch t99 EXAMPLE | native=9.99 FAIL | isal=9.99 PASS | rg=9999ms | N=99 frozen 0000-00-00 | blind:src=DEADBEEF,dist=RESOLVED,lever=EXAMPLE,mask=EXAMPLE
 ```
 
 ### 2. YAML header block
 
 Fenced ```yaml block immediately after the SCORE line. Schema:
 
+> **FICTIONAL EXAMPLE — NOT A MEASUREMENT.** All values below are invented to
+> show field shapes only. `ratio: 1.00` for rapidgzip is definitional (it is the
+> comparator anchor, not a measured value). Real cells live at
+> `score/<arch-os>/<tN>/<corpus>.md`.
+
 ```yaml
-cell: intel-x86_64/t8/silesia
-date: 2026-06-13
-box: neurotic
-arch_os: intel-x86_64
-threads: 8
-thread_mask: "0-7"          # actual mask/affinity used; confirm via lscpu at fill time
-corpus: silesia
+cell: example-arch/t99/EXAMPLE
+date: 0000-00-00
+box: EXAMPLE-BOX
+arch_os: example-arch
+threads: 99
+thread_mask: "EXAMPLE"      # actual mask/affinity used; confirm via lscpu at fill time
+corpus: EXAMPLE
 corpus_pin:                 # the input the numbers are for
-  path: /root/corpora/silesia.tar.gz
+  path: /path/to/EXAMPLE.tar.gz
   sha256: <sha256 of the .gz input>
   decompressed_sha256: <sha256 of the gunzip output — the byte-exact target>
 frozen:
-  method: "/root/bench-lock.sh"   # or "no_turbo" / "source /root/bench-env.sh && freeze"
+  method: "EXAMPLE"         # or "no_turbo" / "source /root/bench-env.sh && freeze"
   readback: "<verbatim freeze readback line>"
-samples: 9                  # 3 interleaved sweeps x 3 = 9
+samples: 99                 # 3 interleaved sweeps x 3 = 9
 comparator: rapidgzip-native
 bar: ">=0.99 ratio = PASS"
 builds:
   rapidgzip-native:
-    wall_ms: 247
-    spread_ms: 4
+    wall_ms: 9999
+    spread_ms: 99
     sha256: <binary sha256>
     ratio: 1.00
     verdict: COMPARATOR
     flavor: native-elf
   gzippy-native:
-    wall_ms: 334
-    spread_ms: 6
+    wall_ms: 9999
+    spread_ms: 99
     sha256: <binary sha256>
-    ratio: 0.74
+    ratio: 9.99
     verdict: FAIL
     flavor: pure-rust-inflate      # MUST assert: no isal symbols
   gzippy-isal:
-    wall_ms: 249
-    spread_ms: 5
+    wall_ms: 9999
+    spread_ms: 99
     sha256: <binary sha256>
-    ratio: 0.99
+    ratio: 9.99
     verdict: PASS
     flavor: isal                   # MUST assert: isal on decode path
 parity:
-  native_vs_rg: 0.74
-  isal_vs_rg: 0.99
-  native_vs_isal: 0.75
+  native_vs_rg: 9.99
+  isal_vs_rg: 9.99
+  native_vs_isal: 9.99
 distribution: RESOLVED      # RESOLVED | BIMODAL | NOISY ; must match dist= tag
 blindspots:
   - "<cell-specific caveat, free text>"
-dominant_lever: engine-W    # must match lever= tag
+dominant_lever: EXAMPLE     # must match lever= tag
 ```
 
 ### 3. `## VERDICT` — prose
