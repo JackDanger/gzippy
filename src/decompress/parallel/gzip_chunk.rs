@@ -2148,7 +2148,6 @@ struct MarkerDecodeCtx {
     #[allow(dead_code)]
     data_base_byte: usize,
     current_bit_offset: usize,
-    trailing_clean: usize,
     /// Clean u8 bytes committed to `chunk.data` (vendor `cleanDataCount`).
     clean_data_count: usize,
     block_primed: bool,
@@ -2170,7 +2169,6 @@ impl MarkerDecodeCtx {
         Ok(Self {
             data_base_byte,
             current_bit_offset: start_bit_offset,
-            trailing_clean: 0,
             clean_data_count: 0,
             block_primed: false,
             flipped: false,
@@ -2493,16 +2491,16 @@ where
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        if output.sink_len() > before_len {
-            let block_len = output.sink_len() - before_len;
-            let trailing_this_block = output.trailing_clean_since(before_len);
-            if trailing_this_block == block_len {
-                ctx.trailing_clean =
-                    (ctx.trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
-            } else {
-                ctx.trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
-            }
-        }
+        // DELETED (engine/u8-single-loop, 2026-06-12): the per-block
+        // `output.trailing_clean_since(before_len)` backward scan that fed
+        // `ctx.trailing_clean`. The field was WRITE-ONLY (no reader anywhere),
+        // and the scan walked the just-decoded block's u16s element-by-element
+        // through `SegmentedU16::get` (O(#segments) PER ELEMENT — the segment
+        // list is re-walked from the front for every index). Vendor has no
+        // counterpart: rapidgzip tracks `m_distanceToLastMarkerByte`
+        // incrementally inside `Block` (deflate.hpp:1311-1322), which gzippy's
+        // `WidthRing::distance_to_last_marker` already mirrors. Pure dead work
+        // on the marker-phase critical path; output-identical by construction.
 
         let flipped_clean = !block.contains_marker_bytes();
         if flipped_clean {
