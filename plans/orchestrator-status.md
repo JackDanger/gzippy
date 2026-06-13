@@ -1,3 +1,23 @@
+## FULCRUM `insn` BUILT + GATED — totals TRUSTWORTHY, per-category NOT YET (hardening dispatched) [2026-06-12]
+Rule-1 capability landed: `fulcrum insn` (decide/fulcrum/core/insn.py, INSN-CLOSURE-OR-NO-LEDGER,
+222 selftests, pushed) — deterministic instruction ledger that REFUSES unless categories sum to
+the perf-stat total; the 690M in-tool double-count class is now STRUCTURALLY IMPOSSIBLE
+(single-bucket resolve_category + over-count/ambiguous/percentage refusals, all non-vacuous per
+the gate). HETEROGENEOUS-ADVISOR GATE (Opus, adversarial) caught Rule-1-critical gaps BEFORE we
+trusted it on the +2.8B question: (G1) per-category attribution — the ACTUAL deliverable — has NO
+guard; a single-WRONG-bucket symbol passes silently because the TOTAL still closes (the adapter's
+"safe by construction" claim is FALSE for single-wrong-match); (G2) NO stat-vs-report EVENT
+cross-check => a report sampled on a different event summing within tolerance conserves silently
+(the denominator-mismatch class = the old 2.7-insn/byte hallucination); (G3) selftests assert
+refusals by exception TYPE only (can rot green). The "conservation assertion" is an algebraic
+IDENTITY (can't fire) — the real guards are elsewhere. VERDICT: TRUST insn TOTALS, do NOT trust
+its per-category split until calibrated + event-check added. HARDENING DISPATCHED (push-free):
+INSN-EVENT-MISMATCH refusal (G2), docstring/comment truth + necessary-not-sufficient test (G1),
+refusals-asserted-by-name (G3). CATEGORY CALIBRATION needs real perf data = a SUPERVISOR step
+(gzippy-native/isal/rg `perf report -F period,symbol` on solvency+neurotic) before insn's
+per-category answer is trusted for the marker-phase verdict. This gate is the user's
+"more/heterogeneous advisors" rule paying off — exactly the vacuous-invariant class that slipped
+twice before (locate residual, registry subset).
 ## CLEANUP BASELINE MERGED (ea7c7584) + workspace minimal + neurotic online [2026-06-12]
 gzippy easy-mode cleanup MERGED (solvency-verified MERGE-READY: both builds compile, clippy -2,
 4/4 sha smoke 028bd002 correct routing, fmt clean): 4 dead-code deletions, stale-comment removals,
