@@ -1,3 +1,31 @@
+## u8 PORT FALSIFIER = FALSIFIED — marker phase is NOT the T8 wall (stalls, not instructions); instruction framing REFUTED [2026-06-12]
+Built the faithful u8 single-loop (engine/u8-faithful-v2, pushed, NO MERGE, default-OFF
+GZIPPY_MFAST_REENTRY): byte-exact 36/36 sha grid both builds on solvency real-AVX2; marker coverage
+55.8%->98.8% (converges to vendor's single readInternal loop); T4 diff_ratio guard PASSES (the prior
+1.637 regression did NOT reproduce — kept default-OFF to be safe). THE NEVER-RAN FALSIFIER, now run
+on a REAL removal-oracle (not the rule-3-forbidden slope): FALSIFIED on the instruction bar. perf
+stat silesia T8: only -21M (-0.32%) total, ~-0.75% of the ~2.76B marker phase; marker phase stays
+~2.74B >> 1.9B target. MECHANISM works (44%->1% careful-loop coverage) but the careful-loop excess
+is ~32% CYCLES (STALLS), only ~7 insns/converted-event => eliminating it is instruction-neutral.
+WALL A/B (interleaved N=11 frozen): ALL TIE (silesia isal 256.5/256.5, native 247.3/247.3; model
+isal 121/120, native 135/135). VERDICT: the faithful single-loop is NECESSARY-BUT-INSUFFICIENT —
+exactly the off-track read's prediction, now SETTLED by a genuine removal-oracle. The 2nd advisor's
+"pass-elimination beats the slope estimate" ALSO resolved: the elimination is byte-exact but
+WALL-NEUTRAL. THE GOVERNING "wall = instruction delta" RULE IS DECISIVELY CONTRADICTED on this
+workload (2nd confirmation: IPC anomaly was the hint, this is the proof) — perturbing ~42% of
+instructions moves the wall 0. PREMISE CORRECTIONS (worker, read-the-code): (a) gzippy marker arch
+is ALREADY single-ring (window16 + same-backing ring8 view) + inline in-buffer resolve + in-place
+flip — the "SegmentedU16 is the shortcut / flat-buffer is the faithful target" view (2nd advisor via
+rg-marker-completing CLAIM B) is DISPUTED; SegmentedU16 = the faithful per-read drain sink (vendor
+dataWithMarkers). RECONCILE in synthesis. (b) the 69.7MB marker denominator is SILESIA not model
+(model = 1.88MB marker on this box) — the "model-isal" baseline was silesia mislabeled. ROBUST RE-AIM
+(survives the faithfulness dispute): the native T8 wall lever is NOT marker symbol rate. It is
+STALLS/IPC (cycles), SCHEDULING/PLACEMENT, NATIVE-T1 (no ISA-L), SMALL-FILE overhead, memory
+bandwidth — corroborating Intel (gap is IPC not instructions) + engine-W asm-bounded 0.667x.
+DISPOSITION: keep u8-faithful-v2 on branch as the measured artifact; do NOT merge (wall-neutral,
+default-off = Rule-2 surface for no gain; faithful-arch status is a synthesis question). NEXT:
+heterogeneous-advisor SYNTHESIS after the insn-calibration thread lands — what native parity
+ACTUALLY requires now that the instruction framing is dead.
 ## INTEL RE-BASELINE (neurotic, ship-target substrate) — native far from bar; isal RECOVERS, reversing Zen2 [2026-06-12]
 24 cells, sha-verified, interleaved best-of-N, native rg ELF (41baa20f, <10ms), built @836e4897.
 Intel masks (P-cores 0,2,4,6,8,10,12,14). SHIP-TARGET (native) SCORECARD: PASSES the 0.99 bar ONLY
