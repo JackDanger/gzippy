@@ -81,6 +81,25 @@ ATTRIBUTION?**
 
 Fast-lane changes still pay the faithfulness gate + matrix re-measure.
 
+**FAST-LANE IS A BIAS-AMPLIFIER — two hard limits (added 2026-06-13 after the
+antagonist caught it).** The fast lane skips S4 (causal perturbation), the one gate
+that has ever produced truth in this campaign. Without limits it becomes a machine
+for: form an interpretation → implement it without the gate that detects phantom
+levers → keep it because it's byte-identical-and-TIE. So:
+- **A kept-on-TIE change is BOOKKEEPING (correctness/cleanliness), NOT a
+  performance advance.** Do not report a wall-TIE as a win; by the campaign's
+  governing truth (1000 commits: a TIE is not an advance) it is a guess we kept.
+  Keeping it is fine; *crediting* it as progress, or as "we already fixed region
+  X," is the trap (it makes the real structural lever look addressed).
+- **"Fewer instructions/ops" is NOT a fast-lane qualifier when the wall is
+  frontend/memory/serialization/scheduling-bound** (which our oracles say it is).
+  Reducing a retired-instruction count is an *attribution* about the wall, and
+  attributions go through the funnel. The fast lane is ONLY for changes that
+  remove a STRUCTURAL divergence from rapidgzip (e.g. a wrong data structure rg
+  doesn't use) whose wall effect the matrix then confirms — not micro-opts *inside*
+  a divergence (renaming the cost without removing it: the crc_write/push_slice
+  pattern).
+
 ---
 
 ## Stage 0 — COVERAGE, TRUST & VALIDITY MAP (is the data even readable?)
@@ -97,6 +116,16 @@ the job. Classify every gap:
 | **Provenance hole** | number lacks commit / host / flavor / fulcrum-version / freeze context to be reproduced | the phantom 2105ms that reproduced on no binary |
 | **Decomposition hole** | a span conflates sub-costs; can't act until split | `crc_write` = CRC32 + write() + buffer-copy |
 | **Mechanism hole** | an attribution exists but no causal perturbation | "serial consumer = 69% of wall" (attribution only) |
+
+**CONSULT THE MEASURED LEDGER FIRST (added 2026-06-13 — the session's deepest
+bias).** Before forming ANY new hypothesis, read `plans/disproof-ledger.md` and the
+prior removal-oracle findings. This campaign's advances come from MEASUREMENT, and
+many levers are ALREADY located by past oracles (e.g. DIS-15: T1 deficit is the
+247ms ParallelSM per-chunk serialization, not the inner loop; DIS-16: T4 gap is
+parallel-scheduling, not the consumer lifecycle; DIS-22: isal-T1→single-shot
+shipped). Generating a fresh interpretation that re-treads or contradicts a measured
+oracle is the relapse. A new hypothesis must either cite why the prior oracle
+doesn't apply, or build on it — never ignore it.
 
 **Gate 0:** (a) the instrument used to produce a cell must have passed a self-test
 on this host/commit (see Instrument Self-Validation) — an unvalidated instrument
