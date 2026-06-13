@@ -71,7 +71,7 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::gzip_chunk::{decode_chunk, decode_chunk_window_absent};
+use crate::decompress::parallel::gzip_chunk::decode_chunk_window_absent;
 #[cfg(all(unix, parallel_sm))]
 use crate::decompress::parallel::output_writer;
 #[cfg(parallel_sm)]
@@ -3429,7 +3429,6 @@ fn recv_post_process_blocking<F>(
 ) -> Result<F, FetchError> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     use std::time::Duration;
-    let mut rx = rx;
     loop {
         match rx.try_recv() {
             Ok(v) => return Ok(v),

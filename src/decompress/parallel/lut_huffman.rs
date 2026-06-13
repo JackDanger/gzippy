@@ -28,16 +28,6 @@
 //! and is reproduced here without behavioral change so this module is
 //! self-contained.
 //!
-//! ## Correctness gate
-//!
-//! When BOTH the `isal-compression` and `pure-rust-inflate` features are
-//! enabled (the test-only cross-check build profile), the unit test
-//! `port_matches_c_isal_byte_for_byte` runs both this Rust builder and
-//! ISA-L's C builder on the same code-length inputs and asserts the
-//! resulting LUTs are byte-equal. Per the memory rule
-//! `feedback-real-corpus-test-with-lever`, the wiring commit also ships a
-//! silesia byte-perfect differential.
-//!
 //! ## License
 //!
 //! Original code is BSD-3-Clause licensed by Intel Corporation (ISA-L).
@@ -1293,28 +1283,6 @@ mod tests {
         assert_eq!(h.extra_bit_count(), 0x42);
         assert_eq!(h.code_and_extra(), 0x42_3456);
     }
-
-    /// Cross-check: build the LUT with both pure-Rust and ISA-L C on
-    /// the SAME code-length input and assert byte-equality of the
-    /// resulting `inflate_huff_code_large.short_code_lookup` +
-    /// `long_code_lookup`. This is the gate that pinpoints any bug in
-    /// the pure-Rust port — silesia decode failures surface as CRC32
-    /// mismatches but don't say WHERE the LUT differs.
-    ///
-    /// Only runs when BOTH the `isal-compression` and `pure-rust-inflate`
-    /// features are enabled (which means ISA-L is linked AND we
-    /// constructed `LutLitLenCode`). Use:
-    ///
-    ///     cargo test --release --features isal-compression \
-    ///         --features pure-rust-inflate --lib \
-    ///         port_matches_c_isal -- --nocapture
-    #[test]
-
-    /// Same cross-check on a couple of randomized real-world-shape
-    /// dynamic-Huffman code-length sets (Kraft-valid by construction).
-    #[test]
-
-    /// Helper used by the two cross-check tests above.
 
     /// Build a lit/len decoder from a real dynamic-block code-length set
     /// and round-trip decode a few hand-crafted symbol bit patterns.
