@@ -150,7 +150,7 @@ routing_assert() { # <corpus> <T>
 run_cell() { # <corpus> <T>
   local c="$1" t="$2" mask maskd cdir f i gsec gsha rsec rsha GZT="" RGT="" DIVERGED=0
   mask="$(pin_mask "$t")"
-  [ -n "$mask" ] || decide_fail "bad-T:$t (use 1,4,8,16)" 8
+  [ -n "$mask" ] || decide_fail "bad-T:$t (use 1,4,8,12,16)" 8
   # DERIVED mask: the kernel's readback of the requested pin (a cpuset-shrunk
   # or silently-failed pin is caught by the analyzer's canonical comparison).
   maskd="$(mask_readback "$mask")"
