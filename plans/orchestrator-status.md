@@ -1,3 +1,22 @@
+## CHAMPION SCORECARD (measured, AMD) — DIS-15 tax NOT reproduced; native T1 deficit = INNER KERNEL, not pipeline [2026-06-13]
+Worker a5d39a7d, solvency frozen, silesia T1, N=10 interleaved, all 80 outputs sha-verified vs pin. The
+goal-comparator scorecard that was NEVER measured (native vs the tools we want to delete):
+  gzippy-isal-shot 706ms > isal-PSM 712 > igzip(ISA-L 2.31) 744 > rapidgzip-P1 799 > gzippy-native 826
+  ~= libdeflate-gunzip 833 > pigz 1192 > gzip 1775.  (min of N=10; native spread wide ±68ms.)
+TWO MEASURED CORRECTIONS (stale-conclusion pattern, the user's thesis):
+- DIS-15's 247ms ParallelSM serialization tax is NOT REPRODUCED at HEAD: isal-PSM 712 vs isal-shot 706 =
+  +6ms (WITHIN spread ~20ms) => the per-chunk pipeline is ~FREE at T1 now (code changed since DIS-15, or it
+  was corpus/state-specific). So the "native T1 lever = mirror DIS-22 single-shot routing" pivot is WRONG.
+- native T1 deficit = the INNER INFLATE KERNEL (pure-Rust vs ISA-L asm): native BEATS libdeflate (+6.5ms) but
+  trails igzip by 82.7ms (~10%, gap > both spreads). NOT serialization (6ms), NOT consumer copies.
+CAVEAT (must confirm on Intel): AMD Zen2 microcoded PEXT HANDICAPS igzip/libdeflate BMI2 — so on Intel
+(BMI2-fast) native's gap to igzip likely WIDENS. The "fastest on any system" claim REQUIRES the neurotic
+Intel scorecard (paved path scripts/bench/parity.sh + freeze; champions /usr/bin/{igzip,libdeflate-gunzip,
+gzip,pigz} present; builds /root/gz-score-bins/{gzippy-native,gzippy-isal}; rg /usr/local/bin/rapidgzip).
+IMPLICATION: the T1 front is the INNER KERNEL (CLAUDE.md explicitly-authorized open territory: BMI2/asm/
+multi-literal/etc.), located by MEASUREMENT not interpretation. isal-shot (706) is the current fastest —
+the bar native must reach to let us drop ISA-L. (DIS-15/16 may be stale at HEAD — re-measure before citing.)
+
 ## push_slice REJECTED — the "win" evaporated under the spread check; live proof of the thesis [2026-06-13]
 Implementation worker a8e681e9 built the byte-identical copy_nonoverlapping fix (branch fix/push-slice-batch-
 copy @ 921b8ffa, sha-verified both flavors) and declared "KEEPER, clear WIN ~7-8% both builds." FALSE by our
