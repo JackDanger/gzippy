@@ -1,3 +1,22 @@
+## SCOPE SHARPENED + two-front diagnostic plan (user 2026-06-13) [2026-06-13]
+USER: "We must be the fastest single-threaded decoder as well as multi-thread. [project uses libdeflate +
+zlib-ng switched on file size, tradeoffs not ideal] I want a native decoder that is best at T1 on ANY
+system, letting us cut out zlib-ng and libdeflate ENTIRELY. I want this native decoder to mature nicely
+into multiple threads." => banked to [[project_native_is_ship_target]]. CONSEQUENCE: native = SOLE decoder
+T1->Tmax; T1 bar = FASTEST on any system (beat libdeflate/zlib-ng/ISA-L, not just rg); inner-loop dead-lever
+guard NO LONGER covers T1 (only parallel goal); DELETE libdeflate+zlib-ng from decode graph.
+TWO HEADLINE FRONTS now:
+  (1) T1 = native inner CLEAN Huffman loop (reopened). Native T1 ratios vs rg 0.76-1.11; rg isn't even the
+      T1 champ (libdeflate/ISA-L are) so the real bar is higher. Need T1 comparators ADDED: native vs
+      libdeflate vs zlib-ng vs ISA-L vs rg (matrix currently only vs rg).
+  (2) T4+ = SHARED parallel machinery (block-finder/window-map/dispatch/partition), proven by native<->isal
+      high-T convergence. Confirm-or-kill probe = AMD silesia t4 `fulcrum flow`.
+PERF-BOX NOTE: cycles/insn/flow-with-counters need bare-metal perf => SOLVENCY (AMD). neurotic LXC perf
+sampling historically blocked. So perf diagnostics serialize on solvency (one at a time, no contention).
+PLAN: worker#1 (solvency) = build derived fulcrum views from the 50 committed cells (self-speedup BOTH
+tools, abs walls+sizes, chunks-per-T) + run the parallel confirm-or-kill probe (silesia t4+t8 flow/vs/
+cycles). Then supervisor interprets + aims the T1 locate (front 1) next.
+
 ## FULL 50-cell matrix COMPLETE (AMD+Intel) + advisor-sharpened read — high-T gap is SHARED parallel machinery, NOT inner loop [2026-06-13]
 Both grids in: AMD(solvency) 25/25 + Intel(neurotic i7-13700T) 25/25, all `fulcrum score`, integrity-verified
 (50/50 well-formed). Intel masks AVOID E-cores (t4=0,2,4,6 phys P; t8=8 phys P; t12/t16 add SMT siblings —
