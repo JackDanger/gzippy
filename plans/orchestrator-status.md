@@ -1,3 +1,38 @@
+## FULL 50-cell matrix COMPLETE (AMD+Intel) + advisor-sharpened read — high-T gap is SHARED parallel machinery, NOT inner loop [2026-06-13]
+Both grids in: AMD(solvency) 25/25 + Intel(neurotic i7-13700T) 25/25, all `fulcrum score`, integrity-verified
+(50/50 well-formed). Intel masks AVOID E-cores (t4=0,2,4,6 phys P; t8=8 phys P; t12/t16 add SMT siblings —
+so Intel t12/t16 are SMT-CONTENDED, AMD t12/t16 are distinct phys cores: the two arches' high-T columns are
+NOT the same measurement). Intel ratios native/isal:
+  model 0.76/1.07|0.65/0.77|0.63/0.75|0.61/0.70|0.68/0.78 ; monorepo 0.90/1.37|0.84/0.82|0.82/0.82|0.79/0.74|0.73/0.64
+  storedheavy 1.11/1.39|0.82/0.78|0.98/0.86|1.02/0.92|1.05/0.89 ; silesia 0.84/1.14|0.80/0.81|0.72/0.69|0.82/0.79|0.88/0.77
+  bignasa 0.92/1.31|0.91/0.92|0.80/0.81|0.84/0.84|0.88/0.90  (cols t1|t4|t8|t12|t16)
+
+OPUS ADVISOR (a9f6f905) DISPROOF — adopted, REFRAMES the read:
+- LEAD EVIDENCE = native<->isal CONVERGENCE as T rises (NOT the ratio dip). Only code diff between builds is
+  the clean-tail decode. T1: builds far apart (AMD monorepo 1.34 vs 0.89). T16: collapse to ~0 (0.82/0.87,
+  native sometimes AHEAD). => the high-T bottleneck is in SHARED machinery (block-finder/window-map/marker
+  resolve/dispatch/partition), build-independent. This proves "not the inner clean loop" WITHOUT ratio framing.
+- "rg extracts more speedup per core" is an UNPROVEN self-speedup claim made from ratios — FORBIDDEN. Owe
+  S(t)=wall(t1)/wall(tN) for BOTH tools per corpus. AMD dip-recover is CONTAMINATED by rg anti-scaling
+  (bignasa rg 1196->1277 t8->t16). Intel monotonic decline (monorepo 0.90->0.73) fits an Amdahl higher-
+  fixed-serial-overhead model; the two arches likely tell DIFFERENT stories.
+- DO NOT merge 3 distinct mechanisms: (i) fixed serial overhead (Intel monotonic), (ii) too-few-chunks/
+  granularity (small-file high-T: monorepo rg only 92ms — maybe fewer chunks than cores, or gz chunk-size >
+  rg's), (iii) SMT contention (Intel t12/t16 only). "Scaling efficiency gap" is too coarse a single label.
+- DANGEROUS ALT: the convergence ALSO fits "gz does MORE WORK per byte" (marker re-decode volume / double-
+  decode-discard) — shared work is ALSO build-independent and looks like a scheduler gap. Must distinguish.
+- SINGLE confirm-or-kill PROBE: AMD silesia t4, `fulcrum flow` (+ vs/cycles cross-check). Large file (overhead
+  amortized), 4/16 cores (NO bandwidth saturation, NO SMT) => a gap there is overhead OR work-volume, clean.
+  CONFIRM(scheduler)=worker starvation rising + idle/coordination wall + gz insn~=rg. FALSIFY=workers ~100%
+  busy yet slower => gz does more work/byte (revives work-audit, NOT scheduler). Repeat at t8: starvation must
+  GROW to prove it's the scaling axis.
+- MUST add before concluding (R1b fulcrum work): absolute walls+file-sizes per cell, CHUNKS-per-corpus-vs-T,
+  self-speedup curves, RESOLVE bimodal cells (t8/model bimodal => mean is meaningless; report MODES + find the
+  guess-hit-vs-miss discriminator), comparator fairness (rg same mask/pinning? rg chunk-size vs gz).
+- NATIVE T1 is a SEPARATE in-scope gap (native=ship-target; Intel model T1=0.76 = the inner clean loop). The
+  dead-lever guard (no inner-loop asm) covers ONLY the parallel goal where it washes out by convergence — if
+  native single-thread parity is in scope, the guard does NOT cover T1. [strategic Q for user]
+
 ## AMD score matrix COMPLETE — 25/25 cells, integrity-verified; t4-DIP is the headline anomaly [2026-06-13]
 solvency (AMD EPYC 7282 Zen2) score/amd-x86_64 FULL: 5 corpora x {t1,t4,t8,t12,t16}, all via `fulcrum
 score` (N=9, 6 provenance invariants pass, native-rg ELF comparator, file-sink, frozen 2026-06-13,
