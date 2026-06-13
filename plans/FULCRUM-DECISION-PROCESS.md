@@ -117,6 +117,22 @@ the job. Classify every gap:
 | **Decomposition hole** | a span conflates sub-costs; can't act until split | `crc_write` = CRC32 + write() + buffer-copy |
 | **Mechanism hole** | an attribution exists but no causal perturbation | "serial consumer = 69% of wall" (attribution only) |
 
+**FULCRUM IS A CAUSATION-DISCOVERY TOOL (user 2026-06-13).** Fulcrum's job is to
+show PRECISELY WHERE, WHY, and HOW the wall is what it is — not to hand us numbers we
+then interpret. Interpretation is where this campaign's biases live, so we push the
+hard work INTO Fulcrum until it presents the obvious-in-hindsight opportunity with no
+interpretation left to get wrong. If a stage below needs a causal answer Fulcrum
+can't yet give, the right move is often to IMPROVE Fulcrum, not to interpret around
+it.
+
+**A STALE DISPROOF LEDGER IS DANGEROUS (user 2026-06-13).** Every disproof in
+`plans/disproof-ledger.md` holds ONLY within the context it was measured —
+commit/bin-sha, corpus, arch, thread count, code state — and at the confidence its
+evidence supports. State that context IN the entry; cite an entry only with its
+scope; re-measure before relying on it (DIS-15's 247ms tax was real then and is GONE
+at HEAD — citing it as current sent the campaign down a wrong front). A disproof is a
+TIME-STAMPED verdict in a context, never an eternal law.
+
 **CONSULT THE MEASURED LEDGER FIRST (added 2026-06-13 — the session's deepest
 bias).** Before forming ANY new hypothesis, read `plans/disproof-ledger.md` and the
 prior removal-oracle findings. This campaign's advances come from MEASUREMENT, and
