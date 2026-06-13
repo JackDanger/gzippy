@@ -1,3 +1,30 @@
+## PROBE RESULT — "shared parallel machinery" FALSIFIED; gap is SERIAL CONSUMER + 1.56x per-byte instructions [2026-06-13]
+Worker af8596f0 on solvency (frozen, sha-verified, GZIPPY_FORCE_PARALLEL_SM, path=ParallelSM asserted).
+AMD silesia t4/t8, gz-native trace (17 chunks, 16/17 speculative accepts, 0 mismatches):
+- STARVATION = 0.0% at BOTH t4 and t8 (recv_us=0 — consumer NEVER blocks on decode; workers run AHEAD).
+  block_finder=0ms. => scheduler/dispatch/block-finder hypothesis FALSIFIED. Worker util DROPS 66%->49%
+  t4->t8 (workers idle waiting on consumer) — the CONSUMER is the bottleneck, not workers.
+- CRITICAL PATH = the SERIAL CONSUMER: crc_write (output write + CRC32) = 254ms = 54% of 467ms wall;
+  apply_window (marker resolution, 73MB markers = 34.5% of output) = 69ms = 15%; combined ~69% of wall.
+  Both ~flat t4->t8 (consumer can't absorb output faster) — that's why wall savings diminish past t4.
+- perf instructions: gz-native 7.93B vs rg 5.08B at t4 = 1.56x MORE (1.54x at t8); ratio CONSTANT across T
+  => per-BYTE extra work, NOT coordination. sum_decode flat t4->t8 (1237->1273ms) = decode volume constant.
+- SELF-SPEEDUP (DERIVED.md, committed 7ac34554 + score/derived_views.py): native and rg scale ~IDENTICALLY
+  (silesia S(t8) 2.17 both; model 4.12/4.13); rg/native ratio FLAT T1->T16 (silesia ~0.88 const). Independent
+  confirmation: gap is per-unit-WORK, not parallelism. (isal scales WORSE than native at T4+ — ISA-L parallel
+  integration does more per-chunk work at high T.)
+VERDICT (worker, attribution-grade — NOT yet causally perturbed): bottleneck = serial consumer throughput
+(crc_write CRC32+write+buffering, apply_window marker resolution), + gz's 1.56x per-byte instruction tax.
+UNIFICATION (supervisor): at T1 there's no parallelism so the SAME serial consumer cost + 1.56x per-byte
+tax is exactly what makes native T1 lose => BOTH fronts likely share ONE root cause (gz does 1.56x rg's
+per-byte work). Cutting per-byte work helps T1 AND T4+.
+OPEN (next probe must resolve): crc_write conflates CRC32-compute vs write()-syscall vs buffer-copy — must
+DECOMPOSE (perf can't see I/O stalls in the instruction count, but the 1.56x is real retired-insn compute,
+separate from I/O). Need causal perturbation: does removing/scaling CRC32 (and apply_window) move the wall
+proportionally? Where do the 2.85B extra instructions live (apply_window? CRC? clean decode?).
+LIMITATION: fulcrum vs/flow need Chrome-trace (coz feature) not compiled in; rg has no FULCRUM_TRACE. Used
+JSONL trace + perf stat instead. A coz-instrumented build OR an insn-by-region breakdown is the gap to close.
+
 ## SCOPE SHARPENED + two-front diagnostic plan (user 2026-06-13) [2026-06-13]
 USER: "We must be the fastest single-threaded decoder as well as multi-thread. [project uses libdeflate +
 zlib-ng switched on file size, tradeoffs not ideal] I want a native decoder that is best at T1 on ANY
