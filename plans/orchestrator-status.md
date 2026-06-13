@@ -1,3 +1,27 @@
+## NOFINALIZE/NORING REMOVAL-ORACLE — ring+finalize chain is 94ms WALL; but CONTRADICTS TMA on the u8-port verdict — RECONCILE [2026-06-12]
+probe/nofinalize-oracle (pushed): frozen solvency silesia T8, 3xN=9 +/-1ms. NOFINALIZE (skip
+clean_unmarked_data's u16->u8 narrow walk) = 20ms (8.4%); NORING (push_slice no-op => ring + ALL
+downstream finalize/apply/drain vanish) = 94ms (39.5%); ring-write isolated ~74ms. Neurotic Intel
+(unfrozen): NOFINALIZE ~60ms, NORING ~132ms. Both SUBSTANTIAL. Worker concluded "u8-direct port
+GO-worthy, ~40-70ms."
+**CONTRADICTION (do NOT paper over):** TMA said memory_bound<0.5% => cache/BW dead => u8-direct
+NO-GO; this oracle says removing ring+finalize buys 94ms => GO. SUPERVISOR RECONCILIATION HYPOTHESIS
+(to be advisor-gated): they are CONSISTENT on the wall being FRONTEND/CORE-bound (not memory) — the
+94ms is frontend/core INSTRUCTIONS in the ring+finalize+apply chain, not memory BW. They DIFFER on
+what the u8-WIDTH port captures: NORING removes the OPERATIONS entirely; a u8-direct port only
+HALVES WIDTH (same elements/iterations/branches, narrower loads) => captures ~the NOFINALIZE 20ms
+(the narrow it deletes) NOT the 94ms; width-halving relieves only the <0.5% memory part. The 94ms is
+reducible by FEWER OPERATIONS — port rg's lighter post-decode chain (calibration: rg finalize 174M
+vs gz 924M insns = 5x lighter), a DIFFERENT change than width-halving. So likely THREE distinct
+levers: (1) u8-narrow elimination ~20ms (the u8-direct port's real ceiling, modest); (2) finalize/
+ring OPERATION-reduction ~74ms (port rg's 5x-lighter chain — the big post-decode lever); (3) inner
+HUFFMAN DECODE loop frontend/bad-spec (TMA: native model 19.5% vs rg 10.8% frontend — a separate
+region = port rg's inner-loop structure). The worker's "u8 port buys 40-70ms" likely OVERSTATES
+(conflates NORING-removes-ops with port-halves-width). ALSO noted: gz-PURE 237ms vs rg 177ms on
+solvency T8 = native 0.74x rg (pure-Rust behind rg on Zen2; the prior "gz ahead" was the ISA-L path).
+DISPATCHED: reconciliation advisor (Opus, heterogeneous) — confirm/refute the 3-lever split, the
+real u8-direct ceiling, and RANK the levers (wall ceiling x feasibility) before any work-stretch.
+NOFINALIZE/NORING are CEILING oracles (garbage output, removal_oracle.rs, production-safe env-off).
 ## TMA VERDICT — the wall lever is FRONTEND-BOUND + BAD-SPEC in the INNER HUFFMAN LOOP (not BW, not instructions) [2026-06-12]
 fulcrum cycles built (TMA-CLOSURE-OR-NO-BREAKDOWN invariant, 348 selftests, pushed fulcrum
 2678d4c/bcae041) — Rule-1 tool for cycle/stall questions now exists. THE MEASUREMENT (Intel
