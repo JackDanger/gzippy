@@ -1,3 +1,29 @@
+## OFF-TRACK READ (user-requested, READ-ONLY Opus) — DRIFT FOUND: marker lever is NECESSARY-BUT-INSUFFICIENT [2026-06-12]
+Cold outside assessment. BAR is tracked honestly (zero corpora pass under the binding bar; T1-isal
+20/20 = product-today not goal-state; discipline + quarantine held) — NOT losing sight of the bar.
+BUT losing sight of whether the CHOSEN LEVER can reach it. CRUX (the campaign's OWN arithmetic):
+marker phase = +1.0-1.5B of the +2.8-3.0B instruction excess (~42%); a PERFECT marker port leaves
+~1.55B (kernel +631M, sched +490M, tables +217M, finalize +142M) => still ~1.30x insns => ~0.77x
+wall by the governing rule — nowhere near 0.99. Wall arith worse: the criticality probes give marker
+only ~12-19ms ceiling against 50-90ms gaps. WORST: the port is MIS-TARGETED for the SHIP build —
+bootstrap/marker is STRUCTURALLY ABSENT at native T1 (the flagship cell the rewrite was funded for,
+banked INC-0); marker criticality is confirmed mainly on ISAL-T8 (the build being DROPPED). Real
+native beneficiary = model/weights-native only (narrow). The u8 port has INDEPENDENT justification
+as the faithful-architecture mandate — pursue it AS THAT, not sold as "the #1 gap-closer."
+OTHER FINDINGS: (2) the "42%" is an UN-CALIBRATED per-category split the campaign itself flagged
+not-yet-trustworthy (fulcrum insn calibration owed) — prioritizing the lever on it violates Rule 1
+in spirit. (3) ALL wall numbers are Zen2 (ISA-L PEXT microcode-crippled, penalizes isal); Intel
+ship-box (neurotic) un-re-measured. (4) IPC ANOMALY: gz IPC BETTER than rg + kernel "spins-not-
+parks" => a chunk of +2.8B is WALL-NEUTRAL SPIN — the instruction=wall framing is contradicted by
+its own data and is next-in-line to be refuted (after CPU-gate + wall-conversion already died). (5)
+parked failing cells with no plan: silesia-isal T4 0.912, native T1 129ms uncharted. (6) minor:
+broken clean-window oracle still compiled; RSS (native +40%/2.7x) not in the bar = unratified scope
+narrowing; perturbations still 3-corpus monoculture. RESOLUTION (measure, don't argue — Rule 1):
+2nd heterogeneous advisor on the redirect + DETERMINISTIC measurements before funding the port:
+(M-solvency) calibrate fulcrum insn categories + classify spin-vs-real-work share; (M-neurotic)
+Intel re-baseline native+isal vs native rg + marker criticality on the box that SHIPS. The port is
+NOT cancelled — it is reframed (faithful-arch + model/weights-native) and DE-prioritized as "THE
+lever" until the data says it closes the bar.
 ## FULCRUM `insn` HARDENED (code-side trustworthy) — calibration is the remaining SUPERVISOR step [2026-06-12]
 The gate's 3 gaps CLOSED + pushed (fulcrum main 5bc1147/2b785e7/82cc031, 228 selftests): GAP2
 INSN-EVENT-MISMATCH refusal (denominator/event-mismatch class — the 2.7-insn/byte hallucination —
