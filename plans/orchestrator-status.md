@@ -1,3 +1,26 @@
+## TMA VERDICT — the wall lever is FRONTEND-BOUND + BAD-SPEC in the INNER HUFFMAN LOOP (not BW, not instructions) [2026-06-12]
+fulcrum cycles built (TMA-CLOSURE-OR-NO-BREAKDOWN invariant, 348 selftests, pushed fulcrum
+2678d4c/bcae041) — Rule-1 tool for cycle/stall questions now exists. THE MEASUREMENT (Intel
+i7-13700T frozen + AMD Zen2 cross-check, fractions not absolutes = freq/spread-robust):
+MEMORY-BOUND < 0.5% EVERYWHERE => the cache/BW hypothesis is DEAD => the u8-direct SegmentedU8
+port is NO-GO-FOR-WALL, CONFIRMED 2nd time (after the falsifier; the NOFINALIZE oracle in flight
+corroborates). THE NATIVE-vs-isal/rg GAP IS: FRONTEND-BOUND (I-cache/fetch stalls) + BAD-SPEC
+(branch mispredict). model T8: native frontend 19.5% vs isal 10.8% (+8.7pp!) / rg 17.7%; bad-spec
+native 28.7% vs isal 23.8% (+5.0pp). silesia T8 smaller but same direction. T1->T8 backend does
+NOT jump + memory flat (0.33->0.40%) => NOT BW contention, it's the OOO engine (branches+fetch).
+THE LOCATED LEVER: the INNER HUFFMAN DECODE LOOP's branch/frontend structure — native's loop is
+branch-rich + I-cache-dense in a way that saturates Raptor Lake's deep OOO frontend and mispredicts
+more than ISA-L/rg; rg achieves 2x less frontend-bound on model (10.8 vs 19.5). The charter EXPLICITLY
+opened the inner loop for full reimplementation (branchless, multi-literal, BMI2, I-cache layout).
+AMD REVERSAL EXPLAINED: native is FASTER than isal on Zen2 (0.239 vs 0.248; simpler frontend, less
+branch-pressure-sensitive) — the Intel gap is Raptor-Lake-deep-OOO punishing native's branch-rich
+loop = ARCHITECTURE-SPECIFIC MAGNITUDE. "isal recovers on Intel" CONFIRMED at N=15 (model T8 83ms >
+30.5ms spread, 0.839x — phantom-killer passed) => "drop isal, ship native" stays UNSOUND on Intel
+until native's inner loop closes the frontend/bad-spec gap. NEXT (deterministic): localize WITHIN
+the inner loop — perf branch-miss + frontend-stall annotation native-vs-rg (Intel model T8) + a
+vendor two-column inner-loop STRUCTURE map (rg deflate.hpp multi-cached loop vs gz asm_kernel
+run_contig / marker_inflate) => ranked structural levers (each gated + falsifier-pre-registered
+before building); THEN heterogeneous-advisor the inner-loop work-stretch.
 ## SYNTHESIS (Opus, pivotal RE-AIM) — the wall is CLEAN-DECODE-KERNEL IPC, not instructions/marker [2026-06-12]
 Four investigations + the FROZEN removal-oracle reconcile: instruction-count regions != cycle-cost
 regions. WALL LOCALIZATION (banked removal-oracle-ceilings, frozen): silesia T1 NODECODE = 642ms =
