@@ -1,3 +1,19 @@
+## GOAL/METHOD SET (user 2026-06-13) — MATRIX-FIRST, stop lever-grinding; the score/ build IS this method [2026-06-13]
+User restated the goal + a governing METHODOLOGY (banked feedback_operating_rules R5): "weeks
+grinding on levers — we don't do that anymore. Measure arch x threadcount x archive with Fulcrum,
+see what surfaces, look for HOTSPOTS/INEFFICIENCIES. Every win came from fixing BUGS or
+OBVIOUS-IN-HINDSIGHT optimizations. Use the numbers to LOOK FOR INEFFICIENCIES, not grind levers."
+=> the score/ matrix (in flight, leader-driven) is exactly the instrument. RE-PRIORITIZATION: the
+finalize 5x-rg-work is an OBVIOUS-INEFFICIENCY-class fix (pursue); the inner-loop asm grind (bounded
+0.667x, HARD) is the lever-grind we now AVOID unless the matrix makes it the obvious thing. This
+re-frames the pending strategic fork: don't commit the hard inner-loop asm bet by default — let the
+matrix surface the obvious inefficiencies first. The leader's Phase-3 read MUST be framed as
+inefficiency/anomaly hunting across the matrix (not lever-ranking) — supervisor will set that
+framing when the leader reports Phase 3. Goal otherwise unchanged: both builds (native ship-target,
+isal reference) decode as fast as rg at ANY thread count; silesia + Squishy breadth; encoding out.
+ROLE: supervisor=context/relay/gate; persistent LEADER (re-spawned with state, no SendMessage in
+harness) drives all work. SCORE matrix params: threadcounts {1,4,8,12,16} (user added t12), corpora
+{model,monorepo,storedheavy,silesia,bignasa}, boxes intel(neurotic)-first then amd(solvency).
 ## BYTE-FLOW — marker = 32% of bytes (structural, NOT 1%); but it's RG-SHARED, so lever-1 = the finalize DELTA only [2026-06-12]
 silesia T8 native (DUAL-SHA, 3x stable): marker_bytes 68.17M = 32.2%, clean 143.79M = 67.8%
 (accounting complete). 17/18 chunks window-absent (13 flip + 4 finished-no-flip + 1 seeded) — the
