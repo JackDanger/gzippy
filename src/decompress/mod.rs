@@ -200,7 +200,13 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         // decodes fully (no truncation).
         #[cfg(isal_clean_tail)]
         {
-            if num_threads <= 1 {
+            // MEASUREMENT ORACLE, NOT PRODUCTION: GZIPPY_ISAL_FORCE_PSM=1 skips
+            // the IsalSingleShot early return so isal-T1 falls through to the
+            // ParallelSM pipeline (holds pipeline fixed, swaps only the kernel
+            // to ISA-L — disambiguates native's T1 kernel-vs-pipeline gap).
+            // Env-unset path is byte-identical to before.
+            let force_psm = std::env::var("GZIPPY_ISAL_FORCE_PSM").as_deref() == Ok("1");
+            if num_threads <= 1 && !force_psm {
                 return DecodePath::IsalSingleShot;
             }
         }
