@@ -10,7 +10,7 @@ This document maps **structure** (vendor `vendor/rapidgzip/librapidarchive/src/r
 
 ## 1. What already matches (control plane)
 
-Phases 1-3 from `plans/structural-gap-closure.md` are landed: decode dispatch,
+Phases 1-3 of the structural-gap closure are landed: decode dispatch,
 block-finder seek semantics, and window-map cleanup now match the vendor control
 plane. The remaining gaps are data-plane cost, scheduler parity, and instrument
 gating.
@@ -159,8 +159,8 @@ Chain invariant is vendor-assumed; correctness verified via CRC stress + routing
 
 ## 9. References
 
-- `plans/rapidgzip-architecture-divergence.md` — divergence #1–#4 history
-- `plans/sm-parity-gap-matrix.md` — row-level closure designs A–R
-- `plans/wall-progress.md` — causal verdicts only
+- divergence #1–#4 history, row-level closure designs A–R, and causal wall
+  verdicts formerly lived under `plans/` (deleted as stale-prone); recover from
+  git history if needed, but re-derive any perf verdict with Fulcrum before citing
 - `docs/fulcrum-sota.md` — instrument semantics
 - Vendor anchors: `GzipChunkFetcher.hpp`, `GzipChunk.hpp:712–841`, `WindowMap.hpp:79–90`, `ChunkData.hpp:397–402`

@@ -57,7 +57,7 @@ awk -v g=$gb -v gx=$gx -v r=$rb -v out=$OUT 'BEGIN{
   printf "   PROGRESS RULE: WIN only if gzippy MB/s ROSE vs last row AND ratio fell by > spread(%.1f%%); else TIE / rival-regressed.\n",sp
 }'
 # append-only trajectory log (emitted by the instrument, not hand-edited)
-echo "$(date +%FT%H:%M),$(git rev-parse --short HEAD 2>/dev/null),$gb,$rb,$(awk -v g=$gb -v r=$rb 'BEGIN{printf "%.3f",g/r}'),$(awk -v g=$gb -v gx=$gx 'BEGIN{printf "%.1f",(gx-g)/g*100}')" >> plans/wall-progress.csv 2>/dev/null
+echo "$(date +%FT%H:%M),$(git rev-parse --short HEAD 2>/dev/null),$gb,$rb,$(awk -v g=$gb -v r=$rb 'BEGIN{printf "%.3f",g/r}'),$(awk -v g=$gb -v gx=$gx 'BEGIN{printf "%.1f",(gx-g)/g*100}')" >> "${WALL_PROGRESS_CSV:-/tmp/gzippy-wall-progress.csv}" 2>/dev/null
 
 echo "== 2. GAP STRUCTURE (instr / IPC / parallelism — work vs stalls vs cores) =="
 for which in gz rg; do

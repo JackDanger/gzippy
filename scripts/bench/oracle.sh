@@ -14,7 +14,7 @@
 #       [--build] [--feature F] [-T 8] [-N 9] [--slow GZIPPY_SLOW_DECODE=50]
 #       [--no-sync] [--dry-run]
 #
-# Kinds (CLASS in plans/KNOBS.md):
+# Kinds (CLASS; GZIPPY_SLOW_* knobs live in src/decompress/parallel/slow_knob.rs):
 #   same-sink         production knobs, byte-exact control (a floor; PRODUCTION).
 #   ceiling           decode-removed FLOOR via bypass replay (byte-exact, NOT-prod).
 #   engine-isolation  ISA-L engine oracle (byte-exact, off the prod decode graph).
@@ -67,7 +67,7 @@ case "$KIND" in
 esac
 if [ "$KIND" = perturb ]; then
   [ -n "$SLOW_KNOB" ] && [ -n "$SLOW_PCT" ] || { echo "oracle.sh: --kind perturb needs --slow KNOB=PCT" >&2; exit 2; }
-  case "$SLOW_KNOB" in GZIPPY_SLOW_*) ;; *) echo "oracle.sh: --slow knob must be a GZIPPY_SLOW_* perturbation (see plans/KNOBS.md)" >&2; exit 2;; esac
+  case "$SLOW_KNOB" in GZIPPY_SLOW_*) ;; *) echo "oracle.sh: --slow knob must be a GZIPPY_SLOW_* perturbation (see src/decompress/parallel/slow_knob.rs)" >&2; exit 2;; esac
 fi
 
 pin_mask() { case "$1" in 1) echo 0;; 4) echo 0,2,4,6;; 8) echo 0,2,4,6,8,10,12,14;;
