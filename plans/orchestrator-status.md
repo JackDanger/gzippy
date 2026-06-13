@@ -1,3 +1,35 @@
+## DECOMPOSITION FOUND 2 OBVIOUS-IN-HINDSIGHT BUGS — reconciles WITH the red-team [2026-06-13]
+Worker adfa2ed9 symbol-profiled gz-native vs rg (AMD silesia t4, perf record, release ELF, instructions:u).
+gz 6.937B vs rg 4.463B = +2.474B (+55%). "crc_write" was a MISNOMER — it is NEITHER CRC (VPCLMULQDQ,
+~0.01B, negligible) NOR write (file-vs-null = +141ms WALL but ZERO instructions; gap identical file-vs-null
+=> I/O confound RESOLVED, separate +37ms wall item). The real extra instructions:
+- #1 FAST-LANE: `prepend_bytes` O(total_chunk) buffer copy = 0.792B (11.4%). segmented_buffer.rs:463 via
+  clean_unmarked_data (chunk_data.rs:1151): allocates new buf + copies ALL ~7.2MB accumulated chunk output
+  just to PREPEND a 32KiB narrowed prefix => O(chunk) to prepend O(32KiB). rg does O(1) std::deque front
+  insert (DecodedData.hpp:492). Textbook obvious bug. Byte-identical fix = deque-of-slices/rope.
+- #2 FAST-LANE: `push_slice` scalar u16 copy = 0.649B (9.4%). segmented_markers.rs:163 SegmentedU16::
+  push_slice extend_from_slice emits SCALAR (99.8% scalar, 0.19% SIMD); fix = ptr::copy_nonoverlapping /
+  copy_from_slice to fire LLVM memcpy/SIMD. rg's equivalent inlined/absent.
+- #1+#2 = 1.441B = 58% of the 2.474B gap, NO decode-logic change, byte-identical.
+- Smaller/harder: speculation emit_backref_ring not-inlined +0.649B (PERTURBATION); clean run_contig vs ISA-L
+  +0.359B (PERTURBATION, may invert on Intel/Zen2 PEXT); write I/O +37ms wall (strace writev count).
+  Marker resolution: gz is FASTER than rg (-0.211B) — already good.
+RECONCILIATION WITH RED-TEAM (both right): #1/#2 are SHARED machinery (u16 marker ring drain + chunk
+finalize — BOTH builds pay them; isal also speculates w/ the u16 ring + finalizes). So they DON'T explain
+the native-vs-isal T1 gap (the red-team's inner-loop point stands: run_contig +0.359B is the native-vs-isal
+differentiator). BUT the LARGER absolute opportunity is the SHARED 1.441B both builds waste => fixing it
+lifts BOTH native AND isal at ALL T. Back-of-envelope: cutting native ~20.8% insn could move native T1
+0.88 -> ~1.1 (PASS) and help T4+. The red-team corrected my "one master key" framing; the decomposition
+shows the cheapest wins are SHARED byte-identical bugs, while the inner loop is a smaller separate front.
+FAST-LANE per the decision process (byte-identical + provably-fewer-ops + rg is the existence-proof of the
+better algorithm => enter at S5: implement + RE-MEASURE on matrix, keep TIE-or-better, no perturbation
+needed because not betting effort on an attribution — removing provably-redundant work). NOT the
+decompose-and-shave trap (that shaves a span HOPING; this removes a quadratic copy that has no reason to
+exist). CAVEAT to check: confirm wall actually moves (campaign memory says wall is frontend-bound — but a
+7.2MB redundant copy x17 chunks is memory-traffic, plausibly wall-positive; the matrix re-measure is the
+verdict). VET PENDING: fresh advisor on reconciliation + fast-lane classification before implementing.
+perf.data on solvency: /tmp/gz_perf.data, /tmp/gz_perf_hi.data, /tmp/rg_perf.data.
+
 ## RED-TEAM DISPROVED OUR PRIORITY (verified) — TWO distinct causes, not one per-byte master key [2026-06-13]
 User asked for a red-team to disprove that the serial-consumer decomposition is the right work + surface our
 biases. Red-team a000132d delivered a DATA-GROUNDED disproof; supervisor VERIFIED the crux empirically:
