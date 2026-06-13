@@ -510,24 +510,31 @@ fn mfast_localbits_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MFAST_LOCALBITS").is_ok_and(|v| v == "1"))
 }
 
-/// ENGINE/U8-SINGLE-LOOP kill-switch: `GZIPPY_NO_MFAST_REENTRY=1` restores the
-/// exact pre-change two-segment structure per `read()` call — `'mfast` runs
-/// ONCE (until the ring's physical wrap or call cap) and the careful per-symbol
-/// loop then handles the ENTIRE remainder of the call. With re-entry ON
-/// (default), the careful loop yields back to `'mfast` as soon as the wrap
-/// headroom clears, so the fast loop covers ~100% of marker volume instead of
-/// ~50% (the wrap point is uniformly distributed over the 64Ki-slot ring, so
-/// on average HALF of every call ran in the careful loop). Vendor counterpart:
-/// rapidgzip's readInternal is ONE loop covering 100% of the block body
-/// (deflate.hpp:1601-1666) — the two-segment split with no re-entry was a
-/// gzippy-only deviation. Byte-exact: the careful loop and `'mfast` produce
-/// identical output for identical input bits (the long-standing exit contract:
-/// every `'mfast` exit leaves the bit cursor exactly before the next undecoded
-/// symbol). One OnceLock read per call; zero-cost when OFF.
+/// ENGINE/U8-SINGLE-LOOP opt-in switch: `GZIPPY_MFAST_REENTRY=1` enables the
+/// single-loop fastloop RE-ENTRY — the careful per-symbol loop yields control
+/// back to `'mfast` (via `continue 'outer`) as soon as it has made progress AND
+/// the wrap headroom clears, so the fast loop covers ~100% of marker volume
+/// instead of ~50% (the wrap point is uniformly distributed over the 64Ki-slot
+/// ring, so on average HALF of every call ran in the careful loop). Vendor
+/// counterpart: rapidgzip's readInternal is ONE loop covering 100% of the block
+/// body (deflate.hpp:1601-1666) — the two-segment split with no re-entry is a
+/// gzippy-only deviation.
+///
+/// DEFAULT OFF (engine/u8-faithful-v2, 2026-06-12): the re-entry is byte-exact
+/// (the careful loop and `'mfast` produce identical output for identical input
+/// bits — the long-standing exit contract: every `'mfast` exit leaves the bit
+/// cursor exactly before the next undecoded symbol) BUT it regressed the T4
+/// `diff_ratio_parallel_single_member_speedup` guard (1.226 -> 1.637) on the
+/// prior branch, so production keeps the passing two-segment behavior. This
+/// switch exists for the same-binary falsifier A/B (marker-phase instruction
+/// count OFF vs ON, same body-bytes denominator). One OnceLock read per call;
+/// zero-cost when OFF. The `_disabled` name/return-polarity is kept so the
+/// single call site (`!mfast_reentry_disabled()`) is unchanged — the function
+/// now returns "re-entry NOT enabled" = true unless the opt-in is set.
 fn mfast_reentry_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MFAST_REENTRY").is_ok_and(|v| v == "1"))
+    *OFF.get_or_init(|| !std::env::var("GZIPPY_MFAST_REENTRY").is_ok_and(|v| v == "1"))
 }
 
 /// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
@@ -2110,7 +2117,7 @@ impl Block {
         // again (wrap headroom + output cap + input slop). The careful loop
         // remains the sole owner of the wrap-straddle region, block tails, and
         // edge cases — exactly as before, just bounded to those regions.
-        // Kill-switch: GZIPPY_NO_MFAST_REENTRY=1 (see `mfast_reentry_disabled`).
+        // Opt-in (DEFAULT OFF): GZIPPY_MFAST_REENTRY=1 (see `mfast_reentry_disabled`).
         let mfast_entry_ok: bool =
             CONTAINS_MARKERS && slow_spin == 0 && !slow_yield && !mfast_disabled;
         let mfast_reentry_ok: bool = mfast_entry_ok && !mfast_reentry_disabled();
@@ -2493,8 +2500,8 @@ impl Block {
                 // the `'mfast` entry condition — out cap, ring headroom, input
                 // slop) and progress has been made since the last `'mfast` exit.
                 // `mfast_reentry_ok` is const-false on the clean instantiation and
-                // under GZIPPY_NO_MFAST_REENTRY=1 / probe knobs (exact pre-change
-                // single-pass behavior).
+                // unless GZIPPY_MFAST_REENTRY=1 is set (DEFAULT OFF) / under probe
+                // knobs (exact pre-change single-pass behavior is the default).
                 if mfast_reentry_ok && emitted > emitted_at_mfast_exit {
                     let dst_phys = pos % RING_SIZE;
                     if emitted + FAST_OUT_SLOP < n_max_to_decode
