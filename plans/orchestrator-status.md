@@ -1,3 +1,23 @@
+## FULCRUM insn CALIBRATED — 42% marker REFUTED (real 20% of excess); finalize+ring=64% of INSN excess; but insn != wall [2026-06-12]
+Calibrated INSN_CATEGORIES vs real solvency perf captures (313 selftests, pushed fulcrum 9808d16) —
+Rule 1 satisfied for instruction attribution. CORRECTIONS: marker_emit is 29.7% of total (NOT 42%),
+and the EXCESS over rg is only +491M = 20.3% of the gz-vs-rg instruction gap — rg does NEARLY THE
+SAME marker work (rg marker_emit 1,743M vs gz 2,234M); marker is NOT the dominant bucket. DOMINANT
+INSTRUCTION EXCESS: finalize 40.0% (finalize_with_deflate -> clean_unmarked_data walks the entire
+SegmentedU16 BACKWARD + u16->u8 NARROW + CRC migrate) + segmented_ring 24.3% = 64.3% of the
+wall-RELEVANT instruction excess; kernel 29.1% is WALL-NEUTRAL (ignore). FAITHFULNESS DISPUTE
+RESOLVED toward the 2nd advisor: SegmentedU16 + the finalize u16->u8 narrow IS the shortcut; the
+governing u8-clause target (SegmentedU8 / u8-DIRECT clean, eliminating clean_unmarked_data's
+narrowing walk) is what attacks the 64% — and the u8-port-v2 worker changed the WRONG sub-lever
+(marker-loop mfast COVERAGE, wall-neutral) NOT SegmentedU16. So the REAL faithful-u8 port (ring/
+drain u8-direct) is STILL OWED and now precisely targeted. **CRITICAL CAVEAT**: these are
+INSTRUCTION shares, and we JUST PROVED instructions != wall on this workload (the marker loop is
+wall-neutral despite its instructions; kernel 29% is wall-neutral too). So "finalize+ring = 64% of
+INSN excess" does NOT establish it's a WALL lever — it must be removal-oracle-perturbed. The wall is
+CYCLES/STALLS (Intel: gap is IPC; u8-falsifier: marker excess is stalls). NEXT MEASUREMENT (Rule 1,
+build-tools): a CYCLE/STALL profile (perf cache-misses + stalled-cycles-frontend/backend; a fulcrum
+`cycles` analog) to find WHERE the stalls are (SegmentedU16 cache fragmentation? asm-kernel IPC?
+memory bandwidth?) — NOT more instruction work. SYNTHESIS DISPATCHED.
 ## u8 PORT FALSIFIER = FALSIFIED — marker phase is NOT the T8 wall (stalls, not instructions); instruction framing REFUTED [2026-06-12]
 Built the faithful u8 single-loop (engine/u8-faithful-v2, pushed, NO MERGE, default-OFF
 GZIPPY_MFAST_REENTRY): byte-exact 36/36 sha grid both builds on solvency real-AVX2; marker coverage
