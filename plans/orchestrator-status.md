@@ -1,3 +1,18 @@
+## CLEANUP BASELINE MERGED (ea7c7584) + workspace minimal + neurotic online [2026-06-12]
+gzippy easy-mode cleanup MERGED (solvency-verified MERGE-READY: both builds compile, clippy -2,
+4/4 sha smoke 028bd002 correct routing, fmt clean): 4 dead-code deletions, stale-comment removals,
+39 truly-orphaned plans archived (zero dangling citations). Workspace MINIMAL (4 worktrees/5
+branches; recovery patches /tmp/gz-cleanup-patches, 20 files). Submodule gitlink repaired
+(vendor/isal-rs/.git was cross-linked to deleted gz-vol worktree -> repointed to this checkout's
+module dir; git status rc=0 clean). release/formula-0.7.1 reconciled (reset to origin-authoritative;
+2 stale dup commits saved as patch). NEUROTIC ONLINE (ssh -J 10.0.0.100 root@10.30.0.199, key
+works, corpora present) = the INTEL wall/cycle box. FULCRUM push freely authorized (main pushed
+801736a). IN FLIGHT: fulcrum agentic-surface polish (push-enabled, building fulcrum insn mode),
+gzippy source-easy-mode cleanup (env-knob cull + dead-code + comment-truth, branched off the merged
+base). NEXT GZIPPY CLEANUP (sequenced post-source-merge to avoid conflicts): docs/naming pass.
+USER GUIDANCE 2026-06-12: build/fulcrum portability is first-class — if any of the 3 machines
+(macOS/neurotic-Intel/solvency-AMD) fails to build, or fulcrum fails on any arch, make a fix-plan +
+escalate to user or an Opus agent.
 ## WORKSPACE MINIMIZED (user Rule 2) — 71->4 worktrees, 181->5 branches, ~30Gi reclaimed, zero loss [2026-06-12]
 Two reversible passes: 67 worktrees retired + 176 local branches removed; FINAL local surface =
 ONLY the protected/active set: worktrees {gzippy[main], gzippy-reimplement-isal[reimplement-isa-l],
