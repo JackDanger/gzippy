@@ -1,3 +1,22 @@
+## SHARED-NESS GATE PRODUCED TRUTH — BOTH costs SHARED (measured); push_slice = clean fast-lane, implementing [2026-06-13]
+Confirmation worker a2705d9 ran the isal arm (the gate I'd just added). RESULT overturns BOTH prior
+inferences: BOTH prepend_bytes(finalize) AND push_slice are SHARED. Decisive: perf stat native 6.937B vs
+isal 6.877B = 59M (0.86%) apart; native-heavy would predict ~1.44B delta. finalize_with_deflate 11.39%
+isal/11.42% native; push_slice 8.4%/9.4%. cfg fork changes WHERE decode happens, not finalize-copy/marker-
+drain VOLUME. DEEPEST META-LESSON (for the user's bias-insight ask): the supervisor's unverified guess
+(shared) was right, the vet's CODE-VERIFIED inference (native-heavy) was WRONG — only the EMPIRICAL
+other-build arm was the verdict. Even code-reading is an inference; the shared-ness gate's measurement beats
+it. The disproof chain caught everything before any code shipped.
+push_slice CANARY RESOLVED = real+fixable: perf annotate = genuine scalar u16-per-element loop (98% of
+samples; LLVM can't vectorize across the SEGMENT_ELEMENTS capacity check) — NOT memcpy, NOT mis-attributed.
+Fix = ptr::copy_nonoverlapping at segment-batch granularity. ~8-9% of insns in BOTH builds, byte-identical.
+ACTION: push_slice is a textbook FAST-LANE (real+fixable+shared+byte-identical+local) => IMPLEMENTING NOW
+(worktree, build both flavors, corpus-differential + sha-verify, re-measure silesia t1/t4/t8 both builds vs
+baseline cells, keep TIE-or-better per fast-lane protocol). prepend_bytes/finalize O(chunk) copy = also
+real+shared but the fix is a buffer-structure REFACTOR (Vec->deque/rope, ripples) => RIGOROUS path, queued
+after push_slice validates the fast-lane end-to-end. Wall caveat: ~8-9% INSNs but wall is frontend/mem-bound
+— scalar->memcpy is a throughput win, plausibly wall-positive; the matrix re-measure is the verdict.
+
 ## VET CAUGHT THE SAME BIAS AGAIN (code-verified) — "assume shared" is recurrent; corrected plan [2026-06-13]
 Fresh vet advisor a22d90a7 reviewed the supervisor's "prepend_bytes + push_slice are SHARED, fast-lane, lift
 both builds" plan and DISPROVED the shared claim — supervisor CODE-VERIFIED both advisor claims:
