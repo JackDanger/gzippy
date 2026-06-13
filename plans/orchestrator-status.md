@@ -1,3 +1,28 @@
+## INTEL RE-BASELINE (neurotic, ship-target substrate) — native far from bar; isal RECOVERS, reversing Zen2 [2026-06-12]
+24 cells, sha-verified, interleaved best-of-N, native rg ELF (41baa20f, <10ms), built @836e4897.
+Intel masks (P-cores 0,2,4,6,8,10,12,14). SHIP-TARGET (native) SCORECARD: PASSES the 0.99 bar ONLY
+on storedheavy T8 (1.016, trivial stored copy); EVERY real-content cell FAILS — closest bignasa T8
+0.928, silesia 0.84-0.87 all-T, model 0.68-0.77, monorepo T8 0.474 (small-file overhead). The
+ENGINE GAP IS THE SAME STRUCTURAL SHAPE AS ZEN2 — NOT a Zen2 artifact, NOT closer on Intel: the
+pure-Rust symbol-rate deficit vs rg is real and substrate-independent in SHAPE. HEADLINE REVERSAL:
+isal RECOVERS on Intel — beats native at T8 on model (0.474 isal vs 0.558 native, +15%) and
+monorepo (+45%), reversing Zen2's "native>isal"; confirms that ordering was a Zen2 PEXT-microcode
+penalty on ISA-L, NOT engine truth. On Intel, uncrippled ISA-L makes isal competitive-to-BETTER at
+T8 on chunk-heavy real content; native still wins SMT-bound/large (silesia, bignasa) + stored.
+T1-isal-wins-all HOLDS both boxes (IsalSingleShot beats rg: silesia 1.146, model 1.075).
+RECONCILIATION (critical for strategy): native clean engine is at INSTRUCTION parity with ISA-L
+(9.97 vs 10.5 insn/byte, solvency) YET isal wall-BEATS native on Intel at T8 => the gap is
+IPC/cycle (microarch), NOT instruction count — Intel ISA-L retires the same instructions at higher
+IPC than the pure-Rust asm kernel. So "engine-W done at instruction parity" is FALSE for the WALL:
+native needs Intel CYCLE parity, a deeper-asm/IPC problem, not just instruction reduction.
+STRATEGIC TENSION (for the user, not yet revisiting): "drop isal, ship native" gives up real Intel
+wall on model/monorepo where isal beats native; native-parity is HARDER than the plan assumed.
+HIGHEST-VALUE native targets: bignasa T8 (0.928, closest real), the silesia 0.84-0.87 cluster (pure
+symbol-rate, same all-T), monorepo (small-file overhead = SEPARATE lever). CAVEAT: no_turbo capped
+walls to 1.4GHz base => sub-0.4s cells have >15% spread (min-of-N robust, absolutes low-confidence).
+SYNTHESIS PENDING: combine with the in-flight u8-port falsifier + insn calibration, then a
+heterogeneous-advisor read of what native-parity actually requires (likely engine IPC + per-cell
+levers, not the marker port alone).
 ## SECOND ADVISOR + USER DIRECTIVE — REDIRECT PARTIALLY OVERTURNED; BUILD the faithful port AS its own removal-oracle [2026-06-12]
 Heterogeneous 2nd-opinion (Opus) PARTIAL-overturned the off-track read. HOLDS: 42% split is
 UNCALIBRATED (don't quote as decisive), native-T1 bootstrap ABSENT (port doesn't fix T1 — that's
