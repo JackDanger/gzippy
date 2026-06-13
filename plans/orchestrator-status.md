@@ -1,4 +1,37 @@
-## CHAMPION SCORECARD (measured, AMD) — DIS-15 tax NOT reproduced; native T1 deficit = INNER KERNEL, not pipeline [2026-06-13]
+## PROVENANCE AUDIT CAUGHT A CONTAMINATION — FORCE_PARALLEL_SM is a DEAD NO-OP; "DIS-15 stale / T1=inner-kernel" RETRACTED [2026-06-13]
+User-mandated provenance audit (ac6f275f) of the champion scorecard found a CRITICAL contamination;
+supervisor CODE-VERIFIED: `grep -rn FORCE_PARALLEL_SM src/` = ZERO consumers (only docs mention it). The env
+var GZIPPY_FORCE_PARALLEL_SM is a DEAD NO-OP at HEAD (and was at 443a9e6). CONSEQUENCES:
+- isal at T1 UNCONDITIONALLY routes to IsalSingleShot (mod.rs:201-204, cfg isal_clean_tail); the flag can't
+  override it. So the champion bench's "isal-PSM" arm was ALSO IsalSingleShot — the 6ms vs "isal-shot" is
+  NOISE between two samples of the SAME path. => the headline "DIS-15's 247ms tax NOT reproduced (6ms)" is
+  INVALID; the bench never put isal through ParallelSM. **DIS-15's 247ms ParallelSM serialization tax is NOT
+  refuted; it STANDS in its context** (RETRACT the prior "DIS-15 stale" bank above/below).
+- The earlier RED-TEAM basis ("isal-T1 & native-T1 both ParallelSM, only the inner loop differs => T1=inner
+  loop") is FALSE: isal-T1 was IsalSingleShot (no pipeline), native-T1 was ParallelSM (with pipeline). So
+  "native T1 deficit = inner kernel" is UNSUPPORTED. native-T1 826ms vs igzip 744ms CONFLATES (ParallelSM
+  pipeline tax native pays) + (pure-Rust vs ISA-L kernel); we have NO native single-shot to separate them.
+WHAT REMAINS VALID (audit PASS): binary FLAVOR (native=parallel-sm+pure 0 isal C syms; isal has igzip.c
+syms), COMPARATOR (rg native ELF 0.16.0, 3ms startup, NOT wheel), CHAMPION versions, INPUT pin + 80/80
+sha-verify, and the cross-tool WALL RANKING for genuinely different exes (native beats libdeflate by ~7ms
+[within ±68ms spread, not firm]; native trails igzip ~83ms; isal-shot 706 fastest). Audit GAPS (can't verify
+after the fact): run-time freeze state (no saved stdout; LXC sysfs unreliable), exact binary commit (cargo
+embeds no git hash — rests on clean tree @443a9e6 + hard-coded SRC), no CPU-pinning in the champion bench
+(systematic ~22% slowdown vs the pinned fulcrum cells, ranking stable).
+CAMPAIGN-WIDE BUG: FORCE_PARALLEL_SM is used in fulcrum score (score.rs:464) + many scripts/docs to "force
+ParallelSM" — it does NOTHING. HARMLESS where defaults already match (native=ParallelSM all T; isal-T1=
+IsalSingleShot=production; isal-T4+=ParallelSM), but the ENFORCEMENT is fake and any "forced" routing claim
+is suspect. Rule 2 (names must tell the truth): the flag must be WIRED UP (so we CAN force ParallelSM to
+measure the native pipeline tax) or REMOVED. => CODE decision, USER-GATED.
+HONEST STATE OF native T1: 826ms ParallelSM pure-Rust; the split pipeline-tax-vs-kernel is UNKNOWN. The
+measurement we NEED: a native single-shot (non-chunked whole-stream) oracle to run native-ParallelSM vs
+native-single-shot at T1 (the removal oracle for native's pipeline tax) — native has no such path today;
+building a throwaway oracle is the decomposition. ACTIONS: (1) correct the ledger agent's DIS-15 annotation
+(it was told to mark SUPERSEDED — WRONG; DIS-15 holds in context). (2) correct the leader (briefed with the
+retracted "T1=inner-kernel"). (3) user-gate the FORCE_PARALLEL_SM wire-or-remove + the native single-shot
+oracle.
+
+## CHAMPION SCORECARD (measured, AMD) — DIS-15 tax NOT reproduced; native T1 deficit = INNER KERNEL, not pipeline [SUPERSEDED by the entry above — contaminated by the FORCE_PARALLEL_SM dead-no-op] [2026-06-13]
 Worker a5d39a7d, solvency frozen, silesia T1, N=10 interleaved, all 80 outputs sha-verified vs pin. The
 goal-comparator scorecard that was NEVER measured (native vs the tools we want to delete):
   gzippy-isal-shot 706ms > isal-PSM 712 > igzip(ISA-L 2.31) 744 > rapidgzip-P1 799 > gzippy-native 826
