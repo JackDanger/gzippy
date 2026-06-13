@@ -155,13 +155,6 @@ mod tests {
         }
     }
 
-    /// Single-member gzip via flate2 default level.
-    fn gz_default(payload: &[u8]) -> Vec<u8> {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(payload).unwrap();
-        enc.finish().unwrap()
-    }
-
     /// Single-member gzip via flate2 at a specific level.
     fn gz_at(payload: &[u8], level: u32) -> Vec<u8> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
