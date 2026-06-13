@@ -1,3 +1,50 @@
+## push_slice REJECTED — the "win" evaporated under the spread check; live proof of the thesis [2026-06-13]
+Implementation worker a8e681e9 built the byte-identical copy_nonoverlapping fix (branch fix/push-slice-batch-
+copy @ 921b8ffa, sha-verified both flavors) and declared "KEEPER, clear WIN ~7-8% both builds." FALSE by our
+OWN Δ<spread rule (N=9, solvency frozen):
+  native T1 741±5 -> 752±5 = -11ms = REGRESS(>spread!)   isal T1 584±3->576±2 = +8 WIN
+  native T4 463±31-> 434±21 = +29 <= 31 spread = TIE      isal T4 477±14->440±29 = +37 WIN
+  native T8 342±28-> 343±30 = TIE                          isal T8 340±26->345±25 = TIE
+=> for NATIVE (the SHIP TARGET): NO win on any cell, a slight T1 REGRESSION. isal: marginal T1/T4 wins only.
+The "clear WIN ~7-8% both builds" was over-claimed from numbers mostly inside the noise. DECISION: DO NOT
+MERGE (branch kept as record). This is a LIVE demonstration of the user's thesis — a worker interpreted
+marginal numbers as a win and we nearly shipped a NATIVE-T1 regression; the disciplined Δ-vs-spread check
+(and per-BUILD breakdown, not the "both builds" headline) caught it pre-merge. Reinforces: do not credit a
+kept-on-TIE change as an advance; check Δ vs spread PER BUILD; the ship target is native.
+
+## ANTAGONIST + LEDGER-CHECK OVERTURN THIS SESSION'S INTERPRETATION — measured oracles already located the levers; I ignored them [2026-06-13]
+User-requested antagonist (a66f978) attacked ALL of this session's conclusions; supervisor VERIFIED its
+strongest claim against our OWN disproof-ledger.md (DIS-15/16/22) and it HOLDS. Honest reckoning:
+RETRACTED (interpretation, contradicted by our own MEASURED oracles):
+- "TWO causes; T1 deficit = INNER LOOP" — WRONG. DIS-15 (removal oracle, N=15, frozen): forcing isal through
+  ParallelSM at T1 = 0.905x rg; SINGLE-SHOT isal = 1.197x rg; the ParallelSM pipeline costs 247ms (~24% of T1
+  wall) = pure per-chunk SERIALIZATION (each chunk waits prior's 32KB window). isal-T1=1.12 in the matrix is
+  achieved DESPITE that 247ms tax (ISA-L kernel absorbs it). So native-T1 pays the SAME 247ms serialization
+  tax; that — not "the inner loop", not the consumer copies — is the measured dominant T1 cost. DIS-22 already
+  SHIPPED isal-T1->single-shot routing (1.200x rg, production mod.rs:204).
+- "consumer/crc_write/push_slice/prepend_bytes is THE lever" — the wall is NOT instruction-bound. DIS-16
+  (removal oracle) already REFUTED the consumer per-chunk lifecycle as the T4 lever (consumer-lean = TIE; T4
+  gap = parallel-SCHEDULING / head-of-line stalls / window-publish serialization). I re-trod refuted ground.
+- "the gate produced truth / the disproof chain WORKS" — logic error (one coin-flip favoring the guesser is
+  not method validation); RETRACTED as a meta-claim.
+- "1.56x instructions => cut it to help T1+T4 / 0.88->1.1" — the DISAVOWED instruction->wall projection; wall
+  is frontend/serialization/scheduling-bound. Instruction-count is the seductive-CHEAP-but-wrong number.
+STILL TRUE (measured, kept): the 50-cell matrix ratios vs rg; the symbol profile; the shared-ness arm
+(native 6.937B vs isal 6.877B, 0.86% — but note push_slice 8.4% isal vs 9.4% native = ~12% relative native
+excess the "shared" headline buried); self-speedup curves.
+DEEPEST BIAS (user's thesis confirmed): advances come from MEASUREMENT + NAMING, never interpretation — and
+I ran a whole session of interpretation WITHOUT consulting our own measured ledger that had ALREADY located
+T1=serialization-routing (DIS-15), T4=parallel-scheduling (DIS-16), and shipped the isal-T1 fix (DIS-22).
+DECISION: HOLD push_slice — do NOT merge on a TIE (a kept TIE is a guess kept, not an advance; likely
+wall-irrelevant per DIS-16 + serialization-bound T1). The implementation branch is data only.
+CORRECTED MEASUREMENT-FIRST PLAN (grounded in the oracles, NOT a new guess): native is the ship target and
+has NO single-shot escape (pure-Rust, no ISA-L). The goal-relevant measured question: native-T1-ParallelSM
+vs the REAL T1 champions (libdeflate/zlib-ng/ISA-L single-shot — NEVER measured) — this sizes BOTH the
+247ms-pipeline tax for native AND the distance to the T1 crown the user wants. That (a native fast single-
+shot/non-chunked T1 path, the DIS-22 pattern for pure-Rust) is the measured T1 lever, not consumer insns.
+Process fixes: (1) decision doc — fast-lane is a bias-amplifier (kept-on-TIE launders guesses); restrict it +
+require consulting prior oracles. (2) Stage 0 must read disproof-ledger.md BEFORE forming hypotheses.
+
 ## SHARED-NESS GATE PRODUCED TRUTH — BOTH costs SHARED (measured); push_slice = clean fast-lane, implementing [2026-06-13]
 Confirmation worker a2705d9 ran the isal arm (the gate I'd just added). RESULT overturns BOTH prior
 inferences: BOTH prepend_bytes(finalize) AND push_slice are SHARED. Decisive: perf stat native 6.937B vs
