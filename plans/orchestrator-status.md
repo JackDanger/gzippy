@@ -1,3 +1,28 @@
+## SECOND ADVISOR + USER DIRECTIVE — REDIRECT PARTIALLY OVERTURNED; BUILD the faithful port AS its own removal-oracle [2026-06-12]
+Heterogeneous 2nd-opinion (Opus) PARTIAL-overturned the off-track read. HOLDS: 42% split is
+UNCALIBRATED (don't quote as decisive), native-T1 bootstrap ABSENT (port doesn't fix T1 — that's
+clean-contig asm + 129ms uncharted), engine necessary-not-sufficient. OVER-REACHED (3): (1) the
+"12-19ms ceiling" is a RULE-3-FORBIDDEN slope extrapolation — the removal oracle was NEVER run; it
+is NOT valid evidence the port is small. (2) marginal perturbation STRUCTURALLY CANNOT measure the
+ring-elimination the port does (deletes SegmentedU16 + the separate pass + halves width — a cache/
+traffic change a slow-inject can't see; rg-marker-completing CLAIM B sizes ~1.7e9 of the excess as
+output-fragmentation); the instruction bucket is the better proxy here. (3) spin lives in the
+KERNEL bucket not marker => removing wall-neutral spin RAISES marker's wall-share. KEY RESOLUTION:
+the faithful flat-buffer single-loop is FUNDED faithful-arch work (governing unified-decoder memory
++ project_engine_rewrite_funded) that must be built REGARDLESS of wall verdict, AND the port done
+right IS the removal-oracle — run the NEVER-RAN pre-registered falsifier (marker insns 2,795M -> ?,
+<=1.9B PASS / >2.4B FALSIFIED) + interleaved wall A/B vs NATIVE rg on the engine-W-DOMINANT cells
+(model-isal T8 + model-native), NOT silesia (proven slack). Quarantine was the adb05af5
+mfast-reentry commit only; the target + criticality STAND.
+USER DIRECTIVE (2026-06-12): "It's okay to waste work. We do the hardest best work that might give
+value. Explore everything, disciplined, build tools as we go." => BUILD the port (don't gate it
+behind measure-first); waste is acceptable; the falsifier tells the truth. EXPLORE in parallel.
+DISPATCHED (3 disciplined threads): (A) the faithful u8 single-loop port — recover salvageable
+commits, DROP the mfast-reentry regressor, RUN the falsifier + wall A/B (Opus, the hard work);
+(B) fulcrum insn category CALIBRATION on solvency (makes 42% deterministic — Rule 1, build-tools);
+(C) Intel/neurotic re-baseline native+isal vs native rg (the SHIP-TARGET's real wall, un-penalized
+by Zen2 PEXT microcode — explore the real gap). native-T1 (clean-contig + 129ms) + the parked
+silesia-isal T4 are SEPARATE owed levers, not this port.
 ## OFF-TRACK READ (user-requested, READ-ONLY Opus) — DRIFT FOUND: marker lever is NECESSARY-BUT-INSUFFICIENT [2026-06-12]
 Cold outside assessment. BAR is tracked honestly (zero corpora pass under the binding bar; T1-isal
 20/20 = product-today not goal-state; discipline + quarantine held) — NOT losing sight of the bar.
