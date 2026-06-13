@@ -1,3 +1,19 @@
+## FULCRUM WORKTREE AUDIT (read-only) — 3 at-risk unmerged branches; preserving via push; cleanup deferred [2026-06-13]
+~/www/fulcrum audit: 3 branches hold UNIQUE UNMERGED work NOT on origin (loss risk) =>
+PRESERVING NOW (push -u, non-destructive): (1) feat/memlife-attribution (LOCAL-ONLY, no remote, no
+worktree — HIGHEST risk; src/memlife.rs 502L cross-tool per-buffer memory-lifecycle view +
+scripts/rapidgzip_memlife.py 161L); (2) audit/false-confidence (worktree ~/www/fulcrum-audit, no
+remote; tests/audit_false_confidence.rs 243L, 4 failing false-confidence demos); (3)
+feat/model-params-independent (worktree ~/www/fulcrum-model-params; src/model.rs rewrite fixing the
+L_resolve tautology — measures L_resolve from median publish-span not inter-publish gap). No
+duplicates among the 3 (distinct files). SAFE-TO-CLEAN (deferred — destructive, gate + wait for the
+in-flight fulcrum workers to finish): feat/heavy-observability (stale orphan, remote gone, content
+in main), + 8 fully-merged branches/worktrees (alloc-bundle, consumer-decomposition, profile-bundle,
+release/0.2.0-consolidation, cleanup/trustworthy, causal-speculation-view, model-view,
+provenance-smear-gate). DO NOT TOUCH: fulcrum main has 2 in-flight dirty files
+(cycles.py/test_cycles.py) from the active `fulcrum score`/cycles worker — its working state, leave
+it; bump/0.1.1 is a historical release (remote exists, fine). Cleanup pass runs after the matrix
+workers land, gated.
 ## SCORE/ PHASE-0 DONE; Phase-1 blockers resolved (supervisor) — build fulcrum score FIRST, then fill [2026-06-13]
 Leader delivered Phase 0 (score/ tree + SCHEMA.md + regen-index.sh greps SCORE: lines -> all 5
 blindspot views + README HOW-TO/NORTH-STAR/DEAD-LEVERS; committed ef1e86e7/406bccd7/cdfe5f5e). Fixed
