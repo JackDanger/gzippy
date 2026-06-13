@@ -1,3 +1,24 @@
+## u8 PORT QUARANTINED — fails T4 pipeline-speedup guard (1.226->1.637); falsifier never ran [2026-06-12]
+Verification of the recovered orphaned branch engine/u8-single-loop (sonnet, solvency, GitHub-key
+fetch): DIFF AUDIT clean (asm_kernel.rs + decode_clean_into_contig UNTOUCHED — parity path safe);
+build+flavor OK; but FULL SUITE FAILS both builds on diff_ratio_parallel_single_member_speedup —
+T4/T1 ratio regresses 1.226 (base 72bb692d) -> 1.637 isal / 1.689 native, the mfast RE-ENTRY
+commit (adb05af5) makes T4 ~2.1x slower (per-chunk latency up; re-entering 'mfast after the wrap
+adds work that costs at low-chunk-count T4). NO correctness bug (944/952 pass, no sha mismatch).
+The pre-registered FALSIFIER (marker insns 2,795M->?) NEVER RAN (stop-on-first-failure). VERDICT:
+branch QUARANTINED, NOT merged (failing guard test = automatic no-merge). The THREE commits split:
+51788caf (delete dead trailing_clean scan) + fe36b8c2 (thread-local test counter) are likely
+SALVAGEABLE clean; adb05af5 (re-entry) is the regressor — kill-switch GZIPPY_NO_MFAST_REENTRY=1
+isolates it. DEFERRED (not now — user redirected to cleanup; Fable porting model is DOWN anyway):
+re-attempt the u8 port WITHOUT the re-entry mis-step, or with re-entry behind the kill-switch
+OFF-by-default, then run the falsifier. The marker-phase target (+1.0-1.5B, 42%) and its
+criticality verdict STAND — only this particular implementation regressed. MODEL: advisors revert
+to OPUS (Fable inaccessible; user-confirmed 2026-06-12). CLEANUP CAMPAIGN LAUNCHED (user-directed,
+easy-mode for a smaller driving model): Opus workers on (a) Fulcrum trustworthiness audit
+(invariant-firing proofs, vacuous-test fixes, dead/false-doc deletion; cleanup/trustworthy, no
+push) and (b) gzippy codebase cleanup (dead-code from compiler warnings, env-knob keep/delete
+audit vs banked verdicts, stale-comment deletion, plans/ graveyard -> plans/archive/,
+implicit->explicit; chore/cleanup-easy-mode, byte-exact).
 ## u8 PORT WORKER DIED MID-VERIFY (Fable model access error) — work RECOVERED + re-verifying on solvency [2026-06-12]
 The u8 single-loop port worker (Fable) hit a model-access error (claude-fable-5[1m] inaccessible)
 after ~2h/131 tool-calls and returned only the error — but it had COMMITTED 3 coherent commits to
