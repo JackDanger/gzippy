@@ -1,3 +1,27 @@
+## BYTE-FLOW — marker = 32% of bytes (structural, NOT 1%); but it's RG-SHARED, so lever-1 = the finalize DELTA only [2026-06-12]
+silesia T8 native (DUAL-SHA, 3x stable): marker_bytes 68.17M = 32.2%, clean 143.79M = 67.8%
+(accounting complete). 17/18 chunks window-absent (13 flip + 4 finished-no-flip + 1 seeded) — the
+"~1% dribble" claim REFUTED; marker is structurally large on silesia T8 because parallel SPECULATION
+forces window-absent decode. This mechanically explains NORING 39.5% (ring-write ~31% wall ∝ 32.2%
+bytes + apply_window + finalize). BUT the byte-flow worker's lever conclusion ("remove the ring
+write = u8-direct that never stores SegmentedU16") REPEATS THE FANTASY the reconciliation advisor
+already killed: window-absent markers are UNRESOLVED backrefs that MUST be stored u16 until
+apply_window — rapidgzip does the SAME (dataWithMarkers u16, speculates too, ~34.5% marker fraction;
+calibration: rg marker_emit 1,743M ≈ gz 2,234M). So the ring-STORE of 32% bytes is RG-SHARED, NOT a
+gz-vs-rg lever; NORING's 94ms is a fantasy-vs-rg ceiling. THE DISCIPLINE THAT CATCHES THIS (banked):
+a lever = where gz EXCEEDS rg (the calibration insn DELTA), never an absolute removal-oracle that
+also removes rg-shared work. THE REAL gz-vs-rg DELTAS (calibration): finalize gz 924M vs rg 174M
+(5x — the lever), segmented_ring (gz SegmentedU16 push_slice/extend vs rg FLAT dataWithMarkers — a
+real but entangled delta), marker_emit +491M (small), inner-loop frontend/bad-spec (TMA — the big
+one). CORRECTED LEVER-1: port rg's 5x-lighter cleanUnmarkedData/finalize — ceiling = the gz-rg
+finalize DELTA ≈ 6-7% wall (NOFINALIZE 8.4% x (924-174)/924), ~17ms solvency / ~30ms neurotic, NOT
+the NORING 39.5%. Cheap, faithful, wall-validated. A SECOND candidate: flatten SegmentedU16 -> a
+flat u16 buffer like rg's dataWithMarkers (kills the segmentation/push_slice overhead WITHOUT
+changing width — markers stay u16) — the 24%-of-insn-excess segmented_ring delta; entangled, defer.
+STRATEGIC (unchanged): native parity is capped by the inner-loop frontend/bad-spec (engine-W,
+asm-bounded 0.667x, HARD); these marker/finalize levers are second-order; drop-isal UNSOUND on Intel.
+DISPATCHED: the finalize op-reduction port (lever-1). USER FORK SURFACED: the parity-determining
+inner-loop asm bet (hard, possibly capped) vs accepting isal as the x86 ship path.
 ## RECONCILIATION (Opus heterogeneous) — caught 2 supervisor mechanism errors; u8-width port DEAD; finalize-op-reduction is the cheap win [2026-06-12]
 The TMA-vs-NORING contradiction resolved against the CODE. My reconciliation was directionally right
 (3 frontend/core levers, consistent on not-memory) but WRONG on 2 mechanisms: (a) push_slice +
