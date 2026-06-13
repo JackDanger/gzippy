@@ -1132,6 +1132,38 @@ fn drive_impl<W: std::io::Write>(
             bs_b_rate,
             100.0 - clean_flipped_pct,
         );
+        // BYTEFLOW probe (GZIPPY_BYTEFLOW_STATS=1): marker vs clean byte split.
+        // On gzippy-native, all output bytes route through one of two paths:
+        //   - MARKER path: SegmentedU16::push_slice (needs apply_window) →
+        //       BYTEFLOW_MARKER_BYTES
+        //   - CLEAN path: ContigFoldSink::push_clean_u8 + decode_clean_into_contig
+        //       (u8-direct to chunk.data) → UNIFIED_ROUTE_CLEAN_U8_BYTES
+        // Total = marker + clean ≈ decompressed_size; any gap = paths not yet
+        // covered by UNIFIED_ROUTE (e.g. wrapper-engine seeded chunks if M3/M4
+        // are OFF, which they are not by default).
+        {
+            use crate::decompress::parallel::segmented_markers::BYTEFLOW_MARKER_BYTES;
+            let marker_b = BYTEFLOW_MARKER_BYTES.load(Ordering::Relaxed);
+            let clean_b = gc::UNIFIED_ROUTE_CLEAN_U8_BYTES.load(Ordering::Relaxed);
+            let total_b = marker_b + clean_b;
+            let (marker_pct, clean_pct) = if total_b > 0 {
+                (
+                    100.0 * marker_b as f64 / total_b as f64,
+                    100.0 * clean_b as f64 / total_b as f64,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            if marker_b > 0 || clean_b > 0 {
+                eprintln!(
+                    "  BYTEFLOW (GZIPPY_BYTEFLOW_STATS=1): marker_bytes={marker_b} ({marker_pct:.1}%) clean_bytes={clean_b} ({clean_pct:.1}%) total_accounted={total_b}",
+                );
+            } else {
+                eprintln!(
+                    "  BYTEFLOW: counters zero — rerun with GZIPPY_BYTEFLOW_STATS=1 to measure marker/clean byte split",
+                );
+            }
+        }
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).

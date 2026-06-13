@@ -62,6 +62,23 @@ use crate::decompress::parallel::chunk_buffer_pool;
 use crate::decompress::parallel::replace_markers::MARKER_BASE;
 use crate::decompress::parallel::rpmalloc_alloc::types::U16;
 
+/// BYTEFLOW probe: total u16 elements pushed to the marker ring via
+/// [`SegmentedU16::push_slice`] across the full decode run.  Each element
+/// represents one output byte (resolved by `apply_window`).  Counts only
+/// when `GZIPPY_BYTEFLOW_STATS=1`; zero otherwise.  Compare with
+/// `gzip_chunk::UNIFIED_ROUTE_CLEAN_U8_BYTES` to get the marker/clean split.
+pub static BYTEFLOW_MARKER_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `GZIPPY_BYTEFLOW_STATS=1` enables the marker/clean byte-flow counters
+/// without changing any decode behaviour.  Resolved once per process.
+#[inline]
+fn byteflow_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_BYTEFLOW_STATS").is_ok_and(|v| v == "1"))
+}
+
 thread_local! {
     /// Per post-process worker: literal iota + zero mid-range initialized once.
     static APPLY_WINDOW_LUT: std::cell::RefCell<Option<[u8; 65536]>> =
@@ -161,6 +178,13 @@ impl SegmentedU16 {
     /// This is the decoder's write path (via
     /// [`crate::decompress::parallel::marker_inflate::MarkerSink`]).
     pub fn push_slice(&mut self, values: &[u16]) {
+        // BYTEFLOW probe: count marker symbols before the NORING no-op path
+        // so the counter reflects what production pays (values.len() == output
+        // bytes that require apply_window resolution).
+        if byteflow_stats_enabled() {
+            BYTEFLOW_MARKER_BYTES
+                .fetch_add(values.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut src = values;
         while !src.is_empty() {
             let needs_new = match self.segments.last() {
