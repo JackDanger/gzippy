@@ -324,9 +324,20 @@ pub(crate) static MARKER_DIST_LUT_OVERRIDE: std::sync::atomic::AtomicI8 =
 /// production builds): proves the differential's ON arm actually routed
 /// marker-fast-loop distance decodes through the DistTable path (and that the
 /// OFF arm routed zero through it).
+///
+/// THREAD-LOCAL (2026-06-12): was a process-global AtomicU64, which made the
+/// differential's `hits_off == 0` assert racy — any CONCURRENT test decoding a
+/// marker stream with the LUT on (the default) bumps the global counter inside
+/// this test's OFF-arm window. The fastloop re-entry change widened the
+/// exposure (~2x more backrefs flow through the `'mfast` LUT arm in every
+/// test) and the race fired in the full suite. All increments and reads are
+/// same-thread (the differential decodes synchronously via `Block::read` on
+/// the test thread), so a thread-local gives exact, interference-free deltas.
 #[cfg(all(test, pure_inflate_decode))]
-pub(crate) static MARKER_DIST_LUT_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub(crate) static MARKER_DIST_LUT_HITS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// ENGINE-W INC-1 / N2 test override for the marker-fast-loop local-Bits
 /// mirror kill-switch (`GZIPPY_NO_MFAST_LOCALBITS`):
@@ -2302,8 +2313,7 @@ impl Block {
                                         // worst case (15-bit dist code + 13 extra).
                                         use crate::decompress::inflate::libdeflate_entry::DistTable;
                                         #[cfg(all(test, pure_inflate_decode))]
-                                        MARKER_DIST_LUT_HITS
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        MARKER_DIST_LUT_HITS.with(|c| c.set(c.get() + 1));
                                         #[cfg(pure_inflate_decode)]
                                         if md_stats {
                                             marker_dist_stats::LUT_BACKREFS
@@ -5984,14 +5994,14 @@ mod tests {
                 for &n_max in &[100_000usize, 1499] {
                     let tag = format!("{label} n_max={n_max}");
                     let (hits_on, on) = with_marker_dist_lut(false, || {
-                        let h0 = MARKER_DIST_LUT_HITS.load(Relaxed);
+                        let h0 = MARKER_DIST_LUT_HITS.with(|c| c.get());
                         let r = decode_marker_u16(&stream, n_max);
-                        (MARKER_DIST_LUT_HITS.load(Relaxed) - h0, r)
+                        (MARKER_DIST_LUT_HITS.with(|c| c.get()) - h0, r)
                     });
                     let (hits_off, off) = with_marker_dist_lut(true, || {
-                        let h0 = MARKER_DIST_LUT_HITS.load(Relaxed);
+                        let h0 = MARKER_DIST_LUT_HITS.with(|c| c.get());
                         let r = decode_marker_u16(&stream, n_max);
-                        (MARKER_DIST_LUT_HITS.load(Relaxed) - h0, r)
+                        (MARKER_DIST_LUT_HITS.with(|c| c.get()) - h0, r)
                     });
                     assert_eq!(on.0, off.0, "{tag}: u16 output diverged");
                     assert_eq!(on.1, off.1, "{tag}: cursor/state diverged");
