@@ -1,3 +1,32 @@
+## AMD score matrix COMPLETE — 25/25 cells, integrity-verified; t4-DIP is the headline anomaly [2026-06-13]
+solvency (AMD EPYC 7282 Zen2) score/amd-x86_64 FULL: 5 corpora x {t1,t4,t8,t12,t16}, all via `fulcrum
+score` (N=9, 6 provenance invariants pass, native-rg ELF comparator, file-sink, frozen 2026-06-13,
+src 443a9e6). Supervisor integrity pass: 25/25 well-formed, no missing/dup/malformed, no stale
+index.lock — survived a concurrent-committer race (TWO harvesters ran: the orig AMD worker ac9f670
++ my redundant harvester a3719e53; git's atomic refs + pull-retry kept it clean; I killed my stuck
+redundant /root/amd-score-sweep.sh which never passed its guard — fill-amd-cells.sh was the real
+durable producer).
+
+RATIO TABLE (native/isal vs rg, >=0.99 PASS):
+  model      0.84/1.08 | 0.60/0.65 | 0.84/0.82 | 0.87/0.87 | 0.89/0.87
+  monorepo   0.89/1.34 | 0.75/0.76 | 0.83/0.77 | 0.86/0.80 | 0.87/0.82
+  storedheavy 0.97/1.12| 0.92/0.88 | 0.96/0.94 | 0.96/0.94 | 0.98/0.93
+  silesia    0.88/1.12 | 0.74/0.72 | 0.88/0.89 | 0.92/0.91 | 0.97/0.94
+  bignasa    0.98/1.25 | 0.81/0.82 | 1.03/1.02 | 0.97/0.98 | 0.97/0.97
+            (cols: t1 | t4 | t8 | t12 | t16)
+
+HEADLINE ANOMALY (matrix-first read, PROVISIONAL — not a lever until causal+Intel): a T4 DIP. isal
+PASSES t1 on ALL 5 corpora (1.08-1.34, isal clean tail wins low-T); both builds then CRATER at t4
+(0.60-0.92) and RECOVER toward t16 (only t16/bignasa passes both, 1.03/1.02). i.e. gz's t1->t4
+parallel scaling is WORSE than rg's, but gz keeps scaling further to t16. Shape => fixed per-chunk
+overhead / serial ramp (prefetch warmup, window-map build) that dominates at low-T and amortizes at
+high-T — NOT the inner Huffman loop. DEAD-LEVER guard holds: do NOT jump to inner-loop asm. Next:
+need Intel grid (neurotic worker ac9305fc in flight) + a `fulcrum decide`/causal pass on a t4 cell to
+confirm the ramp hypothesis before any change. Flagged provisional: t4/storedheavy NOISY,
+t8/model BIMODAL (both N=9). lever=none on all (fulcrum score doesn't trace causality).
+GOTCHA for Intel worker: binaries MUST build with CARGO_PROFILE_RELEASE_STRIP=false or fulcrum's
+FLAVOR-I nm-symbol check aborts.
+
 ## FULCRUM WORKTREE AUDIT (read-only) — 3 at-risk unmerged branches; preserving via push; cleanup deferred [2026-06-13]
 ~/www/fulcrum audit: 3 branches hold UNIQUE UNMERGED work NOT on origin (loss risk) =>
 PRESERVING NOW (push -u, non-destructive): (1) feat/memlife-attribution (LOCAL-ONLY, no remote, no
