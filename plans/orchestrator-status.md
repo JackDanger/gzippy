@@ -1,3 +1,21 @@
+## SCORE/ PHASE-0 DONE; Phase-1 blockers resolved (supervisor) — build fulcrum score FIRST, then fill [2026-06-13]
+Leader delivered Phase 0 (score/ tree + SCHEMA.md + regen-index.sh greps SCORE: lines -> all 5
+blindspot views + README HOW-TO/NORTH-STAR/DEAD-LEVERS; committed ef1e86e7/406bccd7/cdfe5f5e). Fixed
+~/.ssh/config neurotic HostName; t12 neurotic mask = 0,1,2,3,4,5,6,7,8,10,12,14 (8P+4SMT,
+cpuset<=15 contamination-free). BLOCKERS RESOLVED (operational, not strategic): (1) SUBAGENTS CANNOT
+SPAWN SUBAGENTS in this harness => the LEADER can't spawn workers; role-model fallback applies — the
+SUPERVISOR spawns workers, the leader plans/analyzes/reads-the-matrix. (2) Per R1b (eliminate toil),
+the 50-cell manual fulcrum-per-cell toil => BUILD `fulcrum score` (cell-generator: arch-os/tN/corpus
++ 3 staged binaries + comparator + mask -> freeze-aware interleaved 3-build capture + per-build
+fulcrum decide -> ratios/verdicts -> SCHEMA-conformant score/ cell file + SCORE: line + verbatim
+decide, sha-verify + strike-5 built in) FIRST, then fill the matrix through it. (3) Disk: neurotic
+/root 93% (2.5G) — workers PREFER a roomy CARGO_TARGET_DIR, clean only stale rebuildable
+/root/gz-*/target if needed (list them), build from a CLEAN at-HEAD checkout (fetch origin, checkout
+the exact reimplement-isa-l HEAD; NEVER the dirty /root/gzippy worktree), stage as the runner's $BIN.
+Batch within the ~1800s freeze (per-threadcount, 5 cells). DISPATCHED: neurotic worker = build
+`fulcrum score` (push) + fill intel-x86_64 matrix with it; solvency worker follows once the tool is
+proven. METHOD (R5): fill the matrix, then READ for OBVIOUS INEFFICIENCIES (finalize-5x class), not
+lever-grind.
 ## LEADER STATUS — Phase 0 DONE+pushed; Phase 1 measurement BLOCKED (disk 93% + no spawn tool) [2026-06-13]
 PHASE 0 COMPLETE (pushed reimplement-isa-l): score/ scaffold + SCHEMA.md + regen-index.sh +
 README skeletons + CELL-TEMPLATE.md (commit ef1e86e7). regen validated end-to-end with sentinel
