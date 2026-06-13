@@ -327,7 +327,9 @@ mod imp {
     ///   lone-literal arm  ↔ marker_inflate.rs lone-lit store (1-byte, Q3)
     ///   chain steps `30:`/`40:`/`60:` ↔ marker_inflate.rs P3.2 chain loop
     ///                       (gate order side-effect-free; `decode()`'s
-    ///                       backstop = `31:`/`41:`/`62:` refills)
+    ///                       backstop = `31:`/`41:` refills; chain-step C's
+    ///                       `< 32` backstop is provably dead and elided —
+    ///                       see `60:`)
     ///   post-chain `7:` / bottom `6:` ↔ the `< 48` threshold refills
     ///   multi arm `22:`   ↔ packed 8-byte store of `sym0 & 0x00FF_FFFF`
     ///   backref arm `50:` ↔ marker_inflate.rs trailing handler (EOB/MAX
@@ -520,20 +522,48 @@ mod imp {
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
                 "jmp 7f",
                 // ── chain step C: third decode, ALWAYS carried (the Rust
-                //    loop's `chained < LIT_CHAIN_MAX` fails at 2) — its
-                //    backstop refill still fires (X1).
+                //    loop's `chained < LIT_CHAIN_MAX` fails at 2).
+                //
+                //    REFILL-CADENCE (T1-kernel): the `< 32` backstop that
+                //    `decode()` would run here is PROVABLY DEAD at this
+                //    program point, so it is ELIDED — byte-identical, since a
+                //    never-taken refill never alters (bitbuf,bitsleft,pos) and
+                //    X1 demands only the EXIT cursor match the reference (whose
+                //    `decode()` runs the same no-op backstop, leaving the same
+                //    state). Removing it drops one convergent refill-gate site
+                //    from the literal chain (profile: the `< 48`/`< 32` refill
+                //    gates are the most-mispredicted hotspot, ~10 paths
+                //    converging; this is the ISA-L "refill fewer times per N
+                //    symbols" cadence applied where it is free).
+                //
+                //    DEAD-BACKSTOP PROOF (bitsleft is the low-byte count;
+                //    `consume` subtracts, `refill` fast form sets `| 56` ⇒
+                //    post-refill ∈ [56,63]; a short literal consumes ≤ 9 bits,
+                //    a long-resolved literal ≤ 21):
+                //      • Iteration top `2:` floor: bitsleft ≥ 48 (the `7:`/`6:`
+                //        `< 48` threshold refill restores it; entry refill /
+                //        prologue establishes it).
+                //      • Lone literal consumes ≤ 21 ⇒ at `30:` bitsleft ≥ 27.
+                //        `30:`'s `< 32` MAY fire (→ ≥ 56) or not (∈ [32,47]).
+                //      • Step A literal ≤ 9 ⇒ at `40:`:
+                //          - if `30:` fired: ≥ 47  (`40:` `< 32` DEAD)
+                //          - else (∈ [23,38]): `40:` `< 32` MAY fire (→ ≥ 56)
+                //      • Step B literal ≤ 9 ⇒ entering `60:`:
+                //          - via the `30:`-fired branch:    ≥ 47 − 9 = 38
+                //          - via the `40:`-fired branch:    ≥ 56 − 9 = 47
+                //          - via neither-fired (≥ 23 at A, A consumed ≤ 9 ⇒
+                //            ≥ 14? — impossible: if `40:` did NOT fire then A's
+                //            entry was ≥ 32, so post-A ≥ 23, and `40:` `< 32`
+                //            WOULD have fired on ≥ 23 < 32; the not-fired arm
+                //            requires post-A ≥ 32, i.e. entry-A ≥ 41 ⇒
+                //            `30:` fired ⇒ already counted as ≥ 38.)
+                //      ⇒ entering `60:` bitsleft ≥ 38 > 32 on EVERY path; the
+                //        `< 32` backstop can never fire. Eliding it is a no-op.
+                //    (Re-derives the IN_MARGIN ≤-4-refills-per-iter accounting:
+                //     this iteration now issues ≤ 3 refills — `30:`, `40:`, and
+                //     the `7:` threshold — strictly fewer than the bound of 4,
+                //     so the IN_MARGIN = 40 proof is preserved with margin.)
                 "60:",
-                "cmp {bitsleft}, 32",
-                "jae 62f",
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
-                "mov {t4:e}, 63",
-                "sub {t4}, {bitsleft}",
-                "shr {t4}, 3",
-                "add {pos}, {t4}",
-                "or {bitsleft}, 56",
-                "62:",
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
