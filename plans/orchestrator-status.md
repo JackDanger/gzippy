@@ -1,3 +1,26 @@
+## VET CAUGHT THE SAME BIAS AGAIN (code-verified) — "assume shared" is recurrent; corrected plan [2026-06-13]
+Fresh vet advisor a22d90a7 reviewed the supervisor's "prepend_bytes + push_slice are SHARED, fast-lane, lift
+both builds" plan and DISPROVED the shared claim — supervisor CODE-VERIFIED both advisor claims:
+- BUILD FORK CONFIRMED: gzip_chunk.rs:257-304 `#[cfg(all(parallel_sm, isal_clean_tail))]` vs `not(...)` —
+  isal sends the clean tail to ISA-L; native FOLDS it into chunk.data. prepend_bytes copies chunk.data =>
+  it is likely NATIVE-HEAVY, not shared. The native-only profile was generalized WITHOUT checking the fork.
+- push_slice CONFIRMED extend_from_slice on Vec<u16> (segmented_markers.rs:163) — which SHOULD memcpy; the
+  99.8%-scalar profile is a CANARY: fix may be a no-op or cost mis-attributed to inlined callers.
+META (user asked for bias insight): the "ASSUME SHARED / MASTER KEY" bias was caught TWICE in one session
+(red-team, then vet) — the supervisor repeated it within minutes. Process gate ADDED to
+FULCRUM-DECISION-PROCESS.md (SHARED-NESS GATE: a one-build profile never proves a cost is shared; re-run the
+OTHER build's arm before claiming generalization). The 0.88->1.1 linear insn->wall projection = DISAVOWED
+instruction-bound reasoning; matrix re-measure is the verdict. The disproof chain (red-team->vet->code-verify)
+WORKS — caught the bias before ANY code written. Banked [[project_two_causes_t1_innerloop_t4_shared]].
+CORRECTED PLAN (vet-endorsed): (1) CHEAP no-code CONFIRMATION first (worker a2705d9 on solvency): perf
+symbol-profile the gzippy-ISAL build (forced ParallelSM) at silesia t4 — is prepend_bytes/push_slice ~0 on
+isal (native-heavy) or paid by both (shared)? + resolve the push_slice scalar canary (real-fixable / no-op /
+mis-attributed). (2) THEN: #2 push_slice first IF canary resolves real+fixable (clean local fast-lane test);
+#1 prepend_bytes as a PROPER RIGOROUS REFACTOR (Vec->deque/rope ripples into copy_range_into/tail_slice/
+copy_last_32k/consumer-write — NOT <=one-probe, NOT fast-lane), justified as a NATIVE ship-target win (isal
+lift is moot — native is what ships). Wall-relevance plausible DESPITE frontend-bound: 7.2MB x17 ~= 122MB
+redundant copy = backend/memory-BW, a different beast — but the matrix re-measure decides, not the projection.
+
 ## DECOMPOSITION FOUND 2 OBVIOUS-IN-HINDSIGHT BUGS — reconciles WITH the red-team [2026-06-13]
 Worker adfa2ed9 symbol-profiled gz-native vs rg (AMD silesia t4, perf record, release ELF, instructions:u).
 gz 6.937B vs rg 4.463B = +2.474B (+55%). "crc_write" was a MISNOMER — it is NEITHER CRC (VPCLMULQDQ,
