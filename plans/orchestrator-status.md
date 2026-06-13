@@ -1,3 +1,18 @@
+## WORKSPACE MINIMIZED (user Rule 2) — 71->4 worktrees, 181->5 branches, ~30Gi reclaimed, zero loss [2026-06-12]
+Two reversible passes: 67 worktrees retired + 176 local branches removed; FINAL local surface =
+ONLY the protected/active set: worktrees {gzippy[main], gzippy-reimplement-isal[reimplement-isa-l],
+/tmp/gz-clean[chore/cleanup-easy-mode, verify in flight], /tmp/gz-u8loop[engine/u8-single-loop,
+quarantined]}; branches those 4 + release/formula-0.7.1. REVERSIBILITY (nothing destroyed): every
+unique commit pushed to origin (39 pushed, 21 already-reachable); 17 dirty-worktree diffs + lowt's
+5 untracked files saved to /tmp/gz-cleanup-patches/ (MANIFEST.json) — all dirty content was benign
+(bench scripts, Cargo.lock, scratch .rs/.md). Disk 1.3Gi->32Gi free. FLAG (user): release/
+formula-0.7.1 DIVERGED from origin (2 local-unique commits, also behind) — NOT force-pushed; needs
+`git pull --rebase origin release/formula-0.7.1` then push to preserve those 2 commits. OPERATING
+RULES now load-bearing ([[feedback_operating_rules_2026_06_12]]): Rule 2 (clean workspace + truthful
+names) just executed — also pushed 2 opaque worktree-agent-<hash> branches under truthful names;
+Rule 1 (Fulcrum-for-deterministic-answers) governs all future measurement; advisors reverted Fable
+->Opus, used MORE + heterogeneously. Recovery-patch dir /tmp/gz-cleanup-patches is itself transient
+surface — deletable once the user confirms nothing's needed from the retired probes.
 ## u8 PORT QUARANTINED — fails T4 pipeline-speedup guard (1.226->1.637); falsifier never ran [2026-06-12]
 Verification of the recovered orphaned branch engine/u8-single-loop (sonnet, solvency, GitHub-key
 fetch): DIFF AUDIT clean (asm_kernel.rs + decode_clean_into_contig UNTOUCHED — parity path safe);
