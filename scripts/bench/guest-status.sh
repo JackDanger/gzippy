@@ -66,7 +66,7 @@ echo "=== guest-status (via: $SSH_GUEST) ==="
 if ! timeout 60 $SSH_GUEST "$REMOTE_PROBE"; then
   rc=$?
   echo "guest-status: probe FAILED (rc=$rc) — connectivity or auth problem on the $JUMP -> $GUEST hop." >&2
-  echo "guest-status: diagnose the hop before any measurement (see plans/GUEST.md)." >&2
+  echo "guest-status: diagnose the hop before any measurement (see scripts/bench/guest.env)." >&2
   exit "$rc"
 fi
 echo "=== end guest-status ==="

@@ -86,9 +86,11 @@ Fulcrum tools — `fulcrum vs A B` (cross-tool per-span busy + wall-critical),
 `fulcrum flow` (per-stage slack/serial/starved), `fulcrum critpath`,
 `fulcrum causal` (speculation decode→publish chain + runtime window-absent fraction)
 — are HYPOTHESIS GENERATORS, never the verdict. The verdict is the causal
-perturbation. Record only survived-disproof findings in `plans/wall-progress.md`;
-treat every "the lever is X" line there as provisional until a perturbation confirms
-it.
+perturbation. Re-derive findings with Fulcrum each session — the `plans/`
+directory was deleted as stale-prone interpretation (a stale ledger entry once
+misled the campaign); durable operational facts live in `scripts/bench/guest.env`,
+and git history preserves the old plans. Treat every "the lever is X" claim as
+provisional until a fresh perturbation confirms it.
 
 Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
 closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the

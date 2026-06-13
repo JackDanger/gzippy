@@ -285,6 +285,6 @@ if [ -n "$RGT" ]; then
     "$(awk -v t="$gmin" 'BEGIN{printf "%.0f", t*1000}')" \
     "$(awk -v t="$rmin" 'BEGIN{printf "%.0f", t*1000}')" "$RATIO"
 fi
-[ "$PRODUCTION" = 1 ] || echo "## REMINDER: oracle/perturbation number — do NOT bank as parity. See plans/KNOBS.md + Measurement PROCESS."
+[ "$PRODUCTION" = 1 ] || echo "## REMINDER: oracle/perturbation number — do NOT bank as parity. See CLAUDE.md Measurement PROCESS."
 echo "================ END ORACLE SUMMARY ================"
 echo "ORACLE_GUEST_DONE"
