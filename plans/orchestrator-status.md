@@ -1,3 +1,36 @@
+## RED-TEAM DISPROVED OUR PRIORITY (verified) — TWO distinct causes, not one per-byte master key [2026-06-13]
+User asked for a red-team to disprove that the serial-consumer decomposition is the right work + surface our
+biases. Red-team a000132d delivered a DATA-GROUNDED disproof; supervisor VERIFIED the crux empirically:
+CRUX (verified): fulcrum score sets GZIPPY_FORCE_PARALLEL_SM=1 for BOTH builds (fulcrum src/score.rs:464,
+applied to native AND isal) => isal-T1 and native-T1 ran the SAME parallel-SM consumer (crc_write,
+apply_window, sink, scheduler all identical); ONLY the inner decode differs. Therefore:
+- silesia T1 isal=1.12 PASS vs native=0.88 FAIL ISOLATES the T1 deficit ENTIRELY to the INNER DECODE LOOP.
+  The consumer/crc_write is NOT the T1 tax (isal pays the identical consumer and still passes). native/isal
+  T1 = 0.88/1.12 => native inner loop ~21-27% slower with everything else held constant.
+- T4 both FAIL together (0.74/0.72) — ISA-L's fast inner loop CANNOT rescue T4 => the T4+ cost is genuinely
+  SHARED (consumer/marker; scheduler already falsified, 0 starvation).
+=> THERE ARE >=2 DISTINCT CAUSES: (1) native-only INNER-LOOP tax at T1; (2) SHARED tax at T4+. The
+"1.56x constant across T" is the SUM of two unrelated per-byte costs that happens to look flat. The
+serial-consumer decomposition addresses ONLY #2 (T4+) but I JUSTIFIED it with the T1 deficit it provably
+does NOT explain. "Blast radius / one master key" = FALSIFIED by our own T1 column.
+BIASES CAUGHT (banked for self-insight): (a) attribution-as-verdict — launched a decomposition before any
+causal perturbation (violates CLAUDE.md rule #1); (b) repeating the decompose-a-slice-and-shave loop (named
+anti-pattern); (c) ANCHORING ON WRONG COMPARATOR — optimizing to MATCH rg's per-byte insns when the GOAL is
+to BEAT libdeflate/ISA-L/zlib-ng at T1 (NEVER measured native vs them); (d) motivated convergence to a
+single root cause; (e) proceeding past the file-sink I/O confound (211MB to file => crc_write 54% may be
+partly write() rg also pays). BUILD-CONFOUND CHECK: the 1.56x came from perf stat on the RELEASE ELF
+(target-cpu=native, fat LTO per .cargo/config.toml + profile.release) = VALID; NOT iai-callgrind/profile.bench
+(LTO-off, would be invalid). Residual: Rust bounds-checks vs C++ = get_unchecked audit, not consumer work.
+CORRECTED PLAN (pivot): PRIMARY front = native INNER-LOOP at T1 measured vs the REAL champions
+(libdeflate/ISA-L/zlib-ng, not just rg) — goal-relevant, provably-isolated, CLAUDE.md open-territory.
+Cheap discriminators (ranked by red-team), to run SERIALIZED on solvency after the in-flight decomposition
+worker frees the box: #1 re-run AMD silesia t4 probe to /dev/null AND on BOTH builds (kills I/O confound +
+shared-vs-inner in one run); #2 confirm 1.56x provenance (done: perf-on-release=valid); #3 native T1 vs
+libdeflate/ISA-L/zlib-ng wall+perf (the comparator hole the goal demands); #4 causal perturbation gate on
+the consumer span before any T4+ consumer work. In-flight decomposition worker adfa2ed9: NOT wasted — its
+gz-vs-rg SYMBOL profile feeds the T1 inner-loop front too, and its file-vs-/dev/null split = part of test #1;
+demote its consumer-decomposition output to the T4+ lever pending the I/O + perturbation gates.
+
 ## USER 2-REQUESTS DONE — Fulcrum consolidated to main + decision-process doc written [2026-06-13]
 REQ1 (Fulcrum repo ready for a fresh agentic session from main ALONE): worker a2f1939d merged all unmerged
 value to fulcrum main (memlife-attribution src/memlife.rs+script; audit/false-confidence 4 falsifier
