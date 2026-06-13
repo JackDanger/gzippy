@@ -1,3 +1,17 @@
+## FULCRUM `insn` HARDENED (code-side trustworthy) — calibration is the remaining SUPERVISOR step [2026-06-12]
+The gate's 3 gaps CLOSED + pushed (fulcrum main 5bc1147/2b785e7/82cc031, 228 selftests): GAP2
+INSN-EVENT-MISMATCH refusal (denominator/event-mismatch class — the 2.7-insn/byte hallucination —
+now caught + firing-tested; alias instructions==inst_retired.any, absent-header => no false
+refusal); GAP1 false "safe by construction" docstring corrected + a necessary-not-sufficient test
+(single-wrong-bucket CLOSES green yet wrong split — closure protects TOTAL not per-category); GAP3
+refusals asserted BY NAME (_raises_named, InvariantViolation). insn is now TRUSTWORTHY CODE-SIDE
+for totals AND structurally honest about per-category limits. REMAINING (Rule-1 completion):
+the gzippy category patterns (adapters/gzippy.py INSN_CATEGORIES) are PROVISIONAL until calibrated
+against real `perf report -F period,symbol` of gzippy-native/isal/rg — a SUPERVISOR run on
+solvency (instruction counts) ready via GzippyAdapter.calibration_capture_cmds(). DO THIS before
+trusting insn's per-category answer on the marker-phase +2.8B verdict (i.e. before/with the next
+u8-port instruction re-measure). Until then: trust insn TOTALS, hand-verify per-category or run
+the calibration first.
 ## FULCRUM `insn` BUILT + GATED — totals TRUSTWORTHY, per-category NOT YET (hardening dispatched) [2026-06-12]
 Rule-1 capability landed: `fulcrum insn` (decide/fulcrum/core/insn.py, INSN-CLOSURE-OR-NO-LEDGER,
 222 selftests, pushed) — deterministic instruction ledger that REFUSES unless categories sum to
