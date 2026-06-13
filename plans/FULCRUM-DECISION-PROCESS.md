@@ -156,6 +156,19 @@ the **single probe chosen to DISCRIMINATE between them** (not to confirm the
 favorite). Pre-registration + a real rival is what stops S2 from laundering S1's
 conclusion into a sharpened version of itself.
 
+**SHARED-NESS GATE (added 2026-06-13 after this bias was caught TWICE in one
+session).** A profile/trace of ONE build (or one cell) does NOT establish that a
+cost is paid by the OTHER build / generalizes. The native and isal builds FORK at
+`gzip_chunk.rs` (`cfg(isal_clean_tail)`), so a native-only profile can be
+native-heavy even when it "looks shared." Before claiming a finding is shared
+(lifts both builds) or is the master cause of a cross-build deficit, **verify with
+the apples-to-apples arm**: re-run the same probe on the OTHER build (both forced
+`GZIPPY_FORCE_PARALLEL_SM=1`) and read whether it pays the same cost. native-vs-isal
+at the same T isolates the inner loop from shared machinery (isal's pass with the
+identical consumer is what proved the T1 deficit is inner-loop, not consumer).
+"Assume shared / one master key" is this campaign's most recurrent bias — the gate
+exists to break it.
+
 ---
 
 ## Stage 3 — CONFIRM-OR-KILL PROBE (attribution; narrows WHERE)
