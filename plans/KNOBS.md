@@ -92,9 +92,12 @@ semantics + CLASS the bare list cannot give you.
 | `GZIPPY_POISON_RESERVE` | segmented_buffer.rs:41 | test | TEST-ONLY reserved-tail poison (opt-in) to catch over-reads. |
 | `GZIPPY_HUGEPAGE` | chunk_buffer_pool.rs:120 | behavior | Request hugepages for the chunk buffer pool. |
 | `GZIPPY_MANUAL_BUFFER_POOL` | chunk_buffer_pool.rs:214 | behavior | Restore the legacy mutex buffer pool for A/B. |
-| `GZIPPY_SHARED_POOL` | chunk_buffer_pool.rs:175 | behavior | (Experiment removed 2026-05-28; flag may be a no-op stub.) |
+| `GZIPPY_SHARED_POOL` | chunk_buffer_pool.rs:175 (comment only) | dead | NOT a live knob — the shared-pool experiment was removed 2026-05-28 and only a comment naming it remains; no `env::var` read exists. (Listed so a transcript reference resolves.) |
 | `GZIPPY_SLAB_ALLOC` | rpmalloc_alloc.rs:22 | behavior | Route huge allocations through a slab allocator. |
-| `GZIPPY_SLAB_CAP` | rpmalloc_alloc.rs:63 | behavior | Cap the slab allocator size. |
+| `GZIPPY_SLAB_BUDGET_MIB` | rpmalloc_alloc.rs:210 | behavior | Cap the slab allocator total budget in MiB (the real "slab cap"; there is no `GZIPPY_SLAB_CAP`). |
+| `GZIPPY_SLAB_THRESHOLD_KIB` | rpmalloc_alloc.rs:60 | behavior | Minimum allocation size (KiB) routed to the slab vs the default allocator. |
+| `GZIPPY_SLAB_MAX_T` | rpmalloc_alloc.rs:124 | behavior | Cap the thread count above which the slab allocator engages. |
+| `GZIPPY_SLAB_TRACE` | rpmalloc_alloc.rs:263 | instrument | `=1` one stderr line per slab event (hit/miss/evict). OFF==identity. |
 | `GZIPPY_STAGING_POOL_CAP` | staged_bits.rs:49 | behavior | Cap (=0 disables) the staged-bits pool. |
 | `GZIPPY_MEM_BALLAST_MIB` | mem_stats.rs:21 | perturbation | Positive control: each worker allocates N MiB ballast (memory-pressure perturbation). |
 | `GZIPPY_BODY_FAIL_LOG` | gzip_chunk.rs:380 | instrument | Per-failure structured JSON log of body-decode failures. |
@@ -103,6 +106,35 @@ semantics + CLASS the bare list cannot give you.
 | `GZIPPY_FUZZ_SEED` | inflate_fuzz_loop.rs:12 | test | Inflate fuzz-loop RNG seed (determinism). |
 | `GZIPPY_BUILD_FEATURES` | (guest drivers) | build | Cargo feature set the guest build scripts pass (pure-rust-inflate / gzippy-native / gzippy-isal). |
 | `GZIPPY_SHA` | (guest drivers) | build | Records the built commit sha for provenance in driver output. |
+
+### Index — engine / marker / asm knobs (added 2026-06-12 source-truth pass; were live but undocumented)
+
+| Knob | Read-site | CLASS | What it does |
+|------|-----------|-------|--------------|
+| `GZIPPY_ASM_KERNEL` | asm_kernel.rs:279 | behavior | Kill-switch for the BMI2 inline-asm contig kernel: `=0` forces the Rust loop (production is ON when BMI2 is present). The active asm campaign's production toggle. |
+| `GZIPPY_ASM_STATS` | asm_kernel.rs:287 | instrument | `=1` enables the asm kernel's effect-verification counters (proves the asm actually executed). OFF==identity. Supports the active asm campaign. |
+| `GZIPPY_CONTIG_PROF` | contig_prof.rs:63 | instrument | `=1` profiles the contiguous-fold (clean-bulk) path. OFF==identity. |
+| `GZIPPY_DIST_AMORT` | marker_inflate.rs:3824 | behavior | `=0` disables distance-decode amortization in marker decode (production default ON). |
+| `GZIPPY_EXACT_BLOCK` | gzip_chunk.rs:289 | behavior | **Default ON** (`map_or(true,…)`); `=0` disables the exact-block-boundary chunk decode. A production-default knob, not OFF==identity. |
+| `GZIPPY_SEEDED_BLOCK` | gzip_chunk.rs:261 | behavior | **Default ON**; `=0` disables seeded-block decode. A production-default knob, not OFF==identity. |
+| `GZIPPY_ISAL_INCREMENTAL_GROWTH` | gzip_chunk.rs:207 | behavior | `=1` enables incremental ISA-L output-buffer growth (x86/Linux ISA-L oracle path only). |
+| `GZIPPY_ISAL_INITIAL_FACTOR` | gzip_chunk.rs:210 | behavior | Initial ISA-L output-buffer size factor (x86/Linux ISA-L oracle path). |
+| `GZIPPY_ISAL_GROW_MIB` | gzip_chunk.rs:215 | behavior | ISA-L output-buffer growth step in MiB (x86/Linux ISA-L oracle path). |
+| `GZIPPY_MARKER_DIST_STATS` | marker_inflate.rs:366 | instrument | `=1` marker distance-decode statistics. OFF==identity. |
+| `GZIPPY_MARKER_DIST_TABLE` | marker_inflate.rs:482 | behavior | `=0` disables the marker distance LUT (production default ON). |
+| `GZIPPY_MFAST_DISABLE` | slow_knob.rs:348 | behavior | **(keep)** Kill-switch: disables the marker fast-path (`mfast`) — a documented same-binary A/B arm. |
+| `GZIPPY_MFAST_PROF` | marker_inflate.rs:411 | instrument | `=1` profiles the marker fast-path. OFF==identity. |
+| `GZIPPY_NO_MFAST_LOCALBITS` | marker_inflate.rs:499 | behavior | **(keep)** Kill-switch (`=1`): use the pre-change struct-field bit path in the mfast loop — the F-w1 causal A/B arm. In a protected decode-loop file. |
+| `GZIPPY_NO_HIT_DRIVE` | chunk_fetcher.rs:1202 | behavior | **(keep)** Kill-switch (`=1`): disable the prefetch hit-drive. |
+| `GZIPPY_NO_STORED_FLIP` | marker_inflate.rs:311 | behavior | `=1` disables the stored-block u16→u8 flip (A/B). |
+| `GZIPPY_NO_STOREDPAR_DEMOTE` | stored_split.rs:62 | behavior | **(keep)** Kill-switch: when unset, the stored path may demote to sequential; set to suppress that demotion. |
+| `GZIPPY_NO_REFILL_STAGING` | isal_decompress.rs:960 | behavior | `=1` disables refill staging in the ISA-L streaming path (x86/Linux only). |
+| `GZIPPY_WINDOW_SPARSITY` | sm_driver.rs:33 | behavior | **(keep)** `=1` enables window-sparsity handling on the SM driver. |
+| `GZIPPY_SLOW_MFAST_MODE` | slow_knob.rs:364 | perturbation | **(keep)** Marker-fast-path slow factor — a production slow_knob marker variant (rule 1; pair with a SLEEP control). |
+| `GZIPPY_PREFAULT_ARENA` | chunk_buffer_pool.rs:219 | behavior | Prefault the chunk-arena pages up front (page-warmth A/B). |
+| `GZIPPY_ORACLE_RECORD` | removal_oracle.rs:125 | oracle | RECORD pass for the removal-oracle family: capture per-chunk results to a file. |
+| `GZIPPY_ORACLE_NOSTORE` | removal_oracle.rs:79 | oracle | Replay with the literal-store/back-ref-copy term REMOVED → store-removed ceiling. |
+| `GZIPPY_ORACLE_NODECODE` | removal_oracle.rs:145 | oracle | Replay with the Huffman-decode term REMOVED → decode-removed ceiling. |
 
 ---
 
@@ -118,3 +150,34 @@ Any name in that list NOT in the table above is a new, undocumented knob — add
 with its read-site (`rg -n NAME src/ | head -1`) and CLASS before using it in a
 turn. (A couple of entries above are family prefixes — `GZIPPY_BYPASS_` etc. — that
 cover several concrete `GZIPPY_BYPASS_*` knobs already itemized.)
+
+## Deletable-candidates (2026-06-12 source-truth audit — for the supervisor to action)
+
+A knob is DELETABLE iff (no banked cite in `orchestrator-status.md` or `plans/archive/`)
+AND (no live test) AND (it is not a documented kill-switch/instrument supporting active
+machinery). The audit (`scripts`-free; `grep` callers + cites + tests) found these
+no-banked-cite + no-test knobs. Each is left in place pending supervisor judgment because
+all are entangled with active machinery, woven through active code paths at several sites,
+or sit in protected decode-loop files:
+
+- **Standalone abandoned probes (safest to delete, but each gates a helper/closure):**
+  `GZIPPY_STORED_PHASE_TIMING` (stored_split `time_phase` wrapper, 9 closure call-sites),
+  `GZIPPY_BODY_FAIL_LOG` (gzip_chunk debug-log helper),
+  `GZIPPY_SLAB_TRACE` (rpmalloc, 6 call-sites in the *active* slab path),
+  `GZIPPY_STORED_INLINE_COPY` / `GZIPPY_STORED_NO_OVERLAP` (stored A/B branches),
+  `GZIPPY_MMAP_OUTPUT` / `GZIPPY_NO_PUBLISH_AHEAD` / `GZIPPY_DISABLE_WRITEV` (output A/B),
+  `GZIPPY_HUGEPAGE` / `GZIPPY_BURST_PREFETCH` / `GZIPPY_PREFETCH_CACHE_CAP` / `GZIPPY_EAGER_POSTPROC` (fetcher behavior A/B),
+  `GZIPPY_FOLD_NOCRC` (fold A/B).
+- **KEEP despite no direct cite (support active machinery / are kill-switches):**
+  `GZIPPY_ASM_STATS` (effect-verification for the active asm campaign),
+  `GZIPPY_ORACLE_TRACE` (inside the active clean-window oracle),
+  `GZIPPY_PID` / `GZIPPY_TRACE_DETAIL` (sub-knobs of the active TIMELINE/TRACE instrument),
+  `GZIPPY_NO_MFAST_LOCALBITS` (kill-switch A/B in a protected decode-loop file),
+  `GZIPPY_RPMALLOC_STATS` (cited in the active fulcrum2 charter),
+  the `GZIPPY_BYPASS_*` and `GZIPPY_ORACLE_{RECORD,NOSTORE,NODECODE}` families (coherent
+  oracle machinery; deleting one member breaks the family),
+  `GZIPPY_NO_REFILL_STAGING` / `GZIPPY_PACKED_LIT_STORE` (ISA-L / inner-loop, defer).
+
+Removing any of the first group is behavior-preserving for production (the gated path is
+dead when the env is unset and the env is never set in prod), but each touches active code
+and must be re-verified on Linux (gzippy-isal / default features) as well as pure-rust.
