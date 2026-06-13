@@ -1,3 +1,25 @@
+## USER 2-REQUESTS DONE — Fulcrum consolidated to main + decision-process doc written [2026-06-13]
+REQ1 (Fulcrum repo ready for a fresh agentic session from main ALONE): worker a2f1939d merged all unmerged
+value to fulcrum main (memlife-attribution src/memlife.rs+script; audit/false-confidence 4 falsifier
+fixtures #[ignore]'d so suite stays GREEN; model-params-independent src/model.rs L_resolve-tautology fix
+w/ 9 conflict regions resolved keeping BOTH sides; cycles.py PMU-prefix+2.0%tol committed). Supervisor
+VERIFIED: local==origin/main, cargo build clean 6s, tests green, only main+bump/0.1.1 local, single
+worktree. Pruned 9 fully-merged REMOTE branches (0-ahead verified each) — origin now just main+bump/0.1.1.
+fulcrum main @ 7e33953 v0.3.0.
+REQ2 (structured method to use Fulcrum output): wrote plans/FULCRUM-DECISION-PROCESS.md, advisor-hardened
+(a26d1892 caught 4 load-bearing holes — all fixed): staged FUNNEL S0 gap-map(coverage/trust/VALIDITY/
+provenance/decomposition/mechanism) -> S0.5 NEGATIVE-SPACE(every failing cell -> hypothesis or
+unexplained-flat ticket; funnel is shape-BLIND to flat/everywhere tax like the 1.56x) -> S1 shapes ->
+S2 >=2 RIVAL hypotheses+pre-registered CONFIRM/FALSIFY+discriminating probe -> S3 confirm-or-kill
+(attribution) -> S4 CAUSAL PERTURBATION >=2 magnitudes+freq-neutral (ONLY verdict) -> S5 bound+strategic
++faithfulness gates. PLUS: FAST LANE (strictly-less-work byte-identical fixes enter at S5 — the campaign's
+real win profile); PRIORITIZATION lexicographic goal-deficit->BLAST-RADIUS(not magnitude)->VoI->cost;
+instrument self-validation hard gate; finding lifecycle (stamp-commit/auto-demote/re-open-trigger);
+tools PULLED by blocked finding not pushed. Banked [[project_fulcrum_decision_process]].
+NEXT (per the new process, S4 owed on the live finding): decompose crc_write (CRC32 vs write vs copy) via
+insn-by-region, then perturb at >=2 magnitudes — promote "reduce per-byte consumer work" to a lever only
+on a survived perturbation. Also open: T1 comparator hole (native vs libdeflate/zlib-ng/ISA-L).
+
 ## PROBE RESULT — "shared parallel machinery" FALSIFIED; gap is SERIAL CONSUMER + 1.56x per-byte instructions [2026-06-13]
 Worker af8596f0 on solvency (frozen, sha-verified, GZIPPY_FORCE_PARALLEL_SM, path=ParallelSM asserted).
 AMD silesia t4/t8, gz-native trace (17 chunks, 16/17 speculative accepts, 0 mismatches):
