@@ -499,6 +499,26 @@ fn mfast_localbits_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MFAST_LOCALBITS").is_ok_and(|v| v == "1"))
 }
 
+/// ENGINE/U8-SINGLE-LOOP kill-switch: `GZIPPY_NO_MFAST_REENTRY=1` restores the
+/// exact pre-change two-segment structure per `read()` call — `'mfast` runs
+/// ONCE (until the ring's physical wrap or call cap) and the careful per-symbol
+/// loop then handles the ENTIRE remainder of the call. With re-entry ON
+/// (default), the careful loop yields back to `'mfast` as soon as the wrap
+/// headroom clears, so the fast loop covers ~100% of marker volume instead of
+/// ~50% (the wrap point is uniformly distributed over the 64Ki-slot ring, so
+/// on average HALF of every call ran in the careful loop). Vendor counterpart:
+/// rapidgzip's readInternal is ONE loop covering 100% of the block body
+/// (deflate.hpp:1601-1666) — the two-segment split with no re-entry was a
+/// gzippy-only deviation. Byte-exact: the careful loop and `'mfast` produce
+/// identical output for identical input bits (the long-standing exit contract:
+/// every `'mfast` exit leaves the bit cursor exactly before the next undecoded
+/// symbol). One OnceLock read per call; zero-cost when OFF.
+fn mfast_reentry_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MFAST_REENTRY").is_ok_and(|v| v == "1"))
+}
+
 /// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
 /// new path active/inactive on a shipped binary without counters plumbing).
 fn stored_flip_debug_log(case: &str, n: usize) {
@@ -2064,534 +2084,594 @@ impl Block {
         // of marker decode. Byte-identical output, different code path. This is the
         // DISCRIMINATOR arm of the mfast-phase0 probe — if wall is flat vs arm0
         // (knobs off), aggregate marker decode is SLACK on this cell.
-        if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield && !mfast_disabled {
-            // ── Rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1) ──────
-            // The fast loop's distance decode goes through the libdeflate-shape
-            // `DistTable` — ONE entry load + in-register `consume_entry` /
-            // `decode_distance` — replacing the dist_hc → DISTANCE_EXTRA →
-            // refill-check → DISTANCE_BASE dependent chain (the P3.1-measured
-            // 84.8→61.5 cyc/backref mechanism; see the `dist_table` field doc).
-            // Byte-exact by the same P3.1 equivalence already differentialed on
-            // the contig loop: identical symbols ⇒ identical distance +
-            // identical bit consumption; unassigned/invalid code ⇒ raw==0
-            // entry ⇒ `InvalidHuffmanCode`, exactly dist_hc's `None`. The
-            // careful loop below keeps dist_hc verbatim (rare tail/edge path).
-            //
-            // Kill-switch `GZIPPY_MARKER_DIST_TABLE=0` (same-binary causal A/B
-            // arm, F-d1): the table is neither built nor used here — the
-            // else-arm below is the exact pre-change chain.
-            #[cfg(pure_inflate_decode)]
-            let marker_dist_lut: bool = !marker_dist_lut_disabled();
-            // Effect-verification snapshot (one OnceLock read per call; the
-            // per-backref increment below is a predictable branch when OFF).
-            #[cfg(pure_inflate_decode)]
-            let md_stats: bool = marker_dist_stats::enabled();
-            #[cfg(pure_inflate_decode)]
-            if marker_dist_lut {
-                // P3.4-amortized: fixed blocks use the process-wide static
-                // table (no per-block work); dynamic blocks memcmp-reuse.
-                // Latched per block (`dist_table_checked`), shared with the
-                // contig clean loop's call site.
-                self.ensure_dist_table();
-            }
-            // FixedHuffman + amortization ON ⇒ the process-wide static table,
-            // hoisted here as `&'static` (no `self` borrow held across the
-            // loop). The dynamic-block table is re-borrowed per backref below
-            // (the field-path borrow ends before the `&mut self` sparsity
-            // call, so it cannot be hoisted across the loop body).
-            #[cfg(pure_inflate_decode)]
-            let marker_fixed_tbl: Option<
-                &'static crate::decompress::inflate::libdeflate_entry::DistTable,
-            > = if marker_dist_lut
-                && self.compression_type == CompressionType::FixedHuffman
-                && !dist_amort_disabled()
-            {
-                fixed_dist_table()
-            } else {
-                None
-            };
-            let in_end = bits.data.len();
-            bits.refill();
-            let mut pre = self.lut_litlen.decode(bits);
-            // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
-            // above (dist-table amortization + initial preload) which is amortized
-            // per block and is negligible vs the loop body in aggregate.
-            // Declared here (not before the `if CONTAINS_MARKERS` block) so
-            // there is no "initial value never read" warning on the clean path.
-            let mfast_t0: u64 = mfast_prof::rdtsc(mfast_prof_on);
-            let mut mfast_ev: u64 = 0;
-            // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
-            // Mirror of the P3.1 / Lever-B1 change on the contig clean loop
-            // (plans/asm-rung-d-eval.md §1 N2): hoist bitbuf/bitsleft/pos into
-            // a stack-local `lb: Bits` for the duration of `'mfast` and write
-            // back at every exit. The raw-pointer ring stores (through `ring_ptr`)
-            // defeat LLVM's alias analysis on the struct-field path (same finding
-            // as the contig loop's `lb` doc comment, marker_inflate.rs:2763-2769):
-            // the compiler cannot prove `ring_ptr` never aliases `bits.bitbuf`
-            // etc. and reloads them from memory after each store. A non-escaping
-            // stack local has unambiguous provenance — LLVM keeps it in registers.
-            //
-            // Byte-exact by construction: identical bit reads, identical
-            // consumption amounts, identical output — same semantics, different
-            // storage for the three cursor fields.
-            //
-            // Kill-switch `GZIPPY_NO_MFAST_LOCALBITS=1`: restores the exact
-            // pre-change struct-field path (bits.xxx throughout the loop). The
-            // same-binary two-variant macro (`mfast_lb_run!`) keeps the loop
-            // body in one place; parameters thread the cursor ident and the two
-            // calls that differ in type (`dist_hc.decode`, `lut_litlen.decode`).
-            //
-            // Exit-path audit (ALL exits sync lb → bits before use by the careful
-            // loop or the mfast_prof rdtsc):
-            //   break 'mfast (guard fail / invalid code) — sync AFTER loop ✓
-            //   return Ok(emitted)   — $sync_at_exit before return ✓
-            //   return Err(*)        — $sync_at_exit before return ✓ (7 sites)
-            macro_rules! mfast_lb_run {
-                ($cur:ident, $dist_hc_decode:expr, $litlen_decode:block, $sync_at_exit:block) => {
-                    'mfast: loop {
-                        // Resumable cap + wrap headroom + input slop. Headroom is in u16
-                        // SLOTS (ring modulus is RING_SIZE = 65536 slots = 128 KiB).
-                        let dst_phys = pos % RING_SIZE;
-                        let out_ok = emitted + FAST_OUT_SLOP < n_max_to_decode
-                            && dst_phys + FAST_OUT_SLOP <= RING_SIZE;
-                        let in_ok = $cur.pos + FAST_IN_SLOP < in_end;
-                        if !(out_ok && in_ok) {
-                            break 'mfast;
-                        }
-                        // MFAST_PROF: count events that passed the guard (actual work).
-                        // SLOW_MFAST_MODE: localized per-event inject WITHOUT gating entry.
-                        if mfast_prof_on {
-                            mfast_ev += 1;
-                        }
-                        super::slow_knob::inject_localize(mfast_spin, mfast_yield);
-                        let sym0 = pre.symbol;
-                        let sym_count0 = pre.sym_count;
-                        let bit_count0 = pre.bit_count;
-                        if bit_count0 == 0 {
-                            break 'mfast;
-                        }
-                        $cur.consume(bit_count0);
+        //
+        // ── ENGINE/U8-SINGLE-LOOP (2026-06-12): fastloop RE-ENTRY ────────────
+        // Pre-change structure: `'mfast` ran ONCE per `read()` call, exiting at
+        // the ring's physical wrap (`dst_phys + FAST_OUT_SLOP > RING_SIZE`), and
+        // the careful per-symbol loop then decoded the ENTIRE remainder of the
+        // call (up to ~64Ki slots) — no way back. Because the wrap point drifts
+        // uniformly (pos advances ~65278 mod 65536 per call), ~HALF of all
+        // marker-mode volume decoded through the careful loop at roughly twice
+        // the instruction rate. Vendor's readInternal is ONE loop covering 100%
+        // (deflate.hpp:1601-1666). Fix: the libdeflate fastloop/slowloop shape —
+        // the careful loop yields control back to `'mfast` (via `continue
+        // 'outer`) once it has made progress AND the `'mfast` entry guards hold
+        // again (wrap headroom + output cap + input slop). The careful loop
+        // remains the sole owner of the wrap-straddle region, block tails, and
+        // edge cases — exactly as before, just bounded to those regions.
+        // Kill-switch: GZIPPY_NO_MFAST_REENTRY=1 (see `mfast_reentry_disabled`).
+        let mfast_entry_ok: bool =
+            CONTAINS_MARKERS && slow_spin == 0 && !slow_yield && !mfast_disabled;
+        let mfast_reentry_ok: bool = mfast_entry_ok && !mfast_reentry_disabled();
+        'outer: loop {
+            if mfast_entry_ok {
+                // ── Rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1) ──────
+                // The fast loop's distance decode goes through the libdeflate-shape
+                // `DistTable` — ONE entry load + in-register `consume_entry` /
+                // `decode_distance` — replacing the dist_hc → DISTANCE_EXTRA →
+                // refill-check → DISTANCE_BASE dependent chain (the P3.1-measured
+                // 84.8→61.5 cyc/backref mechanism; see the `dist_table` field doc).
+                // Byte-exact by the same P3.1 equivalence already differentialed on
+                // the contig loop: identical symbols ⇒ identical distance +
+                // identical bit consumption; unassigned/invalid code ⇒ raw==0
+                // entry ⇒ `InvalidHuffmanCode`, exactly dist_hc's `None`. The
+                // careful loop below keeps dist_hc verbatim (rare tail/edge path).
+                //
+                // Kill-switch `GZIPPY_MARKER_DIST_TABLE=0` (same-binary causal A/B
+                // arm, F-d1): the table is neither built nor used here — the
+                // else-arm below is the exact pre-change chain.
+                #[cfg(pure_inflate_decode)]
+                let marker_dist_lut: bool = !marker_dist_lut_disabled();
+                // Effect-verification snapshot (one OnceLock read per call; the
+                // per-backref increment below is a predictable branch when OFF).
+                #[cfg(pure_inflate_decode)]
+                let md_stats: bool = marker_dist_stats::enabled();
+                #[cfg(pure_inflate_decode)]
+                if marker_dist_lut {
+                    // P3.4-amortized: fixed blocks use the process-wide static
+                    // table (no per-block work); dynamic blocks memcmp-reuse.
+                    // Latched per block (`dist_table_checked`), shared with the
+                    // contig clean loop's call site.
+                    self.ensure_dist_table();
+                }
+                // FixedHuffman + amortization ON ⇒ the process-wide static table,
+                // hoisted here as `&'static` (no `self` borrow held across the
+                // loop). The dynamic-block table is re-borrowed per backref below
+                // (the field-path borrow ends before the `&mut self` sparsity
+                // call, so it cannot be hoisted across the loop body).
+                #[cfg(pure_inflate_decode)]
+                let marker_fixed_tbl: Option<
+                    &'static crate::decompress::inflate::libdeflate_entry::DistTable,
+                > = if marker_dist_lut
+                    && self.compression_type == CompressionType::FixedHuffman
+                    && !dist_amort_disabled()
+                {
+                    fixed_dist_table()
+                } else {
+                    None
+                };
+                let in_end = bits.data.len();
+                bits.refill();
+                let mut pre = self.lut_litlen.decode(bits);
+                // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
+                // above (dist-table amortization + initial preload) which is amortized
+                // per block and is negligible vs the loop body in aggregate.
+                // Declared here (not before the `if CONTAINS_MARKERS` block) so
+                // there is no "initial value never read" warning on the clean path.
+                let mfast_t0: u64 = mfast_prof::rdtsc(mfast_prof_on);
+                let mut mfast_ev: u64 = 0;
+                // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
+                // Mirror of the P3.1 / Lever-B1 change on the contig clean loop
+                // (plans/asm-rung-d-eval.md §1 N2): hoist bitbuf/bitsleft/pos into
+                // a stack-local `lb: Bits` for the duration of `'mfast` and write
+                // back at every exit. The raw-pointer ring stores (through `ring_ptr`)
+                // defeat LLVM's alias analysis on the struct-field path (same finding
+                // as the contig loop's `lb` doc comment, marker_inflate.rs:2763-2769):
+                // the compiler cannot prove `ring_ptr` never aliases `bits.bitbuf`
+                // etc. and reloads them from memory after each store. A non-escaping
+                // stack local has unambiguous provenance — LLVM keeps it in registers.
+                //
+                // Byte-exact by construction: identical bit reads, identical
+                // consumption amounts, identical output — same semantics, different
+                // storage for the three cursor fields.
+                //
+                // Kill-switch `GZIPPY_NO_MFAST_LOCALBITS=1`: restores the exact
+                // pre-change struct-field path (bits.xxx throughout the loop). The
+                // same-binary two-variant macro (`mfast_lb_run!`) keeps the loop
+                // body in one place; parameters thread the cursor ident and the two
+                // calls that differ in type (`dist_hc.decode`, `lut_litlen.decode`).
+                //
+                // Exit-path audit (ALL exits sync lb → bits before use by the careful
+                // loop or the mfast_prof rdtsc):
+                //   break 'mfast (guard fail / invalid code) — sync AFTER loop ✓
+                //   return Ok(emitted)   — $sync_at_exit before return ✓
+                //   return Err(*)        — $sync_at_exit before return ✓ (7 sites)
+                macro_rules! mfast_lb_run {
+                    ($cur:ident, $dist_hc_decode:expr, $litlen_decode:block, $sync_at_exit:block) => {
+                        'mfast: loop {
+                            // Resumable cap + wrap headroom + input slop. Headroom is in u16
+                            // SLOTS (ring modulus is RING_SIZE = 65536 slots = 128 KiB).
+                            let dst_phys = pos % RING_SIZE;
+                            let out_ok = emitted + FAST_OUT_SLOP < n_max_to_decode
+                                && dst_phys + FAST_OUT_SLOP <= RING_SIZE;
+                            let in_ok = $cur.pos + FAST_IN_SLOP < in_end;
+                            if !(out_ok && in_ok) {
+                                break 'mfast;
+                            }
+                            // MFAST_PROF: count events that passed the guard (actual work).
+                            // SLOW_MFAST_MODE: localized per-event inject WITHOUT gating entry.
+                            if mfast_prof_on {
+                                mfast_ev += 1;
+                            }
+                            super::slow_knob::inject_localize(mfast_spin, mfast_yield);
+                            let sym0 = pre.symbol;
+                            let sym_count0 = pre.sym_count;
+                            let bit_count0 = pre.bit_count;
+                            if bit_count0 == 0 {
+                                break 'mfast;
+                            }
+                            $cur.consume(bit_count0);
 
-                        // SPECULATIVE wide store of the (up-to-3) packed literal bytes,
-                        // WIDENED to u16. Each packed byte b is stored as the u16 value b
-                        // (< 256). One 8-byte unaligned write covers 4 u16 slots (≥ the 3
-                        // possible literals); the trailing slot(s) past `lit_prefix` are
-                        // overwritten by the next packet or the back-ref below. `dst_phys +
-                        // FAST_OUT_SLOP <= RING_SIZE` (FAST_OUT_SLOP >= 4 u16 slots) ⇒ the
-                        // 8-byte store never straddles the ring wrap. Value-identical to the
-                        // careful loop's per-literal `write(code & 0xFF)`.
-                        unsafe {
-                            let p = sym0 as u64;
-                            let widened: u64 =
-                                (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
-                            (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
-                        }
-                        let mut s = sym0;
-                        let mut remaining = sym_count0;
-                        let mut lit_prefix = 0usize;
-                        let mut trailing_code: u16 = 0;
-                        let mut have_trailing = false;
-                        while remaining > 0 {
-                            let code = (s & 0xFFFF) as u16;
-                            if code <= 255 || remaining > 1 {
-                                if remaining == 1 && code > 255 {
-                                    trailing_code = code;
-                                    have_trailing = true;
-                                    break;
+                            // SPECULATIVE wide store of the (up-to-3) packed literal bytes,
+                            // WIDENED to u16. Each packed byte b is stored as the u16 value b
+                            // (< 256). One 8-byte unaligned write covers 4 u16 slots (≥ the 3
+                            // possible literals); the trailing slot(s) past `lit_prefix` are
+                            // overwritten by the next packet or the back-ref below. `dst_phys +
+                            // FAST_OUT_SLOP <= RING_SIZE` (FAST_OUT_SLOP >= 4 u16 slots) ⇒ the
+                            // 8-byte store never straddles the ring wrap. Value-identical to the
+                            // careful loop's per-literal `write(code & 0xFF)`.
+                            unsafe {
+                                let p = sym0 as u64;
+                                let widened: u64 =
+                                    (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
+                                (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
+                            }
+                            let mut s = sym0;
+                            let mut remaining = sym_count0;
+                            let mut lit_prefix = 0usize;
+                            let mut trailing_code: u16 = 0;
+                            let mut have_trailing = false;
+                            while remaining > 0 {
+                                let code = (s & 0xFFFF) as u16;
+                                if code <= 255 || remaining > 1 {
+                                    if remaining == 1 && code > 255 {
+                                        trailing_code = code;
+                                        have_trailing = true;
+                                        break;
+                                    }
+                                    lit_prefix += 1;
+                                    remaining -= 1;
+                                    s >>= 8;
+                                    continue;
                                 }
-                                lit_prefix += 1;
-                                remaining -= 1;
-                                s >>= 8;
-                                continue;
+                                trailing_code = code;
+                                have_trailing = true;
+                                break;
                             }
-                            trailing_code = code;
-                            have_trailing = true;
-                            break;
-                        }
-                        pos += lit_prefix;
-                        emitted += lit_prefix;
-                        // Vendor: per clean literal `++m_distanceToLastMarkerByte`.
-                        distance_marker += lit_prefix;
+                            pos += lit_prefix;
+                            emitted += lit_prefix;
+                            // Vendor: per clean literal `++m_distanceToLastMarkerByte`.
+                            distance_marker += lit_prefix;
 
-                        if have_trailing {
-                            let code = trailing_code;
-                            if code == END_OF_BLOCK_SYMBOL {
-                                self.at_end_of_block = true;
-                                self.ring.pos = pos;
-                                self.decoded_bytes += emitted;
-                                self.ring.distance_to_last_marker = distance_marker;
-                                $sync_at_exit;
-                                return Ok(emitted);
-                            }
-                            if (code as u32) > MAX_LIT_LEN_SYM {
-                                self.ring.pos = pos;
-                                self.decoded_bytes += emitted;
-                                self.ring.distance_to_last_marker = distance_marker;
-                                $sync_at_exit;
-                                return Err(BlockError::InvalidHuffmanCode);
-                            }
-                            let length = (code as usize).wrapping_sub(254);
-                            if length != 0 {
-                                // Rung (d) N1: per-backref table select (see the hoist
-                                // comment above the loop). `None` ⇔ kill-switch OFF
-                                // arm or a builder-declined block — both take the
-                                // pre-change dist_hc chain below.
-                                #[cfg(pure_inflate_decode)]
-                                let marker_dt: Option<
-                                    &crate::decompress::inflate::libdeflate_entry::DistTable,
-                                > = if !marker_dist_lut {
-                                    None
-                                } else if marker_fixed_tbl.is_some() {
-                                    marker_fixed_tbl
-                                } else {
-                                    self.dist_table.as_ref()
-                                };
-                                #[cfg(not(pure_inflate_decode))]
-                                let marker_dt: Option<
-                                    &crate::decompress::inflate::libdeflate_entry::DistTable,
-                                > = None;
-                                let distance = if let Some(dt) = marker_dt {
-                                    // Single-lookup path — mirror of the contig fast
-                                    // loop's dist decode (incl. subtable + raw==0
-                                    // handling). Bit-budget proof: the bottom
-                                    // `$cur.refill()` is fast-form whenever the top
-                                    // `in_ok` guard holds (a slow refill ends with
-                                    // `pos == data.len()`, which fails `in_ok`), so
-                                    // iteration tops have >= 56 real bits; the litlen
-                                    // consume is <= 20 ⇒ >= 36 here >= the 28-bit
-                                    // worst case (15-bit dist code + 13 extra).
-                                    use crate::decompress::inflate::libdeflate_entry::DistTable;
-                                    #[cfg(all(test, pure_inflate_decode))]
-                                    MARKER_DIST_LUT_HITS
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if have_trailing {
+                                let code = trailing_code;
+                                if code == END_OF_BLOCK_SYMBOL {
+                                    self.at_end_of_block = true;
+                                    self.ring.pos = pos;
+                                    self.decoded_bytes += emitted;
+                                    self.ring.distance_to_last_marker = distance_marker;
+                                    $sync_at_exit;
+                                    return Ok(emitted);
+                                }
+                                if (code as u32) > MAX_LIT_LEN_SYM {
+                                    self.ring.pos = pos;
+                                    self.decoded_bytes += emitted;
+                                    self.ring.distance_to_last_marker = distance_marker;
+                                    $sync_at_exit;
+                                    return Err(BlockError::InvalidHuffmanCode);
+                                }
+                                let length = (code as usize).wrapping_sub(254);
+                                if length != 0 {
+                                    // Rung (d) N1: per-backref table select (see the hoist
+                                    // comment above the loop). `None` ⇔ kill-switch OFF
+                                    // arm or a builder-declined block — both take the
+                                    // pre-change dist_hc chain below.
                                     #[cfg(pure_inflate_decode)]
-                                    if md_stats {
-                                        marker_dist_stats::LUT_BACKREFS
+                                    let marker_dt: Option<
+                                        &crate::decompress::inflate::libdeflate_entry::DistTable,
+                                    > = if !marker_dist_lut {
+                                        None
+                                    } else if marker_fixed_tbl.is_some() {
+                                        marker_fixed_tbl
+                                    } else {
+                                        self.dist_table.as_ref()
+                                    };
+                                    #[cfg(not(pure_inflate_decode))]
+                                    let marker_dt: Option<
+                                        &crate::decompress::inflate::libdeflate_entry::DistTable,
+                                    > = None;
+                                    let distance = if let Some(dt) = marker_dt {
+                                        // Single-lookup path — mirror of the contig fast
+                                        // loop's dist decode (incl. subtable + raw==0
+                                        // handling). Bit-budget proof: the bottom
+                                        // `$cur.refill()` is fast-form whenever the top
+                                        // `in_ok` guard holds (a slow refill ends with
+                                        // `pos == data.len()`, which fails `in_ok`), so
+                                        // iteration tops have >= 56 real bits; the litlen
+                                        // consume is <= 20 ⇒ >= 36 here >= the 28-bit
+                                        // worst case (15-bit dist code + 13 extra).
+                                        use crate::decompress::inflate::libdeflate_entry::DistTable;
+                                        #[cfg(all(test, pure_inflate_decode))]
+                                        MARKER_DIST_LUT_HITS
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    let mut dist_entry = dt.lookup($cur.bitbuf);
-                                    if dist_entry.is_subtable_ptr() {
-                                        $cur.consume(DistTable::TABLE_BITS as u32);
-                                        dist_entry =
-                                            dt.lookup_subtable_direct(dist_entry, $cur.bitbuf);
-                                    }
-                                    let dist_raw = dist_entry.raw();
-                                    // raw == 0 is the unassigned/invalid-code marker
-                                    // (codes 30/31 and incomplete-code holes) — the
-                                    // exact set `dist_hc.decode` returns `None` for.
-                                    if dist_raw == 0 {
-                                        self.ring.pos = pos;
-                                        self.decoded_bytes += emitted;
-                                        self.ring.distance_to_last_marker = distance_marker;
-                                        $sync_at_exit;
-                                        return Err(BlockError::InvalidHuffmanCode);
-                                    }
-                                    let dist_extra_saved = $cur.bitbuf;
-                                    $cur.consume_entry(dist_raw);
-                                    dist_entry.decode_distance(dist_extra_saved) as usize
-                                } else {
-                                    // Pre-change chain VERBATIM (N1 kill-switch arm).
-                                    #[cfg(pure_inflate_decode)]
-                                    if md_stats {
-                                        marker_dist_stats::HC_BACKREFS
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    let dsym = match $dist_hc_decode {
-                                        Some(d) => d,
-                                        None => {
+                                        #[cfg(pure_inflate_decode)]
+                                        if md_stats {
+                                            marker_dist_stats::LUT_BACKREFS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        let mut dist_entry = dt.lookup($cur.bitbuf);
+                                        if dist_entry.is_subtable_ptr() {
+                                            $cur.consume(DistTable::TABLE_BITS as u32);
+                                            dist_entry =
+                                                dt.lookup_subtable_direct(dist_entry, $cur.bitbuf);
+                                        }
+                                        let dist_raw = dist_entry.raw();
+                                        // raw == 0 is the unassigned/invalid-code marker
+                                        // (codes 30/31 and incomplete-code holes) — the
+                                        // exact set `dist_hc.decode` returns `None` for.
+                                        if dist_raw == 0 {
                                             self.ring.pos = pos;
                                             self.decoded_bytes += emitted;
                                             self.ring.distance_to_last_marker = distance_marker;
                                             $sync_at_exit;
                                             return Err(BlockError::InvalidHuffmanCode);
                                         }
-                                    };
-                                    if dsym as usize >= DISTANCE_BASE.len() {
-                                        self.ring.pos = pos;
-                                        self.decoded_bytes += emitted;
-                                        self.ring.distance_to_last_marker = distance_marker;
-                                        $sync_at_exit;
-                                        return Err(BlockError::InvalidHuffmanCode);
-                                    }
-                                    let extra = DISTANCE_EXTRA[dsym as usize] as u32;
-                                    if extra > 0 {
-                                        if $cur.available() < extra {
-                                            $cur.refill();
-                                            if $cur.available() < extra {
+                                        let dist_extra_saved = $cur.bitbuf;
+                                        $cur.consume_entry(dist_raw);
+                                        dist_entry.decode_distance(dist_extra_saved) as usize
+                                    } else {
+                                        // Pre-change chain VERBATIM (N1 kill-switch arm).
+                                        #[cfg(pure_inflate_decode)]
+                                        if md_stats {
+                                            marker_dist_stats::HC_BACKREFS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        let dsym = match $dist_hc_decode {
+                                            Some(d) => d,
+                                            None => {
                                                 self.ring.pos = pos;
                                                 self.decoded_bytes += emitted;
                                                 self.ring.distance_to_last_marker = distance_marker;
                                                 $sync_at_exit;
-                                                return Err(BlockError::EndOfFile);
+                                                return Err(BlockError::InvalidHuffmanCode);
                                             }
+                                        };
+                                        if dsym as usize >= DISTANCE_BASE.len() {
+                                            self.ring.pos = pos;
+                                            self.decoded_bytes += emitted;
+                                            self.ring.distance_to_last_marker = distance_marker;
+                                            $sync_at_exit;
+                                            return Err(BlockError::InvalidHuffmanCode);
                                         }
-                                        let mask = (1u64 << extra) - 1;
-                                        let v = ($cur.peek() & mask) as usize;
-                                        $cur.consume(extra);
-                                        DISTANCE_BASE[dsym as usize] as usize + v
-                                    } else {
-                                        DISTANCE_BASE[dsym as usize] as usize
+                                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                                        if extra > 0 {
+                                            if $cur.available() < extra {
+                                                $cur.refill();
+                                                if $cur.available() < extra {
+                                                    self.ring.pos = pos;
+                                                    self.decoded_bytes += emitted;
+                                                    self.ring.distance_to_last_marker =
+                                                        distance_marker;
+                                                    $sync_at_exit;
+                                                    return Err(BlockError::EndOfFile);
+                                                }
+                                            }
+                                            let mask = (1u64 << extra) - 1;
+                                            let v = ($cur.peek() & mask) as usize;
+                                            $cur.consume(extra);
+                                            DISTANCE_BASE[dsym as usize] as usize + v
+                                        } else {
+                                            DISTANCE_BASE[dsym as usize] as usize
+                                        }
+                                    };
+                                    if distance == 0 || distance > MAX_WINDOW_SIZE {
+                                        self.ring.pos = pos;
+                                        self.decoded_bytes += emitted;
+                                        self.ring.distance_to_last_marker = distance_marker;
+                                        $sync_at_exit;
+                                        return Err(BlockError::ExceededWindowRange);
                                     }
-                                };
-                                if distance == 0 || distance > MAX_WINDOW_SIZE {
-                                    self.ring.pos = pos;
-                                    self.decoded_bytes += emitted;
-                                    self.ring.distance_to_last_marker = distance_marker;
-                                    $sync_at_exit;
-                                    return Err(BlockError::ExceededWindowRange);
-                                }
-                                // NO clean-mode `distance > decoded+emitted` check here —
-                                // vendor const-folds it out for marker windows.
-                                // Back-ref via the SAME production routine the careful loop
-                                // uses for markers; it maintains `distance_marker` (the fast
-                                // `>= distance` skip + backward marker scan) and is wrap-safe.
-                                unsafe {
-                                    emit_backref_ring::<CONTAINS_MARKERS>(
-                                        ring_ptr,
-                                        &mut pos,
-                                        drained,
-                                        distance,
-                                        length,
-                                        &mut distance_marker,
+                                    // NO clean-mode `distance > decoded+emitted` check here —
+                                    // vendor const-folds it out for marker windows.
+                                    // Back-ref via the SAME production routine the careful loop
+                                    // uses for markers; it maintains `distance_marker` (the fast
+                                    // `>= distance` skip + backward marker scan) and is wrap-safe.
+                                    unsafe {
+                                        emit_backref_ring::<CONTAINS_MARKERS>(
+                                            ring_ptr,
+                                            &mut pos,
+                                            drained,
+                                            distance,
+                                            length,
+                                            &mut distance_marker,
+                                        );
+                                    }
+                                    self.record_backreference_for_sparsity(
+                                        distance, length, emitted,
                                     );
+                                    emitted += length;
                                 }
-                                self.record_backreference_for_sparsity(distance, length, emitted);
-                                emitted += length;
+                            }
+
+                            $cur.refill();
+                            $litlen_decode;
+                        }
+                    };
+                }
+                let mfast_localbits_on = !mfast_localbits_disabled();
+                if mfast_localbits_on {
+                    // N2 LOCAL-BITS PATH: stack-local lb — compiler promotes
+                    // bitbuf/bitsleft/pos to registers (ring stores can't alias lb).
+                    // Test-only routing counter proves the arm is taken.
+                    #[cfg(test)]
+                    MFAST_LOCALBITS_ON_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut lb = Bits {
+                        data: bits.data,
+                        pos: bits.pos,
+                        bitbuf: bits.bitbuf,
+                        bitsleft: bits.bitsleft,
+                    };
+                    mfast_lb_run!(
+                        lb,
+                        self.dist_hc.decode(&mut lb),
+                        {
+                            pre = self.lut_litlen.decode(&mut lb);
+                        },
+                        {
+                            bits.pos = lb.pos;
+                            bits.bitbuf = lb.bitbuf;
+                            bits.bitsleft = lb.bitsleft;
+                        }
+                    );
+                    // Sync lb → bits after natural 'mfast exit (break paths land here).
+                    bits.pos = lb.pos;
+                    bits.bitbuf = lb.bitbuf;
+                    bits.bitsleft = lb.bitsleft;
+                } else {
+                    // KILL-SWITCH PATH (GZIPPY_NO_MFAST_LOCALBITS=1): exact
+                    // pre-change struct-field path — bits.xxx throughout the loop.
+                    // Same-binary causal A/B arm for F-w1.
+                    mfast_lb_run!(
+                        bits,
+                        self.dist_hc.decode(bits),
+                        {
+                            pre = self.lut_litlen.decode(bits);
+                        },
+                        {}
+                    );
+                }
+                // MFAST_PROF: flush mfast cycles + event count to global atomics.
+                if mfast_prof_on {
+                    use std::sync::atomic::Ordering;
+                    let cyc = mfast_prof::rdtsc(true).wrapping_sub(mfast_t0);
+                    mfast_prof::MFAST_CYC.fetch_add(cyc, Ordering::Relaxed);
+                    mfast_prof::MFAST_EVENTS.fetch_add(mfast_ev, Ordering::Relaxed);
+                }
+            }
+
+            // MFAST_PROF: careful-loop cycle measurement. Declared here so the end
+            // rdtsc fires after the loop exits naturally. `commit!()` early-return
+            // paths skip this rdtsc — they are edge cases (EOB, errors) and don't
+            // contribute meaningfully to the aggregate. Const-folds to 0 on the
+            // clean path (mfast_prof_on = false there).
+            let careful_t0: u64 = if mfast_prof_on {
+                mfast_prof::rdtsc(true)
+            } else {
+                0
+            };
+            let mut careful_ev: u64 = 0;
+            // Progress fence for the fastloop re-entry: `'mfast` may exit WITHOUT
+            // progress (e.g. `bit_count0 == 0` on an invalid code, which the
+            // careful loop must re-decode to produce the error). Requiring
+            // `emitted > emitted_at_mfast_exit` before re-entering guarantees the
+            // outer loop cannot spin — every `continue 'outer` is preceded by at
+            // least one byte of forward progress in the careful loop.
+            let emitted_at_mfast_exit = emitted;
+            while emitted < n_max_to_decode {
+                // ENGINE/U8-SINGLE-LOOP re-entry check: hand control back to
+                // `'mfast` once the wrap headroom has cleared (same three guards as
+                // the `'mfast` entry condition — out cap, ring headroom, input
+                // slop) and progress has been made since the last `'mfast` exit.
+                // `mfast_reentry_ok` is const-false on the clean instantiation and
+                // under GZIPPY_NO_MFAST_REENTRY=1 / probe knobs (exact pre-change
+                // single-pass behavior).
+                if mfast_reentry_ok && emitted > emitted_at_mfast_exit {
+                    let dst_phys = pos % RING_SIZE;
+                    if emitted + FAST_OUT_SLOP < n_max_to_decode
+                        && dst_phys + FAST_OUT_SLOP <= RING_SIZE
+                        && bits.pos + FAST_IN_SLOP < bits.data.len()
+                    {
+                        // MFAST_PROF: flush this careful segment before yielding
+                        // back to `'mfast` (cycle/event accounting stays exact
+                        // across segments).
+                        if mfast_prof_on {
+                            use std::sync::atomic::Ordering;
+                            let cyc = mfast_prof::rdtsc(true).wrapping_sub(careful_t0);
+                            mfast_prof::CAREFUL_CYC.fetch_add(cyc, Ordering::Relaxed);
+                            mfast_prof::CAREFUL_EVENTS.fetch_add(careful_ev, Ordering::Relaxed);
+                        }
+                        continue 'outer;
+                    }
+                }
+                // MFAST_PROF: count careful-loop events (outer iterations).
+                if mfast_prof_on {
+                    careful_ev += 1;
+                }
+                // One slow-knob injection per decode event (this outer iteration =
+                // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
+                super::slow_knob::inject(slow_spin, slow_yield);
+                // Single refill at the top of the outer iteration. After
+                // `bits.refill()` returns, `bits.available()` is in
+                // [56, 63] (libdeflate-style refill rounds DOWN to a
+                // multiple of 8 plus the residue) — well above the 48
+                // bits a worst-case back-ref iter consumes (20 for
+                // lit/len decode + 15 for dist decode + 13 for dist extra).
+                // With this guarantee, the per-decode `< 32` checks
+                // inside `IsalLitLenCode::decode`, `IsalDistCode::decode`,
+                // and the dist-extra `ensure_bits` all become
+                // predictably-false branches that never trigger the
+                // expensive 8-byte unaligned load. Net: ~1-2 refills
+                // saved per iter on back-ref-heavy chunks.
+                //
+                // Calling refill when already near-full is a no-op:
+                // `refill` advances `pos` by 0 when `bitsleft >= 56`
+                // (see consume_first_decode.rs:259).
+                bits.refill();
+                let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
+                if bit_count == 0 {
+                    // Inside `IsalLitLenCode::decode`, `symbol` is set to
+                    // `INVALID_SYMBOL` (0x1FFF) exactly when
+                    // `bit_count == 0`, so the prior
+                    // `|| symbol == INVALID_SYMBOL` half of the check was
+                    // redundant. Drop it: one cmp + branch saved per
+                    // outer iter.
+                    commit!(Err(BlockError::InvalidHuffmanCode));
+                }
+                // Consume the LUT-reported bit count (covers Huffman code +
+                // any baked-in length-extra bits). Vendor's `seekAfterPeek`
+                // at HuffmanCodingISAL.hpp:143 is equivalent.
+                bits.consume(bit_count);
+                let mut sym = symbol;
+                let mut sym_count = sym_count;
+
+                // Multi-symbol unpack loop — vendor deflate.hpp:1612-1661.
+                loop {
+                    let code = (sym & 0xFFFF) as u16;
+                    if code <= 255 || sym_count > 1 {
+                        // SAFETY: see ring_ptr / ring8 SAFETY note above. Marker
+                        // mode stores u16 (`code & 0xFF` < 256) into the u16 ring;
+                        // clean mode stores the byte u8-DIRECT into the u8 view
+                        // (vendor `appendToWindow`, deflate.hpp:1319, one u8 store).
+                        unsafe {
+                            if CONTAINS_MARKERS {
+                                ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
+                            } else {
+                                ring8.add(pos % U8_RING_SIZE).write((code & 0xFF) as u8);
                             }
                         }
-
-                        $cur.refill();
-                        $litlen_decode;
-                    }
-                };
-            }
-            let mfast_localbits_on = !mfast_localbits_disabled();
-            if mfast_localbits_on {
-                // N2 LOCAL-BITS PATH: stack-local lb — compiler promotes
-                // bitbuf/bitsleft/pos to registers (ring stores can't alias lb).
-                // Test-only routing counter proves the arm is taken.
-                #[cfg(test)]
-                MFAST_LOCALBITS_ON_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut lb = Bits {
-                    data: bits.data,
-                    pos: bits.pos,
-                    bitbuf: bits.bitbuf,
-                    bitsleft: bits.bitsleft,
-                };
-                mfast_lb_run!(
-                    lb,
-                    self.dist_hc.decode(&mut lb),
-                    {
-                        pre = self.lut_litlen.decode(&mut lb);
-                    },
-                    {
-                        bits.pos = lb.pos;
-                        bits.bitbuf = lb.bitbuf;
-                        bits.bitsleft = lb.bitsleft;
-                    }
-                );
-                // Sync lb → bits after natural 'mfast exit (break paths land here).
-                bits.pos = lb.pos;
-                bits.bitbuf = lb.bitbuf;
-                bits.bitsleft = lb.bitsleft;
-            } else {
-                // KILL-SWITCH PATH (GZIPPY_NO_MFAST_LOCALBITS=1): exact
-                // pre-change struct-field path — bits.xxx throughout the loop.
-                // Same-binary causal A/B arm for F-w1.
-                mfast_lb_run!(
-                    bits,
-                    self.dist_hc.decode(bits),
-                    {
-                        pre = self.lut_litlen.decode(bits);
-                    },
-                    {}
-                );
-            }
-            // MFAST_PROF: flush mfast cycles + event count to global atomics.
-            if mfast_prof_on {
-                use std::sync::atomic::Ordering;
-                let cyc = mfast_prof::rdtsc(true).wrapping_sub(mfast_t0);
-                mfast_prof::MFAST_CYC.fetch_add(cyc, Ordering::Relaxed);
-                mfast_prof::MFAST_EVENTS.fetch_add(mfast_ev, Ordering::Relaxed);
-            }
-        }
-
-        // MFAST_PROF: careful-loop cycle measurement. Declared here so the end
-        // rdtsc fires after the loop exits naturally. `commit!()` early-return
-        // paths skip this rdtsc — they are edge cases (EOB, errors) and don't
-        // contribute meaningfully to the aggregate. Const-folds to 0 on the
-        // clean path (mfast_prof_on = false there).
-        let careful_t0: u64 = if mfast_prof_on {
-            mfast_prof::rdtsc(true)
-        } else {
-            0
-        };
-        let mut careful_ev: u64 = 0;
-        while emitted < n_max_to_decode {
-            // MFAST_PROF: count careful-loop events (outer iterations).
-            if mfast_prof_on {
-                careful_ev += 1;
-            }
-            // One slow-knob injection per decode event (this outer iteration =
-            // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
-            super::slow_knob::inject(slow_spin, slow_yield);
-            // Single refill at the top of the outer iteration. After
-            // `bits.refill()` returns, `bits.available()` is in
-            // [56, 63] (libdeflate-style refill rounds DOWN to a
-            // multiple of 8 plus the residue) — well above the 48
-            // bits a worst-case back-ref iter consumes (20 for
-            // lit/len decode + 15 for dist decode + 13 for dist extra).
-            // With this guarantee, the per-decode `< 32` checks
-            // inside `IsalLitLenCode::decode`, `IsalDistCode::decode`,
-            // and the dist-extra `ensure_bits` all become
-            // predictably-false branches that never trigger the
-            // expensive 8-byte unaligned load. Net: ~1-2 refills
-            // saved per iter on back-ref-heavy chunks.
-            //
-            // Calling refill when already near-full is a no-op:
-            // `refill` advances `pos` by 0 when `bitsleft >= 56`
-            // (see consume_first_decode.rs:259).
-            bits.refill();
-            let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
-            if bit_count == 0 {
-                // Inside `IsalLitLenCode::decode`, `symbol` is set to
-                // `INVALID_SYMBOL` (0x1FFF) exactly when
-                // `bit_count == 0`, so the prior
-                // `|| symbol == INVALID_SYMBOL` half of the check was
-                // redundant. Drop it: one cmp + branch saved per
-                // outer iter.
-                commit!(Err(BlockError::InvalidHuffmanCode));
-            }
-            // Consume the LUT-reported bit count (covers Huffman code +
-            // any baked-in length-extra bits). Vendor's `seekAfterPeek`
-            // at HuffmanCodingISAL.hpp:143 is equivalent.
-            bits.consume(bit_count);
-            let mut sym = symbol;
-            let mut sym_count = sym_count;
-
-            // Multi-symbol unpack loop — vendor deflate.hpp:1612-1661.
-            loop {
-                let code = (sym & 0xFFFF) as u16;
-                if code <= 255 || sym_count > 1 {
-                    // SAFETY: see ring_ptr / ring8 SAFETY note above. Marker
-                    // mode stores u16 (`code & 0xFF` < 256) into the u16 ring;
-                    // clean mode stores the byte u8-DIRECT into the u8 view
-                    // (vendor `appendToWindow`, deflate.hpp:1319, one u8 store).
-                    unsafe {
+                        pos += 1;
+                        emitted += 1;
+                        // Vendor's appendToWindow updates m_distanceToLastMarkerByte
+                        // per literal (deflate.hpp:1311-1322): increment on
+                        // clean bytes (literals always satisfy < 256), reset
+                        // on marker writes. Markers in our path arrive
+                        // exclusively via emit_backref_ring; literal writes
+                        // here always increment. Const-folded out entirely
+                        // when CONTAINS_MARKERS = false.
                         if CONTAINS_MARKERS {
-                            ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
-                        } else {
-                            ring8.add(pos % U8_RING_SIZE).write((code & 0xFF) as u8);
+                            distance_marker += 1;
                         }
+                        sym_count -= 1;
+                        if sym_count == 0 {
+                            break;
+                        }
+                        sym >>= 8;
+                        continue;
                     }
-                    pos += 1;
-                    emitted += 1;
-                    // Vendor's appendToWindow updates m_distanceToLastMarkerByte
-                    // per literal (deflate.hpp:1311-1322): increment on
-                    // clean bytes (literals always satisfy < 256), reset
-                    // on marker writes. Markers in our path arrive
-                    // exclusively via emit_backref_ring; literal writes
-                    // here always increment. Const-folded out entirely
-                    // when CONTAINS_MARKERS = false.
-                    if CONTAINS_MARKERS {
-                        distance_marker += 1;
+                    // sym_count == 1 here. Either EOB, length code, or
+                    // (defensively) an out-of-range symbol.
+                    if code == END_OF_BLOCK_SYMBOL {
+                        self.at_end_of_block = true;
+                        commit!(Ok(emitted));
                     }
-                    sym_count -= 1;
-                    if sym_count == 0 {
+                    if (code as u32) > MAX_LIT_LEN_SYM {
+                        commit!(Err(BlockError::InvalidHuffmanCode));
+                    }
+                    let length = (code as usize).wrapping_sub(254);
+                    if length == 0 {
                         break;
                     }
-                    sym >>= 8;
-                    continue;
-                }
-                // sym_count == 1 here. Either EOB, length code, or
-                // (defensively) an out-of-range symbol.
-                if code == END_OF_BLOCK_SYMBOL {
-                    self.at_end_of_block = true;
-                    commit!(Ok(emitted));
-                }
-                if (code as u32) > MAX_LIT_LEN_SYM {
-                    commit!(Err(BlockError::InvalidHuffmanCode));
-                }
-                let length = (code as usize).wrapping_sub(254);
-                if length == 0 {
-                    break;
-                }
-                // Vendor parity (gzip/deflate.hpp:336): distance via the cached
-                // reversed-bits decoder. `decode` consumes the code bits
-                // internally and returns the raw distance symbol — extra bits
-                // are read below, exactly as the canonical fallback at :1580-1590.
-                let dsym = match self.dist_hc.decode(bits) {
-                    Some(d) => d,
-                    None => commit!(Err(BlockError::InvalidHuffmanCode)),
-                };
-                if dsym as usize >= DISTANCE_BASE.len() {
-                    commit!(Err(BlockError::InvalidHuffmanCode));
-                }
-                // Inlined `read_distance_extra` — eliminates the
-                // function call, the double `if extra > 0` checks,
-                // the `ensure_bits` function call (re-check + branch),
-                // and the `n_lowest_bits_set` runtime-branch helper.
-                // Outer-loop refill guarantees `bits.available() >=
-                // 13 - dbit - decoded.bit_count` (worst case 13 bits
-                // of extra for symbol 29), so the inner availability
-                // check is also a predictably-false branch.
-                let extra = DISTANCE_EXTRA[dsym as usize] as u32;
-                let distance = if extra > 0 {
-                    if bits.available() < extra {
-                        bits.refill();
+                    // Vendor parity (gzip/deflate.hpp:336): distance via the cached
+                    // reversed-bits decoder. `decode` consumes the code bits
+                    // internally and returns the raw distance symbol — extra bits
+                    // are read below, exactly as the canonical fallback at :1580-1590.
+                    let dsym = match self.dist_hc.decode(bits) {
+                        Some(d) => d,
+                        None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                    };
+                    if dsym as usize >= DISTANCE_BASE.len() {
+                        commit!(Err(BlockError::InvalidHuffmanCode));
+                    }
+                    // Inlined `read_distance_extra` — eliminates the
+                    // function call, the double `if extra > 0` checks,
+                    // the `ensure_bits` function call (re-check + branch),
+                    // and the `n_lowest_bits_set` runtime-branch helper.
+                    // Outer-loop refill guarantees `bits.available() >=
+                    // 13 - dbit - decoded.bit_count` (worst case 13 bits
+                    // of extra for symbol 29), so the inner availability
+                    // check is also a predictably-false branch.
+                    let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                    let distance = if extra > 0 {
                         if bits.available() < extra {
-                            commit!(Err(BlockError::EndOfFile));
+                            bits.refill();
+                            if bits.available() < extra {
+                                commit!(Err(BlockError::EndOfFile));
+                            }
+                        }
+                        // `extra` is bounded by DISTANCE_EXTRA[29] = 13,
+                        // so `1u64 << extra` is always well-defined.
+                        let mask = (1u64 << extra) - 1;
+                        let v = (bits.peek() & mask) as usize;
+                        bits.consume(extra);
+                        DISTANCE_BASE[dsym as usize] as usize + v
+                    } else {
+                        DISTANCE_BASE[dsym as usize] as usize
+                    };
+                    if distance == 0 || distance > MAX_WINDOW_SIZE {
+                        commit!(Err(BlockError::ExceededWindowRange));
+                    }
+                    // Clean-mode distance check — mirror of vendor's
+                    // `!containsMarkerBytes && distance > m_decodedBytes
+                    // + nBytesRead` at deflate.hpp:1652-1655. Whole
+                    // branch const-folded away when CONTAINS_MARKERS=true.
+                    if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
+                        commit!(Err(BlockError::ExceededWindowRange));
+                    }
+                    unsafe {
+                        if CONTAINS_MARKERS {
+                            emit_backref_ring::<CONTAINS_MARKERS>(
+                                ring_ptr,
+                                &mut pos,
+                                drained,
+                                distance,
+                                length,
+                                &mut distance_marker,
+                            );
+                        } else {
+                            // Clean tail: u8-direct copy (half the traffic, no
+                            // marker scan). Vendor readInternal<false> back-ref.
+                            emit_backref_ring_u8(ring8, &mut pos, drained, distance, length);
                         }
                     }
-                    // `extra` is bounded by DISTANCE_EXTRA[29] = 13,
-                    // so `1u64 << extra` is always well-defined.
-                    let mask = (1u64 << extra) - 1;
-                    let v = (bits.peek() & mask) as usize;
-                    bits.consume(extra);
-                    DISTANCE_BASE[dsym as usize] as usize + v
-                } else {
-                    DISTANCE_BASE[dsym as usize] as usize
-                };
-                if distance == 0 || distance > MAX_WINDOW_SIZE {
-                    commit!(Err(BlockError::ExceededWindowRange));
+                    self.record_backreference_for_sparsity(distance, length, emitted);
+                    emitted += length;
+                    break;
                 }
-                // Clean-mode distance check — mirror of vendor's
-                // `!containsMarkerBytes && distance > m_decodedBytes
-                // + nBytesRead` at deflate.hpp:1652-1655. Whole
-                // branch const-folded away when CONTAINS_MARKERS=true.
-                if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
-                    commit!(Err(BlockError::ExceededWindowRange));
-                }
-                unsafe {
-                    if CONTAINS_MARKERS {
-                        emit_backref_ring::<CONTAINS_MARKERS>(
-                            ring_ptr,
-                            &mut pos,
-                            drained,
-                            distance,
-                            length,
-                            &mut distance_marker,
-                        );
-                    } else {
-                        // Clean tail: u8-direct copy (half the traffic, no
-                        // marker scan). Vendor readInternal<false> back-ref.
-                        emit_backref_ring_u8(ring8, &mut pos, drained, distance, length);
-                    }
-                }
-                self.record_backreference_for_sparsity(distance, length, emitted);
-                emitted += length;
-                break;
             }
-        }
-        // MFAST_PROF: flush careful-loop cycles + events. Only fires when
-        // mfast_prof_on=true (marker path + GZIPPY_MFAST_PROF=1). commit!()
-        // paths skip this flush (edge cases: EOB mid-block, errors).
-        if mfast_prof_on {
-            use std::sync::atomic::Ordering;
-            let cyc = mfast_prof::rdtsc(true).wrapping_sub(careful_t0);
-            mfast_prof::CAREFUL_CYC.fetch_add(cyc, Ordering::Relaxed);
-            mfast_prof::CAREFUL_EVENTS.fetch_add(careful_ev, Ordering::Relaxed);
-        }
+            // MFAST_PROF: flush careful-loop cycles + events. Only fires when
+            // mfast_prof_on=true (marker path + GZIPPY_MFAST_PROF=1). commit!()
+            // paths skip this flush (edge cases: EOB mid-block, errors).
+            if mfast_prof_on {
+                use std::sync::atomic::Ordering;
+                let cyc = mfast_prof::rdtsc(true).wrapping_sub(careful_t0);
+                mfast_prof::CAREFUL_CYC.fetch_add(cyc, Ordering::Relaxed);
+                mfast_prof::CAREFUL_EVENTS.fetch_add(careful_ev, Ordering::Relaxed);
+            }
+            // Natural end of the call (emitted == n_max_to_decode): leave the
+            // outer fastloop-re-entry loop. All other exits (EOB, errors) return
+            // via commit!() and never reach here.
+            break 'outer;
+        } // 'outer
         self.ring.pos = pos;
         self.decoded_bytes += emitted;
         self.ring.distance_to_last_marker = distance_marker;
