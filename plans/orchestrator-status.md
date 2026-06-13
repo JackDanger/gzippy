@@ -1,3 +1,19 @@
+## u8 PORT WORKER DIED MID-VERIFY (Fable model access error) — work RECOVERED + re-verifying on solvency [2026-06-12]
+The u8 single-loop port worker (Fable) hit a model-access error (claude-fable-5[1m] inaccessible)
+after ~2h/131 tool-calls and returned only the error — but it had COMMITTED 3 coherent commits to
+engine/u8-single-loop (now PUSHED to origin): inlined backref resolution into the marker read
+loop, single-loop fastloop re-entry (careful loop yields back to mfast after ring wrap), deleted a
+dead trailing-clean scan. ~597+/509- in marker_inflate.rs + gzip_chunk.rs; clean tree. NO
+verification report exists => UNTRUSTED until re-verified (the rewrite is byte-exactness-critical:
+the P0 word-copy-overshoot class lives on exactly this surface). RECOVERY: branch pushed; a
+verification worker (sonnet — Fable is the access failure) FETCHES it on solvency (GitHub key now
+installed) and runs the full gauntlet + the pre-registered falsifier the dead worker never
+reported (marker-phase insns 2,795M -> <=1.9B same 69.7MB denominator; 48-cell sha grid;
+asm/clean-parity-path-untouched audit; wall A/B vs 72bb692d). MODEL NOTE: Fable inaccessible this
+session (user switched session default to Opus 4.8); the standing "Fable advisors" directive
+(feedback_advisor_consult, 2026-06-12) is temporarily UN-followable — advisors/workers fall back
+to Opus/sonnet until Fable returns. "0% CPU on solvency" the user observed = the port was in its
+LOCAL Rosetta correctness phase; solvency goes busy now with the verification fetch.
 ## MARKER EMISSION WALL-CRITICAL (both builds, solvency T8) — u8 SINGLE-LOOP PORT IS GO [2026-06-12]
 probe/marker-emit-crit (c459ee54 on solvency). Knob inside BOTH emit sites (mfast :2349 + careful
 :2567), loop-gates verified untouched (new marker_emit_spin var, mfast entry unaffected),
