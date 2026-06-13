@@ -18,6 +18,13 @@ pin_mask() {
   case "$1" in
     1) echo "0";; 4) echo "0,2,4,6";;
     8) echo "0,2,4,6,8,10,12,14";;
+    # T12 (user-added cell): on neurotic (i7-13700T, container=16 logical = the 8
+    # P-cores x2 SMT; E-cores 16-23 excluded) this is the 8 physical P-cores
+    # (0,2,4,6,8,10,12,14) + 4 SMT siblings (1,3,5,7) = 12 logical, mirroring the
+    # physical-first discipline of T8. CONFIRM the readback mask per cell via
+    # lscpu/mask_readback at fill time and record it (thread_mask). On a wider AMD
+    # box (solvency, 32 cores) these are 12 valid symmetric CPU indices.
+    12) echo "0,1,2,3,4,5,6,7,8,10,12,14";;
     16) echo "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15";;
     *) echo "";;
   esac
