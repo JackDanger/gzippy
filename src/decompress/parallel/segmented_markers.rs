@@ -173,7 +173,26 @@ impl SegmentedU16 {
             let last = self.segments.last_mut().unwrap();
             let room = SEGMENT_ELEMENTS - last.len();
             let n = src.len().min(room);
-            last.extend_from_slice(&src[..n]);
+            // `extend_from_slice` on `allocator_api2::Vec<u16, RpmallocAlloc>`
+            // does NOT lower to a vectorized memcpy under LLVM — the custom
+            // allocator breaks the specialization and emits a scalar u16-per-
+            // element loop (~0.649B instructions, ~8-9% of decode total, shared
+            // across both build flavors). Use `copy_nonoverlapping` directly.
+            // SAFETY: `take_marker_segment` pre-allocates SEGMENT_ELEMENTS
+            // capacity; `old_len + n <= SEGMENT_ELEMENTS <= capacity`; `src`
+            // and `last` are distinct allocations — no overlap.
+            let old_len = last.len();
+            debug_assert!(
+                last.capacity() >= old_len + n,
+                "segment capacity invariant: cap={} old_len={} n={}",
+                last.capacity(),
+                old_len,
+                n
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), last.as_mut_ptr().add(old_len), n);
+                last.set_len(old_len + n);
+            }
             self.cached_len += n;
             src = &src[n..];
         }
