@@ -149,8 +149,17 @@ mod bench {
             const PERF_COUNT_HW_CACHE_OP_READ: u64 = 0;
             const PERF_COUNT_HW_CACHE_RESULT_MISS: u64 = 1;
 
-            // read_format: GROUP (leader read returns every member's value)
-            const PERF_FORMAT_GROUP: u64 = 1 << 3;
+            // read_format: per-event scaling fields. We open counters as
+            // INDEPENDENT events (NOT a single group) because a 6-counter group
+            // is all-or-nothing: on a limited-slot PMU (AMD Zen2 here) the kernel
+            // cannot schedule all 6 at once, so the whole group silently reads 0
+            // (time_running==0) — the exact zero-counts failure observed. Opening
+            // them independently lets the kernel time-multiplex; each read returns
+            // (value, time_enabled, time_running) and we SCALE value by
+            // enabled/running. (Coherency is approximate under multiplexing but
+            // EVERY value is real; a coherent-but-unschedulable group is worse.)
+            const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+            const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 
             // flags bitfield bit positions
             const F_DISABLED: u64 = 1 << 0;
@@ -161,8 +170,6 @@ mod bench {
             const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
             const PERF_EVENT_IOC_DISABLE: libc::c_ulong = 0x2401;
             const PERF_EVENT_IOC_RESET: libc::c_ulong = 0x2403;
-            // PERF_IOC_FLAG_GROUP applies the ioctl to the whole group.
-            const PERF_IOC_FLAG_GROUP: libc::c_ulong = 1;
 
             fn cache_config(id: u64, op: u64, result: u64) -> u64 {
                 id | (op << 8) | (result << 16)
@@ -186,15 +193,16 @@ mod bench {
             }
 
             pub struct Group {
-                fds: Vec<RawFd>, // fds[0] is the leader
+                fds: [RawFd; N_CTR], // one independent event per counter slot
             }
 
             impl Group {
-                /// Open the 6-counter group on the calling thread (pid=0), all
-                /// CPUs (cpu=-1). On the hybrid Intel chip the caller MUST pin the
-                /// thread to a P-core (taskset) or the counters read 0; this opens
-                /// the generic PMU, which on a pinned P-core is the cpu_core PMU.
-                /// Returns None on any failure (paranoid sysctl, no PMU).
+                /// Open the 6 counters as INDEPENDENT events on the calling thread
+                /// (pid=0, cpu=-1). On the hybrid Intel chip the caller MUST pin the
+                /// thread to a P-core (taskset) or the counters read 0; on a pinned
+                /// P-core the generic PMU IS the cpu_core PMU. Returns None on any
+                /// failure (paranoid sysctl, no PMU). Each event carries
+                /// TOTAL_TIME_ENABLED/RUNNING so reads can scale for multiplexing.
                 pub fn open() -> Option<Group> {
                     let specs: [(u32, u64); N_CTR] = [
                         (PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS),
@@ -218,73 +226,73 @@ mod bench {
                             ),
                         ),
                     ];
-                    let mut fds: Vec<RawFd> = Vec::with_capacity(N_CTR);
-                    let mut leader: RawFd = -1;
+                    let mut fds = [-1i32; N_CTR];
                     for (i, (ty, cfg)) in specs.iter().enumerate() {
                         let mut attr = PerfEventAttr {
                             type_: *ty,
                             config: *cfg,
-                            read_format: PERF_FORMAT_GROUP,
+                            read_format: PERF_FORMAT_TOTAL_TIME_ENABLED
+                                | PERF_FORMAT_TOTAL_TIME_RUNNING,
                             ..Default::default()
                         };
                         attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
-                        // Leader starts disabled; we ENABLE/RESET via ioctl group.
-                        attr.flags = F_EXCLUDE_KERNEL | F_EXCLUDE_HV;
-                        if i == 0 {
-                            attr.flags |= F_DISABLED;
-                        }
-                        let group_fd = if i == 0 { -1 } else { leader };
-                        let fd = unsafe { perf_event_open(&attr, 0, -1, group_fd, 0) };
+                        // Each event starts disabled; reset+enable per measurement.
+                        // exclude_kernel/hv -> count ONLY the userspace decode.
+                        attr.flags = F_DISABLED | F_EXCLUDE_KERNEL | F_EXCLUDE_HV;
+                        let fd = unsafe { perf_event_open(&attr, 0, -1, -1, 0) };
                         if fd < 0 {
-                            for &f in &fds {
+                            for &f in fds.iter().take(i) {
                                 unsafe { libc::close(f) };
                             }
                             return None;
                         }
-                        if i == 0 {
-                            leader = fd;
-                        }
-                        fds.push(fd);
+                        fds[i] = fd;
                     }
                     Some(Group { fds })
                 }
 
                 #[inline]
                 pub fn reset_enable(&self) {
-                    unsafe {
-                        libc::ioctl(self.fds[0], PERF_EVENT_IOC_RESET as _, PERF_IOC_FLAG_GROUP);
-                        libc::ioctl(self.fds[0], PERF_EVENT_IOC_ENABLE as _, PERF_IOC_FLAG_GROUP);
+                    for &f in &self.fds {
+                        unsafe {
+                            libc::ioctl(f, PERF_EVENT_IOC_RESET as _, 0u64);
+                            libc::ioctl(f, PERF_EVENT_IOC_ENABLE as _, 0u64);
+                        }
                     }
                 }
 
                 #[inline]
                 pub fn disable(&self) {
-                    unsafe {
-                        libc::ioctl(
-                            self.fds[0],
-                            PERF_EVENT_IOC_DISABLE as _,
-                            PERF_IOC_FLAG_GROUP,
-                        );
+                    for &f in &self.fds {
+                        unsafe {
+                            libc::ioctl(f, PERF_EVENT_IOC_DISABLE as _, 0u64);
+                        }
                     }
                 }
 
-                /// Group read: the leader fd returns `nr` followed by `nr` u64
-                /// values in the order the counters were added. Coherent snapshot.
+                /// Read each independent counter as (value, time_enabled,
+                /// time_running) and SCALE: value * enabled / running. running==0
+                /// means the event never got a PMU slot — that counter is invalid;
+                /// we mark the whole snapshot invalid (never report a fabricated 0).
                 pub fn read(&self) -> Counts {
-                    let mut buf = [0u64; N_CTR + 1]; // [nr][v0..v_{nr-1}]
-                    let want = (N_CTR + 1) * std::mem::size_of::<u64>();
-                    let got = unsafe {
-                        libc::read(self.fds[0], buf.as_mut_ptr() as *mut libc::c_void, want)
-                    };
                     let mut c = Counts::default();
-                    if got < 0 {
-                        return c;
+                    for (i, &f) in self.fds.iter().enumerate() {
+                        let mut b = [0u64; 3]; // value, time_enabled, time_running
+                        let got = unsafe { libc::read(f, b.as_mut_ptr() as *mut libc::c_void, 24) };
+                        if got < 24 {
+                            return Counts::default();
+                        }
+                        let (val, te, tr) = (b[0], b[1], b[2]);
+                        if tr == 0 {
+                            // Never scheduled — refuse to emit a fake zero.
+                            return Counts::default();
+                        }
+                        c.vals[i] = if te > tr {
+                            ((val as u128 * te as u128) / tr as u128) as u64
+                        } else {
+                            val
+                        };
                     }
-                    let nr = buf[0] as usize;
-                    if nr != N_CTR {
-                        return c;
-                    }
-                    c.vals.copy_from_slice(&buf[1..=N_CTR]);
                     c.valid = true;
                     c
                 }
@@ -293,7 +301,9 @@ mod bench {
             impl Drop for Group {
                 fn drop(&mut self) {
                     for &f in &self.fds {
-                        unsafe { libc::close(f) };
+                        if f >= 0 {
+                            unsafe { libc::close(f) };
+                        }
                     }
                 }
             }
