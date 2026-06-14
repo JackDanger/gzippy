@@ -54,6 +54,279 @@ mod bench {
     use gzippy::isal_decompress_oracle::decompress_deflate_from_bit;
     use std::time::Instant;
 
+    // ── Hardware counters via raw perf_event_open (the core gap this rev fills) ─
+    //
+    // The campaign's "kernel owns the misses" thesis rested on WHOLE-PROGRAM perf
+    // attribution + this bench's MB/s-only number. This module opens a counter
+    // GROUP (leader + followers, group-read so counts are coherent across one
+    // decode) around each timed `decode_var_*` call and reports IPC, branch-miss
+    // rate, symbols/cycle, bytes/cycle, L1 + dTLB miss-rates per variant.
+    //
+    // Gated behind GZIPPY_KERNEL_PERF=1. Linux x86_64 only; on any other target,
+    // or if perf_event_open fails (paranoid sysctl, no PMU), we emit MB/s-only and
+    // say so LOUDLY (PERF_AVAILABLE=no) — NEVER silent zeros.
+    pub mod perf {
+        // Counter slots we read, in a fixed order. Index 0 is the GROUP LEADER.
+        pub const N_CTR: usize = 6;
+        pub const CTR_NAMES: [&str; N_CTR] = [
+            "instructions",
+            "cpu-cycles",
+            "branch-instructions",
+            "branch-misses",
+            "L1-dcache-load-misses",
+            "dTLB-load-misses",
+        ];
+
+        #[derive(Clone, Copy, Default, Debug)]
+        pub struct Counts {
+            pub vals: [u64; N_CTR],
+            pub valid: bool,
+        }
+        impl Counts {
+            pub fn instructions(&self) -> u64 {
+                self.vals[0]
+            }
+            pub fn cycles(&self) -> u64 {
+                self.vals[1]
+            }
+            pub fn branches(&self) -> u64 {
+                self.vals[2]
+            }
+            pub fn branch_misses(&self) -> u64 {
+                self.vals[3]
+            }
+            pub fn l1_misses(&self) -> u64 {
+                self.vals[4]
+            }
+            pub fn dtlb_misses(&self) -> u64 {
+                self.vals[5]
+            }
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        mod imp {
+            use super::{Counts, N_CTR};
+            use std::os::unix::io::RawFd;
+
+            // perf_event_attr layout (linux/perf_event.h). We zero-fill and set
+            // only the fields we use; the kernel reads the size we pass.
+            #[repr(C)]
+            #[derive(Default)]
+            struct PerfEventAttr {
+                type_: u32,
+                size: u32,
+                config: u64,
+                sample_period_or_freq: u64,
+                sample_type: u64,
+                read_format: u64,
+                flags: u64, // bitfield (disabled/inherit/exclude_*/...)
+                wakeup: u32,
+                bp_type: u32,
+                bp_addr_or_config1: u64,
+                bp_len_or_config2: u64,
+                branch_sample_type: u64,
+                sample_regs_user: u64,
+                sample_stack_user: u32,
+                clockid: i32,
+                sample_regs_intr: u64,
+                aux_watermark: u32,
+                sample_max_stack: u16,
+                __reserved_2: u16,
+                aux_sample_size: u32,
+                __reserved_3: u32,
+            }
+
+            const PERF_TYPE_HARDWARE: u32 = 0;
+            const PERF_TYPE_HW_CACHE: u32 = 3;
+            // Hardware generic counters.
+            const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+            const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+            const PERF_COUNT_HW_BRANCH_INSTRUCTIONS: u64 = 4;
+            const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
+            // HW_CACHE config = (id) | (op << 8) | (result << 16)
+            const PERF_COUNT_HW_CACHE_L1D: u64 = 0;
+            const PERF_COUNT_HW_CACHE_DTLB: u64 = 3;
+            const PERF_COUNT_HW_CACHE_OP_READ: u64 = 0;
+            const PERF_COUNT_HW_CACHE_RESULT_MISS: u64 = 1;
+
+            // read_format: GROUP (leader read returns every member's value)
+            const PERF_FORMAT_GROUP: u64 = 1 << 3;
+
+            // flags bitfield bit positions
+            const F_DISABLED: u64 = 1 << 0;
+            const F_EXCLUDE_KERNEL: u64 = 1 << 5;
+            const F_EXCLUDE_HV: u64 = 1 << 6;
+
+            const SYS_PERF_EVENT_OPEN: libc::c_long = 298; // x86_64
+            const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
+            const PERF_EVENT_IOC_DISABLE: libc::c_ulong = 0x2401;
+            const PERF_EVENT_IOC_RESET: libc::c_ulong = 0x2403;
+            // PERF_IOC_FLAG_GROUP applies the ioctl to the whole group.
+            const PERF_IOC_FLAG_GROUP: libc::c_ulong = 1;
+
+            fn cache_config(id: u64, op: u64, result: u64) -> u64 {
+                id | (op << 8) | (result << 16)
+            }
+
+            unsafe fn perf_event_open(
+                attr: &PerfEventAttr,
+                pid: libc::pid_t,
+                cpu: i32,
+                group_fd: RawFd,
+                flags: libc::c_ulong,
+            ) -> RawFd {
+                libc::syscall(
+                    SYS_PERF_EVENT_OPEN,
+                    attr as *const PerfEventAttr,
+                    pid,
+                    cpu,
+                    group_fd,
+                    flags,
+                ) as RawFd
+            }
+
+            pub struct Group {
+                fds: Vec<RawFd>, // fds[0] is the leader
+            }
+
+            impl Group {
+                /// Open the 6-counter group on the calling thread (pid=0), all
+                /// CPUs (cpu=-1). On the hybrid Intel chip the caller MUST pin the
+                /// thread to a P-core (taskset) or the counters read 0; this opens
+                /// the generic PMU, which on a pinned P-core is the cpu_core PMU.
+                /// Returns None on any failure (paranoid sysctl, no PMU).
+                pub fn open() -> Option<Group> {
+                    let specs: [(u32, u64); N_CTR] = [
+                        (PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS),
+                        (PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES),
+                        (PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS),
+                        (PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES),
+                        (
+                            PERF_TYPE_HW_CACHE,
+                            cache_config(
+                                PERF_COUNT_HW_CACHE_L1D,
+                                PERF_COUNT_HW_CACHE_OP_READ,
+                                PERF_COUNT_HW_CACHE_RESULT_MISS,
+                            ),
+                        ),
+                        (
+                            PERF_TYPE_HW_CACHE,
+                            cache_config(
+                                PERF_COUNT_HW_CACHE_DTLB,
+                                PERF_COUNT_HW_CACHE_OP_READ,
+                                PERF_COUNT_HW_CACHE_RESULT_MISS,
+                            ),
+                        ),
+                    ];
+                    let mut fds: Vec<RawFd> = Vec::with_capacity(N_CTR);
+                    let mut leader: RawFd = -1;
+                    for (i, (ty, cfg)) in specs.iter().enumerate() {
+                        let mut attr = PerfEventAttr {
+                            type_: *ty,
+                            config: *cfg,
+                            read_format: PERF_FORMAT_GROUP,
+                            ..Default::default()
+                        };
+                        attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
+                        // Leader starts disabled; we ENABLE/RESET via ioctl group.
+                        attr.flags = F_EXCLUDE_KERNEL | F_EXCLUDE_HV;
+                        if i == 0 {
+                            attr.flags |= F_DISABLED;
+                        }
+                        let group_fd = if i == 0 { -1 } else { leader };
+                        let fd = unsafe { perf_event_open(&attr, 0, -1, group_fd, 0) };
+                        if fd < 0 {
+                            for &f in &fds {
+                                unsafe { libc::close(f) };
+                            }
+                            return None;
+                        }
+                        if i == 0 {
+                            leader = fd;
+                        }
+                        fds.push(fd);
+                    }
+                    Some(Group { fds })
+                }
+
+                #[inline]
+                pub fn reset_enable(&self) {
+                    unsafe {
+                        libc::ioctl(self.fds[0], PERF_EVENT_IOC_RESET as _, PERF_IOC_FLAG_GROUP);
+                        libc::ioctl(self.fds[0], PERF_EVENT_IOC_ENABLE as _, PERF_IOC_FLAG_GROUP);
+                    }
+                }
+
+                #[inline]
+                pub fn disable(&self) {
+                    unsafe {
+                        libc::ioctl(
+                            self.fds[0],
+                            PERF_EVENT_IOC_DISABLE as _,
+                            PERF_IOC_FLAG_GROUP,
+                        );
+                    }
+                }
+
+                /// Group read: the leader fd returns `nr` followed by `nr` u64
+                /// values in the order the counters were added. Coherent snapshot.
+                pub fn read(&self) -> Counts {
+                    let mut buf = [0u64; N_CTR + 1]; // [nr][v0..v_{nr-1}]
+                    let want = (N_CTR + 1) * std::mem::size_of::<u64>();
+                    let got = unsafe {
+                        libc::read(self.fds[0], buf.as_mut_ptr() as *mut libc::c_void, want)
+                    };
+                    let mut c = Counts::default();
+                    if got < 0 {
+                        return c;
+                    }
+                    let nr = buf[0] as usize;
+                    if nr != N_CTR {
+                        return c;
+                    }
+                    c.vals.copy_from_slice(&buf[1..=N_CTR]);
+                    c.valid = true;
+                    c
+                }
+            }
+
+            impl Drop for Group {
+                fn drop(&mut self) {
+                    for &f in &self.fds {
+                        unsafe { libc::close(f) };
+                    }
+                }
+            }
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        pub use imp::Group;
+
+        // Non-Linux / non-x86_64 stub: open() always None -> MB/s-only fallback.
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        pub struct Group;
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        impl Group {
+            pub fn open() -> Option<Group> {
+                None
+            }
+            pub fn reset_enable(&self) {}
+            pub fn disable(&self) {}
+            pub fn read(&self) -> Counts {
+                Counts::default()
+            }
+        }
+
+        /// Is the perf-counter path requested? (availability is probed separately
+        /// via Group::open). Requested via GZIPPY_KERNEL_PERF=1.
+        pub fn requested() -> bool {
+            matches!(
+                std::env::var("GZIPPY_KERNEL_PERF").ok().as_deref(),
+                Some("1")
+            )
+        }
+    }
+
     const SEED_PATH: &str = "/tmp/engine.seed";
     const CORPUS: &str = "benchmark_data/silesia-gzip.tar.gz";
     const REQUESTED_N: usize = 4 * 1024 * 1024;
@@ -1507,10 +1780,205 @@ mod bench {
         out[base..end].to_vec()
     }
 
+    // ── Variant SLOTS (infrastructure ready; bodies gated/stubbed) ────────────
+    //
+    // The harness is wired to drop these in via GZIPPY_KERNEL_VARIANTS (see
+    // OPTIONAL_VARIANTS). They are NOT in the default VARIANTS array, so the
+    // default run is byte-exact-gated on I/II/III/V/VI/VII exactly as before; a
+    // not-yet-implemented slot that panics cannot poison the default sweep.
+    //
+    // VAR_VIII = direct-map / single-sym + double-sym(u64) LUT. The table rewrite
+    // (a dual-symbol u64 LUT instead of the packed-multi-sym short_code_lookup)
+    // is GATED per the charter — this slot is the byte-exact-gated drop-in target.
+    // When implemented it MUST be SHA-equal to VAR_I scalar AND VAR_III ISA-L.
+    #[allow(unused_variables)]
+    fn decode_var_viii(
+        deflate: &[u8],
+        start_bit: usize,
+        window: &[u8],
+        target_n: usize,
+    ) -> Vec<u8> {
+        panic!(
+            "VAR_VIII (direct-map/single+double-sym u64 LUT) not yet implemented — \
+             slot wired, table rewrite is gated (charter). Enable once the dual-sym \
+             u64 table exists and passes the byte-exact gate."
+        );
+    }
+
+    // VAR_IX = perfect-prediction pre-decoded-trace REPLAY. TIMING-ONLY cheat: it
+    // replays a pre-decoded (symbol, length, distance) trace with zero Huffman /
+    // bit work, to bound the copy/store half of the kernel in the limit of a
+    // perfect branch predictor + zero decode latency. NON-byte-exact by design
+    // (it does not consume bits) — it is gated on same-bits-consumed + same length
+    // by the caller and LABELLED non-byte-exact (excluded from the SHA gate).
+    #[allow(unused_variables)]
+    fn decode_var_ix(deflate: &[u8], start_bit: usize, window: &[u8], target_n: usize) -> Vec<u8> {
+        panic!(
+            "VAR_IX (perfect-prediction trace replay, timing-only) not yet \
+             implemented — slot wired. When implemented, build the trace once per \
+             chunk and replay it; label non-byte-exact (gated on bits-consumed)."
+        );
+    }
+
     fn crc32(b: &[u8]) -> u32 {
         let mut h = crc32fast::Hasher::new();
         h.update(b);
         h.finalize()
+    }
+
+    // ── Symbol denominator (recorded ONCE per chunk) ──────────────────────────
+    // "Symbols" = the count of litlen Huffman codes decoded to produce the first
+    // `target_n` output bytes. This is the natural denominator for symbols/cycle
+    // (the per-symbol hot-loop rate) and is INVARIANT across variants (they all
+    // decode the same deflate stream). Computed by re-running the VAR_V parser
+    // structure but only COUNTING (no output store, no timing) — so it shares the
+    // exact packet/length/dist semantics the timed variants use. Returns
+    // (litlen_codes, decoded_bytes). The bytes it returns must equal n_actual on
+    // a clean chunk; the caller asserts that.
+    fn count_symbols(
+        deflate: &[u8],
+        start_bit: usize,
+        window: &[u8],
+        target_n: usize,
+    ) -> (u64, u64) {
+        let base = MAX_WINDOW_SIZE;
+        let mut block = Block::new();
+        {
+            let mut dummy: Vec<u16> = Vec::new();
+            if block.set_initial_window(&mut dummy, window).is_err() {
+                return (0, 0);
+            }
+        }
+        let mut bits = Bits::at_bit_offset(deflate, start_bit);
+        let mut emitted: usize = 0; // output bytes produced
+        let mut sym_codes: u64 = 0; // litlen huffman codes decoded
+        'blocks: loop {
+            if block.read_header(&mut bits, false).is_err() {
+                break;
+            }
+            match block.compression_type() {
+                CompressionType::Uncompressed => {
+                    bits.align_to_byte();
+                    let len = bits.read_u16() as usize;
+                    let _nlen = bits.read_u16();
+                    for _ in 0..len {
+                        if bits.available() < 8 {
+                            bits.refill();
+                        }
+                        bits.consume(8);
+                        emitted += 1;
+                    }
+                    if block.is_last_block() || emitted >= target_n {
+                        break 'blocks;
+                    }
+                    continue 'blocks;
+                }
+                CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {}
+                CompressionType::Reserved => break 'blocks,
+            }
+            let (litlen, dist) = match build_block_tables(&block) {
+                Some(t) => t,
+                None => break 'blocks,
+            };
+            loop {
+                bits.refill();
+                let d = litlen.decode(&mut bits);
+                if d.bit_count == 0 {
+                    break 'blocks;
+                }
+                bits.consume(d.bit_count);
+                sym_codes += 1;
+                let mut s = d.symbol;
+                let mut remaining = d.sym_count;
+                let mut hit_code = false;
+                while remaining > 0 {
+                    let code = (s & 0xFFFF) as u16;
+                    if remaining == 1 && code > 255 {
+                        hit_code = true;
+                        break;
+                    }
+                    emitted += 1; // literal
+                    remaining -= 1;
+                    s >>= 8;
+                }
+                if hit_code {
+                    let code = (s & 0xFFFF) as u16;
+                    if code == END_OF_BLOCK_SYMBOL {
+                        break; // next block
+                    }
+                    if (code as u32) > MAX_LIT_LEN_SYM {
+                        break 'blocks;
+                    }
+                    let length = (code as usize).wrapping_sub(254);
+                    if length != 0 {
+                        let (dsym, dbits) = match dist.decode(&mut bits) {
+                            Some(x) => x,
+                            None => break 'blocks,
+                        };
+                        bits.consume(dbits);
+                        if dsym as usize >= DISTANCE_BASE.len() {
+                            break 'blocks;
+                        }
+                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                        if extra > 0 {
+                            if bits.available() < extra {
+                                bits.refill();
+                            }
+                            bits.consume(extra);
+                        }
+                        emitted += length;
+                    }
+                }
+                if emitted >= target_n {
+                    break 'blocks;
+                }
+            }
+            if block.is_last_block() || emitted >= target_n {
+                break 'blocks;
+            }
+        }
+        (sym_codes, emitted.min(target_n) as u64)
+    }
+
+    // Derived per-variant rates from a coherent counter snapshot + denominators.
+    struct Derived {
+        ipc: f64,
+        brmiss_rate: f64, // branch-misses / branch-instructions
+        sym_per_cyc: f64,
+        byte_per_cyc: f64,
+        l1miss_rate: f64, // L1 misses / instruction
+        dtlb_rate: f64,   // dTLB misses / instruction
+    }
+    fn derive(c: &perf::Counts, symbols: u64, bytes: u64) -> Derived {
+        let cyc = c.cycles().max(1) as f64;
+        let ins = c.instructions().max(1) as f64;
+        let br = c.branches().max(1) as f64;
+        Derived {
+            ipc: c.instructions() as f64 / cyc,
+            brmiss_rate: c.branch_misses() as f64 / br,
+            sym_per_cyc: symbols as f64 / cyc,
+            byte_per_cyc: bytes as f64 / cyc,
+            l1miss_rate: c.l1_misses() as f64 / ins,
+            dtlb_rate: c.dtlb_misses() as f64 / ins,
+        }
+    }
+
+    /// Median over a slice of counter snapshots, field by field (each field's own
+    /// median, which is robust to a stray context-switch on one iteration).
+    fn median_counts(samples: &[perf::Counts]) -> perf::Counts {
+        let mut out = perf::Counts {
+            vals: [0; perf::N_CTR],
+            valid: !samples.is_empty(),
+        };
+        if samples.is_empty() {
+            return out;
+        }
+        for i in 0..perf::N_CTR {
+            let mut v: Vec<u64> = samples.iter().map(|c| c.vals[i]).collect();
+            v.sort_unstable();
+            out.vals[i] = v[v.len() / 2];
+        }
+        out
     }
 
     fn stats(times: &[f64]) -> (f64, f64, f64) {
@@ -1530,47 +1998,116 @@ mod bench {
     // gate. Order matters: index 0 = scalar reference, index 2 = ISA-L oracle
     // (both used as byte-exact denominators).
     type DecodeFn = fn(&[u8], usize, &[u8], usize) -> Vec<u8>;
-    const NV: usize = 6;
-    const VARIANTS: [(&str, DecodeFn); NV] = [
-        ("VAR_I_scalar_u16", decode_var_i),
-        ("VAR_II_E1u8_part", decode_var_ii),
-        ("VAR_III_isal", decode_var_iii),
-        // (VAR_IV read_clean_e234 stacks deleted in M5 with the bench-only
-        // `read_clean_e234` / `drain_clean_u8` engine entry points.)
-        // VAR_V is the inner-Huffman-kernel LEVER: igzip packed-flat-short-code
-        // table (trick #1) + the speculative software-pipelined loop (trick #2) on
-        // a FLAT-u8 linear buffer (the missing piece — production stores one u8 per
-        // iter with a ring modulo and never preloads). This is the variant the
-        // pre-registered falsifier gates: PASS if (V)/(III isal) >= 0.85.
-        ("VAR_V_specflat", decode_var_v),
-        // VAR_VI = VAR_V + BMI2 BZHI/SHRX bit extraction + AVX2/SSE MOVDQU wide
-        // overlap-copy back-ref. This is the variant the ceiling falsifier gates:
-        // PASS (pure-Rust IS igzip-class) if (VI)/(III isal) >= 0.85.
-        ("VAR_VI_specbmi2avx", decode_var_vi),
-        // VAR_VII = the CHARTER Phase-2 INLINE-ASM transliteration: igzip's
-        // literal-run hot loop as a `core::arch::asm!` block (one-iteration-ahead
-        // table-gather hoist + unconditional flag-free SHLX/SHRX refill+consume +
-        // register-pinned loop state + 8-byte packed-literal store), exiting to the
-        // validated Rust careful tail on any length/long/boundary. This is the
-        // variant the GO/NO-GO gate measures: GO if (VII)/(III isal) materially
-        // exceeds (VI)/(III isal) toward igzip-class (~0.945 ocl_cf); PLATEAU if
-        // (VII) ≈ (VI) (inline asm cannot beat LLVM here).
-        ("VAR_VII_asm", decode_var_vii),
-    ];
 
-    /// Per-chunk result: median MB/s per variant (index-aligned with VARIANTS)
-    /// and whether every variant was byte-exact vs scalar AND scalar vs ISA-L.
-    struct ChunkResult {
-        med_mbps: [f64; NV],
-        exact: [bool; NV],
-        all_equal: bool,
-        r_iii_i: f64,
+    // How a variant participates in the SHA gate.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Gate {
+        // Must be byte-exact vs VAR_I scalar AND VAR_I==ISA-L (the production gate).
+        ByteExact,
+        // Timing-only (e.g. VAR_IX trace replay): NOT bit-faithful, EXCLUDED from
+        // the SHA gate, LABELLED non-byte-exact in output. Never a verdict input.
+        TimingOnly,
     }
 
-    /// Run the full byte-exact gate + interleaved timing for one seed entry.
-    /// Returns None when the chunk is unusable (wrong window size, not mid-
-    /// stream, or decodes too little).
-    fn run_chunk(deflate: &[u8], entry: &SeedEntry) -> Option<ChunkResult> {
+    struct Variant {
+        label: &'static str,
+        f: DecodeFn,
+        gate: Gate,
+    }
+
+    fn default_variants() -> Vec<Variant> {
+        vec![
+            Variant {
+                label: "VAR_I_scalar_u16",
+                f: decode_var_i,
+                gate: Gate::ByteExact,
+            },
+            Variant {
+                label: "VAR_II_E1u8_part",
+                f: decode_var_ii,
+                gate: Gate::ByteExact,
+            },
+            Variant {
+                label: "VAR_III_isal",
+                f: decode_var_iii,
+                gate: Gate::ByteExact,
+            },
+            // (VAR_IV read_clean_e234 stacks deleted in M5.)
+            // VAR_V: igzip packed-flat-short-code table + speculative pipelined
+            // loop on a FLAT-u8 buffer (falsifier PASS if (V)/(III) >= 0.85).
+            Variant {
+                label: "VAR_V_specflat",
+                f: decode_var_v,
+                gate: Gate::ByteExact,
+            },
+            // VAR_VI: VAR_V + BMI2 BZHI/SHRX + AVX2/SSE wide overlap copy.
+            Variant {
+                label: "VAR_VI_specbmi2avx",
+                f: decode_var_vi,
+                gate: Gate::ByteExact,
+            },
+            // VAR_VII: CHARTER Phase-2 inline-asm literal-run hot loop.
+            Variant {
+                label: "VAR_VII_asm",
+                f: decode_var_vii,
+                gate: Gate::ByteExact,
+            },
+        ]
+    }
+
+    /// Optional slots, opt-in via GZIPPY_KERNEL_VARIANTS=viii,ix (comma list).
+    /// They are appended to the variant list; a not-yet-implemented slot panics
+    /// only when EXPLICITLY enabled, so the default sweep stays clean.
+    fn optional_variants() -> Vec<Variant> {
+        let req = std::env::var("GZIPPY_KERNEL_VARIANTS").unwrap_or_default();
+        let mut out = Vec::new();
+        for tok in req.split(',').map(|s| s.trim().to_ascii_lowercase()) {
+            match tok.as_str() {
+                "viii" | "8" => out.push(Variant {
+                    label: "VAR_VIII_dualsym",
+                    f: decode_var_viii,
+                    gate: Gate::ByteExact,
+                }),
+                "ix" | "9" => out.push(Variant {
+                    label: "VAR_IX_replay",
+                    f: decode_var_ix,
+                    gate: Gate::TimingOnly,
+                }),
+                "" => {}
+                other => eprintln!("WARN unknown GZIPPY_KERNEL_VARIANTS token {other:?}"),
+            }
+        }
+        out
+    }
+
+    fn all_variants() -> Vec<Variant> {
+        let mut v = default_variants();
+        v.extend(optional_variants());
+        v
+    }
+
+    /// Per-chunk result: median MB/s + median counter snapshot per variant
+    /// (index-aligned with the variant list) and the SHA gate outcome.
+    struct ChunkResult {
+        labels: Vec<&'static str>,
+        med_mbps: Vec<f64>,
+        counts: Vec<perf::Counts>, // median counter snapshot per variant
+        exact: Vec<bool>,
+        all_equal: bool,
+        r_iii_i: f64,
+        symbols: u64,
+        n_bytes: u64,
+        perf_on: bool,
+    }
+
+    /// Run the full byte-exact gate + interleaved timing (+ optional hardware
+    /// counters) for one seed entry. Returns None when the chunk is unusable.
+    /// `pg` is the perf counter group (Some => counters measured per variant).
+    fn run_chunk(
+        deflate: &[u8],
+        entry: &SeedEntry,
+        pg: Option<&perf::Group>,
+    ) -> Option<ChunkResult> {
         if entry.window.len() != MAX_WINDOW_SIZE {
             return None;
         }
@@ -1580,6 +2117,9 @@ mod bench {
             return None;
         }
 
+        let variants = all_variants();
+        let nv = variants.len();
+
         // N_actual from the scalar reference (clamps to BFINAL if early).
         let probe = decode_var_i(deflate, start_bit, window, REQUESTED_N);
         let n_actual = probe.len().min(REQUESTED_N);
@@ -1587,26 +2127,45 @@ mod bench {
             return None;
         }
 
-        // Decode every variant once for the byte-exact gate.
-        let outs: Vec<Vec<u8>> = VARIANTS
-            .iter()
-            .map(|(_, f)| f(deflate, start_bit, window, n_actual))
-            .collect();
-        let scalar = &outs[0][..n_actual];
-        let isal = &outs[2][..n_actual];
-        let scalar_eq_isal = scalar == isal;
-        // Length-safe exact check: variant must be >= n_actual long AND match
-        // scalar over [0, n_actual) AND scalar must match ISA-L.
-        let mut exact = [false; NV];
-        for (k, o) in outs.iter().enumerate() {
-            exact[k] = o.len() >= n_actual && &o[..n_actual] == scalar && scalar_eq_isal;
+        // Symbol/byte denominators recorded ONCE per chunk (decode-invariant).
+        let (symbols, sym_bytes) = count_symbols(deflate, start_bit, window, n_actual);
+        // On a clean chunk the symbol-counter's emitted bytes must match n_actual.
+        if sym_bytes as usize != n_actual {
+            eprintln!(
+                "WARN symbol-count bytes={sym_bytes} != n_actual={n_actual} \
+                 (start_bit={start_bit}); sym_per_cyc denominator may be off"
+            );
         }
-        let all_equal = exact.iter().all(|&b| b);
+
+        // Decode every variant once for the byte-exact gate.
+        let outs: Vec<Vec<u8>> = variants
+            .iter()
+            .map(|v| (v.f)(deflate, start_bit, window, n_actual))
+            .collect();
+        let scalar = outs[0][..n_actual].to_vec();
+        let isal = &outs[2][..n_actual];
+        let scalar_eq_isal = &scalar[..] == isal;
+        // Gate: ByteExact variants must be >= n_actual long AND match scalar over
+        // [0,n_actual) AND scalar must match ISA-L. TimingOnly variants are not
+        // bit-faithful — never marked exact, never a verdict input.
+        let mut exact = vec![false; nv];
+        for (k, o) in outs.iter().enumerate() {
+            exact[k] = variants[k].gate == Gate::ByteExact
+                && o.len() >= n_actual
+                && o[..n_actual] == scalar[..]
+                && scalar_eq_isal;
+        }
+        // all_equal: every BYTE-EXACT variant passed (TimingOnly excluded).
+        let all_equal = variants
+            .iter()
+            .enumerate()
+            .all(|(k, v)| v.gate != Gate::ByteExact || exact[k]);
 
         if !all_equal {
             eprintln!("BYTE-EXACT FAILURE chunk start_bit={start_bit}:");
-            for (k, (label, _)) in VARIANTS.iter().enumerate() {
-                if !exact[k] {
+            for (k, v) in variants.iter().enumerate() {
+                if v.gate == Gate::ByteExact && !exact[k] {
+                    let label = v.label;
                     let common = outs[k].len().min(n_actual);
                     let fd = outs[k][..common]
                         .iter()
@@ -1629,52 +2188,128 @@ mod bench {
             }
         }
 
-        // Warm-up (discarded) then interleaved best-of-N.
-        for (_, f) in VARIANTS.iter() {
-            let _ = f(deflate, start_bit, window, n_actual);
+        // Warm-up (discarded).
+        for v in &variants {
+            let _ = (v.f)(deflate, start_bit, window, n_actual);
         }
-        let mut times: [Vec<f64>; NV] = Default::default();
+
+        // ── PURE-TIMING pass (no counter ioctls in the loop -> clean MB/s) ────
+        let mut times: Vec<Vec<f64>> = vec![Vec::with_capacity(ITERS); nv];
         for _ in 0..ITERS {
-            for (k, (_, f)) in VARIANTS.iter().enumerate() {
+            for (k, v) in variants.iter().enumerate() {
                 let s = Instant::now();
-                let r = f(deflate, start_bit, window, n_actual);
+                let r = (v.f)(deflate, start_bit, window, n_actual);
                 times[k].push(s.elapsed().as_secs_f64());
                 std::hint::black_box(&r);
             }
         }
 
+        // ── COUNTER pass (separate; ioctl overhead is OUTSIDE the timed region
+        // above so it never pollutes MB/s). reset+enable immediately before the
+        // call, disable+read immediately after -> the counts bracket ONLY the
+        // decode. Group-read => coherent across the 6 counters. ───────────────
+        let perf_on = pg.is_some();
+        let mut ctr_samples: Vec<Vec<perf::Counts>> = vec![Vec::new(); nv];
+        if let Some(g) = pg {
+            for _ in 0..ITERS {
+                for (k, v) in variants.iter().enumerate() {
+                    g.reset_enable();
+                    let r = (v.f)(deflate, start_bit, window, n_actual);
+                    g.disable();
+                    let c = g.read();
+                    std::hint::black_box(&r);
+                    if c.valid {
+                        ctr_samples[k].push(c);
+                    }
+                }
+            }
+        }
+
         let mbps = |secs: f64| (n_actual as f64) / secs / 1e6;
-        let mut med_mbps = [0.0f64; NV];
-        for k in 0..NV {
+        let mut med_mbps = vec![0.0f64; nv];
+        for k in 0..nv {
             let (_min, med, _sig) = stats(&times[k]);
             med_mbps[k] = mbps(med);
         }
+        let counts: Vec<perf::Counts> = (0..nv).map(|k| median_counts(&ctr_samples[k])).collect();
         let r_iii_i = med_mbps[2] / med_mbps[0];
 
-        // Per-chunk report.
+        // ── Per-chunk human + MACHINE-PARSEABLE report ────────────────────────
         println!(
-            "CHUNK start_bit={start_bit} N_bytes={n_actual} SHA_ALL_EQUAL={}",
-            if all_equal { "yes" } else { "no" }
+            "CHUNK start_bit={start_bit} N_bytes={n_actual} symbols={symbols} \
+             SHA_ALL_EQUAL={} PERF={}",
+            if all_equal { "yes" } else { "no" },
+            if perf_on { "on" } else { "off" }
         );
-        for (k, (label, _)) in VARIANTS.iter().enumerate() {
-            if exact[k] {
+        for (k, v) in variants.iter().enumerate() {
+            let label = v.label;
+            let timing_only = v.gate == Gate::TimingOnly;
+            let sha_ok = if timing_only {
+                "n/a"
+            } else if exact[k] {
+                "yes"
+            } else {
+                "no"
+            };
+            // Human line.
+            if exact[k] || timing_only {
                 println!(
-                    "  {:<17} MBps_med={:>6.0}  vs_i={:.3} vs_iii={:.3}",
+                    "  {:<19} MBps_med={:>6.0}  vs_i={:.3} vs_iii={:.3}{}",
                     label,
                     med_mbps[k],
                     med_mbps[k] / med_mbps[0],
-                    med_mbps[k] / med_mbps[2]
+                    med_mbps[k] / med_mbps[2],
+                    if timing_only {
+                        "  [TIMING-ONLY, non-byte-exact]"
+                    } else {
+                        ""
+                    }
                 );
             } else {
-                println!("  {:<17} VOID (byte-exact gate failed)", label);
+                println!("  {:<19} VOID (byte-exact gate failed)", label);
+            }
+            // MACHINE-PARSEABLE line (always emitted; counters NA when perf off).
+            if perf_on && counts[k].valid {
+                let d = derive(&counts[k], symbols, n_actual as u64);
+                println!(
+                    "VARIANT {label} start_bit={start_bit} mbps={:.1} ipc={:.4} \
+                     brmiss_rate={:.5} sym_per_cyc={:.4} byte_per_cyc={:.4} \
+                     l1miss={:.6} dtlb={:.6} ins={} cyc={} br={} brmiss={} \
+                     l1m={} dtlbm={} sha_ok={sha_ok}",
+                    med_mbps[k],
+                    d.ipc,
+                    d.brmiss_rate,
+                    d.sym_per_cyc,
+                    d.byte_per_cyc,
+                    d.l1miss_rate,
+                    d.dtlb_rate,
+                    counts[k].instructions(),
+                    counts[k].cycles(),
+                    counts[k].branches(),
+                    counts[k].branch_misses(),
+                    counts[k].l1_misses(),
+                    counts[k].dtlb_misses(),
+                );
+            } else {
+                println!(
+                    "VARIANT {label} start_bit={start_bit} mbps={:.1} ipc=NA \
+                     brmiss_rate=NA sym_per_cyc=NA byte_per_cyc=NA l1miss=NA \
+                     dtlb=NA sha_ok={sha_ok} perf=off",
+                    med_mbps[k]
+                );
             }
         }
 
         Some(ChunkResult {
+            labels: variants.iter().map(|v| v.label).collect(),
             med_mbps,
+            counts,
             exact,
             all_equal,
             r_iii_i,
+            symbols,
+            n_bytes: n_actual as u64,
+            perf_on,
         })
     }
 
@@ -1691,6 +2326,81 @@ mod bench {
         );
         let deflate = load_deflate();
 
+        // ── GATE-ZERO: PERF availability probe + counter SELF-TEST ────────────
+        // Broken instruments are this campaign's recurring failure mode, so the
+        // counters earn trust BEFORE any number is reported:
+        //   (1) PERF_AVAILABLE=yes/no — requested via GZIPPY_KERNEL_PERF=1 AND
+        //       perf_event_open actually succeeded (else MB/s-only, NO zeros).
+        //   (2) VAR_I-vs-VAR_I binary-vs-itself: the SAME decode measured twice;
+        //       the IPC ratio MUST read ~1.0. A drift => the counters are
+        //       untrustworthy and we say so LOUDLY (PERF_SELFTEST=FAIL) rather
+        //       than emit numbers.
+        let want_perf = perf::requested();
+        let pg: Option<perf::Group> = if want_perf { perf::Group::open() } else { None };
+        let perf_available = pg.is_some();
+        println!(
+            "PERF_REQUESTED={} PERF_AVAILABLE={}",
+            if want_perf { "yes" } else { "no" },
+            if perf_available { "yes" } else { "no" }
+        );
+        if want_perf && !perf_available {
+            eprintln!(
+                "PERF note: GZIPPY_KERNEL_PERF=1 but perf_event_open FAILED \
+                 (perf_event_paranoid? no PMU? non-Linux?). Falling back to \
+                 MB/s-only — NOT emitting fabricated zero counters."
+            );
+        }
+        if let Some(g) = pg.as_ref() {
+            // Self-test chunk: the first usable seed entry.
+            if let Some(e) = seed
+                .iter()
+                .find(|e| e.window.len() == MAX_WINDOW_SIZE && e.start_bit > 64)
+            {
+                let n = decode_var_i(&deflate, e.start_bit, &e.window, REQUESTED_N)
+                    .len()
+                    .min(REQUESTED_N);
+                let measure_ipc = || -> f64 {
+                    let mut best = 0.0f64; // best (=highest) IPC over a few reps
+                    for _ in 0..7 {
+                        g.reset_enable();
+                        let r = decode_var_i(&deflate, e.start_bit, &e.window, n);
+                        g.disable();
+                        let c = g.read();
+                        std::hint::black_box(&r);
+                        if c.valid && c.cycles() > 0 {
+                            let ipc = c.instructions() as f64 / c.cycles() as f64;
+                            if ipc > best {
+                                best = ipc;
+                            }
+                        }
+                    }
+                    best
+                };
+                let a = measure_ipc();
+                let b = measure_ipc();
+                let ratio = if b > 0.0 { a / b } else { 0.0 };
+                // VAR_I vs VAR_I is the SAME code; 0.97..1.03 is a generous band.
+                let pass = a > 0.0 && b > 0.0 && (0.97..=1.03).contains(&ratio);
+                println!(
+                    "PERF_SELFTEST={} (VAR_I-vs-VAR_I ipc_a={:.4} ipc_b={:.4} ratio={:.4})",
+                    if pass { "PASS" } else { "FAIL" },
+                    a,
+                    b,
+                    ratio
+                );
+                if !pass {
+                    eprintln!(
+                        "PERF_SELFTEST FAIL: VAR_I-vs-VAR_I IPC ratio {ratio:.4} \
+                         outside [0.97,1.03] (a={a:.4} b={b:.4}). Counters are \
+                         UNTRUSTWORTHY on this run — treat per-variant counter \
+                         numbers below as SUSPECT."
+                    );
+                }
+            } else {
+                println!("PERF_SELFTEST=SKIP (no usable self-test chunk)");
+            }
+        }
+
         // Sweep chunks at 10/30/50/70/90% of the sorted-by-start_bit seed list.
         // run_chunk() skips entries without a 32 KiB window or too-short decode,
         // so we over-pick and keep the usable ones.
@@ -1699,7 +2409,7 @@ mod bench {
         let mut median_chunk_idx: Option<usize> = None;
         for (j, &p) in pct.iter().enumerate() {
             let idx = (seed.len().saturating_sub(1) * p) / 100;
-            if let Some(r) = run_chunk(&deflate, &seed[idx]) {
+            if let Some(r) = run_chunk(&deflate, &seed[idx], pg.as_ref()) {
                 if j == 2 {
                     median_chunk_idx = Some(results.len());
                 }
@@ -1711,30 +2421,138 @@ mod bench {
             "no usable chunks in the sweep (all skipped)"
         );
 
+        // Variant label/count come from the first result (same set every chunk).
+        let labels = results[0].labels.clone();
+        let nv = labels.len();
+
         // Aggregate: median-of-per-chunk-medians + min/max spread per variant.
         let med_of = |vals: &mut Vec<f64>| -> f64 {
             vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
             vals[vals.len() / 2]
         };
         println!("\nAGGREGATE over {} chunk(s):", results.len());
-        for (k, (label, _)) in VARIANTS.iter().enumerate() {
-            // Only aggregate chunks where this variant passed the gate.
+        for k in 0..nv {
+            let label = labels[k];
+            let timing_only = label.contains("replay"); // VAR_IX timing-only
+                                                        // Aggregate chunks where this variant passed the gate (or all chunks
+                                                        // for a timing-only variant, which never sets `exact`).
             let mut vals: Vec<f64> = results
                 .iter()
-                .filter(|r| r.exact[k])
+                .filter(|r| timing_only || r.exact[k])
                 .map(|r| r.med_mbps[k])
                 .collect();
             if vals.is_empty() {
-                println!("  {:<17} VOID (no byte-exact chunk)", label);
+                println!("  {:<19} VOID (no byte-exact chunk)", label);
                 continue;
             }
             let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let med = med_of(&mut vals);
-            println!(
-                "  {:<17} MBps_med_of_med={:>6.0}  min={:>6.0} max={:>6.0}",
-                label, med, min, max
-            );
+            // Aggregate counter medians (only chunks with valid counters).
+            let ctr_chunks: Vec<perf::Counts> = results
+                .iter()
+                .filter(|r| r.perf_on && r.counts[k].valid && (timing_only || r.exact[k]))
+                .map(|r| r.counts[k])
+                .collect();
+            if !ctr_chunks.is_empty() {
+                let agg = median_counts(&ctr_chunks);
+                // Use median per-chunk symbols/bytes for the rate denominators.
+                let mut syms: Vec<u64> = results.iter().map(|r| r.symbols).collect();
+                let mut bys: Vec<u64> = results.iter().map(|r| r.n_bytes).collect();
+                syms.sort_unstable();
+                bys.sort_unstable();
+                let d = derive(&agg, syms[syms.len() / 2], bys[bys.len() / 2]);
+                println!(
+                    "  {:<19} MBps_med_of_med={:>6.0}  min={:>6.0} max={:>6.0}  \
+                     ipc={:.4} brmiss_rate={:.5} sym_per_cyc={:.4} l1miss={:.6} dtlb={:.6}",
+                    label,
+                    med,
+                    min,
+                    max,
+                    d.ipc,
+                    d.brmiss_rate,
+                    d.sym_per_cyc,
+                    d.l1miss_rate,
+                    d.dtlb_rate
+                );
+                // AGG machine-parseable line.
+                println!(
+                    "AGG VARIANT {label} mbps={:.1} ipc={:.4} brmiss_rate={:.5} \
+                     sym_per_cyc={:.4} byte_per_cyc={:.4} l1miss={:.6} dtlb={:.6} \
+                     ins={} cyc={} br={} brmiss={}",
+                    med,
+                    d.ipc,
+                    d.brmiss_rate,
+                    d.sym_per_cyc,
+                    d.byte_per_cyc,
+                    d.l1miss_rate,
+                    d.dtlb_rate,
+                    agg.instructions(),
+                    agg.cycles(),
+                    agg.branches(),
+                    agg.branch_misses()
+                );
+            } else {
+                println!(
+                    "  {:<19} MBps_med_of_med={:>6.0}  min={:>6.0} max={:>6.0}  (no counters)",
+                    label, med, min, max
+                );
+            }
+        }
+
+        // ── THE #1 VERDICT line: VAR_I (scalar pure-Rust) vs VAR_III (ISA-L) in
+        // ISOLATION. Does the whole-program IPC/branch-miss gap REPRODUCE here? ─
+        if perf_available {
+            let i_chunks: Vec<perf::Counts> = results
+                .iter()
+                .filter(|r| r.perf_on && r.counts[0].valid && r.exact[0])
+                .map(|r| r.counts[0])
+                .collect();
+            let iii_chunks: Vec<perf::Counts> = results
+                .iter()
+                .filter(|r| r.perf_on && r.counts[2].valid && r.exact[2])
+                .map(|r| r.counts[2])
+                .collect();
+            if !i_chunks.is_empty() && !iii_chunks.is_empty() {
+                let mut syms: Vec<u64> = results.iter().map(|r| r.symbols).collect();
+                let mut bys: Vec<u64> = results.iter().map(|r| r.n_bytes).collect();
+                syms.sort_unstable();
+                bys.sort_unstable();
+                let s = syms[syms.len() / 2];
+                let b = bys[bys.len() / 2];
+                let di = derive(&median_counts(&i_chunks), s, b);
+                let diii = derive(&median_counts(&iii_chunks), s, b);
+                let ipc_ratio = if diii.ipc > 0.0 {
+                    di.ipc / diii.ipc
+                } else {
+                    0.0
+                };
+                let brmiss_ratio = if diii.brmiss_rate > 0.0 {
+                    di.brmiss_rate / diii.brmiss_rate
+                } else {
+                    0.0
+                };
+                println!(
+                    "\nISOLATION_VERDICT VAR_I_vs_VAR_III  ipc_I={:.4} ipc_III={:.4} \
+                     ipc_ratio_I_over_III={:.4}  brmiss_I={:.5} brmiss_III={:.5} \
+                     brmiss_ratio_I_over_III={:.3}  sympercyc_I={:.4} sympercyc_III={:.4}",
+                    di.ipc,
+                    diii.ipc,
+                    ipc_ratio,
+                    di.brmiss_rate,
+                    diii.brmiss_rate,
+                    brmiss_ratio,
+                    di.sym_per_cyc,
+                    diii.sym_per_cyc
+                );
+                println!(
+                    "ISOLATION_VERDICT note: whole-program gap was ~0.71x IPC and \
+                     ~1.8x branch-misses (I vs III). REPRODUCES in isolation if \
+                     ipc_ratio_I_over_III is materially < 1 AND brmiss_ratio > 1; \
+                     if ipc_ratio ~ 1 and brmiss_ratio ~ 1 the kernel thesis \
+                     COLLAPSES (whole-program gap is a pipeline-interaction artifact)."
+                );
+            }
         }
 
         // Self-test on the MEDIAN chunk (the 50% pick), preserved from round-2:
