@@ -377,6 +377,36 @@ mod imp {
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
                 // ── classify the carried/preloaded entry {t1} ───────────
+                //    FUSED lone-literal gate (the c2b95 STRUCTURAL kill):
+                //    lone literal ⇔ FLAG==0 AND sym_count==1 AND
+                //    symbol[8:24]==0 (⇔ code<=255). All three live in the one
+                //    mask 0x0FFFFF00 = FLAG(25) | sym_count(26..27) |
+                //    symbol-high(8..24); the lone-literal pattern is exactly
+                //    0x04000000 (sym_count==1, the others zero). ONE `and` +
+                //    ONE `cmp` replaces the shr/cmp/shr/and/cmp/cmp ladder
+                //    (the intermediate `cmp $1,sym_count` = the c2b95
+                //    structural mispredict). bit_count (>0 for any populated
+                //    lone slot) is read after the gate for the consume; an
+                //    EMPTY slot (all-zero ⇒ sym_count 0) fails the gate and
+                //    takes the cold ladder, which handles bc==0 → invalid.
+                //    NOTE: encoding UNCHANGED — the ref/production decode is
+                //    byte-identical; only this read is restructured.
+                "mov {t2:e}, {t1:e}",
+                "and {t2:e}, 0x0FFFFF00",
+                "cmp {t2:e}, 0x04000000",
+                "jne 24f",                            // not a lone literal (cold)
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",                     // bc = bit_count
+                "movzx {t4:e}, {t1:l}",               // code = sym0 & 0xFF (<=255)
+                // ── lone literal: consume + 1-byte store (Q3) ───────────
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t4:l}",
+                "inc {dst}",
+                "jmp 30f",
+                // ── cold classify (not a lone literal): long / invalid /
+                //    multi / lone length-EOB-oversize ──────────────────────
+                "24:",
                 "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT
                 "jnz 20f",                            // long code (cold)
                 "mov {t2:e}, {t1:e}",
@@ -387,14 +417,10 @@ mod imp {
                 "and {t3:e}, 3",                      // cnt = sym_count
                 "cmp {t3:e}, 1",
                 "jne 22f",                            // multi-literal pack
+                // sym_count==1 but not the fused lone-lit ⇒ code>255
+                // (length/EOB/oversize): straight to the backref arm.
                 "movzx {t4:e}, {t1:x}",               // code = sym0 & 0xFFFF
-                "cmp {t4:e}, 255",
-                "ja 50f",                             // lone non-literal → backref arm (t4=code, t2=bc)
-                // ── lone literal: consume + 1-byte store (Q3) ───────────
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
-                "mov byte ptr [{dst}], {t4:l}",
-                "inc {dst}",
+                "jmp 50f",                            // lone non-literal → backref arm
                 // ── chain step A (P3.2; backstop refill ↔ decode()) ─────
                 "30:",
                 "cmp {bitsleft}, 32",
@@ -411,26 +437,25 @@ mod imp {
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                "test {t1:e}, 0x2000000",
-                "jnz 33f",                            // long candidate (cold)
+                // FUSED lone-literal gate (c2b95 kill — see top classify).
                 "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 28",
-                "jz 7f",                              // gate fail → carry
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 26",
-                "and {t3:e}, 3",
-                "cmp {t3:e}, 1",
-                "jne 7f",
-                "movzx {t4:e}, {t1:x}",
-                "cmp {t4:e}, 255",
-                "ja 7f",
+                "and {t2:e}, 0x0FFFFF00",
+                "cmp {t2:e}, 0x04000000",
+                "jne 35f",                            // not lone literal (cold)
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",                     // bc
                 "cmp {t2}, {bitsleft}",
                 "ja 7f",                              // not fully backed → carry
+                "movzx {t4:e}, {t1:l}",
                 "shrx {bitbuf}, {bitbuf}, {t2}",
                 "sub {bitsleft}, {t2}",
                 "mov byte ptr [{dst}], {t4:l}",
                 "inc {dst}",
                 "jmp 40f",
+                "35:",                                // chain A cold: long → resolve, else carry
+                "test {t1:e}, 0x2000000",
+                "jnz 33f",                            // long candidate (cold)
+                "jmp 7f",                             // multi / lone non-lit / invalid → carry
                 "33:",                                // chain A: long resolve
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 26",                     // long_max_len (≤21)
@@ -474,26 +499,25 @@ mod imp {
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                "test {t1:e}, 0x2000000",
-                "jnz 43f",
+                // FUSED lone-literal gate (c2b95 kill — see top classify).
                 "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 28",
-                "jz 7f",
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 26",
-                "and {t3:e}, 3",
-                "cmp {t3:e}, 1",
-                "jne 7f",
-                "movzx {t4:e}, {t1:x}",
-                "cmp {t4:e}, 255",
-                "ja 7f",
+                "and {t2:e}, 0x0FFFFF00",
+                "cmp {t2:e}, 0x04000000",
+                "jne 45f",                            // not lone literal (cold)
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",                     // bc
                 "cmp {t2}, {bitsleft}",
-                "ja 7f",
+                "ja 7f",                              // not fully backed → carry
+                "movzx {t4:e}, {t1:l}",
                 "shrx {bitbuf}, {bitbuf}, {t2}",
                 "sub {bitsleft}, {t2}",
                 "mov byte ptr [{dst}], {t4:l}",
                 "inc {dst}",
                 "jmp 60f",
+                "45:",                                // chain B cold: long → resolve, else carry
+                "test {t1:e}, 0x2000000",
+                "jnz 43f",
+                "jmp 7f",
                 "43:",                                // chain B: long resolve
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 26",
