@@ -62,8 +62,20 @@ const MIN_ADJUSTED_CHUNK_BYTES: usize = 512 * 1024;
 /// A nonzero value (bytes) turns the policy on by default. Always overridable
 /// per-run via `GZIPPY_TARGET_DECODED_KIB` (the step-13 sweep knob that selects
 /// the most ROBUST target before it is baked here).
+///
+/// SELECTED = 8 MiB (step-13 frozen-Intel matrix sweep, 2026-06-16, N=9
+/// interleaved, sha-verified, A/A rig PASS every cell). 8 MiB decoded is the
+/// most ROBUST of {4,5,6,8} MiB — the ONLY target that WINS silesia-T7 (−9.0%
+/// sig, P 4.84→5.54, gz/rg 1.18→1.076) AND nasa-T4 (−11% sig, P 3.14→3.33)
+/// while NOT regressing any cell (silesia-T4 +2.1% is within the 6.2% inter-run
+/// spread ⇒ TIE; nasa-T7 / monorepo-T4 / monorepo-T7 TIE). Smaller targets
+/// sig-regress silesia-T4 (d4096 +9.8%, d5120 +9.9%), and d5120 hits a
+/// reproducible +80–120% chunk-boundary pathology at ~515 KiB on nasa. This is
+/// the adaptive advantage no fixed compressed constant could achieve (it picks
+/// silesia→2.6 MiB and nasa→0.8 MiB simultaneously). NOT-YET-LAW: single-arch
+/// (Intel i7-13700T); AMD (solvency) replication owed before this is universal.
 #[allow(dead_code)] // read by the parallel_sm decompress_parallel path
-const TARGET_DECODED_CHUNK_BYTES: usize = 0;
+const TARGET_DECODED_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 #[allow(dead_code)]
 fn env_kib(name: &str) -> Option<usize> {
