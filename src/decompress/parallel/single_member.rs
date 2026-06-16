@@ -47,6 +47,83 @@ const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const MIN_ADJUSTED_CHUNK_BYTES: usize = 512 * 1024;
 
+/// Step-13 decoded-size-adaptive chunk policy: compile-time DECODED-bytes target.
+///
+/// rapidgzip (and gzippy's base) split the COMPRESSED stream at a fixed spacing
+/// (`TARGET_COMPRESSED_CHUNK_BYTES`, 4 MiB). Step-12 Gate-2-confirmed that the
+/// parallelism-relevant quantity is the DECODED chunk size: smaller decoded
+/// chunks raise P (avg busy CPUs) and drop the multi-thread wall *where it
+/// helps* — but the sweet spot tracks decoded bytes, which is corpus×T-dependent
+/// because the compression ratio differs per corpus. This policy derives the
+/// compressed spacing from a fixed DECODED target:
+///   `compressed_chunk = target_decoded / ratio`,  `ratio = ISIZE / comp_len`.
+///
+/// `0` = adaptive DISABLED → ship the fixed 4 MiB compressed spacing (the base).
+/// A nonzero value (bytes) turns the policy on by default. Always overridable
+/// per-run via `GZIPPY_TARGET_DECODED_KIB` (the step-13 sweep knob that selects
+/// the most ROBUST target before it is baked here).
+#[allow(dead_code)] // read by the parallel_sm decompress_parallel path
+const TARGET_DECODED_CHUNK_BYTES: usize = 0;
+
+#[allow(dead_code)]
+fn env_kib(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// Resolved decoded-size target for the adaptive policy: the per-run env knob
+/// `GZIPPY_TARGET_DECODED_KIB` wins, else the compile-time default (when > 0),
+/// else `None` (adaptive off → fixed compressed spacing).
+#[allow(dead_code)]
+fn adaptive_target_bytes() -> Option<usize> {
+    if let Some(kib) = env_kib("GZIPPY_TARGET_DECODED_KIB") {
+        return Some(kib * 1024);
+    }
+    if TARGET_DECODED_CHUNK_BYTES != 0 {
+        return Some(TARGET_DECODED_CHUNK_BYTES);
+    }
+    None
+}
+
+/// Adaptive compressed chunk spacing derived from a decoded-size target.
+///
+/// `compressed_chunk = target_decoded / ratio = target_decoded * comp_len / isize`
+/// (ratio = ISIZE / comp_len, guarded ≥ 1).
+///
+/// Edge cases (the policy NEVER produces a value that risks correctness — only
+/// optimality — and falls back to the fixed default when the estimate is
+/// untrustworthy):
+/// * `isize == 0` or `comp_len == 0` → fixed default.
+/// * `comp_len > u32::MAX` (member > 4 GiB compressed) → its true decoded size
+///   is certainly > 4 GiB so the trailer ISIZE (mod 2^32) is a wrap → default.
+/// * `isize < comp_len` (implied ratio < 1: incompressible/stored, OR a > 4 GiB
+///   decoded member whose wrapped ISIZE landed below comp_len) → default.
+/// * otherwise clamp the result to `[MIN_ADJUSTED_CHUNK_BYTES, fallback_default]`
+///   — adaptive only ever SHRINKS the compressed spacing below the 4 MiB base
+///   (high ratio ⇒ more, smaller chunks); it never grows it past the base, so a
+///   low-ratio corpus can never be made *coarser* (and thus less parallel) than
+///   today.
+#[allow(dead_code)]
+pub(crate) fn adaptive_compressed_chunk_bytes(
+    isize_estimate: u64,
+    comp_len: usize,
+    target_decoded: usize,
+    fallback_default: usize,
+) -> usize {
+    if isize_estimate == 0 || comp_len == 0 {
+        return fallback_default;
+    }
+    if comp_len as u64 > u32::MAX as u64 {
+        return fallback_default;
+    }
+    if isize_estimate < comp_len as u64 {
+        return fallback_default;
+    }
+    let cc = (target_decoded as u128 * comp_len as u128 / isize_estimate as u128) as usize;
+    cc.clamp(MIN_ADJUSTED_CHUNK_BYTES, fallback_default)
+}
+
 /// Literal port of vendor's small-file chunk-size adjustment at
 /// `ParallelGzipReader.hpp:294-306`:
 ///
@@ -191,19 +268,56 @@ pub fn decompress_parallel<W: Write>(
         // ISIZE verification + chunk_fetcher::drive orchestration all
         // live in the new driver (mirror of vendor's
         // `ParallelGzipReader::read` at ParallelGzipReader.hpp:553-646).
-        // Granularity probe (2026-05-29): GZIPPY_CHUNK_KIB overrides the
-        // 4 MiB default chunk target so a T=16 chunk-count sweep can
-        // discriminate "T16 regression is straggler/granularity" from
-        // "T16 regression is HT microarchitecture" without a rebuild per
-        // size. Falls back to TARGET_COMPRESSED_CHUNK_BYTES when unset.
-        let default_chunk = std::env::var("GZIPPY_CHUNK_KIB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|kib| kib * 1024)
-            .unwrap_or(TARGET_COMPRESSED_CHUNK_BYTES);
+        // ISIZE — decoded size mod 2^32 — from the gzip trailer (last 4 bytes
+        // of the member, LE). The routing-eligibility gate above already proved
+        // `gzip_data.len() >= header_size + 8`, so these indices are in bounds.
+        // Feeds the step-13 decoded-size-adaptive chunk policy.
+        let isize_estimate = {
+            let n = gzip_data.len();
+            u32::from_le_bytes([
+                gzip_data[n - 4],
+                gzip_data[n - 3],
+                gzip_data[n - 2],
+                gzip_data[n - 1],
+            ]) as u64
+        };
+
+        // Chunk-spacing policy. Precedence:
+        //   1. GZIPPY_CHUNK_KIB — explicit FIXED compressed spacing (KIB*1024).
+        //      The granularity probe (2026-05-29) and the step-13 sweep BASE arm
+        //      (=4096 ⇒ 4 MiB, identical to the compile-time base). Bypasses the
+        //      adaptive computation entirely.
+        //   2. GZIPPY_TARGET_DECODED_KIB / TARGET_DECODED_CHUNK_BYTES — step-13
+        //      decoded-size-adaptive spacing: compressed = target_decoded / ratio
+        //      so the chunk COUNT adapts to the corpus compression ratio.
+        //   3. else the fixed 4 MiB base (TARGET_COMPRESSED_CHUNK_BYTES).
+        let default_chunk = if let Some(kib) = env_kib("GZIPPY_CHUNK_KIB") {
+            kib * 1024
+        } else if let Some(target) = adaptive_target_bytes() {
+            adaptive_compressed_chunk_bytes(
+                isize_estimate,
+                gzip_data.len(),
+                target,
+                TARGET_COMPRESSED_CHUNK_BYTES,
+            )
+        } else {
+            TARGET_COMPRESSED_CHUNK_BYTES
+        };
         let chunk_size = adjusted_chunk_size_bytes(gzip_data.len(), num_threads, default_chunk);
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
+        }
+        if debug_enabled() {
+            let n_chunks = gzip_data.len().div_ceil(chunk_size.max(1));
+            eprintln!(
+                "[parallel_sm] isize={} comp_len={} ratio={:.3} chunk_size={} (~{} KiB) est_chunks={}",
+                isize_estimate,
+                gzip_data.len(),
+                isize_estimate as f64 / (gzip_data.len() as f64).max(1.0),
+                chunk_size,
+                chunk_size / 1024,
+                n_chunks,
+            );
         }
 
         // No pool pre-warm here. A prior experiment touched pool pages
@@ -373,6 +487,92 @@ mod tests {
         let file_size = 256 * 1024 * 1024;
         let got = adjusted_chunk_size_bytes(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
         assert_eq!(got, TARGET_COMPRESSED_CHUNK_BYTES);
+    }
+
+    // ---- step-13 adaptive decoded-size chunk policy ----
+    const D4: usize = 4 * 1024 * 1024; // fixed default / fallback
+
+    #[test]
+    fn adaptive_normal_ratio_shrinks_to_target_over_ratio() {
+        // silesia-like: 211 MiB decoded, 68 MiB compressed → ratio ≈ 3.1.
+        // target 6 MiB decoded → compressed ≈ 6/3.1 ≈ 1.94 MiB.
+        let isize = 211 * 1024 * 1024;
+        let comp = 68 * 1024 * 1024;
+        let cc = adaptive_compressed_chunk_bytes(isize, comp, 6 * 1024 * 1024, D4);
+        // 6Mi * 68Mi / 211Mi = 2_027_578 bytes ≈ 1.93 MiB
+        assert!(
+            (2_000_000..=2_060_000).contains(&cc),
+            "silesia target-6 → ~1.93 MiB, got {cc}"
+        );
+        assert!(cc < D4, "adaptive shrinks below the 4 MiB base");
+    }
+
+    #[test]
+    fn adaptive_high_ratio_clamps_to_floor() {
+        // nasa-like ratio 10, but a huge decoded so the raw value < 512 KiB floor.
+        // ratio 100: target 6 MiB → 60 KiB → clamped up to the 512 KiB floor.
+        let cc =
+            adaptive_compressed_chunk_bytes(100 * 1024 * 1024, 1024 * 1024, 6 * 1024 * 1024, D4);
+        assert_eq!(cc, MIN_ADJUSTED_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn adaptive_nasa_ratio_ten_target_six() {
+        // ratio 10 (nasa): target 6 MiB → 614 KiB compressed (above the floor).
+        let isize = 200 * 1024 * 1024;
+        let comp = 20 * 1024 * 1024;
+        let cc = adaptive_compressed_chunk_bytes(isize, comp, 6 * 1024 * 1024, D4);
+        assert!(
+            (600_000..=640_000).contains(&cc),
+            "nasa target-6 → ~614 KiB, got {cc}"
+        );
+    }
+
+    #[test]
+    fn adaptive_low_ratio_clamps_to_default_ceiling() {
+        // ratio 1.1 (barely compressible): target 6 MiB → 5.45 MiB → clamp to 4 MiB.
+        let cc = adaptive_compressed_chunk_bytes(
+            110 * 1024 * 1024,
+            100 * 1024 * 1024,
+            6 * 1024 * 1024,
+            D4,
+        );
+        assert_eq!(
+            cc, D4,
+            "low ratio never produces a chunk coarser than the base"
+        );
+    }
+
+    #[test]
+    fn adaptive_ratio_below_one_falls_back() {
+        // incompressible/stored: ISIZE < comp_len (ratio < 1) → fixed default.
+        let cc = adaptive_compressed_chunk_bytes(
+            10 * 1024 * 1024,
+            11 * 1024 * 1024,
+            6 * 1024 * 1024,
+            D4,
+        );
+        assert_eq!(cc, D4);
+    }
+
+    #[test]
+    fn adaptive_zero_isize_falls_back() {
+        assert_eq!(
+            adaptive_compressed_chunk_bytes(0, 10 * 1024 * 1024, 6 * 1024 * 1024, D4),
+            D4
+        );
+        assert_eq!(
+            adaptive_compressed_chunk_bytes(5, 0, 6 * 1024 * 1024, D4),
+            D4
+        );
+    }
+
+    #[test]
+    fn adaptive_member_over_4gib_compressed_falls_back() {
+        // comp_len > u32::MAX ⇒ decoded certainly > 4 GiB ⇒ ISIZE wrapped ⇒ default.
+        let comp = (u32::MAX as usize) + 1;
+        let cc = adaptive_compressed_chunk_bytes(123, comp, 6 * 1024 * 1024, D4);
+        assert_eq!(cc, D4);
     }
 
     #[test]
