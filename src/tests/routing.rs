@@ -154,6 +154,70 @@ mod tests {
         }
     }
 
+    /// Regression (a VALID multi-member stream that the detector MIS-FLAGS as
+    /// single-member must still decode byte-exact — never a loud error, never
+    /// truncation).
+    ///
+    /// `is_likely_multi_member` is a perf-bounded heuristic (format.rs): to
+    /// avoid magic-byte false positives inside compressed data it REJECTS a
+    /// candidate member boundary whose preceding ISIZE is 0 (format.rs:89).
+    /// A genuine `cat empty.gz data.gz` stream — first member empty, so the
+    /// only boundary's preceding ISIZE is 0 — therefore classifies as
+    /// single-member and routes to the parallel-SM path. That is the exact
+    /// "valid multi-member flagged single → errors at the embedded 2nd gzip
+    /// header" report. Correctness is preserved ONLY by the trailing-member
+    /// resume fallback (`single_member.rs` `trailing_member_after_first` +
+    /// `sm_driver::read_parallel_sm_resume_multi`): the single-member attempt
+    /// fails at the member boundary, the driver confirms a real trailing
+    /// member, and resumes the remaining members per-member-CRC-verified.
+    ///
+    /// This locks that contract end-to-end through the production entry
+    /// (`decompress_single_member`) at T1 (inline pool) and T2/T4
+    /// (concurrency). If detection is ever tightened so this no longer
+    /// mis-detects, the precondition assert will fire — update the premise
+    /// then; the byte-exact guarantee must hold either way.
+    #[test]
+    fn test_misdetected_multi_member_resumes_byte_exact() {
+        // `cat empty.gz data.gz` — empty FIRST member forces the ISIZE==0
+        // mis-detection deterministically (one boundary, preceding ISIZE 0).
+        let body = make_test_data(300 * 1024);
+        let mut mm = Vec::new();
+        for chunk in [&b""[..], &body[..]] {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(chunk).unwrap();
+            mm.extend_from_slice(&enc.finish().unwrap());
+        }
+        // Precondition: this VALID multi-member stream MIS-DETECTS as
+        // single-member (the reported-bug trigger / the point of the test).
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&mm),
+            "fixture premise: empty-first multi-member must mis-detect as \
+             single-member to exercise the resume fallback"
+        );
+        // ...and gzip(1)/flate2 decode it fine — it is a legal stream.
+        let expected = decompress_reference(&mm);
+        assert_eq!(
+            expected, body,
+            "reference oracle: empty member ++ data == data"
+        );
+        for threads in [1usize, 2, 4] {
+            let mut out = Vec::new();
+            crate::decompress::decompress_single_member(&mm, &mut out, threads).unwrap_or_else(
+                |e| {
+                    panic!(
+                        "mis-detected multi-member -p{threads} must resume-decode \
+                         byte-exact, got error {e:?}"
+                    )
+                },
+            );
+            assert_eq!(
+                out, expected,
+                "mis-detected multi-member -p{threads}: WRONG BYTES \
+                 (trailing-member resume fallback broken)"
+            );
+        }
+    }
+
     /// Advisor review of the eager window-chain port (queuePrefetchedChunkPostProcessing,
     /// f7868ab): the consumer now eagerly publishes each prefetched chunk's end-window via
     /// `get_last_window`. Vendor `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:562-570)
