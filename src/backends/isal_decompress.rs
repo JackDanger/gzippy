@@ -939,7 +939,13 @@ pub fn decompress_deflate_from_bit_into(
 /// is exactly what rapidgzip relies on (it hands a brand-new buffer each
 /// iteration). Therefore growing/moving the output buffer between
 /// `commit_and_reserve` calls is byte-exact.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+// Used only by the parallel-SM ISA-L clean-tail path (`gzip_chunk` /
+// `segmented_buffer`, both `#[cfg(parallel_sm)]`). Gate on `parallel_sm` too so
+// the `isal-compression`-only lint build (no `pure-rust-inflate` ⇒ no
+// `parallel_sm`) doesn't compile these without their callers and flag them as
+// dead code. The `gzippy-isal` production build (pure-rust-inflate +
+// isal-compression) compiles both halves.
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
 pub trait IncrementalOutSink {
     /// (1) Commit `just_written` bytes from the PREVIOUS spare into the buffer
     /// (bump its logical length), then (2) ensure at least `min_spare` bytes of
@@ -953,7 +959,7 @@ pub trait IncrementalOutSink {
 /// Kill-switch: `GZIPPY_NO_REFILL_STAGING=1` reverts the parallel-chunk clean-tail
 /// FFI to the whole-slice `avail_in` mode (no 128 KiB staging buffer). Default OFF
 /// (staging ON — the faithful refillBuffer port).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
 fn staging_no_refill_enabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
@@ -991,7 +997,7 @@ fn staging_no_refill_enabled() -> bool {
 /// `data.len()*8 - avail_in*8` to `data_pos*8 - avail_in*8` where `data_pos` is
 /// the cumulative bytes loaded from `data` into ISA-L's input; the two are
 /// equivalent when kill-switch is ON (`data_pos == data.len()` immediately).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
 pub fn decompress_deflate_from_bit_into_growable(
     data: &[u8],
     bit_offset: usize,
