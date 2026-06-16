@@ -3877,7 +3877,15 @@ fn fixed_dist_table() -> Option<&'static crate::decompress::inflate::libdeflate_
 /// On return `*pos` is incremented by exactly `length`, and (when
 /// `CONTAINS_MARKERS`) `*distance_marker` reflects the post-copy
 /// distance to the nearest marker in the ring.
-#[inline]
+///
+/// STAGE-c (perf/window-absent-inflate): forced `inline(always)` — the plain
+/// `#[inline]` hint was being DECLINED by LLVM (the function stayed a standalone
+/// symbol carrying ~18% of gz's retired instructions, with a per-backref
+/// call prologue/epilogue rg does not pay because rg fuses the same copy into
+/// `Block<false>::read`). The wall gap vs rg is an instruction-count gap (gz
+/// 1.32× rg instructions at HIGHER IPC), so eliminating the per-backref call/
+/// spill/return is an instruction-removal lever. Byte-exact: codegen-only.
+#[inline(always)]
 pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     ring_ptr: *mut u16,
     pos: &mut usize,
