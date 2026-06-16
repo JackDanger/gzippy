@@ -125,10 +125,17 @@ dynasmrt = ["dep:dynasmrt"]
 route-c-dynasm = ["dynasm", "dynasmrt"]
 
 [dependencies]
-# Causal profiler probes (optional; pulled only under --features coz). Path
-# dep so the same checkout layout works locally and on the perf box
-# (../fulcrum alongside this repo). See the `coz` feature.
-fulcrum = { path = "../fulcrum", optional = true }
+# Causal profiler probes (optional; pulled ONLY under --features coz, which is
+# never enabled by default/CI builds — see the `coz` feature). Declared as a GIT
+# dep (not a `../fulcrum` path dep): cargo loads an optional path-dependency's
+# manifest at RESOLVE time even when the feature is off, so a `path = "../fulcrum"`
+# made every default/CI build fail (`failed to load manifest for dependency
+# 'fulcrum'`) in checkouts without a sibling ../fulcrum. A git source resolves
+# without a local checkout and is only fetched/compiled when `coz` is enabled.
+# For local iteration ON fulcrum, override with an UNCOMMITTED patch in your
+# .cargo/config.toml: [patch."https://github.com/JackDanger/fulcrum.git"]
+#   fulcrum = { path = "../fulcrum" }
+fulcrum = { git = "https://github.com/JackDanger/fulcrum.git", optional = true }
 # Compression: flate2 with zlib-ng for maximum performance
 # zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
