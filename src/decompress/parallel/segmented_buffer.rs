@@ -63,6 +63,34 @@ use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 /// boundary. The decode bulk is one contiguous allocation.
 pub const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
+/// memcpy-append `src` onto `dst`.
+///
+/// `allocator_api2::Vec::extend_from_slice` is `self.extend(other.iter().cloned())`,
+/// and BOTH of allocator-api2 0.2.21's `Extend` impls (the generic `Extend<T>`
+/// AND the `Extend<&T>` one whose doc-comment *claims* `copy_from_slice`) are in
+/// fact SCALAR per-element `while next() { ptr::write; set_len(len+1) }` loops
+/// (vec/mod.rs:2704 & :2788). Assembling the chunk's clean output through that
+/// byte-by-byte path measured ~16% of T4-silesia instructions (perf attributed
+/// it to the inlined-into `finalize_with_deflate`/`append_clean_narrowed`
+/// symbol). rapidgzip's clean `DecodedData::append` is a `std::copy`/`insert`
+/// memcpy (DecodedData.hpp:282-289). Mirror that with `copy_nonoverlapping`.
+/// Byte-for-byte identical to the element loop.
+#[inline]
+pub(crate) fn buf_append_memcpy(dst: &mut U8, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    dst.reserve(src.len());
+    let len = dst.len();
+    // SAFETY: `reserve` guarantees `capacity() >= len + src.len()`; `src` is an
+    // external slice disjoint from `dst`'s allocation (non-overlapping copy); we
+    // initialize exactly `src.len()` fresh bytes before bumping the length.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(len), src.len());
+        dst.set_len(len + src.len());
+    }
+}
+
 /// TEST-ONLY reserved-tail poison (OPT-IN via `GZIPPY_POISON_RESERVE`). The
 /// clean-tail copy-free path writes u8 DIRECTLY into this reserved
 /// (uninitialized) spare and back-refs may resolve from it; a read-BEFORE-write
@@ -190,7 +218,7 @@ impl SegmentedU8 {
             return;
         }
         self.ensure_buf(ALLOCATION_CHUNK_SIZE);
-        self.buf.extend_from_slice(window);
+        buf_append_memcpy(&mut self.buf, window);
     }
 
     /// Mutable contiguous A3 decode window — a `[0, capacity)` view into
@@ -266,7 +294,7 @@ impl SegmentedU8 {
             return;
         }
         self.ensure_buf(bytes.len());
-        self.buf.extend_from_slice(bytes);
+        buf_append_memcpy(&mut self.buf, bytes);
     }
 
     /// Zero-copy decode sink: return a writable window (up to
@@ -435,7 +463,7 @@ impl SegmentedU8 {
                 let total: usize = segments.iter().map(|s| s.len()).sum();
                 let mut buf = types::u8_with_capacity(total.max(ALLOCATION_CHUNK_SIZE));
                 for s in &segments {
-                    buf.extend_from_slice(s);
+                    buf_append_memcpy(&mut buf, s);
                 }
                 Self {
                     front: Vec::new(),
@@ -702,8 +730,8 @@ impl SegmentedU8 {
             return;
         }
         let tail = self.buf.split_off(offset);
-        self.buf.extend_from_slice(bytes);
-        self.buf.extend_from_slice(&tail);
+        buf_append_memcpy(&mut self.buf, bytes);
+        buf_append_memcpy(&mut self.buf, &tail);
     }
 
     /// Append the entire logical contents of `other` onto `self`, moving
@@ -720,9 +748,12 @@ impl SegmentedU8 {
         // `other`'s logical content goes after self's. Flatten other into a
         // contiguous tail of self.buf (front of `other` would otherwise need to
         // interleave). Front of `self` is preserved as the logical prefix.
+        // memcpy-append each slice (was scalar `extend_from_slice`; #129 port —
+        // `buf_append_memcpy` mirrors rapidgzip's `DecodedData::append` memcpy,
+        // byte-for-byte identical to the element loop).
         for seg in other.ordered_slices() {
             if !seg.is_empty() {
-                self.buf.extend_from_slice(seg);
+                buf_append_memcpy(&mut self.buf, seg);
             }
         }
         other.clear();
