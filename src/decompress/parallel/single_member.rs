@@ -47,6 +47,38 @@ const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const MIN_ADJUSTED_CHUNK_BYTES: usize = 512 * 1024;
 
+/// BOUNDARY FENCE for the step-13 adaptive policy (2026-06-16, frozen-Intel,
+/// N≥6 per cell, sha-verified, host-locked). The adaptive computation can emit
+/// an ARBITRARY compressed spacing (= target_decoded·comp/isize), and a measured
+/// chunk-boundary-ALIGNMENT pathology makes certain small spacings catastrophic:
+/// a chunk whose boundary lands badly mis-speculates and serially re-resolves,
+/// blowing the wall up +40–66% (nasa T4/T7) to +280–320% (monorepo T4/T7 at
+/// 560 KiB). A frozen GZIPPY_CHUNK_KIB sweep (the FIXED-spacing knob, which lets
+/// us drive any spacing without rebuild) established the bad spacings are:
+///   * T-INVARIANT (identical bad sizes at T4 and T7) ⇒ NOT tail-imbalance —
+///     e.g. 520 KiB (39 chunks) is FAST but 530 KiB (also 39 chunks) is SLOW;
+///     monorepo 544 KiB / 576 KiB fast, 560 KiB = 4× — it is purely where the
+///     chunk byte-boundaries tile the deflate-block structure of THAT corpus;
+///   * SPARSE + corpus-specific: silesia has none in [512 KiB,4 MiB]; nasa has a
+///     scattered cluster in [448,592] KiB plus an isolated spike at 672 KiB;
+///     monorepo has a single razor spike at exactly 560 KiB;
+///   * CONFINED to small spacings: nothing pathological was found at or above
+///     704 KiB on any corpus×T, and the entire achievable adaptive range
+///     [1 MiB,4 MiB] measured uniformly clean.
+///
+/// So the robust fence is to keep the adaptive spacing ABOVE the whole measured
+/// pathology band with margin: floor the adaptive clamp at 1 MiB (>672 KiB worst
+/// spike + 352 KiB margin). This is preferred over a chunk_count≫T rule because
+/// the data FALSIFIES the tail-imbalance hypothesis the count-rule rests on
+/// (same chunk_count, opposite wall), and it preserves the wins: silesia ships
+/// 2.57 MiB and monorepo's small-file vendor shrink stays on the 512 KiB-multiple
+/// grid (all measured-clean); only nasa moves 825 KiB → 1 MiB (re-measured: the
+/// win survives). The fixed-spacing vendor path (`adjusted_chunk_size_bytes`,
+/// 512 KiB-aligned) is untouched — it only emits 512 KiB multiples, none of which
+/// landed in a bad band. NOT-YET-LAW: single-arch (Intel i7-13700T); AMD owed.
+#[allow(dead_code)] // read by the parallel_sm decompress_parallel path
+const ADAPTIVE_MIN_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// Step-13 decoded-size-adaptive chunk policy: compile-time DECODED-bytes target.
 ///
 /// rapidgzip (and gzippy's base) split the COMPRESSED stream at a fixed spacing
@@ -111,11 +143,14 @@ fn adaptive_target_bytes() -> Option<usize> {
 ///   is certainly > 4 GiB so the trailer ISIZE (mod 2^32) is a wrap → default.
 /// * `isize < comp_len` (implied ratio < 1: incompressible/stored, OR a > 4 GiB
 ///   decoded member whose wrapped ISIZE landed below comp_len) → default.
-/// * otherwise clamp the result to `[MIN_ADJUSTED_CHUNK_BYTES, fallback_default]`
+/// * otherwise clamp the result to `[ADAPTIVE_MIN_CHUNK_BYTES, fallback_default]`
 ///   — adaptive only ever SHRINKS the compressed spacing below the 4 MiB base
 ///   (high ratio ⇒ more, smaller chunks); it never grows it past the base, so a
 ///   low-ratio corpus can never be made *coarser* (and thus less parallel) than
-///   today.
+///   today. The 1 MiB floor (raised from 512 KiB) is the measured BOUNDARY FENCE
+///   (see `ADAPTIVE_MIN_CHUNK_BYTES`): it keeps the spacing above the entire
+///   chunk-boundary-alignment pathology band so no high-ratio corpus can be
+///   driven onto a catastrophic mis-speculation size.
 #[allow(dead_code)]
 pub(crate) fn adaptive_compressed_chunk_bytes(
     isize_estimate: u64,
@@ -133,7 +168,13 @@ pub(crate) fn adaptive_compressed_chunk_bytes(
         return fallback_default;
     }
     let cc = (target_decoded as u128 * comp_len as u128 / isize_estimate as u128) as usize;
-    cc.clamp(MIN_ADJUSTED_CHUNK_BYTES, fallback_default)
+    // Boundary fence: floor at ADAPTIVE_MIN_CHUNK_BYTES (1 MiB), above the whole
+    // measured chunk-boundary-alignment pathology band (worst spike 672 KiB), so
+    // adaptive can never drop the spacing into a catastrophic mis-speculation
+    // size. `min` with the floor guards the degenerate `fallback_default < floor`
+    // case (e.g. a tiny test default) so the clamp lo never exceeds hi.
+    let lo = ADAPTIVE_MIN_CHUNK_BYTES.min(fallback_default);
+    cc.clamp(lo, fallback_default)
 }
 
 /// Literal port of vendor's small-file chunk-size adjustment at
@@ -521,23 +562,41 @@ mod tests {
 
     #[test]
     fn adaptive_high_ratio_clamps_to_floor() {
-        // nasa-like ratio 10, but a huge decoded so the raw value < 512 KiB floor.
-        // ratio 100: target 6 MiB → 60 KiB → clamped up to the 512 KiB floor.
+        // ratio 100: target 6 MiB → 60 KiB → clamped up to the 1 MiB BOUNDARY
+        // FENCE floor (raised from 512 KiB to fence the alignment pathology band).
         let cc =
             adaptive_compressed_chunk_bytes(100 * 1024 * 1024, 1024 * 1024, 6 * 1024 * 1024, D4);
-        assert_eq!(cc, MIN_ADJUSTED_CHUNK_BYTES);
+        assert_eq!(cc, ADAPTIVE_MIN_CHUNK_BYTES);
     }
 
     #[test]
-    fn adaptive_nasa_ratio_ten_target_six() {
-        // ratio 10 (nasa): target 6 MiB → 614 KiB compressed (above the floor).
-        let isize = 200 * 1024 * 1024;
-        let comp = 20 * 1024 * 1024;
-        let cc = adaptive_compressed_chunk_bytes(isize, comp, 6 * 1024 * 1024, D4);
-        assert!(
-            (600_000..=640_000).contains(&cc),
-            "nasa target-6 → ~614 KiB, got {cc}"
+    fn adaptive_fences_pathology_band_up_to_1mib() {
+        // BOUNDARY FENCE regression guard: a ratio that would place the raw
+        // adaptive spacing INSIDE the measured pathology band (≤672 KiB) must be
+        // fenced UP to the 1 MiB floor, never emitted as-is.
+        // ratio 15, target 8 MiB → 8 MiB/15 ≈ 559 KiB (right on monorepo's 560 KiB
+        // 4× spike) → fenced to 1 MiB.
+        let cc = adaptive_compressed_chunk_bytes(
+            150 * 1024 * 1024,
+            10 * 1024 * 1024,
+            8 * 1024 * 1024,
+            D4,
         );
+        assert_eq!(
+            cc, ADAPTIVE_MIN_CHUNK_BYTES,
+            "a ~559 KiB raw spacing must be fenced to the 1 MiB floor, got {cc}"
+        );
+    }
+
+    #[test]
+    fn adaptive_nasa_real_target_eight_fences_to_1mib() {
+        // The shipped 8 MiB target on the real nasa member (isize 205_242_368,
+        // comp 20_676_664, ratio 9.93) → raw ≈ 825 KiB, inside the band → the
+        // fence pins it to the 1 MiB floor. The win survives at 1 MiB (re-measured
+        // frozen-Intel: nasa-T4 wall within ~3% of the un-fenced 825 KiB, still a
+        // large win vs the 4 MiB base).
+        let cc = adaptive_compressed_chunk_bytes(205_242_368, 20_676_664, 8 * 1024 * 1024, D4);
+        assert_eq!(cc, ADAPTIVE_MIN_CHUNK_BYTES, "nasa@8MiB fenced to 1 MiB");
     }
 
     #[test]
