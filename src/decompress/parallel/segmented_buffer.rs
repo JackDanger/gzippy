@@ -38,6 +38,34 @@ use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 /// boundary. The clean buffer is one contiguous allocation.
 pub const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
+/// memcpy-append `src` onto `dst`.
+///
+/// `allocator_api2::Vec::extend_from_slice` is `self.extend(other.iter().cloned())`,
+/// and BOTH of allocator-api2 0.2.21's `Extend` impls (the generic `Extend<T>`
+/// AND the `Extend<&T>` one whose doc-comment *claims* `copy_from_slice`) are in
+/// fact SCALAR per-element `while next() { ptr::write; set_len(len+1) }` loops
+/// (vec/mod.rs:2704 & :2788). Assembling the chunk's clean output through that
+/// byte-by-byte path measured ~16% of T4-silesia instructions (perf attributed
+/// it to the inlined-into `finalize_with_deflate`/`append_clean_narrowed`
+/// symbol). rapidgzip's clean `DecodedData::append` is a `std::copy`/`insert`
+/// memcpy (DecodedData.hpp:282-289). Mirror that with `copy_nonoverlapping`.
+/// Byte-for-byte identical to the element loop.
+#[inline]
+pub(crate) fn buf_append_memcpy(dst: &mut U8, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    dst.reserve(src.len());
+    let len = dst.len();
+    // SAFETY: `reserve` guarantees `capacity() >= len + src.len()`; `src` is an
+    // external slice disjoint from `dst`'s allocation (non-overlapping copy); we
+    // initialize exactly `src.len()` fresh bytes before bumping the length.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(len), src.len());
+        dst.set_len(len + src.len());
+    }
+}
+
 /// TEST-ONLY reserved-tail poison (OPT-IN via `GZIPPY_POISON_RESERVE`). The
 /// clean-tail copy-free path writes u8 DIRECTLY into this reserved
 /// (uninitialized) spare and back-refs may resolve from it; a read-BEFORE-write
@@ -143,7 +171,7 @@ impl SegmentedU8 {
             return;
         }
         self.ensure_buf(ALLOCATION_CHUNK_SIZE);
-        self.buf.extend_from_slice(window);
+        buf_append_memcpy(&mut self.buf, window);
     }
 
     /// Mutable contiguous A3 decode window — a `[0, capacity)` view into
@@ -198,7 +226,7 @@ impl SegmentedU8 {
             return;
         }
         self.ensure_buf(bytes.len());
-        self.buf.extend_from_slice(bytes);
+        buf_append_memcpy(&mut self.buf, bytes);
     }
 
     /// Zero-copy decode sink: return a writable window (up to
@@ -381,7 +409,7 @@ impl SegmentedU8 {
                 let total: usize = segments.iter().map(|s| s.len()).sum();
                 let mut buf = types::u8_with_capacity(total.max(ALLOCATION_CHUNK_SIZE));
                 for s in &segments {
-                    buf.extend_from_slice(s);
+                    buf_append_memcpy(&mut buf, s);
                 }
                 Self { buf }
             }
@@ -466,8 +494,8 @@ impl SegmentedU8 {
         }
         let mut nb =
             types::u8_with_capacity((bytes.len() + self.buf.len()).max(ALLOCATION_CHUNK_SIZE));
-        nb.extend_from_slice(bytes);
-        nb.extend_from_slice(&self.buf);
+        buf_append_memcpy(&mut nb, bytes);
+        buf_append_memcpy(&mut nb, &self.buf);
         self.buf = nb;
     }
 
@@ -488,14 +516,14 @@ impl SegmentedU8 {
             // SAFETY: `resolve_and_narrow_in_place` wrote u8 at byte offsets
             // `[0, seg.len())` in this segment's storage.
             let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, take) };
-            nb.extend_from_slice(sl);
+            buf_append_memcpy(&mut nb, sl);
             left -= take;
         }
         debug_assert_eq!(
             left, 0,
             "prepend_narrowed_from_markers: short by {left} bytes"
         );
-        nb.extend_from_slice(&self.buf);
+        buf_append_memcpy(&mut nb, &self.buf);
         self.buf = nb;
     }
 
@@ -534,8 +562,8 @@ impl SegmentedU8 {
             return;
         }
         let tail = self.buf.split_off(offset);
-        self.buf.extend_from_slice(bytes);
-        self.buf.extend_from_slice(&tail);
+        buf_append_memcpy(&mut self.buf, bytes);
+        buf_append_memcpy(&mut self.buf, &tail);
     }
 
     /// Append the entire logical contents of `other` onto `self`, moving
@@ -549,7 +577,7 @@ impl SegmentedU8 {
             std::mem::swap(&mut self.buf, &mut other.buf);
             return;
         }
-        self.buf.extend_from_slice(&other.buf);
+        buf_append_memcpy(&mut self.buf, &other.buf);
         other.buf.clear();
     }
 }
