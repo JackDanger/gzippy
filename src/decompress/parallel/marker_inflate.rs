@@ -3944,11 +3944,47 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // word-copy DEVIATION but only when the rounded run also fits within
         // the undrained window: `(*pos - drained) + rounded <= RING_SIZE`.
         // Otherwise fall to the exact-length arms below (byte-identical).
+        // 16-byte (8-u16) WIDE path (2026-06-16): the measured back-ref length
+        // distribution is mean ≈ 6.3 u16, 98.6% < 16, 77% length 4-7 — so a
+        // SINGLE 16-byte unaligned store (`movups` on x86_64 SSE2, one `str q`
+        // on aarch64) finalises length ≤ 8 in ONE store where the 8-byte arm
+        // below needs two. This ~halves backref store instructions on the
+        // window-absent path. REQUIRES `distance >= 8` u16 so the 16-byte
+        // stride never aliases (src and dst are ≥ 16 bytes apart): each chunk
+        // read sees only ALREADY-FINALISED bytes — the exact `dist >= WORDBYTES`
+        // invariant `copy_match_fast` relies on, now at u128 width. The
+        // overshoot (≤ 7 u16) is bounded by the SAME three guards as the 8-byte
+        // arm, just rounded to a multiple of 8 u16: it stays inside the
+        // physical buffer AND inside the undrained window (the mono-gnu9 P0
+        // contract — see below), else we fall to the 8-byte / exact arms which
+        // are byte-identical to vendor's `memcpy(length*2)`.
+        let rounded16 = (length + 7) & !7;
+        let src_r16_fits = src_phys + rounded16 <= RING_SIZE;
+        let dst_r16_fits = dst_phys + rounded16 <= RING_SIZE;
+        let span_r16_fits = (*pos - drained) + rounded16 <= RING_SIZE;
         let rounded = (length + 3) & !3;
         let src_round_fits = src_phys + rounded <= RING_SIZE;
         let dst_round_fits = dst_phys + rounded <= RING_SIZE;
         let span_round_fits = (*pos - drained) + rounded <= RING_SIZE;
-        if distance >= 4 && src_round_fits && dst_round_fits && span_round_fits {
+        if distance >= 8 && src_r16_fits && dst_r16_fits && span_r16_fits {
+            // One 16-byte store covers length ≤ 8; the loop handles the rare
+            // long tail (≥ 9 u16). `u128` write_unaligned lowers to a single
+            // unaligned 128-bit vector store on x86_64 (SSE2 baseline) and
+            // aarch64 — portable, no arch-gated intrinsic needed.
+            let s = ring_ptr.add(src_phys) as *const u8;
+            let d = ring_ptr.add(dst_phys) as *mut u8;
+            (d as *mut u128).write_unaligned((s as *const u128).read_unaligned());
+            if length > 8 {
+                let mut s = s.add(16);
+                let mut d = d.add(16);
+                let dend = (ring_ptr.add(dst_phys + rounded16)) as *mut u8;
+                while d < dend {
+                    (d as *mut u128).write_unaligned((s as *const u128).read_unaligned());
+                    s = s.add(16);
+                    d = d.add(16);
+                }
+            }
+        } else if distance >= 4 && src_round_fits && dst_round_fits && span_round_fits {
             // One 8-byte word covers length ≤ 4; a second covers 5–8; the
             // loop handles the rare long tail (≥ 9 u16).
             let s = ring_ptr.add(src_phys) as *const u8;
@@ -5670,6 +5706,131 @@ mod tests {
                 "u8 word-copy rounding overshoot clobbered undrained byte {k} \
                  (clean-mode twin of the mono-gnu9 P0)"
             );
+        }
+    }
+
+    /// DIFFERENTIAL PROPTEST for the wide (16-byte / u128) back-ref copy
+    /// (2026-06-16). Drives `emit_backref_ring` directly across a broad random
+    /// space of (ring contents, pos, drained, distance, length, prior
+    /// distance_marker) and asserts byte-for-byte equality of the `length`
+    /// copied slots AND the recomputed marker counter against a NAIVE scalar
+    /// reference (sequential per-element ring copy = exact deflate semantics).
+    /// Covers the new `distance >= 8` wide path, the 8-byte arm, distance
+    /// 1/2/3 overlap + RLE, wrap-straddle, and the undrained overshoot guard.
+    ///
+    /// The ring is filled with FULL-range u16 (≈50% are >= MARKER_U16) so the
+    /// backward marker scan and the `distance_marker >= distance` fast path are
+    /// both exercised. `drained` is chosen behind `pos` with random headroom so
+    /// both the overshoot-fits (wide/word) and overshoot-doesn't-fit (exact
+    /// fallback) branches are hit.
+    fn naive_backref_ref(
+        ring: &[u16],
+        pos: usize,
+        distance: usize,
+        length: usize,
+        dm_in: usize,
+    ) -> (Vec<u16>, usize) {
+        const MARKER_U16: u16 = MAX_WINDOW_SIZE as u16;
+        let mut r = ring.to_vec();
+        let src_phys = (pos + RING_SIZE - distance) % RING_SIZE;
+        let dst_phys = pos % RING_SIZE;
+        for i in 0..length {
+            let v = r[(src_phys + i) % RING_SIZE];
+            r[(dst_phys + i) % RING_SIZE] = v;
+        }
+        // Counter: mirror emit_backref_ring's CONTAINS_MARKERS arm exactly.
+        let dm_out = if dm_in >= distance {
+            dm_in + length
+        } else {
+            let mut found = dm_in + length;
+            for k in 0..length {
+                let v = r[(pos + length - 1 - k) % RING_SIZE];
+                if v >= MARKER_U16 {
+                    found = k;
+                    break;
+                }
+            }
+            found
+        };
+        (r, dm_out)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 4000,
+            .. proptest::prelude::ProptestConfig::default()
+        })]
+
+        #[test]
+        fn emit_backref_ring_wide_copy_matches_naive_reference(
+            seed in proptest::prelude::any::<u64>(),
+            pos in 0usize..RING_SIZE,
+            headroom in 0usize..RING_SIZE,
+            distance_raw in 1usize..=MAX_WINDOW_SIZE,
+            length in 1usize..=258usize,
+            dm_in in 0usize..(2 * MAX_WINDOW_SIZE),
+        ) {
+            // distance must be <= pos (a back-ref can't reach before the
+            // stream start) for the logical ring math to be meaningful here;
+            // clamp into [1, max(1, min(pos, MAX_WINDOW_SIZE))].
+            let dmax = pos.min(MAX_WINDOW_SIZE).max(1);
+            let distance = (distance_raw % dmax).max(1);
+            let drained = pos.saturating_sub(headroom);
+
+            // Random full-range ring (≈50% markers) from a cheap LCG seed.
+            let mut ring = vec![0u16; RING_SIZE];
+            let mut rng = seed | 1;
+            for v in ring.iter_mut() {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *v = (rng >> 33) as u16;
+            }
+
+            let (ref_ring, ref_dm) = naive_backref_ref(&ring, pos, distance, length, dm_in);
+
+            // ── CONTAINS_MARKERS = true ──
+            {
+                let mut work = ring.clone();
+                let mut p = pos;
+                let mut dm = dm_in;
+                unsafe {
+                    emit_backref_ring::<true>(
+                        work.as_mut_ptr(), &mut p, drained, distance, length, &mut dm,
+                    );
+                }
+                proptest::prop_assert_eq!(p, pos + length, "pos advance");
+                proptest::prop_assert_eq!(dm, ref_dm, "distance_marker counter");
+                let dst_phys = pos % RING_SIZE;
+                for i in 0..length {
+                    let slot = (dst_phys + i) % RING_SIZE;
+                    proptest::prop_assert_eq!(
+                        work[slot], ref_ring[slot],
+                        "copied slot {} (i={}) dist={} len={} pos={} drained={}",
+                        slot, i, distance, length, pos, drained
+                    );
+                }
+            }
+
+            // ── CONTAINS_MARKERS = false (counter compile-eliminated; copy identical) ──
+            {
+                let mut work = ring.clone();
+                let mut p = pos;
+                let mut dm = dm_in;
+                unsafe {
+                    emit_backref_ring::<false>(
+                        work.as_mut_ptr(), &mut p, drained, distance, length, &mut dm,
+                    );
+                }
+                proptest::prop_assert_eq!(p, pos + length, "pos advance (false arm)");
+                let dst_phys = pos % RING_SIZE;
+                for i in 0..length {
+                    let slot = (dst_phys + i) % RING_SIZE;
+                    proptest::prop_assert_eq!(
+                        work[slot], ref_ring[slot],
+                        "copied slot {} (false arm) dist={} len={} pos={}",
+                        slot, distance, length, pos
+                    );
+                }
+            }
         }
     }
 
