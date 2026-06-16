@@ -1788,6 +1788,21 @@ impl Block {
         // marker-mode-only paperwork stops being paid at all on
         // chunks that have already switched to clean mode.
         let mut distance_marker = self.ring.distance_to_last_marker;
+        // Hoist the per-backref sparsity-tracking dispatch out of the per-symbol
+        // loop. `track_backreferences` is CONSTANT for the duration of this
+        // `read()` (only `set_track_backreferences` mutates it, never mid-decode),
+        // and defaults to `false` in production — it is set `true` only by the
+        // non-production `used_window_symbols` analysis path. When `false`,
+        // `record_backreference_for_sparsity` is a no-op early-return, yet at the
+        // base it stays an out-of-line CALL per back-reference (perf-annotate:
+        // marker_inflate.rs:825 `if !self.track_backreferences` = 0.92% + the two
+        // call sites = ~1.1%, pure prologue/epilogue + arg-spill rg never pays —
+        // vendor has no sparsity tracking). Snapshotting it here lets the hot loop
+        // guard the call with a single hoistable bool (predictably-false in
+        // production), removing the per-backref dispatch entirely on the common
+        // path. Byte-exact: `false` ⇒ the function did nothing anyway; `true` ⇒
+        // the guarded call is identical to the unconditional one.
+        let track_backref = self.track_backreferences;
 
         macro_rules! commit {
             ($result:expr) => {{
@@ -2355,7 +2370,11 @@ impl Block {
                                         &mut distance_marker,
                                     );
                                 }
-                                self.record_backreference_for_sparsity(distance, length, emitted);
+                                if track_backref {
+                                    self.record_backreference_for_sparsity(
+                                        distance, length, emitted,
+                                    );
+                                }
                                 emitted += length;
                             }
                         }
@@ -2587,7 +2606,9 @@ impl Block {
                         emit_backref_ring_u8(ring8, &mut pos, drained, distance, length);
                     }
                 }
-                self.record_backreference_for_sparsity(distance, length, emitted);
+                if track_backref {
+                    self.record_backreference_for_sparsity(distance, length, emitted);
+                }
                 emitted += length;
                 break;
             }
