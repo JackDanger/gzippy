@@ -3,7 +3,7 @@
 #
 # ONE command: freeze the box, run every requested cell's wall interleave +
 # trace/prof captures + in-tree kill-switch knob A/Bs on the guest, pull the
-# artifacts back, and render the ONE ranked decision table (fulcrum_decide.py)
+# artifacts back, and render the ONE ranked decision table (`fulcrum decide`)
 # ending in a DO-THIS-NEXT line.
 #
 # Usage:
@@ -34,6 +34,14 @@ KNOB_FILTER=""
 N=9; KNOB_N=7; DO_KNOBS=1; DO_LOCK=1; DRY=0; ALLOW_THAW=0
 ANALYZE_ONLY=""
 HOST_FROZEN="${HOST_FROZEN:-0}"
+# Comparator champions beside rapidgzip (gzippy = SUBJECT, ranked vs EACH). Paths
+# come from guest.env (overridable per run). DO_COMP=0 reverts to the pure gz<->rg
+# matrix. AA_N = per-tool A/A self-stability iterations.
+DO_COMP="${DO_COMP:-1}"; DO_COMP_AA="${DO_COMP_AA:-1}"; AA_N="${AA_N:-5}"
+COMP_LIBDEFLATE="${COMP_LIBDEFLATE:-/usr/bin/libdeflate-gunzip}"
+COMP_IGZIP="${COMP_IGZIP:-/usr/bin/igzip}"
+COMP_ZLIBNG="${COMP_ZLIBNG:-}"
+COMP_PIGZ="${COMP_PIGZ:-/usr/bin/pigz}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -46,6 +54,10 @@ while [ "$#" -gt 0 ]; do
     --knob-cells) KNOB_CELLS="$2"; shift;;
     --knob-cells=*) KNOB_CELLS="${1#*=}";;
     --no-knobs) DO_KNOBS=0;;
+    --no-comp) DO_COMP=0;;
+    --no-comp-aa) DO_COMP_AA=0;;
+    --aa-n) AA_N="$2"; shift;;
+    --aa-n=*) AA_N="${1#*=}";;
     --knobs) KNOB_FILTER="$2"; shift;;
     --knobs=*) KNOB_FILTER="${1#*=}";;
     -N) N="$2"; shift;;
@@ -66,7 +78,17 @@ done
 
 RUNID="decide_$(date -u '+%Y%m%dT%H%M%SZ')"
 LOCAL_ART="$ROOT/artifacts/decide/$RUNID"
-ANALYZER=(python3 "$ROOT/scripts/fulcrum_decide.py")
+# Analyzer = the Rust `fulcrum decide` (the Python decide/ engine was removed
+# 2026-06-15 after a clean whole-pipeline cross-check). It reads FULCRUM_LEDGER.
+FULCRUM_HOME="${FULCRUM_HOME:-$HOME/www/fulcrum}"
+FULCRUM_BIN="${FULCRUM_BIN:-$FULCRUM_HOME/target/release/fulcrum}"
+if [ ! -x "$FULCRUM_BIN" ]; then
+  echo "decide.sh: Rust fulcrum binary not found at $FULCRUM_BIN" >&2
+  echo "  Build it: cd '$FULCRUM_HOME' && cargo build --release  (or set FULCRUM_BIN)" >&2
+  exit 1
+fi
+export FULCRUM_LEDGER="${FULCRUM_LEDGER:-$ROOT/artifacts/fulcrum/ledger.jsonl}"
+ANALYZER=("$FULCRUM_BIN" decide)
 [ "$ALLOW_THAW" = 1 ] && ANALYZER+=(--allow-thaw)
 
 if [ -n "$ANALYZE_ONLY" ]; then
@@ -78,6 +100,9 @@ remote_env() {
 GUEST_SRC='$GUEST_SRC' BIN='$BIN' FEATURE='$FEATURE' CELLS='$CELLS' \
 N='$N' KNOB_N='$KNOB_N' DO_KNOBS='$DO_KNOBS' KNOB_CELLS='$KNOB_CELLS' \
 KNOB_FILTER='$KNOB_FILTER' \
+DO_COMP='$DO_COMP' DO_COMP_AA='$DO_COMP_AA' AA_N='$AA_N' \
+COMP_LIBDEFLATE='$COMP_LIBDEFLATE' COMP_IGZIP='$COMP_IGZIP' \
+COMP_ZLIBNG='$COMP_ZLIBNG' COMP_PIGZ='$COMP_PIGZ' \
 ARTDIR='${ARTDIR_BASE}/decide' RUNID='$RUNID' RG='$RG' RG_TRACE='$RG_TRACE' \
 GOV='$GOV' NO_TURBO='$NO_TURBO' HOST_FROZEN='$HOST_FROZEN' \
 ALLOW_LOAD='${ALLOW_LOAD:-0}' CORPUS_RAW_SHA256='$CORPUS_RAW_SHA256'
@@ -88,9 +113,20 @@ if [ "$DRY" = 1 ]; then
   echo "## DRY-RUN — plan only, nothing executed"
   echo "bin=$BIN feature=$FEATURE cells=$CELLS knobs=$DO_KNOBS knob_cells=$KNOB_CELLS N=$N knob_n=$KNOB_N"
   echo "guest artifacts: ${ARTDIR_BASE}/decide/$RUNID  ->  local $LOCAL_ART"
+  if [ "$DO_COMP" = 1 ]; then
+    echo "comparator arms (gzippy=SUBJECT, ranked vs EACH at bar 0.99x; same SINK_C regular-file sink as gz/rg):"
+    echo "  - rapidgzip  : $RG  (-d -c -f -P <T>)                 [primary; existing arm]"
+    echo "  - libdeflate : $COMP_LIBDEFLATE  (-c <f>)             [single-shot champion]"
+    echo "  - igzip      : $COMP_IGZIP  (-d -c <f>)               [ISA-L single-shot]"
+    echo "  - zlibng     : ${COMP_ZLIBNG:-<unset — minigzip absent on guest; build & set COMP_ZLIBNG>}  (-d < <f>)"
+    echo "  - pigz       : $COMP_PIGZ  (-d -c -p <T> <f>)         [parallel champion]"
+    echo "  each present tool: interleaved wall (sha-verified) + A/A self-stability (AA_N=$AA_N); absent => comp_absent, skipped"
+  else
+    echo "comparator arms: DISABLED (--no-comp) — pure gzippy<->rapidgzip matrix"
+  fi
   echo "remote env: $(remote_env | tr '\n' ' ')"
-  echo "runtime estimate: walls ~N*(gz+rg) per cell; knobs ~KNOB_N*2*wall per knob per knob-cell;"
-  echo "  defaults on silesia+model fit well inside the 1800s freeze TTL."
+  echo "runtime estimate: walls ~N*(gz+rg+#comp) per cell; A/A ~AA_N*2*#comp per cell;"
+  echo "  knobs ~KNOB_N*2*wall per knob per knob-cell; defaults on silesia+model fit inside the 1800s freeze TTL."
   exit 0
 fi
 

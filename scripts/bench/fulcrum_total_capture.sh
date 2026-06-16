@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # fulcrum_total_capture.sh — capture a trace + matching counter sidecar for
-# scripts/fulcrum_total.py, WITHOUT seeding (production routing preserved).
+# `scripts/fulcrum total` (the Rust analyzer), WITHOUT seeding (production
+# routing preserved).
 #
 # This is the companion capture for the trustworthy whole-system instrument. It
 # produces TWO files per label so the analyzer can verify window-absent routing:
 #   ARTDIR/trace_<label>.json     (GZIPPY_TIMELINE — the Chrome-trace timeline)
 #   ARTDIR/verbose_<label>.txt    (GZIPPY_VERBOSE stderr — the counter sidecar)
-# fulcrum_total.py auto-detects verbose_<label>.txt next to trace_<label>.json.
+# `fulcrum total` auto-detects verbose_<label>.txt next to trace_<label>.json.
 #
 # CRITICAL: this script does NOT set GZIPPY_SEED_WINDOWS and does NOT set the
 # ISA-L engine oracle. Seeding routes to the clean engine and MASKS the binder;
@@ -17,7 +18,7 @@
 #   bash scripts/bench/fulcrum_total_capture.sh LABEL=gzippy_T8 T=8 \
 #        CORPUS=/root/gzippy/benchmark_data/silesia-large.gz ARTDIR=/root/ft-art
 #   # then, on any host with the trace pulled down:
-#   python3 scripts/fulcrum_total.py /root/ft-art/trace_gzippy_T8.json
+#   scripts/fulcrum total /root/ft-art/trace_gzippy_T8.json
 #
 # To capture an ORACLE/SEEDED run ON PURPOSE (for a ceiling, never as production),
 # set SEED=1 — the sidecar will record it and the analyzer will correctly REFUSE
@@ -93,4 +94,4 @@ echo "OK trace=$TRACE verbose=$VERB out_sha=$OUT_SHA (==ref)"
 echo "## counter sidecar (routing-relevant lines):"
 grep -E 'window_seeded|flip_to_clean|finished_no_flip|isal_oracle' "$VERB" || true
 echo ""
-echo "## analyze with:  python3 scripts/fulcrum_total.py $TRACE"
+echo "## analyze with:  scripts/fulcrum total $TRACE"

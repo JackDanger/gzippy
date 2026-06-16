@@ -1,0 +1,428 @@
+{
+  "base": {
+    "label": "base",
+    "samples": [
+      {
+        "cycles": 1427518138.0,
+        "instructions": 3013199442.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1427413460.0,
+        "instructions": 3016528526.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1428841002.0,
+        "instructions": 3019063324.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1423400812.0,
+        "instructions": 3010121122.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1424146470.0,
+        "instructions": 3016510110.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1427744531.0,
+        "instructions": 3017331911.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1426089225.0,
+        "instructions": 3020486963.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1435357956.0,
+        "instructions": 3013928611.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1428849690.0,
+        "instructions": 3016250352.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1431615925.0,
+        "instructions": 3016915045.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1435625715.0,
+        "instructions": 3021165953.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1435390506.0,
+        "instructions": 3019781077.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1431736931.0,
+        "instructions": 3018045173.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      }
+    ],
+    "sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f"
+  },
+  "after": {
+    "label": "after",
+    "samples": [
+      {
+        "cycles": 1403702149.0,
+        "instructions": 3060262703.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1403208487.0,
+        "instructions": 3062891440.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1402404747.0,
+        "instructions": 3065736120.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1400194754.0,
+        "instructions": 3064589464.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1401305459.0,
+        "instructions": 3065321603.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1402712644.0,
+        "instructions": 3069271021.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1406152821.0,
+        "instructions": 3067204874.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1407030354.0,
+        "instructions": 3063270402.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1413963894.0,
+        "instructions": 3066432015.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1409770108.0,
+        "instructions": 3066942855.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1409510735.0,
+        "instructions": 3068955410.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1407667282.0,
+        "instructions": 3075655582.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1406771278.0,
+        "instructions": 3064944946.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      }
+    ],
+    "sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f"
+  },
+  "rg": {
+    "label": "rapidgzip",
+    "samples": [
+      {
+        "cycles": 1245632172.0,
+        "instructions": 2753397591.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1229006387.0,
+        "instructions": 2760255797.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1228231224.0,
+        "instructions": 2762348181.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1224670517.0,
+        "instructions": 2758474657.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1226997637.0,
+        "instructions": 2762806050.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1229461957.0,
+        "instructions": 2761383203.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1233904618.0,
+        "instructions": 2765358358.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1241447266.0,
+        "instructions": 2761114347.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1241231763.0,
+        "instructions": 2764069135.0,
+        "bytes": 211968000.0,
+        "procs_running": 3.0
+      },
+      {
+        "cycles": 1231766896.0,
+        "instructions": 2763137549.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1237929626.0,
+        "instructions": 2762049367.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1232903109.0,
+        "instructions": 2766585518.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1233378801.0,
+        "instructions": 2758635953.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      }
+    ]
+  },
+  "reference_sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "clean_base": {
+    "label": "clean_base",
+    "samples": [
+      {
+        "cycles": 1425728225.0,
+        "instructions": 3015703880.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1422923175.0,
+        "instructions": 3019397466.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1431830948.0,
+        "instructions": 3019072962.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1428089573.0,
+        "instructions": 3016674620.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1425055067.0,
+        "instructions": 3019061041.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1430074056.0,
+        "instructions": 3018839953.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1435370539.0,
+        "instructions": 3015356278.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1432699422.0,
+        "instructions": 3017945451.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1431451281.0,
+        "instructions": 3022580935.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1434424257.0,
+        "instructions": 3017176751.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1435621389.0,
+        "instructions": 3019311931.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1429805344.0,
+        "instructions": 3020954114.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1428144408.0,
+        "instructions": 3016217856.0,
+        "bytes": 211968000.0,
+        "procs_running": 4.0
+      }
+    ],
+    "sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f"
+  },
+  "clean_after": {
+    "label": "clean_after",
+    "samples": [
+      {
+        "cycles": 1405796643.0,
+        "instructions": 3063778889.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1398677501.0,
+        "instructions": 3064375247.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1403013629.0,
+        "instructions": 3061904386.0,
+        "bytes": 211968000.0,
+        "procs_running": 3.0
+      },
+      {
+        "cycles": 1397355682.0,
+        "instructions": 3063696125.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1404619767.0,
+        "instructions": 3066412031.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1401058276.0,
+        "instructions": 3066812605.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1418415703.0,
+        "instructions": 3063825752.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1407600694.0,
+        "instructions": 3067149121.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1405267174.0,
+        "instructions": 3064946568.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1406693648.0,
+        "instructions": 3068232847.0,
+        "bytes": 211968000.0,
+        "procs_running": 2.0
+      },
+      {
+        "cycles": 1407672230.0,
+        "instructions": 3066417068.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1408014243.0,
+        "instructions": 3069481441.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      },
+      {
+        "cycles": 1405970944.0,
+        "instructions": 3067395035.0,
+        "bytes": 211968000.0,
+        "procs_running": 1.0
+      }
+    ],
+    "sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f"
+  },
+  "k": 1.0,
+  "clean_k": 1.0,
+  "arch": "intel-i7-13700T",
+  "cross_arch_replicated": false,
+  "base_commit": "b22e1b14",
+  "after_commit": "b22e1b14-SINGLE997"
+}

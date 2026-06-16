@@ -59,10 +59,30 @@ use std::sync::OnceLock;
 /// counting is disabled, so it is perf-transparent unless `GZIPPY_SLOW_HITS=1`.
 static HIT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// MARKER-SITE-VALIDITY hit counter (instrument-validation only). Counts the
+/// number of u16 MARKER-mode (`CONTAINS_MARKERS == true`) careful-loop decode
+/// events that pass through [`marker_inject`]. DISTINCT from [`HIT_COUNTER`]
+/// (which counts the clean `<false>` careful-loop events) — the two never share
+/// a site, so a non-zero value here PROVES the marker knob fired on the
+/// marker-mode decode path SPECIFICALLY (not the clean contig loop). Reported by
+/// [`report_hits`] when `GZIPPY_SLOW_MARKER_HITS=1`.
+static MARKER_HIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 fn count_hits() -> bool {
     static C: OnceLock<bool> = OnceLock::new();
     *C.get_or_init(|| matches!(std::env::var("GZIPPY_SLOW_HITS").ok().as_deref(), Some("1")))
+}
+
+#[inline]
+fn count_marker_hits() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| {
+        matches!(
+            std::env::var("GZIPPY_SLOW_MARKER_HITS").ok().as_deref(),
+            Some("1")
+        )
+    })
 }
 
 /// Print the clean-loop decode-event hit count when `GZIPPY_SLOW_HITS=1`. Call
@@ -72,6 +92,12 @@ pub fn report_hits() {
         eprintln!(
             "[slow_knob] clean-loop inject hits = {}",
             HIT_COUNTER.load(Ordering::Relaxed)
+        );
+    }
+    if count_marker_hits() {
+        eprintln!(
+            "[slow_knob] marker-loop inject hits = {}",
+            MARKER_HIT_COUNTER.load(Ordering::Relaxed)
         );
     }
 }
@@ -376,6 +402,22 @@ pub fn mfast_spin_iters() -> u64 {
 /// `spin == 0` (OFF) returns immediately — the single hoistable branch. The
 /// busy work only mutates a black-boxed local accumulator, so it is
 /// byte-transparent; `black_box` prevents the optimizer from deleting it.
+/// MARKER-mode twin of [`inject`]. Identical injection mechanism (byte-transparent
+/// spin / frequency-neutral sleep), but its site-validity counter is the
+/// MARKER-specific [`MARKER_HIT_COUNTER`] (gated on `GZIPPY_SLOW_MARKER_HITS=1`),
+/// NOT the clean-path [`HIT_COUNTER`]. Call this ONLY from the `CONTAINS_MARKERS`
+/// (u16 marker) careful-loop inject site so a non-zero counter PROVES the marker
+/// knob fired on the marker decode path specifically. `spin == 0` (OFF) is a
+/// single hoistable branch — perf-transparent on the production marker path.
+#[inline(always)]
+#[allow(dead_code)] // instrument: only reached from the feature-gated marker decode loop
+pub fn marker_inject(spin: u64, yield_hint: bool) {
+    if count_marker_hits() {
+        MARKER_HIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
+    inject_localize(spin, yield_hint);
+}
+
 #[inline(always)]
 pub fn inject(spin: u64, yield_hint: bool) {
     // SITE-VALIDITY counter (TASK 1): only active when GZIPPY_SLOW_HITS=1, so

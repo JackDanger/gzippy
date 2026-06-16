@@ -446,7 +446,7 @@ if [ "$DO_FULCRUM" = 1 ]; then
     bash scripts/bench/fulcrum_total_capture.sh \
       LABEL="parity_T${T}" T="$T" CORPUS="$CORPUS" ARTDIR="$ARTDIR" GZIPPY="$GZIPPY_BIN" \
       || echo "## WARN: fulcrum capture failed (non-fatal; parity number above stands)"
-    echo "## analyze on any host:  python3 scripts/fulcrum_total.py $ARTDIR/trace_parity_T${T}.json"
+    echo "## analyze on any host:  scripts/fulcrum total $ARTDIR/trace_parity_T${T}.json"
   else
     echo "## WARN: scripts/bench/fulcrum_total_capture.sh absent — skipping decompose"
   fi

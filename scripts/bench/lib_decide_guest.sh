@@ -15,17 +15,23 @@ decide_fail() { echo "DECIDE_FAIL=$1"; echo "DECIDE_GUEST_DONE"; exit "${2:-1}";
 # VERBATIM-FROM parity.sh:94-101 (pin_mask — the canonical mask convention;
 # free-placement numbers lie, so every run goes through this).
 pin_mask() {
+  # CLEAN P-CORE POOL (neurotic, re-derived from `lscpu -e` 2026-06-15):
+  # the box has only 7 ONLINE distinct physical P-cores. Their thread_siblings
+  # map (logical CPU -> physical core):
+  #   cpu0->core0 (sib cpu1 OFFLINE), cpu2->core1, cpu4->core2,
+  #   cpu8->core4 (sib cpu9 OFFLINE), cpu10->core5 (sib cpu11 OFFLINE),
+  #   cpu12->core6, cpu14->core7.  (core3 fully OFFLINE: cpu6,cpu7 down.)
+  # So the legacy "0,2,4,6,..." mask was BROKEN — cpu6 is OFFLINE. The clean
+  # pool of 7 distinct physical cores, no SMT-sibling overlap, is:
+  POOL="0,2,4,8,10,12,14"
   case "$1" in
-    1) echo "0";; 4) echo "0,2,4,6";;
-    8) echo "0,2,4,6,8,10,12,14";;
-    # T12 (user-added cell): on neurotic (i7-13700T, container=16 logical = the 8
-    # P-cores x2 SMT; E-cores 16-23 excluded) this is the 8 physical P-cores
-    # (0,2,4,6,8,10,12,14) + 4 SMT siblings (1,3,5,7) = 12 logical, mirroring the
-    # physical-first discipline of T8. CONFIRM the readback mask per cell via
-    # lscpu/mask_readback at fill time and record it (thread_mask). On a wider AMD
-    # box (solvency, 32 cores) these are 12 valid symmetric CPU indices.
-    12) echo "0,1,2,3,4,5,6,7,8,10,12,14";;
-    16) echo "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15";;
+    1) echo "0";;
+    2) echo "0,2";;
+    4) echo "0,2,4,8";;
+    7) echo "$POOL";;
+    # T8 OVERSUBSCRIBES the 7-core box (8 threads / 7 physical cores) -> the 8th
+    # CPU (3) is an SMT sibling of cpu2's core. Documented-void only; do not bank.
+    8) echo "0,2,3,4,8,10,12,14";;
     *) echo "";;
   esac
 }
@@ -95,22 +101,29 @@ mask_readback() { # <requested-mask> -> kernel-canonical affinity list (or empty
 # with the appended rss (caught live: false SHA DIVERGENCE on a correct pin).
 # Stale claim removed: it is NOT safe to ignore the
 # third field. Knob callers read the third field as rss_mb for meta.txt rendering.
-timed_masked() { # <mask> <sink> <cmd...> -> echoes "secs sha rss_mb"
+timed_masked() { # <mask> <sink> <cmd...> -> echoes "secs sha rss_mb pcpu"
+  # EXTENSION (matrix P column): also capture GNU time's %P (Percent of CPU =
+  # (user+sys)/elapsed*100). On a freeze-pinned fixed-freq box this is the
+  # avg-busy-CPUs proxy P=pcpu/100 (task_clock/elapsed) — the parallel-starvation
+  # signal. Captured in the SAME measured run (no extra pass); both arms wrapped
+  # identically so the gz/rg wall RATIO is unperturbed. 4th field is additive;
+  # 3-var `read` callers ignore it (last var slurps remainder, unused).
   local mask="$1" sink="$2"; shift 2
-  local s e secs sha rc rss_mb=0 _tfile
+  local s e secs sha rc rss_mb=0 pcpu=0 _tfile
   _tfile=$(mktemp /tmp/.decide_rss_XXXXXX)
   s=$(date +%s.%N)
   set +e
-  /usr/bin/time -f '%M' -o "$_tfile" taskset -c "$mask" "$@" >"$sink" 2>>"$ARTDIR/run.stderr"
+  /usr/bin/time -f '%M %P' -o "$_tfile" taskset -c "$mask" "$@" >"$sink" 2>>"$ARTDIR/run.stderr"
   rc=$?
   set -e 2>/dev/null || true
   e=$(date +%s.%N)
   secs=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.4f", b-a}')
   sha=$(sha256sum "$sink" | cut -d' ' -f1)
   rss_mb=$(awk 'NR==1 && $1~/^[0-9]+$/{printf "%.0f", $1/1024}' "$_tfile" 2>/dev/null || echo 0)
+  pcpu=$(awk 'NR==1{p=$2; gsub(/%/,"",p); if(p ~ /^[0-9.]+$/) printf "%.0f", p; else print 0}' "$_tfile" 2>/dev/null || echo 0)
   rm -f "$_tfile"
   [ "$rc" -eq 0 ] || echo "## WARN exit=$rc: $*" >&2
-  echo "$secs $sha $rss_mb"
+  echo "$secs $sha $rss_mb $pcpu"
 }
 
 # VERBATIM-FROM _parity_guest.sh:326-332 (min/med/spread% over a sample string).

@@ -2434,7 +2434,16 @@ impl Block {
             }
             // One slow-knob injection per decode event (this outer iteration =
             // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
-            super::slow_knob::inject(slow_spin, slow_yield);
+            // Const-generic split: the u16 marker specialization uses
+            // `marker_inject` (whose site-validity counter is the MARKER-specific
+            // GZIPPY_SLOW_MARKER_HITS), the clean `<false>` specialization keeps
+            // the original `inject` (GZIPPY_SLOW_HITS). The branch const-folds to a
+            // single call per specialization, so this is perf-transparent.
+            if CONTAINS_MARKERS {
+                super::slow_knob::marker_inject(slow_spin, slow_yield);
+            } else {
+                super::slow_knob::inject(slow_spin, slow_yield);
+            }
             // Single refill at the top of the outer iteration. After
             // `bits.refill()` returns, `bits.available()` is in
             // [56, 63] (libdeflate-style refill rounds DOWN to a
