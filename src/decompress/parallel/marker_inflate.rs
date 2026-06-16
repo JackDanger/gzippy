@@ -4111,10 +4111,46 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // Scan backward through the just-written `length` u16 slots.
         const MARKER_U16: u16 = MAX_WINDOW_SIZE as u16;
         if dst_phys + length <= RING_SIZE {
-            let slice = std::slice::from_raw_parts(ring_ptr.add(dst_phys), length);
-            for (k, &v) in slice.iter().rev().enumerate() {
-                if v >= MARKER_U16 {
-                    *distance_marker = k;
+            // Branchless backward marker scan — PROVABLY EQUIVALENT to the
+            // scalar `slice.iter().rev()` it replaces. A u16 is a marker iff its
+            // high bit is set (`v >= MARKER_U16`, and `MARKER_U16 == 0x8000` is
+            // exactly the u16 sign bit), so 4 contiguous u16 pack into one
+            // unaligned u64 whose per-lane high bits are isolated by the mask
+            // `0x8000_8000_8000_8000`. We walk the just-written region from the
+            // HIGH (latest) end in 4-u16 (u64) strides; the FIRST stride with any
+            // high bit set holds the LAST (highest-index) marker — `from_le`
+            // normalises lane order so lane 0 is the lowest index, and
+            // `63 - leading_zeros()` picks the highest set lane (= highest index
+            // = the marker the rev-scan would have stopped on). `distance_marker`
+            // is then `length - 1 - global_index` (matching the scalar `k`, since
+            // there `index == length - 1 - k`); the sub-4 low-end remainder and
+            // the no-marker `+= length` fall through exactly as before.
+            //
+            // This collapses a chain of up-to-`length` dependent single-u16
+            // loads/compares into one u64 load + mask + lzcnt per 4 elements. AVX2
+            // (`_mm256`) was deliberately NOT used: 98.6% of back-refs have
+            // length < 16 (measured distribution above) and the scan early-exits,
+            // so vector setup + GPR-transfer cost would dominate (external review
+            // concurred) — a GPR-width bitmask is the right granularity here.
+            const MARKER_LANES: u64 = 0x8000_8000_8000_8000;
+            let base = ring_ptr.add(dst_phys);
+            let mut hi = length;
+            while hi >= 4 {
+                let chunk = hi - 4;
+                let w = u64::from_le((base.add(chunk) as *const u64).read_unaligned());
+                let m = w & MARKER_LANES;
+                if m != 0 {
+                    let lane = (63 - m.leading_zeros()) as usize / 16;
+                    *distance_marker = length - 1 - (chunk + lane);
+                    return;
+                }
+                hi = chunk;
+            }
+            // Low-end remainder (< 4 u16), scanned high → low.
+            while hi > 0 {
+                hi -= 1;
+                if *base.add(hi) >= MARKER_U16 {
+                    *distance_marker = length - 1 - hi;
                     return;
                 }
             }
@@ -5860,6 +5896,63 @@ mod tests {
                         slot, distance, length, pos
                     );
                 }
+            }
+        }
+    }
+
+    /// Deterministic OFF-BY-ONE battery for the branchless u64 backward
+    /// marker scan (2026-06-16). Drives `emit_backref_ring::<true>` through the
+    /// non-wrap branch with EXACT marker placements — no markers, all markers,
+    /// single marker at the first / last / each interior copied index — across
+    /// every length boundary (1..=3 below the u64 stride, 4 exact stride, 5..=8,
+    /// the 15/16/17 stride+tail seam, and 258 max) and verifies `distance_marker`
+    /// equals the proven scalar `naive_backref_ref`. The off-by-one is the #1
+    /// risk: `distance_marker == length - 1 - last_marker_index`.
+    #[test]
+    fn backref_marker_scan_offbyone_boundaries() {
+        const MARKER: u16 = MAX_WINDOW_SIZE as u16; // 0x8000, a marker
+        const CLEAN: u16 = 0x1234; // < MARKER_U16, not a marker
+        let pos = 40_000usize; // mid-ring: non-wrap, src/dst both in [0, RING_SIZE)
+        for &length in &[1usize, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 258] {
+            let distance = length; // non-overlap, distance >= length
+                                   // Enumerate marker patterns over the COPIED region [0, length):
+                                   //   - all clean, all marker, and a single marker at each index.
+            let mut patterns: Vec<Vec<bool>> = vec![vec![false; length], vec![true; length]];
+            for one in 0..length {
+                let mut p = vec![false; length];
+                p[one] = true;
+                patterns.push(p);
+            }
+            for pat in patterns {
+                // The copied region [pos, pos+length) is sourced from
+                // [pos-distance, pos). Place the desired markers THERE so the
+                // copy reproduces `pat` at the destination.
+                let mut ring = vec![CLEAN; RING_SIZE];
+                let src_phys = pos - distance;
+                for (i, &is_marker) in pat.iter().enumerate() {
+                    ring[src_phys + i] = if is_marker { MARKER } else { CLEAN };
+                }
+                let dm_in = 0usize; // < distance ⇒ fast path NOT taken, scan runs
+                let (_ref_ring, ref_dm) = naive_backref_ref(&ring, pos, distance, length, dm_in);
+                let mut work = ring.clone();
+                let mut p = pos;
+                let mut dm = dm_in;
+                unsafe {
+                    emit_backref_ring::<true>(
+                        work.as_mut_ptr(),
+                        &mut p,
+                        distance, /*drained*/
+                        distance,
+                        length,
+                        &mut dm,
+                    );
+                }
+                assert_eq!(p, pos + length, "pos advance len={}", length);
+                assert_eq!(
+                    dm, ref_dm,
+                    "distance_marker len={} pattern={:?}",
+                    length, pat
+                );
             }
         }
     }
