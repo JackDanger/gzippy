@@ -1,0 +1,40 @@
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=9819846 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=9819846
+[parallel_sm] isize=50915328 comp_len=9819846 ratio=5.185 chunk_size=524288 (~512 KiB) est_chunks=19
+gzippy: stored-flip case1-ge-window uncompressed_size=51542
+gzippy: stored-flip case1-ge-window uncompressed_size=50707
+gzippy: stored-flip case1-ge-window uncompressed_size=57999
+[parallel_sm:v0.6] total=99.4ms isize=50915328 (512 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=9819846 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=9819846
+[parallel_sm] isize=50915328 comp_len=9819846 ratio=5.185 chunk_size=524288 (~512 KiB) est_chunks=19
+gzippy: stored-flip case1-ge-window uncompressed_size=51542
+gzippy: stored-flip case1-ge-window uncompressed_size=50707
+gzippy: stored-flip case1-ge-window uncompressed_size=57999
+[parallel_sm:v0.6] total=101.9ms isize=50915328 (500 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=9819846 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=9819846
+[parallel_sm] isize=50915328 comp_len=9819846 ratio=5.185 chunk_size=524288 (~512 KiB) est_chunks=19
+gzippy: stored-flip case1-ge-window uncompressed_size=51542
+gzippy: stored-flip case1-ge-window uncompressed_size=50707
+gzippy: stored-flip case1-ge-window uncompressed_size=57999
+[parallel_sm:v0.6] total=102.7ms isize=50915328 (496 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=9819846 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=9819846
+[parallel_sm] isize=50915328 comp_len=9819846 ratio=5.185 chunk_size=524288 (~512 KiB) est_chunks=19
+gzippy: stored-flip case1-ge-window uncompressed_size=51542
+gzippy: stored-flip case1-ge-window uncompressed_size=50707
+gzippy: stored-flip case1-ge-window uncompressed_size=57999
+[parallel_sm:v0.6] total=95.4ms isize=50915328 (534 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=9819846 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=9819846
+[parallel_sm] isize=50915328 comp_len=9819846 ratio=5.185 chunk_size=524288 (~512 KiB) est_chunks=19
+gzippy: stored-flip case1-ge-window uncompressed_size=51542
+gzippy: stored-flip case1-ge-window uncompressed_size=50707
+gzippy: stored-flip case1-ge-window uncompressed_size=57999
+[parallel_sm:v0.6] total=103.0ms isize=50915328 (495 MB/s)

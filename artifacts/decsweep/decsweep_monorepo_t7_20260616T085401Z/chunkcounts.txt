@@ -1,0 +1,6 @@
+[parallel_sm:v0.6] total=101.9ms isize=50915328 (500 MB/s)
+[parallel_sm:v0.6] total=102.7ms isize=50915328 (496 MB/s)
+[parallel_sm:v0.6] total=103.0ms isize=50915328 (495 MB/s)
+[parallel_sm:v0.6] total=95.4ms isize=50915328 (534 MB/s)
+[parallel_sm:v0.6] total=99.4ms isize=50915328 (512 MB/s)
+[parallel_sm] isize=50915328 comp_len=9819846 ratio=5.185 chunk_size=524288 (~512 KiB) est_chunks=19

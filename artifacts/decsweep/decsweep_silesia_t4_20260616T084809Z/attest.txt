@@ -1,0 +1,31 @@
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=68229982 bgzf=false multi=false parallel=false procs=4
+[gzippy] decompress_single_member path=ParallelSM threads=4 bytes=68229982
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=4194304 (~4096 KiB) est_chunks=17
+[parallel_sm:v0.6] total=544.5ms isize=211968000 (389 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=68229982 bgzf=false multi=false parallel=false procs=4
+[gzippy] decompress_single_member path=ParallelSM threads=4 bytes=68229982
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=1350096 (~1318 KiB) est_chunks=51
+gzippy: stored-flip case2-crossing uncompressed_size=16441
+gzippy: stored-flip case2-crossing uncompressed_size=16389
+[parallel_sm:v0.6] total=591.5ms isize=211968000 (358 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=68229982 bgzf=false multi=false parallel=false procs=4
+[gzippy] decompress_single_member path=ParallelSM threads=4 bytes=68229982
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=1687620 (~1648 KiB) est_chunks=41
+gzippy: stored-flip case2-crossing uncompressed_size=16389
+[parallel_sm:v0.6] total=580.9ms isize=211968000 (365 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=68229982 bgzf=false multi=false parallel=false procs=4
+[gzippy] decompress_single_member path=ParallelSM threads=4 bytes=68229982
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=2025144 (~1977 KiB) est_chunks=34
+gzippy: stored-flip case2-crossing uncompressed_size=16391
+gzippy: stored-flip case2-crossing uncompressed_size=16441
+[parallel_sm:v0.6] total=567.4ms isize=211968000 (374 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=68229982 bgzf=false multi=false parallel=false procs=4
+[gzippy] decompress_single_member path=ParallelSM threads=4 bytes=68229982
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=2700193 (~2636 KiB) est_chunks=26
+gzippy: stored-flip case2-crossing uncompressed_size=16389
+[parallel_sm:v0.6] total=542.6ms isize=211968000 (391 MB/s)

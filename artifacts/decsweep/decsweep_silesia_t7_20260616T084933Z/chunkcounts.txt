@@ -1,0 +1,10 @@
+[parallel_sm:v0.6] total=340.3ms isize=211968000 (623 MB/s)
+[parallel_sm:v0.6] total=348.7ms isize=211968000 (608 MB/s)
+[parallel_sm:v0.6] total=350.0ms isize=211968000 (606 MB/s)
+[parallel_sm:v0.6] total=363.5ms isize=211968000 (583 MB/s)
+[parallel_sm:v0.6] total=369.2ms isize=211968000 (574 MB/s)
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=1350096 (~1318 KiB) est_chunks=51
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=1687620 (~1648 KiB) est_chunks=41
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=2025144 (~1977 KiB) est_chunks=34
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=2700193 (~2636 KiB) est_chunks=26
+[parallel_sm] isize=211968000 comp_len=68229982 ratio=3.107 chunk_size=4194304 (~4096 KiB) est_chunks=17

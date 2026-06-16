@@ -1,0 +1,29 @@
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=20676664 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=20676664
+[parallel_sm] isize=205242368 comp_len=20676664 ratio=9.926 chunk_size=1048576 (~1024 KiB) est_chunks=20
+gzippy: stored-flip case1-ge-window uncompressed_size=58125
+gzippy: stored-flip case1-ge-window uncompressed_size=40585
+[parallel_sm:v0.6] total=222.0ms isize=205242368 (924 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=20676664 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=20676664
+[parallel_sm] isize=205242368 comp_len=20676664 ratio=9.926 chunk_size=524288 (~512 KiB) est_chunks=40
+gzippy: stored-flip case1-ge-window uncompressed_size=58125
+gzippy: stored-flip case1-ge-window uncompressed_size=40585
+[parallel_sm:v0.6] total=212.2ms isize=205242368 (967 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=20676664 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=20676664
+[parallel_sm] isize=205242368 comp_len=20676664 ratio=9.926 chunk_size=528181 (~515 KiB) est_chunks=40
+[parallel_sm:v0.6] total=559.1ms isize=205242368 (367 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=20676664 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=20676664
+[parallel_sm] isize=205242368 comp_len=20676664 ratio=9.926 chunk_size=633818 (~618 KiB) est_chunks=33
+[parallel_sm:v0.6] total=212.0ms isize=205242368 (968 MB/s)
+[gzippy] build-flavor=parallel-sm+pure
+[gzippy] decompress_file: len=20676664 bgzf=false multi=false parallel=false procs=7
+[gzippy] decompress_single_member path=ParallelSM threads=7 bytes=20676664
+[parallel_sm] isize=205242368 comp_len=20676664 ratio=9.926 chunk_size=845090 (~825 KiB) est_chunks=25
+[parallel_sm:v0.6] total=207.0ms isize=205242368 (991 MB/s)
