@@ -1,8 +1,64 @@
 # CLAUDE.md — gzippy Development Guide
 
+## ⛔ ANTI-BIAS PREAMBLE — READ FIRST (the governing law; it overrides everything below it)
+
+You are fine-tuned to produce confident conclusions from reasoning and to narrate
+them as findings. **In THIS project that default has failed catastrophically — in a
+single session it produced ~11 confident "the lever is X" conclusions, each disproven
+by the very next measurement** (shared-floor, key-pin, prefetch-depth, "T1 settled",
+single-shot-routing, async-overlap, decode-volume, utilization, B-width,
+templated-Block, "fix clean-path overhead"). Every one felt rigorous. Every one was
+wrong. The reasoning is not the problem to fix — the *trusting of reasoning* is. So:
+
+**THE GOVERNING POLICY (user, 2026-06-14) — enforced, not advisory:**
+
+1. **ONLY DETERMINISTIC SOFTWARE IS TRUSTED.** No hypothesis, theory, attribution,
+   model, or conclusion may live in conversation or memory AS A FINDING. A finding
+   EXISTS only as a FULCRUM MEASUREMENT that ran and passed its own self-tests. Prose
+   is never where a conclusion lives.
+2. **A claim of a lever / cause / win / tie / regression / "settled" / "dead" is VALID
+   only if it is the OUTPUT of a Fulcrum measurement whose self-tests passed AND whose
+   significance gate is met (Δ vs inter-run spread, N≥7, replicated on BOTH arches).**
+   Anything else is an **OPEN HYPOTHESIS** — you MUST label it `HYPOTHESIS
+   (unvalidated)`, and its ONLY permitted next action is to build/run the Fulcrum
+   measurement that would test it. You may not act on it, bank it, ship from it, or
+   stack another inference on top of it.
+3. **FULCRUM IS THE SOLE ORACLE** — used soberly and humbly. Not advisors, not your
+   reasoning, not a hand-rolled script, not a "code-verified" read (even reading the
+   source is an inference that has been wrong — the shared-ness gate's empirical arm,
+   not the cfg-read, is the verdict).
+4. **THE WORK IS BUILDING THE TOOL THAT PERFORMS THE ANALYSIS — not performing the
+   analysis yourself.** When you need an answer, the deliverable is the Fulcrum
+   measurement (carrying its own tests) that answers it deterministically. "Fulcrum
+   does our work." If Fulcrum cannot yet answer the question, EXTEND FULCRUM FIRST;
+   do not substitute hand-computation, eyeballing, or intuition.
+
+**Tripwire.** If you catch yourself writing "so the cause is…", "this means…",
+"therefore the lever is…", "X is settled/dead", "this is shared/native-heavy",
+"Δ≈0 so it's a win/tie" — STOP. That sentence is the bias firing. Rewrite it as a
+`HYPOTHESIS (unvalidated)` line plus the exact Fulcrum measurement that would confirm
+or falsify it. A correct (byte-identical) code change may be KEPT on a TIE, but "it
+TIE'd" is NOT a finding about the cause.
+
+Named biases this preamble exists to kill (all observed here): inference-as-conclusion
+(the core one); premature closure / synthesis-ahead-of-evidence; over-correction
+(flipping to the opposite conclusion just as confidently); attribution-as-verdict
+(decompose/blame instead of causally perturb); dimensional/statistical error
+(multiplying a CPU-share by a wall-time; calling Δ<spread a win; no significance test);
+single-arch/single-corpus over-generalization (AMD-silesia → universal); trusting
+un-self-validated instruments (file-sink A/B, inert oracle, hardcoded `pred_available`,
+contaminated perf-annotate); over-banking interpretation (memory accreting disproven
+"the lever is X" claims that misguide the next session).
+
 ## Prime Directive
 
-**gzippy aims to be the fastest gzip implementation ever created.**
+**gzippy aims to be the fastest gzip implementation ever created — but the OPERATING
+prime directive is: BUILD THE TOOL THAT MEASURES, don't hand-derive conclusions.**
+Speed is the goal; a passing, self-validated Fulcrum measurement is the only currency
+that counts toward it. Every session's primary work product is either (a) a
+byte-identical code change whose effect a Fulcrum measurement confirmed at the wall,
+or (b) an improvement to Fulcrum/the test harness that makes the next causal question
+deterministically answerable. Prose analysis is not a work product.
 
 ## Goal (updated 2026-05-30 — perf-driven; faithful structural CONVERGENCE to rapidgzip REINSTATED)
 
@@ -29,68 +85,84 @@ clean-window arming is a byte-for-byte port of vendor (`deflate.hpp:1282-1284` �
 `deflate_block.rs:781-783`). So the gap is NOT extra machinery to delete — deleting
 `deflate_block`/marker rings/`apply_window` would diverge from rapidgzip, not converge.
 
-## Measurement PROCESS (the rules that survived disproof — follow the process, never a cached conclusion)
+## Measurement PROTOCOL (ENFORCEABLE — a measurement that skips a gate is not a measurement)
 
-The wall of this in-order pipeline is NOT predictable from producer-side
-attribution. Busy-time, latency-share, and critical-path "blame" are all
-ANALYST-BIASABLE and have repeatedly manufactured phantom levers — a region can
-be huge in any of them and wall-neutral, or small and still gate the wall. NEVER
-conclude a lever from attribution. The only verdict is a CAUSAL PERTURBATION:
+This is no longer advice you weigh; it is the definition of "finding." A statement
+about cause/lever/win/tie that did not pass EVERY gate below is an OPEN HYPOTHESIS
+(label it as such) — not a result, not bankable, not actionable.
 
-1. **Perturb, don't attribute.** To test whether region R gates the wall, change
-   R's time by a known factor and measure the *interleaved wall response*. A
-   monotonic, proportional response ⇒ R is on the critical path; a flat response
-   ⇒ R is slack. Template: `GZIPPY_SLOW_BOOTSTRAP=N` spins/sleeps N% of a
-   region's own measured time. (This is what coz does; coz needs perf-event
-   sampling and is BLOCKED in the LXC, so slow-injection is the substitute.)
-2. **Always run a frequency-neutral control.** A busy-spin can depress all-core
-   turbo and inflate the delta. Re-run with a SLEEP (yields the core); if the
-   delta survives, the criticality is real, not a spin artifact.
-3. **Slow-down slope ≠ speed-up ceiling.** Slowing a critical region always adds
-   wall; SPEEDING it helps only until the next component binds. To bound a
-   speed-up lever you must REMOVE the region (oracle) and measure — never
-   extrapolate the slow-down slope through an unlocated knee.
-4. **Validate the instrument before trusting it.** Positive/negative controls
-   first; a binary-vs-itself self-test must read 1.0 ± spread. (Two instruments
-   here were silently broken: a clean-window oracle that re-ran the bootstrap,
-   and another that emitted EMPTY output.)
-5. **Disproof-driven.** State the claim, then actively try to BREAK it (control
-   region, frequency-neutral variant, instrument self-test). Only what survives a
-   genuine disproof attempt is real. Δ < inter-run spread ⇒ TIE, full stop.
-6. **Always, mechanically:** assert the production path (`GZIPPY_DEBUG=1` →
-   `path=ParallelSM`; build `--no-default-features --features pure-rust-inflate`;
-   `GZIPPY_FORCE_PARALLEL_SM=1` to exercise the engine at every T); frozen host;
-   interleaved best-of-N≥7; sha-verified output (a speed win with wrong bytes is a
-   loss).
+**GATE 0 — INSTRUMENT SELF-VALIDATION (BLOCKING; the single most-violated rule).**
+Before any number is reported, the instrument must LOUD-PASS its own tests, else the
+number does not exist:
+  (a) every env knob/flag the run sets has a CONFIRMED consumer in `src/` (grep proves
+      it — `GZIPPY_TIMELINE` vs `GZIPPY_LOG_FILE`, `GZIPPY_FORCE_PARALLEL_SM`, etc.
+      have all been set inertly);
+  (b) the comparator binary EXISTS on that box and self-tests to 1.0 ± spread
+      (binary-vs-itself; "no rg on solvency" went unnoticed for a whole session);
+  (c) any "oracle"/perturbation run produces output that PROVABLY DIFFERS from the
+      baseline (counter fired, hits>0, hits==expected-count) — else it is inert and is
+      silently measuring the normal path (`GZIPPY_SEED_WINDOWS` no-op-to-None);
+  (d) both A/B arms use the SAME sink (`/dev/null`, matching how rg is measured) —
+      a file sink penalizes the FASTER arm and manufactures phantom sign-flips;
+  (e) conservation holds (busy+idle==span; buckets reconcile to chunk count; no
+      double-count — the "62ms serial CRC" phantom was a nested-span double-count).
+A self-validated instrument's ATTRIBUTION is STILL only attribution — it is a
+HYPOTHESIS until Gate 2 (a tool proving it is internally consistent does NOT prove its
+blame is the cross-tool causal lever).
 
-7. **A REJECTION needs a mechanism, not a narrow miss (user-set 2026-05-31).** We
-   do NOT abandon a direction just because one fix didn't measure narrowly the way
-   we hoped. To reject a lever you MUST supply EITHER (a) a concrete hypothesis of
-   what happens if attempted PLUS an explanation of *how rapidgzip does the same
-   thing differently* (the vendor is the existence proof — if it's faster there
-   must be a structural reason), OR (b) a specific measurement of how it makes
-   things worse in some other named way (e.g. "bounding depth re-inflates
-   `rx_recv_block` wait by Xms"). "It TIE'd" / "Δ < spread" alone is a TIE verdict
-   on THAT run, NOT a refutation of the direction. A correct (byte-identical) change
-   is KEPT and layered even on a TIE ([[feedback_layer_dont_revert_whole_system]]).
-8. **Numbers come from the FULLEST Fulcrum test, never a hand-rolled script
-   (user-set 2026-05-31).** Hand scripts manufacture phantoms (the combine_crc
-   "62ms serial CRC" was a nested-span double-count; it's actually an O(1) combine
-   of worker-computed CRCs). Keep DEVELOPING Fulcrum toward a COMPLETE picture even
-   if it gets slow to run — a correct, validated, complete instrument (self-time
-   with no double-count, idle-gap, busy+idle==span asserted, wait-vs-compute-vs-output
-   classification, per-T) beats a fast partial one. If the instrument can't yet show
-   it, extend the instrument before trusting a number.
+**GATE 1 — STATISTICAL SIGNIFICANCE (BLOCKING).** Interleaved best-of-N≥7 on a frozen
+host; report Δ AND inter-run spread. **Δ < spread ⇒ TIE, full stop — never a win.**
+Never multiply a CPU-share by a wall-time, or a ratio by a ratio, to synthesize an
+absolute (the decode-volume "1.33× more bytes" was circular share×wall arithmetic);
+if you need an absolute, MEASURE the absolute.
 
-Fulcrum tools — `fulcrum vs A B` (cross-tool per-span busy + wall-critical),
-`fulcrum flow` (per-stage slack/serial/starved), `fulcrum critpath`,
-`fulcrum causal` (speculation decode→publish chain + runtime window-absent fraction)
-— are HYPOTHESIS GENERATORS, never the verdict. The verdict is the causal
-perturbation. Re-derive findings with Fulcrum each session — the `plans/`
-directory was deleted as stale-prone interpretation (a stale ledger entry once
-misled the campaign); durable operational facts live in `scripts/bench/guest.env`,
-and git history preserves the old plans. Treat every "the lever is X" claim as
-provisional until a fresh perturbation confirms it.
+**GATE 2 — CAUSAL PERTURBATION IS THE ONLY VERDICT (attribution never is).** To prove
+region R gates the wall, change R's time by a KNOWN factor (≥2 magnitudes) and measure
+the interleaved wall response: monotonic+proportional ⇒ on the critical path; flat ⇒
+slack. ALWAYS run a frequency-neutral control (sleep that yields the core, not a busy
+spin that depresses turbo); if the delta survives the sleep, it is real. Slow-down
+slope ≠ speed-up ceiling — to BOUND a speed-up you must REMOVE the region (oracle) and
+measure, never extrapolate a slope through an unlocated knee.
+
+**GATE 3 — CROSS-ARCH / CROSS-CORPUS REPLICATION (BLOCKING for any banked finding).**
+A one-arch result is NOT a finding ("deficit grows with T" held only on noisy Intel;
+AMD showed native scaled like rg). A single-corpus or model-anchored result is NOT a
+verdict (model is a hard-to-compress CORNER case). Replicate on the other arch and a
+balanced corpus spread before the claim is anything but a HYPOTHESIS.
+
+**GATE 4 — PRODUCTION-PATH ASSERTION (mechanical, every run).** `GZIPPY_DEBUG=1` →
+`path=ParallelSM`; build `--no-default-features --features pure-rust-inflate`;
+`GZIPPY_FORCE_PARALLEL_SM=1` to exercise the engine at every T; verify the binary's
+feature-set fingerprint (a mislabeled native-as-isal binary produced a false "ISA-L
+dormant" bombshell); sha-verified output (a speed win with wrong bytes is a loss).
+
+**GATE 5 — EVIDENCE TIER + SCOPE STAMP (how you must price every claim).** Tier the
+evidence and never over-bet: removal-oracle / causal-perturbation = STRONG;
+cross-tool frozen matrix = STRONG; self-validated tool attribution = HYPOTHESIS;
+whole-program perf attribution = WEAK; source-read = HYPOTHESIS. Every result is a
+TIME-STAMPED verdict IN A CONTEXT (commit/bin-sha, corpus, arch, T, code state) — it
+holds ONLY there. A disproof is not an eternal law: `git diff <cell-src-sha>..HEAD`
+before relying on it (the 247ms "DIS-15" tax was real then, GONE at HEAD; citing it as
+current sent the campaign down a wrong front).
+
+**On REJECTING a direction.** "It TIE'd on this run" is a TIE verdict on THAT cell,
+not a refutation of the direction. To DECLARE a direction dead you still need a
+Gate-2 mechanism (a measured way it makes things worse, or a confirmed structural
+reason it cannot help) — but equally, do NOT keep re-banking a "dead lever" as prose;
+a dead direction is recorded as a FALSIFY entry with its premise + scope + re-open
+trigger, never as a standing conclusion.
+
+**Fulcrum is the SOLE oracle, and BUILDING it is the work.** `fulcrum vs`, `fulcrum
+flow`, `fulcrum critpath`, `fulcrum causal`, `fulcrum score`/matrix, `fulcrum decide`,
+`fulcrum locate` produce the numbers; each must carry its own self-tests (Gate 0) and
+significance accounting (Gate 1). They are still HYPOTHESIS GENERATORS until Gate 2.
+When a question can't be answered deterministically by Fulcrum, the correct next action
+is to EXTEND FULCRUM (tooling is PULLED by a blocked finding, never pushed for its own
+sake) — never to hand-roll a script or eyeball it (hand scripts manufacture phantoms).
+The `plans/` directory was deleted as stale-prone interpretation; durable operational
+facts live in `scripts/bench/guest.env` and git history. Treat EVERY "the lever is X"
+claim — including ones written in memory — as an unvalidated hypothesis until a fresh
+gated measurement confirms it THIS session.
 
 Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
 closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the

@@ -114,7 +114,7 @@ isal_incremental_growth|GZIPPY_ISAL_INCREMENTAL_GROWTH=1|none
 
 # ---- corpus reference oracles -------------------------------------------------
 declare -A REFSHA RAWBYTES
-corpus_path() { echo "/root/$1.gz"; }
+corpus_path() { echo "${CORPORA_DIR:-/mnt/internal/corpora}/$1.gz"; }
 ensure_ref() { # <corpus>
   local c="$1" f
   [ -n "${REFSHA[$c]:-}" ] && return 0
@@ -149,6 +149,7 @@ routing_assert() { # <corpus> <T>
 # ---- per-cell measurement -------------------------------------------------------
 run_cell() { # <corpus> <T>
   local c="$1" t="$2" mask maskd cdir f i gsec gsha rsec rsha GZT="" RGT="" DIVERGED=0
+  local gpcpu rpcpu GZP="" RGP=""   # %CPU (P=pcpu/100) sidecar accumulators
   mask="$(pin_mask "$t")"
   [ -n "$mask" ] || decide_fail "bad-T:$t (use 1,4,8,12,16)" 8
   # DERIVED mask: the kernel's readback of the requested pin (a cpuset-shrunk
@@ -160,16 +161,20 @@ run_cell() { # <corpus> <T>
   routing_assert "$c" "$t"
   echo "## cell $c:T$t mask=$mask — wall interleave N=$N (drop warmup iter0)"
   for ((i=0;i<=N;i++)); do
-    read -r gsec gsha _grss < <(timed_masked "$mask" "$SINK_A" "$BIN" -d -c -p "$t" "$f")
-    read -r rsec rsha _rrss < <(timed_masked "$mask" "$SINK_B" "$RG_CMD" -d -c -f -P "$t" "$f")
+    read -r gsec gsha _grss gpcpu < <(timed_masked "$mask" "$SINK_A" "$BIN" -d -c -p "$t" "$f")
+    read -r rsec rsha _rrss rpcpu < <(timed_masked "$mask" "$SINK_B" "$RG_CMD" -d -c -f -P "$t" "$f")
     [ "$i" -eq 0 ] && continue
     GZT="$GZT $gsec"; RGT="$RGT $rsec"
+    GZP="$GZP ${gpcpu:-0}"; RGP="$RGP ${rpcpu:-0}"
     [ "$gsha" = "${REFSHA[$c]}" ] || { echo "!! SHA DIVERGENCE gz $c:T$t i=$i sha=$gsha"; DIVERGED=1; }
     [ "$rsha" = "${REFSHA[$c]}" ] || { echo "!! SHA DIVERGENCE rg $c:T$t i=$i sha=$rsha"; DIVERGED=1; }
   done
   [ "$DIVERGED" -eq 0 ] || decide_fail "sha-mismatch $c:T$t (wrong-bytes — number VOID)" 11
   echo "$GZT" | tr ' ' '\n' | grep -v '^$' > "$cdir/wall_gz.txt"
   echo "$RGT" | tr ' ' '\n' | grep -v '^$' > "$cdir/wall_rg.txt"
+  # P sidecars (not read by `fulcrum decide`; consumed by the matrix report).
+  echo "$GZP" | tr ' ' '\n' | grep -v '^$' > "$cdir/pcpu_gz.txt"
+  echo "$RGP" | tr ' ' '\n' | grep -v '^$' > "$cdir/pcpu_rg.txt"
   mf "cell_done=$c:$t:mask=$mask:maskd=${maskd:-unreadable}:sha_ok=1"
 
   # -- trace capture (1 run; counters/trace are NOT wall numbers -> labeled).
