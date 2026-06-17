@@ -17,7 +17,7 @@
 //! prefix, FLIP to clean at 32 KiB, FOLD in place to the end) then
 //! `resolve_and_narrow_markers_in_place` + `merge_resolved_markers_into_data`
 //! against the TRUE predecessor window — exactly what a real mid-stream chunk
-//! goes through. Unlike `gzip_chunk::native_fold_parity` (which needs the
+//! goes through. Unlike `chunk_decode::native_fold_parity` (which needs the
 //! silesia file on disk) these are SYNTHETIC + self-contained, so they run in
 //! CI and can be aimed at specific seam edge cases.
 //!
@@ -35,7 +35,7 @@ mod tests {
     use std::io::Write;
 
     use crate::decompress::parallel::chunk_data::ChunkConfiguration;
-    use crate::decompress::parallel::gzip_chunk::decode_chunk_window_absent;
+    use crate::decompress::parallel::chunk_decode::decode_chunk_window_absent;
     use crate::decompress::parallel::inflate_wrapper::{StoppingPoints, StreamingInflateWrapper};
 
     const WINDOW: usize = 32 * 1024;
@@ -146,7 +146,7 @@ mod tests {
     /// boundaries that (a) have a full 32 KiB of preceding output for the
     /// predecessor window and (b) have at least `lookahead` boundaries of room
     /// ahead. For each, run the production fold path with a BOUNDED stop hint
-    /// (`bounds[start+lookahead].bit`, mirroring `gzip_chunk::native_fold_parity`
+    /// (`bounds[start+lookahead].bit`, mirroring `chunk_decode::native_fold_parity`
     /// — an unbounded hint overruns the slice) and assert byte-equality of the
     /// chunk's full payload against the ground-truth slice. Returns the number
     /// of chunks that actually FLIPPED (clean tail extends past the 32 KiB
@@ -463,7 +463,7 @@ mod tests {
     //
     // `decode_chunk_with_rapidgzip_impl` pre-reserves the clean tail as
     // `compressed*8 + 1 MiB` CLAMPED to `RESERVE_CLAMP = 16 MiB`
-    // (gzip_chunk.rs:1001). Two failure modes live at that boundary: the clamp
+    // (chunk_decode.rs:1001). Two failure modes live at that boundary: the clamp
     // DECISION (just-under vs just-over) and the CONTIGUITY of the tail once the
     // clamp under-reserves and the buffer must amortized-regrow (realloc + move)
     // — a post-flip back-ref must still resolve correctly across that realloc.

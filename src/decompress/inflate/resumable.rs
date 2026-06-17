@@ -375,7 +375,7 @@ impl<'a> ResumableInflate2<'a> {
 
     /// Vendor parity alias for `bit_position`. Vendor `IsalInflateWrapper`
     /// exposes `tellCompressed()` (isal.hpp:69-74); existing call sites
-    /// in `inflate_wrapper.rs` and `gzip_chunk.rs` use this name.
+    /// in `inflate_wrapper.rs` and `chunk_decode.rs` use this name.
     pub fn tell_compressed(&self) -> usize {
         self.bits.bit_position()
     }
@@ -390,7 +390,7 @@ impl<'a> ResumableInflate2<'a> {
 
     /// Returns `Some(last_btype)` ONLY when stopped at
     /// `END_OF_BLOCK_HEADER`. Matches vendor semantics
-    /// (`consume_first_decode.rs:2992-2998`). Used by `gzip_chunk.rs:217`
+    /// (`consume_first_decode.rs:2992-2998`). Used by `chunk_decode.rs:217`
     /// to detect fixed-Huffman blocks where the chunk can't safely stop.
     pub fn btype(&self) -> Option<u8> {
         if self.stopped_at == StoppingPoint::END_OF_BLOCK_HEADER {
@@ -612,7 +612,7 @@ impl<'a> ResumableInflate2<'a> {
                 // END_OF_BLOCK and END_OF_STREAM are requested, the
                 // BFINAL block's EOB fires END_OF_BLOCK FIRST. Callers
                 // that drive a chunk-by-chunk decoder
-                // (`gzip_chunk.rs::decode_chunk_isal_impl`) treat
+                // (`chunk_decode.rs::decode_chunk_isal_impl`) treat
                 // END_OF_BLOCK+`is_final_block=true` as the natural exit
                 // for the last block of a single-member stream — they
                 // never want to read a footer from the chunk's input
@@ -624,7 +624,7 @@ impl<'a> ResumableInflate2<'a> {
                 // `read_footer_at_current` would return Internal(-1)
                 // because the input slice ends at the deflate body.
                 // END_OF_STREAM still fires when ONLY END_OF_STREAM is
-                // requested (e.g. multi-stream `gzip_chunk` config).
+                // requested (e.g. multi-stream `chunk_decode` config).
                 if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
                     self.stopped_at = StoppingPoint::END_OF_BLOCK;
                 } else if self
@@ -1193,7 +1193,7 @@ fn decode_huffman_body_resumable(
             // the two-phase FlipToClean tail). On gzippy-NATIVE (the default
             // perf build and the 1.0× bar) the fold keeps Engine M
             // (marker_inflate::Block) decoding the clean tail in-place
-            // (gzip_chunk.rs:1219, `not(isal_clean_tail)`), so ~99% of clean
+            // (chunk_decode.rs:1219, `not(isal_clean_tail)`), so ~99% of clean
             // bytes decode through marker_inflate's CONTAINS_MARKERS=false arm,
             // NOT here. This injection is therefore the correct site for the
             // gzippy-ISAL CONTROL build; the NATIVE pre-gate fires the sibling

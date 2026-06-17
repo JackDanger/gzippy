@@ -434,7 +434,7 @@ mod tests {
     /// only triggers when `consumer_loop` schedules a sub-byte tail
     /// chunk, which depends on the exact confirmed-block layout and is
     /// not reliably forced here. The deterministic reproducer for it
-    /// lives in `gzip_chunk` — see
+    /// lives in `chunk_decode` — see
     /// `decode_chunk_isal_terminates_on_sub_byte_eof_padding`.
     #[test]
     fn read_parallel_sm_roundtrip_incompressible_high_thread() {

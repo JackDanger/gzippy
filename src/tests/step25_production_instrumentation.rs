@@ -8,7 +8,7 @@
 //! shape.
 //!
 //! Hypothesis from the advisor's third-pass verdict: production
-//! callers in `gzip_chunk.rs:240-289` write into chunk.data's spare
+//! callers in `chunk_decode.rs:240-289` write into chunk.data's spare
 //! capacity directly, so they MIGHT be calling read_stream with a
 //! large (~128 KiB or more) output buffer rather than the tiny
 //! chunked-bench shape (64 KiB). If avg bytes/call is large,

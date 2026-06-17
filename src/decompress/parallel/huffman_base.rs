@@ -75,7 +75,7 @@ pub enum BitReaderError {
 /// - [`Self::read_one`] — one-bit read (BitReader.hpp:298-307).
 ///
 /// Implementations on the existing in-tree bit reader
-/// (`block_finder::BitReader`) are provided in this module.
+/// (`bit_reader::BitReader`) are provided in this module.
 pub trait LsbBitReader {
     /// Read `num_bits` bits and advance the cursor.
     ///
@@ -105,15 +105,15 @@ pub trait LsbBitReader {
     }
 }
 
-// --- Adapter for the in-tree `block_finder::BitReader` --------------------
+// --- Adapter for the in-tree `bit_reader::BitReader` --------------------
 
-impl<'a> LsbBitReader for super::block_finder::BitReader<'a> {
+impl<'a> LsbBitReader for super::bit_reader::BitReader<'a> {
     #[inline]
     fn read(&mut self, num_bits: u8) -> Result<u64, BitReaderError> {
         if self.is_eof() && num_bits > 0 {
             return Err(BitReaderError::Eof);
         }
-        Ok(super::block_finder::BitReader::read(self, num_bits))
+        Ok(super::bit_reader::BitReader::read(self, num_bits))
     }
 
     #[inline]

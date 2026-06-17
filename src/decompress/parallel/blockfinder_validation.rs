@@ -4,13 +4,14 @@
 //!
 //! Port of rapidgzip's `blockfinder/` directory — the per-position deflate-header
 //! checkers — NOT vendor's `core/BlockFinder.hpp` (that async coordinator is
-//! [`super::raw_block_finder`]) and NOT `GzipBlockFinder.hpp` (the offset
+//! [`super::async_block_finder`]) and NOT `GzipBlockFinder.hpp` (the offset
 //! partitioner is [`super::gzip_block_finder`]). Concretely this mirrors:
 //!   - `blockfinder/DynamicHuffman.hpp` (15-bit next-candidate LUT + precode/
 //!     Huffman validation)
 //!   - `blockfinder/Uncompressed.hpp` (stored-block boundary check)
 //!
-//! Also hosts the shared [`BitReader`] used across the parallel modules.
+//! The shared [`BitReader`] now lives in [`super::bit_reader`] (rg
+//! `core/BitReader.hpp`).
 //!
 //! Validates valid deflate block boundaries via:
 //! 1. 15-bit LUT for quick invalid position skipping
@@ -22,6 +23,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use super::bit_reader::BitReader;
 
 // ============================================================================
 // Constants
@@ -219,134 +222,6 @@ fn validate_precode(hclen: usize, precode_bits: u64) -> bool {
 }
 
 // ============================================================================
-// Fast Bit Reader
-// ============================================================================
-
-pub struct BitReader<'a> {
-    data: &'a [u8],
-    byte_pos: usize,
-    bit_buf: u64,
-    bits_available: u8,
-}
-
-impl<'a> BitReader<'a> {
-    #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
-        let mut reader = Self {
-            data,
-            byte_pos: 0,
-            bit_buf: 0,
-            bits_available: 0,
-        };
-        reader.refill();
-        reader
-    }
-
-    #[inline]
-    pub fn seek_to_bit(&mut self, bit_offset: usize) {
-        self.byte_pos = bit_offset / 8;
-        self.bit_buf = 0;
-        self.bits_available = 0;
-        self.refill();
-        let skip = (bit_offset % 8) as u8;
-        if skip > 0 {
-            self.bit_buf >>= skip;
-            self.bits_available = self.bits_available.saturating_sub(skip);
-        }
-    }
-
-    #[inline]
-    fn refill(&mut self) {
-        // Vendor-parity 8-byte misaligned refill. Previously this loop
-        // OR'd one byte at a time, up to 7 iterations to refill a low
-        // bit_buf. Vendor (`BitReader.hpp`) issues a single unaligned
-        // 8-byte little-endian load and OR-shifts it in.
-        //
-        // The shift may discard the top `bits_available` bits of the
-        // loaded value (they overflow the u64); we compensate by
-        // advancing `byte_pos` by ONLY `(64 - bits_available) / 8`
-        // bytes — the discarded high bits are re-read on the next refill
-        // from the not-yet-advanced byte position.
-        if self.bits_available <= 56 && self.byte_pos + 8 <= self.data.len() {
-            // SAFETY: bounds-checked above; little-endian byte order
-            // matches our bit-numbering (low bit of byte 0 → bit 0 of bit_buf).
-            let next8: u64 = unsafe {
-                core::ptr::read_unaligned(self.data.as_ptr().add(self.byte_pos) as *const u64)
-            }
-            .to_le();
-            self.bit_buf |= next8 << self.bits_available;
-            let bytes_consumed = (64 - self.bits_available as usize) / 8;
-            self.bits_available += (bytes_consumed * 8) as u8;
-            self.byte_pos += bytes_consumed;
-        }
-        // Tail: byte-by-byte for the last <8 bytes of input (and the
-        // path taken when bits_available > 56 already, which is a no-op).
-        while self.bits_available <= 56 && self.byte_pos < self.data.len() {
-            self.bit_buf |= (self.data[self.byte_pos] as u64) << self.bits_available;
-            self.bits_available += 8;
-            self.byte_pos += 1;
-        }
-    }
-
-    /// Returns true if at least `n` bits are available (refilling first).
-    #[inline]
-    pub fn can_read(&mut self, n: u8) -> bool {
-        if self.bits_available < n {
-            self.refill();
-        }
-        self.bits_available >= n
-    }
-
-    /// Peek up to `n` bits. Caller must ensure `bits_available >= n` —
-    /// use `peek_refilled` for the safe variant.
-    #[inline]
-    pub fn peek(&self, n: u8) -> u64 {
-        self.bit_buf & ((1u64 << n) - 1)
-    }
-
-    /// Refill if needed, then peek. Use for reads larger than the
-    /// refill watermark (e.g. 57-bit precode reads).
-    #[inline]
-    pub fn peek_refilled(&mut self, n: u8) -> u64 {
-        if self.bits_available < n {
-            self.refill();
-        }
-        self.peek(n)
-    }
-
-    #[inline]
-    pub fn skip(&mut self, n: u8) {
-        self.bit_buf >>= n;
-        self.bits_available = self.bits_available.saturating_sub(n);
-        if self.bits_available < 32 {
-            self.refill();
-        }
-    }
-
-    /// Read up to `n` bits, refilling first if necessary. Safe for
-    /// any n ≤ 57.
-    #[inline]
-    pub fn read(&mut self, n: u8) -> u64 {
-        if self.bits_available < n {
-            self.refill();
-        }
-        let val = self.peek(n);
-        self.skip(n);
-        val
-    }
-
-    #[inline]
-    pub fn bit_position(&self) -> usize {
-        self.byte_pos * 8 - self.bits_available as usize
-    }
-
-    #[inline]
-    pub fn is_eof(&self) -> bool {
-        self.byte_pos >= self.data.len() && self.bits_available == 0
-    }
-}
-
-// ============================================================================
 // Block Boundary
 // ============================================================================
 
@@ -452,11 +327,11 @@ fn peek_bits_at(data: &[u8], bit: usize, n: u8) -> Option<u32> {
 // Block Finder
 // ============================================================================
 
-pub struct BlockFinder<'a> {
+pub struct DeflateBlockValidator<'a> {
     data: &'a [u8],
 }
 
-impl<'a> BlockFinder<'a> {
+impl<'a> DeflateBlockValidator<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data }
     }
@@ -1012,7 +887,7 @@ pub fn find_blocks_parallel(data: &[u8], num_threads: usize) -> Vec<BlockBoundar
     let chunk_bits = data_bits / num_threads;
 
     if chunk_bits < 1024 || num_threads <= 1 {
-        return BlockFinder::new(data).find_blocks(0, data_bits);
+        return DeflateBlockValidator::new(data).find_blocks(0, data_bits);
     }
 
     let results: Vec<std::sync::Mutex<Vec<BlockBoundary>>> = (0..num_threads)
@@ -1026,7 +901,7 @@ pub fn find_blocks_parallel(data: &[u8], num_threads: usize) -> Vec<BlockBoundar
             let next_ref = &next_chunk;
 
             scope.spawn(move || {
-                let finder = BlockFinder::new(data);
+                let finder = DeflateBlockValidator::new(data);
 
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -1134,7 +1009,7 @@ mod tests {
             .expect("scan");
 
         let lut = get_lut();
-        let finder = BlockFinder::new(deflate);
+        let finder = DeflateBlockValidator::new(deflate);
         let mut found = 0;
 
         for cp in &scan.checkpoints {
@@ -1252,7 +1127,7 @@ mod tests {
             .expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
 
-        let sequential = BlockFinder::new(deflate).find_blocks(0, deflate.len() * 8);
+        let sequential = DeflateBlockValidator::new(deflate).find_blocks(0, deflate.len() * 8);
         let parallel = find_blocks_parallel(deflate, 4);
 
         let seq_offsets: Vec<usize> = sequential.iter().map(|b| b.bit_offset).collect();
@@ -1289,7 +1164,7 @@ mod tests {
         use std::io::Write;
         enc.write_all(&rng_data).unwrap();
         let data = enc.finish().unwrap();
-        let sequential = BlockFinder::new(&data).find_blocks(0, data.len() * 8);
+        let sequential = DeflateBlockValidator::new(&data).find_blocks(0, data.len() * 8);
         let parallel = find_blocks_parallel(&data, 4);
         assert_eq!(
             sequential.len(),
@@ -1315,7 +1190,7 @@ mod tests {
         use std::io::Write;
         enc.write_all(&rng_data).unwrap();
         let data = enc.finish().unwrap();
-        let sequential = BlockFinder::new(&data).find_blocks(0, data.len() * 8);
+        let sequential = DeflateBlockValidator::new(&data).find_blocks(0, data.len() * 8);
         let parallel = find_blocks_parallel(&data, 1);
         assert_eq!(
             sequential.len(),
@@ -1366,7 +1241,7 @@ mod tests {
             crate::decompress::format::parse_gzip_header_size(&compressed).unwrap_or(10);
         let deflate = &compressed[header_size..compressed.len() - 8];
         let partition_bit = 10 * 1024 * 1024 * 8;
-        let finder = BlockFinder::new(deflate);
+        let finder = DeflateBlockValidator::new(deflate);
         // Dynamic-only finder (vendor DynamicHuffman.hpp parity): no
         // fixed-Huffman candidates are emitted. Verify no BTYPE=01 slips
         // through — each candidate's 3-bit header must be BTYPE=00 or

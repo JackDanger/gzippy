@@ -295,11 +295,11 @@ production paths.
   isolation mode; produces garbage output (zeros); CRC verification disabled. Not
   a production path.
 
-- **`GZIPPY_SLOW_BOOTSTRAP` / `_SLEEP`** — `gzip_chunk.rs:890/900`: causal probe
+- **`GZIPPY_SLOW_BOOTSTRAP` / `_SLEEP`** — `chunk_decode.rs:890/900`: causal probe
   injecting artificial delay into the window-absent bootstrap. Pure measurement;
   byte-identical but adds wall time by design.
 
-- **`GZIPPY_ISAL_PURE_BULK`** — `gzip_chunk.rs:169`: the stateless ISA-L-LUT bulk
+- **`GZIPPY_ISAL_PURE_BULK`** — `chunk_decode.rs:169`: the stateless ISA-L-LUT bulk
   decoder (`src/decompress/parallel/isal_lut_bulk.rs`). Pending neurotic
   confirmation before becoming the production default.
 
@@ -310,9 +310,9 @@ production paths.
 - **`GZIPPY_MMAP_OUTPUT`** — `src/decompress/io.rs:160`: experimental mmap output
   path for single-member file decode. Not the default I/O mode.
 
-- **`GZIPPY_OPTION_A_PREFILL`** — `gzip_chunk.rs:188`: Option A3+A4 pre-fill;
+- **`GZIPPY_OPTION_A_PREFILL`** — `chunk_decode.rs:188`: Option A3+A4 pre-fill;
   default state depends on the `OnceLock` logic and may be ON by default in some
-  builds (measured +4.2% T=16). Check `gzip_chunk.rs:188–195` for the exact
+  builds (measured +4.2% T=16). Check `chunk_decode.rs:188–195` for the exact
   current default before treating this as inactive.
 
 - **`global-rpmalloc` feature** — `#[global_allocator] = rpmalloc::RpMalloc` in

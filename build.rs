@@ -40,7 +40,7 @@ fn main() {
 /// Two aliases:
 ///
 /// * `parallel_sm` — the whole chunked parallel-SM orchestration
-///   (chunk_fetcher / gzip_chunk / inflate_wrapper / sm_driver / …) is
+///   (chunk_fetcher / chunk_decode / inflate_wrapper / sm_driver / …) is
 ///   compiled in. True when EITHER:
 ///     - `x86_64` with `isal-compression` OR `pure-rust-inflate`
 ///       (x86 historically ran ISA-L; `pure-rust-inflate` is the

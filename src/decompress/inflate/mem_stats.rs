@@ -35,7 +35,7 @@ use super::staged_bits::INPUT_STAGING_BYTES;
 
 /// Per-thread native engine (`marker_inflate::Block`) resident working-set byte
 /// breakdown. This is the REAL native per-thread state after the flip-in-place
-/// fold (`gzip_chunk.rs` `BOOTSTRAP_BLOCK`); the staging-box hooks below are
+/// fold (`chunk_decode.rs` `BOOTSTRAP_BLOCK`); the staging-box hooks below are
 /// DEAD on native (they instrumented Engine C, which the fold removed). Built
 /// by `marker_inflate::Block::heap_bytes()`. Counters only.
 #[derive(Clone, Copy, Default)]
@@ -110,13 +110,13 @@ thread_local! {
 }
 
 /// Record this worker thread's native `Block` resident working set. Called from
-/// the native bootstrap (`gzip_chunk.rs` `marker_decode_step_vendor_block` /
+/// the native bootstrap (`chunk_decode.rs` `marker_decode_step_vendor_block` /
 /// `_marker_ring`) once the thread-local engine is primed. No-op unless
 /// `GZIPPY_MEM_STATS` is set, and the registry lock is taken at most ONCE per
 /// thread (subsequent calls early-return on the thread-local flag). Counters
 /// only — does not touch decode state.
 #[inline]
-#[allow(dead_code)] // sole caller is under cfg(parallel_sm) (gzip_chunk.rs)
+#[allow(dead_code)] // sole caller is under cfg(parallel_sm) (chunk_decode.rs)
 pub fn on_block_active(bytes: BlockHeapBytes) {
     // Ballast (positive control) is on its OWN switch, independent of
     // GZIPPY_MEM_STATS, so the RSS-vs-T guard can drive it without accounting

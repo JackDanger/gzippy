@@ -734,7 +734,7 @@ impl Block {
     /// Resident PER-THREAD working-set byte breakdown for the gzippy-native
     /// cache-residency mandate (`git history (campaign plan, removed)`). This
     /// is the persistent thread-local engine state (`BOOTSTRAP_BLOCK`,
-    /// `gzip_chunk.rs`) — the real native working set after the flip-in-place
+    /// `chunk_decode.rs`) — the real native working set after the flip-in-place
     /// fold removed Engine C. Counters only; never mutates decode state.
     ///
     /// Components (native `pure_inflate_decode` build):

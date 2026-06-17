@@ -24,7 +24,7 @@
 //!    offsets and the OUTPUT buffer at random sizes. The decoder MUST
 //!    produce byte-identical output regardless of where the caller
 //!    splits. This is where resumable-specific bugs hide (the a6c0a8b
-//!    regression cited at `gzip_chunk.rs:228-236` was exactly this
+//!    regression cited at `chunk_decode.rs:228-236` was exactly this
 //!    shape — the decoder kept looping past the boundary).
 //!
 //! Parameter space is enumerated deterministically (no proptest dep);

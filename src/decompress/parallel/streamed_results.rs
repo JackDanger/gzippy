@@ -6,7 +6,7 @@
 //!
 //! Append-only result queue with `push` / `finalise` on the producer side
 //! and blocking `get(position, timeout)` on consumers. Used by the async
-//! raw block-finder coordinator (`raw_block_finder.rs`), mirroring vendor
+//! raw block-finder coordinator (`async_block_finder.rs`), mirroring vendor
 //! `core/BlockFinder<RawFinder>`'s `m_blockOffsets` member
 //! (BlockFinder.hpp:202).
 

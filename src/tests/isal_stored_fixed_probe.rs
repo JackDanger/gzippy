@@ -1,7 +1,7 @@
 //! PROBE (JOB 2 diagnosis): does ISA-L's END_OF_BLOCK stopping point record
 //! boundaries on STORED (BTYPE=00) and FIXED-Huffman (BTYPE=01) blocks?
 //!
-//! The gzip_chunk.rs decline (the `end_bit<=stop_hint` BFINAL-only accept added
+//! The chunk_decode.rs decline (the `end_bit<=stop_hint` BFINAL-only accept added
 //! in 19add96c) fires when `decompress_deflate_from_bit_with_boundaries` returns
 //! ZERO boundaries at-or-past the stop hint on stored/fixed input. This probe
 //! constructs deflate streams dominated by stored and fixed blocks and reports
@@ -317,7 +317,7 @@ fn materialize_tiny_block_tmp() {
 #[cfg(all(parallel_sm, target_arch = "x86_64"))]
 #[test]
 fn isal_coverage_on_tiny_blocks() {
-    use crate::decompress::parallel::gzip_chunk::{
+    use crate::decompress::parallel::chunk_decode::{
         ISAL_ENGINE_ORACLE_CHUNKS, ISAL_ENGINE_ORACLE_FALLBACKS,
     };
     use std::sync::atomic::Ordering;

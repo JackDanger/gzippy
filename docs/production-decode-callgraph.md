@@ -17,7 +17,7 @@ bad-speculative-seed fallback (`resumable_resync`), never on the clean tail.
 
 ## Per-chunk decode (same *shape* as rapidgzip)
 
-**One function:** `gzip_chunk::decode_chunk_with_rapidgzip_impl` →
+**One function:** `chunk_decode::decode_chunk_with_rapidgzip_impl` →
 `decode_chunk_unified_marker` (vendor single `deflate::Block<containsMarkerBytes>`,
 `decodeChunkWithRapidgzip` + `finishDecodeChunkWithInexactOffset`).
 

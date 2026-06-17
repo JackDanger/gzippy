@@ -1525,7 +1525,7 @@ fn decode_chunk_unified_marker(
 ///     wrapper's `try_enter_next_block` cap stop), or the member's BFINAL
 ///     block ends with its BYTE-ALIGNED post-EOB bit == `stop_hint_bits`.
 ///   - Otherwise `ChunkDecodeError::ExactStopMissed { requested, actual }`,
-///     replicating gzip_chunk.rs `finish_decode_chunk_impl`'s
+///     replicating chunk_decode.rs `finish_decode_chunk_impl`'s
 ///     `final_bit != stop_hint_bits` assertion with the same coordinates.
 ///
 /// END-BIT COORDINATE CONVENTION (explicit, the BFINAL scar-class lesson):
@@ -3290,7 +3290,7 @@ mod tests {
 //   truncate decoded bytes + recompute CRC + set final_bit at that boundary.
 //
 // The post-processing rule is frozen BEFORE running (advisor Q1): if it
-// disagrees with the pure tail's coalesce rule (gzip_chunk.rs:459-497, esp.
+// disagrees with the pure tail's coalesce rule (chunk_decode.rs:459-497, esp.
 // the END_OF_BLOCK_HEADER/last_eob_pos branch at :478-489) that disagreement
 // is the GATE FINDING, not a bug to patch out.
 #[cfg(all(test, isal_clean_tail))]
@@ -4002,7 +4002,7 @@ mod isal_tail_parity {
 /// starts at-or-past stop_hint (the faithful rapidgzip behavior). The pre-fold
 /// two-phase tail (`StreamingInflateWrapper`, kept on `isal_clean_tail`) has an
 /// ISA-L-emulation rewind that can keep/skip one fixed-vs-dynamic block at a
-/// header straddle (gzip_chunk.rs:481-486). That is a *speculative* stop-point
+/// header straddle (chunk_decode.rs:481-486). That is a *speculative* stop-point
 /// difference only — the consumer reconciles it exactly via `furthest_decoded_
 /// bit` and `block_finder.insert(chunk_end_bit)` (chunk_fetcher.rs:1074, 2663),
 /// so concatenated output is byte-identical either way (proven end-to-end by
