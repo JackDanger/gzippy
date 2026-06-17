@@ -1,8 +1,18 @@
 #![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
 
-//! High-Performance Deflate Block Finder
+//! Deflate block-boundary VALIDATION primitives (the candidate finder/validator).
 //!
-//! Implements rapidgzip's approach to finding valid deflate block boundaries:
+//! Port of rapidgzip's `blockfinder/` directory — the per-position deflate-header
+//! checkers — NOT vendor's `core/BlockFinder.hpp` (that async coordinator is
+//! [`super::raw_block_finder`]) and NOT `GzipBlockFinder.hpp` (the offset
+//! partitioner is [`super::gzip_block_finder`]). Concretely this mirrors:
+//!   - `blockfinder/DynamicHuffman.hpp` (15-bit next-candidate LUT + precode/
+//!     Huffman validation)
+//!   - `blockfinder/Uncompressed.hpp` (stored-block boundary check)
+//!
+//! Also hosts the shared [`BitReader`] used across the parallel modules.
+//!
+//! Validates valid deflate block boundaries via:
 //! 1. 15-bit LUT for quick invalid position skipping
 //! 2. Precode validation via leaf counting
 //! 3. Full Huffman table validation

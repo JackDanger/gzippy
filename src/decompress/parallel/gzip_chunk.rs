@@ -2,7 +2,12 @@
 #![allow(dead_code)]
 // task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
-//! Per-chunk deflate decode for parallel single-member.
+//! Per-chunk deflate decode DRIVER for parallel single-member (the decode
+//! *logic*, despite the data-flavored name). Port of rapidgzip's
+//! `GzipChunkFetcher::decodeChunkWithRapidgzip` / `decodeChunk`
+//! (GzipChunkFetcher.hpp). Distinct from: [`super::chunk_data`] (the
+//! `ChunkData` *container* it fills) and [`super::chunk_fetcher`] (the
+//! `processNextChunk` *orchestration* that calls this).
 //!
 //! - [`decode_chunk_with_rapidgzip`] — vendor `decodeChunkWithRapidgzip` +
 //!   `finishDecodeChunkWithInexactOffset` on one [`ChunkData`]:

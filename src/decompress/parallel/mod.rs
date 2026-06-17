@@ -29,9 +29,6 @@ pub mod contig_prof;
 pub mod crc32;
 #[cfg(parallel_sm)]
 pub mod decode_bypass;
-// Window-absent marker decoder (u16 ring + pre-seeded marker zone), shared with
-// the unified single-member decode path. Formerly `deflate_block`; renamed to
-// retire the "deflate_block bootstrap" name from production entirely.
 pub mod error;
 #[cfg(parallel_sm)]
 pub mod fd_vectored_write;
@@ -50,6 +47,10 @@ pub mod inflate_wrapper;
 pub mod lut_bulk_inflate;
 #[cfg(parallel_sm)]
 pub mod lut_huffman;
+/// Window-absent marker decoder: literal port of `rapidgzip::deflate::Block`
+/// (vendor/.../gzip/deflate.hpp:513-1156) — the u16-marker ring + pre-seeded
+/// marker zone decode loops shared by the unified single-member path. (Formerly
+/// `deflate_block`; renamed to retire the "deflate_block bootstrap" name.)
 #[cfg(parallel_sm)]
 pub mod marker_inflate;
 #[cfg(parallel_sm)]
@@ -65,7 +66,6 @@ pub mod raw_block_finder;
 pub mod removal_oracle;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
-pub mod rfc_tables;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;
 /// CLEAN-ONLY ENGINE ORACLE — force every chunk through the clean decode path
