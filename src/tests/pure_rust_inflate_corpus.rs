@@ -1,6 +1,6 @@
 //! Corpus differential harness for the `pure-rust-inflate` backend.
 //!
-//! Plan: see `plans/rust-rapidgzip.md` (this corpus is the §7
+//! Plan: see `former plans/rust-rapidgzip.md` (this corpus is the §7
 //! correctness gate). The original Step 0.2 plan is in git history.
 //!
 //! This is the gate that catches "the wrapper API tests pass against

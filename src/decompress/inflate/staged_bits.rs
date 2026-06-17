@@ -21,7 +21,7 @@ thread_local! {
     /// tail constructs one `StagedBitInput` per chunk; without pooling that is
     /// ~128 KiB of `Box` alloc/free churn per chunk per thread. Reusing the
     /// box keeps the per-thread working set fixed (cache-residency mandate,
-    /// plans/gzippy-native-design-mandate.md) and is byte-transparent: the box
+    /// former plans/gzippy-native-design-mandate.md) and is byte-transparent: the box
     /// content is ALWAYS fully overwritten by the constructor's first
     /// `reload_at_bit` (copy_from_slice + zero-pad tail) before any read, so a
     /// recycled box needs no zeroing.

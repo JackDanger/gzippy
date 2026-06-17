@@ -1387,7 +1387,7 @@ mod tests {
             dangerous_entries
         );
         // Demonstrative — the count may be 0 for this particular
-        // code-length set, but the bug class is real (see deflate_block.rs
+        // code-length set, but the bug class is real (see marker_inflate.rs
         // wiring comment).
     }
 

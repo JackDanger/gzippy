@@ -868,10 +868,10 @@ mod tests {
     // entirely lost regression protection on the most common CI class).
     // =========================================================================
     // Perf gates (1a/1b) run on neurotic via `make test-x86_64` — see
-    // plans/rust-rapidgzip.md validation gate. Ignored in CI while the
+    // former plans/rust-rapidgzip.md validation gate. Ignored in CI while the
     // unported primitives (#1–#5) are still landing.
     #[test]
-    #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
+    #[ignore = "perf gate — run on neurotic, not GHA (former plans/rust-rapidgzip.md)"]
     #[cfg(parallel_sm)]
     fn test_single_member_parallel_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -921,7 +921,7 @@ mod tests {
         );
 
         // Validation Gate 1a (synthetic): parallel must beat sequential
-        // by 2× on ≥4 physical cores (plans/rust-rapidgzip.md Track A).
+        // by 2× on ≥4 physical cores (former plans/rust-rapidgzip.md Track A).
         let threshold = if physical >= 4 { 0.5 } else { 3.0 };
         assert!(
             ratio < threshold,
@@ -931,9 +931,9 @@ mod tests {
         );
     }
 
-    /// Real silesia corpus — Validation Gate 1b (plans/rust-rapidgzip.md A4).
+    /// Real silesia corpus — Validation Gate 1b (former plans/rust-rapidgzip.md A4).
     #[test]
-    #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
+    #[ignore = "perf gate — run on neurotic, not GHA (former plans/rust-rapidgzip.md)"]
     #[cfg(parallel_sm)]
     fn test_single_member_parallel_silesia() {
         use crate::tests::datasets;
@@ -1067,12 +1067,12 @@ mod tests {
     /// few back-refs, few block boundaries → speculation pathology. The
     /// 0.5× gate encodes the **production** (isal-compression) bar.
     /// **Expected RED on `--features pure-rust-inflate` until Phase B
-    /// lands** (`plans/pure-rust-perf.md`); pure-Rust inflate at ~334
+    /// lands** (`former plans/pure-rust-perf.md`); pure-Rust inflate at ~334
     /// MB/s vs ISA-L's ~800 MB/s leaves no headroom for speculation
     /// overhead on this fixture. Use `test_single_member_parallel_silesia`
     /// (real silesia.tar.gz) as the pure-Rust Phase B gate.
     #[test]
-    #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
+    #[ignore = "perf gate — run on neurotic, not GHA (former plans/rust-rapidgzip.md)"]
     #[cfg(parallel_sm)]
     fn test_single_member_parallel_silesia_class_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK

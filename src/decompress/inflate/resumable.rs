@@ -1,4 +1,4 @@
-//! Vendor-faithful resumable DEFLATE inflate (plans/rust-rapidgzip.md §5,
+//! Vendor-faithful resumable DEFLATE inflate (former plans/rust-rapidgzip.md §5,
 //! option 2).
 //!
 //! Mirrors `vendor/.../gzip/isal.hpp:254-356` `IsalInflateWrapper::readStream`:
@@ -17,7 +17,7 @@
 //! [`crate::decompress::parallel::inflate_wrapper::StreamingInflateWrapper`],
 //! the parallel-SM hot path.
 //!
-//! Plan progress (`plans/rust-rapidgzip.md §5`): all 7 steps complete.
+//! Plan progress (`former plans/rust-rapidgzip.md §5`): all 7 steps complete.
 //! The old `ResumableInflate` + `session: Vec<u8>` accumulator and the
 //! B3a headroom band-aid (commit 2eff70f) are deleted as of §5 step 6.
 
@@ -487,7 +487,7 @@ impl<'a> ResumableInflate2<'a> {
     ///   actually decoded in this call (NOT including the prefix);
     ///   i.e. `out_pos_after - out_pos_start`.
     ///
-    /// See `plans/unified-decoder.md` §6 "copy_match_windowed slow-path
+    /// See `former plans/unified-decoder.md` §6 "copy_match_windowed slow-path
     /// elimination" for the perf rationale.
     pub fn read_stream_starting_at(
         &mut self,
@@ -1016,7 +1016,7 @@ fn decode_huffman_body_resumable(
     //
     // The vendor-faithful win is elsewhere — likely BMI2 pext bit
     // extraction or specializing on FIXED-Huffman static tables.
-    // See `plans/pure-rust-perf.md` Phase B work-item #1(a).
+    // See `former plans/pure-rust-perf.md` Phase B work-item #1(a).
     // Vendor refill threshold pattern (mirror of
     // `consume_first_decode::decode_huffman_libdeflate_style:852-863`):
     // a single match consumes at most 48 bits — 20 for litlen (12 table +

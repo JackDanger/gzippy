@@ -1,5 +1,5 @@
 //! Unified deflate decoder — Phase 1 of the plan at
-//! `plans/unified-decoder.md` (sign-off commit `e2ecace`).
+//! `former plans/unified-decoder.md` (sign-off commit `e2ecace`).
 //!
 //! This file is the *type-system commitment* — three sealed-trait axes
 //! (`DecodeMode`, `ArchProfile`, `OutputModel`) and the `Inflate<M, A, O>`
