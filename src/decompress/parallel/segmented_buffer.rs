@@ -2,40 +2,65 @@
 #![allow(dead_code)]
 // task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
-//! Contiguous `Vec<u8>`-shaped buffer for `ChunkData::data` (the CLEAN,
-//! marker-free decoded output).
+//! `ChunkData::data` storage: a contiguous decode bulk PLUS an O(1)-prepend
+//! front-segment list — the faithful port of rapidgzip's
+//! `DecodedData::data = std::vector<VectorView<uint8_t>>`
+//! (`vendor/.../rapidgzip/DecodedData.hpp:234`).
 //!
-//! **Faithful port of rapidgzip's CLEAN-data storage** in
-//! `DecodedData::append` (`vendor/.../rapidgzip/DecodedData.hpp:278-289`):
-//! vendor stores the *marker* buffer (`dataWithMarkers`) in 128 KiB
-//! equally-sized chunks via `appendToEquallySizedChunks` (243-258) — but
-//! DELIBERATELY stores the clean `data` in single contiguous per-append
-//! buffers. The comment at `DecodedData.hpp:278-281` states that forcing
-//! the clean `dataBuffer` chunks to 128 KiB "makes no sense"; vendor does
-//! `dataBuffers.emplace_back(); copied.reserve(buffers.dataSize()); …`.
+//! ## Why a view-list and not one contiguous `Vec`
 //!
-//! An earlier gzippy revision wrongly applied the 128 KiB-segmented
-//! *marker* pattern (`Vec<Vec<u8>>`) to the *clean* buffer as well. That
-//! measured 3.26x DTLB-walks / 1.42x cycles vs rapidgzip at equal
-//! instruction count (1.01x) — the memory-bound gap. The clean bytes
-//! belong in ONE contiguous allocation, grown by amortized reserve.
+//! rapidgzip's `data` is a LIST of views. `cleanUnmarkedData`
+//! (`DecodedData.hpp:492-516`) narrows the marker-free clean tail into a small
+//! buffer and INSERTS A VIEW AT THE FRONT (`data.insert(data.begin(), …)`,
+//! O(1), one narrowing copy, NO byte-copy of the existing payload).
+//! `applyWindow` (`DecodedData.hpp:365-388`) resolves markers in place and
+//! likewise PREPENDS views — never copying the bulk.
+//!
+//! An earlier gzippy revision modelled `data` as a single contiguous
+//! `Vec<u8>` (faithful to vendor's *clean-append* storage `dataBuffers`, which
+//! IS contiguous per append). That kept the big sequential decode write
+//! DTLB-friendly, but it forced `cleanUnmarkedData`/`applyWindow` to
+//! `prepend_bytes`/`insert_logical_at` by REALLOCATING + memmoving the whole
+//! payload PER CHUNK (plus a temp-`Vec` narrow, so the clean tail was copied
+//! TWICE). perf-annotate measured `finalize_with_deflate` at ~10% of program
+//! instructions vs rapidgzip's `ChunkData::finalize` at ~0.11% — a ~90x
+//! gz-specific migration tax that is exactly this memmove/eager-narrow.
+//!
+//! ## The hybrid that converges WITHOUT regressing decode locality
+//!
+//! The decode engine (clean `run_contig`, A3 single-shot, ISA-L copy-free)
+//! requires ONE CONTIGUOUS buffer to write into and to resolve back-references
+//! against (`output[..out_pos]`). So decode keeps writing into a single
+//! contiguous bulk [`buf`]. Prepends — which only ever happen AFTER decode is
+//! complete (`finalize_with_deflate::clean_unmarked_data`, and the
+//! consumer-side `merge_resolved_markers_into_data` on the legacy/Folded
+//! path) — push onto [`front`], a small ordered list (typically 0-1 entries)
+//! whose first element is the logical start of the chunk. No bulk byte is ever
+//! moved by a prepend; the clean tail is narrowed DIRECTLY into its destination
+//! front segment (one copy, mirroring vendor's single `std::transform`).
+//!
+//! Logical content is `front[0] ‖ front[1] ‖ … ‖ buf`. The public API is
+//! unchanged from the contiguous version (same method names/signatures) so the
+//! decode sink, marker-resolution, window-construction and writev output paths
+//! are transparent to the switch — only the prepend cost changes.
+//!
+//! INVARIANT: decode-sink methods (`extend_from_slice`, `writable_tail*`,
+//! `contig_decode_window`, `commit`, `first_segment_a3_output`,
+//! `prefill_window_prefix`, `reserve`, `decoded_range`) run BEFORE any prepend,
+//! so they `debug_assert!(front.is_empty())` and operate on `buf` exactly as
+//! the contiguous version did.
 //!
 //! The u16 marker buffer stays 128 KiB-segmented in
 //! [`super::segmented_markers::SegmentedU16`] — that one MATCHES vendor's
 //! `dataWithMarkers` and must NOT be changed.
-//!
-//! The public API is unchanged from the segmented version (same method
-//! names/signatures) so the decode sink, A3 fast-path, marker-resolution,
-//! window-construction and writev output paths are byte-for-byte
-//! transparent to the switch — only the physical layout differs.
 
 use super::segmented_markers::SegmentedU16;
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 
 /// Vendor's `ALLOCATION_CHUNK_SIZE` (`ChunkData.hpp:65`). Reused here as
-/// the GROWTH GRANULARITY for the contiguous buffer's amortized reserve
+/// the GROWTH GRANULARITY for the contiguous bulk's amortized reserve
 /// and as the A3 single-shot decode window size — NOT a hard segment
-/// boundary. The clean buffer is one contiguous allocation.
+/// boundary. The decode bulk is one contiguous allocation.
 pub const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
 /// TEST-ONLY reserved-tail poison (OPT-IN via `GZIPPY_POISON_RESERVE`). The
@@ -72,33 +97,55 @@ fn poison_reserved_tail(_spare: &mut [u8]) {
     }
 }
 
-/// Vec<u8>-shaped contiguous buffer. Backed by a single
-/// `Vec<u8, RpmallocAlloc>` sourced from the worker buffer pool on first
-/// write and grown by amortized `reserve`.
+/// View-list-shaped clean-data buffer (faithful port of vendor
+/// `std::vector<VectorView<uint8_t>>`). A contiguous decode bulk [`Self::buf`]
+/// plus an O(1)-prepend ordered front-segment list [`Self::front`].
 ///
-/// Cloned via the derived impl: a single contiguous deep clone (matches
-/// vendor, whose `data` buffers are also contiguous per append). Used by
-/// `ChunkData::Clone` in the cache-promote path.
+/// Cloned via the derived impl (deep clone of every owned segment) — used by
+/// `ChunkData::Clone` in the cache-promote path. The byte count cloned is
+/// identical to the contiguous version; only the physical layout differs.
 #[derive(Debug, Clone)]
 pub struct SegmentedU8 {
-    /// Single contiguous backing store for all clean decoded bytes.
-    /// `buf.len()` is the logical byte count; `buf.capacity() == 0`
-    /// means "not yet sourced from the pool".
+    /// O(1)-prepended front segments, in LOGICAL order: `front[0]` is the
+    /// chunk's logical start. Populated only AFTER decode by
+    /// `cleanUnmarkedData`/`applyWindow`-style prepends. Typically empty or
+    /// a single entry. Vendor: the front of `data` (the prepended views).
+    front: Vec<U8>,
+    /// Single contiguous backing store for the decode bulk (clean
+    /// `run_contig`/A3/ISA-L output, plus any window-image prefix). Logically
+    /// FOLLOWS every front segment. `buf.capacity() == 0` means "not yet
+    /// sourced from the pool".
     buf: U8,
 }
 
 impl Default for SegmentedU8 {
     fn default() -> Self {
         Self {
+            front: Vec::new(),
             buf: types::u8_with_capacity(0),
         }
     }
 }
 
 impl SegmentedU8 {
+    /// Sum of the front-segment lengths. O(front.len()) — front is tiny.
+    #[inline]
+    fn front_total(&self) -> usize {
+        self.front.iter().map(|s| s.len()).sum()
+    }
+
+    /// All logical slices in order: front segments then the bulk. Includes
+    /// the (possibly empty) bulk so index/copy walks always terminate on it.
+    #[inline]
+    fn ordered_slices(&self) -> impl Iterator<Item = &[u8]> {
+        self.front
+            .iter()
+            .map(|s| s.as_slice())
+            .chain(std::iter::once(self.buf.as_slice()))
+    }
+
     /// Lazily source the backing allocation from the current worker's u8
-    /// pool (warm, pre-faulted pages) on first use, mirroring the old
-    /// per-segment `new_segment()` pull. No-op once `buf` owns an
+    /// pool (warm, pre-faulted pages) on first use. No-op once `buf` owns an
     /// allocation; `Vec`'s own amortized `reserve` handles later growth.
     #[inline]
     fn ensure_buf(&mut self, min_capacity: usize) {
@@ -108,32 +155,32 @@ impl SegmentedU8 {
         }
     }
 
-    /// Total byte count. O(1).
+    /// Total logical byte count. O(front.len()).
     #[inline]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.front_total() + self.buf.len()
     }
 
-    /// True iff no decoded bytes have been appended. O(1).
+    /// True iff no bytes have been appended or prepended.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.buf.is_empty() && self.front.iter().all(|s| s.is_empty())
     }
 
     /// True when the logical contents still fit in a single 128 KiB A3
-    /// decode window. The backing store is ALWAYS contiguous now, but we
-    /// preserve the prior A3-engagement gate so decode-path *selection*
-    /// stays byte-identical to the segmented version — the only change is
-    /// the physical layout the A3 view points into.
+    /// decode window. Decode-time gate (front is empty) so it preserves the
+    /// segmented version's decode-path *selection* byte-for-byte.
     #[inline]
     pub fn all_in_first_segment(&self) -> bool {
+        debug_assert!(self.front.is_empty(), "all_in_first_segment is decode-time");
         self.buf.len() <= ALLOCATION_CHUNK_SIZE
     }
 
     /// Segment-native Option A3: install the predecessor's 32 KiB sliding
-    /// window at the FRONT of the contiguous buffer. Must run before any
+    /// window at the FRONT of the contiguous bulk. Must run before any
     /// decoded bytes are appended (`len() == 0`).
     pub fn prefill_window_prefix(&mut self, window: &[u8]) {
+        debug_assert!(self.front.is_empty(), "prefill before any prepend");
         debug_assert!(self.buf.is_empty(), "prefill before any decoded bytes");
         debug_assert!(
             window.len() <= ALLOCATION_CHUNK_SIZE,
@@ -153,8 +200,9 @@ impl SegmentedU8 {
     /// [`Self::all_in_first_segment`] holds (caller's gate).
     ///
     /// SAFETY contract: caller writes only at indices `>= len()` before
-    /// `commit`; identical to the segmented version this replaces.
+    /// `commit`; identical to the contiguous version this replaces.
     pub fn first_segment_a3_output(&mut self) -> &mut [u8] {
+        debug_assert!(self.front.is_empty(), "a3 output is decode-time");
         self.ensure_buf(ALLOCATION_CHUNK_SIZE);
         debug_assert!(self.buf.capacity() >= ALLOCATION_CHUNK_SIZE);
         let cap = self.buf.capacity();
@@ -164,36 +212,56 @@ impl SegmentedU8 {
     }
 
     /// Write every decoded payload byte, skipping the first `skip_prefix`
-    /// logical bytes (the A3 window image at the front of the buffer).
+    /// logical bytes (the A3 window image at the front of the bulk).
     pub fn write_payload_skipping_prefix<W: std::io::Write>(
         &self,
         skip_prefix: usize,
         writer: &mut W,
     ) -> std::io::Result<()> {
-        if skip_prefix >= self.buf.len() {
-            return Ok(());
+        let mut skip = skip_prefix;
+        for seg in self.ordered_slices() {
+            if seg.is_empty() {
+                continue;
+            }
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            writer.write_all(&seg[skip..])?;
+            skip = 0;
         }
-        writer.write_all(&self.buf[skip_prefix..])
+        Ok(())
     }
 
     /// Collect payload slice refs for `writev` (skips `skip_prefix`
-    /// logical bytes). One contiguous slice now.
+    /// logical bytes). Yields each non-empty logical segment in order.
     pub fn append_payload_iovecs<'a>(&'a self, skip_prefix: usize, out: &mut Vec<&'a [u8]>) {
-        if skip_prefix >= self.buf.len() {
-            return;
+        let mut skip = skip_prefix;
+        for seg in self.ordered_slices() {
+            if seg.is_empty() {
+                continue;
+            }
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            out.push(&seg[skip..]);
+            skip = 0;
         }
-        out.push(&self.buf[skip_prefix..]);
     }
 
-    /// Truncate to zero length, retaining the allocation for reuse.
+    /// Truncate to zero length, retaining the bulk allocation for reuse and
+    /// dropping front segments.
     pub fn clear(&mut self) {
+        self.front.clear();
         self.buf.clear();
     }
 
-    /// Append a clean (marker-free) byte slice. Contiguous, amortized
-    /// growth. Mirror of vendor's contiguous clean-data append
-    /// (`DecodedData.hpp:282-289`).
+    /// Append a clean (marker-free) byte slice to the bulk. Decode-time
+    /// (front empty). Contiguous, amortized growth. Mirror of vendor's
+    /// contiguous clean-data append (`DecodedData.hpp:282-289`).
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        debug_assert!(self.front.is_empty(), "extend after prepend not supported");
         if bytes.is_empty() {
             return;
         }
@@ -203,25 +271,22 @@ impl SegmentedU8 {
 
     /// Zero-copy decode sink: return a writable window (up to
     /// [`ALLOCATION_CHUNK_SIZE`] bytes) of contiguous spare capacity at the
-    /// tail for a decoder to write DIRECTLY into. After the decoder writes
-    /// N bytes, call [`Self::commit`] to record them. The 128 KiB cap
-    /// keeps the resumable decoder's per-call cadence (and its 32 KiB
-    /// window ring) identical to the segmented version; the bytes are now
-    /// physically contiguous with the prior tail.
+    /// tail of the bulk for a decoder to write DIRECTLY into. Decode-time
+    /// (front empty). After the decoder writes N bytes, call [`Self::commit`].
     ///
     /// SAFETY contract: the caller must only WRITE into the returned slice
     /// (uninitialized spare) and call `commit(n)` with `n <= slice.len()`
     /// before the next mutating call.
     pub fn writable_tail(&mut self) -> &mut [u8] {
+        debug_assert!(self.front.is_empty(), "writable_tail is decode-time");
         self.ensure_buf(ALLOCATION_CHUNK_SIZE);
         let len = self.buf.len();
         if self.buf.capacity() == len {
             // Only grow once the contiguous spare is fully exhausted, so
             // the decoder's per-call window cadence matches the segmented
-            // version (which handed out the current 128 KiB segment's
-            // remainder, then a fresh segment). Amortized; may realloc +
-            // move, but no live raw pointer spans this call — callers
-            // re-fetch the tail each outer decode iteration.
+            // version. Amortized; may realloc + move, but no live raw
+            // pointer spans this call — callers re-fetch the tail each
+            // outer decode iteration.
             self.buf.reserve(ALLOCATION_CHUNK_SIZE);
         }
         let window = ALLOCATION_CHUNK_SIZE.min(self.buf.capacity() - len);
@@ -236,24 +301,20 @@ impl SegmentedU8 {
 
     /// Like [`Self::writable_tail`] but guarantees AT LEAST `min_spare` bytes of
     /// CONTIGUOUS spare capacity and returns the WHOLE spare region (not capped
-    /// at [`ALLOCATION_CHUNK_SIZE`]). Used by the copy-free ISA-L oracle to give
-    /// the FFI decoder one contiguous output buffer to write directly into, so
-    /// no intermediate `Vec` + `copy_from_slice` confounds the WALL measurement.
+    /// at [`ALLOCATION_CHUNK_SIZE`]). Used by the copy-free ISA-L oracle.
+    /// Decode-time (front empty).
     /// SAFETY contract identical to [`Self::writable_tail`]: write-then-`commit`.
     pub fn writable_tail_reserve(&mut self, min_spare: usize) -> &mut [u8] {
+        debug_assert!(
+            self.front.is_empty(),
+            "writable_tail_reserve is decode-time"
+        );
         self.ensure_buf(self.buf.len() + min_spare);
         let len = self.buf.len();
         if self.buf.capacity() - len < min_spare {
             // `Vec::reserve(additional)` guarantees `capacity >= len + additional`,
             // so to obtain `min_spare` bytes of spare PAST the current `len` we must
-            // request `min_spare` directly — NOT `min_spare - (capacity - len)`. The
-            // latter under-requests: `reserve` measures from `len`, so subtracting the
-            // already-available spare made it a no-op whenever `min_spare` exceeded the
-            // current capacity but the *delta* was smaller than the existing spare
-            // (e.g. len=49 KiB, cap=16.6 MiB, min_spare=16.5 MiB → reserve(704 KiB)
-            // no-ops because 704 KiB < 16.6 MiB spare, leaving the buffer SHORT). That
-            // mis-sizing handed the copy-free ISA-L FFI a too-small slice on dense
-            // tiny-block input. Reserve `min_spare` so the post-condition holds.
+            // request `min_spare` directly — NOT `min_spare - (capacity - len)`.
             self.buf.reserve(min_spare);
         }
         let spare = self.buf.capacity() - len;
@@ -267,28 +328,22 @@ impl SegmentedU8 {
     }
 
     /// Copy-free-to-final contig decode window (gzippy-native FOLD post-flip
-    /// tail). Ensures at least `min_spare` bytes of CONTIGUOUS spare past the
-    /// current logical length, then returns `(base, cap, len)` where `base` is
-    /// the FULL backing pointer (offset 0), `cap` the allocation capacity, and
-    /// `len` the current committed length (= the contig write head `*pos`). The
-    /// decoder writes at `base.add(len..)` and resolves back-refs from
-    /// `base[*pos - distance]` — the already-committed clean tail (the faithful
-    /// vendor `setInitialWindow` prepend, where prior real output precedes new).
-    ///
-    /// The full base (not the tail) is returned BECAUSE `decode_clean_into_contig`
-    /// addresses back-refs against `base[0..*pos)`, not a tail window.
+    /// tail). Decode-time (front empty). Ensures at least `min_spare` bytes of
+    /// CONTIGUOUS spare past the current logical length, then returns
+    /// `(base, cap, len)` where `base` is the FULL backing pointer (offset 0),
+    /// `cap` the allocation capacity, and `len` the current committed length.
+    /// The decoder writes at `base.add(len..)` and resolves back-refs from
+    /// `base[*pos - distance]` — the already-committed clean tail.
     ///
     /// SAFETY contract: the caller writes only at indices `>= len` (uninitialized
     /// spare), within `[0, cap)`, then calls [`Self::commit`]. The returned
-    /// `base` is INVALIDATED by any subsequent grow (`reserve`/`extend`/this
-    /// method when it grows) — re-fetch every outer decode iteration (H4).
+    /// `base` is INVALIDATED by any subsequent grow — re-fetch every outer
+    /// decode iteration (H4).
     pub fn contig_decode_window(&mut self, min_spare: usize) -> (*mut u8, usize, usize) {
+        debug_assert!(self.front.is_empty(), "contig_decode_window is decode-time");
         self.ensure_buf(self.buf.len() + min_spare);
         let len = self.buf.len();
         if self.buf.capacity() - len < min_spare {
-            // `Vec::reserve(min_spare)` guarantees `capacity >= len + min_spare`
-            // (it reserves min_spare MORE than the current length), so the spare
-            // is at least `min_spare` after this call.
             self.buf.reserve(min_spare);
         }
         debug_assert!(
@@ -297,12 +352,6 @@ impl SegmentedU8 {
             self.buf.capacity() - len
         );
         let cap = self.buf.capacity();
-        // TEST-ONLY: poison the uninitialized contig spare `[len, cap)` so the
-        // Stage-2 copy-free clean tail (which writes u8 DIRECTLY here and resolves
-        // back-refs from the committed prefix) deterministically corrupts output
-        // on any read-before-write seam/regrow bug, instead of flakily passing on
-        // freshly-zeroed pages. No-op (inlines away) outside `cfg(test)` and
-        // unless `GZIPPY_POISON_RESERVE` is set — byte/cost-transparent shipped.
         // SAFETY: `[len, cap)` is allocated-but-uninitialized backing memory; the
         // decoder overwrites it before any read (same contract as the return).
         let spare =
@@ -312,9 +361,10 @@ impl SegmentedU8 {
     }
 
     /// Record `n` bytes written into the slice returned by
-    /// [`Self::writable_tail`] (or the A3 window). Bumps the logical
-    /// length. Panics in debug if `n` overflows spare capacity.
+    /// [`Self::writable_tail`] (or the A3 window). Decode-time (front empty).
+    /// Bumps the bulk's logical length. Panics in debug if `n` overflows spare.
     pub fn commit(&mut self, n: usize) {
+        debug_assert!(self.front.is_empty(), "commit is decode-time");
         if n == 0 {
             return;
         }
@@ -332,49 +382,53 @@ impl SegmentedU8 {
         }
     }
 
-    /// Zero-copy view of the committed bytes `[start, start+len)`. Used by the
-    /// copy-free ISA-L oracle to CRC the exact kept region without re-copying.
+    /// Zero-copy view of the committed bulk bytes `[start, start+len)`.
+    /// Decode-time (front empty). Used by the copy-free ISA-L oracle to CRC
+    /// the exact kept region without re-copying.
     #[inline]
     pub fn decoded_range(&self, start: usize, len: usize) -> &[u8] {
+        debug_assert!(self.front.is_empty(), "decoded_range is decode-time");
         &self.buf[start..start + len]
     }
 
-    /// Iterate over the logical contents as byte slices (one contiguous
-    /// slice; empty buffers yield nothing). Used by the consumer write
-    /// path and CRC.
+    /// Iterate over the logical contents as byte slices (front segments then
+    /// the bulk; empty slices are skipped). Used by the consumer write path
+    /// and CRC.
     #[inline]
     pub fn segments(&self) -> impl Iterator<Item = &[u8]> {
-        std::iter::once(self.buf.as_slice()).filter(|s| !s.is_empty())
+        self.ordered_slices().filter(|s| !s.is_empty())
     }
 
-    /// Number of populated backing buffers (0 or 1). Diagnostic surface.
+    /// Number of populated logical segments. Diagnostic surface.
     #[allow(dead_code)]
     pub fn segment_count(&self) -> usize {
-        usize::from(!self.buf.is_empty())
+        self.front.iter().filter(|s| !s.is_empty()).count() + usize::from(!self.buf.is_empty())
     }
 
-    /// Capacity of the contiguous backing store.
+    /// Total reserved capacity across the bulk and front segments.
     pub fn capacity(&self) -> usize {
-        self.buf.capacity()
+        self.front.iter().map(|s| s.capacity()).sum::<usize>() + self.buf.capacity()
     }
 
-    /// Hand the backing allocation to the chunk-buffer pool recycler as a
-    /// one-element `Vec<U8>` (the recycler returns each element to the
-    /// owner worker's u8 pool). Leaves `self` empty.
+    /// Hand every owned backing allocation (front segments then the bulk) to
+    /// the chunk-buffer pool recycler. Leaves `self` empty.
     pub fn take_segments(&mut self) -> Vec<U8> {
-        if self.buf.capacity() == 0 {
-            return Vec::new();
+        let mut out: Vec<U8> = Vec::with_capacity(self.front.len() + 1);
+        out.append(&mut self.front);
+        if self.buf.capacity() != 0 {
+            out.push(std::mem::replace(&mut self.buf, types::u8_with_capacity(0)));
         }
-        vec![std::mem::replace(&mut self.buf, types::u8_with_capacity(0))]
+        out
     }
 
-    /// Construct from owned backing buffer(s). The common case is the
-    /// single buffer a prior `take_segments` produced; multiple buffers
-    /// are concatenated into one contiguous allocation.
+    /// Construct from owned backing buffer(s) in logical order, concatenated
+    /// into one contiguous bulk (front empty). The common case is the single
+    /// buffer a prior `take_segments` produced.
     pub fn from_segments(mut segments: Vec<U8>) -> Self {
         match segments.len() {
             0 => Self::default(),
             1 => Self {
+                front: Vec::new(),
                 buf: segments.pop().unwrap(),
             },
             _ => {
@@ -383,13 +437,18 @@ impl SegmentedU8 {
                 for s in &segments {
                     buf.extend_from_slice(s);
                 }
-                Self { buf }
+                Self {
+                    front: Vec::new(),
+                    buf,
+                }
             }
         }
     }
 
-    /// Reserve at least `additional` more bytes of contiguous capacity.
+    /// Reserve at least `additional` more bytes of contiguous bulk capacity.
+    /// Decode-time (front empty).
     pub fn reserve(&mut self, additional: usize) {
+        debug_assert!(self.front.is_empty(), "reserve is decode-time");
         if additional == 0 {
             return;
         }
@@ -402,125 +461,229 @@ impl SegmentedU8 {
 
     /// Truncate the logical buffer to at most `new_len` bytes.
     pub fn truncate(&mut self, new_len: usize) {
-        self.buf.truncate(new_len);
+        let ft = self.front_total();
+        if new_len >= ft {
+            self.buf.truncate(new_len - ft);
+            return;
+        }
+        // Truncation lands inside the front list (rare — front prepends happen
+        // post-decode and truncate is a decode-time rollback, but handle it).
+        self.buf.clear();
+        let mut rem = new_len;
+        let mut keep = 0usize;
+        for (i, s) in self.front.iter_mut().enumerate() {
+            if rem >= s.len() {
+                rem -= s.len();
+                keep = i + 1;
+            } else {
+                s.truncate(rem);
+                keep = i + 1;
+                break;
+            }
+        }
+        self.front.truncate(keep);
     }
 
     /// Copy the logical contents into a single contiguous `Vec<u8>`. O(n).
     #[allow(dead_code)]
     pub fn to_contiguous(&self) -> Vec<u8> {
-        self.buf.as_slice().to_vec()
+        let mut v = Vec::with_capacity(self.len());
+        for s in self.ordered_slices() {
+            v.extend_from_slice(s);
+        }
+        v
     }
 
-    /// In-place index access. O(1). Returns `None` if out of bounds.
+    /// Logical index access. O(front.len()). Returns `None` if out of bounds.
     pub fn get(&self, index: usize) -> Option<u8> {
-        self.buf.get(index).copied()
+        let mut idx = index;
+        for s in &self.front {
+            if idx < s.len() {
+                return Some(s[idx]);
+            }
+            idx -= s.len();
+        }
+        self.buf.get(idx).copied()
     }
 
-    /// Mutable index access. O(1).
+    /// Mutable logical index access. O(front.len()).
     #[allow(dead_code)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut u8> {
-        self.buf.get_mut(index)
+        let mut idx = index;
+        for s in &mut self.front {
+            if idx < s.len() {
+                return s.get_mut(idx);
+            }
+            idx -= s.len();
+        }
+        self.buf.get_mut(idx)
     }
 
-    /// Iterate over each byte in append order.
+    /// Iterate over each byte in logical order.
     pub fn iter_bytes(&self) -> impl Iterator<Item = u8> + '_ {
-        self.buf.iter().copied()
-    }
-
-    #[inline]
-    fn tail_slice(&self, n: usize) -> &[u8] {
-        debug_assert!(
-            n <= self.buf.len(),
-            "tail_slice: n {n} > len {}",
-            self.buf.len()
-        );
-        &self.buf[self.buf.len() - n..]
+        self.front
+            .iter()
+            .flat_map(|s| s.iter().copied())
+            .chain(self.buf.iter().copied())
     }
 
     /// Copy the last `n` logical bytes into `out` (exactly `n` long).
-    /// Used to source a chunk's trailing 32 KiB sliding window.
+    /// Used to source a chunk's trailing 32 KiB sliding window. May span the
+    /// bulk and the front list.
     #[inline]
     pub fn copy_last_into(&self, out: &mut [u8]) {
-        out.copy_from_slice(self.tail_slice(out.len()));
+        let n = out.len();
+        let total = self.len();
+        debug_assert!(n <= total, "copy_last_into: n {n} > len {total}");
+        self.copy_range_into(total - n, out);
     }
 
     /// Specialized hot-path tail copy for the consumer publish chain.
     #[inline]
     pub fn copy_last_32k(&self, out: &mut [u8; 32768]) {
-        out.copy_from_slice(self.tail_slice(32768));
+        self.copy_last_into(out);
     }
 
-    /// Vec-producing twin of [`Self::copy_last_32k`]. One 32 KiB allocation,
-    /// one memcpy from the contiguous tail.
+    /// Vec-producing twin of [`Self::copy_last_32k`].
     #[inline]
     pub fn copy_last_32k_vec(&self) -> Vec<u8> {
-        self.tail_slice(32768).to_vec()
+        let mut v = vec![0u8; 32768];
+        self.copy_last_into(&mut v);
+        v
     }
 
-    /// Prepend `bytes` as the new logical prefix. Mirror of vendor's
-    /// `dataBuffers.emplace(dataBuffers.begin(), …)` in `cleanUnmarkedData`
-    /// (`DecodedData.hpp:502`).
+    /// Prepend `bytes` as a new front segment — O(1) view insert at the
+    /// logical front (no bulk byte-copy). Mirror of vendor's
+    /// `data.insert(data.begin(), …)` in `cleanUnmarkedData`
+    /// (`DecodedData.hpp:503`).
     pub fn prepend_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let mut nb =
-            types::u8_with_capacity((bytes.len() + self.buf.len()).max(ALLOCATION_CHUNK_SIZE));
-        nb.extend_from_slice(bytes);
-        nb.extend_from_slice(&self.buf);
-        self.buf = nb;
+        let mut seg = types::u8_with_capacity(bytes.len());
+        seg.extend_from_slice(bytes);
+        self.front.insert(0, seg);
     }
 
     /// Prepend `n` in-place-narrowed marker bytes (u8 view over u16
-    /// segments) without an intermediate `Vec`. Vendor `applyWindow` swap
-    /// (`DecodedData.hpp:365-388`).
+    /// segments) as a new front segment. Vendor `applyWindow` swap
+    /// (`DecodedData.hpp:365-388`). Legacy/Folded path — NOT production, which
+    /// keeps the narrowed bytes in `data_with_markers` and emits them as
+    /// zero-copy views via `append_narrowed_iovecs`.
     pub fn prepend_narrowed_from_markers(&mut self, markers: &SegmentedU16, n: usize) {
         if n == 0 {
             return;
         }
-        let mut nb = types::u8_with_capacity((n + self.buf.len()).max(ALLOCATION_CHUNK_SIZE));
+        let mut seg = types::u8_with_capacity(n);
         let mut left = n;
-        for seg in markers.segments() {
+        for mseg in markers.segments() {
             if left == 0 {
                 break;
             }
-            let take = left.min(seg.len());
+            let take = left.min(mseg.len());
             // SAFETY: `resolve_and_narrow_in_place` wrote u8 at byte offsets
-            // `[0, seg.len())` in this segment's storage.
-            let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, take) };
-            nb.extend_from_slice(sl);
+            // `[0, mseg.len())` in this segment's storage.
+            let sl = unsafe { std::slice::from_raw_parts(mseg.as_ptr() as *const u8, take) };
+            seg.extend_from_slice(sl);
             left -= take;
         }
-        debug_assert_eq!(
-            left, 0,
-            "prepend_narrowed_from_markers: short by {left} bytes"
-        );
-        nb.extend_from_slice(&self.buf);
-        self.buf = nb;
+        debug_assert_eq!(left, 0, "prepend_narrowed_from_markers: short by {left}");
+        self.front.insert(0, seg);
+    }
+
+    /// Prepend the marker-free clean tail `markers[split_at .. split_at+n]`
+    /// (every value already `< 256` by construction) as a new front segment,
+    /// narrowing u16→u8 DIRECTLY into the destination — ONE copy, no temp `Vec`,
+    /// no bulk memmove. This is the faithful port of vendor `cleanUnmarkedData`'s
+    /// single `std::transform(marker.base(), …, downcasted->begin(), to_u8)`
+    /// into the front-inserted `dataBuffer` (`DecodedData.hpp:502-505`).
+    ///
+    /// `split_at` and `n` are in u16-ELEMENT units of `markers` (one element →
+    /// one output byte). After this call, [`Self::first_front_bytes`] returns
+    /// exactly the narrowed bytes (for CRC) without re-copying.
+    pub fn prepend_narrowed_clean_tail(
+        &mut self,
+        markers: &SegmentedU16,
+        split_at: usize,
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let mut seg = types::u8_with_capacity(n);
+        let mut skip = split_at;
+        let mut left = n;
+        for mseg in markers.segments() {
+            if left == 0 {
+                break;
+            }
+            if skip >= mseg.len() {
+                skip -= mseg.len();
+                continue;
+            }
+            let take = left.min(mseg.len() - skip);
+            seg.extend(mseg[skip..skip + take].iter().map(|&v| v as u8));
+            left -= take;
+            skip = 0;
+        }
+        debug_assert_eq!(left, 0, "prepend_narrowed_clean_tail: short by {left}");
+        self.front.insert(0, seg);
+    }
+
+    /// Bytes of the most-recently-prepended front segment (`front[0]`). Used
+    /// to CRC the migrated clean tail straight out of its destination, with no
+    /// re-copy. Returns `&[]` if there are no front segments.
+    #[inline]
+    pub fn first_front_bytes(&self) -> &[u8] {
+        self.front.first().map(|s| s.as_slice()).unwrap_or(&[])
     }
 
     /// Copy the logical byte range `[start, start + out.len())` into `out`.
     pub fn copy_range_into(&self, start: usize, out: &mut [u8]) {
         let n = out.len();
         debug_assert!(
-            start + n <= self.buf.len(),
+            start + n <= self.len(),
             "copy_range_into: [{start}, {}) > len {}",
             start + n,
-            self.buf.len()
+            self.len()
         );
-        out.copy_from_slice(&self.buf[start..start + n]);
+        if n == 0 {
+            return;
+        }
+        let mut skip = start;
+        let mut written = 0usize;
+        for seg in self.ordered_slices() {
+            if written >= n {
+                break;
+            }
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            let take = (seg.len() - skip).min(n - written);
+            out[written..written + take].copy_from_slice(&seg[skip..skip + take]);
+            written += take;
+            skip = 0;
+        }
+        debug_assert_eq!(written, n, "copy_range_into underran");
     }
 
-    /// Truncate to the first `at` logical bytes; return the suffix as a
-    /// new `SegmentedU8`. Used by `clean_unmarked_data`.
+    /// Truncate to the first `at` logical bytes; return the suffix as a new
+    /// `SegmentedU8`. Decode-time helper (front empty).
     pub fn split_off(&mut self, at: usize) -> SegmentedU8 {
+        debug_assert!(self.front.is_empty(), "split_off with front prepends");
         debug_assert!(at <= self.buf.len());
         let tail = self.buf.split_off(at);
-        SegmentedU8 { buf: tail }
+        SegmentedU8 {
+            front: Vec::new(),
+            buf: tail,
+        }
     }
 
-    /// Insert `bytes` at logical offset `offset` (shifting the suffix
-    /// right).
+    /// Insert `bytes` at logical offset `offset` (shifting the suffix right).
+    /// `offset == 0` is an O(1) front prepend. `offset > 0` is the
+    /// window-present (`data_prefix_len > 0`) path, which carries no front
+    /// prepends, so it inserts into the contiguous bulk.
     pub fn insert_logical_at(&mut self, offset: usize, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -529,8 +692,13 @@ impl SegmentedU8 {
             self.prepend_bytes(bytes);
             return;
         }
+        debug_assert!(
+            self.front.is_empty(),
+            "insert_logical_at(offset>0) with front prepends"
+        );
         if offset >= self.buf.len() {
-            self.extend_from_slice(bytes);
+            self.ensure_buf(bytes.len());
+            self.buf.extend_from_slice(bytes);
             return;
         }
         let tail = self.buf.split_off(offset);
@@ -539,30 +707,35 @@ impl SegmentedU8 {
     }
 
     /// Append the entire logical contents of `other` onto `self`, moving
-    /// `other`'s allocation in wholesale when `self` is empty (the common
-    /// merge case). Leaves `other` empty.
+    /// `other`'s bulk allocation wholesale when `self` is empty. Leaves
+    /// `other` empty.
     pub fn append_segmented(&mut self, other: &mut SegmentedU8) {
-        if other.buf.is_empty() {
+        if other.is_empty() {
             return;
         }
-        if self.buf.is_empty() {
-            std::mem::swap(&mut self.buf, &mut other.buf);
+        if self.is_empty() {
+            std::mem::swap(self, other);
             return;
         }
-        self.buf.extend_from_slice(&other.buf);
-        other.buf.clear();
+        // `other`'s logical content goes after self's. Flatten other into a
+        // contiguous tail of self.buf (front of `other` would otherwise need to
+        // interleave). Front of `self` is preserved as the logical prefix.
+        for seg in other.ordered_slices() {
+            if !seg.is_empty() {
+                self.buf.extend_from_slice(seg);
+            }
+        }
+        other.clear();
     }
 }
 
-/// Sink for the incremental (growable) copy-free ISA-L decode. Grows the single
-/// contiguous backing `Vec` on demand so the steady-state footprint tracks the
-/// ACTUAL decoded size rather than an 8x-compressed-span over-reserve — the
-/// faithful analogue of rapidgzip's fixed-`ALLOCATION_CHUNK_SIZE` segment append
-/// (GzipChunk.hpp:309-379), done on one contiguous Vec.
+/// Sink for the incremental (growable) copy-free ISA-L decode. Decode-time
+/// (front empty). Grows the single contiguous bulk on demand.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 impl crate::backends::isal_decompress::IncrementalOutSink for SegmentedU8 {
     #[inline]
     fn commit_and_reserve(&mut self, just_written: usize, min_spare: usize) -> (*mut u8, usize) {
+        debug_assert!(self.front.is_empty(), "ISA-L sink is decode-time");
         self.commit(just_written);
         if min_spare == 0 {
             // Final flush: commit only; the returned region is unused.
@@ -607,7 +780,7 @@ mod tests {
         buf.extend_from_slice(&chunk_a);
         buf.extend_from_slice(&chunk_b);
         assert_eq!(buf.len(), ALLOCATION_CHUNK_SIZE + 40);
-        // Contiguous now — a single backing buffer regardless of size.
+        // Decode bulk stays one contiguous buffer regardless of size.
         assert_eq!(buf.segment_count(), 1);
         let cat: Vec<u8> = buf.segments().flatten().copied().collect();
         assert_eq!(cat[..chunk_a.len()], chunk_a[..]);
@@ -739,5 +912,121 @@ mod tests {
         buf.copy_last_32k(&mut out);
         assert_eq!(&out[..], &src[src.len() - 32768..]);
         assert_eq!(buf.copy_last_32k_vec(), src[src.len() - 32768..].to_vec());
+    }
+
+    // ---- front-list (view-list convergence) coverage ----
+
+    #[test]
+    fn prepend_view_no_bulk_copy_logical_order() {
+        // bulk = "world", prepend "hello " at front (O(1) view insert).
+        let mut buf = SegmentedU8::default();
+        buf.extend_from_slice(b"world");
+        buf.prepend_bytes(b"hello ");
+        assert_eq!(buf.len(), 11);
+        assert_eq!(buf.segment_count(), 2);
+        assert_eq!(buf.to_contiguous(), b"hello world");
+        // logical indexing across the boundary
+        assert_eq!(buf.get(0), Some(b'h'));
+        assert_eq!(buf.get(5), Some(b' '));
+        assert_eq!(buf.get(6), Some(b'w'));
+        assert_eq!(buf.get(10), Some(b'd'));
+        assert_eq!(buf.get(11), None);
+        // iter_bytes order
+        let it: Vec<u8> = buf.iter_bytes().collect();
+        assert_eq!(it, b"hello world");
+    }
+
+    #[test]
+    fn two_prepends_logical_order_markers_then_clean_then_bulk() {
+        // Mimic finalize (clean tail prepend) then applyWindow (markers prepend).
+        let mut buf = SegmentedU8::default();
+        buf.extend_from_slice(b"BULK"); // run_contig clean tail decoded post-flip
+        buf.prepend_bytes(b"clean"); // clean_unmarked_data clean tail
+        buf.prepend_bytes(b"MARK"); // applyWindow resolved markers (legacy path)
+        assert_eq!(buf.to_contiguous(), b"MARKcleanBULK");
+        assert_eq!(buf.segment_count(), 3);
+
+        // copy_range_into spanning all three segments
+        let mut mid = [0u8; 7];
+        buf.copy_range_into(2, &mut mid); // "RKclea"... len 7 => "RKcleanB"? check
+        assert_eq!(&mid, b"RKclean");
+
+        // copy_last_into spanning bulk + a front seg
+        let mut last = [0u8; 6];
+        buf.copy_last_into(&mut last);
+        assert_eq!(&last, b"anBULK");
+    }
+
+    #[test]
+    fn prepend_narrowed_clean_tail_one_copy() {
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        // markers buffer: [m, m, 0x41('A'), 0x42('B'), 0x43('C')] where the
+        // first two are real markers and the trailing 3 are the clean tail.
+        let mut markers = SegmentedU16::default();
+        markers.push_slice(&[MARKER_BASE, MARKER_BASE + 1, 0x41, 0x42, 0x43]);
+        let split_at = 2; // first 2 stay markered
+        let n = 3; // clean tail length
+        let mut buf = SegmentedU8::default();
+        buf.prepend_narrowed_clean_tail(&markers, split_at, n);
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.first_front_bytes(), b"ABC");
+        assert_eq!(buf.to_contiguous(), b"ABC");
+    }
+
+    #[test]
+    fn prepend_narrowed_clean_tail_matches_temp_vec_path() {
+        // Equivalence: direct-narrow front prepend == old narrow-into-temp + prepend_bytes.
+        let mut markers = SegmentedU16::default();
+        let vals: Vec<u16> = (0..500u16).map(|i| (i % 256)).collect();
+        markers.push_slice(&vals);
+        let split_at = 137;
+        let n = vals.len() - split_at;
+
+        let mut direct = SegmentedU8::default();
+        direct.extend_from_slice(b"tail-bulk");
+        direct.prepend_narrowed_clean_tail(&markers, split_at, n);
+
+        let mut temp: Vec<u8> = Vec::with_capacity(n);
+        temp.extend(vals[split_at..].iter().map(|&v| v as u8));
+        let mut viaold = SegmentedU8::default();
+        viaold.extend_from_slice(b"tail-bulk");
+        viaold.prepend_bytes(&temp);
+
+        assert_eq!(direct.to_contiguous(), viaold.to_contiguous());
+        assert_eq!(direct.first_front_bytes(), &temp[..]);
+    }
+
+    #[test]
+    fn append_payload_iovecs_skips_prefix_across_segments() {
+        let mut buf = SegmentedU8::default();
+        buf.extend_from_slice(b"BULK");
+        buf.prepend_bytes(b"PREFIXdata");
+        // skip 6 ("PREFIX") -> "dataBULK"
+        let mut parts: Vec<&[u8]> = Vec::new();
+        buf.append_payload_iovecs(6, &mut parts);
+        let cat: Vec<u8> = parts.concat();
+        assert_eq!(cat, b"dataBULK");
+    }
+
+    #[test]
+    fn truncate_into_front_segment() {
+        let mut buf = SegmentedU8::default();
+        buf.extend_from_slice(b"BULK");
+        buf.prepend_bytes(b"FRONT");
+        assert_eq!(buf.len(), 9);
+        buf.truncate(3); // inside front seg "FRONT" -> "FRO"
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.to_contiguous(), b"FRO");
+        buf.truncate(0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn insert_logical_at_offset_zero_is_prepend() {
+        let mut buf = SegmentedU8::default();
+        buf.extend_from_slice(b"world");
+        buf.insert_logical_at(0, b"hello ");
+        assert_eq!(buf.to_contiguous(), b"hello world");
+        assert_eq!(buf.segment_count(), 2);
     }
 }
