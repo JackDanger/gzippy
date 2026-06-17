@@ -13,8 +13,8 @@
 //! trailer, mod 2^32). For multi-member files where the true output
 //! size exceeds 4 GiB, the caller MUST pre-size larger and trim on
 //! finalize; today's `MmapWriter::open_pre_sized` accepts an exact
-//! size and the call site picks it (e.g. via the `ultra_fast_inflate`
-//! multi-member detection in `decompress::io`).
+//! size and the call site picks it (e.g. via the multi-member
+//! detection in `decompress::io`).
 //!
 //! ## Why a custom Write impl
 //!
