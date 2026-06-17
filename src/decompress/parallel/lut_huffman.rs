@@ -946,6 +946,15 @@ impl LutLitLenCode {
         for h in self.lit_and_dist_huff.iter_mut() {
             h.0 = 0;
         }
+        // BUGFIX: `code_list` is a PERSISTENT, reused box. Fixed-Huffman
+        // blocks populate fewer entries than a prior dynamic block left
+        // behind, so stale tail slots (e.g. the 2 length-8 fixed slots)
+        // can hold an out-of-range prior index → `make_inflate_huff_code_*`
+        // rejects a valid stream as `InvalidCodeLengths`. The C buffer is
+        // freshly built each call; replicate that by clearing it here.
+        for v in self.code_list.iter_mut() {
+            *v = 0;
+        }
         let mut lit_count: [u16; MAX_LIT_LEN_COUNT] = [0; MAX_LIT_LEN_COUNT];
         let mut lit_expand_count: [u16; MAX_LIT_LEN_COUNT] = [0; MAX_LIT_LEN_COUNT];
 
@@ -1389,6 +1398,53 @@ mod tests {
         // Demonstrative — the count may be 0 for this particular
         // code-length set, but the bug class is real (see marker_inflate.rs
         // wiring comment).
+    }
+
+    /// LOCKING regression for the leaked-state `InvalidCodeLengths` bug:
+    /// `LutLitLenCode.code_list` is a PERSISTENT reused box. A prior build
+    /// (or any stale content) leaves indices in the tail slots; a fresh
+    /// fixed-Huffman rebuild populates fewer entries and, before the fix,
+    /// the stale slots fed an out-of-range index into the LUT builder →
+    /// `rebuild_from` returned false (surfacing as `InvalidCodeLengths` on
+    /// a perfectly valid fixed-Huffman block that followed a dynamic one).
+    /// This test dirties `code_list` between two identical valid builds and
+    /// asserts the second still succeeds. Decode-free and fast.
+    #[test]
+    fn bughunt_reuse_dynamic_then_fixed() {
+        // Full RFC 1951 §3.2.6 fixed-Huffman lit/len lengths (288 syms;
+        // symbols 286/287 are the length-8 phantom slots at the heart of
+        // the bug).
+        let mut fixed = vec![0u8; 288];
+        for sym in 0..144 {
+            fixed[sym] = 8;
+        }
+        for sym in 144..256 {
+            fixed[sym] = 9;
+        }
+        for sym in 256..280 {
+            fixed[sym] = 7;
+        }
+        for sym in 280..288 {
+            fixed[sym] = 8;
+        }
+
+        let mut decoder = LutLitLenCode::new_empty();
+        assert!(
+            decoder.rebuild_from(&fixed),
+            "first fixed-Huffman build must succeed"
+        );
+
+        // Simulate leaked state from a prior (e.g. dynamic) block: dirty
+        // every code_list slot with an out-of-range index.
+        for v in decoder.code_list.iter_mut() {
+            *v = 500;
+        }
+
+        assert!(
+            decoder.rebuild_from(&fixed),
+            "reused build after dirtying code_list must still succeed (leaked-state regression)"
+        );
+        assert!(decoder.is_valid());
     }
 
     /// Fixed-Huffman distance LUT (32× length-5) must match C igzip byte-for-byte.
