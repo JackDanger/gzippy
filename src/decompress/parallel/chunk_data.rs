@@ -1158,33 +1158,49 @@ impl ChunkData {
         }
         let prefix_len = self.data_with_markers.len() - split_at;
 
-        // Bulk-narrow data_with_markers[split_at..] (all < 256 by construction —
-        // the marker-free clean tail) into u8. The old per-byte `get(i)` walked
-        // the segment list on EVERY index (O(n·segments)); walk the segments
-        // once instead (perf: clean_unmarked_data was ~12% of decode).
-        let mut narrowed_prefix: Vec<u8> = Vec::with_capacity(prefix_len);
-        let mut skip = split_at;
-        for seg in self.data_with_markers.segments() {
-            if skip >= seg.len() {
-                skip -= seg.len();
-                continue;
-            }
-            narrowed_prefix.extend(seg[skip..].iter().map(|&v| v as u8));
-            skip = 0;
-        }
-
-        // CRC the migrated bytes (NOT CRC'd at append_markered time) and
-        // prepend into crc32s[0] so it covers (clean_tail | original_data).
-        // Vendor: `crc32s.front().prepend(crc32)` (ChunkData.hpp:426-435).
-        if self.configuration.crc32_enabled && !self.crc32s.is_empty() {
-            let mut migrated_crc = CRC32Calculator::new();
-            migrated_crc.update(&narrowed_prefix);
-            self.crc32s[0].prepend(&migrated_crc);
-        }
-
         if self.data_prefix_len == 0 {
-            self.data.prepend_bytes(&narrowed_prefix);
+            // View-list convergence (vendor cleanUnmarkedData, DecodedData.hpp:
+            // 502-505): narrow the marker-free clean tail u16→u8 DIRECTLY into a
+            // fresh FRONT segment of `data` and O(1)-insert it at the logical
+            // front — ONE copy, no temp `Vec`, no bulk memmove. (The old path
+            // narrowed into a temp `Vec` then `prepend_bytes`-copied it again,
+            // and on flip-to-clean chunks also memmoved the whole existing
+            // bulk; that double-copy/memmove was the ~10% finalize migration
+            // tax vs rapidgzip's 0.11% `ChunkData::finalize`.)
+            self.data
+                .prepend_narrowed_clean_tail(&self.data_with_markers, split_at, prefix_len);
+
+            // CRC the migrated bytes (NOT CRC'd at append_markered time) and
+            // prepend into crc32s[0] so it covers (clean_tail | original_data).
+            // Vendor: `crc32s.front().prepend(crc32)` (ChunkData.hpp:426-435).
+            // The narrowed bytes are read straight out of their destination
+            // front segment — no re-copy.
+            if self.configuration.crc32_enabled && !self.crc32s.is_empty() {
+                let mut migrated_crc = CRC32Calculator::new();
+                migrated_crc.update(self.data.first_front_bytes());
+                self.crc32s[0].prepend(&migrated_crc);
+            }
         } else {
+            // Window-present (`data_prefix_len > 0`) path: the clean tail must be
+            // inserted after the window-image prefix in the contiguous bulk.
+            // This path carries no front prepends; narrow into a temp buffer and
+            // insert. (Markers + a real window rarely co-occur in production —
+            // a seeded window makes decode clean — so this is the cold path.)
+            let mut narrowed_prefix: Vec<u8> = Vec::with_capacity(prefix_len);
+            let mut skip = split_at;
+            for seg in self.data_with_markers.segments() {
+                if skip >= seg.len() {
+                    skip -= seg.len();
+                    continue;
+                }
+                narrowed_prefix.extend(seg[skip..].iter().map(|&v| v as u8));
+                skip = 0;
+            }
+            if self.configuration.crc32_enabled && !self.crc32s.is_empty() {
+                let mut migrated_crc = CRC32Calculator::new();
+                migrated_crc.update(&narrowed_prefix);
+                self.crc32s[0].prepend(&migrated_crc);
+            }
             self.data
                 .insert_logical_at(self.data_prefix_len, &narrowed_prefix);
         }
