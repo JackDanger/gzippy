@@ -631,7 +631,7 @@ impl ChunkData {
 
     /// Pre-fill `self.data[0..window.len()]` with the predecessor's
     /// 32 KiB sliding-window image and record `data_prefix_len`.
-    /// Scaffolding for Option A — see `plans/unified-decoder.md` §6
+    /// Scaffolding for Option A — see `git history (campaign plan, removed)` §6
     /// "copy_match_windowed slow-path elimination."
     ///
     /// Caller contract:

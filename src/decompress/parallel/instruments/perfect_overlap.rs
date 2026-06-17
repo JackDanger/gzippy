@@ -3,7 +3,7 @@
 //! PERFECT-OVERLAP removal oracle (`GZIPPY_PERFECT_OVERLAP=1`).
 //!
 //! THE REGISTERED DECIDER for the scheduling/serial ceiling
-//! (plans/scheduling-ceiling-prereg.md §Oracle). Measurement-only,
+//! (git history (campaign plan, removed) §Oracle). Measurement-only,
 //! byte-transparent on the output.
 //!
 //! ## What it removes (and what it KEEPS)
@@ -18,7 +18,7 @@
 //!
 //! This oracle removes term (2) ONLY, via a CORRECTED OVERLAP schedule
 //! (2026-06-07; the PRIOR warm-all-then-drain version was an ANTI-overlap,
-//! advisor-REFUTED — plans/perfect-overlap-advisor-verdict.md). The
+//! advisor-REFUTED — git history (campaign plan, removed)). The
 //! dispatch phase submits EVERY chunk's decode as an IN-FLIGHT prefetch
 //! up-front (non-blocking `submit_prefetch`) and returns IMMEDIATELY, so
 //! the unchanged in-order `consumer_loop` runs CONCURRENTLY with the

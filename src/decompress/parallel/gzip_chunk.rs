@@ -1272,7 +1272,7 @@ fn decode_chunk_with_rapidgzip_impl(
 /// ~0-1ms (frozen host N=21), so the gap to the ISA-L `ocl_cf` ceiling
 /// (matched-comparator 0.945× rg) is ~36ms of essentially PURE symbol rate on the
 /// SAME covered chunks — NOT an upper bound padded by ring cost (that earlier
-/// caveat is STALE for the contig bulk). See plans/fold-drain-split-result.md.
+/// caveat is STALE for the contig bulk). See git history (campaign plan, removed).
 #[cfg(parallel_sm)]
 struct ContigFoldSink<'a> {
     markers: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
@@ -1403,7 +1403,7 @@ fn decode_chunk_unified_marker(
     // pure-Rust-vs-ISA-L SYMBOL RATE on the SAME covered chunks (coverage symmetry
     // confirmed: native flip_to_clean=12 finished_no_flip=4 window_seeded=2 ==
     // ocl_cf's 14 covered). The earlier "ring-write+drain remain, upper bound only"
-    // caveat is STALE for the contig bulk path. See plans/fold-drain-split-result.md.
+    // caveat is STALE for the contig bulk path. See git history (campaign plan, removed).
     {
         const RESERVE_CLAMP: usize = 16 * 1024 * 1024;
         let compressed_bytes = stop_hint_bits.saturating_sub(encoded_offset_bits) / 8;
@@ -1761,7 +1761,7 @@ fn finish_decode_chunk_contig_native(
 /// `set_initial_window` → `WidthRing::seed_window`, deflate.hpp:1750-1759)
 /// and decode every deflate block u8-DIRECT into `chunk.data`'s contiguous
 /// tail via `decode_clean_into_contig` — the design's single clean-destination
-/// contract (plans/engine-u8-design.md §4.3), the same machinery the FOLD
+/// contract (git history (campaign plan, removed) §4.3), the same machinery the FOLD
 /// post-flip tail already runs ([`finish_decode_chunk_contig_native`]).
 ///
 /// The 32 KiB seed is installed as a NON-OUTPUT dictionary prefix at
@@ -1884,7 +1884,7 @@ fn seed_block_for_contig_native(
 /// no faithful wrapper engine to hand the chunk to; gzippy-isal keeps the
 /// faithful wrapper path untouched, see `exact_block_route_enabled`).
 ///
-/// PRE-REGISTERED CONTRACT (plans/engine-u8-design.md GATE AMENDMENTS §2) —
+/// PRE-REGISTERED CONTRACT (git history (campaign plan, removed) GATE AMENDMENTS §2) —
 /// Block must replicate from the `unified::Inflate` wrapper arm
 /// (`finish_decode_chunk_impl`, until_exact=true):
 ///

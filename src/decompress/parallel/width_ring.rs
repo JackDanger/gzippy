@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// M2 (plans/engine-campaign.md, plans/engine-u8-design.md §5): `marker_inflate::Block`
+// M2 (git history (campaign plan, removed), git history (campaign plan, removed) §5): `marker_inflate::Block`
 // owns a `WidthRing` member and its fast loops write through raw pointers obtained
 // from `window16` (pub(crate) fields — the type is an ownership/contract boundary,
 // not a call-virtualization layer; codegen of the hot loops is unchanged). The
@@ -45,7 +45,7 @@
 //! The emit methods here are simple per-element loops: this type is the
 //! ownership/contract boundary. `Block`'s optimized fast loops keep writing
 //! through raw pointers obtained FROM the ring after the M2 migration (same
-//! codegen); see plans/engine-u8-design.md §2.
+//! codegen); see git history (campaign plan, removed) §2.
 
 use super::marker_inflate::{MAX_WINDOW_SIZE, RING_SIZE, U8_RING_SIZE};
 use super::replace_markers::MARKER_BASE;
@@ -83,7 +83,7 @@ pub enum RingError {
 /// The one dual-width decode window. See module docs for the vendor mapping.
 ///
 /// Fields are `pub(crate)` because `marker_inflate::Block`'s optimized fast
-/// loops (M2, plans/engine-u8-design.md §2/§5) pull `pos` /
+/// loops (M2, git history (campaign plan, removed) §2/§5) pull `pos` /
 /// `distance_to_last_marker` into locals and write through raw pointers
 /// derived from `window16` — identical codegen to the pre-M2 inline fields.
 pub struct WidthRing {

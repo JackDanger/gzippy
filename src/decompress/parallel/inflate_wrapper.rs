@@ -144,7 +144,7 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
 // ── Pure-Rust backend (Track B3) ─────────────────────────────────────────
 //
 // Routes through `Inflate<Clean, Generic, Streaming>` — the unified-decoder
-// surface (`plans/unified-decoder.md`, phase 2). M3 (DIV-1 part 1) removed
+// surface (`git history (campaign plan, removed)`, phase 2). M3 (DIV-1 part 1) removed
 // this SECOND engine from the gzippy-native window-seeded INEXACT route
 // (those chunks now decode on the ONE `deflate::Block`; see
 // `gzip_chunk::finish_decode_chunk_seeded_block_native` and the

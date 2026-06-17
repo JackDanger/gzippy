@@ -576,7 +576,7 @@ where
     /// Read-only snapshot of the MAIN (post-consume promote) cache contents,
     /// sorted by key. Like `prefetch_cache_contents_sorted` but for `self.cache`.
     /// Used ONLY by the STEP-0 parent-cached-at-stall probe
-    /// (plans/step0-discriminator-a-falsifier.md) to classify the residency of
+    /// (git history (campaign plan, removed)) to classify the residency of
     /// the chunk CONTAINING a stalled confirmed offset. Read-only, no LRU/evict.
     #[cfg_attr(not(parallel_sm), allow(dead_code))]
     pub fn cache_contents_sorted(&self) -> Vec<(Key, Value)> {
@@ -1094,7 +1094,7 @@ pub static PREFETCH_TOTAL_SUBMITTED: std::sync::atomic::AtomicU64 =
 /// Counts firings of the vendor cache-pollution stop (BlockFetcher.hpp:544-551):
 /// a prefetch refused because submitting it would evict a block we intend to
 /// prefetch. Non-zero ⇒ the admission control is live (falsifier check for
-/// Divergence #4). See plans/rapidgzip-architecture-divergence.md.
+/// Divergence #4). See git history (campaign plan, removed).
 pub static PREFETCH_CACHE_POLLUTION_STOPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
