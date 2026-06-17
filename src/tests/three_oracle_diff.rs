@@ -1,5 +1,5 @@
 //! Three-oracle differential testing for the inflate path
-//! (`plans/unified-decoder.md` §3.10).
+//! (`former plans/unified-decoder.md` §3.10).
 //!
 //! Prerequisite for all bake-off routes (§5 dependency graph): we
 //! cannot validate correctness of any alternative inflate without
@@ -224,7 +224,7 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
 //
 // E2 gap closer: `decode_via_gzippy` above uses num_threads=1 and deliberately
 // avoids the parallel-SM / marker path, so the window-absent marker decoder
-// (`marker_inflate::Block`) — the code the COLLAPSE (plans/decoder-plan.md E3)
+// (`marker_inflate::Block`) — the code the COLLAPSE (former plans/decoder-plan.md E3)
 // will rewrite — had ZERO fuzz coverage (only one silesia md5). This decodes
 // raw DEFLATE through `Block` directly (from offset 0, empty window → all
 // output is clean, no markers emitted) and asserts byte-exactness vs both the

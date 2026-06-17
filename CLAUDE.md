@@ -337,6 +337,13 @@ source is in `vendor/rapidgzip/librapidarchive/`; port modules cite
 vendor `file:line` in their doc comments — treat those citations as the
 reference when a change appears to "work" but looks structurally off.
 
+**The canonical gz→rapidgzip ROLE MAP** (which gz module ports which rg
+source) lives in two byte-identical places: the module-doc table at the top
+of `src/decompress/parallel/mod.rs` and the prose+table in
+`docs/parallel-decode-architecture.md`. That doc is the single place the
+"what mirrors what" mapping lives — consult it (instead of re-deriving the
+structure from a cold read) before any structural-convergence change.
+
 Capture a trace with `GZIPPY_LOG_FILE=/tmp/sm.log` and analyze via
 `scripts/parallel_sm_log_summary.py` before claiming a perf change worked.
 
@@ -437,8 +444,13 @@ This is the governing rule; the specific tactics below are just consequences:
 | `src/decompress/parallel/single_member.rs` | Parallel single-member decode — entry point |
 | `src/decompress/parallel/{blockfinder_validation,gzip_block_finder,async_block_finder}.rs` | Block-boundary finders (validators / offset partitioner / async coordinator) |
 | `src/decompress/parallel/{bit_reader,chunk_decode}.rs` | Shared bit reader (rg `core/BitReader.hpp`) / per-chunk decode driver (rg `GzipChunkFetcher::decodeChunk*`) |
+| `src/decompress/parallel/{sm_driver,chunk_fetcher,block_fetcher}.rs` | Driver loop / `GzipChunkFetcher::processNextChunk` consumer / `BlockFetcher` prefetch+cache coordinator |
+| `src/decompress/parallel/marker_inflate.rs` | Window-absent u16-marker decoder — port of rg `deflate::Block` (`deflate.hpp:513-1156`); the `read_internal_compressed_specialized<CONTAINS_MARKERS>` dispatcher splits into `decode_clean_fast_loop` / `decode_marker_fast_loop` / `decode_careful_tail` |
+| `src/decompress/parallel/{apply_window,replace_markers}.rs` | Window application / marker resolution (rg `ChunkData::applyWindow` + `MarkerReplacement`) |
+| `src/decompress/parallel/instruments/*.rs` | Campaign measurement instruments (env-gated, byte-transparent, NO rg counterpart) — re-exported at `parallel::<name>` for call-site transparency |
+| `src/decompress/parallel/mod.rs` | Module map + canonical gz→rg ROLE MAP (see also `docs/parallel-decode-architecture.md`) |
 | `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
-| `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,vector_huffman,double_literal,bmi2}.rs` | Huffman/inflate building blocks |
+| `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,staged_bits,unified,resumable,bmi2}.rs` | Huffman/inflate building blocks |
 | `src/decompress/{combined_lut,inflate_tables,packed_lut,simd_copy,simd_huffman,two_level_table}.rs` | SIMD + LUT primitives shared with bgzf |
 | `src/backends/isal_decompress.rs` | ISA-L streaming inflate (x86_64 production path) |
 | `src/backends/inflate_bit.rs` | Universal inflate-from-bit (ISA-L on x86_64, libz-ng elsewhere) |

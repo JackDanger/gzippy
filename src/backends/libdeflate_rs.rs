@@ -2,7 +2,7 @@
 //! crate, vendored as an optional dep gated on `streaming-libdeflate-rs`
 //! feature) wrapped for in-memory gzip decompression.
 //!
-//! `plans/unified-decoder.md` §4.1: this is the cheapest bake-off route
+//! `former plans/unified-decoder.md` §4.1: this is the cheapest bake-off route
 //! — if it lands ≤5pp of ISA-L FFI on neurotic silesia, §4.5 outcome 1
 //! triggers (vendor + ship; Routes B/C/D die).
 //!

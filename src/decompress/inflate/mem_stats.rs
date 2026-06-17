@@ -1,6 +1,6 @@
 //! Debug-only memory accounting for the gzippy-native cache mandate.
 //!
-//! The mandate (`plans/gzippy-native-design-mandate.md`) requires a tiny
+//! The mandate (`former plans/gzippy-native-design-mandate.md`) requires a tiny
 //! per-thread decode working set + shared read-only tables, with footprint
 //! roughly flat as thread-count `T` rises. Process RSS is too coarse to see the
 //! per-thread 128 KiB staging scratch (≈2 MiB at T16 against a ~300-400 MiB
