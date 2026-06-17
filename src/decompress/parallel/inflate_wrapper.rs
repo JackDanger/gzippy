@@ -147,7 +147,7 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
 // surface (`git history (campaign plan, removed)`, phase 2). M3 (DIV-1 part 1) removed
 // this SECOND engine from the gzippy-native window-seeded INEXACT route
 // (those chunks now decode on the ONE `deflate::Block`; see
-// `gzip_chunk::finish_decode_chunk_seeded_block_native` and the
+// `chunk_decode::finish_decode_chunk_seeded_block_native` and the
 // `tests::routing::seeded_block_engine_runs_on_parallel_sm` trap). The
 // wrapper remains the engine for the until-exact paths (M4 pre-registered
 // contract), the `GZIPPY_SEEDED_BLOCK=0` kill-switch arm, and the
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// Sync-flush every 32 KiB — yields non-byte-aligned END_OF_BLOCK
-    /// handoffs for cross-chunk resume tests (gzip_chunk.rs helper).
+    /// handoffs for cross-chunk resume tests (chunk_decode.rs helper).
     fn make_sync_multi_block_deflate(payload: &[u8]) -> Vec<u8> {
         use flate2::{Compress, Compression, FlushCompress, Status};
         let mut compress = Compress::new(Compression::new(6), false);
@@ -997,13 +997,13 @@ mod tests {
     // implements differently from the patched ISA-L backend. They're
     // load-bearing for the FFI-removal plan because the differences live
     // *behind* the wrapper surface — three production callers in
-    // `gzip_chunk.rs` rely on the patched-ISA-L semantics. If any of these
+    // `chunk_decode.rs` rely on the patched-ISA-L semantics. If any of these
     // tests starts failing, do NOT delete the C-FFI backend yet.
 
     // §2 divergence 1: `session_pending()` always returns `false` on the
     // pure-Rust backend (`resumable.rs:376-378`). The OLD patched-ISA-L
     // wrapper returned `true` whenever post-stop bytes were still buffered.
-    // Three call sites in `gzip_chunk.rs:239, 273, 419` use it as part of
+    // Three call sites in `chunk_decode.rs:239, 273, 419` use it as part of
     // an outer-loop continuation condition; if the new backend ever
     // accidentally accumulates buffered output, the continuation loop
     // will under-drain.
@@ -1038,7 +1038,7 @@ mod tests {
                 !wrapper.session_pending(),
                 "session_pending must be false after every read_stream return; \
                  a `true` here would force the production outer loop at \
-                 gzip_chunk.rs:239 to under-drain"
+                 chunk_decode.rs:239 to under-drain"
             );
             if r.stopped_at == StoppingPoints::END_OF_BLOCK {
                 saw_stop = true;
@@ -1061,7 +1061,7 @@ mod tests {
     // a different errno. This test locks the current error variant so
     // accidental ErrorKind drift surfaces loudly.
     //
-    // Production note: `decompress_chunk_isal_impl` in `gzip_chunk.rs` does
+    // Production note: `decompress_chunk_isal_impl` in `chunk_decode.rs` does
     // NOT call `read_footer_at_current` on the parallel-SM path — the
     // gzip trailer is parsed by `sm_driver` from the outer envelope.
     // But ANY caller that does (e.g. multi-stream test harnesses) will

@@ -349,7 +349,7 @@ mod tests {
     /// against). silesia (gzip-9, all-dynamic) cannot surface this; this fixture
     /// is fixed-Huffman-heavy (mixed BTYPE=00/01) and is swept across thread
     /// counts so chunk boundaries land on many different block boundaries.
-    /// See `resumable.rs` coalesce branch + `gzip_chunk.rs` resumable_resync drain.
+    /// See `resumable.rs` coalesce branch + `chunk_decode.rs` resumable_resync drain.
     #[test]
     fn test_coalesce_fixed_huffman_multithread_byte_exact() {
         let original = make_btype01_heavy_data(32 * 1024 * 1024);
@@ -689,16 +689,16 @@ mod tests {
         );
 
         let block_before =
-            crate::decompress::parallel::gzip_chunk::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
-        let wrapper_before =
-            crate::decompress::parallel::gzip_chunk::SEEDED_WRAPPER_CHUNKS.load(Ordering::Relaxed);
+            crate::decompress::parallel::chunk_decode::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
+        let wrapper_before = crate::decompress::parallel::chunk_decode::SEEDED_WRAPPER_CHUNKS
+            .load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
         let block_after =
-            crate::decompress::parallel::gzip_chunk::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
-        let wrapper_after =
-            crate::decompress::parallel::gzip_chunk::SEEDED_WRAPPER_CHUNKS.load(Ordering::Relaxed);
+            crate::decompress::parallel::chunk_decode::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
+        let wrapper_after = crate::decompress::parallel::chunk_decode::SEEDED_WRAPPER_CHUNKS
+            .load(Ordering::Relaxed);
 
         assert!(
             block_after > block_before,
@@ -741,12 +741,12 @@ mod tests {
         let compressed = compress_single_member_gzip(&original);
 
         let wrapper_before =
-            crate::decompress::parallel::gzip_chunk::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
+            crate::decompress::parallel::chunk_decode::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
         let wrapper_after =
-            crate::decompress::parallel::gzip_chunk::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
+            crate::decompress::parallel::chunk_decode::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
 
         assert_eq!(
             wrapper_after, wrapper_before,

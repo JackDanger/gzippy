@@ -314,7 +314,7 @@ impl ChunkData {
         // 232k→363k, and barely moved peak maxrss (1025→1010 MB). MECHANISM:
         // gzippy stores decoded bytes in ONE contiguous growing `data` Vec.
         // A small initial cap forces the `reserve(ALLOCATION_CHUNK_SIZE)`
-        // growth loop (gzip_chunk.rs:318) to realloc+memcpy+RE-FAULT as the
+        // growth loop (chunk_decode.rs:318) to realloc+memcpy+RE-FAULT as the
         // chunk grows past 4 MiB — the extra faults are the regression. This
         // is the OPPOSITE of vendor: rapidgzip's `DecodedData::data` is a
         // std::vector<DecodedVector> — a LIST of fixed 128 KiB chunks that is

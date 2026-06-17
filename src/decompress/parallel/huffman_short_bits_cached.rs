@@ -258,7 +258,7 @@ pub type DistanceShortBitsCached<const MAX_SYMBOL_COUNT: usize> =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompress::parallel::block_finder::BitReader;
+    use crate::decompress::parallel::bit_reader::BitReader;
     use crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
 
     /// The bounded-LUT decoder must agree byte-for-byte with the full-width

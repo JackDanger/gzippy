@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::block_finder::{BlockBoundary, BlockFinder};
+use super::blockfinder_validation::{BlockBoundary, DeflateBlockValidator};
 use super::streamed_results::{StreamedGetReturnCode, StreamedResults};
 
 // B-instrumentation: per-spawn cost breakdown for the BlockFinder
@@ -45,7 +45,7 @@ fn push_boundary_candidates(
     max_end: usize,
     cancel: Option<&AtomicBool>,
 ) {
-    let finder = BlockFinder::new(data);
+    let finder = DeflateBlockValidator::new(data);
     let mut chunk_begin = start_bit;
     while chunk_begin < max_end {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -118,7 +118,7 @@ impl RawBlockFinderCoordinator {
         max_end: usize,
         mut try_candidate: impl FnMut(BlockBoundary) -> Option<R>,
     ) -> Option<R> {
-        let finder = BlockFinder::new(data);
+        let finder = DeflateBlockValidator::new(data);
         let mut chunk_begin = start_bit;
         while chunk_begin < max_end {
             let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);

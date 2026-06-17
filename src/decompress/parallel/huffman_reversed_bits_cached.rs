@@ -129,7 +129,7 @@ impl<const MAX_SYMBOL_COUNT: usize> Default for HuffmanCodingReversedBitsCached<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompress::parallel::block_finder::BitReader;
+    use crate::decompress::parallel::bit_reader::BitReader;
 
     #[test]
     fn fixed_tree_cached_matches_symbols_per_length() {

@@ -53,31 +53,31 @@
 use crate::decompress::parallel::chunk_data::ChunkConfiguration;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::chunk_data::ChunkData;
+use crate::decompress::parallel::chunk_decode::ChunkDecodeError;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::chunk_handle::{ChunkArc, SharedChunkData};
-use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
 #[cfg(parallel_sm)]
 use std::sync::Arc;
 
+#[cfg(parallel_sm)]
+use crate::decompress::parallel::async_block_finder::RawBlockFinderCoordinator;
 #[cfg(parallel_sm)]
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
 #[cfg(parallel_sm)]
+use crate::decompress::parallel::chunk_decode::decode_chunk_window_absent;
+#[cfg(parallel_sm)]
 use crate::decompress::parallel::compressed_vector::CompressionType;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
-#[cfg(parallel_sm)]
-use crate::decompress::parallel::gzip_chunk::decode_chunk_window_absent;
 #[cfg(all(unix, parallel_sm))]
 use crate::decompress::parallel::output_writer;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
-#[cfg(parallel_sm)]
-use crate::decompress::parallel::raw_block_finder::RawBlockFinderCoordinator;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::stall_residency;
 #[cfg(parallel_sm)]
@@ -161,7 +161,7 @@ pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
 /// spacing/bookkeeping only and has NO scanner; confirmed entries enter it
 /// solely via `consumer_append_subchunks_vendor` insertions (and the
 /// test-only oracle pre-seed). The deflate-candidate scanner is the raw
-/// block finder (block_finder.rs), which can hand stored-payload false
+/// block finder (blockfinder_validation.rs), which can hand stored-payload false
 /// positives to trial decodes; a stale confirmed entry behind the frontier
 /// arises via subchunk insertion around such regions, not via any
 /// GzipBlockFinder scan (98fd618c's message attributed this to the wrong
@@ -387,7 +387,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
             starts.push(cur);
             dicts.push(prev_tail.clone());
             let stop_hint = (cur + STRIDE_BITS).min(total_bits);
-            let c = crate::decompress::parallel::gzip_chunk::decode_chunk(
+            let c = crate::decompress::parallel::chunk_decode::decode_chunk(
                 input,
                 cur,
                 stop_hint,
@@ -453,7 +453,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
                     let start_bit = starts[span_idx];
                     let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
                     let dict: &[u8] = &dicts[span_idx];
-                    let r = crate::decompress::parallel::gzip_chunk::decode_chunk(
+                    let r = crate::decompress::parallel::chunk_decode::decode_chunk(
                         input,
                         start_bit,
                         stop_hint,
@@ -874,7 +874,7 @@ fn drive_impl<W: std::io::Write>(
         //   resumable_fallback MUST be 0 with a 32 KiB window (no decline into
         //     slow ResumableInflate2).
         {
-            use crate::decompress::parallel::gzip_chunk::{
+            use crate::decompress::parallel::chunk_decode::{
                 BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, EXACT_BLOCK_CHUNKS,
                 EXACT_WRAPPER_CHUNKS, FINISHED_NO_FLIP_CHUNKS, FINISH_DECODE_ENTRIES,
                 FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS, INFLATE_WRAPPER_CHUNKS,
@@ -965,7 +965,7 @@ fn drive_impl<W: std::io::Write>(
                 );
             }
         }
-        use crate::decompress::parallel::gzip_chunk::{
+        use crate::decompress::parallel::chunk_decode::{
             BOOTSTRAP_OUTPUT_ALLOCS, BOOTSTRAP_OUTPUT_DROPPED, BOOTSTRAP_OUTPUT_RETURNS,
             BOOTSTRAP_OUTPUT_REUSED_BYTES, BOOTSTRAP_OUTPUT_TAKES,
         };
@@ -1065,7 +1065,7 @@ fn drive_impl<W: std::io::Write>(
         // Body-failure forensic detail — speculation-accuracy attack.
         // After disprove-advisor confirmed body failures are the dominant
         // re-decode cost, characterize them by error variant + waste size.
-        use crate::decompress::parallel::gzip_chunk as gc;
+        use crate::decompress::parallel::chunk_decode as gc;
         let body_count = gc::BODY_FAIL_COUNT.load(Ordering::Relaxed);
         let body_wasted = gc::BODY_FAIL_BYTES_WASTED.load(Ordering::Relaxed);
         let body_bits = gc::BODY_FAIL_BITS_INTO_BODY.load(Ordering::Relaxed);
@@ -1091,7 +1091,7 @@ fn drive_impl<W: std::io::Write>(
             gc::BODY_FAIL_OTHER_VARIANT.load(Ordering::Relaxed),
         );
         // B: BlockFinder per-spawn breakdown — scan vs consumer time.
-        use crate::decompress::parallel::raw_block_finder as rbf;
+        use crate::decompress::parallel::async_block_finder as rbf;
         let bf_calls = rbf::BOUNDARY_SEARCH_CALLS.load(Ordering::Relaxed);
         let bf_total = rbf::BOUNDARY_SEARCH_TOTAL_US.load(Ordering::Relaxed);
         let bf_scan = rbf::BOUNDARY_SEARCH_SCAN_US.load(Ordering::Relaxed);
@@ -1291,7 +1291,7 @@ fn consumer_loop<W: std::io::Write>(
         // Any block — confirmed or spacing-guess — whose start bit falls
         // within already-decoded territory is stale: either a fast-path
         // chunk consumed it as an intermediate subchunk (spacing guess)
-        // or subchunk insertion around a raw-finder (block_finder.rs)
+        // or subchunk insertion around a raw-finder (blockfinder_validation.rs)
         // stored-payload false-positive region left a confirmed entry
         // behind the frontier.  In both cases skip immediately.
         // Invariant: a legitimate confirmed block is ALWAYS at or after
@@ -2261,7 +2261,7 @@ fn decode_chunk_with_until_exact(
     until_exact: bool,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    crate::decompress::parallel::gzip_chunk::decode_chunk_until_exact(
+    crate::decompress::parallel::chunk_decode::decode_chunk_until_exact(
         input,
         encoded_offset_bits,
         stop_hint_bits,
@@ -3872,7 +3872,7 @@ fn speculative_decode_find_boundary(
         let tail_start_byte = start_bit / 8;
         for byte_off in tail_start_byte..input.len() {
             let bit = byte_off * 8;
-            if !super::block_finder::plausible_trial_decode_offset(input, bit) {
+            if !super::blockfinder_validation::plausible_trial_decode_offset(input, bit) {
                 continue;
             }
             if let Ok(chunk) = try_speculative_decode_candidate(
@@ -4429,7 +4429,7 @@ mod tests {
             .expect("spawn gzip");
         // Feed stdin on a worker thread while draining stdout here, else
         // gzip's stdout pipe fills mid-write and deadlocks (see
-        // gzip_chunk::cross_chunk_resume for the same fix).
+        // chunk_decode::cross_chunk_resume for the same fix).
         let mut stdin = child.stdin.take().expect("stdin");
         let head_owned = head.to_vec();
         let writer = std::thread::spawn(move || {

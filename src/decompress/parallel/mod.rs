@@ -1,7 +1,7 @@
 //! Parallel single-member decompression (production path).
 //!
 //! Entry: [`single_member::decompress_parallel`] → [`sm_driver::read_parallel_sm`]
-//! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_with_rapidgzip`].
+//! → [`chunk_fetcher::drive`] → [`chunk_decode::decode_chunk_with_rapidgzip`].
 //!
 //! # gzippy → rapidgzip ROLE MAP (which gz module ports which rg source)
 //!
@@ -15,8 +15,11 @@
 //! | `sm_driver`            | `ParallelGzipReader::read*` driver loop       |
 //! | `chunk_fetcher`        | `GzipChunkFetcher` + `BlockFetcher` consumer  |
 //! | `block_fetcher`        | `BlockFetcher` (prefetch/cache coordinator)   |
-//! | `block_finder`/`gzip_block_finder`/`raw_block_finder` | `blockfinder/*` (deflate/gzip block boundary scan) |
-//! | `gzip_chunk`           | `GzipChunk::decodeBlock` (per-chunk decode)   |
+//! | `blockfinder_validation` | `blockfinder/{DynamicHuffman,Uncompressed}.hpp` (per-position validators) |
+//! | `gzip_block_finder`    | `GzipBlockFinder.hpp` (offset partitioner)    |
+//! | `async_block_finder`   | `core/BlockFinder<RawFinder>` (BlockFinder.hpp async coordinator) |
+//! | `bit_reader`           | `core/BitReader.hpp` (shared LSB bit reader)  |
+//! | `chunk_decode`         | `GzipChunkFetcher::decodeChunk*` (per-chunk decode driver) |
 //! | `marker_inflate`       | `deflate::Block` (u16 marker-ring decode)     |
 //! | `apply_window`/`replace_markers` | window application / marker resolution |
 //! | `window_map`/`block_map` | `WindowMap` / `BlockMap`                    |
@@ -32,17 +35,22 @@ pub mod apply_window;
 /// (feature `asm-kernel`, x86_64-only; pure-Rust path always compiled).
 #[cfg(parallel_sm)]
 pub mod asm_kernel;
+#[cfg(parallel_sm)]
+pub mod async_block_finder;
 pub mod bit_manipulation;
+pub mod bit_reader;
 #[cfg(parallel_sm)]
 pub mod block_fetcher;
-pub mod block_finder;
 #[cfg(parallel_sm)]
 pub mod block_map;
+pub mod blockfinder_validation;
 pub mod cache;
 #[cfg(parallel_sm)]
 pub mod chunk_buffer_pool;
 #[cfg(parallel_sm)]
 pub mod chunk_data;
+#[cfg(parallel_sm)]
+pub mod chunk_decode;
 #[cfg(parallel_sm)]
 pub mod chunk_fetcher;
 #[cfg(parallel_sm)]
@@ -53,8 +61,6 @@ pub mod error;
 #[cfg(parallel_sm)]
 pub mod fd_vectored_write;
 pub mod gzip_block_finder;
-#[cfg(parallel_sm)]
-pub mod gzip_chunk;
 pub mod gzip_definitions;
 pub mod gzip_format;
 pub mod huffman_base;
@@ -76,8 +82,6 @@ pub mod marker_inflate;
 #[cfg(all(unix, parallel_sm))]
 pub mod output_writer;
 pub mod prefetcher;
-#[cfg(parallel_sm)]
-pub mod raw_block_finder;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
 #[cfg(parallel_sm)]

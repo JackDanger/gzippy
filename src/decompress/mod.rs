@@ -177,7 +177,7 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     // end-to-end (NO C-FFI in the decode graph, /goal part 1, task #8). On the
     // gzippy-isal build (x86_64 + `isal-compression`, sets `isal_clean_tail`)
     // the SAME ParallelSM pipeline decodes the clean tail through REAL ISA-L FFI
-    // (gzip_chunk.rs `finish_decode_chunk_impl` -> `decompress_deflate_from_bit_into`,
+    // (chunk_decode.rs `finish_decode_chunk_impl` -> `decompress_deflate_from_bit_into`,
     // faithful rapidgzip WITH_ISAL) — so on that build C-FFI IS on the decode
     // graph by design. The one-shot C-FFI backends remain compiled ONLY in the
     // `not(parallel_sm)` legacy build and behind the dev/oracle feature as fuzz

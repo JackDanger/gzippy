@@ -435,7 +435,8 @@ This is the governing rule; the specific tactics below are just consequences:
 | `src/decompress/bgzf.rs` | gzippy-parallel + multi-member parallel (core engine) |
 | `src/decompress/scan_inflate.rs` | Streaming scan-and-inflate path |
 | `src/decompress/parallel/single_member.rs` | Parallel single-member decode — entry point |
-| `src/decompress/parallel/{block_finder,marker_decode,ultra_fast_inflate}.rs` | Speculation supporting primitives |
+| `src/decompress/parallel/{blockfinder_validation,gzip_block_finder,async_block_finder}.rs` | Block-boundary finders (validators / offset partitioner / async coordinator) |
+| `src/decompress/parallel/{bit_reader,chunk_decode}.rs` | Shared bit reader (rg `core/BitReader.hpp`) / per-chunk decode driver (rg `GzipChunkFetcher::decodeChunk*`) |
 | `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
 | `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,vector_huffman,double_literal,bmi2}.rs` | Huffman/inflate building blocks |
 | `src/decompress/{combined_lut,inflate_tables,packed_lut,simd_copy,simd_huffman,two_level_table}.rs` | SIMD + LUT primitives shared with bgzf |

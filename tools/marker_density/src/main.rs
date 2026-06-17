@@ -17,7 +17,7 @@
 //! Usage: gzippy-marker-density <file.gz> [num_starts] [bytes_per_start]
 
 use gzippy::decompress::inflate::consume_first_decode::Bits;
-use gzippy::decompress::parallel::block_finder::find_blocks_parallel;
+use gzippy::decompress::parallel::blockfinder_validation::find_blocks_parallel;
 use gzippy::decompress::parallel::deflate_block::Block;
 use std::fs;
 

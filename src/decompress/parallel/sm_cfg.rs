@@ -16,7 +16,7 @@
 #[allow(dead_code)]
 pub const PURE_RUST_INFLATE_DECODE: bool = cfg!(pure_inflate_decode);
 
-/// Parallel SM orchestration (chunk_fetcher, block_finder, etc.) is available.
+/// Parallel SM orchestration (chunk_fetcher, blockfinder_validation, etc.) is available.
 ///
 /// The `parallel_sm` cfg is emitted by `build.rs::emit_parallel_sm_cfgs` and is
 /// true when EITHER `x86_64 + (isal-compression | pure-rust-inflate)` OR
