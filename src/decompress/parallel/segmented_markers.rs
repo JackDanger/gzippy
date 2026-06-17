@@ -765,16 +765,18 @@ impl crate::decompress::parallel::marker_inflate::MarkerSink for SegmentedU16 {
         if from >= self.cached_len {
             return 0;
         }
-        let mut run = 0usize;
-        let mut i = self.cached_len;
-        while i > from {
-            i -= 1;
-            match self.get(i) {
-                Some(v) if v < MARKER_BASE => run += 1,
-                _ => break,
-            }
-        }
-        run
+        // Byte-exact equivalent of the back-to-front clean run capped at
+        // `from`: both scan the suffix from the end, count CLEAN
+        // (`< MARKER_BASE`) values, and stop at the first marker. The old
+        // body walked backward via `get(i)`, which re-walks the segment list
+        // from the FRONT on every element → O(run × segments) (the comment on
+        // `get` warns "avoid in tight loops"). `trailing_clean_run` does the
+        // identical scan as ONE back-to-front segment walk → O(segments + run).
+        // Capping its count at `cached_len - from` reproduces the `i > from`
+        // lower bound exactly: if the first marker lies within `[from, end)`
+        // both stop there; if the whole suffix is clean both return the suffix
+        // length `cached_len - from`.
+        self.trailing_clean_run(self.cached_len - from)
     }
     fn copy_last_n_clean_u8(&self, n: usize, out: &mut Vec<u8>) -> bool {
         out.clear();
@@ -833,6 +835,86 @@ mod tests {
         assert_eq!(b.segment_count(), 4);
         let cat: Vec<u16> = b.segments().flatten().copied().collect();
         assert_eq!(cat, big);
+    }
+
+    #[test]
+    fn trailing_clean_since_matches_bruteforce_reference() {
+        use crate::decompress::parallel::marker_inflate::MarkerSink;
+        // Brute-force reference = the ORIGINAL get()-per-index backward walk.
+        fn reference(b: &SegmentedU16, from: usize) -> usize {
+            if from >= b.len() {
+                return 0;
+            }
+            let mut run = 0usize;
+            let mut i = b.len();
+            while i > from {
+                i -= 1;
+                match b.get(i) {
+                    Some(v) if v < MARKER_BASE => run += 1,
+                    _ => break,
+                }
+            }
+            run
+        }
+        // Cover: markers inside/outside the window, runs crossing segment
+        // boundaries, all-clean, all-marker, empty.
+        let cases: Vec<Vec<u16>> = vec![
+            vec![],
+            vec![1, 2, 3],
+            vec![marker(0), 1, 2, 3],
+            vec![1, 2, marker(5), 3, 4],
+            vec![1, 2, 3, marker(9)],
+            {
+                let mut v = vec![5u16; SEGMENT_ELEMENTS - 3];
+                v.extend([marker(1), 6, 7, 8, 9]); // marker straddling boundary region
+                v
+            },
+            {
+                let mut v = vec![5u16; SEGMENT_ELEMENTS + 10];
+                v[SEGMENT_ELEMENTS - 2] = marker(2);
+                v
+            },
+            (0..(SEGMENT_ELEMENTS * 2 + 50))
+                .map(|i| {
+                    if i % 997 == 0 {
+                        marker(0)
+                    } else {
+                        (i & 0x7) as u16
+                    }
+                })
+                .collect(),
+        ];
+        for data in cases {
+            let mut b = SegmentedU16::default();
+            if !data.is_empty() {
+                b.push_slice(&data);
+            }
+            let len = b.len();
+            // Exhaustive for small inputs; sampled near boundaries/end for
+            // large ones (the reference is O(run × segments) — quadratic).
+            let froms: Vec<usize> = if len <= 4096 {
+                (0..=len).collect()
+            } else {
+                let mut s = vec![0, 1, len / 2, len.saturating_sub(1), len];
+                for bnd in [SEGMENT_ELEMENTS, SEGMENT_ELEMENTS * 2] {
+                    for d in 0..6 {
+                        s.push(bnd.saturating_sub(d));
+                        s.push((bnd + d).min(len));
+                    }
+                }
+                s.retain(|&f| f <= len);
+                s.sort_unstable();
+                s.dedup();
+                s
+            };
+            for from in froms {
+                assert_eq!(
+                    MarkerSink::trailing_clean_since(&b, from),
+                    reference(&b, from),
+                    "mismatch at from={from} len={len}"
+                );
+            }
+        }
     }
 
     #[test]
