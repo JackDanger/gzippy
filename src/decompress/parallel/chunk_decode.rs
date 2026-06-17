@@ -1649,17 +1649,23 @@ fn finish_decode_chunk_contig_native(
                     "contig native tail: insufficient headroom (pos {pos} cap {cap})"
                 );
 
+                // SAFETY: `base` is `contig_decode_window`'s pointer, valid for
+                // `[0, cap)`; the assert above proves `pos <= out_room` (the
+                // headroom contract); `bits.data` is the compressed input, which
+                // never aliases the chunk's decode destination.
                 let body_res = match comp_type {
-                    CompressionType::Uncompressed => block.decode_clean_stored_into_contig(
-                        &mut bits,
-                        base,
-                        cap,
-                        &mut pos,
-                        usize::MAX,
-                    ),
-                    CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                    CompressionType::Uncompressed => unsafe {
+                        block.decode_clean_stored_into_contig(
+                            &mut bits,
+                            base,
+                            cap,
+                            &mut pos,
+                            usize::MAX,
+                        )
+                    },
+                    CompressionType::FixedHuffman | CompressionType::DynamicHuffman => unsafe {
                         block.decode_clean_into_contig(&mut bits, base, cap, &mut pos, usize::MAX)
-                    }
+                    },
                     CompressionType::Reserved => Err(BlockError::InvalidCompression),
                 };
                 let emitted = match body_res {
