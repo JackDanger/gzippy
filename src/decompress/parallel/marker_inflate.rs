@@ -465,7 +465,7 @@ pub(crate) mod mfast_prof {
     }
 }
 
-/// Rung-(d) increment 1 kill-switch (plans/asm-rung-d-eval.md §5, F-d1):
+/// Rung-(d) increment 1 kill-switch (git history (campaign plan, removed) §5, F-d1):
 /// `GZIPPY_MARKER_DIST_TABLE=0` restores the exact pre-change marker-fast-loop
 /// distance decode (the `dist_hc` → DISTANCE_EXTRA → refill-check →
 /// DISTANCE_BASE dependent chain) — the same-binary causal A/B arm the
@@ -566,7 +566,7 @@ pub struct Block {
     decoded_bytes: usize,
     /// `m_decodedBytes` snapshot at the start of the current block.
     decoded_bytes_at_block_start: usize,
-    /// The ONE dual-width decode window (M2, plans/engine-u8-design.md §2/§5):
+    /// The ONE dual-width decode window (M2, git history (campaign plan, removed) §2/§5):
     /// vendor's `m_window16` + `getWindow()` u8 view + `m_windowPosition` +
     /// `m_distanceToLastMarkerByte` + `m_containsMarkerBytes` as a single
     /// `WidthRing` (see `width_ring.rs` for the per-field vendor citations).
@@ -732,7 +732,7 @@ impl Block {
     }
 
     /// Resident PER-THREAD working-set byte breakdown for the gzippy-native
-    /// cache-residency mandate (`plans/gzippy-native-design-mandate.md`). This
+    /// cache-residency mandate (`git history (campaign plan, removed)`). This
     /// is the persistent thread-local engine state (`BOOTSTRAP_BLOCK`,
     /// `gzip_chunk.rs`) — the real native working set after the flip-in-place
     /// fold removed Engine C. Counters only; never mutates decode state.
@@ -2080,7 +2080,7 @@ impl Block {
         // DISCRIMINATOR arm of the mfast-phase0 probe — if wall is flat vs arm0
         // (knobs off), aggregate marker decode is SLACK on this cell.
         if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield && !mfast_disabled {
-            // ── Rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1) ──────
+            // ── Rung (d) increment 1 (git history (campaign plan, removed) §4/N1) ──────
             // The fast loop's distance decode goes through the libdeflate-shape
             // `DistTable` — ONE entry load + in-register `consume_entry` /
             // `decode_distance` — replacing the dist_hc → DISTANCE_EXTRA →
@@ -2137,7 +2137,7 @@ impl Block {
             let mut mfast_ev: u64 = 0;
             // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
             // Mirror of the P3.1 / Lever-B1 change on the contig clean loop
-            // (plans/asm-rung-d-eval.md §1 N2): hoist bitbuf/bitsleft/pos into
+            // (git history (campaign plan, removed) §1 N2): hoist bitbuf/bitsleft/pos into
             // a stack-local `lb: Bits` for the duration of `'mfast` and write
             // back at every exit. The raw-pointer ring stores (through `ring_ptr`)
             // defeat LLVM's alias analysis on the struct-field path (same finding
@@ -2629,7 +2629,7 @@ impl Block {
     }
 
     /// P3.1/P3.4 dist-table ensure, factored out of `decode_clean_into_contig`
-    /// for rung (d) increment 1 (plans/asm-rung-d-eval.md §4/N1): the
+    /// for rung (d) increment 1 (git history (campaign plan, removed) §4/N1): the
     /// libdeflate-shape `DistTable` build with the P3.4 amortization scheme —
     /// FixedHuffman + amortization ON never touches this cache (callers use the
     /// process-wide `fixed_dist_table()`); DynamicHuffman blocks memcmp the
@@ -6005,7 +6005,7 @@ mod tests {
         );
     }
 
-    // ── Rung (d) increment 1 differential (plans/asm-rung-d-eval.md §5) ──
+    // ── Rung (d) increment 1 differential (git history (campaign plan, removed) §5) ──
     //
     // The marker fast loop's DistTable distance decode (ON arm) vs the exact
     // pre-change dist_hc chain (OFF arm, via MARKER_DIST_LUT_OVERRIDE) on the

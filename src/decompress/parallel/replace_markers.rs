@@ -122,7 +122,7 @@ fn replace_markers_lut(data: &mut [u16], window: &[u8]) {
 /// single write of `dst[i]` per element, vs gzippy's prior
 /// `replace_markers_lut` (u16→u16 in-place) + `narrow_u16_to_u8`
 /// (u16→u8) which was two full passes over the buffer (~24ms / 3.3MiB
-/// per chunk per `plans/pure-rust-perf.md` consumer-narrow finding).
+/// per chunk per `git history (campaign plan, removed)` consumer-narrow finding).
 ///
 /// `dst` is cleared and grown to `src.len()`. The LUT layout matches
 /// `replace_markers_lut`: literals pass through, markers (≥32768)

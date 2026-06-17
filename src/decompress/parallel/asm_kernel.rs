@@ -1,5 +1,5 @@
 //! ASM-campaign rung (c) — the FULL contig clean fast loop as ONE
-//! `core::arch::asm!` region (plans/asm-campaign.md §2(c), §5 VAR_VIII salvage).
+//! `core::arch::asm!` region (git history (campaign plan, removed) §2(c), §5 VAR_VIII salvage).
 //!
 //! Increment (a) (commit `b5c3f7c4`, REVERTED, recoverable) proved the
 //! per-symbol asm seam costs ~1.4 cyc/crossing with zero latency recovered

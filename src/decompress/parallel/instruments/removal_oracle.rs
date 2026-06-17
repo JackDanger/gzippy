@@ -2,7 +2,7 @@
 //! — the campaign's Rule-3 instruments: a speed-up ceiling comes from REMOVING a
 //! region and measuring, never from extrapolating a slow-down slope.
 //!
-//! Background (plans/orchestrator-status.md, localization split 2026-06-11): the
+//! Background (git history (campaign plan, removed), localization split 2026-06-11): the
 //! frozen 9-arm T1 silesia perturbation found DECODE ≈ STORE (+576ms vs +526ms at
 //! N=50 spin) — neither sub-region dominates, the gap is whole-loop. The next
 //! pre-registered step is to size each side's REMOVAL ceiling. These two oracles
@@ -41,8 +41,8 @@
 //! memcpy — it removes header parsing, LUT builds, AND the per-symbol store
 //! stream along with the decode, so its delta is not comparable to the
 //! STORE-removal arm and the shares-sum sanity check (store-share + decode-share
-//! + remainder ≈ whole) would be meaningless. This instrument removes ONLY the
-//! decode half of the same region NOSTORE removes the store half of.
+//! plus remainder ≈ whole) would be meaningless. This instrument removes ONLY
+//! the decode half of the same region NOSTORE removes the store half of.
 //!
 //! Known approximation (documented, accepted): replay writes multi-literal
 //! packets as single-byte stores while the production litpack arm uses one

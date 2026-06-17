@@ -42,7 +42,7 @@
 //! is picked so that `F = 1.0` (`GZIPPY_SLOW_MODE=100`) roughly DOUBLES the
 //! single-thread clean-loop decode wall on arm64 native. Perfect calibration is
 //! not required — what matters is MONOTONICITY (larger `F` ⇒ more wall) and the
-//! documented linear relationship. See `plans/slow-knob-impl.md` for the
+//! documented linear relationship. See `git history (campaign plan, removed)` for the
 //! measured OFF-vs-ON ratio that fixed `BASE_SPIN`.
 
 use core::hint::black_box;
@@ -104,7 +104,7 @@ pub fn report_hits() {
 
 /// Per-decode-event spin iteration count at `F = 1.0`. Calibrated so
 /// `GZIPPY_SLOW_MODE=100` roughly doubles the single-thread clean-loop wall on
-/// arm64 native (see module + `plans/slow-knob-impl.md`).
+/// arm64 native (see module + `git history (campaign plan, removed)`).
 const BASE_SPIN: u64 = 22;
 
 /// Slow factor as a fraction (`percent / 100`). `0.0` ⇒ OFF. Read once.

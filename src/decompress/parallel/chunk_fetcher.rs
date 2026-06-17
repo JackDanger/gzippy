@@ -598,14 +598,14 @@ fn drive_impl<W: std::io::Write>(
     // BOTH caps to 4096 with no eviction, which held the whole member's u16
     // (2×-width) markered working set resident (~400MB vs production's ~190MB) —
     // an advisor-identified memory-bandwidth CONFOUND that added ~5-7% wall
-    // (plans/corrected-overlap-advisor-verdict.md §C1.2). Vendor sizing kept so
+    // (git history (campaign plan, removed) §C1.2). Vendor sizing kept so
     // the oracle is production-shaped and isolates ONLY the dispatch-depth term.
     // STEP-0 discriminator (a) POSITIVE CONTROL (gated on the probe being on, so
     // production is untouched / OFF==identity): GZIPPY_PREFETCH_CACHE_CAP=N
     // overrides BOTH cache capacities. Shrinking to a tiny value MUST force the
     // containing parent to be evicted before the lagging consumer reaches it ⇒
     // NOT_RESIDENT must rise (validates the probe observes residency). A LARGE
-    // value should DROP NOT_RESIDENT. See plans/step0-discriminator-a-falsifier.md.
+    // value should DROP NOT_RESIDENT. See git history (campaign plan, removed).
     if stall_residency::enabled() {
         if let Some(v) = std::env::var_os("GZIPPY_PREFETCH_CACHE_CAP") {
             if let Ok(n) = v.to_string_lossy().parse::<usize>() {
@@ -684,7 +684,7 @@ fn drive_impl<W: std::io::Write>(
     // ORACLE-C (decode-bypass FLOOR): warm the prebuilt replay map BEFORE the
     // timed drive so the one-time capture-load + ChunkData reconstruction (the
     // ~656MB rebuild that CONTAMINATED the prior leverB floor at 3.667s, see
-    // plans/leverB-ceiling.md) is NOT counted as decode-floor time. Emits the
+    // git history (campaign plan, removed)) is NOT counted as decode-floor time. Emits the
     // build duration to stderr (GZIPPY_BYPASS_DECODE replay only) so the harness
     // can report floor = wall − warm. No-op unless replay is enabled.
     crate::decompress::parallel::decode_bypass::warm_prebuilt();
@@ -1593,7 +1593,7 @@ fn consumer_loop<W: std::io::Write>(
                     crate::decompress::parallel::perfect_overlap::record_warm_miss();
                 }
                 // STEP-0 discriminator (a): PARENT-CACHED-AT-STALL probe
-                // (plans/step0-discriminator-a-falsifier.md). This `None`
+                // (git history (campaign plan, removed)). This `None`
                 // branch IS the genuine head-of-line cold-get stall. Before
                 // blocking, classify whether the chunk CONTAINING `decode_start`
                 // is resident (interior-reuse fixable) or evicted (re-scope).
@@ -1632,7 +1632,7 @@ fn consumer_loop<W: std::io::Write>(
                         partition_span,
                     );
                     // SATURATION vs HORIZON occupancy snapshot at the stall
-                    // instant (plans/prefetch-horizon-falsifier.md). Excludes the
+                    // instant (git history (campaign plan, removed)). Excludes the
                     // startup stall (decode_start == 0, unavoidable). Worker
                     // occupancy: lazy-spawn means an un-spawned slot is available
                     // capacity, so idle_capacity = parked idle + (cap - spawned).
@@ -2292,7 +2292,7 @@ fn decode_chunk_with_until_exact(
 /// The PRIOR version (warm-all-then-drain) blocked on `recv()` for every
 /// chunk before the consumer started, SERIALIZING the two phases production
 /// overlaps — an ANTI-overlap whose wall was a pessimistic SUM (advisor
-/// REFUTED it: plans/perfect-overlap-advisor-verdict.md). It could not
+/// REFUTED it: git history (campaign plan, removed)). It could not
 /// decide F1. This version removes ONLY the prefetch-DEPTH gap (every chunk
 /// is in flight from t0, so the consumer never head-of-line stalls on a
 /// not-yet-DISPATCHED chunk — the named project_confirmed_offset_prefetch_gap
@@ -3083,7 +3083,7 @@ fn run_post_process_task(
 /// (saturating pack — since values are already < 256, saturation is
 /// a no-op). Scalar tail handles the remainder. AVX-256 downclock
 /// concern from an earlier session was empirically refuted on neurotic
-/// via injection probe (see `plans/rust-rapidgzip.md` §4).
+/// via injection probe (see `git history (campaign plan, removed)` §4).
 #[cfg(parallel_sm)]
 #[allow(dead_code)]
 fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {

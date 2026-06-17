@@ -2,6 +2,29 @@
 //!
 //! Entry: [`single_member::decompress_parallel`] → [`sm_driver::read_parallel_sm`]
 //! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_with_rapidgzip`].
+//!
+//! # gzippy → rapidgzip ROLE MAP (which gz module ports which rg source)
+//!
+//! Faithful structural port of rapidgzip's chunked single-member decode. Vendor
+//! source: `vendor/rapidgzip/src/rapidgzip/`. When a gz module "works but looks
+//! structurally off", the cited vendor `file` is the reference.
+//!
+//! | gzippy module          | rapidgzip counterpart                         |
+//! |------------------------|-----------------------------------------------|
+//! | `single_member`        | `ParallelGzipReader` (entry / orchestration)  |
+//! | `sm_driver`            | `ParallelGzipReader::read*` driver loop       |
+//! | `chunk_fetcher`        | `GzipChunkFetcher` + `BlockFetcher` consumer  |
+//! | `block_fetcher`        | `BlockFetcher` (prefetch/cache coordinator)   |
+//! | `block_finder`/`gzip_block_finder`/`raw_block_finder` | `blockfinder/*` (deflate/gzip block boundary scan) |
+//! | `gzip_chunk`           | `GzipChunk::decodeBlock` (per-chunk decode)   |
+//! | `marker_inflate`       | `deflate::Block` (u16 marker-ring decode)     |
+//! | `apply_window`/`replace_markers` | window application / marker resolution |
+//! | `window_map`/`block_map` | `WindowMap` / `BlockMap`                    |
+//! | `huffman_*`/`lut_*`    | `huffman/*` coding tables                      |
+//! | `chunk_data`/`segmented_*` | `ChunkData` + `MarkerReplacement` buffers  |
+//! | `crc32`                | `gzip/crc32.hpp`                              |
+//! | `thread_pool`          | `ThreadPool`                                  |
+//! | `instruments/*`        | NONE — campaign measurement instruments (env-gated, byte-transparent) |
 
 #[cfg(parallel_sm)]
 pub mod apply_window;
@@ -25,10 +48,7 @@ pub mod chunk_fetcher;
 #[cfg(parallel_sm)]
 pub mod chunk_handle;
 pub mod compressed_vector;
-pub mod contig_prof;
 pub mod crc32;
-#[cfg(parallel_sm)]
-pub mod decode_bypass;
 pub mod error;
 #[cfg(parallel_sm)]
 pub mod fd_vectored_write;
@@ -53,42 +73,22 @@ pub mod lut_huffman;
 /// `deflate_block`; renamed to retire the "deflate_block bootstrap" name.)
 #[cfg(parallel_sm)]
 pub mod marker_inflate;
-#[cfg(parallel_sm)]
-pub mod memlife;
 #[cfg(all(unix, parallel_sm))]
 pub mod output_writer;
-pub mod perfect_overlap;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod raw_block_finder;
-/// Removal oracles for the contig clean loop (STORE-removal + symbol-stream
-/// NODECODE replay) — Rule-3 ceiling instruments. See `removal_oracle.rs`.
-pub mod removal_oracle;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;
-/// CLEAN-ONLY ENGINE ORACLE — force every chunk through the clean decode path
-/// via captured predecessor windows (campaign instrument). See `seed_windows.rs`.
-#[cfg(parallel_sm)]
-pub mod seed_windows;
 pub mod segmented_buffer;
 #[cfg(parallel_sm)]
 pub mod segmented_markers;
 pub mod single_member;
-/// Byte-transparent env-gated slow-injection knob for the clean-mode inner
-/// decode loop (causal-perturbation pre-gate). See `slow_knob.rs`.
-pub mod slow_knob;
 pub mod sm_cfg;
 #[cfg(parallel_sm)]
 pub mod sm_driver;
-/// STEP-0 discriminator (a): byte-exact env-gated parent-cached-at-stall probe +
-/// the SATURATION-vs-HORIZON occupancy probe (plans/prefetch-horizon-falsifier.md).
-/// See `stall_residency.rs` + plans/step0-discriminator-a-falsifier.md. Gated on
-/// `parallel_sm` because its only consumer (chunk_fetcher consumer loop) is — under
-/// default features it would be dead code (clippy -D warnings).
-#[cfg(parallel_sm)]
-pub mod stall_residency;
 pub mod statistics;
 /// Non-speculative parallel decode for stored-block-dominated (incompressible)
 /// single-member streams. Portable (depends only on crc32 + gzip_format), so it
@@ -98,10 +98,25 @@ pub mod stored_split;
 pub mod streamed_results;
 #[cfg(parallel_sm)]
 pub mod thread_pool;
-pub mod trace;
-pub mod trace_v2;
 #[cfg(parallel_sm)]
 pub mod used_window_symbols;
 #[cfg(parallel_sm)]
 pub mod width_ring;
 pub mod window_map;
+
+/// Campaign measurement instruments (env-gated, byte-transparent, NO vendor
+/// counterpart). Grouped out of the production modules above so the decode
+/// pipeline reads as a clean structural mirror of rapidgzip. The re-exports
+/// below preserve the historical `parallel::<name>` paths so every hot-path
+/// hook call site is byte-transparent — only the file location changed.
+pub mod instruments;
+// `contig_prof`/`slow_knob` are consumed by the always-compiled inner loop
+// (`inflate::resumable`) + `main`, so they are not parallel_sm-gated.
+pub use instruments::{contig_prof, slow_knob};
+// The rest are consumed only by parallel_sm modules; gate the re-export so the
+// non-parallel_sm (legacy serial) build does not see them as unused imports.
+#[cfg(parallel_sm)]
+pub use instruments::{
+    decode_bypass, memlife, perfect_overlap, removal_oracle, seed_windows, stall_residency,
+    trace_jsonl as trace, trace_timeline as trace_v2,
+};

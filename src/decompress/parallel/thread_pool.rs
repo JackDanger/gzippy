@@ -255,7 +255,7 @@ impl ThreadPool {
 
     /// Current count of worker threads parked in the condvar wait
     /// (`m_idleThreadCount`, ThreadPool.hpp:235). Diagnostic-only read for
-    /// the SATURATION-vs-HORIZON stall probe (plans/prefetch-horizon-falsifier.md):
+    /// the SATURATION-vs-HORIZON stall probe (git history (campaign plan, removed)):
     /// `busy = spawned_threads() - idle_thread_count()`, and
     /// `idle_capacity = idle_thread_count() + (capacity() - spawned_threads())`
     /// (lazy-spawn means an un-spawned slot is also available capacity). A

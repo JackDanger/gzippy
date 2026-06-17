@@ -1,6 +1,6 @@
 //! STEP-0 discriminator (a): PARENT-CACHED-AT-STALL probe.
 //!
-//! See plans/step0-discriminator-a-falsifier.md. Answers the
+//! See git history (campaign plan, removed). Answers the
 //! [[project_confirmed_offset_prefetch_gap]] UNANSWERED discriminator: when the
 //! consumer stalls at a CONFIRMED encoded-bit offset and falls through to a
 //! synchronous COLD `get_with_prefetch`, is the chunk whose decoded range
@@ -50,7 +50,7 @@ pub static CONTAINING_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 /// the stalled offset → EVICTED/absent. The re-scope signal.
 pub static NOT_RESIDENT: AtomicU64 = AtomicU64::new(0);
 
-// --- SATURATION vs HORIZON occupancy channels (plans/prefetch-horizon-falsifier.md) ---
+// --- SATURATION vs HORIZON occupancy channels (git history (campaign plan, removed)) ---
 // At each non-startup cold-get stall, classify WHY the decode hasn't started:
 /// All workers busy at the stall instant (idle_capacity == 0) — no free slot to
 /// start the marginal index's decode. SATURATION (engine) signal.
@@ -219,7 +219,7 @@ pub fn report() {
         cached + inflight + absent == total,
     );
 
-    // SATURATION vs HORIZON occupancy report (plans/prefetch-horizon-falsifier.md).
+    // SATURATION vs HORIZON occupancy report (git history (campaign plan, removed)).
     let sat = OCC_SAT.load(Ordering::Relaxed);
     let hz_ne = OCC_HORIZON_NOT_ENQUEUED.load(Ordering::Relaxed);
     let hz_end = OCC_HORIZON_ENQUEUED_NOT_DONE.load(Ordering::Relaxed);
