@@ -1,5 +1,105 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== LOCALIZE SESSION (2026-06-18 PM) — WHERE IS THE PER-ITERATION GAP? ======
+GOAL: decompose gzippy run_contig vs igzip decode_huffman kernel into per-region
+cyc/B (refill / copy / classify-decode / loop-overhead), confirm top candidate
+causally. Intel cpu4 unstressed, /dev/null sink, freq-invariant cyc/B. SINGLE-ARCH
+= NOT LAW (AMD owed). Tools committed: scripts/bench/_localize_profile_guest.sh
+(perf record+annotate both kernels), scripts/bench/_localize_bucket.py (deterministic
+address→region bucketer, SELF-VALIDATES sum=100%), scripts/bench/_localize_patch_perturb.py.
+
+### GATE-0 CATCH (instrument self-validation — the most-violated rule, caught here)
+The prior /tmp/symtarget was STALE: built @ 2b10aa48 (PRE-flagbit); its disasm showed
+the OLD shrx→cmp$0xff literal discriminator, NOT the production flag-bit
+`test 0x1000000;jnz 49f`. REBUILT symtarget from mission tip 0a592a54
+(CARGO_TARGET_DIR=/tmp/symtarget on tmpfs; strip=false debug=2 target-cpu=native;
+asm pulled by pure-rust-inflate). New disasm has BOTH `test 0x2000000`(long) AND
+`test 0x1000000`(flag-bit), cmp$0xff now COLD. SHA==zcat (silesia+nasa), entries=24128.
+REBUILD: `cd /root/gz-fullrewrite && git checkout 0a592a54 && RUSTFLAGS="-C target-cpu=native"
+CARGO_TARGET_DIR=/tmp/symtarget CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=2
+cargo build --release --no-default-features --features pure-rust-inflate`
+
+### DELIVERABLE 1 — per-region cyc/B, KERNEL-to-KERNEL (perf -F5000, 12 loops, self-validated sum=100%)
+SILESIA (gz kernel 4.889 = 82.95%×total/B; ig kernel 3.981 = 89.14%×; KERNEL gap +0.908):
+| region                          | gz %  | ig %  | gz c/B | ig c/B | gz−ig  |
+|---------------------------------|-------|-------|--------|--------|--------|
+| bit-mgmt (consume+refill)       | 19.1  | 14.4  | 0.934  | 0.573  | +0.361 |
+| backref-copy (MOVDQU)           | 19.1  | 28.0  | 0.932  | 1.115  | −0.183 |
+| classify/decode/table/EOB       | 46.9  | 47.8  | 2.294  | 1.905  | +0.389 |
+| loop-overhead (guard/store/spill)| 14.9 | 9.8   | 0.730  | 0.389  | +0.341 |
+NASA (gz kernel 1.843=54.22%×; ig 1.390=87.73%×; KERNEL gap +0.453):
+| bit-mgmt   16.2/13.9  0.299/0.193 +0.105 | copy 26.5/35.7 0.488/0.496 −0.008 |
+| classify   39.4/39.2  0.726/0.545 +0.180 | loop-ovh 18.0/11.2 0.331/0.155 +0.176 |
+⇒ KERNEL gap is **DIFFUSE** — spread ~evenly across bit-mgmt + classify + loop-overhead;
+  **backref-copy is at PARITY-or-BETTER** (gzippy's MOVDQU port already matches igzip;
+  do NOT attack copy). NO single dominant kernel sub-lever.
+
+### DELIVERABLE 1b — WHOLE-PROCESS gap ≫ KERNEL gap: the gap is SCAFFOLD-DOMINATED
+| corpus  | whole gz | whole ig | whole gap | kernel gap | SCAFFOLD gap | scaffold %of gap |
+|---------|----------|----------|-----------|------------|--------------|------------------|
+| silesia | 5.894    | 4.466    | +1.428    | +0.908     | **+0.520**   | 36%              |
+| nasa    | 3.399    | 1.584    | +1.815    | +0.453     | **+1.362**   | **75%**          |
+gz scaffold (nasa, %proc→cyc/B): asm_exc_page_fault 9.32%(0.317) + __memmove_avx 7.35%
+(0.250) + finish_decode 4.03%(0.137) + sync_regs 2.48%(0.084) + clear_page 1.71%(0.058).
+ig scaffold (nasa): crc32 7.82%(0.124) + copy_to_iter 1.39%. ⇒ On backref-heavy data the
+bulk of the igzip deficit is OUTPUT memmove + first-touch PAGE FAULTS + Rust bail-glue —
+i.e. the rapidgzip-ARCHITECTURE/consumer domain, NOT the inner-loop machinery.
+(HYPOTHESIS-tier: perf attribution; scaffold NOT yet causally perturbed — see NEXT.)
+
+### DELIVERABLE 2 — Gate-2 CAUSAL perturbation of the REFILL/bit-mgmt chain (named top suspect)
+THROWAWAY K8 build (mission tip + 4 rol/ror pairs = 8 value-NEUTRAL serially-DEPENDENT
+ops on {bitbuf} right after the hot `6:` refill `or {bitbuf},{t2}`, extending the
+bitbuf→preload/consume recurrence). CONTROLS: K0 sha==new-native 891c9925 (trusted
+baseline); K8 sha 82f1eeab DISTINCT + byte-EXACT silesia/nasa + entries=24128 +
+16 extra rol/ror in .text (asm! opaque to optimizer, non-inert PASS); GHz spread PASS;
+self-test (A2-A1) PASS. N=21 paired, unstressed, /dev/null. medΔ=(K8−K0):
+| corpus  | medΔ cyc/B | per-op    | 95%CI            | Wilcox p  | ΔIPC   | verdict        |
+|---------|------------|-----------|------------------|-----------|--------|----------------|
+| silesia | +1.007 (+17.0%) | +0.126 | [+0.989,+1.020]  | 6.412e-05 | −0.205 | **ON CRITICAL PATH** |
+| nasa    | +0.133 (+3.9%)  | +0.017 | [+0.086,+0.170]  | 0.0136    | −0.028 | WASH (fails p<0.01) |
+⇒ silesia: PROPORTIONAL, large, p<0.01, ΔIPC dropped (latency-bound) ⇒ the refill/bit-mgmt
+  chain IS on the critical recurrence — shortening it CAN move cyc/B. nasa: weak/wash
+  (nasa's hot literal refill runs rarely; its backref X1 refill — unpatched — is the
+  relevant one). COMBINED w/ STATE's banked classify-chain perturbation (proportional),
+  the top-2 kernel candidates (refill + classify) are BOTH causally on-path.
+  Loop-overhead (+0.341 sil) NOT perturbed this turn (attribution-only).
+  RE-VERIFY: rebuild K0/K8 (`/tmp/loc_prof/patch_perturb.py <asm> 4`, prod flags), then
+  `BIN_A=/tmp/bin/gzippy-k0 BIN_B=/tmp/bin/gzippy-k8 PIN=4 REPS=21 CORPORA="silesia nasa"
+  SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash /root/distpreload-harness/_distpreload_paired_guest.sh`
+
+### DELIVERABLE 3 — removal-oracle BOUNDS (ceiling ≠ gain)
+KERNEL machinery ceiling (igzip-parity removal-oracle, perf-decomposed): if gzippy's
+kernel matched igzip per-region → recover +0.908 cyc/B (sil) / +0.453 (nasa) MAX —
+diffuse, so realistically only fractions capturable. Per-region ceilings (sil):
+refill +0.361, classify +0.389, loop-ovh +0.341, copy 0 (already ≤). SCAFFOLD ceiling
+(whole−kernel): +0.520 (sil) / +1.362 (nasa) — LARGER, esp. backref-heavy.
+
+### RECOMMENDATION (gated-HYPOTHESIS; Intel-only NOT-YET-LAW; for next-technique decision)
+1. **Do NOT chase a single kernel micro-lever.** The kernel per-iteration gap is small
+   (+0.91 sil/+0.45 nasa) and DIFFUSE; copy is already at parity. The mission premise
+   ("igzip's leaner per-iteration machinery") is CONFIRMED real (refill on-path) but
+   bounded and spread — no peephole captures it; matching igzip needs its whole fused
+   shape (consume+refill+preload interleave), high-effort/low-marginal.
+2. **The biggest causally-confirmed KERNEL sub-lever = refill/bit-mgmt** (silesia, Gate-2
+   on-path, ceiling +0.36 cyc/B). Byte-exact technique to target it: fuse gzippy's
+   consume (`shrx;sub`) + refill (`mov;shlx;or;63-sub-shr3-add;or56`) + next-litlen
+   preload into igzip's single interleaved cadence (igzip 38d0e-38d71 does consume,
+   speculative store, ONE refill-advance, and BOTH next-litlen+dist preloads in one
+   straight chain with the load-use hidden) — i.e. reduce the consume+refill DEPENDENT
+   chain LENGTH, not the instruction count. Pre-register success = silesia cyc/B medΔ<0 p<0.01.
+3. **HIGHER-VoI but ARCHITECTURE-domain: the SCAFFOLD** (whole gap ≫ kernel gap; nasa
+   75%). Next causal test (owed, not done): removal-oracle on output __memmove_avx +
+   first-touch page faults — decode into a REUSED/pre-faulted output buffer (no per-chunk
+   fresh alloc) and/or eliminate the libc memmove copy; measure nasa whole-process cyc/B.
+   If it drops proportionally, the consumer/chunk-output path (faithful rapidgzip port
+   territory) is the real remaining lever on backref-heavy corpora — ESCALATE to user (R3:
+   inner-loop is near its floor; the gap is moving to architecture).
+4. AMD/Zen2 replication of all of the above is owed before LAW.
+GUEST ARTIFACTS kept: /tmp/symtarget (symboled mission-tip bin), /tmp/bin/gzippy-k0
+(=new-native), /tmp/bin/gzippy-k8 (perturb), /tmp/loc_prof/ (annot+stat+bucket.py).
+gz-fullrewrite moved to 0a592a54 (was 2b10aa48); asm reverted clean; box: powersave,
+0 stressors, no pinning leftover.
+
 ## ====== B-SIZING SESSION (2026-06-18) — 3 GATING MEASUREMENTS BEFORE FUNDING B ======
 Goal: size rewrite B (igzip-style fat DIRECT one-symbol-per-iter table, ~0 unpack)
 with MEASURED numbers (not the 1.34 slope/ceiling) for a USER R3 decision. Guest
