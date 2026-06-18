@@ -21,15 +21,39 @@ Harness on guest: /root/distpreload-harness/.
             nasa wash). KEPT on byte-exact license; gap to igzip NOT closed (still +39.5%).
 
 ## STEP-B TECHNIQUE LOG (gated, Intel trainer cpu4, N=21 paired, /dev/null sink)
-| # | technique | byte-exact | Δinstr/B (sil) | cyc/B medΔ (sil) | p | verdict | kept? |
+| # | technique | byte-exact | Δinstr/B (sil) | cyc/B medΔ (sil) unstressed | p | verdict | kept? |
 |---|-----------|-----------|----------------|------------------|---|---------|-------|
 | 1 | fuse shift `lea[t3*8-8]` (was lea-1+shl3) | PASS | -0.186 | -0.040 [CI-0] | 0.018 | TIE (fails p<0.01) | YES (byte-exact) |
-  Re-verify #1: BIN_A=<prior> BIN_B=<new> PIN=4 REPS=21 CORPORA="silesia nasa"
-  SKIP_STRESS=1 bash /root/distpreload-harness/_distpreload_paired_guest.sh
-  LESSON (confirms advisor #1): removing a PREDICTABLE, load-shadowed instr drops
-  instr/byte but NOT cyc/byte proportionally — the shl was overlapped behind the table
-  load. To move cyc/byte the lever must cut the CRITICAL-PATH ALU (the shrx-fed
-  classify dep chain / mispredicting branch), not just retired-instruction count.
+| 2 | FLAG-BIT discriminator (`test entry,0x1000000;jnz` off build-time trailing-class bit 24; removes shift-lea+and+shrx+cmp from literal discriminator chain) | PASS | -0.279 | **-0.099 (-1.67%)** [CI -0.103,-0.094] | 6.4e-05 | **SIGNIF-faster UNSTRESSED** (sil+nasa+mono p<0.01, CI excl 0); WASH/TIE under bandwidth stressor (LLC 91%) | YES |
+  Re-verify #1/#2: BIN_A=/root/bin/gzippy-base-native BIN_B=/root/bin/gzippy-new-native
+  PIN=4 REPS=21 CORPORA="silesia nasa monorepo" SKIP_STRESS=1
+  GZIPPY_FORCE_PARALLEL_SM=1 bash /root/distpreload-harness/_distpreload_paired_guest.sh
+  (stressor arm: SKIP_STRESS=0 CORPORA="silesia nasa")
+
+  TECHNIQUE #2 RESULT (2026-06-18, this session):
+    - byte-exact: native sha grid silesia/nasa/monorepo/squishy × T1/T4/T8 == gzip;
+      c1/c2/c3 asm-vs-ref differential PASS (x86_64); proptest 60k prop_structured_roundtrip
+      PASS; new lut_huffman flag-invariant test PASS (flag bit24 == trailing>=256 for
+      every short entry). exit profile IDENTICAL to base (entries=24128, reclass_dist=21330,
+      reclass_eob=2796) — same paths, fewer instrs.
+    - UNSTRESSED gated cyc/byte (base-vs-new, self-test PASS all 3, mono self-test flagged
+      a -0.0044 rig bias dwarfed by the -0.062 effect):
+        silesia  medΔ=-0.0993 (-1.67%)  CI[-0.103,-0.094]  p=6.4e-05  SIGNIF-faster
+        nasa     medΔ=-0.0112 (-0.33%)  CI[-0.022,-0.005]  p=0.0067   SIGNIF-faster
+        monorepo medΔ=-0.0620 (-1.20%)  CI[-0.079,-0.043]  p=0.00085  SIGNIF-faster
+        ΔIPC sil -0.010, Δinstr/B sil -0.279 (the removed shift+extract+cmp).
+    - STRESSED (memstress 14T, LLC 91-92%): WASH/TIE
+        silesia medΔ=-0.013 CI[-0.245,+0.093] p=0.465; nasa medΔ=+0.014 p=0.627.
+        Δinstr/B STILL -0.28 (sil) stressed — the WORK is removed in both regimes; the
+        cyc/byte win only surfaces when NOT bandwidth-saturated (compute-bound regime).
+    - VERDICT: real CRITICAL-CHAIN win in the compute-bound regime (contrast #1's
+      load-shadowed TIE — this time cyc/byte moved with instr/byte because the removed
+      ops fed the discriminator branch the Gate-2 perturbation proved is on the critical
+      recurrence). Does NOT meet the strict "stressor-stable" arm. KEPT on byte-exact +
+      compute-bound win. Single-arch Intel = NOT-YET-LAW (AMD owed).
+  LESSON #1 (still valid): removing a PREDICTABLE, load-shadowed instr drops instr/byte
+  but NOT cyc/byte — the shl was overlapped behind the table load. Technique #2 confirms
+  the inverse: cutting the CRITICAL-PATH discriminator chain DOES move cyc/byte (unstressed).
 
 ## GATE-2 CAUSAL PERTURBATION — IS THE UNPACK/CLASSIFY CHAIN ON THE CRITICAL RECURRENCE? (2026-06-18)
 DECISIVE TEST that gates whether rewrite B (igzip-style fat DIRECT table, ~0 unpack)
@@ -93,11 +117,25 @@ Intel i7-13700T LXC (cpu4 pinned). All cells p=6.4e-5, CI excludes 0, self-test 
 (except stressed-nasa, noted). medΔ=(B-A1)>0 means gzippy SLOWER. THE GAP IS LARGE:
 
 UNSTRESSED (clean) — THE number to close:
+START (base af53f95e, banked):
 | corpus   | igzip cyc/B | gzippy cyc/B | medΔ (B-A1)      | Δinstr/byte | ΔIPC   |
 |----------|-------------|--------------|------------------|-------------|--------|
 | silesia  | 4.30        | 6.00         | +1.70 (+39.5%)   | +~2.3       | -0.27  |
 | monorepo | 2.97        | 5.17         | +2.20 (+73.9%)   | +2.83       | -0.43  |
 | nasa     | 1.58        | 3.43         | +1.84 (+116.5%)  | +2.08       | -0.64  |
+
+CURRENT after technique #2 FLAG-BIT (new-native vs igzip, 2026-06-18, unstressed,
+all self-tests PASS, N=21 paired):
+| corpus   | igzip cyc/B | gzippy cyc/B | medΔ (B-A1)      | Δinstr/byte | ΔIPC   |
+|----------|-------------|--------------|------------------|-------------|--------|
+| silesia  | 4.367       | 5.871        | +1.499 (+34.3%)  | +1.86       | -0.35  |
+| nasa     | 1.576       | 3.331        | +1.754 (+111.3%) | +1.98       | -0.64  |
+| monorepo | 2.956       | 5.033        | +2.070 (+70.0%)  | +2.73       | -0.41  |
+  ⇒ gap CLOSED by the flag-bit: silesia +39.5%→+34.3% (~0.10 cyc/B), monorepo
+    +73.9%→+70.0% (~0.06), nasa ~+0.01. RESIDUAL gap = +1.50/+1.75/+2.07 cyc/B.
+    Removal-oracle ceiling was ~1.34 cyc/B (silesia kernel 5.32→3.98); flag-bit
+    recovered ~0.10 of it ⇒ ~7% of the headroom captured, ~1.24 cyc/B STILL on the
+    table ⇒ rewrite B (fat DIRECT table, ~0 unpack) remains justified by the residual.
 
 STRESSED (memstress 14T, LLC-miss ~42-45%): gap HELD/GREW (silesia +39.5%, monorepo
 +108%, nasa +179%) ⇒ NOT a bandwidth artifact; it is real work-volume. (stressed-nasa
@@ -158,6 +196,35 @@ the hot run_contig classify+decode loop, addressable."
   DIRECTLY, paying ~0 unpack ALU — that ~21% is the instruction excess. NOTE: attacking
   it = changing the short-entry TABLE FORMAT (build side in lut_huffman) in lockstep, a
   STRUCTURAL change, not a peephole; high byte-exact risk, must be one gated commit.
+
+## RESUME POINT (2026-06-18, end of technique #2 = NEXT #1 flag-bit)
+DONE this session: NEXT #1 (flag-bit discriminator) IMPLEMENTED + GATED + KEPT.
+  - byte-exact PROVEN on x86_64 guest (sha grid native, c1/c2/c3 asm-vs-ref, proptest
+    60k, builder flag-invariant test). KEPT.
+  - cyc/byte: SIGNIF-faster UNSTRESSED (sil -1.67% p=6.4e-5, nasa -0.33% p=0.0067,
+    mono -1.20% p=8.5e-4, self-tests PASS except mono small rig-bias); WASH/TIE under
+    bandwidth stressor (LLC 91%). Does NOT meet strict "stressor-stable" arm; KEPT on
+    byte-exact + compute-bound critical-chain win.
+  - NEW residual gap vs igzip: silesia +1.50 (+34.3%), nasa +1.75 (+111%), monorepo
+    +2.07 (+70%) cyc/B. Flag-bit captured ~7% of the silesia removal-oracle headroom.
+COMMIT: technique #2 source (lut_huffman flag bit + builder + invariant test;
+  asm_kernel flag-bit discriminator + 49: trailing-recovery shim; lut_bulk
+  symbol→code length fix) pushed to perf/igzip-full-rewrite.
+GUEST BINARIES (kept for next A/B): /root/bin/gzippy-base-native (af53f95e),
+  /root/bin/gzippy-new-native (af53f95e+flagbit). Worktrees: /root/gz-flagbit-new
+  (patched src), /root/gz-flagbit-base (clean af53f95e). Re-verify cmds in the
+  technique log above.
+
+RECOMMENDATION (B decision — for USER R3): the flag-bit did NOT capture most of the
+headroom (~0.10 of ~1.34 cyc/B on silesia). Residual gap to igzip is STILL +1.50 to
++2.07 cyc/B (+34-70%). ⇒ rewrite B (fat DIRECT one-symbol-per-iter table, ~0 unpack
+ALU) REMAINS justified by the residual. CAVEAT: the stressor wash shows much of the
+kernel time is memory-bound under contention; B's instruction reduction (like #2's)
+will similarly wash when bandwidth-saturated — B's payoff is bounded to the
+compute-bound regime (which is where the removal-oracle 1.34 cyc/B ceiling was
+measured). NEXT step before B: optionally extend the flag idea — also bake a
+"length-vs-EOB-vs-reclass" sub-class into spare entry bits to shrink the 50: arm —
+but the bigger lever is B. DO NOT begin B without USER R3.
 
 ## NEXT (planned, in priority order) — for the iteration phase (deliverable #2)
 REVISED after technique #1's TIE: the prize is CRITICAL-PATH cyc/byte, NOT retired
