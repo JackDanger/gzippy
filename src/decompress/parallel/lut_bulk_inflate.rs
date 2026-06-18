@@ -274,7 +274,12 @@ pub fn decode_block(
             if code as u32 > MAX_LIT_LEN_SYM {
                 return Err(BulkDecodeError::InvalidHuffmanCode);
             }
-            let length = (symbol - LENGTH_BASE_OFFSET) as usize;
+            // Use the masked trailing `code`, NOT raw `symbol`: a non-literal
+            // singleton/pair entry now carries the build-time trailing-class
+            // flag (bit 24, or its bit-16 displacement after a >>8 prefix
+            // shift) which `& 0xFFFF` (the `code` mask) strips. For pre-flag
+            // tables `code == symbol` here, so this is byte-exact.
+            let length = (code as u32 - LENGTH_BASE_OFFSET) as usize;
             if length == 0 || length > MAX_MATCH_LENGTH {
                 return Err(BulkDecodeError::InvalidHuffmanCode);
             }
@@ -350,7 +355,9 @@ pub fn decode_block(
                 return Err(BulkDecodeError::InvalidHuffmanCode);
             }
 
-            let length = (symbol - LENGTH_BASE_OFFSET) as usize;
+            // Masked trailing `code` (not raw `symbol`) — strips the build-time
+            // trailing-class flag; `code == symbol` for pre-flag tables.
+            let length = (code as u32 - LENGTH_BASE_OFFSET) as usize;
             if length == 0 || length > MAX_MATCH_LENGTH {
                 return Err(BulkDecodeError::InvalidHuffmanCode);
             }

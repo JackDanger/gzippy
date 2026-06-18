@@ -348,7 +348,11 @@ mod imp {
     ///   top guards        ↔ ref `*dst >= out_lim || pos >= in_lim`
     ///   prologue/carried gather + `20:` long resolve
     ///                     ↔ lut_huffman.rs `decode_prefilled`
-    ///   flat classify (`cmp 255` on trailing, `50f`) ↔ ref `trailing > 255`
+    ///   flat classify (`test FLAG` bit 24 → `49f`/`50f`) ↔ ref `trailing > 255`
+    ///                     (the build-time flag == `trailing >= 256` by the
+    ///                      `make_inflate_huff_code_lit_len` invariant; the ref
+    ///                      computes the equivalent predicate, so the c2/c3
+    ///                      differential still pins the same contract)
     ///   pure-literal pack (lone+multi unified) ↔ ref 8-byte packed store +
     ///                       `*dst += cnt` (one packet/iter, NO chain)
     ///   bottom `6:`/`63:` ↔ ref `< 48` threshold refill
@@ -403,15 +407,17 @@ mod imp {
                 "jae 9f",
                 // ── FLAT CLASSIFY (igzip/libdeflate fastloop shape): the
                 //    preloaded short entry {t1} is dispatched with ONE
-                //    data-dependent branch — literal-vs-non-literal on the
-                //    TRAILING packed symbol (`cmp 255`, the analog of
-                //    igzip's `cmp 0x100`). The LARGE_FLAG (long) and bc==0
-                //    (invalid) branches are perfectly-predicted on real
-                //    streams (rare, monotone). The old multi-stage cascade
-                //    (sym_count branch) AND the speculative literal chain
-                //    that RE-RAN the whole classify for the 2nd/3rd literal
-                //    are GONE: lone + multi literals are unified into one
-                //    flat path, one packet per top-iteration.
+                //    data-dependent branch — literal-vs-non-literal — read
+                //    DIRECTLY off the BUILD-TIME trailing-class FLAG bit in
+                //    the loaded entry (`test 0x1000000`, the analog of igzip's
+                //    table carrying the symbol class), NOT by extracting and
+                //    `cmp 255`-ing the trailing symbol. The LARGE_FLAG (long)
+                //    and bc==0 (invalid) branches are perfectly-predicted on
+                //    real streams (rare, monotone). The old multi-stage
+                //    cascade (sym_count branch) AND the speculative literal
+                //    chain that RE-RAN the whole classify for the 2nd/3rd
+                //    literal are GONE: lone + multi literals are unified into
+                //    one flat path, one packet per top-iteration.
                 "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT → long (cold)
                 "jnz 20f",
                 "mov {t2:e}, {t1:e}",
@@ -419,16 +425,21 @@ mod imp {
                 "jz 8f",                              // invalid (bc==0) → Rust (pre-consume)
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
-                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
-                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1) (0/8/16) — fused
-                                                     // lea (was `lea -1` + `shl 3`):
-                                                     // t3*8-8 == (cnt-1)<<3 for all cnt,
-                                                     // byte-exact, one fewer hot instr.
-                "mov {t5:e}, {t1:e}",
-                "and {t5:e}, 0x1FFFFFF",              // strip flag/cnt/bc → packed syms only
-                "shrx {t5}, {t5}, {t4}",              // trailing symbol → low bits (high bits 0)
-                "cmp {t5:e}, 255",
-                "ja 50f",                             // trailing non-literal → backref/EOB arm
+                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3) — for advance/prefix
+                // ── FLAG-BIT DISCRIMINATOR (NEXT #1) ──────────────────────
+                //    Branch off the BUILD-TIME trailing-class bit (bit 24,
+                //    LARGE_TRAILING_NONLIT_FLAG) loaded WITH the entry,
+                //    instead of extracting+classifying the trailing symbol.
+                //    This removes the `lea`(shift) + `mov`/`and`/`shrx`
+                //    (extract) + `cmp` dependency chain from the LITERAL fast
+                //    path's discriminator — the Gate-2 perturbation proved
+                //    that shrx→cmp chain sits on the critical recurrence; the
+                //    branch now resolves off the load (t1) directly. The
+                //    trailing symbol is recovered only in the cold `49:` shim
+                //    on the (rarer) non-literal arm. Faithful to igzip's
+                //    table carrying the symbol-class flag in its entry.
+                "test {t1:e}, 0x1000000",             // LARGE_TRAILING_NONLIT_FLAG (bit 24)
+                "jnz 49f",                            // trailing non-literal → recover + backref/EOB arm
                 // ── pure-literal pack (cnt literals, all ≤255), SOFTWARE-
                 //    PIPELINED (igzip loop_block 514-556): SAVE the up-to-3
                 //    packed bytes, consume the packet, then INTERLEAVE the
@@ -501,9 +512,23 @@ mod imp {
                 "inc {dst}",
                 "jmp 64b",                            // → cold bottom: refill + preload + loop
                 "21:",                                // long lone non-literal
-                "mov {t5:e}, {t1:e}",                 // trailing = code
+                "mov {t5:e}, {t1:e}",                 // trailing = code (already clean, no flag bit)
                 "mov {t3:e}, 1",                      // cnt = 1 (long codes are never packed)
-                // fall through to the unified non-literal arm
+                "jmp 50f",                            // skip the short-entry trailing recompute
+                // ── 49: short-entry NON-LITERAL trailing recovery (flag-bit
+                //    discriminator cold arm). Reached only from the top
+                //    `test FLAG; jnz 49f`. Reconstruct the trailing symbol the
+                //    way the old hot path did (`(syms >> 8*(cnt-1))`), then
+                //    mask 0xFFFF: for cnt∈{1,2} this drops the displaced FLAG
+                //    bit (bit 24, or bit 16 after the >>8); for cnt==3 it keeps
+                //    sym3's legitimate bit 8. t4 is scratch (recomputed in
+                //    50:). Falls through to the unified non-literal arm.
+                "49:",
+                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1) (0/8/16)
+                "mov {t5:e}, {t1:e}",
+                "and {t5:e}, 0x1FFFFFF",              // strip largeflag/cnt/bc → packed syms
+                "shrx {t5}, {t5}, {t4}",              // trailing symbol → low bits
+                "and {t5:e}, 0xFFFF",                 // strip displaced FLAG bit (cnt 1/2)
                 // ── unified non-literal arm (replaces lone `50:` + multi
                 //    `25:`): t3=cnt, t2=bc, t5=trailing(>255), t1=raw short
                 //    entry. Lone backref (cnt==1) and multi-with-trailing-
@@ -887,11 +912,16 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if pre.bit_count == 0 {
             return EXIT_RECLASS;
         }
-        // FLAT CLASSIFY (mirrors the rewritten asm top): extract the TRAILING
-        // packed symbol uniformly (`(syms >> 8*(cnt-1)) & 0xFFFF`, after
-        // stripping the flag/cnt/bc bits with `& 0x01FF_FFFF`) and dispatch
-        // on literal-vs-non-literal with ONE branch. Lone + multi literals
-        // are unified; there is NO speculative literal chain (one packet per
+        // FLAT CLASSIFY (mirrors the rewritten asm top): the asm now branches
+        // off the BUILD-TIME trailing-class FLAG bit (entry bit 24); this ref
+        // computes the EQUIVALENT predicate by extracting the TRAILING packed
+        // symbol uniformly (`(syms >> 8*(cnt-1)) & 0xFFFF`, after stripping the
+        // flag/cnt/bc bits with `& 0x01FF_FFFF`) and testing `> 255`. The
+        // builder's invariant guarantees `flag == (trailing >= 256)`
+        // (see lut_huffman::LARGE_TRAILING_NONLIT_FLAG + the flag-invariant
+        // unit test), so the two dispatch identically — the `& 0xFFFF` here
+        // also strips the displaced flag bit for cnt∈{1,2}. Lone + multi
+        // literals are unified; NO speculative literal chain (one packet per
         // iteration), exactly as the asm now does.
         let cnt = pre.sym_count as usize;
         let trailing = ((pre.symbol & 0x01FF_FFFF) >> (8 * (cnt - 1))) & 0xFFFF;
