@@ -1,5 +1,108 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== SCAFFOLD-ARTIFACT SESSION (2026-06-18 late PM) — is the SCAFFOLD gap REAL or a HARNESS/ALLOC ARTIFACT? ======
+MISSION: settle whether the SCAFFOLD gap (output __memmove_avx + first-touch page
+faults + finish_decode) is a real production cost or a fresh-per-run allocation
+artifact, via removal-oracles, BEFORE any architecture work. Intel cpu4 unstressed,
+/dev/null sink, freq-invariant cyc/B. Binaries: /root/bin/gzippy-new-native (mission
+tip), igzip=/usr/bin/igzip. Symboled bin /tmp/symtarget/release/gzippy (@0a592a54).
+SINGLE-ARCH Intel = NOT-YET-LAW (AMD owed). T1 single-core only.
+
+### MEASUREMENT 1 — page-fault accounting (gated, perf -r 11, cpu4 unstressed)
+| corpus  | tool   | page-faults | cyc       | cyc/B  | dTLB-miss | gap cyc/B      |
+|---------|--------|-------------|-----------|--------|-----------|----------------|
+| silesia | gzippy | 24,075      | 1.261e9   | 5.950  | 42,546    |                |
+| silesia | igzip  | 667         | 0.941e9   | 4.440  | 21,099    | +1.510 (+34.0%)|
+| nasa    | gzippy | 54,077      | 0.710e9   | 3.459  | 82,468    |                |
+| nasa    | igzip  | 666         | 0.326e9   | 1.589  | 3,240     | +1.869 (+117.5%)|
+⇒ SMOKING GUN: igzip faults ~666-667 pages REGARDLESS of output size (212MB vs 205MB)
+  ⇒ igzip STREAMS output through a small fixed REUSED buffer. gzippy faults 24k(sil)/
+  54k(nasa) ≈ tracks output page count (nasa 54k ≈ 50,108 output pages; silesia 24k ≈
+  HALF — partial reuse/THP, unexplained-but-noted) ⇒ gzippy MATERIALIZES the full
+  contiguous output, faulting each page once. Δfaults = +23,408 (36x) sil / +53,411
+  (81x) nasa. major-faults=0 (all minor/anon).
+
+### MEASUREMENT 2 — reuse/pre-fault REMOVAL-ORACLES: ALL THREE INERT (decisive negative)
+Tried to make gzippy recycle/pre-fault output pages so faults→igzip-level:
+  (a) glibc `MALLOC_MMAP_THRESHOLD_=1G MALLOC_TRIM_THRESHOLD_=-1` (heap-recycle): faults
+      24029→24026 — INERT.
+  (b) THP=always: LXC sysfs is READ-ONLY ("Read-only file system"), cannot change in
+      container; faults unchanged 24016 — UNAVAILABLE here.
+  (c) `GZIPPY_PREFAULT_ARENA=220` (the in-tree rule-#3 oracle, chunk_buffer_pool.rs:208;
+      ±GZIPPY_SLAB_ALLOC=1): faults nasa 54020→54018, sil 24023→24017 — INERT (does NOT
+      serve the output buffer's pages from the prefaulted rpmalloc thread-cache).
+GATE-0: all three non-inert checks FAILED to move faults ⇒ the output faults are GENUINE
+one-time first-touch of the materialized output buffer; NOT allocator-recyclable and NOT
+pre-faultable via the available knobs. ⇒ The faults are NOT a "fresh per-run allocation"
+artifact in the recyclable sense — they recur on EVERY production decode and no recycle
+removes them. The ONLY removal is architectural (don't materialize full output; stream
+through a reused buffer = igzip's design).
+COULD-NOT-RUN: the definitive in-process reused/pre-faulted-output-buffer oracle (decode
+N× reusing one warm dst) — needs a throwaway reuse-harness build OR THP on a non-LXC box
+(neurotic-baremetal / solvency). OWED before the recoverable-cyc magnitude is STRONG-tier.
+
+### MEASUREMENT 3 — the extra-memmove question + perf attribution (HYPOTHESIS-tier; perf -F6000 symboled)
+SILESIA self%: run_contig 83.71 | rebuild_from 2.86 | finish_decode(=CRC) 2.01 |
+  __memmove_avx 1.08 | kernel mm/fault ~4.75 (sync_regs .82, __rmqueue .64, clear_page
+  .56, unmap .50, mm_fault .33, ...). SCAFFOLD ≈ 7.8% → ~0.47 cyc/B.
+NASA self%: run_contig 53.66 | __memmove_avx 14.00 | finish_decode(=CRC) 4.15 |
+  kernel mm/fault ~15.0 (sync_regs 2.37, clear_page 1.77, irq_iret 1.77, pte_lock 1.58,
+  do_user_addr_fault .79, __handle_mm_fault .79, ...). SCAFFOLD ≈ 33% → ~1.13 cyc/B.
+CALLGRAPH (nasa, dwarf): __memmove_avx (14.78%) = 8.21% pure inlined memcpy + 6.57%
+  memcpy INVOKED FROM asm_exc_page_fault (copy writing to COLD output pages). The
+  page-fault path = {memcpy 9-11%} + {run_contig→marker_inflate::decode_clean_into_contig
+  4.67-5.32%} — i.e. faults are triggered by BOTH the backref/output memcpy AND the
+  decode itself writing decoded bytes to fresh output pages. finish_decode is ~all CRC32
+  (crc32fast pclmulqdq inlined), NOT a copy.
+EXTRA-MEMMOVE VERDICT: there is NO redundant decode→scratch→writer double-copy to elide.
+  gzippy decodes COPY-FREE into the contig buffer (decode_clean_into_contig) then
+  output_writer does writev (no copy). The memmove/memcpy IS the LZ77 backref copy +
+  cold-page output writing — work igzip ALSO does, BUT igzip's copy lands on its small
+  REUSED (already-faulted) window buffer (→0 faults), gzippy's lands on FRESH 200MB output
+  (→ faults). So the "extra cost" is the FAULTS from materializing full output, not a
+  duplicate memmove. Size: nasa memmove+fault ≈ 14%+15% ≈ 29% (~1.0 cyc/B); silesia ≈
+  1%+5% ≈ 6% (~0.35 cyc/B). igzip's memmove+fault ≈ ~0 (666 faults, banked scaffold = crc).
+
+### ARTIFACT-vs-REAL VERDICT (gated negative-oracle + T1-single-core structural argument)
+1. NOT a harness re-run artifact: production decodes one file/invocation → materializes +
+   faults the full output EVERY run; 3 recycle/prefault oracles INERT ⇒ no allocation
+   trick removes it.
+2. At T1 SINGLE-CORE there is no second thread to hide fault/memmove cycles behind, so the
+   perf-sampled mm/fault/memmove cycles (~6% sil / ~29% nasa) ARE wall cycles — real T1
+   cost, not slack. (The prior in-tree "faults may be slack" thesis was a MULTI-thread
+   depth-14 matched-wall scenario, NOT T1.) This is structural, not a removal-oracle —
+   the exact recoverable cyc/B is still HYPOTHESIS until a working output-reuse oracle.
+3. Discounting "artifacts" does NOT shrink the gap: the scaffold is REAL. True production
+   T1 gap to igzip STANDS at silesia +1.510 (+34.0%), nasa +1.869 (+117.5%) cyc/B. On
+   backref-heavy nasa the scaffold (~1.1 cyc/B) is the DOMINANT remaining component
+   (kernel gap only +0.45; whole gap +1.87); on silesia kernel (+0.91) > scaffold (~0.47).
+
+### RECOMMENDATION (gated-HYPOTHESIS; Intel-only NOT-YET-LAW; feeds R3 user decision)
+- There IS a REAL architecture/consumer-domain gap: gzippy MATERIALIZES full contiguous
+  output (24-54k first-touch faults + cold-page memcpy) where igzip STREAMS through a
+  reused buffer (~666 faults). It is the DOMINANT remaining gap on backref-heavy corpora
+  (nasa) and a real T1 cost (single-core ⇒ on the wall). This is faithful-rapidgzip-
+  /streaming-consumer territory = USER R3.
+- BUT ceiling≠gain: every available removal-oracle was INERT, so the RECOVERABLE cyc/B
+  from a streaming consumer is NOT YET BOUNDED (attribution says ~0.35 sil / ~1.0 nasa,
+  HYPOTHESIS-tier). Caveat: rapidgzip ITSELF materializes chunk output, so a "faithful rg
+  consumer" may NOT reach igzip's 666-fault streaming profile — the lever that matches
+  igzip is OUTPUT STREAMING through a reused buffer (igzip-shaped), which at T1 is feasible
+  but is a divergence-from-rg architecture choice. ESCALATE this fork to USER (R3).
+- OWED before funding the port (the decisive gate): a WORKING output-reuse removal-oracle
+  — either (i) a throwaway in-process harness decoding N× into one warm dst, or (ii) THP
+  on a non-LXC box (neurotic bare-metal / solvency) — that DROPS faults to igzip-level
+  and shows matched-wall T1 cyc/B drops proportionally. Until then the scaffold is
+  REAL-and-on-the-T1-wall (gated) but its recoverable magnitude is HYPOTHESIS.
+- AMD/Zen2 replication of M1 owed before LAW.
+RE-VERIFY M1: `bash /tmp/m1_pagefaults.sh` on guest (uploaded), or:
+  `taskset -c 4 perf stat -r 11 -e page-faults,cpu_core/cycles/ -- env GZIPPY_FORCE_PARALLEL_SM=1 taskset -c 4 /root/bin/gzippy-new-native -d -c -p1 /root/{silesia,nasa}.gz >/dev/null`
+  igzip arm: `taskset -c 4 perf stat -r 11 -e page-faults,cpu_core/cycles/ -- taskset -c 4 igzip -d -c /root/{corpus}.gz >/dev/null`
+RE-VERIFY M3 profile: `taskset -c 4 perf record -F6000 -o /tmp/p.data -- env GZIPPY_FORCE_PARALLEL_SM=1 /tmp/symtarget/release/gzippy -d -c -p1 /root/nasa.gz >/dev/null; perf report -i /tmp/p.data --stdio`
+BOX STATE: clean — THP unchanged (madvise; the always-write errored read-only, no-op),
+governor powersave, 0 stressors, no pinning leftover, guest src /root/gz-fullrewrite
+@0a592a54 clean. NO main push. Perf scratch in guest /tmp (ephemeral).
+
 ## ====== LOCALIZE SESSION (2026-06-18 PM) — WHERE IS THE PER-ITERATION GAP? ======
 GOAL: decompose gzippy run_contig vs igzip decode_huffman kernel into per-region
 cyc/B (refill / copy / classify-decode / loop-overhead), confirm top candidate
