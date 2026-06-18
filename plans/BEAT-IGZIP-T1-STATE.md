@@ -1,5 +1,88 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== PRODUCTIONIZE SESSION (2026-06-18 night2) — ratio-based output reserve SHIPPED (gated, byte-exact, KEPT) ======
+MISSION: productionize the cheap-fix the prior session bounded (oracle gzippy-bigreserve:
+nasa -0.533 cyc/B / -12% to-file wall via blind 16->96 MiB clamp + 8->16 mult). Goal:
+size the per-chunk output reserve from the ALREADY-computed member ratio
+(`expansion_ratio_ceil`), not a blind 96 MiB, so the grow-realloc storm dies on expanding
+data WITHOUT over-reserving low-expansion data. Intel guest cpu4 unstressed. SINGLE-ARCH
+Intel = NOT-YET-LAW (AMD/Zen2 owed).
+
+### THE DIFF (commit 1afc7a02 on perf/igzip-full-rewrite) — ONE production path, asm untouched
+- `chunk_decode.rs`: broadened `compute_initial_reserve(compressed_span, expansion_ratio_ceil)`
+  cfg from isal-only to `#[cfg(parallel_sm)]` (it already existed for the ISA-L oracle path:
+  factor = ratio_ceil (0->8 fallback), clamp [4 MiB, 64 MiB]).
+- Rewired BOTH native reserve sites to use it (replacing `compressed*8 + 1MiB` clamped 16 MiB):
+  `decode_chunk_unified_marker` (was chunk_decode.rs:1408-1413) and
+  `seed_block_for_contig_native` (was :1853-1858). `expansion_ratio_ceil` is read from
+  `chunk.configuration` (plumbed from sm_driver.rs:139-149). Under-reserve still falls back
+  to safe amortized regrow (byte-transparent — proven B==A byte-identical).
+
+### GATE 1 — BYTE-EXACT: PASS (HARD GATE)
+- BOTH flavors build (native pure-rust + gzippy-isal on guest). ratioB output == gzip == igzip
+  == baseA (BYTE-IDENTICAL) across silesia/nasa/monorepo/squishy/weights × T1/T4/T8 (native);
+  isal flavor byte-exact silesia/nasa/monorepo/squishy × T1/T4/T8. proptest 60k
+  prop_structured_roundtrip PASS. The change is a pure capacity-hint -> byte-transparent.
+- Binaries: BIN_A=/root/bin/gzippy-baseA (15cbdffd, sha 891c9925 == prior gzippy-new-native),
+  BIN_B=/root/bin/gzippy-ratioB (1afc7a02, sha ed948aa6) — distinct (non-inert).
+
+### GATE 2 — cyc/byte (paired N=21, unstressed) + WALL (best-of-9/21) + faults — SIGNIF WIN on expanding data
+cyc/byte (BIN_A baseA vs BIN_B ratioB, self-tests PASS, GHz spread PASS):
+| corpus   | A1 cyc/B | B cyc/B | medΔ (B-A1)        | 95%CI             | Wilcox p  | Δinstr/B | verdict |
+|----------|----------|---------|--------------------|-------------------|-----------|----------|---------|
+| silesia  | 5.962    | 5.935   | -0.0353 (-0.59%)   | [-0.052,-0.015]   | 0.00198   | -0.009   | SIGNIF-faster |
+| nasa     | 3.500    | 2.921   | **-0.5737 (-16.4%)**| [-0.624,-0.517]  | 6.4e-05   | -0.420   | SIGNIF-faster |
+| monorepo | 5.191    | 4.732   | **-0.4736 (-9.1%)** | [-0.502,-0.436]  | 6.4e-05   | -0.356   | SIGNIF-faster |
+WALL best-of (T1, sha-OK) + page-faults (perf -r7):
+| corpus   | sink      | baseA  | ratioB | Δwall  | faults base->ratio | igzip wall |
+|----------|-----------|--------|--------|--------|--------------------|------------|
+| silesia  | /dev/null | 0.898  | 0.895  | ~tie   | 24076 -> 24054     | 0.680      |
+| silesia  | tmpfs     | 1.038  | 1.083  | tie(noise) | (interleaved N21x2: ratioB faster both rounds) | 0.826 |
+| nasa     | /dev/null | 0.520  | 0.439  | -15.6% | 54080 -> 41782 (-23%) | 0.239   |
+| nasa     | tmpfs     | 0.640  | 0.586  | -8.4%  |                    | 0.380      |
+| monorepo | /dev/null | 0.198  | 0.175  | -11.4% | 15716 -> 13248 (-16%) | 0.112   |
+| monorepo | tmpfs     | 0.219  | 0.205  | -6.4%  |                    | 0.143      |
+⇒ nasa/monorepo: cyc/B + wall + faults ALL drop (p<0.01). silesia: cyc/B SIGNIF-faster but
+  TINY (-0.59%) + wall TIE — MECHANISTICALLY EXPECTED: silesia ratio=4 @ 4 MiB chunks ->
+  reserve 16 MiB == the OLD 16 MiB clamp (identical), so silesia never hit the grow storm.
+
+### GATE 3 — RSS (peak maxRSS, T1/T4/T8, min-of-5 final): NO MATERIAL REGRESSION
+| corpus  | T  | baseA kB | ratioB kB | Δ%    |
+|---------|----|----------|-----------|-------|
+| silesia | T1 | 143160   | 147372    | +2.9% (~4 MB noise; reserve identical) |
+| silesia | T8 | 275100   | 268916    | -2.2% (tie/better; the min-of-3 +8.6% was a noise sample) |
+| nasa    | T1 | 216620   | 187576    | **-13.4%** (pre-sizing kills realloc transient) |
+| nasa    | T4 | 315144   | 311276    | -1.2% |
+| nasa    | T8 | 261024   | 254336    | -2.6% |
+⇒ nasa RSS BETTER (no realloc old+new coexistence); silesia tie (reserve unchanged).
+  RSS-neutral-to-better BY CONSTRUCTION: reserve is virtual capacity, resident = touched =
+  actual decoded size (unchanged); the ratio-fix avoids the over-reserve a blind clamp incurs.
+
+### NEW GAP TO IGZIP after the fix (T1 wall; was the mission target)
+| corpus   | /dev/null gz-vs-igzip | tmpfs gz-vs-igzip | (was, pre-fix) |
+|----------|-----------------------|-------------------|----------------|
+| silesia  | +32% (0.895 vs 0.680) | +31% (1.083 vs 0.826) | ~+33%/+29% (unchanged — no storm) |
+| nasa     | +84% (0.439 vs 0.239) | +54% (0.586 vs 0.380) | +117%/+112% (CLOSED a lot) |
+| monorepo | +57% (0.175 vs 0.112) | +44% (0.205 vs 0.143) | ~+70% |
+
+### VERDICT: **KEPT** — gated win (nasa -16.4% cyc/-15.6% wall, monorepo -9.1%/-11.4%,
+both p<0.01 CI-excl-0), byte-exact (both flavors + proptest 60k), NO RSS regression.
+silesia = tie (expected; fits the old clamp). Pushed to perf/igzip-full-rewrite.
+GATED-HYPOTHESIS, Intel-only NOT-YET-LAW — AMD/Zen2 replication owed.
+RE-VERIFY: `BIN_A=/root/bin/gzippy-baseA BIN_B=/root/bin/gzippy-ratioB PIN=4 REPS=21
+  CORPORA="silesia nasa monorepo" SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash
+  /root/distpreload-harness/_distpreload_paired_guest.sh`; wall+faults `bash /tmp/wall_faults.sh`;
+  RSS `bash /tmp/rss.sh`. Box clean: powersave, 0 stressors, no persistent pinning (taskset
+  per-cmd only), /tmp scratch ephemeral.
+
+### RESIDUAL / NEXT
+- The remaining igzip gap is now SCAFFOLD (first-touch faults of the ACTUAL decoded output —
+  igzip streams through a ~666-fault reused window) + the diffuse per-iteration KERNEL gap
+  (refill/classify/loop-overhead, all causally on-path, BOUND ~0.9 cyc/B sil). The grow-storm
+  component is now REMOVED. The next-largest removable T1 component on backref-heavy data =
+  output STREAMING through a reused buffer (igzip-shaped; divergence-from-rg) — USER R3 fork.
+- AMD/Zen2 replication of THIS fix owed before LAW.
+
 ## ====== MATERIALIZATION-RECONCILE SESSION (2026-06-18 night) — RECONCILE + BOUND the scaffold gap ======
 MISSION (this turn): reconcile WHY T1 faults 24k/54k pages if a recycling buffer pool
 exists; build a WORKING warm-output oracle to BOUND recoverable gain; wall in real sink;
