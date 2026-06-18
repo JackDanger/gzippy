@@ -318,9 +318,14 @@ mod imp {
     ///
     /// STAGE c3 (this commit): the BACKREF arm lives inside too (`50:`) —
     /// a lone length code (short or long path) consumes the litlen packet,
-    /// decodes the distance from the libdeflate-shape `DistTable` (ONE load
-    /// + in-register entry decode: `consume_entry` == `shrx` by the entry
-    /// low byte, `decode_distance` == `bzhi(saved, total_bits) >> cw_bits`
+    /// SPECULATIVELY PRELOADS the dist short entry from the post-consume
+    /// bitbuf at the consume point (igzip `decode_next_dist` 457 + load
+    /// 550-552: the dist code immediately follows the litlen, so its L1
+    /// gather is issued early and overlaps the cnt-branch / prefix store /
+    /// length lea — `dpre`), then at `58:` decodes the distance from the
+    /// libdeflate-shape `DistTable` (the preloaded entry + in-register decode:
+    /// `consume_entry` == `shrx` by the entry low byte, `decode_distance` ==
+    /// `bzhi(saved, total_bits) >> cw_bits`
     /// + base), validates (raw==0 / subtable / dist==0 / >32768 / > *pos),
     /// runs the X1 pre-copy `< 48` refill + carried-packet preload (the
     /// P3.5 c1 hoist), and copies with the P3.4 `emit_backref_contig`
@@ -347,10 +352,12 @@ mod imp {
     ///   pure-literal pack (lone+multi unified) ↔ ref 8-byte packed store +
     ///                       `*dst += cnt` (one packet/iter, NO chain)
     ///   bottom `6:`/`63:` ↔ ref `< 48` threshold refill
-    ///   non-literal arm `50:` (cnt-split lone/multi-trailing)
+    ///   non-literal arm `50:` (cnt-split lone/multi-trailing; dist entry
+    ///                       PRELOADED post-consume — igzip decode_next_dist)
     ///                     ↔ ref `trailing > 255` arm (EOB/oversize gates,
-    ///                       cnt>=2 literal-prefix store, dist single-lookup,
-    ///                       validity, X2 restore on bail)
+    ///                       cnt>=2 literal-prefix store, post-consume
+    ///                       `dist.lookup` (== the asm preload), validity,
+    ///                       X2 restore on bail)
     ///   copy `71:`-`74:`  ↔ igzip large/small_byte_copy (16-byte MOVDQU);
     ///                       `70:`-`59:` scalar fallback (length > 240)
     ///                       ↔ marker_inflate.rs `emit_backref_contig`
@@ -511,6 +518,21 @@ mod imp {
                 "mov qword ptr [{ctx} + 72], {dst}",
                 "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the whole litlen packet
                 "sub {bitsleft}, {t2}",
+                // ── SPECULATIVE DIST-ENTRY PRELOAD (igzip decode_next_dist
+                //    457 + speculative load 550-552). The distance code
+                //    immediately FOLLOWS the just-consumed litlen, so its short
+                //    entry is at the low DistTable::TABLE_BITS (=9) bits of the
+                //    post-consume bitbuf (>= 48-21 = >= 27 valid bits — bit
+                //    budget proof in the doc). Issue the entry LOAD here so it
+                //    is in flight across the cnt-branch / literal-prefix store /
+                //    length lea that follow, hiding its L1 load-use latency
+                //    before `58:` consumes it (igzip 552 loads next_sym3, 563
+                //    uses it). PURE table READ — no bit/output state changes —
+                //    so the move is byte-exact; the Rust ref models the
+                //    identical post-consume `dist.lookup(lb.bitbuf)`.
+                "mov {dpre:e}, {bitbuf:e}",
+                "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
+                "mov {dpre:e}, dword ptr [{dtbl} + {dpre}*4]",
                 "cmp {t3:e}, 1",
                 "je 31f",                             // lone: no literal prefix
                 "mov {t4:e}, {t1:e}",
@@ -525,14 +547,14 @@ mod imp {
                 "cmp {t3:e}, 1",
                 "je 8f",                              // lone oversize → tag 0
                 "jmp 83f",                            // multi oversize → tag 3
-                // ── shared backref body: t2 = length; X2 state spilled ──
+                // ── shared backref body: t2 = length; X2 state spilled;
+                //    {dpre} = the dist entry PRELOADED at the `50:` consume
+                //    (igzip decode_next_dist). The base+index gather (the
+                //    L1-latency load) already ran; the in-register entry decode
+                //    (consume_entry == shrx; decode_distance == bzhi>>cw + base)
+                //    follows with the load latency already hidden. ──
                 "58:",
-                // dist decode: ONE main-table load + in-register entry decode
-                // (libdeflate DistTable shape; subtable → Rust, §5-R1).
-                "mov {t3}, qword ptr [{ctx} + 40]",   // dist entries base
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0x1FF",                  // DistTable::TABLE_BITS = 9
-                "mov {t1:e}, dword ptr [{t3} + {t1}*4]",
+                "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
                 "test {t1:e}, {t1:e}",
                 "jz 80f",                             // raw == 0 (hole/code 30/31) → restore
                 "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
@@ -719,6 +741,8 @@ mod imp {
                 ctx = in(reg) ctx as *mut KernCtx,
                 short_tbl = in(reg) ctx.short_tbl,
                 in_ptr = in(reg) ctx.in_ptr,
+                dtbl = in(reg) ctx.dist_tbl,          // dist entries base (preload + decode)
+                dpre = out(reg) _,                    // preloaded dist entry carried 50: → 58:
                 bitbuf = inout(reg) bitbuf,
                 bitsleft = inout(reg) bitsleft,
                 pos = inout(reg) pos,
@@ -889,6 +913,12 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
                 *dst += cnt - 1;
             }
             let length = trailing as usize - 254;
+            // Lockstep with the asm's SPECULATIVE dist-entry preload (issued at
+            // the `50:` consume): the asm gathers `dist_tbl[bitbuf & 0x1FF]`
+            // from the SAME post-consume bitbuf this `dist.lookup` reads, just
+            // earlier in program order to hide the load latency. The gathered
+            // ENTRY is identical, so the differential (state/dst/bytes) is
+            // unaffected — the preload is a timing-only transform.
             let e = dist.lookup(lb.bitbuf);
             let bail = if e.raw() == 0 || e.is_subtable_ptr() {
                 true
