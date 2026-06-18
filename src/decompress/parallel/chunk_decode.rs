@@ -337,7 +337,17 @@ fn exact_block_route_enabled() -> bool {
 ///
 /// Exposed as `pub(crate)` so the unit-test module can exercise the clamp logic
 /// directly without constructing a full ISA-L decode.
-#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+///
+/// Shared by BOTH decode paths: the ISA-L clean-tail oracle
+/// (`finish_decode_chunk_isal_oracle`) AND the pure-Rust native clean/seeded
+/// path (`decode_chunk_unified_marker`, `seed_block_for_contig_native`). Sizing
+/// the native per-chunk output reserve from the member ratio (instead of the old
+/// `compressed × 8` clamped to 16 MiB) eliminates the grow-realloc storm on
+/// expanding corpora (nasa ~10× → the 16 MiB clamp forced 16→32→64 MiB doubling,
+/// each grow faulting the new alloc AND memmove-copying accumulated output) while
+/// NOT over-reserving on near-incompressible data (ratio ≈ 2 → small reserve),
+/// which a blind big-clamp would do.
+#[cfg(parallel_sm)]
 pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ceil: u16) -> usize {
     const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never start below 4 MiB
     const RESERVE_CAP: usize = 64 * 1024 * 1024; // upfront ceiling; growth may exceed on demand
@@ -1405,12 +1415,19 @@ fn decode_chunk_unified_marker(
     // ocl_cf's 14 covered). The earlier "ring-write+drain remain, upper bound only"
     // caveat is STALE for the contig bulk path. See git history (campaign plan, removed).
     {
-        const RESERVE_CLAMP: usize = 16 * 1024 * 1024;
+        // RATIO-INFORMED upfront reserve (shared with the ISA-L oracle path):
+        // size from the member's KNOWN ISIZE/compressed ratio
+        // (`configuration.expansion_ratio_ceil`) instead of the old fixed
+        // `compressed × 8` clamped to 16 MiB. On expanding corpora (nasa ~10×)
+        // the 16 MiB clamp forced a 16→32→64 MiB grow-realloc storm (each grow
+        // faults the new alloc + memmoves accumulated output); ratio-sizing
+        // reserves the realistic decoded size ONCE. An under-reserve still falls
+        // back to safe amortized regrow. See `compute_initial_reserve`.
         let compressed_bytes = stop_hint_bits.saturating_sub(encoded_offset_bits) / 8;
-        let estimate = compressed_bytes
-            .saturating_mul(8)
-            .saturating_add(1024 * 1024);
-        chunk.reserve_clean(estimate.min(RESERVE_CLAMP));
+        chunk.reserve_clean(compute_initial_reserve(
+            compressed_bytes,
+            chunk.configuration.expansion_ratio_ceil,
+        ));
     }
     let mut pending_boundaries: Vec<(usize, usize)> = Vec::new();
     loop {
@@ -1847,15 +1864,14 @@ fn seed_block_for_contig_native(
     chunk.prefill_window_prefix(initial_window);
 
     // Pre-reserve ONE contiguous clean-data region (mirror of
-    // `decode_chunk_unified_marker`'s reserve — same heuristic, same clamp;
+    // `decode_chunk_unified_marker`'s reserve — same ratio-informed sizing;
     // an under-reserve falls back to safe amortized regrow between calls).
     {
-        const RESERVE_CLAMP: usize = 16 * 1024 * 1024;
         let compressed_bytes = stop_hint_bits.saturating_sub(inflate_start_bit) / 8;
-        let estimate = compressed_bytes
-            .saturating_mul(8)
-            .saturating_add(1024 * 1024);
-        chunk.reserve_clean(estimate.min(RESERVE_CLAMP));
+        chunk.reserve_clean(compute_initial_reserve(
+            compressed_bytes,
+            chunk.configuration.expansion_ratio_ceil,
+        ));
     }
 
     let mut marker_ctx = MarkerDecodeCtx::new(input, inflate_start_bit)?;
@@ -3726,7 +3742,7 @@ mod isal_tail_parity {
     /// * Unknown (0) — falls back to historical 8× factor.
     /// * Floor: tiny compressed_span → clamped up to RESERVE_FLOOR (4 MiB).
     /// * Cap: large span × large factor → clamped to RESERVE_CAP (64 MiB).
-    #[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(parallel_sm)]
     #[test]
     fn ratio_informed_reserve_computation() {
         const FLOOR: usize = 4 * 1024 * 1024;
