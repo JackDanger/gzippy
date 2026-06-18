@@ -101,24 +101,29 @@
 //!    the next `continue 'fast` re-enters the asm.
 //!
 //! ## IN_MARGIN proof (no slow refill inside the asm)
-//! One asm iteration issues at most 4 refills (chain arm: ≤ 3 `decode()`
-//! backstops — 2 consumed extras + 1 carried — plus the post-chain `< 48`
-//! threshold; the backref/litpack arms issue ≤ 1). Each fast refill
-//! advances `pos` by ≤ 7 and reads 8 bytes, so the deepest read inside an
-//! iteration touches `pos_top + 4*7 + 8 = pos_top + 36 <= pos_top +
-//! IN_MARGIN - 1 < in_end` for `IN_MARGIN = 40` (guard: `pos_top + 40 <=
-//! in_end - 1`... `pos_top < in_lim = in_end - 40`). Hence `pos + 8 <= len`
-//! at every asm refill — the Rust fast form, bit-for-bit, and the `> 64`
-//! underflow check is dead (E2: bitsleft ≤ 63 always).
+//! After the branchless-classify rewrite the speculative literal chain is
+//! GONE, so one asm iteration issues at most ONE refill (the pure-literal
+//! bottom `< 48`, or the backref pre-copy `< 48`). Each fast refill advances
+//! `pos` by ≤ 7 and reads 8 bytes, so the deepest read inside an iteration
+//! touches `pos_top + 7 + 8 = pos_top + 15 <= pos_top + IN_MARGIN - 1 <
+//! in_end` for `IN_MARGIN = 40` (`pos_top < in_lim = in_end - 40`). Hence
+//! `pos + 8 <= len` at every asm refill — the Rust fast form, bit-for-bit,
+//! and the `> 64` underflow check is dead (E2: bitsleft ≤ 63 always).
+//! IN_MARGIN stays 40 (the pre-rewrite value): the contract only got
+//! looser, so no caller change is needed.
 //!
-//! ## Store-shape equivalence (c2/c3)
-//! Lone literal: 1-byte store (advisor Q3 — never the 8-byte store).
-//! Multi-literal: the 8-byte speculative store of `sym0 & 0x00FF_FFFF`,
-//! advance by `sym_count` — identical to the Rust packed arm. Backref (c3):
-//! the P3.4 `emit_backref_contig` shape transliterated (dist ≥ 8 burst-5 +
-//! stride-8 words; dist == 1 RLE broadcast word fill; 2..=7 stride-dist
-//! words; `length > 40` prefetch) — NOT VAR_VIII's byte-copy-all-overlaps D
-//! loop (refuted by P3.4's −87 ms).
+//! ## Store-shape equivalence (branchless rewrite)
+//! Pure-literal pack (lone OR multi, unified): ONE 8-byte speculative store
+//! of `entry & 0x00FF_FFFF` (up to 3 packed literal bytes), advance by
+//! `sym_count`. This is the libdeflate/igzip fastloop shape and folds the
+//! lone-literal case into the multi path so the per-symbol classify needs
+//! no `sym_count` branch (the old 1-byte lone store / advisor-Q3 special
+//! case is retired — the extra store-buffer width is dominated by the
+//! branch-misprediction it removes). Bytes above `dst` are X3 overshoot,
+//! never read back. Backref (c3): the P3.4 `emit_backref_contig` shape
+//! transliterated (dist ≥ 8 burst-5 + stride-8 words; dist == 1 RLE
+//! broadcast word fill; 2..=7 stride-dist words; `length > 40` prefetch) —
+//! NOT VAR_VIII's byte-copy-all-overlaps D loop (refuted by P3.4's −87 ms).
 //!
 //! ## Dispatch policy (charter §4)
 //! Cargo feature `asm-kernel`, x86_64-only call sites; pure-Rust loop ALWAYS
@@ -289,14 +294,16 @@ mod imp {
 
     /// The rung-(c) kernel region.
     ///
-    /// STAGE c2: the LITERAL hot path lives inside the asm —
-    /// iteration-top guards, raw short-LUT gather, long-code resolution
-    /// (X1: required in-asm so LIT_CHAIN_MAX accounting and hence refill
-    /// placement match the Rust loop exactly), the lone-literal arm with the
-    /// exact P3.2 runtime chain (two gated steps + one always-carry decode,
-    /// each `decode()` preceded by the bit-exact `< 32` backstop refill),
-    /// the packed multi-literal arm, the post-chain / bottom `< 48`
-    /// threshold refills, and the back-edge.
+    /// BRANCHLESS-CLASSIFY (this commit): the LITERAL hot path is a FLAT
+    /// igzip/libdeflate-style dispatch — iteration-top guards, raw short-LUT
+    /// gather, long-code resolution (`20:`), then ONE data-dependent branch
+    /// (`cmp 255` on the uniformly-extracted TRAILING packed symbol, the
+    /// analog of igzip's `cmp 0x100`). Lone AND multi literals are unified
+    /// into one pure-literal path (single 8-byte packed store, advance by
+    /// `sym_count`); the old multi-stage `sym_count` cascade and the
+    /// speculative literal chain that RE-RAN the classify for the 2nd/3rd
+    /// literal are GONE — one packet per top-iteration, one bottom `< 48`
+    /// refill, and the back-edge.
     ///
     /// STAGE c3 (this commit): the BACKREF arm lives inside too (`50:`) —
     /// a lone length code (short or long path) consumes the litlen packet,
@@ -374,187 +381,44 @@ mod imp {
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
-                // ── classify the carried/preloaded entry {t1} ───────────
-                "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT
-                "jnz 20f",                            // long code (cold)
+                // ── FLAT CLASSIFY (igzip/libdeflate fastloop shape): the
+                //    preloaded short entry {t1} is dispatched with ONE
+                //    data-dependent branch — literal-vs-non-literal on the
+                //    TRAILING packed symbol (`cmp 255`, the analog of
+                //    igzip's `cmp 0x100`). The LARGE_FLAG (long) and bc==0
+                //    (invalid) branches are perfectly-predicted on real
+                //    streams (rare, monotone). The old multi-stage cascade
+                //    (sym_count branch) AND the speculative literal chain
+                //    that RE-RAN the whole classify for the 2nd/3rd literal
+                //    are GONE: lone + multi literals are unified into one
+                //    flat path, one packet per top-iteration.
+                "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT → long (cold)
+                "jnz 20f",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 28",                     // bc = bit_count
-                "jz 8f",                              // invalid → Rust (pre-consume)
+                "jz 8f",                              // invalid (bc==0) → Rust (pre-consume)
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
-                "and {t3:e}, 3",                      // cnt = sym_count
-                "cmp {t3:e}, 1",
-                "jne 22f",                            // multi-literal pack
-                "movzx {t4:e}, {t1:x}",               // code = sym0 & 0xFFFF
-                "cmp {t4:e}, 255",
-                "ja 50f",                             // lone non-literal → backref arm (t4=code, t2=bc)
-                // ── lone literal: consume + 1-byte store (Q3) ───────────
+                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
+                "lea {t4:e}, [{t3:e} - 1]",
+                "shl {t4:e}, 3",                      // shift = 8*(cnt-1)  (0/8/16)
+                "mov {t5:e}, {t1:e}",
+                "and {t5:e}, 0x1FFFFFF",              // strip flag/cnt/bc → packed syms only
+                "shrx {t5}, {t5}, {t4}",              // trailing symbol → low bits (high bits 0)
+                "cmp {t5:e}, 255",
+                "ja 50f",                             // trailing non-literal → backref/EOB arm
+                // ── pure-literal pack (cnt literals, all ≤255): consume the
+                //    whole packet, ONE speculative 8-byte store of the up-to-3
+                //    packed bytes (libdeflate fastloop; the bytes above dst
+                //    are X3 overshoot, never read back), advance by cnt. Lone
+                //    AND multi unified — no sym_count branch, no chain.
                 "shrx {bitbuf}, {bitbuf}, {t2}",
                 "sub {bitsleft}, {t2}",
-                "mov byte ptr [{dst}], {t4:l}",
-                "inc {dst}",
-                // ── chain step A (P3.2; backstop refill ↔ decode()) ─────
-                "30:",
-                "cmp {bitsleft}, 32",
-                "jae 31f",
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
-                "mov {t4:e}, 63",
-                "sub {t4}, {bitsleft}",
-                "shr {t4}, 3",
-                "add {pos}, {t4}",
-                "or {bitsleft}, 56",
-                "31:",
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                "test {t1:e}, 0x2000000",
-                "jnz 33f",                            // long candidate (cold)
-                "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 28",
-                "jz 7f",                              // gate fail → carry
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 26",
-                "and {t3:e}, 3",
-                "cmp {t3:e}, 1",
-                "jne 7f",
-                "movzx {t4:e}, {t1:x}",
-                "cmp {t4:e}, 255",
-                "ja 7f",
-                "cmp {t2}, {bitsleft}",
-                "ja 7f",                              // not fully backed → carry
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
-                "mov byte ptr [{dst}], {t4:l}",
-                "inc {dst}",
-                "jmp 40f",
-                "33:",                                // chain A: long resolve
-                "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 26",                     // long_max_len (≤21)
-                "bzhi {t3}, {bitbuf}, {t2}",
-                "shr {t3}, 12",
-                "and {t1:e}, 0x1FFFFFF",
-                "add {t1:e}, {t3:e}",
-                "mov {t2}, qword ptr [{ctx} + 32]",   // long_tbl
-                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
-                "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 10",                     // bc
-                "jz 34f",
-                "and {t1:e}, 0x3FF",
-                "cmp {t1:e}, 255",
-                "ja 34f",
-                "cmp {t2}, {bitsleft}",
-                "ja 34f",
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
-                "mov byte ptr [{dst}], {t1:l}",
-                "inc {dst}",
-                "jmp 40f",
-                "34:",                                // long gate-fail: reload raw
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                "jmp 7f",
-                // ── chain step B (identical, success → always-carry) ────
-                "40:",
-                "cmp {bitsleft}, 32",
-                "jae 41f",
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
-                "mov {t4:e}, 63",
-                "sub {t4}, {bitsleft}",
-                "shr {t4}, 3",
-                "add {pos}, {t4}",
-                "or {bitsleft}, 56",
-                "41:",
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                "test {t1:e}, 0x2000000",
-                "jnz 43f",
-                "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 28",
-                "jz 7f",
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 26",
-                "and {t3:e}, 3",
-                "cmp {t3:e}, 1",
-                "jne 7f",
-                "movzx {t4:e}, {t1:x}",
-                "cmp {t4:e}, 255",
-                "ja 7f",
-                "cmp {t2}, {bitsleft}",
-                "ja 7f",
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
-                "mov byte ptr [{dst}], {t4:l}",
-                "inc {dst}",
-                "jmp 60f",
-                "43:",                                // chain B: long resolve
-                "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 26",
-                "bzhi {t3}, {bitbuf}, {t2}",
-                "shr {t3}, 12",
-                "and {t1:e}, 0x1FFFFFF",
-                "add {t1:e}, {t3:e}",
-                "mov {t2}, qword ptr [{ctx} + 32]",
-                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
-                "mov {t2:e}, {t1:e}",
-                "shr {t2:e}, 10",
-                "jz 44f",
-                "and {t1:e}, 0x3FF",
-                "cmp {t1:e}, 255",
-                "ja 44f",
-                "cmp {t2}, {bitsleft}",
-                "ja 44f",
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
-                "mov byte ptr [{dst}], {t1:l}",
-                "inc {dst}",
-                "jmp 60f",
-                "44:",
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                "jmp 7f",
-                // ── chain step C: third decode, ALWAYS carried (the Rust
-                //    loop's `chained < LIT_CHAIN_MAX` fails at 2) — its
-                //    backstop refill still fires (X1).
-                "60:",
-                "cmp {bitsleft}, 32",
-                "jae 62f",
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
-                "mov {t4:e}, 63",
-                "sub {t4}, {bitsleft}",
-                "shr {t4}, 3",
-                "add {pos}, {t4}",
-                "or {bitsleft}, 56",
-                "62:",
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                // fall through: post-chain threshold refill
-                // ── post-chain `< 48` refill + back edge (carried {t1}
-                //    stays valid: refills are append-only, low 12 bits and
-                //    the ≤21 bits a long resolve reads are unchanged).
-                "7:",
-                "cmp {bitsleft}, 48",
-                "jae 71f",
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
-                "mov {t4:e}, 63",
-                "sub {t4}, {bitsleft}",
-                "shr {t4}, 3",
-                "add {pos}, {t4}",
-                "or {bitsleft}, 56",
-                "71:",
-                "jmp 2b",
-                // ── bottom (litpack path): `< 48` refill + preload ──────
+                "mov {t4:e}, {t1:e}",
+                "and {t4:e}, 0xFFFFFF",               // up to 3 packed literal bytes
+                "mov qword ptr [{dst}], {t4}",        // speculative 8-byte store
+                "add {dst}, {t3}",                    // advance by cnt
+                // ── bottom: `< 48` refill + preload + back-edge ──────────
                 "6:",
                 "cmp {bitsleft}, 48",
                 "jae 63f",
@@ -571,51 +435,15 @@ mod imp {
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
                 "jmp 2b",
-                // ── multi-literal pack ({t1}=e, {t2}=bc, {t3}=cnt) ──────
-                "22:",
-                "lea {t4:e}, [{t3:e} - 1]",
-                "shl {t4:e}, 3",                      // 8*(cnt-1)
-                "mov {ret:e}, {t1:e}",                // ret as 5th scratch here
-                "and {ret:e}, 0x1FFFFFF",             // packed syms
-                "shrx {t4:e}, {ret:e}, {t4:e}",
-                "and {t4:e}, 0xFFFF",                 // trailing element
-                "cmp {t4:e}, 255",
-                "ja 25f",                             // multi-with-trailing → in-asm backref (c3)
-                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume whole packet
-                "sub {bitsleft}, {t2}",
-                "and {ret:e}, 0xFFFFFF",              // sym0 & 0x00FF_FFFF
-                "mov qword ptr [{dst}], {ret}",       // speculative 8-byte store
-                "add {dst}, {t3}",                    // advance by sym_count
-                "jmp 6b",
-                // ── multi-with-trailing-length (c3: the DOMINANT backref
-                //    carrier — 99.6% of c3a RECLASSes): packed store +
-                //    literal-prefix advance, then the shared backref body.
-                //    t1=raw entry t2=bc t3=cnt t4=trailing code {ret}=packed
-                "25:",
-                "cmp {t4:e}, 256",
-                "je 82f",                             // trailing EOB → Rust (pre-consume, tag 2)
-                "cmp {t4:e}, 512",                    // MAX_LIT_LEN_SYM
-                "ja 83f",                             // trailing oversize → Rust (pre-consume, tag 3)
-                "mov qword ptr [{ctx} + 48], {bitbuf}",   // X2 spill (incl. dst)
-                "mov qword ptr [{ctx} + 56], {bitsleft}",
-                "mov qword ptr [{ctx} + 72], {dst}",
-                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume whole packet
-                "sub {bitsleft}, {t2}",
-                "and {ret:e}, 0xFFFFFF",              // sym0 & 0x00FF_FFFF
-                "mov qword ptr [{dst}], {ret}",       // speculative 8-byte store
-                "lea {t3:e}, [{t3:e} - 1]",           // lit_prefix = cnt - 1
-                "add {dst}, {t3}",
-                "lea {t2:e}, [{t4:e} - 254]",         // length = code - 254
-                "jmp 58f",                            // → shared dist+copy body
-                // ── long code at top (decode_prefilled long path) ───────
+                // ── long code at top (decode_prefilled long path; rare) ──
                 "20:",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 26",                     // long_max_len (≤21)
-                "bzhi {t3}, {bitbuf}, {t2}",          // == bitbuf & ((1<<lml)-1)
+                "bzhi {t3}, {bitbuf}, {t2}",
                 "shr {t3}, 12",                       // >> ISAL_DECODE_LONG_BITS
                 "and {t1:e}, 0x1FFFFFF",
                 "add {t1:e}, {t3:e}",                 // long_idx
-                "mov {t2}, qword ptr [{ctx} + 32]",
+                "mov {t2}, qword ptr [{ctx} + 32]",   // long_tbl
                 "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 10",                     // bc
@@ -627,25 +455,41 @@ mod imp {
                 "sub {bitsleft}, {t2}",
                 "mov byte ptr [{dst}], {t1:l}",
                 "inc {dst}",
-                "jmp 30b",                            // → chain
-                "21:",
-                "mov {t4:e}, {t1:e}",                 // code → t4 (arm reg contract)
-                "jmp 50f",
-                // ── backref arm (c3): t4:e = code (>255), t2 = bc ───────
-                //    X2: spill the pre-consume cursor; every rare bail
-                //    (`80:`) restores it and RECLASSes with pos/dst
-                //    untouched (first refill comes after all rare checks).
+                "jmp 6b",                             // → bottom refill + preload + loop
+                "21:",                                // long lone non-literal
+                "mov {t5:e}, {t1:e}",                 // trailing = code
+                "mov {t3:e}, 1",                      // cnt = 1 (long codes are never packed)
+                // fall through to the unified non-literal arm
+                // ── unified non-literal arm (replaces lone `50:` + multi
+                //    `25:`): t3=cnt, t2=bc, t5=trailing(>255), t1=raw short
+                //    entry. Lone backref (cnt==1) and multi-with-trailing-
+                //    length (cnt>=2, literal prefix + trailing length) share
+                //    the dist+copy body at `58:`. X2 spill/restore makes
+                //    every dist-side bail pre-consume.
                 "50:",
-                "cmp {t4:e}, 256",
-                "je 82f",                             // lone EOB → Rust (pre-consume, tag 2)
-                "cmp {t4:e}, 512",                    // MAX_LIT_LEN_SYM
-                "ja 8f",                              // oversize → Rust (pre-consume)
-                "mov qword ptr [{ctx} + 48], {bitbuf}",   // X2 spill (incl. dst:
-                "mov qword ptr [{ctx} + 56], {bitsleft}", //  shared restore 80:)
+                "cmp {t5:e}, 256",
+                "je 82f",                             // EOB (lone or trailing) → Rust, tag 2
+                "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
+                "ja 30f",                             // oversize → pre-consume RECLASS
+                "mov qword ptr [{ctx} + 48], {bitbuf}",   // X2 spill (incl. dst → 80:)
+                "mov qword ptr [{ctx} + 56], {bitsleft}",
                 "mov qword ptr [{ctx} + 72], {dst}",
-                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the litlen packet
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the whole litlen packet
                 "sub {bitsleft}, {t2}",
-                "lea {t2:e}, [{t4:e} - 254]",         // length = code - 254 (3..=258)
+                "cmp {t3:e}, 1",
+                "je 31f",                             // lone: no literal prefix
+                "mov {t4:e}, {t1:e}",
+                "and {t4:e}, 0xFFFFFF",               // packed literal prefix
+                "mov qword ptr [{dst}], {t4}",        // speculative prefix store
+                "lea {t4:e}, [{t3:e} - 1]",
+                "add {dst}, {t4}",                    // advance by lit-prefix (cnt-1)
+                "31:",
+                "lea {t2:e}, [{t5:e} - 254]",         // length = code - 254 (3..=258)
+                "jmp 58f",                            // → shared dist+copy body
+                "30:",                                // oversize trailing (>512): pre-consume RECLASS
+                "cmp {t3:e}, 1",
+                "je 8f",                              // lone oversize → tag 0
+                "jmp 83f",                            // multi oversize → tag 3
                 // ── shared backref body: t2 = length; X2 state spilled ──
                 "58:",
                 // dist decode: ONE main-table load + in-register entry decode
@@ -932,129 +776,79 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if pre.bit_count == 0 {
             return EXIT_RECLASS;
         }
-        if pre.sym_count == 1 {
-            let code = pre.symbol & 0xFFFF;
-            if code > 255 {
-                // c3 backref arm (asm `50:`): EOB/oversize pre-consume; all
-                // dist-side bails restore the spilled cursor (X2).
-                if code == 256 || code > super::lut_huffman::MAX_LIT_LEN_SYM {
-                    return EXIT_RECLASS;
-                }
-                let (sb, sl) = (lb.bitbuf, lb.bitsleft);
-                lb.consume(pre.bit_count);
-                let length = code as usize - 254;
-                let e = dist.lookup(lb.bitbuf);
-                if e.raw() == 0 || e.is_subtable_ptr() {
-                    lb.bitbuf = sb;
-                    lb.bitsleft = sl;
-                    return EXIT_RECLASS;
-                }
+        // FLAT CLASSIFY (mirrors the rewritten asm top): extract the TRAILING
+        // packed symbol uniformly (`(syms >> 8*(cnt-1)) & 0xFFFF`, after
+        // stripping the flag/cnt/bc bits with `& 0x01FF_FFFF`) and dispatch
+        // on literal-vs-non-literal with ONE branch. Lone + multi literals
+        // are unified; there is NO speculative literal chain (one packet per
+        // iteration), exactly as the asm now does.
+        let cnt = pre.sym_count as usize;
+        let trailing = ((pre.symbol & 0x01FF_FFFF) >> (8 * (cnt - 1))) & 0xFFFF;
+        if trailing > 255 {
+            // Unified non-literal arm (asm `50:`): EOB/oversize pre-consume;
+            // a multi pack stores its literal PREFIX then shares the dist+
+            // copy body; every dist-side bail restores the spilled cursor
+            // AND dst (X2). `multi_trail*` count only the cnt>=2 path (the
+            // asm `25:`-equivalent crossings the coverage gate asserts).
+            if trailing == 256 || trailing > super::lut_huffman::MAX_LIT_LEN_SYM {
+                return EXIT_RECLASS;
+            }
+            if cnt >= 2 {
+                stats.multi_trail += 1;
+            }
+            let (sb, sl, sd) = (lb.bitbuf, lb.bitsleft, *dst);
+            lb.consume(pre.bit_count);
+            if cnt >= 2 {
+                let packed = (pre.symbol & 0x00FF_FFFF) as u64;
+                out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
+                *dst += cnt - 1;
+            }
+            let length = trailing as usize - 254;
+            let e = dist.lookup(lb.bitbuf);
+            let bail = if e.raw() == 0 || e.is_subtable_ptr() {
+                true
+            } else {
                 let saved = lb.bitbuf;
                 lb.consume_entry(e.raw());
                 let distance = e.decode_distance(saved) as usize;
                 if distance == 0 || distance > 32768 || distance > *dst {
-                    lb.bitbuf = sb;
-                    lb.bitsleft = sl;
-                    return EXIT_RECLASS;
-                }
-                // X1 pre-copy refill, then the production copy shape.
-                if (lb.bitsleft as u8) < 48 {
-                    lb.refill();
-                }
-                unsafe {
-                    super::marker_inflate::emit_backref_contig(
-                        out.as_mut_ptr(),
-                        dst,
-                        distance,
-                        length,
-                    );
-                }
-                continue;
-            }
-            // CONSUME_BIAS != 0 only in the positive-control test (off-by-one
-            // model of a wrong asm consume count); 0 == production reference.
-            lb.consume(pre.bit_count + CONSUME_BIAS);
-            out[*dst] = code as u8;
-            *dst += 1;
-            // P3.2 chain: two gated steps + one always-carry decode.
-            let mut chained = 0usize;
-            loop {
-                let nxt = lut.decode(lb);
-                let ncode = nxt.symbol & 0xFFFF;
-                if chained < 2
-                    && nxt.sym_count == 1
-                    && nxt.bit_count != 0
-                    && ncode <= 255
-                    && nxt.bit_count <= lb.available()
-                {
-                    lb.consume(nxt.bit_count);
-                    out[*dst] = ncode as u8;
-                    *dst += 1;
-                    chained += 1;
-                    continue;
-                }
-                break;
-            }
-            if (lb.bitsleft as u8) < 48 {
-                lb.refill();
-            }
-        } else {
-            let last = (pre.symbol >> (8 * (pre.sym_count - 1))) & 0xFFFF;
-            if last > 255 {
-                // c3 multi-with-trailing-length (asm `25:`): EOB/oversize
-                // pre-consume; otherwise packed store + lit-prefix advance,
-                // then the shared backref body; dist bails restore the
-                // cursor AND dst.
-                if last == 256 || last > super::lut_huffman::MAX_LIT_LEN_SYM {
-                    return EXIT_RECLASS;
-                }
-                stats.multi_trail += 1; // asm `25:` X2-spill point
-                let (sb, sl, sd) = (lb.bitbuf, lb.bitsleft, *dst);
-                lb.consume(pre.bit_count);
-                let packed = (pre.symbol & 0x00FF_FFFF) as u64;
-                out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
-                *dst += pre.sym_count as usize - 1;
-                let length = last as usize - 254;
-                let e = dist.lookup(lb.bitbuf);
-                let bail = if e.raw() == 0 || e.is_subtable_ptr() {
                     true
                 } else {
-                    let saved = lb.bitbuf;
-                    lb.consume_entry(e.raw());
-                    let distance = e.decode_distance(saved) as usize;
-                    if distance == 0 || distance > 32768 || distance > *dst {
-                        true
-                    } else {
-                        if (lb.bitsleft as u8) < 48 {
-                            lb.refill();
-                        }
-                        unsafe {
-                            super::marker_inflate::emit_backref_contig(
-                                out.as_mut_ptr(),
-                                dst,
-                                distance,
-                                length,
-                            );
-                        }
-                        false
+                    if (lb.bitsleft as u8) < 48 {
+                        lb.refill();
                     }
-                };
-                if bail {
-                    lb.bitbuf = sb;
-                    lb.bitsleft = sl;
-                    *dst = sd;
-                    return EXIT_RECLASS;
+                    unsafe {
+                        super::marker_inflate::emit_backref_contig(
+                            out.as_mut_ptr(),
+                            dst,
+                            distance,
+                            length,
+                        );
+                    }
+                    if cnt >= 2 {
+                        stats.multi_trail_completed += 1;
+                    }
+                    false
                 }
-                stats.multi_trail_completed += 1; // asm `25:`→`58:` success
-                continue;
+            };
+            if bail {
+                lb.bitbuf = sb;
+                lb.bitsleft = sl;
+                *dst = sd;
+                return EXIT_RECLASS;
             }
-            lb.consume(pre.bit_count);
-            let packed = (pre.symbol & 0x00FF_FFFF) as u64;
-            out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
-            *dst += pre.sym_count as usize;
-            if (lb.bitsleft as u8) < 48 {
-                lb.refill();
-            }
+            continue;
+        }
+        // Pure-literal pack (asm pure-literal path): consume the whole packet,
+        // one speculative 8-byte store of the up-to-3 packed bytes, advance by
+        // cnt. CONSUME_BIAS != 0 only in the positive-control test (off-by-one
+        // model of a wrong asm consume count); 0 == production reference.
+        lb.consume(pre.bit_count + CONSUME_BIAS);
+        let packed = (pre.symbol & 0x00FF_FFFF) as u64;
+        out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
+        *dst += cnt;
+        if (lb.bitsleft as u8) < 48 {
+            lb.refill();
         }
     }
 }
