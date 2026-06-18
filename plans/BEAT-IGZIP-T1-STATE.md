@@ -1,5 +1,76 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== B-SIZING SESSION (2026-06-18) — 3 GATING MEASUREMENTS BEFORE FUNDING B ======
+Goal: size rewrite B (igzip-style fat DIRECT one-symbol-per-iter table, ~0 unpack)
+with MEASURED numbers (not the 1.34 slope/ceiling) for a USER R3 decision. Guest
+trainer cpu4, unstressed, /dev/null sink. Binaries: packON=/root/bin/gzippy-new-native
+(=mission tip 76c750f8; rebuild gzippy-packON sha-IDENTICAL → provenance proven),
+packOFF=/root/bin/gzippy-packOFF (SINGLE_SYM_FLAG @ lut_huffman.rs:1041; byte-exact
+silesia/nasa/monorepo; source REVERTED to TRIPLE).
+
+### MEASUREMENT 1 — REAL-regime memory-stall fraction (is the 1.34 headroom real or memory-capped?)
+new-native, unstressed, cpu4, perf -r 9. ANSWER: **COMPUTE-BOUND = YES.**
+| corpus  | cycles    | L1d-miss-stall | L2-miss-stall | L3-miss(DRAM)-stall | TMA mem-bound | TMA core-bound |
+|---------|-----------|----------------|---------------|---------------------|---------------|----------------|
+| silesia | 1.244e9   | 2.39%          | 1.17%         | **0.69%**           | 7.0%          | 15.2%          |
+| nasa    | 0.686e9   | 6.06%          | 3.98%         | **2.73%**           | 16.7%         | 16.0%          |
+⇒ Tiny DRAM-stall fraction (silesia 0.69%, nasa 2.73% of cycles). TMA agrees: silesia
+mem-bound only 7.0% (core-bound 15.2%); nasa mem-bound 16.7% (core-bound 16.0%). The
+unstressed (production) regime is COMPUTE-bound — esp. silesia where B's payoff is
+largest. ⇒ B's instruction-reduction headroom (the ~1.34 cyc/B oracle) is REAL in
+production, NOT memory-capped. The earlier stressor-WASH was an artifact of the
+artificial 14-thread bandwidth-saturation, not the real regime.
+RE-VERIFY: `taskset -c 4 perf stat -r 9 -e cpu_core/cycles/,cpu_core/instructions/,cpu_core/memory_activity.stalls_l1d_miss/,cpu_core/memory_activity.stalls_l2_miss/,cpu_core/memory_activity.stalls_l3_miss/ -- env GZIPPY_FORCE_PARALLEL_SM=1 taskset -c 4 /root/bin/gzippy-new-native -d -c -p1 /root/silesia.gz >/dev/null`
+
+### MEASUREMENT 2 — what does multi-symbol packing (which B ABANDONS) currently buy?
+TOGGLE FOUND: lut_huffman.rs:1041 TRIPLE_SYM_FLAG→SINGLE_SYM_FLAG forces 1-sym/iter
+through the EXISTING table (still pays unpack). packON(A=new-native) vs packOFF(B),
+N=21 paired, unstressed, all SIGNIF (p=6.4e-5, CI excl 0), self-tests PASS, non-inert
+(packOFF Δinstr/B>0 = more loop iters). medΔ=(packOFF−packON) = **packing_benefit =
+what B costs us:**
+| corpus  | packON cyc/B | packOFF cyc/B | packing_benefit medΔ | Δinstr/B | 95%CI            |
+|---------|--------------|---------------|----------------------|----------|------------------|
+| silesia | 5.868        | 6.087         | **+0.216 (+3.68%)**  | +0.599   | [+0.200,+0.225]  |
+| monorepo| 5.052        | 5.209         | **+0.155 (+3.06%)**  | +0.291   | [+0.138,+0.165]  |
+| nasa    | 3.336        | 3.423         | **+0.087 (+2.62%)**  | +0.224   | [+0.079,+0.094]  |
+⇒ Packing buys only 0.087–0.216 cyc/B (SMALL). B abandons this. Residual gap to igzip
+is +1.50/+2.07/+1.75 — so the packing loss is ~1/7th the gap on silesia.
+RE-VERIFY: `BIN_A=/root/bin/gzippy-new-native BIN_B=/root/bin/gzippy-packOFF PIN=4 REPS=21 CORPORA="silesia monorepo nasa" SKIP_STRESS=1 bash /root/distpreload-harness/_distpreload_paired_guest.sh`
+
+### MEASUREMENT 3 — B-SPIKE: measured bound on B's achievable cyc/B
+SPIKE = throwaway partial-B (gz-flagbit-new patched: lut SINGLE_SYM + asm cnt-extract
+hardcoded `mov t3,1` since cnt≡1 in SINGLE mode → removes the mov/shr/and unpack
+cnt-extract chain that B eliminates). BYTE-EXACT silesia/nasa/monorepo; distinct
+binary (sha 9be95b74≠packON 891c9925) — non-inert. N=21 paired vs packON(=current
+flag-bit kernel), unstressed. medΔ=(spike−packON), all SIGNIF, self-tests PASS:
+| corpus  | packON cyc/B | spike cyc/B | spike−packON medΔ | 95%CI            | vs igzip (banked) |
+|---------|--------------|-------------|-------------------|------------------|-------------------|
+| silesia | 5.869        | 5.954       | **+0.091 SLOWER** | [+0.078,+0.096]  | +1.59 (+36%) still|
+| monorepo| 5.089        | 5.166       | **+0.078 SLOWER** | [+0.060,+0.095]  | +2.21 (+75%) still|
+| nasa    | 3.330        | 3.340       | **+0.015 SLOWER** | [+0.005,+0.021]  | +1.76 (+112%) still|
+⇒ The partial-B spike is SIGNIF SLOWER than the current packed kernel on ALL 3 corpora.
+
+DECOMPOSITION (derived; packON A1 medians stable 5.868↔5.869 across the two paired runs):
+  spike−packOFF = unpack(cnt-extract) RECOVERY = {sil −0.125, mono −0.077, nasa −0.072}.
+  So removing the cnt-extract recovered 0.072–0.125 cyc/B — but going single-mode COST
+  0.087–0.216 (M2). NET partial-B = packing_loss − unpack_recovery = +0.015..+0.091 WORSE.
+
+⇒ **MEASURED net-B ≈ NEGATIVE-to-BREAKEVEN, NOT the 1.34 ceiling.** Full B (fat direct
+  table) removes ~2 MORE unpack ops than the spike (byte-mask + bc-extract), so could
+  recover a bit more — but to even BREAK EVEN with the current packed kernel on silesia
+  it must recover another +0.091 from ~2 ops, comparable to what the 3-op cnt-extract
+  just bought. Best realistic case: full B ≈ break-even-to-small-win vs CURRENT — it
+  does NOT approach igzip (spike vs igzip is UNCHANGED at +36/75/112%).
+
+WHY the 1.34 ceiling is a MIRAGE for B-as-scoped: igzip is ALSO one-symbol-per-iter yet
+hits 3.98 cyc/B; gzippy single-mode (packOFF) is 6.09. The 2.1 cyc/B gap between two
+one-symbol-per-iter loops is NOT the table format — it is igzip's whole leaner
+per-iteration machinery (bit-reader cadence, refill, copy, codegen). B (table-format
+swap) does not touch that, so it cannot reach 3.98. The 1.34 removal-oracle bounded a
+DIFFERENT thing (igzip's entire kernel), not the unpack-removal lever.
+
+---
+
 Mission: make gzippy-native (pure-Rust, FFI-off) **T1 single-member gzip DECODE**
 measurably FASTER than igzip (ISA-L), byte-exact, gated. Single-arch Intel = NOT LAW
 (AMD/Zen2 replication owed). T1 single-core only — no T4/T8 extrapolation.
@@ -197,7 +268,43 @@ the hot run_contig classify+decode loop, addressable."
   it = changing the short-entry TABLE FORMAT (build side in lut_huffman) in lockstep, a
   STRUCTURAL change, not a peephole; high byte-exact risk, must be one gated commit.
 
-## RESUME POINT (2026-06-18, end of technique #2 = NEXT #1 flag-bit)
+## RESUME POINT (2026-06-18 PM, end of B-SIZING session) — READ FIRST
+DONE this session: the 3 B-sizing GATING measurements (M1/M2/M3 above) that price
+rewrite B for the USER R3 decision. Source on guest restored to mission tip; spike
+removed; disk restored (1.1G); no stressors/pinning leftover; governor untouched
+(powersave); NO main push. Kept binaries: /root/bin/gzippy-new-native (=mission tip
+packON, sha 891c9925), /root/bin/gzippy-base-native (af53f95e), /root/bin/gzippy-packOFF
+(M2 SINGLE-mode toggle, sha ff477774). NOT committed: nothing new to source — only this
+STATE file edited.
+
+### RECOMMENDATION FOR USER R3 (fund the multi-hour rewrite B?): **NO — do NOT fund B as scoped.**
+GATED-HYPOTHESIS (Intel-only, NOT-YET-LAW; AMD/Zen2 owed). The prior STATE rec ("B
+remains justified by the residual / 1.34 ceiling") is OVERTURNED by M3:
+  - M1: the real (unstressed) regime is COMPUTE-bound (silesia DRAM-stall 0.69%, TMA
+    mem-bound 7%), so headroom is real — but that only says SOME compute lever exists.
+  - M2: multi-symbol packing currently BUYS 0.087–0.216 cyc/B; B abandons it.
+  - M3: a byte-exact partial-B spike (one-sym-per-iter + unpack cnt-extract removed) is
+    SIGNIF SLOWER than the current packed kernel on ALL 3 corpora (+0.015..+0.091 cyc/B).
+    The unpack removal recovered only 0.072–0.125 — LESS than the packing it costs.
+  - ⇒ MEASURED net-B is negative-to-breakeven vs current, NOT the 1.34 ceiling. The
+    table-format swap cannot close the igzip gap: igzip is ALSO one-sym-per-iter at 3.98
+    while gzippy single-mode is 6.09 — the 2.1 cyc/B is igzip's whole leaner per-iteration
+    loop, which B does not touch.
+  - The igzip residual (+1.50/+2.07/+1.75 cyc/B) is therefore in the PER-ITERATION
+    MACHINERY (bit-reader/refill cadence, copy, codegen), not the short-entry table format.
+
+### NEXT (if the campaign continues toward the igzip gap):
+  - DO NOT start B (fat-direct-table). It is measured net-negative-to-breakeven.
+  - The real lever is converging gzippy's per-iteration loop on igzip's (single
+    speculative store + one discriminator + igzip's refill cadence) — i.e. the gap
+    between two one-symbol-per-iter loops (6.09 vs 3.98). Size THAT before committing:
+    a removal/perturbation on the refill+copy+back-edge overhead, not the table format.
+  - AMD/Zen2 replication of M1/M2/M3 is owed before any of this is LAW.
+  - RE-VERIFY M3: rebuild spike (patch lut:1041 SINGLE + asm 426-428 `mov t3,1`; see
+    /tmp gone — re-derive from this STATE), or simpler re-confirm via packOFF: packOFF
+    is already SIGNIF slower than packON (M2), and the spike only recovered a fraction.
+
+## (prior) RESUME POINT (2026-06-18, end of technique #2 = NEXT #1 flag-bit)
 DONE this session: NEXT #1 (flag-bit discriminator) IMPLEMENTED + GATED + KEPT.
   - byte-exact PROVEN on x86_64 guest (sha grid native, c1/c2/c3 asm-vs-ref, proptest
     60k, builder flag-invariant test). KEPT.
