@@ -351,6 +351,17 @@ fn exact_block_route_enabled() -> bool {
 pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ceil: u16) -> usize {
     const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never start below 4 MiB
     const RESERVE_CAP: usize = 64 * 1024 * 1024; // upfront ceiling; growth may exceed on demand
+    // RESIDENT-OUTPUT-POOL ORACLE (GZIPPY_RESIDENT_OUTPUT_POOL=1, byte-transparent,
+    // MEASUREMENT-ONLY). Determination tool for BEAT-IGZIP-T1: pin EVERY chunk's
+    // upfront reserve to a single fixed size so all pooled output buffers share an
+    // IDENTICAL capacity. Combined with the manual LIFO pool (which retains Vec
+    // capacity via `clear()` instead of dropping), the recycled buffer is never
+    // realloc'd by-a-hair on reuse → its pages stay RESIDENT, so the next chunk
+    // decodes into already-faulted memory (igzip's reused-window fault profile).
+    // This tests whether T1 first-touch output faults are recoverable by residency.
+    if crate::decompress::parallel::chunk_buffer_pool::resident_output_pool_enabled() {
+        return RESERVE_CAP;
+    }
     let factor = if expansion_ratio_ceil == 0 {
         8 // unknown → historical default
     } else {

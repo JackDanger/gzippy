@@ -1,5 +1,106 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== UNIFIED-T1-DETERMINATION SESSION (2026-06-18 night3) — resident-output-pool: DETERMINATION = NOT FEASIBLE as a unified path; igzip-T1 needs a dedicated streaming path. (gated, byte-exact, Intel-only NOT-YET-LAW) ======
+USER QUESTION: "Is there a way to achieve igzip-like T1 speeds using code that MAINTAINS
+rapidgzip T>1 parity? If yes → do it; if not → dedicated pure-Rust T1 path."
+MECHANISM TESTED (the prompt's hypothesis): a BOUNDED POOL OF RESIDENT, REUSED output
+buffers recycled on in-order drain (keep pages resident, no munmap/DONTNEED) so the next
+chunk decodes into warm already-faulted memory → igzip-like ~hundreds of T1 faults.
+Re-tested CORRECTLY now: (a) AFTER the grow-storm fix (ratioB tip), (b) with the pool
+buffers GUARANTEED page-resident (fixed reserve → no realloc on reuse). Guest Intel cpu4
+unstressed, /dev/null, perf freq-invariant. Bins: A=/root/bin/gzippy-ratioB (tip 1afc7a02,
+sha ed948aa6), B=/root/bin/gzippy-resident (oracle, sha 375d1b19, distinct=non-inert).
+SINGLE-ARCH Intel = NOT-YET-LAW (AMD owed). T1 single-core.
+
+### TASK 1 — OUTPUT LIFECYCLE MAP + the in-order-drain recycle point (READ, file:line)
+- T1 output = PER-CHUNK contiguous `ChunkData.data : SegmentedU8.buf : Vec<u8>` (4 MiB-
+  COMPRESSED chunks → silesia 17 chunks ~12 MiB-decoded each, nasa 5 chunks ~40 MiB each).
+- buf is LAZILY sourced from the per-worker LIFO `chunk_buffer_pool::take_u8` via
+  `SegmentedU8::ensure_buf` (segmented_buffer.rs:151-156) on FIRST use, at
+  `min_capacity.max(ALLOCATION_CHUNK_SIZE=128 KiB)`.
+- IN-ORDER-DRAIN RECYCLE POINT = `ChunkData::recycle_decoded_buffers` (chunk_data.rs:1709)
+  → `return_u8_to_worker` (also from Drop). Returns the buf to the worker pool AFTER the
+  consumer wrote it. Manual pool retains capacity via `v.clear()` (NOT drop) — pages SHOULD
+  stay resident. Default OFF (`manual_buffer_pool_enabled()` false → return DROPS the Vec).
+- RECONCILED the prior-session INERT anomaly (the "13 warm reuses yet faults flat", allocator
+  forensics deferred): `prefill_window_prefix` calls `ensure_buf(128 KiB)` → takes a SMALL
+  pooled buffer, THEN `reserve_clean(R)` GROWS it to R by realloc (segmented_buffer.rs:450-460,
+  chunk_decode.rs:1871/1427). With the OLD variable per-chunk reserve, the buffer realloc'd
+  by-a-hair on most reuses → the LARGE output region was freshly mmap'd+faulted every chunk;
+  the pool only ever recycled a throwaway 128 KiB allocation. THAT is why retaining it was inert.
+
+### TASK 2 — DETERMINATION ORACLE (committed; byte-transparent; Gate-0 NON-INERT proven)
+`GZIPPY_RESIDENT_OUTPUT_POOL=1` (chunk_buffer_pool.rs:resident_output_pool_enabled +
+chunk_decode.rs compute_initial_reserve): pins EVERY chunk's reserve to a FIXED 64 MiB
+(RESERVE_CAP) so all pooled buffers share ONE capacity → never realloc on reuse → pages stay
+RESIDENT; AND auto-enables the manual LIFO pool. Gate-0 PASS: byte-EXACT (sha==zcat==ratioB==
+igzip, silesia+nasa); distinct binary; NON-INERT THIS time (silesia faults 24054→19971 = the
+fixed-reserve removed refaults the prior flat manual pool could not). Pool hits>0 confirmed.
+
+### TASK 3 — MEASUREMENTS (perf -r 11, cpu4 unstressed, /dev/null)
+T1 page-faults + cyc + wall (A=ratioB tip, B=resident):
+| corpus  | A faults | B faults | Δfaults  | A cyc   | B cyc   | A wall  | B wall  | Δwall | igzip faults/cyc/wall |
+|---------|----------|----------|----------|---------|---------|---------|---------|-------|-----------------------|
+| silesia | 24054    | 19971    | -4083 (-17%) | 1258M | 1239M(-1.5%) | 0.908 | 0.897 | -1.2% | 668 / 940M / 0.677 |
+| nasa    | 41782    | 41784    | +2 (FLAT)    | 586M  | 567M(-3.2%)  | 0.426 | 0.421 | -1.2% | 666 / 327M / 0.236 |
+IN-FLIGHT DEPTH + pool stats (GZIPPY_VERBOSE): depth=4 BOTH corpora.
+  silesia 17 chunks: pool u8 hits=13 misses=4 returns=17 → 4 distinct buffers cycle (13 warm).
+  nasa 5 chunks: hits=1 misses=4 returns=5 → 5 chunks ≤ depth=4 → only 1 reuse → faults FLAT.
+T>1 constraint (best-of-7 wall, min-of-5 peak RSS, sha-OK) — resident vs ratioB:
+| corpus T | wall ratioB | wall resid | Δwall | RSS ratioB kB | RSS resid kB | ΔRSS |
+|----------|-------------|------------|-------|---------------|--------------|------|
+| silesia 4| 0.49 | 0.52 | +6.1% | 206336 | 363112 | +76.0% |
+| silesia 8| 0.32 | 0.37 | +15.6%| 275528 | 412908 | +49.9% |
+| nasa 4   | 0.32 | 0.35 | +9.4% | 293808 | 332752 | +13.3% |
+| nasa 8   | 0.20 | 0.21 | +5.0% | 256308 | 279216 | +8.9%  |
+⇒ forcing residency REGRESSES T>1 wall (+5–16%) AND RSS (+9–76%): the pipeline holds
+  depth×workers buffers; the fixed over-reserve inflates RSS. (ratioB baseline already DROPS
+  drained buffers → already RSS-bounded; retaining-resident is what COSTS RSS — the prompt's
+  "lower RSS" prediction is backwards for the retain-resident approach.)
+
+### DETERMINATION: **NOT FEASIBLE as a unified resident-pool path.** Recommend a dedicated T1 path — but SIZE IT HONESTLY (the dominant gap is the KERNEL, not materialization).
+1. The resident-pool unified mechanism does NOT deliver the igzip T1 gain: T1 wall only
+   -1.2% (faults depth-bounded: silesia -17%, nasa inert), the +33%/+78% igzip gap STANDS;
+   and it REGRESSES T>1 wall+RSS. KILLED.
+2. STRUCTURAL BLOCKER (measured): gzippy MATERIALIZES each chunk's FULL decoded output
+   (12–40 MiB/chunk) held depth(=4)-deep concurrently for out-of-order assembly — this IS
+   rg's parallel design (the T>1 parity source). The recyclable T1 fault floor = depth ×
+   chunk-output-pages; even at depth-1 that's ~3k (sil) / ~10k (nasa) faults vs igzip's 666.
+   igzip's profile comes from STREAMING output through ONE ~tens-of-KB reused window
+   (decode-and-emit), which is INCOMPATIBLE with per-chunk materialization. No pool-tuning of
+   the rg architecture reaches igzip's T1 fault profile.
+3. CAUSAL FINDING that resizes the prize: the T1 OUTPUT FAULTS ARE LARGELY SLACK at the wall
+   — a -17% silesia fault drop moved the wall only -1.2% (cyc -1.5%). So the materialization/
+   scaffold component (STATE attribution ~0.35 sil / ~1.0 nasa cyc/B) is NOT the dominant
+   T1-WALL lever; the bulk of the igzip gap is the KERNEL per-iteration machinery (STATE
+   B-sizing: gzippy single-mode 6.09 vs igzip 3.98 cyc/B — a 2.1 cyc/B kernel-loop gap, NOT
+   the table format). A dedicated T1 streaming path buys the small materialization slack
+   (~1% wall) PLUS removes the resumable/marker/chunk SCAFFOLD around the kernel — but to
+   reach igzip-T1-PARITY it must ALSO converge the inner loop on igzip's cadence, which is a
+   SEPARATE problem that applies to the unified path too.
+   ⇒ EXPECTED dedicated-T1 gain is bounded by kernel convergence, NOT by faults; do NOT size
+   it at the full +33%/+78%. ESCALATE to USER (R3): the igzip-T1 lever is the inner kernel
+   loop, not the output path; a dedicated T1 path is a vehicle for a tighter kernel, not a
+   fault-removal win.
+RE-VERIFY T1: `REPS=11 CORPORA="silesia nasa" bash /tmp/resident_faults.sh` (on guest);
+  T>1: `N=7 M=5 CORPORA="silesia nasa" THREADS="4 8" bash /tmp/resident_tn.sh`;
+  depth/pool: `GZIPPY_VERBOSE=1 GZIPPY_RESIDENT_OUTPUT_POOL=1 GZIPPY_FORCE_PARALLEL_SM=1
+  taskset -c 4 /root/bin/gzippy-resident -d -c -p1 /root/silesia.gz >/dev/null`.
+BOX CLEAN: powersave, 0 stressors, no persistent pinning (taskset per-cmd), /tmp scratch
+  ephemeral, root-disk untouched (built on tmpfs CARGO_TARGET_DIR). guest worktree reverted
+  to tip. NO main push, NO reimplement-isa-l push.
+
+### NEXT
+- USER R3 DECISION owed: the determination says igzip-T1-parity is NOT reachable by a unified
+  resident-pool; a dedicated T1 path is needed but its prize is KERNEL convergence (the inner
+  loop), and materialization-removal alone is ~1% wall. Decide whether to (a) fund a dedicated
+  pure-Rust T1 streaming decoder (igzip-shaped: one small reused window, decode-and-emit, no
+  per-chunk materialization, no resumable/marker scaffold) whose REAL prize is letting the
+  inner kernel run in igzip's tight loop, or (b) keep converging the SHARED kernel loop (helps
+  both T1 and T>1) without a fork. Per STATE B-sizing the kernel gap is diffuse (refill +
+  classify + loop-overhead) and NOT the table format.
+- AMD/Zen2 replication of this determination owed before LAW.
+
 ## ====== PRODUCTIONIZE SESSION (2026-06-18 night2) — ratio-based output reserve SHIPPED (gated, byte-exact, KEPT) ======
 MISSION: productionize the cheap-fix the prior session bounded (oracle gzippy-bigreserve:
 nasa -0.533 cyc/B / -12% to-file wall via blind 16->96 MiB clamp + 8->16 mult). Goal:

@@ -257,7 +257,21 @@ fn pool_index_for_take() -> usize {
 
 fn manual_buffer_pool_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("GZIPPY_MANUAL_BUFFER_POOL").is_some())
+    *EN.get_or_init(|| {
+        std::env::var_os("GZIPPY_MANUAL_BUFFER_POOL").is_some() || resident_output_pool_enabled()
+    })
+}
+
+/// RESIDENT-OUTPUT-POOL ORACLE flag (`GZIPPY_RESIDENT_OUTPUT_POOL=1`, default OFF,
+/// byte-transparent, MEASUREMENT-ONLY). Turns on the manual LIFO pool AND pins every
+/// chunk's upfront reserve to a single fixed size (see `compute_initial_reserve`), so
+/// recycled output buffers share one capacity, are never realloc'd on reuse, and keep
+/// their pages RESIDENT across chunks. Determination tool for the BEAT-IGZIP-T1
+/// question: can a resident, reused output buffer reach igzip's T1 fault profile while
+/// holding T>1 rapidgzip parity?
+pub fn resident_output_pool_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("GZIPPY_RESIDENT_OUTPUT_POOL").is_some())
 }
 
 /// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).
