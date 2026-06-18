@@ -129,7 +129,9 @@
 //! Cargo feature `asm-kernel`, x86_64-only call sites; pure-Rust loop ALWAYS
 //! compiled and reachable. Runtime: BMI2 detect (`shrx`/`shlx`/`bzhi`) +
 //! `GZIPPY_ASM_KERNEL=0` kill-switch (OnceLock, one predictable branch per
-//! contig call). Default-OFF until the ship gate passes frozen.
+//! contig call). DEFAULT-ON on x86_64: `pure-rust-inflate` (the shipped
+//! native + isal feature set) pulls in `asm-kernel`, so on a BMI2 host this
+//! region IS the production clean fast loop.
 
 #![allow(dead_code)]
 
@@ -327,20 +329,20 @@ mod imp {
     /// underflow; the subtable case (the only one that could) exits to
     /// Rust.
     ///
-    /// Asm↔Rust line map (byte-exactness audit):
-    ///   top guards        ↔ marker_inflate.rs `out_ok`/`in_ok` (E4 limits)
+    /// Asm↔Rust line map (byte-exactness audit; Rust mirror =
+    /// `run_contig_ref_biased`, pinned asm==ref by the c2/c3 differentials):
+    ///   top guards        ↔ ref `*dst >= out_lim || pos >= in_lim`
     ///   prologue/carried gather + `20:` long resolve
-    ///                     ↔ lut_huffman.rs `decode_prefilled` (:1055)
-    ///   lone-literal arm  ↔ marker_inflate.rs lone-lit store (1-byte, Q3)
-    ///   chain steps `30:`/`40:`/`60:` ↔ marker_inflate.rs P3.2 chain loop
-    ///                       (gate order side-effect-free; `decode()`'s
-    ///                       backstop = `31:`/`41:`/`62:` refills)
-    ///   post-chain `7:` / bottom `6:` ↔ the `< 48` threshold refills
-    ///   multi arm `22:`   ↔ packed 8-byte store of `sym0 & 0x00FF_FFFF`
-    ///   backref arm `50:` ↔ marker_inflate.rs trailing handler (EOB/MAX
-    ///                       gates, dist single-lookup :2747-2778, validity
-    ///                       :2810-2817, pre-copy refill+preload :2834-2839)
-    ///   copy `52:`-`59:`  ↔ marker_inflate.rs `emit_backref_contig` (:3560)
+    ///                     ↔ lut_huffman.rs `decode_prefilled`
+    ///   flat classify (`cmp 255` on trailing, `50f`) ↔ ref `trailing > 255`
+    ///   pure-literal pack (lone+multi unified) ↔ ref 8-byte packed store +
+    ///                       `*dst += cnt` (one packet/iter, NO chain)
+    ///   bottom `6:`/`63:` ↔ ref `< 48` threshold refill
+    ///   non-literal arm `50:` (cnt-split lone/multi-trailing)
+    ///                     ↔ ref `trailing > 255` arm (EOB/oversize gates,
+    ///                       cnt>=2 literal-prefix store, dist single-lookup,
+    ///                       validity, X2 restore on bail)
+    ///   copy `52:`-`59:`  ↔ marker_inflate.rs `emit_backref_contig`
     ///   REFILL sequence   ↔ consume_first_decode.rs `Bits::refill` fast
     ///                       form (`pos + 8 <= len` structural via
     ///                       IN_MARGIN; `>64` underflow check dead via E2)
