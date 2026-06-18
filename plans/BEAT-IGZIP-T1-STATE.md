@@ -31,6 +31,54 @@ Harness on guest: /root/distpreload-harness/.
   load. To move cyc/byte the lever must cut the CRITICAL-PATH ALU (the shrx-fed
   classify dep chain / mispredicting branch), not just retired-instruction count.
 
+## GATE-2 CAUSAL PERTURBATION — IS THE UNPACK/CLASSIFY CHAIN ON THE CRITICAL RECURRENCE? (2026-06-18)
+DECISIVE TEST that gates whether rewrite B (igzip-style fat DIRECT table, ~0 unpack)
+is worth funding. Method (STRONG tier — Gate-2 causal perturbation): in a THROWAWAY
+worktree (/root/gz-perturb, base 2b10aa48 — identical shrx→cmp critical segment;
+REMOVED after run), inserted K serially-DEPENDENT, value-NEUTRAL ALU ops
+(`rol $1,%r10`/`ror $1,%r10` pairs, all on t5) BETWEEN the trailing-symbol extraction
+`shrx {t5},{t5},{t4}` and the literal/non-literal discriminator `cmp {t5:e},255`,
+extending the loop-carried recurrence that feeds the discriminator branch.
+CONTROLS PASSED: all 4 builds byte-exact (sha==zcat silesia ref) + kernel-engaged
+(entries=24128 identical) + distinct binaries; disasm-verified the chain is a genuine
+DEPENDENT serial chain on %r10 sitting exactly between the shrx and `cmp $0xff,%r10d`
++ `ja` (rol/ror count scales 8→10→12→16 = +K); paired self-test (A2-A1) PASS.
+Harness: `_distpreload_paired_guest.sh`, PIN=4 REPS=21 SKIP_STRESS=1, /dev/null sink.
+
+SLOPE TABLE (medΔ cyc/byte vs K=0, all p=6.412e-05, CI excludes 0):
+| K (dep ops) | silesia medΔ (per-op)   | nasa medΔ (per-op)     |
+|-------------|-------------------------|------------------------|
+| 2           | +0.280 (+4.6%) [0.140]  | +0.070 (+2.1%) [0.035] |
+| 4           | +0.686 (+11.3%) [0.171] | +0.204 (+6.1%) [0.051] |
+| 8           | +1.380 (+22.8%) [0.172] | +0.375 (+11.2%) [0.047]|
+
+VERDICT: **PROPORTIONAL slope on BOTH corpora** (monotone, ~linear; silesia
+doubling-K → ~2.0× Δ, ~0.17 cyc/B per op; nasa ~0.05 cyc/B per op). ⇒ the
+shrx-fed t5-extraction → discriminator chain (the gz-specific UNPACK/classify the
+STATE'd ~21% region) IS on the critical recurrence — NOT load-shadowed (contrast
+technique #1's load-shadowed shl, which TIE'd). Eliminating that extraction
+(rewrite B: direct table yields byte+len, ~0 unpack) therefore has REAL cyc/byte
+headroom. The unpack cost is concentrated on entropy-DENSE/literal-heavy data
+(silesia 0.17/op) vs backref-heavy/low-entropy (nasa 0.05/op) — i.e. B's payoff is
+LARGEST exactly where gzippy's gap is largest (silesia +39.5%).
+
+CAVEAT (Gate-2 rule: slow-down slope ≠ speed-up ceiling): this proves the chain is
+ON the critical path (necessary), NOT how much B's shorter chain recovers. The
+removal-ORACLE that BOUNDS the win already exists and is banked: igzip's
+decode_huffman kernel = 3.98 cyc/B vs gzippy run_contig 5.32 cyc/B (silesia, Step A
+iii) ⇒ up to ~1.34 cyc/B recoverable, and igzip pays ~0 unpack. So: perturbation
+(chain on critical path) + igzip removal-oracle (1.34 cyc/B ceiling) ⇒ B is
+JUSTIFIED. Single-arch Intel = NOT-YET-LAW (AMD/Zen2 owed). monorepo 3rd-corpus owed
+(optional; 2-corpus spread already concordant).
+
+RECOMMENDATION FOR USER R3 (fund rewrite B?): **YES, justified** — gated proportional
+slope (both corpora) + a measured igzip removal-oracle ceiling (~1.34 cyc/B). BUT do
+the CHEAPER step first (pre-registered NEXT #1: flag-bit discriminator — same critical
+chain, ~1/10th the work, no table re-layout): if a single `test entry,FLAG; jnz` off
+the LOAD (no shrx-extract) recovers a significant fraction of the slope, B's full
+table-format rewrite may be unnecessary. Sequence: flag-bit (NEXT #1) → re-measure →
+THEN decide B with the residual.
+
 ## THE INSTRUMENT (deliverable #1) — Gate-0 SELF-VALIDATED, PASS
 `scripts/bench/_gzippy_vs_igzip_paired_guest.sh` (reuses committed `_distpreload_paired_analyze.py`).
 arm A(A1,A2)=igzip, arm B=gzippy-native (ParallelSM @ T1). medΔ=(B-A1) cyc/byte;
