@@ -1,5 +1,22 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== CORRECTION (2026-06-18 night4, advisor-caught over-claims in the night3 determination below) ======
+The night3 resident-pool determination (section immediately below) OVER-STATED. Corrected wording:
+(a) **"output faults are SLACK" is UNDER-POWERED** — it rested on a −17% fault NUDGE (a slope,
+    NOT a drive-to-igzip's-666 removal-oracle), no inter-run spread was stated, and nasa's pool
+    DID NOT FIRE (faults flat, only 1 reuse). Downgrade the claim to: *"an elaborate T1 streaming
+    path is low-value (~1% materialization wall-prize, single-corpus silesia only)."* It is NOT a
+    gated proof that faults are slack.
+(b) **"T>1 not feasible" tested ONLY the NAIVE global-resident pool** — downgrade to: *"the naive
+    global fixed-64MiB-reserve resident pool regresses T>1 wall (+5–16%) and RSS (+9–76%)."* This
+    does NOT rule out a thread-parameterized (T1-only) depth/pool change.
+(c) **The "2.1 cyc/B kernel gap (6.09 vs 3.98)" is SINGLE-SYM microbench mode** which gzippy does
+    NOT ship. Do NOT cite it as production headroom. The honest PRODUCTION-PACKED inner-kernel gap
+    is **~0.9 cyc/B diffuse (silesia)** (refill+classify+loop-overhead), per the night2 residual note.
+(d) **"diffuse / near-floor / exhausted" is NOT established** — there was an untested lever: the T1
+    in-flight / recycle-deferral depth (the pipeline holds 4 concurrently-live ChunkData at T1 for
+    ZERO parallelism benefit). The night4 session below TESTS it.
+
 ## ====== UNIFIED-T1-DETERMINATION SESSION (2026-06-18 night3) — resident-output-pool: DETERMINATION = NOT FEASIBLE as a unified path; igzip-T1 needs a dedicated streaming path. (gated, byte-exact, Intel-only NOT-YET-LAW) ======
 USER QUESTION: "Is there a way to achieve igzip-like T1 speeds using code that MAINTAINS
 rapidgzip T>1 parity? If yes → do it; if not → dedicated pure-Rust T1 path."

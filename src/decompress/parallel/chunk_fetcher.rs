@@ -3918,11 +3918,28 @@ enum PendingWrite {
 
 /// Return drained chunk buffers to the pool only after `RECYCLE_DEFER_DEPTH`
 /// newer chunks have drained (see `consumer_loop`).
+/// BEAT-IGZIP-T1 night4 sweep knob (byte-transparent; default == old const 2).
+/// `GZIPPY_RECYCLE_DEFER_DEPTH=N` overrides the recycle-deferral depth so the T1
+/// in-flight / live-ChunkData working set can be swept (depth 4→2→1) WITHOUT a
+/// rebuild. OFF (unset) == identity (DEPTH=2). Recycling a buffer is pure
+/// lifecycle (drop or pool-return) so changing WHEN it happens is byte-exact.
+#[cfg(parallel_sm)]
+fn recycle_defer_depth() -> usize {
+    use std::sync::OnceLock;
+    static D: OnceLock<usize> = OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("GZIPPY_RECYCLE_DEFER_DEPTH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2)
+    })
+}
+
 #[cfg(parallel_sm)]
 fn defer_chunk_recycle(deferral: &mut std::collections::VecDeque<ChunkData>, chunk: ChunkData) {
-    const DEPTH: usize = 2;
+    let depth = recycle_defer_depth();
     deferral.push_back(chunk);
-    while deferral.len() > DEPTH {
+    while deferral.len() > depth {
         if let Some(mut old) = deferral.pop_front() {
             old.recycle_decoded_buffers();
         }
