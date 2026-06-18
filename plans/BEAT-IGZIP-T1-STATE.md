@@ -112,21 +112,34 @@ the hot run_contig classify+decode loop, addressable."
   STRUCTURAL change, not a peephole; high byte-exact risk, must be one gated commit.
 
 ## NEXT (planned, in priority order) — for the iteration phase (deliverable #2)
-The target is now precise: cut instr/byte in run_contig toward igzip's loop_block
-economy (fewer classify branches per symbol; speculative unconditional store; single
-discriminator branch). Candidate techniques, ONE per commit, each byte-exact gated
-(both flavors build + `cargo test --release --lib` 0-fail + proptest≥60k + tri-oracle
-gzip/flate2/libdeflate/igzip × corpora × T1/T4/T8 sha-identical) THEN paired cyc/byte
-A/B vs prior commit AND vs igzip via `_gzippy_vs_igzip_paired_guest.sh`:
-1. Loop-level restructure: consume litlen BEFORE the len/EOB classify; preload
-   next-litlen + next-dist every iteration (igzip loop_block). HAZARD: collides with
-   gz's X2 reclass contract (RECLASS packets must be handed back un-consumed) — needs a
-   cheap per-iter (bitbuf,bitsleft) spill+restore; MEASURE the spill cost on the hot
-   literal path before committing (it may regress).
-2. igzip speculative unconditional store + single discriminator branch (collapse the
-   cmp 0x100 / cmp 0xff / test 0x2000000 chain).
+REVISED after technique #1's TIE: the prize is CRITICAL-PATH cyc/byte, NOT retired
+instruction count. Technique #1 cut -0.186 instr/byte yet TIE'd cyc/byte because the
+removed shl was load-shadowed (overlapped behind the table-load latency). Peephole
+instruction-shaving of already-overlapped ops will keep TIE-ing. The remaining cyc/byte
+deficit (+1.34 cyc/B kernel) lives in (a) the data-dependent classify dep-chain that
+FEEDS the load and the cmp (the `shrx`-fed trailing-symbol extraction → `cmp 255`
+branch; negative ΔIPC says this mispredicts/serializes), and (b) the ~21% packed-symbol
+UNPACK ALU that has no igzip counterpart. So:
+1. (HIGHEST VoI) Attack the CRITICAL PATH, not the instruction count. The dep chain is
+   short_tbl load -> (bc/cnt/shift extraction) -> shrx -> cmp 255 -> branch. Shorten the
+   chain LENGTH or break the misprediction: e.g. derive the literal-vs-nonliteral
+   discriminator from a flag BIT already in the loaded entry (a single `test`, no
+   shrx-extract), so the branch resolves off the load directly instead of waiting on the
+   extraction chain. Requires a table-format bit (build side lut_huffman) — STRUCTURAL,
+   one gated commit, ref in lockstep. Pre-register success = cyc/byte medΔ<0 p<0.01.
+2. The packed-multi-symbol short-entry format itself: evaluate whether multi-symbol
+   packing (decode 2-3 lits/iter, pay UNPACK ALU) actually beats igzip's
+   one-symbol-per-iter + fatter DIRECT table (decoded byte+len in the entry, ~0 unpack).
+   This is the core convergence question — likely the real lever, but a large rewrite +
+   STRATEGIC fork: escalate to supervisor/user before committing the rewrite (R3).
 3. Update `run_contig_ref` / `run_contig_ref_biased` in LOCKSTEP with every asm change
    (X1-X5 exit-state + IN_MARGIN bit-exact-refill contract).
+GATE (each technique, ONE per commit): byte-exact (sha 3 corpora×T1/T4/T8 + proptest≥60k
++ c2/c3 asm-vs-ref diffs) THEN paired N≥21 cyc/byte vs prior AND vs igzip. Build native
+flavor: `RUSTFLAGS="-C target-cpu=native" cargo build --release --no-default-features
+--features pure-rust-inflate`. NOTE: local Mac pre-commit hook is BROKEN (uninitialized
+vendor submodules) — commit on the guest, or `git commit --no-verify` for non-perf
+metadata; CI still runs the real checks.
 
 ## TOOLING STATE (for next turn)
 - Instrument: `/root/distpreload-harness/_gzippy_vs_igzip_paired_guest.sh` (committed
