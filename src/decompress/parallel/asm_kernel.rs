@@ -103,7 +103,9 @@
 //! ## IN_MARGIN proof (no slow refill inside the asm)
 //! After the branchless-classify rewrite the speculative literal chain is
 //! GONE, so one asm iteration issues at most ONE refill (the pure-literal
-//! bottom `< 48`, or the backref pre-copy `< 48`). Each fast refill advances
+//! bottom — now UNCONDITIONAL, igzip-style every-iteration, the software-
+//! pipelined `loop_block` shape; or the backref pre-copy `< 48`). Each fast
+//! refill advances
 //! `pos` by ≤ 7 and reads 8 bytes, so the deepest read inside an iteration
 //! touches `pos_top + 7 + 8 = pos_top + 15 <= pos_top + IN_MARGIN - 1 <
 //! in_end` for `IN_MARGIN = 40` (`pos_top < in_lim = in_end - 40`). Hence
@@ -409,30 +411,52 @@ mod imp {
                 "shrx {t5}, {t5}, {t4}",              // trailing symbol → low bits (high bits 0)
                 "cmp {t5:e}, 255",
                 "ja 50f",                             // trailing non-literal → backref/EOB arm
-                // ── pure-literal pack (cnt literals, all ≤255): consume the
-                //    whole packet, ONE speculative 8-byte store of the up-to-3
-                //    packed bytes (libdeflate fastloop; the bytes above dst
-                //    are X3 overshoot, never read back), advance by cnt. Lone
-                //    AND multi unified — no sym_count branch, no chain.
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
+                // ── pure-literal pack (cnt literals, all ≤255), SOFTWARE-
+                //    PIPELINED (igzip loop_block 514-556): SAVE the up-to-3
+                //    packed bytes, consume the packet, then INTERLEAVE the
+                //    unconditional refill (igzip refills EVERY iteration —
+                //    `or bitsleft,56` is exact for all bitsleft∈[0,63]; the
+                //    `<48` branch is GONE) and ISSUE the next-litlen preload
+                //    load, and only THEN do the speculative 8-byte store +
+                //    advance. The store/advance/back-edge/top-guards (none of
+                //    which depend on the preloaded {t1}) execute while the
+                //    preload load is in flight, hiding its L1 latency — the
+                //    IPC buy the branchless flat-classify lacked (igzip 540
+                //    loads next_sym BEFORE the dist preload + back-edge, with
+                //    the speculative store at 518 ahead of the load-use).
                 "mov {t4:e}, {t1:e}",
-                "and {t4:e}, 0xFFFFFF",               // up to 3 packed literal bytes
+                "and {t4:e}, 0xFFFFFF",               // SAVE packed bytes (before preload clobbers t1)
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the whole packet
+                "sub {bitsleft}, {t2}",
+                // ── interleaved UNCONDITIONAL refill (t2 free post-consume) ─
+                "6:",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
+                "or {bitsleft}, 56",
+                // ── preload NEXT litlen entry — load ISSUED EARLY ───────────
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                // ── speculative store + advance HIDE the preload load latency
                 "mov qword ptr [{dst}], {t4}",        // speculative 8-byte store
                 "add {dst}, {t3}",                    // advance by cnt
-                // ── bottom: `< 48` refill + preload + back-edge ──────────
-                "6:",
-                "cmp {bitsleft}, 48",
-                "jae 63f",
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
-                "mov {t4:e}, 63",
-                "sub {t4}, {bitsleft}",
-                "shr {t4}, 3",
-                "add {pos}, {t4}",
+                "jmp 2b",
+                // ── cold bottom (long-literal path): unconditional refill +
+                //    preload, NO store (the long path stored its 1 byte already)
+                "64:",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "63:",
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
@@ -457,7 +481,7 @@ mod imp {
                 "sub {bitsleft}, {t2}",
                 "mov byte ptr [{dst}], {t1:l}",
                 "inc {dst}",
-                "jmp 6b",                             // → bottom refill + preload + loop
+                "jmp 64b",                            // → cold bottom: refill + preload + loop
                 "21:",                                // long lone non-literal
                 "mov {t5:e}, {t1:e}",                 // trailing = code
                 "mov {t3:e}, 1",                      // cnt = 1 (long codes are never packed)
@@ -841,17 +865,21 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
             }
             continue;
         }
-        // Pure-literal pack (asm pure-literal path): consume the whole packet,
-        // one speculative 8-byte store of the up-to-3 packed bytes, advance by
-        // cnt. CONSUME_BIAS != 0 only in the positive-control test (off-by-one
-        // model of a wrong asm consume count); 0 == production reference.
+        // Pure-literal pack (asm pure-literal path), SOFTWARE-PIPELINED:
+        // consume the whole packet, then refill UNCONDITIONALLY (lockstep with
+        // the asm's igzip-style every-iteration refill — `Bits::refill`'s fast
+        // form is bit-for-bit the asm's `or bitsleft,56` refill at this call
+        // site: pos+8<=len via the in_lim guard, bitsleft<=63 via E2), then the
+        // speculative 8-byte store + advance by cnt (store ordered after the
+        // refill, exactly as the asm issues the preload+store after refilling;
+        // store and refill are independent so the committed state is identical).
+        // CONSUME_BIAS != 0 only in the positive-control test (off-by-one model
+        // of a wrong asm consume count); 0 == production reference.
         lb.consume(pre.bit_count + CONSUME_BIAS);
+        lb.refill();
         let packed = (pre.symbol & 0x00FF_FFFF) as u64;
         out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
         *dst += cnt;
-        if (lb.bitsleft as u8) < 48 {
-            lb.refill();
-        }
     }
 }
 
