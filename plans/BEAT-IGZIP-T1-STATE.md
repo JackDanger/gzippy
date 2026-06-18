@@ -14,6 +14,22 @@ Harness on guest: /root/distpreload-harness/.
 ## COMMITS THIS MISSION
 - 2c135d07 — deliverable #0: commit orphaned paired harness (analyzer+memstress+driver) to scripts/bench.
 - 2e01dd4f — deliverable #1: add igzip arm `scripts/bench/_gzippy_vs_igzip_paired_guest.sh`.
+- (HEAD)   — Step-B technique #1: fuse `lea-1`+`shl3` shift into one `lea [t3*8-8]`.
+            BYTE-EXACT (sha 3 corpora×T1/T4/T8, proptest 60k, c2/c3 asm-vs-ref diffs).
+            Δinstr/byte=-0.186 (silesia, deterministic + paired); cyc/byte TIE
+            (silesia medΔ=-0.040, CI=[-0.0475,-0.0216] excl 0 but p=0.018 fails p<0.01;
+            nasa wash). KEPT on byte-exact license; gap to igzip NOT closed (still +39.5%).
+
+## STEP-B TECHNIQUE LOG (gated, Intel trainer cpu4, N=21 paired, /dev/null sink)
+| # | technique | byte-exact | Δinstr/B (sil) | cyc/B medΔ (sil) | p | verdict | kept? |
+|---|-----------|-----------|----------------|------------------|---|---------|-------|
+| 1 | fuse shift `lea[t3*8-8]` (was lea-1+shl3) | PASS | -0.186 | -0.040 [CI-0] | 0.018 | TIE (fails p<0.01) | YES (byte-exact) |
+  Re-verify #1: BIN_A=<prior> BIN_B=<new> PIN=4 REPS=21 CORPORA="silesia nasa"
+  SKIP_STRESS=1 bash /root/distpreload-harness/_distpreload_paired_guest.sh
+  LESSON (confirms advisor #1): removing a PREDICTABLE, load-shadowed instr drops
+  instr/byte but NOT cyc/byte proportionally — the shl was overlapped behind the table
+  load. To move cyc/byte the lever must cut the CRITICAL-PATH ALU (the shrx-fed
+  classify dep chain / mispredicting branch), not just retired-instruction count.
 
 ## THE INSTRUMENT (deliverable #1) — Gate-0 SELF-VALIDATED, PASS
 `scripts/bench/_gzippy_vs_igzip_paired_guest.sh` (reuses committed `_distpreload_paired_analyze.py`).
@@ -54,6 +70,46 @@ GATED FACTS (this commit, Intel-only, NOT-YET-LAW — AMD owed):
    loads `mov (%r11,%rXX,4)` (6.3%+) and the engaged MOVDQU backref copy (4.5%x2,
    8383a2eb is LIVE). igzip's loop_block collapses this to ONE speculative store + ONE
    discriminator branch — THAT delta is the instruction excess to attack.
+
+## STEP A — AIM CONFIRMED (2026-06-18, guest trainer cpu4, symboled bin rebuilt today)
+Localization re-run fresh; all three sub-checks PASS and converge on "the excess is in
+the hot run_contig classify+decode loop, addressable."
+
+(i) RECLASS RATIO — cold exits are NOT the cost. GZIPPY_VERBOSE=1 GZIPPY_ASM_STATS=1:
+| corpus   | entries | exit_reclass(tag0) | reclass_dist | reclass_eob | asm_bytes/entry |
+|----------|---------|--------------------|--------------|-------------|-----------------|
+| silesia  | 24128   | 0                  | 21330        | 2796        | ~8770           |
+| monorepo | 8299    | 0                  | 8130         | 166         | ~6118           |
+| nasa     | 25399   | 0                  | 25037        | 351         | ~8077           |
+  Generic invalid/oversize exit (tag 0) = 0 everywhere. The dominant exit is
+  reclass_dist (subtable/raw0 dist → Rust), BUT asm_bytes/entry is ~6-9 KB: the kernel
+  decodes thousands of CLEAN bytes between each bail, so per-byte cold-exit overhead is
+  negligible. The excess instr/byte is in the hot loop. => loop_block port is aimed right.
+
+(ii) PER-REGION (perf annotate -F4000, silesia, hottest run_contig instrs, self%):
+  - Packed-symbol UNPACK ALU chain (gz's multi-sym short-entry format tax, no igzip
+    counterpart): test 0x2000000 3.27, mov t2,t1 4.31, shl $3 (shift=8*(cnt-1)) 3.81,
+    and 0x1FFFFFF 2.96, mov 2.23, lea-1 1.38, shrx 1.12, cmp 0xff 1.92  => ~21%
+  - Two table-load preloads: mov(%r11,%r14,4) 5.63 + mov(%r11,%r12,4) 5.55 => ~11%
+    (IRREDUCIBLE — igzip's decode_next_sym has the identical 2 loads)
+  - MOVDQU backref copy: load 4.69 + store 4.10 + jle 2.03 => ~11%
+  - Non-literal arm: cmp 0x100 (EOB) 5.12, cmp 0x200 1.28, dist preload/decode/copy body
+
+(iii) SYMBOL-RESTRICTED KERNEL-vs-KERNEL cyc/byte (perf stat cycles × self%, silesia):
+  - gzippy run_contig self=86.64%, total=1,302,094,139 cyc / 211,968,000 B => 5.32 cyc/B
+  - igzip decode_huffman_code_block_stateless_04 self=90.31%, total=934,030,780 cyc
+    => 3.98 cyc/B
+  - KERNEL GAP = +1.34 cyc/B (+33.7%) — tracks the whole-process silesia +39.5%, so the
+    excess really is IN the kernel. Whole-proc instr/byte: gzippy 13.73 vs igzip 11.38
+    (+2.35), consistent with banked +~2.3.
+
+  VERDICT (Step A): the +1.34 cyc/B kernel deficit decomposes as ~21% packed-symbol
+  UNPACK ALU + ~11% backref copy + ~11% irreducible table loads. The single addressable
+  lever with NO igzip counterpart is the packed-multi-symbol UNPACK chain (cnt extract,
+  shift=8*(cnt-1), shrx, masks). igzip's table format yields the decoded byte(s)+length
+  DIRECTLY, paying ~0 unpack ALU — that ~21% is the instruction excess. NOTE: attacking
+  it = changing the short-entry TABLE FORMAT (build side in lut_huffman) in lockstep, a
+  STRUCTURAL change, not a peephole; high byte-exact risk, must be one gated commit.
 
 ## NEXT (planned, in priority order) — for the iteration phase (deliverable #2)
 The target is now precise: cut instr/byte in run_contig toward igzip's loop_block

@@ -420,8 +420,10 @@ mod imp {
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
                 "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
-                "lea {t4:e}, [{t3:e} - 1]",
-                "shl {t4:e}, 3",                      // shift = 8*(cnt-1)  (0/8/16)
+                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1) (0/8/16) — fused
+                                                     // lea (was `lea -1` + `shl 3`):
+                                                     // t3*8-8 == (cnt-1)<<3 for all cnt,
+                                                     // byte-exact, one fewer hot instr.
                 "mov {t5:e}, {t1:e}",
                 "and {t5:e}, 0x1FFFFFF",              // strip flag/cnt/bc → packed syms only
                 "shrx {t5}, {t5}, {t4}",              // trailing symbol → low bits (high bits 0)
