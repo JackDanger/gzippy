@@ -1237,11 +1237,11 @@ fn consumer_loop<W: std::io::Write>(
     let mut eager_completed: EagerCompleted = std::collections::HashMap::new();
     // Keep the last N drained chunks' buffers off the pool until the
     // pipeline moves on (lone-drain CRC bisect 2026-06-05: 1-chunk defer
-    // insufficient; byte diff at chunk 4 boundary when lone emit races
-    // worker fill of successor buffers).
-    const RECYCLE_DEFER_DEPTH: usize = 2;
-    let mut recycle_deferral: std::collections::VecDeque<ChunkData> =
-        std::collections::VecDeque::with_capacity(RECYCLE_DEFER_DEPTH + 1);
+    // insufficient at T>1; byte diff at chunk 4 boundary when lone emit
+    // races worker fill of successor buffers). The depth + lone-drain
+    // policy is T1-tuned (depth 0 + drain-lone at pool_size==1, where the
+    // pool runs inline with no racing workers); see `RecycleDeferral`.
+    let mut recycle_deferral = RecycleDeferral::new(pool_size);
     // Optional duplicate probe (GZIPPY_EAGER_POSTPROC=1) — full-cache scan
     // on every stall; production uses handoff-triggered resolve-ahead only.
     let eager_probe_enabled = eager_postproc_enabled();
@@ -2111,7 +2111,7 @@ fn consumer_loop<W: std::io::Write>(
             &mut recycle_deferral,
         )?;
     }
-    while let Some(mut held) = recycle_deferral.pop_front() {
+    while let Some(mut held) = recycle_deferral.queue.pop_front() {
         held.recycle_decoded_buffers();
     }
     let _ = submit_us_sum; // reserved for future submit-only timing
@@ -3916,31 +3916,62 @@ enum PendingWrite {
     },
 }
 
-/// Return drained chunk buffers to the pool only after `RECYCLE_DEFER_DEPTH`
-/// newer chunks have drained (see `consumer_loop`).
-/// BEAT-IGZIP-T1 night4 sweep knob (byte-transparent; default == old const 2).
-/// `GZIPPY_RECYCLE_DEFER_DEPTH=N` overrides the recycle-deferral depth so the T1
-/// in-flight / live-ChunkData working set can be swept (depth 4→2→1) WITHOUT a
-/// rebuild. OFF (unset) == identity (DEPTH=2). Recycling a buffer is pure
-/// lifecycle (drop or pool-return) so changing WHEN it happens is byte-exact.
+/// Recycle-deferral queue + the thread-count-tuned T1 in-flight-depth config.
+///
+/// Return drained chunk buffers to the pool only after `depth` newer chunks
+/// have drained, and (at T1) drain a lone head Ready immediately.
+///
+/// At `parallelization == 1` the thread pool runs INLINE (`pool_threads == 0`,
+/// see `drive_impl`) with NO concurrent workers, so the per-chunk output buffer
+/// can be recycled immediately (`depth == 0`) and a lone Ready can drain without
+/// the worker-fill race that forces defer-2 + lone-hold at T>1 (the 2026-06-05
+/// lone-drain CRC bisect: "byte diff at chunk 4 boundary when lone emit races
+/// worker fill of successor buffers"). Shrinking the T1 live-ChunkData working
+/// set 4→1 is byte-exact at T1 and a measured win (BEAT-IGZIP-T1 night4, Intel:
+/// nasa −22.9% cyc/B / −21% wall, silesia −3.2% cyc/B / −4.4% wall, RSS
+/// −64%/−30%, both p<0.005, sha-identical) — the smaller resident output
+/// working-set cuts page-faults (nasa −73%, silesia −42%) that feed the kernel.
+/// It is INCORRECT at T>1 (a global depth-1 corrupts silesia at T4/T8) so the
+/// T1 tuning is GATED on `pool_size == 1`. Sweep-only env overrides
+/// (`GZIPPY_RECYCLE_DEFER_DEPTH`, `GZIPPY_DRAIN_LONE`) take precedence for
+/// measurement; unset == identity.
 #[cfg(parallel_sm)]
-fn recycle_defer_depth() -> usize {
-    use std::sync::OnceLock;
-    static D: OnceLock<usize> = OnceLock::new();
-    *D.get_or_init(|| {
-        std::env::var("GZIPPY_RECYCLE_DEFER_DEPTH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(2)
-    })
+struct RecycleDeferral {
+    queue: std::collections::VecDeque<ChunkData>,
+    depth: usize,
+    drain_lone: bool,
 }
 
 #[cfg(parallel_sm)]
-fn defer_chunk_recycle(deferral: &mut std::collections::VecDeque<ChunkData>, chunk: ChunkData) {
-    let depth = recycle_defer_depth();
-    deferral.push_back(chunk);
-    while deferral.len() > depth {
-        if let Some(mut old) = deferral.pop_front() {
+impl RecycleDeferral {
+    fn new(pool_size: usize) -> Self {
+        let t1 = pool_size == 1;
+        // T>1 default: defer 2, hold lone (correctness — worker-fill race).
+        // T1: defer 0, drain lone (single inline worker, no race; measured win).
+        let mut depth = if t1 { 0 } else { 2 };
+        let mut drain_lone = t1;
+        if let Some(v) = std::env::var("GZIPPY_RECYCLE_DEFER_DEPTH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            depth = v;
+        }
+        if std::env::var_os("GZIPPY_DRAIN_LONE").is_some() {
+            drain_lone = true;
+        }
+        Self {
+            queue: std::collections::VecDeque::with_capacity(depth + 1),
+            depth,
+            drain_lone,
+        }
+    }
+}
+
+#[cfg(parallel_sm)]
+fn defer_chunk_recycle(deferral: &mut RecycleDeferral, chunk: ChunkData) {
+    deferral.queue.push_back(chunk);
+    while deferral.queue.len() > deferral.depth {
+        if let Some(mut old) = deferral.queue.pop_front() {
             old.recycle_decoded_buffers();
         }
     }
@@ -3966,10 +3997,10 @@ fn drain_ready_pending_heads<W: std::io::Write>(
     thread_pool: &Arc<ThreadPool>,
     eager_inflight: &mut EagerSubmitted,
     eager_completed: &mut EagerCompleted,
-    recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
+    recycle_deferral: &mut RecycleDeferral,
 ) -> Result<(), FetchError> {
     use std::sync::atomic::Ordering;
-    let debug_lone = std::env::var_os("GZIPPY_DRAIN_LONE").is_some();
+    let debug_lone = recycle_deferral.drain_lone;
     while matches!(pending.front(), Some(PendingWrite::Ready { .. }))
         && (debug_lone
             || pending.len() >= 2
@@ -4015,7 +4046,7 @@ fn drain_one_pending<W: std::io::Write>(
     // predecessor window is published, so they run on the pool while the
     // consumer blocks on the head. `None` (eager disabled) skips it.
     mut eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted, &mut EagerCompleted)>,
-    recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
+    recycle_deferral: &mut RecycleDeferral,
 ) -> Result<(), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     if let Some((_, in_flight, completed)) = eager_ctx.as_mut() {
