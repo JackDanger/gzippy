@@ -57,12 +57,49 @@ warm=13 (silesia) / 1 (nasa).
   13 warm reuses, fits-clamp/no-grow, yet faults flat — pooled-buffer pages not warm on
   reuse; allocator forensics deferred, the operational verdict stands.)
 
-### NEXT (this session, in progress): the REAL cheap-fix bound = kill the grow-realloc storm
-HYPOTHESIS (unvalidated): pre-size buf from the expansion_ratio_ceil (raise/remove the 16 MiB
-RESERVE_CLAMP at chunk_decode.rs:1853) → ONE alloc per chunk, no grow-double, no O(n) memmove
-→ recovers the nasa 68% grow-fault component. Byte-exact (capacity hint only). The decisive
-oracle: build native with the larger reserve, measure nasa+silesia faults + cyc/B paired.
-STATE chunk_data.rs:308-327 reverted right-sizing DOWN (caused grows); sizing UP is the inverse.
+### CHEAP-FIX ORACLE — pre-size the output buf (kill the grow-realloc storm) = GATED BYTE-EXACT WIN
+Built /root/bin/gzippy-bigreserve (native, std-Vec; gz-fullrewrite + RESERVE_CLAMP 16→96 MiB
+and estimate multiplier 8→16 at chunk_decode.rs:1408/1411 + 1853/1856; src REVERTED after build;
+NB sed also hit absolute_bit_pos:2555 mul(8)→16 — REVERTED before build, would corrupt bits).
+DIRECT faults+cyc/B (perf -r 11, cpu4, /dev/null, sha-OK):
+| corpus  | bin        | faults | cyc/B  |
+|---------|------------|--------|--------|
+| silesia | new-native | 24016  | 5.939  |
+| silesia | bigreserve | 21855  | 5.869  |
+| nasa    | new-native | 54020  | 3.404  |
+| nasa    | bigreserve | 41724  | 2.860  |
+INTERLEAVED PAIRED N=15 (A=new-native, B=bigreserve), GATE-0 PASS (sha_B SHA_OK, entries=24127
+KERN_OK, non-inert), self-test PASS, GHz<0.3%:
+| corpus  | medΔ cyc/B (B−A)      | 95%CI               | Wilcox p  | verdict        |
+|---------|----------------------|---------------------|-----------|----------------|
+| silesia | -0.0768 (-1.29%)     | [-0.108,-0.060]     | 0.0016    | SIGNIF-faster  |
+| nasa    | **-0.533 (-15.9%)**  | [-0.578,-0.524]     | 0.0007    | SIGNIF-faster  |
+WALL best-of-9 (sha-OK), does the cyc/B win reach the wall in a real sink? YES:
+| corpus  | sink      | new-native | bigreserve | Δ      | igzip  | gz-vs-igzip after fix |
+|---------|-----------|------------|------------|--------|--------|-----------------------|
+| silesia | /dev/null | 0.910s     | 0.897s     | -1.4%  | 0.676  | +33%                  |
+| silesia | tmpfs     | 1.047s     | 1.034s     | -1.3%  | 0.802  | +29%                  |
+| nasa    | /dev/null | 0.502s     | 0.422s     | -15.9% | 0.237  | +78% (was +112%)      |
+| nasa    | tmpfs     | 0.631s     | 0.555s     | -12.0% | 0.353  | +57%                  |
+(No disk sink: root fs 97% full; tmpfs is the real-file sink. AMD owed.)
+
+### VERDICT (this turn) — CHEAP-FIX, not a port (gated-HYPOTHESIS, Intel-only NOT-YET-LAW)
+- The materialization gap is REAL but its LARGEST removable T1 component is NOT "stream through
+  a reused buffer" (igzip-arch/R3) — it is the GROW-REALLOC STORM of the per-chunk output buf,
+  removable by a BYTE-EXACT one-path capacity-hint change (no new code path, no architecture).
+- CHEAP FIX (recommend implement, refined): size reserve_clean from the config's
+  `expansion_ratio_ceil` (already computed, sm_driver.rs:139-149) instead of compressed*8 clamped
+  16 MiB — so high-ratio chunks (nasa ~10x) reserve their full decoded size ONCE. The oracle used
+  a blind 16x/96 MiB (over-reserves virtual mem) → DO NOT ship blind; the ratio-based version
+  gives the SAME grow-elimination without the over-reserve. OWED before shipping: T4/T8 RSS +
+  wall check (over-reserve × in-flight chunks) and AMD/Zen2 replication.
+- The RESIDUAL after the cheap fix (nasa still +57-78%, silesia +29-33%) = first-touch faults of
+  the ACTUAL decoded output (igzip's 666-fault reused-window streaming) + the kernel per-iteration
+  gap. THAT is the R3 architecture territory — but it is now SMALLER, and the cheap fix should land
+  first. recoverable-by-cheap-fix BOUNDED = nasa 0.53 cyc/B / -12% to-file wall (gated this turn).
+RE-VERIFY cheap fix: `BIN_A=/root/bin/gzippy-new-native BIN_B=/root/bin/gzippy-bigreserve PIN=4
+  REPS=15 CORPORA="silesia nasa" SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash
+  /root/distpreload-harness/_distpreload_paired_guest.sh`; wall: `N=9 bash /root/_wall_sink_guest.sh`
 RE-VERIFY warm oracle: `REPS=11 CORPORA="silesia nasa" bash /root/_warmdst_oracle_guest.sh`
 RE-VERIFY fault stacks: `env GZIPPY_FORCE_PARALLEL_SM=1 taskset -c 4 perf record -e page-faults
   -g --call-graph dwarf,8192 -o /tmp/pf.data -- taskset -c 4 /tmp/symtarget/release/gzippy
