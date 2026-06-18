@@ -1,5 +1,73 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== MATERIALIZATION-RECONCILE SESSION (2026-06-18 night) — RECONCILE + BOUND the scaffold gap ======
+MISSION (this turn): reconcile WHY T1 faults 24k/54k pages if a recycling buffer pool
+exists; build a WORKING warm-output oracle to BOUND recoverable gain; wall in real sink;
+cheap-fix vs port. Guest Intel cpu4 unstressed, /dev/null, perf freq-invariant cyc/B.
+Bins: /root/bin/gzippy-new-native (std-Vec native, sha 891c9925), igzip=/usr/bin/igzip.
+Symboled /tmp/symtarget/release/gzippy (ARENA build — see GATE-0 caveat). SINGLE-ARCH
+Intel = NOT-YET-LAW (AMD owed). T1 single-core.
+
+### TASK 1 — RECONCILE: the exact allocation that faults output pages (READ the path)
+- T1 output is NOT one ISIZE buffer. It is PER-CHUNK contiguous `SegmentedU8.buf` Vecs
+  (4 MiB-compressed chunks → silesia ~17, nasa ~5 chunks). Path: ChunkData.data:SegmentedU8;
+  decode bulk = single `buf` (NOT segmented — `front` list is only for post-decode prepends).
+- buf is pre-reserved to `min(estimate, RESERVE_CLAMP=16 MiB)` at
+  seed_block_for_contig_native (chunk_decode.rs:1849-1859; estimate = compressed*8 + 1 MiB),
+  then GROWN by amortized doubling via `SegmentedU8::contig_decode_window`
+  (segmented_buffer.rs:342-361 → `self.buf.reserve(min_spare)` → grow_amortized).
+- The "recycling chunk-buffer pool" (chunk_buffer_pool::take/return_u8) is OFF BY DEFAULT
+  (`manual_buffer_pool_enabled()` false; return drops the Vec). The slab resident-retention
+  (RpmallocAlloc/SlabAlloc side-table, T<=2 auto-on) only routes `Vec<_,RpmallocAlloc>` —
+  but the NATIVE build (`--features pure-rust-inflate`, NO `arena-allocator`) makes
+  `types::U8 = std::Vec<u8>` (rpmalloc_alloc.rs:1116-1120). So neither pool NOR slab serves
+  the native output buffer → that is why STATE M2's slab/prefault oracles were INERT.
+
+### THE INSTRUMENTED FAULT ATTRIBUTION (perf record -e page-faults -g dwarf, symboled bin) — overturns prior M1
+Dominant fault stack = `contig_decode_window → Vec::reserve → grow_amortized → finish_grow →
+RpmallocAlloc::grow → __memcpy_avx`:
+| corpus  | grow-realloc faults | first-touch decode-write faults (run_contig) |
+|---------|---------------------|----------------------------------------------|
+| nasa    | **68.39%**          | 27.90%                                        |
+| silesia | 11.30%              | 82.64%                                        |
+⇒ MECHANISM (overturns M1 "first-touch each output page once"): nasa expands ~10x (4 MiB
+  comp → ~40 MiB decoded ≫ 16 MiB clamp) → the buf REALLOC-GROWS 16→32→64 MiB during decode;
+  EACH grow (a) faults the new larger alloc AND (b) `__memmove_avx` copies the accumulated
+  output (THE "extra memmove" M3 could not explain = the realloc copy, NOT a double-copy).
+  silesia (~12 MiB decoded < 16 MiB clamp) fits → faults are 82% first-touch decode writes.
+GATE-0 CAVEAT: /tmp/symtarget is an ARENA-allocator build (stack shows RpmallocAlloc/SlabAlloc)
+  ≠ the std-Vec gzippy-new-native I fault-counted. The grow_amortized MECHANISM is identical
+  in both (std RawVec also doubles+copies); the attribution % is from the arena bin. OWED:
+  re-profile faults on a std-Vec symboled bin to confirm the % transfers.
+
+### WARM-REUSE ORACLE (manual LIFO pool, in-tree, NON-INERT) — recycling does NOT recover the gain
+`GZIPPY_MANUAL_BUFFER_POOL=1` retains freed output Vecs (pages resident → warm reuse).
+perf -r 11, cpu4, /dev/null, sha-OK both arms. Non-inert PROVEN: pool u8 hits cold=0 →
+warm=13 (silesia) / 1 (nasa).
+| corpus  | mode | page-faults | cyc/B  | igzip cyc/B (faults 666) |
+|---------|------|-------------|--------|--------------------------|
+| silesia | cold | 24017       | 5.905  | 4.410                    |
+| silesia | warm | 24019       | 5.896  |                          |
+| nasa    | cold | 54021       | 3.395  | 1.592                    |
+| nasa    | warm | 54020       | 3.294 (~3%, only 1 reuse) |             |
+⇒ Recycling the output buffer (manual pool) is INERT on faults (24017→24019) and ~0 on
+  silesia cyc/B. nasa cyc/B moved ~3% but with only 1 of 5 chunks reused (depth-4 pipeline,
+  too few chunks). CONCLUSION: simple buffer recycling is NOT the cheap win — faults are the
+  GROW-REALLOC + first-touch, not removable by retaining the final buffer. (silesia anomaly:
+  13 warm reuses, fits-clamp/no-grow, yet faults flat — pooled-buffer pages not warm on
+  reuse; allocator forensics deferred, the operational verdict stands.)
+
+### NEXT (this session, in progress): the REAL cheap-fix bound = kill the grow-realloc storm
+HYPOTHESIS (unvalidated): pre-size buf from the expansion_ratio_ceil (raise/remove the 16 MiB
+RESERVE_CLAMP at chunk_decode.rs:1853) → ONE alloc per chunk, no grow-double, no O(n) memmove
+→ recovers the nasa 68% grow-fault component. Byte-exact (capacity hint only). The decisive
+oracle: build native with the larger reserve, measure nasa+silesia faults + cyc/B paired.
+STATE chunk_data.rs:308-327 reverted right-sizing DOWN (caused grows); sizing UP is the inverse.
+RE-VERIFY warm oracle: `REPS=11 CORPORA="silesia nasa" bash /root/_warmdst_oracle_guest.sh`
+RE-VERIFY fault stacks: `env GZIPPY_FORCE_PARALLEL_SM=1 taskset -c 4 perf record -e page-faults
+  -g --call-graph dwarf,8192 -o /tmp/pf.data -- taskset -c 4 /tmp/symtarget/release/gzippy
+  -d -c -p1 /root/nasa.gz >/dev/null; perf report -i /tmp/pf.data --stdio -g folded`
+
 ## ====== SCAFFOLD-ARTIFACT SESSION (2026-06-18 late PM) — is the SCAFFOLD gap REAL or a HARNESS/ALLOC ARTIFACT? ======
 MISSION: settle whether the SCAFFOLD gap (output __memmove_avx + first-touch page
 faults + finish_decode) is a real production cost or a fresh-per-run allocation
