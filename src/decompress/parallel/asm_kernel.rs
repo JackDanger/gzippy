@@ -122,10 +122,17 @@
 //! no `sym_count` branch (the old 1-byte lone store / advisor-Q3 special
 //! case is retired — the extra store-buffer width is dominated by the
 //! branch-misprediction it removes). Bytes above `dst` are X3 overshoot,
-//! never read back. Backref (c3): the P3.4 `emit_backref_contig` shape
-//! transliterated (dist ≥ 8 burst-5 + stride-8 words; dist == 1 RLE
-//! broadcast word fill; 2..=7 stride-dist words; `length > 40` prefetch) —
-//! NOT VAR_VIII's byte-copy-all-overlaps D loop (refuted by P3.4's −87 ms).
+//! never read back. Backref copy (igzip-full-rewrite): a faithful 16-byte
+//! MOVDQU port of igzip `large_byte_copy` (603-612) + `small_byte_copy`
+//! (614-627) with `COPY_SIZE == 16` — load 16B from src, `distance >=
+//! min(16, length)` ⇒ large (one-or-more MOVDQU, src += 16/iter); else
+//! grow the period by store+double-distance until >= COPY_SIZE then large.
+//! Output in `[dst, dst+length)` is byte-identical to the scalar
+//! `emit_backref_contig` walk (overshoot above dst is X3). `length > 240`
+//! (mean back-ref len 6.3, so ~never) keeps the proven scalar P3.4 shape
+//! (dist ≥ 8 burst-5 + stride-8 words; dist == 1 RLE broadcast word; 2..=7
+//! stride-dist words; `length > 40` prefetch) so the write extent stays
+//! inside the MAX_RUN_LENGTH+8 ring envelope.
 //!
 //! ## Dispatch policy (charter §4)
 //! Cargo feature `asm-kernel`, x86_64-only call sites; pure-Rust loop ALWAYS
@@ -344,7 +351,9 @@ mod imp {
     ///                     ↔ ref `trailing > 255` arm (EOB/oversize gates,
     ///                       cnt>=2 literal-prefix store, dist single-lookup,
     ///                       validity, X2 restore on bail)
-    ///   copy `52:`-`59:`  ↔ marker_inflate.rs `emit_backref_contig`
+    ///   copy `71:`-`74:`  ↔ igzip large/small_byte_copy (16-byte MOVDQU);
+    ///                       `70:`-`59:` scalar fallback (length > 240)
+    ///                       ↔ marker_inflate.rs `emit_backref_contig`
     ///   REFILL sequence   ↔ consume_first_decode.rs `Bits::refill` fast
     ///                       form (`pos + 8 <= len` structural via
     ///                       IN_MARGIN; `>64` underflow check dead via E2)
@@ -563,9 +572,58 @@ mod imp {
                 "mov {t3:e}, {bitbuf:e}",
                 "and {t3:e}, 0xFFF",
                 "mov {t3:e}, dword ptr [{short_tbl} + {t3}*4]",  // carried preload
-                // ── copy: emit_backref_contig transliterated ────────────
-                //    t1=distance t2=length t4=src {ret}=cursor t5=word
-                //    {t3}=carried entry (LIVE across the copy)
+                // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
+                //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
+                //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
+                //    Faithful igzip mechanism: load 16B from src; if
+                //    `distance >= min(16, length)` the 16-byte window never
+                //    reads an un-finalized byte ⇒ large copy (one-or-more
+                //    MOVDQU, src+=16/iter); else GROW THE PERIOD by storing
+                //    then doubling the distance (small copy) until the period
+                //    >= COPY_SIZE, then fall through to large. The bytes in
+                //    [dst, dst+length) are byte-identical to the scalar
+                //    `emit_backref_contig` walk; bytes above dst are X3
+                //    overshoot (never read back). `length > 240` (vanishingly
+                //    rare — mean back-ref len 6.3) takes the proven scalar
+                //    path so the write extent stays inside the
+                //    MAX_RUN_LENGTH+8 ring envelope: MOVDQU tail overshoot
+                //    <= 15, so dst+240+15 = dst+255 <= cap-12 (the scalar
+                //    path's own bound is dst+264 <= cap-3,
+                //    marker_inflate.rs:2959-2962).
+                "cmp {t2}, 240",
+                "ja 70f",                             // long (rare) → scalar path
+                "lea {ret}, [{dst} + {t2}]",          // ret = end = dst + length
+                "movdqu xmm0, [{t4}]",                // load 16 from src
+                "mov {t5:e}, 16",
+                "cmp {t5}, {t2}",
+                "cmovg {t5}, {t2}",                   // t5 = min(16, length)
+                "cmp {t1}, {t5}",
+                "jb 72f",                             // distance < min → overlap (small)
+                "71:",                                // large_byte_copy (igzip 603-612)
+                "movdqu [{t4} + {t1}], xmm0",         // store 16 at src+distance (= dst run)
+                "sub {t2}, 16",
+                "jle 74f",
+                "add {t4}, 16",
+                "movdqu xmm0, [{t4}]",
+                "jmp 71b",
+                "72:",                                // small_byte_copy_pre (igzip 614-616)
+                "add {t2}, {t1}",                     // repeat_length += distance
+                "73:",                                // small_byte_copy (igzip 617-623)
+                "movdqu [{t4} + {t1}], xmm0",
+                "shl {t1}, 1",                        // distance *= 2 (grow the period)
+                "movdqu xmm0, [{t4}]",
+                "cmp {t1}, 16",
+                "jl 73b",
+                "sub {t2}, {t1}",                     // repeat_length -= distance
+                "jg 71b",                             // remainder (> 0) → large
+                "74:",
+                "mov {dst}, {ret}",                   // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                // ── scalar fallback (length > 240): emit_backref_contig
+                //    transliterated. t1=distance t2=length t4=src {ret}=cursor
+                //    t5=word {t3}=carried entry (LIVE across the copy)
+                "70:",
                 "mov {ret}, {dst}",
                 "cmp {t2}, 40",
                 "jbe 52f",
@@ -671,6 +729,7 @@ mod imp {
                 t3 = out(reg) _,
                 t4 = out(reg) _,
                 t5 = out(reg) _,
+                out("xmm0") _, // MOVDQU back-ref copy scratch (16-byte SIMD)
                 options(nostack),
             );
         }
