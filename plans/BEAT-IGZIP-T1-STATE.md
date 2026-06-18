@@ -17,6 +17,88 @@ The night3 resident-pool determination (section immediately below) OVER-STATED. 
     in-flight / recycle-deferral depth (the pipeline holds 4 concurrently-live ChunkData at T1 for
     ZERO parallelism benefit). The night4 session below TESTS it.
 
+## ====== T1-INFLIGHT-DEPTH SESSION (2026-06-18 night4) — DETERMINATION = T1 in-flight depth IS A REAL byte-exact lever; SHIPPED thread-gated (depth 4→1 at T1). REFUTES night3 "faults are slack / near-floor". (gated, byte-exact, Intel-only NOT-YET-LAW) ======
+MISSION: test the untested lever — the pipeline holds 4 concurrently-live ChunkData at T1
+for ZERO parallelism benefit; does shrinking it cut faults+working-set and feed the kernel?
+
+### MECHANISM LOCATED (file:line) — the "depth 4" is NOT prefetch
+- At T1 prefetch is FULLY DISABLED: `thread_pool_saturated()` = `prefetching_len()+1 >= parallelization(=1)`
+  is ALWAYS true → `prefetch_new_blocks` returns 0 (block_fetcher.rs:724-742). VERBOSE confirms:
+  Prefetched=0, On-demand=17, dispatch called=17 saturated=17. Pool runs INLINE (pool_threads=0,
+  chunk_fetcher.rs:652) at T1.
+- The "Max concurrently-live ChunkData (in-flight depth): 4" (chunk_data.rs:1561 MAX_LIVE_CHUNKS,
+  printed chunk_fetcher.rs:932) at T1 = 1 chunk being written + 1 lone Ready HELD (drain only when
+  pending.len()>=2, chunk_fetcher.rs drain_ready_pending_heads) + 2 in the RECYCLE deferral
+  (`defer_chunk_recycle` const DEPTH=2, chunk_fetcher.rs ~3923). Each holds a 12-MiB(sil)/40-MiB(nasa)
+  output buffer. The defer-2 + lone-hold exists for a T>1 CORRECTNESS race (consumer_loop:1238-1242
+  "byte diff at chunk 4 boundary when lone emit races worker fill") — at T1 (inline, no workers) it is
+  pure overhead.
+
+### THE DIFF (commit 68fdbda5 on perf/igzip-full-rewrite) — ONE production path, thread-gated
+`RecycleDeferral` struct (chunk_fetcher.rs) carries {queue, depth, drain_lone} derived from pool_size:
+  pool_size==1 → depth 0 + drain_lone (T1 win); else → depth 2 + hold-lone (unchanged T>1 correctness).
+Sweep env overrides kept (GZIPPY_RECYCLE_DEFER_DEPTH, GZIPPY_DRAIN_LONE) for measurement; OFF==identity.
+
+### GATE 0 — non-inert + byte-exact (PASS). Sweep binary /root/bin/gzippy-depthknob (sha 19308adf, from
+7065e1e8+knob). MAX_LIVE responds cleanly: d4→4, d3(drain_lone)→3, d2(drain_lone+defer1)→2, d1(drain_lone
++defer0)→1. ALL arms sha==zcat==igzip on silesia+nasa at T1. Production binary /root/bin/gzippy-t1prod
+(sha 261f1ebf, thread-gated, NO env): T1 MAX_LIVE=1 AUTO, sha-exact T1/T4/T8 both corpora.
+
+### GATE 1+2 — T1 cyc/byte + faults (paired N=11 INTERLEAVED, perf cpu_core/cycles, pin cpu4, /dev/null)
+| corpus  | arm | medcyc/B | Δ vs d4 (cyc/B)        | 95%CI            | Wilcox p | meanfaults | Δfaults |
+|---------|-----|----------|-----------------------|------------------|----------|------------|---------|
+| nasa    | d4  | 2.940    | —                     | —                | —        | 41666      | —       |
+| nasa    | d2  | 2.465    | -0.441 (-14.98%)      | [-0.483,-0.423]  | 0.0033   | 21390      | -49%    |
+| nasa    | d1  | 2.247    | **-0.672 (-22.86%)**  | [-0.692,-0.648]  | 0.0033   | 11265      | **-73%**|
+| silesia | d4  | 5.993    | —                     | —                | —        | 23939      | —       |
+| silesia | d2  | 5.861    | -0.151 (-2.52%)       | [-0.169,-0.111]  | 0.0033   | 16917      | -29%    |
+| silesia | d1  | 5.870    | **-0.192 (-3.20%)**   | [-0.247,-0.114]  | 0.0044   | 13795      | **-42%**|
+⇒ depth-1 SIGNIF-faster cyc/B on BOTH corpora (CI excl 0, p<0.005), monotonic d1>d2>d4. NOT slack.
+
+### WALL (best-of-9, sha-verified) + RSS (min-of-5, maxRSS kB), T1, pin cpu4
+| corpus  | arm | wall /dev/null | wall tmpfs | RSS kB  | igzip /dev/null |
+|---------|-----|----------------|------------|---------|-----------------|
+| silesia | d4  | 0.91           | 1.01       | 148668  | 0.66            |
+| silesia | d1  | 0.87 (-4.4%)   | 0.98       | 104272 (-30%) |           |
+| nasa    | d4  | 0.42           | 0.53       | 188476  | 0.23            |
+| nasa    | d1  | 0.33 (-21.4%)  | 0.43 (-19%)| 67020 (-64%)  |           |
+⇒ depth-1 cuts WALL (both sinks) AND RSS. The prompt's "lower depth → lower RSS" is CONFIRMED
+  (night3's resident-pool RAISED RSS because it forced over-reserve residency; SHRINKING the live
+  set LOWERS it). New gap to igzip T1: silesia +31.8% (was +32%, kernel-bound, depth doesn't move it);
+  nasa +43.5% (was +84% night2 — depth-1 closed a big slice).
+
+### T>1 GUARD (best-of-9 wall + RSS min-of-5; prod no-env vs ratioB; and global-d1 to prove the gate)
+- prod(no-env) T4/T8 == ratioB (identity): silesia T4 0.46/0.46, T8 0.32/0.33; nasa T4 0.32/0.33,
+  T8 0.19/0.19; RSS within noise. NO T>1 regression (OFF==identity by construction).
+- **global-depth-1 at T>1 CORRUPTS silesia (sha FAIL at T4/T8)** — proves depth-1 is correctness-
+  UNSAFE at T>1 (early recycle races worker fill) ⇒ the pool_size==1 GATE is mandatory.
+
+### PROD CONFIRM (thread-gated binary gzippy-t1prod, NO env): T1 silesia 0.87 vs ratioB 0.90
+(RSS 104k vs 149k), nasa 0.32 vs 0.42 (RSS 67k vs 188k); T>1 identity (T4/T8 walls+RSS == ratioB).
+BYTE-EXACT BREADTH: sha==zcat at T1/T4/T8 on silesia, nasa, monorepo, squishy.
+
+### DETERMINATION: **T1 in-flight depth IS a real, byte-exact, gated lever — SHIPPED (KEPT).**
+1. Shrinking T1 live-ChunkData 4→1 (thread-gated) is SIGNIF-faster cyc/B (nasa -22.9%, silesia -3.2%,
+   both p<0.005), faster wall (nasa -21%, silesia -4.4%), lower faults (-73%/-42%) AND lower RSS
+   (-64%/-30%), byte-exact at every T. T>1 untouched (identity). KEPT, pushed.
+2. This REFUTES the night3 over-claim that T1 output faults are "slack / near-floor / exhausted":
+   the wall DID move with the working set. The lever was the in-flight DEPTH, which the resident-pool
+   oracle conflated with a fixed-reserve RSS-inflating mechanism.
+3. RESIDUAL gap to igzip T1 AFTER this fix: silesia +31.8% (kernel-bound — depth-invariant), nasa
+   +43.5%. The silesia residual is the diffuse inner-kernel (~0.9 cyc/B) — the next lever is the
+   KERNEL, not the output path. nasa still has fault headroom (11265 vs igzip 666).
+RE-VERIFY: depth sweep `bash /tmp/depth_perf.sh` (+ `python3 /tmp/paired_analyze.py /tmp/depth_perf.csv`),
+  wall/RSS `bash /tmp/depth_wall.sh`, T>1 `bash /tmp/depth_tn.sh`, prod `bash /tmp/prod_verify.sh`.
+  Binaries: gzippy-depthknob (sweep, 19308adf), gzippy-t1prod (thread-gated prod, 261f1ebf).
+BOX CLEAN: powersave, no persistent pinning (taskset per-cmd), /tmp scratch, root-disk untouched
+  (built on /dev/shm CARGO_TARGET_DIR). NO main push, NO reimplement-isa-l push.
+
+### NEXT
+- AMD/Zen2 replication of this T1-depth fix owed before LAW (Intel LXC single-arch).
+- The silesia residual is KERNEL-bound (depth-invariant +31.8%); the next T1 lever is the inner
+  Huffman kernel (~0.9 cyc/B diffuse), NOT the output/scaffold path. nasa retains fault headroom.
+- Consider: does drain-lone alone (without defer-0) carry T>1 risk? Not isolated here (gated to T1).
+
 ## ====== UNIFIED-T1-DETERMINATION SESSION (2026-06-18 night3) — resident-output-pool: DETERMINATION = NOT FEASIBLE as a unified path; igzip-T1 needs a dedicated streaming path. (gated, byte-exact, Intel-only NOT-YET-LAW) ======
 USER QUESTION: "Is there a way to achieve igzip-like T1 speeds using code that MAINTAINS
 rapidgzip T>1 parity? If yes → do it; if not → dedicated pure-Rust T1 path."
