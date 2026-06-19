@@ -636,10 +636,18 @@ mod imp {
                 //    bail un-consume (tag at `80:` → reconstruct at `85:`). ──
                 "58:",
                 "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
+                // FLOOR ORACLE (NIGHT16): subtable leaf re-enters here (the
+                // inline subtable decode at 91: loads the leaf into {t1} and
+                // jumps back to 94b). On a leaf the two tests below are
+                // harmless: a valid leaf is nonzero (raw0 test falls through)
+                // and bit14 (0x4000) is always 0 for a distance entry (the
+                // distance base occupies bits 16-30, codeword_bits bits 8-11),
+                // so it falls straight into the normal in-register entry decode.
+                "94:",
                 "test {t1:e}, {t1:e}",
-                "jz 90f",                             // raw == 0 (hole/code 30/31) → restore (tag 5)
+                "jz 90f",                             // raw == 0 (hole/code 30/31) → bail (tag 5)
                 "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
-                "jnz 91f",                            // subtable dist → restore (tag 6)
+                "jnz 91f",                            // subtable dist → INLINE decode at 91:
                 "mov {t3}, {bitbuf}",                 // saved_bitbuf
                 "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry: >>= raw as u8 (= total_bits <= 31)
                 "mov {t4:e}, {t1:e}",
@@ -827,9 +835,31 @@ mod imp {
                 "90:",
                 "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
                 "jmp 85f",
+                // FLOOR ORACLE (NIGHT16): INLINE subtable-dist (igzip
+                // decode_next_dist long path, igzip_decode_block_stateless.asm
+                // macro 396-440; mirror of production careful path
+                // marker_inflate.rs:3447-3449 `if is_subtable_ptr { consume(9);
+                // lookup_subtable_direct }`). At 91:: {dpre}=={t1}=subtable
+                // pointer entry, {t2}=length (PRESERVE), bitbuf/bitsleft are
+                // post-litlen+refill, t3/t4 free. Consume the 9 main DistTable
+                // bits, index the subtable, load the leaf into {t1}, re-enter
+                // 94b — where the leaf's total_bits/codeword_bits (= len-9 +
+                // extra, relative to the post-9-consume bitbuf, since the
+                // builder stores subtable_len = len-table_bits) are decoded by
+                // the unchanged in-register entry path. Byte-exact (ref lockstep
+                // in run_contig_ref_biased).
                 "91:",
-                "mov {ret}, 6",                       // RECLASS subtable-dist (removable)
-                "jmp 85f",
+                "shr {bitbuf}, 9",                    // consume DistTable::TABLE_BITS=9
+                "sub {bitsleft}, 9",
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 8",
+                "and {t3:e}, 0xF",                    // subtable_bits (DistEntry bits 11-8)
+                "bzhi {t4}, {bitbuf}, {t3}",          // idx = bitbuf & ((1<<sb)-1)   (sb<=6)
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 16",                     // subtable_start (DistEntry bits 31-16)
+                "add {t4:e}, {t3:e}",
+                "mov {t1:e}, dword ptr [{dtbl} + {t4}*4]",   // leaf entry
+                "jmp 94b",
                 "92:",
                 "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
                 "jmp 85f",
@@ -1068,8 +1098,20 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         // decode_len_dist: dst = base+cnt → copy start base+cnt-1 (asm `dec`).
         *dst -= 1;
         let length = trailing as usize - 254;
-        let e = dist.lookup(lb.bitbuf);
-        let bail = if e.raw() == 0 || e.is_subtable_ptr() {
+        // FLOOR ORACLE (NIGHT16): inline subtable-dist in lockstep with the asm
+        // 91:→94b path (mirror of careful path marker_inflate.rs:3447-3449).
+        // After consuming the 9 main DistTable bits, the leaf entry's
+        // total_bits/codeword_bits are relative to the post-9-consume bitbuf, so
+        // `decode_distance(saved=post-9 bitbuf)` and `consume_entry(leaf.raw())`
+        // reproduce the asm exactly. raw==0 (hole/codes 30,31) still bails.
+        let e0 = dist.lookup(lb.bitbuf);
+        let e = if e0.is_subtable_ptr() {
+            lb.consume(crate::decompress::inflate::libdeflate_entry::DistTable::TABLE_BITS as u32);
+            dist.lookup_subtable_direct(e0, lb.bitbuf)
+        } else {
+            e0
+        };
+        let bail = if e.raw() == 0 {
             true
         } else {
             let saved = lb.bitbuf;
