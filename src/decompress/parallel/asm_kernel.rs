@@ -162,6 +162,18 @@ pub const EXIT_RECLASS_EOB: u64 = 2; // lone EOB packet
 pub const EXIT_RECLASS_MULTI_TRAIL: u64 = 3; // multi-literal packet with trailing non-literal
 pub const EXIT_RECLASS_DIST: u64 = 4; // backref arm dist-side bail (subtable/raw0/validity)
 
+// NIGHT15 DECOMPOSITION INSTRUMENT (byte-transparent; the caller collapses every
+// non-BOUNDARY exit to EXIT_RECLASS, so these sub-tags change ONLY which stat
+// counter increments — Rust handling + the 85: re-read reconstruct are identical
+// for all of them). They split the lumped EXIT_RECLASS_DIST (reclass_dist=6410 on
+// silesia, NIGHT14) into its four mutually-exclusive causes to TEST the task's
+// load-bearing premise that subtable-dist DOMINATES (vs the out-of-scope
+// window-absent marker case `src < out_base`, which keeps the D-1 anchor alive).
+pub const EXIT_RECLASS_RAW0: u64 = 5; // dist entry raw==0 (hole / code 30,31 — invalid)
+pub const EXIT_RECLASS_SUBTABLE: u64 = 6; // dist subtable pointer (the removable bucket)
+pub const EXIT_RECLASS_BADDIST: u64 = 7; // distance==0 or >MAX_WINDOW (invalid)
+pub const EXIT_RECLASS_MARKER: u64 = 8; // src<out_base (window-absent backref — OUT OF SCOPE)
+
 /// The single dispatch predicate for the knob-exclusion rule (charter §3.5)
 /// — pure so it is unit-testable. `enabled()` (env + CPU) is checked
 /// separately by the call site; this covers the per-call state.
@@ -277,6 +289,11 @@ mod imp {
     pub static KERN_RECLASS_EOB: AtomicU64 = AtomicU64::new(0);
     pub static KERN_RECLASS_MULTI_TRAIL: AtomicU64 = AtomicU64::new(0);
     pub static KERN_RECLASS_DIST: AtomicU64 = AtomicU64::new(0);
+    // NIGHT15 decomposition of KERN_RECLASS_DIST (byte-transparent stat split).
+    pub static KERN_RECLASS_RAW0: AtomicU64 = AtomicU64::new(0);
+    pub static KERN_RECLASS_SUBTABLE: AtomicU64 = AtomicU64::new(0);
+    pub static KERN_RECLASS_BADDIST: AtomicU64 = AtomicU64::new(0);
+    pub static KERN_RECLASS_MARKER: AtomicU64 = AtomicU64::new(0);
 
     /// Flip-precondition 3 (the permanent ON-vs-OFF fuzz net): in-process
     /// dispatch override. The env kill-switch is a process-wide OnceLock
@@ -620,9 +637,9 @@ mod imp {
                 "58:",
                 "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
                 "test {t1:e}, {t1:e}",
-                "jz 80f",                             // raw == 0 (hole/code 30/31) → restore
+                "jz 90f",                             // raw == 0 (hole/code 30/31) → restore (tag 5)
                 "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
-                "jnz 80f",                            // subtable dist → restore
+                "jnz 91f",                            // subtable dist → restore (tag 6)
                 "mov {t3}, {bitbuf}",                 // saved_bitbuf
                 "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry: >>= raw as u8 (= total_bits <= 31)
                 "mov {t4:e}, {t1:e}",
@@ -635,13 +652,13 @@ mod imp {
                 "shrx {t3}, {t3}, {t4}",              // extra value
                 "shr {t1:e}, 16",                     // distance base
                 "add {t1:e}, {t3:e}",                 // distance
-                "jz 80f",                             // distance == 0 → restore
+                "jz 92f",                             // distance == 0 → restore (tag 7)
                 "cmp {t1:e}, 32768",
-                "ja 80f",                             // > MAX_WINDOW_SIZE → restore
+                "ja 92f",                             // > MAX_WINDOW_SIZE → restore (tag 7)
                 "mov {t4}, {dst}",
                 "sub {t4}, {t1}",                     // src = dst - distance
                 "cmp {t4}, qword ptr [{ctx} + 24]",
-                "jb 80f",                             // src < out_base ⇔ distance > *pos → restore
+                "jb 93f",                             // src < out_base ⇔ distance > *pos → restore (tag 8, marker)
                 // X1 pre-copy `< 48` refill (production refills BEFORE the
                 // copy — P3.5 c1; the carried gather below is pure).
                 "cmp {bitsleft}, 48",
@@ -804,8 +821,20 @@ mod imp {
                 //    lockstep; the caller only re-runs decode_prefilled(&lb),
                 //    never inspecting the cursor shape. igzip has no counterpart
                 //    (stateless — it never un-consumes).
-                "80:",
-                "mov {ret}, 4",                       // RECLASS, dist-bail tag
+                // NIGHT15 decomposed dist-bail labels (replace the lumped 80:).
+                // All reconstruct identically at 85: (re-read from p0, dst=d0);
+                // the only difference is the stat tag in {ret}. Byte-transparent.
+                "90:",
+                "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
+                "jmp 85f",
+                "91:",
+                "mov {ret}, 6",                       // RECLASS subtable-dist (removable)
+                "jmp 85f",
+                "92:",
+                "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
+                "jmp 85f",
+                "93:",
+                "mov {ret}, 8",                       // RECLASS marker (src<out_base; out of scope)
                 "jmp 85f",
                 "82:",
                 "mov {ret}, 2",                       // RECLASS, lone-EOB tag
@@ -872,6 +901,10 @@ mod imp {
             super::EXIT_RECLASS_EOB => &KERN_RECLASS_EOB,
             super::EXIT_RECLASS_MULTI_TRAIL => &KERN_RECLASS_MULTI_TRAIL,
             super::EXIT_RECLASS_DIST => &KERN_RECLASS_DIST,
+            super::EXIT_RECLASS_RAW0 => &KERN_RECLASS_RAW0,
+            super::EXIT_RECLASS_SUBTABLE => &KERN_RECLASS_SUBTABLE,
+            super::EXIT_RECLASS_BADDIST => &KERN_RECLASS_BADDIST,
+            super::EXIT_RECLASS_MARKER => &KERN_RECLASS_MARKER,
             _ => &KERN_EXIT_RECLASS,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -882,7 +915,7 @@ mod imp {
             return;
         }
         eprintln!(
-            "[asm-kernel:c] enabled={} entries={} exit_boundary={} exit_reclass={} reclass_eob={} reclass_multi_trail={} reclass_dist={} asm_bytes={}",
+            "[asm-kernel:c] enabled={} entries={} exit_boundary={} exit_reclass={} reclass_eob={} reclass_multi_trail={} reclass_dist={} reclass_raw0={} reclass_subtable={} reclass_baddist={} reclass_marker={} asm_bytes={}",
             enabled(),
             KERN_ENTRIES.load(Ordering::Relaxed),
             KERN_EXIT_BOUNDARY.load(Ordering::Relaxed),
@@ -890,6 +923,10 @@ mod imp {
             KERN_RECLASS_EOB.load(Ordering::Relaxed),
             KERN_RECLASS_MULTI_TRAIL.load(Ordering::Relaxed),
             KERN_RECLASS_DIST.load(Ordering::Relaxed),
+            KERN_RECLASS_RAW0.load(Ordering::Relaxed),
+            KERN_RECLASS_SUBTABLE.load(Ordering::Relaxed),
+            KERN_RECLASS_BADDIST.load(Ordering::Relaxed),
+            KERN_RECLASS_MARKER.load(Ordering::Relaxed),
             KERN_ASM_BYTES.load(Ordering::Relaxed),
         );
     }
