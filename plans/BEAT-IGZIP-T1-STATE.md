@@ -1,5 +1,75 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT21 (2026-06-19, branch kernel-converge-A @5c5ba052, base 621e95fe=NIGHT20) — ELEMENT A (igzip SINGLE-STATE-BASE register discipline) IMPLEMENTED + builds BOTH flavors on guest (Intel-LXC) + BYTE-EXACT at the differential gate + TRI-corpus sha-identity. NOT yet FF'd to kernel-converge-faithful (full lib suite + 60k prop + PERF owed). Intel-LXC, NOT-YET-LAW. ======
+
+### WHAT SHIPPED (commit 5c5ba052 on origin/kernel-converge-A — WIP, NOT on faithful)
+THE STRUCTURE (igzip `igzip_decode_block_stateless.asm` ONE `state` base in r11;
+tables `[state+_lit_huff_code+...]`/`[state+_dist_huff_code+...]`; struct
+`igzip_lib.h:515-524`): co-located the litlen LUT + the contig-loop dist table
+INLINE in ONE boxed `AsmState`, so the asm addresses BOTH off the single `{ctx}`
+base — `[{ctx}+{idx}*4+{lit_off}]` / `[{ctx}+{idx}*4+{dist_off}]` (const operands
+from nested `offset_of!`) — instead of the two pinned base regs `{short_tbl}`+
+`{dtbl}`. The 2 freed GP regs carry the iteration-top `p0`/`d0` un-consume anchor
+IN-REGISTER; the 2 per-iteration anchor STORES (former `mov [ctx+56],p0` /
+`mov [ctx+64],dst`) are DELETED (D-1 ledger). Because the anchor stores are gone,
+the asm is now READ-ONLY on ctx → `run_contig` takes `&AsmState` (shared), which
+removed all borrow-checker conflict in the careful loop.
+FILES:
+  * `lut_huffman.rs`: `LutLitLenCode.table` UN-BOXED (inline `InflateHuffCodeLarge`),
+    `#[repr(C)]`, `table` first (offset 0).
+  * `libdeflate_entry.rs`: `DistTable.entries` `Vec`→inline `[DistEntry; DIST_CAP=2560]`
+    (512 main + 64×32 subtable worst case), `#[repr(C)]`, entries first; `rebuild`
+    fills in place + returns bool (fails if needed>cap); `new_empty()`. ZERO-COPY.
+  * `asm_kernel.rs`: `KernCtx`→`AsmState` {in_ptr,in_lim,out_lim,out_base (hdr +0..32),
+    lut_litlen (inline, short at +32), dist (inline)}; `ASM_LIT_SHORT_OFF`(==32)/
+    `ASM_LIT_LONG_OFF`/`ASM_DIST_OFF` via nested offset_of! const-asserts + asm const
+    operands; asm table loads → single-base; anchor→{p0}/{d0} regs; 85: reads regs;
+    long path `lea {ctx}+{llong_off}`. Operand budget 15 (=15−short_tbl−dtbl+p0+d0).
+    4 differential-test ctors rebuilt to share inline storage asm↔ref.
+  * `marker_inflate.rs`: Block `lut_litlen`+`dist_table:Option` → `asm:Box<AsmState>` +
+    `dist_valid:bool`; `ensure_dist_table` builds in place (fixed+dynamic UNIFIED into
+    self.asm.dist; process-wide `fixed_dist_table()` static REMOVED — the asm reads
+    ONLY the single ctx base); per-call header set on self.asm; careful loop + marker
+    loop use shared `&self.asm` borrows.
+
+### GATE STATUS (Intel-LXC guest, GATE-0; NOT-YET-LAW)
+PASS:
+  * BUILD both flavors EXIT=0 (native pure-rust-inflate + gzippy-isal) — proves the
+    asm REGISTER-ALLOC FIT (15 operands) and the const-operand single-base addressing
+    ASSEMBLES on real x86_64 (the two unknowns the Mac `cargo check` could not test).
+  * asm-vs-ref DIFFERENTIAL: c1_seam + c2 (random streams ×3 tables) + c3 (windowed
+    backrefs ×5 pairs) + positive_control(consume off-by-one trips) ALL PASS — proves
+    asm==ref bit-for-bit (exit, full cursor pos/bitbuf/bitsleft, dst advance, every
+    output byte) over thousands of trials with the single-base addressing + in-reg
+    anchor.
+  * dist_table_rebuild_matches_fresh_build PASS — the inline-array rebuild is identical
+    to a fresh build. no_build_time_trailing_class_flag PASS.
+  * TRI-corpus sha-identity vs zcat: silesia/nasa/monorepo × T1/T4/T8 × BOTH flavors
+    (native + isal) ALL OK (18 cells). Production path (GZIPPY_FORCE_PARALLEL_SM=1).
+OWED (do NOT FF to kernel-converge-faithful until cleared):
+  * full `cargo test --release --lib` BOTH flavors 0-failed (running serialized this
+    session; result pending — was OWED since NIGHT19/20 too).
+  * 60k prop_structured_roundtrip; squishy/large corpora; explicit quad-oracle
+    (gzip+flate2+libdeflate+igzip) — zcat used this session (gzip/zlib oracle, valid).
+  * PERF (cyc/B·IPC·instr/B vs igzip/OLD/NIGHT19 + T4/T8 wall+RSS) — box loaded
+    (load ~4.5), Gate-0/Gate-1 NOT clean; perf is the open question (NIGHT16 floor said
+    anchor-store removal ≈0 under OLD shape; regime now IPC-parity — MEASURE, do not
+    pre-judge). AMD/Zen2.
+
+### RESUME / DECISION
+Element A is byte-exact at the differential + tri-corpus level and builds both flavors.
+Remaining to FF into kernel-converge-faithful: clear full lib suite + 60k prop on a
+quiet box, then PERF (frozen box) to report whether single-base moved cyc/B. Branch
+discipline HELD: faithful restored to 621e95fe (a transient `-u`-upstream mis-push of
+5c5ba052 onto faithful was force-reverted; WIP preserved on kernel-converge-A; local
+upstream now correctly origin/kernel-converge-A). Guest checkout /root/gzippy @
+kernel-converge-A; builds /dev/shm/kca (native), /dev/shm/kci (isal). MAC LOOP:
+`cargo check --target x86_64-apple-darwin --no-default-features --features
+pure-rust-inflate --lib [--tests]` typechecks the asm region (metadata-only — does NOT
+catch register-alloc/assembler; guest build does). DECISION: gated-HYPOTHESIS for
+supervisor decorrelated review; do NOT self-bless; do NOT FF until the owed gates pass.
+
+
 ## ====== NIGHT20 (2026-06-19, branch kernel-converge-faithful @85e98c9f, base 96d2742b=NIGHT19) — STRUCTURAL CONVERGENCE ELEMENT B DONE + GATED + PUSHED: the dead bit-24 TRAILING_NONLIT_FLAG removed from the litlen table build, converging gz's build on igzip's (igzip's make_inflate_huff_code_lit_len sets NO class flag; runtime `cmp 256` classifies). Element A (single-state-base register discipline) is FULLY DE-RISKED + implementation-ready but NOT yet implemented (it is the NIGHT14 FULL-form multi-file ownership refactor; banked as a precise resume point below, per NIGHT14's "not completable+gateable in one session" + the push-byte-exact-only rule). Intel-LXC byte-exact PASS, NOT-YET-LAW (AMD owed; PERF gate owed — box not frozen this session). ======
 
 ### ELEMENT B — DONE (commit 85e98c9f, pushed origin/kernel-converge-faithful)
