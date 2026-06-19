@@ -1,5 +1,87 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== CHEAP-FAMILY SWEEP SESSION (night7) — input-mmap prefault = NOT a gated win (faults slack); T1 table-build BOUNDED (~5% sil / ~1.7% nasa, dominant litlen-LUT build NOT cheaply reducible); cheap space now mined across ALL families. (gated, byte-exact, Intel-only NOT-YET-LAW) ======
+MISSION (advisor flagged two untested cheap levers in DIFFERENT families before the endgame):
+(1) INPUT-mmap madvise/prefault (distinct fault family from all prior OUTPUT-buffer work);
+(2) T1 Huffman table-build amortization (more 1 MiB chunks). Both TESTED this session.
+HEAD at session = 89dad5c8 (== night6 chunk-size product ca70e9d1). Guest Intel LXC, cpu4, /dev/null.
+
+### TASK 1 — INPUT-mmap prefault = byte-exact + NON-INERT but NOT a gated win (faults are SLACK)
+PRIOR-STATE CORRECTION of the advisor's "no input hint": the PRODUCTION input mmap (io.rs:107-108,
+`decompress_file`) ALREADY carries `Advice::Sequential`. The only untested input levers were the
+STRONGER eager-prefault hints layered on top: MAP_POPULATE and MADV_WILLNEED.
+ORACLE (byte-transparent, OFF==identity): `GZIPPY_INPUT_PREFAULT={populate|willneed}` in io.rs
+(populate = `MmapOptions::populate()` at map time; willneed = `Advice::WillNeed`). Built native on
+/dev/shm, bin `/root/bin/gzippy-prefault` (sha-built 89dad5c8 + oracle; src REVERTED after — NOT
+committed, it is not a win).
+- GATE-0 byte-exact: all modes sha==igzip on silesia+nasa. NON-INERT proven for `populate` only:
+  minor-faults silesia 8039→6997 (-1042 ≈ the 16657 input pages collapsed by fault-around),
+  nasa 3713→3396 (-317). `willneed` is fully INERT (faults identical to default) — MADV_SEQUENTIAL
+  + kernel fault-around already cover it. ⇒ willneed DEAD; populate is the only live arm.
+- GATE-1+2 paired N=15 cyc/B (analyzer /tmp/paired_analyze.py, perf cpu_core, cpu4, /dev/null,
+  SAME bin env-only A=default B=populate):
+  | corpus  | medΔ cyc/B (B−A)   | 95%CI             | Wilcox p | faults A→B   | verdict |
+  |---------|--------------------|-------------------|----------|--------------|---------|
+  | nasa    | -0.0060 (-0.28%)   | [-0.0366,-0.0032] | 0.0409   | 3714→3396    | SUB-GATE (p>0.01) |
+  | silesia | -0.0022 (-0.04%)   | [-0.0280,+0.0055] | 0.1914   | 8039→6998    | TIE     |
+  WALL best-of-9 (both sinks) IDENTICAL to 0.01s: silesia null 0.87/0.87 tmpfs 0.96/0.97; nasa
+  null 0.31/0.31 tmpfs 0.41/0.41.
+- DETERMINATION: input-mmap MAP_POPULATE removes the input minor-faults but does NOT move the wall
+  (silesia TIE p=0.19; nasa -0.28% FAILS the p<0.01 gate; wall flat). **The input faults are SLACK**
+  — consistent with the campaign's output-fault-slack finding; input faults are even cheaper
+  (page-cache-warm + fault-around). NOT KEPT (oracle reverted, not committed). MINED.
+
+### TASK 2 — T1 Huffman table-build BOUNDED (perf -F4000 -g dwarf, symboled /tmp/symtarget, T1)
+PREMISE CORRECTION: chunk size does NOT multiply table builds. Build count == dynamic-BLOCK count
+(set by the encoder), independent of our chunking. So the 1 MiB chunk default did NOT change
+table-build absolute cyc; it is the same fraction it always was. Measured fraction (self+children):
+- silesia ~5% of T1 cyc: read_header(children) 5.70%; build_huffman_luts_for_block 4.83%;
+  LutLitLenCode::rebuild_from 2.96% self (the litlen LUT — DOMINANT); HuffmanCodingShortBitsCached
+  ::initialize_from_lengths 1.64% (dist_hc); precode SymbolsPerLength ~0.25%.
+- nasa ~1.7% of T1 cyc: read_header 1.66%; dist_hc 1.07% (DOMINANT here); litlen LUT 0.60%;
+  DistTable::rebuild 0.49% (the P3.4 amortized path IS firing on nasa). nasa has fewer/larger
+  blocks → table-build amortized over more bytes/block → smaller fraction.
+- NO REDUNDANT builds: build_huffman_luts_for_block (marker_inflate.rs:1163) builds exactly the 3
+  necessary structures per dynamic block (precode, litlen LUT, dist_hc). No dead/duplicate build to
+  delete cheaply.
+- CHEAP-REDUCTION SEARCH: (a) the DOMINANT piece (litlen LUT rebuild_from, 2.96% sil) is reducible
+  ONLY by a faster construction algorithm = an inner-primitive rewrite = Route-1-class, NOT cheap.
+  (b) the ONE cheap byte-exact candidate: `dist_hc` (HuffmanCodingShortBitsCached) is rebuilt EVERY
+  dynamic block in build_huffman_luts_for_block with NO lens-reuse guard — unlike the existing P3.4
+  `DistTable` amortization (dist_table_lens memcmp). A parallel memcmp-skip on dist_hc lens would be
+  cheap + byte-exact (decoder is a pure fn of lens). CEILING ~1.07% (nasa) / ~1.64% (silesia) — but
+  real capture is bounded by the consecutive-block dist-lens REPEAT frequency (partial; unmeasured),
+  and it is a hot-path PER-BLOCK lifecycle edit requiring the full tri-oracle+lib-suite gate.
+- VERDICT: table-build BOUNDED (~5% sil / ~1.7% nasa); no cheap HIGH-value reduction. dist_hc
+  lens-reuse amortization = HYPOTHESIS (unvalidated), ceiling ≤~1.6%, small + uncertain + heavy
+  gate → NOT implemented this turn without R3 (ROI poor, won't move the endgame verdict). RE-OPEN
+  TRIGGER: a future cheap-pass with budget for a lifecycle-gated ≤1.6% lever; measure dist-lens
+  repeat-frequency FIRST (instrument) to size real capture before building.
+  RE-VERIFY: `perf record -F4000 -g --call-graph dwarf,8192 ... /tmp/symtarget/release/gzippy`
+  then `perf report --stdio -g none | grep -iE 'read_header|build_huffman|rebuild_from|initialize_from_lengths'`.
+
+### FINAL SCOREBOARD (unchanged this session — neither task banked) vs igzip T1, paired:
+  silesia +1.24 cyc/B (+28.1%); nasa +0.48 cyc/B (+30.3%). [night6 numbers stand.]
+
+### TASK 3 — ENDGAME R3 (cheap space now mined across ALL families)
+Families tested across the campaign: fault/working-set (depth-1 BANKED, chunk-size BANKED,
+resident-pool DEAD), INPUT (prefault TIE — this session), TABLE-BUILD (bounded, no cheap
+high-value reduction — this session), kernel-primitives (CRC=CLMUL, bit-reader u64, fastloop
+split — mined per advisor), output-streaming (bounded ≤1.5%). The remaining gap is now credibly
+the diffuse inner-Huffman KERNEL — the litlen-LUT build (~3% sil) is itself part of that kernel
+region (a faster table-build construction belongs to the kernel rewrite, not the cheap pass).
+TWO framings for supervisor→user R3:
+ (A) BANK the banked wins (dist-preload, flag-bit, ratio-reserve, T1-depth-1, T1-chunk-size) +
+     ACCEPT the narrowed Intel-HYPOTHESIS gap (silesia +28.1%, nasa +30.3%; from +39.5%/+116.5%).
+     AMD/Zen2 replication owed before LAW. = the advisor's LEAD recommendation (Route 1 ROI poor).
+ (B) FUND Route 1 — inner-Huffman kernel asm-cadence convergence (converge run_contig on igzip's
+     fused consume+refill+dual-preload loop; + a faster litlen-LUT construction). HONEST realistic-
+     capturable estimate: removal-oracle ceiling = +0.908 cyc/B silesia but DIFFUSE across
+     refill/classify/loop-overhead + LUT-build; only a FRACTION is capturable per technique
+     (flag-bit captured ~0.10). Realistic = ~3-6% WALL over MULTIPLE sessions, HIGH byte-exact risk
+     (X1-X5 exit + IN_MARGIN refill contract + run_contig_ref lockstep). Does NOT reach full parity
+     cheaply. (NOT started — R3 gate.)
+
 ## ====== CHUNK-SIZE SESSION (2026-06-19 night6) — DETERMINATION: T1 chunk-size IS a real byte-exact gated lever; SHIPPED thread-gated (1 MiB default at T1). Refutes the night5 "cheap levers exhausted" R3 (3rd premature-closure). Route 2 BOUNDED (corrects night5 over-claim). (gated, byte-exact, Intel-only NOT-YET-LAW) ======
 MISSION (advisor caught the night5 R3 as the 3rd premature "levers exhausted"): two cheap
 things were NOT done before escalating — (1) the CHUNK_SIZE × pool-retain cross at T1
