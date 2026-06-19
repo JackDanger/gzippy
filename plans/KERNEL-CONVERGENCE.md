@@ -78,7 +78,7 @@ tmp4=rdx, rcx = shift count. next_sym lives in a CALLEE-SAVED reg across the who
 | C | speculative store + advance (518-519) | ✅ 8-byte store `entry&0xFFFFFF`, add cnt | 475-476 | none (timing differs, see G) |
 | D | extract trailing sym (520-521) | 🔶 AVOIDED on literal path via flag-bit `test 0x1000000;jnz 49f`; recovered only in cold `49:` | 441-442 / 526-531 | **DECISION POINT (§3.1)** |
 | E | preload index for next litlen (524-525) | ✅ folded into the preload load (`and 0xFFF`) | 471-473 | none |
-| F | REFILL split A/B (528-530, 543-547) | 🔶 CONTIGUOUS block at `6:` (load→shlx→or→63-sub-shr3-add→or56) | 461-469 | **§3.2 split-refill** |
+| F | REFILL split A/B (528-530, 543-547) | ✅ DONE (NIGHT19 @c4ac5acc): `6:` reordered to igzip's exact 524-552 — index PRE-OR into {t4}, OR, litlen-entry load, DEFERRED ptr/len advance, dist preload. GATED win vs pre-reorder (silesia −0.25, nasa −0.04, monorepo −0.05 cyc/B; all IPC, 0 instr change) | `6:` 537-552 | **DONE §3.2** |
 | G | speculative length precompute (533) | ❌ not on literal path (computed in backref arm `31:`) | 571 | tied to §3.1 |
 | H | EOB test (536-537) | 🔶 in the cold non-literal arm `50:` (`cmp 256;je 82f`) | 539-540 | tied to §3.1 |
 | I | preload NEXT litlen entry (540) | ✅ issued early, store hides its latency | 471-473 (lit), 489-491 (long) | none |
@@ -199,10 +199,13 @@ Commit ONLY byte-exact states.
 ---
 
 ## 6. IMPLEMENTATION ORDER (cheapest-isolating first; each its own byte-exact gate)
-1. **§3.1 shape A/B** (late-discriminator full-speculation vs current early-flag-bit) — the
-   core question, isolates with the LEAST other change. Build both byte-exact; paired vs igzip
-   + vs each other. This decides the loop's skeleton before the register rewrite.
-2. **§3.2 split-refill cadence** — on the winning skeleton.
+1. **§3.1 shape A/B** ✅ DONE — the kernel is the late-discriminator full-speculation shape
+   (bb2cff5d: Stage-A subtable-inline + mask-once + full per-iter speculation).
+2. **§3.2 split-refill cadence** ✅ DONE (NIGHT19 @c4ac5acc) — gated win vs pre-reorder on all
+   3 corpora (silesia −0.25 cyc/B etc.), all via IPC (0 instr change). silesia now at IPC
+   parity with igzip (ΔIPC −0.017). The residual gap to igzip is now INSTRUCTION-bound
+   (Δinstr/B +3.03) → NEXT FRONT is the register-discipline/table-format instruction reduction
+   (steps 4+5 below, now PRIORITY).
 3. **§3.3 per-iter dist preload** — coupled to §3.1; corpus-split expected.
 4. **§3.4 register pinning** — last; verify zero hot-loop stack traffic via perf annotate.
 5. **§3.5 litlen-LUT build** — separate, after the loop is at/under igzip.
@@ -290,3 +293,14 @@ choice. (Mission rule: a true divergence is legal when byte-exact + ledgered.)
 - **Gate.** Byte-exact via c1/c2/c3 asm-vs-ref differentials + prop roundtrip + tri-oracle
   sha grid; perf via the paired harness vs igzip / night9(kc) / old(chunkt1). GUEST-OWED
   (status tracked in BEAT-IGZIP-T1-STATE.md).
+
+### D-cadence — cold long-literal bottom `64:` kept CONTIGUOUS (NIGHT19, minor)
+- **What diverges.** NIGHT19 converged the HOT literal bottom (`6:`) to igzip's split-refill
+  schedule (524-552), but left the COLD long-literal bottom `64:` (reached only via the rare
+  long-Huffman-code path at `20:`) as a contiguous refill+preload. So the cold path's cadence
+  still diverges from igzip's.
+- **Why minimal/faithful.** `64:` is off the hot critical path (long codes are rare — silesia
+  long-litlen ≈ a few % of symbols); converging it would not move the wall and only adds risk.
+  Byte-exact either way (same refill, different schedule). Re-open trigger: if a later
+  decomposition shows the long-code path is a measurable cyc/B share, apply the same 524-552
+  reorder to `64:`.
