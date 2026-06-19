@@ -507,27 +507,45 @@ mod imp {
                 //    read_in; sub read_in_length). {t2} = bc.
                 "shrx {bitbuf}, {bitbuf}, {t2}",
                 "sub {bitsleft}, {t2}",
-                // ── REFILL, UNCONDITIONAL every iteration (igzip 528-530 +
-                //    543-547; `or bitsleft,56` exact for bitsleft∈[0,63]). Tops
-                //    bitsleft to ≥56 BEFORE the discriminator so the backref
-                //    dist decode (≤28 bits) is always in budget. {t2} free
-                //    post-consume; {t4} scratch.
+                // ── SPLIT REFILL + SOFTWARE-PIPELINED PRELOAD CADENCE (NIGHT19:
+                //    converge run_contig's per-iteration SCHEDULE on igzip's EXACT
+                //    loop_block straight-line order 524-552 — element F of the
+                //    KERNEL-CONVERGENCE map, the remaining divergence in the
+                //    software-pipelined shape that owns the loop-carried
+                //    dependency chain / hot-loop IPC, NIGHT18). Three coupled
+                //    reorders vs the prior contiguous `6:` block, all byte-exact
+                //    (refill is append-only; ref model is functional, unchanged):
+                //      (1) igzip 524-525: extract the NEXT litlen INDEX from the
+                //          POST-CONSUME bitbuf BEFORE the refill OR, into a
+                //          SEPARATE reg {t4}. The OR sets only bits >= bitsleft,
+                //          and post-consume bitsleft >= 48-21 = 27 > 12, so the
+                //          low-12 index is identical pre-/post-OR; extracting it
+                //          early lets the index compute overlap the OR and widens
+                //          the index→load distance.
+                //      (2) igzip 528-530: refill part A (OR new high bits).
+                //      (3) igzip 540: load the litlen ENTRY from the early index,
+                //          AFTER the OR (load-use distance), into {t1}.
+                //      (4) igzip 543-547: refill part B (next_in/len advance)
+                //          DEFERRED past the litlen load so the loop-carried `pos`
+                //          update overlaps that load-use latency — the crux of
+                //          igzip's pipelining (gz's prior contiguous form
+                //          serialized pos-advance ahead of the preload).
+                //    `or bitsleft,56` exact for bitsleft∈[0,63]; tops bitsleft to
+                //    ≥56 before the discriminator so the backref dist decode
+                //    (≤28 bits) is in budget. {t2} free post-consume; {t4} scratch
+                //    (dead after the trailing shrx @491).
                 "6:",
-                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "mov {t4:e}, {bitbuf:e}",             // (1) igzip 524-525: index PRE-OR
+                "and {t4:e}, 0xFFF",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]", // (2) igzip 528-530: OR
                 "shlx {t2}, {t2}, {bitsleft}",
                 "or {bitbuf}, {t2}",
-                "mov {t4:e}, 63",
+                "mov {t1:e}, dword ptr [{short_tbl} + {t4}*4]", // (3) igzip 540: entry load
+                "mov {t4:e}, 63",                     // (4) igzip 543-547: ptr/len advance DEFERRED
                 "sub {t4}, {bitsleft}",
                 "shr {t4}, 3",
                 "add {pos}, {t4}",
                 "or {bitsleft}, 56",
-                // ── preload NEXT litlen entry (igzip 540), issued EARLY so its
-                //    L1 load-use latency hides behind the dist preload + the
-                //    discriminator. Used by the literal back-edge; the backref
-                //    arm re-preloads post-dist-consume (igzip 580-582).
-                "mov {t1:e}, {bitbuf:e}",
-                "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
                 // ── SPECULATIVE preload of the NEXT dist entry, EVERY iteration
                 //    (igzip 550-552): the dist code follows the just-consumed
                 //    litlen, so its short entry is at the low 9
