@@ -545,8 +545,18 @@ mod imp {
                 //    (≤28 bits) is in budget. {t2} free post-consume; {t4} scratch
                 //    (dead after the trailing shrx @491).
                 "6:",
-                "mov {t4:e}, {bitbuf:e}",             // (1) igzip 524-525: index PRE-OR
-                "and {t4:e}, 0xFFF",
+                // (1) igzip 524-525 EXACT micro-schedule: `mov tmp3, CONST` /
+                //    `and tmp3, read_in`. The mask CONSTANT goes in {t4} FIRST
+                //    (no source dependency → OFF the loop-carried critical path);
+                //    the single `and {t4}, {bitbuf}` is then the ONLY critical-path
+                //    op feeding the entry load. The prior `mov {t4},{bitbuf}` copied
+                //    the just-consumed (loop-carried) bitbuf — an EXTRA dependent op
+                //    on the recurrence shrx→COPY→and→load. AND is commutative so the
+                //    index value (bitbuf & 0xFFF) is byte-identical; pure schedule
+                //    convergence (NIGHT24 located the divergence: objdump c33b5
+                //    `mov %r8d,%r13d` vs igzip's off-path const-mov).
+                "mov {t4:e}, 0xFFF",                  // (1) igzip 524: mask CONST (off critical path)
+                "and {t4:e}, {bitbuf:e}",             //     igzip 525: index = bitbuf & 0xFFF (single crit op)
                 "mov {t2}, qword ptr [{in_ptr} + {pos}]", // (2) igzip 528-530: OR
                 "shlx {t2}, {t2}, {bitsleft}",
                 "or {bitbuf}, {t2}",
@@ -564,8 +574,12 @@ mod imp {
                 //    finds it already in flight (load latency hidden). PURE table
                 //    read — byte-exact (the ref models the same post-consume
                 //    `dist.lookup`).
-                "mov {dpre:e}, {bitbuf:e}",
-                "and {dpre:e}, 0x1FF",
+                // igzip 550-551 EXACT: `mov next_bits2, CONST` / `and next_bits2,
+                //    read_in` — mask CONST off-path, single `and` critical op (same
+                //    convergence as the litlen index above; byte-identical, AND
+                //    commutative).
+                "mov {dpre:e}, 0x1FF",                // igzip 550: mask CONST (off critical path)
+                "and {dpre:e}, {bitbuf:e}",           // igzip 551: dist index = bitbuf & 0x1FF
                 "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 // ── LATE DISCRIMINATOR (igzip 555-556): trailing < 256 ⇒
                 //    literal ⇒ back-edge (the HOT exit); ≥ 256 ⇒ length/EOB ⇒
