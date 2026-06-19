@@ -1,5 +1,36 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== TASK-0 CORRECTNESS GATE (2026-06-18 night5) — OWED depth-change verification: PASS on BOTH flavors ======
+The night4 T1-depth change (commit 68fdbda5, thread-gated RecycleDeferral; touches the
+recycle/drain lifecycle) needed its FULL serialized lib-suite correctness gate, which the
+prior agent built green but LOST by orphaning. Re-run DURABLY this session, SERIALIZED
+(`--test-threads=1`), at HEAD 62b802dc (== 68fdbda5 + this STATE doc), built on /dev/shm
+(root disk was 99% full — would have hung a root-target build per CLAUDE.md):
+
+| flavor (features)        | result                                  | EXIT | routing multithread (deletion-trap/lifecycle) | parallel module |
+|--------------------------|-----------------------------------------|------|-----------------------------------------------|-----------------|
+| native (pure-rust-inflate) | **949 passed; 0 failed; 12 ignored** (282.52s) | 0 | `test_single_member_routing_multithread ... ok` | 359 ok / 4 ignored |
+| isal (gzippy-isal)         | **934 passed; 0 failed; 15 ignored** (246.37s) | 0 | `test_single_member_routing_multithread ... ok` | (all ok)        |
+
+- NO FAILED / NO panicked on either flavor (the only "failed"-substring hit is the PASSING
+  test name `block_fetcher::tests::failed_prefetch_flag_persists ... ok`).
+- The ignored tests are ALL by-design: perf gates that only run on neurotic
+  (`test_single_member_parallel_not_slower_than_sequential`, `..._silesia`, `..._class_not_slower`),
+  slow integration (`drive_round_trips_*`, `drive_silesia_head_gzip9_t2`), fuzz loops
+  (`fuzz_loop_differential`, `three_oracle_extended_fuzz_10k`), microbenches, and diagnostics.
+  NONE are correctness regressions from the depth change.
+- VERDICT: **PASS** — the T1-depth lifecycle change (and the whole banked set on it:
+  dist-preload, flag-bit, ratio-reserve, T1-depth-1) is CORRECTNESS-CONFIRMED on both flavors.
+  Frontier work is unblocked.
+- RE-VERIFY (guest, /dev/shm target, serialized): `cd /root/gz-fullrewrite && RUSTFLAGS="-C
+  target-cpu=native" CARGO_TARGET_DIR=/dev/shm/gz-verify-target cargo test --release
+  --no-default-features --features pure-rust-inflate --lib -- --test-threads=1` (swap
+  `gzippy-isal` for the isal flavor). Durable logs: /tmp/depthverify_{native,isal}.log on guest.
+- BOX HYGIENE NOTE: on arrival the guest had THREE orphaned `cargo test` runs from prior
+  agents still running on the ROOT-disk default target (load 4.4, root 99% full) — killed
+  them (PIDs 335519/2735131/3769312 trees) to stop root-disk-fill + CPU contention; my run
+  was isolated on /dev/shm. No box freeze, no persistent pinning, governor untouched.
+
 ## ====== CORRECTION (2026-06-18 night4, advisor-caught over-claims in the night3 determination below) ======
 The night3 resident-pool determination (section immediately below) OVER-STATED. Corrected wording:
 (a) **"output faults are SLACK" is UNDER-POWERED** — it rested on a −17% fault NUDGE (a slope,
