@@ -596,10 +596,16 @@ pub struct Block {
     /// Tracked back-references (debug instrumentation).
     pub backreferences: Vec<Backreference>,
     track_backreferences: bool,
-    /// Pure-Rust ISA-L LUT tables (byte-matched to igzip; same decode loop
-    /// as the C `IsalLitLenCode` / `IsalDistCode` fields above).
+    /// ELEMENT A (igzip single-state-base): the litlen LUT and the
+    /// contig-loop dist table are CO-LOCATED INLINE in ONE boxed `AsmState`
+    /// (asm_kernel.rs) so the asm addresses both off a single `ctx` base
+    /// (igzip `[state+_lit_huff_code+...]`/`[state+_dist_huff_code+...]`).
+    /// Boxed → stable address → tables built IN PLACE (zero-copy) and read by
+    /// the asm via `[{ctx}+disp+idx*4]`. Was two separate fields
+    /// (`lut_litlen: LutLitLenCode` + `dist_table: Option<DistTable>`).
+    /// `self.asm.lut_litlen` / `self.asm.dist` everywhere they were used.
     #[cfg(pure_inflate_decode)]
-    lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode,
+    asm: Box<crate::decompress::parallel::asm_kernel::AsmState>,
     /// Distance Huffman decoder. Vendor rapidgzip explicitly REJECTED ISA-L
     /// for distance and uses `HuffmanCodingReversedBitsCached` (gzip/deflate.hpp:336;
     /// ISA-L distance commented out :338) — with `Symbol = uint8_t`, a 64 KiB
@@ -626,8 +632,12 @@ pub struct Block {
     /// faithful); byte-exactness: identical symbols => identical
     /// distance/bit-consumption, unassigned/invalid code => raw==0 entry =>
     /// `InvalidHuffmanCode`, exactly `dist_hc`'s `None`.
+    ///
+    /// ELEMENT A: the dist table now lives INLINE in `self.asm.dist` (always
+    /// present); this latch replaces the old `Option::is_some()` "built &
+    /// valid" signal used by the asm-dispatch gate and the contig loop.
     #[cfg(pure_inflate_decode)]
-    dist_table: Option<crate::decompress::inflate::libdeflate_entry::DistTable>,
+    dist_valid: bool,
     /// P3.4 item 1 (DistTable build amortization): the distance code lengths
     /// `dist_table` was last built from (`dist_table_nlens == 0` ⇒ never
     /// built). The table is a pure function of the lens, so when a new
@@ -706,13 +716,20 @@ impl Block {
             track_backreferences: false,
             ring: super::width_ring::WidthRing::new(),
             #[cfg(pure_inflate_decode)]
-            lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode::new_empty(),
+            asm: Box::new(crate::decompress::parallel::asm_kernel::AsmState {
+                in_ptr: 0,
+                in_lim: 0,
+                out_lim: 0,
+                out_base: 0,
+                lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode::new_empty(),
+                dist: crate::decompress::inflate::libdeflate_entry::DistTable::new_empty(),
+            }),
             #[cfg(pure_inflate_decode)]
             dist_hc:
                 crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached::new(
                 ),
             #[cfg(pure_inflate_decode)]
-            dist_table: None,
+            dist_valid: false,
             #[cfg(pure_inflate_decode)]
             dist_table_lens: [0u8; MAX_DISTANCE_SYMBOL_COUNT],
             #[cfg(pure_inflate_decode)]
@@ -752,7 +769,7 @@ impl Block {
         use std::mem::size_of;
         let ring = size_of::<[u16; RING_SIZE]>();
         #[cfg(pure_inflate_decode)]
-        let litlen_lut = self.lut_litlen.heap_bytes();
+        let litlen_lut = self.asm.lut_litlen.heap_bytes();
         #[cfg(not(pure_inflate_decode))]
         let litlen_lut = 0usize;
         #[cfg(pure_inflate_decode)]
@@ -1623,7 +1640,7 @@ impl Block {
     fn lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
         #[cfg(pure_inflate_decode)]
         {
-            self.lut_litlen.rebuild_from(litlen_lens)
+            self.asm.lut_litlen.rebuild_from(litlen_lens)
         }
         #[cfg(not(any(
             all(
@@ -1651,7 +1668,7 @@ impl Block {
     fn lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
         #[cfg(pure_inflate_decode)]
         {
-            let d = self.lut_litlen.decode(bits);
+            let d = self.asm.lut_litlen.decode(bits);
             (d.symbol, d.sym_count, d.bit_count)
         }
         #[cfg(not(any(
@@ -2010,25 +2027,13 @@ impl Block {
             // contig clean loop's call site.
             self.ensure_dist_table();
         }
-        // FixedHuffman + amortization ON ⇒ the process-wide static table,
-        // hoisted here as `&'static` (no `self` borrow held across the
-        // loop). The dynamic-block table is re-borrowed per backref below
-        // (the field-path borrow ends before the `&mut self` sparsity
-        // call, so it cannot be hoisted across the loop body).
-        #[cfg(pure_inflate_decode)]
-        let marker_fixed_tbl: Option<
-            &'static crate::decompress::inflate::libdeflate_entry::DistTable,
-        > = if marker_dist_lut
-            && self.compression_type == CompressionType::FixedHuffman
-            && !dist_amort_disabled()
-        {
-            fixed_dist_table()
-        } else {
-            None
-        };
+        // ELEMENT A: fixed AND dynamic blocks now share the inline
+        // `self.asm.dist` (built in `ensure_dist_table`). It is re-borrowed
+        // per backref below (the field-path SHARED borrow ends before the
+        // `&mut self` sparsity call, so it cannot be hoisted across the loop).
         let in_end = bits.data.len();
         bits.refill();
-        let mut pre = self.lut_litlen.decode(bits);
+        let mut pre = self.asm.lut_litlen.decode(bits);
         // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
         // above (dist-table amortization + initial preload) which is amortized
         // per block and is negligible vs the loop body in aggregate.
@@ -2138,12 +2143,10 @@ impl Block {
                             #[cfg(pure_inflate_decode)]
                             let marker_dt: Option<
                                 &crate::decompress::inflate::libdeflate_entry::DistTable,
-                            > = if !marker_dist_lut {
-                                None
-                            } else if marker_fixed_tbl.is_some() {
-                                marker_fixed_tbl
+                            > = if marker_dist_lut && self.dist_valid {
+                                Some(&self.asm.dist)
                             } else {
-                                self.dist_table.as_ref()
+                                None
                             };
                             #[cfg(not(pure_inflate_decode))]
                             let marker_dt: Option<
@@ -2282,7 +2285,7 @@ impl Block {
                 lb,
                 self.dist_hc.decode(&mut lb),
                 {
-                    pre = self.lut_litlen.decode(&mut lb);
+                    pre = self.asm.lut_litlen.decode(&mut lb);
                 },
                 {
                     bits.pos = lb.pos;
@@ -2302,7 +2305,7 @@ impl Block {
                 bits,
                 self.dist_hc.decode(bits),
                 {
-                    pre = self.lut_litlen.decode(bits);
+                    pre = self.asm.lut_litlen.decode(bits);
                 },
                 {}
             );
@@ -2377,7 +2380,7 @@ impl Block {
         // so on ANY break the bit cursor sits exactly before `pre`'s bits and
         // the careful loop re-decodes from the same position — never desyncs.
         bits.refill();
-        let mut pre = self.lut_litlen.decode(bits);
+        let mut pre = self.asm.lut_litlen.decode(bits);
         'fast: loop {
             // Resumable cap + wrap headroom + input slop — all REAL overheads.
             let dst_phys = pos % U8_RING_SIZE;
@@ -2515,7 +2518,7 @@ impl Block {
             // Preload next symbol (pipeline). Refill first so the decode and
             // any subsequent dist-extra reads have headroom.
             bits.refill();
-            pre = self.lut_litlen.decode(bits);
+            pre = self.asm.lut_litlen.decode(bits);
         }
         // FALL THROUGH: `pre` was decoded but NOT consumed (we always break
         // with a fresh un-consumed `pre`), so the bit cursor is positioned
@@ -2789,50 +2792,48 @@ impl Block {
             return;
         }
         self.dist_table_checked = true;
+        // ELEMENT A: the dist table lives INLINE in `self.asm.dist` and is
+        // built IN PLACE (zero-copy). Both fixed and dynamic blocks build into
+        // it (the old process-wide `fixed_dist_table()` static is no longer the
+        // asm/contig source — the asm addresses ONLY `self.asm.dist` off its
+        // single base). The lens-cache still skips redundant rebuilds, so a run
+        // of fixed (constant lens) or repeated-dynamic blocks rebuilds at most
+        // once. `dist_valid` replaces the old `Option::is_some()` signal.
+        let lens: &[u8] = match self.compression_type {
+            CompressionType::FixedHuffman => &FIXED_DIST_LENGTHS[..],
+            CompressionType::DynamicHuffman => {
+                let split = self.literal_code_count;
+                let end = split + self.distance_code_count;
+                &self.literal_cl[split..end]
+            }
+            _ => {
+                self.dist_valid = false;
+                return;
+            }
+        };
         if dist_amort_disabled() {
-            // KILL-SWITCH (GZIPPY_DIST_AMORT=0): the exact pre-P3.4 lazy
-            // build — fresh Vec alloc per block, fixed blocks included.
-            // Same binary, same code layout; only the behavior toggles —
-            // the disproof instrument for layout-phantom vs behavioral
-            // deltas (and the standard campaign kill-switch).
-            self.dist_table = match self.compression_type {
-                CompressionType::FixedHuffman => {
-                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                        &FIXED_DIST_LENGTHS[..],
-                    )
-                }
-                CompressionType::DynamicHuffman => {
-                    let split = self.literal_code_count;
-                    let end = split + self.distance_code_count;
-                    crate::decompress::inflate::libdeflate_entry::DistTable::build(
-                        &self.literal_cl[split..end],
-                    )
-                }
-                _ => None,
-            };
-        } else if self.compression_type == CompressionType::DynamicHuffman {
-            let split = self.literal_code_count;
-            let end = split + self.distance_code_count;
-            let lens = &self.literal_cl[split..end];
-            let reusable =
-                self.dist_table.is_some() && &self.dist_table_lens[..self.dist_table_nlens] == lens;
-            if !reusable {
-                if let Some(t) = self.dist_table.as_mut() {
-                    t.rebuild(lens);
-                } else {
-                    self.dist_table =
-                        crate::decompress::inflate::libdeflate_entry::DistTable::build(lens);
-                }
+            // KILL-SWITCH (GZIPPY_DIST_AMORT=0): rebuild every block (no cache
+            // reuse), still in place. Same binary/layout; only behavior toggles.
+            self.dist_valid = self.asm.dist.rebuild(lens);
+            self.dist_table_nlens = 0; // force a rebuild next block too
+            return;
+        }
+        let reusable = self.dist_valid && &self.dist_table_lens[..self.dist_table_nlens] == lens;
+        if !reusable {
+            let ok = self.asm.dist.rebuild(lens);
+            self.dist_valid = ok;
+            if ok {
                 self.dist_table_lens[..lens.len()].copy_from_slice(lens);
                 self.dist_table_nlens = lens.len();
-                if super::contig_prof::enabled() {
-                    super::contig_prof::C_N_DISTBUILD
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            } else if super::contig_prof::enabled() {
-                super::contig_prof::C_N_DISTREUSE
+            } else {
+                self.dist_table_nlens = 0;
+            }
+            if super::contig_prof::enabled() {
+                super::contig_prof::C_N_DISTBUILD
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+        } else if super::contig_prof::enabled() {
+            super::contig_prof::C_N_DISTREUSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -3074,10 +3075,33 @@ impl Block {
             // process-wide static table (P3.4 item 1) — same 5-bit lens every
             // time, so the table is identical to the per-block build it
             // replaces.
+            // ELEMENT A: set the per-call header on the boxed AsmState BEFORE
+            // taking the shared table borrows below — the asm reads
+            // in_ptr/in_lim/out_lim/out_base via `[ctx+0/8/16/24]`. This is the
+            // only &mut self.asm in the region; the loop then only reads it
+            // (`run_contig(&self.asm,…)`, `decode_prefilled`, dist lookups all
+            // SHARED — the anchor stores that needed &mut are gone).
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            {
+                self.asm.in_ptr = lb.data.as_ptr() as u64;
+                self.asm.in_lim = in_end.saturating_sub(super::asm_kernel::IN_MARGIN) as u64;
+                self.asm.out_lim = (base as u64)
+                    .wrapping_add(*pos as u64)
+                    .wrapping_add(local_cap as u64)
+                    .wrapping_sub(FAST_OUT_SLOP as u64);
+                self.asm.out_base = base as u64;
+            }
+            // Hoisted single-lookup distance table (inline in `self.asm.dist`).
+            // Field-disjoint from every `self` mutation inside the loop
+            // (`at_end_of_block`, `backreferences`, `decoded_bytes`), so the
+            // SHARED borrow is legal across them and across `run_contig(&self.asm)`.
             #[cfg(pure_inflate_decode)]
-            let dist_tbl = match self.compression_type {
-                CompressionType::FixedHuffman if !dist_amort_disabled() => fixed_dist_table(),
-                _ => self.dist_table.as_ref(),
+            let dist_tbl: Option<
+                &crate::decompress::inflate::libdeflate_entry::DistTable,
+            > = if self.dist_valid {
+                Some(&self.asm.dist)
+            } else {
+                None
             };
             #[cfg(not(pure_inflate_decode))]
             let dist_tbl: Option<
@@ -3103,25 +3127,6 @@ impl Block {
                 && dist_tbl.is_some();
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
             let asm_stats: bool = super::asm_kernel::stats_enabled();
-            // Loop-invariant kernel context (contract E4/E5). Limits are
-            // computed as integers (no `ptr::add` on speculative values);
-            // `*pos` here is the call-entry position (`emitted == 0`), so
-            // `out_lim` encodes exactly the Rust out guard.
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-            let mut asm_ctx = super::asm_kernel::KernCtx {
-                in_ptr: lb.data.as_ptr() as u64,
-                in_lim: in_end.saturating_sub(super::asm_kernel::IN_MARGIN) as u64,
-                out_lim: (base as u64)
-                    .wrapping_add(*pos as u64)
-                    .wrapping_add(local_cap as u64)
-                    .wrapping_sub(FAST_OUT_SLOP as u64),
-                out_base: base as u64,
-                long_tbl: self.lut_litlen.table.long_code_lookup.as_ptr() as u64,
-                dist_tbl: dist_tbl.map(|t| t.entries_ptr() as u64).unwrap_or(0),
-                save_p0: 0,
-                save_d0: 0,
-                short_tbl: self.lut_litlen.table.short_code_lookup.as_ptr() as u64,
-            };
             macro_rules! sync_local_bits {
                 () => {{
                     bits.pos = lb.pos;
@@ -3149,7 +3154,7 @@ impl Block {
             lb.refill();
             // P3.5 c4: immediately after a refill — backstop-free decode
             // (byte-exact proof on `decode_prefilled`).
-            let mut pre = self.lut_litlen.decode_prefilled(&lb);
+            let mut pre = self.asm.lut_litlen.decode_prefilled(&lb);
             super::slow_knob::inject_localize(dec_spin, dec_yield);
             // P3.1 profiler chaining state: ONE rdtsc per iteration; the delta
             // between consecutive iteration tops is charged to the class the
@@ -3208,7 +3213,7 @@ impl Block {
                     // excluded by dispatch).
                     let dst0 = unsafe { base.add(*pos) };
                     let (exit, dst1) =
-                        unsafe { super::asm_kernel::run_contig(&mut asm_ctx, &mut lb, dst0) };
+                        unsafe { super::asm_kernel::run_contig(&self.asm, &mut lb, dst0) };
                     let delta = (dst1 as usize) - (dst0 as usize);
                     if asm_stats {
                         super::asm_kernel::note_exit(exit, delta);
@@ -3219,7 +3224,7 @@ impl Block {
                         // X5/X6: re-derive the carried packet from the
                         // identical cursor (decode purity + ≤21-bit backing
                         // — contract doc); skipped when nothing changed.
-                        pre = self.lut_litlen.decode_prefilled(&lb);
+                        pre = self.asm.lut_litlen.decode_prefilled(&lb);
                     }
                     if exit == super::asm_kernel::EXIT_BOUNDARY {
                         // Monotone guard failure — the Rust loop owns the
@@ -3321,7 +3326,7 @@ impl Block {
                         // bottom-of-loop preload.
                         let mut chained = 0usize;
                         loop {
-                            let nxt = self.lut_litlen.decode(&mut lb);
+                            let nxt = self.asm.lut_litlen.decode(&mut lb);
                             let ncode = (nxt.symbol & 0xFFFF) as u16;
                             if chained < LIT_CHAIN_MAX
                                 && nxt.sym_count == 1
@@ -3519,7 +3524,7 @@ impl Block {
                         }
                         // P3.5 c4: threshold-refill site — backstop-free
                         // decode (byte-exact proof on `decode_prefilled`).
-                        pre = self.lut_litlen.decode_prefilled(&lb);
+                        pre = self.asm.lut_litlen.decode_prefilled(&lb);
                         super::slow_knob::inject_localize(dec_spin, dec_yield);
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
@@ -3576,7 +3581,7 @@ impl Block {
                 }
                 // P3.5 c4: threshold-refill site — backstop-free decode
                 // (byte-exact proof on `decode_prefilled`).
-                pre = self.lut_litlen.decode_prefilled(&lb);
+                pre = self.asm.lut_litlen.decode_prefilled(&lb);
                 super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
                 };
@@ -4012,19 +4017,11 @@ fn dist_amort_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("GZIPPY_DIST_AMORT").is_ok_and(|v| v == "0"))
 }
 
-/// P3.4 item 1: process-wide single-lookup distance table for FixedHuffman
-/// blocks. The fixed dist lens are the RFC 1951 §3.2.6 constants, so every
-/// per-block build produced the identical table — build it once and share.
-/// (`DistTable` is `Sync`: lookups take `&self` and never mutate.)
-#[cfg(pure_inflate_decode)]
-fn fixed_dist_table() -> Option<&'static crate::decompress::inflate::libdeflate_entry::DistTable> {
-    static T: std::sync::OnceLock<Option<crate::decompress::inflate::libdeflate_entry::DistTable>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        crate::decompress::inflate::libdeflate_entry::DistTable::build(&FIXED_DIST_LENGTHS[..])
-    })
-    .as_ref()
-}
+// ELEMENT A: the process-wide `fixed_dist_table()` static is REMOVED — the
+// dist table (fixed and dynamic) is now built INLINE into `self.asm.dist`
+// (the asm addresses only the single `ctx` base). `FIXED_DIST_LENGTHS` is
+// still the source of the fixed lens fed to `DistTable::rebuild` in
+// `ensure_dist_table`.
 
 /// Ring-buffer back-reference emit. Mirror of vendor's
 /// `resolveBackreference` (vendor/.../gzip/deflate.hpp:1349-1410):
