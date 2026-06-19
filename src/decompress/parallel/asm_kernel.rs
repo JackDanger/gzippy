@@ -206,26 +206,32 @@ pub struct KernCtx {
     pub long_tbl: u64,
     /// +40: dist `DistTable` entries base (`*const DistEntry` = u32s, c3).
     pub dist_tbl: u64,
-    /// +48: backref-arm spill: saved bitbuf (X2 restore).
-    pub save_bitbuf: u64,
-    /// +56: backref-arm spill: saved bitsleft.
-    pub save_bitsleft: u64,
-    /// +64: litlen short table (`short_code_lookup.as_ptr()`) — passed to
+    /// +48: litlen short table (`short_code_lookup.as_ptr()`) — passed to
     /// the asm as a pinned REGISTER; kept here so the ctx is self-contained.
+    ///
+    /// NIGHT11 SNAPSHOT REMOVAL (see DIVERGENCE LEDGER in
+    /// plans/KERNEL-CONVERGENCE.md): the night9 per-iteration X2 cursor
+    /// snapshot (`save_bitbuf/+48`, `save_bitsleft/+56`, `save_dst/+72`,
+    /// `save_pos/+80` — four L1 stores at the iteration top) is DELETED.
+    /// The un-consume on a rare RECLASS bail is now reconstructed from the
+    /// iteration-top bit position `P0` (carried in a register, not stored)
+    /// via a single from-data re-read; `dst0` is carried in a register too.
+    /// See `run_contig`'s reconstruct block. igzip is stateless and never
+    /// un-consumes, so it has no counterpart to these fields at all.
     pub short_tbl: u64,
-    /// +72: backref-arm spill: saved dst (X2 restore — the multi-with-
-    /// trailing path advances dst by the literal prefix BEFORE the dist
-    /// decode can bail; the restore rolls dst back, and the already-stored
-    /// packed bytes become X3 overshoot garbage above the exit dst).
-    pub save_dst: u64,
-    /// +80: per-iteration cursor snapshot of `pos` (X2 restore). The
-    /// igzip-shape late-discriminator body refills (advancing `pos`) BEFORE
-    /// it knows the packet is non-literal, so every rare bail (EOB, oversize,
-    /// invalid, dist-side) must roll `pos` back to the iteration-top value to
-    /// hand the packet to Rust UN-consumed (the refill is append-only, but a
-    /// bitbuf/bitsleft restore to the pre-consume snapshot leaves `pos`
-    /// advanced past those bits, so `pos` must be restored in lockstep).
-    pub save_pos: u64,
+    /// +56: iteration-top BIT POSITION anchor `p0 = pos*8 - bitsleft` (the
+    /// MINIMAL un-consume state — see DIVERGENCE LEDGER). ONE store per
+    /// iteration (vs night9's four). `p0` is REFILL-INVARIANT, so it equals
+    /// the un-consumed packet start independent of the body's consume/refill;
+    /// a rare RECLASS bail reconstructs the whole bit cursor from it via a
+    /// from-data re-read (the consumed low bits are shifted out and cannot be
+    /// recovered from post-consume registers; the 15-GP-register asm ceiling
+    /// also forbids carrying the anchor in a register without dropping an
+    /// igzip speculation feature — hence a single ctx-memory word).
+    pub save_p0: u64,
+    /// +64: iteration-top dst (un-consume target — rolls back the speculative
+    /// store advance; the stored packed bytes become X3 overshoot above it).
+    pub save_d0: u64,
 }
 
 const _: () = assert!(std::mem::offset_of!(KernCtx, in_ptr) == 0);
@@ -234,11 +240,9 @@ const _: () = assert!(std::mem::offset_of!(KernCtx, out_lim) == 16);
 const _: () = assert!(std::mem::offset_of!(KernCtx, out_base) == 24);
 const _: () = assert!(std::mem::offset_of!(KernCtx, long_tbl) == 32);
 const _: () = assert!(std::mem::offset_of!(KernCtx, dist_tbl) == 40);
-const _: () = assert!(std::mem::offset_of!(KernCtx, save_bitbuf) == 48);
-const _: () = assert!(std::mem::offset_of!(KernCtx, save_bitsleft) == 56);
-const _: () = assert!(std::mem::offset_of!(KernCtx, short_tbl) == 64);
-const _: () = assert!(std::mem::offset_of!(KernCtx, save_dst) == 72);
-const _: () = assert!(std::mem::offset_of!(KernCtx, save_pos) == 80);
+const _: () = assert!(std::mem::offset_of!(KernCtx, short_tbl) == 48);
+const _: () = assert!(std::mem::offset_of!(KernCtx, save_p0) == 56);
+const _: () = assert!(std::mem::offset_of!(KernCtx, save_d0) == 64);
 
 /// LUT-layout constants mirrored from `lut_huffman.rs` / `libdeflate_entry.rs`
 /// (compile-checked so drift between the asm immediates and the table
@@ -416,18 +420,26 @@ mod imp {
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
-                // ── X2 SNAPSHOT (igzip-shape un-consume support). The
-                //    late-discriminator body below CONSUMES + REFILLS +
-                //    speculatively STORES before it knows the packet is
-                //    non-literal, so every rare bail (EOB / oversize / invalid /
-                //    dist-side) must roll the cursor back to here to hand the
-                //    packet to Rust UN-consumed (X2). Four INDEPENDENT stores to
-                //    the L1-hot ctx (no dependency on the decode recurrence) —
-                //    they fill OOO slots the latency-bound loop leaves idle.
-                "mov qword ptr [{ctx} + 48], {bitbuf}",
-                "mov qword ptr [{ctx} + 56], {bitsleft}",
-                "mov qword ptr [{ctx} + 80], {pos}",
-                "mov qword ptr [{ctx} + 72], {dst}",
+                // ── NIGHT11 MINIMAL UN-CONSUME ANCHOR (the night9 4-store X2
+                //    snapshot is DELETED — see DIVERGENCE LEDGER). The late-
+                //    discriminator body below CONSUMES + REFILLS + speculatively
+                //    STORES before it knows the packet is non-literal, so a rare
+                //    bail must hand Rust the packet UN-consumed (X2). Instead of
+                //    snapshotting all four of (bitbuf,bitsleft,pos,dst), save the
+                //    TWO values a bail cannot otherwise recover:
+                //      [ctx+56] = p0 = pos*8 - bitsleft  (iteration-top BIT
+                //        position). REFILL-INVARIANT (Bits::refill's |56 + pos
+                //        advance preserve pos*8-bitsleft), so it is the un-
+                //        consumed packet start regardless of the body's
+                //        consume/refill. A bail re-reads the whole cursor from it
+                //        (the consumed low bits are shifted out — unrecoverable
+                //        from post-consume registers).
+                //      [ctx+64] = dst (iteration-top dst; un-consume target).
+                //    ONE bit-cursor store + one dst store, vs night9's four.
+                "lea {t2}, [{pos} * 8]",
+                "sub {t2}, {bitsleft}",
+                "mov qword ptr [{ctx} + 56], {t2}",   // p0
+                "mov qword ptr [{ctx} + 64], {dst}",  // d0
                 // ── decode_next_lit_len on the preloaded entry {t1} (igzip
                 //    322-372 / loop_block 515): extract bit_count + sym_count.
                 //    LARGE_FLAG → long table (cold); bc==0 → invalid (cold).
@@ -530,8 +542,8 @@ mod imp {
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
                 "jmp 2b",
                 // ── long code at top (decode_prefilled long path; rare/cold).
-                //    The X2 snapshot at the iteration top already covers it.
-                //    {t2} = bc throughout.
+                //    The iteration-top p0/d0 anchor ([ctx+56]/[ctx+64]) covers
+                //    its bails (reconstruct at 85:). {t2} = bc throughout.
                 "20:",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 26",                     // long_max_len (≤21)
@@ -589,8 +601,8 @@ mod imp {
                 //    550-552) or at `21:` for the long path, {dst}=copy start.
                 //    The base+index gather (the L1-latency load) already ran;
                 //    the in-register entry decode follows with latency hidden.
-                //    X2: the iteration-top snapshot makes every dist-side bail
-                //    un-consume (restore at `80:`). ──
+                //    X2: the iteration-top p0/d0 anchor makes every dist-side
+                //    bail un-consume (tag at `80:` → reconstruct at `85:`). ──
                 "58:",
                 "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
                 "test {t1:e}, {t1:e}",
@@ -759,40 +771,49 @@ mod imp {
                 "mov {dst}, {t2}",                    // dst advances by exactly length
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
-                // ── restore + RECLASS (X2: un-consume the whole packet). The
-                //    igzip-shape body consumes+refills+spec-stores before the
-                //    late discriminator, so EVERY rare exit restores the full
-                //    iteration-top snapshot (bitbuf/bitsleft/pos/dst) — `pos`
-                //    too, because the main-body refill advanced it. The 8-byte
-                //    spec store(s) become X3 overshoot above the restored dst.
+                // ── RECLASS un-consume via FROM-DATA RE-READ (X2). The igzip-
+                //    shape body consumes+refills+spec-stores before the late
+                //    discriminator, so a rare exit hands Rust the packet UN-
+                //    consumed. Each bail sets {ret}=tag and jumps to 85: which
+                //    reconstructs the cursor from the iteration-top bit anchor
+                //    [ctx+56]=p0 (NOT a 4-value snapshot):
+                //      byte = p0>>3 ; skip = p0&7
+                //      bitbuf = load_u64(in_ptr+byte) >> skip   (low 64-skip bits = the
+                //                                                bitstream from p0)
+                //      bitsleft = 64 - skip   (∈[57,64] ⇒ X5 bitsleft>=48 holds)
+                //      pos = byte + 8 ; dst = [ctx+64]=d0
+                //    8-byte read in-range by IN_MARGIN (p0>>3 <= pos < in_lim =
+                //    len-40 ⇒ byte+8 < len). Byte-exact: p0 is the exact un-
+                //    consumed packet start; the re-read yields the SAME low bits
+                //    decode_prefilled reads (a different but equivalent cursor
+                //    REPRESENTATION). The ref model uses the identical re-read in
+                //    lockstep; the caller only re-runs decode_prefilled(&lb),
+                //    never inspecting the cursor shape. igzip has no counterpart
+                //    (stateless — it never un-consumes).
                 "80:",
-                "mov {bitbuf}, qword ptr [{ctx} + 48]",
-                "mov {bitsleft}, qword ptr [{ctx} + 56]",
-                "mov {pos}, qword ptr [{ctx} + 80]",
-                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 4",                       // RECLASS, dist-bail tag
-                "jmp 9f",
+                "jmp 85f",
                 "82:",
-                "mov {bitbuf}, qword ptr [{ctx} + 48]",
-                "mov {bitsleft}, qword ptr [{ctx} + 56]",
-                "mov {pos}, qword ptr [{ctx} + 80]",
-                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 2",                       // RECLASS, lone-EOB tag
-                "jmp 9f",
+                "jmp 85f",
                 "83:",
-                "mov {bitbuf}, qword ptr [{ctx} + 48]",
-                "mov {bitsleft}, qword ptr [{ctx} + 56]",
-                "mov {pos}, qword ptr [{ctx} + 80]",
-                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 3",                       // RECLASS, multi-trailing tag
-                "jmp 9f",
+                "jmp 85f",
                 // ── exits ───────────────────────────────────────────────
                 "8:",
-                "mov {bitbuf}, qword ptr [{ctx} + 48]",
-                "mov {bitsleft}, qword ptr [{ctx} + 56]",
-                "mov {pos}, qword ptr [{ctx} + 80]",
-                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 0",                       // RECLASS (invalid / lone-oversize)
+                // fall through to 85: (reconstruct)
+                "85:",
+                "mov {t2}, qword ptr [{ctx} + 56]",   // p0
+                "mov {t1}, {t2}",
+                "and {t1:e}, 7",                      // skip = p0 & 7
+                "shr {t2}, 3",                        // byte = p0 >> 3
+                "mov {bitbuf}, qword ptr [{in_ptr} + {t2}]",
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // >> skip
+                "mov {bitsleft:e}, 64",
+                "sub {bitsleft}, {t1}",               // bitsleft = 64 - skip
+                "lea {pos}, [{t2} + 8]",              // pos = byte + 8
+                "mov {dst}, qword ptr [{ctx} + 64]",  // dst = d0
                 "9:",
                 ctx = in(reg) ctx as *mut KernCtx,
                 short_tbl = in(reg) ctx.short_tbl,
@@ -937,19 +958,18 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if *dst >= out_lim || lb.pos >= in_lim {
             return EXIT_BOUNDARY;
         }
-        // X2 SNAPSHOT (mirrors the asm's iteration-top 4 stores to ctx): the
-        // igzip-shape body below consumes + refills + speculatively stores
-        // BEFORE the late discriminator resolves, so every rare bail restores
-        // (bitbuf, bitsleft, pos, dst) to hand the packet to Rust un-consumed.
-        let (sb, sl, sp, sd) = (lb.bitbuf, lb.bitsleft, lb.pos, *dst);
+        // NIGHT11 MINIMAL UN-CONSUME ANCHOR (lockstep with the asm's
+        // [ctx+56]=p0 / [ctx+64]=d0 capture): the night9 4-value snapshot is
+        // DELETED. Capture only the iteration-top BIT POSITION `p0` (refill-
+        // invariant) and `d0`; a rare bail reconstructs the whole cursor from
+        // `p0` via the identical from-data re-read (`reclass_reread`).
+        let p0: usize = lb.pos * 8 - lb.bitsleft as usize;
+        let d0: usize = *dst;
         let pre = lut.decode_prefilled(lb);
         if pre.bit_count == 0 {
-            // invalid (asm `8:`): nothing consumed yet, the restore is an
-            // identity but kept for shape symmetry with the asm.
-            lb.bitbuf = sb;
-            lb.bitsleft = sl;
-            lb.pos = sp;
-            *dst = sd;
+            // invalid (asm `8:` → `85:`): un-consume via re-read.
+            reclass_reread(lb, p0);
+            *dst = d0;
             return EXIT_RECLASS;
         }
         let cnt = pre.sym_count as usize;
@@ -977,12 +997,10 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if trailing <= 255 {
             continue; // literal → loop (the hot back-edge)
         }
-        // ── non-literal arm: EOB / oversize → restore + RECLASS ──
+        // ── non-literal arm: EOB / oversize → un-consume + RECLASS ──
         if trailing == 256 || trailing > super::lut_huffman::MAX_LIT_LEN_SYM {
-            lb.bitbuf = sb;
-            lb.bitsleft = sl;
-            lb.pos = sp;
-            *dst = sd;
+            reclass_reread(lb, p0);
+            *dst = d0;
             return EXIT_RECLASS;
         }
         if cnt >= 2 {
@@ -1019,13 +1037,33 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
             }
         };
         if bail {
-            lb.bitbuf = sb;
-            lb.bitsleft = sl;
-            lb.pos = sp;
-            *dst = sd;
+            reclass_reread(lb, p0);
+            *dst = d0;
             return EXIT_RECLASS;
         }
     }
+}
+
+/// X2 un-consume reconstruction (lockstep with the asm `85:` block). Given the
+/// iteration-top absolute BIT position `p0` (= `pos*8 - bitsleft`, refill-
+/// invariant), re-read the bit cursor from the input so it points at the
+/// un-consumed packet start with `bitsleft >= 48` (X5). The consumed low bits
+/// were shifted out by `consume` and are unrecoverable from the post-consume
+/// cursor, so a from-data re-read is the only faithful un-consume. The result
+/// is a different but equivalent cursor REPRESENTATION than the pre-consume
+/// state; correctness rests on `p0` being the exact packet start and the caller
+/// only re-running `decode_prefilled(&lb)` (never inspecting the cursor shape).
+/// `byte + 8 <= data.len()` is guaranteed by IN_MARGIN inside the asm region
+/// (`p0>>3 <= pos < in_lim = len-40`).
+#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[inline]
+fn reclass_reread(lb: &mut Bits<'_>, p0: usize) {
+    let byte = p0 >> 3;
+    let skip = (p0 & 7) as u32;
+    let w = u64::from_le_bytes(lb.data[byte..byte + 8].try_into().unwrap());
+    lb.bitbuf = w >> skip;
+    lb.bitsleft = 64 - skip;
+    lb.pos = byte + 8;
 }
 
 #[cfg(test)]
@@ -1072,10 +1110,8 @@ mod tests {
             out_base: dst as u64,
             long_tbl: long.as_ptr() as u64,
             dist_tbl: 0,
-            save_bitbuf: 0,
-            save_bitsleft: 0,
-            save_dst: 0,
-            save_pos: 0,
+            save_p0: 0,
+            save_d0: 0,
             short_tbl: short.as_ptr() as u64,
         };
         // Guards pass → RECLASS, state unchanged.
@@ -1210,10 +1246,8 @@ mod tests {
                     out_base: dst0 as u64,
                     long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
                     dist_tbl: dist_holes.entries_ptr() as u64,
-                    save_bitbuf: 0,
-                    save_bitsleft: 0,
-                    save_dst: 0,
-                    save_pos: 0,
+                    save_p0: 0,
+                    save_d0: 0,
                     short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
                 };
                 let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
@@ -1299,10 +1333,8 @@ mod tests {
                 out_base: dst0 as u64,
                 long_tbl: lut.table.long_code_lookup.as_ptr() as u64,
                 dist_tbl: dist_holes.entries_ptr() as u64,
-                save_bitbuf: 0,
-                save_bitsleft: 0,
-                save_dst: 0,
-                save_pos: 0,
+                save_p0: 0,
+                save_d0: 0,
                 short_tbl: lut.table.short_code_lookup.as_ptr() as u64,
             };
             let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
@@ -1518,10 +1550,8 @@ mod tests {
                     out_base: base0 as u64,
                     long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
                     dist_tbl: dt.entries_ptr() as u64,
-                    save_bitbuf: 0,
-                    save_bitsleft: 0,
-                    save_dst: 0,
-                    save_pos: 0,
+                    save_p0: 0,
+                    save_d0: 0,
                     short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
                 };
                 let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };

@@ -1486,8 +1486,7 @@ mod tests {
                 let cnt = (entry >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK;
                 debug_assert!((1..=3).contains(&cnt));
                 // Recover the trailing symbol exactly as the decoders do.
-                let trailing =
-                    ((entry & LARGE_SHORT_SYM_MASK) >> (8 * (cnt - 1))) & 0xFFFF;
+                let trailing = ((entry & LARGE_SHORT_SYM_MASK) >> (8 * (cnt - 1))) & 0xFFFF;
                 let flag_set = (entry & LARGE_TRAILING_NONLIT_FLAG) != 0;
                 assert_eq!(
                     flag_set,
