@@ -218,5 +218,60 @@ current cyc/B vs igzip). Commit only byte-exact states to perf/igzip-full-rewrit
 - igzip blueprint: `vendor/isa-l/igzip/igzip_decode_block_stateless.asm` loop_block 507-627,
   macros decode_next_lit_len 322-372 / decode_next_dist 396-440 / *_with_load.
 - Guest (ONLY box that can build/run the asm): `ssh -o ConnectTimeout=15 -J 10.0.0.100 root@10.30.0.199`.
-  Product binary: `/root/bin/gzippy-chunkt1` (== ca70e9d1). Source dir `/root/gz-fullrewrite`.
-  igzip `/usr/bin/igzip`. Build on /dev/shm (root disk 99% full).
+  Product binary: `/root/bin/gzippy-chunkt1` (== ca70e9d1). Git checkout `/root/gzippy`
+  (fetch+checkout the branch there; build to `/dev/shm/<t>` — root disk 99% full).
+  igzip `/usr/bin/igzip`. macOS x86_64 CANNOT build the asm (register-alloc fails —
+  pre-existing, night9 too): use `cargo check --target x86_64-apple-darwin` for ref-model
+  typeck only; the guest (linux x86_64) is the sole asm build/run gate.
+
+---
+
+## 8. DIVERGENCE LEDGER (gzippy state igzip lacks — kept MINIMAL & faithful)
+
+Each row is a place gzippy's `run_contig` must keep state that igzip's stateless
+`loop_block` does NOT, why igzip lacks it, and why the gz form is the minimal faithful
+choice. (Mission rule: a true divergence is legal when byte-exact + ledgered.)
+
+### D-1 — X2 un-consume cursor (NIGHT11, the snapshot replacement)
+- **What diverges.** On a rare RECLASS bail (EOB / oversize / invalid / dist-subtable /
+  invalid-dist) gzippy must hand the un-decoded packet BACK to the Rust careful loop
+  UN-CONSUMED (it re-decodes it). The late-discriminator body has already consumed +
+  refilled + speculatively stored by the time a bail is known.
+- **Why igzip lacks it.** igzip's decoder is STATELESS: EOB ends the block and errors
+  abort; it never re-decodes a consumed packet, so its handlers (`end_loop_block`
+  640-642) merely PERSIST the current (post-consume) `read_in/read_in_length/next_out`
+  — they never un-consume. There is no igzip counterpart to roll back.
+- **Why the consumed state is unrecoverable from registers.** `consume` is
+  `bitbuf >>= bc` — the low `bc` bits are SHIFTED OUT and lost; `refill` then ORs new
+  high bits and advances `pos`. So the pre-consume `bitbuf` cannot be rebuilt from the
+  post-consume registers. A SAVE (per-iter snapshot) or a FROM-DATA RE-READ is
+  structurally required. This is the irreducible divergence.
+- **night9's form (rejected by night10's gate).** A per-iteration 4-store snapshot of
+  `(bitbuf, bitsleft, pos, dst)` → ctx (`save_bitbuf/+48 save_bitsleft/+56 save_dst/+72
+  save_pos/+80`). Gated-slower than the old early-flag-bit shape (+0.194 cyc/B silesia);
+  4 stores/iter on the hot literal path.
+- **c936's form (DEAD — do not reuse).** Moved EOB/oversize/invalid PRE-consume to delete
+  the snapshot → serialized the classify into the critical chain → IPC collapsed
+  (ΔIPC −0.04→−0.30), net slower than night9.
+- **NIGHT11 minimal faithful form.** Keep the late discriminator + consume-forward; on a
+  bail RECONSTRUCT via a single FROM-DATA RE-READ at the iteration-top BIT POSITION
+  `p0 = pos*8 - bitsleft`. `p0` is REFILL-INVARIANT (proved vs `Bits::refill`: the `|56`
+  + pos-advance preserve `pos*8 - bitsleft`), so it equals the un-consumed packet start
+  regardless of the body's consume/refill. Re-read: `byte=p0>>3; skip=p0&7;
+  bitbuf=load_u64(in_ptr+byte)>>skip; bitsleft=64-skip (∈[57,64]⇒X5); pos=byte+8`.
+  In-range by IN_MARGIN. The re-read yields a DIFFERENT but EQUIVALENT cursor
+  REPRESENTATION (the caller only re-runs `decode_prefilled(&lb)`, never inspecting the
+  cursor shape; the ref model `reclass_reread` uses the identical re-read so the c2/c3
+  differential pins asm==ref field-for-field).
+- **Why still TWO ctx words (`save_p0/+56`, `save_d0/+64`), not zero.** The asm is at the
+  15-GP-operand register ceiling (night9: "register allocation FIT … 15 GP operands");
+  carrying `p0`+`d0` in registers overflows it (the macOS x86_64 build already fails
+  register-alloc on the unmodified night9). Freeing a register would require dropping an
+  igzip speculation feature (the per-iter dist preload `dpre`, igzip 550-552) — a
+  divergence AWAY from igzip. So the anchor is a MINIMAL 2-word ctx save: one bit-cursor
+  store + one dst store per iteration (50% fewer than night9's four), uniform across all
+  bails. (A 1-store form — store `p0` only, compute `d0` from the live `cnt` in the rare
+  arms — is a possible follow-up if the gate shows store-port is the binding constraint.)
+- **Gate.** Byte-exact via c1/c2/c3 asm-vs-ref differentials + prop roundtrip + tri-oracle
+  sha grid; perf via the paired harness vs igzip / night9(kc) / old(chunkt1). GUEST-OWED
+  (status tracked in BEAT-IGZIP-T1-STATE.md).

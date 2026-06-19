@@ -447,7 +447,7 @@ mod imp {
                 "jnz 20f",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 28",                     // bc = bit_count
-                "jz 8f",                              // invalid (bc==0) → Rust
+                "jz 86f",                             // invalid (bc==0) → Rust (UN-consumed, no re-read)
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
                 "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
@@ -555,7 +555,7 @@ mod imp {
                 "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 10",                     // bc
-                "jz 8f",                              // invalid → Rust
+                "jz 86f",                             // invalid (bc==0) → Rust (UN-consumed, no re-read)
                 "and {t1:e}, 0x3FF",                  // symbol
                 "cmp {t1:e}, 255",
                 "ja 21f",                             // lone non-literal → backref arm
@@ -801,8 +801,8 @@ mod imp {
                 "jmp 85f",
                 // ── exits ───────────────────────────────────────────────
                 "8:",
-                "mov {ret}, 0",                       // RECLASS (invalid / lone-oversize)
-                // fall through to 85: (reconstruct)
+                "mov {ret}, 0",                       // RECLASS (lone/long oversize — CONSUMED)
+                "jmp 85f",                            // → reconstruct
                 "85:",
                 "mov {t2}, qword ptr [{ctx} + 56]",   // p0
                 "mov {t1}, {t2}",
@@ -814,6 +814,13 @@ mod imp {
                 "sub {bitsleft}, {t1}",               // bitsleft = 64 - skip
                 "lea {pos}, [{t2} + 8]",              // pos = byte + 8
                 "mov {dst}, qword ptr [{ctx} + 64]",  // dst = d0
+                "jmp 9f",
+                // ── invalid (bc==0) exit: reached PRE-consume (short 438 /
+                //    long 546), so the cursor is ALREADY at the un-consumed
+                //    packet start and dst is still d0 — leave both UNCHANGED
+                //    (X6), no re-read. ──
+                "86:",
+                "mov {ret}, 0",                       // RECLASS (invalid)
                 "9:",
                 ctx = in(reg) ctx as *mut KernCtx,
                 short_tbl = in(reg) ctx.short_tbl,
@@ -967,9 +974,10 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         let d0: usize = *dst;
         let pre = lut.decode_prefilled(lb);
         if pre.bit_count == 0 {
-            // invalid (asm `8:` → `85:`): un-consume via re-read.
-            reclass_reread(lb, p0);
-            *dst = d0;
+            // invalid (asm `86:`): decode_prefilled consumed nothing, so the
+            // cursor is already at the un-consumed packet start and dst is still
+            // d0 — leave both UNCHANGED (X6), no re-read. (p0/d0 used by the
+            // consumed-bail paths below.)
             return EXIT_RECLASS;
         }
         let cnt = pre.sym_count as usize;
