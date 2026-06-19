@@ -50,9 +50,8 @@ pub const ISAL_DECODE_SHORT_BITS: u32 = 10;
 
 /// Layout of `short_code_lookup[]` entries for the LARGE (lit/len) table.
 ///
-/// Bits 0..25  = packed symbols (up to 3 × 8-bit)
-/// Bit  24     = TRAILING_NONLIT_FLAG (build-time class bit; see below) —
-///              also the MSB of the packed-symbol field (a triple's sym3 bit 8)
+/// Bits 0..25  = packed symbols (up to 3 × 8-bit; bit 24 is a triple's sym3
+///              bit 8 — pure DATA, no build-time class flag, igzip shape)
 /// Bits 25     = LARGE_FLAG_BIT (0 = short-code entry, 1 = long-code pointer)
 /// Bits 26..28 = symbol count (1, 2, or 3) — short-code case only
 /// Bits 26..32 = long-max-length              — long-code case only
@@ -69,29 +68,15 @@ pub const LARGE_SYM_COUNT_OFFSET: u32 = 26;
 pub const LARGE_SYM_COUNT_LEN: u32 = 2;
 pub const LARGE_SYM_COUNT_MASK: u32 = (1u32 << LARGE_SYM_COUNT_LEN) - 1;
 
-/// Build-time CLASSIFICATION bit: set in a short lit/len entry IFF its
-/// TRAILING packed symbol is non-literal (`>= 256`: EOB or a length code).
-/// Lives in bit 24 — the top bit of the 25-bit packed-symbol field. It is
-/// FREE on every pure-literal entry (1–3 literals, each `<= 255`, occupy
-/// bits 0..24 exactly so bit 24 == 0) and on every non-literal singleton
-/// (trailing in bits 0..10) or pair (trailing in bits 8..18) entry, whose
-/// trailing never reaches bit 24. For a TRIPLE with `sym3 >= 256` the bit
-/// is ALREADY set by `sym3 << 16` (sym3's own bit 8 lands on bit 24), and
-/// that data bit means EXACTLY this predicate — so the builder only needs to
-/// set it explicitly for `sym_count ∈ {1, 2}`; the triple case is the
-/// natural coincidence.
-///
-/// Consumers: the asm kernel branches off it directly (`test entry, FLAG;
-/// jnz`) so the literal fast path skips the `shrx`-extract + classify
-/// dependency chain that the Gate-2 perturbation proved is on the critical
-/// recurrence. Rust decoders (`decode_prefilled` callers) keep their
-/// existing `& 0xFFFF` trailing mask: for `sym_count ∈ {1, 2}` the displaced
-/// flag bit falls OUTSIDE `0xFFFF` (cnt=1: bit 24; cnt=2: bit 16, after the
-/// `>> 8` prefix shift) and is dropped; for `sym_count == 3` it is the
-/// legitimate sym3 bit 8 and is kept — so the recovered trailing symbol is
-/// byte-identical with or without the flag.
-pub const LARGE_TRAILING_NONLIT_FLAG_OFFSET: u32 = 24;
-pub const LARGE_TRAILING_NONLIT_FLAG: u32 = 1u32 << LARGE_TRAILING_NONLIT_FLAG_OFFSET;
+// NOTE (kernel-converge, faithful-to-igzip): there is NO build-time
+// trailing-class flag. igzip's `make_inflate_huff_code_lit_len`
+// (igzip_inflate.c:387-599) sets no such bit; its decoder classifies the
+// trailing packed symbol at RUNTIME (`cmp next_sym2, 256`). gz previously
+// carried a `LARGE_TRAILING_NONLIT_FLAG` in bit 24, dead since the kernel
+// moved to the late `cmp {t5}, 256` discriminator (asm_kernel.rs run_contig);
+// it has been removed to match igzip's table build exactly (the per-entry OR
+// igzip does not do). Bit 24 is now pure DATA — a triple's sym3 bit 8 — and
+// the decoders' `& 0xFFFF` trailing recovery is byte-identical to before.
 pub const LARGE_SHORT_MAX_LEN_OFFSET: u32 = 26;
 
 /// Layout for the SMALL (distance) lookup.
@@ -539,9 +524,7 @@ pub fn make_inflate_huff_code_lit_len(
                 }
                 result.short_code_lookup[sym1_code as usize] = sym1
                     | (sym1_len << LARGE_SHORT_CODE_LEN_OFFSET)
-                    | (1 << LARGE_SYM_COUNT_OFFSET)
-                    // Build-time trailing-class bit: lone trailing is sym1.
-                    | (if sym1 >= 256 { LARGE_TRAILING_NONLIT_FLAG } else { 0 });
+                    | (1 << LARGE_SYM_COUNT_OFFSET);
             }
             index1 += 1;
         }
@@ -588,10 +571,7 @@ pub fn make_inflate_huff_code_lit_len(
                 result.short_code_lookup[code as usize] = sym1
                     | (sym2 << 8)
                     | (code_length << LARGE_SHORT_CODE_LEN_OFFSET)
-                    | (2 << LARGE_SYM_COUNT_OFFSET)
-                    // Build-time trailing-class bit: pair trailing is sym2
-                    // (bits 8..18 — never reaches bit 24, so OR is collision-free).
-                    | (if sym2 >= 256 { LARGE_TRAILING_NONLIT_FLAG } else { 0 });
+                    | (2 << LARGE_SYM_COUNT_OFFSET);
                 index2 += 1;
             }
             index1 += 1;
@@ -653,10 +633,10 @@ pub fn make_inflate_huff_code_lit_len(
                     if code as usize >= short_len {
                         return false;
                     }
-                    // NB: the trailing-class bit (LARGE_TRAILING_NONLIT_FLAG,
-                    // bit 24) needs NO explicit OR here — `sym3 << 16` sets it
-                    // EXACTLY when `sym3 >= 256` (sym3's bit 8 → entry bit 24),
-                    // which is the trailing-non-literal predicate by definition.
+                    // For a triple, sym3 (bits 16..25) occupies the top of the
+                    // 25-bit packed-symbol field; a `sym3 >= 256` trailing sets
+                    // bit 24 NATURALLY via `sym3 << 16`, so it survives the
+                    // decoders' `& 0xFFFF` trailing recovery (igzip same shape).
                     result.short_code_lookup[code as usize] = sym1
                         | (sym2 << 8)
                         | (sym3 << 16)
@@ -1366,14 +1346,9 @@ mod tests {
         let mut bits = crate::decompress::inflate::consume_first_decode::Bits::new(&bytes);
         bits.refill();
         let result = decoder.decode(&mut bits);
-        // The trailing-class flag (bit 24) is set on this lone non-literal
-        // (EOB) entry; consumers recover the symbol via `& 0xFFFF`.
+        // Consumers recover the trailing symbol via `& 0xFFFF` (no build-time
+        // class flag — faithful to igzip's runtime `cmp 256` classification).
         assert_eq!(result.symbol & 0xFFFF, 256, "EOB symbol decode failed");
-        assert_eq!(
-            result.symbol & LARGE_TRAILING_NONLIT_FLAG,
-            LARGE_TRAILING_NONLIT_FLAG,
-            "EOB (non-literal) entry must carry the trailing-class flag"
-        );
         assert_eq!(result.bit_count, 7);
         assert_eq!(result.sym_count, 1);
     }
@@ -1442,20 +1417,17 @@ mod tests {
         // wiring comment).
     }
 
-    /// Invariant lock for the build-time TRAILING-CLASS flag (bit 24): for
-    /// EVERY valid short lit/len entry, `(entry & LARGE_TRAILING_NONLIT_FLAG)
-    /// != 0` MUST equal "the entry's trailing packed symbol is non-literal
-    /// (>= 256)". The asm kernel branches off this bit instead of extracting
-    /// + classifying the trailing symbol; if the builder ever set it wrong,
-    /// the asm would misroute a literal to the backref arm (or vice-versa),
-    /// so this invariant is the asm's correctness contract on the table.
-    /// Checked across multiple code-length sets that exercise singleton /
-    /// pair / triple packing AND non-literal trailings of each arity.
+    /// Invariant lock that the builder carries NO bit-24 trailing-class flag
+    /// (faithful to igzip's `make_inflate_huff_code_lit_len`, which sets none —
+    /// the decoder classifies at RUNTIME via `cmp 256`). For EVERY valid short
+    /// lit/len entry: (a) bit 24 is set ONLY as the natural sym3 bit-8 of a
+    /// triple (`cnt == 3`) — never for cnt ∈ {1, 2}, even when their trailing
+    /// is non-literal; and (b) the trailing symbol the decoders recover via the
+    /// cnt-shift + `& 0xFFFF` is still byte-correct. A regression that re-adds
+    /// a class flag for cnt ∈ {1, 2} would trip (a); a packing/shift error
+    /// would trip (b).
     #[test]
-    fn trailing_nonlit_flag_matches_trailing_class() {
-        // Several Kraft-valid code-length sets. The fixed-Huffman set packs
-        // pairs/triples (8/9/7-bit codes); the short-skew sets force many
-        // multi-symbol entries whose trailing is a length code (>= 256).
+    fn no_build_time_trailing_class_flag() {
         let mut fixed = vec![0u8; LIT_LEN];
         for sym in 0..144 {
             fixed[sym] = 8;
@@ -1485,20 +1457,26 @@ mod tests {
                 }
                 let cnt = (entry >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK;
                 debug_assert!((1..=3).contains(&cnt));
-                // Recover the trailing symbol exactly as the decoders do.
+                let bit24 = (entry >> 24) & 1;
+                if cnt < 3 {
+                    // No build-time class flag: bit 24 is free for cnt ∈ {1, 2}.
+                    assert_eq!(
+                        bit24, 0,
+                        "cnt={cnt} entry must not set bit 24 (no class flag): entry={entry:#010x}"
+                    );
+                }
+                // Trailing still recovered byte-correctly by the decoders.
                 let trailing = ((entry & LARGE_SHORT_SYM_MASK) >> (8 * (cnt - 1))) & 0xFFFF;
-                let flag_set = (entry & LARGE_TRAILING_NONLIT_FLAG) != 0;
-                assert_eq!(
-                    flag_set,
-                    trailing >= 256,
-                    "flag/class mismatch: entry={entry:#010x} cnt={cnt} trailing={trailing}"
+                assert!(
+                    trailing <= MAX_LIT_LEN_SYM,
+                    "trailing out of range: entry={entry:#010x} cnt={cnt} trailing={trailing}"
                 );
             }
         }
     }
 
     /// A Kraft-complete fixed-Huffman length set (288 syms, the real one),
-    /// used by the flag-invariant test as a second, packing-heavy table.
+    /// used by the no-flag invariant test as a second, packing-heavy table.
     #[cfg(test)]
     fn build_kraft_complete() -> Vec<u8> {
         let mut v = vec![0u8; 288];
