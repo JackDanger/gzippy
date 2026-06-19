@@ -1,5 +1,28 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT23 (2026-06-19, branch kernel-converge-A @0b0c45c4) — THE NIGHT22 DECISIVE GATE RE-RUN WITH PER-REP RANDOMIZED ARM ORDER. The Gate-0 self-test (IG2−IG, must CI-include 0) now PASSES on ALL THREE corpora (NIGHT22's silesia FAIL −0.006 was the fixed-arm-order warmup bias — CLEARED). A's verdict SIGNS HOLD exactly → the decisive result is GATE-FINAL. Element A is then FF'd to kernel-converge-faithful on FAITHFULNESS grounds (byte-exact, faster-or-TIE vs the faithful line N19 on all 3 corpora, no T>1 regression — keep-on-TIE). Intel-LXC, NOT-YET-LAW (AMD owed). ======
+
+### THE CLEAN RE-GATE (randomized per-rep arm order, seed=20260619; harness scripts/bench/_kca_perf4r_guest.sh; PIN=cpu4, N=21 paired interleaved; /dev/null both arms; powersave GHz~1.39; Gate-0 PASS: every arm sha==zcat ref, KERN fired every gz arm; load 4.2→5.4 host-wide, container single-core pinned; cyc/B freq-invariant + paired)
+```
+            cyc/B    IPC    instr/B  | Δcyc/B vs igzip [95%CI]      A vs OLD             A vs N19             self-test IG2−IG
+silesia
+  igzip    4.4220  2.5788  11.4027  |
+  A        5.6258  2.5201  14.1774  | A:+1.2141 [+1.1881,+1.2270] -0.0686 A FASTER     -0.0221 A FASTER     +0.0016 [-0.0093,+0.0106] OK
+  OLD      5.6958  2.2846  13.0123  | OLD:+1.2742                 [-0.0782,-0.0592]    [-0.0334,-0.0149]
+  N19      5.6482  2.5562  14.4377  | N19:+1.2327
+nasa
+  igzip    1.6043  2.3004   3.6869  |
+  A        2.1705  2.1299   4.6228  | A:+0.5765 [+0.5727,+0.5787] +0.0808 A SLOWER     -0.0039 TIE          -0.0006 [-0.0039,+0.0022] OK
+  OLD      2.0913  2.0679   4.3245  | OLD:+0.4988                 [+0.0679,+0.0856]    [-0.0100,+0.0039]
+  N19      2.1725  2.1557   4.6832  | N19:+0.5762
+monorepo
+  igzip    3.0109  2.2734   6.8448  |
+  A        4.3583  2.0864   9.0895  | A:+1.3262 [+1.3134,+1.3401] +0.2330 A SLOWER     -0.0019 TIE          -0.0071 [-0.0172,+0.0030] OK
+  OLD      4.1404  2.0551   8.5008  | OLD:+1.0898                 [+0.2108,+0.2477]    [-0.0142,+0.0273]
+  N19      4.3380  2.1213   9.2010  | N19:+1.3202
+```
+SELF-TEST: all 3 corpora include 0 (randomized order killed the +0.006 silesia warmup bias). SIGNS CONFIRMED: A loses igzip ×3; A beats OLD on silesia ONLY (faster −0.069 sig; loses nasa +0.081 sig, monorepo +0.233 sig); A faster-or-TIE vs N19 on all 3 (silesia faster −0.022 sig; nasa/monorepo TIE). instr/B gap to igzip = +2.77 / +0.94 / +2.25 (reproduces NIGHT22). The decisive question's answer is UNCHANGED and now gate-final: structural identity to igzip did NOT close the gap; the residual is INSTRUCTION-bound (instr/B), not the modeled structural elements.
+
 ## ====== NIGHT22 (2026-06-19, branch kernel-converge-A @0efc6c46, base 621e95fe=NIGHT20+elemB) — THE DECISIVE GATE RAN: element A (single-state-base) is BYTE-EXACT (quad-oracle 5-corpus T1/T4/T8 both flavors + NIGHT21 differential) and the campaign's moment-of-truth perf is MEASURED. ANSWER: structural convergence on igzip did NOT close the gap — A still LOSES igzip on all 3 corpora; A beats OLD-chunkt1 on silesia ONLY (1/3); A beats NIGHT19 on silesia only (others TIE). The residual to igzip is now INSTRUCTION-bound (instr/B), NOT the modeled structural elements (base regs / anchor stores / cadence — those are converged). NOT a promote by the perf bar → HONEST RESIDUAL FINDING. Intel-LXC, NOT-YET-LAW (AMD owed). ======
 
 ### THE DECISIVE PERF (Gate-0 self-validated; PIN=cpu4, N=21 paired interleaved IG,IG2,A,OLD,N19; /dev/null both arms; powersave GHz~1.394 — cyc/B is freq-invariant + paired; box load host-wide ~3.9→7.2 but container CPU idle, single-core pinned)
