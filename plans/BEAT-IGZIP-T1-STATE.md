@@ -1,5 +1,97 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== CHUNK-SIZE SESSION (2026-06-19 night6) — DETERMINATION: T1 chunk-size IS a real byte-exact gated lever; SHIPPED thread-gated (1 MiB default at T1). Refutes the night5 "cheap levers exhausted" R3 (3rd premature-closure). Route 2 BOUNDED (corrects night5 over-claim). (gated, byte-exact, Intel-only NOT-YET-LAW) ======
+MISSION (advisor caught the night5 R3 as the 3rd premature "levers exhausted"): two cheap
+things were NOT done before escalating — (1) the CHUNK_SIZE × pool-retain cross at T1
+depth-1 (depth's untested analogue; the fault-floor formula is depth×chunk-output-pages and
+only depth had been swept), and (2) a proper cyc/B bound on Route 2 (output-streaming).
+
+### TASK 1 — CHUNK_KIB × pool-retain CROSS at T1 depth-1 = GATED BYTE-EXACT WIN (chunk-size; retain REFUTED)
+STAGE-A probe (perf -r5, t1prod, cpu4, /dev/null, GZIPPY_CHUNK_KIB×{MANUAL_BUFFER_POOL on/off}):
+| corpus  | config       | faults | cyc/B  | (igzip faults/cyc/B) |
+|---------|--------------|--------|--------|----------------------|
+| nasa    | c_def_roff   | 11379  | 2.1817 | 667 / 1.5865         |
+| nasa    | c1024_roff   | 3769   | 2.0595 |                      |
+| nasa    | c512_roff    | 2631   | 2.0573 |                      |
+| nasa    | c256_roff    | 2358   | 2.0912 | (c256 OVER-shoots — too many chunks) |
+| silesia | c_def_roff   | 13910  | 5.7144 | 668 / 4.3973         |
+| silesia | c1024_roff   | 8097   | 5.6380 |                      |
+| silesia | c512_roff    | 5194   | 5.6927 |                      |
+| silesia | c256_roff    | 4586   | 5.7266 |                      |
+- **RETAIN (GZIPPY_MANUAL_BUFFER_POOL) is INERT**: roff≈ron at EVERY chunk size (faults & cyc/B
+  identical). The prompt's "lever only fires with a retained-resident reused buffer" HALF is
+  REFUTED. The REAL mechanism: smaller chunk → smaller per-chunk output buffer → stays UNDER the
+  allocator mmap threshold → the depth-1 in-order drain's DROP returns it to the DEFAULT
+  allocator's arena, and the next chunk's same-size alloc gets those WARM already-faulted pages
+  back (no munmap/refault). No manual pool needed. (Large 4 MiB-chunk → ~40 MiB(nasa)/~12 MiB(sil)
+  decoded buf > mmap threshold → mmap+munmap each chunk → refault. That is the night-series
+  "first-touch 24k/54k faults" mechanism, now mostly removed by simply shrinking the chunk.)
+- OPTIMUM = c1024 (1 MiB): best JOINT (nasa ties c512, silesia clearly best); c256 over-shoots.
+
+GATE 1+2 — paired N=15 cyc/B (analyzer A1/A2/B interleaved, perf cpu_core, cpu4, /dev/null,
+SAME binary env-only A=default B=GZIPPY_CHUNK_KIB=1024); GATE-0 PASS (KERN 25389/24129, byte-exact,
+self-test A2-A1 CI-incl-0 p>0.5, GHz<0.21%):
+| corpus  | medΔ cyc/B (B−A1)   | 95%CI            | Wilcox p  | faults A→B      | verdict |
+|---------|---------------------|------------------|-----------|-----------------|---------|
+| nasa    | -0.12490 (-5.69%)   | [-0.133,-0.120]  | 0.000727  | 11381→3769 -67% | SIGNIF  |
+| silesia | -0.07851 (-1.37%)   | [-0.098,-0.039]  | 0.001092  | 13911→8095 -42% | SIGNIF  |
+PRODUCTION confirm (TWO DISTINCT binaries, NO env): A=gzippy-t1prod (4 MiB), B=gzippy-chunkt1
+(1 MiB T1 default): nasa -0.116 cyc/B (-5.32%) CI[-0.120,-0.105] p=0.0007; silesia -0.067 cyc/B
+(-1.16%) CI[-0.075,-0.060] p=0.0007. Self-test PASS. T1 WALL /dev/null: nasa 0.329→0.309 (-6.1%),
+silesia 0.874→0.863 (-1.3%); tmpfs nasa 0.440→0.429, silesia 1.001→0.990.
+
+### THE DIFF (commit ca70e9d1 on perf/igzip-full-rewrite) — ONE production path, thread-gated
+`single_member.rs`: new const `T1_TARGET_COMPRESSED_CHUNK_BYTES = 1 MiB`; `decompress_parallel`
+picks `thread_default_chunk = if num_threads<=1 { 1 MiB } else { 4 MiB }` as the `default_chunk`
+fallback. Explicit `GZIPPY_CHUNK_KIB` still overrides. asm/kernel UNTOUCHED.
+
+### T>1 NO-REGRESSION (HARD GATE) — why it MUST be T1-gated
+With GZIPPY_CHUNK_KIB=1024 at T>1 (env, all-threads) silesia REGRESSES: T4 wall 0.482→0.574/0.578
+(+19/20%, confirmed 2×), T8 +5.7% (then tie) — more/smaller chunks add block-finder+scheduling
+overhead in the parallel pipeline. nasa T4/T8 fine. ⇒ the num_threads>1 path KEEPS 4 MiB. PROD
+binary T>1 == old (structurally unchanged; T4/T8 wall+RSS old-vs-new identity confirmed). Byte-exact
+T1/T4/T8 on nasa/silesia/monorepo/squishy.
+
+### TASK 2 — ROUTE 2 (output-streaming/residency) cyc/B BOUND on the NEW baseline (CORRECTS night5 "unbounded")
+Re-ran the EXISTING GZIPPY_RESIDENT_OUTPUT_POOL=1 oracle (paired N=11) on gzippy-chunkt1:
+| corpus  | medΔ cyc/B          | 95%CI            | Wilcox p | faults A→B      | verdict   |
+|---------|---------------------|------------------|----------|-----------------|-----------|
+| nasa    | -0.00542 (-0.26%)   | [-0.013,+0.002]  | 0.1197   | 3769→3771 FLAT  | WASH/TIE  |
+| silesia | -0.08396 (-1.49%)   | [-0.089,-0.081]  | 0.003857 | 8096→4999 -38%  | SIGNIF    |
+⇒ Route 2 is BOUNDED, NOT "unbounded": ≤~1.5% cyc/B (silesia) / ~0 (nasa). The small-chunk win
+already CONSUMED nasa's materialization headroom (nasa residency now washes out). Matches night3's
+~1% WALL bound. CORRECTION to the night5 R3 below: Route 2 is bounded (~1% wall / ≤1.5% cyc/B sil,
+~0 nasa), NOT unbounded. NB this oracle is NOT shippable as-is (night3: T>1 RSS/wall regression
+when global; the 64 MiB over-reserve also fights small chunks) — it only BOUNDS the prize.
+
+### NEW SCOREBOARD (canonical mission instrument gzippy-chunkt1 vs igzip, T1, paired N=11, GATE-0+self PASS)
+| corpus  | igzip cyc/B | gzippy cyc/B | medΔ (B−A1)      | 95%CI            | verdict       | (night5 was) |
+|---------|-------------|--------------|------------------|------------------|---------------|--------------|
+| silesia | 4.397       | 5.640        | +1.2415 (+28.1%) | [+1.235,+1.249]  | SIGNIF-slower | +1.317/+29.8%|
+| nasa    | 1.587       | 2.067        | +0.4806 (+30.3%) | [+0.475,+0.488]  | SIGNIF-slower | +0.600/+38.0%|
+CAMPAIGN PROGRESSION: silesia +1.70→+1.24 cyc/B; nasa +1.84→+0.48 cyc/B. gzippy-native T1 still
+LOSES; parity NOT reached. RE-VERIFY: `GZIPPY=/root/bin/gzippy-chunkt1 PIN=4 REPS=11
+CORPORA="silesia nasa" SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash
+/root/distpreload-harness/_gzippy_vs_igzip_paired_guest.sh`. Chunk sweep+paired+T>1+wall+Route2:
+`scripts/bench/{chunk_retain_probe,chunk_paired,chunk_tn_guard,chunk_prod_wall,route2_bound}.sh`
+(transferred to /tmp on guest). Binaries: gzippy-t1prod (old 4 MiB, 261f1ebf), gzippy-chunkt1
+(new T1=1 MiB, e5266440, == commit ca70e9d1 native).
+
+### TASK 3 — VERDICT
+1. CHUNK-SIZE is a real, cheap, byte-exact, gated T1 lever — BANKED + SHIPPED (commit ca70e9d1).
+   This is the 3rd time a "levers exhausted" R3 was PREMATURE — chunk-size was an untested cheap
+   lever and it paid (nasa -5.3%, silesia -1.2% cyc/B; nasa igzip-gap +38%→+30%).
+2. Route 2 is now properly BOUNDED (≤1.5% cyc/B silesia, ~0 nasa) — the night5 "unbounded" is
+   corrected. A residual SILESIA-only residency micro-lever (~0.084 cyc/B) exists but is small,
+   silesia-only, and carries the night3 T>1 caveat (would need a T1-gated small-fixed-reserve
+   resident pool, NOT the 64 MiB oracle) → HYPOTHESIS (unvalidated) for a future cheap-pass.
+3. With chunk-size banked + Route 2 bounded small, the DOMINANT remaining gap is now credibly the
+   diffuse inner-Huffman KERNEL (Route 1, ceiling +0.908 cyc/B silesia, diffuse across
+   refill/classify/loop-overhead) = a multi-session asm-cadence convergence. THIS is now a
+   properly-grounded R3 (cheap levers mined THIS session, not asserted): silesia residual is
+   kernel-bound; nasa residual = diffuse kernel + the depth×chunk-output-page fault floor (now
+   already at ~3769 with 1 MiB chunks). AMD/Zen2 replication of all of this owed before LAW.
+
 ## ====== TASK-0 CORRECTNESS GATE (2026-06-18 night5) — OWED depth-change verification: PASS on BOTH flavors ======
 The night4 T1-depth change (commit 68fdbda5, thread-gated RecycleDeferral; touches the
 recycle/drain lifecycle) needed its FULL serialized lib-suite correctness gate, which the
