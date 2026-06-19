@@ -174,6 +174,21 @@ pub const EXIT_RECLASS_SUBTABLE: u64 = 6; // dist subtable pointer (the removabl
 pub const EXIT_RECLASS_BADDIST: u64 = 7; // distance==0 or >MAX_WINDOW (invalid)
 pub const EXIT_RECLASS_MARKER: u64 = 8; // src<out_base (window-absent backref — OUT OF SCOPE)
 
+// FLOOR ORACLE (NIGHT16): the ANCHOR-FREE exits. After the subtable inline the
+// ONLY in-stream bail on valid data is EOB; inlining EOB here POST-consume (no
+// un-consume — cursor left PAST the EOB, caller sets at_end_of_block + commits,
+// mirror of careful-loop EOB marker_inflate.rs:3421-3424) leaves NOTHING using
+// the per-iteration p0/d0 anchor, which is then deleted to read the floor.
+// HARDFAIL is the anchor-free terminal for the rare dist-side invalid paths
+// (raw0/baddist/marker/oversize) that used to un-consume via the anchor; with
+// the anchor gone they cannot un-consume, so they hand the caller a hard
+// InvalidHuffmanCode. These fire ZERO times on valid silesia/nasa (subtable
+// inline drove every reclass_* except EOB to 0), so the floor decode is exact
+// on both corpora; a corpus that DID hit them would error (this is an ORACLE,
+// not a promotable binary — promotion needs the rare paths re-handled).
+pub const EXIT_EOB_CONSUMED: u64 = 9;
+pub const EXIT_HARDFAIL: u64 = 10;
+
 /// The single dispatch predicate for the knob-exclusion rule (charter §3.5)
 /// — pure so it is unit-testable. `enabled()` (env + CPU) is checked
 /// separately by the call site; this covers the per-call state.
@@ -437,26 +452,16 @@ mod imp {
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
-                // ── NIGHT11 MINIMAL UN-CONSUME ANCHOR (the night9 4-store X2
-                //    snapshot is DELETED — see DIVERGENCE LEDGER). The late-
-                //    discriminator body below CONSUMES + REFILLS + speculatively
-                //    STORES before it knows the packet is non-literal, so a rare
-                //    bail must hand Rust the packet UN-consumed (X2). Instead of
-                //    snapshotting all four of (bitbuf,bitsleft,pos,dst), save the
-                //    TWO values a bail cannot otherwise recover:
-                //      [ctx+56] = p0 = pos*8 - bitsleft  (iteration-top BIT
-                //        position). REFILL-INVARIANT (Bits::refill's |56 + pos
-                //        advance preserve pos*8-bitsleft), so it is the un-
-                //        consumed packet start regardless of the body's
-                //        consume/refill. A bail re-reads the whole cursor from it
-                //        (the consumed low bits are shifted out — unrecoverable
-                //        from post-consume registers).
-                //      [ctx+64] = dst (iteration-top dst; un-consume target).
-                //    ONE bit-cursor store + one dst store, vs night9's four.
-                "lea {t2}, [{pos} * 8]",
-                "sub {t2}, {bitsleft}",
-                "mov qword ptr [{ctx} + 56], {t2}",   // p0
-                "mov qword ptr [{ctx} + 64], {dst}",  // d0
+                // ── FLOOR ORACLE (NIGHT16): the NIGHT11 per-iteration
+                //    UN-CONSUME ANCHOR (lea/sub + the two stores
+                //    [ctx+56]=p0 / [ctx+64]=d0, paid EVERY iteration ~13M× on
+                //    silesia) is DELETED. After the subtable inline (91:→94b)
+                //    the only in-stream bail on valid data is EOB, now handled
+                //    POST-consume (82:/84: → EXIT_EOB_CONSUMED, no un-consume),
+                //    and the rare dist-side invalid paths HARDFAIL (90/92/93/
+                //    8/83 → EXIT_HARDFAIL, no un-consume). Nothing reads p0/d0
+                //    anymore, so the anchor is pure dead per-iteration overhead
+                //    — its removal is exactly the floor this oracle measures.
                 // ── decode_next_lit_len on the preloaded entry {t1} (igzip
                 //    322-372 / loop_block 515): extract bit_count + sym_count.
                 //    LARGE_FLAG → long table (cold); bc==0 → invalid (cold).
@@ -551,7 +556,7 @@ mod imp {
                 //    start (base for a lone backref; base+(cnt-1) past the
                 //    literal prefix for a pack). {dpre} carries the preloaded
                 //    dist entry into `58:`.
-                "je 82f",                             // EOB → restore + RECLASS tag 2
+                "je 84f",                             // EOB (main body; dst=d0+cnt) → dec + EXIT_EOB_CONSUMED
                 "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
                 "ja 30f",                             // oversize → restore + RECLASS
                 "dec {dst}",                          // base+cnt → copy start
@@ -613,9 +618,9 @@ mod imp {
                 "add {pos}, {t4}",
                 "or {bitsleft}, 56",
                 "cmp {t5:e}, 256",
-                "je 82f",                             // long EOB → restore + RECLASS
+                "je 82f",                             // long EOB (dst=d0, no spec store) → EXIT_EOB_CONSUMED, no dec
                 "cmp {t5:e}, 512",
-                "ja 8f",                              // long oversize lone → restore + RECLASS tag 0
+                "ja 8f",                              // long oversize lone → EXIT_HARDFAIL
                 "mov {dpre:e}, {bitbuf:e}",
                 "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
                 "mov {dpre:e}, dword ptr [{dtbl} + {dpre}*4]",
@@ -810,31 +815,19 @@ mod imp {
                 "mov {dst}, {t2}",                    // dst advances by exactly length
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
-                // ── RECLASS un-consume via FROM-DATA RE-READ (X2). The igzip-
-                //    shape body consumes+refills+spec-stores before the late
-                //    discriminator, so a rare exit hands Rust the packet UN-
-                //    consumed. Each bail sets {ret}=tag and jumps to 85: which
-                //    reconstructs the cursor from the iteration-top bit anchor
-                //    [ctx+56]=p0 (NOT a 4-value snapshot):
-                //      byte = p0>>3 ; skip = p0&7
-                //      bitbuf = load_u64(in_ptr+byte) >> skip   (low 64-skip bits = the
-                //                                                bitstream from p0)
-                //      bitsleft = 64 - skip   (∈[57,64] ⇒ X5 bitsleft>=48 holds)
-                //      pos = byte + 8 ; dst = [ctx+64]=d0
-                //    8-byte read in-range by IN_MARGIN (p0>>3 <= pos < in_lim =
-                //    len-40 ⇒ byte+8 < len). Byte-exact: p0 is the exact un-
-                //    consumed packet start; the re-read yields the SAME low bits
-                //    decode_prefilled reads (a different but equivalent cursor
-                //    REPRESENTATION). The ref model uses the identical re-read in
-                //    lockstep; the caller only re-runs decode_prefilled(&lb),
-                //    never inspecting the cursor shape. igzip has no counterpart
-                //    (stateless — it never un-consumes).
-                // NIGHT15 decomposed dist-bail labels (replace the lumped 80:).
-                // All reconstruct identically at 85: (re-read from p0, dst=d0);
-                // the only difference is the stat tag in {ret}. Byte-transparent.
+                // ── FLOOR ORACLE (NIGHT16): the rare dist-side invalid paths
+                //    HARDFAIL. The anchor that let them un-consume (re-read the
+                //    cursor from [ctx+56]=p0 at the old 85: block) is DELETED, so
+                //    they cannot hand Rust an un-consumed packet; instead they
+                //    set {ret}=EXIT_HARDFAIL and exit, and the caller turns that
+                //    into a terminal InvalidHuffmanCode. On valid corpora these
+                //    fire ZERO times (after the subtable inline every reclass_*
+                //    except EOB reads 0 on silesia+nasa), so the floor decode is
+                //    byte-exact there. (A corpus that hit raw0/baddist/marker/
+                //    oversize would error — this is an ORACLE, not promotable.)
                 "90:",
-                "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
-                "jmp 85f",
+                "mov {ret}, 10",                      // EXIT_HARDFAIL raw==0 (hole/invalid)
+                "jmp 9f",
                 // FLOOR ORACLE (NIGHT16): INLINE subtable-dist (igzip
                 // decode_next_dist long path, igzip_decode_block_stateless.asm
                 // macro 396-440; mirror of production careful path
@@ -861,37 +854,38 @@ mod imp {
                 "mov {t1:e}, dword ptr [{dtbl} + {t4}*4]",   // leaf entry
                 "jmp 94b",
                 "92:",
-                "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
-                "jmp 85f",
+                "mov {ret}, 10",                      // EXIT_HARDFAIL bad-distance (0 / >window)
+                "jmp 9f",
                 "93:",
-                "mov {ret}, 8",                       // RECLASS marker (src<out_base; out of scope)
-                "jmp 85f",
+                "mov {ret}, 10",                      // EXIT_HARDFAIL marker (src<out_base; out of scope)
+                "jmp 9f",
+                // ── FLOOR ORACLE (NIGHT16): EOB inlined POST-consume (no
+                //    un-consume). 84: is the main-body entry (dst=d0+cnt after
+                //    the speculative store), so `dec {dst}` backs off the phantom
+                //    EOB byte → dst = d0+(cnt-1) (= the leading-literal end). The
+                //    long-path EOB (21:→`je 82f`) skips the dec (it never spec-
+                //    stored; dst is still d0 = d0+(1-1)). Both fall into 82:
+                //    which returns EXIT_EOB_CONSUMED with the cursor LEFT past
+                //    the EOB (post-consume+refill); the caller accounts the
+                //    leading literals (delta), sets at_end_of_block, and commits
+                //    (mirror of careful-loop EOB marker_inflate.rs:3421-3424).
+                "84:",
+                "dec {dst}",
                 "82:",
-                "mov {ret}, 2",                       // RECLASS, lone-EOB tag
-                "jmp 85f",
+                "mov {ret}, 9",                       // EXIT_EOB_CONSUMED
+                "jmp 9f",
                 "83:",
-                "mov {ret}, 3",                       // RECLASS, multi-trailing tag
-                "jmp 85f",
+                "mov {ret}, 10",                      // EXIT_HARDFAIL multi-trailing oversize
+                "jmp 9f",
                 // ── exits ───────────────────────────────────────────────
                 "8:",
-                "mov {ret}, 0",                       // RECLASS (lone/long oversize — CONSUMED)
-                "jmp 85f",                            // → reconstruct
-                "85:",
-                "mov {t2}, qword ptr [{ctx} + 56]",   // p0
-                "mov {t1}, {t2}",
-                "and {t1:e}, 7",                      // skip = p0 & 7
-                "shr {t2}, 3",                        // byte = p0 >> 3
-                "mov {bitbuf}, qword ptr [{in_ptr} + {t2}]",
-                "shrx {bitbuf}, {bitbuf}, {t1}",      // >> skip
-                "mov {bitsleft:e}, 64",
-                "sub {bitsleft}, {t1}",               // bitsleft = 64 - skip
-                "lea {pos}, [{t2} + 8]",              // pos = byte + 8
-                "mov {dst}, qword ptr [{ctx} + 64]",  // dst = d0
+                "mov {ret}, 10",                      // EXIT_HARDFAIL (lone/long oversize)
                 "jmp 9f",
-                // ── invalid (bc==0) exit: reached PRE-consume (short 438 /
-                //    long 546), so the cursor is ALREADY at the un-consumed
+                // ── invalid (bc==0) exit: reached PRE-consume (short / long
+                //    decode top), so the cursor is ALREADY at the un-consumed
                 //    packet start and dst is still d0 — leave both UNCHANGED
-                //    (X6), no re-read. ──
+                //    (X6), no re-read. This is the ONE anchor-free RECLASS that
+                //    survives (the careful path re-decodes from the same cursor).
                 "86:",
                 "mov {ret}, 0",                       // RECLASS (invalid)
                 "9:",
@@ -935,6 +929,10 @@ mod imp {
             super::EXIT_RECLASS_SUBTABLE => &KERN_RECLASS_SUBTABLE,
             super::EXIT_RECLASS_BADDIST => &KERN_RECLASS_BADDIST,
             super::EXIT_RECLASS_MARKER => &KERN_RECLASS_MARKER,
+            // FLOOR ORACLE (NIGHT16): EOB now exits POST-consume (count under
+            // the eob bucket); HARDFAIL is a terminal invalid (count as reclass).
+            super::EXIT_EOB_CONSUMED => &KERN_RECLASS_EOB,
+            super::EXIT_HARDFAIL => &KERN_EXIT_RECLASS,
             _ => &KERN_EXIT_RECLASS,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -1046,19 +1044,15 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if *dst >= out_lim || lb.pos >= in_lim {
             return EXIT_BOUNDARY;
         }
-        // NIGHT11 MINIMAL UN-CONSUME ANCHOR (lockstep with the asm's
-        // [ctx+56]=p0 / [ctx+64]=d0 capture): the night9 4-value snapshot is
-        // DELETED. Capture only the iteration-top BIT POSITION `p0` (refill-
-        // invariant) and `d0`; a rare bail reconstructs the whole cursor from
-        // `p0` via the identical from-data re-read (`reclass_reread`).
-        let p0: usize = lb.pos * 8 - lb.bitsleft as usize;
-        let d0: usize = *dst;
+        // FLOOR ORACLE (NIGHT16): the per-iteration p0/d0 anchor is DELETED in
+        // lockstep with the asm. After the subtable inline the only in-stream
+        // bail is EOB (now handled POST-consume) and the rare invalid paths
+        // (now HARDFAIL), neither of which un-consumes — so nothing needs the
+        // anchor. The ONE surviving un-consume-free RECLASS is the bc==0
+        // invalid below: decode_prefilled consumed nothing, so the cursor is
+        // already at the packet start and *dst is unchanged (X6), no re-read.
         let pre = lut.decode_prefilled(lb);
         if pre.bit_count == 0 {
-            // invalid (asm `86:`): decode_prefilled consumed nothing, so the
-            // cursor is already at the un-consumed packet start and dst is still
-            // d0 — leave both UNCHANGED (X6), no re-read. (p0/d0 used by the
-            // consumed-bail paths below.)
             return EXIT_RECLASS;
         }
         let cnt = pre.sym_count as usize;
@@ -1086,11 +1080,18 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if trailing <= 255 {
             continue; // literal → loop (the hot back-edge)
         }
-        // ── non-literal arm: EOB / oversize → un-consume + RECLASS ──
-        if trailing == 256 || trailing > super::lut_huffman::MAX_LIT_LEN_SYM {
-            reclass_reread(lb, p0);
-            *dst = d0;
-            return EXIT_RECLASS;
+        // ── non-literal arm ── FLOOR ORACLE (NIGHT16):
+        // EOB → inlined POST-consume (mirror asm 84:/82:). The EOB litlen is
+        // already consumed+refilled; the spec store advanced *dst by cnt, so
+        // back off the phantom EOB byte → *dst = d0+(cnt-1) (leading-literal
+        // end). Cursor left past the EOB. (Long lone EOB: cnt=1 → *dst = d0.)
+        if trailing == 256 {
+            *dst -= 1;
+            return EXIT_EOB_CONSUMED;
+        }
+        // oversize (invalid) → HARDFAIL (anchor deleted, no un-consume).
+        if trailing > super::lut_huffman::MAX_LIT_LEN_SYM {
+            return EXIT_HARDFAIL;
         }
         if cnt >= 2 {
             stats.multi_trail += 1;
@@ -1137,35 +1138,18 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
                 false
             }
         };
+        // FLOOR ORACLE (NIGHT16): raw0 / bad-distance / marker (window-absent)
+        // → HARDFAIL in lockstep with the asm (anchor deleted, no un-consume).
         if bail {
-            reclass_reread(lb, p0);
-            *dst = d0;
-            return EXIT_RECLASS;
+            return EXIT_HARDFAIL;
         }
     }
 }
 
-/// X2 un-consume reconstruction (lockstep with the asm `85:` block). Given the
-/// iteration-top absolute BIT position `p0` (= `pos*8 - bitsleft`, refill-
-/// invariant), re-read the bit cursor from the input so it points at the
-/// un-consumed packet start with `bitsleft >= 48` (X5). The consumed low bits
-/// were shifted out by `consume` and are unrecoverable from the post-consume
-/// cursor, so a from-data re-read is the only faithful un-consume. The result
-/// is a different but equivalent cursor REPRESENTATION than the pre-consume
-/// state; correctness rests on `p0` being the exact packet start and the caller
-/// only re-running `decode_prefilled(&lb)` (never inspecting the cursor shape).
-/// `byte + 8 <= data.len()` is guaranteed by IN_MARGIN inside the asm region
-/// (`p0>>3 <= pos < in_lim = len-40`).
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-#[inline]
-fn reclass_reread(lb: &mut Bits<'_>, p0: usize) {
-    let byte = p0 >> 3;
-    let skip = (p0 & 7) as u32;
-    let w = u64::from_le_bytes(lb.data[byte..byte + 8].try_into().unwrap());
-    lb.bitbuf = w >> skip;
-    lb.bitsleft = 64 - skip;
-    lb.pos = byte + 8;
-}
+// FLOOR ORACLE (NIGHT16): `reclass_reread` (the X2 from-data un-consume that
+// rebuilt the cursor from the iteration-top p0 anchor at the old asm `85:`
+// block) is DELETED — with the anchor gone there is no un-consume path: EOB
+// exits POST-consume and the rare invalid paths HARDFAIL.
 
 #[cfg(test)]
 mod tests {
@@ -1357,12 +1341,11 @@ mod tests {
                 let tag = format!("table {ti} trial {trial}");
                 // Ref reports the exit CLASS; the asm additionally tags
                 // RECLASS reasons (codes >= 2) for the effect instrument.
-                let asm_class = if asm_exit == EXIT_BOUNDARY {
-                    EXIT_BOUNDARY
-                } else {
-                    EXIT_RECLASS
-                };
-                assert_eq!(ref_exit, asm_class, "exit diverged ({tag})");
+                // FLOOR ORACLE (NIGHT16): asm + ref now return IDENTICAL raw
+                // exit codes {EXIT_BOUNDARY, EXIT_RECLASS(bc==0),
+                // EXIT_EOB_CONSUMED, EXIT_HARDFAIL} — the reason-tag collapse is
+                // gone, so compare raw exits directly.
+                assert_eq!(ref_exit, asm_exit, "exit diverged ({tag})");
                 assert_eq!(dref, dasm, "dst advance diverged ({tag})");
                 assert_eq!(lb_ref.pos, lb_asm.pos, "pos diverged ({tag})");
                 assert_eq!(lb_ref.bitbuf, lb_asm.bitbuf, "bitbuf diverged ({tag})");
@@ -1457,12 +1440,9 @@ mod tests {
                 in_lim,
                 &mut st0,
             );
-            let asm_class = if asm_exit == EXIT_BOUNDARY {
-                EXIT_BOUNDARY
-            } else {
-                EXIT_RECLASS
-            };
-            assert_eq!(ref0_exit, asm_class, "bias-0 exit diverged (trial {trial})");
+            // FLOOR ORACLE (NIGHT16): asm + bias-0 ref return IDENTICAL raw
+            // exit codes now — compare directly.
+            assert_eq!(ref0_exit, asm_exit, "bias-0 exit diverged (trial {trial})");
             assert_eq!(dref0, dasm, "bias-0 dst diverged (trial {trial})");
             assert_eq!(
                 lb_ref0.pos, lb_asm.pos,
@@ -1661,12 +1641,11 @@ mod tests {
                 let tag = format!("pair {pi} ({tag0}) trial {trial}");
                 // Ref reports the exit CLASS; the asm additionally tags
                 // RECLASS reasons (codes >= 2) for the effect instrument.
-                let asm_class = if asm_exit == EXIT_BOUNDARY {
-                    EXIT_BOUNDARY
-                } else {
-                    EXIT_RECLASS
-                };
-                assert_eq!(ref_exit, asm_class, "exit diverged ({tag})");
+                // FLOOR ORACLE (NIGHT16): asm + ref now return IDENTICAL raw
+                // exit codes {EXIT_BOUNDARY, EXIT_RECLASS(bc==0),
+                // EXIT_EOB_CONSUMED, EXIT_HARDFAIL} — the reason-tag collapse is
+                // gone, so compare raw exits directly.
+                assert_eq!(ref_exit, asm_exit, "exit diverged ({tag})");
                 assert_eq!(dref, dasm, "dst advance diverged ({tag})");
                 assert_eq!(lb_ref.pos, lb_asm.pos, "pos diverged ({tag})");
                 assert_eq!(lb_ref.bitbuf, lb_asm.bitbuf, "bitbuf diverged ({tag})");
