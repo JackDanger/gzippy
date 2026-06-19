@@ -27,17 +27,16 @@ for corp in $CORPORA; do
       # sha check
       S=$(GZIPPY_FORCE_PARALLEL_SM=1 "$BIN" -d -c -p$T "$F" 2>/dev/null | sha256sum | cut -c1-16)
       SOK=$([ "$S" = "$REF" ] && echo OK || echo BAD)
-      best=99999; rss=0
+      best=999999; rss=0
       for r in $(seq 1 $REPS); do
-        t0=$(date +%s.%N)
         $TIME -v env GZIPPY_FORCE_PARALLEL_SM=1 "$BIN" -d -c -p$T "$F" >/dev/null 2>/tmp/wt.err
-        t1=$(date +%s.%N)
-        el=$(echo "$t1 - $t0" | bc -l)
+        # parse /usr/bin/time -v "Elapsed (wall clock) time (h:mm:ss or m:ss): M:SS.ss"
+        el=$(grep "Elapsed (wall clock)" /tmp/wt.err | sed 's/.*: //' | awk -F: '{if(NF==3)print $1*3600+$2*60+$3; else print $1*60+$2}')
         m=$(grep "Maximum resident" /tmp/wt.err | grep -o '[0-9]*')
-        awk "BEGIN{exit !($el < $best)}" && best=$el
+        best=$(awk -v e="$el" -v b="$best" 'BEGIN{print (e<b)?e:b}')
         [ "${m:-0}" -gt "$rss" ] && rss=$m
       done
-      printf "  %-8s T%-2s %-4s best=%.4fs  peakRSS=%sKB (%.1fMB)\n" "$corp" "$T" "$arm/$SOK" "$best" "$rss" "$(awk "BEGIN{print $rss/1024}")"
+      printf "  %-8s T%-2s %-6s best=%ss  peakRSS=%sKB (%.1fMB)\n" "$corp" "$T" "$arm/$SOK" "$best" "$rss" "$(awk -v r="$rss" 'BEGIN{print r/1024}')"
     done
   done
 done
