@@ -218,6 +218,14 @@ pub struct KernCtx {
     /// decode can bail; the restore rolls dst back, and the already-stored
     /// packed bytes become X3 overshoot garbage above the exit dst).
     pub save_dst: u64,
+    /// +80: per-iteration cursor snapshot of `pos` (X2 restore). The
+    /// igzip-shape late-discriminator body refills (advancing `pos`) BEFORE
+    /// it knows the packet is non-literal, so every rare bail (EOB, oversize,
+    /// invalid, dist-side) must roll `pos` back to the iteration-top value to
+    /// hand the packet to Rust UN-consumed (the refill is append-only, but a
+    /// bitbuf/bitsleft restore to the pre-consume snapshot leaves `pos`
+    /// advanced past those bits, so `pos` must be restored in lockstep).
+    pub save_pos: u64,
 }
 
 const _: () = assert!(std::mem::offset_of!(KernCtx, in_ptr) == 0);
@@ -230,6 +238,7 @@ const _: () = assert!(std::mem::offset_of!(KernCtx, save_bitbuf) == 48);
 const _: () = assert!(std::mem::offset_of!(KernCtx, save_bitsleft) == 56);
 const _: () = assert!(std::mem::offset_of!(KernCtx, short_tbl) == 64);
 const _: () = assert!(std::mem::offset_of!(KernCtx, save_dst) == 72);
+const _: () = assert!(std::mem::offset_of!(KernCtx, save_pos) == 80);
 
 /// LUT-layout constants mirrored from `lut_huffman.rs` / `libdeflate_entry.rs`
 /// (compile-checked so drift between the asm immediates and the table
@@ -392,9 +401,11 @@ mod imp {
         let ret: u64;
         unsafe {
             core::arch::asm!(
-                // ── prologue: speculative gather of the packet at the
-                //    cursor (no consume — harmless table read, exactly the
-                //    bits `decode_prefilled` reads).
+                // ── prologue: speculative preload of the CURRENT packet's
+                //    short entry (no consume — harmless table read, exactly the
+                //    bits `decode_prefilled` reads). Carried in {t1} = igzip
+                //    `next_sym`, the preloaded symbol re-loaded at the bottom of
+                //    every iteration (igzip 502 / 540 / 580-582).
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
@@ -405,76 +416,104 @@ mod imp {
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
-                // ── FLAT CLASSIFY (igzip/libdeflate fastloop shape): the
-                //    preloaded short entry {t1} is dispatched with ONE
-                //    data-dependent branch — literal-vs-non-literal — read
-                //    DIRECTLY off the BUILD-TIME trailing-class FLAG bit in
-                //    the loaded entry (`test 0x1000000`, the analog of igzip's
-                //    table carrying the symbol class), NOT by extracting and
-                //    `cmp 255`-ing the trailing symbol. The LARGE_FLAG (long)
-                //    and bc==0 (invalid) branches are perfectly-predicted on
-                //    real streams (rare, monotone). The old multi-stage
-                //    cascade (sym_count branch) AND the speculative literal
-                //    chain that RE-RAN the whole classify for the 2nd/3rd
-                //    literal are GONE: lone + multi literals are unified into
-                //    one flat path, one packet per top-iteration.
+                // ── X2 SNAPSHOT (igzip-shape un-consume support). The
+                //    late-discriminator body below CONSUMES + REFILLS +
+                //    speculatively STORES before it knows the packet is
+                //    non-literal, so every rare bail (EOB / oversize / invalid /
+                //    dist-side) must roll the cursor back to here to hand the
+                //    packet to Rust UN-consumed (X2). Four INDEPENDENT stores to
+                //    the L1-hot ctx (no dependency on the decode recurrence) —
+                //    they fill OOO slots the latency-bound loop leaves idle.
+                "mov qword ptr [{ctx} + 48], {bitbuf}",
+                "mov qword ptr [{ctx} + 56], {bitsleft}",
+                "mov qword ptr [{ctx} + 80], {pos}",
+                "mov qword ptr [{ctx} + 72], {dst}",
+                // ── decode_next_lit_len on the preloaded entry {t1} (igzip
+                //    322-372 / loop_block 515): extract bit_count + sym_count.
+                //    LARGE_FLAG → long table (cold); bc==0 → invalid (cold).
                 "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT → long (cold)
                 "jnz 20f",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 28",                     // bc = bit_count
-                "jz 8f",                              // invalid (bc==0) → Rust (pre-consume)
+                "jz 8f",                              // invalid (bc==0) → Rust
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
-                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3) — for advance/prefix
-                // ── FLAG-BIT DISCRIMINATOR (NEXT #1) ──────────────────────
-                //    Branch off the BUILD-TIME trailing-class bit (bit 24,
-                //    LARGE_TRAILING_NONLIT_FLAG) loaded WITH the entry,
-                //    instead of extracting+classifying the trailing symbol.
-                //    This removes the `lea`(shift) + `mov`/`and`/`shrx`
-                //    (extract) + `cmp` dependency chain from the LITERAL fast
-                //    path's discriminator — the Gate-2 perturbation proved
-                //    that shrx→cmp chain sits on the critical recurrence; the
-                //    branch now resolves off the load (t1) directly. The
-                //    trailing symbol is recovered only in the cold `49:` shim
-                //    on the (rarer) non-literal arm. Faithful to igzip's
-                //    table carrying the symbol-class flag in its entry.
-                "test {t1:e}, 0x1000000",             // LARGE_TRAILING_NONLIT_FLAG (bit 24)
-                "jnz 49f",                            // trailing non-literal → recover + backref/EOB arm
-                // ── pure-literal pack (cnt literals, all ≤255), SOFTWARE-
-                //    PIPELINED (igzip loop_block 514-556): SAVE the up-to-3
-                //    packed bytes, consume the packet, then INTERLEAVE the
-                //    unconditional refill (igzip refills EVERY iteration —
-                //    `or bitsleft,56` is exact for all bitsleft∈[0,63]; the
-                //    `<48` branch is GONE) and ISSUE the next-litlen preload
-                //    load, and only THEN do the speculative 8-byte store +
-                //    advance. The store/advance/back-edge/top-guards (none of
-                //    which depend on the preloaded {t1}) execute while the
-                //    preload load is in flight, hiding its L1 latency — the
-                //    IPC buy the branchless flat-classify lacked (igzip 540
-                //    loads next_sym BEFORE the dist preload + back-edge, with
-                //    the speculative store at 518 ahead of the load-use).
+                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
+                // ── TRAILING EXTRACT (igzip 520-521), UNCONDITIONAL every
+                //    iteration: next_sym2 = (packed_syms >> 8*(cnt-1)) & 0xFFFF.
+                //    Strip flag/cnt/bc with LARGE_SHORT_SYM_MASK first; & 0xFFFF
+                //    keeps a >255 length/EOB code and drops the displaced flag
+                //    bit for cnt∈{1,2}. {t4} is the scratch shift count.
+                "mov {t5:e}, {t1:e}",
+                "and {t5:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK
+                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
+                "shrx {t5}, {t5}, {t4}",
+                "and {t5:e}, 0xFFFF",                 // {t5} = trailing symbol
+                // ── SPECULATIVE STORE + advance by cnt (igzip 518-519),
+                //    UNCONDITIONAL: write the up-to-3 packed bytes and advance
+                //    dst by the full sym_count assuming a pure-literal pack. A
+                //    trailing length over-advances dst by 1 (its low byte stored
+                //    as garbage); `decode_len_dist` fixes it with one `dec dst`
+                //    so the copy overwrites it (igzip's symmetric next_out
+                //    `lea +repeat_length-1`).
                 "mov {t4:e}, {t1:e}",
-                "and {t4:e}, 0xFFFFFF",               // SAVE packed bytes (before preload clobbers t1)
-                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the whole packet
+                "and {t4:e}, 0xFFFFFF",               // packed bytes
+                "mov qword ptr [{dst}], {t4}",        // speculative 8-byte store
+                "add {dst}, {t3}",                    // advance by cnt
+                // ── CONSUME the current litlen packet (igzip decode end: SHRX
+                //    read_in; sub read_in_length). {t2} = bc.
+                "shrx {bitbuf}, {bitbuf}, {t2}",
                 "sub {bitsleft}, {t2}",
-                // ── interleaved UNCONDITIONAL refill (t2 free post-consume) ─
+                // ── REFILL, UNCONDITIONAL every iteration (igzip 528-530 +
+                //    543-547; `or bitsleft,56` exact for bitsleft∈[0,63]). Tops
+                //    bitsleft to ≥56 BEFORE the discriminator so the backref
+                //    dist decode (≤28 bits) is always in budget. {t2} free
+                //    post-consume; {t4} scratch.
                 "6:",
                 "mov {t2}, qword ptr [{in_ptr} + {pos}]",
                 "shlx {t2}, {t2}, {bitsleft}",
                 "or {bitbuf}, {t2}",
-                "mov {t5:e}, 63",
-                "sub {t5}, {bitsleft}",
-                "shr {t5}, 3",
-                "add {pos}, {t5}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
                 "or {bitsleft}, 56",
-                // ── preload NEXT litlen entry — load ISSUED EARLY ───────────
+                // ── preload NEXT litlen entry (igzip 540), issued EARLY so its
+                //    L1 load-use latency hides behind the dist preload + the
+                //    discriminator. Used by the literal back-edge; the backref
+                //    arm re-preloads post-dist-consume (igzip 580-582).
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
-                // ── speculative store + advance HIDE the preload load latency
-                "mov qword ptr [{dst}], {t4}",        // speculative 8-byte store
-                "add {dst}, {t3}",                    // advance by cnt
-                "jmp 2b",
+                // ── SPECULATIVE preload of the NEXT dist entry, EVERY iteration
+                //    (igzip 550-552): the dist code follows the just-consumed
+                //    litlen, so its short entry is at the low 9
+                //    (DistTable::TABLE_BITS) bits of the refilled bitbuf. On a
+                //    literal this load is discarded; on a length the backref arm
+                //    finds it already in flight (load latency hidden). PURE table
+                //    read — byte-exact (the ref models the same post-consume
+                //    `dist.lookup`).
+                "mov {dpre:e}, {bitbuf:e}",
+                "and {dpre:e}, 0x1FF",
+                "mov {dpre:e}, dword ptr [{dtbl} + {dpre}*4]",
+                // ── LATE DISCRIMINATOR (igzip 555-556): trailing < 256 ⇒
+                //    literal ⇒ back-edge (the HOT exit); ≥ 256 ⇒ length/EOB ⇒
+                //    fall through to the non-literal arm. THE core igzip-shape
+                //    change: all the speculation above ran before this single
+                //    data-dependent branch resolves.
+                "cmp {t5:e}, 256",
+                "jb 2b",                              // literal → loop (HOT)
+                // ── non-literal arm: EOB / oversize → restore + RECLASS; else
+                //    length → decode_len_dist. dst = base+cnt → `dec` = copy
+                //    start (base for a lone backref; base+(cnt-1) past the
+                //    literal prefix for a pack). {dpre} carries the preloaded
+                //    dist entry into `58:`.
+                "je 82f",                             // EOB → restore + RECLASS tag 2
+                "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
+                "ja 30f",                             // oversize → restore + RECLASS
+                "dec {dst}",                          // base+cnt → copy start
+                "lea {t2:e}, [{t5:e} - 254]",         // length = trailing - 254
+                "jmp 58f",                            // → shared dist+copy body
                 // ── cold bottom (long-literal path): unconditional refill +
                 //    preload, NO store (the long path stored its 1 byte already)
                 "64:",
@@ -490,7 +529,9 @@ mod imp {
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
                 "jmp 2b",
-                // ── long code at top (decode_prefilled long path; rare) ──
+                // ── long code at top (decode_prefilled long path; rare/cold).
+                //    The X2 snapshot at the iteration top already covers it.
+                //    {t2} = bc throughout.
                 "20:",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 26",                     // long_max_len (≤21)
@@ -511,75 +552,45 @@ mod imp {
                 "mov byte ptr [{dst}], {t1:l}",
                 "inc {dst}",
                 "jmp 64b",                            // → cold bottom: refill + preload + loop
-                "21:",                                // long lone non-literal
-                "mov {t5:e}, {t1:e}",                 // trailing = code (already clean, no flag bit)
-                "mov {t3:e}, 1",                      // cnt = 1 (long codes are never packed)
-                "jmp 50f",                            // skip the short-entry trailing recompute
-                // ── 49: short-entry NON-LITERAL trailing recovery (flag-bit
-                //    discriminator cold arm). Reached only from the top
-                //    `test FLAG; jnz 49f`. Reconstruct the trailing symbol the
-                //    way the old hot path did (`(syms >> 8*(cnt-1))`), then
-                //    mask 0xFFFF: for cnt∈{1,2} this drops the displaced FLAG
-                //    bit (bit 24, or bit 16 after the >>8); for cnt==3 it keeps
-                //    sym3's legitimate bit 8. t4 is scratch (recomputed in
-                //    50:). Falls through to the unified non-literal arm.
-                "49:",
-                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1) (0/8/16)
-                "mov {t5:e}, {t1:e}",
-                "and {t5:e}, 0x1FFFFFF",              // strip largeflag/cnt/bc → packed syms
-                "shrx {t5}, {t5}, {t4}",              // trailing symbol → low bits
-                "and {t5:e}, 0xFFFF",                 // strip displaced FLAG bit (cnt 1/2)
-                // ── unified non-literal arm (replaces lone `50:` + multi
-                //    `25:`): t3=cnt, t2=bc, t5=trailing(>255), t1=raw short
-                //    entry. Lone backref (cnt==1) and multi-with-trailing-
-                //    length (cnt>=2, literal prefix + trailing length) share
-                //    the dist+copy body at `58:`. X2 spill/restore makes
-                //    every dist-side bail pre-consume.
-                "50:",
-                "cmp {t5:e}, 256",
-                "je 82f",                             // EOB (lone or trailing) → Rust, tag 2
-                "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
-                "ja 30f",                             // oversize → pre-consume RECLASS
-                "mov qword ptr [{ctx} + 48], {bitbuf}",   // X2 spill (incl. dst → 80:)
-                "mov qword ptr [{ctx} + 56], {bitsleft}",
-                "mov qword ptr [{ctx} + 72], {dst}",
-                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume the whole litlen packet
+                // ── long lone non-literal (cnt=1; dst still = base = copy
+                //    start, no spec store on the long path). Consume the long
+                //    litlen, refill (dist budget), EOB/oversize gate, preload
+                //    the dist entry, length, → 58: (no `dec` — dst is already
+                //    the copy start).
+                "21:",
+                "mov {t5:e}, {t1:e}",                 // trailing = code (clean, no flag bit)
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume long litlen
                 "sub {bitsleft}, {t2}",
-                // ── SPECULATIVE DIST-ENTRY PRELOAD (igzip decode_next_dist
-                //    457 + speculative load 550-552). The distance code
-                //    immediately FOLLOWS the just-consumed litlen, so its short
-                //    entry is at the low DistTable::TABLE_BITS (=9) bits of the
-                //    post-consume bitbuf (>= 48-21 = >= 27 valid bits — bit
-                //    budget proof in the doc). Issue the entry LOAD here so it
-                //    is in flight across the cnt-branch / literal-prefix store /
-                //    length lea that follow, hiding its L1 load-use latency
-                //    before `58:` consumes it (igzip 552 loads next_sym3, 563
-                //    uses it). PURE table READ — no bit/output state changes —
-                //    so the move is byte-exact; the Rust ref models the
-                //    identical post-consume `dist.lookup(lb.bitbuf)`.
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "cmp {t5:e}, 256",
+                "je 82f",                             // long EOB → restore + RECLASS
+                "cmp {t5:e}, 512",
+                "ja 8f",                              // long oversize lone → restore + RECLASS tag 0
                 "mov {dpre:e}, {bitbuf:e}",
                 "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
                 "mov {dpre:e}, dword ptr [{dtbl} + {dpre}*4]",
-                "cmp {t3:e}, 1",
-                "je 31f",                             // lone: no literal prefix
-                "mov {t4:e}, {t1:e}",
-                "and {t4:e}, 0xFFFFFF",               // packed literal prefix
-                "mov qword ptr [{dst}], {t4}",        // speculative prefix store
-                "lea {t4:e}, [{t3:e} - 1]",
-                "add {dst}, {t4}",                    // advance by lit-prefix (cnt-1)
-                "31:",
-                "lea {t2:e}, [{t5:e} - 254]",         // length = code - 254 (3..=258)
-                "jmp 58f",                            // → shared dist+copy body
-                "30:",                                // oversize trailing (>512): pre-consume RECLASS
+                "lea {t2:e}, [{t5:e} - 254]",         // length
+                "jmp 58f",                            // dst = base = copy start
+                // ── oversize trailing (>512): restore + RECLASS, tag by cnt
+                //    (lone → 0 via 8:, multi → 3 via 83:).
+                "30:",
                 "cmp {t3:e}, 1",
                 "je 8f",                              // lone oversize → tag 0
                 "jmp 83f",                            // multi oversize → tag 3
-                // ── shared backref body: t2 = length; X2 state spilled;
-                //    {dpre} = the dist entry PRELOADED at the `50:` consume
-                //    (igzip decode_next_dist). The base+index gather (the
-                //    L1-latency load) already ran; the in-register entry decode
-                //    (consume_entry == shrx; decode_distance == bzhi>>cw + base)
-                //    follows with the load latency already hidden. ──
+                // ── shared backref body (igzip decode_len_dist). {t2}=length,
+                //    {dpre}=dist entry preloaded in the main body (igzip
+                //    550-552) or at `21:` for the long path, {dst}=copy start.
+                //    The base+index gather (the L1-latency load) already ran;
+                //    the in-register entry decode follows with latency hidden.
+                //    X2: the iteration-top snapshot makes every dist-side bail
+                //    un-consume (restore at `80:`). ──
                 "58:",
                 "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
                 "test {t1:e}, {t1:e}",
@@ -748,22 +759,40 @@ mod imp {
                 "mov {dst}, {t2}",                    // dst advances by exactly length
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
-                // ── restore + RECLASS (X2: un-consume the whole packet) ─
+                // ── restore + RECLASS (X2: un-consume the whole packet). The
+                //    igzip-shape body consumes+refills+spec-stores before the
+                //    late discriminator, so EVERY rare exit restores the full
+                //    iteration-top snapshot (bitbuf/bitsleft/pos/dst) — `pos`
+                //    too, because the main-body refill advanced it. The 8-byte
+                //    spec store(s) become X3 overshoot above the restored dst.
                 "80:",
                 "mov {bitbuf}, qword ptr [{ctx} + 48]",
                 "mov {bitsleft}, qword ptr [{ctx} + 56]",
-                "mov {dst}, qword ptr [{ctx} + 72]",  // multi path: rolls back lit_prefix
+                "mov {pos}, qword ptr [{ctx} + 80]",
+                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 4",                       // RECLASS, dist-bail tag
                 "jmp 9f",
                 "82:",
+                "mov {bitbuf}, qword ptr [{ctx} + 48]",
+                "mov {bitsleft}, qword ptr [{ctx} + 56]",
+                "mov {pos}, qword ptr [{ctx} + 80]",
+                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 2",                       // RECLASS, lone-EOB tag
                 "jmp 9f",
                 "83:",
+                "mov {bitbuf}, qword ptr [{ctx} + 48]",
+                "mov {bitsleft}, qword ptr [{ctx} + 56]",
+                "mov {pos}, qword ptr [{ctx} + 80]",
+                "mov {dst}, qword ptr [{ctx} + 72]",
                 "mov {ret}, 3",                       // RECLASS, multi-trailing tag
                 "jmp 9f",
                 // ── exits ───────────────────────────────────────────────
                 "8:",
-                "mov {ret}, 0",                       // RECLASS (pre-consume)
+                "mov {bitbuf}, qword ptr [{ctx} + 48]",
+                "mov {bitsleft}, qword ptr [{ctx} + 56]",
+                "mov {pos}, qword ptr [{ctx} + 80]",
+                "mov {dst}, qword ptr [{ctx} + 72]",
+                "mov {ret}, 0",                       // RECLASS (invalid / lone-oversize)
                 "9:",
                 ctx = in(reg) ctx as *mut KernCtx,
                 short_tbl = in(reg) ctx.short_tbl,
@@ -908,99 +937,94 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if *dst >= out_lim || lb.pos >= in_lim {
             return EXIT_BOUNDARY;
         }
+        // X2 SNAPSHOT (mirrors the asm's iteration-top 4 stores to ctx): the
+        // igzip-shape body below consumes + refills + speculatively stores
+        // BEFORE the late discriminator resolves, so every rare bail restores
+        // (bitbuf, bitsleft, pos, dst) to hand the packet to Rust un-consumed.
+        let (sb, sl, sp, sd) = (lb.bitbuf, lb.bitsleft, lb.pos, *dst);
         let pre = lut.decode_prefilled(lb);
         if pre.bit_count == 0 {
+            // invalid (asm `8:`): nothing consumed yet, the restore is an
+            // identity but kept for shape symmetry with the asm.
+            lb.bitbuf = sb;
+            lb.bitsleft = sl;
+            lb.pos = sp;
+            *dst = sd;
             return EXIT_RECLASS;
         }
-        // FLAT CLASSIFY (mirrors the rewritten asm top): the asm now branches
-        // off the BUILD-TIME trailing-class FLAG bit (entry bit 24); this ref
-        // computes the EQUIVALENT predicate by extracting the TRAILING packed
-        // symbol uniformly (`(syms >> 8*(cnt-1)) & 0xFFFF`, after stripping the
-        // flag/cnt/bc bits with `& 0x01FF_FFFF`) and testing `> 255`. The
-        // builder's invariant guarantees `flag == (trailing >= 256)`
-        // (see lut_huffman::LARGE_TRAILING_NONLIT_FLAG + the flag-invariant
-        // unit test), so the two dispatch identically — the `& 0xFFFF` here
-        // also strips the displaced flag bit for cnt∈{1,2}. Lone + multi
-        // literals are unified; NO speculative literal chain (one packet per
-        // iteration), exactly as the asm now does.
         let cnt = pre.sym_count as usize;
+        // TRAILING extract (asm 520-521), UNCONDITIONAL: the asm tests the
+        // BUILD-TIME trailing-class flag bit but the resulting predicate is
+        // exactly `trailing >= 256` (lut_huffman flag invariant); this ref
+        // extracts the trailing packed symbol the way the asm now does in the
+        // body. `& 0xFFFF` keeps a >255 length/EOB code and drops the displaced
+        // flag bit for cnt∈{1,2}.
         let trailing = ((pre.symbol & 0x01FF_FFFF) >> (8 * (cnt - 1))) & 0xFFFF;
-        if trailing > 255 {
-            // Unified non-literal arm (asm `50:`): EOB/oversize pre-consume;
-            // a multi pack stores its literal PREFIX then shares the dist+
-            // copy body; every dist-side bail restores the spilled cursor
-            // AND dst (X2). `multi_trail*` count only the cnt>=2 path (the
-            // asm `25:`-equivalent crossings the coverage gate asserts).
-            if trailing == 256 || trailing > super::lut_huffman::MAX_LIT_LEN_SYM {
-                return EXIT_RECLASS;
-            }
-            if cnt >= 2 {
-                stats.multi_trail += 1;
-            }
-            let (sb, sl, sd) = (lb.bitbuf, lb.bitsleft, *dst);
-            lb.consume(pre.bit_count);
-            if cnt >= 2 {
-                let packed = (pre.symbol & 0x00FF_FFFF) as u64;
-                out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
-                *dst += cnt - 1;
-            }
-            let length = trailing as usize - 254;
-            // Lockstep with the asm's SPECULATIVE dist-entry preload (issued at
-            // the `50:` consume): the asm gathers `dist_tbl[bitbuf & 0x1FF]`
-            // from the SAME post-consume bitbuf this `dist.lookup` reads, just
-            // earlier in program order to hide the load latency. The gathered
-            // ENTRY is identical, so the differential (state/dst/bytes) is
-            // unaffected — the preload is a timing-only transform.
-            let e = dist.lookup(lb.bitbuf);
-            let bail = if e.raw() == 0 || e.is_subtable_ptr() {
-                true
-            } else {
-                let saved = lb.bitbuf;
-                lb.consume_entry(e.raw());
-                let distance = e.decode_distance(saved) as usize;
-                if distance == 0 || distance > 32768 || distance > *dst {
-                    true
-                } else {
-                    if (lb.bitsleft as u8) < 48 {
-                        lb.refill();
-                    }
-                    unsafe {
-                        super::marker_inflate::emit_backref_contig(
-                            out.as_mut_ptr(),
-                            dst,
-                            distance,
-                            length,
-                        );
-                    }
-                    if cnt >= 2 {
-                        stats.multi_trail_completed += 1;
-                    }
-                    false
-                }
-            };
-            if bail {
-                lb.bitbuf = sb;
-                lb.bitsleft = sl;
-                *dst = sd;
-                return EXIT_RECLASS;
-            }
-            continue;
-        }
-        // Pure-literal pack (asm pure-literal path), SOFTWARE-PIPELINED:
-        // consume the whole packet, then refill UNCONDITIONALLY (lockstep with
-        // the asm's igzip-style every-iteration refill — `Bits::refill`'s fast
-        // form is bit-for-bit the asm's `or bitsleft,56` refill at this call
-        // site: pos+8<=len via the in_lim guard, bitsleft<=63 via E2), then the
-        // speculative 8-byte store + advance by cnt (store ordered after the
-        // refill, exactly as the asm issues the preload+store after refilling;
-        // store and refill are independent so the committed state is identical).
+        // SPECULATIVE STORE + advance by cnt (asm 518-519), UNCONDITIONAL — the
+        // packed literal bytes go down assuming a pure-literal pack; a trailing
+        // length over-advances dst by 1 (fixed below with `*dst -= 1`).
+        let packed = (pre.symbol & 0x00FF_FFFF) as u64;
+        out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
+        *dst += cnt;
+        // CONSUME + REFILL every iteration (asm consume + main-body refill).
         // CONSUME_BIAS != 0 only in the positive-control test (off-by-one model
         // of a wrong asm consume count); 0 == production reference.
         lb.consume(pre.bit_count + CONSUME_BIAS);
         lb.refill();
-        let packed = (pre.symbol & 0x00FF_FFFF) as u64;
-        out[*dst..*dst + 8].copy_from_slice(&packed.to_le_bytes());
-        *dst += cnt;
+        // The asm's speculative dist-entry preload (550-552) is a timing-only
+        // pure table read; the ref models it lazily at `dist.lookup` below.
+        // LATE DISCRIMINATOR (asm 555-556).
+        if trailing <= 255 {
+            continue; // literal → loop (the hot back-edge)
+        }
+        // ── non-literal arm: EOB / oversize → restore + RECLASS ──
+        if trailing == 256 || trailing > super::lut_huffman::MAX_LIT_LEN_SYM {
+            lb.bitbuf = sb;
+            lb.bitsleft = sl;
+            lb.pos = sp;
+            *dst = sd;
+            return EXIT_RECLASS;
+        }
+        if cnt >= 2 {
+            stats.multi_trail += 1;
+        }
+        // decode_len_dist: dst = base+cnt → copy start base+cnt-1 (asm `dec`).
+        *dst -= 1;
+        let length = trailing as usize - 254;
+        let e = dist.lookup(lb.bitbuf);
+        let bail = if e.raw() == 0 || e.is_subtable_ptr() {
+            true
+        } else {
+            let saved = lb.bitbuf;
+            lb.consume_entry(e.raw());
+            let distance = e.decode_distance(saved) as usize;
+            if distance == 0 || distance > 32768 || distance > *dst {
+                true
+            } else {
+                if (lb.bitsleft as u8) < 48 {
+                    lb.refill();
+                }
+                unsafe {
+                    super::marker_inflate::emit_backref_contig(
+                        out.as_mut_ptr(),
+                        dst,
+                        distance,
+                        length,
+                    );
+                }
+                if cnt >= 2 {
+                    stats.multi_trail_completed += 1;
+                }
+                false
+            }
+        };
+        if bail {
+            lb.bitbuf = sb;
+            lb.bitsleft = sl;
+            lb.pos = sp;
+            *dst = sd;
+            return EXIT_RECLASS;
+        }
     }
 }
 
@@ -1051,6 +1075,7 @@ mod tests {
             save_bitbuf: 0,
             save_bitsleft: 0,
             save_dst: 0,
+            save_pos: 0,
             short_tbl: short.as_ptr() as u64,
         };
         // Guards pass → RECLASS, state unchanged.
@@ -1188,6 +1213,7 @@ mod tests {
                     save_bitbuf: 0,
                     save_bitsleft: 0,
                     save_dst: 0,
+                    save_pos: 0,
                     short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
                 };
                 let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
@@ -1276,6 +1302,7 @@ mod tests {
                 save_bitbuf: 0,
                 save_bitsleft: 0,
                 save_dst: 0,
+                save_pos: 0,
                 short_tbl: lut.table.short_code_lookup.as_ptr() as u64,
             };
             let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
@@ -1494,6 +1521,7 @@ mod tests {
                     save_bitbuf: 0,
                     save_bitsleft: 0,
                     save_dst: 0,
+                    save_pos: 0,
                     short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
                 };
                 let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };

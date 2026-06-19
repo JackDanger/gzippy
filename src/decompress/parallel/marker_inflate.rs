@@ -3121,6 +3121,7 @@ impl Block {
                 save_bitbuf: 0,
                 save_bitsleft: 0,
                 save_dst: 0,
+                save_pos: 0,
                 short_tbl: self.lut_litlen.table.short_code_lookup.as_ptr() as u64,
             };
             macro_rules! sync_local_bits {
