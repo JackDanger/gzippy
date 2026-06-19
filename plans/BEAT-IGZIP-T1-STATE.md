@@ -1,5 +1,47 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== KERNEL-CONVERGENCE HEROIC REWRITE (night8, branch kernel-converge → perf/igzip-full-rewrite) — DESIGN SPINE LAID + BASELINE RE-ANCHORED (gated, Gate-0 PASS, Intel-only NOT-YET-LAW) ======
+MISSION (user, heroic, no-phases): converge the WHOLE inner-Huffman `run_contig` kernel on
+igzip's COMPLETE integrated `loop_block` at once until gzippy-native T1 cyc/B ≤ igzip on
+silesia AND nasa, byte-exact. Cost is a non-factor. Branch off origin/perf/igzip-full-rewrite
+@ 380f0828.
+
+### DONE THIS TURN
+1. **Convergence DESIGN doc written + committed: `plans/KERNEL-CONVERGENCE.md`** — the durable
+   spine. Maps EVERY igzip loop_block element (asm 507-627 + decode_next_lit_len/dist macros)
+   to the gz kernel state. KEY FINDING from the map: the kernel is ALREADY a faithful igzip
+   port for guards/decode/spec-store/preload-index/litlen-preload/dist-decode/MOVDQU-copy
+   (elements A,B,C,E,I,L,M ✅). GENUINELY divergent = the coupled cluster {D,G,H,K} =
+   discriminator PLACEMENT + speculation depth (gzippy branches EARLY via flag-bit `jnz 49f`
+   and skips per-iter trailing-extract/length-precompute/dist-preload; igzip branches LATE
+   and speculates ALL of it every iter to buy ILP), plus F (contiguous vs split refill),
+   J (per-iter dist preload), N (LLVM vs igzip fixed register layout). Implementation order +
+   byte-exact contract (X1-X6 + ref-model lockstep) + measurement gates are in the doc §3-6.
+2. **Baseline RE-ANCHORED, Gate-0 self-validated** (gzippy-chunkt1 sha e5266440 vs igzip,
+   paired N=9, cpu4, /dev/null, GZIPPY_FORCE_PARALLEL_SM=1; KERN sil 24137 / nasa 25389;
+   both arms sha==zcat==each other; GHz spread <0.15%; A2-A1 self-test CI-incl-0 PASS):
+   | corpus  | igzip cyc/B | gzippy cyc/B | medΔ (B-A1)       | 95%CI            | Wilcox p | ΔIPC   | Δinstr/B | verdict |
+   |---------|-------------|--------------|-------------------|------------------|----------|--------|----------|---------|
+   | silesia | 4.378       | 5.681        | +1.3073 (+29.9%)  | [+1.251,+1.350]  | 0.009152 | -0.322 | +1.570   | SIGNIF-slower |
+   | nasa    | 1.594       | 2.106        | +0.5012 (+31.5%)  | [+0.461,+0.527]  | 0.009152 | -0.251 | +0.635   | SIGNIF-slower |
+   Reproduces the STATE scoreboard (+28.1%/+30.3% @N=11) within spread. **ΔIPC NEGATIVE on
+   both** = latency-bound = the empirical signature that motivates §3.1 (igzip's deeper
+   speculation could fill the OOO window). NB LLC-miss ~24% flagged (stressor SKIPPED this
+   anchor run); final rewrite verdict owes a stressor phase. RE-VERIFY:
+   `GZIPPY=/root/bin/gzippy-chunkt1 PIN=4 REPS=9 CORPORA="silesia nasa" SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash /root/distpreload-harness/_gzippy_vs_igzip_paired_guest.sh`
+
+### CLEAN RESUME POINT (next turn — implementation)
+NEXT = KERNEL-CONVERGENCE.md §6 step 1: build TWO byte-exact binaries — (A) current
+early-flag-bit shape (= gzippy-chunkt1), (B) igzip late-discriminator full-speculation
+straight-line `run_contig` (rewrite per §3.1; update run_contig_ref_biased in LOCKSTEP) —
+on the guest /dev/shm, and run the paired harness B-vs-A and both-vs-igzip. This isolates
+the core shape question (the discriminator/speculation cluster {D,G,H,K}) with the least
+other change, BEFORE the refill (§3.2) / dist-preload (§3.3) / register-pinning (§3.4) work.
+Guest src `/root/gz-fullrewrite` @ 89dad5c8 (== mission tip minus the STATE-docs commit;
+`git pull` / checkout kernel-converge there before editing). NO main/reimplement-isa-l push.
+BOX CLEAN this turn: background ssh finished (exit 0); no guest cargo started; no pinning;
+governor untouched.
+
 ## ====== CHEAP-FAMILY SWEEP SESSION (night7) — input-mmap prefault = NOT a gated win (faults slack); T1 table-build BOUNDED (~5% sil / ~1.7% nasa, dominant litlen-LUT build NOT cheaply reducible); cheap space now mined across ALL families. (gated, byte-exact, Intel-only NOT-YET-LAW) ======
 MISSION (advisor flagged two untested cheap levers in DIFFERENT families before the endgame):
 (1) INPUT-mmap madvise/prefault (distinct fault family from all prior OUTPUT-buffer work);
