@@ -451,26 +451,40 @@ mod imp {
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
                 "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
+                // ── STEP-2(b) MASK-ONCE (igzip decode_next_lit_len macro 341
+                //    `and next_sym, LARGE_SHORT_SYM_MASK`): clear bc/cnt/
+                //    LARGE_FLAG (bits 25-31) from {t1} IN PLACE — all already
+                //    extracted (bc→{t2} @449, cnt→{t3} @451-453, LARGE_FLAG
+                //    tested @446). The single masked {t1} (= the bits-0..24
+                //    packed-symbol field) is then REUSED for BOTH the trailing
+                //    shrx (igzip 521) AND the speculative store (igzip 518) —
+                //    deleting the two scratch copies (`mov {t5},{t1}` +
+                //    `mov {t4},{t1}`) and the per-use store mask (`and 0xFFFFFF`).
+                //    {t1} is dead after the store until reloaded at the bottom
+                //    preload (497-499); the non-literal arm re-derives its needs
+                //    from {t5}/{t3}, so the in-place mask is safe. (`and r32`
+                //    zero-extends, so {t1}'s high 32 bits are 0 for the store.)
+                "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
                 // ── TRAILING EXTRACT (igzip 520-521), UNCONDITIONAL every
-                //    iteration: next_sym2 = (packed_syms >> 8*(cnt-1)) & 0xFFFF.
-                //    Strip flag/cnt/bc with LARGE_SHORT_SYM_MASK first; & 0xFFFF
-                //    keeps a >255 length/EOB code and drops the displaced flag
-                //    bit for cnt∈{1,2}. {t4} is the scratch shift count.
-                "mov {t5:e}, {t1:e}",
-                "and {t5:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK
+                //    iteration: next_sym2 = (masked >> 8*(cnt-1)) & 0xFFFF. The
+                //    post-shrx & 0xFFFF stays — drops the displaced trailing
+                //    flag bit for cnt∈{1,2} (cnt=1: bit24; cnt=2: bit16) and
+                //    keeps a >255 length/EOB code; for cnt=3 the surviving bit24
+                //    is the legitimate sym3 bit-8. {t4} is the scratch shift.
                 "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
-                "shrx {t5}, {t5}, {t4}",
+                "shrx {t5}, {t1}, {t4}",
                 "and {t5:e}, 0xFFFF",                 // {t5} = trailing symbol
                 // ── SPECULATIVE STORE + advance by cnt (igzip 518-519),
-                //    UNCONDITIONAL: write the up-to-3 packed bytes and advance
-                //    dst by the full sym_count assuming a pure-literal pack. A
-                //    trailing length over-advances dst by 1 (its low byte stored
-                //    as garbage); `decode_len_dist` fixes it with one `dec dst`
-                //    so the copy overwrites it (igzip's symmetric next_out
-                //    `lea +repeat_length-1`).
-                "mov {t4:e}, {t1:e}",
-                "and {t4:e}, 0xFFFFFF",               // packed bytes
-                "mov qword ptr [{dst}], {t4}",        // speculative 8-byte store
+                //    UNCONDITIONAL: store the masked {t1} (bits 0..24) directly
+                //    and advance dst by the full sym_count assuming a pure-
+                //    literal pack. A trailing length over-advances dst by 1 (its
+                //    low byte stored as garbage); `decode_len_dist` fixes it with
+                //    one `dec dst` so the copy overwrites it (igzip's symmetric
+                //    next_out `lea +repeat_length-1`). {t1} byte 3 (bit24) is X3
+                //    overshoot — dst advances by cnt ≤ 3 so byte 3 is never a
+                //    final output byte (identical overshoot semantics to the old
+                //    `and 0xFFFFFF` store, which only differed in byte 3).
+                "mov qword ptr [{dst}], {t1}",        // speculative 8-byte store
                 "add {dst}, {t3}",                    // advance by cnt
                 // ── CONSUME the current litlen packet (igzip decode end: SHRX
                 //    read_in; sub read_in_length). {t2} = bc.
