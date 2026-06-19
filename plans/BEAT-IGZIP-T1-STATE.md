@@ -1,5 +1,50 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT13 (2026-06-19, branch kernel-converge-faithful @ 305c723e, base eee0522b=NEW11) — STEP-2(b) MASK-ONCE-IN-REGISTER (igzip macro 341) IMPLEMENTED + DISASM-PROVEN (3 instr/iter removed from the literal hot path: 44→41). BYTE-EXACT GATE PASS (native asm-vs-ref 6/6 + native proptest 57/57 @60k cases + trioracle silesia/nasa/monorepo/squishy/large × {native,isal} × T1/4/8 sha-identical). 3-way perf (2b/NEW11/OLD vs igzip): PENDING (running on quiet box; verdict appended below when complete). DECOUPLED from STEP-2(a): mask-once needs NO freed register (it REUSES {t1}, REDUCING pressure) — so the NIGHT12 "2a+2b are one coupled change" premise is WRONG for 2b. ======
+
+### THE CHANGE (asm_kernel.rs run_contig, the literal hot path)
+Faithful transliteration of igzip `decode_next_lit_len` (igzip_decode_block_stateless.asm
+macro 341: `and next_sym, SYM_MASK` ONCE; store(518)+trailing-shrx(521) BOTH read that one
+masked reg). gz previously made TWO scratch copies of the raw short entry (`mov {t5},{t1}`
+for the trailing extract, `mov {t4},{t1}` for the store) and re-masked per use
+(`and {t4},0xFFFFFF`). NOW masks `{t1}` ONCE in place (`and {t1},0x1FFFFFF`) AFTER bc→{t2}/
+cnt→{t3}/LARGE_FLAG are extracted, then reuses {t1} for BOTH the trailing `shrx {t5},{t1},{t4}`
+AND the speculative `mov [dst],{t1}`. The post-shrx `and {t5},0xFFFF` STAYS (drops the
+displaced trailing-nonlit flag bit24 for cnt∈{1,2}). Ref model (run_contig_ref_biased)
+UNCHANGED — it models the decode RESULT, byte-identical.
+
+### BYTE-EXACT ARGUMENT (then GATED — never bank the reasoning)
+Only byte that differs new-vs-old: store byte 3 (bits 24-31). Old store (`& 0xFFFFFF`) → byte3=0;
+new store (`& 0x1FFFFFF`, bits25-31 zeroed by the 32-bit `and`) → byte3 = bit24 only (0 or 1).
+Byte 3 is at dst+3; dst advances by cnt ≤ 3 every iteration, so byte 3 is ALWAYS overshoot
+(≥ the post-advance dst) — never a final output byte (pure-lit: bit24=0 anyway; lone-length:
+the backref copy overwrites/overshoots it). X3-equivalent. → GATE confirms.
+
+### DISASM PROOF (stripped binary, hot-loop region ~line 113000; gz-new-native@7391868b vs gzippy-new11-native@8eb0d456)
+NEW11 hot loop:  `mov %r14d,%r10d` ; `and $0x1ffffff,%r10d` ; … ; `shrx %r13,%r10,%r10` ; … ;
+                 `mov %r14d,%r13d` ; `and $0xffffff,%r13d` ; `mov %r13,(%rdx)`
+2B   hot loop:   `and $0x1ffffff,%r14d` (MASK ONCE on r14=t1 in place) ; … ;
+                 `shrx %r13,%r14,%r10` (reuse) ; … ; `mov %r14,(%rdx)` (store reuse)
+REMOVED: 2× `mov rN,r14` (scratch copies) + 1× `and $0xffffff` (store mask) = **3 instr/iter**.
+Whole-binary `and $0xffffff` count 27→26 (the only mask-family delta; everything else
+identical: `and $0x1ffffff`=38, `and $0xffff`=3, `and $0xfff`=66, shrx=245 unchanged).
+
+### STEP-2(a) STRUCTURAL FINDING (re-scopes the NIGHT12 bucket table — the anchor "+4" is NOT 4-removable)
+NIGHT12's bucket (1) "ANCHOR hand-spill +4, removable via single-base" OVER-COUNTED the
+removable share. The anchor is `lea {t2},[pos*8]` + `sub {t2},bitsleft` (compute p0) + `mov
+[ctx+56]` (store p0) + `mov [ctx+64]` (store d0) = 4 instr. Per DIVERGENCE LEDGER §8 D-1, the
+p0 COMPUTE (lea+sub) is the IRREDUCIBLE un-consume divergence (igzip is stateless; gz must
+reconstruct the un-consumed packet start on a RECLASS bail; the consumed low bits are shifted
+out, so p0 MUST be (re)computed). Even with 2a's single-base freeing both short_tbl+dtbl regs,
+carrying p0+d0 in-register only deletes the 2 STORES → `lea`+`sub`+`mov ad,dst` = 3 instr (net
+−1 instruction, −2 store-port ops). So 2a removes ~1 instr, NOT 4. Combined 2a+2b: literal hot
+path 44 → ~40 vs igzip 38 → residual +2 = the irreducible D-1 un-consume (NOT a transliteration
+gap). HYPOTHESIS (unvalidated): the +2 residual cannot be closed on instr/B without abandoning
+the late-discriminator/un-consume divergence; whether cyc/B still beats via IPC/critical-path
+is the open question the perf gate settles. (2a remains a candidate for STORE-PORT relief if the
+gate shows store-port is the binding constraint — but it is NOT the path below igzip on instr/B.)
+
+
 ## ====== NIGHT12 (2026-06-19, branch kernel-converge-faithful @ d67e72a6 = NEW11) — STEP-1 DECISIVE STATIC DIFF: localized the NEW11 +3.589 instr/B (vs igzip) per-instruction. BUCKETS: anchor hand-spill +4/iter, table-format masking +4/iter, RECLASS/exit glue +1/iter, gz LEANER on spec-length+EOB −3/iter → NET +6/iter (literal hot path: gz 44 instr vs igzip 38) ≈ the gated +3.589 instr/B. DECISION RULE met: anchor(1)+masking(2) DOMINATE glue(3) → the +3.58 is a FIXABLE un-transliterated gap (NOT a structural ceiling), proceed to STEP 2 (single-base register layout + table pre-masking). This is a NEW result, NOT redundant with night11. NO asm change this turn (STEP 2 is a coupled rewrite needing the guest byte-exact gate). (static decomposition of a GATED number; the per-bucket "removable" attribution is HYPOTHESIS until STEP-2 build+measure) ======
 
 ### WHY THIS IS NOT REDUNDANT WITH NIGHT11 (the honest reconciliation — flag to supervisor)

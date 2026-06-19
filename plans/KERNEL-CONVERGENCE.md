@@ -272,6 +272,21 @@ choice. (Mission rule: a true divergence is legal when byte-exact + ledgered.)
   store + one dst store per iteration (50% fewer than night9's four), uniform across all
   bails. (A 1-store form — store `p0` only, compute `d0` from the live `cnt` in the rare
   arms — is a possible follow-up if the gate shows store-port is the binding constraint.)
+- **NIGHT13 re-scope of the STEP-2(a) "free a register" idea (single-base table co-location).**
+  An ALTERNATE way to free regs (vs dropping `dpre`): inline the litlen+dist tables into ctx
+  and address them `[ctx+disp+idx*scale]` (igzip's one-base `[state+_lit_huff_code+…]`), freeing
+  `short_tbl`+`dtbl` (2 regs). BUT even with both freed, carrying `p0`+`d0` in-register deletes
+  ONLY the 2 STORES → the anchor becomes `lea p0,[pos*8]`+`sub p0,bitsleft`+`mov d0,dst` = 3 instr
+  (net −1 instruction, −2 store-port ops). The `lea`+`sub` p0-COMPUTE is irreducible (it IS this
+  D-1 divergence — the un-consumed packet start must be (re)computed each iteration). So 2a
+  removes ~1 instr, NOT the "+4" the NIGHT12 bucket table implied. 2a is therefore a STORE-PORT
+  relief lever (worth it ONLY if the gate shows store-port binding), not the path to instr/B ≤
+  igzip. The path below igzip on instr/B does not exist while D-1 stands (residual +2/iter on the
+  literal path after 2a+2b vs igzip's stateless 0).
+- **STEP-2(b) is CONVERGENCE, not a divergence (no D-row).** mask-once-in-register (igzip macro
+  341) DELETED gz-specific scratch (two `mov rN,t1` copies + a per-use store mask), moving gz
+  TOWARD igzip's single-masked-reg reuse. It needs NO freed register (reuses `{t1}`), so it is
+  fully decoupled from 2a — falsifying NIGHT12's "2a+2b are one coupled change" premise.
 - **Gate.** Byte-exact via c1/c2/c3 asm-vs-ref differentials + prop roundtrip + tri-oracle
   sha grid; perf via the paired harness vs igzip / night9(kc) / old(chunkt1). GUEST-OWED
   (status tracked in BEAT-IGZIP-T1-STATE.md).
