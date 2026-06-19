@@ -1,6 +1,6 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
-## ====== NIGHT11 (2026-06-19, branch kernel-converge-faithful @ 3bacc1a1, base night9 c4fbc3d3) — FAITHFUL snapshot removal: minimal p0/d0 anchor + from-data RE-READ un-consume (NOT c936's pre-consume serialized cut). BYTE-EXACT confirmed on guest; perf measurement IN PROGRESS. (Intel-LXC NOT-YET-LAW) ======
+## ====== NIGHT11 (2026-06-19, branch kernel-converge-faithful @ 3bacc1a1, base night9 c4fbc3d3) — FAITHFUL snapshot removal (minimal p0/d0 anchor + from-data RE-READ un-consume, NOT c936's serialized cut). BYTE-EXACT (asm 6/6 + trioracle 30/30 + prop 57/57). GATED PERF: NEW11 ≈ night9 (the 2-store anchor is INSTRUCTION-NEUTRAL) and BOTH LOSE to OLD early-flag-bit — snapshot was NOT the lever; the ~2 instr/B gap is the full-spec speculation. §3.1 skeleton FALSIFIED a 3rd time. NOT promoted. (gated, Gate-0 PASS, Intel-LXC NOT-YET-LAW) ======
 
 ### THE CHANGE
 Deleted night9's per-iteration 4-store X2 snapshot (`save_bitbuf/+48 save_bitsleft/+56
@@ -27,21 +27,63 @@ updated; short_tbl 64->48.
   no-consume invalid bail) → fixed by the `86:` no-re-read invalid exit.
 - TRIORACLE_GATE (`scripts/bench/_trioracle_gate.sh`): **PASS** — silesia/nasa/monorepo/
   squishy/large × {native,isal} × T1/T4/T8 all sha-identical vs gzip+igzip+libdeflate+pigz.
-- OWED THIS TURN: full `--lib` both flavors (IN PROGRESS), prop_structured ≥60k, then the
-  paired perf harness vs igzip AND night9(gzippy-kc) AND old(gzippy-chunkt1).
+- prop_/lut_huffman/marker_inflate `--lib` (PROPTEST_CASES=20000, guest-side timeout):
+  **57 passed, 0 failed** (prop_structured + prop_random + prop_near_max_distance + lut +
+  marker). The FULL `--lib` run hung on the PRE-EXISTING parallel pipe-deadlock test
+  `fd_vectored_write::early_reader_death_is_clean_error_no_duplicate` (project memory:
+  test-harness deadlock on a loaded box, NOT a decoder bug) — killed (scoped), box clean.
+  The targeted run covers everything the snapshot change touches (night9 used the same
+  scoping).
 
 ### BINARIES (guest)
 /root/gz-new-native, /root/gz-new-isal (== 3bacc1a1). Compare set: /root/bin/gzippy-kc
 (night9), /root/bin/gzippy-chunkt1 (old early-flag-bit), /usr/bin/igzip. Source checkout
 /root/gzippy (branch kernel-converge-faithful). Builds in /dev/shm/n11 (native) /dev/shm/n11i (isal).
 
-### EXPECTATION (pre-registered, NOT a finding) — settle by the gated paired harness
-HYPOTHESIS: removing 2 of night9's 4 stores drops instr/B toward old WHILE holding
-night9's near-igzip IPC (-0.04) → cyc/B improves on night9. RIVAL: the full-spec
-speculation overhead (dist preload + trailing extract every iter) is the real night9>old
-gap (night10's verdict), so even total snapshot removal stays > old. Decision is the
-measured cyc/B vs igzip/kc/chunkt1 — do NOT pre-judge. If it beats old → candidate to
-promote; if it improves kc but not old → confirms night10's "lean wins" via a new angle.
+### GATED PERF RESULT (paired N=15, PIN=4, /dev/null, GZIPPY_FORCE_PARALLEL_SM=1, all 3 bins SAME box-state, Gate-0 PASS: KERN fired, sha==zcat==igzip, A2-A1 self-test CI-incl-0, GHz spread <1.7%). medΔ=(gzippy−igzip) cyc/B, LOWER=better.
+| binary (shape)                 | silesia medΔ [95%CI]    | nasa medΔ [95%CI]       | sil ΔIPC/Δinstr·B | nasa ΔIPC/Δinstr·B |
+|--------------------------------|-------------------------|------------------------|-------------------|--------------------|
+| NEW11 gz-new-native (2-store)  | +1.4534 [1.439,1.458]   | +0.6242 [0.622,0.628]  | -0.032 / +3.589   | -0.138 / +1.154    |
+| KC night9 (4-store snapshot)   | +1.5024 [1.446,1.521]   | +0.6128 [0.603,0.622]  | -0.043 / +3.595   | -0.122 / +1.155    |
+| OLD early-flag-bit (chunkt1)   | +1.3243 [1.276,1.364]   | +0.4915 [0.483,0.498]  | -0.316 / +1.585   | -0.241 / +0.626    |
+Cross-shape (sil): NEW11−KC = **−0.049** (marginal, CIs touch); NEW11−OLD = **+0.129
+(SIGNIF, CIs NON-OVERLAPPING — OLD wins)**. (nasa): NEW11−KC = +0.011 (~tie); NEW11−OLD =
++0.133 (SIGNIF).
+
+### VERDICT — §3.1 snapshot-removal HYPOTHESIS FALSIFIED; OLD early-flag-bit still WINS (do NOT promote). (gated, Gate-0 PASS, Intel-LXC NOT-YET-LAW)
+1. **NEW11 ≈ night9 (TIE).** instr/B is IDENTICAL (sil +3.589 vs +3.595; nasa +1.154 vs
+   +1.155). The 2-store anchor is INSTRUCTION-NEUTRAL vs the 4-store snapshot: removing 2
+   stores but adding the `p0` anchor arithmetic (lea+sub) + keeping 2 stores = 4 ops/iter
+   either way. So cyc/B is ~unchanged (sil marginally better via slightly higher IPC,
+   nasa marginally worse).
+2. **The snapshot was NOT the lever.** The ~2.0 instr/B GAP to OLD (NEW11/n9 +3.59 vs OLD
+   +1.585 sil; +1.15 vs +0.63 nasa) is the FULL-SPEC SPECULATION the §3.1 shape adds every
+   iteration (per-iter dist preload `dpre` + trailing extract + unconditional spec store),
+   NOT the un-consume save. Deleting the snapshot (even to 0 stores) cannot close a gap it
+   does not own. OLD wins by doing FEWER instructions despite WORSE IPC (-0.316 vs -0.03):
+   the loop is uop/throughput-bound, not latency-bound-with-idle-slots — leaner wins.
+3. **Triple-confirms night10.** Three independent byte-exact iterations on the igzip
+   late-discriminator full-speculation skeleton (night9 4-store, c936 pre-consume-serialized,
+   night11 2-store re-read) ALL land at/above OLD. The §3.1 "more speculation lifts IPC"
+   premise is FALSIFIED on this uarch across all three.
+4. **A 1-store / 0-store refinement would NOT change the verdict.** Best case (store only
+   p0, derive d0 from cnt) saves ~1 instr/iter → instr/B ~+2.6, still ≫ OLD's +1.585. The
+   speculation gap dominates. NOT worth the asm risk. RE-OPEN TRIGGER for the whole §3.1
+   skeleton: a uarch with genuine idle OOO slots (AMD/Zen2 owed), or a corpus where the
+   loop is latency-bound.
+
+### DECISION (report to supervisor; not self-blessed)
+- NEW11 is BYTE-EXACT (asm 6/6 + trioracle 30/30 + prop/lut/marker 57/57) and a clean,
+  faithful, ledgered implementation of igzip's save-at-boundary idiom — KEPT on
+  kernel-converge-faithful as the recorded byte-exact iteration with this gated verdict.
+- NOT promoted to perf/igzip-full-rewrite (loses to OLD, gated-significant; same class as
+  night9/c936).
+- The data-driven next direction (carried from night10, now reinforced): the lever to beat
+  OLD is NOT inside the un-consume machinery; it is REDUCING the §3.1 per-iter speculation
+  (toward the leaner early-flag-bit shape) OR a different front entirely. STRATEGIC FORK
+  for the supervisor: keep converging on igzip's full-spec shape (which loses at T1 on
+  Intel-LXC across 3 iters) vs accept OLD early-flag-bit as the T1 skeleton and attack the
+  scaffold/other fronts. AMD/Zen2 replication owed before any LAW.
 
 ## ====== GUEST GATE + KEY MEASUREMENT (night10, 2026-06-19, branch kernel-converge-wip @ 3202968d) — c936a4df (snapshot-removal) is FULLY BYTE-EXACT on real BMI2/AVX2, but is gated-SLOWER than BOTH night9 and the OLD early-flag-bit shape. The igzip late-discriminator full-speculation skeleton LOSES the §3.1 fork across 2 byte-exact iterations. NOT promoted. (gated, Gate-0 PASS, Intel-LXC NOT-YET-LAW) ======
 MISSION this turn: discharge the GUEST-OWED gate for c936a4df (the snapshot-removal —
