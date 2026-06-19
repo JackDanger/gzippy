@@ -378,11 +378,13 @@ mod imp {
     ///   top guards        ↔ ref `*dst >= out_lim || pos >= in_lim`
     ///   prologue/carried gather + `20:` long resolve
     ///                     ↔ lut_huffman.rs `decode_prefilled`
-    ///   flat classify (`test FLAG` bit 24 → `49f`/`50f`) ↔ ref `trailing > 255`
-    ///                     (the build-time flag == `trailing >= 256` by the
-    ///                      `make_inflate_huff_code_lit_len` invariant; the ref
-    ///                      computes the equivalent predicate, so the c2/c3
-    ///                      differential still pins the same contract)
+    ///   late discriminator (`cmp {t5}, 256` on the extracted trailing →
+    ///                      `2b`/non-literal arm) ↔ ref `trailing > 255`
+    ///                      (igzip loop_block 555-556 runtime classify; no
+    ///                      build-time class flag — gz's dead bit-24
+    ///                      TRAILING_NONLIT_FLAG was removed to match igzip's
+    ///                      table build. The c2/c3 differential pins the same
+    ///                      contract on the runtime-extracted trailing.)
     ///   pure-literal pack (lone+multi unified) ↔ ref 8-byte packed store +
     ///                       `*dst += cnt` (one packet/iter, NO chain)
     ///   bottom `6:`/`63:` ↔ ref `< 48` threshold refill
