@@ -1,5 +1,207 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== GUEST GATE + KEY MEASUREMENT (night10, 2026-06-19, branch kernel-converge-wip @ 3202968d) — c936a4df (snapshot-removal) is FULLY BYTE-EXACT on real BMI2/AVX2, but is gated-SLOWER than BOTH night9 and the OLD early-flag-bit shape. The igzip late-discriminator full-speculation skeleton LOSES the §3.1 fork across 2 byte-exact iterations. NOT promoted. (gated, Gate-0 PASS, Intel-LXC NOT-YET-LAW) ======
+MISSION this turn: discharge the GUEST-OWED gate for c936a4df (the snapshot-removal —
+only its pure-Rust ref-half was Rosetta-verifiable; the asm/AVX2 half + ALL perf were
+owed), then the KEY structural measurement (did snapshot-removal recover night9's
+regression vs old?). Guest = neurotic Intel i7-13700T LXC, /dev/shm builds (root 99% full),
+governor powersave (NOT frozen — restored nothing, froze nothing), cpu4 pin.
+
+### STEP 1 — c936a4df FULL BYTE-EXACT GATE = **PASS** (both flavors, real BMI2+AVX2)
+The asm-vs-ref differentials that SKIPPED under Rosetta (bmi2 hidden from CPUID) now RAN
+on real BMI2 and PASS — this is the core gate for the snapshot-removal change (it directly
+pins asm==ref on exit-cursor + every output byte through the edited bail classes):
+- `cargo test --lib asm_kernel -- --test-threads=1` (native pure-rust-inflate): **8/8 PASS** —
+  c1_seam_roundtrip, c2_differential_asm_vs_ref_random_streams, c3_differential_asm_vs_ref_
+  windowed_backrefs, positive_control_consume_off_by_one (harness PROVEN live), dispatch_
+  allowed_excludes_every_knob, asm_kernel_on_off_fuzz_random_gzip_members, + the 2 new
+  ref-model bail tests. ASMTEST_EXIT=0.
+- `prop_structured_roundtrip` @ **PROPTEST_CASES=60000**: PASS (152s), EXIT=0.
+- TRI-ORACLE sha grid (gzippy vs igzip vs gzip/zcat), GZIPPY_FORCE_PARALLEL_SM=1 → ParallelSM:
+  **native 16/16 MATCH** + **isal 16/16 MATCH**, each = silesia/nasa/monorepo/squishy × T1/T4/T8
+  + model/bignasa(large) × T1/T8. GRID_FAIL=0 both flavors.
+- Full serialized `cargo test --release --lib` (native): PARTIAL — **392 tests `... ok`, 0 FAILED/
+  panicked** before a remote `timeout 480` cutoff (box load ~4 from other LXC tenants made the full
+  949 exceed 480s; it self-terminated cleanly, NO orphan). Full 949 completion OWED-low-risk (change
+  is asm-kernel-localized; night5 ran the full 949 green at a near-identical HEAD; the asm
+  differentials + 60k proptest + tri-oracle grids are the binding evidence). Re-run with a longer
+  REMOTE timeout on a quieter box. Binaries: /root/bin/gzippy-c936-native (sha 3e121b9f7df7c11f),
+  /root/bin/gzippy-c936-isal.
+  HARNESS LESSON (banked): put `timeout` on the REMOTE command (`ssh '... timeout N cargo ...'`), NOT
+  on the local ssh — a local `timeout 600 ssh` SIGALRM kills only the client and ORPHANS the remote
+  cargo (hit + cleaned this turn). Detached `setsid bash -c "timeout N ... > /dev/shm/log"` is
+  orphan-proof: the remote timeout self-terminates it regardless of the ssh client.
+⇒ c936a4df is BYTE-EXACT (asm half NOW verified, not just the Rosetta ref-half). The Rosetta
+  GUEST-OWED items #1 are DISCHARGED.
+
+### STEP 2 — THE KEY MEASUREMENT (paired N=15, /dev/null, cpu4, GZIPPY_FORCE_PARALLEL_SM=1, Gate-0 self-validated). medΔ=(gzippy−igzip) cyc/B; LOWER=better. igzip A1 stable across all 3 runs (sil 4.351/4.360/4.360, nasa 1.582/1.589/1.580) ⇒ consistent box state ⇒ cross-shape deltas reliable.
+| shape (binary)                          | silesia medΔ [95%CI]      | nasa medΔ [95%CI]        | ΔIPC sil/nasa | Δinstr/B sil/nasa | Gate0 self-test |
+|-----------------------------------------|---------------------------|-------------------------|---------------|-------------------|-----------------|
+| OLD early-flag-bit (gzippy-chunkt1)     | +1.2626 [1.258,1.274]     | +0.4838 [0.480,0.486]   | -0.307/-0.238 | +1.573/+0.635     | marginal FAIL (bias≈0.003, ≪effect) |
+| night9 full-spec+snapshot (gzippy-kc)   | +1.4564 [1.438,1.470]     | +0.6159 [0.594,0.620]   | -0.039/-0.122 | +3.582/+1.163     | PASS |
+| c936 snapshot-removed (gzippy-c936-nat) | +1.8613 [1.855,1.887]     | +0.7354 [0.730,0.742]   | -0.299/-0.298 | +3.025/+1.022     | PASS |
+All SIGNIF-slower vs igzip (Wilcoxon p=0.00073, CIs exclude 0). Cross-shape (sil): c936−night9=+0.405,
+c936−old=+0.599, night9−old=+0.194. (nasa): c936−night9=+0.120, c936−old=+0.252, night9−old=+0.132.
+
+STRUCTURAL READ (diagnostic, NOT a pass/fail verdict on the mission):
+1. Did snapshot-removal drop instr/byte toward old? **YES** — sil 3.582→3.025 (−0.557), nasa
+   1.163→1.022 (−0.141). The change did exactly what it was designed to (fewer retired instr).
+2. Did it lift IPC? **NO — the OPPOSITE.** ΔIPC COLLAPSED: kc −0.039 → c936 −0.299 (sil);
+   kc −0.122 → c936 −0.298 (nasa). night9 had nearly closed IPC to igzip (−0.04); c936 re-opened it.
+3. Did it recover night9's regression vs old? **NO — it WORSENED it.** Gap to old grew from
+   +0.194 (night9) to +0.599 (c936) sil; +0.132→+0.252 nasa.
+4. Is the igzip-shape now ≤ old? **NO** — significantly slower on both corpora, CIs non-overlapping.
+MECHANISM (gated counters, structural): the c936 change moved EOB/oversize/invalid discrimination
+PRE-consume to delete the per-iter snapshot stores. It cut retired instructions BUT inserted a
+serializing dependency (decode→classify→consume) into the latency-bound critical chain → IPC
+collapsed → net slower. In this loop the night9 snapshot stores were apparently NOT on the
+critical path (they filled OOO slots); removing them + adding a pre-consume classify was a net loss.
+The remaining gap to igzip on c936 is now IPC-dominated (−0.30), not instr-count-dominated.
+
+### VERDICT — §3.1 SKELETON FORK DECIDED: OLD early-flag-bit WINS (do NOT promote kernel-converge-wip)
+Across TWO byte-exact iterations of the igzip late-discriminator full-speculation direction
+(night9 kc, then c936 snapshot-removed) BOTH are gated-slower than the OLD early-flag-bit shape
+on BOTH corpora (non-overlapping CIs, Gate-0 PASS). Per KERNEL-CONVERGENCE.md §6 step-1 ("the
+A/B decides the loop's skeleton; KEEP whichever wins per Gate-1"), the OLD early-flag-bit
+skeleton (= production perf/igzip-full-rewrite @ 37e669cf) WINS. **NO promotion** — kernel-
+converge-wip stays a scratch branch; production unchanged.
+SCOPED FALSIFY (not eternal): the igzip full-speculation late-discriminator skeleton is slower
+than the lean early-flag-bit skeleton at T1 on Intel-LXC i7-13700T, silesia+nasa, because the
+loop is latency-bound with NO idle OOO slots to fill (the §3.1 premise that more speculation
+lifts IPC is FALSIFIED here — leaner won). RE-OPEN TRIGGER: a uarch where the loop is genuinely
+throughput-bound (idle issue slots), or AMD/Zen2 replication showing the opposite.
+
+### STEP 3 — NEXT CONVERGENCE ELEMENT: redirected by the measurement (STRATEGIC FORK for supervisor/R3)
+The measurement OVERTURNS the working assumption that §3.2-3.5 build on the full-spec skeleton.
+The data-driven next element = **§3.2 split-refill cadence authored on the OLD early-flag-bit
+skeleton** (production branch), NOT on kernel-converge-wip's deprecated full-spec body. I did NOT
+author it on the losing skeleton (that would stack on a gated-worse foundation — the bias the
+project forbids). This is a strategic redirection: §3.2/§3.3/§3.4 to be re-rooted on the early-
+flag-bit run_contig. Flag to supervisor: the entire night9→c936 line is a gated-slower skeleton;
+continue convergence FROM the old shape.
+
+### CLEAN RESUME POINT (next turn)
+1. Re-root §3.2 split-refill on the OLD early-flag-bit run_contig (production @ 37e669cf): interleave
+   the refill memory-load+shlx+or with the spec-store/preload, defer the pos/len update past it
+   (KERNEL-CONVERGENCE.md §3.2); run_contig_ref_biased in LOCKSTEP; byte-exact gate (asm diffs +
+   tri-oracle + 60k proptest, all green THIS turn = the template) + paired harness vs igzip AND
+   vs gzippy-chunkt1.
+2. OWED regardless: AMD/Zen2 (solvency) replication of this whole scoreboard for LAW; T4/T8 wall+RSS
+   + stressor phase for any promoted change.
+RE-VERIFY the KEY measurement: `for B in c936-native kc chunkt1; do GZIPPY=/root/bin/gzippy-$B
+PIN=4 REPS=15 CORPORA="silesia nasa" SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash
+/root/distpreload-harness/_gzippy_vs_igzip_paired_guest.sh; done`. sha grid: `GZIPPY=<bin> bash
+/root/sha_grid.sh`. Binaries in /root/bin: gzippy-c936-native/-isal (3202968d), gzippy-kc (night9
+cc2840ff), gzippy-chunkt1 (old early-flag-bit, ca70e9d1). Box: cpu4 pin only, NOT frozen, governor
+powersave untouched, all cargo finished (pgrep clean at turn end).
+
+## ====== ROSETTA LOCAL-ONLY TURN (branch kernel-converge-wip @ c936a4df+) — c936a4df Rosetta-correctness verdict + ref-model net strengthened. NO NEUROTIC, NO PERF. Asm byte-exact + ALL perf = GUEST-OWED. ======
+LOCAL-ONLY mandate (user: neurotic reserved for hours). Mac aarch64 + x86_64 Rosetta
+toolchain ONLY. NO guest, NO perf claims. Goal: maximize CORRECTNESS + AUTHORING so
+guest time is efficient when it returns.
+
+### DETERMINISTIC ROSETTA-CAPABILITY PROBES (the governing facts this turn rests on)
+- `is_x86_feature_detected!` under Rosetta on this Mac: **bmi2=FALSE, avx2=FALSE**,
+  sse4.2=true, pclmulqdq=true. (probe: /tmp/feat_probe.rs)
+- BUT Rosetta **EXECUTES** BMI2 directly: a standalone `shrx`/`bzhi` asm program ran
+  byte-correct, exit 0 (probe: /tmp/shrx_probe.rs). So Rosetta runs BMI2 instructions
+  yet hides them from CPUID — the prompt's "Rosetta executes BMI2" is TRUE for
+  execution, FALSE for advertisement.
+
+### TASK 1 — c936a4df ROSETTA-CORRECTNESS VERDICT = **ASM PATH NOT EXERCISABLE LOCALLY (guest-owed); REF-MODEL HALF + WHOLE PIPELINE = PASS.**
+The prompt's premise ("run_contig BMI2 → kernel IS exercised under Rosetta") is
+**FALSIFIED** by two independent deterministic blockers:
+ 1. **COMPILE blocker:** the macOS x86_64 target reserves rbp (frame pointer, NOT
+    overridable via `-C force-frame-pointers=no`), leaving 14 GP regs; `run_contig`
+    needs 15 register operands → LLVM "inline assembly requires more registers than
+    available". Relief would need either a full 400-line cfg-duplicated asm
+    (Rust asm! has no per-line cfg) or bug-prone register-merging — UNACCEPTABLE for
+    smoke. (`dpre`→memory was the only clean 1-reg save but still needs whole-block
+    cfg.) So the real asm cannot compile under Rosetta.
+ 2. **DISPATCH/TEST gate:** the asm dispatch (`asm_on`) and the c1/c2/c3/positive-
+    control/on-off-fuzz differentials all gate on `is_x86_feature_detected!("bmi2")`
+    = FALSE → production routes to the pure-Rust fast loop and every asm-vs-ref
+    differential SKIPs (confirmed: all 6 print SKIP, 0 run the asm).
+ ⇒ **The run_contig asm and its asm-vs-ref byte-exact gate are FULLY GUEST-OWED.**
+    Rosetta gives ZERO asm signal. (Said plainly per the prompt's "if Rosetta skips
+    it, say so".) Kernel-executed-under-Rosetta = **NO**.
+
+ WHAT IS VERIFIED LOCALLY (high confidence, Rosetta x86_64, target-cpu=x86-64-v2):
+ - **Full native (pure-rust-inflate) lib suite, serialized: 949 passed / 0 failed /
+   12 ignored.** Includes prop_structured/random/near_max_distance @ PROPTEST_CASES=
+   20000 (PASS), tests::routing::* (32 ok incl deletion-trap + parallel-SM e2e +
+   silesia CRC stress), decompress::parallel::* lifecycle (357 ok, no hang).
+   ⇒ c936a4df is BUILD-SOUND and the production PURE-RUST decode path (the path that
+   actually runs under Rosetta, asm_on=false) is byte-exact.
+ - **gzippy-isal flavor also builds + byte-exact** under Rosetta (routing 29 ok/0
+   failed; asm_kernel 8 ok with the asm diffs skipping).
+ - **c936a4df's REF-MODEL half (`run_contig_ref_biased`, edited in LOCKSTEP with the
+   asm) is now DIRECTLY verified locally** by two NEW pure-Rust tests (TASK 3 below).
+ - The one prior failure `test_avx2_detected_on_x86` was an ENV artifact (Rosetta
+   hides AVX2; the AVX2 fast paths in copy_match_fast/fill_byte_avx2 fall back to
+   scalar = guest-owed) — gated to skip on macOS; NOT a wrong-bytes issue.
+
+### TASK 3 — CORRECTNESS NET STRENGTHENED (pure-Rust, runs under Rosetta AND on guest)
+Two new tests in asm_kernel.rs tests mod (NO bmi2/asm dependency — they drive the
+pure-Rust `run_contig_ref_biased` that c936a4df changed):
+ - `ref_pre_consume_bail_keeps_cursor_un_consumed_rosetta`: random streams × 3 tables
+   (fixed/dense/longy) × all-holes dist; asserts that on every FIRST-packet RECLASS
+   bail (dst back at entry) the FULL cursor (bitbuf/bitsleft/pos) == entry. Covers ALL
+   of c936a4df's snapshot-removal bail classes: invalid (bc==0), lone-EOB (==256),
+   oversize (>512) — all PRE-consume un-consumed — AND the length-arm dist-side bail
+   RESTORE (the only post-consume un-consume). Non-vacuous gate ≥50 first-packet bails
+   (observed PASS).
+ - `ref_consume_bias_perturbs_cursor_rosetta`: pure-Rust sibling of positive_control —
+   `run_contig_ref_biased::<1>` (off-by-one consume) MUST diverge from `<0>` on every
+   literal-progressing stream (gate: ≥100 progressing, ALL diverge — observed PASS).
+   Proves the ref's consume accounting is load-bearing locally.
+ Both PASS on native AND isal flavors under Rosetta.
+
+### TASK 2 — NEXT CONVERGENCE ELEMENT = **DEFERRED to guest (deliberate, governing-law-compliant).**
+Did NOT author a new asm element (§3.2 split-refill / §3.3 per-iter dist-preload /
+§3.4 register-pin). Reasons, not excuses:
+ - Those are ASM changes; under Rosetta they are NEITHER byte-exact-verifiable (asm
+   won't compile/run) NOR perf-measurable. Committing them would be UNVERIFIED +
+   UNMEASURED speculative asm — exactly what the governing law forbids.
+ - They would also STACK on c936a4df, which is itself NOT yet guest-byte-exact-gated
+   (its commit says "gauntlet on guest = NEXT"). Stacking unverified asm on unverified
+   asm violates "don't stack inferences."
+ ⇒ Correct order: VERIFY c936a4df on guest first (full AVX2 tri-oracle), THEN author
+   the next §3.x element with its own byte-exact+perf gate. The design spine for those
+   elements is already durable in plans/KERNEL-CONVERGENCE.md §3.2-3.5; nothing is lost.
+
+### CHANGES THIS TURN (committed to kernel-converge-wip; guest/Linux behavior UNCHANGED)
+ - asm_kernel.rs: (a) `#[cfg(target_os="macos")]` Rosetta compile shim in run_contig
+   (unreachable!; the asm is dead at runtime on Rosetta since asm_on=false) wrapping
+   the real asm in `#[cfg(not(target_os="macos"))]` — guest asm byte-for-byte
+   UNCHANGED; (b) c1 seam test skips on macOS (it calls run_contig directly, no bmi2
+   guard); (c) the 2 new pure-Rust ref tests.
+ - consume_first_decode.rs: `test_avx2_detected_on_x86` skips on macOS (Rosetta env).
+ All marked "Rosetta-smoke-correct; full AVX2 byte-exact gate + perf MEASUREMENT owed
+ on neurotic." NO wrong-bytes anywhere → nothing reverted.
+
+### OWED ON NEUROTIC (the guest gate this turn could NOT touch — DEFERRED, not done)
+ 1. **c936a4df full AVX2 byte-exact gate, BOTH flavors** (native pure-rust-inflate +
+    gzippy-isal) × silesia/nasa/monorepo/squishy/large × T1/T4/T8 sha-identical vs
+    tri-oracle (gzip/flate2/libdeflate/igzip); the c1/c2/c3/positive-control/on-off-
+    fuzz asm-vs-ref differentials (BMI2-real); ≥60k prop_structured_roundtrip.
+ 2. **ALL PERF (every claim DEFERRED):** the canonical paired harness
+    `_gzippy_vs_igzip_paired_guest.sh` — cyc/B / IPC / instr/byte for c936a4df vs igzip
+    AND vs the night9 cc2840ff shape AND vs the OLD early-flag-bit gzippy-chunkt1 (does
+    snapshot-removal recover the night9 +0.188 sil / +0.144 nasa regression?); stressor
+    phase; T4/T8 wall + RSS no-regression; AMD/Zen2 (solvency) replication for LAW.
+ 3. The next §3.x convergence element (authored + byte-exact-gated + measured on guest).
+
+### RESUME POINT
+HEAD = c936a4df + this turn's local-correctness commit on kernel-converge-wip. On guest:
+checkout kernel-converge-wip, run the §1 byte-exact gauntlet for c936a4df, then the §2
+paired perf harness (the open question: did snapshot-removal recover night9's regression
+and beat the old early-flag-bit shape?). Local toolchain note for future Rosetta turns:
+`CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS="-C target-cpu=x86-64-v2"` (the repo
+.cargo/config.toml forces target-cpu=native = invalid apple-m1 for x86_64); the asm is
+macOS-shimmed so the lib compiles; asm differentials SKIP (guest-owed); pure-Rust ref +
+pipeline tests give real local signal.
+
 ## ====== KERNEL-CONVERGENCE NIGHT9 (branch kernel-converge-wip @ cc2840ff) — igzip LATE-DISCRIMINATOR FULL-SPECULATION run_contig REWRITE: BUILDS + BYTE-EXACT (asm==ref diffs + production sha grid PASS). Perf measurement = NEXT. (Intel-only NOT-YET-LAW) ======
 MISSION (heroic, no-phases): replace the early-flag-bit run_contig with igzip
 loop_block's COMPLETE integrated shape AT ONCE. DONE THIS TURN: the rewrite is
