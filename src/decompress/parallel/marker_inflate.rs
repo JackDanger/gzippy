@@ -3221,27 +3221,6 @@ impl Block {
                         // — contract doc); skipped when nothing changed.
                         pre = self.lut_litlen.decode_prefilled(&lb);
                     }
-                    if exit == super::asm_kernel::EXIT_EOB_CONSUMED {
-                        // FLOOR ORACLE (NIGHT16): inline EOB. The asm consumed
-                        // the EOB litlen and left the cursor past it; the
-                        // leading literals (delta = cnt-1) were already
-                        // accounted into *pos/emitted above. Mirror the
-                        // careful-loop EOB (marker_inflate.rs:3421-3424): set
-                        // at_end_of_block + commit, WITHOUT the un-consume +
-                        // re-decode the old EXIT_RECLASS-tagged EOB required.
-                        self.at_end_of_block = true;
-                        commit_fast!(Ok(emitted));
-                    }
-                    if exit == super::asm_kernel::EXIT_HARDFAIL {
-                        // FLOOR ORACLE (NIGHT16): a rare dist-side invalid path
-                        // (raw0/baddist/marker/oversize) reached with the
-                        // per-iteration anchor deleted — it cannot un-consume,
-                        // so it is terminal. Fires 0× on valid silesia/nasa
-                        // (every reclass_* except EOB is 0 after the subtable
-                        // inline); a corpus that hit it would error here (this
-                        // is an ORACLE binary, not promotable).
-                        commit_fast!(Err(BlockError::InvalidHuffmanCode));
-                    }
                     if exit == super::asm_kernel::EXIT_BOUNDARY {
                         // Monotone guard failure — the Rust loop owns the
                         // tail under its own (looser) guards.
