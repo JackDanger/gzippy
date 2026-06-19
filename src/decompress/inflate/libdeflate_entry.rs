@@ -559,20 +559,38 @@ impl LitLenTable {
     }
 }
 
-/// Distance decode table
+/// Inline capacity for the distance table: main(1<<9 = 512) + worst-case
+/// subtables (1<<MAX_SUBTABLE_BITS=64 × up-to-32 codes longer than table_bits).
+/// 512 + 64*32 = 2560 covers any legal distance alphabet (≤30 real codes;
+/// 32 = the 5-bit hdist ceiling). Element A (single-state-base): the entries
+/// live INLINE so the asm addresses them `[{ctx}+DIST_OFF+idx*4]` off the one
+/// `ctx` base (igzip `[state+_dist_huff_code+...]`).
+pub const DIST_CAP: usize = 512 + 64 * 32;
+
+/// Distance decode table.
+///
+/// `#[repr(C)]` + `entries` FIRST: element A inlines the entries inside the
+/// boxed `AsmState` (asm_kernel.rs) so `offset_of!(DistTable, entries) == 0`
+/// and the asm reaches them via `[{ctx}+DIST_OFF+idx*4]`. Entries are a
+/// fixed `[DistEntry; DIST_CAP]` (was `Vec`) so the table is built IN PLACE
+/// (zero-copy) — a per-region copy of ~10 KiB × ~7465 blocks/silesia would
+/// negate the win. `used` is the count of live entries (main + subtables).
 #[derive(Clone)]
+#[repr(C)]
 pub struct DistTable {
-    /// Main table (size: 1 << table_bits)
-    entries: Vec<DistEntry>,
+    /// Main table + subtables, inline (capacity `DIST_CAP`); `used` valid.
+    pub entries: [DistEntry; DIST_CAP],
+    /// Number of live entries (main_size + subtable fan-out).
+    used: usize,
     /// Number of bits for main table lookup
     table_bits: u8,
 }
 
 impl DistTable {
-    /// Resident heap footprint of this table (struct + decode entries). Used by
-    /// the debug-only `mem_stats` instrument to report the shared-table size.
+    /// Resident footprint of this table. Entries are now inline (no heap
+    /// allocation), so this is just the struct size.
     pub fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.entries.capacity() * std::mem::size_of::<DistEntry>()
+        std::mem::size_of::<Self>()
     }
 }
 
@@ -587,13 +605,26 @@ impl DistTable {
     /// Maximum number of subtable bits
     pub const MAX_SUBTABLE_BITS: u8 = 6; // 15 - 9
 
+    /// An all-zero (no valid codes) table — the initial inline state before
+    /// the first block builds into it (element A: `AsmState.dist`).
+    pub fn new_empty() -> Self {
+        Self {
+            entries: [DistEntry(0); DIST_CAP],
+            used: 1usize << Self::TABLE_BITS,
+            table_bits: Self::TABLE_BITS,
+        }
+    }
+
     /// Build a distance decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
         let mut t = Self {
-            entries: Vec::new(),
+            entries: [DistEntry(0); DIST_CAP],
+            used: 0,
             table_bits: Self::TABLE_BITS,
         };
-        t.rebuild(code_lengths);
+        if !t.rebuild(code_lengths) {
+            return None;
+        }
         Some(t)
     }
 
@@ -608,7 +639,7 @@ impl DistTable {
     /// prefix of the same computed size, and the table is a pure function
     /// of `code_lengths` (differential: `dist_table_rebuild_matches_fresh
     /// _build` in marker_inflate.rs).
-    pub fn rebuild(&mut self, code_lengths: &[u8]) {
+    pub fn rebuild(&mut self, code_lengths: &[u8]) -> bool {
         let table_bits = Self::TABLE_BITS;
         let main_size = 1usize << table_bits;
 
@@ -633,9 +664,19 @@ impl DistTable {
         // once capacity has grown to the high-water mark).
         let max_subtable_entries = (1usize << Self::MAX_SUBTABLE_BITS)
             * code_lengths.iter().filter(|&&l| l > table_bits).count();
-        let mut entries = std::mem::take(&mut self.entries);
-        entries.clear();
-        entries.resize(main_size + max_subtable_entries, DistEntry(0));
+        let needed = main_size + max_subtable_entries;
+        if needed > DIST_CAP {
+            // Out of inline capacity (malformed alphabet) — fail; the asm
+            // dispatch gate (dist valid) then forces the careful path.
+            self.used = 0;
+            return false;
+        }
+        // Zero the live prefix in place (the build relies on a zeroed table so
+        // `is_subtable_ptr()` reads false before a subtable is installed).
+        let entries = &mut self.entries;
+        for e in entries[..needed].iter_mut() {
+            *e = DistEntry(0);
+        }
         let mut subtable_next = main_size;
 
         // Assign codes to symbols
@@ -692,9 +733,9 @@ impl DistTable {
             }
         }
 
-        entries.truncate(subtable_next);
-        self.entries = entries;
+        self.used = subtable_next;
         self.table_bits = table_bits;
+        true
     }
 
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)

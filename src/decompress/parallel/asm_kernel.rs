@@ -198,12 +198,30 @@ pub fn dispatch_allowed(
         && local_cap > fast_out_slop
 }
 
-/// Loop-invariant context for the asm region (VAR_VIII KernCtx salvage —
-/// cold invariants via `[ctx + off]` memory operands keep register pressure
-/// inside the 12-operand envelope). Field order is the asm ABI: offsets are
-/// compile-asserted below and referenced as literal displacements.
+/// Loop-invariant context + INLINE Huffman tables for the asm region —
+/// ELEMENT A: igzip's single-state-base register discipline
+/// (`igzip_decode_block_stateless.asm`: ONE `state` base in r11, tables via
+/// struct offsets `[state+_lit_huff_code+...]` / `[state+_dist_huff_code+...]`;
+/// struct `igzip_lib.h:515-524`). The litlen LUT and the dist table are
+/// CO-LOCATED INLINE in this ONE boxed struct so the asm addresses them off
+/// the single `ctx` base — `[{ctx}+ASM_LIT_SHORT_OFF+idx*4]` and
+/// `[{ctx}+ASM_DIST_OFF+idx*4]` — instead of two extra pinned base registers
+/// ({short_tbl}, {dtbl}). Those 2 freed GP registers carry the iteration-top
+/// `p0`/`d0` un-consume anchor IN-REGISTER, deleting the 2 per-iteration anchor
+/// STORES (former `[ctx+56]`/`[ctx+64]`; D-1 ledger).
+///
+/// ZERO-COPY: the tables are BUILT IN PLACE inside this boxed struct (held in
+/// the decoder `self`, stable address) — a per-region copy (~7465 blocks ×
+/// ~27 KiB on silesia) would negate the win. `in_ptr` stays a separate
+/// register (it indexes the compressed input window `[in_ptr+pos]`, not state
+/// — igzip likewise keeps `next_in` in its own register).
+///
+/// `#[repr(C)]`, header first at the SAME low offsets the asm guards read
+/// (`[ctx+8]`/`[ctx+16]`/`[ctx+24]`), then the inline tables. Offsets are
+/// compile-asserted below; the table offsets are passed to the asm as `const`
+/// operands computed from `offset_of!` (layout-driven, not hand-numbered).
 #[repr(C)]
-pub struct KernCtx {
+pub struct AsmState {
     /// +0: `bits.data.as_ptr()` — refill word loads.
     pub in_ptr: u64,
     /// +8: `in_end - IN_MARGIN` (saturating) — top guard `pos < in_lim`.
@@ -214,47 +232,33 @@ pub struct KernCtx {
     /// +24: `base` as integer — c3 backref validity (`src >= out_base` ⇔
     /// `distance <= *pos`).
     pub out_base: u64,
-    /// +32: litlen long-code table (`long_code_lookup.as_ptr()`, u16s).
-    pub long_tbl: u64,
-    /// +40: dist `DistTable` entries base (`*const DistEntry` = u32s, c3).
-    pub dist_tbl: u64,
-    /// +48: litlen short table (`short_code_lookup.as_ptr()`) — passed to
-    /// the asm as a pinned REGISTER; kept here so the ctx is self-contained.
-    ///
-    /// NIGHT11 SNAPSHOT REMOVAL (see DIVERGENCE LEDGER in
-    /// plans/KERNEL-CONVERGENCE.md): the night9 per-iteration X2 cursor
-    /// snapshot (`save_bitbuf/+48`, `save_bitsleft/+56`, `save_dst/+72`,
-    /// `save_pos/+80` — four L1 stores at the iteration top) is DELETED.
-    /// The un-consume on a rare RECLASS bail is now reconstructed from the
-    /// iteration-top bit position `P0` (carried in a register, not stored)
-    /// via a single from-data re-read; `dst0` is carried in a register too.
-    /// See `run_contig`'s reconstruct block. igzip is stateless and never
-    /// un-consumes, so it has no counterpart to these fields at all.
-    pub short_tbl: u64,
-    /// +56: iteration-top BIT POSITION anchor `p0 = pos*8 - bitsleft` (the
-    /// MINIMAL un-consume state — see DIVERGENCE LEDGER). ONE store per
-    /// iteration (vs night9's four). `p0` is REFILL-INVARIANT, so it equals
-    /// the un-consumed packet start independent of the body's consume/refill;
-    /// a rare RECLASS bail reconstructs the whole bit cursor from it via a
-    /// from-data re-read (the consumed low bits are shifted out and cannot be
-    /// recovered from post-consume registers; the 15-GP-register asm ceiling
-    /// also forbids carrying the anchor in a register without dropping an
-    /// igzip speculation feature — hence a single ctx-memory word).
-    pub save_p0: u64,
-    /// +64: iteration-top dst (un-consume target — rolls back the speculative
-    /// store advance; the stored packed bytes become X3 overshoot above it).
-    pub save_d0: u64,
+    /// +32: litlen LUT, INLINE (short_code_lookup `[u32;4096]` at +32 then
+    /// long_code_lookup `[u16;1264]`). Built in place by
+    /// `LutLitLenCode::rebuild_from`; read by the asm via the single base.
+    pub lut_litlen: super::lut_huffman::LutLitLenCode,
+    /// dist `DistTable`, INLINE (`entries: [DistEntry;DIST_CAP]` first). Built
+    /// in place by `DistTable::rebuild`; read by the asm via the single base.
+    pub dist: crate::decompress::inflate::libdeflate_entry::DistTable,
 }
 
-const _: () = assert!(std::mem::offset_of!(KernCtx, in_ptr) == 0);
-const _: () = assert!(std::mem::offset_of!(KernCtx, in_lim) == 8);
-const _: () = assert!(std::mem::offset_of!(KernCtx, out_lim) == 16);
-const _: () = assert!(std::mem::offset_of!(KernCtx, out_base) == 24);
-const _: () = assert!(std::mem::offset_of!(KernCtx, long_tbl) == 32);
-const _: () = assert!(std::mem::offset_of!(KernCtx, dist_tbl) == 40);
-const _: () = assert!(std::mem::offset_of!(KernCtx, short_tbl) == 48);
-const _: () = assert!(std::mem::offset_of!(KernCtx, save_p0) == 56);
-const _: () = assert!(std::mem::offset_of!(KernCtx, save_d0) == 64);
+/// Asm `const`-operand displacements (single-base addressing). Layout-driven
+/// via nested `offset_of!` — never hand-numbered.
+pub const ASM_LIT_SHORT_OFF: usize =
+    std::mem::offset_of!(AsmState, lut_litlen.table.short_code_lookup);
+pub const ASM_LIT_LONG_OFF: usize =
+    std::mem::offset_of!(AsmState, lut_litlen.table.long_code_lookup);
+pub const ASM_DIST_OFF: usize = std::mem::offset_of!(AsmState, dist.entries);
+
+const _: () = assert!(std::mem::offset_of!(AsmState, in_ptr) == 0);
+const _: () = assert!(std::mem::offset_of!(AsmState, in_lim) == 8);
+const _: () = assert!(std::mem::offset_of!(AsmState, out_lim) == 16);
+const _: () = assert!(std::mem::offset_of!(AsmState, out_base) == 24);
+// Header is exactly 32 bytes; the inline litlen short table starts right after.
+const _: () = assert!(ASM_LIT_SHORT_OFF == 32);
+const _: () = assert!(ASM_LIT_LONG_OFF == 32 + 4096 * 4);
+// Dist entries land after the whole litlen LUT (short 16384 + long 2528) plus
+// LutLitLenCode's two Box fields + valid (padded). Asserted to pin layout.
+const _: () = assert!(ASM_DIST_OFF > ASM_LIT_LONG_OFF);
 
 /// LUT-layout constants mirrored from `lut_huffman.rs` / `libdeflate_entry.rs`
 /// (compile-checked so drift between the asm immediates and the table
@@ -275,7 +279,7 @@ const _: () = assert!(crate::decompress::inflate::libdeflate_entry::DistTable::T
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 mod imp {
-    use super::{Bits, KernCtx};
+    use super::{AsmState, Bits, ASM_DIST_OFF, ASM_LIT_LONG_OFF, ASM_LIT_SHORT_OFF};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
 
@@ -414,7 +418,7 @@ mod imp {
     /// taxes its layout even when killed. One CALL per region run is
     /// amortized by the in-asm back-edge.
     #[inline(never)]
-    pub unsafe fn run_contig(ctx: &mut KernCtx, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
+    pub unsafe fn run_contig(ctx: &AsmState, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
         #[cfg(test)]
         TEST_RUN_CONTIG_CALLS.fetch_add(1, Ordering::Relaxed);
         let mut bitbuf = lb.bitbuf;
@@ -431,7 +435,7 @@ mod imp {
                 //    every iteration (igzip 502 / 540 / 580-582).
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
                 // ── iteration top: guards (E4) ──────────────────────────
                 "2:",
                 "mov {ret}, 1",                       // speculative BOUNDARY
@@ -453,12 +457,16 @@ mod imp {
                 //        consume/refill. A bail re-reads the whole cursor from it
                 //        (the consumed low bits are shifted out — unrecoverable
                 //        from post-consume registers).
-                //      [ctx+64] = dst (iteration-top dst; un-consume target).
-                //    ONE bit-cursor store + one dst store, vs night9's four.
-                "lea {t2}, [{pos} * 8]",
-                "sub {t2}, {bitsleft}",
-                "mov qword ptr [{ctx} + 56], {t2}",   // p0
-                "mov qword ptr [{ctx} + 64], {dst}",  // d0
+                //      {d0} = dst (iteration-top dst; un-consume target).
+                //    ELEMENT A: with {short_tbl}+{dtbl} folded into the single
+                //    {ctx} base (inline tables), the 2 freed GP registers carry
+                //    p0/d0 IN-REGISTER — the 2 per-iteration anchor STORES
+                //    (former `mov [ctx+56],p0` / `mov [ctx+64],dst`) are DELETED
+                //    (igzip stateless single-base; D-1 ledger). The bails read
+                //    p0/d0 from registers at 85:.
+                "lea {p0}, [{pos} * 8]",
+                "sub {p0}, {bitsleft}",
+                "mov {d0}, {dst}",
                 // ── decode_next_lit_len on the preloaded entry {t1} (igzip
                 //    322-372 / loop_block 515): extract bit_count + sym_count.
                 //    LARGE_FLAG → long table (cold); bc==0 → invalid (cold).
@@ -542,7 +550,7 @@ mod imp {
                 "mov {t2}, qword ptr [{in_ptr} + {pos}]", // (2) igzip 528-530: OR
                 "shlx {t2}, {t2}, {bitsleft}",
                 "or {bitbuf}, {t2}",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t4}*4]", // (3) igzip 540: entry load
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {lit_off}]", // (3) igzip 540: entry load
                 "mov {t4:e}, 63",                     // (4) igzip 543-547: ptr/len advance DEFERRED
                 "sub {t4}, {bitsleft}",
                 "shr {t4}, 3",
@@ -558,7 +566,7 @@ mod imp {
                 //    `dist.lookup`).
                 "mov {dpre:e}, {bitbuf:e}",
                 "and {dpre:e}, 0x1FF",
-                "mov {dpre:e}, dword ptr [{dtbl} + {dpre}*4]",
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 // ── LATE DISCRIMINATOR (igzip 555-556): trailing < 256 ⇒
                 //    literal ⇒ back-edge (the HOT exit); ≥ 256 ⇒ length/EOB ⇒
                 //    fall through to the non-literal arm. THE core igzip-shape
@@ -590,7 +598,7 @@ mod imp {
                 "or {bitsleft}, 56",
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
-                "mov {t1:e}, dword ptr [{short_tbl} + {t1}*4]",
+                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
                 "jmp 2b",
                 // ── long code at top (decode_prefilled long path; rare/cold).
                 //    The iteration-top p0/d0 anchor ([ctx+56]/[ctx+64]) covers
@@ -602,7 +610,7 @@ mod imp {
                 "shr {t3}, 12",                       // >> ISAL_DECODE_LONG_BITS
                 "and {t1:e}, 0x1FFFFFF",
                 "add {t1:e}, {t3:e}",                 // long_idx
-                "mov {t2}, qword ptr [{ctx} + 32]",   // long_tbl
+                "lea {t2}, [{ctx} + {llong_off}]",    // litlen long table (inline, single base)
                 "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
                 "mov {t2:e}, {t1:e}",
                 "shr {t2:e}, 10",                     // bc
@@ -638,7 +646,7 @@ mod imp {
                 "ja 8f",                              // long oversize lone → restore + RECLASS tag 0
                 "mov {dpre:e}, {bitbuf:e}",
                 "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
-                "mov {dpre:e}, dword ptr [{dtbl} + {dpre}*4]",
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 "lea {t2:e}, [{t5:e} - 254]",         // length
                 "jmp 58f",                            // dst = base = copy start
                 // ── oversize trailing (>512): restore + RECLASS, tag by cnt
@@ -702,7 +710,7 @@ mod imp {
                 "51:",
                 "mov {t3:e}, {bitbuf:e}",
                 "and {t3:e}, 0xFFF",
-                "mov {t3:e}, dword ptr [{short_tbl} + {t3}*4]",  // carried preload
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
                 // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
                 //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
                 //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
@@ -878,7 +886,7 @@ mod imp {
                 "mov {t3:e}, {dpre:e}",
                 "shr {t3:e}, 16",                     // subtable_start (DistEntry bits 31-16)
                 "add {t4:e}, {t3:e}",
-                "mov {t1:e}, dword ptr [{dtbl} + {t4}*4]",   // leaf entry
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {dist_off}]",   // leaf entry
                 "jmp 94b",
                 "92:",
                 "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
@@ -897,7 +905,7 @@ mod imp {
                 "mov {ret}, 0",                       // RECLASS (lone/long oversize — CONSUMED)
                 "jmp 85f",                            // → reconstruct
                 "85:",
-                "mov {t2}, qword ptr [{ctx} + 56]",   // p0
+                "mov {t2}, {p0}",                     // p0 (in-register anchor)
                 "mov {t1}, {t2}",
                 "and {t1:e}, 7",                      // skip = p0 & 7
                 "shr {t2}, 3",                        // byte = p0 >> 3
@@ -906,7 +914,7 @@ mod imp {
                 "mov {bitsleft:e}, 64",
                 "sub {bitsleft}, {t1}",               // bitsleft = 64 - skip
                 "lea {pos}, [{t2} + 8]",              // pos = byte + 8
-                "mov {dst}, qword ptr [{ctx} + 64]",  // dst = d0
+                "mov {dst}, {d0}",                    // dst = d0 (in-register anchor)
                 "jmp 9f",
                 // ── invalid (bc==0) exit: reached PRE-consume (short 438 /
                 //    long 546), so the cursor is ALREADY at the un-consumed
@@ -915,11 +923,18 @@ mod imp {
                 "86:",
                 "mov {ret}, 0",                       // RECLASS (invalid)
                 "9:",
-                ctx = in(reg) ctx as *mut KernCtx,
-                short_tbl = in(reg) ctx.short_tbl,
+                // ELEMENT A single base: {ctx} addresses the inline litlen +
+                // dist tables via const-operand displacements (igzip single
+                // state base). {short_tbl} + {dtbl} are GONE (2 GP freed);
+                // {p0}/{d0} carry the un-consume anchor in those freed regs.
+                ctx = in(reg) ctx as *const AsmState,
                 in_ptr = in(reg) ctx.in_ptr,
-                dtbl = in(reg) ctx.dist_tbl,          // dist entries base (preload + decode)
                 dpre = out(reg) _,                    // preloaded dist entry carried 50: → 58:
+                p0 = out(reg) _,                      // iteration-top bit anchor (was [ctx+56])
+                d0 = out(reg) _,                      // iteration-top dst anchor (was [ctx+64])
+                lit_off = const ASM_LIT_SHORT_OFF,    // [ctx + idx*4 + lit_off]
+                llong_off = const ASM_LIT_LONG_OFF,   // lea [ctx + llong_off]
+                dist_off = const ASM_DIST_OFF,        // [ctx + idx*4 + dist_off]
                 bitbuf = inout(reg) bitbuf,
                 bitsleft = inout(reg) bitsleft,
                 pos = inout(reg) pos,
@@ -1222,21 +1237,20 @@ mod tests {
         };
         let mut out = vec![0u8; 64];
         let dst = out.as_mut_ptr();
-        let short = vec![0u32; 1 << 12];
-        let long = vec![0u16; 1264];
-        let mut ctx = KernCtx {
+        // ELEMENT A: zeroed inline tables in one AsmState (the prologue reads
+        // the short table once; guards fail before any decode).
+        use crate::decompress::inflate::libdeflate_entry::DistTable;
+        use crate::decompress::parallel::lut_huffman::LutLitLenCode;
+        let mut ctx = Box::new(AsmState {
             in_ptr: data.as_ptr() as u64,
             in_lim: (data.len() - IN_MARGIN) as u64,
             out_lim: dst as u64 + 32,
             out_base: dst as u64,
-            long_tbl: long.as_ptr() as u64,
-            dist_tbl: 0,
-            save_p0: 0,
-            save_d0: 0,
-            short_tbl: short.as_ptr() as u64,
-        };
+            lut_litlen: LutLitLenCode::new_empty(),
+            dist: DistTable::new_empty(),
+        });
         // Guards pass → RECLASS, state unchanged.
-        let (exit, ndst) = unsafe { run_contig(&mut ctx, &mut lb, dst) };
+        let (exit, ndst) = unsafe { run_contig(&ctx, &mut lb, dst) };
         assert_eq!(exit, EXIT_RECLASS);
         assert_eq!(ndst, dst, "X6: dst unchanged");
         assert_eq!(lb.pos, 17);
@@ -1244,7 +1258,7 @@ mod tests {
         assert_eq!(lb.bitsleft, 56);
         // Out guard fails → BOUNDARY, state unchanged.
         ctx.out_lim = dst as u64;
-        let (exit, ndst) = unsafe { run_contig(&mut ctx, &mut lb, dst) };
+        let (exit, ndst) = unsafe { run_contig(&ctx, &mut lb, dst) };
         assert_eq!(exit, EXIT_BOUNDARY);
         assert_eq!(ndst, dst);
         assert_eq!(lb.pos, 17);
@@ -1253,7 +1267,7 @@ mod tests {
         // In guard fails → BOUNDARY.
         ctx.out_lim = dst as u64 + 32;
         ctx.in_lim = 17;
-        let (exit, _) = unsafe { run_contig(&mut ctx, &mut lb, dst) };
+        let (exit, _) = unsafe { run_contig(&ctx, &mut lb, dst) };
         assert_eq!(exit, EXIT_BOUNDARY);
         assert_eq!(lb.bitsleft, 56);
     }
@@ -1308,12 +1322,7 @@ mod tests {
         for s in 5..133 {
             longy[s] = 13;
         }
-        let build = |lens: &[u8]| -> LutLitLenCode {
-            let mut c = LutLitLenCode::new_empty();
-            assert!(c.rebuild_from(lens), "test table lens must be valid");
-            c
-        };
-        let tables = [build(&fixed), build(&dense), build(&longy)];
+        let lens_set: [&[u8]; 3] = [&fixed, &dense, &longy];
 
         let mut x: u64 = 0x9E3779B97F4A7C15;
         let mut next = move || {
@@ -1328,7 +1337,23 @@ mod tests {
         // covering the X2 restore on every backref candidate).
         use crate::decompress::inflate::libdeflate_entry::DistTable;
         let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
-        for (ti, tbl) in tables.iter().enumerate() {
+        for (ti, lens) in lens_set.iter().enumerate() {
+            // ELEMENT A: tables INLINE in one AsmState — the asm reads them off
+            // the single `ctx` base; the ref reads the SAME storage
+            // (`st.lut_litlen` / `st.dist`), so contents are identical and the
+            // differential is valid.
+            let mut st = Box::new(AsmState {
+                in_ptr: 0,
+                in_lim: 0,
+                out_lim: 0,
+                out_base: 0,
+                lut_litlen: {
+                    let mut c = LutLitLenCode::new_empty();
+                    assert!(c.rebuild_from(lens), "test table lens must be valid");
+                    c
+                },
+                dist: dist_holes.clone(),
+            });
             for trial in 0..4000 {
                 // Random input stream, long enough for the margin scheme.
                 let n = 96 + (next() as usize % 400);
@@ -1350,8 +1375,8 @@ mod tests {
 
                 let mut dref = 0usize;
                 let ref_exit = run_contig_ref(
-                    tbl,
-                    &dist_holes,
+                    &st.lut_litlen,
+                    &st.dist,
                     &mut lb_ref,
                     &mut out_ref,
                     &mut dref,
@@ -1360,18 +1385,11 @@ mod tests {
                 );
 
                 let dst0 = out_asm.as_mut_ptr();
-                let mut ctx = KernCtx {
-                    in_ptr: data.as_ptr() as u64,
-                    in_lim: in_lim as u64,
-                    out_lim: dst0 as u64 + out_lim as u64,
-                    out_base: dst0 as u64,
-                    long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
-                    dist_tbl: dist_holes.entries_ptr() as u64,
-                    save_p0: 0,
-                    save_d0: 0,
-                    short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
-                };
-                let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
+                st.in_ptr = data.as_ptr() as u64;
+                st.in_lim = in_lim as u64;
+                st.out_lim = dst0 as u64 + out_lim as u64;
+                st.out_base = dst0 as u64;
+                let (asm_exit, dst1) = unsafe { run_contig(&st, &mut lb_asm, dst0) };
                 let dasm = (dst1 as usize) - (dst0 as usize);
 
                 let tag = format!("table {ti} trial {trial}");
@@ -1426,6 +1444,16 @@ mod tests {
         let mut lut = LutLitLenCode::new_empty();
         assert!(lut.rebuild_from(&fixed), "fixed table lens must be valid");
         let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
+        // ELEMENT A: tables INLINE in one AsmState; asm + both ref arms read the
+        // SAME storage (st.lut_litlen / st.dist).
+        let mut st = Box::new(AsmState {
+            in_ptr: 0,
+            in_lim: 0,
+            out_lim: 0,
+            out_base: 0,
+            lut_litlen: lut,
+            dist: dist_holes,
+        });
 
         let mut x: u64 = 0xD1B54A32D192ED03;
         let mut next = move || {
@@ -1447,18 +1475,11 @@ mod tests {
             let mut out_asm = vec![0u8; buf_len];
             let mut lb_asm = Bits::new(&data);
             let dst0 = out_asm.as_mut_ptr();
-            let mut ctx = KernCtx {
-                in_ptr: data.as_ptr() as u64,
-                in_lim: in_lim as u64,
-                out_lim: dst0 as u64 + out_lim as u64,
-                out_base: dst0 as u64,
-                long_tbl: lut.table.long_code_lookup.as_ptr() as u64,
-                dist_tbl: dist_holes.entries_ptr() as u64,
-                save_p0: 0,
-                save_d0: 0,
-                short_tbl: lut.table.short_code_lookup.as_ptr() as u64,
-            };
-            let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
+            st.in_ptr = data.as_ptr() as u64;
+            st.in_lim = in_lim as u64;
+            st.out_lim = dst0 as u64 + out_lim as u64;
+            st.out_base = dst0 as u64;
+            let (asm_exit, dst1) = unsafe { run_contig(&st, &mut lb_asm, dst0) };
             let dasm = (dst1 as usize) - (dst0 as usize);
 
             // Arm B (negative control): bias-0 ref — MUST match the asm on
@@ -1468,8 +1489,8 @@ mod tests {
             let mut dref0 = 0usize;
             let mut st0 = RefArmStats::default();
             let ref0_exit = run_contig_ref_biased::<0>(
-                &lut,
-                &dist_holes,
+                &st.lut_litlen,
+                &st.dist,
                 &mut lb_ref0,
                 &mut out_ref0,
                 &mut dref0,
@@ -1510,8 +1531,8 @@ mod tests {
             let mut dref1 = 0usize;
             let mut st1 = RefArmStats::default();
             let _ = run_contig_ref_biased::<1>(
-                &lut,
-                &dist_holes,
+                &st.lut_litlen,
+                &st.dist,
                 &mut lb_ref1,
                 &mut out_ref1,
                 &mut dref1,
@@ -1593,24 +1614,19 @@ mod tests {
         let mut fixed = vec![8u8; 288];
         fixed[144..256].iter_mut().for_each(|x| *x = 9);
         fixed[256..280].iter_mut().for_each(|x| *x = 7);
-        let build = |lens: &[u8]| -> LutLitLenCode {
-            let mut c = LutLitLenCode::new_empty();
-            assert!(c.rebuild_from(lens), "test table lens must be valid");
-            c
-        };
-        let lut_lenny = build(&lenny);
-        let lut_fixed = build(&fixed);
         // Dist tables.
         let dist_small = DistTable::build(&[2, 2, 2, 3, 4, 5, 6, 6]).expect("small dist table");
         let dist_fixed5 = DistTable::build(&[5u8; 30]).expect("fixed5 dist table");
         let dist_sub = DistTable::build(&[1, 2, 3, 4, 5, 6, 7, 8, 10, 10, 10, 10])
             .expect("subtable dist table");
-        let pairs: [(&LutLitLenCode, &DistTable, &str); 5] = [
-            (&lut_lenny, &dist_small, "lenny×small"),
-            (&lut_lenny, &dist_fixed5, "lenny×fixed5"),
-            (&lut_lenny, &dist_sub, "lenny×sub"),
-            (&lut_fixed, &dist_fixed5, "fixed×fixed5"),
-            (&lut_fixed, &dist_small, "fixed×small"),
+        // ELEMENT A: pairs carry the litlen LENS (a per-pair AsmState rebuilds
+        // the inline litlen table) + the dist table (cloned into the inline slot).
+        let pairs: [(&[u8], &DistTable, &str); 5] = [
+            (&lenny, &dist_small, "lenny×small"),
+            (&lenny, &dist_fixed5, "lenny×fixed5"),
+            (&lenny, &dist_sub, "lenny×sub"),
+            (&fixed, &dist_fixed5, "fixed×fixed5"),
+            (&fixed, &dist_small, "fixed×small"),
         ];
 
         let mut x: u64 = 0x243F6A8885A308D3;
@@ -1628,7 +1644,21 @@ mod tests {
         // ref counts are a valid proxy for the asm arms under the equality
         // asserts below).
         let mut cell_stats: [RefArmStats; 5] = Default::default();
-        for (pi, (tbl, dt, tag0)) in pairs.iter().enumerate() {
+        for (pi, (lens, dt, tag0)) in pairs.iter().enumerate() {
+            // Inline litlen + dist in ONE AsmState (zero-copy single base);
+            // asm + ref share the storage (st.lut_litlen / st.dist).
+            let mut st = Box::new(AsmState {
+                in_ptr: 0,
+                in_lim: 0,
+                out_lim: 0,
+                out_base: 0,
+                lut_litlen: {
+                    let mut c = LutLitLenCode::new_empty();
+                    assert!(c.rebuild_from(lens), "test table lens must be valid");
+                    c
+                },
+                dist: (*dt).clone(),
+            });
             for trial in 0..3000 {
                 let n = 150 + (next() as usize % 450);
                 let data: Vec<u8> = (0..n).map(|_| next() as u8).collect();
@@ -1652,8 +1682,8 @@ mod tests {
 
                 let mut dref = WIN;
                 let ref_exit = run_contig_ref_biased::<0>(
-                    tbl,
-                    dt,
+                    &st.lut_litlen,
+                    &st.dist,
                     &mut lb_ref,
                     &mut out_ref,
                     &mut dref,
@@ -1664,18 +1694,11 @@ mod tests {
 
                 let base0 = out_asm.as_mut_ptr();
                 let dst0 = unsafe { base0.add(WIN) };
-                let mut ctx = KernCtx {
-                    in_ptr: data.as_ptr() as u64,
-                    in_lim: in_lim as u64,
-                    out_lim: base0 as u64 + out_lim as u64,
-                    out_base: base0 as u64,
-                    long_tbl: tbl.table.long_code_lookup.as_ptr() as u64,
-                    dist_tbl: dt.entries_ptr() as u64,
-                    save_p0: 0,
-                    save_d0: 0,
-                    short_tbl: tbl.table.short_code_lookup.as_ptr() as u64,
-                };
-                let (asm_exit, dst1) = unsafe { run_contig(&mut ctx, &mut lb_asm, dst0) };
+                st.in_ptr = data.as_ptr() as u64;
+                st.in_lim = in_lim as u64;
+                st.out_lim = base0 as u64 + out_lim as u64;
+                st.out_base = base0 as u64;
+                let (asm_exit, dst1) = unsafe { run_contig(&st, &mut lb_asm, dst0) };
                 let dasm = WIN + ((dst1 as usize) - (dst0 as usize));
 
                 let tag = format!("pair {pi} ({tag0}) trial {trial}");

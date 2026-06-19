@@ -912,8 +912,16 @@ pub struct DecodedSymbol {
 /// decode body is identical (already pure Rust); the rebuild path uses
 /// pure-rust `set_and_expand_lit_len_huffcode` +
 /// `make_inflate_huff_code_lit_len` instead of ISA-L FFI.
+/// `#[repr(C)]` + `table` FIRST: element A (igzip single-state-base register
+/// discipline) co-locates the litlen short+long LUT INLINE inside the boxed
+/// `AsmState` (asm_kernel.rs) so the asm addresses it `[{ctx}+LIT_OFF+idx*4]`
+/// off the ONE `ctx` base (igzip `[state+_lit_huff_code+...]`,
+/// igzip_lib.h:515-524). The table is UN-BOXED (was `Box<InflateHuffCodeLarge>`)
+/// so its bytes are physically inline in the owning `AsmState`; `table` is the
+/// first field at offset 0 so `offset_of!(LutLitLenCode, table) == 0`.
+#[repr(C)]
 pub struct LutLitLenCode {
-    pub table: Box<InflateHuffCodeLarge>,
+    pub table: InflateHuffCodeLarge,
     lit_and_dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
     code_list: Box<[u32; LIT_LEN_ELEMS + 2]>,
     valid: bool,
@@ -931,7 +939,7 @@ impl LutLitLenCode {
 
     pub fn new_empty() -> Self {
         Self {
-            table: Box::new(InflateHuffCodeLarge::default()),
+            table: InflateHuffCodeLarge::default(),
             lit_and_dist_huff: Box::new([HuffCode::default(); LIT_LEN_ELEMS]),
             code_list: Box::new([0u32; LIT_LEN_ELEMS + 2]),
             valid: false,
