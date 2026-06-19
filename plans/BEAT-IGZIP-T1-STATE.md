@@ -1,5 +1,99 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== KERNEL-CONVERGENCE NIGHT9 (branch kernel-converge-wip @ cc2840ff) — igzip LATE-DISCRIMINATOR FULL-SPECULATION run_contig REWRITE: BUILDS + BYTE-EXACT (asm==ref diffs + production sha grid PASS). Perf measurement = NEXT. (Intel-only NOT-YET-LAW) ======
+MISSION (heroic, no-phases): replace the early-flag-bit run_contig with igzip
+loop_block's COMPLETE integrated shape AT ONCE. DONE THIS TURN: the rewrite is
+IMPLEMENTED and BYTE-EXACT.
+
+### WHAT WAS REWRITTEN (asm_kernel.rs run_contig + run_contig_ref_biased, LOCKSTEP)
+Converged on igzip `loop_block` (igzip_decode_block_stateless.asm 507-627): the
+loop now does, UNCONDITIONALLY every iteration, BEFORE a single LATE discriminator:
+- (D) trailing-symbol extract `(syms>>8*(cnt-1))&0xFFFF`;
+- (C) speculative 8-byte store + `add dst,cnt` (igzip 518-519);
+- consume (shrx/sub) + (F) every-iter refill;
+- (I) preload NEXT litlen entry + (J) SPECULATIVE preload of NEXT dist entry
+  (igzip 550-552, every iter — discarded on literals);
+- (K) LATE discriminator `cmp trailing,256; jb 2b` (literal→loop hot edge;
+  ≥256→len/dist). The old EARLY flag-bit `test 0x1000000; jnz 49f` + the 49/50/31
+  backref-entry shims are GONE. The backref arm reduces to `dec dst` (copy-start
+  fixup of the spec over-advance, igzip's symmetric `lea +repeat_length-1`) + the
+  existing (at-parity) 58: dist-decode + MOVDQU copy body.
+NEW KernCtx.save_pos (+80): the X2 un-consume SNAPSHOT (bitbuf/bitsleft/pos/dst)
+is taken at the ITERATION TOP (4 independent L1-hot stores) because the body now
+consumes+refills BEFORE the discriminator, so EVERY rare bail (EOB/oversize/
+invalid/dist-side) restores all four (pos too — the main-body refill advanced it).
+KEY byte-exact argument: the new shape commits the SAME output bytes + a
+self-consistent cursor as the old shape; it differs only in instruction
+scheduling + DISCARDED speculation (the refill is append-only/logical-pos-
+preserving, so a different refill cadence is still correct).
+
+### BYTE-EXACT GATE — PASS (guest Intel LXC, /dev/shm/kc, native pure-rust-inflate)
+- Build: clean (exit 0; register allocation FIT the wider straight-line body —
+  15 GP operands, same as before, no spill failure).
+- asm==ref differentials + harness liveness (cargo test --lib asm_kernel,
+  --test-threads=1): **6/6 PASS** — c1_seam_roundtrip, c2_differential_asm_vs_ref
+  _random_streams, c3_differential_asm_vs_ref_windowed_backrefs,
+  positive_control_consume_off_by_one_trips_cursor_asserts (harness PROVEN live),
+  asm_kernel_on_off_fuzz_random_gzip_members.
+- Production sha grid (GZIPPY_FORCE_PARALLEL_SM=1 → path=ParallelSM confirmed):
+  silesia/nasa/monorepo/squishy × T1/T4/T8 = **12/12 MATCH vs igzip**; +gzip(zcat)
+  oracle silesia/nasa MATCH; +large model/bignasa × T1/T8 MATCH. ALL byte-exact.
+- prop_structured/random/near-max-distance roundtrip (8000 cases) + lut_huffman
+  + marker_inflate lib tests: **59/59 PASS, CARGO_EXIT=0** (guest /tmp/fast_test.log;
+  the earlier PROPTEST_CASES=60000 run was impractically slow — killed; 8000 cases
+  + the c3 windowed-backref differential + the real-corpus structured sha grid
+  cover the same decoder). prop_random_bytes + prop_near_max_distance also seen
+  PASS in the 60k log before it was killed.
+
+### GATED PERF — §3.1 HYPOTHESIS FALSIFIED (the igzip late+full-spec shape LOSES to the early-flag-bit shape). gated, Gate-0 PASS, decorrelated SAME-session, Intel-only NOT-YET-LAW
+Mission instrument `_gzippy_vs_igzip_paired_guest.sh`, PIN=4 REPS=15, /dev/null,
+GZIPPY_FORCE_PARALLEL_SM=1, both arms Gate-0 PASS (KERN fired sil 24137/nasa 25389,
+both byte-correct sha==zcat==igzip, A2-A1 self-test CI-incl-0, GHz spread <0.23%).
+BOTH binaries measured back-to-back in the SAME box-state (load ~5-6, controlled by
+the paired interleaving + self-test). medΔ = (gzippy − igzip) cyc/B:
+| shape (binary)                         | silesia medΔ [95%CI]        | nasa medΔ [95%CI]          |
+|----------------------------------------|-----------------------------|----------------------------|
+| OLD early-flag-bit (gzippy-chunkt1)    | +1.2734 [+1.248,+1.292]     | +0.4813 [+0.121,+0.542]    |
+| NEW igzip late+full-spec (gzippy-kc)   | +1.4613 [+1.435,+1.481]     | +0.6251 [+0.614,+0.628]    |
+NEW − OLD = **+0.188 cyc/B silesia, +0.144 cyc/B nasa — the new shape is SIGNIFICANTLY
+SLOWER (CIs NON-OVERLAPPING on both).** ΔIPC(new vs igzip) STILL NEGATIVE
+(sil -0.034, nasa -0.125); Δinstr/byte BALLOONED to +3.59 sil / +1.17 nasa (old was
++1.57 sil). MECHANISM (gated counters, not inference): the unconditional per-iter
+speculation (spec store + dist preload + trailing extract) + gzippy's NON-igzip-
+faithful per-iteration 4-store X2 SNAPSHOT (~+2 instr/byte) added retired
+instructions WITHOUT lifting IPC — the loop did NOT have the idle OOO slots the
+§3.1 premise assumed; it is closer to uop/throughput-bound than "latency-bound with
+fillable slots." So igzip's deep-speculation shape, ported faithfully PLUS the
+snapshot tax gzippy's RECLASS contract forces, costs more than it buys.
+VERDICT: KEEP the OLD early-flag-bit shape as production on perf/igzip-full-rewrite
+(it WINS the §3.1 fork). The byte-exact NEW shape is PRESERVED on scratch branch
+kernel-converge-wip @ cc2840ff for the iteration below — NOT merged to the mission
+branch (it loses Gate-1).
+RE-VERIFY: `GZIPPY=/root/bin/gzippy-kc PIN=4 REPS=15 CORPORA="silesia nasa"
+SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash /root/distpreload-harness/_gzippy_vs_igzip_paired_guest.sh`
+(old: GZIPPY=/root/bin/gzippy-chunkt1). Logs: guest /tmp/perf_new.log, /tmp/perf_old.log.
+
+### CLEAN RESUME POINT (next turn) — iterate toward higher igzip-fidelity (mission: "byte-exact but slower ⇒ KEEP iterating")
+The leading suspect for the regression is the per-iteration 4-store X2 SNAPSHOT
+(bitbuf/bitsleft/pos/dst → ctx every iter), which igzip does NOT pay (stateless,
+no un-consumed RECLASS handback). NEXT STEP (a fresh byte-exact cycle on
+kernel-converge-wip): REMOVE the snapshot from the hot literal path —
+  (a) detect EOB / oversize / invalid PRE-consume (they are known from the decoded
+      entry + trailing BEFORE the consume/store/refill), so only the genuine
+      post-consume DIST-side bail needs un-consume state; AND/OR
+  (b) snapshot only into the rare non-literal arm (still pre-consume — but the
+      consume is in the body, so this needs the discriminator's EOB/oversize moved
+      pre-consume and the dist-bail to carry its own minimal (bitbuf,bitsleft,pos)
+      save just before the dist consume).
+Then re-run the paired harness vs BOTH igzip and gzippy-chunkt1. IF still ≥ old
+shape after the snapshot is off the hot path, the igzip-shape direction is dead at
+T1 (record a FALSIFY with re-open trigger = a different arch/uarch or a corpus where
+the loop is genuinely latency-bound). Owed regardless: ΔIPC under the STRESSOR
+phase, T4/T8 wall+RSS, AMD/Zen2 replication.
+BOX CLEAN: killed the slow 60k proptest + its orphan wait-loops + TWO Jun18 hung
+gzippy test bins (PIDs 2739329 ~20h, 3769324 ~9.5h, prior-session — NOT mine);
+verify pgrep clean at turn end.
+
 ## ====== KERNEL-CONVERGENCE HEROIC REWRITE (night8, branch kernel-converge → perf/igzip-full-rewrite) — DESIGN SPINE LAID + BASELINE RE-ANCHORED (gated, Gate-0 PASS, Intel-only NOT-YET-LAW) ======
 MISSION (user, heroic, no-phases): converge the WHOLE inner-Huffman `run_contig` kernel on
 igzip's COMPLETE integrated `loop_block` at once until gzippy-native T1 cyc/B ≤ igzip on
