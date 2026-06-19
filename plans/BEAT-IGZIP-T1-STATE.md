@@ -1,5 +1,46 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT22 (2026-06-19, branch kernel-converge-A @0efc6c46, base 621e95fe=NIGHT20+elemB) — THE DECISIVE GATE RAN: element A (single-state-base) is BYTE-EXACT (quad-oracle 5-corpus T1/T4/T8 both flavors + NIGHT21 differential) and the campaign's moment-of-truth perf is MEASURED. ANSWER: structural convergence on igzip did NOT close the gap — A still LOSES igzip on all 3 corpora; A beats OLD-chunkt1 on silesia ONLY (1/3); A beats NIGHT19 on silesia only (others TIE). The residual to igzip is now INSTRUCTION-bound (instr/B), NOT the modeled structural elements (base regs / anchor stores / cadence — those are converged). NOT a promote by the perf bar → HONEST RESIDUAL FINDING. Intel-LXC, NOT-YET-LAW (AMD owed). ======
+
+### THE DECISIVE PERF (Gate-0 self-validated; PIN=cpu4, N=21 paired interleaved IG,IG2,A,OLD,N19; /dev/null both arms; powersave GHz~1.394 — cyc/B is freq-invariant + paired; box load host-wide ~3.9→7.2 but container CPU idle, single-core pinned)
+GATE-0 PASS: every arm sha==zcat ref on all 3 corpora; KERN entries fired for every gz arm. STRUCTURAL SIGNAL: A and N19 have IDENTICAL kernel-entry counts (silesia 2807, nasa 352, monorepo 168) — the converged full-spec speculation shape — vs OLD's 24137/25389/8298 (early-flag-bit). cyc/B = cycles/decompressed-byte (lower=faster):
+
+```
+            cyc/B    IPC   instr/B   |  Δcyc/B vs igzip [95%CI]        A vs OLD          A vs N19
+silesia
+  igzip    4.4132  2.583  11.399     |
+  A        5.6312  2.517  14.173     |  A:+1.192 [+1.180,+1.223]   -0.078 A FASTER   -0.028 A FASTER
+  OLD      5.6990  2.282  13.005     |  OLD:+1.274                 (CI disjoint)      (CI disjoint)
+  N19      5.6454  2.556  14.431     |  N19:+1.227
+nasa
+  igzip    1.5986  2.307   3.686     |
+  A        2.1738  2.126   4.622     |  A:+0.583 [+0.579,+0.588]   +0.089 A SLOWER   -0.0003 TIE
+  OLD      2.0886  2.070   4.322     |  OLD:+0.486
+  N19      2.1739  2.154   4.681     |  N19:+0.580
+monorepo
+  igzip    3.0177  2.269   6.842     |
+  A        4.3106  2.109   9.090     |  A:+1.295 [+1.291,+1.324]   +0.223 A SLOWER   -0.003 TIE
+  OLD      4.0796  2.083   8.498     |  OLD:+1.079
+  N19      4.3215  2.129   9.198     |  N19:+1.312
+```
+SELF-TEST (IG2-IG, must include 0): nasa OK [-0.0025,+0.0049], monorepo OK [-0.016,+0.022], **silesia FAIL** [-0.0115,-0.0007] — a tiny +0.006 cyc/B fixed-arm-ORDER warmup bias (IG always pos-1=cold, IG2 pos-2). Magnitude is ~200x SMALLER than the headline gaps and CONSERVATIVE for every A-favorable verdict (A is pos-3, OLD pos-4, N19 pos-5 → later=warmer=favored, so A's wins are understated, A's losses overstated). All verdict SIGNS are robust to it. OWED-for-law: re-run with per-rep RANDOMIZED arm order.
+
+### THE MEASURED ANSWER (the question this campaign asked)
+"Does structural identity to igzip ⇒ igzip performance for gz's resumable kernel?" — **NO.** With the structure fully converged (single `state` base, anchor-in-register, NIGHT19 IPC-parity split-refill cadence), gz still retires **+2.77 / +0.94 / +2.25 instr/B more than igzip** (silesia/nasa/monorepo). The cyc/B gap ≈ Δinstr/B ÷ IPC accounts for most of it (silesia +2.77/2.55≈+1.09 ≈ the +1.19 measured). IPC has LARGELY converged on silesia (A 2.517 vs igzip 2.583, Δ-0.066; was -0.30 on the OLD shape — NIGHT19's IPC win held) but a residual IPC deficit remains on nasa/monorepo (Δ-0.18/-0.16). Element A DID delete the anchor STORES it targeted: A's instr/B is LOWER than N19's by 0.26/0.06/0.11 — a real, as-designed instruction shave — but that is a SMALL fraction of the +1-2.8 instr/B gap to igzip. So the residual is NOT structural-divergence-in-the-modeled-elements; it sits in instr/B from elements NOT yet modeled: the resumable-contract overhead (D-1 floor), speculation/reclass glue, table-format masking (NIGHT12 buckets +4/iter masking, +1/iter glue). NEXT STRUCTURAL QUESTION: where do the residual +1-2.8 instr/B live, and which are removable without breaking the resumable contract / byte-exactness?
+
+### DECISION (report, NOT self-bless)
+**HONEST RESIDUAL FINDING — NOT a promote by the perf bar.** Bar was "A ≥ parity igzip OR beats OLD on ≥2 corpora": A reaches neither (loses igzip ×3; beats OLD on silesia only = 1/3). Over N19/faithful, element A is a byte-exact, MORE-faithful (single igzip base) structural change that is a marginal silesia win (-0.028 signif) + TIE on nasa/monorepo + a real instr/B shave — a candidate KEEP-on-tie for FAITHFULNESS grounds, but that is a SUPERVISOR strategic call, not a perf promote. Do NOT FF to kernel-converge-faithful on the perf bar. Branch discipline HELD (work on kernel-converge-A; faithful untouched at 621e95fe).
+
+### GATE STATUS (Intel-LXC GATE-0; NOT-YET-LAW)
+PASS: TRIORACLE — quad-oracle (gzip+igzip+libdeflate+pigz) × silesia/nasa/monorepo/squishy/large × T1/T4/T8 × BOTH flavors (native+isal) sha-IDENTICAL (re-confirmed at HEAD 0efc6c46). + NIGHT21 asm-vs-ref differential. + DECISIVE perf Gate-0 (above).
+KNOWN-HARNESS-HANG (NOT a real failure): full `cargo test --lib --test-threads=1` (native) DEADLOCKED at ~640s — diagnosed: 2 threads, one in `pipe_wait_writable` (pipe buffer full, no reader), main in `futex_do_wait`, CPU frozen (utime+stime 5039→5039 over 3s). This is exactly the banked decompress::parallel/fd_vectored pipe-deadlock ("after decode completes, NOT a decoder bug"). gate2 (below) re-runs skipping the pipe modules + isolates them under timeout.
+RUNNING (gate2, /dev/shm/kca_gate2.log): 60k prop_structured both flavors + full --lib both flavors SKIPPING pipe-deadlock modules + isolated pipe modules under timeout-90.
+OWED: T4/T8 wall+RSS A-vs-OLD (script /root/_kca_walltn_guest.sh ready; not run to keep perf box uncontended); AMD/Zen2 replication; law-grade perf re-run with randomized arm order.
+
+### REPRO
+Builds (guest /root/gzippy @0efc6c46, RUSTFLAGS=-C target-cpu=native): A-native /root/gz-A-native (sha eff966b1), A-isal /root/gz-A-isal (sha 9e50f0a7, +196KB & isal-rs string = genuine isal flavor), NIGHT19 /root/gz-night19 (sha c0719476, built from c4ac5acc), OLD /root/bin/gzippy-chunkt1 (e5266440), igzip /usr/bin/igzip 2.31.1. Perf: `REPS=21 PIN=4 bash /root/_kca_perf4_guest.sh` (scripts/bench/_kca_perf4_guest.sh + _kca_perf4_analyze.py). Gates: /root/_kca_buildall.sh, /root/_trioracle_gate.sh (NATIVE=/root/gz-A-native ISAL=/root/gz-A-isal), /root/_kca_gate2_guest.sh.
+
+
 ## ====== NIGHT21 (2026-06-19, branch kernel-converge-A @5c5ba052, base 621e95fe=NIGHT20) — ELEMENT A (igzip SINGLE-STATE-BASE register discipline) IMPLEMENTED + builds BOTH flavors on guest (Intel-LXC) + BYTE-EXACT at the differential gate + TRI-corpus sha-identity. NOT yet FF'd to kernel-converge-faithful (full lib suite + 60k prop + PERF owed). Intel-LXC, NOT-YET-LAW. ======
 
 ### WHAT SHIPPED (commit 5c5ba052 on origin/kernel-converge-A — WIP, NOT on faithful)
