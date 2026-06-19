@@ -1,5 +1,77 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT12 (2026-06-19, branch kernel-converge-faithful @ d67e72a6 = NEW11) — STEP-1 DECISIVE STATIC DIFF: localized the NEW11 +3.589 instr/B (vs igzip) per-instruction. BUCKETS: anchor hand-spill +4/iter, table-format masking +4/iter, RECLASS/exit glue +1/iter, gz LEANER on spec-length+EOB −3/iter → NET +6/iter (literal hot path: gz 44 instr vs igzip 38) ≈ the gated +3.589 instr/B. DECISION RULE met: anchor(1)+masking(2) DOMINATE glue(3) → the +3.58 is a FIXABLE un-transliterated gap (NOT a structural ceiling), proceed to STEP 2 (single-base register layout + table pre-masking). This is a NEW result, NOT redundant with night11. NO asm change this turn (STEP 2 is a coupled rewrite needing the guest byte-exact gate). (static decomposition of a GATED number; the per-bucket "removable" attribution is HYPOTHESIS until STEP-2 build+measure) ======
+
+### WHY THIS IS NOT REDUNDANT WITH NIGHT11 (the honest reconciliation — flag to supervisor)
+NIGHT11 decomposed the gap to **OLD** (+2.0 instr/B, NEW11−OLD) and concluded "the full-spec
+speculation itself" owns it, and that anchor-removal-ALONE (→ ~+2.6 instr/B) cannot close it →
+correctly NOT worth the risk. STEP 1 (this turn) decomposes the DIFFERENT gap to **igzip**
+(+3.589 instr/B, NEW11−igzip) — the comparison that matters because **igzip's full-spec shape
+BEATS OLD (igzip ~4.35 vs OLD ~5.67 cyc/B) AND NEW11 already MATCHES igzip's IPC (−0.03).** The
+NEW insight night11 did NOT consider: a SECOND removable bucket (table-format MASKING, +4/iter)
+on top of the anchor (+4/iter). Removing BOTH (−8/iter) against the NET +6/iter would put gz's
+full-spec at ≈ −2/iter vs igzip = BELOW igzip's instr/B (gz is already −3/iter leaner on the
+hot-path spec-length+EOB that igzip computes unconditionally). With IPC already at igzip parity,
+that is the FIRST credible path for the full-spec shape to beat OLD. HYPOTHESIS (unvalidated):
+single-base + pre-masking brings NEW11 instr/B to ≤ igzip with IPC held → cyc/B ≤ igzip → beats
+OLD. ONLY a STEP-2 build + gated paired measurement settles it (the §3.1 skeleton was falsified
+3× on the gap-to-OLD framing; this is a 4th, sharper test on the gap-to-igzip framing).
+
+### THE +3.589 instr/B BUCKET TABLE (literal hot path: gz `2:`→`jb 2b` vs igzip loop_block 509→`jl loop_block`)
+Counted instruction-by-instruction from asm_kernel.rs run_contig (HEAD d67e72a6) and
+igzip_decode_block_stateless.asm loop_block 507-556 + decode_next_lit_len macro 322-372.
+gz literal path = **44 instr/iter**; igzip literal path = **38 instr/iter**; Δ = **+6/iter**.
+(silesia bytes/iter ⇒ +6/iter ≈ +3.589 gated instr/B — self-consistent with the GATED number.)
+
+| bucket | gz instrs (asm_kernel.rs line) | igzip counterpart (asm line) | Δ/iter | removable? cite |
+|--------|-------------------------------|------------------------------|--------|-----------------|
+| (1) ANCHOR hand-spill (X2 un-consume, gz-only) | `lea t2,[pos*8]`+`sub t2,bitsleft`+`mov [ctx+56],t2`+`mov [ctx+64],dst` (439-442) | NONE (igzip stateless, never un-consumes — DIVERGENCE LEDGER §8 D-1) | **+4** | YES via STEP 2(a): single-base frees 2 GP regs → carry p0,d0 in regs, drop the 2 stores. (igzip register layout: ONE base `state`, lines 86-136) |
+| (2) TABLE-FORMAT MASKING (per-use extract masks) | `and t5,0x1FFFFFF`(460) + `and t5,0xFFFF`(463) + `mov t4,t1`+`and t4,0xFFFFFF`(471-472); two scratch-mov copies of t1 because the raw entry is reused for store AND trailing | igzip masks the entry ONCE: `and next_sym,FLAG\|SYM_MASK` (D7, 341); store(518) + trailing-shrx(521) BOTH read that one masked reg; table guarantees zero bits above the cnt*8 sym field ⇒ no post-shrx `and`, no second mask | **+4** | YES via STEP 2(b): gz litlen table format is ALREADY igzip LARGE_SHORT (offsets 28/26/25, mask 0x1FFFFFF — igzip 58-67 ✓). Transliterate the BUILD to zero high bits above cnt*8 + restructure decode to mask-once-reuse (needs 1 freed reg from (a)) |
+| (3) RECLASS/exit glue (gz return-code contract) | `mov ret,1` per-iter speculative BOUNDARY (418) | igzip uses `jg end_loop_block_pre` (510/512), no per-iter ret | **+1** | partial: hoistable to guard-fail path only; minor |
+| (−) gz LEANER (igzip speculates these unconditionally; gz defers to backref arm) | — | `lea repeat_length,[next_sym2-254]`(533 spec length) + `cmp next_sym2,256`+`je`(536-537 EOB) | **−3** | n/a (gz already leaner here) |
+
+DECISION: (1)+(2) = +8/iter DOMINATE glue (3) = +1/iter. Per KERNEL-CONVERGENCE.md decision
+rule → the +3.58 is a FIXABLE transliteration gap, NOT the structural ceiling. PROCEED to STEP 2.
+Both buckets are COUPLED through the 15-GP register ceiling (operand list asm_kernel.rs 825-841:
+ctx/short_tbl/in_ptr/dtbl are FOUR base pointers where igzip pins ONE = `state` + struct offsets):
+freeing regs via single-base is the prerequisite for BOTH carrying the anchor in-reg (1) AND
+holding a persistent mask-once symbol (2). So STEP 2 is ONE coupled change, not splittable.
+
+### STEP 2 — PRECISE TRANSLITERATION DESIGN (the clean resume point; faithful, igzip-cited; NOT yet implemented)
+**2(a) SINGLE-BASE REGISTER LAYOUT (igzip 86-136, 502/540/552/577 addressing).** igzip addresses
+both tables off ONE base: `[state + _lit_huff_code + LARGE_SHORT_CODE_SIZE*idx]` (502/540/577)
+and `[state + _dist_huff_code + SMALL_SHORT_CODE_SIZE*idx]` (552) — the tables are INLINE arrays
+in inflate_state. gz pins separate `short_tbl`/`dtbl` `*const` base regs. TRANSLITERATE: store
+the litlen short table + dist table CONTIGUOUS inside (or immediately addressable from) KernCtx so
+`[ctx + LIT_OFF + idx*4]` / `[ctx + DIST_OFF + idx*4]` use ctx as the only base ⇒ frees the
+`short_tbl` and `dtbl` operands (2 regs). Move p0 + d0 into the 2 freed regs ⇒ delete the 2 anchor
+stores (asm 441-442); p0 stays REFILL-INVARIANT in a reg (still re-read on bail via `85:`, just
+sourced from the reg not [ctx+56]). LIFECYCLE care: tables are per-dynamic-block, ctx per-chunk —
+build the inline tables in place per block (litlen 4096*4=16KiB, dist 512*4=2KiB; already rebuilt
+per block in build_huffman_luts_for_block, marker_inflate.rs:1163) with no added per-chunk copy.
+**2(b) TABLE-FORMAT PRE-MASKING (igzip 341 + table build igzip_inflate.c).** Make
+LutLitLenCode::rebuild_from (lut_huffman.rs) store each entry with bits above the cnt*8 sym field
+ZEROED (igzip's table guarantee), and restructure run_contig's decode to mask the entry ONCE into
+a freed reg (igzip D7 `and FLAG|SYM_MASK`, 341), reusing it for the spec store (igzip 518) AND the
+trailing shrx (igzip 520-521) ⇒ deletes asm 463 (`and 0xFFFF`) + 471-472 (`mov t4,t1; and 0xFFFFFF`).
+**LOCKSTEP + GATE:** update run_contig_ref_biased identically; preserve X1-X6 + IN_MARGIN + X2
+re-read (`85:`/`86:`) + the divergence ledger §8 D-1 (the anchor moves register→register, the
+re-read contract is unchanged). Byte-exact gate = the night11 template (asm c1/c2/c3/pos-control/
+on-off-fuzz + ≥60k prop_structured + trioracle silesia/nasa/monorepo/squishy/large × {native,isal}
+× T1/T4/T8 sha-identical + serialized --lib both flavors 0-failed). THEN gated paired N≥15 vs
+igzip AND OLD(chunkt1) AND NEW11(d67e72a6): cyc/B + instr/B + IPC. SUCCESS = instr/B falls toward
+igzip WITH IPC held (~−0.03) → cyc/B ≤ igzip → beats OLD. Promote kernel-converge-faithful →
+perf/igzip-full-rewrite ONLY then, as gated-HYPOTHESIS for decorrelated/AMD review. Else: STEP-2
+falsified ⇒ OLD early-flag-bit is gz's full-spec ceiling on this uarch (4th confirmation) — record
+FALSIFY with re-open trigger = AMD/Zen2 idle-slot uarch.
+
+### GUEST / BOX STATE (this turn — analysis only, nothing built/run)
+Guest reachable `ssh -o ConnectTimeout=15 -J 10.0.0.100 root@10.30.0.199`; 16 cores; /dev/shm
+12G free; root disk 99% (build ⇒ /dev/shm); igzip /usr/bin/igzip; NO cargo running on arrival
+or exit (pgrep clean — I started none). Compare binaries in /root/bin: gzippy-chunkt1 (OLD
+early-flag-bit), gzippy-kc (night9). NEW11 (d67e72a6) binary must be rebuilt for re-measure
+(gz-new-native from night11 not present in /root/bin listing). Box NOT frozen, no pinning set.
+
 ## ====== NIGHT11 (2026-06-19, branch kernel-converge-faithful @ 3bacc1a1, base night9 c4fbc3d3) — FAITHFUL snapshot removal (minimal p0/d0 anchor + from-data RE-READ un-consume, NOT c936's serialized cut). BYTE-EXACT (asm 6/6 + trioracle 30/30 + prop 57/57). GATED PERF: NEW11 ≈ night9 (the 2-store anchor is INSTRUCTION-NEUTRAL) and BOTH LOSE to OLD early-flag-bit — snapshot was NOT the lever; the ~2 instr/B gap is the full-spec speculation. §3.1 skeleton FALSIFIED a 3rd time. NOT promoted. (gated, Gate-0 PASS, Intel-LXC NOT-YET-LAW) ======
 
 ### THE CHANGE
