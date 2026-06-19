@@ -1,5 +1,87 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT20 (2026-06-19, branch kernel-converge-faithful @85e98c9f, base 96d2742b=NIGHT19) — STRUCTURAL CONVERGENCE ELEMENT B DONE + GATED + PUSHED: the dead bit-24 TRAILING_NONLIT_FLAG removed from the litlen table build, converging gz's build on igzip's (igzip's make_inflate_huff_code_lit_len sets NO class flag; runtime `cmp 256` classifies). Element A (single-state-base register discipline) is FULLY DE-RISKED + implementation-ready but NOT yet implemented (it is the NIGHT14 FULL-form multi-file ownership refactor; banked as a precise resume point below, per NIGHT14's "not completable+gateable in one session" + the push-byte-exact-only rule). Intel-LXC byte-exact PASS, NOT-YET-LAW (AMD owed; PERF gate owed — box not frozen this session). ======
+
+### ELEMENT B — DONE (commit 85e98c9f, pushed origin/kernel-converge-faithful)
+THE CHANGE (lut_huffman.rs): removed the two per-entry conditional ORs that set
+`LARGE_TRAILING_NONLIT_FLAG` (bit 24) for cnt∈{1,2} non-literal trailings (build
+sites for lone @~540 + pair @~588), plus the const + offset + doc. Faithful to
+igzip (igzip_inflate.c:387-599 sets no such bit). Updated the stale asm doc
+comment (run_contig line-map: the discriminator is the runtime `cmp {t5},256`,
+not `test FLAG bit24`). Replaced the flag-invariant test with
+`no_build_time_trailing_class_flag` (locks: bit 24 unset for cnt∈{1,2}; trailing
+still byte-correct via the cnt-shift + `& 0xFFFF`).
+BYTE-EXACT (why): bit 24 lives in the 25-bit packed field; decoders recover the
+trailing via cnt-shift + `& 0xFFFF`, which drops bit 24 (cnt=1: outside 0xFFFF;
+cnt=2: lands bit16 after >>8, dropped). The asm spec-store keeps bits 0..24 but
+dst advances by cnt≤3 so byte 3 (bit 24) is always X3 overshoot, never final.
+Triple sym3≥256 sets bit 24 NATURALLY (sym3 bit 8) — untouched.
+GATE (guest Intel-LXC, GATE-0 PASS, /dev/shm/kcb_gate.log):
+  * TRIORACLE: PASS — silesia/nasa/monorepo/squishy/large × {native,isal} ×
+    T1/T4/T8 sha-IDENTICAL vs gzip+igzip+libdeflate+pigz (oracles concur).
+  * asm-vs-ref differential (c2/c3) + lut_huffman tests: 13 passed / 0 failed
+    (incl. new no_build_time_trailing_class_flag) — proves asm==ref with the new
+    table.
+  * prop_structured_roundtrip: PASS (default cases; 60k-case run OWED — env not set).
+  * both flavors build EXIT=0 (gzippy-native, gzippy-isal).
+OWED: PERF (cyc/B·IPC·instr/B vs igzip/OLD/NIGHT19, frozen box — box load 2.76
+this session, no reliable Gate-0/Gate-1); full lib suite both flavors (ran
+targeted lut+differential+prop only, to dodge the loaded-box parallel-test hang);
+60k prop; AMD/Zen2. Element B is a TABLE-BUILD-path shave (NIGHT18 bucket: table
+build = +0.28 cyc/B sil / +1.24 instr/B) — small, do NOT pre-judge its cyc/B (the
+governing law: confirm by measurement, do not instruction-anchor).
+
+### ELEMENT A — SINGLE-STATE-BASE register discipline (NOT implemented; precise, DE-RISKED resume design)
+GOAL (disasm-provable): fold the 3 asm base registers ({short_tbl},{dtbl},
+{in_ptr}) toward igzip's ONE `state` base. {in_ptr} CANNOT fold (it indexes the
+compressed input window `[in_ptr+pos]`, not in ctx). {short_tbl}+{dtbl} CAN fold:
+co-locate the litlen short table + the dist table INLINE in ONE persistent boxed
+struct addressed `[{ctx}+disp+idx*4]`. Frees 2 GP → carry p0+d0 in registers →
+DELETE the 2 per-iteration anchor STORES (asm_kernel.rs 458-459). Operand budget:
+15 → (−short_tbl,−dtbl) 13 → (+p0,+d0) 15 (ceiling held — VALID).
+NEW DE-RISKING FINDINGS THIS SESSION (reduce NIGHT14's stated risk):
+  1. The REF MODEL needs NO anchor change: run_contig_ref_biased already uses
+     LOCAL `let p0 = lb.pos*8 - lb.bitsleft; let d0 = *dst` (asm_kernel.rs
+     1074-1075) and `reclass_reread(lb,p0); *dst=d0` — it never stores to ctx. So
+     moving the asm anchor from ctx-memory to registers is byte-transparent to the
+     ref. Only TABLE ADDRESSING changes in the asm (an addressing-mode change
+     loading the SAME value), so the c2/c3 differential stays valid if table
+     CONTENTS are identical.
+  2. The DIST table CAN be zero-copy inlined: max entries = main(512) +
+     64×count(len>9) ≤ 512 + 64×30 = 2432 (libdeflate_entry.rs rebuild:634). A
+     FIXED `[u32; ~2560]` inline array holds any dist table (primary + ALL
+     subtables) → the 91: subtable path also reads `[{ctx}+DIST_OFF+{t4}*4]`, NO
+     separate base-load. ~10 KiB inline.
+  3. ZERO-COPY BACKING IS REQUIRED (not a per-block/per-call copy): region calls
+     ≈ blocks ≈ 7465/silesia (NIGHT14), so a per-call copy of litlen(16K)+dist(10K)
+     = ~194 MB of copies — that is exactly NIGHT14's "negates the win". The build
+     MUST write directly into the persistent inline arrays.
+THE REFACTOR (multi-file, guest-only-validatable, the work):
+  * `#[repr(C)] struct AsmState { in_ptr,in_lim,out_lim,out_base,long_tbl: u64;
+    litlen_short:[u32;4096]; dist_entries:[u32;DIST_CAP]; dist_table_bits:u8 }`
+    held boxed in the decoder `self` (stable address). Header updated per region
+    call (cheap ~5 stores); tables built IN PLACE per block (zero copy).
+  * Back LutLitLenCode's SHORT table by AsmState.litlen_short (build writes there;
+    decode_prefilled + the OFF careful loop read there). Litlen LONG table stays
+    separate, pointed to by AsmState.long_tbl (cold 20: path keeps the [ctx+disp]
+    ptr-load). DistTable backed by AsmState.dist_entries.
+  * asm rewrite: `[{short_tbl}+i*4]`→`[{ctx}+LIT_OFF+i*4]` (prologue 432, 543,
+    591, 703); `[{dtbl}+i*4]`→`[{ctx}+DIST_OFF+i*4]` (559, 639, 879); anchor
+    458-459 write p0/d0 to REGISTERS (delete the 2 stores); 85: read p0/d0 from
+    registers (not [ctx+56/64]); drop short_tbl/dtbl operands, add p0/d0; remove
+    KernCtx.save_p0/save_d0 + short_tbl/dist_tbl fields; update the 3 asm-test
+    KernCtx constructors (asm_kernel.rs ~1226/1362/1449) + the offset asserts.
+  * GATE: same as Element B (trioracle 5-corpus + c2/c3 differential + 60k prop +
+    full lib both flavors) THEN perf (frozen box) cyc/B·IPC·instr/B vs igzip/OLD/
+    NIGHT19 + T4/T8 wall+RSS. CAVEAT (NIGHT16): anchor-store removal ALONE measured
+    ≈0 (TIE) under the OLD shape — but the regime changed (NIGHT19 → IPC parity;
+    NIGHT13 2b showed −3 instr = −0.024 cyc/B SIGNIF, so store-port relief CAN
+    move cyc/B now). DO NOT pre-judge; REPORT the measured truth either way.
+BUILDS THIS SESSION: /root/gz-new-native, /root/gz-new-isal (Element B, gated).
+Target dir /dev/shm/kcb. Gate script committed scripts/bench/_kcb_gate_guest.sh
+(+ /root/_kcb_gate_guest.sh) + reuses /root/_trioracle_gate.sh. Guest clean on
+exit (no cargo/perf). Resume: implement Element A per the refactor above.
+
 ## ====== NIGHT19 (2026-06-19, branch kernel-converge-faithful @c4ac5acc, base bb2cff5d) — CADENCE CONVERGENCE (igzip loop_block SPLIT-REFILL software-pipelined schedule, element F) IMPLEMENTED + GATED + BYTE-EXACT. ISOLATED RESULT (vs the immediately-prior full-spec kernel bb2cff5d, NOT chunkt1): the reorder is a SIGNIFICANT cyc/B win on ALL THREE corpora — silesia −0.2525, nasa −0.0389, monorepo −0.0514 (paired N=21, CIs DISJOINT, same box state, igzip bar stable). MECHANISM CONFIRMED STRUCTURAL: Δinstr/B IDENTICAL to 3 decimals (NEW +3.0322 vs BASE +3.0339 silesia — a PURE reorder, 0 instruction change as designed), the gain is ALL IPC: silesia whole-decode ΔIPC −0.126→−0.017 (now ≈ igzip parity; was −0.30 on the OLD early-flag-bit shape). NIGHT18's IPC diagnosis (gz hot-loop low-IPC, latency-bound) is CONFIRMED and the targeted structural element CLOSED it on the literal-heavy corpus. STRUCTURAL PICTURE FLIPPED: the residual gap to igzip (silesia +1.20) is now INSTRUCTION-bound (ΔIPC≈0, Δinstr/B +3.03) → next front = register discipline (N)/single-state-base to delete retired instructions toward igzip's stateless count. NOT a promote (still loses igzip on all 3, still loses OLD-chunkt1 on nasa/monorepo; BEATS OLD-chunkt1 on silesia +1.20 vs +1.27 — first time the full-spec shape beats the early-flag-bit on silesia). Intel-LXC, NOT-YET-LAW (AMD owed). gzippy-isal flavor + full lib suite OWED. ======
 
 ### THE CHANGE (asm_kernel.rs run_contig `6:` block — pure schedule reorder, ref UNCHANGED)

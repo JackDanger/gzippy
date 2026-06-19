@@ -235,6 +235,20 @@ Each row is a place gzippy's `run_contig` must keep state that igzip's stateless
 `loop_block` does NOT, why igzip lacks it, and why the gz form is the minimal faithful
 choice. (Mission rule: a true divergence is legal when byte-exact + ledgered.)
 
+### RESOLVED-1 — bit-24 TRAILING_NONLIT_FLAG REMOVED (NIGHT20 @85e98c9f, CONVERGED)
+- **Was.** gz set a build-time `LARGE_TRAILING_NONLIT_FLAG` (bit 24) in each
+  litlen short entry whose trailing packed symbol was non-literal (cnt∈{1,2}).
+  A leftover from the EARLY-flag-bit discriminator shape (`test entry,bit24;jnz`).
+- **igzip has no counterpart.** `make_inflate_huff_code_lit_len` (igzip_inflate.c
+  387-599) sets no class flag; the decoder classifies at RUNTIME (loop_block
+  555-556 `cmp next_sym2,256`). The flag was DEAD in gz too (the kernel uses the
+  late `cmp {t5},256` at run_contig:565).
+- **Removed** to match igzip's build exactly (deleted the 2 per-entry conditional
+  ORs + const + offset + doc). Byte-exact (bit 24 only ever read inside the 25-bit
+  packed field; decoders drop it via the cnt-shift + `& 0xFFFF`; triple sym3≥256
+  sets it as natural DATA). GATED: trioracle 5-corpus × both flavors × T1/4/8
+  sha-identical + c2/c3 differential. NOT a divergence any longer — a convergence.
+
 ### D-1 — X2 un-consume cursor (NIGHT11, the snapshot replacement)
 - **What diverges.** On a rare RECLASS bail (EOB / oversize / invalid / dist-subtable /
   invalid-dist) gzippy must hand the un-decoded packet BACK to the Rust careful loop
