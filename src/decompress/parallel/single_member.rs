@@ -42,6 +42,24 @@ use std::sync::Mutex;
 const MIN_THREADS_FOR_PARALLEL: usize = 1;
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// T1-only default compressed-chunk target (1 MiB vs the 4 MiB T>1 default).
+///
+/// At T1 the pipeline is inline (no workers, no prefetch — see the night4
+/// in-flight-depth note) and the only thing chunk size changes is the size of
+/// each chunk's materialized output buffer. A SMALLER per-chunk output buffer
+/// stays under the allocator's mmap threshold, so when the in-order-drain
+/// recycles it (depth-1) the next chunk decodes into the SAME warm, already-
+/// faulted pages instead of a fresh mmap → faults drop ~67% (nasa
+/// 11381→3769) / ~42% (silesia 13911→8095) and the warm working set cuts
+/// cyc/byte (GATED paired N=15: nasa −0.125 cyc/B / −5.69% p=0.0007; silesia
+/// −0.079 cyc/B / −1.37% p=0.0011; both CI-excl-0, byte-exact).
+/// SCOPED TO T1: at T>1 the finer granularity REGRESSES the parallel pipeline
+/// (silesia T4 wall +20%, measured) because more/smaller chunks add
+/// block-finder + scheduling overhead, so T>1 keeps the 4 MiB default.
+/// Intel-LXC NOT-YET-LAW (AMD/Zen2 replication owed). The explicit
+/// `GZIPPY_CHUNK_KIB` env override still wins over this default.
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
+const T1_TARGET_COMPRESSED_CHUNK_BYTES: usize = 1024 * 1024;
 /// Floor on the adjusted chunk size when the file is small.
 /// Mirror of `512_Ki` literal at vendor's ParallelGzipReader.hpp:305.
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
@@ -196,11 +214,20 @@ pub fn decompress_parallel<W: Write>(
         // discriminate "T16 regression is straggler/granularity" from
         // "T16 regression is HT microarchitecture" without a rebuild per
         // size. Falls back to TARGET_COMPRESSED_CHUNK_BYTES when unset.
+        // Thread-aware default: T1 uses the smaller 1 MiB target (warm
+        // output-buffer recycling win, gated; see T1_TARGET_COMPRESSED_CHUNK_BYTES),
+        // T>1 keeps the 4 MiB target (finer granularity regresses the parallel
+        // pipeline). Explicit GZIPPY_CHUNK_KIB always overrides.
+        let thread_default_chunk = if num_threads <= 1 {
+            T1_TARGET_COMPRESSED_CHUNK_BYTES
+        } else {
+            TARGET_COMPRESSED_CHUNK_BYTES
+        };
         let default_chunk = std::env::var("GZIPPY_CHUNK_KIB")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|kib| kib * 1024)
-            .unwrap_or(TARGET_COMPRESSED_CHUNK_BYTES);
+            .unwrap_or(thread_default_chunk);
         let chunk_size = adjusted_chunk_size_bytes(gzip_data.len(), num_threads, default_chunk);
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
