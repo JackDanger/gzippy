@@ -1,5 +1,42 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT18 (2026-06-19, branch kernel-converge-faithful) — THE BY-FUNCTION WHOLE-DECODE DECOMPOSITION (never run before). gz-OLD (early-flag-bit, +1.26) vs igzip, BOTH symbolized, perf-recorded instructions+cycles, T1 pin=cpu4, N=7. VERDICT — RECORD CORRECTED: the +1.26 cyc/B gap is DOMINATED by the HOT LOOP, NOT the scaffold. run_contig = 86.7% of CYCLES and carries +0.98 cyc/B = 77% of the silesia gap (+0.42=79% nasa). Per-block TABLE BUILD is the SECONDARY cyc lever (+0.28 silesia=22% / +0.06 nasa=11%) — and the #1 INSTRUCTION excess (+1.24 instr/B) but it runs at ~4× IPC so it is cheap in CYCLES. CRC = TIE; output/window = gz CHEAPER than igzip. The task's framing ("hot loop ≈0 of gap, the +3.5 instr/B is SCAFFOLD") was the INSTRUCTION-ANCHORING bias: extra INSTRUCTIONS are scaffold (table build, near-free in cycles), but the extra WALL (cycles) is the hot loop. NIGHT16 was right only about the ANCHOR sub-component (~4 instr/iter, a small slice of run_contig), NOT the hot loop as a whole. Intel-LXC, NOT-YET-LAW (AMD owed). ======
+
+### THE MEASUREMENT (Gate-0 PASS, deterministic, conservation-checked, self-validated)
+- **Instrument:** gz-OLD rebuilt from `37e669cf` (perf/igzip-full-rewrite kernel = the +1.26 production shape) with `strip=false` + `debug=line-tables-only` and `#[inline(never)]` forced on the scaffold fns (`LutLitLenCode::rebuild_from`, `LutDistCode::rebuild_from`, `read_header`, `read_dynamic_huffman_coding`, `decode_careful_tail`, `prefill_window_prefix`, `CRC32Calculator::update`). `run_contig` was ALREADY `#[inline(never)]` in source (asm_kernel.rs:384) — its 85% is NOT an edit artifact. Byte-transparent: sha==igzip on silesia AND nasa (T1, ParallelSM routing confirmed). Binary `/dev/shm/gzold/target/release/gzippy` (13MB symbolized).
+- **igzip is dynamically linked to `libisal.so.2.0.31` WITH symbols** → BOTH sides decompose by function (igzip is NOT an opaque blob).
+- **Gate-0 conservation/self-validation:** whole-decode cyc/B (perf stat, N=7, cpu_core PMU, pin=cpu4): silesia gz 5.6497 − igzip 4.3887 = **+1.2610** (reproduces banked +1.26 to 4 decimals); nasa gz 2.1157 − igzip 1.5878 = **+0.5279** (≈ banked +0.49). Per-symbol cyc/B sum to ~whole (Δ-bucket sum reconstructs ~93%/87% of the measured whole-Δ; remainder in <0.3% symbols). Hybrid-PMU hazard handled (explicit `cpu_core/` events; cpu4 verified P-core).
+
+### THE BY-FUNCTION TABLE — cyc/B (gz-OLD vs igzip), pin=cpu4 N=7. Δ = gz−igzip (LOWER=better)
+| bucket (gz symbol → igzip symbol)                              | silesia gz | silesia ig | Δsil cyc/B | nasa gz | nasa ig | Δnasa cyc/B |
+|----------------------------------------------------------------|-----------:|-----------:|-----------:|--------:|--------:|------------:|
+| **HOT LOOP** run_contig → decode_huffman_code_block_stateless  |     4.899  |     3.922  | **+0.977** |  1.798  |  1.382  | **+0.416**  |
+| **TABLE BUILD** rebuild_from+read_dynamic+init_from_lengths(+DistTable) → (igzip <0.3%, inlined) | 0.279 | ~0 | **+0.279** | 0.058 | ~0 | **+0.058** |
+| CRC  CRC32Calculator::update → crc32_gzip_refl_by8_02          |     0.136  |     0.139  |   −0.003   |  0.125  |  0.120  |   +0.005    |
+| OUTPUT/WINDOW prefill_window_prefix → kernel _copy_to_iter+memmove | 0.028  |     0.100  |   −0.072   |  0.011  |  0.028  |   −0.017    |
+| **whole decode (perf stat)**                                   |   5.6497  |   4.3887  | **+1.2610**| 2.1157  | 1.5878  | **+0.5279** |
+
+### THE BY-FUNCTION TABLE — instr/B (silesia), shows the INSTRUCTION/CYCLE INVERSION
+| bucket | gz instr/B | ig instr/B | Δ instr/B | note |
+|--------|-----------:|-----------:|----------:|------|
+| HOT LOOP run_contig            | 11.04 | 10.22 | **+0.82** | low IPC (gz 2.31 vs ig 2.60) → CYCLE-heavy |
+| TABLE BUILD (rebuild_from 0.81 + init 0.29 + read_dynamic 0.14) | 1.24 | ~0 | **+1.24** | **#1 instr excess**, but ~4× IPC → only +0.28 cyc/B |
+| CRC | 0.30 | 0.43 | −0.12 | |
+| whole (stat) | 13.034 | 11.400 | +1.634 | |
+
+### WHERE THE +1.26 LIVES (ranked, cycles, both corpora)
+1. **HOT LOOP (run_contig) — +0.98 cyc/B silesia (77%), +0.42 nasa (79%). DOMINANT.** gz's per-symbol decode runs at LOWER IPC than igzip's decode_huffman (2.31 vs 2.60 silesia) ⇒ dependency-chain/critical-path latency = the speculation SHAPE (consistent w/ NIGHT11/16). OLD's early-flag-bit is gz's leanest tried shape and STILL +0.98.
+2. **TABLE BUILD (per-block LUT construction) — +0.28 cyc/B silesia (22%), +0.06 nasa (11%). SECONDARY, real, PREVIOUSLY-UNMEASURED.** gz builds SEVERAL per-block structures (LutLitLenCode 4096-entry triple LUT + read_dynamic precode + HuffmanCodingShortBitsCached + DistTable); igzip's make_inflate_huff_code is <0.3% (inlined into decode_huffman, near-free). Worth ~2× more on silesia (more blocks/byte) than nasa.
+3. CRC = TIE (~0). OUTPUT/WINDOW = gz CHEAPER (igzip pays kernel _copy_to_iter). Neither is a lever.
+
+### IMPLICATION FOR THE LEVER (LOCATE-only this turn; fix NOT built)
+- **PRIMARY front = the HOT LOOP critical path (NOT its micro-details).** The anchor/mask-once/packing tweaks (NIGHT13/16/17) are tiny slices of run_contig's 85% and correctly moved ~0. The +0.98 cyc/B is the OVERALL per-symbol dependency chain of run_contig vs igzip's decode_huffman_code_block_stateless. Lever = structurally converge gz's inner per-symbol cadence (refill→index→extract→store critical path) on igzip's, OR raise IPC (2.31→2.60). This is a SHAPE rewrite, not a tweak; OLD is already gz's best-tried shape.
+- **SECONDARY front (cheaper, well-bounded) = converge the per-block TABLE BUILD on igzip.** gz spends +0.28 cyc/B (silesia) building multiple Huffman LUTs per block where igzip spends ~0. Faithfully porting igzip's `make_inflate_huff_code_lit_len` build path (single multisym table, inlined) and dropping gz's redundant table structures could recover ~22% of the silesia gap — and this is the LARGEST instruction-count win (+1.24 instr/B).
+- **RECORD CORRECTION:** the gap is HOT-LOOP (cycles), not scaffold. The "scaffold/+3.5 instr/B" read was instruction-anchoring — scaffold carries the extra INSTRUCTIONS (table build) but those are near-free in CYCLES. Do NOT pivot the whole campaign to scaffold; the wall lives in run_contig. The table build is a real but SECONDARY (~22%/11%) lever.
+
+### BOX / RESUME
+Guest `ssh -o ConnectTimeout=15 -J REDACTED_IP root@REDACTED_IP`, powersave (NOT frozen), pgrep clean on exit. gz-OLD-symbols binary `/dev/shm/gzold/target/release/gzippy` (worktree `/dev/shm/gzold` @ 37e669cf + inline(never) edits + Cargo strip=false); perf data `/dev/shm/perfdec/{gz_sil,ig_sil,gz_nasa,ig_nasa}.{data,full.rpt}` + `stat.csv` (N=7) for decorrelated re-run. Decomp script committed `scripts/bench/_byfn_decomp.sh`. Decompressed sizes: silesia 211968000, nasa 205242368. igzip symbols come from libisal.so.2.0.31 (decode_huffman_code_block_stateless_04, crc32_gzip_refl_by8_02). AMD/Zen2 replication OWED (Intel-LXC NOT-YET-LAW).
+
 ## ====== NIGHT17 (2026-06-19, branch kernel-converge-faithful @b53a4f9d) — THE MULTI-SYMBOL-PACKING DISCRIMINATOR: REFUTED. Deterministic, no-wall (LUT-builder code-read, both file:line cited). gz packs ≥ igzip symbols/iter (EQUAL on the dominant dynamic-Huffman path; gz packs MORE on the rare static/small-final blocks). iter-ratio ≈ 1.0 ⇒ the +1.4 cyc/B is NOT multiplicative (NOT more iterations/byte) — it is ADDITIVE per-iteration. The task's CONTEXT framing ("the +1.4 is MULTIPLICATIVE — gz runs MORE iterations") is FALSIFIED. Fallback (packing matched ⇒ in-loop spills?): the production hot loop is VERBATIM `core::arch::asm!` (asm_kernel.rs:434-548) — zero compiler-inserted in-loop stack spills BY CONSTRUCTION; its only per-iter memory ops are real work + the p0/d0 ctx anchor, which NIGHT16's STRONG-tier removal oracle ALREADY removed for ~0. ⇒ DECISION-tree third branch: packing matched + no in-loop spills ⇒ OLD (early-flag-bit, +1.26 to igzip) is gz's practical T1 ceiling on the KERNEL-MICROARCH front. Next front = the SPECULATION SHAPE (converge gz on OLD's leaner discriminator), per NIGHT16's standing pivot. Intel-LXC, NOT-YET-LAW (AMD owed). NO binary built; deterministic code analysis only. ======
 
 ### THE DISCRIMINATOR (deterministic — LUT construction + igzip's runtime multisym selection, NO wall, NO flakiness)
