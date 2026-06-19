@@ -1,5 +1,48 @@
 # BEAT-IGZIP-T1 — DURABLE STATE
 
+## ====== NIGHT11 (2026-06-19, branch kernel-converge-faithful @ 3bacc1a1, base night9 c4fbc3d3) — FAITHFUL snapshot removal: minimal p0/d0 anchor + from-data RE-READ un-consume (NOT c936's pre-consume serialized cut). BYTE-EXACT confirmed on guest; perf measurement IN PROGRESS. (Intel-LXC NOT-YET-LAW) ======
+
+### THE CHANGE
+Deleted night9's per-iteration 4-store X2 snapshot (`save_bitbuf/+48 save_bitsleft/+56
+save_dst/+72 save_pos/+80`). Replaced with a MINIMAL 2-word anchor saved at the
+iteration top: `save_p0/+56` = bit position `pos*8-bitsleft` (REFILL-INVARIANT, proved
+vs `Bits::refill`) and `save_d0/+64` = iteration-top dst. A rare RECLASS bail
+reconstructs the whole un-consumed cursor via a SINGLE from-data RE-READ at p0
+(asm `85:`; ref `reclass_reread`) — the consumed low bits are shifted out and
+unrecoverable from registers, so save-or-reread is structurally required (igzip is
+stateless, no counterpart). The bc==0 INVALID bail is reached PRE-consume so it leaves
+the cursor UNCHANGED (asm `86:`, no re-read — preserves X6/c1). The asm stays at the
+15-GP-register ceiling (a register-carried anchor overflows it / would need dropping
+igzip's per-iter dist preload), so 2 ctx-words is the minimal faithful save: ONE
+bit-cursor store + ONE dst store/iter vs night9's four. See DIVERGENCE LEDGER §8 in
+KERNEL-CONVERGENCE.md. run_contig_ref_biased updated in LOCKSTEP; 5 KernCtx initializers
+updated; short_tbl 64->48.
+
+### BYTE-EXACT GATE (guest, Intel LXC i7-13700T, real BMI2/AVX2) — PASS so far
+- Guest build (native + isal): both register-allocate cleanly (the asm-ceiling risk),
+  EXIT 0. (macOS x86_64 cannot build the asm — pre-existing, night9 too.)
+- asm-vs-ref differentials `cargo test --lib asm_kernel --test-threads=1`: **6/6 PASS**
+  (c1_seam_roundtrip, c2/c3 differential random+windowed, positive_control consume-bias,
+  on_off_fuzz). c1 initially failed (the re-read changed the cursor representation on the
+  no-consume invalid bail) → fixed by the `86:` no-re-read invalid exit.
+- TRIORACLE_GATE (`scripts/bench/_trioracle_gate.sh`): **PASS** — silesia/nasa/monorepo/
+  squishy/large × {native,isal} × T1/T4/T8 all sha-identical vs gzip+igzip+libdeflate+pigz.
+- OWED THIS TURN: full `--lib` both flavors (IN PROGRESS), prop_structured ≥60k, then the
+  paired perf harness vs igzip AND night9(gzippy-kc) AND old(gzippy-chunkt1).
+
+### BINARIES (guest)
+/root/gz-new-native, /root/gz-new-isal (== 3bacc1a1). Compare set: /root/bin/gzippy-kc
+(night9), /root/bin/gzippy-chunkt1 (old early-flag-bit), /usr/bin/igzip. Source checkout
+/root/gzippy (branch kernel-converge-faithful). Builds in /dev/shm/n11 (native) /dev/shm/n11i (isal).
+
+### EXPECTATION (pre-registered, NOT a finding) — settle by the gated paired harness
+HYPOTHESIS: removing 2 of night9's 4 stores drops instr/B toward old WHILE holding
+night9's near-igzip IPC (-0.04) → cyc/B improves on night9. RIVAL: the full-spec
+speculation overhead (dist preload + trailing extract every iter) is the real night9>old
+gap (night10's verdict), so even total snapshot removal stays > old. Decision is the
+measured cyc/B vs igzip/kc/chunkt1 — do NOT pre-judge. If it beats old → candidate to
+promote; if it improves kc but not old → confirms night10's "lean wins" via a new angle.
+
 ## ====== GUEST GATE + KEY MEASUREMENT (night10, 2026-06-19, branch kernel-converge-wip @ 3202968d) — c936a4df (snapshot-removal) is FULLY BYTE-EXACT on real BMI2/AVX2, but is gated-SLOWER than BOTH night9 and the OLD early-flag-bit shape. The igzip late-discriminator full-speculation skeleton LOSES the §3.1 fork across 2 byte-exact iterations. NOT promoted. (gated, Gate-0 PASS, Intel-LXC NOT-YET-LAW) ======
 MISSION this turn: discharge the GUEST-OWED gate for c936a4df (the snapshot-removal —
 only its pure-Rust ref-half was Rosetta-verifiable; the asm/AVX2 half + ALL perf were
