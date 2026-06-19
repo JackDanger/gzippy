@@ -31,6 +31,76 @@ prior agent built green but LOST by orphaning. Re-run DURABLY this session, SERI
   them (PIDs 335519/2735131/3769312 trees) to stop root-disk-fill + CPU contention; my run
   was isolated on /dev/shm. No box freeze, no persistent pinning, governor untouched.
 
+## ====== CURRENT-HEAD GATED SCOREBOARD + R3 ESCALATION (2026-06-18 night5, post-TASK-0) ======
+After TASK-0 PASS, re-ran the committed mission instrument to get the CURRENT gap at HEAD with
+ALL banked wins live (arm B = /root/bin/gzippy-t1prod, sha 261f1ebf == HEAD depth-gated product;
+byte-exact gz==zcat==igzip both corpora; N=11, cpu4, /dev/null, SKIP_STRESS=1; box quiet load~1.5
+after killing the orphan cargo runs). Gate-0 PASS (KERN entries 24129/25389; igzip non-inert
+sha-match; same sink+pin), self-test A2-A1 PASS (CI incl 0), GHz spread <0.2%.
+
+| corpus  | igzip cyc/B | gzippy cyc/B | medΔ (B−A1)       | 95%CI            | Wilcox p | ΔIPC   | Δinstr/B | verdict       |
+|---------|-------------|--------------|-------------------|------------------|----------|--------|----------|---------------|
+| silesia | 4.414       | 5.723        | +1.317 (+29.8%)   | [+1.306,+1.332]  | 0.0039   | -0.311 | +1.621   | SIGNIF-slower |
+| nasa    | 1.580       | 2.183        | +0.600 (+38.0%)   | [+0.596,+0.605]  | 0.0039   | -0.298 | +0.746   | SIGNIF-slower |
+
+CAMPAIGN PROGRESSION (gated, Intel-only NOT-YET-LAW):
+  silesia: START +1.70 (+39.5%)  → HEAD +1.317 (+29.8%)   [closed ~0.38 cyc/B / ~10 pts]
+  nasa:    START +1.84 (+116.5%) → HEAD +0.600 (+38.0%)   [closed ~1.24 cyc/B / ~78 pts]
+Wins responsible: dist-preload, flag-bit (silesia critical-chain), ratio-reserve (nasa grow-storm
+kill), T1-depth-1 (nasa faults -73% + materialization). gzippy-native T1 still LOSES to igzip on
+both corpora; parity NOT reached. RE-VERIFY: `GZIPPY=/root/bin/gzippy-t1prod PIN=4 REPS=11
+CORPORA="silesia nasa" SKIP_STRESS=1 GZIPPY_FORCE_PARALLEL_SM=1 bash
+/root/distpreload-harness/_gzippy_vs_igzip_paired_guest.sh`.
+
+### POST-WINS RESIDUAL — where the gap is NOW (consolidated; the asm kernel is UNCHANGED since the
+### LOCALIZE session, so its per-region decomposition still holds; only the SCAFFOLD shrank via
+### ratio-reserve + depth-1, which the nasa +116%→+38% collapse reflects):
+- **silesia (+1.317):** DEPTH-INVARIANT ⇒ KERNEL-bound. Kernel gap +0.908 cyc/B is DIFFUSE across
+  refill (+0.361) / classify (+0.389) / loop-overhead (+0.341); backref-copy is at PARITY (do not
+  attack). Residual scaffold (~+0.4) = first-touch output faults (materialization) + CRC (≈igzip) +
+  Rust bail-glue. NO single peephole; flag-bit already captured ~7% of the kernel ceiling.
+- **nasa (+0.600):** was scaffold-dominated (75%); depth-1 + ratio-reserve removed most of it.
+  Remaining = residual materialization faults (11265 vs igzip 666; depth-1 is the rg-architecture
+  floor — depth×chunk-output-pages, cannot go lower correctly) + the diffuse kernel (+0.453).
+
+### DEAD / MINED (do NOT re-attempt without a new premise):
+- Table-format rewrite B (fat direct one-sym table): MEASURED net-negative-to-breakeven (M3 spike
+  +0.015..+0.091 SLOWER); igzip is ALSO one-sym/iter at 3.98 yet gzippy single-mode is 6.09 — the
+  2.1 cyc/B is igzip's whole leaner per-iteration loop, which B does not touch. DEAD.
+- Resident-output-pool (unified T1+T>1): REGRESSES T>1 wall +5–16% & RSS +9–76%. DEAD as unified.
+- Warm-buffer-recycle / glibc-trim / THP-madvise / prefault-arena fault-removal oracles: all INERT.
+- Elaborate dedicated T1 output-streaming sized as a FAULT-removal win: ~1% wall materialization
+  slack only — the real prize there is kernel convergence, not faults (night3).
+- The cheap/medium PIPELINE/CONFIG levers are now MINED (depth-1 was the last one; it was found
+  AFTER a "near-floor" call, so this list is held as falsifiable, not eternal).
+
+### R3 ESCALATION (BOUNDED) — the sole remaining routes to igzip-T1 PARITY are both DEEP efforts:
+The prompt's stop-condition is met: the residual is dominantly (a) the diffuse inner-Huffman kernel
+and (b) nasa residual materialization, with no cheaper pipeline/config lever remaining. Per the
+governing rule I do NOT grind a multi-hour rewrite without R3 sign-off. The two routes + BOUNDS:
+  ROUTE 1 — KERNEL CADENCE CONVERGENCE (authorized open territory, but DEEP/heroic): converge
+    gzippy's run_contig per-iteration loop on igzip's fused consume+refill+dual-preload cadence
+    (NOT the table format — that's B, dead). Entry point = the refill-fusion technique
+    (Gate-2-confirmed on the critical recurrence). BOUND (removal-oracle, banked): igzip kernel
+    3.98 vs gzippy 5.32 cyc/B silesia ⇒ ceiling +0.908 cyc/B; DIFFUSE, so only a FRACTION
+    capturable per technique (flag-bit got ~0.10). To actually reach 3.98 needs igzip's WHOLE
+    fused loop shape = a multi-step asm rewrite with byte-exact run_contig_ref kept in lockstep
+    (X1-X5 exit + IN_MARGIN refill contract) = high byte-exact risk, multi-session. → R3.
+  ROUTE 2 — OUTPUT STREAMING (divergence-from-rapidgzip architecture): decode-and-emit through ONE
+    small reused window (igzip-shaped) instead of materializing full per-chunk output. Targets the
+    materialization faults (nasa 11265→~666). BUT: recoverable magnitude is UNBOUNDED by any
+    available oracle (every fault-removal oracle was INERT; a working oracle needs THP on a non-LXC
+    box or an in-process reuse harness — neither built). And it DIVERGES from the rg parallel
+    design that is the T>1 parity source ⇒ must be T1-gated or it regresses T>1. → R3 (strategic
+    fork: faithful-rg vs igzip-shaped-streaming).
+RECOMMENDATION FOR SUPERVISOR/USER: gzippy-native T1 is now within +29.8% (silesia) / +38.0%
+  (nasa) of igzip — substantially narrowed but NOT parity. Reaching parity requires funding a deep
+  effort (Route 1 kernel-cadence rewrite, ceiling +0.908 sil diffuse; and/or Route 2 T1-output-
+  streaming, recoverable-magnitude unbounded). Decide: (a) fund Route 1 (multi-session asm kernel
+  convergence), (b) fund Route 2 (T1-gated streaming, requires building the output-reuse oracle
+  first to BOUND it), (c) accept the narrowed gap as the campaign result. AMD/Zen2 replication of
+  the whole scoreboard is owed before any LAW claim (all results Intel-LXC NOT-YET-LAW).
+
 ## ====== CORRECTION (2026-06-18 night4, advisor-caught over-claims in the night3 determination below) ======
 The night3 resident-pool determination (section immediately below) OVER-STATED. Corrected wording:
 (a) **"output faults are SLACK" is UNDER-POWERED** — it rested on a −17% fault NUDGE (a slope,
