@@ -495,6 +495,119 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
     Ok((total_crc.crc32(), total_size))
 }
 
+/// THIN-T1-DRIVER removal-oracle (`GZIPPY_THIN_T1_ORACLE=1`, default OFF).
+///
+/// The MINIMAL clean removal-oracle the BEAT-IGZIP TASK 2 brief calls for: a
+/// single SERIAL rolling-window loop over chunks calling the SHARED
+/// `decode_chunk` kernel with NO parallel bulk whatsoever — no `block_finder`,
+/// no `BlockFetcher`/prefetch, no `WindowMap` publish/handoff, no marker arming
+/// (never fires — every chunk gets a full 32 KiB predecessor window), no
+/// `ThreadPool`/`std::thread::scope`, no `Arc` chunk lifecycle, no pending
+/// queue. It is the candidate THIN-T1-DRIVER spine measured in isolation: the
+/// ENTIRE process (perf-stat over the whole binary) is this clean serial decode
+/// plus the same CLI/mmap/header prologue both arms share — so cyc/B over the
+/// process attributes to the shared kernel + serial driver, not the scaffold.
+///
+/// Unlike `drive_clean_window_oracle` this does NOT run a speculative Pass 1 and
+/// has NO separate untimed Phase A: the rolling window IS derived inline as the
+/// loop advances (each chunk's true trailing 32 KiB becomes the next chunk's
+/// dict), so there is exactly ONE decode of the stream and nothing the perf
+/// counter sees that is not the thin-T1 path. Output is byte-correct (real
+/// rolling windows) and markers never fire — both verified by the caller's
+/// CRC/size check (Gate-0 non-inert + markers==0).
+#[cfg(parallel_sm)]
+pub fn drive_thin_t1_oracle<W: std::io::Write>(
+    input: &[u8],
+    writer: &mut W,
+    configuration: ChunkConfiguration,
+) -> Result<(u32, usize), FetchError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+
+    let total_bits = input.len() * 8;
+    const STRIDE_BITS: usize = 4 * 1024 * 1024 * 8; // ~4 MiB compressed per chunk
+
+    let mut total_crc = CRC32Calculator::new();
+    let mut total_size = 0usize;
+    let mut marker_chunks = 0usize;
+
+    // Rolling 32 KiB window. First chunk starts with a zero window (chunk-0
+    // semantics: the first deflate block references no back-history past output
+    // start, so a zero dict is correct for chunk 0). All subsequent chunks get
+    // the TRUE trailing 32 KiB, so they take the window-PRESENT clean path.
+    let mut prev_tail = vec![0u8; MAX_WINDOW_SIZE];
+    let mut cur = 0usize;
+    while cur < total_bits {
+        let stop_hint = (cur + STRIDE_BITS).min(total_bits);
+        let chunk = crate::decompress::parallel::chunk_decode::decode_chunk(
+            input,
+            cur,
+            stop_hint,
+            &prev_tail,
+            configuration,
+        )
+        .map_err(FetchError::Decode)?;
+
+        // Gate-0(d): a clean window-present decode must produce NO markers.
+        // (Clean output lands in `data: SegmentedU8`; markers would show as a
+        // non-zero `marker_count` / non-empty `data_with_markers`.)
+        if chunk.statistics.marker_count != 0 || chunk.data_with_markers.len() != 0 {
+            marker_chunks += 1;
+        }
+
+        // Advance the rolling window from this chunk's decoded tail.
+        let data_len = chunk.data.len();
+        if data_len >= MAX_WINDOW_SIZE {
+            let mut t = vec![0u8; MAX_WINDOW_SIZE];
+            chunk.data.copy_last_into(&mut t);
+            prev_tail = t;
+        } else {
+            let mut nt = prev_tail.clone();
+            let mut tail_bytes = vec![0u8; data_len];
+            chunk.data.copy_range_into(0, &mut tail_bytes);
+            nt.extend_from_slice(&tail_bytes);
+            let n = nt.len();
+            prev_tail = nt[n.saturating_sub(MAX_WINDOW_SIZE)..].to_vec();
+        }
+
+        // In-order write + CRC fold (mirror of the consumer's clean branch).
+        chunk
+            .data
+            .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
+            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        total_size += chunk.decoded_size();
+        for stream_crc in &chunk.crc32s {
+            total_crc.append(stream_crc);
+        }
+
+        // Stop once the gzip footer (trailer) was reached: the deflate stream
+        // is complete and the remaining bits are the 8-byte CRC/ISIZE trailer
+        // (single-member corpora). Decoding past it would misread the trailer
+        // as a deflate header.
+        if !chunk.footers.is_empty() {
+            break;
+        }
+
+        let end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        if end_bit <= cur {
+            break; // no forward progress (last chunk ran to EOF/BFINAL)
+        }
+        cur = end_bit;
+        // The final deflate block of a single-member stream leaves only the
+        // 8-byte gzip trailer (CRC32 + ISIZE = 64 bits). The smallest possible
+        // gzip member HEADER is 10 bytes + footer, so < 18 bytes (144 bits) of
+        // remaining input cannot hold another member — it is the trailer. Stop
+        // rather than feed the trailer to decode_chunk as a deflate header.
+        // (The corpora here — silesia/nasa/monorepo — are single-member; a real
+        // multi-member next header always leaves >> 144 bits.)
+        if total_bits.saturating_sub(cur) < 18 * 8 {
+            break;
+        }
+    }
+
+    eprintln!("THIN_T1_ORACLE out={total_size} bytes marker_chunks={marker_chunks} (clean serial, no parallel bulk)");
+    Ok((total_crc.crc32(), total_size))
+}
+
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,

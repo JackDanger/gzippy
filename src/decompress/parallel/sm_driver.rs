@@ -176,7 +176,12 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
     // whether the marker pipeline is the rapidgzip gap. CRC/size still verified
     // below, so the known-window path's correctness is checked too.
-    let drive_result = if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
+    let drive_result = if std::env::var_os("GZIPPY_THIN_T1_ORACLE").is_some() {
+        // BEAT-IGZIP TASK 2: minimal clean serial thin-T1-driver removal-oracle.
+        // No parallel bulk; one serial rolling-window pass. CRC/size verified
+        // below (non-inert + correctness). See drive_thin_t1_oracle doc.
+        chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration)
+    } else if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
         chunk_fetcher::drive_clean_window_oracle(
             deflate_data,
             writer,
