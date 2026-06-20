@@ -132,14 +132,22 @@ fn build_real_block() -> (Vec<u8>, u64, Vec<u8>) {
     // consume RAW deflate, so we strip the gzip header+trailer and return the
     // deflate body; start_bit is then directly the bit cursor into it.
     let header_end = gzip_header_end(&gz);
-    let deflate = gz[header_end..gz.len() - 8].to_vec();
+    let full_deflate = &gz[header_end..gz.len() - 8];
 
     // Use the FIRST block; require it dynamic (byte-aligned at deflate bit 0).
     let first = &blocks[0];
     if first.btype != 2 {
         die("first block is not dynamic — adjust slice/level");
     }
-    // Full-stream oracle, then take the first block's output prefix.
+    // TRUNCATE the deflate body to JUST the first block (ceil(end_bit/8) bytes),
+    // so BOTH kernels (gz: loop-to-eob; igzip stateless: runs out of input after
+    // the block's EOB) decode EXACTLY this one block and agree on output length.
+    // The first block is non-final; after its EOB igzip's stateless loop hits
+    // ISAL_END_INPUT (ret=1) having produced exactly first.decoded_bytes.
+    let end_byte = (first.end_bit as usize).div_ceil(8);
+    let deflate = full_deflate[..end_byte].to_vec();
+
+    // Oracle = the first block's output (prefix of the full decode).
     let mut full = Vec::new();
     flate2::read::GzDecoder::new(&gz[..])
         .read_to_end(&mut full)
