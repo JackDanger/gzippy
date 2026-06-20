@@ -28,7 +28,7 @@ rm -f "$DONE"; rm -rf "$OUT"; mkdir -p "$OUT"
 exec > "$LOG" 2>&1
 
 SHA="${SHA:-HEAD}"
-CORPORA="${CORPORA:-silesia monorepo}"
+CORPORA="${CORPORA:-silesia monorepo nasa}"
 THREADS="${THREADS:-1 2 4 8}"
 N="${N:-13}"
 GZ_SRC="${GZ_SRC:-/mnt/internal/gz-head}"
