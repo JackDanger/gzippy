@@ -51,7 +51,18 @@ fail() { echo "KGATE_FAIL=$*"; echo "FAIL $*" > "$DONE"; exit 2; }
 
 echo "== KERNEL-GATE guest =="
 echo "host: $(uname -srm)  cores: $(nproc)  load: $(cat /proc/loadavg)"
-echo "no_turbo: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')  gov: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
+NO_TURBO_NOW="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')"
+GOV_NOW="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
+echo "no_turbo: $NO_TURBO_NOW  gov: $GOV_NOW"
+# FREEZE WARN: a ±0.02 cyc/B kernel verdict needs a frozen box. On an unfrozen /
+# loaded box the inter-run spread swamps small kernel deltas -> they read TIE even
+# when the paired CI excludes 0. The A/A self-test still licenses TRUSTING the
+# paired Δ; this only flags that the RESOLUTION floor is degraded.
+FREEZE_BANNER=""
+if [ "$NO_TURBO_NOW" != "1" ] || [ "$GOV_NOW" != "performance" ]; then
+  FREEZE_BANNER="BOX NOT FROZEN (no_turbo=$NO_TURBO_NOW gov=$GOV_NOW) -> resolution floor degraded; sub-spread kernel deltas WILL read TIE. Freeze the host (intel no_turbo=1 + governor=performance) for a ±0.02 cyc/B verdict; this LXC cannot self-freeze."
+  echo "!! FREEZE WARN: $FREEZE_BANNER"
+fi
 echo "BASE=$BASE  CAND=$CAND  corpora='$CORPORA'  T=$THREADS  N=$N  pin=cpu$PINBASE"
 echo "df /dev/shm: $(df -h /dev/shm | tail -1)"
 
@@ -193,6 +204,7 @@ echo "load_end: $(cat /proc/loadavg)"
 } > "$OUT/meta.txt"
 
 echo "=== ANALYZE ==="
-python3 "$SELF_DIR/_kernel_gate_analyze.py" "$OUT" --threads "$THREADS" $CORPORA 2>&1 | tee "$OUT/REPORT.txt"
+{ [ -n "$FREEZE_BANNER" ] && echo "!! FREEZE WARN: $FREEZE_BANNER" || echo "box freeze: no_turbo=$NO_TURBO_NOW gov=$GOV_NOW (frozen)"; } > "$OUT/REPORT.txt"
+python3 "$SELF_DIR/_kernel_gate_analyze.py" "$OUT" --threads "$THREADS" $CORPORA 2>&1 | tee -a "$OUT/REPORT.txt"
 echo PASS > "$DONE"
 echo "=== KGATE_GUEST_DONE ($(date -u +%FT%TZ)) ==="
