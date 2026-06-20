@@ -963,7 +963,26 @@ impl LutLitLenCode {
 
         // Reset only the entries we'll touch (mirror of vendor's
         // per-call `lit_and_dist_huff[i].code_and_length = 0` loop).
-        for h in self.lit_and_dist_huff.iter_mut() {
+        //
+        // CONVERGE toward igzip (NIGHT38): igzip never separately clears the
+        // huff table here — `set_and_expand_lit_len_huffcode` memsets ONLY the
+        // length/expansion region `[ISAL_DEF_LIT_SYMBOLS..LIT_LEN_ELEMS]`
+        // (igzip_inflate.c:333-334) and relies on the literal read-loop
+        // (igzip_inflate.c:338) + the `[257..286]` length snapshot
+        // (igzip_inflate.c:331). We must keep zeroing `[0..LIT_LEN]` because
+        // (a) the literal read-loop (`set_and_expand`, this file :390) scans
+        //     `[0..ISAL_DEF_LIT_SYMBOLS]` and a speculative seed can leave
+        //     `split < 257`, and (b) the length snapshot reads `[257..LIT_LEN]`
+        //     BEFORE `set_and_expand` re-clears it (:385). But `[LIT_LEN..
+        //     LIT_LEN_ELEMS]` is REDUNDANT: on the success path `set_and_expand`
+        //     unconditionally clears `[257..LIT_LEN_ELEMS]` (:385) before the
+        //     expansion writes it and before `make_inflate` reads it; on the
+        //     over-subscription failure path `set_and_expand` returns Err and
+        //     `make_inflate` is never called, so the tail is never observed.
+        //     ⇒ clearing `[0..LIT_LEN]` is byte-identical to clearing all
+        //     LIT_LEN_ELEMS on EVERY input, and drops 228 redundant per-block
+        //     writes off the shared table-build (NIGHT28/35: on the T1 wall).
+        for h in self.lit_and_dist_huff[..LIT_LEN].iter_mut() {
             h.0 = 0;
         }
         // BUGFIX: `code_list` is a PERSISTENT, reused box. Fixed-Huffman
