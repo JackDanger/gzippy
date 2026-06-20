@@ -454,8 +454,26 @@ pub fn set_and_expand_lit_len_huffcode(
 /// these checks because it only runs on headers `read_header` already
 /// validated; the speculative single-member path decodes from *guessed* offsets
 /// so the builder must self-guard.)
+///
+/// CLEAN-PATH SPECIALIZATION (NIGHT39, faithful igzip convergence): on the
+/// clean / known-window path (`CLEAN = true`, `!ring.is_marker()` — chunk 0 at
+/// T1 single-shot, or a chunk whose window is resolved) the offsets are the
+/// REAL stream position, not a guess, so the build mirrors igzip
+/// (`make_inflate_huff_code`, igzip_inflate.c:387-599) which carries NO such
+/// per-symbol guard. The three SHORT-loop guards
+/// (`sym1_code/code >= short_len`) are then elided at compile time. This is
+/// byte-exact on EVERY input — and provably so independent of `CLEAN`: every
+/// `code` written in the short loops is the OR of `bit_reverse2`-masked
+/// components whose widths sum to `last_length <= ISAL_DECODE_LONG_BITS = 12`,
+/// and `bit_reverse2(_, n)` (line 162) returns a value `< 2^n`, so
+/// `code < 2^last_length <= 2^12 = short_len` ALWAYS. The short-loop guards
+/// can never legitimately fire. Malformed/over-subscribed tables are still
+/// rejected upstream by `set_and_expand_lit_len_huffcode`'s Kraft screen
+/// (line 365-368, run ONCE per build) and downstream by the retained LONG-loop
+/// guards (`long_code_lookup` overflow). The guard is preserved verbatim on the
+/// SPECULATIVE path (`CLEAN = false`) so T>1 correctness is untouched.
 #[must_use]
-pub fn make_inflate_huff_code_lit_len(
+pub fn make_inflate_huff_code_lit_len<const CLEAN: bool>(
     result: &mut InflateHuffCodeLarge,
     huff_code_table: &mut [HuffCode],
     _table_length: usize,
@@ -517,7 +535,7 @@ pub fn make_inflate_huff_code_lit_len(
             let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
 
             if sym1 <= max_symbol {
-                if sym1_code as usize >= short_len {
+                if !CLEAN && sym1_code as usize >= short_len {
                     return false;
                 }
                 result.short_code_lookup[sym1_code as usize] = sym1
@@ -563,7 +581,7 @@ pub fn make_inflate_huff_code_lit_len(
                 let sym2_code = huff_code_table[sym2_index as usize].code() as u32;
                 let code = sym1_code | (sym2_code << sym1_len);
                 let code_length = sym1_len + sym2_len;
-                if code as usize >= short_len {
+                if !CLEAN && code as usize >= short_len {
                     return false;
                 }
                 result.short_code_lookup[code as usize] = sym1
@@ -628,7 +646,7 @@ pub fn make_inflate_huff_code_lit_len(
                     let code =
                         sym1_code | (sym2_code << sym1_len) | (sym3_code << (sym2_len + sym1_len));
                     let code_length = sym1_len + sym2_len + sym3_len;
-                    if code as usize >= short_len {
+                    if !CLEAN && code as usize >= short_len {
                         return false;
                     }
                     // For a triple, sym3 (bits 16..25) occupies the top of the
@@ -949,6 +967,19 @@ impl LutLitLenCode {
     /// `isal_huffman.rs::IsalLitLenCode::rebuild_from` (line 119-175) but
     /// dispatches to the pure-rust builders defined above.
     pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
+        // Default to the GUARDED (speculative-safe) build — preserves the exact
+        // behavior for every existing caller (lut_bulk_inflate, tests). The
+        // clean-path caller uses `rebuild_from_gen::<true>`.
+        self.rebuild_from_gen::<false>(code_lengths)
+    }
+
+    /// Const-generic body of [`rebuild_from`]. `CLEAN = true` elides the
+    /// per-symbol short-loop self-guard in `make_inflate_huff_code_lit_len`
+    /// (faithful igzip convergence on the known-window path); `CLEAN = false`
+    /// keeps the guard verbatim for the speculative (window-absent) path.
+    /// Byte-identical for both values of `CLEAN` (the short-loop guard is
+    /// structurally unreachable — see `make_inflate_huff_code_lit_len`).
+    pub fn rebuild_from_gen<const CLEAN: bool>(&mut self, code_lengths: &[u8]) -> bool {
         self.valid = false;
         // Allow up to 288 entries: 286 for dynamic-Huffman (LIT_LEN) plus
         // symbols 286 and 287 for fixed-Huffman participation (RFC 1951
@@ -1036,7 +1067,7 @@ impl LutLitLenCode {
             return false;
         }
 
-        if !make_inflate_huff_code_lit_len(
+        if !make_inflate_huff_code_lit_len::<CLEAN>(
             &mut self.table,
             &mut self.lit_and_dist_huff[..],
             LIT_LEN_ELEMS,
@@ -1637,7 +1668,7 @@ mod tests {
 
         let mut result = Box::new(InflateHuffCodeLarge::default());
         assert!(
-            make_inflate_huff_code_lit_len(
+            make_inflate_huff_code_lit_len::<false>(
                 &mut result,
                 &mut lit_len_huff,
                 LIT_LEN_ELEMS,

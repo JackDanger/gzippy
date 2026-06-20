@@ -1195,7 +1195,19 @@ impl Block {
             pure_inflate_decode
         ))]
         {
-            self.build_huffman_luts_for_block()?;
+            // CLEAN = !marker: a known-window block builds the LUT with the
+            // speculative self-guard elided (mirrors igzip, which never guards);
+            // a window-absent (speculative) block keeps the guard. Dispatched on
+            // the SAME `ring.is_marker()` the decode dispatch reads
+            // (`read_internal_compressed`), so build- and decode-time agree for
+            // this block's first `read()`. (Byte-identical regardless — the
+            // short-loop guard is structurally unreachable, see
+            // `make_inflate_huff_code_lit_len`.)
+            if self.ring.is_marker() {
+                self.build_huffman_luts_for_block::<false>()?;
+            } else {
+                self.build_huffman_luts_for_block::<true>()?;
+            }
             self.block_huffman_luts_ready = true;
         }
         Ok(())
@@ -1211,7 +1223,7 @@ impl Block {
         ),
         pure_inflate_decode
     ))]
-    fn build_huffman_luts_for_block(&mut self) -> Result<(), BlockError> {
+    fn build_huffman_luts_for_block<const CLEAN: bool>(&mut self) -> Result<(), BlockError> {
         // Builds ONLY the literal/length LUT (the clean contig hot loop's table
         // + the ISA-L multi-symbol packing). The distance decoder `dist_hc` is
         // built LAZILY by `ensure_dist_hc` only where it is actually read (the
@@ -1226,7 +1238,7 @@ impl Block {
         match self.compression_type {
             CompressionType::FixedHuffman => {
                 for _ in 0..tmult {
-                    if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
+                    if !self.lut_litlen_rebuild::<CLEAN>(&FIXED_LIT_LEN_LENGTHS[..]) {
                         return Err(BlockError::InvalidCodeLengths);
                     }
                 }
@@ -1236,7 +1248,7 @@ impl Block {
                 let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
                 lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
                 for _ in 0..tmult {
-                    if !self.lut_litlen_rebuild(&lit_stack[..split]) {
+                    if !self.lut_litlen_rebuild::<CLEAN>(&lit_stack[..split]) {
                         return Err(BlockError::InvalidCodeLengths);
                     }
                 }
@@ -1711,10 +1723,10 @@ impl Block {
         pure_inflate_decode
     ))]
     #[inline(always)]
-    fn lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
+    fn lut_litlen_rebuild<const CLEAN: bool>(&mut self, litlen_lens: &[u8]) -> bool {
         #[cfg(pure_inflate_decode)]
         {
-            self.asm.lut_litlen.rebuild_from(litlen_lens)
+            self.asm.lut_litlen.rebuild_from_gen::<CLEAN>(litlen_lens)
         }
         #[cfg(not(any(
             all(
@@ -1775,7 +1787,15 @@ impl Block {
         match self.compression_type {
             CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
                 if !self.block_huffman_luts_ready {
-                    self.build_huffman_luts_for_block()?;
+                    // CLEAN = !CONTAINS_MARKERS (const-folded): the marker
+                    // dispatch already chose this specialization, so the
+                    // table-build sheds the speculative guard exactly on the
+                    // clean path.
+                    if CONTAINS_MARKERS {
+                        self.build_huffman_luts_for_block::<false>()?;
+                    } else {
+                        self.build_huffman_luts_for_block::<true>()?;
+                    }
                     self.block_huffman_luts_ready = true;
                 }
                 // The ring/marker decode loops dispatched below
@@ -3002,7 +3022,10 @@ impl Block {
         match self.compression_type {
             CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
                 if !self.block_huffman_luts_ready {
-                    self.build_huffman_luts_for_block()?;
+                    // decode_clean_into_contig is the CLEAN (known-window,
+                    // non-speculated) contig path → build with the speculative
+                    // guard elided (faithful igzip convergence).
+                    self.build_huffman_luts_for_block::<true>()?;
                     self.block_huffman_luts_ready = true;
                 }
             }
