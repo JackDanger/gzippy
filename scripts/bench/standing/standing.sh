@@ -31,8 +31,9 @@ ROOT="$(cd "$HERE/../../.." && pwd)"
 # shellcheck source=/dev/null
 . "$ROOT/scripts/bench/guest.env"
 
+BOX="${BOX:-neurotic}"
 SHA="${SHA:-}"
-CORPORA="silesia monorepo"
+CORPORA="silesia monorepo nasa"
 THREADS="1 2 4 8"
 N=13
 BUILD=1
@@ -44,6 +45,8 @@ LOCAL_ART="$ROOT/artifacts/standing/$RUNID"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --box) BOX="$2"; shift;;
+    --box=*) BOX="${1#*=}";;
     --sha) SHA="$2"; shift;;
     --sha=*) SHA="${1#*=}";;
     --corpora) CORPORA="$2"; shift;;
@@ -65,6 +68,16 @@ if [ -n "$ANALYZE_ONLY" ]; then
   exec python3 "$HERE/standing_report.py" "$ANALYZE_ONLY"
 fi
 
+# --- per-box abstraction (default neurotic == identical to the prior behaviour) --
+# shellcheck source=/dev/null
+BOX="$BOX" . "$ROOT/scripts/bench/boxes.sh"
+SSH_GUEST="$BOX_SSH"; JUMP="$BOX_JUMP"; GUEST="${BOX_GUEST#*@}"; GUEST_USER="${BOX_GUEST%@*}"
+RG="$BOX_RG"; COMP_IGZIP="$BOX_IGZIP"; GUEST_GZ_SRC="$BOX_SRC"
+SCP_J="$BOX_SCP_JFLAG"
+if [ "$BOX_ARCH" != "intel" ]; then
+  echo "!! standing.sh on NON-INTEL box '$BOX_NAME' — verify boxes.sh BOX_* paths are live first."
+fi
+
 # Default subject = HEAD of kernel-converge-A (origin is truth).
 if [ -z "$SHA" ]; then
   SHA="$(git ls-remote origin kernel-converge-A | cut -f1)"
@@ -73,7 +86,7 @@ echo "== standing.sh — subject sha=$SHA  corpora='$CORPORA'  threads='$THREADS
 
 echo "=== ship rig -> $GUEST_USER@$GUEST:$GUEST_STAGE/ ==="
 timeout 60 $SSH_GUEST "mkdir -p '$GUEST_STAGE'"
-timeout 120 scp -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -J "$JUMP" \
+timeout 120 scp -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new $SCP_J \
   "$HERE/_standing_guest.sh" "$HERE/standing_report.py" \
   "$ROOT/scripts/parallel_sm_tail_metric.py" \
   "$GUEST_USER@$GUEST:$GUEST_STAGE/"
@@ -104,9 +117,9 @@ done
 
 echo "=== pull artifacts -> $LOCAL_ART ==="
 mkdir -p "$LOCAL_ART"
-timeout 120 rsync -az -e "ssh -o ConnectTimeout=15 -J $JUMP" \
+timeout 120 rsync -az -e "ssh -o ConnectTimeout=15 $SCP_J" \
   "$GUEST_USER@$GUEST:/dev/shm/standing-art/" "$LOCAL_ART/" 2>/dev/null || true
-timeout 60 scp -o ConnectTimeout=15 -J "$JUMP" \
+timeout 60 scp -o ConnectTimeout=15 $SCP_J \
   "$GUEST_USER@$GUEST:/dev/shm/standing.log" "$LOCAL_ART/standing.log" 2>/dev/null || true
 
 if timeout 30 $SSH_GUEST "cat /dev/shm/standing.DONE" 2>/dev/null | grep -q FAIL; then
