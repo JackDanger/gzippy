@@ -307,6 +307,15 @@ choice. (Mission rule: a true divergence is legal when byte-exact + ledgered.)
 - **Gate.** Byte-exact via c1/c2/c3 asm-vs-ref differentials + prop roundtrip + tri-oracle
   sha grid; perf via the paired harness vs igzip / night9(kc) / old(chunkt1). GUEST-OWED
   (status tracked in BEAT-IGZIP-T1-STATE.md).
+- **NIGHT32 MEASURED COST (isolated stateless-kernel A/B, Intel-LXC, byte-exact, N=13 paired,
+  self-test PASS).** The per-iteration anchor save = **0.607 instr/B** (`as−a` instr/B
+  −0.6068 [−0.6085,−0.6048]), i.e. **17.9% of the +3.39 instr/B residual over igzip _04**.
+  BUT shedding it INCREASES cyc/B by +0.13 (CI-disjoint, IPC 3.07→2.90): the anchor is
+  **cyc/B-SLACK** — the hot loop has IPC headroom that absorbs it, so deleting it lowers IPC
+  without lowering cycles. ⇒ D-1's instruction count is NOT a wall lever at T1. (Confound: the
+  lazy-reconstruct keeps `bc` live across the refill → schedule perturbation; the un-confounded
+  facts are the 0.607 instr/B cost + the direction "does not close cyc/B".) Variant lives at
+  `asm_kernel.rs::run_contig_stateless` (GZIPPY_STATELESS_KERNEL=1); measurement-only, not shippable.
 
 ### D-cadence — cold long-literal bottom `64:` kept CONTIGUOUS (NIGHT19, minor)
 - **What diverges.** NIGHT19 converged the HOT literal bottom (`6:`) to igzip's split-refill
