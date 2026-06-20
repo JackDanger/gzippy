@@ -492,9 +492,23 @@ mod imp {
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
+                // ── NIGHT36: HOIST the resumable BOUNDARY set `ret=1` OUT of the
+                //    hot literal loop top. On the literal path `{ret}` is written
+                //    but never read until a guard-exit (`9f`); it is CLOBBERED only
+                //    in the two backref arms (`74:` lea/`70:` mov reuse {ret} as the
+                //    copy cursor — 15-GP-operand ceiling). So set it ONCE here, and
+                //    re-set it ONLY on the backref completion paths (74:/59:) before
+                //    they loop to `2b`. Removes 1 instr/iter from the hot literal
+                //    path (the ~0.20 instr/B `ret=1` bucket, NIGHT34 ledger);
+                //    long-literal paths (64:/20:/21:) never touch {ret}. {ret} is
+                //    NOT loop-carried (dedicated `out(reg)`, dead on the literal
+                //    path) so this adds NO live-range across the refill (the NIGHT32
+                //    hazard) and lengthens NO loop-carried chain. Byte-exact: the
+                //    {ret} VALUE at every exit is unchanged (boundary=1, reclass tags
+                //    set in their own arms) ⇒ ref model needs no change.
+                "mov {ret}, 1",                       // speculative BOUNDARY (hoisted, once)
                 // ── iteration top: guards (E4) ──────────────────────────
                 "2:",
-                "mov {ret}, 1",                       // speculative BOUNDARY
                 "cmp {dst}, qword ptr [{ctx} + 16]",  // dst vs out_lim
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
@@ -827,6 +841,7 @@ mod imp {
                 "jg 71b",                             // remainder (> 0) → large
                 "74:",
                 "mov {dst}, {ret}",                   // dst advances by exactly length
+                "mov {ret}, 1",                       // NIGHT36: restore hoisted BOUNDARY ({ret} clobbered as copy cursor)
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
                 // ── scalar fallback (length > 240): emit_backref_contig
@@ -906,6 +921,7 @@ mod imp {
                 "jmp 57b",
                 "59:",
                 "mov {dst}, {t2}",                    // dst advances by exactly length
+                "mov {ret}, 1",                       // NIGHT36: restore hoisted BOUNDARY ({ret} clobbered as scalar cursor)
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
                 // ── RECLASS un-consume via FROM-DATA RE-READ (X2). The igzip-
