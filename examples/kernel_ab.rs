@@ -237,95 +237,115 @@ fn run_arm_a(gz: &[u8], start_bit: u64, oracle: &[u8], reps: u64) {
 }
 
 /// ARM B — igzip decode_huffman_code_block_stateless_04, looped, tables built
-/// once via one bounded isal_inflate header parse.
-fn run_arm_b(gz: &[u8], start_bit: u64, oracle: &[u8], reps: u64) {
+/// once.
+///
+/// Setup faithfully mirrors `isal_inflate_stateless` (igzip_inflate.c:2157):
+///   (1) a full `isal_inflate_stateless` decode of the single block — builds
+///       `lit_huff_code`/`dist_huff_code` (read_header) AND gives the Gate-0
+///       oracle output;
+///   (2) for the TIMED loop, reconstruct the EXACT pre-kernel state the C loop
+///       hands `decode_huffman_code_block_stateless`: read_in preloaded with the
+///       body bits (LSB-first) via the same `inflate_in_load` discipline,
+///       next_in/avail_in at the body, block_state = ISAL_BLOCK_CODED, the
+///       already-built tables left in place. `_04` is then the ONLY timed work.
+///
+/// `body_bit` = bit offset of the block BODY (after the dynamic header), known
+/// exactly from ARM A's `read_header` (same block, same header).
+fn run_arm_b(deflate: &[u8], start_bit: u64, body_bit: u64, oracle: &[u8], reps: u64) {
     use isal::isal_sys::igzip_lib as isal;
-    // The first deflate block starts byte-aligned (start_bit % 8 == 0).
     if start_bit % 8 != 0 {
         die("ARM B requires a byte-aligned first block");
     }
-    let deflate_byte = (start_bit / 8) as usize;
-    let deflate = &gz[deflate_byte..];
 
     const HEADROOM: usize = 258 + 64;
     let cap = oracle.len() + HEADROOM;
     let mut dst = vec![0u8; cap];
-
-    // Parse the header ONCE: run isal_inflate with avail_out clamped so it stops
-    // right after building tables (block_state -> ISAL_BLOCK_CODED). We give it
-    // tiny avail_out so it parses the header + emits a few bytes then returns
-    // output-full, leaving lit_huff_code/dist_huff_code built and the bit cursor
-    // at the body.
-    let mut state: isal::inflate_state = unsafe { std::mem::zeroed() };
-    unsafe { isal::isal_inflate_init(&mut state) };
-    state.crc_flag = 0; // raw inflate (no gzip wrapper on the slice we point at)
-    state.next_in = deflate.as_ptr() as *mut u8;
-    state.avail_in = deflate.len() as u32;
-    state.next_out = dst.as_mut_ptr();
-    state.avail_out = 1; // clamp: stop after header build + first byte
-    let _ = unsafe { isal::isal_inflate(&mut state) };
-    if state.block_state != isal::isal_block_state_ISAL_BLOCK_CODED {
-        die(&format!(
-            "ARM B: header parse did not reach ISAL_BLOCK_CODED (block_state={})",
-            state.block_state
-        ));
-    }
-    // Snapshot the post-header kernel-entry state (read_in/length/next_in/avail_in
-    // + how many output bytes the header-parse already emitted).
-    let snap_read_in = state.read_in;
-    let snap_read_in_length = state.read_in_length;
-    let snap_next_in = state.next_in;
-    let snap_avail_in = state.avail_in;
-    let pre_emitted = state.total_out as usize; // bytes the header-parse emitted
-
-    // decode_huffman_code_block_stateless writes to state.next_out; start_out is
-    // the original out base (used for distance bounds). We restore next_out to
-    // base+pre_emitted each rep so the full block lands contiguously and the
-    // backref window (start_out..next_out) is valid.
     let base = dst.as_mut_ptr();
 
-    let decode_once = |state: &mut isal::inflate_state| -> usize {
-        state.read_in = snap_read_in;
-        state.read_in_length = snap_read_in_length;
-        state.next_in = snap_next_in;
-        state.avail_in = snap_avail_in;
-        state.next_out = unsafe { base.add(pre_emitted) };
-        state.avail_out = (cap - pre_emitted) as u32;
-        state.block_state = isal::isal_block_state_ISAL_BLOCK_CODED;
-        unsafe {
-            isal_kernel::decode_huffman_code_block_stateless_04(state as *mut _, base);
+    // (1) Full stateless decode → builds tables + oracle output.
+    let mut state: isal::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal::isal_inflate_init(&mut state) };
+    state.crc_flag = 0; // raw deflate (no wrapper)
+    state.next_in = deflate.as_ptr() as *mut u8;
+    state.avail_in = deflate.len() as u32;
+    state.next_out = base;
+    state.avail_out = cap as u32;
+    let ret = unsafe { isal::isal_inflate_stateless(&mut state) };
+    let produced = state.total_out as usize;
+    if produced != oracle.len() || &dst[..produced] != oracle {
+        die(&format!(
+            "ARM B warm decode mismatch: ret={ret} produced={produced} oracle={}",
+            oracle.len()
+        ));
+    }
+    eprintln!(
+        "ARM B Gate-0: byte-exact vs flate2 OK ({produced} bytes/block); kernel=_04 (called directly)"
+    );
+
+    // (2) Reconstruct the pre-kernel state for the SAME block. The tables remain
+    // built in `state`. Preload read_in with the body bits LSB-first (mirror
+    // inflate_in_load, igzip_inflate.c:193-220): the kernel reads symbols out of
+    // read_in/read_in_length, refilling from next_in. body_bit is byte-aligned-
+    // free; handle the partial leading byte.
+    let body_byte = (body_bit / 8) as usize;
+    let body_skip = (body_bit % 8) as u32; // bits to drop from the first byte
+    let kernel_setup = |state: &mut isal::inflate_state| {
+        // Start with the bits from body_byte, dropping body_skip low bits.
+        let mut read_in: u64 = 0;
+        let mut read_in_length: i32 = 0;
+        let mut p = body_byte;
+        if body_skip != 0 {
+            read_in = (deflate[p] as u64) >> body_skip;
+            read_in_length = (8 - body_skip) as i32;
+            p += 1;
         }
-        let written = (state.next_out as usize) - (base as usize);
-        written
+        // Load whole bytes up to <64 valid bits (the kernel will refill the rest).
+        while read_in_length <= 56 && p < deflate.len() {
+            read_in |= (deflate[p] as u64) << read_in_length;
+            read_in_length += 8;
+            p += 1;
+        }
+        state.read_in = read_in;
+        state.read_in_length = read_in_length;
+        state.next_in = unsafe { deflate.as_ptr().add(p) as *mut u8 };
+        state.avail_in = (deflate.len() - p) as u32;
+        state.next_out = base;
+        state.avail_out = cap as u32;
+        state.block_state = isal::isal_block_state_ISAL_BLOCK_CODED;
+        state.copy_overflow_length = 0;
+        state.copy_overflow_distance = 0;
     };
 
-    // WARM + Gate-0 byte check.
-    let produced = decode_once(&mut state);
-    if produced != oracle.len() {
+    // Verify the manual kernel setup reproduces the oracle (Gate-0 for the timed
+    // path itself — proves the loop measures a CORRECT decode, not a stub).
+    dst[..produced].fill(0);
+    kernel_setup(&mut state);
+    unsafe {
+        isal_kernel::decode_huffman_code_block_stateless_04(&mut state as *mut _, base);
+    }
+    let kp = (state.next_out as usize) - (base as usize);
+    if kp != oracle.len() || &dst[..kp] != oracle {
         die(&format!(
-            "ARM B byte count {produced} != oracle {} (block_state after={})",
+            "ARM B kernel-only setup mismatch: produced={kp} oracle={} (block_state={})",
             oracle.len(),
             state.block_state
         ));
     }
-    if &dst[..produced] != oracle {
-        die("ARM B byte mismatch vs flate2");
-    }
-    eprintln!(
-        "ARM B Gate-0: byte-exact vs flate2 OK ({} bytes/block); kernel=_04 (called directly)",
-        produced
-    );
+    eprintln!("ARM B kernel-only setup verified byte-exact ({kp} bytes)");
 
+    // TIMED LOOP — _04 only.
     let mut total: u64 = 0;
     let t0 = unsafe { _rdtsc() };
     for _ in 0..reps {
-        let n = decode_once(&mut state);
-        total += n as u64;
+        kernel_setup(&mut state);
+        unsafe {
+            isal_kernel::decode_huffman_code_block_stateless_04(&mut state as *mut _, base);
+        }
+        total += (state.next_out as usize - base as usize) as u64;
         std::hint::black_box(dst[0]);
     }
     let t1 = unsafe { _rdtsc() };
-    let cyc = t1 - t0;
-    report("B", cyc, total);
+    report("B", t1 - t0, total);
 }
 
 fn asm_enabled() -> bool {
@@ -364,8 +384,20 @@ fn main() {
     }
 
     let (gz, start_bit, oracle) = build_real_block();
+    // Body bit offset (after the dynamic header) — parse the header once with a
+    // throwaway Block (same path ARM A uses); ARM B needs it to preload read_in.
+    let body_bit = {
+        let mut blk = Block::new();
+        let mut unused: Vec<u16> = Vec::new();
+        blk.reset(None, None);
+        blk.set_initial_window(&mut unused, &[]).unwrap();
+        let mut bits = Bits::at_bit_offset(&gz, start_bit as usize);
+        blk.read_header(&mut bits, false)
+            .unwrap_or_else(|e| die(&format!("body_bit read_header: {e:?}")));
+        bits.bit_position() as u64
+    };
     eprintln!(
-        "block: start_bit={start_bit} (byte-aligned={}) output_bytes={}",
+        "block: start_bit={start_bit} body_bit={body_bit} (byte-aligned={}) output_bytes={}",
         start_bit % 8 == 0,
         oracle.len()
     );
@@ -377,10 +409,10 @@ fn main() {
 
     match arm.as_str() {
         "a" => run_arm_a(&gz, start_bit, &oracle, reps),
-        "b" => run_arm_b(&gz, start_bit, &oracle, reps),
+        "b" => run_arm_b(&gz, start_bit, body_bit, &oracle, reps),
         "both" => {
             run_arm_a(&gz, start_bit, &oracle, reps);
-            run_arm_b(&gz, start_bit, &oracle, reps);
+            run_arm_b(&gz, start_bit, body_bit, &oracle, reps);
         }
         other => die(&format!("unknown arm {other}")),
     }
