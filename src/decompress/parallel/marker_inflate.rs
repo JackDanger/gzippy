@@ -817,6 +817,21 @@ impl Block {
     pub fn is_last_block(&self) -> bool {
         self.is_last_block
     }
+    /// MEASUREMENT-ONLY (kernel-isolation A/B harness, examples/kernel_ab.rs):
+    /// reset ONLY the per-block-body decode accounting (`at_end_of_block`,
+    /// `decoded_bytes`) so the SAME real DEFLATE block can be re-decoded by
+    /// `decode_clean_into_contig` in a loop WITHOUT re-parsing the header or
+    /// rebuilding the Huffman LUTs (`block_huffman_luts_ready` is left TRUE).
+    /// Production never calls this — it exists solely to amortize table-build
+    /// to ~0 in the isolated kernel-vs-kernel timing. Byte-transparent: the
+    /// loop body each iteration decodes from the identical bit cursor + tables
+    /// into the identical buffer, so every iteration's output is identical.
+    #[allow(dead_code)] // measurement-harness surface only
+    pub fn reset_block_body_for_isolation(&mut self) {
+        self.at_end_of_block = false;
+        self.decoded_bytes = 0;
+        self.decoded_bytes_at_block_start = 0;
+    }
     #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn compression_type(&self) -> CompressionType {
         self.compression_type

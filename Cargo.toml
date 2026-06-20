@@ -204,6 +204,10 @@ criterion = "0.5"
 name = "coz_bench"
 required-features = ["pure-rust-inflate"]
 
+[[example]]
+name = "kernel_ab"
+required-features = ["pure-rust-inflate", "isal-compression"]
+
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
 harness = false
