@@ -217,5 +217,19 @@ def main():
         print("  WARNING: >=1 cell failed the A/A self-test (loaded box) — those ratios were withheld.")
     print("=" * 100)
 
+    # ── EFFCORES discriminator (Tool 2; present only when EFFCORES=1 was set) ──
+    # Per cell, the H-TAIL-vs-H-KERNEL fork line from parallel_sm_tail_metric.py:
+    #   effcores << T => schedule slack (H-TAIL); effcores ~= T (and ~= rg's
+    #   effcores) => CPU-bound (H-KERNEL, the T1 kernel front). The reducer's
+    #   Gate-0 (conservation + non-inert chunk-count) must have passed or the
+    #   line is absent.
+    eff = os.path.join(art, "effcores.txt")
+    if os.path.exists(eff):
+        print("EFFCORES (Tool 2 — schedule-vs-kernel discriminator; ATTRIBUTION-tier, routes only):")
+        with open(eff) as f:
+            for ln in f:
+                print("  " + ln.rstrip())
+        print("=" * 100)
+
 if __name__ == "__main__":
     main()

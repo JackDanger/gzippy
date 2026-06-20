@@ -75,10 +75,11 @@ echo "=== ship rig -> $GUEST_USER@$GUEST:$GUEST_STAGE/ ==="
 timeout 60 $SSH_GUEST "mkdir -p '$GUEST_STAGE'"
 timeout 120 scp -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -J "$JUMP" \
   "$HERE/_standing_guest.sh" "$HERE/standing_report.py" \
+  "$ROOT/scripts/parallel_sm_tail_metric.py" \
   "$GUEST_USER@$GUEST:$GUEST_STAGE/"
 
 REMOTE_ENV="SHA='$SHA' CORPORA='$CORPORA' THREADS='$THREADS' N='$N' BUILD='$BUILD' \
-GZ_SRC='$GUEST_GZ_SRC' GZ_TARGET='/dev/shm/standing-target' \
+GZ_SRC='$GUEST_GZ_SRC' GZ_TARGET='/dev/shm/standing-target' EFFCORES='${EFFCORES:-0}' \
 RG='$RG' IGZIP='$COMP_IGZIP' PINBASE='0' CORPUS_DIR='/root'"
 
 echo "=== run on guest (detached; build+gate0+measure+analyze) ==="

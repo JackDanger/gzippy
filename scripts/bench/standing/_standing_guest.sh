@@ -162,6 +162,37 @@ for corp in $CORPORA; do
 done
 echo "load_end: $(cat /proc/loadavg)"
 
+# ---------------------------------------------------------------------------
+# EFFCORES (Tool 2, opt-in EFFCORES=1): one extra GZIPPY_TIMELINE-instrumented
+# decode per cell, reduced to the H-TAIL-vs-H-KERNEL discriminator. Runs AFTER
+# the timed matrix so the trace instrument NEVER contaminates the Gate-1 walls.
+# Also pulls rg --verbose "Blocks Total Fetched" as the non-inert chunk-count
+# cross-check. Pure analysis; OFF by default (zero effect on the matrix).
+# ---------------------------------------------------------------------------
+if [ "${EFFCORES:-0}" = 1 ] && [ -f "$SELF_DIR/parallel_sm_tail_metric.py" ]; then
+  echo "--- EFFCORES capture (post-matrix, instrumented; off the timed path) ---"
+  : > "$OUT/effcores.txt"
+  for corp in $CORPORA; do
+    F="$CORPUS_DIR/$corp.gz"
+    [ -f "$F" ] || continue
+    for T in $THREADS; do
+      [ "$T" -ge 2 ] || continue   # effcores is a T>=2 schedule metric
+      mask="$(pin_mask "$T")"
+      # rg's own chunk count for the cross-check
+      rgv="$OUT/rgverbose.$corp.T$T.txt"
+      taskset -c "$mask" "$RG" -d -c -P"$T" --verbose "$F" >/dev/null 2>"$rgv" || true
+      nblk="$(grep -iE 'Total Fetched' "$rgv" | grep -oE '[0-9]+' | tail -1)"
+      tj="$OUT/timeline.$corp.T$T.json"
+      GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_TIMELINE="$tj" taskset -c "$mask" \
+        "$GZ" -d -c -p"$T" "$F" >/dev/null 2>>"$OUT/effcores.err" || true
+      line="$(python3 "$SELF_DIR/parallel_sm_tail_metric.py" "$tj" \
+                ${nblk:+--expected-chunks "$nblk"} --sink /dev/null \
+                --label "$corp-T$T" 2>&1 | grep -E 'GATE-0|FORK LINE|effcores=' | tr '\n' ' ')"
+      echo "$corp T$T (rg_blocks=${nblk:-?}): $line" | tee -a "$OUT/effcores.txt"
+    done
+  done
+fi
+
 # meta for the analyzer
 {
   echo "sha $BUILT_SHA"
