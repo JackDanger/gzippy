@@ -469,9 +469,8 @@ pub fn make_inflate_huff_code_lit_len(
 
     let code_list_len = count_total[MAX_LIT_LEN_COUNT - 1] as u32;
     if code_list_len == 0 {
-        for v in result.short_code_lookup.iter_mut() {
-            *v = 0;
-        }
+        // igzip: memset(short_code_lookup, 0, sizeof(short_code_lookup))
+        result.short_code_lookup.fill(0);
         return true;
     }
 
@@ -492,9 +491,8 @@ pub fn make_inflate_huff_code_lit_len(
     let mut copy_size: usize = 1 << (last_length - 1);
 
     // Initialize short_code_lookup to zero for `copy_size` entries
-    for v in result.short_code_lookup[..copy_size].iter_mut() {
-        *v = 0;
-    }
+    // igzip: memset(short_code_lookup, 0x00, copy_size * sizeof(*short_code_lookup))
+    result.short_code_lookup[..copy_size].fill(0);
 
     let min_length = last_length;
 
@@ -504,9 +502,9 @@ pub fn make_inflate_huff_code_lit_len(
         // Note: source overlaps destination range — split-borrow to copy
         // [0..copy_size] into [copy_size..copy_size*2].
         let (head, tail) = result.short_code_lookup.split_at_mut(copy_size);
-        for k in 0..copy_size {
-            tail[k] = head[k];
-        }
+        // igzip: memcpy(short_code_lookup + copy_size, short_code_lookup,
+        //               sizeof(*short_code_lookup) * copy_size)
+        tail[..copy_size].copy_from_slice(&head[..copy_size]);
         copy_size *= 2;
 
         // Encode code singletons
@@ -756,9 +754,8 @@ pub fn make_inflate_huff_code_dist(
     let long_len = result.long_code_lookup.len();
     let code_list_len = count[MAX_HUFF_TREE_DEPTH + 1] as u32;
     if code_list_len == 0 {
-        for v in result.short_code_lookup.iter_mut() {
-            *v = 0;
-        }
+        // igzip: memset(short_code_lookup, 0, sizeof(short_code_lookup))
+        result.short_code_lookup.fill(0);
         return true;
     }
 
@@ -788,9 +785,9 @@ pub fn make_inflate_huff_code_dist(
 
     while last_length <= ISAL_DECODE_SHORT_BITS {
         let (head, tail) = result.short_code_lookup.split_at_mut(copy_size);
-        for k in 0..copy_size {
-            tail[k] = head[k];
-        }
+        // igzip: memcpy(short_code_lookup + copy_size, short_code_lookup,
+        //               sizeof(*short_code_lookup) * copy_size)
+        tail[..copy_size].copy_from_slice(&head[..copy_size]);
         copy_size *= 2;
 
         let mut index1 = count[last_length as usize] as usize;
