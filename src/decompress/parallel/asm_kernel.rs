@@ -315,6 +315,16 @@ mod imp {
     #[cfg(test)]
     pub static TEST_RUN_CONTIG_CALLS: AtomicU64 = AtomicU64::new(0);
 
+    /// NIGHT32 non-inert proof (Gate-0c): incremented once per
+    /// `run_contig_stateless` REGION call (coarse — a handful per block, NOT
+    /// per symbol), so the isolated A/B can PROVE the stateless path executed
+    /// (>0) rather than silently measuring the resumable path. Overhead is
+    /// ~10^4 atomic adds over a 256 MiB run ⇒ < 10^-4 instr/B, below the noise.
+    pub static STATELESS_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    pub fn stateless_entries() -> u64 {
+        STATELESS_ENTRIES.load(Ordering::Relaxed)
+    }
+
     /// Runtime dispatch: ON when compiled in, unless `GZIPPY_ASM_KERNEL=0`
     /// (kill-switch) or the CPU lacks BMI2 (`shrx`/`shlx`/`bzhi`).
     pub fn enabled() -> bool {
@@ -335,6 +345,18 @@ mod imp {
     pub fn stats_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("GZIPPY_ASM_STATS").is_ok_and(|v| v == "1"))
+    }
+
+    /// `GZIPPY_STATELESS_KERNEL=1` — NIGHT32 isolated stateless-kernel A/B
+    /// (measurement only). When set, `decode_clean_into_contig` dispatches to
+    /// `run_contig_stateless` (the resumable-contract glue from divergence D-1
+    /// removed) instead of `run_contig`. SAFE only at T1 on a valid single-shot
+    /// block (markers never fire; the only `85:` reconstruct is the once-per-
+    /// block EOB, which the stateless variant reconstructs lazily byte-exactly).
+    /// NOT a shippable path — see `run_contig_stateless` doc.
+    pub fn stateless_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GZIPPY_STATELESS_KERNEL").is_ok_and(|v| v == "1"))
     }
 
     /// The rung-(c) kernel region.
@@ -969,6 +991,382 @@ mod imp {
         (ret, dst_c)
     }
 
+    /// NIGHT32 — STATELESS variant of `run_contig` for the isolated kernel A/B.
+    ///
+    /// IDENTICAL to `run_contig` EXCEPT the divergence-D-1 resumable-contract
+    /// glue is shed from the HOT literal path: the per-iteration un-consume
+    /// anchor save (`lea {p0},[{pos}*8]` / `sub {p0},{bitsleft}` / `mov {d0},
+    /// {dst}` — 3 instructions every iteration) is DELETED. The two freed GP
+    /// registers drop the operand count from 15 → 14; one new register `{bc}`
+    /// carries the current packet's `bit_count` to the late discriminator.
+    ///
+    /// WHY THIS IS BYTE-EXACT ON A VALID T1 BLOCK: on a valid stream the ONLY
+    /// exit that reaches the `85:` reconstruct is the once-per-block EOB
+    /// (subtable-dist is handled INLINE at `91:`; raw0/baddist/marker/oversize/
+    /// multi-trail bails fire only on invalid/marker input). For that EOB the
+    /// un-consume cursor is reconstructed LAZILY at `82:`, provably identical to
+    /// the saved anchor:
+    ///   p0 = (pos*8 - bitsleft) - bc   [refill-invariant: Bits::refill's `|56`
+    ///        + pos-advance preserve `pos*8 - bitsleft`, so at the discriminator
+    ///        `pos*8 - bitsleft == p0_top + bc`; D-1 ledger]
+    ///   d0 = dst - cnt                 [the speculative store advanced dst by
+    ///        cnt; {t3}=cnt is live at the discriminator]
+    /// The exit CONTRACT is unchanged (EXIT_RECLASS_EOB with the un-consumed
+    /// cursor + restored dst), so the Rust wrapper needs NO change.
+    ///
+    /// NOT SHIPPABLE: the rare dist-error / marker / oversize bails are routed
+    /// to a plain writeback (they cannot reconstruct without the saved anchor)
+    /// — correct ONLY because they never fire on valid T1 data. A marker block
+    /// (T>1 window-absent) WOULD hit `93:` and mis-decode. The byte-exact gate
+    /// catches any unexpected firing (output diverges → harness dies).
+    ///
+    /// # Safety
+    /// Same as `run_contig` (E1-E6). Caller must guarantee a valid, window-
+    /// present (clean) block — i.e. T1 single-shot. The `GZIPPY_STATELESS_KERNEL`
+    /// dispatch is gated on the same `enabled()`/`dispatch_allowed()` predicate.
+    #[inline(never)]
+    pub unsafe fn run_contig_stateless(
+        ctx: &AsmState,
+        lb: &mut Bits<'_>,
+        dst: *mut u8,
+    ) -> (u64, *mut u8) {
+        #[cfg(test)]
+        TEST_RUN_CONTIG_CALLS.fetch_add(1, Ordering::Relaxed);
+        STATELESS_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        let mut bitbuf = lb.bitbuf;
+        let mut bitsleft: u64 = lb.bitsleft as u64;
+        let mut pos: u64 = lb.pos as u64;
+        let mut dst_c = dst;
+        let ret: u64;
+        unsafe {
+            core::arch::asm!(
+                // ── prologue (identical to run_contig) ───────────────────
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
+                // ── iteration top: guards (E4) ──────────────────────────
+                "2:",
+                "mov {ret}, 1",                       // speculative BOUNDARY
+                "cmp {dst}, qword ptr [{ctx} + 16]",
+                "jae 9f",
+                "cmp {pos}, qword ptr [{ctx} + 8]",
+                "jae 9f",
+                // ── NIGHT32: the per-iteration p0/d0 un-consume anchor SAVE
+                //    (run_contig's `lea {p0}`/`sub {p0}`/`mov {d0}`) is DELETED.
+                //    The EOB bail reconstructs it lazily at 82: from bc/cnt.
+                // ── decode_next_lit_len on the preloaded entry {t1}.
+                "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT → long (cold)
+                "jnz 20f",
+                "mov {bc:e}, {t1:e}",
+                "shr {bc:e}, 28",                     // bc = bit_count (KEPT LIVE in {bc})
+                "jz 86f",                             // invalid (bc==0) → Rust (UN-consumed, no re-read)
+                "mov {t3:e}, {t1:e}",
+                "shr {t3:e}, 26",
+                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3) — KEPT LIVE
+                "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
+                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
+                "shrx {t5}, {t1}, {t4}",
+                "and {t5:e}, 0xFFFF",                 // {t5} = trailing symbol
+                "mov qword ptr [{dst}], {t1}",        // speculative 8-byte store
+                "add {dst}, {t3}",                    // advance by cnt
+                "shrx {bitbuf}, {bitbuf}, {bc}",      // consume by bc
+                "sub {bitsleft}, {bc}",
+                "6:",
+                "mov {t4:e}, 0xFFF",
+                "and {t4:e}, {bitbuf:e}",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {lit_off}]",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "mov {dpre:e}, 0x1FF",
+                "and {dpre:e}, {bitbuf:e}",
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
+                "cmp {t5:e}, 256",
+                "jb 2b",                              // literal → loop (HOT)
+                "je 82f",                             // EOB → lazy reconstruct + RECLASS tag 2
+                "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
+                "ja 30f",                             // oversize → sentinel
+                "dec {dst}",                          // base+cnt → copy start
+                "lea {t2:e}, [{t5:e} - 254]",         // length = trailing - 254
+                "jmp 58f",
+                // ── cold bottom (long-literal path) ──────────────────────
+                "64:",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
+                "or {bitsleft}, 56",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
+                "jmp 2b",
+                // ── long code at top (rare/cold) ─────────────────────────
+                "20:",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 26",                     // long_max_len (≤21)
+                "bzhi {t3}, {bitbuf}, {t2}",
+                "shr {t3}, 12",
+                "and {t1:e}, 0x1FFFFFF",
+                "add {t1:e}, {t3:e}",                 // long_idx
+                "lea {t2}, [{ctx} + {llong_off}]",
+                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 10",                     // bc
+                "jz 86f",
+                "and {t1:e}, 0x3FF",                  // symbol
+                "cmp {t1:e}, 255",
+                "ja 21f",
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // lone literal via long path
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t1:l}",
+                "inc {dst}",
+                "jmp 64b",
+                // ── long lone non-literal ────────────────────────────────
+                "21:",
+                "mov {t5:e}, {t1:e}",                 // trailing = code
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume long litlen
+                "sub {bitsleft}, {t2}",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "cmp {t5:e}, 256",
+                "je 30f",                             // long EOB (never on valid) → sentinel
+                "cmp {t5:e}, 512",
+                "ja 30f",                             // long oversize → sentinel
+                "mov {dpre:e}, {bitbuf:e}",
+                "and {dpre:e}, 0x1FF",
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
+                "lea {t2:e}, [{t5:e} - 254]",
+                "jmp 58f",
+                // ── oversize / multi-trail / dist-error SENTINELS (NIGHT32:
+                //    cannot reconstruct without the saved anchor; never fire on
+                //    valid T1 data — writeback current cursor as RECLASS, the
+                //    byte-exact gate catches any firing). ──
+                "30:",
+                "mov {ret}, 0",                       // SENTINEL reclass (oversize/long)
+                "jmp 9f",
+                // ── shared backref body (igzip decode_len_dist) ──────────
+                "58:",
+                "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
+                "94:",
+                "test {t1:e}, {t1:e}",
+                "jz 30b",                             // raw == 0 → SENTINEL (never on valid)
+                "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
+                "jnz 91f",                            // subtable dist → INLINE decode at 91:
+                "mov {t3}, {bitbuf}",                 // saved_bitbuf
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry
+                "mov {t4:e}, {t1:e}",
+                "and {t4:e}, 0x1F",
+                "sub {bitsleft}, {t4}",
+                "bzhi {t3}, {t3}, {t1}",
+                "mov {t4:e}, {t1:e}",
+                "shr {t4:e}, 8",
+                "and {t4:e}, 0xF",                    // codeword_bits
+                "shrx {t3}, {t3}, {t4}",              // extra value
+                "shr {t1:e}, 16",                     // distance base
+                "add {t1:e}, {t3:e}",                 // distance
+                "jz 30b",                             // distance == 0 → SENTINEL
+                "cmp {t1:e}, 32768",
+                "ja 30b",                             // > MAX_WINDOW_SIZE → SENTINEL
+                "mov {t4}, {dst}",
+                "sub {t4}, {t1}",                     // src = dst - distance
+                "cmp {t4}, qword ptr [{ctx} + 24]",
+                "jb 30b",                             // src < out_base (marker) → SENTINEL
+                "cmp {bitsleft}, 48",
+                "jae 51f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
+                "or {bitsleft}, 56",
+                "51:",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
+                // ── 16-byte MOVDQU back-ref copy (identical to run_contig) ─
+                "cmp {t2}, 240",
+                "ja 70f",
+                "lea {ret}, [{dst} + {t2}]",
+                "movdqu xmm0, [{t4}]",
+                "mov {t5:e}, 16",
+                "cmp {t5}, {t2}",
+                "cmovg {t5}, {t2}",
+                "cmp {t1}, {t5}",
+                "jb 72f",
+                "71:",
+                "movdqu [{t4} + {t1}], xmm0",
+                "sub {t2}, 16",
+                "jle 74f",
+                "add {t4}, 16",
+                "movdqu xmm0, [{t4}]",
+                "jmp 71b",
+                "72:",
+                "add {t2}, {t1}",
+                "73:",
+                "movdqu [{t4} + {t1}], xmm0",
+                "shl {t1}, 1",
+                "movdqu xmm0, [{t4}]",
+                "cmp {t1}, 16",
+                "jl 73b",
+                "sub {t2}, {t1}",
+                "jg 71b",
+                "74:",
+                "mov {dst}, {ret}",
+                "mov {t1:e}, {t3:e}",
+                "jmp 2b",
+                // ── scalar fallback (length > 240) ───────────────────────
+                "70:",
+                "mov {ret}, {dst}",
+                "cmp {t2}, 40",
+                "jbe 52f",
+                "prefetcht0 byte ptr [{t4} + 40]",
+                "52:",
+                "add {t2}, {dst}",
+                "cmp {t1}, 8",
+                "jb 55f",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "mov {t5}, qword ptr [{t4} + 8]",
+                "mov qword ptr [{ret} + 8], {t5}",
+                "mov {t5}, qword ptr [{t4} + 16]",
+                "mov qword ptr [{ret} + 16], {t5}",
+                "mov {t5}, qword ptr [{t4} + 24]",
+                "mov qword ptr [{ret} + 24], {t5}",
+                "mov {t5}, qword ptr [{t4} + 32]",
+                "mov qword ptr [{ret} + 32], {t5}",
+                "add {ret}, 40",
+                "cmp {ret}, {t2}",
+                "jae 59f",
+                "add {t4}, 40",
+                "53:",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, 8",
+                "add {ret}, 8",
+                "cmp {ret}, {t2}",
+                "jb 53b",
+                "jmp 59f",
+                "55:",
+                "cmp {t1:e}, 1",
+                "jne 56f",
+                "movzx {t5:e}, byte ptr [{t4}]",
+                "mov {t1}, 0x0101010101010101",
+                "imul {t5}, {t1}",
+                "54:",
+                "mov qword ptr [{ret}], {t5}",
+                "add {ret}, 8",
+                "cmp {ret}, {t2}",
+                "jb 54b",
+                "jmp 59f",
+                "56:",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "57:",
+                "cmp {ret}, {t2}",
+                "jae 59f",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "jmp 57b",
+                "59:",
+                "mov {dst}, {t2}",
+                "mov {t1:e}, {t3:e}",
+                "jmp 2b",
+                // ── INLINE subtable-dist (identical to run_contig 91:) ────
+                "91:",
+                "shr {bitbuf}, 9",                    // consume DistTable::TABLE_BITS=9
+                "sub {bitsleft}, 9",
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 8",
+                "and {t3:e}, 0xF",                    // subtable_bits
+                "bzhi {t4}, {bitbuf}, {t3}",
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 16",                     // subtable_start
+                "add {t4:e}, {t3:e}",
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {dist_off}]",   // leaf entry
+                "jmp 94b",
+                // ── EOB: LAZY un-consume reconstruct (NIGHT32). At entry from
+                //    the main discriminator: {bc}=EOB bit_count, {t3}=cnt (=1,
+                //    dst advanced by it), cursor post-consume+refill. Compute
+                //    p0 = pos*8 - bitsleft - bc (refill-invariant), d0 = dst -
+                //    cnt; then the from-data re-read (mirror of run_contig 85:).
+                "82:",
+                "mov {ret}, 2",                       // RECLASS, lone-EOB tag
+                "sub {dst}, {t3}",                    // d0 = dst - cnt
+                "lea {t2}, [{pos} * 8]",
+                "sub {t2}, {bitsleft}",
+                "sub {t2}, {bc}",                     // {t2} = p0 = iteration-top bit pos
+                "mov {t1}, {t2}",
+                "and {t1:e}, 7",                      // skip = p0 & 7
+                "shr {t2}, 3",                        // byte = p0 >> 3
+                "mov {bitbuf}, qword ptr [{in_ptr} + {t2}]",
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // >> skip
+                "mov {bitsleft:e}, 64",
+                "sub {bitsleft}, {t1}",               // bitsleft = 64 - skip
+                "lea {pos}, [{t2} + 8]",              // pos = byte + 8
+                "jmp 9f",
+                // ── invalid (bc==0) exit: PRE-consume, cursor unchanged (X6) ─
+                "86:",
+                "mov {ret}, 0",                       // RECLASS (invalid)
+                "9:",
+                ctx = in(reg) ctx as *const AsmState,
+                in_ptr = in(reg) ctx.in_ptr,
+                dpre = out(reg) _,
+                bc = out(reg) _,                      // NIGHT32: current packet bit_count (was {t2}; kept live for the lazy EOB anchor)
+                lit_off = const ASM_LIT_SHORT_OFF,
+                llong_off = const ASM_LIT_LONG_OFF,
+                dist_off = const ASM_DIST_OFF,
+                bitbuf = inout(reg) bitbuf,
+                bitsleft = inout(reg) bitsleft,
+                pos = inout(reg) pos,
+                dst = inout(reg) dst_c,
+                ret = out(reg) ret,
+                t1 = out(reg) _,
+                t2 = out(reg) _,
+                t3 = out(reg) _,
+                t4 = out(reg) _,
+                t5 = out(reg) _,
+                out("xmm0") _,
+                options(nostack),
+            );
+        }
+        lb.bitbuf = bitbuf;
+        lb.bitsleft = bitsleft as u32;
+        lb.pos = pos as usize;
+        (ret, dst_c)
+    }
+
     pub fn note_exit(exit: u64, delta: usize) {
         if !stats_enabled() {
             return;
@@ -1012,7 +1410,10 @@ mod imp {
 }
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-pub use imp::{dump_if_enabled, enabled, note_exit, run_contig, stats_enabled};
+pub use imp::{
+    dump_if_enabled, enabled, note_exit, run_contig, run_contig_stateless, stateless_enabled,
+    stateless_entries, stats_enabled,
+};
 #[cfg(all(test, feature = "asm-kernel", target_arch = "x86_64"))]
 pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
 

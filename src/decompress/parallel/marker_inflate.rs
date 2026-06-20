@@ -3211,6 +3211,11 @@ impl Block {
                 && dist_tbl.is_some();
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
             let asm_stats: bool = super::asm_kernel::stats_enabled();
+            // NIGHT32 isolated stateless-kernel A/B (measurement only): dispatch
+            // to run_contig_stateless (D-1 resumable glue removed). One branch
+            // per region call (not per iteration); SAFE only at T1 valid blocks.
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            let stateless_kernel: bool = super::asm_kernel::stateless_enabled();
             macro_rules! sync_local_bits {
                 () => {{
                     bits.pos = lb.pos;
@@ -3296,8 +3301,13 @@ impl Block {
                     // bitsleft, lockstep cursors, validated tables, knobs
                     // excluded by dispatch).
                     let dst0 = unsafe { base.add(*pos) };
-                    let (exit, dst1) =
-                        unsafe { super::asm_kernel::run_contig(&self.asm, &mut lb, dst0) };
+                    let (exit, dst1) = unsafe {
+                        if stateless_kernel {
+                            super::asm_kernel::run_contig_stateless(&self.asm, &mut lb, dst0)
+                        } else {
+                            super::asm_kernel::run_contig(&self.asm, &mut lb, dst0)
+                        }
+                    };
                     let delta = (dst1 as usize) - (dst0 as usize);
                     if asm_stats {
                         super::asm_kernel::note_exit(exit, delta);
