@@ -534,9 +534,29 @@ mod imp {
                 //    (former `mov [ctx+56],p0` / `mov [ctx+64],dst`) are DELETED
                 //    (igzip stateless single-base; D-1 ledger). The bails read
                 //    p0/d0 from registers at 85:.
+                // ── NIGHT40: HOIST the {d0} dst anchor OFF the hot literal path
+                //    (the NIGHT36 ret=1 pattern applied to the dst un-consume
+                //    target). {d0} is read ONLY on a non-literal/long bail (85:),
+                //    never on the literal back-edge (`jb 2b`), so the per-iteration
+                //    `mov {d0},{dst}` on the HOT literal path is pure waste. It is
+                //    moved to the two cold points where a bail can first occur,
+                //    reconstructed as `dst - cnt` (= iteration-top dst, since the
+                //    speculative store advanced dst by cnt): the short non-literal
+                //    fall-through (post-discriminator, `{t3}`=cnt still live —
+                //    captured BEFORE the dist decode clobbers `{t3}` at saved_bitbuf
+                //    `94:`) and the long lone non-literal `21:` (dst un-advanced
+                //    there, so {d0}={dst}). Byte-exact: the {d0} VALUE at every bail
+                //    is identical to the old top capture (iteration-top dst), so the
+                //    ref model (`run_contig_ref_biased`, d0=*dst at top) needs NO
+                //    change. The {p0} bit anchor (lea+sub) STAYS on the hot path:
+                //    moving it would need `bc` reconstructed at the bail, but `bc`
+                //    (`{t2}`) is DESTROYED by the refill (`6:` reuses {t2}) and
+                //    keeping it live across the refill is the NIGHT32 trap (register
+                //    live-range / schedule hazard → cyc/B regress). cnt survives the
+                //    refill ({t3} untouched), bc does not — that asymmetry is why d0
+                //    is hoistable and p0 is not.
                 "lea {p0}, [{pos} * 8]",
                 "sub {p0}, {bitsleft}",
-                "mov {d0}, {dst}",
                 // ── decode_next_lit_len on the preloaded entry {t1} (igzip
                 //    322-372 / loop_block 515): extract bit_count + sym_count.
                 //    LARGE_FLAG → long table (cold); bc==0 → invalid (cold).
@@ -658,14 +678,30 @@ mod imp {
                 //    data-dependent branch resolves.
                 "cmp {t5:e}, 256",
                 "jb 2b",                              // literal → loop (HOT)
+                // ── NIGHT40: short non-literal — capture the hoisted {d0} dst
+                //    anchor HERE (off the hot literal path). dst = base+cnt (the
+                //    speculative store advanced by cnt), so iteration-top dst =
+                //    dst - cnt = dst - {t3}. {t3}=cnt is still live (set pre-refill,
+                //    untouched by `6:`; the dist decode at `94:` clobbers it later,
+                //    so it MUST be captured before `58:`). Covers EOB (82:),
+                //    oversize (30:), and every dist bail (90/92/93) on the short
+                //    path. Byte-exact == old top capture (iteration-top dst).
+                // FLAG-SAFE snapshot: `mov` does NOT touch flags, so the
+                //    `cmp {t5},256` result still drives the `je` (EOB) below.
+                //    d0 := dst (= top+cnt here); the -cnt is applied later where
+                //    flags are dead (length path) or re-set (short EOB/oversize
+                //    stubs `81:`/`30:`). The long path (`21:`) captures d0=dst
+                //    directly (dst un-advanced there, so already = top).
+                "mov {d0}, {dst}",                    // d0 = top+cnt (flag-safe)
                 // ── non-literal arm: EOB / oversize → restore + RECLASS; else
                 //    length → decode_len_dist. dst = base+cnt → `dec` = copy
                 //    start (base for a lone backref; base+(cnt-1) past the
                 //    literal prefix for a pack). {dpre} carries the preloaded
                 //    dist entry into `58:`.
-                "je 82f",                             // EOB → restore + RECLASS tag 2
+                "je 81f",                             // EOB (short) → sub cnt @81 then RECLASS tag 2
                 "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
-                "ja 30f",                             // oversize → restore + RECLASS
+                "ja 30f",                             // oversize (short) → sub cnt @30 then RECLASS
+                "sub {d0}, {t3}",                     // length path: d0 = top+cnt - cnt = top (flags dead)
                 "dec {dst}",                          // base+cnt → copy start
                 "lea {t2:e}, [{t5:e} - 254]",         // length = trailing - 254
                 "jmp 58f",                            // → shared dist+copy body
@@ -713,6 +749,11 @@ mod imp {
                 //    the dist entry, length, → 58: (no `dec` — dst is already
                 //    the copy start).
                 "21:",
+                // NIGHT40: long lone non-literal — dst was NOT advanced on the
+                //    long path (no speculative store), so iteration-top dst == dst.
+                //    Capture the hoisted {d0} here (covers long EOB/oversize 82:/8:
+                //    and long dist bails 90/92/93). Byte-exact == old top capture.
+                "mov {d0}, {dst}",
                 "mov {t5:e}, {t1:e}",                 // trailing = code (clean, no flag bit)
                 "shrx {bitbuf}, {bitbuf}, {t2}",      // consume long litlen
                 "sub {bitsleft}, {t2}",
@@ -736,6 +777,7 @@ mod imp {
                 // ── oversize trailing (>512): restore + RECLASS, tag by cnt
                 //    (lone → 0 via 8:, multi → 3 via 83:).
                 "30:",
+                "sub {d0}, {t3}",                     // NIGHT40 short oversize: d0 = top (cmp below re-sets flags)
                 "cmp {t3:e}, 1",
                 "je 8f",                              // lone oversize → tag 0
                 "jmp 83f",                            // multi oversize → tag 3
@@ -980,8 +1022,10 @@ mod imp {
                 "93:",
                 "mov {ret}, 8",                       // RECLASS marker (src<out_base; out of scope)
                 "jmp 85f",
+                "81:",                                // NIGHT40 short-EOB stub: d0 = top (was top+cnt snapshot)
+                "sub {d0}, {t3}",
                 "82:",
-                "mov {ret}, 2",                       // RECLASS, lone-EOB tag
+                "mov {ret}, 2",                       // RECLASS, lone-EOB tag (long EOB enters here, d0 already top)
                 "jmp 85f",
                 "83:",
                 "mov {ret}, 3",                       // RECLASS, multi-trailing tag
