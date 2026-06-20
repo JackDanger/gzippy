@@ -667,6 +667,18 @@ pub struct Block {
         pure_inflate_decode
     ))]
     block_huffman_luts_ready: bool,
+    /// True after `dist_hc` (the reversed-bits distance decoder) was built for
+    /// the current block. Split out of `block_huffman_luts_ready` so the clean
+    /// CONTIG production path — which decodes distance via the libdeflate-shape
+    /// `asm.dist` `DistTable`, NEVER `dist_hc` — skips the redundant per-block
+    /// `dist_hc` build. This converges gzippy's per-block table build toward
+    /// igzip, which builds a SINGLE distance table (`make_inflate_huff_code_dist`,
+    /// igzip_inflate.c) folded into decode; gzippy was building two (the
+    /// libdeflate `DistTable` AND `dist_hc`). Built lazily by `ensure_dist_hc`
+    /// only on the ring/marker decode paths and the contig `!dist_valid`
+    /// fallback — the sole readers of `dist_hc`. Reset per header.
+    #[cfg(pure_inflate_decode)]
+    dist_hc_built: bool,
 }
 
 #[cfg(parallel_sm)]
@@ -745,6 +757,8 @@ impl Block {
                 pure_inflate_decode
             ))]
             block_huffman_luts_ready: false,
+            #[cfg(pure_inflate_decode)]
+            dist_hc_built: false,
         }
     }
 
@@ -909,6 +923,10 @@ impl Block {
         ))]
         {
             self.block_huffman_luts_ready = false;
+        }
+        #[cfg(pure_inflate_decode)]
+        {
+            self.dist_hc_built = false;
         }
 
         // rapidgzip's `reset` ends with: `if (initialWindow) setInitialWindow(*initialWindow);`
@@ -1125,6 +1143,7 @@ impl Block {
         #[cfg(pure_inflate_decode)]
         {
             self.dist_table_checked = false;
+            self.dist_hc_built = false;
         }
         if treat_last_block_as_error && bfinal {
             return Err(BlockError::UnexpectedLastBlock);
@@ -1178,14 +1197,54 @@ impl Block {
         pure_inflate_decode
     ))]
     fn build_huffman_luts_for_block(&mut self) -> Result<(), BlockError> {
+        // Builds ONLY the literal/length LUT (the clean contig hot loop's table
+        // + the ISA-L multi-symbol packing). The distance decoder `dist_hc` is
+        // built LAZILY by `ensure_dist_hc` only where it is actually read (the
+        // ring/marker loops + the contig `!dist_valid` fallback), so the clean
+        // contig production path — which decodes distance via `asm.dist`
+        // (`ensure_dist_table`) — does not pay a redundant second distance
+        // build. Converges toward igzip's single inline distance table
+        // (`make_inflate_huff_code_dist`, igzip_inflate.c).
         match self.compression_type {
             CompressionType::FixedHuffman => {
                 if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
-                // Vendor parity (gzip/deflate.hpp:336): distance via the cached
-                // reversed-bits decoder, not the ISA-L LUT. Mirror of the canonical
-                // fallback build at :1516-1519.
+            }
+            CompressionType::DynamicHuffman => {
+                let split = self.literal_code_count;
+                let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
+                lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
+                if !self.lut_litlen_rebuild(&lit_stack[..split]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+            }
+            CompressionType::Uncompressed | CompressionType::Reserved => {}
+        }
+        Ok(())
+    }
+
+    /// Build the reversed-bits distance decoder (`dist_hc`) for the current
+    /// block, lazily and at most once (latched by `dist_hc_built`, reset per
+    /// header). Split out of `build_huffman_luts_for_block` so the clean CONTIG
+    /// production path — which decodes distance via the libdeflate-shape
+    /// `asm.dist` `DistTable`, never `dist_hc` — does NOT pay this per-block
+    /// build. Called by the ring/marker decode paths
+    /// (`read_internal_compressed_specialized` and its `decode_*` loops) and the
+    /// contig `!dist_valid` fallback, the only readers of `dist_hc`.
+    ///
+    /// Vendor parity (gzip/deflate.hpp:336): distance via the cached
+    /// reversed-bits decoder. Mirror of the canonical fallback build at
+    /// :1516-1519. Distance lengths come from the SAME source the eager build
+    /// used (FixedHuffman → `FIXED_DIST_LENGTHS`; DynamicHuffman → the dist
+    /// slice of `literal_cl`) ⇒ byte-identical to the prior eager build.
+    #[cfg(pure_inflate_decode)]
+    fn ensure_dist_hc(&mut self) -> Result<(), BlockError> {
+        if self.dist_hc_built {
+            return Ok(());
+        }
+        match self.compression_type {
+            CompressionType::FixedHuffman => {
                 if self
                     .dist_hc
                     .initialize_from_lengths(&FIXED_DIST_LENGTHS[..], false)
@@ -1197,16 +1256,8 @@ impl Block {
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
                 let end = split + self.distance_code_count;
-                let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
                 let mut dist_stack = [0u8; MAX_DISTANCE_SYMBOL_COUNT + 2];
-                lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
                 dist_stack[..end - split].copy_from_slice(&self.literal_cl[split..end]);
-                if !self.lut_litlen_rebuild(&lit_stack[..split]) {
-                    return Err(BlockError::InvalidCodeLengths);
-                }
-                // Vendor parity (gzip/deflate.hpp:336): distance via the cached
-                // reversed-bits decoder, not the ISA-L LUT. Mirror of the canonical
-                // fallback build at :1516-1519.
                 if self
                     .dist_hc
                     .initialize_from_lengths(&dist_stack[..end - split], false)
@@ -1217,6 +1268,7 @@ impl Block {
             }
             CompressionType::Uncompressed | CompressionType::Reserved => {}
         }
+        self.dist_hc_built = true;
         Ok(())
     }
 
@@ -1704,6 +1756,14 @@ impl Block {
                     self.build_huffman_luts_for_block()?;
                     self.block_huffman_luts_ready = true;
                 }
+                // The ring/marker decode loops dispatched below
+                // (`decode_clean_fast_loop`, `decode_marker_fast_loop`,
+                // `decode_careful_tail`) decode distance via `dist_hc`, so it
+                // must be built here. The eager build in `read_header` no longer
+                // does it (so the clean contig path can skip it); build it
+                // lazily now, latched so the per-block cost is paid once.
+                #[cfg(pure_inflate_decode)]
+                self.ensure_dist_hc()?;
             }
             _ => return Err(BlockError::InvalidCompression),
         }
@@ -2943,6 +3003,15 @@ impl Block {
         // fresh_build`, `contig_clean_stream_multi_block_dist_reuse`).
         #[cfg(pure_inflate_decode)]
         self.ensure_dist_table();
+        // The contig loops decode distance via `asm.dist` (built above). They
+        // only fall back to `dist_hc` when `asm.dist` declined the lengths
+        // (`!dist_valid` — invalid dist code, unreachable on a valid stream).
+        // Build `dist_hc` for that fallback ONLY in that case, so a clean block
+        // with a valid dist table pays no redundant `dist_hc` build.
+        #[cfg(pure_inflate_decode)]
+        if !self.dist_valid {
+            self.ensure_dist_hc()?;
+        }
 
         const MAX_LIT_LEN_SYM: u32 = 512;
         const MAX_RUN_LENGTH: usize = 258;
@@ -3665,28 +3734,56 @@ impl Block {
                 if length == 0 {
                     break;
                 }
-                let dsym = match self.dist_hc.decode(bits) {
-                    Some(d) => d,
-                    None => commit!(Err(BlockError::InvalidHuffmanCode)),
-                };
-                super::slow_knob::inject_localize(dec_spin, dec_yield);
-                if dsym as usize >= DISTANCE_BASE.len() {
-                    commit!(Err(BlockError::InvalidHuffmanCode));
-                }
-                let extra = DISTANCE_EXTRA[dsym as usize] as u32;
-                let distance = if extra > 0 {
-                    if bits.available() < extra {
-                        bits.refill();
-                        if bits.available() < extra {
-                            commit!(Err(BlockError::EndOfFile));
-                        }
+                // Distance via the SAME single libdeflate-shape `asm.dist`
+                // `DistTable` the fast loop uses (converges on igzip's single
+                // inline distance table; lets clean blocks skip the redundant
+                // `dist_hc` build). Byte-identical to the `dist_hc` walk
+                // (`dist_table_matches_dist_hc_differential`). `dist_hc` stays
+                // as the `!dist_valid` fallback (unreachable on a valid stream).
+                let distance = if self.dist_valid {
+                    use crate::decompress::inflate::libdeflate_entry::DistTable;
+                    let dt = &self.asm.dist;
+                    bits.refill();
+                    let mut dist_entry = dt.lookup(bits.bitbuf);
+                    if dist_entry.is_subtable_ptr() {
+                        bits.consume(DistTable::TABLE_BITS as u32);
+                        dist_entry = dt.lookup_subtable_direct(dist_entry, bits.bitbuf);
                     }
-                    let mask = (1u64 << extra) - 1;
-                    let v = (bits.peek() & mask) as usize;
-                    bits.consume(extra);
-                    DISTANCE_BASE[dsym as usize] as usize + v
+                    let dist_raw = dist_entry.raw();
+                    // raw == 0 is the unassigned/invalid-code marker (codes
+                    // 30/31 + incomplete-code holes) — the exact set
+                    // `dist_hc.decode` returns `None` for.
+                    if dist_raw == 0 {
+                        commit!(Err(BlockError::InvalidHuffmanCode));
+                    }
+                    let dist_extra_saved = bits.bitbuf;
+                    bits.consume_entry(dist_raw);
+                    super::slow_knob::inject_localize(dec_spin, dec_yield);
+                    dist_entry.decode_distance(dist_extra_saved) as usize
                 } else {
-                    DISTANCE_BASE[dsym as usize] as usize
+                    let dsym = match self.dist_hc.decode(bits) {
+                        Some(d) => d,
+                        None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                    };
+                    super::slow_knob::inject_localize(dec_spin, dec_yield);
+                    if dsym as usize >= DISTANCE_BASE.len() {
+                        commit!(Err(BlockError::InvalidHuffmanCode));
+                    }
+                    let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                    if extra > 0 {
+                        if bits.available() < extra {
+                            bits.refill();
+                            if bits.available() < extra {
+                                commit!(Err(BlockError::EndOfFile));
+                            }
+                        }
+                        let mask = (1u64 << extra) - 1;
+                        let v = (bits.peek() & mask) as usize;
+                        bits.consume(extra);
+                        DISTANCE_BASE[dsym as usize] as usize + v
+                    } else {
+                        DISTANCE_BASE[dsym as usize] as usize
+                    }
                 };
                 if distance == 0 || distance > MAX_WINDOW_SIZE {
                     commit!(Err(BlockError::ExceededWindowRange));
