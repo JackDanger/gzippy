@@ -111,6 +111,7 @@ type LiteralLoopFn = unsafe extern "sysv64" fn(
     input_len: u64,
 ) -> i32;
 
+#[allow(dead_code)] // reserved for the layered-LUT main-table mask; not yet wired
 const MAIN_MASK: u64 = (1u64 << 12) - 1; // 0x0FFF for 12-bit main table
 
 /// Emit the literal-only inner loop. Reads bits from bitbuf, looks up

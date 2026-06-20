@@ -182,6 +182,13 @@ impl ShiftRegisterWidth {
 /// and packs them contiguously. For DEFLATE this is useful in the
 /// extras decode (length-extra + dist-extra) where the byte stream
 /// has the extras at known bit positions per code-length.
+///
+/// # Safety
+///
+/// Pure-register BMI2 intrinsic with no memory operands; it is `unsafe`
+/// only because `_pext_u64` is an arch intrinsic. Safe to call on any
+/// inputs when the build targets a BMI2-capable CPU (guaranteed by the
+/// `target_feature = "bmi2"` cfg gating this definition).
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline(always)]
 pub unsafe fn pext_u64(src: u64, mask: u64) -> u64 {
