@@ -52,6 +52,32 @@ mod isal_kernel {
 
 const TARGET_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Byte offset where the deflate body begins (mirror of block_walker.rs:78-98).
+fn gzip_header_end(gz: &[u8]) -> usize {
+    let flg = gz[3];
+    let mut header_end = 10;
+    if flg & 0x04 != 0 {
+        let xlen = u16::from_le_bytes([gz[header_end], gz[header_end + 1]]) as usize;
+        header_end += 2 + xlen;
+    }
+    if flg & 0x08 != 0 {
+        while header_end < gz.len() && gz[header_end] != 0 {
+            header_end += 1;
+        }
+        header_end += 1;
+    }
+    if flg & 0x10 != 0 {
+        while header_end < gz.len() && gz[header_end] != 0 {
+            header_end += 1;
+        }
+        header_end += 1;
+    }
+    if flg & 0x02 != 0 {
+        header_end += 2;
+    }
+    header_end
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("FATAL: {msg}");
     std::process::exit(2);
@@ -101,23 +127,14 @@ fn build_real_block() -> (Vec<u8>, u64, Vec<u8>) {
     let gz = enc.finish().unwrap();
 
     let blocks = walk_block_boundaries(&gz).unwrap_or_else(|e| die(&format!("walk: {e}")));
-    // First dynamic-Huffman block.
-    let blk = blocks
-        .iter()
-        .find(|b| b.btype == 2)
-        .unwrap_or_else(|| die("no dynamic block produced"));
+    // walk_block_boundaries returns start_bit RELATIVE TO THE DEFLATE BODY
+    // (`deflate = &gz[header_end..len-8]`, block_walker.rs:98). Both kernels
+    // consume RAW deflate, so we strip the gzip header+trailer and return the
+    // deflate body; start_bit is then directly the bit cursor into it.
+    let header_end = gzip_header_end(&gz);
+    let deflate = gz[header_end..gz.len() - 8].to_vec();
 
-    // The deflate body lives inside `gz` after the gzip header. walk gives bit
-    // offsets relative to the START of the gzip stream. The kernels consume RAW
-    // deflate. We hand both kernels the FULL gzip bytes as the data buffer and
-    // position the bit cursor at `blk.start_bit` (gz run_contig via Bits) / set
-    // up igzip on the raw deflate region. To keep igzip byte-aligned, we REQUIRE
-    // the first dynamic block to start byte-aligned within the deflate body.
-    //
-    // The gzip header is a whole number of bytes; the deflate body starts at a
-    // byte boundary. The FIRST deflate block's header is at deflate-body bit 0,
-    // i.e. byte-aligned. We use the FIRST block and require it to be dynamic.
-    let _ = blk;
+    // Use the FIRST block; require it dynamic (byte-aligned at deflate bit 0).
     let first = &blocks[0];
     if first.btype != 2 {
         die("first block is not dynamic — adjust slice/level");
@@ -130,8 +147,8 @@ fn build_real_block() -> (Vec<u8>, u64, Vec<u8>) {
     let block_out_len = first.decoded_bytes as usize;
     let block_output = full[..block_out_len].to_vec();
 
-    // start_bit for the FIRST block == deflate-body-start bit (byte-aligned).
-    (gz, first.start_bit, block_output)
+    // start_bit for the FIRST block == deflate-body-start bit (== 0, byte-aligned).
+    (deflate, first.start_bit, block_output)
 }
 
 /// ARM A — gz production clean-contig kernel, looped, tables built once.
