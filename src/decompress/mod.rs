@@ -450,6 +450,22 @@ fn decompress_single_member_for<W: Write>(
             )
             .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
             writer.flush()?;
+            // Gate-0 non-inert proof for the engine-A clean-path fastloop
+            // wire-in: dump the calls/bytes it actually decoded (process-global).
+            #[cfg(all(
+                pure_inflate_decode,
+                not(all(feature = "asm-kernel", target_arch = "x86_64"))
+            ))]
+            if crate::utils::debug_enabled() {
+                use std::sync::atomic::Ordering::Relaxed;
+                eprintln!(
+                    "[gzippy] flat_contig calls={} bytes={}",
+                    crate::decompress::inflate::consume_first_decode::FLAT_CONTIG_CALLS
+                        .load(Relaxed),
+                    crate::decompress::inflate::consume_first_decode::FLAT_CONTIG_BYTES
+                        .load(Relaxed),
+                );
+            }
             Ok(n)
         }
         DecodePath::StoredParallel => {
