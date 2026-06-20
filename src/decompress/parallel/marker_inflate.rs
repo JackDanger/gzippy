@@ -679,6 +679,23 @@ pub struct Block {
     /// fallback — the sole readers of `dist_hc`. Reset per header.
     #[cfg(pure_inflate_decode)]
     dist_hc_built: bool,
+    /// Flat libdeflate-style litlen table (engine A) for the CLEAN contig
+    /// fastloop wire-in. Built per DynamicHuffman block from `literal_cl` and
+    /// CACHED across blocks (rebuilt only when the lengths change — same scheme
+    /// as `dist_table_lens`); FixedHuffman uses the process-wide static
+    /// `get_fixed_tables().0` and leaves this `None`. Only present on the
+    /// pure-Rust clean path that runs the flat fastloop.
+    #[cfg(all(
+        pure_inflate_decode,
+        not(all(feature = "asm-kernel", target_arch = "x86_64"))
+    ))]
+    flat_litlen: Option<crate::decompress::inflate::libdeflate_entry::LitLenTable>,
+    /// Litlen code lengths the cached `flat_litlen` was built from (cache key).
+    #[cfg(all(
+        pure_inflate_decode,
+        not(all(feature = "asm-kernel", target_arch = "x86_64"))
+    ))]
+    flat_litlen_lens: Vec<u8>,
 }
 
 #[cfg(parallel_sm)]
@@ -759,6 +776,16 @@ impl Block {
             block_huffman_luts_ready: false,
             #[cfg(pure_inflate_decode)]
             dist_hc_built: false,
+            #[cfg(all(
+                pure_inflate_decode,
+                not(all(feature = "asm-kernel", target_arch = "x86_64"))
+            ))]
+            flat_litlen: None,
+            #[cfg(all(
+                pure_inflate_decode,
+                not(all(feature = "asm-kernel", target_arch = "x86_64"))
+            ))]
+            flat_litlen_lens: Vec::new(),
         }
     }
 
@@ -2919,6 +2946,52 @@ impl Block {
         }
     }
 
+    /// Build/cache the flat libdeflate-style litlen table (engine A) for the
+    /// CLEAN contig fastloop wire-in. DynamicHuffman: build from
+    /// `literal_cl[..literal_code_count]`, cached on `flat_litlen` keyed by
+    /// `flat_litlen_lens` (rebuild only when lengths change — same amortization
+    /// as `ensure_dist_table`). FixedHuffman: leaves `flat_litlen = None`; the
+    /// caller uses the process-wide static `get_fixed_tables().0`.
+    ///
+    /// Returns `true` if a usable table is available (static-fixed or cached).
+    #[cfg(all(
+        pure_inflate_decode,
+        not(all(feature = "asm-kernel", target_arch = "x86_64"))
+    ))]
+    fn ensure_flat_litlen(&mut self) -> bool {
+        use crate::decompress::inflate::libdeflate_entry::LitLenTable;
+        match self.compression_type {
+            CompressionType::FixedHuffman => {
+                // Static process-wide fixed table; nothing to build.
+                self.flat_litlen = None;
+                true
+            }
+            CompressionType::DynamicHuffman => {
+                let split = self.literal_code_count;
+                let lens = &self.literal_cl[..split];
+                let reusable =
+                    self.flat_litlen.is_some() && self.flat_litlen_lens.as_slice() == lens;
+                if reusable {
+                    return true;
+                }
+                match LitLenTable::build(lens) {
+                    Some(t) => {
+                        self.flat_litlen_lens.clear();
+                        self.flat_litlen_lens.extend_from_slice(lens);
+                        self.flat_litlen = Some(t);
+                        true
+                    }
+                    None => {
+                        self.flat_litlen = None;
+                        self.flat_litlen_lens.clear();
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// COPY-FREE-TO-FINAL (Stage 1) clean-phase decode into a CONTIGUOUS buffer.
     ///
     /// The faithful vendor `setInitialWindow` model: the post-flip clean
@@ -3103,6 +3176,112 @@ impl Block {
                 self.decoded_bytes += emitted;
                 return __r;
             }};
+        }
+
+        // ── ENGINE A (flat libdeflate-style) BULK FASTLOOP wire-in ───────────
+        // STEP-0.5 verdict: the flat decoder (`decode_huffman_libdeflate_style`)
+        // beats the two-level engine-B loop below 2.07–3.84× instr/B on gzippy's
+        // own primitives. Run engine A's BOUNDED fastloop here to consume the
+        // BULK of the block straight into the contiguous tail; it exits at a
+        // clean SYMBOL boundary ≥ FASTLOOP_MARGIN (320) bytes before the budget,
+        // hands a CANONICAL re-read `Bits` (the N32-safe reclass_reread seam —
+        // `bit_position()` → `at_bit_offset`) to the engine-B careful tail below,
+        // which finishes the <320-byte residual + the exact `n_max`/`out_room`
+        // boundary + EOB (already resumable + byte-exact). So engine A never
+        // lands on the resumable boundary itself — the seam risk stays with the
+        // proven engine-B tail.
+        //
+        // Gated OFF whenever a measurement knob / oracle / backref-tracking is
+        // active (those instruments must keep measuring the engine-B path, and
+        // engine A implements none of them). Compiled out on x86 WITH the BMI2
+        // asm kernel (design §3: x86 asm path untouched); present on aarch64 and
+        // on the x86 asm-OFF cross-ISA-LAW arm.
+        #[cfg(all(
+            pure_inflate_decode,
+            not(all(feature = "asm-kernel", target_arch = "x86_64"))
+        ))]
+        {
+            use crate::decompress::inflate::consume_first_decode::{
+                decode_huffman_fastloop_bounded, FlatFastloopExit, FLAT_CONTIG_BYTES,
+                FLAT_CONTIG_CALLS,
+            };
+            let flat_eligible = flat_clean_enabled()
+                && slow_spin == 0
+                && !slow_yield
+                && dec_spin == 0
+                && st_spin == 0
+                && !oracle_nostore
+                && orec.is_none()
+                && !prof_on
+                && !self.track_backreferences
+                && self.dist_valid
+                && local_cap > 0;
+            if flat_eligible && self.ensure_flat_litlen() {
+                let out_fastloop_end = *pos + local_cap;
+                // SAFETY: `base` is valid for `[0, cap)` (caller contract). The
+                // fastloop bound is `out_fastloop_end = *pos + local_cap ≤
+                // out_room = cap - (MAX_RUN_LENGTH+8)`, and a single iteration's
+                // copy/8-literal overshoot past the bound is ≤ MAX_RUN_LENGTH+40
+                // < the reserved 266 headroom, so every store stays `< cap`.
+                let out_slice = unsafe { std::slice::from_raw_parts_mut(base, cap) };
+                let fixed_tbl;
+                let litlen_ref = match self.compression_type {
+                    CompressionType::FixedHuffman => {
+                        fixed_tbl =
+                            crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
+                        &fixed_tbl.0
+                    }
+                    // ensure_flat_litlen() returned true ⇒ Some for Dynamic.
+                    _ => self.flat_litlen.as_ref().unwrap(),
+                };
+                let exit = decode_huffman_fastloop_bounded(
+                    bits,
+                    out_slice,
+                    *pos,
+                    out_fastloop_end,
+                    litlen_ref,
+                    &self.asm.dist,
+                );
+                FLAT_CONTIG_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Canonical seam re-read: rebuild a pristine `Bits` from the
+                // absolute bit position so the engine-B tail / next read_header
+                // never sees engine A's internal bit representation.
+                let reread = |bits: &mut Bits| {
+                    let data = bits.data;
+                    let bp = bits.bit_position();
+                    *bits = Bits::at_bit_offset(data, bp);
+                };
+                match exit {
+                    FlatFastloopExit::EndOfBlock(new_pos) => {
+                        let delta = new_pos - *pos;
+                        *pos = new_pos;
+                        emitted += delta;
+                        FLAT_CONTIG_BYTES
+                            .fetch_add(delta as u64, std::sync::atomic::Ordering::Relaxed);
+                        self.at_end_of_block = true;
+                        reread(bits);
+                        commit!(Ok(emitted));
+                    }
+                    FlatFastloopExit::Stopped(new_pos) => {
+                        let delta = new_pos - *pos;
+                        *pos = new_pos;
+                        emitted += delta;
+                        FLAT_CONTIG_BYTES
+                            .fetch_add(delta as u64, std::sync::atomic::Ordering::Relaxed);
+                        reread(bits);
+                        // fall through to the engine-B careful tail below.
+                    }
+                    FlatFastloopExit::InvalidDistance(new_pos) => {
+                        let delta = new_pos - *pos;
+                        *pos = new_pos;
+                        emitted += delta;
+                        FLAT_CONTIG_BYTES
+                            .fetch_add(delta as u64, std::sync::atomic::Ordering::Relaxed);
+                        reread(bits);
+                        commit!(Err(BlockError::ExceededWindowRange));
+                    }
+                }
+            }
         }
 
         // ── SPECULATIVE SOFTWARE-PIPELINED FAST LOOP (contig clean) ──────────
@@ -4153,6 +4332,20 @@ const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_S
 fn dist_amort_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("GZIPPY_DIST_AMORT").is_ok_and(|v| v == "0"))
+}
+
+/// Byte-transparent kill-switch for the engine-A flat clean-contig fastloop
+/// wire-in (default ON). `GZIPPY_FLAT_CLEAN=0` routes the clean contig path back
+/// to the engine-B two-level loop with IDENTICAL output, so the same binary can
+/// A/B engine A vs engine B (controls for code layout). Compiled only where the
+/// wire-in exists.
+#[cfg(all(
+    pure_inflate_decode,
+    not(all(feature = "asm-kernel", target_arch = "x86_64"))
+))]
+fn flat_clean_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("GZIPPY_FLAT_CLEAN").is_ok_and(|v| v == "0"))
 }
 
 /// NIGHT35 (re-added NIGHT28/NIGHT33 perturbation at HEAD): per-block
