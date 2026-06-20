@@ -224,6 +224,29 @@ fn run_arm_a(gz: &[u8], start_bit: u64, oracle: &[u8], reps: u64) {
             oracle.len()
         ));
     }
+    // NIGHT32 Gate-0(c) non-inert: if GZIPPY_STATELESS_KERNEL=1 the wrapper
+    // routes to run_contig_stateless; prove it executed (entries > 0) AND that
+    // it stayed byte-exact (the mismatch check above already ran). If the env
+    // var is set but entries == 0 the stateless path was inert (it would
+    // silently measure the resumable kernel) — fail loudly.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let stateless_req = std::env::var("GZIPPY_STATELESS_KERNEL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let entries = gzippy::decompress::parallel::asm_kernel::stateless_entries();
+        if stateless_req && entries == 0 {
+            die("ARM A: GZIPPY_STATELESS_KERNEL=1 set but stateless kernel never entered (INERT)");
+        }
+        if !stateless_req && entries != 0 {
+            die("ARM A: stateless kernel entered without the env flag (dispatch bug)");
+        }
+        eprintln!(
+            "ARM A Gate-0: byte-exact vs flate2 OK ({produced} bytes/block); asm_kernel enabled={} stateless_req={stateless_req} stateless_entries(warm)={entries}",
+            asm_enabled(),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     eprintln!(
         "ARM A Gate-0: byte-exact vs flate2 OK ({} bytes/block); asm_kernel enabled={}",
         produced,
