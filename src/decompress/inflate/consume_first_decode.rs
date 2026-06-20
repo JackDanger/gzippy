@@ -1149,6 +1149,118 @@ pub static FLAT_CONTIG_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// Companion byte counter (bytes emitted by the bounded flat fastloop).
 pub static FLAT_CONTIG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Non-inert Gate-0 counter: every call to the engine-A flat CLEAN *careful
+/// tail* (`decode_clean_careful_flat`, wired into the parallel-SM clean contig
+/// path to finish the <FASTLOOP_MARGIN residual + the exact `n_max`/EOB
+/// boundary that the bounded fastloop stops short of) increments this. A
+/// positive count PROVES the clean path is 100% engine A — the engine-B
+/// two-level careful loop no longer runs on the clean path.
+pub static FLAT_CAREFUL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Non-inert Gate-0 counter: every time the parallel-SM clean contig path
+/// FALLS BACK to building the engine-B two-level `lut_litlen` table (i.e. the
+/// flat engine A did NOT take the block). On a pure-clean run this stays 0,
+/// PROVING the double table-build is gone from the clean path.
+pub static CLEAN_LUT_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Outcome of one bounded flat-CLEAN careful-tail call.
+pub enum FlatCarefulExit {
+    /// Reached HUFFDEC_END_OF_BLOCK; `out_pos` is the byte just past EOB.
+    EndOfBlock(usize),
+    /// `out_pos` reached the `n_max`/`out_room` cap at a clean SYMBOL boundary
+    /// (`bits` left consistent — `bit_position()` is exact). The block is NOT
+    /// finished; the caller resumes from `bits` next call.
+    Stopped(usize),
+    /// Decoded an invalid backref distance (distance==0 or > available output).
+    /// All `out_pos` bytes so far are valid; the caller surfaces a terminal
+    /// error after committing them.
+    InvalidDistance(usize),
+}
+
+/// Engine A's flat, RESUMABLE, CLEAN careful tail — the per-symbol decode that
+/// finishes a block after [`decode_huffman_fastloop_bounded`] stops short of the
+/// budget (by FASTLOOP_MARGIN) or runs out of input margin. It is byte-for-byte
+/// the SAME per-symbol decode as [`decode_huffman_cf`]'s generic loop (the
+/// proven production careful decode used by bgzf / scan_inflate / multi-member),
+/// using the SAME flat `LitLenTable` / `DistTable` the bounded fastloop uses, so
+/// the seam between the two is byte-exact BY CONSTRUCTION (identical tables,
+/// identical entry-decode helpers, resuming from the canonical re-read `bits`).
+///
+/// Contract differences from `decode_huffman_cf` that make it the parallel-SM
+/// CLEAN careful tail (replacing engine B's two-level careful loop):
+///   * **Bounded + resumable.** Yields [`FlatCarefulExit::Stopped`] when
+///     `out_pos >= out_cap_end` at a symbol boundary instead of running to
+///     `output.len()`. This mirrors engine B's `while emitted < local_cap`
+///     exactly: the cap is checked at the TOP of each iteration, so ONE full
+///     symbol may overshoot `out_cap_end` by ≤ `MAX_RUN_LENGTH-1` bytes — the
+///     identical overshoot semantics engine B had, which the caller's `out_room`
+///     reservation (`cap - MAX_RUN_LENGTH - 8`) keeps in-bounds.
+///   * **Exit enum, not Result.** EOB → `EndOfBlock`; a bad backref →
+///     `InvalidDistance` (the caller maps it to a terminal `BlockError`). No
+///     fallback hides the error.
+///   * **`copy_match_safe`** (byte-by-byte, no copy overshoot) so a backref
+///     landing at the cap never writes past the reserved headroom.
+///
+/// # Safety / bounds
+/// `output.len() >= out_cap_end + MAX_RUN_LENGTH` so a full backref at the cap
+/// stays in-bounds (the caller passes `out_cap_end <= cap - MAX_RUN_LENGTH - 8`).
+pub(crate) fn decode_clean_careful_flat(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    out_cap_end: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> FlatCarefulExit {
+    FLAT_CAREFUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        // Resumable cap: yield at a clean symbol boundary (block NOT finished).
+        if out_pos >= out_cap_end {
+            return FlatCarefulExit::Stopped(out_pos);
+        }
+        // Always refill at the top — handles end-of-input gracefully (mirror of
+        // `decode_huffman_cf`'s generic loop).
+        bits.refill();
+        let mut saved_bitbuf = bits.peek();
+        let mut entry = litlen.lookup(saved_bitbuf);
+        if entry.is_subtable_ptr() {
+            bits.consume(LitLenTable::TABLE_BITS as u32);
+            entry = litlen.lookup_subtable(entry, saved_bitbuf);
+            saved_bitbuf = bits.peek();
+            bits.consume_entry(entry.raw());
+        } else {
+            bits.consume_entry(entry.raw());
+        }
+
+        if (entry.raw() as i32) < 0 {
+            // LITERAL. `out_pos < out_cap_end <= output.len()` (top guard).
+            output[out_pos] = entry.literal_value();
+            out_pos += 1;
+            continue;
+        }
+
+        if entry.is_end_of_block() {
+            return FlatCarefulExit::EndOfBlock(out_pos);
+        }
+
+        // LENGTH code — decode from saved_bitbuf, then DISTANCE.
+        let length = entry.decode_length(saved_bitbuf);
+        bits.refill();
+        let dist_saved = bits.peek();
+        let mut dist_entry = dist.lookup(dist_saved);
+        if dist_entry.is_subtable_ptr() {
+            bits.consume(DistTable::TABLE_BITS as u32);
+            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+        }
+        let dist_extra_saved = bits.peek();
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_extra_saved);
+        if distance == 0 || distance as usize > out_pos {
+            return FlatCarefulExit::InvalidDistance(out_pos);
+        }
+        out_pos = copy_match_safe(output, out_pos, distance, length);
+    }
+}
+
 /// Outcome of one bounded-flat-fastloop call.
 pub enum FlatFastloopExit {
     /// Reached HUFFDEC_END_OF_BLOCK; `out_pos` is the byte just past EOB.
@@ -3102,6 +3214,125 @@ mod tests {
         while k < block_out {
             check_budget(k);
             k += 97;
+        }
+    }
+
+    /// SEAM DIFFERENTIAL for the engine-A flat CLEAN *careful tail*
+    /// (`decode_clean_careful_flat`) — the convergence that makes the parallel-SM
+    /// clean path 100% engine A (no engine-B two-level careful loop). Two arms:
+    ///   (A) fastloop(k) → Stopped → canonical re-read → careful tail to EOB must
+    ///       reproduce the FULL block, for EVERY budget `k` (the cap lands at
+    ///       every intra-batch offset / mid-back-ref / EOB);
+    ///   (B) the careful tail's OWN resumable cap: drive the whole block through
+    ///       the careful tail alone in tiny `out_cap_end` steps (1,2,3,7,17,64,
+    ///       259 bytes) with a canonical re-read between calls — concatenation
+    ///       must equal the oracle and reach EOB exactly. A mid-symbol cap bug or
+    ///       a seam desync is caught here, invisible to a coarse sha grid.
+    #[test]
+    fn seam_flat_careful_tail_byte_exact_and_resumable() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut data: Vec<u8> = Vec::with_capacity(120_000);
+        let mut x: u32 = 0x1234_5678;
+        for i in 0..120_000usize {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if i % 64 < 40 {
+                data.push((x >> 24) as u8 & 0x1F);
+            } else {
+                data.push(b"the quick brown fox "[i % 20]);
+            }
+        }
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(&data).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let mut hbits = Bits::at_bit_offset(&deflate, 0);
+        hbits.refill();
+        let btype = ((hbits.peek() >> 1) & 3) as u8;
+        assert_eq!(btype, 2, "first block must be dynamic for this test");
+        hbits.consume(3);
+        let (ll, dl) = parse_dynamic_header(&mut hbits).expect("parse dynamic header");
+        let litlen = LitLenTable::build(&ll).expect("LitLenTable::build");
+        let dist = DistTable::build(&dl).expect("DistTable::build");
+        let body_bit = hbits.bit_position();
+
+        let mut oracle = vec![0u8; data.len() + 1024];
+        let mut obits = Bits::at_bit_offset(&deflate, body_bit);
+        let block_out =
+            decode_flat_clean_pub(&mut obits, &mut oracle, 0, &litlen, &dist).expect("oracle");
+        oracle.truncate(block_out);
+        assert!(block_out > 4_000, "block too small");
+
+        const FASTLOOP_MARGIN: usize = 320;
+        let cap = block_out + 1024;
+        // > block_out so the careful tail decodes the EOB symbol (no output).
+        let eob_cap_end = block_out + 512;
+
+        // (A) fastloop → careful-tail completion at every budget.
+        let check = |k: usize| {
+            let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+            let mut out = vec![0u8; cap];
+            let start =
+                match decode_huffman_fastloop_bounded(&mut bits, &mut out, 0, k, &litlen, &dist) {
+                    FlatFastloopExit::EndOfBlock(p) => {
+                        assert_eq!(p, block_out, "fastloop EOB count k={k}");
+                        assert_eq!(&out[..p], &oracle[..], "fastloop EOB bytes k={k}");
+                        return;
+                    }
+                    FlatFastloopExit::Stopped(p) => {
+                        let bp = bits.bit_position();
+                        bits = Bits::at_bit_offset(&deflate, bp); // canonical re-read seam
+                        p
+                    }
+                    FlatFastloopExit::InvalidDistance(p) => panic!("invalid dist k={k} p={p}"),
+                };
+            match decode_clean_careful_flat(&mut bits, &mut out, start, eob_cap_end, &litlen, &dist)
+            {
+                FlatCarefulExit::EndOfBlock(p) => {
+                    assert_eq!(p, block_out, "careful EOB count k={k}");
+                    assert_eq!(&out[..p], &oracle[..], "careful bytes k={k}");
+                }
+                FlatCarefulExit::Stopped(p) => panic!("careful never reached EOB k={k} p={p}"),
+                FlatCarefulExit::InvalidDistance(p) => panic!("careful invalid dist k={k} p={p}"),
+            }
+        };
+        let lo = block_out.saturating_sub(FASTLOOP_MARGIN + 258 + 64);
+        for k in lo..=(block_out + FASTLOOP_MARGIN + 64) {
+            check(k);
+        }
+        let mut k = 1usize;
+        while k < block_out {
+            check(k);
+            k += 97;
+        }
+
+        // (B) careful tail's own resumable cap, tiny steps, whole block.
+        for step in [1usize, 2, 3, 7, 17, 64, 259] {
+            let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+            let mut out = vec![0u8; cap];
+            let mut pos = 0usize;
+            loop {
+                let cap_end = (pos + step).min(eob_cap_end);
+                match decode_clean_careful_flat(&mut bits, &mut out, pos, cap_end, &litlen, &dist) {
+                    FlatCarefulExit::Stopped(p) => {
+                        assert!(p >= pos, "step {step}: regressed");
+                        assert_eq!(&out[pos..p], &oracle[pos..p], "step {step} prefix at {pos}");
+                        pos = p;
+                        let bp = bits.bit_position();
+                        bits = Bits::at_bit_offset(&deflate, bp); // canonical re-read
+                    }
+                    FlatCarefulExit::EndOfBlock(p) => {
+                        assert_eq!(p, block_out, "step {step} EOB count");
+                        assert_eq!(&out[..p], &oracle[..], "step {step} EOB bytes");
+                        break;
+                    }
+                    FlatCarefulExit::InvalidDistance(p) => {
+                        panic!("step {step} invalid dist at {p}")
+                    }
+                }
+            }
         }
     }
 
