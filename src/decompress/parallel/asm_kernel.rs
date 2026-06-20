@@ -516,13 +516,13 @@ mod imp {
                 "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
                 // ── TRAILING EXTRACT (igzip 520-521), UNCONDITIONAL every
                 //    iteration: next_sym2 = (masked >> 8*(cnt-1)) & 0xFFFF. The
-                //    post-shrx & 0xFFFF stays — drops the displaced trailing
-                //    flag bit for cnt∈{1,2} (cnt=1: bit24; cnt=2: bit16) and
-                //    keeps a >255 length/EOB code; for cnt=3 the surviving bit24
-                //    is the legitimate sym3 bit-8. {t4} is the scratch shift.
+                //    post-shrx & 0xFFFF was DELETED (NIGHT34, igzip _04 0x38d25
+                //    convergence): the mask-once `and 0x1FFFFFF` clears class
+                //    bits 25-31 and the LUT build zero-fills unused symbol slots,
+                //    so bits above the trailing are already 0 for every cnt. {t4}
+                //    is the scratch shift.
                 "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
-                "shrx {t5}, {t1}, {t4}",
-                "and {t5:e}, 0xFFFF",                 // {t5} = trailing symbol
+                "shrx {t5}, {t1}, {t4}",              // {t5} = trailing (clean; NIGHT34 igzip _04 0x38d25 converge: & 0xFFFF removed)
                 // ── SPECULATIVE STORE + advance by cnt (igzip 518-519),
                 //    UNCONDITIONAL: store the masked {t1} (bits 0..24) directly
                 //    and advance dst by the full sym_count assuming a pure-
@@ -1065,8 +1065,7 @@ mod imp {
                 "and {t3:e}, 3",                      // cnt = sym_count (1/2/3) — KEPT LIVE
                 "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
                 "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
-                "shrx {t5}, {t1}, {t4}",
-                "and {t5:e}, 0xFFFF",                 // {t5} = trailing symbol
+                "shrx {t5}, {t1}, {t4}",              // {t5} = trailing (clean; NIGHT34 igzip _04 0x38d25 converge: & 0xFFFF removed)
                 "mov qword ptr [{dst}], {t1}",        // speculative 8-byte store
                 "add {dst}, {t3}",                    // advance by cnt
                 "shrx {bitbuf}, {bitbuf}, {bc}",      // consume by bc
@@ -1516,9 +1515,9 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         // BUILD-TIME trailing-class flag bit but the resulting predicate is
         // exactly `trailing >= 256` (lut_huffman flag invariant); this ref
         // extracts the trailing packed symbol the way the asm now does in the
-        // body. `& 0xFFFF` keeps a >255 length/EOB code and drops the displaced
-        // flag bit for cnt∈{1,2}.
-        let trailing = ((pre.symbol & 0x01FF_FFFF) >> (8 * (cnt - 1))) & 0xFFFF;
+        // body. The `& 0xFFFF` was removed (NIGHT34 igzip-converge): redundant
+        // given the 0x01FF_FFFF mask + the LUT build's zero-filled upper slots.
+        let trailing = (pre.symbol & 0x01FF_FFFF) >> (8 * (cnt - 1));
         // SPECULATIVE STORE + advance by cnt (asm 518-519), UNCONDITIONAL — the
         // packed literal bytes go down assuming a pure-literal pack; a trailing
         // length over-advances dst by 1 (fixed below with `*dst -= 1`).
