@@ -1,9 +1,43 @@
 # CLEAN-KERNEL-DESIGN — the converged clean-decode kernel (per-arch: x86 BMI2 / aarch64 NEON)
 
-Status: **DESIGN** (no kernel implementation in this turn — "fully design, then fully implement").
-Scope: **macOS-aarch64, NOT-YET-LAW cross-arch.** Every Deliverable-1 number is deterministic-
-instruction (Gate-0 self-validated, byte-exact, /dev/null both arms). Cross-ISA LAW requires the
-Intel **asm-OFF** pairing (designed in §5). No floor/settled/accept claim is made anywhere here.
+Status: **DESIGN — REVISED per STEP-0.5 (premise falsified; reframed to REUSE).**
+The pre-Step-0.5 premise ("BUILD a flat clean kernel from scratch") is FALSIFIED:
+gzippy ALREADY has a flat libdeflate-style decoder (engine A,
+`decode_huffman_libdeflate_style`, consume_first_decode.rs:632) and the Step-0.5 A/B
+proves it BEATS the production two-level clean path (engine B,
+`Block::decode_clean_into_contig`) 2.07–3.84× instr/B on real corpora and closes the
+ENTIRE +19.5/+11.69 aarch64 clean-core excess. So this turn's work product is no
+longer a from-scratch build — it is **WIRING engine A into the parallel-SM clean
+dispatch + resumable seam** (§1, §6). Full Step-0.5 results + Gate-0 evidence:
+`plans/STEP-0.5-RESULTS.md`.
+
+Scope: **macOS-aarch64, NOT-YET-LAW cross-arch.** Every Deliverable-1 and Step-0.5
+number is deterministic-instruction (Gate-0 self-validated, byte-exact, /dev/null /
+in-RAM both arms). Cross-ISA LAW requires the Intel **asm-OFF** pairing (designed in
+§5). No floor/settled/accept claim is made anywhere here.
+
+## STEP-0.5 A/B VERDICT (the re-ranking measurement that gates this build)
+
+Measured (macOS-aarch64, `examples/kernel_ab_aarch64.rs` + `kernel_ab_aarch64.py`,
+N=7, two-point R/2R marginal instr, byte-exact A==B==oracle, FLAT_DECODE_CALLS
+non-inert proof):
+
+| corpus | A (flat) instr/B | B (two-level) instr/B | B/A | A cyc/B | B cyc/B |
+|--------|-----------------:|----------------------:|----:|--------:|--------:|
+| webster | 8.374 | 17.306 | **2.067×** | 3.174 | 6.220 |
+| mozilla | 4.330 | 16.637 | **3.842×** | 2.018 | 4.716 |
+| lit_extreme (per-symbol) | 13.910 | 32.916 | **2.366×** | 6.332 | 12.639 |
+| backref_extreme (per-copy) | 0.626 | 0.814 | **1.301×** | 0.096 | 0.182 |
+
+- **Flat WINS on every corpus**, instr and cyc. On the per-symbol extreme engine A
+  (13.91) even BEATS libdeflate (16.47, Deliverable-1) and saves −19.0 instr/B vs
+  engine B — ≈ the whole +19.5 clean-core excess. The gap WAS the engine, and the
+  flat engine already exists.
+- **Table-width vs cadence/unpack:** HYPOTHESIS (unvalidated) — the dominant lever is
+  the engine STRUCTURE (two-level packed table + unpack branch-chain + double refill),
+  NOT table WIDTH (flat-11 libdeflate ≈ flat-12 engine A, both ~14–16 instr/B; the
+  two-level decoder is ~2× higher). An exact split needs a third engine (out of scope).
+  The design converges the whole flat bundle (= engine A) rather than over-betting the split.
 
 Subject binary: gzippy-native (FFI off), `cargo build --release --no-default-features --features
 gzippy-native`, path=ParallelSM, build-flavor=parallel-sm+pure (confirmed via GZIPPY_DEBUG=1).
@@ -74,36 +108,48 @@ that is a kernel modification (out of scope this turn) and the design below conv
   asm counterpart — it takes `decode_clean_fast_loop`. So the clean core is *shared pure-Rust in
   shape*; converging it advances both arches.
 
-### 1.2 libdeflate's clean fastloop (the blueprint — `vendor/libdeflate/lib/decompress_template.h`)
+### 1.2 The flat clean kernel ALREADY EXISTS — engine A (the thing to WIRE, not build)
 
-- **Flat masked litlen table**, `LITLEN_TABLEBITS=11` (`deflate_decompress.c:372`): one masked load
-  `entry = litlen_decode_table[bitbuf & litlen_tablemask]` per symbol (template :347/391/430).
-- **Single fused consume**: `saved_bitbuf=bitbuf; bitbuf>>=(u8)entry; bitsleft-=entry;` (:358-360) —
-  the whole entry subtracted from bitsleft (only low 8 bits matter under the refill watermark).
-- **3-literal lookahead** off ONE refill (:366-435): up to 3 literals + 1 match decoded between
-  refills, each preloading the NEXT entry before the consume so the dependent table load overlaps.
-- **`saved_bitbuf` extract** of length/offset extra bits (:496, :547) — no re-read of the bitstream.
-- **Flat masked offset table**, `OFFSET_TABLEBITS=8` (:374): one load `offset_decode_table[bitbuf &
-  BITMASK(OFFSET_TABLEBITS)]` (:505), subtable only on the exceptional flag.
-- **Contiguous output** `*out_next++` / wide word copy (:547-560), bounds checked ONLY in the loop
-  condition (`out_fastloop_end`, FASTLOOP_MAX_BYTES_WRITTEN headroom — template :52-53, macros
-  :280-295), never per symbol.
-- **One refill per iteration** amortized over ≥3 symbols (`REFILL_BITS_IN_FASTLOOP`,
-  `deflate_decompress.c:260`), bit budget statically proven by `CAN_CONSUME_AND_THEN_PRELOAD`.
+`decode_huffman_libdeflate_style` (consume_first_decode.rs:632) is a faithful
+libdeflate transliteration that gzippy ALREADY runs in production (bgzf /
+scan_inflate / multi-member). Step-0.5 proved it beats engine B 2.07–3.84× instr/B.
+Its libdeflate-shaped properties (all PRESENT today, mapped to
+`vendor/libdeflate/lib/decompress_template.h`):
 
-### 1.3 The converged target
+- **Flat masked litlen table** — `LitLenTable` with `TABLE_BITS = 12` (libdeflate_entry.rs:361),
+  one masked load `(*litlen_ptr.add(bitbuf & MASK)).raw()` per symbol (`lookup!`, :698-702).
+  NOTE: gzippy uses **12**, NOT libdeflate's 11 — and **12 is correct for arm64 M-series**
+  (the TABLE_BITS=13 attempt was falsified flat on arm64, libdeflate_entry.rs:364-371; Step-0.5
+  confirms flat-12 ≈ flat-11 libdeflate, ~14–16 instr/B). KEEP 12; the "=11" target is dropped.
+- **Single fused consume** — `consume!`/`huffdec!` macros: `saved=bitbuf; bitbuf>>=entry; bitsleft-=entry` (:724-744).
+- **Multi-literal lookahead** — up to **8** literals off batched refills (:777-933), NOT the "3"
+  the pre-Step-0.5 draft assumed (see §4 literal-count reconciliation). `saved_bitbuf` extract of
+  length/dist extra bits (:976, :1015-1037) — no bitstream re-read.
+- **Flat masked dist table** — `DistTable::lookup(bitbuf)` (:1012), subtable only on the exceptional flag.
+- **Contiguous output** `out_ptr.add(out_pos)` / `copy_match_fast` (:1050), bounds checked only in
+  the loop condition (`out_pos + FASTLOOP_MARGIN <= out_end`, FASTLOOP_MARGIN=320, :763), never per symbol.
+- **One refill per iteration** amortized over the literal batch (`refill_branchless_fast!`, :661-672),
+  with intermediate refills only inside the >4-literal batch.
 
-ONE clean kernel `decode_clean_contig` taking a **contiguous output region** + a `Bits` cursor,
-structurally a transliteration of `decompress_template.h:344-560`:
-- shared pure-Rust skeleton (flat-table decode, fused consume, 3-literal lookahead, saved_bitbuf
-  extract, single amortized refill, contiguous output with margin-bounded loop condition);
-- arch-specialized only at the **copy** (NEON `vld1q/vst1q` on aarch64; the existing MOVDQU path on
-  x86, `asm_kernel.rs` copy arm) and, on x86, the existing BMI2 asm body kept as the x86 spec of
-  the SAME contract;
-- the resumable/marker surplus moved OUT of the per-symbol path to the region boundary (§4).
+### 1.3 The converged target = engine A wired into the clean dispatch
 
-This is the "stateless clean-T1 kernel" (AMD-FREE-PATH Rank-2) given a concrete shape, AIMED by
-Deliverable 1 at the per-symbol path (the actual gap), not at the copy.
+Do NOT write a new `decode_clean_contig`. The converged clean kernel IS engine A
+(`decode_huffman_libdeflate_style`) plus its EXISTING resumable variant
+(`decode_huffman_body_resumable` / `resume_decode_dynamic_resumable`, resumable.rs:946-1007,
+which already handles mid-block yield + window-aware copies + EOB state transitions).
+The work is:
+- **WIRE** engine A as the parallel-SM CLEAN (`CONTAINS_MARKERS=false`) decode for
+  FixedHuffman/DynamicHuffman chunks, replacing the engine-B two-level contig loop
+  inside `decode_clean_into_contig` (marker_inflate.rs:3108+) and/or
+  `chunk_decode.rs:1695` (§6 sequences this);
+- arch-specialize ONLY the copy (engine A already calls NEON on aarch64 via
+  `copy_match_fast`/`simd_copy`; on x86 keep the existing BMI2 asm path as the x86 spec — §3/§4(iv));
+- handle the resumable `n_max_to_decode` boundary at the SEAM, not per symbol (§4) —
+  engine A's fastloop already breaks to a generic loop on margin; the seam re-reads
+  the bit cursor (`reclass_reread`-style) rather than carrying a per-iter anchor (N32-safe).
+
+This is the AMD-FREE-PATH Rank-2 "stateless clean-T1 kernel" — and Step-0.5 shows it
+is already built and already wins; the remaining cost is integration, not codegen.
 
 ---
 
@@ -125,32 +171,32 @@ vst1q_u8}` 16-byte overlapping stores (the libdeflate-shaped analog of the x86 M
 length-rounded `FASTLOOP_MAX_BYTES_WRITTEN` slop lets the copy overshoot without a per-iteration
 bound. Expected instr win small (+0.26 ceiling); cyc win the larger half (copy cyc ratio 1.5×).
 
-### (c) Huffman inner loop → flat-table + 3-literal lookahead + single amortized refill (THE big one)
-Today (`decode_clean_fast_loop` + `LutLitLenCode::decode`, `lut_huffman.rs:1068-1140`):
-- a **two-level ISA-L table** (short_code_lookup[12] + long_code_lookup) returning a PACKED multi-
-  symbol `DecodedSymbol{symbol, sym_count, bit_count}`, then a branch-heavy **inner unpack loop**
-  (`while remaining>0 { s>>=8; if code<=255||remaining>1 … }`, marker_inflate.rs:2500-2516);
-- **two refills per iteration** (top preload `bits.refill()` :2464 + bottom `bits.refill()` :2602,
-  plus `decode()`'s own `available()<32` refill, lut_huffman.rs:1072) → poor refill amortization;
-- per-symbol **ring wrap math** `dst_phys = pos % U8_RING_SIZE` + dual `out_ok && in_ok` bounds
-  (:2468-2471) + `record_backreference_for_sparsity` (:2595) — resumable/marker cost in the hot path.
+### (c) Huffman inner loop → USE engine A (already flat-table + multi-literal + single refill) (THE big one)
+Engine B today (the thing being REPLACED — `decode_clean_into_contig`'s inline loop +
+`LutLitLenCode::decode`):
+- a **two-level ISA-L table** returning a PACKED multi-symbol `DecodedSymbol{symbol, sym_count,
+  bit_count}`, then a branch-heavy **inner unpack loop** (`while remaining>0 { s>>=8; … }`,
+  marker_inflate.rs:2500-2516 for the ring variant; the contig variant's P3.2 chain is analogous);
+- **double refill cadence** (top preload + bottom refill, plus `decode()`'s own `available()<32`
+  refill) → poor amortization.
+- Step-0.5 measured this at 32.9 instr/B (per-symbol) vs engine A's 13.9 — a 2.37× tax.
 
-Converge to libdeflate's shape:
-1. **Flat masked litlen table** entry layout matching `decompress_template.h` (low 8 bits = consume
-   length; LITERAL flag; literal value in `entry>>16`; length base + extra-count in `entry>>8`;
-   EXCEPTIONAL flag for subtable/EOB). Build via a port of `build_decode_table`
-   (`deflate_decompress.c:722`, called for litlen at :1037, LITLEN_TABLEBITS=11). Drop the packed
-   multi-symbol unpack loop — replace with libdeflate's **explicit 3-literal lookahead** (:366-435),
-   which gets the same "multiple literals per refill" benefit without the per-symbol `s>>=8` branch
-   chain.
-2. **Fused consume** `saved_bitbuf=bitbuf; bitbuf>>=entry; bitsleft-=entry` (gzippy already has
-   `consume_entry`, consume_first_decode.rs:304 — extend to the libdeflate full-entry-subtract form)
-   and **preload the next entry before consuming** so the table load overlaps (:391/430).
-3. **One refill per iteration** via `REFILL_BITS_IN_FASTLOOP` semantics (`Bits::refill` already
-   branchless libdeflate-style, consume_first_decode.rs:245), with a static bit budget so 3 literals
-   + length + offset preload fit (the `CAN_CONSUME_AND_THEN_PRELOAD` invariant, :159). Remove the
-   redundant in-`decode()` refill on the fast path (use a `decode_prefilled`-style backstop-free
-   entry, lut_huffman.rs:1093).
+The convergence is NOT new code — engine A (`decode_huffman_libdeflate_style`) ALREADY has the
+libdeflate shape and already won the A/B:
+1. **Flat masked litlen table** — `LitLenTable` (TABLE_BITS=12) with the libdeflate entry layout
+   (LITERAL flag = sign bit; literal in `entry>>16`; EXCEPTIONAL flag bit15; length in `entry>>16`,
+   extra-count in `entry>>8`). Built by `LitLenTable::build` (libdeflate_entry.rs:372). No packed
+   multi-symbol unpack loop — engine A uses the explicit multi-literal lookahead (up to 8) which
+   gets "multiple literals per refill" WITHOUT the per-symbol `s>>=8` branch chain.
+2. **Fused consume** — engine A's `consume!`/`huffdec!` (consume_first_decode.rs:724-744) already
+   do `saved=bitbuf; bitbuf>>=entry; bitsleft-=entry` and preload the next entry before consuming.
+3. **One refill per iteration** — engine A's `refill_branchless_fast!` (:661) with REFILL_THRESHOLD
+   gating; intermediate refills only inside the >4-literal batch. No redundant per-decode refill.
+
+The WORK in §2c is therefore: route the clean dispatch to engine A and shed the engine-B-only
+ring/marker per-symbol surplus at the seam (§4). The literal-count and FASTLOOP-margin
+reconciliation is in §4 (engine A does 8 literals, FASTLOOP_MARGIN=320; the seam must respect
+`n_max_to_decode`).
 
 ### (d) bit reader → keep the branchless 8-byte refill, fix the CADENCE
 `Bits` (consume_first_decode.rs:197-314) is already a faithful libdeflate misaligned single-load
@@ -185,9 +231,20 @@ BITMASK(OFFSET_TABLEBITS)]`, OFFSET_TABLEBITS=8, template :505; built by `build_
 - The authorization explicitly allows asm; we DECLINE it for aarch64 on the merits above and reserve
   it as a fallback IF a gated measurement shows intrinsics leave codegen on the table.
 
-**x86_64:** keep the existing BMI2 asm `run_contig` (asm_kernel.rs:477) as the x86 specialization of
-the SAME `decode_clean_contig` contract; it already meets/beats its ref. The shared SKELETON is the
-pure-Rust kernel (which Intel runs when built **asm-off** — the cross-ISA LAW arm, §5).
+**x86_64 — SCOPE THE ASM OUT of this convergence (advisor change iv).** Wiring engine A into the
+x86 clean path would create a TWO-TABLE divergence: engine A uses the flat `LitLenTable`/`DistTable`,
+while the x86 BMI2 asm `run_contig` (asm_kernel.rs:477) is built against the ISA-L two-level
+`asm.lut_litlen`/`asm.dist`. Reconciling them means either (a) porting the asm to read the flat
+table layout (a full asm rewrite + a new c2/c3 differential burden), or (b) running engine A on x86
+asm-off and KEEPING the asm as a separate, faster x86 specialization (two clean kernels on x86). The
+PRICE of (a) is high and its payoff is unmeasured; the PRICE of (b) is carrying two x86 tables.
+
+DECISION for THIS convergence: **converge only the PURE-RUST skeleton (engine A) — the arm that
+Intel runs asm-OFF and that aarch64 always runs.** That is the cross-ISA LAW arm (§5: Intel asm-off
++ macOS aarch64). The x86 BMI2 asm `run_contig` is LEFT AS-IS (it already meets/beats its ref and
+is AMD-blocked); it is explicitly OUT of this convergence's LAW claim. Whether to later (a) rewrite
+the asm against the flat table or (b) replace it with engine A on x86 is a SEPARATE, post-LAW
+decision gated on an x86 A/B (engine A asm-off vs the BMI2 asm) — do NOT pre-judge it here.
 
 ---
 
@@ -206,18 +263,31 @@ bounds, marker bookkeeping). Design:
    marker_inflate.rs:1699/1994). The clean kernel is `CONTAINS_MARKERS=false` only — so all marker
    bookkeeping (`record_backreference_for_sparsity`, distance_marker) is **out of scope** for it and
    is removed from the clean hot path (it stays in the marker kernel, unchanged).
-3. **Resumable boundary handled like libdeflate's `generic_loop` fallback** (template :344
-   `goto generic_loop`): the clean loop runs while margin holds; on margin/boundary it breaks to
-   `decode_careful_tail` (marker_inflate.rs:2641) with the bit cursor sitting before a fresh
-   un-consumed preloaded entry (today's contract, :2605-2613 — preserved verbatim). The careful tail
-   owns the wrap-straddle and the `n_max_to_decode` split. No state carried across the seam.
-4. **N32 hazard avoidance (no register live-range across the refill / no lengthened loop-carried
-   chain):** mirror libdeflate's `saved_bitbuf` pattern EXACTLY — the only value alive across the
-   refill is `entry` (the preloaded next entry) and the bit cursor; length/offset extra bits come
-   from `saved_bitbuf` captured BEFORE the consume, never held across the refill. No extra accumulator
-   (no per-iter sparsity counter, no marker distance) lengthens the chain. This is the precise
-   structure that made the x86 N32 attempt a trap; the clean kernel adopts libdeflate's invariant
-   instead of inventing a new one.
+3. **Resumable boundary via a bit-cursor RE-READ at the seam, NOT a per-iter anchor (advisor
+   change ii; N32-safe).** Engine A's fastloop runs while `out_pos + FASTLOOP_MARGIN <= out_end`
+   AND `in_pos < in_fastloop_end`; on either bound it falls through to its generic loop
+   (consume_first_decode.rs:1059), and the generic loop / `decode_huffman_body_resumable`
+   (resumable.rs:1001) owns the tail. The parallel-SM seam must, on the RARE bail (margin reached
+   mid-block, or the `n_max_to_decode` cap), recover the bit cursor by **re-deriving the iteration-
+   top bit position and re-reading from the data** — the `reclass_reread` pattern: `p0 = lb.pos*8 -
+   lb.bitsleft` (asm_kernel.rs:2186), then `reclass_reread(lb, p0)` (asm_kernel.rs:2293) rebuilds
+   `bitbuf/bitsleft/pos` from `data[p0>>3]`. This is the N32-SAFE seam: it does NOT "preserve the
+   per-iter anchor verbatim" (the deleted night9 4-value snapshot — the N32 trap that lengthened the
+   loop-carried chain); it carries only `p0` and re-reads. Engine A already keeps `bitbuf`/`bitsleft`
+   in locals with writebacks at every exit (:1040-1042, :1055-1057), so the seam reads a consistent
+   `(pos,bitbuf,bitsleft)` and `bit_position()` is well-defined there.
+4. **Literal-count + FASTLOOP-margin reconciliation (advisor change ii).** The pre-Step-0.5 draft
+   said "3-literal"; engine A actually does **up to 8 literals** per batch (lit1..lit8,
+   consume_first_decode.rs:777-933) with intermediate `refill_branchless_fast!` before the 5th and
+   8th lookups and `in_fastloop_end = len - 32` input margin. Output margin `FASTLOOP_MARGIN = 320`
+   bytes (:639) ≥ 8 speculative literal bytes + one 258-byte max back-ref + copy_match_fast overshoot
+   — so a single fastloop iteration writes ≤ 8 + 258 + slop < 320, contiguous, no per-symbol bound.
+   **The seam must cap the fastloop so it never overruns `n_max_to_decode`:** enter the fastloop only
+   while `out_pos + FASTLOOP_MARGIN <= min(out_end, n_max_to_decode)`; below that, hand off to the
+   resumable/careful tail which decodes one symbol at a time up to the exact cap. This proves the
+   8-literal batch + max back-ref always fits before the resumable boundary (320 > 8+258+slop) and
+   the cap is honored to the byte. No accumulator (sparsity counter, marker distance) is carried
+   across the refill — engine A's loop has none, preserving the N32 invariant by construction.
 
 Net: the clean kernel sheds the ~per-symbol ring+marker surplus (the cross-arch "~75% residual"
 shape) WITHOUT touching the marker kernel or the careful tail that enforce T>1 correctness.
@@ -230,10 +300,18 @@ Every step is gated identically; a step is KEPT only on a byte-exact + instr-win
 if it's strictly-less-code) or REVERTED otherwise.
 
 **Byte-exact (blocking, every step):**
-- The existing reference differential: the new `decode_clean_contig` is pinned against
-  `run_contig_ref`-style reference over random bitstreams × {fixed, dense, long-code} tables ×
-  varying out budgets (the c2 harness pattern, asm_kernel.rs:2383) — assert exit class, full bit
-  cursor, dst advance, every output byte.
+- Engine A vs engine B reference differential: decode the SAME block with both engines (the
+  `kernel_ab_aarch64` Gate-0 cross-check already does A==B==flate2) over random bitstreams ×
+  {fixed, dense, long-code} tables × varying out budgets — assert exit class, full bit cursor, dst
+  advance, every output byte.
+- **n_max_to_decode boundary fuzz (advisor change iii):** the seam's correctness hinges on the cap
+  landing INSIDE a multi-literal batch. Fuzz `n_max_to_decode` across EVERY value in
+  `[block_out - (FASTLOOP_MARGIN+258), block_out]` so the cap falls at every intra-batch position
+  (after literal 1..8, mid-back-ref, at EOB) and assert byte-exact + bit-cursor identity vs a
+  one-symbol-at-a-time oracle at each cap. Also fuzz the SEAM RE-ENTRY: bail at cap `k`, resume, and
+  assert the concatenation == full decode, for every `k` in that window. (Engine A's existing
+  resumable variant `decode_huffman_body_resumable` is the resume target; the fuzz proves the
+  reclass_reread seam re-reads the cursor correctly at every batch offset.)
 - `kernel_ab` / `prop_structured` (existing) + the lib test suite (635+).
 - **sha == zcat on T1/T4/T8** across silesia + monorepo + nasa + the synthetic literal/backref
   corpora (real-corpus differential ships in the SAME commit, per the standing rule).
@@ -260,60 +338,69 @@ recording a FALSIFY entry (premise + scope + re-open trigger).
 
 ---
 
-## 6. IMPLEMENTATION PLAN — ordered FULL sub-builds (not micro-patches)
+## 6. IMPLEMENTATION PLAN — WIRE engine A (reframed per Step-0.5; no from-scratch build)
 
-Each step is a complete buildable kernel state with its own byte-exact gate. Expected instr/B deltas
-are STRUCTURAL feedback (from Deliverable 1's shares), NOT a progress promise — the gate is the wall/
-instr measurement, not the prediction.
+The flat kernel exists and won the A/B. The plan is integration, ordered so each step is a
+complete buildable state with its own byte-exact gate. Expected deltas are the Step-0.5 A/B shares
+(2.07–3.84× instr/B), NOT a promise — the gate is the measured instr, not the prediction.
 
-- **Step 0 — scaffolding + the contiguous-output clean kernel skeleton.** Add `decode_clean_contig`
-  (CONTAINS_MARKERS=false only) writing a contiguous region with the `out_fastloop_end` margin;
-  wire it behind the existing clean dispatch with the careful tail as the boundary fallback (§4).
-  No table change yet — call the current decode. Verify byte-exact + that it routes (a counter).
-  Expected: ~0 instr change (pure restructure); proves the contract before the hot changes.
+- **Step 0 — seam scaffolding (route the clean dispatch to a wrapper, no engine change yet).**
+  Add a `decode_clean_contig_flat` wrapper inside `decode_clean_into_contig` (marker_inflate.rs:3108)
+  / `chunk_decode.rs:1695`, behind a counter, that for now still calls engine B. Add the
+  `reclass_reread` seam (§4.3) and the `n_max_to_decode` cap-to-min(out_end, cap) entry guard (§4.4).
+  Verify byte-exact + that it routes (counter > 0). Expected ~0 instr change; proves the seam contract.
 
-- **Step 1 — flat masked litlen table + fused consume + saved_bitbuf (port `build_decode_table` +
-  template :344-435,496).** Replace the two-level packed decode with the flat 11-bit table and the
-  explicit 3-literal lookahead. Drop the per-symbol unpack loop. *Biggest expected instr win* (the
-  per-symbol gap, Deliverable-1 §3, +19.5 instr/B excess lives here). Risk: HIGH (table layout +
-  byte-exactness). Gate: c2-style differential + full sha grid.
+- **Step 1 — swap the clean body to engine A (`decode_huffman_libdeflate_style`) + its resumable
+  variant.** Route Fixed/DynamicHuffman clean chunks to engine A for the fastloop and to
+  `decode_huffman_body_resumable` (resumable.rs:1001) for the bail/cap tail. Build the flat
+  `LitLenTable`/`DistTable` per block via `LitLenTable::build`/`DistTable::build` (cache by
+  fingerprint, as bgzf/scan already do). *Biggest expected instr win — the entire Step-0.5 2.07–3.84×
+  lives here.* Risk: HIGH (seam byte-exactness at the n_max boundary). Gate: the §5
+  n_max_to_decode boundary fuzz + engine-A-vs-engine-B differential + full sha grid (T1/T4/T8).
 
-- **Step 2 — single amortized refill cadence.** Remove the redundant top/bottom + in-`decode` refills;
-  one `REFILL_BITS_IN_FASTLOOP`-equivalent per iteration with the static bit budget. Risk: MED
-  (bit-budget proof). Gate: same; watch `decomp_literal` instr/B.
+- **Step 2 — shed the engine-B-only per-symbol surplus.** With engine A in place, the contiguous
+  output already removes `% U8_RING_SIZE`; confirm no marker bookkeeping
+  (`record_backreference_for_sparsity`) remains on the clean (`CONTAINS_MARKERS=false`) path. Risk:
+  LOW. Gate: instr (decomp_literal) + sha; marker-grid sha unchanged.
 
-- **Step 3 — flat masked offset table (replace dist_hc + DISTANCE_EXTRA/BASE).** Port the offset
-  table (OFFSET_TABLEBITS=8); extract extra from saved_bitbuf. Risk: MED. Gate: backref + silesia sha
-  + instr (this also helps the match path the backref corpus exercises).
+- **Step 3 — confirm the flat dist path covers the match-heavy corpus.** Engine A already uses the
+  flat `DistTable` (saved_bitbuf extract); verify the backref_extreme corpus is byte-exact and
+  measure its instr/cyc (Step-0.5 already shows A 0.626 vs B 0.814 instr/B). Risk: LOW. Gate:
+  backref + silesia sha + instr.
 
-- **Step 4 — NEON wide overlapping match copy (aarch64) / confirm x86 MOVDQU arm.** Contiguous
-  `vld1q/vst1q` overlapping copy with FASTLOOP overshoot. Risk: LOW-MED (overlap correctness — copy
-  the libdeflate length-rounding exactly). Expected small instr (+0.26 ceiling) but the larger cyc
-  win (copy cyc ratio 1.5×). Gate: backref corpus cyc + sha.
+- **Step 4 — NEON match copy (aarch64) confirm.** Engine A's `copy_match_fast` already routes to the
+  NEON copy on aarch64; verify it is the overlapping wide-store path under FASTLOOP overshoot (no
+  per-symbol bound). Expected small instr, the larger cyc win (copy cyc ratio). Risk: LOW. Gate:
+  backref corpus cyc + sha.
 
-- **Step 5 — x86 specialization reconcile + cross-ISA LAW.** Make the BMI2 asm `run_contig` the x86
-  spec of the `decode_clean_contig` contract (or confirm the pure-Rust skeleton suffices on x86
-  asm-off). Run Intel(asm-off)+macOS standing rig → promote the wins to LAW. Risk: MED (two arches
-  agree). Gate: cross-ISA replication.
+- **Step 5 — cross-ISA LAW (Intel asm-OFF + macOS aarch64).** Build Intel asm-off so it runs the SAME
+  engine A, run `kernel_ab_aarch64`-equivalent + the standing rig there; promote the win to LAW only
+  when it replicates on both. The x86 BMI2 asm is OUT of this LAW arm (§3 change iv). Risk: MED.
+  Gate: cross-ISA replication.
 
-- **Step 6 — CRC build-hygiene assertion + cleanup.** Assert HW-CRC feature on ship targets; delete
-  the superseded `decode_clean_fast_loop` ring path if Step 0-4 fully replace it (no dead code on
-  the clean path). Gate: full suite + measure.sh vs libdeflate (and rapidgzip where available).
+- **Step 6 — cleanup.** Delete the superseded engine-B clean contig loop + the ring
+  `decode_clean_fast_loop` IF Steps 1–4 fully replace them on the clean path (no dead code; the
+  MARKER path keeps its own loop). Keep the CRC HW build-hygiene assertion (§2a). Gate: full suite +
+  measure.sh vs libdeflate / rapidgzip.
 
-**Done-criterion for the kernel:** silesia clean-core instr/B excess closed toward libdeflate
-(target: the +11.69 driven down to the copy-floor ~tie), byte-exact across the grid, replicated on
-Intel(asm-off)+macOS = cross-ISA LAW, clean kernel the sole clean-decode path per arch.
+**Done-criterion for the kernel:** the clean-core instr/B closed to engine A's measured level
+(silesia ~8.4 vs engine B ~17.3; per-symbol ~13.9 — at/below libdeflate), byte-exact across the
+grid (incl. the n_max boundary fuzz), replicated on Intel(asm-off)+macOS = cross-ISA LAW, engine A
+the sole pure-Rust clean-decode path per arch.
 
 ---
 
 ## SELF-CHECK against the anti-bias preamble
-- No "the lever is X" banked as prose: the component verdict is the OUTPUT of a self-validated,
-  byte-exact, /dev/null, deterministic-instr Fulcrum-style harness (clean_core_decomp_mac.py), with
-  the INERT CRC knob explicitly NOT counted (Gate-0c).
-- The biggest-component claim (per-symbol Huffman) is measured (2.18× / +19.5 instr/B), and it
-  REVISES a prior HYPOTHESIS (NEON-copy-as-biggest-win) DOWN — over-correction guarded by keeping the
-  copy step in the plan at its measured (minor) size.
+- No "the lever is X" banked as prose: both the Deliverable-1 component verdict AND the Step-0.5
+  engine verdict are OUTPUTS of self-validated, byte-exact, /dev/null-or-in-RAM, deterministic-instr
+  harnesses (clean_core_decomp_mac.py; kernel_ab_aarch64.py with FLAT_DECODE_CALLS non-inert proof,
+  cursor conservation, A==B==oracle), with the INERT CRC knob explicitly NOT counted (Gate-0c).
+- Step-0.5 KILLED the design's own premise (build a flat kernel) by MEASUREMENT, not reasoning: the
+  flat engine already exists and wins 2.07–3.84×. The reframe to REUSE is the disciplined response to
+  a falsifier, not a new confident conclusion — the build is now wiring + a boundary-fuzz gate.
+- Table-width-vs-cadence is held as an EXPLICIT unvalidated HYPOTHESIS (the A/B moved both together);
+  the plan converges the whole flat bundle rather than over-betting the split it did not isolate.
 - Scope stamped macOS-aarch64 NOT-YET-LAW; cross-ISA LAW is DESIGNED IN (Intel asm-off), not claimed.
-- Corpus-contrast is labeled WEAK-tier (confounds named); the design converges all sub-components so
-  it does not over-bet on the internal table-vs-bitreader split it did not measure.
+  The x86 BMI2 asm is explicitly SCOPED OUT of the convergence/LAW (§3 change iv) with its two-table
+  price named, not pre-judged.
 - No floor/settled/accept claim. Every step ends in a gated measurement, not a prose conclusion.

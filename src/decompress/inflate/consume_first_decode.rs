@@ -1114,6 +1114,32 @@ pub fn decode_dynamic_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) ->
     decode_dynamic(bits, output, out_pos)
 }
 
+/// Non-inert counter for the Step-0.5 A/B harness: every call to the flat
+/// libdeflate-style decoder (engine A) increments this. The harness asserts it
+/// advanced by exactly the rep count after each timed loop, PROVING the flat
+/// kernel actually executed on aarch64 (Gate-0c) — not a silently-skipped/inert
+/// path.
+pub static FLAT_DECODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Step-0.5 A/B harness entry: the engine-A (flat-table libdeflate-style) clean
+/// decoder, called with PRE-BUILT tables so a kernel-only A/B can amortize
+/// table-build outside the timed loop and start at the SAME body bit as engine B
+/// (`Block::decode_clean_into_contig`). Byte-exactness is enforced by the harness
+/// (output == engine B == flate2/gzip). This is a thin transparent wrapper around
+/// the production `decode_huffman_libdeflate_style` (consume_first_decode.rs:632) —
+/// the SAME function bgzf/scan/multi-member run — with a non-inert call counter.
+#[doc(hidden)]
+pub fn decode_flat_clean_pub(
+    bits: &mut Bits,
+    output: &mut [u8],
+    out_pos: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> Result<usize> {
+    FLAT_DECODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
+}
+
 fn decode_huffman_cf(
     bits: &mut Bits,
     output: &mut [u8],
@@ -1498,7 +1524,15 @@ fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<us
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
 
-fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+/// Parse a dynamic-Huffman block header (called AFTER the 3-bit block header
+/// `BFINAL|BTYPE` has been consumed) and return `(litlen_lengths,
+/// dist_lengths)`, leaving `bits` positioned at the block BODY.
+///
+/// This is the single source of truth for the dynamic-header parse: `decode_dynamic`
+/// calls it, and the `kernel_ab_aarch64` Step-0.5 harness calls it to build the
+/// flat tables for the engine-A (libdeflate-style) decoder so the engine-A vs
+/// engine-B A/B starts both engines at the SAME body bit with tables pre-built.
+pub fn parse_dynamic_header(bits: &mut Bits) -> Result<(Vec<u8>, Vec<u8>)> {
     // Read dynamic Huffman table header
     if bits.available() < 14 {
         bits.refill();
@@ -1593,13 +1627,18 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
         }
     }
 
-    let litlen_lengths = &all_lengths[..hlit];
-    let dist_lengths = &all_lengths[hlit..];
+    let litlen_lengths = all_lengths[..hlit].to_vec();
+    let dist_lengths = all_lengths[hlit..].to_vec();
+    Ok((litlen_lengths, dist_lengths))
+}
+
+fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen_lengths, dist_lengths) = parse_dynamic_header(bits)?;
 
     // Compute fingerprint for table caching
     let fingerprint = crate::decompress::inflate::jit_decode::TableFingerprint::combined(
-        litlen_lengths,
-        dist_lengths,
+        &litlen_lengths,
+        &dist_lengths,
     );
 
     // Use libdeflate-style decoder for all dynamic blocks
@@ -1611,8 +1650,8 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
         bits,
         output,
         out_pos,
-        litlen_lengths,
-        dist_lengths,
+        &litlen_lengths,
+        &dist_lengths,
         fingerprint,
     )
 }
