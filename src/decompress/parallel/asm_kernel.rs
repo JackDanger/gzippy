@@ -359,6 +359,40 @@ mod imp {
         *ON.get_or_init(|| std::env::var("GZIPPY_STATELESS_KERNEL").is_ok_and(|v| v == "1"))
     }
 
+    /// NIGHT35 PRODUCTION-WALL KERNEL INSTRUCTION INJECTOR knobs.
+    /// `GZIPPY_KERNEL_INJECT=<mult>` (0/1/2/4): per-iteration injected dummy
+    /// work count = mult*4 (read by `run_contig_inject` via a RIP-relative
+    /// `sym` operand — no GP register consumed). `GZIPPY_KERNEL_INJECT_MODE`:
+    /// 0=dependent add chain (latency probe), 1=independent `lea` (throughput
+    /// probe). Byte-transparent (only discarded scratch is touched). Set ONCE
+    /// by `inject_enabled()`'s OnceLock before any decode.
+    pub static INJECT_N: AtomicU64 = AtomicU64::new(0);
+    pub static INJECT_MODE: AtomicU64 = AtomicU64::new(0);
+
+    /// `GZIPPY_KERNEL_INJECT>0` — route the production clean fast loop through
+    /// `run_contig_inject`. Populates INJECT_N (=mult*4) and INJECT_MODE from
+    /// the env on first call (before the dispatch reads them).
+    pub fn inject_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mult = std::env::var("GZIPPY_KERNEL_INJECT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let mode = std::env::var("GZIPPY_KERNEL_INJECT_MODE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            INJECT_N.store(mult.saturating_mul(4), Ordering::Relaxed);
+            INJECT_MODE.store(mode, Ordering::Relaxed);
+            mult > 0 && std::arch::is_x86_feature_detected!("bmi2")
+        })
+    }
+    /// Current injected-count (for the harness non-inert self-test).
+    pub fn inject_n() -> u64 {
+        INJECT_N.load(Ordering::Relaxed)
+    }
+
     /// The rung-(c) kernel region.
     ///
     /// BRANCHLESS-CLASSIFY (this commit): the LITERAL hot path is a FLAT
@@ -991,6 +1025,595 @@ mod imp {
         (ret, dst_c)
     }
 
+    /// NIGHT35 INSTRUCTION INJECTOR — exact copy of `run_contig` with a
+    /// byte-transparent per-iteration dummy-work injection (see inline doc).
+    /// Selected at the production dispatch when `GZIPPY_KERNEL_INJECT>0`.
+    #[inline(never)]
+    pub unsafe fn run_contig_inject(
+        ctx: &AsmState,
+        lb: &mut Bits<'_>,
+        dst: *mut u8,
+    ) -> (u64, *mut u8) {
+        let mut bitbuf = lb.bitbuf;
+        let mut bitsleft: u64 = lb.bitsleft as u64;
+        let mut pos: u64 = lb.pos as u64;
+        let mut dst_c = dst;
+        let ret: u64;
+        unsafe {
+            core::arch::asm!(
+                // ── prologue: speculative preload of the CURRENT packet's
+                //    short entry (no consume — harmless table read, exactly the
+                //    bits `decode_prefilled` reads). Carried in {t1} = igzip
+                //    `next_sym`, the preloaded symbol re-loaded at the bottom of
+                //    every iteration (igzip 502 / 540 / 580-582).
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
+                // ── iteration top: guards (E4) ──────────────────────────
+                "2:",
+                "mov {ret}, 1",                       // speculative BOUNDARY
+                "cmp {dst}, qword ptr [{ctx} + 16]",  // dst vs out_lim
+                "jae 9f",
+                "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
+                "jae 9f",
+                // ── NIGHT35 PRODUCTION-WALL KERNEL INSTRUCTION INJECTOR
+                //    (byte-transparent: clobbers only dead-on-every-path scratch
+                //    regs {ret}/{t2}/{t3}/{t5}; {ret} is re-set on every exit and
+                //    at the literal back-edge top; {t2}/{t3}/{t5} are written later
+                //    this iteration before any read; {p0}/{d0}/{t1}/{dpre} untouched.
+                //    Reads the count/mode from the INJECT_N/INJECT_MODE statics via
+                //    RIP-relative `sym` operands (no GP register consumed). N=0 ⇒ a
+                //    single predicted-not-taken branch (jz). DEPENDENT mode = a
+                //    loop-carried add chain through {ret} (LATENCY-slack probe);
+                //    INDEPENDENT mode = renamed `lea` into {t5}/{ret} from the live
+                //    {pos} (THROUGHPUT/issue-slot-slack probe). Runs per hot-loop
+                //    iteration (per decoded packet). ─────────────────────────────
+                "mov {t2}, qword ptr [rip + {injn}]",   // N (injection count)
+                "test {t2}, {t2}",
+                "jz 200f",                              // N==0 → no injection
+                "mov {t3}, qword ptr [rip + {injm}]",   // mode (0=dep,1=indep)
+                "test {t3}, {t3}",
+                "jnz 210f",
+                "201:",                                 // DEPENDENT latency chain
+                "add {ret}, {ret}",                     // loop-carried through {ret}
+                "add {ret}, 1",
+                "dec {t2}",
+                "jg 201b",
+                "jmp 200f",
+                "210:",                                 // INDEPENDENT throughput
+                "lea {t5:e}, [{pos:e} + 1]",            // src {pos} const → independent
+                "lea {ret:e}, [{pos:e} + 3]",
+                "dec {t2}",
+                "jg 210b",
+                "200:",
+                // ── NIGHT11 MINIMAL UN-CONSUME ANCHOR (the night9 4-store X2
+                //    snapshot is DELETED — see DIVERGENCE LEDGER). The late-
+                //    discriminator body below CONSUMES + REFILLS + speculatively
+                //    STORES before it knows the packet is non-literal, so a rare
+                //    bail must hand Rust the packet UN-consumed (X2). Instead of
+                //    snapshotting all four of (bitbuf,bitsleft,pos,dst), save the
+                //    TWO values a bail cannot otherwise recover:
+                //      [ctx+56] = p0 = pos*8 - bitsleft  (iteration-top BIT
+                //        position). REFILL-INVARIANT (Bits::refill's |56 + pos
+                //        advance preserve pos*8-bitsleft), so it is the un-
+                //        consumed packet start regardless of the body's
+                //        consume/refill. A bail re-reads the whole cursor from it
+                //        (the consumed low bits are shifted out — unrecoverable
+                //        from post-consume registers).
+                //      {d0} = dst (iteration-top dst; un-consume target).
+                //    ELEMENT A: with {short_tbl}+{dtbl} folded into the single
+                //    {ctx} base (inline tables), the 2 freed GP registers carry
+                //    p0/d0 IN-REGISTER — the 2 per-iteration anchor STORES
+                //    (former `mov [ctx+56],p0` / `mov [ctx+64],dst`) are DELETED
+                //    (igzip stateless single-base; D-1 ledger). The bails read
+                //    p0/d0 from registers at 85:.
+                "lea {p0}, [{pos} * 8]",
+                "sub {p0}, {bitsleft}",
+                "mov {d0}, {dst}",
+                // ── decode_next_lit_len on the preloaded entry {t1} (igzip
+                //    322-372 / loop_block 515): extract bit_count + sym_count.
+                //    LARGE_FLAG → long table (cold); bc==0 → invalid (cold).
+                "test {t1:e}, 0x2000000",             // LARGE_FLAG_BIT → long (cold)
+                "jnz 20f",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 28",                     // bc = bit_count
+                "jz 86f",                             // invalid (bc==0) → Rust (UN-consumed, no re-read)
+                "mov {t3:e}, {t1:e}",
+                "shr {t3:e}, 26",
+                "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
+                // ── STEP-2(b) MASK-ONCE (igzip decode_next_lit_len macro 341
+                //    `and next_sym, LARGE_SHORT_SYM_MASK`): clear bc/cnt/
+                //    LARGE_FLAG (bits 25-31) from {t1} IN PLACE — all already
+                //    extracted (bc→{t2} @449, cnt→{t3} @451-453, LARGE_FLAG
+                //    tested @446). The single masked {t1} (= the bits-0..24
+                //    packed-symbol field) is then REUSED for BOTH the trailing
+                //    shrx (igzip 521) AND the speculative store (igzip 518) —
+                //    deleting the two scratch copies (`mov {t5},{t1}` +
+                //    `mov {t4},{t1}`) and the per-use store mask (`and 0xFFFFFF`).
+                //    {t1} is dead after the store until reloaded at the bottom
+                //    preload (497-499); the non-literal arm re-derives its needs
+                //    from {t5}/{t3}, so the in-place mask is safe. (`and r32`
+                //    zero-extends, so {t1}'s high 32 bits are 0 for the store.)
+                "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
+                // ── TRAILING EXTRACT (igzip 520-521), UNCONDITIONAL every
+                //    iteration: next_sym2 = (masked >> 8*(cnt-1)) & 0xFFFF. The
+                //    post-shrx & 0xFFFF was DELETED (NIGHT34, igzip _04 0x38d25
+                //    convergence): the mask-once `and 0x1FFFFFF` clears class
+                //    bits 25-31 and the LUT build zero-fills unused symbol slots,
+                //    so bits above the trailing are already 0 for every cnt. {t4}
+                //    is the scratch shift.
+                "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
+                "shrx {t5}, {t1}, {t4}",              // {t5} = trailing (clean; NIGHT34 igzip _04 0x38d25 converge: & 0xFFFF removed)
+                // ── SPECULATIVE STORE + advance by cnt (igzip 518-519),
+                //    UNCONDITIONAL: store the masked {t1} (bits 0..24) directly
+                //    and advance dst by the full sym_count assuming a pure-
+                //    literal pack. A trailing length over-advances dst by 1 (its
+                //    low byte stored as garbage); `decode_len_dist` fixes it with
+                //    one `dec dst` so the copy overwrites it (igzip's symmetric
+                //    next_out `lea +repeat_length-1`). {t1} byte 3 (bit24) is X3
+                //    overshoot — dst advances by cnt ≤ 3 so byte 3 is never a
+                //    final output byte (identical overshoot semantics to the old
+                //    `and 0xFFFFFF` store, which only differed in byte 3).
+                "mov qword ptr [{dst}], {t1}",        // speculative 8-byte store
+                "add {dst}, {t3}",                    // advance by cnt
+                // ── CONSUME the current litlen packet (igzip decode end: SHRX
+                //    read_in; sub read_in_length). {t2} = bc.
+                "shrx {bitbuf}, {bitbuf}, {t2}",
+                "sub {bitsleft}, {t2}",
+                // ── SPLIT REFILL + SOFTWARE-PIPELINED PRELOAD CADENCE (NIGHT19:
+                //    converge run_contig's per-iteration SCHEDULE on igzip's EXACT
+                //    loop_block straight-line order 524-552 — element F of the
+                //    KERNEL-CONVERGENCE map, the remaining divergence in the
+                //    software-pipelined shape that owns the loop-carried
+                //    dependency chain / hot-loop IPC, NIGHT18). Three coupled
+                //    reorders vs the prior contiguous `6:` block, all byte-exact
+                //    (refill is append-only; ref model is functional, unchanged):
+                //      (1) igzip 524-525: extract the NEXT litlen INDEX from the
+                //          POST-CONSUME bitbuf BEFORE the refill OR, into a
+                //          SEPARATE reg {t4}. The OR sets only bits >= bitsleft,
+                //          and post-consume bitsleft >= 48-21 = 27 > 12, so the
+                //          low-12 index is identical pre-/post-OR; extracting it
+                //          early lets the index compute overlap the OR and widens
+                //          the index→load distance.
+                //      (2) igzip 528-530: refill part A (OR new high bits).
+                //      (3) igzip 540: load the litlen ENTRY from the early index,
+                //          AFTER the OR (load-use distance), into {t1}.
+                //      (4) igzip 543-547: refill part B (next_in/len advance)
+                //          DEFERRED past the litlen load so the loop-carried `pos`
+                //          update overlaps that load-use latency — the crux of
+                //          igzip's pipelining (gz's prior contiguous form
+                //          serialized pos-advance ahead of the preload).
+                //    `or bitsleft,56` exact for bitsleft∈[0,63]; tops bitsleft to
+                //    ≥56 before the discriminator so the backref dist decode
+                //    (≤28 bits) is in budget. {t2} free post-consume; {t4} scratch
+                //    (dead after the trailing shrx @491).
+                "6:",
+                // (1) igzip 524-525 EXACT micro-schedule: `mov tmp3, CONST` /
+                //    `and tmp3, read_in`. The mask CONSTANT goes in {t4} FIRST
+                //    (no source dependency → OFF the loop-carried critical path);
+                //    the single `and {t4}, {bitbuf}` is then the ONLY critical-path
+                //    op feeding the entry load. The prior `mov {t4},{bitbuf}` copied
+                //    the just-consumed (loop-carried) bitbuf — an EXTRA dependent op
+                //    on the recurrence shrx→COPY→and→load. AND is commutative so the
+                //    index value (bitbuf & 0xFFF) is byte-identical; pure schedule
+                //    convergence (NIGHT24 located the divergence: objdump c33b5
+                //    `mov %r8d,%r13d` vs igzip's off-path const-mov).
+                "mov {t4:e}, 0xFFF",                  // (1) igzip 524: mask CONST (off critical path)
+                "and {t4:e}, {bitbuf:e}",             //     igzip 525: index = bitbuf & 0xFFF (single crit op)
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]", // (2) igzip 528-530: OR
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {lit_off}]", // (3) igzip 540: entry load
+                "mov {t4:e}, 63",                     // (4) igzip 543-547: ptr/len advance DEFERRED
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                // ── SPECULATIVE preload of the NEXT dist entry, EVERY iteration
+                //    (igzip 550-552): the dist code follows the just-consumed
+                //    litlen, so its short entry is at the low 9
+                //    (DistTable::TABLE_BITS) bits of the refilled bitbuf. On a
+                //    literal this load is discarded; on a length the backref arm
+                //    finds it already in flight (load latency hidden). PURE table
+                //    read — byte-exact (the ref models the same post-consume
+                //    `dist.lookup`).
+                // igzip 550-551 EXACT: `mov next_bits2, CONST` / `and next_bits2,
+                //    read_in` — mask CONST off-path, single `and` critical op (same
+                //    convergence as the litlen index above; byte-identical, AND
+                //    commutative).
+                "mov {dpre:e}, 0x1FF",                // igzip 550: mask CONST (off critical path)
+                "and {dpre:e}, {bitbuf:e}",           // igzip 551: dist index = bitbuf & 0x1FF
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
+                // ── LATE DISCRIMINATOR (igzip 555-556): trailing < 256 ⇒
+                //    literal ⇒ back-edge (the HOT exit); ≥ 256 ⇒ length/EOB ⇒
+                //    fall through to the non-literal arm. THE core igzip-shape
+                //    change: all the speculation above ran before this single
+                //    data-dependent branch resolves.
+                "cmp {t5:e}, 256",
+                "jb 2b",                              // literal → loop (HOT)
+                // ── non-literal arm: EOB / oversize → restore + RECLASS; else
+                //    length → decode_len_dist. dst = base+cnt → `dec` = copy
+                //    start (base for a lone backref; base+(cnt-1) past the
+                //    literal prefix for a pack). {dpre} carries the preloaded
+                //    dist entry into `58:`.
+                "je 82f",                             // EOB → restore + RECLASS tag 2
+                "cmp {t5:e}, 512",                    // MAX_LIT_LEN_SYM
+                "ja 30f",                             // oversize → restore + RECLASS
+                "dec {dst}",                          // base+cnt → copy start
+                "lea {t2:e}, [{t5:e} - 254]",         // length = trailing - 254
+                "jmp 58f",                            // → shared dist+copy body
+                // ── cold bottom (long-literal path): unconditional refill +
+                //    preload, NO store (the long path stored its 1 byte already)
+                "64:",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
+                "or {bitsleft}, 56",
+                "mov {t1:e}, {bitbuf:e}",
+                "and {t1:e}, 0xFFF",
+                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
+                "jmp 2b",
+                // ── long code at top (decode_prefilled long path; rare/cold).
+                //    The iteration-top p0/d0 anchor ([ctx+56]/[ctx+64]) covers
+                //    its bails (reconstruct at 85:). {t2} = bc throughout.
+                "20:",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 26",                     // long_max_len (≤21)
+                "bzhi {t3}, {bitbuf}, {t2}",
+                "shr {t3}, 12",                       // >> ISAL_DECODE_LONG_BITS
+                "and {t1:e}, 0x1FFFFFF",
+                "add {t1:e}, {t3:e}",                 // long_idx
+                "lea {t2}, [{ctx} + {llong_off}]",    // litlen long table (inline, single base)
+                "movzx {t1:e}, word ptr [{t2} + {t1}*2]",
+                "mov {t2:e}, {t1:e}",
+                "shr {t2:e}, 10",                     // bc
+                "jz 86f",                             // invalid (bc==0) → Rust (UN-consumed, no re-read)
+                "and {t1:e}, 0x3FF",                  // symbol
+                "cmp {t1:e}, 255",
+                "ja 21f",                             // lone non-literal → backref arm
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // lone literal via long path
+                "sub {bitsleft}, {t2}",
+                "mov byte ptr [{dst}], {t1:l}",
+                "inc {dst}",
+                "jmp 64b",                            // → cold bottom: refill + preload + loop
+                // ── long lone non-literal (cnt=1; dst still = base = copy
+                //    start, no spec store on the long path). Consume the long
+                //    litlen, refill (dist budget), EOB/oversize gate, preload
+                //    the dist entry, length, → 58: (no `dec` — dst is already
+                //    the copy start).
+                "21:",
+                "mov {t5:e}, {t1:e}",                 // trailing = code (clean, no flag bit)
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume long litlen
+                "sub {bitsleft}, {t2}",
+                "mov {t2}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t2}, {t2}, {bitsleft}",
+                "or {bitbuf}, {t2}",
+                "mov {t4:e}, 63",
+                "sub {t4}, {bitsleft}",
+                "shr {t4}, 3",
+                "add {pos}, {t4}",
+                "or {bitsleft}, 56",
+                "cmp {t5:e}, 256",
+                "je 82f",                             // long EOB → restore + RECLASS
+                "cmp {t5:e}, 512",
+                "ja 8f",                              // long oversize lone → restore + RECLASS tag 0
+                "mov {dpre:e}, {bitbuf:e}",
+                "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
+                "lea {t2:e}, [{t5:e} - 254]",         // length
+                "jmp 58f",                            // dst = base = copy start
+                // ── oversize trailing (>512): restore + RECLASS, tag by cnt
+                //    (lone → 0 via 8:, multi → 3 via 83:).
+                "30:",
+                "cmp {t3:e}, 1",
+                "je 8f",                              // lone oversize → tag 0
+                "jmp 83f",                            // multi oversize → tag 3
+                // ── shared backref body (igzip decode_len_dist). {t2}=length,
+                //    {dpre}=dist entry preloaded in the main body (igzip
+                //    550-552) or at `21:` for the long path, {dst}=copy start.
+                //    The base+index gather (the L1-latency load) already ran;
+                //    the in-register entry decode follows with latency hidden.
+                //    X2: the iteration-top p0/d0 anchor makes every dist-side
+                //    bail un-consume (tag at `80:` → reconstruct at `85:`). ──
+                "58:",
+                "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
+                // FLOOR ORACLE (NIGHT16): subtable leaf re-enters here (the
+                // inline subtable decode at 91: loads the leaf into {t1} and
+                // jumps back to 94b). On a leaf the two tests below are
+                // harmless: a valid leaf is nonzero (raw0 test falls through)
+                // and bit14 (0x4000) is always 0 for a distance entry (the
+                // distance base occupies bits 16-30, codeword_bits bits 8-11),
+                // so it falls straight into the normal in-register entry decode.
+                "94:",
+                "test {t1:e}, {t1:e}",
+                "jz 90f",                             // raw == 0 (hole/code 30/31) → bail (tag 5)
+                "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
+                "jnz 91f",                            // subtable dist → INLINE decode at 91:
+                "mov {t3}, {bitbuf}",                 // saved_bitbuf
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry: >>= raw as u8 (= total_bits <= 31)
+                "mov {t4:e}, {t1:e}",
+                "and {t4:e}, 0x1F",
+                "sub {bitsleft}, {t4}",               // -= raw & 0x1F (no underflow: budget proof)
+                "bzhi {t3}, {t3}, {t1}",              // saved & ((1 << total_bits) - 1)
+                "mov {t4:e}, {t1:e}",
+                "shr {t4:e}, 8",
+                "and {t4:e}, 0xF",                    // codeword_bits
+                "shrx {t3}, {t3}, {t4}",              // extra value
+                "shr {t1:e}, 16",                     // distance base
+                "add {t1:e}, {t3:e}",                 // distance
+                "jz 92f",                             // distance == 0 → restore (tag 7)
+                "cmp {t1:e}, 32768",
+                "ja 92f",                             // > MAX_WINDOW_SIZE → restore (tag 7)
+                "mov {t4}, {dst}",
+                "sub {t4}, {t1}",                     // src = dst - distance
+                "cmp {t4}, qword ptr [{ctx} + 24]",
+                "jb 93f",                             // src < out_base ⇔ distance > *pos → restore (tag 8, marker)
+                // X1 pre-copy `< 48` refill (production refills BEFORE the
+                // copy — P3.5 c1; the carried gather below is pure).
+                "cmp {bitsleft}, 48",
+                "jae 51f",
+                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t3}, {t3}, {bitsleft}",
+                "or {bitbuf}, {t3}",
+                "mov {t5:e}, 63",
+                "sub {t5}, {bitsleft}",
+                "shr {t5}, 3",
+                "add {pos}, {t5}",
+                "or {bitsleft}, 56",
+                "51:",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
+                // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
+                //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
+                //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
+                //    Faithful igzip mechanism: load 16B from src; if
+                //    `distance >= min(16, length)` the 16-byte window never
+                //    reads an un-finalized byte ⇒ large copy (one-or-more
+                //    MOVDQU, src+=16/iter); else GROW THE PERIOD by storing
+                //    then doubling the distance (small copy) until the period
+                //    >= COPY_SIZE, then fall through to large. The bytes in
+                //    [dst, dst+length) are byte-identical to the scalar
+                //    `emit_backref_contig` walk; bytes above dst are X3
+                //    overshoot (never read back). `length > 240` (vanishingly
+                //    rare — mean back-ref len 6.3) takes the proven scalar
+                //    path so the write extent stays inside the
+                //    MAX_RUN_LENGTH+8 ring envelope: MOVDQU tail overshoot
+                //    <= 15, so dst+240+15 = dst+255 <= cap-12 (the scalar
+                //    path's own bound is dst+264 <= cap-3,
+                //    marker_inflate.rs:2959-2962).
+                "cmp {t2}, 240",
+                "ja 70f",                             // long (rare) → scalar path
+                "lea {ret}, [{dst} + {t2}]",          // ret = end = dst + length
+                "movdqu xmm0, [{t4}]",                // load 16 from src
+                "mov {t5:e}, 16",
+                "cmp {t5}, {t2}",
+                "cmovg {t5}, {t2}",                   // t5 = min(16, length)
+                "cmp {t1}, {t5}",
+                "jb 72f",                             // distance < min → overlap (small)
+                "71:",                                // large_byte_copy (igzip 603-612)
+                "movdqu [{t4} + {t1}], xmm0",         // store 16 at src+distance (= dst run)
+                "sub {t2}, 16",
+                "jle 74f",
+                "add {t4}, 16",
+                "movdqu xmm0, [{t4}]",
+                "jmp 71b",
+                "72:",                                // small_byte_copy_pre (igzip 614-616)
+                "add {t2}, {t1}",                     // repeat_length += distance
+                "73:",                                // small_byte_copy (igzip 617-623)
+                "movdqu [{t4} + {t1}], xmm0",
+                "shl {t1}, 1",                        // distance *= 2 (grow the period)
+                "movdqu xmm0, [{t4}]",
+                "cmp {t1}, 16",
+                "jl 73b",
+                "sub {t2}, {t1}",                     // repeat_length -= distance
+                "jg 71b",                             // remainder (> 0) → large
+                "74:",
+                "mov {dst}, {ret}",                   // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                // ── scalar fallback (length > 240): emit_backref_contig
+                //    transliterated. t1=distance t2=length t4=src {ret}=cursor
+                //    t5=word {t3}=carried entry (LIVE across the copy)
+                "70:",
+                "mov {ret}, {dst}",
+                "cmp {t2}, 40",
+                "jbe 52f",
+                "prefetcht0 byte ptr [{t4} + 40]",    // length > 40 (P3.4 item 3B)
+                "52:",
+                "add {t2}, {dst}",                    // t2 = end = dst + length
+                "cmp {t1}, 8",
+                "jb 55f",
+                // dist >= 8: unconditional 5-word burst, then stride-8
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "mov {t5}, qword ptr [{t4} + 8]",
+                "mov qword ptr [{ret} + 8], {t5}",
+                "mov {t5}, qword ptr [{t4} + 16]",
+                "mov qword ptr [{ret} + 16], {t5}",
+                "mov {t5}, qword ptr [{t4} + 24]",
+                "mov qword ptr [{ret} + 24], {t5}",
+                "mov {t5}, qword ptr [{t4} + 32]",
+                "mov qword ptr [{ret} + 32], {t5}",
+                "add {ret}, 40",
+                "cmp {ret}, {t2}",
+                "jae 59f",                            // length <= 40 → done
+                "add {t4}, 40",
+                "53:",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, 8",
+                "add {ret}, 8",
+                "cmp {ret}, {t2}",
+                "jb 53b",
+                "jmp 59f",
+                "55:",
+                "cmp {t1:e}, 1",
+                "jne 56f",
+                // dist == 1: RLE broadcast-word fill while dst < end
+                "movzx {t5:e}, byte ptr [{t4}]",
+                "mov {t1}, 0x0101010101010101",
+                "imul {t5}, {t1}",
+                "54:",
+                "mov qword ptr [{ret}], {t5}",
+                "add {ret}, 8",
+                "cmp {ret}, {t2}",
+                "jb 54b",
+                "jmp 59f",
+                // 2 <= dist <= 7: stride-dist words, 4 unconditional then
+                // while dst < end
+                "56:",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "57:",
+                "cmp {ret}, {t2}",
+                "jae 59f",
+                "mov {t5}, qword ptr [{t4}]",
+                "mov qword ptr [{ret}], {t5}",
+                "add {t4}, {t1}",
+                "add {ret}, {t1}",
+                "jmp 57b",
+                "59:",
+                "mov {dst}, {t2}",                    // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                // ── RECLASS un-consume via FROM-DATA RE-READ (X2). The igzip-
+                //    shape body consumes+refills+spec-stores before the late
+                //    discriminator, so a rare exit hands Rust the packet UN-
+                //    consumed. Each bail sets {ret}=tag and jumps to 85: which
+                //    reconstructs the cursor from the iteration-top bit anchor
+                //    [ctx+56]=p0 (NOT a 4-value snapshot):
+                //      byte = p0>>3 ; skip = p0&7
+                //      bitbuf = load_u64(in_ptr+byte) >> skip   (low 64-skip bits = the
+                //                                                bitstream from p0)
+                //      bitsleft = 64 - skip   (∈[57,64] ⇒ X5 bitsleft>=48 holds)
+                //      pos = byte + 8 ; dst = [ctx+64]=d0
+                //    8-byte read in-range by IN_MARGIN (p0>>3 <= pos < in_lim =
+                //    len-40 ⇒ byte+8 < len). Byte-exact: p0 is the exact un-
+                //    consumed packet start; the re-read yields the SAME low bits
+                //    decode_prefilled reads (a different but equivalent cursor
+                //    REPRESENTATION). The ref model uses the identical re-read in
+                //    lockstep; the caller only re-runs decode_prefilled(&lb),
+                //    never inspecting the cursor shape. igzip has no counterpart
+                //    (stateless — it never un-consumes).
+                // NIGHT15 decomposed dist-bail labels (replace the lumped 80:).
+                // All reconstruct identically at 85: (re-read from p0, dst=d0);
+                // the only difference is the stat tag in {ret}. Byte-transparent.
+                "90:",
+                "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
+                "jmp 85f",
+                // FLOOR ORACLE (NIGHT16): INLINE subtable-dist (igzip
+                // decode_next_dist long path, igzip_decode_block_stateless.asm
+                // macro 396-440; mirror of production careful path
+                // marker_inflate.rs:3447-3449 `if is_subtable_ptr { consume(9);
+                // lookup_subtable_direct }`). At 91:: {dpre}=={t1}=subtable
+                // pointer entry, {t2}=length (PRESERVE), bitbuf/bitsleft are
+                // post-litlen+refill, t3/t4 free. Consume the 9 main DistTable
+                // bits, index the subtable, load the leaf into {t1}, re-enter
+                // 94b — where the leaf's total_bits/codeword_bits (= len-9 +
+                // extra, relative to the post-9-consume bitbuf, since the
+                // builder stores subtable_len = len-table_bits) are decoded by
+                // the unchanged in-register entry path. Byte-exact (ref lockstep
+                // in run_contig_ref_biased).
+                "91:",
+                "shr {bitbuf}, 9",                    // consume DistTable::TABLE_BITS=9
+                "sub {bitsleft}, 9",
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 8",
+                "and {t3:e}, 0xF",                    // subtable_bits (DistEntry bits 11-8)
+                "bzhi {t4}, {bitbuf}, {t3}",          // idx = bitbuf & ((1<<sb)-1)   (sb<=6)
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 16",                     // subtable_start (DistEntry bits 31-16)
+                "add {t4:e}, {t3:e}",
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {dist_off}]",   // leaf entry
+                "jmp 94b",
+                "92:",
+                "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
+                "jmp 85f",
+                "93:",
+                "mov {ret}, 8",                       // RECLASS marker (src<out_base; out of scope)
+                "jmp 85f",
+                "82:",
+                "mov {ret}, 2",                       // RECLASS, lone-EOB tag
+                "jmp 85f",
+                "83:",
+                "mov {ret}, 3",                       // RECLASS, multi-trailing tag
+                "jmp 85f",
+                // ── exits ───────────────────────────────────────────────
+                "8:",
+                "mov {ret}, 0",                       // RECLASS (lone/long oversize — CONSUMED)
+                "jmp 85f",                            // → reconstruct
+                "85:",
+                "mov {t2}, {p0}",                     // p0 (in-register anchor)
+                "mov {t1}, {t2}",
+                "and {t1:e}, 7",                      // skip = p0 & 7
+                "shr {t2}, 3",                        // byte = p0 >> 3
+                "mov {bitbuf}, qword ptr [{in_ptr} + {t2}]",
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // >> skip
+                "mov {bitsleft:e}, 64",
+                "sub {bitsleft}, {t1}",               // bitsleft = 64 - skip
+                "lea {pos}, [{t2} + 8]",              // pos = byte + 8
+                "mov {dst}, {d0}",                    // dst = d0 (in-register anchor)
+                "jmp 9f",
+                // ── invalid (bc==0) exit: reached PRE-consume (short 438 /
+                //    long 546), so the cursor is ALREADY at the un-consumed
+                //    packet start and dst is still d0 — leave both UNCHANGED
+                //    (X6), no re-read. ──
+                "86:",
+                "mov {ret}, 0",                       // RECLASS (invalid)
+                "9:",
+                // ELEMENT A single base: {ctx} addresses the inline litlen +
+                // dist tables via const-operand displacements (igzip single
+                // state base). {short_tbl} + {dtbl} are GONE (2 GP freed);
+                // {p0}/{d0} carry the un-consume anchor in those freed regs.
+                ctx = in(reg) ctx as *const AsmState,
+                injn = sym INJECT_N,                  // NIGHT35 injector count
+                injm = sym INJECT_MODE,               // NIGHT35 injector mode
+                in_ptr = in(reg) ctx.in_ptr,
+                dpre = out(reg) _,                    // preloaded dist entry carried 50: → 58:
+                p0 = out(reg) _,                      // iteration-top bit anchor (was [ctx+56])
+                d0 = out(reg) _,                      // iteration-top dst anchor (was [ctx+64])
+                lit_off = const ASM_LIT_SHORT_OFF,    // [ctx + idx*4 + lit_off]
+                llong_off = const ASM_LIT_LONG_OFF,   // lea [ctx + llong_off]
+                dist_off = const ASM_DIST_OFF,        // [ctx + idx*4 + dist_off]
+                bitbuf = inout(reg) bitbuf,
+                bitsleft = inout(reg) bitsleft,
+                pos = inout(reg) pos,
+                dst = inout(reg) dst_c,
+                ret = out(reg) ret,
+                t1 = out(reg) _,
+                t2 = out(reg) _,
+                t3 = out(reg) _,
+                t4 = out(reg) _,
+                t5 = out(reg) _,
+                out("xmm0") _, // MOVDQU back-ref copy scratch (16-byte SIMD)
+                options(nostack),
+            );
+        }
+        lb.bitbuf = bitbuf;
+        lb.bitsleft = bitsleft as u32;
+        lb.pos = pos as usize;
+        (ret, dst_c)
+    }
+
     /// NIGHT32 — STATELESS variant of `run_contig` for the isolated kernel A/B.
     ///
     /// IDENTICAL to `run_contig` EXCEPT the divergence-D-1 resumable-contract
@@ -1410,8 +2033,8 @@ mod imp {
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 pub use imp::{
-    dump_if_enabled, enabled, note_exit, run_contig, run_contig_stateless, stateless_enabled,
-    stateless_entries, stats_enabled,
+    dump_if_enabled, enabled, inject_enabled, inject_n, note_exit, run_contig, run_contig_inject,
+    run_contig_stateless, stateless_enabled, stateless_entries, stats_enabled,
 };
 #[cfg(all(test, feature = "asm-kernel", target_arch = "x86_64"))]
 pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};

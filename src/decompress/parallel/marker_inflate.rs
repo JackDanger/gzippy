@@ -1220,18 +1220,25 @@ impl Block {
         // (`ensure_dist_table`) — does not pay a redundant second distance
         // build. Converges toward igzip's single inline distance table
         // (`make_inflate_huff_code_dist`, igzip_inflate.c).
+        // NIGHT35 table-build slope knob (byte-transparent): repeat the litlen
+        // LUT build `tbuild_mult()` times into the idempotent state. Default 1.
+        let tmult = tbuild_mult();
         match self.compression_type {
             CompressionType::FixedHuffman => {
-                if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
-                    return Err(BlockError::InvalidCodeLengths);
+                for _ in 0..tmult {
+                    if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
+                        return Err(BlockError::InvalidCodeLengths);
+                    }
                 }
             }
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
                 let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
                 lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
-                if !self.lut_litlen_rebuild(&lit_stack[..split]) {
-                    return Err(BlockError::InvalidCodeLengths);
+                for _ in 0..tmult {
+                    if !self.lut_litlen_rebuild(&lit_stack[..split]) {
+                        return Err(BlockError::InvalidCodeLengths);
+                    }
                 }
             }
             CompressionType::Uncompressed | CompressionType::Reserved => {}
@@ -3216,6 +3223,13 @@ impl Block {
             // per region call (not per iteration); SAFE only at T1 valid blocks.
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
             let stateless_kernel: bool = super::asm_kernel::stateless_enabled();
+            // NIGHT35 production-wall kernel instruction injector (measurement
+            // only): when GZIPPY_KERNEL_INJECT>0, dispatch to run_contig_inject
+            // (byte-transparent per-iteration dummy work). One branch per region
+            // call (not per iteration). inject_enabled() also populates the
+            // INJECT_N/INJECT_MODE statics the asm reads.
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            let inject_kernel: bool = super::asm_kernel::inject_enabled();
             macro_rules! sync_local_bits {
                 () => {{
                     bits.pos = lb.pos;
@@ -3304,6 +3318,8 @@ impl Block {
                     let (exit, dst1) = unsafe {
                         if stateless_kernel {
                             super::asm_kernel::run_contig_stateless(&self.asm, &mut lb, dst0)
+                        } else if inject_kernel {
+                            super::asm_kernel::run_contig_inject(&self.asm, &mut lb, dst0)
                         } else {
                             super::asm_kernel::run_contig(&self.asm, &mut lb, dst0)
                         }
@@ -4137,6 +4153,23 @@ const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_S
 fn dist_amort_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("GZIPPY_DIST_AMORT").is_ok_and(|v| v == "0"))
+}
+
+/// NIGHT35 (re-added NIGHT28/NIGHT33 perturbation at HEAD): per-block
+/// table-build multiplier. `GZIPPY_TBUILD_MULT=N` runs the per-block litlen
+/// LUT build N times into the SAME idempotent state (N-1 throwaway rebuilds +
+/// the real one). `rebuild_from` is a FULL repopulate (clears valid + tables
+/// first), so the table the decode reads is byte-identical at any N — this is
+/// a byte-transparent Gate-2 slope knob for the table-build's ON-WALL share.
+fn tbuild_mult() -> u64 {
+    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("GZIPPY_TBUILD_MULT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
 }
 
 // ELEMENT A: the process-wide `fixed_dist_table()` static is REMOVED — the
