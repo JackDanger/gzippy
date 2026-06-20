@@ -26,8 +26,15 @@ run_one() {
       perf stat -x, -e cycles,instructions \
       "$BIN" --arm "$arm" --reps "$REPS" 2>"$perflog" \
       | grep '^ARM=' | sed -E 's/.*bytes=([0-9]+).*/\1/')
-  cyc=$(grep -E ',cycles' "$perflog" | head -1 | cut -d, -f1)
-  ins=$(grep -E ',instructions' "$perflog" | head -1 | cut -d, -f1)
+  # Hybrid CPU: perf emits cpu_atom + cpu_core events. We pin to a P-core, so
+  # take the cpu_core counts (the cpu_atom rows are <not counted>). Fall back to
+  # a plain 'cycles'/'instructions' event name on non-hybrid perf.
+  cyc=$(grep -E 'cpu_core/cycles/' "$perflog" | head -1 | cut -d, -f1)
+  ins=$(grep -E 'cpu_core/instructions/' "$perflog" | head -1 | cut -d, -f1)
+  if [ -z "$cyc" ]; then
+    cyc=$(grep -E ',cycles,|,cycles$|cycles,' "$perflog" | head -1 | cut -d, -f1)
+    ins=$(grep -E ',instructions,|,instructions$|instructions,' "$perflog" | head -1 | cut -d, -f1)
+  fi
   rm -f "$perflog"
   # Strip any thousands separators perf might emit.
   cyc=${cyc//[^0-9]/}; ins=${ins//[^0-9]/}
