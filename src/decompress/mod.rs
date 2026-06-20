@@ -459,10 +459,14 @@ fn decompress_single_member_for<W: Write>(
             if crate::utils::debug_enabled() {
                 use std::sync::atomic::Ordering::Relaxed;
                 eprintln!(
-                    "[gzippy] flat_contig calls={} bytes={}",
+                    "[gzippy] flat_contig calls={} bytes={} careful_calls={} clean_lut_builds={}",
                     crate::decompress::inflate::consume_first_decode::FLAT_CONTIG_CALLS
                         .load(Relaxed),
                     crate::decompress::inflate::consume_first_decode::FLAT_CONTIG_BYTES
+                        .load(Relaxed),
+                    crate::decompress::inflate::consume_first_decode::FLAT_CAREFUL_CALLS
+                        .load(Relaxed),
+                    crate::decompress::inflate::consume_first_decode::CLEAN_LUT_BUILDS
                         .load(Relaxed),
                 );
             }

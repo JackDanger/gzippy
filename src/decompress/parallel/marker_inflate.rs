@@ -3072,13 +3072,18 @@ impl Block {
             *pos,
             n_max_to_decode,
         );
+        // LAZY two-level LUT build (engine B). Validate the compression type
+        // here, but DEFER `build_huffman_luts_for_block` (which builds the
+        // engine-B `lut_litlen` table) until just before the engine-B fallback
+        // loop below. Engine A (the production clean path) commits on EVERY exit
+        // without ever touching `lut_litlen`, so on the clean path the engine-B
+        // table is never built — retiring the clean-path double table-build. The
+        // dynamic-header validity check that `build_huffman_luts_for_block`
+        // performed is preserved: the flat path validates via
+        // `LitLenTable::build` (ensure_flat_litlen → false on bad lengths), and
+        // the engine-B fallback still calls `build_huffman_luts_for_block()?`.
         match self.compression_type {
-            CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
-                if !self.block_huffman_luts_ready {
-                    self.build_huffman_luts_for_block()?;
-                    self.block_huffman_luts_ready = true;
-                }
-            }
+            CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {}
             _ => return Err(BlockError::InvalidCompression),
         }
         // P3.1 lazy dist_table: only needed in the contig fast loop, so skip
@@ -3269,7 +3274,54 @@ impl Block {
                         FLAT_CONTIG_BYTES
                             .fetch_add(delta as u64, std::sync::atomic::Ordering::Relaxed);
                         reread(bits);
-                        // fall through to the engine-B careful tail below.
+                        // ENGINE-A FLAT CAREFUL TAIL (the convergence): finish the
+                        // <FASTLOOP_MARGIN residual + the exact n_max/EOB boundary
+                        // with engine A's own flat resumable careful loop, then
+                        // COMMIT — the engine-B two-level speculative loop + careful
+                        // tail below are NOT reached on the clean path, and the
+                        // engine-B `lut_litlen` table is never built. `out_fastloop_end`
+                        // (= *pos_initial + local_cap) is the absolute budget cap.
+                        use crate::decompress::inflate::consume_first_decode::{
+                            decode_clean_careful_flat, FlatCarefulExit,
+                        };
+                        let cexit = decode_clean_careful_flat(
+                            bits,
+                            out_slice,
+                            *pos,
+                            out_fastloop_end,
+                            litlen_ref,
+                            &self.asm.dist,
+                        );
+                        match cexit {
+                            FlatCarefulExit::EndOfBlock(p) => {
+                                let d = p - *pos;
+                                *pos = p;
+                                emitted += d;
+                                FLAT_CONTIG_BYTES
+                                    .fetch_add(d as u64, std::sync::atomic::Ordering::Relaxed);
+                                self.at_end_of_block = true;
+                                reread(bits);
+                                commit!(Ok(emitted));
+                            }
+                            FlatCarefulExit::Stopped(p) => {
+                                let d = p - *pos;
+                                *pos = p;
+                                emitted += d;
+                                FLAT_CONTIG_BYTES
+                                    .fetch_add(d as u64, std::sync::atomic::Ordering::Relaxed);
+                                reread(bits);
+                                commit!(Ok(emitted));
+                            }
+                            FlatCarefulExit::InvalidDistance(p) => {
+                                let d = p - *pos;
+                                *pos = p;
+                                emitted += d;
+                                FLAT_CONTIG_BYTES
+                                    .fetch_add(d as u64, std::sync::atomic::Ordering::Relaxed);
+                                reread(bits);
+                                commit!(Err(BlockError::ExceededWindowRange));
+                            }
+                        }
                     }
                     FlatFastloopExit::InvalidDistance(new_pos) => {
                         let delta = new_pos - *pos;
@@ -3282,6 +3334,23 @@ impl Block {
                     }
                 }
             }
+        }
+
+        // ── ENGINE-B fallback table-build (LAZY) ─────────────────────────────
+        // Reached ONLY when engine A did not take the block: a measurement knob
+        // forced engine B, the flat litlen build declined invalid lengths,
+        // `local_cap == 0`, `!dist_valid`, or the x86 BMI2 asm kernel is compiled
+        // in (engine A is cfg'd out there). Engine A commits on EVERY exit above,
+        // so on the production clean path this is NEVER reached — the engine-B
+        // two-level `lut_litlen` table is NOT built (the clean-path double-build
+        // retired). `CLEAN_LUT_BUILDS` counts the fallbacks (0 on a pure-clean
+        // run = Gate-0 non-inert proof). `build_huffman_luts_for_block` also
+        // performs the dynamic-header validity check for the engine-B path.
+        if !self.block_huffman_luts_ready {
+            self.build_huffman_luts_for_block()?;
+            self.block_huffman_luts_ready = true;
+            crate::decompress::inflate::consume_first_decode::CLEAN_LUT_BUILDS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // ── SPECULATIVE SOFTWARE-PIPELINED FAST LOOP (contig clean) ──────────
