@@ -614,9 +614,16 @@ impl DistTable {
     /// codes. 10 was tried and regressed (silesia ratio 2.41 → 2.85)
     /// — distance codes don't compress as well into a bigger table
     /// and L1d pressure starts dominating.
+    // STEP B-2 engine-A convergence (2026-06-21): arch-conditional. aarch64
+    // (engine A = production) -> 8, matching libdeflate's OFFSET_TABLEBITS=8
+    // (deflate_decompress.c:374). x86 keeps 9 (its tuned value; engine A there is
+    // the asm-off kernel). Byte-exact (table geometry only).
+    #[cfg(target_arch = "aarch64")]
+    pub const TABLE_BITS: u8 = 8;
+    #[cfg(not(target_arch = "aarch64"))]
     pub const TABLE_BITS: u8 = 9;
     /// Maximum number of subtable bits
-    pub const MAX_SUBTABLE_BITS: u8 = 6; // 15 - 9
+    pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
 
     /// An all-zero (no valid codes) table — the initial inline state before
     /// the first block builds into it (element A: `AsmState.dist`).
