@@ -324,9 +324,21 @@ pub(crate) static MARKER_DIST_LUT_OVERRIDE: std::sync::atomic::AtomicI8 =
 /// production builds): proves the differential's ON arm actually routed
 /// marker-fast-loop distance decodes through the DistTable path (and that the
 /// OFF arm routed zero through it).
+///
+/// THREAD-LOCAL, not a process-wide atomic: the differential asserts the OFF
+/// arm's delta is exactly zero, but the `marker_dist_lut` enable flag is latched
+/// ONCE per `decode_marker_fast_loop` call (not re-checked per backref), so a
+/// CONCURRENT test that latched the LUT ON *before* this test's OFF arm sets the
+/// override would keep incrementing a shared counter inside the OFF window —
+/// contaminating the delta (a real data race observed on slower/wider-window
+/// targets, e.g. aarch64 debug CI). The test's own `decode_marker_u16` runs
+/// synchronously on the test thread, so a thread-local cell captures exactly
+/// this decode's hits and is immune to other test threads. Test-only; no
+/// production reader.
 #[cfg(all(test, pure_inflate_decode))]
-pub(crate) static MARKER_DIST_LUT_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub(crate) static MARKER_DIST_LUT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// ENGINE-W INC-1 / N2 test override for the marker-fast-loop local-Bits
 /// mirror kill-switch (`GZIPPY_NO_MFAST_LOCALBITS`):
@@ -341,9 +353,15 @@ pub(crate) static MFAST_LOCALBITS_OVERRIDE: std::sync::atomic::AtomicI8 =
 /// Test-only routing counter for the N2 local-Bits ON arm: counts the number
 /// of 'mfast iterations that ran through the lb (stack-local) code path.
 /// Compiled out of production builds — engagement proof for the differential.
+///
+/// THREAD-LOCAL for the same reason as [`MARKER_DIST_LUT_HITS`]: the localbits
+/// enable flag is latched once per call, so a process-wide atomic would let a
+/// concurrent test's in-flight ON decode leak increments into this test's OFF
+/// (kill-switch) delta window. The test decodes synchronously on its own thread.
 #[cfg(test)]
-pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Effect-verification counters for the rung-(d) marker-loop DistTable arm
 /// (`GZIPPY_MARKER_DIST_STATS=1` — the GZIPPY_ASM_STATS pattern): proves on a
@@ -2273,8 +2291,7 @@ impl Block {
                                 // worst case (15-bit dist code + 13 extra).
                                 use crate::decompress::inflate::libdeflate_entry::DistTable;
                                 #[cfg(all(test, pure_inflate_decode))]
-                                MARKER_DIST_LUT_HITS
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                MARKER_DIST_LUT_HITS.with(|c| c.set(c.get() + 1));
                                 #[cfg(pure_inflate_decode)]
                                 if md_stats {
                                     marker_dist_stats::LUT_BACKREFS
@@ -2383,7 +2400,7 @@ impl Block {
             // bitbuf/bitsleft/pos to registers (ring stores can't alias lb).
             // Test-only routing counter proves the arm is taken.
             #[cfg(test)]
-            MFAST_LOCALBITS_ON_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MFAST_LOCALBITS_ON_ITERS.with(|c| c.set(c.get() + 1));
             let mut lb = Bits {
                 data: bits.data,
                 pos: bits.pos,
@@ -6778,14 +6795,14 @@ mod tests {
                 for &n_max in &[100_000usize, 1499] {
                     let tag = format!("{label} n_max={n_max}");
                     let (hits_on, on) = with_marker_dist_lut(false, || {
-                        let h0 = MARKER_DIST_LUT_HITS.load(Relaxed);
+                        let h0 = MARKER_DIST_LUT_HITS.with(|c| c.get());
                         let r = decode_marker_u16(&stream, n_max);
-                        (MARKER_DIST_LUT_HITS.load(Relaxed) - h0, r)
+                        (MARKER_DIST_LUT_HITS.with(|c| c.get()) - h0, r)
                     });
                     let (hits_off, off) = with_marker_dist_lut(true, || {
-                        let h0 = MARKER_DIST_LUT_HITS.load(Relaxed);
+                        let h0 = MARKER_DIST_LUT_HITS.with(|c| c.get());
                         let r = decode_marker_u16(&stream, n_max);
-                        (MARKER_DIST_LUT_HITS.load(Relaxed) - h0, r)
+                        (MARKER_DIST_LUT_HITS.with(|c| c.get()) - h0, r)
                     });
                     assert_eq!(on.0, off.0, "{tag}: u16 output diverged");
                     assert_eq!(on.1, off.1, "{tag}: cursor/state diverged");
@@ -6947,16 +6964,16 @@ mod tests {
 
                     // ON arm: lb path
                     let (iters_on, on) = with_localbits(true, || {
-                        let i0 = MFAST_LOCALBITS_ON_ITERS.load(Relaxed);
+                        let i0 = MFAST_LOCALBITS_ON_ITERS.with(|c| c.get());
                         let r = decode_marker_u16(&stream, n_max);
-                        (MFAST_LOCALBITS_ON_ITERS.load(Relaxed) - i0, r)
+                        (MFAST_LOCALBITS_ON_ITERS.with(|c| c.get()) - i0, r)
                     });
 
                     // OFF arm: struct-field path (kill-switch)
                     let (iters_off, off) = with_localbits(false, || {
-                        let i0 = MFAST_LOCALBITS_ON_ITERS.load(Relaxed);
+                        let i0 = MFAST_LOCALBITS_ON_ITERS.with(|c| c.get());
                         let r = decode_marker_u16(&stream, n_max);
-                        (MFAST_LOCALBITS_ON_ITERS.load(Relaxed) - i0, r)
+                        (MFAST_LOCALBITS_ON_ITERS.with(|c| c.get()) - i0, r)
                     });
 
                     // Byte-identical u16 output.
