@@ -212,6 +212,31 @@ Commit ONLY byte-exact states.
 Maintain `plans/BEAT-IGZIP-T1-STATE.md` after each step (what implemented, byte-exact status,
 current cyc/B vs igzip). Commit only byte-exact states to perf/igzip-full-rewrite.
 
+### 6.1 EMISSION APPORTIONMENT of STEP-0's +3.22 instr/B (2026-06-21, STATIC objdump @59b3123e — NOT-YET-LAW, HYPOTHESIS-tier; full note `plans/EMISSION-APPORTION-2026-06-21.md`)
+Static disasm of `run_contig` vs ISA-L `_04` (Intel guest, load-immune). **The premise
+that the +3.22 instr/B is a hot-loop emission gap portable from `_04`'s `loop_block` is
+FALSIFIED:**
+- **Hot LITERAL group: gz 37 insns vs `_04` 38 → gz is −1 (already converged/ahead).**
+  Element-by-element parity except gz's D-1 anchor (+2), offset by gz omitting the EOB
+  test (−2) and the spec length precompute (−1) on the literal path.
+- **Packing is IDENTICAL** (both pack up to 3 lits/group; `make_inflate_huff_code_lit_len`
+  called with `TRIPLE_SYM_FLAG`, faithful igzip_inflate.c:386-599 port). "gz decodes
+  fewer symbols/iteration" is FALSE.
+- **Element M (MOVDQU copy) HOLDS at parity** (gz 10 ≈ `_04` 9 insns/copy) — NOT overturned.
+- **D-1 anchor confirmed ≈0.6–0.83 instr/B** (consistent with NIGHT32's 0.607) — NON-ADDRESSABLE.
+- The only hot-loop divergence is the **length/backref TAIL (≈+1.8 instr/B gross)**,
+  DIFFUSE and dominated by NON-portable costs: D-1 anchor (~0.6, SLACK) + the
+  architectural parallel **window-base/marker validation** (~0.59, no `_04` counterpart)
+  + resumable contract (~0.23). The lone in-loop `_04`-portable sub-bucket = the
+  **pre-copy refill cadence on the backref arm** (~+0.23, element-F applied to `58:`/`51:`).
+- **CONSERVATION GAP (reported, not forced):** hot-loop buckets sum to ≈+1.8 instr/B
+  (~56% of +3.22). **~+1.4 instr/B (~44%) is OUTSIDE `run_contig`** — in the
+  `decode_clean_into_contig` SCAFFOLD (5959-insn Rust fn vs `_04`'s 331-insn monolith;
+  no loop_block counterpart). This SCAFFOLD residual is the **LARGEST addressable
+  bucket** and the redirected port target — but its per-byte EXECUTED share is OWED
+  (objdump gives static size only). **NEXT ACTION: apportion the scaffold's
+  executed-per-byte path BEFORE any port** (the hot loop is already converged).
+
 ---
 
 ## 7. RESUME POINTERS
