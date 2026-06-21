@@ -5173,6 +5173,23 @@ pub fn record_block_starts(data: &[u8]) -> std::io::Result<Vec<usize>> {
 mod tests {
     use super::*;
 
+    /// ONE shared lock for ALL same-binary kill-switch differential tests
+    /// (`marker_dist_lut_diff`, `mfast_local_bits_diff`, `stored_flip`). Each
+    /// of those tests flips a PROCESS-WIDE override atomic
+    /// (`MARKER_DIST_LUT_OVERRIDE` / `MFAST_LOCALBITS_OVERRIDE` /
+    /// `STORED_FLIP_OVERRIDE`) and then compares two decode arms expecting
+    /// byte- AND cursor-identical results. Per-module locks were NOT enough:
+    /// while test A held its own lock comparing its two arms, test B (a
+    /// different module, different lock) could flip a DIFFERENT global override
+    /// mid-comparison, so A's two arms decoded under different background-switch
+    /// state and diverged (observed as a spurious "cursor/state diverged" on
+    /// the rand/stored case under parallel test scheduling — never in
+    /// isolation). A single shared lock makes the three mutually exclusive so no
+    /// override is mutated inside another's comparison window. (Non-differential
+    /// tests only READ the overrides at their -1 default, so they cannot
+    /// corrupt a comparison and need not take this lock.)
+    pub(super) static DIFFERENTIAL_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn make_bits(data: &[u8]) -> Bits<'static> {
         // Leak a static copy so the Bits borrow is 'static within the test.
         let boxed: &'static [u8] = Box::leak(data.to_vec().into_boxed_slice());
@@ -6618,9 +6635,6 @@ mod tests {
     mod marker_dist_lut_diff {
         use super::*;
         use std::sync::atomic::Ordering::Relaxed;
-        use std::sync::Mutex;
-
-        static LOCK: Mutex<()> = Mutex::new(());
 
         struct OverrideGuard;
         impl Drop for OverrideGuard {
@@ -6630,7 +6644,9 @@ mod tests {
         }
 
         fn with_marker_dist_lut<T>(disabled: bool, f: impl FnOnce() -> T) -> T {
-            let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = super::DIFFERENTIAL_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             MARKER_DIST_LUT_OVERRIDE.store(if disabled { 1 } else { 0 }, Relaxed);
             let _restore = OverrideGuard;
             f()
@@ -6832,9 +6848,6 @@ mod tests {
     mod mfast_local_bits_diff {
         use super::*;
         use std::sync::atomic::Ordering::Relaxed;
-        use std::sync::Mutex;
-
-        static LOCK: Mutex<()> = Mutex::new(());
 
         struct OverrideGuard;
         impl Drop for OverrideGuard {
@@ -6844,7 +6857,9 @@ mod tests {
         }
 
         fn with_localbits<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
-            let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = super::DIFFERENTIAL_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // 0 = force ON; 1 = force OFF (kill-switch)
             MFAST_LOCALBITS_OVERRIDE.store(if enabled { 0 } else { 1 }, Relaxed);
             let _restore = OverrideGuard;
@@ -7017,9 +7032,6 @@ mod tests {
         use super::*;
         use crate::decompress::parallel::replace_markers::MARKER_BASE;
         use std::sync::atomic::Ordering::Relaxed;
-        use std::sync::Mutex;
-
-        static LOCK: Mutex<()> = Mutex::new(());
 
         struct OverrideGuard;
         impl Drop for OverrideGuard {
@@ -7029,7 +7041,9 @@ mod tests {
         }
 
         fn with_stored_flip<T>(disabled: bool, f: impl FnOnce() -> T) -> T {
-            let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = super::DIFFERENTIAL_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             STORED_FLIP_OVERRIDE.store(if disabled { 1 } else { 0 }, Relaxed);
             let _restore = OverrideGuard;
             f()
