@@ -1,0 +1,89 @@
+================ INTEL gz-vs-rapidgzip cyc/B + instr/B AXIS ================
+GZ=/dev/shm/gzrg-target/release/gzippy  sha=b5eec9eed5feeb45
+RG=/root/oracle_c/rapidgzip-native  sha=41baa20fdfbdea24  ver=version 0.16.0
+CORP=/root/silesia.gz  pin_t1=cpu3  pin_t4=cpu{2,4,6,8}  N=15
+load: 4.04 4.43 4.29 2/2394 2976236
+host-freq-state: no_turbo=0 gov=powersave (LXC: host-managed/read-only; gate=measured GHz spread)
+--- GATE-0 FLAVOR/PATH (gz) ---
+    flavor=parallel-sm+pure   path=ParallelSM
+    PATH PASS (ParallelSM)
+--- GATE-0 BYTE-EXACT (sha; /dev/null sink) ---
+    ref(zcat)=028bd002c89c9a90  gz=028bd002c89c9a90  rg=028bd002c89c9a90
+    BYTE-EXACT PASS (gz==rg==zcat)
+    output_bytes=211968000
+--- MEASURE T1 (single P-core cpu3) interleaved gzA,gzB,rgA,rgB x N=15 ---
+--- MEASURE T4 (4 P-cores cpuset {2,4,6,8}) interleaved gzA,gzB,rgA,rgB x N=15 ---
+load(post): 5.06 4.62 4.36 2/2393 2983685
+
+#################### AXIS ANALYSIS ####################
+output_bytes = 211968000
+
+========================= T1 =========================
+metric                      gz(native)       rapidgzip     gz/rg
+instr/B (mean)                 13.6496         11.9420    1.1430
+cyc/B (best-of-N)               5.4541          5.1115    1.0670
+cyc/B (mean)                    5.4836          5.1261    1.0697
+IPC (best)                      2.5037          2.3365    1.0716
+IPC (mean)                      2.4892          2.3296    1.0685
+GHz (mean)                      1.3955          1.3954    1.0001
+LLC-miss/B                      0.0009          0.0033    0.2797
+wall ms (best)                   831.3           780.9    1.0646
+wall ms (med)                    836.8           783.7    1.0678
+task-clock ms                    833.0           778.7    1.0697
+CPUs-utilized                    0.995           0.994    1.0015
+-- Gate-0 stability --
+   instr inter-run spread:  gz 0.140%  rg 0.123%  (LOAD-IMMUNE PRIMITIVE; gate <0.5%): PASS
+   GHz spread:              gz 0.079%  rg 0.113%  (gate <=1%): PASS
+   wall spread:             gz 1.3%   rg 0.8%
+   A/A wall ratio:          gz 0.9973  rg 1.0042  (license <=1.02): PASS
+   GHz fairness gz-vs-rg:   0.01% apart (fair)
+-- T1 AXIS NUMBERS --
+   instr/B ratio gz/rg = 1.1430  (+14.3%)  [LOAD-IMMUNE]
+   cyc/B   ratio gz/rg = 1.0670  (+6.7%)
+   IPC     ratio gz/rg = 1.0716  (+7.2%)
+   wall    ratio gz/rg = 1.0646  (+6.5%)  (A/A-licensed)
+
+========================= T4 =========================
+metric                      gz(native)       rapidgzip     gz/rg
+instr/B (mean)                 22.7893         22.1888    1.0271
+cyc/B (best-of-N)               9.6437          9.2742    1.0398
+cyc/B (mean)                    9.7103          9.3910    1.0340
+IPC (best)                      2.3594          2.3814    0.9908
+IPC (mean)                      2.3469          2.3628    0.9933
+GHz (mean)                      1.3931          1.3942    0.9992
+LLC-miss/B                      0.0023          0.0038    0.6134
+wall ms (best)                   586.4           501.8    1.1686
+wall ms (med)                    591.0           522.4    1.1314
+task-clock ms                   1477.5          1427.8    1.0348
+CPUs-utilized                    2.468           2.736    0.9023
+-- Gate-0 stability --
+   instr inter-run spread:  gz 0.403%  rg 1.067%  (LOAD-IMMUNE PRIMITIVE; gate <0.5%): WARN
+   GHz spread:              gz 0.108%  rg 0.112%  (gate <=1%): PASS
+   wall spread:             gz 5.2%   rg 7.7%
+   A/A wall ratio:          gz 1.0050  rg 0.9935  (license <=1.02): PASS
+   GHz fairness gz-vs-rg:   0.08% apart (fair)
+-- T4 AXIS NUMBERS --
+   instr/B ratio gz/rg = 1.0271  (+2.7%)  [LOAD-IMMUNE]
+   cyc/B   ratio gz/rg = 1.0398  (+4.0%)
+   IPC     ratio gz/rg = 0.9908  (-0.9%)
+   wall    ratio gz/rg = 1.1686  (+16.9%)  (A/A-licensed)
+
+>>> T1 AXIS:
+    cyc/B gap = +6.7%   instr/B gap = +14.3%   IPC gap = +7.2%
+    util: gz=0.995 cores  rg=0.994 cores  util-deficit(rg/gz)=0.9985 (-0.1%)
+    WALL decomposition: wall_ratio 1.0646 ~= cyc/B_ratio 1.0670 x util-deficit 0.9985 (= 1.0654)
+    WALL gap share (approx): per-byte CPU-work 104% | parallel-utilization -2%
+    cyc/B gap decomposition: instructions 206% | IPC(1/ipc) -107%
+    => INSTRUCTION-COUNT AXIS (gz executes more instr/B at comparable/better IPC)
+       -> silesia gap is apportionable/portable -> recommend STEP 2 (per-phase localize)
+
+>>> T4 AXIS:
+    cyc/B gap = +4.0%   instr/B gap = +2.7%   IPC gap = -0.9%
+    util: gz=2.468 cores  rg=2.736 cores  util-deficit(rg/gz)=1.1083 (+10.8%)
+    WALL decomposition: wall_ratio 1.1686 ~= cyc/B_ratio 1.0398 x util-deficit 1.1083 (= 1.1524)
+    WALL gap share (approx): per-byte CPU-work 24% | parallel-utilization 64%
+    cyc/B gap decomposition: instructions 68% | IPC(1/ipc) 24%
+    => MIXED / inconclusive — see numbers (instr and IPC both contribute)
+
+>>> T1-vs-T4 AGREEMENT on instr-axis sign: NO — they disagree
+DONE_INTEL_GZ_RG_AXIS
