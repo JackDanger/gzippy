@@ -483,7 +483,17 @@ fn decompress_single_member_for<W: Write>(
                 decompress_stored_parallel, StoredSplitError,
             };
             match decompress_stored_parallel(data, writer, num_threads) {
-                Ok(n) => Ok(n),
+                Ok(n) => {
+                    if crate::utils::debug_enabled() {
+                        eprintln!(
+                            "[gzippy] StoredParallel ok: {n} bytes; pure-stored chunked-streaming \
+                             runs (no monolithic buffer)={}",
+                            crate::decompress::parallel::stored_split::STORED_STREAM_RUNS
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                    }
+                    Ok(n)
+                }
                 Err(StoredSplitError::NotStoredDominated) => {
                     if crate::utils::debug_enabled() {
                         eprintln!(
