@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::decompress::parallel::crc32::{combine_crc32, crc32};
 use crate::decompress::parallel::gzip_format;
+use crc32fast::Hasher;
 
 /// Counter: number of times StoredParallel was demoted to ParallelSM because
 /// the Huffman tail accounts for >= 50% of total output (prefix_out < 50% of
@@ -686,8 +687,15 @@ fn fill_and_crc(
     // partitioned copy+CRC pays depends on the box's memory subsystem).
     let force_inline = std::env::var_os("GZIPPY_STORED_INLINE_COPY").is_some();
     if force_inline || threads <= 1 || total < 1 << 20 {
-        copy_runs(output, deflate, base_off, runs);
-        return crc32(output);
+        // Fused copy+CRC: hash each run's bytes while they are still hot in
+        // cache from the copy, instead of a SECOND full pass over `output`.
+        // A/B knob `GZIPPY_STORED_SPLIT_CRC=1` restores the old split (copy
+        // then `crc32(output)`) for measurement parity.
+        if std::env::var_os("GZIPPY_STORED_SPLIT_CRC").is_some() {
+            copy_runs(output, deflate, base_off, runs);
+            return crc32(output);
+        }
+        return copy_runs_fused_crc(output, deflate, base_off, runs);
     }
 
     // Partition the run list into `threads` contiguous groups, balanced by
@@ -719,17 +727,36 @@ fn fill_and_crc(
     std::thread::scope(|scope| {
         for ((part, out_slice), result) in parts.iter().zip(out_slices).zip(results.iter_mut()) {
             let runs_part = &runs[part.clone()];
+            let split_crc = std::env::var_os("GZIPPY_STORED_SPLIT_CRC").is_some();
             scope.spawn(move || {
                 // Each run's out_off is absolute; translate to slice-local by
                 // subtracting the partition's first run's out_off.
                 let local_base = runs_part.first().map(|r| r.out_off).unwrap_or(0);
-                for r in runs_part {
-                    let dst = r.out_off - local_base;
-                    out_slice[dst..dst + r.len].copy_from_slice(
-                        &deflate[r.src_off - base_off..r.src_off - base_off + r.len],
-                    );
+                let out_len = out_slice.len();
+                if split_crc {
+                    // Old behavior: copy, then a SECOND full pass for the CRC.
+                    for r in runs_part {
+                        let dst = r.out_off - local_base;
+                        out_slice[dst..dst + r.len].copy_from_slice(
+                            &deflate[r.src_off - base_off..r.src_off - base_off + r.len],
+                        );
+                    }
+                    *result = (crc32(out_slice), out_len);
+                } else {
+                    // Fused copy+CRC: hash each run's bytes while they are still
+                    // hot in cache from the copy (one pass over `output`, not
+                    // two). Runs within a partition are contiguous and ordered,
+                    // so an incremental Hasher over them yields the exact same
+                    // CRC32 as one `crc32(out_slice)` over the whole partition.
+                    let mut hasher = Hasher::new();
+                    for r in runs_part {
+                        let dst = r.out_off - local_base;
+                        let s = r.src_off - base_off;
+                        out_slice[dst..dst + r.len].copy_from_slice(&deflate[s..s + r.len]);
+                        hasher.update(&out_slice[dst..dst + r.len]);
+                    }
+                    *result = (hasher.finalize(), out_len);
                 }
-                *result = (crc32(out_slice), out_slice.len());
             });
         }
     });
@@ -748,6 +775,26 @@ fn copy_runs(output: &mut [u8], deflate: &[u8], base_off: usize, runs: &[StoredR
         let src = r.src_off - base_off;
         output[r.out_off..r.out_off + r.len].copy_from_slice(&deflate[src..src + r.len]);
     }
+}
+
+/// Inline (single-threaded) copy of all runs that ALSO computes the whole-output
+/// CRC32 in the same pass: each run's bytes are hashed immediately after the
+/// copy, while still hot in cache, instead of a second full pass over `output`.
+/// Runs are contiguous and ordered, so the incremental hash equals
+/// `crc32(output)` byte-for-byte.
+fn copy_runs_fused_crc(
+    output: &mut [u8],
+    deflate: &[u8],
+    base_off: usize,
+    runs: &[StoredRun],
+) -> u32 {
+    let mut hasher = Hasher::new();
+    for r in runs {
+        let src = r.src_off - base_off;
+        output[r.out_off..r.out_off + r.len].copy_from_slice(&deflate[src..src + r.len]);
+        hasher.update(&output[r.out_off..r.out_off + r.len]);
+    }
+    hasher.finalize()
 }
 
 /// Sum of output bytes covered by a contiguous partition (run range).
