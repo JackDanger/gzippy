@@ -1050,6 +1050,13 @@ fn drive_impl<W: std::io::Write>(
             crate::decompress::parallel::stored_split::STORED_DEMOTE_TO_PARALLEL_SM
                 .load(Ordering::Relaxed),
         );
+        // Pure-stored chunked-streaming path: non-zero = the no-monolithic-buffer
+        // streaming path ran (Gate-0 non-inert witness; the 100 MB zero-init Vec
+        // is gone, runs stream straight from input → sink).
+        eprintln!(
+            "  StoredParallel pure-stored chunked-streaming runs (no monolithic buffer): {}",
+            crate::decompress::parallel::stored_split::STORED_STREAM_RUNS.load(Ordering::Relaxed),
+        );
         // Window-sparsity effect counter: 0 = keepIndex=false faithful port (default),
         // non-zero = GZIPPY_WINDOW_SPARSITY=1 kill-switch active (old always-on path).
         // Each count = one 32 KiB getUsedWindowSymbols scan run at chunk finalize.

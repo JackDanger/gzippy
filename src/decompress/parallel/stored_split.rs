@@ -40,8 +40,13 @@
 //!   * CRC32 + ISIZE are verified against the gzip trailer before any byte is
 //!     written; a mismatch is a terminal `Err` (no partial output, no fallback).
 //!     This is STRICTER than the streaming parallel-SM path (which writes as it
-//!     goes); stored decode buffers the whole output (sized exactly from ISIZE)
-//!     so verification precedes the single write.
+//!     goes). For a PURE-stored stream the output bytes ARE the verbatim input
+//!     run slices, so verification reads the input runs (computing CRC) and the
+//!     trailer is checked BEFORE the runs are streamed directly from the input
+//!     to the writer — NO monolithic output buffer is allocated (rapidgzip-style
+//!     chunked streaming; the old `vec![0u8; total]` fault-storm is gone). A
+//!     stored-prefix + Huffman tail still buffers (the tail has no explicit
+//!     length and its back-refs resolve against the materialised prefix).
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +59,12 @@ use crc32fast::Hasher;
 /// the Huffman tail accounts for >= 50% of total output (prefix_out < 50% of
 /// expected_size). Dumped by `GZIPPY_DEBUG=1`.
 pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
+
+/// Counter: number of pure-stored streams decoded via the chunked-streaming
+/// path that copies the verbatim input run slices straight to the writer with
+/// NO monolithic output buffer. Non-zero proves the streaming path ran (Gate-0
+/// non-inert witness). Dumped by `GZIPPY_DEBUG=1`.
+pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 
 /// Kill-switch: when `GZIPPY_NO_STOREDPAR_DEMOTE=1` the demotion is
 /// suppressed and the Huffman tail is decoded sequentially (old behavior).
@@ -316,13 +327,51 @@ pub fn decompress_stored_parallel<W: Write>(
                     actual: total,
                 });
             }
-            let mut output = time_phase("alloc_zero", || vec![0u8; total]);
-            let crc = time_phase("fill_and_crc", || {
-                fill_and_crc(&mut output, deflate, header_size, &runs, num_threads)
+
+            // A/B kill-switch: `GZIPPY_STORED_MONOLITHIC=1` restores the old
+            // monolithic path (alloc a zero-init `vec![0u8; total]`, copy every
+            // run in, then `write_all` the whole buffer out). Correctness-
+            // equivalent; for same-binary A/B measurement of the streaming win.
+            if std::env::var_os("GZIPPY_STORED_MONOLITHIC").is_some() {
+                let mut output = time_phase("alloc_zero", || vec![0u8; total]);
+                let crc = time_phase("fill_and_crc", || {
+                    fill_and_crc(&mut output, deflate, header_size, &runs, num_threads)
+                });
+                return time_phase("verify_write", || {
+                    verify_and_write(writer, &output, crc, expected_crc, expected_size)
+                });
+            }
+
+            // Pure-stored stream: the output bytes ARE the verbatim input run
+            // slices — `StoredRun { src_off, len }` indexes straight into the
+            // compressed input, so `output[out_off..][..len] ==
+            // deflate[src_off-base..][..len]` byte-for-byte, no transform. So we
+            // STREAM the runs directly from the input to the writer with NO
+            // intermediate buffer, eliminating the old `vec![0u8; total]`
+            // 100 MB zero-init first-touch page-fault storm AND the full second
+            // copy pass. Faithful to rapidgzip's chunk-by-chunk reused-buffer
+            // streaming (`DecodedData.hpp` + the `GzipChunkFetcher` writeAll
+            // loop): for stored blocks the "chunk" is the input run slice.
+            //
+            // Verify-before-write is PRESERVED exactly: the input is fully
+            // buffered, so we CRC the runs (output order == run order, since
+            // `out_off` ascends) and compare to the trailer BEFORE the first
+            // byte reaches the sink. On mismatch a terminal Err with no partial
+            // output — identical contract to the old monolithic path.
+            let crc = time_phase("crc_runs", || {
+                crc_runs(deflate, header_size, &runs, total, num_threads)
             });
-            time_phase("verify_write", || {
-                verify_and_write(writer, &output, crc, expected_crc, expected_size)
-            })
+            if crc != expected_crc {
+                return Err(StoredSplitError::CrcMismatch {
+                    expected: expected_crc,
+                    actual: crc,
+                });
+            }
+            STORED_STREAM_RUNS.fetch_add(1, Ordering::Relaxed);
+            time_phase("stream_write", || {
+                write_runs(writer, deflate, header_size, &runs)
+            })?;
+            Ok(total as u64)
         }
         WalkEnd::HuffmanTail {
             tail_byte,
@@ -769,6 +818,92 @@ fn fill_and_crc(
     acc_crc
 }
 
+/// Compute the whole-output CRC32 of a pure-stored stream DIRECTLY from the
+/// input run slices — NO intermediate output buffer. The output bytes equal the
+/// concatenation of the runs in output order (`out_off` ascends == run order),
+/// so this yields the exact same CRC32 as `crc32(assembled_output)`. Mirrors
+/// `fill_and_crc`'s parallel partition + `combine_crc32` fold, minus the copy.
+///
+/// For `T<=1`, small output, or `GZIPPY_STORED_INLINE_COPY=1` it hashes inline;
+/// otherwise it partitions runs into contiguous output-byte-balanced groups,
+/// hashes each group's input slices on its own thread, and folds the
+/// per-partition CRCs left-to-right (same fold as `fill_and_crc`).
+fn crc_runs(
+    deflate: &[u8],
+    base_off: usize,
+    runs: &[StoredRun],
+    total: usize,
+    num_threads: usize,
+) -> u32 {
+    if runs.is_empty() || total == 0 {
+        // CRC32 of the empty stream is 0 (gzip stores crc32(b"") == 0).
+        return 0;
+    }
+
+    let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
+    let force_inline = std::env::var_os("GZIPPY_STORED_INLINE_COPY").is_some();
+    if force_inline || threads <= 1 || total < 1 << 20 {
+        return crc_runs_inline(deflate, base_off, runs);
+    }
+
+    let parts = partition_runs(runs, total, threads);
+    let mut results: Vec<(u32, usize)> = vec![(0u32, 0usize); parts.len()];
+
+    std::thread::scope(|scope| {
+        for (part, result) in parts.iter().zip(results.iter_mut()) {
+            let runs_part = &runs[part.clone()];
+            scope.spawn(move || {
+                // Incremental hash over this partition's input slices, in order.
+                let mut hasher = Hasher::new();
+                let mut len = 0usize;
+                for r in runs_part {
+                    let s = r.src_off - base_off;
+                    hasher.update(&deflate[s..s + r.len]);
+                    len += r.len;
+                }
+                *result = (hasher.finalize(), len);
+            });
+        }
+    });
+
+    // Fold partition CRCs left-to-right in output order.
+    let mut acc_crc = results[0].0;
+    for (crc, len) in results.iter().skip(1) {
+        acc_crc = combine_crc32(acc_crc, *crc, *len as u64);
+    }
+    acc_crc
+}
+
+/// Inline (single-threaded) CRC32 over all run slices, read straight from the
+/// input. Equals `crc32` over the concatenation of the runs in output order.
+fn crc_runs_inline(deflate: &[u8], base_off: usize, runs: &[StoredRun]) -> u32 {
+    let mut hasher = Hasher::new();
+    for r in runs {
+        let s = r.src_off - base_off;
+        hasher.update(&deflate[s..s + r.len]);
+    }
+    hasher.finalize()
+}
+
+/// Stream every run's literal bytes DIRECTLY from the input to the writer with
+/// no intermediate buffer. Faithful to rapidgzip's chunk-by-chunk `writeAll`
+/// loop (`GzipChunkFetcher`). The caller has already verified CRC32 + size, so
+/// the first byte written here is the first byte to reach the sink — the
+/// verify-before-write / no-partial-output-on-corruption contract is preserved.
+fn write_runs<W: Write>(
+    writer: &mut W,
+    deflate: &[u8],
+    base_off: usize,
+    runs: &[StoredRun],
+) -> Result<(), StoredSplitError> {
+    for r in runs {
+        let s = r.src_off - base_off;
+        writer.write_all(&deflate[s..s + r.len])?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Inline (single-threaded) copy of all runs.
 fn copy_runs(output: &mut [u8], deflate: &[u8], base_off: usize, runs: &[StoredRun]) {
     for r in runs {
@@ -1115,6 +1250,39 @@ mod tests {
         decompress_stored_parallel(&gz, &mut out, 8).expect("decode");
         assert_eq!(out, payload);
         assert_eq!(out, oracle);
+    }
+
+    /// The streaming CRC (`crc_runs`, parallel partitioned + `combine_crc32`
+    /// fold, computed straight from the input slices with NO output buffer) must
+    /// equal the serial whole-output CRC32 at every thread count. This is the
+    /// load-bearing correctness invariant of the no-monolithic-buffer fix: the
+    /// verify-before-write contract relies on `crc_runs == crc32(assembled)`.
+    #[test]
+    fn crc_runs_matches_whole_crc() {
+        let payload: Vec<u8> = (0..3_000_001u64)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let gz = gzip_stored(&payload, 65535);
+        let (_h, header_size) = gzip_format::read_header(&gz).unwrap();
+        let deflate = &gz[header_size..gz.len() - 8];
+        let (runs, walk_end) = walk_stored_chain(deflate, header_size).unwrap();
+        assert!(
+            matches!(walk_end, WalkEnd::Final { .. }),
+            "fixture must be pure-stored"
+        );
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        assert_eq!(total, payload.len());
+        let expected = crc32(&payload);
+        // inline path (t=1) and parallel partitioned path (t>1) must both agree.
+        for t in [1usize, 2, 3, 4, 7, 8] {
+            assert_eq!(
+                crc_runs(deflate, header_size, &runs, total, t),
+                expected,
+                "crc_runs (parallel combine) != serial crc32(whole) at t={t}"
+            );
+        }
+        // The inline helper alone must also agree.
+        assert_eq!(crc_runs_inline(deflate, header_size, &runs), expected);
     }
 
     /// Demotion gate: a stored prefix that is < 50% of total output must fire
