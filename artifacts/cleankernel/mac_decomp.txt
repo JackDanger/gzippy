@@ -1,0 +1,49 @@
+GATE-0 PASS path=ParallelSM build=parallel-sm+pure git=dc3158e6
+
+===== silesia  (uncompressed 212.0 MB) =====
+  NODECODE non-inert: ORACLE_NODECODE replay: hits=2807 misses=0 (misses ran the REAL contig decode); nodecode sha==ref:True slow*byte-transparent:OK nocrc sha==ref:True
+  arm            instr(M)  spr%      cyc(M)  instr/B   cyc/B
+  base             2100.2  0.12       872.9    9.908   4.118
+  nodecode         2046.7  1.31       765.1    9.656   3.610
+  nocrc            2099.8  0.28       871.7    9.906   4.112
+  slowdec50        8605.3  0.11      2193.3   40.597  10.347
+  slowdec100      12724.0  0.05      3943.3   60.028  18.603
+  slowsto50        7405.5  0.06      2782.3   34.937  13.126
+  slowsto100      10371.6  0.07      4997.1   48.930  23.575
+
+  --- W1 CLEAN-PATH INSTR DECOMPOSITION (gz own, no ISA-L) ---
+  base total instr      :    2100.2 M  (9.908 instr/B)
+  Huffman-decode+bitread:      53.5 M  =  2.55% (base-nodecode; replay-overhead caveat -> UNDERSTATES decode)
+  CRC                    :       0.4 M  =  0.02% (base-nocrc, clean)
+  copy/store+loop+coord  :    2046.7 M  = 97.45% (nodecode residual; INCLUDES replay loop overhead)
+  [cyc] base 872.9M  nodecode 765.1M  decode-cyc-share 12.35%
+
+  --- W1 CAUSAL SLOW-INJECT (Gate-2; uniform spin/event) ---
+  SLOW_DECODE  +instr: F50=6505M F100=10624M  +cyc: F50=1320M F100=3070M
+  SLOW_STORE   +instr: F50=5305M F100=8271M  +cyc: F50=1909M F100=4124M
+  decode/store event-weighted ratio (F100 instr): 1.28 (>1 => more decode events; ~1 => comparable)
+  decode/store WALL-criticality ratio (F100 cyc): 0.74 (>1 => decode site more wall-critical)
+
+===== squishy  (uncompressed 400.4 MB) =====
+  NODECODE non-inert: ORACLE_NODECODE replay: hits=7191 misses=0 (misses ran the REAL contig decode); nodecode sha==ref:True slow*byte-transparent:OK nocrc sha==ref:True
+  arm            instr(M)  spr%      cyc(M)  instr/B   cyc/B
+  base             3816.5  0.14      1754.7    9.532   4.382
+  nodecode         3594.0  1.82      1278.7    8.976   3.194
+  nocrc            3816.7  0.17      1755.0    9.532   4.383
+  slowdec50       16791.8  0.04      4311.4   41.938  10.768
+  slowdec100      24168.3  0.05      7525.0   60.362  18.794
+  slowsto50       15260.9  0.03      5166.8   38.115  12.904
+  slowsto100      21153.0  0.04      9383.1   52.831  23.435
+
+  --- W1 CLEAN-PATH INSTR DECOMPOSITION (gz own, no ISA-L) ---
+  base total instr      :    3816.5 M  (9.532 instr/B)
+  Huffman-decode+bitread:     222.5 M  =  5.83% (base-nodecode; replay-overhead caveat -> UNDERSTATES decode)
+  CRC                    :      -0.2 M  = -0.01% (base-nocrc, clean)
+  copy/store+loop+coord  :    3594.0 M  = 94.17% (nodecode residual; INCLUDES replay loop overhead)
+  [cyc] base 1754.7M  nodecode 1278.7M  decode-cyc-share 27.13%
+
+  --- W1 CAUSAL SLOW-INJECT (Gate-2; uniform spin/event) ---
+  SLOW_DECODE  +instr: F50=12975M F100=20352M  +cyc: F50=2557M F100=5770M
+  SLOW_STORE   +instr: F50=11444M F100=17337M  +cyc: F50=3412M F100=7628M
+  decode/store event-weighted ratio (F100 instr): 1.17 (>1 => more decode events; ~1 => comparable)
+  decode/store WALL-criticality ratio (F100 cyc): 0.76 (>1 => decode site more wall-critical)
