@@ -1,0 +1,29 @@
+== GATE-0(a) byte-exact (gz==rg==ld==gzip -d) + sizes ==
+   silesia    bytes=  211968000 ref=028bd002c89c9a90 gz=OK ld=OK rg=OK
+   monorepo   bytes=   50915328 ref=0dd50d07b0147211 gz=OK ld=OK rg=OK
+   nasa       bytes=  205242368 ref=96551161b5bdcaac gz=OK ld=OK rg=OK
+   squishy    bytes=  400391411 ref=4ee30c1571688ca4 gz=OK ld=OK rg=OK
+== measure: interleaved best-of-N=13, /dev/null both/all arms ==
+
+========================= MAC WALL MATRIX (aarch64, pure-Rust engine A) =========================
+corpus      T   gzMB/s  wallms  spr%   ldMB/s   rgMB/s  gz/ld  gz/rg   A/A  GATE
+silesia     1    761.6   278.3   1.3    922.1    317.1  1.211  0.416  0.10  PASS
+silesia     2    807.6   262.5   0.3    926.7    518.3  1.147  0.642  0.25  PASS
+silesia     4   1514.5   140.0   1.3    927.5    924.1  0.612  0.610  0.13  PASS
+silesia     8   2389.7    88.7   1.2    929.8   1394.0  0.389  0.583  0.83  PASS
+monorepo    1   1075.6    47.3   1.9   1332.2    337.2  1.239  0.314  0.65  PASS
+monorepo    2    741.2    68.7   1.7   1298.6    429.1  1.752  0.579  0.46  PASS
+monorepo    4   1141.0    44.6   2.1   1311.4    627.7  1.149  0.550  0.44  PASS
+monorepo    8   1721.3    29.6   2.5   1333.0    871.3  0.774  0.506  0.52  PASS
+nasa        1   1836.9   111.7   1.1   2277.0    648.9  1.240  0.353  1.03  PASS
+nasa        2   1173.7   174.9   1.3   2283.1    751.4  1.945  0.640  0.05  PASS
+nasa        4   2001.4   102.5   3.1   2271.9   1273.4  1.135  0.636  1.81  PASS
+nasa        8   3270.8    62.7   6.7   2288.7   2016.8  0.700  0.617  0.44  PASS
+squishy     1    724.0   553.0   1.2    890.3    341.0  1.230  0.471  0.37  PASS
+squishy     2    867.7   461.4   1.2    887.1    571.8  1.022  0.659  0.21  PASS
+squishy     4   1644.3   243.5   3.0    888.4   1039.1  0.540  0.632  0.65  PASS
+squishy     8   2670.6   149.9   1.2    887.5   1692.1  0.332  0.634  1.20  PASS
+
+note: gz/ld and gz/rg are WALL ratios (<1.0 = gzippy FASTER). libdeflate is
+T1-only (single-thread) so gz/ld at T>1 is multi-vs-single (informational).
+rapidgzip here is aarch64 (no ISA-L) — NOT the Intel SOTA; labeled.

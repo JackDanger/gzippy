@@ -1,0 +1,10 @@
+silesia ParallelSM
+monorepo ParallelSM
+nasa ParallelSM
+model ParallelSM
+storedheavy StoredParallel
+storedmix ParallelSM
+pure_stored_100mb StoredParallel
+squishy ParallelSM
+bignasa ParallelSM
+weights ParallelSM

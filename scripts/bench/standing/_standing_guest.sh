@@ -101,7 +101,13 @@ for corp in $CORPORA; do
   # production routing assertion (force the parallel SM engine at every T)
   PATHL="$(GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 taskset -c "$PINBASE" "$GZ" -d -c -p4 "$F" >/dev/null 2>/tmp/path.err; grep -m1 'path=' /tmp/path.err)"
   echo "$corp: $PATHL"
-  echo "$PATHL" | grep -q 'path=ParallelSM' || fail "$corp not routed to ParallelSM: '$PATHL'"
+  # Accept either pure-Rust parallel production path: ParallelSM (the marker-pipeline
+  # kernel under test) OR StoredParallel (the correct route for stored-dominated
+  # corpora: storedheavy/storedmix/pure_stored). Both are C-FFI-off native paths;
+  # the report notes which one each corpus took. Reject anything else (e.g. a libdeflate
+  # fallback would mean the native build silently bailed).
+  echo "$PATHL" | grep -qE 'path=(ParallelSM|StoredParallel)' || fail "$corp not routed to a pure-Rust parallel path: '$PATHL'"
+  echo "$corp $(echo "$PATHL" | sed -n 's/.*path=\([A-Za-z]*\).*/\1/p')" >> "$OUT/paths.txt"
   GS="$(GZIPPY_FORCE_PARALLEL_SM=1 taskset -c "$PINBASE" "$GZ" -d -c -p4 "$F" 2>/dev/null | sha256sum | cut -c1-16)"
   RS="$(taskset -c "$PINBASE" "$RG" -d -c -P4 "$F" 2>/dev/null | sha256sum | cut -c1-16)"
   IS="$(taskset -c "$PINBASE" "$IGZIP" -d -c "$F" 2>/dev/null | sha256sum | cut -c1-16)"
