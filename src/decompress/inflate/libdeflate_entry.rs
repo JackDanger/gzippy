@@ -358,6 +358,19 @@ impl LitLenTable {
     /// that previously hit the subtable. 12-bit table = 16 KB, still
     /// fits in 48 KB L1d on Raptor Lake. rapidgzip uses larger main
     /// tables for the same reason (vendor's HuffmanCoding* variants).
+    // STEP B-2 engine-A convergence (2026-06-21): TABLE_BITS is arch-conditional.
+    // aarch64 (engine A = PRODUCTION clean kernel): 11, matching libdeflate's
+    // LITLEN_TABLEBITS=11 (deflate_decompress.c:372) — the frontier comparator.
+    // The doc comment above records that 11 (= 8 KB table) was originally the
+    // fastest on ARM64 for L1d locality; the const was later bumped to 12 as an
+    // x86 (Raptor Lake, 48 KB L1d) tuning that silently regressed aarch64 back to
+    // a 16 KB table. Reverting aarch64 to vendor's 11 is byte-exact (table
+    // geometry only; identical decoded output) and converges the per-symbol table
+    // lookup toward decompress_template.h. x86 keeps 12 (its production path is the
+    // run_contig asm; engine A there is the asm-off kernel — left at its tuned 12).
+    #[cfg(target_arch = "aarch64")]
+    pub const TABLE_BITS: u8 = 11;
+    #[cfg(not(target_arch = "aarch64"))]
     pub const TABLE_BITS: u8 = 12;
     /// Maximum number of subtable bits for codes longer than TABLE_BITS
     pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
