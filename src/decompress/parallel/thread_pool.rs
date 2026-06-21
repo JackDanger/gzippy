@@ -102,6 +102,19 @@ pub fn phys_pin_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// PIN-DISCRIMINATOR knob (arm B). When `GZIPPY_NO_PIN=1` the decode pool is
+/// built with an EMPTY pinning map (pin:None for every worker) — faithful to
+/// rapidgzip's decode pool (`BlockFetcher.hpp:185` constructs the pool with a
+/// thread COUNT only, empty map → the OS scheduler places threads). This is
+/// the candidate FAITHFUL FIX: gzippy ADDED worker-pinning rapidgzip never
+/// had, and it packs workers onto SMT siblings (+18-20% silesia-T4 loss).
+/// Affinity-only; byte-transparent. Takes precedence over `GZIPPY_PHYS_PIN`.
+pub fn no_pin_enabled() -> bool {
+    std::env::var("GZIPPY_NO_PIN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Parse a Linux `thread_siblings_list` body (`"2-3"`, `"0,8"`, `"2-3,10-11"`)
 /// into the set of logical CPU ids it names.
 fn parse_cpu_list(s: &str) -> Vec<u32> {
