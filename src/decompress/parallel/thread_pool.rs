@@ -64,6 +64,24 @@ fn available_cores() -> usize {
 /// Cycles through `core_affinity::get_core_ids()` when there are fewer
 /// cores than workers (mirror of vendor AffinityHelpers).
 pub fn pinning_for_capacity(thread_count: usize) -> ThreadPinning {
+    // STEP-3 affinity probe (GZIPPY_PHYS_PIN=1, default OFF, byte-transparent —
+    // affinity only, no decode-path change): pin each worker to a DISTINCT
+    // PHYSICAL core (one logical id per SMT sibling group) instead of the
+    // default get_core_ids() cycling order. The default order on a cpuset like
+    // `0,2-5,8,...` packs workers 1&2 onto logical 2,3 — SMT siblings of one
+    // physical core — which the P1 measurement implicated in the +17% unpinned
+    // cyc/B inflation. This tests that SMT-co-location hypothesis directly.
+    if phys_pin_enabled() {
+        let phys = distinct_physical_core_ids();
+        if !phys.is_empty() && thread_count > 0 {
+            let mut map = ThreadPinning::new();
+            for i in 0..thread_count {
+                map.insert(i, phys[i % phys.len()]);
+            }
+            return map;
+        }
+        // fall through to default if /sys topology was unreadable
+    }
     let cores = core_affinity::get_core_ids().unwrap_or_default();
     let mut map = ThreadPinning::new();
     if cores.is_empty() || thread_count == 0 {
@@ -73,6 +91,71 @@ pub fn pinning_for_capacity(thread_count: usize) -> ThreadPinning {
         map.insert(i, cores[i % cores.len()].id as u32);
     }
     map
+}
+
+/// STEP-3 probe knob. When `GZIPPY_PHYS_PIN=1` the thread pool pins workers
+/// (and the caller pins the in-order consumer) to DISTINCT PHYSICAL cores,
+/// avoiding SMT-sibling co-location. Affinity-only; byte-transparent.
+pub fn phys_pin_enabled() -> bool {
+    std::env::var("GZIPPY_PHYS_PIN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Parse a Linux `thread_siblings_list` body (`"2-3"`, `"0,8"`, `"2-3,10-11"`)
+/// into the set of logical CPU ids it names.
+fn parse_cpu_list(s: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for tok in s.trim().split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = tok.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                for c in a..=b {
+                    out.push(c);
+                }
+            }
+        } else if let Ok(a) = tok.parse::<u32>() {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// One logical-core id per DISTINCT PHYSICAL core, intersected with the
+/// process's allowed cpuset (`core_affinity::get_core_ids()`), in ascending
+/// order. Reads `/sys/.../topology/thread_siblings_list` to dedupe SMT
+/// siblings; falls back to the raw allowed-core order if `/sys` is unreadable.
+pub fn distinct_physical_core_ids() -> Vec<u32> {
+    let mut allowed: Vec<u32> = core_affinity::get_core_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.id as u32)
+        .collect();
+    allowed.sort_unstable();
+    let allowed_set: std::collections::BTreeSet<u32> = allowed.iter().copied().collect();
+    let mut seen_reps: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut out: Vec<u32> = Vec::new();
+    for &id in &allowed {
+        let path = format!("/sys/devices/system/cpu/cpu{id}/topology/thread_siblings_list");
+        // Representative = smallest sibling id that is ALSO in our cpuset.
+        let rep = match std::fs::read_to_string(&path) {
+            Ok(s) => parse_cpu_list(&s)
+                .into_iter()
+                .filter(|c| allowed_set.contains(c))
+                .min()
+                .unwrap_or(id),
+            Err(_) => return allowed, // /sys unreadable → faithful fallback
+        };
+        if seen_reps.insert(rep) {
+            // First time we see this physical core: pin to this (smallest
+            // allowed) logical id of the group.
+            out.push(rep);
+        }
+    }
+    out
 }
 
 /// A move-only handle to the eventual result of a submitted task.
