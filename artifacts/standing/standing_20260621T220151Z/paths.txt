@@ -1,0 +1,4 @@
+pure_stored_100mb StoredParallel
+storedheavy StoredParallel
+storedmix ParallelSM
+silesia ParallelSM

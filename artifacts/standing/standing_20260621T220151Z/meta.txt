@@ -1,0 +1,11 @@
+sha 105efc90fd444be558114320a2960b1f739f9b53
+flavor parallel-sm+pure
+threads 1 2 4 8
+n 13
+no_turbo 1
+gov performance
+load_start 3.58
+bytes pure_stored_100mb 104857600
+bytes storedheavy 100000000
+bytes storedmix 104857600
+bytes silesia 211968000
