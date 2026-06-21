@@ -41,11 +41,11 @@ def collect(out, arm, outbytes):
         dur_ns = v.get("duration_time")
         cyc = None
         for k in v:
-            if k.endswith("cycles") or k == "cycles":
+            if "cycles" in k:
                 cyc = v[k]
         ins = None
         for k in v:
-            if k.endswith("instructions") or k == "instructions":
+            if "instructions" in k:
                 ins = v[k]
         tc_ms = v.get("task-clock")
         if dur_ns is None or cyc is None:
