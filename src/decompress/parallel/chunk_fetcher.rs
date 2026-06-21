@@ -763,7 +763,22 @@ fn drive_impl<W: std::io::Write>(
     // the cache/prefetch sizing above keeps reading the true `pool_size` (vendor sizes
     // m_prefetchCache off m_parallelization, which stays 1 → 2, not 0).
     let pool_threads = if pool_size == 1 { 0 } else { pool_size };
-    let thread_pool = Arc::new(ThreadPool::with_pinning_for_capacity(pool_threads));
+    // PIN-DISCRIMINATOR (arm B = GZIPPY_NO_PIN=1): build the decode pool with an
+    // EMPTY pinning map = pin:None for every worker, faithful to rapidgzip's
+    // decode pool (BlockFetcher.hpp:185 = thread COUNT only, OS schedules). This
+    // is the candidate FAITHFUL FIX vs HEAD's with_pinning_for_capacity, which
+    // packs workers onto SMT siblings (+18-20% silesia-T4 loss). Byte-transparent
+    // (affinity only). GZIPPY_PHYS_PIN (arm C) still routed via the default ctor.
+    let thread_pool = Arc::new(
+        if crate::decompress::parallel::thread_pool::no_pin_enabled() {
+            ThreadPool::new(
+                pool_threads,
+                crate::decompress::parallel::thread_pool::ThreadPinning::new(),
+            )
+        } else {
+            ThreadPool::with_pinning_for_capacity(pool_threads)
+        },
+    );
 
     // Running CRC + size accumulators. Mirror of vendor's
     // `m_crc32Calculator` + `m_totalDecompressedSize` updates inside
