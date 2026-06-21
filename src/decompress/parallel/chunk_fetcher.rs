@@ -763,22 +763,20 @@ fn drive_impl<W: std::io::Write>(
     // the cache/prefetch sizing above keeps reading the true `pool_size` (vendor sizes
     // m_prefetchCache off m_parallelization, which stays 1 → 2, not 0).
     let pool_threads = if pool_size == 1 { 0 } else { pool_size };
-    // PIN-DISCRIMINATOR (arm B = GZIPPY_NO_PIN=1): build the decode pool with an
-    // EMPTY pinning map = pin:None for every worker, faithful to rapidgzip's
-    // decode pool (BlockFetcher.hpp:185 = thread COUNT only, OS schedules). This
-    // is the candidate FAITHFUL FIX vs HEAD's with_pinning_for_capacity, which
-    // packs workers onto SMT siblings (+18-20% silesia-T4 loss). Byte-transparent
-    // (affinity only). GZIPPY_PHYS_PIN (arm C) still routed via the default ctor.
-    let thread_pool = Arc::new(
-        if crate::decompress::parallel::thread_pool::no_pin_enabled() {
-            ThreadPool::new(
-                pool_threads,
-                crate::decompress::parallel::thread_pool::ThreadPinning::new(),
-            )
-        } else {
-            ThreadPool::with_pinning_for_capacity(pool_threads)
-        },
-    );
+    // Build the decode pool with an EMPTY pinning map — faithful to rapidgzip's
+    // decode pool (`BlockFetcher.hpp:185` constructs the pool with a thread COUNT
+    // only, empty pinning → the OS scheduler places threads). gzippy previously
+    // added speculative worker-pinning (`with_pinning_for_capacity`) rapidgzip
+    // never had; on an SMT box the default `get_core_ids()` cycling order packed
+    // workers onto SMT-sibling logical cores of the same physical core, costing
+    // +18-20% on silesia-T4. The PIN-DISCRIMINATOR measurement (FROZEN Intel,
+    // N=13, plans/PIN-DISCRIMINATOR-2026-06-21.md) proved the unpinned pool ties
+    // rapidgzip (silesia-T4 1.028 vs pinned 1.198) and the OS spreads the workers
+    // across distinct physical cores on its own — so the pinning is deleted.
+    let thread_pool = Arc::new(ThreadPool::new(
+        pool_threads,
+        crate::decompress::parallel::thread_pool::ThreadPinning::new(),
+    ));
 
     // Running CRC + size accumulators. Mirror of vendor's
     // `m_crc32Calculator` + `m_totalDecompressedSize` updates inside
@@ -846,22 +844,10 @@ fn drive_impl<W: std::io::Write>(
             warm_t0.elapsed().as_secs_f64()
         );
     }
-    // STEP-3 affinity probe (GZIPPY_PHYS_PIN=1, default OFF, byte-transparent):
-    // pin the in-order CONSUMER (this thread runs `consumer_loop` inline) to its
-    // OWN distinct physical core — the (n_workers)-th distinct-physical id — so
-    // workers + consumer each occupy a separate physical core (no SMT
-    // co-location). Affinity only; no decode-path change. No-op unless enabled.
-    if crate::decompress::parallel::thread_pool::phys_pin_enabled() {
-        let phys = crate::decompress::parallel::thread_pool::distinct_physical_core_ids();
-        if !phys.is_empty() {
-            let slot = pool_threads % phys.len();
-            let want = phys[slot];
-            let ids = core_affinity::get_core_ids().unwrap_or_default();
-            if let Some(id) = ids.into_iter().find(|c| c.id as u32 == want) {
-                let _ = core_affinity::set_for_current(id);
-            }
-        }
-    }
+    // The in-order consumer (this thread runs `consumer_loop` inline) is left
+    // unpinned — faithful to rapidgzip, which never pins its reader thread; the
+    // OS schedules it alongside the unpinned decode workers (see the decode-pool
+    // construction above and plans/PIN-DISCRIMINATOR-2026-06-21.md).
     let consumer_result = consumer_loop(
         input_view,
         writer,
