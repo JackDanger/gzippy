@@ -831,6 +831,22 @@ fn drive_impl<W: std::io::Write>(
             warm_t0.elapsed().as_secs_f64()
         );
     }
+    // STEP-3 affinity probe (GZIPPY_PHYS_PIN=1, default OFF, byte-transparent):
+    // pin the in-order CONSUMER (this thread runs `consumer_loop` inline) to its
+    // OWN distinct physical core — the (n_workers)-th distinct-physical id — so
+    // workers + consumer each occupy a separate physical core (no SMT
+    // co-location). Affinity only; no decode-path change. No-op unless enabled.
+    if crate::decompress::parallel::thread_pool::phys_pin_enabled() {
+        let phys = crate::decompress::parallel::thread_pool::distinct_physical_core_ids();
+        if !phys.is_empty() {
+            let slot = pool_threads % phys.len();
+            let want = phys[slot];
+            let ids = core_affinity::get_core_ids().unwrap_or_default();
+            if let Some(id) = ids.into_iter().find(|c| c.id as u32 == want) {
+                let _ = core_affinity::set_for_current(id);
+            }
+        }
+    }
     let consumer_result = consumer_loop(
         input_view,
         writer,
