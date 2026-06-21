@@ -60,117 +60,6 @@ fn available_cores() -> usize {
     num_cpus::get()
 }
 
-/// Build a worker-index → logical-core map for `thread_count` workers.
-/// Cycles through `core_affinity::get_core_ids()` when there are fewer
-/// cores than workers (mirror of vendor AffinityHelpers).
-pub fn pinning_for_capacity(thread_count: usize) -> ThreadPinning {
-    // STEP-3 affinity probe (GZIPPY_PHYS_PIN=1, default OFF, byte-transparent —
-    // affinity only, no decode-path change): pin each worker to a DISTINCT
-    // PHYSICAL core (one logical id per SMT sibling group) instead of the
-    // default get_core_ids() cycling order. The default order on a cpuset like
-    // `0,2-5,8,...` packs workers 1&2 onto logical 2,3 — SMT siblings of one
-    // physical core — which the P1 measurement implicated in the +17% unpinned
-    // cyc/B inflation. This tests that SMT-co-location hypothesis directly.
-    if phys_pin_enabled() {
-        let phys = distinct_physical_core_ids();
-        if !phys.is_empty() && thread_count > 0 {
-            let mut map = ThreadPinning::new();
-            for i in 0..thread_count {
-                map.insert(i, phys[i % phys.len()]);
-            }
-            return map;
-        }
-        // fall through to default if /sys topology was unreadable
-    }
-    let cores = core_affinity::get_core_ids().unwrap_or_default();
-    let mut map = ThreadPinning::new();
-    if cores.is_empty() || thread_count == 0 {
-        return map;
-    }
-    for i in 0..thread_count {
-        map.insert(i, cores[i % cores.len()].id as u32);
-    }
-    map
-}
-
-/// STEP-3 probe knob. When `GZIPPY_PHYS_PIN=1` the thread pool pins workers
-/// (and the caller pins the in-order consumer) to DISTINCT PHYSICAL cores,
-/// avoiding SMT-sibling co-location. Affinity-only; byte-transparent.
-pub fn phys_pin_enabled() -> bool {
-    std::env::var("GZIPPY_PHYS_PIN")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// PIN-DISCRIMINATOR knob (arm B). When `GZIPPY_NO_PIN=1` the decode pool is
-/// built with an EMPTY pinning map (pin:None for every worker) — faithful to
-/// rapidgzip's decode pool (`BlockFetcher.hpp:185` constructs the pool with a
-/// thread COUNT only, empty map → the OS scheduler places threads). This is
-/// the candidate FAITHFUL FIX: gzippy ADDED worker-pinning rapidgzip never
-/// had, and it packs workers onto SMT siblings (+18-20% silesia-T4 loss).
-/// Affinity-only; byte-transparent. Takes precedence over `GZIPPY_PHYS_PIN`.
-pub fn no_pin_enabled() -> bool {
-    std::env::var("GZIPPY_NO_PIN")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// Parse a Linux `thread_siblings_list` body (`"2-3"`, `"0,8"`, `"2-3,10-11"`)
-/// into the set of logical CPU ids it names.
-fn parse_cpu_list(s: &str) -> Vec<u32> {
-    let mut out = Vec::new();
-    for tok in s.trim().split(',') {
-        let tok = tok.trim();
-        if tok.is_empty() {
-            continue;
-        }
-        if let Some((a, b)) = tok.split_once('-') {
-            if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
-                for c in a..=b {
-                    out.push(c);
-                }
-            }
-        } else if let Ok(a) = tok.parse::<u32>() {
-            out.push(a);
-        }
-    }
-    out
-}
-
-/// One logical-core id per DISTINCT PHYSICAL core, intersected with the
-/// process's allowed cpuset (`core_affinity::get_core_ids()`), in ascending
-/// order. Reads `/sys/.../topology/thread_siblings_list` to dedupe SMT
-/// siblings; falls back to the raw allowed-core order if `/sys` is unreadable.
-pub fn distinct_physical_core_ids() -> Vec<u32> {
-    let mut allowed: Vec<u32> = core_affinity::get_core_ids()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|c| c.id as u32)
-        .collect();
-    allowed.sort_unstable();
-    let allowed_set: std::collections::BTreeSet<u32> = allowed.iter().copied().collect();
-    let mut seen_reps: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut out: Vec<u32> = Vec::new();
-    for &id in &allowed {
-        let path = format!("/sys/devices/system/cpu/cpu{id}/topology/thread_siblings_list");
-        // Representative = smallest sibling id that is ALSO in our cpuset.
-        let rep = match std::fs::read_to_string(&path) {
-            Ok(s) => parse_cpu_list(&s)
-                .into_iter()
-                .filter(|c| allowed_set.contains(c))
-                .min()
-                .unwrap_or(id),
-            Err(_) => return allowed, // /sys unreadable → faithful fallback
-        };
-        if seen_reps.insert(rep) {
-            // First time we see this physical core: pin to this (smallest
-            // allowed) logical id of the group.
-            out.push(rep);
-        }
-    }
-    out
-}
-
 /// A move-only handle to the eventual result of a submitted task.
 ///
 /// Mirror of `std::future<T>` as returned by
@@ -323,14 +212,6 @@ impl ThreadPool {
     #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn with_default_capacity() -> Self {
         Self::new(available_cores(), ThreadPinning::new())
-    }
-
-    /// Construct a pool with one logical core pinned per worker index.
-    /// Mirror of vendor's `ThreadPool(threadCount, threadPinning)` where
-    /// the caller pre-populates the pinning map
-    /// (`ThreadPool.hpp:101-108`, `AffinityHelpers.hpp`).
-    pub fn with_pinning_for_capacity(thread_count: usize) -> Self {
-        Self::new(thread_count, pinning_for_capacity(thread_count))
     }
 
     /// `size_t capacity() const` (ThreadPool.hpp:166-170).
@@ -534,25 +415,14 @@ fn worker_main(
         // Mirror of `pinThreadToLogicalCore(static_cast<int>(pinning->second))`
         // (ThreadPool.hpp:199). `core_affinity` is portable across the
         // platforms gzippy targets; the rapidgzip implementation uses
-        // raw `sched_setaffinity` on Linux and is a no-op elsewhere.
-        if phys_pin_enabled() {
-            // STEP-3 probe: pin DIRECTLY (sched_setaffinity replaces the mask).
-            // The default branch below validates the target against
-            // get_core_ids() (the thread's CURRENT allowed set). Under
-            // GZIPPY_PHYS_PIN the consumer pins the spawning (main) thread to
-            // ITS core BEFORE these workers spawn, so a freshly-spawned worker
-            // inherits a 1-core mask and get_core_ids() would NOT contain the
-            // worker's distinct-physical target → the guard would silently skip
-            // and leave every worker stuck on the consumer's core. Set the
-            // target absolutely to escape the inherited mask.
-            let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                id: core_id as usize,
-            });
-        } else {
-            let ids = core_affinity::get_core_ids().unwrap_or_default();
-            if let Some(id) = ids.into_iter().find(|c| c.id as u32 == core_id) {
-                let _ = core_affinity::set_for_current(id);
-            }
+        // raw `sched_setaffinity` on Linux and is a no-op elsewhere. The
+        // production decode pool constructs with an EMPTY pinning map (see
+        // chunk_fetcher.rs and BlockFetcher.hpp:185), so `pin` is None there
+        // and the OS schedules the workers; this branch keeps the generic
+        // vendor ThreadPool pinning surface for any caller that supplies a map.
+        let ids = core_affinity::get_core_ids().unwrap_or_default();
+        if let Some(id) = ids.into_iter().find(|c| c.id as u32 == core_id) {
+            let _ = core_affinity::set_for_current(id);
         }
     }
 
