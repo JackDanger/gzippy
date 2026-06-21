@@ -522,9 +522,24 @@ fn worker_main(
         // (ThreadPool.hpp:199). `core_affinity` is portable across the
         // platforms gzippy targets; the rapidgzip implementation uses
         // raw `sched_setaffinity` on Linux and is a no-op elsewhere.
-        let ids = core_affinity::get_core_ids().unwrap_or_default();
-        if let Some(id) = ids.into_iter().find(|c| c.id as u32 == core_id) {
-            let _ = core_affinity::set_for_current(id);
+        if phys_pin_enabled() {
+            // STEP-3 probe: pin DIRECTLY (sched_setaffinity replaces the mask).
+            // The default branch below validates the target against
+            // get_core_ids() (the thread's CURRENT allowed set). Under
+            // GZIPPY_PHYS_PIN the consumer pins the spawning (main) thread to
+            // ITS core BEFORE these workers spawn, so a freshly-spawned worker
+            // inherits a 1-core mask and get_core_ids() would NOT contain the
+            // worker's distinct-physical target → the guard would silently skip
+            // and leave every worker stuck on the consumer's core. Set the
+            // target absolutely to escape the inherited mask.
+            let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                id: core_id as usize,
+            });
+        } else {
+            let ids = core_affinity::get_core_ids().unwrap_or_default();
+            if let Some(id) = ids.into_iter().find(|c| c.id as u32 == core_id) {
+                let _ = core_affinity::set_for_current(id);
+            }
         }
     }
 
