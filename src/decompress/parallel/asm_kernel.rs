@@ -275,6 +275,10 @@ const _: () = assert!(super::lut_huffman::ISAL_DECODE_LONG_BITS == 12);
 const _: () = assert!(super::lut_huffman::MAX_LIT_LEN_SYM == 512);
 const _: () =
     assert!(crate::decompress::inflate::libdeflate_entry::HUFFDEC_SUBTABLE_POINTER == 0x4000);
+// The x86 asm kernel hardcodes 9-bit dist-table indexing ([{ctx}+DIST_OFF+idx*4]).
+// On aarch64 the dist table is 8 (engine-A convergence to libdeflate OFFSET_TABLEBITS),
+// and the asm kernel does not run there, so this invariant is x86-only.
+#[cfg(target_arch = "x86_64")]
 const _: () = assert!(crate::decompress::inflate::libdeflate_entry::DistTable::TABLE_BITS == 9);
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
