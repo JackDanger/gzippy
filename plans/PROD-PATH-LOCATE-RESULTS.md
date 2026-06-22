@@ -126,6 +126,42 @@ Mechanism cross-check (neurotic perf, software counter reliable; LXC HW counters
 (~13 MB first-touch) account for only ~20% of the wall gap; the rest is per-chunk
 INSTRUCTIONS (bookkeeping). Clean HW instruction/cycle counts owed from AMD bare metal.
 
+### AMD (solvency Zen2, FROZEN gov=performance boost=0, pin cpu4, best-of-11; thawed+verified after)
+| corpus   | igzip | 256K  | 512K  | 1024K(default) | 2048K | 4096K | slope 256K→2M | 2M floor vs igzip |
+|----------|-------|-------|-------|----------------|-------|-------|---------------|-------------------|
+| nasa     | 158.9 | 272.2 | 236.8 | 209.3          | 201.5 | 207.4 | −70.7 ms (−26%)  | +27%           |
+| silesia  | 357.4 | 704.3 | 547.1 | 475.7          | 456.3 | 473.6 | −248.0 ms (−35%) | +28%           |
+| monorepo | 58.1  | 105.1 | 91.3  | 83.3           | 74.6  | 79.5  | −30.5 ms (−28%)  | +28%           |
+
+Same U-shape + 2 MiB optimum as Intel → CROSS-ARCH. 1MiB→2MiB recovers nasa −3.7% /
+silesia −4.1% / monorepo −10.4%.
+
+### Mechanism decomposition (AMD bare-metal perf, clean HW counters)
+| arm (nasa)  | minor-faults | instructions | cycles | vs igzip |
+|-------------|--------------|--------------|--------|----------|
+| igzip       | 5,637        | 789.1 M      | 429.1 M| —        |
+| prod 1024K  | 8,800        | 950.8 M      | 541.3 M| +20.5% ins / +26% cyc / +56% flt |
+| prod 4096K  | 16,515       | 863.7 M      | 551.2 M| +9.5% ins / +28% cyc / +193% flt |
+| silesia igzip   | 17,094  | 2514.6 M     | 1187.1 M| —       |
+| silesia prod1024| 25,385  | 3138.9 M     | 1520.4 M| +24.8% ins / +28% cyc |
+| silesia prod4096| 41,658  | 2823.7 M     | 1549.8 M| +12.3% ins / +31% cyc |
+
+**The U-shape is an instruction↔fault tradeoff:** bigger chunks CUT per-chunk-bookkeeping
+INSTRUCTIONS (nasa 951M→864M, −87M; the surplus over igzip halves +20.5%→+9.5%) but
+BALLOON first-touch FAULTS (bigger per-chunk reserve, 8.8K→16.5K). 2 MiB balances them.
+At the optimum the residual is ~half per-chunk-instructions (the bookkeeping #2/#3/#4
+that the chunk-sweep collapses) + ~half per-byte (CRC second-touch + SegmentedU8 commit +
+first-touch faults). NOT one clean lever — a real structural convergence (fewer per-chunk
+ops AND a recycled/resident output buffer) is needed to fully close it.
+
+### CROSS-ARCH PER-CHUNK VERDICT (Intel + AMD agree → LAW-grade)
+- Per-chunk fixed cost is the dominant residual on BOTH arches; wall is U-shaped in chunk
+  size with a 2 MiB optimum; the 256K→2M slope is −26 to −38% of wall.
+- The T1 production default (T1_TARGET_COMPRESSED_CHUNK_BYTES = 1 MiB) is SUBOPTIMAL on
+  both arches; 2 MiB is the gated optimum (cheap immediate win, existing knob).
+- Irreducible floor +21–28% over igzip at the optimum = per-chunk-instruction-irreducible
+  + per-byte (CRC + commit + faults).
+
 ## OWED (next, this cycle)
 - Clean per-chunk removal-oracles (code change, byte-transparent, non-inert counter each):
   recycle output buffer (#1), reuse window tail buffers (#2), and a boundary-record no-op
