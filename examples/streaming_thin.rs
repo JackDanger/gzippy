@@ -232,6 +232,53 @@ fn run_igzip(_file: &[u8]) -> (f64, usize) {
     panic!("igzip mode requires the isal-compression feature (build --features gzippy-isal)");
 }
 
+// igzipnocrc — the SAME streaming ISA-L driver as `run_igzip`'s
+// `decompress_gzip_stream` (1 MiB out_buf, write_all per fill) but RAW DEFLATE
+// (manual gzip-header skip + `crc_flag = ISAL_DEFLATE`), so NO checksum is
+// folded. `igzip − igzipnocrc` = ISA-L's INLINE crc cost within the identical
+// driver → the difference-of-differences that decides whether gzippy's separate
+// crc32fast second-touch is a RECOVERABLE surplus over igzip or a cost igzip
+// pays too. Measurement-only arm (output is byte-correct; no crc verify).
+#[cfg(feature = "isal-compression")]
+fn run_igzipnocrc(file: &[u8]) -> (f64, usize) {
+    use gzippy::decompress::parallel::gzip_format::read_header as gz_read_header;
+    use isal::isal_sys::igzip_lib as isal_raw;
+    let (_hdr, body_off) = gz_read_header(file).expect("gzip header");
+    let mut out = devnull();
+    let t = Instant::now();
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE; // raw deflate, NO crc
+    state.avail_in = (file.len() - body_off) as u32;
+    state.next_in = unsafe { file.as_ptr().add(body_off) as *mut u8 };
+    let mut out_buf = vec![0u8; 1024 * 1024];
+    let mut total = 0usize;
+    loop {
+        state.avail_out = out_buf.len() as u32;
+        state.next_out = out_buf.as_mut_ptr();
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        assert!(ret == 0, "igzipnocrc: isal_inflate ret={ret}");
+        let written = out_buf.len() - state.avail_out as usize;
+        if written > 0 {
+            out.write_all(&out_buf[..written]).expect("sink");
+            total += written;
+        }
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+    out.flush().expect("flush");
+    (t.elapsed().as_secs_f64() * 1e3, total)
+}
+
+#[cfg(not(feature = "isal-compression"))]
+fn run_igzipnocrc(_file: &[u8]) -> (f64, usize) {
+    panic!("igzipnocrc mode requires the isal-compression feature (build --features gzippy-isal)");
+}
+
 // ──────────────── gz-driver + igzip _04 BARE kernel (MEASUREMENT 2) ──────────
 //
 // DE-CONFOUNDED bare-inner-decode removal-oracle. This is the EXACT same thin
@@ -970,6 +1017,10 @@ fn main() {
         "zlibng" => {
             let (ms, n) = run_zlibng(&file);
             println!("RESULT mode=zlibng ms={ms:.3} bytes={n}");
+        }
+        "igzipnocrc" => {
+            let (ms, n) = run_igzipnocrc(&file);
+            println!("RESULT mode=igzipnocrc ms={ms:.3} bytes={n}");
         }
         "igzip" => {
             let (ms, n) = run_igzip(&file);
