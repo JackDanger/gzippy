@@ -1650,6 +1650,241 @@ pub(crate) fn decode_huffman_fastloop_bounded(
     FlatFastloopExit::Stopped(out_pos)
 }
 
+/// ROUTE-B (aarch64): FAITHFUL PORT of libdeflate 1.25's SOFTWARE-PIPELINED
+/// fastloop ORGANIZATION (`libdeflate-sys-1.25.2/libdeflate/lib/decompress_template.h`
+/// fastloop, lines 344-671) into the engine-A bounded contiguous fastloop.
+///
+/// Byte-for-byte the same OUTPUT as [`decode_huffman_fastloop_bounded`] and the
+/// SAME [`FlatFastloopExit`] resumable contract; the ONLY differences are the
+/// loop *organization* the disasm diff identified as the one remaining structural
+/// divergence vs libdeflate (`plans/disasm/`, `project_aarch64_disasm_diff_2026_06_21`):
+///   1. **No top-of-loop refill gate.** The baseline opens each iteration with
+///      `if bitsleft < REFILL_THRESHOLD { refill }`; libdeflate instead WEAVES the
+///      refills into the symbol chain (template lines 413/431/572). Every body path
+///      here still hits ≥1 refill, so the gate is removable.
+///   2. **Software-pipelined literal chain (template lines 366-435).** Instead of
+///      the baseline's pack-≤8-literals-into-one-u64 (which DEFERS stores), this
+///      issues the NEXT litlen table load EARLY (`entry = lookup!()`) and stores the
+///      *current* literal as a single byte immediately AFTER, so the load-use
+///      latency of the table read is hidden behind the store. Capped at 2 extra
+///      fast literals + a 3rd "in lieu of primary" (exactly libdeflate's bound for
+///      LITLEN_TABLEBITS=11 on a 64-bit bitbuffer: 3*11=33 ≤ CONSUMABLE_NBITS=56).
+///
+/// KEPT from gz (superior to libdeflate's scalar word-copy, do NOT regress):
+/// `copy_match_fast` (NEON-128 + prefetch), `*mut`/`get_unchecked` raw stores (no
+/// bounds checks), the branchless u64 refill. The match/offset decode is already
+/// libdeflate-faithful in the baseline (preload next litlen + refill before the
+/// copy) and is carried over unchanged.
+///
+/// Gated AB only — selected at the call site by `pipelined_kernel_enabled()`;
+/// production default remains the baseline until a gated win flips it.
+///
+/// # Safety contract
+/// Identical to [`decode_huffman_fastloop_bounded`].
+pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    out_fastloop_end: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> FlatFastloopExit {
+    const FASTLOOP_MARGIN: usize = 320;
+    const LITLEN_TABLEMASK: u64 = (1u64 << LitLenTable::TABLE_BITS) - 1;
+
+    let out_ptr = output.as_mut_ptr();
+    let litlen_ptr = litlen.entries_ptr();
+
+    let mut bitbuf = bits.bitbuf;
+    let mut bitsleft = bits.bitsleft;
+    let mut in_pos = bits.pos;
+    let in_data = bits.data;
+    let in_ptr = in_data.as_ptr();
+    let in_fastloop_end = in_data.len().saturating_sub(32);
+
+    macro_rules! refill_branchless_fast {
+        () => {
+            unsafe {
+                let bits_u8 = bitsleft as u8;
+                let word = (in_ptr.add(in_pos) as *const u64).read_unaligned();
+                let word = u64::from_le(word);
+                bitbuf |= word << bits_u8;
+                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                bitsleft = (bits_u8 as u32) | 56;
+            }
+        };
+    }
+    macro_rules! lookup {
+        () => {
+            unsafe { (*litlen_ptr.add((bitbuf & LITLEN_TABLEMASK) as usize)).raw() }
+        };
+    }
+    macro_rules! consume {
+        ($entry:expr) => {{
+            let saved = bitbuf;
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            saved
+        }};
+    }
+    macro_rules! writeback_stopped {
+        () => {{
+            bits.bitbuf = bitbuf;
+            bits.bitsleft = bitsleft & 0xFF;
+            bits.pos = in_pos;
+        }};
+    }
+    macro_rules! store_lit {
+        ($lit:expr) => {{
+            unsafe {
+                *out_ptr.add(out_pos) = $lit;
+            }
+            out_pos += 1;
+        }};
+    }
+
+    // PRELOAD first entry BEFORE loop (libdeflate template line 346-347).
+    if in_pos + 8 > in_data.len() {
+        return FlatFastloopExit::Stopped(out_pos);
+    }
+    refill_branchless_fast!();
+    let mut entry = lookup!();
+
+    while in_pos < in_fastloop_end && out_pos + FASTLOOP_MARGIN <= out_fastloop_end {
+        // Consume the (preloaded, unconsumed) primary entry; save pre-consume
+        // bitbuf for length/offset extra-bit extraction (template line 358-360).
+        let mut saved_bitbuf = consume!(entry);
+
+        // ── LITERAL: software-pipelined chain (template lines 366-435) ──
+        if (entry as i32) < 0 {
+            // 1st extra fast literal: store primary AFTER issuing next load.
+            let lit = (entry >> 16) as u8;
+            entry = lookup!();
+            saved_bitbuf = consume!(entry);
+            store_lit!(lit);
+            if (entry as i32) < 0 {
+                // 2nd extra fast literal.
+                let lit = (entry >> 16) as u8;
+                entry = lookup!();
+                saved_bitbuf = consume!(entry);
+                store_lit!(lit);
+                if (entry as i32) < 0 {
+                    // 3rd literal in lieu of primary: load next (unconsumed),
+                    // refill, store, and loop (template lines 411-415).
+                    let lit = (entry >> 16) as u8;
+                    entry = lookup!();
+                    refill_branchless_fast!();
+                    store_lit!(lit);
+                    continue;
+                }
+            }
+            // Fell through: `entry` is the first NON-literal symbol, already
+            // consumed, `saved_bitbuf` = its pre-consume bitbuf. Drop into the
+            // exceptional / length-match handling below.
+        }
+
+        // ── EXCEPTIONAL: subtable pointer or end-of-block (template 442-483) ──
+        if (entry & 0x8000) != 0 {
+            if (entry & 0x2000) != 0 {
+                writeback_stopped!();
+                return FlatFastloopExit::EndOfBlock(out_pos);
+            }
+            let subtable_start = (entry >> 16) as usize;
+            let subtable_bits = ((entry >> 8) & 0x3F) as u64;
+            let sub_idx = (bitbuf & ((1u64 << subtable_bits) - 1)) as usize;
+            entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
+            let saved_sub = consume!(entry);
+            if (entry as i32) < 0 {
+                // Subtable literal (template 472-478): refill, preload, store.
+                let lit = ((entry >> 16) & 0xFF) as u8;
+                refill_branchless_fast!();
+                entry = lookup!();
+                store_lit!(lit);
+                continue;
+            }
+            if (entry & 0x2000) != 0 {
+                writeback_stopped!();
+                return FlatFastloopExit::EndOfBlock(out_pos);
+            }
+            // Subtable length.
+            let length = (entry >> 16)
+                + (extract_bits(saved_sub, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+            refill_branchless_fast!();
+            let mut dist_entry = dist.lookup(bitbuf);
+            if dist_entry.is_subtable_ptr() {
+                bitbuf >>= DistTable::TABLE_BITS;
+                bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+            }
+            let dist_extra_saved = bitbuf;
+            let dist_raw = dist_entry.raw();
+            bitbuf >>= dist_raw as u8;
+            bitsleft = bitsleft.wrapping_sub(dist_raw);
+            let distance = (dist_raw >> 16)
+                + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32)
+                    >> ((dist_raw >> 8) as u8)) as u32;
+            if distance == 0 || distance as usize > out_pos {
+                writeback_stopped!();
+                return FlatFastloopExit::InvalidDistance(out_pos);
+            }
+            refill_branchless_fast!();
+            entry = lookup!();
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            continue;
+        }
+
+        // ── LENGTH CODE (no subtable) + match (template 485-572) ──
+        let mut dist_entry = dist.lookup(bitbuf);
+        let length = (entry >> 16)
+            + (extract_bits(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+        if (bitsleft as u8) < 32 {
+            refill_branchless_fast!();
+        }
+        if dist_entry.is_subtable_ptr() {
+            bitbuf >>= DistTable::TABLE_BITS;
+            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+        }
+        let dist_extra_saved = bitbuf;
+        let dist_raw = dist_entry.raw();
+        bitbuf >>= dist_raw as u8;
+        bitsleft = bitsleft.wrapping_sub(dist_raw);
+        let distance = (dist_raw >> 16)
+            + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32) >> ((dist_raw >> 8) as u8))
+                as u32;
+        if distance == 0 || distance as usize > out_pos {
+            writeback_stopped!();
+            return FlatFastloopExit::InvalidDistance(out_pos);
+        }
+        // Preload next litlen entry + refill BEFORE the copy so the match-copy
+        // latency overlaps (template lines 571-572).
+        refill_branchless_fast!();
+        entry = lookup!();
+        out_pos = copy_match_fast(output, out_pos, distance, length);
+    }
+
+    writeback_stopped!();
+    FlatFastloopExit::Stopped(out_pos)
+}
+
+/// ROUTE-B kernel selector. PRODUCTION DEFAULT is the libdeflate
+/// software-pipelined fastloop port ([`decode_huffman_fastloop_bounded_pipelined`]),
+/// a gated aarch64 T1 win (paired sign-test 19-20/21 reps, gap silesia
+/// +19.6%→+13.1%, byte-exact on silesia/nasa/monorepo/squishy, 2026-06-21).
+/// `GZIPPY_BASELINE_KERNEL=1` reverts to the legacy pack-8 baseline
+/// ([`decode_huffman_fastloop_bounded`]) — kept ONLY so the win stays re-verifiable
+/// by the AB rig (`scripts/bench/_aarch64_pipelined_ab_local.sh`). Read ONCE
+/// (OnceLock) so the per-chunk dispatch is a single relaxed load, not a getenv.
+pub(crate) fn use_baseline_kernel() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("GZIPPY_BASELINE_KERNEL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 fn decode_huffman_cf(
     bits: &mut Bits,
     output: &mut [u8],
@@ -3271,6 +3506,158 @@ mod tests {
         while k < block_out {
             check_budget(k);
             k += 97;
+        }
+    }
+
+    /// ROUTE-B SEAM DIFFERENTIAL for the libdeflate-software-pipelined fastloop
+    /// port (`decode_huffman_fastloop_bounded_pipelined`). The faithful port MUST
+    /// be byte-IDENTICAL to (a) the flate2 oracle, (b) the production flat engine
+    /// oracle, and (c) the baseline fastloop — at EVERY output-budget boundary `k`
+    /// (the budget IS the per-chunk cap, so this sweeps "multiple chunk sizes"
+    /// densely: every bit position around the block end + a coarse full-block
+    /// sweep). The cap deliberately lands inside the pipelined 2-extra+lieu literal
+    /// chain (the changed code), mid-length, mid-dist, and mid-copy. Two block
+    /// shapes: a literal/back-ref mix AND a literal-heavy block that stresses the
+    /// 3-literal cap path. Ships in the SAME commit as the kernel per the
+    /// real-corpus-test rule.
+    #[test]
+    fn seam_pipelined_fastloop_matches_baseline_and_flate2_at_every_budget() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::{Read as _, Write as _};
+
+        // Two block shapes: mixed (literals + back-refs) and literal-heavy.
+        for shape in 0..2u8 {
+            let mut data: Vec<u8> = Vec::with_capacity(120_000);
+            let mut x: u32 = 0x1234_5678 ^ ((shape as u32) << 24);
+            for i in 0..120_000usize {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if shape == 0 {
+                    // mixed: small alphabet + periodic long repeats (back-refs)
+                    if i % 64 < 40 {
+                        data.push((x >> 24) as u8 & 0x1F);
+                    } else {
+                        data.push(b"the quick brown fox "[i % 20]);
+                    }
+                } else {
+                    // literal-heavy: skewed 64-symbol alphabet, few exploitable
+                    // matches → stays dynamic-Huffman but exercises the 2-extra+lieu
+                    // literal chain hardest (random bytes would emit a STORED block).
+                    let b = (x >> 24) as u8 & 0x3F;
+                    // Bias toward a few common symbols so Huffman (dynamic) wins.
+                    data.push(if b < 0x10 { b & 0x07 } else { b });
+                }
+            }
+
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+            enc.write_all(&data).unwrap();
+            let deflate = enc.finish().unwrap();
+
+            let mut hbits = Bits::at_bit_offset(&deflate, 0);
+            hbits.refill();
+            let btype = ((hbits.peek() >> 1) & 3) as u8;
+            // Only the dynamic-block shape exercises subtables; require it.
+            assert_eq!(btype, 2, "shape {shape}: first block must be dynamic");
+            hbits.consume(3);
+            let (ll, dl) = parse_dynamic_header(&mut hbits).expect("parse dynamic header");
+            let litlen = LitLenTable::build(&ll).expect("LitLenTable::build");
+            let dist = DistTable::build(&dl).expect("DistTable::build");
+            let body_bit = hbits.bit_position();
+
+            // Oracle 1: production flat engine.
+            let mut oracle = vec![0u8; data.len() + 1024];
+            let mut obits = Bits::at_bit_offset(&deflate, body_bit);
+            let block_out = decode_flat_clean_pub(&mut obits, &mut oracle, 0, &litlen, &dist)
+                .expect("oracle decode");
+            oracle.truncate(block_out);
+            assert!(block_out > 4_000, "shape {shape}: block too small");
+
+            // Oracle 2 (independent): flate2 raw-deflate decode of the WHOLE
+            // stream — its prefix of length block_out must equal the flat oracle.
+            let mut f2 = Vec::new();
+            flate2::read::DeflateDecoder::new(&deflate[..])
+                .read_to_end(&mut f2)
+                .expect("flate2 decode");
+            assert!(f2.len() >= block_out, "shape {shape}: flate2 short");
+            assert_eq!(
+                &f2[..block_out],
+                &oracle[..],
+                "shape {shape}: flate2 vs flat-engine oracle disagree"
+            );
+
+            const FASTLOOP_MARGIN: usize = 320;
+            let cap = block_out + 1024;
+
+            // Decode the WHOLE block through `arm` at budget `k`; assert byte-exact
+            // vs the oracle (= flate2) and, on a budget Stop, that the canonical
+            // re-read seam resumes to the exact full block. NOTE: the pipelined and
+            // baseline kernels legitimately hit the FASTLOOP_MARGIN budget at
+            // DIFFERENT granularities (3-literal vs 8-literal batches), so they may
+            // return DIFFERENT exit variants (EOB vs Stopped) at the same `k` — that
+            // is correct; only the emitted/resumed BYTES must match. Both arms are
+            // run so the test exercises the production (pipe) AND escape (base) paths
+            // identically; their byte-exactness is the gate (transitively pipe==base
+            // since both == oracle).
+            let check_arm = |k: usize, arm: u8| {
+                let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+                let mut out = vec![0u8; cap];
+                let exit = if arm == 0 {
+                    decode_huffman_fastloop_bounded_pipelined(
+                        &mut bits, &mut out, 0, k, &litlen, &dist,
+                    )
+                } else {
+                    decode_huffman_fastloop_bounded(&mut bits, &mut out, 0, k, &litlen, &dist)
+                };
+                let who = if arm == 0 { "pipe" } else { "base" };
+                match exit {
+                    FlatFastloopExit::EndOfBlock(p) => {
+                        assert_eq!(p, block_out, "shape {shape} {who}: EOB count k={k}");
+                        assert_eq!(
+                            &out[..p],
+                            &oracle[..],
+                            "shape {shape} {who}: EOB bytes k={k}"
+                        );
+                    }
+                    FlatFastloopExit::Stopped(p) => {
+                        assert!(
+                            p <= k.max(FASTLOOP_MARGIN),
+                            "shape {shape} {who}: Stopped past budget k={k} p={p}"
+                        );
+                        assert_eq!(
+                            &out[..p],
+                            &oracle[..p],
+                            "shape {shape} {who}: prefix k={k} p={p}"
+                        );
+                        let bp = bits.bit_position();
+                        let mut rbits = Bits::at_bit_offset(&deflate, bp);
+                        let total = decode_flat_clean_pub(&mut rbits, &mut out, p, &litlen, &dist)
+                            .expect("resume");
+                        assert_eq!(total, block_out, "shape {shape} {who}: resume count k={k}");
+                        assert_eq!(
+                            &out[..total],
+                            &oracle[..],
+                            "shape {shape} {who}: resume k={k}"
+                        );
+                    }
+                    FlatFastloopExit::InvalidDistance(p) => {
+                        panic!("shape {shape} {who}: unexpected InvalidDistance k={k} p={p}")
+                    }
+                }
+            };
+            let check_budget = |k: usize| {
+                check_arm(k, 0);
+                check_arm(k, 1);
+            };
+
+            let lo = block_out.saturating_sub(FASTLOOP_MARGIN + 258 + 64);
+            for k in lo..=(block_out + FASTLOOP_MARGIN + 64) {
+                check_budget(k);
+            }
+            let mut k = 1usize;
+            while k < block_out {
+                check_budget(k);
+                k += 97;
+            }
         }
     }
 
