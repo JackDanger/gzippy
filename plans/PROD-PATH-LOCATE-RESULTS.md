@@ -63,6 +63,32 @@ recycle the ChunkData output buffer in the thin-T1 loop (OWED, code change).
    overhead is NOT CRC. It must be the per-chunk data-plane (#1 alloc/first-touch / #2
    window-roll / #3 isal lifecycle / #4 boundary record). Clean per-candidate oracles OWED.
 
+## AMD (solvency EPYC 7282 Zen2, bare-metal FROZEN gov=performance boost=0, taskset cpu4, best-of-15)
+Box thawed + verified after: gov=ondemand / boost=1 / paranoid=4.
+
+| corpus   | igzip ms | prod ms | **REAL SCAFFOLD** (prod−igzip)/igzip | CRC share (prod−crcoff)/prod | SCAFFOLD−CRC (crcoff−igzip)/igzip | reserve#1 (prod−pool)/prod | A/A ms |
+|----------|----------|---------|--------------------------------------|------------------------------|-----------------------------------|----------------------------|--------|
+| silesia  | 357.4    | 472.8   | **+32.31%** (115.5 ms)               | 4.31% (20.4 ms)              | 26.61%                            | 3.07% (14.5 ms)            | 0.35   |
+| nasa     | 131.2    | 169.2   | **+28.94%** (38.0 ms)                | 11.99% (20.3 ms)             | 13.49%                            | 0.33% (0.6 ms)             | 1.54   |
+| monorepo | 57.9     | 82.7    | **+42.82%** (24.8 ms)                | 5.37% (4.4 ms)               | 35.15%                            | 8.40% (6.9 ms)             | 0.11   |
+| squishy  | 703.8    | 906.4   | **+28.79%** (202.6 ms)               | 4.12% (37.3 ms)              | 23.49%                            | 0.89% (8.1 ms)             | 1.12   |
+
+A/A ≤ 1.5 ms ≪ every reported Δ. GATE0(bytes)=PASS all. `prodbig` confounded again
+(nasa −46.4% / squishy −16.7% — same reserve-balloon confound as Intel; do NOT bank).
+
+## CROSS-ARCH VERDICT (Intel AND AMD AGREE → LAW-grade)
+1. **The REAL production T1 driver is +28.8 to +42.8% slower than the igzip monolith on
+   BOTH arches** (Intel 28.8–35.2%, AMD 28.9–42.8%), positive on all 8 cells, holding the
+   inner kernel constant (isal clean tail = igzip `_04`). This OVERTURNS the prior
+   SCAFFOLD-LOCATE "no scaffold to converge" verdict — which was a PROXY artifact (the
+   `cheap` arm omitted the real production driver). There IS a large real scaffold.
+2. **CRC32 second-touch (#5) = 2.0–12.0%** of prod wall, both arches (larger on Zen2 +
+   on nasa). Real, clean removal-oracle (non-inert proven), but a minority of the gap.
+3. **SCAFFOLD−CRC = 13.5–35.2%** remains after CRC removed, both arches — the DOMINANT
+   production-only overhead is the per-chunk data-plane, NOT CRC. Clean per-candidate
+   removal-oracles (#1 alloc/first-touch, #2 window-roll, #3 isal lifecycle, #4 boundary
+   record) are OWED — `prodbig`/`prodpool` could not isolate them (confounded/weak).
+
 ## OWED (next, this cycle)
 - Clean per-chunk removal-oracles (code change, byte-transparent, non-inert counter each):
   recycle output buffer (#1), reuse window tail buffers (#2), and a boundary-record no-op
