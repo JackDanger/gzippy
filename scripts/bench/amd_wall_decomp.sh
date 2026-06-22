@@ -40,7 +40,7 @@ echo "FROZEN gov=performance boost=0 (no llama touch); watchdog=$WD cores=$CORES
 
 # perf field extractors
 pf(){ grep -E "[[:space:]]$2\b" "$1" | grep -oE '[0-9,]+' | head -1 | tr -d ,; }
-gzreg(){ grep "$2" "$1" | grep -oE 'cyc=[0-9]+' | head -1 | cut -d= -f2; }
+gzreg(){ grep "$2" "$1" | grep -oE 'cyc= *[0-9]+' | head -1 | grep -oE '[0-9]+'; }
 gzov(){ grep "OVERLAP_VIOLATIONS=" "$1" | grep -oE 'OVERLAP_VIOLATIONS=[0-9]+' | head -1 | cut -d= -f2; }
 # rg region: "[RG-REGION] WORKER cyc=.. | MARKERPP cyc=.. | OUTPUT cyc=.."
 rgreg(){ grep '\[RG-REGION\] WORKER' "$1" | grep -oE "$2 cyc=[0-9]+" | head -1 | grep -oE '[0-9]+'; }
@@ -63,7 +63,7 @@ for corpus in "${CORPORA[@]}"; do
   for TH in $THS; do
     for r in $(seq 1 "$N"); do
       taskset -c "$CORES" perf stat -o "$OUT/gz.perf" -e "$PE" -- env GZIPPY_FORCE_PARALLEL_SM=1 \
-        GZIPPY_REGION_PROF=1 "$GZ" -d -p "$TH" -c "$corpus" >/dev/null 2>"$OUT/gz.err"
+        GZIPPY_REGION_PROF=1 GZIPPY_VERBOSE=1 "$GZ" -d -p "$TH" -c "$corpus" >/dev/null 2>"$OUT/gz.err"
       gp=$(pf "$OUT/gz.perf" cycles); gcs=$(pf "$OUT/gz.perf" context-switches); gmig=$(pf "$OUT/gz.perf" cpu-migrations)
       gw=$(gzreg "$OUT/gz.err" R_WORKER); gm=$(gzreg "$OUT/gz.err" R_MARKERPP); go=$(gzreg "$OUT/gz.err" R_OUTPUT); gov=$(gzov "$OUT/gz.err")
 
@@ -73,7 +73,7 @@ for corpus in "${CORPORA[@]}"; do
       rw=$(rgreg "$OUT/rg.err" WORKER); rm=$(rgreg "$OUT/rg.err" MARKERPP); ro=$(rgreg "$OUT/rg.err" OUTPUT); rov=$(rgov "$OUT/rg.err")
 
       taskset -c "$CORES" perf stat -o "$OUT/gzaa.perf" -e cycles -- env GZIPPY_FORCE_PARALLEL_SM=1 \
-        GZIPPY_REGION_PROF=1 "$GZ" -d -p "$TH" -c "$corpus" >/dev/null 2>"$OUT/gzaa.err"
+        GZIPPY_REGION_PROF=1 GZIPPY_VERBOSE=1 "$GZ" -d -p "$TH" -c "$corpus" >/dev/null 2>"$OUT/gzaa.err"
       ap=$(pf "$OUT/gzaa.perf" cycles); aw=$(gzreg "$OUT/gzaa.err" R_WORKER)
 
       echo "$name,$TH,$r,$gp,$gw,$gm,$go,$gov,$rp,$rw,$rm,$ro,$rov,$ap,$aw,$gcs,$rcs,$gmig,$rmig" >> "$CSV"
