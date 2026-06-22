@@ -74,6 +74,52 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --no-default-features --f
 for k in GZIPPY_INJ_LIT GZIPPY_INJ_COPY GZIPPY_INJ_REFILL; do bash scripts/bench/_inject_slope_local.sh /tmp/silesia.gz $k 9 0 4 8 16; done
 ```
 
+## 5. NIGHT25-STYLE DISASM DIFF — gz fastloop vs libdeflate fastloop (2026-06-21)
+Gate-5 tier = DISASM-READ = **HYPOTHESIS** (not a wall verdict). But it DISCRIMINATES
+the rival "codegen" hypotheses deterministically (these are facts readable from the asm,
+not inferences about the wall). Artifacts: `plans/disasm/gz_fastloop_aarch64.s`
+(gz `decode_huffman_fastloop_bounded`, 618 insns, prod build `pure-rust-inflate`,
+target-cpu=native, codegen-units=1, INJECTOR ELIDED — verified 0 getenv/inject residue)
+vs `plans/disasm/libdeflate_decompress_aarch64.s` (Homebrew libdeflate 1.25
+`_libdeflate_deflate_decompress_ex`, the EXACT code `libdeflate-gunzip` = the §1 bar runs;
+fastloop ≈ 0x508-0x84c). Both aarch64-apple-darwin.
+
+### Bucketed per-iteration divergence (gz − libdeflate)
+| bucket | finding | verdict |
+|--------|---------|---------|
+| **array bounds-checks** | gz: NONE. Table loads are raw `ldr w,[x4,x8,lsl#2]`; lit store raw `strb w,[x1,x2]`; copy raw ptrs. NO panic/brk landing pad, NO `bl` (fully inlined). get_unchecked/`*mut` already in effect. | **FALSIFIED** — no cheap get_unchecked win waiting |
+| **register spills** | gz loop body (LBB1115_5..98): **0** sp-relative mem ops. Everything in x19-x28 + caller regs. | **FALSIFIED** — no spill to fix |
+| **match-copy** | gz: NEON-128 `ldp/stp q0,q1` + explicit `prfm pldl1keep` (12 q-ops, 2 prefetch). libdeflate: scalar-64 `ldr x/str x` (0 NEON, 0 prefetch). | gz **MORE** aggressive — NOT a loss; a NEON kernel here is redundant |
+| **refill / loop ORGANIZATION** | gz: top-of-loop `cmp bitsleft,#44; b.hs` refill-gate + nested 8-deep literal unroll (packs ≤8 lits → 1×u64 store via ORR-assembly) + returns to a per-iter budget check (LBB1115_98: 2 cmp + 2 b + 2 add). libdeflate: software-pipelined symbol-CHAIN — issues the NEXT litlen table-load EARLY (0x6ac in lit path, 0x5d8 mid-match-copy) to hide load-use latency, stores lits singly (`strb [post]`), and re-checks budget ONLY after a match (chains literals bounds-check-free). | **THE one material divergence** — a real libdeflate technique gz hasn't fully ported |
+
+### DISCRIMINATED VERDICT (the brief's fork)
+NEITHER of the brief's two clean outcomes; a refined THIRD:
+- **NOT "gross/sloppy Rust codegen → cheap fix"**: the obvious Rust-level remedies
+  (get_unchecked, de-spill, vectorize copy) are ALREADY APPLIED — falsified above. No
+  cheap get_unchecked/restructure capture is sitting unclaimed.
+- **NOT "NEON-kernel target"**: the divergence is in SCALAR decode scheduling, not the
+  copy; the copy is already NEON-128+prefetch. Hand-NEON is aimed at the wrong region.
+- **NOT yet "irreducible Rust-vs-C floor → escalate"**: that escalation is PREMATURE
+  because exactly ONE concrete structural divergence remains — libdeflate's
+  software-pipelined fastloop ORGANIZATION (early next-symbol table-load to hide
+  load-use latency; bounds-check amortized per-match not per-iteration).
+
+**Cheapest surviving candidate remedy** = a faithful port of libdeflate 1.25's
+software-pipelined fastloop organization (a Rust LOOP-STRUCTURE refactor — moderate,
+NOT multi-session hand-asm, NOT NEON). **Per Gate-2 whether it pays is UNPROVEN** and
+MUST be settled by an interleaved AB (Gate-1), not assumed.
+- PRIOR (explicit HYPOTHESIS, NOT banked): §4 showed the loop is uniformly
+  throughput-bound with NO fat slack sub-region; latency-hiding pipelining helps
+  LATENCY-bound loops, so the expected payoff is small → leans toward the
+  irreducible-floor escalation. This prior sets up the AB; it is not a finding.
+
+### RE-RUN (disasm diff)
+```
+RUSTFLAGS="-C target-cpu=native --emit asm -C codegen-units=1" cargo rustc --release --lib --no-default-features --features pure-rust-inflate
+# gz: grep decode_huffman_fastloop_bounded in target/release/deps/gzippy-*.s
+ar x /opt/homebrew/lib/libdeflate.a deflate_decompress.c.o && objdump -d --no-show-raw-insn deflate_decompress.c.o   # libdeflate bar
+```
+
 ## OWED / CAVEATS
 - NOT-YET-LAW: single box (macOS M-series, no perf), wall-only. Linux aarch64 box owed.
 - PRE-EXISTING (not introduced here, confirmed by stash-and-test on pristine @c6152d17):
