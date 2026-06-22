@@ -131,9 +131,19 @@ pin_mask() {  # $1=T -> echo "c0,c1,..."
   echo "$m"
 }
 
-# perf events: wall(duration_time, ns) + P-core cycles/instructions + task-clock(ms)
+# perf events: wall(duration_time, ns) + cycles/instructions + task-clock(ms)
 #  + cache refs/misses for an LLC-miss% report column (multiplexed; report-only).
-EVENTS="duration_time,cpu_core/cycles/,cpu_core/instructions/,task-clock,cpu_core/cache-references/,cpu_core/cache-misses/"
+# ARCH-CONDITIONAL: Intel i7-13700T is a HYBRID PMU (cpu_core/cpu_atom) so the
+# P-core counters need the `cpu_core/<ev>/` syntax; AMD (and any non-hybrid PMU)
+# rejects that — use plain event names. standing_report.py matches by substring so
+# both forms parse identically. (Without this, AMD perf errored on every run →
+# zero samples → the analyzer's misleading "no trusted cells — box too loaded".)
+if [ -d /sys/devices/cpu_core ]; then
+  EVENTS="duration_time,cpu_core/cycles/,cpu_core/instructions/,task-clock,cpu_core/cache-references/,cpu_core/cache-misses/"
+else
+  EVENTS="duration_time,cycles,instructions,task-clock,cache-references,cache-misses"
+fi
+echo "perf EVENTS: $EVENTS"
 
 run_one() {  # $1=arm $2=corp $3=T $4=rep
   local arm=$1 corp=$2 T=$3 r=$4 F="$CORPUS_DIR/$2.gz"
