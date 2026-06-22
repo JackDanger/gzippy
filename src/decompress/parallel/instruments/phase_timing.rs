@@ -112,7 +112,7 @@ pub fn report() {
     let total_ms = last.duration_since(first).as_secs_f64() * 1e3;
 
     eprintln!(
-        "[phase-timing] fired_marks={} decode_wall(decode_entry->last)={:.3}ms",
+        "[phase-timing] fired_marks={} wall(first->last)={:.3}ms",
         m.len(),
         total_ms
     );
@@ -148,7 +148,8 @@ pub fn report() {
         }
     );
     // Non-inert proof: list which expected marks are MISSING.
-    const EXPECTED: [&str; 7] = [
+    const EXPECTED: [&str; 9] = [
+        "main_start",
         "decode_entry",
         "envelope_parsed",
         "scaffold_built",
@@ -156,6 +157,7 @@ pub fn report() {
         "consumer_done",
         "finalize_done",
         "crc_verified",
+        "main_end",
     ];
     let present: Vec<&str> = m.iter().map(|(n, _)| *n).collect();
     let missing: Vec<&str> = EXPECTED
@@ -164,7 +166,7 @@ pub fn report() {
         .filter(|e| !present.contains(e))
         .collect();
     if missing.is_empty() {
-        eprintln!("  [non-inert] all 7 expected marks fired");
+        eprintln!("  [non-inert] all 9 expected marks fired");
     } else {
         eprintln!("  [non-inert] MISSING marks: {missing:?}");
     }

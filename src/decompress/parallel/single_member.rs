@@ -204,8 +204,9 @@ pub fn decompress_parallel<W: Write>(
 
         // Phase-timing instrument (GZIPPY_PHASE_TIMING=1, byte-transparent, NO rg
         // counterpart). Marks the SERIAL phase boundaries to locate the AMD-T2
-        // serial-wrapper excess. decode_entry == this T0; report() at the end.
-        crate::decompress::parallel::phase_timing::reset();
+        // serial-wrapper excess. reset()+main_start fire in main() so the PRE
+        // (main_start->decode_entry) and POST (crc_verified->main_end) wrappers
+        // OUTSIDE this region are captured; report() runs in main().
         crate::decompress::parallel::phase_timing::mark("decode_entry");
 
         // Production driver: `sm_driver::read_parallel_sm` → `chunk_fetcher::drive`.
@@ -313,7 +314,6 @@ pub fn decompress_parallel<W: Write>(
         };
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
-        crate::decompress::parallel::phase_timing::report();
         if debug_enabled() {
             let total = t0.elapsed();
             let mbps = result.total_size as f64 / total.as_secs_f64() / 1e6;
