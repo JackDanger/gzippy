@@ -3073,6 +3073,14 @@ fn resolve_chunk_markers_on_chunk(
     // `data_with_markers`). `populate_subchunk_windows` runs against the un-merged
     // markers — `copy_window_at_chunk_offset` already branches on `narrowed_len>0`.
     chunk.populate_subchunk_windows(predecessor_window);
+    // RSS convergence (GZIPPY_FREE_MARKERS): after narrow + CRC + subchunk-
+    // window extraction have read the low-half narrowed bytes, release the
+    // dead upper half of each marker segment back to the OS (faithful to rg
+    // applyWindow @todo, DecodedData.hpp:374-379). The narrowed low half
+    // stays resident for the consumer's zero-copy iovec write.
+    if dwm_len_pre > 0 && crate::decompress::parallel::segmented_markers::free_markers_enabled() {
+        chunk.data_with_markers.release_narrowed_upper_pages();
+    }
     chunk.markers_resolved = true;
     chunk.resolved_pred_key = Some(pred_key);
 }
