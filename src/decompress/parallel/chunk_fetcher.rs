@@ -4379,6 +4379,12 @@ fn drain_one_pending<W: std::io::Write>(
     let t_crc_write = std::time::Instant::now();
     let decoded_data_len = chunk.data.len().saturating_sub(chunk.data_prefix_len);
     let payload_bytes = chunk.narrowed_len + decoded_data_len;
+    if crate::decompress::parallel::chunk_data::rss_split_enabled() {
+        crate::decompress::parallel::chunk_data::rss_split_account(
+            chunk.narrowed_len,
+            decoded_data_len,
+        );
+    }
     let mut wrote_via_fd = false;
     #[cfg(unix)]
     if let Some(fd) = out_fd {
