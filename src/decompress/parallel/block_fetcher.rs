@@ -452,6 +452,10 @@ where
                 // deep-clone (~7ms × 24 chunks). Drop the promote —
                 // just evict from prefetch_cache and return.
                 pc.evict(block_offset);
+                crate::decompress::parallel::chunk_data::lc_set(
+                    &crate::decompress::parallel::chunk_data::LC_G_PREFETCH,
+                    pc.size(),
+                );
                 return Some(v);
             }
         }
@@ -494,6 +498,10 @@ where
             c.clear();
         }
         c.insert(block_offset, block_data);
+        crate::decompress::parallel::chunk_data::lc_set(
+            &crate::decompress::parallel::chunk_data::LC_G_MAIN,
+            c.size(),
+        );
     }
 
     /// Insert a prefetched block into the prefetch cache. Stats:
@@ -933,10 +941,14 @@ where
             // BlockFetcher.hpp:558 — `m_prefetching.emplace(offset, std::move(future))`.
             // We bypass `submit_prefetch` here to avoid double-counting
             // record_prefetch (already done above).
-            self.prefetching
-                .lock()
-                .unwrap()
-                .insert(prefetch_block_offset, rx);
+            {
+                let mut p = self.prefetching.lock().unwrap();
+                p.insert(prefetch_block_offset, rx);
+                crate::decompress::parallel::chunk_data::lc_set(
+                    &crate::decompress::parallel::chunk_data::LC_G_PREFETCHING,
+                    p.len(),
+                );
+            }
             submitted += 1;
         }
 
@@ -1003,7 +1015,14 @@ where
                         prefetching.remove(&key);
                         // Insert into prefetch cache.
                         drop(prefetching);
-                        self.prefetch_cache.lock().unwrap().insert(key, value);
+                        {
+                            let mut pc = self.prefetch_cache.lock().unwrap();
+                            pc.insert(key, value);
+                            crate::decompress::parallel::chunk_data::lc_set(
+                                &crate::decompress::parallel::chunk_data::LC_G_PREFETCH,
+                                pc.size(),
+                            );
+                        }
                         prefetching = self.prefetching.lock().unwrap();
                         moved += 1;
                     }
@@ -1021,6 +1040,10 @@ where
                 }
             }
         }
+        crate::decompress::parallel::chunk_data::lc_set(
+            &crate::decompress::parallel::chunk_data::LC_G_PREFETCHING,
+            prefetching.len(),
+        );
         moved
     }
 

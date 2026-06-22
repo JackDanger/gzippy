@@ -377,7 +377,12 @@ impl ChunkData {
         // Clones=0 in production (Arc::try_unwrap 36/0) so this stays
         // balanced against the Drop decrement below.
         let live = LIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        MAX_LIVE_CHUNKS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
+        let prev_max = MAX_LIVE_CHUNKS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
+        // LIFECYCLE-SPLIT: peak live is always at a construct — snapshot the
+        // per-holder gauges whenever this construct sets a new max.
+        if live > prev_max {
+            lc_record_peak(live);
+        }
         let first_subchunk = Subchunk {
             encoded_offset_bits,
             encoded_size_bits: 0,
@@ -1630,6 +1635,120 @@ pub fn rss_split_report(total_decoded: u64) -> bool {
         );
     }
     non_inert && conserves
+}
+
+/// LIFECYCLE-SPLIT ISOLATION INSTRUMENT (env GZIPPY_LIFECYCLE_SPLIT=1;
+/// byte-transparent, OFF == identity). Decomposes the simultaneously-live
+/// ChunkData set (MAX_LIVE_CHUNKS) into lifecycle states, to answer WHY all
+/// chunks of a small file are resident at peak RSS:
+///   AHEAD     — decoded, sitting in BlockFetcher prefetch_cache / main cache
+///               awaiting the in-order consumer (= prefetch depth; decoded
+///               ahead for overlap).
+///   PENDING   — consumer holds it (post-process in flight / awaiting write).
+///   RETAINED  — written to the output sink, still held in `recycle_deferral`
+///               before its buffers are recycled/freed (FREEABLE after write).
+///   DECODING  — derived = peak_live − (AHEAD+PENDING+RETAINED): workers
+///               actively building it (genuinely in-flight, needed).
+/// Per-holder current-size GAUGES are kept live; snapshotted at the construct
+/// that sets a new MAX_LIVE_CHUNKS (peak live is ALWAYS at a construct, since
+/// LIVE_CHUNKS only rises there). Gate-0: non-inert (snapshot fired) +
+/// conservation (AHEAD+PENDING+RETAINED ≤ peak_live; DECODING ≥ 1 — the
+/// just-constructed chunk).
+pub static LC_G_PREFETCH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_G_MAIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_G_PREFETCHING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_G_PENDING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_G_RECYCLE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub static LC_S_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LC_S_PREFETCH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_S_MAIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_S_PREFETCHING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_S_PENDING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_S_RECYCLE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static LC_S_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True iff the lifecycle-split isolation instrument is armed (cached).
+#[inline]
+pub fn lifecycle_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("GZIPPY_LIFECYCLE_SPLIT").is_some())
+}
+
+/// Set a holder gauge to its current size (called at the mutation site while the
+/// holder's lock is held). No-op unless armed.
+#[inline]
+pub fn lc_set(gauge: &std::sync::atomic::AtomicI64, n: usize) {
+    if lifecycle_enabled() {
+        gauge.store(n as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Snapshot all holder gauges. Called from `new_with_buffers` when LIVE hits a
+/// new peak. No-op unless armed.
+#[inline]
+pub fn lc_record_peak(live: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !lifecycle_enabled() {
+        return;
+    }
+    LC_S_LIVE.store(live, Relaxed);
+    LC_S_PREFETCH.store(LC_G_PREFETCH.load(Relaxed), Relaxed);
+    LC_S_MAIN.store(LC_G_MAIN.load(Relaxed), Relaxed);
+    LC_S_PREFETCHING.store(LC_G_PREFETCHING.load(Relaxed), Relaxed);
+    LC_S_PENDING.store(LC_G_PENDING.load(Relaxed), Relaxed);
+    LC_S_RECYCLE.store(LC_G_RECYCLE.load(Relaxed), Relaxed);
+    LC_S_FIRED.fetch_add(1, Relaxed);
+}
+
+/// Emit the lifecycle-split report. Returns false if inert. `per_chunk_mib` is
+/// the average resident MiB per live chunk (peak_rss_mib / max_live) supplied by
+/// the caller so the state COUNTS can be priced into bytes vs the rg gap.
+pub fn lifecycle_report() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !lifecycle_enabled() {
+        return true;
+    }
+    let fired = LC_S_FIRED.load(Relaxed);
+    let live = LC_S_LIVE.load(Relaxed) as i64;
+    let prefetch = LC_S_PREFETCH.load(Relaxed);
+    let main = LC_S_MAIN.load(Relaxed);
+    let prefetching = LC_S_PREFETCHING.load(Relaxed);
+    let pending = LC_S_PENDING.load(Relaxed);
+    let recycle = LC_S_RECYCLE.load(Relaxed);
+    let ahead = prefetch + main;
+    let accounted = ahead + pending + recycle;
+    // DECODING = live − accounted (includes the just-constructed chunk, ≥1).
+    let decoding = live - accounted;
+    let non_inert = fired > 0;
+    let max_live = MAX_LIVE_CHUNKS.load(Relaxed) as i64;
+    eprintln!(
+        "[lifecycle] peak_live={live} max_live={max_live} fired={fired} | \
+         AHEAD(prefetch={prefetch}+main={main})={ahead} PENDING={pending} \
+         RETAINED(recycle)={recycle} DECODING(derived)={decoding} \
+         in_flight_decode_jobs={prefetching}"
+    );
+    let pct = |n: i64| {
+        if live > 0 {
+            100.0 * n as f64 / live as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "[lifecycle] state share of peak_live: AHEAD={:.0}% PENDING={:.0}% \
+         RETAINED={:.0}% DECODING={:.0}% | GATE0 non_inert={non_inert} \
+         conservation(accounted<=live & decoding>=1)={}",
+        pct(ahead),
+        pct(pending),
+        pct(recycle),
+        pct(decoding),
+        accounted <= live && decoding >= 1,
+    );
+    if !non_inert {
+        eprintln!("[lifecycle] WARNING: instrument INERT (snapshot never fired)");
+    }
+    non_inert
 }
 
 /// Effect counter: number of times `determine_used_window_symbols_for_last_subchunk`
