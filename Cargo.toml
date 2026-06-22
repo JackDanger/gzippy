@@ -212,6 +212,10 @@ required-features = ["pure-rust-inflate", "isal-compression"]
 name = "kernel_ab_aarch64"
 required-features = ["pure-rust-inflate"]
 
+[[example]]
+name = "streaming_thin"
+required-features = ["pure-rust-inflate"]
+
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
 harness = false
