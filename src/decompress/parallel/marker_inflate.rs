@@ -2701,27 +2701,6 @@ impl Block {
         let mut pos = *pos_io;
         let mut emitted = *emitted_io;
         let mut distance_marker = *distance_marker_io;
-        // ── MARKER-KERNEL Lever 2 ─────────────────────────────────────────────
-        // Route the careful-tail distance decode through the same libdeflate-
-        // shape `DistTable` single-lookup the marker fast loop uses
-        // (decode_marker_fast_loop, marker_inflate.rs:2282-2318), replacing the
-        // careful tail's `dist_hc.decode` → DISTANCE_EXTRA → refill-check →
-        // DISTANCE_BASE dependent chain (the same P3.1 84.8→61.5 cyc/backref
-        // mechanism the fast loop already banked). Scoped to the marker
-        // specialization (the locate's careful-tail bucket = 40.2% of marker
-        // decode @ 96.4 cyc/ev). `ensure_dist_table` is latched per block
-        // (`dist_table_checked`) — the marker fast loop already ran it before the
-        // tail, so this is a no-op; it is here only so the tail is self-contained.
-        // Kill-switch `GZIPPY_MARKER_DIST_TABLE=0` shares the fast loop's gate.
-        #[cfg(pure_inflate_decode)]
-        let careful_dist_lut: bool = if CONTAINS_MARKERS && !marker_dist_lut_disabled() {
-            self.ensure_dist_table();
-            true
-        } else {
-            false
-        };
-        #[cfg(not(pure_inflate_decode))]
-        let careful_dist_lut: bool = false;
         macro_rules! commit {
             ($result:expr) => {{
                 self.ring.pos = pos;
@@ -2840,71 +2819,40 @@ impl Block {
                     break;
                 }
                 // Vendor parity (gzip/deflate.hpp:336): distance via the cached
-                // reversed-bits decoder OR (Lever 2) the single-lookup DistTable.
-                let distance: usize = if careful_dist_lut && self.dist_valid {
-                    // MARKER-KERNEL Lever 2: single-lookup DistTable path —
-                    // mirror of the marker fast loop's dist decode
-                    // (marker_inflate.rs:2300-2318). Byte-exact by the same P3.1
-                    // equivalence the fast loop banked: identical litlen symbol
-                    // ⇒ identical distance + identical bit consumption; raw==0
-                    // (unassigned codes 30/31 + incomplete-code holes) ⇒
-                    // InvalidHuffmanCode, exactly `dist_hc.decode`'s `None`. Bit
-                    // budget: the outer-iteration `bits.refill()` leaves >=56
-                    // bits and the litlen consume is <=20, so >=36 here >= the
-                    // 28-bit worst case (15-bit dist code + 13 extra) — no refill
-                    // needed inside this path (matches the fast loop's proof).
-                    use crate::decompress::inflate::libdeflate_entry::DistTable;
-                    let dt = &self.asm.dist;
-                    let mut dist_entry = dt.lookup(bits.bitbuf);
-                    if dist_entry.is_subtable_ptr() {
-                        bits.consume(DistTable::TABLE_BITS as u32);
-                        dist_entry = dt.lookup_subtable_direct(dist_entry, bits.bitbuf);
-                    }
-                    let dist_raw = dist_entry.raw();
-                    if dist_raw == 0 {
-                        commit!(Err(BlockError::InvalidHuffmanCode));
-                    }
-                    let dist_extra_saved = bits.bitbuf;
-                    bits.consume_entry(dist_raw);
-                    dist_entry.decode_distance(dist_extra_saved) as usize
-                } else {
-                    // dist_hc chain VERBATIM (kill-switch / non-pure / !dist_valid
-                    // / clean specialization). `decode` consumes the code bits
-                    // internally and returns the raw distance symbol — extra bits
-                    // are read below, exactly as the canonical fallback at
-                    // :1580-1590.
-                    let dsym = match self.dist_hc.decode(bits) {
-                        Some(d) => d,
-                        None => commit!(Err(BlockError::InvalidHuffmanCode)),
-                    };
-                    if dsym as usize >= DISTANCE_BASE.len() {
-                        commit!(Err(BlockError::InvalidHuffmanCode));
-                    }
-                    // Inlined `read_distance_extra` — eliminates the
-                    // function call, the double `if extra > 0` checks,
-                    // the `ensure_bits` function call (re-check + branch),
-                    // and the `n_lowest_bits_set` runtime-branch helper.
-                    // Outer-loop refill guarantees `bits.available() >=
-                    // 13 - dbit - decoded.bit_count` (worst case 13 bits
-                    // of extra for symbol 29), so the inner availability
-                    // check is also a predictably-false branch.
-                    let extra = DISTANCE_EXTRA[dsym as usize] as u32;
-                    if extra > 0 {
+                // reversed-bits decoder. `decode` consumes the code bits
+                // internally and returns the raw distance symbol — extra bits
+                // are read below, exactly as the canonical fallback at :1580-1590.
+                let dsym = match self.dist_hc.decode(bits) {
+                    Some(d) => d,
+                    None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                };
+                if dsym as usize >= DISTANCE_BASE.len() {
+                    commit!(Err(BlockError::InvalidHuffmanCode));
+                }
+                // Inlined `read_distance_extra` — eliminates the
+                // function call, the double `if extra > 0` checks,
+                // the `ensure_bits` function call (re-check + branch),
+                // and the `n_lowest_bits_set` runtime-branch helper.
+                // Outer-loop refill guarantees `bits.available() >=
+                // 13 - dbit - decoded.bit_count` (worst case 13 bits
+                // of extra for symbol 29), so the inner availability
+                // check is also a predictably-false branch.
+                let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                let distance = if extra > 0 {
+                    if bits.available() < extra {
+                        bits.refill();
                         if bits.available() < extra {
-                            bits.refill();
-                            if bits.available() < extra {
-                                commit!(Err(BlockError::EndOfFile));
-                            }
+                            commit!(Err(BlockError::EndOfFile));
                         }
-                        // `extra` is bounded by DISTANCE_EXTRA[29] = 13,
-                        // so `1u64 << extra` is always well-defined.
-                        let mask = (1u64 << extra) - 1;
-                        let v = (bits.peek() & mask) as usize;
-                        bits.consume(extra);
-                        DISTANCE_BASE[dsym as usize] as usize + v
-                    } else {
-                        DISTANCE_BASE[dsym as usize] as usize
                     }
+                    // `extra` is bounded by DISTANCE_EXTRA[29] = 13,
+                    // so `1u64 << extra` is always well-defined.
+                    let mask = (1u64 << extra) - 1;
+                    let v = (bits.peek() & mask) as usize;
+                    bits.consume(extra);
+                    DISTANCE_BASE[dsym as usize] as usize + v
+                } else {
+                    DISTANCE_BASE[dsym as usize] as usize
                 };
                 if distance == 0 || distance > MAX_WINDOW_SIZE {
                     commit!(Err(BlockError::ExceededWindowRange));
