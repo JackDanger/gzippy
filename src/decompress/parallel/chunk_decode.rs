@@ -1484,6 +1484,7 @@ fn decode_chunk_unified_marker(
                     end_bit_offset,
                     stop_hint_bits,
                     false,
+                    true,
                 )?;
                 return Ok(chunk);
             }
@@ -1579,6 +1580,13 @@ fn finish_decode_chunk_contig_native(
     start_bit_offset: usize,
     stop_hint_bits: usize,
     until_exact: bool,
+    // T1-MONOLITH divergence (divergence-ledger #4): when false, per-block EOB
+    // boundaries are NOT recorded. The boundary index feeds the block-map /
+    // prefetch / subchunk-split which are pure T>1 scaffold — never consumed by
+    // the single-chunk T1 monolith. Byte-transparent (output is identical; only
+    // the never-read boundary metadata is skipped). Every existing caller passes
+    // `true`; only `decode_monolith_native` passes `false`.
+    record_boundaries: bool,
 ) -> Result<(), ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
 
@@ -1771,9 +1779,11 @@ fn finish_decode_chunk_contig_native(
             // is 0 on the FOLD path (the 32 KiB window is real prior output);
             // on the M3 seeded path the dictionary prefix at `data[0..32768)`
             // is NOT chunk output and must not shift boundary keys.
-            let decoded_offset =
-                chunk.data_with_markers.len() + chunk.data.len() - chunk.data_prefix_len;
-            chunk.append_block_boundary_at(end_bit_offset, decoded_offset, Some(input));
+            if record_boundaries {
+                let decoded_offset =
+                    chunk.data_with_markers.len() + chunk.data.len() - chunk.data_prefix_len;
+                chunk.append_block_boundary_at(end_bit_offset, decoded_offset, Some(input));
+            }
         }
     })
 }
@@ -1848,6 +1858,7 @@ fn finish_decode_chunk_seeded_block_native(
         inflate_start_bit,
         stop_hint_bits,
         false,
+        true,
     )
 }
 
@@ -1907,6 +1918,142 @@ fn seed_block_for_contig_native(
     marker_ctx.block_primed = true;
     Ok(marker_ctx)
 }
+
+/// T1-MONOLITH (gzippy-native) — a deliberate, T1-gated DIVERGENCE from the
+/// rapidgzip chunk pipeline TOWARD the igzip serial monolith
+/// (`vendor/isa-l/igzip/igzip_inflate.c isal_inflate :2239-2560`). See
+/// `plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`.
+///
+/// Decodes the ENTIRE single-member deflate body as ONE chunk into ONE
+/// contiguous output buffer reserved upfront to the whole-member ISIZE (igzip's
+/// single reused `out` buffer; NOT `compute_initial_reserve`'s 64 MiB-capped
+/// per-chunk reserve — that cap is the `prodbig` reserve-balloon confound). The
+/// single buffer IS the implicit history, so there is ZERO per-chunk alloc, ZERO
+/// per-chunk window clone+re-seed, and (via `record_boundaries=false`) ZERO
+/// per-block boundary record / subchunk split. The pure-Rust
+/// `decode_clean_into_contig` kernel runs over the whole stream.
+///
+/// Output is byte-identical to `drive_thin_t1_oracle` (same kernel, same clean
+/// window-present decode; chunk-0 semantics = a zero 32 KiB window seed, valid
+/// because the first block of a valid stream never back-references before output
+/// start). CRC + ISIZE are verified by the caller. T>1 NEVER reaches here.
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+pub(crate) fn decode_monolith_native(
+    input: &[u8],
+    expected_isize: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+
+    let total_bits = input.len() * 8;
+    let mut chunk = ChunkData::new(0, configuration);
+
+    // Chunk-0 semantics: a zero 32 KiB predecessor window installed as a
+    // NON-OUTPUT dictionary prefix (`data_prefix_len` excludes it from output /
+    // size / CRC). Back-refs resolve as `base[*pos - d]`; a back-ref reaching
+    // into the zero prefix would be invalid deflate (referencing before stream
+    // start) and never occurs in a valid stream.
+    let zero_window = [0u8; MAX_WINDOW_SIZE];
+    chunk.prefill_window_prefix(&zero_window);
+
+    // The ONE igzip-shaped reserve: the whole-member ISIZE, uncapped, faulted
+    // once during decode (mirrors igzip writing into the caller's full `out`).
+    // +1024 covers the per-call HEADROOM the contig kernel reserves.
+    chunk.reserve_clean(expected_isize.saturating_add(1024));
+
+    let mut marker_ctx = MarkerDecodeCtx::new(input, 0)?;
+    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
+        let mut block = cell_block.borrow_mut();
+        block.reset(None, None);
+        let mut unused: Vec<u16> = Vec::new();
+        block
+            .set_initial_window(&mut unused, &zero_window)
+            .map_err(|e| {
+                ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("monolith set_initial_window: {e:?}"),
+                ))
+            })?;
+        debug_assert!(unused.is_empty(), "seed must not drain into output");
+        Ok(())
+    })?;
+    marker_ctx.block_primed = true;
+
+    MONOLITH_NATIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    finish_decode_chunk_contig_native(
+        &mut chunk,
+        &mut marker_ctx,
+        input,
+        0,
+        total_bits,
+        false,
+        // T1-MONOLITH: no per-block boundary recording (ledger #4).
+        false,
+    )?;
+    Ok(chunk)
+}
+
+/// T1-MONOLITH (gzippy-isal) — one full-stream ISA-L decode into ONE growable
+/// buffer (≈ the igzip monolith itself). Same divergence-ledger #1/#2/#3 as the
+/// native monolith, but the engine is ISA-L `decompress_deflate_from_bit_into_growable`
+/// over the whole stream (no per-chunk bound/re-slice/re-seed). Used as the
+/// post-shed kernel reference (isal_monolith ≈ igzip).
+#[cfg(all(parallel_sm, isal_clean_tail))]
+pub(crate) fn decode_monolith_isal(
+    input: &[u8],
+    expected_isize: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::backends::isal_decompress;
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+
+    let mut chunk = ChunkData::new(0, configuration);
+    let zero_window = [0u8; MAX_WINDOW_SIZE];
+    chunk.prefill_window_prefix(&zero_window);
+    chunk.reserve_clean(expected_isize.saturating_add(1024));
+    let decode_start = chunk.data.len();
+
+    let crc32_enabled = chunk.configuration.crc32_enabled;
+    const GROW_BYTES: usize = 4 * 1024 * 1024;
+    let (written, end_bit, _boundaries) =
+        isal_decompress::decompress_deflate_from_bit_into_growable(
+            input,
+            0,
+            &zero_window,
+            &mut chunk.data,
+            expected_isize.saturating_add(1024),
+            GROW_BYTES,
+        )
+        .ok_or_else(|| {
+            ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "monolith ISA-L full-stream decode failed",
+            ))
+        })?;
+    // The growable decode commits bytes during decode then leaves them in spare;
+    // reset the logical length to decode_start and commit exactly `written`
+    // (mirror finish_decode_chunk_isal_oracle:496,610).
+    chunk.data.truncate(decode_start);
+    chunk.data.commit(written);
+    if crc32_enabled {
+        let kept = chunk.data.decoded_range(decode_start, written);
+        if let Some(last_crc) = chunk.crc32s.last_mut() {
+            last_crc.update(kept);
+        }
+    }
+    chunk.statistics.non_marker_count += written as u64;
+    MONOLITH_ISAL_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    chunk.finalize_with_deflate(end_bit, Some(input));
+    Ok(chunk)
+}
+
+/// Routing/effect counters for the T1-monolith path (deletion-trap pattern):
+/// non-zero proves the monolith engine — not the legacy chunk driver — handled
+/// the T1 decode. Read via `GZIPPY_DEBUG`.
+pub static MONOLITH_NATIVE_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MONOLITH_ISAL_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// M4 (DIV-1 part 2) — LABELED DEVIATION from the vendor blueprint.
 ///
@@ -1984,6 +2131,7 @@ fn finish_decode_chunk_exact_block_native(
         input,
         inflate_start_bit,
         stop_hint_bits,
+        true,
         true,
     )
 }

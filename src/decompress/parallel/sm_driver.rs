@@ -188,11 +188,27 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // is captured so the multi-member-misroute resume net still works.
     // `GZIPPY_NO_THIN_T1=1` forces the legacy parallel path at T1 (AB re-verify).
     let force_thin_oracle = std::env::var_os("GZIPPY_THIN_T1_ORACLE").is_some();
-    let use_thin_t1 = (parallelization <= 1
+    // T1 serial-eligible: strictly T==1, no clean-window oracle, not force-thin.
+    let t1_serial = parallelization <= 1
         && std::env::var_os("GZIPPY_NO_THIN_T1").is_none()
-        && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none())
-        || force_thin_oracle;
-    let drive_result = if use_thin_t1 {
+        && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none();
+    // T1-MONOLITH (igzip-shaped single-buffer path) is the DEFAULT T1 serial
+    // path — a deliberate, T1-gated divergence from the rapidgzip chunk pipeline
+    // (plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). Kill-switch GZIPPY_NO_MONOLITH=1
+    // restores the legacy thin-T1 rolling-window driver for A/B re-verification.
+    // T>1 NEVER takes this path (the faithful rg chunk pipeline is untouched).
+    let use_monolith =
+        t1_serial && !force_thin_oracle && std::env::var_os("GZIPPY_NO_MONOLITH").is_none();
+    let use_thin_t1 = (t1_serial && !use_monolith) || force_thin_oracle;
+    let drive_result = if use_monolith {
+        chunk_fetcher::drive_monolith_t1(
+            deflate_data,
+            writer,
+            configuration,
+            expected_size,
+            bytes_written_out,
+        )
+    } else if use_thin_t1 {
         chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration, bytes_written_out)
     } else if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
         chunk_fetcher::drive_clean_window_oracle(
