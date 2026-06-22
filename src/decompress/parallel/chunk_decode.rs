@@ -818,6 +818,101 @@ pub fn decode_chunk(
     )
 }
 
+/// T1 thin-serial decode with a RECYCLED, RESIDENT output buffer + boundary shed
+/// (cache-residency levers (b)+(c) — see `plans/T1-CACHE-RESIDENCY-RESULTS.md`).
+///
+/// The thin-T1 serial driver always seeds a full 32 KiB predecessor window and
+/// never decodes until-exact, so this specializes that one case:
+///
+/// - **Lever (b) — resident recycled buffer.** The caller threads the prior
+///   chunk's (cleared, capacity-retained) `SegmentedU8` back in via
+///   [`ChunkData::new_with_buffers`]; `resident_reserve` pins it to ONE fixed
+///   capacity up front so a per-chunk size change never realloc's it and its
+///   faulted pages stay RESIDENT across chunks. GATED mechanism: minor-faults
+///   drop toward igzip (silesia 23039→19941, monorepo 6996→5195 on AMD), which
+///   tracks the wall win (monorepo 1.39→1.29). A no-op once the recycled buffer
+///   already owns `>= resident_reserve` capacity.
+/// - **Lever (c) — boundary shed.** On the gzippy-native build the per-block EOB
+///   boundary index (`record_boundaries=false`) is NOT recorded: it feeds the
+///   block-map / prefetch / subchunk-split that the strictly-serial T1 driver
+///   never consumes. Byte-transparent (output identical; only never-read metadata
+///   is skipped).
+///
+/// Output is byte-identical to [`decode_chunk`] on this input shape. T>1 NEVER
+/// reaches here (the caller gates on `T==1`); the parallel pipeline keeps the
+/// faithful per-chunk allocation + boundary index it needs.
+#[cfg(parallel_sm)]
+pub fn decode_chunk_thin_t1(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+    recycled: Option<crate::decompress::parallel::segmented_buffer::SegmentedU8>,
+    resident_reserve: usize,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+    use crate::decompress::parallel::segmented_markers::SegmentedU16;
+    debug_assert_eq!(
+        initial_window.len(),
+        MAX_WINDOW_SIZE,
+        "decode_chunk_thin_t1 requires a full 32 KiB seeded window (caller gate)"
+    );
+
+    let data = recycled.unwrap_or_default();
+    let mut chunk = ChunkData::new_with_buffers(
+        encoded_offset_bits,
+        configuration,
+        SegmentedU16::default(),
+        data,
+        0,
+    );
+
+    // Lever (b): pin the recycled buffer to a fixed RESIDENT capacity BEFORE any
+    // decode so it is never realloc'd by a per-chunk size change (no-op once the
+    // recycled buffer already owns the capacity).
+    if resident_reserve > 0 {
+        chunk.reserve_clean(resident_reserve);
+    }
+
+    #[cfg(not(isal_clean_tail))]
+    {
+        // gzippy-native production path: seed the ONE deflate::Block engine, then
+        // decode every block u8-direct into the resident contig buffer with the
+        // boundary index SHED (lever c).
+        let mut marker_ctx = seed_block_for_contig_native(
+            &mut chunk,
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+        )?;
+        finish_decode_chunk_contig_native(
+            &mut chunk,
+            &mut marker_ctx,
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            false, // until_exact: thin-T1 is always inexact (stop at boundary past stride)
+            false, // record_boundaries: shed — never consumed by the serial T1 driver
+        )?;
+    }
+    #[cfg(isal_clean_tail)]
+    {
+        // gzippy-isal reference build: keep the faithful ISA-L clean-tail handoff
+        // (boundaries handled inside). The recycled buffer (lever b) still applies.
+        finish_decode_chunk_with_inexact_offset(
+            &mut chunk,
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+            false,
+        )?;
+    }
+    Ok(chunk)
+}
+
 #[cfg(parallel_sm)]
 pub fn decode_chunk_until_exact(
     input: &[u8],
