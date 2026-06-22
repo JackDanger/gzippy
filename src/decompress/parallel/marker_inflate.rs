@@ -422,6 +422,15 @@ pub(crate) mod mfast_prof {
     pub static CAREFUL_CYC: AtomicU64 = AtomicU64::new(0);
     /// Total decode events handled by the careful marker loop (outer iterations).
     pub static CAREFUL_EVENTS: AtomicU64 = AtomicU64::new(0);
+    /// ZEN2-DECODE-MICROBENCH: total bytes EMITTED by the `'mfast` marker fast
+    /// loop (the denominator for the cyc/B comparison vs rapidgzip's
+    /// `readInternalCompressedMultiCached`). Counted at exactly the same site
+    /// MFAST_CYC is, so cycles and bytes are both-counted-or-both-skipped.
+    pub static MFAST_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// ZEN2-DECODE-MICROBENCH: total bytes EMITTED by the careful marker loop,
+    /// counted at the same site CAREFUL_CYC is (the natural-exit flush; the rare
+    /// EOB commit! path skips both cyc and bytes, keeping the ratio consistent).
+    pub static CAREFUL_BYTES: AtomicU64 = AtomicU64::new(0);
 
     #[inline(always)]
     pub fn enabled() -> bool {
@@ -444,8 +453,11 @@ pub(crate) mod mfast_prof {
         let mf_ev = MFAST_EVENTS.load(Relaxed);
         let ca_cyc = CAREFUL_CYC.load(Relaxed);
         let ca_ev = CAREFUL_EVENTS.load(Relaxed);
+        let mf_b = MFAST_BYTES.load(Relaxed);
+        let ca_b = CAREFUL_BYTES.load(Relaxed);
         let total_cyc = mf_cyc + ca_cyc;
         let total_ev = mf_ev + ca_ev;
+        let total_b = mf_b + ca_b;
         let pct = |part: u64, whole: u64| -> f64 {
             if whole == 0 {
                 0.0
@@ -479,6 +491,22 @@ pub(crate) mod mfast_prof {
         eprintln!(
             "  mfast-share: {:.3}  (hypothesis: wall delta ≈ inject_pct × this)",
             pct(mf_cyc, total_cyc) / 100.0
+        );
+        // ZEN2-DECODE-MICROBENCH: the cyc/B headline (decode-loop-only marker
+        // decode, symmetric to rg's readInternalCompressedMultiCached<u16>).
+        let cpb = |cyc: u64, b: u64| -> f64 {
+            if b == 0 {
+                0.0
+            } else {
+                cyc as f64 / b as f64
+            }
+        };
+        eprintln!("  [WA-CYCB] mfast_bytes={mf_b} careful_bytes={ca_b} total_bytes={total_b}");
+        eprintln!(
+            "  [WA-CYCB] gz_marker_decode_cyc_per_byte={:.4}  (mfast={:.4} careful={:.4})",
+            cpb(total_cyc, total_b),
+            cpb(mf_cyc, mf_b),
+            cpb(ca_cyc, ca_b)
         );
     }
 }
@@ -2178,6 +2206,10 @@ impl Block {
         // per block and is negligible vs the loop body in aggregate.
         let mfast_t0: u64 = mfast_prof::rdtsc(mfast_prof_on);
         let mut mfast_ev: u64 = 0;
+        // ZEN2-DECODE-MICROBENCH: byte denominator snapshot at the same point cyc
+        // timing starts (after table build, before the loop). delta == bytes this
+        // fast loop emits.
+        let mfast_bytes0: usize = emitted;
         // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
         // Hoist bitbuf/bitsleft/pos into a stack-local `lb: Bits` for the
         // duration of `'mfast` and write back at every exit. The raw-pointer
@@ -2459,6 +2491,7 @@ impl Block {
             let cyc = mfast_prof::rdtsc(true).wrapping_sub(mfast_t0);
             mfast_prof::MFAST_CYC.fetch_add(cyc, Ordering::Relaxed);
             mfast_prof::MFAST_EVENTS.fetch_add(mfast_ev, Ordering::Relaxed);
+            mfast_prof::MFAST_BYTES.fetch_add((emitted - mfast_bytes0) as u64, Ordering::Relaxed);
         }
         // FALL THROUGH: every `break 'mfast` leaves a fresh un-consumed `pre`
         // and the synced `bits` cursor before it; write the live cursors back so
@@ -2736,6 +2769,9 @@ impl Block {
         } else {
             0
         };
+        // ZEN2-DECODE-MICROBENCH: byte denominator snapshot (marker path only;
+        // CONTAINS_MARKERS const-folds this dead on the clean tail).
+        let careful_bytes0: usize = emitted;
         let mut careful_ev: u64 = 0;
         while emitted < n_max_to_decode {
             // MFAST_PROF: count careful-loop events (outer iterations).
@@ -2912,6 +2948,12 @@ impl Block {
             let cyc = mfast_prof::rdtsc(true).wrapping_sub(careful_t0);
             mfast_prof::CAREFUL_CYC.fetch_add(cyc, Ordering::Relaxed);
             mfast_prof::CAREFUL_EVENTS.fetch_add(careful_ev, Ordering::Relaxed);
+            // ZEN2-DECODE-MICROBENCH: only the marker careful tail contributes
+            // (clean tail has mfast_prof_on=false). Bytes at the same site as cyc.
+            if CONTAINS_MARKERS {
+                mfast_prof::CAREFUL_BYTES
+                    .fetch_add((emitted - careful_bytes0) as u64, Ordering::Relaxed);
+            }
         }
         self.ring.pos = pos;
         self.decoded_bytes += emitted;
