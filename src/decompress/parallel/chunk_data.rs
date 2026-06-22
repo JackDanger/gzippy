@@ -1561,6 +1561,77 @@ impl ChunkData {
 pub static LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// RSS-SPLIT ISOLATION INSTRUMENT (env GZIPPY_RSS_SPLIT=1; byte-transparent,
+/// no effect on output). Accounts, per chunk at consumer-write time, the
+/// payload bytes that flowed through the u16 `data_with_markers` 2× buffer
+/// (`narrowed_len`) vs the u8 `data` 1× buffer (`decoded_data_len`). The u16
+/// marker buffer is held at 2× its narrowed byte count for the chunk's life
+/// (vendor DecodedData.hpp:374-379 keeps the 2× too). With a small file where
+/// MAX_LIVE_CHUNKS == total chunks (all chunks cached/live at peak), the peak
+/// resident u16 marker bytes ≈ 2 × NARROWED_BYTES_TOTAL and the freeable upper
+/// half ≈ NARROWED_BYTES_TOTAL. CONSERVATION: NARROWED+CLEAN == total decoded.
+pub static NARROWED_BYTES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CLEAN_DATA_BYTES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Number of chunks accounted (non-inert proof: must be > 0 and == chunk count).
+pub static RSS_SPLIT_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True iff the RSS-split isolation instrument is armed.
+#[inline]
+pub fn rss_split_enabled() -> bool {
+    std::env::var_os("GZIPPY_RSS_SPLIT").is_some()
+}
+
+/// Account one chunk's payload split (consumer write path).
+#[inline]
+pub fn rss_split_account(narrowed_len: usize, clean_data_len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    NARROWED_BYTES_TOTAL.fetch_add(narrowed_len as u64, Relaxed);
+    CLEAN_DATA_BYTES_TOTAL.fetch_add(clean_data_len as u64, Relaxed);
+    RSS_SPLIT_CHUNKS.fetch_add(1, Relaxed);
+}
+
+/// Emit the RSS-split isolation report (Gate-0 self-tests: non-inert +
+/// conservation). Returns false if the instrument was inert.
+pub fn rss_split_report(total_decoded: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let narrowed = NARROWED_BYTES_TOTAL.load(Relaxed);
+    let clean = CLEAN_DATA_BYTES_TOTAL.load(Relaxed);
+    let chunks = RSS_SPLIT_CHUNKS.load(Relaxed);
+    let max_live = MAX_LIVE_CHUNKS.load(Relaxed);
+    let sum = narrowed + clean;
+    let non_inert = chunks > 0 && sum > 0;
+    let conserves = sum == total_decoded;
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "[rss_split] chunks={chunks} max_live_chunks={max_live} \
+         narrowed(u16 2x src)={:.2}MiB clean(u8 1x)={:.2}MiB sum={:.2}MiB \
+         total_decoded={:.2}MiB",
+        mib(narrowed),
+        mib(clean),
+        mib(sum),
+        mib(total_decoded),
+    );
+    eprintln!(
+        "[rss_split] peak_resident_u16_markers≈2x_narrowed={:.2}MiB \
+         freeable_upper_half≈narrowed={:.2}MiB | GATE0 non_inert={non_inert} \
+         conservation(sum==total)={conserves}",
+        mib(narrowed * 2),
+        mib(narrowed),
+    );
+    if !non_inert {
+        eprintln!("[rss_split] WARNING: instrument INERT (no chunks accounted)");
+    }
+    if !conserves {
+        eprintln!(
+            "[rss_split] WARNING: conservation FAILED (sum {} != total_decoded {})",
+            sum, total_decoded
+        );
+    }
+    non_inert && conserves
+}
+
 /// Effect counter: number of times `determine_used_window_symbols_for_last_subchunk`
 /// actually ran the 32 KiB marker-engine scan (window_sparsity=true path, not
 /// early-returned). With window_sparsity=false (default, keepIndex=false faithful port)

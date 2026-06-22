@@ -314,6 +314,9 @@ pub fn decompress_parallel<W: Write>(
         };
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
+        if crate::decompress::parallel::chunk_data::rss_split_enabled() {
+            crate::decompress::parallel::chunk_data::rss_split_report(result.total_size as u64);
+        }
         if debug_enabled() {
             let total = t0.elapsed();
             let mbps = result.total_size as f64 / total.as_secs_f64() / 1e6;
