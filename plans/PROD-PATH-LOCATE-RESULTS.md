@@ -89,6 +89,43 @@ A/A ≤ 1.5 ms ≪ every reported Δ. GATE0(bytes)=PASS all. `prodbig` confounde
    removal-oracles (#1 alloc/first-touch, #2 window-roll, #3 isal lifecycle, #4 boundary
    record) are OWED — `prodbig`/`prodpool` could not isolate them (confounded/weak).
 
+## PER-CHUNK FIXED COST — chunk-size sweep (the CLEAN per-chunk oracle)
+
+`prodbig` (CHUNK_KIB=huge) was confounded because a giant chunk balloons each chunk's
+`compute_initial_reserve` past the 64MiB cap + reallocs. The CLEAN per-chunk-count
+perturbation is a chunk-SIZE SWEEP within the sane reserve range (256KiB–4MiB, all under
+the cap): varying chunk count ~8× while reserve stays proportional. `prod` mode + real
+ISA-L tail, GZIPPY_CHUNK_KIB ∈ {256,512,1024,2048,4096}, igzip bar, best-of-11, pin cpu4.
+Non-inert: GZIPPY_DEBUG `stride=` tracks the knob.
+
+### INTEL (neurotic, pin cpu4, best-of-11) — wall ms by chunk KiB
+| corpus   | igzip | 256K  | 512K  | 1024K(default) | 2048K | 4096K | slope 256K→2M | 4M floor vs igzip |
+|----------|-------|-------|-------|----------------|-------|-------|---------------|-------------------|
+| nasa     | 232.4 | 408.8 | 346.5 | 297.5          | 279.3 | 281.7 | −129.5 ms (−32%) | +21.5%         |
+| silesia  | 657.0 | 1321.7| 1013.6| 867.6          | 813.3 | 816.4 | −508.3 ms (−38%) | +24.3%         |
+| monorepo | 105.8 | 190.6 | 162.6 | 143.5          | 128.7 | 131.0 | −61.8 ms (−32%)  | +23.8%         |
+
+GATED FINDING (Intel, Gate-2 causal perturbation — monotonic, 8× chunk-count swing):
+1. **Per-chunk FIXED cost is the DOMINANT residual lever.** Wall scales with chunk COUNT;
+   reducing it (bigger chunks) recovers a LARGE fraction: the 256K→2M slope is −32 to −38%
+   of wall. This is the combined per-chunk family (#1 alloc/first-touch + #2 window-roll +
+   #3 isal lifecycle + #4 boundary record) — they all fire per chunk.
+2. **The T1 production default (1 MiB) is SUBOPTIMAL.** The optimum is ~2 MiB; moving
+   1MiB→2MiB recovers nasa −6.4% / silesia −6.3% / monorepo −10.4% with zero code beyond
+   the existing knob. (T1_TARGET_COMPRESSED_CHUNK_BYTES=1MiB — re-evaluate; it was chosen
+   for "warm output-buffer recycling," not gated on this real-path sweep.)
+3. **Irreducible floor ≈ +21–24% over igzip** even at the optimal chunk size — the per-byte
+   + per-chunk-irreducible residual (CRC second-touch ~2–8%, segment commit, the single
+   window handoff). This is what a structural convergence (not just chunk sizing) must close.
+4. **EXPLAINS the prodbig confound:** beyond ~4 MiB the reserve-balloon/realloc/fault cost
+   reverses the gain (giant chunk SLOWER), so the curve is U-shaped with a 2–4 MiB optimum.
+
+Mechanism cross-check (neurotic perf, software counter reliable; LXC HW counters
+`<not supported>`): prod minor-faults ≈ 1.5× igzip (nasa 8804 vs 5636; silesia 25390 vs
+17099) — consistent with the documented 40%-vs-17% page-fault gap, but extra faults
+(~13 MB first-touch) account for only ~20% of the wall gap; the rest is per-chunk
+INSTRUCTIONS (bookkeeping). Clean HW instruction/cycle counts owed from AMD bare metal.
+
 ## OWED (next, this cycle)
 - Clean per-chunk removal-oracles (code change, byte-transparent, non-inert counter each):
   recycle output buffer (#1), reuse window tail buffers (#2), and a boundary-record no-op
