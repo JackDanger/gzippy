@@ -632,6 +632,66 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
 #[cfg(parallel_sm)]
 pub static THIN_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// T1-MONOLITH driver — a deliberate, T1-gated DIVERGENCE from the rapidgzip
+/// chunk pipeline TOWARD the igzip serial monolith (see
+/// `plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`). Decodes the ENTIRE single-member
+/// deflate body as ONE chunk into ONE contiguous buffer reserved upfront to the
+/// whole-member ISIZE, then writes it once. No per-chunk alloc, no per-chunk
+/// rolling-window clone+re-seed, no per-block boundary record — the single
+/// buffer IS the implicit history (igzip `tmp_out`/`out` shape).
+///
+/// Output is byte-identical to `drive_thin_t1_oracle` (same kernel, same clean
+/// window-present decode, chunk-0 zero-window seed). CRC + ISIZE are verified by
+/// the caller. T>1 NEVER reaches here (the caller gates strictly on `T==1`).
+#[cfg(parallel_sm)]
+pub fn drive_monolith_t1<W: std::io::Write>(
+    input: &[u8],
+    writer: &mut W,
+    configuration: ChunkConfiguration,
+    expected_isize: usize,
+    bytes_written_out: Option<&mut usize>,
+) -> Result<(u32, usize), FetchError> {
+    use crate::decompress::parallel::chunk_decode;
+
+    #[cfg(not(isal_clean_tail))]
+    let chunk = chunk_decode::decode_monolith_native(input, expected_isize, configuration)
+        .map_err(FetchError::Decode)?;
+    #[cfg(isal_clean_tail)]
+    let chunk = chunk_decode::decode_monolith_isal(input, expected_isize, configuration)
+        .map_err(FetchError::Decode)?;
+
+    // ONE write of the whole output buffer (skip the 32 KiB dictionary prefix).
+    chunk
+        .data
+        .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
+        .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+    let total_size = chunk.decoded_size();
+    // Multi-member-misroute resume net: report bytes streamed so a stream the
+    // classifier called single-member but whose 2nd member began past the
+    // detection window decodes member 1 here, then fails the trailer check;
+    // resume re-decodes members 2+ past this prefix.
+    if let Some(out) = bytes_written_out {
+        *out = total_size;
+    }
+    let mut total_crc = CRC32Calculator::new();
+    for stream_crc in &chunk.crc32s {
+        total_crc.append(stream_crc);
+    }
+
+    if std::env::var_os("GZIPPY_DEBUG").is_some() {
+        eprintln!(
+            "[parallel_sm] T1-MONOLITH out={total_size} bytes (single chunk, igzip-shaped: \
+             one ISIZE-reserved buffer, no per-chunk alloc/window/boundary)"
+        );
+    }
+    MONOLITH_T1_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok((total_crc.crc32(), total_size))
+}
+
+/// Production-routing proof for the T1-monolith path (deletion-trap pattern).
+#[cfg(parallel_sm)]
+pub static MONOLITH_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
