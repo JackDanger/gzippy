@@ -192,13 +192,17 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let t1_serial = parallelization <= 1
         && std::env::var_os("GZIPPY_NO_THIN_T1").is_none()
         && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none();
-    // T1-MONOLITH (igzip-shaped single-buffer path) is the DEFAULT T1 serial
-    // path — a deliberate, T1-gated divergence from the rapidgzip chunk pipeline
-    // (plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). Kill-switch GZIPPY_NO_MONOLITH=1
-    // restores the legacy thin-T1 rolling-window driver for A/B re-verification.
-    // T>1 NEVER takes this path (the faithful rg chunk pipeline is untouched).
+    // T1-MONOLITH (igzip-shaped single-buffer path): a deliberate, T1-gated
+    // divergence from the rapidgzip chunk pipeline toward the igzip monolith
+    // (plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). It is OPT-IN (GZIPPY_MONOLITH=1),
+    // NOT the default: the pre-registered falsifier measurement (Intel+AMD,
+    // plans/T1-MONOLITH-RESULTS.md) found it FALSIFIED — it REGRESSES past the
+    // legacy thin-T1 driver because the single ISIZE buffer first-touches the
+    // whole output (~4× igzip's page faults), the cost igzip's streaming small
+    // reused buffer avoids. Kept opt-in only so the falsifier stays reproducible;
+    // the production T1 default remains thin-T1. T>1 NEVER takes this path.
     let use_monolith =
-        t1_serial && !force_thin_oracle && std::env::var_os("GZIPPY_NO_MONOLITH").is_none();
+        t1_serial && !force_thin_oracle && std::env::var_os("GZIPPY_MONOLITH").is_some();
     let use_thin_t1 = (t1_serial && !use_monolith) || force_thin_oracle;
     let drive_result = if use_monolith {
         chunk_fetcher::drive_monolith_t1(
