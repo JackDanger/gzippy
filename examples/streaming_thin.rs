@@ -537,6 +537,223 @@ fn run_igzipbarecheap(file: &[u8], batch: usize) -> (f64, usize) {
     (t.elapsed().as_secs_f64() * 1e3, n)
 }
 
+// ───── SCAFFOLD-LOCATE: per-sub-region removal oracles (MEASUREMENT 3) ────────
+//
+// CLEAN SCAFFOLD = (cheap − igzip)/igzip is the gz-contig-driver-vs-igzip-monolith
+// overhead, holding the inner decode constant (BOTH arms run igzip read_header +
+// `_04`/`_base`). This family REMOVES one gz-driver sub-region at a time from the
+// `cheap` arm so the interleaved wall response BOUNDS that sub-region's share of
+// the scaffold (removal-oracle = the verdict, not a code-read). Each ablation is
+// byte-exact (`total` still == ref) and prints a NON-INERT proof to stderr
+// (sink_calls / memmove_calls / input_copied / cap) so we can confirm the
+// perturbation actually fired and differs from baseline.
+//
+//   None        = baseline cheap (== igzip_bare_cheap)
+//   NoSink      = remove the per-flush output sink writes (/dev/null write_all)
+//   NoZero      = allocate the contig buffer UNINITIALIZED (remove the ~cap zeroing)
+//   NoInputCopy = borrow file_bytes[hdr..] directly (remove the input .to_vec memcpy)
+//   BigBuf      = one uninit buffer sized to the whole output → copy_within window
+//                 memmove + per-batch flush NEVER fire (single final flush)
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ablate {
+    None,
+    NoSink,
+    NoZero,
+    NoInputCopy,
+    BigBuf,
+}
+
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn igzip_bare_cheap_ab<S: FnMut(&[u8])>(
+    file_bytes: &[u8],
+    batch: usize,
+    ab: Ablate,
+    mut sink: S,
+) -> usize {
+    use gzippy::decompress::parallel::gzip_format::read_header as gz_read_header;
+    use isal::isal_sys::igzip_lib as isal;
+
+    extern "C" {
+        fn gzippy_read_header_export(state: *mut isal::inflate_state) -> i32;
+        fn decode_huffman_code_block_stateless_04(
+            state: *mut isal::inflate_state,
+            start_out: *mut u8,
+        );
+        fn decode_huffman_code_block_stateless_base(
+            state: *mut isal::inflate_state,
+            start_out: *mut u8,
+        );
+    }
+
+    let (_h, hdr) = gz_read_header(file_bytes).expect("gzip header");
+
+    // INPUT: NoInputCopy borrows file_bytes[hdr..] (the trailing 8-byte gzip
+    // trailer + EOF acts as read-ahead slop); every other arm copies + zero-pads.
+    let owned: Vec<u8>;
+    let (in_ptr, in_len, input_copied): (*const u8, usize, u32) = if ab == Ablate::NoInputCopy {
+        let s = &file_bytes[hdr..];
+        (s.as_ptr(), s.len(), 0)
+    } else {
+        let mut v: Vec<u8> = file_bytes[hdr..].to_vec();
+        v.extend_from_slice(&[0u8; 64]);
+        let (p, l) = (v.as_ptr(), v.len());
+        owned = v;
+        let _ = &owned; // keep alive
+        (p, l, 1)
+    };
+
+    const MAXBLK: usize = 8 * 1024 * 1024;
+    // BigBuf: whole output fits → no mid-decode flush/memmove ever.
+    let isize_hint = gzip_isize(file_bytes);
+    let cap = if ab == Ablate::BigBuf {
+        WINDOW + isize_hint + MAXBLK + SLOP
+    } else {
+        WINDOW + batch + MAXBLK + SLOP
+    };
+    // NoZero / BigBuf: uninitialized alloc (skip the cap zeroing). Safe here:
+    // every byte read back (window prefix + flushed slice) was written by decode
+    // or copy_within before any read.
+    let mut buf: Vec<u8> = if ab == Ablate::NoZero || ab == Ablate::BigBuf {
+        let mut v = Vec::with_capacity(cap);
+        unsafe { v.set_len(cap) };
+        v
+    } else {
+        vec![0u8; cap]
+    };
+    let base = buf.as_mut_ptr();
+
+    let mut state: Box<isal::inflate_state> = Box::new(unsafe { std::mem::zeroed() });
+    unsafe { isal::isal_inflate_init(&mut *state) };
+    state.crc_flag = 0;
+    state.hist_bits = 0;
+    state.next_in = in_ptr as *mut u8;
+    state.avail_in = in_len as u32;
+    state.read_in = 0;
+    state.read_in_length = 0;
+    state.block_state = isal::isal_block_state_ISAL_BLOCK_NEW_HDR;
+
+    let coded = isal::isal_block_state_ISAL_BLOCK_CODED;
+    let type0 = isal::isal_block_state_ISAL_BLOCK_TYPE0;
+
+    let mut pos: usize = 0;
+    let mut window_len: usize = 0;
+    let mut total: usize = 0;
+    // BigBuf disables the mid-decode flush trigger.
+    let flush_hi = if ab == Ablate::BigBuf {
+        usize::MAX
+    } else {
+        WINDOW + batch
+    };
+    let mut sink_calls: u64 = 0;
+    let mut memmove_calls: u64 = 0;
+
+    loop {
+        if pos >= flush_hi {
+            if ab != Ablate::NoSink {
+                sink(&buf[window_len..pos]);
+            }
+            sink_calls += 1;
+            total += pos - window_len;
+            buf.copy_within(pos - WINDOW..pos, 0);
+            memmove_calls += 1;
+            pos = WINDOW;
+            window_len = WINDOW;
+        }
+
+        let ret = unsafe { gzippy_read_header_export(&mut *state as *mut _) };
+        assert_eq!(ret, 0, "cheap_ab: read_header ret={ret}");
+        let bfinal = state.bfinal;
+
+        if state.block_state == coded {
+            let out_ptr = unsafe { base.add(pos) };
+            state.next_out = out_ptr;
+            state.avail_out = (cap - pos) as u32;
+            unsafe {
+                decode_huffman_code_block_stateless_04(&mut *state as *mut _, base);
+                if state.block_state == coded {
+                    decode_huffman_code_block_stateless_base(&mut *state as *mut _, base);
+                }
+            }
+            assert!(
+                state.block_state != coded,
+                "cheap_ab: block exceeded headroom"
+            );
+            let produced = (state.next_out as usize) - (out_ptr as usize);
+            pos += produced;
+        } else if state.block_state == type0 {
+            let len = unsafe { state.__bindgen_anon_1.type0_block_len } as usize;
+            let consumed = (state.next_in as usize) - (in_ptr as usize);
+            let buffered = (state.read_in_length / 8) as usize;
+            let data_off = consumed - buffered;
+            unsafe {
+                std::ptr::copy_nonoverlapping(in_ptr.add(data_off), base.add(pos), len);
+            }
+            pos += len;
+            let after = data_off + len;
+            state.next_in = unsafe { in_ptr.add(after) as *mut u8 };
+            state.avail_in = (in_len - after) as u32;
+            state.read_in = 0;
+            state.read_in_length = 0;
+            state.block_state = if bfinal == 1 {
+                isal::isal_block_state_ISAL_BLOCK_INPUT_DONE
+            } else {
+                isal::isal_block_state_ISAL_BLOCK_NEW_HDR
+            };
+        } else {
+            panic!("cheap_ab: unexpected block_state {}", state.block_state);
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+    if pos > window_len {
+        if ab != Ablate::NoSink {
+            sink(&buf[window_len..pos]);
+        }
+        sink_calls += 1;
+        total += pos - window_len;
+    }
+    eprintln!(
+        "ABLATE {ab:?}: sink_calls={sink_calls} memmove_calls={memmove_calls} input_copied={input_copied} cap={cap}"
+    );
+    total
+}
+
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn run_cheap_ab(file: &[u8], batch: usize, ab: Ablate) -> (f64, usize) {
+    let mut out = devnull();
+    let t = Instant::now();
+    let n = igzip_bare_cheap_ab(file, batch, ab, |slice| {
+        out.write_all(slice).expect("sink write");
+    });
+    out.flush().expect("flush");
+    (t.elapsed().as_secs_f64() * 1e3, n)
+}
+
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn run_cheap_mode(file: &[u8], batch: usize, mode: &str) -> Option<(f64, usize)> {
+    let ab = match mode {
+        "cheap_nosink" => Ablate::NoSink,
+        "cheap_nozero" => Ablate::NoZero,
+        "cheap_noin" => Ablate::NoInputCopy,
+        "cheap_big" => Ablate::BigBuf,
+        _ => return None,
+    };
+    Some(run_cheap_ab(file, batch, ab))
+}
+
+#[cfg(not(all(pure_inflate_decode, feature = "isal-compression")))]
+fn run_cheap_mode(_file: &[u8], _batch: usize, mode: &str) -> Option<(f64, usize)> {
+    match mode {
+        "cheap_nosink" | "cheap_nozero" | "cheap_noin" | "cheap_big" => {
+            panic!("cheap-ablation modes require gzippy-isal")
+        }
+        _ => None,
+    }
+}
+
 #[cfg(not(all(pure_inflate_decode, feature = "isal-compression")))]
 fn run_igzipbarecheap(_file: &[u8], _batch: usize) -> (f64, usize) {
     panic!("igzipbarecheap mode requires gzippy-isal (pure_inflate_decode + isal-compression)");
@@ -746,6 +963,14 @@ fn main() {
                 .unwrap_or(DEFAULT_BATCH);
             let (ms, n) = run_igzipbarecheap(&file, batch);
             println!("RESULT mode=igzipbarecheap batch={batch} ms={ms:.3} bytes={n}");
+        }
+        "cheap_nosink" | "cheap_nozero" | "cheap_noin" | "cheap_big" => {
+            let batch = args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_BATCH);
+            let (ms, n) = run_cheap_mode(&file, batch, mode).expect("cheap mode");
+            println!("RESULT mode={mode} batch={batch} ms={ms:.3} bytes={n}");
         }
         other => {
             eprintln!("unknown mode: {other}");
