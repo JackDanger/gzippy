@@ -289,6 +289,13 @@ pub struct ChunkData {
     /// predecessor 32 KiB window image into segment 0; the consumer skips
     /// it via `write_payload_skipping_prefix` / `append_payload_iovecs`.
     pub data_prefix_len: usize,
+    /// STEP-1 U16-preserving ceiling oracle (GZIPPY_MARKER_CEILING_U16): when a
+    /// window-absent chunk is decoded through the seeded-clean path, this records
+    /// the decoded byte count so the CONSUMER thread can inject the phantom u16
+    /// write + resolve traffic serially (the pessimistic resolve-location arm).
+    /// 0 in production / for all other arms. Byte-transparent (only read by the
+    /// ceiling instrument).
+    pub phantom_ceiling_len: usize,
 }
 
 impl ChunkData {
@@ -414,6 +421,7 @@ impl ChunkData {
             next_subchunk_start_decoded_offset: 0,
             pool_worker_index,
             data_prefix_len: 0,
+            phantom_ceiling_len: 0,
         }
     }
 
@@ -479,6 +487,7 @@ impl ChunkData {
             next_subchunk_start_decoded_offset: 0,
             pool_worker_index: 0,
             data_prefix_len,
+            phantom_ceiling_len: 0,
         }
     }
 
