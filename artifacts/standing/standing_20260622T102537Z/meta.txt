@@ -1,0 +1,8 @@
+sha 42b8c869e01b80d5c2f379f095ba5e2dfb857e69
+flavor parallel-sm+pure
+threads 2 4 8
+n 9
+no_turbo 0
+gov powersave
+load_start 5.96
+bytes silesia 211968000

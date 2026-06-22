@@ -1,0 +1,3 @@
+silesia T2 (rg_blocks=17): === tail-metric [silesia-T2]  GATE-0 PASS === 
+silesia T4 (rg_blocks=17): === tail-metric [silesia-T4]  GATE-0 PASS === 
+silesia T8 (rg_blocks=17): === tail-metric [silesia-T8]  GATE-0 PASS === 

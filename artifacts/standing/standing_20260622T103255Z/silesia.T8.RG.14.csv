@@ -1,0 +1,6 @@
+214016894,ns,duration_time,214016894,100.00,242.567,M/sec
+2461671743,,cycles,882301311,100.00,2.790,GHz
+4748479950,,instructions,882301311,100.00,1.93,insn per cycle
+882.30,msec,task-clock,882301311,100.00,4.123,CPUs utilized
+85440328,,cache-references,882301311,100.00,96.838,M/sec
+7160630,,cache-misses,882301311,100.00,8.38,of all cache refs

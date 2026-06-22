@@ -1,0 +1,118 @@
+====================================================================================================
+GROUND-TRUTH STANDING — gzippy-native vs rapidgzip(rg) vs igzip(ig)
+sha=42b8c869e01b flavor=parallel-sm+pure N=15 | box: no_turbo=? gov=performance load_start=4.97
+  STAMP: Intel i7-13700T LXC ONLY — NOT-YET-LAW (AMD/Zen2 owed for LAW).
+====================================================================================================
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+monorepo T1     gz        4.36     78.19    1.6%  0.815  1.294  2.80   0.3%   5.1%  gz FASTER than rg by 18.5%
+monorepo T1     rg        5.21     95.95    1.3%  1.000  1.588  2.80   0.3%   7.9%  
+monorepo T1     ig        3.47     60.44    1.4%  0.630  1.000  2.80   0.3%   3.3%  
+  self-test A/A: rg|gz = 0.5% / 0.1%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+monorepo T2     gz       12.45    137.05    1.3%  1.095  2.252  2.77   0.3%   7.4%  gz SLOWER than rg by 9.5%
+monorepo T2     rg       12.24    125.15    2.7%  1.000  2.057  2.78   0.3%   6.5%  
+monorepo T2     ig        3.47     60.85    3.8%  0.486  1.000  2.80   0.3%   3.3%  
+  self-test A/A: rg|gz = 0.6% / 0.7%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+monorepo T4     gz       13.76     87.32    2.0%  0.989  1.449  2.78   0.6%   8.0%  TIE vs rg (±7.5%)
+monorepo T4     rg       14.53     88.30    5.5%  1.000  1.465  2.79   0.4%   7.3%  
+monorepo T4     ig        3.46     60.27    1.8%  0.683  1.000  2.80   0.2%   3.2%  
+  self-test A/A: rg|gz = 0.5% / 0.7%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+monorepo T8     gz       15.40     69.56    7.6%  0.957  1.150  2.78   0.4%   9.6%  UNTRUSTED(box)
+monorepo T8     rg       16.64     72.70   10.0%  1.000  1.201  2.79   0.5%   8.5%  
+monorepo T8     ig        3.47     60.51    1.0%  0.832  1.000  2.80   0.3%   3.3%  
+  self-test A/A: rg|gz = 3.7% / 13.7%  (tol 5% => UNTRUSTED)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+nasa T1         gz        2.33    170.05    1.7%  0.649  1.239  2.80   0.1%   3.2%  gz FASTER than rg by 35.1%
+nasa T1         rg        3.59    261.93    1.4%  1.000  1.909  2.80   0.1%   6.6%  
+nasa T1         ig        1.90    137.21    0.7%  0.524  1.000  2.80   0.1%   2.7%  
+  self-test A/A: rg|gz = 0.1% / 0.2%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+nasa T2         gz        9.45    405.04    2.4%  1.005  2.946  2.76   0.8%   7.4%  TIE vs rg (±3.9%)
+nasa T2         rg        9.77    403.21    1.6%  1.000  2.933  2.79   0.5%   5.5%  
+nasa T2         ig        1.90    137.46    1.0%  0.341  1.000  2.79   0.6%   2.6%  
+  self-test A/A: rg|gz = 0.7% / 1.6%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+nasa T4         gz        9.64    228.49    5.2%  0.969  1.664  2.76   0.4%   8.2%  TIE vs rg (±13.2%)
+nasa T4         rg       10.23    235.76    8.0%  1.000  1.717  2.79   0.3%   5.7%  
+nasa T4         ig        1.91    137.32    1.8%  0.582  1.000  2.80   0.3%   2.6%  
+  self-test A/A: rg|gz = 3.3% / 2.3%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+nasa T8         gz        9.81    159.02   18.4%  0.886  1.165  2.77   0.4%   9.6%  UNTRUSTED(box)
+nasa T8         rg       10.51    179.46    3.4%  1.000  1.314  2.79   0.2%   6.5%  
+nasa T8         ig        1.90    136.54    1.6%  0.761  1.000  2.79   0.7%   2.6%  
+  self-test A/A: rg|gz = 1.6% / 9.9%  (tol 5% => UNTRUSTED)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T1      gz        5.64    427.09    0.7%  0.982  1.125  2.80   0.4%   3.7%  TIE vs rg (±2.6%)
+silesia T1      rg        5.75    435.08    2.0%  1.000  1.146  2.80   0.4%   7.9%  
+silesia T1      ig        5.04    379.55    0.8%  0.872  1.000  2.80   0.2%   3.1%  
+  self-test A/A: rg|gz = 0.2% / 0.1%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T2      gz       11.02    457.25    1.4%  1.070  1.204  2.77   0.4%   7.1%  gz SLOWER than rg by 7.0%
+silesia T2      rg       10.62    427.46    1.1%  1.000  1.126  2.78   0.5%   7.9%  
+silesia T2      ig        5.05    379.65    0.4%  0.888  1.000  2.80   0.2%   3.0%  
+  self-test A/A: rg|gz = 0.4% / 1.8%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T4      gz       11.72    257.91    3.7%  1.075  0.679  2.78   0.3%   6.5%  gz SLOWER than rg by 7.5%
+silesia T4      rg       10.84    239.95    2.1%  1.000  0.632  2.79   0.2%   7.1%  
+silesia T4      ig        5.03    379.70    0.2%  1.582  1.000  2.80   0.2%   2.5%  
+  self-test A/A: rg|gz = 1.2% / 0.5%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T8      gz       12.22    185.72   16.8%  0.946  0.490  2.78   0.3%   7.0%  UNTRUSTED(box)
+silesia T8      rg       11.41    196.28    7.1%  1.000  0.518  2.79   0.2%   7.9%  
+silesia T8      ig        5.04    378.68    0.7%  1.929  1.000  2.80   0.3%   2.5%  
+  self-test A/A: rg|gz = 0.7% / 6.5%  (tol 5% => UNTRUSTED)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+squishy T1      gz        5.75    823.50    0.2%  0.945  1.112  2.80   0.3%   3.6%  gz FASTER than rg by 5.5%
+squishy T1      rg        6.08    871.23    0.7%  1.000  1.177  2.80   0.4%   7.7%  
+squishy T1      ig        5.19    740.33    0.4%  0.850  1.000  2.80   0.4%   3.4%  
+  self-test A/A: rg|gz = 0.1% / 0.0%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+squishy T2      gz        9.60    758.05    1.4%  1.007  1.025  2.77   0.4%   6.1%  TIE vs rg (±3.2%)
+squishy T2      rg        9.92    753.00    1.8%  1.000  1.018  2.78   0.3%   6.6%  
+squishy T2      ig        5.19    739.60    0.5%  0.982  1.000  2.80   0.5%   3.0%  
+  self-test A/A: rg|gz = 0.2% / 0.1%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+squishy T4      gz       11.10    450.73    1.2%  1.075  0.609  2.78   0.4%   6.4%  gz SLOWER than rg by 7.5%
+squishy T4      rg       10.21    419.38    2.2%  1.000  0.567  2.79   0.2%   7.1%  
+squishy T4      ig        5.19    739.93    0.3%  1.764  1.000  2.80   0.2%   3.0%  
+  self-test A/A: rg|gz = 0.8% / 0.1%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+squishy T8      gz       11.67    319.01    8.2%  1.067  0.431  2.78   0.3%   6.9%  UNTRUSTED(box)
+squishy T8      rg       10.67    298.98   13.8%  1.000  0.404  2.79   0.2%   7.8%  
+squishy T8      ig        5.18    739.77    0.4%  2.474  1.000  2.80   0.2%   2.9%  
+  self-test A/A: rg|gz = 5.9% / 2.7%  (tol 5% => UNTRUSTED)
+====================================================================================================
+FORK SUMMARY (trusted cells only; ratio = gz_wall / rg_wall, <1.0 = gz wins):
+  monorepo   T1   gz/rg=0.815  WIN/TIE
+  monorepo   T2   gz/rg=1.095  LOSS
+  monorepo   T4   gz/rg=0.989  WIN/TIE
+  nasa       T1   gz/rg=0.649  WIN/TIE
+  nasa       T2   gz/rg=1.005  WIN/TIE
+  nasa       T4   gz/rg=0.969  WIN/TIE
+  silesia    T1   gz/rg=0.982  WIN/TIE
+  silesia    T2   gz/rg=1.070  LOSS
+  silesia    T4   gz/rg=1.075  LOSS
+  squishy    T1   gz/rg=0.945  WIN/TIE
+  squishy    T2   gz/rg=1.007  WIN/TIE
+  squishy    T4   gz/rg=1.075  LOSS
+  => FORK-B: a T>=2 cell genuinely loses (worst=('monorepo', 2, 1.0951463071717462)). Rule out fingerprint/artifact, then follow T2-LOCATE decision tree.
+  WARNING: >=1 cell failed the A/A self-test (loaded box) — those ratios were withheld.
+====================================================================================================

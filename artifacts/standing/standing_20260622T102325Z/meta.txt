@@ -1,0 +1,11 @@
+sha 42b8c869e01b80d5c2f379f095ba5e2dfb857e69
+flavor parallel-sm+pure
+threads 1 2 4 8
+n 13
+no_turbo ?
+gov performance
+load_start 3.26
+bytes silesia 211968000
+bytes monorepo 50915328
+bytes nasa 205242368
+bytes squishy 400391411

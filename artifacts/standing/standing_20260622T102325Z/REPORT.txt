@@ -1,0 +1,9 @@
+====================================================================================================
+GROUND-TRUTH STANDING — gzippy-native vs rapidgzip(rg) vs igzip(ig)
+sha=42b8c869e01b flavor=parallel-sm+pure N=13 | box: no_turbo=? gov=performance load_start=3.26
+  STAMP: Intel i7-13700T LXC ONLY — NOT-YET-LAW (AMD/Zen2 owed for LAW).
+====================================================================================================
+====================================================================================================
+FORK SUMMARY (trusted cells only; ratio = gz_wall / rg_wall, <1.0 = gz wins):
+  (no trusted cells — box too loaded; re-run when load drops)
+====================================================================================================

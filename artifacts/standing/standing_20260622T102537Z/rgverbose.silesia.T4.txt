@@ -1,0 +1,72 @@
+Called with: '/root/oracle_c/rapidgzip-native' '-d' '-c' '-P4' '--verbose' '/root/silesia.gz'
+file path for input: /root/silesia.gz
+file path for output: <none>
+Decompress /root/silesia.gz -> <stdout>
+
+[GzipChunkFetcher::GzipChunkFetcher] First block access statistics:
+    Number of false positives                : 0
+    Time spent in block finder               : 0.00908603 s
+    Time spent decoding with custom inflate  : 1.72502 s
+    Time spent decoding with inflate wrapper : 0 s
+    Time spent decoding with ISA-L           : 0.713929 s
+    Time spent allocating and copying        : 0.0725857 s
+    Time spent applying the last window      : 0.109352 s
+    Time spent computing the checksum        : 0.0349139 s
+    Time spent compressing seek points       : 0.00294349 s
+    Time spent queuing post-processing       : 0.00165182 s
+    Total decompressed bytes                 : 211'968'000
+    Non-marker symbols                       : 138'843'035 (65.5019 %)
+    Replaced marker symbol buffers           : 73'124'965 (34.4981 %)
+    Chunks exceeding max. compression ratio  : 0
+    Thread Pool Utilization:
+        Total Real Decode Duration    : 0.477609 s
+        Theoretical Optimal Duration  : 0.48555 s
+        Pool Efficiency (Fill Factor) : 101.663 %
+    BGZF file          : false
+[10:27:15.848][0x7ccdac0ec780] [BlockFetcher::~BlockFetcher] 
+    Parallelization                   : 4
+    Cache
+        Hits                          : 0
+        Misses                        : 8
+        Unused Entries                : 17
+        Maximum Fill Size             : 1
+        Capacity                      : 16
+    Prefetch Cache
+        Hits                          : 7
+        Misses                        : 1
+        Unused Entries                : 0
+        Prefetch Queue Hit            : 9
+        Maximum Fill Size             : 3
+        Capacity                      : 8
+    Cache Hit Rate                    : 94.1176 %
+    Useless Prefetches                : 0 %
+    Access Patterns
+        Total Accesses                : 17
+        Duplicate Block Accesses      : 1
+        Sequential Block Accesses     : 0
+        Block Seeks Back              : 0
+        Block Seeks Forward           : 16
+    Blocks
+        Total Existing                : 54
+        Total Fetched                 : 17
+        Prefetched                    : 16
+        Fetched On-demand             : 1
+    Prefetch Stall by BlockFinder     : 0
+    Time spent in:
+        decodeBlock                   : 1.79794 s
+        std::future::get              : 0.39054 s
+        get                           : 0.393958 s
+    Thread Pool Utilization:
+        Total Real Decode Duration    : 0.477609 s
+        Theoretical Optimal Duration  : 0.449484 s
+        Pool Efficiency (Fill Factor) : 94.1112 %
+[10:27:15.848][0x7ccdac0ec780] [SharedFileReader::~SharedFileReader]
+    seeks back    : ( 800000 <= 5600000 +- 2800000 <= 13600000  ) B ( 246 calls )
+    seeks forward : ( 0 <= 5000000 +- 3000000 <= 14000000  ) B ( 293 calls )
+    reads         : ( 0 <= 129000 +- 13000 <= 131000  ) B ( 541 calls )
+    locks         : 610 
+    read in total 69902355 B out of 68229982 B, i.e., read the file 1.02451 times
+    time spent seeking and reading: 0.0283985 s
+
+Spent 0.000937229 s writing to output.
+Decompressed in total 211968000 B in 0.511178 s -> 414.666 MB/s

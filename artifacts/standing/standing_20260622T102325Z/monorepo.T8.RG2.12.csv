@@ -1,0 +1,13 @@
+event syntax error: '..ation_time,cpu_core/cycles/,cpu_core/instructions/,tas..'
+                                  \___ Bad event or PMU
+
+Unable to find PMU or event on a PMU of 'cpu_core'
+
+Initial error:
+event syntax error: '..ation_time,cpu_core/cycles/,cpu_core/instructions/,tas..'
+                                  \___ Cannot find PMU `cpu_core'. Missing kernel support?
+Run 'perf list' for a list of valid events
+
+ Usage: perf stat [<options>] [<command>]
+
+    -e, --event <event>   event selector. use 'perf list' to list available events

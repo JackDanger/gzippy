@@ -1,0 +1,46 @@
+== standing.sh — subject sha=42b8c869e01b80d5c2f379f095ba5e2dfb857e69  corpora='silesia'  threads='2 4 8'  N=9 ==
+=== ship rig -> root@10.30.0.199:/root/standing/ ===
+=== run on guest (detached; build+gate0+measure+analyze) ===
+launched pid=1012638
+=== poll for completion (DONE marker) ===
+=== pull artifacts -> /Users/jackdanger/www/gz-t2-locate/artifacts/standing/standing_20260622T102537Z ===
+
+############################## GROUND-TRUTH REPORT ##############################
+====================================================================================================
+GROUND-TRUTH STANDING — gzippy-native vs rapidgzip(rg) vs igzip(ig)
+sha=42b8c869e01b flavor=parallel-sm+pure N=9 | box: no_turbo=0 gov=powersave load_start=5.96
+  STAMP: Intel i7-13700T LXC ONLY — NOT-YET-LAW (AMD/Zen2 owed for LAW).
+  NOTE: turbo ON + governor not pinned => ABSOLUTE cyc/B/GHz drift; trust RELATIVE ratios gated by the A/A self-test.
+====================================================================================================
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T2      gz        9.26    734.90    1.5%  1.014  1.082  1.39   1.3%  56.1%  TIE vs rg (±3.5%)
+silesia T2      rg        9.25    724.80    2.0%  1.000  1.067  1.39   0.9%  57.3%  
+silesia T2      ig        4.46    679.44    0.4%  0.937  1.000  1.39   1.2%  20.1%  
+  self-test A/A: rg|gz = 0.1% / 0.5%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T4      gz        9.64    528.40    3.7%  1.020  0.779  1.39   0.2%  59.5%  TIE vs rg (±7.1%)
+silesia T4      rg        9.39    517.87    3.4%  1.000  0.763  1.39   0.2%  56.5%  
+silesia T4      ig        4.45    678.68    0.5%  1.311  1.000  1.40   0.1%  20.2%  
+  self-test A/A: rg|gz = 2.2% / 1.0%  (tol 5% => OK)
+----------------------------------------------------------------------------------------------------
+cell            tool     cyc/B   wall_ms  spread    /rg    /ig   GHz   GHzσ   LLC%  verdict
+silesia T8      gz        9.96    286.04    4.8%  0.963  0.420  1.39   0.1%  57.4%  TIE vs rg (±8.4%)
+silesia T8      rg        9.77    296.88    3.6%  1.000  0.436  1.39   0.2%  55.9%  
+silesia T8      ig        4.46    680.63    0.7%  2.293  1.000  1.39   0.1%  20.1%  
+  self-test A/A: rg|gz = 4.2% / 1.4%  (tol 5% => OK)
+====================================================================================================
+FORK SUMMARY (trusted cells only; ratio = gz_wall / rg_wall, <1.0 = gz wins):
+  silesia    T2   gz/rg=1.014  WIN/TIE
+  silesia    T4   gz/rg=1.020  LOSS
+  silesia    T8   gz/rg=0.963  WIN/TIE
+  => FORK-B: a T>=2 cell genuinely loses (worst=('silesia', 4, 1.0203405974684379)). Rule out fingerprint/artifact, then follow T2-LOCATE decision tree.
+====================================================================================================
+EFFCORES (Tool 2 — schedule-vs-kernel discriminator; ATTRIBUTION-tier, routes only):
+  silesia T2 (rg_blocks=17): === tail-metric [silesia-T2]  GATE-0 PASS ===
+  silesia T4 (rg_blocks=17): === tail-metric [silesia-T4]  GATE-0 PASS ===
+  silesia T8 (rg_blocks=17): === tail-metric [silesia-T8]  GATE-0 PASS ===
+====================================================================================================
+
+(full log + raw CSVs: /Users/jackdanger/www/gz-t2-locate/artifacts/standing/standing_20260622T102537Z)
