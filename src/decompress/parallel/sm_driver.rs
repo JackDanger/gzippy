@@ -157,7 +157,9 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let configuration = ChunkConfiguration {
         split_chunk_size: target_compressed_chunk_bytes,
         max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
-        crc32_enabled: true,
+        // Gate-2 CRC removal oracle: GZIPPY_ORACLE_CRC_OFF=1 disables the
+        // per-chunk CRC32 accumulation (bytes stay correct). Default true.
+        crc32_enabled: !crate::decompress::parallel::removal_oracle::crc_off_enabled(),
         // Default (keepIndex=false, vendor benchmark): sparsity OFF — skip the
         // 32 KiB `getUsedWindowSymbols` scan per chunk finalize.
         window_sparsity: sparsity,
@@ -226,6 +228,9 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // stays VERIFIED: its replay hits are byte-correct by construction and its
     // misses run the real decode, so verification doubles as the honesty check.
     let nostore_mode = crate::decompress::parallel::removal_oracle::nostore_enabled();
+    // CRC removal oracle: calculator disabled → total_crc is 0, so skip ONLY the
+    // CRC verify (bytes/ISIZE still correct and verified).
+    let crc_off_mode = crate::decompress::parallel::removal_oracle::crc_off_enabled();
     if !sleep_mode && !nostore_mode {
         if total_size != expected_size {
             return Err(ReadParallelSmError::SizeMismatch {
@@ -233,7 +238,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
                 actual: total_size,
             });
         }
-        if total_crc != expected_crc {
+        if !crc_off_mode && total_crc != expected_crc {
             return Err(ReadParallelSmError::CrcMismatch {
                 expected: expected_crc,
                 actual: total_crc,

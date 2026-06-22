@@ -91,6 +91,32 @@ pub fn nostore_enabled() -> bool {
     })
 }
 
+/// `GZIPPY_ORACLE_CRC_OFF=1` — Gate-2 CRC removal oracle. Sets the chunk
+/// `CRC32Calculator` to disabled so `update()` early-returns (no `crc32fast`
+/// folding work), while output bytes stay BYTE-CORRECT (only the checksum
+/// accumulation is removed). Sizes CRC32's share of the T1 wall by AB against
+/// the production-with-CRC arm. CRC verification is skipped in sm_driver when
+/// this is on (the disabled calculator returns 0); ISIZE size verify still
+/// runs, and the bytes are sha-verifiable (UNLIKE NOSTORE). Read once.
+#[inline]
+pub fn crc_off_enabled() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        let on = matches!(
+            std::env::var("GZIPPY_ORACLE_CRC_OFF").ok().as_deref(),
+            Some("1")
+        );
+        if on {
+            eprintln!(
+                "\n████ ORACLE CRC_OFF ACTIVE — CRC32 computation ELIDED ████\n\
+                 ████ measurement-only arm: bytes are CORRECT (sha-ok);  ████\n\
+                 ████ CRC verify SKIPPED (calculator disabled → 0).      ████\n"
+            );
+        }
+        on
+    })
+}
+
 // ── DECODE-removal record/replay ────────────────────────────────────────────
 
 /// On-disk magic for the symbol-stream capture format.
