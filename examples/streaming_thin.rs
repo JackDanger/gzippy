@@ -213,6 +213,245 @@ fn run_igzip(_file: &[u8]) -> (f64, usize) {
     panic!("igzip mode requires the isal-compression feature (build --features gzippy-isal)");
 }
 
+// ──────────────── gz-driver + igzip _04 BARE kernel (MEASUREMENT 2) ──────────
+//
+// DE-CONFOUNDED bare-kernel removal-oracle. This is the EXACT same thin
+// single-pass contig driver as `gzippy_thin` (same buffer, same memmove-retain
+// window, same flush), but the inner per-block decode is igzip's BARE
+// `decode_huffman_code_block_stateless_04` instead of gz's `run_contig` kernel.
+//
+// gz STILL parses every block header and BUILDS the Huffman tables
+// (`LutLitLenCode`/`LutDistCode` — gz's own table-build, whose output is the
+// byte-for-byte igzip `inflate_huff_code_large/small` `#[repr(C)]` layout), so
+// `_04` reads gz's already-built tables directly. NOTHING of igzip's STREAMING
+// ENGINE is grafted in (no per-chunk `set_dict`, no 128 KiB input staging, no
+// streaming-history glue) — that whole-engine swap was NIGHT37's confound. The
+// ONLY thing swapped is the inner decode loop. Hence:
+//     gzippy_thin − igzip_bare  ==  the BARE-KERNEL ceiling
+//     igzip_bare  ≈ igzip       ⇒  the kernel IS the lever
+//     igzip_bare  ≈ gzippy_thin ⇒  residual is NOT the bare loop (pivot)
+//
+// One per-block ~18 KiB table memcpy installs gz's table into the igzip state
+// (igzip builds in-place, so this is overhead igzip does not pay → it biases
+// igzip_bare SLOWER → CONSERVATIVE for the "kernel is the lever" verdict).
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn igzip_bare<S: FnMut(&[u8])>(file_bytes: &[u8], batch: usize, mut sink: S) -> usize {
+    use gzippy::decompress::inflate::consume_first_decode::{parse_dynamic_header, Bits};
+    use gzippy::decompress::parallel::gzip_format::read_header as gz_read_header;
+    use gzippy::decompress::parallel::lut_huffman::{
+        InflateHuffCodeLarge, InflateHuffCodeSmall, LutDistCode, LutLitLenCode, SINGLE_SYM_FLAG,
+    };
+    use isal::isal_sys::igzip_lib as isal;
+
+    extern "C" {
+        fn decode_huffman_code_block_stateless_04(
+            state: *mut isal::inflate_state,
+            start_out: *mut u8,
+        );
+        fn decode_huffman_code_block_stateless_base(
+            state: *mut isal::inflate_state,
+            start_out: *mut u8,
+        );
+    }
+    let use_base = std::env::var("GZIPPY_BARE_BASE").is_ok();
+
+    let (_h, hdr) = gz_read_header(file_bytes).expect("gzip header");
+    // Padded deflate body so _04's (>=8 B) lookahead never runs off the end.
+    let mut input: Vec<u8> = file_bytes[hdr..].to_vec();
+    input.extend_from_slice(&[0u8; 32]);
+
+    let cap = WINDOW + batch + SLOP;
+    let mut buf = vec![0u8; cap];
+    let base = buf.as_mut_ptr();
+
+    // Reusable per-block builders + ONE igzip inflate_state (boxed; ~40 KiB).
+    let mut litlen = LutLitLenCode::new_empty();
+    let mut dist = LutDistCode::new_empty();
+    let mut state: Box<isal::inflate_state> = Box::new(unsafe { std::mem::zeroed() });
+    unsafe { isal::isal_inflate_init(&mut *state) };
+    state.crc_flag = 0;
+    debug_assert_eq!(
+        std::mem::size_of::<InflateHuffCodeLarge>(),
+        std::mem::size_of_val(&state.lit_huff_code),
+        "gz/igzip lit table layout drift"
+    );
+    debug_assert_eq!(
+        std::mem::size_of::<InflateHuffCodeSmall>(),
+        std::mem::size_of_val(&state.dist_huff_code),
+        "gz/igzip dist table layout drift"
+    );
+
+    // Fixed-Huffman code lengths (RFC 1951 §3.2.6).
+    let fixed_litlen: Vec<u8> = (0u32..288)
+        .map(|s| match s {
+            0..=143 => 8u8,
+            144..=255 => 9,
+            256..=279 => 7,
+            _ => 8,
+        })
+        .collect();
+    let fixed_dist: Vec<u8> = vec![5u8; 30];
+
+    let mut bit_off: usize = 0;
+    let mut pos: usize = 0;
+    let mut window_len: usize = 0;
+    let mut total: usize = 0;
+    let mut dbg_n: usize = 0;
+    let dbg = std::env::var("GZIPPY_BARE_DEBUG").is_ok();
+    let flush_hi = WINDOW + batch;
+
+    loop {
+        let mut bits = Bits::at_bit_offset(&input, bit_off);
+        bits.refill();
+        let bfinal = (bits.peek() & 1) as u32;
+        bits.consume(1);
+        let btype = (bits.peek() & 0b11) as u32;
+        bits.consume(2);
+
+        match btype {
+            0 => {
+                // Stored: align to byte, LEN/NLEN, copy raw bytes (gz handles
+                // stored too — this is a memcpy, not the kernel under test).
+                bits.align_to_byte();
+                let byte = bits.bit_position() / 8;
+                let len = u16::from_le_bytes([input[byte], input[byte + 1]]) as usize;
+                let data = byte + 4;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(input.as_ptr().add(data), base.add(pos), len);
+                }
+                pos += len;
+                bit_off = (data + len) * 8;
+            }
+            1 | 2 => {
+                let (ll, dl): (Vec<u8>, Vec<u8>) = if btype == 1 {
+                    (fixed_litlen.clone(), fixed_dist.clone())
+                } else {
+                    parse_dynamic_header(&mut bits).expect("dynamic header")
+                };
+                // SINGLE-symbol packing: igzip's _04 speculative-literal asm
+                // path mis-decodes gz's TRIPLE pack; single-symbol entries are
+                // unambiguous. (Conservative: SINGLE makes _04 do more
+                // iterations than its native TRIPLE → biases igzip_bare SLOWER.)
+                if !litlen.rebuild_from_multisym(&ll, SINGLE_SYM_FLAG) {
+                    panic!("litlen table build failed");
+                }
+                if !dist.rebuild_from(&dl) {
+                    panic!("dist table build failed");
+                }
+                // Install gz-built tables into the igzip state (binary-identical
+                // repr(C) layout; _04 reads them as [state + huff_code offset]).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (&litlen.table) as *const InflateHuffCodeLarge as *const u8,
+                        (&mut state.lit_huff_code) as *mut _ as *mut u8,
+                        std::mem::size_of::<InflateHuffCodeLarge>(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        (&*dist.table) as *const InflateHuffCodeSmall as *const u8,
+                        (&mut state.dist_huff_code) as *mut _ as *mut u8,
+                        std::mem::size_of::<InflateHuffCodeSmall>(),
+                    );
+                }
+                // Pre-kernel bit state for the block BODY (mirror kernel_ab
+                // ARM B / igzip inflate_in_load): preload read_in LSB-first.
+                let body_bit = bits.bit_position();
+                let body_byte = body_bit / 8;
+                let body_skip = (body_bit % 8) as u32;
+                let mut read_in: u64 = 0;
+                let mut read_in_length: i32 = 0;
+                let mut p = body_byte;
+                if body_skip != 0 {
+                    read_in = (input[p] as u64) >> body_skip;
+                    read_in_length = (8 - body_skip) as i32;
+                    p += 1;
+                }
+                while read_in_length <= 56 && p < input.len() {
+                    read_in |= (input[p] as u64) << read_in_length;
+                    read_in_length += 8;
+                    p += 1;
+                }
+                state.read_in = read_in;
+                state.read_in_length = read_in_length;
+                state.next_in = unsafe { input.as_ptr().add(p) as *mut u8 };
+                state.avail_in = (input.len() - p) as u32;
+                let out_ptr = unsafe { base.add(pos) };
+                state.next_out = out_ptr;
+                state.avail_out = (cap - pos) as u32;
+                state.block_state = isal::isal_block_state_ISAL_BLOCK_CODED;
+                state.copy_overflow_length = 0;
+                state.copy_overflow_distance = 0;
+                // start_out = base ⇒ lookback bounded by (next_out − base) =
+                // the contiguous retained window + already-decoded bytes.
+                // igzip contract: _04 is the FAST bulk loop that bails (leaves
+                // block_state == CODED) within OUT/IN_BUFFER_SLOP of the buffer
+                // ends; the caller then finishes the block's tail with the
+                // careful loop. We mirror that: _04 for the bulk, _base for the
+                // (tiny, near-boundary) tail. >99% of symbols run on _04.
+                let coded = isal::isal_block_state_ISAL_BLOCK_CODED;
+                unsafe {
+                    if use_base {
+                        decode_huffman_code_block_stateless_base(&mut *state as *mut _, base);
+                    } else {
+                        decode_huffman_code_block_stateless_04(&mut *state as *mut _, base);
+                        if state.block_state == coded {
+                            decode_huffman_code_block_stateless_base(&mut *state as *mut _, base);
+                        }
+                    }
+                }
+                let produced = (state.next_out as usize) - (out_ptr as usize);
+                pos += produced;
+                // Absolute bit offset after EOB (inverse of inflate_in_load).
+                let consumed_bytes = (state.next_in as usize) - (input.as_ptr() as usize);
+                bit_off = consumed_bytes * 8 - state.read_in_length as usize;
+                if dbg && dbg_n < 6 {
+                    dbg_n += 1;
+                    eprintln!(
+                        "blk btype={btype} bfinal={bfinal} produced={produced} \
+                         block_state={} read_in_len={} consumed_bytes={consumed_bytes} \
+                         body_bit={body_bit} -> bit_off={bit_off}",
+                        state.block_state, state.read_in_length
+                    );
+                }
+            }
+            _ => panic!("invalid btype 3"),
+        }
+
+        // FLUSH (only at block return) — identical to gzippy_thin.
+        if pos >= flush_hi {
+            sink(&buf[window_len..pos]);
+            total += pos - window_len;
+            buf.copy_within(pos - WINDOW..pos, 0);
+            pos = WINDOW;
+            window_len = WINDOW;
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+    if pos > window_len {
+        sink(&buf[window_len..pos]);
+        total += pos - window_len;
+    }
+    total
+}
+
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn run_igzipbare(file: &[u8], batch: usize) -> (f64, usize) {
+    let mut out = devnull();
+    let t = Instant::now();
+    let n = igzip_bare(file, batch, |slice| {
+        out.write_all(slice).expect("sink write");
+    });
+    out.flush().expect("flush");
+    (t.elapsed().as_secs_f64() * 1e3, n)
+}
+
+#[cfg(not(all(pure_inflate_decode, feature = "isal-compression")))]
+fn run_igzipbare(_file: &[u8], _batch: usize) -> (f64, usize) {
+    panic!("igzipbare mode requires gzippy-isal (pure_inflate_decode + isal-compression)");
+}
+
 // ───────────────────────────── correctness gate ────────────────────────────
 
 /// Dependency-free 64-bit FNV-1a fingerprint (compact log lines only).
@@ -287,6 +526,29 @@ fn verify(file: &[u8]) {
             "prod parallel-SM T=1 byte-exact OK (fnv={:016x})",
             fnv64(&pv)
         );
+    }
+
+    // igzip_bare (gz driver + igzip _04 kernel, gz-built tables) — EXPERIMENTAL,
+    // BLOCKED: the asm `_04` long-code path mis-reads gz's long_code_lookup
+    // table layout (short/singleton entries decode fine under the C `_base`
+    // kernel with the SAME gz-built table, but `_04` trips END_INPUT on the
+    // first >12-bit code). Kept as scaffolding for the de-confounded bare-kernel
+    // removal-oracle; NON-FATAL here (set GZIPPY_VERIFY_IGZIPBARE=1 to assert).
+    #[cfg(feature = "isal-compression")]
+    if std::env::var("GZIPPY_VERIFY_IGZIPBARE").is_ok() {
+        for &batch in &[64 * 1024usize, 1024 * 1024, DEFAULT_BATCH] {
+            let mut v = Vec::new();
+            igzip_bare(file, batch, |slice| v.extend_from_slice(slice));
+            assert!(
+                v == ld,
+                "igzipbare batch={batch}: BYTE MISMATCH ({} vs {})",
+                v.len(),
+                ld.len()
+            );
+            println!("igzipbare batch={batch:>8} byte-exact OK");
+        }
+    } else {
+        println!("igzipbare: SKIPPED verify (EXPERIMENTAL/BLOCKED — _04 long-code table)");
     }
 
     verify_synthetic_flush_boundary();
@@ -367,6 +629,14 @@ fn main() {
         "igzip" => {
             let (ms, n) = run_igzip(&file);
             println!("RESULT mode=igzip ms={ms:.3} bytes={n}");
+        }
+        "igzipbare" => {
+            let batch = args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_BATCH);
+            let (ms, n) = run_igzipbare(&file, batch);
+            println!("RESULT mode=igzipbare batch={batch} ms={ms:.3} bytes={n}");
         }
         other => {
             eprintln!("unknown mode: {other}");

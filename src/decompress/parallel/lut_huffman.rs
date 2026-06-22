@@ -949,6 +949,16 @@ impl LutLitLenCode {
     /// `isal_huffman.rs::IsalLitLenCode::rebuild_from` (line 119-175) but
     /// dispatches to the pure-rust builders defined above.
     pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
+        self.rebuild_from_multisym(code_lengths, TRIPLE_SYM_FLAG)
+    }
+
+    /// As `rebuild_from`, but with a caller-chosen multi-symbol packing flag.
+    /// Production decode always uses `rebuild_from` (TRIPLE) — this is
+    /// byte-identical for `multisym == TRIPLE_SYM_FLAG`. The bare-kernel
+    /// removal-oracle (examples/streaming_thin.rs `igzipbare`) uses
+    /// `SINGLE_SYM_FLAG` so igzip's `_04` reads unambiguous single-symbol
+    /// entries (its asm speculative-literal path mis-handles gz's TRIPLE pack).
+    pub fn rebuild_from_multisym(&mut self, code_lengths: &[u8], multisym: u32) -> bool {
         self.valid = false;
         // Allow up to 288 entries: 286 for dynamic-Huffman (LIT_LEN) plus
         // symbols 286 and 287 for fixed-Huffman participation (RFC 1951
@@ -1042,7 +1052,7 @@ impl LutLitLenCode {
             LIT_LEN_ELEMS,
             &lit_count,
             &self.code_list[..],
-            TRIPLE_SYM_FLAG,
+            multisym,
         ) {
             return false;
         }
