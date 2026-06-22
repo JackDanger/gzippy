@@ -2282,6 +2282,10 @@ fn consumer_loop<W: std::io::Write>(
                 cache_key: next_block_offset,
                 handoff_bit,
             });
+            crate::decompress::parallel::chunk_data::lc_set(
+                &crate::decompress::parallel::chunk_data::LC_G_PENDING,
+                pending.len(),
+            );
         }
 
         // Vendor parity: write each post-process-complete chunk as soon as
@@ -4229,6 +4233,10 @@ fn defer_chunk_recycle(deferral: &mut RecycleDeferral, chunk: ChunkData) {
             old.recycle_decoded_buffers();
         }
     }
+    crate::decompress::parallel::chunk_data::lc_set(
+        &crate::decompress::parallel::chunk_data::LC_G_RECYCLE,
+        deferral.queue.len(),
+    );
 }
 
 /// Drain consecutive `Ready` entries at the FIFO head when two or more
@@ -4310,6 +4318,10 @@ fn drain_one_pending<W: std::io::Write>(
         Some(h) => h,
         None => return Ok(()),
     };
+    crate::decompress::parallel::chunk_data::lc_set(
+        &crate::decompress::parallel::chunk_data::LC_G_PENDING,
+        pending.len(),
+    );
     // Phase-timing: first real chunk dequeued for write — first-chunk-to-first-
     // output latency boundary (the consumer's block-for-first-chunk wait ends
     // here). mark_once → only the FIRST chunk records it.
