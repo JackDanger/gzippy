@@ -1178,6 +1178,23 @@ pub fn decode_chunk_window_absent(
     stop_hint_bits: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    // STEP-1 CEILING ORACLE (GZIPPY_MARKER_CEILING=1): seed a ZEROED 32 KiB window
+    // so this window-absent (speculative) chunk decodes through the clean asm
+    // `run_contig` path (~4.7 cyc/B) instead of the 11.7 cyc/B u16-marker loop.
+    // Output bytes are wrong-on-purpose (backrefs resolve into the zero window) —
+    // a perturbation oracle, NEVER the product. See `slow_knob::marker_ceiling`.
+    if crate::decompress::parallel::slow_knob::marker_ceiling() {
+        crate::decompress::parallel::slow_knob::note_marker_ceiling_hit();
+        let zero_window = [0u8; crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE];
+        return decode_chunk_with_rapidgzip_impl(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            &zero_window,
+            configuration,
+            false,
+        );
+    }
     decode_chunk_with_rapidgzip_impl(
         input,
         encoded_offset_bits,

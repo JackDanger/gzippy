@@ -100,6 +100,12 @@ pub fn report_hits() {
             MARKER_HIT_COUNTER.load(Ordering::Relaxed)
         );
     }
+    if count_hits() {
+        eprintln!(
+            "[slow_knob] marker-CEILING oracle hits = {}",
+            MARKER_CEILING_HITS.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// Per-decode-event spin iteration count at `F = 1.0`. Calibrated so
@@ -416,6 +422,50 @@ pub fn marker_inject(spin: u64, yield_hint: bool) {
         MARKER_HIT_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
     inject_localize(spin, yield_hint);
+}
+
+// ── STEP-1 CEILING ORACLE (GZIPPY_MARKER_CEILING) ───────────────────────────
+//
+// Causal REMOVAL oracle for the Zen2 marker-asm decision (CLAUDE.md Gate-2: "to
+// BOUND a speed-up you must REMOVE the region and measure"). When ON, the
+// window-absent (speculative) decode in `decode_chunk_window_absent` seeds a
+// ZEROED 32 KiB window, routing the whole bootstrap chunk through the clean asm
+// `run_contig` path (~4.7 cyc/B) instead of the 11.7 cyc/B u16-marker loop. The
+// huffman bitstream decode is identical (same symbols, same lengths, same EOB),
+// so the chunk size + block boundaries + control flow are UNCHANGED — only the
+// back-reference byte VALUES are wrong (they resolve into the zero window). Output
+// is therefore wrong-on-purpose (sha mismatch EXPECTED — this is a perturbation,
+// not a product); the full pipeline still runs end to end and the final CRC fails
+// only AFTER all bytes are written, so a `perf stat duration_time` wall captures
+// the full decode+write. This yields the ABSOLUTE (generous) ceiling: all decode
+// at clean asm speed, marker machinery + the separate marker-resolution pass both
+// removed. If the AMD/Zen2 wall STILL loses to rapidgzip under this oracle, no
+// decode-throughput asm can pay (STOP); if it closes to <=~1.01 the realistic
+// marker asm (which lands between baseline and this ceiling) is worth building.
+
+static MARKER_CEILING_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// `GZIPPY_MARKER_CEILING=1` — STEP-1 ceiling oracle (see module note above).
+/// OnceLock-cached, `false` by default. NOT byte-transparent (output is
+/// wrong-on-purpose) — this is a perturbation oracle, never the product path.
+#[inline]
+#[allow(dead_code)]
+pub fn marker_ceiling() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| {
+        matches!(
+            std::env::var("GZIPPY_MARKER_CEILING").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
+/// Record that the ceiling oracle fired on one window-absent chunk (Gate-0
+/// non-inert proof). Reported by [`report_hits`] when `GZIPPY_SLOW_HITS=1`.
+#[inline]
+#[allow(dead_code)]
+pub fn note_marker_ceiling_hit() {
+    MARKER_CEILING_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline(always)]
