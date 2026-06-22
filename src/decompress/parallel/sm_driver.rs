@@ -173,6 +173,9 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         expansion_ratio_ceil,
     };
 
+    // Phase-timing: gzip envelope (header+footer) parsed + chunk config built.
+    crate::decompress::parallel::phase_timing::mark("envelope_parsed");
+
     // Clean-window oracle (GZIPPY_CLEAN_WINDOW_ORACLE=1, default OFF): decode
     // every chunk with its true predecessor window — no speculation, no marker
     // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
@@ -265,6 +268,9 @@ fn read_parallel_sm_inner<W: std::io::Write>(
             });
         }
     }
+
+    // Phase-timing: trailer CRC32 + ISIZE verified (the finalize/verify phase).
+    crate::decompress::parallel::phase_timing::mark("crc_verified");
 
     // Allocator visibility (GZIPPY_RPMALLOC_STATS=1): show whether the
     // decode's span allocations were warm-reused (cache) or re-mapped (faults).

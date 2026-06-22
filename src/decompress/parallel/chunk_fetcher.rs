@@ -913,6 +913,10 @@ fn drive_impl<W: std::io::Write>(
     // replay map (no-op unless GZIPPY_ORACLE_NODECODE is set).
     crate::decompress::parallel::removal_oracle::warm_replay();
 
+    // Phase-timing: all scaffold (block_finder, window_map, block_fetcher,
+    // thread_pool spawn) is built — this is the block-finder-bootstrap boundary.
+    crate::decompress::parallel::phase_timing::mark("scaffold_built");
+
     let drive_t0 = std::time::Instant::now();
     // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): CORRECTED overlap
     // dispatch — submit EVERY chunk's decode as an in-flight prefetch
@@ -959,6 +963,11 @@ fn drive_impl<W: std::io::Write>(
         &mut total_crc,
         &mut total_size,
     );
+
+    // Phase-timing: consumer_loop returned — steady-state parallel decode +
+    // in-order drain done. What follows (pool stop + flush + finalize) is the
+    // finalize phase.
+    crate::decompress::parallel::phase_timing::mark("consumer_done");
 
     // Stop the pool BEFORE returning so any straggler prefetch tasks
     // are joined and `InputSlice` is no longer reachable. Mirror of
@@ -1029,6 +1038,11 @@ fn drive_impl<W: std::io::Write>(
     // as `cache_unused_entry`. The drain wires `record_cache_unused_entry`
     // once per remaining entry so the --verbose dump reports them.
     block_fetcher.clear_prefetch_cache();
+
+    // Phase-timing: pool stopped, output flushed, block_map/finder finalized,
+    // prefetch cache drained — drive() finalize bookkeeping complete. The
+    // trailer CRC32+ISIZE verify (crc_verified mark) runs next in sm_driver.
+    crate::decompress::parallel::phase_timing::mark("finalize_done");
 
     // --verbose stats dump. Mirror of vendor's destructor print at
     // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Triggered
@@ -4288,6 +4302,10 @@ fn drain_one_pending<W: std::io::Write>(
         Some(h) => h,
         None => return Ok(()),
     };
+    // Phase-timing: first real chunk dequeued for write — first-chunk-to-first-
+    // output latency boundary (the consumer's block-for-first-chunk wait ends
+    // here). mark_once → only the FIRST chunk records it.
+    crate::decompress::parallel::phase_timing::mark_once("first_output");
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
     let (idx, mut chunk, cache_key, handoff_bit) = match head {

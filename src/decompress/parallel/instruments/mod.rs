@@ -26,6 +26,8 @@ pub mod decode_bypass;
 #[cfg(parallel_sm)]
 pub mod memlife;
 #[cfg(parallel_sm)]
+pub mod phase_timing;
+#[cfg(parallel_sm)]
 pub mod seed_windows;
 #[cfg(parallel_sm)]
 pub mod stall_residency;
