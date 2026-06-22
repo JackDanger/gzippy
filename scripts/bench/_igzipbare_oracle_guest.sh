@@ -30,8 +30,9 @@ echo "bin sha=$(sha256sum "$BIN"|cut -c1-12)"
 declare -A MODE
 MODE[thin]=gzippy; MODE[thin2]=gzippy
 MODE[igzipbare]=igzipbare; MODE[bare2]=igzipbare
+MODE[cheap]=igzipbarecheap; MODE[cheap2]=igzipbarecheap
 MODE[igzip]=igzip
-ARMS="thin thin2 igzipbare bare2 igzip"
+ARMS="thin thin2 igzipbare bare2 cheap cheap2 igzip"
 
 for corp in $CORPORA; do
   F=$GZDIR/$corp.gz
@@ -60,13 +61,24 @@ for corp in $CORPORA; do
   done
   aa1=$(awk -v a="${BEST[thin]}" -v b="${BEST[thin2]}" 'BEGIN{d=a-b;if(d<0)d=-d;printf "%.3f",d}')
   aa2=$(awk -v a="${BEST[igzipbare]}" -v b="${BEST[bare2]}" 'BEGIN{d=a-b;if(d<0)d=-d;printf "%.3f",d}')
-  printf "  A/A self-test |thin-thin2|=%s ms  |bare-bare2|=%s ms\n" "$aa1" "$aa2"
+  aa3=$(awk -v a="${BEST[cheap]}" -v b="${BEST[cheap2]}" 'BEGIN{d=a-b;if(d<0)d=-d;printf "%.3f",d}')
+  printf "  A/A self-test |thin-thin2|=%s ms  |bare-bare2|=%s ms  |cheap-cheap2|=%s ms\n" "$aa1" "$aa2" "$aa3"
   echo "  GATE0(bytes)=$GATE"
-  printf "  thin/igzip=%s  igzipbare/igzip=%s  thin/igzipbare=%s\n" \
+  printf "  thin/igzip=%s  igzipbare/igzip=%s  cheap/igzip=%s  thin/cheap=%s\n" \
     "$(awk -v t="${BEST[thin]}" -v c="${BEST[igzip]}" 'BEGIN{printf "%.3f",t/c}')" \
     "$(awk -v g="${BEST[igzipbare]}" -v c="${BEST[igzip]}" 'BEGIN{printf "%.3f",g/c}')" \
-    "$(awk -v t="${BEST[thin]}" -v g="${BEST[igzipbare]}" 'BEGIN{printf "%.3f",t/g}')"
-  printf "  INNER-DECODE CEILING (thin-igzipbare)/thin = %s%%  | residual igzipbare-igzip = %s%%\n" \
+    "$(awk -v k="${BEST[cheap]}" -v c="${BEST[igzip]}" 'BEGIN{printf "%.3f",k/c}')" \
+    "$(awk -v t="${BEST[thin]}" -v k="${BEST[cheap]}" 'BEGIN{printf "%.3f",t/k}')"
+  # NON-INERT proof + decomposition:
+  #   header artifact removed = (igzipbare - cheap)/igzip  (must exceed A/A spread)
+  #   CLEAN scaffold          = (cheap - igzip)/igzip      (gz contig driver vs monolith, gz skips CRC)
+  #   inner-decode (cheap)    = (thin - cheap)/thin        (gz kernel+tables vs igzip _04+read_header)
+  printf "  HEADER-ARTIFACT removed (bare-cheap)/igzip = %s%%  [non-inert if > A/A]\n" \
+    "$(awk -v b="${BEST[igzipbare]}" -v k="${BEST[cheap]}" -v c="${BEST[igzip]}" 'BEGIN{printf "%.1f",(b-k)/c*100}')"
+  printf "  CLEAN SCAFFOLD (cheap-igzip)/igzip = %s%%  | INNER-DECODE(cheap) (thin-cheap)/thin = %s%%\n" \
+    "$(awk -v k="${BEST[cheap]}" -v c="${BEST[igzip]}" 'BEGIN{printf "%.1f",(k-c)/c*100}')" \
+    "$(awk -v t="${BEST[thin]}" -v k="${BEST[cheap]}" 'BEGIN{printf "%.1f",(t-k)/t*100}')"
+  printf "  (legacy contaminated: inner(thin-bare)=%s%%  residual(bare-igzip)=%s%%)\n" \
     "$(awk -v t="${BEST[thin]}" -v g="${BEST[igzipbare]}" 'BEGIN{printf "%.1f",(t-g)/t*100}')" \
     "$(awk -v g="${BEST[igzipbare]}" -v c="${BEST[igzip]}" 'BEGIN{printf "%.1f",(g-c)/c*100}')"
 done
