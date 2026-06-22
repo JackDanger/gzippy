@@ -396,6 +396,93 @@ mod tests {
         assert_parallel_sm_matches_all_oracles(&gz, "mixed_l9");
     }
 
+    /// REAL-CORPUS differential for the MARKER-KERNEL Lever 1 inline change
+    /// (huffman_short_bits_cached::decode `#[inline(always)]`). Decodes the real
+    /// silesia gzip corpus through the production parallel-SM marker pipeline at
+    /// SEVERAL `GZIPPY_CHUNK_KIB` granularities (smaller chunks → more chunks →
+    /// more window-absent marker chunks + more careful-tail entries, where the
+    /// inlined dist `decode` lives), comparing every chunk size against TWO
+    /// independent oracles (flate2/zlib-ng + libdeflate). Synthetic fixtures
+    /// don't reproduce real gzip-9 bit patterns at the marker/careful boundaries
+    /// (feedback_real_corpus_test_with_lever), so this ships with the lever.
+    /// Skips gracefully when `benchmark_data/silesia-gzip.tar.gz` is absent
+    /// (CI/laptop); the bench boxes carry the corpus.
+    #[test]
+    fn diff_real_silesia_marker_path_multi_chunk() {
+        let gz = match crate::tests::datasets::load_silesia_gzip() {
+            Some(g) => g,
+            None => {
+                eprintln!(
+                    "diff_real_silesia_marker_path_multi_chunk: \
+                     benchmark_data/silesia-gzip.tar.gz missing — skipping"
+                );
+                return;
+            }
+        };
+        assert!(
+            gz.len() > 10 * 1024 * 1024,
+            "silesia gz must exceed 10 MiB to route parallel-SM (got {})",
+            gz.len()
+        );
+
+        let exact = isize_from_trailer(gz.as_slice());
+        let ref_flate2 = oracle_flate2(&gz);
+        let ref_libdeflate = oracle_libdeflate(&gz, exact);
+        assert_eq!(
+            ref_flate2, ref_libdeflate,
+            "silesia: oracle disagreement flate2 vs libdeflate — corpus suspect"
+        );
+        let reference = ref_flate2;
+        assert_eq!(
+            reference.len(),
+            exact,
+            "silesia: ISIZE disagrees with decode"
+        );
+
+        // Serialize the whole env-mutating section against the other parallel-SM
+        // tests (they all take this lock during their decode), so GZIPPY_CHUNK_KIB
+        // is never read mid-flight by a concurrent decode.
+        let _lock = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Several granularities: smaller chunks exercise more marker chunks +
+        // careful-tail entries; the default (no override) plus tight values.
+        for chunk_kib in ["256", "512", "1024", "4096"] {
+            std::env::set_var("GZIPPY_CHUNK_KIB", chunk_kib);
+            let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+                .load(Ordering::Relaxed);
+            let mut got = Vec::with_capacity(reference.len());
+            let r = crate::decompress::decompress_single_member(&gz, &mut got, 4);
+            std::env::remove_var("GZIPPY_CHUNK_KIB");
+            r.unwrap_or_else(|e| panic!("silesia chunk_kib={chunk_kib}: decode failed: {e}"));
+            let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+                .load(Ordering::Relaxed);
+            assert!(
+                after > before,
+                "silesia chunk_kib={chunk_kib}: parallel-SM marker pipeline did not run"
+            );
+            assert_eq!(
+                got.len(),
+                reference.len(),
+                "silesia chunk_kib={chunk_kib}: length mismatch"
+            );
+            if got != reference {
+                let d = got
+                    .iter()
+                    .zip(reference.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(got.len().min(reference.len()));
+                panic!(
+                    "silesia chunk_kib={chunk_kib}: byte mismatch at offset {d} \
+                     (got=0x{:02x} ref=0x{:02x})",
+                    got.get(d).copied().unwrap_or(0),
+                    reference.get(d).copied().unwrap_or(0)
+                );
+            }
+        }
+    }
+
     #[test]
     fn diff_max_distance_backrefs_l9() {
         // L9 maximizes match-finding → genuine near-32768-distance back-refs.
