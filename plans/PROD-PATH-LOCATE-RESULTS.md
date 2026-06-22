@@ -162,6 +162,42 @@ ops AND a recycled/resident output buffer) is needed to fully close it.
 - Irreducible floor +21–28% over igzip at the optimum = per-chunk-instruction-irreducible
   + per-byte (CRC + commit + faults).
 
+## NATIVE KERNEL ON THE REAL PATH — the kernel is NOT a lever here
+
+Race: `prod_native` (gzippy-NATIVE build, pure-Rust `decode_clean_into_contig` kernel) vs
+`prod_isal` (gzippy-isal build, ISA-L `_04` tail) vs `igzip`, SAME production driver
+(`decompress_parallel,1`), chunk=1024 default, best-of-11, pin cpu4. `(prod_native −
+prod_isal)/prod_isal` = the KERNEL delta on the real path (driver held constant). Both
+builds VERIFY OK (byte-exact).
+
+| corpus   | igzip | prod_isal | prod_native | **kernel (nat−isal)/isal** | native_vs_igz |
+|----------|-------|-----------|-------------|----------------------------|---------------|
+| **Intel (neurotic)** |||||
+| nasa     | 232.6 | 297.4     | 302.5       | +1.72%                     | +30.1%        |
+| silesia  | 657.1 | 865.4     | 806.3       | **−6.83%** (native faster) | +22.7%        |
+| monorepo | 105.7 | 142.5     | 146.2       | +2.59%                     | +38.4%        |
+| squishy  | 1287.6| 1677.5    | 1532.5      | **−8.64%** (native faster) | +19.0%        |
+| **AMD (solvency, frozen→thawed)** |||||
+| nasa     | 130.8 | 167.5     | 163.5       | −2.40%                     | +25.0%        |
+| silesia  | 357.2 | 473.5     | 428.3       | **−9.54%** (native faster) | +19.9%        |
+| monorepo | 58.0  | 83.3      | 81.3        | −2.38%                     | +40.3%        |
+| squishy  | 703.4 | 905.7     | 814.5       | **−10.07%** (native faster)| +15.8%        |
+
+### CROSS-ARCH KERNEL VERDICT (Intel + AMD agree → LAW-grade) — REFRAMES the campaign
+1. **On the REAL production path the native pure-Rust kernel is at PARITY-or-FASTER than
+   the ISA-L kernel** — kernel delta within ±2.6% on nasa/monorepo and NEGATIVE (native
+   FASTER) by 6.8–10.1% on silesia/squishy, on BOTH arches.
+2. **The prior decomposition's "Intel kernel ceiling +14.5% (nasa) / +13.8% (monorepo)"
+   does NOT survive the real path.** It was a `thin`-PROXY artifact: in the proxy the
+   kernel was a large fraction of a near-monolith driver; in the real per-chunk driver the
+   per-chunk overhead dominates and MASKS the kernel difference. The heroic inner-kernel
+   rewrite the prior cycles debated would buy ~nothing on the real production T1 path.
+3. **The ship target (gzippy-NATIVE, no FFI) is +15.8 to +40.3% over igzip — and that gap
+   is ALMOST ENTIRELY the DRIVER (per-chunk), not the kernel.** Closing the per-chunk
+   driver overhead (chunk sizing + recycled output buffer + shedding per-chunk bookkeeping)
+   would bring gzippy-native to near-igzip parity WITHOUT an ISA-L dependency or a kernel
+   rewrite. **The lever is the driver, not the kernel.**
+
 ## OWED (next, this cycle)
 - Clean per-chunk removal-oracles (code change, byte-transparent, non-inert counter each):
   recycle output buffer (#1), reuse window tail buffers (#2), and a boundary-record no-op
