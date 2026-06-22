@@ -144,7 +144,7 @@ def patch_cpp():
             "::rapidgzip_region_prof::o_cyc, ::rapidgzip_region_prof::o_calls, "
             "::rapidgzip_region_prof::o_bytes, (uint64_t)dataToWriteSize };\n                    "
             "return writeAll( chunkData, fileDescriptor, offsetInChunk, dataToWriteSize ); }();")
-    src = src[:ai] + repl + src[ai:]
+    src = src[:ai] + repl + src[ai + len(anchor):]
     open(CPP, "w").write(src)
     print("CPP PATCHED OK")
 
