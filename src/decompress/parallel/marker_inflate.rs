@@ -3224,8 +3224,8 @@ impl Block {
         ))]
         {
             use crate::decompress::inflate::consume_first_decode::{
-                decode_huffman_fastloop_bounded, FlatFastloopExit, FLAT_CONTIG_BYTES,
-                FLAT_CONTIG_CALLS,
+                decode_huffman_fastloop_bounded, decode_huffman_fastloop_bounded_pipelined,
+                use_baseline_kernel, FlatFastloopExit, FLAT_CONTIG_BYTES, FLAT_CONTIG_CALLS,
             };
             let flat_eligible = flat_clean_enabled()
                 && slow_spin == 0
@@ -3256,14 +3256,28 @@ impl Block {
                     // ensure_flat_litlen() returned true ⇒ Some for Dynamic.
                     _ => self.flat_litlen.as_ref().unwrap(),
                 };
-                let exit = decode_huffman_fastloop_bounded(
-                    bits,
-                    out_slice,
-                    *pos,
-                    out_fastloop_end,
-                    litlen_ref,
-                    &self.asm.dist,
-                );
+                // ROUTE-B: production default = faithful libdeflate software-
+                // pipelined fastloop port (gated aarch64 T1 win). GZIPPY_BASELINE_KERNEL=1
+                // reverts to the legacy pack-8 baseline for AB re-verification.
+                let exit = if use_baseline_kernel() {
+                    decode_huffman_fastloop_bounded(
+                        bits,
+                        out_slice,
+                        *pos,
+                        out_fastloop_end,
+                        litlen_ref,
+                        &self.asm.dist,
+                    )
+                } else {
+                    decode_huffman_fastloop_bounded_pipelined(
+                        bits,
+                        out_slice,
+                        *pos,
+                        out_fastloop_end,
+                        litlen_ref,
+                        &self.asm.dist,
+                    )
+                };
                 FLAT_CONTIG_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Canonical seam re-read: rebuild a pristine `Bits` from the
                 // absolute bit position so the engine-B tail / next read_header
