@@ -133,6 +133,126 @@ pub fn combine_crc32(crc1: u32, crc2: u32, byte_stream_length: u64) -> u32 {
 }
 
 // =====================================================================
+// CRC32 byte-fold kernel (dispatched).
+// =====================================================================
+//
+// GATE-2 / asm-confirmed motivation (aarch64, 2026-06-21): crc32fast 1.5.0's
+// aarch64 path threads ONE `crc32x` accumulator (`crc32x w8, w8, xN` 8-way
+// "unrolled" but a single w8 dependency chain) → latency-bound at ~8.5 GB/s on
+// M-series (CRC32 instr ~3-cycle latency). The removal-oracle sized this at
+// ~25 ms (9-20% of the T1 wall) on silesia/nasa; libdeflate uses PMULL
+// multi-accumulator folding that breaks the chain. This kernel matches the
+// throughput technique on the HW crc32 unit: THREE independent `crc32x`
+// accumulators over three contiguous thirds, folded with the already-tested
+// GF(2) `combine_crc32`. Bytes are unchanged (it is the same gzip CRC32); the
+// gzip-trailer verify is a loud correctness check, and a differential test
+// pins it byte-for-byte against crc32fast across sizes/seeds/alignments.
+
+/// Continue the finalized gzip CRC32 `crc` over `data`. `crc` is the value a
+/// previous fold returned (0 for an empty prefix). Single source of truth for
+/// `CRC32Calculator`'s running checksum.
+#[inline]
+pub(crate) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if hw_crc::available() && !crc_legacy() {
+            // SAFETY: gated on runtime `crc` feature detection.
+            return unsafe { hw_crc::fold3(crc, data) };
+        }
+    }
+    let mut h = Hasher::new_with_initial(crc);
+    h.update(data);
+    h.finalize()
+}
+
+/// `GZIPPY_CRC_LEGACY=1` forces the crc32fast single-`crc32x`-chain path so the
+/// 3-way HW-CRC win stays re-verifiable by an interleaved AB on ONE binary
+/// (controls for build variance). Read once. Default OFF = fast 3-way path.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn crc_legacy() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        matches!(
+            std::env::var("GZIPPY_CRC_LEGACY").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+mod hw_crc {
+    use super::combine_crc32;
+    use core::arch::aarch64::{__crc32b, __crc32d};
+    use std::sync::OnceLock;
+
+    #[inline]
+    pub fn available() -> bool {
+        static A: OnceLock<bool> = OnceLock::new();
+        *A.get_or_init(|| std::arch::is_aarch64_feature_detected!("crc"))
+    }
+
+    /// Single `crc32x` chain (matches crc32fast's kernel) — used for the head
+    /// alignment, the post-3way tail, and small inputs.
+    #[target_feature(enable = "crc")]
+    unsafe fn fold1(crc: u32, data: &[u8]) -> u32 {
+        let mut c = !crc;
+        let (pre, mid, post) = data.align_to::<u64>();
+        for &b in pre {
+            c = __crc32b(c, b);
+        }
+        for &w in mid {
+            c = __crc32d(c, w);
+        }
+        for &b in post {
+            c = __crc32b(c, b);
+        }
+        !c
+    }
+
+    /// THREE independent `crc32x` accumulators over three contiguous,
+    /// equal, word-aligned thirds, GF(2)-combined. Breaks the single-chain
+    /// latency bottleneck (3 crc32x in flight hides the ~3-cycle latency).
+    #[target_feature(enable = "crc")]
+    pub unsafe fn fold3(crc: u32, data: &[u8]) -> u32 {
+        const STRIDE: usize = 8; // bytes per crc32d
+        let n = data.len();
+        // Small inputs: the combine fixed-cost outweighs the ILP win.
+        if n < 3 * 1024 {
+            return fold1(crc, data);
+        }
+        // words processed per stream; block = bytes per stream (mult. of 8).
+        let words = n / (3 * STRIDE);
+        let block = words * STRIDE;
+        let ptr = data.as_ptr();
+
+        // Internal (pre-final-inversion) accumulators. Stream A carries the
+        // incoming finalized `crc` (→ `!crc`); B and C start fresh (`!0`).
+        let mut a = !crc;
+        let mut b = !0u32;
+        let mut c = !0u32;
+        for i in 0..words {
+            let off = i * STRIDE;
+            let wa = (ptr.add(off) as *const u64).read_unaligned();
+            let wb = (ptr.add(block + off) as *const u64).read_unaligned();
+            let wc = (ptr.add(2 * block + off) as *const u64).read_unaligned();
+            a = __crc32d(a, wa);
+            b = __crc32d(b, wb);
+            c = __crc32d(c, wc);
+        }
+        // Finalize each stream, then fold A++B++C (each `block` bytes).
+        let fa = !a;
+        let fb = !b;
+        let fc = !c;
+        let ab = combine_crc32(fa, fb, block as u64);
+        let abc = combine_crc32(ab, fc, block as u64);
+        // Tail past the three equal thirds.
+        fold1(abc, &data[3 * block..])
+    }
+}
+
+// =====================================================================
 // CRC32Calculator (crc32.hpp:261-345).
 // =====================================================================
 
@@ -151,7 +271,10 @@ pub fn combine_crc32(crc1: u32, crc2: u32, byte_stream_length: u64) -> u32 {
 /// inner `crc32fast::Hasher` implements both, so the derive is cheap.
 #[derive(Debug, Clone)]
 pub struct CRC32Calculator {
-    hasher: Hasher,
+    /// Finalized gzip CRC32 of all bytes fed via `update` since the last
+    /// reset/append/prepend (0 for an empty run). Replaces the former inner
+    /// `crc32fast::Hasher` so the fold kernel is dispatchable (`crc32_fold`).
+    running: u32,
     stream_size_in_bytes: u64,
     enabled: bool,
     finalized_crc: u32,
@@ -169,7 +292,7 @@ impl CRC32Calculator {
     /// internal CRC seed `~0u32`.
     pub fn new() -> Self {
         Self {
-            hasher: Hasher::new(),
+            running: 0,
             stream_size_in_bytes: 0,
             enabled: true,
             finalized_crc: 0,
@@ -189,7 +312,7 @@ impl CRC32Calculator {
     /// Mirror of `CRC32Calculator::reset` (crc32.hpp:277-281).
     /// Returns calculator to the initial-empty-stream state.
     pub fn reset(&mut self) {
-        self.hasher = Hasher::new();
+        self.running = 0;
         self.stream_size_in_bytes = 0;
         self.finalized_crc = 0;
     }
@@ -202,7 +325,7 @@ impl CRC32Calculator {
             // behavior `return ~m_crc32` with `m_crc32 = ~0` → 0.
             0
         } else {
-            self.hasher.clone().finalize() ^ self.finalized_crc
+            self.running ^ self.finalized_crc
         }
     }
 
@@ -214,7 +337,7 @@ impl CRC32Calculator {
     /// Mirror of `CRC32Calculator::update` (crc32.hpp:296-303).
     pub fn update(&mut self, data: &[u8]) {
         if self.enabled {
-            self.hasher.update(data);
+            self.running = crc32_fold(self.running, data);
             self.stream_size_in_bytes += data.len() as u64;
         }
     }
@@ -248,8 +371,8 @@ impl CRC32Calculator {
             to_append.crc32(),
             to_append.stream_size_in_bytes,
         );
-        // Reset internal hasher and store the combined CRC.
-        self.hasher = Hasher::new();
+        // Reset the running fold and store the combined CRC.
+        self.running = 0;
         self.stream_size_in_bytes += to_append.stream_size_in_bytes;
         self.finalized_crc = combined;
     }
@@ -262,7 +385,7 @@ impl CRC32Calculator {
             return;
         }
         let combined = combine_crc32(to_prepend.crc32(), self.crc32(), self.stream_size_in_bytes);
-        self.hasher = Hasher::new();
+        self.running = 0;
         self.stream_size_in_bytes += to_prepend.stream_size_in_bytes;
         self.finalized_crc = combined;
     }
@@ -277,6 +400,81 @@ pub fn crc32(buffer: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dispatched `crc32_fold` (aarch64 3-way `crc32x` interleave + tail,
+    /// else crc32fast continuation) MUST equal crc32fast byte-for-byte across
+    /// sizes that exercise the small-input path, the 3-way body, the
+    /// post-3way tail, and every head/tail (mis)alignment. This is the
+    /// correctness pin for the GATE-2 CRC throughput lever.
+    #[test]
+    fn crc32_fold_matches_crc32fast_all_sizes_seeds_alignments() {
+        // LCG-filled buffer so content varies; bytes don't matter for the
+        // poly but exercise real values.
+        let mut big = vec![0u8; 200_000 + 64];
+        let mut x: u32 = 0x1234_5678;
+        for b in big.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 16) as u8;
+        }
+        // Sizes around the 3*1024 small/large threshold and 3*8 block edges.
+        let sizes = [
+            0usize, 1, 7, 8, 9, 23, 24, 25, 64, 1023, 3071, 3072, 3073, 3095, 4096, 9999, 65536,
+            131071, 131072, 131073, 200000,
+        ];
+        let seeds = [0u32, 1, 0xFFFF_FFFF, 0xDEAD_BEEF, 0x8000_0001];
+        for &align in &[0usize, 1, 3, 5, 7] {
+            for &size in &sizes {
+                if align + size > big.len() {
+                    continue;
+                }
+                let data = &big[align..align + size];
+                for &seed in &seeds {
+                    let got = crc32_fold(seed, data);
+                    let mut h = Hasher::new_with_initial(seed);
+                    h.update(data);
+                    let want = h.finalize();
+                    assert_eq!(
+                        got, want,
+                        "fold mismatch size={size} align={align} seed={seed:#x}"
+                    );
+                }
+            }
+        }
+        // Chained folds (multiple update calls) must equal one fold over the
+        // concatenation — the running-CRC invariant CRC32Calculator relies on.
+        let parts = [
+            &big[0..7],
+            &big[7..3000],
+            &big[3000..50000],
+            &big[50000..131073],
+        ];
+        let mut running = 0u32;
+        for p in parts {
+            running = crc32_fold(running, p);
+        }
+        let whole = crc32_fold(0, &big[0..131073]);
+        assert_eq!(running, whole, "chained fold != single fold");
+    }
+
+    /// `CRC32Calculator::update` (now backed by `crc32_fold`) must still equal
+    /// the standalone `crc32()` of the same bytes after the hasher->running
+    /// refactor, for a large multi-update stream.
+    #[test]
+    fn calculator_update_matches_reference_after_refactor() {
+        let mut buf = vec![0u8; 300_003];
+        let mut x: u32 = 0xCAFE_BABE;
+        for b in buf.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 8) as u8;
+        }
+        let mut c = CRC32Calculator::new();
+        // Feed in irregular chunks crossing the 3-way and tail boundaries.
+        for chunk in buf.chunks(7919) {
+            c.update(chunk);
+        }
+        assert_eq!(c.crc32(), crc32(&buf));
+        assert_eq!(c.stream_size(), buf.len() as u64);
+    }
 
     /// Cross-check `polynomial_multiply_modulo` against a brute-force
     /// reference for a few small inputs.
