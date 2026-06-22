@@ -49,6 +49,32 @@ WATCHDOG_TTL_DEFAULT=2700          # 45 min — generous upper bound for a measu
 KEEP_ALLOWLIST="${KEEP_ALLOWLIST:-199 152 153 115 116 109}"  # bench-target + DNS + VPN/route + proxy
 SELF_ACCESS_REQUIRED="${SELF_ACCESS_REQUIRED:-199 152 153 115 116}"
 
+# CONNECTIVITY-CRITICAL GUARD (defense-in-depth, 2026-06-22).
+# The allowlist above is BY VMID and therefore FRAGILE: a renamed CT, a new
+# WireGuard/VPN/DNS CT with a different id, or a caller that overrides
+# KEEP_ALLOWLIST could silently push a connectivity-critical guest into the
+# freeze set — pausing WireGuard cuts the VPN to the bench boxes (and possibly
+# the operator's link to the host itself). So, INDEPENDENT of the allowlist, we
+# NEVER freeze any running CT whose hostname/tags/description identify it as
+# WireGuard/VPN/DNS/proxy/gateway. This guard is unconditional and cannot be
+# disabled by an env override of KEEP_ALLOWLIST. If a CT's identity cannot be
+# read (pct config fails), we treat it as critical and skip it — fail SAFE
+# toward connectivity (a non-quiet bench is recoverable; a severed VPN is not).
+CRITICAL_REGEX="${CRITICAL_REGEX:-wireguard|wg|vpn|dns|pihole|gateway|router|proxy}"
+
+# is_connectivity_critical <id> — 0 if the CT must never be frozen.
+is_connectivity_critical() {
+  local id="$1" cfg name
+  cfg="$(pct config "$id" 2>/dev/null)"
+  # Identity unreadable -> fail safe (treat as critical, never freeze).
+  [ -n "$cfg" ] || return 0
+  name="$(printf '%s\n' "$cfg" | awk -F': ' '/^hostname:/{print $2}')"
+  printf '%s\n' "$name" | grep -qiE "$CRITICAL_REGEX" && return 0
+  # also match tags:/description: lines (e.g. tags: dns / tags: vpn)
+  printf '%s\n' "$cfg" | grep -iE '^(tags|description):' | grep -qiE "$CRITICAL_REGEX" && return 0
+  return 1
+}
+
 # Quiet threshold. We gate on INSTANTANEOUS runnable-process count, NOT the 1-min
 # loadavg: loadavg is a ~60s exponential average that still carries the pre-freeze
 # neighbor load for a full minute AFTER the neighbors are paused (measured: a box
@@ -74,14 +100,22 @@ in_list() { local x="$1"; shift; for e in "$@"; do [ "$e" = "$x" ] && return 0; 
 
 loadavg1() { cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo NA; }
 
-# Compute freeze set = running LXCs - KEEP_ALLOWLIST.
+# Compute freeze set = running LXCs - KEEP_ALLOWLIST - connectivity-critical CTs.
+# The connectivity-critical guard is UNCONDITIONAL: even if a WireGuard/VPN/DNS
+# CT is somehow absent from KEEP_ALLOWLIST (renamed id, env override), it is
+# still excluded from FREEZE and recorded in PROTECTED for the status readout.
 compute_freeze() {
   local running id
   mapfile -t running < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print $1}')
   [ "${#running[@]}" -gt 0 ] || { echo "BENCH_LOCK_FAIL=no-running-lxcs (pct list failed?)" >&2; return 1; }
   RUNNING_LXC=("${running[@]}")
   FREEZE=()
-  for id in "${running[@]}"; do in_list "$id" $KEEP_ALLOWLIST || FREEZE+=("$id"); done
+  PROTECTED=()
+  for id in "${running[@]}"; do
+    if in_list "$id" $KEEP_ALLOWLIST; then continue; fi
+    if is_connectivity_critical "$id"; then PROTECTED+=("$id"); continue; fi
+    FREEZE+=("$id")
+  done
 }
 
 # procs_running — instantaneous count of runnable tasks (field 2 of the
@@ -121,7 +155,8 @@ case "${1:-status}" in
       in_list "$need" "${RUNNING_LXC[@]}" || { log "ABORT self-access guard: required guest $need not running"; echo "BENCH_LOCK_FAIL=self-access:$need-not-running"; exit 3; }
     done
     log "running LXCs: ${RUNNING_LXC[*]}"
-    log "freeze set (running - keep): ${FREEZE[*]:-<none>}"
+    log "freeze set (running - keep - critical): ${FREEZE[*]:-<none>}"
+    log "connectivity-protected (never frozen): ${PROTECTED[*]:-<none>}"
     log "VMs left running: $(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{printf "%s ",$1}')"
 
     # 2. write baseline state BEFORE any mutation (atomic), record freeze list.
@@ -197,6 +232,7 @@ case "${1:-status}" in
     echo "frozen_now=[$(for f in /sys/fs/cgroup/lxc/*/cgroup.freeze; do [ "$(cat "$f" 2>/dev/null)" = 1 ] && echo -n "$(basename $(dirname $f)) "; done)]"
     echo "watchdog=$(systemctl is-active ${WD_UNIT}.timer 2>/dev/null || echo inactive)"
     echo "keep_allowlist=[$KEEP_ALLOWLIST] would_freeze=[${FREEZE[*]:-}]"
+    echo "connectivity_protected=[${PROTECTED[*]:-}] (never frozen; matched /$CRITICAL_REGEX/ on hostname/tags/description)"
     ;;
 
   *)
