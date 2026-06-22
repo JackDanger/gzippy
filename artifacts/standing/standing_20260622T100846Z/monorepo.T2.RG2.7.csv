@@ -1,0 +1,6 @@
+205972884,ns,duration_time,205972884,100.00,545.557,M/sec
+525911140,,cpu_core/cycles/,377545708,100.00,1.393,GHz
+1196929538,,cpu_core/instructions/,377545708,100.00,3.170,G/sec
+377.55,msec,task-clock,377545708,100.00,1.834,CPUs utilized
+3987055,,cpu_core/cache-references/,377545708,100.00,10.560,M/sec
+1954729,,cpu_core/cache-misses/,377545708,100.00,5.177,M/sec

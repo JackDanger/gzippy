@@ -51,17 +51,21 @@ case "$BOX" in
     # (reference_solvency_bench_box) and MUST be confirmed with one read-only ssh
     # the moment the box returns (see scripts/bench/AMD-STAGING.md). Do NOT bank an
     # AMD number until these are verified live.
+    # CONFIRMED LIVE 2026-06-22 (T≥2-locate cycle): box reachable as root@10.0.2.240,
+    # cargo 1.96 at /root/.cargo/bin (symlinked into /usr/local/bin so the rig's bare
+    # `cargo` resolves under non-interactive ssh), rapidgzip-native 0.16.0 ELF built,
+    # corpora in /root, gov=ondemand/boost=1 (default, NOT frozen).
     BOX_NAME=solvency
     BOX_ARCH=amd
     BOX_JUMP=""                             # direct — no jump host
-    BOX_GUEST=jackdanger@10.0.2.240
+    BOX_GUEST=root@10.0.2.240
     BOX_SSH="ssh -o ConnectTimeout=15 ${BOX_GUEST}"
     BOX_SCP_JFLAG=""                        # no jump
-    BOX_SRC="${SOLVENCY_SRC:-/home/jackdanger/gz-head}"   # CONFIRM on return
+    BOX_SRC="${SOLVENCY_SRC:-/root/gz-head}"             # fresh clone, origin=GitHub
     BOX_TARGET="${SOLVENCY_TARGET:-/dev/shm/kgate-target}"
-    BOX_STAGE="${SOLVENCY_STAGE:-/home/jackdanger/kernel-gate}"
-    BOX_CORPUS_DIR="${SOLVENCY_CORPUS_DIR:-/home/jackdanger}"   # CONFIRM corpora present
-    BOX_RG="${SOLVENCY_RG:-}"               # CONFIRM rapidgzip-native ELF path
+    BOX_STAGE="${SOLVENCY_STAGE:-/root/kernel-gate}"
+    BOX_CORPUS_DIR="${SOLVENCY_CORPUS_DIR:-/root}"       # <corpus>.gz live here
+    BOX_RG="${SOLVENCY_RG:-/root/gz-base/vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip}"
     BOX_IGZIP="${SOLVENCY_IGZIP:-/usr/bin/igzip}"
     BOX_PINBASE="${SOLVENCY_PINBASE:-4}"    # a single physical core (no SMT sibling)
     BOX_FEATURES=gzippy-native
