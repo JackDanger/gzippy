@@ -66,3 +66,24 @@ path=ParallelSM; verify box binary built this sha).
 AMD: PAUSE llama (SIGSTOP + GUARANTEED-RESUME watchdog + trap; verify RUNNING at exit),
 freeze (gov performance + boost off) + restore+verify. Never leave llama stopped / box
 frozen.
+
+## VERDICT (2026-06-22, kernel-converge-A @08895e9b, clean AMD + llama-paused, N=9)
+STEP-1 ceiling RE-RUN with the CORRECTED U16-preserving arms (cursor-agent design-
+reviewed; see plans/ZEN2-CEILING-U16-RESULTS.md for the bracket table + rig).
+
+- **The seeded-window ceiling is INVALID.** Both the pre-existing u8 ceiling and the
+  new u16 arms run 2.5–3.0× SLOWER than the production baseline on the decode-bound
+  cells (silesia-T4 u8=655ms vs gz=254ms; squishy-T4 u8=1319 vs 438). A speed-ceiling
+  that inflates the wall cannot bound a speed-UP — so the prior STEP-1 ceiling
+  (981575f4) was invalid (it routes through the slow seeded `unified::Inflate` engine,
+  not the fast `run_contig` asm).
+- **CONFIRM is therefore BLOCKED** (no valid decode-speed ceiling exists yet).
+- **The REFUTE direction is SUPPORTED** by the only valid signal — the u16−u8 delta
+  (same seeded decode underneath) shows the u16-write + apply-window resolve traffic is
+  HEAVY (+145ms parallel / +380ms serial on silesia-T4, ≈ the whole baseline wall) —
+  and by the prior banked ~3–10% total-gap bound. The baseline gap is only ~14ms.
+- **ACTION: DO NOT BUILD the marker asm** on this evidence (the confirm-before-code
+  SAVE holds). RE-OPEN TRIGGER: a VALID decode-speed ceiling instrument — route the
+  window-absent decode through the FAST run_contig/asm kernel (not the slow seeded
+  engine) while preserving u16+resolve, or a freq-pinned cyc/B microbench of
+  decode_marker_fast_loop in isolation. STEP 2 (asm stages) NOT entered.
