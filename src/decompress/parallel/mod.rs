@@ -121,6 +121,6 @@ pub use instruments::{contig_prof, slow_knob};
 // non-parallel_sm (legacy serial) build does not see them as unused imports.
 #[cfg(parallel_sm)]
 pub use instruments::{
-    decode_bypass, memlife, perfect_overlap, phase_timing, removal_oracle, seed_windows,
-    stall_residency, trace_jsonl as trace, trace_timeline as trace_v2,
+    decode_bypass, memlife, perfect_overlap, phase_timing, region_prof, removal_oracle,
+    seed_windows, stall_residency, trace_jsonl as trace, trace_timeline as trace_v2,
 };
