@@ -198,7 +198,62 @@ builds VERIFY OK (byte-exact).
    would bring gzippy-native to near-igzip parity WITHOUT an ISA-L dependency or a kernel
    rewrite. **The lever is the driver, not the kernel.**
 
-## OWED (next, this cycle)
+## T>1 LOAD-BEARING CLASSIFICATION (the strategic fork)
+
+Chunk-size optimum across thread counts (neurotic, full cores, unpinned LXC = noisy, best-of-9).
+`prodt` mode = real `decompress_parallel(file, …, T)`.
+
+| corpus   | T  | 1024K | 2048K | 4096K | 8192K | optimum |
+|----------|----|-------|-------|-------|-------|---------|
+| silesia  | T1 | 873   | 819   | 815   | 796   | big (≥4M) |
+| silesia  | T4 | 525   | 440   | **404** | 503 | 4M (8M REGRESSES +24%) |
+| silesia  | T8 | 300   | **258** | 268 | 265 | 2M |
+| monorepo | T1 | 144   | **130** | 132 | 131 | 2M |
+| monorepo | T4 | 121   | 122   | 122   | **120** | flat |
+| monorepo | T8 | 80    | 84    | 85    | **79**  | flat/small |
+
+VERDICT (directional, noisy box): **the chunk-SIZE/count is T>1-LOAD-BEARING.** The optimal
+chunk size DECREASES as T rises (T1 wants big chunks ~2–8M; T4 wants 4M and 8M regresses
++24%; T8 wants ~2M) — because at high T the chunk is the unit of parallel work and too-few
+chunks starve cores (granularity/load-balance). So the T1 chunk-size win (bigger chunks)
+would REGRESS T>1 if applied globally → it MUST be T1-gated. **Production already gates this**
+(T1_TARGET_COMPRESSED_CHUNK_BYTES=1MiB vs T>1=4MiB); the gated fix is to bump the T1 default
+1MiB→2MiB (safe, T>1 untouched).
+
+Classification of the per-chunk candidates:
+- **Chunk granularity (size/count): T>1-LOAD-BEARING** — keep per-T defaults; bump T1 to 2MiB.
+- **Per-chunk OPERATION cost (#1 alloc/first-touch, #2 window-roll, #3 isal lifecycle,
+  #4 boundary record): PURE COST, NOT load-bearing** — removing the COST (e.g. a recycled/
+  resident output buffer, cheaper window handoff, no-op boundary record at T==1) does not
+  reduce the number of chunks, so it cannot starve T>1 cores. These are safe to shed/optimize
+  at every T (and shedding helps T1 most, where they run serially). Individual clean oracles
+  for each are OWED, but the chunk-sweep + AMD perf already bound them: combined they are the
+  per-chunk instruction surplus (+20% ins at 1MiB, halving to +9% at 4MiB) + first-touch faults.
+
+## SUMMARY — the real-production-path T1 decomposition (cross-arch LAW)
+
+Holding the inner kernel constant (isal clean tail = igzip `_04`), the REAL production T1
+driver is **+28.8 to +42.8% slower than the igzip monolith on both arches** (the prior
+"no scaffold" verdict was a proxy artifact). That gap is:
+- **CRC32 second-touch (#5): 2–12%** (clean removal-oracle; per-byte; bigger on Zen2/nasa).
+- **Per-chunk fixed cost: the DOMINANT residual** (chunk-sweep, Gate-2, both arches): wall is
+  U-shaped in chunk size, optimum ~2 MiB; the 256K→2M slope is −26 to −38% of wall. T1 default
+  1 MiB is suboptimal (2 MiB recovers 4–10%). Mechanism = per-chunk bookkeeping instructions
+  (+20%→+9% across the sweep) ↔ first-touch faults (balloon with reserve) tradeoff.
+- **Irreducible floor +21–28% over igzip** at the optimum = per-chunk-irreducible + per-byte.
+- **The kernel is NOT a lever on the real path** (native = ISA-L parity-or-faster, both arches);
+  the prior "+14.5% kernel ceiling" was a proxy artifact. **The lever is the DRIVER.**
+- Ship target gzippy-NATIVE (no FFI) = +15.8 to +40.3% over igzip, almost entirely DRIVER →
+  closable to near-parity by driver convergence (T1 chunk size + recycled output buffer +
+  shed per-chunk bookkeeping) with NO kernel rewrite and NO ISA-L.
+
+## OWED (next cycle — LOCATE complete; these are the CLOSE actions)
+- Bump T1 default chunk 1MiB→2MiB (T1-gated; safe per T>1 classification) and re-measure.
+- Recycled/resident output buffer for the thin-T1 loop (#1, the first-touch fault cost) —
+  clean per-candidate oracle (reuse ChunkData buffers across the serial T1 chunks).
+- Cheaper window handoff (#2: drop the per-chunk vec![0;32768] + clone) + no-op boundary
+  record at T==1 (#4) — clean component oracles.
+- Fold CRC inline during decode (#5) instead of the per-byte second-touch re-read.
 - Clean per-chunk removal-oracles (code change, byte-transparent, non-inert counter each):
   recycle output buffer (#1), reuse window tail buffers (#2), and a boundary-record no-op
   stub (#4) — in `drive_thin_t1_oracle` / `decode_chunk`, gated on T==1.
