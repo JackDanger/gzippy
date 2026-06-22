@@ -572,13 +572,26 @@ impl LitLenTable {
     }
 }
 
-/// Inline capacity for the distance table: main(1<<9 = 512) + worst-case
-/// subtables (1<<MAX_SUBTABLE_BITS=64 × up-to-32 codes longer than table_bits).
-/// 512 + 64*32 = 2560 covers any legal distance alphabet (≤30 real codes;
-/// 32 = the 5-bit hdist ceiling). Element A (single-state-base): the entries
-/// live INLINE so the asm addresses them `[{ctx}+DIST_OFF+idx*4]` off the one
-/// `ctx` base (igzip `[state+_dist_huff_code+...]`).
-pub const DIST_CAP: usize = 512 + 64 * 32;
+/// Inline capacity for the distance table: `main(1<<TABLE_BITS) + worst-case
+/// subtables ((1<<MAX_SUBTABLE_BITS) × up-to-32 codes longer than table_bits)`.
+/// 32 = the 5-bit hdist ceiling, covering any legal distance alphabet (≤30 real
+/// codes). The cap MUST track `DistTable::{TABLE_BITS, MAX_SUBTABLE_BITS}`,
+/// which are arch-dependent (aarch64 uses a narrower TABLE_BITS=8 → wider
+/// MAX_SUBTABLE_BITS=7 → 2× the per-long-code subtable reservation):
+///   * x86:     512 + 64*32  = 2560   (TABLE_BITS=9, MAX_SUBTABLE_BITS=6)
+///   * aarch64: 256 + 128*32 = 4352   (TABLE_BITS=8, MAX_SUBTABLE_BITS=7)
+///
+/// Undersizing it makes `DistTable::rebuild` return false for deep distance
+/// trees that `dist_hc` accepts — a real arch-specific divergence (the
+/// `!dist_valid` careful fallback keeps output byte-exact, but the fast path
+/// is silently lost and the `dist_table_matches_dist_hc_differential`
+/// invariant breaks). Element A (single-state-base): the entries live INLINE
+/// so the asm addresses them `[{ctx}+DIST_OFF+idx*4]` off the one `ctx` base
+/// (igzip `[state+_dist_huff_code+...]`).
+#[cfg(target_arch = "aarch64")]
+pub const DIST_CAP: usize = (1 << 8) + (1 << 7) * 32;
+#[cfg(not(target_arch = "aarch64"))]
+pub const DIST_CAP: usize = (1 << 9) + (1 << 6) * 32;
 
 /// Distance decode table.
 ///
