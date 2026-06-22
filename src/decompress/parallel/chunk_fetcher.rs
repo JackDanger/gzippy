@@ -1062,6 +1062,8 @@ fn drive_impl<W: std::io::Write>(
         // mfast-phase0 probe: cycle/event breakdown for `'mfast` vs careful loop
         // (no-op unless GZIPPY_MFAST_PROF=1).
         crate::decompress::parallel::marker_inflate::mfast_prof::dump_if_enabled();
+        // AMD-residual region partition (no-op unless GZIPPY_REGION_PROF=1).
+        crate::decompress::parallel::region_prof::dump_if_enabled();
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
@@ -2524,14 +2526,27 @@ fn decode_chunk_with_until_exact(
     until_exact: bool,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    crate::decompress::parallel::chunk_decode::decode_chunk_until_exact(
-        input,
-        encoded_offset_bits,
-        stop_hint_bits,
-        initial_window,
-        configuration,
-        until_exact,
-    )
+    // AMD-residual R_WORKER region: the whole per-chunk decode CALL (huffman decode
+    // + commit + clean-CRC + ring) at the production pool-submitted chokepoint.
+    let r = crate::decompress::parallel::region_prof::measure_worker(0, || {
+        crate::decompress::parallel::chunk_decode::decode_chunk_until_exact(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+            configuration,
+            until_exact,
+        )
+    });
+    if crate::decompress::parallel::region_prof::enabled() {
+        if let Ok(ref c) = r {
+            crate::decompress::parallel::region_prof::R_WORKER_BYTES.fetch_add(
+                c.decoded_size() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+    r
 }
 
 /// Submit a decode task to the `ThreadPool`, returning the
@@ -3067,6 +3082,15 @@ fn resolve_chunk_markers_on_chunk(
     predecessor_window: &[u8],
 ) {
     let dwm_len_pre = chunk.data_with_markers.len();
+    // AMD-residual R_MARKERPP region (resolve+narrow+narrowed-crc+subwin == rg applyWindow).
+    let _rp_span = crate::decompress::parallel::region_prof::Span::new(
+        &crate::decompress::parallel::region_prof::R_MARKERPP_CYC,
+        &crate::decompress::parallel::region_prof::R_MARKERPP_N,
+    );
+    if crate::decompress::parallel::region_prof::enabled() {
+        crate::decompress::parallel::region_prof::R_MARKERPP_BYTES
+            .fetch_add(dwm_len_pre as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     if dwm_len_pre > 0 {
         // Always fused resolve+narrow (64 KiB u8 LUT, one pass). The old
         // sub-128Ki-element branch ran `resolve_markers_u16` (128 KiB u16 LUT)
@@ -4424,6 +4448,15 @@ fn drain_one_pending<W: std::io::Write>(
         if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_none() && payload_bytes > 0 {
             use crate::decompress::parallel::fd_vectored_write;
             let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
+            // AMD-residual R_OUTPUT region (iovec assembly + crc-combine + writev == rg write).
+            let _ro_span = crate::decompress::parallel::region_prof::Span::new(
+                &crate::decompress::parallel::region_prof::R_OUTPUT_CYC,
+                &crate::decompress::parallel::region_prof::R_OUTPUT_N,
+            );
+            if crate::decompress::parallel::region_prof::enabled() {
+                crate::decompress::parallel::region_prof::R_OUTPUT_BYTES
+                    .fetch_add(payload_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             // Zero-copy gather: narrowed marker segments + clean payload
             // (vendor DecodedData.hpp:529 toIoVec). No memcpy — iovecs borrow
             // decode buffers until writev/vmsplice completes.
