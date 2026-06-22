@@ -2024,6 +2024,18 @@ fn consumer_loop<W: std::io::Write>(
         // branch only). Used to validate an eager-submitted result is
         // byte-identical before reusing it.
         let mut consumer_pred_key: Option<usize> = None;
+        // STEP-1 U16-preserving ceiling oracle (consumer-serial arm): a ceiling
+        // chunk was decoded through the seeded-clean path (dwm empty), so it takes
+        // this clean branch. Inject the u16 write + resolve traffic HERE, serially
+        // on the consumer thread (the pessimistic resolve-location arm). Wrong bytes
+        // are expected (CRC fails terminally); this only adds the asm-irremovable
+        // resolve cost to the wall.
+        if chunk.phantom_ceiling_len > 0 {
+            crate::decompress::parallel::slow_knob::phantom_marker_resolve_traffic(
+                chunk.phantom_ceiling_len,
+                false,
+            );
+        }
         if chunk.data_with_markers.is_empty() {
             // No markers → apply_window is a no-op. Publish successor window
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).

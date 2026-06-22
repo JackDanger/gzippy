@@ -106,6 +106,24 @@ pub fn report_hits() {
             MARKER_CEILING_HITS.load(Ordering::Relaxed)
         );
     }
+    // U16-preserving ceiling arms: always report when armed (Gate-0 non-inert
+    // proof: HITS must match the u8 ceiling HITS and RESOLVE_BYTES > 0).
+    if marker_ceiling_u16() || count_hits() {
+        eprintln!(
+            "[slow_knob] marker-CEILING-U16 (consumer-serial) hits = {} resolve_bytes = {} (seeded-decode hits = {})",
+            MARKER_CEILING_U16_HITS.load(Ordering::Relaxed),
+            MARKER_CEILING_U16_RESOLVE_BYTES.load(Ordering::Relaxed),
+            MARKER_CEILING_HITS.load(Ordering::Relaxed),
+        );
+    }
+    if marker_ceiling_u16w() || count_hits() {
+        eprintln!(
+            "[slow_knob] marker-CEILING-U16W (worker-parallel) hits = {} resolve_bytes = {} (seeded-decode hits = {})",
+            MARKER_CEILING_U16W_HITS.load(Ordering::Relaxed),
+            MARKER_CEILING_U16W_RESOLVE_BYTES.load(Ordering::Relaxed),
+            MARKER_CEILING_HITS.load(Ordering::Relaxed),
+        );
+    }
 }
 
 /// Per-decode-event spin iteration count at `F = 1.0`. Calibrated so
@@ -466,6 +484,125 @@ pub fn marker_ceiling() -> bool {
 #[allow(dead_code)]
 pub fn note_marker_ceiling_hit() {
     MARKER_CEILING_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+// ── STEP-1 U16-PRESERVING CEILING ORACLE (corrected; cursor-agent design-reviewed) ──
+//
+// The plain u8 `GZIPPY_MARKER_CEILING` above is OVER-GENEROUS: it seeds a zeroed
+// window so the speculative chunk decodes through the clean asm `run_contig` u8 path
+// (~4.7 cyc/B) AND, because `data_with_markers` ends up EMPTY, the consumer's
+// `resolve_and_narrow_markers_in_place` becomes a NO-OP — so it deletes BOTH the u16
+// marker buffer (2× write traffic + footprint) AND the apply-window resolve/gather
+// pass. A real marker-decode asm can only speed the per-symbol DECODE; it CANNOT
+// remove the u16 buffer or the resolve gather. So the realistic prize is bracketed:
+//
+//   baseline(~11.7 cyc/B) > U16-ceiling(clean decode + u16 write + resolve) > u8-ceiling
+//
+// The U16-preserving ceiling keeps the u16 write traffic + the real fused
+// `resolve_and_narrow_in_place` LUT/gather pass, crediting ONLY clean-asm decode
+// speed. Two location arms bracket where the resolve runs in the real pipeline (pool
+// post-process, consumer-blocked):
+//   * `GZIPPY_MARKER_CEILING_U16W` — phantom resolve in the DECODE WORKER (parallel;
+//     OPTIMISTIC on resolve location — under-counts the serial gate).
+//   * `GZIPPY_MARKER_CEILING_U16`  — phantom resolve INLINE on the CONSUMER thread,
+//     serialized per chunk (PESSIMISTIC location — over-serializes vs the real
+//     pool-parallel-but-consumer-blocked resolve).
+// The truth lies between the two arms. Both close ⇒ robust CONFIRM; neither ⇒ robust
+// REFUTE. Output bytes are wrong-on-purpose (perturbation, never the product).
+
+static MARKER_CEILING_U16_HITS: AtomicU64 = AtomicU64::new(0);
+static MARKER_CEILING_U16_RESOLVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static MARKER_CEILING_U16W_HITS: AtomicU64 = AtomicU64::new(0);
+static MARKER_CEILING_U16W_RESOLVE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `GZIPPY_MARKER_CEILING_U16=1` — consumer-inline (serial) U16-preserving ceiling.
+#[inline]
+#[allow(dead_code)]
+pub fn marker_ceiling_u16() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| {
+        matches!(
+            std::env::var("GZIPPY_MARKER_CEILING_U16").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
+/// `GZIPPY_MARKER_CEILING_U16W=1` — worker-side (parallel) U16-preserving ceiling.
+#[inline]
+#[allow(dead_code)]
+pub fn marker_ceiling_u16w() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| {
+        matches!(
+            std::env::var("GZIPPY_MARKER_CEILING_U16W").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
+
+/// True if any U16-preserving ceiling arm is armed (so the caller takes the
+/// seeded-clean-decode path used by all ceiling arms).
+#[inline]
+#[allow(dead_code)]
+pub fn marker_ceiling_any_u16() -> bool {
+    marker_ceiling_u16() || marker_ceiling_u16w()
+}
+
+/// Inject EXACTLY the u16 marker write traffic + the real fused resolve/gather
+/// pass for one ceiling chunk of `n` decoded bytes, then discard the scratch. This
+/// is the cost a marker-decode asm CANNOT remove (it lands on top of the clean-asm
+/// decode speed credited by the seeded-window decode). `worker_arm` selects the
+/// counter so the worker (parallel) vs consumer (serial) location arms stay
+/// distinct. Builds a `SegmentedU16` with ~31% scattered markers (matching the
+/// measured replaced-marker fraction) and the rest literals, then runs the SAME
+/// `resolve_and_narrow_in_place` kernel the production consumer runs.
+///
+/// Gated to `parallel_sm`: it references the marker buffer + resolve kernel which
+/// only exist in the parallel single-member engine (its only callers are
+/// parallel_sm-gated). The knob readers above stay ungated (plain env reads).
+#[cfg(parallel_sm)]
+#[allow(dead_code)]
+pub fn phantom_marker_resolve_traffic(n: usize, worker_arm: bool) {
+    if n == 0 {
+        return;
+    }
+    use crate::decompress::parallel::replace_markers::MARKER_BASE;
+    use crate::decompress::parallel::segmented_markers::SegmentedU16;
+
+    let mut scratch = SegmentedU16::default();
+    const FILL_CHUNK: usize = 8192;
+    let mut buf = [0u16; FILL_CHUNK];
+    let mut remaining = n;
+    let mut base = 0usize;
+    while remaining > 0 {
+        let m = remaining.min(FILL_CHUNK);
+        for (j, slot) in buf.iter_mut().enumerate().take(m) {
+            let i = base + j;
+            // Deterministic scatter (~31% markers) into the 32 KiB window, the
+            // rest literals (< 256). Avoids artificial sequential gather locality.
+            let h = i.wrapping_mul(2_654_435_761);
+            *slot = if (h >> 7) % 100 < 31 {
+                MARKER_BASE + ((h % 32768) as u16)
+            } else {
+                (i & 0xFF) as u16
+            };
+        }
+        scratch.push_slice(&buf[..m]);
+        base += m;
+        remaining -= m;
+    }
+    // Real production resolve kernel (64 KiB u8 LUT, window gather, u16→u8 narrow).
+    let zero_window = [0u8; 32768];
+    scratch.resolve_and_narrow_in_place(&zero_window);
+    std::hint::black_box(&scratch);
+    if worker_arm {
+        MARKER_CEILING_U16W_HITS.fetch_add(1, Ordering::Relaxed);
+        MARKER_CEILING_U16W_RESOLVE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    } else {
+        MARKER_CEILING_U16_HITS.fetch_add(1, Ordering::Relaxed);
+        MARKER_CEILING_U16_RESOLVE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    }
 }
 
 #[inline(always)]

@@ -1183,17 +1183,37 @@ pub fn decode_chunk_window_absent(
     // `run_contig` path (~4.7 cyc/B) instead of the 11.7 cyc/B u16-marker loop.
     // Output bytes are wrong-on-purpose (backrefs resolve into the zero window) —
     // a perturbation oracle, NEVER the product. See `slow_knob::marker_ceiling`.
-    if crate::decompress::parallel::slow_knob::marker_ceiling() {
-        crate::decompress::parallel::slow_knob::note_marker_ceiling_hit();
-        let zero_window = [0u8; crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE];
-        return decode_chunk_with_rapidgzip_impl(
-            input,
-            encoded_offset_bits,
-            stop_hint_bits,
-            &zero_window,
-            configuration,
-            false,
-        );
+    {
+        use crate::decompress::parallel::slow_knob;
+        // STEP-1 ceiling oracles (u8 over-generous + corrected U16-preserving arms).
+        // All arms decode this speculative chunk through the clean asm `run_contig`
+        // path (seeded zeroed 32 KiB window) to credit clean-asm DECODE SPEED. The
+        // U16 arms then add back the u16 write + resolve traffic an asm cannot remove.
+        if slow_knob::marker_ceiling()
+            || slow_knob::marker_ceiling_u16()
+            || slow_knob::marker_ceiling_u16w()
+        {
+            slow_knob::note_marker_ceiling_hit();
+            let zero_window = [0u8; crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE];
+            let mut chunk = decode_chunk_with_rapidgzip_impl(
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                &zero_window,
+                configuration,
+                false,
+            )?;
+            let decoded_len = chunk.data.len().saturating_sub(chunk.data_prefix_len);
+            if slow_knob::marker_ceiling_u16w() {
+                // Worker (parallel) arm: pay the u16 write + resolve traffic here.
+                slow_knob::phantom_marker_resolve_traffic(decoded_len, true);
+            }
+            if slow_knob::marker_ceiling_u16() {
+                // Consumer (serial) arm: defer the traffic to the consumer thread.
+                chunk.phantom_ceiling_len = decoded_len;
+            }
+            return Ok(chunk);
+        }
     }
     decode_chunk_with_rapidgzip_impl(
         input,
