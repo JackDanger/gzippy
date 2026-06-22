@@ -255,11 +255,48 @@ fn pool_index_for_take() -> usize {
     current_worker_pool_index().unwrap_or(0)
 }
 
+thread_local! {
+    /// T1 cache-residency scope (set only by `drive_thin_t1_oracle`, on the
+    /// single serial decode thread, via [`T1ResidentScope`]). When active it
+    /// turns ON the manual buffer pool AND pins every reserve to the fixed
+    /// resident cap — exactly the `GZIPPY_RESIDENT_OUTPUT_POOL` oracle that the
+    /// gated discrimination measured (minor-faults drop toward igzip, monorepo
+    /// wall 1.39→1.29 both arches; see plans/T1-CACHE-RESIDENCY-RESULTS.md), but
+    /// SCOPED to the T1 thread so the T>1 parallel workers (which never set it)
+    /// keep their faithful per-chunk ratio-informed reserve + pooling behavior.
+    static T1_RESIDENT_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that activates the T1 cache-residency scope for the current thread
+/// and restores the prior value on drop (panic-safe).
+pub struct T1ResidentScope {
+    prev: bool,
+}
+
+impl T1ResidentScope {
+    pub fn enter() -> Self {
+        let prev = T1_RESIDENT_SCOPE.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for T1ResidentScope {
+    fn drop(&mut self) {
+        T1_RESIDENT_SCOPE.with(|c| c.set(self.prev));
+    }
+}
+
+#[inline]
+fn t1_resident_scope_active() -> bool {
+    T1_RESIDENT_SCOPE.with(|c| c.get())
+}
+
 fn manual_buffer_pool_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var_os("GZIPPY_MANUAL_BUFFER_POOL").is_some() || resident_output_pool_enabled()
-    })
+    let env = *EN.get_or_init(|| {
+        std::env::var_os("GZIPPY_MANUAL_BUFFER_POOL").is_some() || env_resident_output_pool()
+    });
+    env || t1_resident_scope_active()
 }
 
 /// RESIDENT-OUTPUT-POOL ORACLE flag (`GZIPPY_RESIDENT_OUTPUT_POOL=1`, default OFF,
@@ -269,9 +306,13 @@ fn manual_buffer_pool_enabled() -> bool {
 /// their pages RESIDENT across chunks. Determination tool for the BEAT-IGZIP-T1
 /// question: can a resident, reused output buffer reach igzip's T1 fault profile while
 /// holding T>1 rapidgzip parity?
-pub fn resident_output_pool_enabled() -> bool {
+fn env_resident_output_pool() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| std::env::var_os("GZIPPY_RESIDENT_OUTPUT_POOL").is_some())
+}
+
+pub fn resident_output_pool_enabled() -> bool {
+    env_resident_output_pool() || t1_resident_scope_active()
 }
 
 /// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).

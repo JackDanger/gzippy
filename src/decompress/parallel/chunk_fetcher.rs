@@ -516,16 +516,6 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 /// rolling windows) and markers never fire — both verified by the caller's
 /// CRC/size check (Gate-0 non-inert + markers==0).
 #[cfg(parallel_sm)]
-/// Fixed capacity the T1 thin-serial driver pins its ONE recycled output buffer
-/// to (cache-residency lever (b)). Matches the `GZIPPY_RESIDENT_OUTPUT_POOL`
-/// oracle's `RESERVE_CAP` (chunk_decode::compute_initial_reserve) that the gated
-/// discrimination measured: a single resident buffer this size, reused across
-/// every chunk, drops minor-faults toward igzip (the per-chunk fresh ratio-sized
-/// alloc was the fault source). T1-ONLY: the parallel T>1 pipeline keeps its
-/// per-chunk ratio-informed reserve (one buffer per concurrent worker, not one).
-#[cfg(parallel_sm)]
-const T1_RESIDENT_OUTPUT_RESERVE: usize = 64 * 1024 * 1024;
-
 pub fn drive_thin_t1_oracle<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
@@ -533,6 +523,17 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     mut bytes_written_out: Option<&mut usize>,
 ) -> Result<(u32, usize), FetchError> {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+
+    // Cache-residency lever (b): activate the T1 resident-pool scope for THIS
+    // (single, serial) decode thread. While active, the chunk output buffer is
+    // taken from / returned to the manual per-thread pool AND its reserve is
+    // pinned to the fixed resident cap, so consecutive chunks decode into ONE
+    // resident buffer instead of a fresh ratio-sized alloc per chunk — the
+    // GATED `GZIPPY_RESIDENT_OUTPUT_POOL` mechanism (minor-faults drop toward
+    // igzip, monorepo wall 1.39→1.29 both arches; plans/T1-CACHE-RESIDENCY-RESULTS).
+    // SCOPED to this thread (RAII): the T>1 parallel workers never set it, so the
+    // faithful per-chunk reserve/pool path is unchanged at T>1.
+    let _resident = crate::decompress::parallel::chunk_buffer_pool::T1ResidentScope::enter();
 
     let total_bits = input.len() * 8;
     // Compressed-bytes-per-chunk stride from the chunk configuration (T1 default
@@ -549,24 +550,15 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     // start, so a zero dict is correct for chunk 0). All subsequent chunks get
     // the TRUE trailing 32 KiB, so they take the window-PRESENT clean path.
     let mut prev_tail = vec![0u8; MAX_WINDOW_SIZE];
-    // Cache-residency lever (b): ONE resident output buffer recycled across the
-    // serial loop. `decode_chunk_thin_t1` pins it to T1_RESIDENT_OUTPUT_RESERVE
-    // up front so a per-chunk size change never realloc's it; after each chunk's
-    // bytes are written we reclaim it (cleared, capacity retained) and feed it
-    // back in, so consecutive chunks decode into the SAME warm, faulted pages
-    // (GATED: minor-faults drop toward igzip — plans/T1-CACHE-RESIDENCY-RESULTS.md).
-    let mut recycled: Option<crate::decompress::parallel::segmented_buffer::SegmentedU8> = None;
     let mut cur = 0usize;
     while cur < total_bits {
         let stop_hint = (cur + stride_bits).min(total_bits);
-        let mut chunk = crate::decompress::parallel::chunk_decode::decode_chunk_thin_t1(
+        let chunk = crate::decompress::parallel::chunk_decode::decode_chunk(
             input,
             cur,
             stop_hint,
             &prev_tail,
             configuration,
-            recycled.take(),
-            T1_RESIDENT_OUTPUT_RESERVE,
         )
         .map_err(FetchError::Decode)?;
 
@@ -577,14 +569,12 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
             marker_chunks += 1;
         }
 
-        // Advance the rolling window from this chunk's decoded tail. The chunk's
-        // `data` carries the 32 KiB predecessor window as a non-output prefix, so
-        // its total length is always >= MAX_WINDOW_SIZE and the last 32 KiB of
-        // (prefix + output) is exactly the new rolling window — overwrite
-        // `prev_tail` IN PLACE (lever c: no per-chunk 32 KiB window-clone alloc).
+        // Advance the rolling window from this chunk's decoded tail.
         let data_len = chunk.data.len();
         if data_len >= MAX_WINDOW_SIZE {
-            chunk.data.copy_last_into(&mut prev_tail);
+            let mut t = vec![0u8; MAX_WINDOW_SIZE];
+            chunk.data.copy_last_into(&mut t);
+            prev_tail = t;
         } else {
             let mut nt = prev_tail.clone();
             let mut tail_bytes = vec![0u8; data_len];
@@ -610,15 +600,6 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
         }
-
-        // Lever (b): reclaim the resident output buffer for the next chunk.
-        // `take_data` moves the `SegmentedU8` out (leaving the chunk's footer /
-        // offset metadata intact for the loop-control checks below); `clear`
-        // retains its faulted-resident capacity so the next chunk decodes into
-        // the same warm pages instead of a fresh allocation.
-        let mut reclaimed = chunk.take_data();
-        reclaimed.clear();
-        recycled = Some(reclaimed);
 
         // Stop once the gzip footer (trailer) was reached: the deflate stream
         // is complete and the remaining bits are the 8-byte CRC/ISIZE trailer
@@ -4604,12 +4585,13 @@ mod tests {
         assert!(super::chunk_may_resolve_markers_early(&chunk, &window_map));
     }
 
-    /// Cache-residency levers (b)+(c): the recycled-resident-buffer + boundary-
-    /// shed thin-T1 driver must be byte-EXACT vs a flate2 reference across MANY
-    /// chunk sizes (so the recycle reclaim engages over multiple iterations) and
+    /// Cache-residency lever (b): the thin-T1 driver runs inside the resident-
+    /// pool scope (manual buffer pool + fixed resident reserve, scoped to the T1
+    /// thread). It must be byte-EXACT vs a flate2 reference across MANY chunk
+    /// sizes (so the pool take/return cycle engages over multiple iterations) and
     /// several payload shapes (compressible / back-ref-heavy / mixed). A
-    /// regression in the reclaim or the resident reserve would corrupt a
-    /// later-chunk window or write into stale pages — caught here.
+    /// regression in the pooled-buffer reuse or the resident reserve would
+    /// corrupt a later-chunk window or write into stale pages — caught here.
     #[test]
     fn thin_t1_recycled_byte_exact_multi_chunk_sizes() {
         use std::io::Read;
@@ -4644,7 +4626,7 @@ mod tests {
                     let mut bytes_written = 0usize;
                     let (_crc, n) =
                         drive_thin_t1_oracle(&deflate, &mut out, cfg, Some(&mut bytes_written))
-                            .expect("thin-T1 recycled drive");
+                            .expect("thin-T1 resident-pool drive");
                     assert_eq!(n, payload.len(), "size at {kib}KiB level{level}");
                     assert_eq!(bytes_written, payload.len(), "bytes_written at {kib}KiB");
                     assert_eq!(&out, payload, "bytes at {kib}KiB level{level}");
