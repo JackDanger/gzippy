@@ -164,6 +164,25 @@ fn run_prod(_file: &[u8]) -> (f64, usize) {
     panic!("prod mode requires pure_inflate_decode (build --features gzippy-native/isal)");
 }
 
+// Thread-parameterized prod for the T>1 load-bearing classification: same real
+// production path at an arbitrary thread count, decode-only timed, /dev/null sink.
+#[cfg(pure_inflate_decode)]
+fn run_prodt(file: &[u8], threads: usize) -> (f64, usize) {
+    let mut out = devnull();
+    let t = Instant::now();
+    let n = gzippy::decompress::parallel::single_member::decompress_parallel(
+        file, &mut out, None, threads,
+    )
+    .expect("prodt parallel-SM decode");
+    out.flush().expect("flush");
+    (t.elapsed().as_secs_f64() * 1e3, n as usize)
+}
+
+#[cfg(not(pure_inflate_decode))]
+fn run_prodt(_file: &[u8], _threads: usize) -> (f64, usize) {
+    panic!("prodt mode requires pure_inflate_decode (build --features gzippy-native/isal)");
+}
+
 // ───────────────────────────── competitors ────────────────────────────────
 
 fn run_libdeflate(file: &[u8]) -> (f64, usize) {
@@ -935,6 +954,14 @@ fn main() {
         "prod" => {
             let (ms, n) = run_prod(&file);
             println!("RESULT mode=prod ms={ms:.3} bytes={n}");
+        }
+        "prodt" => {
+            let threads = args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            let (ms, n) = run_prodt(&file, threads);
+            println!("RESULT mode=prodt threads={threads} ms={ms:.3} bytes={n}");
         }
         "libdeflate" => {
             let (ms, n) = run_libdeflate(&file);
