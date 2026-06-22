@@ -520,11 +520,15 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
     configuration: ChunkConfiguration,
+    mut bytes_written_out: Option<&mut usize>,
 ) -> Result<(u32, usize), FetchError> {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
     let total_bits = input.len() * 8;
-    const STRIDE_BITS: usize = 4 * 1024 * 1024 * 8; // ~4 MiB compressed per chunk
+    // Compressed-bytes-per-chunk stride from the chunk configuration (T1 default
+    // = 1 MiB target, warm output-buffer recycling; GZIPPY_CHUNK_KIB overrides).
+    // Clamp to ≥64 KiB so a pathological tiny config can't thrash the loop.
+    let stride_bits = configuration.split_chunk_size.max(64 * 1024) * 8;
 
     let mut total_crc = CRC32Calculator::new();
     let mut total_size = 0usize;
@@ -537,7 +541,7 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     let mut prev_tail = vec![0u8; MAX_WINDOW_SIZE];
     let mut cur = 0usize;
     while cur < total_bits {
-        let stop_hint = (cur + STRIDE_BITS).min(total_bits);
+        let stop_hint = (cur + stride_bits).min(total_bits);
         let chunk = crate::decompress::parallel::chunk_decode::decode_chunk(
             input,
             cur,
@@ -575,6 +579,13 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
             .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
         total_size += chunk.decoded_size();
+        // Track bytes streamed (for the multi-member-misroute resume net: a
+        // stream the classifier called single-member but whose 2nd member began
+        // past the detection window decodes member 1 here, then fails the
+        // trailer check; resume re-decodes members 2+ past this prefix).
+        if let Some(out) = bytes_written_out.as_deref_mut() {
+            *out = total_size;
+        }
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
         }
@@ -604,9 +615,22 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
         }
     }
 
-    eprintln!("THIN_T1_ORACLE out={total_size} bytes marker_chunks={marker_chunks} (clean serial, no parallel bulk)");
+    if std::env::var_os("GZIPPY_DEBUG").is_some() {
+        eprintln!(
+            "[parallel_sm] thin-T1 out={total_size} bytes marker_chunks={marker_chunks} \
+             stride={}KiB (clean serial, no parallel bulk)",
+            stride_bits / 8 / 1024
+        );
+    }
+    THIN_T1_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok((total_crc.crc32(), total_size))
 }
+
+/// Production-routing proof: incremented once per [`drive_thin_t1_oracle`] call
+/// (the thin single-chunk/T1 production path). A test snapshots it around a T1
+/// decode to assert the thin spine — not the parallel scaffold — handled it.
+#[cfg(parallel_sm)]
+pub static THIN_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn drive_impl<W: std::io::Write>(
     input: &[u8],

@@ -176,11 +176,22 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
     // whether the marker pipeline is the rapidgzip gap. CRC/size still verified
     // below, so the known-window path's correctness is checked too.
-    let drive_result = if std::env::var_os("GZIPPY_THIN_T1_ORACLE").is_some() {
-        // BEAT-IGZIP TASK 2: minimal clean serial thin-T1-driver removal-oracle.
-        // No parallel bulk; one serial rolling-window pass. CRC/size verified
-        // below (non-inert + correctness). See drive_thin_t1_oracle doc.
-        chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration)
+    // THIN-T1 PRODUCTION PATH (route-A scaffold shed). At T==1 the decode is
+    // strictly sequential front-to-back, so EVERY block already has its 32 KiB
+    // predecessor window — the parallel block-finder / WindowMap / marker arming
+    // / prefetch / threadpool scaffold is pure overhead. The thin serial rolling-
+    // window driver over the SAME shared `decode_chunk` kernel sheds it (route-A
+    // oracle: thin/libdeflate≈1.08 vs prod/libdeflate≈1.22 on this box). CRC32 +
+    // ISIZE are verified below exactly as for the parallel path, and bytes_written
+    // is captured so the multi-member-misroute resume net still works.
+    // `GZIPPY_NO_THIN_T1=1` forces the legacy parallel path at T1 (AB re-verify).
+    let force_thin_oracle = std::env::var_os("GZIPPY_THIN_T1_ORACLE").is_some();
+    let use_thin_t1 = (parallelization <= 1
+        && std::env::var_os("GZIPPY_NO_THIN_T1").is_none()
+        && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none())
+        || force_thin_oracle;
+    let drive_result = if use_thin_t1 {
+        chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration, bytes_written_out)
     } else if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
         chunk_fetcher::drive_clean_window_oracle(
             deflate_data,
