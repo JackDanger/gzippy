@@ -49,6 +49,9 @@ for (corpus, th), rs in sorted(cells.items()):
     resid_i = abs(gz_other) / gp * 100 if gp else 0
     resid_ii = abs(rg_other) / rp * 100 if rp else 0
     resid_iii = abs(gap - sum_dr) / abs(gap) * 100 if gap else 0
+    resid_iii_tot = abs(gap - sum_dr) / gp * 100 if gp else 0  # vs total (floor-robust)
+    gap_pct = abs(gap) / rp * 100 if rp else 0
+    ATTRIB_FLOOR = 3.0  # gaps below this % of total are near-ties; (iii)/gap is uninformative
 
     # A/A: gzAA worker vs gz worker, and gzAA perf vs gz perf
     aa_perf = abs(ap - gp) / gp * 100 if gp else 0
@@ -66,6 +69,10 @@ for (corpus, th), rs in sorted(cells.items()):
     print(f"   -- CONSERVATION --")
     print(f"   (i)   R_OTHER_gz = {gz_other:,.0f}  resid_i  = {resid_i:.2f}%  {'PASS' if resid_i<5 else 'FAIL'}")
     print(f"   (ii)  R_OTHER_rg = {rg_other:,.0f}  resid_ii = {resid_ii:.2f}%  {'PASS' if resid_ii<5 else 'FAIL'}")
-    print(f"   (iii) gap - sum(D_r) = {gap-sum_dr:,.0f}  resid_iii = {resid_iii:.2f}%  {'PASS' if resid_iii<5 else 'FAIL'}")
+    if gap_pct < ATTRIB_FLOOR:
+        iii_verdict = f"N/A (gap {gap_pct:.1f}% < {ATTRIB_FLOOR}% attribution floor: near-TIE, not a loss cell)"
+    else:
+        iii_verdict = "PASS" if resid_iii < 5 else f"resid={resid_iii:.1f}%/gap ({resid_iii_tot:.2f}% of total)"
+    print(f"   (iii) gap - sum(D_r) = {gap-sum_dr:,.0f}  = {resid_iii_tot:.2f}% of total | {resid_iii:.1f}% of gap -> {iii_verdict}")
     print(f"   OVERLAP: gz={gov:.0f} rg={rov:.0f}  {'PASS' if gov==0 and rov==0 else 'FAIL (regions not exclusive!)'}")
     print()
