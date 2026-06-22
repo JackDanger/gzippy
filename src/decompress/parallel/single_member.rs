@@ -317,6 +317,19 @@ pub fn decompress_parallel<W: Write>(
         if crate::decompress::parallel::chunk_data::rss_split_enabled() {
             crate::decompress::parallel::chunk_data::rss_split_report(result.total_size as u64);
         }
+        if crate::decompress::parallel::segmented_markers::free_markers_enabled() {
+            use crate::decompress::parallel::segmented_markers::{
+                MARKER_FREE_BYTES, MARKER_FREE_FIRED,
+            };
+            let bytes = MARKER_FREE_BYTES.load(Ordering::Relaxed);
+            let fired = MARKER_FREE_FIRED.load(Ordering::Relaxed);
+            eprintln!(
+                "[free_markers] MADV_DONTNEED freed={:.2}MiB chunks_fired={} (non_inert={})",
+                bytes as f64 / (1024.0 * 1024.0),
+                fired,
+                bytes > 0 && fired > 0,
+            );
+        }
         if debug_enabled() {
             let total = t0.elapsed();
             let mbps = result.total_size as f64 / total.as_secs_f64() / 1e6;

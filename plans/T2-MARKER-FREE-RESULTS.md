@@ -43,3 +43,61 @@ simultaneously live (bounded prefetch/recycle) — whereas gz caches all 5 at on
 (max_live==chunks). Therefore the realizable RSS win depends on whether the
 upper half can be released BEFORE peak; peak may be decode-bound (all chunks hit
 2× during decode before resolve). The fix below MEASURES this directly.
+
+### Cross-arch isolation replication (Gate-3) — instrument validated both arches
+macOS aarch64, silesia T2 (same SegmentedU16 data model, byte-exact sha==gzcat):
+```
+[rss_split] chunks=17 max_live_chunks=6 narrowed(u16 2x src)=66.86MiB \
+            clean(u8 1x)=135.29MiB sum=202.15MiB total_decoded=202.15MiB | GATE0 PASS
+```
+Conservation + non-inert PASS on both arches. **CORPUS DEPENDENCE:** silesia is
+only 33% markered (66.86 / 202 MiB) with 6/17 chunks live at peak, vs monorepo
+64% markered (31.0 / 48.6) with ALL 5 live. So the u16 2× share of RSS is
+corpus-dependent — dominant on monorepo, secondary on silesia. (CLAUDE.md
+corpus-breadth caveat: do not over-generalize from one corpus.)
+
+## FIX — MADV_DONTNEED post-narrow upper-half free (GZIPPY_FREE_MARKERS) → **FALSIFIED on throughput**
+
+Mechanism: after narrow + CRC + subchunk-window extraction read the low (narrowed)
+half, `release_narrowed_upper_pages()` MADV_DONTNEED's the page-aligned dead upper
+half of each marker segment (faithful to rg applyWindow @todo DecodedData.hpp:374-379;
+churn-free — no realloc/copy, the mission's preferred shrink/reuse). Gated behind
+GZIPPY_FREE_MARKERS (OFF by default — production unchanged). Non-inert: freed=29.79
+MiB, chunks_fired=4.
+
+RSS (load-immune, solvency AMD x86_64, monorepo T2, 3 runs each):
+| arm | peak RSS |
+|-----|----------|
+| OFF (baseline) | 99072/99328/99328 KiB = **96.9 MiB** |
+| ON  (DONTNEED) | 76976/77232/77744 KiB = **75.4 MiB** |
+
+→ **-21.5 MiB** toward rg's 59 (closes ~57% of the gap). Byte-exact: sha256==zcat.
+
+THROUGHPUT (interleaved best-of-9, /dev/null sink both arms, frozen
+gov=performance/boost=0, box restored after):
+| workload | ON/OFF | verdict |
+|----------|--------|---------|
+| monorepo T2 | 1.0112 | +1.1% regress |
+| silesia  T2 | 1.0285 | **+2.85% REGRESSION** (Δ13ms > intra-arm spread ~6ms) |
+| silesia  T4 | 1.0009 | tie |
+| silesia  T8 | 0.9969 | tie |
+
+MADV_DONTNEED forces per-call TLB shootdowns on the post-process worker; at T2
+(fewest workers) this is on the critical path. **MADV_FREE variant tested:** no
+throughput cost BUT does NOT drop peak max-RSS (lazy reclaim isn't reflected in
+getrusage max RSS — monorepo-T2 stayed 99 MiB) → fails the RSS goal. So DONTNEED
+is required for the metric, and its T2 throughput cost is intrinsic.
+
+### VERDICT vs pre-registered falsifier
+- byte-exact ✓ ; RSS drops materially toward rg ✓ ; **NO throughput regression ✗
+  (silesia-T2 +2.85%)** ⇒ **FIX FALSIFIED on the throughput gate.** Kept behind
+  GZIPPY_FREE_MARKERS as a measurement tool (OFF by default); NOT shipped.
+
+## NEXT FAITHFUL LEVER (identified by this measurement)
+rg keeps the 2× buffer in-flight too (source @todo) — its lower RSS comes from
+holding FEWER simultaneously-live chunks, not from freeing the 2×. gz holds the
+WHOLE small file live (monorepo max_live==chunks==5). The rg-faithful convergence
+is to BOUND the in-flight/cached chunk set (cache_capacity / prefetch depth —
+RSS-CONVERGE candidate #2/#3), which drops peak RSS WITHOUT per-chunk madvise
+throughput cost. That is the recommended next mission.
+
