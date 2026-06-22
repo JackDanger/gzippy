@@ -181,7 +181,20 @@ impl<
     }
 
     /// Mirror of `decode` (header:101-116).
-    #[inline]
+    ///
+    /// MARKER-KERNEL Lever 1 (perf/marker-kernel codegen): forced
+    /// `#[inline(always)]` — the plain `#[inline]` hint was DECLINED by LLVM, so
+    /// the marker-path distance decode (`decode_careful_tail` dist site,
+    /// marker_inflate.rs:2825, + the fast-loop kill-switch arm) emitted a
+    /// per-symbol `call HuffmanCodingShortBitsCached::decode` (perf-annotate
+    /// 6.2% of the marker bucket on Zen2 T4) with call/spill/return overhead that
+    /// rg's `Block::read` does not pay (rg inlines its decode, vendor
+    /// gzip/deflate.hpp:336/1580-1590). The hot body here (peek + LUT lookup +
+    /// seek_after_peek) is small; the cold `decode_long` / `base.decode` paths
+    /// stay out-of-line as separate symbols. Byte-exact: codegen-only, no logic
+    /// change. Mirrors the existing `emit_backref_ring` `#[inline(always)]`
+    /// precedent (marker_inflate.rs:4514-4521).
+    #[inline(always)]
     pub fn decode<R: LsbBitReader>(&self, bit_reader: &mut R) -> Option<u16> {
         let value = match bit_reader.peek(self.lut_bits_count) {
             Ok(v) => v as usize,
