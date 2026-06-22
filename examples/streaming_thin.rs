@@ -393,6 +393,155 @@ fn run_igzipbare(_file: &[u8], _batch: usize) -> (f64, usize) {
     panic!("igzipbare mode requires gzippy-isal (pure_inflate_decode + isal-compression)");
 }
 
+// ──────── CHEAP-HEADER bare kernel (clean-scaffold sizing, 2026-06-21) ────────
+//
+// IDENTICAL to `igzip_bare` (same gz contig driver, same memmove-retain window,
+// same per-batch flush, same igzip `_04`/`_base` body kernel) EXCEPT the per-block
+// HEADER read calls the lean `gzippy_read_header_export` (= file-local static
+// `read_header`, the SAME function igzip's monolith calls inline) instead of
+// re-entering the full stateful `isal_inflate` with avail_out=0 + the
+// END_OF_BLOCK_HEADER stopping point.
+//
+// WHY: `igzip_bare`'s per-block `isal_inflate(stop=header)` pays outer dispatch +
+// tmp_out setup + read-buffer save/restore EVERY block — overhead the igzip
+// monolith does NOT (it reads headers inline). That artifact CONTAMINATES the
+// `igzipbare - igzip` residual (only an UPPER bound on scaffold). This variant
+// removes it, so `igzipbarecheap - igzip` is a CLEAN gz-contig-driver-vs-monolith
+// scaffold (still gz-favorable: gz arms skip CRC, igzip computes it). The removed
+// artifact is then directly measurable as `igzipbare - igzipbarecheap` > A/A
+// spread (the NON-INERT proof the header overhead was real and is gone).
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn igzip_bare_cheap<S: FnMut(&[u8])>(file_bytes: &[u8], batch: usize, mut sink: S) -> usize {
+    use gzippy::decompress::parallel::gzip_format::read_header as gz_read_header;
+    use isal::isal_sys::igzip_lib as isal;
+
+    extern "C" {
+        fn gzippy_read_header_export(state: *mut isal::inflate_state) -> i32;
+        fn decode_huffman_code_block_stateless_04(
+            state: *mut isal::inflate_state,
+            start_out: *mut u8,
+        );
+        fn decode_huffman_code_block_stateless_base(
+            state: *mut isal::inflate_state,
+            start_out: *mut u8,
+        );
+    }
+
+    let (_h, hdr) = gz_read_header(file_bytes).expect("gzip header");
+    let mut input: Vec<u8> = file_bytes[hdr..].to_vec();
+    input.extend_from_slice(&[0u8; 64]);
+
+    const MAXBLK: usize = 8 * 1024 * 1024;
+    let cap = WINDOW + batch + MAXBLK + SLOP;
+    let mut buf = vec![0u8; cap];
+    let base = buf.as_mut_ptr();
+
+    let mut state: Box<isal::inflate_state> = Box::new(unsafe { std::mem::zeroed() });
+    unsafe { isal::isal_inflate_init(&mut *state) };
+    state.crc_flag = 0;
+    state.hist_bits = 0;
+    state.next_in = input.as_ptr() as *mut u8;
+    state.avail_in = input.len() as u32;
+    state.read_in = 0;
+    state.read_in_length = 0;
+    state.block_state = isal::isal_block_state_ISAL_BLOCK_NEW_HDR;
+
+    let coded = isal::isal_block_state_ISAL_BLOCK_CODED;
+    let type0 = isal::isal_block_state_ISAL_BLOCK_TYPE0;
+
+    let mut pos: usize = 0;
+    let mut window_len: usize = 0;
+    let mut total: usize = 0;
+    let flush_hi = WINDOW + batch;
+
+    loop {
+        if pos >= flush_hi {
+            sink(&buf[window_len..pos]);
+            total += pos - window_len;
+            buf.copy_within(pos - WINDOW..pos, 0);
+            pos = WINDOW;
+            window_len = WINDOW;
+        }
+
+        // LEAN inline header read (no isal_inflate re-entry). read_header sets
+        // block_state=CODED (setup_{static,dynamic}_header) or =TYPE0 (stored),
+        // advances the bit reader to the block body, and records bfinal/btype.
+        let ret = unsafe { gzippy_read_header_export(&mut *state as *mut _) };
+        assert_eq!(
+            ret, 0,
+            "igzipbarecheap: read_header ret={ret} (ISAL_END_INPUT?)"
+        );
+        let bfinal = state.bfinal;
+
+        if state.block_state == coded {
+            let out_ptr = unsafe { base.add(pos) };
+            state.next_out = out_ptr;
+            state.avail_out = (cap - pos) as u32;
+            unsafe {
+                decode_huffman_code_block_stateless_04(&mut *state as *mut _, base);
+                if state.block_state == coded {
+                    decode_huffman_code_block_stateless_base(&mut *state as *mut _, base);
+                }
+            }
+            assert!(
+                state.block_state != coded,
+                "igzipbarecheap: block output exceeded MAXBLK headroom (raise MAXBLK)"
+            );
+            let produced = (state.next_out as usize) - (out_ptr as usize);
+            pos += produced;
+        } else if state.block_state == type0 {
+            let len = unsafe { state.__bindgen_anon_1.type0_block_len } as usize;
+            let consumed = (state.next_in as usize) - (input.as_ptr() as usize);
+            let buffered = (state.read_in_length / 8) as usize;
+            let data_off = consumed - buffered;
+            unsafe {
+                std::ptr::copy_nonoverlapping(input.as_ptr().add(data_off), base.add(pos), len);
+            }
+            pos += len;
+            let after = data_off + len;
+            state.next_in = unsafe { input.as_ptr().add(after) as *mut u8 };
+            state.avail_in = (input.len() - after) as u32;
+            state.read_in = 0;
+            state.read_in_length = 0;
+            state.block_state = if bfinal == 1 {
+                isal::isal_block_state_ISAL_BLOCK_INPUT_DONE
+            } else {
+                isal::isal_block_state_ISAL_BLOCK_NEW_HDR
+            };
+        } else {
+            panic!(
+                "igzipbarecheap: unexpected block_state {} after header read",
+                state.block_state
+            );
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+    if pos > window_len {
+        sink(&buf[window_len..pos]);
+        total += pos - window_len;
+    }
+    total
+}
+
+#[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
+fn run_igzipbarecheap(file: &[u8], batch: usize) -> (f64, usize) {
+    let mut out = devnull();
+    let t = Instant::now();
+    let n = igzip_bare_cheap(file, batch, |slice| {
+        out.write_all(slice).expect("sink write");
+    });
+    out.flush().expect("flush");
+    (t.elapsed().as_secs_f64() * 1e3, n)
+}
+
+#[cfg(not(all(pure_inflate_decode, feature = "isal-compression")))]
+fn run_igzipbarecheap(_file: &[u8], _batch: usize) -> (f64, usize) {
+    panic!("igzipbarecheap mode requires gzippy-isal (pure_inflate_decode + isal-compression)");
+}
+
 // ───────────────────────────── correctness gate ────────────────────────────
 
 /// Dependency-free 64-bit FNV-1a fingerprint (compact log lines only).
@@ -486,6 +635,18 @@ fn verify(file: &[u8]) {
             );
             assert!(v == ld, "igzipbare batch={batch}: BYTE MISMATCH");
             println!("igzipbare batch={batch:>8} byte-exact OK");
+
+            let mut vc = Vec::new();
+            igzip_bare_cheap(file, batch, |slice| vc.extend_from_slice(slice));
+            assert_eq!(
+                vc.len(),
+                ld.len(),
+                "igzipbarecheap batch={batch}: length mismatch ({} vs {})",
+                vc.len(),
+                ld.len()
+            );
+            assert!(vc == ld, "igzipbarecheap batch={batch}: BYTE MISMATCH");
+            println!("igzipbarecheap batch={batch:>8} byte-exact OK");
         }
     } else {
         println!("igzipbare: SKIPPED verify (GZIPPY_SKIP_IGZIPBARE set)");
@@ -536,7 +697,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "usage: streaming_thin <verify|gzippy|prod|libdeflate|zlibng|igzip> <file.gz> [batch_bytes]"
+            "usage: streaming_thin <verify|gzippy|prod|libdeflate|zlibng|igzip|igzipbare|igzipbarecheap> <file.gz> [batch_bytes]"
         );
         std::process::exit(2);
     }
@@ -577,6 +738,14 @@ fn main() {
                 .unwrap_or(DEFAULT_BATCH);
             let (ms, n) = run_igzipbare(&file, batch);
             println!("RESULT mode=igzipbare batch={batch} ms={ms:.3} bytes={n}");
+        }
+        "igzipbarecheap" => {
+            let batch = args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_BATCH);
+            let (ms, n) = run_igzipbarecheap(&file, batch);
+            println!("RESULT mode=igzipbarecheap batch={batch} ms={ms:.3} bytes={n}");
         }
         other => {
             eprintln!("unknown mode: {other}");
