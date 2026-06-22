@@ -1787,7 +1787,13 @@ impl Block {
     fn lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
         #[cfg(pure_inflate_decode)]
         {
-            let d = self.asm.lut_litlen.decode(bits);
+            // WINDOW-ABSENT CONVERGE (Lever A): every caller (`decode_careful_tail`
+            // and the `decode_clean_into_contig` Rust-fallback careful loop) calls
+            // this IMMEDIATELY after a `bits.refill()`, so the `available() < 32`
+            // backstop inside `decode` is provably dead (lut_huffman.rs:1088-1101).
+            // Use `decode_prefilled` to drop the per-symbol load+branch — byte-exact,
+            // matching the clean asm path's litlen decode.
+            let d = self.asm.lut_litlen.decode_prefilled(bits);
             (d.symbol, d.sym_count, d.bit_count)
         }
         #[cfg(not(any(
@@ -2160,7 +2166,13 @@ impl Block {
         // `&mut self` sparsity call, so it cannot be hoisted across the loop).
         let in_end = bits.data.len();
         bits.refill();
-        let mut pre = self.asm.lut_litlen.decode(bits);
+        // WINDOW-ABSENT CONVERGE (Lever A): backstop-free `decode_prefilled`,
+        // matching the clean asm path's litlen decode (chunk_decode contig path
+        // / `decode_prefilled` at the run_contig preload). This site sits
+        // IMMEDIATELY after the `bits.refill()` above, so the `available() < 32`
+        // backstop inside `decode` is a no-op (lut_huffman.rs:1088-1101 proof) —
+        // byte-exact, drops the per-symbol load+branch from the marker hot loop.
+        let mut pre = self.asm.lut_litlen.decode_prefilled(bits);
         // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
         // above (dist-table amortization + initial preload) which is amortized
         // per block and is negligible vs the loop body in aggregate.
@@ -2411,7 +2423,10 @@ impl Block {
                 lb,
                 self.dist_hc.decode(&mut lb),
                 {
-                    pre = self.asm.lut_litlen.decode(&mut lb);
+                    // WINDOW-ABSENT CONVERGE (Lever A): the bottom-of-loop
+                    // `$cur.refill()` runs immediately before this decode, so the
+                    // backstop is dead — use `decode_prefilled` like the clean path.
+                    pre = self.asm.lut_litlen.decode_prefilled(&lb);
                 },
                 {
                     bits.pos = lb.pos;
@@ -2431,7 +2446,9 @@ impl Block {
                 bits,
                 self.dist_hc.decode(bits),
                 {
-                    pre = self.asm.lut_litlen.decode(bits);
+                    // WINDOW-ABSENT CONVERGE (Lever A): post-`$cur.refill()` site
+                    // — backstop-free decode (kill-switch struct-field arm).
+                    pre = self.asm.lut_litlen.decode_prefilled(bits);
                 },
                 {}
             );
