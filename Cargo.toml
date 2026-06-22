@@ -47,6 +47,12 @@ path = "src/main.rs"
 # is a separate cleanup). Make the default `pure-rust-inflate` once that debt is
 # cleared.
 default = []
+# Route-B aarch64 sub-region wall-slope injector (consume_first_decode.rs).
+# OFF by default => production hot loop is byte- AND instruction-identical
+# (inject_env folds to const 0, inject_work is an empty inline fn => fully
+# elided). Measurement runs build `--features pure-rust-inflate,inject-probe`
+# and drive via GZIPPY_INJ_LIT / GZIPPY_INJ_COPY / GZIPPY_INJ_REFILL.
+inject-probe = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation

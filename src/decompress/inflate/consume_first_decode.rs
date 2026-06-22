@@ -1162,6 +1162,55 @@ pub static FLAT_CAREFUL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// PROVING the double table-build is gone from the clean path.
 pub static CLEAN_LUT_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ── AARCH64 ROUTE-B SUB-REGION WALL-SLOPE INJECTOR (Gate-2, byte-transparent) ──
+// Splices a KNOWN amount of dependent-latency dummy work into one of the three
+// emission sub-regions of `decode_huffman_fastloop_bounded` (literal-store /
+// match-copy / refill). Env-gated; OFF (==0) on every production run, so the
+// normal path is byte-identical and instruction-identical when unset. With a
+// region's knob set, a PROPORTIONAL production-wall slope ⇒ that region is on the
+// T1 critical path; FLAT ⇒ slack. `INJECT_FIRED` proves non-inert even when the
+// wall is flat. The work is a dependent LCG chain through `black_box` (cannot be
+// hoisted/elided, does not touch output → byte-exact). NO GP register is pinned
+// across the loop (the counts are read ONCE into locals at fn entry).
+pub static INJECT_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When the `inject-probe` feature is OFF this folds to a const `0` at every call
+/// site, so the per-region counts (`inj_lit`/`inj_copy`/`inj_refill`) are compile-
+/// time 0 and `inject_work(0)` is an empty inline fn — the production hot loop is
+/// byte- AND instruction-identical to a build without the injector.
+#[cfg(feature = "inject-probe")]
+fn inject_env(name: &str) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+#[cfg(not(feature = "inject-probe"))]
+#[inline(always)]
+fn inject_env(_name: &str) -> u32 {
+    0
+}
+
+#[cfg(feature = "inject-probe")]
+#[inline(always)]
+fn inject_work(n: u32) {
+    if n == 0 {
+        return;
+    }
+    INJECT_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut x = std::hint::black_box(0x9E37_79B9_7F4A_7C15u64);
+    for _ in 0..n {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        x = std::hint::black_box(x);
+    }
+    std::hint::black_box(x);
+}
+#[cfg(not(feature = "inject-probe"))]
+#[inline(always)]
+fn inject_work(_n: u32) {}
+
 /// Outcome of one bounded flat-CLEAN careful-tail call.
 pub enum FlatCarefulExit {
     /// Reached HUFFDEC_END_OF_BLOCK; `out_pos` is the byte just past EOB.
@@ -1320,6 +1369,10 @@ pub(crate) fn decode_huffman_fastloop_bounded(
     let in_ptr = in_data.as_ptr();
     let in_fastloop_end = in_data.len().saturating_sub(32);
 
+    // ROUTE-B sub-region injector counts (read ONCE; 0 ⇒ byte+instr-identical).
+    let inj_lit = inject_env("GZIPPY_INJ_LIT");
+    let inj_copy = inject_env("GZIPPY_INJ_COPY");
+    let inj_refill = inject_env("GZIPPY_INJ_REFILL");
     macro_rules! refill_branchless_fast {
         () => {
             unsafe {
@@ -1330,6 +1383,7 @@ pub(crate) fn decode_huffman_fastloop_bounded(
                 in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
                 bitsleft = (bits_u8 as u32) | 56;
             }
+            inject_work(inj_refill);
         };
     }
     macro_rules! lookup {
@@ -1384,6 +1438,7 @@ pub(crate) fn decode_huffman_fastloop_bounded(
         let saved_bitbuf = consume!(entry);
 
         if (entry as i32) < 0 {
+            inject_work(inj_lit);
             let lit1 = (entry >> 16) as u8;
             entry = lookup!();
             if (entry as i32) < 0 {
@@ -1555,6 +1610,7 @@ pub(crate) fn decode_huffman_fastloop_bounded(
             refill_branchless_fast!();
             entry = lookup!();
             out_pos = copy_match_fast(output, out_pos, distance, length);
+            inject_work(inj_copy);
             continue;
         }
 
@@ -1584,6 +1640,7 @@ pub(crate) fn decode_huffman_fastloop_bounded(
         refill_branchless_fast!();
         entry = lookup!();
         out_pos = copy_match_fast(output, out_pos, distance, length);
+        inject_work(inj_copy);
     }
 
     // Budget/input-margin exit at a clean symbol boundary: the preloaded `entry`
