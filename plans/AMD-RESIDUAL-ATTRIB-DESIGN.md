@@ -109,3 +109,26 @@ ADOPTED:
 STAGED EXECUTION (bank each): S0 re-confirm premise (perf total cyc gz-vs-rg, existing
 binaries) → S1 gz exclusive-TSC region partition → S2 rg symmetric patch → S3 absolute-delta
 verdict. perf-cycles total for S0 is sound (same metric both arms).
+
+---
+## S2/S3 EXTENSION — full 3-identity conservation tool (2026-06-22)
+Closes identities (ii) sum(rg regions)==rg_total and (iii) gap==sum(gz_r - rg_r) by
+adding a SYMMETRIC rg partition matched to gz's GZIPPY_REGION_PROF:
+  WORKER (rg decodeBlock) / MARKERPP (rg applyWindow) / OUTPUT (rg writeAll) / OTHER=perf-sum.
+ONE rg namespace `rapidgzip_region_prof` (in ChunkData.hpp, visible to all 3 sites),
+shared per-thread depth -> OVERLAP_VIOLATIONS. Gated RAPIDGZIP_REGION_PROF=1, OFF==identity.
+gz gets a matching OVERLAP_VIOLATIONS counter across all 3 regions.
+
+### CURSOR-AGENT REVIEW (2026-06-22, s2s3) + ADOPTED
+Risks raised: (1) region cancellation can still fake a small OTHER -> ADOPTED an
+OVERLAP-violation counter (mutual-exclusion invariant) in BOTH binaries; fail if !=0.
+(2) R_OUTPUT not perfectly symmetric (gz includes crc-combine; rg writeAll write-only) ->
+ACCEPTED: gz R_OUTPUT is ~0.03% so the crc-combine asymmetry lands in OTHER and is
+immaterial; documented. (3) GZIPPY_OVERLAP_WRITER must be unset -> harness unsets it
+(and OverlapWriter is dead code at HEAD: cargo says spawn/submit never used). (4) TSC-wall
+vs perf on-CPU mismatch -> harness warms page cache + reports context-switches/cpu-migrations
+as scheduler gates; frozen box. (5) writeAll@618 is THE payload write (fwrite@206 is index,
+disabled). (6) (iii) is a consistency restatement when both OTHER~0 -> treated as secondary;
+the per-region delta table is the primary explanation, (i)/(ii) the primary proof.
+Q-answers: decodeBlock IS structurally exclusive of applyWindow (different stages); overlap
+counter proves it at runtime.

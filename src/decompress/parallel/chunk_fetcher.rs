@@ -2941,6 +2941,9 @@ fn run_decode_task(
     let _worker_t0 = crate::decompress::parallel::region_prof::rdtsc(
         crate::decompress::parallel::region_prof::enabled(),
     );
+    if crate::decompress::parallel::region_prof::enabled() {
+        crate::decompress::parallel::region_prof::region_enter();
+    }
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_with_until_exact(
             input_bytes,
@@ -2991,6 +2994,7 @@ fn run_decode_task(
     };
     if crate::decompress::parallel::region_prof::enabled() {
         use std::sync::atomic::Ordering;
+        crate::decompress::parallel::region_prof::region_exit();
         let dt = crate::decompress::parallel::region_prof::rdtsc(true).wrapping_sub(_worker_t0);
         crate::decompress::parallel::region_prof::R_WORKER_CYC.fetch_add(dt, Ordering::Relaxed);
         crate::decompress::parallel::region_prof::R_WORKER_N.fetch_add(1, Ordering::Relaxed);
