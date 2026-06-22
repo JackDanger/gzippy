@@ -1703,6 +1703,20 @@ impl ChunkData {
         self.data.append_payload_iovecs(self.data_prefix_len, out);
     }
 
+    /// Move the decoded `data` buffer OUT of this chunk, leaving an empty
+    /// `SegmentedU8` behind. Used by the T1 thin serial driver to RECYCLE one
+    /// resident output buffer across chunks (cache-residency lever): the caller
+    /// `clear()`s the returned buffer (retains its faulted-resident capacity)
+    /// and feeds it into the next chunk via [`Self::new_with_buffers`], so
+    /// consecutive chunks decode into the SAME warm pages instead of a fresh
+    /// allocation. Because the buffer is taken out before `Drop`, the `Drop`
+    /// recycle path sees an empty `data` and returns nothing — the caller owns
+    /// the lifecycle. Byte-transparent: only the allocation is reused.
+    #[cfg(parallel_sm)]
+    pub(crate) fn take_data(&mut self) -> SegmentedU8 {
+        std::mem::take(&mut self.data)
+    }
+
     /// Return decoded payload buffers to the per-worker pool immediately
     /// after the consumer has finished writing them (vendor FasterVector
     /// auto-recycle on `writeAll` completion). Idempotent — safe to call
