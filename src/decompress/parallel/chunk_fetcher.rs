@@ -2526,27 +2526,14 @@ fn decode_chunk_with_until_exact(
     until_exact: bool,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    // AMD-residual R_WORKER region: the whole per-chunk decode CALL (huffman decode
-    // + commit + clean-CRC + ring) at the production pool-submitted chokepoint.
-    let r = crate::decompress::parallel::region_prof::measure_worker(0, || {
-        crate::decompress::parallel::chunk_decode::decode_chunk_until_exact(
-            input,
-            encoded_offset_bits,
-            stop_hint_bits,
-            initial_window,
-            configuration,
-            until_exact,
-        )
-    });
-    if crate::decompress::parallel::region_prof::enabled() {
-        if let Ok(ref c) = r {
-            crate::decompress::parallel::region_prof::R_WORKER_BYTES.fetch_add(
-                c.decoded_size() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-    }
-    r
+    crate::decompress::parallel::chunk_decode::decode_chunk_until_exact(
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+        configuration,
+        until_exact,
+    )
 }
 
 /// Submit a decode task to the `ThreadPool`, returning the
@@ -2948,6 +2935,12 @@ fn run_decode_task(
         "t",
     );
 
+    // AMD-residual R_WORKER region: wraps the WHOLE per-chunk decode dispatch (all 4
+    // branches incl. window-absent speculative) so every chunk (on-demand + prefetched)
+    // is counted. ONE rdtsc pair per chunk on this worker thread.
+    let _worker_t0 = crate::decompress::parallel::region_prof::rdtsc(
+        crate::decompress::parallel::region_prof::enabled(),
+    );
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_with_until_exact(
             input_bytes,
@@ -2996,6 +2989,16 @@ fn run_decode_task(
             window_map,
         )
     };
+    if crate::decompress::parallel::region_prof::enabled() {
+        use std::sync::atomic::Ordering;
+        let dt = crate::decompress::parallel::region_prof::rdtsc(true).wrapping_sub(_worker_t0);
+        crate::decompress::parallel::region_prof::R_WORKER_CYC.fetch_add(dt, Ordering::Relaxed);
+        crate::decompress::parallel::region_prof::R_WORKER_N.fetch_add(1, Ordering::Relaxed);
+        if let Ok(ref c) = chunk_result {
+            crate::decompress::parallel::region_prof::R_WORKER_BYTES
+                .fetch_add(c.decoded_size() as u64, Ordering::Relaxed);
+        }
+    }
 
     // DECODE-BYPASS capture (campaign instrument, GZIPPY_BYPASS_CAPTURE).
     // Record this decode result keyed by (start_bit, stop_hint_bit) so a
