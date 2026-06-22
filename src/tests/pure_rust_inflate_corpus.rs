@@ -315,6 +315,67 @@ mod tests {
         assert_pure_rust_parallel_sm_roundtrips(&compressed, "large_dynamic_heavy");
     }
 
+    /// ROUTE-A THIN-T1 PRODUCTION PATH differential (Task 2). At T==1 the
+    /// production single-member path sheds the parallel scaffold and uses the
+    /// thin serial rolling-window driver (`drive_thin_t1_oracle`, the SAME shared
+    /// `decode_chunk` kernel). This asserts (a) the thin spine actually RAN
+    /// (THIN_T1_RUNS fired — not the parallel scaffold), and (b) byte-exactness
+    /// vs BOTH flate2 and libdeflate on a multi-block corpus spanning several
+    /// 1 MiB chunk strides, incl. the in-driver CRC32 + ISIZE verification (a
+    /// mismatch surfaces as Err here). Ships in the SAME commit as the routing
+    /// change per the real-corpus-test rule.
+    #[cfg(all(parallel_sm, not(feature = "isal-compression")))]
+    #[test]
+    fn thin_t1_production_path_byte_exact_and_routed() {
+        use std::sync::atomic::Ordering;
+
+        // ~6 MiB raw mixed data → multiple dynamic blocks; at L6 it compresses
+        // to a few MiB, spanning several 1 MiB compressed chunk strides so the
+        // rolling-window handoff between chunks is exercised.
+        let payload = make_mixed_data(6 * 1024 * 1024);
+        let compressed = gz_at(&payload, 6);
+
+        // flate2 + libdeflate oracles must agree before trusting either.
+        let oracle: Vec<u8> = {
+            let mut d = flate2::read::MultiGzDecoder::new(&compressed[..]);
+            let mut out = Vec::new();
+            d.read_to_end(&mut out).expect("flate2 oracle");
+            out
+        };
+        {
+            let mut out = vec![0u8; oracle.len()];
+            let mut dec = crate::backends::libdeflate::DecompressorEx::new();
+            let r = dec
+                .gzip_decompress_ex(&compressed, &mut out)
+                .expect("libdeflate oracle");
+            out.truncate(r.output_size);
+            assert_eq!(out, oracle, "oracle disagreement (flate2 vs libdeflate)");
+        }
+
+        let before =
+            crate::decompress::parallel::chunk_fetcher::THIN_T1_RUNS.load(Ordering::Relaxed);
+        let mut got = Vec::with_capacity(oracle.len());
+        // Direct T=1 production decode (the thin spine). CRC32 + ISIZE are
+        // verified inside the driver; a mismatch returns Err here.
+        crate::decompress::parallel::single_member::decompress_parallel(
+            &compressed,
+            &mut got,
+            None,
+            1,
+        )
+        .expect("thin-T1 decode");
+        let after =
+            crate::decompress::parallel::chunk_fetcher::THIN_T1_RUNS.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "thin-T1 spine did not run (THIN_T1_RUNS {before} -> {after}); routing fell through \
+             to the parallel scaffold at T=1"
+        );
+        assert_eq!(got.len(), oracle.len(), "thin-T1 length mismatch");
+        assert_eq!(got, oracle, "thin-T1 byte mismatch vs flate2/libdeflate");
+    }
+
     /// Real silesia corpus, if present. The production target — failure
     /// here is the most authoritative signal because every other test
     /// uses synthetic data.
