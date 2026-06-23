@@ -3026,6 +3026,11 @@ fn run_decode_task(
             window_map,
         )
     };
+    // RING/FOLD-DRAIN perturbation (GZIPPY_RING_INJECT_NS, Gate-2). Fires INSIDE
+    // the R_WORKER rdtsc window but OUTSIDE the Block-method R_TABLE/R_DECODE
+    // spans, so the injected per-chunk work lands in `ring_other` — the residual
+    // fulcrum F-9c5ca01d020d flagged. OFF (unset) ⇒ a single hoistable branch.
+    crate::decompress::parallel::slow_knob::ring_inject();
     if crate::decompress::parallel::region_prof::enabled() {
         use std::sync::atomic::Ordering;
         crate::decompress::parallel::region_prof::region_exit();

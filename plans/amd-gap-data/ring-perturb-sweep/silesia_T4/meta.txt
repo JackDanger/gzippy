@@ -1,0 +1,7 @@
+region=ring_other(worker_residual)
+region_self_ms=130.914
+perturb_cmd=GZIPPY_RING_INJECT_NS spin/sleep + GZIPPY_FOLD_NODRAIN oracle (ring_other residual; does NOT isolate the fold-drain copy)
+sha_ok=1
+cell_id=silesia_T4
+freeze_state=frozen
+quiet_state=quiet
