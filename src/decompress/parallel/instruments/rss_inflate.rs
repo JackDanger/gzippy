@@ -58,16 +58,24 @@ pub fn engage() {
     // Allocate and first-touch one byte per 4 KiB page to force residency.
     let mut buf: Vec<u8> = vec![0u8; bytes];
     const PAGE: usize = 4096;
+    let ptr = buf.as_mut_ptr();
     let mut xor: u8 = 0;
     let mut i = 0usize;
     while i < bytes {
-        // Write a non-trivial value derived from the index so the store cannot
-        // be folded to a constant memset the allocator might lazy-zero.
-        let v = (i as u8) ^ 0xA5;
-        buf[i] = v;
-        xor ^= v;
+        // VOLATILE write + read-back: `buf` is leaked and never read, so plain
+        // `buf[i] = v` stores are DEAD and the compiler elides them — the pages
+        // then never fault in and RSS does not rise (caught by Gate-0: the first
+        // cut measured +0 MiB). Volatile write cannot be elided; the volatile
+        // read-back feeds `xor` so residency is observable (non-inert proof) and
+        // varies per page (page index), so `xor` is a real fingerprint not 0.
+        let v = ((i >> 12) as u8).wrapping_mul(31) ^ 0xA5;
+        unsafe {
+            std::ptr::write_volatile(ptr.add(i), v);
+            xor ^= std::ptr::read_volatile(ptr.add(i));
+        }
         i += PAGE;
     }
+    std::hint::black_box(ptr);
     eprintln!(
         "\n████ RSS-INFLATE ACTIVE — pinned {mib} MiB resident ({bytes} B), \
          touched_xor=0x{xor:02x} ████\n\
