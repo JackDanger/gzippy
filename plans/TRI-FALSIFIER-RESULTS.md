@@ -90,6 +90,24 @@ not a competitive deficit. FINDING-DECAY: the 2026-06-16 two-binary matrix's
 kernel wins (matrix @pre-wins; AMD findings @8cad4f6b/39acc213, before f5f827b6).
 The kernel wins appear to have CLOSED the T≥2-vs-rg gap.
 
+## RESULT 5 — CROSS-ARCH CONFIRMED: gz beats rapidgzip+pigz at T≥2 on AMD too (@HEAD)
+AMD/Zen2 EPYC 7282 (solvency), gz-native @eea9e445 built on box, rapidgzip 0.16.0
+(venv), interleaved N=11, /dev/null, cores 24-31 (load-robust ratio; box under
+llama load so spreads high but the paired ratio + direction are decisive). silesia
+corpus byte-identical to Intel (decode sha 028bd002…).
+
+| cell | gz ms | rg ms | pigz ms | gz/rg | gz/pigz | verdict |
+|------|-------|-------|---------|-------|---------|---------|
+| T2 monorepo | 131.0 | 154.6 | 150.4 | **0.848** | 0.871 | gz beats rg +18% |
+| T4 silesia  | 243.8 | 260.1 | 767.0 | **0.937** | 0.318 | gz beats rg +7% |
+| T8 silesia  | 184.6 | 214.1 | 736.7 | **0.863** | 0.251 | gz beats rg +16% |
+
+**gz BEATS rapidgzip AND pigz at EVERY T≥2 cell on BOTH Intel and AMD at HEAD.**
+The AMD ~3-6% rg loss ([[project_amd_t2_phase_and_t4_floor_2026_06_22]],
+@pre-kernel-wins) is GONE — B2/B3/RANK-2 closed it on both arches. The T≥2-vs-rg
+GOAL IS MET CROSS-ARCH. (AMD load-noisy ⇒ a frozen+llama-paused reconfirm would
+tighten the exact ratio for LAW, but the direction is robust across all 3 cells.)
+
 ## VERDICT / NEXT (REVISED after RESULT 4)
 - **On Intel, T≥2-vs-rg+pigz is WON** — no decode port needed; the marker-port
   front is MOOT here. Do NOT build the A1 marker oracle for an Intel gz-vs-rg gap
