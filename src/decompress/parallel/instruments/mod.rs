@@ -37,6 +37,7 @@ pub mod stall_residency;
 pub mod contig_prof;
 pub mod perfect_overlap;
 pub mod removal_oracle;
+pub mod rss_inflate;
 pub mod slow_knob;
 pub mod trace_jsonl;
 pub mod trace_timeline;

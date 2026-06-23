@@ -122,5 +122,5 @@ pub use instruments::{contig_prof, slow_knob};
 #[cfg(parallel_sm)]
 pub use instruments::{
     decode_bypass, memlife, perfect_overlap, phase_timing, region_prof, removal_oracle,
-    seed_windows, stall_residency, trace_jsonl as trace, trace_timeline as trace_v2,
+    rss_inflate, seed_windows, stall_residency, trace_jsonl as trace, trace_timeline as trace_v2,
 };
