@@ -825,10 +825,21 @@ mod imp {
                 "sub {t4}, {t1}",                     // src = dst - distance
                 "cmp {t4}, qword ptr [{ctx} + 24]",
                 "jb 93f",                             // src < out_base ⇔ distance > *pos → restore (tag 8, marker)
-                // X1 pre-copy `< 48` refill (production refills BEFORE the
-                // copy — P3.5 c1; the carried gather below is pure).
-                "cmp {bitsleft}, 48",
-                "jae 51f",
+                // RANK-2 UNCONDITIONAL pre-copy refill (igzip-converge: igzip
+                // refills UNCONDITIONALLY; the `cmp bitsleft,48; jae 51f` skip is
+                // DELETED to remove the STEP-1-located silesia 36%-mispredict
+                // branch). Byte-exact: the refill is append-only and the fast
+                // form is bit-for-bit `Bits::refill` (the ref-model pre-copy
+                // refill `run_contig_ref_biased` is made unconditional in
+                // lockstep, so the c2/c3 cursor-equality differential still
+                // holds). When bitsleft>=48 the load+shlx appends >=0 high bytes
+                // and pos advances by (63-bitsleft)>>3 in [0,1] — the cursor
+                // stays self-consistent (more bits buffered, pos points past
+                // them), decoding the identical symbol stream. OOB-safe: pos <=
+                // iteration-top_pos + 8 < in_lim+8 = len-IN_MARGIN+8, so pos+8 <=
+                // len (fast form only; the IN_MARGIN proof is preserved — the
+                // refill was already issued conditionally here, this only removes
+                // the skip). The carried gather below is pure.
                 "mov {t3}, qword ptr [{in_ptr} + {pos}]",
                 "shlx {t3}, {t3}, {bitsleft}",
                 "or {bitbuf}, {t3}",
@@ -837,7 +848,6 @@ mod imp {
                 "shr {t5}, 3",
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "51:",
                 "mov {t3:e}, {bitbuf:e}",
                 "and {t3:e}, 0xFFF",
                 "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
@@ -1416,10 +1426,21 @@ mod imp {
                 "sub {t4}, {t1}",                     // src = dst - distance
                 "cmp {t4}, qword ptr [{ctx} + 24]",
                 "jb 93f",                             // src < out_base ⇔ distance > *pos → restore (tag 8, marker)
-                // X1 pre-copy `< 48` refill (production refills BEFORE the
-                // copy — P3.5 c1; the carried gather below is pure).
-                "cmp {bitsleft}, 48",
-                "jae 51f",
+                // RANK-2 UNCONDITIONAL pre-copy refill (igzip-converge: igzip
+                // refills UNCONDITIONALLY; the `cmp bitsleft,48; jae 51f` skip is
+                // DELETED to remove the STEP-1-located silesia 36%-mispredict
+                // branch). Byte-exact: the refill is append-only and the fast
+                // form is bit-for-bit `Bits::refill` (the ref-model pre-copy
+                // refill `run_contig_ref_biased` is made unconditional in
+                // lockstep, so the c2/c3 cursor-equality differential still
+                // holds). When bitsleft>=48 the load+shlx appends >=0 high bytes
+                // and pos advances by (63-bitsleft)>>3 in [0,1] — the cursor
+                // stays self-consistent (more bits buffered, pos points past
+                // them), decoding the identical symbol stream. OOB-safe: pos <=
+                // iteration-top_pos + 8 < in_lim+8 = len-IN_MARGIN+8, so pos+8 <=
+                // len (fast form only; the IN_MARGIN proof is preserved — the
+                // refill was already issued conditionally here, this only removes
+                // the skip). The carried gather below is pure.
                 "mov {t3}, qword ptr [{in_ptr} + {pos}]",
                 "shlx {t3}, {t3}, {bitsleft}",
                 "or {bitbuf}, {t3}",
@@ -1428,7 +1449,6 @@ mod imp {
                 "shr {t5}, 3",
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "51:",
                 "mov {t3:e}, {bitbuf:e}",
                 "and {t3:e}, 0xFFF",
                 "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
@@ -1871,8 +1891,11 @@ mod imp {
                 "sub {t4}, {t1}",                     // src = dst - distance
                 "cmp {t4}, qword ptr [{ctx} + 24]",
                 "jb 30b",                             // src < out_base (marker) → SENTINEL
-                "cmp {bitsleft}, 48",
-                "jae 51f",
+                // RANK-2 UNCONDITIONAL pre-copy refill (igzip-converge; matches
+                // the run_contig change — `cmp bitsleft,48; jae 51f` deleted).
+                // Byte-exact: append-only fast `Bits::refill` form, IN_MARGIN
+                // keeps pos+8 <= len. (Non-shipped stateless variant kept in
+                // sync with run_contig.)
                 "mov {t3}, qword ptr [{in_ptr} + {pos}]",
                 "shlx {t3}, {t3}, {bitsleft}",
                 "or {bitbuf}, {t3}",
@@ -1881,7 +1904,6 @@ mod imp {
                 "shr {t5}, 3",
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "51:",
                 "mov {t3:e}, {bitbuf:e}",
                 "and {t3:e}, 0xFFF",
                 "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
@@ -2256,9 +2278,12 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
             if distance == 0 || distance > 32768 || distance > *dst {
                 true
             } else {
-                if (lb.bitsleft as u8) < 48 {
-                    lb.refill();
-                }
+                // RANK-2: UNCONDITIONAL pre-copy refill, in lockstep with the
+                // asm (the `if bitsleft < 48` skip is DELETED there too). The
+                // fast `Bits::refill` form is bit-for-bit the asm refill, so the
+                // c2/c3 cursor-equality differential (asm.pos/bitbuf/bitsleft ==
+                // ref) still holds; append-only ⇒ functionally identical decode.
+                lb.refill();
                 unsafe {
                     super::marker_inflate::emit_backref_contig(
                         out.as_mut_ptr(),
