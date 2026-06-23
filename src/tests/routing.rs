@@ -403,12 +403,12 @@ mod tests {
         );
     }
 
-    /// Production-routing proof (deletion-trap) for the T1-MONOLITH-STREAMING
-    /// native path: a single-member decode at T==1 MUST be handled by
-    /// `decode_and_stream_monolith_native` (counter fires) AND be byte-exact.
-    /// If a future change re-routes T1 away from the streaming monolith the
-    /// counter stays flat and this test fails loudly (it is the non-inert
-    /// routing gate — Gate-0c). Native build only (gzippy-isal keeps thin-T1).
+    /// Opt-in routing proof (deletion-trap) for the T1-MONOLITH-STREAMING native
+    /// path: with `GZIPPY_STREAM_MONOLITH=1`, a single-member decode at T==1 MUST
+    /// be handled by `decode_and_stream_monolith_native` (counter fires) AND be
+    /// byte-exact. The streaming monolith is OPT-IN (fulcrum optgate refused the
+    /// wall win as INSTRUCTION-ONLY; production T1 default stays thin-T1) — this
+    /// test locks the opt-in wiring + byte-exactness. Native build only.
     #[cfg(all(parallel_sm, not(isal_clean_tail)))]
     #[test]
     fn test_t1_routes_through_streaming_monolith() {
@@ -419,13 +419,18 @@ mod tests {
         let compressed = compress_single_member_gzip(&original);
         let before = MONOLITH_STREAM_NATIVE_RUNS.load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 1).unwrap();
+        // SAFETY: test-only env toggle; all T1 paths are byte-exact so concurrent
+        // tests are unaffected by the routing flip.
+        unsafe { std::env::set_var("GZIPPY_STREAM_MONOLITH", "1") };
+        let r = crate::decompress::decompress_single_member(&compressed, &mut output, 1);
+        unsafe { std::env::remove_var("GZIPPY_STREAM_MONOLITH") };
+        r.unwrap();
         let after = MONOLITH_STREAM_NATIVE_RUNS.load(Ordering::Relaxed);
         assert_eq!(output, original, "T1 streaming-monolith output mismatch");
         assert!(
             after > before,
-            "T1 single-member did NOT route through the streaming monolith \
-             (counter {before} -> {after}); production routing changed"
+            "T1 single-member did NOT route through the streaming monolith with \
+             GZIPPY_STREAM_MONOLITH=1 (counter {before} -> {after}); opt-in wiring changed"
         );
     }
 
