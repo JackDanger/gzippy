@@ -69,10 +69,37 @@ teardown. The `_teardown_split` rig isolates pure teardown = external − intern
   teardown is ~1% of wall, not the headline magnitude. (RSS remains its own
   scoreboard the user values separately — but on the WALL it is a ~1% lever.)
 
-## VERDICT / NEXT
-- Focus wall effort on the MARKER-DECODE lever (dominant); RSS/teardown is a ~1%
-  wall sideshow (pursue for the RSS scoreboard, not the wall).
-- NEXT deterministic step (cursor option 3): build the byte-exact marker-decode
-  removal oracle to BOUND the marker speed-up prize on BOTH arches before any port.
-- Gate-3 OWED: AMD replication of RESULTS 1–3 (rg-free legs runnable on solvency;
-  needs clone+build + guaranteed-resume llama-pause). Single-arch ⇒ NOT-YET-LAW.
+## RESULT 4 — PREMISE BREAKER: gz already BEATS rapidgzip AND pigz at T≥2 on Intel
+Direct cross-tool wall, interleaved N=11, /dev/null all arms, sha==zcat, fair
+thread counts (rg/gz both spawn 5 threads at 4 workers — verified via /proc/task):
+
+| cell (corpus)      | gz ms | rg ms | pigz ms | gz/rg | gz/pigz | verdict |
+|--------------------|-------|-------|---------|-------|---------|---------|
+| T2 monorepo        | 264.4 | 331.4 | 335.2   | **0.798** | 0.789 | gz beats rg +20% |
+| T4 silesia         |1004.4 |1095.5 |1812.9   | **0.917** | 0.554 | gz beats rg +8% |
+| T8 silesia         | 485.9 | 559.5 |1759.7   | **0.868** | 0.276 | gz beats rg +13% |
+
+**The T≥2-vs-rapidgzip goal is ALREADY MET on Intel** — gz wins every cell. The
+A0 marker-ceiling sweep was INVALID (ceiling arms slower than baseline: U16/U16W
+inject a phantom 201MB resolve pass = extra work; u8 cross-cell-inconsistent —
+confirms cursor's "wrong-routing" warning), so it gives no marker-prize bound;
+but it does not matter, because RESULT 4 shows there is no gz-vs-rg gap to close
+on Intel. The marker-loop's ~50% gz-internal criticality (RESULT 2) is HEADROOM,
+not a competitive deficit. FINDING-DECAY: the 2026-06-16 two-binary matrix's
+"native loses at T≥2" and the AMD T2/T4 (~3-6% loss) BOTH predate the B2/B3/RANK-2
+kernel wins (matrix @pre-wins; AMD findings @8cad4f6b/39acc213, before f5f827b6).
+The kernel wins appear to have CLOSED the T≥2-vs-rg gap.
+
+## VERDICT / NEXT (REVISED after RESULT 4)
+- **On Intel, T≥2-vs-rg+pigz is WON** — no decode port needed; the marker-port
+  front is MOOT here. Do NOT build the A1 marker oracle for an Intel gz-vs-rg gap
+  that does not exist.
+- The only place gz reportedly loses to rg at T≥2 is AMD/Zen2 (~3-6%, AMD finding
+  @pre-kernel-wins). DECISIVE NEXT MEASUREMENT: re-run gz-vs-rg at T≥2 on AMD AT
+  HEAD (eea9e445, with the kernel wins). If gz now ties/beats rg on AMD too, the
+  T≥2-vs-rg goal is MET cross-arch and this front CLOSES. (AMD has no rg binary —
+  pip install rapidgzip; clone+build gz-native; guaranteed-resume llama-pause.)
+- RSS/teardown is a ~0.9% wall sideshow (RESULT 3) — pursue only for the RSS
+  scoreboard, not the wall.
+- The marker port is only justified IF AMD still loses at HEAD AND an A1 removal
+  oracle brackets a real gz-vs-rg prize there. Otherwise it solves a non-problem.
