@@ -204,10 +204,31 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // whole output (~4× igzip's page faults), the cost igzip's streaming small
     // reused buffer avoids. Kept opt-in only so the falsifier stays reproducible;
     // the production T1 default remains thin-T1. T>1 NEVER takes this path.
-    let use_monolith =
+    // Legacy full-ISIZE monolith (FALSIFIED — fault-storm): opt-in only via
+    // GZIPPY_MONOLITH=1 so the prior falsifier stays reproducible.
+    let use_old_monolith =
         t1_serial && !force_thin_oracle && std::env::var_os("GZIPPY_MONOLITH").is_some();
-    let use_thin_t1 = (t1_serial && !use_monolith) || force_thin_oracle;
-    let drive_result = if use_monolith {
+    // T1-MONOLITH-STREAMING: the gzippy-native PRODUCTION DEFAULT at T==1. One
+    // continuous serial decode streaming through a small resident buffer — sheds
+    // the per-chunk DRIVER SCAFFOLD (gated +21-30% igzip gap) without the prior
+    // monolith's fault-storm. GZIPPY_NO_MONOLITH=1 forces thin-T1 (A/B
+    // re-verify). gzippy-isal keeps thin-T1 (its ISA-L clean tail already wins
+    // at T1; the streaming monolith is native-only).
+    let use_stream_monolith = {
+        #[cfg(not(isal_clean_tail))]
+        {
+            t1_serial
+                && !force_thin_oracle
+                && !use_old_monolith
+                && std::env::var_os("GZIPPY_NO_MONOLITH").is_none()
+        }
+        #[cfg(isal_clean_tail)]
+        {
+            false
+        }
+    };
+    let use_thin_t1 = (t1_serial && !use_old_monolith && !use_stream_monolith) || force_thin_oracle;
+    let drive_result = if use_old_monolith {
         chunk_fetcher::drive_monolith_t1(
             deflate_data,
             writer,
@@ -215,6 +236,21 @@ fn read_parallel_sm_inner<W: std::io::Write>(
             expected_size,
             bytes_written_out,
         )
+    } else if use_stream_monolith {
+        #[cfg(not(isal_clean_tail))]
+        {
+            chunk_fetcher::drive_monolith_streaming_t1(
+                deflate_data,
+                writer,
+                configuration,
+                expected_size,
+                bytes_written_out,
+            )
+        }
+        #[cfg(isal_clean_tail)]
+        {
+            unreachable!("stream monolith is native-only")
+        }
     } else if use_thin_t1 {
         chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration, bytes_written_out)
     } else if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {

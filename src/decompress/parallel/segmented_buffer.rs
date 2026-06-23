@@ -487,6 +487,28 @@ impl SegmentedU8 {
         }
     }
 
+    /// T1-MONOLITH-STREAMING flush helper. The decoded output bytes BEFORE the
+    /// trailing `keep` bytes have already been written to the sink; drop them and
+    /// shift the trailing `keep` bytes to the FRONT of the bulk so they remain
+    /// available as the DEFLATE sliding-window history for subsequent
+    /// back-references (max distance 32768). Decode-time only (front empty,
+    /// single contiguous bulk). After this call `len() == keep`, `buf[0..keep)`
+    /// are the most-recent `keep` decoded bytes, and the CAPACITY is unchanged
+    /// (no realloc → the buffer stays resident, the cache-residency lever that
+    /// fixed the prior full-ISIZE monolith's page-fault storm).
+    pub fn retain_tail(&mut self, keep: usize) {
+        debug_assert!(self.front.is_empty(), "retain_tail is decode-time");
+        let len = self.buf.len();
+        debug_assert!(keep <= len, "retain_tail keep {keep} > len {len}");
+        let start = len - keep;
+        if start == 0 {
+            return;
+        }
+        // memmove the trailing `keep` bytes to the front; capacity preserved.
+        self.buf.copy_within(start..len, 0);
+        self.buf.truncate(keep);
+    }
+
     /// Truncate the logical buffer to at most `new_len` bytes.
     pub fn truncate(&mut self, new_len: usize) {
         let ft = self.front_total();

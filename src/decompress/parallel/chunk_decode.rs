@@ -2030,6 +2030,324 @@ pub(crate) fn decode_monolith_native(
     Ok(chunk)
 }
 
+/// T1-MONOLITH-STREAMING flush-buffer size (output bytes between flushes). One
+/// fixed-size buffer is reserved ONCE and recycled in place via
+/// [`SegmentedU8::retain_tail`]; the prior full-ISIZE monolith first-touched the
+/// whole output (212 MB silesia → ~4× igzip page-faults, FALSIFIED). A small
+/// resident buffer streams like igzip's bounded output window. `GZIPPY_MONOLITH
+/// _STREAM_KIB` overrides for the fulcrum sweep (floor 128 KiB ≥ 2·window +
+/// headroom); default 8 MiB (cache-resident in L2/L3, few flushes).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+fn monolith_stream_buf_bytes() -> usize {
+    const DEFAULT_BYTES: usize = 8 * 1024 * 1024;
+    std::env::var("GZIPPY_MONOLITH_STREAM_KIB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k >= 128)
+        .map(|k| k * 1024)
+        .unwrap_or(DEFAULT_BYTES)
+}
+
+/// T1-MONOLITH-STREAMING (gzippy-native) — the production T==1 decode path.
+///
+/// Decodes the WHOLE single-member deflate body in ONE continuous serial pass —
+/// ONE `deflate::Block`, ONE `MarkerDecodeCtx`, ONE `set_initial_window` (zero
+/// 32 KiB seed) — with NO per-chunk `ChunkData` lifecycle, NO per-chunk
+/// rolling-window clone+reseed, NO per-block boundary record, NO block-finder /
+/// WindowMap / threadpool. That sheds the gated per-chunk DRIVER SCAFFOLD
+/// (F-6ce077591bb5 / F-8bd982118f3d: the scaffold, not the kernel, is the
+/// +21–30% T1-vs-igzip gap; the pure-Rust kernel is acquitted).
+///
+/// Output STREAMS through ONE fixed-size resident buffer
+/// ([`monolith_stream_buf_bytes`], default 8 MiB) instead of a full-ISIZE
+/// buffer: whenever the buffer fills toward `cap − HEADROOM`, the bytes before
+/// the trailing 32 KiB are written to the sink and the trailing 32 KiB is
+/// memmoved to the front ([`SegmentedU8::retain_tail`]) as the sliding-window
+/// history, then decode CONTINUES in the same `Block` state. Back-references
+/// (max distance 32768) always resolve into the retained 32 KiB. This fixes the
+/// prior full-ISIZE monolith's page-fault storm (cache-residency lever) WHILE
+/// shedding the scaffold (the streaming monolith does neither).
+///
+/// CRC32 is folded inline per decoded run (covers every output byte exactly
+/// once; the memmove never re-folds). The caller verifies CRC + ISIZE against
+/// the gzip trailer AFTER decode completes; on a later mismatch the partial
+/// output is already on the writer (same as gzip(1)). `bytes_written_out` is
+/// updated on EVERY flush so a multi-member-misroute resume sees the exact
+/// streamed prefix. Errors are terminal (`ChunkDecodeError`) — NO fallback.
+///
+/// Byte-identical output to `drive_thin_t1_oracle` / `decode_monolith_native`
+/// (same kernel, same clean window-present decode, chunk-0 zero-window seed).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+pub(crate) fn decode_and_stream_monolith_native<W: std::io::Write>(
+    input: &[u8],
+    expected_isize: usize,
+    configuration: ChunkConfiguration,
+    writer: &mut W,
+    bytes_written_out: Option<&mut usize>,
+) -> Result<(u32, usize), ChunkDecodeError> {
+    decode_and_stream_monolith_native_capped(
+        input,
+        expected_isize,
+        configuration,
+        writer,
+        bytes_written_out,
+        monolith_stream_buf_bytes(),
+    )
+}
+
+/// Core of the streaming monolith with an EXPLICIT stream-buffer cap (bytes),
+/// so tests can force MANY flush cycles with a tiny cap to exercise the
+/// sliding-window retention boundary, stored-block bursts spanning flushes, and
+/// the incremental `bytes_written` accounting. Production passes
+/// [`monolith_stream_buf_bytes`].
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
+    input: &[u8],
+    expected_isize: usize,
+    configuration: ChunkConfiguration,
+    writer: &mut W,
+    mut bytes_written_out: Option<&mut usize>,
+    stream_cap_bytes: usize,
+) -> Result<(u32, usize), ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::{
+        BlockError, CompressionType, MAX_WINDOW_SIZE,
+    };
+
+    const WINDOW: usize = MAX_WINDOW_SIZE; // 32 KiB sliding-window history
+                                           // One max back-ref (258) + the 8-byte word-copy overshoot — matches
+                                           // `finish_decode_chunk_contig_native`'s out_room = cap − HEADROOM.
+    const HEADROOM: usize = 258 + 8;
+
+    let mut chunk = ChunkData::new(0, configuration);
+
+    // Chunk-0 semantics: a zero 32 KiB predecessor window as a NON-OUTPUT
+    // dictionary prefix (`data_prefix_len == WINDOW`). A back-ref reaching into
+    // it would be invalid deflate (references before stream start) and never
+    // occurs in a valid stream.
+    let zero_window = [0u8; WINDOW];
+    chunk.prefill_window_prefix(&zero_window);
+    debug_assert_eq!(chunk.data_prefix_len, WINDOW);
+
+    // The ONE resident streaming buffer: capped at the stream-buf size, never
+    // grown (we FLUSH instead of grow). For small members it shrinks to fit so
+    // tiny files do not fault a multi-MiB buffer.
+    let target = stream_cap_bytes
+        .min(expected_isize.saturating_add(2 * WINDOW + HEADROOM + 1024))
+        .max(2 * WINDOW + HEADROOM + 1024);
+    chunk.reserve_clean(target);
+    // Stable capacity (no grow ⇒ cap is constant): flush threshold leaves room
+    // for one more HEADROOM+1 contig request without ever reallocating.
+    let cap = chunk.data.capacity();
+    debug_assert!(cap >= 2 * WINDOW + HEADROOM + 1);
+    let flush_threshold = cap - (HEADROOM + 1);
+
+    let mut marker_ctx = MarkerDecodeCtx::new(input, 0)?;
+    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
+        let mut block = cell_block.borrow_mut();
+        block.reset(None, None);
+        let mut unused: Vec<u16> = Vec::new();
+        block
+            .set_initial_window(&mut unused, &zero_window)
+            .map_err(|e| {
+                ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("streaming monolith set_initial_window: {e:?}"),
+                ))
+            })?;
+        debug_assert!(unused.is_empty(), "seed must not drain into output");
+        Ok(())
+    })?;
+    marker_ctx.block_primed = true;
+    marker_ctx.current_bit_offset = 0;
+
+    let crc32_enabled = chunk.configuration.crc32_enabled;
+    let mut streamed: usize = 0; // output bytes written to the sink so far
+
+    // Flush all output bytes except the trailing 32 KiB (retained as history).
+    // Returns the io error verbatim so the caller surfaces a terminal Err.
+    let flush_keep_window = |chunk: &mut ChunkData,
+                             streamed: &mut usize,
+                             bytes_written_out: &mut Option<&mut usize>,
+                             writer: &mut W|
+     -> Result<(), std::io::Error> {
+        let len = chunk.data.len();
+        debug_assert!(len >= 2 * WINDOW);
+        // Emit EVERY decoded output byte past the dictionary prefix
+        // (`data_prefix_len == WINDOW`). The trailing 32 KiB is emitted HERE
+        // and ALSO copied to the front as the next back-ref window — it is
+        // emitted exactly once (the copy is history only; the next flush
+        // emits `buf[WINDOW..]`, after the prefix, so it is never re-sent).
+        let flush_len = len - WINDOW;
+        if flush_len > 0 {
+            let bytes = chunk.data.decoded_range(WINDOW, flush_len);
+            writer.write_all(bytes)?;
+            *streamed += flush_len;
+            if let Some(out) = bytes_written_out.as_deref_mut() {
+                *out = *streamed;
+            }
+        }
+        // Retain a COPY of the trailing 32 KiB (already emitted) as the
+        // sliding-window history; capacity preserved (no realloc).
+        chunk.data.retain_tail(WINDOW);
+        Ok(())
+    };
+
+    let body_result = BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
+        let mut block = cell_block.borrow_mut();
+        debug_assert!(
+            !block.contains_marker_bytes(),
+            "streaming monolith requires a flipped (clean) Block"
+        );
+
+        loop {
+            let slice_byte = marker_ctx.current_bit_offset / 8;
+            let mut bits = marker_ctx.open_bits(input);
+            let next_block_offset = absolute_bit_pos(slice_byte, &bits);
+
+            // Inexact stop-at-EOF: the input slice is exactly the member's
+            // deflate body, so decode runs to the BFINAL EOB. A header parse at
+            // the cap means the trailer was misrouted — handled below by the
+            // final-block check; here just parse the next block header.
+            {
+                if let Err(e) = block.read_header(&mut bits, false) {
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("deflate header at bit {next_block_offset}: {e:?}"),
+                    )));
+                }
+            }
+
+            let comp_type = block.compression_type();
+            while !block.eob() {
+                // FLUSH-OR-GROW becomes FLUSH-ONLY: when the buffer is near full
+                // (always at a symbol boundary here — `decode_clean_*_into_contig`
+                // returns between symbols), stream out the older bytes and recycle
+                // the buffer in place instead of growing it.
+                if chunk.data.len() > flush_threshold {
+                    flush_keep_window(&mut chunk, &mut streamed, &mut bytes_written_out, writer)
+                        .map_err(ChunkDecodeError::BootstrapFailed)?;
+                }
+
+                // H4: re-fetch (base, cap, pos) every iteration (retain_tail/grow
+                // may have moved the allocation). Request HEADROOM+1 (not
+                // HEADROOM) to avoid the zero-budget `Ok(0)` spin.
+                let (base, cur_cap, pos_before) = chunk.data.contig_decode_window(HEADROOM + 1);
+                debug_assert_eq!(cur_cap, cap, "streaming monolith must not grow the buffer");
+                let mut pos = pos_before;
+                let out_room = cur_cap.saturating_sub(HEADROOM);
+                assert!(
+                    pos <= out_room && cur_cap >= pos_before + HEADROOM,
+                    "streaming monolith: insufficient headroom (pos {pos} cap {cur_cap})"
+                );
+
+                // SAFETY: `base` is `contig_decode_window`'s pointer valid for
+                // `[0, cur_cap)`; the assert proves `pos <= out_room`; `bits.data`
+                // (compressed input) never aliases the decode destination.
+                let body_res = match comp_type {
+                    CompressionType::Uncompressed => unsafe {
+                        block.decode_clean_stored_into_contig(
+                            &mut bits,
+                            base,
+                            cur_cap,
+                            &mut pos,
+                            usize::MAX,
+                        )
+                    },
+                    CompressionType::FixedHuffman | CompressionType::DynamicHuffman => unsafe {
+                        block.decode_clean_into_contig(
+                            &mut bits,
+                            base,
+                            cur_cap,
+                            &mut pos,
+                            usize::MAX,
+                        )
+                    },
+                    CompressionType::Reserved => Err(BlockError::InvalidCompression),
+                };
+                let emitted = match body_res {
+                    Ok(n) => n,
+                    Err(e) => {
+                        record_block_body_fail(&e);
+                        chunk.data.commit(pos - pos_before);
+                        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("deflate body at bit {next_block_offset}: {e:?}"),
+                        )));
+                    }
+                };
+                debug_assert_eq!(emitted, pos - pos_before);
+                // H3: commit BEFORE the CRC read-back (decoded_range indexes the
+                // committed region).
+                chunk.data.commit(emitted);
+                if emitted > 0 {
+                    if crc32_enabled {
+                        if let Some(last_crc) = chunk.crc32s.last_mut() {
+                            last_crc.update(chunk.data.decoded_range(pos_before, emitted));
+                        }
+                    }
+                    chunk.statistics.non_marker_count += emitted as u64;
+                    marker_ctx.clean_data_count += emitted;
+                    UNIFIED_ROUTE_CLEAN_U8_BYTES
+                        .fetch_add(emitted as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if emitted == 0 && !block.eob() {
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "streaming monolith: no progress",
+                    )));
+                }
+            }
+
+            let end_bit_offset = absolute_bit_pos(slice_byte, &bits);
+            marker_ctx.current_bit_offset = end_bit_offset;
+
+            if block.is_last_block() {
+                chunk.finalize_with_deflate(end_bit_offset, Some(input));
+                return Ok(());
+            }
+            // T1-MONOLITH: no per-block boundary recording (ledger #4).
+        }
+    });
+    body_result?;
+
+    // Final flush: stream out everything still in the buffer past the dictionary
+    // prefix (the trailing-window retention no longer matters — decode is done).
+    let len = chunk.data.len();
+    let tail_len = len - WINDOW; // output bytes (data_prefix_len == WINDOW)
+    if tail_len > 0 {
+        let bytes = chunk.data.decoded_range(WINDOW, tail_len);
+        writer
+            .write_all(bytes)
+            .map_err(ChunkDecodeError::BootstrapFailed)?;
+        streamed += tail_len;
+        if let Some(out) = bytes_written_out.as_deref_mut() {
+            *out = streamed;
+        }
+    }
+
+    let mut total_crc = crate::decompress::parallel::crc32::CRC32Calculator::new();
+    for stream_crc in &chunk.crc32s {
+        total_crc.append(stream_crc);
+    }
+
+    if std::env::var_os("GZIPPY_DEBUG").is_some() {
+        eprintln!(
+            "[parallel_sm] T1-MONOLITH-STREAMING out={streamed} bytes \
+             (single Block, igzip-shaped: ONE resident {}KiB buffer streamed, \
+             no per-chunk alloc/window/boundary)",
+            cap / 1024
+        );
+    }
+    MONOLITH_STREAM_NATIVE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok((total_crc.crc32(), streamed))
+}
+
+/// Routing/effect counter for the T1-monolith-STREAMING native path
+/// (deletion-trap pattern): non-zero proves the streaming monolith — not the
+/// thin-T1 chunk driver or the legacy full-ISIZE monolith — handled the decode.
+pub static MONOLITH_STREAM_NATIVE_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// T1-MONOLITH (gzippy-isal) — one full-stream ISA-L decode into ONE growable
 /// buffer (≈ the igzip monolith itself). Same divergence-ledger #1/#2/#3 as the
 /// native monolith, but the engine is ISA-L `decompress_deflate_from_bit_into_growable`
@@ -2800,6 +3118,124 @@ mod tests {
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
         enc.write_all(payload).unwrap();
         enc.finish().unwrap()
+    }
+
+    fn make_deflate_level(payload: &[u8], level: u32) -> Vec<u8> {
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn make_gzip_level(payload: &[u8], level: u32) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// T1-MONOLITH-STREAMING byte-exactness differential (REAL-corpus contract,
+    /// same commit as the lever — feedback_real_corpus_test_with_lever).
+    ///
+    /// Decodes the WHOLE deflate body in one continuous pass while STREAMING
+    /// through a deliberately TINY resident buffer (128–192 KiB) so MANY flush
+    /// cycles fire — exercising the three cursor-flagged hazards:
+    ///   (1) sliding-window retention across flush (distance ∈ {1, 32768},
+    ///       length ∈ {3, 258}, runs that straddle the flush/window boundary);
+    ///   (2) STORED-block bursts (level 0, up to 65535 B) spanning flush cycles;
+    ///   (3) incremental bytes_written accounting across flushes.
+    /// Verified against TWO independent oracles (flate2 + libdeflate) on the
+    /// bytes each oracle's encoder produced.
+    #[cfg(all(parallel_sm, not(isal_clean_tail)))]
+    #[test]
+    fn monolith_streaming_byte_exact_multi_cap_multi_shape() {
+        use std::io::Read;
+
+        // Shape 4: a 32 KiB pseudo-random block repeated → forces MAX-distance
+        // (32768) back-references that must resolve into the retained window
+        // AFTER a flush. This is the streaming retention invariant's hardest case.
+        let mut block = vec![0u8; 32 * 1024];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
+        }
+        let mut max_dist = Vec::new();
+        for _ in 0..100 {
+            max_dist.extend_from_slice(&block);
+        } // ~3.2 MiB, distance-32768 repeats
+
+        let mut mixed = Vec::new();
+        for i in 0..(3 * 1024 * 1024u32) {
+            mixed.push((i.wrapping_mul(2654435761) >> 24) as u8);
+        }
+
+        let payloads: Vec<Vec<u8>> = vec![
+            b"abcdefghijklmnopqrst".repeat(170_000), // ~3.4 MiB, compressible
+            vec![0x5au8; 3 * 1024 * 1024],           // pure run, distance-1 back-refs
+            mixed,                                   // ~3 MiB low-redundancy
+            max_dist,                                // distance-32768 back-refs
+        ];
+
+        for payload in &payloads {
+            for level in [0u32, 1, 6, 9] {
+                // ── Oracle A: flate2 raw-deflate encode + flate2 decode ──
+                let body = make_deflate_level(payload, level);
+                let mut flate2_ref = Vec::new();
+                flate2::read::DeflateDecoder::new(&body[..])
+                    .read_to_end(&mut flate2_ref)
+                    .expect("flate2 reference decode");
+                assert_eq!(&flate2_ref, payload, "flate2 self-check level{level}");
+
+                // ── Oracle B: flate2 gzip encode + libdeflate gzip decode ──
+                let gz = make_gzip_level(payload, level);
+                let mut ld_ref = vec![0u8; payload.len().max(1)];
+                let ld_n = crate::backends::libdeflate::DecompressorEx::new()
+                    .gzip_decompress_ex(&gz, &mut ld_ref)
+                    .expect("libdeflate reference decode")
+                    .output_size;
+                ld_ref.truncate(ld_n);
+                assert_eq!(&ld_ref, payload, "libdeflate self-check level{level}");
+                // The deflate BODY of the gzip member (flate2 GzEncoder emits a
+                // 10-byte header, no FEXTRA, and an 8-byte trailer).
+                let gz_body = &gz[10..gz.len() - 8];
+
+                // Tiny caps → many flush cycles. 128 KiB is the floor; 192 KiB
+                // shifts the flush boundary to a different alignment.
+                for cap in [128 * 1024usize, 192 * 1024, 1024 * 1024] {
+                    let cfg = ChunkConfiguration {
+                        crc32_enabled: true,
+                        ..Default::default()
+                    };
+                    // Monolith over the flate2-produced body.
+                    let mut out = Vec::new();
+                    let mut bw = 0usize;
+                    let (_crc, n) = decode_and_stream_monolith_native_capped(
+                        &body,
+                        payload.len(),
+                        cfg.clone(),
+                        &mut out,
+                        Some(&mut bw),
+                        cap,
+                    )
+                    .expect("monolith decode (flate2 body)");
+                    assert_eq!(n, payload.len(), "size flate2 body cap{cap} level{level}");
+                    assert_eq!(bw, payload.len(), "bytes_written flate2 body cap{cap}");
+                    assert_eq!(&out, payload, "bytes flate2 body cap{cap} level{level}");
+
+                    // Monolith over the libdeflate/gzip-produced body (2nd encoder).
+                    let mut out2 = Vec::new();
+                    let (_crc2, n2) = decode_and_stream_monolith_native_capped(
+                        gz_body,
+                        payload.len(),
+                        cfg,
+                        &mut out2,
+                        None,
+                        cap,
+                    )
+                    .expect("monolith decode (gzip body)");
+                    assert_eq!(n2, payload.len(), "size gzip body cap{cap} level{level}");
+                    assert_eq!(&out2, payload, "bytes gzip body cap{cap} level{level}");
+                }
+            }
+        }
     }
 
     /// P0 REGRESSION (2026-06-12, /tmp/mono-gnu9.tar.gz: deterministic CRC32

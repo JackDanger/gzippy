@@ -703,6 +703,40 @@ pub fn drive_monolith_t1<W: std::io::Write>(
 #[cfg(parallel_sm)]
 pub static MONOLITH_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// T1-MONOLITH-STREAMING driver — the gzippy-native production T==1 path.
+///
+/// Decodes the WHOLE single-member deflate body in ONE continuous serial pass
+/// (one `Block`, one marker ctx, one `set_initial_window`) that STREAMS output
+/// through ONE small fixed-size resident buffer — shedding the per-chunk DRIVER
+/// SCAFFOLD (the gated +21–30% T1-vs-igzip gap, F-6ce077591bb5/F-8bd982118f3d)
+/// WITHOUT the prior full-ISIZE monolith's page-fault storm (the buffer is
+/// reserved once and recycled in place via `retain_tail`; see
+/// `decode_and_stream_monolith_native`). The decode runs inside the
+/// `T1ResidentScope` (validated cache-residency lever: warm pooled pages,
+/// scoped to this single serial thread; T>1 workers never enter it).
+///
+/// Byte-identical output to `drive_thin_t1_oracle`. CRC + ISIZE are verified by
+/// the caller; errors are terminal (NO fallback). T>1 NEVER reaches here.
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+pub fn drive_monolith_streaming_t1<W: std::io::Write>(
+    input: &[u8],
+    writer: &mut W,
+    configuration: ChunkConfiguration,
+    expected_isize: usize,
+    bytes_written_out: Option<&mut usize>,
+) -> Result<(u32, usize), FetchError> {
+    let _resident = crate::decompress::parallel::chunk_buffer_pool::T1ResidentScope::enter();
+    let result = crate::decompress::parallel::chunk_decode::decode_and_stream_monolith_native(
+        input,
+        expected_isize,
+        configuration,
+        writer,
+        bytes_written_out,
+    )
+    .map_err(FetchError::Decode)?;
+    Ok(result)
+}
+
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,

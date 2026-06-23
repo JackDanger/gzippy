@@ -403,6 +403,32 @@ mod tests {
         );
     }
 
+    /// Production-routing proof (deletion-trap) for the T1-MONOLITH-STREAMING
+    /// native path: a single-member decode at T==1 MUST be handled by
+    /// `decode_and_stream_monolith_native` (counter fires) AND be byte-exact.
+    /// If a future change re-routes T1 away from the streaming monolith the
+    /// counter stays flat and this test fails loudly (it is the non-inert
+    /// routing gate — Gate-0c). Native build only (gzippy-isal keeps thin-T1).
+    #[cfg(all(parallel_sm, not(isal_clean_tail)))]
+    #[test]
+    fn test_t1_routes_through_streaming_monolith() {
+        use crate::decompress::parallel::chunk_decode::MONOLITH_STREAM_NATIVE_RUNS;
+        use std::sync::atomic::Ordering;
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        let before = MONOLITH_STREAM_NATIVE_RUNS.load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 1).unwrap();
+        let after = MONOLITH_STREAM_NATIVE_RUNS.load(Ordering::Relaxed);
+        assert_eq!(output, original, "T1 streaming-monolith output mismatch");
+        assert!(
+            after > before,
+            "T1 single-member did NOT route through the streaming monolith \
+             (counter {before} -> {after}); production routing changed"
+        );
+    }
+
     /// COALESCE correctness lock (rapidgzip parity): the clean-tail decoder now
     /// warm-decodes ACROSS deflate block boundaries within a chunk, returning to
     /// the driver only at the first pre-header EOB whose bit position reaches the
