@@ -921,6 +921,39 @@ mod imp {
                 //    transliterated. t1=distance t2=length t4=src {ret}=cursor
                 //    t5=word {t3}=carried entry (LIVE across the copy)
                 "70:",
+                // RANK-2 (project_rank2_instr_locate_2026_06_23): the dist>=8
+                // 5-word SCALAR burst below is 19.6% of all gz instructions.
+                // For the dist>=16 AND len<=40 sub-bucket, replace it with an
+                // UNCONDITIONAL 3x 16-byte MOVDQU burst (48 B written, NO
+                // trip-count loop). PRESERVES B3's branchlessness (no nasa
+                // `sub;jle` mispredict re-introduced) AND cuts the dominant
+                // copy-path instruction count (3 SIMD stores vs ~10 scalar mov
+                // pairs). Cite igzip large_byte_copy
+                // (igzip_decode_block_stateless.asm:603-612, COPY_SIZE=16).
+                // BYTE-EXACT ONLY for dist>=16: each sequential 16-byte load
+                // stays at-or-behind the write frontier (frontier +16/store,
+                // load offset +16) so every load reads already-finalized bytes
+                // — the canonical libdeflate/igzip large-copy invariant.
+                // dist<16 (the 1..7 period-growth + 8..15 word arms) and len>40
+                // (incl. the rare >240) fall through to the UNTOUCHED scalar
+                // path at 60:. The 48 B extent <= FAST_OUT_SLOP=282; src+48 <=
+                // dst+32 stays inside the same envelope; the copy touches NO
+                // bit cursor so the c2/c3 cursor differential + ref model are
+                // unchanged. {ret} (hoisted BOUNDARY=1) is NOT clobbered here.
+                "cmp {t2}, 40",
+                "ja 60f",                             // len>40 → scalar path (untouched)
+                "cmp {t1}, 16",
+                "jb 60f",                             // dist<16 → scalar arms (untouched)
+                "movdqu xmm0, [{t4}]",                // load [src, src+16)
+                "movdqu [{dst}], xmm0",               // store [dst, dst+16)
+                "movdqu xmm0, [{t4} + 16]",           // load [src+16, src+32)
+                "movdqu [{dst} + 16], xmm0",          // store [dst+16, dst+32)
+                "movdqu xmm0, [{t4} + 32]",           // load [src+32, src+48)
+                "movdqu [{dst} + 32], xmm0",          // store [dst+32, dst+48) (overshoot <=8)
+                "add {dst}, {t2}",                    // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                "60:",                                // dist<16 OR len>40 → B3 scalar path
                 "mov {ret}, {dst}",
                 "cmp {t2}, 40",
                 "jbe 52f",
@@ -1538,6 +1571,23 @@ mod imp {
                 //    transliterated. t1=distance t2=length t4=src {ret}=cursor
                 //    t5=word {t3}=carried entry (LIVE across the copy)
                 "70:",
+                // RANK-2 dist>=16 & len<=40 → unconditional 3x MOVDQU burst
+                // (identical to run_contig; see its proof). {ret} not used as
+                // BOUNDARY here, so no restore.
+                "cmp {t2}, 40",
+                "ja 60f",                             // len>40 → scalar path (untouched)
+                "cmp {t1}, 16",
+                "jb 60f",                             // dist<16 → scalar arms (untouched)
+                "movdqu xmm0, [{t4}]",
+                "movdqu [{dst}], xmm0",
+                "movdqu xmm0, [{t4} + 16]",
+                "movdqu [{dst} + 16], xmm0",
+                "movdqu xmm0, [{t4} + 32]",
+                "movdqu [{dst} + 32], xmm0",
+                "add {dst}, {t2}",                    // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                "60:",                                // dist<16 OR len>40 → B3 scalar path
                 "mov {ret}, {dst}",
                 "cmp {t2}, 40",
                 "jbe 52f",
@@ -1979,6 +2029,22 @@ mod imp {
                 "jmp 2b",
                 // ── scalar fallback (length > 240) ───────────────────────
                 "70:",
+                // RANK-2 dist>=16 & len<=40 → unconditional 3x MOVDQU burst
+                // (identical to run_contig; see its proof). {ret} not BOUNDARY.
+                "cmp {t2}, 40",
+                "ja 60f",                             // len>40 → scalar path (untouched)
+                "cmp {t1}, 16",
+                "jb 60f",                             // dist<16 → scalar arms (untouched)
+                "movdqu xmm0, [{t4}]",
+                "movdqu [{dst}], xmm0",
+                "movdqu xmm0, [{t4} + 16]",
+                "movdqu [{dst} + 16], xmm0",
+                "movdqu xmm0, [{t4} + 32]",
+                "movdqu [{dst} + 32], xmm0",
+                "add {dst}, {t2}",                    // dst advances by exactly length
+                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
+                "jmp 2b",
+                "60:",                                // dist<16 OR len>40 → B3 scalar path
                 "mov {ret}, {dst}",
                 "cmp {t2}, 40",
                 "jbe 52f",
