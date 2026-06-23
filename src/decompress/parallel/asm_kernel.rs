@@ -237,27 +237,8 @@ pub struct AsmState {
     /// `LutLitLenCode::rebuild_from`; read by the asm via the single base.
     pub lut_litlen: super::lut_huffman::LutLitLenCode,
     /// dist `DistTable`, INLINE (`entries: [DistEntry;DIST_CAP]` first). Built
-    /// in place by `DistTable::rebuild`. Read by the production Rust fast loop
-    /// and careful tail (`marker_inflate.rs` `dist_tbl`) — the proven byte-exact
-    /// reference for the non-asm dispatch and the cross-chunk careful path. The
-    /// asm kernel no longer indexes this (it reads `dist_small`/`dist_start`);
-    /// both tables are rebuilt from the SAME dist code-lengths every block, so
-    /// they decode the identical stream and the asm<->Rust handoff is seamless.
+    /// in place by `DistTable::rebuild`; read by the asm via the single base.
     pub dist: crate::decompress::inflate::libdeflate_entry::DistTable,
-    /// igzip-shaped distance table, INLINE (`InflateHuffCodeSmall`:
-    /// `short_code_lookup[1024]u16` 10-bit index, then `long_code_lookup[80]u16`).
-    /// Built in place by `LutDistCode::rebuild_from`. The asm backref dist-decode
-    /// indexes it `[{ctx}+DIST_SHORT_OFF + idx*2]` / `[{ctx}+DIST_LONG_OFF + idx*2]`
-    /// — igzip's two-stage form (`decode_next_dist`, igzip
-    /// `igzip_decode_block_stateless.asm:396-440,550-552`). The single `ctx` base
-    /// addresses it; no extra pinned register.
-    pub dist_small: super::lut_huffman::LutDistCode,
-    /// rfc1951 `dist_start[32]` (distance base per dist symbol), INLINE. The asm
-    /// adds `dist_start[sym]` to the BZHI-extracted extra bits to form the back-ref
-    /// distance (igzip `igzip_decode_block_stateless.asm:565,581`). Indexed
-    /// `[{ctx}+DIST_START_OFF + sym*4]`. Constant (`RFC1951_DIST_START`),
-    /// populated once at construction.
-    pub dist_start: [u32; 32],
 }
 
 /// Asm `const`-operand displacements (single-base addressing). Layout-driven
@@ -267,14 +248,6 @@ pub const ASM_LIT_SHORT_OFF: usize =
 pub const ASM_LIT_LONG_OFF: usize =
     std::mem::offset_of!(AsmState, lut_litlen.table.long_code_lookup);
 pub const ASM_DIST_OFF: usize = std::mem::offset_of!(AsmState, dist.entries);
-/// igzip dist short-code table (`[u16;1024]`, 10-bit index) displacement.
-pub const ASM_DIST_SHORT_OFF: usize =
-    std::mem::offset_of!(AsmState, dist_small.table.short_code_lookup);
-/// igzip dist long-code table (`[u16;80]`) displacement.
-pub const ASM_DIST_LONG_OFF: usize =
-    std::mem::offset_of!(AsmState, dist_small.table.long_code_lookup);
-/// rfc1951 `dist_start[32]` (u32) displacement.
-pub const ASM_DIST_START_OFF: usize = std::mem::offset_of!(AsmState, dist_start);
 
 const _: () = assert!(std::mem::offset_of!(AsmState, in_ptr) == 0);
 const _: () = assert!(std::mem::offset_of!(AsmState, in_lim) == 8);
@@ -299,20 +272,6 @@ const _: () = assert!(super::lut_huffman::LARGE_SHORT_MAX_LEN_OFFSET == 26);
 const _: () = assert!(super::lut_huffman::LARGE_LONG_CODE_LEN_OFFSET == 10);
 const _: () = assert!(super::lut_huffman::LARGE_LONG_SYM_MASK == 0x3FF);
 const _: () = assert!(super::lut_huffman::ISAL_DECODE_LONG_BITS == 12);
-// igzip dist-table layout constants the asm dist-decode hardcodes as immediates
-// (compile-checked against the table builder so the asm immediates and
-// `make_inflate_huff_code_dist` can never drift).
-const _: () = assert!(super::lut_huffman::ISAL_DECODE_SHORT_BITS == 10); // 0x3FF index mask
-const _: () = assert!(super::lut_huffman::SMALL_FLAG_BIT == 0x400); // long-code flag (bit 10)
-const _: () = assert!(super::lut_huffman::SMALL_SHORT_CODE_LEN_OFFSET == 11); // short bit_count >>
-const _: () = assert!(super::lut_huffman::SMALL_LONG_CODE_LEN_OFFSET == 10); // long bit_count >>
-const _: () = assert!(super::lut_huffman::SMALL_SHORT_SYM_MASK == 0x1FF); // sym|extra field
-const _: () = assert!(super::lut_huffman::DIST_SYM_MASK == 0x1F); // dist symbol (low 5)
-const _: () = assert!(super::lut_huffman::DIST_SYM_EXTRA_OFFSET == 5); // extra-count >>
-const _: () = assert!(super::lut_huffman::DIST_SYM_EXTRA_MASK == 0xF); // extra-count mask
-                                                                       // The igzip dist short table is indexed 10-bit, u16 entries; long table u16.
-const _: () = assert!(ASM_DIST_SHORT_OFF > ASM_LIT_LONG_OFF);
-const _: () = assert!(ASM_DIST_LONG_OFF == ASM_DIST_SHORT_OFF + 1024 * 2);
 const _: () = assert!(super::lut_huffman::MAX_LIT_LEN_SYM == 512);
 const _: () =
     assert!(crate::decompress::inflate::libdeflate_entry::HUFFDEC_SUBTABLE_POINTER == 0x4000);
@@ -324,10 +283,7 @@ const _: () = assert!(crate::decompress::inflate::libdeflate_entry::DistTable::T
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 mod imp {
-    use super::{
-        AsmState, Bits, ASM_DIST_LONG_OFF, ASM_DIST_OFF, ASM_DIST_SHORT_OFF, ASM_DIST_START_OFF,
-        ASM_LIT_LONG_OFF, ASM_LIT_SHORT_OFF,
-    };
+    use super::{AsmState, Bits, ASM_DIST_OFF, ASM_LIT_LONG_OFF, ASM_LIT_SHORT_OFF};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
 
@@ -716,9 +672,9 @@ mod imp {
                 //    read_in` — mask CONST off-path, single `and` critical op (same
                 //    convergence as the litlen index above; byte-identical, AND
                 //    commutative).
-                "mov {dpre:e}, 0x3FF",                // igzip 550: mask CONST (10-bit ISAL_DECODE_SHORT_BITS index)
-                "and {dpre:e}, {bitbuf:e}",           // igzip 551: dist index = bitbuf & 0x3FF
-                "movzx {dpre:e}, word ptr [{ctx} + {dpre}*2 + {dist_short_off}]", // igzip 552: u16 short_code_lookup
+                "mov {dpre:e}, 0x1FF",                // igzip 550: mask CONST (off critical path)
+                "and {dpre:e}, {bitbuf:e}",           // igzip 551: dist index = bitbuf & 0x1FF
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 // ── LATE DISCRIMINATOR (igzip 555-556): trailing < 256 ⇒
                 //    literal ⇒ back-edge (the HOT exit); ≥ 256 ⇒ length/EOB ⇒
                 //    fall through to the non-literal arm. THE core igzip-shape
@@ -818,8 +774,8 @@ mod imp {
                 "cmp {t5:e}, 512",
                 "ja 8f",                              // long oversize lone → restore + RECLASS tag 0
                 "mov {dpre:e}, {bitbuf:e}",
-                "and {dpre:e}, 0x3FF",                // igzip 10-bit ISAL_DECODE_SHORT_BITS index
-                "movzx {dpre:e}, word ptr [{ctx} + {dpre}*2 + {dist_short_off}]", // u16 short_code_lookup
+                "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 "lea {t2:e}, [{t5:e} - 254]",         // length
                 "jmp 58f",                            // dst = base = copy start
                 // ── oversize trailing (>512): restore + RECLASS, tag by cnt
@@ -837,50 +793,32 @@ mod imp {
                 //    X2: the iteration-top p0/d0 anchor makes every dist-side
                 //    bail un-consume (tag at `80:` → reconstruct at `85:`). ──
                 "58:",
-                "mov {t1:e}, {dpre:e}",               // preloaded igzip dist short entry (u16, zero-ext) → t1
-                // ── igzip TWO-STAGE distance decode (decode_next_dist,
-                //    igzip_decode_block_stateless.asm macro 396-440 + body
-                //    565-581). REPLACES libdeflate's in-register DistEntry
-                //    consume_entry (the structural Rank-1 divergence). t1 = the
-                //    10-bit-indexed short_code_lookup entry: bits 0..8 = sym(5) |
-                //    extra-count(4) (SMALL_SHORT_SYM), bit 10 = SMALL_FLAG_BIT
-                //    (long-code pointer), bits 11.. = code length. The shared tail
-                //    `96:` consumes the codeword, looks up rfc1951 `dist_start[sym]`,
-                //    BZHI-extracts the extra bits, and forms the distance. A
-                //    long-code leaf re-enters `96:` with t3 = bit_count. Byte-exact
-                //    with `run_contig_ref_biased` (igzip-form ref, lockstep).
+                "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
+                // FLOOR ORACLE (NIGHT16): subtable leaf re-enters here (the
+                // inline subtable decode at 91: loads the leaf into {t1} and
+                // jumps back to 94b). On a leaf the two tests below are
+                // harmless: a valid leaf is nonzero (raw0 test falls through)
+                // and bit14 (0x4000) is always 0 for a distance entry (the
+                // distance base occupies bits 16-30, codeword_bits bits 8-11),
+                // so it falls straight into the normal in-register entry decode.
                 "94:",
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 11",                     // bit_count (SMALL_SHORT_CODE_LEN_OFFSET); long entry → long_max_len
-                "jz 90f",                             // bit_count == 0 → invalid dist symbol (hole/30/31) → bail (tag 5)
-                "test {t1:e}, 0x400",                 // SMALL_FLAG_BIT
-                "jz 96f",                             // short code → shared tail
-                // ── long-code path (cold; igzip macro 416-431). t3 = long_max_len.
-                "mov {t4}, {bitbuf}",
-                "shr {t4}, 10",                       // next_bits = read_in >> ISAL_DECODE_SHORT_BITS
-                "sub {t3:e}, 10",                     // long_max_len - lookup_size
-                "bzhi {t4}, {t4}, {t3}",              // CLEAR_HIGH_BITS: keep low (long_max_len-10) bits
-                "and {t1:e}, 0x1FF",                  // SMALL_SHORT_SYM (long-table base index)
-                "add {t1:e}, {t4:e}",                 // long_idx = base + next_bits
-                "movzx {t1:e}, word ptr [{ctx} + {t1}*2 + {dist_long_off}]", // leaf entry (u16)
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 10",                     // leaf bit_count (SMALL_LONG_CODE_LEN_OFFSET)
-                "jz 90f",                             // invalid leaf → bail (tag 5)
-                // ── shared tail (igzip macro %%end 433-439 + body 565-581):
-                //    t3 = bit_count (codeword length), t1 = entry (low 9 = sym|extra).
-                "96:",
-                "shrx {bitbuf}, {bitbuf}, {t3}",      // consume the dist codeword bits
-                "sub {bitsleft}, {t3}",
+                "test {t1:e}, {t1:e}",
+                "jz 90f",                             // raw == 0 (hole/code 30/31) → bail (tag 5)
+                "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
+                "jnz 91f",                            // subtable dist → INLINE decode at 91:
+                "mov {t3}, {bitbuf}",                 // saved_bitbuf
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry: >>= raw as u8 (= total_bits <= 31)
                 "mov {t4:e}, {t1:e}",
-                "shr {t4:e}, 5",                      // DIST_SYM_EXTRA_OFFSET
-                "and {t4:e}, 0xF",                    // t4 = extra bit count (DIST_SYM_EXTRA_MASK)
-                "and {t1:e}, 0x1F",                   // t1 = dist symbol (DIST_SYM_MASK)
-                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {dist_start_off}]", // igzip 565: dist_start[sym]
-                "bzhi {t3}, {bitbuf}, {t4}",          // igzip 571: extra value = low (extra-count) bits
-                "shrx {bitbuf}, {bitbuf}, {t4}",      // igzip 572: consume the extra bits
-                "sub {bitsleft}, {t4}",               // igzip 578
-                "add {t1:e}, {t3:e}",                 // igzip 581: distance = dist_start[sym] + extra
-                "jz 92f",                             // distance == 0 → restore (tag 7; corrupt sym-30-with-code)
+                "and {t4:e}, 0x1F",
+                "sub {bitsleft}, {t4}",               // -= raw & 0x1F (no underflow: budget proof)
+                "bzhi {t3}, {t3}, {t1}",              // saved & ((1 << total_bits) - 1)
+                "mov {t4:e}, {t1:e}",
+                "shr {t4:e}, 8",
+                "and {t4:e}, 0xF",                    // codeword_bits
+                "shrx {t3}, {t3}, {t4}",              // extra value
+                "shr {t1:e}, 16",                     // distance base
+                "add {t1:e}, {t3:e}",                 // distance
+                "jz 92f",                             // distance == 0 → restore (tag 7)
                 "cmp {t1:e}, 32768",
                 "ja 92f",                             // > MAX_WINDOW_SIZE → restore (tag 7)
                 "mov {t4}, {dst}",
@@ -1115,11 +1053,33 @@ mod imp {
                 // All reconstruct identically at 85: (re-read from p0, dst=d0);
                 // the only difference is the stat tag in {ret}. Byte-transparent.
                 "90:",
-                "mov {ret}, 5",                       // RECLASS bit_count==0 (invalid dist symbol / hole / code 30,31)
+                "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
                 "jmp 85f",
-                // (igzip-converge: the libdeflate DistTable subtable inline decode
-                //  formerly at `91:` is DELETED — long dist codes now resolve
-                //  inline in the igzip two-stage body at `94:`→`96:`.)
+                // FLOOR ORACLE (NIGHT16): INLINE subtable-dist (igzip
+                // decode_next_dist long path, igzip_decode_block_stateless.asm
+                // macro 396-440; mirror of production careful path
+                // marker_inflate.rs:3447-3449 `if is_subtable_ptr { consume(9);
+                // lookup_subtable_direct }`). At 91:: {dpre}=={t1}=subtable
+                // pointer entry, {t2}=length (PRESERVE), bitbuf/bitsleft are
+                // post-litlen+refill, t3/t4 free. Consume the 9 main DistTable
+                // bits, index the subtable, load the leaf into {t1}, re-enter
+                // 94b — where the leaf's total_bits/codeword_bits (= len-9 +
+                // extra, relative to the post-9-consume bitbuf, since the
+                // builder stores subtable_len = len-table_bits) are decoded by
+                // the unchanged in-register entry path. Byte-exact (ref lockstep
+                // in run_contig_ref_biased).
+                "91:",
+                "shr {bitbuf}, 9",                    // consume DistTable::TABLE_BITS=9
+                "sub {bitsleft}, 9",
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 8",
+                "and {t3:e}, 0xF",                    // subtable_bits (DistEntry bits 11-8)
+                "bzhi {t4}, {bitbuf}, {t3}",          // idx = bitbuf & ((1<<sb)-1)   (sb<=6)
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 16",                     // subtable_start (DistEntry bits 31-16)
+                "add {t4:e}, {t3:e}",
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {dist_off}]",   // leaf entry
+                "jmp 94b",
                 "92:",
                 "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
                 "jmp 85f",
@@ -1168,9 +1128,7 @@ mod imp {
                 d0 = out(reg) _,                      // iteration-top dst anchor (was [ctx+64])
                 lit_off = const ASM_LIT_SHORT_OFF,    // [ctx + idx*4 + lit_off]
                 llong_off = const ASM_LIT_LONG_OFF,   // lea [ctx + llong_off]
-                dist_short_off = const ASM_DIST_SHORT_OFF, // igzip dist short_code_lookup [ctx + idx*2 + ..]
-                dist_long_off = const ASM_DIST_LONG_OFF,   // igzip dist long_code_lookup [ctx + idx*2 + ..]
-                dist_start_off = const ASM_DIST_START_OFF, // rfc1951 dist_start [ctx + sym*4 + ..]
+                dist_off = const ASM_DIST_OFF,        // [ctx + idx*4 + dist_off]
                 bitbuf = inout(reg) bitbuf,
                 bitsleft = inout(reg) bitsleft,
                 pos = inout(reg) pos,
@@ -1387,9 +1345,9 @@ mod imp {
                 //    read_in` — mask CONST off-path, single `and` critical op (same
                 //    convergence as the litlen index above; byte-identical, AND
                 //    commutative).
-                "mov {dpre:e}, 0x3FF",                // igzip 550: mask CONST (10-bit ISAL_DECODE_SHORT_BITS index)
-                "and {dpre:e}, {bitbuf:e}",           // igzip 551: dist index = bitbuf & 0x3FF
-                "movzx {dpre:e}, word ptr [{ctx} + {dpre}*2 + {dist_short_off}]", // igzip 552: u16 short_code_lookup
+                "mov {dpre:e}, 0x1FF",                // igzip 550: mask CONST (off critical path)
+                "and {dpre:e}, {bitbuf:e}",           // igzip 551: dist index = bitbuf & 0x1FF
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 // ── LATE DISCRIMINATOR (igzip 555-556): trailing < 256 ⇒
                 //    literal ⇒ back-edge (the HOT exit); ≥ 256 ⇒ length/EOB ⇒
                 //    fall through to the non-literal arm. THE core igzip-shape
@@ -1468,8 +1426,8 @@ mod imp {
                 "cmp {t5:e}, 512",
                 "ja 8f",                              // long oversize lone → restore + RECLASS tag 0
                 "mov {dpre:e}, {bitbuf:e}",
-                "and {dpre:e}, 0x3FF",                // igzip 10-bit ISAL_DECODE_SHORT_BITS index
-                "movzx {dpre:e}, word ptr [{ctx} + {dpre}*2 + {dist_short_off}]", // u16 short_code_lookup
+                "and {dpre:e}, 0x1FF",                // DistTable::TABLE_BITS = 9
+                "mov {dpre:e}, dword ptr [{ctx} + {dpre}*4 + {dist_off}]",
                 "lea {t2:e}, [{t5:e} - 254]",         // length
                 "jmp 58f",                            // dst = base = copy start
                 // ── oversize trailing (>512): restore + RECLASS, tag by cnt
@@ -1486,50 +1444,32 @@ mod imp {
                 //    X2: the iteration-top p0/d0 anchor makes every dist-side
                 //    bail un-consume (tag at `80:` → reconstruct at `85:`). ──
                 "58:",
-                "mov {t1:e}, {dpre:e}",               // preloaded igzip dist short entry (u16, zero-ext) → t1
-                // ── igzip TWO-STAGE distance decode (decode_next_dist,
-                //    igzip_decode_block_stateless.asm macro 396-440 + body
-                //    565-581). REPLACES libdeflate's in-register DistEntry
-                //    consume_entry (the structural Rank-1 divergence). t1 = the
-                //    10-bit-indexed short_code_lookup entry: bits 0..8 = sym(5) |
-                //    extra-count(4) (SMALL_SHORT_SYM), bit 10 = SMALL_FLAG_BIT
-                //    (long-code pointer), bits 11.. = code length. The shared tail
-                //    `96:` consumes the codeword, looks up rfc1951 `dist_start[sym]`,
-                //    BZHI-extracts the extra bits, and forms the distance. A
-                //    long-code leaf re-enters `96:` with t3 = bit_count. Byte-exact
-                //    with `run_contig_ref_biased` (igzip-form ref, lockstep).
+                "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
+                // FLOOR ORACLE (NIGHT16): subtable leaf re-enters here (the
+                // inline subtable decode at 91: loads the leaf into {t1} and
+                // jumps back to 94b). On a leaf the two tests below are
+                // harmless: a valid leaf is nonzero (raw0 test falls through)
+                // and bit14 (0x4000) is always 0 for a distance entry (the
+                // distance base occupies bits 16-30, codeword_bits bits 8-11),
+                // so it falls straight into the normal in-register entry decode.
                 "94:",
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 11",                     // bit_count (SMALL_SHORT_CODE_LEN_OFFSET); long entry → long_max_len
-                "jz 90f",                             // bit_count == 0 → invalid dist symbol (hole/30/31) → bail (tag 5)
-                "test {t1:e}, 0x400",                 // SMALL_FLAG_BIT
-                "jz 96f",                             // short code → shared tail
-                // ── long-code path (cold; igzip macro 416-431). t3 = long_max_len.
-                "mov {t4}, {bitbuf}",
-                "shr {t4}, 10",                       // next_bits = read_in >> ISAL_DECODE_SHORT_BITS
-                "sub {t3:e}, 10",                     // long_max_len - lookup_size
-                "bzhi {t4}, {t4}, {t3}",              // CLEAR_HIGH_BITS: keep low (long_max_len-10) bits
-                "and {t1:e}, 0x1FF",                  // SMALL_SHORT_SYM (long-table base index)
-                "add {t1:e}, {t4:e}",                 // long_idx = base + next_bits
-                "movzx {t1:e}, word ptr [{ctx} + {t1}*2 + {dist_long_off}]", // leaf entry (u16)
-                "mov {t3:e}, {t1:e}",
-                "shr {t3:e}, 10",                     // leaf bit_count (SMALL_LONG_CODE_LEN_OFFSET)
-                "jz 90f",                             // invalid leaf → bail (tag 5)
-                // ── shared tail (igzip macro %%end 433-439 + body 565-581):
-                //    t3 = bit_count (codeword length), t1 = entry (low 9 = sym|extra).
-                "96:",
-                "shrx {bitbuf}, {bitbuf}, {t3}",      // consume the dist codeword bits
-                "sub {bitsleft}, {t3}",
+                "test {t1:e}, {t1:e}",
+                "jz 90f",                             // raw == 0 (hole/code 30/31) → bail (tag 5)
+                "test {t1:e}, 0x4000",                // HUFFDEC_SUBTABLE_POINTER
+                "jnz 91f",                            // subtable dist → INLINE decode at 91:
+                "mov {t3}, {bitbuf}",                 // saved_bitbuf
+                "shrx {bitbuf}, {bitbuf}, {t1}",      // consume_entry: >>= raw as u8 (= total_bits <= 31)
                 "mov {t4:e}, {t1:e}",
-                "shr {t4:e}, 5",                      // DIST_SYM_EXTRA_OFFSET
-                "and {t4:e}, 0xF",                    // t4 = extra bit count (DIST_SYM_EXTRA_MASK)
-                "and {t1:e}, 0x1F",                   // t1 = dist symbol (DIST_SYM_MASK)
-                "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {dist_start_off}]", // igzip 565: dist_start[sym]
-                "bzhi {t3}, {bitbuf}, {t4}",          // igzip 571: extra value = low (extra-count) bits
-                "shrx {bitbuf}, {bitbuf}, {t4}",      // igzip 572: consume the extra bits
-                "sub {bitsleft}, {t4}",               // igzip 578
-                "add {t1:e}, {t3:e}",                 // igzip 581: distance = dist_start[sym] + extra
-                "jz 92f",                             // distance == 0 → restore (tag 7; corrupt sym-30-with-code)
+                "and {t4:e}, 0x1F",
+                "sub {bitsleft}, {t4}",               // -= raw & 0x1F (no underflow: budget proof)
+                "bzhi {t3}, {t3}, {t1}",              // saved & ((1 << total_bits) - 1)
+                "mov {t4:e}, {t1:e}",
+                "shr {t4:e}, 8",
+                "and {t4:e}, 0xF",                    // codeword_bits
+                "shrx {t3}, {t3}, {t4}",              // extra value
+                "shr {t1:e}, 16",                     // distance base
+                "add {t1:e}, {t3:e}",                 // distance
+                "jz 92f",                             // distance == 0 → restore (tag 7)
                 "cmp {t1:e}, 32768",
                 "ja 92f",                             // > MAX_WINDOW_SIZE → restore (tag 7)
                 "mov {t4}, {dst}",
@@ -1746,11 +1686,33 @@ mod imp {
                 // All reconstruct identically at 85: (re-read from p0, dst=d0);
                 // the only difference is the stat tag in {ret}. Byte-transparent.
                 "90:",
-                "mov {ret}, 5",                       // RECLASS bit_count==0 (invalid dist symbol / hole / code 30,31)
+                "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
                 "jmp 85f",
-                // (igzip-converge: the libdeflate DistTable subtable inline decode
-                //  formerly at `91:` is DELETED — long dist codes now resolve
-                //  inline in the igzip two-stage body at `94:`→`96:`.)
+                // FLOOR ORACLE (NIGHT16): INLINE subtable-dist (igzip
+                // decode_next_dist long path, igzip_decode_block_stateless.asm
+                // macro 396-440; mirror of production careful path
+                // marker_inflate.rs:3447-3449 `if is_subtable_ptr { consume(9);
+                // lookup_subtable_direct }`). At 91:: {dpre}=={t1}=subtable
+                // pointer entry, {t2}=length (PRESERVE), bitbuf/bitsleft are
+                // post-litlen+refill, t3/t4 free. Consume the 9 main DistTable
+                // bits, index the subtable, load the leaf into {t1}, re-enter
+                // 94b — where the leaf's total_bits/codeword_bits (= len-9 +
+                // extra, relative to the post-9-consume bitbuf, since the
+                // builder stores subtable_len = len-table_bits) are decoded by
+                // the unchanged in-register entry path. Byte-exact (ref lockstep
+                // in run_contig_ref_biased).
+                "91:",
+                "shr {bitbuf}, 9",                    // consume DistTable::TABLE_BITS=9
+                "sub {bitsleft}, 9",
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 8",
+                "and {t3:e}, 0xF",                    // subtable_bits (DistEntry bits 11-8)
+                "bzhi {t4}, {bitbuf}, {t3}",          // idx = bitbuf & ((1<<sb)-1)   (sb<=6)
+                "mov {t3:e}, {dpre:e}",
+                "shr {t3:e}, 16",                     // subtable_start (DistEntry bits 31-16)
+                "add {t4:e}, {t3:e}",
+                "mov {t1:e}, dword ptr [{ctx} + {t4}*4 + {dist_off}]",   // leaf entry
+                "jmp 94b",
                 "92:",
                 "mov {ret}, 7",                       // RECLASS bad-distance (0 / >window)
                 "jmp 85f",
@@ -1799,9 +1761,7 @@ mod imp {
                 d0 = out(reg) _,                      // iteration-top dst anchor (was [ctx+64])
                 lit_off = const ASM_LIT_SHORT_OFF,    // [ctx + idx*4 + lit_off]
                 llong_off = const ASM_LIT_LONG_OFF,   // lea [ctx + llong_off]
-                dist_short_off = const ASM_DIST_SHORT_OFF, // igzip dist short_code_lookup [ctx + idx*2 + ..]
-                dist_long_off = const ASM_DIST_LONG_OFF,   // igzip dist long_code_lookup [ctx + idx*2 + ..]
-                dist_start_off = const ASM_DIST_START_OFF, // rfc1951 dist_start [ctx + sym*4 + ..]
+                dist_off = const ASM_DIST_OFF,        // [ctx + idx*4 + dist_off]
                 bitbuf = inout(reg) bitbuf,
                 bitsleft = inout(reg) bitsleft,
                 pos = inout(reg) pos,
@@ -2286,8 +2246,7 @@ pub fn dump_if_enabled() {}
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 pub fn run_contig_ref(
     lut: &super::lut_huffman::LutLitLenCode,
-    dist_small: &super::lut_huffman::LutDistCode,
-    dist_start: &[u32; 32],
+    dist: &crate::decompress::inflate::libdeflate_entry::DistTable,
     lb: &mut Bits<'_>,
     out: &mut [u8],
     dst: &mut usize,
@@ -2295,9 +2254,7 @@ pub fn run_contig_ref(
     in_lim: usize,
 ) -> u64 {
     let mut stats = RefArmStats::default();
-    run_contig_ref_biased::<0>(
-        lut, dist_small, dist_start, lb, out, dst, out_lim, in_lim, &mut stats,
-    )
+    run_contig_ref_biased::<0>(lut, dist, lb, out, dst, out_lim, in_lim, &mut stats)
 }
 
 /// Arm-level coverage counters for the REFERENCE model — flip-precondition 2
@@ -2340,8 +2297,7 @@ pub struct RefArmStats {
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
     lut: &super::lut_huffman::LutLitLenCode,
-    dist_small: &super::lut_huffman::LutDistCode,
-    dist_start: &[u32; 32],
+    dist: &crate::decompress::inflate::libdeflate_entry::DistTable,
     lb: &mut Bits<'_>,
     out: &mut [u8],
     dst: &mut usize,
@@ -2405,42 +2361,25 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         // decode_len_dist: dst = base+cnt → copy start base+cnt-1 (asm `dec`).
         *dst -= 1;
         let length = trailing as usize - 254;
-        // ── igzip TWO-STAGE distance decode — lockstep with run_contig's
-        //    `94:`→`96:` body (igzip decode_next_dist macro 396-440 + body
-        //    565-581). `short_code_lookup` is indexed by the low 10 bits
-        //    (ISAL_DECODE_SHORT_BITS) of the post-litlen-consume+refill bitbuf
-        //    (the asm's speculative `dpre` preload). The entry packs
-        //    sym|extra-count in its low 9 bits; a SMALL_FLAG_BIT entry points to
-        //    a long-code leaf. `bit_count==0` ⇒ invalid dist symbol (hole / code
-        //    30,31) ⇒ bail (asm `90:`). Distance = rfc1951 `dist_start[sym]` +
-        //    BZHI-extracted extra bits. The ==0 / >32768 / >*dst guards mirror
-        //    the asm `92:`/`93:` bails exactly.
-        use super::lut_huffman::{
-            DIST_SYM_EXTRA_MASK, DIST_SYM_EXTRA_OFFSET, DIST_SYM_MASK, SMALL_FLAG_BIT,
-            SMALL_LONG_CODE_LEN_OFFSET, SMALL_SHORT_CODE_LEN_OFFSET, SMALL_SHORT_SYM_MASK,
-        };
-        let short_idx = (lb.bitbuf & 0x3FF) as usize;
-        let mut entry = dist_small.table.short_code_lookup[short_idx] as u32;
-        let bit_count = if entry & SMALL_FLAG_BIT == 0 {
-            entry >> SMALL_SHORT_CODE_LEN_OFFSET
+        // FLOOR ORACLE (NIGHT16): inline subtable-dist in lockstep with the asm
+        // 91:→94b path (mirror of careful path marker_inflate.rs:3447-3449).
+        // After consuming the 9 main DistTable bits, the leaf entry's
+        // total_bits/codeword_bits are relative to the post-9-consume bitbuf, so
+        // `decode_distance(saved=post-9 bitbuf)` and `consume_entry(leaf.raw())`
+        // reproduce the asm exactly. raw==0 (hole/codes 30,31) still bails.
+        let e0 = dist.lookup(lb.bitbuf);
+        let e = if e0.is_subtable_ptr() {
+            lb.consume(crate::decompress::inflate::libdeflate_entry::DistTable::TABLE_BITS as u32);
+            dist.lookup_subtable_direct(e0, lb.bitbuf)
         } else {
-            // long-code path (cold; igzip macro 416-431).
-            let long_max = entry >> SMALL_SHORT_CODE_LEN_OFFSET;
-            let next_bits = ((lb.bitbuf >> 10) & ((1u64 << (long_max - 10)) - 1)) as u32;
-            let long_idx = ((entry & SMALL_SHORT_SYM_MASK) + next_bits) as usize;
-            entry = dist_small.table.long_code_lookup[long_idx] as u32;
-            entry >> SMALL_LONG_CODE_LEN_OFFSET
+            e0
         };
-        let bail = if bit_count == 0 {
+        let bail = if e.raw() == 0 {
             true
         } else {
-            lb.consume(bit_count);
-            let extra_count = (entry >> DIST_SYM_EXTRA_OFFSET) & DIST_SYM_EXTRA_MASK;
-            let sym = (entry & DIST_SYM_MASK) as usize;
-            let base = dist_start[sym];
-            let extra_val = (lb.bitbuf & ((1u64 << extra_count) - 1)) as u32;
-            lb.consume(extra_count);
-            let distance = (base + extra_val) as usize;
+            let saved = lb.bitbuf;
+            lb.consume_entry(e.raw());
+            let distance = e.decode_distance(saved) as usize;
             if distance == 0 || distance > 32768 || distance > *dst {
                 true
             } else {
@@ -2540,8 +2479,6 @@ mod tests {
             out_base: dst as u64,
             lut_litlen: LutLitLenCode::new_empty(),
             dist: DistTable::new_empty(),
-            dist_small: crate::decompress::parallel::lut_huffman::LutDistCode::new_empty(),
-            dist_start: crate::decompress::parallel::lut_huffman::RFC1951_DIST_START,
         });
         // Guards pass → RECLASS, state unchanged.
         let (exit, ndst) = unsafe { run_contig(&ctx, &mut lb, dst) };
@@ -2630,13 +2567,12 @@ mod tests {
         // literal-only semantics and small-buffer envelope, while now
         // covering the X2 restore on every backref candidate).
         use crate::decompress::inflate::libdeflate_entry::DistTable;
-        use crate::decompress::parallel::lut_huffman::{LutDistCode, RFC1951_DIST_START};
         let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
         for (ti, lens) in lens_set.iter().enumerate() {
             // ELEMENT A: tables INLINE in one AsmState — the asm reads them off
             // the single `ctx` base; the ref reads the SAME storage
-            // (`st.lut_litlen` / `st.dist_small`), so contents are identical and
-            // the differential is valid.
+            // (`st.lut_litlen` / `st.dist`), so contents are identical and the
+            // differential is valid.
             let mut st = Box::new(AsmState {
                 in_ptr: 0,
                 in_lim: 0,
@@ -2648,12 +2584,6 @@ mod tests {
                     c
                 },
                 dist: dist_holes.clone(),
-                dist_small: {
-                    let mut d = LutDistCode::new_empty();
-                    assert!(d.rebuild_from(&[0u8; 30]), "holes dist table");
-                    d
-                },
-                dist_start: RFC1951_DIST_START,
             });
             for trial in 0..4000 {
                 // Random input stream, long enough for the margin scheme.
@@ -2677,8 +2607,7 @@ mod tests {
                 let mut dref = 0usize;
                 let ref_exit = run_contig_ref(
                     &st.lut_litlen,
-                    &st.dist_small,
-                    &st.dist_start,
+                    &st.dist,
                     &mut lb_ref,
                     &mut out_ref,
                     &mut dref,
@@ -2746,9 +2675,8 @@ mod tests {
         let mut lut = LutLitLenCode::new_empty();
         assert!(lut.rebuild_from(&fixed), "fixed table lens must be valid");
         let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
-        use crate::decompress::parallel::lut_huffman::{LutDistCode, RFC1951_DIST_START};
         // ELEMENT A: tables INLINE in one AsmState; asm + both ref arms read the
-        // SAME storage (st.lut_litlen / st.dist_small).
+        // SAME storage (st.lut_litlen / st.dist).
         let mut st = Box::new(AsmState {
             in_ptr: 0,
             in_lim: 0,
@@ -2756,12 +2684,6 @@ mod tests {
             out_base: 0,
             lut_litlen: lut,
             dist: dist_holes,
-            dist_small: {
-                let mut d = LutDistCode::new_empty();
-                assert!(d.rebuild_from(&[0u8; 30]), "holes dist table");
-                d
-            },
-            dist_start: RFC1951_DIST_START,
         });
 
         let mut x: u64 = 0xD1B54A32D192ED03;
@@ -2799,8 +2721,7 @@ mod tests {
             let mut st0 = RefArmStats::default();
             let ref0_exit = run_contig_ref_biased::<0>(
                 &st.lut_litlen,
-                &st.dist_small,
-                &st.dist_start,
+                &st.dist,
                 &mut lb_ref0,
                 &mut out_ref0,
                 &mut dref0,
@@ -2842,8 +2763,7 @@ mod tests {
             let mut st1 = RefArmStats::default();
             let _ = run_contig_ref_biased::<1>(
                 &st.lut_litlen,
-                &st.dist_small,
-                &st.dist_start,
+                &st.dist,
                 &mut lb_ref1,
                 &mut out_ref1,
                 &mut dref1,
@@ -2892,9 +2812,7 @@ mod tests {
     #[test]
     fn c3_differential_asm_vs_ref_windowed_backrefs() {
         use crate::decompress::inflate::libdeflate_entry::DistTable;
-        use crate::decompress::parallel::lut_huffman::{
-            LutDistCode, LutLitLenCode, RFC1951_DIST_START,
-        };
+        use crate::decompress::parallel::lut_huffman::LutLitLenCode;
         if !std::arch::is_x86_feature_detected!("bmi2") {
             eprintln!("SKIP c3 differential: no BMI2 on this host (run on guest)");
             return;
@@ -2927,27 +2845,19 @@ mod tests {
         let mut fixed = vec![8u8; 288];
         fixed[144..256].iter_mut().for_each(|x| *x = 9);
         fixed[256..280].iter_mut().for_each(|x| *x = 7);
-        // Dist code-length sets. The igzip dist_small (10-bit short index) is
-        // built per-pair into the inline AsmState slot; both arms read it.
-        //   * small  (dsym 0..7, complete) — dist 1..16: RLE/stride/burst copy;
-        //   * fixed5 ([5;30], 2/32 holes) — full distance range + invalid-dist /
-        //     > *pos restore/RECLASS coverage;
-        //   * deep   (Kraft-complete tree, code lengths up to 15) — codes > 10
-        //     bits exercise the igzip LONG-code path (the `94:`→long→`96:` route;
-        //     igzip ISAL_DECODE_SHORT_BITS=10, so >10-bit dist codes are the only
-        //     way to hit the long table).
-        let dist_small_lens: &[u8] = &[2, 2, 2, 3, 4, 5, 6, 6];
-        let dist_fixed5_lens: &[u8] = &[5u8; 30];
-        let dist_deep_lens: &[u8] = &[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0,
-        ];
-        let pairs: [(&[u8], &[u8], &str); 5] = [
-            (&lenny, dist_small_lens, "lenny×small"),
-            (&lenny, dist_fixed5_lens, "lenny×fixed5"),
-            (&lenny, dist_deep_lens, "lenny×deep"),
-            (&fixed, dist_fixed5_lens, "fixed×fixed5"),
-            (&fixed, dist_small_lens, "fixed×small"),
+        // Dist tables.
+        let dist_small = DistTable::build(&[2, 2, 2, 3, 4, 5, 6, 6]).expect("small dist table");
+        let dist_fixed5 = DistTable::build(&[5u8; 30]).expect("fixed5 dist table");
+        let dist_sub = DistTable::build(&[1, 2, 3, 4, 5, 6, 7, 8, 10, 10, 10, 10])
+            .expect("subtable dist table");
+        // ELEMENT A: pairs carry the litlen LENS (a per-pair AsmState rebuilds
+        // the inline litlen table) + the dist table (cloned into the inline slot).
+        let pairs: [(&[u8], &DistTable, &str); 5] = [
+            (&lenny, &dist_small, "lenny×small"),
+            (&lenny, &dist_fixed5, "lenny×fixed5"),
+            (&lenny, &dist_sub, "lenny×sub"),
+            (&fixed, &dist_fixed5, "fixed×fixed5"),
+            (&fixed, &dist_small, "fixed×small"),
         ];
 
         let mut x: u64 = 0x243F6A8885A308D3;
@@ -2965,10 +2875,9 @@ mod tests {
         // ref counts are a valid proxy for the asm arms under the equality
         // asserts below).
         let mut cell_stats: [RefArmStats; 5] = Default::default();
-        for (pi, (lens, dlens, tag0)) in pairs.iter().enumerate() {
-            // Inline litlen + igzip dist in ONE AsmState (zero-copy single base);
-            // asm + ref share the storage (st.lut_litlen / st.dist_small). The
-            // libdeflate `dist` field is unused by the asm post-convergence.
+        for (pi, (lens, dt, tag0)) in pairs.iter().enumerate() {
+            // Inline litlen + dist in ONE AsmState (zero-copy single base);
+            // asm + ref share the storage (st.lut_litlen / st.dist).
             let mut st = Box::new(AsmState {
                 in_ptr: 0,
                 in_lim: 0,
@@ -2979,13 +2888,7 @@ mod tests {
                     assert!(c.rebuild_from(lens), "test table lens must be valid");
                     c
                 },
-                dist: DistTable::new_empty(),
-                dist_small: {
-                    let mut d = LutDistCode::new_empty();
-                    assert!(d.rebuild_from(dlens), "dist lens must be valid");
-                    d
-                },
-                dist_start: RFC1951_DIST_START,
+                dist: (*dt).clone(),
             });
             for trial in 0..3000 {
                 let n = 150 + (next() as usize % 450);
@@ -3011,8 +2914,7 @@ mod tests {
                 let mut dref = WIN;
                 let ref_exit = run_contig_ref_biased::<0>(
                     &st.lut_litlen,
-                    &st.dist_small,
-                    &st.dist_start,
+                    &st.dist,
                     &mut lb_ref,
                     &mut out_ref,
                     &mut dref,
