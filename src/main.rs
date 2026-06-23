@@ -135,6 +135,14 @@ fn main() {
 
     install_signal_handlers();
 
+    // Leg-2 RSS-inflation ceiling oracle (GZIPPY_RSS_INFLATE_MIB=<N>, no-op
+    // unless set; byte-transparent). Pin N MiB resident BEFORE the timed decode
+    // region so its first-touch cost is in the PRE span and only the resident
+    // footprint persists into the kernel address-space teardown at _exit —
+    // bounds the AMD-T2 "teardown ∝ peak RSS" prize without touching decode.
+    #[cfg(parallel_sm)]
+    crate::decompress::parallel::rss_inflate::engage();
+
     let result = run();
 
     // Debug-only memory accounting (no-op unless GZIPPY_MEM_STATS is set).
