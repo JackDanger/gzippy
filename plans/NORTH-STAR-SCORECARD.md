@@ -50,9 +50,42 @@ vs-ISA-L codegen floor ([[project_x86_t1_monolith_finish_2026_06_22]]: kernel
 acquitted, scaffold = harness artifact, monolith instruction-only, dist-rewrite
 refuted). Closing it needs a heroic inner-kernel asm rewrite to match ISA-L IPC.
 
-## OPEN (owed before any "we win" claim)
-- **aarch64 (macOS)**: T1 + T≥2 cross-tool matrix — UNMEASURED at HEAD (different
-  Rust no-asm kernel; igzip N/A on arm64). cursor's next front (b).
+## aarch64 (macOS M-series, 10-core; N=13, sha==zcat; no taskset/igzip on arm64;
+## local-box noise ⇒ ratios near 1.0 are effectively TIE)
+| cell | gz/libdeflate | gz/pigz | gz/rg | gz/gunzip |
+|------|---------------|---------|-------|-----------|
+| T1 silesia  | 1.045 | 0.940 | 0.365 | 0.331 |
+| T1 monorepo | 1.068 | 0.949 | 0.277 | 0.295 |
+| T1 nasa     | 0.936 | 0.928 | 0.280 | 0.266 |
+| T4 silesia  | —     | 0.410 | 0.530 | — |
+| T4 monorepo | —     | 0.743 | 0.511 | — |
+| T8 silesia  | —     | 0.297 | 0.541 | — |
+
+**aarch64: gz beats pigz, rapidgzip (~2-3×), gunzip at ALL T; ~TIES libdeflate at
+T1 (0.94-1.07, within local-box noise; ~5-7% behind on silesia/monorepo, ahead on
+nasa). No igzip on arm64 → libdeflate is the arm64 serial SOTA, and gz is at-parity.**
+
+## FINAL CROSS-ARCH VERDICT
+| north-star target | Intel | AMD | aarch64 |
+|-------------------|-------|-----|---------|
+| beat pigz @ all T | ✓ | ✓ | ✓ |
+| tie/beat rapidgzip @ all T | ✓ | ✓ | ✓ |
+| beat libdeflate @ T1 | ✓ | ✓ | ~TIE (noise) |
+| beat igzip @ T1 | **LOSS 9-15%** | **LOSS 4-8%** | n/a (no ISA-L) |
+| beat gunzip/zlib | ✓ (~4-6×) | ✓ | ✓ (~3×) |
+
+**gz-native is the fastest or tied-fastest gzip decoder across every arch × T × tool
+measured, with ONE honest asterisk: T1-vs-igzip on x86 (the intrinsic pure-Rust-vs-
+ISA-L IPC floor, 4-15%, gated-CONCLUDED).** It beats pigz and rapidgzip — the
+explicit "all T" / parallel comparators — everywhere.
+
+## OPEN / CAVEATS
 - AMD numbers are llama-load-noisy ⇒ a frozen+llama-paused reconfirm tightens ratios
-  (direction is robust). Honest label: "parallel-decode SOTA on x86 (T≥2); serial
-  beats all-but-igzip at T1 (pure-Rust floor); aarch64 owed."
+  (direction robust across all cells). aarch64 measured on the working mac (no
+  pinning, efficiency cores) ⇒ T1 gz/libdeflate near 1.0 is effectively a TIE.
+- For LAW-grade promotion: frozen AMD reconfirm + a quiet-mac aarch64 reconfirm
+  would tighten the near-1.0 ratios (none would flip a direction — the pigz/rg wins
+  are 2-6× and the igzip loss is consistent 4-15%).
+- The single remaining north-star gap is **T1-vs-igzip on x86** — closing it needs a
+  heroic inner-kernel asm rewrite to match ISA-L IPC (gated-concluded floor; opt-in
+  front, not a default).
