@@ -208,19 +208,25 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // GZIPPY_MONOLITH=1 so the prior falsifier stays reproducible.
     let use_old_monolith =
         t1_serial && !force_thin_oracle && std::env::var_os("GZIPPY_MONOLITH").is_some();
-    // T1-MONOLITH-STREAMING: the gzippy-native PRODUCTION DEFAULT at T==1. One
-    // continuous serial decode streaming through a small resident buffer — sheds
-    // the per-chunk DRIVER SCAFFOLD (gated +21-30% igzip gap) without the prior
-    // monolith's fault-storm. GZIPPY_NO_MONOLITH=1 forces thin-T1 (A/B
-    // re-verify). gzippy-isal keeps thin-T1 (its ISA-L clean tail already wins
-    // at T1; the streaming monolith is native-only).
+    // T1-MONOLITH-STREAMING: one continuous serial decode that STREAMS through a
+    // small resident buffer (no fault-storm — fixes the prior full-ISIZE
+    // monolith). It IS byte-exact, fault-storm-free, and DOES shed the per-chunk
+    // scaffold INSTRUCTIONS (fulcrum optgate: instr/byte RESOLVED-improved on
+    // silesia/nasa/monorepo/squishy), but fulcrum optgate REFUSED the wall win as
+    // INSTRUCTION-ONLY — cyc/byte did NOT improve beyond spread (only 2.8-4.6% of
+    // the gz→igzip cyc/byte gap closed; residual is kernel cycle-efficiency, NOT
+    // the scaffold). Per the governing policy (FULCRUM is the sole oracle; a
+    // default-path change must ride a gated WALL win), it is OPT-IN
+    // (GZIPPY_STREAM_MONOLITH=1), NOT the default; production T1 stays thin-T1
+    // (byte-identical to before this cycle). See
+    // plans/T1-MONOLITH-FINISH-RESULTS.md. Native-only; T>1 never takes it.
     let use_stream_monolith = {
         #[cfg(not(isal_clean_tail))]
         {
             t1_serial
                 && !force_thin_oracle
                 && !use_old_monolith
-                && std::env::var_os("GZIPPY_NO_MONOLITH").is_none()
+                && std::env::var_os("GZIPPY_STREAM_MONOLITH").is_some()
         }
         #[cfg(isal_clean_tail)]
         {

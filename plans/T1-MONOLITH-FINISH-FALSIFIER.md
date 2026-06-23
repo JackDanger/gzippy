@@ -1,5 +1,14 @@
 # T1-MONOLITH-FINISH — PRE-REGISTERED FALSIFIER
 
+> **OUTCOME (2026-06-22, gated Intel, NOT-YET-LAW): PARTIAL.** byte-exact + no
+> fault-storm + no regression + instr/byte RESOLVED-shed, but fulcrum optgate
+> REFUSED the wall win (INSTRUCTION-ONLY) on all 4 corpora — cyc/byte did NOT
+> improve beyond spread, only 2.8–4.6% of the gz→igzip gap closed, mono/igzip
+> still 1.16–1.30. Residual = kernel cyc/byte, NOT the scaffold. Shipped OPT-IN
+> (`GZIPPY_STREAM_MONOLITH=1`); production T1 default stays thin-T1. Full numbers:
+> plans/T1-MONOLITH-FINISH-RESULTS.md.
+
+
 Committed BEFORE building (CLAUDE.md Measurement PROTOCOL; pre-register hypothesis +
 falsifier). Branch `t1-monolith-finish` off `origin/kernel-converge-A` @39acc213.
 
