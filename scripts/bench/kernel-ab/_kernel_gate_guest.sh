@@ -174,7 +174,17 @@ fi
 pin_mask() { local t=$1 i=0 m=""; while [ "$i" -lt "$t" ]; do [ -n "$m" ] && m="$m,"; m="$m$((PINBASE + i*2))"; i=$((i+1)); done; echo "$m"; }
 
 # wall(duration_time,ns) + cycles + instructions + task-clock(ms) + LLC refs/misses
-EVENTS="duration_time,cpu_core/cycles/,cpu_core/instructions/,task-clock,cpu_core/cache-references/,cpu_core/cache-misses/"
+# ARCH-AWARE PMU: Intel hybrid exposes a `cpu_core/` P-core PMU; AMD Zen2 (and
+# non-hybrid Intel) only has the plain core counters. Probe once and pick the
+# event syntax the box actually supports (an Intel-only `cpu_core/...` string
+# produces ALL-error CSVs on Zen2 -> "NO PAIRED DATA" -> UNTRUSTED).
+if perf stat -e cpu_core/cycles/ -- true >/dev/null 2>&1; then
+  EVENTS="duration_time,cpu_core/cycles/,cpu_core/instructions/,task-clock,cpu_core/cache-references/,cpu_core/cache-misses/"
+  echo "PMU: cpu_core/ (Intel hybrid P-core)"
+else
+  EVENTS="duration_time,cycles,instructions,task-clock,cache-references,cache-misses"
+  echo "PMU: plain core counters (AMD / non-hybrid)"
+fi
 MASK="$(pin_mask "$THREADS")"
 
 run_one() {  # $1=arm(A1|A2|B) $2=corp $3=rep
