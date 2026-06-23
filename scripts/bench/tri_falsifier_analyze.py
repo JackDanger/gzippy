@@ -140,7 +140,10 @@ if len(rss_pts) >= 2:
     if gz and rg:
         dmib = (gz-rg)/1024
         print(f"     peak RSS T2: gz={gz/1024:.1f}MiB rg={rg/1024:.1f}MiB ratio={gz/rg:.2f} ΔRSS={dmib:.1f}MiB")
-        print(f"     => teardown prize at full convergence ~ {slope*dmib:+.2f}% of T2 wall")
+        print(f"     => [CONFLATED first-touch+teardown — run() times the WHOLE process;")
+        print(f"         this OVER-states the prize. Use _teardown_split_guest.sh for the")
+        print(f"         PURE-teardown slope (~0.084 ms/MiB Intel => ~0.9% of T2 wall).]")
+        print(f"         conflated estimate: {slope*dmib:+.2f}% of T2 wall")
 
 print("\nPEAK RSS (median KiB) all cells:")
 for (cell, who), v in sorted(peak.items()):
