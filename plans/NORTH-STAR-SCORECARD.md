@@ -89,3 +89,20 @@ explicit "all T" / parallel comparators — everywhere.
 - The single remaining north-star gap is **T1-vs-igzip on x86** — closing it needs a
   heroic inner-kernel asm rewrite to match ISA-L IPC (gated-concluded floor; opt-in
   front, not a default).
+
+## T1-vs-igzip FLOOR ATTACK (2026-06-23, gated) — named micro-levers EXHAUSTED
+Mechanism re-located at HEAD (gated, Intel+AMD): INSTRUCTION-BOUND, not mispredict
+(gz instr/B 13.4 vs igzip 11.4 ~1.18x; gz IPC HIGHER; gz brmiss% LOWER). Recoverability
+inject oracle: cyc/B rises with instr/B (slope 0.19-0.22, not flat floor) BUT IPC rises
+under injection (partial slack; slope = upper bound on hypothetical removals, not the
+actual surplus mix).
+ATTEMPTS (all gated): cursor #1 copy-shape (route <=40&dist>=16 through arm-1 MOVDQU
+loop) BUILT byte-exact -> cyc/B REVERT (instr UP +2-4.6%, monorepo +8.2%); the RANK-2
+3-burst was already near-optimal for <=40. stateless anchor (-0.607 instr/B) BROKEN at
+HEAD + cycle-slack pre. dist refuted. literal path at parity.
+VERDICT (cursor + gated): BANK+ACCEPT the incremental inner-kernel floor. Remaining
+#2/#3 = <1 instr/B at ~0.12-0.20 cyc/B (noise vs 0.40 gap). The ONLY remaining path to
+igzip-T1 parity is a HEROIC from-scratch T1-stateless-monolith asm rewrite (igzip _04
+loop shape, no resumable tax, T1-only; high byte-exact risk; possibly the true floor).
+=> STRATEGIC FORK for the user: fund the heroic rewrite or accept the ~9%(Intel)/
+~4-7%(AMD) pure-Rust-vs-ISA-L T1 floor.
