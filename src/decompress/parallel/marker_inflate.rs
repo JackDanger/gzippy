@@ -798,8 +798,6 @@ impl Block {
                 out_base: 0,
                 lut_litlen: crate::decompress::parallel::lut_huffman::LutLitLenCode::new_empty(),
                 dist: crate::decompress::inflate::libdeflate_entry::DistTable::new_empty(),
-                dist_small: crate::decompress::parallel::lut_huffman::LutDistCode::new_empty(),
-                dist_start: crate::decompress::parallel::lut_huffman::RFC1951_DIST_START,
             }),
             #[cfg(pure_inflate_decode)]
             dist_hc:
@@ -3011,21 +3009,13 @@ impl Block {
         if dist_amort_disabled() {
             // KILL-SWITCH (GZIPPY_DIST_AMORT=0): rebuild every block (no cache
             // reuse), still in place. Same binary/layout; only behavior toggles.
-            // Dual-build (atomic): the asm kernel reads the igzip-shaped
-            // `dist_small`; the Rust fast loop / careful tail read `dist`. Both
-            // are built from the SAME `lens` so they decode the identical stream
-            // and the asm<->Rust handoff is seamless. `dist_valid` latches BOTH.
-            let ok_d = self.asm.dist.rebuild(lens);
-            let ok_s = self.asm.dist_small.rebuild_from(lens);
-            self.dist_valid = ok_d && ok_s;
+            self.dist_valid = self.asm.dist.rebuild(lens);
             self.dist_table_nlens = 0; // force a rebuild next block too
             return;
         }
         let reusable = self.dist_valid && &self.dist_table_lens[..self.dist_table_nlens] == lens;
         if !reusable {
-            // Dual-build (atomic): igzip-shaped `dist_small` for the asm kernel +
-            // libdeflate `dist` for the Rust paths, both from the SAME `lens`.
-            let ok = self.asm.dist.rebuild(lens) && self.asm.dist_small.rebuild_from(lens);
+            let ok = self.asm.dist.rebuild(lens);
             self.dist_valid = ok;
             if ok {
                 self.dist_table_lens[..lens.len()].copy_from_slice(lens);
