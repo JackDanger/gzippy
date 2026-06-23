@@ -67,3 +67,4 @@ tools/fulcrum/**/__pycache__/
 .fulcrum/
 artifacts/standing/
 artifacts/kernel-gate/
+!.fulcrum/findings.jsonl
