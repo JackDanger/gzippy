@@ -62,3 +62,8 @@ tools/fulcrum/**/__pycache__/
 !artifacts/decide/decide_20260611T193035Z/
 !artifacts/decide/decide_20260611T193035Z/**/
 !artifacts/decide/decide_20260611T193035Z/**/*.txt
+
+# machine-local fulcrum config + regenerable measurement artifacts
+.fulcrum/
+artifacts/standing/
+artifacts/kernel-gate/
