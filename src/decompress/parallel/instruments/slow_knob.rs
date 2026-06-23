@@ -88,6 +88,7 @@ fn count_marker_hits() -> bool {
 /// Print the clean-loop decode-event hit count when `GZIPPY_SLOW_HITS=1`. Call
 /// from `main` after the decode completes. No-op otherwise.
 pub fn report_hits() {
+    report_ring_inject();
     if count_hits() {
         eprintln!(
             "[slow_knob] clean-loop inject hits = {}",
@@ -643,5 +644,115 @@ pub fn inject(spin: u64, yield_hint: bool) {
             acc = acc.wrapping_add(black_box(i).wrapping_mul(0x9E37_79B9));
         }
         black_box(acc);
+    }
+}
+
+// ── RING / FOLD-DRAIN PER-CHUNK INJECTOR (ring_other region perturbation) ─────
+//
+// Causal-perturbation (CLAUDE.md Gate-2) knob for the per-worker `ring_other`
+// region = R_WORKER − R_TABLE − R_DECODE (per-chunk scaffold: ChunkData setup +
+// the per-block loop machinery in `finish_decode_chunk_contig_native` + finalize
+// + the ~1% ContigFoldSink drain copy). The fulcrum F-9c5ca01d020d sub-decomp
+// flagged this as the LARGEST raw gz>rg gap but did NOT prove it MOVES the wall.
+//
+// Contract:
+//   GZIPPY_RING_INJECT_NS=<ns>  — inject ~<ns> nanoseconds of work PER CHUNK in
+//     the ring_other region (the call site is in the chunk_fetcher worker
+//     wrapper, inside the R_WORKER rdtsc window but OUTSIDE the Block-method
+//     R_TABLE/R_DECODE spans, so the injected cycles land in `ring_other`).
+//     Unset / 0 / unparseable ⇒ OFF (a single hoistable branch per chunk —
+//     chunk granularity, NOT per-decode-event, so OFF cost is negligible).
+//   GZIPPY_SLOW_KIND=sleep      — frequency-neutral CONTROL (real nanosleep that
+//     yields the core) instead of the busy rdtsc-bounded spin. Reuses the same
+//     env knob the inner-loop perturbation uses.
+//
+// Byte transparency: the busy arm only mutates a black-boxed accumulator; the
+// sleep arm only deschedules. Decoded bytes are IDENTICAL ON vs OFF (DUAL-SHA
+// gate). Non-inert proof: RING_INJECT_HITS (== chunk decode count) and
+// RING_INJECT_NS_TOTAL (> 0) reported by `report_hits` when the knob is set.
+
+/// Non-inert proof: number of chunks the ring injector fired on.
+pub static RING_INJECT_HITS: AtomicU64 = AtomicU64::new(0);
+/// Non-inert proof: total nanoseconds the ring injector TARGETED (sum of per-
+/// chunk `<ns>`). Actual injected wall ≈ this on the frozen box.
+pub static RING_INJECT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Per-chunk target injection in nanoseconds (`GZIPPY_RING_INJECT_NS`). `0` ⇒
+/// OFF. Read once.
+#[inline]
+pub fn ring_inject_ns() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GZIPPY_RING_INJECT_NS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Calibrated TSC ticks per nanosecond, measured ONCE at first use against a
+/// 10 ms `Instant` window. On the frozen Zen2 box (invariant TSC, gov=
+/// performance, boost=0) TSC ≈ core cycles, so an rdtsc-bounded spin yields a
+/// precise wall-ns injection — turbo-neutral by construction (freq is pinned),
+/// which is what makes the busy arm and the sleep control comparable.
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the parallel_sm worker call site
+fn tsc_per_ns() -> f64 {
+    static C: OnceLock<f64> = OnceLock::new();
+    *C.get_or_init(|| {
+        let rd = || crate::decompress::parallel::instruments::contig_prof::rdtsc(true);
+        let t0 = std::time::Instant::now();
+        let c0 = rd();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let c1 = rd();
+        let ns = t0.elapsed().as_nanos() as f64;
+        let dc = c1.wrapping_sub(c0) as f64;
+        if ns > 0.0 && dc > 0.0 {
+            dc / ns
+        } else {
+            2.8 // EPYC 7282 base ~2.8 GHz fallback
+        }
+    })
+}
+
+/// Inject one chunk's worth of ring-region work. Snapshot `ring_inject_ns()` /
+/// `yield_kind()` is unnecessary here — chunk granularity makes the OnceLock
+/// read negligible. OFF (ns==0) returns on a single predicted branch.
+#[inline]
+#[allow(dead_code)] // instrument: only reached from the parallel_sm worker call site
+pub fn ring_inject() {
+    let ns = ring_inject_ns();
+    if ns == 0 {
+        return;
+    }
+    RING_INJECT_HITS.fetch_add(1, Ordering::Relaxed);
+    RING_INJECT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
+    if yield_kind() {
+        // Frequency-neutral control: a real nanosleep (yields the core).
+        std::thread::sleep(std::time::Duration::from_nanos(ns));
+    } else {
+        // Busy rdtsc-bounded spin: precise wall-ns on the frozen box.
+        let target = (ns as f64 * tsc_per_ns()) as u64;
+        let rd = || crate::decompress::parallel::instruments::contig_prof::rdtsc(true);
+        let t0 = rd();
+        let mut acc: u64 = black_box(0);
+        while rd().wrapping_sub(t0) < target {
+            acc = acc.wrapping_add(black_box(acc).wrapping_mul(0x9E37_79B9).wrapping_add(1));
+        }
+        black_box(acc);
+    }
+}
+
+/// Report ring-injector non-inert counters when the knob is armed. Called from
+/// `report_hits`.
+pub fn report_ring_inject() {
+    if ring_inject_ns() > 0 {
+        eprintln!(
+            "[slow_knob] RING inject: hits(chunks)={} target_ns_total={} per_chunk_ns={} kind={}",
+            RING_INJECT_HITS.load(Ordering::Relaxed),
+            RING_INJECT_NS_TOTAL.load(Ordering::Relaxed),
+            ring_inject_ns(),
+            if yield_kind() { "sleep" } else { "spin" },
+        );
     }
 }

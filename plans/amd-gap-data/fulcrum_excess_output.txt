@@ -1,0 +1,7 @@
+── fulcrum excess ─ cyc/byte differential [NOT-YET-LAW]
+   loss=silesia  control=nasa  arch=amd-zen2  gz=1b7473f8ff8d  rg=b407b3d56849  ε=0.050
+   region                       verdict        loss g/r  ctrl g/r   recoverable
+   R_WORKER                     EXCESS           1.119    0.923       1.1564
+   R_MARKERPP                   INCONCLUSIVE     0.699    0.690       0.0000
+   R_OUTPUT                     INCONCLUSIVE     0.272    0.259       0.0000
+   ── RECOVERABLE BUDGET = 1.1564 cyc/byte  (sum of 1 EXCESS region(s))  [NOT-YET-LAW: needs cross-arch replication]
