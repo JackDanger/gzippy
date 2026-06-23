@@ -869,6 +869,23 @@ mod imp {
                 //    <= 15, so dst+240+15 = dst+255 <= cap-12 (the scalar
                 //    path's own bound is dst+264 <= cap-3,
                 //    marker_inflate.rs:2959-2962).
+                // RANK-3 (B3) libdeflate overshoot-burst routing
+                // (decompress_template.h:590-622): short-medium matches (<=40 B —
+                // the nasa-dominant variable-trip-count case) take the scalar
+                // 5-word (40 B) UNCONDITIONAL burst at `70:` — one shot, NO
+                // per-16B `sub {t2},16; jle` trip-count loop (removes the nasa
+                // 48%-mispredict B3 branch for the common length range). Long
+                // matches (41..240) keep the 16-B MOVDQU SIMD loop (SIMD
+                // efficiency where the loop is amortized); >240 also takes the
+                // scalar path. Byte-exact: both copy paths are proven equivalent
+                // to emit_backref_contig for every distance/overlap (the scalar
+                // path IS the production >240 path), and a back-ref copy touches
+                // NO bit-cursor (bitbuf/bitsleft/pos), so the c2/c3 cursor
+                // differential + ref model are unchanged. Envelope-safe: <=40
+                // scalar extent <=48 B, 41..240 MOVDQU extent <=255 B, >240
+                // scalar extent <=265 B — all < FAST_OUT_SLOP=282.
+                "cmp {t2}, 40",
+                "jbe 70f",                            // <=40 → scalar burst (no trip-count loop)
                 "cmp {t2}, 240",
                 "ja 70f",                             // long (rare) → scalar path
                 "lea {ret}, [{dst} + {t2}]",          // ret = end = dst + length
@@ -1470,6 +1487,23 @@ mod imp {
                 //    <= 15, so dst+240+15 = dst+255 <= cap-12 (the scalar
                 //    path's own bound is dst+264 <= cap-3,
                 //    marker_inflate.rs:2959-2962).
+                // RANK-3 (B3) libdeflate overshoot-burst routing
+                // (decompress_template.h:590-622): short-medium matches (<=40 B —
+                // the nasa-dominant variable-trip-count case) take the scalar
+                // 5-word (40 B) UNCONDITIONAL burst at `70:` — one shot, NO
+                // per-16B `sub {t2},16; jle` trip-count loop (removes the nasa
+                // 48%-mispredict B3 branch for the common length range). Long
+                // matches (41..240) keep the 16-B MOVDQU SIMD loop (SIMD
+                // efficiency where the loop is amortized); >240 also takes the
+                // scalar path. Byte-exact: both copy paths are proven equivalent
+                // to emit_backref_contig for every distance/overlap (the scalar
+                // path IS the production >240 path), and a back-ref copy touches
+                // NO bit-cursor (bitbuf/bitsleft/pos), so the c2/c3 cursor
+                // differential + ref model are unchanged. Envelope-safe: <=40
+                // scalar extent <=48 B, 41..240 MOVDQU extent <=255 B, >240
+                // scalar extent <=265 B — all < FAST_OUT_SLOP=282.
+                "cmp {t2}, 40",
+                "jbe 70f",                            // <=40 → scalar burst (no trip-count loop)
                 "cmp {t2}, 240",
                 "ja 70f",                             // long (rare) → scalar path
                 "lea {ret}, [{dst} + {t2}]",          // ret = end = dst + length
@@ -1908,6 +1942,11 @@ mod imp {
                 "and {t3:e}, 0xFFF",
                 "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
                 // ── 16-byte MOVDQU back-ref copy (identical to run_contig) ─
+                // RANK-3 (B3): <=40 → scalar overshoot-burst (no trip-count
+                // loop); 41..240 MOVDQU; >240 scalar. See run_contig for the
+                // byte-exact + envelope proof.
+                "cmp {t2}, 40",
+                "jbe 70f",
                 "cmp {t2}, 240",
                 "ja 70f",
                 "lea {ret}, [{dst} + {t2}]",
