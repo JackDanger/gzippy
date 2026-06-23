@@ -125,6 +125,61 @@ pub const INVALID_CODE: u32 = 0xFF_FFFF;
 
 pub const ISAL_INVALID_BLOCK: i32 = -2;
 
+/// Distance base values indexed by distance symbol (0..29; 30/31 are holes).
+/// Bit-identical to vendor `rfc1951_lookup_table.dist_start`
+/// (vendor/isa-l/igzip/rfc1951_lookup.asm). igzip's two-stage distance decode
+/// adds this base to the BZHI-extracted extra bits to form the back-ref
+/// distance (`igzip_decode_block_stateless.asm:565,581`). Embedded INLINE in
+/// `AsmState` so the asm kernel indexes it `[{ctx}+DIST_START_OFF + sym*4]`
+/// off the single `ctx` base. Symbols 30/31 are 0 (unreachable: a code that
+/// decodes to 30/31 has dist_start 0 + extra 0 = distance 0, but the asm bails
+/// on bit_count==0 before reaching here — those alphabet slots are holes).
+pub const RFC1951_DIST_START: [u32; 32] = [
+    0x0000_0001,
+    0x0000_0002,
+    0x0000_0003,
+    0x0000_0004,
+    0x0000_0005,
+    0x0000_0007,
+    0x0000_0009,
+    0x0000_000d,
+    0x0000_0011,
+    0x0000_0019,
+    0x0000_0021,
+    0x0000_0031,
+    0x0000_0041,
+    0x0000_0061,
+    0x0000_0081,
+    0x0000_00c1,
+    0x0000_0101,
+    0x0000_0181,
+    0x0000_0201,
+    0x0000_0301,
+    0x0000_0401,
+    0x0000_0601,
+    0x0000_0801,
+    0x0000_0c01,
+    0x0000_1001,
+    0x0000_1801,
+    0x0000_2001,
+    0x0000_3001,
+    0x0000_4001,
+    0x0000_6001,
+    0x0000_0000,
+    0x0000_0000,
+];
+
+/// Distance-extra bit counts indexed by distance symbol (0..29; 30/31 = 0).
+/// Bit-identical to vendor `rfc1951_lookup_table.dist_extra_bit_count`
+/// (vendor/isa-l/igzip/rfc1951_lookup.asm). Packed into each dist `HuffCode`'s
+/// extra-bit-count field by `LutDistCode::rebuild_from` so the LUT builder
+/// folds it into the entry (`DIST_SYM_EXTRA`) and the igzip two-stage decode
+/// reads it from the entry.
+pub const DIST_EXTRA_BIT_COUNT: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02, 0x02, 0x03, 0x03, 0x04, 0x04, 0x05, 0x05, 0x06, 0x06,
+    0x07, 0x07, 0x08, 0x08, 0x09, 0x09, 0x0a, 0x0a, 0x0b, 0x0b, 0x0c, 0x0c, 0x0d, 0x0d, 0x00, 0x00,
+];
+
 /// Length-extra bit counts indexed by length-code (length symbol minus 257).
 /// Vendor `rfc_lookup_table.len_extra_bit_count` (igzip_inflate.c:113-115).
 pub const LEN_EXTRA_BIT_COUNT: [u8; 32] = [
@@ -795,7 +850,16 @@ pub fn make_inflate_huff_code_dist(
         while index1 < last_total {
             let sym1_index = code_list[index1];
             let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
-            let sym1_extra = huff_code_table[sym1_index as usize].extra_bit_count() as u32;
+            // igzip reads the dist-extra count straight from the rfc table at
+            // LUT-write time (igzip_inflate.c:680) — NOT from the HuffCode (its
+            // `.code` field carries no extra). Keeping extra out of the HuffCode
+            // is required: the long-code build uses `.code >> ISAL_DECODE_SHORT_BITS`
+            // as the sub-table index (igzip_inflate.c:717), which would be
+            // corrupted by a packed extra field.
+            let sym1_extra = DIST_EXTRA_BIT_COUNT
+                .get(sym1_index as usize)
+                .copied()
+                .unwrap_or(0) as u32;
             if sym1_index <= max_symbol {
                 if sym1_code as usize >= short_len {
                     return false;
@@ -857,7 +921,8 @@ pub fn make_inflate_huff_code_dist(
             let sym1_index = temp_code_list[j as usize] as usize;
             let sym1_len = huff_code_table[sym1_index].length() as u32;
             let sym1_code = huff_code_table[sym1_index].code_and_extra();
-            let sym1_extra = huff_code_table[sym1_index].extra_bit_count() as u32;
+            // Extra from the rfc table (igzip_inflate.c:731), not the HuffCode.
+            let sym1_extra = DIST_EXTRA_BIT_COUNT.get(sym1_index).copied().unwrap_or(0) as u32;
 
             let mut long_bits = sym1_code >> ISAL_DECODE_SHORT_BITS;
             let min_increment = 1u32 << (sym1_len - ISAL_DECODE_SHORT_BITS);
@@ -1154,8 +1219,17 @@ impl LutLitLenCode {
 /// LIT_LEN_ELEMS to match the C, which uses the same buffer for both
 /// lit/len and dist phases (the dist phase uses only the first 30
 /// entries — `ISAL_DEF_DIST_SYMBOLS`).
+/// `#[repr(C)]` + `table` FIRST: element A (igzip single-state-base register
+/// discipline) — co-locate the igzip-shaped distance short+long LUT INLINE
+/// inside the boxed `AsmState` (asm_kernel.rs) so the asm addresses it
+/// `[{ctx}+DIST_SHORT_OFF + idx*2]` off the ONE `ctx` base, exactly like the
+/// litlen `LutLitLenCode`. The table is UN-BOXED so its bytes are physically
+/// inline in the owning `AsmState`; `table` is the first field at offset 0 so
+/// `offset_of!(LutDistCode, table) == 0`. (Previously `Box<InflateHuffCodeSmall>`
+/// — the boxed form is incompatible with the single-base, zero-copy build.)
+#[repr(C)]
 pub struct LutDistCode {
-    pub table: Box<InflateHuffCodeSmall>,
+    pub table: InflateHuffCodeSmall,
     dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
     valid: bool,
 }
@@ -1163,7 +1237,7 @@ pub struct LutDistCode {
 impl LutDistCode {
     pub fn new_empty() -> Self {
         Self {
-            table: Box::new(InflateHuffCodeSmall::default()),
+            table: InflateHuffCodeSmall::default(),
             dist_huff: Box::new([HuffCode::default(); LIT_LEN_ELEMS]),
             valid: false,
         }
@@ -1597,6 +1671,146 @@ mod tests {
         let r = decoder.decode(&mut bits).expect("valid code");
         assert_eq!(r.0, 0, "dist symbol 0 for bit-0 input");
         assert_eq!(r.1, 1, "1 bit consumed");
+    }
+
+    /// (a) TABLE-EQUIVALENCE differential — the byte-exact gate for the
+    /// igzip-two-stage dist-decode convergence (`asm_kernel.rs run_contig`).
+    ///
+    /// For every dist code-length set and a large sweep of bit patterns, the
+    /// igzip-shaped `LutDistCode` + `RFC1951_DIST_START` MUST decode the IDENTICAL
+    /// `(distance, total-bits-consumed)` as the libdeflate `DistTable` the
+    /// production Rust fast loop / careful tail still use — and bail (no valid
+    /// code) on the IDENTICAL bit patterns. This proves the two dist tables,
+    /// built from the same `lens`, decode the same stream, so the asm (igzip
+    /// table) ↔ Rust (DistTable) handoff in `marker_inflate.rs` is seamless.
+    /// Mirrors the asm/`run_contig_ref_biased` two-stage decode exactly.
+    #[test]
+    fn lutdist_matches_disttable_distance_and_bits() {
+        use crate::decompress::inflate::consume_first_decode::Bits;
+        use crate::decompress::inflate::libdeflate_entry::DistTable;
+
+        // igzip two-stage decode of ONE distance from `bitbuf`, returning
+        // (distance, total_bits) or None on an invalid/hole code. Byte-for-byte
+        // the `run_contig` `94:`→`96:` body / `run_contig_ref_biased` ref.
+        fn decode_igzip(d: &LutDistCode, bitbuf: u64) -> Option<(u32, u32)> {
+            let short_idx = (bitbuf & 0x3FF) as usize;
+            let mut entry = d.table.short_code_lookup[short_idx] as u32;
+            let bit_count = if entry & SMALL_FLAG_BIT == 0 {
+                entry >> SMALL_SHORT_CODE_LEN_OFFSET
+            } else {
+                let long_max = entry >> SMALL_SHORT_CODE_LEN_OFFSET;
+                let next_bits = ((bitbuf >> 10) & ((1u64 << (long_max - 10)) - 1)) as u32;
+                let long_idx = ((entry & SMALL_SHORT_SYM_MASK) + next_bits) as usize;
+                entry = d.table.long_code_lookup[long_idx] as u32;
+                entry >> SMALL_LONG_CODE_LEN_OFFSET
+            };
+            if bit_count == 0 {
+                return None;
+            }
+            let extra_count = (entry >> DIST_SYM_EXTRA_OFFSET) & DIST_SYM_EXTRA_MASK;
+            let sym = (entry & DIST_SYM_MASK) as usize;
+            let base = RFC1951_DIST_START[sym];
+            let extra_val = ((bitbuf >> bit_count) & ((1u64 << extra_count) - 1)) as u32;
+            Some((base + extra_val, bit_count + extra_count))
+        }
+
+        // libdeflate DistTable decode of ONE distance via a real Bits reader
+        // (the exact production careful-path / old-ref sequence): lookup →
+        // subtable → decode_distance + consume_entry. Returns (distance,
+        // total_bits) or None on raw==0.
+        fn decode_lib(dist: &DistTable, data: &[u8]) -> Option<(u32, u32)> {
+            let mut lb = Bits::new(data);
+            lb.refill();
+            let start = lb.pos * 8 - lb.bitsleft as usize;
+            let e0 = dist.lookup(lb.bitbuf);
+            let e = if e0.is_subtable_ptr() {
+                lb.consume(DistTable::TABLE_BITS as u32);
+                dist.lookup_subtable_direct(e0, lb.bitbuf)
+            } else {
+                e0
+            };
+            if e.raw() == 0 {
+                return None;
+            }
+            let saved = lb.bitbuf;
+            lb.consume_entry(e.raw());
+            let distance = e.decode_distance(saved);
+            let consumed = (lb.pos * 8 - lb.bitsleft as usize) - start;
+            Some((distance, consumed as u32))
+        }
+
+        let lens_sets: [&[u8]; 5] = [
+            &[2, 2, 2, 3, 4, 5, 6, 6],
+            &[5u8; 30],
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ],
+            &[3, 3, 3, 3, 3, 3, 3, 3], // complete 8-leaf depth-3
+            &[
+                4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6,
+                6, 6,
+            ], // 29 real dist syms, mixed lengths
+        ];
+
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+
+        for (li, lens) in lens_sets.iter().enumerate() {
+            let mut lut = LutDistCode::new_empty();
+            let ok_s = lut.rebuild_from(lens);
+            let dist = DistTable::build(lens);
+            // Build acceptance must agree (cursor-agent hazard #1).
+            assert_eq!(
+                ok_s,
+                dist.is_some(),
+                "build acceptance diverged for lens set {li}"
+            );
+            if !ok_s {
+                continue;
+            }
+            let dist = dist.unwrap();
+            let mut compared = 0u64;
+            let mut both_bail = 0u64;
+            for _ in 0..200_000 {
+                // 16 random bytes (safe Bits refill margin) → a 64-bit bit
+                // window from the first 8; both decoders see the SAME low bits
+                // (igzip from bitbuf, libdeflate from the byte stream via Bits —
+                // bit 0 is byte 0 bit 0 in both). A dist code consumes <=28 bits
+                // < 64, so the first 8 bytes fully determine the decode.
+                let w0 = next();
+                let w1 = next();
+                let mut data = [0u8; 16];
+                data[..8].copy_from_slice(&w0.to_le_bytes());
+                data[8..].copy_from_slice(&w1.to_le_bytes());
+                let bitbuf = w0;
+                let igz = decode_igzip(&lut, bitbuf);
+                let lib = decode_lib(&dist, &data);
+                match (igz, lib) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a, b, "lens {li}: (dist,bits) diverged for bitbuf {bitbuf:#018x}");
+                        compared += 1;
+                    }
+                    (None, None) => {
+                        both_bail += 1;
+                    }
+                    (a, b) => panic!(
+                        "lens {li}: bail-agreement diverged for bitbuf {bitbuf:#018x}: igzip={a:?} libdeflate={b:?}"
+                    ),
+                }
+            }
+            // Coverage floor: the sweep must actually decode codes (not all bail).
+            assert!(
+                compared > 0,
+                "lens set {li}: no valid decodes compared (sweep degenerate)"
+            );
+            eprintln!("[lutdist≡disttable] lens {li}: {compared} matched decodes, {both_bail} agreed-bails");
+        }
     }
 
     /// Build a simple lit/len table from a fixed code-length distribution
