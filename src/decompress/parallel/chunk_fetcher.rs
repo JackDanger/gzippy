@@ -530,7 +530,7 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     // pinned to the fixed resident cap, so consecutive chunks decode into ONE
     // resident buffer instead of a fresh ratio-sized alloc per chunk — the
     // GATED `GZIPPY_RESIDENT_OUTPUT_POOL` mechanism (minor-faults drop toward
-    // igzip, monorepo wall 1.39→1.29 both arches; plans/T1-CACHE-RESIDENCY-RESULTS).
+    // igzip, monorepo wall 1.39→1.29 both arches; former plans/T1-CACHE-RESIDENCY-RESULTS).
     // SCOPED to this thread (RAII): the T>1 parallel workers never set it, so the
     // faithful per-chunk reserve/pool path is unchanged at T>1.
     let _resident = crate::decompress::parallel::chunk_buffer_pool::T1ResidentScope::enter();
@@ -645,7 +645,7 @@ pub static THIN_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// T1-MONOLITH driver — a deliberate, T1-gated DIVERGENCE from the rapidgzip
 /// chunk pipeline TOWARD the igzip serial monolith (see
-/// `plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`). Decodes the ENTIRE single-member
+/// `former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`). Decodes the ENTIRE single-member
 /// deflate body as ONE chunk into ONE contiguous buffer reserved upfront to the
 /// whole-member ISIZE, then writes it once. No per-chunk alloc, no per-chunk
 /// rolling-window clone+re-seed, no per-block boundary record — the single
@@ -899,7 +899,7 @@ fn drive_impl<W: std::io::Write>(
     // never had; on an SMT box the default `get_core_ids()` cycling order packed
     // workers onto SMT-sibling logical cores of the same physical core, costing
     // +18-20% on silesia-T4. The PIN-DISCRIMINATOR measurement (FROZEN Intel,
-    // N=13, plans/PIN-DISCRIMINATOR-2026-06-21.md) proved the unpinned pool ties
+    // N=13, former plans/PIN-DISCRIMINATOR-2026-06-21.md) proved the unpinned pool ties
     // rapidgzip (silesia-T4 1.028 vs pinned 1.198) and the OS spreads the workers
     // across distinct physical cores on its own — so the pinning is deleted.
     let thread_pool = Arc::new(ThreadPool::new(
@@ -980,7 +980,7 @@ fn drive_impl<W: std::io::Write>(
     // The in-order consumer (this thread runs `consumer_loop` inline) is left
     // unpinned — faithful to rapidgzip, which never pins its reader thread; the
     // OS schedules it alongside the unpinned decode workers (see the decode-pool
-    // construction above and plans/PIN-DISCRIMINATOR-2026-06-21.md).
+    // construction above and former plans/PIN-DISCRIMINATOR-2026-06-21.md).
     let consumer_result = consumer_loop(
         input_view,
         writer,

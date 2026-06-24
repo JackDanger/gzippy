@@ -211,10 +211,6 @@ name = "coz_bench"
 required-features = ["pure-rust-inflate"]
 
 [[example]]
-name = "kernel_ab"
-required-features = ["pure-rust-inflate", "isal-compression"]
-
-[[example]]
 name = "kernel_ab_aarch64"
 required-features = ["pure-rust-inflate"]
 

@@ -1657,7 +1657,7 @@ pub(crate) fn decode_huffman_fastloop_bounded(
 /// Byte-for-byte the same OUTPUT as [`decode_huffman_fastloop_bounded`] and the
 /// SAME [`FlatFastloopExit`] resumable contract; the ONLY differences are the
 /// loop *organization* the disasm diff identified as the one remaining structural
-/// divergence vs libdeflate (`plans/disasm/`, `project_aarch64_disasm_diff_2026_06_21`):
+/// divergence vs libdeflate (`former plans/disasm/`, `project_aarch64_disasm_diff_2026_06_21`):
 ///   1. **No top-of-loop refill gate.** The baseline opens each iteration with
 ///      `if bitsleft < REFILL_THRESHOLD { refill }`; libdeflate instead WEAVES the
 ///      refills into the symbol chain (template lines 413/431/572). Every body path

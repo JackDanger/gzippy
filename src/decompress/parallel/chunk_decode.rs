@@ -2005,7 +2005,7 @@ fn seed_block_for_contig_native(
 /// T1-MONOLITH (gzippy-native) — a deliberate, T1-gated DIVERGENCE from the
 /// rapidgzip chunk pipeline TOWARD the igzip serial monolith
 /// (`vendor/isa-l/igzip/igzip_inflate.c isal_inflate :2239-2560`). See
-/// `plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`.
+/// `former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`.
 ///
 /// Decodes the ENTIRE single-member deflate body as ONE chunk into ONE
 /// contiguous output buffer reserved upfront to the whole-member ISIZE (igzip's
