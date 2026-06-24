@@ -121,14 +121,14 @@ FORCE:
 quick: $(GZIPPY_BIN)
 	@echo "══ make quick ══════════════════════════════════════════"
 	@echo "── Stage 1: correctness + routing smoke ────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) correctness 2>&1 | tail -3
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) routing 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) correctness 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) routing 2>&1 | tail -3
 	@echo "── Stage 2: allocation budget ──────────────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) alloc_budget 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) alloc_budget 2>&1 | tail -3
 	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) diff_ratio 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) hot_path 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) hot_path 2>&1 | tail -3
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
