@@ -861,23 +861,34 @@ mod imp {
                 // len (fast form only; the IN_MARGIN proof is preserved — the
                 // refill was already issued conditionally here, this only removes
                 // the skip). The carried gather below is pure.
-                // STEP-2 cadence reorder (NIGHT19/24 class, 0-instruction): issue
-                // the litlen table LOAD in parallel with the pos-advance chain
-                // (igzip loop_block 540 ∥ 543-547) — refill scratch moved to {t5},
-                // index/preload to {t3}, so the 4-cyc L1 load overlaps shr/add.
-                // Byte-exact: same 11 ops permuted; index uses post-OR bitbuf,
-                // pos-advance uses pre-`or 56` bitsleft (identical values to before).
-                "mov {t5}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t5}, {t5}, {bitsleft}",
-                "or {bitbuf}, {t5}",
+                // CURSOR2 (single-refill convergence to igzip): DELETE the SECOND
+                // per-back-ref refill (the `or {bitbuf}` + input load + pos-advance
+                // + `or {bitsleft},56`). igzip refills ONCE per loop_block iteration
+                // (528-530 / 543-547), covering BOTH the litlen and dist consumes
+                // from that one full-budget refill, doing only a table preload before
+                // the copy (575-577). gz had been refilling AGAIN here after the dist
+                // consume — an EXTRA `or {bitbuf}` on the LOOP-CARRIED bitbuf
+                // recurrence (bitbuf feeds the next index→entry-load) for ~30% of
+                // iterations. That on-chain edge is the gz-specific critical-path
+                // lengthening behind the +9% cyc/B vs igzip (gz IPC is already HIGHER
+                // and mispredicts FEWER; gated trainer 2026-06-23: NRK/scaffold
+                // instr-cuts were cyc-FLAT/slack ⇒ the loop is LATENCY-bound, so
+                // only chain-shortening moves the wall).
+                //
+                // BYTE-EXACT BUDGET PROOF: after `6:` real bitsleft F∈[56,63] (the
+                // `or 56` accounting is exact for byte-granular loads). Dist consume
+                // removes D bits; DEFLATE max D = 15-bit code + 13 extra = 28 (incl.
+                // subtable). (a) carried index read needs ≥12: F−D ≥ 56−28 = 28 ✓.
+                // (b) leave bitsleft=F−D, pos UN-advanced; bit pos pos*8−bitsleft is
+                // unchanged (consume-only) so the next `6:` refill loads the correct
+                // bytes. Next top: SHORT litlen bc≤12 (12-bit short table; >12-bit
+                // symbols take the LONG path 20: which bzhi’s ≤21<28 then self-
+                // refills) ⇒ bitsleft ≥ 28−12 = 16 ≥ 12 for the next `6:` index ✓.
+                // Ref model `run_contig_ref_biased` drops its pre-copy refill in
+                // lockstep (c2/c3 cursor differential preserved).
                 "mov {t3:e}, {bitbuf:e}",
                 "and {t3:e}, 0xFFF",
-                "mov {t5:e}, 63",
-                "sub {t5}, {bitsleft}",
-                "shr {t5}, 3",
-                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload (L1 load ∥ pos-advance)
-                "add {pos}, {t5}",
-                "or {bitsleft}, 56",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload only (igzip 575-577; no 2nd refill)
                 // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
                 //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
                 //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
@@ -3094,12 +3105,13 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
             if distance == 0 || distance > 32768 || distance > *dst {
                 true
             } else {
-                // RANK-2: UNCONDITIONAL pre-copy refill, in lockstep with the
-                // asm (the `if bitsleft < 48` skip is DELETED there too). The
-                // fast `Bits::refill` form is bit-for-bit the asm refill, so the
-                // c2/c3 cursor-equality differential (asm.pos/bitbuf/bitsleft ==
-                // ref) still holds; append-only ⇒ functionally identical decode.
-                lb.refill();
+                // CURSOR2 lockstep: the asm DROPS the second per-back-ref refill
+                // (single-refill convergence to igzip), so the ref model drops its
+                // pre-copy `lb.refill()` here too — keeping the c2/c3 cursor-
+                // equality differential (asm.pos/bitbuf/bitsleft == ref) exact.
+                // Budget proof in the asm comment: F−D ≥ 28 bits remain, enough for
+                // the next short decode + `6:` index; the next-iteration refill tops
+                // up. No refill here.
                 unsafe {
                     super::marker_inflate::emit_backref_contig(
                         out.as_mut_ptr(),
