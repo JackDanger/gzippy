@@ -273,6 +273,20 @@ strip = false
 debug = true
 lto = false
 
+# Fast CORRECTNESS-test profile: release-grade opt (so the asm kernel + differential
+# tests run fast on big corpora) but LTO OFF + parallel codegen + unwind, so the test
+# harness BUILDS in ~1-2 min instead of the ~15-20 min fat-LTO release-test build.
+# Correctness (byte-exact output) is opt-/LTO-independent, so this is a safe ~10x faster
+# gate. Use: `cargo test --profile quicktest --no-default-features --features gzippy-native`.
+# PERF (cyc/B) gating still uses the real `--release` binary.
+[profile.quicktest]
+inherits = "release"
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = false
+incremental = true
+
 # Enable native CPU optimizations when building locally
 # (commented out for portable binaries - uncomment for max local perf)
 # [build]
