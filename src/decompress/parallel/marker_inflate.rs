@@ -3583,6 +3583,13 @@ impl Block {
             // INJECT_N/INJECT_MODE statics the asm reads.
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
             let inject_kernel: bool = super::asm_kernel::inject_enabled();
+            // T1 NON-RESUMABLE KERNEL opt-in (GZIPPY_T1_NRK=1): run-to-completion
+            // kernel with the resumable contract shed. One call decodes from the
+            // cursor to either a CONSUMED EOB or an iteration-top BOUNDARY. SAFE
+            // only on a valid window-present (clean) T1 block. Takes precedence
+            // over stateless/inject (mutually exclusive in practice).
+            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            let t1_nrk_kernel: bool = super::asm_kernel::t1_nrk_enabled();
             macro_rules! sync_local_bits {
                 () => {{
                     bits.pos = lb.pos;
@@ -3669,7 +3676,9 @@ impl Block {
                     // excluded by dispatch).
                     let dst0 = unsafe { base.add(*pos) };
                     let (exit, dst1) = unsafe {
-                        if stateless_kernel {
+                        if t1_nrk_kernel {
+                            super::asm_kernel::run_contig_t1_nrk(&self.asm, &mut lb, dst0)
+                        } else if stateless_kernel {
                             super::asm_kernel::run_contig_stateless(&self.asm, &mut lb, dst0)
                         } else if inject_kernel {
                             super::asm_kernel::run_contig_inject(&self.asm, &mut lb, dst0)
@@ -3688,6 +3697,29 @@ impl Block {
                         // identical cursor (decode purity + ≤21-bit backing
                         // — contract doc); skipped when nothing changed.
                         pre = self.asm.lut_litlen.decode_prefilled(&lb);
+                    }
+                    // NRK run-to-completion exit contract (non-resumable): one
+                    // call decodes to a CONSUMED EOB, an iteration-top BOUNDARY,
+                    // or a fatal invalid. EOB ⇒ block done, commit. BOUNDARY ⇒
+                    // fall through to the generic asm_on=false (careful tail
+                    // resumes at the un-consumed cursor). Anything else is an
+                    // invalid symbol on a valid T1 block (never on valid input).
+                    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+                    if t1_nrk_kernel {
+                        if exit == super::asm_kernel::EXIT_NRK_EOB {
+                            // CONSUMED EOB: lb is past the EOB litlen. Mirror lb
+                            // → bits (commit! records `bits`), mark block end,
+                            // commit (returns Ok(emitted) — block complete).
+                            sync_local_bits!();
+                            self.at_end_of_block = true;
+                            commit!(Ok(emitted));
+                        }
+                        if exit != super::asm_kernel::EXIT_BOUNDARY {
+                            sync_local_bits!();
+                            commit!(Err(BlockError::InvalidHuffmanCode));
+                        }
+                        // EXIT_BOUNDARY → generic handling below (asm_on=false →
+                        // careful tail resumes at the un-consumed cursor).
                     }
                     if exit == super::asm_kernel::EXIT_BOUNDARY {
                         // Monotone guard failure — the Rust loop owns the
