@@ -403,6 +403,44 @@ mod tests {
         );
     }
 
+    /// DoS/OOM regression: a tiny MALFORMED gzip must be REJECTED with a terminal
+    /// Err — never trigger an unbounded allocation. This fixture (a 78-byte fuzz
+    /// mutant, `robust_compare.py` m8) decoded to a phantom-block runaway under the
+    /// parallel-SM path: both bit readers zero-pad past end-of-input, so the
+    /// decoder fabricated literals forever, growing the output buffer until the
+    /// process OOM-killed (measured: 78 bytes → >1.5 GiB before SIGKILL). The
+    /// input-relative output ceiling (`input_len × MAX_DEFLATE_EXPANSION`) caps
+    /// the runaway: decode now errors like gzip/igzip. Runs at T=4 (parallel) and
+    /// T=1; both must return Err quickly with bounded memory (no hang, no OOM).
+    #[test]
+    fn test_malformed_input_rejected_not_oom() {
+        // robust_compare.py mutant m8: valid gzip header, corrupted deflate body,
+        // ISIZE trailer = 0x44444444 (~1.14 GiB claimed). A correct decoder errors.
+        const M8: &[u8] = &[
+            31, 139, 8, 0, 144, 239, 59, 106, 0, 255, 237, 198, 177, 1, 0, 32, 8, 0, 32, 45, 75,
+            255, 191, 184, 177, 39, 96, 34, 114, 237, 58, 183, 39, 68, 68, 68, 68, 68, 68, 68, 68,
+            68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
+            68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
+        ];
+        for threads in [1usize, 4] {
+            let mut out = Vec::new();
+            let r = crate::decompress::decompress_single_member(M8, &mut out, threads);
+            assert!(
+                r.is_err(),
+                "malformed input must be rejected at T={threads} (got Ok, {} bytes)",
+                out.len()
+            );
+            // Bounded: the ceiling for a 78-byte input is ~127 KiB; the runaway is
+            // caught after at most one reserve-floor fill (~4 MiB), never the GiBs
+            // it produced before the fix.
+            assert!(
+                out.len() < 64 * 1024 * 1024,
+                "malformed decode produced {} bytes at T={threads} — ceiling not bounding output",
+                out.len()
+            );
+        }
+    }
+
     /// Opt-in routing proof (deletion-trap) for the T1-MONOLITH-STREAMING native
     /// path: with `GZIPPY_STREAM_MONOLITH=1`, a single-member decode at T==1 MUST
     /// be handled by `decode_and_stream_monolith_native` (counter fires) AND be

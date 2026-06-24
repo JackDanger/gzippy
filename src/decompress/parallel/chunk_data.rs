@@ -296,7 +296,23 @@ pub struct ChunkData {
     /// 0 in production / for all other arms. Byte-transparent (only read by the
     /// ceiling instrument).
     pub phantom_ceiling_len: usize,
+    /// DoS/OOM guard: hard upper bound on this chunk's decoded output bytes,
+    /// derived from the compressed input length (`input_len ×
+    /// MAX_DEFLATE_EXPANSION + slack`). Malformed input can drive the deflate
+    /// decoder to fabricate phantom blocks from zero-padding past end-of-input
+    /// (both bit readers zero-pad on underflow), producing UNBOUNDED output from
+    /// a tiny input and OOMing the process. A valid DEFLATE stream expands by at
+    /// most ~1032:1, so this ceiling never trips on legitimate data but caps the
+    /// malformed runaway. `usize::MAX` (no bound) until a decoder sets it via
+    /// [`Self::set_output_ceiling_for_input`]. See `ensure_within_output_ceiling`.
+    pub output_ceiling: usize,
 }
+
+/// Maximum bytes a single DEFLATE byte can expand to. The theoretical worst
+/// case is 1032:1 (a length-258 back-reference encoded in as few as ~2 Huffman
+/// bits). We never need a tighter bound — the goal is only to stop a malformed
+/// stream from allocating without limit, not to predict the exact output size.
+pub const MAX_DEFLATE_EXPANSION: usize = 1032;
 
 impl ChunkData {
     /// Construct an empty chunk anchored at the given compressed-stream
@@ -422,6 +438,7 @@ impl ChunkData {
             pool_worker_index,
             data_prefix_len: 0,
             phantom_ceiling_len: 0,
+            output_ceiling: usize::MAX,
         }
     }
 
@@ -488,6 +505,7 @@ impl ChunkData {
             pool_worker_index: 0,
             data_prefix_len,
             phantom_ceiling_len: 0,
+            output_ceiling: usize::MAX,
         }
     }
 
@@ -594,6 +612,36 @@ impl ChunkData {
             Some(out)
         } else {
             None
+        }
+    }
+
+    /// DoS/OOM guard: arm the decoded-output ceiling from the compressed input
+    /// length this chunk may consume. A valid DEFLATE stream expands by at most
+    /// [`MAX_DEFLATE_EXPANSION`]:1, so any decode producing more than
+    /// `input_len × MAX_DEFLATE_EXPANSION + slack` is malformed (the decoder is
+    /// fabricating phantom blocks from zero-padding past end-of-input). The
+    /// slack absorbs the tiny-input edge (one window + headroom) so small valid
+    /// members never trip. Callers pass the whole deflate-data length, which
+    /// bounds the whole member's output.
+    #[inline]
+    pub fn set_output_ceiling_for_input(&mut self, input_len: usize) {
+        const SLACK: usize = 64 * 1024; // one 32 KiB window + headroom for tiny inputs
+        self.output_ceiling = input_len
+            .saturating_mul(MAX_DEFLATE_EXPANSION)
+            .saturating_add(SLACK);
+    }
+
+    /// DoS/OOM guard: error if decoded output has exceeded the armed ceiling.
+    /// Called once per decode-loop iteration; cheap (one comparison). Returns
+    /// the implausible produced size so the caller can surface a terminal
+    /// corruption error instead of OOMing.
+    #[inline]
+    pub fn ensure_within_output_ceiling(&self) -> Result<(), usize> {
+        let produced = self.decoded_size();
+        if produced > self.output_ceiling {
+            Err(produced)
+        } else {
+            Ok(())
         }
     }
 

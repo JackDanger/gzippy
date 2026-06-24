@@ -36,6 +36,14 @@ pub enum ChunkDecodeError {
         requested: usize,
         actual: usize,
     },
+    /// DoS/OOM guard: decoded output exceeded the plausible ceiling derived from
+    /// the compressed input length (`input_len × MAX_DEFLATE_EXPANSION`). The
+    /// input is malformed — the decoder was fabricating output from zero-padding
+    /// past end-of-input. Surfaced as terminal corruption (no allocation runaway).
+    OutputCeilingExceeded {
+        produced: usize,
+        ceiling: usize,
+    },
     #[allow(dead_code)] // non-SM-build cfg stub
     UnsupportedPlatform,
 }
@@ -932,6 +940,11 @@ fn finish_decode_chunk_impl(
     allow_isal: bool,
 ) -> Result<(), ChunkDecodeError> {
     FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // DoS/OOM guard: bound decoded output to what this compressed input could
+    // plausibly produce (input_len × MAX_DEFLATE_EXPANSION). Malformed input
+    // makes the inflate engine fabricate output from zero-padding past EOF;
+    // the ceiling turns that runaway into a terminal error instead of an OOM.
+    chunk.set_output_ceiling_for_input(input.len());
 
     // gzippy-isal PRODUCTION clean-tail routing (faithful rapidgzip WITH_ISAL,
     // GzipChunk.hpp:440-444 known-window + :520-526 post-32 KiB-flip clean bulk):
@@ -1004,6 +1017,13 @@ fn finish_decode_chunk_impl(
     const STOP_INNER_ON_PENDING_FLUSH: bool = true;
 
     while !stopping_point_reached || wrapper.session_pending() {
+        // DoS/OOM guard: stop a malformed runaway before it OOMs.
+        if let Err(produced) = chunk.ensure_within_output_ceiling() {
+            return Err(ChunkDecodeError::OutputCeilingExceeded {
+                produced,
+                ceiling: chunk.output_ceiling,
+            });
+        }
         let prev_data_len = chunk.data.len();
         let seg_tail = chunk.data.writable_tail();
         let seg_ptr = seg_tail.as_mut_ptr();
@@ -1435,6 +1455,12 @@ fn decode_chunk_unified_marker(
 ) -> Result<ChunkData, ChunkDecodeError> {
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
+    // DoS/OOM guard: bound decoded output to what this compressed input could
+    // plausibly produce. A window-absent (markered) chunk on malformed input can
+    // fabricate phantom blocks from zero-padding past EOF, growing both the u16
+    // marker buffer and the u8 clean buffer without bound; the ceiling turns that
+    // into a terminal error. No effect on valid data (max expansion ~1032:1).
+    chunk.set_output_ceiling_for_input(input.len());
     chunk.data_with_markers.reserve(128 * 1024);
     // Pre-reserve ONE contiguous clean-data region up-front so the post-flip
     // clean tail lands without per-run amortized regrow. Estimate the decoded
@@ -1498,6 +1524,13 @@ fn decode_chunk_unified_marker(
         UNIFIED_ROUTE_CLEAN_U8_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         apply_recorded_block_boundaries(&mut chunk, input, &pending_boundaries);
         pending_boundaries.clear();
+        // DoS/OOM guard: stop a malformed runaway before it OOMs.
+        if let Err(produced) = chunk.ensure_within_output_ceiling() {
+            return Err(ChunkDecodeError::OutputCeilingExceeded {
+                produced,
+                ceiling: chunk.output_ceiling,
+            });
+        }
         if flipped_clean {
             UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1634,6 +1667,12 @@ fn finish_decode_chunk_contig_native(
 
     marker_ctx.current_bit_offset = start_bit_offset;
     let crc32_enabled = chunk.configuration.crc32_enabled;
+    // DoS/OOM guard: bound decoded output to what this compressed input could
+    // plausibly produce (input_len × MAX_DEFLATE_EXPANSION). Malformed input
+    // makes the decoder fabricate phantom blocks from zero-padding past EOF,
+    // growing the output buffer without bound; the ceiling turns that into a
+    // terminal error instead of an OOM. No effect on valid data.
+    chunk.set_output_ceiling_for_input(input.len());
 
     BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
         let mut block = cell_block.borrow_mut();
@@ -1779,6 +1818,13 @@ fn finish_decode_chunk_contig_native(
                         std::io::ErrorKind::InvalidData,
                         "contig native tail: no progress",
                     )));
+                }
+                // DoS/OOM guard: stop a malformed runaway before it OOMs.
+                if let Err(produced) = chunk.ensure_within_output_ceiling() {
+                    return Err(ChunkDecodeError::OutputCeilingExceeded {
+                        produced,
+                        ceiling: chunk.output_ceiling,
+                    });
                 }
             }
 
@@ -2199,7 +2245,24 @@ pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
             "streaming monolith requires a flipped (clean) Block"
         );
 
+        // DoS guard: a valid member's total output cannot exceed
+        // input_len × MAX_DEFLATE_EXPANSION. On malformed input the streaming
+        // decoder fabricates phantom blocks from zero-padding past EOF and would
+        // stream forever (a DoS hang, even though memory stays bounded by the
+        // flush); cap total streamed+buffered output and error past it.
+        let output_ceiling = input
+            .len()
+            .saturating_mul(crate::decompress::parallel::chunk_data::MAX_DEFLATE_EXPANSION)
+            .saturating_add(64 * 1024);
+
         loop {
+            // DoS guard: terminate a malformed phantom-block runaway.
+            if streamed.saturating_add(chunk.decoded_size()) > output_ceiling {
+                return Err(ChunkDecodeError::OutputCeilingExceeded {
+                    produced: streamed.saturating_add(chunk.decoded_size()),
+                    ceiling: output_ceiling,
+                });
+            }
             let slice_byte = marker_ctx.current_bit_offset / 8;
             let mut bits = marker_ctx.open_bits(input);
             let next_block_offset = absolute_bit_pos(slice_byte, &bits);
