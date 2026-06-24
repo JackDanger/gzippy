@@ -607,6 +607,16 @@ mod imp {
                 //    from {t5}/{t3}, so the in-place mask is safe. (`and r32`
                 //    zero-extends, so {t1}'s high 32 bits are 0 for the store.)
                 "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
+                // CONSUME-REORDER (candidate #1, igzip 370-371 order): consume the
+                // litlen bits HERE (right after mask), BEFORE the trailing extract +
+                // spec store, matching igzip decode_next_lit_len (consume before the
+                // store 518). Byte-exact: nothing between mask and the old consume
+                // site reads {bitbuf} (trailing uses {t1}; store uses {t1}/{dst}/{t3});
+                // {t2}=bc is live from classify and dead after. Lets the loop-carried
+                // bitbuf->index->refill->entry-load recurrence start earlier.
+                // Schedule-only; ref model (functional) unchanged.
+                "shrx {bitbuf}, {bitbuf}, {t2}",      // consume litlen (moved up)
+                "sub {bitsleft}, {t2}",
                 // ── TRAILING EXTRACT (igzip 520-521), UNCONDITIONAL every
                 //    iteration: next_sym2 = (masked >> 8*(cnt-1)) & 0xFFFF. The
                 //    post-shrx & 0xFFFF was DELETED (NIGHT34, igzip _04 0x38d25
@@ -628,10 +638,6 @@ mod imp {
                 //    `and 0xFFFFFF` store, which only differed in byte 3).
                 "mov qword ptr [{dst}], {t1}",        // speculative 8-byte store
                 "add {dst}, {t3}",                    // advance by cnt
-                // ── CONSUME the current litlen packet (igzip decode end: SHRX
-                //    read_in; sub read_in_length). {t2} = bc.
-                "shrx {bitbuf}, {bitbuf}, {t2}",
-                "sub {bitsleft}, {t2}",
                 // ── SPLIT REFILL + SOFTWARE-PIPELINED PRELOAD CADENCE (NIGHT19:
                 //    converge run_contig's per-iteration SCHEDULE on igzip's EXACT
                 //    loop_block straight-line order 524-552 — element F of the
