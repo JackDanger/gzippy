@@ -861,17 +861,23 @@ mod imp {
                 // len (fast form only; the IN_MARGIN proof is preserved — the
                 // refill was already issued conditionally here, this only removes
                 // the skip). The carried gather below is pure.
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
+                // STEP-2 cadence reorder (NIGHT19/24 class, 0-instruction): issue
+                // the litlen table LOAD in parallel with the pos-advance chain
+                // (igzip loop_block 540 ∥ 543-547) — refill scratch moved to {t5},
+                // index/preload to {t3}, so the 4-cyc L1 load overlaps shr/add.
+                // Byte-exact: same 11 ops permuted; index uses post-OR bitbuf,
+                // pos-advance uses pre-`or 56` bitsleft (identical values to before).
+                "mov {t5}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t5}, {t5}, {bitsleft}",
+                "or {bitbuf}, {t5}",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
                 "mov {t5:e}, 63",
                 "sub {t5}, {bitsleft}",
                 "shr {t5}, 3",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload (L1 load ∥ pos-advance)
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "mov {t3:e}, {bitbuf:e}",
-                "and {t3:e}, 0xFFF",
-                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
                 // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
                 //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
                 //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
@@ -905,10 +911,26 @@ mod imp {
                 // differential + ref model are unchanged. Envelope-safe: <=40
                 // scalar extent <=48 B, 41..240 MOVDQU extent <=255 B, >240
                 // scalar extent <=265 B — all < FAST_OUT_SLOP=282.
-                "cmp {t2}, 40",
-                "jbe 70f",                            // <=40 → scalar burst (no trip-count loop)
+                // EDIT1 (dispatch-delete): kill the `cmp {t2},40` mispredict (9% cyc,
+                // ~10% br-miss). dist<16 → scalar overlap; len>48 → MOVDQU loop (RARE,
+                // >99% not-taken at mean len 6.3); else the proven branchless 3x MOVDQU
+                // burst (covers len<=48; 48B write = the threshold). No straddling branch.
+                "cmp {t1}, 16",
+                "jb 60f",                             // dist<16 → scalar overlap (period-growth)
+                "cmp {t2}, 48",
+                "ja 75f",                             // len>48 → MOVDQU loop (rare)
+                "movdqu xmm0, [{t4}]",
+                "movdqu [{dst}], xmm0",
+                "movdqu xmm0, [{t4} + 16]",
+                "movdqu [{dst} + 16], xmm0",
+                "movdqu xmm0, [{t4} + 32]",
+                "movdqu [{dst} + 32], xmm0",
+                "add {dst}, {t2}",
+                "mov {t1:e}, {t3:e}",
+                "jmp 2b",
+                "75:",                                // len 49..240 → MOVDQU loop; >240 → scalar
                 "cmp {t2}, 240",
-                "ja 70f",                             // long (rare) → scalar path
+                "ja 60f",
                 "lea {ret}, [{dst} + {t2}]",          // ret = end = dst + length
                 "movdqu xmm0, [{t4}]",                // load 16 from src
                 "mov {t5:e}, 16",
@@ -938,10 +960,6 @@ mod imp {
                 "mov {ret}, 1",                       // NIGHT36: restore hoisted BOUNDARY ({ret} clobbered as copy cursor)
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
-                // ── scalar fallback (length > 240): emit_backref_contig
-                //    transliterated. t1=distance t2=length t4=src {ret}=cursor
-                //    t5=word {t3}=carried entry (LIVE across the copy)
-                "70:",
                 // RANK-2 (project_rank2_instr_locate_2026_06_23): the dist>=8
                 // 5-word SCALAR burst below is 19.6% of all gz instructions.
                 // For the dist>=16 AND len<=40 sub-bucket, replace it with an
@@ -961,24 +979,9 @@ mod imp {
                 // dst+32 stays inside the same envelope; the copy touches NO
                 // bit cursor so the c2/c3 cursor differential + ref model are
                 // unchanged. {ret} (hoisted BOUNDARY=1) is NOT clobbered here.
-                "cmp {t2}, 40",
-                "ja 60f",                             // len>40 → scalar path (untouched)
-                "cmp {t1}, 16",
-                "jb 60f",                             // dist<16 → scalar arms (untouched)
-                "movdqu xmm0, [{t4}]",                // load [src, src+16)
-                "movdqu [{dst}], xmm0",               // store [dst, dst+16)
-                "movdqu xmm0, [{t4} + 16]",           // load [src+16, src+32)
-                "movdqu [{dst} + 16], xmm0",          // store [dst+16, dst+32)
-                "movdqu xmm0, [{t4} + 32]",           // load [src+32, src+48)
-                "movdqu [{dst} + 32], xmm0",          // store [dst+32, dst+48) (overshoot <=8)
-                "add {dst}, {t2}",                    // dst advances by exactly length
-                "mov {t1:e}, {t3:e}",                 // carried packet → top classify
-                "jmp 2b",
                 "60:",                                // dist<16 OR len>40 → B3 scalar path
                 "mov {ret}, {dst}",
-                "cmp {t2}, 40",
-                "jbe 52f",
-                "prefetcht0 byte ptr [{t4} + 40]",    // length > 40 (P3.4 item 3B)
+                "prefetcht0 byte ptr [{t4} + 40]",    // EDIT1: unconditional (was cmp 40 gate)
                 "52:",
                 "add {t2}, {dst}",                    // t2 = end = dst + length
                 "cmp {t1}, 8",
@@ -1543,17 +1546,23 @@ mod imp {
                 // len (fast form only; the IN_MARGIN proof is preserved — the
                 // refill was already issued conditionally here, this only removes
                 // the skip). The carried gather below is pure.
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
+                // STEP-2 cadence reorder (NIGHT19/24 class, 0-instruction): issue
+                // the litlen table LOAD in parallel with the pos-advance chain
+                // (igzip loop_block 540 ∥ 543-547) — refill scratch moved to {t5},
+                // index/preload to {t3}, so the 4-cyc L1 load overlaps shr/add.
+                // Byte-exact: same 11 ops permuted; index uses post-OR bitbuf,
+                // pos-advance uses pre-`or 56` bitsleft (identical values to before).
+                "mov {t5}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t5}, {t5}, {bitsleft}",
+                "or {bitbuf}, {t5}",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
                 "mov {t5:e}, 63",
                 "sub {t5}, {bitsleft}",
                 "shr {t5}, 3",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload (L1 load ∥ pos-advance)
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "mov {t3:e}, {bitbuf:e}",
-                "and {t3:e}, 0xFFF",
-                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
                 // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
                 //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
                 //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
@@ -2180,17 +2189,23 @@ mod imp {
                 // len (fast form only; the IN_MARGIN proof is preserved — the
                 // refill was already issued conditionally here, this only removes
                 // the skip). The carried gather below is pure.
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
+                // STEP-2 cadence reorder (NIGHT19/24 class, 0-instruction): issue
+                // the litlen table LOAD in parallel with the pos-advance chain
+                // (igzip loop_block 540 ∥ 543-547) — refill scratch moved to {t5},
+                // index/preload to {t3}, so the 4-cyc L1 load overlaps shr/add.
+                // Byte-exact: same 11 ops permuted; index uses post-OR bitbuf,
+                // pos-advance uses pre-`or 56` bitsleft (identical values to before).
+                "mov {t5}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t5}, {t5}, {bitsleft}",
+                "or {bitbuf}, {t5}",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
                 "mov {t5:e}, 63",
                 "sub {t5}, {bitsleft}",
                 "shr {t5}, 3",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload (L1 load ∥ pos-advance)
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "mov {t3:e}, {bitbuf:e}",
-                "and {t3:e}, 0xFFF",
-                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
                 // ── 16-byte MOVDQU back-ref copy (igzip large_byte_copy
                 //    603-612 + small_byte_copy 614-627, COPY_SIZE = 16) ──
                 //    t1=distance t2=length t4=src dst=dest {ret}=end {t3}=carried
@@ -2669,17 +2684,23 @@ mod imp {
                 // Byte-exact: append-only fast `Bits::refill` form, IN_MARGIN
                 // keeps pos+8 <= len. (Non-shipped stateless variant kept in
                 // sync with run_contig.)
-                "mov {t3}, qword ptr [{in_ptr} + {pos}]",
-                "shlx {t3}, {t3}, {bitsleft}",
-                "or {bitbuf}, {t3}",
+                // STEP-2 cadence reorder (NIGHT19/24 class, 0-instruction): issue
+                // the litlen table LOAD in parallel with the pos-advance chain
+                // (igzip loop_block 540 ∥ 543-547) — refill scratch moved to {t5},
+                // index/preload to {t3}, so the 4-cyc L1 load overlaps shr/add.
+                // Byte-exact: same 11 ops permuted; index uses post-OR bitbuf,
+                // pos-advance uses pre-`or 56` bitsleft (identical values to before).
+                "mov {t5}, qword ptr [{in_ptr} + {pos}]",
+                "shlx {t5}, {t5}, {bitsleft}",
+                "or {bitbuf}, {t5}",
+                "mov {t3:e}, {bitbuf:e}",
+                "and {t3:e}, 0xFFF",
                 "mov {t5:e}, 63",
                 "sub {t5}, {bitsleft}",
                 "shr {t5}, 3",
+                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload (L1 load ∥ pos-advance)
                 "add {pos}, {t5}",
                 "or {bitsleft}, 56",
-                "mov {t3:e}, {bitbuf:e}",
-                "and {t3:e}, 0xFFF",
-                "mov {t3:e}, dword ptr [{ctx} + {t3}*4 + {lit_off}]",  // carried preload
                 // ── 16-byte MOVDQU back-ref copy (identical to run_contig) ─
                 // RANK-3 (B3): <=40 → scalar overshoot-burst (no trip-count
                 // loop); 41..240 MOVDQU; >240 scalar. See run_contig for the
