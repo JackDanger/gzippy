@@ -58,3 +58,34 @@ EVERY named structural T1 lever is gated-exhausted. The ~9% Intel / ~4-7% AMD
 T1-vs-igzip gap is the genuine pure-Rust-vs-ISA-L codegen/schedule FLOOR. The only
 untried path is a full-loop igzip-objdump-scheduled MONOLITH (cursor MOVE 2) — and
 NRK already showed whole-loop schedule changes regress on AMD (high-risk).
+
+## LITLEN AMORTIZATION — gated INERT (2026-06-23), last optimization lever falsified
+Built litlen LUT amortization (memcmp cached lens, skip rebuild on match; byte-safe,
+default-on + GZIPPY_LITLEN_AMORT kill-switch + reuse counters). Measured reuse-rate
+(GZIPPY_LITLEN_AMORT_STATS, T4): silesia 1/2816, nasa 0/364, monorepo 0/180,
+model 0/6472 = ~0% EVERYWHERE. gzip/pigz re-optimize the Huffman tree per block =>
+consecutive blocks never share litlen lengths. Amortization only helps repeated-
+header streams (BGZF/concatenated/low-entropy), NONE in the benchmark. Default-on it
+would only add a per-block memcmp for 0 benefit. REVERTED.
+
+## FINAL EXHAUSTIVE VERDICT — T1-vs-igzip is a confirmed pure-Rust-asm!-vs-hand-asm floor
+Every optimization lever gated-falsified or proven intrinsic:
+  resumable anchor (NRK): cycle-slack (Intel TIE / AMD regress)
+  dist-rewrite: refuted (already optimal)
+  copy-shape #1 (igzip loop): regress (trip-count branch)
+  copy minimal-write: regress (length branches > store savings)
+  table-build: intrinsic (igzip pays same, inlined) — TBUILD_MULT 0.17 cyc/B but shared
+  CRC: equal to igzip (4.5% both)
+  litlen-amortization: inert (reuse ~0)
+  literal core: at igzip parity (37 vs 38 instr/iter, gz leaner discriminator)
+  recurrence: intrinsic serial-Huffman litlen-load dependency (~12 cyc/packet)
+ROOT CAUSE (objdump-proven): Rust `asm!` lets LLVM pick registers/schedule (NRK
+removing 2 ops reshuffled ALL loop registers); ISA-L ships HAND-assembled .s with
+hand-tuned register allocation + scheduling. The ~9% Intel / ~4-7% AMD residual on
+an instruction-parity loop is the `asm!`-vs-hand-asm codegen delta — NOT optimization-
+closable. Corroborates Fulcrum excess recoverable-budget=0.
+ONLY remaining path to MEET igzip at T1: a HAND-WRITTEN .s assembly decode kernel
+(our own, no C FFI — the branch's "reimplement-isa-l" namesake), giving igzip-grade
+register/schedule control that Rust `asm!` structurally cannot. Multi-session build;
+NRK evidence flags AMD schedule-regress risk; to MEET (not lose to) ISA-L's hand-asm
+likely requires transliterating its decode_huffman_code_block_stateless schedule.
