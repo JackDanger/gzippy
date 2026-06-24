@@ -3,9 +3,7 @@
 #
 # Splits gzippy-native's -p1 instr/B (and cyc/B) gap vs libdeflate into
 # pipeline-scaffold / table-build / clean-decode-core using ONLY portable,
-# BYTE-EXACT, deterministic-instr perturbations (no x86-only knob — the
-# GZIPPY_KERNEL_INJECT / stateless dispatch are bmi2-gated and INERT on aarch64,
-# so they are deliberately NOT used here):
+# BYTE-EXACT, deterministic-instr perturbations (no x86-only knob):
 #
 #   pipeline scaffold  = normal -p1  -  GZIPPY_THIN_T1_ORACLE   (byte-exact removal-oracle)
 #   table-build litlen = GZIPPY_TBUILD_MULT slope (mult 1..4)    (byte-transparent slope)

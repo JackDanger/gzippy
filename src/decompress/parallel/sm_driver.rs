@@ -197,9 +197,9 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none();
     // T1-MONOLITH (igzip-shaped single-buffer path): a deliberate, T1-gated
     // divergence from the rapidgzip chunk pipeline toward the igzip monolith
-    // (plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). It is OPT-IN (GZIPPY_MONOLITH=1),
+    // (former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). It is OPT-IN (GZIPPY_MONOLITH=1),
     // NOT the default: the pre-registered falsifier measurement (Intel+AMD,
-    // plans/T1-MONOLITH-RESULTS.md) found it FALSIFIED — it REGRESSES past the
+    // former plans/T1-MONOLITH-RESULTS.md) found it FALSIFIED — it REGRESSES past the
     // legacy thin-T1 driver because the single ISIZE buffer first-touches the
     // whole output (~4× igzip's page faults), the cost igzip's streaming small
     // reused buffer avoids. Kept opt-in only so the falsifier stays reproducible;
@@ -219,7 +219,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // default-path change must ride a gated WALL win), it is OPT-IN
     // (GZIPPY_STREAM_MONOLITH=1), NOT the default; production T1 stays thin-T1
     // (byte-identical to before this cycle). See
-    // plans/T1-MONOLITH-FINISH-RESULTS.md. Native-only; T>1 never takes it.
+    // former plans/T1-MONOLITH-FINISH-RESULTS.md. Native-only; T>1 never takes it.
     let use_stream_monolith = {
         #[cfg(not(isal_clean_tail))]
         {

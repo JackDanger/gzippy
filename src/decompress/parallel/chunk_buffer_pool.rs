@@ -261,7 +261,7 @@ thread_local! {
     /// turns ON the manual buffer pool AND pins every reserve to the fixed
     /// resident cap — exactly the `GZIPPY_RESIDENT_OUTPUT_POOL` oracle that the
     /// gated discrimination measured (minor-faults drop toward igzip, monorepo
-    /// wall 1.39→1.29 both arches; see plans/T1-CACHE-RESIDENCY-RESULTS.md), but
+    /// wall 1.39→1.29 both arches; see former plans/T1-CACHE-RESIDENCY-RESULTS.md), but
     /// SCOPED to the T1 thread so the T>1 parallel workers (which never set it)
     /// keep their faithful per-chunk ratio-informed reserve + pooling behavior.
     static T1_RESIDENT_SCOPE: Cell<bool> = const { Cell::new(false) };
