@@ -3995,6 +3995,10 @@ fn try_speculative_decode_candidate(
                 SPEC_FAIL_STOP_MISSED.fetch_add(1, Ordering::Relaxed);
                 "stop_missed"
             }
+            ChunkDecodeError::OutputCeilingExceeded { .. } => {
+                SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
+                "output_ceiling_exceeded"
+            }
             ChunkDecodeError::UnsupportedPlatform => {
                 SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
                 "other"
