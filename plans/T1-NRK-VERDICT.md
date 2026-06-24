@@ -37,3 +37,24 @@ floor. Default routing NRK would REGRESS AMD, so it must NOT be default-routed.
 NRK kept as env-gated opt-in (GZIPPY_T1_NRK=1), NOT default (would regress AMD).
 This is the deepest structural attack on the igzip-T1 floor; its falsification is
 the definitive answer that the floor is codegen-intrinsic, not contract-tax.
+
+## COPY-PATH lever — gated FALSIFIED (2026-06-23), confirming the floor exhaustively
+perf annotate (AMD Zen2, root bare-metal) located run_contig=80.8% of cycles, with
+the backref COPY path ~18% of cyc: the `cmp len,40` dispatch (9% cyc, ~10% of
+branch-misses = real mispredict) + the 3× MOVDQU burst (48B written for ~6B mean
+match). The recurrence (litlen table load, ~15% cyc) is INTRINSIC (igzip identical;
+the serial-Huffman dependency L1_load→consume→index→L1_load).
+Two copy convergence attempts, BOTH gated-FALSIFIED:
+- cursor #1 (route ≤40 through igzip's cmovg+MOVDQU loop): REVERT (instr UP, monorepo
+  cyc +8.2%) — the sub;jle trip-count loop mispredicts worse than the flat burst.
+- MINIMAL-WRITE (1 MOVDQU for len≤16 + well-predicted cmp;jbe gates, write 16/32/48
+  not always 48): REGRESS (Intel silesia +1.5%, nasa +6.5%, monorepo +4.8% paired;
+  byte-exact). The 2 length branches mispredict (varied match lengths) and cost MORE
+  than the saved store bandwidth.
+=> CONCLUSION: the copy path's cost is BRANCHES, not store bandwidth; the flat
+branchless 48B burst is gz's LOCAL OPTIMUM (both length-control variants regress).
+Combined with NRK (anchor cycle-slack), dist-rewrite (refuted), literal-core (parity),
+EVERY named structural T1 lever is gated-exhausted. The ~9% Intel / ~4-7% AMD
+T1-vs-igzip gap is the genuine pure-Rust-vs-ISA-L codegen/schedule FLOOR. The only
+untried path is a full-loop igzip-objdump-scheduled MONOLITH (cursor MOVE 2) — and
+NRK already showed whole-loop schedule changes regress on AMD (high-risk).
