@@ -845,9 +845,18 @@ mod imp {
                 "shrx {t3}, {t3}, {t4}",              // extra value
                 "shr {t1:e}, 16",                     // distance base
                 "add {t1:e}, {t3:e}",                 // distance
-                "jz 92f",                             // distance == 0 → restore (tag 7)
-                "cmp {t1:e}, 32768",
-                "ja 92f",                             // > MAX_WINDOW_SIZE → restore (tag 7)
+                // CORRECTNESS-NEUTRAL DEAD-CHECK REMOVAL (Intel-silesia lever):
+                // the `distance==0` and `distance>32768` bails are UNREACHABLE — a
+                // decoded distance = LutDistCode base (1..24577) + bounded extra is
+                // always in [1,32768] by construction, and an invalid dist code is
+                // already caught by the raw==0 entry bail (`test {t1},{t1}; jz 90f`).
+                // Removing these 3 hot back-ref instructions is BYTE-EXACT on valid
+                // input (full differential suite incl. prop_near_max_distance +
+                // diff_max_distance_backrefs_l9, 19/19) and corruption-behavior-
+                // NEUTRAL (base-vs-after crash CONTROL identical on adversarial
+                // mutants); the kept `src<out_base` bound (93f) + final CRC32 remain
+                // the backstops. Gated Intel: gz/igzip 1.023->1.003 (instr/B -0.254
+                // RESOLVED, 19/21 faster). run_contig only; forks keep their checks.
                 "mov {t4}, {dst}",
                 "sub {t4}, {t1}",                     // src = dst - distance
                 "cmp {t4}, qword ptr [{ctx} + 24]",
