@@ -4502,6 +4502,21 @@ mod tests {
                 }
             };
 
+            // Guard against an empty/short benchmark fixture: a gzip member is
+            // a 10-byte header + 8-byte trailer, so anything shorter cannot be
+            // valid and would panic the `gz[3]` / `gz[len-8]` indexing below.
+            // On CI runners where the fixture is absent or a stub (observed:
+            // macos-arm64 pure-rust-inflate test job), skip rather than panic.
+            if gz.len() < 18 {
+                eprintln!(
+                    "⚠ Skipping {} - fixture too short ({} bytes): {}",
+                    name,
+                    gz.len(),
+                    path
+                );
+                continue;
+            }
+
             // Parse gzip header to get raw deflate data
             let mut pos = 10;
             let flg = gz[3];
@@ -4632,6 +4647,21 @@ mod tests {
                     continue;
                 }
             };
+
+            // Guard against an empty/short benchmark fixture: a gzip member is
+            // a 10-byte header + 8-byte trailer, so anything shorter cannot be
+            // valid and would panic the `gz[3]` / `gz[len-8]` indexing below.
+            // On CI runners where the fixture is absent or a stub (observed:
+            // macos-arm64 pure-rust-inflate test job), skip rather than panic.
+            if gz.len() < 18 {
+                eprintln!(
+                    "⚠ Skipping {} - fixture too short ({} bytes): {}",
+                    name,
+                    gz.len(),
+                    path
+                );
+                continue;
+            }
 
             // Parse gzip header to get raw deflate data
             let mut pos = 10;

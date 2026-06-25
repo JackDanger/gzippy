@@ -3017,6 +3017,21 @@ mod tests {
             }
         };
 
+        // A gzip member is a 10-byte header + 8-byte trailer, so anything
+        // shorter cannot be valid and would panic the `gz[3]` / `gz[len-8]`
+        // indexing below. This can happen transiently when a sibling test
+        // races `prepare_datasets()` on the same fixture file; skip rather
+        // than panic.
+        if gz.len() < 18 {
+            eprintln!(
+                "Skipping {} benchmark - fixture too short ({} bytes): {}",
+                name,
+                gz.len(),
+                gz_path
+            );
+            return;
+        }
+
         // Parse gzip header properly
         let mut pos = 10;
         let flg = gz[3];
