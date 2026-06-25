@@ -320,21 +320,21 @@ fn stored_flip_disabled() -> bool {
 pub(crate) static MARKER_DIST_LUT_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-/// Test-only liveness counter for the rung-(d) DistTable arm (compiled out of
-/// production builds): proves the differential's ON arm actually routed
-/// marker-fast-loop distance decodes through the DistTable path (and that the
-/// OFF arm routed zero through it).
-///
-/// THREAD-LOCAL, not a process-wide atomic: the differential asserts the OFF
-/// arm's delta is exactly zero, but the `marker_dist_lut` enable flag is latched
-/// ONCE per `decode_marker_fast_loop` call (not re-checked per backref), so a
-/// CONCURRENT test that latched the LUT ON *before* this test's OFF arm sets the
-/// override would keep incrementing a shared counter inside the OFF window —
-/// contaminating the delta (a real data race observed on slower/wider-window
-/// targets, e.g. aarch64 debug CI). The test's own `decode_marker_u16` runs
-/// synchronously on the test thread, so a thread-local cell captures exactly
-/// this decode's hits and is immune to other test threads. Test-only; no
-/// production reader.
+// Test-only liveness counter for the rung-(d) DistTable arm (compiled out of
+// production builds): proves the differential's ON arm actually routed
+// marker-fast-loop distance decodes through the DistTable path (and that the
+// OFF arm routed zero through it).
+//
+// THREAD-LOCAL, not a process-wide atomic: the differential asserts the OFF
+// arm's delta is exactly zero, but the `marker_dist_lut` enable flag is latched
+// ONCE per `decode_marker_fast_loop` call (not re-checked per backref), so a
+// CONCURRENT test that latched the LUT ON *before* this test's OFF arm sets the
+// override would keep incrementing a shared counter inside the OFF window —
+// contaminating the delta (a real data race observed on slower/wider-window
+// targets, e.g. aarch64 debug CI). The test's own `decode_marker_u16` runs
+// synchronously on the test thread, so a thread-local cell captures exactly
+// this decode's hits and is immune to other test threads. Test-only; no
+// production reader.
 #[cfg(all(test, pure_inflate_decode))]
 thread_local! {
     pub(crate) static MARKER_DIST_LUT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -350,14 +350,14 @@ thread_local! {
 pub(crate) static MFAST_LOCALBITS_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-/// Test-only routing counter for the N2 local-Bits ON arm: counts the number
-/// of 'mfast iterations that ran through the lb (stack-local) code path.
-/// Compiled out of production builds — engagement proof for the differential.
-///
-/// THREAD-LOCAL for the same reason as [`MARKER_DIST_LUT_HITS`]: the localbits
-/// enable flag is latched once per call, so a process-wide atomic would let a
-/// concurrent test's in-flight ON decode leak increments into this test's OFF
-/// (kill-switch) delta window. The test decodes synchronously on its own thread.
+// Test-only routing counter for the N2 local-Bits ON arm: counts the number
+// of 'mfast iterations that ran through the lb (stack-local) code path.
+// Compiled out of production builds — engagement proof for the differential.
+//
+// THREAD-LOCAL for the same reason as [`MARKER_DIST_LUT_HITS`]: the localbits
+// enable flag is latched once per call, so a process-wide atomic would let a
+// concurrent test's in-flight ON decode leak increments into this test's OFF
+// (kill-switch) delta window. The test decodes synchronously on its own thread.
 #[cfg(test)]
 thread_local! {
     pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -2554,7 +2554,7 @@ impl Block {
         const FAST_IN_SLOP: usize = 8;
         let mut pos = *pos_io;
         let mut emitted = *emitted_io;
-        let mut distance_marker = *distance_marker_io;
+        let distance_marker = *distance_marker_io;
         let ring8_fast = ring8;
         let in_end = bits.data.len();
         // Preload (igzip pipeline): decode the first symbol before entering
@@ -6752,7 +6752,7 @@ mod tests {
                 let w = WORDS[(xorshift(&mut seed) as usize) % WORDS.len()];
                 out.extend_from_slice(w.as_bytes());
                 out.push(b' ');
-                if xorshift(&mut seed) % 13 == 0 {
+                if xorshift(&mut seed).is_multiple_of(13) {
                     out.push(b'0' + (xorshift(&mut seed) % 10) as u8);
                 }
             }
@@ -7232,7 +7232,7 @@ mod tests {
             stream.extend_from_slice(&stored_block(&payload[40_000..80_000], false));
             stream.extend_from_slice(&stored_block(&payload[80_000..], true));
 
-            let (enabled, dis) = with_stored_flip(false, || {
+            let enabled = with_stored_flip(false, || {
                 let c0 = counters();
                 let (sink, b) = decode_windowless(&stream);
                 let c1 = counters();
@@ -7241,9 +7241,8 @@ mod tests {
                     c1.0 - c0.0 >= 1,
                     "case 1 must fire on a 40000-byte stored block"
                 );
-                (sink, ())
+                sink
             });
-            let _ = dis;
             let disabled = with_stored_flip(true, || {
                 let c0 = counters();
                 let (sink, b) = decode_windowless(&stream);

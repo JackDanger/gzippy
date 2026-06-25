@@ -6,14 +6,9 @@
 use crate::decompress::inflate::consume_first_decode::Bits;
 use crate::decompress::parallel::marker_inflate::{Block, BlockError, MarkerSink, MAX_WINDOW_SIZE};
 
+#[derive(Default)]
 struct DiscardSink {
     len: usize,
-}
-
-impl Default for DiscardSink {
-    fn default() -> Self {
-        Self { len: 0 }
-    }
 }
 
 impl MarkerSink for DiscardSink {

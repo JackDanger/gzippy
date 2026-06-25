@@ -20,7 +20,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use gzippy::decompress::inflate::consume_first_decode::Bits;
-use gzippy::decompress::parallel::deflate_block::Block;
+use gzippy::decompress::parallel::marker_inflate::Block;
 
 #[path = "common/corpus_loader.rs"]
 mod corpus_loader;

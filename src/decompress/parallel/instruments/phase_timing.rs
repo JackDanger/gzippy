@@ -80,7 +80,7 @@ pub fn mark_once(name: &'static str) {
     }
     let now = Instant::now();
     if let Ok(mut f) = FIRED_ONCE.lock() {
-        if f.iter().any(|&n| n == name) {
+        if f.contains(&name) {
             return;
         }
         f.push(name);

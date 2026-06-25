@@ -1030,7 +1030,7 @@ mod tests {
     fn prepend_narrowed_clean_tail_matches_temp_vec_path() {
         // Equivalence: direct-narrow front prepend == old narrow-into-temp + prepend_bytes.
         let mut markers = SegmentedU16::default();
-        let vals: Vec<u16> = (0..500u16).map(|i| (i % 256)).collect();
+        let vals: Vec<u16> = (0..500u16).map(|i| i % 256).collect();
         markers.push_slice(&vals);
         let split_at = 137;
         let n = vals.len() - split_at;

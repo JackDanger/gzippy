@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)] // not every bench reads every descriptor field
 pub struct CorpusBlock {
     pub file_name: String,
     pub block_idx: u32,

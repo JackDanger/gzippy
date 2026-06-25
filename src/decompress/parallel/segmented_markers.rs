@@ -65,7 +65,7 @@ use crate::decompress::parallel::rpmalloc_alloc::types::U16;
 thread_local! {
     /// Per post-process worker: literal iota + zero mid-range initialized once.
     static APPLY_WINDOW_LUT: std::cell::RefCell<Option<[u8; 65536]>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Allocate (or recycle) one 128 KiB marker segment. Sources from the

@@ -74,8 +74,6 @@ use crate::decompress::parallel::compressed_vector::CompressionType;
 use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
-#[cfg(all(unix, parallel_sm))]
-use crate::decompress::parallel::output_writer;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
@@ -565,7 +563,7 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
         // Gate-0(d): a clean window-present decode must produce NO markers.
         // (Clean output lands in `data: SegmentedU8`; markers would show as a
         // non-zero `marker_count` / non-empty `data_with_markers`.)
-        if chunk.statistics.marker_count != 0 || chunk.data_with_markers.len() != 0 {
+        if chunk.statistics.marker_count != 0 || !chunk.data_with_markers.is_empty() {
             marker_chunks += 1;
         }
 
@@ -751,7 +749,7 @@ fn drive_impl<W: std::io::Write>(
     // the driver uses this count to resume the remaining members past the
     // bytes already streamed, instead of silently truncating. `None` for every
     // existing caller (zero behavior change).
-    mut bytes_written_out: Option<&mut usize>,
+    bytes_written_out: Option<&mut usize>,
 ) -> Result<(u32, usize), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin_with(
         "drive",
@@ -1031,7 +1029,7 @@ fn drive_impl<W: std::io::Write>(
     // consumer writes chunks in order and only after they fully validate, so on
     // a finder/decode error at a member boundary this count is exactly the
     // contiguous, correct prefix already on the sink. Set on BOTH paths.
-    if let Some(out) = bytes_written_out.as_deref_mut() {
+    if let Some(out) = bytes_written_out {
         *out = total_size;
     }
     consumer_result?;
@@ -4049,7 +4047,7 @@ fn try_speculative_decode_candidate(
     // call this function.
     if encoded_end < stop_hint_bit {
         // Byte-align: deflate pads to a byte boundary before the gzip footer.
-        let end_byte = (encoded_end + 7) / 8;
+        let end_byte = encoded_end.div_ceil(8);
         // Gzip footer is 8 bytes (CRC32 LE + ISIZE LE, RFC 1952 §2.3.1).
         let footer_end = end_byte.saturating_add(8);
         if footer_end + 2 <= input.len() {
@@ -4245,6 +4243,7 @@ fn speculative_decode_find_boundary(
 
 #[cfg(parallel_sm)]
 #[allow(clippy::large_enum_variant)] // boxing ChunkData would add an alloc on the per-chunk write path
+#[allow(dead_code)] // the `Async` prefetch-write variant is retained scaffolding, not yet constructed
 enum PendingWrite {
     Ready {
         idx: usize,
@@ -4415,7 +4414,7 @@ fn drain_one_pending<W: std::io::Write>(
     crate::decompress::parallel::phase_timing::mark_once("first_output");
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
-    let (idx, mut chunk, cache_key, handoff_bit) = match head {
+    let (idx, chunk, cache_key, handoff_bit) = match head {
         PendingWrite::Ready {
             idx,
             chunk,
@@ -4434,7 +4433,7 @@ fn drain_one_pending<W: std::io::Write>(
             );
             let overlap = eager_ctx
                 .as_mut()
-                .map(|ctx| (block_fetcher, window_map, &*ctx.0, &mut *ctx.1, &mut *ctx.2));
+                .map(|ctx| (block_fetcher, window_map, ctx.0, &mut *ctx.1, &mut *ctx.2));
             let chunk = recv_post_process_blocking(rx, idx, overlap)?;
             (idx, chunk, cache_key, handoff_bit)
         }
