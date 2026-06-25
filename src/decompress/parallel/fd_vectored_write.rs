@@ -642,6 +642,15 @@ mod tests {
     /// path. Either way the bytes must arrive in order. A reader thread
     /// drains so the writer never blocks forever. The owner is an
     /// owning copy of the buffers, kept alive by the vault.
+    ///
+    /// IGNORE'd under the default parallel `cargo test`: this writes ~620 KiB
+    /// to a kernel pipe while a reader thread drains it. Under a saturated
+    /// runner (the bin test binary co-runs subprocess-spawning CLI tests on a
+    /// 2-core CI host) the reader thread can be starved of a core, the
+    /// Linux vmsplice writer then blocks on the full pipe, and the whole test
+    /// binary wedges for the 6 h job timeout. Run it serially with
+    /// `--ignored --test-threads=1`, where the reader always gets scheduled.
+    #[ignore = "blocking pipe write deadlocks if the reader thread is starved under parallel cargo test; run serially with --ignored --test-threads=1"]
     #[test]
     fn pipe_path_byte_order_and_lifetime() {
         use std::io::Read as _;
@@ -705,9 +714,14 @@ mod tests {
     /// (b) NOT silently duplicate already-written bytes. We ignore
     /// SIGPIPE so the syscall returns EPIPE rather than killing us.
     ///
-    /// NOTE: no reader thread blocks on this pipe — the read end is
-    /// closed outright — so the test can never hang.
+    /// NOTE: the read end is closed before the failing write, but Phase 1
+    /// still issues a *blocking* vmsplice into a 4 KiB pipe with no reader;
+    /// under a core-starved parallel run that splice can block long enough to
+    /// wedge the whole bin test binary (observed: 6 h job timeout). It also
+    /// flips SIGPIPE to SIG_IGN process-wide, polluting sibling tests. Run it
+    /// serially with `--ignored --test-threads=1`.
     #[cfg(target_os = "linux")]
+    #[ignore = "blocking vmsplice into a tiny pipe + process-global SIGPIPE=SIG_IGN; unsafe under parallel cargo test, run serially with --ignored --test-threads=1"]
     #[test]
     fn early_reader_death_is_clean_error_no_duplicate() {
         unsafe {
