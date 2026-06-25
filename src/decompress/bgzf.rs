@@ -2414,8 +2414,9 @@ fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
 /// Zero-copy parallel decompression for multi-member gzip files.
 ///
 /// Uses the same approach as BGZF parallel: pre-allocate output, write directly
-/// to disjoint slices. Member boundaries are found by sequential scanning with
-/// libdeflate (each member is trial-decompressed to get input_consumed).
+/// to disjoint slices. Member boundaries are found by `scan_member_boundaries_fast`
+/// (header-only scan), and each member's deflate body is decoded with the
+/// pure-Rust `inflate_into` (no C-FFI).
 ///
 /// This avoids the old approach's issues:
 /// - No intermediate Vec copies (~1GB saved for 503MB output)

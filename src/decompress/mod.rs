@@ -184,8 +184,8 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
 /// Decompress gzip data with an explicit thread count.
 ///
 /// Uses gzippy's full routing table (parallel bgzf, parallel multi-member,
-/// ISA-L single-member, libdeflate one-shot) based on the input and
-/// the requested thread count.
+/// pure-Rust parallel single-member) based on the input and the requested
+/// thread count. The decode graph is pure-Rust end-to-end — no C-FFI.
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn decompress_bytes<W: Write + Send>(
     data: &[u8],

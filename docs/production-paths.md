@@ -35,43 +35,24 @@ Input (mmap'd slice, num_threads)
 │     → decompress_multi_member_sequential(data, writer)
 │       [src/decompress/mod.rs:547 — libdeflate, member-by-member]
 │
-└─ single-member
+└─ single-member  [PURE-RUST ONLY — no C-FFI in the decode graph, every T/size]
     │
-    ├─ PARALLEL_SM [cfg(parallel_sm), set by build.rs:80]
-    │  AND num_threads >= parallel_sm_min_threads() [mod.rs:113 — 4 in prod, 0 w/ GZIPPY_FORCE_PARALLEL_SM]
-    │  AND data.len() > MIN_PARALLEL_COMPRESSED [mod.rs:92 — 10 MiB]
-    │   │
-    │   ├─ NOT parallel_sm_unprofitable(data)?  [mod.rs:144 — ratio < 1.15 → unprofitable]
-    │   │   YES (compressible) → DecodePath::IsalParallelSM
-    │   │     → parallel::single_member::decompress_parallel(data, writer, num_threads)
-    │   │       [src/decompress/parallel/single_member.rs:126]
-    │   │         → sm_driver::read_parallel_sm [src/decompress/parallel/sm_driver.rs]
-    │   │           → chunk_fetcher::drive [src/decompress/parallel/chunk_fetcher.rs]
-    │   │             (speculative marker pipeline — see §3)
-    │   │
-    │   └─ unprofitable (stored-dominated, ratio ~1.0)
-    │       ├─ first_block_is_stored(data)?  [stored_split.rs, called at mod.rs:186]
-    │       │   YES → DecodePath::StoredParallel
-    │       │     → stored_split::decompress_stored_parallel(data, writer, num_threads)
-    │       │       [src/decompress/parallel/stored_split.rs]
-    │       │       On NotStoredDominated → decompress_single_member_one_shot
-    │       │
-    │       └─ NO → falls through to one-shot paths below
+    ├─ parallel_sm_unprofitable(data) AND first_block_is_stored(data)?
+    │   [mod.rs classify_gzip — ISIZE/len ratio < 1.15 AND first block is stored]
+    │   YES (incompressible / stored-dominated) → DecodePath::StoredParallel
+    │     → stored_split::decompress_stored_parallel(data, writer, num_threads)
+    │       [src/decompress/parallel/stored_split.rs]  (pure-Rust stored-block split)
+    │       On NotStoredDominated → pure-Rust ParallelSM marker pipeline
     │
-    ├─ isal_decompress::is_available()?  [src/backends/isal_decompress.rs]
-    │   YES → DecodePath::IsalSingle
-    │     → isal_decompress::decompress_gzip_stream(data, writer)
-    │       [src/backends/isal_decompress.rs]
-    │       (x86_64 only; ISA-L streaming inflate, one-shot)
-    │
-    ├─ data.len() > 1 GiB?   [mod.rs:193]
-    │   YES → DecodePath::StreamingSingle
-    │     → decompress_single_member_streaming(data, writer)
-    │       [src/decompress/mod.rs:471 — flate2/zlib-ng, 1 MB streaming buffer]
-    │
-    └─ default → DecodePath::LibdeflateSingle
-          → decompress_single_member_libdeflate(data, writer)
-            [src/decompress/mod.rs:494 — libdeflate one-shot, ISIZE-hint sizing]
+    └─ otherwise → DecodePath::ParallelSM
+          → parallel::single_member::decompress_parallel(data, writer, num_threads)
+            [src/decompress/parallel/single_member.rs]
+              → sm_driver / chunk_fetcher  (pure-Rust marker pipeline — see §3)
+            The SOLE single-member decode path at every thread count and size.
+            (gzippy-native: pure-Rust end-to-end. The ISA-L from-bit clean-tail
+             decode survives only as a dormant measurement ORACLE compiled under
+             the `isal-compression` feature and reachable solely via
+             GZIPPY_ISAL_ENGINE_ORACLE=1 — NOT on the production decode graph.)
 ```
 
 ### Key constants (all in `src/decompress/mod.rs`)
