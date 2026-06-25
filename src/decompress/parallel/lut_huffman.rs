@@ -123,6 +123,8 @@ pub mod prof {
     pub static C_MAKE_PAIR: AtomicU64 = AtomicU64::new(0); // pair fill
     pub static C_MAKE_TRIPLE: AtomicU64 = AtomicU64::new(0); // triple fill
     pub static C_MAKE_LONG: AtomicU64 = AtomicU64::new(0); // long-code phase
+    pub static C_LONG_SCAN: AtomicU64 = AtomicU64::new(0); // O(n^2) prefix-group scan within long
+    pub static N_LONG_CODES: AtomicU64 = AtomicU64::new(0); // sum of long_code_length
 
     #[inline(always)]
     pub fn rdtsc() -> u64 {
@@ -163,6 +165,14 @@ pub fn dump_rebuild_profile() {
         row("make_pair", p);
         row("make_triple", t);
         row("make_long", l);
+        let scan = C_LONG_SCAN.load(Relaxed);
+        let nlong = N_LONG_CODES.load(Relaxed);
+        eprintln!(
+            "    (long_scan    cyc/blk={:>8.1}  share={:>5.1}%  avg_long_codes/blk={:.1})",
+            scan as f64 / n as f64,
+            100.0 * scan as f64 / tot as f64,
+            nlong as f64 / n as f64
+        );
         eprintln!("  TOTAL          cyc/blk={:>8.1}", tot as f64 / n as f64);
     }
 }
@@ -727,6 +737,8 @@ pub fn make_inflate_huff_code_lit_len(
     // Long-code processing.
     let long_start = count_total[ISAL_DECODE_LONG_BITS as usize + 1] as usize;
     let long_code_length = (code_list_len as usize).saturating_sub(long_start);
+    #[cfg(feature = "profile-rebuild")]
+    prof::add(&prof::N_LONG_CODES, long_code_length as u64);
     let long_code_list = &code_list[long_start..long_start + long_code_length];
     let mut long_code_lookup_length: u32 = 0;
     let mut temp_code_list: [u16; 1 << (MAX_LIT_LEN_CODE_LEN - ISAL_DECODE_LONG_BITS as usize)] =
@@ -748,6 +760,8 @@ pub fn make_inflate_huff_code_lit_len(
         temp_code_list[0] = long_code_list[i] as u16;
         let mut temp_code_length: u32 = 1;
 
+        #[cfg(feature = "profile-rebuild")]
+        let _ls = prof::rdtsc();
         for j in (i + 1)..long_code_length {
             let lj = long_code_list[j] as usize;
             if (huff_code_table[lj].code() as u32 & ((1 << ISAL_DECODE_LONG_BITS) - 1))
@@ -761,6 +775,8 @@ pub fn make_inflate_huff_code_lit_len(
                 temp_code_length += 1;
             }
         }
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::C_LONG_SCAN, prof::rdtsc().wrapping_sub(_ls));
 
         // Zero out the long-code-lookup region we're about to populate
         let lcl_size = 1usize << (max_length - ISAL_DECODE_LONG_BITS);
