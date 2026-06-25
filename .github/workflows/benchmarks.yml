@@ -26,6 +26,17 @@ permissions:
   contents: read
   pull-requests: write
 
+# An open PR makes every branch push fire BOTH the `push` and `pull_request`
+# events → two concurrent Benchmarks runs on the SAME commit, both uploading
+# identically-named artifacts (binaries-*, results-*). That concurrent-upload
+# race is the most likely source of the x86 guard's `download-artifact
+# digest-mismatch: error` (and it doubles CI cost). Dedupe by the head commit
+# SHA so the push-run and PR-run share one group and the older is cancelled —
+# exactly one Benchmarks run per commit.
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -634,8 +645,12 @@ jobs:
       # only signal is the bench's stdout summary, which doesn't include
       # the GZIPPY_DEBUG output needed to diagnose perf shortfalls
       # (silent fallback vs slow marker pipeline vs chain-decode).
+      # `if: always()` so a failing bench still uploads the diagnostic JSON —
+      # but ONLY if a JSON actually exists. A job SIGTERM'd at its 8-min timeout
+      # would otherwise upload an empty/partial `results/`, which the guards job
+      # then fails to validate (`download-artifact digest-mismatch: error`).
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: always() && hashFiles('results/*.json') != ''
         with:
           name: single-member-results-x86_64-t${{ matrix.threads }}
           path: results/

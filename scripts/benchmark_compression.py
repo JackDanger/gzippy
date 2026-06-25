@@ -55,103 +55,56 @@ def find_binary(binaries_dir: Path, name: str) -> str | None:
     return None
 
 
-def benchmark_compression(
-    tool: str,
-    bin_path: str,
-    input_file: str,
-    output_file: str,
-    level: int,
-    threads: int,
-) -> dict:
-    """Benchmark compression for a single tool."""
-
-    # Build command based on tool
+def build_compress_cmd(tool: str, bin_path: str, input_file: str,
+                       level: int, threads: int) -> list | None:
+    """Stdin→stdout compress command for a tool (writes gzip to stdout)."""
     if tool == "gzippy":
         if level >= 10:
-            cmd = [bin_path, "--level", str(level), f"-p{threads}", "-c", input_file]
-        else:
-            cmd = [bin_path, f"-{level}", f"-p{threads}", "-c", input_file]
+            return [bin_path, "--level", str(level), f"-p{threads}", "-c", input_file]
+        return [bin_path, f"-{level}", f"-p{threads}", "-c", input_file]
     elif tool == "pigz":
-        cmd = [bin_path, f"-{level}", f"-p{threads}", "-c", input_file]
+        return [bin_path, f"-{level}", f"-p{threads}", "-c", input_file]
     elif tool == "gzip":
         # Cap at L9; at L>=10 gzip runs at its max level as a size baseline
-        cmd = [bin_path, f"-{min(9, level)}", "-c", input_file]
+        return [bin_path, f"-{min(9, level)}", "-c", input_file]
     elif tool == "igzip":
         # igzip only supports levels 0-3
-        igzip_level = min(3, level)
-        cmd = [bin_path, f"-{igzip_level}", "-c", input_file]
+        return [bin_path, f"-{min(3, level)}", "-c", input_file]
     elif tool == "zopfli":
         # zopfli: only run once (very slow)
-        cmd = [bin_path, "--i5", "-c", input_file]
-    else:
-        return {"error": f"unknown tool: {tool}"}
+        return [bin_path, "--i5", "-c", input_file]
+    return None
 
-    # For zopfli, just run once
-    if tool == "zopfli":
-        start = time.perf_counter()
-        with open(output_file, 'wb') as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
-        elapsed = time.perf_counter() - start
 
-        if result.returncode != 0:
-            return {"error": "zopfli failed"}
+def prepare_tool(cmd: list, output_file: str) -> tuple:
+    """Warmup compress to a REAL file (SINK LAW, Gate-0d): this is the ONE
+    write that touches disk, and output_size/ratio are captured FROM IT — the
+    timed trials never write a file, so disk-writeback can't stall the measured
+    wall (which on a shared runner used to land in the faster tool's window).
+    Returns (output_size, error_str|None)."""
+    with open(output_file, 'wb') as f:
+        result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+    if result.returncode != 0:
+        return None, "compression failed on warmup"
+    return os.path.getsize(output_file), None
 
-        output_size = os.path.getsize(output_file)
-        input_size = os.path.getsize(input_file)
 
-        return {
-            "tool": tool,
-            "operation": "compress",
-            "times": [elapsed],
-            "median": elapsed,
-            "mean": elapsed,
-            "stdev": 0,
-            "cv": 0,
-            "trials": 1,
-            "converged": True,
-            "output_size": output_size,
-            "input_size": input_size,
-            "ratio": output_size / input_size,
-            "speed_mbps": input_size / elapsed / 1_000_000,
-        }
+def run_timed(cmd: list) -> tuple:
+    """One timed compress to /dev/null (SINK LAW). Returns (seconds, ok)."""
+    start = time.perf_counter()
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return time.perf_counter() - start, result.returncode == 0
 
-    # Normal adaptive benchmark
-    def run_compress():
-        with open(output_file, 'wb') as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
 
-    # L>=10 (zopfli) is too slow for statistical convergence; 1 trial is enough
-    # since the ratio (output size) is deterministic and that's all we guard on.
-    effective_min = 1 if level >= 10 else MIN_TRIALS
-    effective_max = 3 if level >= 10 else MAX_TRIALS
-
-    times = []
-    converged = False
-
-    # Warmup
-    run_compress()
-
-    for trial in range(effective_max):
-        start = time.perf_counter()
-        if not run_compress():
-            return {"error": f"{tool} compression failed"}
-        times.append(time.perf_counter() - start)
-
-        if len(times) >= effective_min:
-            _, _, _, cv = trimmed_stats(times)
-            if cv < TARGET_CV:
-                converged = True
-                break
-
-    output_size = os.path.getsize(output_file)
-    input_size = os.path.getsize(input_file)
+def finalize_stats(tool: str, times: list, converged: bool,
+                   output_size: int, input_size: int) -> dict:
+    """Build the per-tool result dict (schema unchanged) from its trial times.
+    output_size/ratio come from the warmup write, never a timed trial."""
     trimmed, t_mean, t_stdev, t_cv = trimmed_stats(times)
     median = statistics.median(trimmed)
     sorted_trimmed = sorted(trimmed)
     p10 = sorted_trimmed[max(0, len(sorted_trimmed) // 10)]
     p90 = sorted_trimmed[min(len(sorted_trimmed) - 1, len(sorted_trimmed) * 9 // 10)]
-
     return {
         "tool": tool,
         "operation": "compress",
@@ -169,6 +122,7 @@ def benchmark_compression(
         "speed_mbps": input_size / median / 1_000_000,
         "p10_speed_mbps": input_size / p90 / 1_000_000,
         "p90_speed_mbps": input_size / p10 / 1_000_000,
+        "timed_sink": "devnull",
     }
 
 
@@ -227,31 +181,123 @@ def main():
     if args.level >= 9 and tools["zopfli"]:
         comp_tools.append("zopfli")
 
+    # L>=10 compression is too slow for statistical convergence; 1 trial is
+    # enough since the ratio (output size) is deterministic and that's all we
+    # guard on at those levels.
+    effective_min = 1 if args.level >= 10 else MIN_TRIALS
+    effective_max = 3 if args.level >= 10 else MAX_TRIALS
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
+        # Phase 1 — prepare every multi-trial tool: build cmd + ONE warmup
+        # write to a real file (SINK LAW, Gate-0d), capturing output_size/ratio
+        # FROM that warmup. zopfli is handled separately below (ratio-only,
+        # single deterministic run, OUTSIDE the interleave). Tools that fail
+        # the warmup are recorded as errors and excluded from timing. The valid
+        # set is then timed INTERLEAVED (round-robin per trial, Gate-1) to
+        # /dev/null — the old harness ran all N trials of one tool then all N of
+        # the next while writing the full output to disk every trial, so a
+        # shared-runner disk-writeback stall landed in the faster tool's window
+        # and manufactured a phantom sign-flip.
+        valid = []  # [(tool, cmd, output_size)]
+        times_by_tool = {}
         for tool in comp_tools:
+            if tool == "zopfli":
+                continue
             bin_path = tools.get(tool)
             if not bin_path or not os.path.exists(bin_path):
                 continue
-
+            cmd = build_compress_cmd(tool, bin_path, data_file, args.level, args.threads)
+            if cmd is None:
+                continue
             out_file = str(tmpdir / f"{tool}.gz")
-            result = benchmark_compression(
-                tool, bin_path, data_file, out_file,
-                args.level, args.threads
+            output_size, err = prepare_tool(cmd, out_file)
+            if err is not None:
+                print(f"  {tool}: {err}")
+                results["results"].append({
+                    "tool": tool, "operation": "compress",
+                    "error": f"{tool} {err}",
+                    "level": args.level, "threads": args.threads,
+                    "content_type": args.content_type,
+                })
+                continue
+            valid.append((tool, cmd, output_size))
+            times_by_tool[tool] = []
+
+        # Phase 2 — interleaved timed trials to /dev/null.
+        converged = False
+        for trial in range(effective_max):
+            for tool, cmd, _ in valid:
+                elapsed, ok = run_timed(cmd)
+                if not ok:
+                    # Should not happen after a passing warmup; record and drop.
+                    times_by_tool[tool].append(float("inf"))
+                else:
+                    times_by_tool[tool].append(elapsed)
+            if trial + 1 >= effective_min:
+                if all(trimmed_stats(times_by_tool[t])[3] < TARGET_CV for t, _, _ in valid):
+                    converged = True
+                    break
+
+        # Phase 3 — finalize per-tool stats (schema unchanged); ratio from warmup.
+        for tool, _, output_size in valid:
+            result = finalize_stats(
+                tool, times_by_tool[tool], converged, output_size, input_size,
             )
-
-            if "error" not in result:
-                print(f"  {tool}: {result['speed_mbps']:.1f} MB/s, "
-                      f"ratio {result['ratio']:.3f}, "
-                      f"{result['trials']} trials")
-            else:
-                print(f"  {tool}: {result['error']}")
-
+            print(f"  {tool}: {result['speed_mbps']:.1f} MB/s, "
+                  f"ratio {result['ratio']:.3f}, "
+                  f"{result['trials']} trials")
             result["level"] = args.level
             result["threads"] = args.threads
             result["content_type"] = args.content_type
             results["results"].append(result)
+
+        # zopfli — ratio-only single deterministic measurement, OUTSIDE the
+        # interleave (it is far too slow to converge and is guarded only on
+        # output size). It needs a real output file to read the size, so it
+        # keeps its single timed write-to-file.
+        if "zopfli" in comp_tools:
+            bin_path = tools.get("zopfli")
+            if bin_path and os.path.exists(bin_path):
+                cmd = build_compress_cmd("zopfli", bin_path, data_file, args.level, args.threads)
+                out_file = str(tmpdir / "zopfli.gz")
+                start = time.perf_counter()
+                with open(out_file, 'wb') as f:
+                    zr = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+                elapsed = time.perf_counter() - start
+                if zr.returncode != 0:
+                    print("  zopfli: zopfli failed")
+                    results["results"].append({
+                        "tool": "zopfli", "operation": "compress",
+                        "error": "zopfli failed",
+                        "level": args.level, "threads": args.threads,
+                        "content_type": args.content_type,
+                    })
+                else:
+                    output_size = os.path.getsize(out_file)
+                    result = {
+                        "tool": "zopfli",
+                        "operation": "compress",
+                        "times": [elapsed],
+                        "median": elapsed,
+                        "mean": elapsed,
+                        "stdev": 0,
+                        "cv": 0,
+                        "trials": 1,
+                        "converged": True,
+                        "output_size": output_size,
+                        "input_size": input_size,
+                        "ratio": output_size / input_size,
+                        "speed_mbps": input_size / elapsed / 1_000_000,
+                    }
+                    print(f"  zopfli: {result['speed_mbps']:.1f} MB/s, "
+                          f"ratio {result['ratio']:.3f}, "
+                          f"{result['trials']} trials")
+                    result["level"] = args.level
+                    result["threads"] = args.threads
+                    result["content_type"] = args.content_type
+                    results["results"].append(result)
 
     # Write output
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
