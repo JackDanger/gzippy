@@ -107,6 +107,65 @@ pub const LIT_LEN_ELEMS: usize = 514;
 /// Vendor `ISAL_DEF_LIT_LEN_SYMBOLS = 286` (igzip_lib.h). 256 literals +
 /// EOB + 29 length codes.
 pub const LIT_LEN: usize = 286;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROFILING-ONLY sub-step timers (feature = "profile-rebuild"). RDTSC cycle
+// accumulators that locate the expensive per-block build sub-step. Never
+// compiled into the gate binary. Relative shares are load-immune within one run.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "profile-rebuild")]
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static N_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static C_ZERO: AtomicU64 = AtomicU64::new(0); // rebuild zeroing + count loop
+    pub static C_EXPAND: AtomicU64 = AtomicU64::new(0); // set_and_expand_lit_len_huffcode
+    pub static C_MAKE_DOUBLE: AtomicU64 = AtomicU64::new(0); // doubling memcpy + singletons
+    pub static C_MAKE_PAIR: AtomicU64 = AtomicU64::new(0); // pair fill
+    pub static C_MAKE_TRIPLE: AtomicU64 = AtomicU64::new(0); // triple fill
+    pub static C_MAKE_LONG: AtomicU64 = AtomicU64::new(0); // long-code phase
+
+    #[inline(always)]
+    pub fn rdtsc() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[inline(always)]
+    pub fn add(c: &AtomicU64, d: u64) {
+        c.fetch_add(d, Ordering::Relaxed);
+    }
+}
+
+/// Dump the profile-rebuild sub-step cycle shares to stderr. No-op unless built
+/// with `--features profile-rebuild`.
+pub fn dump_rebuild_profile() {
+    #[cfg(feature = "profile-rebuild")]
+    {
+        use prof::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = N_BLOCKS.load(Relaxed).max(1);
+        let z = C_ZERO.load(Relaxed);
+        let e = C_EXPAND.load(Relaxed);
+        let d = C_MAKE_DOUBLE.load(Relaxed);
+        let p = C_MAKE_PAIR.load(Relaxed);
+        let t = C_MAKE_TRIPLE.load(Relaxed);
+        let l = C_MAKE_LONG.load(Relaxed);
+        let tot = (z + e + d + p + t + l).max(1);
+        eprintln!("REBUILD_PROFILE blocks={n}");
+        let row = |name: &str, c: u64| {
+            eprintln!(
+                "  {name:<14} cyc/blk={:>8.1}  share={:>5.1}%",
+                c as f64 / n as f64,
+                100.0 * c as f64 / tot as f64
+            );
+        };
+        row("zero+count", z);
+        row("set_expand", e);
+        row("make_double", d);
+        row("make_pair", p);
+        row("make_triple", t);
+        row("make_long", l);
+        eprintln!("  TOTAL          cyc/blk={:>8.1}", tot as f64 / n as f64);
+    }
+}
 pub const ISAL_DEF_LIT_SYMBOLS: usize = 257;
 pub const ISAL_DEF_LEN_SYMBOLS: usize = 29;
 pub const ISAL_DEF_DIST_SYMBOLS: usize = 30;
@@ -497,6 +556,8 @@ pub fn make_inflate_huff_code_lit_len(
     let min_length = last_length;
 
     while last_length <= ISAL_DECODE_LONG_BITS {
+        #[cfg(feature = "profile-rebuild")]
+        let _ma = prof::rdtsc();
         // memcpy(short_code_lookup + copy_size, short_code_lookup,
         //        sizeof(*short_code_lookup) * copy_size);
         // Note: source overlaps destination range — split-borrow to copy
@@ -526,6 +587,11 @@ pub fn make_inflate_huff_code_lit_len(
             }
             index1 += 1;
         }
+
+        #[cfg(feature = "profile-rebuild")]
+        let _mb = prof::rdtsc();
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::C_MAKE_DOUBLE, _mb.wrapping_sub(_ma));
 
         // Continue if no pairs are possible
         if multisym >= SINGLE_SYM_FLAG || last_length < 2 * min_length {
@@ -574,6 +640,11 @@ pub fn make_inflate_huff_code_lit_len(
             }
             index1 += 1;
         }
+
+        #[cfg(feature = "profile-rebuild")]
+        let _mc = prof::rdtsc();
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::C_MAKE_PAIR, _mc.wrapping_sub(_mb));
 
         // Continue if no triples are possible
         if multisym >= DOUBLE_SYM_FLAG || last_length < 3 * min_length {
@@ -646,9 +717,13 @@ pub fn make_inflate_huff_code_lit_len(
             }
             index1 += 1;
         }
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::C_MAKE_TRIPLE, prof::rdtsc().wrapping_sub(_mc));
         last_length += 1;
     }
 
+    #[cfg(feature = "profile-rebuild")]
+    let _ml = prof::rdtsc();
     // Long-code processing.
     let long_start = count_total[ISAL_DECODE_LONG_BITS as usize + 1] as usize;
     let long_code_length = (code_list_len as usize).saturating_sub(long_start);
@@ -725,6 +800,8 @@ pub fn make_inflate_huff_code_lit_len(
             long_code_lookup_length | (max_length << LARGE_SHORT_MAX_LEN_OFFSET) | LARGE_FLAG_BIT;
         long_code_lookup_length += 1u32 << (max_length - ISAL_DECODE_LONG_BITS);
     }
+    #[cfg(feature = "profile-rebuild")]
+    prof::add(&prof::C_MAKE_LONG, prof::rdtsc().wrapping_sub(_ml));
     true
 }
 
@@ -959,6 +1036,8 @@ impl LutLitLenCode {
     /// `SINGLE_SYM_FLAG` so igzip's `_04` reads unambiguous single-symbol
     /// entries (its asm speculative-literal path mis-handles gz's TRIPLE pack).
     pub fn rebuild_from_multisym(&mut self, code_lengths: &[u8], multisym: u32) -> bool {
+        #[cfg(feature = "profile-rebuild")]
+        let _t0 = prof::rdtsc();
         self.valid = false;
         // Allow up to 288 entries: 286 for dynamic-Huffman (LIT_LEN) plus
         // symbols 286 and 287 for fixed-Huffman participation (RFC 1951
@@ -1034,6 +1113,10 @@ impl LutLitLenCode {
         }
 
         let table_len = code_lengths.len();
+        #[cfg(feature = "profile-rebuild")]
+        let _t1 = prof::rdtsc();
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::C_ZERO, _t1.wrapping_sub(_t0));
         if set_and_expand_lit_len_huffcode(
             &mut self.lit_and_dist_huff[..],
             table_len,
@@ -1045,6 +1128,10 @@ impl LutLitLenCode {
         {
             return false;
         }
+        #[cfg(feature = "profile-rebuild")]
+        let _t2 = prof::rdtsc();
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::C_EXPAND, _t2.wrapping_sub(_t1));
 
         if !make_inflate_huff_code_lit_len(
             &mut self.table,
@@ -1056,6 +1143,8 @@ impl LutLitLenCode {
         ) {
             return false;
         }
+        #[cfg(feature = "profile-rebuild")]
+        prof::add(&prof::N_BLOCKS, 1);
 
         self.valid = true;
         true
