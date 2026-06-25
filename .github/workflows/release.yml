@@ -113,23 +113,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # gzippy-native = the pure-Rust ParallelSM decode engine (no C-FFI in
+          # the decode graph). x86_64-linux ALSO layers isal-compression (the
+          # orthogonal ISA-L compress backend, T1 L0–L3); the two features
+          # coexist — gzippy-native pulls pure-rust-inflate (decode), while
+          # isal-compression pulls isal-rs (compress). The shipped binary must
+          # decode single-member via ParallelSM, not libdeflate one-shot.
           - target: aarch64-apple-darwin
             runner: macos-latest
             apt_extras: ""
-            features: ""
+            features: --features gzippy-native
           - target: x86_64-apple-darwin
             runner: macos-latest
             apt_extras: ""
-            features: ""
+            features: --features gzippy-native
             cross_target: x86_64-apple-darwin
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             apt_extras: cmake
-            features: ""
+            features: --features gzippy-native
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             apt_extras: cmake nasm autoconf automake libtool
-            features: --features isal-compression
+            features: --features gzippy-native,isal-compression
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       TAG:     ${{ needs.prepare.outputs.tag }}

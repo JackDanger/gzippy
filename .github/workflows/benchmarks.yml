@@ -69,12 +69,29 @@ jobs:
 
       - name: Build all tools
         run: |
-          # Build gzippy (with ISA-L compression on x86_64 for fastest L0-L3)
+          # Build gzippy with the pure-Rust ParallelSM decode engine
+          # (gzippy-native => pure-rust-inflate => parallel_sm cfg). This is the
+          # binary every decode benchmark below exercises, so it MUST be the
+          # shipped/product decode path, NOT libdeflate one-shot. x86_64 also
+          # layers ISA-L *compression* (fastest L0–L3); the two features coexist.
           if [ "$(uname -m)" = "x86_64" ]; then
-            cargo build --release --features isal-compression
+            cargo build --release --features gzippy-native,isal-compression
           else
-            cargo build --release
+            cargo build --release --features gzippy-native
           fi
+
+          # GATE-4 (production-path assertion): the just-built binary must decode
+          # single-member via ParallelSM (the campaign's pure-Rust engine), never
+          # silently regress to libdeflate one-shot. Fail the build if not.
+          printf 'gate4 production-path assertion fixture\n%.0s' {1..4096} \
+            | ./target/release/gzippy -c > /tmp/gate4-sm.gz
+          DBG=$(GZIPPY_DEBUG=1 ./target/release/gzippy -d -c /tmp/gate4-sm.gz 2>&1 >/dev/null)
+          echo "$DBG"
+          echo "$DBG" | grep -q 'path=ParallelSM' || {
+            echo "::error::Gate-4 FAILED: single-member decode is NOT ParallelSM (shipped flavor regressed to libdeflate one-shot). Build features must enable gzippy-native."
+            exit 1
+          }
+          echo "✓ Gate-4: single-member decode routes to ParallelSM"
 
           # Build pigz
           make -C vendor/pigz
