@@ -267,6 +267,7 @@ mod tests {
     /// won't fail).
     #[test]
     fn resumable_decodes_real_silesia() {
+        use std::fs::File;
         use std::path::Path;
         use std::process::Command;
 
@@ -281,12 +282,21 @@ mod tests {
         }
         if !tar_path.exists() {
             eprintln!("silesia: extracting silesia.tar (~211 MB)…");
+            // Extract to a per-process temp then atomically rename into place.
+            // cargo runs tests concurrently and `prepare_datasets()` (in the
+            // bench/corpus tests) reads silesia.tar; a plain in-place `xz -dk`
+            // lets those readers observe a half-written tar. `rename` is atomic
+            // on POSIX, so a concurrent reader sees either no tar or the full one.
+            let tmp_tar = tar_path.with_extension(format!("tar.partial.{}", std::process::id()));
+            let tmp_file = File::create(&tmp_tar).expect("create temp silesia.tar");
             let status = Command::new("xz")
-                .arg("-dk")
+                .arg("-dc")
                 .arg(xz_path)
+                .stdout(tmp_file)
                 .status()
-                .expect("xz -dk failed");
+                .expect("xz -dc failed");
             assert!(status.success(), "xz extraction failed");
+            std::fs::rename(&tmp_tar, tar_path).expect("rename temp silesia.tar into place");
         }
         let payload = std::fs::read(tar_path).expect("read silesia.tar");
         eprintln!("silesia: {} bytes raw", payload.len());
