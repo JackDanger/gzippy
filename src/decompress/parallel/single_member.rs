@@ -60,6 +60,31 @@ const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// `GZIPPY_CHUNK_KIB` env override still wins over this default.
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const T1_TARGET_COMPRESSED_CHUNK_BYTES: usize = 1024 * 1024;
+/// T1 OUTPUT-RESIDENT chunk sizing target (decoded bytes per chunk).
+///
+/// The T1 win documented on `T1_TARGET_COMPRESSED_CHUNK_BYTES` is purely a
+/// function of the per-chunk *output* (decoded) buffer staying warm/cache- and
+/// fault-friendly when the depth-1 in-order drain recycles it. A *fixed
+/// compressed* stride (1 MiB) makes that output buffer scale with the corpus
+/// expansion ratio: a high-ratio corpus (monorepo 5.2×, nasa 9.9×) gets a
+/// 5–10 MiB per-chunk output buffer (cold, fault-heavy), while a low-ratio one
+/// (silesia 3.1×) sits near the sweet spot. So instead we target a fixed
+/// *decoded* size and derive the compressed stride from the gzip-trailer ISIZE
+/// expansion ratio. GATED (Intel, `fulcrum abmeasure`, paired N=15 interleaved,
+/// load-immune sign-test): monorepo gz/igzip 1.00→0.98 (15/15 faster, p=6e-5),
+/// nasa →0.95 (15/15, p=6e-5), silesia NEUTRAL (derived ≈824 KiB, 8/7 TIE —
+/// silesia's flat optimum is already ≈1 MiB so it does not over-shrink). 2.5 MiB
+/// lands monorepo at ≈494 KiB (confirmed win zone 384–512 KiB) and silesia at
+/// ≈824 KiB (confirmed flat zone 768–1024 KiB). Intel NOT-YET-LAW (AMD owed).
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
+const T1_OUTPUT_RESIDENT_TARGET_BYTES: usize = 2_560 * 1024;
+/// Lower clamp on the ISIZE-derived T1 compressed stride: a pathological ratio
+/// (all-zeros corpus, or an ISIZE field wrapped on a >4 GiB member) must not
+/// pick a degenerate sub-256-KiB stride that thrashes the per-chunk loop. Upper
+/// clamp is `T1_TARGET_COMPRESSED_CHUNK_BYTES` (the legacy 1 MiB default), so
+/// low-ratio / stored corpora keep exactly the prior behaviour.
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
+const T1_MIN_COMPRESSED_CHUNK_BYTES: usize = 256 * 1024;
 /// Floor on the adjusted chunk size when the file is small.
 /// Mirror of `512_Ki` literal at vendor's ParallelGzipReader.hpp:305.
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
@@ -103,6 +128,47 @@ pub(crate) fn adjusted_chunk_size_bytes(
     let inner = file_size.div_ceil(denom);
     let aligned = inner.div_ceil(MIN_ADJUSTED_CHUNK_BYTES) * MIN_ADJUSTED_CHUNK_BYTES;
     aligned.max(MIN_ADJUSTED_CHUNK_BYTES)
+}
+
+/// T1 OUTPUT-RESIDENT compressed stride: derive the per-chunk *compressed*
+/// stride so the per-chunk *decoded* output buffer is ≈[`T1_OUTPUT_RESIDENT_TARGET_BYTES`],
+/// using the gzip-trailer ISIZE expansion ratio (decoded / compressed). Keeps
+/// the per-chunk output buffer warm/fault-friendly across corpus ratios instead
+/// of letting a fixed compressed stride blow it up on high-ratio corpora. See
+/// [`T1_OUTPUT_RESIDENT_TARGET_BYTES`] for the gated rationale + measurements.
+///
+/// Falls back to the legacy [`T1_TARGET_COMPRESSED_CHUNK_BYTES`] when ISIZE is
+/// implausible (ISIZE < compressed ⇒ near-incompressible / stored / wrapped
+/// field), and clamps the result to
+/// `[T1_MIN_COMPRESSED_CHUNK_BYTES, T1_TARGET_COMPRESSED_CHUNK_BYTES]` so the
+/// stride can never go below 256 KiB or above the prior 1 MiB default — output
+/// is byte-identical for any stride (the thin-T1 driver just lands chunk
+/// boundaries elsewhere; CRC32 + ISIZE are still verified by the caller).
+#[cfg_attr(not(parallel_sm), allow(dead_code))] // used by the parallel-SM T1 path
+pub(crate) fn t1_output_resident_chunk(gzip_data: &[u8], deflate_data_len: usize) -> usize {
+    let n = gzip_data.len();
+    if n < 4 || deflate_data_len == 0 {
+        return T1_TARGET_COMPRESSED_CHUNK_BYTES;
+    }
+    // ISIZE = original (decoded) size modulo 2^32 — gzip trailer, last 4 bytes LE.
+    let isize_field = u32::from_le_bytes([
+        gzip_data[n - 4],
+        gzip_data[n - 3],
+        gzip_data[n - 2],
+        gzip_data[n - 1],
+    ]) as u64;
+    let deflate_len = deflate_data_len as u64;
+    if isize_field < deflate_len {
+        // Near-incompressible / stored / wrapped ISIZE: keep the safe default.
+        return T1_TARGET_COMPRESSED_CHUNK_BYTES;
+    }
+    // stride_compressed = target_decoded × compressed / decoded  (one division,
+    // no double truncation). u64 math: target(2.5 MiB) × deflate_len(≤4 GiB) fits.
+    let stride = (T1_OUTPUT_RESIDENT_TARGET_BYTES as u64).saturating_mul(deflate_len) / isize_field;
+    (stride as usize).clamp(
+        T1_MIN_COMPRESSED_CHUNK_BYTES,
+        T1_TARGET_COMPRESSED_CHUNK_BYTES,
+    )
 }
 
 /// Counter incremented every time `adjusted_chunk_size_bytes` returns a
@@ -226,7 +292,10 @@ pub fn decompress_parallel<W: Write>(
         // T>1 keeps the 4 MiB target (finer granularity regresses the parallel
         // pipeline). Explicit GZIPPY_CHUNK_KIB always overrides.
         let thread_default_chunk = if num_threads <= 1 {
-            T1_TARGET_COMPRESSED_CHUNK_BYTES
+            // T1 OUTPUT-RESIDENT stride: keep the per-chunk decoded buffer near a
+            // fixed cache/fault-friendly size by deriving the compressed stride
+            // from the ISIZE expansion ratio (gated win; see the helper doc).
+            t1_output_resident_chunk(gzip_data, _deflate_data_len)
         } else {
             TARGET_COMPRESSED_CHUNK_BYTES
         };
