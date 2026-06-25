@@ -512,7 +512,42 @@ pub fn set_and_expand_lit_len_huffcode(
 //
 // Codes longer than ISAL_DECODE_LONG_BITS go through the long_code_lookup
 // secondary table (final loop).
+//
+// LONG-CODE GROUPING (perf, byte-exact divergence from the vendor's O(n²) shape):
+// igzip groups long codes that share the low-12-bit prefix and emits one
+// long_code_lookup sub-table per group, in the prefix's first-appearance order.
+// The faithful port did this with a quadratic inner re-scan (for each group
+// leader, scan all later long codes) — measured (RDTSC sub-step profile, Intel
+// i7-13700T) as the #1 per-block build cost: ~4.6 kcyc/blk = 32% of the build on
+// pigz (~69 long codes/blk) and 28% on silesia. We replace it with an O(n)
+// single-pass bucketed grouping using a thread-local generation-stamped 4096-slot
+// table (gen tag in the high 20 bits, last-member list-index in the low 12 — no
+// per-block init, reset only on the ~1M-block gen wrap). The emitted groups, the
+// per-group member order (ascending list order), the max-length, and the
+// allocation order are all identical to the quadratic version → the produced
+// short_code_lookup / long_code_lookup are byte-for-byte identical, so the
+// triple-pack DECODE format is unchanged.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Thread-local scratch for the O(n) long-code prefix grouping in
+/// [`make_inflate_huff_code_lit_len`]. The 4096-slot table is generation-stamped
+/// so it never needs a per-block memset; `lc[fb] = (gen << 12) | last_list_index`.
+struct LongPrefixScratch {
+    lc: Box<[u32; 1 << ISAL_DECODE_LONG_BITS]>,
+    gen: u32,
+}
+impl LongPrefixScratch {
+    fn new() -> Self {
+        Self {
+            lc: Box::new([0u32; 1 << ISAL_DECODE_LONG_BITS]),
+            gen: 0,
+        }
+    }
+}
+thread_local! {
+    static LONG_PREFIX_SCRATCH: std::cell::RefCell<LongPrefixScratch> =
+        std::cell::RefCell::new(LongPrefixScratch::new());
+}
 
 /// Returns `false` if the (already over-subscription-screened) table still
 /// drives a LUT write out of range. A well-formed canonical code never does —
@@ -744,39 +779,73 @@ pub fn make_inflate_huff_code_lit_len(
     let mut temp_code_list: [u16; 1 << (MAX_LIT_LEN_CODE_LEN - ISAL_DECODE_LONG_BITS as usize)] =
         [0u16; 1 << (MAX_LIT_LEN_CODE_LEN - ISAL_DECODE_LONG_BITS as usize)];
 
-    for i in 0..long_code_length {
-        // Set the look up table to point to a hint where the symbol can be
-        // found in the list of long codes and add the current symbol to the
-        // list of long codes.
-        let li = long_code_list[i] as usize;
-        if huff_code_table[li].code_and_extra() == INVALID_CODE {
-            continue;
+    // O(n) prefix-group construction (byte-exact replacement of the original
+    // O(n²) inner re-scan — see module note above). `chain[i]` links the next
+    // member (in ascending long_code_list order) sharing i's 12-bit prefix;
+    // `group_head[g]` is the head list-index of group g in first-appearance order.
+    const CHAIN_END: u32 = u32::MAX;
+    const LC_LAST_MASK: u32 = (1 << ISAL_DECODE_LONG_BITS) - 1; // low 12 bits = list index
+    let mut chain = [CHAIN_END; LIT_LEN_ELEMS + 2];
+    let mut group_head = [0u32; LIT_LEN_ELEMS + 2];
+    let mut n_groups = 0usize;
+
+    #[cfg(feature = "profile-rebuild")]
+    let _ls = prof::rdtsc();
+    // Pass 1: bucket every long code into its prefix chain in ONE pass.
+    LONG_PREFIX_SCRATCH.with(|cell| {
+        let s = &mut *cell.borrow_mut();
+        s.gen = s.gen.wrapping_add(1);
+        if s.gen >= (1u32 << (32 - ISAL_DECODE_LONG_BITS)) {
+            // gen no longer fits above the 12-bit last-index field → reset.
+            s.lc.fill(0);
+            s.gen = 1;
         }
-
-        let mut max_length = huff_code_table[li].length() as u32;
-        let first_bits =
-            (huff_code_table[li].code_and_extra() & ((1 << ISAL_DECODE_LONG_BITS) - 1)) as u16;
-
-        temp_code_list[0] = long_code_list[i] as u16;
-        let mut temp_code_length: u32 = 1;
-
-        #[cfg(feature = "profile-rebuild")]
-        let _ls = prof::rdtsc();
-        for j in (i + 1)..long_code_length {
-            let lj = long_code_list[j] as usize;
-            if (huff_code_table[lj].code() as u32 & ((1 << ISAL_DECODE_LONG_BITS) - 1))
-                == first_bits as u32
-            {
-                max_length = huff_code_table[lj].length() as u32;
-                if temp_code_length as usize >= temp_code_list.len() {
-                    return false;
-                }
-                temp_code_list[temp_code_length as usize] = long_code_list[j] as u16;
-                temp_code_length += 1;
+        let gen_tag = s.gen << ISAL_DECODE_LONG_BITS;
+        let lc = &mut *s.lc;
+        for i in 0..long_code_length {
+            let li = long_code_list[i] as usize;
+            let fb = (huff_code_table[li].code() as u32) & LC_LAST_MASK;
+            let slot = &mut lc[fb as usize];
+            if (*slot & !LC_LAST_MASK) != gen_tag {
+                // First member of this prefix this block → new group.
+                group_head[n_groups] = i as u32;
+                n_groups += 1;
+            } else {
+                let prev = (*slot & LC_LAST_MASK) as usize;
+                chain[prev] = i as u32;
             }
+            *slot = gen_tag | (i as u32);
         }
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::C_LONG_SCAN, prof::rdtsc().wrapping_sub(_ls));
+    });
+    #[cfg(feature = "profile-rebuild")]
+    prof::add(&prof::C_LONG_SCAN, prof::rdtsc().wrapping_sub(_ls));
+
+    // Pass 2: emit groups in first-appearance order (byte-identical layout).
+    for g in 0..n_groups {
+        let head = group_head[g] as usize;
+        let head_li = long_code_list[head] as usize;
+        let first_bits =
+            (huff_code_table[head_li].code_and_extra() & ((1 << ISAL_DECODE_LONG_BITS) - 1)) as u16;
+
+        // Walk the chain: members in ascending list order; max_length = last
+        // (the chain is sorted ascending so the final member is the longest).
+        let mut max_length;
+        let mut temp_code_length: u32 = 0;
+        let mut walk = head;
+        loop {
+            if temp_code_length as usize >= temp_code_list.len() {
+                return false;
+            }
+            let m_li = long_code_list[walk] as usize;
+            temp_code_list[temp_code_length as usize] = m_li as u16;
+            max_length = huff_code_table[m_li].length() as u32;
+            temp_code_length += 1;
+            let nxt = chain[walk];
+            if nxt == CHAIN_END {
+                break;
+            }
+            walk = nxt as usize;
+        }
 
         // Zero out the long-code-lookup region we're about to populate
         let lcl_size = 1usize << (max_length - ISAL_DECODE_LONG_BITS);
@@ -805,8 +874,8 @@ pub fn make_inflate_huff_code_lit_len(
                     (sym1 | (sym1_len << LARGE_LONG_CODE_LEN_OFFSET)) as u16;
                 long_bits += min_increment;
             }
-            // Mark this code as already-placed so the outer loop's
-            // INVALID_CODE check skips it.
+            // Mark this code as already-placed (preserves the vendor post-state;
+            // the chain dedup means it is never re-read this call).
             huff_code_table[sym1_index].set_code_and_extra(INVALID_CODE);
         }
         if first_bits as usize >= short_len {
