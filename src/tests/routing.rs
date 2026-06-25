@@ -612,11 +612,9 @@ mod tests {
         assert_ne!(path, crate::decompress::DecodePath::StoredParallel);
 
         // Byte-exact through the full single-member dispatcher at T1/T4/T8.
-        // Serialize against the no-silent-fallback counter tests: the T1 decode
-        // takes the one-shot single-member path (libdeflate/ISA-L), which bumps
-        // the process-global LIBDEFLATE_SM_CALLS / ISAL_STREAM_SM_CALLS counters
-        // those tests snapshot. Without the lock our T1 decode races their
-        // before/after read and flakes them.
+        // Serialize against the other parallel-SM tests via the shared lock so
+        // concurrent decodes don't race the shared process-global pipeline
+        // counters those tests snapshot.
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());

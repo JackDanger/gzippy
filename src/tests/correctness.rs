@@ -1714,16 +1714,24 @@ mod tests {
         let data = make_mixed(3 * 1024 * 1024);
         let gz = compress_single_member(&data);
 
-        let mut streaming_out = Vec::new();
-        crate::decompress::decompress_single_member_pure(&gz, &mut streaming_out).unwrap();
+        // Pure-Rust production single-member decode.
+        let mut pure_out = Vec::new();
+        crate::decompress::decompress_single_member_pure(&gz, &mut pure_out).unwrap();
 
-        let mut libdeflate_out = Vec::new();
-        crate::decompress::decompress_single_member_pure(&gz, &mut libdeflate_out).unwrap();
+        // Differential oracle: libdeflate FFI (test-only). The production decode
+        // graph no longer uses libdeflate, but it remains a fuzz/differential
+        // oracle — the pure-Rust decode must be byte-identical to it.
+        let mut oracle_out = vec![0u8; data.len() + 1024];
+        let res = crate::backends::libdeflate::DecompressorEx::new()
+            .gzip_decompress_ex(&gz, &mut oracle_out)
+            .expect("libdeflate oracle decode");
+        oracle_out.truncate(res.output_size);
 
         assert_eq!(
-            streaming_out, libdeflate_out,
-            "streaming and libdeflate must produce byte-identical output"
+            pure_out, oracle_out,
+            "pure-Rust decode must be byte-identical to the libdeflate oracle"
         );
+        assert_eq!(pure_out, data, "decode must match the original");
     }
 
     #[test]
