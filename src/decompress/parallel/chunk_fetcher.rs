@@ -4535,7 +4535,7 @@ fn drain_one_pending<W: std::io::Write>(
             } else if fd_vectored_write::is_pipe_fd(fd) {
                 fd_vectored_write::write_chunk_payload_to_fd(fd, &mut iovs, chunk)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            } else if output_writer::enabled() {
+            } else if crate::decompress::parallel::output_writer::enabled() {
                 // FAITHFUL OVERLAP (rapidgzip writeFunctor, ParallelGzipReader.hpp:521):
                 // hand the owned chunk to a single in-order writer thread so the
                 // 211 MiB serial writev overlaps the next chunk's decode WAIT. Windows
@@ -4545,7 +4545,7 @@ fn drain_one_pending<W: std::io::Write>(
                 // `iovs`/`parts` borrow `chunk`; drop them before moving it.
                 drop(iovs);
                 drop(parts);
-                output_writer::submit_chunk(fd, chunk);
+                crate::decompress::parallel::output_writer::submit_chunk(fd, chunk);
             } else {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
