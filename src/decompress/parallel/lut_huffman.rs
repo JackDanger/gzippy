@@ -1456,6 +1456,7 @@ impl LutDistCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn bit_reverse2_matches_spec() {
@@ -1841,5 +1842,917 @@ mod tests {
             nonzero > 0,
             "make_inflate_huff_code_lit_len should populate short_code_lookup"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // MERGE-BLOCKER GATE: O(n) long-code grouping ≡ original O(n²) grouping.
+    //
+    // The production `make_inflate_huff_code_lit_len` replaced an O(n²)
+    // long-code prefix-grouping inner re-scan with an O(n) single-pass
+    // bucketed grouping (commit 74b41505). The win is byte-identical by
+    // source-reasoning + a 3-corpus sha; this gate PROVES byte-identity of
+    // the produced LUTs across weird-but-valid canonical Huffman lit/len
+    // code-length distributions — a wrong table build = wrong decompressed
+    // output on some valid input, so it must hold on ALL distributions, not
+    // just the three sampled corpora.
+    //
+    // `make_inflate_huff_code_lit_len_oldref` below is a VERBATIM copy of the
+    // pre-rewrite function (git 38f44528) — the original O(n²) long-code
+    // grouping. Kept test-only. The differential builds the LUT both ways
+    // from identical post-`set_and_expand` inputs and asserts byte-equality
+    // of short_code_lookup, long_code_lookup, the return value, and the
+    // huff-table post-state.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// VERBATIM port of the pre-74b41505 `make_inflate_huff_code_lit_len`
+    /// (git 38f44528) — the ORIGINAL O(n²) long-code prefix-grouping (for
+    /// each not-yet-placed long code, inner-rescan all later long codes
+    /// sharing its 12-bit prefix). Test-only reference oracle for the O(n)
+    /// rewrite. The short-code (singleton/pair/triple) section is identical
+    /// to production (verified by diff) modulo the `profile-rebuild` timers;
+    /// only the long-code section differs.
+    #[cfg(test)]
+    #[must_use]
+    fn make_inflate_huff_code_lit_len_oldref(
+        result: &mut InflateHuffCodeLarge,
+        huff_code_table: &mut [HuffCode],
+        _table_length: usize,
+        count_total: &[u16; MAX_LIT_LEN_COUNT],
+        code_list: &[u32],
+        multisym: u32,
+    ) -> bool {
+        let max_symbol: u32 = MAX_LIT_LEN_SYM;
+        let short_len = result.short_code_lookup.len();
+        let long_len = result.long_code_lookup.len();
+
+        let code_list_len = count_total[MAX_LIT_LEN_COUNT - 1] as u32;
+        if code_list_len == 0 {
+            result.short_code_lookup.fill(0);
+            return true;
+        }
+
+        let mut last_length = 0u32;
+        for l in 1..MAX_LIT_LEN_COUNT as u32 {
+            if count_total[(l + 1) as usize] > count_total[l as usize] {
+                last_length = l;
+                break;
+            }
+        }
+        if last_length == 0 {
+            return true;
+        }
+        if last_length > ISAL_DECODE_LONG_BITS {
+            last_length = ISAL_DECODE_LONG_BITS + 1;
+        }
+        let mut copy_size: usize = 1 << (last_length - 1);
+        result.short_code_lookup[..copy_size].fill(0);
+        let min_length = last_length;
+
+        while last_length <= ISAL_DECODE_LONG_BITS {
+            let (head, tail) = result.short_code_lookup.split_at_mut(copy_size);
+            tail[..copy_size].copy_from_slice(&head[..copy_size]);
+            copy_size *= 2;
+
+            // singletons
+            let mut index1 = count_total[last_length as usize] as usize;
+            let last_total = count_total[(last_length + 1) as usize] as usize;
+            while index1 < last_total {
+                let sym1_index = code_list[index1];
+                let sym1 = index_to_sym(sym1_index);
+                let sym1_len = huff_code_table[sym1_index as usize].length() as u32;
+                let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
+                if sym1 <= max_symbol {
+                    if sym1_code as usize >= short_len {
+                        return false;
+                    }
+                    result.short_code_lookup[sym1_code as usize] = sym1
+                        | (sym1_len << LARGE_SHORT_CODE_LEN_OFFSET)
+                        | (1 << LARGE_SYM_COUNT_OFFSET);
+                }
+                index1 += 1;
+            }
+
+            if multisym >= SINGLE_SYM_FLAG || last_length < 2 * min_length {
+                last_length += 1;
+                continue;
+            }
+
+            // pairs
+            let pair_idx1_end = count_total[(last_length - min_length + 1) as usize] as usize;
+            let mut index1 = count_total[min_length as usize] as usize;
+            while index1 < pair_idx1_end {
+                let sym1_index = code_list[index1];
+                let sym1 = index_to_sym(sym1_index);
+                let sym1_len = huff_code_table[sym1_index as usize].length() as u32;
+                let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
+                if sym1 >= 256 {
+                    index1 = count_total[(sym1_len + 1) as usize] as usize;
+                    index1 = index1.saturating_sub(1) + 1;
+                    continue;
+                }
+                let sym2_len = last_length - sym1_len;
+                let mut index2 = count_total[sym2_len as usize] as usize;
+                let pair_idx2_end = count_total[(sym2_len + 1) as usize] as usize;
+                while index2 < pair_idx2_end {
+                    let sym2_index = code_list[index2];
+                    let sym2 = index_to_sym(sym2_index);
+                    if sym2 > max_symbol {
+                        break;
+                    }
+                    let sym2_code = huff_code_table[sym2_index as usize].code() as u32;
+                    let code = sym1_code | (sym2_code << sym1_len);
+                    let code_length = sym1_len + sym2_len;
+                    if code as usize >= short_len {
+                        return false;
+                    }
+                    result.short_code_lookup[code as usize] = sym1
+                        | (sym2 << 8)
+                        | (code_length << LARGE_SHORT_CODE_LEN_OFFSET)
+                        | (2 << LARGE_SYM_COUNT_OFFSET);
+                    index2 += 1;
+                }
+                index1 += 1;
+            }
+
+            if multisym >= DOUBLE_SYM_FLAG || last_length < 3 * min_length {
+                last_length += 1;
+                continue;
+            }
+
+            // triples
+            let trip_idx1_end = count_total[(last_length - 2 * min_length + 1) as usize] as usize;
+            let mut index1 = count_total[min_length as usize] as usize;
+            while index1 < trip_idx1_end {
+                let sym1_index = code_list[index1];
+                let sym1 = index_to_sym(sym1_index);
+                let sym1_len = huff_code_table[sym1_index as usize].length() as u32;
+                let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
+                if sym1 >= 256 {
+                    index1 = count_total[(sym1_len + 1) as usize] as usize;
+                    continue;
+                }
+                if last_length - sym1_len < 2 * min_length {
+                    break;
+                }
+                let trip_idx2_end =
+                    count_total[(last_length - sym1_len - min_length + 1) as usize] as usize;
+                let mut index2 = count_total[min_length as usize] as usize;
+                while index2 < trip_idx2_end {
+                    let sym2_index = code_list[index2];
+                    let sym2 = index_to_sym(sym2_index);
+                    let sym2_len = huff_code_table[sym2_index as usize].length() as u32;
+                    let sym2_code = huff_code_table[sym2_index as usize].code() as u32;
+                    if sym2 >= 256 {
+                        index2 = count_total[(sym2_len + 1) as usize] as usize;
+                        continue;
+                    }
+                    let sym3_len = last_length - sym1_len - sym2_len;
+                    let mut index3 = count_total[sym3_len as usize] as usize;
+                    let trip_idx3_end = count_total[(sym3_len + 1) as usize] as usize;
+                    while index3 < trip_idx3_end {
+                        let sym3_index = code_list[index3];
+                        let sym3 = index_to_sym(sym3_index);
+                        let sym3_code = huff_code_table[sym3_index as usize].code() as u32;
+                        if sym3 > max_symbol - 1 {
+                            break;
+                        }
+                        let code = sym1_code
+                            | (sym2_code << sym1_len)
+                            | (sym3_code << (sym2_len + sym1_len));
+                        let code_length = sym1_len + sym2_len + sym3_len;
+                        if code as usize >= short_len {
+                            return false;
+                        }
+                        result.short_code_lookup[code as usize] = sym1
+                            | (sym2 << 8)
+                            | (sym3 << 16)
+                            | (code_length << LARGE_SHORT_CODE_LEN_OFFSET)
+                            | (3 << LARGE_SYM_COUNT_OFFSET);
+                        index3 += 1;
+                    }
+                    index2 += 1;
+                }
+                index1 += 1;
+            }
+            last_length += 1;
+        }
+
+        // ── ORIGINAL O(n²) long-code grouping (38f44528) ──
+        let long_start = count_total[ISAL_DECODE_LONG_BITS as usize + 1] as usize;
+        let long_code_length = (code_list_len as usize).saturating_sub(long_start);
+        let long_code_list = &code_list[long_start..long_start + long_code_length];
+        let mut long_code_lookup_length: u32 = 0;
+        let mut temp_code_list: [u16; 1
+            << (MAX_LIT_LEN_CODE_LEN - ISAL_DECODE_LONG_BITS as usize)] =
+            [0u16; 1 << (MAX_LIT_LEN_CODE_LEN - ISAL_DECODE_LONG_BITS as usize)];
+
+        for i in 0..long_code_length {
+            let li = long_code_list[i] as usize;
+            if huff_code_table[li].code_and_extra() == INVALID_CODE {
+                continue;
+            }
+            let mut max_length = huff_code_table[li].length() as u32;
+            let first_bits =
+                (huff_code_table[li].code_and_extra() & ((1 << ISAL_DECODE_LONG_BITS) - 1)) as u16;
+            temp_code_list[0] = long_code_list[i] as u16;
+            let mut temp_code_length: u32 = 1;
+            for j in (i + 1)..long_code_length {
+                let lj = long_code_list[j] as usize;
+                if (huff_code_table[lj].code() as u32 & ((1 << ISAL_DECODE_LONG_BITS) - 1))
+                    == first_bits as u32
+                {
+                    max_length = huff_code_table[lj].length() as u32;
+                    if temp_code_length as usize >= temp_code_list.len() {
+                        return false;
+                    }
+                    temp_code_list[temp_code_length as usize] = long_code_list[j] as u16;
+                    temp_code_length += 1;
+                }
+            }
+            let lcl_size = 1usize << (max_length - ISAL_DECODE_LONG_BITS);
+            if long_code_lookup_length as usize + lcl_size > long_len {
+                return false;
+            }
+            for k in 0..lcl_size {
+                result.long_code_lookup[long_code_lookup_length as usize + k] = 0;
+            }
+            for j in 0..temp_code_length {
+                let sym1_index = temp_code_list[j as usize] as usize;
+                let sym1 = index_to_sym(sym1_index as u32);
+                let sym1_len = huff_code_table[sym1_index].length() as u32;
+                let sym1_code = huff_code_table[sym1_index].code_and_extra();
+                let mut long_bits = sym1_code >> ISAL_DECODE_LONG_BITS;
+                let min_increment = 1u32 << (sym1_len - ISAL_DECODE_LONG_BITS);
+                while long_bits < (1 << (max_length - ISAL_DECODE_LONG_BITS)) {
+                    let idx = (long_code_lookup_length + long_bits) as usize;
+                    if idx >= long_len {
+                        return false;
+                    }
+                    result.long_code_lookup[idx] =
+                        (sym1 | (sym1_len << LARGE_LONG_CODE_LEN_OFFSET)) as u16;
+                    long_bits += min_increment;
+                }
+                huff_code_table[sym1_index].set_code_and_extra(INVALID_CODE);
+            }
+            if first_bits as usize >= short_len {
+                return false;
+            }
+            result.short_code_lookup[first_bits as usize] = long_code_lookup_length
+                | (max_length << LARGE_SHORT_MAX_LEN_OFFSET)
+                | LARGE_FLAG_BIT;
+            long_code_lookup_length += 1u32 << (max_length - ISAL_DECODE_LONG_BITS);
+        }
+        true
+    }
+
+    /// Replicate the `LutLitLenCode::rebuild_from_multisym` prep that runs
+    /// BEFORE `make_inflate_huff_code_lit_len` (zero + count + length-extra
+    /// accounting + `set_and_expand_lit_len_huffcode`). Returns the
+    /// post-expand `(huff_table, lit_count, code_list)` — the IDENTICAL
+    /// inputs both make-variants consume — or `None` when the prep itself
+    /// rejects the distribution (so `make` would never run).
+    #[cfg(test)]
+    fn prep_lit_len(
+        code_lengths: &[u8],
+    ) -> Option<(Vec<HuffCode>, [u16; MAX_LIT_LEN_COUNT], Vec<u32>)> {
+        if code_lengths.len() > 288 {
+            return None;
+        }
+        let mut huff = vec![HuffCode::default(); LIT_LEN_ELEMS];
+        let mut code_list = vec![0u32; LIT_LEN_ELEMS + 2];
+        let mut lit_count = [0u16; MAX_LIT_LEN_COUNT];
+        let mut lit_expand_count = [0u16; MAX_LIT_LEN_COUNT];
+        for (i, &length) in code_lengths.iter().enumerate() {
+            if (length as usize) >= MAX_LIT_LEN_COUNT {
+                return None;
+            }
+            lit_count[length as usize] += 1;
+            huff[i].set_length(length);
+            if length != 0 && i >= 264 {
+                let extra_count = LEN_EXTRA_BIT_COUNT[i - 257] as usize;
+                lit_expand_count[length as usize] =
+                    lit_expand_count[length as usize].wrapping_sub(1);
+                let target = (length as usize) + extra_count;
+                if target < MAX_LIT_LEN_COUNT {
+                    lit_expand_count[target] =
+                        lit_expand_count[target].wrapping_add(1u16 << extra_count);
+                }
+            }
+        }
+        let table_len = code_lengths.len();
+        if set_and_expand_lit_len_huffcode(
+            &mut huff[..],
+            table_len,
+            &mut lit_count,
+            &mut lit_expand_count,
+            &mut code_list[..],
+        )
+        .is_err()
+        {
+            return None;
+        }
+        Some((huff, lit_count, code_list))
+    }
+
+    /// Decode one symbol packet through a built LUT exactly as the production
+    /// `decode_prefilled` does (short flag → long-pointer indirection).
+    /// Returns `(symbol, sym_count, bit_count)`. Used to compare the O(n) and
+    /// O(n²) tables for DECODE-EQUIVALENCE (the property that actually governs
+    /// correct decompressed output — see `build_both`).
+    #[cfg(test)]
+    fn decode_lut(t: &InflateHuffCodeLarge, bits: u64) -> (u32, u32, u32) {
+        let n12 = (bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
+        let s = t.short_code_lookup[n12];
+        if s & LARGE_FLAG_BIT == 0 {
+            let bc = s >> LARGE_SHORT_CODE_LEN_OFFSET;
+            let mut sym = s & LARGE_SHORT_SYM_MASK;
+            if bc == 0 {
+                sym = INVALID_SYMBOL;
+            }
+            return (
+                sym,
+                (s >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK,
+                bc,
+            );
+        }
+        let ml = s >> LARGE_SHORT_MAX_LEN_OFFSET;
+        let used = if ml <= 32 {
+            bits & ((1u64 << ml) - 1)
+        } else {
+            bits
+        };
+        let idx = ((s & LARGE_SHORT_SYM_MASK) + ((used >> ISAL_DECODE_LONG_BITS) as u32)) as usize;
+        let ls = t.long_code_lookup[idx] as u32;
+        let bc = ls >> LARGE_LONG_CODE_LEN_OFFSET;
+        let mut sym = ls & LARGE_LONG_SYM_MASK;
+        if bc == 0 {
+            sym = INVALID_SYMBOL;
+        }
+        (sym, 1, bc)
+    }
+
+    /// Exhaustive decode-equivalence over the ENTIRE distinguishable input
+    /// space: for every 12-bit short index, if both tables hold a non-long
+    /// (singleton/pair/triple) entry they must be BYTE-IDENTICAL (multi-symbol
+    /// packing is unaffected by the long-code rewrite); for any prefix where
+    /// either table holds a long pointer, decode every high-bit extension up
+    /// to the larger `max_length` and require both tables to return the same
+    /// `(symbol, sym_count, bit_count)`. Bits above `max_length` are
+    /// don't-cares, so this covers all reachable bit patterns.
+    #[cfg(test)]
+    fn decode_equivalent(tn: &InflateHuffCodeLarge, to: &InflateHuffCodeLarge) -> bool {
+        for p in 0u64..(1u64 << ISAL_DECODE_LONG_BITS) {
+            let en = tn.short_code_lookup[p as usize];
+            let eo = to.short_code_lookup[p as usize];
+            let ln = en & LARGE_FLAG_BIT != 0;
+            let lo = eo & LARGE_FLAG_BIT != 0;
+            if !ln && !lo {
+                // Pure short (packed) entry — must be byte-identical.
+                if en != eo {
+                    return false;
+                }
+                continue;
+            }
+            let mln = if ln {
+                en >> LARGE_SHORT_MAX_LEN_OFFSET
+            } else {
+                ISAL_DECODE_LONG_BITS
+            };
+            let mlo = if lo {
+                eo >> LARGE_SHORT_MAX_LEN_OFFSET
+            } else {
+                ISAL_DECODE_LONG_BITS
+            };
+            // Real max code length ≤ MAX_LIT_LEN_CODE_LEN (21); cap the
+            // enumeration there (anything above is a don't-care bit anyway).
+            let ml = mln.max(mlo).min(MAX_LIT_LEN_CODE_LEN as u32);
+            let ext_bits = ml.saturating_sub(ISAL_DECODE_LONG_BITS);
+            for ext in 0u64..(1u64 << ext_bits) {
+                let bits = p | (ext << ISAL_DECODE_LONG_BITS);
+                if decode_lut(tn, bits) != decode_lut(to, bits) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Outcome of building the LUT both ways from identical prep inputs.
+    #[cfg(test)]
+    struct BuildPair {
+        /// O(n) and O(n²) are DECODE-EQUIVALENT (identical decompressed
+        /// output) AND short packed entries are byte-identical.
+        decode_equiv: bool,
+        /// O(n) and O(n²) produced byte-identical LUTs (strictly stronger;
+        /// fails on the all-ones-prefix layout quirk — see module finding).
+        byte_identical: bool,
+        /// `set_and_expand` accepted the distribution (so `make` actually ran).
+        prepped: bool,
+        /// This distribution exercised the rewritten long-code path.
+        has_long: bool,
+        /// O(n) accepted but O(n²) rejected (the safe direction — the O(n²)
+        /// 0xFFF over-match can over-allocate and overflow `long_len`).
+        n_accepts_o_rejects: bool,
+    }
+
+    /// Build the lit/len LUT with BOTH the production O(n) grouping and the
+    /// `*_oldref` O(n²) grouping from the SAME post-`set_and_expand` inputs,
+    /// then compare for DECODE-EQUIVALENCE (the safety property) and, as a
+    /// stronger diagnostic, raw byte-identity.
+    #[cfg(test)]
+    fn build_both(code_lengths: &[u8], multisym: u32) -> BuildPair {
+        let Some((huff, lit_count, code_list)) = prep_lit_len(code_lengths) else {
+            return BuildPair {
+                decode_equiv: true,
+                byte_identical: true,
+                prepped: false,
+                has_long: false,
+                n_accepts_o_rejects: false,
+            };
+        };
+
+        // Does this distribution exercise the long-code path at all? Long
+        // codes are code_list[count_total[13]..code_list_len] (post-expand).
+        let code_list_len = lit_count[MAX_LIT_LEN_COUNT - 1] as usize;
+        let long_start = lit_count[ISAL_DECODE_LONG_BITS as usize + 1] as usize;
+        let has_long = code_list_len > long_start;
+
+        let mut huff_new = huff.clone();
+        let mut table_new = InflateHuffCodeLarge::default();
+        let ok_new = make_inflate_huff_code_lit_len(
+            &mut table_new,
+            &mut huff_new[..],
+            LIT_LEN_ELEMS,
+            &lit_count,
+            &code_list[..],
+            multisym,
+        );
+
+        let mut huff_old = huff;
+        let mut table_old = InflateHuffCodeLarge::default();
+        let ok_old = make_inflate_huff_code_lit_len_oldref(
+            &mut table_old,
+            &mut huff_old[..],
+            LIT_LEN_ELEMS,
+            &lit_count,
+            &code_list[..],
+            multisym,
+        );
+
+        let byte_identical = ok_new == ok_old
+            && table_new.short_code_lookup[..] == table_old.short_code_lookup[..]
+            && table_new.long_code_lookup[..] == table_old.long_code_lookup[..]
+            && huff_new == huff_old;
+
+        // Decode-equivalence: only meaningful when BOTH builds succeeded
+        // (a rejected build leaves a partial table). When they disagree on
+        // accept/reject, the only legal direction is O(n) accepts where the
+        // O(n²) quirk over-allocates and rejects.
+        let decode_equiv = if ok_new && ok_old {
+            decode_equivalent(&table_new, &table_old)
+        } else {
+            true
+        };
+        let n_accepts_o_rejects = ok_new && !ok_old;
+
+        BuildPair {
+            decode_equiv,
+            byte_identical,
+            prepped: true,
+            has_long,
+            n_accepts_o_rejects,
+        }
+    }
+
+    /// Result of checking a distribution across all three packing modes.
+    #[cfg(test)]
+    #[derive(Default)]
+    struct ModeSummary {
+        prepped: bool,
+        has_long: bool,
+        any_byte_divergence: bool,
+        n_over_o: bool,
+    }
+
+    /// Assert DECODE-EQUIVALENCE (and that O(n) never rejects what O(n²)
+    /// accepts) across all three multi-symbol packing modes.
+    #[cfg(test)]
+    fn assert_decode_equiv_all_modes(code_lengths: &[u8]) -> ModeSummary {
+        let mut s = ModeSummary::default();
+        for &ms in &[TRIPLE_SYM_FLAG, DOUBLE_SYM_FLAG, SINGLE_SYM_FLAG] {
+            let r = build_both(code_lengths, ms);
+            assert!(
+                r.decode_equiv,
+                "O(n) grouping is NOT decode-equivalent to the O(n²) reference \
+                 (multisym={ms}) for distribution {:?}",
+                code_lengths
+            );
+            assert!(
+                !(r.prepped && !r.byte_identical && r.n_accepts_o_rejects && !r.decode_equiv),
+                "unexpected combination"
+            );
+            s.prepped |= r.prepped;
+            s.has_long |= r.prepped && r.has_long;
+            s.any_byte_divergence |= r.prepped && !r.byte_identical;
+            s.n_over_o |= r.n_accepts_o_rejects;
+        }
+        s
+    }
+
+    // ── Valid canonical-Huffman code-length distribution generator ──
+    //
+    // A canonical Huffman code must satisfy the Kraft equality (complete
+    // tree) for the LUT prep to accept it — `set_and_expand` rejects any
+    // length set whose `next_code` overflows 2^15. We build a COMPLETE tree
+    // by repeated random leaf-splitting (always Kraft-exact, max depth ≤ 15),
+    // then scatter the resulting lengths over a chosen alphabet so that
+    // length-codes (≥257, with extra bits) participate and the
+    // expansion-driven long path is exercised.
+
+    /// Tiny deterministic splitmix64 PRNG (no external rand dep).
+    #[cfg(test)]
+    struct Rng(u64);
+    #[cfg(test)]
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// Build `k` code-lengths forming a COMPLETE canonical code (Kraft == 1),
+    /// max length ≤ `max_len`. Returns fewer than `k` only if the depth cap
+    /// is hit (still complete). `k == 1` → a single length-1 code.
+    #[cfg(test)]
+    fn complete_lengths(rng: &mut Rng, k: usize, max_len: u8) -> Vec<u8> {
+        if k <= 1 {
+            return vec![1];
+        }
+        let mut depths = vec![1u8, 1u8];
+        while depths.len() < k {
+            let splittable: Vec<usize> = depths
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| **d < max_len)
+                .map(|(i, _)| i)
+                .collect();
+            if splittable.is_empty() {
+                break;
+            }
+            let pick = splittable[rng.below(splittable.len())];
+            let d = depths[pick];
+            depths[pick] = d + 1;
+            depths.push(d + 1);
+        }
+        depths
+    }
+
+    /// Scatter a complete length set across an `alphabet`-sized code-length
+    /// vector at random distinct positions (the rest length 0). This puts
+    /// lengths on length-code symbols (257..286) so the length-extra
+    /// expansion — and its long-code interaction — is exercised.
+    #[cfg(test)]
+    fn scatter(rng: &mut Rng, lengths: &[u8], alphabet: usize) -> Vec<u8> {
+        let alphabet = alphabet.max(lengths.len());
+        let mut positions: Vec<usize> = (0..alphabet).collect();
+        // Fisher–Yates partial shuffle for the first lengths.len() slots.
+        for i in 0..lengths.len() {
+            let j = i + rng.below(alphabet - i);
+            positions.swap(i, j);
+        }
+        let mut out = vec![0u8; alphabet];
+        for (idx, &len) in lengths.iter().enumerate() {
+            out[positions[idx]] = len;
+        }
+        out
+    }
+
+    /// Generate one valid distribution from a seed, varying symbol count,
+    /// alphabet size, and max code length.
+    #[cfg(test)]
+    fn gen_distribution(seed: u64) -> Vec<u8> {
+        let mut rng = Rng::new(seed);
+        // Symbol count: bias across the whole range incl. tiny + near-full.
+        let k = match rng.below(10) {
+            0 => 1,
+            1 => 2,
+            2 => 3 + rng.below(6),
+            3..=5 => 10 + rng.below(120),
+            _ => 100 + rng.below(187), // up to ~286
+        };
+        let max_len = 9 + (rng.below(7) as u8); // 9..=15
+        let lengths = complete_lengths(&mut rng, k, max_len);
+        // Alphabet ≤ LIT_LEN (286) — the production INPUT DOMAIN for arbitrary
+        // (dynamic-block) content. table_length > 286 is reached ONLY by the
+        // genuine fixed-Huffman 288 table (which has the exact 286/287 length-8
+        // codes the `count[8] -= 2` correction in `set_and_expand` requires);
+        // that case is covered explicitly in `perblock_oldref_edge_cases`.
+        // Feeding arbitrary 287/288-symbol sets would underflow that
+        // correction — a state the production header path never produces.
+        let alphabet = match rng.below(3) {
+            0 => 286,
+            1 => lengths.len().max(1),
+            _ => 30 + rng.below(256), // 30..=285
+        };
+        scatter(&mut rng, &lengths, alphabet.min(286))
+    }
+
+    /// ⛔ MERGE-BLOCKER GATE — Gate-0 + breadth.
+    ///
+    /// Deterministic sweep over many generated VALID canonical lit/len
+    /// code-length distributions. For each, builds the LUT with the production
+    /// O(n) grouping and the O(n²) reference and asserts DECODE-EQUIVALENCE on
+    /// EVERY one (the property that governs correct decompressed output) AND
+    /// that a meaningful fraction actually exercised the rewritten long-code
+    /// path (else the gate would be inert — Gate-0).
+    ///
+    /// FINDING (deterministic, reproduced by `perblock_byte_layout_divergence`
+    /// below): raw LUT byte-identity does NOT hold universally — the O(n²)
+    /// reference's inner re-scan keys on `code() & 0xFFF`, and an
+    /// already-placed member's `code()` is `INVALID_CODE` (low 16 bits
+    /// `0xFFFF` → `& 0xFFF == 4095`), so it spuriously re-adds invalidated
+    /// members to the ALL-ONES (0xFFF) prefix group, inflating that group's
+    /// `max_length` and over-allocating `long_code_lookup`. The O(n) rewrite
+    /// buckets by the real prefix BEFORE any invalidation and is immune. Both
+    /// remain DECODE-EQUIVALENT (the over-allocated slots are unreachable
+    /// zero-fill), so decompressed output is identical — the rewrite is SAFE,
+    /// and is in fact the cleaner of the two.
+    #[test]
+    fn perblock_oldref_decode_equiv_gate() {
+        const N: u64 = 20_000;
+        let mut prepped_n = 0u64;
+        let mut long_n = 0u64;
+        let mut byte_div_n = 0u64;
+        for seed in 0..N {
+            let dist = gen_distribution(seed);
+            let s = assert_decode_equiv_all_modes(&dist);
+            if s.prepped {
+                prepped_n += 1;
+            }
+            if s.has_long {
+                long_n += 1;
+            }
+            if s.any_byte_divergence {
+                byte_div_n += 1;
+            }
+        }
+        // Gate-0 (non-inert): a substantial fraction of accepted distributions
+        // must drive the long-code path that the O(n) rewrite touches.
+        assert!(
+            prepped_n > N / 2,
+            "too many distributions rejected by prep: {prepped_n}/{N}"
+        );
+        let frac = long_n as f64 / prepped_n as f64;
+        assert!(
+            frac > 0.10,
+            "long-code path under-exercised: {long_n}/{prepped_n} = {frac:.3} (<0.10 ⇒ inert gate)"
+        );
+        eprintln!(
+            "perblock_oldref_decode_equiv_gate: {N} distributions, prepped={prepped_n}, \
+             long-code-hit={long_n} ({:.1}% of prepped), byte-layout-divergent={byte_div_n}",
+            100.0 * frac
+        );
+    }
+
+    /// Named edge cases the advisor called out — explicit, deterministic.
+    /// Each asserts DECODE-EQUIVALENCE between the O(n) win and the O(n²)
+    /// reference across all three packing modes.
+    #[test]
+    fn perblock_oldref_edge_cases() {
+        // 1. Fixed-Huffman 288-entry table (symbols 286/287 participate).
+        let mut fixed = vec![0u8; 288];
+        for s in 0..144 {
+            fixed[s] = 8;
+        }
+        for s in 144..256 {
+            fixed[s] = 9;
+        }
+        for s in 256..280 {
+            fixed[s] = 7;
+        }
+        for s in 280..288 {
+            fixed[s] = 8;
+        }
+        let s = assert_decode_equiv_all_modes(&fixed);
+        assert!(s.prepped, "fixed-288 must prep");
+
+        // 2. Single symbol (length 1) at a literal and at a length-code slot.
+        let mut single_lit = vec![0u8; 286];
+        single_lit[65] = 1;
+        assert!(assert_decode_equiv_all_modes(&single_lit).prepped);
+        let mut single_len = vec![0u8; 286];
+        single_len[270] = 1; // a length-code with extra bits
+        assert!(assert_decode_equiv_all_modes(&single_len).prepped);
+
+        // 3. Two symbols (length 1 each = complete).
+        let mut two = vec![0u8; 286];
+        two[0] = 1;
+        two[257] = 1;
+        assert!(assert_decode_equiv_all_modes(&two).prepped);
+
+        // 4. All-same-length complete codes: 2^L symbols of length L
+        //    (L ≤ 8 so 2^L ≤ 256 fits the alphabet; L=12,13,14,15 covered by
+        //    the `deep` case below). Exercises the no-long-code path.
+        for l in 1u8..=8 {
+            let n = 1usize << l;
+            let alphabet = n.max(20);
+            let mut all = vec![0u8; alphabet];
+            for s in all.iter_mut().take(n) {
+                *s = l;
+            }
+            assert!(
+                assert_decode_equiv_all_modes(&all).prepped,
+                "all-same-length L={l} must prep"
+            );
+        }
+
+        // 5. Max base code length 15 present (deep complete tree:
+        //    lengths 1,2,3,...,14,15,15 = Kraft 1) — long codes guaranteed.
+        let mut deep = vec![0u8; 286];
+        for (i, len) in (1u8..=14).enumerate() {
+            deep[i] = len;
+        }
+        deep[14] = 15;
+        deep[15] = 15;
+        let s = assert_decode_equiv_all_modes(&deep);
+        assert!(
+            s.has_long,
+            "deep 1..15 tree must exercise the long-code path"
+        );
+
+        // 6. Length-codes driving the length-extra EXPANSION past 12 bits:
+        //    a complete code whose mass sits on high length-codes (each with
+        //    several extra bits) so `set_and_expand` produces expanded codes
+        //    > 12 bits → the long path via expansion.
+        //    Lengths: literals 0,1 @ 2; literal 2 @ 2; length-codes
+        //    280..285 @ 4 (extra bits 4..5) → expanded 8..9; deepen them so
+        //    some expand past 12: put a length-13 length-code with 5 extra.
+        let mut expand = vec![0u8; 286];
+        // Complete: 0,1 @ 1? Build a valid complete set with long length-codes.
+        // Tree: {a:2, b:2, c:2, d:2} is complete on 4 leaves. Assign two
+        // literals + two high length-codes so the length-codes expand long.
+        expand[0] = 2;
+        expand[1] = 2;
+        expand[284] = 2; // length-code 284: 4 extra bits → expanded 6
+        expand[285] = 2; // length-code 285: 0 extra bits
+                         // To force expansion > 12, give a length-code a deep base code.
+                         // Rebuild as: complete tree lengths 1,2,3,3 over {lit0, lit1, len284, len285}
+        let mut expand2 = vec![0u8; 286];
+        expand2[0] = 1;
+        expand2[1] = 2;
+        expand2[284] = 3; // 4 extra → expanded 7
+        expand2[285] = 3; // 0 extra → expanded 3
+        assert!(assert_decode_equiv_all_modes(&expand).prepped);
+        assert!(assert_decode_equiv_all_modes(&expand2).prepped);
+    }
+
+    /// FINDING (deterministic, banked): the O(n) rewrite is NOT raw
+    /// byte-identical to the O(n²) original on every distribution — the
+    /// original spuriously re-adds already-invalidated members (whose
+    /// `code()` masks to the all-ones 12-bit prefix `0xFFF`) to the 0xFFF
+    /// group, over-inflating its `max_length` / `long_code_lookup`
+    /// allocation. This test reproduces a concrete divergent distribution,
+    /// proves the byte-divergence exists, pins it to the all-ones prefix
+    /// group (the short-pointer at index 0xFFF), confirms the diverging
+    /// short entries are ALL long pointers (singleton/pair/triple packing
+    /// untouched) and the huff post-state is identical, and confirms the two
+    /// tables remain DECODE-EQUIVALENT (so output is unaffected → the win is
+    /// SAFE; the O(n) version is the cleaner of the two).
+    #[test]
+    fn perblock_byte_layout_divergence_is_benign() {
+        // Scan generated distributions for the first that exhibits the known
+        // all-ones-prefix byte-layout divergence (a long code on prefix 0xFFF
+        // alongside earlier, already-invalidated long codes). Robust to
+        // generator tweaks.
+        let mut found: Option<Vec<u8>> = None;
+        for seed in 0..50_000u64 {
+            let dist = gen_distribution(seed);
+            let r = build_both(&dist, TRIPLE_SYM_FLAG);
+            if r.prepped && !r.byte_identical {
+                found = Some(dist);
+                break;
+            }
+        }
+        let dist = found.expect(
+            "no byte-layout divergence found in 50k distributions — the O(n²) \
+             0xFFF over-match quirk did not reproduce",
+        );
+        let (huff, lit_count, code_list) = prep_lit_len(&dist).expect("dist must prep");
+
+        let mut hn = huff.clone();
+        let mut tn = InflateHuffCodeLarge::default();
+        assert!(make_inflate_huff_code_lit_len(
+            &mut tn,
+            &mut hn[..],
+            LIT_LEN_ELEMS,
+            &lit_count,
+            &code_list[..],
+            TRIPLE_SYM_FLAG
+        ));
+        let mut ho = huff;
+        let mut to = InflateHuffCodeLarge::default();
+        assert!(make_inflate_huff_code_lit_len_oldref(
+            &mut to,
+            &mut ho[..],
+            LIT_LEN_ELEMS,
+            &lit_count,
+            &code_list[..],
+            TRIPLE_SYM_FLAG
+        ));
+
+        // 1. A raw byte-divergence in the LUT exists.
+        let byte_identical = tn.short_code_lookup[..] == to.short_code_lookup[..]
+            && tn.long_code_lookup[..] == to.long_code_lookup[..];
+        assert!(
+            !byte_identical,
+            "expected the known all-ones-prefix layout divergence to reproduce"
+        );
+
+        // 2. Every divergent short entry is a LONG POINTER (packing untouched).
+        let all_ones = (1usize << ISAL_DECODE_LONG_BITS) - 1; // 0xFFF
+        let mut all_ones_diverged = false;
+        for i in 0..tn.short_code_lookup.len() {
+            if tn.short_code_lookup[i] != to.short_code_lookup[i] {
+                assert!(
+                    tn.short_code_lookup[i] & LARGE_FLAG_BIT != 0
+                        || to.short_code_lookup[i] & LARGE_FLAG_BIT != 0,
+                    "a NON-long short entry diverged at {i:#x} — packing changed!"
+                );
+                if i == all_ones {
+                    all_ones_diverged = true;
+                }
+            }
+        }
+        // 3. The root-cause group (the all-ones 0xFFF prefix) is involved:
+        //    its short pointer's max_length differs (over-inflated by O(n²)).
+        let n_ml = tn.short_code_lookup[all_ones] >> LARGE_SHORT_MAX_LEN_OFFSET;
+        let o_ml = to.short_code_lookup[all_ones] >> LARGE_SHORT_MAX_LEN_OFFSET;
+        assert!(
+            all_ones_diverged && o_ml > n_ml,
+            "root cause not confirmed: 0xFFF group n_ml={n_ml} o_ml={o_ml}"
+        );
+
+        // 4. huff post-state identical (same real members invalidated).
+        assert_eq!(hn, ho, "huff post-state diverged");
+
+        // 5. DECODE-EQUIVALENT — output is unaffected (the win is SAFE).
+        assert!(
+            decode_equivalent(&tn, &to),
+            "tables are NOT decode-equivalent — would change decompressed output"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 3000, ..ProptestConfig::default() })]
+
+        /// Property: for any seed-generated VALID canonical lit/len
+        /// code-length distribution and any multisym mode, the O(n) long-code
+        /// grouping is DECODE-EQUIVALENT to the O(n²) reference (identical
+        /// decompressed output). Shrinks the seed on failure.
+        #[test]
+        fn perblock_oldref_decode_equivalent(seed in any::<u64>(), mode in 0u32..3u32) {
+            let dist = gen_distribution(seed);
+            let r = build_both(&dist, mode);
+            prop_assert!(
+                r.decode_equiv,
+                "O(n) vs O(n²) DECODE divergence (seed={seed}, mode={mode}) dist={:?}",
+                dist
+            );
+            // O(n) must never reject what O(n²) accepts (the over-allocation
+            // quirk can only make O(n²) the stricter one).
+            prop_assert!(
+                !(! r.byte_identical && r.prepped) || r.decode_equiv,
+                "byte-divergence without decode-equivalence (seed={seed})"
+            );
+        }
+
+        /// Property over RAW arbitrary length vectors (incl. invalid /
+        /// over-subscribed / under-subscribed) — both impls must agree on the
+        /// DECODE result and never panic. Catches divergence on ill-formed
+        /// seeds the speculative single-member path can hand the builder.
+        #[test]
+        fn perblock_oldref_raw_lengths(
+            // ≤ 286 (LIT_LEN): the production input domain for dynamic blocks
+            // (HLIT ≤ 286). 287/288 is reached only by the genuine fixed table
+            // — see the note in `gen_distribution`.
+            lens in prop::collection::vec(0u8..16u8, 0..=286usize),
+            mode in 0u32..3u32,
+        ) {
+            let r = build_both(&lens, mode);
+            prop_assert!(
+                r.decode_equiv,
+                "DECODE divergence on raw lengths mode={mode}: {:?}",
+                lens
+            );
+        }
     }
 }
