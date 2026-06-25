@@ -27,8 +27,6 @@ use std::io::Write;
 use crate::decompress::format::{has_bgzf_markers, is_likely_multi_member, read_gzip_isize};
 use crate::error::{GzippyError, GzippyResult};
 
-const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
-
 #[cfg(target_os = "macos")]
 const CACHE_LINE_SIZE: usize = 128;
 #[cfg(not(target_os = "macos"))]
@@ -52,55 +50,30 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 ///
 /// Current paths (in priority order):
 ///   GzippyParallel   — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
-///   MultiMemberPar   — pigz-style multi-member, Tmax threads
-///   MultiMemberSeq   — pigz-style multi-member, T1
-///   ParallelSM   — single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
-///                      (x86_64: ISA-L or pure-Rust; aarch64: pure-Rust inner decoder).
-///                      Gated by `parallel::sm_cfg::PARALLEL_SM`; name is historical.
-///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
-///   LibdeflateSingle — default single-member via libdeflate one-shot (no ISA-L)
+///   MultiMemberPar   — pigz-style multi-member, Tmax threads (pure-Rust inflate)
+///   MultiMemberSeq   — pigz-style multi-member, T1 (pure-Rust inflate)
+///   ParallelSM       — single-member parallel marker pipeline (pure-Rust DEFLATE
+///                      engine, every arch). The SOLE single-member decode path.
+///   StoredParallel   — stored-block-dominated single-member, non-speculative
+///                      parallel split (pure-Rust).
 ///
-/// The single-member sub-paths are now fully decided here. The body of
+/// The single-member sub-paths are fully decided here. The body of
 /// `decompress_single_member` is a pure dispatcher — no `if-let-Some-else`
-/// fall-through, no silent retry against a different backend.
+/// fall-through, no silent retry against a different backend, and NO C-FFI in
+/// the decode graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodePath {
     GzippyParallel,
     MultiMemberPar,
     MultiMemberSeq,
-    // Constructed only under `parallel_sm` (the pure-rust-inflate build);
-    // dead in the legacy default build, alive in production.
-    #[allow(dead_code)]
     ParallelSM,
     /// Stored-block-dominated (incompressible) single-member, decoded in
     /// parallel WITHOUT speculation by splitting on explicit stored-block
     /// `LEN` fields. See [`crate::decompress::parallel::stored_split`]. The
     /// `parallel_sm_unprofitable` ratio gate routes incompressible input here
-    /// (instead of single-thread libdeflate) when its first block is stored —
-    /// stored streams are trivially, bandwidth-bound parallelizable.
-    #[allow(dead_code)] // constructed only under parallel_sm (production)
+    /// when its first block is stored — stored streams are trivially,
+    /// bandwidth-bound parallelizable (still pure-Rust).
     StoredParallel,
-    /// Single-threaded (`num_threads <= 1`) single-member decode on the
-    /// gzippy-isal build (`isal_clean_tail`): the WHOLE stream through ONE
-    /// ISA-L `isal_inflate` call (`isal_decompress::decompress_gzip_stream`),
-    /// no chunking. The 16-chunk ParallelSM pipeline buys ZERO parallelism at
-    /// one thread — each chunk waits the prior's 32 KiB tail window before it
-    /// can ISA-L-decode, so it runs fully serial WITH handoff/ring/window-map
-    /// overhead (DIS-15: that lifecycle costs ~247 ms / ~24% of the T1 wall;
-    /// single-shot = 1.197x rapidgzip vs ParallelSM 0.905x, byte-exact —
-    /// `decompress_gzip_stream` verifies the gzip CRC32+ISIZE via ISA-L's
-    /// `IGZIP_GZIP` crc_flag, a non-zero `isal_inflate` ret => terminal Err,
-    /// no fallback). Constructed ONLY under `isal_clean_tail` for true
-    /// single-member streams (multi-member/BGZF are classified earlier and
-    /// never reach here); on the gzippy-native build T1 stays ParallelSM.
-    #[allow(dead_code)] // constructed only under isal_clean_tail (production)
-    IsalSingleShot,
-    // Only constructed in the legacy `not(parallel_sm)` build; under
-    // `parallel_sm` (production) single-member never routes to C-FFI.
-    #[allow(dead_code)]
-    StreamingSingle,
-    #[allow(dead_code)]
-    LibdeflateSingle,
 }
 
 /// Inputs ≥ this size on a multi-threaded host with ISA-L take the
@@ -169,66 +142,23 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
             DecodePath::MultiMemberSeq
         };
     }
-    // SINGLE-MEMBER. When the pure-Rust engine is compiled (`parallel_sm`,
-    // i.e. the `pure-rust-inflate` build), single-member always routes to the
-    // ParallelSM pipeline — never a C-FFI one-shot dispatch (libdeflate/zlib-ng
-    // one-shot). On the gzippy-native build the ParallelSM pipeline is pure-Rust
-    // end-to-end (NO C-FFI in the decode graph, /goal part 1, task #8). On the
-    // gzippy-isal build (x86_64 + `isal-compression`, sets `isal_clean_tail`)
-    // the SAME ParallelSM pipeline decodes the clean tail through REAL ISA-L FFI
-    // (chunk_decode.rs `finish_decode_chunk_impl` -> `decompress_deflate_from_bit_into`,
-    // faithful rapidgzip WITH_ISAL) — so on that build C-FFI IS on the decode
-    // graph by design. The one-shot C-FFI backends remain compiled ONLY in the
-    // `not(parallel_sm)` legacy build and behind the dev/oracle feature as fuzz
-    // oracles; production single-member never routes to a one-shot.
-    #[cfg(parallel_sm)]
+    // SINGLE-MEMBER. The pure-Rust ParallelSM pipeline is the SOLE single-member
+    // decode path at every thread count and size — NO C-FFI one-shot (libdeflate /
+    // zlib-ng / ISA-L) anywhere in the decode graph. Correctness-wise it handles
+    // any size/T (verified byte-exact for tiny / T1 / incompressible / stored).
+    //
+    // Stored-dominated streams have sparse deflate boundaries; the speculative
+    // marker pipeline thrashes on them, so they take the explicit stored-block
+    // parallel decoder (also pure-Rust). It re-validates and, if not actually
+    // 100% stored, dispatch falls back to the pure-Rust marker pipeline (see
+    // `decompress_single_member_for`).
+    let _ = num_threads;
+    if parallel_sm_unprofitable(data)
+        && crate::decompress::parallel::stored_split::first_block_is_stored(data)
     {
-        // T1 ROUTE (gzippy-isal only): single-threaded single-member decode
-        // goes to ONE ISA-L call, not the 16-chunk ParallelSM pipeline. At one
-        // thread the pipeline's chunking buys NO parallelism (each chunk waits
-        // the prior's 32 KiB tail window before it can ISA-L-decode → fully
-        // serial) yet still pays ring/window-map/CRC/handoff — ~247 ms / ~24%
-        // of the T1 wall (DIS-15). Single-shot ISA-L (same igzip kernel) =
-        // 1.197x rapidgzip vs the pipeline's 0.905x, byte-exact. This is the
-        // gzippy-isal charter literally ("hand off to ISA-L at the right spot"
-        // — at T1 the right spot is one ISA-L call). gzippy-NATIVE has no ISA-L
-        // (`isal_clean_tail` false) so it stays ParallelSM at every T.
-        // Multi-member/BGZF are classified above and never reach here; and
-        // `decompress_gzip_stream` itself loops over trailing gzip members, so
-        // a multi-member stream that slipped past the detection window still
-        // decodes fully (no truncation).
-        #[cfg(isal_clean_tail)]
-        {
-            if num_threads <= 1 {
-                return DecodePath::IsalSingleShot;
-            }
-        }
-        // No thread/size floor: correctness-wise the ParallelSM pipeline
-        // handles any size/T (verified byte-exact for tiny / T1 /
-        // incompressible / stored), and the C-FFI one-shot is no longer an
-        // option, so every remaining single-member stream routes to the
-        // ParallelSM pipeline (pure-Rust on gzippy-native; ISA-L clean tail on
-        // gzippy-isal, whose T1 took the single-shot route above).
-        // Stored-dominated streams have sparse deflate boundaries; the
-        // speculative marker pipeline thrashes on them, so use the explicit
-        // stored-block parallel decoder (also pure-Rust). It re-validates
-        // and, if not actually 100% stored, the dispatch falls back to the
-        // pure-Rust marker pipeline (see `decompress_single_member_for`).
-        if parallel_sm_unprofitable(data)
-            && crate::decompress::parallel::stored_split::first_block_is_stored(data)
-        {
-            return DecodePath::StoredParallel;
-        }
-        DecodePath::ParallelSM
+        return DecodePath::StoredParallel;
     }
-    #[cfg(not(parallel_sm))]
-    {
-        let _ = num_threads;
-        if data.len() > 1024 * 1024 * 1024 {
-            return DecodePath::StreamingSingle;
-        }
-        DecodePath::LibdeflateSingle
-    }
+    DecodePath::ParallelSM
 }
 
 // =============================================================================
@@ -309,11 +239,7 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
             }
         }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
-        DecodePath::ParallelSM
-        | DecodePath::StoredParallel
-        | DecodePath::IsalSingleShot
-        | DecodePath::StreamingSingle
-        | DecodePath::LibdeflateSingle => {
+        DecodePath::ParallelSM | DecodePath::StoredParallel => {
             decompress_single_member_for(path, data, writer, None, num_threads)
         }
     }
@@ -340,11 +266,7 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
         }
-        DecodePath::ParallelSM
-        | DecodePath::StoredParallel
-        | DecodePath::IsalSingleShot
-        | DecodePath::StreamingSingle
-        | DecodePath::LibdeflateSingle => {
+        DecodePath::ParallelSM | DecodePath::StoredParallel => {
             let r = decompress_single_member_for(path, data, writer, out_fd, num_threads);
             if crate::utils::debug_enabled() {
                 eprintln!(
@@ -418,11 +340,7 @@ pub(crate) fn decompress_single_member<W: Write>(
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
         }
-        DecodePath::ParallelSM
-        | DecodePath::StoredParallel
-        | DecodePath::IsalSingleShot
-        | DecodePath::StreamingSingle
-        | DecodePath::LibdeflateSingle => {
+        DecodePath::ParallelSM | DecodePath::StoredParallel => {
             let r = decompress_single_member_for(path, data, writer, None, num_threads);
             if crate::utils::debug_enabled() {
                 eprintln!(
@@ -436,13 +354,19 @@ pub(crate) fn decompress_single_member<W: Write>(
     }
 }
 
-/// Test-only counter incremented every time a single-member call reaches
-/// the libdeflate one-shot backend. Snapshot before/after a decode to
-/// verify the no-fallback invariant — any increment from a call that
-/// *should* have routed parallel is a bug.
+/// Test-only pure-Rust single-member decode helper. After the C-FFI decode
+/// backends (libdeflate / zlib-ng one-shot) were removed, the unit tests that
+/// previously called those helpers route here instead, exercising the SAME
+/// pure-Rust single-member production path (`decompress_single_member`, T=1 →
+/// ParallelSM). It preserves the historical error semantics those tests assert
+/// (corrupt / truncated single-member input → terminal `Err`).
 #[cfg(test)]
-pub(crate) static LIBDEFLATE_SM_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn decompress_single_member_pure<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    decompress_single_member(data, writer, 1)
+}
 
 /// Hard dispatcher. Each arm is terminal — success or `Err`.
 fn decompress_single_member_for<W: Write>(
@@ -516,179 +440,48 @@ fn decompress_single_member_for<W: Write>(
                             "[gzippy] StoredParallel declined (not pure-stored) → pure-Rust SM"
                         );
                     }
-                    // ParallelSM marker pipeline (NOT a C-FFI one-shot). On
-                    // gzippy-native the decode graph stays FFI-free; on
-                    // gzippy-isal the clean tail uses ISA-L FFI.
-                    #[cfg(parallel_sm)]
-                    {
-                        let n = crate::decompress::parallel::single_member::decompress_parallel(
-                            data,
-                            writer,
-                            out_fd,
-                            num_threads,
-                        )
-                        .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
-                        writer.flush()?;
-                        Ok(n)
-                    }
-                    #[cfg(not(parallel_sm))]
-                    {
-                        decompress_single_member_one_shot(data, writer)
-                    }
+                    // ParallelSM marker pipeline (pure-Rust; NO C-FFI in the
+                    // decode graph).
+                    let n = crate::decompress::parallel::single_member::decompress_parallel(
+                        data,
+                        writer,
+                        out_fd,
+                        num_threads,
+                    )
+                    .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
+                    writer.flush()?;
+                    Ok(n)
                 }
                 Err(e) => Err(GzippyError::decompression(format!("stored parallel: {e}"))),
             }
         }
-        DecodePath::StreamingSingle => {
-            if crate::utils::debug_enabled() {
-                eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
-            }
-            decompress_single_member_streaming(data, writer)
-        }
-        DecodePath::LibdeflateSingle => {
-            #[cfg(test)]
-            LIBDEFLATE_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            decompress_single_member_libdeflate(data, writer)
-        }
-        // T1 single-threaded single-member on the gzippy-isal build: ONE ISA-L
-        // `isal_inflate` over the whole stream (no chunking pipeline). Verifies
-        // the gzip CRC32 + ISIZE via ISA-L's IGZIP_GZIP crc_flag — a non-zero
-        // ret => `decompress_gzip_stream` returns None => terminal Err here,
-        // NO fallback (rule 5). Constructed only under `isal_clean_tail`; on
-        // other builds the variant is never produced by `classify_gzip`, and
-        // `decompress_gzip_stream` resolves to the no-op stub. `out_fd` is
-        // unused (the writer is the sink; single-shot needs no zero-copy
-        // writev plumbing at one thread).
-        DecodePath::IsalSingleShot => {
-            let _ = out_fd;
-            if crate::utils::debug_enabled() {
-                eprintln!(
-                    "[gzippy] IsalSingleShot: one ISA-L call, {} bytes",
-                    data.len()
-                );
-            }
-            let n = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
-                .ok_or_else(|| {
-                    GzippyError::decompression("isal single-shot decode failed".to_string())
-                })?;
-            writer.flush()?;
-            Ok(n)
-        }
-        // unreachable on well-formed callers — `decompress_gzip_libdeflate`
-        // routes multi-member / bgzf paths before calling here.
+        // unreachable on well-formed callers — `classify_gzip` only produces
+        // `ParallelSM` / `StoredParallel` for single-member streams, and
+        // `decompress_gzip_libdeflate` routes multi-member / bgzf paths before
+        // calling here.
         other => Err(GzippyError::decompression(format!(
             "decompress_single_member_for called with non-single-member path: {other:?}"
         ))),
     }
 }
 
-/// Safe one-shot single-member decode — the path the classifier would pick if
-/// the parallel/stored fast-paths were unavailable. Used as the correction
-/// target when `StoredParallel`'s heuristic mis-fires on a non-stored stream
-/// (`NotStoredDominated`). Mirrors the tail of [`classify_gzip`]: ISA-L when
-/// available, zlib-ng streaming for >1 GiB, else libdeflate one-shot.
+/// Sequential multi-member decompress via the pure-Rust inflate engine
+/// (RFC 1952 §2.2: `cat a.gz b.gz`, pigz, log rotation). NO C-FFI: each member's
+/// gzip header is parsed in Rust, the raw deflate body is decoded with
+/// `inflate_consume_first_bits` (which byte-aligns at BFINAL), and the per-member
+/// CRC32 + ISIZE trailer is verified before stepping to the next member.
 ///
-/// Legacy-build only: under `parallel_sm` (the default/production build) the
-/// ParallelSM pipeline is the sole single-member path and this C-FFI one-shot
-/// is off the decode graph. (The pipeline is pure-Rust on gzippy-native; on
-/// gzippy-isal its clean tail uses ISA-L FFI — but never this one-shot.)
-#[cfg(not(parallel_sm))]
-fn decompress_single_member_one_shot<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    if data.len() > 1024 * 1024 * 1024 {
-        return decompress_single_member_streaming(data, writer);
-    }
-    #[cfg(test)]
-    LIBDEFLATE_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    decompress_single_member_libdeflate(data, writer)
-}
-
-/// Streaming single-member decompress via flate2/zlib-ng. Fixed 1MB buffer —
-/// avoids the page-fault overhead of allocating a full-size output buffer.
-pub(crate) fn decompress_single_member_streaming<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> GzippyResult<u64> {
-    use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(data);
-    let mut buf = vec![0u8; STREAM_BUFFER_SIZE];
-    let mut total = 0u64;
-    loop {
-        let n = decoder.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-    }
-    writer.flush()?;
-    Ok(total)
-}
-
-/// Single-member decompress via libdeflate FFI (fastest path).
-/// Uses the ISIZE trailer hint for initial buffer sizing; grows and retries
-/// on InsufficientSpace.
-pub(crate) fn decompress_single_member_libdeflate<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> GzippyResult<u64> {
-    use crate::backends::libdeflate::{DecompressError, DecompressorEx};
-    let mut decompressor = DecompressorEx::new();
-    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
-    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-        isize_hint + 1024
-    } else {
-        data.len().saturating_mul(4).max(64 * 1024)
-    };
-    let mut output = alloc_aligned_buffer(initial_size);
-    loop {
-        match decompressor.gzip_decompress_ex(data, &mut output) {
-            Ok(result) => {
-                writer.write_all(&output[..result.output_size])?;
-                let mut total = result.output_size as u64;
-                // Multi-member gzip (RFC 1952 §2.2; `cat a.gz b.gz`, pigz, log
-                // rotation): `gzip_decompress_ex` decodes ONE member and
-                // reports `input_consumed`. If another member follows, decode
-                // the remainder — otherwise we'd SILENTLY TRUNCATE to the first
-                // member (classify() can land a multi-member file here when its
-                // 2nd member starts past the 16 MiB detection window). Zero cost
-                // on a true single member: input_consumed == data.len().
-                let consumed = result.input_consumed;
-                if consumed < data.len()
-                    && data.len() - consumed >= 2
-                    && data[consumed] == 0x1f
-                    && data[consumed + 1] == 0x8b
-                {
-                    total += decompress_multi_member_sequential(&data[consumed..], writer)?;
-                    return Ok(total);
-                }
-                writer.flush()?;
-                return Ok(total);
-            }
-            Err(DecompressError::InsufficientSpace) => {
-                let new_size = output.len().saturating_mul(2);
-                output.resize(new_size, 0);
-            }
-            Err(DecompressError::BadData) => {
-                return Err(GzippyError::invalid_argument(
-                    "invalid gzip data".to_string(),
-                ));
-            }
-        }
-    }
-}
-
-/// Sequential multi-member decompress via libdeflate. Uses `gzip_decompress_ex`
-/// which returns `input_consumed` so we can step through members without
-/// re-scanning.
+/// Stops cleanly (returning the bytes decoded so far) on the first non-gzip /
+/// truncated / corrupt trailing bytes — matching the historical libdeflate-based
+/// behavior, where trailing garbage after a valid member terminated the walk
+/// without erroring the already-written output.
 pub(crate) fn decompress_multi_member_sequential<W: Write>(
     data: &[u8],
     writer: &mut W,
 ) -> GzippyResult<u64> {
-    use crate::backends::libdeflate::{DecompressError, DecompressorEx};
-    let mut decompressor = DecompressorEx::new();
-    let mut total_bytes = 0u64;
-    let mut offset = 0;
-    let mut member_count = 0u32;
+    use crate::decompress::format::parse_gzip_header_size;
+    use crate::decompress::inflate::consume_first_decode::{inflate_consume_first_bits, Bits};
+
     let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
     let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
         isize_hint + 1024
@@ -697,51 +490,81 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
     };
     let mut output_buf = alloc_aligned_buffer(initial_size);
 
-    while offset < data.len() {
-        if data.len() - offset < 10 {
-            break;
-        }
+    let mut total_bytes = 0u64;
+    let mut offset = 0usize;
+    let mut member_count = 0u32;
+
+    // Minimum gzip member: 10-byte header + ≥2-byte deflate + 8-byte trailer.
+    while offset + 18 <= data.len() {
         if data[offset] != 0x1f || data[offset + 1] != 0x8b {
             break;
         }
-        let remaining = &data[offset..];
-        let min_size = remaining.len().max(128 * 1024);
-        if output_buf.len() < min_size {
-            output_buf.resize(min_size, 0);
-        }
-        let mut success = false;
-        loop {
-            match decompressor.gzip_decompress_ex(remaining, &mut output_buf) {
-                Ok(result) => {
-                    member_count += 1;
-                    if crate::utils::debug_enabled() {
-                        eprintln!(
-                            "[gzippy] sequential member {}: in_consumed={} out_size={} offset={}/{}",
-                            member_count,
-                            result.input_consumed,
-                            result.output_size,
-                            offset,
-                            data.len()
-                        );
-                    }
-                    writer.write_all(&output_buf[..result.output_size])?;
-                    total_bytes += result.output_size as u64;
-                    offset += result.input_consumed;
-                    success = true;
-                    break;
-                }
-                Err(DecompressError::InsufficientSpace) => {
-                    let new_size = output_buf.len().saturating_mul(2);
+        let header = match parse_gzip_header_size(&data[offset..]) {
+            Some(h) if h > 0 && offset + h < data.len() => h,
+            _ => break,
+        };
+        let body_start = offset + header;
+        let body = &data[body_start..];
+
+        // Decode the raw deflate body, growing the output buffer on overflow.
+        let (out_size, deflate_len) = loop {
+            let mut bits = Bits::new(body);
+            match inflate_consume_first_bits(&mut bits, &mut output_buf) {
+                Ok(n) => break (n, bits.bit_position().div_ceil(8)),
+                Err(e) if e.kind() == std::io::ErrorKind::WriteZero => {
+                    let new_size = output_buf.len().saturating_mul(2).max(256 * 1024);
                     output_buf.resize(new_size, 0);
+                    continue;
                 }
-                Err(DecompressError::BadData) => {
-                    break;
+                // Corrupt / truncated trailing bytes: stop the walk (parity with
+                // the prior libdeflate `BadData => break`).
+                Err(_) => {
+                    writer.flush()?;
+                    return Ok(total_bytes);
                 }
             }
+        };
+
+        // Verify the 8-byte gzip trailer (CRC32 + ISIZE) for this member.
+        let trailer = body_start + deflate_len;
+        if trailer + 8 > data.len() {
+            break; // truncated trailer
         }
-        if !success {
-            break;
+        let expected_crc = u32::from_le_bytes([
+            data[trailer],
+            data[trailer + 1],
+            data[trailer + 2],
+            data[trailer + 3],
+        ]);
+        let expected_isize = u32::from_le_bytes([
+            data[trailer + 4],
+            data[trailer + 5],
+            data[trailer + 6],
+            data[trailer + 7],
+        ]);
+        if (out_size as u32) != expected_isize {
+            return Err(GzippyError::decompression(format!(
+                "multi-member: ISIZE mismatch (got {out_size}, expected {expected_isize})"
+            )));
         }
+        let actual_crc = crc32fast::hash(&output_buf[..out_size]);
+        if actual_crc != expected_crc {
+            return Err(GzippyError::decompression(
+                "multi-member: CRC32 mismatch".to_string(),
+            ));
+        }
+
+        member_count += 1;
+        if crate::utils::debug_enabled() {
+            eprintln!(
+                "[gzippy] sequential member {member_count}: out_size={out_size} \
+                 deflate_len={deflate_len} offset={offset}/{}",
+                data.len()
+            );
+        }
+        writer.write_all(&output_buf[..out_size])?;
+        total_bytes += out_size as u64;
+        offset = trailer + 8;
     }
     writer.flush()?;
     Ok(total_bytes)
@@ -771,37 +594,26 @@ pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gz
 
 /// Decompress a raw DEFLATE stream (RFC 1951) — no gzip header or trailer.
 ///
-/// Uses libdeflate with a growing output buffer, falling back to flate2/zlib-ng
-/// streaming when the output exceeds 1 GiB.
+/// Pure-Rust (`inflate_consume_first`) with a growing output buffer — NO C-FFI.
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn decompress_raw_bytes(data: &[u8]) -> GzippyResult<Vec<u8>> {
-    let mut decompressor = libdeflater::Decompressor::new();
-    const CAP: usize = 1 << 30; // 1 GiB
+    use crate::decompress::inflate::consume_first_decode::inflate_consume_first;
+    const CAP: usize = 1 << 31; // 2 GiB output ceiling
     let mut estimate = data.len().saturating_mul(4).clamp(4096, CAP);
 
     loop {
         let mut out = vec![0u8; estimate];
-        match decompressor.deflate_decompress(data, &mut out) {
+        match inflate_consume_first(data, &mut out) {
             Ok(n) => {
                 out.truncate(n);
                 return Ok(out);
             }
-            Err(libdeflater::DecompressionError::InsufficientSpace) if estimate < CAP => {
+            Err(e) if e.kind() == std::io::ErrorKind::WriteZero && estimate < CAP => {
                 estimate = (estimate * 2).min(CAP);
             }
-            Err(libdeflater::DecompressionError::InsufficientSpace) => break,
             Err(_) => return Err(GzippyError::decompression("invalid raw DEFLATE data")),
         }
     }
-
-    // Output exceeds 1 GiB — stream through flate2/zlib-ng
-    use flate2::read::DeflateDecoder;
-    use std::io::Read;
-    let mut dec = DeflateDecoder::new(data);
-    let mut out = Vec::new();
-    dec.read_to_end(&mut out)
-        .map_err(|_| GzippyError::decompression("raw DEFLATE decompression failed"))?;
-    Ok(out)
 }
 
 // =============================================================================
@@ -814,8 +626,6 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
-    #[cfg(parallel_sm)]
-    use std::sync::atomic::Ordering;
 
     /// Build a moderately-compressible single-member gzip fixture whose
     /// compressed size clears `MIN_PARALLEL_COMPRESSED` AND whose ratio clears
@@ -878,48 +688,18 @@ mod tests {
         }
     }
 
-    /// The speculative parallel single-member pipeline must engage only at
-    /// T≥4 (its per-core throughput is below the ISA-L one-shot until ~4
-    /// threads; 2026-05-29 matrix: one-shot T1 1074 > parallel T2 863). At T2/T3
-    /// a compressible, size-eligible input must route to the one-shot path.
-    #[cfg(parallel_sm)]
+    /// The pure-Rust ParallelSM pipeline is the SOLE single-member decode path
+    /// at every thread count — there is no C-FFI one-shot to gate toward, so a
+    /// compressible, size-eligible input must classify `ParallelSM` at T1–T4.
     #[test]
     fn test_parallel_sm_thread_gate() {
         let (_raw, payload) = compressible_parallel_fixture();
-        // ParallelSM is the single-member path at EVERY thread count on
-        // gzippy-native (no C-FFI one-shot to gate toward, task #8). On the
-        // gzippy-isal build (`isal_clean_tail`) T1 routes to single-shot ISA-L
-        // (DIS-15: the 16-chunk pipeline buys no parallelism at one thread),
-        // while T>=2 stays ParallelSM. (Legacy `not(parallel_sm)` build keeps
-        // the T>=4 gate that fed the FFI one-shot below it.)
-        #[cfg(all(parallel_sm, isal_clean_tail))]
-        {
-            assert_eq!(
-                classify_gzip(&payload, 1),
-                DecodePath::IsalSingleShot,
-                "T=1 on gzippy-isal must take single-shot ISA-L"
-            );
-            for t in [2usize, 3, 4] {
-                assert_eq!(
-                    classify_gzip(&payload, t),
-                    DecodePath::ParallelSM,
-                    "T={t} on gzippy-isal must take the ParallelSM pipeline"
-                );
-            }
-        }
-        #[cfg(all(parallel_sm, not(isal_clean_tail)))]
         for t in [1usize, 2, 3, 4] {
             assert_eq!(
                 classify_gzip(&payload, t),
                 DecodePath::ParallelSM,
                 "T={t} must take the pure-Rust pipeline (sole single-member path)"
             );
-        }
-        #[cfg(not(parallel_sm))]
-        {
-            assert_ne!(classify_gzip(&payload, 2), DecodePath::ParallelSM);
-            assert_ne!(classify_gzip(&payload, 3), DecodePath::ParallelSM);
-            assert_eq!(classify_gzip(&payload, 4), DecodePath::ParallelSM);
         }
     }
 
@@ -977,33 +757,23 @@ mod tests {
         assert_eq!(out, original, "byte-perfect output required");
     }
 
-    /// On a parallel-eligible input the libdeflate one-shot backend must
-    /// never be called from the single-member dispatcher. This is the
-    /// no-fallback invariant the user asked for: under no circumstances
-    /// can a silent libdeflate retry mask a parallel-pipeline failure.
+    /// The single-member dispatcher decodes a parallel-eligible input purely
+    /// through the pure-Rust ParallelSM pipeline. The historical "no silent
+    /// libdeflate fallback" invariant is now enforced at COMPILE TIME: there is
+    /// no C-FFI one-shot decode backend left in the decode graph to fall back to
+    /// (the libdeflate/zlib-ng one-shot paths were deleted). This test asserts
+    /// byte-exact decode through the sole pure-Rust path.
     #[cfg(parallel_sm)]
     #[test]
     fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        // Compressible fixture above MIN_PARALLEL_COMPRESSED so the
-        // classifier returns ParallelSM (incompressible would now bail
-        // to one-shot via parallel_sm_unprofitable).
         let (original, compressed) = compressible_parallel_fixture();
-        let before_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
+        assert_eq!(classify_gzip(&compressed, 4), DecodePath::ParallelSM);
         let mut out = Vec::new();
         decompress_single_member(&compressed, &mut out, 4).expect("must succeed");
         assert_eq!(out, original, "byte-perfect output required");
-        let after_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
-        assert_eq!(
-            after_lib, before_lib,
-            "libdeflate SM backend must not be called from the parallel-eligible SM path \
-             (would indicate a silent fallback)"
-        );
-        // ISA-L sequential counter is incremented by other unit tests that
-        // call `decompress_single_member(..., T=1)` in parallel; only the
-        // libdeflate counter is a reliable no-fallback signal here.
     }
 
     /// A corrupted CRC must surface as `GzippyError::Decompression`, not

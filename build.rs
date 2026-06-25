@@ -63,7 +63,14 @@ fn emit_parallel_sm_cfgs() {
     // `unexpected_cfgs` lint (required since Rust 1.80).
     println!("cargo::rustc-check-cfg=cfg(parallel_sm)");
     println!("cargo::rustc-check-cfg=cfg(pure_inflate_decode)");
-    // Phase-2: the real-ISA-L clean tail (gzippy-isal). x86_64 only.
+    // `isal_clean_tail` is the (now-dormant) ISA-L from-bit clean-tail DECODE
+    // oracle selector. It is NEVER emitted: the pure-Rust DEFLATE engine is the
+    // SOLE production decode path on every build. The cfg is still DECLARED so
+    // the remaining `#[cfg(not(isal_clean_tail))]` branches (the active pure-Rust
+    // path) and the dormant `#[cfg(isal_clean_tail)]` branches do not trip the
+    // `unexpected_cfgs` lint. The ISA-L from-bit decode survives only as a
+    // measurement oracle compiled under `isal-compression` and reachable solely
+    // via `GZIPPY_ISAL_ENGINE_ORACLE=1` — off the production decode graph.
     println!("cargo::rustc-check-cfg=cfg(isal_clean_tail)");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -72,46 +79,15 @@ fn emit_parallel_sm_cfgs() {
 
     // Cargo exposes enabled features as CARGO_FEATURE_<NAME> (uppercased,
     // `-` → `_`).
-    let has_isal_compression = std::env::var_os("CARGO_FEATURE_ISAL_COMPRESSION").is_some();
     let has_pure_rust_inflate = std::env::var_os("CARGO_FEATURE_PURE_RUST_INFLATE").is_some();
-    let has_gzippy_isal = std::env::var_os("CARGO_FEATURE_GZIPPY_ISAL").is_some();
-
-    // gzippy-isal is an x86_64-only reference baseline: it links the ISA-L C lib
-    // (via isal-compression / isal-sys) which has no arm64 build. Fail loudly at
-    // build time rather than producing a broken arm64 binary.
-    if has_gzippy_isal && !is_x86_64 {
-        panic!(
-            "feature `gzippy-isal` is x86_64-only (it links the ISA-L C library, \
-             which has no aarch64 build). Use `gzippy-native` on this target."
-        );
-    }
 
     // The single-member parallel decode (the rapidgzip-shaped path) exists in
-    // EXACTLY ONE config: pure-Rust. `isal-compression` no longer enables it —
-    // that feature keeps only the ISA-L *compression* backend. So there is no
-    // alternate build-config variant of the parallel decode; it is always the
-    // pure-Rust decoder, and `pure_inflate_decode == parallel_sm`.
+    // EXACTLY ONE config: pure-Rust. `isal-compression` only keeps the ISA-L
+    // *compression* backend; it does NOT enable any production decode. So the
+    // parallel decode is always the pure-Rust decoder, and
+    // `pure_inflate_decode == parallel_sm`.
     let parallel_sm = (is_x86_64 || is_aarch64) && has_pure_rust_inflate;
     let pure_inflate_decode = parallel_sm;
-    let _ = has_isal_compression;
-
-    // gzippy-isal clean-tail ENGINE selector.
-    // When ON (x86_64 + gzippy-isal, guarded above): the chunk uses the TWO-PHASE
-    // handoff — Engine M (`marker_inflate::Block`, u16) bootstraps until 32 KiB clean,
-    // then `FlipToClean` hands the clean tail to REAL ISA-L FFI **in PRODUCTION**
-    // (`finish_decode_chunk_isal_oracle` -> `isal_inflate`), faithful rapidgzip
-    // WITH_ISAL. This is the DEFAULT: `isal_engine_oracle_enabled()` returns
-    // `cfg!(isal_clean_tail)` (true here) when `GZIPPY_ISAL_ENGINE_ORACLE` is unset;
-    // the env var only FORCES on(1)/off(0). The pure-Rust `StreamingInflateWrapper`
-    // (`unified::Inflate<Clean>`, resumable.rs) is the decline-FALLBACK (rare on
-    // dynamic corpora; fires on flush-dense input). So C-FFI IS on the gzippy-isal
-    // decode graph BY DESIGN (faithful WITH_ISAL); `isal_chunks>0` is its fingerprint.
-    // When OFF (gzippy-native, and arm64 always): the FOLD — Engine M keeps decoding
-    // the clean tail in-place via `read_internal_compressed_specialized::<false>`,
-    // PURE RUST, NO C-FFI. (NB: the `*_oracle` naming on this PRODUCTION ISA-L path is
-    // a stale misnomer from when it was a measurement knob — pending rename; it is NOT
-    // measurement-only on gzippy-isal.)
-    let isal_clean_tail = is_x86_64 && has_gzippy_isal && parallel_sm;
 
     if parallel_sm {
         println!("cargo::rustc-cfg=parallel_sm");
@@ -119,22 +95,15 @@ fn emit_parallel_sm_cfgs() {
     if pure_inflate_decode {
         println!("cargo::rustc-cfg=pure_inflate_decode");
     }
-    if isal_clean_tail {
-        println!("cargo::rustc-cfg=isal_clean_tail");
-    }
 
     // BUILD_FLAVOR: compile-time &'static str consumed by `env!("BUILD_FLAVOR")`.
-    //   "parallel-sm+isal"  — parallel_sm + isal_clean_tail (gzippy-isal, the
-    //                         faithful WITH_ISAL rapidgzip port, x86_64 only).
-    //   "parallel-sm+pure"  — parallel_sm only (gzippy-native or pure-rust-inflate,
-    //                         pure-Rust DEFLATE engine, x86_64 + aarch64).
-    //   "legacy-serial"     — no parallel_sm (default features / no-feature build:
-    //                         the serial libdeflate/ISA-L one-shot path). This is
-    //                         NOT the product — the product uses gzippy-isal or
-    //                         gzippy-native. A `cargo::warning` is emitted below.
-    let flavor = if isal_clean_tail {
-        "parallel-sm+isal"
-    } else if parallel_sm {
+    //   "parallel-sm+pure"  — parallel_sm (gzippy-native / pure-rust-inflate, the
+    //                         pure-Rust DEFLATE engine, x86_64 + aarch64). The product.
+    //   "legacy-serial"     — no parallel_sm (a bare no-feature build). NOT the
+    //                         product and no longer a working decode build (the
+    //                         legacy C-FFI one-shot decode path was removed); a
+    //                         `cargo::warning` is emitted below.
+    let flavor = if parallel_sm {
         "parallel-sm+pure"
     } else {
         "legacy-serial"
@@ -143,10 +112,9 @@ fn emit_parallel_sm_cfgs() {
 
     if !parallel_sm {
         println!(
-            "cargo::warning=building the legacy serial binary (no parallel_sm) — \
-             this is NOT the product binary. \
-             Use `--no-default-features --features gzippy-isal` (x86_64) or \
-             `--no-default-features --features gzippy-native` for the product build."
+            "cargo::warning=building without the pure-Rust parallel decoder (no parallel_sm) — \
+             this build has NO working decode path. \
+             Use the default build or `--no-default-features --features gzippy-native`."
         );
     }
 }
