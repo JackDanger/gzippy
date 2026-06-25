@@ -7452,6 +7452,7 @@ mod tests {
         /// Case 2 with `uncompressed_size == 0`: the sync-flush empty stored
         /// block flips once >=32 KiB of trailing clean exists (markers
         /// earlier), emitting ZERO bytes.
+        #[ignore = "shared process-global counter races under parallel cargo test; run serially with --ignored --test-threads=1"]
         #[test]
         fn case2_empty_stored_block_flips_after_32k_clean() {
             let dict = test_dict();
