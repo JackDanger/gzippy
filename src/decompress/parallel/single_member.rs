@@ -171,6 +171,66 @@ pub(crate) fn t1_output_resident_chunk(gzip_data: &[u8], deflate_data_len: usize
     )
 }
 
+/// Default ISIZE/deflate ratio at or above which the parallel single-member
+/// pipeline is capped to one thread (the fast inline T1 path). Override with
+/// `GZIPPY_PARALLEL_RATIO_MAX` (used to lock this constant from a gate-hardware
+/// sweep). Rationale + measurements in [`effective_parallel_threads`].
+const PARALLEL_RATIO_MAX_DEFAULT: u64 = 8;
+
+/// Counter proving the compressibility thread-cap fired on a real decode
+/// (deletion-trap discipline; read by the routing test).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub static COMPRESSIBILITY_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
+
+/// Compressibility-gated effective thread count for the parallel single-member
+/// pipeline.
+///
+/// The pipeline's per-chunk marker-resolution + window-application cost scales
+/// with OUTPUT bytes, while the parallelizable decode work scales with
+/// COMPRESSED bytes. On a highly-compressible single-member stream (high
+/// ISIZE/deflate ratio) the output-proportional overhead overwhelms the
+/// parallel speedup, so Tmax REGRESSES below T1. Measured (gzippy-vs-itself,
+/// /dev/null, interleaved; crossover transfers across arch):
+///   silesia  ratio 2.75x → p8 = 1.94x of T1   (parallel HELPS)
+///   logs     ratio 15.2x → p8 = 0.61x of T1   (parallel HURTS — even p2 = 0.59x)
+///   software ratio 29.8x → p8 = 0.51x of T1   (parallel HURTS)
+/// So when the ratio is at/above the crossover, cap to ONE thread — the inline
+/// T1 path — guaranteeing Tmax is never slower than T1. ISIZE wrap (>4 GiB
+/// output) or near-incompressible (isize<deflate) yields a low/!computable
+/// ratio → keep the requested threads (parallel is correct there).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub(crate) fn effective_parallel_threads(
+    gzip_data: &[u8],
+    deflate_data_len: usize,
+    num_threads: usize,
+) -> usize {
+    if num_threads <= 1 || deflate_data_len == 0 || gzip_data.len() < 4 {
+        return num_threads;
+    }
+    let ratio_max = std::env::var("GZIPPY_PARALLEL_RATIO_MAX")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(PARALLEL_RATIO_MAX_DEFAULT);
+    if ratio_max == 0 {
+        return num_threads; // explicit disable of the cap
+    }
+    let n = gzip_data.len();
+    let isize_field = u32::from_le_bytes([
+        gzip_data[n - 4],
+        gzip_data[n - 3],
+        gzip_data[n - 2],
+        gzip_data[n - 1],
+    ]) as u64;
+    let deflate_len = deflate_data_len as u64;
+    // ratio = isize/deflate >= ratio_max  ⟺  isize >= ratio_max*deflate (no division)
+    if isize_field >= ratio_max.saturating_mul(deflate_len) {
+        COMPRESSIBILITY_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
+        1
+    } else {
+        num_threads
+    }
+}
+
 /// Counter incremented every time `adjusted_chunk_size_bytes` returns a
 /// value strictly less than the default. Mirror of the
 /// `PREFETCH_NEXT_FILESIZE_ACCEPT` / `UNSPLIT_BLOCKS_EMPLACED`
@@ -291,6 +351,15 @@ pub fn decompress_parallel<W: Write>(
         // output-buffer recycling win, gated; see T1_TARGET_COMPRESSED_CHUNK_BYTES),
         // T>1 keeps the 4 MiB target (finer granularity regresses the parallel
         // pipeline). Explicit GZIPPY_CHUNK_KIB always overrides.
+        // Compressibility thread-cap: on highly-compressible single-member
+        // streams the parallel pipeline regresses below the inline T1 path
+        // (output-proportional marker overhead > parallel decode benefit), so
+        // cap to one thread there. Shadows num_threads so chunk sizing and the
+        // driver both use the effective count. See `effective_parallel_threads`.
+        let num_threads = effective_parallel_threads(gzip_data, _deflate_data_len, num_threads);
+        if debug_enabled() {
+            eprintln!("[parallel_sm] effective_threads={num_threads} (compressibility cap)");
+        }
         let thread_default_chunk = if num_threads <= 1 {
             // T1 OUTPUT-RESIDENT stride: keep the per-chunk decoded buffer near a
             // fixed cache/fault-friendly size by deriving the compressed stride
@@ -487,6 +556,35 @@ impl std::fmt::Display for ParallelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ISIZE/deflate ratio gate: highly-compressible single-member caps to one
+    /// thread (the inline T1 path) so Tmax never regresses below T1; moderately
+    /// compressible keeps the requested threads. Builds a minimal blob whose
+    /// last 4 bytes are the gzip-trailer ISIZE the helper reads.
+    fn blob_with_isize(isize_val: u32) -> Vec<u8> {
+        let mut v = vec![0u8; 64];
+        v[60..64].copy_from_slice(&isize_val.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn compressibility_cap_serializes_high_ratio_keeps_low_ratio() {
+        let deflate_len = 1_000_000usize;
+        // ratio 20x (>= default 8) → cap to 1 thread.
+        let high = blob_with_isize(20_000_000);
+        assert_eq!(effective_parallel_threads(&high, deflate_len, 8), 1);
+        // ratio 3x (< 8) → keep all threads.
+        let low = blob_with_isize(3_000_000);
+        assert_eq!(effective_parallel_threads(&low, deflate_len, 8), 8);
+        // single-thread request is never altered.
+        assert_eq!(effective_parallel_threads(&high, deflate_len, 1), 1);
+        // exactly at the threshold (8x) caps (>= boundary).
+        let at = blob_with_isize(8_000_000);
+        assert_eq!(effective_parallel_threads(&at, deflate_len, 8), 1);
+        // just under (7.99x) keeps.
+        let under = blob_with_isize(7_990_000);
+        assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+    }
 
     #[test]
     fn adjusted_chunk_size_keeps_default_on_large_files() {
