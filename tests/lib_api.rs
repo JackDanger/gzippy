@@ -228,20 +228,11 @@ fn decompress_multi_member_parallel() {
 fn classify_single_member_t1() {
     let compressed = gzip_encode_with_flate2(&make_text(4096), 6);
     let path = gzippy::classify(&compressed, 1);
-    // gzippy-native: ParallelSM (or the non-parallel_sm fallbacks elsewhere).
-    // gzippy-isal (`isal_clean_tail`): T1 single-member routes to ONE ISA-L
-    // call — `DecodePath::IsalSingleShot` (decompress/mod.rs, the
-    // `#[cfg(isal_clean_tail)] if num_threads <= 1` branch, since 0e57d8d9).
-    let isal_single_shot_ok = cfg!(isal_clean_tail) && matches!(path, DecodePath::IsalSingleShot);
+    // Single-member always routes to the pure-Rust ParallelSM pipeline (or the
+    // non-speculative pure-Rust StoredParallel split for stored-dominated input).
+    // The C-FFI one-shot decode backends and ISA-L decode are off the graph.
     assert!(
-        isal_single_shot_ok
-            || matches!(
-                path,
-                DecodePath::ParallelSM
-                    | DecodePath::StoredParallel
-                    | DecodePath::StreamingSingle
-                    | DecodePath::LibdeflateSingle
-            ),
+        matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
         "unexpected path {path:?} for T1 single-member"
     );
 }
@@ -252,13 +243,7 @@ fn classify_single_member_t4() {
     let path = gzippy::classify(&compressed, 4);
     // Still single-member (no multi-block markers) even with T4.
     assert!(
-        matches!(
-            path,
-            DecodePath::ParallelSM
-                | DecodePath::StoredParallel
-                | DecodePath::StreamingSingle
-                | DecodePath::LibdeflateSingle
-        ),
+        matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
         "unexpected path {path:?} for T4 single-member"
     );
 }

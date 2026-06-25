@@ -362,11 +362,8 @@ mod tests {
 
         // Sequential fallback
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(
-            &oracle.single_member_gz,
-            &mut output,
-        )
-        .unwrap();
+        crate::decompress::decompress_single_member_pure(&oracle.single_member_gz, &mut output)
+            .unwrap();
         assert_eq!(
             output, oracle.original,
             "single-member libdeflate output doesn't match original"
@@ -1172,7 +1169,7 @@ mod tests {
     #[cfg(all(parallel_sm, unix))]
     fn test_silesia_parallel_sm_mmap_fd_cli_shape() {
         use std::fs::File;
-        use std::io::Write;
+
         use std::os::unix::io::AsRawFd;
 
         let path = std::path::Path::new("benchmark_data/silesia-gzip.tar.gz");
@@ -1183,7 +1180,7 @@ mod tests {
         let file = File::open(path).expect("open silesia");
         let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap silesia") };
         let mut sink = Vec::new();
-        let mut drain = tempfile::NamedTempFile::new().expect("tempfile");
+        let drain = tempfile::NamedTempFile::new().expect("tempfile");
         let out_fd = Some(drain.as_raw_fd());
         let nbytes =
             crate::decompress::decompress_single_member_fd(&mmap[..], &mut sink, out_fd, 8)
@@ -1587,7 +1584,7 @@ mod tests {
         .unwrap();
 
         let mut from_single = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(
+        crate::decompress::decompress_single_member_pure(
             &oracle.single_member_gz,
             &mut from_single,
         )
@@ -1655,18 +1652,11 @@ mod tests {
         use crate::decompress::{classify_gzip, DecodePath};
         let oracle = FileOracle::new(512 * 1024);
         let path = classify_gzip(&oracle.single_member_gz, 4);
-        // Single-member must route to one of the single-member paths. Under
-        // `parallel_sm` (production) it's the pure-Rust pipeline; the legacy
-        // build may pick StreamingSingle / LibdeflateSingle. ISA-L decode is
-        // deleted from the decode graph (task #8).
+        // Single-member must route to one of the pure-Rust single-member paths.
+        // The C-FFI one-shot decode backends (libdeflate / zlib-ng) and ISA-L
+        // decode are deleted from the decode graph.
         assert!(
-            matches!(
-                path,
-                DecodePath::ParallelSM
-                    | DecodePath::StoredParallel
-                    | DecodePath::StreamingSingle
-                    | DecodePath::LibdeflateSingle
-            ),
+            matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
             "single-member should classify as a single-member path, got {:?}",
             path
         );

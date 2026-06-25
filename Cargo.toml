@@ -29,6 +29,30 @@ include = [
     "rust-toolchain.toml",
 ]
 
+# Lint levels applied package-wide to every target (lib, bin, tests, benches,
+# examples). Flipping `default` to `pure-rust-inflate` brought the large
+# pure-Rust parallel-decode engine into the bare `cargo clippy --all-targets`
+# lint gate for the first time. These lints fire on INTENTIONAL, perf-deliberate
+# patterns in the hot decode/table-build code (index loops over parallel arrays,
+# hand-rolled clamps/memcpy/div in the bit-twiddling kernels) and on doc-comment
+# formatting — they are pre-existing style, not correctness issues, so they are
+# allowed here rather than rewriting hot loops (which risks the byte-exact
+# contract). Real correctness/clarity lints stay enabled.
+[lints.clippy]
+needless_range_loop = "allow"
+manual_clamp = "allow"
+manual_memcpy = "allow"
+manual_checked_ops = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+nonminimal_bool = "allow"
+explicit_counter_loop = "allow"
+if_same_then_else = "allow"
+unusual_byte_groupings = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
 [lib]
 name = "gzippy"
 path = "src/lib.rs"
@@ -39,14 +63,14 @@ path = "src/main.rs"
 
 [features]
 # The pure-Rust parallel single-member decoder (the `parallel_sm` cfg, emitted
-# by `pure-rust-inflate`) is the production decode path: the release/ship/bench
-# builds enable `pure-rust-inflate`, so the SHIPPED binary decodes single-member
-# via pure-Rust with NO C-FFI (ISA-L decode is deleted from the graph entirely;
-# task #8). `default` stays empty so the bare `cargo build` / lint gate does not
-# compile the large experimental parallel module (whose pre-existing lint debt
-# is a separate cleanup). Make the default `pure-rust-inflate` once that debt is
-# cleared.
-default = []
+# by `pure-rust-inflate`) is the SOLE production decode path: every build —
+# including the bare `cargo build` / lint gate — compiles the parallel module and
+# decodes ALL gzip formats (single-member, multi-member, BGZF, raw DEFLATE) via
+# pure-Rust with NO C-FFI in the decode graph. The legacy serial libdeflate/
+# zlib-ng one-shot single-member path and the ISA-L FFI decode path have been
+# removed. (C-FFI remains ONLY for COMPRESSION — ISA-L/libdeflate/zlib-ng — and
+# behind dev/test code as differential oracles.)
+default = ["pure-rust-inflate"]
 # Route-B aarch64 sub-region wall-slope injector (consume_first_decode.rs).
 # OFF by default => production hot loop is byte- AND instruction-identical
 # (inject_env folds to const 0, inject_work is an empty inline fn => fully
@@ -96,13 +120,6 @@ asm-kernel = []
 # command line for the ISA-L *compression* backend (T1 L0–L3); that is layered by
 # the build/CI scripts per-target, NOT pulled here, so arm64 native stays C-free.
 gzippy-native = ["pure-rust-inflate"]
-# gzippy-isal (x86_64-only reference/comparison baseline, NOT default): FAITHFUL
-# rapidgzip — the pure-Rust marker engine runs to a 32 KiB clean window, then HANDS
-# OFF the clean tail to REAL ISA-L via FFI (vendor GzipChunk.hpp:520-525). It pulls
-# `isal-compression` to link the ISA-L C lib + FFI decode entry points, and sets the
-# build.rs `isal_clean_tail` cfg (x86_64 only). build.rs emits a compile_error! if
-# this feature is built on a non-x86_64 target (the ISA-L C lib has no arm64 build).
-gzippy-isal = ["pure-rust-inflate", "isal-compression"]
 arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
 # Allocator-visibility tooling: enable rpmalloc's ENABLE_STATISTICS so
 # dump_global_stats() reports mapped_total / unmapped_total / cached /

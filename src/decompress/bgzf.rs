@@ -20,52 +20,6 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// =============================================================================
-// Hot-path counters (active only in test builds or with feature "counters")
-// =============================================================================
-//
-// Zero overhead in production: the cfg gate eliminates all counter code.
-// Use in tests: crate::decompress::bgzf::hot_counters::reset() / snapshot()
-// Use manually: cargo build --features counters
-#[cfg(any(test, feature = "counters"))]
-pub mod hot_counters {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static DYNAMIC_BLOCKS: AtomicU64 = AtomicU64::new(0);
-    static MULTI_SYM_BLOCKS: AtomicU64 = AtomicU64::new(0);
-    static STANDARD_BLOCKS: AtomicU64 = AtomicU64::new(0);
-
-    pub fn reset() {
-        DYNAMIC_BLOCKS.store(0, Ordering::SeqCst);
-        MULTI_SYM_BLOCKS.store(0, Ordering::SeqCst);
-        STANDARD_BLOCKS.store(0, Ordering::SeqCst);
-    }
-
-    /// Returns (dynamic_blocks, multi_sym_blocks, standard_blocks).
-    pub fn snapshot() -> (u64, u64, u64) {
-        (
-            DYNAMIC_BLOCKS.load(Ordering::SeqCst),
-            MULTI_SYM_BLOCKS.load(Ordering::SeqCst),
-            STANDARD_BLOCKS.load(Ordering::SeqCst),
-        )
-    }
-
-    #[inline(always)]
-    pub fn inc_dynamic() {
-        DYNAMIC_BLOCKS.fetch_add(1, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn inc_multi_sym() {
-        MULTI_SYM_BLOCKS.fetch_add(1, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn inc_standard() {
-        STANDARD_BLOCKS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-use crate::decompress::combined_lut::CombinedLUT;
-use crate::decompress::inflate_tables::CODE_LENGTH_ORDER;
 use crate::decompress::packed_lut::PackedLUT;
 #[allow(unused_imports)]
 use crate::decompress::two_level_table::{FastBits, TurboBits, TwoLevelTable};
@@ -458,95 +412,21 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
 
 /// Inflate directly into a pre-allocated output slice
 ///
-/// Decompress raw deflate data using libdeflate FFI.
+/// Decompress raw deflate data using the pure-Rust inflate engine.
 ///
-/// This is the key function for zero-copy parallel decompression.
-/// Each call allocates a lightweight (~4KB) libdeflate decompressor.
+/// This is the key function for zero-copy parallel decompression. The pure-Rust
+/// decoder (`inflate_consume_first`) is stateless — there is no per-call
+/// decompressor to allocate/free — and carries NO C-FFI, so the BGZF /
+/// multi-member decode graph is FFI-free.
 fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    inflate_into_libdeflate(deflate_data, output)
-}
-
-/// Decompress raw deflate data using libdeflate's optimized C implementation.
-///
-/// Uses `libdeflate_deflate_decompress` which is 30-50% faster than zlib
-/// for in-memory operations. The decompressor is ~4KB and cheap to allocate.
-fn inflate_into_libdeflate(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
-    if decompressor.is_null() {
-        return Err(io::Error::other(
-            "failed to allocate libdeflate decompressor",
-        ));
-    }
-
-    let mut actual_out = 0usize;
-    let result = unsafe {
-        libdeflate_sys::libdeflate_deflate_decompress(
-            decompressor,
-            deflate_data.as_ptr() as *const std::ffi::c_void,
-            deflate_data.len(),
-            output.as_mut_ptr() as *mut std::ffi::c_void,
-            output.len(),
-            &mut actual_out,
-        )
-    };
-
-    unsafe {
-        libdeflate_sys::libdeflate_free_decompressor(decompressor);
-    }
-
-    match result {
-        libdeflate_sys::libdeflate_result_LIBDEFLATE_SUCCESS => Ok(actual_out),
-        libdeflate_sys::libdeflate_result_LIBDEFLATE_BAD_DATA => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid deflate data",
-        )),
-        libdeflate_sys::libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "output buffer too small",
-        )),
-        _ => Err(io::Error::other("unknown libdeflate error")),
-    }
+    crate::decompress::inflate::consume_first_decode::inflate_consume_first(deflate_data, output)
 }
 
 /// Public version of inflate_into for use by other modules.
 ///
-/// Uses libdeflate FFI for maximum decompression speed.
+/// Pure-Rust inflate — no C-FFI in the decode graph.
 pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
     inflate_into(deflate_data, output)
-}
-
-/// Decode stored block directly into output slice
-fn decode_stored_into(
-    bits: &mut FastBits,
-    output: &mut [u8],
-    mut out_pos: usize,
-) -> io::Result<usize> {
-    bits.align();
-    bits.refill();
-
-    let len = bits.read(16) as usize;
-    let nlen = bits.read(16) as usize;
-
-    if len != (!nlen & 0xFFFF) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Stored block length mismatch",
-        ));
-    }
-
-    for _ in 0..len {
-        if out_pos >= output.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "Output buffer full",
-            ));
-        }
-        bits.ensure(8);
-        output[out_pos] = bits.read(8) as u8;
-        out_pos += 1;
-    }
-
-    Ok(out_pos)
 }
 
 /// Get fixed Huffman code lengths (RFC 1951)
@@ -565,34 +445,6 @@ fn get_fixed_lit_len_lens() -> [u8; 288] {
         lens[i] = 8;
     }
     lens
-}
-
-/// Pre-built fixed Huffman tables
-fn get_fixed_tables() -> (
-    &'static TwoLevelTable,
-    &'static TwoLevelTable,
-    &'static CombinedLUT,
-) {
-    use std::sync::OnceLock;
-
-    static FIXED_LIT_LEN: OnceLock<TwoLevelTable> = OnceLock::new();
-    static FIXED_DIST: OnceLock<TwoLevelTable> = OnceLock::new();
-    static FIXED_COMBINED: OnceLock<CombinedLUT> = OnceLock::new();
-
-    let lit_len =
-        FIXED_LIT_LEN.get_or_init(|| TwoLevelTable::build(&get_fixed_lit_len_lens()).unwrap());
-
-    let dist = FIXED_DIST.get_or_init(|| {
-        let lens = [5u8; 32];
-        TwoLevelTable::build(&lens).unwrap()
-    });
-
-    let combined = FIXED_COMBINED.get_or_init(|| {
-        let dist_lens = vec![5u8; 32];
-        CombinedLUT::build(&get_fixed_lit_len_lens(), &dist_lens).unwrap()
-    });
-
-    (lit_len, dist, combined)
 }
 
 /// Pre-built fixed Huffman tables with PackedLUT for turbo decode
@@ -622,521 +474,6 @@ fn get_fixed_tables_turbo() -> (
     });
 
     (lit_len, dist, packed)
-}
-
-/// Decode fixed Huffman block into output slice
-fn decode_fixed_into(bits: &mut FastBits, output: &mut [u8], out_pos: usize) -> io::Result<usize> {
-    let (lit_len_table, dist_table, combined_lut) = get_fixed_tables();
-    decode_huffman_into(
-        bits,
-        output,
-        out_pos,
-        combined_lut,
-        lit_len_table,
-        dist_table,
-    )
-}
-
-/// Decode dynamic Huffman block into output slice
-fn decode_dynamic_into(
-    bits: &mut FastBits,
-    output: &mut [u8],
-    out_pos: usize,
-) -> io::Result<usize> {
-    bits.ensure(16);
-    let hlit = bits.read(5) as usize + 257;
-    let hdist = bits.read(5) as usize + 1;
-    let hclen = bits.read(4) as usize + 4;
-
-    // Read code length code lengths
-    let mut code_len_lens = [0u8; 19];
-    for i in 0..hclen {
-        bits.ensure(8);
-        code_len_lens[CODE_LENGTH_ORDER[i] as usize] = bits.read(3) as u8;
-    }
-
-    let code_len_table = TwoLevelTable::build(&code_len_lens)?;
-
-    // Read all code lengths
-    let total_codes = hlit + hdist;
-    let mut code_lens = vec![0u8; total_codes];
-    let mut i = 0;
-
-    while i < total_codes {
-        bits.ensure(16);
-        let (symbol, sym_len) = code_len_table.decode(bits.buffer());
-        if sym_len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid code length code",
-            ));
-        }
-        bits.consume(sym_len);
-
-        match symbol {
-            0..=15 => {
-                code_lens[i] = symbol as u8;
-                i += 1;
-            }
-            16 => {
-                if i == 0 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid repeat"));
-                }
-                let repeat = 3 + bits.read(2) as usize;
-                let last = code_lens[i - 1];
-                for _ in 0..repeat.min(total_codes - i) {
-                    code_lens[i] = last;
-                    i += 1;
-                }
-            }
-            17 => {
-                let repeat = 3 + bits.read(3) as usize;
-                i += repeat.min(total_codes - i);
-            }
-            18 => {
-                let repeat = 11 + bits.read(7) as usize;
-                i += repeat.min(total_codes - i);
-            }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid code")),
-        }
-    }
-
-    let lit_len_table = TwoLevelTable::build(&code_lens[..hlit])?;
-    let dist_table = TwoLevelTable::build(&code_lens[hlit..])?;
-    let combined_lut = CombinedLUT::build(&code_lens[..hlit], &code_lens[hlit..])?;
-
-    // Check if codes are short enough for multi-symbol optimization
-    // If max code length <= 6, we can fit 2 symbols in 12 bits
-    let max_lit_len = code_lens[..hlit].iter().copied().max().unwrap_or(0);
-    let use_multi_sym = max_lit_len <= 6 && max_lit_len > 0;
-
-    #[cfg(any(test, feature = "counters"))]
-    hot_counters::inc_dynamic();
-
-    if use_multi_sym {
-        // Try multi-symbol decode for literal-heavy blocks
-        if let Ok(multi_sym_table) =
-            crate::decompress::simd_huffman::MultiSymTable::build(&code_lens[..hlit])
-        {
-            #[cfg(any(test, feature = "counters"))]
-            hot_counters::inc_multi_sym();
-            return decode_huffman_multi_sym(
-                bits,
-                output,
-                out_pos,
-                &multi_sym_table,
-                &combined_lut,
-                &lit_len_table,
-                &dist_table,
-            );
-        }
-    }
-
-    #[cfg(any(test, feature = "counters"))]
-    hot_counters::inc_standard();
-
-    decode_huffman_into(
-        bits,
-        output,
-        out_pos,
-        &combined_lut,
-        &lit_len_table,
-        &dist_table,
-    )
-}
-
-/// Decode using multi-symbol table for literal runs
-/// Falls back to regular decode for length codes and complex cases
-fn decode_huffman_multi_sym(
-    bits: &mut FastBits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    multi_sym_table: &crate::decompress::simd_huffman::MultiSymTable,
-    _combined_lut: &CombinedLUT,
-    lit_len_table: &TwoLevelTable,
-    dist_table: &TwoLevelTable,
-) -> io::Result<usize> {
-    use crate::decompress::inflate_tables::{
-        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
-    };
-
-    loop {
-        bits.ensure(32);
-
-        // Try multi-symbol decode first
-        let entry = multi_sym_table.lookup(bits.buffer());
-
-        if entry.sym_count > 0 && entry.total_bits > 0 {
-            // Got literals - write them all
-            bits.consume(entry.total_bits as u32);
-
-            match entry.sym_count {
-                1 => {
-                    if out_pos >= output.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "Output buffer full",
-                        ));
-                    }
-                    output[out_pos] = entry.sym1;
-                    out_pos += 1;
-                }
-                2 => {
-                    if out_pos + 1 >= output.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "Output buffer full",
-                        ));
-                    }
-                    output[out_pos] = entry.sym1;
-                    output[out_pos + 1] = entry.sym2;
-                    out_pos += 2;
-                }
-                3 => {
-                    if out_pos + 2 >= output.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "Output buffer full",
-                        ));
-                    }
-                    output[out_pos] = entry.sym1;
-                    output[out_pos + 1] = entry.sym2;
-                    output[out_pos + 2] = entry.sym3;
-                    out_pos += 3;
-                }
-                4 => {
-                    if out_pos + 3 >= output.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "Output buffer full",
-                        ));
-                    }
-                    output[out_pos] = entry.sym1;
-                    output[out_pos + 1] = entry.sym2;
-                    output[out_pos + 2] = entry.sym3;
-                    output[out_pos + 3] = entry.sym4;
-                    out_pos += 4;
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        // Non-literal or invalid - use fallback
-        if entry.total_bits > 0 {
-            bits.consume(entry.total_bits as u32);
-            let symbol = entry.symbol();
-
-            if symbol == 256 {
-                // End of block
-                break;
-            }
-
-            // Length code - handle with regular path
-            let len_idx = (symbol - 257) as usize;
-            if len_idx >= 29 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid length code",
-                ));
-            }
-
-            bits.ensure(16);
-            let length =
-                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
-
-            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
-            if dist_len == 0 || dist_sym >= 30 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance code",
-                ));
-            }
-            bits.consume(dist_len);
-
-            bits.ensure(16);
-            let distance = DIST_START[dist_sym as usize] as usize
-                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
-
-            if distance > out_pos || distance == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance",
-                ));
-            }
-
-            out_pos = copy_match_into(output, out_pos, distance, length);
-        } else {
-            // Fall back to regular decode for long codes
-            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
-            if code_len == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid Huffman code",
-                ));
-            }
-            bits.consume(code_len);
-
-            if symbol < 256 {
-                if out_pos >= output.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "Output buffer full",
-                    ));
-                }
-                output[out_pos] = symbol as u8;
-                out_pos += 1;
-            } else if symbol == 256 {
-                break;
-            } else {
-                // Length code
-                let len_idx = (symbol - 257) as usize;
-                if len_idx >= 29 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid length code",
-                    ));
-                }
-
-                bits.ensure(16);
-                let length = LEN_START[len_idx] as usize
-                    + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
-
-                let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
-                if dist_len == 0 || dist_sym >= 30 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid distance code",
-                    ));
-                }
-                bits.consume(dist_len);
-
-                bits.ensure(16);
-                let distance = DIST_START[dist_sym as usize] as usize
-                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
-
-                if distance > out_pos || distance == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid distance",
-                    ));
-                }
-
-                out_pos = copy_match_into(output, out_pos, distance, length);
-            }
-        }
-    }
-
-    Ok(out_pos)
-}
-
-/// Core decode loop using CombinedLUT, writing directly to output slice
-fn decode_huffman_into(
-    bits: &mut FastBits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    combined_lut: &CombinedLUT,
-    lit_len_table: &TwoLevelTable,
-    dist_table: &TwoLevelTable,
-) -> io::Result<usize> {
-    use crate::decompress::combined_lut::{DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH};
-    use crate::decompress::inflate_tables::{
-        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
-    };
-
-    // Branch prediction hints (stable workaround for likely/unlikely)
-    // These help the compiler optimize hot paths by marking cold paths
-    #[cold]
-    #[inline(never)]
-    fn cold_path() {}
-
-    #[inline(always)]
-    fn likely(b: bool) -> bool {
-        if !b {
-            cold_path();
-        }
-        b
-    }
-
-    #[inline(always)]
-    fn unlikely(b: bool) -> bool {
-        if b {
-            cold_path();
-        }
-        b
-    }
-
-    // Prefetch next output cache line (64 bytes ahead on x86_64)
-    // This hides memory latency by loading data into L1 cache before it's needed
-    #[inline(always)]
-    #[allow(unused_variables)]
-    fn prefetch_output(output: &[u8], pos: usize) {
-        #[cfg(target_arch = "x86_64")]
-        if pos + 64 < output.len() {
-            // SAFETY: Pointer arithmetic within bounds, prefetch is advisory
-            unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    output.as_ptr().add(pos + 64) as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
-            }
-        }
-        // ARM prefetch is unstable in Rust, no-op for now
-    }
-
-    loop {
-        bits.ensure(32);
-
-        // Prefetch next output cache line
-        prefetch_output(output, out_pos);
-
-        let entry = combined_lut.decode(bits.buffer());
-
-        // Long code fallback (rare - most codes fit in 12 bits)
-        if unlikely(entry.bits_to_skip == 0) {
-            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
-            if code_len == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid Huffman code",
-                ));
-            }
-            bits.consume(code_len);
-
-            if likely(symbol < 256) {
-                // Literal byte - most common case
-                if unlikely(out_pos >= output.len()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "Output buffer full",
-                    ));
-                }
-                output[out_pos] = symbol as u8;
-                out_pos += 1;
-                continue;
-            }
-            if unlikely(symbol == 256) {
-                // End of block - rare
-                break;
-            }
-
-            // Length code (less common than literals)
-            let len_idx = (symbol - 257) as usize;
-            if unlikely(len_idx >= 29) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid length code",
-                ));
-            }
-
-            bits.ensure(16);
-            let length =
-                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
-
-            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
-            if unlikely(dist_len == 0 || dist_sym >= 30) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance code",
-                ));
-            }
-            bits.consume(dist_len);
-
-            bits.ensure(16);
-            let distance = DIST_START[dist_sym as usize] as usize
-                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
-
-            if unlikely(distance > out_pos || distance == 0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance",
-                ));
-            }
-
-            out_pos = copy_match_into(output, out_pos, distance, length);
-            continue;
-        }
-
-        bits.consume(entry.bits_to_skip as u32);
-
-        match entry.distance {
-            DIST_LITERAL => {
-                // === LITERAL FAST PATH ===
-                // This is the hot path - most deflate streams are literal-heavy
-                // We use a tight inner loop that continues until we hit a non-literal
-
-                if unlikely(out_pos >= output.len()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "Output buffer full",
-                    ));
-                }
-                output[out_pos] = entry.symbol_or_length;
-                out_pos += 1;
-
-                // Continue decoding literals in a tight loop while we can
-                // Exit conditions: non-literal, need refill, output full
-                while likely(bits.bits_available() >= 12 && out_pos + 8 <= output.len()) {
-                    let e = combined_lut.decode(bits.buffer());
-
-                    // Check if this is a literal (fast check)
-                    if e.bits_to_skip == 0 || e.distance != DIST_LITERAL {
-                        // Non-literal - exit inner loop, outer loop will handle it
-                        break;
-                    }
-
-                    // It's a literal - consume and write
-                    bits.consume(e.bits_to_skip as u32);
-                    output[out_pos] = e.symbol_or_length;
-                    out_pos += 1;
-                }
-            }
-
-            DIST_END_OF_BLOCK => break,
-
-            DIST_SLOW_PATH => {
-                let length = entry.symbol_or_length as usize + 3;
-
-                let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
-                if dist_len == 0 || dist_sym >= 30 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid distance code",
-                    ));
-                }
-                bits.consume(dist_len);
-
-                bits.ensure(16);
-                let distance = DIST_START[dist_sym as usize] as usize
-                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
-
-                if unlikely(distance > out_pos || distance == 0) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid distance",
-                    ));
-                }
-
-                out_pos = copy_match_into(output, out_pos, distance, length);
-            }
-
-            distance => {
-                let length = entry.length();
-                let dist = distance as usize;
-
-                if dist > out_pos || dist == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid distance",
-                    ));
-                }
-
-                out_pos = copy_match_into(output, out_pos, dist, length);
-            }
-        }
-    }
-
-    Ok(out_pos)
 }
 
 /// Consume-first decode loop using ConsumeFirstTable
@@ -2728,12 +2065,6 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
             let error_ref = &had_error;
 
             scope.spawn(move || {
-                let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
-                if decompressor.is_null() {
-                    error_ref.store(true, Ordering::Relaxed);
-                    return;
-                }
-
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     if idx >= num_blocks {
@@ -2757,23 +2088,11 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    let mut actual_out = 0usize;
-                    let ret = unsafe {
-                        libdeflate_sys::libdeflate_deflate_decompress(
-                            decompressor,
-                            deflate_data.as_ptr() as *const std::ffi::c_void,
-                            deflate_data.len(),
-                            out_slice.as_mut_ptr() as *mut std::ffi::c_void,
-                            out_size,
-                            &mut actual_out,
-                        )
-                    };
-                    if ret != 0 || actual_out != out_size {
-                        error_ref.store(true, Ordering::Relaxed);
+                    match inflate_into(deflate_data, out_slice) {
+                        Ok(actual_out) if actual_out == out_size => {}
+                        _ => error_ref.store(true, Ordering::Relaxed),
                     }
                 }
-
-                unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
             });
         }
     });
@@ -2848,12 +2167,6 @@ fn decompress_bgzf_pipelined<W: Write>(
             let error_ref = &had_error;
 
             scope.spawn(move || {
-                let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
-                if decompressor.is_null() {
-                    error_ref.store(true, Ordering::Relaxed);
-                    return;
-                }
-
                 let mut buf = vec![0u8; max_block_output];
 
                 loop {
@@ -2876,21 +2189,17 @@ fn decompress_bgzf_pipelined<W: Write>(
                     let deflate_end = block.start + block.length - 8;
                     let deflate_data = &data[block.deflate_start..deflate_end];
 
-                    let mut actual_out = 0usize;
-                    let ret = unsafe {
-                        libdeflate_sys::libdeflate_deflate_decompress(
-                            decompressor,
-                            deflate_data.as_ptr() as *const std::ffi::c_void,
-                            deflate_data.len(),
-                            buf.as_mut_ptr() as *mut std::ffi::c_void,
-                            out_size,
-                            &mut actual_out,
-                        )
+                    let actual_out = match inflate_into(deflate_data, &mut buf[..out_size]) {
+                        Ok(n) if n == out_size => n,
+                        Ok(n) => {
+                            error_ref.store(true, Ordering::Relaxed);
+                            n
+                        }
+                        Err(_) => {
+                            error_ref.store(true, Ordering::Relaxed);
+                            0
+                        }
                     };
-
-                    if ret != 0 || actual_out != out_size {
-                        error_ref.store(true, Ordering::Relaxed);
-                    }
 
                     // Transfer buffer ownership through the channel; swap in a
                     // fresh capacity-only Vec so the next block has a buffer to
@@ -2900,8 +2209,6 @@ fn decompress_bgzf_pipelined<W: Write>(
                         std::mem::replace(&mut buf, Vec::with_capacity(max_block_output));
                     let _ = done_tx.send((idx, send_buf));
                 }
-
-                unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
             });
         }
         drop(done_tx); // close channel when all decoders finish
@@ -2953,55 +2260,31 @@ fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Resul
     let mut buf = vec![0u8; max_block_output];
     let mut total = 0u64;
 
-    let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
-    if decompressor.is_null() {
-        return Err(io::Error::other(
-            "failed to allocate libdeflate decompressor",
-        ));
-    }
-
-    let result = (|| -> io::Result<u64> {
-        for block in &blocks {
-            let out_size = block.isize as usize;
-            if out_size == 0 {
-                continue;
-            }
-
-            if out_size > buf.len() {
-                buf.resize(out_size, 0);
-            }
-
-            // Raw deflate data: between header and 8-byte trailer (CRC32 + ISIZE)
-            let deflate_end = block.start + block.length - 8;
-            let deflate_data = &data[block.deflate_start..deflate_end];
-
-            let mut actual_out = 0usize;
-            let ret = unsafe {
-                libdeflate_sys::libdeflate_deflate_decompress(
-                    decompressor,
-                    deflate_data.as_ptr() as *const std::ffi::c_void,
-                    deflate_data.len(),
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    out_size,
-                    &mut actual_out,
-                )
-            };
-
-            if ret != libdeflate_sys::libdeflate_result_LIBDEFLATE_SUCCESS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "deflate decompression failed in BGZF block",
-                ));
-            }
-
-            writer.write_all(&buf[..actual_out])?;
-            total += actual_out as u64;
+    for block in &blocks {
+        let out_size = block.isize as usize;
+        if out_size == 0 {
+            continue;
         }
-        Ok(total)
-    })();
 
-    unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
-    result
+        if out_size > buf.len() {
+            buf.resize(out_size, 0);
+        }
+
+        // Raw deflate data: between header and 8-byte trailer (CRC32 + ISIZE)
+        let deflate_end = block.start + block.length - 8;
+        let deflate_data = &data[block.deflate_start..deflate_end];
+
+        let actual_out = inflate_into(deflate_data, &mut buf[..out_size]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deflate decompression failed in BGZF block",
+            )
+        })?;
+
+        writer.write_all(&buf[..actual_out])?;
+        total += actual_out as u64;
+    }
+    Ok(total)
 }
 
 // ============================================================================
@@ -3170,15 +2453,9 @@ pub fn decompress_multi_member_parallel_to_vec(
             let error_ref = &had_error;
 
             scope.spawn(move || {
-                // Allocate a raw libdeflate decompressor (same as BGZF path).
                 // scan_member_boundaries_fast already parsed each gzip header and
-                // stored deflate_start, so we skip re-parsing with gzip_decompress_ex.
-                let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
-                if decompressor.is_null() {
-                    error_ref.store(true, Ordering::Relaxed);
-                    return;
-                }
-
+                // stored deflate_start, so we decode the raw deflate body directly
+                // via the pure-Rust inflate engine (no C-FFI in the decode graph).
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     if idx >= num_members {
@@ -3198,23 +2475,11 @@ pub fn decompress_multi_member_parallel_to_vec(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    let mut actual_out = 0usize;
-                    let ret = unsafe {
-                        libdeflate_sys::libdeflate_deflate_decompress(
-                            decompressor,
-                            deflate_data.as_ptr() as *const std::ffi::c_void,
-                            deflate_data.len(),
-                            out_slice.as_mut_ptr() as *mut std::ffi::c_void,
-                            out_size,
-                            &mut actual_out,
-                        )
-                    };
-                    if ret != 0 || actual_out != out_size {
-                        error_ref.store(true, Ordering::Relaxed);
+                    match inflate_into(deflate_data, out_slice) {
+                        Ok(actual_out) if actual_out == out_size => {}
+                        _ => error_ref.store(true, Ordering::Relaxed),
                     }
                 }
-
-                unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
             });
         }
     });
@@ -3251,47 +2516,6 @@ pub fn decompress_multi_member_parallel<W: Write>(
     Ok(len)
 }
 
-/// Single-member decompression using libdeflate gzip_decompress_ex
-fn decompress_single_member<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
-    use crate::backends::libdeflate::{DecompressError, DecompressorEx};
-
-    let mut decompressor = DecompressorEx::new();
-    let isize_hint = if data.len() >= 8 {
-        u32::from_le_bytes([
-            data[data.len() - 4],
-            data[data.len() - 3],
-            data[data.len() - 2],
-            data[data.len() - 1],
-        ]) as usize
-    } else {
-        data.len() * 4
-    };
-    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-        isize_hint + 1024
-    } else {
-        data.len().saturating_mul(4).max(64 * 1024)
-    };
-
-    let mut buf = vec![0u8; initial_size];
-    loop {
-        match decompressor.gzip_decompress_ex(data, &mut buf) {
-            Ok(result) => {
-                writer.write_all(&buf[..result.output_size])?;
-                return Ok(result.output_size as u64);
-            }
-            Err(DecompressError::InsufficientSpace) => {
-                buf.resize(buf.len() * 2, 0);
-            }
-            Err(DecompressError::BadData) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid gzip data",
-                ));
-            }
-        }
-    }
-}
-
 // ============================================================================
 // Single-Member Parallel Decompression (rapidgzip strategy)
 // ============================================================================
@@ -3301,171 +2525,6 @@ fn decompress_single_member<W: Write>(data: &[u8], writer: &mut W) -> io::Result
 // 2. Parallel second pass: re-decode each segment using windows as dictionaries
 //
 // This provides speedup when the file is large enough to amortize the overhead.
-
-/// Chunk boundary information collected during first pass
-/// Note: This will be used in future parallel single-member implementation
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct ChunkBoundary {
-    /// Bit position where this chunk starts
-    deflate_bit_start: usize,
-    /// Bit position where this chunk ends
-    deflate_bit_end: usize,
-    /// Output offset where this chunk's data starts
-    output_offset: usize,
-    /// Output size for this chunk
-    output_size: usize,
-    /// 32KB window at the end of this chunk (for next chunk's dictionary)
-    window: Vec<u8>,
-}
-
-/// Parallel decompression for single-member gzip files
-///
-/// Uses the rapidgzip two-pass strategy:
-/// 1. **First pass (sequential)**: Decode and collect 32KB windows at chunk intervals
-/// 2. **Second pass (parallel)**: Re-decode each chunk using windows as dictionaries
-///
-/// Target: 2x-3x speedup over single-threaded on large files
-#[allow(dead_code)] // Keep for future use - currently libdeflater is faster for single-member
-pub fn decompress_single_member_parallel<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> io::Result<u64> {
-    // For small files or single-thread, use fast sequential
-    let isize_hint = if data.len() >= 8 {
-        u32::from_le_bytes([
-            data[data.len() - 4],
-            data[data.len() - 3],
-            data[data.len() - 2],
-            data[data.len() - 1],
-        ]) as usize
-    } else {
-        data.len() * 4
-    };
-
-    // Only use parallel for large files (>20MB uncompressed) with multiple threads
-    // The overhead of two-pass decode isn't worth it for smaller files
-    const MIN_SIZE_FOR_PARALLEL: usize = 20 * 1024 * 1024;
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks like rapidgzip
-
-    if isize_hint < MIN_SIZE_FOR_PARALLEL || num_threads <= 1 {
-        return decompress_single_member(data, writer);
-    }
-
-    // Parse gzip header
-    let header_size = crate::decompress::parallel::single_member::skip_gzip_header(data)?;
-    let deflate_data = &data[header_size..data.len().saturating_sub(8)];
-
-    // === FIRST PASS: Sequential decode to collect chunk boundaries and windows ===
-    // We decode the entire file and record windows at regular intervals.
-    // This is the "boundary finding" pass that rapidgzip does.
-
-    let mut output = Vec::with_capacity(isize_hint);
-    let mut chunk_windows: Vec<(usize, Vec<u8>)> = Vec::new(); // (output_offset, window)
-
-    // Decode using CombinedLUT (our fastest pure-Rust decoder)
-    let mut bits = FastBits::new(deflate_data);
-    let mut out_pos = 0;
-
-    // Pre-allocate output
-    output.resize(isize_hint.max(1024), 0);
-
-    loop {
-        bits.refill();
-        let bfinal = bits.read(1);
-        let btype = bits.read(2);
-
-        let start_out_pos = out_pos;
-
-        match btype {
-            0 => out_pos = decode_stored_into(&mut bits, &mut output, out_pos)?,
-            1 => out_pos = decode_fixed_into(&mut bits, &mut output, out_pos)?,
-            2 => out_pos = decode_dynamic_into(&mut bits, &mut output, out_pos)?,
-            3 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Reserved block type",
-                ))
-            }
-            _ => unreachable!(),
-        }
-
-        // Record window at chunk boundaries (every CHUNK_SIZE bytes of output)
-        let chunk_before = start_out_pos / CHUNK_SIZE;
-        let chunk_after = out_pos / CHUNK_SIZE;
-
-        if chunk_after > chunk_before && out_pos >= 32 * 1024 {
-            // We crossed a chunk boundary - save the 32KB window
-            let boundary_pos = chunk_after * CHUNK_SIZE;
-            let window_start = boundary_pos.saturating_sub(32 * 1024);
-            let window = output[window_start..boundary_pos.min(out_pos)].to_vec();
-            chunk_windows.push((boundary_pos, window));
-        }
-
-        if bfinal == 1 {
-            break;
-        }
-    }
-
-    // Truncate output to actual size
-    output.truncate(out_pos);
-
-    // If we didn't find enough chunk boundaries, just use the sequential result
-    if chunk_windows.len() < 2 {
-        writer.write_all(&output)?;
-        return Ok(out_pos as u64);
-    }
-
-    // === SECOND PASS: Parallel re-decode using windows ===
-    // Note: For now, we just use the first-pass output since re-decoding is complex
-    // and our first pass is already fast. The main benefit of two-pass is when the
-    // first pass uses a simpler (slower) decoder and the second pass uses SIMD.
-    //
-    // Since our CombinedLUT first pass is already optimized, the benefit of re-decode
-    // is minimal. We keep the first-pass result.
-    //
-    // Future optimization: Use marker-based decode in first pass (with u16 buffers),
-    // then parallel marker resolution in second pass.
-
-    if std::env::var("GZIPPY_DEBUG").is_ok() {
-        eprintln!(
-            "[gzippy] Single-member parallel: {} bytes, {} chunk boundaries found",
-            out_pos,
-            chunk_windows.len()
-        );
-    }
-
-    writer.write_all(&output)?;
-    Ok(out_pos as u64)
-}
-
-/// Check if data is a multi-member gzip file by attempting to decompress
-/// the first member and checking if more data follows.
-#[allow(dead_code)]
-pub fn is_multi_member(data: &[u8]) -> bool {
-    use crate::backends::libdeflate::{DecompressError, DecompressorEx};
-
-    if data.len() < 36 {
-        return false;
-    }
-    let mut decompressor = DecompressorEx::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match decompressor.gzip_decompress_ex(data, &mut buf) {
-            Ok(result) => {
-                return result.input_consumed < data.len()
-                    && data.len() - result.input_consumed >= 18
-                    && data[result.input_consumed] == 0x1f
-                    && data[result.input_consumed + 1] == 0x8b;
-            }
-            Err(DecompressError::InsufficientSpace) => {
-                buf.resize(buf.len() * 2, 0);
-            }
-            Err(DecompressError::BadData) => return false,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -4408,7 +3467,10 @@ mod tests {
         multi.extend_from_slice(&compressed2);
         multi.extend_from_slice(&compressed3);
 
-        assert!(is_multi_member(&multi), "Should detect multi-member");
+        assert!(
+            crate::decompress::format::is_likely_multi_member(&multi),
+            "Should detect multi-member"
+        );
 
         // Get expected output
         let mut expected = part1.clone();
@@ -4444,7 +3506,10 @@ mod tests {
             expected.extend_from_slice(&part);
         }
 
-        assert!(is_multi_member(&multi), "Should detect multi-member");
+        assert!(
+            crate::decompress::format::is_likely_multi_member(&multi),
+            "Should detect multi-member"
+        );
 
         // Test parallel decompressor
         let mut output = Vec::new();
@@ -8428,7 +7493,8 @@ mod optimization_tests {
                 // Error is also acceptable — single-member files aren't multi-member.
                 // Verify sequential decompression works.
                 output.clear();
-                decompress_single_member(&compressed, &mut output).expect("sequential should work");
+                crate::decompress::decompress_single_member_pure(&compressed, &mut output)
+                    .expect("sequential should work");
                 assert_eq!(output.len(), payload.len());
                 assert_eq!(output, payload);
             }

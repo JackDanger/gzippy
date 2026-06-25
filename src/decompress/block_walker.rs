@@ -21,10 +21,7 @@
 //! from sub-crate examples, fuzz harnesses, and AOT pipelines without
 //! pulling in the full chunk-aware parallel-SM machinery.
 
-use std::io::Read;
 use std::io::Write;
-
-use flate2::read::DeflateDecoder;
 
 /// Per-block metadata.
 #[derive(Debug, Clone)]
@@ -103,9 +100,11 @@ pub fn walk_block_boundaries(gz: &[u8]) -> std::io::Result<Vec<BlockMeta>> {
         gz[gz.len() - 1],
     ]) as usize;
 
-    // Decode the full payload first (oracle output) for byte counts.
-    let mut decoded = Vec::with_capacity(trailer_isize);
-    DeflateDecoder::new(deflate).read_to_end(&mut decoded)?;
+    // Decode the full payload first (oracle output) for byte counts — pure-Rust
+    // raw-DEFLATE inflate (no C-FFI in the decode graph).
+    let _ = trailer_isize;
+    let decoded = crate::decompress::decompress_raw_bytes(deflate)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Walk the bit stream block-by-block with our own minimal parser.
     let mut bits = BitWalker {
