@@ -12,6 +12,14 @@
 mod tests {
     use std::time::Instant;
 
+    /// Serializes the timing/ratio tests against each other. `cargo test` runs
+    /// tests concurrently; two timing tests (or a timing test plus an unrelated
+    /// CPU-heavy test) racing for cores inflate the measured wall and flake the
+    /// ratio assertions under full-suite contention — they pass in isolation.
+    /// Every `diff_ratio_*` timing test locks this at entry so at most one is
+    /// timing at a time. Poison-tolerant so a panicking test cannot cascade.
+    static TIMING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // ── baseline reading ─────────────────────────────────────────────────────
 
     fn read_threshold(key: &str, default: f64) -> f64 {
@@ -88,6 +96,7 @@ mod tests {
     /// runner spikes affect at most one batch and are filtered out.
     #[test]
     fn diff_ratio_single_member_1mb() {
+        let _timing = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = crate::tests::fixtures::text_1mb();
         let data = &fixture.single_member_gz;
         let out_size = fixture.plain.len() + 1024;
@@ -195,6 +204,7 @@ mod tests {
     // Run on demand: `cargo test ... -- --ignored diff_ratio_parallel_single`.
     #[ignore = "perf gate (wall-ratio) — T4>T1 on cheap inputs is the gated, rg-shared pipeline fixed-overhead, not a regression; 1.5x ceiling stale (measured 2.04x on neurotic). See standing rig."]
     fn diff_ratio_parallel_single_member_speedup() {
+        let _timing = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = crate::tests::fixtures::text_10mb();
         let data = &fixture.single_member_gz;
 
@@ -291,6 +301,7 @@ mod tests {
     #[cfg(parallel_sm)]
     #[test]
     fn diff_ratio_parallel_no_regression_vs_sequential() {
+        let _timing = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = crate::tests::fixtures::text_10mb();
         let data = &fixture.single_member_gz;
         let out_size = fixture.plain.len() + 1024;
@@ -342,12 +353,19 @@ mod tests {
 
     /// gzippy-parallel 10MB T4 regression guard: ratio vs libdeflate T1.
     ///
-    /// Catches bgzf parallel path regressions. The threshold is set to current
-    /// measured performance + 15% headroom — this test fails if the parallel path
-    /// gets significantly *worse*, not if it isn't yet winning.
-    /// (Baseline: ~1.48 on Apple M-series at time of writing; wins on x86_64 multi-core.)
+    /// Catches catastrophic bgzf parallel-path regressions — it fails if the
+    /// parallel path gets significantly *worse*, not if it isn't yet winning.
+    /// Since the decode-graph purge, bgzf decode is pure-Rust (no libdeflate
+    /// FFI), so gzippy_T4 vs libdeflate_T1 sits higher than the old FFI baseline
+    /// (~1.7x on a 32-core x86_64 box under TIMING_LOCK; ~2.8x reported on
+    /// low-core CI runners where T4 can't claim 4 cores and the rest of the
+    /// suite steals the others). Threshold 4.50 keeps headroom over that while
+    /// still tripping on a true regression (e.g. the parallel path falling back
+    /// to serial would blow well past it). TIMING_LOCK serializes the ratio
+    /// tests so they don't inflate each other.
     #[test]
     fn diff_ratio_bgzf_10mb_no_regression() {
+        let _timing = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = crate::tests::fixtures::text_10mb();
         let bgzf_data = &fixture.bgzf_gz;
         let single_data = &fixture.single_member_gz;

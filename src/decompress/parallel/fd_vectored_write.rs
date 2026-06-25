@@ -216,6 +216,7 @@ pub mod splice {
     pub(crate) static VMSPLICE_ENGAGEMENTS: AtomicU64 = AtomicU64::new(0);
 
     /// Read the vmsplice-engagement counter.
+    #[allow(dead_code)] // diagnostic accessor; consumed by the byte-identity gate test only
     pub fn vmsplice_engagements() -> u64 {
         VMSPLICE_ENGAGEMENTS.load(Ordering::Relaxed)
     }

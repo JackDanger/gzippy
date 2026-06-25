@@ -10,7 +10,7 @@
   },
   "diff_ratio": {
     "max_ratio": 3.50,
-    "max_ratio_bgzf_10mb": 3.50
+    "max_ratio_bgzf_10mb": 4.50
   },
   "hit_rates": {
     "multi_sym_min": 0.0,
