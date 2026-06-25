@@ -1577,8 +1577,6 @@ mod tests {
     }
 
     /// Fixed-Huffman distance LUT (32× length-5) must match C igzip byte-for-byte.
-    #[test]
-
     /// The pure-rust dist-table decoder round-trips a single-bit input
     /// when the dist code-length set assigns length 1 to one symbol.
     #[test]

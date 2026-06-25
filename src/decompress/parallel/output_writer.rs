@@ -36,6 +36,11 @@
 //! unchanged — splice page-lifetime accounting needs the inline path).
 
 #![cfg(all(unix, parallel_sm))]
+// The overlap-writer machinery (`enabled`/`submit_chunk`/`OverlapWriter`/
+// `WriteJob`) is reached only from the Linux-only writev branch in
+// `chunk_fetcher`; on non-Linux unix it compiles but is unused. Allow dead_code
+// here so the macOS lint gate stays clean without `cfg`-splitting every item.
+#![allow(dead_code)]
 
 use std::io;
 use std::sync::mpsc::{Receiver, Sender};
@@ -112,10 +117,7 @@ impl OverlapWriter {
         if let Some(h) = self.handle.take() {
             match h.join() {
                 Ok(res) => res,
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "output writer thread panicked",
-                )),
+                Err(_) => Err(io::Error::other("output writer thread panicked")),
             }
         } else {
             Ok(())

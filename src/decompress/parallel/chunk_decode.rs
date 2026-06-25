@@ -319,17 +319,14 @@ fn exact_block_route_enabled() -> bool {
     false
 }
 
-/// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
-///
-/// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
-/// patched-boundary FFI, then feed ISA-L's bytes / boundaries / end-bit through
-/// the SAME `ChunkData` accounting primitives `finish_decode_chunk_impl` uses
-/// (commit + per-byte CRC + `append_block_boundary_at` + `finalize_with_deflate`),
-/// trimmed to the chunk's natural stop. Returns `Ok(true)` if ISA-L produced the
-/// chunk; `Ok(false)` to fall back to the pure-Rust engine (uncovered contract).
-///
-/// This drops an igzip-class engine into the REAL parallel-SM pipeline (the pool,
-/// consumer, window-publish, ring, and CRC all stay) to bound the T8 WALL.
+// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
+//
+// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
+// patched-boundary FFI, then feed ISA-L's bytes / boundaries / end-bit through
+// the SAME `ChunkData` accounting primitives `finish_decode_chunk_impl` uses,
+// trimmed to the chunk's natural stop. (The from-bit ISA-L decode survives only
+// as a dormant measurement oracle under `isal-compression`; it is OFF the
+// production decode graph.)
 
 /// Compute the upfront output-reserve byte count for the ISA-L clean-tail decode.
 ///
@@ -1075,14 +1072,14 @@ fn finish_decode_chunk_impl(
             }
 
             match r.stopped_at {
-                sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
-                    if decode_base + n_bytes_read > 0 {
-                        chunk.append_block_boundary_at(
-                            r.bit_position,
-                            decode_base + n_bytes_read,
-                            Some(input),
-                        );
-                    }
+                sp if sp == StoppingPoints::END_OF_STREAM_HEADER
+                    && decode_base + n_bytes_read > 0 =>
+                {
+                    chunk.append_block_boundary_at(
+                        r.bit_position,
+                        decode_base + n_bytes_read,
+                        Some(input),
+                    );
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK => {
                     if !wrapper.is_final_block() {
@@ -2184,7 +2181,7 @@ pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
     // Stable capacity (no grow ⇒ cap is constant): flush threshold leaves room
     // for one more HEADROOM+1 contig request without ever reallocating.
     let cap = chunk.data.capacity();
-    debug_assert!(cap >= 2 * WINDOW + HEADROOM + 1);
+    debug_assert!(cap > 2 * WINDOW + HEADROOM);
     let flush_threshold = cap - (HEADROOM + 1);
 
     let mut marker_ctx = MarkerDecodeCtx::new(input, 0)?;
@@ -2383,7 +2380,7 @@ pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
             .write_all(bytes)
             .map_err(ChunkDecodeError::BootstrapFailed)?;
         streamed += tail_len;
-        if let Some(out) = bytes_written_out.as_deref_mut() {
+        if let Some(out) = bytes_written_out {
             *out = streamed;
         }
     }
@@ -2837,10 +2834,10 @@ pub static BOOTSTRAP_OUTPUT_RETURNS: std::sync::atomic::AtomicU64 =
 pub static BOOTSTRAP_OUTPUT_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Mirror of the `while ( true )` loop in
-/// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
-/// single-member case (no multi-stream loop) and with the handoff
-/// triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
+// Mirror of the `while ( true )` loop in
+// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
+// single-member case (no multi-stream loop) and with the handoff
+// triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
 
 /// Map vendor `Block::read` failures into body-fail telemetry buckets.
 #[cfg(parallel_sm)]
@@ -3273,7 +3270,7 @@ mod tests {
                     let (_crc, n) = decode_and_stream_monolith_native_capped(
                         &body,
                         payload.len(),
-                        cfg.clone(),
+                        cfg,
                         &mut out,
                         Some(&mut bw),
                         cap,
@@ -3387,7 +3384,7 @@ mod tests {
         let p = |i: usize| (i % 140) as u8;
         let mut events: Vec<Ev> = Vec::new();
         let mut out_len = 0usize;
-        let mut lits_to = |events: &mut Vec<Ev>, out_len: &mut usize, upto: usize| {
+        let lits_to = |events: &mut Vec<Ev>, out_len: &mut usize, upto: usize| {
             while *out_len < upto {
                 events.push(Ev::Lit(p(*out_len)));
                 *out_len += 1;

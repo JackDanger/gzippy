@@ -144,7 +144,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         } else {
             let numer = isize_bytes.saturating_mul(5);
             let denom = compressed_bytes.saturating_mul(4);
-            ((numer + denom - 1) / denom).max(2).min(u16::MAX as u64) as u16
+            numer.div_ceil(denom).max(2).min(u16::MAX as u64) as u16
         }
     };
 

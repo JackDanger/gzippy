@@ -544,6 +544,9 @@ pub fn is_pipe_fd(fd: i32) -> bool {
 /// copies bytes before return, so `chunk` stays on the stack with no
 /// per-chunk `Box<dyn Any>` owner. Linux pipes box `chunk` for
 /// `SpliceVault` page-lifetime accounting (vendor `writeAll` pipe arm).
+// Reached only from the Linux-only pipe-fd branch in `chunk_fetcher`; on
+// non-Linux unix it compiles but is unused.
+#[allow(dead_code)]
 pub fn write_chunk_payload_to_fd(
     fd: i32,
     iovs: &mut [libc::iovec],
