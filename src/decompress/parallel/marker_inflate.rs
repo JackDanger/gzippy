@@ -290,6 +290,25 @@ pub static STORED_CLEAN_BULK: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// (`decode_clean_stored_into_contig`).
 pub static STORED_CONTIG_BULK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// THREAD-LOCAL test mirrors of the four stored-block path counters, for the
+// SAME reason MARKER_DIST_LUT_HITS is thread-local (see its note below): the
+// `stored_flip` differential asserts the kill-switch (disabled) arm's counter
+// delta is EXACTLY zero, but the process-wide atomics above are bumped by EVERY
+// thread's decode — so a concurrent decode test running in the same binary
+// contaminates the delta and flakes the "kill-switch arm inert" assert under
+// full-suite parallelism (observed only under heavy contention; passes in
+// isolation). The stored_flip test decodes synchronously on its own thread, so
+// a thread-local cell captures exactly this decode's hits and is immune to
+// other threads. Incremented alongside the atomics at the four call sites under
+// `#[cfg(test)]`; the production atomics are unchanged (byte-identical).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STORED_FLIP_GE_WINDOW_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static STORED_FLIP_CROSSING_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static STORED_CLEAN_BULK_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static STORED_CONTIG_BULK_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Test-only override for the kill-switch: -1 = follow the env var,
 /// 0 = force-enabled, 1 = force-disabled. Lets one test process exercise
 /// BOTH arms (the env-var read is `OnceLock`-cached). One relaxed load per
@@ -1589,6 +1608,8 @@ impl Block {
             self.ring.pos = U8_RING_SIZE + n;
             self.ring.drained = U8_RING_SIZE;
             STORED_FLIP_GE_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            STORED_FLIP_GE_WINDOW_TL.with(|c| c.set(c.get() + 1));
             stored_flip_debug_log("case1-ge-window", n);
         } else if self.ring.is_marker() && self.ring.distance_to_last_marker + n >= MAX_WINDOW_SIZE
         {
@@ -1624,6 +1645,8 @@ impl Block {
             self.ring.pos = U8_RING_SIZE + MAX_WINDOW_SIZE;
             self.ring.drained = U8_RING_SIZE + rem;
             STORED_FLIP_CROSSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            STORED_FLIP_CROSSING_TL.with(|c| c.set(c.get() + 1));
             stored_flip_debug_log("case2-crossing", n);
         } else if self.ring.is_clean() {
             // Case 3 (deflate.hpp:1243-1255): bulk read into the u8 ring at
@@ -1644,6 +1667,8 @@ impl Block {
             debug_assert_eq!(got, n, "avail gate guaranteed the full payload");
             self.ring.pos += n;
             STORED_CLEAN_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            STORED_CLEAN_BULK_TL.with(|c| c.set(c.get() + 1));
         } else {
             return None; // markers + dist + n < MAX_WINDOW_SIZE: per-byte path
         }
@@ -4369,6 +4394,8 @@ impl Block {
                     self.at_end_of_block = true;
                 }
                 STORED_CONTIG_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                STORED_CONTIG_BULK_TL.with(|c| c.set(c.get() + 1));
                 return Ok(to_read);
             }
         }
@@ -7118,12 +7145,15 @@ mod tests {
             f()
         }
 
+        // Reads the THREAD-LOCAL mirrors (not the process-wide atomics) so the
+        // kill-switch-arm-inert deltas are immune to concurrent decode on other
+        // test threads (see the note at the counter definitions).
         fn counters() -> (u64, u64, u64, u64) {
             (
-                STORED_FLIP_GE_WINDOW.load(Relaxed),
-                STORED_FLIP_CROSSING.load(Relaxed),
-                STORED_CLEAN_BULK.load(Relaxed),
-                STORED_CONTIG_BULK.load(Relaxed),
+                STORED_FLIP_GE_WINDOW_TL.with(|c| c.get()),
+                STORED_FLIP_CROSSING_TL.with(|c| c.get()),
+                STORED_CLEAN_BULK_TL.with(|c| c.get()),
+                STORED_CONTIG_BULK_TL.with(|c| c.get()),
             )
         }
 
