@@ -860,6 +860,15 @@ mod imp {
                 // differential + ref model are unchanged. Envelope-safe: <=40
                 // scalar extent <=48 B, 41..240 MOVDQU extent <=255 B, >240
                 // scalar extent <=265 B — all < FAST_OUT_SLOP=282.
+                // COPYFLOOR-C (VEX-converge): all back-ref copy SIMD ops are
+                // VEX `vmovdqu` (igzip emits VEX vmovdqu; gz had emitted legacy
+                // SSE `movdqu`). Byte-exact (identical low-128 semantics; ymm0
+                // upper is dead scratch). llvm-mca/chainlat rates legacy-SSE and
+                // VEX movdqu identical (copy loop cyc/iter Δ=0.000), but legacy
+                // SSE mixed with the AVX2 code elsewhere in the binary
+                // (memchr/memmove avx2) can incur AVX-SSE dirty-upper
+                // false-dependency penalties llvm-mca cannot see. VEX avoids it
+                // and matches igzip's encoding faithfully.
                 // EDIT1 (dispatch-delete): kill the `cmp {t2},40` mispredict (9% cyc,
                 // ~10% br-miss). dist<16 → scalar overlap; len>48 → MOVDQU loop (RARE,
                 // >99% not-taken at mean len 6.3); else the proven branchless 3x MOVDQU
@@ -868,12 +877,12 @@ mod imp {
                 "jb 60f",                             // dist<16 → scalar overlap (period-growth)
                 "cmp {t2}, 48",
                 "ja 75f",                             // len>48 → MOVDQU loop (rare)
-                "movdqu xmm0, [{t4}]",
-                "movdqu [{dst}], xmm0",
-                "movdqu xmm0, [{t4} + 16]",
-                "movdqu [{dst} + 16], xmm0",
-                "movdqu xmm0, [{t4} + 32]",
-                "movdqu [{dst} + 32], xmm0",
+                "vmovdqu xmm0, [{t4}]",
+                "vmovdqu [{dst}], xmm0",
+                "vmovdqu xmm0, [{t4} + 16]",
+                "vmovdqu [{dst} + 16], xmm0",
+                "vmovdqu xmm0, [{t4} + 32]",
+                "vmovdqu [{dst} + 32], xmm0",
                 "add {dst}, {t2}",
                 "mov {t1:e}, {t3:e}",
                 "jmp 2b",
@@ -881,25 +890,25 @@ mod imp {
                 "cmp {t2}, 240",
                 "ja 60f",
                 "lea {ret}, [{dst} + {t2}]",          // ret = end = dst + length
-                "movdqu xmm0, [{t4}]",                // load 16 from src
+                "vmovdqu xmm0, [{t4}]",                // load 16 from src
                 "mov {t5:e}, 16",
                 "cmp {t5}, {t2}",
                 "cmovg {t5}, {t2}",                   // t5 = min(16, length)
                 "cmp {t1}, {t5}",
                 "jb 72f",                             // distance < min → overlap (small)
                 "71:",                                // large_byte_copy (igzip 603-612)
-                "movdqu [{t4} + {t1}], xmm0",         // store 16 at src+distance (= dst run)
+                "vmovdqu [{t4} + {t1}], xmm0",         // store 16 at src+distance (= dst run)
                 "sub {t2}, 16",
                 "jle 74f",
                 "add {t4}, 16",
-                "movdqu xmm0, [{t4}]",
+                "vmovdqu xmm0, [{t4}]",
                 "jmp 71b",
                 "72:",                                // small_byte_copy_pre (igzip 614-616)
                 "add {t2}, {t1}",                     // repeat_length += distance
                 "73:",                                // small_byte_copy (igzip 617-623)
-                "movdqu [{t4} + {t1}], xmm0",
+                "vmovdqu [{t4} + {t1}], xmm0",
                 "shl {t1}, 1",                        // distance *= 2 (grow the period)
-                "movdqu xmm0, [{t4}]",
+                "vmovdqu xmm0, [{t4}]",
                 "cmp {t1}, 16",
                 "jl 73b",
                 "sub {t2}, {t1}",                     // repeat_length -= distance
