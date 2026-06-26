@@ -40,9 +40,34 @@ use std::sync::Mutex;
 // erroring "input below parallel SM minimum (routing bug)". This is what lets us
 // measure the engine we are optimizing at T=1 instead of a libdeflate confound.
 const MIN_THREADS_FOR_PARALLEL: usize = 1;
+/// T>1 default compressed-chunk target.
+///
+/// COARSER-IS-BETTER (mid-T): the window-absent u16-marker decode path is ~2.5×
+/// the cost/byte of the clean run_contig path (marker_inflate ~11.7 vs ~4.7
+/// cyc/B). At T>1 every chunk but the first decodes window-absent, so total work
+/// scales with chunk COUNT; fewer/larger chunks ⇒ less marker work (and more
+/// flip-to-clean), as long as the count stays ≳ thread-count for utilization
+/// (`adjusted_chunk_size_bytes` shrinks back when it would drop near T).
+///
+/// 6 MiB chosen over the prior 4 MiB by a FULCRUM-gated paired wall sweep
+/// (`fulcrum abmeasure` with the wall extension; contention-invariant per-rep
+/// after/base ratio; silesia, Intel trainer, GZIPPY_CHUNK_KIB proxy ≡ this
+/// constant): 6 MiB vs 4 MiB is paired-faster at T2 (0.947, 15+/0-), T4 (0.851,
+/// 21+/0-), T8 (0.809, 17+/0-), and a TIE at T16 (chunks identical there — the
+/// shrink path fires regardless) and unaffected at T1 (own
+/// `t1_output_resident_chunk`). This LOCATES+CLOSES the silesia T4/T8 parallel
+/// loss vs rapidgzip, whose root cause is the +5-7% instr/B of gz's marker
+/// decode loop (gz IPC ≥ rg at every T ⇒ NOT a utilization deficit) — coarser
+/// chunks amortize that surplus over fewer marker-decoded bytes.
+///
+/// SCOPE: Intel-trainer + silesia, NOT-YET-LAW. Cross-corpus (only silesia is
+/// non-ratio-capped on the gate box) and AMD/Zen2 replication are OWED, and the
+/// absolute vs-rg at T8/T16 was contention-distorted on the (loaded) gate box;
+/// the PAIRED win over the prior default is the gated claim. `GZIPPY_CHUNK_KIB`
+/// still overrides.
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
-const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-/// T1-only default compressed-chunk target (1 MiB vs the 4 MiB T>1 default).
+const TARGET_COMPRESSED_CHUNK_BYTES: usize = 6 * 1024 * 1024;
+/// T1-only default compressed-chunk target (1 MiB vs the 6 MiB T>1 default).
 ///
 /// At T1 the pipeline is inline (no workers, no prefetch — see the night4
 /// in-flight-depth note) and the only thing chunk size changes is the size of
@@ -55,7 +80,9 @@ const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// −0.079 cyc/B / −1.37% p=0.0011; both CI-excl-0, byte-exact).
 /// SCOPED TO T1: at T>1 the finer granularity REGRESSES the parallel pipeline
 /// (silesia T4 wall +20%, measured) because more/smaller chunks add
-/// block-finder + scheduling overhead, so T>1 keeps the 4 MiB default.
+/// block-finder + scheduling overhead — and indeed COARSER (6 MiB) is better
+/// still at T>1 (see `TARGET_COMPRESSED_CHUNK_BYTES`), so T1 keeps the small
+/// 1 MiB target while T>1 uses the 6 MiB default.
 /// Intel-LXC NOT-YET-LAW (AMD/Zen2 replication owed). The explicit
 /// `GZIPPY_CHUNK_KIB` env override still wins over this default.
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
@@ -589,7 +616,7 @@ mod tests {
     #[test]
     fn adjusted_chunk_size_keeps_default_on_large_files() {
         // File big enough that chunkSize * 2 * threads <= fileSize.
-        // 4 MiB * 2 * 16 = 128 MiB; pick fileSize = 256 MiB.
+        // 6 MiB * 2 * 16 = 192 MiB; pick fileSize = 256 MiB.
         let file_size = 256 * 1024 * 1024;
         let got = adjusted_chunk_size_bytes(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
         assert_eq!(got, TARGET_COMPRESSED_CHUNK_BYTES);
