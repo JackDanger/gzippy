@@ -881,4 +881,176 @@ mod tests {
         assert_eq!(cb.crc32(), crc32(&concat));
         assert_eq!(cb.stream_size(), (a.len() + b.len()) as u64);
     }
+
+    // =================================================================
+    // STAGE-1 CRC-KERNEL HARDENING (merge-blocker for the VPCLMULQDQ /
+    // 3-way HW-CRC fold). A wrong fold is SILENT corruption, so the
+    // dispatched `crc32_fold` MUST equal BOTH crc32fast AND an
+    // independent bit-serial reference across every length×alignment
+    // that exercises the kernel's structural boundaries:
+    //   x86 VPCLMULQDQ: <128 fallback, the 128 B/iter fold-by-4 body
+    //     (128·k ± 1), the 16 B fold-by-1 tail, the <16 scalar tail.
+    //   aarch64 3-way:  <3072 fold1, the 3·8 block edges, the post-3way
+    //     tail.
+    // crc32fast is the project's trusted kernel; the independent
+    // bit-serial reference removes the "both wrap the same crate" blind
+    // spot. This test FIRES the new kernel on x86_64 (vpclmul) and
+    // aarch64 (hw_crc) because `crc32_fold` dispatches to it.
+    // =================================================================
+
+    /// Textbook reflected (LSB-first) bit-serial CRC32 continuation —
+    /// independent of crc32fast, used as a second oracle.
+    fn crc32_ref_continue(crc: u32, data: &[u8]) -> u32 {
+        let mut c = !crc;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = (c >> 1) ^ (CRC32_GENERATOR_POLYNOMIAL & (!(c & 1)).wrapping_add(1));
+            }
+        }
+        !c
+    }
+
+    #[test]
+    fn crc32_ref_self_consistency() {
+        // Independent reference must match crc32fast on a known vector.
+        // "123456789" CRC32 == 0xCBF43926 (the canonical check value).
+        assert_eq!(crc32_ref_continue(0, b"123456789"), 0xCBF4_3926);
+        let mut h = Hasher::new();
+        h.update(b"123456789");
+        assert_eq!(h.finalize(), 0xCBF4_3926);
+    }
+
+    /// THE merge-blocker. Exhaustive-ish length × alignment sweep of the
+    /// dispatched fold kernel against TWO oracles. Prints the pass count.
+    #[test]
+    fn crc_kernel_hardening_lengths_x_alignments() {
+        // LCG-filled buffer; content varies so the poly sees real bytes.
+        const MAXLEN: usize = 70_001;
+        const PAD: usize = 64; // alignment headroom
+        let mut buf = vec![0u8; MAXLEN + PAD];
+        let mut x: u32 = 0x9E37_79B9;
+        for b in buf.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 13) as u8;
+        }
+
+        // Build the length set: exhaustive small, all 128 B/iter
+        // boundaries ±1 (x86 fold-by-4), the 16 B tail edges, the aarch64
+        // 3·8 / 3072 edges, and large spot lengths.
+        let mut lengths: Vec<usize> = (0..=600).collect();
+        for k in 1..=549 {
+            // 128·k − 1, 128·k, 128·k + 1  (fold-by-4 body, up to ~70272)
+            let base: usize = 128 * k;
+            for d in [base.wrapping_sub(1), base, base + 1] {
+                if d <= MAXLEN {
+                    lengths.push(d);
+                }
+            }
+        }
+        // 16 B tail edges and aarch64 thresholds.
+        for &e in &[
+            15usize, 16, 17, 31, 32, 33, 127, 128, 129, 143, 144, 145, 3071, 3072, 3073, 3095,
+            3096, 3097, 6143, 6144, 6145, 9215, 9216, 9217, 65535, 65536, 65537, 70000, 70001,
+        ] {
+            if e <= MAXLEN {
+                lengths.push(e);
+            }
+        }
+        lengths.sort_unstable();
+        lengths.dedup();
+
+        let seeds = [0u32, 1, 0xFFFF_FFFF, 0xDEAD_BEEF, 0x8000_0001, 0xCBF4_3926];
+
+        let mut pass: u64 = 0;
+        let mut fail: u64 = 0;
+        let mut first_fail: Option<(usize, usize, u32)> = None;
+
+        for align in 0usize..=63 {
+            for &len in &lengths {
+                if align + len > buf.len() {
+                    continue;
+                }
+                let data = &buf[align..align + len];
+                // crc32fast (trusted crate kernel) is the oracle for ALL
+                // lengths. The O(n·8) bit-serial reference is run only for
+                // len <= 4096 (still covers <128 fallback + the first 32
+                // fold-by-4 iters + all 16 B-tail edges) to keep the
+                // sweep fast; crc32fast covers the large body.
+                let do_ref = len <= 4096;
+                for &seed in &seeds {
+                    let got = crc32_fold(seed, data);
+                    let mut h = Hasher::new_with_initial(seed);
+                    h.update(data);
+                    let want_fast = h.finalize();
+                    let ref_ok = !do_ref || got == crc32_ref_continue(seed, data);
+                    if got == want_fast && ref_ok {
+                        pass += 1;
+                    } else {
+                        fail += 1;
+                        if first_fail.is_none() {
+                            first_fail = Some((len, align, seed));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Chained-fold invariant across the kernel boundaries (the
+        // running-CRC contract CRC32Calculator relies on): many small
+        // updates == one big fold.
+        let split = [0usize, 1, 15, 16, 128, 129, 3072, 20000, 40000, 70001];
+        let mut running = 0u32;
+        for w in split.windows(2) {
+            running = crc32_fold(running, &buf[w[0]..w[1]]);
+        }
+        let whole = crc32_fold(0, &buf[0..70001]);
+        let chained_ok = running == whole;
+        if chained_ok {
+            pass += 1;
+        } else {
+            fail += 1;
+        }
+
+        eprintln!(
+            "CRC-KERNEL-HARDENING: pass={pass} fail={fail} \
+             lengths={} alignments=64 seeds={} chained_ok={chained_ok} \
+             first_fail={:?}",
+            lengths.len(),
+            seeds.len(),
+            first_fail
+        );
+        assert_eq!(
+            fail, 0,
+            "CRC fold mismatch; first_fail (len,align,seed)={first_fail:?}"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
+
+        /// Property: the dispatched fold == crc32fast == independent
+        /// bit-serial reference for ARBITRARY bytes, lengths and seeds,
+        /// at every alignment 0..64. Random fuzz on top of the
+        /// structured sweep above.
+        #[test]
+        fn prop_crc_fold_matches_both_oracles(
+            mut bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4200usize),
+            seed in proptest::prelude::any::<u32>(),
+            align in 0usize..64,
+        ) {
+            // Prepend `align` filler bytes, then fold the aligned tail so
+            // the kernel sees a non-zero start offset.
+            let mut padded = vec![0u8; align];
+            padded.append(&mut bytes);
+            let data = &padded[align..];
+            let got = crc32_fold(seed, data);
+            let mut h = Hasher::new_with_initial(seed);
+            h.update(data);
+            let want_fast = h.finalize();
+            let want_ref = crc32_ref_continue(seed, data);
+            proptest::prop_assert_eq!(got, want_fast, "fold != crc32fast");
+            proptest::prop_assert_eq!(got, want_ref, "fold != bit-serial ref");
+        }
+    }
 }
