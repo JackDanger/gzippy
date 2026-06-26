@@ -1084,6 +1084,14 @@ pub struct LutLitLenCode {
     lit_and_dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
     code_list: Box<[u32; LIT_LEN_ELEMS + 2]>,
     valid: bool,
+    /// Per-block table-build cache: the code-length key of the LAST
+    /// successfully built table. When the next block presents a byte-identical
+    /// key (+ same `multisym`), `self.table` is already correct and the rebuild
+    /// is skipped (see `tbuild_cache` in marker_inflate.rs). `cache_key_len ==
+    /// usize::MAX` means "no cached table" (forces a miss).
+    cache_key: Box<[u8; 290]>,
+    cache_key_len: usize,
+    cache_multisym: u32,
 }
 
 impl LutLitLenCode {
@@ -1102,6 +1110,9 @@ impl LutLitLenCode {
             lit_and_dist_huff: Box::new([HuffCode::default(); LIT_LEN_ELEMS]),
             code_list: Box::new([0u32; LIT_LEN_ELEMS + 2]),
             valid: false,
+            cache_key: Box::new([0u8; 290]),
+            cache_key_len: usize::MAX,
+            cache_multisym: 0,
         }
     }
 
@@ -1123,6 +1134,28 @@ impl LutLitLenCode {
     pub fn rebuild_from_multisym(&mut self, code_lengths: &[u8], multisym: u32) -> bool {
         #[cfg(feature = "profile-rebuild")]
         let _t0 = prof::rdtsc();
+        // Per-block table-build cache: if the previous successfully built table
+        // had a byte-identical code-length key and the same multisym packing,
+        // `self.table` is already the exact table this call would rebuild
+        // (rebuild is a deterministic function of (code_lengths, multisym), and
+        // decode only reads the table). Skip the rebuild — byte-identical, and
+        // ~9.5% of the logs-T1 wall per the table-build perturbation gate.
+        #[cfg(pure_inflate_decode)]
+        {
+            use crate::decompress::parallel::marker_inflate::tbuild_cache;
+            use std::sync::atomic::Ordering;
+            if tbuild_cache::cache_enabled() {
+                if self.valid
+                    && multisym == self.cache_multisym
+                    && self.cache_key_len == code_lengths.len()
+                    && self.cache_key[..code_lengths.len()] == *code_lengths
+                {
+                    tbuild_cache::HITS.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                tbuild_cache::MISSES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.valid = false;
         // Allow up to 288 entries: 286 for dynamic-Huffman (LIT_LEN) plus
         // symbols 286 and 287 for fixed-Huffman participation (RFC 1951
@@ -1232,6 +1265,19 @@ impl LutLitLenCode {
         prof::add(&prof::N_BLOCKS, 1);
 
         self.valid = true;
+        // Store the cache key for the next block (byte-identical headers skip
+        // the rebuild). Bounded by the `code_lengths.len() > 288` guard above.
+        #[cfg(pure_inflate_decode)]
+        {
+            let n = code_lengths.len();
+            if n <= self.cache_key.len() {
+                self.cache_key[..n].copy_from_slice(code_lengths);
+                self.cache_key_len = n;
+                self.cache_multisym = multisym;
+            } else {
+                self.cache_key_len = usize::MAX;
+            }
+        }
         true
     }
 

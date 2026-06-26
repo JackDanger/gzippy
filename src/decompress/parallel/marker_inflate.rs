@@ -414,6 +414,56 @@ pub(crate) mod marker_dist_stats {
     }
 }
 
+/// Per-block Huffman table-build CACHE (litlen LUT). Many adjacent deflate
+/// blocks on repetitive corpora (logs) carry byte-identical dynamic-Huffman
+/// code-length vectors; rebuilding the LUT for an identical header is pure
+/// redundant work (`rebuild_from` is a deterministic function of the
+/// code-length slice + multisym flag). The cache stores the last successfully
+/// built code-length key inside `LutLitLenCode`; a hit skips the rebuild and
+/// reuses the already-correct `self.table` (decode only READS the table, never
+/// mutates it, so a hit is byte-identical to a fresh build).
+///
+/// `GZIPPY_TBUILD_CACHE_OFF=1` disables the cache (always rebuild) — the
+/// removal-oracle's BASE arm. `GZIPPY_TBUILD_CACHE_STATS=1` (with
+/// `GZIPPY_VERBOSE=1`) dumps the hit/miss counts proving non-inertness +
+/// the hit rate that bounds the recoverable ceiling.
+pub(crate) mod tbuild_cache {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    pub static MISSES: AtomicU64 = AtomicU64::new(0);
+    /// True unless explicitly disabled (default ON — shippable on a win).
+    pub fn cache_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| !std::env::var("GZIPPY_TBUILD_CACHE_OFF").is_ok_and(|v| v == "1"))
+    }
+    pub fn stats_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GZIPPY_TBUILD_CACHE_STATS").is_ok_and(|v| v == "1"))
+    }
+    pub fn dump_if_enabled() {
+        if !stats_enabled() {
+            return;
+        }
+        let h = HITS.load(Ordering::Relaxed);
+        let m = MISSES.load(Ordering::Relaxed);
+        let tot = h + m;
+        let rate = if tot > 0 {
+            100.0 * h as f64 / tot as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[tbuild-cache] litlen builds={} hits={} misses={} hit_rate={:.1}% enabled={}",
+            tot,
+            h,
+            m,
+            rate,
+            cache_enabled()
+        );
+    }
+}
+
 /// `GZIPPY_MFAST_PROF=1` — rdtsc cycle/event profiler for the `'mfast` marker
 /// fast loop and the careful marker loop. Zero-cost when off (one OnceLock bool
 /// branch per `read_internal_compressed_specialized::<true>` call). x86_64 only
