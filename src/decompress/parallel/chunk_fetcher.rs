@@ -1091,6 +1091,10 @@ fn drive_impl<W: std::io::Write>(
         // GZIPPY_MARKER_DIST_STATS=1).
         #[cfg(pure_inflate_decode)]
         crate::decompress::parallel::marker_inflate::marker_dist_stats::dump_if_enabled();
+        // Per-block litlen table-build cache hit/miss (no-op unless
+        // GZIPPY_TBUILD_CACHE_STATS=1).
+        #[cfg(pure_inflate_decode)]
+        crate::decompress::parallel::marker_inflate::tbuild_cache::dump_if_enabled();
         // mfast-phase0 probe: cycle/event breakdown for `'mfast` vs careful loop
         // (no-op unless GZIPPY_MFAST_PROF=1).
         crate::decompress::parallel::marker_inflate::mfast_prof::dump_if_enabled();
