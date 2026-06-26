@@ -450,19 +450,6 @@ pub(crate) mod tbuild_cache {
     extern "C" fn atexit_dump() {
         dump_if_enabled();
     }
-    /// Production LRU capacity gate (NOT the key-only simulator `lru_k`): >0
-    /// enables the real bounded table-LRU in `LutLitLenCode`, 0 leaves only the
-    /// MRU (last-header) fast path. Default ON; `GZIPPY_TBUILD_LRU_CAP=0`
-    /// disables it (the size-1 A/B arm).
-    pub fn lru_cap() -> usize {
-        static C: OnceLock<usize> = OnceLock::new();
-        *C.get_or_init(|| {
-            std::env::var("GZIPPY_TBUILD_LRU_CAP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1) // any >0 enables the fixed-size (8-slot) LRU
-        })
-    }
     pub fn stats_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("GZIPPY_TBUILD_CACHE_STATS").is_ok_and(|v| v == "1"))
