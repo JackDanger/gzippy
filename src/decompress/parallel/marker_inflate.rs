@@ -459,15 +459,45 @@ pub(crate) mod tbuild_cache {
     /// only when stats are enabled — never in production.
     pub static DISTINCT: OnceLock<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
         OnceLock::new();
+    /// Stats-only key-only LRU simulator (capacity GZIPPY_TBUILD_LRU_K, default
+    /// 0 = off). Counts how many builds an LRU of that size would have hit —
+    /// bounds the practical (bounded-cache) ceiling without storing tables.
+    pub static LRU_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static LRU: OnceLock<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>> =
+        OnceLock::new();
+    pub fn lru_k() -> usize {
+        static K: OnceLock<usize> = OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("GZIPPY_TBUILD_LRU_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
+    }
     pub fn note_key(code_lengths: &[u8], multisym: u32) {
         if !stats_enabled() {
             return;
         }
-        let set = DISTINCT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         let mut k = Vec::with_capacity(code_lengths.len() + 4);
         k.extend_from_slice(&multisym.to_le_bytes());
         k.extend_from_slice(code_lengths);
-        set.lock().unwrap().insert(k);
+        let set = DISTINCT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        set.lock().unwrap().insert(k.clone());
+        let cap = lru_k();
+        if cap > 0 {
+            let lru = LRU.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut q = lru.lock().unwrap();
+            if let Some(pos) = q.iter().position(|e| *e == k) {
+                LRU_HITS.fetch_add(1, Ordering::Relaxed);
+                q.remove(pos);
+                q.push_front(k);
+            } else {
+                if q.len() >= cap {
+                    q.pop_back();
+                }
+                q.push_front(k);
+            }
+        }
     }
     pub fn dump_if_enabled() {
         if !stats_enabled() {
@@ -490,9 +520,15 @@ pub(crate) mod tbuild_cache {
         } else {
             0.0
         };
+        let lru_h = LRU_HITS.load(Ordering::Relaxed);
+        let lru_rate = if tot > 0 {
+            100.0 * lru_h as f64 / tot as f64
+        } else {
+            0.0
+        };
         eprintln!(
-            "[tbuild-cache] litlen builds={} hits={} misses={} hit_rate={:.1}% distinct={} unbounded_ceil={:.1}% enabled={}",
-            tot, h, m, rate, distinct, ceil, cache_enabled()
+            "[tbuild-cache] litlen builds={} hits={} misses={} hit_rate={:.1}% distinct={} unbounded_ceil={:.1}% lru_k={} lru_hit_rate={:.1}% enabled={}",
+            tot, h, m, rate, distinct, ceil, lru_k(), lru_rate, cache_enabled()
         );
     }
 }
