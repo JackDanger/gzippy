@@ -66,6 +66,9 @@ def build_decompress_cmd(tool: str, bin_path: str, threads: int) -> list | None:
         return [bin_path, "-d"]
     elif tool == "rapidgzip":
         return [bin_path, "-d", "-P", str(threads)]
+    elif tool == "libdeflate":
+        # libdeflate-gunzip: single-threaded; stdin->stdout decompress.
+        return [bin_path, "-d", "-c"]
     return None
 
 
@@ -163,6 +166,7 @@ def main():
         "unpigz": find_binary(binaries_dir, "unpigz"),
         "igzip": find_binary(binaries_dir, "igzip"),
         "rapidgzip": find_binary(binaries_dir, "rapidgzip"),
+        "libdeflate": find_binary(binaries_dir, "libdeflate-gunzip"),
         "gzip": "/usr/bin/gzip",
     }
 
@@ -194,6 +198,8 @@ def main():
         decomp_tools.append(("igzip", tools["igzip"]))
     if tools["rapidgzip"]:
         decomp_tools.append(("rapidgzip", tools["rapidgzip"]))
+    if tools["libdeflate"]:
+        decomp_tools.append(("libdeflate", tools["libdeflate"]))
     decomp_tools.append(("gzip", tools["gzip"]))
 
     with tempfile.TemporaryDirectory() as tmpdir:
