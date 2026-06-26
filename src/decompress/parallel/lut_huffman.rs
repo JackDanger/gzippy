@@ -1144,6 +1144,7 @@ impl LutLitLenCode {
         {
             use crate::decompress::parallel::marker_inflate::tbuild_cache;
             use std::sync::atomic::Ordering;
+            tbuild_cache::note_key(code_lengths, multisym);
             if tbuild_cache::cache_enabled() {
                 if self.valid
                     && multisym == self.cache_multisym

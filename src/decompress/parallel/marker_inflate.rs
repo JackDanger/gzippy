@@ -454,6 +454,21 @@ pub(crate) mod tbuild_cache {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("GZIPPY_TBUILD_CACHE_STATS").is_ok_and(|v| v == "1"))
     }
+    /// Stats-only: set of DISTINCT (multisym, code_lengths) keys seen. Bounds
+    /// the ceiling an unbounded cache would reach (distinct / total). Touched
+    /// only when stats are enabled — never in production.
+    pub static DISTINCT: OnceLock<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
+        OnceLock::new();
+    pub fn note_key(code_lengths: &[u8], multisym: u32) {
+        if !stats_enabled() {
+            return;
+        }
+        let set = DISTINCT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let mut k = Vec::with_capacity(code_lengths.len() + 4);
+        k.extend_from_slice(&multisym.to_le_bytes());
+        k.extend_from_slice(code_lengths);
+        set.lock().unwrap().insert(k);
+    }
     pub fn dump_if_enabled() {
         if !stats_enabled() {
             return;
@@ -466,13 +481,18 @@ pub(crate) mod tbuild_cache {
         } else {
             0.0
         };
+        let distinct = DISTINCT
+            .get()
+            .map(|s| s.lock().unwrap().len())
+            .unwrap_or(0);
+        let ceil = if tot > 0 {
+            100.0 * (tot - distinct as u64) as f64 / tot as f64
+        } else {
+            0.0
+        };
         eprintln!(
-            "[tbuild-cache] litlen builds={} hits={} misses={} hit_rate={:.1}% enabled={}",
-            tot,
-            h,
-            m,
-            rate,
-            cache_enabled()
+            "[tbuild-cache] litlen builds={} hits={} misses={} hit_rate={:.1}% distinct={} unbounded_ceil={:.1}% enabled={}",
+            tot, h, m, rate, distinct, ceil, cache_enabled()
         );
     }
 }
