@@ -435,7 +435,20 @@ pub(crate) mod tbuild_cache {
     /// True unless explicitly disabled (default ON — shippable on a win).
     pub fn cache_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| !std::env::var("GZIPPY_TBUILD_CACHE_OFF").is_ok_and(|v| v == "1"))
+        *ON.get_or_init(|| {
+            // Register a process-exit dump so the hit-rate prints regardless of
+            // which driver path (thin-T1 vs chunk_fetcher) ran the decode. The
+            // handler no-ops unless GZIPPY_TBUILD_CACHE_STATS=1.
+            if stats_enabled() {
+                unsafe {
+                    libc::atexit(atexit_dump);
+                }
+            }
+            !std::env::var("GZIPPY_TBUILD_CACHE_OFF").is_ok_and(|v| v == "1")
+        })
+    }
+    extern "C" fn atexit_dump() {
+        dump_if_enabled();
     }
     pub fn stats_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
