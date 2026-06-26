@@ -511,10 +511,7 @@ pub(crate) mod tbuild_cache {
         } else {
             0.0
         };
-        let distinct = DISTINCT
-            .get()
-            .map(|s| s.lock().unwrap().len())
-            .unwrap_or(0);
+        let distinct = DISTINCT.get().map(|s| s.lock().unwrap().len()).unwrap_or(0);
         let ceil = if tot > 0 {
             100.0 * (tot - distinct as u64) as f64 / tot as f64
         } else {
