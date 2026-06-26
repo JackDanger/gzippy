@@ -309,6 +309,7 @@ impl HuffCode {
 /// long-code fan-out from the deflate alphabet (vendor sized this
 /// constant; we mirror it).
 #[repr(C)]
+#[derive(Clone)]
 pub struct InflateHuffCodeLarge {
     pub short_code_lookup: [u32; 1 << ISAL_DECODE_LONG_BITS],
     pub long_code_lookup: [u16; 1264],
@@ -1084,14 +1085,77 @@ pub struct LutLitLenCode {
     lit_and_dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
     code_list: Box<[u32; LIT_LEN_ELEMS + 2]>,
     valid: bool,
-    /// Per-block table-build cache: the code-length key of the LAST
-    /// successfully built table. When the next block presents a byte-identical
-    /// key (+ same `multisym`), `self.table` is already correct and the rebuild
-    /// is skipped (see `tbuild_cache` in marker_inflate.rs). `cache_key_len ==
-    /// usize::MAX` means "no cached table" (forces a miss).
+    /// Per-block table-build cache: the code-length key of the table currently
+    /// resident in `self.table` (the MRU entry). When the next block presents a
+    /// byte-identical key (+ same `multisym`), `self.table` is already correct
+    /// and the rebuild is skipped with ZERO copy (see `tbuild_cache` in
+    /// marker_inflate.rs). `cache_key_len == usize::MAX` means "no cached table".
     cache_key: Box<[u8; 290]>,
     cache_key_len: usize,
     cache_multisym: u32,
+    /// LRU of recently-built tables (the K-1 non-MRU entries). A block whose
+    /// header matches a stored slot copies that table into `self.table`
+    /// (~590 cyc) instead of rebuilding it (~11k cyc). Every built table is
+    /// stored here at creation, so `self.table` can always be overwritten
+    /// without data loss. Byte-exact: a stored table IS a fresh build of its
+    /// key. `None` until first use (avoids the ~150 KiB cost when the cache is
+    /// disabled or unused).
+    lru: Option<Box<TbuildLru>>,
+}
+
+/// Bounded LRU of built lit/len tables. CAP chosen from the measured
+/// hit-rate-vs-K curve on logs (K=8 ≈ 41% ≈ the 43% unbounded ceiling).
+const TBUILD_LRU_CAP: usize = 8;
+
+struct TbuildLruSlot {
+    key: [u8; 290],
+    key_len: usize,
+    multisym: u32,
+    recency: u64,
+    table: InflateHuffCodeLarge,
+}
+
+pub struct TbuildLru {
+    slots: [TbuildLruSlot; TBUILD_LRU_CAP],
+    clock: u64,
+}
+
+impl TbuildLru {
+    fn new() -> Box<Self> {
+        Box::new(TbuildLru {
+            slots: std::array::from_fn(|_| TbuildLruSlot {
+                key: [0u8; 290],
+                key_len: usize::MAX,
+                multisym: 0,
+                recency: 0,
+                table: InflateHuffCodeLarge::default(),
+            }),
+            clock: 0,
+        })
+    }
+    #[inline]
+    fn find(&self, code_lengths: &[u8], multisym: u32) -> Option<usize> {
+        let n = code_lengths.len();
+        self.slots.iter().position(|s| {
+            s.key_len == n && s.multisym == multisym && s.key[..n] == *code_lengths
+        })
+    }
+    /// Pick the eviction victim: an empty slot if any, else least-recently-used.
+    #[inline]
+    fn victim(&self) -> usize {
+        let mut v = 0usize;
+        let mut best = u64::MAX;
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.key_len == usize::MAX {
+                return i;
+            }
+            if s.recency < best {
+                best = s.recency;
+                v = i;
+            }
+        }
+        v
+    }
 }
 
 impl LutLitLenCode {
@@ -1113,6 +1177,7 @@ impl LutLitLenCode {
             cache_key: Box::new([0u8; 290]),
             cache_key_len: usize::MAX,
             cache_multisym: 0,
+            lru: None,
         }
     }
 
@@ -1145,14 +1210,39 @@ impl LutLitLenCode {
             use crate::decompress::parallel::marker_inflate::tbuild_cache;
             use std::sync::atomic::Ordering;
             tbuild_cache::note_key(code_lengths, multisym);
-            if tbuild_cache::cache_enabled() {
+            let n = code_lengths.len();
+            if tbuild_cache::cache_enabled() && n <= self.cache_key.len() {
+                // MRU fast path: identical to the last block → table already
+                // resident, ZERO copy.
                 if self.valid
                     && multisym == self.cache_multisym
-                    && self.cache_key_len == code_lengths.len()
-                    && self.cache_key[..code_lengths.len()] == *code_lengths
+                    && self.cache_key_len == n
+                    && self.cache_key[..n] == *code_lengths
                 {
                     tbuild_cache::HITS.fetch_add(1, Ordering::Relaxed);
                     return true;
+                }
+                // LRU lookup: copy a stored table into self.table (~590 cyc)
+                // instead of rebuilding (~11k cyc). The stored table IS a fresh
+                // build of this key, so the copy is byte-identical.
+                if tbuild_cache::lru_cap() > 0 {
+                    let lru = self.lru.get_or_insert_with(TbuildLru::new);
+                    if let Some(i) = lru.find(code_lengths, multisym) {
+                        lru.clock += 1;
+                        lru.slots[i].recency = lru.clock;
+                        self.table
+                            .short_code_lookup
+                            .copy_from_slice(&lru.slots[i].table.short_code_lookup);
+                        self.table
+                            .long_code_lookup
+                            .copy_from_slice(&lru.slots[i].table.long_code_lookup);
+                        self.cache_key[..n].copy_from_slice(code_lengths);
+                        self.cache_key_len = n;
+                        self.cache_multisym = multisym;
+                        self.valid = true;
+                        tbuild_cache::HITS.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
                 }
                 tbuild_cache::MISSES.fetch_add(1, Ordering::Relaxed);
             }
@@ -1266,15 +1356,36 @@ impl LutLitLenCode {
         prof::add(&prof::N_BLOCKS, 1);
 
         self.valid = true;
-        // Store the cache key for the next block (byte-identical headers skip
-        // the rebuild). Bounded by the `code_lengths.len() > 288` guard above.
+        // Record this freshly-built table as the MRU and store a copy in the
+        // LRU so a later block with the same header hits (byte-exact: it is a
+        // fresh build of `code_lengths`). Bounded by the len>288 guard above.
         #[cfg(pure_inflate_decode)]
         {
+            use crate::decompress::parallel::marker_inflate::tbuild_cache;
             let n = code_lengths.len();
             if n <= self.cache_key.len() {
                 self.cache_key[..n].copy_from_slice(code_lengths);
                 self.cache_key_len = n;
                 self.cache_multisym = multisym;
+                if tbuild_cache::cache_enabled() && tbuild_cache::lru_cap() > 0 {
+                    let lru = self.lru.get_or_insert_with(TbuildLru::new);
+                    // Skip if already present (e.g. a non-MRU rebuild path).
+                    if lru.find(code_lengths, multisym).is_none() {
+                        let v = lru.victim();
+                        lru.clock += 1;
+                        let slot = &mut lru.slots[v];
+                        slot.key[..n].copy_from_slice(code_lengths);
+                        slot.key_len = n;
+                        slot.multisym = multisym;
+                        slot.recency = lru.clock;
+                        slot.table
+                            .short_code_lookup
+                            .copy_from_slice(&self.table.short_code_lookup);
+                        slot.table
+                            .long_code_lookup
+                            .copy_from_slice(&self.table.long_code_lookup);
+                    }
+                }
             } else {
                 self.cache_key_len = usize::MAX;
             }
