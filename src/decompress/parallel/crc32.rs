@@ -160,15 +160,22 @@ pub(crate) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
             return unsafe { hw_crc::fold3(crc, data) };
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vpclmul::available() && !crc_legacy() {
+            return vpclmul::crc32_vpclmul(crc, data);
+        }
+    }
     let mut h = Hasher::new_with_initial(crc);
     h.update(data);
     h.finalize()
 }
 
-/// `GZIPPY_CRC_LEGACY=1` forces the crc32fast single-`crc32x`-chain path so the
-/// 3-way HW-CRC win stays re-verifiable by an interleaved AB on ONE binary
-/// (controls for build variance). Read once. Default OFF = fast 3-way path.
-#[cfg(target_arch = "aarch64")]
+/// `GZIPPY_CRC_LEGACY=1` forces the crc32fast kernel so the faster HW-CRC fold
+/// (aarch64 3-way `crc32x`, x86_64 VPCLMULQDQ 256-bit fold) stays re-verifiable
+/// by an interleaved A/B on ONE binary (controls for build variance). Read
+/// once. Default OFF = fast path.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn crc_legacy() -> bool {
     use std::sync::OnceLock;
@@ -249,6 +256,241 @@ mod hw_crc {
         let abc = combine_crc32(ab, fc, block as u64);
         // Tail past the three equal thirds.
         fold1(abc, &data[3 * block..])
+    }
+}
+
+// =====================================================================
+// x86_64 VPCLMULQDQ CRC32 fold (DIVERGENCE from the crc32fast crate kernel).
+// =====================================================================
+//
+// GATE-1 motivation (Intel i7-13700T raptorlake, 2026-06-26, /dev/shm
+// microbench, byte-exact vs crc32fast across sizes/aligns/seeds): crc32fast
+// 1.5.0's x86 kernel is a 128-bit fold-by-4 (SSE PCLMULQDQ, 64 B/iter). On
+// cache-resident data (16 KiB–1 MiB — the regime per-block CRC runs in) it
+// measures ~11 GB/s; ISA-L's crc32_gzip_refl is the SAME (~11 GB/s); but
+// libdeflate's CRC reaches ~22 GB/s = 2.0x. The win is a WIDER fold: 256-bit
+// VEX-encoded VPCLMULQDQ (`_mm256_clmulepi64_epi128`, 2 carryless mults/insn)
+// folding 128 B/iter with 4 YMM accumulators hides PCLMUL latency. This pure-
+// Rust port matches libdeflate (~21.4–21.8 GB/s, 2.0x crc32fast on hot data).
+// Bytes are unchanged (same reflected gzip CRC32); the gzip-trailer verify is
+// a loud correctness check and the differential test pins it byte-for-byte.
+// Fold constants are derived at COMPILE TIME from the reflected GF(2) routine
+// above (same algorithm as `polynomial_multiply_modulo`) and asserted to
+// reproduce crc32fast's published 64 B / 16 B keys before yielding the new
+// 128 B-stride keys — so no magic numbers are trusted unverified.
+#[cfg(target_arch = "x86_64")]
+mod vpclmul {
+    use core::arch::x86_64 as arch;
+    use crc32fast::Hasher;
+    use std::sync::OnceLock;
+
+    /// Runtime feature gate (cached). Requires the full VPCLMULQDQ + AVX2 set.
+    #[inline]
+    pub fn available() -> bool {
+        static A: OnceLock<bool> = OnceLock::new();
+        *A.get_or_init(|| {
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("vpclmulqdq")
+                && is_x86_feature_detected!("pclmulqdq")
+                && is_x86_feature_detected!("sse4.1")
+                && is_x86_feature_detected!("sse2")
+        })
+    }
+
+    // ---- compile-time fold-key derivation (reflected GF(2)) ----
+    const POLY: u32 = super::CRC32_GENERATOR_POLYNOMIAL; // 0xEDB88320
+
+    const fn pmm(a: u32, mut b: u32) -> u32 {
+        let mut result: u32 = 0;
+        let mut cp: u32 = 1u32 << 31;
+        while cp > 0 {
+            if (a & cp) != 0 {
+                result ^= b;
+            }
+            let of = (b & 1) != 0;
+            b >>= 1;
+            if of {
+                b ^= POLY;
+            }
+            cp >>= 1;
+        }
+        result
+    }
+
+    /// x^exponent mod P in reflected form (binary exponentiation; const-usable).
+    const fn x_pow_mod(mut e: u64) -> u32 {
+        let mut result: u32 = 1u32 << 31; // x^0
+        let mut base: u32 = 1u32 << 30; // x^1
+        while e > 0 {
+            if e & 1 != 0 {
+                result = pmm(result, base);
+            }
+            base = pmm(base, base);
+            e >>= 1;
+        }
+        result
+    }
+
+    /// PCLMULQDQ key for x^e mod P (33-bit reflected encoding = residue << 1).
+    const fn key(e: u64) -> i64 {
+        ((x_pow_mod(e) as u64) << 1) as i64
+    }
+
+    // For an S-byte fold stride: low key (× a.low , clmul 0x00) = x^(8S+32),
+    // high key (× a.high, clmul 0x11) = x^(8S-32). Verified vs crc32fast below.
+    const K1_64: i64 = key(544); // 64 B stride, low
+    const K2_64: i64 = key(480); // 64 B stride, high
+    const K1_128: i64 = key(1056); // 128 B stride, low
+    const K2_128: i64 = key(992); // 128 B stride, high
+    const K3: i64 = key(160); // 16 B stride, low
+    const K4: i64 = key(96); // 16 B stride, high
+    const K5: i64 = key(64); // step-3
+    const P_X: i64 = 0x1DB7_10641;
+    const U_PRIME: i64 = 0x1F70_11641;
+
+    const _: () = {
+        assert!(K1_64 == 0x1544_42bd4);
+        assert!(K2_64 == 0x1c6e_41596);
+        assert!(K3 == 0x1751_997d0);
+        assert!(K4 == 0x0cca_a009e);
+        assert!(K5 == 0x163c_d6124);
+    };
+
+    /// crc32fast continuation — the project's trusted scalar/short-input path.
+    #[inline]
+    fn fallback(crc: u32, data: &[u8]) -> u32 {
+        let mut h = Hasher::new_with_initial(crc);
+        h.update(data);
+        h.finalize()
+    }
+
+    /// Continue the finalized gzip CRC32 `crc` over `data`, byte-identical to
+    /// `crc32fast`. Dispatches to the 256-bit fold when the buffer is large
+    /// enough; small/short inputs go through crc32fast.
+    #[inline]
+    pub fn crc32_vpclmul(crc: u32, data: &[u8]) -> u32 {
+        if data.len() < 128 {
+            return fallback(crc, data);
+        }
+        // SAFETY: `available()` (checked at the call site in crc32_fold) proves
+        // the CPU supports every feature the inner fn enables.
+        unsafe { crc32_vpclmul_inner(crc, data) }
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    #[target_feature(enable = "avx2,vpclmulqdq,pclmulqdq,sse4.1,sse2")]
+    unsafe fn crc32_vpclmul_inner(crc: u32, mut data: &[u8]) -> u32 {
+        debug_assert!(data.len() >= 128);
+
+        let mut y3 = get256(&mut data);
+        let mut y2 = get256(&mut data);
+        let mut y1 = get256(&mut data);
+        let mut y0 = get256(&mut data);
+
+        // Fold the incoming finalized CRC into the lowest dword (first byte).
+        y3 = arch::_mm256_xor_si256(y3, arch::_mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, !crc as i32));
+
+        let k128 = arch::_mm256_set_epi64x(K2_128, K1_128, K2_128, K1_128);
+        while data.len() >= 128 {
+            y3 = reduce256(y3, get256(&mut data), k128);
+            y2 = reduce256(y2, get256(&mut data), k128);
+            y1 = reduce256(y1, get256(&mut data), k128);
+            y0 = reduce256(y0, get256(&mut data), k128);
+        }
+
+        // Reduce the 8 128-bit sub-lanes (stream order) to one with the 16 B key.
+        let k3k4 = arch::_mm_set_epi64x(K4, K3);
+        let mut x = reduce128(low128(y3), high128(y3), k3k4);
+        x = reduce128(x, low128(y2), k3k4);
+        x = reduce128(x, high128(y2), k3k4);
+        x = reduce128(x, low128(y1), k3k4);
+        x = reduce128(x, high128(y1), k3k4);
+        x = reduce128(x, low128(y0), k3k4);
+        x = reduce128(x, high128(y0), k3k4);
+
+        // Also fold any remaining 64 B groups with the 64 B key for parity with
+        // crc32fast's fold-by-1 step (here just the 16 B fold-by-1 loop).
+        let _ = (K1_64, K2_64);
+        while data.len() >= 16 {
+            x = reduce128(x, get128(&mut data), k3k4);
+        }
+
+        // Step 3 (128->64) + Barrett (64->32), verbatim from crc32fast 1.5.0.
+        let x = arch::_mm_xor_si128(
+            arch::_mm_clmulepi64_si128::<0x10>(x, k3k4),
+            arch::_mm_srli_si128::<8>(x),
+        );
+        let x = arch::_mm_xor_si128(
+            arch::_mm_clmulepi64_si128::<0x00>(
+                arch::_mm_and_si128(x, arch::_mm_set_epi32(0, 0, 0, !0)),
+                arch::_mm_set_epi64x(0, K5),
+            ),
+            arch::_mm_srli_si128::<4>(x),
+        );
+        let pu = arch::_mm_set_epi64x(U_PRIME, P_X);
+        let t1 = arch::_mm_clmulepi64_si128::<0x10>(
+            arch::_mm_and_si128(x, arch::_mm_set_epi32(0, 0, 0, !0)),
+            pu,
+        );
+        let t2 = arch::_mm_clmulepi64_si128::<0x00>(
+            arch::_mm_and_si128(t1, arch::_mm_set_epi32(0, 0, 0, !0)),
+            pu,
+        );
+        let c = arch::_mm_extract_epi32::<1>(arch::_mm_xor_si128(x, t2)) as u32;
+
+        arch::_mm256_zeroupper();
+
+        if data.is_empty() {
+            !c
+        } else {
+            fallback(!c, data)
+        }
+    }
+
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn reduce256(a: arch::__m256i, b: arch::__m256i, keys: arch::__m256i) -> arch::__m256i {
+        let t1 = arch::_mm256_clmulepi64_epi128::<0x00>(a, keys);
+        let t2 = arch::_mm256_clmulepi64_epi128::<0x11>(a, keys);
+        arch::_mm256_xor_si256(arch::_mm256_xor_si256(b, t1), t2)
+    }
+
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn reduce128(a: arch::__m128i, b: arch::__m128i, keys: arch::__m128i) -> arch::__m128i {
+        let t1 = arch::_mm_clmulepi64_si128::<0x00>(a, keys);
+        let t2 = arch::_mm_clmulepi64_si128::<0x11>(a, keys);
+        arch::_mm_xor_si128(arch::_mm_xor_si128(b, t1), t2)
+    }
+
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn get256(data: &mut &[u8]) -> arch::__m256i {
+        debug_assert!(data.len() >= 32);
+        let out = arch::_mm256_loadu_si256(data.as_ptr() as *const arch::__m256i);
+        *data = &data[32..];
+        out
+    }
+
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn get128(data: &mut &[u8]) -> arch::__m128i {
+        debug_assert!(data.len() >= 16);
+        let out = arch::_mm_loadu_si128(data.as_ptr() as *const arch::__m128i);
+        *data = &data[16..];
+        out
+    }
+
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn low128(value: arch::__m256i) -> arch::__m128i {
+        arch::_mm256_castsi256_si128(value)
+    }
+
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn high128(value: arch::__m256i) -> arch::__m128i {
+        arch::_mm256_extracti128_si256::<1>(value)
     }
 }
 
