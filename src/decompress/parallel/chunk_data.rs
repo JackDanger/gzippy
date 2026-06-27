@@ -1901,6 +1901,32 @@ impl ChunkData {
         len
     }
 
+    /// FUSED resolve + narrow + narrowed-CRC in a SINGLE traversal.
+    ///
+    /// Equivalent to `resolve_and_narrow_markers_in_place(window)` immediately
+    /// followed by `update_narrowed_crc()`, but folds the CRC into the
+    /// resolve+narrow pass so the narrowed bytes are touched ONCE instead of
+    /// twice. Byte-exact (`narrowed_crc` ends identical — see
+    /// `SegmentedU16::resolve_and_narrow_in_place_crc`), universal (no arch
+    /// dispatch), strict work reduction.
+    pub fn resolve_and_narrow_markers_in_place_crc(&mut self, window: &[u8]) -> usize {
+        debug_assert_eq!(
+            self.data_prefix_len, 0,
+            "trim_window_prefix before resolve_and_narrow_markers_in_place_crc"
+        );
+        debug_assert!(
+            self.narrowed_len == 0 && !self.markers_resolved,
+            "resolve_and_narrow_markers_in_place_crc: already resolved (double-resolve)"
+        );
+        let len = self.data_with_markers.len();
+        if len > 0 {
+            self.data_with_markers
+                .resolve_and_narrow_in_place_crc(window, &mut self.narrowed_crc);
+        }
+        self.narrowed_len = len;
+        len
+    }
+
     /// CRC the in-place-narrowed marker bytes (may span multiple segments).
     pub fn update_narrowed_crc(&mut self) {
         if self.narrowed_len == 0 {

@@ -526,6 +526,63 @@ impl SegmentedU16 {
         }
     }
 
+    /// FUSED resolve + narrow + CRC32 in a SINGLE traversal of the buffer.
+    ///
+    /// Identical output to [`Self::resolve_and_narrow_in_place`] followed by a
+    /// separate CRC pass (the production sequence was
+    /// `resolve_and_narrow_markers_in_place` → `update_narrowed_crc`, two full
+    /// touches of the narrowed bytes). Here the just-written narrowed bytes of
+    /// each segment are CRC'd while still hot in cache, eliminating the second
+    /// whole-buffer memory traversal — a strict work reduction, no arch
+    /// dispatch, byte-exact.
+    ///
+    /// BYTE-EXACTNESS: the CRC is folded per-segment, in segment order, over
+    /// exactly the `seg.len()` narrowed bytes of each segment — the SAME slices
+    /// in the SAME order that `ChunkData::update_narrowed_crc` feeds (where
+    /// `narrowed_len == sum(seg.len())`). `CRC32Calculator::update` is an
+    /// associative streaming fold, so the resulting CRC is identical.
+    pub fn resolve_and_narrow_in_place_crc(
+        &mut self,
+        window: &[u8],
+        crc: &mut crate::decompress::parallel::crc32::CRC32Calculator,
+    ) {
+        if self.cached_len == 0 {
+            return;
+        }
+        debug_assert_eq!(window.len(), 32768);
+        APPLY_WINDOW_LUT.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            let lut = opt.get_or_insert_with(|| {
+                let mut lut = [0u8; 65536];
+                for (i, slot) in lut[0..256].iter_mut().enumerate() {
+                    *slot = i as u8;
+                }
+                lut
+            });
+            lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
+            for seg in &mut self.segments {
+                let n = seg.len();
+                if n == 0 {
+                    continue;
+                }
+                let base = seg.as_mut_ptr() as *mut u8;
+                let src = seg.as_ptr();
+                for i in 0..n {
+                    // SAFETY: read element i in [0,n); write byte i (< n <= 2n).
+                    let v = unsafe { *src.add(i) };
+                    unsafe {
+                        base.add(i).write(lut[v as usize]);
+                    }
+                }
+                // Fold CRC over the bytes we just wrote — still hot in cache.
+                // SAFETY: `[base, base+n)` holds the n narrowed u8 bytes written
+                // by the loop above.
+                let sl = unsafe { std::slice::from_raw_parts(base as *const u8, n) };
+                crc.update(sl);
+            }
+        });
+    }
+
     /// Release the unused UPPER half of each marker segment's backing
     /// allocation back to the OS after in-place narrow. The narrowed u8
     /// bytes occupy only the low `seg.len()` BYTES of a `seg.capacity()*2`
