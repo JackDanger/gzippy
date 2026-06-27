@@ -234,6 +234,84 @@ impl Drop for NestedTableSpan {
     }
 }
 
+// ── R_MARKERPP SUB-PARTITION (R_MARKERPP = R_RESOLVE + R_SUBWIN + markerpp_other) ─
+// Sub-decomposition of the marker post-process region to localize the AMD-Zen2
+// silesia mid-T residual (the LAST AMD deficit). Two exclusive sequential leaves
+// inside `resolve_chunk_markers_on_chunk`, MATCHED to rg's ChunkData::applyWindow
+// internals:
+//   R_RESOLVE : `resolve_and_narrow_markers_in_place_crc` — the per-output-byte
+//               marker→window resolution + u16→u8 narrow + fused narrowed-CRC.
+//               rg counterpart = applyWindow's marker map + narrow + CRC.
+//   R_SUBWIN  : `populate_subchunk_windows` — per-subchunk 32 KiB window copy +
+//               sparsity mask + compression for successor handoff. rg counterpart
+//               = applyWindow's per-subchunk window extraction.
+//   markerpp_other = R_MARKERPP - R_RESOLVE - R_SUBWIN (dwm_len read, free-pages,
+//               bookkeeping).
+// Own depth counter (MPP_OVERLAP) — these leaves nest INSIDE the outer R_MARKERPP
+// span, so they cannot share the R_MARKERPP region depth counter.
+pub static R_RESOLVE_CYC: AtomicU64 = AtomicU64::new(0);
+pub static R_RESOLVE_N: AtomicU64 = AtomicU64::new(0);
+pub static R_RESOLVE_BYTES: AtomicU64 = AtomicU64::new(0); // marker bytes resolved
+pub static R_SUBWIN_CYC: AtomicU64 = AtomicU64::new(0);
+pub static R_SUBWIN_N: AtomicU64 = AtomicU64::new(0);
+pub static R_SUBWIN_SUBCHUNKS: AtomicU64 = AtomicU64::new(0); // subchunk windows built
+
+thread_local! {
+    static MPP_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+pub static MPP_OVERLAP_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn mpp_enter() {
+    MPP_DEPTH.with(|d| {
+        let v = d.get();
+        if v > 0 {
+            MPP_OVERLAP_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        d.set(v + 1);
+    });
+}
+#[inline(always)]
+fn mpp_exit() {
+    MPP_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
+/// RAII span over an R_MARKERPP sub-leaf (R_RESOLVE / R_SUBWIN). Exclusive via the
+/// MPP_DEPTH counter; nests inside the outer R_MARKERPP `Span`.
+pub struct MarkerSubSpan {
+    on: bool,
+    t0: u64,
+    cyc: &'static AtomicU64,
+    n: &'static AtomicU64,
+}
+impl MarkerSubSpan {
+    #[inline(always)]
+    pub fn new(cyc: &'static AtomicU64, n: &'static AtomicU64) -> Self {
+        let on = enabled();
+        if on {
+            mpp_enter();
+        }
+        Self {
+            on,
+            t0: rdtsc(on),
+            cyc,
+            n,
+        }
+    }
+}
+impl Drop for MarkerSubSpan {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !self.on {
+            return;
+        }
+        let dt = rdtsc(true).wrapping_sub(self.t0);
+        mpp_exit();
+        self.cyc.fetch_add(dt, Ordering::Relaxed);
+        self.n.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[inline(always)]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -382,6 +460,47 @@ pub fn dump_if_enabled() {
         sub_non_inert,
         wc >= tc + dc,
         if sub_overlap == 0 && sub_non_inert && wc >= tc + dc { "PASS" } else { "FAIL" }
+    );
+
+    // ── R_MARKERPP sub-partition dump ──────────────────────────────────────
+    let (rc, rn, rb) = (
+        load(&R_RESOLVE_CYC),
+        load(&R_RESOLVE_N),
+        load(&R_RESOLVE_BYTES),
+    );
+    let (swc, swn, sws) = (
+        load(&R_SUBWIN_CYC),
+        load(&R_SUBWIN_N),
+        load(&R_SUBWIN_SUBCHUNKS),
+    );
+    let markerpp_other = mc.saturating_sub(rc).saturating_sub(swc);
+    eprintln!(
+        "  [markerpp-prof] R_MARKERPP sub-partition (R_MARKERPP = R_RESOLVE + R_SUBWIN + markerpp_other):"
+    );
+    eprintln!(
+        "    R_RESOLVE cyc={:>16} calls={:>9} mkbytes={:>11} cyc/mkB={:.3} cyc/call={:.1}  (resolve+narrow+narrowed-CRC)",
+        rc, rn, rb, cpb(rc, rb), cpcall(rc, rn)
+    );
+    eprintln!(
+        "    R_SUBWIN  cyc={:>16} calls={:>9} subchunks={:>9} cyc/mkB={:.3} cyc/subchunk={:.1}  (populate_subchunk_windows)",
+        swc, swn, sws, cpb(swc, mb), cpcall(swc, sws)
+    );
+    eprintln!(
+        "    markerpp_other cyc={:>11} (= R_MARKERPP - R_RESOLVE - R_SUBWIN; dwm read/free-pages/bookkeeping) cyc/mkB={:.3}",
+        markerpp_other, cpb(markerpp_other, mb)
+    );
+    let mpp_overlap = MPP_OVERLAP_VIOLATIONS.load(Ordering::Relaxed);
+    let mpp_sum = rc + swc + markerpp_other;
+    let mpp_non_inert = rn > 0 && swn > 0;
+    eprintln!(
+        "    [markerpp-prof] MPP_OVERLAP_VIOLATIONS={mpp_overlap} (must be 0) conservation R_RESOLVE+R_SUBWIN+other={mpp_sum} vs R_MARKERPP={mc}"
+    );
+    eprintln!(
+        "    [markerpp-prof] SELF-TEST: mpp_overlap==0:{} non-inert(resolve&subwin):{} other>=0:{} -> {}",
+        mpp_overlap == 0,
+        mpp_non_inert,
+        mc >= rc + swc,
+        if mpp_overlap == 0 && mpp_non_inert && mc >= rc + swc { "PASS" } else { "FAIL" }
     );
 
     let overlap = OVERLAP_VIOLATIONS.load(Ordering::Relaxed);

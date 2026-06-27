@@ -1100,6 +1100,9 @@ fn drive_impl<W: std::io::Write>(
         crate::decompress::parallel::marker_inflate::mfast_prof::dump_if_enabled();
         // AMD-residual region partition (no-op unless GZIPPY_REGION_PROF=1).
         crate::decompress::parallel::region_prof::dump_if_enabled();
+        // Marker post-process bounding-oracle self-report (no-op unless a
+        // GZIPPY_PERTURB_SKIP_* knob is set).
+        crate::decompress::parallel::markerpp_perturb::report_if_enabled();
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
@@ -3149,7 +3152,23 @@ fn resolve_chunk_markers_on_chunk(
         // each segment's narrowed bytes are CRC'd while hot in cache instead of
         // re-read in a separate `update_narrowed_crc` whole-buffer pass.
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        chunk.resolve_and_narrow_markers_in_place_crc(predecessor_window);
+        // R_RESOLVE sub-leaf (rdtsc) + SKIP_RESOLVE bounding-oracle.
+        if crate::decompress::parallel::markerpp_perturb::skip_resolve_enabled() {
+            // Skip the per-output-byte resolve+narrow+CRC; still set narrowed_len
+            // so the consumer emits bytes (garbage) and the pipeline completes.
+            crate::decompress::parallel::markerpp_perturb::note_skip_resolve();
+            chunk.narrowed_len = dwm_len_pre;
+        } else {
+            let _rs = crate::decompress::parallel::region_prof::MarkerSubSpan::new(
+                &crate::decompress::parallel::region_prof::R_RESOLVE_CYC,
+                &crate::decompress::parallel::region_prof::R_RESOLVE_N,
+            );
+            if crate::decompress::parallel::region_prof::enabled() {
+                crate::decompress::parallel::region_prof::R_RESOLVE_BYTES
+                    .fetch_add(dwm_len_pre as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            chunk.resolve_and_narrow_markers_in_place_crc(predecessor_window);
+        }
     }
     // CRC folded above for the marker path; when `dwm_len_pre == 0` there are no
     // narrowed bytes (`narrowed_len == 0`), so there is nothing to CRC here.
@@ -3166,7 +3185,21 @@ fn resolve_chunk_markers_on_chunk(
     // (chunk_fetcher.rs:3486 / chunk_data.rs:1621, which frees BOTH `data` and
     // `data_with_markers`). `populate_subchunk_windows` runs against the un-merged
     // markers — `copy_window_at_chunk_offset` already branches on `narrowed_len>0`.
-    chunk.populate_subchunk_windows(predecessor_window);
+    // R_SUBWIN sub-leaf (rdtsc) + SKIP_APPLYWINDOW bounding-oracle.
+    if crate::decompress::parallel::markerpp_perturb::skip_subwin_enabled() {
+        crate::decompress::parallel::markerpp_perturb::note_skip_subwin();
+        chunk.populate_subchunk_windows_stub();
+    } else {
+        let _sw = crate::decompress::parallel::region_prof::MarkerSubSpan::new(
+            &crate::decompress::parallel::region_prof::R_SUBWIN_CYC,
+            &crate::decompress::parallel::region_prof::R_SUBWIN_N,
+        );
+        if crate::decompress::parallel::region_prof::enabled() {
+            crate::decompress::parallel::region_prof::R_SUBWIN_SUBCHUNKS
+                .fetch_add(chunk.subchunks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        chunk.populate_subchunk_windows(predecessor_window);
+    }
     // RSS convergence (GZIPPY_FREE_MARKERS): after narrow + CRC + subchunk-
     // window extraction have read the low-half narrowed bytes, release the
     // dead upper half of each marker segment back to the OS (faithful to rg

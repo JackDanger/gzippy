@@ -1437,6 +1437,22 @@ impl ChunkData {
         }
     }
 
+    /// BOUNDING-ORACLE stub for `populate_subchunk_windows`
+    /// (GZIPPY_PERTURB_SKIP_APPLYWINDOW). Skips the per-subchunk 32 KiB window
+    /// copy + sparsity mask + compression, substituting ONE shared cheap
+    /// zero-window so the window-publish chain does not starve (process still
+    /// completes; output is GARBAGE by design — bounding only).
+    #[cfg(parallel_sm)]
+    pub fn populate_subchunk_windows_stub(&mut self) {
+        const W: usize = 32768;
+        let compression = self.window_compression_type();
+        let stub = Arc::new(CompressedVector::from_bytes(&[0u8; W], compression));
+        for sc in self.subchunks.iter_mut() {
+            sc.used_window_symbols.clear();
+            sc.window = Some(Arc::clone(&stub));
+        }
+    }
+
     /// Literal port of `ChunkData::appendFooter`
     /// (vendor/rapidgzip/.../ChunkData.hpp:472-489). Records that a gzip
     /// stream ended at `end_bit_offset` (= byte position immediately

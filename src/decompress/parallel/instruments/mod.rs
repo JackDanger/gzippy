@@ -26,6 +26,8 @@ pub mod decode_bypass;
 #[cfg(parallel_sm)]
 pub mod memlife;
 #[cfg(parallel_sm)]
+pub mod markerpp_perturb;
+#[cfg(parallel_sm)]
 pub mod phase_timing;
 #[cfg(parallel_sm)]
 pub mod region_prof;
