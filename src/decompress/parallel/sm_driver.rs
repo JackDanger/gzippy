@@ -296,7 +296,11 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // CRC removal oracle: calculator disabled → total_crc is 0, so skip ONLY the
     // CRC verify (bytes/ISIZE still correct and verified).
     let crc_off_mode = crate::decompress::parallel::removal_oracle::crc_off_enabled();
-    if !sleep_mode && !nostore_mode {
+    // Gate-2 MARKER-WORK REMOVAL ORACLE: marker resolve+narrow+CRC skipped →
+    // output bytes are wrong and CRC cannot match. Skip verification so the run
+    // exits 0 and its WALL can be measured (NOT sha-verified — bounds the prize).
+    let marker_remove_mode = std::env::var_os("GZIPPY_PERTURB_MARKER_REMOVE").is_some();
+    if !sleep_mode && !nostore_mode && !marker_remove_mode {
         if total_size != expected_size {
             return Err(ReadParallelSmError::SizeMismatch {
                 expected: expected_size,

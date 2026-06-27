@@ -644,6 +644,19 @@ pub fn decompress_parallel<W: Write>(
                 bytes > 0 && fired > 0,
             );
         }
+        {
+            // Gate-2 marker-work perturbation fired-counter report (Gate-0c).
+            use crate::decompress::parallel::chunk_fetcher::{
+                MARKERWORK_EXTRA_PASSES, MARKER_REMOVE_FIRED,
+            };
+            let extra = MARKERWORK_EXTRA_PASSES.load(Ordering::Relaxed);
+            let removed = MARKER_REMOVE_FIRED.load(Ordering::Relaxed);
+            if extra > 0 || removed > 0 {
+                eprintln!(
+                    "[perturb_markerwork] extra_passes={extra} removal_oracle_chunks={removed}",
+                );
+            }
+        }
         if debug_enabled() {
             let total = t0.elapsed();
             let mbps = result.total_size as f64 / total.as_secs_f64() / 1e6;

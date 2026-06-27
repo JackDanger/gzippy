@@ -3122,6 +3122,83 @@ fn chunk_matches_consumer_pred(chunk: &ChunkData, consumer_pred_key: Option<usiz
     chunk.has_been_post_processed(false) && consumer_pred_key == chunk.resolved_pred_key
 }
 
+// ── Gate-2 marker-work perturbation (branch perturb/marker-work-gate2) ──────
+// Two env knobs, each with a grep-proven consumer below:
+//   GZIPPY_PERTURB_MARKERWORK=K  (K>=1, default 1): KNOWN-FACTOR slow injection.
+//     Repeats the marker resolve+narrow+CRC work K-1 EXTRA times into a scratch
+//     buffer that is discarded; the real production pass then runs unchanged, so
+//     output stays BYTE-IDENTICAL (sha_ok). K=2 adds ~1 marker-pass, K=3 ~2.
+//   GZIPPY_PERTURB_MARKER_REMOVE=1 : REMOVAL ORACLE. Skips the per-byte
+//     resolve+narrow+CRC entirely (output WILL be wrong — sha FAILS). Only for
+//     bounding the max recoverable wall prize. Window/subchunk publishing and
+//     state flags are kept intact so the pipeline does not hang.
+#[cfg(parallel_sm)]
+pub static MARKERWORK_EXTRA_PASSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(parallel_sm)]
+pub static MARKER_REMOVE_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(parallel_sm)]
+fn marker_work_factor() -> usize {
+    use std::sync::OnceLock;
+    static F: OnceLock<usize> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("GZIPPY_PERTURB_MARKERWORK")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(1)
+    })
+}
+
+#[cfg(parallel_sm)]
+fn marker_remove_enabled() -> bool {
+    use std::sync::OnceLock;
+    static R: OnceLock<bool> = OnceLock::new();
+    *R.get_or_init(|| std::env::var_os("GZIPPY_PERTURB_MARKER_REMOVE").is_some())
+}
+
+/// Repeat the marker resolve+narrow+CRC WORK `extra_passes` times against a
+/// throwaway scratch buffer (the production buffer is left untouched for the
+/// real pass that follows). Faithful to `resolve_and_narrow_segments_in_place`
+/// (one u8-LUT lookup per element) + `update_narrowed_crc` (CRC over the
+/// narrowed low bytes). `black_box` prevents the optimizer from eliding it.
+#[cfg(parallel_sm)]
+#[inline(never)]
+fn perturb_repeat_marker_work(chunk: &ChunkData, window: &[u8], extra_passes: usize) {
+    use std::sync::atomic::Ordering;
+    const MARKER_BASE: usize = 32768;
+    if extra_passes == 0 {
+        return;
+    }
+    // One-time snapshot of the PRE-resolution markers (does not scale with K).
+    let raw: Vec<u16> = chunk.data_with_markers.iter().collect();
+    if raw.is_empty() {
+        return;
+    }
+    // Same 64 KiB u8 LUT the production fused path builds.
+    let mut lut = [0u8; 65536];
+    for (i, slot) in lut[0..256].iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    let wlen = window.len().min(32768);
+    lut[MARKER_BASE..MARKER_BASE + wlen].copy_from_slice(&window[..wlen]);
+
+    let mut scratch: Vec<u8> = vec![0u8; raw.len()];
+    for _ in 0..extra_passes {
+        // resolve + narrow (mirror of resolve_and_narrow_segments_in_place)
+        for (i, &v) in raw.iter().enumerate() {
+            scratch[i] = lut[v as usize];
+        }
+        // narrowed CRC (mirror of update_narrowed_crc)
+        let mut crc = CRC32Calculator::new();
+        crc.update(&scratch);
+        std::hint::black_box(crc.crc32());
+        MARKERWORK_EXTRA_PASSES.fetch_add(1, Ordering::Relaxed);
+    }
+    std::hint::black_box(scratch.as_ptr());
+}
+
 /// Shared marker resolve body (`applyWindow` + narrow + subchunk windows + CRC).
 #[cfg(parallel_sm)]
 fn resolve_chunk_markers_on_chunk(
@@ -3139,6 +3216,30 @@ fn resolve_chunk_markers_on_chunk(
         crate::decompress::parallel::region_prof::R_MARKERPP_BYTES
             .fetch_add(dwm_len_pre as u64, std::sync::atomic::Ordering::Relaxed);
     }
+
+    // Gate-2 KNOWN-FACTOR injection: repeat resolve+narrow+CRC work K-1 extra
+    // times into a discarded scratch (output stays byte-identical).
+    let k = marker_work_factor();
+    if k > 1 && dwm_len_pre > 0 {
+        perturb_repeat_marker_work(chunk, predecessor_window, k - 1);
+    }
+
+    // Gate-2 REMOVAL ORACLE: skip the per-byte resolve+narrow+CRC entirely.
+    // Output WILL be wrong (sha fails) — this arm exists ONLY to bound the max
+    // recoverable wall prize. Subchunk windows + state flags are kept so the
+    // pipeline does not hang; narrowed_len is set so the consumer's iovec
+    // emission still runs over the (unresolved) marker bytes.
+    if marker_remove_enabled() {
+        if dwm_len_pre > 0 {
+            chunk.narrowed_len = dwm_len_pre;
+            MARKER_REMOVE_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        chunk.populate_subchunk_windows(predecessor_window);
+        chunk.markers_resolved = true;
+        chunk.resolved_pred_key = Some(pred_key);
+        return;
+    }
+
     if dwm_len_pre > 0 {
         // Always fused resolve+narrow (64 KiB u8 LUT, one pass). The old
         // sub-128Ki-element branch ran `resolve_markers_u16` (128 KiB u16 LUT)
