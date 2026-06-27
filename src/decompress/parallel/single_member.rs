@@ -186,6 +186,28 @@ const PARALLEL_RATIO_MAX_DEFAULT: u64 = 8;
 /// always-parallel-below-ratio_max behaviour, for A/B).
 const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 
+/// Output-size threshold (bytes) at/above which the cost-model crossover is
+/// lowered by one notch (see [`effective_parallel_threads`]). The parallel
+/// pipeline carries a roughly FIXED per-decode overhead (thread spawn, pipeline
+/// setup, the serial Amdahl tail). On a LARGE output that fixed cost is a small
+/// fraction of the serial work (B/S → 0), so the real crossover sits ~1 thread
+/// BELOW the ISIZE-ratio proxy; on a SMALL output the same fixed cost is a large
+/// fraction (B/S large) and pushes the crossover ABOVE the proxy. The pure
+/// ISIZE-ratio model can't separate these (silesia ratio 3.1 and monorepo ratio
+/// 5.18 both round to a too-high crossover for silesia while monorepo genuinely
+/// needs the high one). Gated (Intel, N≥11, parallel-vs-serial-vs-rapidgzip):
+///   silesia  212 MiB out, ratio 3.1  → parallel first beats serial at T3 (proxy
+///                                       said 4) → 1-notch bonus routes T3 parallel
+///   squishy  480 MiB out, ratio 2.76 → first beats serial at T2 (proxy said 3)
+///   monorepo  51 MiB out, ratio 5.18 → first beats serial at T7 (proxy said 6);
+///                                       BELOW the threshold ⇒ NO bonus (correct)
+/// Conservative by construction: the bonus only fires for clearly-large outputs
+/// where the parallel arm at `crossover-1` still beats single-thread igzip by a
+/// wide margin (silesia T3 516 ≪ igzip ~686; squishy T2 1184 ≪ igzip ~1215), so
+/// it can never manufacture an igzip regression. Override with
+/// `GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES` (gate-tunable; `0` disables the bonus).
+const PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT: u64 = 128 * 1024 * 1024;
+
 /// Counter proving the serial-clean cost-model selector fired on a real decode
 /// (deletion-trap discipline; read by the routing test). Distinct from the hard
 /// ratio cap so the two effects can be told apart in a trace.
@@ -273,7 +295,21 @@ pub(crate) fn effective_parallel_threads(
     if margin > 0.0 {
         // ratio as f64 (deflate_len > 0 guaranteed above); crossover = ceil(ratio*margin).
         let ratio = isize_field as f64 / deflate_len as f64;
-        let crossover = (ratio * margin).ceil();
+        let mut crossover = (ratio * margin).ceil();
+        // LARGE-OUTPUT BONUS: a large output amortizes the parallel pipeline's
+        // FIXED overhead (B/S → 0), so its real crossover is ~1 notch below the
+        // ISIZE-ratio proxy. Lower the crossover by one for outputs at/above the
+        // threshold (kept ≥ 1). The small-output case (where fixed overhead is a
+        // large fraction → the proxy under-estimates the crossover) is left as-is,
+        // which is exactly what the gated data wants (monorepo keeps its higher
+        // crossover). See [`PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT`].
+        let large_output_bytes = std::env::var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT);
+        if large_output_bytes > 0 && isize_field >= large_output_bytes && crossover > 1.0 {
+            crossover -= 1.0;
+        }
         if (num_threads as f64) < crossover {
             SERIAL_CLEAN_FLOOR_APPLIED.fetch_add(1, Ordering::Relaxed);
             return 1;
@@ -673,6 +709,38 @@ mod tests {
         assert_eq!(effective_parallel_threads(&blob, deflate_len, 6), 6);
 
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+    }
+
+    #[test]
+    fn serial_clean_selector_large_output_bonus() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Default margin, default 128 MiB large-output threshold.
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
+
+        // LARGE output (200 MiB), ratio 3.1 (< hard cap 8). Proxy crossover =
+        // ceil(3.1) = 4, but the large-output bonus lowers it to 3 → T3 parallel,
+        // T2 serial. (silesia-shaped: 212 MiB out, ratio 3.1 → first wins at T3.)
+        let big_out = 200 * 1024 * 1024u32;
+        let big_deflate = (big_out as f64 / 3.1) as usize; // ratio 3.1
+        let big = blob_with_isize(big_out);
+        assert_eq!(effective_parallel_threads(&big, big_deflate, 2), 1); // serial
+        assert_eq!(effective_parallel_threads(&big, big_deflate, 3), 3); // parallel
+        assert_eq!(effective_parallel_threads(&big, big_deflate, 4), 4);
+
+        // SMALL output (50 MiB), same ratio 3.1: below the threshold → NO bonus →
+        // crossover stays 4 → T3 still serial, T4 parallel. (monorepo-shaped: the
+        // fixed overhead is a large fraction, so the proxy crossover is correct.)
+        let small_out = 50 * 1024 * 1024u32;
+        let small_deflate = (small_out as f64 / 3.1) as usize;
+        let small = blob_with_isize(small_out);
+        assert_eq!(effective_parallel_threads(&small, small_deflate, 3), 1); // serial
+        assert_eq!(effective_parallel_threads(&small, small_deflate, 4), 4); // parallel
+
+        // Bonus disabled via env (0) → large output behaves like the proxy again.
+        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "0");
+        assert_eq!(effective_parallel_threads(&big, big_deflate, 3), 1); // serial (no bonus)
+        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
     }
 
     #[test]
