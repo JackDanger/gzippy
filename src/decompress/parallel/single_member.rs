@@ -177,6 +177,21 @@ pub(crate) fn t1_output_resident_chunk(gzip_data: &[u8], deflate_data_len: usize
 /// sweep). Rationale + measurements in [`effective_parallel_threads`].
 const PARALLEL_RATIO_MAX_DEFAULT: u64 = 8;
 
+/// Default crossover-margin multiplier for the serial-clean cost-model selector
+/// (see [`effective_parallel_threads`]). The predicted parallel work-inflation
+/// W ≈ ISIZE/deflate ratio; parallel only repays at `T >= ceil(W * margin)`.
+/// `margin = 1.0` reproduces the gated per-corpus crossovers (silesia ratio
+/// 2.75 → T3, monorepo → T6, storedheavy → T7-8). Override with
+/// `GZIPPY_PARALLEL_CROSSOVER_MARGIN`; `0` disables the selector (legacy
+/// always-parallel-below-ratio_max behaviour, for A/B).
+const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
+
+/// Counter proving the serial-clean cost-model selector fired on a real decode
+/// (deletion-trap discipline; read by the routing test). Distinct from the hard
+/// ratio cap so the two effects can be told apart in a trace.
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub static SERIAL_CLEAN_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
+
 /// Counter proving the compressibility thread-cap fired on a real decode
 /// (deletion-trap discipline; read by the routing test).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
@@ -225,10 +240,46 @@ pub(crate) fn effective_parallel_threads(
     // ratio = isize/deflate >= ratio_max  ⟺  isize >= ratio_max*deflate (no division)
     if isize_field >= ratio_max.saturating_mul(deflate_len) {
         COMPRESSIBILITY_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
-        1
-    } else {
-        num_threads
+        return 1;
     }
+
+    // SERIAL-CLEAN COST-MODEL SELECTOR (the low-T monotonicity fix).
+    //
+    // Below the hard ratio cap the parallel pipeline is still NOT free: it does
+    // W ≈ (ISIZE/deflate ratio)× more total CPU work than the serial-clean
+    // thin-T1 driver, because marker-RESOLUTION + apply_window + per-chunk
+    // SCAFFOLD are OUTPUT-proportional and under-amortized at low T (gated,
+    // T2-MECHANISM-2026-06-26, Intel: parallel does 2.25× silesia – 4.75×
+    // monorepo more work than serial-clean; the decode kernel itself is K≈1.0).
+    // Predicted parallel speedup ≈ T / W, so parallel only repays once
+    //     T >= ceil(W * margin)         (W taken as the ISIZE/deflate ratio).
+    // `ceil(ratio)` reproduces the measured per-corpus crossovers (silesia
+    // ratio 2.75 → first wins at T3; monorepo → T6; storedheavy → T7-8; nasa /
+    // low-ratio → wins at every T≥2), and is conservative by construction
+    // (rounds UP → stays serial one notch longer). Below the crossover we route
+    // to the serial-clean thin-T1 driver (return 1 → the `parallelization<=1`
+    // path in `read_parallel_sm`), which returns to ~1.02-1.07× of gz-T1 — and
+    // gz-T1 already BEATS single-thread igzip, so the floor is a WIN, not a tie.
+    //
+    // The asymmetry licenses the conservatism: misrouting a cell to PARALLEL
+    // below its crossover REGRESSES it below T1 (loses to single-thread igzip);
+    // misrouting to SERIAL at worst ties gz-T1 (still a win). `margin` is the
+    // gate-tunable safety knob; `0` disables this selector entirely (A/B).
+    let margin = std::env::var("GZIPPY_PARALLEL_CROSSOVER_MARGIN")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|m| m.is_finite() && *m >= 0.0)
+        .unwrap_or(PARALLEL_CROSSOVER_MARGIN_DEFAULT);
+    if margin > 0.0 {
+        // ratio as f64 (deflate_len > 0 guaranteed above); crossover = ceil(ratio*margin).
+        let ratio = isize_field as f64 / deflate_len as f64;
+        let crossover = (ratio * margin).ceil();
+        if (num_threads as f64) < crossover {
+            SERIAL_CLEAN_FLOOR_APPLIED.fetch_add(1, Ordering::Relaxed);
+            return 1;
+        }
+    }
+    num_threads
 }
 
 /// Counter incremented every time `adjusted_chunk_size_bytes` returns a
@@ -557,6 +608,10 @@ impl std::fmt::Display for ParallelError {
 mod tests {
     use super::*;
 
+    /// Serializes the two tests that read/mutate `GZIPPY_PARALLEL_CROSSOVER_MARGIN`
+    /// (process-global) so they never observe each other's writes.
+    static SELECTOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// ISIZE/deflate ratio gate: highly-compressible single-member caps to one
     /// thread (the inline T1 path) so Tmax never regresses below T1; moderately
     /// compressible keeps the requested threads. Builds a minimal blob whose
@@ -569,6 +624,7 @@ mod tests {
 
     #[test]
     fn compressibility_cap_serializes_high_ratio_keeps_low_ratio() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let deflate_len = 1_000_000usize;
         // ratio 20x (>= default 8) → cap to 1 thread.
         let high = blob_with_isize(20_000_000);
@@ -584,6 +640,39 @@ mod tests {
         // just under (7.99x) keeps.
         let under = blob_with_isize(7_990_000);
         assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+    }
+
+    #[test]
+    fn serial_clean_selector_crossover_and_margin() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Single sequential test: the margin env var is process-global, so all
+        // env-dependent assertions live here (no concurrent test reads it).
+        let deflate_len = 1_000_000usize;
+
+        // Default margin 1.0, ratio 3× (< hard cap 8): crossover = ceil(3.0) = 3.
+        let blob = blob_with_isize(3_000_000);
+        // T below crossover → serial-clean floor (1 thread).
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 2), 1);
+        // T at/above crossover → parallel keeps the requested threads.
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 3), 3);
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 8), 8);
+
+        // Non-integer ratio rounds UP (conservative): ratio 2.75× → crossover 3.
+        let blob275 = blob_with_isize(2_750_000);
+        assert_eq!(effective_parallel_threads(&blob275, deflate_len, 2), 1);
+        assert_eq!(effective_parallel_threads(&blob275, deflate_len, 3), 3);
+
+        // margin 0 disables the selector → keep threads (legacy below-cap behaviour).
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 2), 2);
+
+        // Larger margin pushes the crossover up (more conservative): margin 2.0,
+        // ratio 3 → crossover 6 → T4 now serial, T6 parallel.
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "2.0");
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 4), 1);
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 6), 6);
+
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
     #[test]
