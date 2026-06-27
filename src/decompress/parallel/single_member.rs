@@ -186,6 +186,14 @@ const PARALLEL_RATIO_MAX_DEFAULT: u64 = 8;
 /// always-parallel-below-ratio_max behaviour, for A/B).
 const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 
+/// AMD/Zen crossover-margin default. Zen2's per-chunk parallel overhead is higher
+/// than Raptor Lake, so the marginal-parallelism crossover sits one notch higher;
+/// `margin = 1.6` (crossover `ceil(ratio·1.6)`) is the GATED value that erases the
+/// Zen2 monorepo-T6/T8 default-constant regression (AMD/Zen2, N=11, load-immune
+/// interleaved paired ratios, plans/XARCH-CONCURRENCY-LAW-2026-06-26.md). Selected
+/// at runtime by [`cpu_is_amd`]; overridable via `GZIPPY_PARALLEL_CROSSOVER_MARGIN`.
+const PARALLEL_CROSSOVER_MARGIN_AMD: f64 = 1.6;
+
 /// Output-size threshold (bytes) at/above which the cost-model crossover is
 /// lowered by one notch (see [`effective_parallel_threads`]). The parallel
 /// pipeline carries a roughly FIXED per-decode overhead (thread spawn, pipeline
@@ -207,6 +215,66 @@ const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 /// it can never manufacture an igzip regression. Override with
 /// `GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES` (gate-tunable; `0` disables the bonus).
 const PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT: u64 = 128 * 1024 * 1024;
+
+/// AMD/Zen large-output-bonus default. On Zen2 the −1 crossover bonus is
+/// net-NEGATIVE for ratio≈2.7 corpora (squishy-T2 parallel 676 > serial 651, and
+/// loses to single-thread igzip 1.013) — Zen2's parallel pipeline does not amortize
+/// the fixed overhead the way Raptor Lake does at the knee. GATED: bonus OFF (`0`)
+/// fixes squishy-T2 (676→653, beats igzip+rg) with no other AMD cell harmed
+/// (plans/XARCH-CONCURRENCY-LAW-2026-06-26.md). Selected at runtime by
+/// [`cpu_is_amd`]; overridable via `GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES`.
+const PARALLEL_LARGE_OUTPUT_BYTES_AMD: u64 = 0;
+
+/// Runtime CPU-vendor detection for the arch-dispatched selector constants.
+/// AMD (Zen) needs a higher crossover margin AND the large-output bonus OFF
+/// (both GATED on Zen2 — see [`PARALLEL_CROSSOVER_MARGIN_AMD`] /
+/// [`PARALLEL_LARGE_OUTPUT_BYTES_AMD`]); Intel and every other arch keep the
+/// Raptor-Lake-gated `margin = 1.0` + bonus on (arm64 decode CI-green with those).
+/// The dispatch is by VENDOR (`AuthenticAMD`), the deterministic signal; it only
+/// changes the parallel THREAD-COUNT routing (byte-identical output). `cpuid`
+/// leaf 0 is read once and cached.
+#[cfg(target_arch = "x86_64")]
+fn cpu_is_amd() -> bool {
+    use std::sync::OnceLock;
+    static IS_AMD: OnceLock<bool> = OnceLock::new();
+    *IS_AMD.get_or_init(|| {
+        // SAFETY: cpuid leaf 0 (vendor string) is available on every x86_64 CPU.
+        let v = unsafe { std::arch::x86_64::__cpuid(0) };
+        // Vendor string lives in EBX, EDX, ECX (in that order) — 12 bytes.
+        let mut vendor = [0u8; 12];
+        vendor[0..4].copy_from_slice(&v.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&v.edx.to_le_bytes());
+        vendor[8..12].copy_from_slice(&v.ecx.to_le_bytes());
+        &vendor == b"AuthenticAMD"
+    })
+}
+
+/// Non-x86_64 arches (aarch64) keep the Intel/Raptor-Lake defaults — the selector
+/// is arch-independent and arm64 decode is CI-green with `margin = 1.0` + bonus on.
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_is_amd() -> bool {
+    false
+}
+
+/// Arch-dispatched default crossover margin (env override takes precedence).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+fn arch_crossover_margin_default() -> f64 {
+    if cpu_is_amd() {
+        PARALLEL_CROSSOVER_MARGIN_AMD
+    } else {
+        PARALLEL_CROSSOVER_MARGIN_DEFAULT
+    }
+}
+
+/// Arch-dispatched default large-output bonus threshold (env override takes precedence).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+fn arch_large_output_bytes_default() -> u64 {
+    if cpu_is_amd() {
+        PARALLEL_LARGE_OUTPUT_BYTES_AMD
+    } else {
+        PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT
+    }
+}
 
 /// Counter proving the serial-clean cost-model selector fired on a real decode
 /// (deletion-trap discipline; read by the routing test). Distinct from the hard
@@ -291,7 +359,7 @@ pub(crate) fn effective_parallel_threads(
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|m| m.is_finite() && *m >= 0.0)
-        .unwrap_or(PARALLEL_CROSSOVER_MARGIN_DEFAULT);
+        .unwrap_or_else(arch_crossover_margin_default);
     if margin > 0.0 {
         // ratio as f64 (deflate_len > 0 guaranteed above); crossover = ceil(ratio*margin).
         let ratio = isize_field as f64 / deflate_len as f64;
@@ -306,7 +374,7 @@ pub(crate) fn effective_parallel_threads(
         let large_output_bytes = std::env::var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT);
+            .unwrap_or_else(arch_large_output_bytes_default);
         if large_output_bytes > 0 && isize_field >= large_output_bytes && crossover > 1.0 {
             crossover -= 1.0;
         }
@@ -661,6 +729,10 @@ mod tests {
     #[test]
     fn compressibility_cap_serializes_high_ratio_keeps_low_ratio() {
         let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Pin the selector margin so the assertions are arch-independent (the
+        // arch-dispatched default is 1.6 on AMD vs 1.0 on Intel — this test
+        // exercises the HARD ratio cap, not the per-arch crossover tune).
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
         let deflate_len = 1_000_000usize;
         // ratio 20x (>= default 8) → cap to 1 thread.
         let high = blob_with_isize(20_000_000);
@@ -676,6 +748,7 @@ mod tests {
         // just under (7.99x) keeps.
         let under = blob_with_isize(7_990_000);
         assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
     #[test]
@@ -683,9 +756,12 @@ mod tests {
         let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Single sequential test: the margin env var is process-global, so all
         // env-dependent assertions live here (no concurrent test reads it).
+        // Pin margin=1.0 so the crossover assertions are arch-independent (the
+        // default is 1.6 on AMD).
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
         let deflate_len = 1_000_000usize;
 
-        // Default margin 1.0, ratio 3× (< hard cap 8): crossover = ceil(3.0) = 3.
+        // Margin 1.0, ratio 3× (< hard cap 8): crossover = ceil(3.0) = 3.
         let blob = blob_with_isize(3_000_000);
         // T below crossover → serial-clean floor (1 thread).
         assert_eq!(effective_parallel_threads(&blob, deflate_len, 2), 1);
@@ -714,9 +790,10 @@ mod tests {
     #[test]
     fn serial_clean_selector_large_output_bonus() {
         let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Default margin, default 128 MiB large-output threshold.
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
-        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
+        // Pin margin=1.0 + the 128 MiB bonus threshold so the assertions are
+        // arch-independent (AMD defaults are margin 1.6 + bonus OFF).
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "134217728");
 
         // LARGE output (200 MiB), ratio 3.1 (< hard cap 8). Proxy crossover =
         // ceil(3.1) = 4, but the large-output bonus lowers it to 3 → T3 parallel,
@@ -741,6 +818,48 @@ mod tests {
         std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "0");
         assert_eq!(effective_parallel_threads(&big, big_deflate, 3), 1); // serial (no bonus)
         std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+    }
+
+    #[test]
+    fn arch_dispatch_defaults_match_vendor() {
+        // The arch-dispatched defaults must follow the detected CPU vendor: AMD
+        // gets the Zen2-gated margin 1.6 + bonus OFF; everything else keeps the
+        // Raptor-Lake margin 1.0 + 128 MiB bonus. Detection is deterministic
+        // (cpuid leaf 0), so this is a stable invariant on whatever host runs it.
+        if cpu_is_amd() {
+            assert_eq!(
+                arch_crossover_margin_default(),
+                PARALLEL_CROSSOVER_MARGIN_AMD
+            );
+            assert_eq!(
+                arch_large_output_bytes_default(),
+                PARALLEL_LARGE_OUTPUT_BYTES_AMD
+            );
+            assert_eq!(arch_large_output_bytes_default(), 0); // bonus disabled on Zen
+        } else {
+            assert_eq!(
+                arch_crossover_margin_default(),
+                PARALLEL_CROSSOVER_MARGIN_DEFAULT
+            );
+            assert_eq!(
+                arch_large_output_bytes_default(),
+                PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT
+            );
+        }
+    }
+
+    #[test]
+    fn arch_dispatch_env_override_wins_over_arch_default() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Even on AMD (default margin 1.6), an explicit env override must take
+        // precedence — proves the env knob still works as the documented override.
+        let deflate_len = 1_000_000usize;
+        let blob = blob_with_isize(3_000_000); // ratio 3.0
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        // margin 1.0, ratio 3 → crossover 3 → T3 parallel regardless of host arch.
+        assert_eq!(effective_parallel_threads(&blob, deflate_len, 3), 3);
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
     #[test]
