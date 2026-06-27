@@ -3140,14 +3140,19 @@ fn resolve_chunk_markers_on_chunk(
             .fetch_add(dwm_len_pre as u64, std::sync::atomic::Ordering::Relaxed);
     }
     if dwm_len_pre > 0 {
-        // Always fused resolve+narrow (64 KiB u8 LUT, one pass). The old
-        // sub-128Ki-element branch ran `resolve_markers_u16` (128 KiB u16 LUT)
-        // plus a second narrow pass — Fulcrum T8 showed +411ms wall-critical
-        // vs rapidgzip in marker-resolve despite only 6/35 chunks on that path.
+        // Always fused resolve+narrow+CRC (64 KiB u8 LUT, ONE traversal). The
+        // old sub-128Ki-element branch ran `resolve_markers_u16` (128 KiB u16
+        // LUT) plus a second narrow pass — Fulcrum T8 showed +411ms
+        // wall-critical vs rapidgzip in marker-resolve despite only 6/35 chunks
+        // on that path. The narrowed-CRC second touch is now folded INTO the
+        // resolve+narrow pass (byte-exact, universal, strict work reduction):
+        // each segment's narrowed bytes are CRC'd while hot in cache instead of
+        // re-read in a separate `update_narrowed_crc` whole-buffer pass.
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        chunk.resolve_and_narrow_markers_in_place(predecessor_window);
+        chunk.resolve_and_narrow_markers_in_place_crc(predecessor_window);
     }
-    chunk.update_narrowed_crc();
+    // CRC folded above for the marker path; when `dwm_len_pre == 0` there are no
+    // narrowed bytes (`narrowed_len == 0`), so there is nothing to CRC here.
     // Vendor `applyWindow` = narrow (DecodedData.hpp:325-363) → swap + in-place
     // VectorViews (:365-388). There is NO output-size copy: rapidgzip's narrowed
     // marker buffers ARE the output views, recycled when `writeAll` completes.
