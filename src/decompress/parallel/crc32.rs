@@ -155,9 +155,21 @@ pub fn combine_crc32(crc1: u32, crc2: u32, byte_stream_length: u64) -> u32 {
 pub(crate) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
-        if hw_crc::available() && !crc_legacy() {
-            // SAFETY: gated on runtime `crc` feature detection.
-            return unsafe { hw_crc::fold3(crc, data) };
+        if !crc_legacy() {
+            // PMULL carry-less fold (libdeflate crc32_arm_pmullx12 structure):
+            // PMULL is a SEPARATE execution resource from the `crc32x` unit on
+            // Apple Silicon, so a multi-accumulator PMULL fold can exceed the
+            // 1-crc32x/cycle ceiling that bounds `fold3`. Default ON when the
+            // CPU has BOTH the `aes` (PMULL) and `crc` extensions; force OFF for
+            // a one-binary A/B with `GZIPPY_CRC_PMULL=0`.
+            if hw_pmull::available() && crc_pmull_enabled() {
+                // SAFETY: gated on runtime `aes`+`crc` feature detection.
+                return unsafe { hw_pmull::crc32_arm_pmull(crc, data) };
+            }
+            if hw_crc::available() {
+                // SAFETY: gated on runtime `crc` feature detection.
+                return unsafe { hw_crc::fold3(crc, data) };
+            }
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -186,6 +198,17 @@ fn crc_legacy() -> bool {
             Some("1")
         )
     })
+}
+
+/// `GZIPPY_CRC_PMULL=0` forces the `crc32x` 3-way fold (`hw_crc::fold3`) so the
+/// PMULL fold stays re-verifiable by a one-binary A/B (controls for build
+/// variance). Read once. Default ON = PMULL fold when `aes`+`crc` are present.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn crc_pmull_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| !matches!(std::env::var("GZIPPY_CRC_PMULL").ok().as_deref(), Some("0")))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -256,6 +279,222 @@ mod hw_crc {
         let abc = combine_crc32(ab, fc, block as u64);
         // Tail past the three equal thirds.
         fold1(abc, &data[3 * block..])
+    }
+}
+
+// =====================================================================
+// aarch64 PMULL carry-less CRC32 fold (libdeflate crc32_arm_pmullx12 port).
+// =====================================================================
+//
+// GATE motivation (M1, 2026-06-28): gz's arm64 CRC = `hw_crc::fold3`, three
+// interleaved `crc32x` chains, bounded by the M1's 1-crc32x/cycle throughput.
+// libdeflate uses PMULL (carry-less multiply, a SEPARATE execution resource on
+// Apple Silicon) folding 192 bytes (12 independent 128-bit accumulators) per
+// iteration, then a `crc32x` reduction of the final 128-bit accumulator + tail.
+// This is a faithful port of libdeflate's `crc32_arm` extra-wide template
+// (vendor/libdeflate/lib/arm/crc32_pmull_wide.h, stride 12) — the variant
+// libdeflate itself selects for the M1. The pointer-alignment step is omitted
+// (we use unaligned 128-bit loads, equally correct: CRC is a function of bytes,
+// not of how they are blocked), so the result is byte-identical to crc32fast,
+// pinned by the differential test across sizes/alignments/seeds.
+//
+// Fold multipliers are x^N mod G(x) (reflected gzip generator), N = 128·D ± 31/33
+// for a D-vector fold, derived at COMPILE TIME by the same `x_power_modulo`
+// routine that builds `combine_crc32`, and asserted to reproduce libdeflate's
+// published `crc32_multipliers.h` constants — no magic numbers trusted unverified.
+#[cfg(target_arch = "aarch64")]
+mod hw_pmull {
+    use super::x_power_modulo as xpow;
+    use core::arch::aarch64::{__crc32b, __crc32d, __crc32h, __crc32w, vmull_p64};
+    use std::sync::OnceLock;
+
+    #[inline]
+    pub fn available() -> bool {
+        static A: OnceLock<bool> = OnceLock::new();
+        *A.get_or_init(|| {
+            std::arch::is_aarch64_feature_detected!("aes")
+                && std::arch::is_aarch64_feature_detected!("crc")
+        })
+    }
+
+    // ---- compile-time fold-multiplier derivation (reflected GF(2)) ----
+    // For a D-vector (D·16-byte) fold the reflected multiplier pair is
+    // {low = x^(128·D + 31) mod G, high = x^(128·D − 33) mod G}.
+    const fn m(d: u64) -> (u64, u64) {
+        (xpow(128 * d + 31) as u64, xpow(128 * d - 33) as u64)
+    }
+    const M12: (u64, u64) = m(12);
+    const M6: (u64, u64) = m(6);
+    const M4: (u64, u64) = m(4);
+    const M3: (u64, u64) = m(3);
+    const M2: (u64, u64) = m(2);
+    const M1: (u64, u64) = m(1);
+
+    // Assert the derived multipliers reproduce libdeflate's published
+    // crc32_multipliers.h constants (provenance: each is `x^N mod G(x)`).
+    const _: () = {
+        assert!(M12.0 == 0x596c8d81 && M12.1 == 0xf5e48c85); // X1567 / X1503
+        assert!(M6.0 == 0xdf068dc2 && M6.1 == 0x57c54819); // X799  / X735
+        assert!(M4.0 == 0x8f352d95 && M4.1 == 0x1d9513d7); // X543  / X479
+        assert!(M3.0 == 0x3db1ecdc && M3.1 == 0xaf449247); // X415  / X351
+        assert!(M2.0 == 0xf1da05aa && M2.1 == 0x81256527); // X287  / X223
+        assert!(M1.0 == 0xae689191 && M1.1 == 0xccaa009e); // X159  / X95
+    };
+
+    /// Load 16 unaligned bytes as a little-endian 128-bit polynomial
+    /// (lane0 = first 8 bytes, lane1 = next 8 bytes — matches `vld1q_u8`).
+    #[inline(always)]
+    unsafe fn ld(p: *const u8) -> u128 {
+        (p as *const u128).read_unaligned()
+    }
+
+    /// libdeflate `fold_vec`: reflected fold of `src` (one 16-byte vector)
+    /// `mult` distance ahead into `dst`:
+    ///   clmul(src.lo, mult.lo) ^ clmul(src.hi, mult.hi) ^ dst.
+    #[inline]
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn fold(src: u128, dst: u128, mult: (u64, u64)) -> u128 {
+        let lo = vmull_p64(src as u64, mult.0);
+        let hi = vmull_p64((src >> 64) as u64, mult.1);
+        lo ^ hi ^ dst
+    }
+
+    /// Reduce a final 128-bit accumulator to 32 bits via two `crc32x`.
+    #[inline]
+    #[target_feature(enable = "crc")]
+    unsafe fn reduce128(crc: u32, v: u128) -> u32 {
+        let c = __crc32d(crc, v as u64);
+        __crc32d(c, (v >> 64) as u64)
+    }
+
+    /// Continue the finalized gzip CRC32 `crc_in` over `data`, byte-identical to
+    /// `crc32fast`, via the PMULL extra-wide fold. Internal (`!crc`) domain
+    /// throughout; inverted at the boundaries like `fold3`.
+    #[target_feature(enable = "neon,aes,crc")]
+    pub unsafe fn crc32_arm_pmull(crc_in: u32, data: &[u8]) -> u32 {
+        let mut crc = !crc_in;
+        let mut p = data.as_ptr();
+        let mut len = data.len();
+
+        if len >= 3 * 192 {
+            // ----- extra-wide path: 12 independent 128-bit accumulators -----
+            let mut v0 = ld(p) ^ (crc as u128);
+            let mut v1 = ld(p.add(16));
+            let mut v2 = ld(p.add(32));
+            let mut v3 = ld(p.add(48));
+            let mut v4 = ld(p.add(64));
+            let mut v5 = ld(p.add(80));
+            let mut v6 = ld(p.add(96));
+            let mut v7 = ld(p.add(112));
+            let mut v8 = ld(p.add(128));
+            let mut v9 = ld(p.add(144));
+            let mut v10 = ld(p.add(160));
+            let mut v11 = ld(p.add(176));
+            p = p.add(192);
+            len -= 192;
+            while len >= 192 {
+                v0 = fold(v0, ld(p), M12);
+                v1 = fold(v1, ld(p.add(16)), M12);
+                v2 = fold(v2, ld(p.add(32)), M12);
+                v3 = fold(v3, ld(p.add(48)), M12);
+                v4 = fold(v4, ld(p.add(64)), M12);
+                v5 = fold(v5, ld(p.add(80)), M12);
+                v6 = fold(v6, ld(p.add(96)), M12);
+                v7 = fold(v7, ld(p.add(112)), M12);
+                v8 = fold(v8, ld(p.add(128)), M12);
+                v9 = fold(v9, ld(p.add(144)), M12);
+                v10 = fold(v10, ld(p.add(160)), M12);
+                v11 = fold(v11, ld(p.add(176)), M12);
+                p = p.add(192);
+                len -= 192;
+            }
+            // Fold v0..v11 down to v0, consuming up to 144 more bytes.
+            v0 = fold(v0, v6, M6);
+            v1 = fold(v1, v7, M6);
+            v2 = fold(v2, v8, M6);
+            v3 = fold(v3, v9, M6);
+            v4 = fold(v4, v10, M6);
+            v5 = fold(v5, v11, M6);
+            if len >= 96 {
+                v0 = fold(v0, ld(p), M6);
+                v1 = fold(v1, ld(p.add(16)), M6);
+                v2 = fold(v2, ld(p.add(32)), M6);
+                v3 = fold(v3, ld(p.add(48)), M6);
+                v4 = fold(v4, ld(p.add(64)), M6);
+                v5 = fold(v5, ld(p.add(80)), M6);
+                p = p.add(96);
+                len -= 96;
+            }
+            v0 = fold(v0, v3, M3);
+            v1 = fold(v1, v4, M3);
+            v2 = fold(v2, v5, M3);
+            if len >= 48 {
+                v0 = fold(v0, ld(p), M3);
+                v1 = fold(v1, ld(p.add(16)), M3);
+                v2 = fold(v2, ld(p.add(32)), M3);
+                p = p.add(48);
+                len -= 48;
+            }
+            v0 = fold(v0, v1, M1);
+            v0 = fold(v0, v2, M1);
+            crc = reduce128(0, v0);
+        } else if len >= 64 {
+            // ----- medium path: 4 accumulators, 64 bytes/iter -----
+            let mut v0 = ld(p) ^ (crc as u128);
+            let mut v1 = ld(p.add(16));
+            let mut v2 = ld(p.add(32));
+            let mut v3 = ld(p.add(48));
+            p = p.add(64);
+            len -= 64;
+            while len >= 64 {
+                v0 = fold(v0, ld(p), M4);
+                v1 = fold(v1, ld(p.add(16)), M4);
+                v2 = fold(v2, ld(p.add(32)), M4);
+                v3 = fold(v3, ld(p.add(48)), M4);
+                p = p.add(64);
+                len -= 64;
+            }
+            v0 = fold(v0, v2, M2);
+            v1 = fold(v1, v3, M2);
+            if len >= 32 {
+                v0 = fold(v0, ld(p), M2);
+                v1 = fold(v1, ld(p.add(16)), M2);
+                p = p.add(32);
+                len -= 32;
+            }
+            v0 = fold(v0, v1, M1);
+            crc = reduce128(0, v0);
+        }
+
+        // ----- tail (< 64 bytes remaining) via crc32x instructions -----
+        if len & 32 != 0 {
+            crc = __crc32d(crc, (p as *const u64).read_unaligned());
+            crc = __crc32d(crc, (p.add(8) as *const u64).read_unaligned());
+            crc = __crc32d(crc, (p.add(16) as *const u64).read_unaligned());
+            crc = __crc32d(crc, (p.add(24) as *const u64).read_unaligned());
+            p = p.add(32);
+        }
+        if len & 16 != 0 {
+            crc = __crc32d(crc, (p as *const u64).read_unaligned());
+            crc = __crc32d(crc, (p.add(8) as *const u64).read_unaligned());
+            p = p.add(16);
+        }
+        if len & 8 != 0 {
+            crc = __crc32d(crc, (p as *const u64).read_unaligned());
+            p = p.add(8);
+        }
+        if len & 4 != 0 {
+            crc = __crc32w(crc, (p as *const u32).read_unaligned());
+            p = p.add(4);
+        }
+        if len & 2 != 0 {
+            crc = __crc32h(crc, (p as *const u16).read_unaligned());
+            p = p.add(2);
+        }
+        if len & 1 != 0 {
+            crc = __crc32b(crc, *p);
+        }
+        !crc
     }
 }
 
@@ -642,6 +881,132 @@ pub fn crc32(buffer: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BYTE-EXACT pin for the aarch64 PMULL fold: `hw_pmull::crc32_arm_pmull`
+    /// MUST equal crc32fast (the trusted oracle) AND `hw_crc::fold3` across every
+    /// size that exercises the extra-wide (≥576 B), medium (64–575 B), and
+    /// crc32x-tail paths, at every head/tail misalignment and seed. A fast CRC
+    /// with wrong checksums is a FAIL, so this is the gate the perf claim rides on.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn crc32_pmull_matches_crc32fast_and_fold3_all_sizes() {
+        if !hw_pmull::available() {
+            eprintln!("skip: no aes+crc on this aarch64 host");
+            return;
+        }
+        let mut big = vec![0u8; 200_000 + 64];
+        let mut x: u32 = 0x0BAD_F00D;
+        for b in big.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 16) as u8;
+        }
+        // Sizes straddle the 64-byte and 576-byte path thresholds, the 192/96/48
+        // wide-fold edges, the 64/32 medium edges, and every tail bit (32/16/8/4/2/1).
+        let sizes = [
+            0usize, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 33, 47, 48, 63, 64, 65, 95, 96, 127, 128,
+            143, 144, 191, 192, 193, 287, 288, 383, 384, 575, 576, 577, 768, 1151, 1152, 1153,
+            4096, 9999, 65536, 131073, 200000,
+        ];
+        let seeds = [0u32, 1, 0xFFFF_FFFF, 0xDEAD_BEEF, 0x8000_0001, 0x0000_0001];
+        for &align in &[0usize, 1, 3, 5, 7, 8, 9] {
+            for &size in &sizes {
+                if align + size > big.len() {
+                    continue;
+                }
+                let data = &big[align..align + size];
+                for &seed in &seeds {
+                    let want = {
+                        let mut h = Hasher::new_with_initial(seed);
+                        h.update(data);
+                        h.finalize()
+                    };
+                    let pmull = unsafe { hw_pmull::crc32_arm_pmull(seed, data) };
+                    assert_eq!(
+                        pmull, want,
+                        "PMULL!=crc32fast size={size} align={align} seed={seed:#x}"
+                    );
+                    if hw_crc::available() {
+                        let f3 = unsafe { hw_crc::fold3(seed, data) };
+                        assert_eq!(
+                            pmull, f3,
+                            "PMULL!=fold3 size={size} align={align} seed={seed:#x}"
+                        );
+                    }
+                }
+            }
+        }
+        // Chained PMULL folds == single fold over the concatenation.
+        let parts = [
+            &big[0..7],
+            &big[7..600],
+            &big[600..50000],
+            &big[50000..131073],
+        ];
+        let mut running = 0u32;
+        for q in parts {
+            running = unsafe { hw_pmull::crc32_arm_pmull(running, q) };
+        }
+        let whole = unsafe { hw_pmull::crc32_arm_pmull(0, &big[0..131073]) };
+        assert_eq!(running, whole, "chained PMULL fold != single fold");
+    }
+
+    /// Standalone GB/s microbench: PMULL fold vs `crc32x` fold3 on M1.
+    /// IGNORED in normal runs; invoke with
+    ///   cargo test --release --no-default-features --features pure-rust-inflate \
+    ///     -- --ignored --nocapture crc_pmull_vs_crc32x_gbps
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn crc_pmull_vs_crc32x_gbps() {
+        if !hw_pmull::available() {
+            eprintln!("skip: no aes+crc");
+            return;
+        }
+        use std::time::Instant;
+        // ~4 MiB working set (cache-resident, the per-chunk CRC regime).
+        let n = 4 << 20;
+        let mut buf = vec![0u8; n];
+        let mut x: u32 = 0x1357_9BDF;
+        for b in buf.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 16) as u8;
+        }
+        let iters = 200usize;
+        // Warm + correctness cross-check before timing.
+        let a = unsafe { hw_pmull::crc32_arm_pmull(0, &buf) };
+        let b = unsafe { hw_crc::fold3(0, &buf) };
+        assert_eq!(a, b, "bench inputs disagree — refusing to report GB/s");
+
+        let bench = |f: &dyn Fn(u32, &[u8]) -> u32| -> f64 {
+            // best-of-7 to suppress scheduler noise. The running `acc` is fed
+            // back as the seed AND the buffer is black_box'd each iteration so
+            // the optimizer cannot CSE/hoist the pure call out of the loop
+            // (the phantom-GB/s trap). The seed dependency serializes calls.
+            let mut best = f64::INFINITY;
+            for _ in 0..7 {
+                let t = Instant::now();
+                let mut acc = 0u32;
+                for _ in 0..iters {
+                    acc = f(acc, std::hint::black_box(&buf));
+                }
+                std::hint::black_box(acc);
+                let s = t.elapsed().as_secs_f64();
+                if s < best {
+                    best = s;
+                }
+            }
+            (n as f64 * iters as f64) / best / 1e9
+        };
+        let pmull = bench(&|c, d| unsafe { hw_pmull::crc32_arm_pmull(c, d) });
+        let crc32x = bench(&|c, d| unsafe { hw_crc::fold3(c, d) });
+        eprintln!(
+            "CRC32 standalone microbench (M1, {} MiB x{iters}, best-of-7):",
+            n >> 20
+        );
+        eprintln!("  crc32x fold3  : {crc32x:7.2} GB/s");
+        eprintln!("  PMULL  fold12 : {pmull:7.2} GB/s");
+        eprintln!("  PMULL/crc32x  : {:.3}x", pmull / crc32x);
+    }
 
     /// The dispatched `crc32_fold` (aarch64 3-way `crc32x` interleave + tail,
     /// else crc32fast continuation) MUST equal crc32fast byte-for-byte across
