@@ -1599,8 +1599,8 @@ impl Block {
             return Ok(0);
         }
         // R_WORKER sub-partition: the ring/marker decode body. Exclusive of nested
-        // dist-table builds (subtracted via TL accumulator) → R_DECODE.
-        let _dec = crate::decompress::parallel::region_prof::DecodeSpan::new();
+        // dist-table builds (subtracted via TL accumulator) → R_DECODE (marker split).
+        let _dec = crate::decompress::parallel::region_prof::DecodeSpan::new_marker();
         let result = match self.compression_type {
             CompressionType::Reserved => Err(BlockError::InvalidCompression),
             CompressionType::Uncompressed => self.read_internal_uncompressed(bits, n_max_to_decode),
@@ -3278,8 +3278,8 @@ impl Block {
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
         // R_WORKER sub-partition: the clean contig decode body (post-flip / window-
-        // present). Exclusive of nested dist-table builds → R_DECODE.
-        let _dec = crate::decompress::parallel::region_prof::DecodeSpan::new();
+        // present). Exclusive of nested dist-table builds → R_DECODE (clean split).
+        let _dec = crate::decompress::parallel::region_prof::DecodeSpan::new_clean();
         debug_assert!(
             self.ring.is_clean(),
             "decode_clean_into_contig requires clean (window-primed) mode"

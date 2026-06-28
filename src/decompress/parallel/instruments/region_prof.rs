@@ -99,6 +99,14 @@ pub static R_TABLE_NESTED_INSTR: AtomicU64 = AtomicU64::new(0);
 pub static R_DECODE_CYC: AtomicU64 = AtomicU64::new(0);
 pub static R_DECODE_N: AtomicU64 = AtomicU64::new(0);
 pub static R_DECODE_INSTR: AtomicU64 = AtomicU64::new(0);
+// R_DECODE split: clean-contig body vs marker/ring body (gz-internal IPC only;
+// NOT matched gz-vs-rg). R_DECODE_CLEAN + R_DECODE_MARKER == R_DECODE.
+pub static R_DECODE_CLEAN_CYC: AtomicU64 = AtomicU64::new(0);
+pub static R_DECODE_CLEAN_INSTR: AtomicU64 = AtomicU64::new(0);
+pub static R_DECODE_CLEAN_N: AtomicU64 = AtomicU64::new(0);
+pub static R_DECODE_MARKER_CYC: AtomicU64 = AtomicU64::new(0);
+pub static R_DECODE_MARKER_INSTR: AtomicU64 = AtomicU64::new(0);
+pub static R_DECODE_MARKER_N: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static SUB_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -172,6 +180,7 @@ impl Drop for TableHeaderSpan {
 /// fired during this span (kept exclusive of R_TABLE).
 pub struct DecodeSpan {
     on: bool,
+    marker: bool,
     t0: u64,
     i0: u64,
     nested0: u64,
@@ -180,6 +189,20 @@ pub struct DecodeSpan {
 impl DecodeSpan {
     #[inline(always)]
     pub fn new() -> Self {
+        Self::new_kind(false)
+    }
+    /// Clean-contig decode body (`decode_clean_into_contig`).
+    #[inline(always)]
+    pub fn new_clean() -> Self {
+        Self::new_kind(false)
+    }
+    /// Marker/ring decode body (`Block::read`).
+    #[inline(always)]
+    pub fn new_marker() -> Self {
+        Self::new_kind(true)
+    }
+    #[inline(always)]
+    fn new_kind(marker: bool) -> Self {
         let on = enabled();
         if on {
             sub_enter();
@@ -195,6 +218,7 @@ impl DecodeSpan {
         let i0 = rdinstr(on);
         Self {
             on,
+            marker,
             t0: rdtsc(on),
             i0,
             nested0,
@@ -222,9 +246,20 @@ impl Drop for DecodeSpan {
             .with(|c| c.get())
             .wrapping_sub(self.nested0_instr);
         // body cycles/instrs exclusive of nested table builds
-        R_DECODE_CYC.fetch_add(dt.wrapping_sub(nested), Ordering::Relaxed);
+        let cyc = dt.wrapping_sub(nested);
+        let instr = di.wrapping_sub(nested_instr);
+        R_DECODE_CYC.fetch_add(cyc, Ordering::Relaxed);
         R_DECODE_N.fetch_add(1, Ordering::Relaxed);
-        R_DECODE_INSTR.fetch_add(di.wrapping_sub(nested_instr), Ordering::Relaxed);
+        R_DECODE_INSTR.fetch_add(instr, Ordering::Relaxed);
+        if self.marker {
+            R_DECODE_MARKER_CYC.fetch_add(cyc, Ordering::Relaxed);
+            R_DECODE_MARKER_INSTR.fetch_add(instr, Ordering::Relaxed);
+            R_DECODE_MARKER_N.fetch_add(1, Ordering::Relaxed);
+        } else {
+            R_DECODE_CLEAN_CYC.fetch_add(cyc, Ordering::Relaxed);
+            R_DECODE_CLEAN_INSTR.fetch_add(instr, Ordering::Relaxed);
+            R_DECODE_CLEAN_N.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -673,9 +708,21 @@ pub fn dump_if_enabled() {
     };
     row("R_TABLE", tc, ti);
     row("R_DECODE", dc, di);
+    // R_DECODE clean/marker split (indented; sums back to R_DECODE).
+    let (dcc, dci) = (load(&R_DECODE_CLEAN_CYC), load(&R_DECODE_CLEAN_INSTR));
+    let (dmc, dmi) = (load(&R_DECODE_MARKER_CYC), load(&R_DECODE_MARKER_INSTR));
+    row(" .clean", dcc, dci);
+    row(" .marker", dmc, dmi);
     row("ring_other", ring_other, ring_other_instr);
     row("R_MARKERPP", mc, mi);
     row("R_OUTPUT", oc, oi);
+    eprintln!(
+        "  [region-ipc] R_DECODE split conservation: clean+marker cyc={} vs R_DECODE cyc={} (calls clean={} marker={})",
+        dcc + dmc,
+        dc,
+        load(&R_DECODE_CLEAN_N),
+        load(&R_DECODE_MARKER_N)
+    );
     let worker_mean_ipc = ipc(wi, wc);
     let total_ipc = ipc(wi + mi + oi, total_cyc);
     eprintln!(
