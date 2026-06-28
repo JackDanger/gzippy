@@ -2974,12 +2974,16 @@ fn run_decode_task(
     // AMD-residual R_WORKER region: wraps the WHOLE per-chunk decode dispatch (all 4
     // branches incl. window-absent speculative) so every chunk (on-demand + prefetched)
     // is counted. ONE rdtsc pair per chunk on this worker thread.
-    let _worker_t0 = crate::decompress::parallel::region_prof::rdtsc(
-        crate::decompress::parallel::region_prof::enabled(),
-    );
     if crate::decompress::parallel::region_prof::enabled() {
         crate::decompress::parallel::region_prof::region_enter();
     }
+    // instr snapshot BEFORE the tsc window so the cycle measurement is unperturbed.
+    let _worker_i0 = crate::decompress::parallel::region_prof::rdinstr(
+        crate::decompress::parallel::region_prof::enabled(),
+    );
+    let _worker_t0 = crate::decompress::parallel::region_prof::rdtsc(
+        crate::decompress::parallel::region_prof::enabled(),
+    );
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_with_until_exact(
             input_bytes,
@@ -3035,10 +3039,13 @@ fn run_decode_task(
     crate::decompress::parallel::slow_knob::ring_inject();
     if crate::decompress::parallel::region_prof::enabled() {
         use std::sync::atomic::Ordering;
-        crate::decompress::parallel::region_prof::region_exit();
+        // tsc closes the cycle window FIRST, then instr read (outside the window).
         let dt = crate::decompress::parallel::region_prof::rdtsc(true).wrapping_sub(_worker_t0);
+        let di = crate::decompress::parallel::region_prof::rdinstr(true).wrapping_sub(_worker_i0);
+        crate::decompress::parallel::region_prof::region_exit();
         crate::decompress::parallel::region_prof::R_WORKER_CYC.fetch_add(dt, Ordering::Relaxed);
         crate::decompress::parallel::region_prof::R_WORKER_N.fetch_add(1, Ordering::Relaxed);
+        crate::decompress::parallel::region_prof::R_WORKER_INSTR.fetch_add(di, Ordering::Relaxed);
         if let Ok(ref c) = chunk_result {
             crate::decompress::parallel::region_prof::R_WORKER_BYTES
                 .fetch_add(c.decoded_size() as u64, Ordering::Relaxed);
@@ -3134,6 +3141,7 @@ fn resolve_chunk_markers_on_chunk(
     let _rp_span = crate::decompress::parallel::region_prof::Span::new(
         &crate::decompress::parallel::region_prof::R_MARKERPP_CYC,
         &crate::decompress::parallel::region_prof::R_MARKERPP_N,
+        &crate::decompress::parallel::region_prof::R_MARKERPP_INSTR,
     );
     if crate::decompress::parallel::region_prof::enabled() {
         crate::decompress::parallel::region_prof::R_MARKERPP_BYTES
@@ -4510,6 +4518,7 @@ fn drain_one_pending<W: std::io::Write>(
             let _ro_span = crate::decompress::parallel::region_prof::Span::new(
                 &crate::decompress::parallel::region_prof::R_OUTPUT_CYC,
                 &crate::decompress::parallel::region_prof::R_OUTPUT_N,
+                &crate::decompress::parallel::region_prof::R_OUTPUT_INSTR,
             );
             if crate::decompress::parallel::region_prof::enabled() {
                 crate::decompress::parallel::region_prof::R_OUTPUT_BYTES

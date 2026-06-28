@@ -59,14 +59,17 @@ pub fn region_exit() {
 pub static R_WORKER_CYC: AtomicU64 = AtomicU64::new(0);
 pub static R_WORKER_N: AtomicU64 = AtomicU64::new(0);
 pub static R_WORKER_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static R_WORKER_INSTR: AtomicU64 = AtomicU64::new(0);
 
 pub static R_MARKERPP_CYC: AtomicU64 = AtomicU64::new(0);
 pub static R_MARKERPP_N: AtomicU64 = AtomicU64::new(0);
 pub static R_MARKERPP_BYTES: AtomicU64 = AtomicU64::new(0); // marker bytes resolved
+pub static R_MARKERPP_INSTR: AtomicU64 = AtomicU64::new(0);
 
 pub static R_OUTPUT_CYC: AtomicU64 = AtomicU64::new(0);
 pub static R_OUTPUT_N: AtomicU64 = AtomicU64::new(0);
 pub static R_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0); // payload bytes written
+pub static R_OUTPUT_INSTR: AtomicU64 = AtomicU64::new(0);
 
 // ── R_WORKER SUB-PARTITION (R_WORKER = R_TABLE + R_DECODE + ring_other) ─────────
 // Sub-decomposition of the per-chunk decode call to localize the silesia-specific
@@ -91,14 +94,19 @@ pub static R_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0); // payload bytes writt
 pub static R_TABLE_CYC: AtomicU64 = AtomicU64::new(0);
 pub static R_TABLE_N: AtomicU64 = AtomicU64::new(0); // read_header calls (cyc/header diagnostic)
 pub static R_TABLE_NESTED_CYC: AtomicU64 = AtomicU64::new(0); // dist builds clawed from body
+pub static R_TABLE_INSTR: AtomicU64 = AtomicU64::new(0);
+pub static R_TABLE_NESTED_INSTR: AtomicU64 = AtomicU64::new(0);
 pub static R_DECODE_CYC: AtomicU64 = AtomicU64::new(0);
 pub static R_DECODE_N: AtomicU64 = AtomicU64::new(0);
+pub static R_DECODE_INSTR: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static SUB_DEPTH: Cell<u32> = const { Cell::new(0) };
     // Cumulative cycles spent in nested table builds on THIS thread; a decode span
     // snapshots it at entry and credits (exit-entry) back out of R_DECODE.
     static TL_TABLE_NESTED: Cell<u64> = const { Cell::new(0) };
+    // Same, for retired instructions (keeps R_TABLE/R_DECODE instr exclusive).
+    static TL_TABLE_NESTED_INSTR: Cell<u64> = const { Cell::new(0) };
 }
 pub static SUB_OVERLAP_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -121,6 +129,7 @@ fn sub_exit() {
 pub struct TableHeaderSpan {
     on: bool,
     t0: u64,
+    i0: u64,
 }
 impl TableHeaderSpan {
     #[inline(always)]
@@ -129,7 +138,12 @@ impl TableHeaderSpan {
         if on {
             sub_enter();
         }
-        Self { on, t0: rdtsc(on) }
+        let i0 = rdinstr(on);
+        Self {
+            on,
+            t0: rdtsc(on),
+            i0,
+        }
     }
 }
 impl Default for TableHeaderSpan {
@@ -145,9 +159,11 @@ impl Drop for TableHeaderSpan {
             return;
         }
         let dt = rdtsc(true).wrapping_sub(self.t0);
+        let di = rdinstr(true).wrapping_sub(self.i0);
         sub_exit();
         R_TABLE_CYC.fetch_add(dt, Ordering::Relaxed);
         R_TABLE_N.fetch_add(1, Ordering::Relaxed);
+        R_TABLE_INSTR.fetch_add(di, Ordering::Relaxed);
     }
 }
 
@@ -157,7 +173,9 @@ impl Drop for TableHeaderSpan {
 pub struct DecodeSpan {
     on: bool,
     t0: u64,
+    i0: u64,
     nested0: u64,
+    nested0_instr: u64,
 }
 impl DecodeSpan {
     #[inline(always)]
@@ -166,15 +184,21 @@ impl DecodeSpan {
         if on {
             sub_enter();
         }
-        let nested0 = if on {
-            TL_TABLE_NESTED.with(|c| c.get())
+        let (nested0, nested0_instr) = if on {
+            (
+                TL_TABLE_NESTED.with(|c| c.get()),
+                TL_TABLE_NESTED_INSTR.with(|c| c.get()),
+            )
         } else {
-            0
+            (0, 0)
         };
+        let i0 = rdinstr(on);
         Self {
             on,
             t0: rdtsc(on),
+            i0,
             nested0,
+            nested0_instr,
         }
     }
 }
@@ -191,11 +215,16 @@ impl Drop for DecodeSpan {
             return;
         }
         let dt = rdtsc(true).wrapping_sub(self.t0);
+        let di = rdinstr(true).wrapping_sub(self.i0);
         sub_exit();
         let nested = TL_TABLE_NESTED.with(|c| c.get()).wrapping_sub(self.nested0);
-        // body cycles exclusive of nested table builds
+        let nested_instr = TL_TABLE_NESTED_INSTR
+            .with(|c| c.get())
+            .wrapping_sub(self.nested0_instr);
+        // body cycles/instrs exclusive of nested table builds
         R_DECODE_CYC.fetch_add(dt.wrapping_sub(nested), Ordering::Relaxed);
         R_DECODE_N.fetch_add(1, Ordering::Relaxed);
+        R_DECODE_INSTR.fetch_add(di.wrapping_sub(nested_instr), Ordering::Relaxed);
     }
 }
 
@@ -207,12 +236,18 @@ impl Drop for DecodeSpan {
 pub struct NestedTableSpan {
     on: bool,
     t0: u64,
+    i0: u64,
 }
 impl NestedTableSpan {
     #[inline(always)]
     pub fn new() -> Self {
         let on = enabled();
-        Self { on, t0: rdtsc(on) }
+        let i0 = rdinstr(on);
+        Self {
+            on,
+            t0: rdtsc(on),
+            i0,
+        }
     }
 }
 impl Default for NestedTableSpan {
@@ -228,21 +263,216 @@ impl Drop for NestedTableSpan {
             return;
         }
         let dt = rdtsc(true).wrapping_sub(self.t0);
+        let di = rdinstr(true).wrapping_sub(self.i0);
         R_TABLE_CYC.fetch_add(dt, Ordering::Relaxed);
         R_TABLE_NESTED_CYC.fetch_add(dt, Ordering::Relaxed);
         TL_TABLE_NESTED.with(|c| c.set(c.get().wrapping_add(dt)));
+        R_TABLE_INSTR.fetch_add(di, Ordering::Relaxed);
+        R_TABLE_NESTED_INSTR.fetch_add(di, Ordering::Relaxed);
+        TL_TABLE_NESTED_INSTR.with(|c| c.set(c.get().wrapping_add(di)));
     }
 }
 
 #[inline(always)]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GZIPPY_REGION_PROF").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("GZIPPY_REGION_PROF").is_ok_and(|v| v == "1") || ipc_enabled())
+}
+
+/// IPC mode: additionally count retired instructions per region (GZIPPY_REGION_IPC=1).
+/// Implies REGION_PROF. OFF by default ⇒ existing cyc-only runs are byte/behavior
+/// identical and pay zero instruction-read cost.
+#[inline(always)]
+pub fn ipc_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GZIPPY_REGION_IPC").is_ok_and(|v| v == "1"))
 }
 
 #[inline(always)]
 pub fn rdtsc(on: bool) -> u64 {
     crate::decompress::parallel::instruments::contig_prof::rdtsc(on)
+}
+
+/// Current thread's retired-instruction count (userspace, exclude_kernel) read via
+/// rdpmc through the per-thread perf mmap page. Returns 0 when IPC mode is off or
+/// the counter is unavailable. ~30-cyc cost, NO syscall in the hot path. Callers
+/// MUST take this OUTSIDE the rdtsc window (before t0 at enter, after t1 at exit)
+/// so the existing CYCLE measurement is unperturbed by this read.
+#[inline(always)]
+pub fn rdinstr(on: bool) -> u64 {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if on && ipc_enabled() {
+            return perf::read_instr();
+        }
+        0
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = on;
+        0
+    }
+}
+
+// ── Per-thread retired-instruction counter (perf_event_open + rdpmc) ────────────
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod perf {
+    use std::cell::RefCell;
+
+    #[repr(C)]
+    struct PerfEventAttr {
+        type_: u32,
+        size: u32,
+        config: u64,
+        sample_period_or_freq: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup: u32,
+        bp_type: u32,
+        config1: u64,
+        config2: u64,
+        branch_sample_type: u64,
+        sample_regs_user: u64,
+        sample_stack_user: u32,
+        clockid: i32,
+        sample_regs_intr: u64,
+        aux_watermark: u32,
+        sample_max_stack: u16,
+        reserved_2: u16,
+        aux_sample_size: u32,
+        reserved_3: u32,
+    }
+
+    const PERF_TYPE_HARDWARE: u32 = 0;
+    const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+    // perf_event_attr.flags bitfield (low bits): disabled:1 inherit:1 pinned:1
+    // exclusive:1 exclude_user:1 exclude_kernel:1 exclude_hv:1 …
+    const EXCLUDE_KERNEL: u64 = 1 << 5;
+    const EXCLUDE_HV: u64 = 1 << 6;
+
+    struct ThreadPerf {
+        fd: i32,
+        page: *mut u8,
+        rdpmc_ok: bool,
+    }
+
+    impl Drop for ThreadPerf {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.page.is_null() {
+                    libc::munmap(self.page as *mut libc::c_void, page_size());
+                }
+                if self.fd >= 0 {
+                    libc::close(self.fd);
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static TP: RefCell<Option<ThreadPerf>> = const { RefCell::new(None) };
+    }
+
+    fn page_size() -> usize {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    #[inline(always)]
+    unsafe fn rdpmc(counter: u32) -> u64 {
+        let low: u32;
+        let high: u32;
+        std::arch::asm!(
+            "rdpmc",
+            in("ecx") counter,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, nomem, preserves_flags),
+        );
+        (low as u64) | ((high as u64) << 32)
+    }
+
+    unsafe fn open_thread() -> Option<ThreadPerf> {
+        let mut attr: PerfEventAttr = std::mem::zeroed();
+        attr.type_ = PERF_TYPE_HARDWARE;
+        attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
+        attr.config = PERF_COUNT_HW_INSTRUCTIONS;
+        attr.flags = EXCLUDE_KERNEL | EXCLUDE_HV; // disabled=0 ⇒ counts from open
+        let fd = libc::syscall(
+            libc::SYS_perf_event_open,
+            &attr as *const PerfEventAttr,
+            0i32,  // pid=0 ⇒ this thread
+            -1i32, // cpu=-1 ⇒ any
+            -1i32, // group_fd
+            0u64,  // flags
+        ) as i32;
+        if fd < 0 {
+            return None;
+        }
+        let ps = page_size();
+        let page = libc::mmap(
+            std::ptr::null_mut(),
+            ps,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        if page == libc::MAP_FAILED {
+            libc::close(fd);
+            return None;
+        }
+        Some(ThreadPerf {
+            fd,
+            page: page as *mut u8,
+            rdpmc_ok: true,
+        })
+    }
+
+    #[inline]
+    unsafe fn read_via_page(tp: &ThreadPerf) -> u64 {
+        let pc = tp.page;
+        // perf_event_mmap_page offsets: lock@8(u32) index@12(u32) offset@16(i64)
+        for _ in 0..8 {
+            let seq = std::ptr::read_volatile(pc.add(8) as *const u32);
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Acquire);
+            let index = std::ptr::read_volatile(pc.add(12) as *const u32);
+            let offset = std::ptr::read_volatile(pc.add(16) as *const i64);
+            if index == 0 {
+                // Event not currently scheduled via rdpmc — fall back to read().
+                break;
+            }
+            let raw = rdpmc(index - 1);
+            let count = (offset as u64).wrapping_add(raw);
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Acquire);
+            let seq2 = std::ptr::read_volatile(pc.add(8) as *const u32);
+            if seq == seq2 {
+                return count;
+            }
+        }
+        // Fallback: syscall read of the counter (kernel cost excluded from the event).
+        let mut v: u64 = 0;
+        let n = libc::read(tp.fd, &mut v as *mut u64 as *mut libc::c_void, 8);
+        if n == 8 {
+            v
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn read_instr() -> u64 {
+        TP.with(|cell| {
+            let mut b = cell.borrow_mut();
+            if b.is_none() {
+                *b = unsafe { open_thread() };
+            }
+            match b.as_ref() {
+                Some(tp) if tp.rdpmc_ok => unsafe { read_via_page(tp) },
+                _ => 0,
+            }
+        })
+    }
 }
 
 /// RAII span: measures wall-rdtsc of the enclosing scope on THIS thread and adds
@@ -252,22 +482,27 @@ pub fn rdtsc(on: bool) -> u64 {
 pub struct Span {
     on: bool,
     t0: u64,
+    i0: u64,
     cyc: &'static AtomicU64,
     n: &'static AtomicU64,
+    instr: &'static AtomicU64,
 }
 
 impl Span {
     #[inline(always)]
-    pub fn new(cyc: &'static AtomicU64, n: &'static AtomicU64) -> Self {
+    pub fn new(cyc: &'static AtomicU64, n: &'static AtomicU64, instr: &'static AtomicU64) -> Self {
         let on = enabled();
         if on {
             region_enter();
         }
+        let i0 = rdinstr(on);
         Self {
             on,
             t0: rdtsc(on),
+            i0,
             cyc,
             n,
+            instr,
         }
     }
 }
@@ -279,9 +514,11 @@ impl Drop for Span {
             return;
         }
         let dt = rdtsc(true).wrapping_sub(self.t0);
+        let di = rdinstr(true).wrapping_sub(self.i0);
         region_exit();
         self.cyc.fetch_add(dt, Ordering::Relaxed);
         self.n.fetch_add(1, Ordering::Relaxed);
+        self.instr.fetch_add(di, Ordering::Relaxed);
     }
 }
 
@@ -294,13 +531,16 @@ pub fn measure_worker<T>(bytes: u64, f: impl FnOnce() -> T) -> T {
         return f();
     }
     region_enter();
+    let i0 = rdinstr(true);
     let t0 = rdtsc(true);
     let r = f();
     let dt = rdtsc(true).wrapping_sub(t0);
+    let di = rdinstr(true).wrapping_sub(i0);
     region_exit();
     R_WORKER_CYC.fetch_add(dt, Ordering::Relaxed);
     R_WORKER_N.fetch_add(1, Ordering::Relaxed);
     R_WORKER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    R_WORKER_INSTR.fetch_add(di, Ordering::Relaxed);
     r
 }
 
@@ -394,5 +634,66 @@ pub fn dump_if_enabled() {
         overlap == 0,
         non_inert,
         if overlap == 0 && non_inert { "PASS" } else { "FAIL" }
+    );
+
+    // ── PER-REGION IPC TABLE (GZIPPY_REGION_IPC=1) ──────────────────────────────
+    if !ipc_enabled() {
+        return;
+    }
+    let wi = load(&R_WORKER_INSTR);
+    let mi = load(&R_MARKERPP_INSTR);
+    let oi = load(&R_OUTPUT_INSTR);
+    let ti = load(&R_TABLE_INSTR);
+    let di = load(&R_DECODE_INSTR);
+    let ring_other_instr = wi.saturating_sub(ti).saturating_sub(di);
+    // Five EXCLUSIVE leaf decode regions: R_TABLE, R_DECODE, ring_other (all inside
+    // R_WORKER), R_MARKERPP, R_OUTPUT. ring_other = R_WORKER - R_TABLE - R_DECODE.
+    let total_cyc = wc + mc + oc; // = (table+decode+ring_other) + markerpp + output
+    let ipc = |i: u64, c: u64| if c > 0 { i as f64 / c as f64 } else { 0.0 };
+    let share = |c: u64| {
+        if total_cyc > 0 {
+            100.0 * c as f64 / total_cyc as f64
+        } else {
+            0.0
+        }
+    };
+    let ipb = |i: u64, b: u64| if b > 0 { i as f64 / b as f64 } else { 0.0 };
+    eprintln!("  ─────────────────────────────────────────────────────────────────────────");
+    eprintln!("  [region-ipc] PER-REGION IPC (retired-instr via perf rdpmc; bytes={wb}):");
+    eprintln!("  region          cyc/B-share%   cyc/B    instr/B     IPC");
+    let row = |name: &str, c: u64, i: u64| {
+        eprintln!(
+            "  {:<14} {:>9.2}   {:>7.3}  {:>8.3}  {:>6.3}",
+            name,
+            share(c),
+            cpb(c, wb),
+            ipb(i, wb),
+            ipc(i, c)
+        );
+    };
+    row("R_TABLE", tc, ti);
+    row("R_DECODE", dc, di);
+    row("ring_other", ring_other, ring_other_instr);
+    row("R_MARKERPP", mc, mi);
+    row("R_OUTPUT", oc, oi);
+    let worker_mean_ipc = ipc(wi, wc);
+    let total_ipc = ipc(wi + mi + oi, total_cyc);
+    eprintln!(
+        "  [region-ipc] R_WORKER IPC={:.3}  ALL-REGION IPC={:.3}",
+        worker_mean_ipc, total_ipc
+    );
+    // Gate-0: instruction counters non-zero & sane (IPC in [0.2,8]); ring_other instr
+    // non-negative (R_WORKER >= R_TABLE+R_DECODE in instructions too).
+    let instr_nonzero = wi > 0 && ti > 0 && di > 0 && mi > 0 && oi > 0;
+    let sane = |x: f64| x > 0.2 && x < 8.0;
+    let ipc_sane = sane(ipc(ti, tc))
+        && sane(ipc(di, dc))
+        && sane(ipc(mi, mc))
+        && sane(ipc(oi, oc))
+        && sane(total_ipc);
+    let ring_ok = wi >= ti + di;
+    eprintln!(
+        "  [region-ipc] SELF-TEST: instr_nonzero:{instr_nonzero} ipc_sane:{ipc_sane} ring_instr>=0:{ring_ok} -> {}",
+        if instr_nonzero && ipc_sane && ring_ok { "PASS" } else { "FAIL" }
     );
 }
