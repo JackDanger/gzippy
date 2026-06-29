@@ -189,6 +189,53 @@ pub const DOUBLE_SYM_FLAG: u32 = TRIPLE_SYM_FLAG + 1;
 pub const SINGLE_SYM_FLAG: u32 = DOUBLE_SYM_FLAG + 1;
 pub const DEFAULT_SYM_FLAG: u32 = TRIPLE_SYM_FLAG;
 
+/// Selects how much of `make_inflate_huff_code_lit_len` runs for the per-block
+/// litlen table build (`GZIPPY_LITLEN_MULTISYM` = `single` | `double` | `triple`).
+/// SINGLE emits only singleton LUT entries (skips the pair + triple packing
+/// loops — the bulk of build cost), DOUBLE adds pairs, TRIPLE adds triples. The
+/// produced table is read by the SAME decode loop and the DECOMPRESSED OUTPUT IS
+/// BYTE-IDENTICAL for every flag (decode honours each entry's `sym_count`); only
+/// the build/decode cycle split changes.
+///
+/// When the env var is UNSET the default is ARCH-DISPATCHED:
+///   * aarch64 → `SINGLE_SYM_FLAG`. Gated M1 T1 win: skipping the pair/triple
+///     packing build is a measured silesia-T1 win and a logs-T1 tie; the cheaper
+///     decode of single entries pays for itself on this microarch.
+///   * x86_64 / any other arch → `TRIPLE_SYM_FLAG` (production unchanged).
+///     SINGLE is a measured +7.7% cyc/B regression on x86/AMD, so it must NOT
+///     become the default there.
+///
+/// The env override is honoured on EVERY arch (for A/B testing); only the
+/// UNSET default differs by arch.
+pub fn litlen_multisym_flag() -> u32 {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<u32> = OnceLock::new();
+    *FLAG.get_or_init(
+        || match std::env::var("GZIPPY_LITLEN_MULTISYM").as_deref() {
+            Ok("single") => SINGLE_SYM_FLAG,
+            Ok("double") => DOUBLE_SYM_FLAG,
+            Ok("triple") => TRIPLE_SYM_FLAG,
+            // Env unset (or unrecognised) → arch-dispatched default.
+            _ => arch_default_multisym_flag(),
+        },
+    )
+}
+
+/// aarch64 default = single-symbol build (gated M1 T1 win).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn arch_default_multisym_flag() -> u32 {
+    SINGLE_SYM_FLAG
+}
+
+/// x86_64 / other arches default = triple-pack build (production unchanged;
+/// single is a measured regression on x86/AMD).
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn arch_default_multisym_flag() -> u32 {
+    TRIPLE_SYM_FLAG
+}
+
 pub const INVALID_SYMBOL: u32 = 0x1FFF;
 pub const INVALID_CODE: u32 = 0xFF_FFFF;
 
@@ -1122,7 +1169,7 @@ impl LutLitLenCode {
     /// `isal_huffman.rs::IsalLitLenCode::rebuild_from` (line 119-175) but
     /// dispatches to the pure-rust builders defined above.
     pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
-        self.rebuild_from_multisym(code_lengths, TRIPLE_SYM_FLAG)
+        self.rebuild_from_multisym(code_lengths, litlen_multisym_flag())
     }
 
     /// As `rebuild_from`, but with a caller-chosen multi-symbol packing flag.
@@ -1514,6 +1561,17 @@ impl LutDistCode {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The UNSET-env default must be arch-dispatched: SINGLE on aarch64 (gated
+    /// M1 T1 win), TRIPLE everywhere else (x86/AMD regression-avoidance). This
+    /// pins the byte-identical-on-x86 guarantee at compile time per arch.
+    #[test]
+    fn arch_default_multisym_flag_is_arch_dispatched() {
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(arch_default_multisym_flag(), SINGLE_SYM_FLAG);
+        #[cfg(not(target_arch = "aarch64"))]
+        assert_eq!(arch_default_multisym_flag(), TRIPLE_SYM_FLAG);
+    }
 
     #[test]
     fn bit_reverse2_matches_spec() {
