@@ -184,6 +184,9 @@ const PARALLEL_RATIO_MAX_DEFAULT: u64 = 8;
 /// 2.75 → T3, monorepo → T6, storedheavy → T7-8). Override with
 /// `GZIPPY_PARALLEL_CROSSOVER_MARGIN`; `0` disables the selector (legacy
 /// always-parallel-below-ratio_max behaviour, for A/B).
+/// (aarch64 disables the selector entirely — see [`arch_crossover_margin_default`] —
+/// so this Intel-default constant is unconsumed there.)
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 
 /// AMD/Zen crossover-margin default. Zen2's per-chunk parallel overhead is higher
@@ -192,6 +195,9 @@ const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 /// Zen2 monorepo-T6/T8 default-constant regression (AMD/Zen2, N=11, load-immune
 /// interleaved paired ratios, plans/XARCH-CONCURRENCY-LAW-2026-06-26.md). Selected
 /// at runtime by [`cpu_is_amd`]; overridable via `GZIPPY_PARALLEL_CROSSOVER_MARGIN`.
+/// (aarch64 disables the selector entirely — see [`arch_crossover_margin_default`] —
+/// so this Zen-default constant is unconsumed there.)
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 const PARALLEL_CROSSOVER_MARGIN_AMD: f64 = 1.6;
 
 /// Output-size threshold (bytes) at/above which the cost-model crossover is
@@ -267,12 +273,32 @@ fn cpu_is_amd() -> bool {
 }
 
 /// Arch-dispatched default crossover margin (env override takes precedence).
+///
+/// aarch64 (Apple Silicon): the serial-clean cost-model selector + large-output
+/// bonus are x86/Zen2-tuned — their crossover constants were GATED only on Intel
+/// Raptor-Lake (margin 1.0 + 1-notch) and AMD Zen2 (margin 1.6 + 2-notch). On
+/// arm64 they MISFIRE: silesia (ratio ~3.1) → crossover ceil(3.1)=4, minus the
+/// 1-notch large-output bonus = 3, which routes silesia T2 to the SERIAL floor
+/// where the prestack always-parallel-below-ratio_max routing ran parallel —
+/// measured REGRESSION (fulcrum wall --steady, M1, silesia T2 +5.7% / T3 +1.2%
+/// vs reimplement-isa-l@e1f0c99d). Return margin 0.0 to DISABLE the cost-model
+/// selector on aarch64, restoring EXACTLY the prestack routing (the hard
+/// ISIZE-ratio cap above still fires for high-ratio corpora like logs). The
+/// `GZIPPY_PARALLEL_CROSSOVER_MARGIN` env override still takes precedence. x86_64
+/// codegen is byte-identical (this branch compiles out off-aarch64).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 fn arch_crossover_margin_default() -> f64 {
-    if cpu_is_amd() {
-        PARALLEL_CROSSOVER_MARGIN_AMD
-    } else {
-        PARALLEL_CROSSOVER_MARGIN_DEFAULT
+    #[cfg(target_arch = "aarch64")]
+    {
+        0.0
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if cpu_is_amd() {
+            PARALLEL_CROSSOVER_MARGIN_AMD
+        } else {
+            PARALLEL_CROSSOVER_MARGIN_DEFAULT
+        }
     }
 }
 
@@ -851,29 +877,65 @@ mod tests {
     #[test]
     fn arch_dispatch_defaults_match_vendor() {
         // The arch-dispatched defaults must follow the detected CPU vendor: AMD
-        // gets the Zen2-gated margin 1.6 + 2-notch bonus; everything else keeps the
+        // gets the Zen2-gated margin 1.6 + 2-notch bonus; Intel/other x86 keep the
         // Raptor-Lake margin 1.0 + 1-notch bonus. Detection is deterministic
         // (cpuid leaf 0), so this is a stable invariant on whatever host runs it.
-        if cpu_is_amd() {
-            assert_eq!(
-                arch_crossover_margin_default(),
-                PARALLEL_CROSSOVER_MARGIN_AMD
-            );
-            assert_eq!(
-                arch_large_output_notch_default(),
-                PARALLEL_LARGE_OUTPUT_NOTCH_AMD
-            );
-            assert_eq!(arch_large_output_notch_default(), 2); // deeper bonus on Zen
-        } else {
-            assert_eq!(
-                arch_crossover_margin_default(),
-                PARALLEL_CROSSOVER_MARGIN_DEFAULT
-            );
-            assert_eq!(
-                arch_large_output_notch_default(),
-                PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT
-            );
+        // aarch64 (Apple Silicon) DISABLES the selector (margin 0.0) — the x86/Zen2
+        // crossover tune misfires on arm64 (silesia T2/T3 regression), so arm64
+        // restores the prestack always-parallel-below-ratio_max routing.
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(arch_crossover_margin_default(), 0.0);
         }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            if cpu_is_amd() {
+                assert_eq!(
+                    arch_crossover_margin_default(),
+                    PARALLEL_CROSSOVER_MARGIN_AMD
+                );
+                assert_eq!(
+                    arch_large_output_notch_default(),
+                    PARALLEL_LARGE_OUTPUT_NOTCH_AMD
+                );
+                assert_eq!(arch_large_output_notch_default(), 2); // deeper bonus on Zen
+            } else {
+                assert_eq!(
+                    arch_crossover_margin_default(),
+                    PARALLEL_CROSSOVER_MARGIN_DEFAULT
+                );
+                assert_eq!(
+                    arch_large_output_notch_default(),
+                    PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT
+                );
+            }
+        }
+    }
+
+    /// REGRESSION GUARD (aarch64): on Apple Silicon the x86/Zen2-tuned serial-clean
+    /// selector + large-output bonus are DISABLED (arch_crossover_margin_default = 0),
+    /// so a silesia-shaped large output (ISIZE ~212 MiB, ratio ~3.1) routes T2/T3/T4
+    /// to the requested parallel thread count — matching the prestack
+    /// always-parallel-below-ratio_max routing. On x86 the selector would collapse
+    /// T2 (and below) to the serial floor; that x86 tune misfired on arm64 (measured
+    /// silesia T2 +5.7% / T3 +1.2% steady-wall regression). No env override here:
+    /// this asserts the SHIPPED arm64 default. The hard ISIZE-ratio cap (ratio >= 8)
+    /// is unaffected — see `compressibility_cap_serializes_high_ratio_keeps_low_ratio`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_large_output_stays_parallel_at_low_t() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH");
+        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
+        // silesia-shaped: 212 MiB output, ~67 MiB deflate → ratio ~3.14 (< hard cap 8),
+        // output >= the 128 MiB large-output threshold (would trigger the x86 bonus).
+        let deflate_len = 67_585_052usize;
+        let big = blob_with_isize(211_968_000); // 212 MiB ISIZE
+                                                // On aarch64 the selector is OFF → every requested T below the hard cap is kept.
+        assert_eq!(effective_parallel_threads(&big, deflate_len, 2), 2);
+        assert_eq!(effective_parallel_threads(&big, deflate_len, 3), 3);
+        assert_eq!(effective_parallel_threads(&big, deflate_len, 4), 4);
     }
 
     #[test]
