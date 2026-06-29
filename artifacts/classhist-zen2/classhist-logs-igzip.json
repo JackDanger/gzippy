@@ -1,0 +1,15 @@
+{
+  "subject": "/root/gz-decodework/target-unstripped/release/gzippy",
+  "comparator": "/usr/bin/igzip",
+  "corpus": "/root/floor/logs.gz",
+  "subject_sha": "b5c6632f2912e04ff076adf249a357b9381fd124e2a5d0cc5a391b81be4c2673",
+  "comparator_sha": "b5c6632f2912e04ff076adf249a357b9381fd124e2a5d0cc5a391b81be4c2673",
+  "corpus_sha": "aa330e392a71021c22f093178db7e87fb709f8e8a44de6173cf62273efad2f9c",
+  "iters": 30, "freq": 4000, "cpu": 8,
+  "subject_samples": 11782, "comparator_samples": 10803,
+  "subject_coverage": 0.9484, "comparator_coverage": 0.8964, "aa_drift_pp": 0.1273,
+  "subject_shares_pct": {"load": 13.237, "store": 9.666, "branch": 17.416, "arith": 15.444, "logic": 5.604, "shift/bitfield": 7.294, "compare/select": 8.969, "mov": 13.762, "simd": 7.908, "other": 0.700},
+  "comparator_shares_pct": {"load": 7.991, "store": 8.504, "branch": 14.700, "arith": 17.302, "logic": 8.358, "shift/bitfield": 10.831, "compare/select": 7.785, "mov": 12.281, "simd": 8.703, "other": 3.544},
+  "surplus_ratio": 1.1730,
+  "_": "deltas: load=+5.2 store=+1.2 branch=+2.7 arith=-1.9 logic=-2.8 shift/bitfield=-3.5 compare/select=+1.2 mov=+1.5 simd=-0.8 other=-2.8"
+}

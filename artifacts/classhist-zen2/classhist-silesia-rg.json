@@ -1,0 +1,15 @@
+{
+  "subject": "/root/gz-decodework/target-unstripped/release/gzippy",
+  "comparator": "/root/rgbuild/src/tools/rapidgzip",
+  "corpus": "/root/floor/silesia.gz",
+  "subject_sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "comparator_sha": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "corpus_sha": "7221e0abafe999c867879b54d8ea7e12c79428baa8f2a37ed70a45cb35573b52",
+  "iters": 30, "freq": 4000, "cpu": 8,
+  "subject_samples": 43888, "comparator_samples": 52490,
+  "subject_coverage": 0.9796, "comparator_coverage": 0.9694, "aa_drift_pp": 0.0201,
+  "subject_shares_pct": {"load": 14.134, "store": 10.542, "branch": 16.661, "arith": 16.285, "logic": 6.212, "shift/bitfield": 8.315, "compare/select": 8.409, "mov": 14.237, "simd": 4.774, "other": 0.432},
+  "comparator_shares_pct": {"load": 6.146, "store": 3.083, "branch": 15.788, "arith": 20.595, "logic": 10.460, "shift/bitfield": 12.116, "compare/select": 6.801, "mov": 8.771, "simd": 12.314, "other": 3.925},
+  "surplus_ratio": 1.0390,
+  "_": "deltas: load=+8.0 store=+7.5 branch=+0.9 arith=-4.3 logic=-4.2 shift/bitfield=-3.8 compare/select=+1.6 mov=+5.5 simd=-7.5 other=-3.5"
+}
