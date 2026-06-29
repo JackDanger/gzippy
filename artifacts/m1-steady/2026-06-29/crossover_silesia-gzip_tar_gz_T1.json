@@ -1,0 +1,75 @@
+{
+  "oracle": "crossover",
+  "corpus": "silesia-gzip.tar.gz",
+  "threads": 1,
+  "gz_arm_change_present": "selector OFF (default 0.0)",
+  "ref_arm_change_removed": "GZIPPY_PARALLEL_CROSSOVER_MARGIN=1.0",
+  "gate0_non_inert_pathflip": "no-INERT-at-T1",
+  "corpus_ratio_isize_over_deflate": 3.136,
+  "binary_commit": "b2d1a2db",
+  "arch": "aarch64-apple-m1pro",
+  "gate0_native_gz": true,
+  "gate0_native_ref": true,
+  "oracle_sha12": "028bd002c89c",
+  "gate0_gz_sha_eq_oracle": true,
+  "gate0_ref_sha_eq_oracle": true,
+  "steady_ghz": 3.227,
+  "warmup_converged": true,
+  "cohorts": [
+    {
+      "cohort": 0,
+      "gz_ref": 1.0038,
+      "aa": 1.0021,
+      "eff_ghz": 3.219,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.69
+    },
+    {
+      "cohort": 1,
+      "gz_ref": 0.9996,
+      "aa": 1.0,
+      "eff_ghz": 3.223,
+      "kept": 7,
+      "drop": 2,
+      "freq_delta_pct": 0.67
+    },
+    {
+      "cohort": 2,
+      "gz_ref": 0.9996,
+      "aa": 1.0012,
+      "eff_ghz": 3.224,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.65
+    },
+    {
+      "cohort": 3,
+      "gz_ref": 1.0,
+      "aa": 1.0036,
+      "eff_ghz": 3.228,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.38
+    },
+    {
+      "cohort": 4,
+      "gz_ref": 1.0054,
+      "aa": 1.0078,
+      "eff_ghz": 3.218,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.42
+    }
+  ],
+  "n_kept_total": 39,
+  "n_valid_cohorts": 5,
+  "overall_ratio": 1.0,
+  "effect_pct": 0.0,
+  "cross_cohort_spread_pct": 0.29,
+  "aa_floor_pct": 0.39,
+  "min_cohort_effect_pct": 0.0,
+  "sign_consistent": false,
+  "verdict": "NOT_RESOLVABLE",
+  "interpretation": "NOT RESOLVABLE on this laptop (freq/thermal-bound); needs a quiet box."
+}

@@ -1,0 +1,75 @@
+{
+  "oracle": "crossover",
+  "corpus": "logsbig.gz",
+  "threads": 2,
+  "gz_arm_change_present": "selector OFF (default 0.0)",
+  "ref_arm_change_removed": "GZIPPY_PARALLEL_CROSSOVER_MARGIN=1.0",
+  "gate0_non_inert_pathflip": "yes",
+  "corpus_ratio_isize_over_deflate": 3.71,
+  "binary_commit": "b2d1a2db",
+  "arch": "aarch64-apple-m1pro",
+  "gate0_native_gz": true,
+  "gate0_native_ref": true,
+  "oracle_sha12": "8a22e657734a",
+  "gate0_gz_sha_eq_oracle": true,
+  "gate0_ref_sha_eq_oracle": true,
+  "steady_ghz": 3.224,
+  "warmup_converged": true,
+  "cohorts": [
+    {
+      "cohort": 0,
+      "gz_ref": 1.0974,
+      "aa": 1.0134,
+      "eff_ghz": 3.217,
+      "kept": 9,
+      "drop": 0,
+      "freq_delta_pct": 0.47
+    },
+    {
+      "cohort": 1,
+      "gz_ref": 1.0854,
+      "aa": 0.999,
+      "eff_ghz": 3.222,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.26
+    },
+    {
+      "cohort": 2,
+      "gz_ref": 1.0839,
+      "aa": 0.9991,
+      "eff_ghz": 3.226,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.19
+    },
+    {
+      "cohort": 3,
+      "gz_ref": 1.0839,
+      "aa": 1.0,
+      "eff_ghz": 3.221,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.36
+    },
+    {
+      "cohort": 4,
+      "gz_ref": 1.0864,
+      "aa": 1.0045,
+      "eff_ghz": 3.227,
+      "kept": 6,
+      "drop": 3,
+      "freq_delta_pct": 0.62
+    }
+  ],
+  "n_kept_total": 39,
+  "n_valid_cohorts": 5,
+  "overall_ratio": 1.0854,
+  "effect_pct": 8.54,
+  "cross_cohort_spread_pct": 0.63,
+  "aa_floor_pct": 0.72,
+  "min_cohort_effect_pct": 8.39,
+  "sign_consistent": true,
+  "verdict": "LOSS",
+  "interpretation": "REGRESSION: default (change present) is SLOWER than the removed arm beyond the A/A floor in every cohort \u2014 the change HURTS on this cell."
+}

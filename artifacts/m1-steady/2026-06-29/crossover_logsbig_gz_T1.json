@@ -1,0 +1,75 @@
+{
+  "oracle": "crossover",
+  "corpus": "logsbig.gz",
+  "threads": 1,
+  "gz_arm_change_present": "selector OFF (default 0.0)",
+  "ref_arm_change_removed": "GZIPPY_PARALLEL_CROSSOVER_MARGIN=1.0",
+  "gate0_non_inert_pathflip": "no-INERT-at-T1",
+  "corpus_ratio_isize_over_deflate": 3.718,
+  "binary_commit": "b2d1a2db",
+  "arch": "aarch64-apple-m1pro",
+  "gate0_native_gz": true,
+  "gate0_native_ref": true,
+  "oracle_sha12": "8a22e657734a",
+  "gate0_gz_sha_eq_oracle": true,
+  "gate0_ref_sha_eq_oracle": true,
+  "steady_ghz": 3.226,
+  "warmup_converged": true,
+  "cohorts": [
+    {
+      "cohort": 0,
+      "gz_ref": 1.0014,
+      "aa": 0.9988,
+      "eff_ghz": 3.22,
+      "kept": 9,
+      "drop": 0,
+      "freq_delta_pct": 0.48
+    },
+    {
+      "cohort": 1,
+      "gz_ref": 0.9996,
+      "aa": 1.0016,
+      "eff_ghz": 3.22,
+      "kept": 7,
+      "drop": 2,
+      "freq_delta_pct": 0.73
+    },
+    {
+      "cohort": 2,
+      "gz_ref": 1.0005,
+      "aa": 1.0,
+      "eff_ghz": 3.227,
+      "kept": 6,
+      "drop": 3,
+      "freq_delta_pct": 0.49
+    },
+    {
+      "cohort": 3,
+      "gz_ref": 0.9956,
+      "aa": 0.999,
+      "eff_ghz": 3.226,
+      "kept": 6,
+      "drop": 3,
+      "freq_delta_pct": 0.64
+    },
+    {
+      "cohort": 4,
+      "gz_ref": 0.9986,
+      "aa": 0.9999,
+      "eff_ghz": 3.228,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.32
+    }
+  ],
+  "n_kept_total": 36,
+  "n_valid_cohorts": 5,
+  "overall_ratio": 0.9996,
+  "effect_pct": -0.04,
+  "cross_cohort_spread_pct": 0.29,
+  "aa_floor_pct": 0.14,
+  "min_cohort_effect_pct": 0.04,
+  "sign_consistent": false,
+  "verdict": "NOT_RESOLVABLE",
+  "interpretation": "NOT RESOLVABLE on this laptop (freq/thermal-bound); needs a quiet box."
+}

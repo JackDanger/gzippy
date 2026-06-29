@@ -1,0 +1,75 @@
+{
+  "oracle": "tablebuild",
+  "corpus": "logsbig.gz",
+  "threads": 1,
+  "gz_arm_change_present": "SINGLE litlen (default)",
+  "ref_arm_change_removed": "GZIPPY_LITLEN_MULTISYM=triple",
+  "gate0_non_inert_pathflip": "yes",
+  "corpus_ratio_isize_over_deflate": 3.718,
+  "binary_commit": "b2d1a2db",
+  "arch": "aarch64-apple-m1pro",
+  "gate0_native_gz": true,
+  "gate0_native_ref": true,
+  "oracle_sha12": "8a22e657734a",
+  "gate0_gz_sha_eq_oracle": true,
+  "gate0_ref_sha_eq_oracle": true,
+  "steady_ghz": 3.217,
+  "warmup_converged": true,
+  "cohorts": [
+    {
+      "cohort": 0,
+      "gz_ref": 0.9539,
+      "aa": 0.999,
+      "eff_ghz": 3.211,
+      "kept": 9,
+      "drop": 0,
+      "freq_delta_pct": 0.6
+    },
+    {
+      "cohort": 1,
+      "gz_ref": 0.9528,
+      "aa": 1.0017,
+      "eff_ghz": 3.217,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.41
+    },
+    {
+      "cohort": 2,
+      "gz_ref": 0.9508,
+      "aa": 1.0,
+      "eff_ghz": 3.219,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.4
+    },
+    {
+      "cohort": 3,
+      "gz_ref": 0.9529,
+      "aa": 0.9998,
+      "eff_ghz": 3.224,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.23
+    },
+    {
+      "cohort": 4,
+      "gz_ref": 0.9548,
+      "aa": 0.9992,
+      "eff_ghz": 3.22,
+      "kept": 8,
+      "drop": 1,
+      "freq_delta_pct": 0.49
+    }
+  ],
+  "n_kept_total": 41,
+  "n_valid_cohorts": 5,
+  "overall_ratio": 0.9529,
+  "effect_pct": -4.71,
+  "cross_cohort_spread_pct": 0.21,
+  "aa_floor_pct": 0.13,
+  "min_cohort_effect_pct": 4.52,
+  "sign_consistent": true,
+  "verdict": "WIN",
+  "interpretation": "CONFIRMED wall win: default (change present) is faster than the removed arm beyond the A/A floor in every cohort."
+}
