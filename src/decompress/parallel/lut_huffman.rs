@@ -2924,3 +2924,117 @@ mod tests {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LEVER GUARD (commit 20758d5c): the skipped-build cfg must NEVER read lut_litlen
+// on the clean path.
+//
+// 20758d5c skips the eager per-block `lut_litlen` build in
+// `marker_inflate::read_header` on exactly the arches where the clean-decode
+// path (`decode_clean_into_contig`, engine-A over `flat_litlen`) does NOT read
+// `lut_litlen`: `not(all(asm-kernel, x86_64))` — i.e. aarch64, or x86 with the
+// asm kernel off. The lever is byte-safe ONLY while that "never read on the
+// clean path" invariant holds. The cursor-footgun it guards against: a future
+// cfg drift that re-routes the clean path back through
+// `lut_litlen.decode_prefilled` would then decode through a table this lever no
+// longer builds — reading a stale / never-initialized (garbage) table, silently.
+//
+// This test ENFORCES the invariant instead of trusting it: it decodes a clean
+// (T1, window-present, no-marker) single-member gzip through the production
+// `single_member::decompress_parallel` path and asserts the litlen READ counter
+// stayed 0. If cfg drift reintroduces a clean-path read it goes nonzero and this
+// FAILS (loud), rather than the decode silently building-nothing / reading
+// garbage. It also asserts BUILDS stayed 0, so reverting the eager-build skip
+// (or otherwise rebuilding the never-read table on the clean path) trips here
+// too.
+//
+// Compiled ONLY under the skipped-build cfg + the `lut-count` data-flow
+// instrument, so it has ZERO production cost and never runs where the invariant
+// legitimately does not hold (x86 + asm-kernel, where the clean path DOES read
+// lut_litlen via run_contig/decode_prefilled). Run it with:
+//   cargo test --release --features lut-count clean_path_lut_guard
+// (default features already pull in `pure-rust-inflate`).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(all(
+    test,
+    feature = "lut-count",
+    parallel_sm,
+    not(all(feature = "asm-kernel", target_arch = "x86_64"))
+))]
+mod clean_path_lut_guard {
+    use super::litlen_count;
+    use std::io::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn t1_clean_path_never_reads_skipped_lut_litlen() {
+        // Compressible, varied text-like data so flate2 emits real DYNAMIC
+        // Huffman blocks (the case the eager build, pre-lever, fired on — base
+        // M1 silesia T1 was builds=3286). An xorshift-perturbed repeating word
+        // pool keeps entropy low enough for dynamic blocks (not stored) yet
+        // varied enough for multiple blocks.
+        const WORDS: &[&[u8]] = &[
+            b"the ",
+            b"quick ",
+            b"brown ",
+            b"fox ",
+            b"jumps ",
+            b"over ",
+            b"lazy ",
+            b"dog ",
+            b"deflate ",
+            b"huffman ",
+            b"litlen ",
+            b"window ",
+            b"marker ",
+            b"chunk ",
+            b"parallel ",
+            b"gzip ",
+        ];
+        let mut data = Vec::with_capacity(4 * 1024 * 1024);
+        let mut x: u32 = 0x1234_5678;
+        while data.len() < 4 * 1024 * 1024 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.extend_from_slice(WORDS[(x >> 16) as usize % WORDS.len()]);
+        }
+
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&data).unwrap();
+            enc.finish().unwrap();
+        }
+
+        // Reset the data-flow counters, then drive the production T1 clean path.
+        litlen_count::BUILDS.store(0, Relaxed);
+        litlen_count::CACHE_HITS.store(0, Relaxed);
+        litlen_count::READS.store(0, Relaxed);
+
+        let mut out = Vec::with_capacity(data.len());
+        let n =
+            crate::decompress::parallel::single_member::decompress_parallel(&gz, &mut out, None, 1)
+                .expect("T1 clean-path decode must succeed");
+
+        // Byte-exactness first — a read==0 on a wrong-bytes decode proves nothing.
+        assert_eq!(out, data, "clean-path decode must be byte-exact");
+        assert_eq!(n as usize, data.len(), "decoded length mismatch");
+
+        let reads = litlen_count::READS.load(Relaxed);
+        let builds = litlen_count::BUILDS.load(Relaxed);
+        assert_eq!(
+            reads, 0,
+            "INVARIANT VIOLATED: the T1 clean path READ lut_litlen {reads}x. Commit \
+             20758d5c skips the eager lut_litlen build on this cfg because the clean \
+             path is engine-A over flat_litlen and never reads lut_litlen; a cfg drift \
+             has re-routed the clean path through lut_litlen.decode_prefilled, which \
+             now decodes through a table this lever no longer builds. Either restore \
+             the eager build for this cfg or stop reading lut_litlen on the clean path."
+        );
+        assert_eq!(
+            builds, 0,
+            "the eager clean-path lut_litlen build should be SKIPPED on this cfg (got \
+             {builds} builds). The 20758d5c redundant-build elimination regressed — \
+             the never-read table is being built again on the clean path."
+        );
+    }
+}
