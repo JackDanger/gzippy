@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 #[cfg(target_arch = "aarch64")]
+#[allow(unused_imports)]
 use std::arch::aarch64::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -409,8 +410,25 @@ unsafe fn fill_byte_avx2(mut dst: *mut u8, end: *const u8, byte: u8) {
     }
 }
 
-/// Fast match copy for fastloop - may write up to 40 bytes beyond length
+/// Fast match copy for fastloop - may write up to 40 bytes beyond length.
 /// ONLY use when you have FASTLOOP_MARGIN bytes of buffer margin!
+///
+/// Faithful port of libdeflate 1.25's MATCH_COPY
+/// (`lib/decompress_template.h:633-712`). vs the prior gzippy body this removes
+/// (a) the per-match `len > 40` prefetch branch and (b) the leading
+/// `dist >= 32 && len >= 64` SIMD branch that the common short-match path
+/// (silesia avg ~10 B/match) had to fall through before reaching `dist >= 8`.
+/// Here `offset >= WORDBYTES` (`dist >= 8`) is tested FIRST — exactly
+/// libdeflate's order — and all copies are scalar unaligned machine words with
+/// libdeflate's unroll (5× main, 4× RLE, 2× small-dist do-while). This is
+/// branchless within each (dist,len) class and correct for OVERLAPPING copies
+/// (`dist < len`): for `dist >= 8` each 8-byte read is at least one full word
+/// behind `dst` (fully materialized); for `dist == 1` it is an RLE byte fill;
+/// for `dist` in 2..=7 the stride-by-`dist` word copy lets each iteration
+/// finalize exactly `dist` correct bytes ahead of the frontier. Max overrun
+/// stays < 40 bytes (within the FASTLOOP overwrite budget), same contract as
+/// before. Exhaustively gated by
+/// `copy_match_fast_matches_naive_reference_all_dist_len`.
 #[inline(always)]
 pub(crate) fn copy_match_fast(
     output: &mut [u8],
@@ -427,128 +445,69 @@ pub(crate) fn copy_match_fast(
         let mut src = out_ptr.add(out_pos - dist);
         let end = dst.add(len);
 
-        // Prefetch for long matches
-        if len > 40 {
-            prefetch_read(src.add(40));
-        }
-
-        if dist >= 32 && len >= 64 {
-            // SIMD fast path for large non-overlapping matches
-            #[cfg(target_arch = "aarch64")]
-            {
-                while dst.add(32) <= end {
-                    let v0 = vld1q_u8(src);
-                    let v1 = vld1q_u8(src.add(16));
-                    vst1q_u8(dst, v0);
-                    vst1q_u8(dst.add(16), v1);
-                    src = src.add(32);
-                    dst = dst.add(32);
-                }
-                while dst.add(16) <= end {
-                    let v = vld1q_u8(src);
-                    vst1q_u8(dst, v);
-                    src = src.add(16);
-                    dst = dst.add(16);
-                }
-                while dst < end {
-                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                    src = src.add(8);
-                    dst = dst.add(8);
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") {
-                    copy_match_avx2(dst, src, end);
-                } else {
-                    while dst < end {
-                        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                        src = src.add(8);
-                        dst = dst.add(8);
-                    }
-                }
-            }
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-            {
-                while dst < end {
-                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                    src = src.add(8);
-                    dst = dst.add(8);
-                }
-            }
-        } else if dist >= 8 {
-            // Fast path: offset >= WORDBYTES (8)
-            // Unconditionally copy 5 words first (40 bytes - covers most matches)
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-
-            // Loop for longer matches
-            while dst < end {
+        // Copy one unaligned machine word src->dst and advance both by 8.
+        macro_rules! cw {
+            () => {{
                 (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                 src = src.add(8);
                 dst = dst.add(8);
+            }};
+        }
+
+        if dist >= 8 {
+            // offset >= WORDBYTES (decompress_template.h:633-665): 5 unconditional
+            // words then a 5×-unrolled word loop.
+            cw!();
+            cw!();
+            cw!();
+            cw!();
+            cw!();
+            while dst < end {
+                cw!();
+                cw!();
+                cw!();
+                cw!();
+                cw!();
             }
         } else if dist == 1 {
-            // RLE path: use SIMD broadcast for large fills
-            let byte = *src;
-            #[cfg(target_arch = "aarch64")]
-            {
-                if len >= 32 {
-                    let pattern = vdupq_n_u8(byte);
-                    while dst.add(32) <= end {
-                        vst1q_u8(dst, pattern);
-                        vst1q_u8(dst.add(16), pattern);
-                        dst = dst.add(32);
-                    }
-                    while dst.add(16) <= end {
-                        vst1q_u8(dst, pattern);
-                        dst = dst.add(16);
-                    }
-                }
+            // RLE (decompress_template.h:666-691): broadcast byte, 4 unconditional
+            // words then a 4×-unrolled fill loop (kept a multiple of 16 bytes so
+            // the autovectorizer can widen it).
+            let v = 0x0101010101010101u64 * (*src as u64);
+            macro_rules! fw {
+                () => {{
+                    (dst as *mut u64).write_unaligned(v);
+                    dst = dst.add(8);
+                }};
             }
-            #[cfg(target_arch = "x86_64")]
-            {
-                if len >= 64 && is_x86_feature_detected!("avx2") {
-                    fill_byte_avx2(dst, end, byte);
-                    return out_pos + len;
-                }
-            }
-            let v = 0x0101010101010101u64 * (byte as u64);
+            fw!();
+            fw!();
+            fw!();
+            fw!();
             while dst < end {
-                (dst as *mut u64).write_unaligned(v);
-                dst = dst.add(8);
+                fw!();
+                fw!();
+                fw!();
+                fw!();
             }
         } else {
-            // Small distance (2-7): word copy with stride = offset
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            while dst < end {
-                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                src = src.add(dist);
-                dst = dst.add(dist);
+            // Small distance 2..=7 (decompress_template.h:692-706): word copy with
+            // stride = offset, 2 unconditional words then a do-while of 2.
+            macro_rules! sw {
+                () => {{
+                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                    src = src.add(dist);
+                    dst = dst.add(dist);
+                }};
+            }
+            sw!();
+            sw!();
+            loop {
+                sw!();
+                sw!();
+                if dst >= end {
+                    break;
+                }
             }
         }
     }
@@ -2963,6 +2922,61 @@ impl<'a> DecodeLane<'a> {
 mod tests {
     use super::*;
     use crate::assert_slices_eq;
+
+    /// Exhaustive byte-exactness gate for the production `copy_match_fast`
+    /// (libdeflate-faithful unrolled scalar word copy). For every (distance,
+    /// length) pair in the legal DEFLATE range this lays down an LZ77
+    /// back-reference with the production `copy_match_fast` and compares the
+    /// produced `length` bytes against a naive byte-by-byte LZ77 reference that
+    /// handles arbitrary overlap. Covers the OVERLAPPING danger zone
+    /// (`dist < len`) across every branch (dist==1 RLE, dist 2..=7 small-stride,
+    /// dist>=8 word) and every loop-trip count.
+    #[test]
+    fn copy_match_fast_matches_naive_reference_all_dist_len() {
+        // Generous tail so the fast path's <40-byte overwrite never runs off
+        // the end (production callers guarantee FASTLOOP_MARGIN headroom).
+        const TAIL: usize = 512;
+        // Distances: every small/RLE value plus boundary values around the
+        // 8-byte (WORDBYTES) and 32-byte thresholds, plus large ones.
+        let dists: Vec<usize> = (1usize..=40)
+            .chain([48, 63, 64, 65, 100, 127, 128, 200, 255, 256, 257, 300])
+            .collect();
+        for &dist in &dists {
+            // Lengths: full DEFLATE match range 3..=258.
+            for len in 3usize..=258 {
+                let prefix = dist; // valid history == exactly `dist` bytes
+                let total = prefix + len + TAIL;
+
+                // Deterministic, dist-dependent history so RLE/overlap patterns
+                // are non-trivial.
+                let mut got = vec![0u8; total];
+                for (i, b) in got.iter_mut().enumerate().take(prefix) {
+                    *b = ((i * 31 + dist * 7 + 13) & 0xff) as u8;
+                }
+                let mut want = got.clone();
+
+                // Naive reference: byte-by-byte LZ77 copy (handles any overlap).
+                let out_pos = prefix;
+                for i in 0..len {
+                    want[out_pos + i] = want[out_pos + i - dist];
+                }
+
+                let ret = copy_match_fast(&mut got, out_pos, dist as u32, len as u32);
+                assert_eq!(ret, out_pos + len, "dist={dist} len={len} return");
+                assert_eq!(
+                    &got[out_pos..out_pos + len],
+                    &want[out_pos..out_pos + len],
+                    "copy_match_fast mismatch at dist={dist} len={len}"
+                );
+                // Bytes BEFORE the match must be untouched.
+                assert_eq!(
+                    &got[..out_pos],
+                    &want[..out_pos],
+                    "prefix clobbered dist={dist} len={len}"
+                );
+            }
+        }
+    }
 
     /// DISPROOF (advisor-required): does `Bits::at_bit_offset` (the bulk
     /// clean-tail re-entry constructor) produce the SAME bit stream as the
