@@ -43,8 +43,16 @@
   },
   "x86_unaffected": {
     "static_cfg_proof": "On x86_64 pure-rust-inflate (asm-kernel pulled ON), the eager-build cfg evaluates IDENTICALLY before/after: BEFORE second arm 'pure_inflate_decode'=true; AFTER second arm 'all(pure_inflate_decode, asm-kernel, x86_64)'=true. The legacy isal-x86 arm is unchanged. The cfg only flips true->false on aarch64 and on x86 asm-OFF -- both non-asm clean-path configs that decode via flat_litlen and never read lut_litlen.",
-    "functional_x86_run": "OWED -- the x86 asm-kernel cross-build on x86_64-apple-darwin fails with 'inline assembly requires more registers' in asm_kernel.rs (UNTOUCHED code); reproduced IDENTICALLY on the clean base tree => pre-existing M1-cross environment limitation, not this change. x86/M4 functional sha+abmeasure owed on a real x86 box.",
-    "x86_keeps_build_and_read": "x86 production (asm-kernel) still eager-builds in read_header AND reads via run_contig/decode_prefilled; the +7.7% multisym-TRIPLE path is untouched (litlen_multisym_flag still TRIPLE on x86)."
+    "functional_x86_run": "CONFIRMED on neurotic (real GenuineIntel x86_64, path=ParallelSM, --no-default-features --features pure-rust-inflate, RUSTFLAGS=-C target-cpu=native). Variant=ec74ae75 (lever 20758d5c + this guard test); base=3d590738 (lever's direct parent). The earlier x86_64-apple-darwin cross-build failure ('inline assembly requires more registers') was a pre-existing M1-cross limitation, not this change.",
+    "x86_confirm_neurotic": {
+      "box": "neurotic, GenuineIntel x86_64, path=ParallelSM (GZIPPY_DEBUG stamped)",
+      "variant_sha_eq_oracle": "BYTE-EXACT on silesia/logs/monorepo at T1 and T4 (silesia 028bd002..., logs 35c38d94..., monorepo 0dd50d07...)",
+      "base_sha_eq_oracle": "BYTE-EXACT on the same 9 cells; base decode output == variant decode output == gzip -dc oracle (identical x86 decode behavior)",
+      "cfg_inert_on_x86_lut_counts": "variant (lever cfg, +lut-count) silesia T1: builds=3286 reads=6593; base-form-cfg rebuild (eager-build cfg reverted to bare pure_inflate_decode, +lut-count) silesia T1: builds=3286 reads=6593 -- IDENTICAL. T4: reads=15661095 identical, builds 3305 vs 3306 (1-block cache-eviction run variance). Both BUILD>0 AND READ>0 on x86 => the eager build still runs and lut_litlen is still read on the x86 clean path; the lever's skip never applies on x86.",
+      "wall_t1_silesia_dev_null_interleaved_n9": "variant min=0.67s, base min=0.66s, variant/base min-ratio=1.0152; Delta(0.01s) < inter-run spread(~0.02s/3%) => TIE, no x86 regression. (Expected: on x86 the two binaries do byte-identical work.)",
+      "binary_sha256": { "variant_prod": "937e1e95fc0235254a2969a52a79e3c819b7595885108d07f94cafa3089d7275", "base_prod": "07a00462370f041122a3447791a844a4d99259807aca7373ef6de5ebc36afc85" }
+    },
+    "x86_keeps_build_and_read": "x86 production (asm-kernel) still eager-builds in read_header AND reads via run_contig/decode_prefilled; the +7.7% multisym-TRIPLE path is untouched (litlen_multisym_flag still TRIPLE on x86). CONFIRMED empirically on neurotic: T1 builds=3286 reads=6593 (see x86_confirm_neurotic)."
   },
   "wall_status": "HYPOTHESIS until wall-gated on a quiet box (fulcrum abmeasure/optgate on Linux x86/arm). Instruction reduction is load-immune and gated; wall is the downstream check."
 }
