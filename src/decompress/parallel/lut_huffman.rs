@@ -176,6 +176,53 @@ pub fn dump_rebuild_profile() {
         eprintln!("  TOTAL          cyc/blk={:>8.1}", tot as f64 / n as f64);
     }
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// DATA-FLOW INSTRUMENT (feature = "lut-count"). Counts per-block litlen LUT
+// BUILDS (real construction work in `rebuild_from_multisym`), cache HITS (build
+// skipped), and READS (`decode_prefilled`, which `decode` funnels through). The
+// question it answers deterministically: on a given arch's clean-decode path, is
+// the `lut_litlen` table READ at all, or built-then-never-read? `READS == 0` with
+// `BUILDS > 0` is the non-inert proof of a redundant build. Zero overhead unless
+// the feature is compiled in.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "lut-count")]
+pub mod litlen_count {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static BUILDS: AtomicU64 = AtomicU64::new(0); // real table constructions
+    pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0); // MRU-cache build skips
+    pub static READS: AtomicU64 = AtomicU64::new(0); // decode_prefilled invocations
+
+    #[inline(always)]
+    pub fn note_build() {
+        BUILDS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn note_cache_hit() {
+        CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn note_read() {
+        READS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Dump the litlen BUILD/READ data-flow counters (feature = "lut-count").
+/// No-op otherwise. Gated at the call site on `GZIPPY_LUT_COUNT`.
+pub fn dump_litlen_count() {
+    #[cfg(feature = "lut-count")]
+    {
+        use litlen_count::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        if std::env::var_os("GZIPPY_LUT_COUNT").is_none() {
+            return;
+        }
+        let b = BUILDS.load(Relaxed);
+        let h = CACHE_HITS.load(Relaxed);
+        let r = READS.load(Relaxed);
+        eprintln!("LUT_LITLEN_COUNT builds={b} cache_hits={h} reads={r}");
+    }
+}
+
 pub const ISAL_DEF_LIT_SYMBOLS: usize = 257;
 pub const ISAL_DEF_LEN_SYMBOLS: usize = 29;
 pub const ISAL_DEF_DIST_SYMBOLS: usize = 30;
@@ -1207,6 +1254,8 @@ impl LutLitLenCode {
                     && self.cache_key[..n] == *code_lengths
                 {
                     tbuild_cache::HITS.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "lut-count")]
+                    litlen_count::note_cache_hit();
                     return true;
                 }
                 tbuild_cache::MISSES.fetch_add(1, Ordering::Relaxed);
@@ -1319,6 +1368,8 @@ impl LutLitLenCode {
         }
         #[cfg(feature = "profile-rebuild")]
         prof::add(&prof::N_BLOCKS, 1);
+        #[cfg(feature = "lut-count")]
+        litlen_count::note_build();
 
         self.valid = true;
         // Record this freshly-built table as the MRU cache key so a later block
@@ -1390,6 +1441,8 @@ impl LutLitLenCode {
             bits.available() >= 32 || bits.pos == bits.data.len(),
             "decode_prefilled called without the post-refill precondition"
         );
+        #[cfg(feature = "lut-count")]
+        litlen_count::note_read();
         let next_bits = bits.peek();
         let next_12_bits = (next_bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
         let mut next_sym = self.table.short_code_lookup[next_12_bits];

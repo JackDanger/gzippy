@@ -151,6 +151,10 @@ fn main() {
     // Instrument-validity hit counter (no-op unless GZIPPY_SLOW_HITS=1) — proves
     // the slow-knob injection site is the live native clean loop (TASK 1).
     decompress::parallel::slow_knob::report_hits();
+    // Data-flow instrument (feature = "lut-count", GZIPPY_LUT_COUNT=1): per-block
+    // litlen LUT builds vs reads. No-op without the feature/env.
+    #[cfg(parallel_sm)]
+    decompress::parallel::lut_huffman::dump_litlen_count();
 
     // main_end + report() BEFORE process::exit (which skips destructors). Captures
     // POST userspace (crc_verified->main_end); the residual process-wall beyond

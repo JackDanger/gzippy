@@ -1397,13 +1397,31 @@ impl Block {
         self.at_end_of_block = false;
         self.decoded_bytes_at_block_start = self.decoded_bytes;
         self.backreferences.clear();
+        // EAGER litlen-LUT build — kept ONLY where the clean-decode hot path READS
+        // `lut_litlen`, i.e. when the BMI2 asm kernel owns the contig loop
+        // (`run_contig` + `decode_prefilled`, the x86 +7.7% multisym-TRIPLE win) or
+        // the legacy ISA-L x86 path. That condition is the exact inverse of the
+        // `decode_clean_into_contig` engine-A cfg `not(all(asm-kernel, x86_64))`:
+        // when engine A is compiled in (aarch64, or x86 asm-off) the clean path
+        // decodes through `flat_litlen` (a `LitLenTable`) and NEVER touches
+        // `lut_litlen`, so an eager per-block build here is built-then-discarded
+        // (measured M1 silesia T1: builds=3286, reads=0). On those arches the
+        // build is left to the lazy, latch-guarded sites that actually read the
+        // table — the marker/ring path (`read_internal_compressed_specialized`)
+        // and the engine-B fallback in `decode_clean_into_contig` — so the table
+        // is still built (identically) on demand wherever it is read; only the
+        // never-read clean-path build is retired. Byte-exact: the build is a
+        // deterministic function of the code lengths, relocated/skipped, never
+        // changed. The dynamic-header validity check is preserved on the clean
+        // path by `LitLenTable::build` (engine A's `ensure_flat_litlen`) and on
+        // the fallback paths by the lazy `build_huffman_luts_for_block()?`.
         #[cfg(any(
             all(
                 feature = "isal-compression",
                 not(feature = "pure-rust-inflate"),
                 target_arch = "x86_64"
             ),
-            pure_inflate_decode
+            all(pure_inflate_decode, feature = "asm-kernel", target_arch = "x86_64")
         ))]
         {
             self.build_huffman_luts_for_block()?;
