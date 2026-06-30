@@ -117,6 +117,12 @@ asm-kernel = []
 # expensive build sub-step. Dump via `gzippy::decompress::parallel::lut_huffman::
 # dump_rebuild_profile()`.
 profile-rebuild = []
+# ── Data-flow instrument: count per-block lut_huffman litlen BUILDS vs READS
+# (decode/decode_prefilled). Proves whether the engine-B `lut_litlen` table is
+# READ on a given arch's clean-decode path or built-then-discarded. Zero overhead
+# unless this feature is on (relaxed atomics + a report() at process exit). Dump:
+# set GZIPPY_LUT_COUNT=1; counters print at end of run. See lut_huffman::litlen_count.
+lut-count = []
 # ── Phase-2 two-path decode (2026-06-06) ──────────────────────────────────────
 # gzippy-native (intended DEFAULT production once parallel-module lint debt is
 # cleared): ONE unified pure-Rust decode engine, NO C-FFI in the DECODE graph, on

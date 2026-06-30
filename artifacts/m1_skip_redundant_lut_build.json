@@ -1,0 +1,50 @@
+{
+  "deliverable": "m1-skip-redundant-lut-build",
+  "date": "2026-06-30",
+  "branch": "perf/m1-skip-redundant-lut-build",
+  "base_src_sha": "3d590738c3d83585fa87ddd4d37bb5a7ff150d1c",
+  "arch": "aarch64 (Apple M1 Pro)",
+  "build": "--no-default-features --features pure-rust-inflate, RUSTFLAGS=-C target-cpu=native, path=ParallelSM",
+  "hypothesis": "On M1/aarch64 the per-block lut_huffman litlen table (asm.lut_litlen) is BUILT every block-header in read_header but, on the T1 clean-decode path, NEVER READ (the clean contig path is engine-A consume_first_decode::decode_huffman_fastloop_bounded_pipelined + its own flat_litlen LitLenTable; lut_litlen.decode_prefilled is the reader and it is the inverse cfg of engine-A's compile gate).",
+  "data_flow_confirmation": {
+    "instrument": "feature=lut-count, GZIPPY_LUT_COUNT=1 (lut_huffman::litlen_count: BUILDS/CACHE_HITS/READS atomics; non-inert Gate-0)",
+    "lut_litlen_built_independently_of_flat_litlen": true,
+    "flat_litlen_derived_from_lut_huffman": false,
+    "note": "LitLenTable (flat_litlen, libdeflate_entry) is built from the raw code lengths, NOT from lut_huffman output. The two are independent tables. Redundancy CONFIRMED at T1.",
+    "base_M1_T1_silesia": { "builds": 3286, "cache_hits": 78, "reads": 0 },
+    "after_M1_T1_silesia": { "builds": 0, "cache_hits": 0, "reads": 0 },
+    "base_M1_T10_silesia": { "builds": 3324, "cache_hits": 1, "reads": 22186250 },
+    "after_M1_T10_silesia": { "builds": 1179, "cache_hits": 1, "reads": 22186232 },
+    "interpretation": "At T1 the table was built 3286x and read 0x -> redundant build eliminated (3286->0). At T10 the marker/ring path reads it 22.18M x; the after build keeps building lazily exactly where read (1179 builds = marker-path blocks), only the never-read clean-path eager builds are retired. reads unchanged (~22.18M, run-variance only)."
+  },
+  "removal_oracle": {
+    "change": "marker_inflate.rs read_header: the eager per-block build_huffman_luts_for_block() is now cfg-gated to exactly where the clean path READS lut_litlen, i.e. any(legacy-isal-x86, all(pure_inflate_decode, asm-kernel, x86_64)) -- the exact inverse of decode_clean_into_contig's engine-A gate not(all(asm-kernel, x86_64)). On aarch64 (and x86 asm-off) the build is left to the lazy latch-guarded readers (read_internal_compressed_specialized:2005, engine-B fallback:3595).",
+    "byte_exact_rationale": "Build is a deterministic function of code lengths; it is relocated/skipped, never changed. Validity check preserved: clean path via LitLenTable::build (engine-A ensure_flat_litlen), fallback paths via lazy build_huffman_luts_for_block()?."
+  },
+  "load_immune_instruction_reduction": {
+    "metric": "instructions retired (/usr/bin/time -l, kpc) -- load-immune; interleaved N=9, T1 silesia",
+    "base_median_instr": 1916833098,
+    "after_median_instr": 1823499644,
+    "delta_instr": 93333454,
+    "delta_pct": 4.87,
+    "base_inter_run_spread": 3988493,
+    "after_inter_run_spread": 3473665,
+    "significance": "delta 93.3M >> spread ~4M (>20x). Exceeds the ~58M lut_build-phase estimate because whole-program also drops the table memset/short+long fill traffic of the 3286 eliminated builds.",
+    "ab_base_bin_sha256": "b2d4bcc6ef6dbee05e5125dada933884c31526da30b3b9b4046924777aa33f1b",
+    "ab_after_bin_sha256": "1189d8fa33587de0250b1b74e4b67a3bcf786f088c15ccdbe289c08dbdf5b6fb"
+  },
+  "byte_exactness": {
+    "oracle_decompressed_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+    "silesia": { "T1": "BYTE-EXACT", "T4": "BYTE-EXACT", "T10": "BYTE-EXACT" },
+    "logs": { "T1": "BYTE-EXACT", "T4": "BYTE-EXACT", "T10": "BYTE-EXACT" },
+    "monorepo": { "T1": "BYTE-EXACT", "T4": "BYTE-EXACT", "T10": "BYTE-EXACT" },
+    "cargo_test": "952 passed / 0 failed (lib, --features pure-rust-inflate); lut_huffman proptest + inflate corpus + decompress + marker differentials all pass",
+    "make_quick": "passed"
+  },
+  "x86_unaffected": {
+    "static_cfg_proof": "On x86_64 pure-rust-inflate (asm-kernel pulled ON), the eager-build cfg evaluates IDENTICALLY before/after: BEFORE second arm 'pure_inflate_decode'=true; AFTER second arm 'all(pure_inflate_decode, asm-kernel, x86_64)'=true. The legacy isal-x86 arm is unchanged. The cfg only flips true->false on aarch64 and on x86 asm-OFF -- both non-asm clean-path configs that decode via flat_litlen and never read lut_litlen.",
+    "functional_x86_run": "OWED -- the x86 asm-kernel cross-build on x86_64-apple-darwin fails with 'inline assembly requires more registers' in asm_kernel.rs (UNTOUCHED code); reproduced IDENTICALLY on the clean base tree => pre-existing M1-cross environment limitation, not this change. x86/M4 functional sha+abmeasure owed on a real x86 box.",
+    "x86_keeps_build_and_read": "x86 production (asm-kernel) still eager-builds in read_header AND reads via run_contig/decode_prefilled; the +7.7% multisym-TRIPLE path is untouched (litlen_multisym_flag still TRIPLE on x86)."
+  },
+  "wall_status": "HYPOTHESIS until wall-gated on a quiet box (fulcrum abmeasure/optgate on Linux x86/arm). Instruction reduction is load-immune and gated; wall is the downstream check."
+}
