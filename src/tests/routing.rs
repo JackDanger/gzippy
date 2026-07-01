@@ -710,6 +710,63 @@ mod tests {
     }
 
     // =========================================================================
+    // GATE-A guard (2026-06-30, `perf/m1-litlen-preload`) — locks the
+    // correctness precondition of the load-before-refill preload reorder in
+    // `decode_huffman_fastloop_bounded_pipelined` (consume_first_decode.rs).
+    //
+    // The reorder (preload next litlen entry from the CURRENT bitbuf, THEN
+    // refill) is byte-identical to the base ONLY when
+    // `bitsleft >= LitLenTable::TABLE_BITS` at the preload site — the refill
+    // preserves the low TABLE_BITS index bits only when it ORs strictly above
+    // them. A `debug_assert!` at that site (the "instrumented count that must be
+    // 0 on the fast path") makes any future cfg/code drift that breaks the
+    // invariant PANIC in a debug/test build instead of silently corrupting
+    // output.
+    //
+    // This test drives the PRODUCTION clean fast path (T1, window-present,
+    // no-marker) through `single_member::decompress_parallel` on match-heavy
+    // (low-entropy) data — every length-match iteration hits the guarded preload
+    // — and asserts byte-exact roundtrip output. Two-layer coverage:
+    //   * debug build: the `debug_assert!` fires precisely on any bitsleft<11
+    //     preload (this test panics), and
+    //   * release build (`cargo test --release`): a violated invariant corrupts
+    //     the decode, so the byte-exact `assert_eq!` below fails.
+    // On non-`parallel_sm` builds the pipelined kernel is not the decode path,
+    // so the test is compiled out.
+    // =========================================================================
+    #[cfg(parallel_sm)]
+    #[test]
+    fn test_litlen_preload_invariant_clean_fastloop_byte_exact() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Match-heavy so the fastloop's length-match path (which contains the
+        // guarded load-before-refill preload) runs many thousands of times.
+        // Large enough to clear FASTLOOP_MARGIN and drive a real fastloop.
+        let original = make_low_entropy_data(8 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        // T1 (num_threads = 1) → single clean chunk-0 decode on the pipelined
+        // Rust kernel (marker_inflate flat-contig path); no u16-marker resolve.
+        let mut output = Vec::new();
+        crate::decompress::parallel::single_member::decompress_parallel(
+            &compressed,
+            &mut output,
+            None,
+            1,
+        )
+        .expect("clean T1 parallel-SM decode must succeed");
+
+        assert_eq!(
+            output, original,
+            "load-before-refill preload produced wrong bytes on the clean fastloop \
+             — the bitsleft>=TABLE_BITS invariant is violated (see the debug_assert \
+             in decode_huffman_fastloop_bounded_pipelined)"
+        );
+    }
+
+    // =========================================================================
     // Deletion-trap killer — the routing-assertion test from the v0.6 marker
     // decoder premortem.
     //
