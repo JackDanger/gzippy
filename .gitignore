@@ -1,0 +1,70 @@
+# Build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# Test data (generated, not the seed)
+/test_data/*
+!/test_data/text-1MB.txt
+!/test_data/alice.txt
+/test_results/
+
+# Benchmark data - only track silesia corpus (47MB xz), rest generated on demand
+# Run scripts/prepare_benchmark_data.sh to regenerate all datasets
+/benchmark_data/*
+!/benchmark_data/silesia.tar.xz
+
+# Compressed test outputs
+*.gz
+!scripts/*.gz
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug/profiling
+*.log
+*.prof
+perf.data*
+/cloud-logs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local settings
+.claude
+
+# GPG private key — export to 1Password, never commit
+gzippy-apt-signing-key.asc
+
+# Fulcrum decide artifacts: raw trace JSON files are regenerable; exclude to keep
+# the repo lean. Keep TABLE.txt/manifest/wall_*/verbose/prof/effect_* artifacts.
+artifacts/decide/**/*.json
+# fulcrum decide run artifacts: keep only small text evidence; traces/sinks regenerable
+artifacts/decide/**/*.bin
+artifacts/decide/**/trace.json
+artifacts/decide/decide_*/
+!artifacts/decide/decide_20260611T052041Z/
+!artifacts/decide/decide_20260611T052041Z/**/
+!artifacts/decide/decide_20260611T052041Z/**/*.txt
+
+# fulcrum: self-test stamp is machine-local (SELF-TEST-OR-NO-TRUST)
+tools/fulcrum/.selftest-stamp.json
+tools/fulcrum/**/__pycache__/
+!artifacts/decide/decide_20260611T193035Z/
+!artifacts/decide/decide_20260611T193035Z/**/
+!artifacts/decide/decide_20260611T193035Z/**/*.txt
+
+# machine-local fulcrum config + regenerable measurement artifacts
+.fulcrum/
+artifacts/standing/
+artifacts/kernel-gate/
+!.fulcrum/findings.jsonl

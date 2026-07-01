@@ -1,0 +1,79 @@
+# =============================================================================
+# Debian packages: manual smoke-test for .deb builds
+# =============================================================================
+# The release.yml workflow builds and publishes .deb packages on version tags.
+# This workflow exists for isolated manual testing of the Debian packaging.
+# =============================================================================
+name: Debian packages (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-deb:
+    name: Build Debian ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debhelper devscripts build-essential \
+            zlib1g-dev cmake nasm autoconf automake libtool
+
+      - name: Set version from git
+        run: |
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0-dev")
+          DEB_VERSION="${VERSION}-1"
+          sed -i "1s/gzippy ([^)]*)/gzippy ($DEB_VERSION)/" debian/changelog
+          echo "debian/changelog version set to $DEB_VERSION"
+
+      - name: Build Debian packages
+        run: dpkg-buildpackage -us -uc -b -d
+
+      - name: Test gzippy package
+        run: |
+          sudo dpkg -i ../gzippy_*.deb
+          gzippy --version
+          echo "Hello, World!" | gzippy -c | gzippy -d
+          echo "✓ gzippy installed"
+
+      - name: Test gzip replacement via dpkg-divert
+        run: |
+          ls -la /usr/bin/gzip
+          [ "$(readlink /usr/bin/gzip)" = "gzippy" ] || (echo "gzip symlink wrong: $(readlink /usr/bin/gzip)"; exit 1)
+          [ "$(readlink /usr/bin/gunzip)" = "gzippy" ] || (echo "gunzip symlink wrong"; exit 1)
+          [ "$(readlink /usr/bin/zcat)" = "gzippy" ] || (echo "zcat symlink wrong"; exit 1)
+          echo "Test data" > /tmp/test.txt
+          gzip -c /tmp/test.txt | gunzip -c > /tmp/test2.txt
+          diff /tmp/test.txt /tmp/test2.txt
+          dpkg-divert --list | grep gzippy
+          echo "✓ gzip/gunzip/zcat point to gzippy via dpkg-divert"
+
+      - name: Collect .deb files into workspace
+        run: cp ../*.deb ./
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: debian-packages-${{ matrix.arch }}
+          path: "*.deb"

@@ -1,0 +1,64 @@
+[contig-prof] CONTIG (Block::decode_clean_into_contig):
+  calls=1772 total_cyc=1219620106 classed_cyc=1219231746 (100.0% of total; rest=careful+entry/exit+unchained tail)
+  lit1   : iters=     2240400 cyc=     147829044  12.1% of classed,   66.0 cyc/iter
+  litpack: iters=      615530 cyc=      46853238   3.8% of classed,   76.1 cyc/iter, lits=4198991
+  litchn : iters=     4310114 cyc=     284170192  23.3% of classed,   65.9 cyc/iter, lits=11728394
+  backref: iters=    10841757 cyc=     740379272  60.7% of classed,   68.3 cyc/iter, bytes=118684663 dist_long=247
+  careful: cyc=2314 (0.0% of total) outer_iters=7
+  disttbl: builds=1768 reuses=3 (P3.4 dynamic-block dist_table amortization)
+[contig-prof] WRAPPER (decode_huffman_body_resumable):
+  calls=0 total_cyc=0 classed_cyc=0 (0.0%)
+  lit    : iters=           0 cyc=             0   0.0% of classed,    0.0 cyc/iter
+  match  : iters=           0 cyc=             0   0.0% of classed,    0.0 cyc/iter
+[gzippy --verbose] BlockFetcher statistics:
+        Total Existing                : 38
+        Total Fetched                 : 17
+        Prefetched                    : 16
+        Fetched On-demand             : 1
+    Prefetch Stall by BlockFinder     : 0
+    Time spent in:
+        decodeBlock                   : 2.129386 s
+        std::future::get              : 0.082521 s
+        get                           : 0.082925 s
+    Thread Pool Utilization:
+        Total Real Decode Duration    : 0.583829 s
+        Theoretical Optimal Duration  : 0.532346 s
+        Pool Efficiency (Fill Factor) : 91.18 %
+    Prefetch Cache:
+        Hits                          : 9
+        Misses                        : 8
+        Unused Entries                : 0
+    Cache Hit Rate                    : 52.94 %
+    Useless Prefetches                : 0.00 %
+
+  Preemptive stops: 0
+  Time queuing post-processing: 0.000000 s
+  Adjusted chunk size applied: 0
+  Prefetch next-offset filesize-accepts: 2
+  Unsplit blocks emplaced: 23
+  Eager post-process: runs=455 runs_nonempty=6 inspected=320 submitted=7 max/run=2 reused=2
+  Eager harvest ready: 5
+  Prefetch post-process promoted: 0 harvest-promoted: 0 already-resolved take: 0
+  Unified decoder: flip_to_clean=13 finished_no_flip=4 finish_decode=0 inflate_wrapper=0 window_seeded=1 seeded_block=1 seeded_wrapper=0 exact_block=0 exact_wrapper=0 bad_seed_resync=0 resumable_resync_calls=0 handoff_window_grows=0
+  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks=0 isal_fallbacks=0 bfinal_exact_accepted=0 until_exact_fb=0 inexact_fb=0
+  Max concurrently-live ChunkData (in-flight depth): 8  (live now: 0)
+  Buffer pool u8: hits=0 misses=0 returns=0
+  Buffer pool u16: hits=0 misses=0 returns=0
+  Per-worker buffer pool activity (worker: u8 h/m/r | u16 h/m/r):
+  Bootstrap pool: takes=0 allocs=0 returns=0 dropped=0 reused_MB=0.0 reuse_rate=0.0%
+  Slow-path decode: ok=16 fail=0 no_candidate=0
+  Early window publish: published=17 handoff_key=7 tail_not_clean=0 range_speculative=0
+  BlockFinder coordinator spawns: 16
+  Speculation failure modes: header=13 body=2 inflate=0 stop_missed=0 other=0
+  Speculation phantom-EOS rejects: 1
+  Post-process path: fused_lut=16 small_markers=0
+  Prefetch dispatch: called=401 saturated=382 zero_submitted=6 any_submitted=13 total_submitted=16 pollution_stops=0
+  Body-fail forensics: count=2 wasted_bytes=917 avg_waste=458B avg_bits_into_body=818
+    by variant: invalid_huffman=2 exceeded_window=0 invalid_compression=0 invalid_code_lengths=0 other=0
+  BlockFinder spawn breakdown: calls=0 total_ms=0.0 scan_ms=0.0 consumer_ms=0.0 avg_total_us=0
+  Bootstrap per-block: header_calls=1047 header_ms=15.7 avg_header_us=15.0 body_ms=914.5 body_bytes=74917175 body_rate_MB/s=82 clean_flipped_bytes=1480180 (2.0% of body = marker-FREE complement; marker loop owns the other 98.0%)
+  Prefetch guard-rejects: 0
+  Clean decode (pred@key / pred@seed / handoff@stop / boundary@seed / candidate): 0 / 0 / 0 / 0 / 0
+  Worker resolve-ahead: ok=7 / attempts=7
+  Arc::try_unwrap hits/misses: 15 / 0
+  Consumer pair-ready drains: 16

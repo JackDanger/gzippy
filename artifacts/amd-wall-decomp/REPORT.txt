@@ -1,0 +1,93 @@
+# AMD WALL-DECOMP — gz-vs-rg 3-region partition + 3 conservation residuals
+# source: /dev/shm/amd-wall-decomp/raw.csv  (perf cycles total; region cyc = thread-summed exclusive TSC, frozen box)
+
+## monorepo T2  (N=9)
+   gz_perf=617,472,519  rg_perf=608,147,676  gap=gz-rg=9,324,843 (+1.5%)
+   spread: gz_perf=2.2% rg_perf=1.2%  A/A: perf=0.09% worker=0.03%
+   sched: ctx-sw gz=254 rg=101  migrations gz=0 rg=0
+   region              gz_cyc          rg_cyc    delta(gz-rg)   %ofgap
+   WORKER         537,107,480     507,992,632      29,114,848   312.2%
+   MARKERPP        58,111,928      87,964,548     -29,852,620  -320.1%
+   OUTPUT             380,744         856,016        -475,272    -5.1%
+   OTHER           21,872,367      11,334,480      10,537,887   113.0%
+   -- CONSERVATION --
+   (i)   R_OTHER_gz = 21,872,367  resid_i  = 3.54%  PASS
+   (ii)  R_OTHER_rg = 11,334,480  resid_ii = 1.86%  PASS
+   (iii) gap - sum(D_r) = 10,537,887  = 1.71% of total | 113.0% of gap -> N/A (gap 1.5% < 3.0% attribution floor: near-TIE, not a loss cell)
+   OVERLAP: gz=0 rg=0  PASS
+
+## monorepo T4  (N=9)
+   gz_perf=679,072,113  rg_perf=731,463,799  gap=gz-rg=-52,391,686 (-7.2%)
+   spread: gz_perf=1.6% rg_perf=1.7%  A/A: perf=0.09% worker=0.62%
+   sched: ctx-sw gz=278 rg=107  migrations gz=15 rg=12
+   region              gz_cyc          rg_cyc    delta(gz-rg)   %ofgap
+   WORKER         596,495,312     614,881,456     -18,386,144    35.1%
+   MARKERPP        77,780,640     116,650,128     -38,869,488    74.2%
+   OUTPUT             390,012         951,944        -561,932     1.1%
+   OTHER            4,406,149      -1,019,729       5,425,878   -10.4%
+   -- CONSERVATION --
+   (i)   R_OTHER_gz = 4,406,149  resid_i  = 0.65%  PASS
+   (ii)  R_OTHER_rg = -1,019,729  resid_ii = 0.14%  PASS
+   (iii) gap - sum(D_r) = 5,425,878  = 0.80% of total | 10.4% of gap -> resid=10.4%/gap (0.80% of total)
+   OVERLAP: gz=0 rg=0  PASS
+
+## silesia T2  (N=9)
+   gz_perf=2,269,911,980  rg_perf=2,212,268,269  gap=gz-rg=57,643,711 (+2.6%)
+   spread: gz_perf=0.9% rg_perf=2.1%  A/A: perf=0.06% worker=0.20%
+   sched: ctx-sw gz=693 rg=370  migrations gz=0 rg=0
+   region              gz_cyc          rg_cyc    delta(gz-rg)   %ofgap
+   WORKER       2,079,468,328   1,990,034,984      89,433,344   155.1%
+   MARKERPP       134,693,776     198,105,152     -63,411,376  -110.0%
+   OUTPUT           1,431,724       3,100,104      -1,668,380    -2.9%
+   OTHER           54,318,152      21,028,029      33,290,123    57.8%
+   -- CONSERVATION --
+   (i)   R_OTHER_gz = 54,318,152  resid_i  = 2.39%  PASS
+   (ii)  R_OTHER_rg = 21,028,029  resid_ii = 0.95%  PASS
+   (iii) gap - sum(D_r) = 33,290,123  = 1.47% of total | 57.8% of gap -> N/A (gap 2.6% < 3.0% attribution floor: near-TIE, not a loss cell)
+   OVERLAP: gz=0 rg=0  PASS
+
+## silesia T4  (N=9)
+   gz_perf=2,445,695,331  rg_perf=2,273,903,947  gap=gz-rg=171,791,384 (+7.6%)
+   spread: gz_perf=1.0% rg_perf=1.6%  A/A: perf=0.02% worker=0.09%
+   sched: ctx-sw gz=744 rg=336  migrations gz=22 rg=15
+   region              gz_cyc          rg_cyc    delta(gz-rg)   %ofgap
+   WORKER       2,318,071,476   2,056,154,296     261,917,180   152.5%
+   MARKERPP       136,697,316     198,596,608     -61,899,292   -36.0%
+   OUTPUT             796,656       2,902,396      -2,105,740    -1.2%
+   OTHER           -9,870,117      16,250,647     -26,120,764   -15.2%
+   -- CONSERVATION --
+   (i)   R_OTHER_gz = -9,870,117  resid_i  = 0.40%  PASS
+   (ii)  R_OTHER_rg = 16,250,647  resid_ii = 0.71%  PASS
+   (iii) gap - sum(D_r) = -26,120,764  = 1.07% of total | 15.2% of gap -> resid=15.2%/gap (1.07% of total)
+   OVERLAP: gz=0 rg=0  PASS
+
+## squishy T2  (N=9)
+   gz_perf=3,837,478,858  rg_perf=3,926,674,497  gap=gz-rg=-89,195,639 (-2.3%)
+   spread: gz_perf=0.9% rg_perf=0.4%  A/A: perf=0.00% worker=0.02%
+   sched: ctx-sw gz=1168 rg=703  migrations gz=0 rg=0
+   region              gz_cyc          rg_cyc    delta(gz-rg)   %ofgap
+   WORKER       3,524,320,016   3,552,557,148     -28,237,132    31.7%
+   MARKERPP       232,637,608     342,997,620    -110,360,012   123.7%
+   OUTPUT           2,742,740       7,206,136      -4,463,396     5.0%
+   OTHER           77,778,494      23,913,593      53,864,901   -60.4%
+   -- CONSERVATION --
+   (i)   R_OTHER_gz = 77,778,494  resid_i  = 2.03%  PASS
+   (ii)  R_OTHER_rg = 23,913,593  resid_ii = 0.61%  PASS
+   (iii) gap - sum(D_r) = 53,864,901  = 1.40% of total | 60.4% of gap -> N/A (gap 2.3% < 3.0% attribution floor: near-TIE, not a loss cell)
+   OVERLAP: gz=0 rg=0  PASS
+
+## squishy T4  (N=9)
+   gz_perf=4,421,991,157  rg_perf=4,095,698,736  gap=gz-rg=326,292,421 (+8.0%)
+   spread: gz_perf=0.8% rg_perf=2.1%  A/A: perf=0.10% worker=0.21%
+   sched: ctx-sw gz=1315 rg=588  migrations gz=47 rg=42
+   region              gz_cyc          rg_cyc    delta(gz-rg)   %ofgap
+   WORKER       4,221,418,236   3,783,074,568     438,343,668   134.3%
+   MARKERPP       240,521,204     352,781,296    -112,260,092   -34.4%
+   OUTPUT           1,444,716       5,367,068      -3,922,352    -1.2%
+   OTHER          -41,392,999     -45,524,196       4,131,197     1.3%
+   -- CONSERVATION --
+   (i)   R_OTHER_gz = -41,392,999  resid_i  = 0.94%  PASS
+   (ii)  R_OTHER_rg = -45,524,196  resid_ii = 1.11%  PASS
+   (iii) gap - sum(D_r) = 4,131,197  = 0.09% of total | 1.3% of gap -> PASS
+   OVERLAP: gz=0 rg=0  PASS
+

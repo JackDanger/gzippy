@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+CMDS="gzip gunzip zcat"
+
+undivert_cmd() {
+    cmd="$1"
+    target="/usr/bin/$cmd"
+
+    # Remove our symlink
+    if [ -L "$target" ]; then
+        rm -f "$target"
+    fi
+
+    # Restore the original (moves .distrib back to original path)
+    dpkg-divert --package gzippy --rename --remove "$target" 2>/dev/null || true
+}
+
+case "$1" in
+    remove|purge|deconfigure)
+        for cmd in $CMDS; do
+            undivert_cmd "$cmd"
+        done
+        ;;
+esac
+
+#DEBHELPER#

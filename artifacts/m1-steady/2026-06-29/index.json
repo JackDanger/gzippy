@@ -1,0 +1,131 @@
+{
+  "harness": "scripts/bench/m1_steady_wins.sh",
+  "instrument": "fulcrum wall --steady (~/www/fulcrum-mac feat/macos-kpc-measurement)",
+  "binary_commit": "b2d1a2db",
+  "build": "--no-default-features --features pure-rust-inflate, RUSTFLAGS=-C target-cpu=native",
+  "arch": "aarch64-apple-m1pro",
+  "method": "single-binary env-toggle removal-oracle: identical gzippy run under two native Mach-O wrappers; env flips ONE code path; output byte-identical (sha==gzip -dc on both arms); freq-pinned warmed multi-cohort paired A/B; verdict REPRODUCIBLE only if effect clears the gz-vs-gz A/A cross-cohort floor in every cohort with consistent sign.",
+  "params": {
+    "cohorts": 5,
+    "pairs": 9,
+    "warmup_secs": 20,
+    "cooldown_secs": 5,
+    "sink": "/dev/null"
+  },
+  "verdicts": {
+    "pmull": "CONFIRMED wall win (silesia-T1 +1.22%, logsbig-T1 +1.89%; both clear A/A floor every cohort). NOT microbench-only.",
+    "tablebuild": "CONFIRMED wall win (silesia-T1 +0.89%, logsbig-T1 +4.71%; both clear floor every cohort).",
+    "crossover": "CORPUS-DEPENDENT, NOT a clean win. T1 cells INERT (env never consulted). At T2: silesia WIN +1.58% (default-OFF parallel beats forced-serial) but logsbig REGRESSION -8.54% (default-OFF parallel LOSES to forced-serial). The ratio proxy cannot separate them (silesia ratio~3.1, logsbig ratio~3.7) yet their optimal T2 routing is opposite."
+  },
+  "wins": {
+    "pmull": {
+      "claim": "aarch64 default CRC = PMULL carry-less fold (vs crc32x 3-way fold3)",
+      "oracle": "GZIPPY_CRC_PMULL=0 forces fold3 (change removed); default = PMULL (present)",
+      "gate0_non_inert": "CONFIRMED (probe: default->crc_path=PMULL, removed->crc_path=FOLD3)",
+      "cells": [
+        {
+          "corpus": "silesia-gzip.tar.gz",
+          "threads": 1,
+          "non_inert": "yes",
+          "verdict": "WIN",
+          "effect_pct": -1.22,
+          "aa_floor_pct": 0.22,
+          "cross_cohort_spread_pct": 0.5,
+          "n_kept": 41,
+          "sign_consistent": true
+        },
+        {
+          "corpus": "logsbig.gz",
+          "threads": 1,
+          "non_inert": "yes",
+          "verdict": "WIN",
+          "effect_pct": -1.89,
+          "aa_floor_pct": 0.15,
+          "cross_cohort_spread_pct": 0.19,
+          "n_kept": 37,
+          "sign_consistent": true
+        }
+      ]
+    },
+    "tablebuild": {
+      "claim": "aarch64 default litlen table build = SINGLE-symbol (vs x86 TRIPLE-pack)",
+      "oracle": "GZIPPY_LITLEN_MULTISYM=triple forces x86 default (removed); default = SINGLE (present)",
+      "gate0_non_inert": "CONFIRMED (probe: default->multisym=SINGLE, removed->multisym=TRIPLE)",
+      "cells": [
+        {
+          "corpus": "silesia-gzip.tar.gz",
+          "threads": 1,
+          "non_inert": "yes",
+          "verdict": "WIN",
+          "effect_pct": -0.89,
+          "aa_floor_pct": 0.27,
+          "cross_cohort_spread_pct": 0.23,
+          "n_kept": 41,
+          "sign_consistent": true
+        },
+        {
+          "corpus": "logsbig.gz",
+          "threads": 1,
+          "non_inert": "yes",
+          "verdict": "WIN",
+          "effect_pct": -4.71,
+          "aa_floor_pct": 0.13,
+          "cross_cohort_spread_pct": 0.21,
+          "n_kept": 41,
+          "sign_consistent": true
+        }
+      ]
+    },
+    "crossover": {
+      "claim": "aarch64 default parallel-crossover selector = OFF (margin 0.0; vs x86/Zen2 ON margin 1.0)",
+      "oracle": "GZIPPY_PARALLEL_CROSSOVER_MARGIN=1.0 forces x86/Zen2 selector ON (removed=selector-on); default = OFF (present)",
+      "gate0_non_inert": "T1 INERT (effective_parallel_threads early-returns at num_threads<=1, env never read) -> measured at T2 where CONFIRMED non-inert (default->2 parallel, removed->1 serial)",
+      "cells": [
+        {
+          "corpus": "silesia-gzip.tar.gz",
+          "threads": 1,
+          "non_inert": "no-INERT-at-T1",
+          "verdict": "NOT_RESOLVABLE",
+          "effect_pct": 0.0,
+          "aa_floor_pct": 0.39,
+          "cross_cohort_spread_pct": 0.29,
+          "n_kept": 39,
+          "sign_consistent": false
+        },
+        {
+          "corpus": "logsbig.gz",
+          "threads": 1,
+          "non_inert": "no-INERT-at-T1",
+          "verdict": "NOT_RESOLVABLE",
+          "effect_pct": -0.04,
+          "aa_floor_pct": 0.14,
+          "cross_cohort_spread_pct": 0.29,
+          "n_kept": 36,
+          "sign_consistent": false
+        },
+        {
+          "corpus": "silesia-gzip.tar.gz",
+          "threads": 2,
+          "non_inert": "yes",
+          "verdict": "WIN",
+          "effect_pct": -1.58,
+          "aa_floor_pct": 0.1,
+          "cross_cohort_spread_pct": 0.18,
+          "n_kept": 39,
+          "sign_consistent": true
+        },
+        {
+          "corpus": "logsbig.gz",
+          "threads": 2,
+          "non_inert": "yes",
+          "verdict": "LOSS",
+          "effect_pct": 8.54,
+          "aa_floor_pct": 0.72,
+          "cross_cohort_spread_pct": 0.63,
+          "n_kept": 39,
+          "sign_consistent": true
+        }
+      ]
+    }
+  }
+}

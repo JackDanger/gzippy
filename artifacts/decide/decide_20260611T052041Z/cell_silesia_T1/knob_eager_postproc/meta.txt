@@ -1,0 +1,6 @@
+knob=eager_postproc
+env=GZIPPY_EAGER_POSTPROC=1
+pred=none
+cell=silesia:1
+mask=0
+sha_ok=1

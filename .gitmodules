@@ -1,0 +1,26 @@
+[submodule "pigz"]
+	path = vendor/pigz
+	url = https://github.com/madler/pigz.git
+[submodule "gzip"]
+	path = vendor/gzip
+	url = https://github.com/JackDanger/gzip.git
+[submodule "isa-l"]
+	path = vendor/isa-l
+	url = https://github.com/JackDanger/isa-l.git
+	branch = gzippy-stopping-points
+[submodule "rapidgzip"]
+	path = vendor/rapidgzip
+	url = https://github.com/mxmlnkn/rapidgzip.git
+[submodule "libdeflate"]
+	path = vendor/libdeflate
+	url = https://github.com/ebiggers/libdeflate.git
+[submodule "zopfli"]
+	path = vendor/zopfli
+	url = https://github.com/google/zopfli.git
+[submodule "isal-rs"]
+	path = vendor/isal-rs
+	url = https://github.com/JackDanger/isal-rs.git
+	branch = gzippy-stopping-points
+[submodule "vendor/zlib-ng"]
+	path = vendor/zlib-ng
+	url = https://github.com/zlib-ng/zlib-ng

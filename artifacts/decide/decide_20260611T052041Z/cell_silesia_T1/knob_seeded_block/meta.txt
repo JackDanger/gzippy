@@ -1,0 +1,6 @@
+knob=seeded_block
+env=GZIPPY_SEEDED_BLOCK=0
+pred=verbose_seeded
+cell=silesia:1
+mask=0
+sha_ok=1

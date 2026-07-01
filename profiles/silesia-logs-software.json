@@ -1,0 +1,1805 @@
+{
+  "files_scanned": 3,
+  "blocks_total": 3799,
+  "blocks_by_btype": {
+    "stored": 2,
+    "fixed": 0,
+    "dynamic": 3797
+  },
+  "decoded_bytes_total": 654467173,
+  "unique_fingerprints": 3618,
+  "top_n": [
+    {
+      "fingerprint": "0x422881929872199f",
+      "frequency": 18,
+      "decoded_bytes": 13794149,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xb08d0da831d4b47a",
+      "frequency": 9,
+      "decoded_bytes": 6902463,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x761bb89d9df2d20e",
+      "frequency": 7,
+      "decoded_bytes": 5368583,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xcf8411fbb136b054",
+      "frequency": 6,
+      "decoded_bytes": 8447902,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xe03507228adcf175",
+      "frequency": 6,
+      "decoded_bytes": 4597508,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x872a10649dd276ad",
+      "frequency": 6,
+      "decoded_bytes": 4601483,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xbe689389b6598009",
+      "frequency": 6,
+      "decoded_bytes": 8331859,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x8cfe8092e2df0e65",
+      "frequency": 6,
+      "decoded_bytes": 4604254,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xfd2881f385b78925",
+      "frequency": 5,
+      "decoded_bytes": 3808023,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x321d55f636af241b",
+      "frequency": 5,
+      "decoded_bytes": 3828647,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x5378eee502c7d1cd",
+      "frequency": 5,
+      "decoded_bytes": 3847008,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x0f938e4dada37c1c",
+      "frequency": 5,
+      "decoded_bytes": 3839359,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xc5003daaa7768891",
+      "frequency": 4,
+      "decoded_bytes": 3049863,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x6953d65a9ba34dfa",
+      "frequency": 4,
+      "decoded_bytes": 5549282,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x56bffa7977c942c7",
+      "frequency": 4,
+      "decoded_bytes": 5564013,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x459175d28d2a01f1",
+      "frequency": 4,
+      "decoded_bytes": 5611321,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xc3eac742018155c9",
+      "frequency": 4,
+      "decoded_bytes": 3060966,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x228507b3e6ba5d3a",
+      "frequency": 4,
+      "decoded_bytes": 3056956,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xf940c64307d29081",
+      "frequency": 4,
+      "decoded_bytes": 5525169,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x835bf25ee97d0e37",
+      "frequency": 4,
+      "decoded_bytes": 3047568,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x1db25c4c04c3deef",
+      "frequency": 4,
+      "decoded_bytes": 3072730,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x9ca77080e2966cc8",
+      "frequency": 4,
+      "decoded_bytes": 3042084,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x187c2cc777b8d65b",
+      "frequency": 4,
+      "decoded_bytes": 3062764,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x3436508185fcdc83",
+      "frequency": 4,
+      "decoded_bytes": 3067998,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xe4c68ba0af16bcc3",
+      "frequency": 4,
+      "decoded_bytes": 3065646,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xceca1d4ee02c4ec9",
+      "frequency": 4,
+      "decoded_bytes": 3065571,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x4d65030535765db4",
+      "frequency": 4,
+      "decoded_bytes": 3064223,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xbfdcdc96bd0fe2f8",
+      "frequency": 3,
+      "decoded_bytes": 4240283,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xc9bcda135eaa5fa8",
+      "frequency": 3,
+      "decoded_bytes": 2287544,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x79954b877a59cf92",
+      "frequency": 3,
+      "decoded_bytes": 2279409,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x5e4253933e473222",
+      "frequency": 3,
+      "decoded_bytes": 2282168,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xb3fd11656846031c",
+      "frequency": 3,
+      "decoded_bytes": 2289378,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xf61ffd9d31de6079",
+      "frequency": 3,
+      "decoded_bytes": 4243777,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x88f11fb39037e3c9",
+      "frequency": 3,
+      "decoded_bytes": 4216879,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xc906189039034118",
+      "frequency": 3,
+      "decoded_bytes": 2300403,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x6ebe3a6c78ced5f5",
+      "frequency": 3,
+      "decoded_bytes": 2294033,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x61577814285dbbca",
+      "frequency": 3,
+      "decoded_bytes": 4172369,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x2543eb61dbccdf08",
+      "frequency": 3,
+      "decoded_bytes": 4166672,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x6b4cdfbc63d2d43b",
+      "frequency": 3,
+      "decoded_bytes": 2300860,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x6b31e4c4b17a6d04",
+      "frequency": 3,
+      "decoded_bytes": 2298117,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x96cca5cb524fd119",
+      "frequency": 3,
+      "decoded_bytes": 2289549,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xcbbd9a04508600b9",
+      "frequency": 3,
+      "decoded_bytes": 2286565,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x4a5796f8a5076720",
+      "frequency": 3,
+      "decoded_bytes": 2294040,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x97c181bb0ac54b3a",
+      "frequency": 3,
+      "decoded_bytes": 2300723,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xe12681f5d1489801",
+      "frequency": 3,
+      "decoded_bytes": 2279208,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x14c4ac20fc2662c7",
+      "frequency": 2,
+      "decoded_bytes": 2787731,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x2df639137f194dee",
+      "frequency": 2,
+      "decoded_bytes": 2825860,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x35223d8499612eee",
+      "frequency": 2,
+      "decoded_bytes": 2817695,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x674c9c635e42fcd5",
+      "frequency": 2,
+      "decoded_bytes": 1528508,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x3b02489aa255f52b",
+      "frequency": 2,
+      "decoded_bytes": 1522442,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xc7ee2c4f41031b34",
+      "frequency": 2,
+      "decoded_bytes": 1520051,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xfecd9801ec538399",
+      "frequency": 2,
+      "decoded_bytes": 2764459,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x8e49f8419d1f7770",
+      "frequency": 2,
+      "decoded_bytes": 2760609,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xb73ae8b7486c9762",
+      "frequency": 2,
+      "decoded_bytes": 1533042,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x215f9c4139e96c8e",
+      "frequency": 2,
+      "decoded_bytes": 1517114,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x98d0807b32775f26",
+      "frequency": 2,
+      "decoded_bytes": 1518784,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x423816c1912ed88a",
+      "frequency": 2,
+      "decoded_bytes": 2778050,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xdfe92f3c73b4c4cd",
+      "frequency": 2,
+      "decoded_bytes": 1531548,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x1e0bf076b9d2e731",
+      "frequency": 2,
+      "decoded_bytes": 2827897,
+      "litlen_nonzero": 84,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x9c14110829431ffd",
+      "frequency": 2,
+      "decoded_bytes": 1522685,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x5f92597267981d4a",
+      "frequency": 2,
+      "decoded_bytes": 1518986,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x1f93d05c04ddf69a",
+      "frequency": 2,
+      "decoded_bytes": 2793578,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xbd6e3632d6bcf985",
+      "frequency": 2,
+      "decoded_bytes": 1526247,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xe152aaf5d16e1897",
+      "frequency": 2,
+      "decoded_bytes": 1520734,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x7e814ea40115fa20",
+      "frequency": 2,
+      "decoded_bytes": 1520763,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x6ced3ea54ecc2642",
+      "frequency": 2,
+      "decoded_bytes": 2809651,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x70f1663b7f9b4f48",
+      "frequency": 2,
+      "decoded_bytes": 2790757,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x3cd5469e924e7965",
+      "frequency": 2,
+      "decoded_bytes": 1534830,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xcbb73ca710e8e895",
+      "frequency": 2,
+      "decoded_bytes": 2799139,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x6594131a938abd03",
+      "frequency": 2,
+      "decoded_bytes": 1533961,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x06df1f6bcf5a8f71",
+      "frequency": 2,
+      "decoded_bytes": 1523798,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x793d44797684ec43",
+      "frequency": 1,
+      "decoded_bytes": 15370,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x373faeed226fae7f",
+      "frequency": 1,
+      "decoded_bytes": 19602,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0xc3121d6651190693",
+      "frequency": 1,
+      "decoded_bytes": 15189,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x154f160d94a40177",
+      "frequency": 1,
+      "decoded_bytes": 131088,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xc2e1766ebf59c9a9",
+      "frequency": 1,
+      "decoded_bytes": 763771,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xac3324b5f0a4ca28",
+      "frequency": 1,
+      "decoded_bytes": 171983,
+      "litlen_nonzero": 90,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x220190e5531b9e0d",
+      "frequency": 1,
+      "decoded_bytes": 309981,
+      "litlen_nonzero": 128,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xacd57357f71bd156",
+      "frequency": 1,
+      "decoded_bytes": 27828,
+      "litlen_nonzero": 125,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x4e32f3c581e1b31c",
+      "frequency": 1,
+      "decoded_bytes": 15098,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x5836427e0912b787",
+      "frequency": 1,
+      "decoded_bytes": 56646,
+      "litlen_nonzero": 263,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x3dfdefcc074abbd0",
+      "frequency": 1,
+      "decoded_bytes": 59489,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xd027ab875255cefc",
+      "frequency": 1,
+      "decoded_bytes": 15216,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xb577e0273bc30d46",
+      "frequency": 1,
+      "decoded_bytes": 22999,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x76cb798d63c3532c",
+      "frequency": 1,
+      "decoded_bytes": 78374,
+      "litlen_nonzero": 279,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x726812b7e5cc9224",
+      "frequency": 1,
+      "decoded_bytes": 15138,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x23dcb57345af7fb5",
+      "frequency": 1,
+      "decoded_bytes": 13989,
+      "litlen_nonzero": 268,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xa51efca46e0137eb",
+      "frequency": 1,
+      "decoded_bytes": 199388,
+      "litlen_nonzero": 109,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x1121ae29ca336f9b",
+      "frequency": 1,
+      "decoded_bytes": 17245,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xc85c67c443856cf9",
+      "frequency": 1,
+      "decoded_bytes": 15424,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0xf671b86259fdc85c",
+      "frequency": 1,
+      "decoded_bytes": 22760,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x54b636fb12a2f969",
+      "frequency": 1,
+      "decoded_bytes": 201169,
+      "litlen_nonzero": 111,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x68e04304e8eef65f",
+      "frequency": 1,
+      "decoded_bytes": 14063,
+      "litlen_nonzero": 263,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x54a4d0ce6a841c8a",
+      "frequency": 1,
+      "decoded_bytes": 27439,
+      "litlen_nonzero": 280,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x490c19cfc7cf674b",
+      "frequency": 1,
+      "decoded_bytes": 34621,
+      "litlen_nonzero": 274,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x8fd6d8ade492a7ac",
+      "frequency": 1,
+      "decoded_bytes": 16353,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xded7e37d55d3f695",
+      "frequency": 1,
+      "decoded_bytes": 15046,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x8dea7e5a7f2c956f",
+      "frequency": 1,
+      "decoded_bytes": 83026,
+      "litlen_nonzero": 278,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xccc55b1be0d6133c",
+      "frequency": 1,
+      "decoded_bytes": 58707,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xe5b343801aeaa20c",
+      "frequency": 1,
+      "decoded_bytes": 14847,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x71ee8dc96eb93ba4",
+      "frequency": 1,
+      "decoded_bytes": 17567,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x2ee35142c58a2c35",
+      "frequency": 1,
+      "decoded_bytes": 14707,
+      "litlen_nonzero": 254,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xff9e4c77b419a319",
+      "frequency": 1,
+      "decoded_bytes": 14262,
+      "litlen_nonzero": 260,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xdaa1c7e2a070cc14",
+      "frequency": 1,
+      "decoded_bytes": 96048,
+      "litlen_nonzero": 280,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x85d563a40f3faeb0",
+      "frequency": 1,
+      "decoded_bytes": 24189,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xd8f2cf2751574290",
+      "frequency": 1,
+      "decoded_bytes": 14916,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x963f5a90c04a1be6",
+      "frequency": 1,
+      "decoded_bytes": 204233,
+      "litlen_nonzero": 112,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xf49754ca3e751fbb",
+      "frequency": 1,
+      "decoded_bytes": 14420,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xd9428294cb5fe308",
+      "frequency": 1,
+      "decoded_bytes": 212440,
+      "litlen_nonzero": 112,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x299e791a1e687386",
+      "frequency": 1,
+      "decoded_bytes": 14621,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x51841e6de96aed6d",
+      "frequency": 1,
+      "decoded_bytes": 15502,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x6cc2b307e6d476dc",
+      "frequency": 1,
+      "decoded_bytes": 14750,
+      "litlen_nonzero": 268,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x689a0d94564bb806",
+      "frequency": 1,
+      "decoded_bytes": 14928,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x00b744d816690544",
+      "frequency": 1,
+      "decoded_bytes": 15107,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xf1900a42981cf4b3",
+      "frequency": 1,
+      "decoded_bytes": 58856,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xfa92a8e4118810db",
+      "frequency": 1,
+      "decoded_bytes": 54868,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xec875c76dd62781c",
+      "frequency": 1,
+      "decoded_bytes": 24337,
+      "litlen_nonzero": 236,
+      "dist_nonzero": 23
+    },
+    {
+      "fingerprint": "0xd3f7c3ba0130faa3",
+      "frequency": 1,
+      "decoded_bytes": 15212,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x83b50d5986705ae5",
+      "frequency": 1,
+      "decoded_bytes": 765622,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xfc437157f8d15f27",
+      "frequency": 1,
+      "decoded_bytes": 30356,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x207eda2fb679b333",
+      "frequency": 1,
+      "decoded_bytes": 15197,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0xb470dc67c2284fcc",
+      "frequency": 1,
+      "decoded_bytes": 60152,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xcd3bb7456c29c8b4",
+      "frequency": 1,
+      "decoded_bytes": 60375,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xe2f4afd4d12ff37a",
+      "frequency": 1,
+      "decoded_bytes": 26663,
+      "litlen_nonzero": 284,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x6aa11bbc0a57fc23",
+      "frequency": 1,
+      "decoded_bytes": 42137,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xd89773daa075d168",
+      "frequency": 1,
+      "decoded_bytes": 1416032,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xbbe7fc76e1832be6",
+      "frequency": 1,
+      "decoded_bytes": 14924,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xbd569f85074955d3",
+      "frequency": 1,
+      "decoded_bytes": 15212,
+      "litlen_nonzero": 268,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xf14270f2e2e9045d",
+      "frequency": 1,
+      "decoded_bytes": 217508,
+      "litlen_nonzero": 135,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x20fbd834f33a9250",
+      "frequency": 1,
+      "decoded_bytes": 20368,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x8618f3df9310c804",
+      "frequency": 1,
+      "decoded_bytes": 14935,
+      "litlen_nonzero": 270,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x025f15774175a5ce",
+      "frequency": 1,
+      "decoded_bytes": 15074,
+      "litlen_nonzero": 270,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xf73ab3cce0db5b05",
+      "frequency": 1,
+      "decoded_bytes": 765580,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x12b0c546fe7ac1cd",
+      "frequency": 1,
+      "decoded_bytes": 16537,
+      "litlen_nonzero": 269,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x21b9758bf15b0df3",
+      "frequency": 1,
+      "decoded_bytes": 16660,
+      "litlen_nonzero": 269,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xffb033f9453262cd",
+      "frequency": 1,
+      "decoded_bytes": 85763,
+      "litlen_nonzero": 279,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xe65c4cebf48a368c",
+      "frequency": 1,
+      "decoded_bytes": 146907,
+      "litlen_nonzero": 286,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x25c4c6e712b7d7e7",
+      "frequency": 1,
+      "decoded_bytes": 58599,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x7afb684929c479b2",
+      "frequency": 1,
+      "decoded_bytes": 33518,
+      "litlen_nonzero": 280,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x5ec3fa12476b5626",
+      "frequency": 1,
+      "decoded_bytes": 224911,
+      "litlen_nonzero": 90,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xa8cfed58d3d458e1",
+      "frequency": 1,
+      "decoded_bytes": 165871,
+      "litlen_nonzero": 85,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xc6be024099394dcf",
+      "frequency": 1,
+      "decoded_bytes": 320953,
+      "litlen_nonzero": 286,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xc42381956cfa40cf",
+      "frequency": 1,
+      "decoded_bytes": 14688,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x9209b1c1bdc68831",
+      "frequency": 1,
+      "decoded_bytes": 30912,
+      "litlen_nonzero": 257,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xf03487a6c60813e1",
+      "frequency": 1,
+      "decoded_bytes": 56860,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0xa332809e75518c38",
+      "frequency": 1,
+      "decoded_bytes": 34477,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 15
+    },
+    {
+      "fingerprint": "0x82a65b40c2f9c5c2",
+      "frequency": 1,
+      "decoded_bytes": 16277,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x11da1ec8e53a301a",
+      "frequency": 1,
+      "decoded_bytes": 18864,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x44badbd8b2de9284",
+      "frequency": 1,
+      "decoded_bytes": 31538,
+      "litlen_nonzero": 201,
+      "dist_nonzero": 22
+    },
+    {
+      "fingerprint": "0xfa6e2eebfec6fb4f",
+      "frequency": 1,
+      "decoded_bytes": 35072,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 10
+    },
+    {
+      "fingerprint": "0xba398af2aabd59bd",
+      "frequency": 1,
+      "decoded_bytes": 27538,
+      "litlen_nonzero": 265,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x7edb34dcff826f1a",
+      "frequency": 1,
+      "decoded_bytes": 88089,
+      "litlen_nonzero": 286,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xa4b2c5742def718a",
+      "frequency": 1,
+      "decoded_bytes": 57391,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 23
+    },
+    {
+      "fingerprint": "0xe9188c393f862f6d",
+      "frequency": 1,
+      "decoded_bytes": 15264,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x9582eb8d571bb2c7",
+      "frequency": 1,
+      "decoded_bytes": 14924,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x150f673bd446b364",
+      "frequency": 1,
+      "decoded_bytes": 23811,
+      "litlen_nonzero": 108,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x84ea015e9dcb4d53",
+      "frequency": 1,
+      "decoded_bytes": 40155,
+      "litlen_nonzero": 284,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x5be67e3382671422",
+      "frequency": 1,
+      "decoded_bytes": 51666,
+      "litlen_nonzero": 279,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x994fc6fd72120b19",
+      "frequency": 1,
+      "decoded_bytes": 28927,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x837dc42152ed8a0d",
+      "frequency": 1,
+      "decoded_bytes": 216803,
+      "litlen_nonzero": 110,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x1c2ed9ecb55d8dcd",
+      "frequency": 1,
+      "decoded_bytes": 14995,
+      "litlen_nonzero": 270,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x87f51fe76fe16edf",
+      "frequency": 1,
+      "decoded_bytes": 1387539,
+      "litlen_nonzero": 83,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x32727b7eb7856271",
+      "frequency": 1,
+      "decoded_bytes": 222370,
+      "litlen_nonzero": 89,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0xc7c9d4cc79b7a9f3",
+      "frequency": 1,
+      "decoded_bytes": 55733,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x12d8e5e376d9dc00",
+      "frequency": 1,
+      "decoded_bytes": 14782,
+      "litlen_nonzero": 278,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x468627e93e9778a2",
+      "frequency": 1,
+      "decoded_bytes": 57489,
+      "litlen_nonzero": 262,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x0e7de13d0f1fa863",
+      "frequency": 1,
+      "decoded_bytes": 48446,
+      "litlen_nonzero": 284,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0xb2ccb1a7be8c35e8",
+      "frequency": 1,
+      "decoded_bytes": 68560,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x3f0ef41ec8d11f49",
+      "frequency": 1,
+      "decoded_bytes": 13404,
+      "litlen_nonzero": 263,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xf13373c301401502",
+      "frequency": 1,
+      "decoded_bytes": 13997,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 24
+    },
+    {
+      "fingerprint": "0xd2f1b00640e5c8b4",
+      "frequency": 1,
+      "decoded_bytes": 54455,
+      "litlen_nonzero": 279,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x77d28a2812e8ce1f",
+      "frequency": 1,
+      "decoded_bytes": 50425,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x14a9f26381be747e",
+      "frequency": 1,
+      "decoded_bytes": 45443,
+      "litlen_nonzero": 284,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x8edb5c0350c6350b",
+      "frequency": 1,
+      "decoded_bytes": 28480,
+      "litlen_nonzero": 213,
+      "dist_nonzero": 22
+    },
+    {
+      "fingerprint": "0x7b469eb90506a278",
+      "frequency": 1,
+      "decoded_bytes": 16115,
+      "litlen_nonzero": 268,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x55c6bf826057a76c",
+      "frequency": 1,
+      "decoded_bytes": 87155,
+      "litlen_nonzero": 281,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xeddb194c0a22bd17",
+      "frequency": 1,
+      "decoded_bytes": 15058,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xe26608bf79093fdd",
+      "frequency": 1,
+      "decoded_bytes": 27438,
+      "litlen_nonzero": 283,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xc8343aa702302fb1",
+      "frequency": 1,
+      "decoded_bytes": 590787,
+      "litlen_nonzero": 78,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x60e39beb926c4357",
+      "frequency": 1,
+      "decoded_bytes": 259735,
+      "litlen_nonzero": 128,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x015815ff4be27af0",
+      "frequency": 1,
+      "decoded_bytes": 68425,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x863c8f0b06a3a514",
+      "frequency": 1,
+      "decoded_bytes": 83752,
+      "litlen_nonzero": 283,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x7af65199cebf2018",
+      "frequency": 1,
+      "decoded_bytes": 761264,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x5c918ebac86ed73b",
+      "frequency": 1,
+      "decoded_bytes": 14613,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xaef330ae31801ff3",
+      "frequency": 1,
+      "decoded_bytes": 19101,
+      "litlen_nonzero": 267,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xc8280623659090f7",
+      "frequency": 1,
+      "decoded_bytes": 253755,
+      "litlen_nonzero": 125,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x168466ce6cc79155",
+      "frequency": 1,
+      "decoded_bytes": 34413,
+      "litlen_nonzero": 257,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0x5f8948cb163b5a51",
+      "frequency": 1,
+      "decoded_bytes": 18527,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x70f6c884365ce42b",
+      "frequency": 1,
+      "decoded_bytes": 39516,
+      "litlen_nonzero": 255,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x9cc50086297b3fb8",
+      "frequency": 1,
+      "decoded_bytes": 15187,
+      "litlen_nonzero": 274,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x100c7741ac0a848f",
+      "frequency": 1,
+      "decoded_bytes": 34075,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0xf0f688772dee520e",
+      "frequency": 1,
+      "decoded_bytes": 16266,
+      "litlen_nonzero": 269,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xfb229fa2d3500a63",
+      "frequency": 1,
+      "decoded_bytes": 14988,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x1e1daecb4a246e45",
+      "frequency": 1,
+      "decoded_bytes": 227434,
+      "litlen_nonzero": 105,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x573a1002f8cf9791",
+      "frequency": 1,
+      "decoded_bytes": 96339,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x6eab68d9b97740af",
+      "frequency": 1,
+      "decoded_bytes": 22937,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x128631b86428d416",
+      "frequency": 1,
+      "decoded_bytes": 27545,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x7a503cc16af50545",
+      "frequency": 1,
+      "decoded_bytes": 14084,
+      "litlen_nonzero": 266,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xc8c960a0251b99e3",
+      "frequency": 1,
+      "decoded_bytes": 92003,
+      "litlen_nonzero": 281,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xd861c93ecadb69c1",
+      "frequency": 1,
+      "decoded_bytes": 15179,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 17
+    },
+    {
+      "fingerprint": "0xc8ea51c78580159a",
+      "frequency": 1,
+      "decoded_bytes": 14271,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xbc17b04e7c473260",
+      "frequency": 1,
+      "decoded_bytes": 16484,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xb1730c06255a0417",
+      "frequency": 1,
+      "decoded_bytes": 762355,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0xebdaa9c36eb33fde",
+      "frequency": 1,
+      "decoded_bytes": 14779,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x4a54e7312dd71ff7",
+      "frequency": 1,
+      "decoded_bytes": 14961,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x1f6ec35c46e5659c",
+      "frequency": 1,
+      "decoded_bytes": 15301,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x7d4be8b28f919f32",
+      "frequency": 1,
+      "decoded_bytes": 62673,
+      "litlen_nonzero": 265,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xfa256616310b632a",
+      "frequency": 1,
+      "decoded_bytes": 214171,
+      "litlen_nonzero": 112,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xf6caa9afb878d818",
+      "frequency": 1,
+      "decoded_bytes": 15215,
+      "litlen_nonzero": 265,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x6b45837237f0f22f",
+      "frequency": 1,
+      "decoded_bytes": 14748,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x07bde007a49e6713",
+      "frequency": 1,
+      "decoded_bytes": 15230,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x9f6751103fc05101",
+      "frequency": 1,
+      "decoded_bytes": 15639,
+      "litlen_nonzero": 274,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x3be8e7e977f8faf8",
+      "frequency": 1,
+      "decoded_bytes": 18457,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xdfef9f0418d84191",
+      "frequency": 1,
+      "decoded_bytes": 33686,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 16
+    },
+    {
+      "fingerprint": "0x2eddec1156828a8b",
+      "frequency": 1,
+      "decoded_bytes": 35231,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x6f16139bcb6c326c",
+      "frequency": 1,
+      "decoded_bytes": 22132,
+      "litlen_nonzero": 286,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0xf6ce20818563ef70",
+      "frequency": 1,
+      "decoded_bytes": 193191,
+      "litlen_nonzero": 110,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x25d21efbbc642359",
+      "frequency": 1,
+      "decoded_bytes": 22078,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x832bfbabdf49252c",
+      "frequency": 1,
+      "decoded_bytes": 29566,
+      "litlen_nonzero": 283,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x445b64a2f58f16f5",
+      "frequency": 1,
+      "decoded_bytes": 194011,
+      "litlen_nonzero": 110,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xd6fcf375db7fcfc4",
+      "frequency": 1,
+      "decoded_bytes": 15204,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x4bf9dd1b7d5b260a",
+      "frequency": 1,
+      "decoded_bytes": 14686,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x33fccf7458af3e60",
+      "frequency": 1,
+      "decoded_bytes": 13887,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x13251d56c2a9eb3d",
+      "frequency": 1,
+      "decoded_bytes": 229924,
+      "litlen_nonzero": 90,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0xe7ac85b66e6c9995",
+      "frequency": 1,
+      "decoded_bytes": 34419,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0xbbecb37de562045d",
+      "frequency": 1,
+      "decoded_bytes": 15021,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x19decdda053d8b14",
+      "frequency": 1,
+      "decoded_bytes": 155391,
+      "litlen_nonzero": 110,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xe3bbc903c616e471",
+      "frequency": 1,
+      "decoded_bytes": 15041,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 18
+    },
+    {
+      "fingerprint": "0x02634517242f15d0",
+      "frequency": 1,
+      "decoded_bytes": 39414,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 16
+    },
+    {
+      "fingerprint": "0xfa98c358f8fab907",
+      "frequency": 1,
+      "decoded_bytes": 34816,
+      "litlen_nonzero": 272,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x935f616ce10e63b5",
+      "frequency": 1,
+      "decoded_bytes": 69040,
+      "litlen_nonzero": 264,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x4f68a0a90f7a9f1d",
+      "frequency": 1,
+      "decoded_bytes": 161887,
+      "litlen_nonzero": 91,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x1ebadb6723fbcb7c",
+      "frequency": 1,
+      "decoded_bytes": 17053,
+      "litlen_nonzero": 265,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x48fcb7ec428e1116",
+      "frequency": 1,
+      "decoded_bytes": 15576,
+      "litlen_nonzero": 271,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x11856c3fb012d9ff",
+      "frequency": 1,
+      "decoded_bytes": 90536,
+      "litlen_nonzero": 282,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x591ce0c133f6d185",
+      "frequency": 1,
+      "decoded_bytes": 13712,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0xd176d3f036df601d",
+      "frequency": 1,
+      "decoded_bytes": 18246,
+      "litlen_nonzero": 255,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x45aaea755d4f515a",
+      "frequency": 1,
+      "decoded_bytes": 19130,
+      "litlen_nonzero": 269,
+      "dist_nonzero": 25
+    },
+    {
+      "fingerprint": "0xef7ad65c89ffd139",
+      "frequency": 1,
+      "decoded_bytes": 602414,
+      "litlen_nonzero": 69,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x0fff28041282ad55",
+      "frequency": 1,
+      "decoded_bytes": 83684,
+      "litlen_nonzero": 279,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x388ec5e96e6bb7ca",
+      "frequency": 1,
+      "decoded_bytes": 21256,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x49f17ce77312fb67",
+      "frequency": 1,
+      "decoded_bytes": 198356,
+      "litlen_nonzero": 111,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x207be41ce0c9c423",
+      "frequency": 1,
+      "decoded_bytes": 14577,
+      "litlen_nonzero": 254,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0x54f694a921d42075",
+      "frequency": 1,
+      "decoded_bytes": 19257,
+      "litlen_nonzero": 276,
+      "dist_nonzero": 26
+    },
+    {
+      "fingerprint": "0x08d1b5bb6140438d",
+      "frequency": 1,
+      "decoded_bytes": 15204,
+      "litlen_nonzero": 273,
+      "dist_nonzero": 19
+    },
+    {
+      "fingerprint": "0x69b6aff019b1d5b0",
+      "frequency": 1,
+      "decoded_bytes": 88242,
+      "litlen_nonzero": 278,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0x51c45f3880a827a6",
+      "frequency": 1,
+      "decoded_bytes": 95210,
+      "litlen_nonzero": 277,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x6947f5653cd344be",
+      "frequency": 1,
+      "decoded_bytes": 191131,
+      "litlen_nonzero": 126,
+      "dist_nonzero": 30
+    },
+    {
+      "fingerprint": "0xfa5e8b35152a2d62",
+      "frequency": 1,
+      "decoded_bytes": 223063,
+      "litlen_nonzero": 111,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x9018d8d23eb193f2",
+      "frequency": 1,
+      "decoded_bytes": 26584,
+      "litlen_nonzero": 259,
+      "dist_nonzero": 29
+    },
+    {
+      "fingerprint": "0x3b429ffc48510303",
+      "frequency": 1,
+      "decoded_bytes": 231324,
+      "litlen_nonzero": 110,
+      "dist_nonzero": 28
+    },
+    {
+      "fingerprint": "0x9558e2ce1c1d29da",
+      "frequency": 1,
+      "decoded_bytes": 766582,
+      "litlen_nonzero": 76,
+      "dist_nonzero": 21
+    },
+    {
+      "fingerprint": "0x9211ec356ad6ccd1",
+      "frequency": 1,
+      "decoded_bytes": 14999,
+      "litlen_nonzero": 275,
+      "dist_nonzero": 20
+    },
+    {
+      "fingerprint": "0x1469e1e1224c9630",
+      "frequency": 1,
+      "decoded_bytes": 32640,
+      "litlen_nonzero": 236,
+      "dist_nonzero": 22
+    },
+    {
+      "fingerprint": "0x657ce12703e51679",
+      "frequency": 1,
+      "decoded_bytes": 14856,
+      "litlen_nonzero": 263,
+      "dist_nonzero": 27
+    },
+    {
+      "fingerprint": "0xf4275b616d58f1a1",
+      "frequency": 1,
+      "decoded_bytes": 19109,
+      "litlen_nonzero": 266,
+      "dist_nonzero": 25
+    }
+  ]
+}

@@ -1,0 +1,1637 @@
+//! ISA-L Decompression Backend
+//!
+//! Uses Intel ISA-L for fast gzip decompression on x86_64.
+//! ISA-L uses AVX2/AVX-512 for Huffman decode, vpclmulqdq for CRC32,
+//! and optimized RLE match copy — 45-56% faster than libdeflate on
+//! repetitive data (logs, software archives).
+//!
+//! Falls back to libdeflate when ISA-L is not available (ARM, or feature disabled).
+
+/// Check if ISA-L decompression is available and beneficial.
+/// Only true on x86_64 with the isal-compression feature enabled.
+///
+/// OFF the production decode graph (task #8): ISA-L decode is no longer
+/// routed to. Retained only for the oracle/diagnostic tests in this module.
+#[inline]
+#[allow(dead_code)]
+pub fn is_available() -> bool {
+    cfg!(all(feature = "isal-compression", target_arch = "x86_64"))
+}
+
+/// Stream-decompress a gzip stream using ISA-L's raw stateful inflate,
+/// writing directly to the writer. Bypasses the isal-rs Decoder wrapper
+/// to eliminate Cursor and 16KB internal buffer copy overhead.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)] // off the production decode graph (task #8); oracle/test only
+pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -> Option<u64> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    if input.is_empty() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::IGZIP_GZIP;
+
+    state.avail_in = input.len() as u32;
+    state.next_in = input.as_ptr() as *mut u8;
+
+    let mut out_buf = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+
+    loop {
+        state.avail_out = out_buf.len() as u32;
+        state.next_out = out_buf.as_mut_ptr();
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        if ret != 0 {
+            return None;
+        }
+
+        let written = out_buf.len() - state.avail_out as usize;
+        if written > 0 {
+            if writer.write_all(&out_buf[..written]).is_err() {
+                return None;
+            }
+            total += written as u64;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            // Multi-member gzip: a single .gz file may be the concatenation of
+            // several members (RFC 1952 §2.2; `cat a.gz b.gz`, pigz, log
+            // rotation). ISA-L finishes ONE member, leaving `next_in`/`avail_in`
+            // pointing at the residual. If another gzip member follows, re-init
+            // and keep decoding — otherwise we'd SILENTLY TRUNCATE to the first
+            // member (the bug this fixes; classify() can misroute a multi-member
+            // file here when its 2nd member starts past the 16 MiB detection
+            // window). Zero cost on a true single member: avail_in == 0 → return.
+            if state.avail_in >= 2 {
+                let next = state.next_in;
+                let b0 = unsafe { *next };
+                let b1 = unsafe { *next.add(1) };
+                if b0 == 0x1f && b1 == 0x8b {
+                    let saved_next = state.next_in;
+                    let saved_avail = state.avail_in;
+                    unsafe { isal_raw::isal_inflate_init(&mut state) };
+                    state.crc_flag = isal_raw::IGZIP_GZIP;
+                    state.next_in = saved_next;
+                    state.avail_in = saved_avail;
+                    continue;
+                }
+            }
+            // No further member (or trailing non-gzip bytes): done.
+            return Some(total);
+        }
+        if written == 0 && state.avail_in == 0 {
+            return None;
+        }
+    }
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)] // off the production decode graph (task #8); oracle/test only
+pub fn decompress_gzip_stream<W: std::io::Write>(_input: &[u8], _writer: &mut W) -> Option<u64> {
+    None
+}
+
+/// Decompress a full gzip stream into a pre-allocated output buffer.
+/// Returns the number of bytes written, or None on failure.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_gzip_into(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    isal::decompress_into(input, output, isal::Codec::Gzip).ok()
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_gzip_into(_input: &[u8], _output: &mut [u8]) -> Option<usize> {
+    None
+}
+
+/// Decompress raw deflate data into a pre-allocated output buffer.
+/// Returns the number of bytes written, or None on failure.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_into(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    isal::decompress_into(input, output, isal::Codec::Deflate).ok()
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_into(_input: &[u8], _output: &mut [u8]) -> Option<usize> {
+    None
+}
+
+/// Scan a deflate stream using ISA-L, capturing checkpoints at block boundaries.
+///
+/// Faster than pure-Rust `scan_deflate_fast` on x86_64 because ISA-L uses
+/// AVX2/AVX-512 for Huffman decode. Produces `ScanCheckpoint` objects
+/// compatible with `two_pass_parallel`'s parallel decode phase.
+///
+/// Returns `None` if ISA-L is not available or an error occurs.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn scan_deflate_isal(
+    deflate_data: &[u8],
+    checkpoint_interval: usize,
+    expected_output_size: usize,
+) -> Option<crate::decompress::scan_inflate::ScanResult> {
+    use crate::decompress::scan_inflate::{ScanCheckpoint, ScanResult, WINDOW_SIZE};
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+
+    state.avail_in = deflate_data.len() as u32;
+    state.next_in = deflate_data.as_ptr() as *mut u8;
+
+    let buf_size = if expected_output_size > 0 {
+        expected_output_size + 256 * 1024
+    } else {
+        deflate_data.len().saturating_mul(32).max(1024 * 1024)
+    };
+    let mut output = vec![0u8; buf_size];
+
+    let mut out_pos: usize = 0;
+    let mut checkpoints = Vec::new();
+    let mut next_checkpoint_at = checkpoint_interval;
+
+    let chunk_size: u32 = 256 * 1024;
+
+    let mut finished = false;
+    loop {
+        let remaining_out = output.len() - out_pos;
+        if remaining_out == 0 {
+            output.resize(output.len() * 2, 0);
+        }
+        let this_chunk = remaining_out.min(chunk_size as usize);
+
+        state.avail_out = this_chunk as u32;
+        state.next_out = output[out_pos..].as_mut_ptr();
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        if ret != 0 {
+            return None;
+        }
+
+        let written = this_chunk - state.avail_out as usize;
+        out_pos += written;
+
+        // Checkpoint at output-position intervals. ISAL_BLOCK_NEW_HDR is not used
+        // because ISA-L often transitions through it within a single isal_inflate call,
+        // so the caller never sees it — yielding zero checkpoints for most real streams.
+        if out_pos >= next_checkpoint_at && out_pos >= WINDOW_SIZE {
+            let input_byte_pos = deflate_data.len() - state.avail_in as usize;
+            let window_start = out_pos - WINDOW_SIZE;
+            checkpoints.push(ScanCheckpoint {
+                input_byte_pos,
+                bitbuf: state.read_in,
+                bitsleft: state.read_in_length as u32,
+                output_offset: out_pos,
+                window: output[window_start..out_pos].to_vec(),
+            });
+            next_checkpoint_at = out_pos + checkpoint_interval;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            finished = true;
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    if !finished {
+        return None;
+    }
+
+    Some(ScanResult {
+        checkpoints,
+        total_output_size: out_pos,
+    })
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn scan_deflate_isal(
+    _deflate_data: &[u8],
+    _checkpoint_interval: usize,
+    _expected_output_size: usize,
+) -> Option<crate::decompress::scan_inflate::ScanResult> {
+    None
+}
+
+/// Decompress raw deflate from any bit offset using ISA-L + inflatePrime.
+///
+/// Enables ISA-L on non-byte-aligned chunk boundaries from speculative parallel
+/// decode. ISA-L's inflate_state has a 64-bit bit buffer (read_in / read_in_length)
+/// that can be pre-loaded with the partial first byte's bits before starting.
+///
+/// This is the same "inflatePrime" pattern used by rapidgzip's IsalInflateWrapper
+/// (rapidgzip/librapidarchive/src/rapidgzip/gzip/isal.hpp).
+///
+/// `dict` is the 32KB sliding-window from the previous chunk. Empty slice is
+/// valid (first chunk or chunk with no back-references before start).
+/// `max_output` caps the output size — use `chunk.data.len()` from the
+/// speculative decoder to reproduce exactly the right number of bytes.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)] // retained for diagnostics / future routing
+pub fn decompress_deflate_from_bit(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    max_output: usize,
+) -> Option<Vec<u8>> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    // Raw deflate: no gzip/zlib header expected.
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+
+    if bit_skip > 0 {
+        // inflatePrime: deflate is LSB-first, so bits [bit_skip..7] of data[byte_idx]
+        // are the first bits of this chunk. Shift out the preceding block's bits and
+        // load them into ISA-L's internal bit register before feeding full bytes.
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        // SAFETY: byte_idx < data.len(), so byte_idx + 1 <= data.len().
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    // Prime the 32 KB LZ77 history window. Without this, back-references before
+    // position 0 trigger ISAL_INVALID_LOOKBACK and inflate returns non-zero.
+    // When no dict is provided we use a static zero window — matches ISA-L's
+    // own convention for fresh-stream decodes and zlib-ng's zero-window prime.
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    // MIN cap of 32 KB: the principal caller is `try_decode_at` in
+    // the parallel boundary search, which validates with min_output
+    // = 32 KB. The earlier 256 KB MIN over-allocated by 8× per call;
+    // with the boundary search making ~100-1000 calls per chunk,
+    // the over-allocation showed up as a measurable phase 1a wall
+    // overhead on the Silesia Tmax bench.
+    const MAX_CAP: usize = 512 * 1024 * 1024;
+    let cap = max_output.clamp(32 * 1024, MAX_CAP);
+    let mut output = vec![0u8; cap];
+    let mut out_pos = 0usize;
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            break; // output cap reached
+        }
+
+        state.avail_out = remaining as u32;
+        // SAFETY: out_pos < cap = output.len()
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        out_pos += written;
+
+        if ret != 0 {
+            if out_pos == 0 {
+                return None;
+            }
+            break;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            // Same premature-BFINAL guard as decompress_deflate_from_bit_with_end:
+            // if significant compressed input remains after BFINAL, this position
+            // is a false boundary, not a real stream end. Return None so callers
+            // (primarily try_decode_at's stage-1 filter) reject the candidate.
+            // A genuine stream end leaves at most 7 padding bits + ISA-L lookahead
+            // (≤8 bytes); more than 8 bytes means BFINAL fired mid-stream.
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+    output.truncate(out_pos);
+    Some(output)
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _max_output: usize,
+) -> Option<Vec<u8>> {
+    None
+}
+
+/// Allocate an uninitialised `Vec<u8>` of exactly `size` bytes.
+///
+/// Same as `decompress_deflate_from_bit` but also returns the end bit position.
+///
+/// The end bit is derived from ISA-L's post-decode state:
+///   `end_bit = data.len() * 8 - state.avail_in * 8 - state.read_in_length`
+///
+/// This works for both byte-aligned (bit_skip=0) and non-aligned (bit_skip>0) starts
+/// because the formula accounts for bits pre-loaded into the bit buffer at setup time.
+///
+/// Tip: pass `data` as `&full_data[..until_byte]` to limit ISA-L's input consumption.
+/// The end_bit is still in `full_data` coordinates since both slices share the same layout.
+///
+/// `crc` is updated over the decoded output before returning.
+///
+/// Output is returned as a single `Vec<u8>` allocated with `with_capacity + set_len`
+/// (no zero-fill). One VMA per chunk: eliminates the ~1300 mmap/munmap calls that
+/// the 128 KiB segment approach caused (128 KiB == Linux glibc's M_MMAP_THRESHOLD,
+/// so every alloc_segment call went through mmap, and ~3900 concurrent mmap/munmap
+/// pairs serialised through the per-mm mmap_lock, inflating decode from ~83 ms to
+/// ~1374 ms on Silesia at T=4).
+///
+/// CRITICAL invariant: uses stateful `isal_inflate`, not `isal_inflate_stateless`.
+/// The stateful entry rolls back `read_in_length` on END_INPUT so that the reported
+/// end_bit lands precisely at the last completed block boundary. Do not refactor to
+/// the stateless entry without preserving this semantics.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_end(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    max_output: usize,
+    crc: &mut crc32fast::Hasher,
+) -> Option<(Vec<u8>, usize)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    // Single uninit allocation sized to max_output. `with_capacity + set_len`
+    // avoids zero-filling (calloc on macOS eagerly touches every page; on Linux
+    // pages are lazily faulted as ISA-L writes, but with one VMA instead of
+    // ~1300, the kernel doesn't have to acquire mmap_lock for each one).
+    // MAX_CAP = 3 GiB keeps `remaining as u32` valid for ISA-L's avail_out.
+    // Do not raise above u32::MAX without fixing the avail_out cast.
+    const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
+    let mut cap = max_output.min(MAX_CAP);
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(cap)
+    };
+    let mut out_pos: usize = 0;
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            // Buffer full: try to grow (handles chunks that decompress to
+            // more than 2× the per-chunk hint — e.g., a highly compressible
+            // chunk in a Silesia-class file with uneven per-member ratios).
+            let new_cap = (cap * 2).min(MAX_CAP);
+            if new_cap <= cap {
+                // Already at MAX_CAP; fall back to marker decoder.
+                return None;
+            }
+            // set_len to out_pos so reserve_exact sees the "used" prefix,
+            // then extend uninit tail to new_cap.
+            unsafe { output.set_len(out_pos) };
+            output.reserve_exact(new_cap - cap);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                output.set_len(new_cap)
+            };
+            cap = new_cap;
+            continue;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+
+        // CRC while hot: data just written by ISA-L is still in L1/L2 cache.
+        if written > 0 {
+            crc.update(&output[out_pos..out_pos + written]);
+        }
+        out_pos += written;
+
+        match ret {
+            0 => {} // ISAL_DECOMP_OK: continue, check block_state below
+            1 => {
+                // ISAL_END_INPUT: consumed all input. Only return a valid
+                // end_bit when at a real block boundary (ISAL_BLOCK_NEW_HDR).
+                // Mid-block truncation (ISAL_BLOCK_CODED, _HDR, _TYPE0) means
+                // `end_bit` would be non-boundary — return None so the caller
+                // falls back to the marker decoder, which always exits at a
+                // real block boundary past `end_bit_limit`.
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue, // ISAL_OUT_OVERFLOW: buffer full, grow on next iteration
+            _ => return None, // ISAL_INVALID_BLOCK (-1) or unknown: decode error;
+                            // end_bit unreliable — return None so caller falls back
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            // BFINAL=1 hit. If significant compressed input remains unprocessed,
+            // this is a false-positive BFINAL from a speculative start, not the
+            // real end of the deflate stream. Return None so the caller falls back
+            // to the marker decoder, which exits at a real block boundary.
+            // Threshold: 64 bits — a genuine stream-end leaves at most the
+            // bit-alignment padding (0–7 bits) plus a few bits of ISA-L lookahead
+            // in `read_in`. More than 8 bytes remaining means BFINAL fired mid-stream.
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+
+    output.truncate(out_pos);
+
+    // end_bit = data.len()*8 - avail_in*8 - read_in_length
+    // (see function doc for derivation; stateful isal_inflate invariant).
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((output, end_bit))
+}
+
+/// A real deflate block boundary observed during decode: the compressed
+/// bit-offset where the next block's header starts (or where the stream
+/// ends), and the output-byte-offset where the just-finished block's last
+/// byte sits in the chunk's output buffer.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct BlockBoundary {
+    pub bit_offset: usize,
+    pub output_offset: usize,
+}
+
+/// Same shape as [`decompress_deflate_from_bit_with_end`], but additionally
+/// records every deflate block boundary the decoder crossed. Uses the patched
+/// ISA-L's `ISAL_STOPPING_POINT_END_OF_BLOCK` mechanism: the inflate state
+/// machine pauses after each block body finishes, the caller records the
+/// current bit position + output offset, then resumes. Returns
+/// `(output, end_bit, boundaries)` where each `BlockBoundary` records both
+/// the compressed bit position and the output byte position at the moment
+/// the just-finished block ended.
+///
+/// Provability: the patched ISA-L sets `state.stopped_at = END_OF_BLOCK`
+/// only inside its own inflate loop after `decode_huffman_code_block_stateless`
+/// or `decode_literal_block` returns and `block_state` is `NEW_HDR` or
+/// `INPUT_DONE`. Every transition to those states corresponds to the end of a
+/// real deflate block, so every recorded boundary is real. No boundaries are
+/// missed: the loop continues until `block_state == ISAL_BLOCK_FINISH` or
+/// END_INPUT, observing every transition along the way.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_boundaries(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    max_output: usize,
+    crc: &mut crc32fast::Hasher,
+) -> Option<(Vec<u8>, usize, Vec<BlockBoundary>)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    // Request a pause after every full block body so the caller can record
+    // block-boundary bit positions in-band during decode. This is the
+    // gzippy/rapidgzip extension to ISA-L — without the patched ISA-L the
+    // field doesn't exist; with it, this opt-in is the only behavior change.
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
+    let mut cap = max_output.min(MAX_CAP);
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(cap)
+    };
+    let mut out_pos: usize = 0;
+    let mut boundaries: Vec<BlockBoundary> = Vec::new();
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            let new_cap = (cap * 2).min(MAX_CAP);
+            if new_cap <= cap {
+                return None;
+            }
+            unsafe { output.set_len(out_pos) };
+            output.reserve_exact(new_cap - cap);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                output.set_len(new_cap)
+            };
+            cap = new_cap;
+            continue;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+
+        if written > 0 {
+            crc.update(&output[out_pos..out_pos + written]);
+        }
+        out_pos += written;
+
+        match ret {
+            0 => {}
+            1 => {
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue,
+            _ => return None,
+        }
+
+        // Record block boundary if ISA-L stopped at one. Compute bit
+        // position from state: total_consumed_bits = data.len()*8 -
+        // avail_in*8 - read_in_length. The position is past the just-
+        // finished block, i.e. the start of the next block's header (or
+        // end-of-stream).
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            let bit_pos =
+                data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+            // out_pos is the byte position just past the last byte the
+            // just-finished block emitted (i.e. the start of where the
+            // next block's output will be written).
+            boundaries.push(BlockBoundary {
+                bit_offset: bit_pos,
+                output_offset: out_pos,
+            });
+            // Clear so the next isal_inflate call doesn't see a stale value
+            // before its own reset-at-entry runs (defense in depth).
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+
+    output.truncate(out_pos);
+
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((output, end_bit, boundaries))
+}
+
+/// COPY-FREE variant of [`decompress_deflate_from_bit_with_boundaries`]: decode
+/// ISA-L DIRECTLY into the caller's contiguous output buffer `out` (no internal
+/// 64 MiB `Vec` alloc, no `to_vec`/`copy_from_slice`). The caller pre-reserves
+/// `out` (e.g. a chunk's `writable_tail` spare capacity) sized to the chunk's
+/// decoded bytes; ISA-L writes into `out[..]` and stops at a block boundary
+/// before exhausting it. Returns `(written, end_bit, boundaries)` where
+/// `output_offset` in each boundary is the byte offset into `out` (i.e. relative
+/// to the start of THIS decode). No CRC is computed here — the caller hashes the
+/// exact kept region (mirroring the pure path), so this performs ZERO copies.
+///
+/// Returns `None` (caller falls back) if: input is exhausted mid-block, the
+/// stream needs more than `out.len()` bytes (the caller under-reserved), or any
+/// ISA-L error. This is the oracle's clean-tail engine with the copy confound
+/// removed so the clean-engine WALL ceiling is readable.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_into(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    out: &mut [u8],
+) -> Option<(usize, usize, Vec<BlockBoundary>)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    let cap = out.len();
+    let mut out_pos: usize = 0;
+    let mut boundaries: Vec<BlockBoundary> = Vec::new();
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            // Caller under-reserved — fall back rather than realloc/copy (that
+            // would re-introduce the very confound this variant removes).
+            return None;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { out.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        out_pos += written;
+
+        match ret {
+            0 => {}
+            1 => {
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue,
+            _ => return None,
+        }
+
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            let bit_pos =
+                data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+            boundaries.push(BlockBoundary {
+                bit_offset: bit_pos,
+                output_offset: out_pos,
+            });
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((out_pos, end_bit, boundaries))
+}
+
+/// Output sink for the INCREMENTAL (growable) copy-free ISA-L decode. Lets the
+/// FFI loop GROW the output buffer ON DEMAND mid-decode instead of pre-reserving
+/// the whole chunk's worst-case output up front — a faithful structural port of
+/// rapidgzip's `finishDecodeChunkWithInexactOffset` loop (GzipChunk.hpp:309-379),
+/// which allocates a fresh fixed-size `DecodedVector` (`ALLOCATION_CHUNK_SIZE` =
+/// 128 KiB) per iteration, fills it via `readStream`, then `resize` + `append`s
+/// it into a segmented `DecodedData` and loops with a new buffer. gzippy keeps a
+/// single contiguous `Vec` so it grows that Vec instead of appending segments,
+/// but the principle is identical: the steady-state footprint tracks the ACTUAL
+/// decoded size, not an 8x-compressed-span over-reserve.
+///
+/// CORRECTNESS / ISA-L STREAMING CONTRACT: `isal_inflate` keeps its own 32 KiB
+/// history in `state.tmp_out_buffer`, so `next_out` may point to a FRESH region
+/// each call (including after a `Vec` realloc that MOVED the prior bytes). This
+/// is exactly what rapidgzip relies on (it hands a brand-new buffer each
+/// iteration). Therefore growing/moving the output buffer between
+/// `commit_and_reserve` calls is byte-exact.
+// Used only by the parallel-SM ISA-L clean-tail path (`gzip_chunk` /
+// `segmented_buffer`, both `#[cfg(parallel_sm)]`). Gate on `parallel_sm` too so
+// the `isal-compression`-only lint build (no `pure-rust-inflate` ⇒ no
+// `parallel_sm`) doesn't compile these without their callers and flag them as
+// dead code. The `gzippy-isal` production build (pure-rust-inflate +
+// isal-compression) compiles both halves.
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+pub trait IncrementalOutSink {
+    /// (1) Commit `just_written` bytes from the PREVIOUS spare into the buffer
+    /// (bump its logical length), then (2) ensure at least `min_spare` bytes of
+    /// CONTIGUOUS spare past the new length and return `(ptr, spare_len)` for the
+    /// NEXT decode region. The returned `ptr` is INVALIDATED by the next call (a
+    /// grow may realloc + move). When `min_spare == 0` this performs the commit
+    /// only (final flush) and the returned `(ptr, len)` is unused.
+    fn commit_and_reserve(&mut self, just_written: usize, min_spare: usize) -> (*mut u8, usize);
+}
+
+/// Kill-switch: `GZIPPY_NO_REFILL_STAGING=1` reverts the parallel-chunk clean-tail
+/// FFI to the whole-slice `avail_in` mode (no 128 KiB staging buffer). Default OFF
+/// (staging ON — the faithful refillBuffer port).
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+fn staging_no_refill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_REFILL_STAGING").is_ok_and(|v| v == "1"))
+}
+
+/// Incremental / growable sibling of [`decompress_deflate_from_bit_into`]. Same
+/// ISA-L state-machine and boundary semantics, but instead of returning `None`
+/// the instant a FIXED `out` buffer fills, it COMMITS progress, GROWS the sink,
+/// and CONTINUES decoding (`isal_inflate` resumes against the new `next_out`).
+/// On success ALL `total_written` bytes are committed into the sink (the caller
+/// then trims to the kept region); on a `None` return the sink may hold the
+/// bytes committed so far during growth, so the caller MUST reset the buffer's
+/// length back to its pre-call value before falling back.
+///
+/// `output_offset` in each [`BlockBoundary`] is the CUMULATIVE byte offset from
+/// the start of THIS decode (i.e. from the buffer length at entry) — identical
+/// to the fixed-buffer variant's semantics because all committed bytes are
+/// contiguous in the sink.
+///
+/// **INPUT STAGING** (vendor `isal.hpp:163-205` `refillBuffer` port): instead of
+/// pointing `state.next_in`/`avail_in` at the entire (potentially multi-MiB)
+/// compressed slice up front, the function maintains a 128 KiB staging buffer and
+/// feeds the compressed input in chunks. When ISA-L exhausts the current chunk
+/// (`avail_in == 0` or ret == ISAL_END_INPUT with more data available), the next
+/// 128 KiB of `data` are `copy_from_slice`d into the staging buffer and
+/// `next_in`/`avail_in` are reset to it. This keeps the hot input window in L2
+/// cache across the decode loop rather than forcing TLB/cache misses on multi-MiB
+/// random-access to the full member slice — faithfully matching rapidgzip's
+/// `finishDecodeChunkWithInexactOffset` segment loop, which hand-sizes its
+/// `DecodedVector` to exactly `ALLOCATION_CHUNK_SIZE = 128 KiB`.
+///
+/// Kill-switch: `GZIPPY_NO_REFILL_STAGING=1` bypasses staging (whole-slice avail_in,
+/// original behaviour). With staging the bit-position formula changes from
+/// `data.len()*8 - avail_in*8` to `data_pos*8 - avail_in*8` where `data_pos` is
+/// the cumulative bytes loaded from `data` into ISA-L's input; the two are
+/// equivalent when kill-switch is ON (`data_pos == data.len()` immediately).
+#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
+pub fn decompress_deflate_from_bit_into_growable(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    sink: &mut dyn IncrementalOutSink,
+    initial_spare: usize,
+    grow_increment: usize,
+) -> Option<(usize, usize, Vec<BlockBoundary>)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    // ── INPUT STAGING SETUP (vendor isal.hpp:163-205 refillBuffer port) ──────
+    // STAGING_SIZE = 128 KiB matches rapidgzip's ALLOCATION_CHUNK_SIZE.
+    // `no_refill = true` (kill-switch) reverts to the whole-slice avail_in mode.
+    // `data_pos` tracks how many bytes of `data` have been loaded into ISA-L's
+    // input; bit positions are computed as `data_pos*8 - avail_in*8 - read_in_length`
+    // which equals `data.len()*8 - ...` when no staging (kill-switch ON).
+    const STAGING_SIZE: usize = 128 * 1024;
+    let no_refill = staging_no_refill_enabled();
+    // Staging buffer: 128 KiB heap allocation (avoid stack overflow). Unused when
+    // kill-switch is ON (Vec::new(), never written).
+    let mut staging_buf: Vec<u8> = if no_refill {
+        Vec::new()
+    } else {
+        vec![0u8; STAGING_SIZE]
+    };
+    // Total bytes loaded from `data` into ISA-L's input (cumulative).
+    let mut data_pos: usize;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        let data_start = byte_idx + 1;
+        if no_refill {
+            state.next_in = unsafe { data.as_ptr().add(data_start) as *mut u8 };
+            state.avail_in = (data.len() - data_start) as u32;
+            data_pos = data.len();
+        } else {
+            let fill_end = (data_start + STAGING_SIZE).min(data.len());
+            let fill_len = fill_end - data_start;
+            staging_buf[..fill_len].copy_from_slice(&data[data_start..fill_end]);
+            state.next_in = staging_buf.as_mut_ptr();
+            state.avail_in = fill_len as u32;
+            data_pos = fill_end;
+        }
+    } else {
+        let data_start = byte_idx;
+        if no_refill {
+            state.next_in = unsafe { data.as_ptr().add(data_start) as *mut u8 };
+            state.avail_in = (data.len() - data_start) as u32;
+            data_pos = data.len();
+        } else {
+            let fill_end = (data_start + STAGING_SIZE).min(data.len());
+            let fill_len = fill_end - data_start;
+            staging_buf[..fill_len].copy_from_slice(&data[data_start..fill_end]);
+            state.next_in = staging_buf.as_mut_ptr();
+            state.avail_in = fill_len as u32;
+            data_pos = fill_end;
+        }
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    /// Refill the staging buffer from `data[data_pos..]` when more input is
+    /// available. Inline closure to avoid repeating the copy+reset logic.
+    /// Returns `true` if a refill was performed (caller should `continue`).
+    macro_rules! try_refill {
+        () => {{
+            if !no_refill && data_pos < data.len() {
+                let fill_end = (data_pos + STAGING_SIZE).min(data.len());
+                let fill_len = fill_end - data_pos;
+                staging_buf[..fill_len].copy_from_slice(&data[data_pos..fill_end]);
+                data_pos = fill_end;
+                state.next_in = staging_buf.as_mut_ptr();
+                state.avail_in = fill_len as u32;
+                true
+            } else {
+                false
+            }
+        }};
+    }
+
+    let mut boundaries: Vec<BlockBoundary> = Vec::new();
+    // Cumulative bytes decoded across ALL spares == offset from the sink's entry
+    // length (all committed bytes are contiguous).
+    let mut total_written: usize = 0;
+    // Acquire the first spare (commit 0).
+    let (mut base, mut cap) = sink.commit_and_reserve(0, initial_spare.max(1));
+    // Bytes written into the CURRENT (uncommitted) spare.
+    let mut cur_pos: usize = 0;
+
+    loop {
+        let remaining = cap - cur_pos;
+        if remaining == 0 {
+            // Spare exhausted mid-decode: commit what we wrote into it, grow, and
+            // continue (the faithful rg fixed-segment append, as a single-Vec
+            // grow). ISA-L resumes against the new next_out (history is internal).
+            let (nb, nc) = sink.commit_and_reserve(cur_pos, grow_increment.max(1));
+            base = nb;
+            cap = nc;
+            cur_pos = 0;
+            continue;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { base.add(cur_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        cur_pos += written;
+        total_written += written;
+
+        match ret {
+            0 => {}
+            1 => {
+                // ISA-L exhausted the current input window. With staging, refill from
+                // `data` before accepting "input done" as the terminal condition
+                // (vendor isal.hpp:163-205 refillBuffer: loop while reader returns data).
+                if try_refill!() {
+                    continue;
+                }
+                // No more input in `data` — apply the at-boundary guard.
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue,
+            _ => return None,
+        }
+
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            // Bit position formula: `data_pos*8 - avail_in*8 - read_in_length`.
+            // Equivalent to `data.len()*8 - ...` when kill-switch ON (data_pos==data.len()).
+            let bit_pos =
+                data_pos * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+            boundaries.push(BlockBoundary {
+                bit_offset: bit_pos,
+                output_offset: total_written,
+            });
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            // No output and no input remaining in staging. Try refilling before
+            // treating as done (mirrors the ret==1 refill path above).
+            if try_refill!() {
+                continue;
+            }
+            break;
+        }
+    }
+
+    // Commit the final partial spare (min_spare=0 => commit-only).
+    sink.commit_and_reserve(cur_pos, 0);
+
+    if total_written == 0 {
+        return None;
+    }
+
+    let end_bit = data_pos * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((total_written, end_bit, boundaries))
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_boundaries(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _max_output: usize,
+    _crc: &mut crc32fast::Hasher,
+) -> Option<(Vec<u8>, usize, Vec<BlockBoundary>)> {
+    None
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_into(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _out: &mut [u8],
+) -> Option<(usize, usize, Vec<BlockBoundary>)> {
+    None
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_end(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _max_output: usize,
+    _crc: &mut crc32fast::Hasher,
+) -> Option<(Vec<u8>, usize)> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_roundtrip() {
+        use super::*;
+
+        let original = b"Hello, World! This is a test of ISA-L decompression. \
+                         Repeated data for compression: AAAAAAAAAAAAAAAAAAA \
+                         More repeated data: BBBBBBBBBBBBBBBBBBBBBBBB";
+
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(original, &mut compressed)
+            .expect("compression failed");
+        compressed.truncate(size);
+
+        let mut result = Vec::new();
+        let bytes = decompress_gzip_stream(&compressed, &mut result).expect("decompression failed");
+        assert_eq!(bytes as usize, original.len());
+        assert_eq!(&result, &original[..]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_into() {
+        use super::*;
+
+        let original: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .expect("compression failed");
+        compressed.truncate(size);
+
+        let mut output = vec![0u8; original.len()];
+        let bytes = decompress_gzip_into(&compressed, &mut output).expect("decompression failed");
+        assert_eq!(bytes, original.len());
+        assert_eq!(&output[..bytes], &original[..]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_corrupt_returns_none() {
+        use super::*;
+
+        let original: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .unwrap();
+        compressed.truncate(size);
+
+        // Flip a byte in the middle of the compressed data
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xFF;
+
+        let mut output = Vec::new();
+        let result = decompress_gzip_stream(&compressed, &mut output);
+        assert!(result.is_none(), "corrupt data must return None");
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_truncated_returns_none() {
+        use super::*;
+
+        let original: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .unwrap();
+        compressed.truncate(size);
+
+        // Truncate to half
+        let truncated = &compressed[..compressed.len() / 2];
+
+        let mut output = Vec::new();
+        let result = decompress_gzip_stream(truncated, &mut output);
+        assert!(result.is_none(), "truncated data must return None");
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_empty_returns_none() {
+        use super::*;
+
+        let mut output = Vec::new();
+        let result = decompress_gzip_stream(&[], &mut output);
+        assert!(result.is_none(), "empty input must return None");
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_large_roundtrip() {
+        use super::*;
+
+        let mut data = Vec::with_capacity(4 * 1024 * 1024);
+        let mut rng: u64 = 0xdeadbeef;
+        let phrases: &[&[u8]] = &[
+            b"the quick brown fox jumps over the lazy dog. ",
+            b"pack my box with five dozen liquor jugs! ",
+        ];
+        while data.len() < 4 * 1024 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 5 < 2 {
+                data.push((rng >> 16) as u8);
+            } else {
+                let phrase = phrases[((rng >> 24) as usize) % phrases.len()];
+                let remaining = 4 * 1024 * 1024 - data.len();
+                data.extend_from_slice(&phrase[..remaining.min(phrase.len())]);
+            }
+        }
+        data.truncate(4 * 1024 * 1024);
+
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(data.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor.gzip_compress(&data, &mut compressed).unwrap();
+        compressed.truncate(size);
+
+        let mut result = Vec::new();
+        let bytes = decompress_gzip_stream(&compressed, &mut result).expect("ISA-L failed on 4MB");
+        assert_eq!(bytes as usize, data.len());
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_into_corrupt_returns_none() {
+        use super::*;
+
+        let original: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .unwrap();
+        compressed.truncate(size);
+
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xFF;
+
+        let mut output = vec![0u8; original.len() + 1024];
+        let result = decompress_gzip_into(&compressed, &mut output);
+        assert!(
+            result.is_none(),
+            "corrupt data into fixed buffer must return None"
+        );
+    }
+
+    // Tests that work on ALL architectures (ISA-L or not)
+
+    #[test]
+    fn test_isal_is_available_consistent() {
+        use super::*;
+        let available = is_available();
+        if cfg!(all(feature = "isal-compression", target_arch = "x86_64")) {
+            assert!(available, "ISA-L must be available on x86_64 with feature");
+        } else {
+            assert!(
+                !available,
+                "ISA-L must not be available without feature/arch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_isal_stub_returns_none_when_unavailable() {
+        use super::*;
+        if is_available() {
+            return;
+        }
+        let valid_gzip = {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(b"hello world").unwrap();
+            enc.finish().unwrap()
+        };
+        let mut output = Vec::new();
+        assert!(decompress_gzip_stream(&valid_gzip, &mut output).is_none());
+    }
+
+    #[test]
+    fn test_scan_deflate_isal_stub_when_unavailable() {
+        use super::*;
+        if is_available() {
+            return;
+        }
+        let deflate = {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(b"hello world, this is enough data to test")
+                .unwrap();
+            enc.finish().unwrap()
+        };
+        assert!(scan_deflate_isal(&deflate, 1024, 0).is_none());
+    }
+
+    #[test]
+    fn test_scan_deflate_isal_large_data() {
+        use super::*;
+        if !is_available() {
+            eprintln!("skipping (ISA-L not available)");
+            return;
+        }
+
+        let mut data = Vec::new();
+        for i in 0..200_000u64 {
+            data.extend_from_slice(format!("Line {}: some test data for scan\n", i).as_bytes());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = scan_deflate_isal(&compressed, 256 * 1024, data.len())
+            .expect("ISA-L scan should succeed");
+        assert_eq!(result.total_output_size, data.len());
+        assert!(!result.checkpoints.is_empty());
+
+        for cp in &result.checkpoints {
+            assert_eq!(
+                cp.window.len(),
+                crate::decompress::scan_inflate::WINDOW_SIZE
+            );
+            assert!(cp.output_offset >= crate::decompress::scan_inflate::WINDOW_SIZE);
+            assert!(cp.input_byte_pos <= compressed.len());
+        }
+    }
+
+    #[test]
+    fn test_scan_deflate_isal_matches_pure_rust() {
+        use super::*;
+        if !is_available() {
+            eprintln!("skipping (ISA-L not available)");
+            return;
+        }
+
+        let mut data = Vec::new();
+        for i in 0..200_000u64 {
+            data.extend_from_slice(format!("Data item {}: payload\n", i).as_bytes());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let isal_result = scan_deflate_isal(&compressed, 128 * 1024, data.len())
+            .expect("ISA-L scan should succeed");
+        let rust_result =
+            crate::decompress::scan_inflate::scan_deflate_fast(&compressed, 128 * 1024, data.len())
+                .expect("pure Rust scan should succeed");
+
+        assert_eq!(isal_result.total_output_size, rust_result.total_output_size);
+
+        // Windows at matching output positions must be identical
+        for isal_cp in &isal_result.checkpoints {
+            for rust_cp in &rust_result.checkpoints {
+                if isal_cp.output_offset == rust_cp.output_offset {
+                    assert_eq!(
+                        isal_cp.window, rust_cp.window,
+                        "Window mismatch at offset {}",
+                        isal_cp.output_offset
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verify decompress_deflate_from_bit at bit offset 0 (byte-aligned baseline).
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_deflate_from_bit_byte_aligned() {
+        use super::*;
+
+        let original: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cycle()
+            .take(32_000)
+            .cloned()
+            .collect();
+
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &original).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let result = decompress_deflate_from_bit(&deflate, 0, &[], original.len())
+            .expect("byte-aligned inflate must succeed");
+        assert_eq!(result, original);
+    }
+
+    /// Verify decompress_deflate_from_bit with a 32KB dict (window from prior chunk).
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_deflate_from_bit_with_dict() {
+        use super::*;
+
+        // Build a blob where the second half back-references the first half.
+        let window: Vec<u8> = b"AAAA_repeated_window_data_for_back_refs_"
+            .iter()
+            .cycle()
+            .take(32_768)
+            .cloned()
+            .collect();
+        let payload: Vec<u8> = window.iter().take(16_000).cloned().collect(); // all back-refs
+
+        // Compress payload with flate2 using the window as history (zlib dict).
+        // We approximate by concatenating window+payload and taking the deflate tail.
+        let mut combined = window.clone();
+        combined.extend_from_slice(&payload);
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &combined).unwrap();
+        let deflate_all = enc.finish().unwrap();
+
+        // Decompress the whole thing to get expected payload output.
+        let mut dec = flate2::read::DeflateDecoder::new(deflate_all.as_slice());
+        let mut all_out = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut all_out).unwrap();
+        assert_eq!(&all_out[..window.len()], &window[..]);
+        let expected_payload = all_out[window.len()..].to_vec();
+
+        // Now decompress only the deflate stream but supply the window as dict.
+        // Since we encoded window+payload as one stream (not two), we can only
+        // test the dict path via decompress_deflate_from_bit at offset 0 with dict.
+        // The dict doesn't affect byte 0 decode here — this tests that dict doesn't break it.
+        let result = decompress_deflate_from_bit(&deflate_all, 0, &window, all_out.len())
+            .expect("inflate with dict must succeed");
+        assert_eq!(result, all_out, "output must match full decompression");
+        let _ = expected_payload; // used for clarity above
+    }
+
+    /// Verify decompress_deflate_from_bit works at a non-byte-aligned block boundary.
+    ///
+    /// scan_deflate_isal checkpoints are NOT at block boundaries (ISA-L pauses mid-block),
+    /// so we brute-force scan bit-by-bit to find positions where ISA-L actually decodes
+    /// valid output. The first non-byte-aligned position that produces >= 1KB is a real boundary.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_deflate_from_bit_non_byte_aligned() {
+        use super::*;
+
+        // Large repetitive data → many short deflate blocks → many non-byte-aligned boundaries.
+        let original: Vec<u8> = (0u32..50_000)
+            .flat_map(|i| format!("line {}: the quick brown fox\n", i).into_bytes())
+            .collect();
+
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &original).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        // Bit 0 is always valid (start of stream). Find a non-byte-aligned boundary by
+        // scanning. We limit to the first 32KB of the deflate stream to keep the test fast.
+        let min_output = 1024;
+        let search_limit = (32 * 1024 * 8).min(deflate.len() * 8);
+        let found_bit = (1..search_limit)
+            .filter(|b| b % 8 != 0) // non-byte-aligned only
+            .find(|&bit| {
+                decompress_deflate_from_bit(&deflate, bit, &[], min_output)
+                    .is_some_and(|out| out.len() >= min_output)
+            });
+
+        let bit_offset = found_bit.expect(
+            "should find a non-byte-aligned block boundary in the first 32KB of deflate stream",
+        );
+
+        // Second call: confirm the position is stable and produces output.
+        let result = decompress_deflate_from_bit(&deflate, bit_offset, &[], deflate.len() * 4)
+            .expect("second call at confirmed boundary must succeed");
+        assert!(
+            !result.is_empty(),
+            "output must not be empty at bit {}",
+            bit_offset
+        );
+        assert!(
+            bit_offset % 8 != 0,
+            "confirmed boundary must be non-byte-aligned: bit={}",
+            bit_offset
+        );
+    }
+
+    /// x86_64 ISA-L path must not OOM when max_output=usize::MAX.
+    ///
+    /// Old behaviour: `let cap = max_output.max(256 * 1024)` with no upper bound
+    /// attempted to allocate `usize::MAX` bytes, causing an immediate OOM panic.
+    /// The arm64 zlib-ng path already clamps at 512 MB; this test ensures the
+    /// x86_64 path is consistent.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_decompress_deflate_from_bit_huge_max_output_no_oom() {
+        use super::*;
+        // Empty input: should return None without attempting a huge allocation.
+        let result = decompress_deflate_from_bit(&[], 0, &[], usize::MAX);
+        assert!(result.is_none(), "empty input must return None, not OOM");
+
+        // Real data with a huge max_output hint: should decompress correctly
+        // and return the real (small) output, not allocate 512 MB.
+        let original = b"hello world hello world hello world";
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, original).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let result = decompress_deflate_from_bit(&deflate, 0, &[], usize::MAX)
+            .expect("real input with usize::MAX hint must succeed");
+        assert_eq!(result, original);
+    }
+
+    /// Verify that the CRC accumulated inside the ISA-L loop equals the CRC
+    /// computed in a separate pass over the returned bytes. This guards the
+    /// "CRC-while-hot" invariant: if the inline update missed any written
+    /// bytes (off-by-one in the slice window, wrong iteration count, etc.),
+    /// the two CRCs diverge and the test catches it before it silently
+    /// produces a wrong combined-CRC in phase 2.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_inline_crc_matches_postprocess() {
+        use super::*;
+        use std::io::Write;
+
+        let original: Vec<u8> = (0u8..=255).cycle().take(200_000).collect();
+
+        // Produce a raw DEFLATE stream (no gzip wrapper) via flate2.
+        let mut deflate_enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate_enc.write_all(&original).unwrap();
+        let deflated = deflate_enc.finish().unwrap();
+
+        let mut inline_crc = crc32fast::Hasher::new();
+        let (segments, _end_bit) = decompress_deflate_from_bit_with_end(
+            &deflated,
+            0,
+            &[],
+            original.len() * 2,
+            &mut inline_crc,
+        )
+        .expect("ISA-L decode must succeed on valid DEFLATE");
+
+        assert_eq!(segments, original, "decoded bytes must match original");
+
+        let postprocess_crc = crc32fast::hash(&segments);
+        assert_eq!(
+            inline_crc.finalize(),
+            postprocess_crc,
+            "inline CRC must equal post-process CRC over the same bytes"
+        );
+    }
+}

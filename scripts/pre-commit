@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Pre-commit hook — auto-installed by build.rs on every cargo build.
+set -euo pipefail
+
+changed_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+changed_yaml=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.github/.*\.ya?ml$' || true)
+changed_version=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^(VERSION|Cargo\.toml)$' || true)
+
+# Check version consistency if any version file changed
+if [ -n "$changed_version" ]; then
+    VERSION=$(cat VERSION 2>/dev/null || echo "")
+    CARGO_VERSION=$(grep "^version = " Cargo.toml | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null || echo "")
+
+    if [ "$VERSION" != "$CARGO_VERSION" ]; then
+        echo "❌ Version mismatch: VERSION=$VERSION Cargo=$CARGO_VERSION"
+        exit 1
+    fi
+fi
+
+# Only run checks relevant to what's staged
+if [ -n "$changed_yaml" ]; then
+    for f in $changed_yaml; do
+        ruby -ryaml -e "YAML.safe_load(File.read('$f'))" 2>/dev/null \
+            || { echo "YAML syntax error: $f"; exit 1; }
+    done
+fi
+
+if [ -n "$changed_rs" ]; then
+    cargo fmt --check 2>&1 \
+        || { echo "Run 'cargo fmt' then re-stage."; exit 1; }
+
+    # Default features only — isal-compression requires Linux autotools
+    cargo clippy --all-targets -- -D warnings 2>&1 \
+        || { echo "Fix clippy warnings before committing."; exit 1; }
+fi

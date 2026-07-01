@@ -1,0 +1,170 @@
+# gzippy
+
+> **Part of the [7-zippy](https://github.com/JackDanger/7zippy) family** — pure-Rust compression tooling.
+> Full suite: `cargo add sevenzippy`  |  This crate: `cargo add gzippy`
+
+The fastest gzip on any hardware. Drop-in for `gzip`, `gunzip`, `gzcat`,
+`zcat`, and `ungzippy` — same RFC 1952 output, every decompressor on Earth
+still reads your files.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/scripts/install.sh | bash
+```
+
+One line. Detects macOS, Debian, Ubuntu, and most Linux, then uses the
+right package manager.
+
+<details>
+<summary>Per-platform commands</summary>
+
+**macOS — Homebrew**
+
+```bash
+brew tap jackdanger/gzippy https://github.com/JackDanger/gzippy
+brew install jackdanger/gzippy/gzippy
+```
+
+**Debian / Ubuntu — apt**
+
+```bash
+curl -fsSL https://jackdanger.github.io/gzippy/gzippy-signing-key.asc \
+    | gpg --dearmor \
+    | sudo tee /etc/apt/keyrings/gzippy.gpg >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gzippy.gpg] \
+    https://jackdanger.github.io/gzippy stable main" \
+    | sudo tee /etc/apt/sources.list.d/gzippy.list >/dev/null
+sudo apt-get update
+sudo apt-get install gzippy
+```
+
+Replace system gzip (via dpkg-divert):
+
+```bash
+sudo apt-get install gzippy-replace-gzip
+```
+
+**Build from source**
+
+```bash
+git clone --recursive https://github.com/JackDanger/gzippy
+cd gzippy && cargo build --release
+```
+
+</details>
+
+## How fast?
+
+Measured on the [Silesia compression corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia)
+(202 MB of mixed text, source code, images, and database dumps), Apple
+M4 Pro with 14 cores, macOS 15. Level 6. Median of 15 runs per tool.
+
+### Compression (14 threads)
+
+| Tool        |    Throughput   |   Time  |
+|-------------|----------------:|--------:|
+| **gzippy**  | **~1000 MB/s**  | **0.20 s** |
+| pigz        |     ~430 MB/s   |  0.47 s |
+| Apple gzip  |      ~46 MB/s   |  4.35 s |
+
+### Decompression (single-member gzip)
+
+| Tool        | Throughput |
+|-------------|-----------:|
+| **gzippy**  | **~1050 MB/s** |
+| Apple gzip  |    ~997 MB/s |
+| pigz        |    ~882 MB/s |
+
+Reproduce with [`scripts/readme_benchmark.py`](scripts/readme_benchmark.py)
+after `cargo build --release` and `(cd pigz && make)`.
+
+## One binary, many names
+
+```
+gzip    gunzip    gzcat    zcat    ungzippy    gzippy
+```
+
+All six commands are the same Rust binary. `gunzip file.gz` and
+`gzippy -d file.gz` take identical code paths at identical speed.
+Installers put gzippy ahead of the system gzip in `$PATH`, so the
+takeover is silent — and `/usr/bin/gzip` stays untouched.
+
+## Beyond gzip
+
+```
+$ gzippy --analyze Cargo.lock
+gzippy --analyze  Cargo.lock  (22.1 KB)
+──────────────────────────────────────────────────────────────────────────────
+  entropy    [██████▄   ]   5.22/8   MEDIUM      (mixed text and binary, or a data file)
+  LZ77 cover [████████▄ ]   85.4%    EXTREME     (most bytes come for free — this file is very squishy)
+  matches    2.05K  avg length 9.4 B  avg back-distance 4.8 KB
+  est. gzip  [█▅        ]  ~16% of raw
+
+  match-length histogram — how long is each reused sequence?
+     3 -   4 B  ████████████████         73.0%  literal repeats; common everywhere
+     9 -  16 B  █▇                        8.3%  words, variable names, small keys
+    17 -  32 B  █▆                        7.7%  lines of code, struct layouts
+
+  (canvas, colour legend, distance histogram, verdict — see `man gzippy`)
+```
+
+`gzippy --analyze FILE` prints a compression fingerprint: entropy, LZ77
+coverage, an 80×20 colour canvas of the bytes, match-length and
+distance histograms, and a one-line verdict. No other gzip does this.
+
+The full manual lives in `man gzippy`. The `"GZ"` parallel-block wire
+format and the tuning guide have their own pages: `man gzippy-format`,
+`man gzippy-tuning`.
+
+## Rust library API
+
+Add to `Cargo.toml`:
+
+```toml
+gzippy = "0.5"
+```
+
+One-shot compress and decompress using all available CPUs:
+
+```rust
+let compressed = gzippy::compress(&data, 6)?;
+let decompressed = gzippy::decompress(&compressed)?;
+```
+
+Explicit thread count or streaming I/O:
+
+```rust
+// Standard gzip — any tool can decompress
+let out = gzippy::compress_with_threads(&data, 6, 1)?;
+
+// Streaming — no intermediate allocation
+let bytes_read = gzippy::compress_to_writer(reader, writer, 6)?;
+let bytes_written = gzippy::decompress_to_writer(&data, &mut writer)?;
+```
+
+Every function routes through the same backend-selection logic as the CLI:
+ISA-L SIMD, libdeflate, Zopfli, and parallel multi-block — no extra
+configuration needed.
+
+> **Note:** `threads > 1` at levels 0–5 produces gzippy's "GZ" multi-block
+> format, which only gzippy can decompress. Use `threads = 1` or levels 6–9
+> for standard gzip output readable by any tool.
+
+See [`src/lib.rs`](src/lib.rs) or `cargo doc --open` for the full API.
+
+## Standing on shoulders
+
+- [**pigz**](https://zlib.net/pigz/) by Mark Adler — how to parallelize gzip
+- [**libdeflate**](https://github.com/ebiggers/libdeflate) by Eric Biggers — fast deflate
+- [**zlib-ng**](https://github.com/zlib-ng/zlib-ng) — zlib with SIMD
+- [**rapidgzip**](https://github.com/mxmlnkn/rapidgzip) — parallel decompression
+- [**ISA-L**](https://github.com/intel/isa-l) by Intel — SIMD assembly
+
+## License
+
+[zlib license](LICENSE) — same as zlib and pigz.
+
+## About
+
+Made by [Jack Danger](https://github.com/jackdanger).

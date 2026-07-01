@@ -1,0 +1,8 @@
+knob=hit_drive
+env=GZIPPY_NO_HIT_DRIVE=1
+pred=none
+cell=silesia:1
+mask=0
+sha_ok=1
+rss_base_mb=142
+rss_knob_mb=142

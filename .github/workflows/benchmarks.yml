@@ -1,0 +1,863 @@
+# =============================================================================
+# Benchmarks: Compression and Decompression Performance
+# =============================================================================
+# Architecture:
+#   Stage 1: Build all tools on each platform (x86_64 + ARM64)
+#   Stage 2: Prepare benchmark data
+#   Stage 3: Compression benchmarks (platform × data_type × level × threads)
+#   Stage 4: Decompression benchmarks (platform × archive_type × threads)
+#   Stage 5: Guards and summary (per-platform)
+#
+# Benchmark data:
+#   - silesia-large.gz (~170MB compressed, ~500MB uncompressed) - mixed binary/text
+#   - software.archive.gz - synthetic source code patterns
+#   - logs.txt.gz - synthetic repetitive log data
+# =============================================================================
+name: Benchmarks
+
+on:
+  push:
+    branches: ["**"]  # match slashed names like feat/foo too (single-* is just one segment)
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# An open PR makes every branch push fire BOTH the `push` and `pull_request`
+# events → two concurrent Benchmarks runs on the SAME commit, both uploading
+# identically-named artifacts (binaries-*, results-*). That concurrent-upload
+# race is the most likely source of the x86 guard's `download-artifact
+# digest-mismatch: error` (and it doubles CI cost). Dedupe by the head commit
+# SHA so the push-run and PR-run share one group and the older is cancelled —
+# exactly one Benchmarks run per commit.
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # STAGE 1: Build all tools on each platform
+  # ============================================================================
+  build:
+    name: Build Tools (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: ubuntu-latest
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm zlib1g-dev autoconf automake libtool
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.platform }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build all tools
+        run: |
+          # Build gzippy with the pure-Rust ParallelSM decode engine
+          # (gzippy-native => pure-rust-inflate => parallel_sm cfg). This is the
+          # binary every decode benchmark below exercises, so it MUST be the
+          # shipped/product decode path, NOT libdeflate one-shot. x86_64 also
+          # layers ISA-L *compression* (fastest L0–L3); the two features coexist.
+          if [ "$(uname -m)" = "x86_64" ]; then
+            cargo build --release --features gzippy-native,isal-compression
+          else
+            cargo build --release --features gzippy-native
+          fi
+
+          # GATE-4 (production-path assertion): the just-built binary must decode
+          # single-member via ParallelSM (the campaign's pure-Rust engine), never
+          # silently regress to libdeflate one-shot. Fail the build if not.
+          printf 'gate4 production-path assertion fixture\n%.0s' {1..4096} \
+            | ./target/release/gzippy -c > /tmp/gate4-sm.gz
+          DBG=$(GZIPPY_DEBUG=1 ./target/release/gzippy -d -c /tmp/gate4-sm.gz 2>&1 >/dev/null)
+          echo "$DBG"
+          echo "$DBG" | grep -q 'path=ParallelSM' || {
+            echo "::error::Gate-4 FAILED: single-member decode is NOT ParallelSM (shipped flavor regressed to libdeflate one-shot). Build features must enable gzippy-native."
+            exit 1
+          }
+          echo "✓ Gate-4: single-member decode routes to ParallelSM"
+
+          # Build pigz
+          make -C vendor/pigz
+
+          # Build igzip (static)
+          cd vendor/isa-l
+          rm -rf build && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          make -j$(nproc) igzip || echo "igzip build failed"
+          cd ../../..
+
+          # Build rapidgzip
+          cd vendor/rapidgzip/librapidarchive
+          rm -rf build && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
+          make -j$(nproc) rapidgzip || echo "rapidgzip build failed"
+          cd ../../../..
+
+      - name: Package binaries
+        run: |
+          mkdir -p binaries
+          cp target/release/gzippy binaries/
+          cp vendor/pigz/pigz vendor/pigz/unpigz binaries/
+          cp vendor/isa-l/build/igzip binaries/ 2>/dev/null || echo "igzip not available"
+          cp vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip binaries/ 2>/dev/null || echo "rapidgzip not available"
+          ls -la binaries/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: binaries/
+          retention-days: 1
+
+  # ============================================================================
+  # STAGE 2: Prepare benchmark data (platform-independent, run once)
+  # ============================================================================
+  prepare-data:
+    name: Prepare Benchmark Data
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64
+          path: ./bin
+
+      - name: Prepare benchmark data
+        run: |
+          chmod +x ./bin/*
+          make bench-data
+
+          # Create multi-format archives for decompression benchmarks
+          # BGZF (gzippy parallel blocks) and multi-member (pigz-style)
+          for dataset in silesia-large software.archive logs.txt; do
+            base="benchmark_data/${dataset}"
+
+            # Determine uncompressed source file
+            if [ "$dataset" = "silesia-large" ]; then
+              src="${base}.bin"
+            elif [ "$dataset" = "software.archive" ]; then
+              src="${base}"
+            else
+              src="${base}"
+            fi
+
+            if [ ! -f "$src" ]; then
+              echo "WARN: $src not found, skipping multi-format for $dataset"
+              continue
+            fi
+
+            # Create BGZF (gzippy output)
+            echo "Creating BGZF: ${base}-bgzf.gz"
+            ./bin/gzippy -1 -c < "$src" > "${base}-bgzf.gz"
+
+            # Create multi-member (pigz output)
+            echo "Creating multi-member: ${base}-pigz.gz"
+            ./bin/pigz -1 -c < "$src" > "${base}-pigz.gz"
+          done
+
+          ls -lh benchmark_data/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-data
+          path: benchmark_data/
+          retention-days: 1
+
+  # ============================================================================
+  # STAGE 3: Compression benchmarks (platform × data_type × level × threads)
+  # ============================================================================
+  compression-benchmark:
+    name: Compress ${{ matrix.data_type }} L${{ matrix.level }} T${{ matrix.threads }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 - full matrix
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 6
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 6
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 9
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 6
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 6
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 9
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 6
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 6
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 9
+            threads: "max"
+          # x86_64 - L11 (ultra/zopfli: ratio guard vs gzip -9; T1 only, zopfli is single-threaded)
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 11
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 11
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 11
+            threads: "1"
+          # ARM64 - full matrix (matches x86_64)
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 1
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 6
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 9
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 9
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 1
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 6
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 9
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 9
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 1
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 6
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 9
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 9
+            threads: "max"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: ./bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-data
+          path: ./benchmark_data
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+          # Map data_type to actual file
+          case "${{ matrix.data_type }}" in
+            silesia)
+              echo "DATA_FILE=benchmark_data/silesia.tar" >> $GITHUB_ENV
+              ;;
+            software)
+              echo "DATA_FILE=benchmark_data/software.archive" >> $GITHUB_ENV
+              ;;
+            logs)
+              echo "DATA_FILE=benchmark_data/logs.txt" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "$DATA_FILE" ]; then
+            echo "ERROR: $DATA_FILE not found"
+            exit 1
+          fi
+          echo "Using: $DATA_FILE ($(du -h $DATA_FILE | cut -f1))"
+
+      - name: Run compression benchmark
+        run: |
+          python3 scripts/benchmark_compression.py \
+            --binaries ./bin \
+            --data-file "$DATA_FILE" \
+            --level ${{ matrix.level }} \
+            --threads $THREADS \
+            --content-type ${{ matrix.data_type }} \
+            --output results/compress-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: results-compress-${{ matrix.platform }}-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
+  # STAGE 4: Decompression benchmarks (platform × archive_type × threads)
+  # ============================================================================
+  decompression-benchmark:
+    name: Decompress ${{ matrix.archive_type }} T${{ matrix.threads }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x86_64, arm64]
+        archive_type: [silesia-gzip, silesia-bgzf, silesia-pigz, software-gzip, software-bgzf, software-pigz, logs-gzip, logs-bgzf, logs-pigz]
+        threads: ["1", "max"]
+        include:
+          - platform: x86_64
+            runner: ubuntu-latest
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: ./bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-data
+          path: ./benchmark_data
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+          # Parse archive_type: "dataset-format" e.g. "silesia-gzip", "software-bgzf"
+          ARCHIVE_TYPE="${{ matrix.archive_type }}"
+          DATASET="${ARCHIVE_TYPE%-*}"
+          FORMAT="${ARCHIVE_TYPE##*-}"
+
+          # Map dataset+format to actual files
+          case "$DATASET" in
+            silesia)
+              ORIG_FILE="benchmark_data/silesia-large.bin"
+              case "$FORMAT" in
+                gzip) COMP_FILE="benchmark_data/silesia-large.gz" ;;
+                bgzf) COMP_FILE="benchmark_data/silesia-large-bgzf.gz" ;;
+                pigz) COMP_FILE="benchmark_data/silesia-large-pigz.gz" ;;
+              esac
+              ;;
+            software)
+              ORIG_FILE="benchmark_data/software.archive"
+              case "$FORMAT" in
+                gzip) COMP_FILE="benchmark_data/software.archive.gz" ;;
+                bgzf) COMP_FILE="benchmark_data/software.archive-bgzf.gz" ;;
+                pigz) COMP_FILE="benchmark_data/software.archive-pigz.gz" ;;
+              esac
+              ;;
+            logs)
+              ORIG_FILE="benchmark_data/logs.txt"
+              case "$FORMAT" in
+                gzip) COMP_FILE="benchmark_data/logs.txt.gz" ;;
+                bgzf) COMP_FILE="benchmark_data/logs.txt-bgzf.gz" ;;
+                pigz) COMP_FILE="benchmark_data/logs.txt-pigz.gz" ;;
+              esac
+              ;;
+          esac
+
+          echo "COMPRESSED_FILE=$COMP_FILE" >> $GITHUB_ENV
+          echo "ORIGINAL_FILE=$ORIG_FILE" >> $GITHUB_ENV
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "$COMPRESSED_FILE" ]; then
+            echo "ERROR: $COMPRESSED_FILE not found"
+            exit 1
+          fi
+          if [ ! -f "$ORIGINAL_FILE" ]; then
+            echo "ERROR: $ORIGINAL_FILE not found"
+            exit 1
+          fi
+          echo "Compressed: $COMPRESSED_FILE ($(du -h $COMPRESSED_FILE | cut -f1))"
+          echo "Original: $ORIGINAL_FILE ($(du -h $ORIGINAL_FILE | cut -f1))"
+
+      - name: Run decompression benchmark
+        run: |
+          python3 scripts/benchmark_decompression.py \
+            --binaries ./bin \
+            --compressed-file "$COMPRESSED_FILE" \
+            --original-file "$ORIGINAL_FILE" \
+            --threads $THREADS \
+            --archive-type ${{ matrix.archive_type }} \
+            --output results/decompress-${{ matrix.archive_type }}-t${{ matrix.threads }}.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: results-decompress-${{ matrix.platform }}-${{ matrix.archive_type }}-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
+  # STAGE 4b: Single-member parallel decompression benchmark (x86_64 only)
+  # Tests the v0.6 marker pipeline on a standard single-member file:
+  # per-chunk pure-Rust marker decode + SIMD `replace_markers` resolve,
+  # ~1.1N total compute work, scales ~T from T=2 upward.
+  # arm64 skipped: ISA-L unavailable, parallel single-member path is gated off.
+  # ============================================================================
+  single-member-benchmark:
+    name: Single-Member Decomp T${{ matrix.threads }} (x86_64)
+    runs-on: ubuntu-latest
+    # Bound the job at 8 minutes. Earlier today (2026-05-13) a runaway
+    # tier-3 boundary-search sweep ran for 34+ s per gzippy invocation
+    # before the runner sent SIGTERM; the cause was ambiguous because the
+    # signal looked like generic runner preemption. An explicit job-level
+    # timeout turns that class of regression into a clear "exceeded
+    # timeout" failure instead of "runner died, who knows why."
+    timeout-minutes: 8
+    needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: ["1", "max"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64
+          path: ./bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-data
+          path: ./benchmark_data
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "benchmark_data/silesia-large.gz" ]; then
+            echo "ERROR: benchmark_data/silesia-large.gz not found"
+            exit 1
+          fi
+          if [ ! -f "benchmark_data/silesia-large.bin" ]; then
+            echo "ERROR: benchmark_data/silesia-large.bin not found"
+            exit 1
+          fi
+          echo "Compressed: $(du -h benchmark_data/silesia-large.gz | cut -f1)"
+          echo "Original: $(du -h benchmark_data/silesia-large.bin | cut -f1)"
+
+      - name: Run single-member benchmark
+        run: |
+          python3 scripts/benchmark_single_member.py \
+            --binaries ./bin \
+            --compressed-file benchmark_data/silesia-large.gz \
+            --original-file benchmark_data/silesia-large.bin \
+            --threads $THREADS \
+            --output results/single-member-t${{ matrix.threads }}.json
+
+      # `if: always()` so a failing bench still uploads the JSON with
+      # routing_trace.stderr_head and per-phase timings — otherwise the
+      # only signal is the bench's stdout summary, which doesn't include
+      # the GZIPPY_DEBUG output needed to diagnose perf shortfalls
+      # (silent fallback vs slow marker pipeline vs chain-decode).
+      # `if: always()` so a failing bench still uploads the diagnostic JSON —
+      # but ONLY if a JSON actually exists. A job SIGTERM'd at its 8-min timeout
+      # would otherwise upload an empty/partial `results/`, which the guards job
+      # then fails to validate (`download-artifact digest-mismatch: error`).
+      - uses: actions/upload-artifact@v7
+        if: always() && hashFiles('results/*.json') != ''
+        with:
+          name: single-member-results-x86_64-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
+  # STAGE 5: Random data correctness check
+  # ============================================================================
+  random-data:
+    name: Random Data L${{ matrix.level }} T${{ matrix.threads }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 9
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            level: 9
+            threads: "max"
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: ./bin
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+      - name: Test random data
+        run: |
+          # Generate 10MB random data
+          dd if=/dev/urandom of=/tmp/random.bin bs=1M count=10 2>/dev/null
+
+          # Compress
+          cat /tmp/random.bin | ./bin/gzippy -${{ matrix.level }} -p$THREADS > /tmp/random.gz
+
+          # Decompress with gzippy
+          ./bin/gzippy -d < /tmp/random.gz > /tmp/random.out
+          diff /tmp/random.bin /tmp/random.out
+          echo "✓ gzippy roundtrip OK"
+
+          # Verify gzip format compatibility — always run regardless of thread count.
+          # Performance (beating pigz) does not prove format correctness.
+          gzip -d < /tmp/random.gz > /tmp/random.gzip.out
+          diff /tmp/random.bin /tmp/random.gzip.out
+          echo "✓ gzip can decompress gzippy output"
+
+  # ============================================================================
+  # STAGE 6: Performance guards and summary (per platform)
+  # ============================================================================
+  guards:
+    name: Performance Guards (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    needs: [compression-benchmark, decompression-benchmark, random-data, single-member-benchmark]
+    if: always() && needs.compression-benchmark.result == 'success' && needs.decompression-benchmark.result == 'success'
+    strategy:
+      matrix:
+        platform: [x86_64, arm64]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: results-*-${{ matrix.platform }}-*
+          path: results/
+          # merge-multiple intentionally omitted: each artifact goes into its own
+          # subdirectory (results/<artifact-name>/), so compression.json and
+          # decompression.json from different jobs don't collide. aggregate_benchmark_results.py
+          # uses rglob to find all JSON files recursively, and infers data_type from the
+          # subdirectory name (which contains "silesia", "software", "logs", etc.).
+
+      - name: Download single-member results
+        if: matrix.platform == 'x86_64'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: single-member-results-x86_64-*
+          path: results-sm/
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Collect system info
+        run: |
+          python3 scripts/collect_system_info.py --output results/system.json
+          # Tag with platform
+          python3 -c "
+          import json
+          with open('results/system.json') as f:
+              data = json.load(f)
+          data['benchmark_platform'] = '${{ matrix.platform }}'
+          with open('results/system.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          "
+
+      - name: Aggregate results
+        run: |
+          python3 scripts/aggregate_benchmark_results.py \
+            --input-dir results \
+            --output-dir aggregated
+
+      - name: Check performance guards
+        id: guards
+        run: |
+          SM_ARG=""
+          if [ "${{ matrix.platform }}" = "x86_64" ] && [ -d results-sm ]; then
+            SM_ARG="--single-member-dir results-sm"
+          fi
+          python3 scripts/check_guards.py \
+            --compression aggregated/compression.json \
+            --decompression aggregated/decompression.json \
+            $SM_ARG \
+            --output guards-report.json
+
+      - name: Generate summary
+        run: |
+          SM_ARG=""
+          if [ "${{ matrix.platform }}" = "x86_64" ] && [ -d results-sm ]; then
+            SM_ARG="--single-member-dir results-sm"
+          fi
+          python3 scripts/generate_summary.py \
+            --system results/system.json \
+            --compression aggregated/compression.json \
+            --decompression aggregated/decompression.json \
+            $SM_ARG \
+            --output summary.md
+
+          echo "## ${{ matrix.platform }} Performance" >> $GITHUB_STEP_SUMMARY
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-summary-${{ matrix.platform }}
+          path: |
+            aggregated/
+            results/system.json
+            guards-report.json
+            summary.md
+          retention-days: 30
+
+      - name: Post to PR
+        if: github.event_name == 'pull_request' && matrix.platform == 'x86_64'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+
+            let summary;
+            try {
+              summary = fs.readFileSync('summary.md', 'utf8');
+            } catch {
+              summary = '## gzippy Performance Summary\n\nNo results available.';
+            }
+
+            const body = summary + '\n\n---\n*Updated: ' + new Date().toISOString() + '*';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const marker = '# gzippy Performance Summary';
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }

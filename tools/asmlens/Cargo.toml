@@ -1,0 +1,22 @@
+# Standalone dev tool (own workspace; built with --manifest-path, like tools/devtool).
+#
+# MULTI-ARCH by design: uses capstone (x86_64 AND aarch64) so the same tool
+# analyzes the x86 bench-box binaries today and the arm64 (M4) Rust-decoder
+# builds when we optimize natively later. Arch is auto-detected from the ELF.
+[package]
+name = "asmlens"
+version = "0.1.0"
+edition = "2021"
+description = "Machine-code analysis lens: disassemble a symbol (x86_64/aarch64), reconstruct basic blocks + loops, overlay perf dynamic-instruction weight, map to source lines, and diff two symbols (our inflate hot loop vs libdeflate)."
+
+[[bin]]
+name = "asmlens"
+path = "src/main.rs"
+
+[dependencies]
+capstone = "0.12"
+object = "0.36"
+anyhow = "1"
+addr2line = "0.24"
+
+[workspace]

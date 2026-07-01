@@ -1,0 +1,64 @@
+[contig-prof] CONTIG (Block::decode_clean_into_contig):
+  calls=2798 total_cyc=1767022724 classed_cyc=1766558188 (100.0% of total; rest=careful+entry/exit+unchained tail)
+  lit1   : iters=     3303758 cyc=     228783198  13.0% of classed,   69.2 cyc/iter
+  litpack: iters=     1227631 cyc=      93837560   5.3% of classed,   76.4 cyc/iter, lits=7326270
+  litchn : iters=     6319731 cyc=     413187506  23.4% of classed,   65.4 cyc/iter, lits=17217124
+  backref: iters=    17971348 cyc=    1030749924  58.3% of classed,   57.4 cyc/iter, bytes=183889612 dist_long=4
+  careful: cyc=5200 (0.0% of total) outer_iters=7
+  disttbl: builds=2790 reuses=7 (P3.4 dynamic-block dist_table amortization)
+[contig-prof] WRAPPER (decode_huffman_body_resumable):
+  calls=0 total_cyc=0 classed_cyc=0 (0.0%)
+  lit    : iters=           0 cyc=             0   0.0% of classed,    0.0 cyc/iter
+  match  : iters=           0 cyc=             0   0.0% of classed,    0.0 cyc/iter
+[gzippy --verbose] BlockFetcher statistics:
+        Total Existing                : 55
+        Total Fetched                 : 17
+        Prefetched                    : 0
+        Fetched On-demand             : 17
+    Prefetch Stall by BlockFinder     : 0
+    Time spent in:
+        decodeBlock                   : 1.386080 s
+        std::future::get              : 0.000005 s
+        get                           : 1.386212 s
+    Thread Pool Utilization:
+        Total Real Decode Duration    : 1.466302 s
+        Theoretical Optimal Duration  : 1.386080 s
+        Pool Efficiency (Fill Factor) : 94.53 %
+    Prefetch Cache:
+        Hits                          : 0
+        Misses                        : 33
+        Unused Entries                : 0
+    Cache Hit Rate                    : 0.00 %
+    Useless Prefetches                : 0.00 %
+
+  Preemptive stops: 0
+  Time queuing post-processing: 0.000000 s
+  Adjusted chunk size applied: 0
+  Prefetch next-offset filesize-accepts: 1
+  Unsplit blocks emplaced: 37
+  Eager post-process: runs=34 runs_nonempty=0 inspected=0 submitted=0 max/run=0 reused=0
+  Eager harvest ready: 0
+  Prefetch post-process promoted: 0 harvest-promoted: 0 already-resolved take: 0
+  Unified decoder: flip_to_clean=0 finished_no_flip=0 finish_decode=0 inflate_wrapper=0 window_seeded=16 seeded_block=16 seeded_wrapper=0 exact_block=1 exact_wrapper=0 bad_seed_resync=0 resumable_resync_calls=0 handoff_window_grows=0
+  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks=0 isal_fallbacks=0 bfinal_exact_accepted=0 until_exact_fb=0 inexact_fb=0
+  Max concurrently-live ChunkData (in-flight depth): 4  (live now: 0)
+  Buffer pool u8: hits=0 misses=0 returns=0
+  Buffer pool u16: hits=0 misses=0 returns=0
+  Per-worker buffer pool activity (worker: u8 h/m/r | u16 h/m/r):
+  Bootstrap pool: takes=0 allocs=0 returns=0 dropped=0 reused_MB=0.0 reuse_rate=0.0%
+  Slow-path decode: ok=0 fail=0 no_candidate=0
+  Early window publish: published=17 handoff_key=0 tail_not_clean=0 range_speculative=0
+  BlockFinder coordinator spawns: 0
+  Speculation failure modes: header=0 body=0 inflate=0 stop_missed=0 other=0
+  Speculation phantom-EOS rejects: 0
+  Post-process path: fused_lut=0 small_markers=0
+  Prefetch dispatch: called=17 saturated=17 zero_submitted=0 any_submitted=0 total_submitted=0 pollution_stops=0
+  Body-fail forensics: count=0 wasted_bytes=0 avg_waste=0B avg_bits_into_body=0
+    by variant: invalid_huffman=0 exceeded_window=0 invalid_compression=0 invalid_code_lengths=0 other=0
+  BlockFinder spawn breakdown: calls=0 total_ms=0.0 scan_ms=0.0 consumer_ms=0.0 avg_total_us=0
+  Bootstrap per-block: header_calls=0 header_ms=0.0 avg_header_us=0.0 body_ms=0.0 body_bytes=0 body_rate_MB/s=0 clean_flipped_bytes=0 (0.0% of body = marker-FREE complement; marker loop owns the other 100.0%)
+  Prefetch guard-rejects: 0
+  Clean decode (pred@key / pred@seed / handoff@stop / boundary@seed / candidate): 0 / 0 / 0 / 0 / 0
+  Worker resolve-ahead: ok=0 / attempts=0
+  Arc::try_unwrap hits/misses: 17 / 0
+  Consumer pair-ready drains: 16

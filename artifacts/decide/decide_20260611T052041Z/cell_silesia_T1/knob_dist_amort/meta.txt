@@ -1,0 +1,6 @@
+knob=dist_amort
+env=GZIPPY_DIST_AMORT=0
+pred=prof_dist
+cell=silesia:1
+mask=0
+sha_ok=1

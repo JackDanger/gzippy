@@ -1,0 +1,33 @@
+Source: gzippy
+Section: utils
+Priority: optional
+Maintainer: Jack Danger <github@jackdanger.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.70)
+Standards-Version: 4.6.2
+Homepage: https://github.com/jackdanger/gzippy
+Vcs-Git: https://github.com/jackdanger/gzippy.git
+Rules-Requires-Root: no
+
+Package: gzippy
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: The fastest parallel gzip
+ Gzippy is a high-performance parallel gzip implementation written in Rust.
+ It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
+ and optimized compression libraries (libdeflate, zlib-ng).
+ .
+ Features:
+  - Drop-in gzip replacement with compatible CLI
+  - Parallel compression using all available cores
+  - Memory-mapped I/O for zero-copy file access
+  - Compatible output that works with all standard gzip tools
+ .
+ This package provides the gzippy and ungzippy commands.
+
+Package: gzippy-replace-gzip
+Architecture: all
+Depends: gzippy (>= ${binary:Version}), ${misc:Depends}
+Description: Transitional package — gzippy now replaces gzip automatically
+ This is a no-op transitional package. As of gzippy 0.1.6, installing the
+ gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
+ /usr/bin/zcat to gzippy via dpkg-divert. This package can be safely removed.

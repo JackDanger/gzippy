@@ -1,0 +1,36 @@
+runid=settle_20260615T182434Z
+bin=/dev/shm/gz-b22-target/release/gzippy
+bin_sha=172a57316b3203479f427ad06ed0f2a98540d684dc062b034be4e6d1871c5621
+rg=/root/oracle_c/rapidgzip-native
+rg_sha=41baa20fdfbdea24ed89aa6977ebe71ff01936e9a88d9d6c82999dbabe11ffe1
+rg_version=rapidgzip, CLI to the parallelized, indexed, and seekable gzip decoding library rapidgzip version 0.16.0
+protocol=settle-bothsinks-v1
+host_cpu_model=13th Gen Intel(R) Core(TM) i7-13700T
+host_kernel=6.17.13-3-pve
+host_id=886f44abd9c2
+freeze_state=frozen
+quiet_state=quiet
+governor=performance
+no_turbo=1
+runnable_avg=1.25
+n=12
+cells=silesia:1,silesia:4,silesia:7,silesia:8,nasa:4,nasa:7,monorepo:4,monorepo:7,squishy:4
+devnull_class=devnull
+started=2026-06-15T18:24:38Z
+champ_present=igzip:/usr/bin/igzip
+champ_present=libdeflate:/usr/bin/libdeflate-gunzip
+champ_present=pigz:/usr/bin/pigz
+corpus_silesia_sha=028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f
+cell_done=silesia:T1:mask=0
+cell_done=silesia:T4:mask=0,2,4,8
+cell_done=silesia:T7:mask=0,2,4,8,10,12,14
+cell_done=silesia:T8:mask=0,2,3,4,8,10,12,14
+corpus_nasa_sha=96551161b5bdcaacbc3c17fa108191c478fb35dfe87895c16e34a8f6552bf29a
+cell_done=nasa:T4:mask=0,2,4,8
+cell_done=nasa:T7:mask=0,2,4,8,10,12,14
+corpus_monorepo_sha=0dd50d07b0147211144cf696ed8c16418b8b34c0c064df82c7ac352cc640f509
+cell_done=monorepo:T4:mask=0,2,4,8
+cell_done=monorepo:T7:mask=0,2,4,8,10,12,14
+corpus_squishy_sha=4ee30c1571688ca4fa34b2c78865fe8c9faef1f67ed82a2ee0e8abf470a3d498
+cell_done=squishy:T4:mask=0,2,4,8
+finished=2026-06-15T18:37:28Z

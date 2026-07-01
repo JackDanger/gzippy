@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# fulcrum — the campaign's instrument front door.
+# Engine: the Rust `fulcrum` binary from the fulcrum OSS repo
+# ($FULCRUM_HOME/target/release/fulcrum; FULCRUM_HOME defaults to $HOME/www/fulcrum;
+# override the binary directly with $FULCRUM_BIN).
+# (The Python decide/ package was removed 2026-06-15 after the Rust port passed a
+#  whole-pipeline cross-check; the Rust binary is now the SOLE engine.)
+#
+#   fulcrum decide [args]      ONE-RUN decision table on the bench box
+#                              (scripts/bench/decide.sh)
+#   fulcrum analyze <dir>      re-render table + decision brief from artifacts
+#                              (the Rust `decide` subcommand)
+#   fulcrum total <trace...>   the validated whole-system trace analyzer
+#   fulcrum selftest           run the Rust suite (cargo test --release) — the
+#                              SELF-TEST-OR-NO-TRUST gate
+#   fulcrum invariants         the enforced invariant set, with scars
+#   fulcrum ledger [path]      banked results + fingerprints
+#   fulcrum score [args]       generate a score/ cell deterministically
+#   fulcrum <other> [args]     any other Rust subcommand (run/perturb/provenance/
+#                              quantity/insn/cycles/locate/comparability/finding/...)
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FULCRUM_HOME="${FULCRUM_HOME:-$HOME/www/fulcrum}"
+FULCRUM_BIN="${FULCRUM_BIN:-$FULCRUM_HOME/target/release/fulcrum}"
+if [ ! -x "$FULCRUM_BIN" ]; then
+  echo "fulcrum: Rust binary not found at $FULCRUM_BIN" >&2
+  echo "  Build it: cd '$FULCRUM_HOME' && cargo build --release  (or set FULCRUM_BIN)" >&2
+  exit 1
+fi
+export FULCRUM_LEDGER="${FULCRUM_LEDGER:-$HERE/../artifacts/fulcrum/ledger.jsonl}"
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  decide)   exec "$HERE/bench/decide.sh" "$@";;
+  analyze)  exec "$FULCRUM_BIN" decide "$@";;          # Rust `decide` == Python `analyze`
+  selftest) exec cargo test --release --manifest-path "$FULCRUM_HOME/Cargo.toml";;
+  help|-h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}";;
+  # total / invariants / ledger / score / run / perturb / provenance / quantity /
+  # insn / cycles / locate / comparability / finding / ... all map 1:1 to the binary.
+  *) exec "$FULCRUM_BIN" "$cmd" "$@";;
+esac

@@ -1,0 +1,17 @@
+[package]
+name = "gzippy-marker-density"
+version = "0.1.0"
+edition = "2021"
+description = "Kill-test: measure marker fraction vs output offset for window-absent bootstrap decode"
+
+[[bin]]
+name = "gzippy-marker-density"
+path = "src/main.rs"
+
+[dependencies]
+gzippy = { path = "../..", features = ["pure-rust-inflate"] }
+
+[lints.clippy]
+all = "allow"
+
+[workspace]

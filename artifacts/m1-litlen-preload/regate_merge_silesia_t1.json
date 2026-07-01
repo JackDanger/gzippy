@@ -1,0 +1,43 @@
+{
+  "aa_floor_pct": 0.4800138171031322,
+  "arch": "aarch64",
+  "cohort_aa_ratios": [
+    0.9920934448665064,
+    1.000451381777584,
+    1.001680501683103,
+    0.9967946296922792
+  ],
+  "cohort_gz_ref_ratios": [
+    0.969907662597041,
+    0.9733794781403402,
+    0.9763470939297886,
+    0.9781095075580909
+  ],
+  "compressed_bytes": 67647541,
+  "corpus": "/private/tmp/m1-corpus-pinned/silesia.gz",
+  "corpus_sha256": "38242bcb6317e7e00efedb599b9a369cd8cba3c0460a3c4e2d43654de9f4457e",
+  "cross_cohort_spread_pct": 0.42066641951448525,
+  "dropped_pairs": 7,
+  "effect_pct": -2.5136713964935664,
+  "gz_bin": "/Users/jackdanger/www/gzippy/.claude/worktrees/agent-a11723d4f446a7c0d/target/release/gzippy",
+  "gz_faster": true,
+  "gz_sha256": "5af8472a85bdb6082e5d890122f2b8d343e936ba6aeba11af9c20c6cdd678209",
+  "host": "hardcall",
+  "kept_pairs": 29,
+  "min_cohort_effect_pct": 2.1890492441909104,
+  "oracle_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "overall_gz_ref": 0.9748632860350643,
+  "ratio": 3.1334176655438224,
+  "ref_args": [
+    "-c"
+  ],
+  "ref_bin": "/opt/homebrew/bin/libdeflate-gunzip",
+  "ref_sha256": "f9e95b0541c1c98e87bbfe4403428f02a26b8fbc5daf4e90bf88e0339c5c3fc0",
+  "sign_consistent": true,
+  "status": "REPRODUCIBLE",
+  "steady_ghz": 3.1956997014566624,
+  "threads": 1,
+  "tool": "fulcrum vs",
+  "uncompressed_bytes": 211968000,
+  "warmup_converged": true
+}

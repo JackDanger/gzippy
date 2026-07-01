@@ -1,0 +1,36 @@
+{
+  "_comment": "CERTIFIED Fulcrum FieldBaseline, Neurotic Intel i7-13700. f3a418c. gzippy-native vs {igzip,libdeflate,zlibng,pigz,rapidgzip-native-ELF}. T=[1,4,7] (7 independent P-cores). Run from cwd=/mnt/internal/gzfx for the --gate GitSrcOracle. NO perturbations (baseline).",
+  "runid": "neurotic-baseline-aa",
+  "repo": "/mnt/internal/gzfx",
+  "arch": "intel-i7-13700",
+  "feature": "gzippy-native",
+  "gzippy_bin": "/mnt/internal/bin/gzippy-native",
+  "comparator_bin": "/root/oracle_c/rapidgzip-native",
+  "comparator_path": "/root/oracle_c/rapidgzip-native",
+  "comparators": [
+    { "id": "igzip",      "bin": "/usr/bin/igzip",             "args": ["-d", "-c", "{path}"] },
+    { "id": "libdeflate", "bin": "/usr/bin/libdeflate-gunzip", "args": ["-d", "-c", "{path}"] },
+    { "id": "zlibng",     "bin": "/mnt/internal/bin/minigzip-ng", "args": ["-d", "-c", "{path}"] },
+    { "id": "pigz",       "bin": "/usr/bin/pigz",              "args": ["-d", "-c", "-p", "{t}", "{path}"] },
+    { "id": "rapidgzip",  "bin": "/root/oracle_c/rapidgzip-native", "args": ["-d", "-c", "-f", "-P", "{t}", "{path}"], "require_native_elf": true }
+  ],
+  "corpora": [
+    { "id": "squishyreal",     "path": "/tmp/corpora/squishy_realdata.gz" },
+    { "id": "squishycombined", "path": "/tmp/corpora/squishy_combined.gz" },
+    { "id": "silesia",         "path": "/tmp/corpora/silesia.gz" },
+    { "id": "monorepo",        "path": "/tmp/corpora/monorepo.gz" },
+    { "id": "nasa",            "path": "/tmp/corpora/nasa.gz" }
+  ],
+  "threads": [1, 4, 7],
+  "n": 15,
+  "sink": "/dev/null",
+  "knobs": [],
+  "oracles": [],
+  "perturbations": [],
+  "core_pool": [2, 4, 8, 10, 12, 14, 0],
+  "freeze_state": "frozen",
+  "quiet_state": "quiet",
+  "governor": "performance",
+  "no_turbo": "1",
+  "host": { "cpu_model": "Intel i7-13700T", "id": "neurotic" }
+}
