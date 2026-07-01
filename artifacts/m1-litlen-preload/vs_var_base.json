@@ -1,0 +1,45 @@
+{
+  "aa_floor_pct": 0.42029089690549015,
+  "arch": "aarch64",
+  "cohort_aa_ratios": [
+    0.9978081109016842,
+    0.9929160742989636,
+    1.0011052481769744,
+    1.001317325184199
+  ],
+  "cohort_gz_ref_ratios": [
+    0.950844373618856,
+    0.9454358302588723,
+    0.9512027687785878,
+    0.9527083256528865
+  ],
+  "compressed_bytes": 67585052,
+  "corpus": "/Users/jackdanger/www/gzippy-reimplement-isal/benchmark_data/silesia-gzip.tar.gz",
+  "corpus_sha256": "96070b0afda96576619313e2c69d2e44cc150df4873b3c96f4a67c9aafe37e9c",
+  "cross_cohort_spread_pct": 0.382350953975176,
+  "dropped_pairs": 3,
+  "effect_pct": -4.897642880127817,
+  "gz_bin": "/private/tmp/claude-501/-Users-jackdanger-www-gzippy-reimplement-isal/37b843ea-0b0d-4dfd-856e-9f69ef21e47d/scratchpad/bins/gz-var",
+  "gz_faster": true,
+  "gz_sha256": "8e5c53ceeb96af3c4d32781033671ed96aaced942df5d26fedc5ca4869bb1fe6",
+  "host": "hardcall",
+  "kept_pairs": 33,
+  "min_cohort_effect_pct": 4.7291674347113455,
+  "oracle_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "overall_gz_ref": 0.9510235711987218,
+  "ratio": 3.1363148170693127,
+  "ref_args": [
+    "-d",
+    "-c",
+    "-p1"
+  ],
+  "ref_bin": "/private/tmp/claude-501/-Users-jackdanger-www-gzippy-reimplement-isal/37b843ea-0b0d-4dfd-856e-9f69ef21e47d/scratchpad/bins/gz-base",
+  "ref_sha256": "1189d8fa33587de0250b1b74e4b67a3bcf786f088c15ccdbe289c08dbdf5b6fb",
+  "sign_consistent": true,
+  "status": "REPRODUCIBLE",
+  "steady_ghz": 3.2171201199208523,
+  "threads": 1,
+  "tool": "fulcrum vs",
+  "uncompressed_bytes": 211968000,
+  "warmup_converged": true
+}

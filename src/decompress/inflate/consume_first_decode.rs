@@ -1802,6 +1802,20 @@ pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
         if dist_entry.is_subtable_ptr() {
             bitbuf >>= DistTable::TABLE_BITS;
             bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+            // INVARIANT GUARD for the load-before-refill preload below.
+            // After the primary `<32` refill (line above), the FAST offset path
+            // leaves bitsleft >= 32 - OFFSET_MAXFASTBITS(21) = 11, so the next
+            // litlen preload can read the CURRENT (pre-refill) bitbuf: the refill
+            // only ORs bits ABOVE position `bitsleft`, so the low LITLEN_TABLEBITS
+            // (11) — the preload index — are preserved iff bitsleft >= 11.
+            // The SUBTABLE offset path consumes TABLE_BITS(8) here + up to ~21
+            // more, which can drop bitsleft below 11. Refill now so that after the
+            // subtable-offset consume bitsleft still >= 11 and the pre-refill
+            // preload stays byte-identical. Rare path; refill is a hint-free
+            // in-margin read (see FASTLOOP read-margin, in_fastloop_end = len-32).
+            if (bitsleft as u8) < 32 {
+                refill_branchless_fast!();
+            }
             dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
         }
         let dist_extra_saved = bitbuf;
@@ -1815,10 +1829,17 @@ pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
             writeback_stopped!();
             return FlatFastloopExit::InvalidDistance(out_pos);
         }
-        // Preload next litlen entry + refill BEFORE the copy so the match-copy
-        // latency overlaps (template lines 571-572).
-        refill_branchless_fast!();
+        // Preload next litlen entry, THEN refill — mirrors libdeflate template
+        // lines 571-572 (load at 571 BEFORE refill at 572). The preload reads the
+        // CURRENT (pre-refill) bitbuf, so its address does NOT depend on the
+        // refill's word-load+shift+or; the M1 out-of-order core can issue this
+        // dependent table load in parallel with the refill instead of serializing
+        // the ~3-4cyc load latency behind it. Byte-identical: bitsleft >= 11 is
+        // guaranteed at this point (fast path via the `<32` guard; subtable path
+        // via the guard added above), so the low LITLEN_TABLEBITS index bits are
+        // unchanged by the refill. The refill then tops bitbuf up for next iter.
         entry = lookup!();
+        refill_branchless_fast!();
         out_pos = copy_match_fast(output, out_pos, distance, length);
     }
 
