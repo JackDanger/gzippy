@@ -1838,6 +1838,19 @@ pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
         // guaranteed at this point (fast path via the `<32` guard; subtable path
         // via the guard added above), so the low LITLEN_TABLEBITS index bits are
         // unchanged by the refill. The refill then tops bitbuf up for next iter.
+        //
+        // GATE-A GUARD (2026-06-30): the reorder is byte-identical ONLY when
+        // bitsleft >= LitLenTable::TABLE_BITS at THIS preload. Assert it loudly so
+        // future cfg/code drift (e.g. a wider TABLE_BITS, or a change to the `<32`
+        // guard or the subtable-offset guard refill above) TRIPS in debug/test
+        // instead of silently corrupting output. Uses the type-level TABLE_BITS
+        // constant, not a hardcoded 11, so a cfg flip to 12 tightens the guard.
+        debug_assert!(
+            (bitsleft as u8) >= LitLenTable::TABLE_BITS,
+            "load-before-refill preload invariant violated: bitsleft={} < LITLEN_TABLEBITS={}",
+            bitsleft as u8,
+            LitLenTable::TABLE_BITS,
+        );
         entry = lookup!();
         refill_branchless_fast!();
         out_pos = copy_match_fast(output, out_pos, distance, length);
