@@ -121,6 +121,35 @@ pub(crate) fn adjusted_chunk_size_bytes(
     default_chunk_size: usize,
 ) -> usize {
     let threads = num_threads.max(1);
+    // AMD/Zen2 VERY-HIGH-THREAD finer-chunk dispatch (GATED silesia T16, N=15,
+    // load-immune `fulcrum abmeasure`, llama-safe quiet window): Zen's wide CCX pool
+    // wins with MORE, smaller chunks once the worker count is high — finer
+    // granularity flips T16 from a loss to a win (gz/rg 1.035 → 0.956, after/base
+    // 15/0 paired, Δ +7.7%). Restricted to threads > 8:
+    //   • T2/T4 REGRESS badly with finer chunks (silesia T4 gz/rg 1.04 → 1.27 @ 1 MiB),
+    //   • T8 is a measured TIE — the finer effect flips sign across interleaved runs
+    //     (sweep 0.99 vs quiet-window gate 1.04), so it stays on the coarse baseline,
+    // and ALL of T1–T8 keep the coarse vendor spacing. It is ALSO restricted to AMD
+    // because on Intel ANY chunk <= 1 MiB triggers a 3–4× wall BLOWUP (silesia
+    // T8/T16, N=15, all 15/15 slower) while the vendor default (>= 1.5 MiB) wins
+    // every T — so Intel / other x86 / aarch64 keep the vendor formula unchanged
+    // (byte-identical wall). Dispatch is by `cpu_is_amd()` (cached cpuid vendor
+    // string) and only moves chunk BOUNDARIES — decoded output is byte-identical.
+    if cpu_is_amd() && threads > 8 {
+        return adjusted_chunk_size_amd(file_size, threads, default_chunk_size);
+    }
+    adjusted_chunk_size_vendor(file_size, threads, default_chunk_size)
+}
+
+/// Vendor small-file chunk adjustment (Intel / other x86 / aarch64, and AMD at
+/// `threads <= 8`). Literal port of `ParallelGzipReader.hpp:294-306` — see the
+/// rationale block above `adjusted_chunk_size_bytes`.
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
+fn adjusted_chunk_size_vendor(
+    file_size: usize,
+    threads: usize,
+    default_chunk_size: usize,
+) -> usize {
     if default_chunk_size.saturating_mul(2).saturating_mul(threads) <= file_size {
         return default_chunk_size;
     }
@@ -128,6 +157,20 @@ pub(crate) fn adjusted_chunk_size_bytes(
     let inner = file_size.div_ceil(denom);
     let aligned = inner.div_ceil(MIN_ADJUSTED_CHUNK_BYTES) * MIN_ADJUSTED_CHUNK_BYTES;
     aligned.max(MIN_ADJUSTED_CHUNK_BYTES)
+}
+
+/// AMD/Zen2 high-thread finer-chunk sizing: spread the work across ~`threads²`
+/// chunks (chunks-per-worker grows with the worker count), refining the chunk size
+/// DOWN from the caller's coarse `default_chunk_size` toward `file_size / threads²`,
+/// floored at [`MIN_ADJUSTED_CHUNK_BYTES`]. On the 68 MB silesia fixture this yields
+/// ≈4 MiB @ T4 (capped at the default), ≈1 MiB @ T8, and the 512 KiB floor @ T16 —
+/// matching the measured per-T optima. `min`-then-`max` (not `clamp`) so a sub-floor
+/// `default_chunk_size` (e.g. a small `GZIPPY_CHUNK_KIB`) can never panic; the floor
+/// always wins. Byte-transparent — only moves chunk boundaries, not decoded output.
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
+fn adjusted_chunk_size_amd(file_size: usize, threads: usize, default_chunk_size: usize) -> usize {
+    let target = file_size / threads.saturating_mul(threads).max(1);
+    target.min(default_chunk_size).max(MIN_ADJUSTED_CHUNK_BYTES)
 }
 
 /// T1 OUTPUT-RESIDENT compressed stride: derive the per-chunk *compressed*
@@ -951,12 +994,17 @@ mod tests {
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
+    // NOTE: these three cover the VENDOR formula (Intel / other x86 / aarch64, and
+    // AMD at threads <= 8). They call `adjusted_chunk_size_vendor` directly so they
+    // are deterministic regardless of the test runner's CPU vendor (the dispatcher
+    // `adjusted_chunk_size_bytes` would take the AMD branch on a Zen box). The AMD
+    // very-high-thread branch (threads > 8) is covered separately below.
     #[test]
     fn adjusted_chunk_size_keeps_default_on_large_files() {
         // File big enough that chunkSize * 2 * threads <= fileSize.
         // 4 MiB * 2 * 16 = 128 MiB; pick fileSize = 256 MiB.
         let file_size = 256 * 1024 * 1024;
-        let got = adjusted_chunk_size_bytes(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
+        let got = adjusted_chunk_size_vendor(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
         assert_eq!(got, TARGET_COMPRESSED_CHUNK_BYTES);
     }
 
@@ -967,7 +1015,7 @@ mod tests {
         // ceilDiv(10726414, 48) = 223468
         // ceilDiv(223468, 524288) = 1
         // 1 * 524288 = 524288 = 512 KiB
-        let got = adjusted_chunk_size_bytes(10_726_414, 16, TARGET_COMPRESSED_CHUNK_BYTES);
+        let got = adjusted_chunk_size_vendor(10_726_414, 16, TARGET_COMPRESSED_CHUNK_BYTES);
         assert_eq!(got, 512 * 1024, "expected 512 KiB floor for 10.7 MB / T=16");
         // 10.7 MB / 512 KiB = ~20.5 chunks (matches vendor's "Total Fetched: 21").
     }
@@ -977,12 +1025,68 @@ mod tests {
         // For a fixed file size, more threads should produce smaller chunks
         // (more parallelism), but never below the 512 KiB floor.
         let file_size = 80 * 1024 * 1024;
-        let t4 = adjusted_chunk_size_bytes(file_size, 4, TARGET_COMPRESSED_CHUNK_BYTES);
-        let t16 = adjusted_chunk_size_bytes(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
-        let t64 = adjusted_chunk_size_bytes(file_size, 64, TARGET_COMPRESSED_CHUNK_BYTES);
+        let t4 = adjusted_chunk_size_vendor(file_size, 4, TARGET_COMPRESSED_CHUNK_BYTES);
+        let t16 = adjusted_chunk_size_vendor(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
+        let t64 = adjusted_chunk_size_vendor(file_size, 64, TARGET_COMPRESSED_CHUNK_BYTES);
         assert!(t4 >= t16, "more threads → smaller (or equal) chunks");
         assert!(t16 >= t64);
         assert!(t64 >= 512 * 1024, "never below 512 KiB floor");
+    }
+
+    // --- AMD/Zen2 high-thread finer-chunk formula (chunk = file / threads²,
+    //     refined DOWN from `default`, floored at 512 KiB) ---
+    #[test]
+    fn adjusted_chunk_size_amd_matches_per_t_optima_on_silesia() {
+        // 68 MB silesia.gz fixture, 4 MiB default. Measured per-T optima
+        // (fulcrum abmeasure, N=15, load-immune): T4 coarse ≈4 MiB, T8 ≈1 MiB,
+        // T16 512 KiB floor. (T4/T8 do NOT take this branch in the dispatcher —
+        // threads > 8 — but the pure helper still caps/floors correctly.)
+        let file_size = 68_229_982usize;
+        let t4 = adjusted_chunk_size_amd(file_size, 4, TARGET_COMPRESSED_CHUNK_BYTES);
+        let t8 = adjusted_chunk_size_amd(file_size, 8, TARGET_COMPRESSED_CHUNK_BYTES);
+        let t16 = adjusted_chunk_size_amd(file_size, 16, TARGET_COMPRESSED_CHUNK_BYTES);
+        // T4: 68 MB / 16 ≈ 4.07 MiB → capped at the 4 MiB default.
+        assert_eq!(t4, TARGET_COMPRESSED_CHUNK_BYTES);
+        // T8: 68 MB / 64 ≈ 1.02 MiB (finer than default, above the floor).
+        assert_eq!(t8, file_size / 64);
+        assert!(t8 > 512 * 1024 && t8 < TARGET_COMPRESSED_CHUNK_BYTES);
+        // T16: 68 MB / 256 ≈ 260 KiB → clamped up to the 512 KiB floor.
+        assert_eq!(t16, 512 * 1024);
+    }
+
+    #[test]
+    fn adjusted_chunk_size_amd_never_below_floor_or_above_default() {
+        let file_size = 68_229_982usize;
+        for t in [5usize, 8, 12, 16, 32, 64] {
+            let got = adjusted_chunk_size_amd(file_size, t, TARGET_COMPRESSED_CHUNK_BYTES);
+            assert!(got >= 512 * 1024, "T{t}: never below the 512 KiB floor");
+            assert!(
+                got <= TARGET_COMPRESSED_CHUNK_BYTES,
+                "T{t}: never above default"
+            );
+        }
+    }
+
+    #[test]
+    fn adjusted_chunk_size_amd_finer_than_or_equal_vendor_at_high_t() {
+        // At high T the AMD branch must not be COARSER than the vendor formula.
+        let file_size = 68_229_982usize;
+        for t in [8usize, 16] {
+            let amd = adjusted_chunk_size_amd(file_size, t, TARGET_COMPRESSED_CHUNK_BYTES);
+            let vendor = adjusted_chunk_size_vendor(file_size, t, TARGET_COMPRESSED_CHUNK_BYTES);
+            assert!(
+                amd <= vendor,
+                "T{t}: AMD chunk {amd} should be <= vendor {vendor}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjusted_chunk_size_amd_subfloor_default_does_not_panic() {
+        // A sub-floor `default_chunk_size` (e.g. GZIPPY_CHUNK_KIB=256) must not
+        // panic (min-then-max, not clamp) — the floor wins.
+        let got = adjusted_chunk_size_amd(68_229_982, 16, 256 * 1024);
+        assert_eq!(got, 512 * 1024);
     }
 
     #[test]
