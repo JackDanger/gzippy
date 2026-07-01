@@ -1,0 +1,46 @@
+{
+  "deliverable": "LAND the M1-T1-silesia litlen-preload win: GATE-A guard + GATE-B byte-exact + local merge into reimplement-isa-l + merge-SHA re-gate",
+  "date": "2026-06-30",
+  "arch": "aarch64 (Apple M1 Pro)",
+  "corpus": "silesia (decompressed sha 028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f)",
+  "threads": 1,
+  "merge_sha": "ec86276f7eded2ee0695d7c8ea652ea7d0d2d711",
+  "merge_sha_desc": "reimplement-isa-l HEAD after local fast-forward (contains match_copy 3d590738 + lut-skip 20758d5c + preload lever 4eb735b0 + GATE-A guard ec86276f)",
+  "gz_bin_sha256": "5af8472a85bdb6082e5d890122f2b8d343e936ba6aeba11af9c20c6cdd678209",
+  "gz_build": "cargo build --release --no-default-features --features pure-rust-inflate, RUSTFLAGS=-C target-cpu=native, path=ParallelSM",
+  "ref_bin": "/opt/homebrew/bin/libdeflate-gunzip",
+  "gate_A": {
+    "guard": "debug_assert!((bitsleft as u8) >= LitLenTable::TABLE_BITS) at the load-before-refill preload site in decode_huffman_fastloop_bounded_pipelined (consume_first_decode.rs)",
+    "test": "tests::routing::tests::test_litlen_preload_invariant_clean_fastloop_byte_exact — drives production single_member::decompress_parallel clean fastloop (T1, window-present, no-marker), byte-exact assert",
+    "assert_liveness_proof": "temporary >=200 probe fired with observed bitsleft=38 -> site executes on clean path; real >=11 invariant holds comfortably",
+    "status": "PASS (debug + release)"
+  },
+  "gate_B": {
+    "byte_exact_sha_eq_oracle": "silesia+logs+software.archive at T1 and T4 all == gunzip oracle",
+    "cargo_test_release": "inflate 174 ok / decompress 609 ok / proptest 5 ok / new test ok (0 failed)",
+    "make": "make quick PASS",
+    "path": "GZIPPY_DEBUG=1 -> path=ParallelSM at T1 and default",
+    "status": "PASS"
+  },
+  "merge": {
+    "type": "local fast-forward (no push)",
+    "reimplement_isa_l_pre": "909fe5988d9061ccc7a5e4262d580509ed429ce8",
+    "reimplement_isa_l_post": "ec86276f7eded2ee0695d7c8ea652ea7d0d2d711",
+    "origin_reimplement_isa_l": "10efea80fe7d2f0bd06601ab68456a5dd0efb8c3 (UNCHANGED — not pushed)"
+  },
+  "regate_merge_sha": {
+    "tool": "fulcrum vs (macOS steady-wall, kpc, /dev/null, sudo)",
+    "overall_gz_ref": 0.9748632860350643,
+    "effect_pct": -2.5136713964935664,
+    "cross_cohort_spread_pct": 0.42066641951448525,
+    "aa_floor_pct": 0.4800138171031322,
+    "min_cohort_effect_pct": 2.1890492441909104,
+    "kept_pairs": 29,
+    "dropped_pairs": 7,
+    "sign_consistent": true,
+    "status": "REPRODUCIBLE — gz/ld < 1.0 HOLDS at the merge SHA (win survives the merge)",
+    "note": "effect magnitude -2.51% vs landing-commit -5.13% (session/thermal finding-decay in MAGNITUDE) but direction gz/ld<1.0 REPRODUCIBLE; guard is debug-only so release perf == 4eb735b0"
+  },
+  "landed": true,
+  "replication_owed": "x86_64 + M4 (on x86 the default hot path is the asm-kernel; this Rust loop's effect there is unverified)"
+}
