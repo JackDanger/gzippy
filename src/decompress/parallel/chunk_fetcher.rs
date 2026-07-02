@@ -765,10 +765,22 @@ fn drive_impl<W: std::io::Write>(
     let pool_size = parallelization.max(1);
 
     // ── m_blockFinder (vendor GzipChunkFetcher.hpp:283) ─────────────
-    let block_finder = Arc::new(GzipBlockFinder::new(
-        /* first_block_offset_in_bits = */ 0,
-        /* spacing_in_bytes = */ configuration.split_chunk_size,
-        /* file_size_in_bits = */ Some(total_bits),
+    // AMD/Zen2 T3 TAIL-TAPER (byte-transparent; gated). At 3 workers the in-order
+    // pull-queue's makespan is set by a STRAGGLER: the last decode round leaves 2
+    // of 3 workers idle while one finishes a full 4 MiB chunk (GZIPPY_TIMELINE:
+    // ideal makespan 223.6 ms vs actual 249.8 ms — a ~26 ms / ~10% imbalance; the
+    // final-ending span is a full ~38 ms chunk). A GLOBAL finer chunk size regresses
+    // T3 (its own optimum is 4 MiB; at 3 workers whole-file per-chunk overhead > tail
+    // saved), so we subdivide ONLY the trailing region: the bulk keeps 4 MiB, the
+    // last few chunks run short so the final round's straggler is small. NO vendor
+    // counterpart — rapidgzip's GzipBlockFinder uses one uniform spacing (its last
+    // chunk is just the remainder). Scoped to cpu_is_amd() && pool_size==3; every
+    // other cell/arch takes the byte-identical uniform finder. `GZIPPY_TAIL_TAPER`
+    // ("chunks:divisor", e.g. "3:2") overrides for the gate sweep; unset ⇒ the gate.
+    let block_finder = Arc::new(build_block_finder(
+        configuration.split_chunk_size,
+        total_bits,
+        pool_size,
     ));
 
     // ── m_windowMap (vendor GzipChunkFetcher.hpp:285) ───────────────
@@ -2468,6 +2480,65 @@ fn consumer_loop<W: std::io::Write>(
     Ok(())
 }
 
+/// Build the chunk-partitioning [`GzipBlockFinder`], applying the AMD/Zen2 T3
+/// TAIL-TAPER when gated. Returns the byte-identical uniform vendor finder for
+/// every non-AMD-T3 caller (taper disabled). See the call site in `drive` for the
+/// mechanism. `GZIPPY_TAIL_TAPER="chunks:divisor"` overrides the gated schedule
+/// (measurement-only); an unparseable value falls back to the gate.
+#[cfg(parallel_sm)]
+fn build_block_finder(
+    spacing_in_bytes: usize,
+    total_bits: usize,
+    pool_size: usize,
+) -> GzipBlockFinder {
+    use crate::decompress::parallel::single_member::cpu_is_amd;
+    // (chunks, divisor). chunks = # of trailing full spacings to subdivide;
+    // divisor = spacing / divisor for that region. Gated default for AMD T3.
+    let gated: Option<(usize, usize)> = if cpu_is_amd() && pool_size == 3 {
+        Some((TAIL_TAPER_CHUNKS_DEFAULT, TAIL_TAPER_DIVISOR_DEFAULT))
+    } else {
+        None
+    };
+    let (taper_chunks, divisor) = match std::env::var("GZIPPY_TAIL_TAPER") {
+        Ok(s) => {
+            let mut it = s.split(':');
+            match (
+                it.next().and_then(|x| x.trim().parse::<usize>().ok()),
+                it.next().and_then(|x| x.trim().parse::<usize>().ok()),
+            ) {
+                (Some(c), Some(d)) => (c, d),
+                _ => gated.unwrap_or((0, 0)),
+            }
+        }
+        Err(_) => gated.unwrap_or((0, 0)),
+    };
+    GzipBlockFinder::new_tail_tapered(
+        /* first_block_offset_in_bits = */ 0,
+        spacing_in_bytes,
+        Some(total_bits),
+        taper_chunks,
+        divisor,
+    )
+}
+
+/// AMD/Zen2 T3 tail-taper gated defaults (# trailing full spacings subdivided;
+/// spacing divisor). LOCKED from the `fulcrum abmeasure` sweep (silesia/Zen2 vs
+/// rapidgzip-native, load-immune, /dev/null, sha-gated to oracle 028bd002…):
+/// subdividing the last 5 spacings by 2 (4 MiB → 2 MiB in the trailing region)
+/// is the sweep optimum. The response is a plateau at 4–5 chunks and falls off
+/// sharply on either side (paired base→after, after/rg):
+///   1:2 4/15  2:2 4/15  3:2 19/30 (1.011 TIE)  4:2 30/30 (1.001)
+///   **5:2 29/30 (0.999 WIN)**  6:2 6/15 (1.015 TIE)  8:2 0/15 (1.027 REGRESS).
+/// At 5:2, N=30: base gz/rg 1.014 → after 0.999 (105.9% of the gap closed),
+/// cyc/byte 10.816→10.659, paired sign-test p=5.77e-8. Fewer tapered chunks leave
+/// a full-4 MiB straggler in the final round; more pay per-chunk overhead that at
+/// 3 workers exceeds the tail saved (the same wall the base 9fd76daa commit hit
+/// with GLOBAL finer chunks). `GZIPPY_TAIL_TAPER="chunks:divisor"` overrides.
+#[cfg(parallel_sm)]
+const TAIL_TAPER_CHUNKS_DEFAULT: usize = 5;
+#[cfg(parallel_sm)]
+const TAIL_TAPER_DIVISOR_DEFAULT: usize = 2;
+
 /// Compute the `stop_hint_bit` hint for the worker. Mirror of vendor's
 /// `nextBlockOffset = m_blockFinder->get(validDataBlockIndex + 1)` at
 /// BlockFetcher.hpp:268, with one gzippy guard for the confirmed-offset
@@ -2485,7 +2556,6 @@ fn stop_hint_bit_for(
     total_bits: usize,
     floor: usize,
 ) -> usize {
-    let spacing = block_finder.spacing_in_bits();
     // OVERSHOOT FIX (task #12). `min_gap` rejects a stop-hint candidate too close
     // to `floor` so we don't decode a degenerate tiny chunk. It was `spacing`,
     // which ALSO rejected the next partition boundary P+1 when `floor` is an
@@ -2494,7 +2564,10 @@ fn stop_hint_bit_for(
     // ~130ms) decoded SYNCHRONOUSLY on the consumer's critical path (the measured
     // head-of-line stalls, ≈40% of the T8 wall). Half a spacing still skips the
     // genuinely-tiny gaps (the 5-bit test case) while accepting a near-full P+1.
-    let min_gap = (spacing / 2).max(8);
+    // Size off the SMALLEST guess stride (the tapered tail stride when the AMD-T3
+    // tail-taper is on) so a legitimately-short tapered chunk is not rejected and
+    // merged back to full size. Reduces to spacing/2 when the taper is off.
+    let min_gap = (block_finder.min_guess_spacing_bits() / 2).max(8);
 
     for delta in 1..=8 {
         let candidate = match block_finder.get(block_index + delta) {

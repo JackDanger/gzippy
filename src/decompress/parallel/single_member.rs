@@ -336,7 +336,7 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 /// the deterministic signal; it only changes the parallel THREAD-COUNT routing
 /// (byte-identical output). `cpuid` leaf 0 is read once and cached.
 #[cfg(target_arch = "x86_64")]
-fn cpu_is_amd() -> bool {
+pub(crate) fn cpu_is_amd() -> bool {
     use std::sync::OnceLock;
     static IS_AMD: OnceLock<bool> = OnceLock::new();
     *IS_AMD.get_or_init(|| {
@@ -354,7 +354,7 @@ fn cpu_is_amd() -> bool {
 /// Non-x86_64 arches (aarch64) keep the Intel/Raptor-Lake defaults — the selector
 /// is arch-independent and arm64 decode is CI-green with `margin = 1.0` + bonus on.
 #[cfg(not(target_arch = "x86_64"))]
-fn cpu_is_amd() -> bool {
+pub(crate) fn cpu_is_amd() -> bool {
     false
 }
 
