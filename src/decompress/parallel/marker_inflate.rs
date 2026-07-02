@@ -695,6 +695,26 @@ fn marker_preload_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MARKER_PRELOAD").is_ok_and(|v| v == "1"))
 }
 
+/// T3-MARKER-ILP kill-switch (sub-lever #3): `GZIPPY_NO_DIST_PRELOAD=1` restores
+/// the exact pre-lever placement of the marker fast loop's FIRST-level distance
+/// table lookup — computed INSIDE the backref (length) arm — instead of the
+/// speculative-hoist that issues `self.asm.dist.lookup($cur.bitbuf)` at the TOP
+/// of the loop body (immediately after the litlen `consume`, before the literal
+/// store / branchless leading-count / length branch). The hoisted load's ~3-4
+/// cyc latency then overlaps that independent work instead of serialising after
+/// the branch resolves (the M1-preload / igzip asm `mov 0x1FF / and / mov [dist]`
+/// pattern at asm_kernel.rs:625-627). Byte-exact: `$cur.bitbuf` is unchanged
+/// between the hoist point and the branch use (the store/count/EOB-checks never
+/// touch it), so the preloaded `DistEntry` is bit-identical to a fresh in-arm
+/// lookup (a debug_assert proves it every backref). Same-binary causal A/B arm:
+/// ON the load overlaps; OFF it serialises exactly as before. One OnceLock read
+/// per `read_internal_compressed_specialized::<true>` call; zero-cost when OFF.
+fn marker_dist_preload_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_DIST_PRELOAD").is_ok_and(|v| v == "1"))
+}
+
 /// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
 /// new path active/inactive on a shipped binary without counters plumbing).
 fn stored_flip_debug_log(case: &str, n: usize) {
@@ -2396,6 +2416,17 @@ impl Block {
         // transcription resolves it (macro_rules resolves free idents at the
         // def site); also visible at the two call sites below.
         let marker_preload_on = !marker_preload_disabled();
+        // T3-ILP #3 (dist-preload): loop-invariant enable. The speculative
+        // first-level dist lookup is hoisted to the top of the loop body ONLY
+        // when the marker LUT dist path is the active decode arm (marker_dist_lut
+        // && dist_valid ⇔ `marker_dt = Some(..)` below); otherwise the dist_hc
+        // arm is taken and there is nothing to preload. `dist_valid` is set by
+        // `ensure_dist_table` (called just above) and is loop-invariant (no table
+        // rebuild inside the fast loop). Kill-switch `GZIPPY_NO_DIST_PRELOAD=1`.
+        #[cfg(pure_inflate_decode)]
+        let dist_preload_on = marker_dist_lut && self.dist_valid && !marker_dist_preload_disabled();
+        #[cfg(not(pure_inflate_decode))]
+        let dist_preload_on = false;
         // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
         // above (dist-table amortization + initial preload) which is amortized
         // per block and is negligible vs the loop body in aggregate.
@@ -2441,6 +2472,40 @@ impl Block {
                         break 'mfast;
                     }
                     $cur.consume(bit_count0);
+
+                    // ── T3 MARKER-ILP LEVER #3: SPECULATIVE DIST-ENTRY PRELOAD ──
+                    // Issue the FIRST-level distance table load NOW — right after
+                    // the litlen `consume` shifts `$cur.bitbuf` so its low
+                    // `DistTable::TABLE_BITS` bits index the (possible) next dist
+                    // code — instead of inside the length arm after the branch
+                    // resolves. The address depends only on `$cur.bitbuf & mask`,
+                    // so the OoO core issues this ~3-4-cyc dependent load in
+                    // PARALLEL with the independent work that follows (the wide
+                    // literal store + branchless leading-literal count + the
+                    // literal-vs-length branch), pulling it off the backref
+                    // critical chain. This is the igzip asm `mov {dpre},0x1FF /
+                    // and {dpre},{bitbuf} / mov {dpre},[dist_off]` speculation at
+                    // asm_kernel.rs:625-627 ("all the speculation above ran before
+                    // this single data-dependent branch resolves", asm 628-634),
+                    // ported into the marker path.
+                    //
+                    // Byte-exact: `$cur.bitbuf` is NOT modified between here and
+                    // the length arm's use (the store/count/EOB-/oversize-checks
+                    // never touch it, and `self.asm.dist` is not rebuilt inside the
+                    // loop), so `dist_spec` is bit-identical to the fresh in-arm
+                    // `dt.lookup($cur.bitbuf)` it replaces — a debug_assert proves
+                    // it at every backref. `lookup` masks to TABLE_BITS and indexes
+                    // an always-allocated table (memory-safe even on the discarded
+                    // literal iterations). Gated on `dist_preload_on`
+                    // (marker_dist_lut && dist_valid ⇔ the length arm takes the
+                    // `Some(dt)` path); kill-switch `GZIPPY_NO_DIST_PRELOAD=1`.
+                    let dist_spec = if dist_preload_on {
+                        self.asm.dist.lookup($cur.bitbuf)
+                    } else {
+                        // Dummy (never read): the OFF arm decodes via the in-arm
+                        // `dt.lookup` exactly as before this lever.
+                        crate::decompress::inflate::libdeflate_entry::DistEntry::distance(0, 0, 0)
+                    };
 
                     // SPECULATIVE wide store of the (up-to-3) packed literal bytes,
                     // WIDENED to u16. Each packed byte b is stored as the u16 value b
@@ -2542,7 +2607,23 @@ impl Block {
                                     marker_dist_stats::LUT_BACKREFS
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                let mut dist_entry = dt.lookup($cur.bitbuf);
+                                // T3-ILP #3: use the entry preloaded at the top of
+                                // the body (its load overlapped the store/count/
+                                // branch). Byte-exact: `$cur.bitbuf` is unchanged
+                                // since the hoist, so `dist_spec` == a fresh lookup
+                                // here (asserted in debug/test). OFF ⇒ verbatim
+                                // in-arm lookup (pre-lever behaviour).
+                                debug_assert!(
+                                    !dist_preload_on
+                                        || dist_spec.raw() == dt.lookup($cur.bitbuf).raw(),
+                                    "dist preload diverged from fresh lookup: bitsleft={}",
+                                    $cur.bitsleft
+                                );
+                                let mut dist_entry = if dist_preload_on {
+                                    dist_spec
+                                } else {
+                                    dt.lookup($cur.bitbuf)
+                                };
                                 if dist_entry.is_subtable_ptr() {
                                     $cur.consume(DistTable::TABLE_BITS as u32);
                                     dist_entry = dt.lookup_subtable_direct(dist_entry, $cur.bitbuf);
