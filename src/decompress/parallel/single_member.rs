@@ -327,6 +327,36 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT: u64 = 1;
 /// overridable via `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`.
 const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 
+/// SMALL-OUTPUT SERIAL FLOOR: decoded-output size below which the parallel
+/// single-member pipeline is capped to one thread (the fast inline T1 path).
+/// This is the ALL-MARKER-BLOWUP guard (arch-independent — fires on every arch).
+///
+/// MECHANISM (gated AMD/Zen2, N≥15, load-immune, marker-stat instrument
+/// `feat/marker-stat-instrument`): a small, compressible single-member stream
+/// with LOW deflate-block-boundary density — e.g. `markup.xml` (7.6 MiB XML, a
+/// handful of huge dynamic blocks) — has no findable block start inside a chunk,
+/// so EVERY speculatively-decoded chunk stays window-absent all-marker (measured
+/// `marker_byte_frac = 0.9997` vs silesia's 0.45, with 23 742 failed header
+/// probes vs silesia's 20). The parallel path then runs at ~20 MB/s vs the serial
+/// inline path's ~600 MB/s — a ~13× LOSS to rapidgzip at T≥6 (388 ms vs 30 ms),
+/// WORSE than gz's own T1, while T1/T4 (routed serial by the crossover) WIN.
+/// The ISIZE ratio does NOT separate this input (markup 3.71 ≈ silesia 3.10); the
+/// separating signal is OUTPUT SIZE. Below a few MiB the parallel pipeline's fixed
+/// overhead is unamortizable AND the all-marker re-decode dominates, while the
+/// serial inline path already BEATS rapidgzip on every squishy item at T1 (markup
+/// 13.5 ms vs rg 21.9 ms; the smallest squishy item where parallel reliably helps
+/// is ≥14 MiB). 8 MiB sits above markup (7.60 MiB) and below the next squishy item
+/// (aozora 11.4 MiB, a healthy TIE), so only markup-and-smaller (all TIE-or-WIN at
+/// serial) route serial — no genuine parallel win is forfeited. A COMPRESSIBILITY
+/// gate (ratio ≥ 1.5) excludes near-incompressible small files (photo.jpg, ratio
+/// 1.005): they are stored-block-dominated, carry no marker pathology, and DO
+/// parallelize (20 ms parallel vs 28 ms serial), so they stay parallel.
+/// Byte-transparent: only the effective thread count changes; CRC32 + ISIZE are
+/// still verified by the caller. Override with `GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`
+/// (`0` disables).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+const PARALLEL_MIN_OUTPUT_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
+
 /// Runtime CPU-vendor detection for the arch-dispatched selector constants.
 /// AMD (Zen) needs a higher crossover margin (for small outputs) AND a deeper
 /// large-output bonus (2 notches), both GATED on Zen2 — see
@@ -410,6 +440,12 @@ pub static SERIAL_CLEAN_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub static COMPRESSIBILITY_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 
+/// Counter proving the small-output serial floor (the all-marker-blowup guard,
+/// see [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`]) fired on a real decode
+/// (deletion-trap discipline; read by the routing test).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub static SMALL_OUTPUT_SERIAL_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
+
 /// Compressibility-gated effective thread count for the parallel single-member
 /// pipeline.
 ///
@@ -435,6 +471,57 @@ pub(crate) fn effective_parallel_threads(
     if num_threads <= 1 || deflate_data_len == 0 || gzip_data.len() < 4 {
         return num_threads;
     }
+
+    // SMALL-OUTPUT SERIAL FLOOR (x86_64) — the all-marker-blowup guard. A small,
+    // compressible, low-block-boundary-density stream (markup.xml) degenerates into
+    // an all-marker re-decode under the parallel pipeline (~13× LOSS to rapidgzip at
+    // T≥6) while the serial inline path BEATS rapidgzip; below the floor there is no
+    // real parallel win to forfeit. Cap to serial. See
+    // [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`] for the gated mechanism + measurements.
+    // Byte-transparent (only the thread count changes). Guarded by a COMPRESSIBILITY
+    // gate (ratio >= 1.5) so near-incompressible small files (photo.jpg) — which are
+    // stored-block-dominated, have no marker pathology, and parallelize fine — stay
+    // parallel, AND by `deflate < floor` (a true >4 GiB member whose ISIZE wrapped to
+    // a small value still has a huge COMPRESSED size and correctly stays parallel).
+    // ARCH-INDEPENDENT: the all-marker blowup reproduces on BOTH AMD/Zen2 (routed
+    // parallel at T≥6 by the crossover) AND aarch64/Apple-M1 (selector disabled ⇒
+    // routed parallel at T≥2; measured T1 33 ms → T4/T8/T16 ~180 ms, ~5× blowup), so
+    // the floor applies on every arch (gated on AMD/Zen2 + Apple-M1; Intel owed, same
+    // x86_64 code path as AMD).
+    {
+        let n = gzip_data.len();
+        let isize_field = u32::from_le_bytes([
+            gzip_data[n - 4],
+            gzip_data[n - 3],
+            gzip_data[n - 2],
+            gzip_data[n - 1],
+        ]) as u64;
+        let deflate_len = deflate_data_len as u64;
+        let min_output = std::env::var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(PARALLEL_MIN_OUTPUT_BYTES_DEFAULT);
+        // COMPRESSIBILITY GATE (ratio >= 1.5, i.e. 2·isize >= 3·deflate): the
+        // all-marker blowup REQUIRES compressibility — markers come from back-
+        // references, which near-incompressible data (stored-block-dominated) does
+        // not produce. A small INcompressible file (photo.jpg: 6.5 MiB, ratio 1.005)
+        // decodes as clean stored blocks and PARALLELIZES fine (measured 20 ms
+        // parallel vs 28 ms serial), so it must stay parallel; only compressible
+        // small files (markup 3.71, minjs 3.31, …) risk the marker pathology and are
+        // also faster serial at these sizes. The 2·isize >= 3·deflate form uses
+        // integer math (isize <= 4 GiB ⇒ ×2 fits u64). The lower `isize >= deflate`
+        // bound is subsumed (ratio 1.5 > 1.0), which also rejects a wrapped >4 GiB
+        // ISIZE (isize < deflate).
+        if min_output > 0
+            && isize_field.saturating_mul(2) >= deflate_len.saturating_mul(3)
+            && isize_field < min_output
+            && deflate_len < min_output
+        {
+            SMALL_OUTPUT_SERIAL_FLOOR_APPLIED.fetch_add(1, Ordering::Relaxed);
+            return 1;
+        }
+    }
+
     let ratio_max = std::env::var("GZIPPY_PARALLEL_RATIO_MAX")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -863,6 +950,10 @@ mod tests {
         // arch-dispatched default is 1.6 on AMD vs 1.0 on Intel — this test
         // exercises the HARD ratio cap, not the per-arch crossover tune).
         std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        // Disable the small-output serial floor so this test isolates the HARD
+        // ratio cap (its 1–20 MB blobs sit below the 8 MiB floor and would else
+        // all route serial before reaching the ratio cap).
+        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
         let deflate_len = 1_000_000usize;
         // ratio 20x (>= default 8) → cap to 1 thread.
         let high = blob_with_isize(20_000_000);
@@ -878,7 +969,50 @@ mod tests {
         // just under (7.99x) keeps.
         let under = blob_with_isize(7_990_000);
         assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+    }
+
+    /// SMALL-OUTPUT SERIAL FLOOR (x86_64): a small compressible stream (markup.xml-
+    /// shaped: 7.6 MiB out / 2.1 MiB deflate) caps to serial to dodge the all-marker
+    /// blowup, while a stream at/above the 8 MiB floor keeps its threads. The floor
+    /// must NOT fire on a near-incompressible / ISIZE-wrapped stream (isize < deflate)
+    /// nor when the compressed size is large (a real >4 GiB member whose ISIZE wrapped).
+    /// Arch-independent (the floor now fires on every arch — AMD/Zen2 + Apple-M1).
+    #[test]
+    fn small_output_serial_floor_caps_markup_shaped_only() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // markup.xml-shaped: 7.6 MiB decoded, 2.1 MiB deflate → below the 8 MiB
+        // floor, isize >= deflate → floor fires (serial) at every requested T.
+        let markup = blob_with_isize(7_974_912);
+        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 6), 1);
+        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 8), 1);
+        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 16), 1);
+        // T1 request is never altered.
+        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 1), 1);
+        // aozora-shaped: 11.4 MiB decoded (>= 8 MiB floor) → floor does NOT fire;
+        // pin margin low so it stays parallel (isolates the floor from the crossover).
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
+        let aozora = blob_with_isize(12_003_648);
+        assert_eq!(effective_parallel_threads(&aozora, 3_995_900, 8), 8);
+        // Near-incompressible small stream (isize < deflate): floor must NOT fire.
+        let incompressible = blob_with_isize(1_000_000);
+        assert_eq!(effective_parallel_threads(&incompressible, 2_000_000, 8), 8);
+        // photo.jpg-shaped: 6.5 MiB out / 6.48 MiB deflate → ratio 1.005 < 1.5
+        // compressibility gate → floor must NOT fire (parallelizes fine as stored
+        // blocks; the marker pathology needs compressibility).
+        let photo = blob_with_isize(6_511_067);
+        assert_eq!(effective_parallel_threads(&photo, 6_481_121, 8), 8);
+        // Right at the 1.5 gate (isize = 1.5·deflate) → fires (compressible enough).
+        let at_gate = blob_with_isize(6_000_000);
+        assert_eq!(effective_parallel_threads(&at_gate, 4_000_000, 8), 1);
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+        // Env override 0 disables the floor: markup-shaped now reaches the crossover.
+        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
+        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 8), 8);
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
     }
 
     #[test]
@@ -889,6 +1023,9 @@ mod tests {
         // Pin margin=1.0 so the crossover assertions are arch-independent (the
         // default is 1.6 on AMD).
         std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        // Isolate the crossover selector from the small-output serial floor
+        // (the 1–3 MB blobs here sit below the 8 MiB floor).
+        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
         let deflate_len = 1_000_000usize;
 
         // Margin 1.0, ratio 3× (< hard cap 8): crossover = ceil(3.0) = 3.
@@ -914,6 +1051,7 @@ mod tests {
         assert_eq!(effective_parallel_threads(&blob, deflate_len, 4), 1);
         assert_eq!(effective_parallel_threads(&blob, deflate_len, 6), 6);
 
+        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
@@ -1032,8 +1170,12 @@ mod tests {
         let deflate_len = 1_000_000usize;
         let blob = blob_with_isize(3_000_000); // ratio 3.0
         std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        // Disable the small-output serial floor (this 3 MB blob sits below the
+        // 8 MiB floor) so the assertion isolates the crossover override.
+        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
         // margin 1.0, ratio 3 → crossover 3 → T3 parallel regardless of host arch.
         assert_eq!(effective_parallel_threads(&blob, deflate_len, 3), 3);
+        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
