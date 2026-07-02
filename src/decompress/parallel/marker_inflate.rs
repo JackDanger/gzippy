@@ -2428,28 +2428,34 @@ impl Block {
                             (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
                         (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
                     }
-                    let mut s = sym0;
-                    let mut remaining = sym_count0;
-                    let mut lit_prefix = 0usize;
-                    let mut trailing_code: u16 = 0;
-                    let mut have_trailing = false;
-                    while remaining > 0 {
-                        let code = (s & 0xFFFF) as u16;
-                        if code <= 255 || remaining > 1 {
-                            if remaining == 1 && code > 255 {
-                                trailing_code = code;
-                                have_trailing = true;
-                                break;
-                            }
-                            lit_prefix += 1;
-                            remaining -= 1;
-                            s >>= 8;
-                            continue;
-                        }
-                        trailing_code = code;
-                        have_trailing = true;
-                        break;
-                    }
+                    // ── T3 MARKER-ILP LEVER (branchless leading-literal count) ──
+                    // Replaces the per-symbol `while remaining > 0` walk (a serial
+                    // `s >>= 8` loop-carried chain + a data-dependent branch per
+                    // packed byte) with a single read of the FINAL packed symbol.
+                    //
+                    // Byte-exact invariant (proven at the LUT packer): every
+                    // NON-final packed symbol is a literal (<256). The pair/triple
+                    // builders fast-forward past length-code buckets
+                    // (`sym >= 256` skips at lut_huffman.rs:752/803/822), so only
+                    // the LAST packed symbol (sym2 of a pair at bits 8.., sym3 of a
+                    // triple at bits 16..) can be a length/EOB (>255). The scalar
+                    // walk above therefore ALWAYS counted `sym_count-1` leading
+                    // literals and only inspected the final symbol for `>255`
+                    // (its `|| remaining > 1` arm forced every non-final symbol to
+                    // be treated as a literal regardless of its bits). This computes
+                    // the identical `lit_prefix` / `trailing_code` / `have_trailing`
+                    // directly. The `symbol` field is masked to LARGE_SHORT_SYM_MASK
+                    // (25 bits) so `(sym0 >> shift) & 0xFFFF` reads a clean window
+                    // (zeros above the final symbol) — same value the walk saw at
+                    // its final iteration. Removes the mispredictable loop-trip
+                    // branch and the serial shift chain from the marker hot loop.
+                    let count = sym_count0 as usize;
+                    let last_code = ((sym0 >> ((count - 1) * 8)) & 0xFFFF) as u16;
+                    let (lit_prefix, trailing_code, have_trailing) = if last_code > 255 {
+                        (count - 1, last_code, true)
+                    } else {
+                        (count, 0u16, false)
+                    };
                     pos += lit_prefix;
                     emitted += lit_prefix;
                     // Vendor: per clean literal `++m_distanceToLastMarkerByte`.
