@@ -1200,6 +1200,34 @@ fn drive_impl<W: std::io::Write>(
                 ISAL_INEXACT_FALLBACKS.load(Ordering::Relaxed),
             );
         }
+        // STEP-A marker-routing fraction (byte-transparent instrument). Self-test:
+        // total>0 and (marker_region_u16 + clean_tail_u8) reconciles to output size.
+        {
+            let mr = SPEC_MARKER_REGION_U16.load(Ordering::Relaxed);
+            let ct = SPEC_CLEAN_TAIL_U8.load(Ordering::Relaxed);
+            let mc = SPEC_MARKER_CHUNKS.load(Ordering::Relaxed);
+            let cc = SPEC_CLEAN_CHUNKS.load(Ordering::Relaxed);
+            let tot = SPEC_CHUNKS_TOTAL.load(Ordering::Relaxed);
+            let byte_sum = mr + ct;
+            let marker_byte_frac = if byte_sum > 0 {
+                mr as f64 / byte_sum as f64
+            } else {
+                0.0
+            };
+            let marker_chunk_frac = if tot > 0 { mc as f64 / tot as f64 } else { 0.0 };
+            eprintln!(
+                "  [STEP-A] marker-routing: chunks_total={tot} marker_chunks={mc} clean_chunks={cc} \
+                 marker_chunk_frac={marker_chunk_frac:.4} | marker_region_u16={mr} clean_tail_u8={ct} \
+                 marker_byte_frac={marker_byte_frac:.4} (self-test: tot>0={} bytesum>0={})",
+                tot > 0,
+                byte_sum > 0,
+            );
+            eprintln!(
+                "  [GATE-2] marker-sleep injected: hits={} total_ns={} (armed iff >0)",
+                MARKER_SLEEP_HITS.load(Ordering::Relaxed),
+                MARKER_SLEEP_INJECTED_NS.load(Ordering::Relaxed),
+            );
+        }
         // StoredParallel demotion counter: non-zero means a stored-prefix+Huffman-tail
         // stream was routed back to ParallelSM because the stored prefix < 50% of output.
         // A stored-dominated file (e.g. random100.gz with ~8% prefix) should show
@@ -3987,6 +4015,26 @@ pub static EAGER_PROBE_MAX_PER_RUN: std::sync::atomic::AtomicU64 =
 /// Eager-submitted results the consumer actually reused (vs. submitted
 /// but never consumed — e.g. evicted before the consumer reached them).
 pub static EAGER_PROBE_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- Marker-path routing instrument (STEP A, byte-transparent, GZIPPY_VERBOSE) --------
+// These aggregate, once per speculatively-decoded chunk (the ONLY marker-producing
+// production tap), the u16 marker-region size (`data_with_markers.len()` — the bytes
+// that go through `marker_inflate::read_internal_compressed`'s marker fast-loop, i.e.
+// the SLOW pure-Rust path) versus the clean-tail u8 size (`chunk.data.len()` — the
+// bytes that go through `asm_kernel::run_contig`, the FAST clean path). Summed over a
+// run they give the marker-path FRACTION (bytes) and the marker/clean CHUNK counts.
+// Self-test at report time: SPEC_CHUNKS_TOTAL > 0, and
+// SPEC_MARKER_REGION_U16 + SPEC_CLEAN_TAIL_U8 reconciles to the decoded output size.
+pub static SPEC_MARKER_REGION_U16: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_CLEAN_TAIL_U8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_MARKER_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_CLEAN_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_CHUNKS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// GATE-2 perturbation witnesses (Gate-0c non-inert proof: hits>0, ns>0 when armed).
+pub static MARKER_SLEEP_INJECTED_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MARKER_SLEEP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Consumer reached a markered chunk but found NO eager entry under its
 /// pre-set offset key (the eager probe keyed it differently, or it was
 /// never eagerly submitted).
@@ -4099,6 +4147,41 @@ fn try_speculative_decode_candidate(
         "t",
     );
     let mut chunk = result?;
+    // STEP-A marker-routing instrument (byte-transparent): record this chunk's
+    // marker-region size (u16 values decoded before the clean-window flip → the
+    // slow marker fast-loop) vs its clean-tail size (u8 bytes after flip → the
+    // fast asm run_contig path). Summed over the run these give the marker-path
+    // byte fraction and per-T marker/clean chunk counts.
+    {
+        use std::sync::atomic::Ordering;
+        let marker_region = chunk.data_with_markers.len() as u64;
+        let clean_tail = chunk.data.len() as u64;
+        SPEC_MARKER_REGION_U16.fetch_add(marker_region, Ordering::Relaxed);
+        SPEC_CLEAN_TAIL_U8.fetch_add(clean_tail, Ordering::Relaxed);
+        SPEC_CHUNKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if marker_region > 0 {
+            SPEC_MARKER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SPEC_CLEAN_CHUNKS.fetch_add(1, Ordering::Relaxed);
+        }
+        // GATE-2 causal perturbation (byte-transparent, core-yielding). When
+        // GZIPPY_MARKER_SLEEP_NS_PER_KB is set, inject a sleep on THIS worker
+        // thread proportional to the chunk's marker-region size — a frequency-
+        // neutral proxy for "the marker path is slower". A monotonic+proportional
+        // T5/T7 WALL response ⇒ marker path on the critical path; a flat response
+        // ⇒ the marker work is slack (overlapped) and the hypothesis is REFUTED.
+        // The sleep yields the core (does NOT busy-spin / depress turbo).
+        if let Some(v) = std::env::var_os("GZIPPY_MARKER_SLEEP_NS_PER_KB") {
+            if let Some(ns_per_kb) = v.to_str().and_then(|s| s.parse::<u64>().ok()) {
+                let inject_ns = (marker_region / 1024).saturating_mul(ns_per_kb);
+                if inject_ns > 0 {
+                    MARKER_SLEEP_INJECTED_NS.fetch_add(inject_ns, Ordering::Relaxed);
+                    MARKER_SLEEP_HITS.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_nanos(inject_ns));
+                }
+            }
+        }
+    }
     // (Design B) Record the encoded bit the worker decoded byte 0 from.
     // `decode_chunk_window_absent` anchored the chunk at `decode_start`
     // (`offset.second`), so that is the true origin regardless of the
