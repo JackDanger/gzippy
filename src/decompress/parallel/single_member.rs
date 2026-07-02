@@ -537,8 +537,31 @@ pub(crate) fn effective_parallel_threads(
         gzip_data[n - 1],
     ]) as u64;
     let deflate_len = deflate_data_len as u64;
+
+    // Effective crossover-margin (env override > arch default), read HERE so the
+    // hard ratio cap below can be gated on it. `margin == 0.0` ⇒ the cost-model
+    // selector is DISABLED (aarch64) → the hard cap governs high-ratio streams;
+    // `margin > 0.0` ⇒ the selector is ACTIVE (x86) → the soft T-crossover further
+    // down governs them instead.
+    let margin = std::env::var("GZIPPY_PARALLEL_CROSSOVER_MARGIN")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|m| m.is_finite() && *m >= 0.0)
+        .unwrap_or_else(arch_crossover_margin_default);
+
+    // HARD RATIO CAP — fires ONLY when the cost-model selector is disabled
+    // (margin == 0.0, i.e. aarch64). Historically this capped EVERY high-ratio
+    // (ISIZE/deflate >= ratio_max) stream to one thread on every arch, which
+    // FORFEITED real high-T parallel WINS on high-ratio corpora (nasa ratio 9.9 →
+    // ran flat-serial, lost T12+ to rapidgzip; uncapped it BEATS rapidgzip at high
+    // T). When the selector is active (x86, margin > 0) we now fall through to the
+    // soft T-crossover below, which serializes a high-ratio stream only BELOW its
+    // ceil(ratio·margin) crossover and lets it go parallel at/above it — a strict
+    // superset of the old "serial forever" that recovers the forfeited high-T win
+    // (and still stays serial for extreme-ratio logs, whose crossover exceeds Tmax).
+    // aarch64 (margin == 0.0) keeps the exact prior behaviour → byte/routing-identical.
     // ratio = isize/deflate >= ratio_max  ⟺  isize >= ratio_max*deflate (no division)
-    if isize_field >= ratio_max.saturating_mul(deflate_len) {
+    if margin == 0.0 && isize_field >= ratio_max.saturating_mul(deflate_len) {
         COMPRESSIBILITY_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
@@ -565,11 +588,7 @@ pub(crate) fn effective_parallel_threads(
     // below its crossover REGRESSES it below T1 (loses to single-thread igzip);
     // misrouting to SERIAL at worst ties gz-T1 (still a win). `margin` is the
     // gate-tunable safety knob; `0` disables this selector entirely (A/B).
-    let margin = std::env::var("GZIPPY_PARALLEL_CROSSOVER_MARGIN")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite() && *m >= 0.0)
-        .unwrap_or_else(arch_crossover_margin_default);
+    // `margin` is read once above (before the hard ratio cap, which it now gates).
     if margin > 0.0 {
         // ratio as f64 (deflate_len > 0 guaranteed above); crossover = ceil(ratio*margin).
         let ratio = isize_field as f64 / deflate_len as f64;
@@ -946,10 +965,12 @@ mod tests {
     #[test]
     fn compressibility_cap_serializes_high_ratio_keeps_low_ratio() {
         let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Pin the selector margin so the assertions are arch-independent (the
-        // arch-dispatched default is 1.6 on AMD vs 1.0 on Intel — this test
-        // exercises the HARD ratio cap, not the per-arch crossover tune).
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        // The HARD ratio cap now fires ONLY when the cost-model selector is
+        // DISABLED (margin == 0.0, i.e. aarch64) — on x86 (margin > 0) the soft
+        // T-crossover governs high-ratio streams instead (so they can win high-T
+        // parallel rather than being forfeited to serial forever). Pin margin=0 to
+        // exercise the hard cap arch-independently.
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
         // Disable the small-output serial floor so this test isolates the HARD
         // ratio cap (its 1–20 MB blobs sit below the 8 MiB floor and would else
         // all route serial before reaching the ratio cap).
@@ -969,6 +990,33 @@ mod tests {
         // just under (7.99x) keeps.
         let under = blob_with_isize(7_990_000);
         assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
+        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+    }
+
+    /// HIGH-RATIO NO LONGER CAPS FOREVER WHEN THE SELECTOR IS ACTIVE (x86).
+    /// Regression guard for the self-inflicted bug: with `margin > 0` a high-ratio
+    /// (ISIZE/deflate >= hard cap 8) stream must be governed by the soft
+    /// T-crossover — serial BELOW `ceil(ratio·margin)`, parallel AT/ABOVE it — not
+    /// hard-capped to a single thread at every T (which forfeited high-T parallel
+    /// wins on nasa-class corpora). Pins margin=1.0 + bonus-off so `crossover =
+    /// ceil(ratio)` arch-independently.
+    #[test]
+    fn high_ratio_uses_soft_crossover_when_selector_active() {
+        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
+        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0"); // isolate from small-output floor
+        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "0"); // isolate from large-output bonus
+        let deflate_len = 1_000_000usize;
+        // ratio 10× (>= hard cap 8): crossover = ceil(10.0) = 10.
+        let high = blob_with_isize(10_000_000);
+        // BELOW crossover → serial (the soft floor, not the hard cap).
+        assert_eq!(effective_parallel_threads(&high, deflate_len, 8), 1);
+        // AT/ABOVE crossover → PARALLEL. The old hard cap returned 1 here forever;
+        // this is the recovered high-T win.
+        assert_eq!(effective_parallel_threads(&high, deflate_len, 10), 10);
+        assert_eq!(effective_parallel_threads(&high, deflate_len, 16), 16);
+        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
         std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
