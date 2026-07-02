@@ -1990,6 +1990,40 @@ impl ChunkData {
         chunk_buffer_pool::return_marker_segments_to_worker(self.pool_worker_index, dwm);
         self.narrowed_len = 0;
     }
+
+    /// FREE-AFTER-PUBLISH (peak-RSS reduction, race-free).
+    ///
+    /// Release this chunk's decoded payload buffers (`data` + `data_with_markers`)
+    /// to the ALLOCATOR — dropping the segment `Vec`s outright — WITHOUT routing
+    /// them back through `chunk_buffer_pool`'s per-worker reuse LIFO. Unlike
+    /// `recycle_decoded_buffers` (which pools segments when the manual pool is
+    /// active, and only drops in the default no-pool mode), this NEVER hands a
+    /// still-referenceable buffer to a worker's next `take_*`, so it is race-free
+    /// under EVERY pool mode — it sidesteps the "worker-fill race at recycle
+    /// depth<2" that gates `RecycleDeferral` to depth 2 at T>1.
+    ///
+    /// SAFETY / dead-by-construction: the ONLY consumers of these buffers are
+    ///   (1) the output iovecs, which `append_output_iovecs` borrows for the
+    ///       SYNCHRONOUS `writev_all_to_fd`/`write_all` call that has already
+    ///       returned by the time this is called, and
+    ///   (2) the successor chunk's dictionary, which is the predecessor's END
+    ///       window — published to `WindowMap` as an OWNED `Arc<CompressedVector>`
+    ///       copy (chunk_data.rs:1436 `from_bytes`), NOT a view into `data`.
+    /// A single-pass forward decode never re-reads a consumed chunk's key. So
+    /// after writev + `publish_subchunk_windows`, both buffers are dead and the
+    /// pages can go straight back to the OS (glibc munmaps the MiB-scale
+    /// segments on free), lowering peak/at-exit RSS → cheaper kernel exit_group.
+    ///
+    /// Does NOT touch the vmsplice/pipe path (which MOVES the chunk into the
+    /// writer to keep pages alive across the async splice) nor the
+    /// `output_writer` overlap path (owns the chunk for its write lifetime).
+    pub(crate) fn free_decoded_buffers(&mut self) {
+        // take_segments swaps in empty backing stores; the returned Vecs drop
+        // here at end of scope, freeing to the allocator (no pool reinsert).
+        let _u8_segments = self.data.take_segments();
+        let _u16_segments = self.data_with_markers.take_segments();
+        self.narrowed_len = 0;
+    }
 }
 
 impl Drop for ChunkData {
