@@ -4320,6 +4320,32 @@ impl RecycleDeferral {
     }
 }
 
+/// FREE-AFTER-PUBLISH kill-switch (default ON). `GZIPPY_NO_FREE_AFTER_PUBLISH=1`
+/// restores the legacy `defer_chunk_recycle` deferral (2-chunk hold at T>1) for
+/// single-binary A/B measurement; byte-identical output either way.
+#[cfg(parallel_sm)]
+fn free_after_publish_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("GZIPPY_NO_FREE_AFTER_PUBLISH").is_none())
+}
+
+/// Release a just-written chunk's decoded buffers to the allocator immediately
+/// (peak-RSS reduction), or fall back to the legacy deferral when the
+/// kill-switch is set. The chunk's output has already been synchronously
+/// written and its window published, so the buffers are dead (see
+/// `ChunkData::free_decoded_buffers`). `chunk` drops at end of scope, so
+/// `LIVE_CHUNKS` decrements now instead of after the 2-chunk deferral hold —
+/// lowering both peak resident bytes AND peak live-ChunkData depth.
+#[cfg(parallel_sm)]
+fn release_written_chunk(deferral: &mut RecycleDeferral, mut chunk: ChunkData) {
+    if free_after_publish_enabled() {
+        chunk.free_decoded_buffers();
+        // chunk drops here → LIVE_CHUNKS -= 1, backing Vecs already freed.
+    } else {
+        defer_chunk_recycle(deferral, chunk);
+    }
+}
+
 #[cfg(parallel_sm)]
 fn defer_chunk_recycle(deferral: &mut RecycleDeferral, chunk: ChunkData) {
     deferral.queue.push_back(chunk);
@@ -4558,13 +4584,13 @@ fn drain_one_pending<W: std::io::Write>(
             } else {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                defer_chunk_recycle(recycle_deferral, chunk);
+                release_written_chunk(recycle_deferral, chunk);
             }
             #[cfg(not(target_os = "linux"))]
             {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                defer_chunk_recycle(recycle_deferral, chunk);
+                release_written_chunk(recycle_deferral, chunk);
             }
             *total_size += payload_bytes;
             #[allow(unused_assignments)]
@@ -4636,7 +4662,7 @@ fn drain_one_pending<W: std::io::Write>(
     // an extra Arc allocation per chunk).
     let _ = cache_key;
     let _ = block_fetcher;
-    defer_chunk_recycle(recycle_deferral, chunk);
+    release_written_chunk(recycle_deferral, chunk);
     // Coz throughput marker: one in-order chunk just left the consumer. Coz
     // measures a virtual speedup's effect as the change in THIS visit-rate —
     // the program's true end-to-end throughput. No-op without --features coz.
