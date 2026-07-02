@@ -76,9 +76,14 @@ fn pool_spin_us() -> u64 {
     })
 }
 
-/// Baked default spin window. Chosen from the AMD-Zen2 ondemand sweep
-/// (see commit message); `0` would restore park-immediately.
-const DEFAULT_POOL_SPIN_US: u64 = 50;
+/// Baked default spin window. Chosen from the AMD-Zen2 ondemand gated
+/// sweep (fulcrum abmeasure, paired interleaved N=15): 2000us gave the
+/// most consistent mid-T gains — T3 +2.1% (13+/2-), T4 +1.3% (12+/3-),
+/// T6 +1.3% (12+/3-), T16 +3.0%, T1/T2 tie, T8 -0.6% (noise), and NO
+/// saturated-throughput regression (16xT2 1.768x rg, 8xT2 1.267x rg —
+/// the adaptive `pending==0` guard means it never spins when saturated).
+/// `0` restores exact park-immediately behavior.
+const DEFAULT_POOL_SPIN_US: u64 = 2000;
 
 /// Number of `spin_loop()` hints between wall-clock deadline checks in the
 /// worker spin, amortizing the `Instant::now()` cost across the busy-poll.
