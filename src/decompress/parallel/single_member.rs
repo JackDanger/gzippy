@@ -138,7 +138,16 @@ pub(crate) fn adjusted_chunk_size_bytes(
     if cpu_is_amd() && threads > 8 {
         return adjusted_chunk_size_amd(file_size, threads, default_chunk_size);
     }
-    adjusted_chunk_size_vendor(file_size, threads, default_chunk_size)
+    let vendor = adjusted_chunk_size_vendor(file_size, threads, default_chunk_size);
+    // AMD/Zen2 MID-THREAD (2..=8): cap the chunk size by the per-T schedule so the
+    // per-chunk decode-TIME variance spreads across more workers as T grows (see
+    // `amd_midt_chunk_cap`). threads>8 already refines via the AMD branch above;
+    // threads==1 is the serial T1 path. `min` preserves the vendor small-file
+    // shrink (never coarsens); only shrinks large-file chunks.
+    if cpu_is_amd() && (2..=8).contains(&threads) {
+        return vendor.min(amd_midt_chunk_cap(threads));
+    }
+    vendor
 }
 
 /// Vendor small-file chunk adjustment (Intel / other x86 / aarch64, and AMD at
@@ -171,6 +180,40 @@ fn adjusted_chunk_size_vendor(
 fn adjusted_chunk_size_amd(file_size: usize, threads: usize, default_chunk_size: usize) -> usize {
     let target = file_size / threads.saturating_mul(threads).max(1);
     target.min(default_chunk_size).max(MIN_ADJUSTED_CHUNK_BYTES)
+}
+
+/// AMD/Zen2 MID-THREAD (2..=8) per-T chunk-size CAP (byte-transparent).
+///
+/// MECHANISM (measured, not divisibility). The consumer streams chunks IN ORDER
+/// while a `pool_size`-worker pull-queue decodes ahead. The makespan is set by a
+/// STRAGGLER worker, and the straggler is a SLOW CHUNK, not an "extra" chunk from
+/// a count that fails to divide `T`: at silesia-T7 the GZIPPY_TIMELINE shows two
+/// workers with the SAME 2-chunk load differing 76 ms vs 127 ms (1.67× per-chunk
+/// decode-time variance). Rounding the chunk COUNT to a multiple of `T` does NOT
+/// remove the tail (balanced 14-chunk T7 still measured a 53 ms tail) and
+/// regresses the wall (it detunes the chunk size). The lever that WORKS is the
+/// chunk SIZE: as `T` grows, smaller chunks spread the decode-time variance across
+/// more workers so no single straggler dominates the tail — while staying coarse
+/// enough to dodge the low-worker throughput / per-chunk-overhead penalty.
+///
+/// The schedule is the GATED per-T optimum on silesia/Zen2 (`fulcrum abmeasure`,
+/// N=11–15, load-immune, base/rg): T3/T4 want the 4 MiB default (finer REGRESSES
+/// them — 0.99/0.97 vs 1.03/1.05 at 3 MiB), T5/T6 want 3 MiB (0.967/0.913 vs
+/// 1.006/0.986 at 4 MiB), T7/T8 want 2.5 MiB (0.958/0.903 vs 1.022/0.995 at
+/// 4 MiB). Note the T3/T4 PLATEAU: the optimum is not a smooth per-worker formula
+/// (a `file/(T·k)` form would shrink T4 below 4 MiB and regress its win), so the
+/// cap is keyed on `T`. Callers `min` this with the vendor size, so the small-file
+/// vendor shrink is preserved and chunks are only ever made FINER, never coarser.
+/// Only moves chunk boundaries — decoded output is byte-identical (CRC32 + ISIZE
+/// still verified by the caller). Scoped to AMD threads 2..=8; Intel/aarch64 and
+/// AMD threads>8 are untouched (a <1 MiB chunk 3–4×'s Intel; threads>8 already
+/// refines via `adjusted_chunk_size_amd`).
+fn amd_midt_chunk_cap(threads: usize) -> usize {
+    match threads {
+        ..=4 => TARGET_COMPRESSED_CHUNK_BYTES, // 4 MiB (T3/T4 plateau; T2 default)
+        5..=6 => 3 * 1024 * 1024,              // 3 MiB
+        _ => 2560 * 1024,                      // 2.5 MiB (T7/T8)
+    }
 }
 
 /// T1 OUTPUT-RESIDENT compressed stride: derive the per-chunk *compressed*
@@ -1031,6 +1074,29 @@ mod tests {
         assert!(t4 >= t16, "more threads → smaller (or equal) chunks");
         assert!(t16 >= t64);
         assert!(t64 >= 512 * 1024, "never below 512 KiB floor");
+    }
+
+    // --- AMD/Zen2 mid-thread (2..=8) per-T chunk-size cap: shrink the chunk size
+    //     as T grows so per-chunk decode-time variance spreads across workers ---
+    #[test]
+    fn amd_midt_chunk_cap_is_the_gated_per_t_schedule() {
+        // Gated silesia/Zen2 optima (fulcrum abmeasure, base/rg): T3/T4 4 MiB,
+        // T5/T6 3 MiB, T7/T8 2.5 MiB. T2 stays at 4 MiB (default; finer hurts T2).
+        assert_eq!(amd_midt_chunk_cap(2), TARGET_COMPRESSED_CHUNK_BYTES);
+        assert_eq!(amd_midt_chunk_cap(3), TARGET_COMPRESSED_CHUNK_BYTES);
+        assert_eq!(amd_midt_chunk_cap(4), TARGET_COMPRESSED_CHUNK_BYTES);
+        assert_eq!(amd_midt_chunk_cap(5), 3 * 1024 * 1024);
+        assert_eq!(amd_midt_chunk_cap(6), 3 * 1024 * 1024);
+        assert_eq!(amd_midt_chunk_cap(7), 2560 * 1024);
+        assert_eq!(amd_midt_chunk_cap(8), 2560 * 1024);
+        // Monotone non-increasing in T (never coarsens as workers are added).
+        for t in 2..8usize {
+            assert!(amd_midt_chunk_cap(t) >= amd_midt_chunk_cap(t + 1));
+        }
+        // Never below the 512 KiB floor / sub-MiB (Intel blowup / throughput hit).
+        for t in 2..=8usize {
+            assert!(amd_midt_chunk_cap(t) >= MIN_ADJUSTED_CHUNK_BYTES);
+        }
     }
 
     // --- AMD/Zen2 high-thread finer-chunk formula (chunk = file / threads²,
