@@ -680,6 +680,21 @@ fn mfast_localbits_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MFAST_LOCALBITS").is_ok_and(|v| v == "1"))
 }
 
+/// T3-MARKER-ILP kill-switch: `GZIPPY_NO_MARKER_PRELOAD=1` restores the exact
+/// pre-lever bottom-of-loop order in the `'mfast` marker fast loop —
+/// `refill(); decode_prefilled()` — instead of the load-before-refill
+/// software-pipeline (speculative `spec_short_entry` from the pre-refill bitbuf,
+/// then `refill()`, then `decode_from_spec`). Same-binary causal A/B arm: with
+/// the switch ON the speculative table load serialises behind the refill exactly
+/// as before, so a wall/IPC delta between the two arms isolates the pipeline
+/// effect. One OnceLock read per `read_internal_compressed_specialized::<true>`
+/// call; zero-cost when OFF.
+fn marker_preload_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MARKER_PRELOAD").is_ok_and(|v| v == "1"))
+}
+
 /// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
 /// new path active/inactive on a shipped binary without counters plumbing).
 fn stored_flip_debug_log(case: &str, n: usize) {
@@ -2368,6 +2383,19 @@ impl Block {
         // backstop inside `decode` is a no-op (lut_huffman.rs:1088-1101 proof) —
         // byte-exact, drops the per-symbol load+branch from the marker hot loop.
         let mut pre = self.asm.lut_litlen.decode_prefilled(bits);
+        // T3-ILP #2: speculative pre-refill litlen short entry (assigned at the
+        // bottom of each iteration BEFORE the refill; declared here in the
+        // caller scope so the macro-expanded loop body and the `$litlen_decode`
+        // block that reads it share one variable — macro hygiene, same as `pre`).
+        // The `= 0` init is dead (every read is preceded by the per-iteration
+        // assignment at the loop bottom); it exists only to satisfy the
+        // definite-init check for the cross-macro-hygiene shared binding.
+        #[allow(unused_assignments)]
+        let mut spec_litlen: u32 = 0;
+        // Declared BEFORE the `mfast_lb_run!` definition so the macro
+        // transcription resolves it (macro_rules resolves free idents at the
+        // def site); also visible at the two call sites below.
+        let marker_preload_on = !marker_preload_disabled();
         // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
         // above (dist-table amortization + initial preload) which is amortized
         // per block and is negligible vs the loop body in aggregate.
@@ -2606,6 +2634,39 @@ impl Block {
                         }
                     }
 
+                    // ── T3 MARKER-ILP LEVER #2: LOAD-BEFORE-REFILL PRELOAD ──────
+                    // Speculatively load the NEXT litlen short entry from the
+                    // CURRENT (pre-refill) bitbuf, THEN refill. The entry address
+                    // depends only on `$cur.bitbuf`'s low 12 bits — NOT on the
+                    // refill's word-load+shift+or — so the OoO core issues this
+                    // dependent table load in PARALLEL with the refill instead of
+                    // serialising its ~3-4-cyc latency behind it (the M1-preload
+                    // pattern, consume_first_decode.rs:1832-1856 / igzip asm
+                    // asm_kernel.rs:602-607). Shortens the loop-carried
+                    // `refill → LUT load → bit_count → consume` recurrence that
+                    // gates marker-loop IPC (T3 residual: 1.99 vs rg 2.06).
+                    //
+                    // Byte-exact contract: `bitsleft >= ISAL_DECODE_LONG_BITS(12)`
+                    // here (worst case = one 15-bit long litlen + 28-bit dist off a
+                    // ≥56-bit fill ⇒ ≥13 remaining), so the low-12 index is
+                    // unchanged by the refill's high-bit OR; `decode_from_spec`
+                    // trusts the entry ONLY for short codes and re-decodes long
+                    // codes (>12 bits) from the post-refill reader. Kill-switch
+                    // `GZIPPY_NO_MARKER_PRELOAD=1` restores `refill(); decode()`.
+                    spec_litlen = if marker_preload_on {
+                        self.asm.lut_litlen.spec_short_entry($cur.bitbuf)
+                    } else {
+                        0
+                    };
+                    debug_assert!(
+                        !marker_preload_on
+                            || ($cur.bitsleft as u8)
+                                >= crate::decompress::parallel::lut_huffman::ISAL_DECODE_LONG_BITS
+                                    as u8
+                            || $cur.pos >= in_end,
+                        "marker preload invariant violated: bitsleft={} < 12",
+                        $cur.bitsleft as u8
+                    );
                     $cur.refill();
                     $litlen_decode;
                 }
@@ -2631,7 +2692,13 @@ impl Block {
                     // WINDOW-ABSENT CONVERGE (Lever A): the bottom-of-loop
                     // `$cur.refill()` runs immediately before this decode, so the
                     // backstop is dead — use `decode_prefilled` like the clean path.
-                    pre = self.asm.lut_litlen.decode_prefilled(&lb);
+                    // T3-ILP #2: when the preload is ON, finish from the entry
+                    // pre-loaded before the refill (`spec_litlen`).
+                    pre = if marker_preload_on {
+                        self.asm.lut_litlen.decode_from_spec(spec_litlen, &lb)
+                    } else {
+                        self.asm.lut_litlen.decode_prefilled(&lb)
+                    };
                 },
                 {
                     bits.pos = lb.pos;
@@ -2653,7 +2720,12 @@ impl Block {
                 {
                     // WINDOW-ABSENT CONVERGE (Lever A): post-`$cur.refill()` site
                     // — backstop-free decode (kill-switch struct-field arm).
-                    pre = self.asm.lut_litlen.decode_prefilled(bits);
+                    // T3-ILP #2: finish from the pre-refill-loaded entry when ON.
+                    pre = if marker_preload_on {
+                        self.asm.lut_litlen.decode_from_spec(spec_litlen, bits)
+                    } else {
+                        self.asm.lut_litlen.decode_prefilled(bits)
+                    };
                 },
                 {}
             );
