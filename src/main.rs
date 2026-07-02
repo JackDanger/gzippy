@@ -166,12 +166,54 @@ fn main() {
     }
 
     match result {
-        Ok(exit_code) => process::exit(exit_code),
+        Ok(exit_code) => fast_exit_success(exit_code),
         Err(e) => {
             eprintln!("gzippy: {}", e);
             process::exit(1);
         }
     }
+}
+
+/// Verified-success process exit.
+///
+/// On the clean-success path (exit_code == 0) EVERY side effect is already
+/// complete before we get here: all output has been written AND flushed to the
+/// OS by the decompress/compress entry points (their `BufWriter`s call
+/// `flush()?`), CRC32+ISIZE were verified against the gzip trailer inside the
+/// decode driver, the source file was removed and metadata preserved (see
+/// `decompress::io::decompress_file`'s `Ok` branch), and — because `run()`
+/// processes every requested file before returning — this fires only after the
+/// LAST unit of work. There is nothing left to do in userspace except tear
+/// down the address space, which the kernel's `exit_group` does regardless.
+///
+/// So we `libc::_exit` directly, skipping the redundant *userspace* teardown
+/// that `process::exit`'s `libc::exit()` would run first: the allocator's
+/// `madvise(MADV_DONTNEED)` span-decommit flood, C static destructors from the
+/// linked codecs, and any atexit handlers. That teardown cost is proportional
+/// to peak RSS (the measured AMD-Zen2 mid-T loss vs rapidgzip) and is pure
+/// overhead once the output is durable.
+///
+/// Byte-transparency guarantees:
+///  - Only `exit_code == 0` (fully-verified success) fast-exits; every non-zero
+///    Ok code (skipped symlink=2, per-file error=1) and every `Err` takes the
+///    normal `process::exit`, which preserves exit codes AND lets
+///    `decompress_file` delete a partial dest on CRC/size failure.
+///  - We flush the process-wide `stdout`/`stderr` handles first, covering any
+///    `println!`/`eprintln!` (stats, `-v`) still sitting in the global
+///    `LineWriter` buffer. The bulk data path is already flushed to the fd.
+///  - Set `GZIPPY_NO_FAST_EXIT=1` to force the normal exit (A/B measurement
+///    on a single binary); byte-identical output either way.
+fn fast_exit_success(exit_code: i32) -> ! {
+    if exit_code == 0 && env::var_os("GZIPPY_NO_FAST_EXIT").is_none() {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` is async-signal-safe and simply issues the
+        // exit_group syscall. All userspace state we care about (output bytes)
+        // is already flushed to the OS above and inside the entry points.
+        unsafe { libc::_exit(0) };
+    }
+    process::exit(exit_code);
 }
 
 fn run() -> Result<i32, GzippyError> {
