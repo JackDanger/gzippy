@@ -48,6 +48,42 @@ use std::thread::{self, JoinHandle};
 /// (ThreadPool.hpp:36 `using ThreadPinning = std::unordered_map<size_t, uint32_t>`).
 pub type ThreadPinning = HashMap<usize, u32>;
 
+/// Bounded busy-spin window (in microseconds) that a worker polls the
+/// lock-free `pending_tasks` hint BEFORE parking in the condvar.
+///
+/// **Why this exists (no rapidgzip counterpart — byte-transparent perf knob).**
+/// On AMD-Zen2 under the production `ondemand` cpufreq governor, gzippy's
+/// worker pool parks in the condvar during the short, frequent inter-chunk
+/// gaps. Idle cores let `ondemand` drop to a lower P-state, so the pool
+/// clocks ~2.7% lower than rapidgzip (which spins), costing the mid-T
+/// (T3–T6) silesia cell ~4–11%. A bounded spin keeps the core warm across
+/// the gap so the governor holds the clock, WITHOUT burning cores when
+/// saturated: the spin only runs while `pending_tasks == 0` (a genuine
+/// idle gap) and bails the instant a task is queued — in the throughput-
+/// saturated case a finishing worker almost always sees `pending > 0` and
+/// never spins.
+///
+/// Tunable via `GZIPPY_POOL_SPIN_US` for the sweep; `0` disables the spin
+/// (exact legacy park-immediately behavior). Cached once.
+fn pool_spin_us() -> u64 {
+    use std::sync::OnceLock;
+    static SPIN_US: OnceLock<u64> = OnceLock::new();
+    *SPIN_US.get_or_init(|| {
+        std::env::var("GZIPPY_POOL_SPIN_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_POOL_SPIN_US)
+    })
+}
+
+/// Baked default spin window. Chosen from the AMD-Zen2 ondemand sweep
+/// (see commit message); `0` would restore park-immediately.
+const DEFAULT_POOL_SPIN_US: u64 = 50;
+
+/// Number of `spin_loop()` hints between wall-clock deadline checks in the
+/// worker spin, amortizing the `Instant::now()` cost across the busy-poll.
+const SPIN_BATCH: u32 = 64;
+
 /// Default thread count.
 ///
 /// Mirror of `availableCores()` (AffinityHelpers.hpp:18-21 / 104-130). The
@@ -176,6 +212,16 @@ pub struct ThreadPool {
     shared: Arc<Mutex<PoolShared>>,
     /// `m_pingWorkers` (ThreadPool.hpp:241).
     ping_workers: Arc<Condvar>,
+    /// Lock-free hint of the number of queued-but-not-yet-dequeued tasks.
+    /// Incremented under `shared` lock in `submit` (paired with the
+    /// `push_back`), decremented in `worker_main` when a worker pops a
+    /// task. It is ONLY a hint for the pre-park busy-spin — the
+    /// authoritative wait predicate remains `has_unprocessed_tasks` under
+    /// the mutex, so a stale read here can never cause a lost wakeup
+    /// (a false-positive makes a worker acquire the lock, find nothing,
+    /// and park; a task push always happens-before the condvar notify).
+    /// No rapidgzip counterpart — supports the byte-transparent spin knob.
+    pending_tasks: Arc<AtomicUsize>,
     /// `m_threads` (ThreadPool.hpp:247). `JoiningThread` becomes a
     /// `JoinHandle` we explicitly join in `stop()`. Wrapped in `Mutex`
     /// so the `&self`-callable `submit` can push freshly spawned
@@ -202,6 +248,7 @@ impl ThreadPool {
                 running: true,
             })),
             ping_workers: Arc::new(Condvar::new()),
+            pending_tasks: Arc::new(AtomicUsize::new(0)),
             threads: Mutex::new(Vec::with_capacity(thread_count)),
         }
     }
@@ -307,6 +354,12 @@ impl ThreadPool {
                 .entry(priority)
                 .or_default()
                 .push_back(packaged);
+            // Publish the queue-depth hint for the worker pre-park spin.
+            // Under the lock (paired with push_back) so it is consistent
+            // with has_unprocessed_tasks; workers read it Relaxed while
+            // spinning. See `pending_tasks` field doc for the no-lost-
+            // wakeup argument.
+            self.pending_tasks.fetch_add(1, Ordering::Relaxed);
 
             // (m_threads.size() < m_threadCount) && (m_idleThreadCount == 0)
             // (ThreadPool.hpp:157). Vendor reads `m_threads.size()`
@@ -369,10 +422,11 @@ impl ThreadPool {
         let cv = Arc::clone(&self.ping_workers);
         let idle = Arc::clone(&self.idle_thread_count);
         let running = Arc::clone(&self.running);
+        let pending = Arc::clone(&self.pending_tasks);
         let pin = self.thread_pinning.get(&index).copied();
 
         let handle = thread::spawn(move || {
-            worker_main(index, shared, cv, idle, running, pin);
+            worker_main(index, shared, cv, idle, running, pending, pin);
         });
         threads.push(handle);
     }
@@ -404,8 +458,10 @@ fn worker_main(
     cv: Arc<Condvar>,
     idle: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
     pin: Option<u32>,
 ) {
+    let spin_us = pool_spin_us();
     crate::decompress::parallel::chunk_buffer_pool::bind_worker_pool_index(thread_index);
     // Rule-#3 page-warmth oracle (GZIPPY_PREFAULT_ARENA, default OFF, byte-transparent):
     // pre-touch this worker's marker/data arena so first-touch faults are paid off the
@@ -428,6 +484,31 @@ fn worker_main(
 
     use crate::decompress::parallel::trace_v2;
     while running.load(Ordering::Acquire) {
+        // ADAPTIVE PRE-PARK SPIN (byte-transparent; no rapidgzip
+        // counterpart — see `pool_spin_us` doc). During the short,
+        // frequent inter-chunk idle gaps, busy-poll the lock-free
+        // `pending_tasks` hint for a BOUNDED window before falling
+        // through to the condvar park. This keeps the core warm so the
+        // `ondemand` governor holds the clock (closes the AMD-Zen2 mid-T
+        // loss). Correctness: this only DELAYS parking; the authoritative
+        // wait predicate is still `has_unprocessed_tasks` under the mutex
+        // in `wait_while` below, so a task queued during (or after) the
+        // spin is never missed. Adaptive by construction: the loop bails
+        // the instant `pending > 0`, so in the throughput-saturated case
+        // (a task is essentially always queued) it spins ~zero — it only
+        // burns cycles when there is genuinely nothing to do, which is
+        // exactly the idle gap we want to keep the core warm across.
+        if spin_us > 0 && running.load(Ordering::Acquire) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_micros(spin_us);
+            while pending.load(Ordering::Relaxed) == 0 {
+                if !running.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                for _ in 0..SPIN_BATCH {
+                    std::hint::spin_loop();
+                }
+            }
+        }
         // pool.pick = the time a worker spends waiting for + dequeuing a task.
         // Split into `pool.pick.lock` (mutex acquire + dequeue) vs
         // `pool.pick.wait` (condvar wait) so a follow-up trace can tell
@@ -471,6 +552,10 @@ fn worker_main(
         drop(_pick);
 
         if let Some(t) = task {
+            // Popped one task — retire its queue-depth hint (paired with
+            // the fetch_add in `submit`). Only on Some, so the counter
+            // can never underflow.
+            pending.fetch_sub(1, Ordering::Relaxed);
             // task() (ThreadPool.hpp:219).
             let _run = trace_v2::SpanGuard::begin("pool.run_task");
             t();
