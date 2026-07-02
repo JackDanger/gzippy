@@ -321,11 +321,19 @@ fn manual_buffer_pool_enabled() -> bool {
 /// is retained; if the buffer is later re-taken from the manual pool it
 /// re-faults to zero pages that the next decode overwrites before any read.
 ///
-/// Default ON; `GZIPPY_NO_EAGER_DONTNEED=1` disables it (single-binary A/B).
+/// DEFAULT OFF (opt-in `GZIPPY_EAGER_DONTNEED=1`). GATED-MEASURED NET-NEGATIVE
+/// on AMD-Zen2 ondemand silesia T3-T6: the per-chunk `MADV_DONTNEED` runs on the
+/// serial consumer thread and the returned pages re-fault on the next
+/// allocation, and that syscall+refault cost EXCEEDS the exit_group teardown it
+/// saves (after/base 1.02-1.09 at T3-T6; only T8 ~0.99). Kept as an opt-in
+/// instrument documenting the tradeoff, NOT a default. A profitable variant
+/// would have to overlap the page-return onto the PARALLEL worker threads (as
+/// rpmalloc does) rather than the serial consumer — unvalidated.
 #[inline]
 fn eager_dontneed_disabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("GZIPPY_NO_EAGER_DONTNEED").is_some())
+    // Disabled unless explicitly opted in.
+    *EN.get_or_init(|| std::env::var_os("GZIPPY_EAGER_DONTNEED").is_none())
 }
 
 /// Instrument self-validation (Gate-0): proves the release actually fired and
