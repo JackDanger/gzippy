@@ -1479,6 +1479,64 @@ impl LutLitLenCode {
             bit_count,
         }
     }
+
+    /// T3-MARKER-ILP: SPECULATIVE short-code entry load from a PRE-refill
+    /// bitbuf, for the load-before-refill software-pipeline in the marker fast
+    /// loop (mirror of `consume_first_decode.rs:1854` M1-preload and igzip's
+    /// asm `mov {t4},0xFFF / and {t4},{bitbuf} / mov {t1}, [ctx+t4*4+lit_off]`
+    /// at asm_kernel.rs:602-607). Returns the raw `short_code_lookup` entry for
+    /// `bitbuf`'s low `ISAL_DECODE_LONG_BITS` bits. Issuing this table load from
+    /// the CURRENT bitbuf lets it overlap the immediately-following `refill`
+    /// (whose word-load+shift+or the entry address does NOT depend on), pulling
+    /// the ~3-4-cyc dependent load off the loop-carried critical chain.
+    ///
+    /// Byte-exactness contract: the caller MUST have `bitsleft >=
+    /// ISAL_DECODE_LONG_BITS` at the call so the low-12 index bits are IDENTICAL
+    /// before and after the subsequent refill (refill only ORs bits at
+    /// positions `>= bitsleft`). The result is finished by [`decode_from_spec`],
+    /// which trusts this entry ONLY for the SHORT-code path and re-decodes any
+    /// LONG code (needs >12 bits) from the post-refill reader.
+    #[inline(always)]
+    pub fn spec_short_entry(&self, bitbuf: u64) -> u32 {
+        let idx = (bitbuf & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
+        self.table.short_code_lookup[idx]
+    }
+
+    /// T3-MARKER-ILP: finish a decode whose short entry was speculatively
+    /// pre-loaded via [`spec_short_entry`] from the pre-refill bitbuf. `bits`
+    /// is the POST-refill reader.
+    ///
+    /// SHORT code (`LARGE_FLAG_BIT` clear): the pre-loaded `spec` is
+    /// byte-identical to what `decode_prefilled` would compute post-refill (the
+    /// low-`ISAL_DECODE_LONG_BITS` index is unchanged by the refill under the
+    /// caller's `bitsleft >= 12` contract), so build the `DecodedSymbol`
+    /// directly — this is the exact short branch of `decode_prefilled`.
+    ///
+    /// LONG code (`LARGE_FLAG_BIT` set, rare): its code exceeds 12 bits, so the
+    /// speculative entry is only a pointer; discard the speculation and decode
+    /// from the POST-refill bitbuf via `decode_prefilled` (byte-identical to the
+    /// pre-lever `refill(); decode_prefilled()`).
+    #[inline(always)]
+    pub fn decode_from_spec(
+        &self,
+        spec: u32,
+        bits: &crate::decompress::inflate::consume_first_decode::Bits<'_>,
+    ) -> DecodedSymbol {
+        if (spec & LARGE_FLAG_BIT) == 0 {
+            let bit_count = spec >> LARGE_SHORT_CODE_LEN_OFFSET;
+            let mut symbol = spec & LARGE_SHORT_SYM_MASK;
+            if bit_count == 0 {
+                symbol = INVALID_SYMBOL;
+            }
+            DecodedSymbol {
+                symbol,
+                sym_count: (spec >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK,
+                bit_count,
+            }
+        } else {
+            self.decode_prefilled(bits)
+        }
+    }
 }
 
 /// Pure-rust analog of `IsalDistCode`. `dist_huff` is sized at
