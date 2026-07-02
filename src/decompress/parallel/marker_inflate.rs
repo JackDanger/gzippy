@@ -709,6 +709,9 @@ fn marker_preload_disabled() -> bool {
 /// lookup (a debug_assert proves it every backref). Same-binary causal A/B arm:
 /// ON the load overlaps; OFF it serialises exactly as before. One OnceLock read
 /// per `read_internal_compressed_specialized::<true>` call; zero-cost when OFF.
+// Called only on aarch64 (the dist-preload is compile-gated to aarch64); on
+// x86_64 the enable folds to `false` and this reader is never referenced.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn marker_dist_preload_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
@@ -2423,9 +2426,23 @@ impl Block {
         // arm is taken and there is nothing to preload. `dist_valid` is set by
         // `ensure_dist_table` (called just above) and is loop-invariant (no table
         // rebuild inside the fast loop). Kill-switch `GZIPPY_NO_DIST_PRELOAD=1`.
-        #[cfg(pure_inflate_decode)]
+        //
+        // ARCH-GATED (2026-07-02, gated cross-arch A/B on silesia, same-binary
+        // GZIPPY_NO_DIST_PRELOAD ON vs OFF, sha 028bd002...):
+        //   aarch64 (Apple M1): WIN — T3 ON<OFF 23/25 (min -2.0% / median -2.4%),
+        //     T4 21/25 (-1.6% / -1.7%). The wide OoO window + spare load ports
+        //     absorb the per-iteration speculative load and hide the dist
+        //     dependent-load latency.
+        //   x86_64: NO WIN — AMD Zen2 TIE (T3 15/31, T4 19/31; Δmedian ≤0.6% ≪
+        //     ~1.3% run spread; 16xT2 throughput unchanged), Intel slight
+        //     LOSS-lean (T3 8/25, T8 10/25 favour OFF). Microcoded/narrower
+        //     schedulers do not hide the extra load, so compile-gate it OFF on
+        //     x86 — `dist_preload_on` folds to `false`, the top-of-loop hoist and
+        //     its branch dead-code-eliminate, and the length arm reverts to the
+        //     exact pre-lever in-arm `dt.lookup` (x86 codegen byte-identical).
+        #[cfg(all(pure_inflate_decode, target_arch = "aarch64"))]
         let dist_preload_on = marker_dist_lut && self.dist_valid && !marker_dist_preload_disabled();
-        #[cfg(not(pure_inflate_decode))]
+        #[cfg(not(all(pure_inflate_decode, target_arch = "aarch64")))]
         let dist_preload_on = false;
         // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
         // above (dist-table amortization + initial preload) which is amortized
