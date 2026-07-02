@@ -299,6 +299,79 @@ fn manual_buffer_pool_enabled() -> bool {
     env || t1_resident_scope_active()
 }
 
+/// FORM-B RSS FIX — eager per-chunk page release at recycle time.
+///
+/// The AMD-Zen2 mid-T (T3-T8) loss vs rapidgzip was localized (differential +
+/// RSS-inflate Gate-2 oracle) to the process-exit teardown: gz's IN-PROCESS
+/// decode (`main_start`→`main_end`) is at-or-faster than rapidgzip's whole
+/// wall, but the residual after `main_end` — the KERNEL `exit_group`
+/// address-space teardown — is proportional to resident memory and is where the
+/// gap lives. `libc::_exit` cannot skip it (exit_group runs regardless), so the
+/// only lever is to lower PEAK / AT-EXIT resident memory during the run.
+///
+/// gzippy holds each chunk's decoded bulk (and marker) buffer resident until it
+/// is recycled; with the default (no manual pool) allocator, freed buffers can
+/// linger in the arena (glibc's dynamic mmap threshold) instead of being
+/// returned to the OS, inflating at-exit RSS. rapidgzip's rpmalloc returns
+/// pages to the OS incrementally. This mirrors that: at recycle time — which
+/// under the deferral invariant is AFTER the chunk's output was written and its
+/// window published, i.e. the buffer's contents are dead — we `MADV_DONTNEED`
+/// the buffer's resident pages, returning them to the OS immediately and
+/// overlapped with other threads' decode. Byte-transparent: the virtual mapping
+/// is retained; if the buffer is later re-taken from the manual pool it
+/// re-faults to zero pages that the next decode overwrites before any read.
+///
+/// Default ON; `GZIPPY_NO_EAGER_DONTNEED=1` disables it (single-binary A/B).
+#[inline]
+fn eager_dontneed_disabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("GZIPPY_NO_EAGER_DONTNEED").is_some())
+}
+
+/// Instrument self-validation (Gate-0): proves the release actually fired and
+/// how many resident bytes it returned. No-op counters unless the path runs.
+pub static EAGER_DONTNEED_FIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static EAGER_DONTNEED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `MADV_DONTNEED` the page-aligned interior of the owned allocation
+/// `[base, base + bytes)`. Only whole pages STRICTLY inside the allocation are
+/// touched (start rounded up, end rounded down) so neither the allocator's
+/// preceding chunk header nor any trailing partial page outside the allocation
+/// is ever disturbed. Linux-only; a no-op elsewhere.
+#[cfg(target_os = "linux")]
+#[inline]
+fn dontneed_alloc(base: *const u8, bytes: usize) {
+    if eager_dontneed_disabled() {
+        return;
+    }
+    const PAGE: usize = 4096;
+    // Skip small buffers: the DONTNEED syscall isn't worth it below ~1 page of
+    // whole-page interior, and tiny allocations don't move at-exit RSS.
+    if bytes < 2 * PAGE {
+        return;
+    }
+    let start_addr = base as usize;
+    let start = start_addr.div_ceil(PAGE) * PAGE;
+    let end = (start_addr + bytes) / PAGE * PAGE;
+    if start >= end {
+        return;
+    }
+    // SAFETY: [start, end) is page-aligned and lies wholly within the caller's
+    // owned allocation; MADV_DONTNEED retains the mapping and only discards
+    // resident pages whose contents are dead (the buffer is being recycled).
+    unsafe {
+        libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    EAGER_DONTNEED_BYTES.fetch_add((end - start) as u64, Relaxed);
+    EAGER_DONTNEED_FIRED.fetch_add(1, Relaxed);
+}
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn dontneed_alloc(_base: *const u8, _bytes: usize) {}
+
 /// RESIDENT-OUTPUT-POOL ORACLE flag (`GZIPPY_RESIDENT_OUTPUT_POOL=1`, default OFF,
 /// byte-transparent, MEASUREMENT-ONLY). Turns on the manual LIFO pool AND pins every
 /// chunk's upfront reserve to a single fixed size (see `compute_initial_reserve`), so
@@ -367,6 +440,11 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     if v.capacity() == 0 {
         return;
     }
+    // FORM-B: return this recycled buffer's resident pages to the OS now,
+    // before it is pooled (re-fault on reuse) or dropped (freed). Lowers
+    // peak/at-exit RSS → cheaper kernel exit_group teardown. Contents are dead
+    // at recycle time. Fires in BOTH the manual-pool and default (drop) modes.
+    dontneed_alloc(v.as_ptr(), v.capacity());
     if !manual_buffer_pool_enabled() {
         return; // drop — rpmalloc thread cache retains pages (vendor model)
     }
@@ -387,6 +465,11 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     if v.capacity() == 0 {
         return;
     }
+    // FORM-B: page-release before pool/drop (see return_u8_to_worker).
+    dontneed_alloc(
+        v.as_ptr() as *const u8,
+        v.capacity() * std::mem::size_of::<u16>(),
+    );
     if !manual_buffer_pool_enabled() {
         return;
     }
@@ -431,7 +514,19 @@ pub fn take_marker_segment() -> U16 {
 
 /// Return marker segments to the owner worker's pool.
 pub fn return_marker_segments_to_worker(owner_worker: usize, segments: Vec<U16>) {
-    if segments.is_empty() || !manual_buffer_pool_enabled() {
+    if segments.is_empty() {
+        return;
+    }
+    // FORM-B: page-release each marker segment before pool/drop.
+    for v in &segments {
+        if v.capacity() != 0 {
+            dontneed_alloc(
+                v.as_ptr() as *const u8,
+                v.capacity() * std::mem::size_of::<u16>(),
+            );
+        }
+    }
+    if !manual_buffer_pool_enabled() {
         return;
     }
     let idx = owner_worker.min(MAX_WORKERS - 1);
