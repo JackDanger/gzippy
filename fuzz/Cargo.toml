@@ -1,0 +1,38 @@
+[package]
+name = "gzippy-parallel-sm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: not a member of the parent gzippy workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+
+[dependencies.gzippy]
+path = ".."
+# The parallel-SM decoder (parallel_sm cfg) is emitted by pure-rust-inflate,
+# which is the default feature — so the decode path under test is the shipped one.
+
+# Match the SHIPPED release profile's arithmetic semantics: production
+# `[profile.release]` sets no `overflow-checks`, so integer arithmetic WRAPS
+# rather than panicking. Disabling overflow-checks here keeps the fuzzer from
+# flagging benign inner-loop bit-reader wraps that never panic in production,
+# and lets a genuinely dangerous wrap propagate to the real bounds check it
+# would trip (a true production panic). debug-assertions stays on to keep
+# explicit invariant asserts live.
+[profile.release]
+overflow-checks = false
+debug-assertions = true
+
+[[bin]]
+name = "parallel_sm_roundtrip"
+path = "fuzz_targets/parallel_sm_roundtrip.rs"
+test = false
+doc = false
+bench = false
