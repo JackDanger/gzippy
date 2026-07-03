@@ -2464,14 +2464,46 @@ pub fn decompress_multi_member_parallel_to_vec(
                     }
 
                     let member = &members_ref[idx];
-                    // deflate_start is absolute offset in data; trailer is 8 bytes (CRC32+ISIZE)
-                    let deflate_end = member.start + member.length - 8;
+                    // deflate_start is absolute offset in data; trailer is 8 bytes (CRC32+ISIZE).
+                    // Defensive bounds (fuzz-found panic, bgzf.rs OOB): a malformed member from
+                    // scan_member_boundaries_fast on crafted input can carry length < 8,
+                    // deflate_start > deflate_end, or deflate_end past the buffer — slicing
+                    // `data[deflate_start..deflate_end]` then panics ("slice index starts at N
+                    // but ends at M"). For any VALID member deflate_start <= start+length-8 <=
+                    // data.len(), so these guards are byte-transparent; a bad member flags the
+                    // error and is skipped (the had_error check below turns it into a terminal
+                    // Err, matching the inflate-failure arm).
+                    let deflate_end = match member.start.checked_add(member.length) {
+                        Some(end)
+                            if member.length >= 8
+                                && end - 8 >= member.deflate_start
+                                && end - 8 <= data.len() =>
+                        {
+                            end - 8
+                        }
+                        _ => {
+                            error_ref.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
                     let deflate_data = &data[member.deflate_start..deflate_end];
 
-                    // SAFETY: Each member writes to a disjoint region
-                    let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
+                    // SAFETY: Each member writes to a disjoint region. Defensive bounds: a
+                    // malformed member's output_offset/isize could point past the output
+                    // buffer; `from_raw_parts_mut` past the allocation is UB. Valid members
+                    // satisfy output_offset + isize <= output.len() (the buffer is sized to the
+                    // sum of member ISIZEs), so this guard is byte-transparent.
+                    let out_total = unsafe { (*output_ref.0.get()).len() };
                     let out_start = member.output_offset;
                     let out_size = member.isize as usize;
+                    if out_start
+                        .checked_add(out_size)
+                        .is_none_or(|e| e > out_total)
+                    {
+                        error_ref.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
                     let out_slice = unsafe {
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };

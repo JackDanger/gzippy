@@ -2837,6 +2837,8 @@ pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
 /// Decode a deflate stream from a Bits reader
 pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
     let mut out_pos = 0;
+    // DoS/liveness guard counter — see the guard at the bottom of the loop.
+    let mut blocks_after_input_end: u32 = 0;
 
     loop {
         if bits.available() < 3 {
@@ -2881,6 +2883,31 @@ pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<
             // Align bits to byte boundary at end of deflate stream
             bits.align_to_byte();
             return Ok(out_pos);
+        }
+
+        // DoS/liveness guard (per-block boundary — NOT the hot per-symbol loop,
+        // so perf-neutral; this runs once per DEFLATE block). Once every input
+        // byte has been pulled into the bit reader (`bits.pos >= data.len()`), at
+        // most ~64 buffered bits remain, so a well-formed stream MUST reach its
+        // BFINAL block within a small, bounded number of further blocks (≤ ~7:
+        // the minimum valid block is ~10 bits). Malformed/truncated input instead
+        // lets the reader fabricate endless empty "blocks" from the zero-padding
+        // past end-of-input — `bfinal`/`btype` read as 0 → `decode_stored`'s
+        // trailing-zero tolerance returns Ok with no progress, and the loop spins
+        // forever (observed: >18 min CPU on a 5-byte body; `bitsleft` wraps so
+        // `bit_position()` is not a usable progress metric — `bits.pos` pinned at
+        // EOF is). Cap the post-exhaustion non-final blocks and error instead of
+        // hanging. Byte-transparent: no valid stream decodes anywhere near 64
+        // blocks after its input is exhausted.
+        if bits.pos >= bits.data.len() {
+            blocks_after_input_end += 1;
+            if blocks_after_input_end > 64 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "deflate stream did not terminate: no BFINAL block before end of input \
+                     (malformed/truncated)",
+                ));
+            }
         }
     }
 }
