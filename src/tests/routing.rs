@@ -438,6 +438,126 @@ mod tests {
         }
     }
 
+    /// DoS/OOM regression for the MULTI-MEMBER SEQUENTIAL path (Bug A). The
+    /// `decompress_multi_member_sequential` growth loop doubled its output buffer
+    /// without limit on a malformed deflate body: the inflate bit reader zero-pads
+    /// past end-of-input and fabricates phantom literals forever, so a tiny input
+    /// drove a multi-GB allocation (DoS). The `input_len × MAX_DEFLATE_EXPANSION`
+    /// ceiling now rejects the runaway with a terminal `Err` and bounded memory.
+    /// This path is DISTINCT from `test_malformed_input_rejected_not_oom` (which
+    /// covers the parallel-SM path); this fuzz-class input reaches the sequential
+    /// decoder directly.
+    #[test]
+    fn test_multi_member_sequential_oom_rejected() {
+        // Valid gzip header + corrupted deflate body + ISIZE trailer claiming
+        // ~1.14 GiB (0x44444444). A correct decoder must error, not OOM.
+        const M8: &[u8] = &[
+            31, 139, 8, 0, 144, 239, 59, 106, 0, 255, 237, 198, 177, 1, 0, 32, 8, 0, 32, 45, 75,
+            255, 191, 184, 177, 39, 96, 34, 114, 237, 58, 183, 39, 68, 68, 68, 68, 68, 68, 68, 68,
+            68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
+            68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
+        ];
+        let mut out = Vec::new();
+        let r = crate::decompress::decompress_multi_member_sequential(M8, &mut out);
+        assert!(
+            r.is_err(),
+            "malformed multi-member input must be rejected (got Ok, {} bytes)",
+            out.len()
+        );
+        // Bounded: ceiling for a ~78-byte residual is ~78 KiB + slack; the runaway
+        // is caught long before the GiBs it produced before the fix.
+        assert!(
+            out.len() < 16 * 1024 * 1024,
+            "malformed multi-member decode produced {} bytes — ceiling not bounding output",
+            out.len()
+        );
+    }
+
+    /// Byte-exactness guard for Bug A: the OOM ceiling must NOT reject a legitimate
+    /// high-ratio multi-member stream. This builds a large (16 MiB) low-entropy
+    /// corpus compressed as many concatenated gzip members (pigz-style) — a real
+    /// high-compression case — and asserts the sequential decoder recovers it
+    /// byte-for-byte.
+    #[test]
+    fn test_multi_member_sequential_large_high_ratio_byte_exact() {
+        // 16 MiB of highly compressible data → many members, high per-member ratio
+        // (repeated phrase compresses well past 4:1). Exercises the OOM ceiling's
+        // generosity: a legitimate high-ratio stream must NOT be rejected.
+        let mut original = Vec::with_capacity(16 * 1024 * 1024);
+        let phrase = b"the quick brown fox jumps over the lazy dog 0123456789\n";
+        while original.len() < 16 * 1024 * 1024 {
+            original.extend_from_slice(phrase);
+        }
+        original.truncate(16 * 1024 * 1024);
+        let compressed = compress_multi_member_gzip(&original);
+        // Sanity: it really is multi-member and high-ratio.
+        assert!(
+            compressed.len() * 4 < original.len(),
+            "fixture must be high-ratio (got {} → {})",
+            original.len(),
+            compressed.len()
+        );
+        let mut out = Vec::new();
+        let n = crate::decompress::decompress_multi_member_sequential(&compressed, &mut out)
+            .expect("valid large multi-member must decode");
+        assert_eq!(n as usize, original.len(), "decoded length mismatch");
+        assert_eq!(out, original, "large multi-member output not byte-exact");
+    }
+
+    /// DoS/hang regression for the INFLATE outer loop (Bug B). A non-final DEFLATE
+    /// block followed by end-of-input made `inflate_consume_first_bits` spin
+    /// forever: the bit reader zero-pads past EOF, so `bfinal`/`btype` read as 0,
+    /// `decode_stored`'s trailing-zero tolerance returns Ok with no progress, and
+    /// the outer loop never terminates (observed >18 min CPU). The post-input-end
+    /// block cap now errors instead of hanging. Wrapped in an explicit thread with
+    /// a timeout so a regression FAILS (does not hang the suite).
+    #[test]
+    fn test_inflate_nonterminating_stream_errors_not_hangs() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // Non-final empty stored block (BFINAL=0,BTYPE=00; LEN=0,NLEN=0xFFFF), then
+        // EOF — bfinal never set. Also a bare non-final stored header at EOF.
+        for body in [vec![0x00u8, 0x00, 0x00, 0xFF, 0xFF], vec![0x00u8]] {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                use crate::decompress::inflate::consume_first_decode::{
+                    inflate_consume_first_bits, Bits,
+                };
+                // Large buffer so this is NOT the WriteZero/OOM path — a true spin
+                // makes zero output progress and never fills it.
+                let mut out = vec![0u8; 4 * 1024 * 1024];
+                let mut bits = Bits::new(&body);
+                let r = inflate_consume_first_bits(&mut bits, &mut out);
+                let _ = tx.send(r.is_err());
+            });
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(is_err) => assert!(is_err, "malformed non-terminating stream must Err"),
+                Err(_) => panic!("inflate hung on non-terminating stream (Bug B regressed)"),
+            }
+        }
+    }
+
+    /// Robustness regression for the MULTI-MEMBER PARALLEL path (`bgzf.rs`
+    /// `decompress_multi_member_parallel_to_vecs`). A crafted multi-member-looking
+    /// input made `scan_member_boundaries_fast` emit a member whose
+    /// `deflate_start > start + length - 8`, so `data[deflate_start..deflate_end]`
+    /// panicked ("slice index starts at 57 but ends at 56") — a fuzz-found crash
+    /// (parallel_sm_roundtrip). The bounds guard now flags the member and returns
+    /// a terminal Err instead of panicking. This is the exact 66-byte input the
+    /// fuzzer produced; the decoder must return (Ok or Err) without panicking.
+    #[test]
+    fn test_multi_member_parallel_malformed_no_panic() {
+        const CRASH: &[u8] = &[
+            0, 0, 0, 189, 8, 0, 0, 0, 255, 172, 255, 0, 0, 0, 189, 8, 0, 0, 0, 255, 172, 255, 8,
+            189, 0, 0, 0, 31, 139, 8, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 82, 8, 189, 0, 0,
+            0, 31, 139, 8, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 82,
+        ];
+        // Must not panic (Ok or Err both acceptable — this is malformed input).
+        // Same entry the fuzz harness reaches (decompress_with_threads wraps this).
+        let mut out = Vec::new();
+        let _ = crate::decompress::decompress_bytes(CRASH, &mut out, 8);
+    }
+
     /// Opt-in routing proof (deletion-trap) for the T1-MONOLITH-STREAMING native
     /// path: with `GZIPPY_STREAM_MONOLITH=1`, a single-member decode at T==1 MUST
     /// be handled by `decode_and_stream_monolith_native` (counter fires) AND be

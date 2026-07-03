@@ -506,13 +506,46 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
         let body_start = offset + header;
         let body = &data[body_start..];
 
+        // DoS/OOM guard: a valid DEFLATE member expands by at most
+        // MAX_DEFLATE_EXPANSION:1 (~1032:1). On a malformed body the inflate bit
+        // reader zero-pads past end-of-input and fabricates phantom literals
+        // forever, so the WriteZero growth loop below doubles `output_buf`
+        // without limit — a ~50-byte input drives a multi-GB allocation before
+        // OOM-kill. `body` is the whole residual (this member's deflate + its
+        // trailer + any following members), so this ceiling over-counts and can
+        // never trip on a legitimate high-ratio multi-member stream; it only
+        // fires when the decoder is producing implausibly more than the residual
+        // input could ever expand to. Mirrors the parallel-SM path's
+        // `set_output_ceiling_for_input` (chunk_data.rs).
+        const OOM_GUARD_SLACK: usize = 64 * 1024; // one 32 KiB window + headroom
+        let output_ceiling = body
+            .len()
+            .saturating_mul(crate::decompress::parallel::chunk_data::MAX_DEFLATE_EXPANSION)
+            .saturating_add(OOM_GUARD_SLACK);
+
         // Decode the raw deflate body, growing the output buffer on overflow.
         let (out_size, deflate_len) = loop {
             let mut bits = Bits::new(body);
             match inflate_consume_first_bits(&mut bits, &mut output_buf) {
                 Ok(n) => break (n, bits.bit_position().div_ceil(8)),
                 Err(e) if e.kind() == std::io::ErrorKind::WriteZero => {
-                    let new_size = output_buf.len().saturating_mul(2).max(256 * 1024);
+                    if output_buf.len() >= output_ceiling {
+                        // Runaway: output already exceeds the plausible ceiling
+                        // for this member's compressed length — reject as
+                        // malformed (terminal Err) instead of OOMing.
+                        return Err(GzippyError::decompression(format!(
+                            "multi-member: decoded output {} exceeds plausible ceiling {} \
+                             for {}-byte residual input — malformed stream",
+                            output_buf.len(),
+                            output_ceiling,
+                            body.len()
+                        )));
+                    }
+                    let new_size = output_buf
+                        .len()
+                        .saturating_mul(2)
+                        .max(256 * 1024)
+                        .min(output_ceiling);
                     output_buf.resize(new_size, 0);
                     continue;
                 }
