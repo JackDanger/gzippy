@@ -297,7 +297,13 @@ impl<'a> Bits<'a> {
     #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.bitbuf >>= n as u8;
-        self.bitsleft -= n;
+        // `wrapping_sub` matches the sibling `consume_entry` and libdeflate's
+        // "garbage allowed in the high bits of bitsleft" model (`available()`
+        // reads only the low 8 bits). For any valid stream `bitsleft >= n`, so
+        // this is byte-identical; on malformed input it wraps instead of
+        // panicking under overflow-checks. (Found by the parallel-SM fuzz
+        // target via parse_dynamic_header on a crafted deflate header.)
+        self.bitsleft = self.bitsleft.wrapping_sub(n);
     }
 
     /// Consume using entry's low 5 bits
@@ -2944,7 +2950,9 @@ impl<'a> DecodeLane<'a> {
     #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.bitbuf >>= n as u8;
-        self.bitsleft -= n;
+        // See the sibling `Bits::consume` above: wrapping is byte-identical for
+        // valid streams (bitsleft >= n) and panic-free on malformed input.
+        self.bitsleft = self.bitsleft.wrapping_sub(n);
     }
 }
 
