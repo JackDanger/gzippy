@@ -23,6 +23,7 @@ pub mod pure_rust_inflate_corpus;
 pub mod resumable_correctness;
 pub mod routing;
 pub mod seam_crossing;
+pub mod selector_byte_transparency;
 pub mod step25_production_instrumentation;
 pub mod three_oracle_diff;
 pub mod trace_parity;
