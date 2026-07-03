@@ -2798,6 +2798,18 @@ fn submit_decode_to_pool(
 /// GzipChunkFetcher.hpp:579 (which forwards to
 /// `m_threadPool.submit(task, /* priority */ -1)` at
 /// BlockFetcher.hpp:606-611).
+/// ⚠️ SUPERSEDED / DEAD CODE — do NOT read the "CLONE" note below as the
+/// live behavior. The production resolve-ahead path is
+/// `queue_prefetched_marker_postprocess` → `submit_post_process_from_prefetch`
+/// → `run_post_process_in_place`, which mutates the SHARED `ChunkData` IN
+/// PLACE via `SharedChunkData` (`Arc<UnsafeCell<ChunkData>>` = vendor's
+/// `shared_ptr`), byte-for-byte faithful to vendor `GzipChunkFetcher.hpp:579-582`
+/// — NO clone (landed 3b24dd0e, 2026-06-06). The residual
+/// `SharedChunkData::take_or_clone` is a cold correctness fallback (measured
+/// MISSES=0 across workloads to T16). This function's CLONE approach was
+/// retired; its doc misled a 2026-07-02 source-read into a phantom "gz clones"
+/// divergence. Kept only as a reference for the abandoned eager-probe shape.
+///
 /// Eager post-process probe — gated port of vendor's
 /// `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
 ///
