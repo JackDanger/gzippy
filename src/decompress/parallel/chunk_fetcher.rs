@@ -2494,8 +2494,24 @@ fn build_block_finder(
     use crate::decompress::parallel::single_member::cpu_is_amd;
     // (chunks, divisor). chunks = # of trailing full spacings to subdivide;
     // divisor = spacing / divisor for that region. Gated default for AMD T3.
-    let gated: Option<(usize, usize)> = if cpu_is_amd() && pool_size == 3 {
-        Some((TAIL_TAPER_CHUNKS_DEFAULT, TAIL_TAPER_DIVISOR_DEFAULT))
+    // Per-T tail-taper schedule (AMD/Zen2 only). T3=5:2 (locked at 1364b07c);
+    // T4=8:2 and T7=8:2 close the last two silesia TIE cells. The wall CAUSALLY
+    // tracks the taper amount (Gate-2 sweep, silesia/Zen2 vs rapidgzip-native,
+    // load-immune interleaved N=31, /dev/null, sha==oracle):
+    //   T4 off 0.988 TIE → 8:2 0.975 WIN (Δ0.0055>spread0.0032; paired 25/31
+    //       p=9e-4; best-of-N min-ratio 0.977),
+    //   T7 off 0.980 TIE → 8:2 0.963 WIN (Δ0.0065>spread0.0054; paired 27/31
+    //       p<1e-4; best-of-N min-ratio 0.956).
+    // Non-monotonic optimum: 3:2 under-tapers (leaves a full straggler), 10:2
+    // over-tapers (per-chunk overhead at low workers > tail saved) and REGRESSES
+    // to LOSS — so the taper depth is gated per-T, not a smooth formula. Every
+    // other T and every non-AMD arch takes the byte-identical uniform finder.
+    let gated: Option<(usize, usize)> = if cpu_is_amd() {
+        match pool_size {
+            3 => Some((TAIL_TAPER_CHUNKS_DEFAULT, TAIL_TAPER_DIVISOR_DEFAULT)),
+            4 | 7 => Some((TAIL_TAPER_CHUNKS_T4_T7, TAIL_TAPER_DIVISOR_DEFAULT)),
+            _ => None,
+        }
     } else {
         None
     };
@@ -2538,6 +2554,22 @@ fn build_block_finder(
 const TAIL_TAPER_CHUNKS_DEFAULT: usize = 5;
 #[cfg(parallel_sm)]
 const TAIL_TAPER_DIVISOR_DEFAULT: usize = 2;
+
+/// AMD/Zen2 T4 & T7 tail-taper chunk count (divisor reuses
+/// [`TAIL_TAPER_DIVISOR_DEFAULT`] = 2, i.e. 8:2). LOCKED from the Gate-2 sweep
+/// (silesia/Zen2 vs rapidgzip-native, load-immune interleaved N=31, /dev/null,
+/// sha==oracle): subdividing the last 8 spacings by 2 is the optimum for both the
+/// T4 (4 MiB base) and T7 (2.5 MiB base) cells. Response is non-monotonic — 3:2
+/// under-tapers (a full straggler survives the final round → TIE), 10:2
+/// over-tapers (per-chunk overhead at 4/7 workers exceeds the tail saved →
+/// LOSS). At 8:2: T4 off 0.988 TIE → 0.975 WIN (Δ0.0055>spread0.0032, paired
+/// 25/31 p=9e-4); T7 off 0.980 TIE → 0.963 WIN (Δ0.0065>spread0.0054, paired
+/// 27/31 p<1e-4). STEP 1 trace showed these two cells carry the largest
+/// last-wave tail imbalance (T4/T7 ≈15–22% vs the T8 WIN cell's ≈10%); the taper
+/// shrinks the trailing chunks so the final decode round finishes fast.
+/// `GZIPPY_TAIL_TAPER="chunks:divisor"` overrides.
+#[cfg(parallel_sm)]
+const TAIL_TAPER_CHUNKS_T4_T7: usize = 8;
 
 /// Compute the `stop_hint_bit` hint for the worker. Mirror of vendor's
 /// `nextBlockOffset = m_blockFinder->get(validDataBlockIndex + 1)` at
