@@ -110,12 +110,32 @@ fn next_deflate_candidate(bits: u32, bit_count: u8) -> u8 {
 
 /// Generate the 15-bit NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT.
 /// Literal port of `NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT` (DynamicHuffman.hpp:113-124),
-/// minus the negative-encoding for lut[i] == 0 case (we don't use that
-/// branch yet; just store the positive skip).
+/// INCLUDING the negative-encoding for candidate positions (`lut[i] == 0`).
+///
+/// A candidate (a position that passes `isDeflateCandidate` on the known
+/// bits) is stored as `-(1 + nextDeflateCandidate<CACHED-1>(i >> 1))` — a
+/// NEGATIVE value whose sign flags "this is a candidate, run the precode
+/// check" and whose MAGNITUDE is the unconditional advance to the next
+/// candidate after this one. This lets the scan loop
+/// ([`DeflateBlockValidator::find_dynamic_blocks`]) advance branchlessly:
+/// `next <= 0` selects the validation arm, `next.abs()` is the slide amount,
+/// with no separate `if skip > 0` test and no redundant 17-bit re-peek.
+///
+/// Non-candidate positions keep the positive skip, so the legacy scalar
+/// scan ([`DeflateBlockValidator::find_dynamic_blocks_scalar`]) still works
+/// unchanged (`skip > 0` ⇒ non-candidate; `skip <= 0` ⇒ candidate, formerly
+/// `skip == 0`).
 fn generate_deflate_lut() -> Vec<i8> {
     let mut lut = vec![0i8; LUT_SIZE];
     for i in 0..LUT_SIZE {
-        lut[i] = next_deflate_candidate(i as u32, LUT_BITS as u8) as i8;
+        let positive = next_deflate_candidate(i as u32, LUT_BITS as u8);
+        lut[i] = if positive == 0 {
+            // Candidate at this position: encode the distance to the NEXT
+            // candidate (checked on the bits shifted by 1) as a negative.
+            -((1 + next_deflate_candidate((i as u32) >> 1, (LUT_BITS - 1) as u8)) as i8)
+        } else {
+            positive as i8
+        };
     }
     lut
 }
@@ -170,51 +190,34 @@ static PRECODE_LEAF_LUT: [u16; 1 << 12] = generate_precode_lut();
 fn validate_precode(hclen: usize, precode_bits: u64) -> bool {
     // Note: Any precode value 0-7 is valid, so we skip bit-pattern checking
 
-    // Count leaves using LUT (4 precodes at a time) - Duff's device unrolled
-    let mut leaf_count: u16 = 0;
-
     // Only count the precodes we actually have (hclen + 4)
     let precode_count = hclen.min(19);
-    let total_bits = precode_count * 3;
+    let total_bits = precode_count * 3; // 12..=57, always < 64
     let active_mask = (1u64 << total_bits) - 1;
     let active_bits = precode_bits & active_mask;
 
-    // Chunk 0: bits 0-11 (precodes 0-3)
-    leaf_count += PRECODE_LEAF_LUT[(active_bits & 0xFFF) as usize];
-
-    if precode_count > 4 {
-        // Chunk 1: bits 12-23 (precodes 4-7)
-        leaf_count += PRECODE_LEAF_LUT[((active_bits >> 12) & 0xFFF) as usize];
-    }
-
-    if precode_count > 8 {
-        // Chunk 2: bits 24-35 (precodes 8-11)
-        leaf_count += PRECODE_LEAF_LUT[((active_bits >> 24) & 0xFFF) as usize];
-    }
-
-    if precode_count > 12 {
-        // Chunk 3: bits 36-47 (precodes 12-15)
-        leaf_count += PRECODE_LEAF_LUT[((active_bits >> 36) & 0xFFF) as usize];
-    }
-
-    if precode_count > 16 {
-        // Chunk 4: bits 48-56 (precodes 16-18)
-        let chunk4 = (active_bits >> 48) & 0x1FF;
-        let p16 = (chunk4 & 7) as u8;
-        let p17 = ((chunk4 >> 3) & 7) as u8;
-        let p18 = ((chunk4 >> 6) & 7) as u8;
-
-        // Only count what's valid
-        if precode_count > 16 {
-            leaf_count += precode_to_leaves(p16);
-        }
-        if precode_count > 17 {
-            leaf_count += precode_to_leaves(p17);
-        }
-        if precode_count > 18 {
-            leaf_count += precode_to_leaves(p18);
-        }
-    }
+    // BRANCHLESS leaf count — direct port of rapidgzip's
+    // `PrecodeCheck::CountAllocatedLeaves::checkPrecode`
+    // (blockfinder/precodecheck/CountAllocatedLeaves.hpp:119-131). `active_mask`
+    // already zeroed every precode slot past the declared count, so the masked-out
+    // 12-bit chunks index PRECODE_LEAF_LUT[0] == 0. That lets ALL FIVE lookups run
+    // UNCONDITIONALLY — no per-chunk `if precode_count > N` data-dependent branch.
+    //
+    // Those chunk-gate branches were the hot branch-mispredict on incompressible
+    // input: the finder reaches this validator at ~1-in-9 random bit positions
+    // (bfinal=0 · btype=10 · hlit≤29 · hdist≤29 pass rate) with a uniformly random
+    // hclen, so `precode_count > {4,8,12,16,17,18}` are all near-coin-flips the
+    // predictor cannot learn. Byte-identical to the branched form: the extra
+    // chunks contribute exactly LUT[0] == 0 leaves.
+    //
+    // Chunk 4 covers precode slots 16-18 (bits 48-56, at most 9 bits => index
+    // <= 0x1FF) and reuses the SAME 12-bit LUT (its 4th slot, bits 9-11, is 0),
+    // matching vendor's `LUT[precodeBits >> (4 * CACHED_BITS)]`.
+    let leaf_count: u16 = PRECODE_LEAF_LUT[(active_bits & 0xFFF) as usize]
+        + PRECODE_LEAF_LUT[((active_bits >> 12) & 0xFFF) as usize]
+        + PRECODE_LEAF_LUT[((active_bits >> 24) & 0xFFF) as usize]
+        + PRECODE_LEAF_LUT[((active_bits >> 36) & 0xFFF) as usize]
+        + PRECODE_LEAF_LUT[(active_bits >> 48) as usize];
 
     // FAIL FAST: Exact leaf count check
     // Valid: exactly 128 (full tree) or 64 (single symbol with length 1)
@@ -506,10 +509,126 @@ impl<'a> DeflateBlockValidator<'a> {
     }
 
     /// Dynamic-Huffman block finder. Direct port of rapidgzip's
-    /// `seekToNonFinalDynamicDeflateBlock` (DynamicHuffman.hpp:168+).
-    /// Was inlined into find_blocks; extracted so find_blocks can also
-    /// run the uncompressed pass and merge results.
+    /// `seekToNonFinalDynamicDeflateBlock` (DynamicHuffman.hpp:168-298) —
+    /// the BRANCHLESS dual-sliding-bit-buffer scan.
+    ///
+    /// Two in-register bit buffers slide forward together (vendor keeps two
+    /// buffers so the 74 bits needed for LUT+precode span more than a u64):
+    ///   - `bit_buffer_for_lut`  : the 15 LUT bits at `offset`
+    ///   - `bit_buffer_precode`  : the 61 bits at `offset + 13`
+    ///                             (HCLEN[4] + 57 precode bits)
+    /// Each position indexes the SIGNED LUT once. `next <= 0` ⇒ candidate:
+    /// validate precode/Huffman straight from `bit_buffer_precode` — NO
+    /// re-peek of the 17-bit header. The advance is `next.abs()`,
+    /// UNCONDITIONAL (no `if skip > 0` branch), refilling the LUT buffer
+    /// from the precode buffer's overlap and the precode buffer from the
+    /// bit reader. This replaces the legacy per-position
+    /// `peek(15)`/`if skip > 0`/`peek(17)` scan
+    /// ([`Self::find_dynamic_blocks_scalar`], still used byte-identically
+    /// for the &lt;74-bit tail where the two buffers cannot be fully loaded).
+    ///
+    /// BYTE-TRANSPARENT: emits the exact same `BlockBoundary` set as the
+    /// scalar scan (locked by `branchless_scan_matches_scalar`). The LUT's
+    /// candidate set is unchanged (`isDeflateCandidate` inspects only 13
+    /// bits, so the 14- vs 15-bit prefix used by the skip encoding lands on
+    /// the identical next candidate); every candidate runs the identical
+    /// `validate_precode`/`parse_precode`/`validate_huffman_codes` gates.
     fn find_dynamic_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
+        const DUPLICATED_BITS: u32 = (LUT_BITS - 13) as u32; // 2
+        const PRECODE_COUNT_BITS: u32 = 4;
+        const ALL_PRECODE_BITS: u32 = 61;
+        const PRECODE_57_MASK: u64 = (1u64 << 57) - 1;
+
+        let data_bits = self.data.len() * 8;
+        // The fast loop needs 13 + 61 = 74 bits of lookahead to fully load
+        // both sliding buffers. Past that watermark, fall back to the
+        // byte-identical scalar tail scan.
+        let fast_end = end_bit.min(data_bits.saturating_sub(74));
+        if start_bit >= fast_end {
+            return self.find_dynamic_blocks_scalar(start_bit, end_bit);
+        }
+
+        let lut = get_lut();
+        let mut blocks = Vec::new();
+        let mut reader = BitReader::new(self.data);
+
+        // Seed the two sliding bit buffers (rg DynamicHuffman.hpp:184-191).
+        reader.seek_to_bit(start_bit);
+        let mut bit_buffer_for_lut = reader.peek_refilled(LUT_BITS as u8);
+        // The 61-bit precode buffer covers bits [start_bit+13, start_bit+74).
+        // A single 61-bit read cannot be served right after a mid-byte seek
+        // (the refill watermark leaves only 59 bits), so load it as 32 + 29.
+        reader.seek_to_bit(start_bit + 13);
+        let precode_lo = reader.read(32);
+        let precode_hi = reader.read(ALL_PRECODE_BITS as u8 - 32);
+        let mut bit_buffer_precode = precode_lo | (precode_hi << 32);
+        // reader is now at the high watermark start_bit + 74.
+
+        let mut offset = start_bit;
+        while offset < fast_end {
+            let next_position = lut[bit_buffer_for_lut as usize];
+            let bits_to_load = next_position.unsigned_abs() as u32; // ∈ [1, 15]
+
+            if next_position <= 0 {
+                // Candidate — validate straight from the precode buffer.
+                let next4 = (bit_buffer_precode & ((1 << PRECODE_COUNT_BITS) - 1)) as usize;
+                let next57 = (bit_buffer_precode >> PRECODE_COUNT_BITS) & PRECODE_57_MASK;
+                let precode_count = 4 + next4;
+                if validate_precode(precode_count, next57) {
+                    if let Some(precode_lengths) = self.parse_precode(precode_count, next57) {
+                        let hlit = ((bit_buffer_for_lut >> 3) & 0x1F) as u8;
+                        let hdist = ((bit_buffer_for_lut >> 8) & 0x1F) as u8;
+                        let hlit_count = 257 + hlit as usize;
+                        let lit_dist_count = hlit_count + (1 + hdist as usize);
+                        // Validate the lit/dist code lengths from a fresh
+                        // reader positioned just past the precode bits;
+                        // keeps the hot-loop reader/buffers untouched.
+                        let mut vreader = BitReader::new(self.data);
+                        vreader.seek_to_bit(offset + 17 + precode_count * 3);
+                        if self.validate_huffman_codes(
+                            &mut vreader,
+                            &precode_lengths,
+                            lit_dist_count,
+                            hlit_count,
+                        ) {
+                            blocks.push(BlockBoundary {
+                                bit_offset: offset,
+                                seek_bit: offset,
+                                valid: true,
+                                hlit,
+                                hdist,
+                                hclen: next4 as u8,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Unconditional branchless slide (rg DynamicHuffman.hpp:274-291).
+            bit_buffer_for_lut >>= bits_to_load;
+            bit_buffer_for_lut |= ((bit_buffer_precode >> DUPLICATED_BITS)
+                & ((1u64 << bits_to_load) - 1))
+                << (LUT_BITS as u32 - bits_to_load);
+            bit_buffer_precode >>= bits_to_load;
+            bit_buffer_precode |=
+                reader.read(bits_to_load as u8) << (ALL_PRECODE_BITS - bits_to_load);
+            offset += bits_to_load as usize;
+        }
+
+        // Byte-identical tail for the last <74 bits where the buffers
+        // cannot be safely loaded.
+        if offset < end_bit {
+            blocks.extend(self.find_dynamic_blocks_scalar(offset, end_bit));
+        }
+        blocks
+    }
+
+    /// Legacy per-position scalar scan — the reference implementation the
+    /// branchless [`Self::find_dynamic_blocks`] must match byte-for-byte,
+    /// and the tail handler for the final <74 bits. Kept verbatim so the
+    /// `branchless_scan_matches_scalar` differential has an independent
+    /// oracle.
+    fn find_dynamic_blocks_scalar(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
         let mut blocks = Vec::new();
         let mut reader = BitReader::new(self.data);
         reader.seek_to_bit(start_bit);
@@ -966,9 +1085,11 @@ mod tests {
         assert!(lut[0b010] > 0);
         assert!(lut[0b011] > 0);
 
-        // Valid: BTYPE=10 (dynamic), BFINAL=0, HLIT=0, HDIST=0
+        // Valid: BTYPE=10 (dynamic), BFINAL=0, HLIT=0, HDIST=0.
+        // Candidates are now encoded as NEGATIVE (sign = "is candidate",
+        // magnitude = advance to next candidate) — formerly stored as 0.
         let valid = 0b00000_00000_10_0u32;
-        assert_eq!(lut[valid as usize], 0);
+        assert!(lut[valid as usize] <= 0);
 
         // Invalid: BTYPE=10 (dynamic), BFINAL=1 — bfinal filter rejects.
         let final_dyn = 0b00000_00000_10_1u32;
@@ -1020,7 +1141,8 @@ mod tests {
             reader.seek_to_bit(bit_pos);
 
             let lut_bits = reader.peek(LUT_BITS as u8) as usize;
-            let lut_pass = lut_bits < lut.len() && lut[lut_bits] == 0;
+            // Candidate positions are LUT <= 0 (negative-encoded).
+            let lut_pass = lut_bits < lut.len() && lut[lut_bits] <= 0;
 
             let header = reader.peek(17);
             let btype = (header >> 1) & 3;
@@ -1085,6 +1207,105 @@ mod tests {
             found,
             total
         );
+    }
+
+    /// BYTE-TRANSPARENCY GATE for the branchless scan port: on real
+    /// deflate data the branchless `find_dynamic_blocks` must emit the
+    /// EXACT same block-boundary set (offsets + hlit/hdist/hclen fields, in
+    /// the same order) as the scalar reference `find_dynamic_blocks_scalar`.
+    /// Exercised over several corpora shapes and several sub-ranges so the
+    /// fast-region/tail hand-off is covered.
+    #[test]
+    fn branchless_scan_matches_scalar() {
+        use std::io::Write;
+
+        // A few different data shapes: mixed literal+match (default gz),
+        // near-incompressible (random), and highly repetitive.
+        let mut shapes: Vec<Vec<u8>> = Vec::new();
+        {
+            // Mixed / RLE-ish (same generator as the recall test).
+            let mut d = Vec::with_capacity(3 * 1024 * 1024);
+            let mut rng: u64 = 0xc0ffee;
+            while d.len() < 3 * 1024 * 1024 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if (rng >> 32) % 5 < 3 {
+                    d.push((rng >> 16) as u8);
+                } else {
+                    let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                    let repeat = ((rng >> 40) % 8 + 2) as usize;
+                    for _ in 0..repeat.min(3 * 1024 * 1024 - d.len()) {
+                        d.push(byte);
+                    }
+                }
+            }
+            shapes.push(d);
+        }
+        {
+            // Near-incompressible: every position is a scan miss/candidate.
+            let mut d = vec![0u8; 2 * 1024 * 1024];
+            let mut rng: u64 = 0x1badb002;
+            for b in &mut d {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (rng >> 24) as u8;
+            }
+            shapes.push(d);
+        }
+
+        for (si, data) in shapes.iter().enumerate() {
+            let mut gz = Vec::new();
+            {
+                let mut enc =
+                    flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+                enc.write_all(data).unwrap();
+                enc.finish().unwrap();
+            }
+            let header_size =
+                crate::decompress::parallel::single_member::skip_gzip_header(&gz).unwrap();
+            let deflate = &gz[header_size..gz.len() - 8];
+            let total_bits = deflate.len() * 8;
+            let finder = DeflateBlockValidator::new(deflate);
+
+            // Full range plus a few offset sub-ranges (exercise fast/tail
+            // hand-off and mid-stream starts, mirroring the parallel finder).
+            let ranges = [
+                (0usize, total_bits),
+                (0, total_bits / 2),
+                (total_bits / 3, total_bits),
+                (total_bits.saturating_sub(200), total_bits),
+            ];
+            for &(s, e) in &ranges {
+                let fast = finder.find_dynamic_blocks(s, e);
+                let scalar = finder.find_dynamic_blocks_scalar(s, e);
+                assert_eq!(
+                    fast.len(),
+                    scalar.len(),
+                    "shape {si} range {s}..{e}: count {} != scalar {}",
+                    fast.len(),
+                    scalar.len()
+                );
+                for (a, b) in fast.iter().zip(scalar.iter()) {
+                    assert_eq!(
+                        a.bit_offset, b.bit_offset,
+                        "shape {si} range {s}..{e}: offset"
+                    );
+                    assert_eq!(a.seek_bit, b.seek_bit, "shape {si} range {s}..{e}: seek");
+                    assert_eq!(a.hlit, b.hlit, "shape {si} range {s}..{e}: hlit");
+                    assert_eq!(a.hdist, b.hdist, "shape {si} range {s}..{e}: hdist");
+                    assert_eq!(a.hclen, b.hclen, "shape {si} range {s}..{e}: hclen");
+                }
+            }
+            // Guard against a vacuous match: the mixed/compressible shape
+            // must yield dynamic boundaries. (The near-incompressible shape
+            // legitimately compresses to stored blocks — zero dynamic
+            // boundaries — but the branchless scan still runs over every
+            // byte, and the count/field equality above proves transparency.)
+            if si == 0 {
+                assert!(
+                    !finder.find_dynamic_blocks(0, total_bits).is_empty(),
+                    "shape {si}: expected at least one dynamic boundary"
+                );
+            }
+        }
     }
 
     #[test]
