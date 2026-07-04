@@ -636,7 +636,24 @@ pub(crate) fn effective_parallel_threads(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT);
     if min_bpt > 0 {
-        let eff = (deflate_len / min_bpt).max(1);
+        // FLOOR the cap at the physical-core count of the run's affinity set. The
+        // corpus no-regress gate (Intel trainer, paired) proved a cap that drops
+        // BELOW ~physical-cores REGRESSES compressible mid-size files (monorepo 9.8 MB
+        // ratio 5.2× → capped to 6 was +16.7% SIG slower; its own knee is T8 too) and
+        // small incompressible files at moderate T (photo → capped to 4 was +20% SIG).
+        // The over-threading is confined to the SMT-sibling tier (threads > physical
+        // P-cores): a short compute-bound decode saturates the physical cores, so the
+        // 2nd SMT thread per core only adds coordination (chunk-count doubling at the
+        // 512 KiB chunk floor). Large files still repay SMT (silesia/weights T16 win)
+        // and clear `min_bpt*T` so they are never capped. Flooring at the physical
+        // count changes ONLY the sub-floor cases — exactly the regressing ones — so it
+        // keeps the movie/tool.bin wins while erasing the monorepo/photo regressions.
+        // The floor is TOPOLOGY-derived, not a portable constant; env-tunable per arch.
+        let floor = std::env::var("GZIPPY_MIN_THREADS_FLOOR")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
+        let eff = (deflate_len / min_bpt).max(floor).min(num_threads as u64);
         if eff < num_threads as u64 {
             WORK_PER_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
             return eff as usize;
