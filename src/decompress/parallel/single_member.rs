@@ -446,6 +446,25 @@ pub static COMPRESSIBILITY_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub static SMALL_OUTPUT_SERIAL_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
 
+/// Counter proving the work-per-thread cap (the over-threading guard) fired on a
+/// real decode (deletion-trap discipline; read by the routing test).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub static WORK_PER_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum COMPRESSED bytes of work each parallel worker must be given before
+/// spawning another. Over-threading guard: on a SMALL near-incompressible stream
+/// (movie.mp4 12.9 MB, ratio ~1.0) the vendor chunk-size shrink floors chunks at
+/// [`MIN_ADJUSTED_CHUNK_BYTES`] (512 KiB) once `file/(3·T)` drops below it, so at
+/// high T the file is split into ~2× more chunks than at its knee (movie: 13
+/// chunks @ T8 → 25 @ T16) — doubling every per-chunk serial cost (bootstrap scan,
+/// window seed, block-finder validation, consumer coordination, pool-pick
+/// contention) while the short decode cannot hide it. Result: NEGATIVE thread
+/// scaling past the knee (movie T16 +9.64% SIG slower than T8, Intel, paired N=41).
+/// Capping effective-T to `deflate_len / this` keeps each worker's chunk coarse
+/// enough to stay on the amortized side of the knee. `0` disables the cap (the
+/// A/B baseline). Env override: `GZIPPY_MIN_BYTES_PER_THREAD`.
+const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
+
 /// Compressibility-gated effective thread count for the parallel single-member
 /// pipeline.
 ///
@@ -598,6 +617,29 @@ pub(crate) fn effective_parallel_threads(
         if (num_threads as f64) < crossover {
             SERIAL_CLEAN_FLOOR_APPLIED.fetch_add(1, Ordering::Relaxed);
             return 1;
+        }
+    }
+
+    // WORK-PER-THREAD CAP (over-threading guard). Above the serial floors the file
+    // IS worth parallelizing, but a SMALL stream can be split into more chunks than
+    // there is decode work to amortize their per-chunk serial cost (see
+    // [`MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT`] for the mechanism + the paired
+    // movie T8-vs-T16 measurement). Cap effective-T so each worker gets at least
+    // `min_bpt` COMPRESSED bytes: `eff = deflate_len / min_bpt` (floored at 1,
+    // never raised above the requested `num_threads`). This is a GENERAL
+    // work-per-thread law — it binds ONLY when `deflate_len < min_bpt*num_threads`
+    // (small file at high T); a large file (silesia/weights/nasa) clears
+    // `min_bpt*T` and keeps every requested thread. Byte-transparent: only the
+    // thread count changes. `min_bpt == 0` disables (A/B baseline).
+    let min_bpt = std::env::var("GZIPPY_MIN_BYTES_PER_THREAD")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT);
+    if min_bpt > 0 {
+        let eff = (deflate_len / min_bpt).max(1);
+        if eff < num_threads as u64 {
+            WORK_PER_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
+            return eff as usize;
         }
     }
     num_threads
