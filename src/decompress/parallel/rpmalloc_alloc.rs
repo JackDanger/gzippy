@@ -20,12 +20,13 @@ mod arena {
     /// Stateless rpmalloc-backed allocator (vendor `RpmallocAllocator<T>`).
     ///
     /// Huge allocations route through [`SlabAlloc`] (retain resident blocks
-    /// instead of munmapping) when the T-conditional gate is on: auto-ON
-    /// STRICTLY at decode T <= 2 (default `GZIPPY_SLAB_MAX_T` = 2); at T > 2
-    /// the slab is off by construction. The budget (`T × largest_block_seen`,
-    /// uncapped) admits the chunk-class blocks — retention ≈ one chunk buffer
-    /// per active worker. `GZIPPY_SLAB_ALLOC=1`/`=0` force on/off;
-    /// `GZIPPY_SLAB_MAX_T=K` overrides the ceiling.
+    /// instead of munmapping) when the size-aware T gate is on: auto-ON at
+    /// decode T <= 2 for EVERY huge block (uncapped `T × largest_block_seen`
+    /// budget ≈ one chunk buffer per active worker), and at 2 < T <= 64 ONLY
+    /// for chunk-class blocks (<= 8 MiB) with a `min(T × 8 MiB, 16 MiB)`
+    /// retained-free ceiling — the stored/incompressible high-T fault-storm fix
+    /// that leaves large-output compressible chunks (never routed) untouched.
+    /// All thresholds are hardcoded (knob-free prod path).
     #[derive(Copy, Clone, Debug, Default)]
     pub struct RpmallocAlloc;
 
@@ -47,23 +48,15 @@ mod arena {
     // and later hands out an undersized block → heap corruption. (That was
     // the bug in the earlier reverted retain-list that broke multimember.)
     // `grow`/`shrink` are overridden so a resident block whose true size
-    // already fits is reused in place (no copy/realloc churn).
-    // MEASUREMENT-ONLY override (GZIPPY_SLAB_THRESHOLD_KIB): lower the slab
-    // threshold so the 128 KiB u16 marker segments (the dominant page-fault
-    // site, SegmentedU16::push_slice = 44% of faults) ALSO get the resident-
-    // retain treatment instead of rpmalloc cross-thread-free + re-fault. Used
-    // by the clean page-warmth oracle (advisor pass 2): drive marker faults to
-    // ~rg's floor with a never-munmap resident slab and watch the matched wall.
+    // already fits is reused in place (no copy/realloc churn). The huge
+    // threshold is the hardcoded `SLAB_THRESHOLD` (3 MiB) — knob-free prod path.
+    /// Huge-allocation threshold: buffers this size or larger route through the
+    /// resident slab free-list. Hardcoded (knob-free prod path).
+    const SLAB_THRESHOLD: usize = 3 * 1024 * 1024;
+
+    #[inline]
     fn slab_threshold() -> usize {
-        static T: OnceLock<usize> = OnceLock::new();
-        *T.get_or_init(|| {
-            std::env::var("GZIPPY_SLAB_THRESHOLD_KIB")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&v| v > 0)
-                .map(|kib| kib * 1024)
-                .unwrap_or(3 * 1024 * 1024)
-        })
+        SLAB_THRESHOLD
     }
     /// True block sizes are rounded up to this granularity so a few size
     /// classes cover the (near-constant) chunk-buffer sizes for high reuse.
@@ -95,9 +88,6 @@ mod arena {
     // LAST thing dropped (largest-first would evict exactly the lever block
     // whenever anything else shared the free list).
     //
-    // `GZIPPY_SLAB_ALLOC=1` forces ON at every T, `=0` forces OFF (both
-    // override the auto gate). `GZIPPY_SLAB_MAX_T=K` overrides the ceiling.
-    //
     // The decode thread count is STORED AT EVERY DECODE ENTRY
     // (`set_decode_threads`, called from `sm_driver::read_parallel_sm_inner`)
     // — an atomic, NOT a OnceLock, so a second decode in the same process
@@ -107,26 +97,34 @@ mod arena {
     // dealloc/grow/shrink are pointer-keyed against the live side-table (see
     // `SLAB_EVER_ENGAGED`), so a mid-process gate flip can never mis-free a
     // slab block (the multimember-corruption class).
-    fn slab_force() -> Option<bool> {
-        static F: OnceLock<Option<bool>> = OnceLock::new();
-        *F.get_or_init(|| std::env::var("GZIPPY_SLAB_ALLOC").ok().map(|v| v != "0"))
-    }
-
-    /// Highest decode thread count at which the slab auto-enables.
-    /// Default: 2 — STRICTLY T <= 2 (iter-2 spec). At T > 2 the slab is off
-    /// by construction (zero engagement, zero RSS movement). Override with
-    /// `GZIPPY_SLAB_MAX_T=K`.
+    /// Highest decode thread count for the LEGACY UNCAPPED regime: at
+    /// `1 <= T <= this` the slab auto-enables for EVERY huge block with the
+    /// uncapped `T × largest_block_seen` budget. Hardcoded to 2 (knob-free
+    /// prod path).
     const SLAB_AUTO_MAX_T_DEFAULT: usize = 2;
 
+    #[inline]
     fn slab_auto_max_t() -> usize {
-        static K: OnceLock<usize> = OnceLock::new();
-        *K.get_or_init(|| {
-            std::env::var("GZIPPY_SLAB_MAX_T")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(SLAB_AUTO_MAX_T_DEFAULT)
-        })
+        SLAB_AUTO_MAX_T_DEFAULT
     }
+
+    // ── HIGH-T SIZE-AWARE regime (close stored/incompressible high-T) ──────
+    //
+    // Locate #197 (Intel+AMD, byte-exact, N>=15): the stored/incompressible
+    // high-T loss vs rapidgzip is a per-chunk output-buffer alloc fault-storm.
+    // At `SLAB_AUTO_MAX_T_DEFAULT < T <= SLAB_HIGH_T_MAX`, a NEW huge allocation
+    // routes through the slab ONLY if its size is <= SLAB_HIGH_T_MAX_BLOCK (the
+    // chunk-class threshold): stored/incompressible chunks reserve ~4 MiB
+    // (<= thresh ⇒ route ⇒ reuse ⇒ CLOSE), compressible chunks reserve 12–64
+    // MiB (> thresh ⇒ never route ⇒ identical to the T<=2-gated path ⇒ the
+    // large-output protected cells cannot regress in wall OR RSS). Retained-free
+    // bytes are hard-capped at `min(T × SLAB_HIGH_T_MAX_BLOCK,
+    // SLAB_HIGH_T_BUDGET_CEIL)` — the RSS backstop for variable-block
+    // compressible high-T corpora (silesia-T16 measured +3.7% vs +15.6%
+    // uncapped). All three constants are hardcoded (knob-free prod path).
+    const SLAB_HIGH_T_MAX: usize = 64;
+    const SLAB_HIGH_T_MAX_BLOCK: usize = 8 * 1024 * 1024;
+    const SLAB_HIGH_T_BUDGET_CEIL: usize = 16 * 1024 * 1024;
 
     /// Decode thread count of the current/most-recent parallel-SM decode.
     /// 0 = no decode has started (slab auto-gate stays off).
@@ -143,10 +141,34 @@ mod arena {
     }
 
     /// Pure gate decision (unit-tested at the T boundaries).
-    fn gate_decision(force: Option<bool>, auto_max_t: usize, decode_threads: usize) -> bool {
+    ///
+    /// `alloc_size` is the size of the NEW huge allocation being routed. The
+    /// legacy regime (T <= auto_max_t) ignores it (routes every huge block,
+    /// uncapped); the size-aware high-T regime routes ONLY chunk-class blocks
+    /// (<= high_t_block), so large-output compressible chunks never engage the
+    /// slab at high T — that is what keeps peak RSS flat on the large-output
+    /// protected cells.
+    fn gate_decision(
+        force: Option<bool>,
+        auto_max_t: usize,
+        high_t_max: usize,
+        high_t_block: usize,
+        decode_threads: usize,
+        alloc_size: usize,
+    ) -> bool {
         match force {
             Some(v) => v,
-            None => decode_threads != 0 && decode_threads <= auto_max_t,
+            None => {
+                if decode_threads == 0 {
+                    false
+                } else if decode_threads <= auto_max_t {
+                    true // legacy uncapped regime — every huge block, all sizes
+                } else if decode_threads <= high_t_max {
+                    alloc_size <= high_t_block // size-aware: chunk-class only
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -186,55 +208,81 @@ mod arena {
         }
     }
 
-    /// Should a NEW huge allocation route through the slab right now?
-    fn slab_route_new() -> bool {
+    /// Should a NEW huge allocation of `alloc_size` bytes route through the
+    /// slab right now?
+    fn slab_route_new(alloc_size: usize) -> bool {
         gate_decision(
-            slab_test_override().or_else(slab_force),
-            slab_auto_max_t(),
+            slab_test_override(),
+            SLAB_AUTO_MAX_T_DEFAULT,
+            SLAB_HIGH_T_MAX,
+            SLAB_HIGH_T_MAX_BLOCK,
             DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed),
+            alloc_size,
         )
     }
 
-    /// Bytes-budget cap for the resident free list (iter-2, 2026-06-11).
-    ///
-    /// If `GZIPPY_SLAB_BUDGET_MIB` is set, that fixed MiB value is used.
-    /// Otherwise the budget auto-scales: `T × largest-block-seen`, UNCAPPED —
-    /// it must ADMIT the chunk-class blocks (tens of MB; iter-1's 16 MiB hard
-    /// cap evicted the just-freed chunk buffer every time and erased the T1
-    /// win). T = current decode thread count; the gate (T <= 2) bounds the
-    /// multiplier, so the steady-state retention is ≈ the decode's own
-    /// working set (one chunk buffer per active worker), not a leak.
-    fn configured_budget_bytes() -> Option<usize> {
-        static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
-        *BUDGET.get_or_init(|| {
-            std::env::var("GZIPPY_SLAB_BUDGET_MIB")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&v| v > 0)
-                .map(|mib| mib * 1024 * 1024)
-        })
+    /// True iff we are in the AUTO size-aware high-T regime (T above the legacy
+    /// uncapped ceiling but within the high-T window). In this regime the
+    /// retained-free budget is per-thread-capped at `SLAB_HIGH_T_MAX_BLOCK` and
+    /// clamped to `SLAB_HIGH_T_BUDGET_CEIL` so resident overhead stays bounded
+    /// on small-block high-T corpora.
+    fn slab_high_t_capped() -> bool {
+        if slab_test_override().is_some() {
+            return false;
+        }
+        let t = DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        t > SLAB_AUTO_MAX_T_DEFAULT && t <= SLAB_HIGH_T_MAX
     }
 
-    /// Pure budget computation (unit-tested): override wins; otherwise
-    /// `max(GRANULARITY, T × largest_block_seen)` with NO hard cap — the
-    /// chunk-class block (tens of MB) must fit, times one slot per worker.
+    /// Pure budget computation (unit-tested): an explicit `configured` value
+    /// (test-only) wins; otherwise `max(GRANULARITY, T × per_thread)`. In the
+    /// LEGACY regime (`per_thread_cap = None`) `per_thread = largest_block_seen`,
+    /// UNCAPPED — the chunk-class block (tens of MB) must fit, times one slot
+    /// per worker. In the AUTO size-aware HIGH-T regime (`per_thread_cap =
+    /// Some(cap)`) it is `min(largest_block_seen, cap)`, so retained-free
+    /// resident bytes are hard-bounded at `T × cap`.
     fn budget_for(
         decode_threads: usize,
         largest_block_seen: usize,
         configured: Option<usize>,
+        per_thread_cap: Option<usize>,
     ) -> usize {
         configured.unwrap_or_else(|| {
             let t = decode_threads.max(1);
-            SLAB_GRANULARITY.max(t.saturating_mul(largest_block_seen))
+            let per_thread = match per_thread_cap {
+                Some(cap) => largest_block_seen.min(cap),
+                None => largest_block_seen,
+            };
+            SLAB_GRANULARITY.max(t.saturating_mul(per_thread))
         })
     }
 
+    /// Pure high-T budget (unit-tested): `T × min(largest, per_thread_cap)`
+    /// clamped to the absolute `ceil`. Bounds retained-free RSS regardless of T
+    /// or block-size variance.
+    fn capped_budget(
+        decode_threads: usize,
+        largest_block_seen: usize,
+        per_thread_cap: usize,
+        ceil: usize,
+    ) -> usize {
+        budget_for(decode_threads, largest_block_seen, None, Some(per_thread_cap)).min(ceil)
+    }
+
     fn effective_budget(largest_block_seen: usize) -> usize {
-        budget_for(
-            DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed),
-            largest_block_seen,
-            configured_budget_bytes(),
-        )
+        let threads = DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        if slab_high_t_capped() {
+            // AUTO high-T regime: per-thread cap AND an absolute ceiling.
+            capped_budget(
+                threads,
+                largest_block_seen,
+                SLAB_HIGH_T_MAX_BLOCK,
+                SLAB_HIGH_T_BUDGET_CEIL,
+            )
+        } else {
+            // Legacy T<=2: uncapped `T × largest_block_seen`.
+            budget_for(threads, largest_block_seen, None, None)
+        }
     }
 
     #[derive(Default)]
@@ -254,28 +302,12 @@ mod arena {
         S.get_or_init(|| Mutex::new(SlabState::default()))
     }
 
-    /// MEASUREMENT-ONLY event trace (`GZIPPY_SLAB_TRACE=1`): one line per
-    /// slab event (hit/miss/retain/evict) with the size and the live/free
-    /// byte ledgers — the "instrument, don't guess" tool for RSS-peak
-    /// attribution (which blocks coexist when).
-    fn slab_trace_on() -> bool {
-        static T: OnceLock<bool> = OnceLock::new();
-        *T.get_or_init(|| std::env::var_os("GZIPPY_SLAB_TRACE").is_some())
-    }
-
-    fn slab_trace(event: &str, bs: usize, s: &SlabState) {
-        if slab_trace_on() {
-            let live_bytes: usize = s.live.values().map(|&(b, _)| b).sum();
-            eprintln!(
-                "[slab] {event} bs={:.1}M live_n={} live={:.1}M free_n={} free={:.1}M",
-                bs as f64 / 1048576.0,
-                s.live.len(),
-                live_bytes as f64 / 1048576.0,
-                s.free.len(),
-                s.current_free_bytes as f64 / 1048576.0,
-            );
-        }
-    }
+    /// Slab event trace — compiled out of the knob-free prod path (was the
+    /// GZIPPY_SLAB_TRACE measurement instrument). Kept as an inlined no-op so
+    /// the call sites stay in place; re-introduce behind a dev-instruments cfg
+    /// if slab RSS attribution is needed again.
+    #[inline]
+    fn slab_trace(_event: &str, _bs: usize, _s: &SlabState) {}
 
     #[inline]
     fn raw_alloc(size: usize, align: usize) -> *mut u8 {
@@ -409,8 +441,9 @@ mod arena {
         /// Keys on the side-table, NOT the caller layout (grow passes OLD).
         ///
         /// Retention policy: bytes-budget, SMALLEST-first eviction (iter-2).
-        /// Budget = T × largest-block-seen (uncapped) or GZIPPY_SLAB_BUDGET_MIB.
-        /// Smallest-first keeps the chunk-class block resident as long as
+        /// Budget = `effective_budget` (legacy T<=2: uncapped T × largest-block;
+        /// high-T: `min(T × 8 MiB, 16 MiB)`). Smallest-first keeps the chunk-
+        /// class block resident as long as
         /// possible — with budget = 1 × largest at T1, largest-first would
         /// evict exactly the lever block whenever any smaller block shared
         /// the free list. Blocks over budget are munmapped outside the lock.
@@ -588,7 +621,7 @@ mod arena {
             // Gate consulted ONLY for routing new huge allocations; small
             // allocations and the gate-off path are today's raw rpmalloc,
             // bit-for-bit.
-            if layout.size() >= slab_threshold() && slab_route_new() {
+            if layout.size() >= slab_threshold() && slab_route_new(layout.size()) {
                 return SlabAlloc.alloc_huge(layout);
             }
             ensure_thread_initialized();
@@ -694,21 +727,32 @@ mod arena {
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
         #[test]
         fn gate_decision_boundaries() {
-            // force-on wins at every T (GZIPPY_SLAB_ALLOC=1)
-            assert!(gate_decision(Some(true), 1, 0));
-            assert!(gate_decision(Some(true), 1, 16));
-            // force-off wins at every T (GZIPPY_SLAB_ALLOC=0)
-            assert!(!gate_decision(Some(false), 1, 1));
-            assert!(!gate_decision(Some(false), 8, 4));
-            // auto (unset): ON iff 1 <= T <= max_t; T==0 (no decode) OFF
-            assert!(!gate_decision(None, 1, 0));
-            assert!(gate_decision(None, 1, 1));
-            assert!(!gate_decision(None, 1, 2));
-            assert!(!gate_decision(None, 1, 16));
-            // max_t=2 boundary (the iter-2 default gate): T=1,2 ON; T=3 OFF
-            assert!(gate_decision(None, 2, 1));
-            assert!(gate_decision(None, 2, 2));
-            assert!(!gate_decision(None, 2, 3));
+            // Signature: (force, auto_max_t, high_t_max, high_t_block, T, size).
+            let big = 32 << 20; // compressible chunk-class (> high_t_block)
+            let small = 4 << 20; // stored/incompressible chunk-class (<= block)
+            let blk = 8 << 20; // high_t_block threshold
+            let htm = 64; // high_t_max
+                          // force-on wins at every T and size
+            assert!(gate_decision(Some(true), 2, htm, blk, 0, big));
+            assert!(gate_decision(Some(true), 2, htm, blk, 16, big));
+            // force-off wins at every T
+            assert!(!gate_decision(Some(false), 2, htm, blk, 1, small));
+            assert!(!gate_decision(Some(false), 2, htm, blk, 4, small));
+            // auto, LEGACY regime T<=auto_max_t: ON for ALL sizes; T==0 OFF
+            assert!(!gate_decision(None, 2, htm, blk, 0, small));
+            assert!(gate_decision(None, 2, htm, blk, 1, big)); // legacy ignores size
+            assert!(gate_decision(None, 2, htm, blk, 2, big));
+            // auto, HIGH-T size-aware regime (auto_max_t < T <= high_t_max):
+            // chunk-class (<= blk) routes; large (> blk) does NOT.
+            assert!(gate_decision(None, 2, htm, blk, 3, small)); // stored ⇒ route
+            assert!(gate_decision(None, 2, htm, blk, 16, small));
+            assert!(!gate_decision(None, 2, htm, blk, 3, big)); // compressible ⇒ skip
+            assert!(!gate_decision(None, 2, htm, blk, 16, big));
+            // exact boundary: size == blk routes (<=), size == blk+1 does not
+            assert!(gate_decision(None, 2, htm, blk, 8, blk));
+            assert!(!gate_decision(None, 2, htm, blk, 8, blk + 1));
+            // above the high-T window ⇒ OFF regardless of size
+            assert!(!gate_decision(None, 2, 8, blk, 9, small));
         }
 
         /// Iter-2 spec: the DEFAULT gate ceiling is STRICTLY 2 (T<=2). Iter-1
@@ -717,9 +761,7 @@ mod arena {
         #[test]
         fn default_auto_max_t_is_strictly_two() {
             assert_eq!(SLAB_AUTO_MAX_T_DEFAULT, 2);
-            if std::env::var_os("GZIPPY_SLAB_MAX_T").is_none() {
-                assert_eq!(slab_auto_max_t(), 2);
-            }
+            assert_eq!(slab_auto_max_t(), 2);
         }
 
         /// Iter-2 crux: the budget must ADMIT a synthetic chunk-class block
@@ -729,16 +771,32 @@ mod arena {
         #[test]
         fn budget_admits_chunk_class_blocks_at_low_t() {
             let chunk = 38 * 1024 * 1024; // chunk-class: tens of MB
-                                          // T1: exactly one resident chunk slot — the block FITS.
-            assert_eq!(budget_for(1, chunk, None), chunk);
+                                          // Legacy regime (per_thread_cap=None): T1 = one resident chunk slot.
+            assert_eq!(budget_for(1, chunk, None, None), chunk);
             // T2: one slot per active worker.
-            assert_eq!(budget_for(2, chunk, None), 2 * chunk);
+            assert_eq!(budget_for(2, chunk, None, None), 2 * chunk);
             // T=0 (allocator used before any decode) behaves as one worker.
-            assert_eq!(budget_for(0, chunk, None), chunk);
+            assert_eq!(budget_for(0, chunk, None, None), chunk);
             // Floor: granularity when nothing big has been seen yet.
-            assert_eq!(budget_for(1, 0, None), SLAB_GRANULARITY);
-            // Env override wins verbatim (GZIPPY_SLAB_BUDGET_MIB).
-            assert_eq!(budget_for(2, chunk, Some(16 << 20)), 16 << 20);
+            assert_eq!(budget_for(1, 0, None, None), SLAB_GRANULARITY);
+            // Explicit configured budget wins verbatim (test-only path).
+            assert_eq!(budget_for(2, chunk, Some(16 << 20), None), 16 << 20);
+            // HIGH-T per-thread cap: retained-free is bounded at T × cap even
+            // when largest_block_seen (38 MiB) exceeds the cap (8 MiB).
+            let cap = 8 << 20;
+            assert_eq!(budget_for(4, chunk, None, Some(cap)), 4 * cap);
+            assert_eq!(budget_for(16, chunk, None, Some(cap)), 16 * cap);
+            // A small (stored) block below the cap keeps its full working set.
+            let stored = 4 << 20;
+            assert_eq!(budget_for(4, stored, None, Some(cap)), 4 * stored);
+            // Absolute ceiling clamps the high-T retained-free budget: at T16
+            // the uncapped T×cap (128 MiB) is clamped to the 16 MiB ceiling.
+            let ceil = 16 << 20;
+            assert_eq!(capped_budget(16, chunk, cap, ceil), ceil);
+            assert_eq!(capped_budget(4, chunk, cap, ceil), ceil); // 4×8=32 → clamp 16
+            // Below the ceiling the per-thread working set is preserved.
+            assert_eq!(capped_budget(3, stored, cap, ceil), 3 * stored); // 12 MiB < 16
+            assert_eq!(capped_budget(1, stored, cap, ceil), SLAB_GRANULARITY.max(stored));
         }
 
         /// Smallest-first eviction: when the budget forces an eviction, the
@@ -757,7 +815,7 @@ mod arena {
             // a small block arrives; budget (1 x largest = 38 MiB) is blown
             free.push((0x2000, 4 << 20, 16));
             current += 4 << 20;
-            let budget = budget_for(1, 38 << 20, None);
+            let budget = budget_for(1, 38 << 20, None, None);
             let mut evicted = Vec::new();
             while current > budget {
                 let (pos, _) = free
@@ -1060,6 +1118,141 @@ mod arena {
             for l in live {
                 unsafe { a.deallocate(l.ptr, l.layout) };
             }
+        }
+
+        /// CONCURRENCY aliasing check (advisor gap: #198's fuzz was single-
+        /// threaded). Drives the PRODUCTION `RpmallocAlloc` under the high-T
+        /// size-aware slab regime (DECODE_THREADS = 16 ⇒ chunk-class blocks
+        /// route through the shared slab free-list) from 8 worker threads
+        /// concurrently, each doing randomized allocate/grow/shrink/deallocate
+        /// of a mix of chunk-class (<= 8 MiB, routed), large (> 8 MiB, not
+        /// routed) and small blocks. Every block carries a UNIQUE
+        /// (thread_id << 40 | seq) tag written to its head; each iteration
+        /// verifies a random block THIS thread still holds live. If the slab
+        /// ever hands the same memory to two LIVE allocations across threads
+        /// (the multimember-corruption / stale-side-table class), one thread's
+        /// tag write clobbers the other's → assert fires. Exercises the global
+        /// `slab_state` mutex, best-fit reuse, evict-on-miss and budget
+        /// eviction under contention. Harness-serial (own note); internally
+        /// parallel — run with `--ignored --test-threads=1`.
+        #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
+        #[test]
+        fn slab_concurrent_alias_stress_high_t() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+
+            // Activate the AUTO size-aware high-T regime for the whole test.
+            set_decode_threads(16);
+
+            let failed = Arc::new(AtomicBool::new(false));
+            let n_threads = 8usize;
+            let mut handles = Vec::new();
+            for tid in 0..n_threads as u64 {
+                let failed = Arc::clone(&failed);
+                handles.push(std::thread::spawn(move || {
+                    let a = RpmallocAlloc;
+                    let mut st = 0x9e3779b97f4a7c15u64 ^ (tid.wrapping_mul(0xd1b54a32d192ed03));
+                    let mut rng = || {
+                        st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        st >> 33
+                    };
+                    struct Live {
+                        ptr: NonNull<u8>,
+                        layout: Layout,
+                        size: usize,
+                        tag: u64,
+                    }
+                    let mut live: Vec<Live> = Vec::new();
+                    let mut seq: u64 = 0;
+                    let tag_of = |tid: u64, seq: u64| (tid << 40) | (seq & ((1 << 40) - 1));
+                    let write_tag = |ptr: NonNull<u8>, tag: u64| unsafe {
+                        std::ptr::write_unaligned(ptr.as_ptr() as *mut u64, tag);
+                    };
+                    let read_tag = |ptr: NonNull<u8>| unsafe {
+                        std::ptr::read_unaligned(ptr.as_ptr() as *const u64)
+                    };
+
+                    for _ in 0..4000 {
+                        if failed.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // Verify a random live block THIS thread owns.
+                        if !live.is_empty() {
+                            let i = (rng() as usize) % live.len();
+                            if read_tag(live[i].ptr) != live[i].tag {
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        match rng() % 4 {
+                            0 => {
+                                // 0/1/2: chunk-class (routed), large (not routed), small
+                                let size = match rng() % 3 {
+                                    0 => (rng() as usize % (8 * 1024 * 1024)) + 8, // <= chunk-class
+                                    1 => (rng() as usize % (24 * 1024 * 1024))
+                                        + (9 * 1024 * 1024), // > 8 MiB large
+                                    _ => (rng() as usize % 8192) + 8,             // small
+                                };
+                                let layout = Layout::from_size_align(size, 16).unwrap();
+                                if let Ok(p) = a.allocate(layout) {
+                                    let ptr = NonNull::new(p.as_ptr() as *mut u8).unwrap();
+                                    assert!(p.len() >= size);
+                                    seq += 1;
+                                    let tag = tag_of(tid, seq);
+                                    write_tag(ptr, tag);
+                                    live.push(Live { ptr, layout, size, tag });
+                                }
+                            }
+                            1 if !live.is_empty() => {
+                                let i = (rng() as usize) % live.len();
+                                let old = &live[i];
+                                let newsize = old.size + (rng() as usize % (4 * 1024 * 1024)) + 1;
+                                let nl = Layout::from_size_align(newsize, 16).unwrap();
+                                if let Ok(p) = unsafe { a.grow(old.ptr, old.layout, nl) } {
+                                    let np = NonNull::new(p.as_ptr() as *mut u8).unwrap();
+                                    if read_tag(np) != old.tag {
+                                        failed.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    let tag = old.tag;
+                                    write_tag(np, tag);
+                                    live[i] = Live { ptr: np, layout: nl, size: newsize, tag };
+                                }
+                            }
+                            2 if !live.is_empty() => {
+                                let i = (rng() as usize) % live.len();
+                                let old = &live[i];
+                                if old.size > 16 {
+                                    let newsize = (rng() as usize % old.size).max(8);
+                                    let nl = Layout::from_size_align(newsize, 16).unwrap();
+                                    if let Ok(p) = unsafe { a.shrink(old.ptr, old.layout, nl) } {
+                                        let np = NonNull::new(p.as_ptr() as *mut u8).unwrap();
+                                        let tag = old.tag;
+                                        write_tag(np, tag);
+                                        live[i] = Live { ptr: np, layout: nl, size: newsize, tag };
+                                    }
+                                }
+                            }
+                            _ if !live.is_empty() => {
+                                let i = (rng() as usize) % live.len();
+                                let l = live.swap_remove(i);
+                                unsafe { a.deallocate(l.ptr, l.layout) };
+                            }
+                            _ => {}
+                        }
+                    }
+                    for l in live {
+                        unsafe { a.deallocate(l.ptr, l.layout) };
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("worker thread panicked (alloc invariant broke)");
+            }
+            assert!(
+                !failed.load(Ordering::Relaxed),
+                "slab handed the same memory to two live allocations across threads (aliasing)"
+            );
         }
     }
 }
