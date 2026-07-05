@@ -365,7 +365,11 @@ pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ce
                                                  // decodes into already-faulted memory (igzip's reused-window fault profile).
                                                  // This tests whether T1 first-touch output faults are recoverable by residency.
     if crate::decompress::parallel::chunk_buffer_pool::resident_output_pool_enabled() {
-        return RESERVE_CAP;
+        // Same value as RESERVE_CAP; the shared constant keeps
+        // `SegmentedU8::ensure_buf`'s first-take capacity and this pin in
+        // lockstep (one source of truth — lever-2b relies on first-take ==
+        // pinned reserve so the buffer's FIRST allocation is already huge).
+        return crate::decompress::parallel::chunk_buffer_pool::RESIDENT_PINNED_CAPACITY;
     }
     let factor = if expansion_ratio_ceil == 0 {
         8 // unknown → historical default
