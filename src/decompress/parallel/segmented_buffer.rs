@@ -175,11 +175,36 @@ impl SegmentedU8 {
     /// Lazily source the backing allocation from the current worker's u8
     /// pool (warm, pre-faulted pages) on first use. No-op once `buf` owns an
     /// allocation; `Vec`'s own amortized `reserve` handles later growth.
+    ///
+    /// Under the T1 resident scope the first take is at the FULL pinned
+    /// capacity (the buffer is about to be reserve-pinned there anyway by
+    /// `compute_initial_reserve`'s resident arm): (a) one fewer realloc+copy
+    /// per chunk, and (b) the buffer's very first allocation is HUGE, so the
+    /// slab gate — and, for tiny decodes, `rpmalloc_alloc::SystemHugeScope` —
+    /// governs its backend: a tiny thin-T1 decode never touches rpmalloc's
+    /// small-allocation path (whose first call triggers rpmalloc process init,
+    /// the measured ~1M-instruction tiny-file tax, #189/#199 lever-2b).
+    /// T>1 workers never have the scope set: their take stays byte-identical.
     #[inline]
     fn ensure_buf(&mut self, min_capacity: usize) {
         if self.buf.capacity() == 0 {
             use crate::decompress::parallel::chunk_buffer_pool;
-            self.buf = chunk_buffer_pool::take_u8(min_capacity.max(ALLOCATION_CHUNK_SIZE));
+            let floor = if chunk_buffer_pool::resident_output_pool_enabled() {
+                // Pinned capacity PLUS one segment: `reserve_clean` asks for the
+                // pinned reserve as ADDITIONAL bytes on top of the ≤32 KiB window
+                // prefix already appended, so the first take must exceed the pin
+                // by at least that margin or the very first reserve GROWS the
+                // buffer — an out-of-place relocation that copies (and faults)
+                // the full just-taken capacity (measured: t80 wall 7→73 ms, RSS
+                // 4.8→69 MB when the margin was missing). With the margin the
+                // per-chunk reserve is a no-op and the pooled buffer is
+                // steady-state for every subsequent chunk, exactly like the
+                // baseline's grown-once buffer.
+                chunk_buffer_pool::RESIDENT_PINNED_CAPACITY + ALLOCATION_CHUNK_SIZE
+            } else {
+                ALLOCATION_CHUNK_SIZE
+            };
+            self.buf = chunk_buffer_pool::take_u8(min_capacity.max(floor));
         }
     }
 

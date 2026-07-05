@@ -191,6 +191,24 @@ fn u16_pools() -> &'static [Mutex<Vec<U16>>] {
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
 }
 
+/// TEST-ONLY: drop every pooled buffer so the next take is a guaranteed pool
+/// MISS (fresh allocation). The latch-interleave test uses this to prove the
+/// per-decode `SystemHugeScope` re-arms on a fresh tiny decode — without it, a
+/// tiny decode after any earlier T1 decode silently (and correctly) reuses the
+/// pooled buffer and allocates nothing at all.
+#[cfg(test)]
+pub fn drain_pools_for_test() {
+    for p in u8_pools() {
+        p.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    for p in u16_pools() {
+        p.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    for p in marker_segment_pools() {
+        p.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 /// Called once per `ThreadPool` worker thread on entry to `worker_main`,
 /// after core pinning and before any decode task runs.
 pub fn bind_worker_pool_index(index: usize) {
@@ -395,6 +413,12 @@ fn env_resident_output_pool() -> bool {
 pub fn resident_output_pool_enabled() -> bool {
     env_resident_output_pool() || t1_resident_scope_active()
 }
+
+/// The fixed capacity every resident-scope output buffer is pinned to (the
+/// `compute_initial_reserve` resident arm and `SegmentedU8::ensure_buf` both
+/// use it — ONE source of truth). Equal to the historical `RESERVE_CAP`
+/// upfront ceiling: virtual reserve only, pages fault as touched.
+pub const RESIDENT_PINNED_CAPACITY: usize = 64 * 1024 * 1024;
 
 /// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).
 /// Decode tasks run on pool workers and record the correct index; trial

@@ -234,6 +234,25 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         }
     };
     let use_thin_t1 = (t1_serial && !use_old_monolith && !use_stream_monolith) || force_thin_oracle;
+    // Tiny-file lever (#189/#199 lever-2b): a tiny thin-T1 decode makes exactly
+    // ONE rpmalloc-backed allocation (its huge chunk-output reserve), and that
+    // allocation triggers rpmalloc process+thread init — pure overhead for a
+    // single-buffer single-thread decode (MEASURED: instr/byte RESOLVED-improved
+    // on 40-400 KiB files, both arches, when the decode runs on the system
+    // allocator). While this RAII scope is alive on THIS thread, new huge
+    // slab-routed allocations are system-backed, so the tiny decode never
+    // initializes rpmalloc. PER-DECODE and thread-local (no process latch, no
+    // cross-decode state): a big decode after a tiny one behaves exactly as if
+    // it were the process's first. Large thin-T1 decodes (> 8 MiB output:
+    // weights, silesia-T1) keep rpmalloc + the resident slab (its measured win);
+    // T>1 workers never enter the scope, so the parallel path is unchanged by
+    // construction. See `rpmalloc_alloc::SystemHugeScope`.
+    const SYSTEM_ALLOC_MAX_OUTPUT: usize = 8 * 1024 * 1024;
+    let _sys_huge_scope = if use_thin_t1 && expected_size <= SYSTEM_ALLOC_MAX_OUTPUT {
+        Some(crate::decompress::parallel::rpmalloc_alloc::SystemHugeScope::enter())
+    } else {
+        None
+    };
     let drive_result = if use_old_monolith {
         chunk_fetcher::drive_monolith_t1(
             deflate_data,

@@ -15,7 +15,7 @@ mod arena {
     use std::ptr::NonNull;
     use std::sync::{Mutex, Once, OnceLock};
 
-    use allocator_api2::alloc::{AllocError, Allocator, Layout};
+    use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 
     /// Stateless rpmalloc-backed allocator (vendor `RpmallocAllocator<T>`).
     ///
@@ -266,7 +266,13 @@ mod arena {
         per_thread_cap: usize,
         ceil: usize,
     ) -> usize {
-        budget_for(decode_threads, largest_block_seen, None, Some(per_thread_cap)).min(ceil)
+        budget_for(
+            decode_threads,
+            largest_block_seen,
+            None,
+            Some(per_thread_cap),
+        )
+        .min(ceil)
     }
 
     fn effective_budget(largest_block_seen: usize) -> usize {
@@ -285,17 +291,92 @@ mod arena {
         }
     }
 
+    /// Which backend owns a live huge block's memory (pointer-keyed side-table
+    /// value). `Rp` = rpmalloc `raw_alloc` (the historical slab block, retained
+    /// on free). `Sys` = `allocator_api2::alloc::Global` (the tiny thin-T1
+    /// per-decode scope, see [`SystemHugeScope`]) — freed straight back to the
+    /// system on dealloc, NEVER retained in the slab free list.
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    enum HugeBackend {
+        Rp,
+        Sys,
+    }
+
     #[derive(Default)]
     struct SlabState {
-        /// resident, currently-free blocks: (ptr, true_block_size, align)
+        /// resident, currently-free blocks: (ptr, true_block_size, align).
+        /// Always rpmalloc-backed (`Sys` blocks are never retained here).
         free: Vec<(usize, usize, usize)>,
-        /// currently-allocated slab blocks: ptr -> (true_block_size, align)
-        live: HashMap<usize, (usize, usize)>,
+        /// currently-allocated slab blocks: ptr -> (true_block_size, align, backend)
+        live: HashMap<usize, (usize, usize, HugeBackend)>,
         /// sum of `true_block_size` for all entries in `free`
         current_free_bytes: usize,
         /// largest `true_block_size` ever seen alive (for auto-budget)
         largest_block_seen: usize,
     }
+
+    // ── Per-decode system-backend scope for huge blocks (tiny-file lever) ─────
+    //
+    // MEASURED (#189/#199 lever-2a gate, Intel+AMD, fulcrum abmeasure N=15,
+    // sha==oracle): a tiny (≤8 MiB output) thin-T1 decode makes exactly ONE
+    // rpmalloc-backed allocation — its huge chunk-output reserve — and that
+    // single allocation triggers rpmalloc process+thread init (~1M instructions,
+    // instr/byte RESOLVED-improved 94.5→81.7 on t80 when removed), which buys
+    // NOTHING for a single-buffer single-thread decode. This scope routes ONLY
+    // that huge allocation to the system allocator (`Global`), so a tiny decode
+    // never initializes rpmalloc at all.
+    //
+    // Mechanism constraints (lever-2b, supervisor directive after the 2a
+    // process-global latch was REVERTED on an AMD-Zen2 silesia-high-T paired
+    // regression):
+    //   - `RpmallocAlloc`'s `allocate`/`deallocate`/`grow`/`shrink` are
+    //     BYTE-IDENTICAL source to baseline — no new atomic load, no new branch.
+    //     The parallel and big-thin-T1 paths are unchanged by construction.
+    //   - The scope check lives ONLY in `SlabAlloc::alloc_huge` — the cold,
+    //     mutex-taking, once-per-huge-block path (at T1 the legacy slab gate
+    //     already routes every huge block here).
+    //   - PER-DECODE, THREAD-LOCAL, RAII (same pattern as
+    //     `chunk_buffer_pool::T1ResidentScope`): no process-global latch, no
+    //     cross-decode state — a big decode after a tiny one (or the reverse)
+    //     behaves exactly as if it were the first decode in the process.
+    //   - Provenance is pointer-keyed in the SAME live side-table the slab
+    //     already uses (`SLAB_EVER_ENGAGED` + `free_if_slab`), tagged with
+    //     [`HugeBackend`]: every block is freed by the backend that allocated
+    //     it, no matter which thread frees it or whether any scope is active —
+    //     the cross-backend-free corruption class is structurally impossible.
+    thread_local! {
+        static SYSTEM_HUGE_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// RAII guard: while alive on this thread, NEW huge slab-routed allocations
+    /// are system-backed (see module comment above). Entered by
+    /// `sm_driver::read_parallel_sm_inner` for tiny thin-T1 decodes only.
+    pub struct SystemHugeScope {
+        prev: bool,
+    }
+
+    impl SystemHugeScope {
+        pub fn enter() -> Self {
+            let prev = SYSTEM_HUGE_SCOPE.with(|c| c.replace(true));
+            Self { prev }
+        }
+    }
+
+    impl Drop for SystemHugeScope {
+        fn drop(&mut self) {
+            SYSTEM_HUGE_SCOPE.with(|c| c.set(self.prev));
+        }
+    }
+
+    #[inline]
+    fn system_huge_scope_active() -> bool {
+        SYSTEM_HUGE_SCOPE.with(|c| c.get())
+    }
+
+    /// Gate-0 non-inert proof: system-backed huge allocations actually served
+    /// (a tiny-decode test asserts this moved; a big-decode test asserts it
+    /// did NOT — the scope must never leak past its RAII guard).
+    pub static SYS_HUGE_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn slab_state() -> &'static Mutex<SlabState> {
         static S: OnceLock<Mutex<SlabState>> = OnceLock::new();
@@ -350,6 +431,26 @@ mod arena {
             let bs = layout.size().div_ceil(gran) * gran;
             let align = layout.align().max(16);
             SLAB_EVER_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
+            // Tiny thin-T1 per-decode scope: back this huge block with the
+            // system allocator so the decode never triggers rpmalloc init (see
+            // the `SystemHugeScope` module comment). Skips the resident free
+            // list entirely (deterministic: a scoped decode neither consumes
+            // nor produces retained rpmalloc blocks); registered pointer-keyed
+            // with the `Sys` tag so dealloc/grow/shrink route by provenance.
+            if system_huge_scope_active() {
+                let sys_layout = Layout::from_size_align(bs, align).map_err(|_| AllocError)?;
+                let p = Global.allocate(sys_layout)?;
+                let addr = p.as_ptr() as *mut u8 as usize;
+                {
+                    let mut s = slab_state().lock().unwrap();
+                    s.live.insert(addr, (bs, align, HugeBackend::Sys));
+                }
+                SYS_HUGE_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(NonNull::slice_from_raw_parts(
+                    unsafe { NonNull::new_unchecked(addr as *mut u8) },
+                    layout.size(),
+                ));
+            }
             {
                 // BEST-FIT-LARGER match (iter-2): serve the SMALLEST resident
                 // block with b >= bs — NO waste bound. Exact-size matching is
@@ -381,7 +482,7 @@ mod arena {
                     SLAB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (p, b, a) = s.free.swap_remove(pos);
                     s.current_free_bytes -= b;
-                    s.live.insert(p, (b, a));
+                    s.live.insert(p, (b, a, HugeBackend::Rp));
                     slab_trace("hit", b, &s);
                     return Ok(NonNull::slice_from_raw_parts(
                         unsafe { NonNull::new_unchecked(p as *mut u8) },
@@ -428,7 +529,7 @@ mod arena {
             }
             {
                 let mut s = slab_state().lock().unwrap();
-                s.live.insert(p as usize, (bs, align));
+                s.live.insert(p as usize, (bs, align, HugeBackend::Rp));
                 slab_trace("miss-fresh", bs, &s);
             }
             Ok(NonNull::slice_from_raw_parts(
@@ -451,7 +552,21 @@ mod arena {
             let key = ptr.as_ptr() as usize;
             let mut s = slab_state().lock().unwrap();
             match s.live.remove(&key) {
-                Some((bs, a)) => {
+                // System-backed block (tiny thin-T1 scope): free straight back
+                // to the system with the EXACT layout it was allocated with.
+                // Never retained (the resident free list is rpmalloc-only) and
+                // never counted into `largest_block_seen` (it must not inflate
+                // the rpmalloc retention budget).
+                Some((bs, a, HugeBackend::Sys)) => {
+                    drop(s);
+                    // Layout was validated at allocation time (from_size_align
+                    // succeeded there with the same rounded bs/align).
+                    let layout = Layout::from_size_align(bs, a)
+                        .expect("stored Sys block layout must be valid");
+                    unsafe { Global.deallocate(ptr, layout) };
+                    true
+                }
+                Some((bs, a, HugeBackend::Rp)) => {
                     if bs > s.largest_block_seen {
                         s.largest_block_seen = bs;
                     }
@@ -495,14 +610,17 @@ mod arena {
             }
         }
 
-        /// True block size of a live slab block, if `ptr` is one.
+        /// True block size of a live slab block, if `ptr` is one. Backend-
+        /// agnostic: in-place grow/shrink reuse is valid for BOTH backends
+        /// (the block stays live and registered; only a real dealloc or an
+        /// out-of-place grow consults the provenance tag via `free_if_slab`).
         fn live_block(&self, ptr: NonNull<u8>) -> Option<(usize, usize)> {
             slab_state()
                 .lock()
                 .unwrap()
                 .live
                 .get(&(ptr.as_ptr() as usize))
-                .copied()
+                .map(|&(bs, a, _)| (bs, a))
         }
     }
 
@@ -723,6 +841,85 @@ mod arena {
         use allocator_api2::alloc::Allocator;
         use std::sync::atomic::Ordering;
 
+        /// SystemHugeScope white-box: a huge allocation made while the scope is
+        /// active must be system-backed (Sys-tagged, counter moves), survive a
+        /// write/read pattern, and free cleanly through the pointer-keyed
+        /// dealloc path EVEN AFTER the scope has ended (provenance is keyed on
+        /// the pointer, never on the current scope). Huge allocations outside
+        /// the scope must stay rpmalloc-backed (counter still).
+        #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
+        #[test]
+        fn system_huge_scope_alloc_free_and_no_leak() {
+            set_decode_threads(1); // legacy T1 regime: every huge block slab-routes
+            let a = RpmallocAlloc;
+            let layout = Layout::from_size_align(5 * 1024 * 1024, 16).unwrap();
+
+            // In scope: system-backed.
+            let before = SYS_HUGE_ALLOCS.load(Ordering::Relaxed);
+            let ptr = {
+                let _scope = SystemHugeScope::enter();
+                let p = a.allocate(layout).unwrap();
+                NonNull::new(p.as_ptr() as *mut u8).unwrap()
+            }; // scope ends BEFORE the free — pointer-keyed provenance must hold
+            assert!(
+                SYS_HUGE_ALLOCS.load(Ordering::Relaxed) > before,
+                "scoped huge allocation did not take the system backend"
+            );
+            // Write/read pattern across the block.
+            unsafe {
+                for off in (0..5 * 1024 * 1024).step_by(4096) {
+                    ptr.as_ptr().add(off).write(0xA5);
+                }
+                for off in (0..5 * 1024 * 1024).step_by(4096) {
+                    assert_eq!(ptr.as_ptr().add(off).read(), 0xA5);
+                }
+            }
+            // Freed through free_if_slab -> Global (a cross-backend free would
+            // corrupt/abort). The block must leave the live table.
+            unsafe { a.deallocate(ptr, layout) };
+            assert!(
+                SlabAlloc.live_block(ptr).is_none(),
+                "Sys block must be removed from the live table on free"
+            );
+
+            // Out of scope: rpmalloc-backed (counter unchanged).
+            let c0 = SYS_HUGE_ALLOCS.load(Ordering::Relaxed);
+            let p2 = a.allocate(layout).unwrap();
+            let ptr2 = NonNull::new(p2.as_ptr() as *mut u8).unwrap();
+            assert_eq!(
+                SYS_HUGE_ALLOCS.load(Ordering::Relaxed),
+                c0,
+                "unscoped huge allocation must not take the system backend"
+            );
+            unsafe { a.deallocate(ptr2, layout) };
+        }
+
+        /// Scope + grow: a Sys block grown past its true size must relocate
+        /// correctly (content preserved) and both old/new blocks free cleanly.
+        #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
+        #[test]
+        fn system_huge_scope_grow_relocates_correctly() {
+            set_decode_threads(1);
+            let a = RpmallocAlloc;
+            let old_l = Layout::from_size_align(4 * 1024 * 1024, 16).unwrap();
+            let new_l = Layout::from_size_align(9 * 1024 * 1024, 16).unwrap();
+            let _scope = SystemHugeScope::enter();
+            let p = a.allocate(old_l).unwrap();
+            let ptr = NonNull::new(p.as_ptr() as *mut u8).unwrap();
+            unsafe {
+                ptr.as_ptr().write(0x5A);
+                ptr.as_ptr().add(4 * 1024 * 1024 - 1).write(0xC3);
+            }
+            let g = unsafe { a.grow(ptr, old_l, new_l) }.unwrap();
+            let gp = NonNull::new(g.as_ptr() as *mut u8).unwrap();
+            unsafe {
+                assert_eq!(gp.as_ptr().read(), 0x5A);
+                assert_eq!(gp.as_ptr().add(4 * 1024 * 1024 - 1).read(), 0xC3);
+            }
+            unsafe { a.deallocate(gp, new_l) };
+            assert!(SlabAlloc.live_block(gp).is_none());
+        }
+
         /// T-boundary truth table for the auto gate + env force overrides.
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
         #[test]
@@ -794,9 +991,12 @@ mod arena {
             let ceil = 16 << 20;
             assert_eq!(capped_budget(16, chunk, cap, ceil), ceil);
             assert_eq!(capped_budget(4, chunk, cap, ceil), ceil); // 4×8=32 → clamp 16
-            // Below the ceiling the per-thread working set is preserved.
+                                                                  // Below the ceiling the per-thread working set is preserved.
             assert_eq!(capped_budget(3, stored, cap, ceil), 3 * stored); // 12 MiB < 16
-            assert_eq!(capped_budget(1, stored, cap, ceil), SLAB_GRANULARITY.max(stored));
+            assert_eq!(
+                capped_budget(1, stored, cap, ceil),
+                SLAB_GRANULARITY.max(stored)
+            );
         }
 
         /// Smallest-first eviction: when the budget forces an eviction, the
@@ -1189,9 +1389,8 @@ mod arena {
                                 // 0/1/2: chunk-class (routed), large (not routed), small
                                 let size = match rng() % 3 {
                                     0 => (rng() as usize % (8 * 1024 * 1024)) + 8, // <= chunk-class
-                                    1 => (rng() as usize % (24 * 1024 * 1024))
-                                        + (9 * 1024 * 1024), // > 8 MiB large
-                                    _ => (rng() as usize % 8192) + 8,             // small
+                                    1 => (rng() as usize % (24 * 1024 * 1024)) + (9 * 1024 * 1024), // > 8 MiB large
+                                    _ => (rng() as usize % 8192) + 8, // small
                                 };
                                 let layout = Layout::from_size_align(size, 16).unwrap();
                                 if let Ok(p) = a.allocate(layout) {
@@ -1200,7 +1399,12 @@ mod arena {
                                     seq += 1;
                                     let tag = tag_of(tid, seq);
                                     write_tag(ptr, tag);
-                                    live.push(Live { ptr, layout, size, tag });
+                                    live.push(Live {
+                                        ptr,
+                                        layout,
+                                        size,
+                                        tag,
+                                    });
                                 }
                             }
                             1 if !live.is_empty() => {
@@ -1216,7 +1420,12 @@ mod arena {
                                     }
                                     let tag = old.tag;
                                     write_tag(np, tag);
-                                    live[i] = Live { ptr: np, layout: nl, size: newsize, tag };
+                                    live[i] = Live {
+                                        ptr: np,
+                                        layout: nl,
+                                        size: newsize,
+                                        tag,
+                                    };
                                 }
                             }
                             2 if !live.is_empty() => {
@@ -1229,7 +1438,12 @@ mod arena {
                                         let np = NonNull::new(p.as_ptr() as *mut u8).unwrap();
                                         let tag = old.tag;
                                         write_tag(np, tag);
-                                        live[i] = Live { ptr: np, layout: nl, size: newsize, tag };
+                                        live[i] = Live {
+                                            ptr: np,
+                                            layout: nl,
+                                            size: newsize,
+                                            tag,
+                                        };
                                     }
                                 }
                             }
@@ -1247,7 +1461,8 @@ mod arena {
                 }));
             }
             for h in handles {
-                h.join().expect("worker thread panicked (alloc invariant broke)");
+                h.join()
+                    .expect("worker thread panicked (alloc invariant broke)");
             }
             assert!(
                 !failed.load(Ordering::Relaxed),
@@ -1267,6 +1482,29 @@ pub use arena::RpmallocAlloc;
 pub use arena::set_decode_threads;
 #[cfg(not(feature = "arena-allocator"))]
 pub fn set_decode_threads(_t: usize) {}
+
+/// Per-decode, thread-local RAII scope: while alive, NEW huge slab-routed
+/// allocations are system-backed (tiny thin-T1 lever — see the module comment
+/// in `arena`). No-op when the arena is compiled out (buffers are already
+/// plain `std::vec::Vec` = system allocator).
+#[cfg(feature = "arena-allocator")]
+pub use arena::SystemHugeScope;
+#[cfg(not(feature = "arena-allocator"))]
+pub struct SystemHugeScope;
+#[cfg(not(feature = "arena-allocator"))]
+impl SystemHugeScope {
+    pub fn enter() -> Self {
+        SystemHugeScope
+    }
+}
+
+/// Gate-0 non-inert proof counter for [`SystemHugeScope`] (always 0 when the
+/// arena is compiled out). Read by the latch-interleave test only.
+#[cfg(feature = "arena-allocator")]
+#[allow(unused_imports)]
+pub use arena::SYS_HUGE_ALLOCS;
+#[cfg(not(feature = "arena-allocator"))]
+pub static SYS_HUGE_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only programmatic slab gate override (see `arena::slab_test_force`):
 /// the T4-vs-T1 diff_ratio guard forces the slab off for both arms so the
