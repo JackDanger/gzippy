@@ -1,0 +1,31 @@
+{
+  "_comment": "DECOMPRESSION finish line. Consumed by proposed `fulcrum scoreboard diff --dominance dominance-spec-decomp.json <artifact.json>`: loads ONE scoreboard-run artifact and checks each expanded cell's recorded verdict against `require`; emits PASS/FAIL/MISSING per cell + nonzero exit on any FAIL/MISSING. Decompression has ONE axis (wall); output bytes are the fixed decoded plaintext, so there is no level_class and no bytes axis here. The finish line = gzippy WIN-or-TIE vs the WHOLE field at every (box x corpus x T).",
+  "dominance_version": 1,
+  "kind": "decompression",
+  "subject": "gzippy-native",
+  "protocol": "fulcrum-scoreboard-v1",
+  "defaults": { "require": "TIE-OR-BETTER", "vs": ["igzip", "libdeflate", "zlibng", "pigz", "rapidgzip"] },
+  "grid": {
+    "_expand": "cells = for each box: box.threads x corpora, applying defaults (require, vs). A comparator whose threads_max==1 is only required to WIN/TIE in T1 cells; at T>1 it is compared as its T1-invariant reference (a user can always fall back to it) unless listed in per_cell overrides.",
+    "corpora": ["silesia", "monorepo", "nasa", "squishyreal", "squishycombined"],
+    "boxes": [
+      { "box": "m1",       "threads": [1, 4, 8],     "vs_note": "arm64: rapidgzip gated OFF (ISA-L absent); vs = [libdeflate, zlibng, pigz] + gzip. igzip likely absent." },
+      { "box": "solvency", "threads": [1, 4, 8, 16], "vs_note": "x86 full field incl igzip/rapidgzip." },
+      { "box": "neurotic", "threads": [1, 4, 7],     "vs_note": "x86 full field incl igzip/rapidgzip." }
+    ]
+  },
+  "single_thread_only_comparators": ["igzip", "libdeflate", "zlibng"],
+  "cells": [
+    { "_comment": "explicit override examples; the rest expand from grid. Per-arch vs overrides:" },
+    { "box": "m1", "corpus": "silesia",         "threads": 1, "require": "TIE-OR-BETTER", "vs": ["libdeflate", "zlibng", "pigz", "gzip"] },
+    { "box": "m1", "corpus": "silesia",         "threads": 4, "require": "TIE-OR-BETTER", "vs": ["libdeflate", "zlibng", "pigz"] },
+    { "box": "m1", "corpus": "silesia",         "threads": 8, "require": "TIE-OR-BETTER", "vs": ["libdeflate", "zlibng", "pigz"] }
+  ],
+  "pass_condition": "all_cells_satisfied",
+  "on_missing_cell": "FAIL",
+  "notes": [
+    "The full expanded set = 5 corpora x (m1:3 + solvency:4 + neurotic:3 = 10 thread-cells) = 50 cells.",
+    "Each cell PASSES iff its recorded scoreboard verdict vs EVERY tool in vs is WIN or TIE (never LOSS/VOID/REFUSED).",
+    "This spec IS the decompression campaign's done-criterion, made checkable: when `diff --dominance` exits 0 against a frozen both-arch artifact, decompression is closed."
+  ]
+}

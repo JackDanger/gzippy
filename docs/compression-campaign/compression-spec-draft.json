@@ -1,0 +1,72 @@
+{
+  "_comment": "DRAFT compression FieldBaseline spec — extends the fulcrum scoreboard/run FieldBaseline shape (examples/first-run-baseline.spec.json) with a SECOND measured axis (compressed output_bytes) and a level-class dimension. Subject COMPRESSES the plaintext corpora; comparators compress the same input; the correctness arm ROUND-TRIPS each output through TWO independent decompressors + RFC-1952 + records output_bytes (exact). Box paths are placeholders — resolve at staging. UNVERIFIED thread caps (igzip -T, bgzip -@) are resolved by the day-1 capability probes before --live. This is one file with a per-box override block; a real run may split per host.",
+  "spec_kind": "compression-baseline",
+  "protocol": "fulcrum-scoreboard-comp-v1",
+  "runid": "compression-baseline-draft",
+  "subject": {
+    "label": "gzippy-native",
+    "bin": "<BENCH_ROOT>/gzippy/target/release/gzippy",
+    "args_tmpl": "-c -{level} -p {t}",
+    "note": "gzippy compresses stdin->stdout; -p {t} threads, -{level} level. ISA-L C0 only where isal_compress::is_available() (x86)."
+  },
+  "axes": {
+    "wall": { "certify": "interleaved-bestN + AA + paired-sign-test + TOST", "sink": "/dev/null" },
+    "bytes": { "certify": "exact-integer", "source": "correctness-arm output size", "no_significance": true }
+  },
+  "canonicalize_metadata": true,
+  "canonicalize_note": "review D8: invoke every tool with mtime=0 and no name/comment (gzip -n and equivalents; gzippy no header info) so header-METADATA bytes are constant across tools. Count full .gz output bytes; structural framing bytes (GZ FEXTRA subfield, multi-member/pipelined headers) ARE counted - they are the real cost of parallel-decodability, i.e. the ratio-vs-speed trade the 2-D verdict prices.",
+  "level_classes": {
+    "_comment": "review D4: NESTED QUALITY-TARGET constraints, not a partition. Each class = target r <= r(anchor) measured per corpus at run time (r=out/in, SMALLER is better). Targets nest C3<=C2<=C1<=C0. A (tool,level) point QUALIFIES for every class whose target it meets. BAND-WIN(class) = a gzippy point is Pareto-best (fastest at-or-below target, none simultaneously smaller AND faster) among all points meeting the target. Anchors validated per corpus (D5): assert r(gzip1)>=r(gzip6)>=r(gzip9)>=r(zopfli); on inversion mark boundary INVALID and merge.",
+    "C0_FASTEST":     { "target_anchor": "gzip:1",  "target": "r <= r(gzip -1)", "gzippy_candidate_levels": [1, 2] },
+    "C1_DEFAULT":     { "target_anchor": "gzip:6",  "target": "r <= r(gzip -6)", "gzippy_candidate_levels": [5, 6] },
+    "C2_MAXDEFLATE":  { "target_anchor": "gzip:9",  "target": "r <= r(gzip -9)", "gzippy_candidate_levels": [9, 10, 11, 12] },
+    "C3_ZOPFLI":      { "target_anchor": "zopfli",  "target": "r <= r(zopfli)",  "gzippy_candidate_levels": [11] }
+  },
+  "comparators": [
+    { "id": "gzip",       "bin": "/usr/bin/gzip",              "args_tmpl": "-c -{level}",           "levels": [1,6,9], "threads_max": 1, "role": "band-anchor+rival" },
+    { "id": "pigz",       "bin": "/usr/bin/pigz",              "args_tmpl": "-c -{level} -p {t}",    "levels": [1,6,9,11], "threads_max": 0, "role": "primary-parallel-rival", "deterministic": true },
+    { "id": "igzip",      "bin": "/usr/bin/igzip",             "args_tmpl": "-c -{level} -T {t}",    "levels": [0,1,2,3], "threads_max": 0, "threads_max_UNVERIFIED": "probe: igzip --help | grep -i thread; if absent set threads_max=1", "role": "C0-rival" },
+    { "id": "libdeflate", "bin": "/usr/bin/libdeflate-gzip",   "args_tmpl": "-{level}",              "levels": [1,6,9,12], "threads_max": 1, "role": "C2-rival-T1" },
+    { "id": "zlibng",     "bin": "/usr/bin/minigzip-ng",       "args_tmpl": "-{level}",              "levels": [1,6,9], "threads_max": 1, "role": "codec-sanity-rival" },
+    { "id": "zopfli",     "bin": "/usr/bin/zopfli",            "args_tmpl": "--gzip -c",             "levels": ["one-point"], "threads_max": 1, "role": "C3-anchor" },
+    { "id": "bgzip",      "bin": "/usr/bin/bgzip",             "args_tmpl": "-c -l {level} -@ {t}",  "levels": [1,6,9], "threads_max": 0, "threads_max_UNVERIFIED": "probe: bgzip --help | grep -E '@|level'; if absent set threads_max=1", "role": "parallel-block-rival" }
+  ],
+  "corpora": [
+    { "id": "silesia",         "path": "<BENCH_ROOT>/corpora/silesia",          "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>", "reference_for_bands": true },
+    { "id": "monorepo",        "path": "<BENCH_ROOT>/corpora/monorepo",         "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>" },
+    { "id": "nasa",            "path": "<BENCH_ROOT>/corpora/nasa",             "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>" },
+    { "id": "squishyreal",     "path": "<BENCH_ROOT>/corpora/squishy_realdata", "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>" },
+    { "id": "squishycombined", "path": "<BENCH_ROOT>/corpora/squishy_combined", "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>" },
+    { "id": "pregz",  "path": "<BENCH_ROOT>/corpora/pregz.in",  "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>", "gen": "gzip -6 silesia > pregz.in", "tests": "recompression/store-detection" },
+    { "id": "zeros",  "path": "<BENCH_ROOT>/corpora/zeros.bin",  "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>", "gen": "head -c 512M /dev/zero > zeros.bin", "tests": "max-ratio/RLE-corner" },
+    { "id": "rand",   "path": "<BENCH_ROOT>/corpora/rand.bin",   "pin_sha256": "<INPUT_SHA>", "input_bytes": "<N>", "gen": "head -c 512M /dev/urandom > rand.bin (pin once)", "tests": "incompressible/store-detection/never-larger-than-input" }
+  ],
+  "oracle": {
+    "roundtrip_decompressors": [
+      { "id": "gzip",       "cmd": "gzip -dc {out}" },
+      { "id": "libdeflate", "cmd": "libdeflate-gunzip -c {out}" }
+    ],
+    "roundtrip_extra_witnesses_for_gz_subfield": [
+      { "id": "gunzip", "cmd": "gunzip -c {out}" },
+      { "id": "zcat",   "cmd": "zcat {out}" },
+      { "id": "pygzip", "cmd": "python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.open(sys.argv[1]).read())' {out}" }
+    ],
+    "roundtrip_pass": "sha256(decoded) == corpus.pin_sha256 for EVERY decompressor",
+    "rfc1952": "magic 1f8b, CM=8, trailer ISIZE == input_len mod 2^32, trailer CRC32 == crc32(input)",
+    "determinism_preflight": { "k": 3, "assert": "sha256(gzippy output) identical across K runs for fixed (input,level,T)", "on_fail": "BLOCK baseline -> R3 determinism decision" }
+  },
+  "boxes": [
+    { "id": "m1",       "platform": "darwin", "cpu": "Apple M1 Pro", "exec": { "local": true }, "threads": [1, 4, 8],
+      "field_note": "arm64: NO ISA-L (gzippy C0 = libdeflate); igzip likely ABSENT -> drop from field (UNVERIFIED). LocalRunner smoke of the full 2-D loop." },
+    { "id": "solvency", "platform": "linux", "cpu": "AMD EPYC 7282", "exec": { "ssh": "ssh -o ConnectTimeout=15 root@10.0.2.240" }, "threads": [1, 4, 8, 16],
+      "quiesce": { "process": "llama-server", "method": "SIGSTOP", "max_block_s": 600 },
+      "field_note": "x86: ISA-L available. Full field incl igzip. LOAD-IMMUNE measure (do NOT pause llama beyond quiesce guard)." },
+    { "id": "neurotic", "platform": "linux", "cpu": "Intel i7-13700", "exec": { "ssh": "ssh -o ConnectTimeout=15 -J neurotic root@10.30.0.199" }, "threads": [1, 4, 7],
+      "core_pool": [2, 4, 8, 10, 12, 14, 0], "freeze_state": "frozen", "quiet_state": "quiet", "governor": "performance", "no_turbo": "1",
+      "field_note": "x86: ISA-L available. Full field incl igzip. 7 independent P-cores." }
+  ],
+  "n": 15,
+  "criteria": { "tie_margin_pct": 1.0, "aa_spread_cap_pct": 3.0, "tie_tost_aa_mult": 2.0 },
+  "src_sha": "<subject git sha at run time>",
+  "required_evidence_additions": ["output_bytes", "input_bytes", "level_class", "ratio", "roundtrip_pass", "rfc1952_pass"]
+}

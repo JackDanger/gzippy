@@ -1,0 +1,46 @@
+{
+  "_comment": "COMPRESSION finish line. Consumed by proposed `fulcrum scoreboard diff --dominance dominance-spec-comp.json <artifact.json>`. Compression has TWO axes (wall + exact bytes); the verdict is 2-D Pareto (see COMPRESSION-CAMPAIGN-DESIGN.md sec1). Two finish tiers: HULL-MEMBER (mandatory floor: gzippy not strictly dominated by any rival) and BAND-WIN (aspirational per level-class). pass_condition BLOCKS on the HULL floor and REPORTS on BAND-WIN so the mandatory bar gates CI while the stretch bar is tracked, not gated.",
+  "dominance_version": 1,
+  "kind": "compression",
+  "subject": "gzippy-native",
+  "protocol": "fulcrum-scoreboard-comp-v1",
+  "level_classes": ["C0_FASTEST", "C1_DEFAULT", "C2_MAXDEFLATE", "C3_ZOPFLI"],
+  "defaults_hull":    { "require": "HULL-MEMBER", "vs": ["*"] },
+  "defaults_bandwin": { "require": "BAND-WIN",    "vs": ["*"] },
+  "grid": {
+    "_expand": "hull cells = for each box: box.threads x corpora x level_classes with require=HULL-MEMBER. bandwin cells = same coordinates with require=BAND-WIN. D6: a class is N/A ONLY when NO tool can meet the target on that corpus; if gzippy CAN meet a target but its measured points don't, the cell FAILS (not skip). gzippy always has a C3 point (L11==zopfli). Rival absence (e.g. igzip absent on m1) shrinks the field, it does not skip a gzippy claim.",
+    "corpora": ["silesia", "monorepo", "nasa", "squishyreal", "squishycombined", "pregz", "zeros", "rand"],
+    "level_classes": ["C0_FASTEST", "C1_DEFAULT", "C2_MAXDEFLATE", "C3_ZOPFLI"],
+    "boxes": [
+      { "box": "m1",       "threads": [1, 4, 8],     "field_note": "arm64: gzippy C0=libdeflate (no ISA-L); igzip likely absent from field." },
+      { "box": "solvency", "threads": [1, 4, 8, 16], "field_note": "x86: gzippy C0=ISA-L; full field incl igzip, bgzip." },
+      { "box": "neurotic", "threads": [1, 4, 7],     "field_note": "x86: gzippy C0=ISA-L; full field incl igzip, bgzip." }
+    ]
+  },
+  "hull_cells_example": [
+    { "box": "solvency", "corpus": "silesia", "threads": 8, "level_class": "C1_DEFAULT",    "require": "HULL-MEMBER", "vs": ["*"] },
+    { "box": "solvency", "corpus": "silesia", "threads": 8, "level_class": "C2_MAXDEFLATE", "require": "HULL-MEMBER", "vs": ["*"] }
+  ],
+  "bandwin_cells_example": [
+    { "box": "solvency", "corpus": "silesia", "threads": 8, "level_class": "C1_DEFAULT", "require": "BAND-WIN", "vs": ["*"] }
+  ],
+  "review_dispositions_applied": "D1 INDETERMINATE verdict (WALL-VOID never collapses to MATCH); D2 WALL-TIE=TOST-equivalent only; D3 FRONTIER semantics (drop strictly-dominated rival points before aggregating; a dominated rival cannot force CONTESTED); D4 nested QUALITY-TARGET classes (r<=r(anchor)); D6 no-gzippy-candidate=FAIL not skip; D7 global hull universe; D8 metadata canonicalized, framing bytes counted.",
+  "verdict_evaluation": {
+    "admissible_frontier": "D3: field frontier = union of all tools' in-scope (wall,bytes) points with strictly-dominated points removed. gzippy is compared only against NON-DOMINATED rival points.",
+    "HULL-MEMBER": "PASS iff gzippy's point is NOT strictly dominated by any point on the GLOBAL field frontier (all tools, all levels, corpus-wide). never LOSS. wall-cert = FASTER/SLOWER/WALL-TIE(TOST)/WALL-VOID; WALL-VOID -> INDETERMINATE (re-measure), not PASS.",
+    "BAND-WIN": "D4: PASS iff among ALL (tool,level) points meeting the class target r<=r(anchor), a gzippy point is Pareto-best (fastest at-or-below target, no admissible rival simultaneously smaller AND faster)."
+  },
+  "pass_condition": {
+    "block_on": "all HULL-MEMBER cells PASS (INDETERMINATE blocks -> re-measure, does not pass)",
+    "report_only": "BAND-WIN cells (tracked in render, non-blocking)",
+    "on_missing_hull_cell": "FAIL",
+    "on_gzippy_absent_but_target_achievable": "FAIL (D6: INELIGIBLE is a failed claim, not a skip)",
+    "on_target_unachievable_by_any_tool": "N/A (recorded with reason)"
+  },
+  "notes": [
+    "HULL floor = gzippy is never a strictly-worse choice than any rival (never both slower AND larger). This is the achievable 2-D finish line.",
+    "BAND-WIN stretch = at gzippy's ratio it is the fastest AND nothing is simultaneously smaller+faster. VoI-ordered, never dropped (infinite-funding rule).",
+    "The BYTES axis is EXACT (integer output_bytes); only the WALL axis carries A/A+TOST significance. A 0.1%-larger output is a byte LOSS regardless of a wall tie -> that is what turns a naive speed-win into a CONTESTED cell.",
+    "C3_ZOPFLI additionally asserts gzippy L11 output sha256 == C-zopfli output (bit-identity, zopfli.rs:1-14) as a deterministic pass/fail on the bytes axis."
+  ]
+}
