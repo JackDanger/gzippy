@@ -2411,6 +2411,80 @@ fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
     Some(members)
 }
 
+/// GZ coverage walk: hop member-to-member via the "GZ" FEXTRA subfield's
+/// whole-member size and report whether EVERY member carries the subfield AND
+/// the walk ends exactly at the end of `data`. Only meaningful once
+/// [`crate::decompress::format::has_bgzf_markers`] has fired on member 1.
+///
+/// A pure gzippy-parallel file walks cleanly to `data.len()` → the GZ fast path
+/// ([`decompress_bgzf_parallel`]) is safe. A mixed concatenation (a plain member
+/// lacking the subfield, or a walk that over/undershoots the file end) returns
+/// `false` so the classifier routes the whole file to the cross-member chunked
+/// path deterministically at classify time — never an in-body fallback. [R2-#3]
+pub(crate) fn gz_coverage_is_pure(data: &[u8]) -> bool {
+    let mut offset = 0usize;
+    let mut members = 0usize;
+    // Bound the walk so a hostile size field cannot loop forever; a real
+    // gzippy-parallel file has one member per block (≤ millions, but each step
+    // advances by ≥ 1 header so the file length already bounds it).
+    while offset + 12 <= data.len() {
+        if data[offset] != 0x1f || data[offset + 1] != 0x8b || data[offset + 2] != 0x08 {
+            return false;
+        }
+        // FEXTRA must be present for a GZ member.
+        if data[offset + 3] & 0x04 == 0 {
+            return false;
+        }
+        let member_len = match gz_member_len(data, offset) {
+            Some(l) if l >= 18 => l,
+            _ => return false,
+        };
+        offset = match offset.checked_add(member_len) {
+            Some(o) if o <= data.len() => o,
+            _ => return false,
+        };
+        members += 1;
+    }
+    members >= 1 && offset == data.len()
+}
+
+/// Parse the "GZ" FEXTRA subfield's whole-member compressed length at `start`.
+/// Mirrors the size decode in the BGZF block scan (bgzf.rs:315-351): 4-byte
+/// form = whole-member size, legacy 2-byte form = BSIZE-1. Returns `None` when
+/// the member lacks the subfield or the header is truncated.
+fn gz_member_len(data: &[u8], start: usize) -> Option<usize> {
+    if start + 12 > data.len() {
+        return None;
+    }
+    let xlen = u16::from_le_bytes([data[start + 10], data[start + 11]]) as usize;
+    if start + 12 + xlen > data.len() {
+        return None;
+    }
+    let extra = &data[start + 12..start + 12 + xlen];
+    let mut pos = 0;
+    while pos + 4 <= extra.len() {
+        let id = &extra[pos..pos + 2];
+        let sublen = u16::from_le_bytes([extra[pos + 2], extra[pos + 3]]) as usize;
+        if id == b"GZ" {
+            if sublen == 4 && pos + 8 <= extra.len() {
+                let size = u32::from_le_bytes([
+                    extra[pos + 4],
+                    extra[pos + 5],
+                    extra[pos + 6],
+                    extra[pos + 7],
+                ]) as usize;
+                return if size > 0 { Some(size) } else { None };
+            } else if sublen == 2 && pos + 6 <= extra.len() {
+                let size_minus_1 = u16::from_le_bytes([extra[pos + 4], extra[pos + 5]]) as usize;
+                return Some(size_minus_1 + 1);
+            }
+            return None;
+        }
+        pos += 4 + sublen;
+    }
+    None
+}
+
 /// Zero-copy parallel decompression for multi-member gzip files.
 ///
 /// Uses the same approach as BGZF parallel: pre-allocate output, write directly

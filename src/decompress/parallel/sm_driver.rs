@@ -385,6 +385,48 @@ impl<W: std::io::Write> std::io::Write for SkipWriter<'_, W> {
     }
 }
 
+/// Counts production `MultiMemberChunked` decodes (a whole-file member walk,
+/// each member inflated by the full within-member parallel engine). Deletion-trap
+/// discipline (mirror of `single_member::MARKER_PIPELINE_RUNS`): a routing test
+/// asserts this advances on a multi-member CLI-shaped decode and stays 0 on the
+/// single-member corpus.
+#[cfg(parallel_sm)]
+pub static MULTI_MEMBER_PIPELINE_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Production entry for [`crate::decompress::DecodePath::MultiMemberChunked`]:
+/// decode a multi-member gzip stream by walking each member and inflating it
+/// with the full within-member parallel single-member engine, streaming output
+/// in member order. Byte-exact and per-member CRC32 + ISIZE verified (each
+/// member is decoded by [`read_parallel_sm`], which parses and checks that
+/// member's own trailer). Trailing garbage after a valid member boundary ends
+/// the walk cleanly (matching gzip(1) and the sequential path). Shares its
+/// implementation with the misroute re-entry ([`read_parallel_sm_resume_multi`])
+/// started at offset 0 — the `SkipWriter` drops 0 bytes on this fresh entry.
+///
+/// Routed only for MIXED "GZ" ++ plain concatenations (the deterministic route
+/// that the BGZF fast path would truncate), NOT for plain dominant/few-member
+/// distributions — the member-walk was measured to REGRESS those on M1 (see
+/// `DecodePath::MultiMemberChunked` docs). It is a member-walk, NOT the
+/// rapidgzip-faithful whole-file-block-finder cross-member continuation (the
+/// gate-phase core).
+#[cfg(parallel_sm)]
+pub fn read_parallel_sm_multi<W: std::io::Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    parallelization: usize,
+    target_compressed_chunk_bytes: usize,
+) -> Result<ReadResult, ReadParallelSmError> {
+    MULTI_MEMBER_PIPELINE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    read_parallel_sm_resume_multi(
+        gzip_data,
+        writer,
+        0,
+        parallelization,
+        target_compressed_chunk_bytes,
+    )
+}
+
 /// Decode a possibly-multi-member gzip stream, RESUMING past `already_written`
 /// output bytes already streamed by a failed single-member attempt.
 ///

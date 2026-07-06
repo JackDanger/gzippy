@@ -28,6 +28,21 @@
 //! | `crc32`                | `gzip/crc32.hpp`                              |
 //! | `thread_pool`          | `ThreadPool`                                  |
 //! | `instruments/*`        | NONE — campaign measurement instruments (env-gated, byte-transparent) |
+//!
+//! ## Multi-member routing (2026-07-05)
+//!
+//! [`crate::decompress::DecodePath::MultiMemberChunked`] →
+//! [`sm_driver::read_parallel_sm_multi`] walks each member and inflates it with
+//! the full within-member parallel engine (per-member CRC32 + ISIZE verified). It
+//! is the deterministic route for MIXED "GZ" ++ plain concatenations
+//! ([`crate::decompress::bgzf::gz_coverage_is_pure`]), which the BGZF fast path
+//! would truncate. Plain dominant/few-member distributions stay on the
+//! member-per-worker split (`MultiMemberPar`): routing them to this member-walk
+//! was MEASURED to REGRESS on M1 (per-member pipeline spinup + thread
+//! oversubscription at high T). The located dominant-member plateau needs the
+//! rapidgzip-faithful whole-file-block-finder cross-member port (one pool, one
+//! chunk grid spanning members, vendor `GzipChunk.hpp:468-654`) — the gate-phase
+//! core (see `scratchpad/MM-PARALLELSM-DESIGN.md`).
 
 #[cfg(parallel_sm)]
 pub mod apply_window;

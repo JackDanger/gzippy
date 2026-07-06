@@ -679,6 +679,15 @@ pub static ADJUSTED_CHUNK_SIZE_APPLIED: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)] // incremented by the x86_64+isal-compression decompress_parallel path; read by tests
 pub(crate) static MARKER_PIPELINE_RUNS: AtomicU64 = AtomicU64::new(0);
 
+/// Deletion-trap counter for the FALSE-SINGLE late-detection re-entry
+/// (§1.4 / R2-#1): a stream the classifier called single-member that actually
+/// carries a trailing member (empty-first member, or first member compressed
+/// past the 16 MiB detection window) errors at member 1's boundary and re-enters
+/// the multi-member driver. A routing test asserts this FIRES on the
+/// detection-evading fixtures and stays 0 across the single-member corpus.
+#[allow(dead_code)] // incremented on the misroute path; read by tests
+pub(crate) static MISROUTE_REENTRY_APPLIED: AtomicU64 = AtomicU64::new(0);
+
 /// Mutex serializing routing tests that snapshot `MARKER_PIPELINE_RUNS`
 /// against each other. Without this, `cargo test`'s default parallel
 /// execution can mask a real silent-fallback regression with a false
@@ -852,6 +861,7 @@ pub fn decompress_parallel<W: Write>(
                         | ReadParallelSmError::CrcMismatch { .. }
                 );
                 if resumable && trailing_member_after_first(gzip_data) {
+                    MISROUTE_REENTRY_APPLIED.fetch_add(1, Ordering::Relaxed);
                     if debug_enabled() {
                         eprintln!(
                             "[parallel_sm] single-member decode failed at multi-member \
@@ -919,6 +929,41 @@ pub fn decompress_parallel<W: Write>(
         let _ = (writer, out_fd, t0, _deflate_data_len);
         Err(ParallelError::UnsupportedPlatform)
     }
+}
+
+/// Production entry for [`crate::decompress::DecodePath::MultiMemberChunked`].
+/// Walks each member and inflates it with the full within-member parallel
+/// engine, streaming output in member order (per-member CRC32 + ISIZE verified,
+/// pure-Rust, no C-FFI). Routed for MIXED "GZ" ++ plain concatenations (see the
+/// `DecodePath::MultiMemberChunked` docs for why it is not used for plain
+/// dominant/few-member distributions).
+#[cfg(parallel_sm)]
+pub fn decompress_multi_member_chunked<W: Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> Result<u64, ParallelError> {
+    use crate::decompress::parallel::sm_driver::{read_parallel_sm_multi, ReadParallelSmError};
+
+    if gzip_data.len() < 18 || gzip_data[0] != 0x1f || gzip_data[1] != 0x8b {
+        return Err(ParallelError::InvalidGzipFormat);
+    }
+    let num_threads = num_threads.max(1);
+    let chunk_size =
+        adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
+    let r = read_parallel_sm_multi(gzip_data, writer, num_threads, chunk_size).map_err(
+        |e| match e {
+            ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+            ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+            ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
+            ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+            ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+        },
+    )?;
+    writer
+        .flush()
+        .map_err(|_| ParallelError::InvalidGzipFormat)?;
+    Ok(r.total_size as u64)
 }
 
 // ── Error type ───────────────────────────────────────────────────────────────

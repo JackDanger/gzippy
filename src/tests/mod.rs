@@ -19,6 +19,7 @@ pub mod inflate_fuzz_loop;
 pub mod inflate_oracle;
 pub mod inflate_proptest;
 pub mod latch_interleave;
+pub mod multi_member_chunked;
 pub mod phantom_eos_probe;
 pub mod pure_rust_inflate_corpus;
 pub mod resumable_correctness;

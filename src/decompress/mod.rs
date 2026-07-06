@@ -65,6 +65,21 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 pub enum DecodePath {
     GzippyParallel,
     MultiMemberPar,
+    /// Cross-member-capable path: each member is inflated by the full
+    /// within-member parallel single-member engine and streamed in member order
+    /// (pure-Rust, per-member CRC32 + ISIZE verified). Used as the DETERMINISTIC
+    /// upfront route for a MIXED concatenation (a "GZ" first member followed by a
+    /// plain member — see [`crate::decompress::bgzf::gz_coverage_is_pure`]), which
+    /// the BGZF fast path would truncate. See
+    /// [`crate::decompress::parallel::single_member::decompress_multi_member_chunked`].
+    ///
+    /// NOTE (2026-07-05): this reuses the per-member parallel engine (member walk).
+    /// It is NOT routed for plain dominant/few-member distributions: that was
+    /// MEASURED to REGRESS on M1 (per-member pipeline spinup + thread
+    /// oversubscription at high T). The located dominant-member plateau needs the
+    /// rapidgzip-faithful whole-file-block-finder cross-member port, not this
+    /// member-walk shortcut — see the gate-phase plan.
+    MultiMemberChunked,
     MultiMemberSeq,
     ParallelSM,
     /// Stored-block-dominated (incompressible) single-member, decoded in
@@ -133,9 +148,30 @@ fn parallel_sm_unprofitable(data: &[u8]) -> bool {
 /// dispatch on the result.
 pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     if has_bgzf_markers(data) {
+        // A first-member "GZ" FEXTRA hit means gzippy's own parallel format —
+        // UNLESS the file is a mixed concatenation (GZ members ++ a plain gzip
+        // member, or vice-versa). The GZ fast path (`decompress_bgzf_parallel`)
+        // assumes EVERY member carries the subfield; a plain member past the
+        // first would desync it. A member-to-member coverage walk over the GZ
+        // subfield's whole-member size decides deterministically at classify
+        // time (no in-body fallback): pure-GZ (every member carries GZ AND the
+        // walk ends exactly at file end) → GzippyParallel (unchanged); any
+        // shortfall → the cross-member-capable chunked path. [R2-#3]
+        if !crate::decompress::bgzf::gz_coverage_is_pure(data) {
+            return DecodePath::MultiMemberChunked;
+        }
         return DecodePath::GzippyParallel;
     }
     if is_likely_multi_member(data) {
+        // Plain multi-member streams keep the member-per-worker split
+        // ([`MultiMemberPar`]) at T>1 / sequential at T1. NOTE (2026-07-05):
+        // routing dominant/few-member distributions to the within-member
+        // parallel chunked path was MEASURED to REGRESS on M1 (the member-walk
+        // spins a full pipeline per member and oversubscribes threads at high T;
+        // few-large T8 156ms chunked vs 45ms member-per-worker). The located
+        // dominant-member plateau needs the rapidgzip-faithful whole-file
+        // block-finder cross-member port (one pool, one chunk grid spanning
+        // members), not the member-walk shortcut — see the gate-phase plan.
         return if num_threads > 1 {
             DecodePath::MultiMemberPar
         } else {
@@ -238,10 +274,40 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
                 Err(_) => decompress_multi_member_sequential(data, writer),
             }
         }
+        DecodePath::MultiMemberChunked => {
+            decompress_multi_member_chunked(data, writer, num_threads)
+        }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
             decompress_single_member_for(path, data, writer, None, num_threads)
         }
+    }
+}
+
+/// Dispatch a [`DecodePath::MultiMemberChunked`] stream: each member is inflated
+/// by the full within-member parallel single-member engine, streamed in member
+/// order (per-member CRC32 + ISIZE verified). Pure-Rust; no C-FFI. On the
+/// non-`parallel_sm` legacy build the engine is unavailable, so this decodes
+/// sequentially member-by-member (still correct, just not within-member
+/// parallel) — same as [`decompress_multi_member_sequential`].
+fn decompress_multi_member_chunked<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    #[cfg(parallel_sm)]
+    {
+        crate::decompress::parallel::single_member::decompress_multi_member_chunked(
+            data,
+            writer,
+            num_threads.max(1),
+        )
+        .map_err(|e| GzippyError::decompression(format!("multi-member chunked: {e}")))
+    }
+    #[cfg(not(parallel_sm))]
+    {
+        let _ = num_threads;
+        decompress_multi_member_sequential(data, writer)
     }
 }
 
@@ -263,6 +329,9 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
         );
     }
     match path {
+        DecodePath::MultiMemberChunked => {
+            decompress_multi_member_chunked(data, writer, num_threads)
+        }
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
         }
@@ -287,10 +356,17 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
         return Ok(Vec::new());
     }
     if has_bgzf_markers(data) {
-        return Ok(crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(
-            data,
-            num_threads,
-        )?);
+        if crate::decompress::bgzf::gz_coverage_is_pure(data) {
+            return Ok(crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(
+                data,
+                num_threads,
+            )?);
+        }
+        // Mixed "GZ" ++ plain concatenation: the deterministic chunked route
+        // (matches `classify_gzip`). The BGZF fast path would truncate it.
+        let mut out = Vec::new();
+        decompress_multi_member_chunked(data, &mut out, num_threads)?;
+        return Ok(out);
     }
     if num_threads > 1 && is_likely_multi_member(data) {
         match crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads) {
@@ -337,6 +413,9 @@ pub(crate) fn decompress_single_member<W: Write>(
         // `decompress_single_member_for`, which rejects non-single-member
         // paths -> empty output / terminal error. Caught by the multi-member
         // `-p1` audit: `cat a.gz a.gz | gzippy -d -p1` produced 0 bytes.)
+        DecodePath::MultiMemberChunked => {
+            decompress_multi_member_chunked(data, writer, num_threads)
+        }
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
         }
