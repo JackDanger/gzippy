@@ -2,12 +2,13 @@
 //!
 //! WHY (campaign): `effective_parallel_threads`
 //! (`src/decompress/parallel/single_member.rs`) is a PURE thread-count selector
-//! with FIVE decision dimensions —
-//!   1. the hard ratio cap (`GZIPPY_PARALLEL_RATIO_MAX`, default 8),
-//!   2. the serial-clean crossover margin (`GZIPPY_PARALLEL_CROSSOVER_MARGIN`),
-//!   3. the small-output serial FLOOR (`GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`, 8 MiB),
-//!   4. the large-output notch bonus (`GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES/NOTCH`),
-//!   5. the small-file chunk-size adjustment (min-work-per-thread,
+//! with FOUR decision dimensions —
+//!   1. the serial-clean crossover margin (`GZIPPY_PARALLEL_CROSSOVER_MARGIN`)
+//!      (also the sole owner of high-ratio routing since the T-blind hard ratio
+//!      cap `GZIPPY_PARALLEL_RATIO_MAX` was deleted, 2026-07-05),
+//!   2. the small-output serial FLOOR (`GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`, 8 MiB),
+//!   3. the large-output notch bonus (`GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES/NOTCH`),
+//!   4. the small-file chunk-size adjustment (min-work-per-thread,
 //!      `adjusted_chunk_size_bytes`).
 //! Each is BYTE-TRANSPARENT by construction — it may only change the thread
 //! count / chunk granularity, never the decoded bytes. But the existing
@@ -43,18 +44,19 @@ mod tests {
 
     use crate::decompress::parallel::single_member::{
         effective_parallel_threads, skip_gzip_header, ADJUSTED_CHUNK_SIZE_APPLIED,
-        COMPRESSIBILITY_THREAD_CAP_APPLIED, MARKER_PIPELINE_RUNS, MARKER_PIPELINE_TEST_LOCK,
-        SERIAL_CLEAN_FLOOR_APPLIED, SMALL_OUTPUT_SERIAL_FLOOR_APPLIED,
+        MARKER_PIPELINE_RUNS, MARKER_PIPELINE_TEST_LOCK, SERIAL_CLEAN_FLOOR_APPLIED,
+        SMALL_OUTPUT_SERIAL_FLOOR_APPLIED,
     };
 
-    // ── Selector env knobs (the five dimensions) ──────────────────────────────
-    const E_RATIO_MAX: &str = "GZIPPY_PARALLEL_RATIO_MAX";
+    // ── Selector env knobs (the four dimensions) ──────────────────────────────
+    // (the fifth, `GZIPPY_PARALLEL_RATIO_MAX`, was deleted with the T-blind hard
+    // ratio cap on 2026-07-05 — the crossover selector owns high-ratio routing)
     const E_MARGIN: &str = "GZIPPY_PARALLEL_CROSSOVER_MARGIN";
     const E_MIN_OUT: &str = "GZIPPY_PARALLEL_MIN_OUTPUT_BYTES";
     const E_LARGE_OUT: &str = "GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES";
     const E_NOTCH: &str = "GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH";
 
-    const ALL_SELECTOR_ENV: &[&str] = &[E_RATIO_MAX, E_MARGIN, E_MIN_OUT, E_LARGE_OUT, E_NOTCH];
+    const ALL_SELECTOR_ENV: &[&str] = &[E_MARGIN, E_MIN_OUT, E_LARGE_OUT, E_NOTCH];
 
     fn clear_selector_env() {
         for k in ALL_SELECTOR_ENV {
@@ -206,18 +208,14 @@ mod tests {
         },
         Cfg {
             label: "forced-parallel",
-            env: &[(E_RATIO_MAX, "0"), (E_MARGIN, "0"), (E_MIN_OUT, "0")],
+            env: &[(E_MARGIN, "0"), (E_MIN_OUT, "0")],
         },
         Cfg {
             label: "forced-serial",
             // Huge crossover margin ⇒ crossover = ceil(ratio · 1e6) > any T ⇒
-            // serial even for near-incompressible streams; ratio_max=1 and a huge
-            // floor are belt-and-suspenders.
-            env: &[
-                (E_MARGIN, "1000000"),
-                (E_RATIO_MAX, "1"),
-                (E_MIN_OUT, "17179869184"),
-            ],
+            // serial even for near-incompressible streams; the huge floor is
+            // belt-and-suspenders.
+            env: &[(E_MARGIN, "1000000"), (E_MIN_OUT, "17179869184")],
         },
     ];
 
@@ -411,30 +409,48 @@ mod tests {
         );
 
         // ============================================================
-        // 2. RATIO CAP (>= 8×) — direct decision (floor disabled to isolate).
+        // 2. HIGH-RATIO ROUTING (blind cap deleted on x86_64, 2026-07-05).
+        //    x86_64: routing is the T-aware crossover's decision alone — ratio 10
+        //    at T8 (below its crossover 10) routes serial VIA THE SELECTOR
+        //    (counter proves it); the same stream at T16 (>= crossover)
+        //    parallelizes — impossible under the old blind cap.
+        //    aarch64: the prestack cap remains (selector disabled there; cap
+        //    removal regresses M1 2.1-2.6× — see single_member.rs) → serial at
+        //    both T8 and T16.
         // ============================================================
         clear_selector_env();
         std::env::set_var(E_MIN_OUT, "0"); // disable floor
-        std::env::set_var(E_MARGIN, "1.0"); // arch-independent pin
-        let before_cap = COMPRESSIBILITY_THREAD_CAP_APPLIED.load(Ordering::Relaxed);
-        // isize 10 MiB, deflate 1 MiB ⇒ ratio 10 ≥ 8 ⇒ cap fires.
-        let cap_blob = blob_with_isize(10 * MIB as u32);
+        std::env::set_var(E_MARGIN, "1.0"); // vendor-independent pin
+        let hr_blob = blob_with_isize(10 * MIB as u32);
         assert_eq!(
-            effective_parallel_threads(&cap_blob, MIB, 8),
+            effective_parallel_threads(&hr_blob, MIB, 8),
             1,
-            "cap: ratio 10 >= 8 must cap to serial"
+            "ratio 10 at T8 (below crossover 10) routes serial"
         );
-        // Just below the cap (ratio ~7.9) must NOT cap.
-        let uncap_blob = blob_with_isize((79 * MIB / 10) as u32);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let before_xover = SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed);
+            assert_eq!(
+                effective_parallel_threads(&hr_blob, MIB, 8),
+                1,
+                "x86: selector (not a cap) serializes below crossover"
+            );
+            assert_eq!(
+                effective_parallel_threads(&hr_blob, MIB, 16),
+                16,
+                "x86: ratio 10 at T16 (>= crossover 10) must parallelize — no blind cap"
+            );
+            let after_xover = SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed);
+            assert!(
+                after_xover > before_xover,
+                "SELECTOR PATH NOT HIT: SERIAL_CLEAN_FLOOR_APPLIED {before_xover}->{after_xover}"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
         assert_eq!(
-            effective_parallel_threads(&uncap_blob, MIB, 8),
-            8,
-            "cap: ratio 7.9 < 8 must keep threads"
-        );
-        let after_cap = COMPRESSIBILITY_THREAD_CAP_APPLIED.load(Ordering::Relaxed);
-        assert!(
-            after_cap > before_cap,
-            "RATIO-CAP PATH NOT HIT: COMPRESSIBILITY_THREAD_CAP_APPLIED {before_cap}->{after_cap}"
+            effective_parallel_threads(&hr_blob, MIB, 16),
+            1,
+            "aarch64: prestack cap serializes ratio >= 8 at every T"
         );
 
         // ============================================================
@@ -508,7 +524,6 @@ mod tests {
         // ============================================================
         clear_selector_env();
         std::env::set_var(E_MARGIN, "0"); // keep it parallel (skip the crossover)
-        std::env::set_var(E_RATIO_MAX, "0"); // and the ratio cap does not pre-empt
         let before_adj = ADJUSTED_CHUNK_SIZE_APPLIED.load(Ordering::Relaxed);
         // 12 MiB out at T=16: 4 MiB default × 2 × 16 ≫ fileSize ⇒ shrink fires.
         let mut sink2 = Vec::with_capacity(notch_p.len());

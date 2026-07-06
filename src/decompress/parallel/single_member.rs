@@ -257,12 +257,6 @@ pub(crate) fn t1_output_resident_chunk(gzip_data: &[u8], deflate_data_len: usize
     )
 }
 
-/// Default ISIZE/deflate ratio at or above which the parallel single-member
-/// pipeline is capped to one thread (the fast inline T1 path). Override with
-/// `GZIPPY_PARALLEL_RATIO_MAX` (used to lock this constant from a gate-hardware
-/// sweep). Rationale + measurements in [`effective_parallel_threads`].
-const PARALLEL_RATIO_MAX_DEFAULT: u64 = 8;
-
 /// Default crossover-margin multiplier for the serial-clean cost-model selector
 /// (see [`effective_parallel_threads`]). The predicted parallel work-inflation
 /// W ≈ ISIZE/deflate ratio; parallel only repays at `T >= ceil(W * margin)`.
@@ -398,8 +392,10 @@ pub(crate) fn cpu_is_amd() -> bool {
 /// where the prestack always-parallel-below-ratio_max routing ran parallel —
 /// measured REGRESSION (fulcrum wall --steady, M1, silesia T2 +5.7% / T3 +1.2%
 /// vs reimplement-isa-l@e1f0c99d). Return margin 0.0 to DISABLE the cost-model
-/// selector on aarch64, restoring EXACTLY the prestack routing (the hard
-/// ISIZE-ratio cap above still fires for high-ratio corpora like logs). The
+/// selector on aarch64, restoring the prestack routing (whose high-ratio
+/// serialization is the aarch64-only [`AARCH64_PRESTACK_RATIO_MAX`] cap in
+/// [`effective_parallel_threads`] — removing that cap regresses M1 2.1-2.6× on
+/// logs/software-class at T2, paired N=15). The
 /// `GZIPPY_PARALLEL_CROSSOVER_MARGIN` env override still takes precedence. x86_64
 /// codegen is byte-identical (this branch compiles out off-aarch64).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
@@ -430,15 +426,24 @@ fn arch_large_output_notch_default() -> u64 {
 }
 
 /// Counter proving the serial-clean cost-model selector fired on a real decode
-/// (deletion-trap discipline; read by the routing test). Distinct from the hard
-/// ratio cap so the two effects can be told apart in a trace.
+/// (deletion-trap discipline; read by the routing test).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub static SERIAL_CLEAN_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
 
-/// Counter proving the compressibility thread-cap fired on a real decode
-/// (deletion-trap discipline; read by the routing test).
-#[cfg_attr(not(parallel_sm), allow(dead_code))]
-pub static COMPRESSIBILITY_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
+/// aarch64-only prestack ISIZE-ratio cap (see the block comment in
+/// [`effective_parallel_threads`]): with the cost-model selector disabled on
+/// aarch64 (margin 0.0), this cap is the arch's ONLY high-ratio serialization,
+/// and removing it measurably regresses Apple M1 (logs-class T2 2.11×,
+/// software-class T2 2.62×; paired N=15, 0-1/15 wins). x86_64 deletes the cap
+/// entirely (the T-aware selector owns high-ratio routing there — gated wins on
+/// nasa/bignasa/logs-class T16, both x86 boxes). Knob-free: no env override.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_PRESTACK_RATIO_MAX: u64 = 8;
+
+/// Counter proving the aarch64 prestack cap fired on a real decode
+/// (deletion-trap discipline).
+#[cfg(target_arch = "aarch64")]
+pub static AARCH64_PRESTACK_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 /// Counter proving the small-output serial floor (the all-marker-blowup guard,
 /// see [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`]) fired on a real decode
@@ -465,22 +470,27 @@ pub static WORK_PER_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 /// A/B baseline). Env override: `GZIPPY_MIN_BYTES_PER_THREAD`.
 const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
 
-/// Compressibility-gated effective thread count for the parallel single-member
-/// pipeline.
-///
-/// The pipeline's per-chunk marker-resolution + window-application cost scales
-/// with OUTPUT bytes, while the parallelizable decode work scales with
-/// COMPRESSED bytes. On a highly-compressible single-member stream (high
-/// ISIZE/deflate ratio) the output-proportional overhead overwhelms the
-/// parallel speedup, so Tmax REGRESSES below T1. Measured (gzippy-vs-itself,
-/// /dev/null, interleaved; crossover transfers across arch):
-///   silesia  ratio 2.75x → p8 = 1.94x of T1   (parallel HELPS)
-///   logs     ratio 15.2x → p8 = 0.61x of T1   (parallel HURTS — even p2 = 0.59x)
-///   software ratio 29.8x → p8 = 0.51x of T1   (parallel HURTS)
-/// So when the ratio is at/above the crossover, cap to ONE thread — the inline
-/// T1 path — guaranteeing Tmax is never slower than T1. ISIZE wrap (>4 GiB
-/// output) or near-incompressible (isize<deflate) yields a low/!computable
-/// ratio → keep the requested threads (parallel is correct there).
+/// Content-derived effective thread count for the parallel single-member
+/// pipeline. Three guards, in order (each byte-transparent — only the thread
+/// count changes; CRC32 + ISIZE are still verified by the caller):
+///   1. SMALL-OUTPUT SERIAL FLOOR — small compressible streams (markup.xml)
+///      degenerate to an all-marker re-decode; below the floor there is no real
+///      parallel win to forfeit. See [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`].
+///   2. SERIAL-CLEAN COST-MODEL SELECTOR — the T-aware crossover
+///      `T >= ceil(ratio × margin)`: below it the parallel pipeline's
+///      OUTPUT-proportional overhead (marker resolution + apply_window +
+///      per-chunk scaffold ≈ ratio× more total work than serial-clean) is not
+///      repaid, so route serial; at/above it, parallel. High-ratio streams get
+///      proportionally high crossovers (silesia 3.1 → T3, nasa 9.9 → T10-14,
+///      software 29.8 → ≥30 i.e. serial at every practical T), which is what
+///      protects the extreme-ratio corpora now that the former T-blind hard
+///      ratio cap (`ratio >= 8 → serial at EVERY T`) is deleted — that cap
+///      pre-empted this selector and forfeited high-T wins (nasa Intel T16:
+///      capped 220 ms = 1.20 LOSS vs rg → selector-routed 150 ms = 0.82 WIN).
+///   3. WORK-PER-THREAD CAP — over-threading guard for small files at high T.
+/// ISIZE wrap (>4 GiB output) or near-incompressible (isize<deflate) yields a
+/// low ratio → low/no crossover → keep the requested threads (parallel is
+/// correct there).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub(crate) fn effective_parallel_threads(
     gzip_data: &[u8],
@@ -541,13 +551,10 @@ pub(crate) fn effective_parallel_threads(
         }
     }
 
-    let ratio_max = std::env::var("GZIPPY_PARALLEL_RATIO_MAX")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(PARALLEL_RATIO_MAX_DEFAULT);
-    if ratio_max == 0 {
-        return num_threads; // explicit disable of the cap
-    }
+    // ISIZE/deflate ratio (used by the aarch64 prestack cap and the cost-model
+    // selector + large-output bonus below). ISIZE is the gzip trailer's
+    // little-endian uncompressed size (mod 2^32); `deflate_len` is the
+    // compressed member length.
     let n = gzip_data.len();
     let isize_field = u32::from_le_bytes([
         gzip_data[n - 4],
@@ -556,15 +563,46 @@ pub(crate) fn effective_parallel_threads(
         gzip_data[n - 1],
     ]) as u64;
     let deflate_len = deflate_data_len as u64;
-    // ratio = isize/deflate >= ratio_max  ⟺  isize >= ratio_max*deflate (no division)
-    if isize_field >= ratio_max.saturating_mul(deflate_len) {
-        COMPRESSIBILITY_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
+
+    // NOTE (2026-07-05): the former T-BLIND hard ratio cap that lived here
+    // (`if isize >= 8*deflate { return 1 }` at EVERY T, env
+    // `GZIPPY_PARALLEL_RATIO_MAX`) is DELETED on x86_64. It pre-empted the
+    // T-aware cost-model selector below on every high-ratio stream, forfeiting
+    // the parallel wins the selector grants at high T. Changed-cell gate (both
+    // x86 boxes, single binary, arm B = cap-lifted; N=15 paired interleaved,
+    // /dev/null, sha==igzip, A/A noise <0.2%):
+    //   Intel  nasa    T16  220 ms → 150 ms  (artifact re-confirm 0.698, 15/15)
+    //   Intel  bignasa T16  950 ms → 524 ms  (artifact re-confirm 0.563, 15/15)
+    //   AMD    nasa    T16  116 ms → 101 ms  (artifact re-confirm 0.906, 15/15)
+    //   AMD    logs_i100/i400/t0 T16          (0.892–0.924, ≥14/15)
+    // The selector's `crossover = ceil(ratio × margin)` scales the serial floor
+    // with the SAME ratio the cap used, so extreme ratios (logs_i32 11.35 →
+    // crossover 17, logs_r3 19.9 → 30) still route serial at every practical T.
+    // A content-based replacement (marker-density / block-boundary probe) was
+    // designed and FALSIFIED by measurement (probe-a: logs/software have DENSER
+    // dynamic-block boundaries — 5-6 KiB mean gap — than silesia's 25 KiB;
+    // probe-b: window-absent marker fraction is ~1.0 for ALL corpora since
+    // back-refs only reach 32 KiB), so the ISIZE ratio via the selector is the
+    // correct — and only — separating signal.
+    //
+    // aarch64 KEEPS the prestack cap: its cost-model selector is DISABLED
+    // (margin 0.0, see [`arch_crossover_margin_default`]) so nothing else would
+    // serialize high-ratio streams there, and the bare deletion MEASURABLY
+    // REGRESSES Apple M1 (paired interleaved N=15, sha-verified, /dev/null:
+    // logs-class ratio 23 → T2 2.11× / T8 1.08× slower, 0-1/15 wins;
+    // software-class ratio 43 → T2 2.62× / T8 1.45× slower, 0/15). The cap IS
+    // aarch64's prestack routing — byte-transparent, knob-free (no env
+    // override; the old `GZIPPY_PARALLEL_RATIO_MAX` knob is deleted per the
+    // no-env-vars-in-prod-path rule). x86_64 codegen compiles this out.
+    #[cfg(target_arch = "aarch64")]
+    if isize_field >= AARCH64_PRESTACK_RATIO_MAX.saturating_mul(deflate_len) {
+        AARCH64_PRESTACK_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
 
     // SERIAL-CLEAN COST-MODEL SELECTOR (the low-T monotonicity fix).
     //
-    // Below the hard ratio cap the parallel pipeline is still NOT free: it does
+    // The parallel pipeline is NOT free: it does
     // W ≈ (ISIZE/deflate ratio)× more total CPU work than the serial-clean
     // thin-T1 driver, because marker-RESOLUTION + apply_window + per-chunk
     // SCAFFOLD are OUTPUT-proportional and under-amortized at low T (gated,
@@ -1047,32 +1085,133 @@ mod tests {
         v
     }
 
+    /// DIAGNOSTIC (manual, ignored): `GZIPPY_PROBE_FILE=<path.gz> cargo test \
+    /// --release --features pure-rust-inflate marker_density_measure -- \
+    /// --ignored --nocapture`. Prints, for a real gzip file: the dynamic-block
+    /// boundary density, the window-absent marker fraction of an interior chunk,
+    /// and the per-T selector routing.
+    ///
+    /// This is the instrument that FALSIFIED the marker-density-predicate design
+    /// (2026-07-05): logs/software (ratio 15-43×) have DENSER dynamic-block
+    /// boundaries (mean gap 5-6 KiB) than silesia (25 KiB), and the window-absent
+    /// marker fraction is ~1.0 for ALL corpora (back-refs only reach 32 KiB), so
+    /// neither content signal separates "marker-heavy" from "marker-dormant" —
+    /// the ISIZE ratio via the T-aware selector is the correct separating signal.
+    /// Kept so the falsification is re-runnable on any corpus.
     #[test]
-    fn compressibility_cap_serializes_high_ratio_keeps_low_ratio() {
+    #[ignore]
+    fn marker_density_measure() {
+        use crate::decompress::parallel::blockfinder_validation::DeflateBlockValidator;
+        use crate::decompress::parallel::chunk_data::ChunkConfiguration;
+        use crate::decompress::parallel::chunk_decode::decode_chunk_window_absent;
+        let path = match std::env::var("GZIPPY_PROBE_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("set GZIPPY_PROBE_FILE=<file.gz>");
+                return;
+            }
+        };
+        let gz = std::fs::read(&path).expect("read GZIPPY_PROBE_FILE");
+        let header = skip_gzip_header(&gz).expect("gzip header");
+        let deflate = &gz[header..gz.len() - 8];
+        let dlen = deflate.len();
+        let v = DeflateBlockValidator::new(deflate);
+        let total_dyn = v.count_dynamic_boundaries_capped(0, dlen * 8, usize::MAX);
+        let mean_gap = if total_dyn > 0 {
+            dlen / total_dyn
+        } else {
+            dlen
+        };
+        eprintln!(
+            "PROBE {path}: deflate={} MiB dyn_blocks={total_dyn} mean_gap={} KiB",
+            dlen / (1024 * 1024),
+            mean_gap / 1024,
+        );
+        // Window-absent marker fraction of one interior chunk (512 KiB + 4 MiB).
+        let mid = dlen / 2;
+        let scan = (4 * 1024 * 1024usize).min(dlen - mid) * 8;
+        for chunk_kib in [512usize, 4096] {
+            if let Some(start_bit) = v.find_first_candidate(mid * 8, scan) {
+                let stop = (start_bit + chunk_kib * 1024 * 8).min(dlen * 8);
+                match decode_chunk_window_absent(
+                    deflate,
+                    start_bit,
+                    stop,
+                    ChunkConfiguration::default(),
+                ) {
+                    Ok(chunk) => {
+                        let mk = chunk.data_with_markers.len();
+                        let d = chunk.data.len().saturating_sub(chunk.data_prefix_len);
+                        let frac = mk as f64 / (mk + d).max(1) as f64;
+                        eprintln!(
+                            "  MARKERFRAC[{chunk_kib}KiB comp]: u16_markers={mk} u8_data={d} frac={frac:.4}"
+                        );
+                    }
+                    Err(e) => eprintln!("  MARKERFRAC[{chunk_kib}KiB]: decode err {e:?}"),
+                }
+            }
+        }
+        for t in [2usize, 4, 8, 16] {
+            eprintln!(
+                "  T{t} -> effective {}",
+                effective_parallel_threads(&gz, dlen, t)
+            );
+        }
+    }
+
+    /// HIGH-RATIO ROUTING (2026-07-05):
+    /// x86_64 — NO T-blind ratio cap: a high-ISIZE-ratio stream is serialized
+    /// ONLY below its T-aware crossover (`ceil(ratio × margin)`), never at every
+    /// T. The former hard cap (`ratio >= 8 → 1 thread at EVERY T`) forfeited
+    /// high-T parallel wins (gated: Intel nasa T16 220→150 ms 15/15, bignasa T16
+    /// 950→524 ms 15/15; AMD nasa T16 0.871 15/15, logs_i100/i400/t0 T16
+    /// 0.892-0.924) and is DELETED there.
+    /// aarch64 — the prestack cap REMAINS (selector disabled; removing the cap
+    /// regresses M1 2.1-2.6× on logs/software-class at T2, paired N=15).
+    #[test]
+    fn high_ratio_routing_selector_owns_x86_prestack_cap_aarch64() {
         let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Pin the selector margin so the assertions are arch-independent (the
-        // arch-dispatched default is 1.6 on AMD vs 1.0 on Intel — this test
-        // exercises the HARD ratio cap, not the per-arch crossover tune).
+        // Pin the selector margin so the x86 assertions are vendor-independent
+        // (the arch-dispatched default is 1.6 on AMD vs 1.0 on Intel).
         std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
-        // Disable the small-output serial floor so this test isolates the HARD
-        // ratio cap (its 1–20 MB blobs sit below the 8 MiB floor and would else
-        // all route serial before reaching the ratio cap).
+        // Disable the small-output serial floor so this test isolates the
+        // high-ratio routing (its 1–20 MB blobs sit below the 8 MiB floor and
+        // would else all route serial before reaching it).
         std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
         let deflate_len = 1_000_000usize;
-        // ratio 20x (>= default 8) → cap to 1 thread.
-        let high = blob_with_isize(20_000_000);
+        let high = blob_with_isize(20_000_000); // ratio 20
+        let nasa_like = blob_with_isize(10_000_000); // ratio 10
+        let low = blob_with_isize(3_000_000); // ratio 3
+                                              // Common to every arch: high-ratio serial at low T; low-ratio parallel;
+                                              // T1 never altered.
         assert_eq!(effective_parallel_threads(&high, deflate_len, 8), 1);
-        // ratio 3x (< 8) → keep all threads.
-        let low = blob_with_isize(3_000_000);
+        assert_eq!(effective_parallel_threads(&nasa_like, deflate_len, 8), 1);
         assert_eq!(effective_parallel_threads(&low, deflate_len, 8), 8);
-        // single-thread request is never altered.
         assert_eq!(effective_parallel_threads(&high, deflate_len, 1), 1);
-        // exactly at the threshold (8x) caps (>= boundary).
-        let at = blob_with_isize(8_000_000);
-        assert_eq!(effective_parallel_threads(&at, deflate_len, 8), 1);
-        // just under (7.99x) keeps.
-        let under = blob_with_isize(7_990_000);
-        assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            // Selector owns: ratio 20 → crossover 20 → serial through T16 but
+            // parallel at T20 (impossible under the old blind cap); nasa-shaped
+            // ratio 10 → crossover 10 → parallel at T16 (the freed win cell).
+            assert_eq!(effective_parallel_threads(&high, deflate_len, 16), 1);
+            assert_eq!(effective_parallel_threads(&high, deflate_len, 20), 20);
+            assert_eq!(effective_parallel_threads(&nasa_like, deflate_len, 16), 16);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Prestack cap: ratio >= 8 serial at EVERY T (selector is disabled
+            // on aarch64; the cap is its only high-ratio serialization).
+            let before = AARCH64_PRESTACK_CAP_APPLIED.load(Ordering::Relaxed);
+            assert_eq!(effective_parallel_threads(&high, deflate_len, 16), 1);
+            assert_eq!(effective_parallel_threads(&high, deflate_len, 20), 1);
+            assert_eq!(effective_parallel_threads(&nasa_like, deflate_len, 16), 1);
+            let after = AARCH64_PRESTACK_CAP_APPLIED.load(Ordering::Relaxed);
+            assert!(after > before, "aarch64 prestack cap counter must fire");
+            // Just under the cap (ratio 7.99) falls through (selector disabled
+            // by default margin 0.0 → parallel; margin pinned 1.0 here → xover 8).
+            let under = blob_with_isize(7_990_000);
+            assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+        }
         std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
         std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
