@@ -262,6 +262,25 @@ pub struct ChunkData {
     /// inside the chunk's compressed range. Mirror of rapidgzip's
     /// `ChunkData::footers` (ChunkData.hpp:472-489 `appendFooter`).
     pub footers: Vec<Footer>,
+    /// Per-member decoded-byte accumulator, segmented at footers exactly
+    /// like [`Self::crc32s`] (invariant: `segment_sizes.len() ==
+    /// footers.len() + 1` and `Σ segment_sizes == decoded_size()`). Feeds
+    /// the consumer's running per-member ISIZE check (§4/[R2-#2]). Unlike
+    /// `crc32s`, it is maintained **unconditionally** (independent of
+    /// `crc32_enabled`) so the CRC-off oracle mode still verifies sizes.
+    ///
+    /// LABELED STRENGTHENING over vendor: rapidgzip's consumer verifies
+    /// CRC only (`ParallelGzipReader.hpp:1491-1499`); gzippy adds this
+    /// accumulator to check every member's ISIZE, matching gzippy's own
+    /// sequential path and gzip(1) semantics.
+    ///
+    /// Only the CLOSED segments (all but the last) are final; the last
+    /// element is provisional until [`Self::append_footer`] closes it or
+    /// [`Self::segment_sizes_final`] fills it from the authoritative
+    /// `decoded_size()`. Both close it as `decoded_size() − Σ(closed)`, so
+    /// no per-byte bookkeeping runs on the hot single-member path (which
+    /// never appends a footer and leaves this `[0]`).
+    pub segment_sizes: Vec<u64>,
     /// True iff the inexact decoder hit `max_decoded_chunk_size`
     /// before reaching the requested `stop_hint_bits`. Tells the
     /// dispatcher this chunk needs a successor starting at
@@ -431,6 +450,8 @@ impl ChunkData {
             // `std::vector<CRC32Calculator>( 1 )`.
             crc32s: vec![CRC32Calculator::new()],
             footers: Vec::new(),
+            // Mirror of `crc32s`' `( 1 )` default-init: one open segment.
+            segment_sizes: vec![0],
             stopped_preemptively: false,
             statistics: ChunkStatistics::default(),
             configuration,
@@ -498,6 +519,10 @@ impl ChunkData {
             subchunks,
             crc32s: vec![crc0],
             footers,
+            // The bypass harness reconstructs a single-segment chunk
+            // (`crc32s == vec![crc0]`) and never enters the consumer's
+            // per-member gate; mirror crc32s' single-element shape.
+            segment_sizes: vec![0],
             stopped_preemptively,
             statistics: ChunkStatistics::default(),
             configuration,
@@ -1451,11 +1476,46 @@ impl ChunkData {
             end_bit_offset,
             decoded_end_offset: self.decoded_size(),
         });
+        // Close the segment that just ended: its size is the decoded
+        // bytes since the previous footer = `decoded_size() − Σ(closed)`.
+        // The last element is provisional (open); the closed ones precede
+        // it. Independent of `crc32_enabled` — the size accounting always
+        // runs. Mirrors vendor pushing a fresh calculator alongside a new
+        // stream-size boundary (`ChunkData.hpp:472-489`).
+        self.close_open_segment_size();
+        self.segment_sizes.push(0);
         // Open a fresh calculator for the next stream's bytes. If no
         // more bytes follow, the trailing empty calculator's CRC == 0
         // and the consumer's combine treats it as a no-op. Mirror of
         // vendor's `crc32s.emplace_back()` at ChunkData.hpp:478.
         self.crc32s.push(CRC32Calculator::new());
+    }
+
+    /// Set the last (open) `segment_sizes` element to the decoded bytes
+    /// that fall after the previous footer: `decoded_size() − Σ(closed)`.
+    /// `closed` = the sum of every element except the last. Idempotent —
+    /// safe to call again at finalize to close the final open segment.
+    fn close_open_segment_size(&mut self) {
+        let closed: u64 = self.segment_sizes[..self.segment_sizes.len() - 1]
+            .iter()
+            .sum();
+        let total = self.decoded_size() as u64;
+        // `decoded_size()` is monotone across a footer append (footers are
+        // appended after the member's bytes), so this never underflows on
+        // a valid decode; saturate defensively rather than panic.
+        *self.segment_sizes.last_mut().unwrap() = total.saturating_sub(closed);
+    }
+
+    /// The fully-closed segmentation: a copy of `segment_sizes` with the
+    /// final (open) element filled from the authoritative `decoded_size()`.
+    /// Invariant on the result: `len() == footers.len() + 1` and
+    /// `Σ == decoded_size()`. Used by the consumer's per-member ISIZE pass
+    /// and the segmentation unit tests; cheap (O(footers-in-chunk)).
+    pub fn segment_sizes_final(&self) -> Vec<u64> {
+        let mut out = self.segment_sizes.clone();
+        let closed: u64 = out[..out.len() - 1].iter().sum();
+        *out.last_mut().unwrap() = (self.decoded_size() as u64).saturating_sub(closed);
+        out
     }
 
     /// Called by the decoder when it hits a real deflate block boundary.
@@ -1536,6 +1596,15 @@ impl ChunkData {
         // (vendor/.../ChunkData.hpp ~422). Cuts down apply_window's work
         // by moving any marker-free trailing region into `data`.
         self.clean_unmarked_data();
+        // Close the final (open) per-member size segment so the field is
+        // fully materialized for the consumer. Inert for single-member
+        // chunks (no footers ⇒ the `[0]` shape is left provisional; the
+        // consumer never reads it). `clean_unmarked_data` migrates bytes
+        // within segment 0 without changing `decoded_size()`, so this
+        // reads the authoritative total.
+        if !self.footers.is_empty() {
+            self.close_open_segment_size();
+        }
     }
 
     /// Literal port of `ChunkData::setEncodedOffset`
@@ -2538,5 +2607,92 @@ mod tests {
         chunk.append_clean(b"hello world");
         // CRC unchanged from identity.
         assert_eq!(chunk.crc32s[0].crc32(), 0);
+    }
+
+    // ── STAGE-1 per-member CRC + ISIZE segmentation units (§6.5 / [R1-#3],
+    //    [R2-#2]). These drive `ChunkData` directly (no decoder) to pin the
+    //    segmentation invariants the consumer's per-member pass will rely on:
+    //    `segment_sizes.len() == footers.len() + 1`, `Σ == decoded_size()`,
+    //    and `crc32s[i]` covers exactly segment i's bytes. ───────────────────
+
+    fn crc_of(bytes: &[u8]) -> u32 {
+        let mut c = CRC32Calculator::new();
+        c.update(bytes);
+        c.crc32()
+    }
+
+    /// (ii) Multiple footers in one chunk: three members' clean runs split by
+    /// two footers ⇒ 3 CRC/size segments, each covering its own member's bytes.
+    #[test]
+    fn segment_sizes_and_crc_split_at_each_footer() {
+        let mut chunk = ChunkData::new(0, small_config());
+        let a = b"first member payload".as_slice();
+        let b = b"second".as_slice();
+        let c = b"third member's trailing bytes".as_slice();
+
+        chunk.append_clean(a);
+        chunk.append_footer(crc_of(a), a.len() as u32, 800);
+        chunk.append_clean(b);
+        chunk.append_footer(crc_of(b), b.len() as u32, 1600);
+        chunk.append_clean(c);
+
+        // Invariants: one more segment than footers; conservation.
+        let sizes = chunk.segment_sizes_final();
+        assert_eq!(chunk.footers.len(), 2);
+        assert_eq!(sizes.len(), chunk.footers.len() + 1);
+        assert_eq!(sizes, vec![a.len() as u64, b.len() as u64, c.len() as u64]);
+        assert_eq!(sizes.iter().sum::<u64>(), chunk.decoded_size() as u64);
+        assert_eq!(chunk.crc32s.len(), chunk.footers.len() + 1);
+
+        // Each CRC segment covers exactly its member's bytes.
+        assert_eq!(chunk.crc32s[0].crc32(), crc_of(a));
+        assert_eq!(chunk.crc32s[1].crc32(), crc_of(b));
+        assert_eq!(chunk.crc32s[2].crc32(), crc_of(c));
+
+        // The recorded footers carry the running decoded-byte boundary.
+        assert_eq!(chunk.footers[0].decoded_end_offset, a.len());
+        assert_eq!(chunk.footers[1].decoded_end_offset, a.len() + b.len());
+    }
+
+    /// A member that ends exactly at chunk end (no bytes after the last footer)
+    /// still keeps the trailing empty segment — `len == footers + 1`, final
+    /// segment size 0 (mirrors vendor's trailing empty `CRC32Calculator`).
+    #[test]
+    fn segment_sizes_trailing_empty_segment_when_footer_at_chunk_end() {
+        let mut chunk = ChunkData::new(0, small_config());
+        let a = b"only member".as_slice();
+        chunk.append_clean(a);
+        chunk.append_footer(crc_of(a), a.len() as u32, 500);
+        // No bytes after the footer.
+        let sizes = chunk.segment_sizes_final();
+        assert_eq!(sizes, vec![a.len() as u64, 0]);
+        assert_eq!(sizes.len(), chunk.footers.len() + 1);
+        assert_eq!(sizes.iter().sum::<u64>(), chunk.decoded_size() as u64);
+    }
+
+    /// `finalize_with_deflate` materializes the final open segment in the field
+    /// itself (not just via `segment_sizes_final`), and leaves single-member
+    /// chunks (no footers) inert (`[0]`).
+    #[test]
+    fn finalize_materializes_segment_sizes_and_is_inert_for_single_member() {
+        // Multi-member: field is closed by finalize.
+        let mut mm = ChunkData::new(0, small_config());
+        let a = b"aaaa".as_slice();
+        let b = b"bbbbbbbb".as_slice();
+        mm.append_clean(a);
+        mm.append_footer(crc_of(a), a.len() as u32, 400);
+        mm.append_clean(b);
+        mm.finalize(900);
+        assert_eq!(mm.segment_sizes, vec![a.len() as u64, b.len() as u64]);
+
+        // Single-member: no footers ⇒ the provisional `[0]` shape is left
+        // untouched (the hot path never pays segmentation bookkeeping).
+        let mut sm = ChunkData::new(0, small_config());
+        sm.append_clean(b"hello world");
+        sm.finalize(400);
+        assert!(sm.footers.is_empty());
+        assert_eq!(sm.segment_sizes, vec![0]);
+        // Yet the on-demand view still reports the whole chunk as one segment.
+        assert_eq!(sm.segment_sizes_final(), vec![sm.decoded_size() as u64]);
     }
 }

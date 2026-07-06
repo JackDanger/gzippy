@@ -1548,7 +1548,7 @@ fn decode_chunk_unified_marker(
                     "t",
                 );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                finish_decode_chunk_contig_native(
+                finish_decode_chunk_contig_native::<false>(
                     &mut chunk,
                     &mut marker_ctx,
                     input,
@@ -1644,7 +1644,15 @@ fn decode_chunk_unified_marker(
 ///     aligned convention is REQUIRED so the production
 ///     `stop_hint == total_bits` member-final chunk lands exactly.
 #[cfg(all(parallel_sm, not(isal_clean_tail)))]
-fn finish_decode_chunk_contig_native(
+// `MULTI_MEMBER` const-generic (precedent:
+// `read_internal_compressed_specialized<CONTAINS_MARKERS>`, module doc
+// `parallel/mod.rs:76-81`): when `false` the cross-member continuation at BFINAL
+// (footer consume + next-header parse + empty-window reset) is compiled OUT, so
+// the single-member instantiation is codegen-identical to the pre-port driver
+// (verified by the §7 disasm diff). When `true`, the driver walks
+// `… deflate block → BFINAL → gzip footer → next gzip header → next member …`
+// exactly like rapidgzip's `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654).
+fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     chunk: &mut ChunkData,
     marker_ctx: &mut MarkerDecodeCtx,
     input: &[u8],
@@ -1660,6 +1668,16 @@ fn finish_decode_chunk_contig_native(
     record_boundaries: bool,
 ) -> Result<(), ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
+
+    // Cross-member continuation state (vendor `GzipChunk.hpp:449-452`).
+    // `did_read_header` tracks whether the CURRENT member's gzip header was
+    // parsed inside this decode call (member 1's is consumed by the caller, so
+    // it stays false and its ISIZE defers to the consumer accumulator §4);
+    // `stream_bytes_read` is the per-member decoded byte count, reset at every
+    // footer. Only ever read/mutated inside `if MULTI_MEMBER` blocks, so both
+    // fold away on the single-member (`false`) instantiation.
+    let mut did_read_header = false;
+    let mut stream_bytes_read: u64 = 0;
 
     // Per-call contig headroom: one max-length back-ref (258) + the 8-byte
     // word-copy overshoot (matches `decode_clean_into_contig`'s `out_room`
@@ -1809,6 +1827,11 @@ fn finish_decode_chunk_contig_native(
                         last.decoded_size += emitted;
                     }
                     marker_ctx.clean_data_count += emitted;
+                    // Per-member ISIZE accumulator (reset at each footer).
+                    // Const-folded to nothing on the single-member instance.
+                    if MULTI_MEMBER {
+                        stream_bytes_read += emitted as u64;
+                    }
                     UNIFIED_ROUTE_CLEAN_U8_BYTES
                         .fetch_add(emitted as u64, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1833,6 +1856,105 @@ fn finish_decode_chunk_contig_native(
             marker_ctx.current_bit_offset = end_bit_offset;
 
             if block.is_last_block() {
+                if MULTI_MEMBER {
+                    // ── rapidgzip cross-member continuation (GzipChunk.hpp:602-653).
+                    //    Corrected sequencing [R1-#1]: at BFINAL the footer is
+                    //    consumed UNCONDITIONALLY, the next header is read at the
+                    //    top of the next iteration, and the stop-hint check runs
+                    //    only at deflate-block boundaries (the loop-top checks
+                    //    above). So a chunk end is ALWAYS a deflate-block boundary
+                    //    (possibly in the next member) or clean EOF — never a
+                    //    position inside footer/trailer bytes.
+
+                    // The deflate stream ends byte-aligned; the 8-byte gzip
+                    // footer begins at the next byte boundary.
+                    let footer_byte = end_bit_offset.div_ceil(8);
+                    let footer =
+                        crate::decompress::parallel::gzip_format::read_footer(input, footer_byte)
+                            .map_err(|e| {
+                            // A truncated/absent footer after a BFINAL is corruption
+                            // INSIDE the member — terminal (§3.2/§4), never a clean
+                            // trailing-garbage stop.
+                            ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("gzip footer at byte {footer_byte}: {e}"),
+                            ))
+                        })?;
+
+                    // Verify ISIZE iff THIS member's gzip header was read in this
+                    // chunk (vendor `didReadHeader`, GzipChunk.hpp:629-636).
+                    // Member 1's header was consumed by the caller/finder, so its
+                    // check defers to the consumer's running accumulator (§4).
+                    if did_read_header && (stream_bytes_read as u32) != footer.uncompressed_size {
+                        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "gzip ISIZE mismatch: decoded {} vs footer {}",
+                                stream_bytes_read as u32, footer.uncompressed_size
+                            ),
+                        )));
+                    }
+
+                    let after_footer_bit = (footer_byte + 8) * 8;
+                    chunk.append_footer(footer.crc32, footer.uncompressed_size, after_footer_bit);
+
+                    // Per-member reset (GzipChunk.hpp:645-647).
+                    stream_bytes_read = 0;
+                    did_read_header = false;
+                    marker_ctx.current_bit_offset = after_footer_bit;
+
+                    // Read the next member's gzip header (vendor reads it at the
+                    // top of the next iteration, GzipChunk.hpp:470-511). No more
+                    // bytes ⇒ clean EOF break (`bitReader->eof()`,
+                    // GzipChunk.hpp:649-652).
+                    let header_byte = footer_byte + 8;
+                    if header_byte >= input.len() {
+                        chunk.finalize_with_deflate(after_footer_bit, Some(input));
+                        return Ok(());
+                    }
+                    match crate::decompress::parallel::gzip_format::read_header(
+                        &input[header_byte..],
+                    ) {
+                        Ok((_header, header_len)) => {
+                            // Reset the deflate engine to an EMPTY dictionary — a
+                            // new gzip stream carries no back-references into the
+                            // previous member (vendor `block->reset(VectorView<
+                            // uint8_t>{})`, GzipChunk.hpp:508). The contig back-ref
+                            // reader addresses `base[*pos - d]` (buffer-relative),
+                            // and resetting `decoded_bytes` to 0 makes the
+                            // empty-dict range check bound member N+1's window so
+                            // it can never reach member N's bytes on a valid
+                            // stream (a corrupt over-reach is caught by the
+                            // per-member CRC32, §4).
+                            block.reset(None, None);
+                            let mut unused: Vec<u16> = Vec::new();
+                            block.set_initial_window(&mut unused, &[]).map_err(|e| {
+                                ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("member-boundary empty-window reset: {e:?}"),
+                                ))
+                            })?;
+                            debug_assert!(
+                                unused.is_empty(),
+                                "empty-window reset must not drain output"
+                            );
+                            did_read_header = true;
+                            marker_ctx.current_bit_offset = (header_byte + header_len) * 8;
+                            MULTI_MEMBER_CONTINUATIONS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(_) => {
+                            // Trailing bytes after a fully-verified footer are not
+                            // a parseable gzip header ⇒ clean-stop at this member
+                            // boundary (§3.2 LABELED DEVIATION from vendor's
+                            // chunk-level throw: gzippy + gzip(1) tolerate trailing
+                            // garbage; the members decoded so far are `Ok`).
+                            chunk.finalize_with_deflate(after_footer_bit, Some(input));
+                            return Ok(());
+                        }
+                    }
+                }
                 if until_exact {
                     // Member-final exact stop: byte-align the post-EOB bit
                     // (the wrapper consumes the RFC 1952 padding via
@@ -1935,7 +2057,7 @@ fn finish_decode_chunk_seeded_block_native(
     // Same per-block driver the FOLD post-flip tail uses: header parse,
     // stop-hint early-out at block boundaries, `decode_clean_into_contig`
     // bodies, EOB boundary recording, BFINAL finalize.
-    finish_decode_chunk_contig_native(
+    finish_decode_chunk_contig_native::<false>(
         chunk,
         &mut marker_ctx,
         input,
@@ -2064,7 +2186,7 @@ pub(crate) fn decode_monolith_native(
     marker_ctx.block_primed = true;
 
     MONOLITH_NATIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    finish_decode_chunk_contig_native(
+    finish_decode_chunk_contig_native::<false>(
         &mut chunk,
         &mut marker_ctx,
         input,
@@ -2073,6 +2195,71 @@ pub(crate) fn decode_monolith_native(
         false,
         // T1-MONOLITH: no per-block boundary recording (ledger #4).
         false,
+    )?;
+    Ok(chunk)
+}
+
+/// STAGE-1 multi-member chunked decode entry (`MULTI_MEMBER=true`). Decodes a
+/// span of a WHOLE gzip FILE — inter-member footers + headers included in
+/// `input` — into ONE `ChunkData` that walks `… member → footer → header →
+/// member …` via the cross-member continuation in
+/// [`finish_decode_chunk_contig_native`]. Port of rapidgzip's
+/// `decodeChunkWithRapidgzip` over a chunk spanning members (GzipChunk.hpp:
+/// 468-654), with the single-member driver's window/marker machinery elided by
+/// the empty-dictionary start (a member boundary is an empty-window reset, so a
+/// clean-from-block-0 decode is exact from member 1).
+///
+/// STAGE-1 SCOPE: this is the continuation CORE. The whole-file finder span,
+/// the `MultiMemberChunked` routing, and the consumer's per-member CRC/ISIZE
+/// verification pass are stages 2-3 (§1.2/§4); today this is reached only from
+/// the unit + seam tests and instantiates the `true` monomorphization.
+///
+/// `first_block_bit` is the bit offset of member 1's first deflate block (=
+/// `first_header_size * 8`). `stop_hint_bits` is the inexact stop
+/// (`input.len() * 8` decodes the whole span to EOF). `reserve_hint` sizes the
+/// one output reservation (Σ member ISIZE, or 0 for the amortized-grow
+/// fallback).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+pub(crate) fn decode_multi_member_native(
+    input: &[u8],
+    first_block_bit: usize,
+    stop_hint_bits: usize,
+    reserve_hint: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let mut chunk = ChunkData::new(first_block_bit, configuration);
+
+    // Empty-dictionary start: member 1 has no prior history, so NO 32 KiB
+    // window prefix is installed (`data_prefix_len` stays 0). Back-refs
+    // resolve `base[*pos - d]` within the member's own output, bounded by the
+    // empty-dict range check — identical to vendor `block->reset(empty)` at
+    // GzipChunk.hpp:508 and the chunk-0 semantics of `decode_monolith_native`.
+    chunk.reserve_clean(reserve_hint.saturating_add(1024));
+
+    let mut marker_ctx = MarkerDecodeCtx::new(input, first_block_bit)?;
+    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
+        let mut block = cell_block.borrow_mut();
+        block.reset(None, None);
+        let mut unused: Vec<u16> = Vec::new();
+        block.set_initial_window(&mut unused, &[]).map_err(|e| {
+            ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("multi-member seed set_initial_window: {e:?}"),
+            ))
+        })?;
+        debug_assert!(unused.is_empty(), "seed must not drain into output");
+        Ok(())
+    })?;
+    marker_ctx.block_primed = true;
+
+    finish_decode_chunk_contig_native::<true>(
+        &mut chunk,
+        &mut marker_ctx,
+        input,
+        first_block_bit,
+        stop_hint_bits,
+        false,
+        true,
     )?;
     Ok(chunk)
 }
@@ -2466,6 +2653,16 @@ pub(crate) fn decode_monolith_isal(
     Ok(chunk)
 }
 
+/// Cross-member continuation deletion-trap: incremented every time the
+/// `MULTI_MEMBER=true` contig driver consumes a footer + next header and
+/// continues into the following gzip member (`finish_decode_chunk_contig_native`
+/// BFINAL arm). Stays 0 on every single-member decode (the continuation is
+/// compiled out of the `false` instantiation), so a single-member corpus run
+/// asserting this == 0 is the §7 non-execution proof; a multi-member decode
+/// asserting it advanced proves the port ran.
+pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Routing/effect counters for the T1-monolith path (deletion-trap pattern):
 /// non-zero proves the monolith engine — not the legacy chunk driver — handled
 /// the T1 decode. Read via `GZIPPY_DEBUG`.
@@ -2544,7 +2741,7 @@ fn finish_decode_chunk_exact_block_native(
         initial_window,
     )?;
 
-    finish_decode_chunk_contig_native(
+    finish_decode_chunk_contig_native::<false>(
         chunk,
         &mut marker_ctx,
         input,
@@ -6294,5 +6491,274 @@ mod exact_block_parity {
         );
         let bytes = chunk.data.to_contiguous()[chunk.data_prefix_len..].to_vec();
         assert_eq!(bytes, truth, "route decode bytes");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // STAGE-1 MULTI-MEMBER cross-member continuation tests (§6 of the port
+    // design). Drive `decode_multi_member_native` (the `MULTI_MEMBER=true`
+    // instantiation of `finish_decode_chunk_contig_native`) directly, since the
+    // whole-file finder span + `MultiMemberChunked` routing are stages 2-3.
+    // ════════════════════════════════════════════════════════════════════════
+    #[cfg(all(parallel_sm, not(isal_clean_tail)))]
+    mod multi_member_stage1 {
+        use super::*;
+        use crate::decompress::parallel::gzip_format;
+        use std::io::Write;
+
+        fn make_gzip_level(payload: &[u8], level: u32) -> Vec<u8> {
+            let mut enc =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+            enc.write_all(payload).unwrap();
+            enc.finish().unwrap()
+        }
+
+        fn flatten(chunk: &ChunkData) -> Vec<u8> {
+            let mut out = Vec::with_capacity(chunk.decoded_size());
+            for v in chunk.data_with_markers.iter() {
+                out.push(v as u8);
+            }
+            for seg in chunk.data.segments() {
+                out.extend_from_slice(seg);
+            }
+            out
+        }
+
+        fn mm_cfg() -> ChunkConfiguration {
+            ChunkConfiguration {
+                split_chunk_size: 4 * 1024 * 1024,
+                max_decoded_chunk_size: 64 * 1024 * 1024,
+                crc32_enabled: true,
+                ..Default::default()
+            }
+        }
+
+        /// Concatenate `payloads` as independent gzip members and return
+        /// `(bytes, first_header_len, Σ payload len)`.
+        fn build_multi_member(payloads: &[&[u8]], level: u32) -> (Vec<u8>, usize, usize) {
+            let mut input = Vec::new();
+            let mut total = 0usize;
+            for p in payloads {
+                input.extend_from_slice(&make_gzip_level(p, level));
+                total += p.len();
+            }
+            let first_header_len = gzip_format::read_header(&input).unwrap().1;
+            (input, first_header_len, total)
+        }
+
+        fn decode_mm(input: &[u8], first_header_len: usize, reserve: usize) -> ChunkData {
+            decode_multi_member_native(
+                input,
+                first_header_len * 8,
+                input.len() * 8,
+                reserve,
+                mm_cfg(),
+            )
+            .expect("multi-member decode")
+        }
+
+        /// Two members decode byte-exact across the boundary, with correctly
+        /// segmented footers + per-member sizes, and the continuation counter
+        /// advances (deletion-trap).
+        #[test]
+        fn two_member_byte_exact_and_segmented() {
+            let a = b"The quick brown fox jumps over the lazy dog. ".repeat(40);
+            let b = b"Pack my box with five dozen liquor jugs. ".repeat(53);
+            let (input, hlen, total) = build_multi_member(&[&a, &b], 6);
+
+            let before = MULTI_MEMBER_CONTINUATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let chunk = decode_mm(&input, hlen, total);
+            let after = MULTI_MEMBER_CONTINUATIONS.load(std::sync::atomic::Ordering::Relaxed);
+
+            let mut expected = a.clone();
+            expected.extend_from_slice(&b);
+            assert_eq!(flatten(&chunk), expected, "cross-member bytes");
+            assert_eq!(chunk.footers.len(), 2, "one footer per member");
+            // `segment_sizes.len() == footers.len() + 1`: the trailing empty
+            // segment (0 bytes after the final footer) mirrors vendor's trailing
+            // empty `CRC32Calculator` (ChunkData.hpp:559-561); the consumer
+            // carries it forward into the next chunk (a no-op on the last chunk).
+            assert_eq!(
+                chunk.segment_sizes_final(),
+                vec![a.len() as u64, b.len() as u64, 0],
+                "per-member decoded sizes + trailing empty segment"
+            );
+            assert!(after > before, "continuation counter must advance");
+
+            // Per-member CRC/ISIZE segments match each member's own trailer.
+            assert_eq!(chunk.footers[0].uncompressed_size, a.len() as u32);
+            assert_eq!(chunk.footers[1].uncompressed_size, b.len() as u32);
+            assert_eq!(chunk.crc32s[0].crc32(), chunk.footers[0].crc32);
+            assert_eq!(chunk.crc32s[1].crc32(), chunk.footers[1].crc32);
+        }
+
+        /// Three uneven members (different sizes AND compression levels) —
+        /// dominant middle member, mixed dynamic/stored blocks.
+        #[test]
+        fn three_member_uneven_byte_exact() {
+            let m0 = b"small".to_vec();
+            let m1 = {
+                let mut v = Vec::new();
+                for i in 0..(64u32 * 1024) {
+                    v.push((i.wrapping_mul(2654435761) >> 24) as u8);
+                }
+                v
+            };
+            let m2 = b"trailing member with some repetition ".repeat(20);
+            // Member 1 stored (level 0), others dynamic — exercises the stored
+            // arm crossing a member boundary.
+            let mut input = make_gzip_level(&m0, 6);
+            input.extend_from_slice(&make_gzip_level(&m1, 0));
+            input.extend_from_slice(&make_gzip_level(&m2, 9));
+            let hlen = gzip_format::read_header(&input).unwrap().1;
+
+            let chunk = decode_mm(&input, hlen, m0.len() + m1.len() + m2.len());
+            let mut expected = m0.clone();
+            expected.extend_from_slice(&m1);
+            expected.extend_from_slice(&m2);
+            assert_eq!(flatten(&chunk), expected);
+            assert_eq!(chunk.footers.len(), 3);
+            assert_eq!(
+                chunk.segment_sizes_final(),
+                vec![m0.len() as u64, m1.len() as u64, m2.len() as u64, 0]
+            );
+        }
+
+        /// A single member driven through the multi-member path: BFINAL →
+        /// consume footer → header offset == EOF → clean break. One footer, no
+        /// continuation into a next member.
+        #[test]
+        fn single_member_through_mm_path_breaks_clean_at_eof() {
+            let a = b"lonely member".repeat(30);
+            let (input, hlen, total) = build_multi_member(&[&a], 6);
+            let chunk = decode_mm(&input, hlen, total);
+            assert_eq!(flatten(&chunk), a);
+            assert_eq!(chunk.footers.len(), 1);
+            assert_eq!(chunk.segment_sizes_final(), vec![a.len() as u64, 0]);
+        }
+
+        /// SEAM: sweep the inexact stop hint across EVERY byte offset of a
+        /// 2-member stream (including the footer + next-header bytes). Every
+        /// position must yield a clean decode whose output is a prefix of the
+        /// full two-member output — never a panic or wrong bytes.
+        #[test]
+        fn stop_hint_every_byte_offset_yields_clean_prefix() {
+            let a = b"member one payload data ".repeat(12);
+            let b = b"member two different data ".repeat(15);
+            let (input, hlen, total) = build_multi_member(&[&a, &b], 6);
+            let mut full = a.clone();
+            full.extend_from_slice(&b);
+
+            for stop_byte in hlen..=input.len() {
+                let res =
+                    decode_multi_member_native(&input, hlen * 8, stop_byte * 8, total, mm_cfg());
+                let chunk = res.unwrap_or_else(|e| {
+                    panic!("stop_hint at byte {stop_byte} errored on valid input: {e:?}")
+                });
+                let out = flatten(&chunk);
+                assert!(
+                    full.starts_with(&out),
+                    "stop_hint at byte {stop_byte}: output ({} B) is not a prefix of full ({} B)",
+                    out.len(),
+                    full.len()
+                );
+            }
+        }
+
+        /// §3.2 trailing garbage AT a member boundary ⇒ clean-stop: the members
+        /// so far decode `Ok`, the garbage is ignored.
+        #[test]
+        fn trailing_garbage_at_boundary_clean_stops() {
+            let a = b"first".repeat(20);
+            let b = b"second".repeat(25);
+            let (mut input, hlen, total) = build_multi_member(&[&a, &b], 6);
+            // Non-gzip trailing bytes (no valid magic).
+            input.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44]);
+
+            let chunk = decode_mm(&input, hlen, total);
+            let mut expected = a.clone();
+            expected.extend_from_slice(&b);
+            assert_eq!(flatten(&chunk), expected, "garbage ignored, members Ok");
+            assert_eq!(chunk.footers.len(), 2);
+        }
+
+        /// §4 corruption INSIDE a member's deflate body must never silently
+        /// corrupt: stage 1 verifies ISIZE (length) at the footer, so a
+        /// length-changing corruption errors here; a length-preserving one
+        /// surfaces as WRONG BYTES that the consumer's per-member CRC (stage 3)
+        /// rejects. Either way the corruption is observable, never silent.
+        #[test]
+        fn corruption_inside_member_is_never_silent() {
+            let a = b"clean first member ".repeat(30);
+            let b = b"second member body ".repeat(30);
+            let gz_a = make_gzip_level(&a, 6);
+            let mut gz_b = make_gzip_level(&b, 6);
+            let hlen_b = gzip_format::read_header(&gz_b).unwrap().1;
+            // Flip a byte well inside member 2's deflate body.
+            gz_b[hlen_b + 3] ^= 0xFF;
+            let mut input = gz_a.clone();
+            input.extend_from_slice(&gz_b);
+            let hlen = gzip_format::read_header(&input).unwrap().1;
+
+            let mut expected = a.clone();
+            expected.extend_from_slice(&b);
+            match decode_multi_member_native(
+                &input,
+                hlen * 8,
+                input.len() * 8,
+                a.len() + b.len(),
+                mm_cfg(),
+            ) {
+                Err(_) => {} // structural / ISIZE error — corruption caught.
+                Ok(chunk) => assert_ne!(
+                    flatten(&chunk),
+                    expected,
+                    "length-preserving corruption must be visible (CRC rejects it in stage 3)"
+                ),
+            }
+        }
+
+        /// §4 member-2 ISIZE mismatch: the header was read in-chunk
+        /// (`did_read_header`), so the in-decode ISIZE check fires ⇒ terminal Err.
+        #[test]
+        fn member2_isize_mismatch_is_terminal_err() {
+            let a = b"aaaaa".repeat(20);
+            let b = b"bbbbb".repeat(20);
+            let gz_a = make_gzip_level(&a, 6);
+            let mut gz_b = make_gzip_level(&b, 6);
+            // Corrupt member 2's ISIZE (last 4 bytes of its footer).
+            let n = gz_b.len();
+            gz_b[n - 1] ^= 0xFF;
+            let mut input = gz_a.clone();
+            input.extend_from_slice(&gz_b);
+            let hlen = gzip_format::read_header(&input).unwrap().1;
+
+            let res = decode_multi_member_native(
+                &input,
+                hlen * 8,
+                input.len() * 8,
+                a.len() + b.len(),
+                mm_cfg(),
+            );
+            assert!(res.is_err(), "member-2 ISIZE mismatch must error");
+        }
+
+        /// A truncated FINAL footer (fewer than 8 bytes after the last BFINAL)
+        /// is corruption inside the member ⇒ terminal Err (not a clean stop).
+        #[test]
+        fn truncated_final_footer_is_terminal_err() {
+            let a = b"first".repeat(20);
+            let b = b"second".repeat(20);
+            let (input, hlen, total) = build_multi_member(&[&a, &b], 6);
+            // Drop 3 bytes of the last footer.
+            let truncated = &input[..input.len() - 3];
+            let res = decode_multi_member_native(
+                truncated,
+                hlen * 8,
+                truncated.len() * 8,
+                total,
+                mm_cfg(),
+            );
+            assert!(res.is_err(), "truncated final footer must error");
+        }
     }
 }
