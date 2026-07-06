@@ -134,6 +134,34 @@ hot-path hook call site stays byte-transparent. Members:
 
 ---
 
+## Multi-member routing (`MultiMemberChunked` — 2026-07-05)
+
+`DecodePath::MultiMemberChunked` → `sm_driver::read_parallel_sm_multi` walks each
+member and inflates it with the FULL within-member parallel engine
+(`read_parallel_sm` per member, per-member CRC32 + ISIZE verified), streaming
+output in member order. It is the **deterministic route for a MIXED "GZ" ++
+plain concatenation** (`bgzf::gz_coverage_is_pure` returns false → not pure GZ),
+which the BGZF fast path (`decompress_bgzf_parallel`) would truncate.
+
+**Plain multi-member streams stay on `MultiMemberPar`** (the member-per-worker
+split): routing dominant/few-member distributions to this member-walk was
+**MEASURED to REGRESS on M1** — the walk spins a full pipeline per member and
+oversubscribes threads at high T (few-large T8: 156 ms chunked vs 45 ms
+member-per-worker; the member-per-worker baseline was ~90 ms flat / scaling).
+The located dominant-member plateau requires the rapidgzip-faithful whole-file
+block-finder cross-member continuation (one pool, one chunk grid ignoring member
+boundaries + a single decode walking footer→header→empty-window-reset, vendor
+`GzipChunk.hpp:468-654`, CRC segmentation per `ChunkData.hpp:559-561` +
+`ParallelGzipReader.hpp:1454-1502`), **not** this member-walk shortcut — the
+gate-phase core (see `scratchpad/MM-PARALLELSM-DESIGN.md`).
+
+The false-single re-entry (`single_member.rs` `trailing_member_after_first` +
+`sm_driver::read_parallel_sm_resume_multi`, counter `MISROUTE_REENTRY_APPLIED`)
+handles multi-member streams that mis-detect as single (empty-first member; first
+member compressed past the 16 MiB detection window).
+
+---
+
 ## Related docs
 
 - `docs/structural-gap-rapidgzip.md` — measured structural-gap analysis (where the wall is lost vs rg).

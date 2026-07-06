@@ -329,7 +329,13 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
-            let is_bgzf = has_bgzf_markers(input_data);
+            // A first-member "GZ" hit only takes the BGZF fast path when the
+            // WHOLE file is pure GZ (every member carries the subfield, walk ends
+            // at EOF). A mixed concatenation (GZ ++ plain) is treated as
+            // multi-member so it routes through the cross-member-capable path
+            // instead of desyncing the BGZF block walk. [R2-#3]
+            let is_bgzf = has_bgzf_markers(input_data)
+                && crate::decompress::bgzf::gz_coverage_is_pure(input_data);
             let is_multi = !is_bgzf && is_likely_multi_member(input_data);
             let can_parallelize = args.processes > 1 && (is_bgzf || is_multi);
 
@@ -423,7 +429,10 @@ fn decompress_to_writer<W: Write>(
             if !is_gzip {
                 return Ok(0);
             }
-            let bgzf = has_bgzf_markers(&mmap[..]);
+            // Pure-GZ only takes the BGZF fast path; a mixed GZ ++ plain
+            // concatenation routes as multi-member. [R2-#3]
+            let bgzf = has_bgzf_markers(&mmap[..])
+                && crate::decompress::bgzf::gz_coverage_is_pure(&mmap[..]);
             let multi = is_likely_multi_member(&mmap[..]);
             let can_parallelize = args.processes > 1 && (bgzf || multi);
 
