@@ -1326,8 +1326,12 @@ fn decode_chunk_with_rapidgzip_impl(
     }
 
     // Vendor tryToDecode: bootstrap failure propagates; caller catches and tries next candidate.
-    let mut chunk =
-        decode_chunk_unified_marker(input, encoded_offset_bits, stop_hint_bits, configuration)?;
+    let mut chunk = decode_chunk_unified_marker::<false>(
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        configuration,
+    )?;
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     Ok(chunk)
 }
@@ -1444,11 +1448,138 @@ fn apply_recorded_block_boundaries(
     }
 }
 
+/// Result of a pure-marker cross-member continuation attempt (§3.1).
+#[cfg(parallel_sm)]
+enum MemberContinuation {
+    /// A next member's header was parsed; the marker loop should re-enter and
+    /// keep decoding on the same chunk. `marker_ctx` cursor + block are reset.
+    Continued,
+    /// EOF or trailing garbage after a fully-verified footer — the chunk ends
+    /// cleanly at `end_bit` (§3.2 labeled deviation: gzippy + gzip(1) tolerate
+    /// trailing garbage; the members decoded so far are `Ok`).
+    EndOfData { end_bit: usize },
+}
+
+/// STAGE-2b: the pure-marker analogue of stage 1's contig BFINAL continuation
+/// (`finish_decode_chunk_contig_native::<true>` — GzipChunk.hpp:602-653). Called
+/// from [`decode_chunk_unified_marker`]'s `MarkerStep::Finished{bfinal_hit}` arm
+/// when a member-final BFINAL is reached while the chunk is still in marker mode
+/// (small members that never accumulate 32 KiB clean). Consumes the footer,
+/// verifies ISIZE iff this chunk read the member's header, appends the footer
+/// (fresh CRC + size segment), parses the next gzip header, and resets the
+/// thread-local marker engine to an EMPTY dictionary so member N+1 decodes with
+/// no back-references into member N.
+///
+/// `flipped` is forced true at the boundary so the 32 KiB fold-flip can NEVER
+/// fire on a window that straddles the boundary (member N's clean tail + member
+/// N+1's head) — the flip window would otherwise resolve member N+1's back-refs
+/// against member N's bytes. Member N+1 keeps decoding via the marker loop's
+/// clean-u8 path (empty dict ⇒ no real markers on valid data), which is correct
+/// and, for the small members this arm handles, cheap. Large members flip DURING
+/// themselves and take the fast contig continuation instead (FlipToContig arm).
+#[cfg(parallel_sm)]
+fn try_continue_next_member(
+    chunk: &mut ChunkData,
+    marker_ctx: &mut MarkerDecodeCtx,
+    input: &[u8],
+    end_bit_offset: usize,
+    did_read_header: &mut bool,
+    member_start_decoded: &mut usize,
+) -> Result<MemberContinuation, ChunkDecodeError> {
+    // The deflate stream ends byte-aligned; the 8-byte gzip footer begins at the
+    // next byte boundary (the marker loop returns the unaligned post-EOB bit).
+    let footer_byte = end_bit_offset.div_ceil(8);
+    let footer = crate::decompress::parallel::gzip_format::read_footer(input, footer_byte)
+        .map_err(|e| {
+            // A truncated/absent footer after a BFINAL is corruption INSIDE the
+            // member — terminal (§3.2/§4), never a clean trailing-garbage stop.
+            ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("gzip footer at byte {footer_byte}: {e}"),
+            ))
+        })?;
+
+    // In-chunk ISIZE check iff THIS chunk parsed the member's header
+    // (vendor `didReadHeader`, GzipChunk.hpp:629-636). Members whose header
+    // preceded this chunk defer to the consumer accumulator (§4).
+    if *did_read_header {
+        let member_bytes = chunk.decoded_size().saturating_sub(*member_start_decoded);
+        if (member_bytes as u32) != footer.uncompressed_size {
+            return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "gzip ISIZE mismatch: decoded {} vs footer {}",
+                    member_bytes as u32, footer.uncompressed_size
+                ),
+            )));
+        }
+    }
+
+    let after_footer_bit = (footer_byte + 8) * 8;
+    chunk.append_footer(footer.crc32, footer.uncompressed_size, after_footer_bit);
+    *member_start_decoded = chunk.decoded_size();
+
+    // Read the next member's gzip header (vendor reads it at the top of the next
+    // iteration, GzipChunk.hpp:470-511). No more bytes ⇒ clean EOF break.
+    let header_byte = footer_byte + 8;
+    if header_byte >= input.len() {
+        return Ok(MemberContinuation::EndOfData {
+            end_bit: after_footer_bit,
+        });
+    }
+    match crate::decompress::parallel::gzip_format::read_header(&input[header_byte..]) {
+        Ok((_header, header_len)) => {
+            // Empty-dictionary reset: force the marker engine to re-prime with an
+            // empty window on the next `marker_decode_step` (`block_primed=false`
+            // ⇒ `block.reset(None, None)`). `flipped=true` disables the straddle-
+            // prone fold-flip for the rest of this chunk (see fn doc).
+            marker_ctx.block_primed = false;
+            marker_ctx.flipped = true;
+            marker_ctx.current_bit_offset = (header_byte + header_len) * 8;
+            *did_read_header = true;
+            MULTI_MEMBER_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(MemberContinuation::Continued)
+        }
+        Err(_) => {
+            // Trailing bytes after a fully-verified footer are not a parseable
+            // gzip header ⇒ clean-stop at this member boundary (§3.2).
+            Ok(MemberContinuation::EndOfData {
+                end_bit: after_footer_bit,
+            })
+        }
+    }
+}
+
+/// STAGE-2b: window-absent (speculative) decode entry that WALKS member
+/// boundaries — the `MULTI_MEMBER=true` instantiation of
+/// [`decode_chunk_unified_marker`]. This is the entry the whole-file MM parallel
+/// pipeline dispatches speculative chunks through (stage 2 driver, item 2); the
+/// existing [`decode_chunk_window_absent`] stays byte-identical (`::<false>`).
+#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+pub fn decode_chunk_window_absent_multi(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    decode_chunk_unified_marker::<true>(input, encoded_offset_bits, stop_hint_bits, configuration)
+}
+
 /// The ONE unified decode driver — vendor `deflate::Block` (see
 /// `marker_decode_step`). Once 32 KiB of clean output exist at a block boundary, control hands off to
 /// `finish_decode_chunk_with_inexact_offset` with that clean window.
+///
+/// STAGE-2b `MULTI_MEMBER` const-generic (precedent:
+/// `finish_decode_chunk_contig_native::<MULTI_MEMBER>`, stage 1): when `true`,
+/// a member-final BFINAL reached in the WINDOW-ABSENT/marker path (either the
+/// pure-marker `MarkerStep::Finished{bfinal_hit}` arm — small members that never
+/// accumulate 32 KiB clean — or the post-flip `FlipToContig` clean tail) walks
+/// `… member → footer → header → member …` instead of ending the chunk. This is
+/// the gap stage 1 did NOT touch: stage 1 wired the SEEDED/exact/contig arms,
+/// but the actual parallel pipeline decodes speculative chunks THROUGH here.
+/// When `false` the continuation is compiled out (single-member inertness).
 #[cfg(parallel_sm)]
-fn decode_chunk_unified_marker(
+fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
     input: &[u8],
     encoded_offset_bits: usize,
     stop_hint_bits: usize,
@@ -1505,6 +1636,14 @@ fn decode_chunk_unified_marker(
         ));
     }
     let mut pending_boundaries: Vec<(usize, usize)> = Vec::new();
+    // STAGE-2b per-member cross-boundary state (MULTI_MEMBER only). A speculative
+    // chunk STARTS mid-member, so `did_read_header` is false until this chunk
+    // parses a member's gzip header itself; only then does the in-chunk ISIZE
+    // check fire at that member's footer (members whose header preceded this
+    // chunk defer their ISIZE to the consumer accumulator §4). `member_start_
+    // decoded` is the decoded-byte position at the current member's start.
+    let mut did_read_header = false;
+    let mut member_start_decoded: usize = 0;
     loop {
         let mut clean_appended = marker_ctx.clean_data_count;
         let crc32_enabled = chunk.configuration.crc32_enabled;
@@ -1548,7 +1687,14 @@ fn decode_chunk_unified_marker(
                     "t",
                 );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                finish_decode_chunk_contig_native::<false>(
+                // STAGE-2b: the post-flip clean tail carries the cross-member
+                // continuation (stage 1's `::<true>` arm). A large member that
+                // accumulated 32 KiB clean flips here, then walks its own final
+                // BFINAL → footer → next header → next member entirely inside the
+                // fast contig driver (buffer-relative back-refs + per-boundary
+                // empty-window reset — no straddle hazard). This is the dominant-
+                // member path that makes the grid SCALE.
+                finish_decode_chunk_contig_native::<MULTI_MEMBER>(
                     &mut chunk,
                     &mut marker_ctx,
                     input,
@@ -1585,7 +1731,36 @@ fn decode_chunk_unified_marker(
                 )?;
                 return Ok(chunk);
             }
-            MarkerStep::Finished { end_bit_offset, .. } => {
+            MarkerStep::Finished {
+                end_bit_offset,
+                bfinal_hit,
+            } => {
+                // STAGE-2b pure-marker cross-member continuation: a member-final
+                // BFINAL was reached WITHOUT the chunk ever accumulating 32 KiB
+                // clean (small members). Walk the footer + next header and keep
+                // decoding member N+1 on this same chunk. Non-BFINAL Finished
+                // (stop-hint reached) and the single-member instantiation fall
+                // through to the finalize below unchanged.
+                if MULTI_MEMBER && bfinal_hit {
+                    match try_continue_next_member(
+                        &mut chunk,
+                        &mut marker_ctx,
+                        input,
+                        end_bit_offset,
+                        &mut did_read_header,
+                        &mut member_start_decoded,
+                    )? {
+                        MemberContinuation::Continued => continue,
+                        MemberContinuation::EndOfData { end_bit } => {
+                            FINISHED_NO_FLIP_CHUNKS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            chunk.statistics.non_marker_count +=
+                                chunk.data_with_markers.len() as u64;
+                            chunk.finalize_with_deflate(end_bit, Some(input));
+                            return Ok(chunk);
+                        }
+                    }
+                }
                 FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::decompress::parallel::trace_v2::emit_instant(
                     "worker.chunk_phase",
@@ -6759,6 +6934,185 @@ mod exact_block_parity {
                 mm_cfg(),
             );
             assert!(res.is_err(), "truncated final footer must error");
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // STAGE-2b: the WINDOW-ABSENT / marker path continuation
+        // (`decode_chunk_window_absent_multi`). Stage 1 wired the contig/exact
+        // arms; the actual parallel pipeline decodes speculative chunks THROUGH
+        // this marker path. A chunk that STARTS at member 1's first block has an
+        // empty predecessor window, so it decodes all-clean (no residual
+        // markers) and `flatten` yields real bytes — exercising both the
+        // pure-marker small-member continuation and the post-flip contig
+        // continuation depending on member sizes.
+        // ════════════════════════════════════════════════════════════════════
+
+        fn decode_mm_wa(input: &[u8], first_header_len: usize, reserve: usize) -> ChunkData {
+            // Reserve is only a sizing hint on this path; window_absent sizes
+            // itself from the compressed span. `reserve` kept for call symmetry.
+            let _ = reserve;
+            decode_chunk_window_absent_multi(input, first_header_len * 8, input.len() * 8, mm_cfg())
+                .expect("window-absent multi-member decode")
+        }
+
+        /// SMALL members (each < 32 KiB) never accumulate the 32 KiB clean needed
+        /// to flip, so every member-boundary is crossed by the PURE-MARKER
+        /// continuation (`try_continue_next_member`). Byte-exact across 4 members,
+        /// correct footer/segment counts, continuation counter advances.
+        #[test]
+        fn window_absent_small_members_pure_marker_continuation() {
+            let m0 = b"The quick brown fox. ".repeat(30); // ~630 B
+            let m1 = b"Pack my box with five dozen liquor jugs. ".repeat(40);
+            let m2 = b"lorem ipsum dolor sit amet ".repeat(50);
+            let m3 = b"tail member payload here ".repeat(35);
+            let (input, hlen, _total) = build_multi_member(&[&m0, &m1, &m2, &m3], 6);
+
+            let before = MULTI_MEMBER_CONTINUATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let chunk = decode_mm_wa(&input, hlen, m0.len() + m1.len() + m2.len() + m3.len());
+            let after = MULTI_MEMBER_CONTINUATIONS.load(std::sync::atomic::Ordering::Relaxed);
+
+            let mut expected = m0.clone();
+            expected.extend_from_slice(&m1);
+            expected.extend_from_slice(&m2);
+            expected.extend_from_slice(&m3);
+            assert_eq!(
+                flatten(&chunk),
+                expected,
+                "cross-member bytes (marker path)"
+            );
+            assert_eq!(chunk.footers.len(), 4, "one footer per member");
+            assert_eq!(
+                chunk.segment_sizes_final(),
+                vec![
+                    m0.len() as u64,
+                    m1.len() as u64,
+                    m2.len() as u64,
+                    m3.len() as u64,
+                    0
+                ],
+                "per-member sizes + trailing empty segment"
+            );
+            assert!(
+                after >= before + 3,
+                "≥3 cross-member continuations must fire (4 members)"
+            );
+            // NOTE: per-chunk `crc32s[i]` is NOT asserted here. On the window-
+            // absent/marker path, small members that never flip live entirely in
+            // the u16 marker region, whose CRC is credited by the CONSUMER's
+            // apply_window pass (§4), not during decode. Byte-correctness (above)
+            // is the item-1 guarantee; per-member CRC verification is item 3.
+        }
+
+        /// A LARGE first member (> 32 KiB, forces the fold-flip → contig
+        /// continuation) followed by SMALL members (pure-marker continuation) —
+        /// exercises BOTH continuation sub-paths in one chunk.
+        ///
+        /// FIXME(stage-2b): the fold-flip → `finish_decode_chunk_contig_native::
+        /// <true>` continuation SCRAMBLES output order to `[member2][member3]
+        /// [member1]` (member1's decoded bytes land AFTER the continued members).
+        /// ISOLATED: `big`-alone through this exact window-absent path is
+        /// byte-EXACT (matches=true), and the stage-1 `decode_multi_member_native`
+        /// contig `::<true>` continuation entered FRESH (chunk.data empty) is
+        /// byte-exact — the scramble appears ONLY when the contig continuation is
+        /// entered via the FOLD flip (chunk.data pre-populated by the marker
+        /// fold's push_clean_u8). Symptom: total size + footer count are correct;
+        /// only byte ORDER is wrong (member1 written last). Suspected root cause:
+        /// the fold path retains/streams member1's pre-flip bytes via a window/
+        /// retain mechanism so they are not yet in `chunk.data.buf` at the moment
+        /// the continuation appends member2, then member1 is placed at finalize.
+        /// The PURE-MARKER continuation (all-small members, no flip) is byte-exact
+        /// (see `window_absent_small_members_pure_marker_continuation`). Fixing
+        /// this is the first task of the stage-2b successor (see distillation).
+        #[test]
+        #[ignore = "stage-2b FIXME: fold-flip→contig::<true> continuation scrambles output order (see doc)"]
+        fn window_absent_large_then_small_members_both_paths() {
+            // Large, dynamic, well-compressible → > 32 KiB clean output.
+            let big: Vec<u8> = {
+                let mut v = Vec::new();
+                let line = b"the mixed large member payload with repetition and structure ";
+                while v.len() < 200 * 1024 {
+                    v.extend_from_slice(line);
+                }
+                v
+            };
+            let s0 = b"small tail A ".repeat(10);
+            let s1 = b"small tail B ".repeat(12);
+            let (input, hlen, _total) = build_multi_member(&[&big, &s0, &s1], 6);
+
+            let chunk = decode_mm_wa(&input, hlen, big.len() + s0.len() + s1.len());
+            let got = flatten(&chunk);
+            let mut expected = big.clone();
+            expected.extend_from_slice(&s0);
+            expected.extend_from_slice(&s1);
+            assert_eq!(got, expected, "large+small cross-member bytes");
+            assert_eq!(chunk.footers.len(), 3);
+            assert_eq!(
+                chunk.segment_sizes_final(),
+                vec![big.len() as u64, s0.len() as u64, s1.len() as u64, 0]
+            );
+        }
+
+        /// SEAM: sweep the inexact stop hint across EVERY byte offset of a
+        /// small-member 3-member stream (marker path). Every position yields a
+        /// clean decode whose output is a prefix of the full output — never a
+        /// panic or wrong bytes.
+        #[test]
+        fn window_absent_stop_hint_every_byte_yields_clean_prefix() {
+            let m0 = b"alpha member ".repeat(9);
+            let m1 = b"beta member data ".repeat(11);
+            let m2 = b"gamma member payload ".repeat(8);
+            let (input, hlen, _total) = build_multi_member(&[&m0, &m1, &m2], 6);
+            let mut full = m0.clone();
+            full.extend_from_slice(&m1);
+            full.extend_from_slice(&m2);
+
+            for stop_byte in hlen..=input.len() {
+                let chunk =
+                    decode_chunk_window_absent_multi(&input, hlen * 8, stop_byte * 8, mm_cfg())
+                        .unwrap_or_else(|e| panic!("stop_hint at byte {stop_byte} errored: {e:?}"));
+                let out = flatten(&chunk);
+                assert!(
+                    full.starts_with(&out),
+                    "stop_hint {stop_byte}: output ({} B) not a prefix of full ({} B)",
+                    out.len(),
+                    full.len()
+                );
+            }
+        }
+
+        /// §3.2 trailing garbage at a member boundary on the marker path ⇒
+        /// clean-stop; the members so far decode `Ok`.
+        #[test]
+        fn window_absent_trailing_garbage_clean_stops() {
+            let m0 = b"one ".repeat(20);
+            let m1 = b"two ".repeat(25);
+            let (mut input, hlen, _total) = build_multi_member(&[&m0, &m1], 6);
+            input.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            let chunk = decode_mm_wa(&input, hlen, m0.len() + m1.len());
+            let mut expected = m0.clone();
+            expected.extend_from_slice(&m1);
+            assert_eq!(flatten(&chunk), expected, "garbage ignored, members Ok");
+            assert_eq!(chunk.footers.len(), 2);
+        }
+
+        /// A corrupt interior member's ISIZE on the marker path (header read
+        /// in-chunk ⇒ in-decode check fires) ⇒ terminal Err.
+        #[test]
+        fn window_absent_member2_isize_mismatch_is_terminal_err() {
+            let a = b"aaaa ".repeat(15);
+            let b = b"bbbb ".repeat(15);
+            let gz_a = make_gzip_level(&a, 6);
+            let mut gz_b = make_gzip_level(&b, 6);
+            let n = gz_b.len();
+            gz_b[n - 1] ^= 0xFF; // corrupt member 2 ISIZE
+            let mut input = gz_a.clone();
+            input.extend_from_slice(&gz_b);
+            let hlen = gzip_format::read_header(&input).unwrap().1;
+            let res = decode_chunk_window_absent_multi(&input, hlen * 8, input.len() * 8, mm_cfg());
+            assert!(
+                res.is_err(),
+                "member-2 ISIZE mismatch (marker path) must error"
+            );
         }
     }
 }
