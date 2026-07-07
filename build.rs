@@ -63,15 +63,6 @@ fn emit_parallel_sm_cfgs() {
     // `unexpected_cfgs` lint (required since Rust 1.80).
     println!("cargo::rustc-check-cfg=cfg(parallel_sm)");
     println!("cargo::rustc-check-cfg=cfg(pure_inflate_decode)");
-    // `isal_clean_tail` is the (now-dormant) ISA-L from-bit clean-tail DECODE
-    // oracle selector. It is NEVER emitted: the pure-Rust DEFLATE engine is the
-    // SOLE production decode path on every build. The cfg is still DECLARED so
-    // the remaining `#[cfg(not(isal_clean_tail))]` branches (the active pure-Rust
-    // path) and the dormant `#[cfg(isal_clean_tail)]` branches do not trip the
-    // `unexpected_cfgs` lint. The ISA-L from-bit decode survives only as a
-    // measurement oracle compiled under `isal-compression` and reachable solely
-    // via `GZIPPY_ISAL_ENGINE_ORACLE=1` — off the production decode graph.
-    println!("cargo::rustc-check-cfg=cfg(isal_clean_tail)");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let is_x86_64 = arch == "x86_64";

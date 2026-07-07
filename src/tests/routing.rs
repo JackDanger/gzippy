@@ -755,7 +755,7 @@ mod tests {
     /// byte-exact. The streaming monolith is OPT-IN (fulcrum optgate refused the
     /// wall win as INSTRUCTION-ONLY; production T1 default stays thin-T1) — this
     /// test locks the opt-in wiring + byte-exactness. Native build only.
-    #[cfg(all(parallel_sm, not(isal_clean_tail)))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_t1_routes_through_streaming_monolith() {
         use crate::decompress::parallel::chunk_decode::MONOLITH_STREAM_NATIVE_RUNS;

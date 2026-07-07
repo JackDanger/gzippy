@@ -1193,7 +1193,7 @@ fn decode_huffman_body_resumable(
             // the two-phase FlipToClean tail). On gzippy-NATIVE (the default
             // perf build and the 1.0× bar) the fold keeps Engine M
             // (marker_inflate::Block) decoding the clean tail in-place
-            // (chunk_decode.rs:1219, `not(isal_clean_tail)`), so ~99% of clean
+            // (chunk_decode.rs:1219), so ~99% of clean
             // bytes decode through marker_inflate's CONTAINS_MARKERS=false arm,
             // NOT here. This injection is therefore the correct site for the
             // gzippy-ISAL CONTROL build; the NATIVE pre-gate fires the sibling
@@ -1232,7 +1232,7 @@ fn decode_huffman_body_resumable(
             // LITERAL FAST PATH (bit 31). Vendor: `:870-1030`.
             if (raw as i32) < 0 {
                 // FALSIFICATION 2026-05-28: u32 packed multi-literal
-                // store (GZIPPY_PACKED_LIT_STORE) attempted on this
+                // store attempted on this
                 // path; 10-trial neurotic A/B showed parity (+0.4%,
                 // within noise). LLVM + store-buffer coalescing already
                 // merges the 4 separate 1-byte stores below as
