@@ -27,11 +27,16 @@ use std::io::Write;
 use crate::decompress::format::{has_bgzf_markers, is_likely_multi_member, read_gzip_isize};
 use crate::error::{GzippyError, GzippyResult};
 
+// Used only by the legacy scalar multi-member walk (`not(parallel_sm)` builds);
+// on parallel_sm builds the fast chunk kernel owns its own buffers.
+#[cfg_attr(parallel_sm, allow(dead_code))]
 #[cfg(target_os = "macos")]
 const CACHE_LINE_SIZE: usize = 128;
+#[cfg_attr(parallel_sm, allow(dead_code))]
 #[cfg(not(target_os = "macos"))]
 const CACHE_LINE_SIZE: usize = 64;
 
+#[cfg_attr(parallel_sm, allow(dead_code))]
 #[inline]
 fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
     let aligned = (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -656,142 +661,169 @@ fn decompress_single_member_for<W: Write>(
     }
 }
 
-/// Sequential multi-member decompress via the pure-Rust inflate engine
-/// (RFC 1952 §2.2: `cat a.gz b.gz`, pigz, log rotation). NO C-FFI: each member's
-/// gzip header is parsed in Rust, the raw deflate body is decoded with
-/// `inflate_consume_first_bits` (which byte-aligns at BFINAL), and the per-member
-/// CRC32 + ISIZE trailer is verified before stepping to the next member.
+/// Sequential (single-threaded) multi-member decompress (RFC 1952 §2.2:
+/// `cat a.gz b.gz`, pigz, log rotation). NO C-FFI. Each member is an independent
+/// single-member gzip stream; the walk decodes each member, verifies its
+/// per-member CRC32 + ISIZE trailer, and streams output in member order.
+///
+/// On `parallel_sm` builds this routes to the ParallelSM chunk kernel at
+/// parallelization=1 (whole-file grid, with a member-walk fallback — see
+/// [`crate::decompress::parallel::single_member::decompress_multi_member_seq_fast`]),
+/// NOT the scalar `inflate_consume_first_bits`, which ran this path at ~3×
+/// rapidgzip -P1 (mmiso locate, 2026-07-06). On the legacy bare-no-feature build
+/// (no `parallel_sm`) it uses the scalar member walk (correct, just slower).
 ///
 /// Stops cleanly (returning the bytes decoded so far) on the first non-gzip /
-/// truncated / corrupt trailing bytes — matching the historical libdeflate-based
-/// behavior, where trailing garbage after a valid member terminated the walk
-/// without erroring the already-written output.
+/// truncated / trailing bytes — matching gzip(1) and the historical
+/// libdeflate-based behavior, where trailing garbage after a valid member
+/// terminated the walk without erroring the already-written output. A member
+/// with a valid header but a corrupt body / mismatched trailer is a terminal
+/// `Err`.
 pub(crate) fn decompress_multi_member_sequential<W: Write>(
     data: &[u8],
     writer: &mut W,
 ) -> GzippyResult<u64> {
-    use crate::decompress::format::parse_gzip_header_size;
-    use crate::decompress::inflate::consume_first_decode::{inflate_consume_first_bits, Bits};
-
-    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
-    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-        isize_hint + 1024
-    } else {
-        data.len().saturating_mul(4).max(256 * 1024)
-    };
-    let mut output_buf = alloc_aligned_buffer(initial_size);
-
-    let mut total_bytes = 0u64;
-    let mut offset = 0usize;
-    let mut member_count = 0u32;
-
-    // Minimum gzip member: 10-byte header + ≥2-byte deflate + 8-byte trailer.
-    while offset + 18 <= data.len() {
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
-            break;
-        }
-        let header = match parse_gzip_header_size(&data[offset..]) {
-            Some(h) if h > 0 && offset + h < data.len() => h,
-            _ => break,
-        };
-        let body_start = offset + header;
-        let body = &data[body_start..];
-
-        // DoS/OOM guard: a valid DEFLATE member expands by at most
-        // MAX_DEFLATE_EXPANSION:1 (~1032:1). On a malformed body the inflate bit
-        // reader zero-pads past end-of-input and fabricates phantom literals
-        // forever, so the WriteZero growth loop below doubles `output_buf`
-        // without limit — a ~50-byte input drives a multi-GB allocation before
-        // OOM-kill. `body` is the whole residual (this member's deflate + its
-        // trailer + any following members), so this ceiling over-counts and can
-        // never trip on a legitimate high-ratio multi-member stream; it only
-        // fires when the decoder is producing implausibly more than the residual
-        // input could ever expand to. Mirrors the parallel-SM path's
-        // `set_output_ceiling_for_input` (chunk_data.rs).
-        const OOM_GUARD_SLACK: usize = 64 * 1024; // one 32 KiB window + headroom
-        let output_ceiling = body
-            .len()
-            .saturating_mul(crate::decompress::parallel::chunk_data::MAX_DEFLATE_EXPANSION)
-            .saturating_add(OOM_GUARD_SLACK);
-
-        // Decode the raw deflate body, growing the output buffer on overflow.
-        let (out_size, deflate_len) = loop {
-            let mut bits = Bits::new(body);
-            match inflate_consume_first_bits(&mut bits, &mut output_buf) {
-                Ok(n) => break (n, bits.bit_position().div_ceil(8)),
-                Err(e) if e.kind() == std::io::ErrorKind::WriteZero => {
-                    if output_buf.len() >= output_ceiling {
-                        // Runaway: output already exceeds the plausible ceiling
-                        // for this member's compressed length — reject as
-                        // malformed (terminal Err) instead of OOMing.
-                        return Err(GzippyError::decompression(format!(
-                            "multi-member: decoded output {} exceeds plausible ceiling {} \
-                             for {}-byte residual input — malformed stream",
-                            output_buf.len(),
-                            output_ceiling,
-                            body.len()
-                        )));
-                    }
-                    let new_size = output_buf
-                        .len()
-                        .saturating_mul(2)
-                        .max(256 * 1024)
-                        .min(output_ceiling);
-                    output_buf.resize(new_size, 0);
-                    continue;
-                }
-                // Corrupt / truncated trailing bytes: stop the walk (parity with
-                // the prior libdeflate `BadData => break`).
-                Err(_) => {
-                    writer.flush()?;
-                    return Ok(total_bytes);
-                }
-            }
-        };
-
-        // Verify the 8-byte gzip trailer (CRC32 + ISIZE) for this member.
-        let trailer = body_start + deflate_len;
-        if trailer + 8 > data.len() {
-            break; // truncated trailer
-        }
-        let expected_crc = u32::from_le_bytes([
-            data[trailer],
-            data[trailer + 1],
-            data[trailer + 2],
-            data[trailer + 3],
-        ]);
-        let expected_isize = u32::from_le_bytes([
-            data[trailer + 4],
-            data[trailer + 5],
-            data[trailer + 6],
-            data[trailer + 7],
-        ]);
-        if (out_size as u32) != expected_isize {
-            return Err(GzippyError::decompression(format!(
-                "multi-member: ISIZE mismatch (got {out_size}, expected {expected_isize})"
-            )));
-        }
-        let actual_crc = crc32fast::hash(&output_buf[..out_size]);
-        if actual_crc != expected_crc {
-            return Err(GzippyError::decompression(
-                "multi-member: CRC32 mismatch".to_string(),
-            ));
-        }
-
-        member_count += 1;
-        if crate::utils::debug_enabled() {
-            eprintln!(
-                "[gzippy] sequential member {member_count}: out_size={out_size} \
-                 deflate_len={deflate_len} offset={offset}/{}",
-                data.len()
-            );
-        }
-        writer.write_all(&output_buf[..out_size])?;
-        total_bytes += out_size as u64;
-        offset = trailer + 8;
+    // T1 FAST PATH (parallel_sm builds): decode through the ParallelSM chunk
+    // kernel instead of the legacy scalar `inflate_consume_first_bits`, recovering
+    // the located ~3× T1 multi-member deficit (mmiso 2026-07-06). The fast path
+    // tries the whole-file grid (one inflate pass, member boundaries discovered
+    // inline, per-member CRC32 + ISIZE verified) and, on a grid block-finder /
+    // boundary failure, resumes the sequential member-walk past the validated
+    // prefix already streamed — clean-stopping on trailing garbage and surfacing
+    // genuine corruption as a terminal error. Runs at parallelization=1: respects
+    // `-p1` by using the FASTER engine at effective-T=1, NOT by parallelizing.
+    // See `single_member::decompress_multi_member_seq_fast`.
+    #[cfg(parallel_sm)]
+    {
+        crate::decompress::parallel::single_member::decompress_multi_member_seq_fast(data, writer)
+            .map_err(|e| GzippyError::decompression(format!("multi-member seq: {e}")))
     }
-    writer.flush()?;
-    Ok(total_bytes)
+
+    #[cfg(not(parallel_sm))]
+    {
+        use crate::decompress::format::parse_gzip_header_size;
+        use crate::decompress::inflate::consume_first_decode::{inflate_consume_first_bits, Bits};
+
+        let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+        let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+            isize_hint + 1024
+        } else {
+            data.len().saturating_mul(4).max(256 * 1024)
+        };
+        let mut output_buf = alloc_aligned_buffer(initial_size);
+
+        let mut total_bytes = 0u64;
+        let mut offset = 0usize;
+        let mut member_count = 0u32;
+
+        // Minimum gzip member: 10-byte header + ≥2-byte deflate + 8-byte trailer.
+        while offset + 18 <= data.len() {
+            if data[offset] != 0x1f || data[offset + 1] != 0x8b {
+                break;
+            }
+            let header = match parse_gzip_header_size(&data[offset..]) {
+                Some(h) if h > 0 && offset + h < data.len() => h,
+                _ => break,
+            };
+            let body_start = offset + header;
+            let body = &data[body_start..];
+
+            // DoS/OOM guard: a valid DEFLATE member expands by at most
+            // MAX_DEFLATE_EXPANSION:1 (~1032:1). On a malformed body the inflate bit
+            // reader zero-pads past end-of-input and fabricates phantom literals
+            // forever, so the WriteZero growth loop below doubles `output_buf`
+            // without limit — a ~50-byte input drives a multi-GB allocation before
+            // OOM-kill. `body` is the whole residual (this member's deflate + its
+            // trailer + any following members), so this ceiling over-counts and can
+            // never trip on a legitimate high-ratio multi-member stream; it only
+            // fires when the decoder is producing implausibly more than the residual
+            // input could ever expand to. Mirrors the parallel-SM path's
+            // `set_output_ceiling_for_input` (chunk_data.rs).
+            const OOM_GUARD_SLACK: usize = 64 * 1024; // one 32 KiB window + headroom
+            let output_ceiling = body
+                .len()
+                .saturating_mul(crate::decompress::parallel::chunk_data::MAX_DEFLATE_EXPANSION)
+                .saturating_add(OOM_GUARD_SLACK);
+
+            // Decode the raw deflate body, growing the output buffer on overflow.
+            let (out_size, deflate_len) = loop {
+                let mut bits = Bits::new(body);
+                match inflate_consume_first_bits(&mut bits, &mut output_buf) {
+                    Ok(n) => break (n, bits.bit_position().div_ceil(8)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WriteZero => {
+                        if output_buf.len() >= output_ceiling {
+                            // Runaway: output already exceeds the plausible ceiling
+                            // for this member's compressed length — reject as
+                            // malformed (terminal Err) instead of OOMing.
+                            return Err(GzippyError::decompression(format!(
+                                "multi-member: decoded output {} exceeds plausible ceiling {} \
+                             for {}-byte residual input — malformed stream",
+                                output_buf.len(),
+                                output_ceiling,
+                                body.len()
+                            )));
+                        }
+                        let new_size = output_buf
+                            .len()
+                            .saturating_mul(2)
+                            .max(256 * 1024)
+                            .min(output_ceiling);
+                        output_buf.resize(new_size, 0);
+                        continue;
+                    }
+                    // Corrupt / truncated trailing bytes: stop the walk (parity with
+                    // the prior libdeflate `BadData => break`).
+                    Err(_) => {
+                        writer.flush()?;
+                        return Ok(total_bytes);
+                    }
+                }
+            };
+
+            // Verify the 8-byte gzip trailer (CRC32 + ISIZE) for this member.
+            let trailer = body_start + deflate_len;
+            if trailer + 8 > data.len() {
+                break; // truncated trailer
+            }
+            let expected_crc = u32::from_le_bytes([
+                data[trailer],
+                data[trailer + 1],
+                data[trailer + 2],
+                data[trailer + 3],
+            ]);
+            let expected_isize = u32::from_le_bytes([
+                data[trailer + 4],
+                data[trailer + 5],
+                data[trailer + 6],
+                data[trailer + 7],
+            ]);
+            if (out_size as u32) != expected_isize {
+                return Err(GzippyError::decompression(format!(
+                    "multi-member: ISIZE mismatch (got {out_size}, expected {expected_isize})"
+                )));
+            }
+            let actual_crc = crc32fast::hash(&output_buf[..out_size]);
+            if actual_crc != expected_crc {
+                return Err(GzippyError::decompression(
+                    "multi-member: CRC32 mismatch".to_string(),
+                ));
+            }
+
+            member_count += 1;
+            if crate::utils::debug_enabled() {
+                eprintln!(
+                    "[gzippy] sequential member {member_count}: out_size={out_size} \
+                 deflate_len={deflate_len} offset={offset}/{}",
+                    data.len()
+                );
+            }
+            writer.write_all(&output_buf[..out_size])?;
+            total_bytes += out_size as u64;
+            offset = trailer + 8;
+        }
+        writer.flush()?;
+        Ok(total_bytes)
+    }
 }
 
 /// Decompress zlib data (2-byte header + deflate + 4-byte Adler32).
