@@ -1529,11 +1529,29 @@ fn try_continue_next_member(
     }
     match crate::decompress::parallel::gzip_format::read_header(&input[header_byte..]) {
         Ok((_header, header_len)) => {
-            // Empty-dictionary reset: force the marker engine to re-prime with an
-            // empty window on the next `marker_decode_step` (`block_primed=false`
-            // ⇒ `block.reset(None, None)`). `flipped=true` disables the straddle-
-            // prone fold-flip for the rest of this chunk (see fn doc).
-            marker_ctx.block_primed = false;
+            // Empty-dictionary reset — install an EMPTY window so member N+1
+            // decodes CLEAN (into `chunk.data`, appended AFTER member N), exactly
+            // as the contig BFINAL continuation does (`block.reset(None,None)` +
+            // `set_initial_window(&[])`, GzipChunk.hpp:508). A bare
+            // `reset(None,None)` (the old `block_primed=false` path) leaves the
+            // engine in WINDOW-ABSENT/MARKER mode, so member N+1's bytes land in
+            // `data_with_markers` — which the output orders BEFORE `chunk.data`,
+            // scrambling `[big][s0][s1]` into `[s0][s1][big]` whenever an earlier
+            // member decoded clean into `chunk.data`. §3.3 requires markers appear
+            // ONLY before the first footer; every member after a boundary is
+            // clean by construction (empty dict ⇒ no unresolvable back-refs).
+            // `flipped=true` also disables the straddle-prone 32 KiB fold-flip for
+            // the rest of this chunk (see fn doc).
+            BOOTSTRAP_BLOCK.with(|cell_block| {
+                let mut block = cell_block.borrow_mut();
+                let mut unused: Vec<u16> = Vec::new();
+                block.reset(Some(&mut unused), Some(&[]));
+                debug_assert!(
+                    unused.is_empty(),
+                    "empty-window reset must not drain output"
+                );
+            });
+            marker_ctx.block_primed = true;
             marker_ctx.flipped = true;
             marker_ctx.current_bit_offset = (header_byte + header_len) * 8;
             *did_read_header = true;
@@ -7003,28 +7021,22 @@ mod exact_block_parity {
             // is the item-1 guarantee; per-member CRC verification is item 3.
         }
 
-        /// A LARGE first member (> 32 KiB, forces the fold-flip → contig
-        /// continuation) followed by SMALL members (pure-marker continuation) —
-        /// exercises BOTH continuation sub-paths in one chunk.
+        /// A LARGE first member (> 32 KiB, decoded CLEAN into `chunk.data`)
+        /// followed by SMALL members (pure-marker continuation) — exercises the
+        /// mixed geometry that was the stage-2c fold-geometry bug.
         ///
-        /// FIXME(stage-2b): the fold-flip → `finish_decode_chunk_contig_native::
-        /// <true>` continuation SCRAMBLES output order to `[member2][member3]
-        /// [member1]` (member1's decoded bytes land AFTER the continued members).
-        /// ISOLATED: `big`-alone through this exact window-absent path is
-        /// byte-EXACT (matches=true), and the stage-1 `decode_multi_member_native`
-        /// contig `::<true>` continuation entered FRESH (chunk.data empty) is
-        /// byte-exact — the scramble appears ONLY when the contig continuation is
-        /// entered via the FOLD flip (chunk.data pre-populated by the marker
-        /// fold's push_clean_u8). Symptom: total size + footer count are correct;
-        /// only byte ORDER is wrong (member1 written last). Suspected root cause:
-        /// the fold path retains/streams member1's pre-flip bytes via a window/
-        /// retain mechanism so they are not yet in `chunk.data.buf` at the moment
-        /// the continuation appends member2, then member1 is placed at finalize.
-        /// The PURE-MARKER continuation (all-small members, no flip) is byte-exact
-        /// (see `window_absent_small_members_pure_marker_continuation`). Fixing
-        /// this is the first task of the stage-2b successor (see distillation).
+        /// ROOT CAUSE (fixed stage-2c): `try_continue_next_member` left the marker
+        /// engine in WINDOW-ABSENT/marker mode across the boundary
+        /// (`block_primed=false` ⇒ `reset(None,None)`), so member N+1's bytes
+        /// landed in `data_with_markers`. Since the output is
+        /// `data_with_markers ++ data` and member1 (large) was already CLEAN in
+        /// `chunk.data`, the order came out `[s0][s1][big]` (total size + footer
+        /// count correct; only byte ORDER wrong). Fix: install an EMPTY window at
+        /// the boundary (`reset(Some,&[])`) so every member after the first footer
+        /// decodes CLEAN into `chunk.data` — the §3.3 "markers only before the
+        /// first footer" invariant. See `window_absent_small_members_pure_marker_
+        /// continuation` (all-small) and the two-large case below.
         #[test]
-        #[ignore = "stage-2b FIXME: fold-flip→contig::<true> continuation scrambles output order (see doc)"]
         fn window_absent_large_then_small_members_both_paths() {
             // Large, dynamic, well-compressible → > 32 KiB clean output.
             let big: Vec<u8> = {
@@ -7049,6 +7061,40 @@ mod exact_block_parity {
             assert_eq!(
                 chunk.segment_sizes_final(),
                 vec![big.len() as u64, s0.len() as u64, s1.len() as u64, 0]
+            );
+        }
+
+        /// TWO large (> 32 KiB) members back to back: member 1 decodes CLEAN into
+        /// `chunk.data`, then member 2 (also large) must ALSO decode CLEAN into
+        /// `chunk.data` (appended after member 1) via the empty-window boundary
+        /// reset — NOT into `data_with_markers`. Byte-exact + ordered.
+        #[test]
+        fn window_absent_two_large_members_both_clean() {
+            let big0: Vec<u8> = {
+                let mut v = Vec::new();
+                let line = b"first large member with structure and repetition ";
+                while v.len() < 150 * 1024 {
+                    v.extend_from_slice(line);
+                }
+                v
+            };
+            let big1: Vec<u8> = {
+                let mut v = Vec::new();
+                let line = b"second large member entirely distinct payload text ";
+                while v.len() < 120 * 1024 {
+                    v.extend_from_slice(line);
+                }
+                v
+            };
+            let (input, hlen, _total) = build_multi_member(&[&big0, &big1], 6);
+            let chunk = decode_mm_wa(&input, hlen, big0.len() + big1.len());
+            let mut expected = big0.clone();
+            expected.extend_from_slice(&big1);
+            assert_eq!(flatten(&chunk), expected, "two-large cross-member bytes");
+            assert_eq!(chunk.footers.len(), 2);
+            assert_eq!(
+                chunk.segment_sizes_final(),
+                vec![big0.len() as u64, big1.len() as u64, 0]
             );
         }
 
