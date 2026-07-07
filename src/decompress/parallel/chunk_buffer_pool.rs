@@ -172,8 +172,8 @@ thread_local! {
     static WORKER_POOL_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-// (GZIPPY_SHARED_POOL experiment removed 2026-05-28: a shared cross-worker
-// pool showed NO measurable wall effect on a quiet-enough box — page-faults
+// (shared cross-worker pool experiment removed 2026-05-28: it showed NO
+// measurable wall effect on a quiet-enough box — page-faults
 // −3.7% but cycles within noise. The per-worker pool collapses at T=16
 // because chunks sit in the consumer reorder buffer until Drop (buffer
 // RETURN LATENCY), not because of pool topology. See

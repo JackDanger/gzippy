@@ -168,27 +168,17 @@ pub static ISAL_INEXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
 
 /// Whether the clean-tail decode routes through REAL ISA-L FFI.
 ///
-/// PRODUCTION DEFAULT is the build: on `gzippy-isal` (`isal_clean_tail`) the clean
-/// tail is decoded by ISA-L (faithful rapidgzip WITH_ISAL,
-/// `finishDecodeChunkWithInexactOffset<IsalInflateWrapper>`, GzipChunk.hpp:440-444 +
-/// :520-526); on `gzippy-native` it stays pure-Rust. The env var is an OVERRIDE:
-///   * `GZIPPY_ISAL_ENGINE_ORACLE=1` — force ISA-L ON (the measurement oracle on the
-///     native build; OFF==pure-Rust identity there).
-///   * `GZIPPY_ISAL_ENGINE_ORACLE=0` — force ISA-L OFF (used by the differential gate
-///     to obtain a genuine pure-Rust comparison decode on the isal build).
-///   * unset — the build default (`cfg!(isal_clean_tail)`).
+/// The pure-Rust DEFLATE engine is the SOLE production decode path; ISA-L
+/// clean-tail decode survives only as a measurement oracle. The env var is an
+/// OVERRIDE (default OFF == pure-Rust identity):
+///   * `GZIPPY_ISAL_ENGINE_ORACLE=1` — force ISA-L ON (the measurement oracle).
+///   * `GZIPPY_ISAL_ENGINE_ORACLE=0` or unset — force ISA-L OFF (pure-Rust).
 #[cfg(parallel_sm)]
 #[inline]
 fn isal_engine_oracle_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").ok().as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => cfg!(isal_clean_tail),
-        },
-    )
+    *ON.get_or_init(|| std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").ok().as_deref() == Some("1"))
 }
 
 /// ALWAYS-SMALL INCREMENTAL GROWTH (measurement arm) — the footprint /
@@ -267,7 +257,7 @@ fn fold_nocrc_enabled() -> bool {
 /// window-seeded INEXACT chunks on gzippy-native. Default ON (Block engine).
 /// Production proof of which engine decoded each seeded chunk:
 /// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn seeded_block_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -280,14 +270,9 @@ fn seeded_block_enabled() -> bool {
 /// observing the wrapper-entry path it instruments). gzippy-isal: constant
 /// FALSE — the faithful rapidgzip WITH_ISAL clean-tail handoff
 /// (GzipChunk.hpp:440-444) stays untouched.
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn seeded_block_route_enabled() -> bool {
     seeded_block_enabled() && !isal_engine_oracle_enabled()
-}
-
-#[cfg(all(parallel_sm, isal_clean_tail))]
-fn seeded_block_route_enabled() -> bool {
-    false
 }
 
 /// M4 kill-switch (DIV-1 part 2): `GZIPPY_EXACT_BLOCK=0` restores the
@@ -295,7 +280,7 @@ fn seeded_block_route_enabled() -> bool {
 /// window-seeded UNTIL-EXACT chunks on gzippy-native. Default ON (Block
 /// engine). Production proof of which engine decoded each exact chunk:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn exact_block_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -309,14 +294,9 @@ fn exact_block_enabled() -> bool {
 /// BFINAL-exact-landing accept). gzippy-isal: constant FALSE — the faithful
 /// rapidgzip WITH_ISAL `decodeChunkWithInflateWrapper<IsalInflateWrapper>`
 /// path (GzipChunk.hpp:192-265) stays untouched.
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn exact_block_route_enabled() -> bool {
     exact_block_enabled() && !isal_engine_oracle_enabled()
-}
-
-#[cfg(all(parallel_sm, isal_clean_tail))]
-fn exact_block_route_enabled() -> bool {
-    false
 }
 
 // PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
@@ -733,39 +713,6 @@ fn record_bulk_decline(err: crate::decompress::parallel::lut_bulk_inflate::BulkD
     c.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Per-failure structured log. Writes one JSON line to the path in
-/// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
-/// distributional analysis: cluster failures by offset to see if they
-/// fall in specific corpus regions.
-#[cfg(parallel_sm)]
-fn body_fail_log(start_bit: usize, bits_into_body: usize, bytes_wasted: usize, err: &str) {
-    use std::io::Write;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let f = FILE.get_or_init(|| {
-        let path = std::env::var("GZIPPY_BODY_FAIL_LOG").ok()?;
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()?;
-        Some(Mutex::new(f))
-    });
-    let Some(mtx) = f else {
-        return;
-    };
-    let line = format!(
-        r#"{{"start_bit":{start_bit},"bits_into_body":{bits_into_body},"bytes_wasted":{bytes_wasted},"err":"{}"}}"#,
-        err.replace('"', "\\\"")
-    );
-    let mut g = mtx.lock().unwrap();
-    let _ = writeln!(g, "{}", line);
-}
-
-#[cfg(not(parallel_sm))]
-fn body_fail_log(_: usize, _: usize, _: usize, _: &str) {}
-
 /// Rapidgzip-shaped chunk decode — `GzipChunk.hpp::decodeChunkWithRapidgzip`
 /// (outer `while` over deflate blocks) with handoff to
 /// `finishDecodeChunkWithInexactOffset` once 32 KiB clean exist at a block
@@ -935,9 +882,9 @@ fn finish_decode_chunk_impl(
     initial_window: &[u8],
     record_decode_duration: bool,
     until_exact: bool,
-    // When false, FORCE the pure-Rust clean tail regardless of build/env. Used only
+    // When false, FORCE the pure-Rust clean tail regardless of env. Used only
     // by the differential gate's LEFT (pure) decode so it can compare against the
-    // ISA-L RIGHT on the `isal_clean_tail` build (where ISA-L is the default).
+    // ISA-L RIGHT when the ISA-L engine oracle is enabled.
     allow_isal: bool,
 ) -> Result<(), ChunkDecodeError> {
     FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1585,7 +1532,7 @@ fn try_continue_next_member(
 /// [`decode_chunk_unified_marker`]. This is the entry the whole-file MM parallel
 /// pipeline dispatches speculative chunks through (stage 2 driver, item 2); the
 /// existing [`decode_chunk_window_absent`] stays byte-identical (`::<false>`).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 pub fn decode_chunk_window_absent_multi(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -1706,7 +1653,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
         }
         match step {
             MarkerStep::Continue => {}
-            #[cfg(not(isal_clean_tail))]
             MarkerStep::FlipToContig { end_bit_offset } => {
                 FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::decompress::parallel::trace_v2::emit_instant(
@@ -1848,7 +1794,7 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
 ///     bit (documented M3 stream-end exception) — for the exact arm the
 ///     aligned convention is REQUIRED so the production
 ///     `stop_hint == total_bits` member-final chunk lands exactly.
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 // `MULTI_MEMBER` const-generic (precedent:
 // `read_internal_compressed_specialized<CONTAINS_MARKERS>`, module doc
 // `parallel/mod.rs:76-81`): when `false` the cross-member continuation at BFINAL
@@ -2236,7 +2182,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 ///
 /// Kill-switch: `GZIPPY_SEEDED_BLOCK=0` restores the wrapper arm exactly
 /// (see [`seeded_block_route_enabled`]).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn finish_decode_chunk_seeded_block_native(
     chunk: &mut ChunkData,
     input: &[u8],
@@ -2291,7 +2237,7 @@ fn finish_decode_chunk_seeded_block_native(
 /// thread-local [`BOOTSTRAP_BLOCK`] clean-from-byte-0 with the predecessor
 /// window (vendor GzipChunk.hpp:456-458 → `Block::setInitialWindow`,
 /// deflate.hpp:1750-1759).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn seed_block_for_contig_native(
     chunk: &mut ChunkData,
     input: &[u8],
@@ -2362,7 +2308,7 @@ fn seed_block_for_contig_native(
 /// window-present decode; chunk-0 semantics = a zero 32 KiB window seed, valid
 /// because the first block of a valid stream never back-references before output
 /// start). CRC + ISIZE are verified by the caller. T>1 NEVER reaches here.
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 pub(crate) fn decode_monolith_native(
     input: &[u8],
     expected_isize: usize,
@@ -2438,7 +2384,7 @@ pub(crate) fn decode_monolith_native(
 /// (`input.len() * 8` decodes the whole span to EOF). `reserve_hint` sizes the
 /// one output reservation (Σ member ISIZE, or 0 for the amortized-grow
 /// fallback).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 pub(crate) fn decode_multi_member_native(
     input: &[u8],
     first_block_bit: usize,
@@ -2490,7 +2436,7 @@ pub(crate) fn decode_multi_member_native(
 /// resident buffer streams like igzip's bounded output window. `GZIPPY_MONOLITH
 /// _STREAM_KIB` overrides for the fulcrum sweep (floor 128 KiB ≥ 2·window +
 /// headroom); default 8 MiB (cache-resident in L2/L3, few flushes).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn monolith_stream_buf_bytes() -> usize {
     const DEFAULT_BYTES: usize = 8 * 1024 * 1024;
     std::env::var("GZIPPY_MONOLITH_STREAM_KIB")
@@ -2530,7 +2476,7 @@ fn monolith_stream_buf_bytes() -> usize {
 ///
 /// Byte-identical output to `drive_thin_t1_oracle` / `decode_monolith_native`
 /// (same kernel, same clean window-present decode, chunk-0 zero-window seed).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 pub(crate) fn decode_and_stream_monolith_native<W: std::io::Write>(
     input: &[u8],
     expected_isize: usize,
@@ -2553,7 +2499,7 @@ pub(crate) fn decode_and_stream_monolith_native<W: std::io::Write>(
 /// sliding-window retention boundary, stored-block bursts spanning flushes, and
 /// the incremental `bytes_written` accounting. Production passes
 /// [`monolith_stream_buf_bytes`].
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
     input: &[u8],
     expected_isize: usize,
@@ -2818,60 +2764,6 @@ pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
 pub static MONOLITH_STREAM_NATIVE_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// T1-MONOLITH (gzippy-isal) — one full-stream ISA-L decode into ONE growable
-/// buffer (≈ the igzip monolith itself). Same divergence-ledger #1/#2/#3 as the
-/// native monolith, but the engine is ISA-L `decompress_deflate_from_bit_into_growable`
-/// over the whole stream (no per-chunk bound/re-slice/re-seed). Used as the
-/// post-shed kernel reference (isal_monolith ≈ igzip).
-#[cfg(all(parallel_sm, isal_clean_tail))]
-pub(crate) fn decode_monolith_isal(
-    input: &[u8],
-    expected_isize: usize,
-    configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    use crate::backends::isal_decompress;
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-
-    let mut chunk = ChunkData::new(0, configuration);
-    let zero_window = [0u8; MAX_WINDOW_SIZE];
-    chunk.prefill_window_prefix(&zero_window);
-    chunk.reserve_clean(expected_isize.saturating_add(1024));
-    let decode_start = chunk.data.len();
-
-    let crc32_enabled = chunk.configuration.crc32_enabled;
-    const GROW_BYTES: usize = 4 * 1024 * 1024;
-    let (written, end_bit, _boundaries) =
-        isal_decompress::decompress_deflate_from_bit_into_growable(
-            input,
-            0,
-            &zero_window,
-            &mut chunk.data,
-            expected_isize.saturating_add(1024),
-            GROW_BYTES,
-        )
-        .ok_or_else(|| {
-            ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "monolith ISA-L full-stream decode failed",
-            ))
-        })?;
-    // The growable decode commits bytes during decode then leaves them in spare;
-    // reset the logical length to decode_start and commit exactly `written`
-    // (mirror finish_decode_chunk_isal_oracle:496,610).
-    chunk.data.truncate(decode_start);
-    chunk.data.commit(written);
-    if crc32_enabled {
-        let kept = chunk.data.decoded_range(decode_start, written);
-        if let Some(last_crc) = chunk.crc32s.last_mut() {
-            last_crc.update(kept);
-        }
-    }
-    chunk.statistics.non_marker_count += written as u64;
-    MONOLITH_ISAL_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    chunk.finalize_with_deflate(end_bit, Some(input));
-    Ok(chunk)
-}
-
 /// Cross-member continuation deletion-trap: incremented every time the
 /// `MULTI_MEMBER=true` contig driver consumes a footer + next header and
 /// continues into the following gzip member (`finish_decode_chunk_contig_native`
@@ -2937,7 +2829,7 @@ pub static MONOLITH_ISAL_CHUNKS: std::sync::atomic::AtomicU64 =
 /// Kill-switch: `GZIPPY_EXACT_BLOCK=0` restores the wrapper arm exactly
 /// (see [`exact_block_route_enabled`]). Engine proof: [`EXACT_BLOCK_CHUNKS`]
 /// vs [`EXACT_WRAPPER_CHUNKS`].
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn finish_decode_chunk_exact_block_native(
     chunk: &mut ChunkData,
     input: &[u8],
@@ -2985,26 +2877,10 @@ fn finish_decode_chunk_exact_block_native(
     }
 }
 
-/// gzippy-isal stub: [`exact_block_route_enabled`] is constant `false` on the
-/// `isal_clean_tail` build (the faithful WITH_ISAL
-/// `decodeChunkWithInflateWrapper` path stays production, GzipChunk.hpp:192-265),
-/// so this is statically unreachable — it exists only so the route call site
-/// compiles on both builds.
-#[cfg(all(parallel_sm, isal_clean_tail))]
-fn finish_decode_chunk_exact_block_native(
-    _chunk: &mut ChunkData,
-    _input: &[u8],
-    _inflate_start_bit: usize,
-    _stop_hint_bits: usize,
-    _initial_window: &[u8],
-) -> Result<(), ChunkDecodeError> {
-    unreachable!("exact-Block route is gzippy-native only (exact_block_route_enabled() == false on isal_clean_tail)")
-}
-
 /// Vendor `decodeChunkWithInflateWrapper`-shaped envelope for the M4 Block
 /// route: fresh `ChunkData` + window-seeded exact decode + decode-duration
 /// accounting (mirror of `decode_chunk_with_inflate_wrapper`'s envelope).
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 fn decode_chunk_exact_block_native(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -3023,33 +2899,6 @@ fn decode_chunk_exact_block_native(
     )?;
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     Ok(chunk)
-}
-
-/// gzippy-isal stub (see [`finish_decode_chunk_exact_block_native`]'s stub).
-#[cfg(all(parallel_sm, isal_clean_tail))]
-fn decode_chunk_exact_block_native(
-    _input: &[u8],
-    _encoded_offset_bits: usize,
-    _stop_hint_bits: usize,
-    _initial_window: &[u8],
-    _configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    unreachable!("exact-Block route is gzippy-native only (exact_block_route_enabled() == false on isal_clean_tail)")
-}
-
-/// gzippy-isal stub: [`seeded_block_route_enabled`] is constant `false` on the
-/// `isal_clean_tail` build (the faithful WITH_ISAL clean-tail handoff stays the
-/// production seeded path, GzipChunk.hpp:440-444), so this is statically
-/// unreachable — it exists only so the route call site compiles on both builds.
-#[cfg(all(parallel_sm, isal_clean_tail))]
-fn finish_decode_chunk_seeded_block_native(
-    _chunk: &mut ChunkData,
-    _input: &[u8],
-    _inflate_start_bit: usize,
-    _stop_hint_bits: usize,
-    _initial_window: &[u8],
-) -> Result<(), ChunkDecodeError> {
-    unreachable!("seeded-Block route is gzippy-native only (seeded_block_route_enabled() == false on isal_clean_tail)")
 }
 
 /// Counter: chunks that took the window-present clean-from-block-0 fast path
@@ -3148,9 +2997,8 @@ enum MarkerStep {
     /// 32 KiB of clean output reached at a block boundary — FLIP to the u8 clean
     /// tail (vendor setInitialWindow). The clean 32 KiB window is the tail of
     /// `data_with_markers`; the caller decodes the rest as u8 into `chunk.data`.
-    /// Constructed only on the `isal_clean_tail` (gzippy-isal) build; on
-    /// gzippy-native the fold keeps Engine M decoding in-place, so this variant
-    /// is never returned (the match arm stays live for the isal build).
+    /// Never constructed on the gzippy-native build (the fold keeps Engine M
+    /// decoding in-place); the match arm stays live but unreached.
     #[allow(dead_code)]
     FlipToClean {
         end_bit_offset: usize,
@@ -3165,8 +3013,6 @@ enum MarkerStep {
     /// `Block` and decodes subsequent clean blocks DIRECTLY into `chunk.data`'s
     /// reserved tail via `decode_clean_into_contig` (faithful vendor prepend;
     /// `data_prefix_len` stays 0 because the window is real prior output).
-    /// Returned only on the `not(isal_clean_tail)` (gzippy-native) build.
-    #[cfg(not(isal_clean_tail))]
     FlipToContig { end_bit_offset: usize },
     /// Chunk ends in the marker path (BFINAL, stop hint, or no clean dict).
     Finished {
@@ -3418,47 +3264,27 @@ where
         let mut bits = ctx.open_bits(data);
         let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
-        // Vendor GzipChunk.hpp:520-525 — at 32 KiB of clean u8 the engine
-        // strategy forks by build:
-        //   * gzippy-isal (`isal_clean_tail`): two-phase Design-A handoff —
-        //     return `FlipToClean` so Engine C (`StreamingInflateWrapper`)
-        //     decodes the clean tail from the 32 KiB window. UNCHANGED.
-        //   * gzippy-native (`not(isal_clean_tail)`): FOLD — Engine M
-        //     (`marker_inflate::Block`) keeps decoding this and subsequent
-        //     blocks in-place on the SAME `ctx` cursor. `read()` already drains
-        //     clean u8 directly (marker_inflate.rs:1011 -> push_clean_u8 once
-        //     `contains_marker_bytes()==false`). The loop terminates naturally
-        //     at BFINAL (`Finished`, :1293) or stop_hint (:1222).
+        // Vendor GzipChunk.hpp:520-525 — at 32 KiB of clean u8 the engine FOLDS:
+        // Engine M (`marker_inflate::Block`) keeps decoding this and subsequent
+        // blocks in-place on the SAME `ctx` cursor. `read()` already drains clean
+        // u8 directly (marker_inflate.rs:1011 -> push_clean_u8 once
+        // `contains_marker_bytes()==false`). The loop terminates naturally at
+        // BFINAL (`Finished`, :1293) or stop_hint (:1222).
         // `ctx.flipped` is set once so this check fires a single time per chunk.
         if output.clean_appended_len() >= MAX_WINDOW_SIZE && !ctx.flipped {
             ctx.flipped = true;
-            #[cfg(isal_clean_tail)]
-            {
-                let end_bit_offset = next_block_offset;
-                ctx.current_bit_offset = end_bit_offset;
-                return Ok((
-                    MarkerStep::FlipToClean {
-                        end_bit_offset,
-                        window_len: MAX_WINDOW_SIZE,
-                    },
-                    false,
-                ));
-            }
             // gzippy-native: copy-free-to-final. The engine has already flipped
             // (clean_appended only grows post-engine-flip) and ≥32 KiB clean is
             // contiguous in chunk.data; hand the contig tail to the driver, which
             // resumes THIS Block decoding straight into chunk.data (no ring, no
             // drain memcpy). The driver re-borrows the same thread-local Block.
-            #[cfg(not(isal_clean_tail))]
-            {
-                ctx.current_bit_offset = next_block_offset;
-                return Ok((
-                    MarkerStep::FlipToContig {
-                        end_bit_offset: next_block_offset,
-                    },
-                    false,
-                ));
-            }
+            ctx.current_bit_offset = next_block_offset;
+            return Ok((
+                MarkerStep::FlipToContig {
+                    end_bit_offset: next_block_offset,
+                },
+                false,
+            ));
         }
 
         let header_res = {
@@ -3505,12 +3331,6 @@ where
                 BODY_FAIL_BITS_INTO_BODY
                     .fetch_add(bits_into_body as u64, std::sync::atomic::Ordering::Relaxed);
                 on_body_fail(&e);
-                body_fail_log(
-                    next_block_offset,
-                    bits_into_body,
-                    bytes_wasted,
-                    &format!("{e:?}"),
-                );
                 return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -3639,7 +3459,7 @@ mod tests {
     ///   (3) incremental bytes_written accounting across flushes.
     /// Verified against TWO independent oracles (flate2 + libdeflate) on the
     /// bytes each oracle's encoder produced.
-    #[cfg(all(parallel_sm, not(isal_clean_tail)))]
+    #[cfg(parallel_sm)]
     #[test]
     fn monolith_streaming_byte_exact_multi_cap_multi_shape() {
         use std::io::Read;
@@ -4419,717 +4239,7 @@ mod tests {
     }
 }
 
-// =========================================================================
-// STEP 1b GATE — pure-tail vs ISA-L-tail accounting differential
-// =========================================================================
-//
-// Decides whether routing the chunk clean-tail through real ISA-L (C FFI)
-// can reproduce, byte-for-byte, the ACCOUNTING the pure-Rust tail
-// (`finish_decode_chunk_impl`) produces:
-//   (a) committed decoded bytes      (b) committed length
-//   (c) final_bit handoff            (d) per-chunk CRC32 over committed span
-//   (e) deflate block-boundary list (bit offset + chunk-relative output off)
-//
-// LEFT (truth)   = production `finish_decode_chunk_impl` on a fresh ChunkData.
-// RIGHT (candidate ISA-L tail) = `decompress_deflate_from_bit_with_boundaries`
-//   over the full member tail, then a FROZEN coalesce post-processing rule:
-//     - until_exact=false: first recorded boundary with bit >= stop_hint_bits
-//     - until_exact=true : the recorded boundary with bit == stop_hint_bits
-//   truncate decoded bytes + recompute CRC + set final_bit at that boundary.
-//
-// The post-processing rule is frozen BEFORE running (advisor Q1): if it
-// disagrees with the pure tail's coalesce rule (chunk_decode.rs:459-497, esp.
-// the END_OF_BLOCK_HEADER/last_eob_pos branch at :478-489) that disagreement
-// is the GATE FINDING, not a bug to patch out.
-#[cfg(all(test, isal_clean_tail))]
-mod isal_tail_parity {
-    use super::*;
-    use crate::decompress::parallel::crc32::crc32 as crc32_of;
-
-    const WINDOW: usize = 32 * 1024;
-
-    struct Boundary {
-        bit: usize,
-        out_off: usize,
-    }
-
-    /// Decode the whole raw-deflate member once with the pure wrapper,
-    /// recording every END_OF_BLOCK boundary (bit position = start of next
-    /// block header; output offset = decoded bytes just past finished block).
-    fn enumerate(input: &[u8]) -> (Vec<u8>, Vec<Boundary>) {
-        let mut wrapper =
-            StreamingInflateWrapper::with_until_bits(input, 0, input.len() * 8).expect("init");
-        wrapper.set_window(&[]).expect("empty window");
-        wrapper.set_stopping_points(
-            StoppingPoints::END_OF_BLOCK
-                | StoppingPoints::END_OF_BLOCK_HEADER
-                | StoppingPoints::END_OF_STREAM_HEADER,
-        );
-        let mut decoded: Vec<u8> = Vec::new();
-        let mut bounds: Vec<Boundary> = Vec::new();
-        let mut buf = vec![0u8; 128 * 1024];
-        let mut last_bit = 0usize;
-        loop {
-            let r = wrapper.read_stream(&mut buf).expect("read_stream");
-            decoded.extend_from_slice(&buf[..r.bytes_written]);
-            if r.stopped_at == StoppingPoints::END_OF_BLOCK {
-                bounds.push(Boundary {
-                    bit: r.bit_position,
-                    out_off: decoded.len(),
-                });
-            }
-            if r.finished {
-                break;
-            }
-            // No-progress guard.
-            if r.bytes_written == 0
-                && r.stopped_at == StoppingPoints::NONE
-                && r.bit_position == last_bit
-            {
-                break;
-            }
-            last_bit = r.bit_position;
-        }
-        (decoded, bounds)
-    }
-
-    /// One LEFT (production pure tail) decode on a fresh ChunkData.
-    /// Returns (committed bytes, len, final_bit, crc, in-span boundaries).
-    fn left_tail(
-        input: &[u8],
-        start_bit: usize,
-        stop_hint: usize,
-        window: &[u8],
-        until_exact: bool,
-        all: &[Boundary],
-    ) -> (Vec<u8>, usize, usize, u32, Vec<(usize, usize)>) {
-        let cfg = ChunkConfiguration::default();
-        let mut chunk = ChunkData::new(start_bit, cfg);
-        finish_decode_chunk_impl(
-            &mut chunk,
-            input,
-            start_bit,
-            stop_hint,
-            window,
-            false,
-            until_exact,
-            // FORCE pure-Rust: this is the differential gate's LEFT (pure) decode,
-            // compared against the ISA-L RIGHT below. On the isal_clean_tail build
-            // ISA-L is the production default, so the gate must explicitly opt out.
-            false,
-        )
-        .expect("pure tail decode");
-
-        // Control LEFT state (advisor Q5).
-        assert_eq!(
-            chunk.data_prefix_len, 0,
-            "LEFT: unexpected window-image prefix"
-        );
-        assert_eq!(
-            chunk.narrowed_len, 0,
-            "LEFT: unexpected narrowed marker prefix"
-        );
-        assert_eq!(
-            chunk.crc32s.len(),
-            1,
-            "LEFT: expected exactly one CRC accumulator"
-        );
-        assert!(chunk.encoded_size_bits > 0, "LEFT: finalize did not run");
-
-        let bytes = chunk.data.to_contiguous();
-        let len = chunk.data.len();
-        let final_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-        let crc = chunk.crc32s[0].crc32();
-        // Cross-check the accumulator equals a fresh CRC of the committed span
-        // (so a CRC-algorithm mismatch can't masquerade as a (d) divergence).
-        assert_eq!(
-            crc,
-            crc32_of(&bytes),
-            "LEFT: CRC accumulator != crc32(committed)"
-        );
-
-        let start_off = all
-            .iter()
-            .find(|b| b.bit == start_bit)
-            .map(|b| b.out_off)
-            .unwrap_or(0);
-        let in_span: Vec<(usize, usize)> = all
-            .iter()
-            .filter(|b| b.bit > start_bit && b.bit <= final_bit)
-            .map(|b| (b.bit, b.out_off - start_off))
-            .collect();
-        (bytes, len, final_bit, crc, in_span)
-    }
-
-    /// One RIGHT (ISA-L FFI + frozen coalesce post-processing) decode.
-    fn right_tail(
-        input: &[u8],
-        start_bit: usize,
-        stop_hint: usize,
-        window: &[u8],
-        until_exact: bool,
-    ) -> Option<(Vec<u8>, usize, usize, u32, Vec<(usize, usize)>)> {
-        let mut throwaway = crc32fast::Hasher::new();
-        // Full member tail (advisor Q3): never a fixed margin.
-        let (out, _end, bnds) =
-            crate::backends::isal_decompress::decompress_deflate_from_bit_with_boundaries(
-                input,
-                start_bit,
-                window,
-                input.len(), // generous cap; ISA-L grows on demand
-                &mut throwaway,
-            )?;
-        // FROZEN coalesce rule.
-        let chosen = if until_exact {
-            bnds.iter().find(|b| b.bit_offset == stop_hint)
-        } else {
-            bnds.iter().find(|b| b.bit_offset >= stop_hint)
-        }?;
-        let truncate = chosen.output_offset;
-        let final_bit = chosen.bit_offset;
-        let bytes = out[..truncate].to_vec();
-        let crc = crc32_of(&bytes);
-        let in_span: Vec<(usize, usize)> = bnds
-            .iter()
-            .filter(|b| b.bit_offset > start_bit && b.bit_offset <= final_bit)
-            .map(|b| (b.bit_offset, b.output_offset))
-            .collect();
-        Some((bytes, truncate, final_bit, crc, in_span))
-    }
-
-    /// Build a multi-MiB all-DYNAMIC-Huffman gzip member as a portable stand-in
-    /// for the silesia corpus, so the differential gate runs even where the
-    /// benchmark_data fixture is absent (e.g. local Rosetta x86 iteration). The
-    /// payload mixes compressible English-ish phrases with structured bytes so
-    /// flate2 -9 emits dynamic-Huffman blocks with MANY interior EOB boundaries
-    /// (the regime the gate samples). This is a SUPPLEMENT to — not a replacement
-    /// for — the real silesia run on the corpus-bearing box.
-    fn synthetic_dynamic_gz() -> Vec<u8> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-        let words: &[&str] = &[
-            "the ",
-            "quick ",
-            "brown ",
-            "fox ",
-            "jumps ",
-            "over ",
-            "lazy ",
-            "dog ",
-            "lorem ",
-            "ipsum ",
-            "dolor ",
-            "sit ",
-            "amet ",
-            "consectetur ",
-            "adipiscing ",
-        ];
-        let mut data: Vec<u8> = Vec::with_capacity(12 * 1024 * 1024);
-        let mut rng: u64 = 0x9e3779b97f4a7c15;
-        while data.len() < 12 * 1024 * 1024 {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let w = words[(rng >> 33) as usize % words.len()];
-            data.extend_from_slice(w.as_bytes());
-            if (rng >> 17) % 5 == 0 {
-                data.extend_from_slice(&rng.to_le_bytes());
-            }
-        }
-        let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
-        enc.write_all(&data).unwrap();
-        enc.finish().unwrap()
-    }
-
-    /// GROWTH-PAST-THE-OLD-CAP gate (advisor follow-up to the DIS-29 storm
-    /// fix). The 64 MiB RESERVE_CAP now bounds only the UPFRONT reserve; a
-    /// chunk whose decoded size exceeds it must GROW past the cap on demand
-    /// (previously such a chunk ALWAYS fell back to pure-Rust). A multi-GB
-    /// end-to-end fixture is too heavy for the suite, so exercise the exact
-    /// production code path directly: the growable FFI decode into a
-    /// `SegmentedU8` sink with initial == the 64 MiB cap, on a raw-deflate
-    /// stream decoding to ~90 MiB. Asserts full decode + byte-exact output.
-    #[test]
-    fn isal_growable_decode_grows_past_64mib_cap() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        // ~90 MiB of a repeating 512-byte pattern -> tiny compressed stream
-        // with extreme expansion (the regime that blows past the cap).
-        let mut pattern = [0u8; 512];
-        for (i, b) in pattern.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
-        const RAW_LEN: usize = 90 * 1024 * 1024;
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
-        let mut remaining = RAW_LEN;
-        while remaining > 0 {
-            let n = remaining.min(pattern.len());
-            enc.write_all(&pattern[..n]).unwrap();
-            remaining -= n;
-        }
-        let deflate = enc.finish().unwrap();
-
-        const OLD_CAP: usize = 64 * 1024 * 1024; // the production upfront-reserve cap
-        let mut sink = crate::decompress::parallel::segmented_buffer::SegmentedU8::default();
-        let (written, _end_bit, _boundaries) =
-            crate::backends::isal_decompress::decompress_deflate_from_bit_into_growable(
-                &deflate,
-                0,
-                &[],
-                &mut sink,
-                OLD_CAP,
-                4 * 1024 * 1024,
-            )
-            .expect("growable decode must not fail past the old 64 MiB cap");
-        assert_eq!(written, RAW_LEN, "must decode past the 64 MiB initial");
-        assert_eq!(sink.len(), RAW_LEN);
-        let out = sink.to_contiguous();
-        assert!(
-            out.chunks(pattern.len()).all(|c| c == &pattern[..c.len()]),
-            "decoded bytes must match the source pattern"
-        );
-    }
-
-    /// FALLBACK-STORM regression gate (DIS-29 / HANDOFF item i). On a
-    /// >8x-compressible corpus the old FIXED 8x-compressed-span reserve
-    /// overflowed on EVERY chunk: `decompress_deflate_from_bit_into` returned
-    /// `None` at buffer-full, so ALL chunks fell back to the ~7.5x-slower
-    /// pure-Rust engine (isal_chunks=0 — nasa 9.9x crushed T1 to 0.57x rg).
-    /// The growable production decode keeps the same 8x upfront reserve but
-    /// GROWS on overflow, so chunks stay on ISA-L. This test builds a ~10x
-    /// web-log-like member, decodes it through the REAL ParallelSM pipeline at
-    /// T=4, and asserts (a) byte-exact output and (b) at least one chunk
-    /// decoded on the ISA-L engine (the pre-fix binary storms: chunks=0).
-    #[test]
-    fn isal_engine_survives_8x_expansion_no_storm() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-        use std::sync::atomic::Ordering;
-
-        // ~48 MiB of repetitive log lines -> ratio >10x at level 9.
-        let mut raw: Vec<u8> = Vec::with_capacity(48 * 1024 * 1024);
-        let mut rng: u64 = 0x2545f4914f6cdd1d;
-        while raw.len() < 48 * 1024 * 1024 {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let host = (rng >> 33) % 50;
-            let path = (rng >> 13) % 200;
-            let code = 100 + ((rng >> 5) % 65000);
-            raw.extend_from_slice(
-                format!(
-                    "host{host:03}.example.com - - [01/Jul/1995:00:00:{:02} -0400] \
-                     \"GET /path/to/resource/{path} HTTP/1.0\" 200 {code}\n",
-                    rng % 60
-                )
-                .as_bytes(),
-            );
-        }
-        let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
-        enc.write_all(&raw).unwrap();
-        let gz = enc.finish().unwrap();
-        let ratio = raw.len() as f64 / gz.len() as f64;
-        assert!(
-            ratio > 8.5,
-            "fixture must exceed the 8x storm threshold, got {ratio:.2}x"
-        );
-
-        let chunks_before = ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed);
-        let mut out: Vec<u8> = Vec::with_capacity(raw.len());
-        let n =
-            crate::decompress::parallel::single_member::decompress_parallel(&gz, &mut out, None, 4)
-                .expect("parallel decode of >8x member");
-        assert_eq!(n as usize, raw.len());
-        assert_eq!(out, raw, "output must be byte-exact");
-        let chunks_delta = ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed) - chunks_before;
-        assert!(
-            chunks_delta >= 1,
-            "ISA-L engine decoded no chunks on a >8x corpus — the reserve-overflow \
-             fallback storm is back (DIS-29)"
-        );
-    }
-
-    /// BFINAL exact-landing gate: `finish_decode_chunk_isal_oracle` with
-    /// `until_exact=true` must return `Ok(true)` when no recorded EOB boundary
-    /// matches stop_hint_bits exactly BUT ISA-L's `end_bit` is within 1 bit of
-    /// stop_hint_bits. Two diagnosed sub-cases:
-    ///
-    /// (a) ISA-L exits via ISAL_BLOCK_FINISH without setting stopped_at for the
-    ///     BFINAL block — no EOB boundary recorded, `end_bit == stop_hint_bits`.
-    ///
-    /// (b) ISA-L records the BFINAL EOB boundary via stopped_at but at
-    ///     `stop_hint_bits - 1` (1-bit coordinate discrepancy between ISA-L's
-    ///     chunk-decode buffering state and the block_finder's canonical scan).
-    ///     Diagnosed on NASA Jul95: start_bit=150999587, stop_hint=156360208,
-    ///     end_bit=156360207, boundaries=25, delta=-1, 3–5/30 runs at T8/T12.
-    ///
-    /// Pre-fix: the `None` arm of the boundary search returns `Ok(false)`.
-    /// Post-fix: `end_bit` within 1 bit of stop_hint_bits ⇒ accept.
-    #[test]
-    fn isal_until_exact_accepts_bfinal_exact_landing() {
-        use crate::backends::isal_decompress;
-        use crate::decompress::parallel::segmented_buffer::SegmentedU8;
-
-        let gz = synthetic_dynamic_gz();
-        let hdr =
-            crate::decompress::parallel::single_member::skip_gzip_header(&gz).expect("gzip header");
-        // Raw deflate payload: strip gzip header and 8-byte trailer.
-        let input = &gz[hdr..gz.len() - 8];
-
-        // Full-member reference decode via the pure wrapper: decoded bytes + EOB boundaries.
-        let (decoded, bounds) = enumerate(input);
-        assert!(
-            bounds.len() >= 2,
-            "synthetic member must have at least 2 EOB boundaries (got {})",
-            bounds.len()
-        );
-
-        // Get the stream end bit from a full ISA-L decode of the whole member.
-        let mut sink = SegmentedU8::default();
-        let (_, stream_end_bit, _) = isal_decompress::decompress_deflate_from_bit_into_growable(
-            input,
-            0,
-            &[],
-            &mut sink,
-            8 * 1024 * 1024,
-            4 * 1024 * 1024,
-        )
-        .expect("full ISA-L member decode must succeed");
-
-        // Pick the last interior EOB boundary that has at least 32 KiB of decoded
-        // output before it, so we can seed a full 32 KiB window. This boundary is
-        // the simulated "chunk start" — from here to stream_end_bit is the member's
-        // tail chunk, whose only remaining block is the BFINAL block.
-        let start_b = bounds
-            .iter()
-            .rev()
-            .find(|b| b.out_off >= WINDOW && b.bit < stream_end_bit)
-            .expect("synthetic member must have a boundary with >= 32 KiB of preceding output");
-
-        let start_bit = start_b.bit;
-        let window_end = start_b.out_off;
-        let window = &decoded[window_end - WINDOW..window_end];
-
-        // stop_hint == stream_end_bit: this is the until_exact BFINAL exact case.
-        let stop_hint_bits = stream_end_bit;
-
-        // Construct a fresh ChunkData and call finish_decode_chunk_isal_oracle directly.
-        // The test module lives in the same file so the private function is in scope.
-        let cfg = ChunkConfiguration::default();
-        let mut chunk = ChunkData::new(start_bit, cfg);
-        let result = finish_decode_chunk_isal_oracle(
-            &mut chunk,
-            input,
-            start_bit,
-            stop_hint_bits,
-            window,
-            true, // until_exact — exercises the BFINAL exact-landing branch
-        );
-
-        assert!(
-            result.is_ok(),
-            "finish_decode_chunk_isal_oracle returned Err on BFINAL tail: {:?}",
-            result
-        );
-        assert!(
-            result.unwrap(),
-            "finish_decode_chunk_isal_oracle returned Ok(false) on BFINAL exact landing \
-             (start_bit={start_bit} stop_hint={stop_hint_bits}): the None arm should \
-             accept when end_bit is within 1 bit of stop_hint_bits (pre-fix behavior: \
-             exact equality check missed the 1-bit ISA-L coordinate discrepancy)"
-        );
-
-        // Verify decoded bytes match the ground-truth reference.
-        let chunk_bytes = chunk.data.to_contiguous();
-        let reference = &decoded[window_end..];
-        assert_eq!(
-            chunk_bytes.len(),
-            reference.len(),
-            "BFINAL tail length mismatch: ISA-L={} pure={} \
-             (start_bit={start_bit} stop_hint={stop_hint_bits})",
-            chunk_bytes.len(),
-            reference.len()
-        );
-        assert_eq!(
-            chunk_bytes, reference,
-            "BFINAL tail bytes mismatch at start_bit={start_bit} stop_hint={stop_hint_bits}"
-        );
-    }
-
-    /// RATIO-INFORMED RESERVE unit gate. Tests `compute_initial_reserve` for
-    /// the three representative corpus classes and boundary conditions:
-    ///
-    /// * 1.3× (model-like, near-incompressible) — ratio_ceil = 2; reserve
-    ///   = compressed_span × 2, correctly sized 6× smaller than the old 8×.
-    /// * 7.8× (ghcn-like) — ratio_ceil = 10; reserve = compressed_span × 10,
-    ///   within cap for typical 4 MiB chunks.
-    /// * 10× — ratio_ceil = 13; reserve = compressed_span × 13, also within
-    ///   cap for 4 MiB chunks.
-    /// * Unknown (0) — falls back to historical 8× factor.
-    /// * Floor: tiny compressed_span → clamped up to RESERVE_FLOOR (4 MiB).
-    /// * Cap: large span × large factor → clamped to RESERVE_CAP (64 MiB).
-    #[cfg(parallel_sm)]
-    #[test]
-    fn ratio_informed_reserve_computation() {
-        const FLOOR: usize = 4 * 1024 * 1024;
-        const CAP: usize = 64 * 1024 * 1024;
-        let span = 4 * 1024 * 1024usize; // typical 4 MiB compressed chunk
-
-        // 1.3× corpus (model): ceil(1.3 × 1.25) = ceil(1.625) = 2
-        // The sm_driver computes this as ceil(ISIZE×5 / compressed×4) = ceil(6.5/4·compressed)
-        // Verify the clamp helper uses factor 2 correctly.
-        let rc_13: u16 = 2;
-        assert_eq!(
-            compute_initial_reserve(span, rc_13),
-            span * 2, // 8 MiB — within [4 MiB, 64 MiB]
-            "1.3x corpus: expected 2× reserve"
-        );
-
-        // 7.8× corpus (ghcn): ceil(7.8 × 1.25) = ceil(9.75) = 10
-        let rc_78: u16 = 10;
-        assert_eq!(
-            compute_initial_reserve(span, rc_78),
-            span * 10, // 40 MiB — within cap
-            "7.8x corpus: expected 10× reserve (40 MiB < 64 MiB cap)"
-        );
-
-        // 10× corpus: ceil(10 × 1.25) = ceil(12.5) = 13
-        let rc_10: u16 = 13;
-        assert_eq!(
-            compute_initial_reserve(span, rc_10),
-            span * 13, // 52 MiB — within cap
-            "10x corpus: expected 13× reserve (52 MiB < 64 MiB cap)"
-        );
-
-        // Unknown (expansion_ratio_ceil = 0) → historical 8× fallback
-        assert_eq!(
-            compute_initial_reserve(span, 0),
-            span * 8, // 32 MiB
-            "unknown ratio: must fall back to 8× factor"
-        );
-
-        // Floor: tiny span → clamp up to 4 MiB
-        assert_eq!(
-            compute_initial_reserve(0, 2),
-            FLOOR,
-            "zero span: must clamp to RESERVE_FLOOR"
-        );
-        assert_eq!(
-            compute_initial_reserve(100, 2),
-            FLOOR,
-            "tiny span (100B × 2 = 200B < 4 MiB): must clamp to RESERVE_FLOOR"
-        );
-
-        // Cap: 10 MiB span × factor 10 = 100 MiB → clamp to 64 MiB
-        assert_eq!(
-            compute_initial_reserve(10 * 1024 * 1024, 10),
-            CAP,
-            "100 MiB upfront request: must clamp to RESERVE_CAP (64 MiB)"
-        );
-    }
-
-    /// Verify that sm_driver computes the expected ratio_ceil values for the
-    /// representative corpus classes (1.3×, 7.8×, 10×) without needing a full
-    /// decode.  This tests the arithmetic only — the pure formula
-    /// `ceil(ISIZE × 5 / (compressed × 4)), min 2`.
-    #[test]
-    fn ratio_ceil_arithmetic() {
-        // Helper: compute ratio_ceil exactly as sm_driver does.
-        let ratio_ceil = |isize_bytes: u64, compressed_bytes: u64| -> u16 {
-            if compressed_bytes == 0 || isize_bytes == 0 {
-                return 0;
-            }
-            let numer = isize_bytes.saturating_mul(5);
-            let denom = compressed_bytes.saturating_mul(4);
-            ((numer + denom - 1) / denom).max(2).min(u16::MAX as u64) as u16
-        };
-
-        // 1.3× member: ISIZE = 269 MiB, compressed = 204 MiB
-        // ceil(269 × 5 / (204 × 4)) = ceil(1345 / 816) = ceil(1.649) = 2
-        let r = ratio_ceil(269 * 1024 * 1024, 204 * 1024 * 1024);
-        assert_eq!(r, 2, "1.3x model corpus: ratio_ceil should be 2");
-
-        // 7.8× member (ghcn-like): ISIZE = 7.8 × compressed
-        // ceil(7.8 × 5 / 4) = ceil(9.75) = 10
-        let compressed = 50_000_000u64;
-        let uncompressed = (compressed as f64 * 7.8) as u64;
-        let r = ratio_ceil(uncompressed, compressed);
-        assert_eq!(r, 10, "7.8x corpus: ratio_ceil should be 10");
-
-        // 10× member: ceil(10 × 5 / 4) = ceil(12.5) = 13
-        let compressed = 50_000_000u64;
-        let uncompressed = compressed * 10;
-        let r = ratio_ceil(uncompressed, compressed);
-        assert_eq!(r, 13, "10x corpus: ratio_ceil should be 13");
-
-        // Minimum floor: 1.0× exactly → ceil(1.0 × 1.25) = ceil(1.25) = 2 (min)
-        let r = ratio_ceil(100, 100);
-        assert_eq!(r, 2, "1.0x corpus: ratio_ceil should be 2 (minimum)");
-
-        // Unknown (zero isize or compressed) → 0
-        assert_eq!(ratio_ceil(0, 100), 0, "zero isize → unknown");
-        assert_eq!(ratio_ceil(100, 0), 0, "zero compressed → unknown");
-    }
-
-    #[test]
-    fn isal_tail_matches_pure_tail_on_real_silesia_chunks() {
-        // Prefer the real silesia corpus where present (the canonical gate input
-        // on the bench box); fall back to a portable synthetic dynamic member so
-        // the differential runs locally too.
-        let gz = std::fs::read("benchmark_data/silesia-gzip.tar.gz")
-            .unwrap_or_else(|_| synthetic_dynamic_gz());
-        let hdr =
-            crate::decompress::parallel::single_member::skip_gzip_header(&gz).expect("gzip header");
-        let input = &gz[hdr..gz.len() - 8];
-
-        let (decoded, bounds) = enumerate(input);
-        assert!(
-            bounds.len() > 40,
-            "need many real deflate boundaries, got {}",
-            bounds.len()
-        );
-        eprintln!(
-            "[gate] raw deflate {} bytes -> {} decoded bytes, {} EOB boundaries",
-            input.len(),
-            decoded.len(),
-            bounds.len()
-        );
-
-        // Synthesize real chunk tail-decode inputs: 5 starts evenly spread
-        // across interior boundaries, each spanning K=8 blocks.
-        const K: usize = 8;
-        let n = bounds.len();
-        let mut starts: Vec<usize> = Vec::new();
-        for f in 1..=5usize {
-            let idx = (n * f) / 7;
-            if idx >= 1 && idx + K + 1 < n {
-                starts.push(idx);
-            }
-        }
-        starts.dedup();
-        assert!(!starts.is_empty(), "no usable chunk starts");
-
-        let mut total = 0usize;
-        let mut diverged = 0usize;
-
-        for &si in &starts {
-            for until_exact in [false, true] {
-                let start_b = &bounds[si];
-                let start_bit = start_b.bit;
-                let win_lo = start_b.out_off.saturating_sub(WINDOW);
-                // Exact available prefix, capped at 32 KiB (advisor Q4).
-                let window = &decoded[win_lo..start_b.out_off];
-
-                let stop_hint = if until_exact {
-                    // Exact later real boundary.
-                    bounds[si + K].bit
-                } else {
-                    // Mid-block: between boundary si+K-1 and si+K, so the pure
-                    // "first EOB at-or-past" should land on bounds[si+K].
-                    let a = bounds[si + K - 1].bit;
-                    let b = bounds[si + K].bit;
-                    a + (b - a) / 2
-                };
-
-                total += 1;
-                let label = format!(
-                    "start_idx={si} start_bit={start_bit} stop_hint={stop_hint} \
-                     until_exact={until_exact} win_len={}",
-                    window.len()
-                );
-
-                let (lb, ll, lf, lc, lbnd) =
-                    left_tail(input, start_bit, stop_hint, window, until_exact, &bounds);
-
-                let right = right_tail(input, start_bit, stop_hint, window, until_exact);
-                let Some((rb, rl, rf, rc, rbnd)) = right else {
-                    diverged += 1;
-                    eprintln!(
-                        "[gate] DIVERGE ({label}): ISA-L produced NO boundary matching the \
-                         frozen coalesce rule (until_exact={until_exact}); LEFT len={ll} final_bit={lf}"
-                    );
-                    continue;
-                };
-
-                let a_ok = lb == rb;
-                let b_ok = ll == rl;
-                let c_ok = lf == rf;
-                let d_ok = lc == rc;
-                let e_ok = lbnd == rbnd;
-
-                if a_ok && b_ok && c_ok && d_ok && e_ok {
-                    eprintln!(
-                        "[gate] MATCH ({label}): len={ll} final_bit={lf} crc={lc:#010x} \
-                         boundaries={}",
-                        lbnd.len()
-                    );
-                } else {
-                    diverged += 1;
-                    eprintln!("[gate] DIVERGE ({label}):");
-                    eprintln!(
-                        "    (a) bytes     : {}",
-                        if a_ok {
-                            "match".into()
-                        } else {
-                            format!(
-                                "DIFFER (left {} vs right {} bytes; first diff at {:?})",
-                                lb.len(),
-                                rb.len(),
-                                lb.iter().zip(rb.iter()).position(|(x, y)| x != y)
-                            )
-                        }
-                    );
-                    eprintln!(
-                        "    (b) length    : {}",
-                        if b_ok {
-                            "match".into()
-                        } else {
-                            format!("DIFFER left {ll} vs right {rl}")
-                        }
-                    );
-                    eprintln!(
-                        "    (c) final_bit : {}",
-                        if c_ok {
-                            "match".into()
-                        } else {
-                            format!("DIFFER left {lf} vs right {rf}")
-                        }
-                    );
-                    eprintln!(
-                        "    (d) crc       : {}",
-                        if d_ok {
-                            "match".into()
-                        } else {
-                            format!("DIFFER left {lc:#010x} vs right {rc:#010x}")
-                        }
-                    );
-                    eprintln!(
-                        "    (e) boundaries: {}",
-                        if e_ok {
-                            "match".into()
-                        } else {
-                            format!("DIFFER left {} vs right {} entries", lbnd.len(), rbnd.len())
-                        }
-                    );
-                }
-            }
-        }
-
-        eprintln!(
-            "[gate] SUMMARY: {} chunk-decodes, {} matched, {} diverged",
-            total,
-            total - diverged,
-            diverged
-        );
-        assert_eq!(
-            diverged, 0,
-            "ISA-L tail diverged from pure tail on {diverged}/{total} chunk-decodes \
-             (see [gate] lines above for the exact field + mechanism)"
-        );
-    }
-}
-
-/// NATIVE fold gate (gzippy-native, `not(isal_clean_tail)`).
+/// NATIVE fold gate (gzippy-native).
 ///
 /// Permanent catch for the flip-in-place fold. It drives the REAL production
 /// path — `decode_chunk_window_absent` — on real silesia chunks: Engine M
@@ -5147,8 +4257,8 @@ mod isal_tail_parity {
 /// boundary at-or-past the stop hint.
 ///
 /// NOTE on the stop point: Engine M stops at the first block whose header
-/// starts at-or-past stop_hint (the faithful rapidgzip behavior). The pre-fold
-/// two-phase tail (`StreamingInflateWrapper`, kept on `isal_clean_tail`) has an
+/// starts at-or-past stop_hint (the faithful rapidgzip behavior). The retired
+/// pre-fold two-phase tail (`StreamingInflateWrapper`) had an
 /// ISA-L-emulation rewind that can keep/skip one fixed-vs-dynamic block at a
 /// header straddle (chunk_decode.rs:481-486). That is a *speculative* stop-point
 /// difference only — the consumer reconciles it exactly via `furthest_decoded_
@@ -5156,7 +4266,7 @@ mod isal_tail_parity {
 /// so concatenated output is byte-identical either way (proven end-to-end by
 /// the silesia DUAL-SHA gate). Hence this gate asserts correctness against
 /// ground truth, not stop-point equality with the retired two-phase tail.
-#[cfg(all(test, parallel_sm, not(isal_clean_tail)))]
+#[cfg(all(test, parallel_sm))]
 mod native_fold_parity {
     use super::*;
     use crate::decompress::parallel::crc32::crc32 as crc32_of;
@@ -5641,7 +4751,7 @@ mod native_fold_parity {
 //       window check against `pred ‖ payload` (the stale-window-key scar net:
 //       trailing/last-window content must equal ground truth, not just match
 //       the other arm).
-#[cfg(all(test, parallel_sm, not(isal_clean_tail)))]
+#[cfg(all(test, parallel_sm))]
 mod seeded_block_parity {
     use super::*;
 
@@ -6171,7 +5281,7 @@ mod seeded_block_parity {
 //   (g) ERROR equality: when the stop cannot be honored (member-final
 //       misaligned hint, multi-member-crossing hint) both arms must return
 //       ExactStopMissed with IDENTICAL requested/actual coordinates.
-#[cfg(all(test, parallel_sm, not(isal_clean_tail)))]
+#[cfg(all(test, parallel_sm))]
 mod exact_block_parity {
     use super::seeded_block_parity::{
         deflate_with_dict, deflate_with_dict_flushes, flate2_inflate_with_dict, lcg_bytes,
@@ -6732,7 +5842,7 @@ mod exact_block_parity {
     // instantiation of `finish_decode_chunk_contig_native`) directly, since the
     // whole-file finder span + `MultiMemberChunked` routing are stages 2-3.
     // ════════════════════════════════════════════════════════════════════════
-    #[cfg(all(parallel_sm, not(isal_clean_tail)))]
+    #[cfg(parallel_sm)]
     mod multi_member_stage1 {
         use super::*;
         use crate::decompress::parallel::gzip_format;

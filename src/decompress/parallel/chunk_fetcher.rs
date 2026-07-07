@@ -662,11 +662,7 @@ pub fn drive_monolith_t1<W: std::io::Write>(
 ) -> Result<(u32, usize), FetchError> {
     use crate::decompress::parallel::chunk_decode;
 
-    #[cfg(not(isal_clean_tail))]
     let chunk = chunk_decode::decode_monolith_native(input, expected_isize, configuration)
-        .map_err(FetchError::Decode)?;
-    #[cfg(isal_clean_tail)]
-    let chunk = chunk_decode::decode_monolith_isal(input, expected_isize, configuration)
         .map_err(FetchError::Decode)?;
 
     // ONE write of the whole output buffer (skip the 32 KiB dictionary prefix).
@@ -715,7 +711,7 @@ pub static MONOLITH_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 ///
 /// Byte-identical output to `drive_thin_t1_oracle`. CRC + ISIZE are verified by
 /// the caller; errors are terminal (NO fallback). T>1 NEVER reaches here.
-#[cfg(all(parallel_sm, not(isal_clean_tail)))]
+#[cfg(parallel_sm)]
 pub fn drive_monolith_streaming_t1<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
@@ -839,8 +835,8 @@ fn drive_impl<W: std::io::Write>(
     //   m_prefetchCache( 2 * m_parallelization )
     //   threadPoolSaturated: m_prefetching.size() + 1 >= m_parallelization
     // gzippy previously diverged: cache_capacity = pool_size*2 (vendor is
-    // max(16,pool)) and a GZIPPY_BURST_PREFETCH lever on the saturation arg with
-    // no vendor counterpart. Both deleted; sizing now matches vendor.
+    // max(16,pool)) and a prefetch-saturation lever with no vendor counterpart.
+    // Both deleted; sizing now matches vendor.
     let mut cache_capacity = std::cmp::max(16, pool_size);
     let mut prefetch_capacity = pool_size * 2;
     // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): NO cache-cap bump.
@@ -1186,10 +1182,9 @@ fn drive_impl<W: std::io::Write>(
             BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
             HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
         );
-            // On gzippy-isal (`isal_clean_tail`) these are PRODUCTION counters: the
-            // ISA-L clean-tail engine (faithful rapidgzip WITH_ISAL). On gzippy-native
-            // they are non-zero only under the GZIPPY_ISAL_ENGINE_ORACLE measurement
-            // knob. `isal_oracle_fallbacks` MUST be 0 — any non-zero means a clean tail
+            // These counters are non-zero only under the GZIPPY_ISAL_ENGINE_ORACLE
+            // measurement knob (the pure-Rust engine is the sole production decode
+            // path). `isal_oracle_fallbacks` MUST be 0 — any non-zero means a clean tail
             // fell back to pure-Rust (a counted correctness net, not a silent diverge).
             eprintln!(
                 "  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks={} isal_fallbacks={} bfinal_exact_accepted={} until_exact_fb={} inexact_fb={}",

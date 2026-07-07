@@ -222,19 +222,10 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // (GZIPPY_STREAM_MONOLITH=1), NOT the default; production T1 stays thin-T1
     // (byte-identical to before this cycle). See
     // former plans/T1-MONOLITH-FINISH-RESULTS.md. Native-only; T>1 never takes it.
-    let use_stream_monolith = {
-        #[cfg(not(isal_clean_tail))]
-        {
-            t1_serial
-                && !force_thin_oracle
-                && !use_old_monolith
-                && std::env::var_os("GZIPPY_STREAM_MONOLITH").is_some()
-        }
-        #[cfg(isal_clean_tail)]
-        {
-            false
-        }
-    };
+    let use_stream_monolith = t1_serial
+        && !force_thin_oracle
+        && !use_old_monolith
+        && std::env::var_os("GZIPPY_STREAM_MONOLITH").is_some();
     let use_thin_t1 = (t1_serial && !use_old_monolith && !use_stream_monolith) || force_thin_oracle;
     // Tiny-file lever (#189/#199 lever-2b): a tiny thin-T1 decode makes exactly
     // ONE rpmalloc-backed allocation (its huge chunk-output reserve), and that
@@ -264,20 +255,13 @@ fn read_parallel_sm_inner<W: std::io::Write>(
             bytes_written_out,
         )
     } else if use_stream_monolith {
-        #[cfg(not(isal_clean_tail))]
-        {
-            chunk_fetcher::drive_monolith_streaming_t1(
-                deflate_data,
-                writer,
-                configuration,
-                expected_size,
-                bytes_written_out,
-            )
-        }
-        #[cfg(isal_clean_tail)]
-        {
-            unreachable!("stream monolith is native-only")
-        }
+        chunk_fetcher::drive_monolith_streaming_t1(
+            deflate_data,
+            writer,
+            configuration,
+            expected_size,
+            bytes_written_out,
+        )
     } else if use_thin_t1 {
         chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration, bytes_written_out)
     } else if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
