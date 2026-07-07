@@ -316,7 +316,7 @@ thread_local! {
 pub(crate) static STORED_FLIP_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-/// M2b kill-switch: `GZIPPY_NO_STORED_FLIP=1` restores the exact pre-M2b
+/// M2b: when forced off (test-only override) restores the exact pre-M2b
 /// stored-block behavior (per-byte decode, generic arming only) in both the
 /// ring path (`try_read_stored_special`) and the contig path
 /// (`decode_clean_stored_into_contig`'s bulk read).
@@ -361,12 +361,10 @@ thread_local! {
 }
 
 /// ENGINE-W INC-1 / N2 test override for the marker-fast-loop local-Bits
-/// mirror kill-switch (`GZIPPY_NO_MFAST_LOCALBITS`):
-/// -1 = follow the env kill-switch (default); 0 = force localbits ON;
+/// mirror (the env kill-switch that used to gate this was removed):
+/// -1 = shipped default (localbits ON); 0 = force localbits ON;
 /// 1 = force localbits OFF (exact pre-change struct-field path via `bits`).
 /// Tests flip both arms on the same stream and assert byte + cursor equality.
-/// The env read is OnceLock-cached, so tests must use this override, not
-/// `std::env::set_var`.
 pub(crate) static MFAST_LOCALBITS_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
@@ -383,24 +381,19 @@ thread_local! {
     pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Rung-(d) increment 1 kill-switch (git history (campaign plan, removed) §5, F-d1):
-/// `GZIPPY_MARKER_DIST_TABLE=0` restores the exact pre-change marker-fast-loop
-/// distance decode (the `dist_hc` → DISTANCE_EXTRA → refill-check →
-/// DISTANCE_BASE dependent chain) — the same-binary causal A/B arm the
-/// campaign measurement protocol requires. One OnceLock read per
-/// `read_internal_compressed_specialized::<true>` call.
+/// Rung-(d) increment 1 (git history (campaign plan, removed) §5, F-d1):
+/// DistTable distance decode is the shipped default (proven byte-exact
+/// equivalent to the pre-change `dist_hc` → DISTANCE_EXTRA → refill-check →
+/// DISTANCE_BASE dependent chain — see `marker_dist_lut_diff` below). The
+/// `GZIPPY_MARKER_DIST_TABLE=0` env override was removed 2026-07-07 (batch
+/// 4f); `MARKER_DIST_LUT_OVERRIDE` (test-only atomic, NOT env-backed) still
+/// drives the same-binary causal A/B differential test.
 #[cfg(pure_inflate_decode)]
 fn marker_dist_lut_disabled() -> bool {
-    let ov = MARKER_DIST_LUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if ov >= 0 {
-        return ov == 1;
-    }
-    use std::sync::OnceLock;
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GZIPPY_MARKER_DIST_TABLE").is_ok_and(|v| v == "0"))
+    MARKER_DIST_LUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
-/// ENGINE-W INC-1 / N2 kill-switch: `GZIPPY_NO_MFAST_LOCALBITS=1` restores
+/// ENGINE-W INC-1 / N2: when forced off (test-only override) restores
 /// the exact pre-change bit-cursor path in the `'mfast` marker fast loop —
 /// struct-field `bits.xxx` accesses instead of the stack-local `lb.xxx` copy.
 /// The stack-local breaks the aliasing that forces `bits.bitbuf`/`bitsleft`/
@@ -539,7 +532,7 @@ pub struct Block {
     >,
     /// P3.1 (T1 recovery): libdeflate-style single-lookup distance table for
     /// the CONTIG CLEAN fast loop only. The contig-vs-wrapper cycle profile
-    /// (GZIPPY_CONTIG_PROF) measured the back-ref iteration at 84.8 vs 61.5
+    /// measured the back-ref iteration at 84.8 vs 61.5
     /// cyc — the dependent chain `dist_hc cache -> DISTANCE_EXTRA -> refill
     /// check -> DISTANCE_BASE` is the gap; one `DistEntry` lookup decodes
     /// code+extra from the already-peeked word (same technique as the
@@ -1392,7 +1385,7 @@ impl Block {
     /// truncation semantics byte-for-byte. Both arms reject the chunk on a
     /// truncated stored block, so output is unaffected.
     ///
-    /// KILL-SWITCH: `GZIPPY_NO_STORED_FLIP=1` restores the exact pre-M2b
+    /// When forced off (test-only override) restores the exact pre-M2b
     /// behavior (per-byte path, generic arming only).
     ///
     /// Returns `Some(bytes_emitted)` when a special case ran.
@@ -1506,8 +1499,8 @@ impl Block {
     ///
     /// M2b: the vendor stored-block special cases (early flips + clean bulk
     /// read, deflate.hpp:1212-1256) are tried first — see
-    /// [`Block::try_read_stored_special`]. `GZIPPY_NO_STORED_FLIP=1` disables
-    /// them, restoring this per-byte path exactly.
+    /// [`Block::try_read_stored_special`]. The test-only override (forced off)
+    /// disables them, restoring this per-byte path exactly.
     pub fn read_internal_uncompressed(
         &mut self,
         bits: &mut Bits,
@@ -1958,9 +1951,9 @@ impl Block {
         // entry ⇒ `InvalidHuffmanCode`, exactly dist_hc's `None`. The
         // careful loop keeps dist_hc verbatim (rare tail/edge path).
         //
-        // Kill-switch `GZIPPY_MARKER_DIST_TABLE=0` (same-binary causal A/B
-        // arm, F-d1): the table is neither built nor used here — the
-        // else-arm below is the exact pre-change chain.
+        // Test-only override (`MARKER_DIST_LUT_OVERRIDE`, same-binary causal
+        // A/B arm, F-d1): when forced OFF the table is neither built nor used
+        // here — the else-arm below is the exact pre-change chain.
         #[cfg(pure_inflate_decode)]
         let marker_dist_lut: bool = !marker_dist_lut_disabled();
         #[cfg(pure_inflate_decode)]
@@ -2029,7 +2022,7 @@ impl Block {
         // `bits.bitbuf` etc. and reloads them from memory after each store. A
         // non-escaping stack local has unambiguous provenance — LLVM keeps it
         // in registers. Byte-exact by construction (identical bit reads /
-        // consumption / output). Kill-switch `GZIPPY_NO_MFAST_LOCALBITS=1`
+        // consumption / output). The test-only override (forced off)
         // restores the struct-field path; the same-binary two-variant macro
         // (`mfast_lb_run!`) keeps the loop body in one place.
         macro_rules! mfast_lb_run {
@@ -2351,7 +2344,7 @@ impl Block {
             bits.bitbuf = lb.bitbuf;
             bits.bitsleft = lb.bitsleft;
         } else {
-            // KILL-SWITCH PATH (GZIPPY_NO_MFAST_LOCALBITS=1): exact
+            // TEST-OVERRIDE PATH (forced off): exact
             // pre-change struct-field path — bits.xxx throughout the loop.
             // Same-binary causal A/B arm for F-w1.
             mfast_lb_run!(

@@ -4,7 +4,7 @@
 //! (`src/decompress/parallel/single_member.rs`) is a PURE thread-count selector
 //! with FOUR decision dimensions —
 //!   1. the serial-clean crossover margin (also the sole owner of high-ratio
-//!      routing since the T-blind hard ratio cap `GZIPPY_PARALLEL_RATIO_MAX`
+//!      routing since the T-blind hard ratio cap env knob
 //!      was deleted, 2026-07-05),
 //!   2. the small-output serial FLOOR (8 MiB),
 //!   3. the large-output notch bonus,
@@ -28,7 +28,7 @@
 //! (e.g. a serial/parallel seam divergence that only manifests under a
 //! particular thread count) it lands RED here.
 //!
-//! (2026-07: the five `GZIPPY_PARALLEL_*` / `GZIPPY_MIN_THREADS_FLOOR` env
+//! (2026-07: the five parallel-selector env
 //! knobs that used to drive configs (b)/(c) were frozen to their campaign-
 //! measured defaults and the env reads deleted — see
 //! `single_member::effective_parallel_threads_with`, the now-pure

@@ -186,7 +186,7 @@ fn adjusted_chunk_size_amd(file_size: usize, threads: usize, default_chunk_size:
 /// MECHANISM (measured, not divisibility). The consumer streams chunks IN ORDER
 /// while a `pool_size`-worker pull-queue decodes ahead. The makespan is set by a
 /// STRAGGLER worker, and the straggler is a SLOW CHUNK, not an "extra" chunk from
-/// a count that fails to divide `T`: at silesia-T7 the GZIPPY_TIMELINE shows two
+/// a count that fails to divide `T`: at silesia-T7 tracing shows two
 /// workers with the SAME 2-chunk load differing 76 ms vs 127 ms (1.67× per-chunk
 /// decode-time variance). Rounding the chunk COUNT to a multiple of `T` does NOT
 /// remove the tail (balanced 14-chunk T7 still measured a 53 ms tail) and
@@ -260,8 +260,8 @@ pub(crate) fn t1_output_resident_chunk(gzip_data: &[u8], deflate_data_len: usize
 /// (see [`effective_parallel_threads`]). The predicted parallel work-inflation
 /// W ≈ ISIZE/deflate ratio; parallel only repays at `T >= ceil(W * margin)`.
 /// `margin = 1.0` reproduces the gated per-corpus crossovers (silesia ratio
-/// 2.75 → T3, monorepo → T6, storedheavy → T7-8). Frozen (was
-/// `GZIPPY_PARALLEL_CROSSOVER_MARGIN`, unset in production); `margin = 0`
+/// 2.75 → T3, monorepo → T6, storedheavy → T7-8). Frozen (the env override
+/// was removed); `margin = 0`
 /// still disables the selector (legacy always-parallel-below-ratio_max
 /// behaviour) when passed explicitly to [`effective_parallel_threads_with`].
 /// (aarch64 disables the selector entirely — see [`arch_crossover_margin_default`] —
@@ -274,7 +274,7 @@ const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 /// `margin = 1.6` (crossover `ceil(ratio·1.6)`) is the GATED value that erases the
 /// Zen2 monorepo-T6/T8 default-constant regression (AMD/Zen2, N=11, load-immune
 /// interleaved paired ratios, plans/XARCH-CONCURRENCY-LAW-2026-06-26.md). Selected
-/// at runtime by [`cpu_is_amd`]. Frozen (was `GZIPPY_PARALLEL_CROSSOVER_MARGIN`).
+/// at runtime by [`cpu_is_amd`]. Frozen (the env override was removed).
 /// (aarch64 disables the selector entirely — see [`arch_crossover_margin_default`] —
 /// so this Zen-default constant is unconsumed there.)
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -298,14 +298,14 @@ const PARALLEL_CROSSOVER_MARGIN_AMD: f64 = 1.6;
 /// Conservative by construction: the bonus only fires for clearly-large outputs
 /// where the parallel arm at `crossover-1` still beats single-thread igzip by a
 /// wide margin (silesia T3 516 ≪ igzip ~686; squishy T2 1184 ≪ igzip ~1215), so
-/// it can never manufacture an igzip regression. Frozen (was
-/// `GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES`; `0` still disables the bonus when
+/// it can never manufacture an igzip regression. Frozen (the env override
+/// was removed; `0` still disables the bonus when
 /// passed explicitly to [`effective_parallel_threads_with`]).
 pub(crate) const PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT: u64 = 128 * 1024 * 1024;
 
 /// Number of crossover notches the large-output bonus subtracts (default/Intel).
 /// One notch reproduces the Raptor-Lake gate (silesia crossover 4→3, squishy 3→2).
-/// Frozen (was `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`).
+/// Frozen (the env override was removed).
 const PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT: u64 = 1;
 
 /// AMD/Zen large-output bonus depth: TWO notches. The Zen2 margin (1.6) is needed
@@ -319,7 +319,7 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT: u64 = 1;
 /// interleaved paired ratios; plans/ARCH-DISPATCH-ZEN2-T3-2026-06-26.md): margin
 /// 1.6 + 2-notch erases the monorepo-T6/T8 + squishy-T2 regressions WITHOUT
 /// regressing silesia-T3 / squishy-T3. Selected at runtime by [`cpu_is_amd`].
-/// Frozen (was `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`).
+/// Frozen (the env override was removed).
 const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 
 /// SMALL-OUTPUT SERIAL FLOOR: decoded-output size below which the parallel
@@ -347,7 +347,7 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 /// 1.005): they are stored-block-dominated, carry no marker pathology, and DO
 /// parallelize (20 ms parallel vs 28 ms serial), so they stay parallel.
 /// Byte-transparent: only the effective thread count changes; CRC32 + ISIZE are
-/// still verified by the caller. Frozen (was `GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`;
+/// still verified by the caller. Frozen (the env override was removed;
 /// `0` still disables when passed explicitly to
 /// [`effective_parallel_threads_with`]).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
@@ -472,14 +472,14 @@ pub static WORK_PER_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 /// lever left in this selector — see [`effective_parallel_threads`]).
 const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
 
-/// Frozen default for the work-per-thread cap's physical-core floor (was
-/// `GZIPPY_MIN_THREADS_FLOOR`, unset in production). See the mechanism note
+/// Frozen default for the work-per-thread cap's physical-core floor (the env
+/// override was removed). See the mechanism note
 /// on the `floor` local in [`effective_parallel_threads_with`].
 pub(crate) const MIN_THREADS_FLOOR_DEFAULT: u64 = 1;
 
 /// Production entry point: [`effective_parallel_threads_with`] fed the frozen
-/// selector defaults (the campaign-measured values with every
-/// `GZIPPY_PARALLEL_*` / `GZIPPY_MIN_THREADS_FLOOR` knob unset), plus the one
+/// selector defaults (the campaign-measured values with every parallel-selector
+/// env knob removed), plus the one
 /// live lever `GZIPPY_MIN_BYTES_PER_THREAD`.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub(crate) fn effective_parallel_threads(
@@ -607,8 +607,8 @@ pub(crate) fn effective_parallel_threads_with(
     let deflate_len = deflate_data_len as u64;
 
     // NOTE (2026-07-05): the former T-BLIND hard ratio cap that lived here
-    // (`if isize >= 8*deflate { return 1 }` at EVERY T, env
-    // `GZIPPY_PARALLEL_RATIO_MAX`) is DELETED on x86_64. It pre-empted the
+    // (`if isize >= 8*deflate { return 1 }` at EVERY T, env-controlled)
+    // is DELETED on x86_64. It pre-empted the
     // T-aware cost-model selector below on every high-ratio stream, forfeiting
     // the parallel wins the selector grants at high T. Changed-cell gate (both
     // x86 boxes, single binary, arm B = cap-lifted; N=15 paired interleaved,
@@ -634,7 +634,7 @@ pub(crate) fn effective_parallel_threads_with(
     // logs-class ratio 23 → T2 2.11× / T8 1.08× slower, 0-1/15 wins;
     // software-class ratio 43 → T2 2.62× / T8 1.45× slower, 0/15). The cap IS
     // aarch64's prestack routing — byte-transparent, knob-free (no env
-    // override; the old `GZIPPY_PARALLEL_RATIO_MAX` knob is deleted per the
+    // override; the old ratio-cap env knob is deleted per the
     // no-env-vars-in-prod-path rule). x86_64 codegen compiles this out.
     #[cfg(target_arch = "aarch64")]
     if isize_field >= AARCH64_PRESTACK_RATIO_MAX.saturating_mul(deflate_len) {
@@ -715,7 +715,7 @@ pub(crate) fn effective_parallel_threads_with(
         // count changes ONLY the sub-floor cases — exactly the regressing ones — so it
         // keeps the movie/tool.bin wins while erasing the monorepo/photo regressions.
         // The floor is TOPOLOGY-derived, not a portable constant; frozen to
-        // [`MIN_THREADS_FLOOR_DEFAULT`] (was `GZIPPY_MIN_THREADS_FLOOR`, unset).
+        // [`MIN_THREADS_FLOOR_DEFAULT`] (the env override was removed).
         let eff = (deflate_len / min_bpt)
             .max(threads_floor)
             .min(num_threads as u64);

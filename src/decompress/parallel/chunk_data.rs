@@ -1689,9 +1689,9 @@ pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 /// Effect counter: number of times `determine_used_window_symbols_for_last_subchunk`
 /// actually ran the 32 KiB marker-engine scan (window_sparsity=true path, not
-/// early-returned). With window_sparsity=false (default, keepIndex=false faithful port)
-/// this stays 0. With GZIPPY_WINDOW_SPARSITY=1 kill-switch it tracks sparsity work done.
-/// Read via GZIPPY_VERBOSE.
+/// early-returned). window_sparsity is always false (keepIndex=false faithful
+/// port, the shipped default — the old always-on kill-switch was removed), so
+/// this stays 0. Read via GZIPPY_VERBOSE.
 pub static SPARSITY_DECODE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

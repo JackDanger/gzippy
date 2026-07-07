@@ -169,16 +169,19 @@ pub static ISAL_INEXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
 /// Whether the clean-tail decode routes through REAL ISA-L FFI.
 ///
 /// The pure-Rust DEFLATE engine is the SOLE production decode path; ISA-L
-/// clean-tail decode survives only as a measurement oracle. The env var is an
-/// OVERRIDE (default OFF == pure-Rust identity):
-///   * `GZIPPY_ISAL_ENGINE_ORACLE=1` — force ISA-L ON (the measurement oracle).
-///   * `GZIPPY_ISAL_ENGINE_ORACLE=0` or unset — force ISA-L OFF (pure-Rust).
+/// clean-tail decode was a measurement oracle only, controlled by
+/// `GZIPPY_ISAL_ENGINE_ORACLE`. The env override was removed 2026-07-07
+/// (batch 4f, confirmed no production ISA-L decode exists — the decode graph
+/// is pure-Rust; C-FFI is compression-only per CLAUDE.md) — hardcoded OFF
+/// (pure-Rust identity). The oracle-only `finish_decode_chunk_isal_oracle`
+/// call site this used to gate is dead as a mechanical consequence; its
+/// implementation (and the `GZIPPY_ISAL_GROW_MIB` / `GZIPPY_ISAL_INITIAL_FACTOR`
+/// / `GZIPPY_ISAL_INCREMENTAL_GROWTH` knobs it alone consumes) is left in
+/// place, deferred to the x86-box batch that can compile-check it.
 #[cfg(parallel_sm)]
 #[inline]
 fn isal_engine_oracle_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GZIPPY_ISAL_ENGINE_ORACLE").ok().as_deref() == Some("1"))
+    false
 }
 
 /// ALWAYS-SMALL INCREMENTAL GROWTH (measurement arm) — the footprint /
@@ -224,51 +227,46 @@ fn isal_incremental_growth() -> Option<(usize, usize)> {
     })
 }
 
-/// M3 kill-switch (DIV-1 part 1): `GZIPPY_SEEDED_BLOCK=0` restores the
-/// pre-M3 wrapper path (`StreamingInflateWrapper`/`unified::Inflate`) for
-/// window-seeded INEXACT chunks on gzippy-native. Default ON (Block engine).
-/// Production proof of which engine decoded each seeded chunk:
+/// M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
+/// `deflate::Block` engine. Was previously kill-switchable via
+/// `GZIPPY_SEEDED_BLOCK=0` (restoring the pre-M3 wrapper path); the env
+/// override was removed 2026-07-07 (batch 4f) — hardcoded to the shipped
+/// default (ON). Production proof of which engine decoded each seeded chunk:
 /// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
 #[cfg(parallel_sm)]
 fn seeded_block_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GZIPPY_SEEDED_BLOCK").map_or(true, |v| v != "0"))
+    true
 }
 
 /// Whether the M3 seeded-Block route is taken for a window-seeded inexact
-/// chunk. gzippy-native: ON unless `GZIPPY_SEEDED_BLOCK=0` or the ISA-L
-/// measurement oracle is enabled (`GZIPPY_ISAL_ENGINE_ORACLE` must keep
-/// observing the wrapper-entry path it instruments). gzippy-isal: constant
-/// FALSE — the faithful rapidgzip WITH_ISAL clean-tail handoff
-/// (GzipChunk.hpp:440-444) stays untouched.
+/// chunk: always ON (see [`seeded_block_enabled`] — the
+/// `GZIPPY_ISAL_ENGINE_ORACLE` term was dropped 2026-07-07, confirmed no
+/// production ISA-L decode graph exists to preserve — single-member decode
+/// is pure-Rust ParallelSM at every T, see `decompress/mod.rs`).
 #[cfg(parallel_sm)]
 fn seeded_block_route_enabled() -> bool {
-    seeded_block_enabled() && !isal_engine_oracle_enabled()
+    seeded_block_enabled()
 }
 
-/// M4 kill-switch (DIV-1 part 2): `GZIPPY_EXACT_BLOCK=0` restores the
-/// pre-M4 wrapper path (`StreamingInflateWrapper`/`unified::Inflate`) for
-/// window-seeded UNTIL-EXACT chunks on gzippy-native. Default ON (Block
-/// engine). Production proof of which engine decoded each exact chunk:
+/// M4 (DIV-1 part 2): window-seeded UNTIL-EXACT chunks decode on the ONE
+/// `deflate::Block` engine. Was previously kill-switchable via
+/// `GZIPPY_EXACT_BLOCK=0` (restoring the pre-M4 wrapper path); the env
+/// override was removed 2026-07-07 (batch 4f) — hardcoded to the shipped
+/// default (ON). Production proof of which engine decoded each exact chunk:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
 #[cfg(parallel_sm)]
 fn exact_block_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GZIPPY_EXACT_BLOCK").map_or(true, |v| v != "0"))
+    true
 }
 
 /// Whether the M4 exact-Block route is taken for a window-seeded UNTIL-EXACT
-/// chunk. gzippy-native: ON unless `GZIPPY_EXACT_BLOCK=0` or the ISA-L
-/// measurement oracle is enabled (`GZIPPY_ISAL_ENGINE_ORACLE` must keep
-/// observing the wrapper-entry path it instruments, including its
-/// BFINAL-exact-landing accept). gzippy-isal: constant FALSE — the faithful
-/// rapidgzip WITH_ISAL `decodeChunkWithInflateWrapper<IsalInflateWrapper>`
-/// path (GzipChunk.hpp:192-265) stays untouched.
+/// chunk: always ON (see [`exact_block_enabled`] — the
+/// `GZIPPY_ISAL_ENGINE_ORACLE` term was dropped 2026-07-07, confirmed no
+/// production ISA-L decode graph exists to preserve — single-member decode
+/// is pure-Rust ParallelSM at every T, see `decompress/mod.rs`).
 #[cfg(parallel_sm)]
 fn exact_block_route_enabled() -> bool {
-    exact_block_enabled() && !isal_engine_oracle_enabled()
+    exact_block_enabled()
 }
 
 // PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
@@ -759,18 +757,9 @@ pub fn decode_chunk_until_exact(
 
     if initial_window.len() == MAX_WINDOW_SIZE && until_exact {
         // M4 (DIV-1 part 2): window-seeded UNTIL-EXACT chunks decode on the
-        // ONE `deflate::Block` engine on gzippy-native (kill-switch
-        // `GZIPPY_EXACT_BLOCK=0` restores the wrapper arm below exactly).
-        if exact_block_route_enabled() {
-            return decode_chunk_exact_block_native(
-                input,
-                encoded_offset_bits,
-                stop_hint_bits,
-                initial_window,
-                configuration,
-            );
-        }
-        return decode_chunk_with_inflate_wrapper(
+        // ONE `deflate::Block` engine (always ON — see `exact_block_route_enabled`).
+        debug_assert!(exact_block_route_enabled());
+        return decode_chunk_exact_block_native(
             input,
             encoded_offset_bits,
             stop_hint_bits,
@@ -787,36 +776,6 @@ pub fn decode_chunk_until_exact(
         configuration,
         until_exact,
     )
-}
-
-/// Vendor `decodeChunkWithInflateWrapper` shape: exact known-window decode
-/// using the inflate wrapper only.
-#[cfg(parallel_sm)]
-fn decode_chunk_with_inflate_wrapper(
-    input: &[u8],
-    encoded_offset_bits: usize,
-    stop_hint_bits: usize,
-    initial_window: &[u8],
-    configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    INFLATE_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // M4 kill-switch complement proof: an until-exact chunk decoded on the
-    // wrapper engine (gzippy-isal production, `GZIPPY_EXACT_BLOCK=0`, or the
-    // ISA-L measurement oracle).
-    EXACT_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-    finish_decode_chunk_impl(
-        &mut chunk,
-        input,
-        encoded_offset_bits,
-        stop_hint_bits,
-        initial_window,
-        true,
-        true,
-        // PRODUCTION: allow the ISA-L clean-tail engine.
-        true,
-    )?;
-    Ok(chunk)
 }
 
 /// Vendor `finishDecodeChunkWithInexactOffset` shape. Continues a chunk with a
@@ -839,9 +798,6 @@ fn finish_decode_chunk_with_inexact_offset(
         initial_window,
         record_decode_duration,
         false,
-        // PRODUCTION: allow the ISA-L clean-tail engine (the build decides whether it
-        // actually fires — see `isal_engine_oracle_enabled`).
-        true,
     )
 }
 
@@ -854,10 +810,6 @@ fn finish_decode_chunk_impl(
     initial_window: &[u8],
     record_decode_duration: bool,
     until_exact: bool,
-    // When false, FORCE the pure-Rust clean tail regardless of env. Used only
-    // by the differential gate's LEFT (pure) decode so it can compare against the
-    // ISA-L RIGHT when the ISA-L engine oracle is enabled.
-    allow_isal: bool,
 ) -> Result<(), ChunkDecodeError> {
     FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // DoS/OOM guard: bound decoded output to what this compressed input could
@@ -866,42 +818,14 @@ fn finish_decode_chunk_impl(
     // the ceiling turns that runaway into a terminal error instead of an OOM.
     chunk.set_output_ceiling_for_input(input.len());
 
-    // gzippy-isal PRODUCTION clean-tail routing (faithful rapidgzip WITH_ISAL,
-    // GzipChunk.hpp:440-444 known-window + :520-526 post-32 KiB-flip clean bulk):
-    // decode the clean tail through REAL ISA-L FFI (copy-free
-    // `decompress_deflate_from_bit_into`), exactly as rapidgzip's
-    // `finishDecodeChunkWithInexactOffset<IsalInflateWrapper>`. The <=32 KiB markered
-    // prefix already ran on the pure-Rust marker engine (`deflate::Block`) before the
-    // flip — faithful (rapidgzip uses `deflate::Block` there too). On gzippy-native
-    // this routes ISA-L only under the measurement env oracle (OFF==pure-Rust identity).
-    //
-    // FALLBACK (`Ok(false)`): the SAME clean tail decodes byte-exact through the
-    // pure-Rust engine below, and the event is COUNTED in ISAL_ENGINE_ORACLE_FALLBACKS.
-    // This is a correctness safety net for the cases ISA-L genuinely cannot honor (an
-    // `until_exact` stop with no exact ISA-L boundary, or a pathologically compressible
-    // chunk overrunning the chunk-proportional reserve), NOT a silent divergence: the
-    // bytes emitted are identical to what ISA-L would emit — only the emitting engine
-    // differs. The differential gate + parity.sh assert this counter ==0 on the corpus
-    // so a real fallback surfaces loudly. On window-absent bootstrap chunks the body
-    // stays u16 markers and returns `Finished` WITHOUT reaching here (faithful: rapidgzip
-    // also marker-decodes a sub-32 KiB body) — so those never count as a fallback.
-    if allow_isal && isal_engine_oracle_enabled() {
-        match finish_decode_chunk_isal_oracle(
-            chunk,
-            input,
-            inflate_start_bit,
-            stop_hint_bits,
-            initial_window,
-            until_exact,
-        ) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {
-                ISAL_ENGINE_ORACLE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
+    // The ISA-L clean-tail measurement-oracle branch that used to sit here
+    // (`GZIPPY_ISAL_ENGINE_ORACLE`) was removed 2026-07-07 (batch 4f) —
+    // confirmed no production ISA-L decode graph exists (single-member decode
+    // is pure-Rust ParallelSM at every T; C-FFI is compression-only per
+    // CLAUDE.md). `finish_decode_chunk_isal_oracle` and its ISAL_ENGINE_ORACLE_*
+    // counters are left in place (dead), deferred to the x86-box batch that can
+    // compile-check the `feature = "isal-compression", target_arch = "x86_64"`
+    // arm.
     let t_decode = std::time::Instant::now();
 
     let read_cap = if until_exact {
@@ -1139,38 +1063,13 @@ fn decode_chunk_with_rapidgzip_impl(
         WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
-            if exact_block_route_enabled() {
-                // M4 (DIV-1 part 2): until-exact decodes on the ONE
-                // `deflate::Block` engine (see
-                // `finish_decode_chunk_exact_block_native` for the labeled
-                // deviation + pre-registered contract).
-                finish_decode_chunk_exact_block_native(
-                    &mut chunk,
-                    input,
-                    encoded_offset_bits,
-                    stop_hint_bits,
-                    initial_window,
-                )?;
-            } else {
-                EXACT_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                finish_decode_chunk_impl(
-                    &mut chunk,
-                    input,
-                    encoded_offset_bits,
-                    stop_hint_bits,
-                    initial_window,
-                    false,
-                    true,
-                    // PRODUCTION: allow the ISA-L clean-tail engine.
-                    true,
-                )?;
-            }
-        } else if seeded_block_route_enabled() {
-            // M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
-            // `deflate::Block` engine (vendor GzipChunk.hpp:454-458, non-ISAL
-            // build) instead of the second clean engine
-            // (`StreamingInflateWrapper`/`unified::Inflate`).
-            finish_decode_chunk_seeded_block_native(
+            // M4 (DIV-1 part 2): until-exact decodes on the ONE `deflate::Block`
+            // engine (always ON — see `exact_block_route_enabled`; the wrapper
+            // fallback arm this used to have was removed 2026-07-07, batch 4f).
+            // See `finish_decode_chunk_exact_block_native` for the labeled
+            // deviation + pre-registered contract.
+            debug_assert!(exact_block_route_enabled());
+            finish_decode_chunk_exact_block_native(
                 &mut chunk,
                 input,
                 encoded_offset_bits,
@@ -1178,14 +1077,18 @@ fn decode_chunk_with_rapidgzip_impl(
                 initial_window,
             )?;
         } else {
-            SEEDED_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            finish_decode_chunk_with_inexact_offset(
+            // M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
+            // `deflate::Block` engine (vendor GzipChunk.hpp:454-458; always ON —
+            // see `seeded_block_route_enabled`; the wrapper fallback arm this
+            // used to have was removed 2026-07-07, batch 4f) instead of the
+            // second clean engine (`StreamingInflateWrapper`/`unified::Inflate`).
+            debug_assert!(seeded_block_route_enabled());
+            finish_decode_chunk_seeded_block_native(
                 &mut chunk,
                 input,
                 encoded_offset_bits,
                 stop_hint_bits,
                 initial_window,
-                false,
             )?;
         }
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
@@ -1230,7 +1133,7 @@ fn decode_chunk_with_rapidgzip_impl(
 /// DecodedData buffer (DecodedData.hpp:278-289). NOTE: this ContigFoldSink ring
 /// path is the ~1% marker-loop dribble on gzippy-native; the BULK clean tail is
 /// u8-direct via `decode_clean_into_contig` (no ring, no drain). The
-/// GZIPPY_FOLD_NODRAIN/NOCRC split measured the remaining drain+CRC second-touch at
+/// A drain/CRC-split measurement measured the remaining drain+CRC second-touch at
 /// ~0-1ms (frozen host N=21), so the gap to the ISA-L `ocl_cf` ceiling
 /// (matched-comparator 0.945× rg) is ~36ms of essentially PURE symbol rate on the
 /// SAME covered chunks — NOT an upper bound padded by ring cost (that earlier
@@ -1500,8 +1403,8 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
     // gzippy-native build the BULK clean tail does NOT take this ContigFoldSink
     // ring path at all — it takes `finish_decode_chunk_contig_native` ->
     // `decode_clean_into_contig` (u8-DIRECT into chunk.data, no ring, no drain;
-    // this sink governs only the ~1% marker-loop dribble). The
-    // GZIPPY_FOLD_NODRAIN/NOCRC split measured the remaining drain+CRC
+    // this sink governs only the ~1% marker-loop dribble). A drain/CRC-split
+    // measurement measured the remaining drain+CRC
     // second-touch at ~0-1ms (frozen host, N=21), so the gap to the engine-removed
     // ceiling (ocl_cf, matched-comparator 0.945× rg) is ~36ms of essentially PURE
     // pure-Rust-vs-ISA-L SYMBOL RATE on the SAME covered chunks (coverage symmetry
@@ -1700,12 +1603,11 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     start_bit_offset: usize,
     stop_hint_bits: usize,
     until_exact: bool,
-    // T1-MONOLITH divergence (divergence-ledger #4): when false, per-block EOB
-    // boundaries are NOT recorded. The boundary index feeds the block-map /
-    // prefetch / subchunk-split which are pure T>1 scaffold — never consumed by
-    // the single-chunk T1 monolith. Byte-transparent (output is identical; only
-    // the never-read boundary metadata is skipped). Every existing caller passes
-    // `true`; only `decode_monolith_native` passes `false`.
+    // Per-block EOB boundary recording. The boundary index feeds the block-map /
+    // prefetch / subchunk-split (T>1 scaffold). Every remaining caller passes
+    // `true` — the former T1-MONOLITH divergence that passed `false` (no
+    // boundary recording, pure T>1 scaffold skipped) was removed 2026-07-07
+    // (batch 4f, dead opt-in path).
     record_boundaries: bool,
 ) -> Result<(), ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
@@ -2171,80 +2073,6 @@ fn seed_block_for_contig_native(
     Ok(marker_ctx)
 }
 
-/// T1-MONOLITH (gzippy-native) — a deliberate, T1-gated DIVERGENCE from the
-/// rapidgzip chunk pipeline TOWARD the igzip serial monolith
-/// (`vendor/isa-l/igzip/igzip_inflate.c isal_inflate :2239-2560`). See
-/// `former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`.
-///
-/// Decodes the ENTIRE single-member deflate body as ONE chunk into ONE
-/// contiguous output buffer reserved upfront to the whole-member ISIZE (igzip's
-/// single reused `out` buffer; NOT `compute_initial_reserve`'s 64 MiB-capped
-/// per-chunk reserve — that cap is the `prodbig` reserve-balloon confound). The
-/// single buffer IS the implicit history, so there is ZERO per-chunk alloc, ZERO
-/// per-chunk window clone+re-seed, and (via `record_boundaries=false`) ZERO
-/// per-block boundary record / subchunk split. The pure-Rust
-/// `decode_clean_into_contig` kernel runs over the whole stream.
-///
-/// Output is byte-identical to `drive_thin_t1_oracle` (same kernel, same clean
-/// window-present decode; chunk-0 semantics = a zero 32 KiB window seed, valid
-/// because the first block of a valid stream never back-references before output
-/// start). CRC + ISIZE are verified by the caller. T>1 NEVER reaches here.
-#[cfg(parallel_sm)]
-pub(crate) fn decode_monolith_native(
-    input: &[u8],
-    expected_isize: usize,
-    configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-
-    let total_bits = input.len() * 8;
-    let mut chunk = ChunkData::new(0, configuration);
-
-    // Chunk-0 semantics: a zero 32 KiB predecessor window installed as a
-    // NON-OUTPUT dictionary prefix (`data_prefix_len` excludes it from output /
-    // size / CRC). Back-refs resolve as `base[*pos - d]`; a back-ref reaching
-    // into the zero prefix would be invalid deflate (referencing before stream
-    // start) and never occurs in a valid stream.
-    let zero_window = [0u8; MAX_WINDOW_SIZE];
-    chunk.prefill_window_prefix(&zero_window);
-
-    // The ONE igzip-shaped reserve: the whole-member ISIZE, uncapped, faulted
-    // once during decode (mirrors igzip writing into the caller's full `out`).
-    // +1024 covers the per-call HEADROOM the contig kernel reserves.
-    chunk.reserve_clean(expected_isize.saturating_add(1024));
-
-    let mut marker_ctx = MarkerDecodeCtx::new(input, 0)?;
-    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
-        let mut block = cell_block.borrow_mut();
-        block.reset(None, None);
-        let mut unused: Vec<u16> = Vec::new();
-        block
-            .set_initial_window(&mut unused, &zero_window)
-            .map_err(|e| {
-                ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("monolith set_initial_window: {e:?}"),
-                ))
-            })?;
-        debug_assert!(unused.is_empty(), "seed must not drain into output");
-        Ok(())
-    })?;
-    marker_ctx.block_primed = true;
-
-    MONOLITH_NATIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    finish_decode_chunk_contig_native::<false>(
-        &mut chunk,
-        &mut marker_ctx,
-        input,
-        0,
-        total_bits,
-        false,
-        // T1-MONOLITH: no per-block boundary recording (ledger #4).
-        false,
-    )?;
-    Ok(chunk)
-}
-
 /// STAGE-1 multi-member chunked decode entry (`MULTI_MEMBER=true`). Decodes a
 /// span of a WHOLE gzip FILE — inter-member footers + headers included in
 /// `input` — into ONE `ChunkData` that walks `… member → footer → header →
@@ -2279,7 +2107,7 @@ pub(crate) fn decode_multi_member_native(
     // window prefix is installed (`data_prefix_len` stays 0). Back-refs
     // resolve `base[*pos - d]` within the member's own output, bounded by the
     // empty-dict range check — identical to vendor `block->reset(empty)` at
-    // GzipChunk.hpp:508 and the chunk-0 semantics of `decode_monolith_native`.
+    // GzipChunk.hpp:508 and gzippy's chunk-0 zero-window seed semantics.
     chunk.reserve_clean(reserve_hint.saturating_add(1024));
 
     let mut marker_ctx = MarkerDecodeCtx::new(input, first_block_bit)?;
@@ -2310,341 +2138,6 @@ pub(crate) fn decode_multi_member_native(
     Ok(chunk)
 }
 
-/// T1-MONOLITH-STREAMING flush-buffer size (output bytes between flushes). One
-/// fixed-size buffer is reserved ONCE and recycled in place via
-/// [`SegmentedU8::retain_tail`]; the prior full-ISIZE monolith first-touched the
-/// whole output (212 MB silesia → ~4× igzip page-faults, FALSIFIED). A small
-/// resident buffer streams like igzip's bounded output window. `GZIPPY_MONOLITH
-/// _STREAM_KIB` overrides for the fulcrum sweep (floor 128 KiB ≥ 2·window +
-/// headroom); default 8 MiB (cache-resident in L2/L3, few flushes).
-#[cfg(parallel_sm)]
-fn monolith_stream_buf_bytes() -> usize {
-    const DEFAULT_BYTES: usize = 8 * 1024 * 1024;
-    std::env::var("GZIPPY_MONOLITH_STREAM_KIB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&k| k >= 128)
-        .map(|k| k * 1024)
-        .unwrap_or(DEFAULT_BYTES)
-}
-
-/// T1-MONOLITH-STREAMING (gzippy-native) — the production T==1 decode path.
-///
-/// Decodes the WHOLE single-member deflate body in ONE continuous serial pass —
-/// ONE `deflate::Block`, ONE `MarkerDecodeCtx`, ONE `set_initial_window` (zero
-/// 32 KiB seed) — with NO per-chunk `ChunkData` lifecycle, NO per-chunk
-/// rolling-window clone+reseed, NO per-block boundary record, NO block-finder /
-/// WindowMap / threadpool. That sheds the gated per-chunk DRIVER SCAFFOLD
-/// (F-6ce077591bb5 / F-8bd982118f3d: the scaffold, not the kernel, is the
-/// +21–30% T1-vs-igzip gap; the pure-Rust kernel is acquitted).
-///
-/// Output STREAMS through ONE fixed-size resident buffer
-/// ([`monolith_stream_buf_bytes`], default 8 MiB) instead of a full-ISIZE
-/// buffer: whenever the buffer fills toward `cap − HEADROOM`, the bytes before
-/// the trailing 32 KiB are written to the sink and the trailing 32 KiB is
-/// memmoved to the front ([`SegmentedU8::retain_tail`]) as the sliding-window
-/// history, then decode CONTINUES in the same `Block` state. Back-references
-/// (max distance 32768) always resolve into the retained 32 KiB. This fixes the
-/// prior full-ISIZE monolith's page-fault storm (cache-residency lever) WHILE
-/// shedding the scaffold (the streaming monolith does neither).
-///
-/// CRC32 is folded inline per decoded run (covers every output byte exactly
-/// once; the memmove never re-folds). The caller verifies CRC + ISIZE against
-/// the gzip trailer AFTER decode completes; on a later mismatch the partial
-/// output is already on the writer (same as gzip(1)). `bytes_written_out` is
-/// updated on EVERY flush so a multi-member-misroute resume sees the exact
-/// streamed prefix. Errors are terminal (`ChunkDecodeError`) — NO fallback.
-///
-/// Byte-identical output to `drive_thin_t1_oracle` / `decode_monolith_native`
-/// (same kernel, same clean window-present decode, chunk-0 zero-window seed).
-#[cfg(parallel_sm)]
-pub(crate) fn decode_and_stream_monolith_native<W: std::io::Write>(
-    input: &[u8],
-    expected_isize: usize,
-    configuration: ChunkConfiguration,
-    writer: &mut W,
-    bytes_written_out: Option<&mut usize>,
-) -> Result<(u32, usize), ChunkDecodeError> {
-    decode_and_stream_monolith_native_capped(
-        input,
-        expected_isize,
-        configuration,
-        writer,
-        bytes_written_out,
-        monolith_stream_buf_bytes(),
-    )
-}
-
-/// Core of the streaming monolith with an EXPLICIT stream-buffer cap (bytes),
-/// so tests can force MANY flush cycles with a tiny cap to exercise the
-/// sliding-window retention boundary, stored-block bursts spanning flushes, and
-/// the incremental `bytes_written` accounting. Production passes
-/// [`monolith_stream_buf_bytes`].
-#[cfg(parallel_sm)]
-pub(crate) fn decode_and_stream_monolith_native_capped<W: std::io::Write>(
-    input: &[u8],
-    expected_isize: usize,
-    configuration: ChunkConfiguration,
-    writer: &mut W,
-    mut bytes_written_out: Option<&mut usize>,
-    stream_cap_bytes: usize,
-) -> Result<(u32, usize), ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::{
-        BlockError, CompressionType, MAX_WINDOW_SIZE,
-    };
-
-    const WINDOW: usize = MAX_WINDOW_SIZE; // 32 KiB sliding-window history
-                                           // One max back-ref (258) + the 8-byte word-copy overshoot — matches
-                                           // `finish_decode_chunk_contig_native`'s out_room = cap − HEADROOM.
-    const HEADROOM: usize = 258 + 8;
-
-    let mut chunk = ChunkData::new(0, configuration);
-
-    // Chunk-0 semantics: a zero 32 KiB predecessor window as a NON-OUTPUT
-    // dictionary prefix (`data_prefix_len == WINDOW`). A back-ref reaching into
-    // it would be invalid deflate (references before stream start) and never
-    // occurs in a valid stream.
-    let zero_window = [0u8; WINDOW];
-    chunk.prefill_window_prefix(&zero_window);
-    debug_assert_eq!(chunk.data_prefix_len, WINDOW);
-
-    // The ONE resident streaming buffer: capped at the stream-buf size, never
-    // grown (we FLUSH instead of grow). For small members it shrinks to fit so
-    // tiny files do not fault a multi-MiB buffer.
-    let target = stream_cap_bytes
-        .min(expected_isize.saturating_add(2 * WINDOW + HEADROOM + 1024))
-        .max(2 * WINDOW + HEADROOM + 1024);
-    chunk.reserve_clean(target);
-    // Stable capacity (no grow ⇒ cap is constant): flush threshold leaves room
-    // for one more HEADROOM+1 contig request without ever reallocating.
-    let cap = chunk.data.capacity();
-    debug_assert!(cap > 2 * WINDOW + HEADROOM);
-    let flush_threshold = cap - (HEADROOM + 1);
-
-    let mut marker_ctx = MarkerDecodeCtx::new(input, 0)?;
-    BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
-        let mut block = cell_block.borrow_mut();
-        block.reset(None, None);
-        let mut unused: Vec<u16> = Vec::new();
-        block
-            .set_initial_window(&mut unused, &zero_window)
-            .map_err(|e| {
-                ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("streaming monolith set_initial_window: {e:?}"),
-                ))
-            })?;
-        debug_assert!(unused.is_empty(), "seed must not drain into output");
-        Ok(())
-    })?;
-    marker_ctx.block_primed = true;
-    marker_ctx.current_bit_offset = 0;
-
-    let crc32_enabled = chunk.configuration.crc32_enabled;
-    let mut streamed: usize = 0; // output bytes written to the sink so far
-
-    // Flush all output bytes except the trailing 32 KiB (retained as history).
-    // Returns the io error verbatim so the caller surfaces a terminal Err.
-    let flush_keep_window = |chunk: &mut ChunkData,
-                             streamed: &mut usize,
-                             bytes_written_out: &mut Option<&mut usize>,
-                             writer: &mut W|
-     -> Result<(), std::io::Error> {
-        let len = chunk.data.len();
-        debug_assert!(len >= 2 * WINDOW);
-        // Emit EVERY decoded output byte past the dictionary prefix
-        // (`data_prefix_len == WINDOW`). The trailing 32 KiB is emitted HERE
-        // and ALSO copied to the front as the next back-ref window — it is
-        // emitted exactly once (the copy is history only; the next flush
-        // emits `buf[WINDOW..]`, after the prefix, so it is never re-sent).
-        let flush_len = len - WINDOW;
-        if flush_len > 0 {
-            let bytes = chunk.data.decoded_range(WINDOW, flush_len);
-            writer.write_all(bytes)?;
-            *streamed += flush_len;
-            if let Some(out) = bytes_written_out.as_deref_mut() {
-                *out = *streamed;
-            }
-        }
-        // Retain a COPY of the trailing 32 KiB (already emitted) as the
-        // sliding-window history; capacity preserved (no realloc).
-        chunk.data.retain_tail(WINDOW);
-        Ok(())
-    };
-
-    let body_result = BOOTSTRAP_BLOCK.with(|cell_block| -> Result<(), ChunkDecodeError> {
-        let mut block = cell_block.borrow_mut();
-        debug_assert!(
-            !block.contains_marker_bytes(),
-            "streaming monolith requires a flipped (clean) Block"
-        );
-
-        // DoS guard: a valid member's total output cannot exceed
-        // input_len × MAX_DEFLATE_EXPANSION. On malformed input the streaming
-        // decoder fabricates phantom blocks from zero-padding past EOF and would
-        // stream forever (a DoS hang, even though memory stays bounded by the
-        // flush); cap total streamed+buffered output and error past it.
-        let output_ceiling = input
-            .len()
-            .saturating_mul(crate::decompress::parallel::chunk_data::MAX_DEFLATE_EXPANSION)
-            .saturating_add(64 * 1024);
-
-        loop {
-            // DoS guard: terminate a malformed phantom-block runaway.
-            if streamed.saturating_add(chunk.decoded_size()) > output_ceiling {
-                return Err(ChunkDecodeError::OutputCeilingExceeded {
-                    produced: streamed.saturating_add(chunk.decoded_size()),
-                    ceiling: output_ceiling,
-                });
-            }
-            let slice_byte = marker_ctx.current_bit_offset / 8;
-            let mut bits = marker_ctx.open_bits(input);
-            let next_block_offset = absolute_bit_pos(slice_byte, &bits);
-
-            // Inexact stop-at-EOF: the input slice is exactly the member's
-            // deflate body, so decode runs to the BFINAL EOB. A header parse at
-            // the cap means the trailer was misrouted — handled below by the
-            // final-block check; here just parse the next block header.
-            {
-                if let Err(e) = block.read_header(&mut bits, false) {
-                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("deflate header at bit {next_block_offset}: {e:?}"),
-                    )));
-                }
-            }
-
-            let comp_type = block.compression_type();
-            while !block.eob() {
-                // FLUSH-OR-GROW becomes FLUSH-ONLY: when the buffer is near full
-                // (always at a symbol boundary here — `decode_clean_*_into_contig`
-                // returns between symbols), stream out the older bytes and recycle
-                // the buffer in place instead of growing it.
-                if chunk.data.len() > flush_threshold {
-                    flush_keep_window(&mut chunk, &mut streamed, &mut bytes_written_out, writer)
-                        .map_err(ChunkDecodeError::BootstrapFailed)?;
-                }
-
-                // H4: re-fetch (base, cap, pos) every iteration (retain_tail/grow
-                // may have moved the allocation). Request HEADROOM+1 (not
-                // HEADROOM) to avoid the zero-budget `Ok(0)` spin.
-                let (base, cur_cap, pos_before) = chunk.data.contig_decode_window(HEADROOM + 1);
-                debug_assert_eq!(cur_cap, cap, "streaming monolith must not grow the buffer");
-                let mut pos = pos_before;
-                let out_room = cur_cap.saturating_sub(HEADROOM);
-                assert!(
-                    pos <= out_room && cur_cap >= pos_before + HEADROOM,
-                    "streaming monolith: insufficient headroom (pos {pos} cap {cur_cap})"
-                );
-
-                // SAFETY: `base` is `contig_decode_window`'s pointer valid for
-                // `[0, cur_cap)`; the assert proves `pos <= out_room`; `bits.data`
-                // (compressed input) never aliases the decode destination.
-                let body_res = match comp_type {
-                    CompressionType::Uncompressed => unsafe {
-                        block.decode_clean_stored_into_contig(
-                            &mut bits,
-                            base,
-                            cur_cap,
-                            &mut pos,
-                            usize::MAX,
-                        )
-                    },
-                    CompressionType::FixedHuffman | CompressionType::DynamicHuffman => unsafe {
-                        block.decode_clean_into_contig(
-                            &mut bits,
-                            base,
-                            cur_cap,
-                            &mut pos,
-                            usize::MAX,
-                        )
-                    },
-                    CompressionType::Reserved => Err(BlockError::InvalidCompression),
-                };
-                let emitted = match body_res {
-                    Ok(n) => n,
-                    Err(e) => {
-                        record_block_body_fail(&e);
-                        chunk.data.commit(pos - pos_before);
-                        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("deflate body at bit {next_block_offset}: {e:?}"),
-                        )));
-                    }
-                };
-                debug_assert_eq!(emitted, pos - pos_before);
-                // H3: commit BEFORE the CRC read-back (decoded_range indexes the
-                // committed region).
-                chunk.data.commit(emitted);
-                if emitted > 0 {
-                    if crc32_enabled {
-                        if let Some(last_crc) = chunk.crc32s.last_mut() {
-                            last_crc.update(chunk.data.decoded_range(pos_before, emitted));
-                        }
-                    }
-                    chunk.statistics.non_marker_count += emitted as u64;
-                    marker_ctx.clean_data_count += emitted;
-                    UNIFIED_ROUTE_CLEAN_U8_BYTES
-                        .fetch_add(emitted as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                if emitted == 0 && !block.eob() {
-                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "streaming monolith: no progress",
-                    )));
-                }
-            }
-
-            let end_bit_offset = absolute_bit_pos(slice_byte, &bits);
-            marker_ctx.current_bit_offset = end_bit_offset;
-
-            if block.is_last_block() {
-                chunk.finalize_with_deflate(end_bit_offset, Some(input));
-                return Ok(());
-            }
-            // T1-MONOLITH: no per-block boundary recording (ledger #4).
-        }
-    });
-    body_result?;
-
-    // Final flush: stream out everything still in the buffer past the dictionary
-    // prefix (the trailing-window retention no longer matters — decode is done).
-    let len = chunk.data.len();
-    let tail_len = len - WINDOW; // output bytes (data_prefix_len == WINDOW)
-    if tail_len > 0 {
-        let bytes = chunk.data.decoded_range(WINDOW, tail_len);
-        writer
-            .write_all(bytes)
-            .map_err(ChunkDecodeError::BootstrapFailed)?;
-        streamed += tail_len;
-        if let Some(out) = bytes_written_out {
-            *out = streamed;
-        }
-    }
-
-    let mut total_crc = crate::decompress::parallel::crc32::CRC32Calculator::new();
-    for stream_crc in &chunk.crc32s {
-        total_crc.append(stream_crc);
-    }
-
-    if std::env::var_os("GZIPPY_DEBUG").is_some() {
-        eprintln!(
-            "[parallel_sm] T1-MONOLITH-STREAMING out={streamed} bytes \
-             (single Block, igzip-shaped: ONE resident {}KiB buffer streamed, \
-             no per-chunk alloc/window/boundary)",
-            cap / 1024
-        );
-    }
-    MONOLITH_STREAM_NATIVE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok((total_crc.crc32(), streamed))
-}
-
-/// Routing/effect counter for the T1-monolith-STREAMING native path
-/// (deletion-trap pattern): non-zero proves the streaming monolith — not the
-/// thin-T1 chunk driver or the legacy full-ISIZE monolith — handled the decode.
-pub static MONOLITH_STREAM_NATIVE_RUNS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Cross-member continuation deletion-trap: incremented every time the
 /// `MULTI_MEMBER=true` contig driver consumes a footer + next header and
 /// continues into the following gzip member (`finish_decode_chunk_contig_native`
@@ -2655,11 +2148,6 @@ pub static MONOLITH_STREAM_NATIVE_RUNS: std::sync::atomic::AtomicU64 =
 pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Routing/effect counters for the T1-monolith path (deletion-trap pattern):
-/// non-zero proves the monolith engine — not the legacy chunk driver — handled
-/// the T1 decode. Read via `GZIPPY_DEBUG`.
-pub static MONOLITH_NATIVE_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 pub static MONOLITH_ISAL_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -3300,124 +2788,6 @@ mod tests {
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
         enc.write_all(payload).unwrap();
         enc.finish().unwrap()
-    }
-
-    fn make_deflate_level(payload: &[u8], level: u32) -> Vec<u8> {
-        let mut enc =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
-        enc.write_all(payload).unwrap();
-        enc.finish().unwrap()
-    }
-
-    fn make_gzip_level(payload: &[u8], level: u32) -> Vec<u8> {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
-        enc.write_all(payload).unwrap();
-        enc.finish().unwrap()
-    }
-
-    /// T1-MONOLITH-STREAMING byte-exactness differential (REAL-corpus contract,
-    /// same commit as the lever — feedback_real_corpus_test_with_lever).
-    ///
-    /// Decodes the WHOLE deflate body in one continuous pass while STREAMING
-    /// through a deliberately TINY resident buffer (128–192 KiB) so MANY flush
-    /// cycles fire — exercising the three cursor-flagged hazards:
-    ///   (1) sliding-window retention across flush (distance ∈ {1, 32768},
-    ///       length ∈ {3, 258}, runs that straddle the flush/window boundary);
-    ///   (2) STORED-block bursts (level 0, up to 65535 B) spanning flush cycles;
-    ///   (3) incremental bytes_written accounting across flushes.
-    /// Verified against TWO independent oracles (flate2 + libdeflate) on the
-    /// bytes each oracle's encoder produced.
-    #[cfg(parallel_sm)]
-    #[test]
-    fn monolith_streaming_byte_exact_multi_cap_multi_shape() {
-        use std::io::Read;
-
-        // Shape 4: a 32 KiB pseudo-random block repeated → forces MAX-distance
-        // (32768) back-references that must resolve into the retained window
-        // AFTER a flush. This is the streaming retention invariant's hardest case.
-        let mut block = vec![0u8; 32 * 1024];
-        for (i, b) in block.iter_mut().enumerate() {
-            *b = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
-        }
-        let mut max_dist = Vec::new();
-        for _ in 0..100 {
-            max_dist.extend_from_slice(&block);
-        } // ~3.2 MiB, distance-32768 repeats
-
-        let mut mixed = Vec::new();
-        for i in 0..(3 * 1024 * 1024u32) {
-            mixed.push((i.wrapping_mul(2654435761) >> 24) as u8);
-        }
-
-        let payloads: Vec<Vec<u8>> = vec![
-            b"abcdefghijklmnopqrst".repeat(170_000), // ~3.4 MiB, compressible
-            vec![0x5au8; 3 * 1024 * 1024],           // pure run, distance-1 back-refs
-            mixed,                                   // ~3 MiB low-redundancy
-            max_dist,                                // distance-32768 back-refs
-        ];
-
-        for payload in &payloads {
-            for level in [0u32, 1, 6, 9] {
-                // ── Oracle A: flate2 raw-deflate encode + flate2 decode ──
-                let body = make_deflate_level(payload, level);
-                let mut flate2_ref = Vec::new();
-                flate2::read::DeflateDecoder::new(&body[..])
-                    .read_to_end(&mut flate2_ref)
-                    .expect("flate2 reference decode");
-                assert_eq!(&flate2_ref, payload, "flate2 self-check level{level}");
-
-                // ── Oracle B: flate2 gzip encode + libdeflate gzip decode ──
-                let gz = make_gzip_level(payload, level);
-                let mut ld_ref = vec![0u8; payload.len().max(1)];
-                let ld_n = crate::backends::libdeflate::DecompressorEx::new()
-                    .gzip_decompress_ex(&gz, &mut ld_ref)
-                    .expect("libdeflate reference decode")
-                    .output_size;
-                ld_ref.truncate(ld_n);
-                assert_eq!(&ld_ref, payload, "libdeflate self-check level{level}");
-                // The deflate BODY of the gzip member (flate2 GzEncoder emits a
-                // 10-byte header, no FEXTRA, and an 8-byte trailer).
-                let gz_body = &gz[10..gz.len() - 8];
-
-                // Tiny caps → many flush cycles. 128 KiB is the floor; 192 KiB
-                // shifts the flush boundary to a different alignment.
-                for cap in [128 * 1024usize, 192 * 1024, 1024 * 1024] {
-                    let cfg = ChunkConfiguration {
-                        crc32_enabled: true,
-                        ..Default::default()
-                    };
-                    // Monolith over the flate2-produced body.
-                    let mut out = Vec::new();
-                    let mut bw = 0usize;
-                    let (_crc, n) = decode_and_stream_monolith_native_capped(
-                        &body,
-                        payload.len(),
-                        cfg,
-                        &mut out,
-                        Some(&mut bw),
-                        cap,
-                    )
-                    .expect("monolith decode (flate2 body)");
-                    assert_eq!(n, payload.len(), "size flate2 body cap{cap} level{level}");
-                    assert_eq!(bw, payload.len(), "bytes_written flate2 body cap{cap}");
-                    assert_eq!(&out, payload, "bytes flate2 body cap{cap} level{level}");
-
-                    // Monolith over the libdeflate/gzip-produced body (2nd encoder).
-                    let mut out2 = Vec::new();
-                    let (_crc2, n2) = decode_and_stream_monolith_native_capped(
-                        gz_body,
-                        payload.len(),
-                        cfg,
-                        &mut out2,
-                        None,
-                        cap,
-                    )
-                    .expect("monolith decode (gzip body)");
-                    assert_eq!(n2, payload.len(), "size gzip body cap{cap} level{level}");
-                    assert_eq!(&out2, payload, "bytes gzip body cap{cap} level{level}");
-                }
-            }
-        }
     }
 
     /// P0 REGRESSION (2026-06-12, /tmp/mono-gnu9.tar.gz: deterministic CRC32
@@ -5180,17 +4550,8 @@ mod exact_block_parity {
         cfg: ChunkConfiguration,
     ) -> Result<ChunkData, ChunkDecodeError> {
         let mut chunk = ChunkData::new(0, cfg);
-        finish_decode_chunk_impl(
-            &mut chunk,
-            input,
-            0,
-            stop_hint_bits,
-            window,
-            false,
-            true,
-            true,
-        )
-        .map(|()| chunk)
+        finish_decode_chunk_impl(&mut chunk, input, 0, stop_hint_bits, window, false, true)
+            .map(|()| chunk)
     }
 
     /// Enumerate non-final EOB boundaries `(bit, decoded_offset)` via the

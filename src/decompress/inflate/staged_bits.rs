@@ -15,8 +15,8 @@ use super::consume_first_decode::Bits;
 pub const INPUT_STAGING_BYTES: usize = 128 * 1024;
 
 /// Cap on retained pooled boxes per thread (bounds idle RSS). Frozen to 4 —
-/// the value the campaign measured with `GZIPPY_STAGING_POOL_CAP` unset
-/// (production default).
+/// the value the campaign measured as the production default (the env
+/// override was removed).
 const STAGING_POOL_CAP: usize = 4;
 
 type StagingBox = Box<[u8; INPUT_STAGING_BYTES]>;

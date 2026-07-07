@@ -249,7 +249,7 @@ pub const DEFAULT_SYM_FLAG: u32 = TRIPLE_SYM_FLAG;
 ///     SINGLE is a measured +7.7% cyc/B regression on x86/AMD, so it must NOT
 ///     become the default there.
 ///
-/// The arch-dispatched (cfg-selected) default; the `GZIPPY_LITLEN_MULTISYM`
+/// The arch-dispatched (cfg-selected) default; the env-based
 /// A/B override was removed.
 pub fn litlen_multisym_flag() -> u32 {
     arch_default_multisym_flag()

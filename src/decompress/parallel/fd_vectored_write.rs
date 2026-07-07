@@ -128,7 +128,7 @@ pub fn writev_all_to_fd(fd: i32, iovs: &mut [libc::iovec]) -> io::Result<()> {
     let n = iovs.len();
     let mut idx = 0usize;
     // Measured with no per-call byte cap (the campaign-measured production
-    // default — an unset `GZIPPY_WRITEV_CAP_KIB` was always identity; see git
+    // default — the env-based cap override was always identity; see git
     // history for the capped-batching experiment this superseded).
     while idx < n {
         let segment_count = (n - idx).min(iov_max());
