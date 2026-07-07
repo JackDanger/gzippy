@@ -18,7 +18,7 @@
 
 use gzippy::decompress::inflate::consume_first_decode::Bits;
 use gzippy::decompress::parallel::blockfinder_validation::find_blocks_parallel;
-use gzippy::decompress::parallel::deflate_block::Block;
+use gzippy::decompress::parallel::marker_inflate::Block;
 use std::fs;
 
 const MARKER_BASE: u16 = 32_768; // == MAX_WINDOW_SIZE
