@@ -99,68 +99,6 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
 
-/// Lever L1 (2026-05-28): hint the kernel to use 2 MiB transparent huge
-/// pages for fresh chunk-buffer allocations. Reduces page-fault count
-/// ~512× on first touch (12 MiB chunk: 3072 4 KiB faults → 6 2 MiB
-/// faults). Default OFF until A/B on neurotic confirms a win.
-///
-/// MADV_HUGEPAGE is a hint; the kernel grants it opportunistically via
-/// khugepaged. On a one-shot CLI process khugepaged may not get
-/// scheduling time, so the hint may be ignored. MADV_COLLAPSE (kernel
-/// 6.1+) is synchronous but adds latency at the madvise call site.
-///
-/// Per perf attribution 2026-05-28: clear_page_erms is 13.26% of CPU
-/// (kernel page-zeroing on first touch); the per-fault overhead is the
-/// bigger cost than the zeroing itself. Fewer faults → less overhead.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-fn use_hugepage_hint() -> bool {
-    use std::sync::OnceLock as Once;
-    static USE: Once<bool> = Once::new();
-    *USE.get_or_init(|| std::env::var_os("GZIPPY_HUGEPAGE").is_some())
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-fn use_hugepage_hint() -> bool {
-    false
-}
-
-/// Apply `MADV_HUGEPAGE` hint to a freshly-allocated chunk buffer.
-/// Only effective on Linux; called on miss path of `take_u8` so the
-/// hint is set once per backing allocation, not per pool reuse.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-fn hugepage_hint(ptr: *mut u8, len: usize) {
-    if !use_hugepage_hint() || len < 2 * 1024 * 1024 {
-        return;
-    }
-    // Round pointer up to 4 KiB page boundary and length down to whole
-    // pages. madvise requires page-aligned args; the kernel rejects
-    // unaligned calls with EINVAL (silently dropped since we ignore
-    // errors here).
-    const PAGE_SIZE: usize = 4096;
-    let addr = ptr as usize;
-    let aligned_addr = (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let end = addr + len;
-    let aligned_end = end & !(PAGE_SIZE - 1);
-    if aligned_end > aligned_addr {
-        let aligned_len = aligned_end - aligned_addr;
-        unsafe {
-            libc::madvise(
-                aligned_addr as *mut libc::c_void,
-                aligned_len,
-                libc::MADV_HUGEPAGE,
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-#[inline(always)]
-#[allow(dead_code)]
-fn hugepage_hint(_ptr: *mut u8, _len: usize) {}
-
 /// Cap on pool size per worker per Vec type. Sized to a handful of
 /// in-flight chunks per worker (not the old shared cap of 64).
 // Sized for T16 in-flight depth: eager Ready-drain returns buffers sooner,
@@ -223,52 +161,6 @@ pub fn current_worker_pool_index() -> Option<usize> {
     WORKER_POOL_INDEX.with(|c| c.get())
 }
 
-/// MEASUREMENT-ONLY rule-#3 oracle (`GZIPPY_PREFAULT_ARENA=<MiB>`, default OFF):
-/// pre-touch a per-worker arena of rpmalloc-backed pages at worker startup so the
-/// chunk decode's first-touch page faults are PAID ONCE here, OFF the wall-critical
-/// decode path, instead of cold on the hot path. Byte-transparent (allocates +
-/// memsets + frees scratch; rpmalloc retains the freed pages warm in this thread's
-/// cache). Used to falsify the page-warmth thesis: if faults drop toward rg's but
-/// the MATCHED gz_null wall does not move, the excess faults were slack (advisor
-/// arithmetic: fault-work ~33-55ms >> matched wall gap 17ms at depth-14).
-pub fn prefault_worker_arena() {
-    static MIB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let mib = *MIB.get_or_init(|| {
-        std::env::var("GZIPPY_PREFAULT_ARENA")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    });
-    if mib == 0 {
-        return;
-    }
-    // Touch `mib` MiB of u16 + `mib` MiB of u8 scratch in 128 KiB spans (the
-    // marker/data segment size) so every page is faulted+zeroed once, then drop
-    // them so rpmalloc's per-thread cache keeps the warm pages for the next
-    // real take_marker_segment / take_u8 on THIS worker.
-    let spans = (mib * 1024) / 128; // 128 KiB spans
-    let mut keep_u16: Vec<U16> = Vec::with_capacity(spans);
-    let mut keep_u8: Vec<U8> = Vec::with_capacity(spans);
-    for _ in 0..spans {
-        let mut v16 = types::u16_with_capacity(MARKER_SEGMENT_ELEMENTS);
-        // Touch every page of the allocation (write forces the fault now).
-        v16.resize(MARKER_SEGMENT_ELEMENTS, 0);
-        for i in (0..v16.len()).step_by(2048) {
-            v16[i] = 1;
-        }
-        keep_u16.push(v16);
-        let mut v8 = types::u8_with_capacity(128 * 1024);
-        v8.resize(128 * 1024, 0);
-        for i in (0..v8.len()).step_by(4096) {
-            v8[i] = 1;
-        }
-        keep_u8.push(v8);
-    }
-    // Drop all at once → rpmalloc returns these warm pages to THIS thread's cache.
-    drop(keep_u16);
-    drop(keep_u8);
-}
-
 fn pool_index_for_take() -> usize {
     current_worker_pool_index().unwrap_or(0)
 }
@@ -277,8 +169,8 @@ thread_local! {
     /// T1 cache-residency scope (set only by `drive_thin_t1_oracle`, on the
     /// single serial decode thread, via [`T1ResidentScope`]). When active it
     /// turns ON the manual buffer pool AND pins every reserve to the fixed
-    /// resident cap — exactly the `GZIPPY_RESIDENT_OUTPUT_POOL` oracle that the
-    /// gated discrimination measured (minor-faults drop toward igzip, monorepo
+    /// resident cap — the shipped default behavior that gated discrimination
+    /// measured (minor-faults drop toward igzip, monorepo
     /// wall 1.39→1.29 both arches; see former plans/T1-CACHE-RESIDENCY-RESULTS.md), but
     /// SCOPED to the T1 thread so the T>1 parallel workers (which never set it)
     /// keep their faithful per-chunk ratio-informed reserve + pooling behavior.
@@ -310,11 +202,7 @@ fn t1_resident_scope_active() -> bool {
 }
 
 fn manual_buffer_pool_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let env = *EN.get_or_init(|| {
-        std::env::var_os("GZIPPY_MANUAL_BUFFER_POOL").is_some() || env_resident_output_pool()
-    });
-    env || t1_resident_scope_active()
+    t1_resident_scope_active()
 }
 
 /// FORM-B RSS FIX — eager per-chunk page release at recycle time.
@@ -339,7 +227,7 @@ fn manual_buffer_pool_enabled() -> bool {
 /// is retained; if the buffer is later re-taken from the manual pool it
 /// re-faults to zero pages that the next decode overwrites before any read.
 ///
-/// DEFAULT was OFF (opt-in `GZIPPY_EAGER_DONTNEED=1`), and the knob was
+/// DEFAULT was OFF (opt-in env knob, since removed), and the knob was
 /// GATED-MEASURED NET-NEGATIVE on AMD-Zen2 ondemand silesia T3-T6 (the per-chunk
 /// `MADV_DONTNEED` runs on the serial consumer thread and the returned pages
 /// re-fault on the next allocation, a cost EXCEEDING the exit_group teardown it
@@ -350,20 +238,14 @@ fn manual_buffer_pool_enabled() -> bool {
 #[inline]
 fn dontneed_alloc(_base: *const u8, _bytes: usize) {}
 
-/// RESIDENT-OUTPUT-POOL ORACLE flag (`GZIPPY_RESIDENT_OUTPUT_POOL=1`, default OFF,
-/// byte-transparent, MEASUREMENT-ONLY). Turns on the manual LIFO pool AND pins every
-/// chunk's upfront reserve to a single fixed size (see `compute_initial_reserve`), so
-/// recycled output buffers share one capacity, are never realloc'd on reuse, and keep
-/// their pages RESIDENT across chunks. Determination tool for the BEAT-IGZIP-T1
-/// question: can a resident, reused output buffer reach igzip's T1 fault profile while
-/// holding T>1 rapidgzip parity?
-fn env_resident_output_pool() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("GZIPPY_RESIDENT_OUTPUT_POOL").is_some())
-}
-
+/// Whether the T1 resident-output-pool behavior is active: pins every chunk's
+/// upfront reserve to a single fixed size (see `compute_initial_reserve`) so
+/// recycled output buffers share one capacity, are never realloc'd on reuse,
+/// and keep their pages RESIDENT across chunks. Was previously also
+/// controllable via `GZIPPY_RESIDENT_OUTPUT_POOL=1` (measurement oracle,
+/// removed) — the T1 scope activation (the shipped default) is preserved.
 pub fn resident_output_pool_enabled() -> bool {
-    env_resident_output_pool() || t1_resident_scope_active()
+    t1_resident_scope_active()
 }
 
 /// The fixed capacity every resident-scope output buffer is pinned to (the
@@ -376,8 +258,8 @@ pub const RESIDENT_PINNED_CAPACITY: usize = 64 * 1024 * 1024;
 /// Decode tasks run on pool workers and record the correct index; trial
 /// decodes on the consumer thread bucket returns to worker 0's pool.
 pub fn take_u8(min_capacity: usize) -> U8 {
-    // Vendor FasterVector.hpp: rpmalloc per-thread cache only — no manual LIFO pool.
-    // `GZIPPY_MANUAL_BUFFER_POOL=1` restores the legacy mutex pool for A/B.
+    // Vendor FasterVector.hpp: rpmalloc per-thread cache only — no manual LIFO pool,
+    // except within the T1 resident-scope (see `manual_buffer_pool_enabled`).
     if manual_buffer_pool_enabled() {
         let idx = pool_index_for_take();
         if let Ok(mut pool) = u8_pools()[idx].lock() {

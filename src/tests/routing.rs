@@ -749,37 +749,6 @@ mod tests {
         let _ = crate::decompress::decompress_bytes(CRASH, &mut out, 8);
     }
 
-    /// Opt-in routing proof (deletion-trap) for the T1-MONOLITH-STREAMING native
-    /// path: with `GZIPPY_STREAM_MONOLITH=1`, a single-member decode at T==1 MUST
-    /// be handled by `decode_and_stream_monolith_native` (counter fires) AND be
-    /// byte-exact. The streaming monolith is OPT-IN (fulcrum optgate refused the
-    /// wall win as INSTRUCTION-ONLY; production T1 default stays thin-T1) — this
-    /// test locks the opt-in wiring + byte-exactness. Native build only.
-    #[cfg(parallel_sm)]
-    #[test]
-    fn test_t1_routes_through_streaming_monolith() {
-        use crate::decompress::parallel::chunk_decode::MONOLITH_STREAM_NATIVE_RUNS;
-        use std::sync::atomic::Ordering;
-
-        let original = make_low_entropy_data(24 * 1024 * 1024);
-        let compressed = compress_single_member_gzip(&original);
-        let before = MONOLITH_STREAM_NATIVE_RUNS.load(Ordering::Relaxed);
-        let mut output = Vec::new();
-        // SAFETY: test-only env toggle; all T1 paths are byte-exact so concurrent
-        // tests are unaffected by the routing flip.
-        unsafe { std::env::set_var("GZIPPY_STREAM_MONOLITH", "1") };
-        let r = crate::decompress::decompress_single_member(&compressed, &mut output, 1);
-        unsafe { std::env::remove_var("GZIPPY_STREAM_MONOLITH") };
-        r.unwrap();
-        let after = MONOLITH_STREAM_NATIVE_RUNS.load(Ordering::Relaxed);
-        assert_eq!(output, original, "T1 streaming-monolith output mismatch");
-        assert!(
-            after > before,
-            "T1 single-member did NOT route through the streaming monolith with \
-             GZIPPY_STREAM_MONOLITH=1 (counter {before} -> {after}); opt-in wiring changed"
-        );
-    }
-
     /// COALESCE correctness lock (rapidgzip parity): the clean-tail decoder now
     /// warm-decodes ACROSS deflate block boundaries within a chunk, returning to
     /// the driver only at the first pre-header EOB whose bit position reaches the
@@ -1837,7 +1806,7 @@ mod tests {
     // snapshots for v0.6 phase-1 internals). The rapidgzip-port replaces the
     // phase-based pipeline with the chunk_fetcher prefetch loop + worker
     // pool; the per-event JSONL/timeline tracing that once lived under
-    // `src/decompress/parallel/instruments/` (GZIPPY_LOG_FILE / GZIPPY_TIMELINE)
+    // `src/decompress/parallel/instruments/` (env-gated JSONL/timeline tracing)
     // has since been removed as a byte-transparent cleanup.
     // =========================================================================
 

@@ -20,17 +20,16 @@
 //! chunk finalize — per mechanism measurement: ~8.5 ms × 51 chunks ~= 430 ms
 //! thread-summed at T8, ~⅔ of the decodeBlock CPU gap vs rapidgzip.
 //!
-//! Kill-switch: `GZIPPY_WINDOW_SPARSITY=1` restores the old always-on behavior
-//! (sparsity=true, compression=None/auto). Effect counter `SPARSITY_DECODE_COUNT`
-//! in `chunk_data` tracks actual executions; visible via `GZIPPY_VERBOSE`.
+//! The `GZIPPY_WINDOW_SPARSITY=1` kill-switch (which restored the old
+//! always-on behavior) was removed 2026-07-07 (batch 4f) — sparsity is always
+//! OFF (the faithful keepIndex=false default). Effect counter
+//! `SPARSITY_DECODE_COUNT` in `chunk_data` tracks actual executions.
 
-use std::sync::OnceLock;
-
-/// Returns `true` iff the `GZIPPY_WINDOW_SPARSITY=1` kill-switch is active,
-/// restoring the pre-port always-on sparsity behavior.
+/// Whether the pre-port always-on window-sparsity behavior is active.
+/// Hardcoded OFF (shipped default; the `GZIPPY_WINDOW_SPARSITY=1` kill-switch
+/// that used to restore it was removed as dead — batch 4f, byte-transparent).
 fn window_sparsity_kill_switch() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("GZIPPY_WINDOW_SPARSITY").ok().as_deref() == Some("1"))
+    false
 }
 
 /// Decompress one single-member gzip buffer with the parallel chunk pipeline.
@@ -133,7 +132,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // (ParallelGzipReader.hpp:1320-1330, tools/rapidgzip.cpp:47):
     //   windowSparsity   = keepIndex && windowSparsity = false
     //   windowCompressionType = keepIndex ? userValue : Some(NONE) = Some(NONE)
-    // Kill-switch GZIPPY_WINDOW_SPARSITY=1 restores old always-on behavior.
     let sparsity = window_sparsity_kill_switch();
     let configuration = ChunkConfiguration {
         split_chunk_size: target_compressed_chunk_bytes,
@@ -143,7 +141,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         // 32 KiB `getUsedWindowSymbols` scan per chunk finalize.
         window_sparsity: sparsity,
         // Default (keepIndex=false): store windows uncompressed (CompressionType::None).
-        // Kill-switch (old behavior): None → auto-select (heuristic in window_compression_type()).
         window_compression_type: if sparsity {
             None
         } else {
@@ -164,33 +161,17 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // is captured so the multi-member-misroute resume net still works.
     // T1 serial-eligible: strictly T==1.
     let t1_serial = parallelization <= 1;
-    // T1-MONOLITH (igzip-shaped single-buffer path): a deliberate, T1-gated
-    // divergence from the rapidgzip chunk pipeline toward the igzip monolith
-    // (former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). It is OPT-IN (GZIPPY_MONOLITH=1),
-    // NOT the default: the pre-registered falsifier measurement (Intel+AMD,
-    // former plans/T1-MONOLITH-RESULTS.md) found it FALSIFIED — it REGRESSES past the
-    // legacy thin-T1 driver because the single ISIZE buffer first-touches the
-    // whole output (~4× igzip's page faults), the cost igzip's streaming small
-    // reused buffer avoids. Kept opt-in only so the falsifier stays reproducible;
-    // the production T1 default remains thin-T1. T>1 NEVER takes this path.
-    // Legacy full-ISIZE monolith (FALSIFIED — fault-storm): opt-in only via
-    // GZIPPY_MONOLITH=1 so the prior falsifier stays reproducible.
-    let use_old_monolith = t1_serial && std::env::var_os("GZIPPY_MONOLITH").is_some();
-    // T1-MONOLITH-STREAMING: one continuous serial decode that STREAMS through a
-    // small resident buffer (no fault-storm — fixes the prior full-ISIZE
-    // monolith). It IS byte-exact, fault-storm-free, and DOES shed the per-chunk
-    // scaffold INSTRUCTIONS (fulcrum optgate: instr/byte RESOLVED-improved on
-    // silesia/nasa/monorepo/squishy), but fulcrum optgate REFUSED the wall win as
-    // INSTRUCTION-ONLY — cyc/byte did NOT improve beyond spread (only 2.8-4.6% of
-    // the gz→igzip cyc/byte gap closed; residual is kernel cycle-efficiency, NOT
-    // the scaffold). Per the governing policy (FULCRUM is the sole oracle; a
-    // default-path change must ride a gated WALL win), it is OPT-IN
-    // (GZIPPY_STREAM_MONOLITH=1), NOT the default; production T1 stays thin-T1
-    // (byte-identical to before this cycle). See
-    // former plans/T1-MONOLITH-FINISH-RESULTS.md. Native-only; T>1 never takes it.
-    let use_stream_monolith =
-        t1_serial && !use_old_monolith && std::env::var_os("GZIPPY_STREAM_MONOLITH").is_some();
-    let use_thin_t1 = t1_serial && !use_old_monolith && !use_stream_monolith;
+    // T1-MONOLITH (igzip-shaped single-buffer path) and T1-MONOLITH-STREAMING
+    // were deliberate, T1-gated divergences from the rapidgzip chunk pipeline
+    // toward an igzip-shaped monolith, both opt-in only (`GZIPPY_MONOLITH=1` /
+    // `GZIPPY_STREAM_MONOLITH=1`). Both were gate-measured and never won: the
+    // full-ISIZE monolith FALSIFIED (regresses past thin-T1 — the single ISIZE
+    // buffer first-touches the whole output, ~4x igzip's page faults, the cost
+    // igzip's streaming small reused buffer avoids); the streaming variant fixed
+    // the fault-storm and shed per-chunk scaffold INSTRUCTIONS but fulcrum optgate
+    // REFUSED the wall win as INSTRUCTION-ONLY (cyc/byte did not improve beyond
+    // spread). Removed 2026-07-07 (batch 4f) — production T1 stays thin-T1.
+    let use_thin_t1 = t1_serial;
     // Tiny-file lever (#189/#199 lever-2b): a tiny thin-T1 decode makes exactly
     // ONE rpmalloc-backed allocation (its huge chunk-output reserve), and that
     // allocation triggers rpmalloc process+thread init — pure overhead for a
@@ -210,23 +191,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     } else {
         None
     };
-    let drive_result = if use_old_monolith {
-        chunk_fetcher::drive_monolith_t1(
-            deflate_data,
-            writer,
-            configuration,
-            expected_size,
-            bytes_written_out,
-        )
-    } else if use_stream_monolith {
-        chunk_fetcher::drive_monolith_streaming_t1(
-            deflate_data,
-            writer,
-            configuration,
-            expected_size,
-            bytes_written_out,
-        )
-    } else if use_thin_t1 {
+    let drive_result = if use_thin_t1 {
         chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration, bytes_written_out)
     } else if let Some(out) = bytes_written_out {
         // Multi-member resume support: capture bytes streamed even on error so

@@ -63,8 +63,8 @@ pub type ThreadPinning = HashMap<usize, u32>;
 /// saturated case a finishing worker almost always sees `pending > 0` and
 /// never spins.
 ///
-/// Frozen to [`DEFAULT_POOL_SPIN_US`] — the value the campaign measured with
-/// `GZIPPY_POOL_SPIN_US` unset (production default).
+/// Frozen to [`DEFAULT_POOL_SPIN_US`] — the value the campaign measured as
+/// the production default (the env override was removed).
 fn pool_spin_us() -> u64 {
     DEFAULT_POOL_SPIN_US
 }
@@ -457,10 +457,6 @@ fn worker_main(
 ) {
     let spin_us = pool_spin_us();
     crate::decompress::parallel::chunk_buffer_pool::bind_worker_pool_index(thread_index);
-    // Rule-#3 page-warmth oracle (GZIPPY_PREFAULT_ARENA, default OFF, byte-transparent):
-    // pre-touch this worker's marker/data arena so first-touch faults are paid off the
-    // wall-critical decode path. Falsifies whether the excess faults are on the wall.
-    crate::decompress::parallel::chunk_buffer_pool::prefault_worker_arena();
     if let Some(core_id) = pin {
         // Mirror of `pinThreadToLogicalCore(static_cast<int>(pinning->second))`
         // (ThreadPool.hpp:199). `core_affinity` is portable across the

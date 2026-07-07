@@ -32,8 +32,8 @@
 //! unaffected. A write error is captured and surfaced at `join`.
 //!
 //! The shipped default is the inline writev path (byte-identical); this
-//! overlap-writer machinery is currently unwired (the `GZIPPY_OVERLAP_WRITER`
-//! A/B toggle was removed) and retained for a future re-enable. Linux +
+//! overlap-writer machinery is currently unwired (the env-based A/B toggle
+//! was removed) and retained for a future re-enable. Linux +
 //! regular-fd only (the vmsplice/pipe path is unchanged — splice page-lifetime
 //! accounting needs the inline path).
 

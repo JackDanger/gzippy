@@ -185,7 +185,7 @@ pub(crate) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
 /// Whether to use the portable crc32fast kernel instead of the HW-accelerated
 /// fold (aarch64 3-way `crc32x` / PMULL, x86_64 VPCLMULQDQ). The shipped path
 /// is always the HW fold (subject to runtime feature detection at the call
-/// sites); the `GZIPPY_CRC_LEGACY` A/B override was removed.
+/// sites); the env-based A/B override was removed.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn crc_legacy() -> bool {

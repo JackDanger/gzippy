@@ -72,8 +72,8 @@ pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 const DEMOTE_THRESHOLD_NUM: usize = 1;
 const DEMOTE_THRESHOLD_DEN: usize = 2;
 
-/// Phase wrapper for the stored decode path. Formerly hosted the env-gated
-/// `GZIPPY_STORED_PHASE_TIMING` per-phase wall-time dump (removed); reduced to a
+/// Phase wrapper for the stored decode path. Formerly hosted an env-gated
+/// per-phase wall-time dump (removed); reduced to a
 /// transparent pass-through so the phase call sites keep their structure while
 /// carrying zero measurement cost.
 #[inline]
@@ -702,12 +702,9 @@ fn fill_and_crc(
     if threads <= 1 || total < 1 << 20 {
         // Fused copy+CRC: hash each run's bytes while they are still hot in
         // cache from the copy, instead of a SECOND full pass over `output`.
-        // A/B knob `GZIPPY_STORED_SPLIT_CRC=1` restores the old split (copy
-        // then `crc32(output)`) for measurement parity.
-        if std::env::var_os("GZIPPY_STORED_SPLIT_CRC").is_some() {
-            copy_runs(output, deflate, base_off, runs);
-            return crc32(output);
-        }
+        // (The old split-copy-then-`crc32(output)` A/B arm, `GZIPPY_STORED_SPLIT_CRC=1`,
+        // was removed 2026-07-07, batch 4f — same CRC semantics, this is just
+        // fewer passes over `output`.)
         return copy_runs_fused_crc(output, deflate, base_off, runs);
     }
 
@@ -740,36 +737,24 @@ fn fill_and_crc(
     std::thread::scope(|scope| {
         for ((part, out_slice), result) in parts.iter().zip(out_slices).zip(results.iter_mut()) {
             let runs_part = &runs[part.clone()];
-            let split_crc = std::env::var_os("GZIPPY_STORED_SPLIT_CRC").is_some();
             scope.spawn(move || {
                 // Each run's out_off is absolute; translate to slice-local by
                 // subtracting the partition's first run's out_off.
                 let local_base = runs_part.first().map(|r| r.out_off).unwrap_or(0);
                 let out_len = out_slice.len();
-                if split_crc {
-                    // Old behavior: copy, then a SECOND full pass for the CRC.
-                    for r in runs_part {
-                        let dst = r.out_off - local_base;
-                        out_slice[dst..dst + r.len].copy_from_slice(
-                            &deflate[r.src_off - base_off..r.src_off - base_off + r.len],
-                        );
-                    }
-                    *result = (crc32(out_slice), out_len);
-                } else {
-                    // Fused copy+CRC: hash each run's bytes while they are still
-                    // hot in cache from the copy (one pass over `output`, not
-                    // two). Runs within a partition are contiguous and ordered,
-                    // so an incremental Hasher over them yields the exact same
-                    // CRC32 as one `crc32(out_slice)` over the whole partition.
-                    let mut hasher = Hasher::new();
-                    for r in runs_part {
-                        let dst = r.out_off - local_base;
-                        let s = r.src_off - base_off;
-                        out_slice[dst..dst + r.len].copy_from_slice(&deflate[s..s + r.len]);
-                        hasher.update(&out_slice[dst..dst + r.len]);
-                    }
-                    *result = (hasher.finalize(), out_len);
+                // Fused copy+CRC: hash each run's bytes while they are still
+                // hot in cache from the copy (one pass over `output`, not
+                // two). Runs within a partition are contiguous and ordered,
+                // so an incremental Hasher over them yields the exact same
+                // CRC32 as one `crc32(out_slice)` over the whole partition.
+                let mut hasher = Hasher::new();
+                for r in runs_part {
+                    let dst = r.out_off - local_base;
+                    let s = r.src_off - base_off;
+                    out_slice[dst..dst + r.len].copy_from_slice(&deflate[s..s + r.len]);
+                    hasher.update(&out_slice[dst..dst + r.len]);
                 }
+                *result = (hasher.finalize(), out_len);
             });
         }
     });
@@ -865,14 +850,6 @@ fn write_runs<W: Write>(
     }
     writer.flush()?;
     Ok(())
-}
-
-/// Inline (single-threaded) copy of all runs.
-fn copy_runs(output: &mut [u8], deflate: &[u8], base_off: usize, runs: &[StoredRun]) {
-    for r in runs {
-        let src = r.src_off - base_off;
-        output[r.out_off..r.out_off + r.len].copy_from_slice(&deflate[src..src + r.len]);
-    }
 }
 
 /// Inline (single-threaded) copy of all runs that ALSO computes the whole-output

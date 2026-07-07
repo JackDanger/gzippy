@@ -468,96 +468,6 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
 #[cfg(parallel_sm)]
 pub static THIN_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// T1-MONOLITH driver — a deliberate, T1-gated DIVERGENCE from the rapidgzip
-/// chunk pipeline TOWARD the igzip serial monolith (see
-/// `former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md`). Decodes the ENTIRE single-member
-/// deflate body as ONE chunk into ONE contiguous buffer reserved upfront to the
-/// whole-member ISIZE, then writes it once. No per-chunk alloc, no per-chunk
-/// rolling-window clone+re-seed, no per-block boundary record — the single
-/// buffer IS the implicit history (igzip `tmp_out`/`out` shape).
-///
-/// Output is byte-identical to `drive_thin_t1_oracle` (same kernel, same clean
-/// window-present decode, chunk-0 zero-window seed). CRC + ISIZE are verified by
-/// the caller. T>1 NEVER reaches here (the caller gates strictly on `T==1`).
-#[cfg(parallel_sm)]
-pub fn drive_monolith_t1<W: std::io::Write>(
-    input: &[u8],
-    writer: &mut W,
-    configuration: ChunkConfiguration,
-    expected_isize: usize,
-    bytes_written_out: Option<&mut usize>,
-) -> Result<(u32, usize), FetchError> {
-    use crate::decompress::parallel::chunk_decode;
-
-    let chunk = chunk_decode::decode_monolith_native(input, expected_isize, configuration)
-        .map_err(FetchError::Decode)?;
-
-    // ONE write of the whole output buffer (skip the 32 KiB dictionary prefix).
-    chunk
-        .data
-        .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
-        .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-    let total_size = chunk.decoded_size();
-    // Multi-member-misroute resume net: report bytes streamed so a stream the
-    // classifier called single-member but whose 2nd member began past the
-    // detection window decodes member 1 here, then fails the trailer check;
-    // resume re-decodes members 2+ past this prefix.
-    if let Some(out) = bytes_written_out {
-        *out = total_size;
-    }
-    let mut total_crc = CRC32Calculator::new();
-    for stream_crc in &chunk.crc32s {
-        total_crc.append(stream_crc);
-    }
-
-    if std::env::var_os("GZIPPY_DEBUG").is_some() {
-        eprintln!(
-            "[parallel_sm] T1-MONOLITH out={total_size} bytes (single chunk, igzip-shaped: \
-             one ISIZE-reserved buffer, no per-chunk alloc/window/boundary)"
-        );
-    }
-    MONOLITH_T1_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok((total_crc.crc32(), total_size))
-}
-
-/// Production-routing proof for the T1-monolith path (deletion-trap pattern).
-#[cfg(parallel_sm)]
-pub static MONOLITH_T1_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// T1-MONOLITH-STREAMING driver — the gzippy-native production T==1 path.
-///
-/// Decodes the WHOLE single-member deflate body in ONE continuous serial pass
-/// (one `Block`, one marker ctx, one `set_initial_window`) that STREAMS output
-/// through ONE small fixed-size resident buffer — shedding the per-chunk DRIVER
-/// SCAFFOLD (the gated +21–30% T1-vs-igzip gap, F-6ce077591bb5/F-8bd982118f3d)
-/// WITHOUT the prior full-ISIZE monolith's page-fault storm (the buffer is
-/// reserved once and recycled in place via `retain_tail`; see
-/// `decode_and_stream_monolith_native`). The decode runs inside the
-/// `T1ResidentScope` (validated cache-residency lever: warm pooled pages,
-/// scoped to this single serial thread; T>1 workers never enter it).
-///
-/// Byte-identical output to `drive_thin_t1_oracle`. CRC + ISIZE are verified by
-/// the caller; errors are terminal (NO fallback). T>1 NEVER reaches here.
-#[cfg(parallel_sm)]
-pub fn drive_monolith_streaming_t1<W: std::io::Write>(
-    input: &[u8],
-    writer: &mut W,
-    configuration: ChunkConfiguration,
-    expected_isize: usize,
-    bytes_written_out: Option<&mut usize>,
-) -> Result<(u32, usize), FetchError> {
-    let _resident = crate::decompress::parallel::chunk_buffer_pool::T1ResidentScope::enter();
-    let result = crate::decompress::parallel::chunk_decode::decode_and_stream_monolith_native(
-        input,
-        expected_isize,
-        configuration,
-        writer,
-        bytes_written_out,
-    )
-    .map_err(FetchError::Decode)?;
-    Ok(result)
-}
-
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
@@ -582,7 +492,7 @@ fn drive_impl<W: std::io::Write>(
     // ── m_blockFinder (vendor GzipChunkFetcher.hpp:283) ─────────────
     // AMD/Zen2 T3 TAIL-TAPER (byte-transparent; gated). At 3 workers the in-order
     // pull-queue's makespan is set by a STRAGGLER: the last decode round leaves 2
-    // of 3 workers idle while one finishes a full 4 MiB chunk (GZIPPY_TIMELINE:
+    // of 3 workers idle while one finishes a full 4 MiB chunk (traced:
     // ideal makespan 223.6 ms vs actual 249.8 ms — a ~26 ms / ~10% imbalance; the
     // final-ending span is a full ~38 ms chunk). A GLOBAL finer chunk size regresses
     // T3 (its own optimum is 4 MiB; at 3 workers whole-file per-chunk overhead > tail
@@ -876,9 +786,9 @@ fn drive_impl<W: std::io::Write>(
             "  StoredParallel pure-stored chunked-streaming runs (no monolithic buffer): {}",
             crate::decompress::parallel::stored_split::STORED_STREAM_RUNS.load(Ordering::Relaxed),
         );
-        // Window-sparsity effect counter: 0 = keepIndex=false faithful port (default),
-        // non-zero = GZIPPY_WINDOW_SPARSITY=1 kill-switch active (old always-on path).
-        // Each count = one 32 KiB getUsedWindowSymbols scan run at chunk finalize.
+        // Window-sparsity effect counter: always 0 — keepIndex=false faithful port
+        // is the sole behavior now (the old always-on kill-switch was removed).
+        // Each count would be one 32 KiB getUsedWindowSymbols scan at chunk finalize.
         eprintln!(
             "  Window-sparsity decode runs (0=off=vendor-default, >0=kill-switch-active): {}",
             crate::decompress::parallel::chunk_data::SPARSITY_DECODE_COUNT.load(Ordering::Relaxed),
@@ -2987,7 +2897,7 @@ impl ConsumerChunkHold {
     }
 }
 
-// ── Eager post-process probe (GZIPPY_EAGER_POSTPROC=1) ────────────────────
+// ── Eager post-process probe ────────────────────────────────────────────
 // Port of rapidgzip's `queuePrefetchedChunkPostProcessing`
 // (GzipChunkFetcher.hpp:520-551): during a consumer stall, submit
 // apply_window for prefetched SUCCESSOR chunks whose predecessor window
@@ -3451,7 +3361,7 @@ fn drain_one_pending<W: std::io::Write>(
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
     block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
-    // Eager post-process context (GZIPPY_EAGER_POSTPROC=1). When the head
+    // Eager post-process context. When the head
     // pending write is an in-flight post-process (`Async`), the consumer is
     // about to BLOCK on `rx.recv()` (the `wait.future_recv` span — the
     // consumer's real serial wait once Design B has promoted predecessor
