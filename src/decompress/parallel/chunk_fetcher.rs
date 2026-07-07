@@ -362,8 +362,8 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
 
     let total_bits = input.len() * 8;
     // Compressed-bytes-per-chunk stride from the chunk configuration (T1 default
-    // = 1 MiB target, warm output-buffer recycling; GZIPPY_CHUNK_KIB overrides).
-    // Clamp to ≥64 KiB so a pathological tiny config can't thrash the loop.
+    // = 1 MiB target, warm output-buffer recycling). Clamp to ≥64 KiB so a
+    // pathological tiny config can't thrash the loop.
     let stride_bits = configuration.split_chunk_size.max(64 * 1024) * 8;
 
     let mut total_crc = CRC32Calculator::new();

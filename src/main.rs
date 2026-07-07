@@ -127,11 +127,8 @@ fn main() {
 
     let result = run();
 
-    // Debug-only memory accounting (no-op unless GZIPPY_MEM_STATS is set).
-    // Emitted here because `process::exit` below skips destructors.
-    decompress::inflate::mem_stats::report();
-    // Data-flow instrument (feature = "lut-count", GZIPPY_LUT_COUNT=1): per-block
-    // litlen LUT builds vs reads. No-op without the feature/env.
+    // Data-flow instrument (feature = "lut-count"): per-block litlen LUT
+    // builds vs reads. No-op without the (non-default) feature.
     #[cfg(parallel_sm)]
     decompress::parallel::lut_huffman::dump_litlen_count();
 

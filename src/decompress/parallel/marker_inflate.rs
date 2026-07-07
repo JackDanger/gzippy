@@ -708,45 +708,6 @@ impl Block {
         }
     }
 
-    /// Resident PER-THREAD working-set byte breakdown for the gzippy-native
-    /// cache-residency mandate (`git history (campaign plan, removed)`). This
-    /// is the persistent thread-local engine state (`BOOTSTRAP_BLOCK`,
-    /// `chunk_decode.rs`) — the real native working set after the flip-in-place
-    /// fold removed Engine C. Counters only; never mutates decode state.
-    ///
-    /// Components (native `pure_inflate_decode` build):
-    /// - `output_ring`: `Box<[u16; RING_SIZE]>` = 128 KiB.
-    /// - `lut_litlen` (`LutLitLenCode`): the per-thread ISA-L-style lit/len LUT
-    ///   (`InflateHuffCodeLarge` short+long lookup + code lists), rebuilt
-    ///   in-place per block — persistent allocation, not shared.
-    /// - `dist_hc` (`HuffmanCodingReversedBitsCached`): the distance
-    ///   `code_cache` = `[(u8, u16); 1<<15]` = 128 KiB.
-    /// - `literal_cl` / `backreferences` Vecs (heap), `precode_cl` is inline.
-    ///
-    /// Returns `(total, ring, litlen_lut, dist_cache, misc_vecs)`.
-    #[cfg(parallel_sm)]
-    pub fn heap_bytes(&self) -> super::super::inflate::mem_stats::BlockHeapBytes {
-        use std::mem::size_of;
-        let ring = size_of::<[u16; RING_SIZE]>();
-        #[cfg(pure_inflate_decode)]
-        let litlen_lut = self.asm.lut_litlen.heap_bytes();
-        #[cfg(not(pure_inflate_decode))]
-        let litlen_lut = 0usize;
-        #[cfg(pure_inflate_decode)]
-        let dist_cache = self.dist_hc.heap_bytes();
-        #[cfg(not(pure_inflate_decode))]
-        let dist_cache = 0usize;
-        let misc_vecs = self.literal_cl.capacity()
-            + self.backreferences.capacity() * size_of::<Backreference>();
-        super::super::inflate::mem_stats::BlockHeapBytes {
-            total: ring + litlen_lut + dist_cache + misc_vecs,
-            ring,
-            litlen_lut,
-            dist_cache,
-            misc_vecs,
-        }
-    }
-
     // ── Accessors (deflate.hpp:526-561) ─────────────────────────────────────
 
     pub fn eob(&self) -> bool {
@@ -1184,25 +1145,18 @@ impl Block {
         // (`ensure_dist_table`) — does not pay a redundant second distance
         // build. Converges toward igzip's single inline distance table
         // (`make_inflate_huff_code_dist`, igzip_inflate.c).
-        // NIGHT35 table-build slope knob (byte-transparent): repeat the litlen
-        // LUT build `tbuild_mult()` times into the idempotent state. Default 1.
-        let tmult = tbuild_mult();
         match self.compression_type {
             CompressionType::FixedHuffman => {
-                for _ in 0..tmult {
-                    if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
-                        return Err(BlockError::InvalidCodeLengths);
-                    }
+                if !self.lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
+                    return Err(BlockError::InvalidCodeLengths);
                 }
             }
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
                 let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
                 lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
-                for _ in 0..tmult {
-                    if !self.lut_litlen_rebuild(&lit_stack[..split]) {
-                        return Err(BlockError::InvalidCodeLengths);
-                    }
+                if !self.lut_litlen_rebuild(&lit_stack[..split]) {
+                    return Err(BlockError::InvalidCodeLengths);
                 }
             }
             CompressionType::Uncompressed | CompressionType::Reserved => {}
@@ -4021,23 +3975,6 @@ const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
 };
 #[cfg(parallel_sm)]
 const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_SYMBOL_COUNT];
-
-/// NIGHT35 (re-added NIGHT28/NIGHT33 perturbation at HEAD): per-block
-/// table-build multiplier. `GZIPPY_TBUILD_MULT=N` runs the per-block litlen
-/// LUT build N times into the SAME idempotent state (N-1 throwaway rebuilds +
-/// the real one). `rebuild_from` is a FULL repopulate (clears valid + tables
-/// first), so the table the decode reads is byte-identical at any N — this is
-/// a byte-transparent Gate-2 slope knob for the table-build's ON-WALL share.
-fn tbuild_mult() -> u64 {
-    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *M.get_or_init(|| {
-        std::env::var("GZIPPY_TBUILD_MULT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(1)
-    })
-}
 
 // ELEMENT A: the process-wide `fixed_dist_table()` static is REMOVED — the
 // dist table (fixed and dynamic) is now built INLINE into `self.asm.dist`

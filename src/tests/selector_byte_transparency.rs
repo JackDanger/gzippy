@@ -3,11 +3,11 @@
 //! WHY (campaign): `effective_parallel_threads`
 //! (`src/decompress/parallel/single_member.rs`) is a PURE thread-count selector
 //! with FOUR decision dimensions —
-//!   1. the serial-clean crossover margin (`GZIPPY_PARALLEL_CROSSOVER_MARGIN`)
-//!      (also the sole owner of high-ratio routing since the T-blind hard ratio
-//!      cap `GZIPPY_PARALLEL_RATIO_MAX` was deleted, 2026-07-05),
-//!   2. the small-output serial FLOOR (`GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`, 8 MiB),
-//!   3. the large-output notch bonus (`GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES/NOTCH`),
+//!   1. the serial-clean crossover margin (also the sole owner of high-ratio
+//!      routing since the T-blind hard ratio cap `GZIPPY_PARALLEL_RATIO_MAX`
+//!      was deleted, 2026-07-05),
+//!   2. the small-output serial FLOOR (8 MiB),
+//!   3. the large-output notch bonus,
 //!   4. the small-file chunk-size adjustment (min-work-per-thread,
 //!      `adjusted_chunk_size_bytes`).
 //! Each is BYTE-TRANSPARENT by construction — it may only change the thread
@@ -19,18 +19,29 @@
 //! This net closes that gap. For gzip streams spanning the selector's decision
 //! BOUNDARIES (ISIZE/deflate ratio × output size, including exact boundary
 //! ISIZE values), it decodes each through THREE configurations —
-//!   (a) the production selector (default env),
-//!   (b) forced-parallel (all caps disabled),
-//!   (c) forced-serial (crossover forced above every T) —
+//!   (a) the production selector (frozen defaults, `effective_parallel_threads`),
+//!   (b) forced-parallel (selector bypassed — decode with exactly the
+//!       requested thread count),
+//!   (c) forced-serial (selector bypassed — decode with exactly 1 thread) —
 //! and asserts ALL THREE are byte-identical to TWO independent oracles
 //! (flate2/zlib-ng + libdeflate). If any selector branch corrupted a byte
 //! (e.g. a serial/parallel seam divergence that only manifests under a
 //! particular thread count) it lands RED here.
 //!
+//! (2026-07: the five `GZIPPY_PARALLEL_*` / `GZIPPY_MIN_THREADS_FLOOR` env
+//! knobs that used to drive configs (b)/(c) were frozen to their campaign-
+//! measured defaults and the env reads deleted — see
+//! `single_member::effective_parallel_threads_with`, the now-pure
+//! parameterized core. Configs (b)/(c) are reproduced here by calling
+//! `sm_driver::read_parallel_sm_capturing` directly with an explicit
+//! `parallelization`, bypassing the selector rather than overriding it via
+//! env — a strictly stronger check, since it covers EVERY thread count, not
+//! just the ones a particular env override happened to force.)
+//!
 //! Gate-0 non-inertness: the boundary suite PROVES it exercises the <8 MiB
 //! floor path (asserts `SMALL_OUTPUT_SERIAL_FLOOR_APPLIED` increments across a
-//! real production decode) plus the ratio-cap, crossover, notch, and
-//! chunk-adjust branches (each via its dedicated deletion-trap counter).
+//! real production decode) plus the crossover, notch, and chunk-adjust
+//! branches (each via its dedicated deletion-trap counter).
 //!
 //! Run: `cargo test --release --features pure-rust-inflate selector_byte_transparency`.
 
@@ -44,25 +55,8 @@ mod tests {
 
     use crate::decompress::parallel::single_member::{
         effective_parallel_threads, skip_gzip_header, ADJUSTED_CHUNK_SIZE_APPLIED,
-        MARKER_PIPELINE_RUNS, MARKER_PIPELINE_TEST_LOCK, SERIAL_CLEAN_FLOOR_APPLIED,
-        SMALL_OUTPUT_SERIAL_FLOOR_APPLIED,
+        MARKER_PIPELINE_TEST_LOCK, SERIAL_CLEAN_FLOOR_APPLIED, SMALL_OUTPUT_SERIAL_FLOOR_APPLIED,
     };
-
-    // ── Selector env knobs (the four dimensions) ──────────────────────────────
-    // (the fifth, `GZIPPY_PARALLEL_RATIO_MAX`, was deleted with the T-blind hard
-    // ratio cap on 2026-07-05 — the crossover selector owns high-ratio routing)
-    const E_MARGIN: &str = "GZIPPY_PARALLEL_CROSSOVER_MARGIN";
-    const E_MIN_OUT: &str = "GZIPPY_PARALLEL_MIN_OUTPUT_BYTES";
-    const E_LARGE_OUT: &str = "GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES";
-    const E_NOTCH: &str = "GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH";
-
-    const ALL_SELECTOR_ENV: &[&str] = &[E_MARGIN, E_MIN_OUT, E_LARGE_OUT, E_NOTCH];
-
-    fn clear_selector_env() {
-        for k in ALL_SELECTOR_ENV {
-            std::env::remove_var(k);
-        }
-    }
 
     // ── Oracles (two independent codebases; mirror of diff_multi_oracle) ───────
 
@@ -193,44 +187,67 @@ mod tests {
 
     // ── The core differential: three configs, two oracles, byte-exact ─────────
 
-    struct Cfg {
-        label: &'static str,
-        env: &'static [(&'static str, &'static str)],
+    /// How the requested thread count `t` is turned into the ACTUAL
+    /// `parallelization` handed to the driver.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// The frozen production selector (`effective_parallel_threads`).
+        Production,
+        /// Selector bypassed — decode with exactly the requested `t`.
+        ForcedParallel,
+        /// Selector bypassed — decode with exactly 1 thread.
+        ForcedSerial,
     }
 
-    /// (a) production, (b) forced-parallel (all caps off), (c) forced-serial
-    /// (crossover forced above every thread count so the selector returns 1
-    /// even at T=16). All three MUST decode byte-identically.
+    struct Cfg {
+        label: &'static str,
+        mode: Mode,
+    }
+
+    /// (a) production (frozen selector), (b) forced-parallel (selector
+    /// bypassed, exact requested `t`), (c) forced-serial (selector bypassed,
+    /// pinned to 1 thread). All three drive the SAME underlying `sm_driver`
+    /// engine, so this still exercises the parallel-vs-serial seam. All three
+    /// MUST decode byte-identically.
     const CONFIGS: &[Cfg] = &[
         Cfg {
             label: "production",
-            env: &[],
+            mode: Mode::Production,
         },
         Cfg {
             label: "forced-parallel",
-            env: &[(E_MARGIN, "0"), (E_MIN_OUT, "0")],
+            mode: Mode::ForcedParallel,
         },
         Cfg {
             label: "forced-serial",
-            // Huge crossover margin ⇒ crossover = ceil(ratio · 1e6) > any T ⇒
-            // serial even for near-incompressible streams; the huge floor is
-            // belt-and-suspenders.
-            env: &[(E_MARGIN, "1000000"), (E_MIN_OUT, "17179869184")],
+            mode: Mode::ForcedSerial,
         },
     ];
 
-    /// Decode `gz` at thread count `t` under `env`, returning the bytes.
-    /// Caller holds `MARKER_PIPELINE_TEST_LOCK` (serializes the process-global
-    /// env + the shared MARKER_PIPELINE_RUNS snapshot).
-    fn decode_under(gz: &[u8], t: usize, env: &[(&str, &str)], reserve: usize) -> Vec<u8> {
-        clear_selector_env();
-        for (k, v) in env {
-            std::env::set_var(k, v);
-        }
+    /// Decode `gz` requesting thread count `t`, resolving to an actual
+    /// `parallelization` per `cfg.mode`, then driving `sm_driver` directly.
+    /// This bypasses `single_member::decompress_parallel`'s classifier
+    /// wrapper — there is no other decode engine to silently fall back to
+    /// (NO FALLBACKS, per project rules), so a successful, length-matching
+    /// return already proves the real chunk_fetcher/marker pipeline ran.
+    fn decode_under(gz: &[u8], t: usize, cfg: &Cfg, reserve: usize) -> Vec<u8> {
+        let dlen = deflate_len(gz);
+        let parallelization = match cfg.mode {
+            Mode::Production => effective_parallel_threads(gz, dlen, t),
+            Mode::ForcedParallel => t,
+            Mode::ForcedSerial => 1,
+        };
         let mut out = Vec::with_capacity(reserve);
-        let r = crate::decompress::decompress_single_member(gz, &mut out, t);
-        clear_selector_env();
-        r.unwrap_or_else(|e| panic!("decode failed (t={t}): {e}"));
+        let mut bytes_written = 0usize;
+        let r = crate::decompress::parallel::sm_driver::read_parallel_sm_capturing(
+            gz,
+            &mut out,
+            None,
+            parallelization.max(1),
+            4 * 1024 * 1024,
+            &mut bytes_written,
+        );
+        r.unwrap_or_else(|e| panic!("decode failed (t={t}, cfg={}): {e:?}", cfg.label));
         out
     }
 
@@ -258,15 +275,7 @@ mod tests {
 
         for &t in threads {
             for cfg in CONFIGS {
-                let before = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
-                let got = decode_under(gz, t, cfg.env, reference.len());
-                let after = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
-                assert!(
-                    after > before,
-                    "{label}[{},t={t}]: ParallelSM did not run (MARKER_PIPELINE_RUNS \
-                     {before}->{after}) — routing fell through, selector NOT exercised",
-                    cfg.label
-                );
+                let got = decode_under(gz, t, cfg, reference.len());
                 assert_eq!(
                     got.len(),
                     reference.len(),
@@ -316,9 +325,10 @@ mod tests {
             // --- mid outputs above floor, in the crossover zone ---
             ("mid_r3", 12 * MIB, 3.0, 6),
             ("mid_lowratio", 12 * MIB, 1.2, 6),
-            // --- ratio-cap boundary (default cap = 8×), output > floor ---
-            ("cap_below", 12 * MIB, 7.4, 6), // ratio just below 8 ⇒ cap must NOT fire
-            ("cap_above", 12 * MIB, 8.6, 6), // ratio just above 8 ⇒ cap fires
+            // --- higher-ratio crossover cells (the deleted T-blind cap used to
+            //     sit at ratio 8; the T-aware crossover now owns these) ---
+            ("cap_below", 12 * MIB, 7.4, 6),
+            ("cap_above", 12 * MIB, 8.6, 6),
             ("ratio_15", 12 * MIB, 15.0, 6),
             ("ratio_25", 12 * MIB, 25.0, 6),
             // --- a larger output ---
@@ -356,21 +366,24 @@ mod tests {
     // Deterministically proves each selector branch is EXERCISED (its dedicated
     // deletion-trap counter increments / its decision flips), AND that the <8 MiB
     // floor + chunk-adjust paths are hit through REAL production decodes. The
-    // branch DECISIONS use synthetic exact-(isize,deflate) blobs so they are
-    // deterministic on x86 AND aarch64 (env overrides pin the arch-dispatched
-    // defaults); the non-inert proofs use real compressible streams whose
-    // floor/chunk-adjust preconditions hold with wide margin regardless of the
-    // exact realized ratio.
+    // branch DECISIONS use synthetic exact-(isize,deflate) blobs through
+    // `single_member::effective_parallel_threads_with` (explicit params pin the
+    // margin/floor/notch dimensions being exercised, deterministic on x86 AND
+    // aarch64 — no env, no arch dispatch); the non-inert proofs use real
+    // compressible streams whose floor/chunk-adjust preconditions hold with wide
+    // margin regardless of the exact realized ratio.
     #[test]
     fn selector_branches_are_exercised() {
+        use crate::decompress::parallel::single_member::effective_parallel_threads_with;
+
         let _lock = MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
         // ============================================================
-        // 1. <8 MiB SMALL-OUTPUT FLOOR — direct decision + REAL decode.
+        // 1. <8 MiB SMALL-OUTPUT FLOOR — direct decision (frozen production
+        //    default, arch-independent) + REAL decode.
         // ============================================================
-        clear_selector_env(); // default env: the floor is arch-INDEPENDENT
         let before_floor = SMALL_OUTPUT_SERIAL_FLOOR_APPLIED.load(Ordering::Relaxed);
 
         // Direct: isize 6 MiB, deflate 2 MiB (ratio 3 ≥ 1.5, both < 8 MiB) ⇒ floor
@@ -379,7 +392,7 @@ mod tests {
         assert_eq!(
             effective_parallel_threads(&floor_blob, 2 * MIB, 8),
             1,
-            "floor: <8 MiB compressible must cap to serial (default env)"
+            "floor: <8 MiB compressible must cap to serial (frozen default)"
         );
 
         // REAL production decode of a 6 MiB compressible stream at T=8 must ALSO
@@ -417,13 +430,25 @@ mod tests {
         //    aarch64: the prestack cap remains (selector disabled there; cap
         //    removal regresses M1 2.1-2.6× — see single_member.rs) → serial at
         //    both T8 and T16.
+        //    margin pinned to 1.0 (vendor-independent) and the floor disabled,
+        //    isolating the crossover/prestack-cap decision under test.
         // ============================================================
-        clear_selector_env();
-        std::env::set_var(E_MIN_OUT, "0"); // disable floor
-        std::env::set_var(E_MARGIN, "1.0"); // vendor-independent pin
         let hr_blob = blob_with_isize(10 * MIB as u32);
+        let hr_call = |t: usize| {
+            effective_parallel_threads_with(
+                &hr_blob,
+                MIB,
+                t,
+                0,   // floor disabled
+                1.0, // margin pinned
+                crate::decompress::parallel::single_member::PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+                crate::decompress::parallel::single_member::arch_large_output_notch_default(),
+                0, // work-per-thread cap disabled
+                crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
+            )
+        };
         assert_eq!(
-            effective_parallel_threads(&hr_blob, MIB, 8),
+            hr_call(8),
             1,
             "ratio 10 at T8 (below crossover 10) routes serial"
         );
@@ -431,12 +456,12 @@ mod tests {
         {
             let before_xover = SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed);
             assert_eq!(
-                effective_parallel_threads(&hr_blob, MIB, 8),
+                hr_call(8),
                 1,
                 "x86: selector (not a cap) serializes below crossover"
             );
             assert_eq!(
-                effective_parallel_threads(&hr_blob, MIB, 16),
+                hr_call(16),
                 16,
                 "x86: ratio 10 at T16 (>= crossover 10) must parallelize — no blind cap"
             );
@@ -448,7 +473,7 @@ mod tests {
         }
         #[cfg(target_arch = "aarch64")]
         assert_eq!(
-            effective_parallel_threads(&hr_blob, MIB, 16),
+            hr_call(16),
             1,
             "aarch64: prestack cap serializes ratio >= 8 at every T"
         );
@@ -456,18 +481,28 @@ mod tests {
         // ============================================================
         // 3. CROSSOVER (serial-clean) — ratio 3 (< cap 8), margin 1.0 ⇒ xover 3.
         // ============================================================
-        clear_selector_env();
-        std::env::set_var(E_MIN_OUT, "0"); // disable floor
-        std::env::set_var(E_MARGIN, "1.0");
         let xo_blob = blob_with_isize(3 * MIB as u32); // ratio 3 vs deflate 1 MiB
+        let xo_call = |t: usize| {
+            effective_parallel_threads_with(
+                &xo_blob,
+                MIB,
+                t,
+                0,
+                1.0,
+                crate::decompress::parallel::single_member::PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+                crate::decompress::parallel::single_member::arch_large_output_notch_default(),
+                0,
+                crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
+            )
+        };
         let before_xo = SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed);
         assert_eq!(
-            effective_parallel_threads(&xo_blob, MIB, 2),
+            xo_call(2),
             1,
             "crossover: T2 < crossover(3) must route serial"
         );
         assert_eq!(
-            effective_parallel_threads(&xo_blob, MIB, 8),
+            xo_call(8),
             8,
             "crossover: T8 >= crossover(3) must stay parallel"
         );
@@ -480,57 +515,74 @@ mod tests {
         // ============================================================
         // 4. LARGE-OUTPUT NOTCH — 1-notch bonus drops crossover 3→2 at T=2.
         // ============================================================
-        clear_selector_env();
-        std::env::set_var(E_MIN_OUT, "0");
-        std::env::set_var(E_MARGIN, "1.0"); // crossover 3
-        std::env::set_var(E_LARGE_OUT, "1"); // 1-byte threshold ⇒ everything is "large"
-        std::env::set_var(E_NOTCH, "1");
+        let notch_call = |t: usize, large_output_bytes: u64, notch: u64| {
+            effective_parallel_threads_with(
+                &xo_blob,
+                MIB,
+                t,
+                0,
+                1.0, // crossover 3
+                large_output_bytes,
+                notch,
+                0,
+                crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
+            )
+        };
         assert_eq!(
-            effective_parallel_threads(&xo_blob, MIB, 2),
+            notch_call(2, 1, 1), // 1-byte threshold ⇒ everything is "large"
             2,
             "notch: 1-notch bonus must lower crossover 3->2 so T2 stays parallel"
         );
-        std::env::set_var(E_LARGE_OUT, "0"); // notch off
         assert_eq!(
-            effective_parallel_threads(&xo_blob, MIB, 2),
+            notch_call(2, 0, 1), // notch off (threshold 0 disables the bonus)
             1,
             "notch off: T2 must revert to serial (crossover 3)"
         );
-        clear_selector_env();
 
         // ============================================================
-        // 5. NOTCH is BYTE-TRANSPARENT on a REAL decode (threshold lowered so a
-        //    12 MiB output is "large"). Bytes must match the oracle regardless
-        //    of whether the notch flipped the realized thread count.
+        // 5. NOTCH is BYTE-TRANSPARENT on a REAL decode — decode the SAME 12 MiB
+        //    fixture at several EXPLICIT parallelization values (bypassing the
+        //    selector via the `sm_driver` seam), asserting bytes match the
+        //    oracle regardless of thread count. This subsumes "does the notch
+        //    flipping the thread count corrupt bytes" — arithmetic #4 above
+        //    already proves the notch's DECISION; this proves every reachable
+        //    thread count DECODES correctly.
         // ============================================================
         let notch_p = gen_payload(12 * MIB, 3.0, 0x0F5A);
         let notch_gz = gz_at(&notch_p, 6);
         let notch_ref = oracle_flate2(&notch_gz);
-        let notch_env: &[(&str, &str)] = &[
-            (E_MIN_OUT, "0"),
-            (E_MARGIN, "1.0"),
-            (E_LARGE_OUT, "1048576"),
-            (E_NOTCH, "1"),
-        ];
-        let notch_got = decode_under(&notch_gz, 2, notch_env, notch_ref.len());
-        assert_eq!(
-            notch_got, notch_ref,
-            "CORRECTNESS BUG: large-output notch is NOT byte-transparent"
-        );
+        for &t in &[1usize, 2, 3, 4] {
+            let mut got = Vec::with_capacity(notch_ref.len());
+            let mut bytes_written = 0usize;
+            crate::decompress::parallel::sm_driver::read_parallel_sm_capturing(
+                &notch_gz,
+                &mut got,
+                None,
+                t,
+                4 * 1024 * 1024,
+                &mut bytes_written,
+            )
+            .unwrap_or_else(|e| panic!("notch real-decode t={t} failed: {e:?}"));
+            assert_eq!(
+                got, notch_ref,
+                "CORRECTNESS BUG: t={t} real decode is NOT byte-transparent"
+            );
+        }
 
         // ============================================================
         // 6. CHUNK-ADJUST (min-work-per-thread) — REAL decode at high T on a
-        //    small file shrinks the chunk below the 4 MiB default.
+        //    small file shrinks the chunk below the 4 MiB default. Frozen
+        //    production defaults keep this fixture (ratio 3, 12 MiB out) parallel
+        //    at T16 on every arch (Intel crossover 3, AMD crossover 5, aarch64
+        //    selector off), so no override is needed to reach the chunk-adjust
+        //    branch.
         // ============================================================
-        clear_selector_env();
-        std::env::set_var(E_MARGIN, "0"); // keep it parallel (skip the crossover)
         let before_adj = ADJUSTED_CHUNK_SIZE_APPLIED.load(Ordering::Relaxed);
         // 12 MiB out at T=16: 4 MiB default × 2 × 16 ≫ fileSize ⇒ shrink fires.
         let mut sink2 = Vec::with_capacity(notch_p.len());
         crate::decompress::decompress_single_member(&notch_gz, &mut sink2, 16)
             .expect("chunk-adjust decode");
         let after_adj = ADJUSTED_CHUNK_SIZE_APPLIED.load(Ordering::Relaxed);
-        clear_selector_env();
         assert_eq!(sink2, notch_ref, "chunk-adjust decode bytes wrong");
         assert!(
             after_adj > before_adj,
@@ -575,14 +627,7 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner());
 
             for cfg in CONFIGS {
-                let before = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
-                let got = decode_under(&gz, t, cfg.env, reference.len());
-                let after = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
-                prop_assert!(
-                    after > before,
-                    "ParallelSM did not run [{},t={}] len={} ratio={}",
-                    cfg.label, t, len, ratio
-                );
+                let got = decode_under(&gz, t, cfg, reference.len());
                 prop_assert_eq!(
                     got, reference.clone(),
                     "BYTE DIVERGENCE [{},t={}] len={} ratio={} level={} seed={}",

@@ -56,8 +56,7 @@ const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// SCOPED TO T1: at T>1 the finer granularity REGRESSES the parallel pipeline
 /// (silesia T4 wall +20%, measured) because more/smaller chunks add
 /// block-finder + scheduling overhead, so T>1 keeps the 4 MiB default.
-/// Intel-LXC NOT-YET-LAW (AMD/Zen2 replication owed). The explicit
-/// `GZIPPY_CHUNK_KIB` env override still wins over this default.
+/// Intel-LXC NOT-YET-LAW (AMD/Zen2 replication owed).
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const T1_TARGET_COMPRESSED_CHUNK_BYTES: usize = 1024 * 1024;
 /// T1 OUTPUT-RESIDENT chunk sizing target (decoded bytes per chunk).
@@ -174,8 +173,8 @@ fn adjusted_chunk_size_vendor(
 /// floored at [`MIN_ADJUSTED_CHUNK_BYTES`]. On the 68 MB silesia fixture this yields
 /// ≈4 MiB @ T4 (capped at the default), ≈1 MiB @ T8, and the 512 KiB floor @ T16 —
 /// matching the measured per-T optima. `min`-then-`max` (not `clamp`) so a sub-floor
-/// `default_chunk_size` (e.g. a small `GZIPPY_CHUNK_KIB`) can never panic; the floor
-/// always wins. Byte-transparent — only moves chunk boundaries, not decoded output.
+/// `default_chunk_size` can never panic; the floor always wins. Byte-transparent —
+/// only moves chunk boundaries, not decoded output.
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 fn adjusted_chunk_size_amd(file_size: usize, threads: usize, default_chunk_size: usize) -> usize {
     let target = file_size / threads.saturating_mul(threads).max(1);
@@ -261,9 +260,10 @@ pub(crate) fn t1_output_resident_chunk(gzip_data: &[u8], deflate_data_len: usize
 /// (see [`effective_parallel_threads`]). The predicted parallel work-inflation
 /// W ≈ ISIZE/deflate ratio; parallel only repays at `T >= ceil(W * margin)`.
 /// `margin = 1.0` reproduces the gated per-corpus crossovers (silesia ratio
-/// 2.75 → T3, monorepo → T6, storedheavy → T7-8). Override with
-/// `GZIPPY_PARALLEL_CROSSOVER_MARGIN`; `0` disables the selector (legacy
-/// always-parallel-below-ratio_max behaviour, for A/B).
+/// 2.75 → T3, monorepo → T6, storedheavy → T7-8). Frozen (was
+/// `GZIPPY_PARALLEL_CROSSOVER_MARGIN`, unset in production); `margin = 0`
+/// still disables the selector (legacy always-parallel-below-ratio_max
+/// behaviour) when passed explicitly to [`effective_parallel_threads_with`].
 /// (aarch64 disables the selector entirely — see [`arch_crossover_margin_default`] —
 /// so this Intel-default constant is unconsumed there.)
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -274,7 +274,7 @@ const PARALLEL_CROSSOVER_MARGIN_DEFAULT: f64 = 1.0;
 /// `margin = 1.6` (crossover `ceil(ratio·1.6)`) is the GATED value that erases the
 /// Zen2 monorepo-T6/T8 default-constant regression (AMD/Zen2, N=11, load-immune
 /// interleaved paired ratios, plans/XARCH-CONCURRENCY-LAW-2026-06-26.md). Selected
-/// at runtime by [`cpu_is_amd`]; overridable via `GZIPPY_PARALLEL_CROSSOVER_MARGIN`.
+/// at runtime by [`cpu_is_amd`]. Frozen (was `GZIPPY_PARALLEL_CROSSOVER_MARGIN`).
 /// (aarch64 disables the selector entirely — see [`arch_crossover_margin_default`] —
 /// so this Zen-default constant is unconsumed there.)
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -298,13 +298,14 @@ const PARALLEL_CROSSOVER_MARGIN_AMD: f64 = 1.6;
 /// Conservative by construction: the bonus only fires for clearly-large outputs
 /// where the parallel arm at `crossover-1` still beats single-thread igzip by a
 /// wide margin (silesia T3 516 ≪ igzip ~686; squishy T2 1184 ≪ igzip ~1215), so
-/// it can never manufacture an igzip regression. Override with
-/// `GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES` (gate-tunable; `0` disables the bonus).
-const PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT: u64 = 128 * 1024 * 1024;
+/// it can never manufacture an igzip regression. Frozen (was
+/// `GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES`; `0` still disables the bonus when
+/// passed explicitly to [`effective_parallel_threads_with`]).
+pub(crate) const PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT: u64 = 128 * 1024 * 1024;
 
 /// Number of crossover notches the large-output bonus subtracts (default/Intel).
 /// One notch reproduces the Raptor-Lake gate (silesia crossover 4→3, squishy 3→2).
-/// Override with `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`.
+/// Frozen (was `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`).
 const PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT: u64 = 1;
 
 /// AMD/Zen large-output bonus depth: TWO notches. The Zen2 margin (1.6) is needed
@@ -317,8 +318,8 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT: u64 = 1;
 /// — still beats igzip 0.985 + rg 0.901). GATED (AMD/Zen2, N≥9, load-immune
 /// interleaved paired ratios; plans/ARCH-DISPATCH-ZEN2-T3-2026-06-26.md): margin
 /// 1.6 + 2-notch erases the monorepo-T6/T8 + squishy-T2 regressions WITHOUT
-/// regressing silesia-T3 / squishy-T3. Selected at runtime by [`cpu_is_amd`];
-/// overridable via `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`.
+/// regressing silesia-T3 / squishy-T3. Selected at runtime by [`cpu_is_amd`].
+/// Frozen (was `GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH`).
 const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 
 /// SMALL-OUTPUT SERIAL FLOOR: decoded-output size below which the parallel
@@ -346,8 +347,9 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 /// 1.005): they are stored-block-dominated, carry no marker pathology, and DO
 /// parallelize (20 ms parallel vs 28 ms serial), so they stay parallel.
 /// Byte-transparent: only the effective thread count changes; CRC32 + ISIZE are
-/// still verified by the caller. Override with `GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`
-/// (`0` disables).
+/// still verified by the caller. Frozen (was `GZIPPY_PARALLEL_MIN_OUTPUT_BYTES`;
+/// `0` still disables when passed explicitly to
+/// [`effective_parallel_threads_with`]).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 const PARALLEL_MIN_OUTPUT_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
 
@@ -382,7 +384,7 @@ pub(crate) fn cpu_is_amd() -> bool {
     false
 }
 
-/// Arch-dispatched default crossover margin (env override takes precedence).
+/// Arch-dispatched default crossover margin.
 ///
 /// aarch64 (Apple Silicon): the serial-clean cost-model selector + large-output
 /// bonus are x86/Zen2-tuned — their crossover constants were GATED only on Intel
@@ -395,9 +397,8 @@ pub(crate) fn cpu_is_amd() -> bool {
 /// selector on aarch64, restoring the prestack routing (whose high-ratio
 /// serialization is the aarch64-only [`AARCH64_PRESTACK_RATIO_MAX`] cap in
 /// [`effective_parallel_threads`] — removing that cap regresses M1 2.1-2.6× on
-/// logs/software-class at T2, paired N=15). The
-/// `GZIPPY_PARALLEL_CROSSOVER_MARGIN` env override still takes precedence. x86_64
-/// codegen is byte-identical (this branch compiles out off-aarch64).
+/// logs/software-class at T2, paired N=15). x86_64 codegen is byte-identical
+/// (this branch compiles out off-aarch64).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 fn arch_crossover_margin_default() -> f64 {
     #[cfg(target_arch = "aarch64")]
@@ -414,10 +415,10 @@ fn arch_crossover_margin_default() -> f64 {
     }
 }
 
-/// Arch-dispatched large-output bonus depth in crossover notches (env override
-/// takes precedence). AMD subtracts 2; Intel/other subtract 1.
+/// Arch-dispatched large-output bonus depth in crossover notches. AMD
+/// subtracts 2; Intel/other subtract 1.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
-fn arch_large_output_notch_default() -> u64 {
+pub(crate) fn arch_large_output_notch_default() -> u64 {
     if cpu_is_amd() {
         PARALLEL_LARGE_OUTPUT_NOTCH_AMD
     } else {
@@ -467,8 +468,41 @@ pub static WORK_PER_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 /// scaling past the knee (movie T16 +9.64% SIG slower than T8, Intel, paired N=41).
 /// Capping effective-T to `deflate_len / this` keeps each worker's chunk coarse
 /// enough to stay on the amortized side of the knee. `0` disables the cap (the
-/// A/B baseline). Env override: `GZIPPY_MIN_BYTES_PER_THREAD`.
+/// A/B baseline). Env override: `GZIPPY_MIN_BYTES_PER_THREAD` (the one live
+/// lever left in this selector — see [`effective_parallel_threads`]).
 const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
+
+/// Frozen default for the work-per-thread cap's physical-core floor (was
+/// `GZIPPY_MIN_THREADS_FLOOR`, unset in production). See the mechanism note
+/// on the `floor` local in [`effective_parallel_threads_with`].
+pub(crate) const MIN_THREADS_FLOOR_DEFAULT: u64 = 1;
+
+/// Production entry point: [`effective_parallel_threads_with`] fed the frozen
+/// selector defaults (the campaign-measured values with every
+/// `GZIPPY_PARALLEL_*` / `GZIPPY_MIN_THREADS_FLOOR` knob unset), plus the one
+/// live lever `GZIPPY_MIN_BYTES_PER_THREAD`.
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub(crate) fn effective_parallel_threads(
+    gzip_data: &[u8],
+    deflate_data_len: usize,
+    num_threads: usize,
+) -> usize {
+    let min_bpt = std::env::var("GZIPPY_MIN_BYTES_PER_THREAD")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT);
+    effective_parallel_threads_with(
+        gzip_data,
+        deflate_data_len,
+        num_threads,
+        PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+        arch_crossover_margin_default(),
+        PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+        arch_large_output_notch_default(),
+        min_bpt,
+        MIN_THREADS_FLOOR_DEFAULT,
+    )
+}
 
 /// Content-derived effective thread count for the parallel single-member
 /// pipeline. Three guards, in order (each byte-transparent — only the thread
@@ -491,11 +525,23 @@ const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
 /// ISIZE wrap (>4 GiB output) or near-incompressible (isize<deflate) yields a
 /// low ratio → low/no crossover → keep the requested threads (parallel is
 /// correct there).
+///
+/// Pure and parameterized (no env reads, no arch dispatch) — the production
+/// values live in [`effective_parallel_threads`]; tests call this directly
+/// with explicit parameter values so selector-decision coverage stays
+/// deterministic across hosts without process-global env mutation.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
-pub(crate) fn effective_parallel_threads(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn effective_parallel_threads_with(
     gzip_data: &[u8],
     deflate_data_len: usize,
     num_threads: usize,
+    min_output: u64,
+    margin: f64,
+    large_output_bytes: u64,
+    notch: u64,
+    min_bpt: u64,
+    threads_floor: u64,
 ) -> usize {
     if num_threads <= 1 || deflate_data_len == 0 || gzip_data.len() < 4 {
         return num_threads;
@@ -526,10 +572,6 @@ pub(crate) fn effective_parallel_threads(
             gzip_data[n - 1],
         ]) as u64;
         let deflate_len = deflate_data_len as u64;
-        let min_output = std::env::var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(PARALLEL_MIN_OUTPUT_BYTES_DEFAULT);
         // COMPRESSIBILITY GATE (ratio >= 1.5, i.e. 2·isize >= 3·deflate): the
         // all-marker blowup REQUIRES compressibility — markers come from back-
         // references, which near-incompressible data (stored-block-dominated) does
@@ -621,12 +663,8 @@ pub(crate) fn effective_parallel_threads(
     // The asymmetry licenses the conservatism: misrouting a cell to PARALLEL
     // below its crossover REGRESSES it below T1 (loses to single-thread igzip);
     // misrouting to SERIAL at worst ties gz-T1 (still a win). `margin` is the
-    // gate-tunable safety knob; `0` disables this selector entirely (A/B).
-    let margin = std::env::var("GZIPPY_PARALLEL_CROSSOVER_MARGIN")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite() && *m >= 0.0)
-        .unwrap_or_else(arch_crossover_margin_default);
+    // gate-tunable safety knob (param, arch-dispatched by the production
+    // caller); `0` disables this selector entirely.
     if margin > 0.0 {
         // ratio as f64 (deflate_len > 0 guaranteed above); crossover = ceil(ratio*margin).
         let ratio = isize_field as f64 / deflate_len as f64;
@@ -641,14 +679,6 @@ pub(crate) fn effective_parallel_threads(
         // 2 on Zen2 (the Zen2 margin 1.6 over-inflates large-output crossovers; the
         // 2nd notch lands silesia/squishy back at the marginal-parallelism knee).
         // See [`PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT`] / [`PARALLEL_LARGE_OUTPUT_NOTCH_AMD`].
-        let large_output_bytes = std::env::var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT);
-        let notch = std::env::var("GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(arch_large_output_notch_default);
         if large_output_bytes > 0 && isize_field >= large_output_bytes && notch > 0 {
             crossover = (crossover - notch as f64).max(1.0);
         }
@@ -668,11 +698,9 @@ pub(crate) fn effective_parallel_threads(
     // work-per-thread law — it binds ONLY when `deflate_len < min_bpt*num_threads`
     // (small file at high T); a large file (silesia/weights/nasa) clears
     // `min_bpt*T` and keeps every requested thread. Byte-transparent: only the
-    // thread count changes. `min_bpt == 0` disables (A/B baseline).
-    let min_bpt = std::env::var("GZIPPY_MIN_BYTES_PER_THREAD")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT);
+    // thread count changes. `min_bpt == 0` disables (production leaves this on via
+    // `GZIPPY_MIN_BYTES_PER_THREAD`, the one live env lever; see
+    // [`effective_parallel_threads`]).
     if min_bpt > 0 {
         // FLOOR the cap at the physical-core count of the run's affinity set. The
         // corpus no-regress gate (Intel trainer, paired) proved a cap that drops
@@ -686,12 +714,11 @@ pub(crate) fn effective_parallel_threads(
         // and clear `min_bpt*T` so they are never capped. Flooring at the physical
         // count changes ONLY the sub-floor cases — exactly the regressing ones — so it
         // keeps the movie/tool.bin wins while erasing the monorepo/photo regressions.
-        // The floor is TOPOLOGY-derived, not a portable constant; env-tunable per arch.
-        let floor = std::env::var("GZIPPY_MIN_THREADS_FLOOR")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1);
-        let eff = (deflate_len / min_bpt).max(floor).min(num_threads as u64);
+        // The floor is TOPOLOGY-derived, not a portable constant; frozen to
+        // [`MIN_THREADS_FLOOR_DEFAULT`] (was `GZIPPY_MIN_THREADS_FLOOR`, unset).
+        let eff = (deflate_len / min_bpt)
+            .max(threads_floor)
+            .min(num_threads as u64);
         if eff < num_threads as u64 {
             WORK_PER_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
             return eff as usize;
@@ -813,15 +840,11 @@ pub fn decompress_parallel<W: Write>(
         // ISIZE verification + chunk_fetcher::drive orchestration all
         // live in the new driver (mirror of vendor's
         // `ParallelGzipReader::read` at ParallelGzipReader.hpp:553-646).
-        // Granularity probe (2026-05-29): GZIPPY_CHUNK_KIB overrides the
-        // 4 MiB default chunk target so a T=16 chunk-count sweep can
-        // discriminate "T16 regression is straggler/granularity" from
-        // "T16 regression is HT microarchitecture" without a rebuild per
-        // size. Falls back to TARGET_COMPRESSED_CHUNK_BYTES when unset.
-        // Thread-aware default: T1 uses the smaller 1 MiB target (warm
-        // output-buffer recycling win, gated; see T1_TARGET_COMPRESSED_CHUNK_BYTES),
-        // T>1 keeps the 4 MiB target (finer granularity regresses the parallel
-        // pipeline). Explicit GZIPPY_CHUNK_KIB always overrides.
+        // Thread-aware default chunk target: T1 uses the smaller 1 MiB target
+        // (warm output-buffer recycling win, gated; see
+        // T1_TARGET_COMPRESSED_CHUNK_BYTES), T>1 keeps the 4 MiB
+        // TARGET_COMPRESSED_CHUNK_BYTES target (finer granularity regresses the
+        // parallel pipeline).
         // Compressibility thread-cap: on highly-compressible single-member
         // streams the parallel pipeline regresses below the inline T1 path
         // (output-proportional marker overhead > parallel decode benefit), so
@@ -839,12 +862,8 @@ pub fn decompress_parallel<W: Write>(
         } else {
             TARGET_COMPRESSED_CHUNK_BYTES
         };
-        let default_chunk = std::env::var("GZIPPY_CHUNK_KIB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|kib| kib * 1024)
-            .unwrap_or(thread_default_chunk);
-        let chunk_size = adjusted_chunk_size_bytes(gzip_data.len(), num_threads, default_chunk);
+        let chunk_size =
+            adjusted_chunk_size_bytes(gzip_data.len(), num_threads, thread_default_chunk);
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
         }
@@ -1183,10 +1202,6 @@ impl std::fmt::Display for ParallelError {
 mod tests {
     use super::*;
 
-    /// Serializes the two tests that read/mutate `GZIPPY_PARALLEL_CROSSOVER_MARGIN`
-    /// (process-global) so they never observe each other's writes.
-    static SELECTOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// ISIZE/deflate ratio gate: highly-compressible single-member caps to one
     /// thread (the inline T1 path) so Tmax never regresses below T1; moderately
     /// compressible keeps the requested threads. Builds a minimal blob whose
@@ -1280,52 +1295,77 @@ mod tests {
     /// 0.892-0.924) and is DELETED there.
     /// aarch64 — the prestack cap REMAINS (selector disabled; removing the cap
     /// regresses M1 2.1-2.6× on logs/software-class at T2, paired N=15).
+    /// Neutral params that isolate a SINGLE guard: floor disabled (`min_output=0`),
+    /// large-output bonus disabled (`large_output_bytes=0`), work-per-thread cap
+    /// disabled (`min_bpt=0`, `threads_floor` irrelevant then). Tests override
+    /// only the dimension(s) they're exercising.
+    const NO_FLOOR: u64 = 0;
+    const NO_BONUS_BYTES: u64 = 0;
+    const NO_BPT_CAP: u64 = 0;
+
+    /// HIGH-RATIO ROUTING (2026-07-05):
+    /// x86_64 — NO T-blind ratio cap: a high-ISIZE-ratio stream is serialized
+    /// ONLY below its T-aware crossover (`ceil(ratio × margin)`), never at every
+    /// T. The former hard cap (`ratio >= 8 → 1 thread at EVERY T`) forfeited
+    /// high-T parallel wins (gated: Intel nasa T16 220→150 ms 15/15, bignasa T16
+    /// 950→524 ms 15/15; AMD nasa T16 0.871 15/15, logs_i100/i400/t0 T16
+    /// 0.892-0.924) and is DELETED there.
+    /// aarch64 — the prestack cap REMAINS (selector disabled; removing the cap
+    /// regresses M1 2.1-2.6× on logs/software-class at T2, paired N=15).
+    ///
+    /// Calls [`effective_parallel_threads_with`] directly with an explicit
+    /// margin=1.0 (vendor-independent — the production arch default is 1.6 on
+    /// AMD) and the floor disabled, so the assertions below isolate the
+    /// high-ratio crossover logic from both.
     #[test]
     fn high_ratio_routing_selector_owns_x86_prestack_cap_aarch64() {
-        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Pin the selector margin so the x86 assertions are vendor-independent
-        // (the arch-dispatched default is 1.6 on AMD vs 1.0 on Intel).
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
-        // Disable the small-output serial floor so this test isolates the
-        // high-ratio routing (its 1–20 MB blobs sit below the 8 MiB floor and
-        // would else all route serial before reaching it).
-        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
         let deflate_len = 1_000_000usize;
         let high = blob_with_isize(20_000_000); // ratio 20
         let nasa_like = blob_with_isize(10_000_000); // ratio 10
         let low = blob_with_isize(3_000_000); // ratio 3
-                                              // Common to every arch: high-ratio serial at low T; low-ratio parallel;
-                                              // T1 never altered.
-        assert_eq!(effective_parallel_threads(&high, deflate_len, 8), 1);
-        assert_eq!(effective_parallel_threads(&nasa_like, deflate_len, 8), 1);
-        assert_eq!(effective_parallel_threads(&low, deflate_len, 8), 8);
-        assert_eq!(effective_parallel_threads(&high, deflate_len, 1), 1);
+        let call = |gz: &[u8], t: usize| {
+            effective_parallel_threads_with(
+                gz,
+                deflate_len,
+                t,
+                NO_FLOOR,
+                1.0,
+                PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+                arch_large_output_notch_default(),
+                NO_BPT_CAP,
+                MIN_THREADS_FLOOR_DEFAULT,
+            )
+        };
+        // Common to every arch: high-ratio serial at low T; low-ratio parallel;
+        // T1 never altered.
+        assert_eq!(call(&high, 8), 1);
+        assert_eq!(call(&nasa_like, 8), 1);
+        assert_eq!(call(&low, 8), 8);
+        assert_eq!(call(&high, 1), 1);
         #[cfg(not(target_arch = "aarch64"))]
         {
             // Selector owns: ratio 20 → crossover 20 → serial through T16 but
             // parallel at T20 (impossible under the old blind cap); nasa-shaped
             // ratio 10 → crossover 10 → parallel at T16 (the freed win cell).
-            assert_eq!(effective_parallel_threads(&high, deflate_len, 16), 1);
-            assert_eq!(effective_parallel_threads(&high, deflate_len, 20), 20);
-            assert_eq!(effective_parallel_threads(&nasa_like, deflate_len, 16), 16);
+            assert_eq!(call(&high, 16), 1);
+            assert_eq!(call(&high, 20), 20);
+            assert_eq!(call(&nasa_like, 16), 16);
         }
         #[cfg(target_arch = "aarch64")]
         {
             // Prestack cap: ratio >= 8 serial at EVERY T (selector is disabled
             // on aarch64; the cap is its only high-ratio serialization).
             let before = AARCH64_PRESTACK_CAP_APPLIED.load(Ordering::Relaxed);
-            assert_eq!(effective_parallel_threads(&high, deflate_len, 16), 1);
-            assert_eq!(effective_parallel_threads(&high, deflate_len, 20), 1);
-            assert_eq!(effective_parallel_threads(&nasa_like, deflate_len, 16), 1);
+            assert_eq!(call(&high, 16), 1);
+            assert_eq!(call(&high, 20), 1);
+            assert_eq!(call(&nasa_like, 16), 1);
             let after = AARCH64_PRESTACK_CAP_APPLIED.load(Ordering::Relaxed);
             assert!(after > before, "aarch64 prestack cap counter must fire");
             // Just under the cap (ratio 7.99) falls through (selector disabled
             // by default margin 0.0 → parallel; margin pinned 1.0 here → xover 8).
             let under = blob_with_isize(7_990_000);
-            assert_eq!(effective_parallel_threads(&under, deflate_len, 8), 8);
+            assert_eq!(call(&under, 8), 8);
         }
-        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
     /// SMALL-OUTPUT SERIAL FLOOR (x86_64): a small compressible stream (markup.xml-
@@ -1336,88 +1376,167 @@ mod tests {
     /// Arch-independent (the floor now fires on every arch — AMD/Zen2 + Apple-M1).
     #[test]
     fn small_output_serial_floor_caps_markup_shaped_only() {
-        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let call = |gz: &[u8], deflate_len: usize, t: usize, min_output: u64, margin: f64| {
+            effective_parallel_threads_with(
+                gz,
+                deflate_len,
+                t,
+                min_output,
+                margin,
+                PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+                arch_large_output_notch_default(),
+                NO_BPT_CAP,
+                MIN_THREADS_FLOOR_DEFAULT,
+            )
+        };
         // markup.xml-shaped: 7.6 MiB decoded, 2.1 MiB deflate → below the 8 MiB
         // floor, isize >= deflate → floor fires (serial) at every requested T.
         let markup = blob_with_isize(7_974_912);
-        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 6), 1);
-        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 8), 1);
-        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 16), 1);
+        assert_eq!(
+            call(
+                &markup,
+                2_147_400,
+                6,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                1.0
+            ),
+            1
+        );
+        assert_eq!(
+            call(
+                &markup,
+                2_147_400,
+                8,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                1.0
+            ),
+            1
+        );
+        assert_eq!(
+            call(
+                &markup,
+                2_147_400,
+                16,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                1.0
+            ),
+            1
+        );
         // T1 request is never altered.
-        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 1), 1);
+        assert_eq!(
+            call(
+                &markup,
+                2_147_400,
+                1,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                1.0
+            ),
+            1
+        );
         // aozora-shaped: 11.4 MiB decoded (>= 8 MiB floor) → floor does NOT fire;
-        // pin margin low so it stays parallel (isolates the floor from the crossover).
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
+        // margin 0 (crossover selector off) isolates the floor from the crossover.
         let aozora = blob_with_isize(12_003_648);
-        assert_eq!(effective_parallel_threads(&aozora, 3_995_900, 8), 8);
+        assert_eq!(
+            call(
+                &aozora,
+                3_995_900,
+                8,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                0.0
+            ),
+            8
+        );
         // Near-incompressible small stream (isize < deflate): floor must NOT fire.
         let incompressible = blob_with_isize(1_000_000);
-        assert_eq!(effective_parallel_threads(&incompressible, 2_000_000, 8), 8);
+        assert_eq!(
+            call(
+                &incompressible,
+                2_000_000,
+                8,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                0.0
+            ),
+            8
+        );
         // photo.jpg-shaped: 6.5 MiB out / 6.48 MiB deflate → ratio 1.005 < 1.5
         // compressibility gate → floor must NOT fire (parallelizes fine as stored
         // blocks; the marker pathology needs compressibility).
         let photo = blob_with_isize(6_511_067);
-        assert_eq!(effective_parallel_threads(&photo, 6_481_121, 8), 8);
+        assert_eq!(
+            call(&photo, 6_481_121, 8, PARALLEL_MIN_OUTPUT_BYTES_DEFAULT, 0.0),
+            8
+        );
         // Right at the 1.5 gate (isize = 1.5·deflate) → fires (compressible enough).
         let at_gate = blob_with_isize(6_000_000);
-        assert_eq!(effective_parallel_threads(&at_gate, 4_000_000, 8), 1);
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
-        // Env override 0 disables the floor: markup-shaped now reaches the crossover.
-        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
-        assert_eq!(effective_parallel_threads(&markup, 2_147_400, 8), 8);
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
-        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
+        assert_eq!(
+            call(
+                &at_gate,
+                4_000_000,
+                8,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                0.0
+            ),
+            1
+        );
+        // min_output=0 disables the floor: markup-shaped now reaches the crossover.
+        assert_eq!(call(&markup, 2_147_400, 8, NO_FLOOR, 0.0), 8);
     }
 
     #[test]
     fn serial_clean_selector_crossover_and_margin() {
-        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Single sequential test: the margin env var is process-global, so all
-        // env-dependent assertions live here (no concurrent test reads it).
-        // Pin margin=1.0 so the crossover assertions are arch-independent (the
-        // default is 1.6 on AMD).
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
-        // Isolate the crossover selector from the small-output serial floor
-        // (the 1–3 MB blobs here sit below the 8 MiB floor).
-        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
         let deflate_len = 1_000_000usize;
+        let call = |gz: &[u8], t: usize, margin: f64| {
+            effective_parallel_threads_with(
+                gz,
+                deflate_len,
+                t,
+                NO_FLOOR,
+                margin,
+                PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+                arch_large_output_notch_default(),
+                NO_BPT_CAP,
+                MIN_THREADS_FLOOR_DEFAULT,
+            )
+        };
 
         // Margin 1.0, ratio 3× (< hard cap 8): crossover = ceil(3.0) = 3.
         let blob = blob_with_isize(3_000_000);
         // T below crossover → serial-clean floor (1 thread).
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 2), 1);
+        assert_eq!(call(&blob, 2, 1.0), 1);
         // T at/above crossover → parallel keeps the requested threads.
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 3), 3);
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 8), 8);
+        assert_eq!(call(&blob, 3, 1.0), 3);
+        assert_eq!(call(&blob, 8, 1.0), 8);
 
         // Non-integer ratio rounds UP (conservative): ratio 2.75× → crossover 3.
         let blob275 = blob_with_isize(2_750_000);
-        assert_eq!(effective_parallel_threads(&blob275, deflate_len, 2), 1);
-        assert_eq!(effective_parallel_threads(&blob275, deflate_len, 3), 3);
+        assert_eq!(call(&blob275, 2, 1.0), 1);
+        assert_eq!(call(&blob275, 3, 1.0), 3);
 
         // margin 0 disables the selector → keep threads (legacy below-cap behaviour).
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "0");
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 2), 2);
+        assert_eq!(call(&blob, 2, 0.0), 2);
 
         // Larger margin pushes the crossover up (more conservative): margin 2.0,
         // ratio 3 → crossover 6 → T4 now serial, T6 parallel.
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "2.0");
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 4), 1);
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 6), 6);
-
-        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+        assert_eq!(call(&blob, 4, 2.0), 1);
+        assert_eq!(call(&blob, 6, 2.0), 6);
     }
 
     #[test]
     fn serial_clean_selector_large_output_bonus() {
-        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Pin margin=1.0 + 128 MiB threshold + 1-notch so the assertions are
-        // arch-independent (AMD defaults are margin 1.6 + 2-notch).
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
-        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "134217728");
-        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH", "1");
+        let call =
+            |gz: &[u8], deflate_len: usize, t: usize, large_output_bytes: u64, notch: u64| {
+                effective_parallel_threads_with(
+                    gz,
+                    deflate_len,
+                    t,
+                    NO_FLOOR,
+                    1.0,
+                    large_output_bytes,
+                    notch,
+                    NO_BPT_CAP,
+                    MIN_THREADS_FLOOR_DEFAULT,
+                )
+            };
 
         // LARGE output (200 MiB), ratio 3.1 (< hard cap 8). Proxy crossover =
         // ceil(3.1) = 4, but the large-output bonus lowers it to 3 → T3 parallel,
@@ -1425,9 +1544,9 @@ mod tests {
         let big_out = 200 * 1024 * 1024u32;
         let big_deflate = (big_out as f64 / 3.1) as usize; // ratio 3.1
         let big = blob_with_isize(big_out);
-        assert_eq!(effective_parallel_threads(&big, big_deflate, 2), 1); // serial
-        assert_eq!(effective_parallel_threads(&big, big_deflate, 3), 3); // parallel
-        assert_eq!(effective_parallel_threads(&big, big_deflate, 4), 4);
+        assert_eq!(call(&big, big_deflate, 2, 134_217_728, 1), 1); // serial
+        assert_eq!(call(&big, big_deflate, 3, 134_217_728, 1), 3); // parallel
+        assert_eq!(call(&big, big_deflate, 4, 134_217_728, 1), 4);
 
         // SMALL output (50 MiB), same ratio 3.1: below the threshold → NO bonus →
         // crossover stays 4 → T3 still serial, T4 parallel. (monorepo-shaped: the
@@ -1435,22 +1554,16 @@ mod tests {
         let small_out = 50 * 1024 * 1024u32;
         let small_deflate = (small_out as f64 / 3.1) as usize;
         let small = blob_with_isize(small_out);
-        assert_eq!(effective_parallel_threads(&small, small_deflate, 3), 1); // serial
-        assert_eq!(effective_parallel_threads(&small, small_deflate, 4), 4); // parallel
+        assert_eq!(call(&small, small_deflate, 3, 134_217_728, 1), 1); // serial
+        assert_eq!(call(&small, small_deflate, 4, 134_217_728, 1), 4); // parallel
 
-        // Bonus disabled via env (0) → large output behaves like the proxy again.
-        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "0");
-        assert_eq!(effective_parallel_threads(&big, big_deflate, 3), 1); // serial (no bonus)
+        // Bonus disabled (large_output_bytes=0) → large output behaves like the
+        // proxy again.
+        assert_eq!(call(&big, big_deflate, 3, NO_BONUS_BYTES, 1), 1); // serial (no bonus)
 
         // 2-notch bonus (the AMD depth): crossover 4 → 2 → T2 parallel.
-        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES", "134217728");
-        std::env::set_var("GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH", "2");
-        assert_eq!(effective_parallel_threads(&big, big_deflate, 2), 2); // parallel (4-2=2)
-        assert_eq!(effective_parallel_threads(&big, big_deflate, 1), 1); // never alters T1
-
-        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH");
-        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
+        assert_eq!(call(&big, big_deflate, 2, 134_217_728, 2), 2); // parallel (4-2=2)
+        assert_eq!(call(&big, big_deflate, 1, 134_217_728, 2), 1); // never alters T1
     }
 
     #[test]
@@ -1503,10 +1616,6 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn aarch64_large_output_stays_parallel_at_low_t() {
-        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
-        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_NOTCH");
-        std::env::remove_var("GZIPPY_PARALLEL_LARGE_OUTPUT_BYTES");
         // silesia-shaped: 212 MiB output, ~67 MiB deflate → ratio ~3.14 (< hard cap 8),
         // output >= the 128 MiB large-output threshold (would trigger the x86 bonus).
         let deflate_len = 67_585_052usize;
@@ -1515,23 +1624,6 @@ mod tests {
         assert_eq!(effective_parallel_threads(&big, deflate_len, 2), 2);
         assert_eq!(effective_parallel_threads(&big, deflate_len, 3), 3);
         assert_eq!(effective_parallel_threads(&big, deflate_len, 4), 4);
-    }
-
-    #[test]
-    fn arch_dispatch_env_override_wins_over_arch_default() {
-        let _guard = SELECTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Even on AMD (default margin 1.6), an explicit env override must take
-        // precedence — proves the env knob still works as the documented override.
-        let deflate_len = 1_000_000usize;
-        let blob = blob_with_isize(3_000_000); // ratio 3.0
-        std::env::set_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN", "1.0");
-        // Disable the small-output serial floor (this 3 MB blob sits below the
-        // 8 MiB floor) so the assertion isolates the crossover override.
-        std::env::set_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES", "0");
-        // margin 1.0, ratio 3 → crossover 3 → T3 parallel regardless of host arch.
-        assert_eq!(effective_parallel_threads(&blob, deflate_len, 3), 3);
-        std::env::remove_var("GZIPPY_PARALLEL_MIN_OUTPUT_BYTES");
-        std::env::remove_var("GZIPPY_PARALLEL_CROSSOVER_MARGIN");
     }
 
     // NOTE: these three cover the VENDOR formula (Intel / other x86 / aarch64, and
@@ -1646,8 +1738,8 @@ mod tests {
 
     #[test]
     fn adjusted_chunk_size_amd_subfloor_default_does_not_panic() {
-        // A sub-floor `default_chunk_size` (e.g. GZIPPY_CHUNK_KIB=256) must not
-        // panic (min-then-max, not clamp) — the floor wins.
+        // A sub-floor `default_chunk_size` must not panic (min-then-max, not
+        // clamp) — the floor wins.
         let got = adjusted_chunk_size_amd(68_229_982, 16, 256 * 1024);
         assert_eq!(got, 512 * 1024);
     }

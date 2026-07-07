@@ -338,14 +338,6 @@ pub struct LitLenTable {
 }
 
 impl LitLenTable {
-    /// Resident heap footprint of this table (struct + decode entries). Used by
-    /// the debug-only `mem_stats` instrument to report the shared-table size.
-    pub fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.entries.capacity() * std::mem::size_of::<LitLenEntry>()
-    }
-}
-
-impl LitLenTable {
     /// Number of bits for main table lookup.
     ///
     /// ARM64 (the original tuning target): 11 bits = 8 KB table was
@@ -610,14 +602,6 @@ pub struct DistTable {
     used: usize,
     /// Number of bits for main table lookup
     table_bits: u8,
-}
-
-impl DistTable {
-    /// Resident footprint of this table. Entries are now inline (no heap
-    /// allocation), so this is just the struct size.
-    pub fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
 }
 
 impl DistTable {
