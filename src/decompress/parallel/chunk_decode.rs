@@ -1326,12 +1326,24 @@ fn decode_chunk_with_rapidgzip_impl(
     }
 
     // Vendor tryToDecode: bootstrap failure propagates; caller catches and tries next candidate.
-    let mut chunk = decode_chunk_unified_marker::<false>(
-        input,
-        encoded_offset_bits,
-        stop_hint_bits,
-        configuration,
-    )?;
+    // STAGE-2d: the whole-file grid sets `configuration.multi_member`, selecting the
+    // `MULTI_MEMBER=true` instantiation that walks member boundaries. Single-member
+    // decode keeps `::<false>` (byte-identical — the continuation compiles out).
+    let mut chunk = if configuration.multi_member {
+        decode_chunk_unified_marker::<true>(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            configuration,
+        )?
+    } else {
+        decode_chunk_unified_marker::<false>(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            configuration,
+        )?
+    };
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     Ok(chunk)
 }
@@ -2250,15 +2262,29 @@ fn finish_decode_chunk_seeded_block_native(
     // Same per-block driver the FOLD post-flip tail uses: header parse,
     // stop-hint early-out at block boundaries, `decode_clean_into_contig`
     // bodies, EOB boundary recording, BFINAL finalize.
-    finish_decode_chunk_contig_native::<false>(
-        chunk,
-        &mut marker_ctx,
-        input,
-        inflate_start_bit,
-        stop_hint_bits,
-        false,
-        true,
-    )
+    // STAGE-2d: window-seeded INEXACT chunks that cross a member boundary walk
+    // into the next member when the grid sets `multi_member`.
+    if chunk.configuration.multi_member {
+        finish_decode_chunk_contig_native::<true>(
+            chunk,
+            &mut marker_ctx,
+            input,
+            inflate_start_bit,
+            stop_hint_bits,
+            false,
+            true,
+        )
+    } else {
+        finish_decode_chunk_contig_native::<false>(
+            chunk,
+            &mut marker_ctx,
+            input,
+            inflate_start_bit,
+            stop_hint_bits,
+            false,
+            true,
+        )
+    }
 }
 
 /// Shared M3/M4 seeding: dictionary prefix + contig reserve + priming the
@@ -2934,15 +2960,29 @@ fn finish_decode_chunk_exact_block_native(
         initial_window,
     )?;
 
-    finish_decode_chunk_contig_native::<false>(
-        chunk,
-        &mut marker_ctx,
-        input,
-        inflate_start_bit,
-        stop_hint_bits,
-        true,
-        true,
-    )
+    // STAGE-2d: window-seeded EXACT chunks that cross a member boundary walk
+    // into the next member when the grid sets `multi_member`.
+    if chunk.configuration.multi_member {
+        finish_decode_chunk_contig_native::<true>(
+            chunk,
+            &mut marker_ctx,
+            input,
+            inflate_start_bit,
+            stop_hint_bits,
+            true,
+            true,
+        )
+    } else {
+        finish_decode_chunk_contig_native::<false>(
+            chunk,
+            &mut marker_ctx,
+            input,
+            inflate_start_bit,
+            stop_hint_bits,
+            true,
+            true,
+        )
+    }
 }
 
 /// gzippy-isal stub: [`exact_block_route_enabled`] is constant `false` on the

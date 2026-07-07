@@ -74,8 +74,11 @@ mod tests {
 
     #[test]
     fn uneven_three_small_one_dominant_byte_exact() {
-        // 3 small members + 1 dominant. Plain multi-member → member-per-worker
-        // (the dominant→chunked perf routing was measured to regress; reverted).
+        // 3 small members + 1 dominant. STAGE-2d: a dominant-member distribution
+        // routes to the whole-file GRID (fast_path_ok is false — the dominant
+        // member would pin a single worker on the member-per-worker path), so its
+        // deflate blocks spread across all workers. (Previously locked to
+        // MultiMemberPar for the regressing member-walk; the grid is a NEW path.)
         let members = vec![
             gz_member(&semi_compressible(64 * 1024, 1)),
             gz_member(&semi_compressible(64 * 1024, 2)),
@@ -90,8 +93,8 @@ mod tests {
         );
         assert_eq!(
             classify_gzip(&gz, 8),
-            DecodePath::MultiMemberPar,
-            "plain multi-member routes member-per-worker"
+            DecodePath::MultiMemberGrid,
+            "dominant-member distribution routes the whole-file grid"
         );
         assert_bytes_all_threads(&gz, &expected, "uneven");
     }
@@ -114,14 +117,17 @@ mod tests {
 
     #[test]
     fn few_large_members_byte_exact() {
-        // 2 large members → plain multi-member → member-per-worker, byte-exact.
+        // 2 large members at T8 → fewer members than workers, so member-per-worker
+        // cannot saturate the pool (fast_path_ok is false when n < t_eff). STAGE-2d
+        // routes to the whole-file GRID, which splits WITHIN members across all 8
+        // workers. Byte-exact. (Previously locked to MultiMemberPar.)
         let members = vec![
             gz_member(&semi_compressible(12 * 1024 * 1024, 200)),
             gz_member(&semi_compressible(12 * 1024 * 1024, 201)),
         ];
         let gz = concat(&members);
         let expected = reference(&gz);
-        assert_eq!(classify_gzip(&gz, 8), DecodePath::MultiMemberPar);
+        assert_eq!(classify_gzip(&gz, 8), DecodePath::MultiMemberGrid);
         assert_bytes_all_threads(&gz, &expected, "few_large");
     }
 

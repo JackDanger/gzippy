@@ -1538,6 +1538,16 @@ fn consumer_loop<W: std::io::Write>(
     // policy is T1-tuned (depth 0 + drain-lone at pool_size==1, where the
     // pool runs inline with no racing workers); see `RecycleDeferral`.
     let mut recycle_deferral = RecycleDeferral::new(pool_size);
+    // STAGE-2d MULTI-MEMBER GRID: arm the per-member CRC32 + ISIZE verifier so
+    // `drain_one_pending` runs the vendor `processCRC32` steps (design §4) over
+    // resolved chunks in decode order. Single-member drive leaves this None.
+    if configuration.multi_member {
+        recycle_deferral.member_verifier = Some(
+            crate::decompress::parallel::chunk_data::MemberVerifier::new(
+                configuration.crc32_enabled,
+            ),
+        );
+    }
     // Optional duplicate probe (GZIPPY_EAGER_POSTPROC=1) — full-cache scan
     // on every stall; production uses handoff-triggered resolve-ahead only.
     let eager_probe_enabled = eager_postproc_enabled();
@@ -2426,6 +2436,18 @@ fn consumer_loop<W: std::io::Write>(
     }
     while let Some(mut held) = recycle_deferral.queue.pop_front() {
         held.recycle_decoded_buffers();
+    }
+    // STAGE-2d MULTI-MEMBER GRID: every chunk has now been fed to the per-member
+    // verifier in decode order. The stream must have ended exactly at a member
+    // footer (running member carries zero pending bytes) — a non-zero remainder
+    // is a torn final member. No-op for single-member drive (verifier is None).
+    if let Some(v) = recycle_deferral.member_verifier.take() {
+        v.finish().map_err(|e| {
+            FetchError::Decode(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("multi-member verify: {e}"),
+            )))
+        })?;
     }
     let _ = submit_us_sum; // reserved for future submit-only timing
 
@@ -4171,7 +4193,13 @@ fn try_speculative_decode_candidate(
     // gzip footer are neither EOF nor valid gzip magic (0x1f 0x8b), reject.
     // The check is SPECULATIVE PATH ONLY — confirmed/window-seeded paths do not
     // call this function.
-    if encoded_end < stop_hint_bit {
+    // STAGE-2d: in the multi-member grid the decoder INTENTIONALLY walks past a
+    // member-final BFINAL (footer → next header → continue), so an early
+    // `encoded_end < stop_hint_bit` is a legitimate clean member-boundary / EOF
+    // stop, not a phantom end-of-stream to reject. The `_multi` decode already
+    // consumed the footer and (if present) the next header; discarding here would
+    // wrongly drop a valid boundary-crossing chunk. Skip the single-member reject.
+    if !configuration.multi_member && encoded_end < stop_hint_bit {
         // Byte-align: deflate pads to a byte boundary before the gzip footer.
         let end_byte = encoded_end.div_ceil(8);
         // Gzip footer is 8 bytes (CRC32 LE + ISIZE LE, RFC 1952 §2.3.1).
@@ -4410,6 +4438,14 @@ struct RecycleDeferral {
     queue: std::collections::VecDeque<ChunkData>,
     depth: usize,
     drain_lone: bool,
+    /// STAGE-2d MULTI-MEMBER GRID: the running per-member CRC32 + ISIZE
+    /// verifier, fed each chunk in the in-order drain (`drain_one_pending`).
+    /// `Some` only when the grid driver set `configuration.multi_member`; the
+    /// single-member drive leaves it `None` (zero behavior change — the feed is
+    /// skipped and the whole-stream `total_crc` remains the single-trailer
+    /// oracle). Threaded here because `RecycleDeferral` already reaches every
+    /// drain call site, avoiding signature churn on the hot drain path.
+    member_verifier: Option<crate::decompress::parallel::chunk_data::MemberVerifier>,
 }
 
 #[cfg(parallel_sm)]
@@ -4433,6 +4469,7 @@ impl RecycleDeferral {
             queue: std::collections::VecDeque::with_capacity(depth + 1),
             depth,
             drain_lone,
+            member_verifier: None,
         }
     }
 }
@@ -4663,6 +4700,17 @@ fn drain_one_pending<W: std::io::Write>(
             // decode buffers until writev/vmsplice completes.
             let mut parts: Vec<&[u8]> = Vec::with_capacity(8);
             chunk.append_output_iovecs(&mut parts);
+            // STAGE-2d MULTI-MEMBER GRID: feed this chunk (in decode order,
+            // fully resolved) to the per-member verifier BEFORE it is moved to
+            // the writer / recycled. No-op for single-member drive.
+            if let Some(v) = recycle_deferral.member_verifier.as_mut() {
+                v.feed(&chunk).map_err(|e| {
+                    FetchError::Decode(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("multi-member verify: {e}"),
+                    )))
+                })?;
+            }
             // CRC combine before boxing `chunk` for vmsplice lifetime.
             total_crc.append(&chunk.narrowed_crc);
             for stream_crc in &chunk.crc32s {
@@ -4746,6 +4794,16 @@ fn drain_one_pending<W: std::io::Write>(
         }
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
+    // STAGE-2d MULTI-MEMBER GRID: feed this chunk (buffered-writer path) to the
+    // per-member verifier in decode order. No-op for single-member drive.
+    if let Some(v) = recycle_deferral.member_verifier.as_mut() {
+        v.feed(&chunk).map_err(|e| {
+            FetchError::Decode(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("multi-member verify: {e}"),
+            )))
+        })?;
+    }
     let t_combine = std::time::Instant::now();
     {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.combine_crc");

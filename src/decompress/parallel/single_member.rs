@@ -976,6 +976,42 @@ pub fn decompress_parallel<W: Write>(
 /// `DecodePath::MultiMemberChunked` docs for why it is not used for plain
 /// dominant/few-member distributions).
 #[cfg(parallel_sm)]
+/// STAGE-2d whole-file MULTI-MEMBER GRID entry
+/// ([`crate::decompress::DecodePath::MultiMemberGrid`]). Decodes the whole
+/// multi-member stream as ONE chunk grid (not a member walk), streaming with the
+/// zero-copy `out_fd` path when available and running per-member CRC32 + ISIZE
+/// verification inside the consumer. See
+/// [`crate::decompress::parallel::sm_driver::read_parallel_sm_grid`].
+pub fn decompress_multi_member_grid<W: Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    num_threads: usize,
+) -> Result<u64, ParallelError> {
+    use crate::decompress::parallel::sm_driver::{read_parallel_sm_grid, ReadParallelSmError};
+
+    if gzip_data.len() < 18 || gzip_data[0] != 0x1f || gzip_data[1] != 0x8b {
+        return Err(ParallelError::InvalidGzipFormat);
+    }
+    let num_threads = num_threads.max(1);
+    let chunk_size =
+        adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
+    let r =
+        read_parallel_sm_grid(gzip_data, writer, out_fd, num_threads, chunk_size).map_err(|e| {
+            match e {
+                ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+                ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+                ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
+                ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+                ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+            }
+        })?;
+    writer
+        .flush()
+        .map_err(|_| ParallelError::InvalidGzipFormat)?;
+    Ok(r.total_size as u64)
+}
+
 pub fn decompress_multi_member_chunked<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
