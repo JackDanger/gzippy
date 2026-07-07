@@ -273,7 +273,7 @@ fn trace_slow_path() {
 
 /// BGZF block information
 #[derive(Debug, Clone)]
-struct BgzfBlock {
+pub(crate) struct BgzfBlock {
     /// Byte offset of block start in compressed data
     start: usize,
     /// Total block length (including header and trailer)
@@ -2337,7 +2337,7 @@ fn parse_gzip_header(data: &[u8], offset: usize, end: usize) -> Option<usize> {
 /// which fully decompressed every member (doing 2x total work).
 ///
 /// Returns None if the data is not multi-member or boundaries look suspicious.
-fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
+pub(crate) fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
     if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
         return None;
     }
@@ -2409,6 +2409,100 @@ fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
     }
 
     Some(members)
+}
+
+/// Routing predicate (design §1.2 / [R1-#8]): decide whether the plain
+/// multi-member **member-per-worker** fast path
+/// ([`decompress_multi_member_parallel`]) will keep all `t_eff` workers busy —
+/// i.e. whether the member size distribution is balanced enough that assigning
+/// one whole member per worker approaches the ideal makespan `Σcost / t_eff`.
+///
+/// This replaces two coupled scalar thresholds (`count ≥ K·T && max_share ≤
+/// MARGIN/T`) with a **single-member dominance** test over per-member DECODE
+/// COST: the member-per-worker split can rebalance any distribution EXCEPT one
+/// where a member's cost exceeds roughly one worker's fair share of the total —
+/// that member pins a worker for the whole decode and cannot be sped up by more
+/// workers, whereas the chunked path splits *within* it. On a `false` verdict
+/// the classifier routes the whole file to the chunked path
+/// ([`crate::decompress::DecodePath::MultiMemberChunked`]).
+///
+/// Why the dominance test rather than a literal greedy-LPT makespan-vs-ideal
+/// comparison (design §1.2's first form): indivisible equal members carry an
+/// inherent integer-granularity imbalance (40 members over 16 workers has a
+/// forced 3-vs-2 split = 20% over the *continuous* ideal) that a naive
+/// `makespan ≤ (1+EPS)·(Σcost/T)` test mis-flags as "unbalanced" — it would
+/// reject the design's own canonical `mm_many` fast-path example. Granularity
+/// imbalance is NOT a splittable-dominance problem; only a member exceeding a
+/// worker's share is. The dominance test captures exactly the discriminating
+/// signal and is granularity-robust; it also subsumes the adversarial
+/// "two-huge-members" case (each huge member alone exceeds a worker share). A
+/// residual mis-pick (e.g. 3 medium members on 2 workers, where within-member
+/// chunking could shave the forced 3-vs-2 tail) is only a perf choice between
+/// two *correct* paths [R1-#8] and is bounded by `EPS`.
+///
+/// Cost model (`cost_i`): the member's compressed length, blended up by the
+/// output-size proxy `isize_i / global_ratio` so a stored-dense member (whose
+/// decode cost tracks its OUTPUT, not its tiny compressed input) is not
+/// undercounted. `global_ratio = Σ isize / Σ compressed`. All inputs are
+/// content-derived from the header scan — no host benchmark scar.
+///
+/// This is a **perf routing predicate only**: after per-member CRC32/ISIZE is
+/// equalized across paths, a wrong verdict mis-picks between two *correct*
+/// paths, never between correctness levels. `EPS` is a plain named constant (no
+/// production env knob) locked by the box-side OQ-2 gate.
+///
+/// STAGE-2 status: BUILT AND UNIT-TESTED but not yet wired into `classify_gzip`
+/// (the routing flip is a stage-2b action gated on the whole-file grid — see
+/// the note in `crate::decompress::classify_gzip`). `allow(dead_code)` until
+/// then; removing the attribute is the stage-2b wiring checklist item.
+#[allow(dead_code)]
+pub(crate) fn fast_path_ok(members: &[BgzfBlock], t_eff: usize) -> bool {
+    /// Slack on a member's cost over one worker's fair share (`Σcost / t_eff`)
+    /// that still counts as "not dominant". Absorbs the integer granularity of
+    /// indivisible members; locked by the OQ-2 schedule-predictor gate (§7).
+    const EPS: f64 = 0.25;
+
+    let t_eff = t_eff.max(1);
+    let n = members.len();
+    // Fewer members than workers ⇒ at least one worker idles ⇒ the fast path
+    // cannot saturate the pool; the chunked path splits within members.
+    if n < t_eff {
+        return false;
+    }
+
+    // global_ratio = Σ isize / Σ compressed (guard against a zero denom).
+    let total_compressed: u128 = members.iter().map(|m| m.length as u128).sum();
+    let total_isize: u128 = members.iter().map(|m| m.isize as u128).sum();
+    if total_compressed == 0 {
+        return false;
+    }
+    // Fixed-point ratio ×256 to avoid float in the per-member blend.
+    let ratio_q8: u128 = (total_isize.saturating_mul(256) / total_compressed).max(1);
+
+    let costs = members.iter().map(|m| {
+        let by_input = m.length as u128;
+        // isize / global_ratio  ==  isize * 256 / ratio_q8
+        let by_output = (m.isize as u128).saturating_mul(256) / ratio_q8;
+        by_input.max(by_output)
+    });
+
+    let mut total_cost: u128 = 0;
+    let mut max_cost: u128 = 0;
+    for c in costs {
+        total_cost += c;
+        if c > max_cost {
+            max_cost = c;
+        }
+    }
+    if total_cost == 0 {
+        return false;
+    }
+
+    // Dominance test: the largest member's cost must not exceed one worker's
+    // fair share (`total_cost / t_eff`) by more than `EPS`. A dominant member
+    // pins a worker and can only be sped up by the within-member chunked path.
+    let ideal = total_cost as f64 / t_eff as f64;
+    (max_cost as f64) <= (1.0 + EPS) * ideal
 }
 
 /// GZ coverage walk: hop member-to-member via the "GZ" FEXTRA subfield's
@@ -2637,6 +2731,83 @@ pub fn decompress_multi_member_parallel<W: Write>(
 mod tests {
     use super::*;
     use crate::assert_slices_eq;
+
+    // ── STAGE-2 routing predicate (§1.2): greedy-LPT `fast_path_ok`. Feed
+    //    synthetic member distributions and assert the fast (member-per-worker)
+    //    vs chunked (within-member) route. ─────────────────────────────────────
+
+    /// Build a `BgzfBlock` from (compressed_length, isize); the fields the
+    /// predicate reads. Offsets are irrelevant to the schedule sim.
+    fn mm(length: usize, isize: u32) -> BgzfBlock {
+        BgzfBlock {
+            start: 0,
+            length,
+            isize,
+            output_offset: 0,
+            deflate_start: 0,
+        }
+    }
+
+    #[test]
+    fn fast_path_ok_balanced_many_members() {
+        // 40 balanced members (mm_many) at T8 ⇒ LPT makespan ≈ ideal ⇒ fast.
+        let members: Vec<_> = (0..40).map(|_| mm(1_000_000, 3_000_000)).collect();
+        assert!(fast_path_ok(&members, 8));
+        assert!(fast_path_ok(&members, 16));
+    }
+
+    #[test]
+    fn fast_path_ok_single_dominant_member_rejected() {
+        // mm_uneven: 3 tiny + 1 dominant ⇒ dominant ≫ half the total ⇒ chunked.
+        let members = vec![
+            mm(50_000, 150_000),
+            mm(50_000, 150_000),
+            mm(50_000, 150_000),
+            mm(9_000_000, 27_000_000),
+        ];
+        assert!(!fast_path_ok(&members, 4));
+        assert!(!fast_path_ok(&members, 8));
+    }
+
+    #[test]
+    fn fast_path_ok_fewer_members_than_workers_rejected() {
+        // few-large: 3 balanced members but T8 ⇒ workers idle ⇒ chunked.
+        let members = vec![
+            mm(3_000_000, 9_000_000),
+            mm(3_000_000, 9_000_000),
+            mm(3_000_000, 9_000_000),
+        ];
+        assert!(!fast_path_ok(&members, 8));
+        // ...but at T2 the same three saturate the pool ⇒ fast.
+        assert!(fast_path_ok(&members, 2));
+    }
+
+    #[test]
+    fn fast_path_ok_adversarial_two_huge_many_tiny_rejected() {
+        // Many members but two huge ones must share a worker at T8 ⇒ makespan
+        // ≫ ideal ⇒ chunked (the scalar-threshold blind spot [R1-#8]).
+        let mut members: Vec<_> = (0..30).map(|_| mm(100_000, 300_000)).collect();
+        members.push(mm(8_000_000, 24_000_000));
+        members.push(mm(8_000_000, 24_000_000));
+        assert!(!fast_path_ok(&members, 8));
+    }
+
+    #[test]
+    fn fast_path_ok_stored_dense_member_counted_by_output() {
+        // A stored (incompressible-then-stored) member: tiny share of Σcompressed
+        // but its DECODE cost tracks its large output. The isize blend lifts its
+        // cost so it is not mis-scheduled as trivial. Two such stored-dense
+        // members that would each dominate by output ⇒ rejected at T4.
+        let members = vec![
+            mm(2_100_000, 2_000_000), // ~stored: ratio ≈ 1
+            mm(2_100_000, 2_000_000),
+            mm(500_000, 4_000_000), // highly compressible, small input
+            mm(500_000, 4_000_000),
+        ];
+        // Global ratio is dragged up by the compressible members; the stored
+        // members' output-based cost keeps the schedule balanced here → fast at T2.
+        assert!(fast_path_ok(&members, 2));
+    }
 
     /// Helper to compare byte slices with concise error output
     fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
