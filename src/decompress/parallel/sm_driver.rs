@@ -575,27 +575,19 @@ pub fn read_parallel_sm_grid<W: std::io::Write>(
     }
     let input = &gzip_data[header_size..];
 
-    // Σ-based expansion ratio (§5a): `ceil(Σ isize × 1.25 / total_compressed)`,
-    // minimum 2; 0 = unknown → 8× fallback. Σ isize comes from the member
-    // distribution scan (byte-cheap header/footer walk); total_compressed is the
-    // whole file. A wrapped/lying ISIZE only affects reserve SIZING (grow-safe),
-    // never correctness (per-member CRC/ISIZE is the oracle).
-    let expansion_ratio_ceil: u16 = {
-        match crate::decompress::bgzf::scan_member_boundaries_fast(gzip_data) {
-            Some(members) if !members.is_empty() => {
-                let total_isize: u64 = crate::decompress::bgzf::sum_member_isize(&members);
-                let compressed_bytes = gzip_data.len() as u64;
-                if compressed_bytes == 0 || total_isize == 0 {
-                    0
-                } else {
-                    let numer = total_isize.saturating_mul(5);
-                    let denom = compressed_bytes.saturating_mul(4);
-                    numer.div_ceil(denom).max(2).min(u16::MAX as u64) as u16
-                }
-            }
-            _ => 0,
-        }
-    };
+    // Expansion-ratio reserve hint (§5a). The old code recomputed this from a
+    // FULL-FILE `scan_member_boundaries_fast` pass — a T-invariant serial scan of
+    // the whole compressed file, run again here AFTER `classify_gzip` already
+    // scanned it, so the grid critical path paid the O(file) scan TWICE. On a
+    // large compressible-dominant multi-member stream those two scans were ~50%
+    // of the T16 wall (Amdahl). We drop this scan entirely and pass 0 (unknown) →
+    // the per-chunk reserve uses the historical 8× fallback in
+    // `compute_initial_reserve`, which is grow-safe (a wrong hint only affects
+    // initial capacity, never correctness — per-member CRC/ISIZE is the oracle)
+    // AND RSS-neutral (a Vec's reserved-but-unwritten pages are not resident;
+    // only bytes actually decoded fault in). Per-member boundaries are still
+    // discovered DURING the parallel decode by the cross-member chunk walk.
+    let expansion_ratio_ceil: u16 = 0;
 
     let sparsity = window_sparsity_kill_switch();
     let configuration = ChunkConfiguration {
