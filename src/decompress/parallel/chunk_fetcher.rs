@@ -77,8 +77,6 @@ use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFin
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::stall_residency;
-#[cfg(parallel_sm)]
 use crate::decompress::parallel::thread_pool::ThreadPool;
 use crate::decompress::parallel::trace;
 use crate::decompress::parallel::trace_v2;
@@ -791,31 +789,6 @@ fn drive_impl<W: std::io::Write>(
             crate::decompress::parallel::compressed_vector::CompressionType::None,
         )
     });
-    // CLEAN-ONLY ENGINE ORACLE: eagerly load the seed side store (if
-    // GZIPPY_SEED_WINDOWS is set) so the on-disk read is out of the workers'
-    // decode time. No-op otherwise.
-    crate::decompress::parallel::seed_windows::preload();
-    // CLEAN-ONLY ENGINE ORACLE: pre-seed the block_finder with the REAL per-chunk
-    // boundaries that have a captured predecessor window, so every dispatch lands
-    // on a boundary whose window is seedable. A clean decode is only possible at a
-    // real boundary; this + the seeded-window fallback forces every chunk down the
-    // CLEAN path while the production consumer / publish chain runs unchanged.
-    // No-op unless seed mode is on. Skip boundaries within one chunk of EOF (an
-    // EOF-adjacent window key is a stream-end artifact, not a real chunk start).
-    // DECOMPOSE knob (GZIPPY_SEED_NO_BOUNDARIES=1, measurement-only): skip the
-    // block_finder pre-seed so dispatch lands on prod partition-GUESS boundaries
-    // even when windows are seeded. Isolates the boundary-ALIGNMENT sub-lever from
-    // the marker-COMPUTE sub-lever. OFF==identity. Byte-correct (partition guesses
-    // are corrected at the confirmed offset, as in unseeded prod).
-    if !crate::decompress::parallel::seed_windows::seed_no_boundaries() {
-        let starts = crate::decompress::parallel::seed_windows::seedable_chunk_starts();
-        for off in starts {
-            if off + (32 * 1024 * 8) < total_bits {
-                block_finder.insert(off);
-            }
-        }
-    }
-
     // Chunk 0's input window is empty by definition (start of stream).
     // Vendor pattern: insert an empty / zero window so subsequent
     // get(0) lookups return a valid SharedWindow rather than nullptr.
@@ -837,33 +810,8 @@ fn drive_impl<W: std::io::Write>(
     // gzippy previously diverged: cache_capacity = pool_size*2 (vendor is
     // max(16,pool)) and a prefetch-saturation lever with no vendor counterpart.
     // Both deleted; sizing now matches vendor.
-    let mut cache_capacity = std::cmp::max(16, pool_size);
-    let mut prefetch_capacity = pool_size * 2;
-    // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): NO cache-cap bump.
-    // The corrected overlap dispatch parks IN-FLIGHT receivers in the unbounded
-    // `prefetching` map (submit_prefetch), NOT in the size-capped caches, so the
-    // oracle does not need a larger cache. The PRIOR (backwards) oracle bumped
-    // BOTH caps to 4096 with no eviction, which held the whole member's u16
-    // (2×-width) markered working set resident (~400MB vs production's ~190MB) —
-    // an advisor-identified memory-bandwidth CONFOUND that added ~5-7% wall
-    // (git history (campaign plan, removed) §C1.2). Vendor sizing kept so
-    // the oracle is production-shaped and isolates ONLY the dispatch-depth term.
-    // STEP-0 discriminator (a) POSITIVE CONTROL (gated on the probe being on, so
-    // production is untouched / OFF==identity): GZIPPY_PREFETCH_CACHE_CAP=N
-    // overrides BOTH cache capacities. Shrinking to a tiny value MUST force the
-    // containing parent to be evicted before the lagging consumer reaches it ⇒
-    // NOT_RESIDENT must rise (validates the probe observes residency). A LARGE
-    // value should DROP NOT_RESIDENT. See git history (campaign plan, removed).
-    if stall_residency::enabled() {
-        if let Some(v) = std::env::var_os("GZIPPY_PREFETCH_CACHE_CAP") {
-            if let Ok(n) = v.to_string_lossy().parse::<usize>() {
-                let n = n.max(1);
-                cache_capacity = n;
-                prefetch_capacity = n;
-                eprintln!("  STALL_RESIDENCY_PROBE: POSITIVE-CONTROL cache caps overridden to {n}");
-            }
-        }
-    }
+    let cache_capacity = std::cmp::max(16, pool_size);
+    let prefetch_capacity = pool_size * 2;
     let block_fetcher: Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>> =
         Arc::new(BlockFetcher::new(
             cache_capacity,
@@ -942,47 +890,10 @@ fn drive_impl<W: std::io::Write>(
         );
     }
 
-    // ORACLE-C (decode-bypass FLOOR): warm the prebuilt replay map BEFORE the
-    // timed drive so the one-time capture-load + ChunkData reconstruction (the
-    // ~656MB rebuild that CONTAMINATED the prior leverB floor at 3.667s, see
-    // git history (campaign plan, removed)) is NOT counted as decode-floor time. Emits the
-    // build duration to stderr (GZIPPY_BYPASS_DECODE replay only) so the harness
-    // can report floor = wall − warm. No-op unless replay is enabled.
-    crate::decompress::parallel::decode_bypass::warm_prebuilt();
-    // REMOVAL-ORACLE NODECODE: same out-of-wall warm for the symbol-stream
-    // replay map (no-op unless GZIPPY_ORACLE_NODECODE is set).
+    // REMOVAL-ORACLE NODECODE: warm the symbol-stream replay map out of the timed
+    // drive (no-op unless GZIPPY_ORACLE_NODECODE is set).
     crate::decompress::parallel::removal_oracle::warm_replay();
 
-    // Phase-timing: all scaffold (block_finder, window_map, block_fetcher,
-    // thread_pool spawn) is built — this is the block-finder-bootstrap boundary.
-    crate::decompress::parallel::phase_timing::mark("scaffold_built");
-
-    let drive_t0 = std::time::Instant::now();
-    // PERFECT_OVERLAP oracle (GZIPPY_PERFECT_OVERLAP=1): CORRECTED overlap
-    // dispatch — submit EVERY chunk's decode as an in-flight prefetch
-    // (non-blocking) so they decode CONCURRENTLY with the timed consumer below.
-    // The consumer drains in order (resolve + write) while later chunks still
-    // decode = decode↔drain OVERLAP (the schedule production / rg use). Removes
-    // ONLY the prefetch-dispatch-DEPTH gap; KEEPS the marker engine, serial
-    // resolve chain, drain, write. This dispatch is cheap (no recv); the whole
-    // wall is timed by drive_t0 below. No-op unless enabled.
-    let warm_t0 = std::time::Instant::now();
-    if crate::decompress::parallel::perfect_overlap::enabled() {
-        perfect_overlap_warm(
-            input_view,
-            total_bits,
-            &block_finder,
-            &block_fetcher,
-            &window_map,
-            &thread_pool,
-            pool_size,
-            configuration,
-        );
-        eprintln!(
-            "  PERFECT_OVERLAP: dispatch phase {:.4}s (all chunks in flight; consumer overlaps)",
-            warm_t0.elapsed().as_secs_f64()
-        );
-    }
     // The in-order consumer (this thread runs `consumer_loop` inline) is left
     // unpinned — faithful to rapidgzip, which never pins its reader thread; the
     // OS schedules it alongside the unpinned decode workers (see the decode-pool
@@ -1004,11 +915,6 @@ fn drive_impl<W: std::io::Write>(
         &mut total_size,
     );
 
-    // Phase-timing: consumer_loop returned — steady-state parallel decode +
-    // in-order drain done. What follows (pool stop + flush + finalize) is the
-    // finalize phase.
-    crate::decompress::parallel::phase_timing::mark("consumer_done");
-
     // Stop the pool BEFORE returning so any straggler prefetch tasks
     // are joined and `InputSlice` is no longer reachable. Mirror of
     // vendor's `stopThreadPool()` at BlockFetcher.hpp:600-604, called
@@ -1022,17 +928,9 @@ fn drive_impl<W: std::io::Write>(
     // error so the writer thread does not outlive the run.
     #[cfg(all(unix, parallel_sm))]
     let writer_result = crate::decompress::parallel::output_writer::finish();
-    // Report replay stats even on a (CRC) error so the bypass experiment
-    // can see hit/miss counts when the run aborts.
-    crate::decompress::parallel::decode_bypass::report_replay_stats();
+    // Report replay stats even on a (CRC) error so the NODECODE oracle can see
+    // hit/miss counts when the run aborts. No-op unless the oracle is on.
     crate::decompress::parallel::removal_oracle::report_replay_stats();
-    if crate::decompress::parallel::perfect_overlap::enabled() {
-        eprintln!(
-            "  PERFECT_OVERLAP: overlapped wall (dispatch+consumer) {:.4}s",
-            drive_t0.elapsed().as_secs_f64()
-        );
-        crate::decompress::parallel::perfect_overlap::report_stats();
-    }
     // Record bytes streamed so far for the multi-member resume path. The
     // consumer writes chunks in order and only after they fully validate, so on
     // a finder/decode error at a member boundary this count is exactly the
@@ -1046,19 +944,6 @@ fn drive_impl<W: std::io::Write>(
     // writev path which returns Err on a failed write).
     #[cfg(all(unix, parallel_sm))]
     writer_result.map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-
-    if trace::is_enabled() {
-        trace::emit(
-            "consumer",
-            "drive_end",
-            &format!(
-                r#""duration_us":{},"decoded_bytes":{},"crc32":{}"#,
-                drive_t0.elapsed().as_micros(),
-                total_size,
-                total_crc.crc32(),
-            ),
-        );
-    }
 
     // Vendor parity: `m_blockMap->finalize()` + `m_blockFinder->finalize()`
     // at the end of `processNextChunk`'s EOF branch
@@ -1080,10 +965,6 @@ fn drive_impl<W: std::io::Write>(
     block_fetcher.clear_prefetch_cache();
 
     // Phase-timing: pool stopped, output flushed, block_map/finder finalized,
-    // prefetch cache drained — drive() finalize bookkeeping complete. The
-    // trailer CRC32+ISIZE verify (crc_verified mark) runs next in sm_driver.
-    crate::decompress::parallel::phase_timing::mark("finalize_done");
-
     // --verbose stats dump. Mirror of vendor's destructor print at
     // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Triggered
     // by GZIPPY_VERBOSE env var (matches the existing GZIPPY_DEBUG
@@ -1106,8 +987,6 @@ fn drive_impl<W: std::io::Write>(
         // mfast-phase0 probe: cycle/event breakdown for `'mfast` vs careful loop
         // (no-op unless GZIPPY_MFAST_PROF=1).
         crate::decompress::parallel::marker_inflate::mfast_prof::dump_if_enabled();
-        // AMD-residual region partition (no-op unless GZIPPY_REGION_PROF=1).
-        crate::decompress::parallel::region_prof::dump_if_enabled();
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
@@ -1457,17 +1336,9 @@ fn drive_impl<W: std::io::Write>(
     // Flush all per-thread trace_v2 buffers (consumer thread + any
     // already-joined worker threads).
     trace_v2::flush_all();
-    // DECODE-BYPASS: serialize the capture map (no-op unless capture on).
-    crate::decompress::parallel::decode_bypass::flush_capture();
     // REMOVAL-ORACLE NODECODE: serialize the symbol-stream record (no-op
     // unless GZIPPY_ORACLE_RECORD is set).
     crate::decompress::parallel::removal_oracle::flush_record();
-    // CLEAN-ONLY ENGINE ORACLE: snapshot every published window (capture mode) /
-    // report seed hit-miss (seed mode). Both no-ops unless the env vars are set.
-    if crate::decompress::parallel::seed_windows::capture_enabled() {
-        crate::decompress::parallel::seed_windows::write_capture();
-    }
-    crate::decompress::parallel::seed_windows::report_seed_stats();
     Ok((total_crc.crc32(), total_size))
 }
 
@@ -1803,12 +1674,6 @@ fn consumer_loop<W: std::io::Write>(
                         );
                     }
                     // ACCEPT: move the `Arc` (no extra refcount) into the consumer path.
-                    // PERFECT_OVERLAP self-test: a warm-cache hit = head-of-line
-                    // decode wait removed for this chunk. Gated so production is
-                    // perf-transparent (OFF == identity).
-                    if crate::decompress::parallel::perfect_overlap::enabled() {
-                        crate::decompress::parallel::perfect_overlap::record_warm_hit();
-                    }
                     chunk_arc_from_partition = Some(arc);
                 } else {
                     // Vendor GzipChunkFetcher.hpp:646-648 — partition-keyed
@@ -1886,72 +1751,6 @@ fn consumer_loop<W: std::io::Write>(
                 arc
             }
             None => {
-                // PERFECT_OVERLAP self-test: a warm-cache MISS = a residual
-                // head-of-line decode wait the oracle failed to remove. If this
-                // fires often the warm_hit_frac drops below 1.0 and the number
-                // is void (Rule 4). No-op unless the oracle is enabled.
-                if crate::decompress::parallel::perfect_overlap::enabled() {
-                    crate::decompress::parallel::perfect_overlap::record_warm_miss();
-                }
-                // STEP-0 discriminator (a): PARENT-CACHED-AT-STALL probe
-                // (git history (campaign plan, removed)). This `None`
-                // branch IS the genuine head-of-line cold-get stall. Before
-                // blocking, classify whether the chunk CONTAINING `decode_start`
-                // is resident (interior-reuse fixable) or evicted (re-scope).
-                // Read-only snapshots; env-gated (OFF == identity).
-                if stall_residency::enabled() {
-                    // Snapshot each resident chunk's (start, max_start_tolerance,
-                    // encoded_END). The advisor (step0-advisor-verdict.md) caught
-                    // that [enc, max] is the speculative START-tolerance window
-                    // (decoded bytes BEGIN at max, chunk_data.rs:143-145), so the
-                    // containing-parent test must use the chunk's encoded RANGE
-                    // [enc, enc+encoded_size_bits) that its decoded content spans,
-                    // not [enc, max] (which collapses to enc==max after re-anchor).
-                    let mut cached: Vec<(usize, usize, usize)> = Vec::new();
-                    for (_k, arc) in block_fetcher.prefetch_cache_contents_sorted() {
-                        cached.push((
-                            arc.encoded_offset_bits,
-                            arc.max_acceptable_start_bit,
-                            arc.encoded_offset_bits
-                                .saturating_add(arc.encoded_size_bits),
-                        ));
-                    }
-                    for (_k, arc) in block_fetcher.cache_contents_sorted() {
-                        cached.push((
-                            arc.encoded_offset_bits,
-                            arc.max_acceptable_start_bit,
-                            arc.encoded_offset_bits
-                                .saturating_add(arc.encoded_size_bits),
-                        ));
-                    }
-                    let in_flight_keys = block_fetcher.prefetching_keys();
-                    let partition_span = configuration.split_chunk_size.saturating_mul(8);
-                    stall_residency::classify_stall(
-                        decode_start,
-                        &cached,
-                        &in_flight_keys,
-                        partition_span,
-                    );
-                    // SATURATION vs HORIZON occupancy snapshot at the stall
-                    // instant (git history (campaign plan, removed)). Excludes the
-                    // startup stall (decode_start == 0, unavoidable). Worker
-                    // occupancy: lazy-spawn means an un-spawned slot is available
-                    // capacity, so idle_capacity = parked idle + (cap - spawned).
-                    if decode_start != 0 {
-                        let cap = thread_pool.capacity();
-                        let spawned = thread_pool.spawned_threads();
-                        let idle = thread_pool.idle_thread_count();
-                        let busy = spawned.saturating_sub(idle);
-                        let idle_capacity = idle.saturating_add(cap.saturating_sub(spawned));
-                        // `enqueued`: an in-flight prefetch key covers decode_start
-                        // (the index WAS dispatched, just not finished) — same
-                        // keyed estimate the residency probe uses for in-flight.
-                        let enqueued = in_flight_keys.iter().any(|&k| {
-                            k <= decode_start && decode_start < k.saturating_add(partition_span)
-                        });
-                        stall_residency::classify_occupancy(busy, idle_capacity, enqueued);
-                    }
-                }
                 // The head chunk is NOT in the prefetch cache → the
                 // consumer is about to BLOCK on its decode (the
                 // `wait.block_fetcher_get` span, the other real serial wait
@@ -2491,9 +2290,6 @@ fn consumer_loop<W: std::io::Write>(
         }
     }
 
-    // STEP-0 discriminator (a) tally — see stall_residency::report.
-    stall_residency::report();
-
     Ok(())
 }
 
@@ -2702,112 +2498,6 @@ fn decode_chunk_with_until_exact(
 /// `m_threadPool.submit([this, ...] () { return decodeAndMeasureBlock(...); }, 0)`;
 /// we mirror that with `thread_pool.submit(run_decode_task, /* priority */ 0)`.
 #[cfg(parallel_sm)]
-/// PERFECT_OVERLAP oracle dispatch phase (GZIPPY_PERFECT_OVERLAP=1).
-///
-/// CORRECTED (2026-06-07): dispatch EVERY chunk's decode as an IN-FLIGHT
-/// prefetch up-front (non-blocking — `submit_prefetch`, NOT `recv()`),
-/// then return IMMEDIATELY so the timed `consumer_loop` runs CONCURRENTLY
-/// with the still-running decodes. The consumer drains chunk i in order
-/// (resolve markers off chunk i-1's published window + write) WHILE chunks
-/// i+1.. are still decoding on the pool. That is decode↔drain OVERLAP — the
-/// schedule production and rapidgzip actually use.
-///
-/// The PRIOR version (warm-all-then-drain) blocked on `recv()` for every
-/// chunk before the consumer started, SERIALIZING the two phases production
-/// overlaps — an ANTI-overlap whose wall was a pessimistic SUM (advisor
-/// REFUTED it: git history (campaign plan, removed)). It could not
-/// decide F1. This version removes ONLY the prefetch-DEPTH gap (every chunk
-/// is in flight from t0, so the consumer never head-of-line stalls on a
-/// not-yet-DISPATCHED chunk — the named project_confirmed_offset_prefetch_gap
-/// dispatch-TIMING term), while KEEPING the real marker engine, the serial
-/// marker-resolution window chain, drain, and write.
-///
-/// Faithfulness: each dispatched decode is the SAME `submit_decode_to_pool`
-/// task the prefetcher would have run, at the SAME partition-guess start
-/// (`is_speculative_prefetch=true`), keyed in the in-flight map under the
-/// SAME partition offset the consumer queries (`submit_prefetch` mirrors
-/// vendor `m_prefetching.emplace`, BlockFetcher.hpp:558). The window map is
-/// NOT pre-seeded, so each chunk decodes markered at its true rate.
-/// Output is therefore byte-identical (self-test: sha unchanged).
-#[cfg(parallel_sm)]
-#[allow(clippy::too_many_arguments)]
-fn perfect_overlap_warm(
-    input: InputSlice,
-    total_bits: usize,
-    block_finder: &GzipBlockFinder,
-    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
-    window_map: &WindowMap,
-    thread_pool: &Arc<ThreadPool>,
-    _pool_size: usize,
-    configuration: ChunkConfiguration,
-) {
-    use crate::decompress::parallel::perfect_overlap;
-
-    let spacing = block_finder.spacing_in_bits().max(1);
-    let mut block_index: usize = 0;
-    let mut guess_offset: usize = 0;
-
-    loop {
-        // Partition-guess offset for this index. The block_finder yields the
-        // confirmed offset once known, else the partition spacing multiple.
-        let start = match block_finder.get(block_index) {
-            (Some(off), GetReturnCode::Success) => off,
-            _ => guess_offset,
-        };
-        if start >= total_bits || total_bits.saturating_sub(start) < 8 {
-            break;
-        }
-        let part_key = block_finder.partition_offset_containing_offset(start);
-        // Skip if a prefetch for this partition key is already in flight
-        // (e.g. a confirmed offset and its partition-guess collapse to the
-        // same key) — avoid clobbering an existing receiver.
-        if block_fetcher.prefetch_in_flight(&part_key) {
-            block_index += 1;
-            guess_offset = guess_offset.saturating_add(spacing);
-            if guess_offset >= total_bits {
-                break;
-            }
-            continue;
-        }
-        // Worker stop hint: next partition boundary (or EOF). Same derivation
-        // as the prefetch path (next_offset.max(offset)).
-        let next_guess = guess_offset.saturating_add(spacing).min(total_bits);
-        let stop_hint = next_guess.max(start);
-        let params = DecodeParams {
-            start_bit: start,
-            stop_hint_bit: stop_hint,
-            stop_hint_is_exact: false,
-            is_speculative_prefetch: true,
-            partition_idx: usize::MAX,
-        };
-        let rx = submit_decode_to_pool(
-            thread_pool,
-            input,
-            params,
-            window_map,
-            block_fetcher,
-            configuration,
-        );
-        // OVERLAP: park the IN-FLIGHT receiver (do NOT block on recv). The
-        // consumer's `try_take_prefetched_pumping(&part_key)` will
-        // `take_prefetch` it and block on the head chunk while the rest keep
-        // decoding on the pool. Mirror of vendor `m_prefetching.emplace`.
-        block_fetcher.submit_prefetch(part_key, rx);
-        perfect_overlap::record_warm_chunk();
-
-        block_index += 1;
-        guess_offset = guess_offset.saturating_add(spacing);
-        if guess_offset >= total_bits {
-            break;
-        }
-        // Safety bound: never loop past a reasonable chunk count.
-        if block_index > (total_bits / spacing) + 64 {
-            break;
-        }
-    }
-}
-
-#[cfg(parallel_sm)]
 fn submit_decode_to_pool(
     thread_pool: &Arc<ThreadPool>,
     input: InputSlice,
@@ -2978,37 +2668,6 @@ fn run_decode_task(
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
 
-    // DECODE-BYPASS replay (campaign instrument, GZIPPY_BYPASS_DECODE).
-    // Return the precomputed ChunkData for this (start_bit, stop_hint)
-    // via memcpy — ~zero inner-Huffman CPU — keeping the FULL downstream
-    // coordination chain. On a cache miss fall through to real decode so
-    // output stays byte-correct.
-    // FIXED-SLEEP coordination-isolation (GZIPPY_SLEEP_DECODE_NS). Sleep a
-    // fixed duration instead of decoding, return a correct-size clean
-    // zero-filled chunk. Equalizes per-chunk "decode" cost to a constant
-    // identical to the rapidgzip sleep patch so wall delta = pure
-    // coordination. Output is garbage; CRC/size verification is gated off in
-    // sm_driver. Uses the bypass capture file for size/boundary metadata.
-    if crate::decompress::parallel::decode_bypass::sleep_decode_enabled() {
-        if let Some(chunk) = crate::decompress::parallel::decode_bypass::sleep_replay(
-            params.start_bit,
-            params.stop_hint_bit,
-            configuration,
-        ) {
-            return Ok(SharedChunkData::new(chunk));
-        }
-    }
-
-    if crate::decompress::parallel::decode_bypass::replay_enabled() {
-        if let Some(chunk) = crate::decompress::parallel::decode_bypass::replay(
-            params.start_bit,
-            params.stop_hint_bit,
-            configuration,
-        ) {
-            return Ok(SharedChunkData::new(chunk));
-        }
-    }
-
     let label = trace::worker_label(params.partition_idx);
     let t0 = std::time::Instant::now();
 
@@ -3048,22 +2707,9 @@ fn run_decode_task(
     } else {
         window_map.get(params.start_bit)
     };
-    // CLEAN-ONLY ENGINE ORACLE (GZIPPY_SEED_WINDOWS): when the live WindowMap has
-    // NOT yet published this chunk's predecessor window, fall back to the captured
-    // correct window from the seed store (forcing the CLEAN decode path) instead of
-    // speculation. No-op (None) unless seed mode is on; on a seed miss this returns
-    // None and the chunk takes its normal path (output stays byte-correct). Does NOT
-    // shadow a real window: only consulted when window_at_offset is None.
-    let seeded_window: Option<Vec<u8>> = if params.start_bit != 0 && window_at_offset.is_none() {
-        crate::decompress::parallel::seed_windows::seed_window_for(params.start_bit)
-    } else {
-        None
-    };
-    let until_exact =
-        (window_at_offset.is_some() || seeded_window.is_some()) && params.stop_hint_is_exact;
+    let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
-    let decode_mode_clean =
-        params.start_bit == 0 || window_at_offset.is_some() || seeded_window.is_some();
+    let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
     // Fulcrum `model` reads `worker.decode` span mode tags (rapidgzip patch uses
     // clean | window_absent). Keep boundary_search on causal instants only.
     let worker_decode_mode = if decode_mode_clean {
@@ -3105,15 +2751,6 @@ fn run_decode_task(
         "t",
     );
 
-    // AMD-residual R_WORKER region: wraps the WHOLE per-chunk decode dispatch (all 4
-    // branches incl. window-absent speculative) so every chunk (on-demand + prefetched)
-    // is counted. ONE rdtsc pair per chunk on this worker thread.
-    let _worker_t0 = crate::decompress::parallel::region_prof::rdtsc(
-        crate::decompress::parallel::region_prof::enabled(),
-    );
-    if crate::decompress::parallel::region_prof::enabled() {
-        crate::decompress::parallel::region_prof::region_enter();
-    }
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_with_until_exact(
             input_bytes,
@@ -3125,31 +2762,11 @@ fn run_decode_task(
         )
     } else if let Some(w) = window_at_offset.as_ref() {
         let bytes = materialize_window(w);
-        // CLEAN-ONLY ENGINE ORACLE capture: this is the NATURAL clean path — the
-        // window is correctly aligned to this real boundary. Record the aligned
-        // (start_bit -> window) pair (no-op unless capture mode is on). A p=1
-        // capture records every chunk this way → perfectly-aligned seed.
-        crate::decompress::parallel::seed_windows::record_clean_window(
-            params.start_bit,
-            bytes.as_ref(),
-        );
         decode_chunk_with_until_exact(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
             &bytes,
-            until_exact,
-            configuration,
-        )
-    } else if let Some(seed_bytes) = seeded_window.as_ref() {
-        // CLEAN-ONLY ENGINE ORACLE: decode with the captured correct predecessor
-        // window — same clean path the published-window arm takes, just sourced
-        // from the seed store instead of the live WindowMap.
-        decode_chunk_with_until_exact(
-            input_bytes,
-            params.start_bit,
-            params.stop_hint_bit,
-            seed_bytes.as_slice(),
             until_exact,
             configuration,
         )
@@ -3167,28 +2784,6 @@ fn run_decode_task(
     // spans, so the injected per-chunk work lands in `ring_other` — the residual
     // fulcrum F-9c5ca01d020d flagged. OFF (unset) ⇒ a single hoistable branch.
     crate::decompress::parallel::slow_knob::ring_inject();
-    if crate::decompress::parallel::region_prof::enabled() {
-        use std::sync::atomic::Ordering;
-        crate::decompress::parallel::region_prof::region_exit();
-        let dt = crate::decompress::parallel::region_prof::rdtsc(true).wrapping_sub(_worker_t0);
-        crate::decompress::parallel::region_prof::R_WORKER_CYC.fetch_add(dt, Ordering::Relaxed);
-        crate::decompress::parallel::region_prof::R_WORKER_N.fetch_add(1, Ordering::Relaxed);
-        if let Ok(ref c) = chunk_result {
-            crate::decompress::parallel::region_prof::R_WORKER_BYTES
-                .fetch_add(c.decoded_size() as u64, Ordering::Relaxed);
-        }
-    }
-
-    // DECODE-BYPASS capture (campaign instrument, GZIPPY_BYPASS_CAPTURE).
-    // Record this decode result keyed by (start_bit, stop_hint_bit) so a
-    // later replay run can memcpy it back. No-op unless capture is on.
-    if let Ok(ref chunk) = chunk_result {
-        crate::decompress::parallel::decode_bypass::record(
-            params.start_bit,
-            params.stop_hint_bit,
-            chunk,
-        );
-    }
 
     // Wrap in `ChunkArc` to match BlockFetcher's `Value` type (vendor's
     // `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
@@ -3264,15 +2859,6 @@ fn resolve_chunk_markers_on_chunk(
     predecessor_window: &[u8],
 ) {
     let dwm_len_pre = chunk.data_with_markers.len();
-    // AMD-residual R_MARKERPP region (resolve+narrow+narrowed-crc+subwin == rg applyWindow).
-    let _rp_span = crate::decompress::parallel::region_prof::Span::new(
-        &crate::decompress::parallel::region_prof::R_MARKERPP_CYC,
-        &crate::decompress::parallel::region_prof::R_MARKERPP_N,
-    );
-    if crate::decompress::parallel::region_prof::enabled() {
-        crate::decompress::parallel::region_prof::R_MARKERPP_BYTES
-            .fetch_add(dwm_len_pre as u64, std::sync::atomic::Ordering::Relaxed);
-    }
     if dwm_len_pre > 0 {
         // Always fused resolve+narrow+CRC (64 KiB u8 LUT, ONE traversal). The
         // old sub-128Ki-element branch ran `resolve_markers_u16` (128 KiB u16
@@ -4593,9 +4179,6 @@ fn drain_one_pending<W: std::io::Write>(
         pending.len(),
     );
     // Phase-timing: first real chunk dequeued for write — first-chunk-to-first-
-    // output latency boundary (the consumer's block-for-first-chunk wait ends
-    // here). mark_once → only the FIRST chunk records it.
-    crate::decompress::parallel::phase_timing::mark_once("first_output");
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
     let (idx, chunk, cache_key, handoff_bit) = match head {
@@ -4681,15 +4264,6 @@ fn drain_one_pending<W: std::io::Write>(
         if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_none() && payload_bytes > 0 {
             use crate::decompress::parallel::fd_vectored_write;
             let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
-            // AMD-residual R_OUTPUT region (iovec assembly + crc-combine + writev == rg write).
-            let _ro_span = crate::decompress::parallel::region_prof::Span::new(
-                &crate::decompress::parallel::region_prof::R_OUTPUT_CYC,
-                &crate::decompress::parallel::region_prof::R_OUTPUT_N,
-            );
-            if crate::decompress::parallel::region_prof::enabled() {
-                crate::decompress::parallel::region_prof::R_OUTPUT_BYTES
-                    .fetch_add(payload_bytes as u64, std::sync::atomic::Ordering::Relaxed);
-            }
             // Zero-copy gather: narrowed marker segments + clean payload
             // (vendor DecodedData.hpp:529 toIoVec). No memcpy — iovecs borrow
             // decode buffers until writev/vmsplice completes.

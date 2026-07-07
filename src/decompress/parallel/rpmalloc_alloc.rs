@@ -746,9 +746,6 @@ mod arena {
             if layout.size() == 0 {
                 return Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0));
             }
-            // memlife: component-agnostic allocator total (the closure anchor).
-            #[cfg(parallel_sm)]
-            crate::decompress::parallel::memlife::allocator_total(layout.size());
             let ptr = if layout.align() <= 16 {
                 unsafe { rpmalloc_sys::rpmalloc(layout.size()) }
             } else {

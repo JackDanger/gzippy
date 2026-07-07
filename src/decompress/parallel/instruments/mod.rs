@@ -10,34 +10,14 @@
 //!
 //! | instrument        | what it measures / perturbs                              |
 //! |-------------------|----------------------------------------------------------|
-//! | `decode_bypass`   | whole-chunk replay / sleep-decode bypass oracle          |
 //! | `removal_oracle`  | STORE-removal + symbol-stream NODECODE replay ceiling    |
-//! | `seed_windows`    | clean-only engine oracle via captured predecessor windows|
 //! | `slow_knob`       | env-gated slow-injection (causal-perturbation pre-gate)  |
 //! | `contig_prof`     | contig clean-loop rdtsc class profiler                   |
-//! | `perfect_overlap` | warm-chunk prefetch overlap stats                        |
-//! | `stall_residency` | STEP-0 stall/occupancy discriminator                     |
-//! | `memlife`         | allocation lifetime / component accounting               |
 //! | `trace_jsonl`     | per-event JSONL trace emitter (formerly `trace`)         |
 //! | `trace_timeline`  | span/timeline trace emitter (formerly `trace_v2`)        |
 
-#[cfg(parallel_sm)]
-pub mod decode_bypass;
-#[cfg(parallel_sm)]
-pub mod memlife;
-#[cfg(parallel_sm)]
-pub mod phase_timing;
-#[cfg(parallel_sm)]
-pub mod region_prof;
-#[cfg(parallel_sm)]
-pub mod seed_windows;
-#[cfg(parallel_sm)]
-pub mod stall_residency;
-
 pub mod contig_prof;
-pub mod perfect_overlap;
 pub mod removal_oracle;
-pub mod rss_inflate;
 pub mod slow_knob;
 pub mod trace_jsonl;
 pub mod trace_timeline;
