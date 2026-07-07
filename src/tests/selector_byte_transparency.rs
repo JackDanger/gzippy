@@ -246,6 +246,7 @@ mod tests {
             parallelization.max(1),
             4 * 1024 * 1024,
             &mut bytes_written,
+            false,
         );
         r.unwrap_or_else(|e| panic!("decode failed (t={t}, cfg={}): {e:?}", cfg.label));
         out
@@ -408,7 +409,8 @@ mod tests {
             deflate_len(&floor_gz)
         );
         let mut sink = Vec::with_capacity(floor_p.len());
-        crate::decompress::decompress_single_member(&floor_gz, &mut sink, 8).expect("floor decode");
+        crate::decompress::decompress_single_member(&floor_gz, &mut sink, 8, false)
+            .expect("floor decode");
         let after_floor = SMALL_OUTPUT_SERIAL_FLOOR_APPLIED.load(Ordering::Relaxed);
         assert!(
             after_floor >= before_floor + 2,
@@ -561,6 +563,7 @@ mod tests {
                 t,
                 4 * 1024 * 1024,
                 &mut bytes_written,
+                false,
             )
             .unwrap_or_else(|e| panic!("notch real-decode t={t} failed: {e:?}"));
             assert_eq!(
@@ -580,7 +583,7 @@ mod tests {
         let before_adj = ADJUSTED_CHUNK_SIZE_APPLIED.load(Ordering::Relaxed);
         // 12 MiB out at T=16: 4 MiB default × 2 × 16 ≫ fileSize ⇒ shrink fires.
         let mut sink2 = Vec::with_capacity(notch_p.len());
-        crate::decompress::decompress_single_member(&notch_gz, &mut sink2, 16)
+        crate::decompress::decompress_single_member(&notch_gz, &mut sink2, 16, false)
             .expect("chunk-adjust decode");
         let after_adj = ADJUSTED_CHUNK_SIZE_APPLIED.load(Ordering::Relaxed);
         assert_eq!(sink2, notch_ref, "chunk-adjust decode bytes wrong");

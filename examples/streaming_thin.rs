@@ -152,9 +152,10 @@ fn run_gzippy(_file: &[u8], _batch: usize) -> (f64, usize) {
 fn run_prod(file: &[u8]) -> (f64, usize) {
     let mut out = devnull();
     let t = Instant::now();
-    let n =
-        gzippy::decompress::parallel::single_member::decompress_parallel(file, &mut out, None, 1)
-            .expect("prod parallel-SM T=1 decode");
+    let n = gzippy::decompress::parallel::single_member::decompress_parallel(
+        file, &mut out, None, 1, false,
+    )
+    .expect("prod parallel-SM T=1 decode");
     out.flush().expect("flush");
     (t.elapsed().as_secs_f64() * 1e3, n as usize)
 }
@@ -171,7 +172,7 @@ fn run_prodt(file: &[u8], threads: usize) -> (f64, usize) {
     let mut out = devnull();
     let t = Instant::now();
     let n = gzippy::decompress::parallel::single_member::decompress_parallel(
-        file, &mut out, None, threads,
+        file, &mut out, None, threads, false,
     )
     .expect("prodt parallel-SM decode");
     out.flush().expect("flush");
@@ -845,8 +846,10 @@ fn verify(file: &[u8]) {
     // prod path byte-exact too.
     {
         let mut pv = Vec::new();
-        gzippy::decompress::parallel::single_member::decompress_parallel(file, &mut pv, None, 1)
-            .expect("prod decode");
+        gzippy::decompress::parallel::single_member::decompress_parallel(
+            file, &mut pv, None, 1, false,
+        )
+        .expect("prod decode");
         assert!(pv == ld, "prod: BYTE MISMATCH");
         println!(
             "prod parallel-SM T=1 byte-exact OK (fnv={:016x})",

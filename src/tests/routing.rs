@@ -148,7 +148,7 @@ mod tests {
         );
         for threads in [1usize, 2, 4] {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&mm, &mut out, threads)
+            crate::decompress::decompress_single_member(&mm, &mut out, threads, false)
                 .unwrap_or_else(|e| panic!("multi-member -p{threads} must decode, got {e:?}"));
             assert_eq!(out, original, "multi-member -p{threads} must be byte-exact");
         }
@@ -202,14 +202,13 @@ mod tests {
         );
         for threads in [1usize, 2, 4] {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&mm, &mut out, threads).unwrap_or_else(
-                |e| {
+            crate::decompress::decompress_single_member(&mm, &mut out, threads, false)
+                .unwrap_or_else(|e| {
                     panic!(
                         "mis-detected multi-member -p{threads} must resume-decode \
                          byte-exact, got error {e:?}"
                     )
-                },
-            );
+                });
             assert_eq!(
                 out, expected,
                 "mis-detected multi-member -p{threads}: WRONG BYTES \
@@ -305,14 +304,13 @@ mod tests {
 
         for threads in [1usize, 2, 4] {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&mm, &mut out, threads).unwrap_or_else(
-                |e| {
+            crate::decompress::decompress_single_member(&mm, &mut out, threads, false)
+                .unwrap_or_else(|e| {
                     panic!(
                         "dominant-first stored multi-member -p{threads} must decode \
                          byte-exact (P0 regression), got error {e:?}"
                     )
-                },
-            );
+                });
             assert_eq!(
                 out, want,
                 "dominant-first stored multi-member -p{threads}: WRONG BYTES / P0 regression"
@@ -336,7 +334,7 @@ mod tests {
         let len = mm.len();
         mm[len - 8] ^= 0xFF;
         let mut out = Vec::new();
-        let r = crate::decompress::decompress_multi_member_sequential(&mm, &mut out);
+        let r = crate::decompress::decompress_multi_member_sequential(&mm, &mut out, false);
         assert!(
             r.is_err(),
             "corrupt member CRC must be a terminal error, got Ok ({} bytes)",
@@ -369,7 +367,7 @@ mod tests {
         assert_eq!(decompress_reference(&mm), want, "reference oracle sanity");
 
         let mut out = Vec::new();
-        crate::decompress::decompress_multi_member_sequential(&mm, &mut out)
+        crate::decompress::decompress_multi_member_sequential(&mm, &mut out, false)
             .expect("empty-interior multi-member must decode");
         assert_eq!(out, want, "empty interior member: not byte-exact");
     }
@@ -401,7 +399,7 @@ mod tests {
 
         // Through the production single-member entry at T1.
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&mm, &mut out, 1)
+        crate::decompress::decompress_single_member(&mm, &mut out, 1, false)
             .expect("compressible multi-member T1 must decode");
         assert_eq!(
             out, original,
@@ -437,7 +435,7 @@ mod tests {
             // byte-exact is the only acceptable SUCCESS — proving the absent footer
             // special-case is genuinely safe under this routing.
             if crate::decompress::parallel::single_member::decompress_parallel(
-                &mm, &mut out, None, threads,
+                &mm, &mut out, None, threads, false,
             )
             .is_ok()
             {
@@ -537,6 +535,7 @@ mod tests {
         crate::decompress::decompress_multi_member_sequential(
             &oracle.multi_member_gz,
             &mut output_seq,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -584,7 +583,7 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(
             output, original,
             "decompress_single_member(T=4) output mismatch — production routing broken"
@@ -612,7 +611,7 @@ mod tests {
         ];
         for threads in [1usize, 4] {
             let mut out = Vec::new();
-            let r = crate::decompress::decompress_single_member(M8, &mut out, threads);
+            let r = crate::decompress::decompress_single_member(M8, &mut out, threads, false);
             assert!(
                 r.is_err(),
                 "malformed input must be rejected at T={threads} (got Ok, {} bytes)",
@@ -649,7 +648,7 @@ mod tests {
             68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
         ];
         let mut out = Vec::new();
-        let r = crate::decompress::decompress_multi_member_sequential(M8, &mut out);
+        let r = crate::decompress::decompress_multi_member_sequential(M8, &mut out, false);
         assert!(
             r.is_err(),
             "malformed multi-member input must be rejected (got Ok, {} bytes)",
@@ -689,7 +688,7 @@ mod tests {
             compressed.len()
         );
         let mut out = Vec::new();
-        let n = crate::decompress::decompress_multi_member_sequential(&compressed, &mut out)
+        let n = crate::decompress::decompress_multi_member_sequential(&compressed, &mut out, false)
             .expect("valid large multi-member must decode");
         assert_eq!(n as usize, original.len(), "decoded length mismatch");
         assert_eq!(out, original, "large multi-member output not byte-exact");
@@ -771,7 +770,7 @@ mod tests {
         );
         for threads in [2usize, 4, 8, 16] {
             let mut output = Vec::new();
-            crate::decompress::decompress_single_member(&compressed, &mut output, threads)
+            crate::decompress::decompress_single_member(&compressed, &mut output, threads, false)
                 .unwrap_or_else(|e| panic!("coalesce decode failed at T={threads}: {e:?}"));
             assert_eq!(
                 output.len(),
@@ -847,7 +846,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         for t in [1usize, 4, 8] {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&compressed, &mut out, t).unwrap();
+            crate::decompress::decompress_single_member(&compressed, &mut out, t, false).unwrap();
             assert_eq!(out, original, "stored-parallel output mismatch at T={t}");
         }
     }
@@ -881,7 +880,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         for t in [1usize, 4, 8] {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&compressed, &mut out, t).unwrap();
+            crate::decompress::decompress_single_member(&compressed, &mut out, t, false).unwrap();
             assert_eq!(
                 out, original,
                 "mixed-entropy output mismatch at T={t} — StoredParallel fallback broken"
@@ -926,7 +925,7 @@ mod tests {
         let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original);
         let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
@@ -982,6 +981,7 @@ mod tests {
             &mut output,
             None,
             1,
+            false,
         )
         .expect("clean T1 parallel-SM decode must succeed");
 
@@ -1035,7 +1035,7 @@ mod tests {
         let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(
             output, original,
             "output bytes wrong — but routing might also be broken; check the next assertion"
@@ -1105,7 +1105,7 @@ mod tests {
         let wrapper_before = crate::decompress::parallel::chunk_decode::SEEDED_WRAPPER_CHUNKS
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original, "byte-perfect output");
         let block_after =
             crate::decompress::parallel::chunk_decode::SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed);
@@ -1155,7 +1155,7 @@ mod tests {
         let wrapper_before =
             crate::decompress::parallel::chunk_decode::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original, "byte-perfect output");
         let wrapper_after =
             crate::decompress::parallel::chunk_decode::EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed);
@@ -1195,7 +1195,7 @@ mod tests {
         let before = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original);
         let after = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
             .load(Ordering::Relaxed);
@@ -1242,7 +1242,7 @@ mod tests {
         let before = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original);
         let after = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
             .load(Ordering::Relaxed);
@@ -1306,7 +1306,7 @@ mod tests {
             for _ in 0..3 {
                 let mut sink = Vec::with_capacity(original.len());
                 let t = std::time::Instant::now();
-                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads, false)
                     .expect("decompress");
                 let elapsed = t.elapsed();
                 assert_eq!(
@@ -1369,7 +1369,7 @@ mod tests {
             for _ in 0..3 {
                 let mut sink = Vec::new();
                 let t = std::time::Instant::now();
-                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads, false)
                     .expect("decompress");
                 best = best.min(t.elapsed());
                 assert!(!sink.is_empty(), "T={threads} produced empty output");
@@ -1413,7 +1413,7 @@ mod tests {
         let threads = 8usize.min(num_cpus::get().max(2));
         for run in 0..12 {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&compressed, &mut out, threads)
+            crate::decompress::decompress_single_member(&compressed, &mut out, threads, false)
                 .unwrap_or_else(|e| panic!("silesia CRC stress run {run} failed: {e:?}"));
             assert_eq!(
                 out.len(),
@@ -1440,7 +1440,7 @@ mod tests {
         let file = std::fs::File::open(path).expect("open silesia");
         let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap silesia") };
         let mut out = Vec::with_capacity(211_968_000);
-        crate::decompress::decompress_single_member(&mmap[..], &mut out, 8)
+        crate::decompress::decompress_single_member(&mmap[..], &mut out, 8, false)
             .expect("mmap parallel SM");
         assert_eq!(out.len(), 211_968_000);
         assert_eq!(crc32fast::hash(&out), 0xf9ac_f2fe);
@@ -1465,7 +1465,7 @@ mod tests {
         let drain = tempfile::NamedTempFile::new().expect("tempfile");
         let out_fd = Some(drain.as_raw_fd());
         let nbytes =
-            crate::decompress::decompress_single_member_fd(&mmap[..], &mut sink, out_fd, 8)
+            crate::decompress::decompress_single_member_fd(&mmap[..], &mut sink, out_fd, 8, false)
                 .expect("mmap+fd parallel SM");
         assert_eq!(nbytes, 211_968_000);
         let got = std::fs::read(drain.path()).expect("read drain file");
@@ -1516,7 +1516,7 @@ mod tests {
             for _ in 0..3 {
                 let mut sink = Vec::with_capacity(original.len());
                 let t = std::time::Instant::now();
-                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads, false)
                     .expect("decompress");
                 best = best.min(t.elapsed());
                 assert_eq!(sink.len(), original.len());
@@ -1557,7 +1557,7 @@ mod tests {
         let before = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original);
         let after = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
             .load(Ordering::Relaxed);
@@ -1660,7 +1660,7 @@ mod tests {
         let before_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(output, original, "byte-perfect output");
         let after_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
@@ -1704,7 +1704,7 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4, false).unwrap();
         assert_eq!(
             output, original,
             "byte-perfect roundtrip on CI-shaped fixture"
@@ -1786,7 +1786,8 @@ mod tests {
             let threads = num_cpus::get().clamp(9, 16);
 
             let mut output = Vec::with_capacity(original.len());
-            crate::decompress::decompress_single_member(&fixture, &mut output, threads).unwrap();
+            crate::decompress::decompress_single_member(&fixture, &mut output, threads, false)
+                .unwrap();
 
             assert_eq!(
                 output.len(),

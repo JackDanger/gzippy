@@ -1682,7 +1682,7 @@ impl ChunkData {
 /// returning to the pool on its own drop. Cross-thread safe: pool
 /// is a `static Mutex<Vec<...>>`.
 /// Live / peak simultaneously-live ChunkData (Step A instrumentation).
-/// Read via GZIPPY_VERBOSE. MAX_LIVE_CHUNKS = peak in-flight depth, which
+/// Read via `--verbose`. MAX_LIVE_CHUNKS = peak in-flight depth, which
 /// determines the page-fault working set and sizes a bounded-pool fix.
 pub static LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1691,7 +1691,7 @@ pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// actually ran the 32 KiB marker-engine scan (window_sparsity=true path, not
 /// early-returned). window_sparsity is always false (keepIndex=false faithful
 /// port, the shipped default — the old always-on kill-switch was removed), so
-/// this stays 0. Read via GZIPPY_VERBOSE.
+/// this stays 0. Read via `--verbose`.
 pub static SPARSITY_DECODE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

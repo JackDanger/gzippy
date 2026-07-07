@@ -55,7 +55,7 @@ mod tests {
 
     fn decode(gz_bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(gz_bytes, &mut out, 1)
+        crate::decompress::decompress_single_member(gz_bytes, &mut out, 1, false)
             .expect("decompress_single_member(T=1) failed");
         out
     }
