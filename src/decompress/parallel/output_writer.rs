@@ -5,7 +5,7 @@
 //! At high T the per-thread engine work parallelizes ~Tx but the serial
 //! 211 MiB output materialization (writev into the page cache) on the ONE
 //! in-order consumer thread does NOT — it is an Amdahl serial tail. A
-//! validated removal oracle (GZIPPY_SKIP_WRITEV_SYSCALL) showed it is the
+//! validated removal-oracle measurement showed it is the
 //! single largest T8 binder: removing it moved silesia T8 from ~0.79x to
 //! ~0.98x rapidgzip. The instant-feed discriminator proved the cost is
 //! engine-INDEPENDENT (it did not shrink when the engine sped up 38ms), i.e.

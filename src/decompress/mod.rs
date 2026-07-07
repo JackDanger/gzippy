@@ -446,15 +446,7 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
             decompress_multi_member_sequential(data, writer)
         }
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
-            let r = decompress_single_member_for(path, data, writer, out_fd, num_threads);
-            if crate::utils::debug_enabled() {
-                eprintln!(
-                    "[gzippy] inject_fired={} (route-B sub-region injector non-inert proof)",
-                    crate::decompress::inflate::consume_first_decode::INJECT_FIRED
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                );
-            }
-            r
+            decompress_single_member_for(path, data, writer, out_fd, num_threads)
         }
     }
 }
@@ -536,15 +528,7 @@ pub(crate) fn decompress_single_member<W: Write>(
             decompress_multi_member_sequential(data, writer)
         }
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
-            let r = decompress_single_member_for(path, data, writer, None, num_threads);
-            if crate::utils::debug_enabled() {
-                eprintln!(
-                    "[gzippy] inject_fired={} (route-B sub-region injector non-inert proof)",
-                    crate::decompress::inflate::consume_first_decode::INJECT_FIRED
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                );
-            }
-            r
+            decompress_single_member_for(path, data, writer, None, num_threads)
         }
     }
 }

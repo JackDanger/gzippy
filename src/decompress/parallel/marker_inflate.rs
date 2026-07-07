@@ -1940,63 +1940,14 @@ impl Block {
         // the guarded call is identical to the unconditional one.
         let track_backref = self.track_backreferences;
 
-        // Causal-perturbation slow-injection knob. Snapshot the resolved
-        // per-decode-event spin count + kind ONCE here, before the loop, so the
-        // per-iteration cost when OFF is a single hoistable branch on a local
-        // `== 0`. There are TWO independent knobs, selected by the const generic:
-        //   * `<false>` clean path  → `GZIPPY_SLOW_MODE`        (spin_iters)
-        //   * `<true>`  u16 marker  → `GZIPPY_SLOW_MARKER_MODE` (marker_spin_iters)
-        // Each const-folds to 0 on the OTHER specialization, so the clean knob is
-        // compiled away on the marker path and vice-versa — a clean-path slow-down
-        // cannot leak into the u16-path measurement, and the u16-path knob fires at
-        // the careful-loop inject site below (the `<true>` path always uses the
-        // careful loop; the VAR_V fast loop is `!CONTAINS_MARKERS`-gated).
-        // Byte-transparent (DUAL-SHA gate). See `slow_knob.rs`.
-        let slow_spin: u64 = if CONTAINS_MARKERS {
-            super::slow_knob::marker_spin_iters()
-        } else {
-            super::slow_knob::spin_iters()
-        };
-        // Gate the sleep-control kind on THIS specialization actually injecting
-        // (`slow_spin != 0`). `GZIPPY_SLOW_KIND` is global, so without this gate a
-        // MARKER+SLEEP run would set `slow_yield = true` on the `<false>` clean
-        // instantiation too and knock it off the VAR_V fast loop (the `:1484`
-        // gate is `... && !slow_yield`) even though the clean injection is zero —
-        // contaminating the clean wall during a marker-only measurement (advisor
-        // D2). With the gate, the control only affects the path it injects into.
-        let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
-
-        // ── MFAST PROBE KNOBS (probe/mfast-phase0) ────────────────────────────
-        // Snapshot once per function call (OnceLock, cost ≈ one predicted branch
-        // each). Const-folded to their OFF defaults on the clean path because:
-        //   `mfast_disabled` = `CONTAINS_MARKERS && ...` → `false && ...` = false
-        //   `mfast_spin`     = `if false { ... } else { 0 }` = 0
-        //   `mfast_yield`    = `localize_yield_kind(0)` = false
-        // So these are zero-cost on the clean specialization (<false>) and only
-        // active on the marker specialization (<true>).
-        //
-        // GZIPPY_MFAST_DISABLE=1:    mfast_disabled=true ⇒ skip `'mfast` entry.
-        // GZIPPY_SLOW_MFAST_MODE=N:  mfast_spin>0 ⇒ inject per iter INSIDE `'mfast`.
-        //   Unlike GZIPPY_SLOW_MARKER_MODE (which sets slow_spin != 0 and DISABLES
-        //   the fast loop entry), this knob does NOT gate entry — it fires inside the
-        //   loop body, after the guard. GZIPPY_SLOW_KIND=sleep ⇒ frequency-neutral.
-        let mfast_disabled: bool = CONTAINS_MARKERS && super::slow_knob::mfast_disabled();
-        let mfast_spin: u64 = if CONTAINS_MARKERS {
-            super::slow_knob::mfast_spin_iters()
-        } else {
-            0
-        };
-        let mfast_yield: bool = super::slow_knob::localize_yield_kind(mfast_spin);
-
         // ── DISPATCH: clean fast loop (Loop A) → marker fast loop (Loop B) →
         //              careful per-symbol tail (Loop C). ──────────────────────
         // The fast loops (`decode_clean_fast_loop` / `decode_marker_fast_loop`)
         // are the igzip-style speculative multi-cached loops; whichever one
         // matches this specialization runs first and, on `None`, falls through to
         // `decode_careful_tail` with `pos`/`emitted`/`distance_marker` live. Each
-        // const-folds to the right branch per `CONTAINS_MARKERS`. The fast loops
-        // are bypassed when the slow-knob is armed (measurement-only).
-        if !CONTAINS_MARKERS && slow_spin == 0 && !slow_yield {
+        // const-folds to the right branch per `CONTAINS_MARKERS`.
+        if !CONTAINS_MARKERS {
             // Loop A: mirror of vendor's clean-window
             // `readInternalCompressedMultiCached<false>` (gzip/deflate.hpp:1589-
             // 1666). `Some(r)` ⇒ the whole decode finished (EOB / error) —
@@ -2015,12 +1966,9 @@ impl Block {
             }
         }
 
-        // MFAST_DISABLE gate (`!mfast_disabled`): when set, fall through to the
-        // careful tail for 100% of marker decode (the mfast-phase0 discriminator
-        // arm — byte-identical output, different code path). The detail of the
-        // marker fast loop (the three u16 deltas vs the clean loop) lives in the
-        // `decode_marker_fast_loop` doc.
-        if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield && !mfast_disabled {
+        // The detail of the marker fast loop (the three u16 deltas vs the clean
+        // loop) lives in the `decode_marker_fast_loop` doc.
+        if CONTAINS_MARKERS {
             // Loop B extracted into `decode_marker_fast_loop` (mirror of vendor's
             // marker-window `readInternalCompressedMultiCached<true>`,
             // gzip/deflate.hpp:1585-1666). Same `Some`/`None` contract as the
@@ -2034,8 +1982,6 @@ impl Block {
                 n_max_to_decode,
                 drained,
                 track_backref,
-                mfast_spin,
-                mfast_yield,
             ) {
                 return r;
             }
@@ -2059,8 +2005,6 @@ impl Block {
             n_max_to_decode,
             drained,
             track_backref,
-            slow_spin,
-            slow_yield,
         )
     }
 
@@ -2096,8 +2040,6 @@ impl Block {
         n_max_to_decode: usize,
         drained: usize,
         track_backref: bool,
-        mfast_spin: u64,
-        mfast_yield: bool,
     ) -> Option<Result<usize, BlockError>> {
         const MAX_RUN_LENGTH: usize = 258;
         const MAX_LIT_LEN_SYM: u32 = 512;
@@ -2205,8 +2147,6 @@ impl Block {
                     if !(out_ok && in_ok) {
                         break 'mfast;
                     }
-                    // SLOW_MFAST_MODE: localized per-event inject WITHOUT gating entry.
-                    super::slow_knob::inject_localize(mfast_spin, mfast_yield);
                     let sym0 = pre.symbol;
                     let sym_count0 = pre.sym_count;
                     let bit_count0 = pre.bit_count;
@@ -2793,8 +2733,6 @@ impl Block {
         n_max_to_decode: usize,
         drained: usize,
         track_backref: bool,
-        slow_spin: u64,
-        slow_yield: bool,
     ) -> Result<usize, BlockError> {
         const MAX_LIT_LEN_SYM: u32 = 512;
         let mut pos = *pos_io;
@@ -2809,18 +2747,6 @@ impl Block {
             }};
         }
         while emitted < n_max_to_decode {
-            // One slow-knob injection per decode event (this outer iteration =
-            // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
-            // Const-generic split: the u16 marker specialization uses
-            // `marker_inject` (whose site-validity counter is the MARKER-specific
-            // GZIPPY_SLOW_MARKER_HITS), the clean `<false>` specialization keeps
-            // the original `inject` (GZIPPY_SLOW_HITS). The branch const-folds to a
-            // single call per specialization, so this is perf-transparent.
-            if CONTAINS_MARKERS {
-                super::slow_knob::marker_inject(slow_spin, slow_yield);
-            } else {
-                super::slow_knob::inject(slow_spin, slow_yield);
-            }
             // Single refill at the top of the outer iteration. After
             // `bits.refill()` returns, `bits.available()` is in
             // [56, 63] (libdeflate-style refill rounds DOWN to a
@@ -3138,26 +3064,6 @@ impl Block {
             self.ring.is_clean(),
             "decode_clean_into_contig requires clean (window-primed) mode"
         );
-        // ── REMOVAL ORACLES (measurement-only; see removal_oracle.rs) ───────
-        // NODECODE replay: replace THIS call's Huffman decode + bit reads +
-        // per-block LUT builds with a recorded symbol-stream replay whose
-        // stores go through the production kernels (byte-correct on a hit).
-        // A miss or room-bail falls through to the real decode below. OFF is
-        // one OnceLock-bool branch at function entry.
-        if super::removal_oracle::replay_enabled() {
-            if let Some(n) = self.oracle_nodecode_replay(bits, base, cap, pos, n_max_to_decode) {
-                return Ok(n);
-            }
-        }
-        // STORE-removal knob snapshot (one predictable branch per store site
-        // when OFF) + symbol-stream recorder (None unless GZIPPY_ORACLE_RECORD).
-        let oracle_nostore = super::removal_oracle::nostore_enabled();
-        let mut orec = super::removal_oracle::record_begin(
-            bits.data,
-            bits.bit_position(),
-            *pos,
-            n_max_to_decode,
-        );
         // LAZY two-level LUT build (engine B). Validate the compression type
         // here, but DEFER `build_huffman_luts_for_block` (which builds the
         // engine-B `lut_litlen` table) until just before the engine-B fallback
@@ -3227,37 +3133,9 @@ impl Block {
 
         let mut emitted: usize = 0;
 
-        // Causal-perturbation slow-injection (measurement-only, byte-transparent;
-        // OFF==identity, DUAL-SHA gated). This is the PRODUCTION gzippy-native FOLD
-        // clean loop (post-flip contig tail) — the prior `GZIPPY_SLOW_MODE` knob
-        // lived only on the ring-based `read_internal_compressed_specialized::<false>`
-        // path and did NOT perturb this contig loop, so a clean-path perturbation
-        // could not test where the residual native_fold→ocl_cf gap actually is.
-        // Wire the SAME clean knob (`GZIPPY_SLOW_MODE` / `GZIPPY_SLOW_KIND`) here so
-        // slowing the contig symbol-decode by a known factor and watching the
-        // interleaved T8 wall answers it causally. Snapshot once before the loop.
-        let slow_spin: u64 = super::slow_knob::spin_iters();
-        let slow_yield: bool = slow_spin != 0 && super::slow_knob::yield_kind();
-        // DECODE-COMPUTE vs STORE-BANDWIDTH localization knobs (measurement-only,
-        // byte-transparent; see slow_knob.rs). These do NOT force the careful loop
-        // (the fast-loop gate stays `slow_spin == 0` only) so the perturbation
-        // lands on the PRODUCTION fast path. Snapshot once before the loop.
-        let dec_spin: u64 = super::slow_knob::decode_spin_iters();
-        let dec_yield: bool = super::slow_knob::localize_yield_kind(dec_spin);
-        let st_spin: u64 = super::slow_knob::store_spin_iters();
-        let st_yield: bool = super::slow_knob::localize_yield_kind(st_spin);
         macro_rules! commit {
             ($result:expr) => {{
                 let __r: Result<usize, BlockError> = $result;
-                super::removal_oracle::record_end(
-                    orec.take(),
-                    __r.is_ok(),
-                    bits.pos,
-                    bits.bitbuf,
-                    bits.bitsleft,
-                    emitted,
-                    self.at_end_of_block,
-                );
                 self.decoded_bytes += emitted;
                 return __r;
             }};
@@ -3291,12 +3169,6 @@ impl Block {
                 use_baseline_kernel, FlatFastloopExit, FLAT_CONTIG_BYTES, FLAT_CONTIG_CALLS,
             };
             let flat_eligible = flat_clean_enabled()
-                && slow_spin == 0
-                && !slow_yield
-                && dec_spin == 0
-                && st_spin == 0
-                && !oracle_nostore
-                && orec.is_none()
                 && !self.track_backreferences
                 && self.dist_valid
                 && local_cap > 0;
@@ -3457,10 +3329,6 @@ impl Block {
         // bits and the careful loop below re-decodes from the same position — never
         // desyncs, no state carried.
         //
-        // Gated `slow_spin == 0 && !slow_yield` so the causal-perturbation knob
-        // (GZIPPY_SLOW_MODE) forces the careful loop and its per-event inject still
-        // fires — identical gating to the ring fast loop (:1501).
-        //
         // Headroom: at any literal `*pos <= out_room - 1 = cap - (MAX_RUN_LENGTH+8)
         // - 1 = cap - 267`, so the speculative 8-byte store touches at most
         // `*pos + 8 <= cap - 259 < cap` — never OOB. The back-ref word-copy headroom
@@ -3479,7 +3347,7 @@ impl Block {
         // under the iteration-top `emitted + FAST_OUT_SLOP < local_cap` guard
         // (clippy int_plus_one shape of `1 + LIT_CHAIN_MAX <= FAST_OUT_SLOP`).
         const _: () = assert!(LIT_CHAIN_MAX < FAST_OUT_SLOP);
-        if slow_spin == 0 && !slow_yield {
+        {
             let in_end = bits.data.len();
             // P3.1 (T1 recovery, Lever-B1 class): mirror the bit-reader into a
             // STACK-LOCAL `Bits` for the duration of the fast loop and write it
@@ -3547,13 +3415,13 @@ impl Block {
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
             let mut asm_on: bool = super::asm_kernel::enabled()
                 && super::asm_kernel::dispatch_allowed(
-                    // Contig cycle-profiler removed: profiling is never active,
-                    // so it never forces the pure-Rust loop.
+                    // Measurement knobs removed: these are always the OFF values,
+                    // so they never force the pure-Rust loop.
                     false,
-                    oracle_nostore,
-                    orec.is_some(),
-                    dec_spin,
-                    st_spin,
+                    false,
+                    false,
+                    0,
+                    0,
                     track_backrefs,
                     local_cap,
                     FAST_OUT_SLOP,
@@ -3572,15 +3440,6 @@ impl Block {
                 ($result:expr) => {{
                     sync_local_bits!();
                     let __r: Result<usize, BlockError> = $result;
-                    super::removal_oracle::record_end(
-                        orec.take(),
-                        __r.is_ok(),
-                        bits.pos,
-                        bits.bitbuf,
-                        bits.bitsleft,
-                        emitted,
-                        self.at_end_of_block,
-                    );
                     self.decoded_bytes += emitted;
                     return __r;
                 }};
@@ -3589,7 +3448,6 @@ impl Block {
             // P3.5 c4: immediately after a refill — backstop-free decode
             // (byte-exact proof on `decode_prefilled`).
             let mut pre = self.asm.lut_litlen.decode_prefilled(&lb);
-            super::slow_knob::inject_localize(dec_spin, dec_yield);
             // ── TWO LOOP VARIANTS (flip-precondition 4, campaign §9 gate) ──
             // The fast loop is instantiated twice from one macro source:
             // the `false` instantiation const-folds the asm dispatch away
@@ -3701,14 +3559,8 @@ impl Block {
                 if sym_count0 == 1 {
                     let code = (sym0 & 0xFFFF) as u16;
                     if code <= 255 {
-                        // ORACLE NOSTORE: elide the store, keep the accounting.
-                        if !oracle_nostore {
-                            unsafe {
-                                base.add(*pos).write(code as u8);
-                            }
-                        }
-                        if let Some(r) = orec.as_mut() {
-                            r.lit(code as u8);
+                        unsafe {
+                            base.add(*pos).write(code as u8);
                         }
                         *pos += 1;
                         emitted += 1;
@@ -3759,13 +3611,8 @@ impl Block {
                                 // FAST_OUT_SLOP < local_cap` + the compile
                                 // assert `1+LIT_CHAIN_MAX <= FAST_OUT_SLOP`
                                 // keep every chained write < out_room < cap.
-                                if !oracle_nostore {
-                                    unsafe {
-                                        base.add(*pos).write(ncode as u8);
-                                    }
-                                }
-                                if let Some(r) = orec.as_mut() {
-                                    r.lit(ncode as u8);
+                                unsafe {
+                                    base.add(*pos).write(ncode as u8);
                                 }
                                 *pos += 1;
                                 emitted += 1;
@@ -3775,7 +3622,6 @@ impl Block {
                             pre = nxt; // carry un-consumed
                             break;
                         }
-                        super::slow_knob::inject_localize(st_spin, st_yield);
                         // Restore the ≥48-bit iteration-top invariant for the
                         // carried packet (mirrors the wrapper's carry-site
                         // refills, resumable.rs:1345-1348, and the bottom
@@ -3783,7 +3629,6 @@ impl Block {
                         if (lb.bitsleft as u8) < 48 {
                             lb.refill();
                         }
-                        super::slow_knob::inject_localize(dec_spin, dec_yield);
                         continue 'fast;
                     } else {
                         trailing_code = code;
@@ -3794,12 +3639,9 @@ impl Block {
                         }
                     }
                 } else {
-                    // ORACLE NOSTORE: elide the packed store, keep the accounting.
-                    if !oracle_nostore {
-                        unsafe {
-                            let packed = (sym0 & 0x00FF_FFFF) as u64;
-                            (base.add(*pos) as *mut u64).write_unaligned(packed);
-                        }
+                    unsafe {
+                        let packed = (sym0 & 0x00FF_FFFF) as u64;
+                        (base.add(*pos) as *mut u64).write_unaligned(packed);
                     }
                     let mut s = sym0;
                     let mut remaining = sym_count0;
@@ -3821,12 +3663,8 @@ impl Block {
                         have_trailing = true;
                         break;
                     }
-                    if let Some(r) = orec.as_mut() {
-                        r.lits_from_packed(sym0, lit_prefix);
-                    }
                     *pos += lit_prefix;
                     emitted += lit_prefix;
-                    super::slow_knob::inject_localize(st_spin, st_yield);
                 }
 
                 if have_trailing {
@@ -3870,7 +3708,6 @@ impl Block {
                             }
                             let dist_extra_saved = lb.bitbuf;
                             lb.consume_entry(dist_raw);
-                            super::slow_knob::inject_localize(dec_spin, dec_yield);
                             dist_entry.decode_distance(dist_extra_saved) as usize
                         } else {
                             // Fallback: vendor-faithful dist_hc walk (kept
@@ -3882,7 +3719,6 @@ impl Block {
                                 Some(d) => d,
                                 None => commit_fast!(Err(BlockError::InvalidHuffmanCode)),
                             };
-                            super::slow_knob::inject_localize(dec_spin, dec_yield);
                             if dsym as usize >= DISTANCE_BASE.len() {
                                 commit_fast!(Err(BlockError::InvalidHuffmanCode));
                             }
@@ -3933,22 +3769,11 @@ impl Block {
                         // P3.5 c4: threshold-refill site — backstop-free
                         // decode (byte-exact proof on `decode_prefilled`).
                         pre = self.asm.lut_litlen.decode_prefilled(&lb);
-                        super::slow_knob::inject_localize(dec_spin, dec_yield);
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                         // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
-                        // ORACLE NOSTORE: elide the copy (loads+stores), keep
-                        // the position accounting identical.
-                        if oracle_nostore {
-                            *pos += length;
-                        } else {
-                            unsafe {
-                                emit_backref_contig(base, pos, distance, length);
-                            }
+                        unsafe {
+                            emit_backref_contig(base, pos, distance, length);
                         }
-                        if let Some(r) = orec.as_mut() {
-                            r.backref(length, distance);
-                        }
-                        super::slow_knob::inject_localize(st_spin, st_yield);
                         if track_backrefs {
                             // Inlined `record_backreference_for_sparsity`
                             // body (field-disjoint from the `dist_tbl`
@@ -3986,7 +3811,6 @@ impl Block {
                 // P3.5 c4: threshold-refill site — backstop-free decode
                 // (byte-exact proof on `decode_prefilled`).
                 pre = self.asm.lut_litlen.decode_prefilled(&lb);
-                super::slow_knob::inject_localize(dec_spin, dec_yield);
             }
                 };
             }
@@ -4009,10 +3833,8 @@ impl Block {
         }
 
         while emitted < local_cap {
-            super::slow_knob::inject(slow_spin, slow_yield);
             bits.refill();
             let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
-            super::slow_knob::inject_localize(dec_spin, dec_yield);
             if bit_count == 0 {
                 commit!(Err(BlockError::InvalidHuffmanCode));
             }
@@ -4024,18 +3846,11 @@ impl Block {
                 let code = (sym & 0xFFFF) as u16;
                 if code <= 255 || sym_count > 1 {
                     // SAFETY: `*pos < out_room <= cap`; `base` valid for [0, cap).
-                    // ORACLE NOSTORE: elide the store, keep the accounting.
-                    if !oracle_nostore {
-                        unsafe {
-                            base.add(*pos).write((code & 0xFF) as u8);
-                        }
-                    }
-                    if let Some(r) = orec.as_mut() {
-                        r.lit((code & 0xFF) as u8);
+                    unsafe {
+                        base.add(*pos).write((code & 0xFF) as u8);
                     }
                     *pos += 1;
                     emitted += 1;
-                    super::slow_knob::inject_localize(st_spin, st_yield);
                     sym_count -= 1;
                     if sym_count == 0 {
                         break;
@@ -4079,14 +3894,12 @@ impl Block {
                     }
                     let dist_extra_saved = bits.bitbuf;
                     bits.consume_entry(dist_raw);
-                    super::slow_knob::inject_localize(dec_spin, dec_yield);
                     dist_entry.decode_distance(dist_extra_saved) as usize
                 } else {
                     let dsym = match self.dist_hc.decode(bits) {
                         Some(d) => d,
                         None => commit!(Err(BlockError::InvalidHuffmanCode)),
                     };
-                    super::slow_knob::inject_localize(dec_spin, dec_yield);
                     if dsym as usize >= DISTANCE_BASE.len() {
                         commit!(Err(BlockError::InvalidHuffmanCode));
                     }
@@ -4120,141 +3933,16 @@ impl Block {
                 }
                 // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
                 // (out_room reserved MAX_RUN_LENGTH + 8 headroom).
-                // ORACLE NOSTORE: elide the copy, keep the position accounting.
-                if oracle_nostore {
-                    *pos += length;
-                } else {
-                    unsafe {
-                        emit_backref_contig(base, pos, distance, length);
-                    }
+                unsafe {
+                    emit_backref_contig(base, pos, distance, length);
                 }
-                if let Some(r) = orec.as_mut() {
-                    r.backref(length, distance);
-                }
-                super::slow_knob::inject_localize(st_spin, st_yield);
                 self.record_backreference_for_sparsity(distance, length, emitted);
                 emitted += length;
                 break;
             }
         }
-        super::removal_oracle::record_end(
-            orec.take(),
-            true,
-            bits.pos,
-            bits.bitbuf,
-            bits.bitsleft,
-            emitted,
-            self.at_end_of_block,
-        );
         self.decoded_bytes += emitted;
         Ok(emitted)
-    }
-
-    /// REMOVAL-ORACLE NODECODE replay of ONE `decode_clean_into_contig` call
-    /// (measurement-only; see `removal_oracle.rs`). Performs the recorded
-    /// symbol stream's STORES — single-byte literal writes + the production
-    /// [`emit_backref_contig`] kernel — WITHOUT Huffman decode, bit reads, or
-    /// LUT builds, then restores the recorded bit-cursor end state and the
-    /// block/byte accounting so the caller's block state machine (header
-    /// parses, EOB transitions, CRC, commit) runs genuinely. Byte-correct on a
-    /// hit (real literals, real copy positions). Returns `None` on a key miss
-    /// or a room-guard bail (this run's `cap` smaller than the recorded run's
-    /// envelope) — the caller then runs the REAL decode; nothing observable
-    /// has been mutated on the bail path (any bytes already stored before a
-    /// bail are impossible: the room precheck runs before any store).
-    #[cfg(any(
-        all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ),
-        pure_inflate_decode
-    ))]
-    /// # Safety
-    /// Same `base`/`cap`/`*pos` contract as [`Self::decode_clean_into_contig`]
-    /// (it replays recorded stores through the identical kernels). Marked
-    /// `unsafe` for the raw `base` deref (clippy `not_unsafe_ptr_arg_deref`).
-    unsafe fn oracle_nodecode_replay(
-        &mut self,
-        bits: &mut Bits,
-        base: *mut u8,
-        cap: usize,
-        pos: &mut usize,
-        n_max_to_decode: usize,
-    ) -> Option<usize> {
-        use super::removal_oracle as ro;
-        let key = ro::call_key(bits.data, bits.bit_position(), *pos, n_max_to_decode);
-        let rec = ro::replay_lookup(&key)?;
-        // ROOM PRECHECK (no state mutation): the replayed stores need the same
-        // envelope the production loop proves — every backref starts at
-        // `cur + 266 <= cap` (one max back-ref + word overshoot, the out_room
-        // reservation) and every literal write stays `< cap` (+8 slack mirrors
-        // FAST_OUT_SLOP). Also re-derive the recorded totals so a corrupt or
-        // colliding record can never drive an out-of-bounds store.
-        {
-            let mut cur = *pos;
-            let mut lit_total = 0usize;
-            for op in &rec.ops {
-                let run = op.lit_run();
-                if cur + run + 8 > cap {
-                    ro::count_replay_bail();
-                    return None;
-                }
-                cur += run;
-                lit_total += run;
-                let len = op.match_len();
-                if len > 0 {
-                    let dist = op.dist();
-                    if cur + 266 > cap || dist == 0 || dist > cur {
-                        ro::count_replay_bail();
-                        return None;
-                    }
-                    cur += len;
-                }
-            }
-            if cur != *pos + rec.emitted as usize || lit_total != rec.lits.len() {
-                ro::count_replay_bail();
-                return None;
-            }
-        }
-        // REPLAY STORES: per-symbol-faithful — literals one byte at a time
-        // (the dominant lit1/chain production shape; byte count identical to
-        // the litpack packed-store arm), back-refs via the exact production
-        // copy kernel. Sparsity bookkeeping recomputed with the production
-        // formula (`record_backreference_for_sparsity` checks the flag).
-        let entry_pos = *pos;
-        let mut lit_off = 0usize;
-        for op in &rec.ops {
-            let run = op.lit_run();
-            for i in 0..run {
-                // SAFETY: precheck proved every literal write index `< cap`.
-                unsafe {
-                    base.add(*pos).write(rec.lits[lit_off + i]);
-                }
-                *pos += 1;
-            }
-            lit_off += run;
-            let len = op.match_len();
-            if len > 0 {
-                let dist = op.dist();
-                // SAFETY: precheck proved `dist <= *pos` and
-                // `*pos + ((len+7)&!7) <= *pos + 264 <= cap` at this point.
-                unsafe {
-                    emit_backref_contig(base, pos, dist, len);
-                }
-                let emitted_before = *pos - len - entry_pos;
-                self.record_backreference_for_sparsity(dist, len, emitted_before);
-            }
-        }
-        // Restore the recorded end state: bit cursor exactly where the real
-        // decode left it (header parses continue genuinely), EOB flag, and the
-        // decoded-byte accounting the commit paths would have applied.
-        bits.pos = rec.end_pos as usize;
-        bits.bitbuf = rec.end_bitbuf;
-        bits.bitsleft = rec.end_bitsleft;
-        self.at_end_of_block = rec.at_eob;
-        self.decoded_bytes += rec.emitted as usize;
-        Some(rec.emitted as usize)
     }
 
     /// Copy-free-to-final STORED (uncompressed) clean block: drain the
