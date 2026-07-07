@@ -164,14 +164,23 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     }
     if is_likely_multi_member(data) {
         // Plain multi-member streams keep the member-per-worker split
-        // ([`MultiMemberPar`]) at T>1 / sequential at T1. NOTE (2026-07-05):
-        // routing dominant/few-member distributions to the within-member
-        // parallel chunked path was MEASURED to REGRESS on M1 (the member-walk
-        // spins a full pipeline per member and oversubscribes threads at high T;
-        // few-large T8 156ms chunked vs 45ms member-per-worker). The located
-        // dominant-member plateau needs the rapidgzip-faithful whole-file
-        // block-finder cross-member port (one pool, one chunk grid spanning
-        // members), not the member-walk shortcut — see the gate-phase plan.
+        // ([`MultiMemberPar`]) at T>1 / sequential at T1.
+        //
+        // STAGE-2 STATUS (design §1.2 / [R1-#8]): the routing predicate
+        // [`crate::decompress::bgzf::fast_path_ok`] (greedy-LPT/dominance sim
+        // over member sizes) is BUILT AND UNIT-TESTED, but it is NOT wired to
+        // flip production routing yet. Routing dominant/few-member distributions
+        // to today's [`MultiMemberChunked`] body — the per-member MEMBER-WALK —
+        // was MEASURED to REGRESS on M1 (per-member pipeline spinup + thread
+        // oversubscription at high T; few-large T8 156ms chunked vs 45ms
+        // member-per-worker), and that revert is locked by
+        // `tests::multi_member_chunked` (uneven/balanced/few_large ⇒
+        // MultiMemberPar). The flip is a STAGE-2b action: it becomes correct
+        // and non-regressing only once `MultiMemberChunked` IS the
+        // rapidgzip-faithful whole-file block-finder cross-member GRID (one
+        // pool, one chunk grid spanning members), at which point
+        // `fast_path_ok` selects it for dominant streams, gated box-side
+        // (OQ-1/OQ-2, stage 3). Until then the predicate stays dead-code-ready.
         return if num_threads > 1 {
             DecodePath::MultiMemberPar
         } else {
@@ -369,6 +378,9 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
         return Ok(out);
     }
     if num_threads > 1 && is_likely_multi_member(data) {
+        // Plain multi-member keeps the member-per-worker fast path (STAGE-2
+        // status: the `fast_path_ok` flip to chunked is deferred to stage-2b —
+        // see `classify_gzip`).
         match crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads) {
             Ok(v) => return Ok(v),
             // scan_member_boundaries_fast can fail on random/stored-block data where

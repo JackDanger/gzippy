@@ -2102,6 +2102,223 @@ impl Drop for ChunkData {
     }
 }
 
+// ── STAGE-2 consumer per-member CRC32 + ISIZE verifier (§4) ───────────────
+//
+// Port of rapidgzip's serial in-order consumer CRC pass
+// (`ParallelGzipReader::processCRC32`, ParallelGzipReader.hpp:1454-1502) plus
+// the LABELED STRENGTHENING per-member ISIZE running accumulator ([R2-#2],
+// design §4). Stage 1 gave each `ChunkData` the segmented `crc32s` /
+// `segment_sizes` / `footers` machinery; this is the consumer that walks a
+// sequence of chunks IN DECODE ORDER and verifies EVERY member's CRC32 and
+// ISIZE (mod 2^32) as the members' bytes stream past — a member may span any
+// number of chunks (the running calculators carry across `feed` calls), and a
+// single chunk may close several members (multiple footers).
+
+/// Terminal per-member verification failure. Any variant means corrupt output
+/// bytes reached (or would reach) the writer for that member ⇒ the caller must
+/// surface a terminal `Err` with partial output already streamed, exactly like
+/// the single-member CRC/ISIZE trailer check (`sm_driver.rs:318-331`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberVerifyError {
+    /// Conservation gate: `crc32s.len() != footers.len() + 1`
+    /// (ParallelGzipReader.hpp:1474-1477).
+    SegmentCountMismatch { crc_segments: usize, footers: usize },
+    /// Conservation gate: `segment_sizes.len() != footers.len() + 1`.
+    SizeSegmentCountMismatch {
+        size_segments: usize,
+        footers: usize,
+    },
+    /// Conservation gate: `Σ segment_sizes != chunk.decoded_size()`
+    /// (ParallelGzipReader.hpp:1478-1487).
+    ConservationSize { sum: u64, decoded: u64 },
+    /// A member's running CRC32 did not match its gzip footer.
+    Crc {
+        member_index: usize,
+        expected: u32,
+        actual: u32,
+    },
+    /// A member's running decoded size (mod 2^32) did not match its footer ISIZE.
+    Isize {
+        member_index: usize,
+        expected: u32,
+        actual: u32,
+    },
+    /// The stream ended mid-member: bytes were decoded after the last footer
+    /// with no closing footer (a truncated final member is a size mismatch
+    /// against the whole-stream expectation, but this catches the segmentation
+    /// level too).
+    IncompleteFinalMember { pending_bytes: u64 },
+}
+
+impl std::fmt::Display for MemberVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SegmentCountMismatch {
+                crc_segments,
+                footers,
+            } => write!(
+                f,
+                "multi-member CRC segmentation broken: {crc_segments} CRC segments \
+                 for {footers} footers (expected footers+1)"
+            ),
+            Self::SizeSegmentCountMismatch {
+                size_segments,
+                footers,
+            } => write!(
+                f,
+                "multi-member size segmentation broken: {size_segments} size segments \
+                 for {footers} footers (expected footers+1)"
+            ),
+            Self::ConservationSize { sum, decoded } => write!(
+                f,
+                "multi-member size conservation broken: Σ segment_sizes {sum} != \
+                 decoded {decoded}"
+            ),
+            Self::Crc {
+                member_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "member {member_index} CRC32 mismatch (expected 0x{expected:08x}, \
+                 got 0x{actual:08x})"
+            ),
+            Self::Isize {
+                member_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "member {member_index} ISIZE mismatch (expected {expected}, got {actual})"
+            ),
+            Self::IncompleteFinalMember { pending_bytes } => write!(
+                f,
+                "multi-member stream ended mid-member: {pending_bytes} decoded bytes \
+                 after the last footer with no closing footer"
+            ),
+        }
+    }
+}
+
+/// Running per-member CRC32 + ISIZE verifier fed chunks IN DECODE ORDER.
+///
+/// Mirrors `ParallelGzipReader::processCRC32` (steps 1-4, design §4) with the
+/// ISIZE accumulator carried in lock-step with the CRC:
+///   1. per-chunk conservation gates (segment counts + `Σ size == decoded`);
+///   2. `member_crc.append(chunk.crc32s[0])` / `member_size += sizes[0]` —
+///      combine this chunk's leading (pre-first-footer) segment onto the
+///      member still open from prior chunks;
+///   3. for each footer `i` this chunk closes: verify the running CRC and ISIZE
+///      against `footers[i]`, then **restart** the running member from segment
+///      `i+1` (`member_crc = crc32s[i+1]`, `member_size = sizes[i+1]`);
+///   4. the trailing (post-last-footer) segment carries forward into the next
+///      `feed`, which is how a member spanning several chunks is verified.
+///
+/// When `crc_enabled` is false (the CRC-off oracle mode, `crc32_enabled` in the
+/// chunk config), the CRC arm is skipped but ISIZE + conservation are still
+/// checked — `segment_sizes` is maintained unconditionally by the decoder, so
+/// size verification survives the oracle.
+#[derive(Debug)]
+pub struct MemberVerifier {
+    member_crc: CRC32Calculator,
+    member_size: u64,
+    crc_enabled: bool,
+    /// 0-based index of the member currently accumulating; advances at each
+    /// closed footer. Only used to label errors.
+    member_index: usize,
+}
+
+impl MemberVerifier {
+    pub fn new(crc_enabled: bool) -> Self {
+        Self {
+            member_crc: CRC32Calculator::new(),
+            member_size: 0,
+            crc_enabled,
+            member_index: 0,
+        }
+    }
+
+    /// Feed the next chunk in decode order. Runs the conservation gates, folds
+    /// the chunk's leading segment onto the running member, and verifies every
+    /// member this chunk closes. Returns a terminal error on any mismatch.
+    pub fn feed(&mut self, chunk: &ChunkData) -> Result<(), MemberVerifyError> {
+        // ── Gate 1: conservation (ParallelGzipReader.hpp:1474-1487) ─────────
+        if chunk.crc32s.len() != chunk.footers.len() + 1 {
+            return Err(MemberVerifyError::SegmentCountMismatch {
+                crc_segments: chunk.crc32s.len(),
+                footers: chunk.footers.len(),
+            });
+        }
+        let sizes = chunk.segment_sizes_final();
+        if sizes.len() != chunk.footers.len() + 1 {
+            return Err(MemberVerifyError::SizeSegmentCountMismatch {
+                size_segments: sizes.len(),
+                footers: chunk.footers.len(),
+            });
+        }
+        let sum: u64 = sizes.iter().sum();
+        if sum != chunk.decoded_size() as u64 {
+            return Err(MemberVerifyError::ConservationSize {
+                sum,
+                decoded: chunk.decoded_size() as u64,
+            });
+        }
+
+        // ── Step 2: combine the leading segment onto the open member ────────
+        if self.crc_enabled {
+            self.member_crc.append(&chunk.crc32s[0]);
+        }
+        self.member_size += sizes[0];
+
+        // ── Step 3: verify + restart at each footer this chunk closes ───────
+        for (i, footer) in chunk.footers.iter().enumerate() {
+            if self.crc_enabled {
+                let actual = self.member_crc.crc32();
+                if actual != footer.crc32 {
+                    return Err(MemberVerifyError::Crc {
+                        member_index: self.member_index,
+                        expected: footer.crc32,
+                        actual,
+                    });
+                }
+            }
+            let actual_isize = (self.member_size & 0xFFFF_FFFF) as u32;
+            if actual_isize != footer.uncompressed_size {
+                return Err(MemberVerifyError::Isize {
+                    member_index: self.member_index,
+                    expected: footer.uncompressed_size,
+                    actual: actual_isize,
+                });
+            }
+            // Restart the running member from segment i+1 (vendor `m_crc32 =
+            // chunk.crc32s.at(i+1)`, ParallelGzipReader.hpp:1501; the ISIZE
+            // accumulator restarts in lock-step).
+            self.member_crc = chunk.crc32s[i + 1].clone();
+            self.member_size = sizes[i + 1];
+            self.member_index += 1;
+        }
+        Ok(())
+    }
+
+    /// After every chunk has been fed: the stream must have ended exactly at a
+    /// footer, so the running member carries zero pending bytes. A non-zero
+    /// remainder means bytes were decoded after the last footer with no closing
+    /// footer (a torn final member).
+    pub fn finish(self) -> Result<(), MemberVerifyError> {
+        if self.member_size != 0 {
+            return Err(MemberVerifyError::IncompleteFinalMember {
+                pending_bytes: self.member_size,
+            });
+        }
+        Ok(())
+    }
+
+    /// Number of members fully verified so far (footers closed).
+    pub fn members_verified(&self) -> usize {
+        self.member_index
+    }
+}
+
 // ── Unit tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2694,5 +2911,187 @@ mod tests {
         assert_eq!(sm.segment_sizes, vec![0]);
         // Yet the on-demand view still reports the whole chunk as one segment.
         assert_eq!(sm.segment_sizes_final(), vec![sm.decoded_size() as u64]);
+    }
+
+    // ── STAGE-2 consumer per-member CRC32 + ISIZE verifier (§4). Drive
+    //    `MemberVerifier` over sequences of `ChunkData` to pin the four vendor
+    //    processCRC32 steps: leading-segment combine, per-footer verify+restart,
+    //    cross-chunk carry, conservation gates, and terminal errors on any
+    //    corrupt member. ──────────────────────────────────────────────────────
+
+    /// Build a clean-only chunk holding `members` (each `(bytes, isize)`): a
+    /// footer closes every member except the last, whose trailing segment stays
+    /// open (mirrors a chunk that ends mid-member — see the carry test).
+    fn build_chunk(members: &[(&[u8], u32)], close_last: bool) -> ChunkData {
+        let mut chunk = ChunkData::new(0, small_config());
+        let n = members.len();
+        let mut bit = 100usize;
+        for (i, (bytes, isize)) in members.iter().enumerate() {
+            chunk.append_clean(bytes);
+            let is_last = i + 1 == n;
+            if !is_last || close_last {
+                chunk.append_footer(crc_of(bytes), *isize, bit);
+                bit += 64;
+            }
+        }
+        chunk
+    }
+
+    /// One chunk closing three members ⇒ every member's CRC + ISIZE verifies.
+    #[test]
+    fn member_verifier_single_chunk_multi_footer_ok() {
+        let a = b"first member payload".as_slice();
+        let b = b"second".as_slice();
+        let c = b"third member trailing".as_slice();
+        let chunk = build_chunk(
+            &[
+                (a, a.len() as u32),
+                (b, b.len() as u32),
+                (c, c.len() as u32),
+            ],
+            true,
+        );
+        let mut v = MemberVerifier::new(true);
+        v.feed(&chunk).expect("all members verify");
+        assert_eq!(v.members_verified(), 3);
+        v.finish().expect("stream ended at a footer");
+    }
+
+    /// A member split across three chunks: the running CRC + ISIZE carry across
+    /// `feed` calls and match a naive whole-member CRC of the concatenation.
+    #[test]
+    fn member_verifier_member_spans_three_chunks() {
+        let p0 = b"aaaaaaaaaaaa".as_slice();
+        let p1 = b"bbbbbbbbbbbbbbbb".as_slice();
+        let p2 = b"cccc".as_slice();
+        let whole: Vec<u8> = [p0, p1, p2].concat();
+        let isize = whole.len() as u32;
+
+        // chunk0/chunk1 carry the member open (no footer); chunk2 closes it.
+        let c0 = build_chunk(&[(p0, 0)], false);
+        let c1 = build_chunk(&[(p1, 0)], false);
+        let c2 = build_chunk(&[(p2, isize)], true);
+        // Sanity: the closing footer carries the whole-member CRC/ISIZE.
+        assert_eq!(c2.footers[0].crc32, crc_of(p2)); // segment CRC, combined below
+        assert_eq!(c2.footers[0].uncompressed_size, isize);
+
+        let mut v = MemberVerifier::new(true);
+        v.feed(&c0).unwrap();
+        v.feed(&c1).unwrap();
+        // The footer CRC in c2 must equal the WHOLE member CRC — fix the fixture
+        // to carry that (append_footer above stored the segment CRC only). Re-set.
+        let mut c2 = c2;
+        c2.footers[0].crc32 = crc_of(&whole);
+        v.feed(&c2).unwrap();
+        assert_eq!(v.members_verified(), 1);
+        v.finish().unwrap();
+    }
+
+    /// A wrong CRC in a member's footer ⇒ terminal `Crc` error naming the member.
+    #[test]
+    fn member_verifier_bad_crc_errors() {
+        let a = b"good".as_slice();
+        let b = b"corrupt-me".as_slice();
+        let mut chunk = build_chunk(&[(a, a.len() as u32), (b, b.len() as u32)], true);
+        chunk.footers[1].crc32 ^= 0xFFFF_FFFF; // corrupt member 1's CRC
+        let mut v = MemberVerifier::new(true);
+        match v.feed(&chunk) {
+            Err(MemberVerifyError::Crc { member_index, .. }) => assert_eq!(member_index, 1),
+            other => panic!("expected Crc error at member 1, got {other:?}"),
+        }
+    }
+
+    /// A wrong ISIZE ⇒ terminal `Isize` error.
+    #[test]
+    fn member_verifier_bad_isize_errors() {
+        let a = b"payload".as_slice();
+        let mut chunk = build_chunk(&[(a, a.len() as u32)], true);
+        chunk.footers[0].uncompressed_size = 999; // lie about the size
+        let mut v = MemberVerifier::new(true);
+        match v.feed(&chunk) {
+            Err(MemberVerifyError::Isize {
+                member_index,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(member_index, 0);
+                assert_eq!(expected, 999);
+                assert_eq!(actual, a.len() as u32);
+            }
+            other => panic!("expected Isize error, got {other:?}"),
+        }
+    }
+
+    /// CRC-off oracle mode skips the CRC arm but still verifies ISIZE +
+    /// conservation (segment_sizes are maintained unconditionally).
+    #[test]
+    fn member_verifier_crc_off_still_checks_isize() {
+        let a = b"abc".as_slice();
+        let mut chunk = build_chunk(&[(a, a.len() as u32)], true);
+        chunk.footers[0].crc32 ^= 0xDEAD_BEEF; // would fail CRC — but CRC is off
+        let mut v = MemberVerifier::new(false);
+        v.feed(&chunk).expect("CRC-off: bad CRC ignored, ISIZE ok");
+        v.finish().unwrap();
+        // But a bad ISIZE still fails even with CRC off.
+        let mut chunk2 = build_chunk(&[(a, a.len() as u32)], true);
+        chunk2.footers[0].uncompressed_size += 1;
+        let mut v2 = MemberVerifier::new(false);
+        assert!(matches!(
+            v2.feed(&chunk2),
+            Err(MemberVerifyError::Isize { .. })
+        ));
+    }
+
+    /// A chunk that ends mid-member (bytes after the last footer, no closing
+    /// footer) leaves the member open ⇒ `finish` errors.
+    #[test]
+    fn member_verifier_incomplete_final_member_errors() {
+        let a = b"closed".as_slice();
+        let b = b"dangling-open".as_slice();
+        let chunk = build_chunk(&[(a, a.len() as u32), (b, b.len() as u32)], false);
+        let mut v = MemberVerifier::new(true);
+        v.feed(&chunk).unwrap(); // member 0 closes, member 1 stays open
+        assert_eq!(v.members_verified(), 1);
+        match v.finish() {
+            Err(MemberVerifyError::IncompleteFinalMember { pending_bytes }) => {
+                assert_eq!(pending_bytes, b.len() as u64)
+            }
+            other => panic!("expected IncompleteFinalMember, got {other:?}"),
+        }
+    }
+
+    /// A broken segment/footer count conservation gate ⇒ terminal error before
+    /// any CRC/ISIZE check.
+    #[test]
+    fn member_verifier_conservation_gate_errors() {
+        let a = b"payload".as_slice();
+        let mut chunk = build_chunk(&[(a, a.len() as u32)], true);
+        // Corrupt the invariant: one footer but push a spurious extra CRC segment
+        // so crc32s.len() != footers.len()+1.
+        chunk.crc32s.push(CRC32Calculator::new());
+        let mut v = MemberVerifier::new(true);
+        assert!(matches!(
+            v.feed(&chunk),
+            Err(MemberVerifyError::SegmentCountMismatch { .. })
+        ));
+    }
+
+    /// Verifier equals the naive whole-member CRC when a member spans chunks and
+    /// the footer carries the true whole-member CRC — the OQ-3 byte-parity check
+    /// at a chunk-split boundary.
+    #[test]
+    fn member_verifier_matches_naive_crc_at_split() {
+        let whole = b"the quick brown fox jumps over the lazy dog".as_slice();
+        for split in 1..whole.len() {
+            let (l, r) = whole.split_at(split);
+            let c0 = build_chunk(&[(l, 0)], false);
+            let mut c1 = build_chunk(&[(r, whole.len() as u32)], true);
+            c1.footers[0].crc32 = crc_of(whole);
+            let mut v = MemberVerifier::new(true);
+            v.feed(&c0).unwrap();
+            v.feed(&c1)
+                .unwrap_or_else(|e| panic!("split {split} failed: {e:?}"));
+            v.finish().unwrap();
+        }
     }
 }
