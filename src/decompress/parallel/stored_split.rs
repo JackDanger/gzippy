@@ -72,25 +72,13 @@ pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 const DEMOTE_THRESHOLD_NUM: usize = 1;
 const DEMOTE_THRESHOLD_DEN: usize = 2;
 
-/// Env-gated phase timing for the stored decode path. When
-/// `GZIPPY_STORED_PHASE_TIMING=1` is set, each phase's wall time is printed to
-/// stderr. Measurement-only; zero cost when the env is unset (the closure body
-/// is skipped and `Instant::now` is never called).
+/// Phase wrapper for the stored decode path. Formerly hosted the env-gated
+/// `GZIPPY_STORED_PHASE_TIMING` per-phase wall-time dump (removed); reduced to a
+/// transparent pass-through so the phase call sites keep their structure while
+/// carrying zero measurement cost.
 #[inline]
-fn phase_timing_enabled() -> bool {
-    std::env::var_os("GZIPPY_STORED_PHASE_TIMING").is_some()
-}
-
-#[inline]
-fn time_phase<T>(name: &str, f: impl FnOnce() -> T) -> T {
-    if phase_timing_enabled() {
-        let t0 = std::time::Instant::now();
-        let r = f();
-        eprintln!("[stored-phase] {name}: {:?}", t0.elapsed());
-        r
-    } else {
-        f()
-    }
+fn time_phase<T>(_name: &str, f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 /// A decoded stored-block descriptor: where its raw literal bytes live in the

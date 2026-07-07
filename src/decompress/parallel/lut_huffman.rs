@@ -1237,8 +1237,6 @@ impl LutLitLenCode {
         #[cfg(pure_inflate_decode)]
         {
             use crate::decompress::parallel::marker_inflate::tbuild_cache;
-            use std::sync::atomic::Ordering;
-            tbuild_cache::note_key(code_lengths, multisym);
             let n = code_lengths.len();
             if tbuild_cache::cache_enabled() && n <= self.cache_key.len() {
                 // MRU (last-header) fast path: identical to the immediately
@@ -1253,12 +1251,10 @@ impl LutLitLenCode {
                     && self.cache_key_len == n
                     && self.cache_key[..n] == *code_lengths
                 {
-                    tbuild_cache::HITS.fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "lut-count")]
                     litlen_count::note_cache_hit();
                     return true;
                 }
-                tbuild_cache::MISSES.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.valid = false;

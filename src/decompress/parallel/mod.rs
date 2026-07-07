@@ -129,9 +129,9 @@ pub mod window_map;
 /// below preserve the historical `parallel::<name>` paths so every hot-path
 /// hook call site is byte-transparent — only the file location changed.
 pub mod instruments;
-// `contig_prof`/`slow_knob` are consumed by the always-compiled inner loop
-// (`inflate::resumable`) + `main`, so they are not parallel_sm-gated.
-pub use instruments::{contig_prof, slow_knob};
+// `slow_knob` is consumed by the always-compiled inner loop
+// (`inflate::resumable`) + `main`, so it is not parallel_sm-gated.
+pub use instruments::slow_knob;
 // The rest are consumed only by parallel_sm modules; gate the re-export so the
 // non-parallel_sm (legacy serial) build does not see them as unused imports.
 #[cfg(parallel_sm)]

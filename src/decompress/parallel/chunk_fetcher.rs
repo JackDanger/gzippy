@@ -946,21 +946,8 @@ fn drive_impl<W: std::io::Write>(
     // when --verbose is passed; tests and other internal callers
     // ignore it.
     if std::env::var("GZIPPY_VERBOSE").is_ok() {
-        // P3.1 cycle-profile dump (no-op unless GZIPPY_CONTIG_PROF=1).
-        crate::decompress::parallel::contig_prof::dump_if_enabled();
         // ASM-kernel effect counters (no-op unless GZIPPY_ASM_STATS=1).
         crate::decompress::parallel::asm_kernel::dump_if_enabled();
-        // Rung-(d) marker-loop dist-arm effect counters (no-op unless
-        // GZIPPY_MARKER_DIST_STATS=1).
-        #[cfg(pure_inflate_decode)]
-        crate::decompress::parallel::marker_inflate::marker_dist_stats::dump_if_enabled();
-        // Per-block litlen table-build cache hit/miss (no-op unless
-        // GZIPPY_TBUILD_CACHE_STATS=1).
-        #[cfg(pure_inflate_decode)]
-        crate::decompress::parallel::marker_inflate::tbuild_cache::dump_if_enabled();
-        // mfast-phase0 probe: cycle/event breakdown for `'mfast` vs careful loop
-        // (no-op unless GZIPPY_MFAST_PROF=1).
-        crate::decompress::parallel::marker_inflate::mfast_prof::dump_if_enabled();
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
@@ -2004,10 +1991,6 @@ fn consumer_loop<W: std::io::Write>(
                 cache_key: next_block_offset,
                 handoff_bit,
             });
-            crate::decompress::parallel::chunk_data::lc_set(
-                &crate::decompress::parallel::chunk_data::LC_G_PENDING,
-                pending.len(),
-            );
         }
 
         // Vendor parity: write each post-process-complete chunk as soon as
@@ -3710,10 +3693,6 @@ fn defer_chunk_recycle(deferral: &mut RecycleDeferral, chunk: ChunkData) {
             old.recycle_decoded_buffers();
         }
     }
-    crate::decompress::parallel::chunk_data::lc_set(
-        &crate::decompress::parallel::chunk_data::LC_G_RECYCLE,
-        deferral.queue.len(),
-    );
 }
 
 /// Drain consecutive `Ready` entries at the FIFO head when two or more
@@ -3794,10 +3773,6 @@ fn drain_one_pending<W: std::io::Write>(
         Some(h) => h,
         None => return Ok(()),
     };
-    crate::decompress::parallel::chunk_data::lc_set(
-        &crate::decompress::parallel::chunk_data::LC_G_PENDING,
-        pending.len(),
-    );
     let (_idx, chunk, cache_key, _handoff_bit) = match head {
         PendingWrite::Ready {
             idx,
@@ -3846,12 +3821,6 @@ fn drain_one_pending<W: std::io::Write>(
     // no second scan of `chunk.narrowed` here.
     let decoded_data_len = chunk.data.len().saturating_sub(chunk.data_prefix_len);
     let payload_bytes = chunk.narrowed_len + decoded_data_len;
-    if crate::decompress::parallel::chunk_data::rss_split_enabled() {
-        crate::decompress::parallel::chunk_data::rss_split_account(
-            chunk.narrowed_len,
-            decoded_data_len,
-        );
-    }
     let mut wrote_via_fd = false;
     #[cfg(unix)]
     if let Some(fd) = out_fd {

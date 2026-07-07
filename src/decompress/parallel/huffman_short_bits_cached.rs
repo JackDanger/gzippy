@@ -213,12 +213,6 @@ impl<
     /// Mirror of `decodeLong` (header:118-149) with `REVERSE_BITS = true`.
     #[inline]
     fn decode_long<R: LsbBitReader>(&self, bit_reader: &mut R) -> Option<u16> {
-        // P3.1 profiler: count cache-miss (long-path) distance decodes. Cold
-        // path; the enabled() check is a OnceLock-cached bool.
-        if crate::decompress::parallel::contig_prof::enabled() {
-            crate::decompress::parallel::contig_prof::C_N_DIST_LONG
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         let base = &self.base.base;
         let mut code: u16 = 0;
 

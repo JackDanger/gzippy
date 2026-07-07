@@ -924,12 +924,6 @@ pub fn decompress_parallel<W: Write>(
         };
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
-        if crate::decompress::parallel::chunk_data::rss_split_enabled() {
-            crate::decompress::parallel::chunk_data::rss_split_report(result.total_size as u64);
-        }
-        if crate::decompress::parallel::chunk_data::lifecycle_enabled() {
-            crate::decompress::parallel::chunk_data::lifecycle_report();
-        }
         if crate::decompress::parallel::segmented_markers::free_markers_enabled() {
             use crate::decompress::parallel::segmented_markers::{
                 MARKER_FREE_BYTES, MARKER_FREE_FIRED,
