@@ -237,7 +237,7 @@ pub const SINGLE_SYM_FLAG: u32 = DOUBLE_SYM_FLAG + 1;
 pub const DEFAULT_SYM_FLAG: u32 = TRIPLE_SYM_FLAG;
 
 /// Selects how much of `make_inflate_huff_code_lit_len` runs for the per-block
-/// litlen table build (`GZIPPY_LITLEN_MULTISYM` = `single` | `double` | `triple`).
+/// litlen table build (arch-dispatched: `single` / `double` / `triple`).
 /// SINGLE emits only singleton LUT entries (skips the pair + triple packing
 /// loops — the bulk of build cost), DOUBLE adds pairs, TRIPLE adds triples. The
 /// produced table is read by the SAME decode loop and the DECOMPRESSED OUTPUT IS
@@ -252,20 +252,10 @@ pub const DEFAULT_SYM_FLAG: u32 = TRIPLE_SYM_FLAG;
 ///     SINGLE is a measured +7.7% cyc/B regression on x86/AMD, so it must NOT
 ///     become the default there.
 ///
-/// The env override is honoured on EVERY arch (for A/B testing); only the
-/// UNSET default differs by arch.
+/// The arch-dispatched (cfg-selected) default; the `GZIPPY_LITLEN_MULTISYM`
+/// A/B override was removed.
 pub fn litlen_multisym_flag() -> u32 {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<u32> = OnceLock::new();
-    *FLAG.get_or_init(
-        || match std::env::var("GZIPPY_LITLEN_MULTISYM").as_deref() {
-            Ok("single") => SINGLE_SYM_FLAG,
-            Ok("double") => DOUBLE_SYM_FLAG,
-            Ok("triple") => TRIPLE_SYM_FLAG,
-            // Env unset (or unrecognised) → arch-dispatched default.
-            _ => arch_default_multisym_flag(),
-        },
-    )
+    arch_default_multisym_flag()
 }
 
 /// aarch64 default = single-symbol build (gated M1 T1 win).
@@ -1236,9 +1226,8 @@ impl LutLitLenCode {
         // ~9.5% of the logs-T1 wall per the table-build perturbation gate.
         #[cfg(pure_inflate_decode)]
         {
-            use crate::decompress::parallel::marker_inflate::tbuild_cache;
             let n = code_lengths.len();
-            if tbuild_cache::cache_enabled() && n <= self.cache_key.len() {
+            if n <= self.cache_key.len() {
                 // MRU (last-header) fast path: identical to the immediately
                 // preceding block → `self.table` is already correct, ZERO copy.
                 // This is the shippable cache: free on a miss (one key compare),

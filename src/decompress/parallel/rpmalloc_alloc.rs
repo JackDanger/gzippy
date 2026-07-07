@@ -383,13 +383,6 @@ mod arena {
         S.get_or_init(|| Mutex::new(SlabState::default()))
     }
 
-    /// Slab event trace — compiled out of the knob-free prod path (was the
-    /// GZIPPY_SLAB_TRACE measurement instrument). Kept as an inlined no-op so
-    /// the call sites stay in place; re-introduce behind a dev-instruments cfg
-    /// if slab RSS attribution is needed again.
-    #[inline]
-    fn slab_trace(_event: &str, _bs: usize, _s: &SlabState) {}
-
     #[inline]
     fn raw_alloc(size: usize, align: usize) -> *mut u8 {
         if align <= 16 {
@@ -410,8 +403,7 @@ mod arena {
     /// dealloc/grow/shrink of slab-live pointers here (pointer-keyed);
     /// the fuzz test exercises it directly (unconditional).
     /// Engagement proof for the measurement A/B (fulcrum decide effect
-    /// predicate): cache hits + installs prove the slab actually ran in the
-    /// knob arm. Printed in the GZIPPY_RPMALLOC_STATS dump below.
+    /// predicate): cache hits + installs prove the slab actually ran.
     pub static SLAB_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static SLAB_INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -483,7 +475,6 @@ mod arena {
                     let (p, b, a) = s.free.swap_remove(pos);
                     s.current_free_bytes -= b;
                     s.live.insert(p, (b, a, HugeBackend::Rp));
-                    slab_trace("hit", b, &s);
                     return Ok(NonNull::slice_from_raw_parts(
                         unsafe { NonNull::new_unchecked(p as *mut u8) },
                         layout.size(),
@@ -510,9 +501,6 @@ mod arena {
                     }
                 });
                 s.current_free_bytes -= dropped_bytes;
-                if !doomed.is_empty() {
-                    slab_trace("evict-on-miss", dropped_bytes, &s);
-                }
                 drop(s);
                 if !doomed.is_empty() {
                     ensure_thread_initialized();
@@ -530,7 +518,6 @@ mod arena {
             {
                 let mut s = slab_state().lock().unwrap();
                 s.live.insert(p as usize, (bs, align, HugeBackend::Rp));
-                slab_trace("miss-fresh", bs, &s);
             }
             Ok(NonNull::slice_from_raw_parts(
                 unsafe { NonNull::new_unchecked(p) },
@@ -577,7 +564,6 @@ mod arena {
                     SLAB_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     s.current_free_bytes += bs;
                     s.free.push((key, bs, a));
-                    slab_trace("retain", bs, &s);
                     let mut to_munmap: Vec<*mut u8> = Vec::new();
                     loop {
                         let budget = effective_budget(s.largest_block_seen);
@@ -594,7 +580,6 @@ mod arena {
                         let (evict_ptr, evict_bs, _) = s.free.swap_remove(pos);
                         s.current_free_bytes -= evict_bs;
                         to_munmap.push(evict_ptr as *mut u8);
-                        slab_trace("evict-budget", evict_bs, &s);
                     }
                     drop(s);
                     // Release outside the lock (munmap can be slow).

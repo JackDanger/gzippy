@@ -590,8 +590,7 @@ fn drive_impl<W: std::io::Write>(
     // last few chunks run short so the final round's straggler is small. NO vendor
     // counterpart — rapidgzip's GzipBlockFinder uses one uniform spacing (its last
     // chunk is just the remainder). Scoped to cpu_is_amd() && pool_size==3; every
-    // other cell/arch takes the byte-identical uniform finder. `GZIPPY_TAIL_TAPER`
-    // ("chunks:divisor", e.g. "3:2") overrides for the gate sweep; unset ⇒ the gate.
+    // other cell/arch takes the byte-identical uniform finder.
     let block_finder = Arc::new(build_block_finder(
         configuration.split_chunk_size,
         total_bits,
@@ -1185,10 +1184,6 @@ fn consumer_loop<W: std::io::Write>(
             ),
         );
     }
-    // Optional duplicate probe (GZIPPY_EAGER_POSTPROC=1) — full-cache scan
-    // on every stall; production uses handoff-triggered resolve-ahead only.
-    let eager_probe_enabled = eager_postproc_enabled();
-
     // The vendor's `processNextChunk` returns one chunk per call; the
     // caller loops in `ParallelGzipReader::read`. We inline that loop
     // here so the local-state mutation (post-process queue + writer +
@@ -1886,49 +1881,13 @@ fn consumer_loop<W: std::io::Write>(
             )))
         })?;
     }
-    // Eager post-process probe report — the deliverable. Always printed
-    // to stderr when the probe is enabled so an A/B run records whether
-    // the lever actually fired. If `submitted ≈ 0`, the prefetch cache is
-    // empty during the stall and the real lever is prefetch DEPTH, not
-    // post-process eagerness.
-    if eager_probe_enabled {
-        use std::sync::atomic::Ordering;
-        let runs = EAGER_PROBE_RUNS.load(Ordering::Relaxed);
-        let inspected = EAGER_PROBE_INSPECTED.load(Ordering::Relaxed);
-        let submitted = EAGER_PROBE_SUBMITTED.load(Ordering::Relaxed);
-        let nonempty = EAGER_PROBE_RUNS_NONEMPTY.load(Ordering::Relaxed);
-        let max_per_run = EAGER_PROBE_MAX_PER_RUN.load(Ordering::Relaxed);
-        let reused = EAGER_PROBE_REUSED.load(Ordering::Relaxed);
-        let avg_inspected = if runs > 0 {
-            inspected as f64 / runs as f64
-        } else {
-            0.0
-        };
-        let key_absent = EAGER_PROBE_REUSE_KEY_ABSENT.load(Ordering::Relaxed);
-        let pred_mismatch = EAGER_PROBE_REUSE_PRED_MISMATCH.load(Ordering::Relaxed);
-        eprintln!(
-            "[gzippy EAGER_POSTPROC] probe_runs={runs} runs_with_ready_successor={nonempty} \
-             cache_chunks_inspected={inspected} (avg {avg_inspected:.2}/run) \
-             eager_submitted={submitted} max_per_run={max_per_run} reused_by_consumer={reused} \
-             reuse_miss[key_absent={key_absent} pred_mismatch={pred_mismatch}]"
-        );
-        if submitted == 0 {
-            eprintln!(
-                "[gzippy EAGER_POSTPROC] KEY FINDING: 0 ready successors during stalls — \
-                 the prefetch cache holds no post-processable successor whose predecessor \
-                 window is published. The lever is prefetch DEPTH, not post-process eagerness."
-            );
-        }
-    }
-
     Ok(())
 }
 
 /// Build the chunk-partitioning [`GzipBlockFinder`], applying the AMD/Zen2 T3
 /// TAIL-TAPER when gated. Returns the byte-identical uniform vendor finder for
 /// every non-AMD-T3 caller (taper disabled). See the call site in `drive` for the
-/// mechanism. `GZIPPY_TAIL_TAPER="chunks:divisor"` overrides the gated schedule
-/// (measurement-only); an unparseable value falls back to the gate.
+/// mechanism.
 #[cfg(parallel_sm)]
 fn build_block_finder(
     spacing_in_bytes: usize,
@@ -1959,19 +1918,7 @@ fn build_block_finder(
     } else {
         None
     };
-    let (taper_chunks, divisor) = match std::env::var("GZIPPY_TAIL_TAPER") {
-        Ok(s) => {
-            let mut it = s.split(':');
-            match (
-                it.next().and_then(|x| x.trim().parse::<usize>().ok()),
-                it.next().and_then(|x| x.trim().parse::<usize>().ok()),
-            ) {
-                (Some(c), Some(d)) => (c, d),
-                _ => gated.unwrap_or((0, 0)),
-            }
-        }
-        Err(_) => gated.unwrap_or((0, 0)),
-    };
+    let (taper_chunks, divisor) = gated.unwrap_or((0, 0));
     GzipBlockFinder::new_tail_tapered(
         /* first_block_offset_in_bits = */ 0,
         spacing_in_bytes,
@@ -1993,7 +1940,7 @@ fn build_block_finder(
 /// cyc/byte 10.816→10.659, paired sign-test p=5.77e-8. Fewer tapered chunks leave
 /// a full-4 MiB straggler in the final round; more pay per-chunk overhead that at
 /// 3 workers exceeds the tail saved (the same wall the base 9fd76daa commit hit
-/// with GLOBAL finer chunks). `GZIPPY_TAIL_TAPER="chunks:divisor"` overrides.
+/// with GLOBAL finer chunks).
 #[cfg(parallel_sm)]
 const TAIL_TAPER_CHUNKS_DEFAULT: usize = 5;
 #[cfg(parallel_sm)]
@@ -2011,7 +1958,6 @@ const TAIL_TAPER_DIVISOR_DEFAULT: usize = 2;
 /// 27/31 p<1e-4). STEP 1 trace showed these two cells carry the largest
 /// last-wave tail imbalance (T4/T7 ≈15–22% vs the T8 WIN cell's ≈10%); the taper
 /// shrinks the trailing chunks so the final decode round finishes fast.
-/// `GZIPPY_TAIL_TAPER="chunks:divisor"` overrides.
 #[cfg(parallel_sm)]
 const TAIL_TAPER_CHUNKS_T4_T7: usize = 8;
 
@@ -2403,14 +2349,6 @@ fn resolve_chunk_markers_on_chunk(
     // `data_with_markers`). `populate_subchunk_windows` runs against the un-merged
     // markers — `copy_window_at_chunk_offset` already branches on `narrowed_len>0`.
     chunk.populate_subchunk_windows(predecessor_window);
-    // RSS convergence (GZIPPY_FREE_MARKERS): after narrow + CRC + subchunk-
-    // window extraction have read the low-half narrowed bytes, release the
-    // dead upper half of each marker segment back to the OS (faithful to rg
-    // applyWindow @todo, DecodedData.hpp:374-379). The narrowed low half
-    // stays resident for the consumer's zero-copy iovec write.
-    if dwm_len_pre > 0 && crate::decompress::parallel::segmented_markers::free_markers_enabled() {
-        chunk.data_with_markers.release_narrowed_upper_pages();
-    }
     chunk.markers_resolved = true;
     chunk.resolved_pred_key = Some(pred_key);
 }
@@ -3102,24 +3040,6 @@ pub static PREFETCH_HARVEST_PROMOTED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_ALREADY_RESOLVED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// True iff `GZIPPY_EAGER_POSTPROC=1`. Read once and cached.
-#[cfg(parallel_sm)]
-fn eager_postproc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
-    match CACHED.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var_os("GZIPPY_EAGER_POSTPROC")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
 /// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`,
 /// GzipChunk.hpp:712-734): always `decodeChunkWithRapidgzip` with
 /// `initialWindow = nullopt` at the actual decode seek bit (`offset.second`),
@@ -3629,17 +3549,6 @@ fn drain_one_pending<W: std::io::Write>(
             if fd_vectored_write::is_pipe_fd(fd) {
                 fd_vectored_write::write_chunk_payload_to_fd(fd, &mut iovs, chunk)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            } else if crate::decompress::parallel::output_writer::enabled() {
-                // FAITHFUL OVERLAP (rapidgzip writeFunctor, ParallelGzipReader.hpp:521):
-                // hand the owned chunk to a single in-order writer thread so the
-                // 211 MiB serial writev overlaps the next chunk's decode WAIT. Windows
-                // are already published and the CRC already combined above, so output
-                // order + trailer correctness are preserved. The writer owns the chunk
-                // for the write lifetime (iovecs stay valid) and recycles it after.
-                // `iovs`/`parts` borrow `chunk`; drop them before moving it.
-                drop(iovs);
-                drop(parts);
-                crate::decompress::parallel::output_writer::submit_chunk(fd, chunk);
             } else {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;

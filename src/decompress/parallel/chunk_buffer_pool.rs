@@ -339,62 +339,14 @@ fn manual_buffer_pool_enabled() -> bool {
 /// is retained; if the buffer is later re-taken from the manual pool it
 /// re-faults to zero pages that the next decode overwrites before any read.
 ///
-/// DEFAULT OFF (opt-in `GZIPPY_EAGER_DONTNEED=1`). GATED-MEASURED NET-NEGATIVE
-/// on AMD-Zen2 ondemand silesia T3-T6: the per-chunk `MADV_DONTNEED` runs on the
-/// serial consumer thread and the returned pages re-fault on the next
-/// allocation, and that syscall+refault cost EXCEEDS the exit_group teardown it
-/// saves (after/base 1.02-1.09 at T3-T6; only T8 ~0.99). Kept as an opt-in
-/// instrument documenting the tradeoff, NOT a default. A profitable variant
+/// DEFAULT was OFF (opt-in `GZIPPY_EAGER_DONTNEED=1`), and the knob was
+/// GATED-MEASURED NET-NEGATIVE on AMD-Zen2 ondemand silesia T3-T6 (the per-chunk
+/// `MADV_DONTNEED` runs on the serial consumer thread and the returned pages
+/// re-fault on the next allocation, a cost EXCEEDING the exit_group teardown it
+/// saves). The env kill-switch is removed and the shipped default (no eager
+/// release) is hardcoded — `dontneed_alloc` is a no-op. A profitable variant
 /// would have to overlap the page-return onto the PARALLEL worker threads (as
 /// rpmalloc does) rather than the serial consumer — unvalidated.
-#[inline]
-fn eager_dontneed_disabled() -> bool {
-    static EN: OnceLock<bool> = OnceLock::new();
-    // Disabled unless explicitly opted in.
-    *EN.get_or_init(|| std::env::var_os("GZIPPY_EAGER_DONTNEED").is_none())
-}
-
-/// Instrument self-validation (Gate-0): proves the release actually fired and
-/// how many resident bytes it returned. No-op counters unless the path runs.
-pub static EAGER_DONTNEED_FIRED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static EAGER_DONTNEED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// `MADV_DONTNEED` the page-aligned interior of the owned allocation
-/// `[base, base + bytes)`. Only whole pages STRICTLY inside the allocation are
-/// touched (start rounded up, end rounded down) so neither the allocator's
-/// preceding chunk header nor any trailing partial page outside the allocation
-/// is ever disturbed. Linux-only; a no-op elsewhere.
-#[cfg(target_os = "linux")]
-#[inline]
-fn dontneed_alloc(base: *const u8, bytes: usize) {
-    if eager_dontneed_disabled() {
-        return;
-    }
-    const PAGE: usize = 4096;
-    // Skip small buffers: the DONTNEED syscall isn't worth it below ~1 page of
-    // whole-page interior, and tiny allocations don't move at-exit RSS.
-    if bytes < 2 * PAGE {
-        return;
-    }
-    let start_addr = base as usize;
-    let start = start_addr.div_ceil(PAGE) * PAGE;
-    let end = (start_addr + bytes) / PAGE * PAGE;
-    if start >= end {
-        return;
-    }
-    // SAFETY: [start, end) is page-aligned and lies wholly within the caller's
-    // owned allocation; MADV_DONTNEED retains the mapping and only discards
-    // resident pages whose contents are dead (the buffer is being recycled).
-    unsafe {
-        libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
-    }
-    use std::sync::atomic::Ordering::Relaxed;
-    EAGER_DONTNEED_BYTES.fetch_add((end - start) as u64, Relaxed);
-    EAGER_DONTNEED_FIRED.fetch_add(1, Relaxed);
-}
-#[cfg(not(target_os = "linux"))]
 #[inline]
 fn dontneed_alloc(_base: *const u8, _bytes: usize) {}
 

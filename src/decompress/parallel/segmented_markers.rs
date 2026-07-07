@@ -85,17 +85,6 @@ fn new_segment() -> U16 {
 /// the same rpmalloc span class as the clean-data segments.
 pub const SEGMENT_ELEMENTS: usize = 64 * 1024;
 
-/// MADV_DONTNEED bytes returned to the OS by `release_narrowed_upper_pages`
-/// (non-inert proof for the GZIPPY_FREE_MARKERS perturbation).
-pub static MARKER_FREE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MARKER_FREE_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// True iff the post-narrow upper-half marker-buffer free is armed.
-#[inline]
-pub fn free_markers_enabled() -> bool {
-    std::env::var_os("GZIPPY_FREE_MARKERS").is_some()
-}
-
 /// Segmented `Vec<u16>` marker buffer. Each segment is a
 /// `Vec<u16, RpmallocAlloc>` capped at [`SEGMENT_ELEMENTS`] elements
 /// (= 128 KiB bytes). Append-only from the decoder's perspective
@@ -582,64 +571,6 @@ impl SegmentedU16 {
             }
         });
     }
-
-    /// Release the unused UPPER half of each marker segment's backing
-    /// allocation back to the OS after in-place narrow. The narrowed u8
-    /// bytes occupy only the low `seg.len()` BYTES of a `seg.capacity()*2`
-    /// byte allocation (one narrowed byte per original u16 element), so the
-    /// upper `seg.capacity()*2 - seg.len()` bytes are dead weight resident
-    /// for the chunk's whole life.
-    ///
-    /// Faithful realization of rapidgzip's own `applyWindow` `@todo`
-    /// (DecodedData.hpp:374-379): "this leaves half of the chunk space
-    /// unused ... it would be nice to ... free the rest of the chunks."
-    /// rg punts on it ("shrink_to_fit would be expensive"); we instead use
-    /// `MADV_DONTNEED` on the page-aligned dead range — peak RSS drops
-    /// IMMEDIATELY with NO realloc / copy / alloc churn (the mission's
-    /// "prefer shrink/reuse over free-then-realloc"). The virtual mapping
-    /// is retained; reused segments re-fault the upper pages to zero, which
-    /// the next decode overwrites before any read.
-    ///
-    /// SAFETY/CORRECTNESS: only pages strictly ABOVE the narrowed bytes are
-    /// touched. Must be called AFTER all readers of the narrowed low half
-    /// for this resolve (CRC, subchunk-window extraction) and the narrowed
-    /// bytes (low half) remain fully resident for the consumer's zero-copy
-    /// iovec write. Linux-only (madvise); a no-op elsewhere.
-    #[cfg(target_os = "linux")]
-    pub fn release_narrowed_upper_pages(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        const PAGE: usize = 4096;
-        let mut freed = 0u64;
-        for seg in &self.segments {
-            let alloc_bytes = seg.capacity() * std::mem::size_of::<u16>();
-            let used_bytes = seg.len(); // 1 narrowed byte per u16 element
-            if alloc_bytes <= used_bytes {
-                continue;
-            }
-            let base = seg.as_ptr() as usize;
-            // Free only whole pages strictly above the narrowed bytes:
-            // round the start UP and the end DOWN to page boundaries so the
-            // narrowed low half is never touched regardless of `base` align.
-            let start = (base + used_bytes).div_ceil(PAGE) * PAGE;
-            let end = (base + alloc_bytes) / PAGE * PAGE;
-            if start >= end {
-                continue;
-            }
-            // SAFETY: [start, end) is page-aligned, lies within this owned
-            // segment's allocation, and holds only dead post-narrow bytes.
-            unsafe {
-                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
-            }
-            freed += (end - start) as u64;
-        }
-        if freed > 0 {
-            MARKER_FREE_BYTES.fetch_add(freed, Relaxed);
-            MARKER_FREE_FIRED.fetch_add(1, Relaxed);
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn release_narrowed_upper_pages(&self) {}
 
     /// Copy `len` u8 bytes starting at logical narrowed offset `from` into
     /// `out` (must have room). Used by `populate_subchunk_windows`.
