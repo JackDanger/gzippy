@@ -128,7 +128,7 @@ pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 /// land on a real boundary: every speculative chunk fails to validate (header
 /// / body speculation failures) and decode serializes — measured 3–4× SLOWER
 /// than a single ISA-L pass. (2026-05-29 matrix: random100 collapses from T1
-/// 7263 MB/s to T8 1963 MB/s; GZIPPY_VERBOSE showed 228 header + 69 body
+/// 7263 MB/s to T8 1963 MB/s; `--verbose` showed 228 header + 69 body
 /// speculation failures.) The ratio cleanly separates incompressible (~1.00)
 /// from compressible silesia (~3.1); 1.15 leaves margin.
 #[allow(dead_code)] // used by classify's parallel_sm branch + tests
@@ -284,7 +284,8 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
     let num_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4);
-    decompress_gzip_libdeflate(data, writer, num_threads)
+    // Library entry point — no CLI `--verbose` concept reaches here.
+    decompress_gzip_libdeflate(data, writer, num_threads, false)
 }
 
 // =============================================================================
@@ -302,7 +303,8 @@ pub fn decompress_bytes<W: Write + Send>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    decompress_gzip_libdeflate(data, writer, num_threads.max(1))
+    // Library entry point — no CLI `--verbose` concept reaches here.
+    decompress_gzip_libdeflate(data, writer, num_threads.max(1), false)
 }
 
 // =============================================================================
@@ -314,6 +316,7 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
@@ -345,18 +348,18 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
                 Ok(bytes) => Ok(bytes),
                 // Parallel scan can fail on random/stored-block data with false gzip
                 // header sequences; sequential path handles all multi-member files.
-                Err(_) => decompress_multi_member_sequential(data, writer),
+                Err(_) => decompress_multi_member_sequential(data, writer, verbose),
             }
         }
         DecodePath::MultiMemberChunked => {
-            decompress_multi_member_chunked(data, writer, num_threads)
+            decompress_multi_member_chunked(data, writer, num_threads, verbose)
         }
         DecodePath::MultiMemberGrid => {
-            decompress_multi_member_grid(data, writer, None, num_threads)
+            decompress_multi_member_grid(data, writer, None, num_threads, verbose)
         }
-        DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
+        DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer, verbose),
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
-            decompress_single_member_for(path, data, writer, None, num_threads)
+            decompress_single_member_for(path, data, writer, None, num_threads, verbose)
         }
     }
 }
@@ -371,6 +374,7 @@ fn decompress_multi_member_chunked<W: Write>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     #[cfg(parallel_sm)]
     {
@@ -378,13 +382,14 @@ fn decompress_multi_member_chunked<W: Write>(
             data,
             writer,
             num_threads.max(1),
+            verbose,
         )
         .map_err(|e| GzippyError::decompression(format!("multi-member chunked: {e}")))
     }
     #[cfg(not(parallel_sm))]
     {
         let _ = num_threads;
-        decompress_multi_member_sequential(data, writer)
+        decompress_multi_member_sequential(data, writer, verbose)
     }
 }
 
@@ -400,6 +405,7 @@ fn decompress_multi_member_grid<W: Write>(
     writer: &mut W,
     out_fd: Option<i32>,
     num_threads: usize,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     #[cfg(parallel_sm)]
     {
@@ -408,13 +414,14 @@ fn decompress_multi_member_grid<W: Write>(
             writer,
             out_fd,
             num_threads.max(1),
+            verbose,
         )
         .map_err(|e| GzippyError::decompression(format!("multi-member grid: {e}")))
     }
     #[cfg(not(parallel_sm))]
     {
         let _ = (num_threads, out_fd);
-        decompress_multi_member_sequential(data, writer)
+        decompress_multi_member_sequential(data, writer, verbose)
     }
 }
 
@@ -425,6 +432,7 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
     writer: &mut W,
     out_fd: Option<i32>,
     num_threads: usize,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     let path = classify_gzip(data, num_threads);
     if crate::utils::debug_enabled() {
@@ -437,16 +445,16 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
     }
     match path {
         DecodePath::MultiMemberChunked => {
-            decompress_multi_member_chunked(data, writer, num_threads)
+            decompress_multi_member_chunked(data, writer, num_threads, verbose)
         }
         DecodePath::MultiMemberGrid => {
-            decompress_multi_member_grid(data, writer, out_fd, num_threads)
+            decompress_multi_member_grid(data, writer, out_fd, num_threads, verbose)
         }
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
-            decompress_multi_member_sequential(data, writer)
+            decompress_multi_member_sequential(data, writer, verbose)
         }
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
-            decompress_single_member_for(path, data, writer, out_fd, num_threads)
+            decompress_single_member_for(path, data, writer, out_fd, num_threads, verbose)
         }
     }
 }
@@ -466,8 +474,9 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
         }
         // Mixed "GZ" ++ plain concatenation: the deterministic chunked route
         // (matches `classify_gzip`). The BGZF fast path would truncate it.
+        // Library helper — no CLI `--verbose` concept reaches here.
         let mut out = Vec::new();
-        decompress_multi_member_chunked(data, &mut out, num_threads)?;
+        decompress_multi_member_chunked(data, &mut out, num_threads, false)?;
         return Ok(out);
     }
     if num_threads > 1 && is_likely_multi_member(data) {
@@ -481,13 +490,13 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
             // to the sequential path which handles all multi-member files correctly.
             Err(_) => {
                 let mut out = Vec::new();
-                decompress_multi_member_sequential(data, &mut out)?;
+                decompress_multi_member_sequential(data, &mut out, false)?;
                 return Ok(out);
             }
         }
     }
     let mut output = Vec::new();
-    decompress_gzip_libdeflate(data, &mut output, num_threads)?;
+    decompress_gzip_libdeflate(data, &mut output, num_threads, false)?;
     Ok(output)
 }
 
@@ -498,6 +507,7 @@ pub(crate) fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     let path = classify_gzip(data, num_threads);
     if crate::utils::debug_enabled() {
@@ -519,16 +529,16 @@ pub(crate) fn decompress_single_member<W: Write>(
         // paths -> empty output / terminal error. Caught by the multi-member
         // `-p1` audit: `cat a.gz a.gz | gzippy -d -p1` produced 0 bytes.)
         DecodePath::MultiMemberChunked => {
-            decompress_multi_member_chunked(data, writer, num_threads)
+            decompress_multi_member_chunked(data, writer, num_threads, verbose)
         }
         DecodePath::MultiMemberGrid => {
-            decompress_multi_member_grid(data, writer, None, num_threads)
+            decompress_multi_member_grid(data, writer, None, num_threads, verbose)
         }
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
-            decompress_multi_member_sequential(data, writer)
+            decompress_multi_member_sequential(data, writer, verbose)
         }
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
-            decompress_single_member_for(path, data, writer, None, num_threads)
+            decompress_single_member_for(path, data, writer, None, num_threads, verbose)
         }
     }
 }
@@ -544,7 +554,7 @@ pub(crate) fn decompress_single_member_pure<W: Write>(
     data: &[u8],
     writer: &mut W,
 ) -> GzippyResult<u64> {
-    decompress_single_member(data, writer, 1)
+    decompress_single_member(data, writer, 1, false)
 }
 
 /// Hard dispatcher. Each arm is terminal — success or `Err`.
@@ -554,6 +564,7 @@ fn decompress_single_member_for<W: Write>(
     writer: &mut W,
     out_fd: Option<i32>,
     num_threads: usize,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     match path {
         DecodePath::ParallelSM => {
@@ -566,6 +577,7 @@ fn decompress_single_member_for<W: Write>(
                 writer,
                 out_fd,
                 num_threads,
+                verbose,
             )
             .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
             writer.flush()?;
@@ -626,6 +638,7 @@ fn decompress_single_member_for<W: Write>(
                         writer,
                         out_fd,
                         num_threads,
+                        verbose,
                     )
                     .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
                     writer.flush()?;
@@ -665,6 +678,7 @@ fn decompress_single_member_for<W: Write>(
 pub(crate) fn decompress_multi_member_sequential<W: Write>(
     data: &[u8],
     writer: &mut W,
+    verbose: bool,
 ) -> GzippyResult<u64> {
     // T1 FAST PATH (parallel_sm builds): decode through the ParallelSM chunk
     // kernel instead of the legacy scalar `inflate_consume_first_bits`, recovering
@@ -678,8 +692,10 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
     // See `single_member::decompress_multi_member_seq_fast`.
     #[cfg(parallel_sm)]
     {
-        crate::decompress::parallel::single_member::decompress_multi_member_seq_fast(data, writer)
-            .map_err(|e| GzippyError::decompression(format!("multi-member seq: {e}")))
+        crate::decompress::parallel::single_member::decompress_multi_member_seq_fast(
+            data, writer, verbose,
+        )
+        .map_err(|e| GzippyError::decompression(format!("multi-member seq: {e}")))
     }
 
     #[cfg(not(parallel_sm))]
@@ -687,6 +703,9 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
         use crate::decompress::format::parse_gzip_header_size;
         use crate::decompress::inflate::consume_first_decode::{inflate_consume_first_bits, Bits};
 
+        // No `--verbose` BlockFetcher stats dump exists on the legacy scalar
+        // walk (the chunk_fetcher machinery isn't compiled in).
+        let _ = verbose;
         let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
         let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
             isize_hint + 1024
@@ -992,7 +1011,7 @@ mod tests {
         );
         // And it must decode byte-perfectly through whatever path it took.
         let mut out = Vec::new();
-        decompress_single_member(&compressed, &mut out, 4).expect("must decode");
+        decompress_single_member(&compressed, &mut out, 4, false).expect("must decode");
         assert_eq!(out, original, "byte-perfect output required");
     }
 
@@ -1011,7 +1030,7 @@ mod tests {
         let (original, compressed) = compressible_parallel_fixture();
         assert_eq!(classify_gzip(&compressed, 4), DecodePath::ParallelSM);
         let mut out = Vec::new();
-        decompress_single_member(&compressed, &mut out, 4).expect("must succeed");
+        decompress_single_member(&compressed, &mut out, 4, false).expect("must succeed");
         assert_eq!(out, original, "byte-perfect output required");
     }
 
@@ -1029,7 +1048,7 @@ mod tests {
         let mid = compressed.len() / 2;
         compressed[mid] ^= 0xFF;
         let mut out = Vec::new();
-        let res = decompress_single_member(&compressed, &mut out, 4);
+        let res = decompress_single_member(&compressed, &mut out, 4, false);
         assert!(
             matches!(res, Err(GzippyError::Decompression(_))),
             "corrupt input must propagate Err(Decompression(_)), got {:?}",
@@ -1069,7 +1088,8 @@ mod tests {
         );
         // Whatever sub-path the classifier picks, it must decode.
         let mut out = Vec::new();
-        decompress_single_member(&compressed, &mut out, 4).expect("below-gate must still decode");
+        decompress_single_member(&compressed, &mut out, 4, false)
+            .expect("below-gate must still decode");
         assert_eq!(out, small);
     }
 
@@ -1166,12 +1186,14 @@ mod tests {
 
         // Single-threaded reference decode.
         let mut ref_out = Vec::new();
-        decompress_single_member(&compressed, &mut ref_out, 1).expect("T=1 decode must succeed");
+        decompress_single_member(&compressed, &mut ref_out, 1, false)
+            .expect("T=1 decode must succeed");
         assert_eq!(ref_out, original, "T=1 must decode byte-exact");
 
         // Multi-threaded decode must be byte-identical.
         let mut par_out = Vec::new();
-        decompress_single_member(&compressed, &mut par_out, 4).expect("T=4 decode must succeed");
+        decompress_single_member(&compressed, &mut par_out, 4, false)
+            .expect("T=4 decode must succeed");
         assert_eq!(
             par_out, original,
             "T=4 parallel decode must be byte-identical to T=1; \
@@ -1199,7 +1221,7 @@ mod tests {
         let num_threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4);
-        decompress_gzip_libdeflate(&multi, &mut output, num_threads).unwrap();
+        decompress_gzip_libdeflate(&multi, &mut output, num_threads, false).unwrap();
 
         let mut expected = part1;
         expected.extend_from_slice(&part2);

@@ -163,7 +163,7 @@ mod tests {
             .load(Ordering::Relaxed);
 
         let mut got = Vec::with_capacity(reference.len());
-        crate::decompress::decompress_single_member(gz, &mut got, 4)
+        crate::decompress::decompress_single_member(gz, &mut got, 4, false)
             .unwrap_or_else(|e| panic!("{label}: parallel-SM decode failed: {e}"));
 
         let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
@@ -461,6 +461,7 @@ mod tests {
                 4,
                 chunk_kib * 1024,
                 &mut bytes_written,
+                false,
             );
             r.unwrap_or_else(|e| panic!("silesia chunk_kib={chunk_kib}: decode failed: {e:?}"));
             assert_eq!(

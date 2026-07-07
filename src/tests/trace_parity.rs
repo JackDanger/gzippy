@@ -25,7 +25,7 @@ mod tests {
 
     fn decompress_via_router(gz: &[u8], threads: usize) -> Vec<u8> {
         let mut out = Vec::new();
-        crate::decompress::decompress_gzip_libdeflate(gz, &mut out, threads).unwrap();
+        crate::decompress::decompress_gzip_libdeflate(gz, &mut out, threads, false).unwrap();
         out
     }
 

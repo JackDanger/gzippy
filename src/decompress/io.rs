@@ -332,6 +332,7 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                     input_data,
                     &mut counted,
                     args.processes,
+                    args.verbose,
                 )?;
             }
         }
@@ -430,6 +431,7 @@ fn decompress_to_writer<W: Write>(
                     writer,
                     out_fd,
                     args.processes,
+                    args.verbose,
                 )
             }
         }

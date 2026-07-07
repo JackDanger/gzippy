@@ -112,13 +112,15 @@ mod tests {
             .load(Ordering::Relaxed);
 
         let mut got = Vec::with_capacity(reference.len());
-        crate::decompress::decompress_single_member(compressed, &mut got, 4).unwrap_or_else(|e| {
-            panic!(
-                "{label}: pure-rust-inflate parallel-SM decode failed: {e}\n\
+        crate::decompress::decompress_single_member(compressed, &mut got, 4, false).unwrap_or_else(
+            |e| {
+                panic!(
+                    "{label}: pure-rust-inflate parallel-SM decode failed: {e}\n\
                  (CRC32 / ISIZE mismatch surfaces here as `Decompression(...)`;\n\
                   silent truncation would surface as length mismatch below)"
-            );
-        });
+                );
+            },
+        );
 
         let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
@@ -362,6 +364,7 @@ mod tests {
             &mut got,
             None,
             1,
+            false,
         )
         .expect("thin-T1 decode");
         let after =

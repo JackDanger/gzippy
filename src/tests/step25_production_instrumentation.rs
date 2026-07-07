@@ -75,7 +75,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
 
         let mut out = Vec::with_capacity(payload.len() + 1024);
-        crate::decompress::decompress_single_member(&compressed, &mut out, 4)
+        crate::decompress::decompress_single_member(&compressed, &mut out, 4, false)
             .expect("parallel-SM decode");
         assert_eq!(out, payload, "production decode must be byte-perfect");
 

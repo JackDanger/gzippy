@@ -190,7 +190,7 @@ fn isal_engine_oracle_enabled() -> bool {
 /// `GZIPPY_SEEDED_BLOCK=0` (restoring the pre-M3 wrapper path); the env
 /// override was removed 2026-07-07 (batch 4f) — hardcoded to the shipped
 /// default (ON). Production proof of which engine decoded each seeded chunk:
-/// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
+/// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (`--verbose` dump).
 #[cfg(parallel_sm)]
 fn seeded_block_enabled() -> bool {
     true
@@ -211,7 +211,7 @@ fn seeded_block_route_enabled() -> bool {
 /// `GZIPPY_EXACT_BLOCK=0` (restoring the pre-M4 wrapper path); the env
 /// override was removed 2026-07-07 (batch 4f) — hardcoded to the shipped
 /// default (ON). Production proof of which engine decoded each exact chunk:
-/// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (GZIPPY_VERBOSE dump).
+/// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (`--verbose` dump).
 #[cfg(parallel_sm)]
 fn exact_block_enabled() -> bool {
     true
@@ -477,7 +477,7 @@ fn finish_decode_chunk_impl(
     // CLAUDE.md). `finish_decode_chunk_isal_oracle` and `isal_incremental_growth`
     // were themselves deleted (x86-finish batch, 2026-07-07) — zero remaining
     // callers once this branch was removed. The ISAL_ENGINE_ORACLE_* counters
-    // stay (still read by the `GZIPPY_VERBOSE` dump in `chunk_fetcher.rs`) but
+    // stay (still read by the `--verbose` dump in `chunk_fetcher.rs`) but
     // are now permanently zero.
     let t_decode = std::time::Instant::now();
 

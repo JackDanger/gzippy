@@ -282,6 +282,7 @@ pub fn drive<W: std::io::Write>(
     out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
+    verbose: bool,
 ) -> Result<(u32, usize), FetchError> {
     drive_impl(
         input,
@@ -291,6 +292,7 @@ pub fn drive<W: std::io::Write>(
         configuration,
         None,
         None,
+        verbose,
     )
 }
 
@@ -308,6 +310,7 @@ pub fn drive_capturing<W: std::io::Write>(
     parallelization: usize,
     configuration: ChunkConfiguration,
     bytes_written_out: &mut usize,
+    verbose: bool,
 ) -> Result<(u32, usize), FetchError> {
     drive_impl(
         input,
@@ -317,6 +320,7 @@ pub fn drive_capturing<W: std::io::Write>(
         configuration,
         None,
         Some(bytes_written_out),
+        verbose,
     )
 }
 
@@ -483,6 +487,10 @@ fn drive_impl<W: std::io::Write>(
     // bytes already streamed, instead of silently truncating. `None` for every
     // existing caller (zero behavior change).
     bytes_written_out: Option<&mut usize>,
+    // `--verbose` end-of-decode BlockFetcher statistics dump. Threaded from the
+    // CLI's `args.verbose` (main.rs → decompress::io → down the call graph) —
+    // replaces the old internal env-var round-trip (batch 4g).
+    verbose: bool,
 ) -> Result<(u32, usize), FetchError> {
     let total_bits = input.len() * 8;
     // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
@@ -675,12 +683,11 @@ fn drive_impl<W: std::io::Write>(
 
     // Phase-timing: pool stopped, output flushed, block_map/finder finalized,
     // --verbose stats dump. Mirror of vendor's destructor print at
-    // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Triggered
-    // by GZIPPY_VERBOSE env var (matches the existing GZIPPY_DEBUG
-    // pattern at single_member.rs::debug_enabled). The CLI sets this
-    // when --verbose is passed; tests and other internal callers
-    // ignore it.
-    if std::env::var("GZIPPY_VERBOSE").is_ok() {
+    // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Gated on the
+    // `verbose` parameter threaded down from the CLI's `args.verbose`
+    // (batch 4g — replaces the old internal env-var round-trip).
+    // Tests and other internal callers pass `false`.
+    if verbose {
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
@@ -2624,7 +2631,7 @@ pub static SPEC_FAIL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// (GzipChunk.hpp:491-498), which `tryToDecode`'s catch (GzipChunk.hpp:728-732)
 /// turns into a `std::nullopt` — the candidate is silently discarded and the next
 /// candidate is tried. `SPECULATIVE_PHANTOM_EOS_REJECTS` counts the gzippy-side
-/// equivalent rejections, observable in `GZIPPY_VERBOSE` output.
+/// equivalent rejections, observable in `--verbose` output.
 #[cfg(parallel_sm)]
 pub static SPECULATIVE_PHANTOM_EOS_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -3565,7 +3572,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = Vec::new();
-        let (_crc, n) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
+        let (_crc, n) = drive(&deflate, &mut out, None, 8, cfg, false).expect("drive");
         assert_eq!(n, payload.len());
         assert_eq!(out, payload);
     }
@@ -3676,7 +3683,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, None, 4, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 4, cfg, false).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3695,7 +3702,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg, false).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3807,7 +3814,7 @@ mod tests {
 
         let chunk_size = 4 * 1024 * 1024;
         let mut out = Vec::new();
-        let result = read_parallel_sm(&gz, &mut out, None, 2, chunk_size);
+        let result = read_parallel_sm(&gz, &mut out, None, 2, chunk_size, false);
         assert_eq!(result.expect("read_parallel_sm T=2").total_size, head.len());
         assert_eq!(out, head);
     }
@@ -3829,7 +3836,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg, false).expect("drive");
         assert_eq!(size, payload.len(), "size mismatch (suggests early break)");
         assert_eq!(out, payload, "byte mismatch");
     }

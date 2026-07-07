@@ -40,6 +40,7 @@ pub fn read_parallel_sm<W: std::io::Write>(
     out_fd: Option<i32>,
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
+    verbose: bool,
 ) -> Result<ReadResult, ReadParallelSmError> {
     read_parallel_sm_inner(
         gzip_data,
@@ -48,6 +49,7 @@ pub fn read_parallel_sm<W: std::io::Write>(
         parallelization,
         target_compressed_chunk_bytes,
         None,
+        verbose,
     )
 }
 
@@ -63,6 +65,7 @@ pub fn read_parallel_sm_capturing<W: std::io::Write>(
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
     bytes_written_out: &mut usize,
+    verbose: bool,
 ) -> Result<ReadResult, ReadParallelSmError> {
     read_parallel_sm_inner(
         gzip_data,
@@ -71,6 +74,7 @@ pub fn read_parallel_sm_capturing<W: std::io::Write>(
         parallelization,
         target_compressed_chunk_bytes,
         Some(bytes_written_out),
+        verbose,
     )
 }
 
@@ -86,6 +90,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
     bytes_written_out: Option<&mut usize>,
+    verbose: bool,
 ) -> Result<ReadResult, ReadParallelSmError> {
     use crate::decompress::parallel::chunk_data::ChunkConfiguration;
     use crate::decompress::parallel::chunk_fetcher;
@@ -203,9 +208,17 @@ fn read_parallel_sm_inner<W: std::io::Write>(
             parallelization,
             configuration,
             out,
+            verbose,
         )
     } else {
-        chunk_fetcher::drive(deflate_data, writer, out_fd, parallelization, configuration)
+        chunk_fetcher::drive(
+            deflate_data,
+            writer,
+            out_fd,
+            parallelization,
+            configuration,
+            verbose,
+        )
     };
     let (total_crc, total_size) =
         drive_result.map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
@@ -302,6 +315,7 @@ pub fn read_parallel_sm_multi<W: std::io::Write>(
     writer: &mut W,
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
+    verbose: bool,
 ) -> Result<ReadResult, ReadParallelSmError> {
     MULTI_MEMBER_PIPELINE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     read_parallel_sm_resume_multi(
@@ -310,6 +324,7 @@ pub fn read_parallel_sm_multi<W: std::io::Write>(
         0,
         parallelization,
         target_compressed_chunk_bytes,
+        verbose,
     )
 }
 
@@ -338,6 +353,7 @@ pub fn read_parallel_sm_resume_multi<W: std::io::Write>(
     already_written: usize,
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
+    verbose: bool,
 ) -> Result<ReadResult, ReadParallelSmError> {
     use crate::decompress::parallel::gzip_format;
     use crate::decompress::scan_inflate;
@@ -386,6 +402,7 @@ pub fn read_parallel_sm_resume_multi<W: std::io::Write>(
             None,
             parallelization,
             target_compressed_chunk_bytes,
+            verbose,
         )?;
         total_size += r.total_size;
         members += 1;
@@ -435,6 +452,7 @@ pub fn read_parallel_sm_grid<W: std::io::Write>(
     out_fd: Option<i32>,
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
+    verbose: bool,
 ) -> Result<ReadResult, ReadParallelSmError> {
     use crate::decompress::parallel::chunk_data::ChunkConfiguration;
     use crate::decompress::parallel::chunk_fetcher;
@@ -496,9 +514,15 @@ pub fn read_parallel_sm_grid<W: std::io::Write>(
     // check here (a multi-member stream has one trailer PER member, not one
     // global trailer). `total_crc` is the whole-output rolling CRC and is
     // intentionally NOT compared to any single trailer.
-    let (_total_crc, total_size) =
-        chunk_fetcher::drive(input, writer, out_fd, parallelization, configuration)
-            .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
+    let (_total_crc, total_size) = chunk_fetcher::drive(
+        input,
+        writer,
+        out_fd,
+        parallelization,
+        configuration,
+        verbose,
+    )
+    .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
     Ok(ReadResult {
         total_crc: 0,
@@ -556,7 +580,7 @@ mod tests {
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         let gzip = make_gzip(&payload);
         let mut out = Vec::new();
-        let result = read_parallel_sm(&gzip, &mut out, None, 4, 512 * 1024).unwrap();
+        let result = read_parallel_sm(&gzip, &mut out, None, 4, 512 * 1024, false).unwrap();
         assert_eq!(out, payload);
         assert_eq!(result.total_size, payload.len());
     }
@@ -597,7 +621,7 @@ mod tests {
             let original_len = original.len();
             let handle = std::thread::spawn(move || {
                 let mut out = Vec::with_capacity(original_len);
-                let res = read_parallel_sm(&gzip, &mut out, None, 16, 1024 * 1024);
+                let res = read_parallel_sm(&gzip, &mut out, None, 16, 1024 * 1024, false);
                 let _ = tx.send((res, out));
             });
 

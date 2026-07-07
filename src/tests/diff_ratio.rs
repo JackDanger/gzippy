@@ -234,7 +234,7 @@ mod tests {
                 || {
                     let mut out = Vec::new();
                     let _ = crate::decompress::parallel::single_member::decompress_parallel(
-                        data, &mut out, None, 4,
+                        data, &mut out, None, 4, false,
                     );
                 },
                 || {
@@ -248,7 +248,7 @@ mod tests {
                     // pipeline-vs-itself regression check.
                     let mut out = Vec::new();
                     let _ = crate::decompress::parallel::single_member::decompress_parallel(
-                        data, &mut out, None, 1,
+                        data, &mut out, None, 1, false,
                     );
                 },
             );
@@ -312,7 +312,7 @@ mod tests {
             || {
                 let mut out = Vec::new();
                 let _ = crate::decompress::parallel::single_member::decompress_parallel(
-                    data, &mut out, None, 4,
+                    data, &mut out, None, 4, false,
                 );
             },
             || {

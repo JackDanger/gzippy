@@ -814,6 +814,7 @@ pub fn decompress_parallel<W: Write>(
     writer: &mut W,
     out_fd: Option<i32>,
     num_threads: usize,
+    verbose: bool,
 ) -> Result<u64, ParallelError> {
     let t0 = std::time::Instant::now();
 
@@ -892,6 +893,7 @@ pub fn decompress_parallel<W: Write>(
             num_threads,
             chunk_size,
             &mut bytes_written,
+            verbose,
         );
 
         let result = match sm_result {
@@ -930,6 +932,7 @@ pub fn decompress_parallel<W: Write>(
                         bytes_written,
                         num_threads,
                         chunk_size,
+                        verbose,
                     )
                     .map_err(|me| {
                         ParallelError::DecodeFailed(format!("multi-member resume: {me}"))
@@ -986,6 +989,7 @@ pub fn decompress_multi_member_grid<W: Write>(
     writer: &mut W,
     out_fd: Option<i32>,
     num_threads: usize,
+    verbose: bool,
 ) -> Result<u64, ParallelError> {
     use crate::decompress::parallel::sm_driver::{read_parallel_sm_grid, ReadParallelSmError};
 
@@ -995,15 +999,13 @@ pub fn decompress_multi_member_grid<W: Write>(
     let num_threads = num_threads.max(1);
     let chunk_size =
         adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
-    let r =
-        read_parallel_sm_grid(gzip_data, writer, out_fd, num_threads, chunk_size).map_err(|e| {
-            match e {
-                ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
-                ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
-                ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
-                ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
-                ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
-            }
+    let r = read_parallel_sm_grid(gzip_data, writer, out_fd, num_threads, chunk_size, verbose)
+        .map_err(|e| match e {
+            ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+            ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+            ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
+            ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+            ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
         })?;
     writer
         .flush()
@@ -1015,6 +1017,7 @@ pub fn decompress_multi_member_chunked<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
     num_threads: usize,
+    verbose: bool,
 ) -> Result<u64, ParallelError> {
     use crate::decompress::parallel::sm_driver::{read_parallel_sm_multi, ReadParallelSmError};
 
@@ -1024,7 +1027,7 @@ pub fn decompress_multi_member_chunked<W: Write>(
     let num_threads = num_threads.max(1);
     let chunk_size =
         adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
-    let r = read_parallel_sm_multi(gzip_data, writer, num_threads, chunk_size).map_err(
+    let r = read_parallel_sm_multi(gzip_data, writer, num_threads, chunk_size, verbose).map_err(
         |e| match e {
             ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
             ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
@@ -1097,6 +1100,7 @@ fn map_read_sm_err(
 pub fn decompress_multi_member_seq_fast<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
+    verbose: bool,
 ) -> Result<u64, ParallelError> {
     use crate::decompress::parallel::sm_driver::{
         read_parallel_sm_grid, read_parallel_sm_resume_multi, ReadParallelSmError,
@@ -1111,7 +1115,7 @@ pub fn decompress_multi_member_seq_fast<W: Write>(
         inner: writer,
         count: 0,
     };
-    let grid = read_parallel_sm_grid(gzip_data, &mut counter, None, 1, chunk_size);
+    let grid = read_parallel_sm_grid(gzip_data, &mut counter, None, 1, chunk_size, verbose);
     let streamed = counter.count;
     let inner = counter.inner;
 
@@ -1131,8 +1135,9 @@ pub fn decompress_multi_member_seq_fast<W: Write>(
         // validated prefix. If the stream is genuinely corrupt, the walk fails
         // again → terminal error (never silent truncation).
         Err(_) => {
-            let r = read_parallel_sm_resume_multi(gzip_data, inner, streamed, 1, chunk_size)
-                .map_err(map_read_sm_err)?;
+            let r =
+                read_parallel_sm_resume_multi(gzip_data, inner, streamed, 1, chunk_size, verbose)
+                    .map_err(map_read_sm_err)?;
             inner
                 .flush()
                 .map_err(|_| ParallelError::InvalidGzipFormat)?;
@@ -1754,7 +1759,7 @@ mod tests {
     fn small_input_returns_hard_error() {
         let small = [0u8; 100];
         let mut out = Vec::new();
-        let err = decompress_parallel(&small, &mut out, None, 4).unwrap_err();
+        let err = decompress_parallel(&small, &mut out, None, 4, false).unwrap_err();
         // Either InvalidHeader (no gzip magic) or InvalidGzipFormat
         // (too short for a deflate body). Both are terminal —
         // `TooSmall` is gone.
@@ -1784,7 +1789,7 @@ mod tests {
         enc.write_all(&vec![0u8; 5_000_000]).unwrap();
         let gz = enc.finish().unwrap();
         let mut out = Vec::new();
-        let n = decompress_parallel(&gz, &mut out, None, 1)
+        let n = decompress_parallel(&gz, &mut out, None, 1, false)
             .expect("pure-Rust SM decodes a small input at T=1");
         assert_eq!(n, 5_000_000);
         assert_eq!(out, vec![0u8; 5_000_000]);

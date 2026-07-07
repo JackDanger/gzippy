@@ -3042,9 +3042,10 @@ mod clean_path_lut_guard {
         litlen_count::READS.store(0, Relaxed);
 
         let mut out = Vec::with_capacity(data.len());
-        let n =
-            crate::decompress::parallel::single_member::decompress_parallel(&gz, &mut out, None, 1)
-                .expect("T1 clean-path decode must succeed");
+        let n = crate::decompress::parallel::single_member::decompress_parallel(
+            &gz, &mut out, None, 1, false,
+        )
+        .expect("T1 clean-path decode must succeed");
 
         // Byte-exactness first — a read==0 on a wrong-bytes decode proves nothing.
         assert_eq!(out, data, "clean-path decode must be byte-exact");
