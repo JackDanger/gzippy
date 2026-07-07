@@ -320,6 +320,95 @@ mod tests {
         }
     }
 
+    /// Engine-swap correctness (mmiso T1, 2026-07-06): the T1 `MultiMemberSeq`
+    /// path now routes each member's decode through the ParallelSM chunk kernel
+    /// (per-member slice + own-trailer verify) instead of the scalar
+    /// `inflate_consume_first_bits`. A member with a CORRUPTED CRC32 must be a
+    /// TERMINAL error (gzip semantics), NOT silently accepted — the exact
+    /// guarantee the engine-swap must preserve. Corrupt the LAST member's CRC and
+    /// assert the whole decode errors.
+    #[test]
+    fn test_multi_member_seq_t1_corrupt_crc_errors() {
+        let original = make_low_entropy_data(600 * 1024); // 256 KiB chunks → ≥2 members
+        let mut mm = compress_multi_member_gzip(&original);
+        assert!(mm.len() > 16, "fixture must be a real multi-member stream");
+        // CRC32 of the LAST member lives at bytes [len-8 .. len-4]. Flip one bit.
+        let len = mm.len();
+        mm[len - 8] ^= 0xFF;
+        let mut out = Vec::new();
+        let r = crate::decompress::decompress_multi_member_sequential(&mm, &mut out);
+        assert!(
+            r.is_err(),
+            "corrupt member CRC must be a terminal error, got Ok ({} bytes)",
+            out.len()
+        );
+    }
+
+    /// Engine-swap correctness (mmiso T1): an EMPTY interior member (ISIZE=0)
+    /// contributes zero bytes and the walk must continue past it byte-exact. The
+    /// old scalar loop and the new chunk-kernel walk must agree with gzip(1).
+    #[test]
+    fn test_multi_member_seq_t1_empty_interior_member_byte_exact() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let gz_of = |bytes: &[u8]| -> Vec<u8> {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+            enc.write_all(bytes).unwrap();
+            enc.finish().unwrap()
+        };
+        let d1 = make_low_entropy_data(300 * 1024);
+        let d2 = make_low_entropy_data(200 * 1024);
+        let mut mm = gz_of(&d1);
+        mm.extend_from_slice(&gz_of(b"")); // empty INTERIOR member (ISIZE=0)
+        mm.extend_from_slice(&gz_of(&d2));
+
+        let mut want = d1.clone();
+        want.extend_from_slice(&d2);
+        // Independent oracle.
+        assert_eq!(decompress_reference(&mm), want, "reference oracle sanity");
+
+        let mut out = Vec::new();
+        crate::decompress::decompress_multi_member_sequential(&mm, &mut out)
+            .expect("empty-interior multi-member must decode");
+        assert_eq!(out, want, "empty interior member: not byte-exact");
+    }
+
+    /// Engine-swap correctness (mmiso T1): a COMPRESSIBLE multi-member stream
+    /// (pigz-style, many 256 KiB members) routed through the real classifier at
+    /// T1 must land on `MultiMemberSeq` AND decode byte-exact through the fast
+    /// per-member chunk kernel. This is the perf-target shape; the >16 MiB
+    /// dominant-first (mis-detect) case is covered by
+    /// `test_dominant_first_stored_multi_member_p1_byte_exact`.
+    #[test]
+    fn test_multi_member_seq_t1_compressible_byte_exact() {
+        let original = make_low_entropy_data(3 * 1024 * 1024); // → ~12 members
+        let mm = compress_multi_member_gzip(&original);
+        assert!(
+            crate::decompress::format::is_likely_multi_member(&mm),
+            "fixture must be detected multi-member"
+        );
+        assert_eq!(
+            crate::decompress::classify_gzip(&mm, 1),
+            crate::decompress::DecodePath::MultiMemberSeq,
+            "compressible multi-member at T1 must classify MultiMemberSeq"
+        );
+        assert_eq!(
+            decompress_reference(&mm),
+            original,
+            "reference oracle sanity"
+        );
+
+        // Through the production single-member entry at T1.
+        let mut out = Vec::new();
+        crate::decompress::decompress_single_member(&mm, &mut out, 1)
+            .expect("compressible multi-member T1 must decode");
+        assert_eq!(
+            out, original,
+            "compressible multi-member T1: not byte-exact"
+        );
+    }
+
     /// Advisor review of the eager window-chain port (queuePrefetchedChunkPostProcessing,
     /// f7868ab): the consumer now eagerly publishes each prefetched chunk's end-window via
     /// `get_last_window`. Vendor `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:562-570)

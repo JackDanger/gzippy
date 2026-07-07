@@ -1040,6 +1040,108 @@ pub fn decompress_multi_member_chunked<W: Write>(
     Ok(r.total_size as u64)
 }
 
+/// A `Write` that forwards to `inner` and counts the bytes streamed. Used by the
+/// T1 multi-member fast path to learn how many validated output bytes the grid
+/// attempt streamed before an error, so the member-walk fallback can resume past
+/// them (a `SkipWriter` drops exactly that prefix).
+#[cfg(parallel_sm)]
+struct CountWriter<'a, W: Write> {
+    inner: &'a mut W,
+    count: usize,
+}
+
+#[cfg(parallel_sm)]
+impl<W: Write> Write for CountWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(parallel_sm)]
+fn map_read_sm_err(
+    e: crate::decompress::parallel::sm_driver::ReadParallelSmError,
+) -> ParallelError {
+    use crate::decompress::parallel::sm_driver::ReadParallelSmError;
+    match e {
+        ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+        ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+        ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
+        ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+        ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+    }
+}
+
+/// T1 fast path for [`crate::decompress::DecodePath::MultiMemberSeq`] (mmiso
+/// 2026-07-06). Decode a plain multi-member gzip stream at parallelization=1
+/// through the ParallelSM chunk kernel instead of the legacy scalar
+/// `inflate_consume_first_bits` — recovering the located ~3× T1 deficit
+/// (measured on a silesia multi-member: 23.0 → 8.9 insn/byte, 0.66 → 0.22 s,
+/// 760 → 106 MiB RSS on M1).
+///
+/// Strategy: try the WHOLE-FILE grid first (one inflate pass, member boundaries
+/// discovered inline, per-member CRC32 + ISIZE verified in the consumer). The
+/// grid's speculative block finder can fail on a sparse-boundary member or on
+/// trailing garbage where a bounded per-member walk succeeds; on such a failure
+/// we RESUME the sequential member-walk past the validated prefix already
+/// streamed (a `SkipWriter` drops those bytes). This is the SAME correction
+/// [`decompress_parallel`] applies to a misrouted single-member stream — NOT a
+/// silent backend retry masking a failure: the member-walk re-verifies every
+/// member's CRC32 + ISIZE, so a genuinely corrupt stream surfaces here as a
+/// terminal error and trailing garbage clean-stops (gzip(1) parity). Respects
+/// `-p1`: FASTER engine at effective-T=1, never a parallelized request.
+#[cfg(parallel_sm)]
+pub fn decompress_multi_member_seq_fast<W: Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+) -> Result<u64, ParallelError> {
+    use crate::decompress::parallel::sm_driver::{
+        read_parallel_sm_grid, read_parallel_sm_resume_multi, ReadParallelSmError,
+    };
+
+    if gzip_data.len() < 18 || gzip_data[0] != 0x1f || gzip_data[1] != 0x8b {
+        return Err(ParallelError::InvalidGzipFormat);
+    }
+    let chunk_size = adjusted_chunk_size_bytes(gzip_data.len(), 1, TARGET_COMPRESSED_CHUNK_BYTES);
+
+    let mut counter = CountWriter {
+        inner: writer,
+        count: 0,
+    };
+    let grid = read_parallel_sm_grid(gzip_data, &mut counter, None, 1, chunk_size);
+    let streamed = counter.count;
+    let inner = counter.inner;
+
+    match grid {
+        Ok(r) => {
+            inner
+                .flush()
+                .map_err(|_| ParallelError::InvalidGzipFormat)?;
+            Ok(r.total_size as u64)
+        }
+        // A malformed FIRST header / too-short stream is genuine malformation the
+        // member-walk cannot recover — propagate it directly.
+        Err(e @ (ReadParallelSmError::InvalidHeader | ReadParallelSmError::InvalidFormat)) => {
+            Err(map_read_sm_err(e))
+        }
+        // Decode / boundary / trailer failure: resume the member-walk past the
+        // validated prefix. If the stream is genuinely corrupt, the walk fails
+        // again → terminal error (never silent truncation).
+        Err(_) => {
+            let r = read_parallel_sm_resume_multi(gzip_data, inner, streamed, 1, chunk_size)
+                .map_err(map_read_sm_err)?;
+            inner
+                .flush()
+                .map_err(|_| ParallelError::InvalidGzipFormat)?;
+            Ok(r.total_size as u64)
+        }
+    }
+}
+
 // ── Error type ───────────────────────────────────────────────────────────────
 
 /// Every variant is terminal — the classifier filters
