@@ -14,7 +14,6 @@ pub mod index;
 pub mod inflate;
 pub mod inflate_tables;
 pub mod io;
-pub mod mmap_writer;
 pub mod packed_lut;
 pub mod parallel;
 pub mod scan_inflate;

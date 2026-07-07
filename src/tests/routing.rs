@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     /// Repeated CRC gate on real silesia — catches rare (~1–2%) prefetch-path
-    /// corruption at T≥2 (GZIPPY_NO_PREFETCH=1 is clean; see fname-header test).
+    /// corruption at T≥2 (see fname-header test).
     #[test]
     #[cfg(parallel_sm)]
     fn test_silesia_gzip_parallel_sm_crc_stress() {
