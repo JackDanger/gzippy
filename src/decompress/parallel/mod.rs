@@ -135,4 +135,4 @@ pub use instruments::{contig_prof, slow_knob};
 // The rest are consumed only by parallel_sm modules; gate the re-export so the
 // non-parallel_sm (legacy serial) build does not see them as unused imports.
 #[cfg(parallel_sm)]
-pub use instruments::{removal_oracle, trace_jsonl as trace, trace_timeline as trace_v2};
+pub use instruments::removal_oracle;

@@ -806,10 +806,6 @@ impl ChunkData {
         // `data_with_markers`. For bootstraps that filled the whole
         // chunk (no clean-window handoff), values can be several
         // million u16 = 10+ MB memcpy per call.
-        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-            "worker.append_markered",
-            &format!(r#""len":{}"#, values.len()),
-        );
         self.statistics.non_marker_count += values.len() as u64;
         // `allocator_api2::vec::Vec::extend_from_slice` does NOT
         // specialize for `Copy` source types — it falls back to

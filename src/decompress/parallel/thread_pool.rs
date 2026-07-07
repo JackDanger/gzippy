@@ -328,10 +328,6 @@ impl ThreadPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-            "pool.submit",
-            &format!(r#""priority":{priority}"#),
-        );
         let (tx, rx) = mpsc::sync_channel::<T>(1);
         let future = Future { rx };
 
@@ -487,7 +483,6 @@ fn worker_main(
         }
     }
 
-    use crate::decompress::parallel::trace_v2;
     while running.load(Ordering::Acquire) {
         // ADAPTIVE PRE-PARK SPIN (byte-transparent; no rapidgzip
         // counterpart — see `pool_spin_us` doc). During the short,
@@ -514,14 +509,6 @@ fn worker_main(
                 }
             }
         }
-        // pool.pick = the time a worker spends waiting for + dequeuing a task.
-        // Split into `pool.pick.lock` (mutex acquire + dequeue) vs
-        // `pool.pick.wait` (condvar wait) so a follow-up trace can tell
-        // condvar-starvation (consumer-side fix) from mutex contention
-        // (pool-side fix). Outer `pool.pick` preserved for back-compat
-        // with prior timeline diffs.
-        let _pick = trace_v2::SpanGuard::begin("pool.pick");
-        let _pick_lock = trace_v2::SpanGuard::begin("pool.pick.lock");
         let mut guard = shared.lock().expect("ThreadPool mutex poisoned");
 
         // ++m_idleThreadCount (ThreadPool.hpp:205) — must happen under
@@ -529,17 +516,11 @@ fn worker_main(
         // this increment cannot interleave.
         idle.fetch_add(1, Ordering::AcqRel);
 
-        // End the lock-acquire span here; the condvar will atomically
-        // release the mutex and re-acquire it on wake, so the time
-        // inside `wait_while` is condvar-wait + lock-reacquire combined.
-        drop(_pick_lock);
-        let _pick_wait = trace_v2::SpanGuard::begin("pool.pick.wait");
         // m_pingWorkers.wait(tasksLock, [this] () { return hasUnprocessedTasks() || !m_threadPoolRunning; });
         // (ThreadPool.hpp:206).
         guard = cv
             .wait_while(guard, |s| s.running && !has_unprocessed_tasks(&s.tasks))
             .expect("ThreadPool mutex poisoned during condvar wait");
-        drop(_pick_wait);
 
         // --m_idleThreadCount (ThreadPool.hpp:207).
         idle.fetch_sub(1, Ordering::AcqRel);
@@ -554,7 +535,6 @@ fn worker_main(
         // order, matching std::map.
         let task = first_pending_task(&mut guard.tasks);
         drop(guard);
-        drop(_pick);
 
         if let Some(t) = task {
             // Popped one task — retire its queue-depth hint (paired with
@@ -562,7 +542,6 @@ fn worker_main(
             // can never underflow.
             pending.fetch_sub(1, Ordering::Relaxed);
             // task() (ThreadPool.hpp:219).
-            let _run = trace_v2::SpanGuard::begin("pool.run_task");
             t();
         }
         // No task: loop and re-wait. This can happen if another worker
@@ -570,10 +549,6 @@ fn worker_main(
         // tolerance (the `if (nonEmptyTasks != m_tasks.end())` gate at
         // ThreadPool.hpp:215).
     }
-    // Flush this worker thread's trace buffer before exit so its events
-    // make it to disk. thread_local Drop is unreliable for pooled
-    // workers — explicit flush is the only guarantee.
-    trace_v2::flush_all();
 }
 
 /// Mirror of `bool hasUnprocessedTasks() const` (ThreadPool.hpp:188-193).

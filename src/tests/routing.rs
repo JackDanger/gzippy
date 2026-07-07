@@ -829,7 +829,6 @@ mod tests {
         eprintln!("--- pair-drain trace ---");
         let mut good = Vec::new();
         std::env::remove_var("GZIPPY_DRAIN_LONE");
-        std::env::set_var("GZIPPY_TRACE_DRAIN", "1");
         crate::decompress::decompress_single_member(&compressed, &mut good, threads)
             .expect("pair-drain decode");
 
@@ -838,7 +837,6 @@ mod tests {
         let mut bad = Vec::new();
         let err = crate::decompress::decompress_single_member(&compressed, &mut bad, threads);
         std::env::remove_var("GZIPPY_DRAIN_LONE");
-        std::env::remove_var("GZIPPY_TRACE_DRAIN");
 
         if err.is_ok() && bad == good {
             eprintln!("GZIPPY_DRAIN_LONE: byte-identical to pair drain (unexpected)");
@@ -1889,16 +1887,15 @@ mod tests {
     // Optimization counter tests previously lived here (OptimizationCounters
     // snapshots for v0.6 phase-1 internals). The rapidgzip-port replaces the
     // phase-based pipeline with the chunk_fetcher prefetch loop + worker
-    // pool; the relevant per-event observability is now in
-    // `src/decompress/parallel/trace.rs` (GZIPPY_LOG_FILE=path).
+    // pool; the per-event JSONL/timeline tracing that once lived under
+    // `src/decompress/parallel/instruments/` (GZIPPY_LOG_FILE / GZIPPY_TIMELINE)
+    // has since been removed as a byte-transparent cleanup.
     // =========================================================================
 
     // The four OptimizationCounters-based tests (test_isal_handoff_fires_*,
     // test_bootstrap_bounded_*, test_isal_produces_bulk_*, test_phase1a_*)
     // were deleted with the rapidgzip-port. Their assertions probed v0.6
-    // internal counters that no longer exist; the relevant per-event
-    // observability is now in `src/decompress/parallel/trace.rs`
-    // (GZIPPY_LOG_FILE=path → scripts/parallel_sm_log_summary.py).
+    // internal counters that no longer exist.
 
     // =========================================================================
     // Layer 3: Output Identity — same output regardless of thread count

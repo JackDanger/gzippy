@@ -931,14 +931,6 @@ fn finish_decode_chunk_impl(
     }
 
     let t_decode = std::time::Instant::now();
-    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.isal_stream_inflate",
-        &format!(
-            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{},"until_exact":{}"#,
-            !initial_window.is_empty(),
-            until_exact
-        ),
-    );
 
     let read_cap = if until_exact {
         stop_hint_bits
@@ -1210,13 +1202,6 @@ fn decode_chunk_with_rapidgzip_impl(
 
     if initial_window.len() == MAX_WINDOW_SIZE {
         WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::decompress::parallel::trace_v2::emit_instant(
-            "worker.chunk_phase",
-            &format!(
-                r#""start_bit":{encoded_offset_bits},"phase":"window_seeded","until_exact":{until_exact}"#
-            ),
-            "t",
-        );
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
             if exact_block_route_enabled() {
@@ -1655,13 +1640,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
             MarkerStep::Continue => {}
             MarkerStep::FlipToContig { end_bit_offset } => {
                 FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::decompress::parallel::trace_v2::emit_instant(
-                    "worker.chunk_phase",
-                    &format!(
-                        r#""start_bit":{encoded_offset_bits},"phase":"flip_to_contig","end_bit":{end_bit_offset}"#
-                    ),
-                    "t",
-                );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 // STAGE-2b: the post-flip clean tail carries the cross-member
                 // continuation (stage 1's `::<true>` arm). A large member that
@@ -1683,13 +1661,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
             }
             MarkerStep::FlipToClean { end_bit_offset, .. } => {
                 FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::decompress::parallel::trace_v2::emit_instant(
-                    "worker.chunk_phase",
-                    &format!(
-                        r#""start_bit":{encoded_offset_bits},"phase":"flip_to_clean","end_bit":{end_bit_offset}"#
-                    ),
-                    "t",
-                );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 let clean_window = chunk.last_32kib_window_vec().ok_or_else(|| {
                     ChunkDecodeError::BootstrapFailed(std::io::Error::new(
@@ -1738,13 +1709,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
                     }
                 }
                 FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::decompress::parallel::trace_v2::emit_instant(
-                    "worker.chunk_phase",
-                    &format!(
-                        r#""start_bit":{encoded_offset_bits},"phase":"finished_no_flip","end_bit":{end_bit_offset}"#
-                    ),
-                    "t",
-                );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 chunk.finalize_with_deflate(end_bit_offset, Some(input));
                 return Ok(chunk);
@@ -1881,8 +1845,6 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 
             // Header parse (mirror marker_decode_step_loop:1499-1515).
             {
-                let _tv2 =
-                    crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_header");
                 if let Err(e) = block.read_header(&mut bits, false) {
                     return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -1904,8 +1866,6 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
             // One deflate block may span MULTIPLE contig calls (a block bigger
             // than the per-call out_room); accounting accumulates across them and
             // the block boundary fires only at real EOB.
-            let _tv2_body =
-                crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_body");
             let comp_type = block.compression_type();
             while !block.eob() {
                 // H4: re-fetch (base, cap, pos) every iteration — a grow inside
@@ -2191,11 +2151,6 @@ fn finish_decode_chunk_seeded_block_native(
     initial_window: &[u8],
 ) -> Result<(), ChunkDecodeError> {
     SEEDED_BLOCK_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::decompress::parallel::trace_v2::emit_instant(
-        "worker.chunk_phase",
-        &format!(r#""start_bit":{inflate_start_bit},"phase":"window_seeded_block""#),
-        "t",
-    );
 
     let mut marker_ctx = seed_block_for_contig_native(
         chunk,
@@ -2838,11 +2793,6 @@ fn finish_decode_chunk_exact_block_native(
     initial_window: &[u8],
 ) -> Result<(), ChunkDecodeError> {
     EXACT_BLOCK_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::decompress::parallel::trace_v2::emit_instant(
-        "worker.chunk_phase",
-        &format!(r#""start_bit":{inflate_start_bit},"phase":"window_seeded_block_exact""#),
-        "t",
-    );
 
     let mut marker_ctx = seed_block_for_contig_native(
         chunk,
@@ -3257,7 +3207,6 @@ where
     F: FnMut(&E),
 {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-    use crate::decompress::parallel::trace_v2;
 
     loop {
         let slice_byte = ctx.current_bit_offset / 8;
@@ -3288,7 +3237,6 @@ where
         }
 
         let header_res = {
-            let _tv2 = trace_v2::SpanGuard::begin("worker.block_header");
             let t_header = std::time::Instant::now();
             let r = read_header(block, &mut bits);
             BOOTSTRAP_HEADER_US.fetch_add(
@@ -3319,7 +3267,6 @@ where
 
         let before_len = output.sink_len();
         let t_body = std::time::Instant::now();
-        let _tv2_body = trace_v2::SpanGuard::begin("worker.block_body");
         while !block.eob() {
             if let Err(e) = read_body(block, &mut bits, output) {
                 let bits_at_fail = absolute_bit_pos(slice_byte, &bits);

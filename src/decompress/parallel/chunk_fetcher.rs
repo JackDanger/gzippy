@@ -78,8 +78,6 @@ use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFin
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::thread_pool::ThreadPool;
-use crate::decompress::parallel::trace;
-use crate::decompress::parallel::trace_v2;
 use crate::decompress::parallel::window_map::{Window, WindowMap};
 
 #[cfg(parallel_sm)]
@@ -221,8 +219,6 @@ struct DecodeParams {
     /// predecessor window is published (speculative path). False for
     /// on-demand decodes at a confirmed `block_finder` offset.
     is_speculative_prefetch: bool,
-    /// For trace labelling only.
-    partition_idx: usize,
 }
 
 /// `Send`-able wrapper around a raw pointer + length to the
@@ -745,14 +741,6 @@ fn drive_impl<W: std::io::Write>(
     // existing caller (zero behavior change).
     bytes_written_out: Option<&mut usize>,
 ) -> Result<(u32, usize), FetchError> {
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "drive",
-        &format!(
-            r#""input_bytes":{},"parallelization":{}"#,
-            input.len(),
-            parallelization
-        ),
-    );
     let total_bits = input.len() * 8;
     // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
     // more workers than physical cores — SMT siblings collide on cache.
@@ -875,20 +863,6 @@ fn drive_impl<W: std::io::Write>(
     // tasks still spawned. Therefore no closure holding `input_view`
     // can outlive the borrowed `input` slice.
     let input_view = unsafe { InputSlice::from_slice(input) };
-
-    if trace::is_enabled() {
-        trace::emit(
-            "consumer",
-            "drive_begin",
-            &format!(
-                r#""input_bytes":{},"total_bits":{},"pool_size":{},"chunk_size":{}"#,
-                input.len(),
-                total_bits,
-                pool_size,
-                configuration.split_chunk_size,
-            ),
-        );
-    }
 
     // REMOVAL-ORACLE NODECODE: warm the symbol-stream replay map out of the timed
     // drive (no-op unless GZIPPY_ORACLE_NODECODE is set).
@@ -1333,9 +1307,6 @@ fn drive_impl<W: std::io::Write>(
         );
     }
 
-    // Flush all per-thread trace_v2 buffers (consumer thread + any
-    // already-joined worker threads).
-    trace_v2::flush_all();
     // REMOVAL-ORACLE NODECODE: serialize the symbol-stream record (no-op
     // unless GZIPPY_ORACLE_RECORD is set).
     crate::decompress::parallel::removal_oracle::flush_record();
@@ -1413,38 +1384,23 @@ fn consumer_loop<W: std::io::Write>(
     // here so the local-state mutation (post-process queue + writer +
     // CRC) stays simple.
     #[allow(clippy::while_let_loop)] // faithful port of vendor processNextChunk loop
-    let mut iter_us_sum: u128 = 0;
-    let mut prefetch_us_sum: u128 = 0;
-    let mut finder_us_sum: u128 = 0;
-    let mut fetcher_get_us_sum: u128 = 0;
-    let submit_us_sum: u128 = 0;
-    let mut iter_count: usize = 0;
     loop {
-        let _tv2 = trace_v2::SpanGuard::begin("consumer.iter");
-        let t_iter = std::time::Instant::now();
         // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
         // so workers don't idle while the consumer waits on a different key.
-        let t_prefetch = std::time::Instant::now();
         {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.process_prefetches");
             block_fetcher.process_ready_prefetches();
         }
-        prefetch_us_sum += t_prefetch.elapsed().as_micros();
         // Vendor `waitForReplacedMarkers` (:497-511): non-blocking harvest of
         // ready marker-replace futures on every consumer iteration.
         harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
-        let t_finder = std::time::Instant::now();
-        let _tv2_finder = trace_v2::SpanGuard::begin("consumer.block_finder_get");
         let next_block_offset = match block_finder.get(next_unprocessed_block_index) {
             (Some(offset), GetReturnCode::Success) => offset,
             // Vendor GzipChunkFetcher.hpp:320-327 — EOF when no offset
             // or offset past end of file.
             _ => break,
         };
-        finder_us_sum += t_finder.elapsed().as_micros();
-        drop(_tv2_finder);
         if next_block_offset >= total_bits {
             break;
         }
@@ -1528,7 +1484,6 @@ fn consumer_loop<W: std::io::Write>(
             stop_hint_bit,
             stop_hint_is_exact,
             is_speculative_prefetch: false,
-            partition_idx: partition_idx_for_trace,
         };
 
         // The submit_for_prefetch closure mirrors vendor's
@@ -1555,7 +1510,6 @@ fn consumer_loop<W: std::io::Write>(
                 stop_hint_bit: prefetch_stop_hint_bit,
                 stop_hint_is_exact: false,
                 is_speculative_prefetch: true,
-                partition_idx: usize::MAX, // trace marker for "prefetch"
             };
             submit_decode_to_pool(
                 thread_pool,
@@ -1624,7 +1578,6 @@ fn consumer_loop<W: std::io::Write>(
         // real offset, dispatching an on-demand task (matching vendor's
         // `BaseType::get(blockOffset, blockIndex, ...)` at
         // GzipChunkFetcher.hpp:654).
-        let _tv2_specf = trace_v2::SpanGuard::begin("consumer.try_take_prefetched");
         let partition_offset = partition_offset_for(&next_block_offset);
         let mut chunk_arc_from_partition: Option<ChunkArc> = None;
         if partition_offset != next_block_offset {
@@ -1650,36 +1603,12 @@ fn consumer_loop<W: std::io::Write>(
                 // `matchesEncodedOffset(blockOffset)`; else discard and
                 // re-issue at the real offset via `get(blockOffset, ...)`.
                 if arc.matches_encoded_offset(decode_start) {
-                    if trace::is_enabled() {
-                        trace::emit(
-                            "consumer",
-                            "speculative_accept",
-                            &format!(
-                                r#""partition_idx":{partition_idx_for_trace},"decode_start":{decode_start},"spacing_guess":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
-                                arc.encoded_offset_bits,
-                                arc.encoded_offset_bits,
-                                arc.max_acceptable_start_bit,
-                            ),
-                        );
-                    }
                     // ACCEPT: move the `Arc` (no extra refcount) into the consumer path.
                     chunk_arc_from_partition = Some(arc);
                 } else {
                     // Vendor GzipChunkFetcher.hpp:646-648 — partition-keyed
                     // prefetch present but `!matchesEncodedOffset(blockOffset)`.
                     PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if trace::is_enabled() {
-                        trace::emit(
-                            "consumer",
-                            "speculative_mismatch",
-                            &format!(
-                                r#""partition_idx":{partition_idx_for_trace},"decode_start":{decode_start},"spacing_guess":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
-                                arc.encoded_offset_bits,
-                                arc.encoded_offset_bits,
-                                arc.max_acceptable_start_bit,
-                            ),
-                        );
-                    }
                 }
                 // If !matches OR the safety guard rejected, the Arc
                 // is dropped here (vendor "throws away" the
@@ -1688,18 +1617,9 @@ fn consumer_loop<W: std::io::Write>(
                 // vendor's `catch ( const NoBlockInRange& )` at
                 // GzipChunkFetcher.hpp:604-609 silently discards
                 // prefetch failures.
-            } else if trace::is_enabled() {
-                trace::emit(
-                    "consumer",
-                    "speculative_missing",
-                    &format!(
-                        r#""partition_idx":{partition_idx_for_trace},"partition_offset":{partition_offset},"expected_start":{next_block_offset}"#
-                    ),
-                );
             }
         }
 
-        drop(_tv2_specf);
         let chunk_arc = match chunk_arc_from_partition {
             Some(arc) => {
                 // Vendor BlockFetcher.hpp:297-299 — `prefetchNewBlocks` runs on
@@ -1722,7 +1642,6 @@ fn consumer_loop<W: std::io::Write>(
                 // before :297), so the head-of-line task cannot queue behind
                 // fresh prefetches.
                 if should_drive_prefetch {
-                    let _tv2 = trace_v2::SpanGuard::begin("consumer.drive_prefetch_on_hit");
                     block_fetcher.prefetch_new_blocks(
                         &lookup_block_offset,
                         &lookup_next_block_offset,
@@ -1757,14 +1676,6 @@ fn consumer_loop<W: std::io::Write>(
                         skip_keys,
                     );
                 }
-                let t_fg = std::time::Instant::now();
-                let _tv2 = trace_v2::SpanGuard::begin_with(
-                    "wait.block_fetcher_get",
-                    &format!(
-                        r#""chunk_id":{},"offset":{}"#,
-                        partition_idx_for_trace, next_block_offset
-                    ),
-                );
                 let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
                     next_block_offset,
                     |_key: usize| -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
@@ -1784,7 +1695,6 @@ fn consumer_loop<W: std::io::Write>(
                     partition_offset_for,
                     should_drive_prefetch,
                 );
-                fetcher_get_us_sum += t_fg.elapsed().as_micros();
                 chunk_arc_result.map_err(FetchError::Decode)?
             }
         };
@@ -1792,7 +1702,6 @@ fn consumer_loop<W: std::io::Write>(
         // inner ChunkData unless resolve-ahead already submitted post-process
         // (borrow the `Arc` through window publish, `recv` at dispatch).
         let chunk_holder = {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
             match Arc::try_unwrap(chunk_arc) {
                 Ok(shared) => {
                     ARC_TRY_UNWRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1807,11 +1716,6 @@ fn consumer_loop<W: std::io::Write>(
                     if resolved_pred_matches {
                         use std::sync::atomic::Ordering;
                         PREFETCH_ALREADY_RESOLVED.fetch_add(1, Ordering::Relaxed);
-                        trace_v2::emit_instant(
-                            "causal.has_been_post_processed",
-                            &format!(r#""start_bit":{},"site":"consumer_take""#, real_offset),
-                            "t",
-                        );
                     }
                     if resolved_pred_matches
                         || prefetch_post_inflight.contains_key(&real_offset)
@@ -1870,21 +1774,9 @@ fn consumer_loop<W: std::io::Write>(
             // resolve/publish work Fulcrum's `model` view reads as L_resolve
             // (NOT the inter-publish gap — that conflation is the tautology).
             // `end_bit` keys the publish so the model orders + de-dups links.
-            let _tv2 = trace_v2::SpanGuard::begin_with(
-                "consumer.window_publish_clean",
-                &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
-            );
             if let Some((_pred_key, pred)) = confirmed_predecessor_window(window_map, handoff_bit) {
                 let bytes = materialize_window(&pred);
                 publish_end_window_before_post_process(window_map, chunk, bytes.as_ref());
-                trace_v2::emit_instant(
-                    "causal.window_publish",
-                    &format!(
-                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_clean""#,
-                        chunk.encoded_offset_bits
-                    ),
-                    "t",
-                );
                 // TRANSLITERATION (vendor `queuePrefetchedChunkPostProcessing`,
                 // GzipChunkFetcher.hpp:520-551, called from waitForReplacedMarkers:513
                 // on EVERY consumed chunk): full sorted scan of the prefetch cache,
@@ -1935,7 +1827,6 @@ fn consumer_loop<W: std::io::Write>(
             // published window lives at furthest_decoded_bit, not at
             // chunk.encoded_offset_bits.
             {
-                let _tv2 = trace_v2::SpanGuard::begin("consumer.wait_replaced_markers");
                 while !window_map.contains(handoff_bit) {
                     if pending.is_empty() {
                         break;
@@ -1968,10 +1859,6 @@ fn consumer_loop<W: std::io::Write>(
             // The blocking WAIT for the predecessor is the SEPARATE
             // `consumer.wait_replaced_markers` span above, so this span is the
             // resolve WORK only, not the wait.
-            let _tv2_pred = trace_v2::SpanGuard::begin_with(
-                "consumer.window_publish_marker",
-                &format!(r#""end_bit":{chunk_end_bit},"had_markers":true"#),
-            );
             let (pred_key, window) = confirmed_predecessor_window(window_map, handoff_bit).ok_or(
                 FetchError::Decode(ChunkDecodeError::ExactStopMissed {
                     requested: handoff_bit,
@@ -1990,18 +1877,9 @@ fn consumer_loop<W: std::io::Write>(
             // (~1.5ms each). get_last_window is deterministic given the same predecessor, so
             // the eager-published window is byte-identical; skipping the recompute is byte-exact.
             {
-                let _tv2 = trace_v2::SpanGuard::begin("consumer.get_last_window");
                 let window_bytes = materialize_window(&window);
                 publish_end_window_before_post_process(window_map, chunk, window_bytes.as_ref());
             }
-            trace_v2::emit_instant(
-                "causal.window_publish",
-                &format!(
-                    r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_marker""#,
-                    chunk.encoded_offset_bits
-                ),
-                "t",
-            );
             // TRANSLITERATION (vendor queuePrefetchedChunkPostProcessing, full sorted
             // scan on every consumed chunk; see clean-branch note above). `None`
             // replaces the divergent `Some(chunk_end_bit)` chain-follow.
@@ -2022,7 +1900,6 @@ fn consumer_loop<W: std::io::Write>(
         // post-process and queued Async writes — ordering skew vs vendor and
         // measured publish-chain inflation (Fulcrum L_resolve / dispatch_recv).
         {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
             harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
             let (mut chunk, eager_already_done) = chunk_holder.into_chunk_data(
                 &mut prefetch_post_inflight,
@@ -2065,10 +1942,6 @@ fn consumer_loop<W: std::io::Write>(
                             None
                         }
                     };
-                    let _tv2_wait = trace_v2::SpanGuard::begin_with(
-                        "wait.future_recv",
-                        &format!(r#""chunk_id":{partition_idx_for_trace}"#),
-                    );
                     let overlap = Some((
                         block_fetcher,
                         window_map,
@@ -2084,7 +1957,6 @@ fn consumer_loop<W: std::io::Write>(
                             chunk,
                             consumer_pred_key.expect("marker branch sets pred_key"),
                             window,
-                            partition_idx_for_trace,
                         );
                         chunk = recv_post_process_blocking(rx, partition_idx_for_trace, overlap)?;
                     }
@@ -2189,8 +2061,6 @@ fn consumer_loop<W: std::io::Write>(
                 &mut recycle_deferral,
             )?;
         }
-        iter_us_sum += t_iter.elapsed().as_micros();
-        iter_count += 1;
     }
 
     // Final drain — flush remaining post-processes in encoded order.
@@ -2226,18 +2096,6 @@ fn consumer_loop<W: std::io::Write>(
             )))
         })?;
     }
-    let _ = submit_us_sum; // reserved for future submit-only timing
-
-    if trace::is_enabled() {
-        trace::emit(
-            "consumer",
-            "consumer_loop_summary",
-            &format!(
-                r#""iters":{iter_count},"iter_sum_us":{iter_us_sum},"prefetch_us":{prefetch_us_sum},"finder_us":{finder_us_sum},"fetcher_get_us":{fetcher_get_us_sum}"#,
-            ),
-        );
-    }
-
     // Eager post-process probe report — the deliverable. Always printed
     // to stderr when the probe is enabled so an A/B run records whether
     // the lever actually fired. If `submitted ≈ 0`, the prefetch cache is
@@ -2489,19 +2347,6 @@ fn submit_decode_to_pool(
     block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
-    if trace::is_enabled() {
-        trace::emit(
-            "consumer",
-            "submit_decode",
-            &format!(
-                r#""partition_idx":{},"start_bit":{},"stop_hint_bit":{},"is_speculative_prefetch":{}"#,
-                params.partition_idx,
-                params.start_bit,
-                params.stop_hint_bit,
-                params.is_speculative_prefetch,
-            ),
-        );
-    }
     let window_map = window_map.clone();
     let block_fetcher = block_fetcher.clone();
     // Vendor keeps both speculative prefetch and on-demand decode in the same
@@ -2564,7 +2409,6 @@ fn eager_postprocess_prefetched(
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
 ) -> usize {
-    let _tv2 = trace_v2::SpanGuard::begin("consumer.eager_postproc");
     queue_prefetched_marker_postprocess(block_fetcher, window_map, thread_pool, in_flight, &[], &[])
 }
 
@@ -2574,15 +2418,7 @@ fn submit_post_process_to_pool(
     chunk: ChunkData,
     pred_key: usize,
     predecessor_window: Window,
-    partition_idx: usize,
 ) -> mpsc::Receiver<ChunkData> {
-    if trace::is_enabled() {
-        trace::emit(
-            "consumer",
-            "submit_post_process",
-            &format!(r#""partition_idx":{}"#, partition_idx),
-        );
-    }
     submit_post_process_task(thread_pool, move || {
         run_post_process_task(chunk, pred_key, predecessor_window)
     })
@@ -2638,20 +2474,9 @@ fn run_decode_task(
     block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkArc, ChunkDecodeError> {
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "worker.decode_chunk",
-        &format!(
-            r#""chunk_id":{},"start_bit":{},"stop_hint":{},"speculative":{}"#,
-            params.partition_idx,
-            params.start_bit,
-            params.stop_hint_bit,
-            params.is_speculative_prefetch
-        ),
-    );
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
 
-    let label = trace::worker_label(params.partition_idx);
     let t0 = std::time::Instant::now();
 
     // Vendor's `decodeAndMeasureBlock` (BlockFetcher.hpp:649-672):
@@ -2692,48 +2517,6 @@ fn run_decode_task(
     };
     let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
-    let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
-    // Fulcrum `model` reads `worker.decode` span mode tags (rapidgzip patch uses
-    // clean | window_absent). Keep boundary_search on causal instants only.
-    let worker_decode_mode = if decode_mode_clean {
-        "clean"
-    } else {
-        "window_absent"
-    };
-    let mode_str = if decode_mode_clean {
-        "clean"
-    } else {
-        "boundary_search"
-    };
-    let _tv2_decode = trace_v2::SpanGuard::begin_with(
-        "worker.decode",
-        &format!(
-            r#""start_bit":{},"mode":"{worker_decode_mode}""#,
-            params.start_bit
-        ),
-    );
-    trace_v2::emit_instant(
-        "worker.decode_mode",
-        &format!(
-            r#""start_bit":{},"mode":"{worker_decode_mode}","pred_available":false"#,
-            params.start_bit
-        ),
-        "t",
-    );
-    trace_v2::emit_instant(
-        "causal.decode_decision",
-        &format!(
-            r#""start_bit":{},"window_present":{},"window_exact":{},"until_exact":{},"predecessor_available":false,"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
-            params.start_bit,
-            decode_mode_clean,
-            window_at_offset.is_some(),
-            until_exact,
-            params.stop_hint_bit,
-            params.is_speculative_prefetch
-        ),
-        "t",
-    );
-
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_with_until_exact(
             input_bytes,
@@ -2771,41 +2554,6 @@ fn run_decode_task(
     // Wrap in `ChunkArc` to match BlockFetcher's `Value` type (vendor's
     // `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
     let result = chunk_result.map(SharedChunkData::new);
-
-    if trace::is_enabled() {
-        let dur_us = t0.elapsed().as_micros();
-        let path = if params.start_bit == 0 || window_at_offset.is_some() {
-            "fast"
-        } else {
-            "slow"
-        };
-        match &result {
-            Ok(c) => trace::emit(
-                &label,
-                "decode_ok",
-                &format!(
-                    r#""partition_idx":{},"path":"{}","start_bit":{},"end_bit":{},"decoded":{},"duration_us":{dur_us}"#,
-                    params.partition_idx,
-                    path,
-                    params.start_bit,
-                    c.encoded_offset_bits + c.encoded_size_bits,
-                    c.decoded_size(),
-                ),
-            ),
-            Err(e) => trace::emit(
-                &label,
-                "decode_err",
-                &format!(
-                    r#""partition_idx":{},"path":"{}","start_bit":{},"stop_hint_bit":{},"err":"{}","duration_us":{dur_us}"#,
-                    params.partition_idx,
-                    path,
-                    params.start_bit,
-                    params.stop_hint_bit,
-                    trace::esc(&format!("{e:?}")),
-                ),
-            ),
-        }
-    }
 
     // Vendor's `decodeAndMeasureBlock` (BlockFetcher.hpp:660-672)
     // accumulates the decode wall time per task and records the end
@@ -2966,7 +2714,6 @@ fn queue_prefetched_marker_postprocess(
 ) -> usize {
     use std::sync::atomic::Ordering;
     EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
-    let _tv2 = trace_v2::SpanGuard::begin("consumer.queue_prefetched_postproc");
     block_fetcher.process_ready_prefetches();
     let contents = block_fetcher.prefetch_cache_contents_sorted();
     let n_inspected = contents.len();
@@ -3041,40 +2788,10 @@ fn queue_prefetched_marker_postprocess(
 /// `GzipChunkFetcher.hpp:579-582` `chunkData->applyWindow`).
 #[cfg(parallel_sm)]
 fn run_post_process_in_place(arc: &SharedChunkData, pred_key: usize, predecessor_window: Window) {
-    let start_bit = arc.encoded_offset_bits;
-    let marker_bytes = arc.data_with_markers.len();
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "post_process.task",
-        &format!(r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"in_place":true"#,),
-    );
-    let t_materialize = std::time::Instant::now();
     let bytes = materialize_window(&predecessor_window);
-    let materialize_us = t_materialize.elapsed().as_micros();
-    let t_apply = std::time::Instant::now();
-    {
-        let _tv2 = trace_v2::SpanGuard::begin("post_process.apply_window");
-        arc.with_mut(|chunk| {
-            resolve_chunk_markers_on_chunk(chunk, pred_key, bytes.as_ref());
-        });
-    }
-    let apply_us = t_apply.elapsed().as_micros();
-    trace_v2::emit_instant(
-        "causal.tax",
-        &format!(
-            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{apply_us},"materialize_us":{materialize_us},"fused":{fused},"in_place":true"#,
-            fused = marker_bytes > 0,
-        ),
-        "t",
-    );
-    if trace::is_enabled() {
-        trace::emit(
-            "post_process",
-            "post_process_span",
-            &format!(
-                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"marker_bytes":{marker_bytes},"in_place":true"#,
-            ),
-        );
-    }
+    arc.with_mut(|chunk| {
+        resolve_chunk_markers_on_chunk(chunk, pred_key, bytes.as_ref());
+    });
 }
 
 /// Pool-side execution of a uniquely-owned post-process task (consumer head
@@ -3085,43 +2802,8 @@ fn run_post_process_task(
     pred_key: usize,
     predecessor_window: Window,
 ) -> ChunkData {
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "post_process.task",
-        &format!(
-            r#""start_bit":{},"marker_bytes":{}"#,
-            chunk.encoded_offset_bits,
-            chunk.data_with_markers.len()
-        ),
-    );
-    let start_bit = chunk.encoded_offset_bits;
-    let marker_bytes = chunk.data_with_markers.len();
-    let t_materialize = std::time::Instant::now();
     let bytes = materialize_window(&predecessor_window);
-    let materialize_us = t_materialize.elapsed().as_micros();
-    let t_apply = std::time::Instant::now();
-    {
-        let _tv2 = trace_v2::SpanGuard::begin("post_process.apply_window");
-        resolve_chunk_markers_on_chunk(&mut chunk, pred_key, bytes.as_ref());
-    }
-    let apply_us = t_apply.elapsed().as_micros();
-    let resolve_us = apply_us as f64;
-    let fused = marker_bytes > 0;
-    trace_v2::emit_instant(
-        "causal.tax",
-        &format!(
-            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{resolve_us},"materialize_us":{materialize_us},"fused":{fused}"#,
-        ),
-        "t",
-    );
-    if trace::is_enabled() {
-        trace::emit(
-            "post_process",
-            "post_process_span",
-            &format!(
-                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"marker_bytes":{marker_bytes}"#,
-            ),
-        );
-    }
+    resolve_chunk_markers_on_chunk(&mut chunk, pred_key, bytes.as_ref());
     chunk
 }
 
@@ -3557,7 +3239,6 @@ impl ConsumerChunkHold {
                         ARC_DEFERRED_INFLIGHT_RECV
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_recv");
                         if rx.recv().is_err() {
                             ARC_TRY_UNWRAP_MISSES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3680,51 +3361,32 @@ fn try_speculative_decode_candidate(
     //   stop_missed  → chunk size cap hit (not really a "failure")
     if let Err(ref e) = result {
         use std::sync::atomic::Ordering;
-        let fail_kind = match e {
+        match e {
             ChunkDecodeError::BootstrapFailed(io_err) => {
                 let msg = io_err.to_string();
                 if msg.contains("deflate header") {
                     SPEC_FAIL_HEADER.fetch_add(1, Ordering::Relaxed);
-                    "header"
                 } else if msg.contains("deflate body") {
                     SPEC_FAIL_BODY.fetch_add(1, Ordering::Relaxed);
-                    "body"
                 } else {
                     SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
-                    "other"
                 }
             }
             ChunkDecodeError::InflateFailed(_) => {
                 SPEC_FAIL_INFLATE.fetch_add(1, Ordering::Relaxed);
-                "inflate"
             }
             ChunkDecodeError::ExactStopMissed { .. } => {
                 SPEC_FAIL_STOP_MISSED.fetch_add(1, Ordering::Relaxed);
-                "stop_missed"
             }
             ChunkDecodeError::OutputCeilingExceeded { .. } => {
                 SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
-                "output_ceiling_exceeded"
             }
             ChunkDecodeError::UnsupportedPlatform => {
                 SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
-                "other"
             }
         };
-        trace_v2::emit_instant(
-            "worker.try_to_decode",
-            &format!(
-                r#""partition_seed":{partition_seed},"decode_start":{decode_start},"ok":false,"fail_kind":"{fail_kind}""#
-            ),
-            "t",
-        );
         return result;
     }
-    trace_v2::emit_instant(
-        "worker.try_to_decode",
-        &format!(r#""partition_seed":{partition_seed},"decode_start":{decode_start},"ok":true"#),
-        "t",
-    );
     let mut chunk = result?;
     // (Design B) Record the encoded bit the worker decoded byte 0 from.
     // `decode_chunk_window_absent` anchored the chunk at `decode_start`
@@ -3850,7 +3512,6 @@ fn speculative_decode_find_boundary(
     // the vendor side by the trace patch around
     // `tryToDecode({ blockOffset, blockOffset })` at GzipChunk.hpp:739.
     {
-        let _tv2 = trace_v2::SpanGuard::begin("worker.seed_first");
         if let Ok(chunk) = try_speculative_decode_candidate(
             input,
             start_bit,
@@ -3885,7 +3546,6 @@ fn speculative_decode_find_boundary(
     // worker.scan_run span: the bit-by-bit scan + candidate-try loop.
     // Matched on vendor side by the trace patch around the alternating
     // findNextDynamic/findNextUncompressed loop at GzipChunk.hpp:803+.
-    let _tv2_scan = trace_v2::SpanGuard::begin("worker.scan_run");
     if let Some(chunk) = RawBlockFinderCoordinator::with_sync_boundary_search(
         input,
         start_bit,
@@ -3895,7 +3555,6 @@ fn speculative_decode_find_boundary(
             // single bit position the scan flagged as a valid block
             // candidate. Matched on vendor side by the trace patch
             // around each tryToDecode call inside the alternating loop.
-            let _tv2_cand = trace_v2::SpanGuard::begin("worker.scan_candidate");
             match try_speculative_decode_candidate(
                 input,
                 candidate.seek_bit,
@@ -3918,7 +3577,6 @@ fn speculative_decode_find_boundary(
     ) {
         return Ok(chunk);
     }
-    drop(_tv2_scan);
 
     // Near-EOF tail: when the 512 KiB scan window reaches the end of
     // the deflate stream and every BlockFinder candidate failed trial
@@ -4129,7 +3787,6 @@ fn drain_one_pending<W: std::io::Write>(
     mut eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted, &mut EagerCompleted)>,
     recycle_deferral: &mut RecycleDeferral,
 ) -> Result<(), FetchError> {
-    let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     if let Some((_, in_flight, completed)) = eager_ctx.as_mut() {
         harvest_ready_postprocess(in_flight, completed);
     }
@@ -4141,10 +3798,7 @@ fn drain_one_pending<W: std::io::Write>(
         &crate::decompress::parallel::chunk_data::LC_G_PENDING,
         pending.len(),
     );
-    // Phase-timing: first real chunk dequeued for write — first-chunk-to-first-
-    let t_chunk = std::time::Instant::now();
-    let t_recv = std::time::Instant::now();
-    let (idx, chunk, cache_key, handoff_bit) = match head {
+    let (_idx, chunk, cache_key, _handoff_bit) = match head {
         PendingWrite::Ready {
             idx,
             chunk,
@@ -4157,10 +3811,6 @@ fn drain_one_pending<W: std::io::Write>(
             cache_key,
             handoff_bit,
         } => {
-            let _tv2_wait = trace_v2::SpanGuard::begin_with(
-                "wait.future_recv",
-                &format!(r#""chunk_id":{idx}"#),
-            );
             let overlap = eager_ctx
                 .as_mut()
                 .map(|ctx| (block_fetcher, window_map, ctx.0, &mut *ctx.1, &mut *ctx.2));
@@ -4168,28 +3818,10 @@ fn drain_one_pending<W: std::io::Write>(
             (idx, chunk, cache_key, handoff_bit)
         }
     };
-    let recv_us = t_recv.elapsed().as_micros();
-
-    if std::env::var_os("GZIPPY_TRACE_DRAIN").is_some() {
-        eprintln!(
-            "[trace_drain] idx={idx} enc={} handoff={} narrowed_len={} \
-             markers_resolved={} data_len={}",
-            chunk.encoded_offset_bits,
-            handoff_bit,
-            chunk.narrowed_len,
-            chunk.markers_resolved,
-            chunk.data.len().saturating_sub(chunk.data_prefix_len),
-        );
-    }
 
     // Subchunk window publish at drain (post-process + setEncodedOffset +
     // appendSubchunks already ran in `consumer_loop`).
-    let t_pub = std::time::Instant::now();
-    {
-        let _tv2 = trace_v2::SpanGuard::begin("consumer.publish_windows");
-        publish_subchunk_windows(window_map, &chunk);
-    }
-    let publish_us = t_pub.elapsed().as_micros();
+    publish_subchunk_windows(window_map, &chunk);
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
     // Post-process narrows markers in-place then `merge_resolved_markers_into_data`
@@ -4212,7 +3844,6 @@ fn drain_one_pending<W: std::io::Write>(
     // on the post-process worker (`run_post_process_task` stores it on
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
-    let t_crc_write = std::time::Instant::now();
     let decoded_data_len = chunk.data.len().saturating_sub(chunk.data_prefix_len);
     let payload_bytes = chunk.narrowed_len + decoded_data_len;
     if crate::decompress::parallel::chunk_data::rss_split_enabled() {
@@ -4226,7 +3857,6 @@ fn drain_one_pending<W: std::io::Write>(
     if let Some(fd) = out_fd {
         if payload_bytes > 0 {
             use crate::decompress::parallel::fd_vectored_write;
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
             // Zero-copy gather: narrowed marker segments + clean payload
             // (vendor DecodedData.hpp:529 toIoVec). No memcpy — iovecs borrow
             // decode buffers until writev/vmsplice completes.
@@ -4294,18 +3924,6 @@ fn drain_one_pending<W: std::io::Write>(
             {
                 wrote_via_fd = true;
             }
-            let crc_write_us = t_crc_write.elapsed().as_micros();
-            let combine_us = 0usize;
-            let total_us = t_chunk.elapsed().as_micros();
-            if trace::is_enabled() {
-                trace::emit(
-                    "consumer",
-                    "consume_done",
-                    &format!(
-                        r#""partition_idx":{idx},"decoded":{payload_bytes},"recv_us":{recv_us},"publish_us":{publish_us},"crc_write_us":{crc_write_us},"combine_us":{combine_us},"total_us":{total_us}"#,
-                    ),
-                );
-            }
             let _ = cache_key;
             let _ = block_fetcher;
             crate::coz_probe::progress("chunk_emitted");
@@ -4315,7 +3933,6 @@ fn drain_one_pending<W: std::io::Write>(
     #[cfg(not(unix))]
     let _ = out_fd;
     if !wrote_via_fd {
-        let _tv2 = trace_v2::SpanGuard::begin("consumer.write_buffered");
         let mut parts: Vec<&[u8]> = Vec::with_capacity(8);
         chunk.append_output_iovecs(&mut parts);
         for sl in parts {
@@ -4325,7 +3942,6 @@ fn drain_one_pending<W: std::io::Write>(
             *total_size += sl.len();
         }
     }
-    let crc_write_us = t_crc_write.elapsed().as_micros();
     // STAGE-2d MULTI-MEMBER GRID: feed this chunk (buffered-writer path) to the
     // per-member verifier in decode order. No-op for single-member drive.
     if let Some(v) = recycle_deferral.member_verifier.as_mut() {
@@ -4336,33 +3952,17 @@ fn drain_one_pending<W: std::io::Write>(
             )))
         })?;
     }
-    let t_combine = std::time::Instant::now();
-    {
-        let _tv2 = trace_v2::SpanGuard::begin("consumer.combine_crc");
-        // Concatenated chunk output is (narrowed | data), so we combine
-        // in that order. `chunk.narrowed_crc` covers narrowed bytes
-        // (now computed on the post-process worker — vendor parity);
-        // the worker-computed `chunk.crc32s` cover the data-stream bytes.
-        // Multiple stream entries (multi-member inside a chunk) are
-        // appended in stream order to match the output byte order.
-        total_crc.append(&chunk.narrowed_crc);
-        for stream_crc in &chunk.crc32s {
-            total_crc.append(stream_crc);
-        }
+    // Concatenated chunk output is (narrowed | data), so we combine
+    // in that order. `chunk.narrowed_crc` covers narrowed bytes
+    // (now computed on the post-process worker — vendor parity);
+    // the worker-computed `chunk.crc32s` cover the data-stream bytes.
+    // Multiple stream entries (multi-member inside a chunk) are
+    // appended in stream order to match the output byte order.
+    total_crc.append(&chunk.narrowed_crc);
+    for stream_crc in &chunk.crc32s {
+        total_crc.append(stream_crc);
     }
-    let combine_us = t_combine.elapsed().as_micros();
-    let total_us = t_chunk.elapsed().as_micros();
 
-    if trace::is_enabled() {
-        trace::emit(
-            "consumer",
-            "consume_done",
-            &format!(
-                r#""partition_idx":{idx},"decoded":{},"recv_us":{recv_us},"publish_us":{publish_us},"crc_write_us":{crc_write_us},"combine_us":{combine_us},"total_us":{total_us}"#,
-                chunk.decoded_size()
-            ),
-        );
-    }
     // Lever G: do NOT re-insert the consumed chunk into the cache.
     // Single-pass forward decode never queries the same key twice, so
     // the post-consume re-insert was strictly wasted bookkeeping (and
