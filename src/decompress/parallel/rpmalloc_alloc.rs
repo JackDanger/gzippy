@@ -1511,43 +1511,6 @@ pub use arena::slab_test_force;
 #[cfg(all(test, not(feature = "arena-allocator")))]
 pub fn slab_test_force(_v: Option<bool>) {}
 
-/// Allocator-visibility tool — the "don't guess" instrument for the span-cache
-/// work. Prints rpmalloc's process-wide span-map stats. `mapped_total` (total
-/// OS memory mapped since init) is the page-fault proxy: if 128 KiB segments
-/// are warm-reused via the thread/global span cache it stays near the live
-/// working set; if every segment re-maps it balloons toward bytes-touched.
-/// `huge_alloc_peak` exposes the >2 MiB monolithic buffers routing through
-/// `huge_alloc` (the cold path). Counters are nonzero only with the
-/// `rpmalloc-stats` feature (rpmalloc `ENABLE_STATISTICS`); runtime-gated by
-/// `GZIPPY_RPMALLOC_STATS` so normal runs pay nothing.
-#[cfg(feature = "arena-allocator")]
-pub fn dump_global_stats(tag: &str) {
-    if std::env::var_os("GZIPPY_RPMALLOC_STATS").is_none() {
-        return;
-    }
-    let mib = |b: usize| b as f64 / 1_048_576.0;
-    // SAFETY: rpmalloc_global_statistics fills a zeroed POD struct; the FFI is
-    // always bound (values populate only under ENABLE_STATISTICS).
-    let s = unsafe {
-        let mut s: rpmalloc_sys::rpmalloc_global_statistics_t = std::mem::zeroed();
-        rpmalloc_sys::rpmalloc_global_statistics(&mut s);
-        s
-    };
-    eprintln!(
-        "[rpmalloc {tag}] slab_hits={} slab_installs={}",
-        arena::SLAB_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
-        arena::SLAB_INSTALLS.load(std::sync::atomic::Ordering::Relaxed),
-    );
-    eprintln!(
-        "[rpmalloc {tag}] mapped_peak={:.0}M mapped_total={:.0}M unmapped_total={:.0}M cached={:.1}M huge_alloc_peak={:.0}M",
-        mib(s.mapped_peak),
-        mib(s.mapped_total),
-        mib(s.unmapped_total),
-        mib(s.cached),
-        mib(s.huge_alloc_peak),
-    );
-}
-
 /// `ChunkData::data` / pool `Vec<u8>` type — rpmalloc when `arena-allocator` is on.
 pub mod types {
     #[cfg(feature = "arena-allocator")]

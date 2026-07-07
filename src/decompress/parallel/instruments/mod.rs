@@ -12,7 +12,7 @@
 //! |-------------------|----------------------------------------------------------|
 //! | `removal_oracle`  | STORE-removal + symbol-stream NODECODE replay ceiling    |
 //! | `slow_knob`       | env-gated slow-injection (causal-perturbation pre-gate)  |
-//! | `contig_prof`     | contig clean-loop rdtsc class profiler                   |
+//! | `contig_prof`     | shared rdtsc timing helper (used by `slow_knob`)         |
 
 pub mod contig_prof;
 pub mod removal_oracle;

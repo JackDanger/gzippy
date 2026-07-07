@@ -382,38 +382,6 @@ thread_local! {
     pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Effect-verification counters for the rung-(d) marker-loop DistTable arm
-/// (`GZIPPY_MARKER_DIST_STATS=1` — the GZIPPY_ASM_STATS pattern): proves on a
-/// PRODUCTION binary which distance-decode arm the marker fast loop took
-/// (EFFECT-VERIFIED, not assumed — the decide.sh knob rule). Hot-path cost
-/// when OFF: one hoisted predictable branch per backref (the bool is
-/// snapshotted once per decode call). Dumped from the chunk fetcher's
-/// `--verbose` block alongside the asm-kernel counters.
-#[cfg(pure_inflate_decode)]
-pub(crate) mod marker_dist_stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    /// Backrefs decoded via the DistTable arm in the marker fast loop.
-    pub static LUT_BACKREFS: AtomicU64 = AtomicU64::new(0);
-    /// Backrefs decoded via the dist_hc chain in the marker fast loop
-    /// (kill-switch arm or builder-declined block).
-    pub static HC_BACKREFS: AtomicU64 = AtomicU64::new(0);
-    pub fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("GZIPPY_MARKER_DIST_STATS").is_ok_and(|v| v == "1"))
-    }
-    pub fn dump_if_enabled() {
-        if !enabled() {
-            return;
-        }
-        eprintln!(
-            "[marker-dist:d1] lut_backrefs={} hc_backrefs={}",
-            LUT_BACKREFS.load(Ordering::Relaxed),
-            HC_BACKREFS.load(Ordering::Relaxed)
-        );
-    }
-}
-
 /// Per-block Huffman table-build CACHE (litlen LUT). Many adjacent deflate
 /// blocks on repetitive corpora (logs) carry byte-identical dynamic-Huffman
 /// code-length vectors; rebuilding the LUT for an identical header is pure
@@ -424,225 +392,13 @@ pub(crate) mod marker_dist_stats {
 /// mutates it, so a hit is byte-identical to a fresh build).
 ///
 /// `GZIPPY_TBUILD_CACHE_OFF=1` disables the cache (always rebuild) — the
-/// removal-oracle's BASE arm. `GZIPPY_TBUILD_CACHE_STATS=1` (with
-/// `GZIPPY_VERBOSE=1`) dumps the hit/miss counts proving non-inertness +
-/// the hit rate that bounds the recoverable ceiling.
+/// removal-oracle's BASE arm.
 pub(crate) mod tbuild_cache {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
-    pub static HITS: AtomicU64 = AtomicU64::new(0);
-    pub static MISSES: AtomicU64 = AtomicU64::new(0);
     /// True unless explicitly disabled (default ON — shippable on a win).
     pub fn cache_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            // Register a process-exit dump so the hit-rate prints regardless of
-            // which driver path (thin-T1 vs chunk_fetcher) ran the decode. The
-            // handler no-ops unless GZIPPY_TBUILD_CACHE_STATS=1.
-            if stats_enabled() {
-                unsafe {
-                    libc::atexit(atexit_dump);
-                }
-            }
-            !std::env::var("GZIPPY_TBUILD_CACHE_OFF").is_ok_and(|v| v == "1")
-        })
-    }
-    extern "C" fn atexit_dump() {
-        dump_if_enabled();
-    }
-    pub fn stats_enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("GZIPPY_TBUILD_CACHE_STATS").is_ok_and(|v| v == "1"))
-    }
-    /// Stats-only: set of DISTINCT (multisym, code_lengths) keys seen. Bounds
-    /// the ceiling an unbounded cache would reach (distinct / total). Touched
-    /// only when stats are enabled — never in production.
-    pub static DISTINCT: OnceLock<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
-        OnceLock::new();
-    /// Stats-only key-only LRU simulator (capacity GZIPPY_TBUILD_LRU_K, default
-    /// 0 = off). Counts how many builds an LRU of that size would have hit —
-    /// bounds the practical (bounded-cache) ceiling without storing tables.
-    pub static LRU_HITS: AtomicU64 = AtomicU64::new(0);
-    pub static LRU: OnceLock<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>> =
-        OnceLock::new();
-    pub fn lru_k() -> usize {
-        static K: OnceLock<usize> = OnceLock::new();
-        *K.get_or_init(|| {
-            std::env::var("GZIPPY_TBUILD_LRU_K")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
-        })
-    }
-    pub fn note_key(code_lengths: &[u8], multisym: u32) {
-        if !stats_enabled() {
-            return;
-        }
-        let mut k = Vec::with_capacity(code_lengths.len() + 4);
-        k.extend_from_slice(&multisym.to_le_bytes());
-        k.extend_from_slice(code_lengths);
-        let set = DISTINCT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-        set.lock().unwrap().insert(k.clone());
-        let cap = lru_k();
-        if cap > 0 {
-            let lru = LRU.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
-            let mut q = lru.lock().unwrap();
-            if let Some(pos) = q.iter().position(|e| *e == k) {
-                LRU_HITS.fetch_add(1, Ordering::Relaxed);
-                q.remove(pos);
-                q.push_front(k);
-            } else {
-                if q.len() >= cap {
-                    q.pop_back();
-                }
-                q.push_front(k);
-            }
-        }
-    }
-    pub fn dump_if_enabled() {
-        if !stats_enabled() {
-            return;
-        }
-        let h = HITS.load(Ordering::Relaxed);
-        let m = MISSES.load(Ordering::Relaxed);
-        let tot = h + m;
-        let rate = if tot > 0 {
-            100.0 * h as f64 / tot as f64
-        } else {
-            0.0
-        };
-        let distinct = DISTINCT.get().map(|s| s.lock().unwrap().len()).unwrap_or(0);
-        let ceil = if tot > 0 {
-            100.0 * (tot - distinct as u64) as f64 / tot as f64
-        } else {
-            0.0
-        };
-        let lru_h = LRU_HITS.load(Ordering::Relaxed);
-        let lru_rate = if tot > 0 {
-            100.0 * lru_h as f64 / tot as f64
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[tbuild-cache] litlen builds={} hits={} misses={} hit_rate={:.1}% distinct={} unbounded_ceil={:.1}% lru_k={} lru_hit_rate={:.1}% enabled={}",
-            tot, h, m, rate, distinct, ceil, lru_k(), lru_rate, cache_enabled()
-        );
-    }
-}
-
-/// `GZIPPY_MFAST_PROF=1` — rdtsc cycle/event profiler for the `'mfast` marker
-/// fast loop and the careful marker loop. Zero-cost when off (one OnceLock bool
-/// branch per `read_internal_compressed_specialized::<true>` call). x86_64 only
-/// (rdtsc); on other arches `rdtsc` always returns 0 and all counters stay 0.
-///
-/// Reports at decode-end via [`mfast_prof::dump_if_enabled`] (called from the
-/// GZIPPY_VERBOSE block in chunk_fetcher.rs). Key output:
-///   mfast  cyc / total   ← share of marker-decode cycles in the fast loop
-///   careful cyc / total  ← share in the careful loop
-///   cyc/ev for each      ← cost-per-event ratio (fast-loop efficiency)
-pub(crate) mod mfast_prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-
-    /// Total rdtsc cycles inside the `'mfast` block (from the rdtsc taken just
-    /// before `'mfast: loop {` to the one taken after the loop exits). Includes
-    /// the fast-loop setup (dist-table amortization check, initial preload refill)
-    /// — both are amortized per block and are negligible vs the loop itself.
-    pub static MFAST_CYC: AtomicU64 = AtomicU64::new(0);
-    /// Total decode events handled by `'mfast` (iterations that passed the guard
-    /// check). One event = one ISA-L LUT litlen decode that emits 1-3 symbols.
-    pub static MFAST_EVENTS: AtomicU64 = AtomicU64::new(0);
-    /// Total rdtsc cycles in the careful marker loop
-    /// (`while emitted < n_max_to_decode`, CONTAINS_MARKERS=true path only).
-    pub static CAREFUL_CYC: AtomicU64 = AtomicU64::new(0);
-    /// Total decode events handled by the careful marker loop (outer iterations).
-    pub static CAREFUL_EVENTS: AtomicU64 = AtomicU64::new(0);
-    /// ZEN2-DECODE-MICROBENCH: total bytes EMITTED by the `'mfast` marker fast
-    /// loop (the denominator for the cyc/B comparison vs rapidgzip's
-    /// `readInternalCompressedMultiCached`). Counted at exactly the same site
-    /// MFAST_CYC is, so cycles and bytes are both-counted-or-both-skipped.
-    pub static MFAST_BYTES: AtomicU64 = AtomicU64::new(0);
-    /// ZEN2-DECODE-MICROBENCH: total bytes EMITTED by the careful marker loop,
-    /// counted at the same site CAREFUL_CYC is (the natural-exit flush; the rare
-    /// EOB commit! path skips both cyc and bytes, keeping the ratio consistent).
-    pub static CAREFUL_BYTES: AtomicU64 = AtomicU64::new(0);
-
-    #[inline(always)]
-    pub fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("GZIPPY_MFAST_PROF").is_ok_and(|v| v == "1"))
-    }
-
-    /// Read TSC on x86_64; return 0 on other arches.
-    #[inline(always)]
-    pub fn rdtsc(on: bool) -> u64 {
-        crate::decompress::parallel::contig_prof::rdtsc(on)
-    }
-
-    pub fn dump_if_enabled() {
-        if !enabled() {
-            return;
-        }
-        use Ordering::Relaxed;
-        let mf_cyc = MFAST_CYC.load(Relaxed);
-        let mf_ev = MFAST_EVENTS.load(Relaxed);
-        let ca_cyc = CAREFUL_CYC.load(Relaxed);
-        let ca_ev = CAREFUL_EVENTS.load(Relaxed);
-        let mf_b = MFAST_BYTES.load(Relaxed);
-        let ca_b = CAREFUL_BYTES.load(Relaxed);
-        let total_cyc = mf_cyc + ca_cyc;
-        let total_ev = mf_ev + ca_ev;
-        let total_b = mf_b + ca_b;
-        let pct = |part: u64, whole: u64| -> f64 {
-            if whole == 0 {
-                0.0
-            } else {
-                part as f64 * 100.0 / whole as f64
-            }
-        };
-        let cpe = |cyc: u64, ev: u64| -> f64 {
-            if ev == 0 {
-                0.0
-            } else {
-                cyc as f64 / ev as f64
-            }
-        };
-        eprintln!("[mfast-prof] marker-decode breakdown (GZIPPY_MFAST_PROF=1):");
-        eprintln!(
-            "  mfast  : cyc={:>16}  events={:>12}  {:>5.1}% of total  {:>6.1} cyc/ev",
-            mf_cyc,
-            mf_ev,
-            pct(mf_cyc, total_cyc),
-            cpe(mf_cyc, mf_ev)
-        );
-        eprintln!(
-            "  careful: cyc={:>16}  events={:>12}  {:>5.1}% of total  {:>6.1} cyc/ev",
-            ca_cyc,
-            ca_ev,
-            pct(ca_cyc, total_cyc),
-            cpe(ca_cyc, ca_ev)
-        );
-        eprintln!("  total  : cyc={:>16}  events={:>12}", total_cyc, total_ev);
-        eprintln!(
-            "  mfast-share: {:.3}  (hypothesis: wall delta ≈ inject_pct × this)",
-            pct(mf_cyc, total_cyc) / 100.0
-        );
-        // ZEN2-DECODE-MICROBENCH: the cyc/B headline (decode-loop-only marker
-        // decode, symmetric to rg's readInternalCompressedMultiCached<u16>).
-        let cpb = |cyc: u64, b: u64| -> f64 {
-            if b == 0 {
-                0.0
-            } else {
-                cyc as f64 / b as f64
-            }
-        };
-        eprintln!("  [WA-CYCB] mfast_bytes={mf_b} careful_bytes={ca_b} total_bytes={total_b}");
-        eprintln!(
-            "  [WA-CYCB] gz_marker_decode_cyc_per_byte={:.4}  (mfast={:.4} careful={:.4})",
-            cpb(total_cyc, total_b),
-            cpb(mf_cyc, mf_b),
-            cpb(ca_cyc, ca_b)
-        );
+        *ON.get_or_init(|| !std::env::var("GZIPPY_TBUILD_CACHE_OFF").is_ok_and(|v| v == "1"))
     }
 }
 
@@ -2216,7 +1972,6 @@ impl Block {
         //   `mfast_disabled` = `CONTAINS_MARKERS && ...` → `false && ...` = false
         //   `mfast_spin`     = `if false { ... } else { 0 }` = 0
         //   `mfast_yield`    = `localize_yield_kind(0)` = false
-        //   `mfast_prof_on`  = `false && ...` = false
         // So these are zero-cost on the clean specialization (<false>) and only
         // active on the marker specialization (<true>).
         //
@@ -2225,7 +1980,6 @@ impl Block {
         //   Unlike GZIPPY_SLOW_MARKER_MODE (which sets slow_spin != 0 and DISABLES
         //   the fast loop entry), this knob does NOT gate entry — it fires inside the
         //   loop body, after the guard. GZIPPY_SLOW_KIND=sleep ⇒ frequency-neutral.
-        // GZIPPY_MFAST_PROF=1:       rdtsc cycle/event accounting (x86_64 only).
         let mfast_disabled: bool = CONTAINS_MARKERS && super::slow_knob::mfast_disabled();
         let mfast_spin: u64 = if CONTAINS_MARKERS {
             super::slow_knob::mfast_spin_iters()
@@ -2233,7 +1987,6 @@ impl Block {
             0
         };
         let mfast_yield: bool = super::slow_knob::localize_yield_kind(mfast_spin);
-        let mfast_prof_on: bool = CONTAINS_MARKERS && mfast_prof::enabled();
 
         // ── DISPATCH: clean fast loop (Loop A) → marker fast loop (Loop B) →
         //              careful per-symbol tail (Loop C). ──────────────────────
@@ -2283,7 +2036,6 @@ impl Block {
                 track_backref,
                 mfast_spin,
                 mfast_yield,
-                mfast_prof_on,
             ) {
                 return r;
             }
@@ -2309,7 +2061,6 @@ impl Block {
             track_backref,
             slow_spin,
             slow_yield,
-            mfast_prof_on,
         )
     }
 
@@ -2347,7 +2098,6 @@ impl Block {
         track_backref: bool,
         mfast_spin: u64,
         mfast_yield: bool,
-        mfast_prof_on: bool,
     ) -> Option<Result<usize, BlockError>> {
         const MAX_RUN_LENGTH: usize = 258;
         const MAX_LIT_LEN_SYM: u32 = 512;
@@ -2373,10 +2123,6 @@ impl Block {
         // else-arm below is the exact pre-change chain.
         #[cfg(pure_inflate_decode)]
         let marker_dist_lut: bool = !marker_dist_lut_disabled();
-        // Effect-verification snapshot (one OnceLock read per call; the
-        // per-backref increment below is a predictable branch when OFF).
-        #[cfg(pure_inflate_decode)]
-        let md_stats: bool = marker_dist_stats::enabled();
         #[cfg(pure_inflate_decode)]
         if marker_dist_lut {
             // P3.4-amortized: fixed blocks use the process-wide static
@@ -2436,15 +2182,6 @@ impl Block {
         let dist_preload_on = marker_dist_lut && self.dist_valid && !marker_dist_preload_disabled();
         #[cfg(not(all(pure_inflate_decode, target_arch = "aarch64")))]
         let dist_preload_on = false;
-        // MFAST_PROF: rdtsc taken just before the loop. Includes the setup
-        // above (dist-table amortization + initial preload) which is amortized
-        // per block and is negligible vs the loop body in aggregate.
-        let mfast_t0: u64 = mfast_prof::rdtsc(mfast_prof_on);
-        let mut mfast_ev: u64 = 0;
-        // ZEN2-DECODE-MICROBENCH: byte denominator snapshot at the same point cyc
-        // timing starts (after table build, before the loop). delta == bytes this
-        // fast loop emits.
-        let mfast_bytes0: usize = emitted;
         // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
         // Hoist bitbuf/bitsleft/pos into a stack-local `lb: Bits` for the
         // duration of `'mfast` and write back at every exit. The raw-pointer
@@ -2468,11 +2205,7 @@ impl Block {
                     if !(out_ok && in_ok) {
                         break 'mfast;
                     }
-                    // MFAST_PROF: count events that passed the guard (actual work).
                     // SLOW_MFAST_MODE: localized per-event inject WITHOUT gating entry.
-                    if mfast_prof_on {
-                        mfast_ev += 1;
-                    }
                     super::slow_knob::inject_localize(mfast_spin, mfast_yield);
                     let sym0 = pre.symbol;
                     let sym_count0 = pre.sym_count;
@@ -2611,11 +2344,6 @@ impl Block {
                                 use crate::decompress::inflate::libdeflate_entry::DistTable;
                                 #[cfg(all(test, pure_inflate_decode))]
                                 MARKER_DIST_LUT_HITS.with(|c| c.set(c.get() + 1));
-                                #[cfg(pure_inflate_decode)]
-                                if md_stats {
-                                    marker_dist_stats::LUT_BACKREFS
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
                                 // T3-ILP #3: use the entry preloaded at the top of
                                 // the body (its load overlapped the store/count/
                                 // branch). Byte-exact: `$cur.bitbuf` is unchanged
@@ -2653,11 +2381,6 @@ impl Block {
                                 dist_entry.decode_distance(dist_extra_saved) as usize
                             } else {
                                 // Pre-change chain VERBATIM (N1 kill-switch arm).
-                                #[cfg(pure_inflate_decode)]
-                                if md_stats {
-                                    marker_dist_stats::HC_BACKREFS
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
                                 let dsym = match $dist_hc_decode {
                                     Some(d) => d,
                                     None => {
@@ -2819,14 +2542,6 @@ impl Block {
                 },
                 {}
             );
-        }
-        // MFAST_PROF: flush mfast cycles + event count to global atomics.
-        if mfast_prof_on {
-            use std::sync::atomic::Ordering;
-            let cyc = mfast_prof::rdtsc(true).wrapping_sub(mfast_t0);
-            mfast_prof::MFAST_CYC.fetch_add(cyc, Ordering::Relaxed);
-            mfast_prof::MFAST_EVENTS.fetch_add(mfast_ev, Ordering::Relaxed);
-            mfast_prof::MFAST_BYTES.fetch_add((emitted - mfast_bytes0) as u64, Ordering::Relaxed);
         }
         // FALL THROUGH: every `break 'mfast` leaves a fresh un-consumed `pre`
         // and the synced `bits` cursor before it; write the live cursors back so
@@ -3080,7 +2795,6 @@ impl Block {
         track_backref: bool,
         slow_spin: u64,
         slow_yield: bool,
-        mfast_prof_on: bool,
     ) -> Result<usize, BlockError> {
         const MAX_LIT_LEN_SYM: u32 = 512;
         let mut pos = *pos_io;
@@ -3094,25 +2808,7 @@ impl Block {
                 return $result;
             }};
         }
-        // MFAST_PROF: careful-loop cycle measurement. Declared here so the end
-        // rdtsc fires after the loop exits naturally. `commit!()` early-return
-        // paths skip this rdtsc — they are edge cases (EOB, errors) and don't
-        // contribute meaningfully to the aggregate. Const-folds to 0 on the
-        // clean path (mfast_prof_on = false there).
-        let careful_t0: u64 = if mfast_prof_on {
-            mfast_prof::rdtsc(true)
-        } else {
-            0
-        };
-        // ZEN2-DECODE-MICROBENCH: byte denominator snapshot (marker path only;
-        // CONTAINS_MARKERS const-folds this dead on the clean tail).
-        let careful_bytes0: usize = emitted;
-        let mut careful_ev: u64 = 0;
         while emitted < n_max_to_decode {
-            // MFAST_PROF: count careful-loop events (outer iterations).
-            if mfast_prof_on {
-                careful_ev += 1;
-            }
             // One slow-knob injection per decode event (this outer iteration =
             // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
             // Const-generic split: the u16 marker specialization uses
@@ -3275,21 +2971,6 @@ impl Block {
                 break;
             }
         }
-        // MFAST_PROF: flush careful-loop cycles + events. Only fires when
-        // mfast_prof_on=true (marker path + GZIPPY_MFAST_PROF=1). commit!()
-        // paths skip this flush (edge cases: EOB mid-block, errors).
-        if mfast_prof_on {
-            use std::sync::atomic::Ordering;
-            let cyc = mfast_prof::rdtsc(true).wrapping_sub(careful_t0);
-            mfast_prof::CAREFUL_CYC.fetch_add(cyc, Ordering::Relaxed);
-            mfast_prof::CAREFUL_EVENTS.fetch_add(careful_ev, Ordering::Relaxed);
-            // ZEN2-DECODE-MICROBENCH: only the marker careful tail contributes
-            // (clean tail has mfast_prof_on=false). Bytes at the same site as cyc.
-            if CONTAINS_MARKERS {
-                mfast_prof::CAREFUL_BYTES
-                    .fetch_add((emitted - careful_bytes0) as u64, Ordering::Relaxed);
-            }
-        }
         self.ring.pos = pos;
         self.decoded_bytes += emitted;
         self.ring.distance_to_last_marker = distance_marker;
@@ -3348,12 +3029,6 @@ impl Block {
             } else {
                 self.dist_table_nlens = 0;
             }
-            if super::contig_prof::enabled() {
-                super::contig_prof::C_N_DISTBUILD
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        } else if super::contig_prof::enabled() {
-            super::contig_prof::C_N_DISTREUSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -3552,12 +3227,6 @@ impl Block {
 
         let mut emitted: usize = 0;
 
-        // P3.1 cycle profiler (GZIPPY_CONTIG_PROF=1, OFF=default): per-call
-        // accumulator flushed on Drop so every `commit!`/`commit_fast!` return
-        // path is covered. See contig_prof.rs for method + caveats.
-        let prof_on = super::contig_prof::enabled();
-        let mut pf = super::contig_prof::ContigFlush::new(prof_on);
-
         // Causal-perturbation slow-injection (measurement-only, byte-transparent;
         // OFF==identity, DUAL-SHA gated). This is the PRODUCTION gzippy-native FOLD
         // clean loop (post-flip contig tail) — the prior `GZIPPY_SLOW_MODE` knob
@@ -3628,7 +3297,6 @@ impl Block {
                 && st_spin == 0
                 && !oracle_nostore
                 && orec.is_none()
-                && !prof_on
                 && !self.track_backreferences
                 && self.dist_valid
                 && local_cap > 0;
@@ -3879,7 +3547,9 @@ impl Block {
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
             let mut asm_on: bool = super::asm_kernel::enabled()
                 && super::asm_kernel::dispatch_allowed(
-                    prof_on,
+                    // Contig cycle-profiler removed: profiling is never active,
+                    // so it never forces the pure-Rust loop.
+                    false,
                     oracle_nostore,
                     orec.is_some(),
                     dec_spin,
@@ -3920,11 +3590,6 @@ impl Block {
             // (byte-exact proof on `decode_prefilled`).
             let mut pre = self.asm.lut_litlen.decode_prefilled(&lb);
             super::slow_knob::inject_localize(dec_spin, dec_yield);
-            // P3.1 profiler chaining state: ONE rdtsc per iteration; the delta
-            // between consecutive iteration tops is charged to the class the
-            // completed iteration recorded in `prof_pending`.
-            let mut prof_last_t: u64 = super::contig_prof::rdtsc(prof_on);
-            let mut prof_pending: usize = super::contig_prof::CLASS_NONE;
             // ── TWO LOOP VARIANTS (flip-precondition 4, campaign §9 gate) ──
             // The fast loop is instantiated twice from one macro source:
             // the `false` instantiation const-folds the asm dispatch away
@@ -3955,15 +3620,6 @@ impl Block {
             macro_rules! fast_loop_run {
                 ($use_asm:literal) => {
             'fast: loop {
-                if prof_on {
-                    let t = super::contig_prof::rdtsc(true);
-                    if prof_pending != super::contig_prof::CLASS_NONE {
-                        pf.cyc[prof_pending] += t.wrapping_sub(prof_last_t);
-                        pf.n[prof_pending] += 1;
-                    }
-                    prof_last_t = t;
-                    prof_pending = super::contig_prof::CLASS_NONE;
-                }
                 // ── ASM-campaign rung (c): the asm region owns the
                 // per-symbol hot path; Rust handles boundary/rare packets
                 // (asm_kernel.rs EXIT-STATE CONTRACT). Re-entry via
@@ -4120,14 +3776,6 @@ impl Block {
                             break;
                         }
                         super::slow_knob::inject_localize(st_spin, st_yield);
-                        if prof_on {
-                            if chained == 0 {
-                                prof_pending = super::contig_prof::CLASS_LIT1;
-                            } else {
-                                prof_pending = super::contig_prof::CLASS_LITCHAIN;
-                                pf.bytes_litchain += (1 + chained) as u64;
-                            }
-                        }
                         // Restore the ≥48-bit iteration-top invariant for the
                         // carried packet (mirrors the wrapper's carry-site
                         // refills, resumable.rs:1345-1348, and the bottom
@@ -4179,10 +3827,6 @@ impl Block {
                     *pos += lit_prefix;
                     emitted += lit_prefix;
                     super::slow_knob::inject_localize(st_spin, st_yield);
-                    if prof_on {
-                        prof_pending = super::contig_prof::CLASS_LITPACK;
-                        pf.bytes_litpack += lit_prefix as u64;
-                    }
                 }
 
                 if have_trailing {
@@ -4323,10 +3967,6 @@ impl Block {
                             }
                         }
                         emitted += length;
-                        if prof_on {
-                            prof_pending = super::contig_prof::CLASS_BACKREF;
-                            pf.bytes_backref += length as u64;
-                        }
                         // P3.5 c1: `pre` already preloaded above (before the
                         // copy) — skip the bottom-of-loop preload.
                         continue 'fast;
@@ -4368,21 +4008,7 @@ impl Block {
             sync_local_bits!();
         }
 
-        // P3.1 profiler: chained per-iteration accounting for the careful tail
-        // (the EOB-exit iteration's tail cycles are dropped — acceptable, the
-        // careful loop is the low-volume tail).
-        let mut prof_c_last: u64 = super::contig_prof::rdtsc(prof_on);
-        let mut prof_c_pending: bool = false;
         while emitted < local_cap {
-            if prof_on {
-                let t = super::contig_prof::rdtsc(true);
-                if prof_c_pending {
-                    pf.cyc_careful += t.wrapping_sub(prof_c_last);
-                    pf.bytes_careful += 1; // outer-iteration count, not bytes
-                }
-                prof_c_last = t;
-                prof_c_pending = true;
-            }
             super::slow_knob::inject(slow_spin, slow_yield);
             bits.refill();
             let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);

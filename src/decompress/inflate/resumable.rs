@@ -1176,15 +1176,6 @@ fn decode_huffman_body_resumable(
     let slow_spin: u64 = crate::decompress::parallel::slow_knob::spin_iters();
     let slow_yield: bool = crate::decompress::parallel::slow_knob::yield_kind();
 
-    // P3.1 cycle profiler (GZIPPY_CONTIG_PROF=1, OFF=default): the comparison
-    // arm of the contig-loop profile (see contig_prof.rs). One rdtsc per
-    // decode_one_symbol! expansion, chained; class of the completed iteration
-    // is whatever it recorded in `w_pending` (1=literal path, 2=match path).
-    let prof_on = crate::decompress::parallel::contig_prof::enabled();
-    let mut wf = crate::decompress::parallel::contig_prof::WrapperFlush::new(prof_on);
-    let mut w_last_t: u64 = crate::decompress::parallel::contig_prof::rdtsc(prof_on);
-    let mut w_pending: usize = 0;
-
     macro_rules! decode_one_symbol {
         ($refill:ident) => {{
             // Causal-perturbation slow-injection knob (CLEAN-mode inner loop).
@@ -1206,19 +1197,6 @@ fn decode_huffman_body_resumable(
             // only touches a black-boxed scratch accumulator — never `bitbuf`/
             // `bitsleft`/`out_pos`/`entry`. See parallel::slow_knob.
             crate::decompress::parallel::slow_knob::inject(slow_spin, slow_yield);
-
-            if prof_on {
-                let t = crate::decompress::parallel::contig_prof::rdtsc(true);
-                if w_pending == 1 {
-                    wf.cyc_lit += t.wrapping_sub(w_last_t);
-                    wf.n_lit += 1;
-                } else if w_pending == 2 {
-                    wf.cyc_match += t.wrapping_sub(w_last_t);
-                    wf.n_match += 1;
-                }
-                w_last_t = t;
-                w_pending = 0;
-            }
 
             // saved_bitbuf for length / dist-extra extraction. Captured
             // BEFORE consume so the same bits the entry was decoded from
@@ -1265,9 +1243,6 @@ fn decode_huffman_body_resumable(
                     output_ptr.add(out_pos).write(entry.literal_value());
                 }
                 out_pos += 1;
-                if prof_on {
-                    w_pending = 1;
-                }
 
                 // Speculative lookup for the next entry. Two outcomes:
                 //   (A) Next is literal → consume + emit it; try to
@@ -1391,9 +1366,6 @@ fn decode_huffman_body_resumable(
                         output_ptr.add(out_pos).write(entry.literal_value());
                     }
                     out_pos += 1;
-                    if prof_on {
-                        w_pending = 1;
-                    }
                     if (bitsleft as u8) < REFILL_THRESHOLD {
                         $refill!();
                     }
@@ -1409,9 +1381,6 @@ fn decode_huffman_body_resumable(
             }
 
             // LENGTH+DISTANCE path.
-            if prof_on {
-                w_pending = 2;
-            }
             let length = entry.decode_length(saved_bitbuf);
             // Hide match-source load latency (libdeflate_decode.rs:693-701).
             #[cfg(target_arch = "x86_64")]
