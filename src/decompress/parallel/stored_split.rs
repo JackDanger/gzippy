@@ -308,20 +308,6 @@ pub fn decompress_stored_parallel<W: Write>(
                 });
             }
 
-            // A/B kill-switch: `GZIPPY_STORED_MONOLITHIC=1` restores the old
-            // monolithic path (alloc a zero-init `vec![0u8; total]`, copy every
-            // run in, then `write_all` the whole buffer out). Correctness-
-            // equivalent; for same-binary A/B measurement of the streaming win.
-            if std::env::var_os("GZIPPY_STORED_MONOLITHIC").is_some() {
-                let mut output = time_phase("alloc_zero", || vec![0u8; total]);
-                let crc = time_phase("fill_and_crc", || {
-                    fill_and_crc(&mut output, deflate, header_size, &runs, num_threads)
-                });
-                return time_phase("verify_write", || {
-                    verify_and_write(writer, &output, crc, expected_crc, expected_size)
-                });
-            }
-
             // Pure-stored stream: the output bytes ARE the verbatim input run
             // slices — `StoredRun { src_off, len }` indexes straight into the
             // compressed input, so `output[out_off..][..len] ==
@@ -479,9 +465,6 @@ fn decode_with_huffman_tail<W: Write>(
         // predecessor window directly from the runs, then run the tail decode
         // and the full-prefix copy concurrently into disjoint output regions.
         //
-        // `GZIPPY_STORED_NO_OVERLAP=1` forces the old sequential order (prefix
-        // copy THEN tail decode) for A/B comparison.
-        //
         // The overlap path requires `prefix_out >= MAX_WINDOW_SIZE` so the
         // predecessor window is exactly 32 KiB — then for every legal tail
         // back-reference (`distance <= 32 KiB`, validated by `decode_block`)
@@ -490,8 +473,7 @@ fn decode_with_huffman_tail<W: Write>(
         // distance; the contiguous sequential path has no such edge, so we use
         // it. Stored-dominated production input always has a multi-MiB prefix,
         // so this guard never excludes the real workload.
-        let overlap =
-            std::env::var_os("GZIPPY_STORED_NO_OVERLAP").is_none() && prefix_out >= MAX_WINDOW_SIZE;
+        let overlap = prefix_out >= MAX_WINDOW_SIZE;
 
         let (prefix_crc, tail_crc) = if overlap {
             // Gather the predecessor window (last min(prefix_out, 32 KiB) bytes
@@ -717,11 +699,7 @@ fn fill_and_crc(
     let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
     // Below this many threads (or for tiny output) the parallel split's
     // per-partition CRC-combine overhead is not worth it — do it inline.
-    // `GZIPPY_STORED_INLINE_COPY=1` forces the inline path at any thread count
-    // (A/B knob: stored decode is partly bandwidth-bound, so whether the
-    // partitioned copy+CRC pays depends on the box's memory subsystem).
-    let force_inline = std::env::var_os("GZIPPY_STORED_INLINE_COPY").is_some();
-    if force_inline || threads <= 1 || total < 1 << 20 {
+    if threads <= 1 || total < 1 << 20 {
         // Fused copy+CRC: hash each run's bytes while they are still hot in
         // cache from the copy, instead of a SECOND full pass over `output`.
         // A/B knob `GZIPPY_STORED_SPLIT_CRC=1` restores the old split (copy
@@ -810,7 +788,7 @@ fn fill_and_crc(
 /// so this yields the exact same CRC32 as `crc32(assembled_output)`. Mirrors
 /// `fill_and_crc`'s parallel partition + `combine_crc32` fold, minus the copy.
 ///
-/// For `T<=1`, small output, or `GZIPPY_STORED_INLINE_COPY=1` it hashes inline;
+/// For `T<=1` or small output it hashes inline;
 /// otherwise it partitions runs into contiguous output-byte-balanced groups,
 /// hashes each group's input slices on its own thread, and folds the
 /// per-partition CRCs left-to-right (same fold as `fill_and_crc`).
@@ -827,8 +805,7 @@ fn crc_runs(
     }
 
     let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
-    let force_inline = std::env::var_os("GZIPPY_STORED_INLINE_COPY").is_some();
-    if force_inline || threads <= 1 || total < 1 << 20 {
+    if threads <= 1 || total < 1 << 20 {
         return crc_runs_inline(deflate, base_off, runs);
     }
 

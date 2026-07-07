@@ -325,9 +325,10 @@ fn stored_flip_disabled() -> bool {
     if ov >= 0 {
         return ov == 1;
     }
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GZIPPY_NO_STORED_FLIP").is_ok_and(|v| v == "1"))
+    // Shipped default: stored-flip ENABLED (env kill-switch removed). The
+    // test override above still exercises the disabled arm for the byte-equality
+    // differential.
+    false
 }
 
 /// Rung-(d) increment 1 test override (mirror of `STORED_FLIP_OVERRIDE`):
@@ -382,26 +383,6 @@ thread_local! {
     pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Per-block Huffman table-build CACHE (litlen LUT). Many adjacent deflate
-/// blocks on repetitive corpora (logs) carry byte-identical dynamic-Huffman
-/// code-length vectors; rebuilding the LUT for an identical header is pure
-/// redundant work (`rebuild_from` is a deterministic function of the
-/// code-length slice + multisym flag). The cache stores the last successfully
-/// built code-length key inside `LutLitLenCode`; a hit skips the rebuild and
-/// reuses the already-correct `self.table` (decode only READS the table, never
-/// mutates it, so a hit is byte-identical to a fresh build).
-///
-/// `GZIPPY_TBUILD_CACHE_OFF=1` disables the cache (always rebuild) — the
-/// removal-oracle's BASE arm.
-pub(crate) mod tbuild_cache {
-    use std::sync::OnceLock;
-    /// True unless explicitly disabled (default ON — shippable on a win).
-    pub fn cache_enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| !std::env::var("GZIPPY_TBUILD_CACHE_OFF").is_ok_and(|v| v == "1"))
-    }
-}
-
 /// Rung-(d) increment 1 kill-switch (git history (campaign plan, removed) §5, F-d1):
 /// `GZIPPY_MARKER_DIST_TABLE=0` restores the exact pre-change marker-fast-loop
 /// distance decode (the `dist_hc` → DISTANCE_EXTRA → refill-check →
@@ -431,47 +412,10 @@ fn mfast_localbits_disabled() -> bool {
     if ov >= 0 {
         return ov == 1;
     }
-    use std::sync::OnceLock;
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MFAST_LOCALBITS").is_ok_and(|v| v == "1"))
-}
-
-/// T3-MARKER-ILP kill-switch: `GZIPPY_NO_MARKER_PRELOAD=1` restores the exact
-/// pre-lever bottom-of-loop order in the `'mfast` marker fast loop —
-/// `refill(); decode_prefilled()` — instead of the load-before-refill
-/// software-pipeline (speculative `spec_short_entry` from the pre-refill bitbuf,
-/// then `refill()`, then `decode_from_spec`). Same-binary causal A/B arm: with
-/// the switch ON the speculative table load serialises behind the refill exactly
-/// as before, so a wall/IPC delta between the two arms isolates the pipeline
-/// effect. One OnceLock read per `read_internal_compressed_specialized::<true>`
-/// call; zero-cost when OFF.
-fn marker_preload_disabled() -> bool {
-    use std::sync::OnceLock;
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_MARKER_PRELOAD").is_ok_and(|v| v == "1"))
-}
-
-/// T3-MARKER-ILP kill-switch (sub-lever #3): `GZIPPY_NO_DIST_PRELOAD=1` restores
-/// the exact pre-lever placement of the marker fast loop's FIRST-level distance
-/// table lookup — computed INSIDE the backref (length) arm — instead of the
-/// speculative-hoist that issues `self.asm.dist.lookup($cur.bitbuf)` at the TOP
-/// of the loop body (immediately after the litlen `consume`, before the literal
-/// store / branchless leading-count / length branch). The hoisted load's ~3-4
-/// cyc latency then overlaps that independent work instead of serialising after
-/// the branch resolves (the M1-preload / igzip asm `mov 0x1FF / and / mov [dist]`
-/// pattern at asm_kernel.rs:625-627). Byte-exact: `$cur.bitbuf` is unchanged
-/// between the hoist point and the branch use (the store/count/EOB-checks never
-/// touch it), so the preloaded `DistEntry` is bit-identical to a fresh in-arm
-/// lookup (a debug_assert proves it every backref). Same-binary causal A/B arm:
-/// ON the load overlaps; OFF it serialises exactly as before. One OnceLock read
-/// per `read_internal_compressed_specialized::<true>` call; zero-cost when OFF.
-// Called only on aarch64 (the dist-preload is compile-gated to aarch64); on
-// x86_64 the enable folds to `false` and this reader is never referenced.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn marker_dist_preload_disabled() -> bool {
-    use std::sync::OnceLock;
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GZIPPY_NO_DIST_PRELOAD").is_ok_and(|v| v == "1"))
+    // Shipped default: local-Bits register mirror ENABLED (env kill-switch
+    // removed). The test override above still exercises the struct-field arm for
+    // the byte-equality differential.
+    false
 }
 
 /// `GZIPPY_DEBUG=1`-gated one-line trace for the two flip cases (proves the
@@ -2095,20 +2039,19 @@ impl Block {
         // definite-init check for the cross-macro-hygiene shared binding.
         #[allow(unused_assignments)]
         let mut spec_litlen: u32 = 0;
-        // Declared BEFORE the `mfast_lb_run!` definition so the macro
-        // transcription resolves it (macro_rules resolves free idents at the
-        // def site); also visible at the two call sites below.
-        let marker_preload_on = !marker_preload_disabled();
+        // T3-MARKER-ILP LEVER: the marker-fast-loop litlen preload is the shipped
+        // default (the A/B kill-switch that reverted to `refill(); decode()` was
+        // removed); the load-before-refill software pipeline always runs.
         // T3-ILP #3 (dist-preload): loop-invariant enable. The speculative
         // first-level dist lookup is hoisted to the top of the loop body ONLY
         // when the marker LUT dist path is the active decode arm (marker_dist_lut
         // && dist_valid ⇔ `marker_dt = Some(..)` below); otherwise the dist_hc
         // arm is taken and there is nothing to preload. `dist_valid` is set by
         // `ensure_dist_table` (called just above) and is loop-invariant (no table
-        // rebuild inside the fast loop). Kill-switch `GZIPPY_NO_DIST_PRELOAD=1`.
+        // rebuild inside the fast loop).
         //
         // ARCH-GATED (2026-07-02, gated cross-arch A/B on silesia, same-binary
-        // GZIPPY_NO_DIST_PRELOAD ON vs OFF, sha 028bd002...):
+        // dist-preload ON vs OFF, sha 028bd002...):
         //   aarch64 (Apple M1): WIN — T3 ON<OFF 23/25 (min -2.0% / median -2.4%),
         //     T4 21/25 (-1.6% / -1.7%). The wide OoO window + spare load ports
         //     absorb the per-iteration speculative load and hide the dist
@@ -2121,7 +2064,7 @@ impl Block {
         //     its branch dead-code-eliminate, and the length arm reverts to the
         //     exact pre-lever in-arm `dt.lookup` (x86 codegen byte-identical).
         #[cfg(all(pure_inflate_decode, target_arch = "aarch64"))]
-        let dist_preload_on = marker_dist_lut && self.dist_valid && !marker_dist_preload_disabled();
+        let dist_preload_on = marker_dist_lut && self.dist_valid;
         #[cfg(not(all(pure_inflate_decode, target_arch = "aarch64")))]
         let dist_preload_on = false;
         // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
@@ -2180,7 +2123,7 @@ impl Block {
                     // an always-allocated table (memory-safe even on the discarded
                     // literal iterations). Gated on `dist_preload_on`
                     // (marker_dist_lut && dist_valid ⇔ the length arm takes the
-                    // `Some(dt)` path); kill-switch `GZIPPY_NO_DIST_PRELOAD=1`.
+                    // `Some(dt)` path).
                     let dist_spec = if dist_preload_on {
                         self.asm.dist.lookup($cur.bitbuf)
                     } else {
@@ -2404,18 +2347,12 @@ impl Block {
                     // ≥56-bit fill ⇒ ≥13 remaining), so the low-12 index is
                     // unchanged by the refill's high-bit OR; `decode_from_spec`
                     // trusts the entry ONLY for short codes and re-decodes long
-                    // codes (>12 bits) from the post-refill reader. Kill-switch
-                    // `GZIPPY_NO_MARKER_PRELOAD=1` restores `refill(); decode()`.
-                    spec_litlen = if marker_preload_on {
-                        self.asm.lut_litlen.spec_short_entry($cur.bitbuf)
-                    } else {
-                        0
-                    };
+                    // codes (>12 bits) from the post-refill reader.
+                    spec_litlen = self.asm.lut_litlen.spec_short_entry($cur.bitbuf);
                     debug_assert!(
-                        !marker_preload_on
-                            || ($cur.bitsleft as u8)
-                                >= crate::decompress::parallel::lut_huffman::ISAL_DECODE_LONG_BITS
-                                    as u8
+                        ($cur.bitsleft as u8)
+                            >= crate::decompress::parallel::lut_huffman::ISAL_DECODE_LONG_BITS
+                                as u8
                             || $cur.pos >= in_end,
                         "marker preload invariant violated: bitsleft={} < 12",
                         $cur.bitsleft as u8
@@ -2445,13 +2382,9 @@ impl Block {
                     // WINDOW-ABSENT CONVERGE (Lever A): the bottom-of-loop
                     // `$cur.refill()` runs immediately before this decode, so the
                     // backstop is dead — use `decode_prefilled` like the clean path.
-                    // T3-ILP #2: when the preload is ON, finish from the entry
-                    // pre-loaded before the refill (`spec_litlen`).
-                    pre = if marker_preload_on {
-                        self.asm.lut_litlen.decode_from_spec(spec_litlen, &lb)
-                    } else {
-                        self.asm.lut_litlen.decode_prefilled(&lb)
-                    };
+                    // T3-ILP #2: finish from the entry pre-loaded before the
+                    // refill (`spec_litlen`).
+                    pre = self.asm.lut_litlen.decode_from_spec(spec_litlen, &lb);
                 },
                 {
                     bits.pos = lb.pos;
@@ -2473,12 +2406,8 @@ impl Block {
                 {
                     // WINDOW-ABSENT CONVERGE (Lever A): post-`$cur.refill()` site
                     // — backstop-free decode (kill-switch struct-field arm).
-                    // T3-ILP #2: finish from the pre-refill-loaded entry when ON.
-                    pre = if marker_preload_on {
-                        self.asm.lut_litlen.decode_from_spec(spec_litlen, bits)
-                    } else {
-                        self.asm.lut_litlen.decode_prefilled(bits)
-                    };
+                    // T3-ILP #2: finish from the pre-refill-loaded entry.
+                    pre = self.asm.lut_litlen.decode_from_spec(spec_litlen, bits);
                 },
                 {}
             );
@@ -2912,7 +2841,6 @@ impl Block {
     /// place. Latched per block by `dist_table_checked` (reset in
     /// `read_header`), so the contig clean loop and the marker fast loop can
     /// both call it and the work runs at most once per block.
-    /// `GZIPPY_DIST_AMORT=0` kill-switch behavior preserved verbatim.
     #[cfg(pure_inflate_decode)]
     fn ensure_dist_table(&mut self) {
         if self.dist_table_checked {
@@ -2938,13 +2866,6 @@ impl Block {
                 return;
             }
         };
-        if dist_amort_disabled() {
-            // KILL-SWITCH (GZIPPY_DIST_AMORT=0): rebuild every block (no cache
-            // reuse), still in place. Same binary/layout; only behavior toggles.
-            self.dist_valid = self.asm.dist.rebuild(lens);
-            self.dist_table_nlens = 0; // force a rebuild next block too
-            return;
-        }
         let reusable = self.dist_valid && &self.dist_table_lens[..self.dist_table_nlens] == lens;
         if !reusable {
             let ok = self.asm.dist.rebuild(lens);
@@ -3165,13 +3086,10 @@ impl Block {
         ))]
         {
             use crate::decompress::inflate::consume_first_decode::{
-                decode_huffman_fastloop_bounded, decode_huffman_fastloop_bounded_pipelined,
-                use_baseline_kernel, FlatFastloopExit, FLAT_CONTIG_BYTES, FLAT_CONTIG_CALLS,
+                decode_huffman_fastloop_bounded_pipelined, FlatFastloopExit, FLAT_CONTIG_BYTES,
+                FLAT_CONTIG_CALLS,
             };
-            let flat_eligible = flat_clean_enabled()
-                && !self.track_backreferences
-                && self.dist_valid
-                && local_cap > 0;
+            let flat_eligible = !self.track_backreferences && self.dist_valid && local_cap > 0;
             if flat_eligible && self.ensure_flat_litlen() {
                 let out_fastloop_end = *pos + local_cap;
                 // SAFETY: `base` is valid for `[0, cap)` (caller contract). The
@@ -3191,27 +3109,15 @@ impl Block {
                     _ => self.flat_litlen.as_ref().unwrap(),
                 };
                 // ROUTE-B: production default = faithful libdeflate software-
-                // pipelined fastloop port (gated aarch64 T1 win). GZIPPY_BASELINE_KERNEL=1
-                // reverts to the legacy pack-8 baseline for AB re-verification.
-                let exit = if use_baseline_kernel() {
-                    decode_huffman_fastloop_bounded(
-                        bits,
-                        out_slice,
-                        *pos,
-                        out_fastloop_end,
-                        litlen_ref,
-                        &self.asm.dist,
-                    )
-                } else {
-                    decode_huffman_fastloop_bounded_pipelined(
-                        bits,
-                        out_slice,
-                        *pos,
-                        out_fastloop_end,
-                        litlen_ref,
-                        &self.asm.dist,
-                    )
-                };
+                // pipelined fastloop port (gated aarch64 T1 win).
+                let exit = decode_huffman_fastloop_bounded_pipelined(
+                    bits,
+                    out_slice,
+                    *pos,
+                    out_fastloop_end,
+                    litlen_ref,
+                    &self.asm.dist,
+                );
                 FLAT_CONTIG_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Canonical seam re-read: rebuild a pristine `Bits` from the
                 // absolute bit position so the engine-B tail / next read_header
@@ -4115,29 +4021,6 @@ const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
 };
 #[cfg(parallel_sm)]
 const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_SYMBOL_COUNT];
-
-/// P3.4 item 1 kill-switch: `GZIPPY_DIST_AMORT=0` restores the exact
-/// pre-P3.4 per-block fresh-build behavior (fresh Vec per block, fixed
-/// blocks build too, no reuse) inside the same binary. Read once.
-#[cfg(pure_inflate_decode)]
-fn dist_amort_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("GZIPPY_DIST_AMORT").is_ok_and(|v| v == "0"))
-}
-
-/// Byte-transparent kill-switch for the engine-A flat clean-contig fastloop
-/// wire-in (default ON). `GZIPPY_FLAT_CLEAN=0` routes the clean contig path back
-/// to the engine-B two-level loop with IDENTICAL output, so the same binary can
-/// A/B engine A vs engine B (controls for code layout). Compiled only where the
-/// wire-in exists.
-#[cfg(all(
-    pure_inflate_decode,
-    not(all(feature = "asm-kernel", target_arch = "x86_64"))
-))]
-fn flat_clean_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("GZIPPY_FLAT_CLEAN").is_ok_and(|v| v == "0"))
-}
 
 /// NIGHT35 (re-added NIGHT28/NIGHT33 perturbation at HEAD): per-block
 /// table-build multiplier. `GZIPPY_TBUILD_MULT=N` runs the per-block litlen

@@ -159,10 +159,9 @@ pub(crate) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
             // PMULL carry-less fold (libdeflate crc32_arm_pmullx12 structure):
             // PMULL is a SEPARATE execution resource from the `crc32x` unit on
             // Apple Silicon, so a multi-accumulator PMULL fold can exceed the
-            // 1-crc32x/cycle ceiling that bounds `fold3`. Default ON when the
-            // CPU has BOTH the `aes` (PMULL) and `crc` extensions; force OFF for
-            // a one-binary A/B with `GZIPPY_CRC_PMULL=0`.
-            if hw_pmull::available() && crc_pmull_enabled() {
+            // 1-crc32x/cycle ceiling that bounds `fold3`. ON when the CPU has
+            // BOTH the `aes` (PMULL) and `crc` extensions (runtime-detected).
+            if hw_pmull::available() {
                 // SAFETY: gated on runtime `aes`+`crc` feature detection.
                 return unsafe { hw_pmull::crc32_arm_pmull(crc, data) };
             }
@@ -183,32 +182,14 @@ pub(crate) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
     h.finalize()
 }
 
-/// `GZIPPY_CRC_LEGACY=1` forces the crc32fast kernel so the faster HW-CRC fold
-/// (aarch64 3-way `crc32x`, x86_64 VPCLMULQDQ 256-bit fold) stays re-verifiable
-/// by an interleaved A/B on ONE binary (controls for build variance). Read
-/// once. Default OFF = fast path.
+/// Whether to use the portable crc32fast kernel instead of the HW-accelerated
+/// fold (aarch64 3-way `crc32x` / PMULL, x86_64 VPCLMULQDQ). The shipped path
+/// is always the HW fold (subject to runtime feature detection at the call
+/// sites); the `GZIPPY_CRC_LEGACY` A/B override was removed.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn crc_legacy() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| {
-        matches!(
-            std::env::var("GZIPPY_CRC_LEGACY").ok().as_deref(),
-            Some("1")
-        )
-    })
-}
-
-/// `GZIPPY_CRC_PMULL=0` forces the `crc32x` 3-way fold (`hw_crc::fold3`) so the
-/// PMULL fold stays re-verifiable by a one-binary A/B (controls for build
-/// variance). Read once. Default ON = PMULL fold when `aes`+`crc` are present.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn crc_pmull_enabled() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| !matches!(std::env::var("GZIPPY_CRC_PMULL").ok().as_deref(), Some("0")))
+    false
 }
 
 #[cfg(target_arch = "aarch64")]

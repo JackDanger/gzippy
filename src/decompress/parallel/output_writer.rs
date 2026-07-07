@@ -31,9 +31,11 @@
 //! the consumer (O(1) combine), so correctness of the trailer check is
 //! unaffected. A write error is captured and surfaced at `join`.
 //!
-//! OFF by default unless `GZIPPY_OVERLAP_WRITER=1`; OFF == the inline writev
-//! path (byte-identical). Linux + regular-fd only (the vmsplice/pipe path is
-//! unchanged — splice page-lifetime accounting needs the inline path).
+//! The shipped default is the inline writev path (byte-identical); this
+//! overlap-writer machinery is currently unwired (the `GZIPPY_OVERLAP_WRITER`
+//! A/B toggle was removed) and retained for a future re-enable. Linux +
+//! regular-fd only (the vmsplice/pipe path is unchanged — splice page-lifetime
+//! accounting needs the inline path).
 
 #![cfg(all(unix, parallel_sm))]
 // The overlap-writer machinery (`enabled`/`submit_chunk`/`OverlapWriter`/
@@ -49,12 +51,6 @@ use std::thread::JoinHandle;
 
 use crate::decompress::parallel::chunk_data::ChunkData;
 use crate::decompress::parallel::fd_vectored_write;
-
-#[inline]
-pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GZIPPY_OVERLAP_WRITER").is_some())
-}
 
 /// One owned chunk to write, in output order.
 struct WriteJob {

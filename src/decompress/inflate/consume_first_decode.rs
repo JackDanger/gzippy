@@ -1809,24 +1809,6 @@ pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
     FlatFastloopExit::Stopped(out_pos)
 }
 
-/// ROUTE-B kernel selector. PRODUCTION DEFAULT is the libdeflate
-/// software-pipelined fastloop port ([`decode_huffman_fastloop_bounded_pipelined`]),
-/// a gated aarch64 T1 win (paired sign-test 19-20/21 reps, gap silesia
-/// +19.6%→+13.1%, byte-exact on silesia/nasa/monorepo/squishy, 2026-06-21).
-/// `GZIPPY_BASELINE_KERNEL=1` reverts to the legacy pack-8 baseline
-/// ([`decode_huffman_fastloop_bounded`]) — kept ONLY so the win stays re-verifiable
-/// by the AB rig (`scripts/bench/_aarch64_pipelined_ab_local.sh`). Read ONCE
-/// (OnceLock) so the per-chunk dispatch is a single relaxed load, not a getenv.
-pub(crate) fn use_baseline_kernel() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("GZIPPY_BASELINE_KERNEL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 fn decode_huffman_cf(
     bits: &mut Bits,
     output: &mut [u8],
