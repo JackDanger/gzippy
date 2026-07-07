@@ -147,6 +147,17 @@ mod tests {
     fn empty_first_member_byte_exact() {
         // Empty first member → preceding-ISIZE==0 makes detection classify this
         // SINGLE-member; the false-single re-entry decodes it correctly.
+        //
+        // This fixture deliberately trips the process-global
+        // `MISROUTE_REENTRY_APPLIED` counter that the deletion-trap tests below
+        // snapshot before/after a decode — hold the shared lock so this test's
+        // four (T1/2/4/8) decodes can't interleave with those snapshots under
+        // the default parallel test harness.
+        use crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK;
+        let _guard = MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let members = vec![
             gz_member(b""),
             gz_member(&semi_compressible(2 * 1024 * 1024, 500)),
@@ -223,7 +234,9 @@ mod tests {
         use crate::decompress::parallel::sm_driver::MULTI_MEMBER_PIPELINE_RUNS;
         use std::sync::atomic::Ordering;
 
-        let _guard = MARKER_PIPELINE_TEST_LOCK.lock().unwrap();
+        let _guard = MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // A mixed GZ ++ plain concatenation is the deterministic MultiMemberChunked
         // route; it exercises the member-walk chunked pipeline.
         let gz = concat(&[
@@ -258,7 +271,9 @@ mod tests {
         };
         use std::sync::atomic::Ordering;
 
-        let _guard = MARKER_PIPELINE_TEST_LOCK.lock().unwrap();
+        let _guard = MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         // False single: empty first member + a real trailing member.
         let false_single = concat(&[
