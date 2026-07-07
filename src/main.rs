@@ -123,25 +123,7 @@ extern "C" fn signal_handler(sig: libc::c_int) {
 }
 
 fn main() {
-    // Phase-timing PRE/POST split: main_start fires as early as possible so the
-    // serial wrapper OUTSIDE the parallel decode region (CLI/route/mmap PRE and
-    // teardown POST) is captured. Gated to parallel_sm builds (where the
-    // instrument exists); byte-transparent (no-op unless GZIPPY_PHASE_TIMING=1).
-    #[cfg(parallel_sm)]
-    {
-        crate::decompress::parallel::phase_timing::reset();
-        crate::decompress::parallel::phase_timing::mark("main_start");
-    }
-
     install_signal_handlers();
-
-    // Leg-2 RSS-inflation ceiling oracle (GZIPPY_RSS_INFLATE_MIB=<N>, no-op
-    // unless set; byte-transparent). Pin N MiB resident BEFORE the timed decode
-    // region so its first-touch cost is in the PRE span and only the resident
-    // footprint persists into the kernel address-space teardown at _exit —
-    // bounds the AMD-T2 "teardown ∝ peak RSS" prize without touching decode.
-    #[cfg(parallel_sm)]
-    crate::decompress::parallel::rss_inflate::engage();
 
     let result = run();
 
@@ -155,15 +137,6 @@ fn main() {
     // litlen LUT builds vs reads. No-op without the feature/env.
     #[cfg(parallel_sm)]
     decompress::parallel::lut_huffman::dump_litlen_count();
-
-    // main_end + report() BEFORE process::exit (which skips destructors). Captures
-    // POST userspace (crc_verified->main_end); the residual process-wall beyond
-    // main_end is the kernel address-space teardown of the high-RSS process.
-    #[cfg(parallel_sm)]
-    {
-        crate::decompress::parallel::phase_timing::mark("main_end");
-        crate::decompress::parallel::phase_timing::report();
-    }
 
     match result {
         Ok(exit_code) => fast_exit_success(exit_code),

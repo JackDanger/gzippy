@@ -175,9 +175,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         multi_member: false,
     };
 
-    // Phase-timing: gzip envelope (header+footer) parsed + chunk config built.
-    crate::decompress::parallel::phase_timing::mark("envelope_parsed");
-
     // Clean-window oracle (GZIPPY_CLEAN_WINDOW_ORACLE=1, default OFF): decode
     // every chunk with its true predecessor window — no speculation, no marker
     // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
@@ -288,11 +285,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let (total_crc, total_size) =
         drive_result.map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
-    // FIXED-SLEEP coordination-isolation mode produces GARBAGE output (zeros)
-    // by design — it is a wall-only measurement of the coordination chain
-    // with decode replaced by a fixed sleep. Skip CRC/size verification in
-    // that mode only (zero production change when unset).
-    let sleep_mode = crate::decompress::parallel::decode_bypass::sleep_decode_enabled();
     // REMOVAL-ORACLE NOSTORE: output bytes are garbage (stores elided) — CRC and
     // ISIZE cannot match. Skip verification in that mode only. NODECODE replay
     // stays VERIFIED: its replay hits are byte-correct by construction and its
@@ -301,7 +293,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // CRC removal oracle: calculator disabled → total_crc is 0, so skip ONLY the
     // CRC verify (bytes/ISIZE still correct and verified).
     let crc_off_mode = crate::decompress::parallel::removal_oracle::crc_off_enabled();
-    if !sleep_mode && !nostore_mode {
+    if !nostore_mode {
         if total_size != expected_size {
             return Err(ReadParallelSmError::SizeMismatch {
                 expected: expected_size,
@@ -315,9 +307,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
             });
         }
     }
-
-    // Phase-timing: trailer CRC32 + ISIZE verified (the finalize/verify phase).
-    crate::decompress::parallel::phase_timing::mark("crc_verified");
 
     // Allocator visibility (GZIPPY_RPMALLOC_STATS=1): show whether the
     // decode's span allocations were warm-reused (cache) or re-mapped (faults).

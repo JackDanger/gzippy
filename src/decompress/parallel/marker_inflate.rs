@@ -1381,9 +1381,6 @@ impl Block {
         bits: &mut Bits,
         treat_last_block_as_error: bool,
     ) -> Result<(), BlockError> {
-        // R_WORKER sub-partition: read_header = ALL eager table work (precode +
-        // code-lengths + litlen LUT). Exclusive leaf → R_TABLE.
-        let _tbl_hdr = crate::decompress::parallel::region_prof::TableHeaderSpan::new();
         ensure_bits(bits, 3)?;
         let bfinal = (bits.peek() & 1) != 0;
         bits.consume(1);
@@ -1529,8 +1526,6 @@ impl Block {
     /// slice of `literal_cl`) ⇒ byte-identical to the prior eager build.
     #[cfg(pure_inflate_decode)]
     fn ensure_dist_hc(&mut self) -> Result<(), BlockError> {
-        // R_WORKER sub-partition: lazily-built dist table → clawed into R_TABLE.
-        let _nt = crate::decompress::parallel::region_prof::NestedTableSpan::new();
         if self.dist_hc_built {
             return Ok(());
         }
@@ -1654,9 +1649,6 @@ impl Block {
         if self.eob() {
             return Ok(0);
         }
-        // R_WORKER sub-partition: the ring/marker decode body. Exclusive of nested
-        // dist-table builds (subtracted via TL accumulator) → R_DECODE.
-        let _dec = crate::decompress::parallel::region_prof::DecodeSpan::new();
         let result = match self.compression_type {
             CompressionType::Reserved => Err(BlockError::InvalidCompression),
             CompressionType::Uncompressed => self.read_internal_uncompressed(bits, n_max_to_decode),
@@ -3316,8 +3308,6 @@ impl Block {
     /// `GZIPPY_DIST_AMORT=0` kill-switch behavior preserved verbatim.
     #[cfg(pure_inflate_decode)]
     fn ensure_dist_table(&mut self) {
-        // R_WORKER sub-partition: lazily-built dist table → clawed into R_TABLE.
-        let _nt = crate::decompress::parallel::region_prof::NestedTableSpan::new();
         if self.dist_table_checked {
             return;
         }
@@ -3380,8 +3370,6 @@ impl Block {
         not(all(feature = "asm-kernel", target_arch = "x86_64"))
     ))]
     fn ensure_flat_litlen(&mut self) -> bool {
-        // R_WORKER sub-partition: lazily-built litlen table → clawed into R_TABLE.
-        let _nt = crate::decompress::parallel::region_prof::NestedTableSpan::new();
         use crate::decompress::inflate::libdeflate_entry::LitLenTable;
         match self.compression_type {
             CompressionType::FixedHuffman => {
@@ -3471,9 +3459,6 @@ impl Block {
         pos: &mut usize,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
-        // R_WORKER sub-partition: the clean contig decode body (post-flip / window-
-        // present). Exclusive of nested dist-table builds → R_DECODE.
-        let _dec = crate::decompress::parallel::region_prof::DecodeSpan::new();
         debug_assert!(
             self.ring.is_clean(),
             "decode_clean_into_contig requires clean (window-primed) mode"
