@@ -1,5 +1,5 @@
 //! Phase B step-1 diagnostic — isolate marker-bookkeeping cost from
-//! u16-ring/decoder costs in `bootstrap_with_deflate_block`'s hot loop.
+//! u16-ring/decoder costs in `bootstrap_with_marker_inflate`'s hot loop.
 //!
 //! `plans/pure-rust-perf.md` step-zero finding: bootstrap takes
 //! p50=14.2ms per chunk while the inflate-only bench shows 334 MB/s
@@ -16,7 +16,7 @@
 //!   - markers ON  via `Block::reset(Some(&mut out), None)` (empty window)
 //!   - markers OFF via `Block::reset(Some(&mut out), Some(&[0u8; 32768]))`
 //!     which calls `set_initial_window_impl` and flips
-//!     `contains_marker_bytes = false` (deflate_block.rs:537).
+//!     `contains_marker_bytes = false` (marker_inflate.rs:537).
 //!
 //! Large gap (true ≫ false): marker bookkeeping dominates; fix is the
 //! `distance_marker += count` per-literal counter in the hot loop.
@@ -31,7 +31,7 @@
 #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
 mod bench {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
-    use gzippy::decompress::parallel::deflate_block::Block;
+    use gzippy::decompress::parallel::marker_inflate::Block;
     use std::time::Instant;
 
     fn load_silesia_deflate() -> Option<Vec<u8>> {
@@ -102,7 +102,7 @@ mod bench {
     /// drained markers-ON rate to THIS rate = the drain copy cost,
     /// the 150-vs-340 hypothesis.
     fn decode_full_stream_no_drain(deflate: &[u8]) -> (usize, usize) {
-        use gzippy::decompress::parallel::deflate_block::CompressionType;
+        use gzippy::decompress::parallel::marker_inflate::CompressionType;
         let mut block = Block::new();
         let mut sink: Vec<u16> = Vec::with_capacity(64 * 1024);
         block.reset(Some(&mut sink), None); // markers ON (empty window)

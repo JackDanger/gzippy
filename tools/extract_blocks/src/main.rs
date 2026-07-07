@@ -1,7 +1,7 @@
 //! Phase 1.1 corpus extractor (see plans/inner-loop-execution.md).
 //!
 //! Walks a gzip file (silesia or similar), decodes each DEFLATE block via
-//! `gzippy::decompress::parallel::deflate_block::Block`, and dumps each
+//! `gzippy::decompress::parallel::marker_inflate::Block`, and dumps each
 //! dynamic-Huffman block to its own corpus file.
 //!
 //! Per-block corpus file format (little-endian binary):
@@ -36,7 +36,7 @@
 //! - `corpus/silesia_blocks/README.md` selection-criteria doc.
 
 use gzippy::decompress::inflate::consume_first_decode::Bits;
-use gzippy::decompress::parallel::deflate_block::{Block, CompressionType};
+use gzippy::decompress::parallel::marker_inflate::{Block, CompressionType};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;

@@ -85,7 +85,7 @@ fn decode_from_scratch(
 /// SYNTHETIC bootstrap-path decode: omits `set_initial_window`, so
 /// `contains_marker_bytes` stays TRUE and back-refs into the
 /// (uninitialized-as-data) ring emit markers. Mirrors what production
-/// `bootstrap_with_deflate_block` runs on chunk-0 of a parallel SM
+/// `bootstrap_with_marker_inflate` runs on chunk-0 of a parallel SM
 /// decode.
 ///
 /// Note: the decoded output will contain marker u16 values (≥ 256)

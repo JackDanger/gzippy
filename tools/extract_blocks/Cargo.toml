@@ -17,3 +17,5 @@ crc32fast = "1"
 
 [lints.clippy]
 all = "deny"
+
+[workspace]
