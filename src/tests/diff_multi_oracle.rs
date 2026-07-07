@@ -439,29 +439,30 @@ mod tests {
             "silesia: ISIZE disagrees with decode"
         );
 
-        // Serialize the whole env-mutating section against the other parallel-SM
-        // tests (they all take this lock during their decode), so GZIPPY_CHUNK_KIB
-        // is never read mid-flight by a concurrent decode.
+        // Serialize against the other parallel-SM tests (they all take this lock
+        // during their decode) even though this test no longer mutates env.
         let _lock = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
         // Several granularities: smaller chunks exercise more marker chunks +
-        // careful-tail entries; the default (no override) plus tight values.
-        for chunk_kib in ["256", "512", "1024", "4096"] {
-            std::env::set_var("GZIPPY_CHUNK_KIB", chunk_kib);
-            let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
-                .load(Ordering::Relaxed);
+        // careful-tail entries. `GZIPPY_CHUNK_KIB` is gone (frozen to the
+        // production default), so drive the parallel-SM driver directly with an
+        // explicit `target_compressed_chunk_bytes` — the same seam production
+        // routing feeds after computing its (now-frozen) default, so this still
+        // exercises the real chunk_fetcher/marker pipeline at each granularity.
+        for chunk_kib in [256usize, 512, 1024, 4096] {
             let mut got = Vec::with_capacity(reference.len());
-            let r = crate::decompress::decompress_single_member(&gz, &mut got, 4);
-            std::env::remove_var("GZIPPY_CHUNK_KIB");
-            r.unwrap_or_else(|e| panic!("silesia chunk_kib={chunk_kib}: decode failed: {e}"));
-            let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
-                .load(Ordering::Relaxed);
-            assert!(
-                after > before,
-                "silesia chunk_kib={chunk_kib}: parallel-SM marker pipeline did not run"
+            let mut bytes_written = 0usize;
+            let r = crate::decompress::parallel::sm_driver::read_parallel_sm_capturing(
+                &gz,
+                &mut got,
+                None,
+                4,
+                chunk_kib * 1024,
+                &mut bytes_written,
             );
+            r.unwrap_or_else(|e| panic!("silesia chunk_kib={chunk_kib}: decode failed: {e:?}"));
             assert_eq!(
                 got.len(),
                 reference.len(),

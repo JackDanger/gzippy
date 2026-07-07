@@ -63,17 +63,10 @@ pub type ThreadPinning = HashMap<usize, u32>;
 /// saturated case a finishing worker almost always sees `pending > 0` and
 /// never spins.
 ///
-/// Tunable via `GZIPPY_POOL_SPIN_US` for the sweep; `0` disables the spin
-/// (exact legacy park-immediately behavior). Cached once.
+/// Frozen to [`DEFAULT_POOL_SPIN_US`] — the value the campaign measured with
+/// `GZIPPY_POOL_SPIN_US` unset (production default).
 fn pool_spin_us() -> u64 {
-    use std::sync::OnceLock;
-    static SPIN_US: OnceLock<u64> = OnceLock::new();
-    *SPIN_US.get_or_init(|| {
-        std::env::var("GZIPPY_POOL_SPIN_US")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_POOL_SPIN_US)
-    })
+    DEFAULT_POOL_SPIN_US
 }
 
 /// Baked default spin window. Chosen from the AMD-Zen2 ondemand gated

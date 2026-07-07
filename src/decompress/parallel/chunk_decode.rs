@@ -3064,11 +3064,6 @@ fn marker_decode_step_vendor_block(
             block.reset(None, window_opt);
             ctx.block_primed = true;
         }
-        // Cache-mandate instrument (byte-transparent, GZIPPY_MEM_STATS-gated,
-        // at-most-once per worker thread): record THIS thread's native engine
-        // resident working set. This is the real native per-thread state after
-        // the fold — the staging-box hooks are dead here.
-        crate::decompress::inflate::mem_stats::on_block_active(block.heap_bytes());
         marker_decode_step_loop(
             ctx,
             data,

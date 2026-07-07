@@ -127,33 +127,11 @@ where
 pub fn writev_all_to_fd(fd: i32, iovs: &mut [libc::iovec]) -> io::Result<()> {
     let n = iovs.len();
     let mut idx = 0usize;
-    // MEASUREMENT knob: cap bytes per writev call. gzippy emits ~17 writev of
-    // ~12.5 MiB each; rapidgzip emits ~2223 write of ~95 KiB. A 12.5 MiB
-    // uninterruptible kernel page-cache copy stalls the serial in-order
-    // consumer; smaller calls may let page allocation pipeline and reduce the
-    // per-chunk stall the removal oracle proved gates the wall. OFF (unset) ==
-    // identity. Set GZIPPY_WRITEV_CAP_KIB=<n> to cap.
-    let byte_cap: usize = std::env::var("GZIPPY_WRITEV_CAP_KIB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|k| k.saturating_mul(1024))
-        .filter(|&b| b > 0)
-        .unwrap_or(usize::MAX);
+    // Measured with no per-call byte cap (the campaign-measured production
+    // default — an unset `GZIPPY_WRITEV_CAP_KIB` was always identity; see git
+    // history for the capped-batching experiment this superseded).
     while idx < n {
-        let mut segment_count = (n - idx).min(iov_max());
-        if byte_cap != usize::MAX {
-            let mut acc = 0usize;
-            let mut c = 0usize;
-            while idx + c < n && c < segment_count {
-                let l = iovs[idx + c].iov_len;
-                if c > 0 && acc + l > byte_cap {
-                    break;
-                }
-                acc += l;
-                c += 1;
-            }
-            segment_count = c.max(1);
-        }
+        let segment_count = (n - idx).min(iov_max());
         // SAFETY: `iovs[idx..idx+segment_count]` are valid iovecs into
         // live borrowed slices; `segment_count >= 1`.
         let written =

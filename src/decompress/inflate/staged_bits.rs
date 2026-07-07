@@ -14,6 +14,11 @@ use super::consume_first_decode::Bits;
 /// Vendor `m_buffer` capacity (`gzip/isal.hpp:207`).
 pub const INPUT_STAGING_BYTES: usize = 128 * 1024;
 
+/// Cap on retained pooled boxes per thread (bounds idle RSS). Frozen to 4 —
+/// the value the campaign measured with `GZIPPY_STAGING_POOL_CAP` unset
+/// (production default).
+const STAGING_POOL_CAP: usize = 4;
+
 type StagingBox = Box<[u8; INPUT_STAGING_BYTES]>;
 
 thread_local! {
@@ -31,26 +36,16 @@ thread_local! {
 #[inline]
 fn take_staging_box() -> StagingBox {
     match STAGING_POOL.with(|p| p.borrow_mut().pop()) {
-        Some(b) => {
-            super::mem_stats::on_take(true);
-            b
-        }
-        None => {
-            super::mem_stats::on_take(false);
-            Box::new([0; INPUT_STAGING_BYTES])
-        }
+        Some(b) => b,
+        None => Box::new([0; INPUT_STAGING_BYTES]),
     }
 }
 
 #[inline]
 fn return_staging_box(b: StagingBox) {
-    super::mem_stats::on_return();
-    // Cap on retained pooled boxes per thread (bounds idle RSS). Default 4 ==
-    // production; `GZIPPY_STAGING_POOL_CAP=0` disables pooling (D3 finding).
-    let cap = super::mem_stats::staging_pool_cap();
     STAGING_POOL.with(|p| {
         let mut pool = p.borrow_mut();
-        if pool.len() < cap {
+        if pool.len() < STAGING_POOL_CAP {
             pool.push(b);
         }
         // else: drop (free) — keeps idle pool bounded.

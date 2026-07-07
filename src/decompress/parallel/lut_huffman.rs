@@ -207,15 +207,12 @@ pub mod litlen_count {
 }
 
 /// Dump the litlen BUILD/READ data-flow counters (feature = "lut-count").
-/// No-op otherwise. Gated at the call site on `GZIPPY_LUT_COUNT`.
+/// No-op unless built with that (non-default) feature.
 pub fn dump_litlen_count() {
     #[cfg(feature = "lut-count")]
     {
         use litlen_count::*;
         use std::sync::atomic::Ordering::Relaxed;
-        if std::env::var_os("GZIPPY_LUT_COUNT").is_none() {
-            return;
-        }
         let b = BUILDS.load(Relaxed);
         let h = CACHE_HITS.load(Relaxed);
         let r = READS.load(Relaxed);
@@ -1179,15 +1176,6 @@ pub struct LutLitLenCode {
 }
 
 impl LutLitLenCode {
-    /// Resident heap footprint (boxed LUT + code-length buffers). Used by the
-    /// debug-only `mem_stats` instrument for the cache-residency mandate.
-    /// Counters only; never mutates decode state.
-    pub fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<InflateHuffCodeLarge>()
-            + LIT_LEN_ELEMS * std::mem::size_of::<HuffCode>()
-            + (LIT_LEN_ELEMS + 2) * std::mem::size_of::<u32>()
-    }
-
     pub fn new_empty() -> Self {
         Self {
             table: InflateHuffCodeLarge::default(),
