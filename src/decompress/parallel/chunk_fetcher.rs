@@ -320,176 +320,9 @@ pub fn drive_capturing<W: std::io::Write>(
     )
 }
 
-/// Clean-window oracle (advisor 2026-05-29): the cheapest experiment that
-/// discriminates "is the marker/copy/bootstrap pipeline the rapidgzip gap"
-/// from "the gap is inner-loop / scan". Decode every chunk with its TRUE
-/// predecessor window so NO chunk takes the speculative bootstrap path —
-/// no markers, hence no `append_markered` /
-/// `narrow_u16_to_u8` copies. Pass 1 runs the normal speculative decode to
-/// a sink, populating a shared `WindowMap` with every chunk-boundary
-/// window; pass 2 re-runs with that map pre-seeded (every
-/// `window_map.get(start_bit)` HITS → `decode_chunk`) and is the
-/// TIMED measurement. Reuses the entire production pool/consumer/decoder —
-/// apples-to-apples with production minus speculation. Output is correct
-/// (windows from pass 1 are real), so byte-exactness is verifiable.
-/// Triggered by `GZIPPY_CLEAN_WINDOW_ORACLE=1`.
-pub fn drive_clean_window_oracle<W: std::io::Write>(
-    input: &[u8],
-    writer: &mut W,
-    parallelization: usize,
-    configuration: ChunkConfiguration,
-) -> Result<(u32, usize), FetchError> {
-    let seed = WindowMap::with_compression(
-        crate::decompress::parallel::compressed_vector::CompressionType::None,
-    );
-    // Pass 1: normal speculative decode to a sink — its ONLY purpose is to
-    // populate `seed` with a real 32 KiB dict at every published block
-    // boundary (the consumer publishes one per chunk/subchunk end).
-    let mut sink = std::io::sink();
-    drive_impl(
-        input,
-        &mut sink,
-        None,
-        parallelization,
-        configuration,
-        Some(seed.clone()),
-        None,
-    )?;
-
-    let _ = &seed; // (pass-1 window keys are NOT trusted for boundaries; see below)
-    let total_bits = input.len() * 8;
-    let pool_size = parallelization.max(1);
-
-    // --- Phase A (UNTIMED): self-derive REAL block boundaries + correct dicts. ---
-    // Do NOT trust the speculative pass's published window keys for span starts:
-    // some are not confirmed block boundaries, so decode_chunk starting
-    // there misreads random bits as a block header ("Stored block len=0"). Chain
-    // from the decoder's OWN returned end bit instead — decode_chunk stops
-    // at a real block boundary at-or-past stop_hint and reports it
-    // (encoded_offset_bits + encoded_size_bits), so the next span begins at a
-    // guaranteed-valid boundary with the true trailing 32 KiB as its dict. This
-    // is the honest "clean window known a priori" partition.
-    const STRIDE_BITS: usize = 4 * 1024 * 1024 * 8; // ~4 MiB compressed per span
-    let mut starts: Vec<usize> = Vec::new();
-    let mut dicts: Vec<Vec<u8>> = Vec::new();
-    {
-        let mut prev_tail = vec![0u8; 32768];
-        let mut cur = 0usize;
-        while cur < total_bits {
-            starts.push(cur);
-            dicts.push(prev_tail.clone());
-            let stop_hint = (cur + STRIDE_BITS).min(total_bits);
-            let c = crate::decompress::parallel::chunk_decode::decode_chunk(
-                input,
-                cur,
-                stop_hint,
-                &prev_tail,
-                configuration,
-            )
-            .map_err(FetchError::Decode)?;
-            let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
-            let data_len = c.data.len();
-            if data_len >= 32768 {
-                let mut t = vec![0u8; 32768];
-                c.data.copy_last_into(&mut t);
-                prev_tail = t;
-            } else {
-                let mut nt = prev_tail.clone();
-                let mut tail_bytes = vec![0u8; data_len];
-                c.data.copy_range_into(0, &mut tail_bytes);
-                nt.extend_from_slice(&tail_bytes);
-                let n = nt.len();
-                prev_tail = nt[n.saturating_sub(32768)..].to_vec();
-            }
-            if end_bit <= cur {
-                break; // no forward progress — stop (last span ran to EOF/BFINAL)
-            }
-            cur = end_bit;
-        }
-    }
-    let n_spans = starts.len();
-
-    // --- Phase B (TIMED): clean-parallel decode with the correct dicts. ---
-    // A purpose-built clean-parallel driver that BYPASSES the speculative
-    // scheduler (block_finder / prefetcher / block_map) entirely — those
-    // carry tight invariants a hand-seeded partition violates. We dispatch
-    // one clean `decode_chunk` per span across `pool_size` workers and
-    // write results in order. This isolates EXACTLY the clean-parallel
-    // ceiling: pure-Rust inner decode × parallelism + the in-order consumer
-    // write, with ZERO marker / bootstrap / narrow / absorb cost. It is the
-    // markers-vs-scaling discriminator.
-    let mut results: Vec<Option<Result<ChunkData, ChunkDecodeError>>> =
-        (0..n_spans).map(|_| None).collect();
-
-    let t = std::time::Instant::now();
-    {
-        // Atomic-index work queue (NO wave barriers): spawn `pool_size`
-        // persistent workers that each pull the next span from a shared counter
-        // and decode it. The previous wave-of-pool_size design serialized on a
-        // per-wave join — a single straggler stalled the whole wave, giving only
-        // ~1.2× effective parallelism and making this oracle's wall dispatch-
-        // limited rather than decode-limited. A pull queue keeps every worker
-        // busy to the end, isolating the true clean-parallel decode ceiling.
-        // The brief mutex is held only to store a finished result, never during
-        // decode, so it adds no decode contention.
-        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
-        let next = AtomicUsize::new(0);
-        let results_mtx = std::sync::Mutex::new(&mut results);
-        std::thread::scope(|scope| {
-            for _ in 0..pool_size {
-                scope.spawn(|| loop {
-                    let span_idx = next.fetch_add(1, AOrd::Relaxed);
-                    if span_idx >= n_spans {
-                        break;
-                    }
-                    let start_bit = starts[span_idx];
-                    let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
-                    let dict: &[u8] = &dicts[span_idx];
-                    let r = crate::decompress::parallel::chunk_decode::decode_chunk(
-                        input,
-                        start_bit,
-                        stop_hint,
-                        dict,
-                        configuration,
-                    );
-                    results_mtx.lock().unwrap()[span_idx] = Some(r);
-                });
-            }
-        });
-    }
-
-    // In-order write + CRC fold (mirror of the consumer's clean branch).
-    let mut total_crc = CRC32Calculator::new();
-    let mut total_size = 0usize;
-    for (i, slot) in results.into_iter().enumerate() {
-        let chunk = slot
-            .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                requested: starts[i],
-                actual: 0,
-            }))?
-            .map_err(FetchError::Decode)?;
-        // Clean chunks carry no markers: output is the segmented `data`,
-        // CRC is the per-stream crc32s folded in order.
-        chunk
-            .data
-            .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-        total_size += chunk.decoded_size();
-        for stream_crc in &chunk.crc32s {
-            total_crc.append(stream_crc);
-        }
-    }
-    let secs = t.elapsed().as_secs_f64();
-    let mb = total_size as f64 / secs / 1e6;
-    eprintln!(
-        "CLEAN_WINDOW_ORACLE pass2 wall={secs:.4}s out={total_size} bytes {mb:.0} MB/s ({parallelization} workers, {n_spans} spans)"
-    );
-    Ok((total_crc.crc32(), total_size))
-}
-
-/// THIN-T1-DRIVER removal-oracle (`GZIPPY_THIN_T1_ORACLE=1`, default OFF).
+/// THIN-T1 serial driver — the production T1 single-member path.
 ///
-/// The MINIMAL clean removal-oracle the BEAT-IGZIP TASK 2 brief calls for: a
+/// The MINIMAL clean driver the BEAT-IGZIP TASK 2 brief calls for: a
 /// single SERIAL rolling-window loop over chunks calling the SHARED
 /// `decode_chunk` kernel with NO parallel bulk whatsoever — no `block_finder`,
 /// no `BlockFetcher`/prefetch, no `WindowMap` publish/handoff, no marker arming
@@ -500,7 +333,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 /// plus the same CLI/mmap/header prologue both arms share — so cyc/B over the
 /// process attributes to the shared kernel + serial driver, not the scaffold.
 ///
-/// Unlike `drive_clean_window_oracle` this does NOT run a speculative Pass 1 and
+/// It does NOT run a speculative Pass 1 and
 /// has NO separate untimed Phase A: the rolling window IS derived inline as the
 /// loop advances (each chunk's true trailing 32 KiB becomes the next chunk's
 /// dict), so there is exactly ONE decode of the stream and nothing the perf
@@ -864,10 +697,6 @@ fn drive_impl<W: std::io::Write>(
     // can outlive the borrowed `input` slice.
     let input_view = unsafe { InputSlice::from_slice(input) };
 
-    // REMOVAL-ORACLE NODECODE: warm the symbol-stream replay map out of the timed
-    // drive (no-op unless GZIPPY_ORACLE_NODECODE is set).
-    crate::decompress::parallel::removal_oracle::warm_replay();
-
     // The in-order consumer (this thread runs `consumer_loop` inline) is left
     // unpinned — faithful to rapidgzip, which never pins its reader thread; the
     // OS schedules it alongside the unpinned decode workers (see the decode-pool
@@ -902,9 +731,6 @@ fn drive_impl<W: std::io::Write>(
     // error so the writer thread does not outlive the run.
     #[cfg(all(unix, parallel_sm))]
     let writer_result = crate::decompress::parallel::output_writer::finish();
-    // Report replay stats even on a (CRC) error so the NODECODE oracle can see
-    // hit/miss counts when the run aborts. No-op unless the oracle is on.
-    crate::decompress::parallel::removal_oracle::report_replay_stats();
     // Record bytes streamed so far for the multi-member resume path. The
     // consumer writes chunks in order and only after they fully validate, so on
     // a finder/decode error at a member boundary this count is exactly the
@@ -1294,9 +1120,6 @@ fn drive_impl<W: std::io::Write>(
         );
     }
 
-    // REMOVAL-ORACLE NODECODE: serialize the symbol-stream record (no-op
-    // unless GZIPPY_ORACLE_RECORD is set).
-    crate::decompress::parallel::removal_oracle::flush_record();
     Ok((total_crc.crc32(), total_size))
 }
 
@@ -1893,19 +1716,6 @@ fn consumer_loop<W: std::io::Write>(
                 &mut eager_completed,
                 consumer_pred_key,
             );
-            // STEP-1 U16-preserving ceiling oracle (consumer-serial arm): a ceiling
-            // chunk was decoded through the seeded-clean path (dwm empty). Inject the
-            // u16 write + resolve traffic HERE, serially on the consumer thread (the
-            // pessimistic resolve-location arm), exactly ONCE per chunk (owned chunk;
-            // flag cleared after firing). Wrong bytes are expected (terminal CRC fail);
-            // this only adds the asm-irremovable resolve cost to the wall.
-            if chunk.phantom_ceiling_len > 0 {
-                crate::decompress::parallel::slow_knob::phantom_marker_resolve_traffic(
-                    chunk.phantom_ceiling_len,
-                    false,
-                );
-                chunk.phantom_ceiling_len = 0;
-            }
             let pool_resolved = chunk_matches_consumer_pred(&chunk, consumer_pred_key);
             if let Some(window) = predecessor_window_for_postprocess {
                 if !(eager_already_done || pool_resolved)
@@ -2063,9 +1873,6 @@ fn consumer_loop<W: std::io::Write>(
             )),
             &mut recycle_deferral,
         )?;
-    }
-    while let Some(mut held) = recycle_deferral.queue.pop_front() {
-        held.recycle_decoded_buffers();
     }
     // STAGE-2d MULTI-MEMBER GRID: every chunk has now been fed to the per-member
     // verifier in decode order. The stream must have ended exactly at a member
@@ -2528,11 +2335,6 @@ fn run_decode_task(
             window_map,
         )
     };
-    // RING/FOLD-DRAIN perturbation (GZIPPY_RING_INJECT_NS, Gate-2). Fires INSIDE
-    // the R_WORKER rdtsc window but OUTSIDE the Block-method R_TABLE/R_DECODE
-    // spans, so the injected per-chunk work lands in `ring_other` — the residual
-    // fulcrum F-9c5ca01d020d flagged. OFF (unset) ⇒ a single hoistable branch.
-    crate::decompress::parallel::slow_knob::ring_inject();
 
     // Wrap in `ChunkArc` to match BlockFetcher's `Value` type (vendor's
     // `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
@@ -2596,8 +2398,8 @@ fn resolve_chunk_markers_on_chunk(
     // We therefore DROP the redundant `merge_resolved_markers_into_data` full-
     // output memcpy AND the eager `recycle_markers_after_resolution`: the marker
     // segments must outlive the consumer's writev, so recycling is DEFERRED
-    // behind the write via `defer_chunk_recycle` → `recycle_decoded_buffers`
-    // (chunk_fetcher.rs:3486 / chunk_data.rs:1621, which frees BOTH `data` and
+    // behind the write via the fd write path → `recycle_decoded_buffers`
+    // (fd_vectored_write.rs / chunk_data.rs:1621, which frees BOTH `data` and
     // `data_with_markers`). `populate_subchunk_windows` runs against the un-merged
     // markers — `copy_window_at_chunk_offset` already branches on `narrowed_len>0`.
     chunk.populate_subchunk_windows(predecessor_window);
@@ -3616,30 +3418,23 @@ enum PendingWrite {
     },
 }
 
-/// Recycle-deferral queue + the thread-count-tuned T1 in-flight-depth config.
+/// The thread-count-tuned T1 lone-drain config (+ the multi-member verifier).
 ///
-/// Return drained chunk buffers to the pool only after `depth` newer chunks
-/// have drained, and (at T1) drain a lone head Ready immediately.
+/// At T1, drain a lone head Ready immediately; at T>1, hold it.
 ///
 /// At `parallelization == 1` the thread pool runs INLINE (`pool_threads == 0`,
-/// see `drive_impl`) with NO concurrent workers, so the per-chunk output buffer
-/// can be recycled immediately (`depth == 0`) and a lone Ready can drain without
-/// the worker-fill race that forces defer-2 + lone-hold at T>1 (the 2026-06-05
+/// see `drive_impl`) with NO concurrent workers, so a lone Ready can drain without
+/// the worker-fill race that forces lone-hold at T>1 (the 2026-06-05
 /// lone-drain CRC bisect: "byte diff at chunk 4 boundary when lone emit races
 /// worker fill of successor buffers"). Shrinking the T1 live-ChunkData working
 /// set 4→1 is byte-exact at T1 and a measured win (BEAT-IGZIP-T1 night4, Intel:
 /// nasa −22.9% cyc/B / −21% wall, silesia −3.2% cyc/B / −4.4% wall, RSS
 /// −64%/−30%, both p<0.005, sha-identical) — the smaller resident output
 /// working-set cuts page-faults (nasa −73%, silesia −42%) that feed the kernel.
-/// It is INCORRECT at T>1 (a global depth-1 corrupts silesia at T4/T8) so the
-/// T1 tuning is GATED on `pool_size == 1`. The sweep-only env override
-/// `GZIPPY_DRAIN_LONE` takes precedence for measurement; unset == identity.
+/// It is INCORRECT at T>1 (a global lone-drain corrupts silesia at T4/T8) so the
+/// T1 tuning is GATED on `pool_size == 1`.
 #[cfg(parallel_sm)]
 struct RecycleDeferral {
-    queue: std::collections::VecDeque<ChunkData>,
-    // Read only by `defer_chunk_recycle` (Linux-only removal-oracle path).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    depth: usize,
     drain_lone: bool,
     /// STAGE-2d MULTI-MEMBER GRID: the running per-member CRC32 + ISIZE
     /// verifier, fed each chunk in the in-order drain (`drain_one_pending`).
@@ -3655,16 +3450,10 @@ struct RecycleDeferral {
 impl RecycleDeferral {
     fn new(pool_size: usize) -> Self {
         let t1 = pool_size == 1;
-        // T>1 default: defer 2, hold lone (correctness — worker-fill race).
-        // T1: defer 0, drain lone (single inline worker, no race; measured win).
-        let depth = if t1 { 0 } else { 2 };
-        let mut drain_lone = t1;
-        if std::env::var_os("GZIPPY_DRAIN_LONE").is_some() {
-            drain_lone = true;
-        }
+        // T1: drain lone (single inline worker, no worker-fill race; measured
+        // win). T>1: hold lone (correctness — worker-fill race).
+        let drain_lone = t1;
         Self {
-            queue: std::collections::VecDeque::with_capacity(depth + 1),
-            depth,
             drain_lone,
             member_verifier: None,
         }
@@ -3681,18 +3470,6 @@ impl RecycleDeferral {
 fn release_written_chunk(mut chunk: ChunkData) {
     chunk.free_decoded_buffers();
     // chunk drops here → LIVE_CHUNKS -= 1, backing Vecs already freed.
-}
-
-// Only reachable via the Linux-only `GZIPPY_SKIP_WRITEV_SYSCALL` removal-oracle
-// path (below); on other targets it has no caller.
-#[cfg(all(parallel_sm, target_os = "linux"))]
-fn defer_chunk_recycle(deferral: &mut RecycleDeferral, chunk: ChunkData) {
-    deferral.queue.push_back(chunk);
-    while deferral.queue.len() > deferral.depth {
-        if let Some(mut old) = deferral.queue.pop_front() {
-            old.recycle_decoded_buffers();
-        }
-    }
 }
 
 /// Drain consecutive `Ready` entries at the FIFO head when two or more
@@ -3848,22 +3625,8 @@ fn drain_one_pending<W: std::io::Write>(
                 total_crc.append(stream_crc);
             }
             let mut iovs = fd_vectored_write::to_io_vec(parts.iter().copied(), &[]);
-            // MEASUREMENT-ONLY output-removal oracle. GZIPPY_SKIP_WRITEV_SYSCALL=1
-            // skips ONLY the kernel writev (the 211 MB tmpfs page-cache copy on the
-            // serial in-order consumer thread) while keeping CRC combine, recycle,
-            // and all accounting. WRONG bytes ON (terminal trailer CRC still
-            // verifies the decode ran) -> the off->on wall delta is the CAUSAL
-            // removable share of the OUTPUT term that fulcrum_total localized on the
-            // consumer timeline. OFF == identity (byte-exact). Never on a prod build.
-            // The read is gated to linux because its only consumer (the `if
-            // skip_writev` branch below) is linux-only; on other targets the env
-            // var has no effect, so reading it there is dead (unused-var warning).
             #[cfg(target_os = "linux")]
-            let skip_writev = std::env::var_os("GZIPPY_SKIP_WRITEV_SYSCALL").is_some();
-            #[cfg(target_os = "linux")]
-            if skip_writev {
-                defer_chunk_recycle(recycle_deferral, chunk);
-            } else if fd_vectored_write::is_pipe_fd(fd) {
+            if fd_vectored_write::is_pipe_fd(fd) {
                 fd_vectored_write::write_chunk_payload_to_fd(fd, &mut iovs, chunk)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
             } else if crate::decompress::parallel::output_writer::enabled() {

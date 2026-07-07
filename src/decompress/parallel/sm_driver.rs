@@ -97,25 +97,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // once-cached) so consecutive decodes with different T re-gate correctly.
     crate::decompress::parallel::rpmalloc_alloc::set_decode_threads(parallelization);
 
-    // REMOVAL-ORACLE NOSTORE produces GARBAGE output bytes by design. Refuse to
-    // write them to a REGULAR FILE so a forgotten env var can never leave a
-    // plausible-looking corrupt artifact on disk — the sanctioned shape is
-    // `-c ... > /dev/null` (char device / pipe). No-op when the knob is unset.
-    if crate::decompress::parallel::removal_oracle::nostore_enabled() {
-        if let Some(fd) = out_fd {
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut st) } == 0
-                && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
-            {
-                return Err(ReadParallelSmError::DecodeFailed(
-                    "GZIPPY_ORACLE_NOSTORE refuses regular-file output (bytes are \
-                     garbage); redirect to /dev/null"
-                        .into(),
-                ));
-            }
-        }
-    }
-
     let (_hdr, header_size) =
         gzip_format::read_header(gzip_data).map_err(|_| ReadParallelSmError::InvalidHeader)?;
     let trailer_size = 8;
@@ -157,9 +138,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let configuration = ChunkConfiguration {
         split_chunk_size: target_compressed_chunk_bytes,
         max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
-        // Gate-2 CRC removal oracle: GZIPPY_ORACLE_CRC_OFF=1 disables the
-        // per-chunk CRC32 accumulation (bytes stay correct). Default true.
-        crc32_enabled: !crate::decompress::parallel::removal_oracle::crc_off_enabled(),
+        crc32_enabled: true,
         // Default (keepIndex=false, vendor benchmark): sparsity OFF — skip the
         // 32 KiB `getUsedWindowSymbols` scan per chunk finalize.
         window_sparsity: sparsity,
@@ -175,11 +154,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         multi_member: false,
     };
 
-    // Clean-window oracle (GZIPPY_CLEAN_WINDOW_ORACLE=1, default OFF): decode
-    // every chunk with its true predecessor window — no speculation, no marker
-    // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
-    // whether the marker pipeline is the rapidgzip gap. CRC/size still verified
-    // below, so the known-window path's correctness is checked too.
     // THIN-T1 PRODUCTION PATH (route-A scaffold shed). At T==1 the decode is
     // strictly sequential front-to-back, so EVERY block already has its 32 KiB
     // predecessor window — the parallel block-finder / WindowMap / marker arming
@@ -188,10 +162,8 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // oracle: thin/libdeflate≈1.08 vs prod/libdeflate≈1.22 on this box). CRC32 +
     // ISIZE are verified below exactly as for the parallel path, and bytes_written
     // is captured so the multi-member-misroute resume net still works.
-    let force_thin_oracle = std::env::var_os("GZIPPY_THIN_T1_ORACLE").is_some();
-    // T1 serial-eligible: strictly T==1, no clean-window oracle, not force-thin.
-    let t1_serial =
-        parallelization <= 1 && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none();
+    // T1 serial-eligible: strictly T==1.
+    let t1_serial = parallelization <= 1;
     // T1-MONOLITH (igzip-shaped single-buffer path): a deliberate, T1-gated
     // divergence from the rapidgzip chunk pipeline toward the igzip monolith
     // (former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). It is OPT-IN (GZIPPY_MONOLITH=1),
@@ -203,8 +175,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // the production T1 default remains thin-T1. T>1 NEVER takes this path.
     // Legacy full-ISIZE monolith (FALSIFIED — fault-storm): opt-in only via
     // GZIPPY_MONOLITH=1 so the prior falsifier stays reproducible.
-    let use_old_monolith =
-        t1_serial && !force_thin_oracle && std::env::var_os("GZIPPY_MONOLITH").is_some();
+    let use_old_monolith = t1_serial && std::env::var_os("GZIPPY_MONOLITH").is_some();
     // T1-MONOLITH-STREAMING: one continuous serial decode that STREAMS through a
     // small resident buffer (no fault-storm — fixes the prior full-ISIZE
     // monolith). It IS byte-exact, fault-storm-free, and DOES shed the per-chunk
@@ -217,11 +188,9 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // (GZIPPY_STREAM_MONOLITH=1), NOT the default; production T1 stays thin-T1
     // (byte-identical to before this cycle). See
     // former plans/T1-MONOLITH-FINISH-RESULTS.md. Native-only; T>1 never takes it.
-    let use_stream_monolith = t1_serial
-        && !force_thin_oracle
-        && !use_old_monolith
-        && std::env::var_os("GZIPPY_STREAM_MONOLITH").is_some();
-    let use_thin_t1 = (t1_serial && !use_old_monolith && !use_stream_monolith) || force_thin_oracle;
+    let use_stream_monolith =
+        t1_serial && !use_old_monolith && std::env::var_os("GZIPPY_STREAM_MONOLITH").is_some();
+    let use_thin_t1 = t1_serial && !use_old_monolith && !use_stream_monolith;
     // Tiny-file lever (#189/#199 lever-2b): a tiny thin-T1 decode makes exactly
     // ONE rpmalloc-backed allocation (its huge chunk-output reserve), and that
     // allocation triggers rpmalloc process+thread init — pure overhead for a
@@ -259,13 +228,6 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         )
     } else if use_thin_t1 {
         chunk_fetcher::drive_thin_t1_oracle(deflate_data, writer, configuration, bytes_written_out)
-    } else if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
-        chunk_fetcher::drive_clean_window_oracle(
-            deflate_data,
-            writer,
-            parallelization,
-            configuration,
-        )
     } else if let Some(out) = bytes_written_out {
         // Multi-member resume support: capture bytes streamed even on error so
         // a misrouted multi-member stream can resume past the prefix.
@@ -283,27 +245,17 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let (total_crc, total_size) =
         drive_result.map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
-    // REMOVAL-ORACLE NOSTORE: output bytes are garbage (stores elided) — CRC and
-    // ISIZE cannot match. Skip verification in that mode only. NODECODE replay
-    // stays VERIFIED: its replay hits are byte-correct by construction and its
-    // misses run the real decode, so verification doubles as the honesty check.
-    let nostore_mode = crate::decompress::parallel::removal_oracle::nostore_enabled();
-    // CRC removal oracle: calculator disabled → total_crc is 0, so skip ONLY the
-    // CRC verify (bytes/ISIZE still correct and verified).
-    let crc_off_mode = crate::decompress::parallel::removal_oracle::crc_off_enabled();
-    if !nostore_mode {
-        if total_size != expected_size {
-            return Err(ReadParallelSmError::SizeMismatch {
-                expected: expected_size,
-                actual: total_size,
-            });
-        }
-        if !crc_off_mode && total_crc != expected_crc {
-            return Err(ReadParallelSmError::CrcMismatch {
-                expected: expected_crc,
-                actual: total_crc,
-            });
-        }
+    if total_size != expected_size {
+        return Err(ReadParallelSmError::SizeMismatch {
+            expected: expected_size,
+            actual: total_size,
+        });
+    }
+    if total_crc != expected_crc {
+        return Err(ReadParallelSmError::CrcMismatch {
+            expected: expected_crc,
+            actual: total_crc,
+        });
     }
 
     Ok(ReadResult {
@@ -560,7 +512,7 @@ pub fn read_parallel_sm_grid<W: std::io::Write>(
     let configuration = ChunkConfiguration {
         split_chunk_size: target_compressed_chunk_bytes,
         max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
-        crc32_enabled: !crate::decompress::parallel::removal_oracle::crc_off_enabled(),
+        crc32_enabled: true,
         window_sparsity: sparsity,
         window_compression_type: if sparsity {
             None

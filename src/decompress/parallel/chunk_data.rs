@@ -321,13 +321,6 @@ pub struct ChunkData {
     /// predecessor 32 KiB window image into segment 0; the consumer skips
     /// it via `write_payload_skipping_prefix` / `append_payload_iovecs`.
     pub data_prefix_len: usize,
-    /// STEP-1 U16-preserving ceiling oracle (GZIPPY_MARKER_CEILING_U16): when a
-    /// window-absent chunk is decoded through the seeded-clean path, this records
-    /// the decoded byte count so the CONSUMER thread can inject the phantom u16
-    /// write + resolve traffic serially (the pessimistic resolve-location arm).
-    /// 0 in production / for all other arms. Byte-transparent (only read by the
-    /// ceiling instrument).
-    pub phantom_ceiling_len: usize,
     /// DoS/OOM guard: hard upper bound on this chunk's decoded output bytes,
     /// derived from the compressed input length (`input_len ×
     /// MAX_DEFLATE_EXPANSION + slack`). Malformed input can drive the deflate
@@ -466,7 +459,6 @@ impl ChunkData {
             next_subchunk_start_decoded_offset: 0,
             pool_worker_index,
             data_prefix_len: 0,
-            phantom_ceiling_len: 0,
             output_ceiling: usize::MAX,
         }
     }
@@ -537,7 +529,6 @@ impl ChunkData {
             next_subchunk_start_decoded_offset: 0,
             pool_worker_index: 0,
             data_prefix_len,
-            phantom_ceiling_len: 0,
             output_ceiling: usize::MAX,
         }
     }
@@ -1720,7 +1711,7 @@ impl ChunkData {
     /// view-based applyWindow model (vendor swap+views, DecodedData.hpp:365-388)
     /// the narrowed marker bytes stay in `data_with_markers` and ARE the output
     /// views, so they must outlive the consumer's writev; recycling is deferred
-    /// behind the write via `defer_chunk_recycle` → `recycle_decoded_buffers`.
+    /// behind the write via the fd write path → `recycle_decoded_buffers`.
     /// Kept for the legacy merge-then-recycle path + as vendor-parity surface.
     #[allow(dead_code)]
     pub(crate) fn recycle_markers_after_resolution(&mut self) {

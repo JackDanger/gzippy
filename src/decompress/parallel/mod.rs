@@ -27,7 +27,6 @@
 //! | `chunk_data`/`segmented_*` | `ChunkData` + `MarkerReplacement` buffers  |
 //! | `crc32`                | `gzip/crc32.hpp`                              |
 //! | `thread_pool`          | `ThreadPool`                                  |
-//! | `instruments/*`        | NONE — campaign measurement instruments (env-gated, byte-transparent) |
 //!
 //! ## Multi-member routing (2026-07-05)
 //!
@@ -122,17 +121,3 @@ pub mod used_window_symbols;
 #[cfg(parallel_sm)]
 pub mod width_ring;
 pub mod window_map;
-
-/// Campaign measurement instruments (env-gated, byte-transparent, NO vendor
-/// counterpart). Grouped out of the production modules above so the decode
-/// pipeline reads as a clean structural mirror of rapidgzip. The re-exports
-/// below preserve the historical `parallel::<name>` paths so every hot-path
-/// hook call site is byte-transparent — only the file location changed.
-pub mod instruments;
-// `slow_knob` is consumed by the always-compiled inner loop
-// (`inflate::resumable`) + `main`, so it is not parallel_sm-gated.
-pub use instruments::slow_knob;
-// The rest are consumed only by parallel_sm modules; gate the re-export so the
-// non-parallel_sm (legacy serial) build does not see them as unused imports.
-#[cfg(parallel_sm)]
-pub use instruments::removal_oracle;
