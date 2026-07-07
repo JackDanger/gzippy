@@ -762,24 +762,6 @@ impl SegmentedU8 {
     }
 }
 
-/// Sink for the incremental (growable) copy-free ISA-L decode. Decode-time
-/// (front empty). Grows the single contiguous bulk on demand.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-impl crate::backends::isal_decompress::IncrementalOutSink for SegmentedU8 {
-    #[inline]
-    fn commit_and_reserve(&mut self, just_written: usize, min_spare: usize) -> (*mut u8, usize) {
-        debug_assert!(self.front.is_empty(), "ISA-L sink is decode-time");
-        self.commit(just_written);
-        if min_spare == 0 {
-            // Final flush: commit only; the returned region is unused.
-            return (self.buf.as_mut_ptr(), 0);
-        }
-        let spare = self.writable_tail_reserve(min_spare);
-        let len = spare.len();
-        (spare.as_mut_ptr(), len)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -174,57 +174,15 @@ pub static ISAL_INEXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
 /// (batch 4f, confirmed no production ISA-L decode exists — the decode graph
 /// is pure-Rust; C-FFI is compression-only per CLAUDE.md) — hardcoded OFF
 /// (pure-Rust identity). The oracle-only `finish_decode_chunk_isal_oracle`
-/// call site this used to gate is dead as a mechanical consequence; its
-/// implementation (and the `GZIPPY_ISAL_GROW_MIB` / `GZIPPY_ISAL_INITIAL_FACTOR`
-/// / `GZIPPY_ISAL_INCREMENTAL_GROWTH` knobs it alone consumes) is left in
-/// place, deferred to the x86-box batch that can compile-check it.
+/// call site this used to gate was a mechanically dead consequence and has
+/// been removed (2026-07-07, x86-finish batch), along with its
+/// `isal_incremental_growth` sizing knob (`GZIPPY_ISAL_GROW_MIB` /
+/// `GZIPPY_ISAL_INITIAL_FACTOR` / `GZIPPY_ISAL_INCREMENTAL_GROWTH`) — both
+/// had zero remaining callers once this predicate went hardcoded OFF.
 #[cfg(parallel_sm)]
 #[inline]
 fn isal_engine_oracle_enabled() -> bool {
     false
-}
-
-/// ALWAYS-SMALL INCREMENTAL GROWTH (measurement arm) — the footprint /
-/// cache-locality sweep knob (DIS-14/DIS-17: gzippy RSS +21-25% / dTLB MPKI ~2x
-/// vs rapidgzip, traced to the 8x-compressed-span UPFRONT output reserve).
-/// When `GZIPPY_ISAL_INCREMENTAL_GROWTH=1`, the copy-free ISA-L decode reserves
-/// a SMALL initial buffer (FAR below 8x) and GROWS it on demand as ISA-L fills
-/// it — a faithful port of rapidgzip's fixed-`ALLOCATION_CHUNK_SIZE`
-/// segment-append loop (`GzipChunk.hpp:309-379`: `DecodedVector(128 KiB)` ->
-/// `readStream` -> `resize` -> `append`, repeat), done on gzippy's one
-/// contiguous Vec, so the per-worker pooled buffer tracks the ACTUAL decoded
-/// size.
-///
-/// Default OFF == production: the SAME growable decode but with a
-/// **ratio-informed** upfront reserve (see `compute_initial_reserve` and
-/// `ChunkConfiguration::expansion_ratio_ceil`), which sizes the initial from
-/// the member's KNOWN ISIZE/compressed ratio instead of a fixed 8×. The old
-/// fixed 8× is what the env knob FACTOR=2 falsified (+41% model-T8); the ratio
-/// path closes that gap while keeping the DIS-29 >8x storm fix (growth still
-/// engages on overflow). Do NOT default this env knob ON: the small initial
-/// regresses sub-8x corpora at low-T (ghcn T1 -18%, DIS-29).
-/// Returns `Some((initial_factor, grow_bytes))` when ON. Both tunable
-/// for the footprint sweep: `GZIPPY_ISAL_INITIAL_FACTOR` (default 4),
-/// `GZIPPY_ISAL_GROW_MIB` (default 4).
-fn isal_incremental_growth() -> Option<(usize, usize)> {
-    use std::sync::OnceLock;
-    static CFG: OnceLock<Option<(usize, usize)>> = OnceLock::new();
-    *CFG.get_or_init(|| {
-        if !std::env::var("GZIPPY_ISAL_INCREMENTAL_GROWTH").is_ok_and(|v| v == "1") {
-            return None;
-        }
-        let factor = std::env::var("GZIPPY_ISAL_INITIAL_FACTOR")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&f| f >= 1)
-            .unwrap_or(4);
-        let grow_mib = std::env::var("GZIPPY_ISAL_GROW_MIB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&m| m >= 1)
-            .unwrap_or(4);
-        Some((factor, grow_mib * 1024 * 1024))
-    })
 }
 
 /// M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
@@ -269,20 +227,10 @@ fn exact_block_route_enabled() -> bool {
     exact_block_enabled()
 }
 
-// PHASE-0 WALL ORACLE (measurement-only, NOT a production path).
-//
-// Decode this chunk's clean tail with REAL ISA-L (`isal_inflate`) via the
-// patched-boundary FFI, then feed ISA-L's bytes / boundaries / end-bit through
-// the SAME `ChunkData` accounting primitives `finish_decode_chunk_impl` uses,
-// trimmed to the chunk's natural stop. (The from-bit ISA-L decode survives only
-// as a dormant measurement oracle under `isal-compression`; it is OFF the
-// production decode graph.)
-
-/// Compute the upfront output-reserve byte count for the ISA-L clean-tail decode.
+/// Compute the upfront output-reserve byte count for a chunk's clean-tail decode.
 ///
-/// `compressed_span` is the chunk's compressed byte span (`slice_end − byte_start`
-/// inside `finish_decode_chunk_isal_oracle`).  `expansion_ratio_ceil` is the
-/// member-level ratio ceiling from `ChunkConfiguration::expansion_ratio_ceil`; a
+/// `compressed_span` is the chunk's compressed byte span.  `expansion_ratio_ceil` is
+/// the member-level ratio ceiling from `ChunkConfiguration::expansion_ratio_ceil`; a
 /// value of 0 means the ratio was unknown at configuration time → falls back to the
 /// historical 8× factor.
 ///
@@ -291,11 +239,10 @@ fn exact_block_route_enabled() -> bool {
 /// only sizes the *upfront* allocation.
 ///
 /// Exposed as `pub(crate)` so the unit-test module can exercise the clamp logic
-/// directly without constructing a full ISA-L decode.
+/// directly.
 ///
-/// Shared by BOTH decode paths: the ISA-L clean-tail oracle
-/// (`finish_decode_chunk_isal_oracle`) AND the pure-Rust native clean/seeded
-/// path (`decode_chunk_unified_marker`, `seed_block_for_contig_native`). Sizing
+/// Used by the pure-Rust native clean/seeded path
+/// (`decode_chunk_unified_marker`, `seed_block_for_contig_native`). Sizing
 /// the native per-chunk output reserve from the member ratio (instead of the old
 /// `compressed × 8` clamped to 16 MiB) eliminates the grow-realloc storm on
 /// expanding corpora (nasa ~10× → the 16 MiB clamp forced 16→32→64 MiB doubling,
@@ -332,301 +279,6 @@ pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ce
         .min(RESERVE_CAP)
 }
 
-#[cfg(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64"))]
-fn finish_decode_chunk_isal_oracle(
-    chunk: &mut ChunkData,
-    input: &[u8],
-    inflate_start_bit: usize,
-    stop_hint_bits: usize,
-    initial_window: &[u8],
-    until_exact: bool,
-) -> Result<bool, ChunkDecodeError> {
-    use crate::backends::isal_decompress;
-    use std::sync::atomic::Ordering;
-
-    if !isal_decompress::is_available() {
-        return Ok(false);
-    }
-    // The oracle only covers a clean 32 KiB-window continuation (the bulk path
-    // once windows are seeded). A non-full window means marker bootstrap is
-    // needed — not ISA-L's job; fall back.
-    if initial_window.len() != crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE {
-        return Ok(false);
-    }
-
-    // BOUND THE DECODE TO THIS CHUNK (else ISA-L runs to BFINAL of the WHOLE
-    // member per worker). Slice `input` to end a few bytes past `stop_hint_bits`
-    // so ISA-L decodes only this chunk's blocks then runs out of input at a block
-    // boundary. A clean DEFLATE block boundary is the natural stop the pipeline
-    // already trims to.
-    let stop_byte = stop_hint_bits.div_ceil(8);
-    let slice_end = (stop_byte + 256 * 1024).min(input.len());
-    let bounded = &input[..slice_end];
-
-    // COPY-FREE: decode ISA-L DIRECTLY into the chunk's u8 data buffer. Reserve a
-    // contiguous spare region (sized to the chunk decode bound) and hand its raw
-    // pointer to the FFI — no intermediate 64 MiB `Vec`, no `copy_from_slice`.
-    // This removes the per-chunk alloc+copy confound the prior oracle paid that
-    // production's direct-to-`writable_tail()` stream never pays, so the
-    // ISA-L clean-engine WALL ceiling becomes readable (advisor Q1 fix).
-    //
-    // RESERVE SIZING — CHUNK-PROPORTIONAL (TOOLING-AUDIT A5 reserve-confound fix).
-    // The prior flat 64 MiB-per-chunk `reserve` was a residual confound: production
-    // grows its u8 buffer INCREMENTALLY (`contig_decode_window(HEADROOM)`, the Vec
-    // doubling to ~chunk size, ~13-16 MiB for a 4 MiB silesia chunk), so a flat
-    // 64 MiB allocator request per chunk pays a per-chunk alloc several× larger than
-    // production's final footprint. That made ocl_cf PESSIMISTIC (audit A5 / #2).
-    // Fix: size the reserve to THIS chunk's REALISTIC decode bound = the compressed
-    // input span (`slice_end - byte_start`, ≈ the chunk's compressed size + straddle)
-    // × an expansion factor tracking the actual decoded ratio (silesia ~3.3×) with
-    // headroom for a compressible chunk, so the allocator footprint MIRRORS
-    // production's ~chunk-sized final capacity (~28 MiB for a ~4.7 MiB T8 chunk at
-    // factor 8 vs the old flat 64 MiB) instead of the whole-member worst case.
-    // EXPAND_FACTOR=8 covers silesia's ratio ~2.4× over; FLOOR keeps small chunks
-    // safe; CAP bounds a pathological upfront request. Under-reserve no longer
-    // falls back: the GROWABLE decode below grows the buffer on demand when the
-    // chunk expands past the reserve (DIS-29 storm fix), so a >8x-compressible
-    // chunk stays on ISA-L instead of storming to the ~7.5x pure-Rust fallback.
-    // (A window-absent bootstrap chunk still legitimately falls back at some T —
-    // a real property of the ISA-L ceiling, not a sizing bug.)
-    let byte_start = inflate_start_bit / 8;
-    let compressed_span = slice_end.saturating_sub(byte_start);
-    let decode_start = chunk.data.len();
-    let (written, end_bit, boundaries) = {
-        // PRODUCTION DEFAULT: RATIO-INFORMED upfront reserve (box-proven +41%
-        // model-T8; DIS-14/DIS-17 footprint mechanism, 2026-06-09).
-        //
-        // The reserve is sized from the member's KNOWN ISIZE/compressed ratio
-        // (stored in chunk.configuration.expansion_ratio_ceil) rather than the
-        // historical fixed 8×. On near-incompressible corpora (model: ~1.3×)
-        // the 8× reserve over-allocated ~6× per chunk; with O(T) concurrent
-        // workers the excess page-fault/dTLB pressure collapsed per-worker
-        // ISA-L throughput (GZIPPY_ISAL_INCREMENTAL_GROWTH=1 FACTOR=2 falsifier
-        // at model T8: wall 0.31 → 0.22s, maxRSS 390 → 291 MB, 3/3 runs). The
-        // ratio-informed path removes the over-reservation without regressing
-        // sub-8× low-T corpora (ghcn: ceiling = 10 covers 7.8× with margin;
-        // the DIS-29 env-knob regression was exactly "too small a factor at
-        // low-T" — now the factor is sized from the actual member ratio).
-        //
-        // ISIZE is mod 2^32: files >4 GiB raw may wrap → under-ratio → safe
-        // regrow via GROW_BYTES (see ChunkConfiguration::expansion_ratio_ceil).
-        // RESERVE_CAP bounds only the UPFRONT reserve; growth past it is on
-        // demand and tracks the actual decoded size. RESERVE_FLOOR prevents
-        // pathologically small allocations on tiny chunks.
-        //
-        // GZIPPY_ISAL_INCREMENTAL_GROWTH=1 keeps the ALWAYS-SMALL measurement
-        // arm (footprint sweeps; DIS-23). It is NOT the production default —
-        // the ratio-informed path below IS.
-        let (initial, grow_bytes) = if let Some((initial_factor, grow)) = isal_incremental_growth()
-        {
-            const INCR_FLOOR: usize = 512 * 1024; // never start below 512 KiB
-            (
-                compressed_span
-                    .saturating_mul(initial_factor)
-                    .max(INCR_FLOOR),
-                grow,
-            )
-        } else {
-            const GROW_BYTES: usize = 4 * 1024 * 1024; // per-grow increment on overflow
-            (
-                compute_initial_reserve(compressed_span, chunk.configuration.expansion_ratio_ceil),
-                GROW_BYTES,
-            )
-        };
-        match isal_decompress::decompress_deflate_from_bit_into_growable(
-            bounded,
-            inflate_start_bit,
-            initial_window,
-            &mut chunk.data,
-            initial,
-            grow_bytes,
-        ) {
-            Some(v) => {
-                // All decoded bytes were committed during the decode; reset the
-                // LOGICAL length back to decode_start while the bytes REMAIN
-                // physically present in the buffer's spare (Vec::truncate keeps
-                // capacity + contents). This leaves the state the old fixed-buffer
-                // path produced (len == decode_start, the `written` bytes sitting
-                // in spare), so the shared commit/CRC/boundary/fallback logic
-                // below — including its several `return Ok(false)` exits — runs
-                // byte-for-byte the same. (The exits must leave chunk.data at
-                // decode_start; the fixed path got that for free by committing
-                // only at the very end.)
-                chunk.data.truncate(decode_start);
-                v
-            }
-            None => {
-                // The growable decode may have committed bytes during growth
-                // before bailing; reset to the pre-decode length before falling
-                // back to the byte-exact pure-Rust engine.
-                chunk.data.truncate(decode_start);
-                return Ok(false);
-            }
-        }
-    };
-
-    // Pick the natural stop: first boundary at-or-past stop_hint (inexact), or
-    // the exact boundary == stop_hint (exact). Boundaries record (bit_offset,
-    // output_offset) measured from the start of THIS decode (offset into the
-    // reserved region == offset from `decode_start`).
-    let (final_bit, keep_len) = if until_exact {
-        let mut found = None;
-        for b in &boundaries {
-            if b.bit_offset == stop_hint_bits {
-                found = Some((b.bit_offset, b.output_offset));
-                break;
-            }
-        }
-        match found {
-            Some(v) => v,
-            None => {
-                // BFINAL exact-landing: the member's final block ends with no
-                // recorded EOB boundary AT stop_hint_bits. Two sub-cases:
-                //
-                // (a) ISA-L exited via ISAL_BLOCK_FINISH before setting
-                //     stopped_at — no boundary recorded at all for this block.
-                //     `end_bit == stop_hint_bits` (same ISA-L coordinate system
-                //     used to derive stop_hint in tests/measurement).
-                //
-                // (b) Production: ISA-L DID record the BFINAL EOB boundary via
-                //     stopped_at, but at `stop_hint_bits - 1` instead of
-                //     `stop_hint_bits` (a 1-bit coordinate discrepancy between
-                //     ISA-L's chunk-decode context and the block_finder's
-                //     canonical scan — ISA-L's `data.len()*8 - avail_in*8 -
-                //     read_in_length` tracks bit consumption from a different
-                //     internal-buffering state). Diagnosed on NASA Jul95:
-                //     start_bit=150999587, stop_hint=156360208, end_bit=156360207,
-                //     boundaries=25, delta=-1, wrapper_ok=true, 3–5/30 runs.
-                //
-                // In both cases `end_bit` is within 1 bit of `stop_hint_bits`
-                // and below it, confirming ISA-L reached and decoded the final
-                // BFINAL block. The until_exact contract is satisfied — the
-                // decode stopped at or within 1 bit of the exact requested
-                // position, with the 1-bit slack being a coordinate convention
-                // difference, not a data difference. Vendor GzipChunk.hpp
-                // decodeChunkWithInflateWrapper tracks the end position directly
-                // rather than requiring a recorded boundary; accepting an
-                // exact or within-1 landing here converges to that behavior.
-                // LOAD-BEARING: `end_bit <= stop_hint_bits` — not the <=1 slack —
-                // is what structurally excludes INTERIOR chunks from this accept:
-                // an interior decode is input-bounded at stop_byte + 256 KiB and
-                // always runs PAST stop_hint (end_bit >> stop_hint), so reaching
-                // end_bit <= stop_hint means the decode genuinely hit the member's
-                // BFINAL stream end. Do not "simplify" the guard away.
-                let end_within_1 = end_bit <= stop_hint_bits && stop_hint_bits - end_bit <= 1;
-                if end_within_1 {
-                    ISAL_BFINAL_EXACT_LANDING_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-                    // Use stop_hint_bits as the canonical final_bit so the
-                    // chunk records its end at the block_finder's coordinate.
-                    (stop_hint_bits, written)
-                } else {
-                    ISAL_UNTIL_EXACT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                    return Ok(false); // oracle can't honor exact stop ⇒ fall back
-                }
-            }
-        }
-    } else {
-        let mut chosen = None;
-        for b in &boundaries {
-            if b.bit_offset >= stop_hint_bits {
-                chosen = Some((b.bit_offset, b.output_offset));
-                break;
-            }
-        }
-        match chosen {
-            Some(v) => v,
-            None => {
-                // No recorded block boundary at-or-past the stop hint. Accepting
-                // `(end_bit, written)` is correct ONLY when the stream genuinely
-                // ENDED (BFINAL) at-or-before the stop hint — the member's last
-                // chunk — so `end_bit <= stop_hint`. If instead the decode ran PAST
-                // the stop hint with no usable boundary there, ISA-L's END_OF_BLOCK
-                // stopping did NOT fire for this chunk (observed on stored/fixed-block
-                // input: a multi-MiB decode recorded ZERO boundaries), so committing
-                // `end_bit` would OVER-DECODE past the chunk's natural stop and
-                // mis-seed the next chunk's start bit (a "Stored block len/nlen
-                // mismatch" downstream). DECLINE to the byte-exact pure-Rust engine
-                // (counted in ISAL_ENGINE_ORACLE_FALLBACKS). On the all-dynamic parity
-                // corpus ISA-L always records a boundary at-or-past the hint, so this
-                // never fires there.
-                if end_bit <= stop_hint_bits {
-                    (end_bit, written)
-                } else {
-                    ISAL_INEXACT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                    return Ok(false);
-                }
-            }
-        }
-    };
-
-    let keep_len = keep_len.min(written);
-
-    // Commit ONLY the kept region into the chunk's u8 data buffer. The bytes are
-    // already physically present in the reserved spare (ISA-L wrote them, in BOTH
-    // the fixed-buffer and incremental paths — the latter truncated its logical
-    // length back to decode_start above while keeping the bytes in spare); commit
-    // bumps the logical length with zero copies.
-    chunk.data.commit(keep_len);
-
-    // CRC over the exact kept region (mirrors finish_decode_chunk_impl:512-517).
-    // The kept bytes are now the contiguous slice `data[decode_start..decode_start+keep_len]`.
-    if chunk.configuration.crc32_enabled {
-        // Re-borrow the committed region as a slice for hashing (zero-copy view).
-        let kept_view = chunk.data.decoded_range(decode_start, keep_len);
-        if let Some(last_crc) = chunk.crc32s.last_mut() {
-            last_crc.update(kept_view);
-        }
-    }
-    chunk.statistics.non_marker_count += keep_len as u64;
-
-    // Replay boundaries WITH INCREMENTAL byte accounting so on-the-fly subchunk
-    // splitting fires exactly as the pure streaming loop's per-EOB path does.
-    // `ChunkData::append_block_boundary_at` only starts a new subchunk once the
-    // OPEN subchunk's `decoded_size` has crossed `split_chunk_size`; that size is
-    // grown by `note_inner_decoded_bytes`. The pure path interleaves
-    // note+append per read, so crediting the full `keep_len` up front (the old
-    // shape) hid the per-segment growth and produced ONE subchunk for the whole
-    // ISA-L tail (the `UNSPLIT_BLOCKS_EMPLACED` deletion trap caught this). Here we
-    // credit each [prev_off, b.output_offset) segment to the current subchunk
-    // BEFORE recording its boundary, then the final [last_off, keep_len) tail —
-    // byte-transparent (the committed bytes and total decoded_size are unchanged;
-    // only the subchunk split metadata now matches the pure path / vendor
-    // GzipChunk.hpp:321 + appendDeflateBlockBoundary).
-    let mut prev_off = 0usize;
-    for b in &boundaries {
-        if b.bit_offset > final_bit {
-            break;
-        }
-        let off = b.output_offset.min(keep_len);
-        if off > prev_off {
-            chunk.note_inner_decoded_bytes(off - prev_off);
-            prev_off = off;
-        }
-        let decoded_offset = decode_start + off;
-        if decoded_offset > 0 {
-            chunk.append_block_boundary_at(b.bit_offset, decoded_offset, Some(input));
-        }
-    }
-    if keep_len > prev_off {
-        chunk.note_inner_decoded_bytes(keep_len - prev_off);
-    }
-
-    chunk.finalize_with_deflate(final_bit, Some(input));
-    ISAL_ENGINE_ORACLE_CHUNKS.fetch_add(1, Ordering::Relaxed);
-    Ok(true)
-}
-
-#[cfg(not(all(parallel_sm, feature = "isal-compression", target_arch = "x86_64")))]
-fn finish_decode_chunk_isal_oracle(
-    _chunk: &mut ChunkData,
-    _input: &[u8],
-    _inflate_start_bit: usize,
-    _stop_hint_bits: usize,
-    _initial_window: &[u8],
-    _until_exact: bool,
-) -> Result<bool, ChunkDecodeError> {
-    Ok(false)
-}
 /// Chunks that took vendor `decodeChunkWithInflateWrapper` (exact window + until_exact).
 pub static INFLATE_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -822,10 +474,11 @@ fn finish_decode_chunk_impl(
     // (`GZIPPY_ISAL_ENGINE_ORACLE`) was removed 2026-07-07 (batch 4f) —
     // confirmed no production ISA-L decode graph exists (single-member decode
     // is pure-Rust ParallelSM at every T; C-FFI is compression-only per
-    // CLAUDE.md). `finish_decode_chunk_isal_oracle` and its ISAL_ENGINE_ORACLE_*
-    // counters are left in place (dead), deferred to the x86-box batch that can
-    // compile-check the `feature = "isal-compression", target_arch = "x86_64"`
-    // arm.
+    // CLAUDE.md). `finish_decode_chunk_isal_oracle` and `isal_incremental_growth`
+    // were themselves deleted (x86-finish batch, 2026-07-07) — zero remaining
+    // callers once this branch was removed. The ISAL_ENGINE_ORACLE_* counters
+    // stay (still read by the `GZIPPY_VERBOSE` dump in `chunk_fetcher.rs`) but
+    // are now permanently zero.
     let t_decode = std::time::Instant::now();
 
     let read_cap = if until_exact {

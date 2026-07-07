@@ -75,8 +75,7 @@
 //!      back: back-ref sources are `< dst`).
 //!  X4. `self.*` (`at_end_of_block`, `decoded_bytes`, `backreferences`),
 //!      `orec`, prof counters: NEVER touched by the asm. Rust owns every
-//!      commit. Effect/coverage counters are wrapper-side, gated on
-//!      `stats_enabled()`, accumulated from the emitted delta.
+//!      commit.
 //!  X5. `bitsleft >= 48` at exit, OR the cursor is unchanged since entry
 //!      (E2 carries through) — so the caller may re-derive the carried
 //!      packet with `decode_prefilled` (purity: a litlen decode reads at
@@ -136,11 +135,11 @@
 //!
 //! ## Dispatch policy (charter §4)
 //! Cargo feature `asm-kernel`, x86_64-only call sites; pure-Rust loop ALWAYS
-//! compiled and reachable. Runtime: BMI2 detect (`shrx`/`shlx`/`bzhi`) +
-//! `GZIPPY_ASM_KERNEL=0` kill-switch (OnceLock, one predictable branch per
-//! contig call). DEFAULT-ON on x86_64: `pure-rust-inflate` (the shipped
-//! native + isal feature set) pulls in `asm-kernel`, so on a BMI2 host this
-//! region IS the production clean fast loop.
+//! compiled and reachable. Runtime: BMI2 detect (`shrx`/`shlx`/`bzhi`),
+//! cached in a `OnceLock` (one predictable branch per contig call), is the
+//! SOLE dispatch condition. DEFAULT-ON on x86_64: `pure-rust-inflate` (the
+//! shipped native + isal feature set) pulls in `asm-kernel`, so on a BMI2
+//! host this region IS the production clean fast loop.
 
 #![allow(dead_code)]
 
@@ -284,24 +283,9 @@ const _: () = assert!(crate::decompress::inflate::libdeflate_entry::DistTable::T
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
 mod imp {
     use super::{AsmState, Bits, ASM_DIST_OFF, ASM_LIT_LONG_OFF, ASM_LIT_SHORT_OFF};
+    #[cfg(test)]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
-
-    /// Effect/coverage counters (decide.sh EFFECT predicate + the asm_frac
-    /// validity precondition F-c requires). Wrapper-side only (X4), gated on
-    /// `stats_enabled()` so the measured hot path carries zero atomics.
-    pub static KERN_ENTRIES: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_EXIT_BOUNDARY: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_EXIT_RECLASS: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_ASM_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_RECLASS_EOB: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_RECLASS_MULTI_TRAIL: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_RECLASS_DIST: AtomicU64 = AtomicU64::new(0);
-    // NIGHT15 decomposition of KERN_RECLASS_DIST (byte-transparent stat split).
-    pub static KERN_RECLASS_RAW0: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_RECLASS_SUBTABLE: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_RECLASS_BADDIST: AtomicU64 = AtomicU64::new(0);
-    pub static KERN_RECLASS_MARKER: AtomicU64 = AtomicU64::new(0);
 
     /// Flip-precondition 3 (the permanent ON-vs-OFF fuzz net): in-process
     /// dispatch override. The env kill-switch is a process-wide OnceLock
@@ -313,14 +297,14 @@ mod imp {
     #[cfg(test)]
     pub static TEST_FORCE: AtomicU64 = AtomicU64::new(0);
     /// Engagement counter for the fuzz net (cfg(test) only): incremented at
-    /// every `run_contig` entry, independent of `GZIPPY_ASM_STATS`, so the
-    /// ON arm can PROVE the asm actually executed (effect-verified, not
-    /// assumed) and the OFF arm can prove it did not.
+    /// every `run_contig` entry, so the ON arm can PROVE the asm actually
+    /// executed (effect-verified, not assumed) and the OFF arm can prove it
+    /// did not.
     #[cfg(test)]
     pub static TEST_RUN_CONTIG_CALLS: AtomicU64 = AtomicU64::new(0);
 
-    /// Runtime dispatch: ON when compiled in, unless `GZIPPY_ASM_KERNEL=0`
-    /// (kill-switch) or the CPU lacks BMI2 (`shrx`/`shlx`/`bzhi`).
+    /// Runtime dispatch: ON when compiled in and the CPU has BMI2
+    /// (`shrx`/`shlx`/`bzhi`); the shipped default, cached once.
     pub fn enabled() -> bool {
         #[cfg(test)]
         match TEST_FORCE.load(Ordering::Relaxed) {
@@ -329,16 +313,7 @@ mod imp {
             _ => {}
         }
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            let killed = std::env::var("GZIPPY_ASM_KERNEL").is_ok_and(|v| v == "0");
-            !killed && std::arch::is_x86_feature_detected!("bmi2")
-        })
-    }
-
-    /// `GZIPPY_ASM_STATS=1` — effect-verification counters.
-    pub fn stats_enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("GZIPPY_ASM_STATS").is_ok_and(|v| v == "1"))
+        *ON.get_or_init(|| std::arch::is_x86_feature_detected!("bmi2"))
     }
 
     /// The rung-(c) kernel region.
@@ -1130,57 +1105,12 @@ mod imp {
         lb.pos = pos as usize;
         (ret, dst_c)
     }
-
-    pub fn note_exit(exit: u64, delta: usize) {
-        if !stats_enabled() {
-            return;
-        }
-        KERN_ENTRIES.fetch_add(1, Ordering::Relaxed);
-        KERN_ASM_BYTES.fetch_add(delta as u64, Ordering::Relaxed);
-        match exit {
-            super::EXIT_BOUNDARY => &KERN_EXIT_BOUNDARY,
-            super::EXIT_RECLASS_EOB => &KERN_RECLASS_EOB,
-            super::EXIT_RECLASS_MULTI_TRAIL => &KERN_RECLASS_MULTI_TRAIL,
-            super::EXIT_RECLASS_DIST => &KERN_RECLASS_DIST,
-            super::EXIT_RECLASS_RAW0 => &KERN_RECLASS_RAW0,
-            super::EXIT_RECLASS_SUBTABLE => &KERN_RECLASS_SUBTABLE,
-            super::EXIT_RECLASS_BADDIST => &KERN_RECLASS_BADDIST,
-            super::EXIT_RECLASS_MARKER => &KERN_RECLASS_MARKER,
-            _ => &KERN_EXIT_RECLASS,
-        }
-        .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn dump_if_enabled() {
-        if !stats_enabled() {
-            return;
-        }
-        eprintln!(
-            "[asm-kernel:c] enabled={} entries={} exit_boundary={} exit_reclass={} reclass_eob={} reclass_multi_trail={} reclass_dist={} reclass_raw0={} reclass_subtable={} reclass_baddist={} reclass_marker={} asm_bytes={}",
-            enabled(),
-            KERN_ENTRIES.load(Ordering::Relaxed),
-            KERN_EXIT_BOUNDARY.load(Ordering::Relaxed),
-            KERN_EXIT_RECLASS.load(Ordering::Relaxed),
-            KERN_RECLASS_EOB.load(Ordering::Relaxed),
-            KERN_RECLASS_MULTI_TRAIL.load(Ordering::Relaxed),
-            KERN_RECLASS_DIST.load(Ordering::Relaxed),
-            KERN_RECLASS_RAW0.load(Ordering::Relaxed),
-            KERN_RECLASS_SUBTABLE.load(Ordering::Relaxed),
-            KERN_RECLASS_BADDIST.load(Ordering::Relaxed),
-            KERN_RECLASS_MARKER.load(Ordering::Relaxed),
-            KERN_ASM_BYTES.load(Ordering::Relaxed),
-        );
-    }
 }
 
 #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-pub use imp::{dump_if_enabled, enabled, note_exit, run_contig, stats_enabled};
+pub use imp::{enabled, run_contig};
 #[cfg(all(test, feature = "asm-kernel", target_arch = "x86_64"))]
 pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
-
-/// Non-asm builds: constant-false dispatch, no-op dump — call sites fold away.
-#[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
-pub fn dump_if_enabled() {}
 
 /// Pure-Rust REFERENCE MODEL of the asm region's contract — the exact
 /// fast-loop subset of `decode_clean_into_contig` the asm owns (same

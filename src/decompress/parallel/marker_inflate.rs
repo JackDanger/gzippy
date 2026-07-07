@@ -3280,8 +3280,6 @@ impl Block {
                     FAST_OUT_SLOP,
                 )
                 && dist_tbl.is_some();
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
-            let asm_stats: bool = super::asm_kernel::stats_enabled();
             macro_rules! sync_local_bits {
                 () => {{
                     bits.pos = lb.pos;
@@ -3325,9 +3323,8 @@ impl Block {
             // cross-binary code layout of the doubled function body —
             // the campaign's documented layout-phantom class, irreducible
             // here without outlining/PGO. Production-irrelevant post-flip:
-            // the disabled arm exists only under the GZIPPY_ASM_KERNEL=0
-            // measurement control or on pre-BMI2 x86 (pre-2013 Haswell
-            // class).
+            // the disabled arm exists only on pre-BMI2 x86 (pre-2013
+            // Haswell class), where `enabled()` is false at runtime.
             macro_rules! fast_loop_run {
                 ($use_asm:literal) => {
             'fast: loop {
@@ -3346,9 +3343,6 @@ impl Block {
                     let (exit, dst1) =
                         unsafe { super::asm_kernel::run_contig(&self.asm, &mut lb, dst0) };
                     let delta = (dst1 as usize) - (dst0 as usize);
-                    if asm_stats {
-                        super::asm_kernel::note_exit(exit, delta);
-                    }
                     if delta != 0 {
                         *pos += delta;
                         emitted += delta;
@@ -5105,7 +5099,7 @@ mod tests {
     /// then its DEFLATE body is decoded twice through the production
     /// contig-clean path — kernel force-ENABLED vs force-DISABLED (same
     /// binary; the in-process `TEST_FORCE` override stands in for the
-    /// process-wide `GZIPPY_ASM_KERNEL` OnceLock) — asserting byte equality,
+    /// process-wide `enabled()` OnceLock) — asserting byte equality,
     /// equality to the payload, and final bit-cursor equality
     /// (pos/bitbuf/bitsleft — the X1 contract at stream end). ON-arm
     /// engagement is effect-verified via `TEST_RUN_CONTIG_CALLS`, never

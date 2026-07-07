@@ -367,6 +367,12 @@ pub(crate) fn cpu_is_amd() -> bool {
     static IS_AMD: OnceLock<bool> = OnceLock::new();
     *IS_AMD.get_or_init(|| {
         // SAFETY: cpuid leaf 0 (vendor string) is available on every x86_64 CPU.
+        // `#[allow(unused_unsafe)]`: `__cpuid` is `unsafe fn` on some toolchains
+        // and a safe fn on others (stdarch has moved cpuid-class intrinsics in
+        // and out of `unsafe` across Rust versions); keep the block for the
+        // toolchains that still require it and silence the resulting
+        // `unused_unsafe` lint on toolchains (like this one) where it doesn't.
+        #[allow(unused_unsafe)]
         let v = unsafe { std::arch::x86_64::__cpuid(0) };
         // Vendor string lives in EBX, EDX, ECX (in that order) — 12 bytes.
         let mut vendor = [0u8; 12];

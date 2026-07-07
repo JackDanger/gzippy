@@ -681,8 +681,6 @@ fn drive_impl<W: std::io::Write>(
     // when --verbose is passed; tests and other internal callers
     // ignore it.
     if std::env::var("GZIPPY_VERBOSE").is_ok() {
-        // ASM-kernel effect counters (no-op unless GZIPPY_ASM_STATS=1).
-        crate::decompress::parallel::asm_kernel::dump_if_enabled();
         let snap = block_fetcher.statistics.base.snapshot();
         let extra = block_fetcher.statistics.extra_snapshot();
         eprintln!("[gzippy --verbose] BlockFetcher statistics:");
