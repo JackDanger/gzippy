@@ -174,10 +174,8 @@ fn main() {
 ///  - We flush the process-wide `stdout`/`stderr` handles first, covering any
 ///    `println!`/`eprintln!` (stats, `-v`) still sitting in the global
 ///    `LineWriter` buffer. The bulk data path is already flushed to the fd.
-///  - Set `GZIPPY_NO_FAST_EXIT=1` to force the normal exit (A/B measurement
-///    on a single binary); byte-identical output either way.
 fn fast_exit_success(exit_code: i32) -> ! {
-    if exit_code == 0 && env::var_os("GZIPPY_NO_FAST_EXIT").is_none() {
+    if exit_code == 0 {
         use std::io::Write;
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();

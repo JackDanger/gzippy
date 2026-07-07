@@ -14,9 +14,6 @@ use std::path::Path;
 #[cfg(unix)]
 #[inline]
 fn out_fd_of<F: AsRawFd>(f: &F) -> Option<i32> {
-    if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_some() {
-        return None;
-    }
     Some(f.as_raw_fd())
 }
 #[cfg(not(unix))]
@@ -50,12 +47,8 @@ use memmap2::Mmap;
 use crate::cli::GzippyArgs;
 use crate::decompress::format::{
     extract_gzip_fname, extract_gzip_mtime, has_bgzf_markers, is_likely_multi_member,
-    read_gzip_isize,
 };
 
-fn extract_isize_field(data: &[u8]) -> Option<u32> {
-    read_gzip_isize(data)
-}
 use crate::error::{GzippyError, GzippyResult};
 use crate::format::CompressionFormat;
 use crate::utils::{debug_enabled, preserve_metadata, strip_compression_extension};
@@ -169,39 +162,13 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         r
     } else {
         let output_path = output_path.clone().unwrap();
-        // §3.13 mmap direct decode: when GZIPPY_MMAP_OUTPUT=1 is set
-        // AND the gzip trailer's ISIZE plausibly fits a single-member
-        // file (no multi-member detected), allocate the output file
-        // at ISIZE bytes and decode straight into the mmap'd region.
-        // Kernel writeback handles the actual disk I/O asynchronously.
-        let use_mmap_output =
-            std::env::var_os("GZIPPY_MMAP_OUTPUT").is_some() && !is_likely_multi_member(&mmap);
-        if use_mmap_output {
-            if let Some(isize_field) = extract_isize_field(&mmap) {
-                use crate::decompress::mmap_writer::MmapWriter;
-                let mut writer = MmapWriter::open_pre_sized(&output_path, isize_field as usize)?;
-                let r = decompress_to_writer(&mmap, &mut writer, None, format, args);
-                let _written = writer.finalize()?;
-                r
-            } else {
-                // Fall back to BufWriter if ISIZE isn't extractable.
-                let output_file = File::create(&output_path)?;
-                let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-                writer.flush()?;
-                let out_fd = out_fd_of(writer.get_ref());
-                let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
-                writer.flush()?;
-                r
-            }
-        } else {
-            let output_file = File::create(&output_path)?;
-            let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-            writer.flush()?;
-            let out_fd = out_fd_of(writer.get_ref());
-            let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
-            writer.flush()?;
-            r
-        }
+        let output_file = File::create(&output_path)?;
+        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
+        writer.flush()?;
+        let out_fd = out_fd_of(writer.get_ref());
+        let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
+        writer.flush()?;
+        r
     };
 
     crate::set_output_file(None);

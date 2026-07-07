@@ -188,12 +188,10 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     // oracle: thin/libdeflate≈1.08 vs prod/libdeflate≈1.22 on this box). CRC32 +
     // ISIZE are verified below exactly as for the parallel path, and bytes_written
     // is captured so the multi-member-misroute resume net still works.
-    // `GZIPPY_NO_THIN_T1=1` forces the legacy parallel path at T1 (AB re-verify).
     let force_thin_oracle = std::env::var_os("GZIPPY_THIN_T1_ORACLE").is_some();
     // T1 serial-eligible: strictly T==1, no clean-window oracle, not force-thin.
-    let t1_serial = parallelization <= 1
-        && std::env::var_os("GZIPPY_NO_THIN_T1").is_none()
-        && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none();
+    let t1_serial =
+        parallelization <= 1 && std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_none();
     // T1-MONOLITH (igzip-shaped single-buffer path): a deliberate, T1-gated
     // divergence from the rapidgzip chunk pipeline toward the igzip monolith
     // (former plans/T1-MONOLITH-DIVERGENCE-LEDGER.md). It is OPT-IN (GZIPPY_MONOLITH=1),

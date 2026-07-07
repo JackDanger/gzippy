@@ -1344,16 +1344,6 @@ fn drive_impl<W: std::io::Write>(
 
 // ── Consumer: processNextChunk port ──────────────────────────────────────
 
-/// Kill-switch for the cache-hit-path prefetch drive (vendor
-/// BlockFetcher.hpp:297-299 parity). `GZIPPY_NO_HIT_DRIVE=1` reverts to
-/// the pre-fix cadence (drive on miss + blocked-pump only) so the drive
-/// can be A/B'd within a single binary (constant code layout). Read once.
-#[cfg(parallel_sm)]
-fn hit_drive_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("GZIPPY_NO_HIT_DRIVE").is_some_and(|v| v == "1"))
-}
-
 /// Vendor-faithful port of `GzipChunkFetcher::processNextChunk`
 /// (vendor/.../GzipChunkFetcher.hpp:311-362), wrapped in a `loop` that
 /// plays the role of `ParallelGzipReader::read`'s outer loop
@@ -1516,8 +1506,7 @@ fn consumer_loop<W: std::io::Write>(
         block_fetcher.record_fetch(next_unprocessed_block_index);
         let should_drive_prefetch = last_fetched_before
             .map(|li| li != next_unprocessed_block_index)
-            .unwrap_or(true)
-            && std::env::var_os("GZIPPY_NO_PREFETCH").is_none();
+            .unwrap_or(true);
 
         let stop_hint_bit = stop_hint_bit_for(
             block_finder,
@@ -1732,13 +1721,7 @@ fn consumer_loop<W: std::io::Write>(
                 // precedes the dispatch drive (vendor BlockFetcher.hpp:276
                 // before :297), so the head-of-line task cannot queue behind
                 // fresh prefetches.
-                // Kill-switch (A/B discriminator): GZIPPY_NO_HIT_DRIVE=1
-                // disables ONLY this hit-path drive, reverting to the prior
-                // miss-only/blocked-pump cadence. Verifiable: with the switch
-                // set, the consumer.drive_prefetch_on_hit span count is 0 and
-                // the unfrozen model-T8 Fetched-On-demand counter reverts to
-                // its pre-fix value (~5).
-                if should_drive_prefetch && !hit_drive_disabled() {
+                if should_drive_prefetch {
                     let _tv2 = trace_v2::SpanGuard::begin("consumer.drive_prefetch_on_hit");
                     block_fetcher.prefetch_new_blocks(
                         &lookup_block_offset,
@@ -2952,9 +2935,6 @@ fn publish_end_window_before_post_process(
     predecessor_window: &[u8],
 ) {
     use std::sync::atomic::Ordering;
-    if std::env::var_os("GZIPPY_NO_PUBLISH_AHEAD").is_some() {
-        return;
-    }
     if chunk.encoded_size_bits == 0 {
         return;
     }
@@ -4011,12 +3991,13 @@ enum PendingWrite {
 /// −64%/−30%, both p<0.005, sha-identical) — the smaller resident output
 /// working-set cuts page-faults (nasa −73%, silesia −42%) that feed the kernel.
 /// It is INCORRECT at T>1 (a global depth-1 corrupts silesia at T4/T8) so the
-/// T1 tuning is GATED on `pool_size == 1`. Sweep-only env overrides
-/// (`GZIPPY_RECYCLE_DEFER_DEPTH`, `GZIPPY_DRAIN_LONE`) take precedence for
-/// measurement; unset == identity.
+/// T1 tuning is GATED on `pool_size == 1`. The sweep-only env override
+/// `GZIPPY_DRAIN_LONE` takes precedence for measurement; unset == identity.
 #[cfg(parallel_sm)]
 struct RecycleDeferral {
     queue: std::collections::VecDeque<ChunkData>,
+    // Read only by `defer_chunk_recycle` (Linux-only removal-oracle path).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     depth: usize,
     drain_lone: bool,
     /// STAGE-2d MULTI-MEMBER GRID: the running per-member CRC32 + ISIZE
@@ -4035,14 +4016,8 @@ impl RecycleDeferral {
         let t1 = pool_size == 1;
         // T>1 default: defer 2, hold lone (correctness — worker-fill race).
         // T1: defer 0, drain lone (single inline worker, no race; measured win).
-        let mut depth = if t1 { 0 } else { 2 };
+        let depth = if t1 { 0 } else { 2 };
         let mut drain_lone = t1;
-        if let Some(v) = std::env::var("GZIPPY_RECYCLE_DEFER_DEPTH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            depth = v;
-        }
         if std::env::var_os("GZIPPY_DRAIN_LONE").is_some() {
             drain_lone = true;
         }
@@ -4055,33 +4030,21 @@ impl RecycleDeferral {
     }
 }
 
-/// FREE-AFTER-PUBLISH kill-switch (default ON). `GZIPPY_NO_FREE_AFTER_PUBLISH=1`
-/// restores the legacy `defer_chunk_recycle` deferral (2-chunk hold at T>1) for
-/// single-binary A/B measurement; byte-identical output either way.
-#[cfg(parallel_sm)]
-fn free_after_publish_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("GZIPPY_NO_FREE_AFTER_PUBLISH").is_none())
-}
-
 /// Release a just-written chunk's decoded buffers to the allocator immediately
-/// (peak-RSS reduction), or fall back to the legacy deferral when the
-/// kill-switch is set. The chunk's output has already been synchronously
+/// (peak-RSS reduction). The chunk's output has already been synchronously
 /// written and its window published, so the buffers are dead (see
 /// `ChunkData::free_decoded_buffers`). `chunk` drops at end of scope, so
 /// `LIVE_CHUNKS` decrements now instead of after the 2-chunk deferral hold —
 /// lowering both peak resident bytes AND peak live-ChunkData depth.
 #[cfg(parallel_sm)]
-fn release_written_chunk(deferral: &mut RecycleDeferral, mut chunk: ChunkData) {
-    if free_after_publish_enabled() {
-        chunk.free_decoded_buffers();
-        // chunk drops here → LIVE_CHUNKS -= 1, backing Vecs already freed.
-    } else {
-        defer_chunk_recycle(deferral, chunk);
-    }
+fn release_written_chunk(mut chunk: ChunkData) {
+    chunk.free_decoded_buffers();
+    // chunk drops here → LIVE_CHUNKS -= 1, backing Vecs already freed.
 }
 
-#[cfg(parallel_sm)]
+// Only reachable via the Linux-only `GZIPPY_SKIP_WRITEV_SYSCALL` removal-oracle
+// path (below); on other targets it has no caller.
+#[cfg(all(parallel_sm, target_os = "linux"))]
 fn defer_chunk_recycle(deferral: &mut RecycleDeferral, chunk: ChunkData) {
     deferral.queue.push_back(chunk);
     while deferral.queue.len() > deferral.depth {
@@ -4261,7 +4224,7 @@ fn drain_one_pending<W: std::io::Write>(
     let mut wrote_via_fd = false;
     #[cfg(unix)]
     if let Some(fd) = out_fd {
-        if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_none() && payload_bytes > 0 {
+        if payload_bytes > 0 {
             use crate::decompress::parallel::fd_vectored_write;
             let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
             // Zero-copy gather: narrowed marker segments + clean payload
@@ -4318,13 +4281,13 @@ fn drain_one_pending<W: std::io::Write>(
             } else {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                release_written_chunk(recycle_deferral, chunk);
+                release_written_chunk(chunk);
             }
             #[cfg(not(target_os = "linux"))]
             {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                release_written_chunk(recycle_deferral, chunk);
+                release_written_chunk(chunk);
             }
             *total_size += payload_bytes;
             #[allow(unused_assignments)]
@@ -4406,7 +4369,7 @@ fn drain_one_pending<W: std::io::Write>(
     // an extra Arc allocation per chunk).
     let _ = cache_key;
     let _ = block_fetcher;
-    release_written_chunk(recycle_deferral, chunk);
+    release_written_chunk(chunk);
     // Coz throughput marker: one in-order chunk just left the consumer. Coz
     // measures a virtual speedup's effect as the change in THIS visit-rate —
     // the program's true end-to-end throughput. No-op without --features coz.

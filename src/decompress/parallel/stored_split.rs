@@ -66,14 +66,6 @@ pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
 /// non-inert witness). Dumped by `GZIPPY_DEBUG=1`.
 pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 
-/// Kill-switch: when `GZIPPY_NO_STOREDPAR_DEMOTE=1` the demotion is
-/// suppressed and the Huffman tail is decoded sequentially (old behavior).
-/// Correctness-equivalent; use for A/B measurement only.
-#[inline]
-fn demotion_enabled() -> bool {
-    std::env::var_os("GZIPPY_NO_STOREDPAR_DEMOTE").is_none()
-}
-
 /// Threshold: if the stored prefix accounts for < this fraction of total
 /// output (numerator/denominator), demote to ParallelSM so the Huffman tail
 /// is decoded in parallel. Currently 50% (1/2).
@@ -382,14 +374,12 @@ pub fn decompress_stored_parallel<W: Write>(
             // can speculate boundaries across the tail and parallelize it.
             // Return NotStoredDominated so the caller routes to ParallelSM.
             //
-            // Kill-switch: GZIPPY_NO_STOREDPAR_DEMOTE=1 → old sequential path.
             // Counter: STORED_DEMOTE_TO_PARALLEL_SM counts demotion events.
             //
             // Threshold: prefix_out < expected_size * (1/2).
             // storedheavy: prefix_out ~8.2 MB, expected_size ~100 MB → 8.2% < 50%
             // → DEMOTE. A pure-stored or >50% stored stream stays on this path.
-            if demotion_enabled()
-                && prefix_out > 0
+            if prefix_out > 0
                 && prefix_out * DEMOTE_THRESHOLD_DEN < expected_size * DEMOTE_THRESHOLD_NUM
             {
                 STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
