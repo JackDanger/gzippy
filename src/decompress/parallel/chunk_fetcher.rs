@@ -791,6 +791,13 @@ fn drive_impl<W: std::io::Write>(
             "  StoredParallel pure-stored chunked-streaming runs (no monolithic buffer): {}",
             crate::decompress::parallel::stored_split::STORED_STREAM_RUNS.load(Ordering::Relaxed),
         );
+        // Stored-with-Huffman-islands path: non-zero = a stored-heavy stream with
+        // interspersed Huffman islands stayed on the stored path (parallel stored
+        // copy + in-place island decode) instead of demoting to the grid.
+        eprintln!(
+            "  StoredParallel stored-with-Huffman-islands runs: {}",
+            crate::decompress::parallel::stored_split::STORED_ISLANDS_RUNS.load(Ordering::Relaxed),
+        );
         // Window-sparsity effect counter: always 0 — keepIndex=false faithful port
         // is the sole behavior now (the old always-on kill-switch was removed).
         // Each count would be one 32 KiB getUsedWindowSymbols scan at chunk finalize.

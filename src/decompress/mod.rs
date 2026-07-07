@@ -618,8 +618,10 @@ fn decompress_single_member_for<W: Write>(
                     if crate::utils::debug_enabled() {
                         eprintln!(
                             "[gzippy] StoredParallel ok: {n} bytes; pure-stored chunked-streaming \
-                             runs (no monolithic buffer)={}",
+                             runs (no monolithic buffer)={}; stored-with-Huffman-islands runs={}",
                             crate::decompress::parallel::stored_split::STORED_STREAM_RUNS
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            crate::decompress::parallel::stored_split::STORED_ISLANDS_RUNS
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         );
                     }

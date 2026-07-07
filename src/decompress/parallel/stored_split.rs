@@ -66,10 +66,21 @@ pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
 /// non-inert witness). Dumped by `GZIPPY_DEBUG=1`.
 pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 
-/// Threshold: if the stored prefix accounts for < this fraction of total
-/// output (numerator/denominator), demote to ParallelSM so the Huffman tail
-/// is decoded in parallel. Currently 50% (1/2).
+/// Counter: number of stored-heavy-with-Huffman-islands streams decoded via the
+/// multi-island path ([`decode_stored_with_islands`]) — stored runs across the
+/// WHOLE stream are parallel-copied and each Huffman island is decoded in place
+/// against the true rolling output window, instead of demoting to the ParallelSM
+/// grid. Non-zero proves the islands lever fired (Gate-0 non-inert witness).
+/// Dumped by `GZIPPY_DEBUG=1`.
+pub static STORED_ISLANDS_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Threshold: if the TOTAL stored bytes account for < this fraction of total
+/// output (numerator/denominator), demote to ParallelSM so the Huffman islands
+/// are decoded in parallel by the grid. Currently 50% (1/2). Used only by the
+/// `parallel_sm` island decoder.
+#[cfg(parallel_sm)]
 const DEMOTE_THRESHOLD_NUM: usize = 1;
+#[cfg(parallel_sm)]
 const DEMOTE_THRESHOLD_DEN: usize = 2;
 
 /// Phase wrapper for the stored decode path. Formerly hosted an env-gated
@@ -200,9 +211,27 @@ fn walk_stored_chain(
     deflate: &[u8],
     base_off: usize,
 ) -> Result<(Vec<StoredRun>, WalkEnd), StoredSplitError> {
+    walk_stored_prefix(deflate, 0, base_off, 0)
+}
+
+/// Generalised [`walk_stored_chain`]: walk stored blocks from an ARBITRARY
+/// byte-aligned deflate offset `start_p` with the output cursor starting at
+/// `start_out`. Used by the multi-island path to resume the fast byte-aligned
+/// stored walk after a Huffman island (whose trailing stored blocks are again
+/// byte-aligned). `WalkEnd`'s `deflate_end` / `tail_byte` are absolute byte
+/// offsets into `deflate`; `prefix_out` is the absolute output offset.
+///
+/// PRECONDITION: `start_p` is a byte boundary at which a block header begins
+/// (true for the first block, and for any block following a stored block).
+fn walk_stored_prefix(
+    deflate: &[u8],
+    start_p: usize,
+    base_off: usize,
+    start_out: usize,
+) -> Result<(Vec<StoredRun>, WalkEnd), StoredSplitError> {
     let mut runs: Vec<StoredRun> = Vec::new();
-    let mut p: usize = 0; // byte cursor into `deflate`
-    let mut out_off: usize = 0;
+    let mut p: usize = start_p; // byte cursor into `deflate`
+    let mut out_off: usize = start_out;
     let n = deflate.len();
 
     loop {
@@ -343,32 +372,19 @@ pub fn decompress_stored_parallel<W: Write>(
             tail_byte,
             prefix_out,
         } => {
-            // DEMOTION GATE: if the Huffman tail is >= 50% of total output,
-            // the sequential tail decode is the wall bottleneck — ParallelSM
-            // can speculate boundaries across the tail and parallelize it.
-            // Return NotStoredDominated so the caller routes to ParallelSM.
+            // Stored data INTERRUPTED BY HUFFMAN ISLANDS (the `storedheavy`
+            // shape: ~all-stored with occasional small Huffman blocks). The old
+            // path stopped at the FIRST Huffman block and — when its contiguous
+            // stored prefix was < 50% of output (storedheavy: ~8.6%) — DEMOTED
+            // to the ParallelSM grid, paying the grid's per-chunk alloc+copy.
             //
-            // Counter: STORED_DEMOTE_TO_PARALLEL_SM counts demotion events.
-            //
-            // Threshold: prefix_out < expected_size * (1/2).
-            // storedheavy: prefix_out ~8.2 MB, expected_size ~100 MB → 8.2% < 50%
-            // → DEMOTE. A pure-stored or >50% stored stream stays on this path.
-            if prefix_out > 0
-                && prefix_out * DEMOTE_THRESHOLD_DEN < expected_size * DEMOTE_THRESHOLD_NUM
-            {
-                STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
-                if crate::utils::debug_enabled() {
-                    eprintln!(
-                        "[gzippy] StoredParallel demote → ParallelSM: \
-                         prefix_out={prefix_out} < expected_size/2={} \
-                         (stored fraction {:.1}%)",
-                        expected_size / 2,
-                        prefix_out as f64 / expected_size as f64 * 100.0,
-                    );
-                }
-                return Err(StoredSplitError::NotStoredDominated);
-            }
-            decode_with_huffman_tail(
+            // Instead, walk the WHOLE stream across islands: decode each Huffman
+            // island in place against the TRUE rolling output window, and
+            // parallel-copy the stored runs BETWEEN/AFTER the islands too. The
+            // demotion decision now uses the TOTAL stored fraction (computed by
+            // the full walk), so a genuinely Huffman-dominant stream still
+            // demotes, but stored-throughout data stays on the fast path.
+            decode_stored_with_islands(
                 writer,
                 deflate,
                 header_size,
@@ -410,362 +426,342 @@ fn verify_and_write<W: Write>(
     Ok(output.len() as u64)
 }
 
-/// Mixed stream: a stored PREFIX followed by a Huffman tail. The prefix's
-/// literals are copied in parallel (bandwidth-bound); the tail — which has no
-/// explicit length — is decoded sequentially with the proven ISA-L bulk block
-/// decoder into the same output buffer, so its back-references resolve directly
-/// against the already-materialised prefix (no separate 32 KiB window needed).
+/// Stored data INTERRUPTED BY HUFFMAN ISLANDS. Walk the WHOLE stream: the stored
+/// runs between/after the islands are recorded for a parallel bulk copy, and each
+/// Huffman island is decoded IN PLACE into the materialised output buffer.
 ///
-/// On non-x86 (or non-ISA-L/pure-rust) builds the bulk decoder is unavailable,
-/// so we decline (`NotStoredDominated`) and let the safe one-shot path decode
-/// the whole stream — same byte-exact result, just not parallel.
+/// ⚠ BYTE-EXACTNESS (the make-or-break): a Huffman island's back-references reach
+/// up to 32 KiB before its first output byte. Those bytes may be verbatim/stored
+/// OR a PRIOR island's DECODED output (two islands within 32 KiB). We NEVER
+/// reconstruct the window from input alone — the island is decoded straight into
+/// `output` at its ABSOLUTE offset, so `copy_match` resolves every `distance <=
+/// out_pos` back-ref against the TRUE preceding output (stored bytes materialised
+/// by [`materialize_predecessor`] for the <=32 KiB window, prior islands already
+/// present because islands are decoded left-to-right). The adjacent-island case
+/// therefore reads the first island's real decoded bytes, not a stale input copy.
+///
+/// On non-`parallel_sm` builds the bulk decoder is unavailable, so we decline
+/// (`NotStoredDominated`) and let the safe one-shot path decode the whole stream
+/// — same byte-exact result, just not parallel.
+#[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
-fn decode_with_huffman_tail<W: Write>(
+fn decode_stored_with_islands<W: Write>(
     writer: &mut W,
     deflate: &[u8],
     base_off: usize,
     prefix_runs: &[StoredRun],
-    tail_byte: usize,
+    first_tail_byte: usize,
     prefix_out: usize,
     expected_crc: u32,
     expected_size: usize,
     num_threads: usize,
 ) -> Result<u64, StoredSplitError> {
-    // The tail's output cannot be laid out without decoding, but we know the
-    // total from ISIZE, so the tail must produce exactly `expected_size -
-    // prefix_out` bytes. If the stored prefix ALONE already exceeds
-    // `expected_size`, this cannot be the single stored-dominated member we
-    // decode: `expected_size` is the WHOLE-FILE trailer's ISIZE, so a larger
-    // prefix means we were handed a MULTI-MEMBER stream whose first (dominant)
-    // member exceeds the small last member's ISIZE — the router's
-    // `is_likely_multi_member` 16 MiB scan window slipped a big first member
-    // through as "single-member". DECLINE to the safe multi-member-capable path
-    // instead of a terminal error (this path used to emit a spurious
-    // `stored output size mismatch: expected <last-ISIZE>, got <member1-size>`
-    // and EMPTY output on files `gzip -dc` decodes fine). The router now catches
-    // this shape up front (`classify_gzip` dominant-first detection at every T),
-    // so this is defense-in-depth for any residual mis-route.
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::lut_bulk_inflate::{decode_block, DecoderScratch};
+
+    // MULTI-MEMBER DEFENSE (defense-in-depth; classify catches this up front):
+    // `expected_size` is the WHOLE-FILE trailer's ISIZE. If the stored prefix
+    // alone already exceeds it we were mis-routed a multi-member stream whose
+    // dominant first member is larger than the small last member's ISIZE.
+    // DECLINE (no writer bytes) to the safe multi-member-capable path.
     if prefix_out > expected_size {
         return Err(StoredSplitError::NotStoredDominated);
     }
 
-    // The ISA-L bulk per-block decoder (`lut_bulk_inflate`) is available exactly
-    // when the `parallel_sm` cfg is set (x86_64 + isal/pure-rust, OR aarch64 +
-    // pure-rust). Where it is not, decline so the safe one-shot path decodes the
-    // whole stream — same bytes, just not parallel.
-    #[cfg(parallel_sm)]
-    {
-        let mut output = time_phase("alloc_zero", || vec![0u8; expected_size]);
+    // Materialised output: stored runs are bulk-copied in, islands decoded in
+    // place. `vec![0u8; ..]` matches the old single-tail path's allocation.
+    let mut output = time_phase("alloc_zero", || vec![0u8; expected_size]);
 
-        // The Huffman tail's back-references reach at most MAX_WINDOW_SIZE
-        // (32 KiB) bytes before its first output byte. So the tail decode only
-        // depends on the LAST 32 KiB of the stored prefix — not the whole
-        // prefix. That lets us OVERLAP the (single-threaded) tail decode with
-        // the (parallel) bulk copy of the rest of the prefix: build a 32 KiB
-        // predecessor window directly from the runs, then run the tail decode
-        // and the full-prefix copy concurrently into disjoint output regions.
-        //
-        // The overlap path requires `prefix_out >= MAX_WINDOW_SIZE` so the
-        // predecessor window is exactly 32 KiB — then for every legal tail
-        // back-reference (`distance <= 32 KiB`, validated by `decode_block`)
-        // `copy_match`'s window arithmetic is in-bounds. With a shorter prefix
-        // the standalone-buffer window could be smaller than a (corrupt)
-        // distance; the contiguous sequential path has no such edge, so we use
-        // it. Stored-dominated production input always has a multi-MiB prefix,
-        // so this guard never excludes the real workload.
-        let overlap = prefix_out >= MAX_WINDOW_SIZE;
+    // Every stored run recorded by the fast byte-aligned walk (prefix + the
+    // runs between/after islands), for the final parallel copy.
+    let mut all_runs: Vec<StoredRun> = prefix_runs.to_vec();
+    let mut stored_bytes: usize = prefix_runs.iter().map(|r| r.len).sum();
 
-        let (prefix_crc, tail_crc) = if overlap {
-            // Gather the predecessor window (last min(prefix_out, 32 KiB) bytes
-            // of the decoded prefix) from the stored runs, independent of the
-            // full-prefix copy that runs concurrently below.
-            let pred = time_phase("pred_window", || {
-                build_predecessor_window(deflate, base_off, prefix_runs, prefix_out)
-            });
+    let mut scratch = DecoderScratch::new();
+    let mut out_pos = prefix_out;
 
-            let (prefix_buf, tail_buf) = output.split_at_mut(prefix_out);
-            let tail_in = &deflate[tail_byte..];
+    // Drive a bit reader over the WHOLE deflate slice so `bit_position()` is in
+    // absolute deflate coordinates. Start at the first Huffman block (which is
+    // byte-aligned — it follows the stored prefix).
+    let mut bits = Bits::at_bit_offset(deflate, first_tail_byte * 8);
 
-            // Run both halves concurrently: Unit Y parallel-copies the whole
-            // prefix (and returns its CRC); Unit X decodes the tail into the
-            // disjoint tail buffer, resolving early back-refs against `pred`.
-            let mut tail_result: Result<(usize, u32), StoredSplitError> = Ok((0, crc32(&[])));
-            let prefix_crc = time_phase("overlap_copy+tail", || {
-                let mut pcrc = 0u32;
-                std::thread::scope(|scope| {
-                    let tr = &mut tail_result;
-                    scope.spawn(move || {
-                        *tr = decode_tail_into(tail_in, tail_buf, &pred);
-                    });
-                    // The tail decode occupies one core for the whole overlap,
-                    // so the parallel prefix copy gets num_threads-1 to avoid
-                    // oversubscribing (copy threads + tail thread <= cores). The
-                    // main thread drives the copy's own thread::scope.
-                    let copy_threads = num_threads.saturating_sub(1).max(1);
-                    pcrc = fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, copy_threads);
-                });
-                pcrc
-            });
-            let (tail_len, tcrc) = tail_result?;
-            // Guard: the tail must exactly fill the tail buffer (size agreement).
-            if tail_len != tail_buf_len(expected_size, prefix_out) {
-                return Err(StoredSplitError::SizeMismatch {
-                    expected: expected_size,
-                    actual: prefix_out + tail_len,
-                });
+    'walk: loop {
+        // Peek the next block's 3-bit header WITHOUT consuming (decode_block /
+        // the fast walk re-read it). `refill` does not consume, so bit_position
+        // still points at the header start.
+        bits.refill();
+        let header = bits.bitbuf & 0b111;
+        let btype = ((header >> 1) & 0b11) as u8;
+        let bit_pos = bits.bit_position();
+
+        if btype == 0 && bit_pos.is_multiple_of(8) {
+            // A BYTE-ALIGNED stored region (the common case after an island's
+            // stored blocks re-byte-align). Hand it to the fast walk, which
+            // records runs for the parallel copy with no per-byte bit decoding.
+            let p = bit_pos / 8;
+            let (runs_seg, end) = walk_stored_prefix(deflate, p, base_off, out_pos)?;
+            let seg_out: usize = runs_seg.iter().map(|r| r.len).sum();
+            stored_bytes += seg_out;
+            all_runs.extend_from_slice(&runs_seg);
+            out_pos += seg_out;
+            if out_pos > expected_size {
+                return Err(StoredSplitError::NotStoredDominated);
             }
-            (prefix_crc, tcrc)
-        } else {
-            // Sequential path: copy the whole prefix, then decode the tail into
-            // output[prefix_out..] (its back-refs resolve in the now-contiguous
-            // output). Used when overlap is disabled or there is no prefix.
-            let prefix_crc = time_phase("prefix_copy", || {
-                let (prefix_buf, _tail_buf) = output.split_at_mut(prefix_out);
-                fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, num_threads)
-            });
-            time_phase("huffman_tail", || {
-                decode_tail_blocks(&deflate[tail_byte..], &mut output, prefix_out)
-            })?;
-            let tail = &output[prefix_out..];
-            let tcrc = if tail.is_empty() { 0 } else { crc32(tail) };
-            (prefix_crc, tcrc)
-        };
+            match end {
+                WalkEnd::Final { .. } => break 'walk,
+                WalkEnd::HuffmanTail { tail_byte, .. } => {
+                    bits = Bits::at_bit_offset(deflate, tail_byte * 8);
+                    continue 'walk;
+                }
+            }
+        }
 
-        // Fold prefix_crc ⊕ tail_crc in output order. `combine_crc32` is the
-        // standard CRC32 concatenation (tested against crc32fast's combine) so
-        // prefix(parallel) + tail folds to the exact whole-buffer CRC.
-        let tail_len = expected_size - prefix_out;
-        let crc = if tail_len == 0 {
-            prefix_crc
-        } else {
-            combine_crc32(prefix_crc, tail_crc, tail_len as u64)
-        };
-        time_phase("verify_write", || {
-            verify_and_write(writer, &output, crc, expected_crc, expected_size)
-        })
+        // A Huffman block, OR a stored block whose 3-bit header starts mid-byte
+        // (the first stored block right after a Huffman block — it re-aligns
+        // internally, after which the fast walk takes over on the next lap).
+        // Decode ONE block via the bulk decoder into `output` at `out_pos`.
+        //
+        // Before a Huffman block, materialise its <=32 KiB predecessor from the
+        // recorded stored runs so early back-refs into not-yet-bulk-copied
+        // stored bytes resolve; prior islands / mid-byte stored blocks are
+        // already in `output`. `&[]` predecessor is correct because every legal
+        // back-ref has `distance <= out_pos` and reads `output` directly.
+        if btype != 0 {
+            materialize_predecessor(&mut output, deflate, base_off, &all_runs, out_pos);
+        }
+        let before = out_pos;
+        let result = decode_block(&mut bits, &mut output, &mut out_pos, &[], &mut scratch)
+            .map_err(|_| StoredSplitError::Corrupt("huffman island decode failed"))?;
+        if btype == 0 {
+            // A mid-byte stored block: its bytes are already in `output` (not
+            // deferred to the parallel copy). Count them as stored.
+            stored_bytes += out_pos - before;
+        }
+        if out_pos > expected_size {
+            return Err(StoredSplitError::NotStoredDominated);
+        }
+        if result.is_final_block {
+            break 'walk;
+        }
     }
-    #[cfg(not(parallel_sm))]
+
+    // Size agreement: the walk must have tiled the whole output exactly.
+    if out_pos != expected_size {
+        return Err(StoredSplitError::SizeMismatch {
+            expected: expected_size,
+            actual: out_pos,
+        });
+    }
+
+    // DEMOTION GATE (whole-stream stored fraction): if stored is < 50% of the
+    // output the Huffman islands dominate and the ParallelSM grid parallelises
+    // their decode better than this serial-island path. Discard (no writer
+    // bytes) and route to the grid. classify's ratio gate already guarantees
+    // stored dominance for real workloads, so this fires only on contrived input.
+    if stored_bytes * DEMOTE_THRESHOLD_DEN < expected_size * DEMOTE_THRESHOLD_NUM {
+        STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
+        if crate::utils::debug_enabled() {
+            eprintln!(
+                "[gzippy] StoredParallel demote → ParallelSM: stored={stored_bytes} \
+                 < expected_size/2={} (stored fraction {:.1}%)",
+                expected_size / 2,
+                stored_bytes as f64 / expected_size as f64 * 100.0,
+            );
+        }
+        return Err(StoredSplitError::NotStoredDominated);
+    }
+
+    // Parallel-copy the recorded stored runs into `output`. Island bytes (and
+    // any mid-byte stored blocks) were decoded in place and lie in the GAPS
+    // between recorded runs; the copy touches only recorded-stored ranges, so
+    // those decoded bytes are preserved.
+    time_phase("copy_runs", || {
+        copy_runs_parallel(&mut output, deflate, base_off, &all_runs, num_threads)
+    });
+
+    // Whole-output CRC32 (parallel), verified BEFORE the first byte is written —
+    // the verify-before-write / no-partial-output-on-corruption contract.
+    let crc = time_phase("crc_whole", || crc32_whole_parallel(&output, num_threads));
+    STORED_ISLANDS_RUNS.fetch_add(1, Ordering::Relaxed);
+    time_phase("verify_write", || {
+        verify_and_write(writer, &output, crc, expected_crc, expected_size)
+    })
+}
+
+/// Non-`parallel_sm` builds lack the bulk block decoder; decline so the safe
+/// one-shot path decodes the whole stream (same bytes, just not parallel).
+#[cfg(not(parallel_sm))]
+#[allow(clippy::too_many_arguments)]
+fn decode_stored_with_islands<W: Write>(
+    writer: &mut W,
+    deflate: &[u8],
+    base_off: usize,
+    prefix_runs: &[StoredRun],
+    first_tail_byte: usize,
+    prefix_out: usize,
+    expected_crc: u32,
+    expected_size: usize,
+    num_threads: usize,
+) -> Result<u64, StoredSplitError> {
+    let _ = (
+        writer,
+        deflate,
+        base_off,
+        prefix_runs,
+        first_tail_byte,
+        prefix_out,
+        expected_crc,
+        expected_size,
+        num_threads,
+    );
+    Err(StoredSplitError::NotStoredDominated)
+}
+
+/// Materialise the <=32 KiB predecessor window of an in-place island decode:
+/// copy the portions of the recorded stored runs that intersect
+/// `[out_pos - min(out_pos, 32 KiB), out_pos)` DIRECTLY into `output` at their
+/// absolute positions, so `copy_match`'s `distance <= out_pos` back-refs read the
+/// true stored bytes. Prior islands (and mid-byte stored blocks) already occupy
+/// their output ranges, so this only fills the not-yet-bulk-copied stored bytes.
+///
+/// `runs` is ascending by `out_off` and every run precedes `out_pos`, so we scan
+/// from the end and stop once a run lies fully before the window.
+#[cfg(parallel_sm)]
+fn materialize_predecessor(
+    output: &mut [u8],
+    deflate: &[u8],
+    base_off: usize,
+    runs: &[StoredRun],
+    out_pos: usize,
+) {
+    let w = out_pos.min(MAX_WINDOW_SIZE);
+    if w == 0 {
+        return;
+    }
+    let window_start = out_pos - w;
+    for r in runs.iter().rev() {
+        let r_end = r.out_off + r.len;
+        if r_end <= window_start {
+            break; // fully before the window; all earlier runs are too.
+        }
+        let lo = r.out_off.max(window_start);
+        let hi = r_end.min(out_pos);
+        if lo >= hi {
+            continue;
+        }
+        let src = (r.src_off - base_off) + (lo - r.out_off);
+        output[lo..hi].copy_from_slice(&deflate[src..src + (hi - lo)]);
+    }
+}
+
+/// Copy the recorded stored runs into `output` in parallel. Runs write DISJOINT
+/// output ranges separated by island GAPS (decoded in place), so the tiling
+/// boundaries are placed at each partition's first run `out_off` — a chunk may
+/// contain island bytes, which the workers leave untouched. Mirrors
+/// [`fill_and_crc`]'s split-at-mut structure but tolerates the gaps and computes
+/// no CRC (the whole-output CRC is taken separately over the tiled buffer).
+#[cfg(parallel_sm)]
+fn copy_runs_parallel(
+    output: &mut [u8],
+    deflate: &[u8],
+    base_off: usize,
+    runs: &[StoredRun],
+    num_threads: usize,
+) {
+    if runs.is_empty() {
+        return;
+    }
+    let total_stored: usize = runs.iter().map(|r| r.len).sum();
+    let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
+    if threads <= 1 || total_stored < 1 << 20 {
+        for r in runs {
+            let src = r.src_off - base_off;
+            output[r.out_off..r.out_off + r.len].copy_from_slice(&deflate[src..src + r.len]);
+        }
+        return;
+    }
+
+    // Partition runs into contiguous index groups balanced by stored bytes.
+    let parts = partition_runs(runs, total_stored, threads);
+    let out_len = output.len();
+
+    // Split `output` into per-partition disjoint slices. Boundary between group
+    // i and i+1 is `runs[parts[i+1].start].out_off` (ascending, since runs are
+    // ascending by out_off); the last group runs to `output.len()`.
+    let mut out_slices: Vec<&mut [u8]> = Vec::with_capacity(parts.len());
     {
-        let _ = (
-            writer,
-            deflate,
-            base_off,
-            prefix_runs,
-            tail_byte,
-            expected_crc,
-            num_threads,
-        );
-        Err(StoredSplitError::NotStoredDominated)
+        let mut rest = &mut output[..];
+        let mut prev = 0usize;
+        for (i, _part) in parts.iter().enumerate() {
+            let boundary = if i + 1 < parts.len() {
+                runs[parts[i + 1].start].out_off
+            } else {
+                out_len
+            };
+            let (head, tail) = rest.split_at_mut(boundary - prev);
+            out_slices.push(head);
+            rest = tail;
+            prev = boundary;
+        }
+        debug_assert!(rest.is_empty(), "partition slices must tile the buffer");
     }
+
+    std::thread::scope(|scope| {
+        let mut prev = 0usize;
+        for (part, out_slice) in parts.iter().zip(out_slices) {
+            let runs_part = &runs[part.clone()];
+            let base = prev;
+            prev = if part.end < runs.len() {
+                // next group's first run out_off, else end (unused on last).
+                runs.get(part.end).map(|r| r.out_off).unwrap_or(out_len)
+            } else {
+                out_len
+            };
+            scope.spawn(move || {
+                for r in runs_part {
+                    let dst = r.out_off - base;
+                    let s = r.src_off - base_off;
+                    out_slice[dst..dst + r.len].copy_from_slice(&deflate[s..s + r.len]);
+                }
+            });
+        }
+    });
+}
+
+/// Whole-buffer CRC32, parallel over contiguous chunks folded with
+/// `combine_crc32` (equals the serial `crc32(output)` byte-for-byte).
+#[cfg(parallel_sm)]
+fn crc32_whole_parallel(output: &[u8], num_threads: usize) -> u32 {
+    let n = output.len();
+    if n == 0 {
+        return 0;
+    }
+    let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
+    if threads <= 1 || n < 1 << 20 {
+        return crc32(output);
+    }
+    let chunk = n.div_ceil(threads);
+    let chunks: Vec<&[u8]> = output.chunks(chunk).collect();
+    let mut results: Vec<(u32, usize)> = vec![(0u32, 0usize); chunks.len()];
+    std::thread::scope(|scope| {
+        for (c, res) in chunks.iter().zip(results.iter_mut()) {
+            let c = *c;
+            scope.spawn(move || {
+                *res = (crc32(c), c.len());
+            });
+        }
+    });
+    let mut acc = results[0].0;
+    for (crc, len) in results.iter().skip(1) {
+        acc = combine_crc32(acc, *crc, *len as u64);
+    }
+    acc
 }
 
 /// Maximum DEFLATE back-reference distance (RFC 1951 §3.2.5): a tail block can
 /// reach at most this far before its first output byte.
 #[cfg(parallel_sm)]
 const MAX_WINDOW_SIZE: usize = 32 * 1024;
-
-/// Length of the Huffman-tail output region (everything after the prefix).
-#[cfg(parallel_sm)]
-#[inline]
-fn tail_buf_len(expected_size: usize, prefix_out: usize) -> usize {
-    expected_size - prefix_out
-}
-
-/// Build the predecessor window for the Huffman tail: the last
-/// `min(prefix_out, MAX_WINDOW_SIZE)` bytes of the decoded stored prefix,
-/// gathered directly from the stored runs (so it does not depend on the
-/// concurrent full-prefix copy). The returned buffer's LAST byte is
-/// `decoded_output[prefix_out - 1]`, matching `copy_match`'s contract that
-/// `predecessor_window` holds the bytes immediately preceding `output[0]`.
-#[cfg(parallel_sm)]
-fn build_predecessor_window(
-    deflate: &[u8],
-    base_off: usize,
-    runs: &[StoredRun],
-    prefix_out: usize,
-) -> Vec<u8> {
-    let w = prefix_out.min(MAX_WINDOW_SIZE);
-    let mut pred = vec![0u8; w];
-    if w == 0 {
-        return pred;
-    }
-    let window_start = prefix_out - w; // output offset of pred[0]
-                                       // Copy the portion of each run that intersects [window_start, prefix_out).
-    for r in runs {
-        let r_start = r.out_off;
-        let r_end = r.out_off + r.len;
-        if r_end <= window_start {
-            continue;
-        }
-        // Overlap of [r_start, r_end) with [window_start, prefix_out).
-        let lo = r_start.max(window_start);
-        let hi = r_end.min(prefix_out);
-        if lo >= hi {
-            continue;
-        }
-        let dst = lo - window_start;
-        let src = (r.src_off - base_off) + (lo - r_start);
-        pred[dst..dst + (hi - lo)].copy_from_slice(&deflate[src..src + (hi - lo)]);
-    }
-    pred
-}
-
-/// Decode the Huffman tail into a STANDALONE `tail_buf` (out_pos starts at 0),
-/// resolving back-references that reach before the tail against `pred` (the last
-/// 32 KiB of the prefix). Returns `(bytes_written, crc32_of_those_bytes)`.
-///
-/// This is the overlap-friendly variant of [`decode_tail_blocks`]: because the
-/// tail writes its own disjoint buffer and reaches the prefix only through the
-/// immutable `pred` window, it can run concurrently with the full-prefix copy.
-#[cfg(parallel_sm)]
-fn decode_tail_into(
-    tail: &[u8],
-    tail_buf: &mut [u8],
-    pred: &[u8],
-) -> Result<(usize, u32), StoredSplitError> {
-    use crate::decompress::inflate::consume_first_decode::Bits;
-    use crate::decompress::parallel::lut_bulk_inflate::{decode_block, DecoderScratch};
-
-    let mut bits = Bits::new(tail);
-    let mut out_pos = 0usize;
-    let mut scratch = DecoderScratch::new();
-    loop {
-        let result = decode_block(&mut bits, tail_buf, &mut out_pos, pred, &mut scratch)
-            .map_err(|_| StoredSplitError::Corrupt("huffman tail decode failed"))?;
-        if result.is_final_block {
-            break;
-        }
-        if out_pos >= tail_buf.len() {
-            return Err(StoredSplitError::Corrupt("huffman tail overran output"));
-        }
-    }
-    let crc = crc32(&tail_buf[..out_pos]);
-    Ok((out_pos, crc))
-}
-
-/// Decode the Huffman tail (a byte-aligned suffix of the deflate stream) into
-/// `output[start..]` using the ISA-L bulk per-block decoder, looping until the
-/// BFINAL block. `output[..start]` already holds the decoded prefix; all
-/// back-references resolve there (`predecessor_window` is empty).
-#[cfg(parallel_sm)]
-fn decode_tail_blocks(
-    tail: &[u8],
-    output: &mut [u8],
-    start: usize,
-) -> Result<(), StoredSplitError> {
-    use crate::decompress::inflate::consume_first_decode::Bits;
-    use crate::decompress::parallel::lut_bulk_inflate::{decode_block, DecoderScratch};
-
-    let mut bits = Bits::new(tail);
-    let mut out_pos = start;
-    let mut scratch = DecoderScratch::new();
-    loop {
-        let result = decode_block(&mut bits, output, &mut out_pos, &[], &mut scratch)
-            .map_err(|_| StoredSplitError::Corrupt("huffman tail decode failed"))?;
-        if result.is_final_block {
-            break;
-        }
-        if out_pos >= output.len() {
-            // No room left but not final — size disagreement; surface it.
-            return Err(StoredSplitError::Corrupt("huffman tail overran output"));
-        }
-    }
-    if out_pos != output.len() {
-        return Err(StoredSplitError::SizeMismatch {
-            expected: output.len(),
-            actual: out_pos,
-        });
-    }
-    Ok(())
-}
-
-/// Copy every run's literals into `output` (disjoint output ranges → no
-/// synchronisation) and compute the whole-stream CRC32 by combining per-
-/// partition CRCs in output order. Partitions are contiguous runs of blocks so
-/// their output ranges are contiguous and their CRCs fold left-to-right.
-fn fill_and_crc(
-    output: &mut [u8],
-    deflate: &[u8],
-    base_off: usize,
-    runs: &[StoredRun],
-    num_threads: usize,
-) -> u32 {
-    let total = output.len();
-    if runs.is_empty() || total == 0 {
-        // CRC32 of the empty stream is 0 (gzip stores crc32(b"") == 0).
-        return 0;
-    }
-
-    let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
-    // Below this many threads (or for tiny output) the parallel split's
-    // per-partition CRC-combine overhead is not worth it — do it inline.
-    if threads <= 1 || total < 1 << 20 {
-        // Fused copy+CRC: hash each run's bytes while they are still hot in
-        // cache from the copy, instead of a SECOND full pass over `output`.
-        // (The old split-copy-then-`crc32(output)` A/B arm, `GZIPPY_STORED_SPLIT_CRC=1`,
-        // was removed 2026-07-07, batch 4f — same CRC semantics, this is just
-        // fewer passes over `output`.)
-        return copy_runs_fused_crc(output, deflate, base_off, runs);
-    }
-
-    // Partition the run list into `threads` contiguous groups, balanced by
-    // output bytes (not run count) so a few huge blocks don't skew load.
-    let parts = partition_runs(runs, total, threads);
-
-    // Per-partition (crc, out_len) results, indexed by partition for ordered
-    // combine. Each partition writes a disjoint slice of `output`.
-    let mut results: Vec<(u32, usize)> = vec![(0u32, 0usize); parts.len()];
-
-    // Split `output` into the per-partition disjoint slices up front so each
-    // worker gets an exclusive &mut to its range (no aliasing, no unsafe).
-    let mut out_slices: Vec<&mut [u8]> = Vec::with_capacity(parts.len());
-    {
-        let mut rest = &mut output[..];
-        for part in &parts {
-            let part_out = part_out_bytes(runs, part);
-            let (head, tail) = rest.split_at_mut(part_out);
-            out_slices.push(head);
-            rest = tail;
-        }
-        // `rest` should be empty (partitions cover all output).
-        debug_assert!(
-            rest.is_empty(),
-            "partition output slices must tile the buffer"
-        );
-    }
-
-    std::thread::scope(|scope| {
-        for ((part, out_slice), result) in parts.iter().zip(out_slices).zip(results.iter_mut()) {
-            let runs_part = &runs[part.clone()];
-            scope.spawn(move || {
-                // Each run's out_off is absolute; translate to slice-local by
-                // subtracting the partition's first run's out_off.
-                let local_base = runs_part.first().map(|r| r.out_off).unwrap_or(0);
-                let out_len = out_slice.len();
-                // Fused copy+CRC: hash each run's bytes while they are still
-                // hot in cache from the copy (one pass over `output`, not
-                // two). Runs within a partition are contiguous and ordered,
-                // so an incremental Hasher over them yields the exact same
-                // CRC32 as one `crc32(out_slice)` over the whole partition.
-                let mut hasher = Hasher::new();
-                for r in runs_part {
-                    let dst = r.out_off - local_base;
-                    let s = r.src_off - base_off;
-                    out_slice[dst..dst + r.len].copy_from_slice(&deflate[s..s + r.len]);
-                    hasher.update(&out_slice[dst..dst + r.len]);
-                }
-                *result = (hasher.finalize(), out_len);
-            });
-        }
-    });
-
-    // Fold partition CRCs left-to-right in output order.
-    let mut acc_crc = results[0].0;
-    for (crc, len) in results.iter().skip(1) {
-        acc_crc = combine_crc32(acc_crc, *crc, *len as u64);
-    }
-    acc_crc
-}
 
 /// Compute the whole-output CRC32 of a pure-stored stream DIRECTLY from the
 /// input run slices — NO intermediate output buffer. The output bytes equal the
@@ -850,31 +846,6 @@ fn write_runs<W: Write>(
     }
     writer.flush()?;
     Ok(())
-}
-
-/// Inline (single-threaded) copy of all runs that ALSO computes the whole-output
-/// CRC32 in the same pass: each run's bytes are hashed immediately after the
-/// copy, while still hot in cache, instead of a second full pass over `output`.
-/// Runs are contiguous and ordered, so the incremental hash equals
-/// `crc32(output)` byte-for-byte.
-fn copy_runs_fused_crc(
-    output: &mut [u8],
-    deflate: &[u8],
-    base_off: usize,
-    runs: &[StoredRun],
-) -> u32 {
-    let mut hasher = Hasher::new();
-    for r in runs {
-        let src = r.src_off - base_off;
-        output[r.out_off..r.out_off + r.len].copy_from_slice(&deflate[src..src + r.len]);
-        hasher.update(&output[r.out_off..r.out_off + r.len]);
-    }
-    hasher.finalize()
-}
-
-/// Sum of output bytes covered by a contiguous partition (run range).
-fn part_out_bytes(runs: &[StoredRun], part: &std::ops::Range<usize>) -> usize {
-    runs[part.clone()].iter().map(|r| r.len).sum()
 }
 
 /// Partition `runs` into ≤ `threads` contiguous index ranges, each holding
@@ -1061,11 +1032,12 @@ mod tests {
     #[test]
     fn huffman_first_block() {
         use std::io::Write as _;
-        // A real flate2 deflate stream (dynamic Huffman) has NO stored prefix.
-        // Production never routes such a stream here (first_block_is_stored is
-        // false), but a direct call must still be correct:
-        //   * on x86 the empty-prefix + Huffman-tail path decodes it byte-exact,
-        //   * on other platforms (no bulk decoder) it declines without writing.
+        // A real flate2 deflate stream (dynamic Huffman) has NO stored prefix
+        // (0% stored). Production never routes such a stream here
+        // (`first_block_is_stored` is false). A direct call must DECLINE without
+        // writing: the whole-stream demotion gate sees stored fraction 0% < 50%
+        // (Huffman dominates) and returns `NotStoredDominated` so the caller
+        // routes to the ParallelSM grid — on every platform.
         let payload: Vec<u8> = (0..50_000).map(|i| (i % 7) as u8).collect();
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
         enc.write_all(&payload).unwrap();
@@ -1075,19 +1047,11 @@ mod tests {
 
         let mut out = Vec::new();
         let r = decompress_stored_parallel(&gz, &mut out, 4);
-        #[cfg(parallel_sm)]
-        {
-            assert_eq!(r.map(|n| n as usize).unwrap(), payload.len());
-            assert_eq!(out, payload, "empty-prefix Huffman-tail must decode");
+        match r {
+            Err(StoredSplitError::NotStoredDominated) => {}
+            other => panic!("expected NotStoredDominated (0% stored → demote), got {other:?}"),
         }
-        #[cfg(not(parallel_sm))]
-        {
-            match r {
-                Err(StoredSplitError::NotStoredDominated) => {}
-                other => panic!("expected NotStoredDominated, got {other:?}"),
-            }
-            assert!(out.is_empty(), "must not write on NotStoredDominated");
-        }
+        assert!(out.is_empty(), "must not write on NotStoredDominated");
     }
 
     /// The random100.gz shape: a long STORED prefix followed by a Huffman tail
@@ -1234,7 +1198,7 @@ mod tests {
     /// Existing fixtures for context:
     ///   `stored_prefix_then_huffman_tail`: 1.5 MB stored + 1 MB tail = 60% stored
     ///     (above 50% threshold → NOT demoted, decodes normally).
-    ///   `huffman_first_block`: 0% stored → NotStoredDominated for a different reason.
+    ///   `huffman_first_block`: 0% stored → demotes (Huffman dominates).
     #[test]
     fn stored_prefix_below_50pct_demotes_to_parallel_sm() {
         // 40 KiB pseudo-random stored prefix.
@@ -1269,5 +1233,305 @@ mod tests {
         }
         // No partial output on NotStoredDominated.
         assert!(out.is_empty(), "must not write partial output on demotion");
+    }
+
+    // ---- Multi-island fixed-Huffman assembler (for the adversarial test) ----
+
+    /// LSB-first deflate bit writer (bits accumulated then packed low-bit-first).
+    struct DeflateBits {
+        bits: Vec<u8>,
+    }
+    impl DeflateBits {
+        fn new() -> Self {
+            Self { bits: Vec::new() }
+        }
+        fn bit(&mut self, b: u8) {
+            self.bits.push(b & 1);
+        }
+        fn lsb(&mut self, val: u32, n: u32) {
+            for i in 0..n {
+                self.bit(((val >> i) & 1) as u8);
+            }
+        }
+        fn huff(&mut self, code: u32, n: u32) {
+            // Huffman codes pack most-significant bit first.
+            for i in (0..n).rev() {
+                self.bit(((code >> i) & 1) as u8);
+            }
+        }
+        fn align(&mut self) {
+            while !self.bits.len().is_multiple_of(8) {
+                self.bit(0);
+            }
+        }
+        fn into_bytes(self) -> Vec<u8> {
+            let mut out = vec![0u8; self.bits.len().div_ceil(8)];
+            for (i, &b) in self.bits.iter().enumerate() {
+                out[i / 8] |= b << (i % 8);
+            }
+            out
+        }
+    }
+
+    /// Fixed-Huffman literal/length symbol code (RFC 1951 §3.2.6).
+    fn fixed_lit_code(sym: u32) -> (u32, u32) {
+        match sym {
+            0..=143 => (0x30 + sym, 8),
+            144..=255 => (0x190 + (sym - 144), 9),
+            256..=279 => (sym - 256, 7),
+            _ => (0xC0 + (sym - 280), 8),
+        }
+    }
+
+    // (symbol, base, extra_bits) for match lengths 3..=258.
+    const LEN_TBL: &[(u32, u32, u32)] = &[
+        (257, 3, 0),
+        (258, 4, 0),
+        (259, 5, 0),
+        (260, 6, 0),
+        (261, 7, 0),
+        (262, 8, 0),
+        (263, 9, 0),
+        (264, 10, 0),
+        (265, 11, 1),
+        (266, 13, 1),
+        (267, 15, 1),
+        (268, 17, 1),
+        (269, 19, 2),
+        (270, 23, 2),
+        (271, 27, 2),
+        (272, 31, 2),
+        (273, 35, 3),
+        (274, 43, 3),
+        (275, 51, 3),
+        (276, 59, 3),
+        (277, 67, 4),
+        (278, 83, 4),
+        (279, 99, 4),
+        (280, 115, 4),
+        (281, 131, 5),
+        (282, 163, 5),
+        (283, 195, 5),
+        (284, 227, 5),
+        (285, 258, 0),
+    ];
+    const DIST_TBL: &[(u32, u32, u32)] = &[
+        (0, 1, 0),
+        (1, 2, 0),
+        (2, 3, 0),
+        (3, 4, 0),
+        (4, 5, 1),
+        (5, 7, 1),
+        (6, 9, 2),
+        (7, 13, 2),
+        (8, 17, 3),
+        (9, 25, 3),
+        (10, 33, 4),
+        (11, 49, 4),
+        (12, 65, 5),
+        (13, 97, 5),
+        (14, 129, 6),
+        (15, 193, 6),
+        (16, 257, 7),
+        (17, 385, 7),
+        (18, 513, 8),
+        (19, 769, 8),
+        (20, 1025, 9),
+        (21, 1537, 9),
+        (22, 2049, 10),
+        (23, 3073, 10),
+        (24, 4097, 11),
+        (25, 6145, 11),
+        (26, 8193, 12),
+        (27, 12289, 12),
+        (28, 16385, 13),
+        (29, 24577, 13),
+    ];
+
+    /// Token for a fixed-Huffman island: a literal byte or a back-reference.
+    enum Tok {
+        Lit(u8),
+        Match { len: u32, dist: u32 },
+    }
+
+    fn emit_stored_blocks(bw: &mut DeflateBits, data: &[u8], bfinal_last: bool) {
+        if data.is_empty() {
+            bw.bit(bfinal_last as u8);
+            bw.lsb(0, 2);
+            bw.align();
+            bw.lsb(0, 16);
+            bw.lsb(0xFFFF, 16);
+            return;
+        }
+        let mut off = 0;
+        while off < data.len() {
+            let end = (off + 65535).min(data.len());
+            let last = end == data.len();
+            bw.bit((last && bfinal_last) as u8);
+            bw.lsb(0, 2); // BTYPE=00
+            bw.align();
+            let ln = (end - off) as u32;
+            bw.lsb(ln, 16);
+            bw.lsb(!ln & 0xFFFF, 16);
+            for &b in &data[off..end] {
+                bw.lsb(b as u32, 8);
+            }
+            off = end;
+        }
+    }
+
+    fn emit_fixed_island(bw: &mut DeflateBits, toks: &[Tok]) {
+        bw.bit(0); // bfinal=0
+        bw.lsb(1, 2); // BTYPE=01 (fixed Huffman)
+        for t in toks {
+            match *t {
+                Tok::Lit(b) => {
+                    let (c, n) = fixed_lit_code(b as u32);
+                    bw.huff(c, n);
+                }
+                Tok::Match { len, dist } => {
+                    let (sym, base, extra) = *LEN_TBL
+                        .iter()
+                        .rev()
+                        .find(|&&(_, base, ex)| base <= len && len <= base + ((1 << ex) - 1))
+                        .unwrap();
+                    let (c, n) = fixed_lit_code(sym);
+                    bw.huff(c, n);
+                    bw.lsb(len - base, extra);
+                    let (dsym, dbase, dextra) = *DIST_TBL
+                        .iter()
+                        .find(|&&(_, base, ex)| base <= dist && dist <= base + ((1 << ex) - 1))
+                        .unwrap();
+                    bw.huff(dsym, 5);
+                    bw.lsb(dist - dbase, dextra);
+                }
+            }
+        }
+        let (c, n) = fixed_lit_code(256); // end-of-block
+        bw.huff(c, n);
+    }
+
+    fn gzip_wrap(deflate: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        gz.extend_from_slice(deflate);
+        gz.extend_from_slice(&crc32(payload).to_le_bytes());
+        gz.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        gz
+    }
+
+    /// THE ADVERSARIAL CASE (byte-exactness trap): a stored-heavy stream with two
+    /// Huffman islands within 32 KiB where the SECOND island back-references into
+    /// the FIRST island's DECODED output (bytes that exist nowhere in the input
+    /// verbatim). If the island decoder reconstructed its predecessor window from
+    /// input instead of the true decoded output, this corrupts. Verifies byte-
+    /// exact output AND that the stream stays on StoredParallel (islands counter
+    /// increments, demote counter unchanged).
+    #[test]
+    fn adversarial_adjacent_islands_cross_backref() {
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut rbytes = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (rng >> 33) as u8
+                })
+                .collect()
+        };
+
+        let mut bw = DeflateBits::new();
+        let mut payload: Vec<u8> = Vec::new();
+
+        // prefix stored (byte-aligned start → first_block_is_stored true)
+        let p = rbytes(40_000);
+        payload.extend_from_slice(&p);
+        emit_stored_blocks(&mut bw, &p, false);
+
+        // ISLAND 1: a distinctive 300-byte literal run.
+        let s1: Vec<u8> = (0..300u32)
+            .map(|i| (i.wrapping_mul(37) + 11) as u8)
+            .collect();
+        payload.extend_from_slice(&s1);
+        emit_fixed_island(
+            &mut bw,
+            &s1.iter().map(|&b| Tok::Lit(b)).collect::<Vec<_>>(),
+        );
+
+        // stored B: 2000 bytes (< 32 KiB → island 2 within 32 KiB of island 1)
+        let b = rbytes(2000);
+        payload.extend_from_slice(&b);
+        emit_stored_blocks(&mut bw, &b, false);
+
+        // ISLAND 2: a MATCH reaching back INTO island 1's decoded output.
+        // out_pos = 40000 + 300 + 2000 = 42300; dist 2200 → src 40100 ∈ island 1.
+        let out_pos = 40_000 + 300 + 2000;
+        let (dist, len) = (2200u32, 200u32);
+        let src = out_pos - dist as usize;
+        let copied = payload[src..src + len as usize].to_vec();
+        payload.extend_from_slice(&copied);
+        emit_fixed_island(&mut bw, &[Tok::Match { len, dist }]);
+
+        // final stored suffix (multi-block → exercises the fast-walk resume;
+        // > 1 MiB total stored so copy_runs_parallel takes its PARALLEL branch
+        // at T>1, not just the serial fallback).
+        let s = rbytes(1_200_000);
+        payload.extend_from_slice(&s);
+        emit_stored_blocks(&mut bw, &s, true);
+
+        let gz = gzip_wrap(&bw.into_bytes(), &payload);
+        assert!(first_block_is_stored(&gz), "must start stored");
+
+        // Independent oracle.
+        let mut oracle = Vec::new();
+        {
+            use std::io::Read as _;
+            flate2::read::GzDecoder::new(&gz[..])
+                .read_to_end(&mut oracle)
+                .unwrap();
+        }
+        assert_eq!(
+            oracle, payload,
+            "oracle sanity (hand-built stream is valid)"
+        );
+
+        let demote_before = STORED_DEMOTE_TO_PARALLEL_SM.load(Ordering::Relaxed);
+        let islands_before = STORED_ISLANDS_RUNS.load(Ordering::Relaxed);
+
+        for t in [1usize, 2, 4, 8] {
+            let mut out = Vec::new();
+            let r = decompress_stored_parallel(&gz, &mut out, t);
+            #[cfg(parallel_sm)]
+            {
+                assert_eq!(r.map(|n| n as usize).unwrap(), payload.len(), "t={t}");
+                assert_eq!(
+                    out, payload,
+                    "adversarial cross-island back-ref must be byte-exact at t={t}"
+                );
+            }
+            #[cfg(not(parallel_sm))]
+            {
+                let _ = t;
+                match r {
+                    Err(StoredSplitError::NotStoredDominated) => {}
+                    other => {
+                        panic!("expected NotStoredDominated on non-parallel_sm, got {other:?}")
+                    }
+                }
+            }
+        }
+
+        #[cfg(parallel_sm)]
+        {
+            // Stayed on the stored path (islands fired) and was NOT demoted.
+            assert!(
+                STORED_ISLANDS_RUNS.load(Ordering::Relaxed) > islands_before,
+                "islands path must have run"
+            );
+            assert_eq!(
+                STORED_DEMOTE_TO_PARALLEL_SM.load(Ordering::Relaxed),
+                demote_before,
+                "stored-dominant islands stream must NOT demote"
+            );
+        }
+        let _ = (demote_before, islands_before);
     }
 }
