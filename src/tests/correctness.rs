@@ -1446,6 +1446,14 @@ mod tests {
     // already streamed — faithful to gzip(1) multi-member semantics.
     #[test]
     fn test_concatenated_members_large_first_member_no_truncation() {
+        // Serialize against the other parallel-SM tests via the shared lock:
+        // this fixture deliberately trips the process-global
+        // `MISROUTE_REENTRY_APPLIED` counter that `multi_member_chunked.rs`'s
+        // deletion-trap tests snapshot before/after a decode — without this
+        // lock the two race under the default parallel test harness.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // member 1: 17 MiB incompressible → > 16 MiB compressed → the 2nd
         // member's magic falls outside the scan window → misrouted single.
         let mut m1 = vec![0u8; 17 * 1024 * 1024];
@@ -1485,6 +1493,12 @@ mod tests {
     /// `decompress_single_member` entry (the streaming/out_fd sink).
     #[test]
     fn test_concatenated_members_past_window_multiple_trailing() {
+        // Serialize against the other parallel-SM tests via the shared lock
+        // (see `test_concatenated_members_large_first_member_no_truncation`):
+        // this fixture also trips `MISROUTE_REENTRY_APPLIED`.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Member 1: 17 MiB incompressible → compressed > 16 MiB so the second
         // member's magic falls outside the scan window (misroute to single).
         let mut m1 = vec![0u8; 17 * 1024 * 1024];
@@ -1607,6 +1621,14 @@ mod tests {
     fn test_big_member_plus_gzip_magic_garbage_is_terminal_not_hang() {
         use std::sync::mpsc;
         use std::time::Duration;
+
+        // Serialize against the other parallel-SM tests via the shared lock
+        // (see `test_concatenated_members_large_first_member_no_truncation`):
+        // the fake trailing gzip magic also trips `MISROUTE_REENTRY_APPLIED`
+        // before the resume attempt fails.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         // 17 MiB incompressible member → compressed > 16 MiB → routes single.
         let mut m1 = vec![0u8; 17 * 1024 * 1024];

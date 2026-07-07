@@ -6969,7 +6969,10 @@ mod optimization_tests {
 
         // Part 2: Binary-ish data (like .git objects)
         let binary_start = original.len();
-        for i in 0..50000 {
+        for i in 0u64..50000 {
+            // u64 arithmetic: `i * 0x1234567` overflows i32 (the default
+            // inferred type for an unbounded range literal) well before
+            // i=50000, which panics under overflow-checked debug builds.
             let b = ((i * 0x1234567) ^ (i >> 3)) as u8;
             original.push(b);
         }
@@ -7239,7 +7242,9 @@ mod optimization_tests {
             original.extend_from_slice(line.as_bytes());
         }
         // Binary-ish section
-        for i in 0..20000 {
+        for i in 0u64..20000 {
+            // u64 arithmetic: see the identical overflow note in
+            // `test_tarball_l1_diagnostic` above.
             original.push(((i * 0x1234567) ^ (i >> 3)) as u8);
         }
         // Repetitive section
