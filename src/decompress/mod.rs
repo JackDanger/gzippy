@@ -218,10 +218,19 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     // STAGE-2d DOMINANT-FIRST MULTI-MEMBER DETECTION. `is_likely_multi_member`
     // only scans the first 16 MiB, so a multi-member stream whose FIRST member is
     // larger than that (e.g. an 85%-dominant member) is misclassified as
-    // single-member and would take ParallelSM, decode member 1 as one deflate
-    // stream, fail at member 1's footer, and fall back to the member-walk resume
-    // — which does NOT scale (measured plateau). Detect it here and route to the
-    // whole-file GRID instead.
+    // single-member. The single-member decoders (ParallelSM / StoredParallel)
+    // CANNOT span members: they read the whole-file trailer (== the LAST member's
+    // ISIZE/CRC) and walk deflate blocks straight across member boundaries. The
+    // stale `is_likely_multi_member` comment assumes the single-member backend
+    // "consumes-and-loops residual members" — true of the old ISA-L/libdeflate
+    // one-shots, FALSE of StoredParallel. On a stored-dominant first member whose
+    // last deflate block is Huffman, `walk_stored_chain` returns a HuffmanTail
+    // with `prefix_out` == member-1 output, then `decode_with_huffman_tail`
+    // trips `prefix_out > expected_size` (expected == the small last member's
+    // ISIZE) and returns a TERMINAL SizeMismatch → EMPTY output, exit 1 on a
+    // file `gzip -dc`/rapidgzip decode fine (P0 correctness bug, both arches).
+    // So detect the multi-member shape HERE and route to a multi-member path at
+    // EVERY thread count — T1 to the proven sequential walk, T>1 to the grid/par.
     //
     // The full-file boundary scan is O(file) and must NOT run on genuine
     // single-member decodes. Cheap gate: the trailing member's ISIZE (last 4
@@ -230,11 +239,16 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     // (typically larger-than-compressed) output, so `last_isize < len/2` is false
     // and the scan is skipped — single-member routing/latency is unchanged.
     #[cfg(parallel_sm)]
-    if num_threads > 1 {
+    {
         let last_isize = read_gzip_isize(data).unwrap_or(u32::MAX) as u64;
         if last_isize < (data.len() as u64) / 2 {
             if let Some(members) = crate::decompress::bgzf::scan_member_boundaries_fast(data) {
                 if members.len() > 1 {
+                    // Genuinely multi-member. A single-member decoder here is a
+                    // correctness bug, not just a perf miss — route by thread count.
+                    if num_threads <= 1 {
+                        return DecodePath::MultiMemberSeq;
+                    }
                     return if crate::decompress::bgzf::fast_path_ok(&members, num_threads) {
                         DecodePath::MultiMemberPar
                     } else {
