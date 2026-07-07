@@ -218,6 +218,108 @@ mod tests {
         }
     }
 
+    /// Regression (P0 correctness, mmiso locate 2026-07-06): a stored-dominated
+    /// DOMINANT-FIRST multi-member stream decoded at T1 must be byte-exact.
+    ///
+    /// Shape: a large incompressible FIRST member (>16 MiB, so its stored blocks
+    /// push the second member's header past the `is_likely_multi_member` 16 MiB
+    /// scan window → the stream MIS-DETECTS as single-member) whose LAST deflate
+    /// block is Huffman, followed by a small trailing member.
+    ///
+    /// Pre-fix, T1 routed to the single-member `StoredParallel` decoder (the
+    /// `num_threads > 1`-gated dominant-first detector was skipped at T1). That
+    /// decoder read the WHOLE-FILE trailer (== the small last member's ISIZE),
+    /// walked the stored chain across into the first member's Huffman final block
+    /// (`walk_stored_chain` → `HuffmanTail{ prefix_out = member-1 size }`), and
+    /// `decode_with_huffman_tail` tripped `prefix_out > expected_size` → a
+    /// TERMINAL `stored output size mismatch: expected <last-ISIZE>,
+    /// got <member1-size>` → EMPTY output, exit 1, on a file `gzip -dc` and
+    /// rapidgzip decode fine. Verified on both arches with the mmA2_stored.gz
+    /// fixture (98.6%-dominant first member).
+    ///
+    /// The fix: the dominant-first multi-member detection now runs at EVERY
+    /// thread count (T1 → sequential multi-member path); and `StoredParallel`
+    /// DECLINES (not errors) if it is ever handed this shape.
+    #[test]
+    fn test_dominant_first_stored_multi_member_p1_byte_exact() {
+        use std::io::Write as _;
+        // First member: 17 MiB pseudo-random (→ STORED blocks) + a 4 KiB
+        // compressible tail (→ a Huffman FINAL block, the exact bug trigger).
+        // 17 MiB > the 16 MiB is_likely_multi_member scan window.
+        let prefix_len = 17 * 1024 * 1024;
+        let mut m1_payload = vec![0u8; prefix_len];
+        let mut state = 0x1357_9bdf_2468_ace0u64;
+        for b in &mut m1_payload {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 33) as u8;
+        }
+        m1_payload.extend(std::iter::repeat_n(b'Z', 4096)); // compressible tail
+
+        // Hand-build member 1's deflate: STORED blocks (bfinal=0) over the random
+        // prefix, then a flate2 dynamic-Huffman FINAL block over the tail.
+        let mut deflate = Vec::new();
+        let block = 65535usize;
+        let mut off = 0;
+        while off < prefix_len {
+            let end = (off + block).min(prefix_len);
+            let chunk = &m1_payload[off..end];
+            deflate.push(0x00); // bfinal=0, btype=00
+            let len = chunk.len() as u16;
+            deflate.extend_from_slice(&len.to_le_bytes());
+            deflate.extend_from_slice(&(!len).to_le_bytes());
+            deflate.extend_from_slice(chunk);
+            off = end;
+        }
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(&m1_payload[prefix_len..]).unwrap();
+        deflate.extend_from_slice(&enc.finish().unwrap());
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&m1_payload);
+        let m1_crc = hasher.finalize();
+        let mut member1 = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        member1.extend_from_slice(&deflate);
+        member1.extend_from_slice(&m1_crc.to_le_bytes());
+        member1.extend_from_slice(&(m1_payload.len() as u32).to_le_bytes());
+
+        // Small trailing member.
+        let m2_payload = b"small trailing member payload\n".to_vec();
+        let mut enc2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc2.write_all(&m2_payload).unwrap();
+        let member2 = enc2.finish().unwrap();
+
+        let mut mm = member1;
+        mm.extend_from_slice(&member2);
+
+        // Precondition: the >16 MiB first member makes it MIS-DETECT as
+        // single-member (the exact trigger — the point of the test).
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&mm),
+            "fixture premise: >16 MiB first member must mis-detect as single-member"
+        );
+        // Independent oracle sanity: gzip(1)/flate2 decode it fine.
+        let expected = decompress_reference(&mm);
+        let mut want = m1_payload.clone();
+        want.extend_from_slice(&m2_payload);
+        assert_eq!(expected, want, "reference oracle sanity");
+
+        for threads in [1usize, 2, 4] {
+            let mut out = Vec::new();
+            crate::decompress::decompress_single_member(&mm, &mut out, threads).unwrap_or_else(
+                |e| {
+                    panic!(
+                        "dominant-first stored multi-member -p{threads} must decode \
+                         byte-exact (P0 regression), got error {e:?}"
+                    )
+                },
+            );
+            assert_eq!(
+                out, want,
+                "dominant-first stored multi-member -p{threads}: WRONG BYTES / P0 regression"
+            );
+        }
+    }
+
     /// Advisor review of the eager window-chain port (queuePrefetchedChunkPostProcessing,
     /// f7868ab): the consumer now eagerly publishes each prefetched chunk's end-window via
     /// `get_last_window`. Vendor `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:562-570)

@@ -469,12 +469,20 @@ fn decode_with_huffman_tail<W: Write>(
 ) -> Result<u64, StoredSplitError> {
     // The tail's output cannot be laid out without decoding, but we know the
     // total from ISIZE, so the tail must produce exactly `expected_size -
-    // prefix_out` bytes. Guard the obviously-impossible case up front.
+    // prefix_out` bytes. If the stored prefix ALONE already exceeds
+    // `expected_size`, this cannot be the single stored-dominated member we
+    // decode: `expected_size` is the WHOLE-FILE trailer's ISIZE, so a larger
+    // prefix means we were handed a MULTI-MEMBER stream whose first (dominant)
+    // member exceeds the small last member's ISIZE — the router's
+    // `is_likely_multi_member` 16 MiB scan window slipped a big first member
+    // through as "single-member". DECLINE to the safe multi-member-capable path
+    // instead of a terminal error (this path used to emit a spurious
+    // `stored output size mismatch: expected <last-ISIZE>, got <member1-size>`
+    // and EMPTY output on files `gzip -dc` decodes fine). The router now catches
+    // this shape up front (`classify_gzip` dominant-first detection at every T),
+    // so this is defense-in-depth for any residual mis-route.
     if prefix_out > expected_size {
-        return Err(StoredSplitError::SizeMismatch {
-            expected: expected_size,
-            actual: prefix_out,
-        });
+        return Err(StoredSplitError::NotStoredDominated);
     }
 
     // The ISA-L bulk per-block decoder (`lut_bulk_inflate`) is available exactly
