@@ -2344,13 +2344,30 @@ pub(crate) fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>>
 
     let header_size = crate::decompress::format::parse_gzip_header_size(data).unwrap_or(10);
     let mut starts = vec![0usize];
-    let mut pos = header_size + 1;
 
-    while pos + 10 < data.len() {
-        if data[pos] == 0x1f
-            && data[pos + 1] == 0x8b
-            && data[pos + 2] == 0x08
-            && data[pos + 3] & 0xE0 == 0
+    // SIMD magic-byte search (memchr::memmem) instead of a byte-by-byte linear
+    // scan. This is a T-invariant SERIAL pass over the WHOLE compressed file that
+    // ran BEFORE any parallel dispatch, so on a large compressible-dominant
+    // multi-member stream it was ~50% of the T16 wall (Amdahl). memmem vectorizes
+    // the 3-byte magic search (~10× the byte-loop throughput) for an identical
+    // `starts` list — every candidate is re-validated by the same ISIZE + flag
+    // predicate below, so the output is byte-for-byte unchanged.
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
+    let finder = memchr::memmem::Finder::new(GZIP_MAGIC);
+    let mut search_from = header_size + 1;
+    while search_from + 10 < data.len() {
+        let Some(rel) = finder.find(&data[search_from..]) else {
+            break;
+        };
+        let pos = search_from + rel;
+        // Replicate the byte-loop guard exactly: positions whose full 10-byte
+        // header window would run past EOF were never inspected. Matches are
+        // returned left-to-right, so once one crosses that bound every later one
+        // does too — stop.
+        if pos + 10 >= data.len() {
+            break;
+        }
+        if data[pos + 3] & 0xE0 == 0
             // Validate preceding ISIZE field (same heuristic as is_likely_multi_member).
             // Filters false positives from stored-block streams where raw bytes appear
             // verbatim and can accidentally match the gzip magic sequence.
@@ -2364,7 +2381,7 @@ pub(crate) fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>>
         {
             starts.push(pos);
         }
-        pos += 1;
+        search_from = pos + 1;
     }
 
     if starts.len() < 2 {
@@ -2461,6 +2478,7 @@ pub(crate) fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>>
 /// output reserve from (§5a). Content-derived from the header/footer scan; a
 /// wrapped ISIZE only under-sizes the reserve (grow-safe), never a correctness
 /// risk.
+#[allow(dead_code)] // reserve-hint helper; grid driver now uses the grow-safe 8× fallback
 pub(crate) fn sum_member_isize(members: &[BgzfBlock]) -> u64 {
     members.iter().map(|m| m.isize as u64).sum()
 }
