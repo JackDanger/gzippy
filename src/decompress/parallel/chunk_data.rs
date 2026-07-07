@@ -99,6 +99,18 @@ pub struct ChunkConfiguration {
     /// (ISIZE wraps). That is safe — the initial just under-sizes and the
     /// GROW_BYTES loop fills the gap incrementally with no correctness risk.
     pub expansion_ratio_ceil: u16,
+    /// STAGE-2d MULTI-MEMBER GRID: when true, every decode arm walks gzip
+    /// member boundaries (footer consume → next header → empty-window reset →
+    /// continue) instead of stopping at the member's final BFINAL. Set ONLY by
+    /// the whole-file grid driver
+    /// ([`crate::decompress::parallel::sm_driver::read_parallel_sm_grid`]); the
+    /// single-member driver leaves it `false`, so the single-member decode is
+    /// byte-identical (the `MULTI_MEMBER=false` const-generic instantiation is
+    /// selected and the continuation branch compiles out). The flag is read at
+    /// the three native decode entry points to pick the `::<true>` vs `::<false>`
+    /// specialization of `decode_chunk_unified_marker` /
+    /// `finish_decode_chunk_contig_native`.
+    pub multi_member: bool,
 }
 
 impl Default for ChunkConfiguration {
@@ -111,6 +123,7 @@ impl Default for ChunkConfiguration {
             window_sparsity: true,
             window_compression_type: None,
             expansion_ratio_ceil: 0, // unknown — falls back to 8× in finish_decode_chunk_isal_oracle
+            multi_member: false,
         }
     }
 }
@@ -2265,7 +2278,18 @@ impl MemberVerifier {
         }
 
         // ── Step 2: combine the leading segment onto the open member ────────
+        // Output byte order within segment 0 is (narrowed marker bytes | clean
+        // data). The worker CRC's the clean `data` into `crc32s[0]` at decode
+        // time but CANNOT CRC the unresolved u16 markers; their resolved-byte
+        // CRC is computed post-marker-replacement into `narrowed_crc`. Vendor
+        // credits that marker-prefix CRC to `crc32s.front()` (design §4;
+        // markers are confined before the first footer, §3.3), so we fold
+        // `narrowed_crc` FIRST, then `crc32s[0]`, matching output order. On a
+        // clean (markerless) chunk `narrowed_crc` is the empty (zero-length)
+        // CRC and `append` is a no-op, so this is byte-identical for the
+        // synthetic-ChunkData unit tests and the single-member-shaped chunks.
         if self.crc_enabled {
+            self.member_crc.append(&chunk.narrowed_crc);
             self.member_crc.append(&chunk.crc32s[0]);
         }
         self.member_size += sizes[0];

@@ -171,6 +171,8 @@ fn read_parallel_sm_inner<W: std::io::Write>(
             Some(CompressionType::None)
         },
         expansion_ratio_ceil,
+        // Single-member driver: never walk member boundaries.
+        multi_member: false,
     };
 
     // Phase-timing: gzip envelope (header+footer) parsed + chunk config built.
@@ -511,6 +513,116 @@ pub fn read_parallel_sm_resume_multi<W: std::io::Write>(
     }
     skip.flush()
         .map_err(|_| ReadParallelSmError::InvalidFormat)?;
+
+    Ok(ReadResult {
+        total_crc: 0,
+        total_size,
+    })
+}
+
+/// Counts production `MultiMemberGrid` decodes (a SINGLE whole-file chunk grid
+/// spanning every member — the rapidgzip-faithful cross-member port, NOT the
+/// member-walk). Deletion-trap discipline: a routing test asserts this advances
+/// on a dominant/uneven multi-member decode and stays 0 for single-member.
+#[cfg(parallel_sm)]
+pub static MULTI_MEMBER_GRID_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Production entry for [`crate::decompress::DecodePath::MultiMemberGrid`]:
+/// decode a multi-member gzip stream as ONE whole-file chunk grid so the
+/// dominant member's deflate blocks spread across ALL workers (instead of the
+/// member-walk's one-worker-per-member plateau). The whole file (minus only the
+/// FIRST member's gzip header) is handed to the SAME parallel chunk pipeline
+/// used for single-member; `ChunkConfiguration::multi_member = true` makes every
+/// decode arm walk member boundaries (footer → next header → empty-window reset →
+/// continue), and the consumer runs the per-member CRC32 + ISIZE verifier
+/// (`MemberVerifier`, design §4) over resolved chunks in decode order. Byte-exact
+/// and per-member verified; pure-Rust; no C-FFI.
+///
+/// Faithful to rapidgzip's `GzipChunkFetcher` cross-member continuation: the
+/// finder spans the whole file (chunk 0 starts at the first member's first
+/// deflate block, i.e. bit 0 of the header-stripped slice), and chunks that
+/// straddle a member boundary continue into the next member rather than stopping
+/// at its final BFINAL.
+#[cfg(parallel_sm)]
+pub fn read_parallel_sm_grid<W: std::io::Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    parallelization: usize,
+    target_compressed_chunk_bytes: usize,
+) -> Result<ReadResult, ReadParallelSmError> {
+    use crate::decompress::parallel::chunk_data::ChunkConfiguration;
+    use crate::decompress::parallel::chunk_fetcher;
+    use crate::decompress::parallel::compressed_vector::CompressionType;
+    use crate::decompress::parallel::gzip_format;
+
+    MULTI_MEMBER_GRID_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Slab auto-gate input (same as the single-member driver).
+    crate::decompress::parallel::rpmalloc_alloc::set_decode_threads(parallelization);
+
+    // Strip ONLY the first member's gzip header. Everything after (all member
+    // bodies, interior footers+headers, and the FINAL member's footer) stays in
+    // the slice: `decode_chunk_*_multi` consumes interior footers/headers and
+    // clean-stops at EOF after the last member's footer (§3.1/§3.2). Chunk 0
+    // therefore starts at bit 0 of this slice with an empty window — identical
+    // to the single-member chunk 0.
+    let (_hdr, header_size) =
+        gzip_format::read_header(gzip_data).map_err(|_| ReadParallelSmError::InvalidHeader)?;
+    if gzip_data.len() < header_size + 8 {
+        return Err(ReadParallelSmError::InvalidFormat);
+    }
+    let input = &gzip_data[header_size..];
+
+    // Σ-based expansion ratio (§5a): `ceil(Σ isize × 1.25 / total_compressed)`,
+    // minimum 2; 0 = unknown → 8× fallback. Σ isize comes from the member
+    // distribution scan (byte-cheap header/footer walk); total_compressed is the
+    // whole file. A wrapped/lying ISIZE only affects reserve SIZING (grow-safe),
+    // never correctness (per-member CRC/ISIZE is the oracle).
+    let expansion_ratio_ceil: u16 = {
+        match crate::decompress::bgzf::scan_member_boundaries_fast(gzip_data) {
+            Some(members) if !members.is_empty() => {
+                let total_isize: u64 = crate::decompress::bgzf::sum_member_isize(&members);
+                let compressed_bytes = gzip_data.len() as u64;
+                if compressed_bytes == 0 || total_isize == 0 {
+                    0
+                } else {
+                    let numer = total_isize.saturating_mul(5);
+                    let denom = compressed_bytes.saturating_mul(4);
+                    numer.div_ceil(denom).max(2).min(u16::MAX as u64) as u16
+                }
+            }
+            _ => 0,
+        }
+    };
+
+    let sparsity = window_sparsity_kill_switch();
+    let configuration = ChunkConfiguration {
+        split_chunk_size: target_compressed_chunk_bytes,
+        max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
+        crc32_enabled: !crate::decompress::parallel::removal_oracle::crc_off_enabled(),
+        window_sparsity: sparsity,
+        window_compression_type: if sparsity {
+            None
+        } else {
+            Some(CompressionType::None)
+        },
+        expansion_ratio_ceil,
+        // THE grid flag: every decode arm walks member boundaries; the consumer
+        // runs per-member CRC32 + ISIZE verification.
+        multi_member: true,
+    };
+
+    // Drive the whole-file grid. Per-member CRC32 + ISIZE are verified INSIDE
+    // the consumer (`MemberVerifier`), which returns a terminal error on any
+    // member mismatch or a torn final member — so there is NO single-trailer
+    // check here (a multi-member stream has one trailer PER member, not one
+    // global trailer). `total_crc` is the whole-output rolling CRC and is
+    // intentionally NOT compared to any single trailer.
+    let (_total_crc, total_size) =
+        chunk_fetcher::drive(input, writer, out_fd, parallelization, configuration)
+            .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
     Ok(ReadResult {
         total_crc: 0,

@@ -2451,11 +2451,20 @@ pub(crate) fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>>
 /// paths, never between correctness levels. `EPS` is a plain named constant (no
 /// production env knob) locked by the box-side OQ-2 gate.
 ///
-/// STAGE-2 status: BUILT AND UNIT-TESTED but not yet wired into `classify_gzip`
-/// (the routing flip is a stage-2b action gated on the whole-file grid — see
-/// the note in `crate::decompress::classify_gzip`). `allow(dead_code)` until
-/// then; removing the attribute is the stage-2b wiring checklist item.
-#[allow(dead_code)]
+/// STAGE-2d: WIRED into `classify_gzip` — a plain multi-member T>1 stream routes
+/// to [`crate::decompress::DecodePath::MultiMemberGrid`] when this returns
+/// `false` (dominant/uneven ⇒ the whole-file chunk grid spreads the dominant
+/// member across all workers) and to `MultiMemberPar` (member-per-worker) when
+/// it returns `true` (numerous + balanced).
+/// Σ of member uncompressed sizes (ISIZE mod 2³²) — the numerator of the
+/// whole-file expansion ratio the multi-member GRID driver sizes its per-chunk
+/// output reserve from (§5a). Content-derived from the header/footer scan; a
+/// wrapped ISIZE only under-sizes the reserve (grow-safe), never a correctness
+/// risk.
+pub(crate) fn sum_member_isize(members: &[BgzfBlock]) -> u64 {
+    members.iter().map(|m| m.isize as u64).sum()
+}
+
 pub(crate) fn fast_path_ok(members: &[BgzfBlock], t_eff: usize) -> bool {
     /// Slack on a member's cost over one worker's fair share (`Σcost / t_eff`)
     /// that still counts as "not dominant". Absorbs the integer granularity of

@@ -252,7 +252,12 @@ fn classify_single_member_t4() {
 fn classify_multi_member_t1_vs_t4() {
     let compressed = multi_member_gzip(&[&make_text(10_000), &make_text(10_000)]);
     assert_eq!(gzippy::classify(&compressed, 1), DecodePath::MultiMemberSeq);
-    assert_eq!(gzippy::classify(&compressed, 4), DecodePath::MultiMemberPar);
+    // STAGE-2d: 2 members at T4 → fewer members than workers, so member-per-worker
+    // cannot saturate the pool (fast_path_ok false) → the whole-file grid.
+    assert_eq!(
+        gzippy::classify(&compressed, 4),
+        DecodePath::MultiMemberGrid
+    );
 }
 
 #[test]

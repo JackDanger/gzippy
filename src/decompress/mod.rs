@@ -80,6 +80,16 @@ pub enum DecodePath {
     /// rapidgzip-faithful whole-file-block-finder cross-member port, not this
     /// member-walk shortcut — see the gate-phase plan.
     MultiMemberChunked,
+    /// STAGE-2d whole-file MULTI-MEMBER GRID: a plain multi-member stream decoded
+    /// as ONE chunk grid spanning every member (the rapidgzip-faithful
+    /// cross-member port), so a DOMINANT member's deflate blocks spread across
+    /// ALL workers instead of pinning one worker (the `MultiMemberPar`
+    /// member-per-worker plateau) or spinning up a per-member pipeline (the
+    /// regressing `MultiMemberChunked` member-walk). Selected by
+    /// [`crate::decompress::bgzf::fast_path_ok`] for dominant/uneven size
+    /// distributions at T>1. Per-member CRC32 + ISIZE verified; pure-Rust. See
+    /// [`crate::decompress::parallel::single_member::decompress_multi_member_grid`].
+    MultiMemberGrid,
     MultiMemberSeq,
     ParallelSM,
     /// Stored-block-dominated (incompressible) single-member, decoded in
@@ -166,26 +176,34 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         // Plain multi-member streams keep the member-per-worker split
         // ([`MultiMemberPar`]) at T>1 / sequential at T1.
         //
-        // STAGE-2 STATUS (design §1.2 / [R1-#8]): the routing predicate
-        // [`crate::decompress::bgzf::fast_path_ok`] (greedy-LPT/dominance sim
-        // over member sizes) is BUILT AND UNIT-TESTED, but it is NOT wired to
-        // flip production routing yet. Routing dominant/few-member distributions
-        // to today's [`MultiMemberChunked`] body — the per-member MEMBER-WALK —
-        // was MEASURED to REGRESS on M1 (per-member pipeline spinup + thread
-        // oversubscription at high T; few-large T8 156ms chunked vs 45ms
-        // member-per-worker), and that revert is locked by
-        // `tests::multi_member_chunked` (uneven/balanced/few_large ⇒
-        // MultiMemberPar). The flip is a STAGE-2b action: it becomes correct
-        // and non-regressing only once `MultiMemberChunked` IS the
-        // rapidgzip-faithful whole-file block-finder cross-member GRID (one
-        // pool, one chunk grid spanning members), at which point
-        // `fast_path_ok` selects it for dominant streams, gated box-side
-        // (OQ-1/OQ-2, stage 3). Until then the predicate stays dead-code-ready.
-        return if num_threads > 1 {
-            DecodePath::MultiMemberPar
-        } else {
-            DecodePath::MultiMemberSeq
-        };
+        // STAGE-2d: the routing predicate [`crate::decompress::bgzf::fast_path_ok`]
+        // (greedy-LPT/dominance sim over member sizes) IS NOW WIRED. At T>1 the
+        // member-size distribution decides:
+        //   - fast_path_ok == true  (numerous + balanced): member-per-worker
+        //     [`MultiMemberPar`] — each worker gets ~one member; a whole-file
+        //     grid's cross-member bookkeeping would be pure overhead.
+        //   - fast_path_ok == false (dominant/uneven/few): the whole-file
+        //     [`MultiMemberGrid`] — ONE chunk grid spanning members so a dominant
+        //     member's deflate blocks spread across ALL workers. This is the
+        //     rapidgzip-faithful cross-member port, DISTINCT from the regressing
+        //     member-walk [`MultiMemberChunked`] (which is never routed here).
+        // T1 stays sequential. NOTE: `MultiMemberGrid` requires the parallel-SM
+        // engine; on the legacy non-parallel_sm build it is unavailable, so route
+        // to `MultiMemberPar` there (its dispatch falls back to sequential).
+        if num_threads <= 1 {
+            return DecodePath::MultiMemberSeq;
+        }
+        #[cfg(parallel_sm)]
+        {
+            if let Some(members) = crate::decompress::bgzf::scan_member_boundaries_fast(data) {
+                if !members.is_empty()
+                    && !crate::decompress::bgzf::fast_path_ok(&members, num_threads)
+                {
+                    return DecodePath::MultiMemberGrid;
+                }
+            }
+        }
+        return DecodePath::MultiMemberPar;
     }
     // SINGLE-MEMBER. The pure-Rust ParallelSM pipeline is the SOLE single-member
     // decode path at every thread count and size — NO C-FFI one-shot (libdeflate /
@@ -197,6 +215,35 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     // parallel decoder (also pure-Rust). It re-validates and, if not actually
     // 100% stored, dispatch falls back to the pure-Rust marker pipeline (see
     // `decompress_single_member_for`).
+    // STAGE-2d DOMINANT-FIRST MULTI-MEMBER DETECTION. `is_likely_multi_member`
+    // only scans the first 16 MiB, so a multi-member stream whose FIRST member is
+    // larger than that (e.g. an 85%-dominant member) is misclassified as
+    // single-member and would take ParallelSM, decode member 1 as one deflate
+    // stream, fail at member 1's footer, and fall back to the member-walk resume
+    // — which does NOT scale (measured plateau). Detect it here and route to the
+    // whole-file GRID instead.
+    //
+    // The full-file boundary scan is O(file) and must NOT run on genuine
+    // single-member decodes. Cheap gate: the trailing member's ISIZE (last 4
+    // bytes) is FAR smaller than the whole file ⇒ there is a small trailing
+    // member ⇒ worth the scan. A single-member file's ISIZE is its whole
+    // (typically larger-than-compressed) output, so `last_isize < len/2` is false
+    // and the scan is skipped — single-member routing/latency is unchanged.
+    #[cfg(parallel_sm)]
+    if num_threads > 1 {
+        let last_isize = read_gzip_isize(data).unwrap_or(u32::MAX) as u64;
+        if last_isize < (data.len() as u64) / 2 {
+            if let Some(members) = crate::decompress::bgzf::scan_member_boundaries_fast(data) {
+                if members.len() > 1 {
+                    return if crate::decompress::bgzf::fast_path_ok(&members, num_threads) {
+                        DecodePath::MultiMemberPar
+                    } else {
+                        DecodePath::MultiMemberGrid
+                    };
+                }
+            }
+        }
+    }
     let _ = num_threads;
     if parallel_sm_unprofitable(data)
         && crate::decompress::parallel::stored_split::first_block_is_stored(data)
@@ -286,6 +333,9 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
         DecodePath::MultiMemberChunked => {
             decompress_multi_member_chunked(data, writer, num_threads)
         }
+        DecodePath::MultiMemberGrid => {
+            decompress_multi_member_grid(data, writer, None, num_threads)
+        }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
         DecodePath::ParallelSM | DecodePath::StoredParallel => {
             decompress_single_member_for(path, data, writer, None, num_threads)
@@ -320,6 +370,36 @@ fn decompress_multi_member_chunked<W: Write>(
     }
 }
 
+/// Dispatch a [`DecodePath::MultiMemberGrid`] stream: the whole multi-member
+/// file is decoded as ONE chunk grid spanning every member (the whole-file
+/// rapidgzip-faithful cross-member port), streaming with the zero-copy `out_fd`
+/// path when available and running per-member CRC32 + ISIZE verification inside
+/// the consumer. On the legacy non-`parallel_sm` build the grid engine is
+/// unavailable, so this falls back to the sequential member-by-member walk
+/// (still correct, just not parallel).
+fn decompress_multi_member_grid<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    #[cfg(parallel_sm)]
+    {
+        crate::decompress::parallel::single_member::decompress_multi_member_grid(
+            data,
+            writer,
+            out_fd,
+            num_threads.max(1),
+        )
+        .map_err(|e| GzippyError::decompression(format!("multi-member grid: {e}")))
+    }
+    #[cfg(not(parallel_sm))]
+    {
+        let _ = (num_threads, out_fd);
+        decompress_multi_member_sequential(data, writer)
+    }
+}
+
 /// Like [`decompress_single_member`] but threads an output fd for zero-copy
 /// `writev` on the parallel-SM consumer path (file/stdout sinks).
 pub(crate) fn decompress_single_member_fd<W: Write>(
@@ -340,6 +420,9 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
     match path {
         DecodePath::MultiMemberChunked => {
             decompress_multi_member_chunked(data, writer, num_threads)
+        }
+        DecodePath::MultiMemberGrid => {
+            decompress_multi_member_grid(data, writer, out_fd, num_threads)
         }
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
@@ -427,6 +510,9 @@ pub(crate) fn decompress_single_member<W: Write>(
         // `-p1` audit: `cat a.gz a.gz | gzippy -d -p1` produced 0 bytes.)
         DecodePath::MultiMemberChunked => {
             decompress_multi_member_chunked(data, writer, num_threads)
+        }
+        DecodePath::MultiMemberGrid => {
+            decompress_multi_member_grid(data, writer, None, num_threads)
         }
         DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
             decompress_multi_member_sequential(data, writer)
