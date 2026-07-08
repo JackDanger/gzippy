@@ -1,0 +1,5 @@
+M1 storedheavy gz@dfa67ccc vs rapidgzip 0.16 (ns-timer, interleaved N=15, byte-exact):
+T1: gz20ms rg82ms ratio4.05 PASS(gz wins)
+T4: gz17ms rg48ms ratio2.87 PASS
+T8: gz14ms rg42ms ratio3.10 PASS
+=> storedheavy loss is AMD-Zen2-SPECIFIC; gz dominates M1 (rg has no ISA-L on aarch64).

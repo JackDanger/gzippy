@@ -1,0 +1,41 @@
+### RUNNING silesia T1 22:00:16
+SCORE: amd-zen2-linux t1 silesia | native=1.17 PASS | isal=1.17 PASS | rg=598ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING silesia T4 22:01:33
+SCORE: amd-zen2-linux t4 silesia | native=0.99 PASS | isal=0.98 FAIL | rg=313ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=BIMODAL,lever=none
+### RUNNING silesia T8 22:02:41
+SCORE: amd-zen2-linux t8 silesia | native=0.98 FAIL | isal=0.96 FAIL | rg=275ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=NOISY,lever=none
+### RUNNING silesia T16 22:03:47
+SCORE: amd-zen2-linux t16 silesia | native=1.07 PASS | isal=1.05 PASS | rg=301ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING nasa T1 22:04:54
+SCORE: amd-zen2-linux t1 nasa | native=1.52 PASS | isal=1.50 PASS | rg=441ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING nasa T4 22:06:01
+SCORE: amd-zen2-linux t4 nasa | native=1.04 PASS | isal=1.05 PASS | rg=304ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING nasa T8 22:07:06
+SCORE: amd-zen2-linux t8 nasa | native=1.02 PASS | isal=1.02 PASS | rg=297ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING nasa T16 22:08:10
+SCORE: amd-zen2-linux t16 nasa | native=1.00 PASS | isal=1.01 PASS | rg=291ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING weights T1 22:09:15
+SCORE: amd-zen2-linux t1 weights | native=1.05 PASS | isal=1.06 PASS | rg=401ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING weights T4 22:09:56
+SCORE: amd-zen2-linux t4 weights | native=0.95 FAIL | isal=0.93 FAIL | rg=147ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=NOISY,lever=none
+### RUNNING weights T8 22:10:27
+SCORE: amd-zen2-linux t8 weights | native=0.99 PASS | isal=0.97 FAIL | rg=130ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=NOISY,lever=none
+### RUNNING weights T16 22:10:56
+SCORE: amd-zen2-linux t16 weights | native=0.99 FAIL | isal=0.97 FAIL | rg=132ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING logs T1 22:11:26
+SCORE: amd-zen2-linux t1 logs | native=1.24 PASS | isal=1.23 PASS | rg=522ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING logs T4 22:12:52
+SCORE: amd-zen2-linux t4 logs | native=0.98 FAIL | isal=1.00 PASS | rg=413ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING logs T8 22:14:16
+SCORE: amd-zen2-linux t8 logs | native=1.04 PASS | isal=1.03 PASS | rg=367ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=NOISY,lever=none
+### RUNNING logs T16 22:15:38
+SCORE: amd-zen2-linux t16 logs | native=1.06 PASS | isal=1.09 PASS | rg=365ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T1 22:17:00
+SCORE: amd-zen2-linux t1 storedheavy | native=1.12 PASS | isal=1.12 PASS | rg=152ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T4 22:17:31
+SCORE: amd-zen2-linux t4 storedheavy | native=0.94 FAIL | isal=0.93 FAIL | rg=119ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T8 22:18:03
+SCORE: amd-zen2-linux t8 storedheavy | native=0.96 FAIL | isal=0.96 FAIL | rg=125ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T16 22:18:34
+SCORE: amd-zen2-linux t16 storedheavy | native=0.94 FAIL | isal=0.95 FAIL | rg=131ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### MATRIX DONE 22:19:06

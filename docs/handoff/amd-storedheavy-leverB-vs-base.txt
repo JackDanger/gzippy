@@ -1,0 +1,19 @@
+SCORE: amd-zen2-linux t16 storedheavy | native=0.87 FAIL | isal=N/A (native-only build) | rg=135ms | N=15 frozen 2026-07-07 | blind:src=947e7e7d,dist=RESOLVED,lever=islands
+bar: ">=0.99 ratio = PASS"
+    ratio: 1.00
+    ratio: 0.87
+## fulcrum score — 2-way interleaved capture (N=15, mask=0-15)
+## warmup (dropped): native=156ms rg=143ms
+## i=1: native=159ms rg=141ms sha=OK
+## i=2: native=157ms rg=142ms sha=OK
+## i=3: native=156ms rg=136ms sha=OK
+## i=4: native=155ms rg=138ms sha=OK
+--- baseline storedheavy ---
+### RUNNING storedheavy T1 22:17:00
+SCORE: amd-zen2-linux t1 storedheavy | native=1.12 PASS | isal=1.12 PASS | rg=152ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T4 22:17:31
+SCORE: amd-zen2-linux t4 storedheavy | native=0.94 FAIL | isal=0.93 FAIL | rg=119ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T8 22:18:03
+SCORE: amd-zen2-linux t8 storedheavy | native=0.96 FAIL | isal=0.96 FAIL | rg=125ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
+### RUNNING storedheavy T16 22:18:34
+SCORE: amd-zen2-linux t16 storedheavy | native=0.94 FAIL | isal=0.95 FAIL | rg=131ms | N=15 frozen 2026-07-07 | blind:src=dfa67ccc,dist=RESOLVED,lever=none
