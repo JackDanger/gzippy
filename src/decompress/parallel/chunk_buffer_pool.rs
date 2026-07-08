@@ -147,6 +147,23 @@ pub fn drain_pools_for_test() {
     }
 }
 
+/// Latched true once any parallel-grid worker binds. ONLY the T>1 grid spawns
+/// `ThreadPool` workers (`worker_main` → [`bind_worker_pool_index`]); the thin-T1
+/// serial path never does. It signals that the small UNPINNED per-worker
+/// output-buffer reuse pool is armed for this run — see
+/// [`manual_buffer_pool_enabled`].
+static GRID_POOL_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True once the T>1 parallel grid is active. Read by BOTH the worker threads
+/// (which `take_*`) and the consumer/driver thread (which `return_*` at recycle
+/// time) so the warm-capacity LIFO fills and drains — unlike a per-thread
+/// worker-index check, which the consumer-side recycle would see as `None`,
+/// starving the pool.
+#[inline]
+fn grid_pool_armed() -> bool {
+    GRID_POOL_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Called once per `ThreadPool` worker thread on entry to `worker_main`,
 /// after core pinning and before any decode task runs.
 pub fn bind_worker_pool_index(index: usize) {
@@ -154,6 +171,8 @@ pub fn bind_worker_pool_index(index: usize) {
         index < MAX_WORKERS,
         "worker index {index} exceeds MAX_WORKERS {MAX_WORKERS}"
     );
+    // Arm the small unpinned per-worker reuse pool for this T>1 run. Idempotent.
+    GRID_POOL_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
     WORKER_POOL_INDEX.with(|c| c.set(Some(index.min(MAX_WORKERS - 1))));
 }
 
@@ -202,7 +221,14 @@ fn t1_resident_scope_active() -> bool {
 }
 
 fn manual_buffer_pool_enabled() -> bool {
-    t1_resident_scope_active()
+    // T1: `t1_resident_scope_active` (manual pool + resident 64 MiB pin, scoped
+    // to the serial thread). T>1: `grid_pool_armed` turns on the manual LIFO's
+    // warm-capacity reuse WITHOUT arming `resident_output_pool_enabled` — so the
+    // grid reuses each worker's already-faulted output pages (avoiding the
+    // first-touch page-zeroing storm on incompressible data) but keeps the
+    // ratio-informed per-chunk reserve, never the resident 64 MiB pin that
+    // regressed wall+RSS at T>1 in 7065e1e8.
+    t1_resident_scope_active() || grid_pool_armed()
 }
 
 /// FORM-B RSS FIX — eager per-chunk page release at recycle time.
