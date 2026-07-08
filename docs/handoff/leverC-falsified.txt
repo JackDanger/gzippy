@@ -1,0 +1,4 @@
+LEVER C (unpinned buffer reuse, 3219f0f5) PERF GATE — AMD Zen2, fulcrum score N=15, byte-exact:
+storedheavy T1=1.11 PASS / T4=0.95 FAIL / T8=0.96 FAIL / T16=0.92 FAIL (baseline 1.15/0.94/0.96/0.94)
+silesia T4=0.98 (noisy) / nasa T4=1.04 PASS (win cells held)
+=> NO EFFECT on storedheavy. FALSIFIED. The 18% alloc-storm perf-share was SLACK not critical-path (share!=wall). Both storedheavy levers now ruled out: Lever B (reroute) REGRESSED, Lever C (alloc-reuse) NO-EFFECT.

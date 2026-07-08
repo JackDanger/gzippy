@@ -125,39 +125,44 @@ page-zeroing** (`do_anonymous_page`/`clear_page_rep`, ~18% of perf samples) is t
 faulted once. gz WINS storedheavy T1 (1.15) → this is **parallel overhead, not a kernel
 deficit**.
 
-### Falsification ledger (DO NOT re-attempt these):
-- **Lever B — reroute storedheavy to the stored-stream path** (`perf-storedheavy-islands`,
-  now deleted): **FALSIFIED** — regressed every cell (T1 1.15→0.72). storedheavy is NOT
-  stored-throughout; it's an 8.6% stored *prefix* then mostly Huffman blocks. **The
-  baseline demote-to-grid is CORRECT.** (This is where the confounded-locate lesson came
-  from.)
-- **Pinned resident buffer pool at T>1** (`7065e1e8`): **FALSIFIED** earlier — +5-16%
-  wall / +9-76% RSS. Do NOT pin a large reserve.
+### Falsification ledger — BOTH obvious levers are RULED OUT by the gate. DO NOT re-attempt:
+- **Lever B — reroute storedheavy to the stored-stream path** (deleted): **FALSIFIED** —
+  regressed every cell (T1 1.15→0.72). storedheavy is NOT stored-throughout; it's an 8.6%
+  stored *prefix* then mostly Huffman blocks. **The baseline demote-to-grid is CORRECT.**
+  (Its "locate" was confounded — compared different data on different paths. The gate caught it.)
+- **Lever C — small unpinned per-worker buffer reuse at T>1** (`3219f0f5`, deleted):
+  **FALSIFIED (NO EFFECT)** — fulcrum score N=15: storedheavy T4/8/16 = 0.95/0.96/0.92
+  (baseline 0.94/0.96/0.94), unchanged, T16 slightly worse; win cells held. **KEY LESSON:
+  the perf profile's "18% alloc-storm" (page-fault samples) was SLACK, not the critical
+  path — reducing it did NOT move the wall (share ≠ wall).** So the alloc is NOT the lever.
+  Result in `docs/handoff/leverC-falsified.txt`.
+- **Pinned resident buffer pool at T>1** (`7065e1e8`): FALSIFIED earlier — +5-16% wall /
+  +9-76% RSS. Do NOT pin a large reserve.
 
-### IMMEDIATE NEXT STEP → perf-gate Lever C
-**`Lever C` is BUILT + byte-verified but NOT YET PERF-GATED.** Branch
-**`origin/perf-storedheavy-poolreuse`** (commit `3219f0f5`, patch
-`scratchpad/leverC-poolreuse.patch`). It reuses **small UNPINNED** per-worker output
-buffers at T>1 (rapidgzip's model, distinct from the pinned form that regressed in
-7065e1e8) so pages stay faulted. Its own report: byte-differential passed (incl.
-incompressible fixtures T1/4/8/16), suite green both harnesses, no env knob, no split
-path.
+### IMMEDIATE NEXT STEP → a CLEAN RE-LOCATE (both alloc & routing are ruled out)
+The T≥4 deficit's true critical path is UNKNOWN — the two obvious causes (routing, alloc)
+are gate-falsified. Do NOT throw another blind lever. Per the LAW, the only valid next
+action is a **clean Gate-2 locate that changes ONE variable on the SAME `storedheavy`
+corpus**:
+1. Contrast gz **T1 (wins, 1.11–1.15)** vs gz **T4 (loses, 0.95)** — what does the
+   parallelization ADD that costs ~5%? (perf-diff the two on the real corpus; look at
+   scheduling / cross-chunk marker-resolution / per-chunk CRC / output-drain, NOT the
+   alloc which is now ruled out.)
+2. OR a causal perturbation: slow down a candidate region by a known factor and see if the
+   T4 wall responds proportionally (on critical path) or is flat (slack). This is the
+   discipline that would have avoided the Lever-B/C misses.
+3. Cross-check the profile contrast against rg: rg's T4 cost is ~30% `pread` input I/O +
+   `isal_inflate`; gz's is anon-alloc (ruled out) + memmove + filemap faults. The real
+   ~5% may be a fine-grained multi-factor efficiency gap (more copies / worse I/O overlap),
+   not one dominant lever — in which case it needs the hard "match ISA-L on incompressible
+   data" work, or is **accepted as a narrow arch-residual**.
 
-**Do this first:**
-1. On the AMD box, build `3219f0f5`, byte-check it decodes `/root/archive/storedheavy.gz`
-   == `gzip -dc`, then `fulcrum score` it vs rapidgzip on **storedheavy T4/T8/T16**
-   (must move toward ≥0.99) AND **silesia-T4 + nasa-T4 + storedheavy-T1** (must NOT
-   regress — this is the 7065e1e8 trap; a pool that helps incompressible can hurt
-   compressible).
-2. Also re-verify byte-exactness independently (differential + the parallel test harness
-   — reuse bugs are scheduling-nondeterministic).
-3. **If PASS both arches + byte-exact + no win-cell regression** → fast-forward merge
-   `3219f0f5` into `reimplement-isa-l`, re-score the full matrix, done with this front.
-4. **If it regresses the win cells** (7065e1e8 repeat) → FALSIFY it (delete the branch,
-   bank the falsification). Then storedheavy-AMD is an **accepted narrow arch-residual**:
-   gz wins it 3-4× on M1 and wins/ties everything else; matching x86 ISA-L's
-   incompressible-data throughput in pure-Rust is the hard "copy-floor" front and is not
-   worth a regression to the majority.
+**Honest status of this front:** gz WINS storedheavy at T1 on AMD (1.11) and DOMINATES it
+on M1 (3–4×); it loses AMD T4/8/16 by ~4–6% to rapidgzip's x86 ISA-L on incompressible
+data, and **two disciplined, gate-arbitrated levers failed to close it** (reroute
+regressed; alloc-reuse no-effect). This is the campaign's one hard residual. It is either a
+fine-grained ISA-L-parity problem (hard, arch-specific) or an accepted arch-dispatch
+residual — decide after the clean re-locate above, not by more blind levers.
 
 ---
 
