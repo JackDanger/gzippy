@@ -1,0 +1,13 @@
+CLEAN RE-LOCATE (perf stat, AMD Zen2, storedheavy T4, one-variable):
+  gz  = 308,315,928 instructions @ 0.93 IPC
+  rg  = 277,029,607 instructions @ 1.01 IPC
+  => gz executes +11% MORE INSTRUCTIONS than rg (instruction-bound, NOT alloc/routing).
+MECHANISM: gz grid decodes into a per-chunk buffer THEN copies buffer->sink (double pass);
+rapidgzip ISA-L does a leaner single memcpy. The ~5% wall deficit = this extra copy pass.
+BOTH prior levers missed because they targeted alloc (Lever C, no-effect) / routing (Lever B,
+regressed), not the COPY COUNT.
+TRUE LEVER (hard, byte-exactness-critical): eliminate the grid double-copy for stored runs
+WITHOUT breaking cross-chunk marker/window back-ref resolution (a stored chunk's bytes must
+stay visible in the 32KiB window for the next chunk's Huffman back-refs). Composer flagged
+this needs StoredRun metadata + window overrides (see the Lever-A analysis) — a real
+architectural change, not a quick lever. Corner corpus; gz wins it at T1 (AMD) + 3-4x (M1).

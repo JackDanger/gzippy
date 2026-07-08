@@ -139,11 +139,26 @@ deficit**.
 - **Pinned resident buffer pool at T>1** (`7065e1e8`): FALSIFIED earlier — +5-16% wall /
   +9-76% RSS. Do NOT pin a large reserve.
 
-### IMMEDIATE NEXT STEP → a CLEAN RE-LOCATE (both alloc & routing are ruled out)
-The T≥4 deficit's true critical path is UNKNOWN — the two obvious causes (routing, alloc)
-are gate-falsified. Do NOT throw another blind lever. Per the LAW, the only valid next
-action is a **clean Gate-2 locate that changes ONE variable on the SAME `storedheavy`
-corpus**:
+### RE-LOCATE DONE → the true mechanism is an INSTRUCTION SURPLUS (the grid double-copy)
+Clean measurement (perf stat, AMD-Zen2, storedheavy T4, `docs/handoff/storedheavy-relocate-instruction-surplus.txt`):
+**gz = 308M instructions @ 0.93 IPC vs rg = 277M @ 1.01 IPC → gz executes +11% MORE
+instructions than rapidgzip** on this corpus. The deficit is **instruction-bound, NOT the
+alloc (Lever C ruled out) and NOT routing (Lever B ruled out).** Mechanism: gz's grid
+decodes each chunk into a per-chunk output buffer THEN copies buffer→sink (a **double
+pass** over the ~100MB), while rapidgzip's ISA-L does a leaner single memcpy. That extra
+copy pass is the ~5% wall.
+
+**THE TRUE LEVER (open, hard, byte-exactness-critical):** eliminate the grid's second copy
+for stored runs — but a stored chunk's bytes must remain visible in the 32KiB sliding
+window for the NEXT chunk's Huffman back-references, so you cannot just skip the buffer.
+Composer's earlier "Lever A" analysis is the map: it needs `StoredRun` metadata on
+`ChunkData` + overrides to the window-build / output-iovec / per-chunk-CRC paths
+(`chunk_fetcher.rs` `publish_end_window_before_post_process`/`get_last_window`,
+`chunk_data.rs` `copy_window_at_chunk_offset`). This is a real architectural change (spawn
+an implementation agent + gate it), NOT a one-line lever. Given it's a corner corpus where
+gz already wins T1 (AMD) and 3–4× (M1), weigh it against **accepting the arch-residual**.
+
+If instead you want to re-confirm before building, the prior clean-Gate-2 options remain:
 1. Contrast gz **T1 (wins, 1.11–1.15)** vs gz **T4 (loses, 0.95)** — what does the
    parallelization ADD that costs ~5%? (perf-diff the two on the real corpus; look at
    scheduling / cross-chunk marker-resolution / per-chunk CRC / output-drain, NOT the
