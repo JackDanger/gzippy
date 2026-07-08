@@ -11,3 +11,15 @@ WITHOUT breaking cross-chunk marker/window back-ref resolution (a stored chunk's
 stay visible in the 32KiB window for the next chunk's Huffman back-refs). Composer flagged
 this needs StoredRun metadata + window overrides (see the Lever-A analysis) — a real
 architectural change, not a quick lever. Corner corpus; gz wins it at T1 (AMD) + 3-4x (M1).
+
+DEEPER PROFILE (instructions:u, gz storedheavy T4, kernel/page-fault excluded):
+  hot spots (stripped binary, addrs): ~14.5% in one decode fn (0x93236/0x9325b),
+  ~14% in another (0xf988e/0xf8357/0xf8361), + __memmove_avx 6% (the copy pass).
+  => the +11% surplus is in the CORE Huffman/stored decode loop + the buffer copy,
+  NOT in a redundant/skippable op. No safe one-line hand-edit exists.
+  TO PROCEED: rebuild gzippy with debug symbols (or `perf annotate`) to name those two
+  fns, then EITHER (a) eliminate the double-copy for stored runs (Composer Lever-A,
+  byte-exact-critical, needs an agent + full gate), OR (b) tighten the inner decode loop
+  toward ISA-L instruction-efficiency (the CLAUDE.md "fastest raw Huffman decoder" scope:
+  BMI2/asm/multi-literal). Both are multi-step, gated, agent-level efforts — NOT a quick
+  lever. gz already WINS this corpus at T1 (AMD 1.11-1.15) and 3-4x (M1).
