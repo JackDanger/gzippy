@@ -23,3 +23,16 @@ DEEPER PROFILE (instructions:u, gz storedheavy T4, kernel/page-fault excluded):
   toward ISA-L instruction-efficiency (the CLAUDE.md "fastest raw Huffman decoder" scope:
   BMI2/asm/multi-literal). Both are multi-step, gated, agent-level efforts — NOT a quick
   lever. gz already WINS this corpus at T1 (AMD 1.11-1.15) and 3-4x (M1).
+
+CORRECTION (debug-symbol reprofile, definitive): the DOUBLE-COPY hypothesis is OUT.
+Code already eliminated the pending_clean second copy (chunk_decode.rs:777,1050) and the
+writev is zero-copy (append_narrowed_iovecs). gz does ONE copy, same as rg's ISA-L. The
+debug profile shows decode fns <1%, memmove ~4%, malloc/free ~1.5%, rest = memory stalls.
+REAL MECHANISM = POOR T1->T4 PARALLEL SCALING on incompressible data: gz WINS T1 (135ms vs
+rg 152) but barely improves T4 (127ms) while rg scales to 119 => a SERIAL-BOUND region,
+not the copy. ~32 chunks / 4 threads = parallelism is NOT chunk-starved, so the serial part
+is elsewhere (candidates: in-order output drain/writev, block-finder scan, CRC combine).
+TRUE NEXT STEP (agent-gated): re-add TARGETED phase-timing (removed in the env-var cleanup)
+to isolate WHICH serial region dominates at T4, THEN build the specific lever. Do NOT
+hand-guess a lever — that is what falsified Lever B (routing) and Lever C (alloc). gz wins
+this corpus at T1 (AMD 1.11-1.15) + 3-4x (M1); the loss is AMD-Zen2 T>=4 scaling only.
