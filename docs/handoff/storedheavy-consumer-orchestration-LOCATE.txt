@@ -128,6 +128,31 @@ FINAL ELIMINATION MAP (all measured this session, robust to load):
   >= 0.99, no win-cell regression, byte-exact, both arches. This is a multi-cycle
   inner-loop campaign, not a quick lever.
 
+PINNED (2026-07-09, cursor-agent Composer + direct code evidence): the ~21ms
+consumer-idle gap is the consumer BLOCKING in `recv_post_process_blocking`
+(chunk_fetcher.rs:1660 and :1668, the vendor `wait.future_recv` span) — waiting for
+each chunk's MARKER-RESOLUTION / apply_window POST-PROCESS future to complete, in
+encoded order, while pumping successors. My drain RAII guard (0.2ms) MISSED this
+because the wait is in the consumer_loop body, NOT inside drain_one_pending. So the
+earlier "apply_window is cheap" read was measuring the wrong place: apply_window runs
+in the worker POST-PROCESS and the consumer serially waits for it here. => the
+storedheavy deficit IS the marker-resolution pipeline (worker apply_window throughput
++ the in-order serial dependency of window-absent speculative decode), NOT raw decode
+and NOT consumer CPU. This is the faithful u16-marker architecture cost; rg does the
+same apply_window (~0.113s traced) but overlaps/executes it more efficiently.
+  LEVER CLASS (to Gate-2 next): reduce apply_window/marker-resolution cost or improve
+  its overlap so the consumer's recv_post_process_blocking wait shrinks. For storedheavy
+  most chunk bytes are literals/stored with markers only near chunk starts — apply_window
+  may be scanning/copying more than the marker-bearing prefix. Confirm by perturbation,
+  then a targeted apply_window optimization; gate on fulcrum score both arches.
+
+TOOLING (user directive 2026-07-09: "build into Fulcrum, make it not guesswork"):
+the 7 throwaway phz*.py atomic hacks are being replaced by a committed instrument —
+a gzippy compile-time `phase-timing` feature (zero prod-path env knobs; feature OFF by
+default, mirrors coz_probe) emitting a structured phase record, consumed + Gate-0
+conservation-validated by a `fulcrum phasebreak` subcommand. Its first run DETERMIN-
+ISTICALLY confirms future_recv ~= 21ms (this locate becomes tool output, not narration).
+
 STATUS: EXHAUSTIVE deterministic elimination done — every consumer-side candidate
 falsified by measurement (decode-wait ratios, arc counters, drain RAII, and the
 decisive consumer_CPU<<wall). The storedheavy deficit is worker-decode-pipeline-bound;
