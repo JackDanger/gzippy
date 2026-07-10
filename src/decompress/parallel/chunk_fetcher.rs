@@ -653,8 +653,8 @@ fn drive_impl<W: std::io::Write>(
     #[cfg(feature = "phase-timing")]
     let phase_consumer_wall_ns = phase_t0.elapsed().as_nanos() as u64;
     #[cfg(feature = "phase-timing")]
-    let phase_consumer_cpu_ns = crate::decompress::parallel::phase_timing::thread_cpu_ns()
-        .saturating_sub(phase_cpu_t0);
+    let phase_consumer_cpu_ns =
+        crate::decompress::parallel::phase_timing::thread_cpu_ns().saturating_sub(phase_cpu_t0);
     #[cfg(feature = "phase-timing")]
     let phase_t1 = std::time::Instant::now();
 
@@ -824,6 +824,17 @@ fn drive_impl<W: std::io::Write>(
         eprintln!(
             "  StoredParallel pure-stored chunked-streaming runs (no monolithic buffer): {}",
             crate::decompress::parallel::stored_split::STORED_STREAM_RUNS.load(Ordering::Relaxed),
+        );
+        // Segmented stored walk (2026-07-10 lever): interleaved stored + Huffman
+        // islands (e.g. storedheavy.gz) kept on the parallel-copy path — stored
+        // runs streamed, only the tiny islands decoded in place. Non-zero +
+        // stored_demoted=0 is the witness that the segmented lever fired.
+        eprintln!(
+            "  StoredParallel segmented-stored runs / islands decoded: {} / {}",
+            crate::decompress::parallel::stored_split::STORED_SEGMENTED_RUNS
+                .load(Ordering::Relaxed),
+            crate::decompress::parallel::stored_split::STORED_SEGMENT_ISLANDS
+                .load(Ordering::Relaxed),
         );
         // Window-sparsity effect counter: always 0 — keepIndex=false faithful port
         // is the sole behavior now (the old always-on kill-switch was removed).

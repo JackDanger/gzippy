@@ -616,11 +616,19 @@ fn decompress_single_member_for<W: Write>(
             match decompress_stored_parallel(data, writer, num_threads) {
                 Ok(n) => {
                     if crate::utils::debug_enabled() {
+                        use std::sync::atomic::Ordering::Relaxed;
                         eprintln!(
                             "[gzippy] StoredParallel ok: {n} bytes; pure-stored chunked-streaming \
-                             runs (no monolithic buffer)={}",
+                             runs (no monolithic buffer)={}; segmented-stored runs={} islands={} \
+                             demoted={}",
                             crate::decompress::parallel::stored_split::STORED_STREAM_RUNS
-                                .load(std::sync::atomic::Ordering::Relaxed),
+                                .load(Relaxed),
+                            crate::decompress::parallel::stored_split::STORED_SEGMENTED_RUNS
+                                .load(Relaxed),
+                            crate::decompress::parallel::stored_split::STORED_SEGMENT_ISLANDS
+                                .load(Relaxed),
+                            crate::decompress::parallel::stored_split::STORED_DEMOTE_TO_PARALLEL_SM
+                                .load(Relaxed),
                         );
                     }
                     Ok(n)
