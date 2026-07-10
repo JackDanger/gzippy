@@ -67,6 +67,37 @@ NEXT DISCIPLINED STEP (Gate-2 owed BEFORE any lever — do not skip again):
   rapidgzip counterpart to study for a faithful-convergence version: how rg's
   GzipChunkFetcher::processNextChunk keeps consumer per-chunk work off the critical path.
 
-STATUS: measured locate banked; prior inner-loop pin retracted. Win state (all cells
->= 0.99) still UNMET on storedheavy T4/8/16 — but the campaign is now pointed at the
-RIGHT region by measurement, not at the decode kernel by inference.
+FOLLOW-UP (same session, 2026-07-09) — Gate-2 perturbation + Arc-ownership counters:
+  - ITERATION COUNT is TINY: the consumer processes only iters=34 (T4) / 40 (T8) /
+    192 (T16) CHUNKS, not ~3000 blocks. So the ~15-24ms remainder is a PER-CHUNK cost
+    of ~hundreds of us/chunk over a HANDFUL of large chunks (~3MB/chunk at T4,
+    ~520KB/chunk at T16), and it SCALES WITH CHUNK BYTES (~680us/3MB -> ~68us/520KB
+    ~= a per-byte op at ~5 GB/s). It is NOT x3000 per-block bookkeeping.
+  - CLONE HYPOTHESIS FALSIFIED by counters: arc_misses=0 at every T (arc_hits ~= iters,
+    arc_deferred 0-4). The consumer NEVER clones the multi-MB ChunkData
+    (SharedChunkData::take_or_clone always TAKES). So the per-chunk cost is NOT a clone.
+  - PERTURBATION (Gate-2, +20us/iter core-yielding sleep): at T16 (192 iters, ~12ms
+    clean injection) the wall moved ~+16ms and atconsumer ~+12ms -> ~proportional ->
+    consumer orchestration is ON the critical path at T16. At T4/T8 (34-40 iters) the
+    injection was too small (~2ms) to resolve against ~5ms wall noise -> INCONCLUSIVE
+    there; a bigger per-iter injection is needed to confirm T4/T8.
+  - CONTAMINATION CAVEAT: the AMD box runs the user's llama; raw atconsumer/wall are
+    NOT load-immune. The per-chunk remainder magnitude may include consumer-thread
+    DESCHEDULE (CPU contention), inflating it. The ROBUST results here are the RATIOS
+    and COUNTERS (decode_wait small & shrinking; arc_misses=0; drain/blockfind ~0),
+    which are contention-insensitive. The exact remainder attribution needs a CLEAN
+    (llama-paused, taskset-pinned) re-measure.
+
+  NARROWED BY ELIMINATION (robust): the storedheavy deficit is NOT the decode kernel
+  (workers keep up), NOT a per-chunk clone (misses=0), NOT apply_window/write (drain ~0),
+  NOT block-finding (~0). What REMAINS is the consumer's per-chunk POST-DECODE
+  processing (window application / output materialization over the chunk bytes) and/or
+  CPU-contention deschedule. NEXT: clean-box (llama-paused) re-measure to split real
+  consumer per-byte work from contention; time the specific post-decode step over the
+  chunk; only then a lever + fulcrum-score gate both arches.
+
+STATUS: measured locate banked; TWO mechanisms falsified by robust counters (decode
+kernel keeps up; consumer never clones). Search narrowed by elimination to consumer
+per-chunk post-decode processing (needs clean-box split from contention). Win state
+(all cells >= 0.99) still UNMET on storedheavy T4/8/16 — but the campaign is now
+pointed by measurement + elimination, not by inference.
