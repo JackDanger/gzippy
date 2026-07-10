@@ -1,0 +1,72 @@
+storedheavy AMD-Zen2 deficit — FINER CONSUMER-LOOP PHASE-TIMING (measured, 2026-07-09)
+=======================================================================================
+
+WHY THIS FILE: the prior handoff (leverD-overlap-FALSIFIED.txt) pinned the storedheavy
+T4/8/16 deficit to marker_inflate.rs:1424 (per-block window-absent stored-flip decode)
+by READING THE SOURCE. That was an unvalidated inference. This file is the DETERMINISTIC
+measurement that was owed — and it FALSIFIES that pin.
+
+INSTRUMENT: throwaway phase-timing added to chunk_fetcher.rs drive_impl + consumer_loop
++ drain_one_pending (scripts saved at $CLAUDE_JOB_DIR/tmp/phz{2,3,4}_instrument.py):
+  - drive_impl checkpoints:  setup (pool_size->consumer_loop call), atconsumer
+    (->thread_pool.stop), atfinalize (->block_finder.finalize).
+  - consumer_loop cumulative WAIT accumulators (atomic-ns):
+      decode_wait   = time stalled in block_fetcher.get_with_prefetch (waiting for a
+                      chunk to finish DECODING on a worker)
+      blockfind_wait= time stalled in block_finder.get (waiting for the next boundary)
+      drain         = RAII total time in drain_one_pending (apply_window rx.recv + write)
+  - box: AMD 10.0.2.240 (Zen2), clean tip dfa67ccc, release --features pure-rust-inflate,
+    corpus /root/archive/storedheavy.gz (100,016,878 B compressed, ratio ~0.99),
+    GZIPPY_FORCE_PARALLEL_SM=1, sink /dev/null. Wall via `date +%s.%N` (noisy ±5ms; the
+    INTERNAL distribution is the robust signal, not the absolute wall — fulcrum score
+    0.92/0.96/0.97 remains the frozen ratio authority).
+
+MEASURED DECOMPOSITION (3 runs/T; representative):
+  region                         T4        T8        T16      verdict
+  ------                         --        --        ---      -------
+  setup (block-find dispatch)    ~20us     ~20us     ~20us    negligible (async)
+  decode_wait                    ~6.5ms    ~5.4ms    ~3.6ms   small, SHRINKS with T -> workers keep up
+  drain (applyWin recv + write)  ~0.22ms   ~0.25ms   ~2.1ms   NEGLIGIBLE
+  blockfind_wait                 ~9us      ~10us     ~17us    negligible
+  REMAINDER (consumer orch.)     ~24ms     ~14ms     ~15ms    DOMINANT controllable serial cost
+  finalize (atfinalize-atcons)   ~2ms      ~4ms      ~3ms     small
+  flat external (wall-atfinal)   ~21ms     ~22ms     ~20ms    invariant to T; BOTH tools pay
+  ------                         --        --        ---
+  wall (noisy)                   ~54ms     ~47ms     ~44ms
+
+  REMAINDER := atconsumer - decode_wait - drain - blockfind. It is the consumer/main
+  thread's per-CHUNK orchestration between block_finder.get and drain: Arc::try_unwrap
+  hold-juggling, harvest_ready_postprocess + process_ready_prefetches bookkeeping run
+  EVERY iteration, ConsumerChunkHold construction/clone, window publish, post-process
+  submission. (Includes any consumer-thread deschedule while workers saturate cores.)
+
+WHAT THIS FALSIFIES / RULES OUT (measured, not reasoned):
+  - The decode kernel (marker_inflate.rs:1424 stored-flip / careful loop) is NOT the
+    wall lever: decode_wait is small AND shrinks with T -> the worker pool keeps up with
+    the consumer. A deep inner-loop rewrite there is the WRONG target. (Prior source-read
+    pin RETRACTED.)
+  - apply_window / marker-resolution / write are NOT the lever: drain is 0.2-2ms.
+  - Block-finding is NOT the lever: blockfind_wait ~= 0 (fully async, branchless scan).
+
+WHERE THE CONTROLLABLE COST ACTUALLY IS:
+  1. Consumer-thread per-chunk ORCHESTRATION (~14-24ms) — the largest movable region.
+  2. Flat ~20ms process/mmap/IO/teardown overhead (both tools pay; low leverage).
+  gz wins T1 and loses T4/8/16 by a few % (fulcrum 0.92/0.96/0.97). The gap to close is
+  small (~1-2ms of a ~44ms wall) and sits INSIDE region 1 — plenty of headroom there
+  (halving the ~15ms orchestration would over-close it), IF it is on the critical path.
+
+NEXT DISCIPLINED STEP (Gate-2 owed BEFORE any lever — do not skip again):
+  This locate is ATTRIBUTION (a self-consistent time-split), still a HYPOTHESIS about the
+  cause. Confirm the consumer orchestration is on the CRITICAL PATH by PERTURBATION:
+  inject a known per-iteration delay in the consumer loop body (a core-yielding sleep,
+  frequency-neutral) and measure the interleaved wall response — proportional => on the
+  path; flat => slack. ONLY if proportional, build the lever: cut per-chunk consumer
+  bookkeeping (e.g. hoist/skip harvest+process-prefetch when the pending queue is short;
+  avoid the Arc::try_unwrap clone path; batch window publish). Gate on fulcrum score
+  (storedheavy T4/8/16 >= 0.99, NO win-cell regression, byte-exact, BOTH arches).
+  rapidgzip counterpart to study for a faithful-convergence version: how rg's
+  GzipChunkFetcher::processNextChunk keeps consumer per-chunk work off the critical path.
+
+STATUS: measured locate banked; prior inner-loop pin retracted. Win state (all cells
+>= 0.99) still UNMET on storedheavy T4/8/16 — but the campaign is now pointed at the
+RIGHT region by measurement, not at the decode kernel by inference.
