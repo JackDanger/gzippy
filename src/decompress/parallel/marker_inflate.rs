@@ -2045,6 +2045,16 @@ impl Block {
                     }
                     $cur.consume(bit_count0);
 
+                    // Gate-2 Arm H (storedheavy sub-cause brief, `perturb`
+                    // feature, OFF by default): injected exactly here — AFTER
+                    // the litlen decode/consume completes, BEFORE the ring
+                    // write below — to test Huffman/bit-reader COMPUTE
+                    // sensitivity. See `perturb.rs`.
+                    #[cfg(feature = "perturb")]
+                    crate::decompress::parallel::perturb::maybe_inject(
+                        crate::decompress::parallel::perturb::ARM_H,
+                    );
+
                     // ── T3 MARKER-ILP LEVER #3: SPECULATIVE DIST-ENTRY PRELOAD ──
                     // Issue the FIRST-level distance table load NOW — right after
                     // the litlen `consume` shifts `$cur.bitbuf` so its low
@@ -2093,6 +2103,18 @@ impl Block {
                             (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
                         (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
                     }
+
+                    // Gate-2 Arm M (storedheavy sub-cause brief, `perturb`
+                    // feature, OFF by default): injected exactly here —
+                    // immediately AFTER the widened u16 ring store above — to
+                    // test u16-store memory-BANDWIDTH sensitivity, isolated
+                    // from the litlen compute tested by Arm H. See
+                    // `perturb.rs`.
+                    #[cfg(feature = "perturb")]
+                    crate::decompress::parallel::perturb::maybe_inject(
+                        crate::decompress::parallel::perturb::ARM_M,
+                    );
+
                     // ── T3 MARKER-ILP LEVER (branchless leading-literal count) ──
                     // Replaces the per-symbol `while remaining > 0` walk (a serial
                     // `s >>= 8` loop-carried chain + a data-dependent branch per

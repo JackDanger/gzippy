@@ -81,6 +81,13 @@ trace = []  # Enable decode tracing instrumentation
 # `fulcrum phasebreak`. NEVER in the default/CI feature set — diagnostic
 # only; zero effect on production decode bytes or timing.
 phase-timing = []
+# Gate-2 causal-perturbation instrument (storedheavy sub-cause brief,
+# 2026-07-09): injects a calibrated, env-selected delay at one of two named
+# sites in the worker marker-decode fast loop (`GZIPPY_PERTURB_ARM=H|M`,
+# `GZIPPY_PERTURB_NS=<u64>`) to discriminate compute-bound (H) vs
+# u16-store-bandwidth-bound (M) vs scheduling. OFF by default; every call
+# site is a true no-op without it. See `perturb.rs`.
+perturb = []
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the
 # parallel-SM decode so `coz run` can measure per-region wall-elasticity
 # (∂wall/∂speed). OFF by default — no fulcrum dep, probes compile to no-ops.
