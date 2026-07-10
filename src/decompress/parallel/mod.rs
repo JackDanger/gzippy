@@ -100,6 +100,16 @@ pub mod output_writer;
 /// `phase_timing.rs` module doc. NO rg counterpart — measurement-only.
 #[cfg(parallel_sm)]
 pub mod phase_timing;
+/// Gate-2 causal-perturbation instrument (feature `perturb`, OFF by
+/// default). Injects a calibrated, known-magnitude delay at one of two
+/// named sites in the worker marker-decode fast loop (Arm H = compute,
+/// Arm M = u16-store bandwidth) so the interleaved wall response can be
+/// measured (`fulcrum score`) to discriminate compute-bound vs
+/// bandwidth-bound vs scheduling. Every symbol is a true no-op without the
+/// feature. NO rg counterpart — measurement-only, storedheavy sub-cause
+/// brief (2026-07-09).
+#[cfg(parallel_sm)]
+pub mod perturb;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod replace_markers;

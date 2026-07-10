@@ -961,6 +961,21 @@ pub fn decompress_parallel<W: Write>(
                 result.total_size,
                 mbps,
             );
+            #[cfg(feature = "perturb")]
+            {
+                let (arm, iters) = crate::decompress::parallel::perturb::selected_config();
+                let hits = crate::decompress::parallel::perturb::hits();
+                eprintln!(
+                    "[perturb] arm={} spin_iters_per_hit={} hits={}",
+                    match arm {
+                        crate::decompress::parallel::perturb::ARM_H => "H",
+                        crate::decompress::parallel::perturb::ARM_M => "M",
+                        _ => "NONE",
+                    },
+                    iters,
+                    hits,
+                );
+            }
         }
         Ok(result.total_size as u64)
     }
