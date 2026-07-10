@@ -468,3 +468,21 @@ scales negatively (T4/T8), (2) consumer coordination overhead (T16). gz WINS T1 
     contention. Removal-oracle each candidate at the WALL (not cycles) before building.
   FRONT 2 (T16): consumer per-chunk coordination CPU (11.6ms/191 chunks) — reduce per-chunk
     consumer work OR fewer chunks (but fewer chunks regressed the wall — needs care).
+
+──── coherence RULED OUT + last lever (2026-07-10) ────
+IPC-0.77-loop lever DISQUALIFIED (cursor-agent): same kernel runs IPC 1.09 at T1 (gz wins T1)
+→ the IPC drop is a PARALLELISM pathology, not a loop floor. perf c2c gz storedheavy T8: ZERO
+HITM, zero remote/shared-line, LLC misses 100% LOCAL DRAM → FALSE-SHARING/COHERENCE RULED OUT
+(single socket). gz has FEWER cache misses than rg (1.9M vs 4.1M) yet lower IPC → distributed
+parallel-execution stall, not localizable to coherence/bandwidth-traffic/any tested code region.
+LAST UNTESTED LEVER (in flight): storedheavy is DEMOTED out of stored_split (prefix 8.2% < 50%)
+into the non-scaling ParallelSM machinery. Segmented stored_split (walk whole stream, decode 33
+dynamic islands in place with TRUE rolling output window, never demote on early-dynamic) keeps
+98.9% stored on the byte-exact LEN-chain parallel path. = "Lever B" but prior falsification
+compared TWO DIFFERENT CORPORA (confounded/invalid) → clean same-corpus wall re-test. cursor-agent:
+~25-35% closes T4/T8, ~50-60% no-lever. Gated at the wall + adversarial byte-exactness. If it
+TIEs cleanly → CONFIRMS no localizable lever remains (honest gated conclusion; gz wins T1 + all
+compressible corpora; storedheavy is a distributed parallel-efficiency residual on an incompressible
+corner). DO-NOT-RETEST (campaign-closed at wall): copy-removal(+23% rise), page-fault-parity,
+block-finder-removal(T4/T8 wall TIE), chunk-cap(regressed), single-pass(already 99% single-pass),
+inner-loop(1% of corpus, TIE), coherence(c2c clean).
