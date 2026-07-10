@@ -1,0 +1,90 @@
+diff --git a/benchmark_data/silesia.tar.xz b/benchmark_data/silesia.tar.xz
+deleted file mode 100644
+index c6737a03..00000000
+Binary files a/benchmark_data/silesia.tar.xz and /dev/null differ
+diff --git a/src/decompress/parallel/chunk_buffer_pool.rs b/src/decompress/parallel/chunk_buffer_pool.rs
+index e7c84046..73b861e2 100644
+--- a/src/decompress/parallel/chunk_buffer_pool.rs
++++ b/src/decompress/parallel/chunk_buffer_pool.rs
+@@ -201,8 +201,31 @@ fn t1_resident_scope_active() -> bool {
+     T1_RESIDENT_SCOPE.with(|c| c.get())
+ }
+ 
++/// PAGE-FAULT LEVER (2026-07-09): warm per-worker Vec-capacity reuse, unpinned.
++///
++/// Previously this was T1-only (`t1_resident_scope_active()`), so every T>1
++/// worker's `chunk_buffer_pool::take_u8`/`take_u16`/`take_marker_segment`
++/// call fell straight to `types::u8_with_capacity` — a FRESH allocation per
++/// chunk, every chunk, forever. perf on AMD storedheavy T4 attributed ~28%
++/// of the `memmove`-heavy decode phase to `do_anonymous_page`/`alloc_pages`
++/// — first-touch page faults zeroing those freshly mmap'd chunk buffers.
++///
++/// Extend the SAME warm-reuse mechanism to T>1 worker-pool threads
++/// (`current_worker_pool_index().is_some()`), so a worker's buffer capacity
++/// (and already-faulted pages) survives across chunks instead of being
++/// dropped-and-refaulted each time. Deliberately does NOT touch
++/// `resident_output_pool_enabled()` below — that stays T1-only, so T>1
++/// workers get NO `RESIDENT_PINNED_CAPACITY` (64 MiB) pin, matching the
++/// prior falsification (commit `7065e1e8`: pinning at T>1 regressed wall
++/// +5-16% / RSS +9-76%). This flips ONLY which branch of `take_u8`/
++/// `return_u8_to_worker` a T>1 worker takes (pool vs allocator) — the
++/// write-before-read/return-after-write invariants that make T1's pool
++/// reuse byte-safe are architecture-wide (recycle only fires after a
++/// chunk's output is written and its window published as an owned copy;
++/// see `ChunkData::recycle_decoded_buffers` / `free_decoded_buffers`), so
++/// they hold identically for T>1 workers.
+ fn manual_buffer_pool_enabled() -> bool {
+-    t1_resident_scope_active()
++    t1_resident_scope_active() || current_worker_pool_index().is_some()
+ }
+ 
+ /// FORM-B RSS FIX — eager per-chunk page release at recycle time.
+diff --git a/vendor/gzip b/vendor/gzip
+deleted file mode 160000
+index 94cfaabe..00000000
+--- a/vendor/gzip
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 94cfaabe3ae7640b8c0334283df37cbdd7f7a0a9
+diff --git a/vendor/isa-l b/vendor/isa-l
+deleted file mode 160000
+index 55916f5c..00000000
+--- a/vendor/isa-l
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 55916f5ccc2a586c978adf5bc694190813deaa10
+diff --git a/vendor/isal-rs b/vendor/isal-rs
+deleted file mode 160000
+index fa73fa3b..00000000
+--- a/vendor/isal-rs
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit fa73fa3bec0296009bd18b8ad076ed8f763ad65d
+diff --git a/vendor/libdeflate b/vendor/libdeflate
+deleted file mode 160000
+index 22f6e023..00000000
+--- a/vendor/libdeflate
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 22f6e0235ff5651c7300dc120a7ee0d9f0ba3426
+diff --git a/vendor/pigz b/vendor/pigz
+deleted file mode 160000
+index fe4894f5..00000000
+--- a/vendor/pigz
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit fe4894f57739e3039a2ffc2a2a360d35e19bacbe
+diff --git a/vendor/zlib-ng b/vendor/zlib-ng
+deleted file mode 160000
+index da22434b..00000000
+--- a/vendor/zlib-ng
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit da22434b657578c41af1bdf06b27304e4aceb00f
+diff --git a/vendor/zopfli b/vendor/zopfli
+deleted file mode 160000
+index ccf9f058..00000000
+--- a/vendor/zopfli
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit ccf9f0588d4a4509cb1040310ec122243e670ee6

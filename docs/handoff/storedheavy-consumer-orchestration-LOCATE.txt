@@ -219,3 +219,17 @@ decode (which phasebreak gated as 87% of the wall):
   drop, then fulcrum-score gate the wall — faults-drop + wall-flat ⇒ slack CONFIRMED
   (bank, don't ship); wall-moves ⇒ Lever C was a false-negative (win). If slack, the
   lever is the ~59% Huffman inner loop (CLAUDE.md-open) — Gate-2 perturb then optimize.
+
+─── GATED FALSIFY: page-fault removal is SLACK (2026-07-09, share≠wall PROVEN) ───
+Re-test (worktree, byte-exact, patch: docs/handoff/leverC-refire-SLACK-CONFIRMED.patch):
+faulting buffer = SegmentedU8::buf via chunk_buffer_pool::take_u8; manual_buffer_pool_enabled()
+was T1-oracle-only, so every T>1 worker fresh-allocs per chunk (= Lever C's target). Enabled
+warm reuse at T>1 (current_worker_pool_index().is_some()), no pin (avoids 7065e1e8 regression).
+PROVEN the lever FIRED (the step Lever C skipped): perf do_anonymous_page+clear_page share
+5.69%→5.28% (non-overlapping over 3 replicates), minor-faults 15.5k→13.7k (2.0-2.7σ).
+GATED the wall: fulcrum score storedheavy AMD FLAT at every T (T4 .9425→.945, T8 .9675→.9625,
+T16 .9725→.9475; all Δ<spread; N=9×4 sessions). silesia T8 win-cell no regression. Byte-exact
+(sha==gzip -dc, silesia+monorepo+storedheavy+synthetic incompressible, T1/4/8/16); 1005 tests.
+VERDICT: first-touch fault time is OFF the critical path at T>1 (overlapped by other threads'
+Huffman/marker work) → share≠wall CONFIRMED. NOT shipped. The ONLY remaining decode_wait
+component is the ~59% Huffman/marker inner-loop COMPUTE — that is the sole surviving lever.
