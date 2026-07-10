@@ -317,3 +317,22 @@ storedheavy T4/8/16 to >=0.99. Eliminated levers: page-fault(SLACK), single-lite
 NEXT: H-vs-M worker Gate-2 (Huffman-compute vs u16-store-bandwidth vs scheduling) → inner-
 loop lever (CLAUDE.md-open). Owed: cross-arch (Intel) replication of the /dev/null picture.
 SECONDARY lever: gz file-WRITE ~28ms slower than rg on silesia (writer efficiency, separate).
+
+███ COURSE-CORRECTION (2026-07-10): the fast loop is only 8.7% — careful_tail is 91% ███
+Store-elimination oracle (worktree commit 214a52d3, byte-inexact, N=9, AMD frozen):
+  base T4=48ms; ctrl(same-addr volatile)=46ms TIE (byte-exact); stack(reloc,no-TLS)=60ms
+  +25%; probe(reloc,TLS)=61ms +27%. Both RELOCATED variants regress the SAME → it is
+  NOT store-bandwidth (that predicts probe FASTER); it is a REGISTER-PRESSURE/codegen
+  confound — a 2nd raw pointer in decode_marker_fast_loop defeats the N2 register-mirror.
+  perf-stat: IPC 0.85, store-port-stall analog 0.43% (negligible) → NOT store-bound.
+  ⇒ NO u8-literal-lane lever justified. Loop hints codegen/register-pressure-bound.
+CRITICAL: byte-accounting shows decode_marker_fast_loop's store site produces only
+~8.7M of storedheavy's 100M output bytes — **~91% flows through decode_careful_tail**
+(uninstrumented). So ALL prior storedheavy inner-loop analysis (Gate-2 spin 1:1, H-vs-M,
+store-oracle) was on a MINORITY path. The Gate-2 "1:1 wall response" only proved the fast
+loop is executed+on-path, NOT that it dominates TIME (the huge per-hit injection ×33K
+hits became the dominant term itself). THE REAL HOT PATH FOR STOREDHEAVY = decode_careful_
+tail (and/or the stored-block bulk-copy path) — never characterized. NEXT: account ALL
+storedheavy output bytes by path (fast-lit/fast-backref/careful/stored-copy), time each,
+find the dominant time-consumer + WHY the fast loop exits to careful, THEN the real lever.
+Advisor prognosis (cursor-agent + Qwen-fast): full parity 15-35%; Qwen leans accept-residual.
