@@ -297,3 +297,23 @@ added to BOTH arms that DILUTES/FLIPS the decode-time ratio. So:
 FIX OWED: score must TIME to /dev/null (per sink law) and sha-verify correctness in a
 SEPARATE untimed run (pipe stdout to sha256sum), then RE-SCORE — the file-sink cells
 (incl the just-banked "true gap") are all contaminated and must be re-measured.
+
+═══ CONFIRMED /dev/null RE-SCORE (2026-07-09, sink fixed, fulcrum main @ b908b3d) ═══
+Matched A/B (SAME binaries, file-sink vs /dev/null, AMD frozen, N=11, sha-verified,
+gz-native @ 9896c2b7 vs rapidgzip-native 0.16.0). Step-0 sha-verified both sinks decode
+correctly; file-sink walls ~3x inflated + noisier (confirmed the bug is real).
+  cell            file-sink    /dev/null(TRUE)   flip
+  silesia   T4    0.97 FAIL    1.05 PASS         FAIL→PASS (gz wins)
+  silesia   T8    0.98 FAIL    1.14 PASS         FAIL→PASS (gz wins)
+  monorepo  T8    0.86 FAIL    1.01 PASS         FAIL→PASS (gz wins)
+  storedheavy T4  0.95         0.75 FAIL         real loss (was diluted)
+  storedheavy T8  0.99         0.87 FAIL         real loss
+  storedheavy T16 0.98         0.90 FAIL         real loss
+TRUE PICTURE: gzippy WINS the normal corpora on AMD /dev/null; the deficit is
+CONCENTRATED in storedheavy (incompressible) and is BIGGER than the file sink showed
+(~10-25%, not near-tie). storedheavy is decode-THROUGHPUT-bound (phasebreak decode_wait
+87%; on /dev/null gz decodes 100MB @ ~2.4GB/s vs rg ~3.2GB/s). THE WIN = close
+storedheavy T4/8/16 to >=0.99. Eliminated levers: page-fault(SLACK), single-literal(TIE).
+NEXT: H-vs-M worker Gate-2 (Huffman-compute vs u16-store-bandwidth vs scheduling) → inner-
+loop lever (CLAUDE.md-open). Owed: cross-arch (Intel) replication of the /dev/null picture.
+SECONDARY lever: gz file-WRITE ~28ms slower than rg on silesia (writer efficiency, separate).
