@@ -447,6 +447,7 @@ mod tests {
                 crate::decompress::parallel::single_member::arch_large_output_notch_default(),
                 0, // work-per-thread cap disabled
                 crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
+                0, // mid_band_low disabled — isolates the crossover/prestack decision
             )
         };
         assert_eq!(
@@ -495,6 +496,7 @@ mod tests {
                 crate::decompress::parallel::single_member::arch_large_output_notch_default(),
                 0,
                 crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
+                0, // mid_band_low disabled — isolates the crossover/prestack decision
             )
         };
         let before_xo = SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed);
@@ -528,6 +530,7 @@ mod tests {
                 notch,
                 0,
                 crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
+                0, // mid_band_low disabled — isolates the crossover/prestack decision
             )
         };
         assert_eq!(
