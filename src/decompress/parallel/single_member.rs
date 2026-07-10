@@ -432,6 +432,52 @@ pub(crate) fn arch_large_output_notch_default() -> u64 {
     }
 }
 
+/// AMD MID-BAND graduated-amortization LOW bound (byte-transparent). Outputs in
+/// `[this, PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT)` — i.e. 48–128 MiB — earn the
+/// same crossover reduction the >128 MiB tier grants, but FLOORED at
+/// [`PARALLEL_MID_BAND_MIN_CROSSOVER`] (never split below that T) and never
+/// RAISED above the un-amortized crossover.
+///
+/// WHY (STEP-0 measured, this branch's fulcrum): the >128 MiB large-output tier
+/// was the sole fixed-overhead amortization credit, so a mid-size output like
+/// `tool.bin` (59.6 MiB, ratio 2.99) got the full un-amortized crossover
+/// `ceil(2.99·1.6)=5` and routed SERIAL at T2/T3/T4 — flat 139 ms while its own
+/// per-chunk kernel BEATS rapidgzip when it DOES split (T8 63 ms). The step
+/// "splits at T8 not T4" was exactly `SERIAL_CLEAN_FLOOR_APPLIED` firing for
+/// T<5. A 59.6 MiB output amortizes the pipeline's fixed cost as well as
+/// silesia does; the 128 MiB tier boundary was over-conservative for the
+/// 48–128 MiB band. GATED (solvency/Zen2, frozen /dev/null paired-diff, N=51):
+/// tool.bin-T4 gz/rg 1.387→0.901 (Δ 48.8 ms, 51/51); monorepo-T7 1.001→0.875,
+/// -T8 1.012→0.869 (both split-wins). The FLOOR (min crossover 4) is why
+/// storedmix (100 MiB, ratio 1.98, base crossover 4) is BYTE-IDENTICALLY routed
+/// — it keeps its serial T2 (measured: forcing storedmix-T2 parallel REGRESSED
+/// it 42.0→51.1 ms, gz/rg 0.895→1.087), and `min(base, …)` keeps low-ratio
+/// weights (ratio 1.09, crossover 2) unchanged. AMD/Zen2 only (Intel margin 1.0
+/// already lands tool.bin at crossover 3; aarch64 disables the selector).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+const PARALLEL_MID_BAND_LOW_AMD: u64 = 48 * 1024 * 1024;
+
+/// Floor for the mid-band graduated reduction: a mid-band file never routes
+/// parallel below T=4 (the first thread count at which mid-size parallelism was
+/// gate-measured to repay; below it the per-chunk pipeline overhead is
+/// unamortized — the storedmix-T2 regression). See [`PARALLEL_MID_BAND_LOW_AMD`].
+const PARALLEL_MID_BAND_MIN_CROSSOVER: f64 = 4.0;
+
+/// Arch-dispatched mid-band low bound: AMD/Zen2 enables the 48–128 MiB
+/// graduated-amortization tier; every other arch disables it (0 ⇒ the
+/// `mid_band_low > 0` guard in [`effective_parallel_threads_with`] is never
+/// taken, so routing is byte-identical off-AMD).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub(crate) fn arch_mid_band_low_default() -> u64 {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if cpu_is_amd() {
+            return PARALLEL_MID_BAND_LOW_AMD;
+        }
+    }
+    0
+}
+
 /// Counter proving the serial-clean cost-model selector fired on a real decode
 /// (deletion-trap discipline; read by the routing test).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
@@ -507,6 +553,7 @@ pub(crate) fn effective_parallel_threads(
         arch_large_output_notch_default(),
         min_bpt,
         MIN_THREADS_FLOOR_DEFAULT,
+        arch_mid_band_low_default(),
     )
 }
 
@@ -548,6 +595,7 @@ pub(crate) fn effective_parallel_threads_with(
     notch: u64,
     min_bpt: u64,
     threads_floor: u64,
+    mid_band_low: u64,
 ) -> usize {
     if num_threads <= 1 || deflate_data_len == 0 || gzip_data.len() < 4 {
         return num_threads;
@@ -687,6 +735,23 @@ pub(crate) fn effective_parallel_threads_with(
         // See [`PARALLEL_LARGE_OUTPUT_NOTCH_DEFAULT`] / [`PARALLEL_LARGE_OUTPUT_NOTCH_AMD`].
         if large_output_bytes > 0 && isize_field >= large_output_bytes && notch > 0 {
             crossover = (crossover - notch as f64).max(1.0);
+        } else if mid_band_low > 0
+            && isize_field >= mid_band_low
+            && large_output_bytes > 0
+            && isize_field < large_output_bytes
+            && notch > 0
+        {
+            // MID-BAND GRADUATED AMORTIZATION (48–128 MiB, AMD/Zen2). Grant the
+            // same `notch` reduction the >128 MiB tier grants, but (a) FLOORED at
+            // `PARALLEL_MID_BAND_MIN_CROSSOVER` so a mid-size file never splits
+            // below T=4 (protects the low-T over-threading regime that regressed
+            // storedmix-T2), and (b) `min(crossover, …)` so it can only LOWER a
+            // high crossover, never RAISE a low one (protects low-ratio mid files
+            // like weights whose base crossover is already < the floor). This is
+            // the STEP-0-measured fix for the tool-T4 partition step-function; see
+            // [`PARALLEL_MID_BAND_LOW_AMD`] for the gated measurements.
+            let reduced = (crossover - notch as f64).max(PARALLEL_MID_BAND_MIN_CROSSOVER);
+            crossover = crossover.min(reduced);
         }
         if (num_threads as f64) < crossover {
             SERIAL_CLEAN_FLOOR_APPLIED.fetch_add(1, Ordering::Relaxed);
@@ -873,6 +938,35 @@ pub fn decompress_parallel<W: Write>(
             adjusted_chunk_size_bytes(gzip_data.len(), num_threads, thread_default_chunk);
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
+        }
+        if debug_enabled() {
+            // STEP-0 LOCATE instrumentation (byte-transparent, debug-gated): report
+            // the partition decision so the "splits at T8 not T4" step-function is
+            // deterministic. `chunks≈deflate/chunk_size` is the target grid; the
+            // block finder validates boundaries near each stride.
+            let n = gzip_data.len();
+            let isize_field = u32::from_le_bytes([
+                gzip_data[n - 4],
+                gzip_data[n - 3],
+                gzip_data[n - 2],
+                gzip_data[n - 1],
+            ]) as u64;
+            let ratio = isize_field as f64 / (_deflate_data_len.max(1) as f64);
+            let est_chunks = (_deflate_data_len as u64).div_ceil(chunk_size.max(1) as u64);
+            eprintln!(
+                "[parallel_sm] STEP0 deflate_len={} isize={} ratio={:.4} \
+                 eff_threads={} chunk_size={} est_chunks={} \
+                 serial_clean_floor={} small_out_floor={} work_cap={}",
+                _deflate_data_len,
+                isize_field,
+                ratio,
+                num_threads,
+                chunk_size,
+                est_chunks,
+                SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed),
+                SMALL_OUTPUT_SERIAL_FLOOR_APPLIED.load(Ordering::Relaxed),
+                WORK_PER_THREAD_CAP_APPLIED.load(Ordering::Relaxed),
+            );
         }
 
         // No pool pre-warm here. A prior experiment touched pool pages
@@ -1370,6 +1464,7 @@ mod tests {
                 arch_large_output_notch_default(),
                 NO_BPT_CAP,
                 MIN_THREADS_FLOOR_DEFAULT,
+                0, // mid_band_low disabled — this test isolates the base selector
             )
         };
         // Common to every arch: high-ratio serial at low T; low-ratio parallel;
@@ -1423,6 +1518,7 @@ mod tests {
                 arch_large_output_notch_default(),
                 NO_BPT_CAP,
                 MIN_THREADS_FLOOR_DEFAULT,
+                0, // mid_band_low disabled — this test isolates the base selector
             )
         };
         // markup.xml-shaped: 7.6 MiB decoded, 2.1 MiB deflate → below the 8 MiB
@@ -1532,6 +1628,7 @@ mod tests {
                 arch_large_output_notch_default(),
                 NO_BPT_CAP,
                 MIN_THREADS_FLOOR_DEFAULT,
+                0, // mid_band_low disabled — this test isolates the base selector
             )
         };
 
@@ -1571,6 +1668,7 @@ mod tests {
                     notch,
                     NO_BPT_CAP,
                     MIN_THREADS_FLOOR_DEFAULT,
+                    0, // mid_band_low disabled — this test isolates the large-output bonus
                 )
             };
 
@@ -1600,6 +1698,75 @@ mod tests {
         // 2-notch bonus (the AMD depth): crossover 4 → 2 → T2 parallel.
         assert_eq!(call(&big, big_deflate, 2, 134_217_728, 2), 2); // parallel (4-2=2)
         assert_eq!(call(&big, big_deflate, 1, 134_217_728, 2), 1); // never alters T1
+    }
+
+    /// MID-BAND GRADUATED AMORTIZATION (48–128 MiB, AMD margin 1.6 + 2-notch,
+    /// floor 4). The gated fix for the tool-T4 partition step-function: a 48–128
+    /// MiB output earns the 2-notch reduction the >128 MiB tier grants, floored at
+    /// crossover 4 (never split below T4) and never raised above the un-amortized
+    /// proxy. Real corpus shapes (solvency/Zen2, frozen paired-diff N=51).
+    #[test]
+    fn mid_band_graduated_amortization_tool_and_monorepo_only() {
+        const LARGE: u64 = 128 * 1024 * 1024;
+        let mid = PARALLEL_MID_BAND_LOW_AMD;
+        // (gz, deflate_len, t, mid_band_low) with AMD production params margin 1.6,
+        // large=128 MiB, notch=2.
+        let call = |gz: &[u8], deflate_len: usize, t: usize, mid_low: u64| {
+            effective_parallel_threads_with(
+                gz,
+                deflate_len,
+                t,
+                NO_FLOOR,
+                1.6,
+                LARGE,
+                2,
+                NO_BPT_CAP,
+                MIN_THREADS_FLOOR_DEFAULT,
+                mid_low,
+            )
+        };
+
+        // tool.bin-shaped: 59.6 MiB out, 20.87 MiB deflate, ratio 2.99 → base
+        // crossover ceil(2.99·1.6)=5. Mid-band → max(5-2,4)=4: T3 SERIAL (was
+        // already serial at base too, base 5), T4 PARALLEL (was serial at base 5).
+        let tool = blob_with_isize(62_480_352);
+        assert_eq!(call(&tool, 20_874_333, 3, mid), 1); // T3 serial
+        assert_eq!(call(&tool, 20_874_333, 4, mid), 4); // T4 PARALLEL — the fix
+        assert_eq!(call(&tool, 20_874_333, 2, mid), 1); // T2 stays serial
+                                                        // Base (mid disabled): T4 still serial (crossover 5) — reproduces the bug.
+        assert_eq!(call(&tool, 20_874_333, 4, 0), 1);
+
+        // monorepo-shaped: 48.6 MiB out, 9.82 MiB deflate, ratio 5.18 → base
+        // crossover 9. Mid-band → max(9-2,4)=7: T6 serial, T7 PARALLEL (split-win).
+        let mono = blob_with_isize(50_915_328);
+        assert_eq!(call(&mono, 9_819_846, 6, mid), 1); // T6 serial
+        assert_eq!(call(&mono, 9_819_846, 7, mid), 7); // T7 PARALLEL — split-win
+        assert_eq!(call(&mono, 9_819_846, 4, mid), 1); // T4 stays serial
+        assert_eq!(call(&mono, 9_819_846, 7, 0), 1); // base: still serial at T7
+
+        // storedmix-shaped: 100 MiB out, 52.9 MiB deflate, ratio 1.98 → base
+        // crossover 4. Mid-band FLOOR keeps it at 4 (min(4,max(2,4))=4) → BYTE-
+        // IDENTICAL routing: T2/T3 serial (regression-protected), T4 parallel.
+        let smix = blob_with_isize(104_857_600);
+        assert_eq!(call(&smix, 52_890_462, 2, mid), 1); // T2 serial (protected)
+        assert_eq!(call(&smix, 52_890_462, 2, 0), 1); // == base
+        assert_eq!(call(&smix, 52_890_462, 4, mid), 4);
+        assert_eq!(call(&smix, 52_890_462, 4, 0), 4); // == base
+
+        // weights-shaped: 86.7 MiB out, 83.1 MiB deflate, ratio 1.09 → base
+        // crossover 2. `min(base, …)` never RAISES it: mid-band leaves it at 2 →
+        // T2 parallel unchanged (low-ratio mid file must not be de-parallelized).
+        let weights = blob_with_isize(90_868_376);
+        assert_eq!(call(&weights, 83_099_652, 2, mid), 2);
+        assert_eq!(call(&weights, 83_099_652, 2, 0), 2); // == base
+
+        // Below the band (40 MiB): untouched by the mid-band tier.
+        let below = blob_with_isize(40 * 1024 * 1024);
+        let below_deflate = (40.0 * 1024.0 * 1024.0 / 2.99) as usize;
+        assert_eq!(
+            call(&below, below_deflate, 4, mid),
+            call(&below, below_deflate, 4, 0)
+        );
     }
 
     #[test]
