@@ -1,0 +1,121 @@
+storedheavy sub-cause PIN (2026-07-10) — Step-1 waste ruled out, Step-2 Gate-2
+confirms worker per-iteration decode-loop latency is ~1:1 on the critical path,
+but the H-vs-M split does NOT discriminate compute vs bandwidth (both injection
+points sit on the same serial per-thread chain, so they respond identically).
+======================================================================================
+CONTEXT: continues docs/handoff/storedheavy-consumer-orchestration-LOCATE.txt
+(AMD Zen2, /dev/null, storedheavy /root/archive/storedheavy.gz, fulcrum score
+2-way native-vs-rg fixed at main b908b3d). That file's TOOL VERDICT + advisor
+correction left two owed items: (1) is the deficit re-decode/wasted-work, and
+(2) if not, is the worker loop compute-bound (H) or u16-store-bandwidth-bound
+(M)? Both are answered here, gated.
+
+INSTRUMENT 1 (Step 1): `--features phase-timing` extended with
+worker_decode_invocations / worker_decoded_bytes / window_present /
+window_absent counters at the single `run_decode_task` choke point
+(chunk_fetcher.rs). Commit 0301f226.
+
+STEP-1 RESULT (AMD, storedheavy.gz, T4/T8/T16, N=3 replicates each, sha-verified
+every run):
+  T   invocations  iters  decoded_bytes  window_present  window_absent
+  4   33           34     100,000,000    1               32
+  8   39           40     100,000,000    1               38
+  16  191          192    100,000,000    1               190
+
+worker_decoded_bytes == true output size (100,000,000) EXACTLY at every T,
+every replicate (zero variance). invocations == iters-1 exactly at every T.
+=> ZERO byte-level waste (no re-decode, no discarded-but-decoded speculative
+bytes) — far below the brief's 15% significance threshold. The known
+"window-absent chunks can force re-decode" failure mode is NOT firing here:
+gz decodes each byte exactly once regardless of the very high window-absent
+fraction (94-99.5%). STEP-1 HYPOTHESIS (re-decode/wasted-work is the cause)
+IS FALSIFIED. Proceed to Step 2 per the brief.
+
+INSTRUMENT 2 (Step 2): new `--features perturb` — calibrated `spin_loop()`
+delay injectable at two sites in `decode_marker_fast_loop`
+(marker_inflate.rs), selected via GZIPPY_PERTURB_ARM=H|M, sized via
+GZIPPY_PERTURB_NS=<ns>. Arm H = after litlen decode/consume, before the u16
+ring write (compute). Arm M = immediately after the widened u16 ring store
+(store bandwidth). A HITS atomic counter (Gate-0 self-test) proves the arm
+actually fired — printed under GZIPPY_DEBUG=1. Commit 28bc0f43.
+
+GATE-0 SELF-TEST: on storedheavy T4, hits=33304 (constant across both arms —
+same loop-iteration count regardless of which side is perturbed), confirming
+the injection is NOT inert. Byte-exactness: every `fulcrum score` cell below
+sha-verified per-sample ("sha=OK" ×9) against decomp-pin
+d3efb3acd66747173e5b5b3c5f5480accd39eb89f76dd95a17202593c93b6b72 — perturbation
+never changed output bytes, even at the largest (10000ns/hit) injection.
+
+STEP-2 GATE-2 RESULT (fulcrum score, 2-way native-vs-rg, N=9, frozen governor,
+/dev/null sink, taskset 0-3, AMD Zen2, T4, src-sha 28bc0f43):
+  arm        NS/hit   gzippy wall_ms   spread_ms   ratio-vs-rg   rg wall_ms
+  (none)     0        119              5           0.96          114
+  H          1000     192              8           0.60          115
+  M          1000     192              7           0.59          114
+  H          10000    488              15          0.23          114
+  M          10000    488              8           0.24          115
+
+Every Δ is >> spread (Δ=73-369ms vs spread 5-15ms) — Gate-1 significance met,
+N=9 >= 7. rg's own wall stayed flat (114-117ms) across every cell, confirming
+the perturbation is isolated to the gzippy arm (rg doesn't read
+GZIPPY_PERTURB_*) — a clean frequency-neutral control.
+
+H and M give the SAME wall_ms at BOTH magnitudes (192 vs 192; 488 vs 488) —
+not approximately equal, IDENTICAL to the measured millisecond. Marginal
+slope between the two magnitudes: Δwall=(488-192)=296ms vs Δraw-requested=
+hits×ΔNS=33304×9000ns=299.7ms → slope ≈ 0.988 (≈1:1) for BOTH arms.
+
+PINNED SUB-CAUSE (Gate-2, both arches NOT yet replicated — AMD-only so far,
+see OWED below): worker per-iteration latency in `decode_marker_fast_loop`
+transfers ~1:1 into the storedheavy wall — CONFIRMS (not hypothesis) that
+per-thread marker-decode throughput is the critical-path lever, matching the
+phasebreak's decode_wait-dominant attribution. HOWEVER the H-vs-M split as
+designed CANNOT further localize compute vs bandwidth: Arm H and Arm M are
+serially ADJACENT in the same single-threaded, non-pipelined per-iteration
+loop body (compute -> store -> next iteration's compute, no overlap between
+the two halves within one thread at this granularity), so a delay inserted
+at EITHER point adds identically to the same serial critical chain — of
+course they respond identically; this is an algebraic property of the loop's
+structure, not new information about which sub-op is naturally slower in the
+UNPERTURBED loop. This mechanism was NOT one of the brief's three anticipated
+outcomes (H>>M / M>>H / both flat) — it is a fourth outcome ("both strongly
+AND EQUALLY proportional") that the brief's decision tree did not enumerate;
+reporting it as such rather than forcing it into "compute-bound" or
+"bandwidth-bound" is the disciplined call per the governing anti-bias law.
+
+RECOMMENDED LEVER (single, per the brief): reduce TOTAL per-iteration
+serial-chain latency in `decode_marker_fast_loop`'s hot body — the fungible
+combination of litlen decode/consume + the widened u16 ring store, since
+Step-2 proves ANY reduction anywhere in that per-iteration chain transfers
+~1:1 to wall. Concretely this points at software-pipelining /
+overlapping the store of iteration N with the decode of iteration N+1 (so the
+two currently-serial halves gain slack from each other, changing the
+"identical H vs M response" property this experiment measured), OR at
+straight instruction-count reduction in either half (CLAUDE.md-open
+territory: BMI2/table/refill-cadence work on the compute half, narrower/
+batched stores on the write half). A follow-up perturbation that could
+further localize the split: inject the SAME total delay but spread across
+MULTIPLE non-adjacent iterations' compute vs store (so pipelining slack, if
+architecturally added, could differentially absorb one arm) — not attempted
+this session (would require the pipelining lever to exist first to be
+testable).
+
+GATES MET: Step-1 self-validated (deterministic counters, 9 runs, zero
+variance, sha-verified). Step-2 Gate-0 (hits>0, non-inert), Gate-1 (N=9>=7,
+Δ>>spread), Gate-2 (causal perturbation, 2 magnitudes/arm, frequency-neutral
+control via rg's flat wall), byte-exact (sha=OK every sample). NOT yet met:
+Gate-3 cross-arch replication (Intel) — this session was AMD-only per the
+brief's box list; the H≡M finding and the ~1:1 transfer slope are AMD-Zen2-
+scoped until replicated on Intel. Cross-corpus: N/A (storedheavy is itself
+the target corpus, not a generalization claim).
+
+ARTIFACTS: score cells at /tmp/score-{baseline,H1000,H10000,M1000,M10000}/
+amd-x86_64/t4/storedheavy.md on solvency (10.0.2.240) — NOT copied back (tmp,
+box-local); re-run via the `fulcrum score` invocations in each cell's
+"RE-VERIFY" section (swap --native to
+/root/gzippy-storedheavy-subcause/gzippy-perturb, export GZIPPY_PERTURB_ARM/
+GZIPPY_PERTURB_NS before invoking). Source tree synced to
+/root/gzippy-storedheavy-subcause on solvency (rsync of this worktree's src/
+Cargo.toml/crates/vendor/benches/tests/fuzz/examples — NOT a git clone, no
+git history there). Local worktree commits: 0301f226 (phase-timing Step-1
+counters), 28bc0f43 (perturb Step-2 instrument).
