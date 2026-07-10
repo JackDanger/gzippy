@@ -336,3 +336,24 @@ tail (and/or the stored-block bulk-copy path) — never characterized. NEXT: acc
 storedheavy output bytes by path (fast-lit/fast-backref/careful/stored-copy), time each,
 find the dominant time-consumer + WHY the fast loop exits to careful, THEN the real lever.
 Advisor prognosis (cursor-agent + Qwen-fast): full parity 15-35%; Qwen leans accept-residual.
+
+█████ BOTH-TOOLS MEASUREMENT (2026-07-10) — the divergence is the BLOCK FINDER █████
+Built fulcrum/tools/memtrace.c (LD_PRELOAD cross-tool copy/alloc counter; fulcrum @ 538cddb).
+COPY (storedheavy, output=100MB): gzippy copies 1.02x output (102MB bulk memcpy, ~4k calls);
+rapidgzip copies 4.34x (434MB) + 126MB memset. => "gz double-copies" FALSIFIED — gz copies
+LESS than rg and is still slower. The stored copy is NOT the lever (it's bulk single-pass).
+SYMBOL-RESOLVED perf (both tools, fulcrum insn ledger, both closed):
+  gz 193M instrs IPC 1.55; rg 209M IPC 1.73 (rg does MORE, faster — gz is IPC-stalled).
+  gz TOP fns: find_next_dynamic_block 49.2M(25.5%), run_contig asm 37.3M(19.3%),
+    finish_decode_chunk_contig 25.7M, find_next_uncompressed_block 14.6M, validate_huffman
+    13.1M, memchr-avx2 9.7M, libc memmove 6.6M(3.6%).
+  gz BLOCK-FINDING total (find_next_dynamic+find_next_uncompressed+validate_huffman+memchr)
+    = 86.7M = 44.9%.  rg block-finding (seekToNonFinalDynamicDeflateBlock) = 36.6M = 17.5%.
+  => gz spends ~2.4x more on BLOCK FINDING than rg on storedheavy. THIS is the dominant
+     divergence, not the copy. (Also: rg CRC=35.3M via ISA-L fold; gz CRC=0.9M — gz WINS CRC.)
+CAVEAT: 44.9% is instruction SHARE; the block finder runs ASYNC (phasebreak blockfind_wait~0),
+  so it MAY be slack (share!=wall). Gate-2 two-arm perturbation IN FLIGHT (block-finder vs
+  run_contig decode) to decide which gates the wall before building a lever.
+FULCRUM BUG found: insn-attr's plan uses `perf script -F ...,srcline,insn` which splits each
+  record onto 2 physical lines → --analyze falsely reports 51% opcode-byte drop (true 6.5%/3%).
+  Fix the plan generator (drop srcline) or the parser. Flagged, not fixed.
