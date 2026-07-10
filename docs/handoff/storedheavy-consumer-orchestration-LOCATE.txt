@@ -357,3 +357,18 @@ CAVEAT: 44.9% is instruction SHARE; the block finder runs ASYNC (phasebreak bloc
 FULCRUM BUG found: insn-attr's plan uses `perf script -F ...,srcline,insn` which splits each
   record onto 2 physical lines → --analyze falsely reports 51% opcode-byte drop (true 6.5%/3%).
   Fix the plan generator (drop srcline) or the parser. Flagged, not fixed.
+
+──── GATE-2 (block-finder vs decode, 2026-07-10, SLEEP frequency-neutral, N=11) ────
+Two-arm perturbation (worktree diag/gate2-bf-vs-dec @ 43a4f3aa). SPIN mode gave an 8.7x
+turbo-depression artifact under tight pinning (discarded per the freq-neutral-control rule);
+SLEEP is the trustworthy result. Δwall/Δinject slopes at 40ms: BF=0.247, DEC=0.231 — TIED,
+both ~25% wall-coupled. rapidgzip control flat (31-32ms). VERDICT: neither the block finder
+nor the decode is a clean 1:1 wall lever — the parallel pipeline overlaps ~75% of any single
+region's delay. The block finder is NOT pure async slack (real 25% coupling) but NOT the whole
+story. JOINT READ: gz does similar TOTAL work to rg (193M vs 209M instr) but PARALLELIZES WORSE
+(1.3x vs 1.9x on 4 threads) — that parallelism gap IS the 42ms-vs-31ms wall gap. Biggest single
+reducible divergence feeding it = the block finder (gz 86.7M vs rg 36.6M, +50M), concentrated in
+find_next_uncompressed_block (14.6M) + validate_huffman_codes (13.1M). LEVER IN FLIGHT: converge
+gz's block finder to rg's cheaper scan (skip stored blocks via LEN; cheaper candidate rejection),
+gate on fulcrum score. If it fires but the score stays flat (25% coupling absorbed by overlap),
+the next front is PARALLELISM/scheduling (gz 1.3x vs rg 1.9x). Gate-3 cross-arch owed either way.
