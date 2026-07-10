@@ -1,5 +1,46 @@
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║ TOOL VERDICT (2026-07-09, supersedes ALL hand-analysis below) — the committed,     ║
+║ self-validating instrument replaced the 7 throwaway hand-atomic cycles.            ║
+║                                                                                     ║
+║ INSTRUMENT: gzippy `--features phase-timing` (commits 196eca29+38efa665, OFF by    ║
+║ default, byte-exact prod) emits a conserved phase record; `fulcrum phasebreak`      ║
+║ (fulcrum @ 2e8b1ee) analyzes host-side with Gate-0 CONSERVATION (wall = waits+cpu   ║
+║ +overlap, residual ≤ max(500us,12%)) + inert-oracle trap. It REFUSES a breakdown    ║
+║ that does not conserve — so these numbers are gated, not narrated.                  ║
+║                                                                                     ║
+║ AMD storedheavy T4, N=7, Gate-0 PASS:                                               ║
+║   consumer_wall 35.7ms | decode_wait 30.9ms (87%!) | consumer_cpu 2.1ms |           ║
+║   drain 0.15ms | future_recv 0ms | blockfind 0ms → dominant = DECODE_WAIT.          ║
+║                                                                                     ║
+║ VERDICT: storedheavy is DECODE-THROUGHPUT-BOUND — the consumer spends ~87% of the   ║
+║ wall WAITING for workers to decode chunks (decode_wait now includes                 ║
+║ try_take_prefetched_pumping, the ~97%-of-wall wait my hand-cycles MISSED — found    ║
+║ by the tool's conservation gate). The lever is WORKER per-thread DECODE THROUGHPUT  ║
+║ (the inner Huffman/stored decode loop — CLAUDE.md-OPEN territory), NOT consumer     ║
+║ orchestration and NOT marker-resolution.                                            ║
+║                                                                                     ║
+║ FALSIFIED BY THE TOOL (both were my hand-attributed pins below):                    ║
+║  - "consumer per-chunk orchestration is the cost" — NO: consumer_cpu is 2.1ms.      ║
+║  - "marker-resolution / future_recv pipeline (~21ms) is the deficit" — NO:          ║
+║    future_recv≈0 on storedheavy (it is stored, not marker-heavy; the inert-oracle   ║
+║    trap fires confirming ~no marker resolution). My 21ms→future_recv attribution    ║
+║    (via cursor-agent code-reasoning) was WRONG; the deterministic instrument shows  ║
+║    that 21ms was actually the uninstrumented try_take_prefetched_pumping DECODE     ║
+║    wait, now folded into decode_wait.                                               ║
+║                                                                                     ║
+║ STILL OWED (tool is honest about it): T8/T16 REFUSE — a ~5ms region grows with T    ║
+║ beyond waits+cpu (an uninstrumented consumer wait at high chunk-count). Next tool   ║
+║ iteration: add that span to phase_timing until T8/T16 conserve, THEN read them.     ║
+║ Then Gate-2 the worker-decode-throughput lever (perturb worker decode, watch wall). ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
 storedheavy AMD-Zen2 deficit — FINER CONSUMER-LOOP PHASE-TIMING (measured, 2026-07-09)
 =======================================================================================
+NOTE: everything below this line is the HAND-ANALYSIS JOURNEY that the TOOL VERDICT
+above supersedes. It is kept as a cautionary record of ~5 successive hand-attributed
+pins (consumer orchestration, clone, marker-resolution, ...) each overturned by the
+next measurement — the exact bias pattern that motivated building the instrument.
+Read the box above for the gated finding; read below only for method/history.
 
 WHY THIS FILE: the prior handoff (leverD-overlap-FALSIFIED.txt) pinned the storedheavy
 T4/8/16 deficit to marker_inflate.rs:1424 (per-block window-absent stored-flip decode)

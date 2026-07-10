@@ -1,0 +1,8 @@
+{"kind":"phasebreak","protocol":1,"wall_us":33827,"consumer_wall_us":33822,"consumer_cpu_us":3310,"decode_wait_us":25561,"future_recv_us":0,"drain_us":2042,"blockfind_us":9,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":25451,"consumer_wall_us":25446,"consumer_cpu_us":2914,"decode_wait_us":13384,"future_recv_us":3928,"drain_us":196,"blockfind_us":9,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":23359,"consumer_wall_us":23354,"consumer_cpu_us":2919,"decode_wait_us":16238,"future_recv_us":0,"drain_us":651,"blockfind_us":3,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":24198,"consumer_wall_us":24194,"consumer_cpu_us":2470,"decode_wait_us":17267,"future_recv_us":0,"drain_us":152,"blockfind_us":7,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":23826,"consumer_wall_us":23821,"consumer_cpu_us":3014,"decode_wait_us":15154,"future_recv_us":2104,"drain_us":167,"blockfind_us":7,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":25241,"consumer_wall_us":25236,"consumer_cpu_us":2963,"decode_wait_us":15070,"future_recv_us":0,"drain_us":181,"blockfind_us":2,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":39233,"consumer_wall_us":39228,"consumer_cpu_us":2998,"decode_wait_us":26331,"future_recv_us":0,"drain_us":151,"blockfind_us":7,"finalize_us":0,"iters":40,"threads":8}
+{"kind":"phasebreak","protocol":1,"wall_us":27784,"consumer_wall_us":27779,"consumer_cpu_us":2865,"decode_wait_us":17813,"future_recv_us":1956,"drain_us":213,"blockfind_us":8,"finalize_us":0,"iters":40,"threads":8}
