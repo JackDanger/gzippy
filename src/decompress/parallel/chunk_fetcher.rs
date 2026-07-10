@@ -268,6 +268,160 @@ impl InputSlice {
     }
 }
 
+/// Minimum input length for the STEP-3 progressive input-page reaper to arm.
+/// Small inputs cost ~nothing to tear down, so they stay byte-for-byte on the
+/// old path (no madvise). storedheavy/silesia/nasa/… all clear this.
+#[cfg(parallel_sm)]
+const INPUT_RELEASE_MIN_LEN: usize = 16 * 1024 * 1024;
+/// Keep this many bytes immediately behind the in-order decode frontier
+/// resident — a slack band so an in-flight worker's read cursor (or a
+/// speculative prefetch that reaches slightly back) never trips a re-fault.
+#[cfg(parallel_sm)]
+const INPUT_RELEASE_MARGIN: usize = 4 * 1024 * 1024;
+/// Release in stride-sized batches so the whole 100 MB input costs ~a dozen
+/// `madvise` calls (amortized on the consumer thread), not one per chunk.
+#[cfg(parallel_sm)]
+const INPUT_RELEASE_STRIDE: usize = 8 * 1024 * 1024;
+
+#[cfg(parallel_sm)]
+#[inline]
+fn reaper_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if v > 0 {
+            v as usize
+        } else {
+            4096
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        4096
+    }
+}
+
+/// STEP-3 (storedheavy exit-teardown lever, gated 2026-07-10). On a large
+/// single-member decode gz holds the ENTIRE input mmap resident until the
+/// `Mmap::drop` at the end of `decompress_file` — where a single serial
+/// `munmap` of the ~100 MB input costs ~3–7 ms at process exit (strace-measured
+/// on AMD Zen2: `munmap(100016878) <0.006816>` immediately before
+/// `exit_group`). rapidgzip pays ~0 there because it keeps a bounded resident
+/// set (~50 MB). This reaper releases consumed input pages DURING decode,
+/// overlapped with the parallel decode work, so the resident set — and thus the
+/// final teardown — shrinks toward rapidgzip's.
+///
+/// Correctness: the input is a file-backed mmap, so `MADV_DONTNEED` only drops
+/// resident pages; any later access re-faults them from the page cache with the
+/// original bytes. It therefore CANNOT change decoded output. We only release
+/// pages behind `furthest_decoded_bit − MARGIN`, which are past every worker's
+/// read cursor (decode and the block-finder only advance forward; a block that
+/// falls behind the frontier is skipped, never re-decoded — see the
+/// `next_block_offset < furthest_decoded_bit` guard). This preserves gz's
+/// eager teardown (no deferred munmap is introduced).
+#[cfg(parallel_sm)]
+struct InputReaper {
+    base: *const u8,
+    len: usize,
+    released: usize,
+    page: usize,
+    enabled: bool,
+}
+
+#[cfg(parallel_sm)]
+impl InputReaper {
+    fn new(input: InputSlice) -> Self {
+        // Arm ONLY when the input is a FILE-BACKED mapping. `MADV_DONTNEED` on a
+        // file-backed range merely drops resident pages (re-fault restores the
+        // bytes from the page cache), but on ANONYMOUS memory it is DESTRUCTIVE
+        // (pages zero-fill on re-fault). Library / stdin-pipe / test callers pass
+        // a `Vec`-backed (anonymous) input, so the reaper MUST stay off there; the
+        // production `-dc file` path maps the input file and is safe. Verified by
+        // parsing this address's mapping in `/proc/self/maps` (inode != 0).
+        let enabled = input.len >= INPUT_RELEASE_MIN_LEN && Self::input_is_file_backed(input.ptr);
+        Self {
+            base: input.ptr,
+            len: input.len,
+            released: 0,
+            page: reaper_page_size(),
+            enabled,
+        }
+    }
+
+    /// True iff `ptr` lies in a file-backed VMA (non-zero inode in
+    /// `/proc/self/maps`). Conservative: any parse/read failure ⇒ `false`
+    /// (reaper disabled ⇒ byte-safe fallback to the old path).
+    #[cfg(unix)]
+    fn input_is_file_backed(ptr: *const u8) -> bool {
+        let addr = ptr as usize;
+        let maps = match std::fs::read_to_string("/proc/self/maps") {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        for line in maps.lines() {
+            // `start-end perms offset dev inode pathname`
+            let mut it = line.split_whitespace();
+            let range = match it.next() {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut rp = range.split('-');
+            let start = rp.next().and_then(|x| usize::from_str_radix(x, 16).ok());
+            let end = rp.next().and_then(|x| usize::from_str_radix(x, 16).ok());
+            let (start, end) = match (start, end) {
+                (Some(s), Some(e)) => (s, e),
+                _ => continue,
+            };
+            if addr >= start && addr < end {
+                // remaining tokens: perms(0) offset(1) dev(2) inode(3) path(4)
+                let inode = it.nth(3).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+                return inode != 0;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(unix))]
+    fn input_is_file_backed(_ptr: *const u8) -> bool {
+        false
+    }
+
+    /// Release consumed input pages up to `frontier_bit − MARGIN` (page-aligned,
+    /// stride-batched). Called from the in-order consumer after the frontier
+    /// advances. No-op when disabled, off-unix, or below the stride threshold.
+    #[inline]
+    fn advance(&mut self, frontier_bit: usize) {
+        if !self.enabled {
+            return;
+        }
+        let frontier = (frontier_bit / 8).min(self.len);
+        let safe = frontier.saturating_sub(INPUT_RELEASE_MARGIN);
+        if safe <= self.released || safe - self.released < INPUT_RELEASE_STRIDE {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let start_addr = self.base as usize + self.released;
+            let aligned_start = (start_addr + self.page - 1) & !(self.page - 1);
+            let aligned_end = (self.base as usize + safe) & !(self.page - 1);
+            if aligned_end > aligned_start {
+                // SAFETY: [base, base+len) is the live input mmap held by `drive`
+                // for the whole decode. MADV_DONTNEED on a file-backed range drops
+                // only resident pages (re-access re-faults from the page cache) —
+                // it frees no Rust-owned memory and cannot alter decoded bytes.
+                unsafe {
+                    libc::madvise(
+                        aligned_start as *mut libc::c_void,
+                        aligned_end - aligned_start,
+                        libc::MADV_DONTNEED,
+                    );
+                }
+            }
+        }
+        self.released = safe;
+    }
+}
+
 // ── Public driver entry point ─────────────────────────────────────────────
 
 /// Decompress an entire raw deflate stream, writing output bytes to
@@ -1102,6 +1256,10 @@ fn consumer_loop<W: std::io::Write>(
     // Furthest compressed bit offset whose decoded bytes have been
     // handed to the consumer loop (chunk end, not partition guess).
     let mut furthest_decoded_bit: usize = 0;
+    // STEP-3: progressively release consumed input mmap pages behind the
+    // in-order frontier so process-exit teardown of the input is cheap
+    // (overlapped with decode). Byte-transparent — see `InputReaper`.
+    let mut input_reaper = InputReaper::new(input);
     // Pending writes (post-process jobs in flight, output order).
     let mut pending: std::collections::VecDeque<PendingWrite> =
         std::collections::VecDeque::with_capacity(pool_size * 2);
@@ -1540,6 +1698,7 @@ fn consumer_loop<W: std::io::Write>(
         }
         let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
         furthest_decoded_bit = furthest_decoded_bit.max(chunk_end_bit);
+        input_reaper.advance(furthest_decoded_bit);
 
         // Vendor GzipChunkFetcher.hpp:343 — `postProcessChunk(chunkData, lastWindow)`.
         // The window emplacement at lines 558-575 (tail-window publish on
