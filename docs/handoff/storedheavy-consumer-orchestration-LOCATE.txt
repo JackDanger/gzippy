@@ -372,3 +372,21 @@ find_next_uncompressed_block (14.6M) + validate_huffman_codes (13.1M). LEVER IN 
 gz's block finder to rg's cheaper scan (skip stored blocks via LEN; cheaper candidate rejection),
 gate on fulcrum score. If it fires but the score stays flat (25% coupling absorbed by overlap),
 the next front is PARALLELISM/scheduling (gz 1.3x vs rg 1.9x). Gate-3 cross-arch owed either way.
+
+──── FALSIFY: finder first-hit change + PINNED ROOT CAUSE (2026-07-10) ────
+Finder first-hit early-exit (branch feat/blockfinder-first-hit-converge @ 91f7890d,
+byte-exact, +92/-14 blockfinder_validation.rs): does NOT fire on storedheavy (stored regions
+have no candidates → whole 8KiB window scanned regardless of first_only). Total instr flat
+(194M→192M), fulcrum score BIMODAL/noisy no-improvement, win cells hold. KEEP as a faithful
+no-regression tie for candidate-dense corpora; NOT a storedheavy win.
+PINNED ROOT CAUSE (deterministic): the 2.4x block-finding excess is NOT the finder's
+per-position work (faithful port) — it is the CONSUMER's boundary-ADVANCE. gz's slow-path
+consumer (chunk_fetcher.rs:3265 with_sync_boundary_search) WINDOW-SCANS the finder to locate
+each successive block boundary across stored regions; rapidgzip WALKS the deflate block chain
+during decode (read header → skip stored LEN bytes / decode → next block), calling the finder
+only for the chunk ENTRY point. On 98.9%-stored data gz re-scans stored regions to find
+boundaries reachable directly via LEN. This is BOTH the block-finding excess AND the leading
+suspect for the parallelism deficit (gz 1.3x vs rg 1.9x = the 42-vs-31ms wall gap).
+LEVER IN FLIGHT: converge the consumer boundary-advance to rg's chain-walk (use the decoder's
+post-block position; skip stored LEN; finder only at chunk entry). Gate on fulcrum score.
+If it fires but score flat → parallelism limit is elsewhere → measure via fulcrum consumer+scaling.
