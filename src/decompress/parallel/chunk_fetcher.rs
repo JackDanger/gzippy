@@ -700,6 +700,7 @@ fn drive_impl<W: std::io::Write>(
             pool_size,
         );
         crate::decompress::parallel::phase_timing::emit(&phases);
+        crate::decompress::parallel::phase_timing::emit_pathaccount();
     }
     block_fetcher
         .statistics

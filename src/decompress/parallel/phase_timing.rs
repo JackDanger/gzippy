@@ -115,6 +115,133 @@ pub static WORKER_DECODE_WINDOW_PRESENT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "phase-timing")]
 pub static WORKER_DECODE_WINDOW_ABSENT: AtomicU64 = AtomicU64::new(0);
 
+// ── PATH-ACCOUNTING counters (2026-07-09, storedheavy 91%-flow brief) ──────
+// Partition EVERY output-producing site in `marker_inflate.rs` into disjoint
+// buckets so the summed decoded bytes reconcile to the true output size
+// (conservation self-test) and the accumulated per-bucket TIME reveals which
+// decode path dominates the wall. Buckets (all bytes are LOGICAL decoded
+// output bytes, i.e. what advances `Block::decoded_bytes`):
+//
+//   * marker fast loop  (`decode_marker_fast_loop`)     — literal / backref
+//   * clean  fast loop  (`decode_clean_fast_loop`)      — literal / backref
+//   * careful per-symbol tail (`decode_careful_tail`)   — all output
+//   * STORED block special-case bulk copy               — `try_read_stored_special`
+//   * STORED block per-byte path                        — `read_internal_uncompressed`
+//   * contiguous window-PRESENT clean decode            — `decode_clean_into_contig`
+//
+// Each `_BYTES` bucket has a paired `_NS` time accumulator (RAII `PhaseGuard`
+// around the whole site, coarse) and, where per-block coordination matters,
+// a `_CALLS` invocation count. Global atomics, reset once per `drive_impl`
+// (all worker decodes run after the reset, read after workers join). NO
+// rapidgzip counterpart — gzippy-only measurement scaffolding.
+
+/// Marker fast loop literal bytes (`lit_prefix` stores). The store-oracle's
+/// ~8.7M figure lands here.
+#[cfg(feature = "phase-timing")]
+pub static MFAST_LIT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Marker fast loop back-ref/copy bytes (`length`).
+#[cfg(feature = "phase-timing")]
+pub static MFAST_BACKREF_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Clean (post-flip) fast loop literal bytes.
+#[cfg(feature = "phase-timing")]
+pub static CFAST_LIT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Clean (post-flip) fast loop back-ref/copy bytes.
+#[cfg(feature = "phase-timing")]
+pub static CFAST_BACKREF_BYTES: AtomicU64 = AtomicU64::new(0);
+/// All bytes emitted from `decode_careful_tail` (literal + back-ref, both
+/// specializations).
+#[cfg(feature = "phase-timing")]
+pub static CAREFUL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// STORED-block bytes copied by the special-case bulk path
+/// (`try_read_stored_special`: case1 ≥window / case2 crossing / case3 clean
+/// bulk — all `read_stored_bytes_aligned`).
+#[cfg(feature = "phase-timing")]
+pub static STORED_SPECIAL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// STORED-block bytes emitted by the per-byte fallback path
+/// (`read_internal_uncompressed`, when the special cases decline).
+#[cfg(feature = "phase-timing")]
+pub static STORED_PERBYTE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Window-PRESENT contiguous clean-decode bytes (`decode_clean_into_contig`,
+/// incl. the asm-kernel `run_contig` path). Accounts the confirmed/exact
+/// decode output that never goes through the u16 ring.
+#[cfg(feature = "phase-timing")]
+pub static CONTIG_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Time accumulators (ns) — one per bucket, RAII-bracketed at the site.
+#[cfg(feature = "phase-timing")]
+pub static MFAST_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static CFAST_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static CAREFUL_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static STORED_SPECIAL_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static STORED_PERBYTE_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static CONTIG_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Invocation counts — for per-block coordination analysis (bytes/call =
+/// average stored-block size; call rate vs copy time = setup overhead).
+#[cfg(feature = "phase-timing")]
+pub static MFAST_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static CFAST_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static CAREFUL_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static STORED_SPECIAL_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static STORED_PERBYTE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "phase-timing")]
+pub static CONTIG_CALLS: AtomicU64 = AtomicU64::new(0);
+
+macro_rules! path_add_fn {
+    ($add:ident, $counter:ident) => {
+        #[cfg(feature = "phase-timing")]
+        #[inline]
+        pub fn $add(n: u64) {
+            $counter.fetch_add(n, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "phase-timing"))]
+        #[inline(always)]
+        pub fn $add(_n: u64) {}
+    };
+}
+path_add_fn!(add_mfast_lit, MFAST_LIT_BYTES);
+path_add_fn!(add_mfast_backref, MFAST_BACKREF_BYTES);
+path_add_fn!(add_cfast_lit, CFAST_LIT_BYTES);
+path_add_fn!(add_cfast_backref, CFAST_BACKREF_BYTES);
+path_add_fn!(add_careful_bytes, CAREFUL_BYTES);
+path_add_fn!(add_stored_special, STORED_SPECIAL_BYTES);
+path_add_fn!(add_stored_perbyte, STORED_PERBYTE_BYTES);
+path_add_fn!(add_contig_bytes, CONTIG_BYTES);
+path_add_fn!(add_mfast_ns, MFAST_NS);
+path_add_fn!(add_cfast_ns, CFAST_NS);
+path_add_fn!(add_careful_ns, CAREFUL_NS);
+path_add_fn!(add_stored_special_ns, STORED_SPECIAL_NS);
+path_add_fn!(add_stored_perbyte_ns, STORED_PERBYTE_NS);
+path_add_fn!(add_contig_ns, CONTIG_NS);
+
+macro_rules! path_call_fn {
+    ($add:ident, $counter:ident) => {
+        #[cfg(feature = "phase-timing")]
+        #[inline]
+        pub fn $add() {
+            $counter.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "phase-timing"))]
+        #[inline(always)]
+        pub fn $add() {}
+    };
+}
+path_call_fn!(inc_mfast_calls, MFAST_CALLS);
+path_call_fn!(inc_cfast_calls, CFAST_CALLS);
+path_call_fn!(inc_careful_calls, CAREFUL_CALLS);
+path_call_fn!(inc_stored_special_calls, STORED_SPECIAL_CALLS);
+path_call_fn!(inc_stored_perbyte_calls, STORED_PERBYTE_CALLS);
+path_call_fn!(inc_contig_calls, CONTIG_CALLS);
+
 /// Reset all atomics to zero. Called once at the start of every `drive_impl`
 /// invocation so per-decode snapshots do not accumulate across calls in a
 /// long-lived process (e.g. a test harness that decodes repeatedly).
@@ -130,7 +257,98 @@ pub fn reset_atomics() {
     WORKER_DECODED_BYTES.store(0, Ordering::Relaxed);
     WORKER_DECODE_WINDOW_PRESENT.store(0, Ordering::Relaxed);
     WORKER_DECODE_WINDOW_ABSENT.store(0, Ordering::Relaxed);
+    for c in [
+        &MFAST_LIT_BYTES,
+        &MFAST_BACKREF_BYTES,
+        &CFAST_LIT_BYTES,
+        &CFAST_BACKREF_BYTES,
+        &CAREFUL_BYTES,
+        &STORED_SPECIAL_BYTES,
+        &STORED_PERBYTE_BYTES,
+        &CONTIG_BYTES,
+        &MFAST_NS,
+        &CFAST_NS,
+        &CAREFUL_NS,
+        &STORED_SPECIAL_NS,
+        &STORED_PERBYTE_NS,
+        &CONTIG_NS,
+        &MFAST_CALLS,
+        &CFAST_CALLS,
+        &CAREFUL_CALLS,
+        &STORED_SPECIAL_CALLS,
+        &STORED_PERBYTE_CALLS,
+        &CONTIG_CALLS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
 }
+
+/// Emit ONE structured JSON line accounting all decode output bytes by path,
+/// their accumulated per-path time, and per-path invocation counts. Written
+/// to `GZIPPY_PHASE_OUT` (append) if set, else stderr prefixed
+/// `[pathaccount] `. Called once per `drive_impl`, right after [`emit`].
+#[cfg(feature = "phase-timing")]
+pub fn emit_pathaccount() {
+    let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    let mfast_lit = load(&MFAST_LIT_BYTES);
+    let mfast_backref = load(&MFAST_BACKREF_BYTES);
+    let cfast_lit = load(&CFAST_LIT_BYTES);
+    let cfast_backref = load(&CFAST_BACKREF_BYTES);
+    let careful = load(&CAREFUL_BYTES);
+    let stored_special = load(&STORED_SPECIAL_BYTES);
+    let stored_perbyte = load(&STORED_PERBYTE_BYTES);
+    let contig = load(&CONTIG_BYTES);
+    let total = mfast_lit
+        + mfast_backref
+        + cfast_lit
+        + cfast_backref
+        + careful
+        + stored_special
+        + stored_perbyte
+        + contig;
+    let line = format!(
+        "{{\"kind\":\"pathaccount\",\"protocol\":1,\
+\"mfast_lit_bytes\":{mfast_lit},\"mfast_backref_bytes\":{mfast_backref},\
+\"cfast_lit_bytes\":{cfast_lit},\"cfast_backref_bytes\":{cfast_backref},\
+\"careful_bytes\":{careful},\"stored_special_bytes\":{stored_special},\
+\"stored_perbyte_bytes\":{stored_perbyte},\"contig_bytes\":{contig},\
+\"total_bytes\":{total},\
+\"mfast_ns\":{},\"cfast_ns\":{},\"careful_ns\":{},\"stored_special_ns\":{},\
+\"stored_perbyte_ns\":{},\"contig_ns\":{},\
+\"mfast_calls\":{},\"cfast_calls\":{},\"careful_calls\":{},\
+\"stored_special_calls\":{},\"stored_perbyte_calls\":{},\"contig_calls\":{}}}",
+        load(&MFAST_NS),
+        load(&CFAST_NS),
+        load(&CAREFUL_NS),
+        load(&STORED_SPECIAL_NS),
+        load(&STORED_PERBYTE_NS),
+        load(&CONTIG_NS),
+        load(&MFAST_CALLS),
+        load(&CFAST_CALLS),
+        load(&CAREFUL_CALLS),
+        load(&STORED_SPECIAL_CALLS),
+        load(&STORED_PERBYTE_CALLS),
+        load(&CONTIG_CALLS),
+    );
+    match std::env::var_os("GZIPPY_PHASE_OUT") {
+        Some(path) => {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        None => {
+            eprintln!("[pathaccount] {line}");
+        }
+    }
+}
+#[cfg(not(feature = "phase-timing"))]
+#[inline(always)]
+pub fn emit_pathaccount() {}
 #[cfg(not(feature = "phase-timing"))]
 #[inline(always)]
 pub fn reset_atomics() {}
@@ -264,6 +482,57 @@ impl PhaseGuard {
     #[inline(always)]
     pub fn new(_add: fn(u64)) -> Self {
         Self
+    }
+}
+
+/// RAII guard for the fast-loop byte-split sites: accumulates two byte counts
+/// into non-atomic stack `Cell`s during the hot loop (zero atomic/TLS cost per
+/// iteration), then flushes BOTH into their global atomics, records the
+/// wall-time of the whole loop, and bumps the invocation count — on ANY exit
+/// (Drop runs on every `return`/`break`-fallthrough, incl. the macro-internal
+/// returns). Used only from `#[cfg(feature = "phase-timing")]`-gated call
+/// sites, so no no-op counterpart is needed.
+#[cfg(feature = "phase-timing")]
+#[must_use]
+pub struct PathPairGuard<'a> {
+    a: &'a std::cell::Cell<u64>,
+    b: &'a std::cell::Cell<u64>,
+    add_a: fn(u64),
+    add_b: fn(u64),
+    add_ns: fn(u64),
+    inc_calls: fn(),
+    start: std::time::Instant,
+}
+#[cfg(feature = "phase-timing")]
+impl<'a> PathPairGuard<'a> {
+    #[inline]
+    pub fn new(
+        a: &'a std::cell::Cell<u64>,
+        b: &'a std::cell::Cell<u64>,
+        add_a: fn(u64),
+        add_b: fn(u64),
+        add_ns: fn(u64),
+        inc_calls: fn(),
+    ) -> Self {
+        Self {
+            a,
+            b,
+            add_a,
+            add_b,
+            add_ns,
+            inc_calls,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+#[cfg(feature = "phase-timing")]
+impl Drop for PathPairGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        (self.add_a)(self.a.get());
+        (self.add_b)(self.b.get());
+        (self.add_ns)(self.start.elapsed().as_nanos() as u64);
+        (self.inc_calls)();
     }
 }
 
