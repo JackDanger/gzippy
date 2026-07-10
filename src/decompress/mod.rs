@@ -161,7 +161,28 @@ fn parallel_sm_unprofitable(data: &[u8]) -> bool {
 /// `decompress_gzip_libdeflate` and `decompress_single_member` only
 /// dispatch on the result.
 pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
-    if has_bgzf_markers(data) {
+    let bgzf_markers = has_bgzf_markers(data);
+    let multi = is_likely_multi_member(data);
+    classify_gzip_prescanned(data, num_threads, bgzf_markers, multi)
+}
+
+/// Routing core shared with the I/O layer's single-scan fast path.
+///
+/// `classify_gzip` computes `has_bgzf_markers` + `is_likely_multi_member` and
+/// delegates here. The I/O dispatcher (`decompress_to_writer` / `decompress_stdin`)
+/// ALSO needs those two predicates to pick bgzf/multi/single, so it computes
+/// them ONCE and threads them in — eliminating a redundant SECOND
+/// `is_likely_multi_member` scan (a ~16 MiB memmem walk on large single-member
+/// inputs, run twice on the production `-dc` path). Byte-identical routing:
+/// `bgzf_markers` and `multi` are the *only* values classify derived from those
+/// two scans, so passing them in produces the same `DecodePath`.
+pub(crate) fn classify_gzip_prescanned(
+    data: &[u8],
+    num_threads: usize,
+    bgzf_markers: bool,
+    multi: bool,
+) -> DecodePath {
+    if bgzf_markers {
         // A first-member "GZ" FEXTRA hit means gzippy's own parallel format —
         // UNLESS the file is a mixed concatenation (GZ members ++ a plain gzip
         // member, or vice-versa). The GZ fast path (`decompress_bgzf_parallel`)
@@ -176,7 +197,7 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         }
         return DecodePath::GzippyParallel;
     }
-    if is_likely_multi_member(data) {
+    if multi {
         // Plain multi-member streams keep the member-per-worker split
         // ([`MultiMemberPar`]) at T>1 / sequential at T1.
         //
@@ -434,7 +455,34 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
     num_threads: usize,
     verbose: bool,
 ) -> GzippyResult<u64> {
-    let path = classify_gzip(data, num_threads);
+    let bgzf_markers = has_bgzf_markers(data);
+    let multi = is_likely_multi_member(data);
+    decompress_single_member_fd_prescanned(
+        data,
+        writer,
+        out_fd,
+        num_threads,
+        verbose,
+        bgzf_markers,
+        multi,
+    )
+}
+
+/// [`decompress_single_member_fd`] with the two format-detection scans supplied
+/// by the caller (the I/O layer already computed them to route bgzf/multi/single),
+/// so the ~16 MiB `is_likely_multi_member` memmem walk is not repeated here.
+/// Byte-identical routing — see [`classify_gzip_prescanned`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decompress_single_member_fd_prescanned<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    num_threads: usize,
+    verbose: bool,
+    bgzf_markers: bool,
+    multi: bool,
+) -> GzippyResult<u64> {
+    let path = classify_gzip_prescanned(data, num_threads, bgzf_markers, multi);
     if crate::utils::debug_enabled() {
         eprintln!(
             "[gzippy] decompress_single_member path={:?} threads={} bytes={}",
@@ -509,7 +557,22 @@ pub(crate) fn decompress_single_member<W: Write>(
     num_threads: usize,
     verbose: bool,
 ) -> GzippyResult<u64> {
-    let path = classify_gzip(data, num_threads);
+    let bgzf_markers = has_bgzf_markers(data);
+    let multi = is_likely_multi_member(data);
+    decompress_single_member_prescanned(data, writer, num_threads, verbose, bgzf_markers, multi)
+}
+
+/// [`decompress_single_member`] reusing the caller's format-detection scans.
+/// Byte-identical routing — see [`classify_gzip_prescanned`].
+pub(crate) fn decompress_single_member_prescanned<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+    verbose: bool,
+    bgzf_markers: bool,
+    multi: bool,
+) -> GzippyResult<u64> {
+    let path = classify_gzip_prescanned(data, num_threads, bgzf_markers, multi);
     if crate::utils::debug_enabled() {
         eprintln!(
             "[gzippy] decompress_single_member path={:?} threads={} bytes={}",
