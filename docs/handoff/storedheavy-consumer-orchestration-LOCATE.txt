@@ -276,3 +276,24 @@ OWED GATES before trusting the broad-deficit interpretation (per governing law):
   - Gate-3 CROSS-ARCH: single AMD box only. Intel replication owed.
 If the comparator self-tests to 1.0 and Intel replicates, the real target is a BROAD ~1-4%
 AMD deficit (decode-throughput-bound per phasebreak) — attack that, not storedheavy alone.
+
+███ CRITICAL INSTRUMENT BUG (2026-07-09): fulcrum score TIMES A FILE-WRITE ███
+score.rs::timed_run (417-445) sinks stdout to a REGULAR FILE and times it — violating
+the project /dev/null sink law ([[reference_bench_instrument_gotchas]]: file-sink
+penalizes the FASTER arm, manufactures phantom sign-flips). Empirical proof (raw
+interleaved best-of-11, /dev/null, taskset-pinned, frozen governor, AMD):
+  silesia   T8: score(file)=0.98 FAIL  →  /dev/null = 1.15  (gz WINS decode by 15%!)
+  storedheavy T4: score(file)=0.96      →  /dev/null = 0.76  (gz loses decode by 24%)
+Absolute walls: silesia gz 270ms(file)→142ms(devnull); rg 264→164. storedheavy gz
+121→42; rg 116→32. The ~80-128ms file-write (100-211MB output) is a near-fixed cost
+added to BOTH arms that DILUTES/FLIPS the decode-time ratio. So:
+  - the "broad 1-4% deficit" (esp. silesia 0.98) is largely a FILE-SINK ARTIFACT — gz
+    actually WINS normal cells on /dev/null;
+  - storedheavy is a BIGGER real loss than the file-sink showed (0.76 not 0.96) —
+    decode-throughput-bound, the true problem cell;
+  - a SECONDARY real finding: gz's file-WRITE is ~28ms slower than rg's on silesia
+    (128 vs 100 extra) — a writer-efficiency lever, separate from decode, only visible
+    with a file sink.
+FIX OWED: score must TIME to /dev/null (per sink law) and sha-verify correctness in a
+SEPARATE untimed run (pipe stdout to sha256sum), then RE-SCORE — the file-sink cells
+(incl the just-banked "true gap") are all contaminated and must be re-measured.
