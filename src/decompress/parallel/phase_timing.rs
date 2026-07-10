@@ -81,6 +81,40 @@ pub static BLOCKFIND_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "phase-timing")]
 pub static ITERS: AtomicU64 = AtomicU64::new(0);
 
+// ── STEP-1 wasted-work counters (2026-07-09, storedheavy sub-cause brief) ──
+// Instrument EVERY call into `run_decode_task` (chunk_fetcher.rs) — the sole
+// choke point through which all worker decode invocations pass (both the
+// window-PRESENT confirmed/exact path via `decode_chunk_with_until_exact`
+// and the window-ABSENT speculative path via `speculative_decode_find_
+// boundary`). These answer: do workers decode MORE total bytes / MORE total
+// invocations than the chunk count and output size would require (wasted
+// speculative / re-decode work), and what fraction of invocations run
+// window-absent (the known "most chunks become all-marker" failure mode)?
+
+/// Total number of times `run_decode_task` ran (one per submitted decode
+/// job — speculative prefetch AND on-demand alike; includes any job whose
+/// result is later discarded by the consumer, e.g. speculative results that
+/// mismatch the confirmed block chain).
+#[cfg(feature = "phase-timing")]
+pub static WORKER_DECODE_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+/// Sum of `ChunkData::decoded_size()` over every SUCCESSFUL worker decode
+/// invocation. Compare against the true output size: if this sum exceeds
+/// the output size, some decoded bytes were produced more than once
+/// (re-decode) or a decode's output was never used (discarded).
+#[cfg(feature = "phase-timing")]
+pub static WORKER_DECODED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Invocations that took the window-PRESENT branch (chunk 0's zero-window
+/// sentinel, or a real predecessor window already published —
+/// `decode_chunk_with_until_exact`).
+#[cfg(feature = "phase-timing")]
+pub static WORKER_DECODE_WINDOW_PRESENT: AtomicU64 = AtomicU64::new(0);
+/// Invocations that took the window-ABSENT / speculative branch
+/// (`speculative_decode_find_boundary` — no predecessor window published
+/// yet, so the worker bootstraps with u16 markers and searches for a block
+/// boundary).
+#[cfg(feature = "phase-timing")]
+pub static WORKER_DECODE_WINDOW_ABSENT: AtomicU64 = AtomicU64::new(0);
+
 /// Reset all atomics to zero. Called once at the start of every `drive_impl`
 /// invocation so per-decode snapshots do not accumulate across calls in a
 /// long-lived process (e.g. a test harness that decodes repeatedly).
@@ -92,6 +126,10 @@ pub fn reset_atomics() {
     DRAIN_NS.store(0, Ordering::Relaxed);
     BLOCKFIND_NS.store(0, Ordering::Relaxed);
     ITERS.store(0, Ordering::Relaxed);
+    WORKER_DECODE_INVOCATIONS.store(0, Ordering::Relaxed);
+    WORKER_DECODED_BYTES.store(0, Ordering::Relaxed);
+    WORKER_DECODE_WINDOW_PRESENT.store(0, Ordering::Relaxed);
+    WORKER_DECODE_WINDOW_ABSENT.store(0, Ordering::Relaxed);
 }
 #[cfg(not(feature = "phase-timing"))]
 #[inline(always)]
@@ -141,6 +179,27 @@ pub fn add_iter() {
 #[cfg(not(feature = "phase-timing"))]
 #[inline(always)]
 pub fn add_iter() {}
+
+/// Record one worker decode invocation: `window_present` selects which
+/// branch of `run_decode_task` ran; `decoded_bytes` is `Some(n)` on a
+/// successful decode (`ChunkData::decoded_size()`), `None` on error (no
+/// bytes to count).
+#[cfg(feature = "phase-timing")]
+#[inline]
+pub fn record_worker_decode(window_present: bool, decoded_bytes: Option<u64>) {
+    WORKER_DECODE_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    if window_present {
+        WORKER_DECODE_WINDOW_PRESENT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WORKER_DECODE_WINDOW_ABSENT.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(n) = decoded_bytes {
+        WORKER_DECODED_BYTES.fetch_add(n, Ordering::Relaxed);
+    }
+}
+#[cfg(not(feature = "phase-timing"))]
+#[inline(always)]
+pub fn record_worker_decode(_window_present: bool, _decoded_bytes: Option<u64>) {}
 
 /// This-thread CPU time in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`). Used to
 /// compute `consumer_cpu_ns` as a delta across the `drive_impl` span — the
@@ -223,6 +282,10 @@ pub struct Phases {
     pub blockfind_ns: u64,
     pub iters: u64,
     pub threads: usize,
+    pub worker_decode_invocations: u64,
+    pub worker_decoded_bytes: u64,
+    pub worker_decode_window_present: u64,
+    pub worker_decode_window_absent: u64,
 }
 
 #[cfg(feature = "phase-timing")]
@@ -247,6 +310,10 @@ impl Phases {
             blockfind_ns: BLOCKFIND_NS.load(Ordering::Relaxed),
             iters: ITERS.load(Ordering::Relaxed),
             threads,
+            worker_decode_invocations: WORKER_DECODE_INVOCATIONS.load(Ordering::Relaxed),
+            worker_decoded_bytes: WORKER_DECODED_BYTES.load(Ordering::Relaxed),
+            worker_decode_window_present: WORKER_DECODE_WINDOW_PRESENT.load(Ordering::Relaxed),
+            worker_decode_window_absent: WORKER_DECODE_WINDOW_ABSENT.load(Ordering::Relaxed),
         }
     }
 }
@@ -256,14 +323,19 @@ impl Phases {
 /// `[phase-timing] `. Hand-formatted flat object (no nesting, no serde_json
 /// dependency needed — gzippy does not otherwise depend on serde_json).
 ///
-/// Schema (protocol 1; all `_us` fields are integer microseconds):
+/// Schema (protocol 1; all `_us` fields are integer microseconds). Fields
+/// added 2026-07-09 (storedheavy sub-cause brief, STEP 1: re-decode/wasted-
+/// work check) are additive-only, so protocol stays 1 — any consumer keyed
+/// on the original field set still parses:
 /// `{"kind":"phasebreak","protocol":1,"wall_us":..,"consumer_wall_us":..,
 /// "consumer_cpu_us":..,"decode_wait_us":..,"future_recv_us":..,
-/// "drain_us":..,"blockfind_us":..,"finalize_us":..,"iters":..,"threads":..}`
+/// "drain_us":..,"blockfind_us":..,"finalize_us":..,"iters":..,"threads":..,
+/// "worker_decode_invocations":..,"worker_decoded_bytes":..,
+/// "worker_decode_window_present":..,"worker_decode_window_absent":..}`
 #[cfg(feature = "phase-timing")]
 pub fn emit(p: &Phases) {
     let line = format!(
-        "{{\"kind\":\"phasebreak\",\"protocol\":1,\"wall_us\":{},\"consumer_wall_us\":{},\"consumer_cpu_us\":{},\"decode_wait_us\":{},\"future_recv_us\":{},\"drain_us\":{},\"blockfind_us\":{},\"finalize_us\":{},\"iters\":{},\"threads\":{}}}",
+        "{{\"kind\":\"phasebreak\",\"protocol\":1,\"wall_us\":{},\"consumer_wall_us\":{},\"consumer_cpu_us\":{},\"decode_wait_us\":{},\"future_recv_us\":{},\"drain_us\":{},\"blockfind_us\":{},\"finalize_us\":{},\"iters\":{},\"threads\":{},\"worker_decode_invocations\":{},\"worker_decoded_bytes\":{},\"worker_decode_window_present\":{},\"worker_decode_window_absent\":{}}}",
         p.total_ns / 1000,
         p.consumer_wall_ns / 1000,
         p.consumer_cpu_ns / 1000,
@@ -274,6 +346,10 @@ pub fn emit(p: &Phases) {
         p.finalize_ns / 1000,
         p.iters,
         p.threads,
+        p.worker_decode_invocations,
+        p.worker_decoded_bytes,
+        p.worker_decode_window_present,
+        p.worker_decode_window_absent,
     );
     match std::env::var_os("GZIPPY_PHASE_OUT") {
         Some(path) => {
