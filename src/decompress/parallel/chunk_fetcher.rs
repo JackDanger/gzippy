@@ -496,6 +496,14 @@ fn drive_impl<W: std::io::Write>(
     // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
     // more workers than physical cores — SMT siblings collide on cache.
     let pool_size = parallelization.max(1);
+    // Phase-timing (feature `phase-timing`, diagnostic-only, no-op without
+    // it): fresh per-decode snapshot + t0 for the whole `drive_impl` span.
+    #[cfg(feature = "phase-timing")]
+    crate::decompress::parallel::phase_timing::reset_atomics();
+    #[cfg(feature = "phase-timing")]
+    let phase_t0 = std::time::Instant::now();
+    #[cfg(feature = "phase-timing")]
+    let phase_cpu_t0 = crate::decompress::parallel::phase_timing::thread_cpu_ns();
 
     // ── m_blockFinder (vendor GzipChunkFetcher.hpp:283) ─────────────
     // AMD/Zen2 T3 TAIL-TAPER (byte-transparent; gated). At 3 workers the in-order
@@ -640,6 +648,15 @@ fn drive_impl<W: std::io::Write>(
     // vendor's `stopThreadPool()` at BlockFetcher.hpp:600-604, called
     // from `~GzipChunkFetcher` before member destruction (line 686).
     thread_pool.stop();
+    // Phase-timing: consumer_wall/consumer_cpu cover `phase_t0` (pool_size
+    // line, above) through this point — setup + `consumer_loop` + pool join.
+    #[cfg(feature = "phase-timing")]
+    let phase_consumer_wall_ns = phase_t0.elapsed().as_nanos() as u64;
+    #[cfg(feature = "phase-timing")]
+    let phase_consumer_cpu_ns = crate::decompress::parallel::phase_timing::thread_cpu_ns()
+        .saturating_sub(phase_cpu_t0);
+    #[cfg(feature = "phase-timing")]
+    let phase_t1 = std::time::Instant::now();
 
     // Faithful overlap writer: drain + join the background output writer so
     // ALL bytes are on the fd and any write error becomes terminal BEFORE the
@@ -668,6 +685,22 @@ fn drive_impl<W: std::io::Write>(
     // `consumer_loop` exits.
     block_map.finalize();
     block_finder.finalize();
+    // Phase-timing: finalize_ns = `phase_t1` (thread_pool.stop(), above)
+    // through here; total_ns = the whole `drive_impl` span. Emit ONE JSON
+    // phasebreak record for this decode.
+    #[cfg(feature = "phase-timing")]
+    {
+        let finalize_ns = phase_t1.elapsed().as_nanos() as u64;
+        let total_ns = phase_t0.elapsed().as_nanos() as u64;
+        let phases = crate::decompress::parallel::phase_timing::Phases::snapshot(
+            phase_consumer_wall_ns,
+            phase_consumer_cpu_ns,
+            finalize_ns,
+            total_ns,
+            pool_size,
+        );
+        crate::decompress::parallel::phase_timing::emit(&phases);
+    }
     block_fetcher
         .statistics
         .base
@@ -1113,9 +1146,19 @@ fn consumer_loop<W: std::io::Write>(
         // Vendor `waitForReplacedMarkers` (:497-511): non-blocking harvest of
         // ready marker-replace futures on every consumer iteration.
         harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
+        // Phase-timing: one consumer_loop iteration.
+        #[cfg(feature = "phase-timing")]
+        crate::decompress::parallel::phase_timing::add_iter();
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
-        let next_block_offset = match block_finder.get(next_unprocessed_block_index) {
+        let phase_blockfind_result = {
+            #[cfg(feature = "phase-timing")]
+            let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
+                crate::decompress::parallel::phase_timing::add_blockfind,
+            );
+            block_finder.get(next_unprocessed_block_index)
+        };
+        let next_block_offset = match phase_blockfind_result {
             (Some(offset), GetReturnCode::Success) => offset,
             // Vendor GzipChunkFetcher.hpp:320-327 — EOF when no offset
             // or offset past end of file.
@@ -1396,25 +1439,33 @@ fn consumer_loop<W: std::io::Write>(
                         skip_keys,
                     );
                 }
-                let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
-                    next_block_offset,
-                    |_key: usize| -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
-                        submit_decode_to_pool(
-                            thread_pool,
-                            input,
-                            params,
-                            window_map,
-                            block_fetcher,
-                            configuration,
-                        )
-                    },
-                    lookup_block_offset,
-                    lookup_next_block_offset,
-                    prefetch_submit,
-                    is_finalized_too_high,
-                    partition_offset_for,
-                    should_drive_prefetch,
-                );
+                let (chunk_arc_result, _prefetched) = {
+                    // Phase-timing: consumer blocked on the on-demand
+                    // decode/cache-miss path.
+                    #[cfg(feature = "phase-timing")]
+                    let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
+                        crate::decompress::parallel::phase_timing::add_decode_wait,
+                    );
+                    block_fetcher.get_with_prefetch(
+                        next_block_offset,
+                        |_key: usize| -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
+                            submit_decode_to_pool(
+                                thread_pool,
+                                input,
+                                params,
+                                window_map,
+                                block_fetcher,
+                                configuration,
+                            )
+                        },
+                        lookup_block_offset,
+                        lookup_next_block_offset,
+                        prefetch_submit,
+                        is_finalized_too_high,
+                        partition_offset_for,
+                        should_drive_prefetch,
+                    )
+                };
                 chunk_arc_result.map_err(FetchError::Decode)?
             }
         };
@@ -2785,6 +2836,16 @@ fn recv_post_process_blocking<F>(
         &mut EagerCompleted,
     )>,
 ) -> Result<F, FetchError> {
+    // Phase-timing: RAII over the WHOLE function body — this is the
+    // consumer's real serial marker-resolution wait (rg
+    // `waitForReplacedMarkers`'s blocking tail), the phase this instrument
+    // exists to surface. Dropped on every return path (early `Ok`/`Err`
+    // returns included), since Rust always runs live-local destructors on
+    // function exit.
+    #[cfg(feature = "phase-timing")]
+    let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
+        crate::decompress::parallel::phase_timing::add_future_recv,
+    );
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     use std::time::Duration;
     loop {
@@ -3378,6 +3439,15 @@ fn drain_one_pending<W: std::io::Write>(
     mut eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted, &mut EagerCompleted)>,
     recycle_deferral: &mut RecycleDeferral,
 ) -> Result<(), FetchError> {
+    // Phase-timing: RAII over the WHOLE function body. NOTE this overlaps
+    // `FUTURE_RECV_NS` when the head pending write is `Async` (this fn
+    // calls `recv_post_process_blocking` below) — `fulcrum phasebreak`'s
+    // conservation check treats that overlap as expected, not a
+    // double-count of disjoint time (see `phase_timing.rs` doc on `DRAIN_NS`).
+    #[cfg(feature = "phase-timing")]
+    let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
+        crate::decompress::parallel::phase_timing::add_drain,
+    );
     if let Some((_, in_flight, completed)) = eager_ctx.as_mut() {
         harvest_ready_postprocess(in_flight, completed);
     }

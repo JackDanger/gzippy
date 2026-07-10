@@ -95,6 +95,11 @@ pub mod lut_huffman;
 pub mod marker_inflate;
 #[cfg(all(unix, parallel_sm))]
 pub mod output_writer;
+/// Diagnostic phase-breakdown emitter (feature `phase-timing`, OFF by
+/// default). Every symbol compiles to a no-op without the feature; see
+/// `phase_timing.rs` module doc. NO rg counterpart — measurement-only.
+#[cfg(parallel_sm)]
+pub mod phase_timing;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
