@@ -233,3 +233,25 @@ T16 .9725→.9475; all Δ<spread; N=9×4 sessions). silesia T8 win-cell no regre
 VERDICT: first-touch fault time is OFF the critical path at T>1 (overlapped by other threads'
 Huffman/marker work) → share≠wall CONFIRMED. NOT shipped. The ONLY remaining decode_wait
 component is the ~59% Huffman/marker inner-loop COMPUTE — that is the sole surviving lever.
+
+─── ADVISOR (cursor-agent Composer, 2026-07-09) — CORRECTS a skipped causal step ───
+"decode_wait dominates (87%)" forces only: the lever is WORKER per-thread decode
+THROUGHPUT (not consumer/marker). It does NOT force "Huffman compute" — perf's 59%
+bucket COLLAPSES three hypotheses: (H) Huffman/bit-reader compute, (M) u16 store/drain
+memory-BANDWIDTH, (S) chunk-granularity/scheduling. "Huffman is the lever" is a
+HYPOTHESIS, not gated.
+DISCRIMINATOR (Gate-2, owed): two-arm worker perturbation on storedheavy AMD T4 (N≥7,
+fulcrum score): Arm H = inject delay in decode_marker_fast_loop AFTER lut decode/consume
+BEFORE ring write; Arm M = inject delay in drain_to_output/MarkerSink::push_slice only.
+Compare Δwall/Δinject: H≫M → compute-bound; M≫H → u16-bandwidth-bound; both flat despite
+decode_wait≈87% → scheduling/granularity (also fix T8/T16 conservation gap).
+CODE LEAD (advisor read marker_inflate.rs): decode_marker_fast_loop does a SPECULATIVE
+8-byte WIDENED store (packed literals→u16, one 8-byte unaligned write per packet) EVEN
+for a single literal; vendor ISA-L appendToWindow does one SCALAR u16 store per literal.
+"rg does the same u16 scheme" is architecturally true but MICRO-arch FALSE on the hot
+literal path → gz may pay extra Zen2 store/L1 bandwidth.
+FIRST TRY (ranked #1, cheap, byte-safe): a `sym_count==1 && literal` fast arm doing ONE
+u16 store (skip the widen+8-byte store), matching vendor per-literal pattern. PRECHECK
+(advisor disqualifier): measure the sym_count distribution first — if most iterations are
+already 2-3 packed literals, #1 won't help; if single-literals dominate (expected for
+literal-heavy incompressible data), implement + fulcrum-score gate. Falsifies cheaply.
