@@ -19,8 +19,21 @@
 //! 1. `drive_impl`: brackets the whole per-decode span (wall + this-thread
 //!    CPU time via `CLOCK_THREAD_CPUTIME_ID`) and the finalize tail, then
 //!    calls [`emit`] once per decode.
-//! 2. `consumer_loop`'s `block_fetcher.get_with_prefetch(...)` call → RAII
-//!    guard accumulating into [`DECODE_WAIT_NS`].
+//! 2. `consumer_loop`'s `block_fetcher.get_with_prefetch(...)` call (the
+//!    on-demand/cache-miss branch) → RAII guard accumulating into
+//!    [`DECODE_WAIT_NS`]. **Deviation from the original brief** (noted per
+//!    this project's honesty rule, cf. fulcrum's `abmeasure.rs` module doc):
+//!    dogfooding against real corpora showed Gate-0 conservation REFUSING
+//!    every run — `consumer_cpu_us` was ~2% of `consumer_wall_us` but the
+//!    four originally-named phases summed to only ~30%. Root cause:
+//!    `block_fetcher.try_take_prefetched_pumping(...)` (the prefetch-HIT-
+//!    but-still-in-flight sibling branch, a few lines above the miss-path
+//!    call the brief named) was uninstrumented — its OWN doc comment names
+//!    it "THE wait that gates the in-order wall (~97% of it)". It is now
+//!    ALSO wrapped and folded into the same `DECODE_WAIT_NS` accumulator
+//!    (both branches are "consumer waiting for the next chunk to become
+//!    ready" — hit vs miss on the prefetch cache). With this, Gate-0
+//!    conservation holds on silesia at T2/T4 and on a stored-heavy corpus.
 //! 3. `consumer_loop`'s `block_finder.get(...)` call → RAII guard
 //!    accumulating into [`BLOCKFIND_NS`].
 //! 4. `consumer_loop`'s per-iteration `harvest_ready_postprocess` (first

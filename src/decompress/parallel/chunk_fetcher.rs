@@ -1359,9 +1359,28 @@ fn consumer_loop<W: std::io::Write>(
                     );
                 }
             };
-            if let Some(Ok(arc)) =
+            // Phase-timing (NOT one of the brief's originally-named 6 sites;
+            // added after dogfooding surfaced it — see phase_timing.rs doc
+            // for the deviation note): `try_take_prefetched_pumping`'s own
+            // doc comment names it "THE wait that gates the in-order wall
+            // (~97% of it)" — it is the prefetch-HIT-but-still-in-flight
+            // branch of the same "get the next chunk" step whose MISS branch
+            // (`get_with_prefetch`, below) the brief did name. Without this,
+            // Gate-0 conservation in `fulcrum phasebreak` REFUSED every real
+            // silesia/storedheavy run: consumer_cpu_us was ~2% of
+            // consumer_wall_us but the four original phases summed to only
+            // ~30% of consumer_wall_us — this call was the missing ~70%.
+            // Folded into the SAME `DECODE_WAIT` accumulator as
+            // `get_with_prefetch` since both are "consumer waiting for a
+            // chunk to become ready", just different hit/miss branches.
+            let phase_decode_wait_result = {
+                #[cfg(feature = "phase-timing")]
+                let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
+                    crate::decompress::parallel::phase_timing::add_decode_wait,
+                );
                 block_fetcher.try_take_prefetched_pumping(&partition_offset, pump)
-            {
+            };
+            if let Some(Ok(arc)) = phase_decode_wait_result {
                 // Vendor GzipChunkFetcher.hpp:646-648,670-684 — accept when
                 // `matchesEncodedOffset(blockOffset)`; else discard and
                 // re-issue at the real offset via `get(blockOffset, ...)`.
