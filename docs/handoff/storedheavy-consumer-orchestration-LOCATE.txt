@@ -200,3 +200,22 @@ decisive consumer_CPU<<wall). The storedheavy deficit is worker-decode-pipeline-
 the sole remaining in-scope lever is worker inner-loop throughput (CLAUDE.md-open).
 Win state (all cells >= 0.99) still UNMET on storedheavy T4/8/16 — but the target is
 now fixed by measurement, and all wrong targets are eliminated with evidence.
+
+─── perf LOCATE of the worker decode (2026-07-09, WEAK tier — hypothesis) ───
+perf record on AMD storedheavy T4 (debuginfo build, 4187 samples): of the WORKER
+decode (which phasebreak gated as 87% of the wall):
+  ~41% __memmove_avx_unaligned_erms (byte copy) — of which ~28% (=~11% of decode,
+       ~10% of wall) is asm_exc_page_fault → do_anonymous_page → alloc_pages =
+       FIRST-TOUCH page-faults on freshly-allocated ANONYMOUS per-chunk decode
+       buffers (not the input mmap). Remaining ~13% is the real copy.
+  ~59% gzippy decode logic (LTO-inlined, symbols unresolved: hot addr clusters
+       0x4c08x + 0x9fa5x) = the Huffman/marker symbol-decode loops.
+⚠ SHARE≠WALL TRAP: the page-fault share looks large but Lever C (per-chunk buffer
+  warm-reuse at T>1) was ALREADY fulcrum-score-falsified as "no effect" — i.e. that
+  share may be SLACK (a faulting worker overlaps other workers' in-order progress).
+  BUT Lever C's gate ran during the discredited-measurement period and never verified
+  the reuse actually REDUCED faults (could have been "lever didn't fire", not "slack").
+  DECISIVE RE-TEST owed: reuse the faulting buffer, use phasebreak/perf to PROVE faults
+  drop, then fulcrum-score gate the wall — faults-drop + wall-flat ⇒ slack CONFIRMED
+  (bank, don't ship); wall-moves ⇒ Lever C was a false-negative (win). If slack, the
+  lever is the ~59% Huffman inner loop (CLAUDE.md-open) — Gate-2 perturb then optimize.
