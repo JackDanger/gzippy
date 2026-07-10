@@ -1969,6 +1969,26 @@ impl Block {
         // per backref below (the field-path SHARED borrow ends before the
         // `&mut self` sparsity call, so it cannot be hoisted across the loop).
         let in_end = bits.data.len();
+        // Store-elimination removal oracle (`storeprobe` feature): resolve
+        // the hot scratch sink's base pointer ONCE per invocation — exactly
+        // like `ring_ptr` above is a plain hoisted parameter, not
+        // re-resolved per iteration — so the per-symbol store below differs
+        // from baseline ONLY in its destination address, never in a
+        // per-iteration lookup cost. See `storeprobe.rs`.
+        #[cfg(feature = "storeprobe")]
+        let probe_sink_ptr = crate::decompress::parallel::storeprobe::sink_ptr();
+        // Diagnostic-only 2nd control (`storeprobe-stack`, OFF by default,
+        // mutually exclusive with `storeprobe`/`storeprobe-ctrl`): SAME
+        // relocation as `storeprobe` (small hot buffer instead of the
+        // ring) but via a plain on-stack array instead of a
+        // `thread_local!`-derived pointer — isolates whether a regression
+        // is caused by genuine memory/cache effects of relocating the
+        // store vs. by LLVM alias-analysis/codegen quality differing for a
+        // TLS-provenance pointer vs. an ordinary stack-local one.
+        #[cfg(feature = "storeprobe-stack")]
+        let mut probe_stack_sink: [u16; 68] = [0u16; 68];
+        #[cfg(feature = "storeprobe-stack")]
+        let probe_stack_ptr: *mut u16 = probe_stack_sink.as_mut_ptr();
         bits.refill();
         // WINDOW-ABSENT CONVERGE (Lever A): backstop-free `decode_prefilled`,
         // matching the clean asm path's litlen decode (chunk_decode contig path
@@ -2101,7 +2121,64 @@ impl Block {
                         let p = sym0 as u64;
                         let widened: u64 =
                             (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
-                        (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
+                        // Store-elimination removal oracle (`storeprobe`
+                        // feature, OFF by default; storedheavy sub-cause
+                        // brief, 2026-07-09): redirect this store to a
+                        // small L1-hot thread-local scratch buffer instead
+                        // of the 128 KiB ring, isolating the ring's
+                        // memory-spread cost from decode compute for a
+                        // gz-vs-gz wall A/B. BYTE-INEXACT when on (later
+                        // backref copies read stale ring content) — every
+                        // OTHER computation (`dst_phys`, `sym0`, `pos`,
+                        // `emitted`, `distance_marker`, loop trip count) is
+                        // untouched, so the decode stays live and iterates
+                        // identically to baseline. See `storeprobe.rs`.
+                        #[cfg(feature = "storeprobe")]
+                        {
+                            crate::decompress::parallel::storeprobe::probe_store_widened(
+                                probe_sink_ptr,
+                                dst_phys,
+                                widened,
+                            );
+                        }
+                        // Diagnostic-only CONTROL arm (`storeprobe-ctrl`,
+                        // OFF by default, mutually exclusive with
+                        // `storeprobe`): same destination/footprint as
+                        // baseline (the real 128 KiB ring, same address),
+                        // ONLY switched from `write_unaligned` to
+                        // `write_volatile` — isolates whatever cost
+                        // `write_volatile` itself adds (fence/ordering,
+                        // lost store-coalescing, etc.) from the cost of
+                        // relocating the store's destination, so a probe-
+                        // vs-baseline delta can be attributed correctly.
+                        #[cfg(all(
+                            feature = "storeprobe-ctrl",
+                            not(feature = "storeprobe"),
+                            not(feature = "storeprobe-stack")
+                        ))]
+                        {
+                            (ring_ptr.add(dst_phys) as *mut u64).write_volatile(widened);
+                        }
+                        // Diagnostic-only 2nd control (`storeprobe-stack`):
+                        // same relocation as `storeprobe` but via a plain
+                        // stack array — see the declaration-site doc above.
+                        #[cfg(all(
+                            feature = "storeprobe-stack",
+                            not(feature = "storeprobe"),
+                            not(feature = "storeprobe-ctrl")
+                        ))]
+                        {
+                            let idx = dst_phys & 63;
+                            (probe_stack_ptr.add(idx) as *mut u64).write_volatile(widened);
+                        }
+                        #[cfg(not(any(
+                            feature = "storeprobe",
+                            feature = "storeprobe-ctrl",
+                            feature = "storeprobe-stack"
+                        )))]
+                        {
+                            (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
+                        }
                     }
 
                     // Gate-2 Arm M (storedheavy sub-cause brief, `perturb`

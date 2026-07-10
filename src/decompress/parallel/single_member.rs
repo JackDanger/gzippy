@@ -901,6 +901,11 @@ pub fn decompress_parallel<W: Write>(
             Err(e) => {
                 if debug_enabled() {
                     eprintln!("[parallel_sm] driver error: {e}");
+                    #[cfg(feature = "storeprobe")]
+                    {
+                        let hits = crate::decompress::parallel::storeprobe::hits();
+                        eprintln!("[storeprobe] hits={}", hits);
+                    }
                 }
                 // A decode/size/CRC failure on a stream the classifier called
                 // single-member is the multi-member-misroute signature: the
@@ -975,6 +980,11 @@ pub fn decompress_parallel<W: Write>(
                     iters,
                     hits,
                 );
+            }
+            #[cfg(feature = "storeprobe")]
+            {
+                let hits = crate::decompress::parallel::storeprobe::hits();
+                eprintln!("[storeprobe] hits={}", hits);
             }
         }
         Ok(result.total_size as u64)

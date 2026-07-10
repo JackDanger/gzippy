@@ -116,6 +116,16 @@ pub mod replace_markers;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;
 pub mod segmented_buffer;
+/// Store-elimination removal oracle (feature `storeprobe`, OFF by default;
+/// byte-INEXACT when on — NEVER in prod). Redirects the marker fast loop's
+/// widened-literal ring store to a small L1-hot thread-local scratch buffer,
+/// isolating the 128 KiB ring's memory-spread cost from the decode compute
+/// so an interleaved wall A/B can discriminate STORE-BANDWIDTH-BOUND from
+/// COMPUTE-LATENCY-BOUND. Every symbol is a true no-op without the feature.
+/// NO rg counterpart — measurement-only, storedheavy sub-cause brief
+/// (2026-07-09). See `storeprobe.rs` module doc.
+#[cfg(parallel_sm)]
+pub mod storeprobe;
 #[cfg(parallel_sm)]
 pub mod segmented_markers;
 pub mod single_member;
