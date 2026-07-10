@@ -255,3 +255,24 @@ u16 store (skip the widen+8-byte store), matching vendor per-literal pattern. PR
 (advisor disqualifier): measure the sym_count distribution first — if most iterations are
 already 2-3 packed literals, #1 won't help; if single-literals dominate (expected for
 literal-heavy incompressible data), implement + fulcrum-score gate. Falsifies cheaply.
+
+═══ ORACLE FIXED + TRUE GAP (2026-07-09) — supersedes the stale frozen-cell target ═══
+fulcrum score was UNRUNNABLE (3-way, hard-required isal_inflate symbols; ISA-L decode
+removed). Fixed to 2-way native-vs-rg (fulcrum main @ 3959149; kept FLAVOR-N, corpus/
+decomp SHA pins, comparator native-ELF check, SINK LAW, N>=7 best-of-N; dropped only the
+isal arm + FLAVOR-I). Re-scored on AMD Zen2 (FROZEN performance governor, taskset-pinned,
+N=11, sha-verified, dist=RESOLVED), gzippy-native @ 9896c2b7 vs rapidgzip-native ELF:
+  storedheavy T4 = 0.96 FAIL | T8 = 0.99 PASS | T16 = 0.97 FAIL | silesia T8 = 0.98 FAIL
+TRUE gap = 1-4% (NOT the stale 0.92=8% nor abmeasure 18%). The 0.92 cell was src-sha
+443a9e6 (27d drift) self-flagged NOISY; abmeasure ran on a contended, unfrozen-governor
+box (procs_running 1-4) measuring cycles not wall.
+REFRAME: (a) storedheavy T8 already PASSES; (b) silesia T8 (a normal corpus) also FAILs
+at 0.98 → the deficit is BROAD and SMALL (~1-4% across cells), NOT storedheavy-specific.
+The whole session's storedheavy-decode focus was too narrow.
+OWED GATES before trusting the broad-deficit interpretation (per governing law):
+  - Gate-0(b) COMPARATOR SELF-TEST: the 2-way score's rg-vs-rg (or a symmetry check) must
+    read 1.0 ± spread; a ~2% harness/comparator offset would explain silesia's 0.98 as a
+    TIE not a real deficit. NOT yet run in 2-way mode (only a native-vs-native UNIT test).
+  - Gate-3 CROSS-ARCH: single AMD box only. Intel replication owed.
+If the comparator self-tests to 1.0 and Intel replicates, the real target is a BROAD ~1-4%
+AMD deficit (decode-throughput-bound per phasebreak) — attack that, not storedheavy alone.
