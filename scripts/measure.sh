@@ -10,6 +10,12 @@
 #   3. A delta inside the trial-to-trial spread is a TIE, not a win/loss.
 #   4. Flag (don't hide) a contended box so absolutes aren't mistaken for signal.
 #
+# ⛔ Run scripts/bench/preflight.sh || exit 1 BEFORE this — it enforces SINK=/dev/null
+#    both arms, correct box, Gate-4 path/flavor/sha on the shipped binary, freeze +
+#    authority-cell reproduction, and paired-diff at sub-60ms walls. A number this
+#    script prints is void unless preflight printed PREFLIGHT=OK (memory
+#    reference_rig_manifest.md / feedback_branch_blindspots_2026_07_10.md).
+#
 # Usage:
 #   RAW=<uncompressed_bytes> N=11 CPUS=0,2,4,6,8,10,12,14 \
 #     scripts/measure.sh "gzippy=/path/gzippy -d -c -p 8 file.gz" \
