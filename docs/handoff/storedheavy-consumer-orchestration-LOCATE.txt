@@ -96,8 +96,41 @@ FOLLOW-UP (same session, 2026-07-09) — Gate-2 perturbation + Arc-ownership cou
   consumer per-byte work from contention; time the specific post-decode step over the
   chunk; only then a lever + fulcrum-score gate both arches.
 
-STATUS: measured locate banked; TWO mechanisms falsified by robust counters (decode
-kernel keeps up; consumer never clones). Search narrowed by elimination to consumer
-per-chunk post-decode processing (needs clean-box split from contention). Win state
-(all cells >= 0.99) still UNMET on storedheavy T4/8/16 — but the campaign is now
-pointed by measurement + elimination, not by inference.
+DECISIVE (same session, 2026-07-09) — consumer-thread CPU vs WALL (CLOCK_THREAD_CPUTIME_ID):
+  box idle (load 0.63, llama Sl/idle -> NOT contention-contaminated).
+    T   wall(consumer)  consumer_CPU  decode_wait  drain
+    4   ~31ms           ~3.0ms        ~7ms         ~0.2ms
+    8   ~20ms           ~3.6ms        ~5ms         ~0.25ms
+    16  ~20ms           ~12.6ms       ~3.5ms       ~1.9ms
+  The consumer thread uses only ~3ms CPU across a ~31ms consumer phase at T4 -> it is
+  WAIT-BOUND, not work-bound. The "~15-24ms remainder" I earlier attributed to consumer
+  orchestration is the consumer SLEEPING while workers decode, NOT serial CPU work.
+  => "consumer per-chunk post-decode processing is the lever" is FALSIFIED too.
+
+FINAL ELIMINATION MAP (all measured this session, robust to load):
+  - decode kernel as a CONSUMER pin:      OUT (decode_wait small, shrinks with T)
+  - per-chunk ChunkData clone:            OUT (arc_misses=0)
+  - apply_window / marker / write (drain):OUT (~0.2-2ms)
+  - block-finding:                        OUT (~0, async)
+  - consumer-thread serial CPU work:      OUT (consumer_CPU ~3ms; wait-bound)
+  What REMAINS: the wall is gated by the PARALLEL DECODE PIPELINE — worker decode
+  THROUGHPUT + coordination latency (the consumer waits on it). Both gz and rg barely
+  parallelize incompressible data (rg walls also degrade past T4); gz trails rg ~4%
+  (fulcrum 0.92/0.96/0.97). The only in-scope lever left is WORKER-SIDE per-thread
+  decode throughput (the CLAUDE.md-OPEN inner Huffman/stored loop) — NOT any consumer
+  change. NB this is the WORKER inner loop (throughput), distinct from the CONSUMER
+  decode path retracted above.
+
+  NEXT (Gate-2 before any lever): throughput perturbation — slow/speed the WORKER
+  decodeBlock inner loop by a known factor and measure the interleaved wall; if the
+  wall tracks worker-throughput, a per-worker inner-loop speedup (libdeflate/ISA-L
+  technique, arch-specific) is the lever. Gate on fulcrum score storedheavy T4/8/16
+  >= 0.99, no win-cell regression, byte-exact, both arches. This is a multi-cycle
+  inner-loop campaign, not a quick lever.
+
+STATUS: EXHAUSTIVE deterministic elimination done — every consumer-side candidate
+falsified by measurement (decode-wait ratios, arc counters, drain RAII, and the
+decisive consumer_CPU<<wall). The storedheavy deficit is worker-decode-pipeline-bound;
+the sole remaining in-scope lever is worker inner-loop throughput (CLAUDE.md-open).
+Win state (all cells >= 0.99) still UNMET on storedheavy T4/8/16 — but the target is
+now fixed by measurement, and all wrong targets are eliminated with evidence.
