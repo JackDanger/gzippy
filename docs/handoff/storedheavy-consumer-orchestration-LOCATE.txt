@@ -390,3 +390,23 @@ suspect for the parallelism deficit (gz 1.3x vs rg 1.9x = the 42-vs-31ms wall ga
 LEVER IN FLIGHT: converge the consumer boundary-advance to rg's chain-walk (use the decoder's
 post-block position; skip stored LEN; finder only at chunk entry). Gate on fulcrum score.
 If it fires but score flat → parallelism limit is elsewhere → measure via fulcrum consumer+scaling.
+
+█████ DEFINITIVE both-tools SCALING (2026-07-10, perf-stat, deterministic) █████
+storedheavy, AMD Zen2, gz-native @ 9896c2b7 vs rapidgzip-native:
+              gz instr    rg instr   gz faults  rg faults   task-clock
+  T1          139M        174M       2,228      3,383       gz 40.5ms / rg 53.9ms
+  T4          321M        297M       15,534     14,762      gz 121.9ms / rg 95.3ms
+  T8          348M        330M       14,754     21,071
+  inflation   2.31x       1.71x      7x         4.4x
+SETTLED FINDINGS (both-tools, measured):
+  1. gz SINGLE-THREAD decode is LEANER than rg (139M < 174M) — gz WINS T1.
+  2. PAGE-FAULTS ARE NOT THE LEVER — rg faults ~same as gz (14,762 vs 15,534 @T4). The
+     prior fault-reuse "SLACK" verdict was CORRECT; both tools pay it. STOP re-testing faults.
+  3. THE GAP = gz's PARALLEL OVERHEAD: gz inflates 2.31x (T1->T4) vs rg 1.71x = gz's parallel
+     path adds ~+59M more instructions than rg's. A decode that WINS at T1 LOSES at T4.
+  => not copy, not inner-loop, not page-faults, not block-finder-per-position — it's that gz's
+     SPECULATIVE PARALLEL-DECODE machinery (markers / apply-window / chunk coordination) costs
+     more per added thread than rapidgzip's. LEVER = make the parallel path as lean as rg's.
+  NEXT: decompose the +59M parallel overhead (marker-decode vs apply-window vs block-coordination
+  vs re-decode) — target the biggest component, converge to rg, gate on fulcrum score. This is
+  the faithful-port parallel-efficiency front the campaign kept circling; now measured to a number.
