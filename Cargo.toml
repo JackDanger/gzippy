@@ -74,6 +74,13 @@ default = ["pure-rust-inflate"]
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation
+# Diagnostic phase-breakdown emitter (mirrors the `coz` feature's wiring
+# style: OFF by default, every call site compiles to a true no-op without
+# it). Instruments 6 exact sites in `src/decompress/parallel/chunk_fetcher.rs`
+# and emits one JSON line per decode (see `phase_timing.rs`) consumed by
+# `fulcrum phasebreak`. NEVER in the default/CI feature set — diagnostic
+# only; zero effect on production decode bytes or timing.
+phase-timing = []
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the
 # parallel-SM decode so `coz run` can measure per-region wall-elasticity
 # (∂wall/∂speed). OFF by default — no fulcrum dep, probes compile to no-ops.
