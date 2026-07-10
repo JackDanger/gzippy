@@ -446,3 +446,25 @@ itself: gz's parallel machinery's overhead/serial-dependencies cancel the speedu
 a single removable region. NEXT: decompose WHERE the parallel speedup dies (phasebreak across
 T1/4/8/16 — the phase that does NOT shrink with T is the serial bottleneck; candidates: in-order
 consumption, window handoff, marker-resolution ordering, memory-bandwidth contention).
+
+█████ PHASEBREAK ACROSS T — the bottleneck SHIFTS (2026-07-10, why no single lever works) █████
+gz storedheavy phasebreak (phase-timing binary, per T):
+  T   consumer_wall  decode_wait(%)   consumer_cpu   stored_copy_worker_TOTAL_ns
+  4   28.4ms         25.2ms (89%)     1.9ms          49.3ms
+  8   33.3ms         28.2ms (85%)     2.4ms          83.1ms   ← balloons vs T4
+  16  20.2ms         3.1ms (15%)      11.6ms         46.6ms
+READ: the bottleneck SHIFTS with T →
+  - T4/T8: WORKER-DECODE-BOUND (consumer waits 85-89% for workers). The workers' stored-copy
+    AGGREGATE time BALLOONS 49→83ms T4→T8 — negative parallel scaling / memory-contention
+    signature. THIS is the T4/T8 loss (worst cell T4=0.75).
+  - T16: CONSUMER-CPU-BOUND (11.6ms coordinating 191 chunks; workers keep up, decode_wait 15%).
+CONCLUSION (comprehensively gated): storedheavy has NO single lever because it has NO single
+bottleneck. Every instruction-region (block-finding, copy, inner-loop, page-faults) gate-TIED
+because they're OVERLAPPED behind two SHIFTING walls: (1) worker stored-copy throughput that
+scales negatively (T4/T8), (2) consumer coordination overhead (T16). gz WINS T1 (leaner decode)
++ all compressible corpora. TWO REAL FRONTS remain, both deep/architectural:
+  FRONT 1 (T4/T8): worker stored-copy parallel throughput — why does aggregate copy time GROW
+    with threads (49→83ms)? memory-channel contention / the input→ring→output double-pass under
+    contention. Removal-oracle each candidate at the WALL (not cycles) before building.
+  FRONT 2 (T16): consumer per-chunk coordination CPU (11.6ms/191 chunks) — reduce per-chunk
+    consumer work OR fewer chunks (but fewer chunks regressed the wall — needs care).
