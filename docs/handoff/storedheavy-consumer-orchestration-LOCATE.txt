@@ -410,3 +410,22 @@ SETTLED FINDINGS (both-tools, measured):
   NEXT: decompose the +59M parallel overhead (marker-decode vs apply-window vs block-coordination
   vs re-decode) — target the biggest component, converge to rg, gate on fulcrum score. This is
   the faithful-port parallel-efficiency front the campaign kept circling; now measured to a number.
+
+█████ BLOCK-FINDER REMOVAL ORACLE — STRONG-tier, quiet N=21, gated (2026-07-10) █████
+Oracle: feed ground-truth chunk entries, skip all find_next_* (Gate-0: finder calls
+32/38/190→0 at T4/8/16, byte-exact sha==gzip -dc, 100% oracle hits). fulcrum abmeasure
+(quiet, llama-paused, N=21, /root/abq_t{4,8,16}_bforacle.json):
+  T   instr base→after     cyc base→after     rg/after(>=0.99 win)  paired after<base
+  4   317M→220M (-31%)     386M→339M (-12%)    0.81 (loses)          16/21
+  8   357M→245M (-31%)     473M→437M (-8%)     0.82 (loses)          14/21
+  16  820M→239M (-71%)     738M→423M (-43%)    1.13 (gz BEATS rg)    21/21
+VERDICT: block-finding IS the T16 wall lever (removal → gz beats rg, 21/21, decisive).
+The finder EXPLODES at high T: 820M instr / 8.2 per byte at T16 vs 317M/3.2 at T4; 190
+chunk-entry scans at T16 vs 32 at T4. WITHOUT block-finding, T16≈T4 (~239M vs 220M) — the
+entire T16 inflation IS the block-finding. At T4/T8 block-finding is only 31% AND high-IPC
+(cheap cycles) → removal doesn't win; those cells lose to the DECODE/MARKER work (separate front).
+LEVER (T16 win path): reduce block-finding at high T — either (a) fewer/larger chunks (why 190
+at T16? over-chunking?) or (b) cheaper per-scan finder (port rg incremental first-hit seekTo* +
+BTYPE pre-check). Removal oracle shows either wins T16. Gate on fulcrum score. T4/T8 need the
+decode/marker efficiency front separately. llama resumed (STAT=Sl, no orphan). Oracle diag on
+box /root/gz-bf-oracle.
