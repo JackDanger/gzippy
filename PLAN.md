@@ -116,29 +116,40 @@ dominates M1.) Numbers: `scratchpad/handoff-measurements/m1-storedheavy-result.t
 
 ## 4. THE ONE OPEN PERF FRONT: storedheavy T4/8/16 (AMD-Zen2 only)
 
-> ### ★★★ START HERE — THE LEVER IS BUILT AND BYTE-EXACT (just finish it)
-> Branch **`origin/perf-overlap-writer`** (`14b9663f`, patch `scratchpad/leverD-overlap-writer.patch`;
-> status `docs/handoff/leverD-overlap-writer-status.txt`).
-> **Locate is DONE and mechanism-confirmed by phase-timing** (drive_impl, storedheavy T4:
-> setup=20µs, consumer_loop=30ms=94%, finalize=2ms) → the deficit is the **serial in-order
-> `writev` inside the consumer loop** (an Amdahl tail). `output_writer.rs`'s own header doc
-> says exactly this and ships the fix: a background writeFunctor thread (faithful rapidgzip).
-> The lever wires `drain_one_pending`'s non-pipe fd path through `output_writer::submit_chunk`
-> — CRC/ISIZE are already accumulated in-order in the consumer, so byte order + verification
-> are unchanged. **It is BYTE-EXACT** (differentials sha==`gzip -dc` on silesia/logs/software/
-> storedheavy-T1/4/8/mm3; fmt + clippy clean).
-> **TWO things remain, in order:**
-> 1. **Fix 1 failing test** (test-invariant, NOT a corruption): moving the chunk's release/
->    recycle into the writer thread breaks a counter/timing invariant (likely `LIVE_CHUNKS` /
->    a deletion-trap / `recycle_deferral`). Either keep the recycle accounting in the consumer
->    before `submit_chunk`, or update the invariant. Name it: `cargo test --release
->    --no-default-features --features pure-rust-inflate 2>&1 | grep -B2 FAILED`.
-> 2. **Perf-gate on the box**: build `14b9663f`, `fulcrum score` storedheavy T4/8/16 vs
->    rapidgzip must reach ≥0.99 with **no win-cell regression** (silesia-T4/nasa-T4/
->    storedheavy-T1), both arches. If yes → fast-forward merge into `reimplement-isa-l`,
->    re-score the matrix, **front closed**. If it regresses win cells → falsify + bank.
-> This is the strongest candidate to date: byte-correct AND it directly targets the
-> phase-timing-confirmed serial `writev`, unlike Levers B/C which guessed at routing/alloc.
+> ### ★★★ START HERE — 3 levers ruled out; the true region is UNPINNED. Do FINER phase-timing next.
+> **THREE gate-arbitrated levers have now been FALSIFIED** on this cell (details in
+> `docs/handoff/`). Do NOT re-attempt any of them:
+> - **B (reroute to stored-stream)** → regressed (1.15→0.72). storedheavy is mostly-Huffman;
+>   the demote-to-grid is correct.
+> - **C (unpinned buffer reuse)** → no effect. The 18% page-fault "alloc-storm" was SLACK.
+> - **D (overlap writer)** → byte-exact but **no perf effect** (storedheavy T8 RESOLVED stayed
+>   0.96). **KEY: `fulcrum score` sinks to `/dev/null`, where the writev is FREE — so
+>   overlapping it cannot cut the wall.** The "serial writev Amdahl tail" is real for a *real*
+>   sink but slack under the campaign's `/dev/null` measurement. This RULES OUT the output write.
+>
+> **What's now established:** the storedheavy `/dev/null` gap vs rapidgzip is NOT routing, NOT
+> alloc, NOT the output write. Phase-timing put ~94% of the wall in `consumer_loop` (setup=20µs,
+> finalize=2ms), so the true serial region is a SUB-part of `consumer_loop`. rapidgzip's own
+> profile spends ~30% in `pread` (input I/O) + `isal_inflate`; gzippy reads input via **mmap
+> page-faults** and decodes pure-Rust.
+>
+> **THE DISCIPLINED NEXT STEP (not a 4th blind lever — three plausible guesses already failed):**
+> 1. **Finer phase-timing**: instrument `consumer_loop` (chunk_fetcher.rs `drive_impl` calls it)
+>    to split the wall into: input-read/mmap-fault, block-find wait, per-chunk decode, in-order
+>    drain-orchestration (waiting for the next in-order chunk), and CRC-combine. Pin which
+>    sub-region is the serial fraction that doesn't parallelize (gz uses ~2.53/4 cores vs rg
+>    2.86). A throwaway `Instant` instrumentation pattern that worked: anchor `__phz0` to a
+>    line unique to `drive_impl` (e.g. `let pool_size = parallelization.max(1);`), print
+>    elapsed at phase boundaries, build, run, revert.
+> 2. **Prime candidate to test once pinned**: gz's **mmap input access vs rapidgzip's `pread`**
+>    on incompressible data (minor-fault storm vs sequential readahead). Only build a lever
+>    AFTER the finer phase-timing confirms the region — the share≠wall trap has now fired 3×.
+> 3. Gate any resulting lever: `fulcrum score` storedheavy T4/8/16 ≥0.99, no win-cell regress,
+>    both arches, byte-exact.
+>
+> **Honest scope:** this is a narrow AMD-Zen2 incompressible-data corner. gzippy WINS this corpus
+> at T1 (AMD 1.10–1.15) and 3–4× on M1, and ties-or-beats rapidgzip across the rest of the field.
+> Weigh a deep finer-instrumentation campaign against **accepting it as a documented arch-residual**.
 
 
 **Confirmed mechanism (Gate-2 perturbation on the real corpus):** gz decodes this
