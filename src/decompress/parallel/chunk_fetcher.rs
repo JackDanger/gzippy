@@ -2238,6 +2238,15 @@ fn run_decode_task(
     };
     let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
+    // Step-1 wasted-work instrument (phase-timing feature, storedheavy
+    // sub-cause brief 2026-07-09): every branch below is a distinct worker
+    // decode invocation through this single choke point. `window_present`
+    // mirrors the branch actually taken (chunk-0's zero-window sentinel and
+    // a real published predecessor window both count as "window present" —
+    // i.e. NOT the speculative/marker-bootstrap path).
+    #[allow(unused_variables)]
+    let window_present = params.start_bit == 0 || window_at_offset.is_some();
+
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_with_until_exact(
             input_bytes,
@@ -2266,6 +2275,12 @@ fn run_decode_task(
             window_map,
         )
     };
+
+    #[cfg(feature = "phase-timing")]
+    crate::decompress::parallel::phase_timing::record_worker_decode(
+        window_present,
+        chunk_result.as_ref().ok().map(|c| c.decoded_size() as u64),
+    );
 
     // Wrap in `ChunkArc` to match BlockFetcher's `Value` type (vendor's
     // `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
