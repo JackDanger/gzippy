@@ -486,3 +486,33 @@ compressible corpora; storedheavy is a distributed parallel-efficiency residual 
 corner). DO-NOT-RETEST (campaign-closed at wall): copy-removal(+23% rise), page-fault-parity,
 block-finder-removal(T4/T8 wall TIE), chunk-cap(regressed), single-pass(already 99% single-pass),
 inner-loop(1% of corpus, TIE), coherence(c2c clean).
+
+███████ CAMPAIGN CLOSED (2026-07-10): NO LOCALIZABLE LEVER ON STOREDHEAVY ███████
+Segmented stored_split (last untested lever, branch feat/segmented-stored-split @ bf5a3842,
+byte-exact incl adversarial two-island back-ref, non-inert, both arches): FALSIFY. The stored
+path is THROUGHPUT-FLAT across threads (~41ms) — storedheavy has ~no decode work to overlap, so
+its wall is the serial verify-before-write pass; baseline ParallelSM PIPELINES and SCALES
+(45→38→36ms). Seg improves T4 (base weak there) but REGRESSES T8 (1.05→0.82) + T16. => the
+demote-to-ParallelSM is CORRECT for scaling; keeping storedheavy on the stored path is worse.
+FINAL GATED CONCLUSION (exhaustive, ~30 wall-gated measurements/oracles this campaign):
+  storedheavy T4/8/16 (fulcrum score 0.75/0.87/0.90 rg/native) is a DISTRIBUTED PARALLEL-
+  EFFICIENCY RESIDUAL within the (correctly-chosen) ParallelSM path. gz's parallel machinery
+  inflates 2.31x (T1→T4) vs rg 1.71x and drops to IPC 0.77 (from T1's 1.09), but NO single
+  region owns it — every localizable lever is gate-FALSIFIED AT THE WALL:
+    block-finding (removal wall-TIE 28/27; T16 "win" was cycles-mirage) · copy (removal RAISES
+    wall +23/34% — beneficial) · page-faults (rg faults ~same) · inner-loop (1% of corpus, TIE)
+    · double/single-pass (already single-pass 99%) · chunk-count (cap regressed) · coherence/
+    false-sharing (perf c2c clean, 0 HITM, all-local-DRAM) · IPC-loop (disqualified: same kernel
+    IPC 1.09 at T1 where gz WINS) · segmented-stored routing (flat, doesn't scale).
+  gz WINS storedheavy T1 (leaner: 139M instr < rg 174M) AND wins every COMPRESSIBLE corpus
+  (silesia/monorepo PASS). The loss is a synthetic-incompressible-corner PARALLEL-SCALING
+  residual — NOT a compromise, a measured finding. Per the governing law, there is NO clean
+  gated lever left to build; blindly building a blind lever is forbidden.
+RE-OPEN TRIGGERS (deeper, correctness-contract or architectural — each needs its own gated test,
+  none is a clean localizable lever today): (1) fused single-pass CRC+write for the stored path
+  (relaxes verify-before-write toward the production streaming contract); (2) reduce ParallelSM's
+  2.31x parallel-instruction inflation on incompressible data (marker/coordination machinery) —
+  but every removal-oracle showed that inflation is OVERLAPPED at the wall.
+DELIVERABLES BANKED THIS CAMPAIGN: fulcrum score fixed (2-way + /dev/null sink, main b908b3d);
+fulcrum phasebreak (conservation-gated); fulcrum/tools/memtrace.c (cross-tool copy/alloc counter);
+flagged fulcrum insn-attr srcline parser bug. Full loss-map + all falsifies in this file.
