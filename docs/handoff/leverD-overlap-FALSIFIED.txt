@@ -1,3 +1,20 @@
 OVERLAP-WRITER LEVER (leverD, 14b9663f) FALSIFIED by perf gate (fulcrum score N=15, byte-exact):
 storedheavy T1=1.10 PASS / T4=0.92 FAIL(NOISY) / T8=0.96 FAIL(RESOLVED, EXACTLY unchanged from baseline) / T16=0.97(NOISY). NO perf effect on the reliable T8 cell. silesia-T4=1.05/nasa-T4=1.07 held.
 KEY REFINEMENT: fulcrum score sinks to /dev/null where the writev is FREE => overlapping it cannot cut the wall. The serial-writev-Amdahl-tail is real for a REAL sink but SLACK under the /dev/null measurement (share != wall, 3rd time). RULES OUT the output write. Both gz and rg write to /dev/null free; rg advantage is elsewhere: INPUT read (gz mmap page-faults vs rg pread ~30% of its profile) and/or decode/parallel-orchestration in consumer_loop. THREE levers now ruled out: B(routing) regressed, C(alloc) no-effect, D(overlap-write) no-effect-on-/dev/null. Next: FINER phase-timing splitting consumer_loop (input-read vs decode-dispatch vs drain-orchestration vs CRC-combine) to pin the TRUE serial region; consider gz-mmap-vs-rg-pread input access. gz wins the corpus T1(AMD)+3-4x(M1).
+
+FINAL PINNED LOCATE (GZIPPY_DEBUG + scaling + bandwidth math — the deepest of the campaign):
+storedheavy = ~3000 window-sized (~32KB) STORED blocks. Each fires marker_inflate.rs:1424
+"stored-flip case1-ge-window" in the WINDOW-ABSENT u16-marker decoder. gz decodes at ~1.5 GB/s
+(FAR from the ~100GB/s memory floor => CPU/coordination-bound, NOT bandwidth) and is FLAT across
+T (T1~132ms .. T16~139ms => NO parallel benefit) while using 2.53/4 cores => the cores do work
+that yields no speedup. MECHANISM: storedheavy chunks decode window-absent (speculative), so its
+~3000 stored blocks each pay per-block marker->clean window-flip overhead in marker_inflate, and
+that coordination does not parallelize (matches CLAUDE.md "low-redundancy => block boundaries rare
+=> all-marker chunks => redundant work"). This is the rapidgzip-FAITHFUL marker/window machinery
+(CLAUDE.md: architecture = faithful port, don't innovate; only the inner Huffman loop is open).
+LEVER (deep, architectural, agent+gate): reduce per-stored-block marker overhead in the
+window-absent decode, OR reduce window-absent speculation for stored-heavy chunks (a chunk WITH
+its window decodes stored blocks clean, no markers). Both touch the faithful marker architecture.
+rg is ~5% faster here likely via ISA-L's leaner per-block stored handling. NARROW CORNER: gz WINS
+this corpus T1(AMD 1.10-1.15) + 3-4x(M1); ties/beats rg across the rest of the field. Weigh a deep
+marker-path optimization vs ACCEPTING the arch-residual.
