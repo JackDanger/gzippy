@@ -18,3 +18,14 @@ its window decodes stored blocks clean, no markers). Both touch the faithful mar
 rg is ~5% faster here likely via ISA-L's leaner per-block stored handling. NARROW CORNER: gz WINS
 this corpus T1(AMD 1.10-1.15) + 3-4x(M1); ties/beats rg across the rest of the field. Weigh a deep
 marker-path optimization vs ACCEPTING the arch-residual.
+
+CODE EXAM (rules out a quick copy-lever): read_stored_bytes_aligned (marker_inflate.rs:433)
+drains only the few buffered bits byte-by-byte, then BULK copy_from_slice (=> memcpy) for the
+~32KB payload. The stored copy is ALREADY efficient. The stored-flip case1 handler (1405-1424)
+is a byte-for-byte port of deflate.hpp:1214-1219 (direct read into the ring, O(1) flip, no
+redundant copy). => the per-block deficit is the faithful marker/window-flip COORDINATION +
+resumable state machine (x3000 blocks), NOT the copy. No targeted quick lever exists. Closing
+the ~9% requires EITHER a deep inner-loop rewrite matching ISA-L's per-block coordination cost
+(open territory per CLAUDE.md, multi-cycle agent+gate campaign) OR reducing window-absent
+speculation for stored-heavy chunks (marker/chunk architecture = faithful-port, closed). This is
+a documented arch-residual: gz wins the corpus T1(AMD)+3-4x(M1) and ties/beats rg across the field.
