@@ -95,11 +95,6 @@ pub mod lut_huffman;
 pub mod marker_inflate;
 #[cfg(all(unix, parallel_sm))]
 pub mod output_writer;
-/// Diagnostic phase-breakdown emitter (feature `phase-timing`, OFF by
-/// default). Every symbol compiles to a no-op without the feature; see
-/// `phase_timing.rs` module doc. NO rg counterpart — measurement-only.
-#[cfg(parallel_sm)]
-pub mod phase_timing;
 /// Gate-2 causal-perturbation instrument (feature `perturb`, OFF by
 /// default). Injects a calibrated, known-magnitude delay at one of two
 /// named sites in the worker marker-decode fast loop (Arm H = compute,
@@ -110,22 +105,17 @@ pub mod phase_timing;
 /// brief (2026-07-09).
 #[cfg(parallel_sm)]
 pub mod perturb;
+/// Diagnostic phase-breakdown emitter (feature `phase-timing`, OFF by
+/// default). Every symbol compiles to a no-op without the feature; see
+/// `phase_timing.rs` module doc. NO rg counterpart — measurement-only.
+#[cfg(parallel_sm)]
+pub mod phase_timing;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;
 pub mod segmented_buffer;
-/// Store-elimination removal oracle (feature `storeprobe`, OFF by default;
-/// byte-INEXACT when on — NEVER in prod). Redirects the marker fast loop's
-/// widened-literal ring store to a small L1-hot thread-local scratch buffer,
-/// isolating the 128 KiB ring's memory-spread cost from the decode compute
-/// so an interleaved wall A/B can discriminate STORE-BANDWIDTH-BOUND from
-/// COMPUTE-LATENCY-BOUND. Every symbol is a true no-op without the feature.
-/// NO rg counterpart — measurement-only, storedheavy sub-cause brief
-/// (2026-07-09). See `storeprobe.rs` module doc.
-#[cfg(parallel_sm)]
-pub mod storeprobe;
 #[cfg(parallel_sm)]
 pub mod segmented_markers;
 pub mod single_member;
@@ -137,6 +127,16 @@ pub mod statistics;
 /// single-member streams. Portable (depends only on crc32 + gzip_format), so it
 /// is NOT cfg-gated; routing to it lives in [`crate::decompress::classify_gzip`].
 pub mod stored_split;
+/// Store-elimination removal oracle (feature `storeprobe`, OFF by default;
+/// byte-INEXACT when on — NEVER in prod). Redirects the marker fast loop's
+/// widened-literal ring store to a small L1-hot thread-local scratch buffer,
+/// isolating the 128 KiB ring's memory-spread cost from the decode compute
+/// so an interleaved wall A/B can discriminate STORE-BANDWIDTH-BOUND from
+/// COMPUTE-LATENCY-BOUND. Every symbol is a true no-op without the feature.
+/// NO rg counterpart — measurement-only, storedheavy sub-cause brief
+/// (2026-07-09). See `storeprobe.rs` module doc.
+#[cfg(parallel_sm)]
+pub mod storeprobe;
 #[cfg(parallel_sm)]
 pub mod streamed_results;
 #[cfg(parallel_sm)]
