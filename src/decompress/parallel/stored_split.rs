@@ -73,6 +73,21 @@ pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 /// collapse). Dumped by `GZIPPY_DEBUG=1`.
 pub static STORED_WRITEV_BATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Counter: number of Huffman ISLANDS decoded IN PLACE by the SEGMENTED stored
+/// path (`decode_segmented`) — the scattered dynamic/fixed blocks that punctuate
+/// an otherwise-stored stream (storedheavy: 33 islands across 3008 stored runs).
+/// Non-zero proves the segmented walk ran and stayed on the stored LEN-chain
+/// path instead of demoting the whole stream to ParallelSM (Gate-0 non-inert
+/// witness for the anti-demote lever). Dumped by `GZIPPY_DEBUG=1`.
+pub static STORED_SEGMENTED_ISLANDS: AtomicU64 = AtomicU64::new(0);
+
+/// Counter: number of SEGMENTED streams whose ordered output segments (stored
+/// runs + decoded islands) were emitted via the `writev` iovec-GATHER fast path
+/// (all segments gathered into batched `writev` syscalls) instead of one
+/// `write_all` per segment. Non-zero proves the segmented coalesced-write path
+/// fired (Gate-0 non-inert witness). Dumped by `GZIPPY_DEBUG=1`.
+pub static STORED_SEGMENTED_WRITEV_BATCHES: AtomicU64 = AtomicU64::new(0);
+
 /// Threshold: if the stored prefix accounts for < this fraction of total
 /// output (numerator/denominator), demote to ParallelSM so the Huffman tail
 /// is decoded in parallel. Currently 50% (1/2).
@@ -351,32 +366,52 @@ pub fn decompress_stored_parallel<W: Write>(
             tail_byte,
             prefix_out,
         } => {
-            // DEMOTION GATE: if the Huffman tail is >= 50% of total output,
-            // the sequential tail decode is the wall bottleneck — ParallelSM
-            // can speculate boundaries across the tail and parallelize it.
-            // Return NotStoredDominated so the caller routes to ParallelSM.
-            //
-            // Counter: STORED_DEMOTE_TO_PARALLEL_SM counts demotion events.
-            //
-            // Threshold: prefix_out < expected_size * (1/2).
-            // storedheavy: prefix_out ~8.2 MB, expected_size ~100 MB → 8.2% < 50%
-            // → DEMOTE. A pure-stored or >50% stored stream stays on this path.
-            if prefix_out > 0
-                && prefix_out * DEMOTE_THRESHOLD_DEN < expected_size * DEMOTE_THRESHOLD_NUM
-            {
-                STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
-                if crate::utils::debug_enabled() {
-                    eprintln!(
-                        "[gzippy] StoredParallel demote → ParallelSM: \
-                         prefix_out={prefix_out} < expected_size/2={} \
-                         (stored fraction {:.1}%)",
-                        expected_size / 2,
-                        prefix_out as f64 / expected_size as f64 * 100.0,
-                    );
-                }
+            // Multi-member defense-in-depth (P0 fix c4918aa2): a stored-dominant
+            // FIRST member whose prefix ALREADY exceeds the whole-file (== last
+            // member's) ISIZE means a multi-member stream slipped past the
+            // router's dominant-first detector. A single-member decoder cannot
+            // span members, so DECLINE to the safe multi-member-capable path
+            // rather than emit a terminal SizeMismatch on EMPTY output. The
+            // router now catches this shape up front at every T; this is belt-
+            // and-braces (keeps `test_dominant_first_stored_multi_member_p1_byte_exact`
+            // green if the scan window ever slips).
+            if prefix_out > expected_size {
                 return Err(StoredSplitError::NotStoredDominated);
             }
-            decode_with_huffman_tail(
+            // ROUTE 1 — preserved single-tail / empty-prefix behavior (UNCHANGED).
+            // If there is NO stored prefix (prefix_out == 0, a direct-call
+            // Huffman-first stream), OR the stored prefix before the first
+            // Huffman block is ALREADY >= 50% of output, the overlap-friendly
+            // single-tail decoder (`decode_with_huffman_tail`, which copies the
+            // big prefix in parallel while it decodes the remaining suffix —
+            // interspersed stored blocks included — sequentially) is the
+            // efficient, byte-exact decoder. Its behavior is preserved EXACTLY.
+            //   random100.gz: ~60% prefix ≥ 50% → this route (unchanged).
+            if prefix_out == 0
+                || prefix_out * DEMOTE_THRESHOLD_DEN >= expected_size * DEMOTE_THRESHOLD_NUM
+            {
+                return decode_with_huffman_tail(
+                    writer,
+                    deflate,
+                    header_size,
+                    &runs,
+                    tail_byte,
+                    prefix_out,
+                    expected_crc,
+                    expected_size,
+                    num_threads,
+                );
+            }
+            // ROUTE 2 — SEGMENTED walk (the anti-demote lever). The OLD code
+            // DEMOTED the ENTIRE stream to the non-scaling ParallelSM machinery
+            // the moment an EARLY Huffman island appeared with a <50% prefix
+            // (storedheavy: 8.2% stored prefix < 50% → the whole 98.9%-stored
+            // 100 MB went to ParallelSM). NEW: walk the WHOLE member — keep the
+            // stored runs on the byte-exact LEN-chain parallel-copy path and
+            // decode the (rare, scattered) Huffman islands IN PLACE against a
+            // true rolling output window. Demote to ParallelSM ONLY if Huffman
+            // ACTUALLY dominates (>50% of total output), decided by the walk.
+            decode_segmented(
                 writer,
                 deflate,
                 header_size,
@@ -386,6 +421,7 @@ pub fn decompress_stored_parallel<W: Write>(
                 expected_crc,
                 expected_size,
                 num_threads,
+                out_fd,
             )
         }
     }
@@ -565,6 +601,516 @@ fn decode_with_huffman_tail<W: Write>(
         );
         Err(StoredSplitError::NotStoredDominated)
     }
+}
+
+/// SEGMENTED (streaming) decode of a stored-DOMINANT member whose stored runs
+/// are punctuated by RARE, scattered Huffman islands (storedheavy: 33 dynamic
+/// islands across 3008 stored runs, 98.9% of output stored). Walks the WHOLE
+/// member: stored blocks are STREAMED straight from the input mmap to the writer
+/// (the byte-exact LEN-chain path — NO 100 MB intermediate buffer, exactly like
+/// the pure-stored [`WalkEnd::Final`] path); the Huffman islands are decoded into
+/// small per-island buffers (rare & small — ~1 MB total for storedheavy).
+///
+/// # Byte-exactness of the islands (the correctness trap)
+/// A Huffman island's LZ77 back-references (distance ≤ 32 KiB) reach into the
+/// PRECEDING output — which may be a PRIOR ISLAND'S DECODED bytes (not verbatim
+/// input) when two islands fall within 32 KiB, OR a preceding STORED run. Before
+/// decoding each island we reconstruct the TRUE rolling ≤32 KiB output window
+/// from the ordered segments so far — stored bytes read from the input, prior-
+/// island bytes read from their decoded buffers — and feed it to `decode_block`
+/// as its `predecessor_window`. So an island always resolves against the actual
+/// EMITTED output, making the adversarial two-islands-within-32-KiB case correct
+/// by construction. CRC32 + ISIZE are verified over the FULL output BEFORE any
+/// byte reaches the writer (no partial output on corruption).
+///
+/// # Demotion (preserved semantics)
+/// Demote to ParallelSM (return [`StoredSplitError::NotStoredDominated`] WITHOUT
+/// touching the writer) ONLY if Huffman ACTUALLY dominates — as soon as the
+/// running Huffman output exceeds `expected_size / 2` the stored fraction can no
+/// longer reach 50%, so we bail (counted in `STORED_DEMOTE_TO_PARALLEL_SM`).
+///
+/// On non-`parallel_sm` builds the bulk decoder is unavailable → decline.
+#[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
+fn decode_segmented<W: Write>(
+    writer: &mut W,
+    deflate: &[u8],
+    base_off: usize,
+    prefix_runs: &[StoredRun],
+    tail_byte: usize,
+    prefix_out: usize,
+    expected_crc: u32,
+    expected_size: usize,
+    num_threads: usize,
+    out_fd: Option<i32>,
+) -> Result<u64, StoredSplitError> {
+    use crate::decompress::parallel::lut_bulk_inflate::DecoderScratch;
+
+    let n = deflate.len();
+    // Ordered output segments (stored run OR decoded island), in output order.
+    let mut segs: Vec<Seg> = Vec::with_capacity(prefix_runs.len() + 128);
+    for r in prefix_runs {
+        segs.push(Seg::Stored {
+            src: r.src_off - base_off,
+            len: r.len,
+        });
+    }
+    // Per-island decoded bytes (referenced by Seg::Island.idx). ~1 MB total.
+    let mut islands_buf: Vec<Vec<u8>> = Vec::new();
+
+    let mut out_pos = prefix_out;
+    let mut huffman_out: usize = 0;
+    let mut islands: u64 = 0;
+    let demote_limit = expected_size / 2;
+
+    let mut scratch = DecoderScratch::new();
+    let mut pred = vec![0u8; MAX_WINDOW_SIZE]; // reused predecessor scratch
+    let mut p = tail_byte;
+
+    'walk: loop {
+        if p >= n {
+            return Err(StoredSplitError::Corrupt(
+                "deflate stream ended without BFINAL",
+            ));
+        }
+        let header_byte = deflate[p];
+        let btype = (header_byte >> 1) & 0b11;
+        if btype == 0 {
+            // Byte-aligned stored block: record a streamed segment.
+            let bfinal = header_byte & 1;
+            let (len, data_start, data_end) = read_stored_lens(deflate, p + 1, n)?;
+            if len > 0 {
+                segs.push(Seg::Stored {
+                    src: data_start,
+                    len,
+                });
+                out_pos += len;
+                if out_pos > expected_size {
+                    return Err(StoredSplitError::NotStoredDominated);
+                }
+            }
+            p = data_end;
+            if bfinal == 1 {
+                break 'walk;
+            }
+            continue 'walk;
+        }
+
+        // ── Huffman island (byte-aligned start at `p`) ──────────────────────
+        // Reconstruct the TRUE rolling ≤32 KiB output window from the ordered
+        // segments emitted so far (stored from input, prior islands from bufs).
+        let pred_len = build_pred_streaming(&mut pred, &segs, &islands_buf, deflate, out_pos);
+
+        // Decode the maximal run of consecutive Huffman blocks into an adaptive
+        // buffer, growing + retrying on overflow (islands are small; grows rare).
+        let mut cap = 128 * 1024;
+        let huffman_base = huffman_out;
+        let (ibytes, exit) = loop {
+            match try_decode_island(
+                deflate,
+                p * 8,
+                n,
+                &pred[..pred_len],
+                &mut scratch,
+                cap,
+                demote_limit,
+                huffman_base,
+            ) {
+                Ok(v) => break v,
+                Err(IslandErr::Overflow) => {
+                    cap = cap.saturating_mul(4);
+                    continue;
+                }
+                Err(IslandErr::Demote) => {
+                    STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
+                    if crate::utils::debug_enabled() {
+                        eprintln!(
+                            "[gzippy] StoredParallel(segmented) demote → ParallelSM: \
+                             huffman_out>{demote_limit} (Huffman dominates)"
+                        );
+                    }
+                    return Err(StoredSplitError::NotStoredDominated);
+                }
+                Err(IslandErr::Corrupt(m)) => return Err(StoredSplitError::Corrupt(m)),
+            }
+        };
+
+        let ilen = ibytes.len();
+        out_pos += ilen;
+        huffman_out += ilen;
+        if out_pos > expected_size {
+            return Err(StoredSplitError::NotStoredDominated);
+        }
+        if ilen > 0 {
+            let idx = islands_buf.len();
+            islands_buf.push(ibytes);
+            segs.push(Seg::Island { idx, len: ilen });
+            islands += 1;
+        }
+
+        match exit {
+            IslandExit::FinalHuffman => break 'walk,
+            IslandExit::StoredNext { len_off, bfinal } => {
+                let (len, data_start, data_end) = read_stored_lens(deflate, len_off, n)?;
+                if len > 0 {
+                    segs.push(Seg::Stored {
+                        src: data_start,
+                        len,
+                    });
+                    out_pos += len;
+                    if out_pos > expected_size {
+                        return Err(StoredSplitError::NotStoredDominated);
+                    }
+                }
+                if bfinal == 1 {
+                    break 'walk;
+                }
+                p = data_end;
+            }
+        }
+    }
+
+    if out_pos != expected_size {
+        return Err(StoredSplitError::SizeMismatch {
+            expected: expected_size,
+            actual: out_pos,
+        });
+    }
+
+    // Verify CRC (parallel over ordered segments) BEFORE writing.
+    let crc = segmented_crc(&segs, &islands_buf, deflate, num_threads);
+    if crc != expected_crc {
+        return Err(StoredSplitError::CrcMismatch {
+            expected: expected_crc,
+            actual: crc,
+        });
+    }
+
+    STORED_SEGMENTED_ISLANDS.fetch_add(islands, Ordering::Relaxed);
+    if crate::utils::debug_enabled() {
+        eprintln!(
+            "[gzippy] StoredParallel(segmented) ok: {out_pos} bytes; segs={} islands={islands} \
+             huffman_out={huffman_out} (stored fraction {:.2}%)",
+            segs.len(),
+            (expected_size - huffman_out) as f64 / expected_size.max(1) as f64 * 100.0,
+        );
+    }
+
+    // Stream to the writer in output order (stored straight from the input mmap,
+    // islands from their decoded bufs) — NO 100 MB intermediate copy.
+    //
+    // When the sink's raw fd is available (`out_fd` — production file / stdout
+    // sinks), GATHER every ordered segment into batched `writev` syscalls
+    // (`writev_all_to_fd`, vendor `writeAllToFdVector`, the same fast path the
+    // pure-stored `write_runs` uses) rather than one `write_all` per segment.
+    // On storedheavy (~3008 stored runs + islands) that collapses ~3000 serial
+    // per-segment `write()` calls — each of which memcpy'd the ~100 MB output
+    // through the BufWriter on the critical path (the SERIAL ORDERED-WRITE floor
+    // that FALSIFIED the earlier segmented build) — to ⌈segs / IOV_MAX⌉ `writev`
+    // calls straight from the input mmap / decoded island bufs (zero userspace
+    // copy). BYTE-IDENTICAL: the concatenation of the gathered iovecs, in segment
+    // order, equals the old per-segment write order (each iovec borrows the exact
+    // slice `write_all` streamed). Verify-before-write is preserved (CRC32 + ISIZE
+    // checked above); the pre-`writev` `flush` keeps ordering even if the
+    // BufWriter ever held buffered bytes. `islands_buf` outlives the `writev`
+    // (dropped only at function return), so every Island iovec pointer stays
+    // valid. Falls back to the portable per-segment `write_all` loop when no fd is
+    // present (tests / in-memory Vec / non-unix).
+    #[cfg(unix)]
+    if let Some(fd) = out_fd {
+        writer.flush()?;
+        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(segs.len());
+        for s in &segs {
+            let slice: &[u8] = match *s {
+                Seg::Stored { src, len } => &deflate[src..src + len],
+                Seg::Island { idx, len } => &islands_buf[idx][..len],
+            };
+            if slice.is_empty() {
+                continue;
+            }
+            iovs.push(libc::iovec {
+                iov_base: slice.as_ptr() as *mut libc::c_void,
+                iov_len: slice.len(),
+            });
+        }
+        if !iovs.is_empty() {
+            crate::decompress::parallel::fd_vectored_write::writev_all_to_fd(fd, &mut iovs)?;
+        }
+        STORED_SEGMENTED_WRITEV_BATCHES.fetch_add(1, Ordering::Relaxed);
+        return Ok(out_pos as u64);
+    }
+    #[cfg(not(unix))]
+    let _ = out_fd;
+
+    for s in &segs {
+        match *s {
+            Seg::Stored { src, len } => writer.write_all(&deflate[src..src + len])?,
+            Seg::Island { idx, len } => writer.write_all(&islands_buf[idx][..len])?,
+        }
+    }
+    writer.flush()?;
+    Ok(out_pos as u64)
+}
+
+/// Non-`parallel_sm` builds lack the bulk block decoder — decline so the safe
+/// one-shot path decodes the whole stream (same byte-exact result, not parallel).
+#[cfg(not(parallel_sm))]
+#[allow(clippy::too_many_arguments)]
+fn decode_segmented<W: Write>(
+    _writer: &mut W,
+    _deflate: &[u8],
+    _base_off: usize,
+    _prefix_runs: &[StoredRun],
+    _tail_byte: usize,
+    _prefix_out: usize,
+    _expected_crc: u32,
+    _expected_size: usize,
+    _num_threads: usize,
+    _out_fd: Option<i32>,
+) -> Result<u64, StoredSplitError> {
+    Err(StoredSplitError::NotStoredDominated)
+}
+
+/// An ordered output segment for the segmented streaming path.
+#[cfg(parallel_sm)]
+#[derive(Clone, Copy)]
+enum Seg {
+    /// Stored run: `deflate[src..src + len]` streamed verbatim.
+    Stored { src: usize, len: usize },
+    /// Huffman island: `islands_buf[idx][..len]` decoded output.
+    Island { idx: usize, len: usize },
+}
+
+#[cfg(parallel_sm)]
+impl Seg {
+    #[inline]
+    fn out_len(&self) -> usize {
+        match self {
+            Seg::Stored { len, .. } => *len,
+            Seg::Island { len, .. } => *len,
+        }
+    }
+    #[inline]
+    fn bytes<'a>(&self, islands_buf: &'a [Vec<u8>], deflate: &'a [u8]) -> &'a [u8] {
+        match *self {
+            Seg::Stored { src, len } => &deflate[src..src + len],
+            Seg::Island { idx, len } => &islands_buf[idx][..len],
+        }
+    }
+}
+
+/// How a Huffman island ended.
+#[cfg(parallel_sm)]
+enum IslandExit {
+    /// The island's last Huffman block was BFINAL — the member ends here.
+    FinalHuffman,
+    /// A stored block (byte-aligned LEN at `len_off`, `bfinal` from its header)
+    /// follows the island — the byte-aligned stored walk resumes after it.
+    StoredNext { len_off: usize, bfinal: u8 },
+}
+
+#[cfg(parallel_sm)]
+enum IslandErr {
+    /// The provisional island buffer was too small — the caller grows + retries.
+    Overflow,
+    /// Running Huffman output exceeded `demote_limit` — Huffman dominates.
+    Demote,
+    /// Terminal decode corruption.
+    Corrupt(&'static str),
+}
+
+/// Decode the maximal run of consecutive Huffman blocks (one island) starting at
+/// bit offset `start_bit`, into a fresh `cap`-byte buffer, resolving pre-island
+/// back-references against `pred` (the true rolling output window). Stops at the
+/// first STORED block (byte-aligned) or a BFINAL Huffman block. Returns the
+/// decoded island bytes plus how it ended. `Err(Overflow)` if the buffer filled
+/// (caller grows); `Err(Demote)` if Huffman output crosses `demote_limit`.
+#[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
+fn try_decode_island(
+    deflate: &[u8],
+    start_bit: usize,
+    n: usize,
+    pred: &[u8],
+    scratch: &mut crate::decompress::parallel::lut_bulk_inflate::DecoderScratch,
+    cap: usize,
+    demote_limit: usize,
+    huffman_base: usize,
+) -> Result<(Vec<u8>, IslandExit), IslandErr> {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::lut_bulk_inflate::{decode_block, BulkDecodeError};
+
+    let mut buf = vec![0u8; cap];
+    let mut local: usize = 0;
+    let mut bits = Bits::at_bit_offset(deflate, start_bit);
+    loop {
+        bits.refill();
+        let bh = (bits.peek() & 0b111) as u8;
+        let bfinal = bh & 1;
+        let bt = (bh >> 1) & 0b11;
+        if bt == 0 {
+            // A stored block terminates the island: consume its 3-bit header and
+            // align to the byte boundary where LEN/NLEN begin.
+            bits.consume(3);
+            bits.align_to_byte();
+            let bp = bits.bit_position();
+            debug_assert!(bp % 8 == 0, "post-island stored block must byte-align");
+            let len_off = bp / 8;
+            if len_off > n {
+                return Err(IslandErr::Corrupt("island stored terminator past end"));
+            }
+            buf.truncate(local);
+            return Ok((buf, IslandExit::StoredNext { len_off, bfinal }));
+        }
+        // Decode one Huffman block into buf[local..] (out_pos LOCAL; pre-island
+        // back-refs resolve against `pred`, within-island against buf[..local]).
+        match decode_block(&mut bits, &mut buf, &mut local, pred, scratch) {
+            Ok(res) => {
+                if huffman_base + local > demote_limit {
+                    return Err(IslandErr::Demote);
+                }
+                if res.is_final_block {
+                    buf.truncate(local);
+                    return Ok((buf, IslandExit::FinalHuffman));
+                }
+            }
+            Err(BulkDecodeError::OutputOverflow) => return Err(IslandErr::Overflow),
+            Err(_) => return Err(IslandErr::Corrupt("huffman island decode failed")),
+        }
+    }
+}
+
+/// Parse a byte-aligned stored block's `LEN`/`NLEN` at byte offset `len_off`
+/// (RFC 1951 §3.2.4). Returns `(len, data_start, data_end)` where the `len` raw
+/// literal bytes occupy `deflate[data_start..data_end]`. Byte-exact: `LEN` is
+/// explicit and validated against `~NLEN`.
+#[cfg(parallel_sm)]
+#[inline]
+fn read_stored_lens(
+    deflate: &[u8],
+    len_off: usize,
+    n: usize,
+) -> Result<(usize, usize, usize), StoredSplitError> {
+    if len_off + 4 > n {
+        return Err(StoredSplitError::Corrupt("truncated LEN/NLEN"));
+    }
+    let len = u16::from_le_bytes([deflate[len_off], deflate[len_off + 1]]) as usize;
+    let nlen = u16::from_le_bytes([deflate[len_off + 2], deflate[len_off + 3]]);
+    if (len as u16) != !nlen {
+        return Err(StoredSplitError::Corrupt("LEN != ~NLEN"));
+    }
+    let data_start = len_off + 4;
+    let data_end = data_start + len;
+    if data_end > n {
+        return Err(StoredSplitError::Corrupt(
+            "stored block runs past end of input",
+        ));
+    }
+    Ok((len, data_start, data_end))
+}
+
+/// Reconstruct the ≤`MAX_WINDOW_SIZE` bytes of TRUE emitted output immediately
+/// preceding `out_pos` into `pred`, sourcing each byte from the segment covering
+/// it (stored bytes from the input; prior-island bytes from their decoded bufs).
+/// Returns the window length. `pred`'s last byte is `output[out_pos - 1]`,
+/// matching `decode_block`'s `predecessor_window` contract.
+#[cfg(parallel_sm)]
+fn build_pred_streaming(
+    pred: &mut [u8],
+    segs: &[Seg],
+    islands_buf: &[Vec<u8>],
+    deflate: &[u8],
+    out_pos: usize,
+) -> usize {
+    let w = out_pos.min(MAX_WINDOW_SIZE);
+    if w == 0 {
+        return 0;
+    }
+    let window_start = out_pos - w;
+    // Walk segments backward accumulating their output extents; copy the portion
+    // of each segment that intersects [window_start, out_pos) into pred.
+    let mut seg_end = out_pos; // exclusive output offset of the current segment's end
+    for s in segs.iter().rev() {
+        let slen = s.out_len();
+        let seg_start = seg_end - slen;
+        if seg_end <= window_start {
+            break;
+        }
+        let lo = seg_start.max(window_start);
+        let hi = seg_end.min(out_pos);
+        if lo < hi {
+            let src_bytes = s.bytes(islands_buf, deflate);
+            let src_lo = lo - seg_start;
+            let dst_lo = lo - window_start;
+            pred[dst_lo..dst_lo + (hi - lo)]
+                .copy_from_slice(&src_bytes[src_lo..src_lo + (hi - lo)]);
+        }
+        seg_end = seg_start;
+        if seg_end <= window_start {
+            break;
+        }
+    }
+    w
+}
+
+/// Whole-output CRC32 over the ORDERED segments (stored from input, islands from
+/// their bufs). Partitions the segment list into contiguous groups balanced by
+/// output bytes; each worker hashes its segments' bytes in order; the per-group
+/// CRCs fold left-to-right (`combine_crc32`) to exactly `crc32(whole output)`.
+#[cfg(parallel_sm)]
+fn segmented_crc(segs: &[Seg], islands_buf: &[Vec<u8>], deflate: &[u8], num_threads: usize) -> u32 {
+    let total: usize = segs.iter().map(|s| s.out_len()).sum();
+    if total == 0 {
+        return 0;
+    }
+    let threads = num_threads.max(1).min(num_cpus::get_physical().max(1));
+    if threads <= 1 || total < (1 << 20) || segs.len() < threads {
+        let mut hasher = Hasher::new();
+        for s in segs {
+            hasher.update(s.bytes(islands_buf, deflate));
+        }
+        return hasher.finalize();
+    }
+
+    // Partition segment indices into contiguous groups balanced by output bytes.
+    let target = total.div_ceil(threads).max(1);
+    let mut parts: Vec<std::ops::Range<usize>> = Vec::with_capacity(threads);
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (i, s) in segs.iter().enumerate() {
+        acc += s.out_len();
+        if acc >= target && parts.len() < threads - 1 {
+            parts.push(start..i + 1);
+            start = i + 1;
+            acc = 0;
+        }
+    }
+    if start < segs.len() {
+        parts.push(start..segs.len());
+    }
+
+    let mut results: Vec<(u32, usize)> = vec![(0u32, 0usize); parts.len()];
+    std::thread::scope(|scope| {
+        for (part, result) in parts.iter().zip(results.iter_mut()) {
+            let segs_part = &segs[part.clone()];
+            scope.spawn(move || {
+                let mut hasher = Hasher::new();
+                let mut len = 0usize;
+                for s in segs_part {
+                    let b = s.bytes(islands_buf, deflate);
+                    hasher.update(b);
+                    len += b.len();
+                }
+                *result = (hasher.finalize(), len);
+            });
+        }
+    });
+
+    let mut acc_crc = results[0].0;
+    for (crc, len) in results.iter().skip(1) {
+        acc_crc = combine_crc32(acc_crc, *crc, *len as u64);
+    }
+    acc_crc
 }
 
 /// Maximum DEFLATE back-reference distance (RFC 1951 §3.2.5): a tail block can
@@ -1269,6 +1815,214 @@ mod tests {
         }
         // The inline helper alone must also agree.
         assert_eq!(crc_runs_inline(deflate, header_size, &runs), expected);
+    }
+
+    /// Build a gzip stream from ordered `regions`, forcing a DEFLATE block
+    /// boundary between each region via a `Z_SYNC_FLUSH` (`Write::flush`), so
+    /// incompressible regions become STORED blocks and compressible regions
+    /// become Huffman islands — the SEGMENTED shape. `Z_SYNC_FLUSH` does NOT
+    /// reset the 32 KiB window, so a later region identical to an earlier one
+    /// back-references it ACROSS the intervening stored block(s) — the exact
+    /// cross-island back-reference the segmented decoder must resolve against the
+    /// TRUE rolling DECODED output. Returns `(gz_bytes, full_payload)`.
+    fn gzip_segmented_from_regions(regions: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        use std::io::Write as _;
+        let mut payload = Vec::new();
+        for r in regions {
+            payload.extend_from_slice(r);
+        }
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        for (i, r) in regions.iter().enumerate() {
+            enc.write_all(r).unwrap();
+            if i + 1 < regions.len() {
+                enc.flush().unwrap(); // Z_SYNC_FLUSH → block boundary, window kept
+            }
+        }
+        let deflate = enc.finish().unwrap();
+
+        // Wrap raw deflate in a minimal gzip envelope.
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        gz.extend_from_slice(&deflate);
+        gz.extend_from_slice(&crc32(&payload).to_le_bytes());
+        gz.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        (gz, payload)
+    }
+
+    fn oracle_decode(gz: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(gz)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    /// A distinctive, moderately-compressible pattern (a repeated pseudo-text
+    /// line). Compresses to a Huffman block whose bytes are recognisable, so a
+    /// predecessor-window bug corrupts them visibly against the oracle.
+    fn compressible_pattern(len: usize, salt: u8) -> Vec<u8> {
+        let base = b"The quick brown fox jumps over the lazy dog 0123456789. ";
+        let mut v = Vec::with_capacity(len);
+        let mut i = 0usize;
+        while v.len() < len {
+            let b = base[i % base.len()];
+            v.push(b ^ (salt.wrapping_mul((i / base.len()) as u8 + 1) & 0x03));
+            i += 1;
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// Incompressible run (PRNG) → forces a STORED block.
+    fn incompressible(len: usize, seed: u64) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        let mut s = seed;
+        for b in &mut v {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        v
+    }
+
+    /// THE ADVERSARIAL CASE (brief STEP 1 trap): two Huffman islands within
+    /// 32 KiB where the SECOND island back-references the FIRST island's DECODED
+    /// output ACROSS an intervening stored block. If the segmented decoder built
+    /// its predecessor window by RE-READING the compressed input (instead of the
+    /// TRUE rolling DECODED output), island 2 would decode to garbage and the
+    /// oracle comparison would fail. The stream starts stored with a <50% prefix
+    /// (→ routes to `decode_segmented`, not the single-tail path) and stays
+    /// stored-dominant (→ never demotes).
+    #[test]
+    fn adversarial_two_islands_cross_reference() {
+        // Layout (output order) — exercises BOTH cross-reference kinds:
+        //   R0  4 KiB random  (STORED, deferred-copy — later referenced by an island)
+        //   P1  4 KiB pattern  (Huffman island 1)
+        //   R1  8 KiB random  (stored)
+        //   P2  4 KiB == P1    (island 2, back-refs P1's DECODED output @ dist 12 KiB
+        //                       ACROSS R1 — the island→island trap)
+        //   RC  4 KiB == R0    (island: a compressible repeat of R0 → back-refs the
+        //                       STORED, NOT-YET-COPIED region R0 @ dist 20 KiB — the
+        //                       island→deferred-stored trap that needs materialize)
+        //   R2 40 KiB random  (stored; keeps stored-dominant, no demote)
+        let r0 = incompressible(4 * 1024, 0xA1);
+        let p1 = compressible_pattern(4 * 1024, 0x7);
+        let r1 = incompressible(8 * 1024, 0xB2);
+        let p2 = p1.clone(); // identical → flate2 back-references P1
+        let rc = r0.clone(); // identical → flate2 back-references stored R0
+        let r2 = incompressible(40 * 1024, 0xC3);
+
+        let (gz, payload) = gzip_segmented_from_regions(&[&r0, &p1, &r1, &p2, &rc, &r2]);
+        let oracle = oracle_decode(&gz);
+        assert_eq!(oracle, payload, "oracle sanity");
+
+        // Structural: first block stored, and the prefix routes to segmented
+        // (0 < prefix_out < expected/2). This confirms the segmented path — not
+        // the single-tail path — decodes it.
+        assert!(first_block_is_stored(&gz), "fixture must start stored");
+        let (_h, hdr) = gzip_format::read_header(&gz).unwrap();
+        let deflate = &gz[hdr..gz.len() - 8];
+        let (_runs, walk_end) = walk_stored_chain(deflate, hdr).unwrap();
+        match walk_end {
+            WalkEnd::HuffmanTail { prefix_out, .. } => {
+                assert!(prefix_out > 0, "prefix must be non-empty");
+                assert!(
+                    prefix_out * 2 < payload.len(),
+                    "prefix {prefix_out} must be < 50% to route segmented"
+                );
+            }
+            WalkEnd::Final { .. } => panic!("fixture must contain Huffman islands"),
+        }
+
+        let before = STORED_SEGMENTED_ISLANDS.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        let r = decompress_stored_parallel(&gz, &mut out, 4, None);
+        #[cfg(parallel_sm)]
+        {
+            assert_eq!(r.map(|n| n as usize).unwrap(), payload.len());
+            assert_eq!(
+                out, payload,
+                "ADVERSARIAL cross-island back-ref corrupted — predecessor window \
+                 must be the TRUE decoded output, not reconstructed-from-input"
+            );
+            assert_eq!(out, oracle);
+            assert!(
+                STORED_SEGMENTED_ISLANDS.load(Ordering::Relaxed) > before,
+                "segmented island decode must have run (Gate-0 non-inert witness)"
+            );
+        }
+        #[cfg(not(parallel_sm))]
+        {
+            let _ = before;
+            match r {
+                Err(StoredSplitError::NotStoredDominated) => {}
+                other => panic!("expected NotStoredDominated on non-parallel_sm, got {other:?}"),
+            }
+            assert!(out.is_empty());
+        }
+    }
+
+    /// Many scattered Huffman islands across a large stored-dominant stream (the
+    /// storedheavy shape): alternating incompressible (stored) and compressible
+    /// (Huffman) regions. Must decode byte-exact vs the flate2 oracle and stay
+    /// on the segmented path (no demote — stored dominates).
+    #[test]
+    fn segmented_scattered_islands_byte_exact() {
+        // Stored prefix (< 50% of total) then 10 islands each flanked by a
+        // larger stored run (~85% stored overall). Islands repeat earlier
+        // patterns → cross-references into earlier decoded output.
+        let prefix = incompressible(16 * 1024, 0x11);
+        let mut owned: Vec<Vec<u8>> = vec![prefix];
+        for k in 0..10u64 {
+            let salt = (k as u8) & 0x3;
+            owned.push(compressible_pattern(3 * 1024, salt));
+            owned.push(incompressible(20 * 1024, 0x1000 + k));
+        }
+        owned.push(compressible_pattern(3 * 1024, 0)); // trailing repeat of island 0
+        let regions: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+
+        let (gz, payload) = gzip_segmented_from_regions(&regions);
+        let oracle = oracle_decode(&gz);
+        assert_eq!(oracle, payload, "oracle sanity");
+        assert!(first_block_is_stored(&gz), "fixture must start stored");
+
+        for t in [1usize, 2, 4, 8] {
+            let mut out = Vec::new();
+            let r = decompress_stored_parallel(&gz, &mut out, t, None);
+            #[cfg(parallel_sm)]
+            {
+                assert_eq!(r.map(|n| n as usize).unwrap(), payload.len(), "t={t}");
+                assert_eq!(out, payload, "segmented byte-exact mismatch at t={t}");
+            }
+            #[cfg(not(parallel_sm))]
+            {
+                match r {
+                    Err(StoredSplitError::NotStoredDominated) => {}
+                    other => panic!("expected NotStoredDominated, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Demotion still fires (segmented) when Huffman ACTUALLY dominates: a small
+    /// stored prefix (routes to segmented) followed by a large compressible body
+    /// (> 50% of output) must bail to `NotStoredDominated` with no output.
+    #[test]
+    fn segmented_huffman_dominant_demotes() {
+        let prefix = incompressible(8 * 1024, 0x55); // 8 KiB stored prefix
+                                                     // 200 KiB highly compressible (zeros) → Huffman ≫ 50% of the ~208 KiB total.
+        let body = vec![0u8; 200 * 1024];
+        let (gz, _payload) = gzip_segmented_from_regions(&[&prefix, &body]);
+        assert!(first_block_is_stored(&gz), "fixture must start stored");
+
+        let mut out = Vec::new();
+        let r = decompress_stored_parallel(&gz, &mut out, 4, None);
+        match r {
+            Err(StoredSplitError::NotStoredDominated) => {} // demoted (Huffman dominates)
+            other => panic!("expected NotStoredDominated (Huffman-dominant), got {other:?}"),
+        }
+        assert!(out.is_empty(), "no partial output on demotion");
     }
 
     /// Demotion gate: a stored prefix that is < 50% of total output must fire
