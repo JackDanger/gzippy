@@ -2951,7 +2951,7 @@ mod tests {
                 eprintln!(
                     "Compressed: {} bytes, hex: {:02x?}",
                     compressed.len(),
-                    &compressed
+                    compressed
                 );
                 eprintln!(
                     "Standard: {} bytes, output: {:?}",

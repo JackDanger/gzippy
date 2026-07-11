@@ -548,7 +548,7 @@ fn has_unprocessed_tasks(tasks: &BTreeMap<i32, std::collections::VecDeque<Task>>
 /// Pop the front task from the lowest-priority non-empty bucket.
 /// Mirror of ThreadPool.hpp:213-218.
 fn first_pending_task(tasks: &mut BTreeMap<i32, std::collections::VecDeque<Task>>) -> Option<Task> {
-    for (_priority, queue) in tasks.iter_mut() {
+    for queue in tasks.values_mut() {
         if let Some(t) = queue.pop_front() {
             return Some(t);
         }
