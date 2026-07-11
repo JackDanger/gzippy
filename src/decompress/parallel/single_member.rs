@@ -2010,8 +2010,11 @@ mod tests {
 
         // Band constants bracket weights (1.09) between pure-stored (1.0) and the
         // lowest finer-preferring compressible corpus (silesia 3.11 / squishy 2.30).
-        assert!(MID_RATIO_COARSE_LOW > 1.0 && MID_RATIO_COARSE_LOW < 1.09);
-        assert!(MID_RATIO_COARSE_HIGH > 1.09 && MID_RATIO_COARSE_HIGH <= 2.30);
+        // Compile-time checked (both operands are consts).
+        const {
+            assert!(MID_RATIO_COARSE_LOW > 1.0 && MID_RATIO_COARSE_LOW < 1.09);
+            assert!(MID_RATIO_COARSE_HIGH > 1.09 && MID_RATIO_COARSE_HIGH <= 2.30);
+        }
 
         // ratio arg only bites on AMD + T>8; every other host is byte-identical
         // regardless of ratio, so the assertions below are AMD-gated.

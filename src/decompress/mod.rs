@@ -448,6 +448,11 @@ fn decompress_multi_member_grid<W: Write>(
 
 /// Like [`decompress_single_member`] but threads an output fd for zero-copy
 /// `writev` on the parallel-SM consumer path (file/stdout sinks).
+// Test-facing production-entry wrapper: production callers reach the parallel-SM
+// path through `decompress_single_member_fd_prescanned` (io.rs) directly; this
+// self-scanning form is exercised by the routing/correctness tests. Dead in the
+// non-test lib build under `-D warnings`. (routing-unification cleanup: task #6.)
+#[allow(dead_code)]
 pub(crate) fn decompress_single_member_fd<W: Write>(
     data: &[u8],
     writer: &mut W,
@@ -551,6 +556,11 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
 /// Route a single-member input. Pure dispatcher — classifies once and
 /// hands off to exactly one backend. **No fallback.** Each backend
 /// either succeeds or returns `Err(GzippyError::Decompression(_))`.
+// Test-facing production-entry wrapper: production callers reach this via
+// `decompress_single_member_prescanned` (io.rs) after the format scan; this
+// self-scanning form is exercised by the routing/correctness/selector tests.
+// Dead in the non-test lib build under `-D warnings`. (cleanup: task #6.)
+#[allow(dead_code)]
 pub(crate) fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
