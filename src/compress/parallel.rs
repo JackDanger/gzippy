@@ -24,7 +24,7 @@ use std::path::Path;
 
 /// BGZF-style subfield ID for block size markers
 /// Using "GZ" to identify gzippy-compressed blocks with embedded block sizes
-pub const GZ_SUBFIELD_ID: [u8; 2] = [b'G', b'Z'];
+pub const GZ_SUBFIELD_ID: [u8; 2] = *b"GZ";
 
 /// Metadata for gzip header FNAME and MTIME fields
 #[derive(Clone, Debug, Default)]
