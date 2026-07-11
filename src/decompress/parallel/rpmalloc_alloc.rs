@@ -120,11 +120,24 @@ mod arena {
     // large-output protected cells cannot regress in wall OR RSS). Retained-free
     // bytes are hard-capped at `min(T × SLAB_HIGH_T_MAX_BLOCK,
     // SLAB_HIGH_T_BUDGET_CEIL)` — the RSS backstop for variable-block
-    // compressible high-T corpora (silesia-T16 measured +3.7% vs +15.6%
-    // uncapped). All three constants are hardcoded (knob-free prod path).
+    // compressible high-T corpora. All three constants are hardcoded
+    // (knob-free prod path).
+    //
+    // BUDGET_CEIL re-tuned 16→64 MiB (2026-07-11): at 16 MiB the CEIL (not
+    // `T × block`) was the binding cap at T>=4 — only ~4 retained 4 MiB stored
+    // buffers for 8–16 workers, so storedheavy-512M output buffers still
+    // munmap→re-faulted (locate: 82% of page-faults were output-buffer
+    // first-touch; the 512M fixture demotes StoredParallel→ParallelSM and its
+    // 99%-stored body flows through `decode_clean_stored_into_contig`). 64 MiB
+    // admits full stored retention while `MAX_BLOCK`=8 MiB still excludes
+    // variable-large-output compressible chunks. Gated (solvency AMD Zen2,
+    // frozen /dev/null paired N=51, byte-exact): storedheavy-512M
+    // T8 1.089→0.895 (LOSS→WIN), T4 1.248→1.046, T16 0.954→0.889; no wall-cell
+    // regression across 48 cells; worst RSS +9.5% (weights-T8, within the ~15%
+    // wall-win budget); storedheavy RSS flat/lower.
     const SLAB_HIGH_T_MAX: usize = 64;
     const SLAB_HIGH_T_MAX_BLOCK: usize = 8 * 1024 * 1024;
-    const SLAB_HIGH_T_BUDGET_CEIL: usize = 16 * 1024 * 1024;
+    const SLAB_HIGH_T_BUDGET_CEIL: usize = 64 * 1024 * 1024;
 
     /// Decode thread count of the current/most-recent parallel-SM decode.
     /// 0 = no decode has started (slab auto-gate stays off).
