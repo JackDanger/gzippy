@@ -4026,10 +4026,9 @@ impl Block {
                 // copy — same `read_stored_bytes_aligned` bulk operation as the
                 // ring path's `try_read_stored_special`, folded into the same
                 // STORED-bulk bucket.
-                let _pa_stored_guard =
-                    crate::decompress::parallel::phase_timing::PhaseGuard::new(
-                        crate::decompress::parallel::phase_timing::add_stored_special_ns,
-                    );
+                let _pa_stored_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
+                    crate::decompress::parallel::phase_timing::add_stored_special_ns,
+                );
                 // SAFETY: `base` valid for [0, cap); `to_read <= spare = cap -
                 // *pos`; `bits.data` and the chunk buffer never alias.
                 let dst = unsafe { std::slice::from_raw_parts_mut(base.add(*pos), to_read) };

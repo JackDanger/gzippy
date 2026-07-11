@@ -58,8 +58,68 @@ fn push_boundary_candidates(
             }
         }
         chunk_begin = chunk_end;
+        // Test-only deterministic cancel seam: once the finder has produced
+        // enough boundaries for the consumer to read, hold here until the
+        // consumer's cancel lands, so `cancel stops the scan early` is
+        // observable without racing the (very fast) branchless scan. Bounded
+        // by wall-clock so a stray concurrent test's finder can never
+        // deadlock — it resumes the full scan if no cancel arrives. Compiles
+        // out entirely in non-test builds.
+        #[cfg(test)]
+        test_cancel_seam::maybe_hold_for_cancel(results, cancel);
     }
     results.finalize();
+}
+
+/// Test-only synchronization seam for [`scoped_cancel_stops_early_without_full_scan`].
+/// Armed per-test via [`Guard`]; a no-op unless armed. See the call site in
+/// [`push_boundary_candidates`].
+#[cfg(test)]
+mod test_cancel_seam {
+    use super::{AtomicBool, Ordering, StreamedResults};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static PAUSE_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Arm the seam for the lifetime of the returned guard: the finder will
+    /// hold after emitting `pause_after` boundaries until its cancel flag is
+    /// set. Disarms on drop (including on panic).
+    pub(super) struct Guard;
+
+    pub(super) fn arm(pause_after: usize) -> Guard {
+        PAUSE_AFTER.store(pause_after, Ordering::Relaxed);
+        ACTIVE.store(true, Ordering::Relaxed);
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.store(false, Ordering::Relaxed);
+            PAUSE_AFTER.store(usize::MAX, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn maybe_hold_for_cancel(
+        results: &StreamedResults<usize>,
+        cancel: Option<&AtomicBool>,
+    ) {
+        if !ACTIVE.load(Ordering::Relaxed) || results.len() < PAUSE_AFTER.load(Ordering::Relaxed) {
+            return;
+        }
+        // The target consumer sets its cancel within microseconds (it reads
+        // already-buffered offsets); this deadline is only a no-deadlock
+        // backstop for a concurrent test's finder that happens to observe the
+        // armed flag and will never be cancelled.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Coordinator wrapping a [`StreamedResults`] queue fed by one finder thread.
@@ -279,6 +339,10 @@ mod tests {
         sync_full.run_sync_boundary_search(&deflate, 0, end);
         let full_count = sync_full.results().len();
 
+        // Deterministically hold the finder after it has produced the 3
+        // boundaries the consumer reads, so the cancel below is guaranteed to
+        // land before the (sub-millisecond) branchless scan completes.
+        let _seam = test_cancel_seam::arm(3);
         let cancelled_count =
             RawBlockFinderCoordinator::with_scoped_boundary_search(&deflate, 0, end, |coord| {
                 let mut count = 0usize;
