@@ -608,15 +608,46 @@ pub(crate) fn effective_parallel_threads_with(
     // real parallel win to forfeit. Cap to serial. See
     // [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`] for the gated mechanism + measurements.
     // Byte-transparent (only the thread count changes). Guarded by a COMPRESSIBILITY
-    // gate (ratio >= 1.5) so near-incompressible small files (photo.jpg) — which are
-    // stored-block-dominated, have no marker pathology, and parallelize fine — stay
-    // parallel, AND by `deflate < floor` (a true >4 GiB member whose ISIZE wrapped to
-    // a small value still has a huge COMPRESSED size and correctly stays parallel).
-    // ARCH-INDEPENDENT: the all-marker blowup reproduces on BOTH AMD/Zen2 (routed
+    // gate (ratio >= 2.5) so LOW-ratio small files (photo.jpg ratio 1.005; dovi.tar
+    // ratio 2.46) — which parallelize to a WIN — stay parallel, AND by
+    // `deflate < floor` (a true >4 GiB member whose ISIZE wrapped to a small value
+    // still has a huge COMPRESSED size and correctly stays parallel).
+    //
+    // WHY A RATIO GATE AT ALL (the REAL guard — NOT boundary sparsity): the guard is
+    // the downstream AMORTIZATION SELECTOR (below, "SERIAL-CLEAN COST-MODEL
+    // SELECTOR"). The parallel pipeline does W ∝ (ISIZE/deflate ratio) more
+    // marker-resolution + apply_window work than the serial-clean driver, so it only
+    // repays at T >= crossover = ceil(ratio · margin) — a relation that IS monotonic
+    // in ratio and is measured (T2-MECHANISM-2026-06-26). At these SMALL output sizes
+    // the selector's fixed-overhead proxy under-amortizes, so a small compressible
+    // file is faster SERIAL up to a higher T than the proxy predicts; this ratio gate
+    // is the small-output pre-filter that keeps such files serial. (An earlier comment
+    // here claimed the demotion was justified because "higher compressibility ⇒
+    // SPARSER dynamic-block boundaries ⇒ all-marker blowup, monotonic in ratio." That
+    // mechanism is REFUTED by this file's own FALSIFIED boundary-density probe below
+    // (see the "content-based replacement … FALSIFIED" note): higher-ratio corpora
+    // have DENSER boundaries, and the window-absent marker fraction is ~1.0 for ALL
+    // corpora. Boundary sparsity is NOT the separating signal — the amortization
+    // selector is.)
+    //
+    // Gate RAISED 1.5 → 2.5 (2026-07-10, gated on AMD/Zen2): frees the [1.5, 2.5) band
+    // so dovi.tar (ratio 2.46) stays parallel and WINS (p8 16.2 ms vs rg 19.9 ms /
+    // 0.82×, 20% faster than the serial-demoted 20.1 ms; 51/51, /dev/null, byte-exact;
+    // surface dovi T4/T8/T16 1.02-1.03× LOSS → 0.81-0.82× WIN). Above the gate stays
+    // demoted (markup 3.71 forced-parallel measured to regress ~5×: p8 77 ms vs
+    // 15.6 ms serial).
+    //
+    // HYPOTHESIS (unvalidated): the upper edge (2.46, 2.5) is INFERRED, not measured —
+    // dovi at 2.46 is the highest-ratio small file gated a WIN, and no small file with
+    // ratio in (2.46, 2.5) has been measured. RE-OPEN TRIGGER: a small compressible
+    // file with ratio in (2.46, 2.5) that REGRESSES when routed parallel at T >= its
+    // crossover ⇒ tighten the gate back toward 2.46.
+    //
+    // ARCH: the small-output serial demotion is observed on BOTH AMD/Zen2 (routed
     // parallel at T≥6 by the crossover) AND aarch64/Apple-M1 (selector disabled ⇒
-    // routed parallel at T≥2; measured T1 33 ms → T4/T8/T16 ~180 ms, ~5× blowup), so
-    // the floor applies on every arch (gated on AMD/Zen2 + Apple-M1; Intel owed, same
-    // x86_64 code path as AMD).
+    // routed parallel at T≥2; markup measured T1 33 ms → T4/T8/T16 ~180 ms, ~5× when
+    // forced parallel), so the floor applies on every arch (gated on AMD/Zen2 +
+    // Apple-M1; Intel owed, same x86_64 code path as AMD).
     {
         let n = gzip_data.len();
         let isize_field = u32::from_le_bytes([
@@ -626,19 +657,20 @@ pub(crate) fn effective_parallel_threads_with(
             gzip_data[n - 1],
         ]) as u64;
         let deflate_len = deflate_data_len as u64;
-        // COMPRESSIBILITY GATE (ratio >= 1.5, i.e. 2·isize >= 3·deflate): the
-        // all-marker blowup REQUIRES compressibility — markers come from back-
-        // references, which near-incompressible data (stored-block-dominated) does
-        // not produce. A small INcompressible file (photo.jpg: 6.5 MiB, ratio 1.005)
-        // decodes as clean stored blocks and PARALLELIZES fine (measured 20 ms
-        // parallel vs 28 ms serial), so it must stay parallel; only compressible
-        // small files (markup 3.71, minjs 3.31, …) risk the marker pathology and are
-        // also faster serial at these sizes. The 2·isize >= 3·deflate form uses
-        // integer math (isize <= 4 GiB ⇒ ×2 fits u64). The lower `isize >= deflate`
-        // bound is subsumed (ratio 1.5 > 1.0), which also rejects a wrapped >4 GiB
-        // ISIZE (isize < deflate).
+        // COMPRESSIBILITY GATE (ratio >= 2.5, i.e. 2·isize >= 5·deflate). Justified by
+        // the downstream AMORTIZATION SELECTOR (crossover = ceil(ratio · margin),
+        // W ∝ ratio), NOT by the refuted boundary-sparsity mechanism — see the block
+        // comment above. A LOW-ratio small file (photo.jpg 1.005 stored-dominated;
+        // dovi.tar 2.46) PARALLELIZES to a WIN, so it must stay parallel; HIGH-ratio
+        // small files (markup 3.71, source tars 3.9-4.1, minjs 3.31, …) are faster
+        // serial at these sizes and stay demoted. Gate RAISED 1.5 → 2.5 (2026-07-10,
+        // AMD/Zen2 gated): frees the [1.5, 2.5) band (dovi p8 0.82× vs rg, was a 1.03×
+        // LOSS) while keeping the ≥2.5 band demoted (markup forced-parallel still
+        // regresses ~5×). The 2·isize >= 5·deflate form uses integer math (isize <= 4
+        // GiB ⇒ ×2 fits u64). The lower `isize >= deflate` bound is subsumed (ratio
+        // 2.5 > 1.0), which also rejects a wrapped >4 GiB ISIZE (isize < deflate).
         if min_output > 0
-            && isize_field.saturating_mul(2) >= deflate_len.saturating_mul(3)
+            && isize_field.saturating_mul(2) >= deflate_len.saturating_mul(5)
             && isize_field < min_output
             && deflate_len < min_output
         {
@@ -1590,20 +1622,42 @@ mod tests {
             ),
             8
         );
-        // photo.jpg-shaped: 6.5 MiB out / 6.48 MiB deflate → ratio 1.005 < 1.5
+        // photo.jpg-shaped: 6.5 MiB out / 6.48 MiB deflate → ratio 1.005 < 2.5
         // compressibility gate → floor must NOT fire (parallelizes fine as stored
-        // blocks; the marker pathology needs compressibility).
+        // blocks; the low ratio routes it below the amortization crossover).
         let photo = blob_with_isize(6_511_067);
         assert_eq!(
             call(&photo, 6_481_121, 8, PARALLEL_MIN_OUTPUT_BYTES_DEFAULT, 0.0),
             8
         );
-        // Right at the 1.5 gate (isize = 1.5·deflate) → fires (compressible enough).
-        let at_gate = blob_with_isize(6_000_000);
+        // dovi.tar-shaped: 5.888 MiB out / 2.391 MiB deflate → ratio 2.46 < 2.5
+        // compressibility gate → floor must NOT fire. (Gated 2026-07-10: the parallel
+        // pipeline WINS on dovi — p8 16.2 ms vs rg 19.9 ms / 0.82× — so demoting it to
+        // serial forfeited a real parallel win; the raised gate frees the low-ratio
+        // [1.5, 2.5) band while markup/tars, ratio 3.7-4.1, stay demoted.)
+        let dovi = blob_with_isize(5_888_000);
+        assert_eq!(
+            call(&dovi, 2_390_860, 8, PARALLEL_MIN_OUTPUT_BYTES_DEFAULT, 0.0),
+            8
+        );
+        // Just below the 2.5 gate (2·isize < 5·deflate) → floor must NOT fire.
+        let just_below = blob_with_isize(4_999_999);
+        assert_eq!(
+            call(
+                &just_below,
+                2_000_000,
+                8,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                0.0
+            ),
+            8
+        );
+        // Right at the 2.5 gate (2·isize == 5·deflate) → fires (compressible enough).
+        let at_gate = blob_with_isize(5_000_000);
         assert_eq!(
             call(
                 &at_gate,
-                4_000_000,
+                2_000_000,
                 8,
                 PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
                 0.0
