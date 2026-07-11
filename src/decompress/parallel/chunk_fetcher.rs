@@ -807,8 +807,8 @@ fn drive_impl<W: std::io::Write>(
     #[cfg(feature = "phase-timing")]
     let phase_consumer_wall_ns = phase_t0.elapsed().as_nanos() as u64;
     #[cfg(feature = "phase-timing")]
-    let phase_consumer_cpu_ns = crate::decompress::parallel::phase_timing::thread_cpu_ns()
-        .saturating_sub(phase_cpu_t0);
+    let phase_consumer_cpu_ns =
+        crate::decompress::parallel::phase_timing::thread_cpu_ns().saturating_sub(phase_cpu_t0);
     #[cfg(feature = "phase-timing")]
     let phase_t1 = std::time::Instant::now();
 
@@ -978,6 +978,26 @@ fn drive_impl<W: std::io::Write>(
         eprintln!(
             "  StoredParallel pure-stored chunked-streaming runs (no monolithic buffer): {}",
             crate::decompress::parallel::stored_split::STORED_STREAM_RUNS.load(Ordering::Relaxed),
+        );
+        // Segmented stored path: number of Huffman ISLANDS decoded in place while
+        // keeping the stored runs on the byte-exact LEN-chain parallel-copy path
+        // (the anti-demote lever). Non-zero on a stored-DOMINANT stream with
+        // scattered dynamic blocks (storedheavy) that previously DEMOTED wholesale
+        // to ParallelSM. Gate-0 non-inert witness for the segmented walk.
+        eprintln!(
+            "  StoredParallel segmented Huffman islands decoded in place: {}",
+            crate::decompress::parallel::stored_split::STORED_SEGMENTED_ISLANDS
+                .load(Ordering::Relaxed),
+        );
+        // Segmented writev-gather batches: non-zero = the segmented ordered-write
+        // fired the writev iovec-GATHER fast path (all stored+island segments
+        // gathered into batched writev syscalls straight from input mmap / decoded
+        // island bufs, zero userspace copy) instead of one write_all per segment.
+        // Gate-0 non-inert witness that the SERIAL ORDERED-WRITE floor is gone.
+        eprintln!(
+            "  StoredParallel segmented writev-gather batches: {}",
+            crate::decompress::parallel::stored_split::STORED_SEGMENTED_WRITEV_BATCHES
+                .load(Ordering::Relaxed),
         );
         // Window-sparsity effect counter: always 0 — keepIndex=false faithful port
         // is the sole behavior now (the old always-on kill-switch was removed).
