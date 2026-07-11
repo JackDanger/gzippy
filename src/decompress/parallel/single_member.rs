@@ -113,11 +113,44 @@ const MIN_ADJUSTED_CHUNK_BYTES: usize = 512 * 1024;
 /// num_threads` chunks (vendor's "give the thread pool more time to
 /// be filled out" — chosen empirically per the comment), with a
 /// 512 KiB floor (block-finder overhead would dominate below that).
+/// MID-RATIO COARSENING BAND (AMD/Zen2, T>8) — the low edge. A stream whose
+/// ISIZE/deflate ratio is in `[LOW, HIGH)` skips the finer `adjusted_chunk_size_amd`
+/// (`file/T²`, 512 KiB floor) formula and falls through to the VENDOR (rapidgzip)
+/// partition instead. WHY (measured, this branch's fulcrum, frozen solvency/Zen2,
+/// paired /dev/null N=15, ratio=gz/rg): the finer AMD formula over-chunks a LARGE
+/// MID-ratio stream — `weights.safetensors` (83 MiB deflate, ratio 1.09) got 159
+/// chunks at T16, and its per-chunk CONSUMER marker-resolution + apply-window cost
+/// (phasebreak: decode_wait COLLAPSES to 18 ms while consumer_cpu 15 ms +
+/// future_recv 10 ms + ~8 ms unmeasured EXPLODE) then set the wall → gz/rg 1.21
+/// LOSS. The vendor formula gives 40 chunks (2 MiB, = rapidgzip's 39) → gz/rg ~0.96
+/// (TIE/WIN); the chunk sweep is monotone-good down to ~39 chunks (159→1.21,
+/// 80→1.01, 46→0.93, 39→0.97, 20→1.17). The band is BRACKETED by measurement:
+/// BELOW it a PURE-STORED stream (incompressible, ratio 1.0003, NO window markers)
+/// keeps the finer path (base 0.716 vs vendor 0.741 — finer better) and ABOVE it a
+/// COMPRESSIBLE stream's slow Huffman decode repays finer chunks for load balance
+/// (silesia 3.11: base 131ch 0.817 vs vendor 44ch 0.876; bignasa 10.5: base 150ch
+/// 0.706 vs 50ch 0.730 — finer better). The separating mechanism is window-marker
+/// density × decode-cost: mid-ratio has markers but fast decode, so consumer
+/// overhead dominates when over-chunked. AMD/Zen2 + T>8 ONLY (the sole regime that
+/// takes the finer formula); every other arch/T is byte-identically routed.
+const MID_RATIO_COARSE_LOW: f64 = 1.05;
+/// MID-RATIO COARSENING BAND high edge — see [`MID_RATIO_COARSE_LOW`]. Set below
+/// the lowest measured compressible corpus that PREFERS finer chunks (squishy
+/// 2.30, silesia 3.11) and above `weights` (1.09), so only the mid-ratio band
+/// coarsens.
+const MID_RATIO_COARSE_HIGH: f64 = 2.0;
+
+/// Counter proving the mid-ratio coarsening band fired on a real decode
+/// (deletion-trap discipline; read by the routing / byte-transparency tests).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+pub static MID_RATIO_COARSE_APPLIED: AtomicU64 = AtomicU64::new(0);
+
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 pub(crate) fn adjusted_chunk_size_bytes(
     file_size: usize,
     num_threads: usize,
     default_chunk_size: usize,
+    isize_deflate_ratio: f64,
 ) -> usize {
     let threads = num_threads.max(1);
     // AMD/Zen2 VERY-HIGH-THREAD finer-chunk dispatch (GATED silesia T16, N=15,
@@ -135,7 +168,18 @@ pub(crate) fn adjusted_chunk_size_bytes(
     // (byte-identical wall). Dispatch is by `cpu_is_amd()` (cached cpuid vendor
     // string) and only moves chunk BOUNDARIES — decoded output is byte-identical.
     if cpu_is_amd() && threads > 8 {
-        return adjusted_chunk_size_amd(file_size, threads, default_chunk_size);
+        // MID-RATIO COARSENING: a large mid-ratio stream (ratio ∈ [LOW, HIGH))
+        // over-chunks under the finer `file/T²` formula and its per-chunk consumer
+        // marker-resolution cost sets the wall. Skip the finer formula and fall
+        // through to the VENDOR (rapidgzip) partition instead. See
+        // [`MID_RATIO_COARSE_LOW`] for the gated mechanism + measurements.
+        // Byte-transparent (only chunk boundaries move); output CRC32/ISIZE-verified.
+        let in_coarse_band =
+            (MID_RATIO_COARSE_LOW..MID_RATIO_COARSE_HIGH).contains(&isize_deflate_ratio);
+        if !in_coarse_band {
+            return adjusted_chunk_size_amd(file_size, threads, default_chunk_size);
+        }
+        MID_RATIO_COARSE_APPLIED.fetch_add(1, Ordering::Relaxed);
     }
     let vendor = adjusted_chunk_size_vendor(file_size, threads, default_chunk_size);
     // AMD/Zen2 MID-THREAD (2..=8): cap the chunk size by the per-T schedule so the
@@ -966,8 +1010,25 @@ pub fn decompress_parallel<W: Write>(
         } else {
             TARGET_COMPRESSED_CHUNK_BYTES
         };
-        let chunk_size =
-            adjusted_chunk_size_bytes(gzip_data.len(), num_threads, thread_default_chunk);
+        // ISIZE/deflate ratio (gzip trailer's LE uncompressed size mod 2^32 over
+        // the compressed member length) — drives the mid-ratio coarsening band in
+        // `adjusted_chunk_size_bytes` (see its doc). Guarded len above.
+        let chunk_ratio = {
+            let n = gzip_data.len();
+            let isize_field = u32::from_le_bytes([
+                gzip_data[n - 4],
+                gzip_data[n - 3],
+                gzip_data[n - 2],
+                gzip_data[n - 1],
+            ]) as f64;
+            isize_field / (_deflate_data_len.max(1) as f64)
+        };
+        let chunk_size = adjusted_chunk_size_bytes(
+            gzip_data.len(),
+            num_threads,
+            thread_default_chunk,
+            chunk_ratio,
+        );
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
         }
@@ -1148,8 +1209,12 @@ pub fn decompress_multi_member_grid<W: Write>(
         return Err(ParallelError::InvalidGzipFormat);
     }
     let num_threads = num_threads.max(1);
-    let chunk_size =
-        adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
+    let chunk_size = adjusted_chunk_size_bytes(
+        gzip_data.len(),
+        num_threads,
+        TARGET_COMPRESSED_CHUNK_BYTES,
+        0.0,
+    );
     let r = read_parallel_sm_grid(gzip_data, writer, out_fd, num_threads, chunk_size, verbose)
         .map_err(|e| match e {
             ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
@@ -1176,8 +1241,12 @@ pub fn decompress_multi_member_chunked<W: Write>(
         return Err(ParallelError::InvalidGzipFormat);
     }
     let num_threads = num_threads.max(1);
-    let chunk_size =
-        adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
+    let chunk_size = adjusted_chunk_size_bytes(
+        gzip_data.len(),
+        num_threads,
+        TARGET_COMPRESSED_CHUNK_BYTES,
+        0.0,
+    );
     let r = read_parallel_sm_multi(gzip_data, writer, num_threads, chunk_size, verbose).map_err(
         |e| match e {
             ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
@@ -1260,7 +1329,8 @@ pub fn decompress_multi_member_seq_fast<W: Write>(
     if gzip_data.len() < 18 || gzip_data[0] != 0x1f || gzip_data[1] != 0x8b {
         return Err(ParallelError::InvalidGzipFormat);
     }
-    let chunk_size = adjusted_chunk_size_bytes(gzip_data.len(), 1, TARGET_COMPRESSED_CHUNK_BYTES);
+    let chunk_size =
+        adjusted_chunk_size_bytes(gzip_data.len(), 1, TARGET_COMPRESSED_CHUNK_BYTES, 0.0);
 
     let mut counter = CountWriter {
         inner: writer,
@@ -1920,6 +1990,57 @@ mod tests {
         assert!(t4 >= t16, "more threads → smaller (or equal) chunks");
         assert!(t16 >= t64);
         assert!(t64 >= 512 * 1024, "never below 512 KiB floor");
+    }
+
+    // --- AMD/Zen2 mid-ratio coarsening band (T>8): a large MID-ratio stream
+    //     (weights-shaped, ratio ~1.09) skips the finer file/T² formula and takes
+    //     rapidgzip's VENDOR partition; pure-stored (~1.0) and compressible
+    //     (>=2.0) streams keep the finer path. Byte-transparent; gated on Zen2. ---
+    #[test]
+    fn mid_ratio_band_coarsens_only_mid_ratio_on_amd_high_t() {
+        // 83 MiB deflate (weights.safetensors-shaped). At T16 the finer AMD formula
+        // yields ~159 chunks (512 KiB floor); the vendor formula yields ~40 (2 MiB).
+        let file = 83_099_652usize;
+        let vendor = adjusted_chunk_size_vendor(file, 16, TARGET_COMPRESSED_CHUNK_BYTES);
+        let amd_fine = adjusted_chunk_size_amd(file, 16, TARGET_COMPRESSED_CHUNK_BYTES);
+        assert!(
+            vendor > amd_fine,
+            "vendor must be coarser than the finer AMD size"
+        );
+
+        // Band constants bracket weights (1.09) between pure-stored (1.0) and the
+        // lowest finer-preferring compressible corpus (silesia 3.11 / squishy 2.30).
+        assert!(MID_RATIO_COARSE_LOW > 1.0 && MID_RATIO_COARSE_LOW < 1.09);
+        assert!(MID_RATIO_COARSE_HIGH > 1.09 && MID_RATIO_COARSE_HIGH <= 2.30);
+
+        // ratio arg only bites on AMD + T>8; every other host is byte-identical
+        // regardless of ratio, so the assertions below are AMD-gated.
+        #[cfg(not(target_arch = "aarch64"))]
+        if cpu_is_amd() {
+            let mid = adjusted_chunk_size_bytes(file, 16, TARGET_COMPRESSED_CHUNK_BYTES, 1.09);
+            let stored = adjusted_chunk_size_bytes(file, 16, TARGET_COMPRESSED_CHUNK_BYTES, 1.003);
+            let compressible =
+                adjusted_chunk_size_bytes(file, 16, TARGET_COMPRESSED_CHUNK_BYTES, 3.11);
+            // mid-ratio → vendor (coarse); the other two → finer AMD formula.
+            assert_eq!(mid, vendor, "mid-ratio must take the vendor partition");
+            assert_eq!(
+                stored, amd_fine,
+                "pure-stored must keep the finer AMD partition"
+            );
+            assert_eq!(
+                compressible, amd_fine,
+                "compressible must keep the finer AMD partition"
+            );
+            assert!(mid > stored, "mid-ratio coarser than pure-stored");
+            // Below T>8 the band is never consulted (only the T>8 branch reads it),
+            // so T8 is ratio-invariant.
+            let t8_mid = adjusted_chunk_size_bytes(file, 8, TARGET_COMPRESSED_CHUNK_BYTES, 1.09);
+            let t8_hi = adjusted_chunk_size_bytes(file, 8, TARGET_COMPRESSED_CHUNK_BYTES, 3.11);
+            assert_eq!(
+                t8_mid, t8_hi,
+                "T<=8 must be byte-identically routed for any ratio"
+            );
+        }
     }
 
     // --- AMD/Zen2 mid-thread (2..=8) per-T chunk-size cap: shrink the chunk size
