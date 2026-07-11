@@ -676,7 +676,7 @@ fn decompress_single_member_for<W: Write>(
             use crate::decompress::parallel::stored_split::{
                 decompress_stored_parallel, StoredSplitError,
             };
-            match decompress_stored_parallel(data, writer, num_threads) {
+            match decompress_stored_parallel(data, writer, num_threads, out_fd) {
                 Ok(n) => {
                     if crate::utils::debug_enabled() {
                         eprintln!(

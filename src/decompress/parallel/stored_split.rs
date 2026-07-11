@@ -66,6 +66,13 @@ pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
 /// non-inert witness). Dumped by `GZIPPY_DEBUG=1`.
 pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 
+/// Counter: number of pure-stored streams whose runs were emitted via the
+/// `writev` iovec-GATHER fast path (all run slices gathered into batched
+/// `writev` syscalls) instead of one `write_all` per run. Non-zero proves the
+/// coalesced-write path fired (Gate-0 non-inert witness for the syscall-count
+/// collapse). Dumped by `GZIPPY_DEBUG=1`.
+pub static STORED_WRITEV_BATCHES: AtomicU64 = AtomicU64::new(0);
+
 /// Threshold: if the stored prefix accounts for < this fraction of total
 /// output (numerator/denominator), demote to ParallelSM so the Huffman tail
 /// is decoded in parallel. Currently 50% (1/2).
@@ -274,6 +281,7 @@ pub fn decompress_stored_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
     num_threads: usize,
+    out_fd: Option<i32>,
 ) -> Result<u64, StoredSplitError> {
     let (_hdr, header_size) =
         gzip_format::read_header(gzip_data).map_err(|_| StoredSplitError::InvalidFormat)?;
@@ -335,7 +343,7 @@ pub fn decompress_stored_parallel<W: Write>(
             }
             STORED_STREAM_RUNS.fetch_add(1, Ordering::Relaxed);
             time_phase("stream_write", || {
-                write_runs(writer, deflate, header_size, &runs)
+                write_runs(writer, deflate, header_size, &runs, out_fd)
             })?;
             Ok(total as u64)
         }
@@ -838,12 +846,50 @@ fn crc_runs_inline(deflate: &[u8], base_off: usize, runs: &[StoredRun]) -> u32 {
 /// loop (`GzipChunkFetcher`). The caller has already verified CRC32 + size, so
 /// the first byte written here is the first byte to reach the sink — the
 /// verify-before-write / no-partial-output-on-corruption contract is preserved.
+///
+/// When the sink's raw fd is available (`out_fd` — production file / stdout
+/// sinks pass `writer.get_ref().as_raw_fd()`), the run slices are GATHERED into
+/// batched `writev` syscalls (`writev_all_to_fd`, the reaper's iovec pattern,
+/// vendor `writeAllToFdVector`) rather than one `write_all` per run. On a
+/// ~100 MB incompressible stream that collapses ~900 serial per-run `write()`
+/// calls to ⌈runs / IOV_MAX⌉ `writev` calls. It is BYTE-IDENTICAL: the
+/// concatenation of the gathered iovecs, in run order, equals the old per-run
+/// write order (each iovec borrows `deflate[src_off-base..][..len]`, the exact
+/// slice `write_all` streamed). The stored path is the sole producer of output
+/// bytes and has written nothing through `writer` yet; the pre-`writev`
+/// `flush` preserves ordering defensively even if the `BufWriter` (which wraps
+/// the SAME fd) ever held buffered bytes. Without a fd (tests / in-memory Vec /
+/// non-unix) it falls back to the portable per-run `write_all` loop.
 fn write_runs<W: Write>(
     writer: &mut W,
     deflate: &[u8],
     base_off: usize,
     runs: &[StoredRun],
+    out_fd: Option<i32>,
 ) -> Result<(), StoredSplitError> {
+    #[cfg(unix)]
+    if let Some(fd) = out_fd {
+        writer.flush()?;
+        let mut iovs: Vec<libc::iovec> = Vec::with_capacity(runs.len());
+        for r in runs {
+            if r.len == 0 {
+                continue;
+            }
+            let s = r.src_off - base_off;
+            iovs.push(libc::iovec {
+                iov_base: deflate[s..s + r.len].as_ptr() as *mut libc::c_void,
+                iov_len: r.len,
+            });
+        }
+        if !iovs.is_empty() {
+            crate::decompress::parallel::fd_vectored_write::writev_all_to_fd(fd, &mut iovs)?;
+        }
+        STORED_WRITEV_BATCHES.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    let _ = out_fd;
+
     for r in runs {
         let s = r.src_off - base_off;
         writer.write_all(&deflate[s..s + r.len])?;
@@ -983,7 +1029,7 @@ mod tests {
         let gz = gzip_stored(payload, block);
         assert!(first_block_is_stored(&gz) || payload.is_empty());
         let mut out = Vec::new();
-        let n = decompress_stored_parallel(&gz, &mut out, threads).expect("decode");
+        let n = decompress_stored_parallel(&gz, &mut out, threads, None).expect("decode");
         assert_eq!(n as usize, payload.len());
         assert_eq!(
             out, payload,
@@ -1053,7 +1099,7 @@ mod tests {
         gz.extend_from_slice(&(payload.len() as u32).to_le_bytes());
 
         let mut out = Vec::new();
-        let n = decompress_stored_parallel(&gz, &mut out, 4).expect("decode");
+        let n = decompress_stored_parallel(&gz, &mut out, 4, None).expect("decode");
         assert_eq!(n as usize, payload.len());
         assert_eq!(out, payload);
     }
@@ -1074,7 +1120,7 @@ mod tests {
         assert!(!first_block_is_stored(&gz));
 
         let mut out = Vec::new();
-        let r = decompress_stored_parallel(&gz, &mut out, 4);
+        let r = decompress_stored_parallel(&gz, &mut out, 4, None);
         #[cfg(parallel_sm)]
         {
             assert_eq!(r.map(|n| n as usize).unwrap(), payload.len());
@@ -1121,7 +1167,7 @@ mod tests {
         assert_eq!(oracle, payload, "oracle sanity");
 
         let mut out = Vec::new();
-        let r = decompress_stored_parallel(&gz, &mut out, 8);
+        let r = decompress_stored_parallel(&gz, &mut out, 8, None);
         #[cfg(parallel_sm)]
         {
             assert_eq!(r.map(|n| n as usize).unwrap(), payload.len());
@@ -1145,7 +1191,7 @@ mod tests {
         // + LEN(2) → NLEN at offset 13.
         gz[13] ^= 0xFF;
         let mut out = Vec::new();
-        match decompress_stored_parallel(&gz, &mut out, 4) {
+        match decompress_stored_parallel(&gz, &mut out, 4, None) {
             Err(StoredSplitError::Corrupt(_)) => {}
             other => panic!("expected Corrupt, got {other:?}"),
         }
@@ -1159,7 +1205,7 @@ mod tests {
         let crc_pos = gz.len() - 8;
         gz[crc_pos] ^= 0xFF;
         let mut out = Vec::new();
-        match decompress_stored_parallel(&gz, &mut out, 4) {
+        match decompress_stored_parallel(&gz, &mut out, 4, None) {
             Err(StoredSplitError::CrcMismatch { .. }) => {}
             other => panic!("expected CrcMismatch, got {other:?}"),
         }
@@ -1187,7 +1233,7 @@ mod tests {
         assert_eq!(oracle, payload, "oracle sanity");
 
         let mut out = Vec::new();
-        decompress_stored_parallel(&gz, &mut out, 8).expect("decode");
+        decompress_stored_parallel(&gz, &mut out, 8, None).expect("decode");
         assert_eq!(out, payload);
         assert_eq!(out, oracle);
     }
@@ -1260,7 +1306,7 @@ mod tests {
         // The stored prefix (40_000) * 2 = 80_000 < total (100_000) → demotion gate.
         // expected_size / 2 = 50_000; prefix_out (40_000) < 50_000 → DEMOTE.
         let mut out = Vec::new();
-        match decompress_stored_parallel(&gz, &mut out, 4) {
+        match decompress_stored_parallel(&gz, &mut out, 4, None) {
             Err(StoredSplitError::NotStoredDominated) => {} // gate fired correctly
             other => panic!(
                 "expected NotStoredDominated (demotion gate, prefix={stored_size} < total/2={}), got {other:?}",
