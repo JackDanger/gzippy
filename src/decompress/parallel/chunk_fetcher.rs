@@ -1518,6 +1518,16 @@ fn consumer_loop<W: std::io::Write>(
                     );
                 }
             };
+            // EVENT-DRIVEN wakeup: block on the pool's task-completion event
+            // (with a 1ms liveness fallback) instead of a fixed 1ms poll, so the
+            // consumer re-pumps the prefetch horizon at ~0 latency whenever a
+            // worker frees up. Monotonic gen ⇒ a completion during `pump` makes
+            // the wait return immediately (no lost wakeup).
+            let mut last_completion_gen = thread_pool.completion_gen();
+            let wait_ready = || {
+                last_completion_gen = thread_pool
+                    .wait_for_completion(last_completion_gen, std::time::Duration::from_millis(1));
+            };
             // Phase-timing (NOT one of the brief's originally-named 6 sites;
             // added after dogfooding surfaced it — see phase_timing.rs doc
             // for the deviation note): `try_take_prefetched_pumping`'s own
@@ -1537,7 +1547,7 @@ fn consumer_loop<W: std::io::Write>(
                 let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
                     crate::decompress::parallel::phase_timing::add_decode_wait,
                 );
-                block_fetcher.try_take_prefetched_pumping(&partition_offset, pump)
+                block_fetcher.try_take_prefetched_pumping(&partition_offset, pump, wait_ready)
             };
             if let Some(Ok(arc)) = phase_decode_wait_result {
                 // Vendor GzipChunkFetcher.hpp:646-648,670-684 — accept when
@@ -1624,6 +1634,16 @@ fn consumer_loop<W: std::io::Write>(
                     let _phase_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
                         crate::decompress::parallel::phase_timing::add_decode_wait,
                     );
+                    // EVENT-DRIVEN wakeup while blocked on the on-demand decode
+                    // (see the prefetch-hit branch above): wake on the pool's
+                    // task-completion event, not a fixed 1ms poll.
+                    let mut last_completion_gen = thread_pool.completion_gen();
+                    let wait_ready = || {
+                        last_completion_gen = thread_pool.wait_for_completion(
+                            last_completion_gen,
+                            std::time::Duration::from_millis(1),
+                        );
+                    };
                     block_fetcher.get_with_prefetch(
                         next_block_offset,
                         |_key: usize| -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
@@ -1642,6 +1662,7 @@ fn consumer_loop<W: std::io::Write>(
                         is_finalized_too_high,
                         partition_offset_for,
                         should_drive_prefetch,
+                        wait_ready,
                     )
                 };
                 chunk_arc_result.map_err(FetchError::Decode)?

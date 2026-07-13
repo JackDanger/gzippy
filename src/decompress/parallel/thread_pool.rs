@@ -220,6 +220,17 @@ pub struct ThreadPool {
     /// and park; a task push always happens-before the condvar notify).
     /// No rapidgzip counterpart — supports the byte-transparent spin knob.
     pending_tasks: Arc<AtomicUsize>,
+    /// EVENT-DRIVEN CONSUMER WAKEUP (no rapidgzip counterpart — rg's consumer
+    /// blocks on `std::future` directly; ours blocks on an mpsc `Receiver`).
+    /// A monotonic generation counter bumped + `notify_all`'d AFTER every task
+    /// body returns — at which point the task's result is already in its oneshot
+    /// channel (`submit`'s `tx.send(task())`). The single-pass in-order consumer,
+    /// while waiting for the NEXT chunk it needs, blocks on this condvar (with a
+    /// 1 ms fallback) instead of polling `recv_timeout(1ms)`, so it wakes
+    /// IMMEDIATELY when any worker frees up and re-advances the prefetch horizon
+    /// at ~0 latency (closes H-DECODEWAIT). Byte-transparent: only changes WHEN
+    /// the consumer wakes to pump/re-check, never what it decodes.
+    task_completed: Arc<(Mutex<u64>, Condvar)>,
     /// `m_threads` (ThreadPool.hpp:247). `JoiningThread` becomes a
     /// `JoinHandle` we explicitly join in `stop()`. Wrapped in `Mutex`
     /// so the `&self`-callable `submit` can push freshly spawned
@@ -247,8 +258,37 @@ impl ThreadPool {
             })),
             ping_workers: Arc::new(Condvar::new()),
             pending_tasks: Arc::new(AtomicUsize::new(0)),
+            task_completed: Arc::new((Mutex::new(0), Condvar::new())),
             threads: Mutex::new(Vec::with_capacity(thread_count)),
         }
+    }
+
+    /// Current task-completion generation (see [`ThreadPool::task_completed`]).
+    /// A consumer snapshots this BEFORE its non-blocking `try_recv` + prefetch
+    /// pump, then hands it to [`wait_for_completion`](Self::wait_for_completion);
+    /// because the counter is monotonic, a completion that lands during the pump
+    /// makes the subsequent wait return immediately — no lost wakeup.
+    pub fn completion_gen(&self) -> u64 {
+        *self
+            .task_completed
+            .0
+            .lock()
+            .expect("task_completed poisoned")
+    }
+
+    /// Block until the completion generation advances past `last_seen` or
+    /// `timeout` elapses, returning the current generation. The `timeout` is a
+    /// liveness fallback only — under load the condvar notify fires first, so the
+    /// consumer wakes at ~0 latency on each worker completion. On the rare
+    /// tiny-file / idle path the fallback keeps the old poll cadence, so there is
+    /// no extra wakeup cost when there is nothing completing.
+    pub fn wait_for_completion(&self, last_seen: u64, timeout: std::time::Duration) -> u64 {
+        let (lock, cv) = &*self.task_completed;
+        let guard = lock.lock().expect("task_completed poisoned");
+        let (guard, _) = cv
+            .wait_timeout_while(guard, timeout, |g| *g == last_seen)
+            .expect("task_completed poisoned during wait");
+        *guard
     }
 
     /// Convenience constructor using [`available_cores`] and an empty
@@ -417,10 +457,20 @@ impl ThreadPool {
         let idle = Arc::clone(&self.idle_thread_count);
         let running = Arc::clone(&self.running);
         let pending = Arc::clone(&self.pending_tasks);
+        let task_completed = Arc::clone(&self.task_completed);
         let pin = self.thread_pinning.get(&index).copied();
 
         let handle = thread::spawn(move || {
-            worker_main(index, shared, cv, idle, running, pending, pin);
+            worker_main(
+                index,
+                shared,
+                cv,
+                idle,
+                running,
+                pending,
+                task_completed,
+                pin,
+            );
         });
         threads.push(handle);
     }
@@ -453,6 +503,7 @@ fn worker_main(
     idle: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
+    task_completed: Arc<(Mutex<u64>, Condvar)>,
     pin: Option<u32>,
 ) {
     let spin_us = pool_spin_us();
@@ -532,6 +583,18 @@ fn worker_main(
             pending.fetch_sub(1, Ordering::Relaxed);
             // task() (ThreadPool.hpp:219).
             t();
+            // EVENT-DRIVEN CONSUMER WAKEUP (see `ThreadPool::task_completed`).
+            // The task body has returned, so its result is already in its
+            // oneshot channel (`submit`'s `tx.send(task())` ran inside `t()`);
+            // bump the generation + wake any consumer blocked waiting for the
+            // next chunk so it re-checks + re-advances the prefetch horizon at
+            // ~0 latency instead of on a fixed 1ms poll tick.
+            let (lock, cv) = &*task_completed;
+            {
+                let mut g = lock.lock().expect("task_completed poisoned");
+                *g = g.wrapping_add(1);
+            }
+            cv.notify_all();
         }
         // No task: loop and re-wait. This can happen if another worker
         // raced us to the front of the queue; the C++ has the same
@@ -712,6 +775,44 @@ mod tests {
         drop(tx); // simulate the worker never running
         let f: Future<i32> = Future { rx };
         assert_eq!(f.wait(), Err(FutureError::Cancelled));
+    }
+
+    #[test]
+    fn completion_gen_advances_and_wakes_a_waiter() {
+        // Event-driven consumer wakeup: after a task body returns, the pool
+        // bumps `task_completed` and notifies. A consumer that snapshotted the
+        // gen and then blocks in `wait_for_completion` must wake with an
+        // advanced gen well within the (generous) fallback timeout.
+        let pool = ThreadPool::new(1, ThreadPinning::new());
+        let before = pool.completion_gen();
+        let f = pool.submit(|| 1_u32, 0);
+        assert_eq!(f.wait().unwrap(), 1);
+        // The notify fires after t() returns; a wait from `before` must observe
+        // an advanced gen (either already advanced → returns immediately, or via
+        // the condvar notify) far inside the 5s liveness fallback.
+        let g = pool.wait_for_completion(before, Duration::from_secs(5));
+        assert!(g > before, "completion gen must advance after a task runs");
+    }
+
+    #[test]
+    fn wait_for_completion_returns_immediately_when_gen_already_advanced() {
+        // No lost wakeup: if a completion landed between the consumer's snapshot
+        // and its wait (the monotonic-counter race the pump path relies on), the
+        // wait must return immediately rather than block for the fallback.
+        let pool = ThreadPool::new(2, ThreadPinning::new());
+        let start = std::time::Instant::now();
+        // A stale `last_seen` (u64::MAX never equals a real small gen, but the
+        // predicate is `*g == last_seen`; use `before` snapshot then advance).
+        let before = pool.completion_gen();
+        pool.submit(|| 0_u32, 0).wait().unwrap();
+        // Gen is now > before. Waiting from `before` must not block on the 10s
+        // fallback — it should see the advanced gen and return at once.
+        let g = pool.wait_for_completion(before, Duration::from_secs(10));
+        assert!(g > before);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait must not consume the fallback when gen already advanced"
+        );
     }
 
     #[test]
