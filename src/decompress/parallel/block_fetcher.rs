@@ -220,13 +220,21 @@ where
     /// stayed at 2.3s of idle worker capacity while consumer waited
     /// 89-171 ms per session on in-flight prefetches that took 20-25 ms
     /// each (`ttp.rx_recv_block` trace bucket).
-    pub fn try_take_prefetched_pumping<F>(
+    pub fn try_take_prefetched_pumping<F, W>(
         &self,
         block_offset: &Key,
         mut pump_prefetch: F,
+        mut wait_ready: W,
     ) -> Option<Result<Value, Err>>
     where
         F: FnMut(),
+        // EVENT-DRIVEN wakeup: block until any worker completes (or a short
+        // liveness fallback elapses), then re-check. Replaces the fixed
+        // `recv_timeout(1ms)` poll so the consumer re-advances the prefetch
+        // horizon at ~0 latency on each completion. The production caller passes
+        // a `ThreadPool::wait_for_completion`-backed closure; tests pass a small
+        // sleep (same 1ms cadence as the old poll).
+        W: FnMut(),
     {
         if let Some(v) = { self.get_if_available(block_offset) } {
             return Some(Ok(v));
@@ -237,19 +245,23 @@ where
         // keyed correlation, not overlap-heuristic blame. This is THE wait that
         // gates the in-order wall (~97% of it), so knowing which chunk it waits
         // on, and what that chunk was doing, is the indisputable measurement.
-        // Lever H: pump prefetch on 1ms ticks while waiting (vendor
-        // BlockFetcher.hpp:314-316). Keeps the prefetch horizon
-        // advancing so by the time chunk N arrives, chunks N+1..N+k
-        // are already in flight or done — reducing subsequent
-        // `wait.block_fetcher_get` and `ttp.rx_recv_block` events.
+        // Lever H (event-driven): pump the prefetch horizon on each worker
+        // completion, not on a fixed 1ms tick (vendor BlockFetcher.hpp:314-316
+        // uses a 1ms `wait_for`; we converge to rg's blocking consumer by waking
+        // on the completion event instead). Keeps the horizon advancing so by
+        // the time chunk N arrives, chunks N+1..N+k are already in flight or
+        // done — at ~0 latency after a worker frees up.
         loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+            match rx.try_recv() {
                 Ok(Ok(v)) => return Some(Ok(v)),
                 Ok(Err(e)) => return Some(Err(e)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
                     pump_prefetch();
+                    // Block until a worker completes (immediate wakeup) or the
+                    // liveness fallback elapses, then loop and re-check `rx`.
+                    wait_ready();
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!(
                     "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
                      (broken promise)"
                 ),
@@ -261,7 +273,14 @@ where
     /// closure (tests). Production callers must use the pumping variant.
     #[allow(dead_code)]
     pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
-        self.try_take_prefetched_pumping(block_offset, || {})
+        // No pool to wake us here (tests / non-production callers); the fallback
+        // waiter is a short sleep so an empty `try_recv` doesn't busy-spin —
+        // preserving the old 1ms poll cadence for this path.
+        self.try_take_prefetched_pumping(
+            block_offset,
+            || {},
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        )
     }
 
     /// Like `get`, plus the `prefetchNewBlocks` body interleaved
@@ -290,7 +309,7 @@ where
     /// Returns `(value, prefetches_submitted_count)` so the caller can
     /// log / stat-record without re-querying.
     #[allow(clippy::too_many_arguments)]
-    pub fn get_with_prefetch<S, L, LN, P, F, PO>(
+    pub fn get_with_prefetch<S, L, LN, P, F, PO, W>(
         &self,
         block_offset: Key,
         submit: S,
@@ -300,6 +319,7 @@ where
         is_finalized_and_index_too_high: F,
         partition_offset_for: PO,
         should_drive_prefetch: bool,
+        mut wait_ready: W,
     ) -> (Result<Value, Err>, usize)
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
@@ -313,6 +333,11 @@ where
         P: Fn(Key, Key) -> Receiver<Result<Value, Err>>,
         F: Fn(usize) -> bool,
         PO: Fn(&Key) -> Key,
+        // EVENT-DRIVEN wakeup while blocked on the on-demand decode: block until
+        // a worker completes (or a liveness fallback), then re-check + re-pump.
+        // Replaces the fixed `recv_timeout(1ms)` poll — see
+        // `try_take_prefetched_pumping`.
+        W: FnMut(),
     {
         // Vendor's `BlockFetcher::get` timing at BlockFetcher.hpp:280-322:
         //   tGetStart = now();                            // line 280
@@ -356,13 +381,14 @@ where
         }
 
         // BlockFetcher.hpp:312-316 — `while ( queuedResult.wait_for(1ms)
-        // == timeout ) prefetchNewBlocks(...)`. We approximate with
-        // mpsc::Receiver::recv_timeout in a short loop so the prefetch
-        // queue keeps filling while we wait. The 1ms tick matches
-        // vendor exactly.
+        // == timeout ) prefetchNewBlocks(...)`. EVENT-DRIVEN: instead of a
+        // fixed 1ms poll we `try_recv` then block on the worker-completion
+        // event (with a liveness fallback), re-filling the prefetch queue at
+        // ~0 latency each time a worker frees up — converging to rg's blocking
+        // consumer.
         let t_future_wait_start = std::time::Instant::now();
         let value = loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+            match rx.try_recv() {
                 Ok(Ok(v)) => break v,
                 Ok(Err(e)) => {
                     self.statistics
@@ -373,7 +399,7 @@ where
                         .add_get_time(t_get_start.elapsed().as_secs_f64());
                     return (Err(e), prefetched);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if should_drive_prefetch {
                         prefetched += self.prefetch_new_blocks(
                             &lookup_block_offset,
@@ -383,8 +409,11 @@ where
                             &partition_offset_for,
                         );
                     }
+                    // Block until a worker completes (immediate wakeup) or the
+                    // liveness fallback elapses, then loop and re-check `rx`.
+                    wait_ready();
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     panic!(
                         "block_fetcher::get_with_prefetch: dispatch worker dropped reply \
                          (broken promise)"
