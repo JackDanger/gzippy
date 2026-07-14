@@ -519,6 +519,19 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     let _resident = crate::decompress::parallel::chunk_buffer_pool::T1ResidentScope::enter();
 
     let total_bits = input.len() * 8;
+    // STREAMING RSS FIX (thin-T1): the serial T1 driver reads the mmap'd input
+    // strictly front-to-back and never re-reads behind the decode cursor (no
+    // block-finder, no prefetch; the rolling window is a private 32 KiB copy),
+    // so consumed input pages can be released the moment `cur` passes them — the
+    // SAME mechanism the parallel consumer uses (`InputReaper` in `consumer_loop`).
+    // Without it a T1 decode holds the ENTIRE input mmap resident until process
+    // exit: peak RSS grows to ~= input size (~= output size for near-incompressible
+    // corpora), ~20-24x rapidgzip which streams a bounded reader window.
+    // Byte-transparent: MADV_DONTNEED on the file-backed mapping only drops
+    // resident pages (re-fault restores the identical page-cache bytes) and cannot
+    // change decoded output; auto-disabled for Vec-backed (anonymous) library/test
+    // inputs and for inputs below the arm threshold — see `InputReaper::new`.
+    let mut input_reaper = InputReaper::new(unsafe { InputSlice::from_slice(input) });
     // Compressed-bytes-per-chunk stride from the chunk configuration (T1 default
     // = 1 MiB target, warm output-buffer recycling). Clamp to ≥64 KiB so a
     // pathological tiny config can't thrash the loop.
@@ -597,6 +610,7 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
             break; // no forward progress (last chunk ran to EOF/BFINAL)
         }
         cur = end_bit;
+        input_reaper.advance(cur);
         // The final deflate block of a single-member stream leaves only the
         // 8-byte gzip trailer (CRC32 + ISIZE = 64 bits). The smallest possible
         // gzip member HEADER is 10 bytes + footer, so < 18 bytes (144 bits) of
