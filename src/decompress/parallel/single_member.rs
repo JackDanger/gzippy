@@ -278,20 +278,16 @@ fn adjusted_chunk_size_amd(file_size: usize, threads: usize, default_chunk_size:
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 const INCOMPRESSIBLE_CAP_MIN_FILE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Physical (not logical / SMT) core count of the host, cached. Caps the
-/// incompressible-stream finer-chunk refinement divisor in
-/// [`adjusted_chunk_size_bytes`]: SMT-sibling workers past the physical cores add
-/// no real parallel decode to balance a cheap-decode incompressible stream's
-/// (absent) straggler variance, so refining `file/threads²` for them only
-/// multiplies the in-order consumer's per-chunk round-trips (the measured
-/// bbb / storedheavy T32 over-subscription LOSS). Falls back to 1 if topology is
-/// unavailable. Cached in a `OnceLock` (topology is invariant for the process).
 /// Cold, out-of-line divisor selector for the incompressible SMT-oversubscription
-/// cap (see [`adjusted_chunk_size_bytes`]). Isolating the added const+topology-probe
-/// logic behind a `#[cold] #[inline(never)]` boundary keeps it out of the hot
-/// chunk-grid path's codegen unit so it cannot perturb the surrounding decode
-/// code's compiled layout (the byte-identical-grid compressible cells otherwise
-/// showed a ~2-5% cand-vs-base wall shift with no logic change). Byte-transparent.
+/// cap (see [`adjusted_chunk_size_bytes`]). For a large incompressible stream at
+/// more threads than physical cores, caps the finer `file/threads²` refinement
+/// divisor at the physical-core count (reusing the winning T=physical grid);
+/// otherwise returns `threads` unchanged (byte-identical grid). Isolating the added
+/// const+topology-probe logic behind a `#[cold] #[inline(never)]` boundary keeps it
+/// out of the hot chunk-grid path's codegen unit so it cannot perturb the
+/// surrounding decode code's compiled layout (the byte-identical-grid compressible
+/// cells otherwise showed a ~2-5% cand-vs-base wall shift with no logic change).
+/// Byte-transparent.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 #[cold]
 #[inline(never)]
@@ -307,6 +303,14 @@ fn incompressible_refine_divisor(
     }
 }
 
+/// Physical (not logical / SMT) core count of the host, cached. Caps the
+/// incompressible-stream finer-chunk refinement divisor in
+/// [`incompressible_refine_divisor`]: SMT-sibling workers past the physical cores
+/// add no real parallel decode to balance a cheap-decode incompressible stream's
+/// (absent) straggler variance, so refining `file/threads²` for them only
+/// multiplies the in-order consumer's per-chunk round-trips (the measured
+/// bbb / storedheavy T32 over-subscription LOSS). Falls back to 1 if topology is
+/// unavailable. Cached in a `OnceLock` (topology is invariant for the process).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 #[cold]
 #[inline(never)]
@@ -2148,6 +2152,81 @@ mod tests {
             assert_eq!(
                 t8_mid, t8_hi,
                 "T<=8 must be byte-identically routed for any ratio"
+            );
+        }
+    }
+
+    // --- Shipped lever (commit 4062efe3): the incompressible high-T chunk-COUNT cap.
+    //     Once the worker count exceeds the PHYSICAL cores, a large incompressible
+    //     stream reuses the winning T=physical grid instead of the finer file/threads²
+    //     grid (the bbb/storedheavy-T32 SMT-over-subscription fix). Locks the pure
+    //     divisor selector + the >32 MiB file-size gate + the AMD call-site routing. ---
+    #[test]
+    fn incompressible_cap_reuses_physical_grid_above_physical_cores() {
+        let phys = physical_core_count();
+        assert!(phys >= 1, "physical core count must be at least 1");
+        let large = 723 * 1024 * 1024usize; // > INCOMPRESSIBLE_CAP_MIN_FILE_BYTES
+        let stored = 1.003_f64; // ratio < MID_RATIO_COARSE_LOW (incompressible)
+        let compressible = 3.11_f64; // ratio >= MID_RATIO_COARSE_LOW
+
+        // threads <= physical → the divisor is the identity (byte-identical grid).
+        assert_eq!(incompressible_refine_divisor(stored, large, 1), 1);
+        assert_eq!(incompressible_refine_divisor(stored, large, phys), phys);
+
+        // threads > physical on a large incompressible stream → capped at physical.
+        let over = phys + 1;
+        assert_eq!(
+            incompressible_refine_divisor(stored, large, over),
+            phys,
+            "incompressible T>physical must reuse the T=physical divisor"
+        );
+        // The cap only ever SHRINKS the divisor (coarser grid), never grows it.
+        assert!(incompressible_refine_divisor(stored, large, over) <= over);
+
+        // Compressible stream (ratio >= LOW) → the cap arm is NOT taken; full divisor.
+        assert_eq!(
+            incompressible_refine_divisor(compressible, large, over),
+            over,
+            "compressible streams keep the finer file/threads² grid at every T"
+        );
+
+        // File-size gate is a strict `>`: at or below 32 MiB the cap is a no-op even
+        // for T>physical (skips the physical_core_count /sys probe on small decodes);
+        // just above it, the cap engages.
+        assert_eq!(
+            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES, over),
+            over,
+            "at exactly the gate size the cap is a no-op (strict >)"
+        );
+        assert_eq!(
+            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES - 1, over),
+            over
+        );
+        assert_eq!(
+            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES + 1, over),
+            phys,
+            "just above the gate the cap engages"
+        );
+
+        // AMD call-site integration: cpu_is_amd() && threads>8 is the only path that
+        // reads the ratio, so the routing assertion is AMD-gated. A large stored
+        // stream at T>8 AND T>physical sizes chunks by the T=physical grid — coarser
+        // than (or equal to) the uncapped file/threads² grid.
+        #[cfg(not(target_arch = "aarch64"))]
+        if cpu_is_amd() {
+            let threads = core::cmp::max(9, phys + 1); // > 8 (call-site gate) and > physical
+            let capped =
+                adjusted_chunk_size_bytes(large, threads, TARGET_COMPRESSED_CHUNK_BYTES, stored);
+            let physical_grid = adjusted_chunk_size_amd(large, phys, TARGET_COMPRESSED_CHUNK_BYTES);
+            let uncapped_grid =
+                adjusted_chunk_size_amd(large, threads, TARGET_COMPRESSED_CHUNK_BYTES);
+            assert_eq!(
+                capped, physical_grid,
+                "AMD incompressible T>physical must size chunks by the T=physical grid"
+            );
+            assert!(
+                capped >= uncapped_grid,
+                "capped grid must be coarser-or-equal to the uncapped file/threads² grid"
             );
         }
     }
