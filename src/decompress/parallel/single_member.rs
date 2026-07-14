@@ -177,7 +177,50 @@ pub(crate) fn adjusted_chunk_size_bytes(
         let in_coarse_band =
             (MID_RATIO_COARSE_LOW..MID_RATIO_COARSE_HIGH).contains(&isize_deflate_ratio);
         if !in_coarse_band {
-            return adjusted_chunk_size_amd(file_size, threads, default_chunk_size);
+            // INCOMPRESSIBLE HIGH-THREAD CHUNK-COUNT CAP (ratio < LOW; T > physical
+            // cores). THE FINDING (measured, frozen solvency Zen2 16C/32T,
+            // /dev/null, paired N=51, sha==gunzip, gz/rg): at T32 the `file/T²`
+            // refinement = `file/1024` over-chunks a LARGE incompressible stream —
+            // bbb (ratio 1.003) → ~1050 tiny chunks, gz/rg 1.041 LOSS at 170 MiB RSS;
+            // storedheavy-512M (ratio 1.000) → gz/rg 1.113 LOSS at 118 MiB RSS —
+            // while rapidgzip's T-independent uniform grid keeps scaling (bbb rg
+            // 181 ms, gz 191 ms). At T16 (= physical) the SAME `file/threads²` grid
+            // WINS (bbb 0.821, storedheavy 0.924). Capping the refinement divisor at
+            // the physical core count makes T > physical reuse the WINNING
+            // T = physical grid; the cap recovers both losses to Pareto wins vs rg
+            // (bbb-T32 1.075L→0.861W, storedheavy-T32 1.129L→0.872W, ship RSS < rg;
+            // cross-arch layout no-regress on Intel+M1). That wall recovery is the
+            // finding — every requested worker still spawns; only the chunk COUNT
+            // stops growing past T = physical.
+            //
+            // HYPOTHESIS (unvalidated — the WHY, NOT a measured finding): a
+            // cheap-decode incompressible stream has ~no per-chunk decode-TIME
+            // variance to balance, so finer chunks past the physical cores may buy
+            // nothing because the extra workers are SMT siblings sharing execution
+            // units (no real added parallel decode to spread stragglers across) and
+            // only multiply the in-order consumer's per-chunk round-trips. This
+            // mechanism is plausible but NOT causally isolated (a divisor sweep
+            // holding output fixed was not run); the change rides the measured wall
+            // delta regardless of whether this is the true cause. threads <= physical is
+            // byte-IDENTICAL (refine == threads). The COMPRESSIBLE arm
+            // (ratio >= HIGH: silesia 3.11, monorepo 5.19, nasa 10.5) is
+            // UNTOUCHED — its real decode-time variance repays finer chunks at
+            // every T (silesia/monorepo/bignasa WIN at T32 under `file/T²`), so it
+            // keeps the full `threads` divisor. Byte-transparent (only moves chunk
+            // boundaries; CRC32 + ISIZE still verified by the caller).
+            // Only probe the physical-core count (and apply the cap) once the file
+            // is large enough that the cap can actually change the chunk size:
+            // below `file/physical² > floor` the `file/threads²` result is ALREADY
+            // at the 512 KiB floor, so `threads.min(physical)` yields the identical
+            // floored size — a no-op. Gating on file size keeps small incompressible
+            // streams (movie.mp4, data.sqlite, tool.bin) byte-AND-cost-identical to
+            // base: they never call `physical_core_count()` (whose one-time
+            // `/sys` topology scan is a measurable per-process tax on a tiny decode,
+            // negligible on the 500 MiB+ files the cap targets). 32 MiB is a safe
+            // lower bound (`floor · physical²` for physical≥8); bbb (690 MiB) and
+            // storedheavy-512M (477 MiB) clear it and keep the win.
+            let refine = incompressible_refine_divisor(isize_deflate_ratio, file_size, threads);
+            return adjusted_chunk_size_amd(file_size, refine, default_chunk_size);
         }
         MID_RATIO_COARSE_APPLIED.fetch_add(1, Ordering::Relaxed);
     }
@@ -223,6 +266,54 @@ fn adjusted_chunk_size_vendor(
 fn adjusted_chunk_size_amd(file_size: usize, threads: usize, default_chunk_size: usize) -> usize {
     let target = file_size / threads.saturating_mul(threads).max(1);
     target.min(default_chunk_size).max(MIN_ADJUSTED_CHUNK_BYTES)
+}
+
+/// Minimum compressed file size for the incompressible SMT-oversubscription cap to
+/// engage (see [`adjusted_chunk_size_bytes`]). Below this the finer `file/threads²`
+/// size is already at the [`MIN_ADJUSTED_CHUNK_BYTES`] floor, so capping the divisor
+/// at the physical-core count is a no-op — gating on file size avoids the one-time
+/// `physical_core_count()` `/sys` probe on small decodes (a per-process tax that is
+/// measurable on a ~12 MiB file, negligible on the 500 MiB+ files the cap targets).
+/// 32 MiB is a conservative lower bound (`floor · physical²` for physical ≥ 8).
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+const INCOMPRESSIBLE_CAP_MIN_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Physical (not logical / SMT) core count of the host, cached. Caps the
+/// incompressible-stream finer-chunk refinement divisor in
+/// [`adjusted_chunk_size_bytes`]: SMT-sibling workers past the physical cores add
+/// no real parallel decode to balance a cheap-decode incompressible stream's
+/// (absent) straggler variance, so refining `file/threads²` for them only
+/// multiplies the in-order consumer's per-chunk round-trips (the measured
+/// bbb / storedheavy T32 over-subscription LOSS). Falls back to 1 if topology is
+/// unavailable. Cached in a `OnceLock` (topology is invariant for the process).
+/// Cold, out-of-line divisor selector for the incompressible SMT-oversubscription
+/// cap (see [`adjusted_chunk_size_bytes`]). Isolating the added const+topology-probe
+/// logic behind a `#[cold] #[inline(never)]` boundary keeps it out of the hot
+/// chunk-grid path's codegen unit so it cannot perturb the surrounding decode
+/// code's compiled layout (the byte-identical-grid compressible cells otherwise
+/// showed a ~2-5% cand-vs-base wall shift with no logic change). Byte-transparent.
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+#[cold]
+#[inline(never)]
+fn incompressible_refine_divisor(
+    isize_deflate_ratio: f64,
+    file_size: usize,
+    threads: usize,
+) -> usize {
+    if isize_deflate_ratio < MID_RATIO_COARSE_LOW && file_size > INCOMPRESSIBLE_CAP_MIN_FILE_BYTES {
+        threads.min(physical_core_count())
+    } else {
+        threads
+    }
+}
+
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+#[cold]
+#[inline(never)]
+fn physical_core_count() -> usize {
+    use std::sync::OnceLock;
+    static PHYS: OnceLock<usize> = OnceLock::new();
+    *PHYS.get_or_init(|| num_cpus::get_physical().max(1))
 }
 
 /// AMD/Zen2 MID-THREAD (2..=8) per-T chunk-size CAP (byte-transparent).
