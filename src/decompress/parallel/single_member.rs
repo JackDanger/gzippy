@@ -563,9 +563,24 @@ pub static WORK_PER_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 /// contention) while the short decode cannot hide it. Result: NEGATIVE thread
 /// scaling past the knee (movie T16 +9.64% SIG slower than T8, Intel, paired N=41).
 /// Capping effective-T to `deflate_len / this` keeps each worker's chunk coarse
-/// enough to stay on the amortized side of the knee. `0` disables the cap (the
-/// A/B baseline). Env override: `GZIPPY_MIN_BYTES_PER_THREAD` (the one live
-/// lever left in this selector — see [`effective_parallel_threads`]).
+/// enough to stay on the amortized side of the knee. `0` disables the cap.
+///
+/// FROZEN TO `0` (disabled) after a cross-arch measurement retired the
+/// `GZIPPY_MIN_BYTES_PER_THREAD` env override (2026-07-13, solvency-AMD +
+/// diligence-Intel, /dev/null paired N≥41, sha==gunzip): at HEAD the movie.mp4
+/// high-T regression this const was built for is GONE (movie T32 is FASTER than
+/// T8 on both arches — the event-driven consumer + input-page-reap commits
+/// amortized the per-chunk coordination), so the cap has no clean job left. The
+/// ONLY corpus that still over-threads is access.log (small, ratio 10.4; T32 is
+/// 13–35% slower than T8) — but it already BEATS rapidgzip at T24/T32 (0.77–0.81×)
+/// so there is no loss to recover, and the sweep showed its wall only IMPROVES at
+/// eff==1 (the serial-clean path), which requires a floor ≥ ~1.3 MiB/thread — a
+/// value that simultaneously over-caps monorepo/tool.bin/data.parquet (which
+/// scale cleanly to T32) and REGRESSES them. No single compressed-bytes floor
+/// improves access.log without regressing those, so per the no-env-vars rule the
+/// knob was removed rather than baked to a nonzero default. access.log's residual
+/// over-threading is the serial-clean cost-model SELECTOR's domain (its crossover
+/// under-serializes this small high-ratio class), not this cap's.
 const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
 
 /// Frozen default for the work-per-thread cap's physical-core floor (the env
@@ -575,18 +590,17 @@ pub(crate) const MIN_THREADS_FLOOR_DEFAULT: u64 = 1;
 
 /// Production entry point: [`effective_parallel_threads_with`] fed the frozen
 /// selector defaults (the campaign-measured values with every parallel-selector
-/// env knob removed), plus the one
-/// live lever `GZIPPY_MIN_BYTES_PER_THREAD`.
+/// env knob removed). The work-per-thread cap is frozen to
+/// [`MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT`] (`0` — disabled); the former
+/// `GZIPPY_MIN_BYTES_PER_THREAD` override was REMOVED (2026-07-13) per the
+/// no-env-vars-in-prod-path rule, after a cross-arch frozen sweep proved no
+/// nonzero value is a clean no-regress win — see the const's doc comment.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub(crate) fn effective_parallel_threads(
     gzip_data: &[u8],
     deflate_data_len: usize,
     num_threads: usize,
 ) -> usize {
-    let min_bpt = std::env::var("GZIPPY_MIN_BYTES_PER_THREAD")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT);
     effective_parallel_threads_with(
         gzip_data,
         deflate_data_len,
@@ -595,7 +609,7 @@ pub(crate) fn effective_parallel_threads(
         arch_crossover_margin_default(),
         PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
         arch_large_output_notch_default(),
-        min_bpt,
+        MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT,
         MIN_THREADS_FLOOR_DEFAULT,
         arch_mid_band_low_default(),
     )
@@ -845,9 +859,10 @@ pub(crate) fn effective_parallel_threads_with(
     // work-per-thread law — it binds ONLY when `deflate_len < min_bpt*num_threads`
     // (small file at high T); a large file (silesia/weights/nasa) clears
     // `min_bpt*T` and keeps every requested thread. Byte-transparent: only the
-    // thread count changes. `min_bpt == 0` disables (production leaves this on via
-    // `GZIPPY_MIN_BYTES_PER_THREAD`, the one live env lever; see
-    // [`effective_parallel_threads`]).
+    // thread count changes. `min_bpt == 0` disables — the frozen production
+    // default now that the `GZIPPY_MIN_BYTES_PER_THREAD` override is removed (see
+    // [`MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT`]); the block stays a param-driven,
+    // unit-tested pure guard but is inert on the production path.
     if min_bpt > 0 {
         // FLOOR the cap at the physical-core count of the run's affinity set. The
         // corpus no-regress gate (Intel trainer, paired) proved a cap that drops
