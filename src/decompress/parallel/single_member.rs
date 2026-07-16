@@ -492,6 +492,89 @@ const PARALLEL_LARGE_OUTPUT_NOTCH_AMD: u64 = 2;
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 const PARALLEL_MIN_OUTPUT_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
 
+/// SMALL-COMPRESSED (few-chunk) SERIAL FLOOR: compressed (deflate) size below
+/// which a HIGHLY-COMPRESSIBLE (ratio ≥ 2.5) stream is capped to one thread,
+/// regardless of decoded-output size. This is the companion to
+/// [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`] (which keys on OUTPUT size) and closes the
+/// Intel-hybrid (i9-14900K 8P+16E) high-ratio-MEDIUM-file regression.
+///
+/// OPERATIVE FACT (this is what the constant IS — measured, not theorized): an
+/// EMPIRICAL Intel-envelope serial cap. On the i9-hybrid (frozen paired-diff
+/// /dev/null N=51, byte-exact vs gunzip, co-tenants SIGSTOP-paused) two caught
+/// cells run 3–4× SLOWER parallel than serial (access.log-T16 gz 61 ms parallel
+/// vs 10.6 ms serial → 3.9× LOSS vs rg; data.json-T16 1.38× LOSS) while their
+/// serial inline T1 path BEATS rapidgzip (access.log-T16 serial 0.68×, data.json
+/// -T16 0.57×). The cap is fit to the boundary at which that Intel loss appears,
+/// keyed on COMPRESSED size because — for THIS corpus — compressed size is the
+/// signal that separates the two loss cells (access.log 2.66 MiB / 25 MiB out,
+/// data.json 1.58 MiB / 14 MiB out) from the must-stay-parallel neighbours at
+/// equal OUTPUT (data.csv 3.45 MiB, ecoli 4.48 MiB, both ~25 MiB out). The cap is
+/// SAFE on AMD not by luck but because serial is INDEPENDENTLY competitive-or-
+/// better there for both caught cells (measured, see UNIVERSAL below) — so the
+/// same threshold improves AMD while fixing Intel, no arch dispatch needed. The
+/// OUTPUT-size floor (`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`) does NOT catch these
+/// (25/14 MiB ≫ 8 MiB), which is why a second, compressed-size guard exists.
+///
+/// HYPOTHESIS (unvalidated) — WHY the parallel arm loses on Intel: the compressed
+/// size keys the CAP but is NOT established as the CAUSE. The natural "too FEW
+/// compressed chunks (≈ deflate / 512 KiB) fail to amortize the parallel
+/// pipeline's ratio× marker-resolution + apply_window inflation" story is
+/// CONTRADICTED by the gate's own data: access.log has IDENTICAL compressed size
+/// (hence identical chunk count) on both arches, yet parallel is a 3.88× LOSS on
+/// Intel and a 0.58× WIN on AMD at T16 — a chunk-count cause would lose on AMD
+/// too. The un-perturbed candidate cause is instead the Intel HYBRID P/E TOPOLOGY
+/// (window-absent all-marker chunks + cross-chunk coordination landing on E-cores,
+/// which AMD's homogeneous cores lack); this has NOT been confirmed by a causal
+/// perturbation (e.g. P-core-only pinning) and remains a HYPOTHESIS. Nothing in
+/// this file acts on it — the cap is driven only by the measured serial/parallel
+/// wall envelope above, for which compressed size is the empirical fit, not a
+/// proven lever.
+///
+/// FRONTIER (measured, both x86 arches, N=51): the nearest CATCH is access.log
+/// (compressed 2.53–2.66 MiB, serial WINS both arches at every T≥8) and the nearest
+/// EXCLUDE is data.csv (compressed 3.33–3.45 MiB, parallel WIN / serial-neutral).
+/// The floor sits at their measured midpoint with ~12% margin each side. Files just
+/// above it MUST stay parallel — serializing them is a LOSS on ≥1 arch: ecoli
+/// (4.4 MiB, Intel-T16 serial 1.04×), aozora (4.0 MiB, Intel serial 1.21×), dickens
+/// (4.5 MiB, Intel serial 1.16×), monorepo (9.8 MiB, serial 1.46× Intel / 1.06–1.13×
+/// AMD), data.sqlite (12.9 MiB, serial 1.78–2.62×), tool.bin (20.9 MiB, serial
+/// 2.25–3.73×), nasa (37 MiB, serial 1.07–1.35× Intel). All are ≥ 3.3 MiB compressed
+/// and correctly excluded. UNIVERSAL (not arch-dispatched): serial is competitive-
+/// or-BETTER than parallel for the two caught files on AMD too (access.log-T24/T32
+/// 0.58× serial vs 0.80× parallel; data.json-T16/T24/T32 0.58× serial vs 0.88–0.89×
+/// parallel), so the same floor improves AMD while fixing Intel — no topology
+/// dispatch needed. Byte-transparent (only the thread count changes; CRC32 + ISIZE
+/// still verified by the caller). Bounded to MEDIUM output (< the large-output
+/// threshold) so a genuinely huge output with a tiny compressed size (extreme-ratio
+/// stored/RLE) is not force-serialized. `0` disables when passed explicitly to
+/// [`effective_parallel_threads_with`].
+///
+/// CATCH-ZONE PROBE (Intel diligence i9-14900K, frozen paired-diff /dev/null N=51,
+/// byte-exact vs gunzip, co-tenants SIGSTOP-paused, 2026-07-16): the floor's catch
+/// zone (deflate < 2.9 MiB, ratio ≥ 2.5, 8 MiB ≤ output < 128 MiB) was probed for a
+/// file whose forced-serial arm LOSES to rapidgzip (an over-serialization). In the
+/// real corpus the ONLY files this guard NEWLY serializes (output ≥ 8 MiB, so Guard A
+/// does not already cap them) are the two fix targets; every other high-ratio caught
+/// file (markup/minjs/symbols.dwarf/winexe) has output < 8 MiB and is already capped
+/// by Guard A at HEAD, so this guard is a no-op there. The synthetic worst case — a
+/// natural-language file (aozora, the only corpus text whose ratio 2.96 exceeds the
+/// ~2.82 needed for an output-≥-8-MiB catch) truncated to 2.87 MiB deflate / 8.5 MiB
+/// out — is force-serialized by this guard, yet its SERIAL arm still BEATS rapidgzip
+/// (cand/rg T16 0.94, T24 0.76), i.e. the guard converts a bigger parallel win
+/// (base/rg T16 0.72, T24 0.78) into a smaller-but-still WIN, never a loss. So the
+/// floor does NOT over-serialize: no caught cell drops below rapidgzip.
+///
+/// HYPOTHESIS (unvalidated) — RE-OPEN TRIGGER: RATIO separates the two classes
+/// cleanly (fix targets ratio ~9–10, aozora-synth ~3). If a future cross-arch gate
+/// (Gate-3: AMD + M1 no-regress, not just Intel) confirms a ratio sub-gate (e.g.
+/// require ratio ≥ ~5 for the compressed-size guard) leaves access.log/data.json
+/// caught while freeing the aozora-content class to its ~20–30% faster parallel arm,
+/// add it. NOT done here: on Intel the aozora-synth serial arm is already a win, so
+/// no correctness regression forces it, and a behaviour change needs its own
+/// cross-arch gate. Measured only on Intel this session — remains a HYPOTHESIS.
+#[cfg_attr(not(parallel_sm), allow(dead_code))]
+const PARALLEL_MEDIUM_COMPRESSED_FLOOR_DEFAULT: u64 = 2_900 * 1024;
+
 /// Runtime CPU-vendor detection for the arch-dispatched selector constants.
 /// AMD (Zen) needs a higher crossover margin (for small outputs) AND a deeper
 /// large-output bonus (2 notches), both GATED on Zen2 — see
@@ -667,6 +750,7 @@ pub(crate) fn effective_parallel_threads(
         PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
         arch_large_output_notch_default(),
         arch_mid_band_low_default(),
+        PARALLEL_MEDIUM_COMPRESSED_FLOOR_DEFAULT,
     )
 }
 
@@ -709,6 +793,7 @@ pub(crate) fn effective_parallel_threads_with(
     large_output_bytes: u64,
     notch: u64,
     mid_band_low: u64,
+    medium_compressed_floor: u64,
 ) -> usize {
     if num_threads <= 1 || deflate_data_len == 0 || gzip_data.len() < 4 {
         return num_threads;
@@ -782,11 +867,28 @@ pub(crate) fn effective_parallel_threads_with(
         // regresses ~5×). The 2·isize >= 5·deflate form uses integer math (isize <= 4
         // GiB ⇒ ×2 fits u64). The lower `isize >= deflate` bound is subsumed (ratio
         // 2.5 > 1.0), which also rejects a wrapped >4 GiB ISIZE (isize < deflate).
-        if min_output > 0
-            && isize_field.saturating_mul(2) >= deflate_len.saturating_mul(5)
-            && isize_field < min_output
-            && deflate_len < min_output
-        {
+        // COMPRESSIBILITY GATE — shared by both serial-floor guards below.
+        let compressible = isize_field.saturating_mul(2) >= deflate_len.saturating_mul(5);
+        // GUARD A — SMALL-OUTPUT serial floor (markup.xml-shaped): the decoded output
+        // itself is below `min_output`, so the parallel pipeline's fixed overhead is
+        // unamortizable AND the all-marker re-decode dominates. (Unchanged behaviour.)
+        let small_output = min_output > 0 && isize_field < min_output && deflate_len < min_output;
+        // GUARD B — SMALL-COMPRESSED serial floor: a highly-compressible MEDIUM-output
+        // stream whose COMPRESSED size is below the empirical Intel-envelope threshold
+        // (access.log / data.json). Output size does NOT separate these from the
+        // must-stay-parallel files (access.log/data.csv/ecoli all ~25 MiB out);
+        // COMPRESSED size is the empirical signal that does (why the CAUSE is not
+        // chunk count — access.log has the same compressed size on both arches yet
+        // loses parallel only on Intel — see the HYPOTHESIS in
+        // [`PARALLEL_MEDIUM_COMPRESSED_FLOOR_DEFAULT`]). Bounded to medium output
+        // (< `large_output_bytes`) so an extreme-ratio HUGE output is not serialized.
+        // See that constant for the gated frontier + cross-arch measurements.
+        // UNIVERSAL (serial is competitive-or-better on AMD too), byte-transparent
+        // (only the thread count changes).
+        let small_compressed = medium_compressed_floor > 0
+            && deflate_len < medium_compressed_floor
+            && (large_output_bytes == 0 || isize_field < large_output_bytes);
+        if compressible && (small_output || small_compressed) {
             SMALL_OUTPUT_SERIAL_FLOOR_APPLIED.fetch_add(1, Ordering::Relaxed);
             return 1;
         }
@@ -1601,6 +1703,7 @@ mod tests {
                 PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 arch_large_output_notch_default(),
                 0, // mid_band_low disabled — this test isolates the base selector
+                0, // medium_compressed_floor disabled — isolate other guards
             )
         };
         // Common to every arch: high-ratio serial at low T; low-ratio parallel;
@@ -1653,6 +1756,7 @@ mod tests {
                 PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 arch_large_output_notch_default(),
                 0, // mid_band_low disabled — this test isolates the base selector
+                0, // medium_compressed_floor disabled — isolate other guards
             )
         };
         // markup.xml-shaped: 7.6 MiB decoded, 2.1 MiB deflate → below the 8 MiB
@@ -1770,6 +1874,80 @@ mod tests {
         assert_eq!(call(&markup, 2_147_400, 8, NO_FLOOR, 0.0), 8);
     }
 
+    /// SMALL-COMPRESSED (few-chunk) SERIAL FLOOR (Guard B): a highly-compressible
+    /// stream whose COMPRESSED size is below the few-chunk floor is capped to serial
+    /// even when its decoded OUTPUT is well above the small-output floor. This is the
+    /// Intel-hybrid high-ratio-MEDIUM-file fix. The floor keys on COMPRESSED size
+    /// (≈ chunk count), the only signal that separates access.log (catch) from
+    /// data.csv / ecoli (must-stay-parallel, ~equal output). Cross-arch frozen
+    /// paired-diff N=51 anchors the frontier — see
+    /// [`PARALLEL_MEDIUM_COMPRESSED_FLOOR_DEFAULT`].
+    #[test]
+    fn medium_compressed_serial_floor_caps_high_ratio_small_compressed_only() {
+        // margin 0.0 isolates Guard B from the cost-model crossover; min_output at the
+        // 8 MiB production value keeps Guard A (small OUTPUT) OFF for these 14–26 MiB
+        // outputs, so only the COMPRESSED-size guard can fire.
+        let floor = PARALLEL_MEDIUM_COMPRESSED_FLOOR_DEFAULT;
+        let call = |gz: &[u8], deflate_len: usize, t: usize, med_floor: u64| {
+            effective_parallel_threads_with(
+                gz,
+                deflate_len,
+                t,
+                PARALLEL_MIN_OUTPUT_BYTES_DEFAULT,
+                0.0,
+                PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
+                0,
+                0,
+                med_floor,
+            )
+        };
+        // access.log-shaped: 25 MiB out (> 8 MiB small-output floor), 2.66 MiB deflate
+        // (< 2.9 MiB few-chunk floor), ratio ~9.86 → Guard B fires: serial at every T.
+        let access = blob_with_isize(26_214_398);
+        assert_eq!(call(&access, 2_659_220, 16, floor), 1);
+        assert_eq!(call(&access, 2_659_220, 24, floor), 1);
+        assert_eq!(call(&access, 2_659_220, 32, floor), 1);
+        // T1 request is never altered.
+        assert_eq!(call(&access, 2_659_220, 1, floor), 1);
+        // data.json-shaped: 13.6 MiB out, 1.58 MiB deflate, ratio ~8.97 → fires.
+        let djson = blob_with_isize(14_215_394);
+        assert_eq!(call(&djson, 1_584_494, 16, floor), 1);
+        // data.csv-shaped: 25 MiB out, 3.45 MiB deflate (> 2.9 MiB), ratio ~7.68 →
+        // MUST NOT fire (parallel WIN on both arches; nearest exclude in the frontier).
+        let dcsv = blob_with_isize(26_500_039);
+        assert_eq!(call(&dcsv, 3_450_111, 16, floor), 16);
+        // ecoli-shaped: 25 MiB out, 4.48 MiB deflate, ratio ~5.85 → MUST NOT fire
+        // (Intel-T16 serial is a 1.04× LOSS — needs parallel).
+        let ecoli = blob_with_isize(26_214_271);
+        assert_eq!(call(&ecoli, 4_478_915, 16, floor), 16);
+        // LOW-ratio (< 2.5) small-compressed stream: 2 MiB deflate, 4 MiB out (ratio 2)
+        // → compressibility gate rejects → MUST NOT fire (both arches).
+        let lowratio = blob_with_isize(4_000_000);
+        assert_eq!(call(&lowratio, 2_000_000, 16, floor), 16);
+        // The next two exclude cases are ratio ≥ 8, so on aarch64 the (independent)
+        // prestack cap serializes them regardless of Guard B; assert Guard B's
+        // non-firing only where it is observable (x86_64, cap deleted there).
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            // nasa-shaped: 356 MiB out, 37 MiB deflate → deflate ≫ floor → MUST NOT fire.
+            let nasa = blob_with_isize(373_056_138);
+            assert_eq!(call(&nasa, 37_309_343, 16, floor), 16);
+            // BOUND: a HUGE output (> 128 MiB large-output threshold) with a tiny
+            // deflate (extreme ratio) is NOT force-serialized by Guard B — it is not a
+            // "medium" file. 200 MiB out, 1 MiB deflate.
+            let huge = blob_with_isize(200 * 1024 * 1024);
+            assert_eq!(call(&huge, 1_000_000, 16, floor), 16);
+        }
+        // med_floor = 0 disables Guard B: access.log-shaped now keeps its threads on
+        // x86_64 (margin 0 → cost selector off → parallel). On aarch64 the independent
+        // prestack cap (ratio 9.86 ≥ 8) still serializes it, so Guard B's disabling is
+        // not observable there.
+        #[cfg(not(target_arch = "aarch64"))]
+        assert_eq!(call(&access, 2_659_220, 16, 0), 16);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(call(&access, 2_659_220, 16, 0), 1);
+    }
+
     #[test]
     fn serial_clean_selector_crossover_and_margin() {
         let deflate_len = 1_000_000usize;
@@ -1783,6 +1961,7 @@ mod tests {
                 PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 arch_large_output_notch_default(),
                 0, // mid_band_low disabled — this test isolates the base selector
+                0, // medium_compressed_floor disabled — isolate other guards
             )
         };
 
@@ -1821,6 +2000,7 @@ mod tests {
                     large_output_bytes,
                     notch,
                     0, // mid_band_low disabled — this test isolates the large-output bonus
+                    0, // medium_compressed_floor disabled — isolate the large-output bonus
                 )
             };
 
@@ -1864,7 +2044,7 @@ mod tests {
         // (gz, deflate_len, t, mid_band_low) with AMD production params margin 1.6,
         // large=128 MiB, notch=2.
         let call = |gz: &[u8], deflate_len: usize, t: usize, mid_low: u64| {
-            effective_parallel_threads_with(gz, deflate_len, t, NO_FLOOR, 1.6, LARGE, 2, mid_low)
+            effective_parallel_threads_with(gz, deflate_len, t, NO_FLOOR, 1.6, LARGE, 2, mid_low, 0)
         };
 
         // tool.bin-shaped: 59.6 MiB out, 20.87 MiB deflate, ratio 2.99 → base
