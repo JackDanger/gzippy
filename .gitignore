@@ -68,3 +68,9 @@ tools/fulcrum/**/__pycache__/
 artifacts/standing/
 artifacts/kernel-gate/
 !.fulcrum/findings.jsonl
+
+# Process-accumulated scratch / measurement detritus (never part of the branch)
+.pi/
+scratchpad/
+artifacts/imatrix/
+artifacts/insnattr_postlutskip_m1_silesia_t1.json
