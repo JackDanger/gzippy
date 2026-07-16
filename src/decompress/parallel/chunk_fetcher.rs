@@ -278,10 +278,50 @@ const INPUT_RELEASE_MIN_LEN: usize = 16 * 1024 * 1024;
 /// speculative prefetch that reaches slightly back) never trips a re-fault.
 #[cfg(parallel_sm)]
 const INPUT_RELEASE_MARGIN: usize = 4 * 1024 * 1024;
-/// Release in stride-sized batches so the whole 100 MB input costs ~a dozen
-/// `madvise` calls (amortized on the consumer thread), not one per chunk.
+/// Release in stride-sized batches (amortize `madvise` calls on the consumer
+/// thread, not one per chunk). The batch cap directly bounds the behind-frontier
+/// resident lag to `MARGIN + STRIDE`. The high-thread default is 8 MiB (≤ 12 MiB
+/// behind-frontier resident); the low/mid-thread value is 1 MiB (≤ 5 MiB) — a
+/// byte-transparent peak-RSS reduction (storedheavy-512M-T4: 71→64 MiB dedicated
+/// maxrss, frozen solvency AMD, load-immune min-of-7). The safety MARGIN is
+/// UNCHANGED in both, so no worker/prefetch read cursor gains any new re-fault
+/// exposure; only the release cadence tightens.
+///
+/// WHY POOL-SIZE-GATED (`reaper_stride_for`): `MADV_DONTNEED` on a shared
+/// file-backed mmap triggers a TLB shootdown IPI to every thread mapping it, so
+/// the tighter (more frequent) cadence costs O(pool_size) per call. At low/mid T
+/// the shootdown is cheap and the ~64 ms consumer slack (Gate-2 drain-delay
+/// injection at storedheavy-T4) absorbs it — measured wall-NEUTRAL at T4/T8. At
+/// T16 the 1 MiB cadence RESOLVED-regressed the wall +1.35% (frozen solvency,
+/// paired N=51, CI excl 0) via the 16-way shootdown storm, with no compensating
+/// RSS gain worth it — so T > 8 keeps the coarse 8 MiB stride. The residual gap
+/// to rapidgzip (~53 MiB) is the AHEAD-of-frontier read-ahead inherent to gz's
+/// zero-copy whole-file mmap decode (rg streams input into bounded copies and
+/// holds ~5 MiB file-backed) — NOT reachable by tightening a behind-frontier
+/// reaper.
 #[cfg(parallel_sm)]
 const INPUT_RELEASE_STRIDE: usize = 8 * 1024 * 1024;
+/// Low/mid-thread stride (see [`INPUT_RELEASE_STRIDE`] doc): tighter release
+/// cadence for the peak-RSS reduction where the TLB-shootdown cost is cheap.
+#[cfg(parallel_sm)]
+const INPUT_RELEASE_STRIDE_LOWT: usize = 1024 * 1024;
+/// Pool-size threshold at/below which the tighter [`INPUT_RELEASE_STRIDE_LOWT`]
+/// applies. Above it, the shootdown storm dominates (T16 +1.35% regression), so
+/// the coarse [`INPUT_RELEASE_STRIDE`] is used.
+#[cfg(parallel_sm)]
+const INPUT_RELEASE_LOWT_MAX_POOL: usize = 8;
+
+/// The behind-frontier release stride for a given decode `pool_size` (see
+/// [`INPUT_RELEASE_STRIDE`] doc for the pool-size gate rationale).
+#[cfg(parallel_sm)]
+#[inline]
+fn reaper_stride_for(pool_size: usize) -> usize {
+    if pool_size <= INPUT_RELEASE_LOWT_MAX_POOL {
+        INPUT_RELEASE_STRIDE_LOWT
+    } else {
+        INPUT_RELEASE_STRIDE
+    }
+}
 
 #[cfg(parallel_sm)]
 #[inline]
@@ -326,11 +366,13 @@ struct InputReaper {
     released: usize,
     page: usize,
     enabled: bool,
+    /// Pool-size-gated behind-frontier release stride (see `reaper_stride_for`).
+    stride: usize,
 }
 
 #[cfg(parallel_sm)]
 impl InputReaper {
-    fn new(input: InputSlice) -> Self {
+    fn new(input: InputSlice, pool_size: usize) -> Self {
         // Arm ONLY when the input is a FILE-BACKED mapping. `MADV_DONTNEED` on a
         // file-backed range merely drops resident pages (re-fault restores the
         // bytes from the page cache), but on ANONYMOUS memory it is DESTRUCTIVE
@@ -345,6 +387,7 @@ impl InputReaper {
             released: 0,
             page: reaper_page_size(),
             enabled,
+            stride: reaper_stride_for(pool_size),
         }
     }
 
@@ -396,7 +439,7 @@ impl InputReaper {
         }
         let frontier = (frontier_bit / 8).min(self.len);
         let safe = frontier.saturating_sub(INPUT_RELEASE_MARGIN);
-        if safe <= self.released || safe - self.released < INPUT_RELEASE_STRIDE {
+        if safe <= self.released || safe - self.released < self.stride {
             return;
         }
         #[cfg(unix)]
@@ -531,7 +574,9 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     // resident pages (re-fault restores the identical page-cache bytes) and cannot
     // change decoded output; auto-disabled for Vec-backed (anonymous) library/test
     // inputs and for inputs below the arm threshold — see `InputReaper::new`.
-    let mut input_reaper = InputReaper::new(unsafe { InputSlice::from_slice(input) });
+    // T1 serial driver: single-thread → 1-way TLB shootdown, so the tight low-T
+    // stride is free here (pool_size = 1).
+    let mut input_reaper = InputReaper::new(unsafe { InputSlice::from_slice(input) }, 1);
     // Compressed-bytes-per-chunk stride from the chunk configuration (T1 default
     // = 1 MiB target, warm output-buffer recycling). Clamp to ≥64 KiB so a
     // pathological tiny config can't thrash the loop.
@@ -1273,7 +1318,7 @@ fn consumer_loop<W: std::io::Write>(
     // STEP-3: progressively release consumed input mmap pages behind the
     // in-order frontier so process-exit teardown of the input is cheap
     // (overlapped with decode). Byte-transparent — see `InputReaper`.
-    let mut input_reaper = InputReaper::new(input);
+    let mut input_reaper = InputReaper::new(input, pool_size);
     // Pending writes (post-process jobs in flight, output order).
     let mut pending: std::collections::VecDeque<PendingWrite> =
         std::collections::VecDeque::with_capacity(pool_size * 2);
@@ -3874,6 +3919,52 @@ mod tests {
         let (_crc, n) = drive(&deflate, &mut out, None, 8, cfg, false).expect("drive");
         assert_eq!(n, payload.len());
         assert_eq!(out, payload);
+    }
+
+    /// InputReaper differential on a REAL file-backed mmap (the only path where
+    /// the reaper arms — `input_is_file_backed`; Vec-backed tests keep it OFF).
+    /// Exercises the low-T 1 MiB stride (`reaper_stride_for(4)`) across ~40
+    /// release batches so a mis-tuned stride that dropped a still-referenced page
+    /// would corrupt a later chunk. Byte-exact vs flate2 + the drive CRC/size.
+    #[test]
+    fn reaper_file_backed_byte_exact_multi_stride() {
+        use std::io::{Read, Write};
+        // ~40 MiB low-redundancy payload (> INPUT_RELEASE_MIN_LEN=16 MiB so the
+        // reaper arms; ratio≈1 so the compressed input is also large → many
+        // 1 MiB strides fire on the file-backed input).
+        let mut payload = Vec::with_capacity(40 * 1024 * 1024);
+        for i in 0..(40 * 1024 * 1024u32 / 4) {
+            payload.extend_from_slice(&i.wrapping_mul(2654435761).to_le_bytes());
+        }
+        let deflate = make_deflate(&payload, 6);
+        assert!(
+            deflate.len() > super::INPUT_RELEASE_MIN_LEN,
+            "input must exceed reaper arm threshold to exercise the stride"
+        );
+        // Write the deflate to a temp file and mmap it: the mmap'd pointer lies
+        // in a file-backed VMA (non-zero inode), so `InputReaper::new` arms and
+        // MADV_DONTNEED fires on real strides during the decode.
+        let mut tf = tempfile::NamedTempFile::new().expect("tempfile");
+        tf.write_all(&deflate).expect("write deflate");
+        tf.flush().unwrap();
+        let file = std::fs::File::open(tf.path()).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 1024 * 1024,
+            max_decoded_chunk_size: 8 * 1024 * 1024,
+            crc32_enabled: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let (_crc, n) = drive(&mmap[..], &mut out, None, 4, cfg, false).expect("drive");
+        assert_eq!(n, payload.len(), "decoded size");
+        assert_eq!(out, payload, "reaper-active decode must be byte-exact");
+        // Independent oracle cross-check.
+        let mut reference = Vec::new();
+        flate2::read::DeflateDecoder::new(&deflate[..])
+            .read_to_end(&mut reference)
+            .unwrap();
+        assert_eq!(reference, payload, "flate2 self-check");
     }
 
     #[test]
