@@ -150,8 +150,8 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
 // `chunk_decode::finish_decode_chunk_seeded_block_native` and the
 // `tests::routing::seeded_block_engine_runs_on_parallel_sm` trap). The
 // wrapper remains the engine for the until-exact paths (M4 pre-registered
-// contract), the `GZIPPY_SEEDED_BLOCK=0` kill-switch arm, and the
-// gzippy-isal build's ISA-L-backed variant.
+// contract) and the gzippy-isal build's ISA-L-backed variant (the
+// `GZIPPY_SEEDED_BLOCK=0` env kill-switch arm was removed 2026-07-07).
 
 #[cfg(pure_inflate_decode)]
 pub struct StreamingInflateWrapper<'a> {

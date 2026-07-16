@@ -1621,8 +1621,9 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 /// there); the gzippy-isal clean-tail handoff is untouched (faithful
 /// rapidgzip WITH_ISAL, GzipChunk.hpp:440-444/520-526).
 ///
-/// Kill-switch: `GZIPPY_SEEDED_BLOCK=0` restores the wrapper arm exactly
-/// (see [`seeded_block_route_enabled`]).
+/// Route: [`seeded_block_route_enabled`] (hardcoded ON; the wrapper arm now
+/// runs only on the gzippy-isal build — the `GZIPPY_SEEDED_BLOCK=0` env
+/// kill-switch was removed 2026-07-07, batch 4f).
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_seeded_block_native(
     chunk: &mut ChunkData,
@@ -1848,9 +1849,10 @@ pub static MONOLITH_ISAL_CHUNKS: std::sync::atomic::AtomicU64 =
 ///      `decode_base + n_bytes_read` accounting (pinned by the parity nets'
 ///      subchunk-key equality).
 ///
-/// Kill-switch: `GZIPPY_EXACT_BLOCK=0` restores the wrapper arm exactly
-/// (see [`exact_block_route_enabled`]). Engine proof: [`EXACT_BLOCK_CHUNKS`]
-/// vs [`EXACT_WRAPPER_CHUNKS`].
+/// Route: [`exact_block_route_enabled`] (hardcoded ON; the wrapper arm now
+/// runs only on the gzippy-isal build — the `GZIPPY_EXACT_BLOCK=0` env
+/// kill-switch was removed 2026-07-07, batch 4f). Engine proof:
+/// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`].
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_exact_block_native(
     chunk: &mut ChunkData,
@@ -1930,8 +1932,8 @@ pub static WINDOW_SEEDED_CHUNKS: std::sync::atomic::AtomicU64 =
 pub static SEEDED_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// M3 engine proof (complement): window-seeded INEXACT chunks decoded on the
-/// pre-M3 wrapper arm (`GZIPPY_SEEDED_BLOCK=0` kill-switch, the gzippy-isal
-/// build, or the ISA-L measurement oracle).
+/// pre-M3 wrapper arm (the gzippy-isal build or the ISA-L measurement oracle;
+/// the `GZIPPY_SEEDED_BLOCK=0` env kill-switch was removed 2026-07-07).
 #[cfg(parallel_sm)]
 pub static SEEDED_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1942,8 +1944,8 @@ pub static SEEDED_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
 pub static EXACT_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// M4 engine proof (complement): UNTIL-EXACT chunks decoded on the wrapper
-/// arm (`GZIPPY_EXACT_BLOCK=0` kill-switch, the gzippy-isal build, or the
-/// ISA-L measurement oracle).
+/// arm (the gzippy-isal build or the ISA-L measurement oracle; the
+/// `GZIPPY_EXACT_BLOCK=0` env kill-switch was removed 2026-07-07).
 #[cfg(parallel_sm)]
 pub static EXACT_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -3632,8 +3634,9 @@ mod native_fold_parity {
 // from `StreamingInflateWrapper`/`unified::Inflate` onto the ONE
 // `deflate::Block` engine (vendor GzipChunk.hpp:454-458). This gate nets the
 // two arms — `finish_decode_chunk_seeded_block_native` (new production) vs
-// `finish_decode_chunk_with_inexact_offset` (the `GZIPPY_SEEDED_BLOCK=0`
-// kill-switch arm) — on generated corpora, asserting:
+// `finish_decode_chunk_with_inexact_offset` (the pre-M3 wrapper arm; its
+// `GZIPPY_SEEDED_BLOCK=0` env kill-switch was removed 2026-07-07) — on
+// generated corpora, asserting:
 //   (a) decoded bytes        (b) decoded_size / data_prefix_len accounting
 //   (c) final bit (encoded_size_bits)   (d) per-stream CRC32 values
 //   (e) subchunk keys (encoded_offset, encoded_size, decoded_offset, size)
@@ -4160,8 +4163,9 @@ mod seeded_block_parity {
 // C-FFI `decodeChunkWithInflateWrapper`, GzipChunk.hpp:192-265; see
 // `finish_decode_chunk_exact_block_native`). This gate nets the two arms —
 // `finish_decode_chunk_exact_block_native` (new production) vs
-// `finish_decode_chunk_impl(until_exact=true)` (the `GZIPPY_EXACT_BLOCK=0`
-// kill-switch arm) — on generated corpora, asserting STRICT equality (no
+// `finish_decode_chunk_impl(until_exact=true)` (the pre-M4 wrapper arm; its
+// `GZIPPY_EXACT_BLOCK=0` env kill-switch was removed 2026-07-07) — on
+// generated corpora, asserting STRICT equality (no
 // M3-style final-bit exceptions: on success both arms must land EXACTLY at
 // stop_hint_bits by the until-exact contract):
 //   (a) decoded bytes      (b) decoded_size / data_prefix_len accounting

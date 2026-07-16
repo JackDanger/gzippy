@@ -447,7 +447,7 @@ This is the governing rule; the specific tactics below are just consequences:
 | `src/decompress/parallel/{sm_driver,chunk_fetcher,block_fetcher}.rs` | Driver loop / `GzipChunkFetcher::processNextChunk` consumer / `BlockFetcher` prefetch+cache coordinator |
 | `src/decompress/parallel/marker_inflate.rs` | Window-absent u16-marker decoder — port of rg `deflate::Block` (`deflate.hpp:513-1156`); the `read_internal_compressed_specialized<CONTAINS_MARKERS>` dispatcher splits into `decode_clean_fast_loop` / `decode_marker_fast_loop` / `decode_careful_tail` |
 | `src/decompress/parallel/{apply_window,replace_markers}.rs` | Window application / marker resolution (rg `ChunkData::applyWindow` + `MarkerReplacement`) |
-| `src/decompress/parallel/instruments/*.rs` | Campaign measurement instruments (env-gated, byte-transparent, NO rg counterpart) — re-exported at `parallel::<name>` for call-site transparency |
+| `src/decompress/parallel/{perturb,phase_timing,storeprobe}.rs` | Campaign measurement instruments (Cargo-feature-gated `perturb`/`phase-timing`/`storeprobe`, all OFF by default → no-op on the production build, NO rg counterpart) |
 | `src/decompress/parallel/mod.rs` | Module map + canonical gz→rg ROLE MAP (see also `docs/parallel-decode-architecture.md`) |
 | `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
 | `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,staged_bits,unified,resumable,bmi2}.rs` | Huffman/inflate building blocks |

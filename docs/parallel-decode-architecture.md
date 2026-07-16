@@ -123,14 +123,13 @@ rg's decode decomposition:
 
 ### Instruments (NO rapidgzip counterpart)
 
-`parallel/instruments/*` are campaign measurement instruments — env-gated and
-byte-transparent (they compile away / no-op on the production path). They are
-grouped out of the production modules so the pipeline reads as a clean mirror of
-rapidgzip, and re-exported at the historical `parallel::<name>` paths so every
-hot-path hook call site stays byte-transparent. Members:
-`contig_prof`, `slow_knob`, `decode_bypass`, `memlife`, `perfect_overlap`,
-`removal_oracle`, `seed_windows`, `stall_residency`, `trace_jsonl` (as `trace`),
-`trace_timeline` (as `trace_v2`).
+`parallel::{perturb, phase_timing, storeprobe}` are campaign measurement
+instruments with NO rapidgzip counterpart. Each is a Cargo-feature-gated module
+(`perturb`, `phase-timing`, `storeprobe` — all OFF by default) whose every item
+compiles to a true no-op on the production build, so they have ZERO effect on
+the production bytes/timing (`storeprobe` is byte-INEXACT when its feature is
+enabled — a removal oracle, never shipped). They live as flat modules alongside
+the pipeline rather than in a subdirectory.
 
 ---
 
