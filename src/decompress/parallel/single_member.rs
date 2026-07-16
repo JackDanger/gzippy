@@ -643,53 +643,15 @@ pub static AARCH64_PRESTACK_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub static SMALL_OUTPUT_SERIAL_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
 
-/// Counter proving the work-per-thread cap (the over-threading guard) fired on a
-/// real decode (deletion-trap discipline; read by the routing test).
-#[cfg_attr(not(parallel_sm), allow(dead_code))]
-pub static WORK_PER_THREAD_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
-
-/// Minimum COMPRESSED bytes of work each parallel worker must be given before
-/// spawning another. Over-threading guard: on a SMALL near-incompressible stream
-/// (movie.mp4 12.9 MB, ratio ~1.0) the vendor chunk-size shrink floors chunks at
-/// [`MIN_ADJUSTED_CHUNK_BYTES`] (512 KiB) once `file/(3·T)` drops below it, so at
-/// high T the file is split into ~2× more chunks than at its knee (movie: 13
-/// chunks @ T8 → 25 @ T16) — doubling every per-chunk serial cost (bootstrap scan,
-/// window seed, block-finder validation, consumer coordination, pool-pick
-/// contention) while the short decode cannot hide it. Result: NEGATIVE thread
-/// scaling past the knee (movie T16 +9.64% SIG slower than T8, Intel, paired N=41).
-/// Capping effective-T to `deflate_len / this` keeps each worker's chunk coarse
-/// enough to stay on the amortized side of the knee. `0` disables the cap.
-///
-/// FROZEN TO `0` (disabled) after a cross-arch measurement retired the
-/// `GZIPPY_MIN_BYTES_PER_THREAD` env override (2026-07-13, solvency-AMD +
-/// diligence-Intel, /dev/null paired N≥41, sha==gunzip): at HEAD the movie.mp4
-/// high-T regression this const was built for is GONE (movie T32 is FASTER than
-/// T8 on both arches — the event-driven consumer + input-page-reap commits
-/// amortized the per-chunk coordination), so the cap has no clean job left. The
-/// ONLY corpus that still over-threads is access.log (small, ratio 10.4; T32 is
-/// 13–35% slower than T8) — but it already BEATS rapidgzip at T24/T32 (0.77–0.81×)
-/// so there is no loss to recover, and the sweep showed its wall only IMPROVES at
-/// eff==1 (the serial-clean path), which requires a floor ≥ ~1.3 MiB/thread — a
-/// value that simultaneously over-caps monorepo/tool.bin/data.parquet (which
-/// scale cleanly to T32) and REGRESSES them. No single compressed-bytes floor
-/// improves access.log without regressing those, so per the no-env-vars rule the
-/// knob was removed rather than baked to a nonzero default. access.log's residual
-/// over-threading is the serial-clean cost-model SELECTOR's domain (its crossover
-/// under-serializes this small high-ratio class), not this cap's.
-const MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT: u64 = 0;
-
-/// Frozen default for the work-per-thread cap's physical-core floor (the env
-/// override was removed). See the mechanism note
-/// on the `floor` local in [`effective_parallel_threads_with`].
-pub(crate) const MIN_THREADS_FLOOR_DEFAULT: u64 = 1;
-
 /// Production entry point: [`effective_parallel_threads_with`] fed the frozen
 /// selector defaults (the campaign-measured values with every parallel-selector
-/// env knob removed). The work-per-thread cap is frozen to
-/// [`MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT`] (`0` — disabled); the former
-/// `GZIPPY_MIN_BYTES_PER_THREAD` override was REMOVED (2026-07-13) per the
-/// no-env-vars-in-prod-path rule, after a cross-arch frozen sweep proved no
-/// nonzero value is a clean no-regress win — see the const's doc comment.
+/// env knob removed). The former work-per-thread cap (over-threading guard) and
+/// its `GZIPPY_MIN_BYTES_PER_THREAD` override were REMOVED (2026-07-13): a
+/// cross-arch frozen sweep proved no nonzero floor is a clean no-regress win
+/// (the movie.mp4 high-T regression it was built for is gone at HEAD; the only
+/// residual over-threading — access.log — already beats rapidgzip), so per the
+/// no-env-vars-in-prod-path rule the cap was deleted rather than baked to a
+/// nonzero default.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub(crate) fn effective_parallel_threads(
     gzip_data: &[u8],
@@ -704,14 +666,12 @@ pub(crate) fn effective_parallel_threads(
         arch_crossover_margin_default(),
         PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
         arch_large_output_notch_default(),
-        MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT,
-        MIN_THREADS_FLOOR_DEFAULT,
         arch_mid_band_low_default(),
     )
 }
 
 /// Content-derived effective thread count for the parallel single-member
-/// pipeline. Three guards, in order (each byte-transparent — only the thread
+/// pipeline. Two guards, in order (each byte-transparent — only the thread
 /// count changes; CRC32 + ISIZE are still verified by the caller):
 ///   1. SMALL-OUTPUT SERIAL FLOOR — small compressible streams (markup.xml)
 ///      degenerate to an all-marker re-decode; below the floor there is no real
@@ -727,7 +687,9 @@ pub(crate) fn effective_parallel_threads(
 ///      ratio cap (`ratio >= 8 → serial at EVERY T`) is deleted — that cap
 ///      pre-empted this selector and forfeited high-T wins (nasa Intel T16:
 ///      capped 220 ms = 1.20 LOSS vs rg → selector-routed 150 ms = 0.82 WIN).
-///   3. WORK-PER-THREAD CAP — over-threading guard for small files at high T.
+/// (A former 3rd guard, the WORK-PER-THREAD CAP over-threading guard, was
+/// removed 2026-07-13 — it was frozen disabled and had no clean job left; see
+/// [`effective_parallel_threads`].)
 /// ISIZE wrap (>4 GiB output) or near-incompressible (isize<deflate) yields a
 /// low ratio → low/no crossover → keep the requested threads (parallel is
 /// correct there).
@@ -746,8 +708,6 @@ pub(crate) fn effective_parallel_threads_with(
     margin: f64,
     large_output_bytes: u64,
     notch: u64,
-    min_bpt: u64,
-    threads_floor: u64,
     mid_band_low: u64,
 ) -> usize {
     if num_threads <= 1 || deflate_data_len == 0 || gzip_data.len() < 4 {
@@ -944,43 +904,12 @@ pub(crate) fn effective_parallel_threads_with(
         }
     }
 
-    // WORK-PER-THREAD CAP (over-threading guard). Above the serial floors the file
-    // IS worth parallelizing, but a SMALL stream can be split into more chunks than
-    // there is decode work to amortize their per-chunk serial cost (see
-    // [`MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT`] for the mechanism + the paired
-    // movie T8-vs-T16 measurement). Cap effective-T so each worker gets at least
-    // `min_bpt` COMPRESSED bytes: `eff = deflate_len / min_bpt` (floored at 1,
-    // never raised above the requested `num_threads`). This is a GENERAL
-    // work-per-thread law — it binds ONLY when `deflate_len < min_bpt*num_threads`
-    // (small file at high T); a large file (silesia/weights/nasa) clears
-    // `min_bpt*T` and keeps every requested thread. Byte-transparent: only the
-    // thread count changes. `min_bpt == 0` disables — the frozen production
-    // default now that the `GZIPPY_MIN_BYTES_PER_THREAD` override is removed (see
-    // [`MIN_COMPRESSED_BYTES_PER_THREAD_DEFAULT`]); the block stays a param-driven,
-    // unit-tested pure guard but is inert on the production path.
-    if min_bpt > 0 {
-        // FLOOR the cap at the physical-core count of the run's affinity set. The
-        // corpus no-regress gate (Intel trainer, paired) proved a cap that drops
-        // BELOW ~physical-cores REGRESSES compressible mid-size files (monorepo 9.8 MB
-        // ratio 5.2× → capped to 6 was +16.7% SIG slower; its own knee is T8 too) and
-        // small incompressible files at moderate T (photo → capped to 4 was +20% SIG).
-        // The over-threading is confined to the SMT-sibling tier (threads > physical
-        // P-cores): a short compute-bound decode saturates the physical cores, so the
-        // 2nd SMT thread per core only adds coordination (chunk-count doubling at the
-        // 512 KiB chunk floor). Large files still repay SMT (silesia/weights T16 win)
-        // and clear `min_bpt*T` so they are never capped. Flooring at the physical
-        // count changes ONLY the sub-floor cases — exactly the regressing ones — so it
-        // keeps the movie/tool.bin wins while erasing the monorepo/photo regressions.
-        // The floor is TOPOLOGY-derived, not a portable constant; frozen to
-        // [`MIN_THREADS_FLOOR_DEFAULT`] (the env override was removed).
-        let eff = (deflate_len / min_bpt)
-            .max(threads_floor)
-            .min(num_threads as u64);
-        if eff < num_threads as u64 {
-            WORK_PER_THREAD_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
-            return eff as usize;
-        }
-    }
+    // (A former WORK-PER-THREAD CAP over-threading guard lived here — capping
+    // effective-T so each worker got a minimum of COMPRESSED bytes to amortize
+    // per-chunk serial cost. It was frozen disabled and removed 2026-07-13: at
+    // HEAD the movie.mp4 high-T regression it targeted is gone, and no nonzero
+    // floor is a clean no-regress win across the corpus. See
+    // [`effective_parallel_threads`].)
     num_threads
 }
 
@@ -1159,7 +1088,7 @@ pub fn decompress_parallel<W: Write>(
             eprintln!(
                 "[parallel_sm] STEP0 deflate_len={} isize={} ratio={:.4} \
                  eff_threads={} chunk_size={} est_chunks={} \
-                 serial_clean_floor={} small_out_floor={} work_cap={}",
+                 serial_clean_floor={} small_out_floor={}",
                 _deflate_data_len,
                 isize_field,
                 ratio,
@@ -1168,7 +1097,6 @@ pub fn decompress_parallel<W: Write>(
                 est_chunks,
                 SERIAL_CLEAN_FLOOR_APPLIED.load(Ordering::Relaxed),
                 SMALL_OUTPUT_SERIAL_FLOOR_APPLIED.load(Ordering::Relaxed),
-                WORK_PER_THREAD_CAP_APPLIED.load(Ordering::Relaxed),
             );
         }
 
@@ -1638,12 +1566,10 @@ mod tests {
     /// aarch64 — the prestack cap REMAINS (selector disabled; removing the cap
     /// regresses M1 2.1-2.6× on logs/software-class at T2, paired N=15).
     /// Neutral params that isolate a SINGLE guard: floor disabled (`min_output=0`),
-    /// large-output bonus disabled (`large_output_bytes=0`), work-per-thread cap
-    /// disabled (`min_bpt=0`, `threads_floor` irrelevant then). Tests override
+    /// large-output bonus disabled (`large_output_bytes=0`). Tests override
     /// only the dimension(s) they're exercising.
     const NO_FLOOR: u64 = 0;
     const NO_BONUS_BYTES: u64 = 0;
-    const NO_BPT_CAP: u64 = 0;
 
     /// HIGH-RATIO ROUTING (2026-07-05):
     /// x86_64 — NO T-blind ratio cap: a high-ISIZE-ratio stream is serialized
@@ -1674,8 +1600,6 @@ mod tests {
                 1.0,
                 PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 arch_large_output_notch_default(),
-                NO_BPT_CAP,
-                MIN_THREADS_FLOOR_DEFAULT,
                 0, // mid_band_low disabled — this test isolates the base selector
             )
         };
@@ -1728,8 +1652,6 @@ mod tests {
                 margin,
                 PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 arch_large_output_notch_default(),
-                NO_BPT_CAP,
-                MIN_THREADS_FLOOR_DEFAULT,
                 0, // mid_band_low disabled — this test isolates the base selector
             )
         };
@@ -1860,8 +1782,6 @@ mod tests {
                 margin,
                 PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 arch_large_output_notch_default(),
-                NO_BPT_CAP,
-                MIN_THREADS_FLOOR_DEFAULT,
                 0, // mid_band_low disabled — this test isolates the base selector
             )
         };
@@ -1900,8 +1820,6 @@ mod tests {
                     1.0,
                     large_output_bytes,
                     notch,
-                    NO_BPT_CAP,
-                    MIN_THREADS_FLOOR_DEFAULT,
                     0, // mid_band_low disabled — this test isolates the large-output bonus
                 )
             };
@@ -1946,18 +1864,7 @@ mod tests {
         // (gz, deflate_len, t, mid_band_low) with AMD production params margin 1.6,
         // large=128 MiB, notch=2.
         let call = |gz: &[u8], deflate_len: usize, t: usize, mid_low: u64| {
-            effective_parallel_threads_with(
-                gz,
-                deflate_len,
-                t,
-                NO_FLOOR,
-                1.6,
-                LARGE,
-                2,
-                NO_BPT_CAP,
-                MIN_THREADS_FLOOR_DEFAULT,
-                mid_low,
-            )
+            effective_parallel_threads_with(gz, deflate_len, t, NO_FLOOR, 1.6, LARGE, 2, mid_low)
         };
 
         // tool.bin-shaped: 59.6 MiB out, 20.87 MiB deflate, ratio 2.99 → base

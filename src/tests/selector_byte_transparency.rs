@@ -445,8 +445,6 @@ mod tests {
                 1.0, // margin pinned
                 crate::decompress::parallel::single_member::PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 crate::decompress::parallel::single_member::arch_large_output_notch_default(),
-                0, // work-per-thread cap disabled
-                crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
                 0, // mid_band_low disabled — isolates the crossover/prestack decision
             )
         };
@@ -494,8 +492,6 @@ mod tests {
                 1.0,
                 crate::decompress::parallel::single_member::PARALLEL_LARGE_OUTPUT_BYTES_DEFAULT,
                 crate::decompress::parallel::single_member::arch_large_output_notch_default(),
-                0,
-                crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
                 0, // mid_band_low disabled — isolates the crossover/prestack decision
             )
         };
@@ -528,8 +524,6 @@ mod tests {
                 1.0, // crossover 3
                 large_output_bytes,
                 notch,
-                0,
-                crate::decompress::parallel::single_member::MIN_THREADS_FLOOR_DEFAULT,
                 0, // mid_band_low disabled — isolates the crossover/prestack decision
             )
         };
