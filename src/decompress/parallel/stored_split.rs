@@ -55,11 +55,6 @@ use crate::decompress::parallel::crc32::{combine_crc32, crc32};
 use crate::decompress::parallel::gzip_format;
 use crc32fast::Hasher;
 
-/// Counter: number of times StoredParallel was demoted to ParallelSM because
-/// the Huffman tail accounts for >= 50% of total output (prefix_out < 50% of
-/// expected_size). Dumped by `GZIPPY_DEBUG=1`.
-pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
-
 /// Counter: number of pure-stored streams decoded via the chunked-streaming
 /// path that copies the verbatim input run slices straight to the writer with
 /// NO monolithic output buffer. Non-zero proves the streaming path ran (Gate-0
@@ -358,7 +353,6 @@ pub fn decompress_stored_parallel<W: Write>(
             if prefix_out > 0
                 && prefix_out * DEMOTE_THRESHOLD_DEN < expected_size * DEMOTE_THRESHOLD_NUM
             {
-                STORED_DEMOTE_TO_PARALLEL_SM.fetch_add(1, Ordering::Relaxed);
                 if crate::utils::debug_enabled() {
                     eprintln!(
                         "[gzippy] StoredParallel demote → ParallelSM: \

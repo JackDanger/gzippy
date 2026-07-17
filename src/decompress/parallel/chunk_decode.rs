@@ -65,102 +65,6 @@ impl From<std::io::Error> for ChunkDecodeError {
 #[allow(dead_code)]
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
-// =========================================================================
-// Body-failure diagnostics — speculation-accuracy investigation
-// =========================================================================
-// Per advisor-disproof: gzippy fails ~34 body speculations per silesia run,
-// vendor fails 0. The hypothesis is that the WHY of these failures matters:
-// where in the body does decode break, what error variant fires, how many
-// bytes are wasted before failure. If failures cluster on specific corpus
-// regions or specific error types, we can build a precondition heuristic
-// that vendor has but we don't.
-
-pub static BODY_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_BYTES_WASTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_BITS_INTO_BODY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_INVALID_HUFFMAN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_EXCEEDED_WINDOW: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_INVALID_COMPRESSION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_INVALID_CODE_LENGTHS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BODY_FAIL_OTHER_VARIANT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-// C-instrumentation: per-block table-build vs body cost inside
-// bootstrap_with_deflate_block. Each chunk's bootstrap iterates blocks,
-// for each: read_header (precode + lit/len/dist table build) then body.
-// 8.3B flame samples in "marker bootstrap" — need to split.
-pub static BOOTSTRAP_HEADER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static BOOTSTRAP_HEADER_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BOOTSTRAP_BODY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static BOOTSTRAP_BODY_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Bootstrap instrumentation: output bytes belonging to bootstrap blocks that
-/// ended CLEAN (`!contains_marker_bytes()` — no marker bytes remain after the
-/// block). This is the marker-FREE *complement* of the marker-decode domain:
-/// the new u16 marker fast loop touches the OTHER bytes (blocks that still
-/// contain markers). NOTE: the old name `BOOTSTRAP_POST_FLIP_U16_BYTES` and its
-/// "decoded into the u16 marker ring after the flip" doc were BACKWARDS and had
-/// been read inverted multiple times — it counts clean-flipped bytes, NOT marker
-/// bytes. The ratio CLEAN_FLIPPED / BODY_BYTES sizes the clean-flipped sliver
-/// (small on marker-heavy workloads), NOT the marker-loop prize. No behavior change.
-pub static BOOTSTRAP_CLEAN_FLIPPED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// P2 unified decode: clean literals/backrefs routed to `chunk.data` (u8) after
-/// `contains_marker_bytes` flips false — rapidgzip-shaped single output stream.
-pub static UNIFIED_ROUTE_CLEAN_U8_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Bulk LUT declined; tail used ResumableInflate2 (should be rare with 32 KiB window).
-pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Times the reused thread-local marker→clean handoff window buffer had to GROW
-/// its capacity. Proves the per-chunk 32 KiB `clean_window: Vec<u8>` allocation
-/// is gone: this should settle at ≈ num_worker_threads (one grow per thread on
-/// first handoff) and then stay flat — NOT scale with the window-absent chunk
-/// count. If it tracks the chunk count, the buffer is being reallocated per
-/// chunk (the seam is not actually cut).
-pub static HANDOFF_WINDOW_BUF_GROWS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Legacy counter: non-vendor resync after marker bootstrap failure (removed Gate 1).
-/// Must stay 0 in production — any increment means tryToDecode is not vendor-shaped.
-pub static BAD_SEED_RESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Chunks that entered `finish_decode_chunk_impl` (ISA-L / ResumableInflate2 tail).
-pub static FINISH_DECODE_ENTRIES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// PHASE-0 WALL ORACLE (measurement-only, NOT production): chunks whose clean
-/// tail was decoded by REAL ISA-L FFI via `decompress_deflate_from_bit_with_boundaries`
-/// instead of the pure-Rust engine, when `GZIPPY_ISAL_ENGINE_ORACLE=1`. Proves the
-/// engine actually ran ISA-L (assert this counter == clean-chunk count post-run).
-pub static ISAL_ENGINE_ORACLE_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// PHASE-0 WALL ORACLE: clean tails that fell through to the pure-Rust engine
-/// because the ISA-L oracle could not satisfy the contract (no exact boundary,
-/// FFI unavailable). Non-zero ⇒ the oracle did NOT fully cover the bulk decode;
-/// the wall number is contaminated by pure-Rust decode and must be discarded.
-pub static ISAL_ENGINE_ORACLE_FALLBACKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Chunks accepted via the BFINAL exact-landing fix: `until_exact=true`,
-/// no recorded EOB boundary at stop_hint_bits, but ISA-L's `end_bit` is
-/// within 1 bit of stop_hint_bits (delta 0 = ISA-L exact; delta 1 = the
-/// 1-bit coordinate discrepancy between ISA-L's chunk-decode context and
-/// the block_finder's canonical scan position — diagnosed on NASA Jul95
-/// start_bit=150999587, stop_hint=156360208, end_bit=156360207, 3–5/30 runs).
-pub static ISAL_BFINAL_EXACT_LANDING_ACCEPTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// `until_exact=true` fallbacks: no boundary within 1 bit of stop_hint AND
-/// end_bit is more than 1 bit away from stop_hint (genuine decline).
-pub static ISAL_UNTIL_EXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// `until_exact=false` fallbacks (no boundary at-or-past stop_hint AND end_bit > stop_hint).
-pub static ISAL_INEXACT_FALLBACKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Whether the clean-tail decode routes through REAL ISA-L FFI.
 ///
 /// The pure-Rust DEFLATE engine is the SOLE production decode path; ISA-L
@@ -272,47 +176,6 @@ pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ce
         .saturating_mul(factor)
         .max(RESERVE_FLOOR)
         .min(RESERVE_CAP)
-}
-
-/// Chunks that took vendor `decodeChunkWithInflateWrapper` (exact window + until_exact).
-pub static INFLATE_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Chunks that took the marker→clean FLIP: a bounded u16 marker prefix then the
-/// fast u8 clean tail (vendor setInitialWindow). This is the FAST window-absent
-/// path; if it stays 0 while speculative chunks exist, every window-absent chunk
-/// is decoding its whole body as u16 markers + full resolve (the slow path).
-pub static FLIP_TO_CLEAN_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Chunks that finished WITHOUT a flip (BFINAL or stop-hint reached before 32 KiB
-/// of clean output accumulated) — the whole decoded body stayed u16 markers.
-pub static FINISHED_NO_FLIP_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_DECLINE_INVALID_HUFFMAN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_DECLINE_INVALID_LOOKBACK: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_DECLINE_OUTPUT_OVERFLOW: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(pure_inflate_decode)]
-#[allow(dead_code)]
-fn record_bulk_decline(err: crate::decompress::parallel::lut_bulk_inflate::BulkDecodeError) {
-    use crate::decompress::parallel::lut_bulk_inflate::BulkDecodeError;
-    use std::sync::atomic::Ordering;
-    let c = match err {
-        BulkDecodeError::InvalidHuffmanCode => &BULK_DECLINE_INVALID_HUFFMAN,
-        BulkDecodeError::InvalidLookback => &BULK_DECLINE_INVALID_LOOKBACK,
-        BulkDecodeError::OutputOverflow => &BULK_DECLINE_OUTPUT_OVERFLOW,
-        BulkDecodeError::InvalidCodeLengths | BulkDecodeError::BlockTypeReserved => {
-            &BULK_DECLINE_OTHER
-        }
-    };
-    c.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Rapidgzip-shaped chunk decode — `GzipChunk.hpp::decodeChunkWithRapidgzip`
@@ -443,7 +306,6 @@ fn finish_decode_chunk_impl(
     record_decode_duration: bool,
     until_exact: bool,
 ) -> Result<(), ChunkDecodeError> {
-    FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // DoS/OOM guard: bound decoded output to what this compressed input could
     // plausibly produce (input_len × MAX_DEFLATE_EXPANSION). Malformed input
     // makes the inflate engine fabricate output from zero-padding past EOF;
@@ -693,7 +555,6 @@ fn decode_chunk_with_rapidgzip_impl(
     let t_decode = std::time::Instant::now();
 
     if initial_window.len() == MAX_WINDOW_SIZE {
-        WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
             // M4 (DIV-1 part 2): until-exact decodes on the ONE `deflate::Block`
@@ -1083,9 +944,7 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
         };
         let (step, _flipped_clean) =
             marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &[], &mut sink)?;
-        let n = clean_appended - marker_ctx.clean_data_count;
         marker_ctx.clean_data_count = clean_appended;
-        UNIFIED_ROUTE_CLEAN_U8_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         apply_recorded_block_boundaries(&mut chunk, input, &pending_boundaries);
         pending_boundaries.clear();
         // DoS/OOM guard: stop a malformed runaway before it OOMs.
@@ -1098,7 +957,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
         match step {
             MarkerStep::Continue => {}
             MarkerStep::FlipToContig { end_bit_offset } => {
-                FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 // STAGE-2b: the post-flip clean tail carries the cross-member
                 // continuation (stage 1's `::<true>` arm). A large member that
@@ -1119,7 +977,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
                 return Ok(chunk);
             }
             MarkerStep::FlipToClean { end_bit_offset, .. } => {
-                FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 let clean_window = chunk.last_32kib_window_vec().ok_or_else(|| {
                     ChunkDecodeError::BootstrapFailed(std::io::Error::new(
@@ -1158,8 +1015,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
                     )? {
                         MemberContinuation::Continued => continue,
                         MemberContinuation::EndOfData { end_bit } => {
-                            FINISHED_NO_FLIP_CHUNKS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             chunk.statistics.non_marker_count +=
                                 chunk.data_with_markers.len() as u64;
                             chunk.finalize_with_deflate(end_bit, Some(input));
@@ -1167,7 +1022,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
                         }
                     }
                 }
-                FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 chunk.finalize_with_deflate(end_bit_offset, Some(input));
                 return Ok(chunk);
@@ -1371,7 +1225,6 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
                 let emitted = match body_res {
                     Ok(n) => n,
                     Err(e) => {
-                        record_block_body_fail(&e);
                         // Commit whatever was written before the failure so the
                         // logical length stays consistent, then surface the error.
                         chunk.data.commit(pos - pos_before);
@@ -1401,8 +1254,6 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
                     if MULTI_MEMBER {
                         stream_bytes_read += emitted as u64;
                     }
-                    UNIFIED_ROUTE_CLEAN_U8_BYTES
-                        .fetch_add(emitted as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 // No forward progress AND not at EOB ⇒ the buffer can't grow
                 // enough (degenerate); bail rather than spin.
@@ -1894,12 +1745,6 @@ fn decode_chunk_exact_block_native(
     Ok(chunk)
 }
 
-/// Counter: chunks that took the window-present clean-from-block-0 fast path
-/// (vendor `setInitialWindow`) instead of full marker decode.
-#[cfg(parallel_sm)]
-pub static WINDOW_SEEDED_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// M3 engine proof: window-seeded INEXACT chunks decoded on the ONE
 /// `deflate::Block` engine (`finish_decode_chunk_seeded_block_native`).
 #[cfg(parallel_sm)]
@@ -2066,75 +1911,10 @@ impl MarkerDecodeCtx {
     }
 }
 
-/// Counter: fresh `Vec::reserve(128*1024)` events from
-/// `take_bootstrap_output_from_pool`. Each is an mmap-eligible
-/// allocation (256 KiB u16 buffer > glibc mmap threshold). With
-/// pool reuse working, expected ≈ num_worker_threads (one allocation
-/// per thread, then reused on every subsequent call). If this counter
-/// approaches the bootstrap call count, the pool is broken.
-#[cfg(parallel_sm)]
-pub static BOOTSTRAP_OUTPUT_ALLOCS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Counter: total `take` calls. Pool effectiveness =
-/// `1 - (allocs / takes)`. Vendor-equivalent: rpmalloc per-thread arena
-/// reuse rate, which approaches 1.0 after warm-up.
-#[cfg(parallel_sm)]
-pub static BOOTSTRAP_OUTPUT_TAKES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Counter: sum of capacity (in BYTES) of Vecs returned from the
-/// pool with cap ≥ 128 KiB. Total bytes the pool "saved" from a fresh
-/// allocation. A run-end value of `~BOOTSTRAP_OUTPUT_TAKES *
-/// 256 KiB` means every take hit the pool path.
-#[cfg(parallel_sm)]
-pub static BOOTSTRAP_OUTPUT_REUSED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Counter: every call to `return_bootstrap_output_to_pool`. Mirrors
-/// TAKES on the success path; if RETURNS << TAKES, bootstraps are
-/// erroring out and not returning their buffer (it's still moved via
-/// the chunk_fetcher.rs path at line 508, so should always match).
-#[cfg(parallel_sm)]
-pub static BOOTSTRAP_OUTPUT_RETURNS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Counter: returns where the incoming Vec was DROPPED instead of
-/// retained (because the pool's slot already had a larger cap).
-/// Non-zero means we threw away a hot allocation — should be 0 with
-/// 1-Vec-per-thread pool when caps are stable.
-#[cfg(parallel_sm)]
-pub static BOOTSTRAP_OUTPUT_DROPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 // Mirror of the `while ( true )` loop in
 // `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
 // single-member case (no multi-stream loop) and with the handoff
 // triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
-
-/// Map vendor `Block::read` failures into body-fail telemetry buckets.
-#[cfg(parallel_sm)]
-fn record_block_body_fail(err: &crate::decompress::parallel::marker_inflate::BlockError) {
-    use crate::decompress::parallel::marker_inflate::BlockError;
-    use std::sync::atomic::Ordering;
-    match err {
-        BlockError::InvalidHuffmanCode => {
-            BODY_FAIL_INVALID_HUFFMAN.fetch_add(1, Ordering::Relaxed);
-        }
-        BlockError::ExceededWindowRange | BlockError::ExceededDistanceRange => {
-            BODY_FAIL_EXCEEDED_WINDOW.fetch_add(1, Ordering::Relaxed);
-        }
-        BlockError::InvalidCompression => {
-            BODY_FAIL_INVALID_COMPRESSION.fetch_add(1, Ordering::Relaxed);
-        }
-        BlockError::InvalidCodeLengths => {
-            BODY_FAIL_INVALID_CODE_LENGTHS.fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {
-            BODY_FAIL_OTHER_VARIANT.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
 
 /// Decode one deflate block into `output` (vendor block loop body).
 #[cfg(parallel_sm)]
@@ -2189,7 +1969,7 @@ fn marker_decode_step_vendor_block(
             &mut *block,
             |block, bits| block.read_header(bits, false),
             |block, bits, output| block.read(bits, output, usize::MAX),
-            record_block_body_fail,
+            |_e| {},
         )
     })
 }
@@ -2274,16 +2054,7 @@ where
             ));
         }
 
-        let header_res = {
-            let t_header = std::time::Instant::now();
-            let r = read_header(block, &mut bits);
-            BOOTSTRAP_HEADER_US.fetch_add(
-                t_header.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            BOOTSTRAP_HEADER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            r
-        };
+        let header_res = read_header(block, &mut bits);
         if let Err(e) = header_res {
             return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2304,17 +2075,11 @@ where
         }
 
         let before_len = output.sink_len();
-        let t_body = std::time::Instant::now();
         while !block.eob() {
             if let Err(e) = read_body(block, &mut bits, output) {
                 let bits_at_fail = absolute_bit_pos(slice_byte, &bits);
                 let bytes_wasted = output.sink_len() - before_len;
                 let bits_into_body = bits_at_fail.saturating_sub(next_block_offset);
-                BODY_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                BODY_FAIL_BYTES_WASTED
-                    .fetch_add(bytes_wasted as u64, std::sync::atomic::Ordering::Relaxed);
-                BODY_FAIL_BITS_INTO_BODY
-                    .fetch_add(bits_into_body as u64, std::sync::atomic::Ordering::Relaxed);
                 on_body_fail(&e);
                 return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -2324,14 +2089,6 @@ where
                 )));
             }
         }
-        BOOTSTRAP_BODY_US.fetch_add(
-            t_body.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        BOOTSTRAP_BODY_BYTES.fetch_add(
-            (output.sink_len() - before_len) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
 
         if output.sink_len() > before_len {
             let block_len = output.sink_len() - before_len;
@@ -2345,12 +2102,6 @@ where
         }
 
         let flipped_clean = !block.contains_marker_bytes();
-        if flipped_clean {
-            BOOTSTRAP_CLEAN_FLIPPED_BYTES.fetch_add(
-                (output.sink_len().saturating_sub(before_len)) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
 
         let end_bit_offset = absolute_bit_pos(slice_byte, &bits);
         ctx.current_bit_offset = end_bit_offset;

@@ -415,17 +415,6 @@ impl ChunkData {
     ) -> Self {
         debug_assert!(data_with_markers.is_empty());
         debug_assert!(data.is_empty());
-        // Instrumentation (Step A, 2026-05-28): track the peak number of
-        // simultaneously-live ChunkData. This is the in-flight buffer
-        // working set that drives page-fault churn — each live chunk holds
-        // a ~12 MiB u8 + (slow path) up-to-24 MiB u16 Vec, both > rpmalloc's
-        // ~3.94 MiB huge-alloc threshold so they munmap-on-free / re-fault
-        // on next take. MAX_LIVE_CHUNKS sizes any bounded-pool / ring fix
-        // and tests the "prefetch depth, not topology" churn thesis.
-        // Clones=0 in production (Arc::try_unwrap 36/0) so this stays
-        // balanced against the Drop decrement below.
-        let live = LIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        MAX_LIVE_CHUNKS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
         let first_subchunk = Subchunk {
             encoded_offset_bits,
             encoded_size_bits: 0,
@@ -484,8 +473,6 @@ impl ChunkData {
         footers: Vec<Footer>,
         configuration: ChunkConfiguration,
     ) -> Self {
-        let live = LIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        MAX_LIVE_CHUNKS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
         let subchunks = if subchunks.is_empty() {
             vec![Subchunk {
                 encoded_offset_bits,
@@ -981,7 +968,6 @@ impl ChunkData {
         }
         // Past all early exits — we are about to run the 32 KiB marker-engine scan.
         // Count each such execution so the kill-switch effect is observable in VERBOSE.
-        SPARSITY_DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let start_bit = last
             .encoded_offset_bits
             .saturating_add(last.encoded_size_bits);
@@ -1672,29 +1658,6 @@ impl ChunkData {
     }
 }
 
-/// Return `data` and `data_with_markers` to the shared
-/// `chunk_buffer_pool` so the next worker on any thread can reuse
-/// the already-faulted pages. Mirror of vendor's rpmalloc
-/// auto-recycle for `FasterVector<uint8_t>` allocations
-/// (`core/FasterVector.hpp:120-128`).
-///
-/// `Clone` is derived: clones produce independent Vecs, each
-/// returning to the pool on its own drop. Cross-thread safe: pool
-/// is a `static Mutex<Vec<...>>`.
-/// Live / peak simultaneously-live ChunkData (Step A instrumentation).
-/// Read via `--verbose`. MAX_LIVE_CHUNKS = peak in-flight depth, which
-/// determines the page-fault working set and sizes a bounded-pool fix.
-pub static LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Effect counter: number of times `determine_used_window_symbols_for_last_subchunk`
-/// actually ran the 32 KiB marker-engine scan (window_sparsity=true path, not
-/// early-returned). window_sparsity is always false (keepIndex=false faithful
-/// port, the shipped default — the old always-on kill-switch was removed), so
-/// this stays 0. Read via `--verbose`.
-pub static SPARSITY_DECODE_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 impl ChunkData {
     /// Return the (now fully-resolved) `data_with_markers` buffer to the owner
     /// worker's u16 pool EAGERLY — right after the post-process worker narrows
@@ -1907,7 +1870,6 @@ impl ChunkData {
 
 impl Drop for ChunkData {
     fn drop(&mut self) {
-        LIVE_CHUNKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.recycle_decoded_buffers();
     }
 }

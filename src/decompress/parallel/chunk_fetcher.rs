@@ -149,30 +149,6 @@ pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Counter incremented each time the consumer skips a CONFIRMED block
-/// (an entry whose start bit falls behind `furthest_decoded_bit`).
-/// COMPONENT RECORD-CORRECTION: `GzipBlockFinder` (gzip_block_finder.rs) is
-/// spacing/bookkeeping only and has NO scanner; confirmed entries enter it
-/// solely via `consumer_append_subchunks_vendor` insertions (and the
-/// test-only oracle pre-seed). The deflate-candidate scanner is the raw
-/// block finder (blockfinder_validation.rs), which can hand stored-payload false
-/// positives to trial decodes; a stale confirmed entry behind the frontier
-/// arises via subchunk insertion around such regions, not via any
-/// GzipBlockFinder scan (98fd618c's message attributed this to the wrong
-/// component).
-///
-/// Vendor divergence: rapidgzip's GzipChunkFetcher.hpp:411-427 throws a
-/// `std::logic_error` when `block_finder->get(next_unprocessed_block_index)`
-/// does not equal `blockOffsetAfterNext` after advancing the index.
-/// In gzippy the skip guard (removing `!block_is_confirmed &&`) handles this
-/// case silently and correctly — the confirmed false-positive is discarded
-/// rather than decoded.  This counter provides the same signal for
-/// diagnostics without aborting: a non-zero value means GzipBlockFinder
-/// produced at least one false-positive confirmed entry inside a stored
-/// block's raw payload.
-pub static STALE_CONFIRMED_BLOCK_SKIP: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum FetchError {
@@ -584,7 +560,6 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
 
     let mut total_crc = CRC32Calculator::new();
     let mut total_size = 0usize;
-    let mut marker_chunks = 0usize;
 
     // Rolling 32 KiB window. First chunk starts with a zero window (chunk-0
     // semantics: the first deflate block references no back-history past output
@@ -602,13 +577,6 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
             configuration,
         )
         .map_err(FetchError::Decode)?;
-
-        // Gate-0(d): a clean window-present decode must produce NO markers.
-        // (Clean output lands in `data: SegmentedU8`; markers would show as a
-        // non-zero `marker_count` / non-empty `data_with_markers`.)
-        if chunk.statistics.marker_count != 0 || !chunk.data_with_markers.is_empty() {
-            marker_chunks += 1;
-        }
 
         // Advance the rolling window from this chunk's decoded tail.
         let data_len = chunk.data.len();
@@ -668,13 +636,6 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
         }
     }
 
-    if std::env::var_os("GZIPPY_DEBUG").is_some() {
-        eprintln!(
-            "[parallel_sm] thin-T1 out={total_size} bytes marker_chunks={marker_chunks} \
-             stride={}KiB (clean serial, no parallel bulk)",
-            stride_bits / 8 / 1024
-        );
-    }
     THIN_T1_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok((total_crc.crc32(), total_size))
 }
@@ -700,10 +661,11 @@ fn drive_impl<W: std::io::Write>(
     // bytes already streamed, instead of silently truncating. `None` for every
     // existing caller (zero behavior change).
     bytes_written_out: Option<&mut usize>,
-    // `--verbose` end-of-decode BlockFetcher statistics dump. Threaded from the
-    // CLI's `args.verbose` (main.rs → decompress::io → down the call graph) —
-    // replaces the old internal env-var round-trip (batch 4g).
-    verbose: bool,
+    // `--verbose` flag threaded from the CLI's `args.verbose` (main.rs →
+    // decompress::io → down the call graph). Retained for call-site
+    // compatibility; the end-of-decode internal-stats dump it used to gate
+    // has been removed.
+    _verbose: bool,
 ) -> Result<(u32, usize), FetchError> {
     let total_bits = input.len() * 8;
     // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
@@ -886,366 +848,11 @@ fn drive_impl<W: std::io::Write>(
         .base
         .set_block_count(block_map.data_block_count(), true);
 
-    // Drain the prefetch cache before stats dump. Any entries still
-    // sitting in the prefetch cache at end-of-decode were dispatched
-    // but never consumed by the consumer — mirror of vendor's
-    // destructor path at BlockFetcher.hpp:199-201 which counts those
-    // as `cache_unused_entry`. The drain wires `record_cache_unused_entry`
-    // once per remaining entry so the --verbose dump reports them.
+    // Drain the prefetch cache at end-of-decode. Any entries still sitting in
+    // the prefetch cache were dispatched but never consumed by the consumer —
+    // mirror of vendor's destructor path at BlockFetcher.hpp:199-201 which
+    // counts those as `cache_unused_entry`.
     block_fetcher.clear_prefetch_cache();
-
-    // Phase-timing: pool stopped, output flushed, block_map/finder finalized,
-    // --verbose stats dump. Mirror of vendor's destructor print at
-    // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Gated on the
-    // `verbose` parameter threaded down from the CLI's `args.verbose`
-    // (batch 4g — replaces the old internal env-var round-trip).
-    // Tests and other internal callers pass `false`.
-    if verbose {
-        let snap = block_fetcher.statistics.base.snapshot();
-        let extra = block_fetcher.statistics.extra_snapshot();
-        eprintln!("[gzippy --verbose] BlockFetcher statistics:");
-        eprintln!("{}", snap);
-        eprintln!("  Preemptive stops: {}", extra.preemptive_stop_count);
-        eprintln!(
-            "  Time queuing post-processing: {:.6} s",
-            extra.queue_post_processing_duration
-        );
-        // Per-counter hot-path observations relevant to this branch's
-        // optimization work. Mirror of vendor's --verbose details
-        // adapted for gzippy-specific counters added this session.
-        use std::sync::atomic::Ordering;
-        eprintln!(
-            "  Adjusted chunk size applied: {}",
-            crate::decompress::parallel::single_member::ADJUSTED_CHUNK_SIZE_APPLIED
-                .load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  Prefetch next-offset filesize-accepts: {}",
-            PREFETCH_NEXT_FILESIZE_ACCEPT.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  Unsplit blocks emplaced: {}",
-            UNSPLIT_BLOCKS_EMPLACED.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "  Eager post-process: runs={} runs_nonempty={} inspected={} submitted={} max/run={} reused={}",
-            EAGER_PROBE_RUNS.load(Ordering::Relaxed),
-            EAGER_PROBE_RUNS_NONEMPTY.load(Ordering::Relaxed),
-            EAGER_PROBE_INSPECTED.load(Ordering::Relaxed),
-            EAGER_PROBE_SUBMITTED.load(Ordering::Relaxed),
-            EAGER_PROBE_MAX_PER_RUN.load(Ordering::Relaxed),
-            EAGER_PROBE_REUSED.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Eager harvest ready: {}",
-            EAGER_HARVEST_READY.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Prefetch post-process promoted: {} harvest-promoted: {} already-resolved take: {}",
-            PREFETCH_POST_PROCESS_PROMOTED.load(Ordering::Relaxed),
-            PREFETCH_HARVEST_PROMOTED.load(Ordering::Relaxed),
-            PREFETCH_ALREADY_RESOLVED.load(Ordering::Relaxed),
-        );
-        // Unified-decoder migration counters (reimplement-isa-l):
-        //   handoff_window_grows ≈ num_worker_threads (one per thread, then
-        //     flat) PROVES the per-chunk `clean_window: Vec<u8>` alloc is gone.
-        //   resumable_fallback MUST be 0 with a 32 KiB window (no decline into
-        //     slow ResumableInflate2).
-        {
-            use crate::decompress::parallel::chunk_decode::{
-                BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, EXACT_BLOCK_CHUNKS,
-                EXACT_WRAPPER_CHUNKS, FINISHED_NO_FLIP_CHUNKS, FINISH_DECODE_ENTRIES,
-                FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS, INFLATE_WRAPPER_CHUNKS,
-                ISAL_BFINAL_EXACT_LANDING_ACCEPTED, ISAL_ENGINE_ORACLE_CHUNKS,
-                ISAL_ENGINE_ORACLE_FALLBACKS, ISAL_INEXACT_FALLBACKS, ISAL_UNTIL_EXACT_FALLBACKS,
-                SEEDED_BLOCK_CHUNKS, SEEDED_WRAPPER_CHUNKS, WINDOW_SEEDED_CHUNKS,
-            };
-            eprintln!(
-            "  Unified decoder: flip_to_clean={} finished_no_flip={} finish_decode={} inflate_wrapper={} window_seeded={} seeded_block={} seeded_wrapper={} exact_block={} exact_wrapper={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
-            FLIP_TO_CLEAN_CHUNKS.load(Ordering::Relaxed),
-            FINISHED_NO_FLIP_CHUNKS.load(Ordering::Relaxed),
-            FINISH_DECODE_ENTRIES.load(Ordering::Relaxed),
-            INFLATE_WRAPPER_CHUNKS.load(Ordering::Relaxed),
-            WINDOW_SEEDED_CHUNKS.load(Ordering::Relaxed),
-            SEEDED_BLOCK_CHUNKS.load(Ordering::Relaxed),
-            SEEDED_WRAPPER_CHUNKS.load(Ordering::Relaxed),
-            EXACT_BLOCK_CHUNKS.load(Ordering::Relaxed),
-            EXACT_WRAPPER_CHUNKS.load(Ordering::Relaxed),
-            BAD_SEED_RESYNC.load(Ordering::Relaxed),
-            BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
-            HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
-        );
-            // These counters are non-zero only under the GZIPPY_ISAL_ENGINE_ORACLE
-            // measurement knob (the pure-Rust engine is the sole production decode
-            // path). `isal_oracle_fallbacks` MUST be 0 — any non-zero means a clean tail
-            // fell back to pure-Rust (a counted correctness net, not a silent diverge).
-            eprintln!(
-                "  ISA-L clean-tail engine (production on gzippy-isal): isal_chunks={} isal_fallbacks={} bfinal_exact_accepted={} until_exact_fb={} inexact_fb={}",
-                ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed),
-                ISAL_ENGINE_ORACLE_FALLBACKS.load(Ordering::Relaxed),
-                ISAL_BFINAL_EXACT_LANDING_ACCEPTED.load(Ordering::Relaxed),
-                ISAL_UNTIL_EXACT_FALLBACKS.load(Ordering::Relaxed),
-                ISAL_INEXACT_FALLBACKS.load(Ordering::Relaxed),
-            );
-        }
-        // StoredParallel demotion counter: non-zero means a stored-prefix+Huffman-tail
-        // stream was routed back to ParallelSM because the stored prefix < 50% of output.
-        // A stored-dominated file (e.g. random100.gz with ~8% prefix) should show
-        // stored_demoted=1 per run; a pure-stored or >50% stored stream stays 0.
-        eprintln!(
-            "  StoredParallel demoted to ParallelSM (Huffman tail > 50% of output): {}",
-            crate::decompress::parallel::stored_split::STORED_DEMOTE_TO_PARALLEL_SM
-                .load(Ordering::Relaxed),
-        );
-        // Pure-stored chunked-streaming path: non-zero = the no-monolithic-buffer
-        // streaming path ran (Gate-0 non-inert witness; the 100 MB zero-init Vec
-        // is gone, runs stream straight from input → sink).
-        eprintln!(
-            "  StoredParallel pure-stored chunked-streaming runs (no monolithic buffer): {}",
-            crate::decompress::parallel::stored_split::STORED_STREAM_RUNS.load(Ordering::Relaxed),
-        );
-        // Window-sparsity effect counter: always 0 — keepIndex=false faithful port
-        // is the sole behavior now (the old always-on kill-switch was removed).
-        // Each count would be one 32 KiB getUsedWindowSymbols scan at chunk finalize.
-        eprintln!(
-            "  Window-sparsity decode runs (0=off=vendor-default, >0=kill-switch-active): {}",
-            crate::decompress::parallel::chunk_data::SPARSITY_DECODE_COUNT.load(Ordering::Relaxed),
-        );
-        use crate::decompress::parallel::chunk_buffer_pool::*;
-        eprintln!(
-            "  Max concurrently-live ChunkData (in-flight depth): {}  (live now: {})",
-            crate::decompress::parallel::chunk_data::MAX_LIVE_CHUNKS.load(Ordering::Relaxed),
-            crate::decompress::parallel::chunk_data::LIVE_CHUNKS.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Buffer pool u8: hits={} misses={} returns={}",
-            TAKE_U8_HITS.load(Ordering::Relaxed),
-            TAKE_U8_MISSES.load(Ordering::Relaxed),
-            RETURN_U8_CALLS.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Buffer pool u16: hits={} misses={} returns={}",
-            TAKE_U16_HITS.load(Ordering::Relaxed),
-            TAKE_U16_MISSES.load(Ordering::Relaxed),
-            RETURN_U16_CALLS.load(Ordering::Relaxed),
-        );
-        // Per-worker distribution — disambiguates "16 workers each
-        // cold-start" (first-touch dominance) vs "worker 0 is the
-        // hotspot" (consumer-thread-on-wrong-bucket).
-        // Shows only workers with any activity to keep the dump
-        // readable when MAX_WORKERS = 64.
-        eprintln!("  Per-worker buffer pool activity (worker: u8 h/m/r | u16 h/m/r):");
-        for i in 0..TAKE_U8_HITS_BY_WORKER.len() {
-            let u8h = TAKE_U8_HITS_BY_WORKER[i].load(Ordering::Relaxed);
-            let u8m = TAKE_U8_MISSES_BY_WORKER[i].load(Ordering::Relaxed);
-            let u8r = RETURN_U8_BY_WORKER[i].load(Ordering::Relaxed);
-            let u16h = TAKE_U16_HITS_BY_WORKER[i].load(Ordering::Relaxed);
-            let u16m = TAKE_U16_MISSES_BY_WORKER[i].load(Ordering::Relaxed);
-            let u16r = RETURN_U16_BY_WORKER[i].load(Ordering::Relaxed);
-            if u8h + u8m + u8r + u16h + u16m + u16r > 0 {
-                eprintln!(
-                    "    w{:>2}:  {}/{}/{}  |  {}/{}/{}",
-                    i, u8h, u8m, u8r, u16h, u16m, u16r
-                );
-            }
-        }
-        use crate::decompress::parallel::chunk_decode::{
-            BOOTSTRAP_OUTPUT_ALLOCS, BOOTSTRAP_OUTPUT_DROPPED, BOOTSTRAP_OUTPUT_RETURNS,
-            BOOTSTRAP_OUTPUT_REUSED_BYTES, BOOTSTRAP_OUTPUT_TAKES,
-        };
-        let takes = BOOTSTRAP_OUTPUT_TAKES.load(Ordering::Relaxed);
-        let allocs = BOOTSTRAP_OUTPUT_ALLOCS.load(Ordering::Relaxed);
-        let reuse_pct = if takes > 0 {
-            100.0 * (takes - allocs) as f64 / takes as f64
-        } else {
-            0.0
-        };
-        eprintln!(
-            "  Bootstrap pool: takes={} allocs={} returns={} dropped={} reused_MB={:.1} reuse_rate={:.1}%",
-            takes,
-            allocs,
-            BOOTSTRAP_OUTPUT_RETURNS.load(Ordering::Relaxed),
-            BOOTSTRAP_OUTPUT_DROPPED.load(Ordering::Relaxed),
-            BOOTSTRAP_OUTPUT_REUSED_BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
-            reuse_pct,
-        );
-        // Slow-path candidate iteration: ok + fail + no_candidate sum
-        // to the slow-path call count.
-        eprintln!(
-            "  Slow-path decode: ok={} fail={} no_candidate={}",
-            SLOW_PATH_FIRST_CANDIDATE_OK.load(Ordering::Relaxed),
-            SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
-            SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
-        );
-        // Out-of-sync confirmed-block skips (vendor GzipChunkFetcher.hpp:411-427
-        // throws std::logic_error; gzippy skips silently and counts here).
-        eprintln!(
-            "  Stale confirmed-block skips: {}",
-            STALE_CONFIRMED_BLOCK_SKIP.load(Ordering::Relaxed),
-        );
-        // Early window publish: did the worker publish provably-clean
-        // tail windows off the consumer's serial path (the lever)? A high
-        // `published` count with `range_speculative` accounting for the
-        // rest is the success signal; `tail_not_clean` are chunks that
-        // fell back to the consumer's serial `get_last_window_vec(pred)`.
-        eprintln!(
-            "  Early window publish: published={} handoff_key={} tail_not_clean={} range_speculative={}",
-            EARLY_WINDOW_PUBLISHED.load(Ordering::Relaxed),
-            HANDOFF_WINDOW_PUBLISHED.load(Ordering::Relaxed),
-            EARLY_WINDOW_TAIL_NOT_CLEAN.load(Ordering::Relaxed),
-            EARLY_WINDOW_RANGE_SPECULATIVE.load(Ordering::Relaxed),
-        );
-        // V6: Was the boundary search (scoped BlockFinder spawn) needed
-        // for most slow-path decodes, or did the first-candidate try
-        // win without it? If runs == ok_count, every slow-path needed
-        // a search; if runs << ok_count, the partition seed was usually
-        // a real block boundary.
-        eprintln!(
-            "  BlockFinder coordinator spawns: {}",
-            COORDINATOR_BOUNDARY_SEARCH_RUNS.load(Ordering::Relaxed),
-        );
-        // V1: Speculative-decode failure breakdown — picks Design 1
-        // (precode pre-pass) vs Design 3 (coordinator amortization)
-        // vs Design 4 (boundary-confirmed speculation).
-        eprintln!(
-            "  Speculation failure modes: header={} body={} inflate={} stop_missed={} other={}",
-            SPEC_FAIL_HEADER.load(Ordering::Relaxed),
-            SPEC_FAIL_BODY.load(Ordering::Relaxed),
-            SPEC_FAIL_INFLATE.load(Ordering::Relaxed),
-            SPEC_FAIL_STOP_MISSED.load(Ordering::Relaxed),
-            SPEC_FAIL_OTHER.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Speculation phantom-EOS rejects: {}",
-            SPECULATIVE_PHANTOM_EOS_REJECTS.load(Ordering::Relaxed),
-        );
-        // Post-process path mix: tells us if the AVX2 narrow re-enable
-        // is bench-relevant for this fixture. Small-markers path is the
-        // only one that calls `narrow_u16_to_u8`.
-        eprintln!(
-            "  Post-process path: fused_lut={} small_markers={}",
-            POST_PROCESS_FUSED_PATH.load(Ordering::Relaxed),
-            POST_PROCESS_SMALL_MARKERS_PATH.load(Ordering::Relaxed),
-        );
-        // Prefetch dispatcher outcomes: disambiguates worker idleness.
-        // If `called` is high but `saturated` + `zero_submitted` together
-        // dominate, dispatch is firing but the gates short-circuit it.
-        // If `called` is low, the dispatcher just isn't being invoked
-        // often enough — and the fix is hoisting the call site.
-        use crate::decompress::parallel::block_fetcher::{
-            PREFETCH_CACHE_POLLUTION_STOPS, PREFETCH_NEW_BLOCKS_CALLED, PREFETCH_RETURN_SATURATED,
-            PREFETCH_RETURN_SUBMITTED_ANY, PREFETCH_RETURN_ZERO_SUBMITTED,
-            PREFETCH_TOTAL_SUBMITTED,
-        };
-        eprintln!(
-            "  Prefetch dispatch: called={} saturated={} zero_submitted={} any_submitted={} total_submitted={} pollution_stops={}",
-            PREFETCH_NEW_BLOCKS_CALLED.load(Ordering::Relaxed),
-            PREFETCH_RETURN_SATURATED.load(Ordering::Relaxed),
-            PREFETCH_RETURN_ZERO_SUBMITTED.load(Ordering::Relaxed),
-            PREFETCH_RETURN_SUBMITTED_ANY.load(Ordering::Relaxed),
-            PREFETCH_TOTAL_SUBMITTED.load(Ordering::Relaxed),
-            PREFETCH_CACHE_POLLUTION_STOPS.load(Ordering::Relaxed),
-        );
-        // Body-failure forensic detail — speculation-accuracy attack.
-        // After disprove-advisor confirmed body failures are the dominant
-        // re-decode cost, characterize them by error variant + waste size.
-        use crate::decompress::parallel::chunk_decode as gc;
-        let body_count = gc::BODY_FAIL_COUNT.load(Ordering::Relaxed);
-        let body_wasted = gc::BODY_FAIL_BYTES_WASTED.load(Ordering::Relaxed);
-        let body_bits = gc::BODY_FAIL_BITS_INTO_BODY.load(Ordering::Relaxed);
-        let avg_waste = if body_count > 0 {
-            body_wasted as f64 / body_count as f64
-        } else {
-            0.0
-        };
-        let avg_bits = if body_count > 0 {
-            body_bits as f64 / body_count as f64
-        } else {
-            0.0
-        };
-        eprintln!(
-            "  Body-fail forensics: count={body_count} wasted_bytes={body_wasted} avg_waste={avg_waste:.0}B avg_bits_into_body={avg_bits:.0}",
-        );
-        eprintln!(
-            "    by variant: invalid_huffman={} exceeded_window={} invalid_compression={} invalid_code_lengths={} other={}",
-            gc::BODY_FAIL_INVALID_HUFFMAN.load(Ordering::Relaxed),
-            gc::BODY_FAIL_EXCEEDED_WINDOW.load(Ordering::Relaxed),
-            gc::BODY_FAIL_INVALID_COMPRESSION.load(Ordering::Relaxed),
-            gc::BODY_FAIL_INVALID_CODE_LENGTHS.load(Ordering::Relaxed),
-            gc::BODY_FAIL_OTHER_VARIANT.load(Ordering::Relaxed),
-        );
-        // B: BlockFinder per-spawn breakdown — scan vs consumer time.
-        use crate::decompress::parallel::async_block_finder as rbf;
-        let bf_calls = rbf::BOUNDARY_SEARCH_CALLS.load(Ordering::Relaxed);
-        let bf_total = rbf::BOUNDARY_SEARCH_TOTAL_US.load(Ordering::Relaxed);
-        let bf_scan = rbf::BOUNDARY_SEARCH_SCAN_US.load(Ordering::Relaxed);
-        let bf_consumer = rbf::CONSUMER_TIME_US.load(Ordering::Relaxed);
-        eprintln!(
-            "  BlockFinder spawn breakdown: calls={bf_calls} total_ms={:.1} scan_ms={:.1} consumer_ms={:.1} avg_total_us={}",
-            bf_total as f64 / 1000.0,
-            bf_scan as f64 / 1000.0,
-            bf_consumer as f64 / 1000.0,
-            if bf_calls > 0 { bf_total / bf_calls } else { 0 },
-        );
-        // C: bootstrap per-block header vs body cost.
-        let bs_h_us = gc::BOOTSTRAP_HEADER_US.load(Ordering::Relaxed);
-        let bs_h_calls = gc::BOOTSTRAP_HEADER_CALLS.load(Ordering::Relaxed);
-        let bs_b_us = gc::BOOTSTRAP_BODY_US.load(Ordering::Relaxed);
-        let bs_b_bytes = gc::BOOTSTRAP_BODY_BYTES.load(Ordering::Relaxed);
-        let bs_h_avg = if bs_h_calls > 0 {
-            bs_h_us as f64 / bs_h_calls as f64
-        } else {
-            0.0
-        };
-        let bs_b_rate = if bs_b_us > 0 {
-            (bs_b_bytes as f64) / (bs_b_us as f64)
-        } else {
-            0.0
-        };
-        let bs_clean_flipped = gc::BOOTSTRAP_CLEAN_FLIPPED_BYTES.load(Ordering::Relaxed);
-        let clean_flipped_pct = if bs_b_bytes > 0 {
-            100.0 * bs_clean_flipped as f64 / bs_b_bytes as f64
-        } else {
-            0.0
-        };
-        eprintln!(
-            "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0} clean_flipped_bytes={bs_clean_flipped} ({clean_flipped_pct:.1}% of body = marker-FREE complement; marker loop owns the other {:.1}%)",
-            bs_h_us as f64 / 1000.0,
-            bs_h_avg,
-            bs_b_us as f64 / 1000.0,
-            bs_b_rate,
-            100.0 - clean_flipped_pct,
-        );
-        // Per-fetch rejection cause: a prefetched chunk arrived but the
-        // safety guard rejected it (chain invariant broken —
-        // chunk.max != next_block_offset).
-        eprintln!(
-            "  Prefetch guard-rejects: {}",
-            PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Clean decode (pred@key / pred@seed / handoff@stop / boundary@seed / candidate): {} / {} / {} / {} / {}",
-            CLEAN_DECODE_VIA_PRED_KEY.load(Ordering::Relaxed),
-            CLEAN_DECODE_VIA_PREDECESSOR.load(Ordering::Relaxed),
-            HANDOFF_DECODE_CLEAN_OK.load(Ordering::Relaxed),
-            SPEC_PRED_BOUNDARY_CLEAN.load(Ordering::Relaxed),
-            SPEC_DECODE_CLEAN_OK.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Worker resolve-ahead: ok={} / attempts={}",
-            RESOLVE_AHEAD_OK.load(Ordering::Relaxed),
-            RESOLVE_AHEAD_ATTEMPTS.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Arc::try_unwrap hits/misses: {} / {}",
-            ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
-            ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "  Consumer pair-ready drains: {}",
-            DRAIN_READY_IMMEDIATE.load(Ordering::Relaxed),
-        );
-    }
 
     Ok((total_crc.crc32(), total_size))
 }
@@ -1556,7 +1163,6 @@ fn consumer_loop<W: std::io::Write>(
                 } else {
                     // Vendor GzipChunkFetcher.hpp:646-648 — partition-keyed
                     // prefetch present but `!matchesEncodedOffset(blockOffset)`.
-                    PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // If !matches OR the safety guard rejected, the Arc
                 // is dropped here (vendor "throws away" the
@@ -1664,27 +1270,19 @@ fn consumer_loop<W: std::io::Write>(
         // (borrow the `Arc` through window publish, `recv` at dispatch).
         let chunk_holder = {
             match Arc::try_unwrap(chunk_arc) {
-                Ok(shared) => {
-                    ARC_TRY_UNWRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ConsumerChunkHold::Owned(SharedChunkData::into_inner(shared))
-                }
+                Ok(shared) => ConsumerChunkHold::Owned(SharedChunkData::into_inner(shared)),
                 Err(arc) => {
                     let real_offset = arc.encoded_offset_bits;
                     let resolved_pred_matches = arc.markers_resolved
                         && confirmed_predecessor_window(window_map, decode_start)
                             .map(|(pred_key, _)| arc.resolved_pred_key == Some(pred_key))
                             .unwrap_or(false);
-                    if resolved_pred_matches {
-                        use std::sync::atomic::Ordering;
-                        PREFETCH_ALREADY_RESOLVED.fetch_add(1, Ordering::Relaxed);
-                    }
                     if resolved_pred_matches
                         || prefetch_post_inflight.contains_key(&real_offset)
                         || eager_completed.contains_key(&real_offset)
                     {
                         ConsumerChunkHold::Deferred { arc }
                     } else {
-                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ConsumerChunkHold::Owned(SharedChunkData::take_or_clone(arc))
                     }
                 }
@@ -1873,22 +1471,14 @@ fn consumer_loop<W: std::io::Write>(
                     && !chunk.data_with_markers.is_empty()
                     && !chunk.markers_resolved
                 {
-                    use std::sync::atomic::Ordering;
                     let reuse = match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
                         Some((eager_pred_key, _, eager_rx))
                             if consumer_pred_key == Some(eager_pred_key) =>
                         {
-                            EAGER_PROBE_REUSED.fetch_add(1, Ordering::Relaxed);
                             Some(eager_rx)
                         }
-                        Some(_) => {
-                            EAGER_PROBE_REUSE_PRED_MISMATCH.fetch_add(1, Ordering::Relaxed);
-                            None
-                        }
-                        None => {
-                            EAGER_PROBE_REUSE_KEY_ABSENT.fetch_add(1, Ordering::Relaxed);
-                            None
-                        }
+                        Some(_) => None,
+                        None => None,
                     };
                     let overlap = Some((
                         block_fetcher,
@@ -1926,24 +1516,6 @@ fn consumer_loop<W: std::io::Write>(
                 unsplit_blocks,
             );
             next_unprocessed_block_index += inserted;
-            // Out-of-sync detection — vendor GzipChunkFetcher.hpp:411-427.
-            // rapidgzip throws std::logic_error when
-            //   block_finder->get(next_unprocessed_block_index) != blockOffsetAfterNext
-            // (where blockOffsetAfterNext = chunk.encoded_offset_bits + chunk.encoded_size_bits).
-            // gzippy diverges: the skip guard above handles confirmed false-positives
-            // silently rather than aborting.  Here we detect the out-of-sync condition
-            // and count it for diagnostics: a non-zero STALE_CONFIRMED_BLOCK_SKIP means
-            // a confirmed entry fell behind the decode frontier (subchunk
-            // insertion around a raw-finder false-positive region — NOT a
-            // GzipBlockFinder scan; that component has no scanner. See the
-            // record-correction note on STALE_CONFIRMED_BLOCK_SKIP and 98fd618c).
-            {
-                use std::sync::atomic::Ordering;
-                let (got_next, _) = block_finder.get(next_unprocessed_block_index);
-                if !block_finder.finalized() && got_next != Some(chunk_end_bit) {
-                    STALE_CONFIRMED_BLOCK_SKIP.fetch_add(1, Ordering::Relaxed);
-                }
-            }
             pending.push_back(PendingWrite::Ready {
                 idx: partition_idx_for_trace,
                 chunk,
@@ -2484,7 +2056,6 @@ fn resolve_chunk_markers_on_chunk(
         // resolve+narrow pass (byte-exact, universal, strict work reduction):
         // each segment's narrowed bytes are CRC'd while hot in cache instead of
         // re-read in a separate `update_narrowed_crc` whole-buffer pass.
-        POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         chunk.resolve_and_narrow_markers_in_place_crc(predecessor_window);
     }
     // CRC folded above for the marker path; when `dwm_len_pre == 0` there are no
@@ -2559,7 +2130,6 @@ fn publish_end_window_before_post_process(
     chunk: &ChunkData,
     predecessor_window: &[u8],
 ) {
-    use std::sync::atomic::Ordering;
     if chunk.encoded_size_bits == 0 {
         return;
     }
@@ -2573,7 +2143,6 @@ fn publish_end_window_before_post_process(
         let end_window = chunk.get_last_window_vec(predecessor_window);
         window_map.insert_owned_none(window_offset, end_window);
     }
-    EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Vendor `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
@@ -2588,11 +2157,8 @@ fn queue_prefetched_marker_postprocess(
     skip_real_offsets: &[usize],
     skip_cache_keys: &[usize],
 ) -> usize {
-    use std::sync::atomic::Ordering;
-    EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
     block_fetcher.process_ready_prefetches();
     let contents = block_fetcher.prefetch_cache_contents_sorted();
-    let n_inspected = contents.len();
     let mut submitted = 0usize;
     for (cache_key, arc) in contents {
         if skip_cache_keys.contains(&cache_key) {
@@ -2626,13 +2192,11 @@ fn queue_prefetched_marker_postprocess(
         // attempt per chunk entering the predecessor lookup; the eligibility gate
         // above (`chunk_may_resolve_markers_early`) pre-screens window presence, so OK
         // tracks ATTEMPTS, but both are now LIVE on the production resolve-ahead path.
-        RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         let Some((pred_key, predecessor_window)) =
             confirmed_predecessor_window(window_map, handoff_bit)
         else {
             continue;
         };
-        RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
         // Vendor queueChunkForPostProcessing:557-575 — publish end-window on
         // caller thread before pool applyWindow (marker chunks included).
         let pred_bytes = materialize_window(&predecessor_window);
@@ -2646,16 +2210,8 @@ fn queue_prefetched_marker_postprocess(
             predecessor_window,
         );
         in_flight.insert(real_offset, (pred_key, cache_key, rx));
-        // F1 instrument: resolve-ahead submitted ahead-work for this chunk (beside the
-        // batch EAGER_PROBE_SUBMITTED below).
-        HANDOFF_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+        // resolve-ahead submitted ahead-work for this chunk.
         submitted += 1;
-    }
-    EAGER_PROBE_INSPECTED.fetch_add(n_inspected as u64, Ordering::Relaxed);
-    EAGER_PROBE_SUBMITTED.fetch_add(submitted as u64, Ordering::Relaxed);
-    if submitted > 0 {
-        EAGER_PROBE_RUNS_NONEMPTY.fetch_add(1, Ordering::Relaxed);
-        EAGER_PROBE_MAX_PER_RUN.fetch_max(submitted as u64, Ordering::Relaxed);
     }
     submitted
 }
@@ -2838,26 +2394,6 @@ fn publish_subchunk_windows(window_map: &WindowMap, chunk: &ChunkData) {
 
 // ── Slow-path decoder (tryToDecode + BlockFinder iteration) ──────────────
 
-/// Diagnostic counters for slow-path candidate iteration, surfaced in
-/// `--verbose` stats: `NO_CANDIDATE` (no boundary found in the search
-/// window) and the first-candidate trial-decode outcomes `OK` / `FAIL`.
-pub static SLOW_PATH_NO_CANDIDATE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static SLOW_PATH_FIRST_CANDIDATE_OK: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Incremented when the slow-path boundary search uses the async
-/// `RawBlockFinderCoordinator` (StreamedResults + single finder thread).
-/// Proves production routes through the coordinator — see deletion-trap
-/// test in `src/tests/routing.rs`.
-pub static SPEC_FAIL_HEADER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SPEC_FAIL_BODY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SPEC_FAIL_INFLATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SPEC_FAIL_STOP_MISSED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static SPEC_FAIL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Counter: speculative candidates rejected because the DEFLATE stream ended at a
 /// BFINAL block mid-input and the bytes after the gzip footer (8 bytes: CRC32 + ISIZE)
 /// are not EOF and do not start with valid gzip magic (0x1f 0x8b).
@@ -2874,93 +2410,7 @@ pub static SPEC_FAIL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static SPECULATIVE_PHANTOM_EOS_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Early-window-publish telemetry (run_decode_task). PUBLISHED: worker
-/// published a provably-clean 32 KiB tail at chunk_end_bit, off the
-/// consumer's serial path. TAIL_NOT_CLEAN: chunk had an exact confirmed
-/// start but its trailing 32 KiB straddled markers (falls back to the
-/// consumer's serial `get_last_window_vec(pred)` publish).
-/// RANGE_SPECULATIVE: chunk decoded over a speculative start RANGE
-/// (`max > encoded`) so its end is not yet authoritative — never early-
-/// published (the consumer publishes it after accept + set_encoded_offset).
-pub static EARLY_WINDOW_PUBLISHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static EARLY_WINDOW_TAIL_NOT_CLEAN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static EARLY_WINDOW_RANGE_SPECULATIVE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Worker published a confirmed window at `max_acceptable_start_bit` (handoff key).
-pub static HANDOFF_WINDOW_PUBLISHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Worker resolve-ahead: attempts / successes.
-pub static RESOLVE_AHEAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static RESOLVE_AHEAD_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Vendor queueChunkForPostProcessing eager end-window publishes on the consumer
-/// (the window-chain propagation that lets prefetched chunks resolve in parallel).
-/// Chunks drained immediately when the FIFO head is `Ready` (post-process
-/// complete) instead of waiting for `pending.len() > pool_size`. Returns
-/// decode buffers to the warm pool sooner — vendor writes each chunk as
-/// soon as its future completes rather than batching behind the cap.
-pub static DRAIN_READY_IMMEDIATE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Bumps once per consumer iter where the partition-keyed
-/// `try_take_prefetched` returned a chunk but the safety guard
-/// rejected it (mismatch between `chunk.max_acceptable_start_bit` and
-/// consumer-requested `next_block_offset`) — distinct from
-/// `prefetch_cache_miss`, which counts a prefetch being absent.
-/// Worker took the clean `decode_chunk` path using
-/// `WindowMap::get_predecessor` (predecessor published at prior chunk end,
-/// not at this chunk's partition seed).
-pub static CLEAN_DECODE_VIA_PREDECESSOR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Design H′: clean decode starting at confirmed `pred_key` before partition seed.
-pub static CLEAN_DECODE_VIA_PRED_KEY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Speculative partition prefetch: clean `decode_chunk` at the handoff key
-/// (`get_predecessor(stop_hint)`), not at the partition seed.
-pub static HANDOFF_DECODE_CLEAN_OK: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// KEY-MISMATCH oracle: clean decode at partition seed using predecessor tail,
-/// accepting a real boundary inside the partition (Fulcrum causal perturbation).
-pub static SPEC_PRED_BOUNDARY_CLEAN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// `try_speculative_decode_candidate` skipped marker bootstrap via clean
-/// `decode_chunk` at a real boundary with the predecessor dict.
-pub static SPEC_DECODE_CLEAN_OK: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Count of post-process tasks that took the fused
-/// `replace_markers_lut_narrow` path (markers ≥ 128 KiB, 32 KiB window).
-pub static POST_PROCESS_FUSED_PATH: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Count of post-process tasks that took the small-markers path
-/// (`apply_window` + separate `narrow_u16_to_u8`). This is the path
-/// that benefits from the AVX2 narrow re-enable. If this is ~0 on
-/// silesia bench-sm, the AVX2-narrow change is benchmark-invisible
-/// for that fixture (but may still help BGZF / small-marker workloads).
-pub static POST_PROCESS_SMALL_MARKERS_PATH: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Lever G diagnostic: counts how often the consumer's
-/// `Arc::try_unwrap(chunk_arc)` actually succeeded (HITS) vs fell back
-/// to a deep clone (MISSES). Goal: HITS == chunk count, MISSES == 0.
-pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Deferred borrow finished via in-flight post-process `recv` at dispatch.
-pub static ARC_DEFERRED_INFLIGHT_RECV: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Eager post-process bookkeeping: maps a prefetched chunk's real
@@ -2980,7 +2430,6 @@ type EagerCompleted = std::collections::HashMap<usize, usize>;
 /// futures without blocking the consumer on non-head chunks.
 #[cfg(parallel_sm)]
 fn harvest_ready_postprocess(in_flight: &mut EagerSubmitted, completed: &mut EagerCompleted) {
-    use std::sync::atomic::Ordering;
     use std::sync::mpsc::TryRecvError;
     let offsets: Vec<usize> = in_flight.keys().copied().collect();
     for offset in offsets {
@@ -2990,7 +2439,6 @@ fn harvest_ready_postprocess(in_flight: &mut EagerSubmitted, completed: &mut Eag
         match rx.try_recv() {
             Ok(()) => {
                 completed.insert(offset, pred_key);
-                EAGER_HARVEST_READY.fetch_add(1, Ordering::Relaxed);
             }
             Err(TryRecvError::Empty) => {
                 in_flight.insert(offset, (pred_key, cache_key, rx));
@@ -3097,35 +2545,20 @@ impl ConsumerChunkHold {
                 }
                 if let Some(eager_pred_key) = completed.remove(&real_offset) {
                     if pred_key == Some(eager_pred_key) {
-                        EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return (SharedChunkData::take_or_clone(arc), true);
                     }
                     completed.insert(real_offset, eager_pred_key);
                 }
                 match inflight.remove(&real_offset) {
                     Some((eager_pred_key, _, rx)) if pred_key == Some(eager_pred_key) => {
-                        ARC_DEFERRED_INFLIGHT_RECV
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if rx.recv().is_err() {
-                            ARC_TRY_UNWRAP_MISSES
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        let _ = rx.recv();
                         (SharedChunkData::take_or_clone(arc), true)
                     }
                     Some((eager_pred_key, cache_key, rx)) => {
-                        EAGER_PROBE_REUSE_PRED_MISMATCH
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         inflight.insert(real_offset, (eager_pred_key, cache_key, rx));
-                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         (SharedChunkData::take_or_clone(arc), false)
                     }
-                    None => {
-                        EAGER_PROBE_REUSE_KEY_ABSENT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        (SharedChunkData::take_or_clone(arc), false)
-                    }
+                    None => (SharedChunkData::take_or_clone(arc), false),
                 }
             }
         }
@@ -3142,48 +2575,6 @@ impl ConsumerChunkHold {
 // it found 0 ready successors. We MUST distinguish "the lever works"
 // (many eager submits) from "the cache is empty during the stall" (the
 // real lever is prefetch DEPTH, not eagerness).
-/// How many times the eager probe ran (once per stall iteration where it
-/// was invoked).
-pub static EAGER_PROBE_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Total prefetched-cache chunks the probe inspected across all runs.
-pub static EAGER_PROBE_INSPECTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Total eager post-process tasks the probe actually submitted (ready
-/// successors: had markers + a published predecessor window + not yet
-/// submitted). This is THE number that tells us whether the lever fires.
-pub static EAGER_PROBE_SUBMITTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Probe runs that submitted at least one eager task (so we can report
-/// "N of M stalls found ready successors").
-pub static EAGER_PROBE_RUNS_NONEMPTY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Max ready successors found in a single probe run (per-stall peak).
-pub static EAGER_PROBE_MAX_PER_RUN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Eager-submitted results the consumer actually reused (vs. submitted
-/// but never consumed — e.g. evicted before the consumer reached them).
-pub static EAGER_PROBE_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Consumer reached a markered chunk but found NO eager entry under its
-/// pre-set offset key (the eager probe keyed it differently, or it was
-/// never eagerly submitted).
-pub static EAGER_PROBE_REUSE_KEY_ABSENT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Consumer found an eager entry but its predecessor-window key did not
-/// match the consumer's (would have changed bytes — correctly rejected).
-pub static EAGER_PROBE_REUSE_PRED_MISMATCH: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Non-blocking harvest of ready eager post-process futures (vendor :497-511).
-pub static EAGER_HARVEST_READY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Pool post-process promoted resolved chunk into prefetch cache (vendor
-/// `hasBeenPostProcessed` in-place mutation equivalent).
-pub static PREFETCH_POST_PROCESS_PROMOTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Harvest path promoted a ready eager future into the prefetch cache.
-pub static PREFETCH_HARVEST_PROMOTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Consumer took an already-resolved prefetched `Arc` (no dispatch needed).
-pub static PREFETCH_ALREADY_RESOLVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`,
 /// GzipChunk.hpp:712-734): always `decodeChunkWithRapidgzip` with
@@ -3201,43 +2592,7 @@ fn try_speculative_decode_candidate(
     configuration: ChunkConfiguration,
     _window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    let result = decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration);
-    // V1: classify failures so we know which fix to attack.
-    //   header_fail  → "deflate header at bit X" — could be caught by
-    //                  precode pre-pass (CountAllocatedLeaves port)
-    //   body_fail    → "deflate body at bit X" — mid-stream Huffman
-    //                  decode failed; precode wouldn't catch it
-    //   inflate_fail → phase-2 StreamingInflateWrapper / ResumableInflate2
-    //   stop_missed  → chunk size cap hit (not really a "failure")
-    if let Err(ref e) = result {
-        use std::sync::atomic::Ordering;
-        match e {
-            ChunkDecodeError::BootstrapFailed(io_err) => {
-                let msg = io_err.to_string();
-                if msg.contains("deflate header") {
-                    SPEC_FAIL_HEADER.fetch_add(1, Ordering::Relaxed);
-                } else if msg.contains("deflate body") {
-                    SPEC_FAIL_BODY.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            ChunkDecodeError::InflateFailed(_) => {
-                SPEC_FAIL_INFLATE.fetch_add(1, Ordering::Relaxed);
-            }
-            ChunkDecodeError::ExactStopMissed { .. } => {
-                SPEC_FAIL_STOP_MISSED.fetch_add(1, Ordering::Relaxed);
-            }
-            ChunkDecodeError::OutputCeilingExceeded { .. } => {
-                SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
-            }
-            ChunkDecodeError::UnsupportedPlatform => {
-                SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
-            }
-        };
-        return result;
-    }
-    let mut chunk = result?;
+    let mut chunk = decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)?;
     // (Design B) Record the encoded bit the worker decoded byte 0 from.
     // `decode_chunk_window_absent` anchored the chunk at `decode_start`
     // (`offset.second`), so that is the true origin regardless of the
@@ -3370,7 +2725,6 @@ fn speculative_decode_find_boundary(
             configuration,
             window_map,
         ) {
-            SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(chunk);
         }
     }
@@ -3405,24 +2759,15 @@ fn speculative_decode_find_boundary(
             // single bit position the scan flagged as a valid block
             // candidate. Matched on vendor side by the trace patch
             // around each tryToDecode call inside the alternating loop.
-            match try_speculative_decode_candidate(
+            try_speculative_decode_candidate(
                 input,
                 candidate.seek_bit,
                 candidate.bit_offset,
                 stop_hint_bit,
                 configuration,
                 window_map,
-            ) {
-                Ok(chunk) => {
-                    SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(chunk)
-                }
-                Err(_) => {
-                    SLOW_PATH_FIRST_CANDIDATE_FAIL
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    None
-                }
-            }
+            )
+            .ok()
         },
     ) {
         return Ok(chunk);
@@ -3449,13 +2794,11 @@ fn speculative_decode_find_boundary(
                 configuration,
                 window_map,
             ) {
-                SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(chunk);
             }
         }
     }
 
-    SLOW_PATH_NO_CANDIDATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Err(ChunkDecodeError::ExactStopMissed {
         requested: start_bit,
         actual: max_end,
@@ -3528,13 +2871,13 @@ impl RecycleDeferral {
 /// Release a just-written chunk's decoded buffers to the allocator immediately
 /// (peak-RSS reduction). The chunk's output has already been synchronously
 /// written and its window published, so the buffers are dead (see
-/// `ChunkData::free_decoded_buffers`). `chunk` drops at end of scope, so
-/// `LIVE_CHUNKS` decrements now instead of after the 2-chunk deferral hold —
+/// `ChunkData::free_decoded_buffers`). `chunk` drops at end of scope,
+/// releasing it now instead of after the 2-chunk deferral hold —
 /// lowering both peak resident bytes AND peak live-ChunkData depth.
 #[cfg(parallel_sm)]
 fn release_written_chunk(mut chunk: ChunkData) {
     chunk.free_decoded_buffers();
-    // chunk drops here → LIVE_CHUNKS -= 1, backing Vecs already freed.
+    // chunk drops here, backing Vecs already freed.
 }
 
 /// Drain consecutive `Ready` entries at the FIFO head when two or more
@@ -3559,14 +2902,12 @@ fn drain_ready_pending_heads<W: std::io::Write>(
     eager_completed: &mut EagerCompleted,
     recycle_deferral: &mut RecycleDeferral,
 ) -> Result<(), FetchError> {
-    use std::sync::atomic::Ordering;
     let debug_lone = recycle_deferral.drain_lone;
     while matches!(pending.front(), Some(PendingWrite::Ready { .. }))
         && (debug_lone
             || pending.len() >= 2
             || matches!(pending.get(1), Some(PendingWrite::Async { .. })))
     {
-        DRAIN_READY_IMMEDIATE.fetch_add(1, Ordering::Relaxed);
         drain_one_pending(
             pending,
             window_map,

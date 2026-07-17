@@ -693,8 +693,6 @@ where
         F: Fn(usize) -> bool,
         PO: Fn(&Key) -> Key,
     {
-        PREFETCH_NEW_BLOCKS_CALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         // BlockFetcher.hpp:463 — processReadyPrefetches() before new dispatch.
         self.process_ready_prefetches();
 
@@ -707,7 +705,6 @@ where
         let thread_pool_saturated = || self.prefetching_len() + 1 >= self.parallelization;
 
         if thread_pool_saturated() {
-            PREFETCH_RETURN_SATURATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return 0;
         }
 
@@ -819,8 +816,6 @@ where
                 .next_nth_eviction(self.prefetching_len() + 1)
             {
                 if block_offsets_to_prefetch.contains(&offset_to_be_evicted) {
-                    PREFETCH_CACHE_POLLUTION_STOPS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
             }
@@ -845,13 +840,6 @@ where
             submitted += 1;
         }
 
-        if submitted == 0 {
-            PREFETCH_RETURN_ZERO_SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            PREFETCH_TOTAL_SUBMITTED
-                .fetch_add(submitted as u64, std::sync::atomic::Ordering::Relaxed);
-            PREFETCH_RETURN_SUBMITTED_ANY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         submitted
     }
 
@@ -971,27 +959,6 @@ where
         self.prefetching.lock().unwrap().len()
     }
 }
-
-/// Counters for `prefetch_new_blocks` outcomes — surfaced in
-/// `--verbose` stats. Used to disambiguate "workers idle because
-/// dispatch wasn't called" vs "dispatch was called but no-op'd because
-/// the pool was already saturated / no indexes to submit".
-pub static PREFETCH_NEW_BLOCKS_CALLED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static PREFETCH_RETURN_SATURATED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static PREFETCH_RETURN_ZERO_SUBMITTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static PREFETCH_RETURN_SUBMITTED_ANY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static PREFETCH_TOTAL_SUBMITTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Counts firings of the vendor cache-pollution stop (BlockFetcher.hpp:544-551):
-/// a prefetch refused because submitting it would evict a block we intend to
-/// prefetch. Non-zero ⇒ the admission control is live (falsifier check for
-/// Divergence #4). See git history (campaign plan, removed).
-pub static PREFETCH_CACHE_POLLUTION_STOPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
