@@ -365,7 +365,6 @@ pub fn take_marker_segment() -> U16 {
         let idx = pool_index_for_take();
         if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
             if let Some(mut v) = pool.pop() {
-                MARKER_SEG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 v.clear();
                 if v.capacity() < MARKER_SEGMENT_ELEMENTS {
                     v.reserve(MARKER_SEGMENT_ELEMENTS - v.capacity());
@@ -373,7 +372,6 @@ pub fn take_marker_segment() -> U16 {
                 return v;
             }
         }
-        MARKER_SEG_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     types::u16_with_capacity(MARKER_SEGMENT_ELEMENTS)
 }
@@ -409,9 +407,6 @@ pub fn return_marker_segments_to_worker(owner_worker: usize, segments: Vec<U16>)
         }
     }
 }
-
-pub static MARKER_SEG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static MARKER_SEG_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static TAKE_U8_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TAKE_U8_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

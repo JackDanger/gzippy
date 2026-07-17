@@ -105,18 +105,6 @@ pure-rust-inflate = ["rpmalloc-caches", "asm-kernel"]
 # SHIP gate + §10 flip preconditions (T1 silesia -19.2% vs base, byte-exact,
 # asm_frac 0.998); the kill-switch and the BMI2 runtime fallback stay.
 asm-kernel = []
-# ── Profiling-only: RDTSC sub-step timing of the per-block Huffman LUT build
-# (rebuild_from_multisym / make_inflate_huff_code_lit_len). NEVER used for the
-# abmeasure gate (adds rdtsc+atomic adds per block); purely to LOCATE the
-# expensive build sub-step. Dump via `gzippy::decompress::parallel::lut_huffman::
-# dump_rebuild_profile()`.
-profile-rebuild = []
-# ── Data-flow instrument: count per-block lut_huffman litlen BUILDS vs READS
-# (decode/decode_prefilled). Proves whether the engine-B `lut_litlen` table is
-# READ on a given arch's clean-decode path or built-then-discarded. Zero overhead
-# unless this feature is on (relaxed atomics + a report() at process exit). Dump:
-# set GZIPPY_LUT_COUNT=1; counters print at end of run. See lut_huffman::litlen_count.
-lut-count = []
 # ── Phase-2 two-path decode (2026-06-06) ──────────────────────────────────────
 # gzippy-native (intended DEFAULT production once parallel-module lint debt is
 # cleared): ONE unified pure-Rust decode engine, NO C-FFI in the DECODE graph, on

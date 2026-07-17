@@ -116,11 +116,6 @@ pub static BOOTSTRAP_CLEAN_FLIPPED_BYTES: std::sync::atomic::AtomicU64 =
 /// `contains_marker_bytes` flips false — rapidgzip-shaped single output stream.
 pub static UNIFIED_ROUTE_CLEAN_U8_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub static UNIFIED_MODE_CLEAN_FLIPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Clean tail stayed on bulk LUT across a 128 KiB segment boundary (P2 unified).
-pub static BULK_TAIL_SEGMENT_CONTINUES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 /// Bulk LUT declined; tail used ResumableInflate2 (should be rare with 32 KiB window).
 pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -291,21 +286,6 @@ pub static FLIP_TO_CLEAN_CHUNKS: std::sync::atomic::AtomicU64 =
 /// Chunks that finished WITHOUT a flip (BFINAL or stop-hint reached before 32 KiB
 /// of clean output accumulated) — the whole decoded body stayed u16 markers.
 pub static FINISHED_NO_FLIP_CHUNKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// `resumable_resync` bulk loop saw `Handoff` with no bit advance (stall guard).
-#[cfg(pure_inflate_decode)]
-pub static BULK_HANDOFF_NO_PROGRESS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Why [`finish_decode_chunk_bulk_lut`] returned [`BulkCleanTailResult::Decline`].
-#[cfg(pure_inflate_decode)]
-pub static BULK_LUT_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_LUT_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_DECLINE_DISABLED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(pure_inflate_decode)]
-pub static BULK_DECLINE_NO_LOOKBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(pure_inflate_decode)]
 pub static BULK_DECLINE_INVALID_HUFFMAN: std::sync::atomic::AtomicU64 =
@@ -1101,7 +1081,7 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
             crc32_enabled,
             boundaries: &mut pending_boundaries,
         };
-        let (step, flipped_clean) =
+        let (step, _flipped_clean) =
             marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &[], &mut sink)?;
         let n = clean_appended - marker_ctx.clean_data_count;
         marker_ctx.clean_data_count = clean_appended;
@@ -1114,9 +1094,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
                 produced,
                 ceiling: chunk.output_ceiling,
             });
-        }
-        if flipped_clean {
-            UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         match step {
             MarkerStep::Continue => {}
@@ -1800,9 +1777,6 @@ pub(crate) fn decode_multi_member_native(
 /// asserting this == 0 is the §7 non-execution proof; a multi-member decode
 /// asserting it advanced proves the port ran.
 pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub static MONOLITH_ISAL_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// M4 (DIV-1 part 2) — LABELED DEVIATION from the vendor blueprint.

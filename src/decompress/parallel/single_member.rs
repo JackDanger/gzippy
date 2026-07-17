@@ -140,11 +140,6 @@ const MID_RATIO_COARSE_LOW: f64 = 1.05;
 /// coarsens.
 const MID_RATIO_COARSE_HIGH: f64 = 2.0;
 
-/// Counter proving the mid-ratio coarsening band fired on a real decode
-/// (deletion-trap discipline; read by the routing / byte-transparency tests).
-#[cfg_attr(not(parallel_sm), allow(dead_code))]
-pub static MID_RATIO_COARSE_APPLIED: AtomicU64 = AtomicU64::new(0);
-
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 pub(crate) fn adjusted_chunk_size_bytes(
     file_size: usize,
@@ -222,7 +217,6 @@ pub(crate) fn adjusted_chunk_size_bytes(
             let refine = incompressible_refine_divisor(isize_deflate_ratio, file_size, threads);
             return adjusted_chunk_size_amd(file_size, refine, default_chunk_size);
         }
-        MID_RATIO_COARSE_APPLIED.fetch_add(1, Ordering::Relaxed);
     }
     let vendor = adjusted_chunk_size_vendor(file_size, threads, default_chunk_size);
     // AMD/Zen2 MID-THREAD (2..=8): cap the chunk size by the per-T schedule so the

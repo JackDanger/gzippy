@@ -67,12 +67,6 @@ pub static STORED_DEMOTE_TO_PARALLEL_SM: AtomicU64 = AtomicU64::new(0);
 pub static STORED_STREAM_RUNS: AtomicU64 = AtomicU64::new(0);
 
 /// Counter: number of pure-stored streams whose runs were emitted via the
-/// `writev` iovec-GATHER fast path (all run slices gathered into batched
-/// `writev` syscalls) instead of one `write_all` per run. Non-zero proves the
-/// coalesced-write path fired (Gate-0 non-inert witness for the syscall-count
-/// collapse). Dumped by `GZIPPY_DEBUG=1`.
-pub static STORED_WRITEV_BATCHES: AtomicU64 = AtomicU64::new(0);
-
 /// Threshold: if the stored prefix accounts for < this fraction of total
 /// output (numerator/denominator), demote to ParallelSM so the Huffman tail
 /// is decoded in parallel. Currently 50% (1/2).
@@ -884,7 +878,6 @@ fn write_runs<W: Write>(
         if !iovs.is_empty() {
             crate::decompress::parallel::fd_vectored_write::writev_all_to_fd(fd, &mut iovs)?;
         }
-        STORED_WRITEV_BATCHES.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
     #[cfg(not(unix))]

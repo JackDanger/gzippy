@@ -421,14 +421,6 @@ pub fn read_parallel_sm_resume_multi<W: std::io::Write>(
     })
 }
 
-/// Counts production `MultiMemberGrid` decodes (a SINGLE whole-file chunk grid
-/// spanning every member — the rapidgzip-faithful cross-member port, NOT the
-/// member-walk). Deletion-trap discipline: a routing test asserts this advances
-/// on a dominant/uneven multi-member decode and stays 0 for single-member.
-#[cfg(parallel_sm)]
-pub static MULTI_MEMBER_GRID_RUNS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Production entry for [`crate::decompress::DecodePath::MultiMemberGrid`]:
 /// decode a multi-member gzip stream as ONE whole-file chunk grid so the
 /// dominant member's deflate blocks spread across ALL workers (instead of the
@@ -458,8 +450,6 @@ pub fn read_parallel_sm_grid<W: std::io::Write>(
     use crate::decompress::parallel::chunk_fetcher;
     use crate::decompress::parallel::compressed_vector::CompressionType;
     use crate::decompress::parallel::gzip_format;
-
-    MULTI_MEMBER_GRID_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Slab auto-gate input (same as the single-member driver).
     crate::decompress::parallel::rpmalloc_alloc::set_decode_threads(parallelization);

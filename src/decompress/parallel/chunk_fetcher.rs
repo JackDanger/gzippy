@@ -1682,7 +1682,6 @@ fn consumer_loop<W: std::io::Write>(
                         || prefetch_post_inflight.contains_key(&real_offset)
                         || eager_completed.contains_key(&real_offset)
                     {
-                        ARC_DEFERRED_BORROW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ConsumerChunkHold::Deferred { arc }
                     } else {
                         ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1914,8 +1913,6 @@ fn consumer_loop<W: std::io::Write>(
             // Vendor `setEncodedOffset(*nextBlockOffset)` after post-process.
             if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit)
             {
-                use std::sync::atomic::Ordering;
-                REANCHOR_AFTER_POSTPROCESS.fetch_add(1, Ordering::Relaxed);
                 chunk.set_encoded_offset(handoff_bit);
             }
             let inserted = consumer_append_subchunks_vendor(
@@ -2576,7 +2573,6 @@ fn publish_end_window_before_post_process(
         let end_window = chunk.get_last_window_vec(predecessor_window);
         window_map.insert_owned_none(window_offset, end_window);
     }
-    PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
     EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -2909,12 +2905,6 @@ pub static RESOLVE_AHEAD_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// soon as its future completes rather than batching behind the cap.
 pub static DRAIN_READY_IMMEDIATE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// `set_encoded_offset(handoff_bit)` at drain after post-process (vendor order).
-pub static REANCHOR_AFTER_POSTPROCESS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static PUBLISH_AHEAD_WINDOWS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2969,8 +2959,6 @@ pub static POST_PROCESS_SMALL_MARKERS_PATH: std::sync::atomic::AtomicU64 =
 pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// `try_unwrap` missed but resolve-ahead is in flight — borrowed `Arc` through publish.
-pub static ARC_DEFERRED_BORROW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Deferred borrow finished via in-flight post-process `recv` at dispatch.
 pub static ARC_DEFERRED_INFLIGHT_RECV: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);

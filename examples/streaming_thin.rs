@@ -958,22 +958,6 @@ fn main() {
             let (ms, n) = run_prod(&file);
             println!("RESULT mode=prod ms={ms:.3} bytes={n}");
         }
-        #[cfg(all(feature = "profile-rebuild", pure_inflate_decode))]
-        "profile" => {
-            let iters = args
-                .get(3)
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(40);
-            let mut total = 0usize;
-            for _ in 0..iters {
-                total += gzippy_thin(&file, DEFAULT_BATCH, |_s| {});
-            }
-            println!(
-                "RESULT mode=profile iters={iters} bytes_per_iter={}",
-                total / iters
-            );
-            gzippy::decompress::parallel::lut_huffman::dump_rebuild_profile();
-        }
         "prodt" => {
             let threads = args
                 .get(3)

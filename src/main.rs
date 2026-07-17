@@ -127,11 +127,6 @@ fn main() {
 
     let result = run();
 
-    // Data-flow instrument (feature = "lut-count"): per-block litlen LUT
-    // builds vs reads. No-op without the (non-default) feature.
-    #[cfg(parallel_sm)]
-    decompress::parallel::lut_huffman::dump_litlen_count();
-
     match result {
         Ok(exit_code) => fast_exit_success(exit_code),
         Err(e) => {

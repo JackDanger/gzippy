@@ -270,37 +270,17 @@ pub(crate) fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
 
 // ── M2b (DIV-5): vendor stored-block special cases — counters + kill-switch ──
 //
-// Proof-of-path counters for the three vendor stored-block special cases
-// (deflate.hpp:1212-1256) plus the contig sibling of the clean bulk read.
-// Relaxed; test + GZIPPY_DEBUG observability only — never decode logic.
-
-/// Case 1: `uncompressedSize >= MAX_WINDOW_SIZE` ⇒ straight u8 read + flip
-/// (deflate.hpp:1214-1219).
-pub static STORED_FLIP_GE_WINDOW: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Case 2: markers + `distanceToLastMarkerByte + uncompressedSize >=
-/// MAX_WINDOW_SIZE` ⇒ downcast surviving prefix + read + flip
-/// (deflate.hpp:1220-1242).
-pub static STORED_FLIP_CROSSING: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Case 3: already clean ⇒ bulk byte read into the u8 ring
-/// (deflate.hpp:1243-1255).
-pub static STORED_CLEAN_BULK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Contig sibling of case 3: bulk byte read straight into `chunk.data`
-/// (`decode_clean_stored_into_contig`).
-pub static STORED_CONTIG_BULK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// THREAD-LOCAL test mirrors of the four stored-block path counters, for the
-// SAME reason MARKER_DIST_LUT_HITS is thread-local (see its note below): the
-// `stored_flip` differential asserts the kill-switch (disabled) arm's counter
-// delta is EXACTLY zero, but the process-wide atomics above are bumped by EVERY
-// thread's decode — so a concurrent decode test running in the same binary
-// contaminates the delta and flakes the "kill-switch arm inert" assert under
-// full-suite parallelism (observed only under heavy contention; passes in
-// isolation). The stored_flip test decodes synchronously on its own thread, so
-// a thread-local cell captures exactly this decode's hits and is immune to
-// other threads. Incremented alongside the atomics at the four call sites under
-// `#[cfg(test)]`; the production atomics are unchanged (byte-identical).
+// THREAD-LOCAL, test-only proof-of-path counters for the four stored-block
+// decode paths — the three vendor stored-block special cases (deflate.hpp:
+// 1212-1256) plus the contig sibling of the clean bulk read. Thread-local for
+// the SAME reason MARKER_DIST_LUT_HITS is (see its note below): the
+// `stored_flip` differential asserts the kill-switch (disabled) arm records
+// EXACTLY zero hits while the enabled arm records the expected counts, and a
+// thread-local cell captures exactly this decode's hits — immune to a
+// concurrent decode on another test thread in the same binary (which a
+// process-wide counter would let contaminate the delta under full-suite
+// parallelism). Incremented at the four call sites under `#[cfg(test)]` only;
+// never present in a production build, so they cannot touch decode or codegen.
 #[cfg(test)]
 thread_local! {
     pub(crate) static STORED_FLIP_GE_WINDOW_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1418,7 +1398,6 @@ impl Block {
             // underflow). Emit window = [drained, pos) = physical [0, n).
             self.ring.pos = U8_RING_SIZE + n;
             self.ring.drained = U8_RING_SIZE;
-            STORED_FLIP_GE_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
             STORED_FLIP_GE_WINDOW_TL.with(|c| c.set(c.get() + 1));
             stored_flip_debug_log("case1-ge-window", n);
@@ -1455,7 +1434,6 @@ impl Block {
             // new stored bytes drain: [drained, pos) = physical [rem, 32768).
             self.ring.pos = U8_RING_SIZE + MAX_WINDOW_SIZE;
             self.ring.drained = U8_RING_SIZE + rem;
-            STORED_FLIP_CROSSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
             STORED_FLIP_CROSSING_TL.with(|c| c.set(c.get() + 1));
             stored_flip_debug_log("case2-crossing", n);
@@ -1477,7 +1455,6 @@ impl Block {
             }
             debug_assert_eq!(got, n, "avail gate guaranteed the full payload");
             self.ring.pos += n;
-            STORED_CLEAN_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
             STORED_CLEAN_BULK_TL.with(|c| c.set(c.get() + 1));
         } else {
@@ -3850,7 +3827,6 @@ impl Block {
                 if self.uncompressed_size == 0 {
                     self.at_end_of_block = true;
                 }
-                STORED_CONTIG_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 #[cfg(test)]
                 STORED_CONTIG_BULK_TL.with(|c| c.set(c.get() + 1));
                 return Ok(to_read);
@@ -6562,9 +6538,9 @@ mod tests {
             f()
         }
 
-        // Reads the THREAD-LOCAL mirrors (not the process-wide atomics) so the
-        // kill-switch-arm-inert deltas are immune to concurrent decode on other
-        // test threads (see the note at the counter definitions).
+        // Reads the THREAD-LOCAL, test-only counters so the kill-switch-arm-
+        // inert deltas are immune to concurrent decode on other test threads
+        // (see the note at the counter definitions).
         fn counters() -> (u64, u64, u64, u64) {
             (
                 STORED_FLIP_GE_WINDOW_TL.with(|c| c.get()),

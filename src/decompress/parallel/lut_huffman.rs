@@ -108,118 +108,6 @@ pub const LIT_LEN_ELEMS: usize = 514;
 /// EOB + 29 length codes.
 pub const LIT_LEN: usize = 286;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PROFILING-ONLY sub-step timers (feature = "profile-rebuild"). RDTSC cycle
-// accumulators that locate the expensive per-block build sub-step. Never
-// compiled into the gate binary. Relative shares are load-immune within one run.
-// ─────────────────────────────────────────────────────────────────────────────
-#[cfg(feature = "profile-rebuild")]
-pub mod prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    pub static N_BLOCKS: AtomicU64 = AtomicU64::new(0);
-    pub static C_ZERO: AtomicU64 = AtomicU64::new(0); // rebuild zeroing + count loop
-    pub static C_EXPAND: AtomicU64 = AtomicU64::new(0); // set_and_expand_lit_len_huffcode
-    pub static C_MAKE_DOUBLE: AtomicU64 = AtomicU64::new(0); // doubling memcpy + singletons
-    pub static C_MAKE_PAIR: AtomicU64 = AtomicU64::new(0); // pair fill
-    pub static C_MAKE_TRIPLE: AtomicU64 = AtomicU64::new(0); // triple fill
-    pub static C_MAKE_LONG: AtomicU64 = AtomicU64::new(0); // long-code phase
-    pub static C_LONG_SCAN: AtomicU64 = AtomicU64::new(0); // O(n^2) prefix-group scan within long
-    pub static N_LONG_CODES: AtomicU64 = AtomicU64::new(0); // sum of long_code_length
-
-    #[inline(always)]
-    pub fn rdtsc() -> u64 {
-        unsafe { core::arch::x86_64::_rdtsc() }
-    }
-    #[inline(always)]
-    pub fn add(c: &AtomicU64, d: u64) {
-        c.fetch_add(d, Ordering::Relaxed);
-    }
-}
-
-/// Dump the profile-rebuild sub-step cycle shares to stderr. No-op unless built
-/// with `--features profile-rebuild`.
-pub fn dump_rebuild_profile() {
-    #[cfg(feature = "profile-rebuild")]
-    {
-        use prof::*;
-        use std::sync::atomic::Ordering::Relaxed;
-        let n = N_BLOCKS.load(Relaxed).max(1);
-        let z = C_ZERO.load(Relaxed);
-        let e = C_EXPAND.load(Relaxed);
-        let d = C_MAKE_DOUBLE.load(Relaxed);
-        let p = C_MAKE_PAIR.load(Relaxed);
-        let t = C_MAKE_TRIPLE.load(Relaxed);
-        let l = C_MAKE_LONG.load(Relaxed);
-        let tot = (z + e + d + p + t + l).max(1);
-        eprintln!("REBUILD_PROFILE blocks={n}");
-        let row = |name: &str, c: u64| {
-            eprintln!(
-                "  {name:<14} cyc/blk={:>8.1}  share={:>5.1}%",
-                c as f64 / n as f64,
-                100.0 * c as f64 / tot as f64
-            );
-        };
-        row("zero+count", z);
-        row("set_expand", e);
-        row("make_double", d);
-        row("make_pair", p);
-        row("make_triple", t);
-        row("make_long", l);
-        let scan = C_LONG_SCAN.load(Relaxed);
-        let nlong = N_LONG_CODES.load(Relaxed);
-        eprintln!(
-            "    (long_scan    cyc/blk={:>8.1}  share={:>5.1}%  avg_long_codes/blk={:.1})",
-            scan as f64 / n as f64,
-            100.0 * scan as f64 / tot as f64,
-            nlong as f64 / n as f64
-        );
-        eprintln!("  TOTAL          cyc/blk={:>8.1}", tot as f64 / n as f64);
-    }
-}
-// ─────────────────────────────────────────────────────────────────────────────
-// DATA-FLOW INSTRUMENT (feature = "lut-count"). Counts per-block litlen LUT
-// BUILDS (real construction work in `rebuild_from_multisym`), cache HITS (build
-// skipped), and READS (`decode_prefilled`, which `decode` funnels through). The
-// question it answers deterministically: on a given arch's clean-decode path, is
-// the `lut_litlen` table READ at all, or built-then-never-read? `READS == 0` with
-// `BUILDS > 0` is the non-inert proof of a redundant build. Zero overhead unless
-// the feature is compiled in.
-// ─────────────────────────────────────────────────────────────────────────────
-#[cfg(feature = "lut-count")]
-pub mod litlen_count {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    pub static BUILDS: AtomicU64 = AtomicU64::new(0); // real table constructions
-    pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0); // MRU-cache build skips
-    pub static READS: AtomicU64 = AtomicU64::new(0); // decode_prefilled invocations
-
-    #[inline(always)]
-    pub fn note_build() {
-        BUILDS.fetch_add(1, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn note_cache_hit() {
-        CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn note_read() {
-        READS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Dump the litlen BUILD/READ data-flow counters (feature = "lut-count").
-/// No-op unless built with that (non-default) feature.
-pub fn dump_litlen_count() {
-    #[cfg(feature = "lut-count")]
-    {
-        use litlen_count::*;
-        use std::sync::atomic::Ordering::Relaxed;
-        let b = BUILDS.load(Relaxed);
-        let h = CACHE_HITS.load(Relaxed);
-        let r = READS.load(Relaxed);
-        eprintln!("LUT_LITLEN_COUNT builds={b} cache_hits={h} reads={r}");
-    }
-}
-
 pub const ISAL_DEF_LIT_SYMBOLS: usize = 257;
 pub const ISAL_DEF_LEN_SYMBOLS: usize = 29;
 pub const ISAL_DEF_DIST_SYMBOLS: usize = 30;
@@ -682,8 +570,6 @@ pub fn make_inflate_huff_code_lit_len(
     let min_length = last_length;
 
     while last_length <= ISAL_DECODE_LONG_BITS {
-        #[cfg(feature = "profile-rebuild")]
-        let _ma = prof::rdtsc();
         // memcpy(short_code_lookup + copy_size, short_code_lookup,
         //        sizeof(*short_code_lookup) * copy_size);
         // Note: source overlaps destination range — split-borrow to copy
@@ -713,11 +599,6 @@ pub fn make_inflate_huff_code_lit_len(
             }
             index1 += 1;
         }
-
-        #[cfg(feature = "profile-rebuild")]
-        let _mb = prof::rdtsc();
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::C_MAKE_DOUBLE, _mb.wrapping_sub(_ma));
 
         // Continue if no pairs are possible
         if multisym >= SINGLE_SYM_FLAG || last_length < 2 * min_length {
@@ -766,11 +647,6 @@ pub fn make_inflate_huff_code_lit_len(
             }
             index1 += 1;
         }
-
-        #[cfg(feature = "profile-rebuild")]
-        let _mc = prof::rdtsc();
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::C_MAKE_PAIR, _mc.wrapping_sub(_mb));
 
         // Continue if no triples are possible
         if multisym >= DOUBLE_SYM_FLAG || last_length < 3 * min_length {
@@ -843,18 +719,12 @@ pub fn make_inflate_huff_code_lit_len(
             }
             index1 += 1;
         }
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::C_MAKE_TRIPLE, prof::rdtsc().wrapping_sub(_mc));
         last_length += 1;
     }
 
-    #[cfg(feature = "profile-rebuild")]
-    let _ml = prof::rdtsc();
     // Long-code processing.
     let long_start = count_total[ISAL_DECODE_LONG_BITS as usize + 1] as usize;
     let long_code_length = (code_list_len as usize).saturating_sub(long_start);
-    #[cfg(feature = "profile-rebuild")]
-    prof::add(&prof::N_LONG_CODES, long_code_length as u64);
     let long_code_list = &code_list[long_start..long_start + long_code_length];
     let mut long_code_lookup_length: u32 = 0;
     let mut temp_code_list: [u16; 1 << (MAX_LIT_LEN_CODE_LEN - ISAL_DECODE_LONG_BITS as usize)] =
@@ -870,8 +740,6 @@ pub fn make_inflate_huff_code_lit_len(
     let mut group_head = [0u32; LIT_LEN_ELEMS + 2];
     let mut n_groups = 0usize;
 
-    #[cfg(feature = "profile-rebuild")]
-    let _ls = prof::rdtsc();
     // Pass 1: bucket every long code into its prefix chain in ONE pass.
     LONG_PREFIX_SCRATCH.with(|cell| {
         let s = &mut *cell.borrow_mut();
@@ -898,8 +766,6 @@ pub fn make_inflate_huff_code_lit_len(
             *slot = gen_tag | (i as u32);
         }
     });
-    #[cfg(feature = "profile-rebuild")]
-    prof::add(&prof::C_LONG_SCAN, prof::rdtsc().wrapping_sub(_ls));
 
     // Pass 2: emit groups in first-appearance order (byte-identical layout).
     for g in 0..n_groups {
@@ -966,8 +832,6 @@ pub fn make_inflate_huff_code_lit_len(
             long_code_lookup_length | (max_length << LARGE_SHORT_MAX_LEN_OFFSET) | LARGE_FLAG_BIT;
         long_code_lookup_length += 1u32 << (max_length - ISAL_DECODE_LONG_BITS);
     }
-    #[cfg(feature = "profile-rebuild")]
-    prof::add(&prof::C_MAKE_LONG, prof::rdtsc().wrapping_sub(_ml));
     true
 }
 
@@ -1204,8 +1068,6 @@ impl LutLitLenCode {
     /// `SINGLE_SYM_FLAG` so igzip's `_04` reads unambiguous single-symbol
     /// entries (its asm speculative-literal path mis-handles gz's TRIPLE pack).
     pub fn rebuild_from_multisym(&mut self, code_lengths: &[u8], multisym: u32) -> bool {
-        #[cfg(feature = "profile-rebuild")]
-        let _t0 = prof::rdtsc();
         // Per-block table-build cache: if the previous successfully built table
         // had a byte-identical code-length key and the same multisym packing,
         // `self.table` is already the exact table this call would rebuild
@@ -1228,8 +1090,6 @@ impl LutLitLenCode {
                     && self.cache_key_len == n
                     && self.cache_key[..n] == *code_lengths
                 {
-                    #[cfg(feature = "lut-count")]
-                    litlen_count::note_cache_hit();
                     return true;
                 }
             }
@@ -1309,10 +1169,6 @@ impl LutLitLenCode {
         }
 
         let table_len = code_lengths.len();
-        #[cfg(feature = "profile-rebuild")]
-        let _t1 = prof::rdtsc();
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::C_ZERO, _t1.wrapping_sub(_t0));
         if set_and_expand_lit_len_huffcode(
             &mut self.lit_and_dist_huff[..],
             table_len,
@@ -1324,10 +1180,6 @@ impl LutLitLenCode {
         {
             return false;
         }
-        #[cfg(feature = "profile-rebuild")]
-        let _t2 = prof::rdtsc();
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::C_EXPAND, _t2.wrapping_sub(_t1));
 
         if !make_inflate_huff_code_lit_len(
             &mut self.table,
@@ -1339,10 +1191,6 @@ impl LutLitLenCode {
         ) {
             return false;
         }
-        #[cfg(feature = "profile-rebuild")]
-        prof::add(&prof::N_BLOCKS, 1);
-        #[cfg(feature = "lut-count")]
-        litlen_count::note_build();
 
         self.valid = true;
         // Record this freshly-built table as the MRU cache key so a later block
@@ -1414,8 +1262,6 @@ impl LutLitLenCode {
             bits.available() >= 32 || bits.pos == bits.data.len(),
             "decode_prefilled called without the post-refill precondition"
         );
-        #[cfg(feature = "lut-count")]
-        litlen_count::note_read();
         let next_bits = bits.peek();
         let next_12_bits = (next_bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
         let mut next_sym = self.table.short_code_lookup[next_12_bits];
@@ -2068,8 +1914,7 @@ mod tests {
     /// each not-yet-placed long code, inner-rescan all later long codes
     /// sharing its 12-bit prefix). Test-only reference oracle for the O(n)
     /// rewrite. The short-code (singleton/pair/triple) section is identical
-    /// to production (verified by diff) modulo the `profile-rebuild` timers;
-    /// only the long-code section differs.
+    /// to production (verified by diff); only the long-code section differs.
     #[cfg(test)]
     #[must_use]
     fn make_inflate_huff_code_lit_len_oldref(
@@ -2953,120 +2798,5 @@ mod tests {
                 lens
             );
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LEVER GUARD (commit 20758d5c): the skipped-build cfg must NEVER read lut_litlen
-// on the clean path.
-//
-// 20758d5c skips the eager per-block `lut_litlen` build in
-// `marker_inflate::read_header` on exactly the arches where the clean-decode
-// path (`decode_clean_into_contig`, engine-A over `flat_litlen`) does NOT read
-// `lut_litlen`: `not(all(asm-kernel, x86_64))` — i.e. aarch64, or x86 with the
-// asm kernel off. The lever is byte-safe ONLY while that "never read on the
-// clean path" invariant holds. The cursor-footgun it guards against: a future
-// cfg drift that re-routes the clean path back through
-// `lut_litlen.decode_prefilled` would then decode through a table this lever no
-// longer builds — reading a stale / never-initialized (garbage) table, silently.
-//
-// This test ENFORCES the invariant instead of trusting it: it decodes a clean
-// (T1, window-present, no-marker) single-member gzip through the production
-// `single_member::decompress_parallel` path and asserts the litlen READ counter
-// stayed 0. If cfg drift reintroduces a clean-path read it goes nonzero and this
-// FAILS (loud), rather than the decode silently building-nothing / reading
-// garbage. It also asserts BUILDS stayed 0, so reverting the eager-build skip
-// (or otherwise rebuilding the never-read table on the clean path) trips here
-// too.
-//
-// Compiled ONLY under the skipped-build cfg + the `lut-count` data-flow
-// instrument, so it has ZERO production cost and never runs where the invariant
-// legitimately does not hold (x86 + asm-kernel, where the clean path DOES read
-// lut_litlen via run_contig/decode_prefilled). Run it with:
-//   cargo test --release --features lut-count clean_path_lut_guard
-// (default features already pull in `pure-rust-inflate`).
-// ─────────────────────────────────────────────────────────────────────────────
-#[cfg(all(
-    test,
-    feature = "lut-count",
-    parallel_sm,
-    not(all(feature = "asm-kernel", target_arch = "x86_64"))
-))]
-mod clean_path_lut_guard {
-    use super::litlen_count;
-    use std::io::Write;
-    use std::sync::atomic::Ordering::Relaxed;
-
-    #[test]
-    fn t1_clean_path_never_reads_skipped_lut_litlen() {
-        // Compressible, varied text-like data so flate2 emits real DYNAMIC
-        // Huffman blocks (the case the eager build, pre-lever, fired on — base
-        // M1 silesia T1 was builds=3286). An xorshift-perturbed repeating word
-        // pool keeps entropy low enough for dynamic blocks (not stored) yet
-        // varied enough for multiple blocks.
-        const WORDS: &[&[u8]] = &[
-            b"the ",
-            b"quick ",
-            b"brown ",
-            b"fox ",
-            b"jumps ",
-            b"over ",
-            b"lazy ",
-            b"dog ",
-            b"deflate ",
-            b"huffman ",
-            b"litlen ",
-            b"window ",
-            b"marker ",
-            b"chunk ",
-            b"parallel ",
-            b"gzip ",
-        ];
-        let mut data = Vec::with_capacity(4 * 1024 * 1024);
-        let mut x: u32 = 0x1234_5678;
-        while data.len() < 4 * 1024 * 1024 {
-            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            data.extend_from_slice(WORDS[(x >> 16) as usize % WORDS.len()]);
-        }
-
-        let mut gz = Vec::new();
-        {
-            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
-            enc.write_all(&data).unwrap();
-            enc.finish().unwrap();
-        }
-
-        // Reset the data-flow counters, then drive the production T1 clean path.
-        litlen_count::BUILDS.store(0, Relaxed);
-        litlen_count::CACHE_HITS.store(0, Relaxed);
-        litlen_count::READS.store(0, Relaxed);
-
-        let mut out = Vec::with_capacity(data.len());
-        let n = crate::decompress::parallel::single_member::decompress_parallel(
-            &gz, &mut out, None, 1, false,
-        )
-        .expect("T1 clean-path decode must succeed");
-
-        // Byte-exactness first — a read==0 on a wrong-bytes decode proves nothing.
-        assert_eq!(out, data, "clean-path decode must be byte-exact");
-        assert_eq!(n as usize, data.len(), "decoded length mismatch");
-
-        let reads = litlen_count::READS.load(Relaxed);
-        let builds = litlen_count::BUILDS.load(Relaxed);
-        assert_eq!(
-            reads, 0,
-            "INVARIANT VIOLATED: the T1 clean path READ lut_litlen {reads}x. Commit \
-             20758d5c skips the eager lut_litlen build on this cfg because the clean \
-             path is engine-A over flat_litlen and never reads lut_litlen; a cfg drift \
-             has re-routed the clean path through lut_litlen.decode_prefilled, which \
-             now decodes through a table this lever no longer builds. Either restore \
-             the eager build for this cfg or stop reading lut_litlen on the clean path."
-        );
-        assert_eq!(
-            builds, 0,
-            "the eager clean-path lut_litlen build should be SKIPPED on this cfg (got \
-             {builds} builds). The 20758d5c redundant-build elimination regressed — \
-             the never-read table is being built again on the clean path."
-        );
     }
 }
