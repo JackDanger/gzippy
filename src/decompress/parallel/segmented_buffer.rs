@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// Pre-existing parallel-module dead code, exposed by the default-feature flip; delete in a dedicated cleanup.
 
 //! `ChunkData::data` storage: a contiguous decode bulk PLUS an O(1)-prepend
 //! front-segment list — the faithful port of rapidgzip's
@@ -22,9 +22,7 @@
 //! DTLB-friendly, but it forced `cleanUnmarkedData`/`applyWindow` to
 //! `prepend_bytes`/`insert_logical_at` by REALLOCATING + memmoving the whole
 //! payload PER CHUNK (plus a temp-`Vec` narrow, so the clean tail was copied
-//! TWICE). perf-annotate measured `finalize_with_deflate` at ~10% of program
-//! instructions vs rapidgzip's `ChunkData::finalize` at ~0.11% — a ~90x
-//! gz-specific migration tax that is exactly this memmove/eager-narrow.
+//! TWICE).
 //!
 //! ## The hybrid that converges WITHOUT regressing decode locality
 //!
@@ -69,10 +67,7 @@ pub const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 /// and BOTH of allocator-api2 0.2.21's `Extend` impls (the generic `Extend<T>`
 /// AND the `Extend<&T>` one whose doc-comment *claims* `copy_from_slice`) are in
 /// fact SCALAR per-element `while next() { ptr::write; set_len(len+1) }` loops
-/// (vec/mod.rs:2704 & :2788). Assembling the chunk's clean output through that
-/// byte-by-byte path measured ~16% of T4-silesia instructions (perf attributed
-/// it to the inlined-into `finalize_with_deflate`/`append_clean_narrowed`
-/// symbol). rapidgzip's clean `DecodedData::append` is a `std::copy`/`insert`
+/// (vec/mod.rs:2704 & :2788). rapidgzip's clean `DecodedData::append` is a `std::copy`/`insert`
 /// memcpy (DecodedData.hpp:282-289). Mirror that with `copy_nonoverlapping`.
 /// Byte-for-byte identical to the element loop.
 #[inline]
@@ -148,8 +143,7 @@ impl SegmentedU8 {
     /// per chunk, and (b) the buffer's very first allocation is HUGE, so the
     /// slab gate — and, for tiny decodes, `rpmalloc_alloc::SystemHugeScope` —
     /// governs its backend: a tiny thin-T1 decode never touches rpmalloc's
-    /// small-allocation path (whose first call triggers rpmalloc process init,
-    /// the measured ~1M-instruction tiny-file tax, #189/#199 lever-2b).
+    /// small-allocation path (whose first call triggers rpmalloc process init).
     /// T>1 workers never have the scope set: their take stays byte-identical.
     #[inline]
     fn ensure_buf(&mut self, min_capacity: usize) {
@@ -161,8 +155,7 @@ impl SegmentedU8 {
                 // prefix already appended, so the first take must exceed the pin
                 // by at least that margin or the very first reserve GROWS the
                 // buffer — an out-of-place relocation that copies (and faults)
-                // the full just-taken capacity (measured: t80 wall 7→73 ms, RSS
-                // 4.8→69 MB when the margin was missing). With the margin the
+                // the full just-taken capacity. With the margin the
                 // per-chunk reserve is a no-op and the pooled buffer is
                 // steady-state for every subsequent chunk, exactly like the
                 // baseline's grown-once buffer.
@@ -467,15 +460,14 @@ impl SegmentedU8 {
         }
     }
 
-    /// T1-MONOLITH-STREAMING flush helper. The decoded output bytes BEFORE the
+    /// Flush helper: the decoded output bytes BEFORE the
     /// trailing `keep` bytes have already been written to the sink; drop them and
     /// shift the trailing `keep` bytes to the FRONT of the bulk so they remain
     /// available as the DEFLATE sliding-window history for subsequent
     /// back-references (max distance 32768). Decode-time only (front empty,
     /// single contiguous bulk). After this call `len() == keep`, `buf[0..keep)`
     /// are the most-recent `keep` decoded bytes, and the CAPACITY is unchanged
-    /// (no realloc → the buffer stays resident, the cache-residency lever that
-    /// fixed the prior full-ISIZE monolith's page-fault storm).
+    /// (no realloc → the buffer stays resident).
     pub fn retain_tail(&mut self, keep: usize) {
         debug_assert!(self.front.is_empty(), "retain_tail is decode-time");
         let len = self.buf.len();
@@ -750,7 +742,7 @@ impl SegmentedU8 {
         // `other`'s logical content goes after self's. Flatten other into a
         // contiguous tail of self.buf (front of `other` would otherwise need to
         // interleave). Front of `self` is preserved as the logical prefix.
-        // memcpy-append each slice (was scalar `extend_from_slice`; #129 port —
+        // memcpy-append each slice (was scalar `extend_from_slice`;
         // `buf_append_memcpy` mirrors rapidgzip's `DecodedData::append` memcpy,
         // byte-for-byte identical to the element loop).
         for seg in other.ordered_slices() {

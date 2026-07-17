@@ -1,16 +1,13 @@
 //! Zero-copy vectored output for the parallel-SM consumer — the
 //! data-plane `writeAll` tail.
 //!
-//! ## Why this exists (the S4 lever)
+//! ## Why this exists
 //!
 //! The in-order consumer (`chunk_fetcher::drain_one_pending`) is the
 //! single point that materializes every decoded byte to the output
 //! sink. Before this module it did so via `BufWriter::write_all` —
 //! a single-core `memcpy` of all freshly cross-core-decoded payload
-//! through a 1 MiB `BufWriter` staging buffer. A positive-controlled
-//! removal oracle (S4, 2026-06-01) proved that nulling that write
-//! yields a large T8 wall win, thread-local and orthogonal to the
-//! granule levers.
+//! through a 1 MiB `BufWriter` staging buffer.
 //!
 //! rapidgzip writes the SAME bytes via a vectored `writeAll`:
 //! `ChunkData.hpp:794 writeAll` → `DecodedData.hpp:529 toIoVec` →
@@ -127,9 +124,7 @@ where
 pub fn writev_all_to_fd(fd: i32, iovs: &mut [libc::iovec]) -> io::Result<()> {
     let n = iovs.len();
     let mut idx = 0usize;
-    // Measured with no per-call byte cap (the campaign-measured production
-    // default — the env-based cap override was always identity; see git
-    // history for the capped-batching experiment this superseded).
+    // No per-call byte cap.
     while idx < n {
         let segment_count = (n - idx).min(iov_max());
         // SAFETY: `iovs[idx..idx+segment_count]` are valid iovecs into
@@ -682,7 +677,7 @@ mod tests {
         drop(data);
     }
 
-    /// EARLY-READER-DEATH (the Step-1 corruption bug, directly).
+    /// EARLY-READER-DEATH.
     ///
     /// On Linux: open a pipe, shrink its buffer, splice ONE payload that
     /// fits (so the vault retains an owner), then CLOSE the read end with

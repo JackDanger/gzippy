@@ -1,13 +1,12 @@
 //! Deterministic seeded fuzz loop over the pure-Rust inflate entry points,
 //! differential against independent oracles.
 //!
-//! WHY (campaign): cargo-fuzz / libFuzzer is not wired into this repo (no
-//! `fuzz/` crate, and the LXC bench host blocks the sanitizer runtime), so this
-//! is the in-tree substitute: a self-contained, seeded fuzz loop that generates
-//! many random payloads, compresses them through flate2 at random levels, and
-//! asserts gzippy's decode matches a libdeflate oracle byte-for-byte. It is the
-//! standing wide-input net the inner-Huffman rate work and the copy-free-to-final
-//! refactor validate against.
+//! WHY: cargo-fuzz / libFuzzer is not wired into this repo (no `fuzz/` crate,
+//! and the bench host blocks the sanitizer runtime), so this is the in-tree
+//! substitute: a self-contained, seeded fuzz loop that generates many random
+//! payloads, compresses them through flate2 at random levels, and asserts
+//! gzippy's decode matches a libdeflate oracle byte-for-byte. It is the standing
+//! wide-input net for the inflate path.
 //!
 //! Determinism: the RNG is seeded from `GZIPPY_FUZZ_SEED` (default fixed), so a
 //! failure reproduces exactly; the failing seed + iteration is printed. The

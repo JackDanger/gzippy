@@ -210,9 +210,8 @@ impl LitLenEntry {
     /// Decode length value using saved_bitbuf
     /// Length = base + extra_bits_value
     ///
-    /// Lever B4 (pure-Rust ISA-L sign-off): now delegates extras
-    /// extraction to `bmi2::decode_extra_bits`, which uses the BZHI
-    /// instruction on BMI2-capable builds. Matches vendor pattern at
+    /// Delegates extras extraction to `bmi2::decode_extra_bits`, which uses
+    /// the BZHI instruction on BMI2-capable builds. Matches vendor pattern at
     /// `consume_first_decode.rs:1071-1072, :1111-1112` and the
     /// symmetric `decode_distance` below.
     #[inline(always)]
@@ -340,38 +339,23 @@ pub struct LitLenTable {
 impl LitLenTable {
     /// Number of bits for main table lookup.
     ///
-    /// ARM64 (the original tuning target): 11 bits = 8 KB table was
-    /// fastest due to L1d cache locality.
+    /// aarch64: 11 bits (8 KB table), matching libdeflate's
+    /// LITLEN_TABLEBITS=11 (deflate_decompress.c:372) — best for L1d
+    /// locality on ARM64.
     ///
-    /// x86_64 (neurotic, i7-13700T, where the perf/pure-rust-inflate
-    /// branch lives): bumped to **12** per the Phase B advisor audit.
-    /// Larger main table → fewer subtable hits on common code lengths,
-    /// removing a dependent load from the hot path of every symbol
-    /// that previously hit the subtable. 12-bit table = 16 KB, still
-    /// fits in 48 KB L1d on Raptor Lake. rapidgzip uses larger main
-    /// tables for the same reason (vendor's HuffmanCoding* variants).
-    // STEP B-2 engine-A convergence (2026-06-21): TABLE_BITS is arch-conditional.
-    // aarch64 (engine A = PRODUCTION clean kernel): 11, matching libdeflate's
-    // LITLEN_TABLEBITS=11 (deflate_decompress.c:372) — the frontier comparator.
-    // The doc comment above records that 11 (= 8 KB table) was originally the
-    // fastest on ARM64 for L1d locality; the const was later bumped to 12 as an
-    // x86 (Raptor Lake, 48 KB L1d) tuning that silently regressed aarch64 back to
-    // a 16 KB table. Reverting aarch64 to vendor's 11 is byte-exact (table
-    // geometry only; identical decoded output) and converges the per-symbol table
-    // lookup toward decompress_template.h. x86 keeps 12 (its production path is the
-    // run_contig asm; engine A there is the asm-off kernel — left at its tuned 12).
+    /// x86_64: 12 bits. A larger main table → fewer subtable hits on
+    /// common code lengths, removing a dependent load from the hot path
+    /// of every symbol that previously hit the subtable. 12-bit table =
+    /// 16 KB, still fits in 48 KB L1d on Raptor Lake. rapidgzip uses
+    /// larger main tables for the same reason (vendor's HuffmanCoding*
+    /// variants). Byte-exact vs 11 (table geometry only; identical
+    /// decoded output).
     #[cfg(target_arch = "aarch64")]
     pub const TABLE_BITS: u8 = 11;
     #[cfg(not(target_arch = "aarch64"))]
     pub const TABLE_BITS: u8 = 12;
     /// Maximum number of subtable bits for codes longer than TABLE_BITS
     pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
-    // Lever 2 falsification (2026-05-27): tried TABLE_BITS=13 — flat
-    // delta on all bench cases (text_words mono +1%, chunk -2%, others
-    // ~unchanged). Doubling table size didn't reduce subtable hits
-    // enough to matter on this corpus + arm64. Vendor (libdeflate)
-    // uses 11; ISA-L uses dynamic (13 or 14). Pinning at 12 — vendor's
-    // closest static choice — and falsified for arm64 M-series.
 
     /// Build a literal/length decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
@@ -528,7 +512,6 @@ impl LitLenTable {
     /// `main_table_bits`. Mirrors `DistTable::lookup_subtable_direct`
     /// (`:668-674`). Vendor pattern: `consume_first_decode.rs:1042-1046`
     /// — vendor uses post-consume bitbuf directly with no extra shift.
-    /// Lever B6 (sixth-pass advisor sign-off).
     #[inline(always)]
     pub fn lookup_subtable_direct(&self, entry: LitLenEntry, shifted_bits: u64) -> LitLenEntry {
         let subtable_start = entry.subtable_start() as usize;
@@ -606,15 +589,13 @@ pub struct DistTable {
 
 impl DistTable {
     /// Number of bits for main table.
-    /// 9 bits (512 entries) on x86_64 — same rationale as
+    ///
+    /// aarch64: 8 bits, matching libdeflate's OFFSET_TABLEBITS=8
+    /// (deflate_decompress.c:374).
+    ///
+    /// x86_64: 9 bits (512 entries) — same rationale as
     /// LitLenTable::TABLE_BITS, fewer subtable hits on common distance
-    /// codes. 10 was tried and regressed (silesia ratio 2.41 → 2.85)
-    /// — distance codes don't compress as well into a bigger table
-    /// and L1d pressure starts dominating.
-    // STEP B-2 engine-A convergence (2026-06-21): arch-conditional. aarch64
-    // (engine A = production) -> 8, matching libdeflate's OFFSET_TABLEBITS=8
-    // (deflate_decompress.c:374). x86 keeps 9 (its tuned value; engine A there is
-    // the asm-off kernel). Byte-exact (table geometry only).
+    /// codes. Byte-exact vs 8 (table geometry only).
     #[cfg(target_arch = "aarch64")]
     pub const TABLE_BITS: u8 = 8;
     #[cfg(not(target_arch = "aarch64"))]
@@ -646,11 +627,9 @@ impl DistTable {
     }
 
     /// Rebuild this table in place from new code lengths, REUSING the
-    /// `entries` allocation (P3.4 item 1, build-cost shave): the per-block
-    /// lazy build in the contig clean fast loop used to pay a fresh
-    /// `Vec` alloc + zero-fill + truncate + free on EVERY Huffman block;
-    /// at T16 the malloc/free cadence across 16 threads is measurable
-    /// (P3.3b: +8.6ms on silesia T16). Reusing the buffer keeps the
+    /// `entries` allocation: the per-block lazy build in the contig clean
+    /// fast loop would otherwise pay a fresh `Vec` alloc + zero-fill +
+    /// truncate + free on EVERY Huffman block. Reusing the buffer keeps the
     /// resulting table BYTE-IDENTICAL to a fresh `build` by construction:
     /// the fill below writes exactly the same entries over a zeroed
     /// prefix of the same computed size, and the table is a pure function

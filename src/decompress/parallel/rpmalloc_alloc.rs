@@ -34,14 +34,14 @@ mod arena {
     //
     // rpmalloc munmaps allocations above its ~3.94 MiB "huge" threshold on
     // free, so the ~12 MiB `ChunkData` buffers re-fault (first-touch zeroing)
-    // on every reuse — measured 12.4% of CPU in page faults at T8 vs
-    // rapidgzip's 1.2% (the dominant T4-16 gap). rapidgzip avoids it via 128
-    // KiB sub-buffers that stay under the threshold in rpmalloc's per-thread
-    // free list. `SlabAlloc` gets the same residency for the MONOLITHIC
-    // buffer: it keeps freed huge blocks resident in a capped free-list keyed
-    // by TRUE block size and reuses them, instead of munmapping.
+    // on every reuse — a significant CPU cost at high thread counts.
+    // rapidgzip avoids it via 128 KiB sub-buffers that stay under the
+    // threshold in rpmalloc's per-thread free list. `SlabAlloc` gets the same
+    // residency for the MONOLITHIC buffer: it keeps freed huge blocks resident
+    // in a capped free-list keyed by TRUE block size and reuses them, instead
+    // of munmapping.
     //
-    // CRITICAL correctness (advisor 2026-05-29): the live side-table keys
+    // CRITICAL correctness: the live side-table keys
     // dealloc/grow/shrink on the BLOCK, not the caller's `layout.size()` —
     // `Allocator::grow` calls `deallocate` with the OLD (smaller) layout, so
     // keying a free-list on `layout.size()` files blocks under the wrong size
@@ -62,31 +62,27 @@ mod arena {
     /// classes cover the (near-constant) chunk-buffer sizes for high reuse.
     const SLAB_GRANULARITY: usize = 1024 * 1024;
 
-    // ── T-conditional gate (iter-2, 2026-06-11: strict T<=2 + chunk-class budget) ──
+    // ── T-conditional gate (strict T<=2 + chunk-class budget) ──
     //
-    // The fulcrum-decide causal A/B proved the slab PAYS ~100ms at native
-    // silesia T1 (N=21, frozen, canonical mask). The prior RSS blowup
-    // (silesia-T8 +24-35%) was caused by a count-cap retention policy that
-    // retained up to 48 × 12 MiB = 576 MiB of free blocks.
+    // The slab reduces first-touch faults at native T1. An earlier count-cap
+    // retention policy caused an RSS blowup because it retained up to
+    // 48 × 12 MiB = 576 MiB of free blocks.
     //
-    // ITER-1 POST-MORTEM (9bebcada, NO-SHIP): it auto-ON'd at ALL T
-    // (max_t = usize::MAX — chosen to appease the T4-vs-T1 diff_ratio guard)
-    // with budget `min(16 MiB, T × largest_block_seen)`. Both halves were
-    // wrong: the open gate moved T8 RSS (+16.8% max-run) and T8 wall (+2.6%),
-    // and the 16 MiB hard cap EXCLUDED the chunk-class blocks (tens of MB) —
-    // a just-freed chunk buffer always blew the budget and was evicted
-    // immediately (largest-first = itself), so only 18 small-block hits ever
-    // happened and the T1 win measured CAUSAL-NULL. The reconciliation
-    // neutered its own lever.
+    // An earlier version auto-ON'd at ALL T (max_t = usize::MAX) with budget
+    // `min(16 MiB, T × largest_block_seen)`. Both halves were wrong: the open
+    // gate moved T8 RSS and wall, and the 16 MiB hard cap EXCLUDED the
+    // chunk-class blocks (tens of MB) — a just-freed chunk buffer always blew
+    // the budget and was evicted immediately (largest-first = itself), so the
+    // slab almost never hit.
     //
-    // ITER-2 (this version): the gate is STRICTLY T <= 2 (default max_t = 2)
-    // — at T > 2 the slab is OFF BY CONSTRUCTION (zero engagement, zero RSS
-    // movement; the high-T criteria pass trivially). At T <= 2 the budget
-    // ADMITS the chunk-class blocks: `T × largest_block_seen`, UNCAPPED
-    // (≈ one resident chunk buffer per active worker — the working set, not a
-    // leak), and eviction is SMALLEST-first so the chunk-class block is the
-    // LAST thing dropped (largest-first would evict exactly the lever block
-    // whenever anything else shared the free list).
+    // The current gate is STRICTLY T <= 2 (default max_t = 2) — at T > 2 the
+    // slab is OFF BY CONSTRUCTION (zero engagement, zero RSS movement; the
+    // high-T criteria pass trivially). At T <= 2 the budget ADMITS the
+    // chunk-class blocks: `T × largest_block_seen`, UNCAPPED (≈ one resident
+    // chunk buffer per active worker — the working set, not a leak), and
+    // eviction is SMALLEST-first so the chunk-class block is the LAST thing
+    // dropped (largest-first would evict exactly that block whenever anything
+    // else shared the free list).
     //
     // The decode thread count is STORED AT EVERY DECODE ENTRY
     // (`set_decode_threads`, called from `sm_driver::read_parallel_sm_inner`)
@@ -110,8 +106,8 @@ mod arena {
 
     // ── HIGH-T SIZE-AWARE regime (close stored/incompressible high-T) ──────
     //
-    // Locate #197 (Intel+AMD, byte-exact, N>=15): the stored/incompressible
-    // high-T loss vs rapidgzip is a per-chunk output-buffer alloc fault-storm.
+    // The stored/incompressible high-T loss vs rapidgzip is a per-chunk
+    // output-buffer alloc fault-storm.
     // At `SLAB_AUTO_MAX_T_DEFAULT < T <= SLAB_HIGH_T_MAX`, a NEW huge allocation
     // routes through the slab ONLY if its size is <= SLAB_HIGH_T_MAX_BLOCK (the
     // chunk-class threshold): stored/incompressible chunks reserve ~4 MiB
@@ -123,18 +119,13 @@ mod arena {
     // compressible high-T corpora. All three constants are hardcoded
     // (knob-free prod path).
     //
-    // BUDGET_CEIL re-tuned 16→64 MiB (2026-07-11): at 16 MiB the CEIL (not
-    // `T × block`) was the binding cap at T>=4 — only ~4 retained 4 MiB stored
-    // buffers for 8–16 workers, so storedheavy-512M output buffers still
-    // munmap→re-faulted (locate: 82% of page-faults were output-buffer
-    // first-touch; the 512M fixture demotes StoredParallel→ParallelSM and its
-    // 99%-stored body flows through `decode_clean_stored_into_contig`). 64 MiB
-    // admits full stored retention while `MAX_BLOCK`=8 MiB still excludes
-    // variable-large-output compressible chunks. Gated (solvency AMD Zen2,
-    // frozen /dev/null paired N=51, byte-exact): storedheavy-512M
-    // T8 1.089→0.895 (LOSS→WIN), T4 1.248→1.046, T16 0.954→0.889; no wall-cell
-    // regression across 48 cells; worst RSS +9.5% (weights-T8, within the ~15%
-    // wall-win budget); storedheavy RSS flat/lower.
+    // BUDGET_CEIL is 64 MiB, not 16 MiB: at 16 MiB the CEIL (not `T × block`)
+    // was the binding cap at T>=4 — only ~4 retained 4 MiB stored buffers for
+    // 8–16 workers, so storedheavy-512M output buffers still munmap→re-faulted
+    // (the 512M fixture demotes StoredParallel→ParallelSM and its 99%-stored
+    // body flows through `decode_clean_stored_into_contig`). 64 MiB admits full
+    // stored retention while `MAX_BLOCK`=8 MiB still excludes
+    // variable-large-output compressible chunks.
     const SLAB_HIGH_T_MAX: usize = 64;
     const SLAB_HIGH_T_MAX_BLOCK: usize = 8 * 1024 * 1024;
     const SLAB_HIGH_T_BUDGET_CEIL: usize = 64 * 1024 * 1024;
@@ -328,20 +319,17 @@ mod arena {
         largest_block_seen: usize,
     }
 
-    // ── Per-decode system-backend scope for huge blocks (tiny-file lever) ─────
+    // ── Per-decode system-backend scope for huge blocks (tiny-file path) ─────
     //
-    // MEASURED (#189/#199 lever-2a gate, Intel+AMD, fulcrum abmeasure N=15,
-    // sha==oracle): a tiny (≤8 MiB output) thin-T1 decode makes exactly ONE
-    // rpmalloc-backed allocation — its huge chunk-output reserve — and that
-    // single allocation triggers rpmalloc process+thread init (~1M instructions,
-    // instr/byte RESOLVED-improved 94.5→81.7 on t80 when removed), which buys
+    // A tiny (≤8 MiB output) thin-T1 decode makes exactly ONE rpmalloc-backed
+    // allocation — its huge chunk-output reserve — and that single allocation
+    // triggers rpmalloc process+thread init (~1M instructions), which buys
     // NOTHING for a single-buffer single-thread decode. This scope routes ONLY
     // that huge allocation to the system allocator (`Global`), so a tiny decode
     // never initializes rpmalloc at all.
     //
-    // Mechanism constraints (lever-2b, supervisor directive after the 2a
-    // process-global latch was REVERTED on an AMD-Zen2 silesia-high-T paired
-    // regression):
+    // Mechanism constraints (a prior process-global latch was reverted because
+    // it regressed a high-T workload — keep this per-decode and thread-local):
     //   - `RpmallocAlloc`'s `allocate`/`deallocate`/`grow`/`shrink` are
     //     BYTE-IDENTICAL source to baseline — no new atomic load, no new branch.
     //     The parallel and big-thin-T1 paths are unchanged by construction.
@@ -386,7 +374,7 @@ mod arena {
         SYSTEM_HUGE_SCOPE.with(|c| c.get())
     }
 
-    /// Gate-0 non-inert proof: system-backed huge allocations actually served
+    /// Counter of system-backed huge allocations actually served
     /// (a tiny-decode test asserts this moved; a big-decode test asserts it
     /// did NOT — the scope must never leak past its RAII guard).
     pub static SYS_HUGE_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -415,8 +403,7 @@ mod arena {
     /// T-conditional gate is on (see `slab_route_new`), and ALWAYS routes
     /// dealloc/grow/shrink of slab-live pointers here (pointer-keyed);
     /// the fuzz test exercises it directly (unconditional).
-    /// Engagement proof for the measurement A/B (fulcrum decide effect
-    /// predicate): cache hits + installs prove the slab actually ran.
+    /// Engagement counters: cache hits + installs prove the slab actually ran.
     pub static SLAB_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static SLAB_INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -457,24 +444,22 @@ mod arena {
                 ));
             }
             {
-                // BEST-FIT-LARGER match (iter-2): serve the SMALLEST resident
-                // block with b >= bs — NO waste bound. Exact-size matching is
-                // why iter-1-shape runs measured only ~24 hits and +27% T1
-                // RSS: chunk buffer sizes VARY per chunk, so consecutive
-                // chunk allocs missed the exact class — fresh mmap (faults
-                // kept) while the old block sat retained (RSS doubled). A 2x
-                // waste bound was tried and REJECTED by measurement: it
-                // re-created the overlap (a small-output chunk after a big
-                // one got bound-rejected -> fresh mmap while the big block
-                // sat retained; T1 peak RSS stayed +24.6%). Serving an
-                // oversized resident block costs ZERO extra RSS — its pages
-                // are resident either way — and at T <= 2 (the only gated-on
-                // regime) essentially only chunk-class blocks flow through
-                // the slab (installs ~ chunk count), so any resident block
-                // is the right block. With best-fit the ONE resident
-                // chunk-class block IS the working set: every subsequent
-                // chunk reuses it in place (hits ~ chunk-count, RSS overhead
-                // ~ granularity, faults eliminated).
+                // BEST-FIT-LARGER match: serve the SMALLEST resident block
+                // with b >= bs — NO waste bound. Exact-size matching misses
+                // most reuse because chunk buffer sizes VARY per chunk, so
+                // consecutive chunk allocs miss the exact class — fresh mmap
+                // (faults kept) while the old block sits retained (RSS
+                // doubles). A 2x waste bound was tried and rejected: it
+                // re-created the overlap (a small-output chunk after a big one
+                // got bound-rejected -> fresh mmap while the big block sat
+                // retained). Serving an oversized resident block costs ZERO
+                // extra RSS — its pages are resident either way — and at
+                // T <= 2 (the only gated-on regime) essentially only
+                // chunk-class blocks flow through the slab (installs ~ chunk
+                // count), so any resident block is the right block. With
+                // best-fit the ONE resident chunk-class block IS the working
+                // set: every subsequent chunk reuses it in place (hits ~
+                // chunk-count, RSS overhead ~ granularity, faults eliminated).
                 let mut s = slab_state().lock().unwrap();
                 if let Some(pos) = s
                     .free
@@ -494,11 +479,10 @@ mod arena {
                     ));
                 }
             }
-            // MISS. Evict-on-miss (iter-2 RSS peak fix): resident blocks
-            // SMALLER than this request cannot serve it — munmap them BEFORE
-            // the fresh mmap so peak RSS never stacks live + useless-retained
-            // (that overlap, during the chunk-size growing phase, was the
-            // whole +24.6% T1 peak-RSS delta; the criterion is <= +15%).
+            // MISS. Evict-on-miss (RSS peak fix): resident blocks SMALLER than
+            // this request cannot serve it — munmap them BEFORE the fresh mmap
+            // so peak RSS never stacks live + useless-retained (that overlap,
+            // during the chunk-size growing phase, was a large peak-RSS delta).
             // Blocks >= bs stay (they serve future requests in their class).
             {
                 let mut s = slab_state().lock().unwrap();
@@ -541,12 +525,12 @@ mod arena {
         /// Returns true if `ptr` was a live slab block (now retained/released).
         /// Keys on the side-table, NOT the caller layout (grow passes OLD).
         ///
-        /// Retention policy: bytes-budget, SMALLEST-first eviction (iter-2).
+        /// Retention policy: bytes-budget, SMALLEST-first eviction.
         /// Budget = `effective_budget` (legacy T<=2: uncapped T × largest-block;
         /// high-T: `min(T × 8 MiB, 16 MiB)`). Smallest-first keeps the chunk-
         /// class block resident as long as
         /// possible — with budget = 1 × largest at T1, largest-first would
-        /// evict exactly the lever block whenever any smaller block shared
+        /// evict exactly that block whenever any smaller block shared
         /// the free list. Blocks over budget are munmapped outside the lock.
         unsafe fn free_if_slab(&self, ptr: NonNull<u8>) -> bool {
             let key = ptr.as_ptr() as usize;
@@ -947,8 +931,8 @@ mod arena {
             assert!(!gate_decision(None, 2, 8, blk, 9, small));
         }
 
-        /// Iter-2 spec: the DEFAULT gate ceiling is STRICTLY 2 (T<=2). Iter-1
-        /// shipped usize::MAX here — that "leak" is what moved T8 RSS/wall.
+        /// The DEFAULT gate ceiling is STRICTLY 2 (T<=2). A prior version
+        /// shipped usize::MAX here, which moved T8 RSS and wall.
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
         #[test]
         fn default_auto_max_t_is_strictly_two() {
@@ -956,9 +940,9 @@ mod arena {
             assert_eq!(slab_auto_max_t(), 2);
         }
 
-        /// Iter-2 crux: the budget must ADMIT a synthetic chunk-class block
-        /// (tens of MB). Iter-1's min(16 MiB, ...) cap evicted the just-freed
-        /// chunk buffer every time and erased the T1 win.
+        /// The budget must ADMIT a synthetic chunk-class block (tens of MB); a
+        /// min(16 MiB, ...) cap would evict the just-freed chunk buffer every
+        /// time.
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
         #[test]
         fn budget_admits_chunk_class_blocks_at_low_t() {
@@ -996,7 +980,7 @@ mod arena {
 
         /// Smallest-first eviction: when the budget forces an eviction, the
         /// CHUNK-CLASS (largest) block must be the one retained — largest-
-        /// first here would evict the lever block whenever any smaller block
+        /// first here would evict that block whenever any smaller block
         /// shared the free list.
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
         #[test]
@@ -1027,10 +1011,9 @@ mod arena {
             assert_eq!(free[0].1, 38 << 20, "chunk-class block retained");
         }
 
-        /// Best-fit-larger reuse (iter-2): a freed block must serve a LATER,
-        /// SMALLER request (chunk buffer sizes vary per chunk — exact-size
-        /// matching missed most chunk allocs: ~24 hits, +27% T1 RSS). No
-        /// waste bound (measured: a 2x bound re-created the RSS overlap).
+        /// Best-fit-larger reuse: a freed block must serve a LATER, SMALLER
+        /// request (chunk buffer sizes vary per chunk — exact-size matching
+        /// misses most chunk allocs). No waste bound.
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
         #[test]
         fn best_fit_serves_smaller_request_from_larger_block() {
@@ -1061,17 +1044,16 @@ mod arena {
             }
             unsafe { SlabAlloc.deallocate(NonNull::new(q_ptr as *mut u8).unwrap(), small) };
 
-            // NO waste bound (measured decision, see alloc_huge comment): any
-            // resident block b >= bs serves — serving oversized costs zero
-            // extra RSS (pages resident either way); rejecting forces a fresh
-            // mmap that STACKS on the retained block (+24.6% T1 peak RSS when
-            // a 2x bound was tried).
+            // NO waste bound (see alloc_huge comment): any resident block
+            // b >= bs serves — serving oversized costs zero extra RSS (pages
+            // resident either way); rejecting forces a fresh mmap that STACKS
+            // on the retained block.
             let bs = 4 * 1024 * 1024usize;
             let b = 11 * 1024 * 1024usize;
             assert!(b >= bs, "oversized resident block is a valid fit");
         }
 
-        /// Evict-on-miss (iter-2 RSS peak fix): a resident block SMALLER than
+        /// Evict-on-miss (RSS peak fix): a resident block SMALLER than
         /// a missing request must be munmapped BEFORE the fresh mmap — peak
         /// RSS must never stack live + useless-retained.
         #[ignore = "white-box rpmalloc arena probe: races on the process-global arena under parallel `cargo test`; run serially with --ignored --test-threads=1"]
@@ -1315,8 +1297,7 @@ mod arena {
             }
         }
 
-        /// CONCURRENCY aliasing check (advisor gap: #198's fuzz was single-
-        /// threaded). Drives the PRODUCTION `RpmallocAlloc` under the high-T
+        /// CONCURRENCY aliasing check. Drives the PRODUCTION `RpmallocAlloc` under the high-T
         /// size-aware slab regime (DECODE_THREADS = 16 ⇒ chunk-class blocks
         /// route through the shared slab free-list) from 8 worker threads
         /// concurrently, each doing randomized allocate/grow/shrink/deallocate
@@ -1479,7 +1460,7 @@ pub use arena::set_decode_threads;
 pub fn set_decode_threads(_t: usize) {}
 
 /// Per-decode, thread-local RAII scope: while alive, NEW huge slab-routed
-/// allocations are system-backed (tiny thin-T1 lever — see the module comment
+/// allocations are system-backed (tiny thin-T1 path — see the module comment
 /// in `arena`). No-op when the arena is compiled out (buffers are already
 /// plain `std::vec::Vec` = system allocator).
 #[cfg(feature = "arena-allocator")]
@@ -1493,7 +1474,7 @@ impl SystemHugeScope {
     }
 }
 
-/// Gate-0 non-inert proof counter for [`SystemHugeScope`] (always 0 when the
+/// Counter for [`SystemHugeScope`] (always 0 when the
 /// arena is compiled out). Read by the latch-interleave test only.
 #[cfg(feature = "arena-allocator")]
 #[allow(unused_imports)]

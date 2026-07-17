@@ -141,17 +141,16 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
     }
 }
 
-// ── Pure-Rust backend (Track B3) ─────────────────────────────────────────
+// ── Pure-Rust backend ─────────────────────────────────────────────────────
 //
 // Routes through `Inflate<Clean, Generic, Streaming>` — the unified-decoder
-// surface (`git history (campaign plan, removed)`, phase 2). M3 (DIV-1 part 1) removed
-// this SECOND engine from the gzippy-native window-seeded INEXACT route
-// (those chunks now decode on the ONE `deflate::Block`; see
+// surface. This SECOND engine was removed from the gzippy-native
+// window-seeded INEXACT route (those chunks now decode on the ONE
+// `deflate::Block`; see
 // `chunk_decode::finish_decode_chunk_seeded_block_native` and the
 // `tests::routing::seeded_block_engine_runs_on_parallel_sm` trap). The
-// wrapper remains the engine for the until-exact paths (M4 pre-registered
-// contract) and the gzippy-isal build's ISA-L-backed variant (the
-// `GZIPPY_SEEDED_BLOCK=0` env kill-switch arm was removed 2026-07-07).
+// wrapper remains the engine for the until-exact paths and the gzippy-isal
+// build's ISA-L-backed variant.
 
 #[cfg(pure_inflate_decode)]
 pub struct StreamingInflateWrapper<'a> {
@@ -312,7 +311,7 @@ impl<'a> StreamingInflateWrapper<'a> {
         })
     }
 
-    /// Option A3 entry point — see
+    /// Entry point — see
     /// `crate::decompress::inflate::resumable::ResumableInflate2::read_stream_starting_at`
     /// for the contract.
     #[cfg(feature = "pure-rust-inflate")]
@@ -433,9 +432,7 @@ mod tests {
         //
         // Replaces the prior `FlushCompress::Sync`-based approach which
         // broke on flate2 1.x — Sync now emits sync markers inside the
-        // same outer block rather than splitting the stream (see f9201a3
-        // commit notes documenting the resumable_isal_oracle::* test
-        // pair as deferred for this exact reason).
+        // same outer block rather than splitting the stream.
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(0));
         enc.write_all(payload).unwrap();
         enc.finish().unwrap()
@@ -833,10 +830,9 @@ mod tests {
         assert_eq!(full, reference);
     }
 
-    /// Differential oracle (Track B1): pure-Rust `ResumableInflate2`
-    /// must match patched ISA-L at every block boundary, including
-    /// with a predecessor window at non-zero bit offsets. Repointed
-    /// from the deleted `ResumableInflate` in §5 step 6.
+    /// Differential oracle: pure-Rust `ResumableInflate2` must match
+    /// patched ISA-L at every block boundary, including with a predecessor
+    /// window at non-zero bit offsets.
     #[cfg(all(feature = "isal-compression", not(feature = "pure-rust-inflate")))]
     mod resumable_isal_oracle {
         use super::*;
@@ -991,16 +987,16 @@ mod tests {
         }
     }
 
-    // ── §2 divergence tests (pure-rust-isa-l plan) ────────────────────────
+    // ── divergence tests ──────────────────────────────────────────────────
     //
     // These three tests lock down behaviors that the pure-Rust backend
     // implements differently from the patched ISA-L backend. They're
-    // load-bearing for the FFI-removal plan because the differences live
+    // load-bearing for removing the C-FFI backend because the differences live
     // *behind* the wrapper surface — three production callers in
     // `chunk_decode.rs` rely on the patched-ISA-L semantics. If any of these
     // tests starts failing, do NOT delete the C-FFI backend yet.
 
-    // §2 divergence 1: `session_pending()` always returns `false` on the
+    // divergence 1: `session_pending()` always returns `false` on the
     // pure-Rust backend (`resumable.rs:376-378`). The OLD patched-ISA-L
     // wrapper returned `true` whenever post-stop bytes were still buffered.
     // Three call sites in `chunk_decode.rs:239, 273, 419` use it as part of
@@ -1055,7 +1051,7 @@ mod tests {
         );
     }
 
-    // §2 divergence 3: `read_footer_at_current` returns
+    // divergence 3: `read_footer_at_current` returns
     // `InflateError::Internal(-1)` on insufficient input
     // (`inflate_wrapper.rs:749`). The old patched-ISA-L wrapper returned
     // a different errno. This test locks the current error variant so
@@ -1110,7 +1106,7 @@ mod tests {
         }
     }
 
-    // §2 divergence 2 lives in `resumable.rs` (the no-progress guard);
+    // divergence 2 lives in `resumable.rs` (the no-progress guard);
     // see the test `no_progress_guard_breaks_cleanly_on_mid_block_until_bits`
     // there. Adding a wrapper-level test would be redundant because the
     // guard is below the wrapper API surface and the wrapper just

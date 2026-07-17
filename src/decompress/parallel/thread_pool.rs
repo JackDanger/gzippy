@@ -52,30 +52,23 @@ pub type ThreadPinning = HashMap<usize, u32>;
 /// lock-free `pending_tasks` hint BEFORE parking in the condvar.
 ///
 /// **Why this exists (no rapidgzip counterpart — byte-transparent perf knob).**
-/// On AMD-Zen2 under the production `ondemand` cpufreq governor, gzippy's
+/// Under an `ondemand`-style cpufreq governor, gzippy's
 /// worker pool parks in the condvar during the short, frequent inter-chunk
-/// gaps. Idle cores let `ondemand` drop to a lower P-state, so the pool
-/// clocks ~2.7% lower than rapidgzip (which spins), costing the mid-T
-/// (T3–T6) silesia cell ~4–11%. A bounded spin keeps the core warm across
+/// gaps. Idle cores let the governor drop to a lower P-state, so the pool
+/// clocks lower than rapidgzip (which spins). A bounded spin keeps the core warm across
 /// the gap so the governor holds the clock, WITHOUT burning cores when
 /// saturated: the spin only runs while `pending_tasks == 0` (a genuine
 /// idle gap) and bails the instant a task is queued — in the throughput-
 /// saturated case a finishing worker almost always sees `pending > 0` and
 /// never spins.
 ///
-/// Frozen to [`DEFAULT_POOL_SPIN_US`] — the value the campaign measured as
-/// the production default (the env override was removed).
+/// Frozen to [`DEFAULT_POOL_SPIN_US`].
 fn pool_spin_us() -> u64 {
     DEFAULT_POOL_SPIN_US
 }
 
-/// Baked default spin window. Chosen from the AMD-Zen2 ondemand gated
-/// sweep (fulcrum abmeasure, paired interleaved N=15): 2000us gave the
-/// most consistent mid-T gains — T3 +2.1% (13+/2-), T4 +1.3% (12+/3-),
-/// T6 +1.3% (12+/3-), T16 +3.0%, T1/T2 tie, T8 -0.6% (noise), and NO
-/// saturated-throughput regression (16xT2 1.768x rg, 8xT2 1.267x rg —
-/// the adaptive `pending==0` guard means it never spins when saturated).
-/// `0` restores exact park-immediately behavior.
+/// Baked default spin window, in microseconds. `0` restores exact
+/// park-immediately behavior.
 const DEFAULT_POOL_SPIN_US: u64 = 2000;
 
 /// Number of `spin_loop()` hints between wall-clock deadline checks in the
@@ -228,7 +221,7 @@ pub struct ThreadPool {
     /// while waiting for the NEXT chunk it needs, blocks on this condvar (with a
     /// 1 ms fallback) instead of polling `recv_timeout(1ms)`, so it wakes
     /// IMMEDIATELY when any worker frees up and re-advances the prefetch horizon
-    /// at ~0 latency (closes H-DECODEWAIT). Byte-transparent: only changes WHEN
+    /// at ~0 latency. Byte-transparent: only changes WHEN
     /// the consumer wakes to pump/re-check, never what it decodes.
     task_completed: Arc<(Mutex<u64>, Condvar)>,
     /// `m_threads` (ThreadPool.hpp:247). `JoiningThread` becomes a
@@ -316,8 +309,7 @@ impl ThreadPool {
     }
 
     /// Current count of worker threads parked in the condvar wait
-    /// (`m_idleThreadCount`, ThreadPool.hpp:235). Diagnostic-only read for
-    /// the SATURATION-vs-HORIZON stall probe (git history (campaign plan, removed)):
+    /// (`m_idleThreadCount`, ThreadPool.hpp:235). Diagnostic-only read:
     /// `busy = spawned_threads() - idle_thread_count()`, and
     /// `idle_capacity = idle_thread_count() + (capacity() - spawned_threads())`
     /// (lazy-spawn means an un-spawned slot is also available capacity). A

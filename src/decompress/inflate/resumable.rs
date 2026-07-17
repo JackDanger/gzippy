@@ -1,5 +1,4 @@
-//! Vendor-faithful resumable DEFLATE inflate (former plans/rust-rapidgzip.md §5,
-//! option 2).
+//! Vendor-faithful resumable DEFLATE inflate.
 //!
 //! Mirrors `vendor/.../gzip/isal.hpp:254-356` `IsalInflateWrapper::readStream`:
 //! the decoder writes directly into the caller's `output` slice and maintains
@@ -16,10 +15,6 @@
 //! ONLY for `ResumableInflate2` and, via
 //! [`crate::decompress::parallel::inflate_wrapper::StreamingInflateWrapper`],
 //! the parallel-SM hot path.
-//!
-//! Plan progress (`former plans/rust-rapidgzip.md §5`): all 7 steps complete.
-//! The old `ResumableInflate` + `session: Vec<u8>` accumulator and the
-//! B3a headroom band-aid (commit 2eff70f) are deleted as of §5 step 6.
 
 #![allow(dead_code)] // some vendor-parity methods are wrapper-only callers
 
@@ -39,10 +34,7 @@ pub static BODY_RESUMABLE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static BODY_RESUMABLE_FASTLOOP_ENTERS: AtomicU64 = AtomicU64::new(0);
 /// Total bytes produced across all `read_stream` calls. Divide by
 /// `READ_STREAM_CALLS` to get bytes/call — exposes the chunked-vs-mono
-/// gap in production. Step 2.5 (advisor third-pass post-C1 verdict):
-/// if production's bytes/call is small (e.g. ~64 KiB) we have the same
-/// chunked-mode problem the bench shows; if it's large (multi-MiB) the
-/// bench gap is bench-only and production is fine.
+/// gap in production.
 pub static READ_STREAM_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static READ_STREAM_BYTES_OUT: AtomicU64 = AtomicU64::new(0);
 /// Sum across all calls. Divide by `READ_STREAM_CALLS` for average
@@ -239,8 +231,7 @@ pub struct InflateStreamResult {
 ///
 /// Owns the input bit reader and a [`SlidingWindow`]. This is the
 /// production resumable inflate for the parallel-SM path (the old
-/// `session: Vec<u8>`-accumulator `ResumableInflate` was deleted in
-/// §5 step 6).
+/// `session: Vec<u8>`-accumulator `ResumableInflate` was deleted).
 pub struct ResumableInflate2<'a> {
     /// Vendor `IsalInflateWrapper::m_buffer` (`gzip/isal.hpp:205-250`): inner
     /// `Bits` reads from a 128 KiB staging window into `full` so branchless
@@ -423,7 +414,7 @@ impl<'a> ResumableInflate2<'a> {
     /// member's `until_bits`. Mirrors
     /// `consume_first_decode.rs:3021-3027`. Clears `bitbuf`/`bitsleft`
     /// so the next refill loads cleanly (matches the bitbuf-stale
-    /// trap pattern from §5 step 2).
+    /// trap pattern).
     pub fn advance_input(&mut self, n: usize) {
         let cur = self.bits.bit_position() / 8;
         let new_pos = (cur + n).min(self.bits.full_input().len());
@@ -486,9 +477,6 @@ impl<'a> ResumableInflate2<'a> {
     /// - `bytes_written` in the returned result counts ONLY bytes
     ///   actually decoded in this call (NOT including the prefix);
     ///   i.e. `out_pos_after - out_pos_start`.
-    ///
-    /// See `former plans/unified-decoder.md` §6 "copy_match_windowed slow-path
-    /// elimination" for the perf rationale.
     pub fn read_stream_starting_at(
         &mut self,
         output: &mut [u8],
@@ -507,7 +495,7 @@ impl<'a> ResumableInflate2<'a> {
         output: &mut [u8],
         out_pos_start: usize,
     ) -> Result<InflateStreamResult> {
-        // Step 2.5 instrumentation: record per-call shape so production
+        // Instrumentation: record per-call shape so production
         // hot-path analysis can distinguish "small-buffer chunked
         // caller" from "large-buffer monolithic caller". Counters are
         // single atomic-add per call (not per iteration) so the hot
@@ -556,7 +544,7 @@ impl<'a> ResumableInflate2<'a> {
             // encoded_until_bits while block_state still says InDynamic).
             // Vendor `isal.hpp` doesn't need this because ISA-L's state
             // machine never returns "no progress, no error"; we add it
-            // as defensive plumbing per the Opus advisor review of step 4.
+            // as defensive plumbing.
             let snap_out_pos = out_pos;
             let snap_bit_pos = self.bits.bit_position();
             let snap_state_disc = std::mem::discriminant(&self.block_state);
@@ -668,7 +656,7 @@ impl<'a> ResumableInflate2<'a> {
                 //       stop at a chunk's `until_bits` cap.
                 //   (b) bit_position < encoded_until_bits but no body
                 //       progress AND no stopping point fired — this is
-                //       a contract violation (advisor item D4): a
+                //       a contract violation: a
                 //       future change to chunk-boundary logic that
                 //       lands `encoded_until_bits` mid-symbol would
                 //       silently truncate output here. Convert to a
@@ -792,7 +780,7 @@ impl<'a> ResumableInflate2<'a> {
                 // is a contract violation. Surface loudly rather than
                 // leaving the body decoder in a state where it sees
                 // bit_position past cap and returns Ok(0) forever (the
-                // infinite-loop bug Opus advisor caught).
+                // infinite-loop bug).
                 if self.bits.bit_position() > self.encoded_until_bits {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -831,8 +819,7 @@ impl<'a> ResumableInflate2<'a> {
             // to the next byte boundary. EOB symbols are Huffman codes
             // and rarely land on a byte boundary themselves, so without
             // this alignment ~7 of every 8 streams would read a footer
-            // 1-7 bits early — Opus advisor flagged this as the highest-
-            // risk silent-corruption path during the wrapper swap audit.
+            // 1-7 bits early — a silent-corruption path.
             // Matches vendor `consume_first_decode.rs:3204` semantics.
             self.bits.align_to_byte();
             self.block_state = BlockState::Finished;
@@ -940,9 +927,6 @@ pub fn resume_decode_stored_resumable(
 ///
 /// No fastloop here — the loop adds a yield check at the top of every
 /// iteration, which precludes the FASTLOOP_MARGIN bounds-skipping trick.
-/// The plan's §5 Tier 2/3 bench gates may motivate adding a fast inner
-/// loop later when output has > 256 bytes of headroom and no pending
-/// match.
 pub fn resume_decode_fixed_resumable(
     state: &mut ResumableInflate2<'_>,
     output: &mut [u8],
@@ -996,8 +980,7 @@ pub fn resume_decode_dynamic_resumable(
 ///   - EOB transitions the parent state machine via `finish_current_block`.
 ///
 /// No fastloop: every iteration has a yield check, which precludes
-/// FASTLOOP_MARGIN bounds-skipping. Documented at the call site as the
-/// §5 Tier-2/3 perf gate target.
+/// FASTLOOP_MARGIN bounds-skipping.
 fn decode_huffman_body_resumable(
     state: &mut ResumableInflate2<'_>,
     output: &mut [u8],
@@ -1005,18 +988,6 @@ fn decode_huffman_body_resumable(
     litlen: &LitLenTable,
     dist: &DistTable,
 ) -> Result<usize> {
-    // SIMD multi-literal fastloop was tried at commit ca52389 and
-    // regressed the inflate bench from 334 → 284 MB/s (-15%) plus
-    // the silesia E2E test 2.79× → 3.06×. Suspected cause: silesia
-    // data has too few literal clusters for `vector_huffman::
-    // decode_multi_literals` lookahead to pay back the per-iteration
-    // overhead. Reverted to the original scalar loop below; the
-    // counters left in place (`MULTI_LITERAL_*`, `BODY_RESUMABLE_*`)
-    // remain reachable for future microbenches.
-    //
-    // The vendor-faithful win is elsewhere — likely BMI2 pext bit
-    // extraction or specializing on FIXED-Huffman static tables.
-    // See `former plans/pure-rust-perf.md` Phase B work-item #1(a).
     // Vendor refill threshold pattern (mirror of
     // `consume_first_decode::decode_huffman_libdeflate_style:852-863`):
     // a single match consumes at most 48 bits — 20 for litlen (12 table +
@@ -1027,8 +998,8 @@ fn decode_huffman_body_resumable(
     // before the dist lookup) was wasted work on the hot path.
     const REFILL_THRESHOLD: u8 = 48;
 
-    // Lever B1 (advisor sign-off review): lift bits-reader fields into
-    // stack locals so LLVM can promote them into registers across loop
+    // Lift bits-reader fields into stack locals so LLVM can promote them
+    // into registers across loop
     // iterations. Vendor counterpart: `consume_first_decode.rs:743-747`
     // (`let mut bitbuf = bits.bitbuf;` etc) with writebacks at every
     // function exit (`:1036-1039` and parallel sites).
@@ -1055,7 +1026,7 @@ fn decode_huffman_body_resumable(
     let mut bitsleft: u32 = oracle.bitsleft;
     let mut in_pos: usize = oracle.pos;
 
-    // Lever T0 (tight-Huffman-decoder plan): lift output base pointer
+    // Lift output base pointer
     // and length to locals so literal writes go through raw-pointer
     // arithmetic instead of slice-indexing. The top-of-loop yield
     // check `out_pos >= output.len()` is the safety boundary that
@@ -1121,7 +1092,7 @@ fn decode_huffman_body_resumable(
         }};
     }
 
-    // Lever B2 (advisor second-pass): PRELOAD the first entry before
+    // PRELOAD the first entry before
     // entering the loop, and re-load (`huffdec!`-style) at the END of
     // each iteration's branch. This overlaps the table-lookup latency
     // with the literal emit / match copy. Vendor counterpart:
@@ -1140,7 +1111,7 @@ fn decode_huffman_body_resumable(
     }
     let mut entry = litlen.lookup(bitbuf);
 
-    // Lever T4 (tight-Huffman-decoder plan): FASTLOOP yield-elide.
+    // FASTLOOP yield-elide.
     // When both buffers have safety margin, run a tight inner loop that
     // omits the per-iteration yield checks. Vendor pattern:
     // `consume_first_decode.rs:752` (`in_fastloop_end = in_data.len() - 32`),
@@ -1183,18 +1154,7 @@ fn decode_huffman_body_resumable(
 
             // LITERAL FAST PATH (bit 31). Vendor: `:870-1030`.
             if (raw as i32) < 0 {
-                // FALSIFICATION 2026-05-28: u32 packed multi-literal
-                // store attempted on this
-                // path; 10-trial neurotic A/B showed parity (+0.4%,
-                // within noise). LLVM + store-buffer coalescing already
-                // merges the 4 separate 1-byte stores below as
-                // effectively one cache-line write. The packed path
-                // added bounds-check + Option<LitLenEntry> carry
-                // tracking that ate any savings. See
-                // docs/perf/2026-05-28-s1-packed-lit-store-falsified.md
-                //
-                // Lever T3 (tight-Huffman-decoder plan): multi-literal
-                // lookahead. After emitting the first literal, peek at
+                // Multi-literal lookahead. After emitting the first literal, peek at
                 // the preloaded `bitbuf` to see if the NEXT entry is
                 // also a literal. If yes, consume+emit it inline. Try
                 // up to 3 extra literals (4 total) when bit budget
@@ -1207,12 +1167,6 @@ fn decode_huffman_body_resumable(
                 // before needing another refill. We don't multi-batch
                 // subtable literals — those go through the EXCEPTIONAL
                 // path with a different consume size.
-                //
-                // Falsification record: commit `ca52389` regressed -15%
-                // at the pre-PRELOAD loop shape. CLAUDE.md update
-                // 2026-05-27 explicitly allows the re-attempt; this
-                // implementation is structurally different (PRELOAD +
-                // register locals + raw-pointer writes are all in place).
                 unsafe {
                     output_ptr.add(out_pos).write(entry.literal_value());
                 }
@@ -1236,7 +1190,7 @@ fn decode_huffman_body_resumable(
                 // output buffers exist in unit tests), the check
                 // prevents UB.
                 //
-                // T3 BUG FIX 2026-05-27: when we carry forward an entry
+                // When we carry forward an entry
                 // (entry = e_next; continue), the next iter's consume
                 // requires up to 45 bits (length codeword + extras +
                 // dist codeword + extras). Post-batch bitsleft can be
@@ -1246,20 +1200,14 @@ fn decode_huffman_body_resumable(
                 // site below does `if (bitsleft as u8) < 56 { refill }`
                 // before the carry to guarantee sufficient bits.
                 //
-                // Caught by the silesia unit test (real-world deflate);
-                // missed by the 729-case synthetic differential because
-                // synthetic fixtures don't produce the multi-literal-
-                // followed-by-length pattern frequently enough to trip
-                // the bug deterministically.
-                // C+T3-simplify (2026-05-28 advisor): drop 4-literal cap
-                // to vendor's 2-extra-literal shape. Vendor
-                // `decompress_template.h:381` explicitly comments that 3
+                // Drop the 4-literal cap to vendor's 2-extra-literal shape.
+                // Vendor `decompress_template.h:381` explicitly comments that 3
                 // extras "actually decreases performance slightly,
                 // perhaps by messing with branch prediction of the
                 // conditional refill that happens later." Gzippy's
                 // 4-cap with 6 conditional-refill carry paths adds
                 // i-cache pressure + branch-pred state. Simpler 2-cap +
-                // unconditional refill matches vendor's measured shape.
+                // unconditional refill matches vendor's shape.
                 if (bitsleft as u8) >= REFILL_THRESHOLD {
                     let e1 = litlen.lookup(bitbuf);
                     let r1 = e1.raw();
@@ -1383,10 +1331,7 @@ fn decode_huffman_body_resumable(
             // out_pos, so no `state.window` touch) AND there is headroom for
             // copy_match_fast's 48-byte unrolled overshoot. This skips the
             // per-match `copy_match_windowed` FUNCTION CALL + its predicate
-            // tower + `state.pending_match` plumbing — that wrapper is ~28%
-            // of inner-loop instructions vs the same copy_match_fast inlined
-            // (examples/inner_bench.rs A/B: ResumableInflate2 22.86B instr vs
-            // non-resumable consume_first 13.82B). pending_match is None on
+            // tower + `state.pending_match` plumbing. pending_match is None on
             // entry (a yielded match would have returned last iteration), and
             // the headroom guarantees no yield, so it stays None.
             //
@@ -1690,17 +1635,9 @@ pub fn copy_match_windowed(
         return Ok(new_pos);
     }
 
-    // S2 (2026-05-28): split slow-path into three vectorizable phases.
-    // Replaces the per-byte loop with bulk memcpys where safe; falls
-    // back to per-byte only for LZ77-overlap (dist < copy_n) in the
-    // output-to-output phase.
-    //
-    // Perf falsification: throughput at parity with the pre-split
-    // per-byte loop in 10-trial interleaved A/B on neurotic (655.7 vs
-    // 657.8 MB/s). The slow path fires too rarely to move overall
-    // throughput — most matches hit `copy_match_fast` above. The new
-    // shape is kept for structural clarity, not perf.
-    // See docs/perf/2026-05-28-s2-bulk-window-copy-falsified.md
+    // Split the slow path into three vectorizable phases. Replaces the
+    // per-byte loop with bulk memcpys where safe; falls back to per-byte
+    // only for LZ77-overlap (dist < copy_n) in the output-to-output phase.
     //
     // Logical layout (src_logical = total_history - dist + i):
     //   Phase 1: i ∈ [0, n_window) where src_logical < window_len
@@ -1898,7 +1835,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
-    // Advisor-requested H1: tiny output buffer (1 byte) forces every iteration
+    // Tiny output buffer (1 byte) forces every iteration
     // to yield with bytes_remaining > 0. Catches off-by-one in the
     // bytes_remaining -= copy_n math, and proves resume-after-yield works.
     #[test]
@@ -1928,7 +1865,7 @@ mod tests {
         );
     }
 
-    // Advisor-requested H2: stored block whose LEN claims more bytes than
+    // Stored block whose LEN claims more bytes than
     // the input has. The truncated-stored branch in
     // resume_decode_stored_resumable returns UnexpectedEof — until this
     // test landed it was uncovered.
@@ -1944,10 +1881,10 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
-    // (The step-4-pending sentinel test was deleted now that dynamic
+    // (The pending-sentinel test was deleted now that dynamic
     // Huffman is wired. Tests below cover real dynamic-block behavior.)
 
-    // ---- Step 3: fixed-Huffman + window-stitched match copy ---------------
+    // ---- fixed-Huffman + window-stitched match copy ---------------
 
     /// Compress `payload` as raw DEFLATE at the requested level. Used as
     /// an oracle for fixed-Huffman blocks (flate2 picks fixed for short
@@ -2083,7 +2020,7 @@ mod tests {
         assert_eq!(got, payload);
     }
 
-    // ---- Step 4: dynamic-Huffman + advisor-suggested edge cases ----------
+    // ---- dynamic-Huffman edge cases ----------
 
     /// Build a payload that strongly biases flate2 toward emitting a
     /// dynamic-Huffman block (variable entropy = dynamic Huffman wins
@@ -2108,7 +2045,7 @@ mod tests {
         (payload, stream)
     }
 
-    // Advisor item 1: dynamic block roundtrip through tiny output chunks.
+    // Dynamic block roundtrip through tiny output chunks.
     // Catches table-persistence-across-yield bugs (the `take`/restore
     // dance around `state.dynamic_tables`).
     #[test]
@@ -2118,7 +2055,7 @@ mod tests {
         assert_eq!(got, payload);
     }
 
-    // Advisor item 2: dynamic block forcing matches longer than a single
+    // Dynamic block forcing matches longer than a single
     // output chunk → PendingMatch save/restore plus dynamic-table
     // persistence on the same call boundary.
     #[test]
@@ -2249,7 +2186,7 @@ mod tests {
         }
     }
 
-    // Advisor item 3: two consecutive dynamic blocks with DIFFERENT
+    // Two consecutive dynamic blocks with DIFFERENT
     // tables. Catches "stale dynamic_tables leak across block
     // boundaries." Build by concatenating two independent
     // raw_deflate streams via a stored-block bridge to force byte
@@ -2279,7 +2216,7 @@ mod tests {
         assert_eq!(got, payload);
     }
 
-    // Advisor item 4: dynamic block straddling `encoded_until_bits`.
+    // Dynamic block straddling `encoded_until_bits`.
     // Per CLAUDE.md "no fallbacks" + vendor GzipReader contract
     // (parallel-SM boundaries land at block boundaries), this MUST be
     // a loud Err — not silent stop and not infinite loop. The
@@ -2303,7 +2240,7 @@ mod tests {
         );
     }
 
-    // Advisor item 5 (highest-value): RFC 1951 §3.2.7 special case —
+    // RFC 1951 §3.2.7 special case —
     // "If only one distance code is used, it is encoded using one bit,
     // not zero bits". A block with all distance code lengths = 0 except
     // a single code of length 1 should decode correctly. If
@@ -2341,7 +2278,7 @@ mod tests {
         );
     }
 
-    // Advisor item 6: truncate the dynamic header at every byte offset
+    // Truncate the dynamic header at every byte offset
     // and ensure the result is Err, never panic or silent corruption.
     #[test]
     fn dynamic_header_truncated_at_every_offset_does_not_panic() {
@@ -2409,7 +2346,7 @@ mod tests {
         assert_eq!(&output[..6], b"XXXXXX");
     }
 
-    // Advisor-requested H4: bit_position after a stored block lands exactly
+    // bit_position after a stored block lands exactly
     // on the byte after the stored payload — locks down the explicit
     // bitbuf=0/bitsleft=0 reset pattern so future "optimizations" can't
     // silently break the byte alignment.
@@ -2640,7 +2577,7 @@ mod tests {
         }
     }
 
-    // §2 divergence 2 (pure-rust-isa-l plan): the no-progress guard at
+    // The no-progress guard at
     // `resumable.rs:512-522` silently breaks the inner loop when a
     // `read_stream` iteration makes zero progress. This catches the case
     // where a body decoder observes `bit_position >= encoded_until_bits`

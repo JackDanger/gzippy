@@ -1,13 +1,11 @@
-//! ASM-campaign rung (c) — the FULL contig clean fast loop as ONE
-//! `core::arch::asm!` region (git history (campaign plan, removed) §2(c), §5 VAR_VIII salvage).
+//! The FULL contig clean fast loop as ONE `core::arch::asm!` region.
 //!
-//! Increment (a) (commit `b5c3f7c4`, REVERTED, recoverable) proved the
-//! per-symbol asm seam costs ~1.4 cyc/crossing with zero latency recovered
-//! (charter §8). Rung (c) is the only shape that amortizes the seam: the asm
-//! owns the per-symbol hot path of `Block::decode_clean_into_contig`'s fast
-//! loop (marker_inflate.rs:2466-2827) with the back-edge INSIDE the asm;
-//! Rust is re-entered only at fast-loop boundaries (out-of-room, input-low,
-//! EOB, rare/exceptional packets).
+//! Owning the whole fast loop as one asm region (rather than a per-symbol
+//! asm seam) amortizes the Rust↔asm crossing cost: the asm owns the
+//! per-symbol hot path of `Block::decode_clean_into_contig`'s fast loop
+//! (marker_inflate.rs:2466-2827) with the back-edge INSIDE the asm; Rust is
+//! re-entered only at fast-loop boundaries (out-of-room, input-low, EOB,
+//! rare/exceptional packets).
 //!
 //! ───────────────────────────────────────────────────────────────────────────
 //! # EXIT-STATE CONTRACT (the hard part — enumerated BEFORE the asm exists)
@@ -40,7 +38,7 @@
 //!  E6. No measurement knob is active (`contig_prof`, `slow_knob` spins,
 //!      removal-oracle replay/nostore/record) and
 //!      `track_backreferences == false` — `dispatch_allowed` is the single
-//!      predicate (charter §3.5: hooks cannot fire inside asm; a silently
+//!      predicate (hooks cannot fire inside asm; a silently
 //!      unperturbable region would poison every causal instrument).
 //!
 //! ## Exit postconditions (EVERY exit code)
@@ -56,7 +54,7 @@
 //!          replicated at the same program points;
 //!        * long litlen codes are resolved INSIDE the asm (a bail-to-Rust
 //!          there would change LIT_CHAIN_MAX accounting and hence refill
-//!          placement — see the chain-count analysis in the c2 commit);
+//!          placement);
 //!        * the asm NEVER runs a slow refill: `IN_MARGIN` makes the fast
 //!          `pos + 8 <= len` precondition structural (proof below).
 //!  X2. The cursor sits BEFORE a fresh un-consumed packet — never
@@ -93,7 +91,7 @@
 //!    identical): the next packet needs Rust — EOB (lone or trailing,
 //!    tag 2), `bit_count == 0` (invalid), symbol > MAX_LIT_LEN_SYM (lone
 //!    plain, trailing tag 3), a backref (lone OR multi-with-trailing)
-//!    whose dist decode hit a subtable pointer (rare; charter §5-R1) or
+//!    whose dist decode hit a subtable pointer (rare) or
 //!    `raw == 0` / `distance == 0` / `distance > 32768` /
 //!    `distance > *pos` (restored incl. dst, X2; tag 4). The caller
 //!    leaves `asm_on = true`; the Rust loop handles exactly that packet and
@@ -118,7 +116,7 @@
 //! of `entry & 0x00FF_FFFF` (up to 3 packed literal bytes), advance by
 //! `sym_count`. This is the libdeflate/igzip fastloop shape and folds the
 //! lone-literal case into the multi path so the per-symbol classify needs
-//! no `sym_count` branch (the old 1-byte lone store / advisor-Q3 special
+//! no `sym_count` branch (the old 1-byte lone store special
 //! case is retired — the extra store-buffer width is dominated by the
 //! branch-misprediction it removes). Bytes above `dst` are X3 overshoot,
 //! never read back. Backref copy (igzip-full-rewrite): a faithful 16-byte
@@ -128,12 +126,12 @@
 //! grow the period by store+double-distance until >= COPY_SIZE then large.
 //! Output in `[dst, dst+length)` is byte-identical to the scalar
 //! `emit_backref_contig` walk (overshoot above dst is X3). `length > 240`
-//! (mean back-ref len 6.3, so ~never) keeps the proven scalar P3.4 shape
+//! (mean back-ref len 6.3, so ~never) keeps the proven scalar shape
 //! (dist ≥ 8 burst-5 + stride-8 words; dist == 1 RLE broadcast word; 2..=7
 //! stride-dist words; `length > 40` prefetch) so the write extent stays
 //! inside the MAX_RUN_LENGTH+8 ring envelope.
 //!
-//! ## Dispatch policy (charter §4)
+//! ## Dispatch policy
 //! Cargo feature `asm-kernel`, x86_64-only call sites; pure-Rust loop ALWAYS
 //! compiled and reachable. Runtime: BMI2 detect (`shrx`/`shlx`/`bzhi`),
 //! cached in a `OnceLock` (one predictable branch per contig call), is the
@@ -152,30 +150,28 @@ pub const IN_MARGIN: usize = 40;
 
 /// Exit codes (module doc "Exit codes"). The caller's contract tests ONLY
 /// `== EXIT_BOUNDARY`; every other value is a RECLASS. Values >= 2 are
-/// reason-tagged RECLASSes for the effect/coverage instrument (decide.sh
-/// EFFECT predicate + the F-c asm_frac diagnosis) — semantically identical
-/// to `EXIT_RECLASS`.
+/// reason-tagged RECLASSes for the effect/coverage instrument —
+/// semantically identical to `EXIT_RECLASS`.
 pub const EXIT_RECLASS: u64 = 0; // invalid / oversize / lone EOB-class top bail
 pub const EXIT_BOUNDARY: u64 = 1;
 pub const EXIT_RECLASS_EOB: u64 = 2; // lone EOB packet
 pub const EXIT_RECLASS_MULTI_TRAIL: u64 = 3; // multi-literal packet with trailing non-literal
 pub const EXIT_RECLASS_DIST: u64 = 4; // backref arm dist-side bail (subtable/raw0/validity)
 
-// NIGHT15 DECOMPOSITION INSTRUMENT (byte-transparent; the caller collapses every
+// DECOMPOSITION sub-tags (byte-transparent; the caller collapses every
 // non-BOUNDARY exit to EXIT_RECLASS, so these sub-tags change ONLY which stat
 // counter increments — Rust handling + the 85: re-read reconstruct are identical
-// for all of them). They split the lumped EXIT_RECLASS_DIST (reclass_dist=6410 on
-// silesia, NIGHT14) into its four mutually-exclusive causes to TEST the task's
-// load-bearing premise that subtable-dist DOMINATES (vs the out-of-scope
-// window-absent marker case `src < out_base`, which keeps the D-1 anchor alive).
+// for all of them). They split the lumped EXIT_RECLASS_DIST into its four
+// mutually-exclusive causes (subtable-dist vs the out-of-scope window-absent
+// marker case `src < out_base`).
 pub const EXIT_RECLASS_RAW0: u64 = 5; // dist entry raw==0 (hole / code 30,31 — invalid)
 pub const EXIT_RECLASS_SUBTABLE: u64 = 6; // dist subtable pointer (the removable bucket)
 pub const EXIT_RECLASS_BADDIST: u64 = 7; // distance==0 or >MAX_WINDOW (invalid)
 pub const EXIT_RECLASS_MARKER: u64 = 8; // src<out_base (window-absent backref — OUT OF SCOPE)
 
-/// The single dispatch predicate for the knob-exclusion rule (charter §3.5)
-/// — pure so it is unit-testable. `enabled()` (env + CPU) is checked
-/// separately by the call site; this covers the per-call state.
+/// The single dispatch predicate for the knob-exclusion rule — pure so it is
+/// unit-testable. `enabled()` (env + CPU) is checked separately by the call
+/// site; this covers the per-call state.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)] // mirrors the knob list 1:1 (charter §3.5)
 pub fn dispatch_allowed(
@@ -197,8 +193,8 @@ pub fn dispatch_allowed(
         && local_cap > fast_out_slop
 }
 
-/// Loop-invariant context + INLINE Huffman tables for the asm region —
-/// ELEMENT A: igzip's single-state-base register discipline
+/// Loop-invariant context + INLINE Huffman tables for the asm region.
+/// Mirrors igzip's single-state-base register discipline
 /// (`igzip_decode_block_stateless.asm`: ONE `state` base in r11, tables via
 /// struct offsets `[state+_lit_huff_code+...]` / `[state+_dist_huff_code+...]`;
 /// struct `igzip_lib.h:515-524`). The litlen LUT and the dist table are
@@ -207,11 +203,11 @@ pub fn dispatch_allowed(
 /// `[{ctx}+ASM_DIST_OFF+idx*4]` — instead of two extra pinned base registers
 /// ({short_tbl}, {dtbl}). Those 2 freed GP registers carry the iteration-top
 /// `p0`/`d0` un-consume anchor IN-REGISTER, deleting the 2 per-iteration anchor
-/// STORES (former `[ctx+56]`/`[ctx+64]`; D-1 ledger).
+/// STORES (former `[ctx+56]`/`[ctx+64]`).
 ///
 /// ZERO-COPY: the tables are BUILT IN PLACE inside this boxed struct (held in
-/// the decoder `self`, stable address) — a per-region copy (~7465 blocks ×
-/// ~27 KiB on silesia) would negate the win. `in_ptr` stays a separate
+/// the decoder `self`, stable address) — a per-region copy would negate the
+/// win. `in_ptr` stays a separate
 /// register (it indexes the compressed input window `[in_ptr+pos]`, not state
 /// — igzip likewise keeps `next_in` in its own register).
 ///
@@ -228,7 +224,7 @@ pub struct AsmState {
     /// +16: `base + pos_entry + local_cap - FAST_OUT_SLOP` — top guard
     /// `dst < out_lim` (E4: exactly the Rust out guard).
     pub out_lim: u64,
-    /// +24: `base` as integer — c3 backref validity (`src >= out_base` ⇔
+    /// +24: `base` as integer — backref validity (`src >= out_base` ⇔
     /// `distance <= *pos`).
     pub out_base: u64,
     /// +32: litlen LUT, INLINE (short_code_lookup `[u32;4096]` at +32 then
@@ -316,9 +312,9 @@ mod imp {
         *ON.get_or_init(|| std::arch::is_x86_feature_detected!("bmi2"))
     }
 
-    /// The rung-(c) kernel region.
+    /// The kernel region.
     ///
-    /// BRANCHLESS-CLASSIFY (this commit): the LITERAL hot path is a FLAT
+    /// BRANCHLESS-CLASSIFY: the LITERAL hot path is a FLAT
     /// igzip/libdeflate-style dispatch — iteration-top guards, raw short-LUT
     /// gather, long-code resolution (`20:`), then ONE data-dependent branch
     /// (`cmp 255` on the uniformly-extracted TRAILING packed symbol, the
@@ -329,7 +325,7 @@ mod imp {
     /// literal are GONE — one packet per top-iteration, one bottom `< 48`
     /// refill, and the back-edge.
     ///
-    /// STAGE c3 (this commit): the BACKREF arm lives inside too (`50:`) —
+    /// The BACKREF arm lives inside too (`50:`) —
     /// a lone length code (short or long path) consumes the litlen packet,
     /// SPECULATIVELY PRELOADS the dist short entry from the post-consume
     /// bitbuf at the consume point (igzip `decode_next_dist` 457 + load
@@ -341,12 +337,12 @@ mod imp {
     /// `bzhi(saved, total_bits) >> cw_bits`
     /// + base), validates (raw==0 / subtable / dist==0 / >32768 / > *pos),
     /// runs the X1 pre-copy `< 48` refill + carried-packet preload (the
-    /// P3.5 c1 hoist), and copies with the P3.4 `emit_backref_contig`
+    /// hoist), and copies with the `emit_backref_contig`
     /// shape transliterated verbatim (dist>=8 burst-5 + stride-8 words;
     /// dist==1 RLE broadcast word; 2..=7 stride-dist words; `length > 40`
     /// prefetch). The X2 spill/restore (`80:`) makes every rare bail
     /// pre-consume. Remaining `EXIT_RECLASS` packets: lone EOB, invalid,
-    /// oversize (>512), dist-subtable (rare; charter §5-R1), dist validity
+    /// oversize (>512), dist-subtable (rare), dist validity
     /// errors (Rust re-executes to the identical error commit), and
     /// multi-with-trailing (builder-impossible, kept for defense) — all at
     /// an iteration top, cursor before a fresh un-consumed packet.
@@ -389,13 +385,12 @@ mod imp {
     /// dist tables and the input window; it writes only `[entry dst,
     /// exit dst + copy-overshoot)` inside the reserved out_room envelope
     /// (E4; the copy overshoot <= max(40, length+7) <= 265 < the
-    /// MAX_RUN_LENGTH + 8 = 266 reservation, the P3.4 envelope) and the
+    /// MAX_RUN_LENGTH + 8 = 266 reservation) and the
     /// pinned registers.
     ///
-    /// `#[inline(never)]`: c2's frozen A/B measured OFF-vs-base +36 ms —
-    /// inlining the (cold-when-disabled) region into the hot Rust loop
-    /// taxes its layout even when killed. One CALL per region run is
-    /// amortized by the in-asm back-edge.
+    /// `#[inline(never)]`: inlining the (cold-when-disabled) region into the
+    /// hot Rust loop taxes its layout even when killed. One CALL per region
+    /// run is amortized by the in-asm back-edge.
     #[inline(never)]
     pub unsafe fn run_contig(ctx: &AsmState, lb: &mut Bits<'_>, dst: *mut u8) -> (u64, *mut u8) {
         #[cfg(test)]
@@ -415,20 +410,19 @@ mod imp {
                 "mov {t1:e}, {bitbuf:e}",
                 "and {t1:e}, 0xFFF",
                 "mov {t1:e}, dword ptr [{ctx} + {t1}*4 + {lit_off}]",
-                // ── NIGHT36: HOIST the resumable BOUNDARY set `ret=1` OUT of the
+                // ── HOIST the resumable BOUNDARY set `ret=1` OUT of the
                 //    hot literal loop top. On the literal path `{ret}` is written
                 //    but never read until a guard-exit (`9f`); it is CLOBBERED only
                 //    in the two backref arms (`74:` lea/`70:` mov reuse {ret} as the
                 //    copy cursor — 15-GP-operand ceiling). So set it ONCE here, and
                 //    re-set it ONLY on the backref completion paths (74:/59:) before
                 //    they loop to `2b`. Removes 1 instr/iter from the hot literal
-                //    path (the ~0.20 instr/B `ret=1` bucket, NIGHT34 ledger);
-                //    long-literal paths (64:/20:/21:) never touch {ret}. {ret} is
-                //    NOT loop-carried (dedicated `out(reg)`, dead on the literal
-                //    path) so this adds NO live-range across the refill (the NIGHT32
-                //    hazard) and lengthens NO loop-carried chain. Byte-exact: the
-                //    {ret} VALUE at every exit is unchanged (boundary=1, reclass tags
-                //    set in their own arms) ⇒ ref model needs no change.
+                //    path; long-literal paths (64:/20:/21:) never touch {ret}. {ret}
+                //    is NOT loop-carried (dedicated `out(reg)`, dead on the literal
+                //    path) so this adds NO live-range across the refill and
+                //    lengthens NO loop-carried chain. Byte-exact: the {ret} VALUE at
+                //    every exit is unchanged (boundary=1, reclass tags set in their
+                //    own arms) ⇒ ref model needs no change.
                 "mov {ret}, 1",                       // speculative BOUNDARY (hoisted, once)
                 // ── iteration top: guards (E4) ──────────────────────────
                 "2:",
@@ -436,8 +430,8 @@ mod imp {
                 "jae 9f",
                 "cmp {pos}, qword ptr [{ctx} + 8]",   // pos vs in_lim
                 "jae 9f",
-                // ── NIGHT11 MINIMAL UN-CONSUME ANCHOR (the night9 4-store X2
-                //    snapshot is DELETED — see DIVERGENCE LEDGER). The late-
+                // ── MINIMAL UN-CONSUME ANCHOR (the prior 4-store X2
+                //    snapshot is DELETED). The late-
                 //    discriminator body below CONSUMES + REFILLS + speculatively
                 //    STORES before it knows the packet is non-literal, so a rare
                 //    bail must hand Rust the packet UN-consumed (X2). Instead of
@@ -451,14 +445,14 @@ mod imp {
                 //        (the consumed low bits are shifted out — unrecoverable
                 //        from post-consume registers).
                 //      {d0} = dst (iteration-top dst; un-consume target).
-                //    ELEMENT A: with {short_tbl}+{dtbl} folded into the single
+                //    With {short_tbl}+{dtbl} folded into the single
                 //    {ctx} base (inline tables), the 2 freed GP registers carry
                 //    p0/d0 IN-REGISTER — the 2 per-iteration anchor STORES
                 //    (former `mov [ctx+56],p0` / `mov [ctx+64],dst`) are DELETED
-                //    (igzip stateless single-base; D-1 ledger). The bails read
+                //    (igzip stateless single-base). The bails read
                 //    p0/d0 from registers at 85:.
-                // ── NIGHT40: HOIST the {d0} dst anchor OFF the hot literal path
-                //    (the NIGHT36 ret=1 pattern applied to the dst un-consume
+                // ── HOIST the {d0} dst anchor OFF the hot literal path
+                //    (the ret=1 pattern applied to the dst un-consume
                 //    target). {d0} is read ONLY on a non-literal/long bail (85:),
                 //    never on the literal back-edge (`jb 2b`), so the per-iteration
                 //    `mov {d0},{dst}` on the HOT literal path is pure waste. It is
@@ -474,8 +468,8 @@ mod imp {
                 //    change. The {p0} bit anchor (lea+sub) STAYS on the hot path:
                 //    moving it would need `bc` reconstructed at the bail, but `bc`
                 //    (`{t2}`) is DESTROYED by the refill (`6:` reuses {t2}) and
-                //    keeping it live across the refill is the NIGHT32 trap (register
-                //    live-range / schedule hazard → cyc/B regress). cnt survives the
+                //    keeping it live across the refill is a register
+                //    live-range / schedule hazard. cnt survives the
                 //    refill ({t3} untouched), bc does not — that asymmetry is why d0
                 //    is hoistable and p0 is not.
                 "lea {p0}, [{pos} * 8]",
@@ -491,7 +485,7 @@ mod imp {
                 "mov {t3:e}, {t1:e}",
                 "shr {t3:e}, 26",
                 "and {t3:e}, 3",                      // cnt = sym_count (1/2/3)
-                // ── STEP-2(b) MASK-ONCE (igzip decode_next_lit_len macro 341
+                // ── MASK-ONCE (igzip decode_next_lit_len macro 341
                 //    `and next_sym, LARGE_SHORT_SYM_MASK`): clear bc/cnt/
                 //    LARGE_FLAG (bits 25-31) from {t1} IN PLACE — all already
                 //    extracted (bc→{t2} @449, cnt→{t3} @451-453, LARGE_FLAG
@@ -505,7 +499,7 @@ mod imp {
                 //    from {t5}/{t3}, so the in-place mask is safe. (`and r32`
                 //    zero-extends, so {t1}'s high 32 bits are 0 for the store.)
                 "and {t1:e}, 0x1FFFFFF",              // LARGE_SHORT_SYM_MASK (ONCE)
-                // CONSUME-REORDER (candidate #1, igzip 370-371 order): consume the
+                // CONSUME-REORDER (igzip 370-371 order): consume the
                 // litlen bits HERE (right after mask), BEFORE the trailing extract +
                 // spec store, matching igzip decode_next_lit_len (consume before the
                 // store 518). Byte-exact: nothing between mask and the old consume
@@ -517,7 +511,7 @@ mod imp {
                 "sub {bitsleft}, {t2}",
                 // ── TRAILING EXTRACT (igzip 520-521), UNCONDITIONAL every
                 //    iteration: next_sym2 = (masked >> 8*(cnt-1)) & 0xFFFF. The
-                //    post-shrx & 0xFFFF was DELETED (NIGHT34, igzip _04 0x38d25
+                //    post-shrx & 0xFFFF was DELETED (igzip _04 0x38d25
                 //    convergence): the mask-once `and 0x1FFFFFF` clears class
                 //    bits 25-31 and the LUT build zero-fills unused symbol slots,
                 //    so bits above the trailing are already 0 for every cnt. {t4}
@@ -536,12 +530,11 @@ mod imp {
                 //    `and 0xFFFFFF` store, which only differed in byte 3).
                 "mov qword ptr [{dst}], {t1}",        // speculative 8-byte store
                 "add {dst}, {t3}",                    // advance by cnt
-                // ── SPLIT REFILL + SOFTWARE-PIPELINED PRELOAD CADENCE (NIGHT19:
-                //    converge run_contig's per-iteration SCHEDULE on igzip's EXACT
-                //    loop_block straight-line order 524-552 — element F of the
-                //    KERNEL-CONVERGENCE map, the remaining divergence in the
-                //    software-pipelined shape that owns the loop-carried
-                //    dependency chain / hot-loop IPC, NIGHT18). Three coupled
+                // ── SPLIT REFILL + SOFTWARE-PIPELINED PRELOAD CADENCE
+                //    (converge run_contig's per-iteration SCHEDULE on igzip's EXACT
+                //    loop_block straight-line order 524-552 — the software-pipelined
+                //    shape that owns the loop-carried dependency chain / hot-loop
+                //    IPC). Three coupled
                 //    reorders vs the prior contiguous `6:` block, all byte-exact
                 //    (refill is append-only; ref model is functional, unchanged):
                 //      (1) igzip 524-525: extract the NEXT litlen INDEX from the
@@ -572,8 +565,7 @@ mod imp {
                 //    the just-consumed (loop-carried) bitbuf — an EXTRA dependent op
                 //    on the recurrence shrx→COPY→and→load. AND is commutative so the
                 //    index value (bitbuf & 0xFFF) is byte-identical; pure schedule
-                //    convergence (NIGHT24 located the divergence: objdump c33b5
-                //    `mov %r8d,%r13d` vs igzip's off-path const-mov).
+                //    convergence to igzip's off-path const-mov.
                 "mov {t4:e}, 0xFFF",                  // (1) igzip 524: mask CONST (off critical path)
                 "and {t4:e}, {bitbuf:e}",             //     igzip 525: index = bitbuf & 0xFFF (single crit op)
                 "mov {t2}, qword ptr [{in_ptr} + {pos}]", // (2) igzip 528-530: OR
@@ -607,7 +599,7 @@ mod imp {
                 //    data-dependent branch resolves.
                 "cmp {t5:e}, 256",
                 "jb 2b",                              // literal → loop (HOT)
-                // ── NIGHT40: short non-literal — capture the hoisted {d0} dst
+                // ── short non-literal — capture the hoisted {d0} dst
                 //    anchor HERE (off the hot literal path). dst = base+cnt (the
                 //    speculative store advanced by cnt), so iteration-top dst =
                 //    dst - cnt = dst - {t3}. {t3}=cnt is still live (set pre-refill,
@@ -678,7 +670,7 @@ mod imp {
                 //    the dist entry, length, → 58: (no `dec` — dst is already
                 //    the copy start).
                 "21:",
-                // NIGHT40: long lone non-literal — dst was NOT advanced on the
+                // long lone non-literal — dst was NOT advanced on the
                 //    long path (no speculative store), so iteration-top dst == dst.
                 //    Capture the hoisted {d0} here (covers long EOB/oversize 82:/8:
                 //    and long dist bails 90/92/93). Byte-exact == old top capture.
@@ -719,7 +711,7 @@ mod imp {
                 //    bail un-consume (tag at `80:` → reconstruct at `85:`). ──
                 "58:",
                 "mov {t1:e}, {dpre:e}",               // preloaded dist entry → t1
-                // FLOOR ORACLE (NIGHT16): subtable leaf re-enters here (the
+                // Subtable leaf re-enters here (the
                 // inline subtable decode at 91: loads the leaf into {t1} and
                 // jumps back to 94b). On a leaf the two tests below are
                 // harmless: a valid leaf is nonzero (raw0 test falls through)
@@ -743,7 +735,7 @@ mod imp {
                 "shrx {t3}, {t3}, {t4}",              // extra value
                 "shr {t1:e}, 16",                     // distance base
                 "add {t1:e}, {t3:e}",                 // distance
-                // CORRECTNESS-NEUTRAL DEAD-CHECK REMOVAL (Intel-silesia lever):
+                // CORRECTNESS-NEUTRAL DEAD-CHECK REMOVAL:
                 // the `distance==0` and `distance>32768` bails are UNREACHABLE — a
                 // decoded distance = LutDistCode base (1..24577) + bounded extra is
                 // always in [1,32768] by construction, and an invalid dist code is
@@ -753,15 +745,14 @@ mod imp {
                 // diff_max_distance_backrefs_l9, 19/19) and corruption-behavior-
                 // NEUTRAL (base-vs-after crash CONTROL identical on adversarial
                 // mutants); the kept `src<out_base` bound (93f) + final CRC32 remain
-                // the backstops. Gated Intel: gz/igzip 1.023->1.003 (instr/B -0.254
-                // RESOLVED, 19/21 faster).
+                // the backstops.
                 "mov {t4}, {dst}",
                 "sub {t4}, {t1}",                     // src = dst - distance
                 "cmp {t4}, qword ptr [{ctx} + 24]",
                 "jb 93f",                             // src < out_base ⇔ distance > *pos → restore (tag 8, marker)
-                // RANK-2 UNCONDITIONAL pre-copy refill (igzip-converge: igzip
+                // UNCONDITIONAL pre-copy refill (igzip-converge: igzip
                 // refills UNCONDITIONALLY; the `cmp bitsleft,48; jae 51f` skip is
-                // DELETED to remove the STEP-1-located silesia 36%-mispredict
+                // DELETED to remove the mispredict
                 // branch). Byte-exact: the refill is append-only and the fast
                 // form is bit-for-bit `Bits::refill` (the ref-model pre-copy
                 // refill `run_contig_ref_biased` is made unconditional in
@@ -774,19 +765,16 @@ mod imp {
                 // len (fast form only; the IN_MARGIN proof is preserved — the
                 // refill was already issued conditionally here, this only removes
                 // the skip). The carried gather below is pure.
-                // CURSOR2 (single-refill convergence to igzip): DELETE the SECOND
+                // SINGLE-REFILL convergence to igzip: DELETE the SECOND
                 // per-back-ref refill (the `or {bitbuf}` + input load + pos-advance
                 // + `or {bitsleft},56`). igzip refills ONCE per loop_block iteration
                 // (528-530 / 543-547), covering BOTH the litlen and dist consumes
                 // from that one full-budget refill, doing only a table preload before
                 // the copy (575-577). gz had been refilling AGAIN here after the dist
                 // consume — an EXTRA `or {bitbuf}` on the LOOP-CARRIED bitbuf
-                // recurrence (bitbuf feeds the next index→entry-load) for ~30% of
-                // iterations. That on-chain edge is the gz-specific critical-path
-                // lengthening behind the +9% cyc/B vs igzip (gz IPC is already HIGHER
-                // and mispredicts FEWER; gated trainer 2026-06-23: prior
-                // instr-count cuts were cyc-FLAT/slack ⇒ the loop is LATENCY-bound,
-                // so only chain-shortening moves the wall).
+                // recurrence (bitbuf feeds the next index→entry-load). That on-chain
+                // edge lengthens the critical path; the loop is latency-bound, so
+                // only chain-shortening moves the wall.
                 //
                 // BYTE-EXACT BUDGET PROOF: after `6:` real bitsleft F∈[56,63] (the
                 // `or 56` accounting is exact for byte-granular loads). Dist consume
@@ -820,12 +808,12 @@ mod imp {
                 //    <= 15, so dst+240+15 = dst+255 <= cap-12 (the scalar
                 //    path's own bound is dst+264 <= cap-3,
                 //    marker_inflate.rs:2959-2962).
-                // RANK-3 (B3) libdeflate overshoot-burst routing
-                // (decompress_template.h:590-622): short-medium matches (<=40 B —
-                // the nasa-dominant variable-trip-count case) take the scalar
+                // libdeflate overshoot-burst routing
+                // (decompress_template.h:590-622): short-medium matches (<=40 B,
+                // the common variable-trip-count case) take the scalar
                 // 5-word (40 B) UNCONDITIONAL burst at `70:` — one shot, NO
-                // per-16B `sub {t2},16; jle` trip-count loop (removes the nasa
-                // 48%-mispredict B3 branch for the common length range). Long
+                // per-16B `sub {t2},16; jle` trip-count loop (removes the
+                // mispredict branch for the common length range). Long
                 // matches (41..240) keep the 16-B MOVDQU SIMD loop (SIMD
                 // efficiency where the loop is amortized); >240 also takes the
                 // scalar path. Byte-exact: both copy paths are proven equivalent
@@ -835,19 +823,17 @@ mod imp {
                 // differential + ref model are unchanged. Envelope-safe: <=40
                 // scalar extent <=48 B, 41..240 MOVDQU extent <=255 B, >240
                 // scalar extent <=265 B — all < FAST_OUT_SLOP=282.
-                // COPYFLOOR-C (VEX-converge): all back-ref copy SIMD ops are
+                // VEX-converge: all back-ref copy SIMD ops are
                 // VEX `vmovdqu` (igzip emits VEX vmovdqu; gz had emitted legacy
                 // SSE `movdqu`). Byte-exact (identical low-128 semantics; ymm0
-                // upper is dead scratch). llvm-mca/chainlat rates legacy-SSE and
-                // VEX movdqu identical (copy loop cyc/iter Δ=0.000), but legacy
-                // SSE mixed with the AVX2 code elsewhere in the binary
-                // (memchr/memmove avx2) can incur AVX-SSE dirty-upper
-                // false-dependency penalties llvm-mca cannot see. VEX avoids it
+                // upper is dead scratch). Legacy SSE mixed with the AVX2 code
+                // elsewhere in the binary (memchr/memmove avx2) can incur
+                // AVX-SSE dirty-upper false-dependency penalties. VEX avoids it
                 // and matches igzip's encoding faithfully.
-                // EDIT1 (dispatch-delete): kill the `cmp {t2},40` mispredict (9% cyc,
-                // ~10% br-miss). dist<16 → scalar overlap; len>48 → MOVDQU loop (RARE,
-                // >99% not-taken at mean len 6.3); else the proven branchless 3x MOVDQU
-                // burst (covers len<=48; 48B write = the threshold). No straddling branch.
+                // Kill the `cmp {t2},40` mispredict. dist<16 → scalar overlap;
+                // len>48 → MOVDQU loop (RARE, >99% not-taken at mean len 6.3);
+                // else the proven branchless 3x MOVDQU burst (covers len<=48; 48B
+                // write = the threshold). No straddling branch.
                 "cmp {t1}, 16",
                 "jb 60f",                             // dist<16 → scalar overlap (period-growth)
                 "cmp {t2}, 48",
@@ -893,8 +879,8 @@ mod imp {
                 "mov {ret}, 1",                       // NIGHT36: restore hoisted BOUNDARY ({ret} clobbered as copy cursor)
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
-                // RANK-2 (project_rank2_instr_locate_2026_06_23): the dist>=8
-                // 5-word SCALAR burst below is 19.6% of all gz instructions.
+                // The dist>=8 5-word SCALAR burst below is a large fraction of
+                // all gz instructions.
                 // For the dist>=16 AND len<=40 sub-bucket, replace it with an
                 // UNCONDITIONAL 3x 16-byte MOVDQU burst (48 B written, NO
                 // trip-count loop). PRESERVES B3's branchlessness (no nasa
@@ -1006,13 +992,13 @@ mod imp {
                 //    lockstep; the caller only re-runs decode_prefilled(&lb),
                 //    never inspecting the cursor shape. igzip has no counterpart
                 //    (stateless — it never un-consumes).
-                // NIGHT15 decomposed dist-bail labels (replace the lumped 80:).
+                // Decomposed dist-bail labels (replace the lumped 80:).
                 // All reconstruct identically at 85: (re-read from p0, dst=d0);
                 // the only difference is the stat tag in {ret}. Byte-transparent.
                 "90:",
                 "mov {ret}, 5",                       // RECLASS raw==0 (hole/invalid)
                 "jmp 85f",
-                // FLOOR ORACLE (NIGHT16): INLINE subtable-dist (igzip
+                // INLINE subtable-dist (igzip
                 // decode_next_dist long path, igzip_decode_block_stateless.asm
                 // macro 396-440; mirror of production careful path
                 // marker_inflate.rs:3447-3449 `if is_subtable_ptr { consume(9);
@@ -1074,7 +1060,7 @@ mod imp {
                 "86:",
                 "mov {ret}, 0",                       // RECLASS (invalid)
                 "9:",
-                // ELEMENT A single base: {ctx} addresses the inline litlen +
+                // single base: {ctx} addresses the inline litlen +
                 // dist tables via const-operand displacements (igzip single
                 // state base). {short_tbl} + {dtbl} are GONE (2 GP freed);
                 // {p0}/{d0} carry the un-consume anchor in those freed regs.
@@ -1135,10 +1121,9 @@ pub fn run_contig_ref(
     run_contig_ref_biased::<0>(lut, dist, lb, out, dst, out_lim, in_lim, &mut stats)
 }
 
-/// Arm-level coverage counters for the REFERENCE model — flip-precondition 2
-/// (campaign §9 gate): the differential must PROVE it exercises the asm's
-/// `25:` multi-literal+trailing-LENGTH arm (99.6% of c3a crossings — the
-/// make-or-break arm of the F-c coverage gate), not silently degrade to
+/// Arm-level coverage counters for the REFERENCE model — flip-precondition 2:
+/// the differential must PROVE it exercises the asm's
+/// `25:` multi-literal+trailing-LENGTH arm, not silently degrade to
 /// literals-only/lone-backref traffic after a refactor.
 ///
 /// The ref counts are a valid proxy for the ASM arm: the differential pins
@@ -1159,8 +1144,7 @@ pub struct RefArmStats {
 }
 
 /// `run_contig_ref` with a test-injected CONSUME BIAS — the flip-precondition
-/// positive control for the bit-consume failure class (asm-campaign §9 flip
-/// gate, precondition 1).
+/// positive control for the bit-consume failure class.
 ///
 /// `CONSUME_BIAS` is added to the lone-literal arm's litlen consume count
 /// (`lb.consume(pre.bit_count + BIAS)`), modeling exactly an off-by-one in
@@ -1187,8 +1171,8 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         if *dst >= out_lim || lb.pos >= in_lim {
             return EXIT_BOUNDARY;
         }
-        // NIGHT11 MINIMAL UN-CONSUME ANCHOR (lockstep with the asm's
-        // [ctx+56]=p0 / [ctx+64]=d0 capture): the night9 4-value snapshot is
+        // MINIMAL UN-CONSUME ANCHOR (lockstep with the asm's
+        // [ctx+56]=p0 / [ctx+64]=d0 capture): the prior 4-value snapshot is
         // DELETED. Capture only the iteration-top BIT POSITION `p0` (refill-
         // invariant) and `d0`; a rare bail reconstructs the whole cursor from
         // `p0` via the identical from-data re-read (`reclass_reread`).
@@ -1207,7 +1191,7 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         // BUILD-TIME trailing-class flag bit but the resulting predicate is
         // exactly `trailing >= 256` (lut_huffman flag invariant); this ref
         // extracts the trailing packed symbol the way the asm now does in the
-        // body. The `& 0xFFFF` was removed (NIGHT34 igzip-converge): redundant
+        // body. The `& 0xFFFF` was removed (igzip-converge): redundant
         // given the 0x01FF_FFFF mask + the LUT build's zero-filled upper slots.
         let trailing = (pre.symbol & 0x01FF_FFFF) >> (8 * (cnt - 1));
         // SPECULATIVE STORE + advance by cnt (asm 518-519), UNCONDITIONAL — the
@@ -1239,7 +1223,7 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
         // decode_len_dist: dst = base+cnt → copy start base+cnt-1 (asm `dec`).
         *dst -= 1;
         let length = trailing as usize - 254;
-        // FLOOR ORACLE (NIGHT16): inline subtable-dist in lockstep with the asm
+        // inline subtable-dist in lockstep with the asm
         // 91:→94b path (mirror of careful path marker_inflate.rs:3447-3449).
         // After consuming the 9 main DistTable bits, the leaf entry's
         // total_bits/codeword_bits are relative to the post-9-consume bitbuf, so
@@ -1261,8 +1245,8 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
             if distance == 0 || distance > 32768 || distance > *dst {
                 true
             } else {
-                // CURSOR2 lockstep: the asm DROPS the second per-back-ref refill
-                // (single-refill convergence to igzip), so the ref model drops its
+                // Single-refill lockstep: the asm DROPS the second per-back-ref
+                // refill (convergence to igzip), so the ref model drops its
                 // pre-copy `lb.refill()` here too — keeping the c2/c3 cursor-
                 // equality differential (asm.pos/bitbuf/bitsleft == ref) exact.
                 // Budget proof in the asm comment: F−D ≥ 28 bits remain, enough for
@@ -1318,7 +1302,7 @@ mod tests {
 
     #[test]
     fn dispatch_allowed_excludes_every_knob() {
-        // Charter §3.5: any active measurement knob must force the pure-Rust
+        // Any active measurement knob must force the pure-Rust
         // path so causal instruments can still perturb the region.
         let ok = |p, n, o, d, s, t, cap| dispatch_allowed(p, n, o, d, s, t, cap, 8);
         assert!(ok(false, false, false, 0, 0, false, 9));
@@ -1347,7 +1331,7 @@ mod tests {
         };
         let mut out = vec![0u8; 64];
         let dst = out.as_mut_ptr();
-        // ELEMENT A: zeroed inline tables in one AsmState (the prologue reads
+        // Zeroed inline tables in one AsmState (the prologue reads
         // the short table once; guards fail before any decode).
         use crate::decompress::inflate::libdeflate_entry::DistTable;
         use crate::decompress::parallel::lut_huffman::LutLitLenCode;
@@ -1448,7 +1432,7 @@ mod tests {
         use crate::decompress::inflate::libdeflate_entry::DistTable;
         let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
         for (ti, lens) in lens_set.iter().enumerate() {
-            // ELEMENT A: tables INLINE in one AsmState — the asm reads them off
+            // Tables INLINE in one AsmState — the asm reads them off
             // the single `ctx` base; the ref reads the SAME storage
             // (`st.lut_litlen` / `st.dist`), so contents are identical and the
             // differential is valid.
@@ -1527,7 +1511,7 @@ mod tests {
         }
     }
 
-    /// Flip-precondition 1 (campaign §9 gate): POSITIVE CONTROL for the
+    /// Flip-precondition 1: POSITIVE CONTROL for the
     /// bit-consume failure class. A test-injected off-by-one in the
     /// lone-literal consume count (`run_contig_ref_biased::<1>` — the ref
     /// mirror of corrupting the asm's `shrx`/`sub bitsleft` pair) MUST trip
@@ -1554,7 +1538,7 @@ mod tests {
         let mut lut = LutLitLenCode::new_empty();
         assert!(lut.rebuild_from(&fixed), "fixed table lens must be valid");
         let dist_holes = DistTable::build(&[0u8; 30]).expect("holes dist table");
-        // ELEMENT A: tables INLINE in one AsmState; asm + both ref arms read the
+        // Tables INLINE in one AsmState; asm + both ref arms read the
         // SAME storage (st.lut_litlen / st.dist).
         let mut st = Box::new(AsmState {
             in_ptr: 0,
@@ -1729,7 +1713,7 @@ mod tests {
         let dist_fixed5 = DistTable::build(&[5u8; 30]).expect("fixed5 dist table");
         let dist_sub = DistTable::build(&[1, 2, 3, 4, 5, 6, 7, 8, 10, 10, 10, 10])
             .expect("subtable dist table");
-        // ELEMENT A: pairs carry the litlen LENS (a per-pair AsmState rebuilds
+        // Pairs carry the litlen LENS (a per-pair AsmState rebuilds
         // the inline litlen table) + the dist table (cloned into the inline slot).
         let pairs: [(&[u8], &DistTable, &str); 5] = [
             (&lenny, &dist_small, "lenny×small"),
@@ -1846,9 +1830,8 @@ mod tests {
             avg > 30.0,
             "c3 coverage degraded: lenny×small avg bytes/run = {avg:.1}"
         );
-        // Flip-precondition 2 (campaign §9 gate): the `25:` multi-literal+
-        // trailing-LENGTH arm — 99.6% of c3a crossings, the F-c coverage
-        // make-or-break — must be PROVEN exercised, both the completion
+        // Flip-precondition 2: the `25:` multi-literal+
+        // trailing-LENGTH arm must be PROVEN exercised, both the completion
         // route (`25:`→`58:`→copy) and the X2 dst-rollback bail route. The
         // floors are ~25% of the observed counts (lenny×small completes
         // 7,735; bails total 373 — lenny×fixed5 344 + lenny×sub 29), so a

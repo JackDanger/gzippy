@@ -1,11 +1,10 @@
 //! Non-speculative parallel decode for STORED-block-dominated single-member
 //! gzip streams (incompressible / `gzip -1` on random data, BTYPE=00).
 //!
-//! Motivation (FULCRUM-measured, 2026-05-29): on incompressible input the
-//! speculative parallel-SM pipeline's spacing-aligned block-finder never lands
-//! on a real boundary (228 header + 69 body speculation failures observed on
-//! `random100.gz`), so the `parallel_sm_unprofitable` ratio gate routes such
-//! input to single-thread libdeflate — which does not scale with threads.
+//! Motivation: on incompressible input the speculative parallel-SM pipeline's
+//! spacing-aligned block-finder never lands on a real boundary, so the
+//! `parallel_sm_unprofitable` ratio gate routes such input to single-thread
+//! libdeflate — which does not scale with threads.
 //!
 //! The fix is grounded in DEFLATE's framing: a stored block (RFC 1951 §3.2.4)
 //! carries an EXPLICIT byte-aligned `LEN`/`NLEN` followed by `LEN` raw literal
@@ -17,15 +16,12 @@
 //!
 //! Two stream shapes:
 //!   * Pure stored (e.g. `gzip -1`/`-9`/zlib-L0 on random data): the WHOLE
-//!     output is parallel-copied. Measured on neurotic (frozen, interleaved
-//!     A/B, byte-exact): pure-100 MB p8 +47% vs single-thread libdeflate, at
-//!     PARITY with rapidgzip.
+//!     output is parallel-copied.
 //!   * Stored prefix + Huffman tail (the real `random100.gz`: ~65% stored then
 //!     a dynamic-Huffman tail): the prefix is parallel-copied; the tail — which
 //!     has no explicit length — is decoded sequentially by the ISA-L bulk
-//!     decoder (`lut_bulk_inflate`). The sequential tail is an Amdahl ceiling:
-//!     measured random100 p8 +12% vs libdeflate, ~0.77× rapidgzip (the
-//!     un-parallelised Huffman tail is the remaining gap; parallelising it
+//!     decoder (`lut_bulk_inflate`). The sequential tail is an Amdahl ceiling
+//!     (the un-parallelised Huffman tail is the remaining gap; parallelising it
 //!     needs the window-map machinery the speculative pipeline already has).
 //!
 //! Safety contract (correctness is sacred — see CLAUDE.md Rule 4 / Rule 5):
@@ -698,9 +694,7 @@ fn fill_and_crc(
     if threads <= 1 || total < 1 << 20 {
         // Fused copy+CRC: hash each run's bytes while they are still hot in
         // cache from the copy, instead of a SECOND full pass over `output`.
-        // (The old split-copy-then-`crc32(output)` A/B arm, `GZIPPY_STORED_SPLIT_CRC=1`,
-        // was removed 2026-07-07, batch 4f — same CRC semantics, this is just
-        // fewer passes over `output`.)
+        // (Same CRC semantics — just fewer passes over `output`.)
         return copy_runs_fused_crc(output, deflate, base_off, runs);
     }
 

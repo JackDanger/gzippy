@@ -7,9 +7,8 @@
 //! `isal_huffman.rs` wraps the C versions via `isal::isal_sys::*` — only
 //! available on `feature = "isal-compression", target_arch = "x86_64"`. The
 //! pure-rust-inflate build was falling back to a vendor MultiCached.hpp-style
-//! port, which per the May 27 2026 neurotic perf was the dominant cost in the
-//! marker-phase bootstrap decoder (~7.65% of total CPU, with the bootstrap
-//! caller at 81% children-time). That cache used a simpler 11-bit format that
+//! port, a dominant cost in the marker-phase bootstrap decoder. That cache
+//! used a simpler 11-bit format that
 //! caps multi-symbol-packing at 2; ISA-L's `inflate_huff_code_large` uses
 //! 12-bit short + variable-length long lookup and packs up to 3 symbols per
 //! entry — measurably faster per-byte.
@@ -129,21 +128,16 @@ pub const DEFAULT_SYM_FLAG: u32 = TRIPLE_SYM_FLAG;
 /// BYTE-IDENTICAL for every flag (decode honours each entry's `sym_count`); only
 /// the build/decode cycle split changes.
 ///
-/// When the env var is UNSET the default is ARCH-DISPATCHED:
-///   * aarch64 → `SINGLE_SYM_FLAG`. Gated M1 T1 win: skipping the pair/triple
-///     packing build is a measured silesia-T1 win and a logs-T1 tie; the cheaper
-///     decode of single entries pays for itself on this microarch.
-///   * x86_64 / any other arch → `TRIPLE_SYM_FLAG` (production unchanged).
-///     SINGLE is a measured +7.7% cyc/B regression on x86/AMD, so it must NOT
-///     become the default there.
-///
-/// The arch-dispatched (cfg-selected) default; the env-based
-/// A/B override was removed.
+/// The default is ARCH-DISPATCHED:
+///   * aarch64 → `SINGLE_SYM_FLAG`: skips the pair/triple packing build; the
+///     cheaper decode of single entries pays for itself on this microarch.
+///   * x86_64 / any other arch → `TRIPLE_SYM_FLAG` (production unchanged;
+///     SINGLE regresses cyc/B on x86/AMD, so it must NOT become the default there).
 pub fn litlen_multisym_flag() -> u32 {
     arch_default_multisym_flag()
 }
 
-/// aarch64 default = single-symbol build (gated M1 T1 win).
+/// aarch64 default = single-symbol build.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn arch_default_multisym_flag() -> u32 {
@@ -151,7 +145,7 @@ fn arch_default_multisym_flag() -> u32 {
 }
 
 /// x86_64 / other arches default = triple-pack build (production unchanged;
-/// single is a measured regression on x86/AMD).
+/// single regresses on x86/AMD).
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn arch_default_multisym_flag() -> u32 {
@@ -486,9 +480,8 @@ pub fn set_and_expand_lit_len_huffcode(
 // igzip groups long codes that share the low-12-bit prefix and emits one
 // long_code_lookup sub-table per group, in the prefix's first-appearance order.
 // The faithful port did this with a quadratic inner re-scan (for each group
-// leader, scan all later long codes) — measured (RDTSC sub-step profile, Intel
-// i7-13700T) as the #1 per-block build cost: ~4.6 kcyc/blk = 32% of the build on
-// pigz (~69 long codes/blk) and 28% on silesia. We replace it with an O(n)
+// leader, scan all later long codes) — a dominant per-block build cost. We
+// replace it with an O(n)
 // single-pass bucketed grouping using a thread-local generation-stamped 4096-slot
 // table (gen tag in the high 20 bits, last-member list-index in the low 12 — no
 // per-block init, reset only on the ~1M-block gen wrap). The emitted groups, the
@@ -1016,8 +1009,8 @@ pub struct DecodedSymbol {
 /// decode body is identical (already pure Rust); the rebuild path uses
 /// pure-rust `set_and_expand_lit_len_huffcode` +
 /// `make_inflate_huff_code_lit_len` instead of ISA-L FFI.
-/// `#[repr(C)]` + `table` FIRST: element A (igzip single-state-base register
-/// discipline) co-locates the litlen short+long LUT INLINE inside the boxed
+/// `#[repr(C)]` + `table` FIRST: the igzip single-state-base register
+/// discipline co-locates the litlen short+long LUT INLINE inside the boxed
 /// `AsmState` (asm_kernel.rs) so the asm addresses it `[{ctx}+LIT_OFF+idx*4]`
 /// off the ONE `ctx` base (igzip `[state+_lit_huff_code+...]`,
 /// igzip_lib.h:515-524). The table is UN-BOXED (was `Box<InflateHuffCodeLarge>`)
@@ -1072,8 +1065,7 @@ impl LutLitLenCode {
         // had a byte-identical code-length key and the same multisym packing,
         // `self.table` is already the exact table this call would rebuild
         // (rebuild is a deterministic function of (code_lengths, multisym), and
-        // decode only reads the table). Skip the rebuild — byte-identical, and
-        // ~9.5% of the logs-T1 wall per the table-build perturbation gate.
+        // decode only reads the table). Skip the rebuild — byte-identical.
         #[cfg(pure_inflate_decode)]
         {
             let n = code_lengths.len();
@@ -1081,10 +1073,9 @@ impl LutLitLenCode {
                 // MRU (last-header) fast path: identical to the immediately
                 // preceding block → `self.table` is already correct, ZERO copy.
                 // This is the shippable cache: free on a miss (one key compare),
-                // so it never regresses low-reuse corpora (silesia TIE). A
-                // larger table-LRU was measured (logs 41% hit / +3.0% wall) but
-                // it pays a per-miss store-copy that regressed silesia ~0.3%, so
-                // it is NOT shipped — see plans/LOGS-T1-TABLEBUILD-2026-06-26.md.
+                // so it never regresses low-reuse corpora. A larger table-LRU is
+                // rejected: it pays a per-miss store-copy that regresses low-reuse
+                // corpora, so it is NOT shipped.
                 if self.valid
                     && multisym == self.cache_multisym
                     && self.cache_key_len == n
@@ -1109,7 +1100,7 @@ impl LutLitLenCode {
         // Reset only the entries we'll touch (mirror of vendor's
         // per-call `lit_and_dist_huff[i].code_and_length = 0` loop).
         //
-        // CONVERGE toward igzip (NIGHT38): igzip never separately clears the
+        // CONVERGE toward igzip: igzip never separately clears the
         // huff table here — `set_and_expand_lit_len_huffcode` memsets ONLY the
         // length/expansion region `[ISAL_DEF_LIT_SYMBOLS..LIT_LEN_ELEMS]`
         // (igzip_inflate.c:333-334) and relies on the literal read-loop
@@ -1126,7 +1117,7 @@ impl LutLitLenCode {
         //     `make_inflate` is never called, so the tail is never observed.
         //     ⇒ clearing `[0..LIT_LEN]` is byte-identical to clearing all
         //     LIT_LEN_ELEMS on EVERY input, and drops 228 redundant per-block
-        //     writes off the shared table-build (NIGHT28/35: on the T1 wall).
+        //     writes off the shared table-build.
         for h in self.lit_and_dist_huff[..LIT_LEN].iter_mut() {
             h.0 = 0;
         }
@@ -1222,8 +1213,7 @@ impl LutLitLenCode {
     ///
     /// `#[inline(always)]`: the C++ vendor wrapper inlines through this
     /// to fuse with the marker hot loop. Plain `#[inline]` left the
-    /// function as a separate symbol consuming ~3.25% of cycles via
-    /// call overhead on the perf profile that motivated this port.
+    /// function as a separate symbol, adding per-symbol call overhead.
     #[inline(always)]
     pub fn decode(
         &self,
@@ -1235,7 +1225,7 @@ impl LutLitLenCode {
         self.decode_prefilled(bits)
     }
 
-    /// P3.5 c4: backstop-free decode for call sites that sit IMMEDIATELY
+    /// Backstop-free decode for call sites that sit IMMEDIATELY
     /// after a refill (unconditional or `< 48`-threshold). Removes the
     /// `available() < 32` load+branch from the per-symbol critical chain.
     ///
@@ -1299,7 +1289,7 @@ impl LutLitLenCode {
         }
     }
 
-    /// T3-MARKER-ILP: SPECULATIVE short-code entry load from a PRE-refill
+    /// SPECULATIVE short-code entry load from a PRE-refill
     /// bitbuf, for the load-before-refill software-pipeline in the marker fast
     /// loop (mirror of `consume_first_decode.rs:1854` M1-preload and igzip's
     /// asm `mov {t4},0xFFF / and {t4},{bitbuf} / mov {t1}, [ctx+t4*4+lit_off]`
@@ -1321,7 +1311,7 @@ impl LutLitLenCode {
         self.table.short_code_lookup[idx]
     }
 
-    /// T3-MARKER-ILP: finish a decode whose short entry was speculatively
+    /// Finish a decode whose short entry was speculatively
     /// pre-loaded via [`spec_short_entry`] from the pre-refill bitbuf. `bits`
     /// is the POST-refill reader.
     ///
@@ -1492,8 +1482,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// The UNSET-env default must be arch-dispatched: SINGLE on aarch64 (gated
-    /// M1 T1 win), TRIPLE everywhere else (x86/AMD regression-avoidance). This
+    /// The default must be arch-dispatched: SINGLE on aarch64, TRIPLE everywhere
+    /// else (x86/AMD regression-avoidance). This
     /// pins the byte-identical-on-x86 guarantee at compile time per arch.
     #[test]
     fn arch_default_multisym_flag_is_arch_dispatched() {
@@ -2567,7 +2557,7 @@ mod tests {
         );
     }
 
-    /// Named edge cases the advisor called out — explicit, deterministic.
+    /// Named edge cases — explicit, deterministic.
     /// Each asserts DECODE-EQUIVALENCE between the O(n) win and the O(n²)
     /// reference across all three packing modes.
     #[test]

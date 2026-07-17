@@ -1,8 +1,6 @@
-//! Three-oracle differential testing for the inflate path
-//! (`former plans/unified-decoder.md` §3.10).
+//! Three-oracle differential testing for the inflate path.
 //!
-//! Prerequisite for all bake-off routes (§5 dependency graph): we
-//! cannot validate correctness of any alternative inflate without
+//! We cannot validate correctness of any alternative inflate without
 //! agreement from multiple independent reference implementations.
 //!
 //! ## Oracles
@@ -15,10 +13,10 @@
 //! - **gzippy** under test (pure-Rust inflate, current production
 //!   path through `decompress::decompress_gzip_libdeflate`).
 //!
-//! The third oracle named in the plan (`rapidgzip` via C-ABI shim)
-//! is the "long pole" per §11; deferred until needed. Two oracles
-//! catch algorithmic divergences; the third adds independence-of-
-//! lineage but doesn't change the verdict for routine deflate.
+//! A third oracle (`rapidgzip` via C-ABI shim) is deferred until
+//! needed. Two oracles catch algorithmic divergences; the third adds
+//! independence-of-lineage but doesn't change the verdict for routine
+//! deflate.
 //!
 //! ## Methodology
 //!
@@ -222,14 +220,12 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
 
 // ── Marker-decoder (marker_inflate::Block) fuzz differential ──────────────────
 //
-// E2 gap closer: `decode_via_gzippy` above uses num_threads=1 and deliberately
-// avoids the parallel-SM / marker path, so the window-absent marker decoder
-// (`marker_inflate::Block`) — the code the COLLAPSE (former plans/decoder-plan.md E3)
-// will rewrite — had ZERO fuzz coverage (only one silesia md5). This decodes
-// raw DEFLATE through `Block` directly (from offset 0, empty window → all
-// output is clean, no markers emitted) and asserts byte-exactness vs both the
-// libdeflate oracle and the original payload, over fuzzed inputs. It is the
-// safety net the collapse validates against per commit.
+// `decode_via_gzippy` above uses num_threads=1 and deliberately avoids the
+// parallel-SM / marker path, so the window-absent marker decoder
+// (`marker_inflate::Block`) had ZERO fuzz coverage (only one silesia md5). This
+// decodes raw DEFLATE through `Block` directly (from offset 0, empty window →
+// all output is clean, no markers emitted) and asserts byte-exactness vs both
+// the libdeflate oracle and the original payload, over fuzzed inputs.
 #[cfg(pure_inflate_decode)]
 fn decode_via_deflate_block(gz: &[u8]) -> Vec<u8> {
     use crate::decompress::inflate::consume_first_decode::Bits;
@@ -348,8 +344,8 @@ fn three_oracle_random_l0_stored_blocks() {
 
 #[test]
 fn three_oracle_random_l1_fixed_huffman() {
-    // L1 on random data → mostly fixed-Huffman per the session-found
-    // RFC 1951 reserved-symbol bug. This test validates the fix.
+    // L1 on random data → mostly fixed-Huffman, which exercises the
+    // RFC 1951 reserved-symbol handling.
     let mut rng: u64 = 0xcafef00d_deadbeef;
     let mut data = Vec::with_capacity(64 * 1024);
     for _ in 0..(64 * 1024) {
@@ -418,7 +414,7 @@ fn three_oracle_silesia_if_available() {
 /// Mini-fuzz: generate N random payloads with N different seeds, vary
 /// compression level, three-oracle each. Bounded so `cargo test`
 /// completes in seconds. The full ≥72h fuzz lives in a cargo-fuzz
-/// workspace (deferred — long pole per plan §11).
+/// workspace (deferred).
 #[test]
 fn three_oracle_mini_fuzz_50_cases() {
     let mut rng_seed: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -437,21 +433,19 @@ fn three_oracle_mini_fuzz_50_cases() {
     }
 }
 
-/// Extended fuzz soak — proxy for the plan §7 criterion #2's 72h
-/// requirement. We can't run 72h in a test session, but we CAN run
-/// a high-case-count batch (10,000 cases) to materially raise
-/// statistical confidence vs. the 50-case mini-fuzz above.
+/// Extended fuzz soak — proxy for a 72h fuzz requirement. We can't run
+/// 72h in a test session, but we CAN run a high-case-count batch (10,000
+/// cases) to materially raise statistical confidence vs. the 50-case
+/// mini-fuzz above.
 ///
-/// Per the project's process rule: the 72h soak is a release-gate
-/// requirement that must run pre-release in CI, not in unit-test
-/// budget. This test stands in for the pre-release validation
-/// shape — it runs ~minutes on neurotic and zero disagreements
-/// across this scale is necessary-but-not-sufficient for the full
-/// 72h gate.
+/// The full 72h soak is a release-gate requirement that must run
+/// pre-release in CI, not in unit-test budget. This test stands in for
+/// the pre-release validation shape; zero disagreements across this scale
+/// is necessary-but-not-sufficient for the full 72h gate.
 ///
 /// Skipped by default (run with --ignored to opt in).
 #[test]
-#[ignore = "extended fuzz — run with --ignored; ~minutes on neurotic"]
+#[ignore = "extended fuzz — run with --ignored"]
 fn three_oracle_extended_fuzz_10k_cases() {
     let mut rng_seed: u64 = 0xB5C0_FACE_DEAD_BEEF;
     let mut max_size = 0usize;

@@ -256,11 +256,10 @@ mod tests {
     /// oracle.
     ///
     /// This test exists because the synthetic 729-case differential
-    /// did NOT catch a real bug (`InvalidLookback` on silesia in the
-    /// neurotic bench, 2026-05-27). Real-world deflate streams exercise
-    /// match-distance patterns that PRNG / phrase-rotation fixtures
-    /// don't. Without this test the next regression goes unnoticed
-    /// until neurotic measurement.
+    /// did NOT catch a real bug (`InvalidLookback` on silesia). Real-world
+    /// deflate streams exercise match-distance patterns that PRNG /
+    /// phrase-rotation fixtures don't. Without this test the next regression
+    /// goes unnoticed until bench measurement.
     ///
     /// silesia.tar.xz must be present in benchmark_data/; the test
     /// skips with a printed warning if missing (CI without the fixture

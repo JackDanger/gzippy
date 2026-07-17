@@ -1,6 +1,6 @@
 //! Targeted flip-seam + back-ref-across-seam correctness net.
 //!
-//! WHY (campaign danger zone): the copy-free-to-final clean-tail refactor
+//! WHY: the copy-free-to-final clean-tail refactor
 //! changes how the post-flip clean tail is stored (clean u8 written DIRECTLY
 //! into `chunk.data`'s reserved tail; back-refs resolve from that tail; no
 //! `output_ring` for the clean phase) and how the flip seam is addressed
@@ -430,7 +430,7 @@ mod tests {
         }
     }
 
-    // ── (a) Window-extremity distances (advisor item a) ───────────────────────
+    // ── (a) Window-extremity distances ────────────────────────────────────────
     //
     // An off-by-one in seam addressing only manifests if a back-ref actually
     // touches the EXTREME window byte. These pin a period of EXACTLY 32768 (the
@@ -459,7 +459,7 @@ mod tests {
         );
     }
 
-    // ── (c) >16 MiB reserve-clamp boundary (advisor item c) ───────────────────
+    // ── (c) >16 MiB reserve-clamp boundary ────────────────────────────────────
     //
     // `decode_chunk_with_rapidgzip_impl` pre-reserves the clean tail as
     // `compressed*8 + 1 MiB` CLAMPED to `RESERVE_CLAMP = 16 MiB`

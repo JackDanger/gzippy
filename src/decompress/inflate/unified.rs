@@ -1,22 +1,20 @@
-//! Unified deflate decoder — Phase 1 of the plan at
-//! `former plans/unified-decoder.md` (sign-off commit `e2ecace`).
+//! Unified deflate decoder — type-system scaffold.
 //!
 //! This file is the *type-system commitment* — three sealed-trait axes
 //! (`DecodeMode`, `ArchProfile`, `OutputModel`) and the `Inflate<M, A, O>`
 //! struct shape. One monomorphisation, `Inflate<Clean, Generic, Streaming>`,
 //! is implemented today by **delegation to [`ResumableInflate2`]**. Phase 2
-//! replaces the delegation with an interpreted Rust port of the hot loop
-//! (lifting B1-B6 + T0/T3/T4/T5 in place). Phase 3+ adds dynasm JIT,
-//! AOT-codegen, the markers/owned monomorphisations, etc.
+//! replaces the delegation with an interpreted Rust port of the hot loop.
+//! Phase 3+ adds dynasm JIT, AOT-codegen, the markers/owned
+//! monomorphisations, etc.
 //!
 //! ## Why delegation in commit 1
 //!
-//! Per the sixth-pass advisor consult, commit 1 is the type-system
-//! commitment, not the new hot loop. Wrapping `ResumableInflate2` (which
-//! is validated by 638 lib tests + the real-silesia unit test) means
-//! commit 1 is provably correct. The traits + builder are the load-bearing
-//! deliverable; the inner implementation is replaceable in subsequent
-//! commits without touching callers.
+//! Commit 1 is the type-system commitment, not the new hot loop. Wrapping
+//! `ResumableInflate2` (validated by the lib tests + the real-silesia unit
+//! test) means this delegation is provably correct. The traits + builder are
+//! the load-bearing deliverable; the inner implementation is replaceable in
+//! subsequent commits without touching callers.
 //!
 //! ## Public surface
 //!

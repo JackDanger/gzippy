@@ -1,13 +1,13 @@
-//! Same-process tiny/big decode interleave (correctness seam for the
-//! tiny-file system-allocator lever, task #189/#199, lever-2b).
+//! Same-process tiny/big decode interleave (correctness seam for the tiny-file
+//! system-allocator scope).
 //!
-//! Lever-2b is PER-DECODE and thread-local (`rpmalloc_alloc::SystemHugeScope`,
+//! The scope is PER-DECODE and thread-local (`rpmalloc_alloc::SystemHugeScope`,
 //! RAII): a tiny (≤8 MiB output) thin-T1 decode backs its huge chunk-output
-//! reserve with the system allocator; every other decode is untouched. Unlike
-//! the reverted lever-2a process-global latch there is NO cross-decode state —
-//! the #199 advisor's "tiny latches the process, a later big decode is stuck"
-//! seam is removed by construction. This test proves that end-to-end on the
-//! REAL production entry (`decompress_single_member`, T1) in BOTH orders:
+//! reserve with the system allocator; every other decode is untouched. Because
+//! it is per-decode there is NO cross-decode state — a tiny decode cannot latch
+//! the process so that a later big decode is stuck. This test proves that
+//! end-to-end on the REAL production entry (`decompress_single_member`, T1) in
+//! BOTH orders:
 //!
 //!   1. tiny→big and big→tiny both produce byte-exact output;
 //!   2. the tiny decode really is system-backed (SYS_HUGE_ALLOCS moved — the
@@ -83,7 +83,7 @@ mod tests {
         // across same-process decodes; a pool HIT allocates nothing at all, so
         // the Sys counter only moves on a pool MISS. Drain before each
         // "fresh tiny decode" assertion so the miss (the CLI fresh-process
-        // shape, which the lever targets) is what we exercise.
+        // shape this scope targets) is what we exercise.
         use crate::decompress::parallel::chunk_buffer_pool::drain_pools_for_test;
 
         // ── Order A: tiny first, then big ─────────────────────────────────
@@ -130,8 +130,8 @@ mod tests {
         );
 
         // Fresh tiny decode after a big one: the per-decode scope must re-arm
-        // (this is exactly the state 2a's process-global latch got WRONG-way:
-        // it would have latched rpmalloc forever after a big-first decode).
+        // (this is the case a process-global latch would get wrong — it would
+        // stay latched after a big-first decode; the per-decode scope must not).
         drain_pools_for_test();
         let tiny_out2 = decode(&tiny_gz);
         assert_eq!(

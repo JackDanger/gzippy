@@ -217,7 +217,7 @@ mod tests {
         }
     }
 
-    /// Regression (P0 correctness, mmiso locate 2026-07-06): a stored-dominated
+    /// Regression (P0 correctness): a stored-dominated
     /// DOMINANT-FIRST multi-member stream decoded at T1 must be byte-exact.
     ///
     /// Shape: a large incompressible FIRST member (>16 MiB, so its stored blocks
@@ -233,8 +233,7 @@ mod tests {
     /// `decode_with_huffman_tail` tripped `prefix_out > expected_size` → a
     /// TERMINAL `stored output size mismatch: expected <last-ISIZE>,
     /// got <member1-size>` → EMPTY output, exit 1, on a file `gzip -dc` and
-    /// rapidgzip decode fine. Verified on both arches with the mmA2_stored.gz
-    /// fixture (98.6%-dominant first member).
+    /// rapidgzip decode fine.
     ///
     /// The fix: the dominant-first multi-member detection now runs at EVERY
     /// thread count (T1 → sequential multi-member path); and `StoredParallel`
@@ -318,7 +317,7 @@ mod tests {
         }
     }
 
-    /// Engine-swap correctness (mmiso T1, 2026-07-06): the T1 `MultiMemberSeq`
+    /// Engine-swap correctness (multi-member T1): the T1 `MultiMemberSeq`
     /// path now routes each member's decode through the ParallelSM chunk kernel
     /// (per-member slice + own-trailer verify) instead of the scalar
     /// `inflate_consume_first_bits`. A member with a CORRUPTED CRC32 must be a
@@ -342,7 +341,7 @@ mod tests {
         );
     }
 
-    /// Engine-swap correctness (mmiso T1): an EMPTY interior member (ISIZE=0)
+    /// Engine-swap correctness (multi-member T1): an EMPTY interior member (ISIZE=0)
     /// contributes zero bytes and the walk must continue past it byte-exact. The
     /// old scalar loop and the new chunk-kernel walk must agree with gzip(1).
     #[test]
@@ -372,7 +371,7 @@ mod tests {
         assert_eq!(out, want, "empty interior member: not byte-exact");
     }
 
-    /// Engine-swap correctness (mmiso T1): a COMPRESSIBLE multi-member stream
+    /// Engine-swap correctness (multi-member T1): a COMPRESSIBLE multi-member stream
     /// (pigz-style, many 256 KiB members) routed through the real classifier at
     /// T1 must land on `MultiMemberSeq` AND decode byte-exact through the fast
     /// per-member chunk kernel. This is the perf-target shape; the >16 MiB
@@ -407,7 +406,7 @@ mod tests {
         );
     }
 
-    /// Advisor review of the eager window-chain port (queuePrefetchedChunkPostProcessing,
+    /// Eager window-chain port (queuePrefetchedChunkPostProcessing,
     /// f7868ab): the consumer now eagerly publishes each prefetched chunk's end-window via
     /// `get_last_window`. Vendor `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:562-570)
     /// has a FOOTER SPECIAL-CASE — it emplaces an EMPTY window when a chunk ends exactly on a
@@ -805,7 +804,7 @@ mod tests {
 
     /// Stored-dominated single-member input above the 10 MiB gate must route to
     /// the NON-speculative `StoredParallel` path on x86_64 + ISA-L/pure-rust
-    /// (the speculative pipeline thrashes on stored data — FULCRUM 2026-05-29).
+    /// (the speculative pipeline is not used for stored-dominated data).
     /// Everywhere it must decode byte-exact through the full single-member path.
     #[test]
     fn test_stored_dominated_routes_parallel_and_decodes() {
@@ -907,7 +906,7 @@ mod tests {
         );
     }
 
-    /// B3 proof: parallel SM byte-perfect with `--no-default-features
+    /// Proof: parallel SM byte-perfect with `--no-default-features
     /// --features pure-rust-inflate` (no isal-sys in the dependency graph).
     #[test]
     #[cfg(all(pure_inflate_decode, not(feature = "isal-compression")))]
@@ -936,8 +935,8 @@ mod tests {
     }
 
     // =========================================================================
-    // GATE-A guard (2026-06-30, `perf/m1-litlen-preload`) — locks the
-    // correctness precondition of the load-before-refill preload reorder in
+    // Correctness guard — locks the correctness precondition of the
+    // load-before-refill preload reorder in
     // `decode_huffman_fastloop_bounded_pipelined` (consume_first_decode.rs).
     //
     // The reorder (preload next litlen entry from the CURRENT bitbuf, THEN
@@ -994,8 +993,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Deletion-trap killer — the routing-assertion test from the v0.6 marker
-    // decoder premortem.
+    // Deletion-trap killer — the routing-assertion test that keeps the marker
+    // pipeline from being deleted as "dead code."
     //
     // Every prior marker-based attempt in this codebase has been deleted
     // during cleanup because it lived outside the production CLI path. The
@@ -1018,8 +1017,7 @@ mod tests {
         // Serialize against any other test that calls `decompress_parallel`
         // concurrently — under `cargo test`'s default parallel execution,
         // another increment between `before` and `after` would mask a real
-        // silent-fallback regression with a false-positive pass. (Copilot
-        // review on PR #94.)
+        // silent-fallback regression with a false-positive pass.
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -1060,21 +1058,19 @@ mod tests {
     }
 
     // =========================================================================
-    // ONE-engine routing trap (M3, DIV-1 part 1) — paired with
+    // ONE-engine routing trap — paired with
     // `SEEDED_BLOCK_CHUNKS` / `SEEDED_WRAPPER_CHUNKS`.
     //
-    // Pre-M3 this trap asserted `UNIFIED_INFLATE_RUNS` moved: every seeded
-    // chunk's clean tail ran the SECOND engine (`StreamingInflateWrapper` →
-    // `Inflate<Clean, Generic, Streaming>`). M3 reverses that contract on
-    // gzippy-native: window-seeded INEXACT chunks (and chunk 0) decode on the
-    // ONE `deflate::Block` engine (vendor GzipChunk.hpp:454-458), seeded via
-    // `set_initial_window` → `decode_clean_into_contig`. The mark of "the
-    // Block route is wired into production" is `SEEDED_BLOCK_CHUNKS` moving
-    // on a real CLI-shaped decode — and NO seeded chunk silently taking the
-    // wrapper arm (`SEEDED_WRAPPER_CHUNKS` unchanged; that arm exists only
-    // for `GZIPPY_SEEDED_BLOCK=0`, the isal build, and the ISA-L oracle).
+    // This trap asserts the current contract on gzippy-native: window-seeded
+    // INEXACT chunks (and chunk 0) decode on the ONE `deflate::Block` engine
+    // (vendor GzipChunk.hpp:454-458), seeded via `set_initial_window` →
+    // `decode_clean_into_contig`. The mark of "the Block route is wired into
+    // production" is `SEEDED_BLOCK_CHUNKS` moving on a real CLI-shaped decode —
+    // and NO seeded chunk silently taking the wrapper arm
+    // (`SEEDED_WRAPPER_CHUNKS` unchanged; that arm exists only for
+    // `GZIPPY_SEEDED_BLOCK=0`, the isal build, and the ISA-L oracle).
     //
-    // M4 re-routed the until-exact paths onto the same ONE Block engine
+    // The until-exact paths route onto the same ONE Block engine
     // (see `exact_block_engine_owns_until_exact_on_parallel_sm` below);
     // `unified::Inflate` remains compiled as the kill-switch / isal-build /
     // ISA-L-oracle arm only.
@@ -1127,7 +1123,7 @@ mod tests {
     }
 
     // =========================================================================
-    // M4 (DIV-1 part 2) deletion trap: UNTIL-EXACT decodes never take the
+    // Deletion trap: UNTIL-EXACT decodes never take the
     // wrapper engine on gzippy-native.
     //
     // Whether a given production decode schedules any until-exact chunk is
@@ -1220,7 +1216,7 @@ mod tests {
     // this asymmetric lookup, gzippy's `lookup_block_offset(idx+1)`
     // returned `None` on `GetReturnCode::Failure` and the prefetch loop
     // skipped the last chunk — observed on the 221 MB / 3-partition
-    // fixture (bench-2026-05-18). This trap asserts the new
+    // fixture. This trap asserts the new
     // `lookup_next_block_offset` accepts the file-size sentinel during
     // a real parallel SM decode.
     // =========================================================================
@@ -1261,29 +1257,23 @@ mod tests {
     }
 
     // =========================================================================
-    // Performance regression guard — the CI gap that masked v0.3.0.
+    // Performance regression guard.
     //
     // The single-member parallel path must not be SLOWER than the single-thread
-    // ISA-L baseline on the same input. v0.3.0–v0.5.0 had a buggy speculation
-    // design that re-decoded the entire stream sequentially in phase 2; the
-    // parallel path ran at ~1.75× the elapsed time of pure sequential.
+    // baseline on the same input — a past speculation-design bug re-decoded the
+    // whole stream sequentially and made the parallel path slower than pure
+    // sequential; this guard catches that class of regression.
     //
-    // The v0.6 marker pipeline has no per-physical-core routing gate (the
-    // earlier core floor was dropped).
     // On ≥4-physical-core hardware parallel comfortably beats sequential
-    // (tight assertion: ratio < 1.5 catches v0.3.0-class 1.75× regression).
-    // On <4 physical cores (e.g. 2-core CI runners) parallel-at-T=4 pays
-    // Amdahl tax that sequential T=1 doesn't, so ratios in the 1.5–2.0×
-    // range are structural — but we still assert ratio < 3.0 there so a
-    // *catastrophic* regression (5×+) on small-core hardware doesn't slip
-    // through (Opus advisor feedback on PR #97: removing the assertion
-    // entirely lost regression protection on the most common CI class).
+    // (tight assertion: ratio < 0.5). On <4 physical cores (e.g. 2-core CI
+    // runners) parallel-at-T=4 pays Amdahl tax that sequential T=1 doesn't, so
+    // ratios in the 1.5–2.0× range are structural — but we still assert
+    // ratio < 3.0 there so a *catastrophic* regression on small-core hardware
+    // doesn't slip through.
     // =========================================================================
-    // Perf gates (1a/1b) run on neurotic via `make test-x86_64` — see
-    // former plans/rust-rapidgzip.md validation gate. Ignored in CI while the
-    // unported primitives (#1–#5) are still landing.
+    // Perf gate — run on the perf box, not GHA.
     #[test]
-    #[ignore = "perf gate — run on neurotic, not GHA (former plans/rust-rapidgzip.md)"]
+    #[ignore = "perf gate — run on the perf box, not GHA"]
     #[cfg(parallel_sm)]
     fn test_single_member_parallel_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -1332,8 +1322,7 @@ mod tests {
              sequential={seq_mbps:.0} MB/s  parallel={par_mbps:.0} MB/s  ratio={ratio:.2}"
         );
 
-        // Validation Gate 1a (synthetic): parallel must beat sequential
-        // by 2× on ≥4 physical cores (former plans/rust-rapidgzip.md Track A).
+        // Parallel must beat sequential by 2× on ≥4 physical cores (ratio < 0.5).
         let threshold = if physical >= 4 { 0.5 } else { 3.0 };
         assert!(
             ratio < threshold,
@@ -1343,9 +1332,9 @@ mod tests {
         );
     }
 
-    /// Real silesia corpus — Validation Gate 1b (former plans/rust-rapidgzip.md A4).
+    /// Real silesia corpus perf gate.
     #[test]
-    #[ignore = "perf gate — run on neurotic, not GHA (former plans/rust-rapidgzip.md)"]
+    #[ignore = "perf gate — run on the perf box, not GHA"]
     #[cfg(parallel_sm)]
     fn test_single_member_parallel_silesia() {
         use crate::tests::datasets;
@@ -1473,18 +1462,17 @@ mod tests {
         assert_eq!(crc32fast::hash(&got), 0xf9ac_f2fe);
     }
 
-    /// High-entropy synthetic proxy — not gate 2 (real silesia.tar.gz).
+    /// High-entropy synthetic proxy (not the real silesia.tar.gz gate).
     ///
     /// PRNG-compressed-via-flate2-best is adversarial: dense literals,
-    /// few back-refs, few block boundaries → speculation pathology. The
-    /// 0.5× gate encodes the **production** (isal-compression) bar.
-    /// **Expected RED on `--features pure-rust-inflate` until Phase B
-    /// lands** (`former plans/pure-rust-perf.md`); pure-Rust inflate at ~334
-    /// MB/s vs ISA-L's ~800 MB/s leaves no headroom for speculation
-    /// overhead on this fixture. Use `test_single_member_parallel_silesia`
-    /// (real silesia.tar.gz) as the pure-Rust Phase B gate.
+    /// few back-refs, few block boundaries. The 0.5× gate encodes the
+    /// production (isal-compression) bar and may be RED on
+    /// `--features pure-rust-inflate` builds, where pure-Rust inflate is
+    /// slower than ISA-L and leaves no headroom for speculation overhead on
+    /// this fixture. Use `test_single_member_parallel_silesia` (real
+    /// silesia.tar.gz) as the pure-Rust gate.
     #[test]
-    #[ignore = "perf gate — run on neurotic, not GHA (former plans/rust-rapidgzip.md)"]
+    #[ignore = "perf gate — run on the perf box, not GHA"]
     #[cfg(parallel_sm)]
     fn test_single_member_parallel_silesia_class_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -1753,7 +1741,7 @@ mod tests {
         }
 
         /// Regression test for the T≥9 parallel-SM corruption on FNAME-headered
-        /// gzip (neurotic 2026-05-19, `benchmark_data/silesia-large.gz`).
+        /// gzip.
         ///
         /// Root cause was a race: workers pre-emptively published tail windows
         /// to `WindowMap` at the same key from different decode paths; at T≥9
@@ -1768,7 +1756,7 @@ mod tests {
         /// single-member and would pass without exercising parallel-SM.
         #[test]
         fn test_parallel_sm_handles_fname_header() {
-            // Reproducer conditions (empirically on neurotic):
+            // Reproducer conditions:
             //   - FNAME header (gzip(1) CLI output)
             //   - compressed size > 10 MiB (parallel routing gate)
             //   - T >= 9 (deep enough prefetch to hit the race before fix)
@@ -1781,8 +1769,8 @@ mod tests {
                 fixture.len()
             );
 
-            // Use T = num_cpus (or 16, whichever is smaller — neurotic has
-            // 16 physical, smaller machines might not reproduce the race).
+            // Use T = num_cpus (or 16, whichever is smaller — the race needs
+            // enough physical cores; smaller machines might not reproduce it).
             let threads = num_cpus::get().clamp(9, 16);
 
             let mut output = Vec::with_capacity(original.len());

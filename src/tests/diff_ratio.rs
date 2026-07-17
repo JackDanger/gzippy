@@ -86,8 +86,7 @@ mod tests {
     ///
     /// **Noise handling**: shared macOS x86_64 GitHub runners are noisy enough
     /// that a single median-of-20 spikes past threshold under runner
-    /// contention (observed 2026-05-13: 3.89× ratio on one job, 1.x ratio on
-    /// the parallel job for the same commit). Use best-of-3 batches: run
+    /// contention. Use best-of-3 batches: run
     /// three independent 20-sample batches, keep the lowest median of each
     /// tool's batch. The minimum-of-medians is the "least-contended" run
     /// and correctly reflects uncontended throughput — a real regression
@@ -173,10 +172,9 @@ mod tests {
     /// "parallel must win at every size" assertion: at 10 MiB the T4 worker
     /// spin-up / chunk-pool / window-map setup is NOT amortized (CLAUDE.md:
     /// "intentionally SLOWER than libdeflate for small inputs"), so parallel
-    /// and sequential are legitimately a near-TIE here (measured ratio
-    /// 0.99–1.03 on a quiet box). A hard `ratio <= 1.0` bound therefore
-    /// flips pass/fail on sub-millisecond load noise — exactly the flake
-    /// this rewrite removes.
+    /// and sequential are legitimately a near-TIE here. A hard `ratio <= 1.0`
+    /// bound therefore flips pass/fail on sub-millisecond load noise — exactly
+    /// the flake this rewrite removes.
     ///
     /// ROBUSTNESS: best-of-3 batches (each an internally-warmed
     /// median-of-10, alternating parallel/sequential so both see identical
@@ -191,18 +189,12 @@ mod tests {
     #[test]
     // PERF GATE (wall-ratio) — moved out of the gating suite, matching the
     // sibling perf gates in routing.rs (`test_single_member_parallel_not_
-    // slower_than_sequential` et al., all `#[ignore]`'d). The 1.5x default
-    // ceiling is FALSIFIED on current hardware: T4-vs-T1 on a cheap 10 MiB
-    // text fixture is dominated by the gated, rapidgzip-SHARED pipeline
-    // fixed-overhead (the speculative marker/apply-window/dispatch tax that
-    // the T1 inline path does not pay), so T4 is legitimately SLOWER than T1
-    // here — NOT a parallelism regression. Measured deterministically at
-    // ratio 2.04x on the neurotic LXC (T4 17.2ms vs T1 8.4ms) and 1.77x+ on
-    // a contended mac; the doc-comment's "0.99-1.03 on a quiet box" premise
-    // is stale. The authoritative parallel-scaling measurement is the
-    // standing rig (scripts/bench/standing/), not a fixed unit-test ceiling.
-    // Run on demand: `cargo test ... -- --ignored diff_ratio_parallel_single`.
-    #[ignore = "perf gate (wall-ratio) — T4>T1 on cheap inputs is the gated, rg-shared pipeline fixed-overhead, not a regression; 1.5x ceiling stale (measured 2.04x on neurotic). See standing rig."]
+    // slower_than_sequential` et al., all `#[ignore]`'d). At small sizes the
+    // parallel pipeline's fixed overhead is not amortized, so T4 can be slower
+    // than T1 here without it being a parallelism regression — the reason a
+    // fixed unit-test ceiling is the wrong gate for this. Run on the perf box:
+    // `cargo test ... -- --ignored diff_ratio_parallel_single`.
+    #[ignore = "perf gate (wall-ratio) — run on the perf box, not the default suite; T4>T1 on cheap inputs is pipeline fixed-overhead, not a regression"]
     fn diff_ratio_parallel_single_member_speedup() {
         let _timing = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = crate::tests::fixtures::text_10mb();
@@ -211,12 +203,11 @@ mod tests {
         // The slab allocator policy is T-CONDITIONAL by design (auto-ON
         // strictly at decode T <= 2): with it on, the T1 arm retains its
         // chunk buffer resident across iterations while the T4 arm re-faults
-        // every chunk, making T1 ~3x faster on this in-cache fixture
-        // (measured 20ms vs 60ms in the iter-1 reconciliation). That is
+        // every chunk, making T1 faster on this in-cache fixture. That is
         // allocator POLICY, not a parallelism regression — exactly what this
         // guard is NOT about. Force the slab OFF for BOTH arms (restored on
-        // every exit path, including assert panic) so the 1.5x regression
-        // ceiling keeps measuring pipeline-vs-itself apples-to-apples.
+        // every exit path, including assert panic) so the regression ceiling
+        // keeps measuring pipeline-vs-itself apples-to-apples.
         struct SlabForceOffGuard;
         impl Drop for SlabForceOffGuard {
             fn drop(&mut self) {
@@ -241,11 +232,11 @@ mod tests {
                     // The pipeline's OWN T1 decode (NOT the production router):
                     // this guard measures "ParallelSM pipeline at T4 vs the same
                     // pipeline at T1." On gzippy-isal the production T1 route is
-                    // now single-shot ISA-L (DIS-15), which would make this a
-                    // pipeline-vs-single-shot comparison (ratio ~10x) and defeat
-                    // the guard's purpose. Calling `decompress_parallel(..., 1)`
-                    // directly keeps it a true, build-independent
-                    // pipeline-vs-itself regression check.
+                    // single-shot ISA-L, which would make this a
+                    // pipeline-vs-single-shot comparison and defeat the guard's
+                    // purpose. Calling `decompress_parallel(..., 1)` directly
+                    // keeps it a true, build-independent pipeline-vs-itself
+                    // regression check.
                     let mut out = Vec::new();
                     let _ = crate::decompress::parallel::single_member::decompress_parallel(
                         data, &mut out, None, 1, false,
@@ -356,13 +347,11 @@ mod tests {
     /// Catches catastrophic bgzf parallel-path regressions — it fails if the
     /// parallel path gets significantly *worse*, not if it isn't yet winning.
     /// Since the decode-graph purge, bgzf decode is pure-Rust (no libdeflate
-    /// FFI), so gzippy_T4 vs libdeflate_T1 sits higher than the old FFI baseline
-    /// (~1.7x on a 32-core x86_64 box under TIMING_LOCK; ~2.8x reported on
-    /// low-core CI runners where T4 can't claim 4 cores and the rest of the
-    /// suite steals the others). Threshold 4.50 keeps headroom over that while
-    /// still tripping on a true regression (e.g. the parallel path falling back
-    /// to serial would blow well past it). TIMING_LOCK serializes the ratio
-    /// tests so they don't inflate each other.
+    /// FFI), so gzippy_T4 vs libdeflate_T1 sits higher than the old FFI
+    /// baseline. The threshold keeps headroom over that while still tripping on
+    /// a true regression (e.g. the parallel path falling back to serial would
+    /// blow well past it). TIMING_LOCK serializes the ratio tests so they don't
+    /// inflate each other.
     ///
     /// Gated to x86_64: pure-Rust BGZF on low-core aarch64 CI/unit runners is
     /// env-fragile and exceeds this ratio for reasons unrelated to a regression

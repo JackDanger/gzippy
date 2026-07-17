@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// M2 (git history (campaign plan, removed), git history (campaign plan, removed) §5): `marker_inflate::Block`
+// `marker_inflate::Block`
 // owns a `WidthRing` member and its fast loops write through raw pointers obtained
 // from `window16` (pub(crate) fields — the type is an ownership/contract boundary,
 // not a call-virtualization layer; codegen of the hot loops is unchanged). The
@@ -37,15 +37,13 @@
 //!   :1602) be emitted as u8 views into the just-conflated window
 //!   (deflate.hpp:1285-1286, `lastBuffers(window, m_windowPosition,
 //!   nBytesRead)`): [`WidthRing::flipped_seam`]. No u16 re-read after the
-//!   flip (fixes map DIV-4 relative to the pre-M2
-//!   `Block::drain_transition_narrow_u16` temp-Vec narrow).
+//!   flip.
 //! - Pre-decode window seed (deflate.hpp:1750-1759) in [`WidthRing::seed_window`]:
 //!   clean from byte 0.
 //!
 //! The emit methods here are simple per-element loops: this type is the
 //! ownership/contract boundary. `Block`'s optimized fast loops keep writing
-//! through raw pointers obtained FROM the ring after the M2 migration (same
-//! codegen); see git history (campaign plan, removed) §2.
+//! through raw pointers obtained FROM the ring (same codegen).
 
 use super::marker_inflate::{MAX_WINDOW_SIZE, RING_SIZE, U8_RING_SIZE};
 use super::replace_markers::MARKER_BASE;
@@ -83,9 +81,9 @@ pub enum RingError {
 /// The one dual-width decode window. See module docs for the vendor mapping.
 ///
 /// Fields are `pub(crate)` because `marker_inflate::Block`'s optimized fast
-/// loops (M2, git history (campaign plan, removed) §2/§5) pull `pos` /
+/// loops pull `pos` /
 /// `distance_to_last_marker` into locals and write through raw pointers
-/// derived from `window16` — identical codegen to the pre-M2 inline fields.
+/// derived from `window16` — identical codegen.
 pub struct WidthRing {
     /// Single backing allocation (vendor `m_window16`, deflate.hpp:926).
     /// Boxed for stack-pressure parity with vendor's heap'd Block
@@ -106,7 +104,7 @@ pub struct WidthRing {
     /// Vendor `m_decodedBytes` (deflate.hpp:940-944): total decoded bytes,
     /// including a seeded window's length (deflate.hpp:1755).
     ///
-    /// NOTE (M2): maintained ONLY by this type's standalone per-element emit
+    /// NOTE: maintained ONLY by this type's standalone per-element emit
     /// API (`push_literal` / `copy_backref` / `seed_window`) for the contract
     /// tests. `Block` keeps the authoritative `m_decodedBytes` as its own
     /// `decoded_bytes` field (vendor keeps it on `Block`, not the window) and
@@ -883,11 +881,10 @@ mod tests {
 
     // ── byte-exact cross-check against the existing engine ──────────────
     //
-    // Locks the contract WidthRing must preserve through the M2 migration:
+    // Locks the contract WidthRing must preserve:
     // the production `Block` decoding a real deflate-with-dictionary corpus,
     // marker path (+ MapMarkers resolve) vs seeded path vs flate2 ground
-    // truth. (WidthRing itself is not a deflate decoder; the engine moves
-    // ONTO it in M2 and this net then runs against the migrated Block.)
+    // truth. (WidthRing itself is not a deflate decoder.)
     #[cfg(any(
         all(
             feature = "isal-compression",

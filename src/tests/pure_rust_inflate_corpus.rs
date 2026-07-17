@@ -1,13 +1,8 @@
 //! Corpus differential harness for the `pure-rust-inflate` backend.
 //!
-//! Plan: see `former plans/rust-rapidgzip.md` (this corpus is the §7
-//! correctness gate). The original Step 0.2 plan is in git history.
-//!
 //! This is the gate that catches "the wrapper API tests pass against
-//! flate2 fixtures but a real-world corpus breaks." The three §2
-//! divergences (`session_pending() → false`, the no-progress guard,
-//! `read_footer_at_current` ErrorKind) all have narrow unit tests; this
-//! file is the wide-coverage backstop.
+//! flate2 fixtures but a real-world corpus breaks." It is the wide-coverage
+//! backstop for the parallel-SM pipeline.
 //!
 //! All cases run the parallel-SM pipeline end-to-end via
 //! `decompress::decompress_single_member` (T > 1, > 10 MiB compressed,
@@ -45,7 +40,7 @@ mod tests {
     /// with each other AND with gzippy's output. Two independent
     /// implementations beat one — a shared bug in either oracle would
     /// mask a real production divergence if we only compared against
-    /// one of them (advisor item D1).
+    /// one of them.
     ///
     /// Confirms the parallel pipeline was the routing pick by
     /// snapshotting `MARKER_PIPELINE_RUNS` around the call.
@@ -76,7 +71,7 @@ mod tests {
         // independent author, no shared codebase with flate2/zlib-ng.
         // If oracle 1 and oracle 2 disagree, the test fixture has an
         // ambiguity that needs resolving BEFORE we trust gzippy's
-        // output. This is the second oracle from advisor D1.
+        // output.
         let oracle_libdeflate: Vec<u8> = {
             // Allocate generously: libdeflate needs the exact output
             // size up-front; if we under-allocate we get
@@ -130,8 +125,8 @@ mod tests {
              routing fell through to a sequential backend"
         );
 
-        // Length first — catches silent-truncation regressions (the
-        // §2 divergence 1 / 2 failure modes) with a one-line message.
+        // Length first — catches silent-truncation regressions with a
+        // one-line message.
         assert_eq!(
             got.len(),
             reference.len(),
@@ -317,15 +312,14 @@ mod tests {
         assert_pure_rust_parallel_sm_roundtrips(&compressed, "large_dynamic_heavy");
     }
 
-    /// ROUTE-A THIN-T1 PRODUCTION PATH differential (Task 2). At T==1 the
+    /// ROUTE-A THIN-T1 PRODUCTION PATH differential. At T==1 the
     /// production single-member path sheds the parallel scaffold and uses the
     /// thin serial rolling-window driver (`drive_thin_t1_oracle`, the SAME shared
     /// `decode_chunk` kernel). This asserts (a) the thin spine actually RAN
     /// (THIN_T1_RUNS fired — not the parallel scaffold), and (b) byte-exactness
     /// vs BOTH flate2 and libdeflate on a multi-block corpus spanning several
     /// 1 MiB chunk strides, incl. the in-driver CRC32 + ISIZE verification (a
-    /// mismatch surfaces as Err here). Ships in the SAME commit as the routing
-    /// change per the real-corpus-test rule.
+    /// mismatch surfaces as Err here).
     #[cfg(all(parallel_sm, not(feature = "isal-compression")))]
     #[test]
     fn thin_t1_production_path_byte_exact_and_routed() {

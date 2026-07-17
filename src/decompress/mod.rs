@@ -77,12 +77,9 @@ pub enum DecodePath {
     /// the BGZF fast path would truncate. See
     /// [`crate::decompress::parallel::single_member::decompress_multi_member_chunked`].
     ///
-    /// NOTE (2026-07-05): this reuses the per-member parallel engine (member walk).
-    /// It is NOT routed for plain dominant/few-member distributions: that was
-    /// MEASURED to REGRESS on M1 (per-member pipeline spinup + thread
-    /// oversubscription at high T). The located dominant-member plateau needs the
-    /// rapidgzip-faithful whole-file-block-finder cross-member port, not this
-    /// member-walk shortcut — see the gate-phase plan.
+    /// NOTE: this reuses the per-member parallel engine (member walk). It is
+    /// NOT routed for plain dominant/few-member distributions — those take the
+    /// whole-file-grid cross-member port ([`MultiMemberGrid`]) instead.
     MultiMemberChunked,
     /// STAGE-2d whole-file MULTI-MEMBER GRID: a plain multi-member stream decoded
     /// as ONE chunk grid spanning every member (the rapidgzip-faithful
@@ -114,9 +111,9 @@ pub enum DecodePath {
 #[allow(dead_code)] // referenced by tests + the legacy not(parallel_sm) gate
 pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 
-// (Removed 2026-06-04) `MIN_PARALLEL_SM_THREADS` / `parallel_sm_min_threads`:
+// (Removed) `MIN_PARALLEL_SM_THREADS` / `parallel_sm_min_threads`:
 // the parallel-SM engine is now the SOLE single-member decode path at every
-// thread count and size (task #8), so there is no thread floor below which a
+// thread count and size, so there is no thread floor below which a
 // C-FFI one-shot is chosen — there is no C-FFI one-shot in the decode graph.
 
 /// Compression ratio (uncompressed / compressed) below which the speculative
@@ -126,10 +123,8 @@ pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 /// Stored-dominated / incompressible data has very sparse deflate-block
 /// boundaries, so the block finder's spacing-aligned arithmetic guesses never
 /// land on a real boundary: every speculative chunk fails to validate (header
-/// / body speculation failures) and decode serializes — measured 3–4× SLOWER
-/// than a single ISA-L pass. (2026-05-29 matrix: random100 collapses from T1
-/// 7263 MB/s to T8 1963 MB/s; `--verbose` showed 228 header + 69 body
-/// speculation failures.) The ratio cleanly separates incompressible (~1.00)
+/// / body speculation failures) and decode serializes — a net loss versus a
+/// single one-shot pass. The ratio cleanly separates incompressible (~1.00)
 /// from compressible silesia (~3.1); 1.15 leaves margin.
 #[allow(dead_code)] // used by classify's parallel_sm branch + tests
 const PARALLEL_SM_MIN_RATIO_NUM: u64 = 115;
@@ -654,8 +649,8 @@ fn decompress_single_member_for<W: Write>(
             )
             .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
             writer.flush()?;
-            // Gate-0 non-inert proof for the engine-A clean-path fastloop
-            // wire-in: dump the calls/bytes it actually decoded (process-global).
+            // Non-inert proof for the engine-A clean-path fastloop: dump the
+            // calls/bytes it actually decoded (process-global).
             #[cfg(all(
                 pure_inflate_decode,
                 not(all(feature = "asm-kernel", target_arch = "x86_64"))
@@ -738,9 +733,8 @@ fn decompress_single_member_for<W: Write>(
 /// On `parallel_sm` builds this routes to the ParallelSM chunk kernel at
 /// parallelization=1 (whole-file grid, with a member-walk fallback — see
 /// [`crate::decompress::parallel::single_member::decompress_multi_member_seq_fast`]),
-/// NOT the scalar `inflate_consume_first_bits`, which ran this path at ~3×
-/// rapidgzip -P1 (mmiso locate, 2026-07-06). On the legacy bare-no-feature build
-/// (no `parallel_sm`) it uses the scalar member walk (correct, just slower).
+/// NOT the scalar `inflate_consume_first_bits`. On the legacy bare-no-feature
+/// build (no `parallel_sm`) it uses the scalar member walk (correct, just slower).
 ///
 /// Stops cleanly (returning the bytes decoded so far) on the first non-gzip /
 /// truncated / trailing bytes — matching gzip(1) and the historical
@@ -754,9 +748,8 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
     verbose: bool,
 ) -> GzippyResult<u64> {
     // T1 FAST PATH (parallel_sm builds): decode through the ParallelSM chunk
-    // kernel instead of the legacy scalar `inflate_consume_first_bits`, recovering
-    // the located ~3× T1 multi-member deficit (mmiso 2026-07-06). The fast path
-    // tries the whole-file grid (one inflate pass, member boundaries discovered
+    // kernel instead of the legacy scalar `inflate_consume_first_bits`. The fast
+    // path tries the whole-file grid (one inflate pass, member boundaries discovered
     // inline, per-member CRC32 + ISIZE verified) and, on a grid block-finder /
     // boundary failure, resumes the sequential member-walk past the validated
     // prefix already streamed — clean-stopping on trailing garbage and surfacing
@@ -1037,7 +1030,7 @@ mod tests {
     /// Incompressible single-member input above the size gate must NOT take the
     /// SPECULATIVE parallel pipeline — on stored-dominated data the block
     /// finder's spacing guesses never hit a real boundary and that pipeline is
-    /// 3-4× slower than a single ISA-L pass (2026-05-29 matrix). The
+    /// a net loss versus a single one-shot pass. The
     /// `parallel_sm_unprofitable` ratio gate keeps it off the speculative path;
     /// instead such input (a stored stream) is routed to the NON-speculative
     /// `StoredParallel` split path on x86_64 + ISA-L/pure-rust, which decodes

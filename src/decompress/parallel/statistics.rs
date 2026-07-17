@@ -250,9 +250,7 @@ mod tests {
         // catcher for the --verbose port (commits 52b398a..8e77404).
         // If a future commit drops or renames any of these sections,
         // gzippy's --verbose stops being directly comparable to
-        // rapidgzip --verbose — which advisor passes rely on for
-        // cross-tool diagnosis (used to find the chunk-size mismatch
-        // and chunk-finalize divergence this session).
+        // rapidgzip --verbose.
         let s = FetcherStatistics::new();
         s.record_prefetch();
         s.record_prefetch();

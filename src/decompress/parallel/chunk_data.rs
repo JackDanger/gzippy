@@ -188,24 +188,23 @@ pub struct ChunkData {
     /// last 32 KiB window. `apply_window` (next module) resolves these
     /// in place against a known window.
     // std `Vec<u16>` (not the rpmalloc `U16`): the bootstrap decodes into this
-    // buffer directly (zero-copy merge), and std-Vec decode is ~3% faster
-    // per-byte than rpmalloc here (measured). Warm-cycled via the dedicated
+    // buffer directly (zero-copy merge), and std-Vec decode is faster
+    // per-byte than rpmalloc here. Warm-cycled via the dedicated
     // `chunk_buffer_pool::{take,return}_std_u16` retained pool.
     pub data_with_markers: SegmentedU16,
     /// Clean byte suffix. All bytes here were decoded with a known
     /// window (set via StreamingInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
     ///
-    /// CONTIGUOUS (2026-06-04): the clean decoded bytes live in ONE
+    /// CONTIGUOUS: the clean decoded bytes live in ONE
     /// contiguous allocation (see [`SegmentedU8`], now contiguous-backed),
     /// grown by amortized reserve. This is the FAITHFUL port of vendor's
     /// CLEAN-data storage: `DecodedData::append` (`DecodedData.hpp:278-289`)
     /// stores the clean `data` in single contiguous per-append buffers and
     /// the comment there states forcing them to 128 KiB "makes no sense".
     /// The prior FOOTPRINT-ALIGN revision wrongly applied vendor's *marker*
-    /// 128 KiB-segment pattern to the clean buffer; that measured 3.26×
-    /// DTLB-walks / 1.42× cycles vs rapidgzip at equal instruction count —
-    /// the memory-bound gap. Reverted to contiguous; the RSS regression is
+    /// 128 KiB-segment pattern to the clean buffer, which raised DTLB-walks and
+    /// cycles. Reverted to contiguous; the higher RSS is
     /// accepted for speed parity (the prime directive). The u16 MARKER
     /// buffer (`data_with_markers`) stays 128 KiB-segmented — that one
     /// matches vendor's `dataWithMarkers` and is correct.
@@ -348,13 +347,10 @@ impl ChunkData {
     /// `Drop` impl returns the Vecs to the pool.
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
-        // FOOTPRINT-ALIGN (2026-06-02) — REVERTED after measurement.
+        // FOOTPRINT-ALIGN — REVERTED after measurement.
         // Right-sizing `data`'s initial capacity from max_decoded_chunk_size
-        // (80 MiB) down to split_chunk_size (4 MiB) cut allocator TRAFFIC 55%
-        // (memlife T8: data alloc 8.64 GB→1.10 GB, rpmalloc-huge 3.27 GB→159
-        // MB) but on the frozen interleaved A/B it REGRESSED the wall
-        // (T8-file 1.297→1.510 vs rapidgzip; T16 1.677→1.922), RAISED minflt
-        // 232k→363k, and barely moved peak maxrss (1025→1010 MB). MECHANISM:
+        // (80 MiB) down to split_chunk_size (4 MiB) cut allocator traffic but
+        // REGRESSED the wall and raised minor faults. MECHANISM:
         // gzippy stores decoded bytes in ONE contiguous growing `data` Vec.
         // A small initial cap forces the `reserve(ALLOCATION_CHUNK_SIZE)`
         // growth loop (chunk_decode.rs:318) to realloc+memcpy+RE-FAULT as the
@@ -699,8 +695,8 @@ impl ChunkData {
 
     /// Pre-fill `self.data[0..window.len()]` with the predecessor's
     /// 32 KiB sliding-window image and record `data_prefix_len`.
-    /// Scaffolding for Option A — see `git history (campaign plan, removed)` §6
-    /// "copy_match_windowed slow-path elimination."
+    /// Scaffolding for Option A (window pre-fill / copy_match_windowed
+    /// slow-path elimination).
     ///
     /// Caller contract:
     /// - Must be called BEFORE any decoded byte is appended to
@@ -1661,7 +1657,7 @@ impl ChunkData {
     /// chunk, by which point the next chunk's bootstrap has taken a cold
     /// buffer). This is what makes the zero-copy bootstrap merge (decode
     /// straight into `data_with_markers`, no `append_markered` copy) a clean
-    /// no-copy path rather than a ~3% regression: the warm buffer cycles
+    /// no-copy path: the warm buffer cycles
     /// take → decode → resolve → return in time for the next take. Idempotent:
     /// leaves an empty buffer, so the `Drop` return becomes a no-op.
     ///
@@ -1725,7 +1721,7 @@ impl ChunkData {
         // stale u16 high bytes left by the first narrow and feed them through the
         // LUT → silent corruption). The merge used to empty the buffer and act as
         // that guard; now correctness rests on `markers_resolved` / `narrowed_len`,
-        // so assert them here. (Advisor: merge-removal-advisor-verdict.md.)
+        // so assert them here.
         debug_assert!(
             self.narrowed_len == 0 && !self.markers_resolved,
             "resolve_and_narrow_markers_in_place: already resolved (double-resolve)"

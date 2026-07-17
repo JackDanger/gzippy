@@ -1,13 +1,13 @@
 //! Property-based differential testing of the pure-Rust inflate path.
 //!
-//! WHY (campaign): proptest generates structurally-diverse DEFLATE streams —
+//! WHY: proptest generates structurally-diverse DEFLATE streams —
 //! fixed + dynamic Huffman, stored blocks, varied back-ref distances/lengths,
 //! varied BFINAL placement, level-induced block-type mixes — far beyond what a
 //! handful of fixed fixtures cover. For every generated input we assert gzippy's
 //! decode is byte-identical to TWO independent oracles (flate2/zlib-ng and
-//! libdeflate). A subtle break in the inner-Huffman rate work (BMI2/multi-literal/
-//! packed-LUT) or the copy-free-to-final back-ref resolution that escapes the
-//! fixed fixtures lands RED here, with proptest shrinking to a minimal repro.
+//! libdeflate). A subtle break in the inner-Huffman decode (BMI2/multi-literal/
+//! packed-LUT) or the back-ref resolution that escapes the fixed fixtures lands
+//! RED here, with proptest shrinking to a minimal repro.
 //!
 //! Surface driven here: `decompress_bytes(.., 1)` — the single-threaded
 //! production inflate primitive (gzip-wrapped input) — against the libdeflate

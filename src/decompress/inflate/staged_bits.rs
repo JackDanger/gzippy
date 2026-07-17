@@ -14,9 +14,8 @@ use super::consume_first_decode::Bits;
 /// Vendor `m_buffer` capacity (`gzip/isal.hpp:207`).
 pub const INPUT_STAGING_BYTES: usize = 128 * 1024;
 
-/// Cap on retained pooled boxes per thread (bounds idle RSS). Frozen to 4 —
-/// the value the campaign measured as the production default (the env
-/// override was removed).
+/// Cap on retained pooled boxes per thread (bounds idle RSS). Frozen to 4
+/// (the env override was removed).
 const STAGING_POOL_CAP: usize = 4;
 
 type StagingBox = Box<[u8; INPUT_STAGING_BYTES]>;
@@ -25,9 +24,8 @@ thread_local! {
     /// Per-thread free-list of 128 KiB staging boxes. The parallel-SM clean
     /// tail constructs one `StagedBitInput` per chunk; without pooling that is
     /// ~128 KiB of `Box` alloc/free churn per chunk per thread. Reusing the
-    /// box keeps the per-thread working set fixed (cache-residency mandate,
-    /// former plans/gzippy-native-design-mandate.md) and is byte-transparent: the box
-    /// content is ALWAYS fully overwritten by the constructor's first
+    /// box keeps the per-thread working set fixed and is byte-transparent: the
+    /// box content is ALWAYS fully overwritten by the constructor's first
     /// `reload_at_bit` (copy_from_slice + zero-pad tail) before any read, so a
     /// recycled box needs no zeroing.
     static STAGING_POOL: RefCell<Vec<StagingBox>> = const { RefCell::new(Vec::new()) };

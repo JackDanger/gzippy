@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// Pre-existing parallel-module dead code, exposed by the default-feature flip; delete in a dedicated cleanup.
 //! Stateless windowed-bulk DEFLATE decoder using the ISA-L LUT format
 //! from `lut_huffman.rs`.
 //!
@@ -7,10 +7,7 @@
 //!
 //! The parallel-SM bulk phase (post-bootstrap, with a known 32 KiB
 //! predecessor window) currently routes through `ResumableInflate2`
-//! (`src/decompress/inflate/resumable.rs`). Per the 2026-05-27 neurotic
-//! perf profile, ResumableInflate2's bulk hot loop accounts for
-//!   - 9.39% CPU in `decode_huffman_body_resumable`
-//!   - 6.04% CPU in `copy_match_windowed`
+//! (`src/decompress/inflate/resumable.rs`).
 //!
 //! ResumableInflate2 carries state-machine yield-check overhead from
 //! supporting the speculative-decode use case. For the BULK windowed
@@ -214,7 +211,7 @@ pub fn decode_block(
     // literal/match write this iteration (<= 3 packed literals + one match <=258
     // = 261 bytes) is provably in-bounds, so we skip the per-symbol output bounds
     // checks (`*out_pos >= output.len()`, `*out_pos + length > output.len()`).
-    // Fulcrum T16: gzippy's `stream_inflate` is 2.35x ISA-L busy; ISA-L's hot
+    // ISA-L's hot
     // loop is bounds-check-free with an output margin. Validity checks (invalid
     // Huffman, EOB, length/distance bounds) are KEPT — only the *output capacity*
     // checks are elided. The existing safe loop below handles the tail (last

@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// Pre-existing parallel-module dead code, exposed by the default-feature flip; delete in a dedicated cleanup.
 
 //! Cross-thread Vec recycler for `ChunkData`'s `data` (`Vec<u8>`) and
 //! `data_with_markers` (`Vec<u16>`) buffers.
@@ -71,20 +71,18 @@
 //!
 //! ## Page-fault gap vs vendor (open)
 //!
-//! Neurotic x86_64 silesia profile: gzippy spends ~40% of CPU in
-//! `asm_exc_page_fault` + `clear_page_erms`; rapidgzip spends ~17%.
-//! The gap is rpmalloc's per-thread arena keeping pages warm across
+//! rpmalloc's per-thread arena keeps pages warm across
 //! malloc/free cycles within a process. `std::alloc::System` munmaps
 //! large-Vec deallocations and remaps fresh on next allocation,
 //! re-faulting every page. Per-worker LIFO pools address part of this
-//! (capacity reuse on the same worker) but have **not** been measured
-//! to close the 40%→17% gap — treat as an open empirical question.
+//! (capacity reuse on the same worker) but do **not** replace a true
+//! per-thread arena — treat the residual as an open empirical question.
 //!
 //! A previous experiment pre-warmed the pool by touching pages on the
-//! consumer thread before workers spawn. Measured -50% throughput on
-//! the bench (each fresh CLI process paid ~170 ms of pre-touch work
-//! on a ~750 ms decode). Reverted; **do not re-add a prewarm call
-//! without a daemon-mode caller AND a 20-trial bench-on-branch gate.**
+//! consumer thread before workers spawn. It regressed throughput on the
+//! bench (each fresh CLI process paid pre-touch work on a short decode).
+//! Reverted; **do not re-add a prewarm call without a daemon-mode caller
+//! AND a bench-on-branch gate.**
 //!
 //! Closing the remaining gap still requires one of:
 //!   - `allocator-api2` polyfill + `Vec<T, RpmallocAlloc>` for chunk
@@ -110,13 +108,7 @@ thread_local! {
     static WORKER_POOL_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-// (shared cross-worker pool experiment removed 2026-05-28: it showed NO
-// measurable wall effect on a quiet-enough box — page-faults
-// −3.7% but cycles within noise. The per-worker pool collapses at T=16
-// because chunks sit in the consumer reorder buffer until Drop (buffer
-// RETURN LATENCY), not because of pool topology. See
-// project_real_gap_pinned_2026_05_28 / project_parallel_test_hang memory; the
-// real fix is earlier buffer return, queued for the parallel-pipeline work.)
+// A shared cross-worker pool variant was tried and dropped in favor of the per-worker LIFO pools below.
 
 fn u8_pools() -> &'static [Mutex<Vec<U8>>] {
     static POOLS: OnceLock<Vec<Mutex<Vec<U8>>>> = OnceLock::new();
@@ -169,9 +161,7 @@ thread_local! {
     /// T1 cache-residency scope (set only by `drive_thin_t1_oracle`, on the
     /// single serial decode thread, via [`T1ResidentScope`]). When active it
     /// turns ON the manual buffer pool AND pins every reserve to the fixed
-    /// resident cap — the shipped default behavior that gated discrimination
-    /// measured (minor-faults drop toward igzip, monorepo
-    /// wall 1.39→1.29 both arches; see former plans/T1-CACHE-RESIDENCY-RESULTS.md), but
+    /// resident cap — the shipped default behavior, but
     /// SCOPED to the T1 thread so the T>1 parallel workers (which never set it)
     /// keep their faithful per-chunk ratio-informed reserve + pooling behavior.
     static T1_RESIDENT_SCOPE: Cell<bool> = const { Cell::new(false) };
@@ -205,36 +195,25 @@ fn manual_buffer_pool_enabled() -> bool {
     t1_resident_scope_active()
 }
 
-/// FORM-B RSS FIX — eager per-chunk page release at recycle time.
+/// Eager per-chunk page release at recycle time — currently a NO-OP.
 ///
-/// The AMD-Zen2 mid-T (T3-T8) loss vs rapidgzip was localized (differential +
-/// RSS-inflate Gate-2 oracle) to the process-exit teardown: gz's IN-PROCESS
-/// decode (`main_start`→`main_end`) is at-or-faster than rapidgzip's whole
-/// wall, but the residual after `main_end` — the KERNEL `exit_group`
-/// address-space teardown — is proportional to resident memory and is where the
-/// gap lives. `libc::_exit` cannot skip it (exit_group runs regardless), so the
-/// only lever is to lower PEAK / AT-EXIT resident memory during the run.
-///
-/// gzippy holds each chunk's decoded bulk (and marker) buffer resident until it
-/// is recycled; with the default (no manual pool) allocator, freed buffers can
-/// linger in the arena (glibc's dynamic mmap threshold) instead of being
-/// returned to the OS, inflating at-exit RSS. rapidgzip's rpmalloc returns
-/// pages to the OS incrementally. This mirrors that: at recycle time — which
+/// The idea: gzippy holds each chunk's decoded bulk (and marker) buffer resident
+/// until it is recycled; with the default (no manual pool) allocator, freed
+/// buffers can linger in the arena (glibc's dynamic mmap threshold) instead of
+/// being returned to the OS, inflating at-exit RSS. rapidgzip's rpmalloc returns
+/// pages to the OS incrementally. This would mirror that: at recycle time — which
 /// under the deferral invariant is AFTER the chunk's output was written and its
-/// window published, i.e. the buffer's contents are dead — we `MADV_DONTNEED`
-/// the buffer's resident pages, returning them to the OS immediately and
-/// overlapped with other threads' decode. Byte-transparent: the virtual mapping
-/// is retained; if the buffer is later re-taken from the manual pool it
-/// re-faults to zero pages that the next decode overwrites before any read.
+/// window published, i.e. the buffer's contents are dead — `MADV_DONTNEED` the
+/// buffer's resident pages, returning them to the OS immediately. Byte-transparent:
+/// the virtual mapping is retained; if the buffer is later re-taken from the manual
+/// pool it re-faults to zero pages that the next decode overwrites before any read.
 ///
-/// DEFAULT was OFF (opt-in env knob, since removed), and the knob was
-/// GATED-MEASURED NET-NEGATIVE on AMD-Zen2 ondemand silesia T3-T6 (the per-chunk
-/// `MADV_DONTNEED` runs on the serial consumer thread and the returned pages
-/// re-fault on the next allocation, a cost EXCEEDING the exit_group teardown it
-/// saves). The env kill-switch is removed and the shipped default (no eager
-/// release) is hardcoded — `dontneed_alloc` is a no-op. A profitable variant
-/// would have to overlap the page-return onto the PARALLEL worker threads (as
-/// rpmalloc does) rather than the serial consumer — unvalidated.
+/// This was gated-measured net-negative (the per-chunk `MADV_DONTNEED` runs on the
+/// serial consumer thread and the returned pages re-fault on the next allocation, a
+/// cost exceeding the teardown it saves), so the shipped default (no eager release)
+/// is hardcoded and `dontneed_alloc` is a no-op. A profitable variant would have to
+/// overlap the page-return onto the PARALLEL worker threads (as rpmalloc does)
+/// rather than the serial consumer — unvalidated.
 #[inline]
 fn dontneed_alloc(_base: *const u8, _bytes: usize) {}
 
@@ -298,9 +277,9 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     if v.capacity() == 0 {
         return;
     }
-    // FORM-B: return this recycled buffer's resident pages to the OS now,
+    // Return this recycled buffer's resident pages to the OS now,
     // before it is pooled (re-fault on reuse) or dropped (freed). Lowers
-    // peak/at-exit RSS → cheaper kernel exit_group teardown. Contents are dead
+    // peak/at-exit RSS. Contents are dead
     // at recycle time. Fires in BOTH the manual-pool and default (drop) modes.
     dontneed_alloc(v.as_ptr(), v.capacity());
     if !manual_buffer_pool_enabled() {
@@ -321,7 +300,7 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     if v.capacity() == 0 {
         return;
     }
-    // FORM-B: page-release before pool/drop (see return_u8_to_worker).
+    // Page-release before pool/drop (see return_u8_to_worker).
     dontneed_alloc(
         v.as_ptr() as *const u8,
         v.capacity() * std::mem::size_of::<u16>(),
@@ -369,7 +348,7 @@ pub fn return_marker_segments_to_worker(owner_worker: usize, segments: Vec<U16>)
     if segments.is_empty() {
         return;
     }
-    // FORM-B: page-release each marker segment before pool/drop.
+    // Page-release each marker segment before pool/drop.
     for v in &segments {
         if v.capacity() != 0 {
             dontneed_alloc(

@@ -268,7 +268,7 @@ pub(crate) fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
     }
 }
 
-// ── M2b (DIV-5): vendor stored-block special cases — counters + kill-switch ──
+// ── Vendor stored-block special cases — counters + kill-switch ──
 //
 // THREAD-LOCAL, test-only proof-of-path counters for the four stored-block
 // decode paths — the three vendor stored-block special cases (deflate.hpp:
@@ -296,7 +296,7 @@ thread_local! {
 pub(crate) static STORED_FLIP_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-/// M2b: when forced off (test-only override) restores the exact pre-M2b
+/// When forced off (test-only override) restores the exact pre-change
 /// stored-block behavior (per-byte decode, generic arming only) in both the
 /// ring path (`try_read_stored_special`) and the contig path
 /// (`decode_clean_stored_into_contig`'s bulk read).
@@ -311,7 +311,7 @@ fn stored_flip_disabled() -> bool {
     false
 }
 
-/// Rung-(d) increment 1 test override (mirror of `STORED_FLIP_OVERRIDE`):
+/// Test override (mirror of `STORED_FLIP_OVERRIDE`):
 /// -1 = follow the env kill-switch; 0 = force the DistTable path ON;
 /// 1 = force it OFF (the exact pre-change `dist_hc` chain). Tests flip both
 /// arms on the same stream and assert u16 + cursor equality. The env read is
@@ -320,7 +320,7 @@ fn stored_flip_disabled() -> bool {
 pub(crate) static MARKER_DIST_LUT_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-// Test-only liveness counter for the rung-(d) DistTable arm (compiled out of
+// Test-only liveness counter for the DistTable arm (compiled out of
 // production builds): proves the differential's ON arm actually routed
 // marker-fast-loop distance decodes through the DistTable path (and that the
 // OFF arm routed zero through it).
@@ -340,7 +340,7 @@ thread_local! {
     pub(crate) static MARKER_DIST_LUT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// ENGINE-W INC-1 / N2 test override for the marker-fast-loop local-Bits
+/// Test override for the marker-fast-loop local-Bits
 /// mirror (the env kill-switch that used to gate this was removed):
 /// -1 = shipped default (localbits ON); 0 = force localbits ON;
 /// 1 = force localbits OFF (exact pre-change struct-field path via `bits`).
@@ -348,7 +348,7 @@ thread_local! {
 pub(crate) static MFAST_LOCALBITS_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-// Test-only routing counter for the N2 local-Bits ON arm: counts the number
+// Test-only routing counter for the local-Bits ON arm: counts the number
 // of 'mfast iterations that ran through the lb (stack-local) code path.
 // Compiled out of production builds — engagement proof for the differential.
 //
@@ -361,24 +361,22 @@ thread_local! {
     pub(crate) static MFAST_LOCALBITS_ON_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Rung-(d) increment 1 (git history (campaign plan, removed) §5, F-d1):
 /// DistTable distance decode is the shipped default (proven byte-exact
 /// equivalent to the pre-change `dist_hc` → DISTANCE_EXTRA → refill-check →
 /// DISTANCE_BASE dependent chain — see `marker_dist_lut_diff` below). The
-/// `GZIPPY_MARKER_DIST_TABLE=0` env override was removed 2026-07-07 (batch
-/// 4f); `MARKER_DIST_LUT_OVERRIDE` (test-only atomic, NOT env-backed) still
+/// `GZIPPY_MARKER_DIST_TABLE=0` env override was removed;
+/// `MARKER_DIST_LUT_OVERRIDE` (test-only atomic, NOT env-backed) still
 /// drives the same-binary causal A/B differential test.
 #[cfg(pure_inflate_decode)]
 fn marker_dist_lut_disabled() -> bool {
     MARKER_DIST_LUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
-/// ENGINE-W INC-1 / N2: when forced off (test-only override) restores
+/// When forced off (test-only override) restores
 /// the exact pre-change bit-cursor path in the `'mfast` marker fast loop —
 /// struct-field `bits.xxx` accesses instead of the stack-local `lb.xxx` copy.
 /// The stack-local breaks the aliasing that forces `bits.bitbuf`/`bitsleft`/
-/// `pos` to round-trip memory after each ring store (same finding as the P3.1
-/// Lever-B1 on the contig clean loop). One OnceLock read per
+/// `pos` to round-trip memory after each ring store. One OnceLock read per
 /// `read_internal_compressed_specialized::<true>` call; zero-cost when OFF.
 fn mfast_localbits_disabled() -> bool {
     let ov = MFAST_LOCALBITS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
@@ -458,7 +456,7 @@ pub struct Block {
     decoded_bytes: usize,
     /// `m_decodedBytes` snapshot at the start of the current block.
     decoded_bytes_at_block_start: usize,
-    /// The ONE dual-width decode window (M2, git history (campaign plan, removed) §2/§5):
+    /// The ONE dual-width decode window:
     /// vendor's `m_window16` + `getWindow()` u8 view + `m_windowPosition` +
     /// `m_distanceToLastMarkerByte` + `m_containsMarkerBytes` as a single
     /// `WidthRing` (see `width_ring.rs` for the per-field vendor citations).
@@ -466,7 +464,7 @@ pub struct Block {
     /// The optimized fast loops below pull `ring.pos` /
     /// `ring.distance_to_last_marker` into locals and write through raw
     /// pointers derived from `ring.window16` — identical codegen to the
-    /// pre-M2 inline fields. Width dispatch (`ring.is_marker()`) replaces the
+    /// pre-existing inline fields. Width dispatch (`ring.is_marker()`) replaces the
     /// old `contains_marker_bytes` bool (a 2-variant enum byte compare).
     ///
     /// `decoded_bytes` (vendor `m_decodedBytes`) stays a `Block` field —
@@ -488,7 +486,7 @@ pub struct Block {
     /// Tracked back-references (debug instrumentation).
     pub backreferences: Vec<Backreference>,
     track_backreferences: bool,
-    /// ELEMENT A (igzip single-state-base): the litlen LUT and the
+    /// (igzip single-state-base): the litlen LUT and the
     /// contig-loop dist table are CO-LOCATED INLINE in ONE boxed `AsmState`
     /// (asm_kernel.rs) so the asm addresses both off a single `ctx` base
     /// (igzip `[state+_lit_huff_code+...]`/`[state+_dist_huff_code+...]`).
@@ -510,11 +508,10 @@ pub struct Block {
     dist_hc: crate::decompress::parallel::huffman_short_bits_cached::DistanceShortBitsCached<
         MAX_DISTANCE_SYMBOL_COUNT,
     >,
-    /// P3.1 (T1 recovery): libdeflate-style single-lookup distance table for
-    /// the CONTIG CLEAN fast loop only. The contig-vs-wrapper cycle profile
-    /// measured the back-ref iteration at 84.8 vs 61.5
-    /// cyc — the dependent chain `dist_hc cache -> DISTANCE_EXTRA -> refill
-    /// check -> DISTANCE_BASE` is the gap; one `DistEntry` lookup decodes
+    /// Libdeflate-style single-lookup distance table for
+    /// the CONTIG CLEAN fast loop only. Replaces the dependent chain
+    /// `dist_hc cache -> DISTANCE_EXTRA -> refill
+    /// check -> DISTANCE_BASE`; one `DistEntry` lookup decodes
     /// code+extra from the already-peeked word (same technique as the
     /// wrapper's `DistTable`, resumable.rs:1394-1405). AUTHORIZED DEVIATION
     /// from the vendor distance-decode choice, scoped to the inner Huffman
@@ -525,17 +522,16 @@ pub struct Block {
     /// distance/bit-consumption, unassigned/invalid code => raw==0 entry =>
     /// `InvalidHuffmanCode`, exactly `dist_hc`'s `None`.
     ///
-    /// ELEMENT A: the dist table now lives INLINE in `self.asm.dist` (always
+    /// The dist table now lives INLINE in `self.asm.dist` (always
     /// present); this latch replaces the old `Option::is_some()` "built &
     /// valid" signal used by the asm-dispatch gate and the contig loop.
     #[cfg(pure_inflate_decode)]
     dist_valid: bool,
-    /// P3.4 item 1 (DistTable build amortization): the distance code lengths
+    /// DistTable build amortization: the distance code lengths
     /// `dist_table` was last built from (`dist_table_nlens == 0` ⇒ never
     /// built). The table is a pure function of the lens, so when a new
     /// dynamic block's dist lens memcmp-equal the cached ones the table is
-    /// REUSED verbatim instead of rebuilt — the per-block build cadence is
-    /// what the P3.3b T16 triage measured (+8.6ms at 16 threads). Fixed-
+    /// REUSED verbatim instead of rebuilt. Fixed-
     /// Huffman blocks never touch this cache (they use the process-wide
     /// static `fixed_dist_table()`).
     #[cfg(pure_inflate_decode)]
@@ -875,14 +871,13 @@ impl Block {
     /// early-return at deflate.hpp:1751 — "before decoding has started").
     ///
     /// # Empty window
-    /// Vendor-faithful (M3, deflate.hpp:1750-1759): an EMPTY `initial_window`
+    /// Vendor-faithful (deflate.hpp:1750-1759): an EMPTY `initial_window`
     /// still flips the ring to CLEAN mode (`m_containsMarkerBytes = false` at
     /// `:1757` is written OUTSIDE the `!initialWindow.empty()` arm). Used at
     /// stream starts where no history can be referenced — back-refs past the
     /// (zero-length) history then ERROR via the clean-mode range check, exactly
     /// like vendor's `distance > m_decodedBytes + nBytesRead` check
-    /// (deflate.hpp:1652-1655). The historical pre-M3 no-op (stay in marker
-    /// mode) was the recorded divergence resolved here.
+    /// (deflate.hpp:1652-1655).
     #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn set_initial_window(
         &mut self,
@@ -919,13 +914,11 @@ impl Block {
         if initial_window.len() > MAX_WINDOW_SIZE {
             return Err(BlockError::ExceededWindowRange);
         }
-        // Empty window: vendor-faithful as of M3 — fall through to
+        // Empty window: vendor-faithful — fall through to
         // `WidthRing::seed_window`, which flips the ring CLEAN even for a
         // zero-length seed (vendor deflate.hpp:1751-1758: the `:1757`
         // `m_containsMarkerBytes = false` write is OUTSIDE the
-        // `!initialWindow.empty()` arm). The pre-M3 early-return no-op
-        // (stay in marker mode) was the recorded divergence; it is resolved
-        // here because M3 moves the seeded-chunk callers onto Block.
+        // `!initialWindow.empty()` arm).
         //
         // Seed the u8 VIEW of the ring with the initial window
         // (`WidthRing::seed_window` — vendor's pre-decode prime path,
@@ -940,7 +933,7 @@ impl Block {
         // (deflate.hpp:1754-1755). `m_decodedBytes` stays a Block field.
         *decoded_bytes = initial_window.len();
         *decoded_bytes_at_block_start = initial_window.len();
-        // Pre-M2 Block also primed the (dead-while-clean) marker counter to
+        // Prime the (dead-while-clean) marker counter to
         // the seed length; preserved verbatim for mechanical parity.
         ring.distance_to_last_marker = initial_window.len();
         Ok(())
@@ -1030,7 +1023,7 @@ impl Block {
         {
             self.block_huffman_luts_ready = false;
         }
-        // P3.4 item 1: drop the per-block lens-verified latch (was
+        // Drop the per-block lens-verified latch (was
         // `dist_table = None`, forcing a fresh alloc+build every block) so
         // decode_clean_into_contig re-validates lazily — marker-mode blocks
         // that never flip clean still skip the build entirely, and a dynamic
@@ -1309,7 +1302,7 @@ impl Block {
             // bytes are then emitted as a u8 view into the just-conflated
             // window (vendor `result.data = lastBuffers(window,
             // m_windowPosition, nBytesRead)`, deflate.hpp:1286) — no u16
-            // re-read, no temp narrow (map DIV-4 closed). From the next
+            // re-read, no temp narrow. From the next
             // `read()` on, `<false>` decodes u8-DIRECT and the drain is a
             // plain u8 copy.
             let seam_len = self.ring.flip_in_place(self.decoded_bytes);
@@ -1325,8 +1318,8 @@ impl Block {
         result
     }
 
-    /// M2b (DIV-5): vendor's three stored-block special cases in `Block::read`
-    /// (deflate.hpp:1212-1256), verified first-hand 2026-06-10:
+    /// Vendor's three stored-block special cases in `Block::read`
+    /// (deflate.hpp:1212-1256):
     ///
     /// 1. `m_uncompressedSize >= MAX_WINDOW_SIZE` (:1214-1219), ANY width:
     ///    `m_windowPosition = m_uncompressedSize`, read the whole payload
@@ -1365,7 +1358,7 @@ impl Block {
     /// truncation semantics byte-for-byte. Both arms reject the chunk on a
     /// truncated stored block, so output is unaffected.
     ///
-    /// When forced off (test-only override) restores the exact pre-M2b
+    /// When forced off (test-only override) restores the exact pre-change
     /// behavior (per-byte path, generic arming only).
     ///
     /// Returns `Some(bytes_emitted)` when a special case ran.
@@ -1474,7 +1467,7 @@ impl Block {
     /// `n_max_to_decode`; sets `at_end_of_block` when the full payload
     /// is consumed.
     ///
-    /// M2b: the vendor stored-block special cases (early flips + clean bulk
+    /// The vendor stored-block special cases (early flips + clean bulk
     /// read, deflate.hpp:1212-1256) are tried first — see
     /// [`Block::try_read_stored_special`]. The test-only override (forced off)
     /// disables them, restoring this per-byte path exactly.
@@ -1636,7 +1629,7 @@ impl Block {
     fn lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
         #[cfg(pure_inflate_decode)]
         {
-            // WINDOW-ABSENT CONVERGE (Lever A): every caller (`decode_careful_tail`
+            // WINDOW-ABSENT CONVERGE: every caller (`decode_careful_tail`
             // and the `decode_clean_into_contig` Rust-fallback careful loop) calls
             // this IMMEDIATELY after a `bits.refill()`, so the `available() < 32`
             // backstop inside `decode` is provably dead (lut_huffman.rs:1088-1101).
@@ -1780,7 +1773,7 @@ impl Block {
         // Drain frontier — constant for the duration of this call (the drain
         // runs in `read()` AFTER this function returns). Passed to the
         // back-ref copy routines so their word-copy rounding overshoot can
-        // never wrap onto undrained output (P0 stored-marker-CRC fix).
+        // never wrap onto undrained output (stored-marker-CRC fix).
         let drained = self.ring.drained;
         let mut emitted: usize = 0;
         // Local copy of the marker counter — pulled into a register
@@ -1916,45 +1909,44 @@ impl Block {
         let mut pos = *pos_io;
         let mut emitted = *emitted_io;
         let mut distance_marker = *distance_marker_io;
-        // ── Rung (d) increment 1 (git history (campaign plan, removed) §4/N1) ──────
         // The fast loop's distance decode goes through the libdeflate-shape
         // `DistTable` — ONE entry load + in-register `consume_entry` /
         // `decode_distance` — replacing the dist_hc → DISTANCE_EXTRA →
-        // refill-check → DISTANCE_BASE dependent chain (the P3.1-measured
-        // 84.8→61.5 cyc/backref mechanism; see the `dist_table` field doc).
-        // Byte-exact by the same P3.1 equivalence already differentialed on
+        // refill-check → DISTANCE_BASE dependent chain (see the `dist_table`
+        // field doc).
+        // Byte-exact by the same equivalence already differentialed on
         // the contig loop: identical symbols ⇒ identical distance +
         // identical bit consumption; unassigned/invalid code ⇒ raw==0
         // entry ⇒ `InvalidHuffmanCode`, exactly dist_hc's `None`. The
         // careful loop keeps dist_hc verbatim (rare tail/edge path).
         //
         // Test-only override (`MARKER_DIST_LUT_OVERRIDE`, same-binary causal
-        // A/B arm, F-d1): when forced OFF the table is neither built nor used
+        // A/B arm): when forced OFF the table is neither built nor used
         // here — the else-arm below is the exact pre-change chain.
         #[cfg(pure_inflate_decode)]
         let marker_dist_lut: bool = !marker_dist_lut_disabled();
         #[cfg(pure_inflate_decode)]
         if marker_dist_lut {
-            // P3.4-amortized: fixed blocks use the process-wide static
+            // Amortized: fixed blocks use the process-wide static
             // table (no per-block work); dynamic blocks memcmp-reuse.
             // Latched per block (`dist_table_checked`), shared with the
             // contig clean loop's call site.
             self.ensure_dist_table();
         }
-        // ELEMENT A: fixed AND dynamic blocks now share the inline
+        // Fixed AND dynamic blocks now share the inline
         // `self.asm.dist` (built in `ensure_dist_table`). It is re-borrowed
         // per backref below (the field-path SHARED borrow ends before the
         // `&mut self` sparsity call, so it cannot be hoisted across the loop).
         let in_end = bits.data.len();
         bits.refill();
-        // WINDOW-ABSENT CONVERGE (Lever A): backstop-free `decode_prefilled`,
+        // WINDOW-ABSENT CONVERGE: backstop-free `decode_prefilled`,
         // matching the clean asm path's litlen decode (chunk_decode contig path
         // / `decode_prefilled` at the run_contig preload). This site sits
         // IMMEDIATELY after the `bits.refill()` above, so the `available() < 32`
         // backstop inside `decode` is a no-op (lut_huffman.rs:1088-1101 proof) —
         // byte-exact, drops the per-symbol load+branch from the marker hot loop.
         let mut pre = self.asm.lut_litlen.decode_prefilled(bits);
-        // T3-ILP #2: speculative pre-refill litlen short entry (assigned at the
+        // Speculative pre-refill litlen short entry (assigned at the
         // bottom of each iteration BEFORE the refill; declared here in the
         // caller scope so the macro-expanded loop body and the `$litlen_decode`
         // block that reads it share one variable — macro hygiene, same as `pre`).
@@ -1963,10 +1955,10 @@ impl Block {
         // definite-init check for the cross-macro-hygiene shared binding.
         #[allow(unused_assignments)]
         let mut spec_litlen: u32 = 0;
-        // T3-MARKER-ILP LEVER: the marker-fast-loop litlen preload is the shipped
+        // The marker-fast-loop litlen preload is the shipped
         // default (the A/B kill-switch that reverted to `refill(); decode()` was
         // removed); the load-before-refill software pipeline always runs.
-        // T3-ILP #3 (dist-preload): loop-invariant enable. The speculative
+        // Dist-preload: loop-invariant enable. The speculative
         // first-level dist lookup is hoisted to the top of the loop body ONLY
         // when the marker LUT dist path is the active decode arm (marker_dist_lut
         // && dist_valid ⇔ `marker_dt = Some(..)` below); otherwise the dist_hc
@@ -1974,24 +1966,18 @@ impl Block {
         // `ensure_dist_table` (called just above) and is loop-invariant (no table
         // rebuild inside the fast loop).
         //
-        // ARCH-GATED (2026-07-02, gated cross-arch A/B on silesia, same-binary
-        // dist-preload ON vs OFF, sha 028bd002...):
-        //   aarch64 (Apple M1): WIN — T3 ON<OFF 23/25 (min -2.0% / median -2.4%),
-        //     T4 21/25 (-1.6% / -1.7%). The wide OoO window + spare load ports
-        //     absorb the per-iteration speculative load and hide the dist
-        //     dependent-load latency.
-        //   x86_64: NO WIN — AMD Zen2 TIE (T3 15/31, T4 19/31; Δmedian ≤0.6% ≪
-        //     ~1.3% run spread; 16xT2 throughput unchanged), Intel slight
-        //     LOSS-lean (T3 8/25, T8 10/25 favour OFF). Microcoded/narrower
-        //     schedulers do not hide the extra load, so compile-gate it OFF on
-        //     x86 — `dist_preload_on` folds to `false`, the top-of-loop hoist and
-        //     its branch dead-code-eliminate, and the length arm reverts to the
-        //     exact pre-lever in-arm `dt.lookup` (x86 codegen byte-identical).
+        // ARCH-GATED: enabled on aarch64 only. The wide OoO window + spare
+        // load ports there absorb the per-iteration speculative load and hide
+        // the dist dependent-load latency; narrower x86 schedulers do not, so
+        // it is compile-gated OFF on x86 — `dist_preload_on` folds to `false`,
+        // the top-of-loop hoist and its branch dead-code-eliminate, and the
+        // length arm reverts to the in-arm `dt.lookup` (x86 codegen
+        // byte-identical).
         #[cfg(all(pure_inflate_decode, target_arch = "aarch64"))]
         let dist_preload_on = marker_dist_lut && self.dist_valid;
         #[cfg(not(all(pure_inflate_decode, target_arch = "aarch64")))]
         let dist_preload_on = false;
-        // ── N2 (ENGINE-W INC-1): local-Bits register mirror ──────────────
+        // ── Local-Bits register mirror ──────────────
         // Hoist bitbuf/bitsleft/pos into a stack-local `lb: Bits` for the
         // duration of `'mfast` and write back at every exit. The raw-pointer
         // ring stores (through `ring_ptr`) defeat LLVM's alias analysis on the
@@ -2022,7 +2008,7 @@ impl Block {
                     }
                     $cur.consume(bit_count0);
 
-                    // ── T3 MARKER-ILP LEVER #3: SPECULATIVE DIST-ENTRY PRELOAD ──
+                    // ── SPECULATIVE DIST-ENTRY PRELOAD ──
                     // Issue the FIRST-level distance table load NOW — right after
                     // the litlen `consume` shifts `$cur.bitbuf` so its low
                     // `DistTable::TABLE_BITS` bits index the (possible) next dist
@@ -2052,7 +2038,7 @@ impl Block {
                         self.asm.dist.lookup($cur.bitbuf)
                     } else {
                         // Dummy (never read): the OFF arm decodes via the in-arm
-                        // `dt.lookup` exactly as before this lever.
+                        // `dt.lookup` exactly as before this change.
                         crate::decompress::inflate::libdeflate_entry::DistEntry::distance(0, 0, 0)
                     };
 
@@ -2071,7 +2057,7 @@ impl Block {
                         (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
                     }
 
-                    // ── T3 MARKER-ILP LEVER (branchless leading-literal count) ──
+                    // ── Branchless leading-literal count ──
                     // Replaces the per-symbol `while remaining > 0` walk (a serial
                     // `s >>= 8` loop-carried chain + a data-dependent branch per
                     // packed byte) with a single read of the FINAL packed symbol.
@@ -2123,7 +2109,7 @@ impl Block {
                         }
                         let length = (code as usize).wrapping_sub(254);
                         if length != 0 {
-                            // Rung (d) N1: per-backref table select (see the hoist
+                            // Per-backref table select (see the hoist
                             // comment above the loop). `None` ⇔ kill-switch OFF
                             // arm or a builder-declined block — both take the
                             // pre-change dist_hc chain below.
@@ -2152,12 +2138,12 @@ impl Block {
                                 use crate::decompress::inflate::libdeflate_entry::DistTable;
                                 #[cfg(all(test, pure_inflate_decode))]
                                 MARKER_DIST_LUT_HITS.with(|c| c.set(c.get() + 1));
-                                // T3-ILP #3: use the entry preloaded at the top of
+                                // Use the entry preloaded at the top of
                                 // the body (its load overlapped the store/count/
                                 // branch). Byte-exact: `$cur.bitbuf` is unchanged
                                 // since the hoist, so `dist_spec` == a fresh lookup
                                 // here (asserted in debug/test). OFF ⇒ verbatim
-                                // in-arm lookup (pre-lever behaviour).
+                                // in-arm lookup (pre-change behaviour).
                                 debug_assert!(
                                     !dist_preload_on
                                         || dist_spec.raw() == dt.lookup($cur.bitbuf).raw(),
@@ -2188,7 +2174,7 @@ impl Block {
                                 $cur.consume_entry(dist_raw);
                                 dist_entry.decode_distance(dist_extra_saved) as usize
                             } else {
-                                // Pre-change chain VERBATIM (N1 kill-switch arm).
+                                // Pre-change chain VERBATIM (kill-switch arm).
                                 let dsym = match $dist_hc_decode {
                                     Some(d) => d,
                                     None => {
@@ -2255,7 +2241,7 @@ impl Block {
                         }
                     }
 
-                    // ── T3 MARKER-ILP LEVER #2: LOAD-BEFORE-REFILL PRELOAD ──────
+                    // ── LOAD-BEFORE-REFILL PRELOAD ──────
                     // Speculatively load the NEXT litlen short entry from the
                     // CURRENT (pre-refill) bitbuf, THEN refill. The entry address
                     // depends only on `$cur.bitbuf`'s low 12 bits — NOT on the
@@ -2265,7 +2251,7 @@ impl Block {
                     // pattern, consume_first_decode.rs:1832-1856 / igzip asm
                     // asm_kernel.rs:602-607). Shortens the loop-carried
                     // `refill → LUT load → bit_count → consume` recurrence that
-                    // gates marker-loop IPC (T3 residual: 1.99 vs rg 2.06).
+                    // gates marker-loop IPC.
                     //
                     // Byte-exact contract: `bitsleft >= ISAL_DECODE_LONG_BITS(12)`
                     // here (worst case = one 15-bit long litlen + 28-bit dist off a
@@ -2289,7 +2275,7 @@ impl Block {
         }
         let mfast_localbits_on = !mfast_localbits_disabled();
         if mfast_localbits_on {
-            // N2 LOCAL-BITS PATH: stack-local lb — compiler promotes
+            // LOCAL-BITS PATH: stack-local lb — compiler promotes
             // bitbuf/bitsleft/pos to registers (ring stores can't alias lb).
             // Test-only routing counter proves the arm is taken.
             #[cfg(test)]
@@ -2304,10 +2290,10 @@ impl Block {
                 lb,
                 self.dist_hc.decode(&mut lb),
                 {
-                    // WINDOW-ABSENT CONVERGE (Lever A): the bottom-of-loop
+                    // WINDOW-ABSENT CONVERGE: the bottom-of-loop
                     // `$cur.refill()` runs immediately before this decode, so the
                     // backstop is dead — use `decode_prefilled` like the clean path.
-                    // T3-ILP #2: finish from the entry pre-loaded before the
+                    // Finish from the entry pre-loaded before the
                     // refill (`spec_litlen`).
                     pre = self.asm.lut_litlen.decode_from_spec(spec_litlen, &lb);
                 },
@@ -2324,14 +2310,14 @@ impl Block {
         } else {
             // TEST-OVERRIDE PATH (forced off): exact
             // pre-change struct-field path — bits.xxx throughout the loop.
-            // Same-binary causal A/B arm for F-w1.
+            // Same-binary causal A/B arm.
             mfast_lb_run!(
                 bits,
                 self.dist_hc.decode(bits),
                 {
-                    // WINDOW-ABSENT CONVERGE (Lever A): post-`$cur.refill()` site
+                    // WINDOW-ABSENT CONVERGE: post-`$cur.refill()` site
                     // — backstop-free decode (kill-switch struct-field arm).
-                    // T3-ILP #2: finish from the pre-refill-loaded entry.
+                    // Finish from the pre-refill-loaded entry.
                     pre = self.asm.lut_litlen.decode_from_spec(spec_litlen, bits);
                 },
                 {}
@@ -2757,9 +2743,8 @@ impl Block {
         Ok(emitted)
     }
 
-    /// P3.1/P3.4 dist-table ensure, factored out of `decode_clean_into_contig`
-    /// for rung (d) increment 1 (git history (campaign plan, removed) §4/N1): the
-    /// libdeflate-shape `DistTable` build with the P3.4 amortization scheme —
+    /// Dist-table ensure, factored out of `decode_clean_into_contig`: the
+    /// libdeflate-shape `DistTable` build with the amortization scheme —
     /// FixedHuffman + amortization ON never touches this cache (callers use the
     /// process-wide `fixed_dist_table()`); DynamicHuffman blocks memcmp the
     /// (≤30-byte) lens and REUSE the live table on a match, else rebuild in
@@ -2772,7 +2757,7 @@ impl Block {
             return;
         }
         self.dist_table_checked = true;
-        // ELEMENT A: the dist table lives INLINE in `self.asm.dist` and is
+        // The dist table lives INLINE in `self.asm.dist` and is
         // built IN PLACE (zero-copy). Both fixed and dynamic blocks build into
         // it (the old process-wide `fixed_dist_table()` static is no longer the
         // asm/contig source — the asm addresses ONLY `self.asm.dist` off its
@@ -2924,12 +2909,12 @@ impl Block {
             CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {}
             _ => return Err(BlockError::InvalidCompression),
         }
-        // P3.1 lazy dist_table: only needed in the contig fast loop, so skip
+        // Lazy dist_table: only needed in the contig fast loop, so skip
         // the build for marker-mode blocks that never flip clean.
         // After build_huffman_luts_for_block, dist_hc holds the validated lens,
         // and literal_cl / FIXED_DIST_LENGTHS still hold the same raw lengths.
         //
-        // P3.4 item 1 (build amortization — the P3.3b T16 +8.6ms): the table
+        // Build amortization: the table
         // is a pure function of the dist code lengths, so
         //   * FixedHuffman blocks share ONE process-wide static table
         //     (`fixed_dist_table()`) — zero per-block builds;
@@ -2955,14 +2940,14 @@ impl Block {
         const MAX_RUN_LENGTH: usize = 258;
         // Contiguous-buffer cap: leave room for one max back-ref + word overshoot.
         //
-        // Headroom proof (advisor-required): one outer iteration writes EITHER
+        // Headroom proof: one outer iteration writes EITHER
         // ≤3 packed literals, OR ≤ 1+LIT_CHAIN_MAX = 3 runtime-chained single
-        // literals (P3.2), OR exactly one back-ref of length ≤ MAX_RUN_LENGTH,
+        // literals, OR exactly one back-ref of length ≤ MAX_RUN_LENGTH,
         // NEVER both — the ISA-L LUT's multi-symbol packing (sym_count ∈ {1,2,3})
         // stops at any symbol ≥ 256, so a pair/triple slot is all literals and a
         // back-ref appears only at sym_count == 1 (igzip_inflate.c:473-476, see
         // the multi-symbol notes on read_internal_compressed_specialized); the
-        // P3.2 literal chain emits only lone literals and CARRIES any other
+        // literal chain emits only lone literals and CARRIES any other
         // packet un-consumed to the next iteration. The
         // outer guard keeps `*pos ≤ out_room - 1 = cap - (MAX_RUN_LENGTH+8) - 1`
         // at any back-ref, and `emit_backref_contig`'s word path touches up to
@@ -2988,9 +2973,8 @@ impl Block {
         }
 
         // ── ENGINE A (flat libdeflate-style) BULK FASTLOOP wire-in ───────────
-        // STEP-0.5 verdict: the flat decoder (`decode_huffman_libdeflate_style`)
-        // beats the two-level engine-B loop below 2.07–3.84× instr/B on gzippy's
-        // own primitives. Run engine A's BOUNDED fastloop here to consume the
+        // Run the flat decoder's (`decode_huffman_libdeflate_style`)
+        // BOUNDED fastloop here to consume the
         // BULK of the block straight into the contiguous tail; it exits at a
         // clean SYMBOL boundary ≥ FASTLOOP_MARGIN (320) bytes before the budget,
         // hands a CANONICAL re-read `Bits` (the N32-safe reclass_reread seam —
@@ -3003,8 +2987,8 @@ impl Block {
         // Gated OFF whenever a measurement knob / oracle / backref-tracking is
         // active (those instruments must keep measuring the engine-B path, and
         // engine A implements none of them). Compiled out on x86 WITH the BMI2
-        // asm kernel (design §3: x86 asm path untouched); present on aarch64 and
-        // on the x86 asm-OFF cross-ISA-LAW arm.
+        // asm kernel (x86 asm path untouched); present on aarch64 and
+        // on the x86 asm-OFF arm.
         #[cfg(all(
             pure_inflate_decode,
             not(all(feature = "asm-kernel", target_arch = "x86_64"))
@@ -3169,9 +3153,9 @@ impl Block {
         // block tail / resumable boundary).
         const FAST_OUT_SLOP: usize = 8;
         const FAST_IN_SLOP: usize = 8;
-        // P3.2: max EXTRA single-literal packets consumed inline after the lit1
+        // Max EXTRA single-literal packets consumed inline after the lit1
         // arm's first literal (3 literals/iteration total — the wrapper's
-        // measured 2-extra shape, resumable.rs:1305-1313 / vendor
+        // 2-extra shape, resumable.rs:1305-1313 / vendor
         // decompress_template.h:381 "3 extras decreases performance").
         const LIT_CHAIN_MAX: usize = 2;
         // Headroom-proof dependency: the chain writes ≤ 1+LIT_CHAIN_MAX bytes
@@ -3180,12 +3164,12 @@ impl Block {
         const _: () = assert!(LIT_CHAIN_MAX < FAST_OUT_SLOP);
         {
             let in_end = bits.data.len();
-            // P3.1 (T1 recovery, Lever-B1 class): mirror the bit-reader into a
+            // Mirror the bit-reader into a
             // STACK-LOCAL `Bits` for the duration of the fast loop and write it
             // back at every exit. Through `&mut Bits` the
             // bitbuf/bitsleft/pos round-trip memory each symbol (the raw
             // `base: *mut u8` output stores defeat LLVM's aliasing analysis in
-            // practice — same finding as resumable.rs Lever B1, which lifted
+            // practice — same as resumable.rs, which lifted
             // the wrapper loop's reader into locals for exactly this reason);
             // a non-escaping local promotes them to registers. Decode order and
             // bit consumption are IDENTICAL — byte-exact by construction.
@@ -3203,10 +3187,10 @@ impl Block {
             // Field-disjoint from every `self` mutation inside the loop
             // (`at_end_of_block`, `backreferences`, `decoded_bytes`), so the
             // borrow is legal across them. FixedHuffman blocks borrow the
-            // process-wide static table (P3.4 item 1) — same 5-bit lens every
+            // process-wide static table — same 5-bit lens every
             // time, so the table is identical to the per-block build it
             // replaces.
-            // ELEMENT A: set the per-call header on the boxed AsmState BEFORE
+            // Set the per-call header on the boxed AsmState BEFORE
             // taking the shared table borrows below — the asm reads
             // in_ptr/in_lim/out_lim/out_base via `[ctx+0/8/16/24]`. This is the
             // only &mut self.asm in the region; the loop then only reads it
@@ -3238,9 +3222,9 @@ impl Block {
             let dist_tbl: Option<
                 &crate::decompress::inflate::libdeflate_entry::DistTable,
             > = None;
-            // ── ASM-campaign rung (c) dispatch (asm_kernel.rs; charter §4) ──
+            // ── ASM dispatch (asm_kernel.rs) ──
             // One OnceLock env/CPU read + the pure knob-exclusion predicate
-            // (charter §3.5 — any measurement knob forces the pure-Rust
+            // (any measurement knob forces the pure-Rust
             // loop). OFF ⇒ the loop below is the sole path; it is ALWAYS
             // compiled regardless.
             #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
@@ -3274,39 +3258,28 @@ impl Block {
                 }};
             }
             lb.refill();
-            // P3.5 c4: immediately after a refill — backstop-free decode
+            // Immediately after a refill — backstop-free decode
             // (byte-exact proof on `decode_prefilled`).
             let mut pre = self.asm.lut_litlen.decode_prefilled(&lb);
-            // ── TWO LOOP VARIANTS (flip-precondition 4, campaign §9 gate) ──
+            // ── TWO LOOP VARIANTS ──
             // The fast loop is instantiated twice from one macro source:
             // the `false` instantiation const-folds the asm dispatch away
             // (`if false && asm_on` is statically dead), so a binary built
             // WITH the asm-kernel feature but dispatch-disabled (kill-switch
             // / no BMI2 / knobs) runs a loop with ZERO asm-related code in
-            // its body — the c3 OFF-vs-base ~+44 ms layout tax was the
-            // per-iteration dispatch test + asm_ctx liveness in the shared
-            // loop. The variant is selected ONCE per region run, before the
+            // its body — removing the per-iteration dispatch test + asm_ctx
+            // liveness from the shared loop. The variant is selected ONCE per
+            // region run, before the
             // loop; the `true` variant keeps the runtime `asm_on` test so
             // an EXIT_BOUNDARY can still hand the tail to the Rust arms
             // (identical to the pre-split behavior).
             //
-            // MEASURED VERDICT (frozen guest, §10): the split cuts the
-            // disabled-arm tax 44 → 12 ms (1.0%) on T1 silesia and to a
-            // TIE on model T8 (643 vs 645 ms). The residual is NOT in the
-            // loop: the false variant's body contains zero asm code
-            // (objdump: exactly ONE run_contig call site in this whole
-            // function — the true variant's), and the per-call costs
-            // (enabled() + dispatch_allowed + KernCtx init) are bounded
-            // ≤ ~2 ms by the 24,128 region calls. What remains is
-            // cross-binary code layout of the doubled function body —
-            // the campaign's documented layout-phantom class, irreducible
-            // here without outlining/PGO. Production-irrelevant post-flip:
-            // the disabled arm exists only on pre-BMI2 x86 (pre-2013
+            // The disabled arm exists only on pre-BMI2 x86 (pre-2013
             // Haswell class), where `enabled()` is false at runtime.
             macro_rules! fast_loop_run {
                 ($use_asm:literal) => {
             'fast: loop {
-                // ── ASM-campaign rung (c): the asm region owns the
+                // ── The asm region owns the
                 // per-symbol hot path; Rust handles boundary/rare packets
                 // (asm_kernel.rs EXIT-STATE CONTRACT). Re-entry via
                 // `continue 'fast`. `prof_on` true ⇒ `asm_on` false, so the
@@ -3358,7 +3331,7 @@ impl Block {
                 // Fast-path the DOMINANT single-symbol packet (sym_count==1): a
                 // lone literal writes ONE byte (no 8-byte store / no inner
                 // bookkeeping — the wide store would only WASTE bandwidth on a
-                // 1-byte packet, advisor item Q3); a lone non-literal goes
+                // 1-byte packet); a lone non-literal goes
                 // straight to the trailing handler. Only `sym_count > 1` (a real
                 // multi-literal pack) takes the speculative 8-byte packed store
                 // the technique exists to exploit (igzip asm:518): write up to 3
@@ -3369,7 +3342,7 @@ impl Block {
                 // `base` valid for `[0, cap)`.
                 let mut trailing_code: u16 = 0;
                 let mut have_trailing = false;
-                // P3.5 c2: fused litlen→dist lookahead (lone-length arm).
+                // Fused litlen→dist lookahead (lone-length arm).
                 // Carries the dist short-LUT entry loaded EARLY — at the
                 // point the litlen packet is known to be a lone non-literal,
                 // before the EOB/MAX/length branch tree resolves — so the
@@ -3389,7 +3362,7 @@ impl Block {
                         }
                         *pos += 1;
                         emitted += 1;
-                        // ── P3.2 RUNTIME LITERAL CHAIN ───────────────────────
+                        // ── RUNTIME LITERAL CHAIN ───────────────────────
                         // Wrapper analog (resumable.rs:1314-1356; vendor
                         // libdeflate decompress_template.h:354-381): after a
                         // lone literal, speculatively decode the next packet;
@@ -3397,7 +3370,8 @@ impl Block {
                         // inline (≤ LIT_CHAIN_MAX extras); the final un-consumed
                         // packet becomes next iteration's `pre` (the carry that
                         // makes the speculative decode never wasted). This is
-                        // the mechanism behind the wrapper's ~1.96 lits/iter:
+                        // the mechanism behind the wrapper's multi-literal
+                        // per-iteration throughput:
                         // the ISA-L LUT's build-time packing needs the COMBINED
                         // codeword lengths to fit in the 12-bit short lookup
                         // (igzip_inflate.c:386-599), which 2×(7..9)-bit silesia
@@ -3458,7 +3432,7 @@ impl Block {
                     } else {
                         trailing_code = code;
                         have_trailing = true;
-                        // P3.5 c2: issue the dist load now (see decl above).
+                        // Issue the dist load now (see decl above).
                         if let Some(dt) = dist_tbl {
                             spec_dist = Some(dt.lookup(lb.bitbuf));
                         }
@@ -3513,7 +3487,7 @@ impl Block {
                             // <= 15-bit code + <= 5 packed length-extra), so
                             // >= 28 remain >= 9 main + 6 subtable + 13 extra.
                             use crate::decompress::inflate::libdeflate_entry::DistTable;
-                            // P3.5 c2: use the early-issued entry when the
+                            // Use the early-issued entry when the
                             // lone-length arm already loaded it (identical
                             // index — no consumes between the sites).
                             let mut dist_entry = match spec_dist {
@@ -3572,7 +3546,7 @@ impl Block {
                         if distance > *pos {
                             commit_fast!(Err(BlockError::ExceededWindowRange));
                         }
-                        // ── P3.5 c1: NEXT-SYMBOL PRELOAD BEFORE THE COPY ─────
+                        // ── NEXT-SYMBOL PRELOAD BEFORE THE COPY ─────
                         // libdeflate decompress_template.h:555-572 — "Before
                         // starting to issue the instructions to copy the match,
                         // refill the bitbuffer and preload the litlen decode
@@ -3591,7 +3565,7 @@ impl Block {
                         if (lb.bitsleft as u8) < 48 {
                             lb.refill();
                         }
-                        // P3.5 c4: threshold-refill site — backstop-free
+                        // Threshold-refill site — backstop-free
                         // decode (byte-exact proof on `decode_prefilled`).
                         pre = self.asm.lut_litlen.decode_prefilled(&lb);
                         // SAFETY: `distance <= *pos`; `*pos + ((length+7)&!7) <= cap`
@@ -3617,7 +3591,7 @@ impl Block {
                             }
                         }
                         emitted += length;
-                        // P3.5 c1: `pre` already preloaded above (before the
+                        // `pre` already preloaded above (before the
                         // copy) — skip the bottom-of-loop preload.
                         continue 'fast;
                     }
@@ -3633,7 +3607,7 @@ impl Block {
                 if (lb.bitsleft as u8) < 48 {
                     lb.refill();
                 }
-                // P3.5 c4: threshold-refill site — backstop-free decode
+                // Threshold-refill site — backstop-free decode
                 // (byte-exact proof on `decode_prefilled`).
                 pre = self.asm.lut_litlen.decode_prefilled(&lb);
             }
@@ -3805,12 +3779,12 @@ impl Block {
         debug_assert!(self.compression_type == CompressionType::Uncompressed);
         let spare = cap.saturating_sub(*pos);
         let to_read = self.uncompressed_size.min(n_max_to_decode).min(spare);
-        // M2b (DIV-5 case 3, contig sibling): bulk byte read straight into the
+        // Case 3 (contig sibling): bulk byte read straight into the
         // contiguous destination — byte-identical to the per-byte loop below
         // (same `to_read` bytes, same cursor advance), just one memcpy instead
         // of per-byte bit-buffer pulls. Vendor's clean stored read is the same
         // bulk `bitReader.read` (deflate.hpp:1243-1255); the destination here
-        // is gzippy's kept DIV-2 contig deviation. Same kill-switch + full-
+        // is gzippy's kept contig deviation. Same kill-switch + full-
         // availability gate as the ring path (short payloads keep the
         // per-byte commit-then-`Err` truncation semantics).
         if !stored_flip_disabled() {
@@ -3940,7 +3914,7 @@ const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
 #[cfg(parallel_sm)]
 const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_SYMBOL_COUNT];
 
-// ELEMENT A: the process-wide `fixed_dist_table()` static is REMOVED — the
+// The process-wide `fixed_dist_table()` static is REMOVED — the
 // dist table (fixed and dynamic) is now built INLINE into `self.asm.dist`
 // (the asm addresses only the single `ctx` base). `FIXED_DIST_LENGTHS` is
 // still the source of the fixed lens fed to `DistTable::rebuild` in
@@ -3986,13 +3960,11 @@ const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_S
 /// `CONTAINS_MARKERS`) `*distance_marker` reflects the post-copy
 /// distance to the nearest marker in the ring.
 ///
-/// STAGE-c (perf/window-absent-inflate): forced `inline(always)` — the plain
+/// Forced `inline(always)` — the plain
 /// `#[inline]` hint was being DECLINED by LLVM (the function stayed a standalone
-/// symbol carrying ~18% of gz's retired instructions, with a per-backref
-/// call prologue/epilogue rg does not pay because rg fuses the same copy into
-/// `Block<false>::read`). The wall gap vs rg is an instruction-count gap (gz
-/// 1.32× rg instructions at HIGHER IPC), so eliminating the per-backref call/
-/// spill/return is an instruction-removal lever. Byte-exact: codegen-only.
+/// symbol carrying a per-backref call prologue/epilogue rg does not pay because
+/// rg fuses the same copy into `Block<false>::read`). Inlining removes the
+/// per-backref call/spill/return. Byte-exact: codegen-only.
 #[inline(always)]
 pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     ring_ptr: *mut u16,
@@ -4012,13 +3984,10 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // Non-overlap path. Vendor: `std::memcpy(&window[m_windowPosition],
         // &window[offset], length * 2)` at deflate.hpp:1376.
         //
-        // MEASURED DISTRIBUTION (silesia, flate2 L6, window-absent path):
-        // 99.94% of back-refs are non-overlap and ~98.6% have length < 16
-        // (77% are length 4-7, mean ≈ 6.3 u16). The prior 8-u16 (16-byte)
-        // chunk loop NEVER fired for those — its `i + 8 <= length` guard is
-        // false for length < 8 — so every common match fell to the per-element
-        // scalar tail: 4-7 dependent single-u16 stores on the critical path.
-        // That tail, not wide copies, is the window-absent path's output cost.
+        // Short non-overlap matches are the common case. The prior 8-u16
+        // (16-byte) chunk loop NEVER fired for those — its `i + 8 <= length`
+        // guard is false for length < 8 — so every short match fell to the
+        // per-element scalar tail: 4-7 dependent single-u16 stores.
         //
         // Mirror `copy_match_fast`'s `dist >= 8` (bytes) arm
         // (consume_first_decode.rs:479-503) for u16: copy in 8-byte (4-u16)
@@ -4038,8 +4007,7 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // `distance < 4` non-overlap (only length-3/distance-3) is rare and
         // would alias the word stride, so it keeps the exact element copy.
         //
-        // P0 STORED-MARKER-CRC FIX (2026-06-12, mono-gnu9 single-byte
-        // corruption at output 35,335,338): the old "subsequent writes
+        // STORED-MARKER-CRC FIX: the old "subsequent writes
         // overwrite the overshoot" invariant is FALSE for the FINAL back-ref
         // of a maximally-full `read()` call. The per-call cap is `RING_SIZE -
         // MAX_RUN_LENGTH` but the final event may overshoot it by up to
@@ -4052,18 +4020,16 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // word-copy DEVIATION but only when the rounded run also fits within
         // the undrained window: `(*pos - drained) + rounded <= RING_SIZE`.
         // Otherwise fall to the exact-length arms below (byte-identical).
-        // 16-byte (8-u16) WIDE path (2026-06-16): the measured back-ref length
-        // distribution is mean ≈ 6.3 u16, 98.6% < 16, 77% length 4-7 — so a
+        // 16-byte (8-u16) WIDE path: a
         // SINGLE 16-byte unaligned store (`movups` on x86_64 SSE2, one `str q`
         // on aarch64) finalises length ≤ 8 in ONE store where the 8-byte arm
-        // below needs two. This ~halves backref store instructions on the
-        // window-absent path. REQUIRES `distance >= 8` u16 so the 16-byte
+        // below needs two. REQUIRES `distance >= 8` u16 so the 16-byte
         // stride never aliases (src and dst are ≥ 16 bytes apart): each chunk
         // read sees only ALREADY-FINALISED bytes — the exact `dist >= WORDBYTES`
         // invariant `copy_match_fast` relies on, now at u128 width. The
         // overshoot (≤ 7 u16) is bounded by the SAME three guards as the 8-byte
         // arm, just rounded to a multiple of 8 u16: it stays inside the
-        // physical buffer AND inside the undrained window (the mono-gnu9 P0
+        // physical buffer AND inside the undrained window (the undrained-window
         // contract — see below), else we fall to the 8-byte / exact arms which
         // are byte-identical to vendor's `memcpy(length*2)`.
         let rounded16 = (length + 7) & !7;
@@ -4140,10 +4106,9 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // `!CONTAINS_MARKERS`): it writes the identical `v` `length` times
         // either way — byte-for-byte the same ring contents — and the shared
         // backward marker-scan below still recomputes `distance_marker` from
-        // those bytes, so the counter is unchanged. This was the largest
-        // single avoidable slowdown on the window-absent path (RLE runs are
-        // common; the slow element loop was paid only because the chunk hadn't
-        // armed a clean window yet). [2026-05-31, fulcrum head-to-head lever]
+        // those bytes, so the counter is unchanged. RLE runs are
+        // common; the slow element loop was previously paid only because the
+        // chunk hadn't armed a clean window yet.
         let v = *ring_ptr.add((*pos + RING_SIZE - 1) % RING_SIZE);
         if dst_phys + length <= RING_SIZE {
             let dst = std::slice::from_raw_parts_mut(ring_ptr.add(dst_phys), length);
@@ -4181,7 +4146,6 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         // (CONTAINS_MARKERS=false) path — and it holds for the common case once
         // a chunk has decoded a window's worth of clean output. Byte-identical
         // to the scan (which would also find no marker and do `+= length`).
-        // [2026-05-31, fulcrum-vs lever: window-absent decode is ~1.7x rg]
         if *distance_marker >= distance {
             *distance_marker += length;
             return;
@@ -4285,7 +4249,7 @@ pub(crate) unsafe fn emit_backref_contig(
     distance: usize,
     length: usize,
 ) {
-    // P3.4 item 2 (backref-arm polish): libdeflate fastloop copy shape, ported
+    // Libdeflate fastloop copy shape, ported
     // from `copy_match_fast` (consume_first_decode.rs:479-553, itself the
     // libdeflate decompress_template.h match copy). Three arms by DISTANCE
     // only — the old `distance >= length` non-overlap pre-branch is gone:
@@ -4316,7 +4280,7 @@ pub(crate) unsafe fn emit_backref_contig(
     let mut dst = base.add(*pos);
     let mut src = base.add(*pos - distance);
     let end = dst.add(length);
-    // P3.4 item 3 (variant B): long matches walk well past the head of the
+    // Long matches walk well past the head of the
     // source — prefetch one line ahead before the copy loop reaches it
     // (libdeflate analog, copy_match_fast:430-433).
     #[cfg(target_arch = "x86_64")]
@@ -4416,7 +4380,7 @@ pub(crate) unsafe fn emit_backref_ring_u8(
         // Non-overlap. Vendor: `memcpy(&window[wp], &window[off], length)`
         // (deflate.hpp:1376, sizeof==1). Word = 8 u8; round run up to 8.
         //
-        // P0 STORED-MARKER-CRC FIX (2026-06-12): same undrained-span guard as
+        // STORED-MARKER-CRC FIX: same undrained-span guard as
         // `emit_backref_ring` (see the vendor-cited comment there). The u8
         // twin has the identical latent clobber: a maximally-full `read()`
         // call (cap `U8_RING_SIZE - MAX_RUN_LENGTH`, final event overshoots
@@ -4828,7 +4792,7 @@ mod tests {
     //     into the tail, back-refs resolving from that contiguous buffer (the
     //     vendor `setInitialWindow` model the wired Stage-2 path will use).
     // This retires the addressing-retarget + contiguous-back-ref correctness
-    // risk independently of wiring (the advisor-required differential).
+    // risk independently of wiring.
     #[cfg(any(
         all(
             feature = "isal-compression",
@@ -4905,7 +4869,7 @@ mod tests {
     /// until BFINAL, routes stored blocks through
     /// `decode_clean_stored_into_contig` — the `contig_multi` driver shape)
     /// + the FINAL bit-cursor state `(pos, bitbuf, bitsleft)`. The asm-ON/OFF
-    /// fuzz net (flip-precondition 3) asserts state equality, not just byte
+    /// fuzz net asserts state equality, not just byte
     /// equality. Single-block streams behave exactly as the old single-header
     /// driver (the loop exits after the first block's EOB).
     #[cfg(any(
@@ -5062,10 +5026,10 @@ mod tests {
         assert_eq!(contig, ring, "rle/short-distance contig decode diverged");
     }
 
-    /// Flip-precondition 3 (campaign §9 gate): the PERMANENT asm-ON-vs-OFF
+    /// The PERMANENT asm-ON-vs-OFF
     /// fuzz differential over random VALID GZIP MEMBERS — the stream-level
-    /// net binding the asm kernel and the pure-Rust loop forever (charter
-    /// §4: "bound by the differential suite FOREVER").
+    /// net binding the asm kernel and the pure-Rust loop forever
+    /// (bound by the differential suite FOREVER).
     ///
     /// Seeded + bounded: 96 members, payloads 1 KiB–128 KiB of mixed
     /// segments (uniform random → stored-prone; skewed random → dynamic
@@ -5080,8 +5044,7 @@ mod tests {
     /// equality to the payload, and final bit-cursor equality
     /// (pos/bitbuf/bitsleft — the X1 contract at stream end). ON-arm
     /// engagement is effect-verified via `TEST_RUN_CONTIG_CALLS`, never
-    /// assumed. Skips gracefully without BMI2 (local Rosetta); the guest
-    /// run is authoritative.
+    /// assumed. Skips gracefully without BMI2.
     #[cfg(all(pure_inflate_decode, feature = "asm-kernel", target_arch = "x86_64"))]
     #[test]
     fn asm_kernel_on_off_fuzz_random_gzip_members() {
@@ -5248,7 +5211,7 @@ mod tests {
         );
     }
 
-    /// P3.2 stream-level differential for the runtime literal chain: an
+    /// Stream-level differential for the runtime literal chain: an
     /// incompressible (LCG) payload makes flate2 emit ~all-literal dynamic
     /// blocks with 8-9-bit literal codes — the regime where the ISA-L LUT's
     /// build-time multi-symbol packing ~never fires (pairs need ≤12 combined
@@ -5391,10 +5354,9 @@ mod tests {
 
     #[test]
     fn set_initial_window_empty_arms_clean() {
-        // Vendor deflate.hpp:1750-1759 (M3 adoption): an EMPTY initial window
+        // Vendor deflate.hpp:1750-1759: an EMPTY initial window
         // still flips to CLEAN mode (`m_containsMarkerBytes = false` at :1757
-        // is outside the `!initialWindow.empty()` arm). The pre-M3 no-op
-        // (stay in marker mode) was the recorded divergence.
+        // is outside the `!initialWindow.empty()` arm).
         let mut b = Block::new();
         let mut output: Vec<u16> = Vec::new();
         assert!(b.contains_marker_bytes(), "fresh Block starts marker-mode");
@@ -5636,7 +5598,7 @@ mod tests {
         );
     }
 
-    // ── Ring-buffer correctness tests (advisor-flagged scenarios) ────────────
+    // ── Ring-buffer correctness tests ────────────
     //
     // These tests pin down the ring buffer + marker pre-init contract
     // explicitly, so any future regression is caught by `cargo test`
@@ -5728,7 +5690,7 @@ mod tests {
     #[test]
     fn post_switch_max_distance_backref_reads_clean_lower_half_not_marker_zone() {
         let mut block = Block::new();
-        // Simulate the state described in the advisor's concern:
+        // Simulate the state of concern:
         // 32 KiB of distinct literal bytes have been decoded into
         // the lower half of the ring, and the mid-decode switch
         // condition is satisfied.
@@ -5743,7 +5705,7 @@ mod tests {
 
         // Now invoke emit_backref_ring directly with distance =
         // MAX_WINDOW_SIZE, length = 100. This mirrors the back-ref
-        // the advisor said would corrupt output.
+        // that could corrupt output.
         let ring_ptr = block.ring.window16.as_mut_ptr();
         let mut pos = block.ring.pos;
         let mut distance_marker = block.ring.distance_to_last_marker;
@@ -5786,8 +5748,7 @@ mod tests {
         );
     }
 
-    /// P0 REGRESSION (2026-06-12, /tmp/mono-gnu9.tar.gz single-byte CRC
-    /// corruption at output 35,335,338): direct contract test for the
+    /// Regression contract test for the
     /// undrained-span guard in `emit_backref_ring`'s word-copy arm.
     ///
     /// Production worst case: a `read()` call's per-call cap is `RING_SIZE -
@@ -5799,7 +5760,7 @@ mod tests {
     /// `data_with_markers` — one clobbered output u16. Vendor rapidgzip
     /// never overshoots (`std::memcpy(..., length * 2)`, deflate.hpp:1376).
     ///
-    /// Geometry mirror of the mono-gnu9 failure: span before the final
+    /// Geometry mirror of the failure: span before the final
     /// back-ref = 65277 (= cap - 1), final back-ref length 258, distance
     /// 1000 ⇒ rounded = 260, span + rounded = 65537 > RING_SIZE ⇒ the
     /// overshoot's last slot aliases the first undrained element.
@@ -5833,7 +5794,7 @@ mod tests {
                 "byte {k} of the back-ref copy is wrong"
             );
         }
-        // THE P0 ASSERTION: the rounding overshoot must NOT touch the oldest
+        // THE ASSERTION: the rounding overshoot must NOT touch the oldest
         // undrained slot (pre-fix it wrote the u16 at src+259 here — the 'L').
         assert_eq!(
             block.ring.window16[oldest_slot], sentinel,
@@ -5880,8 +5841,8 @@ mod tests {
         }
     }
 
-    /// DIFFERENTIAL PROPTEST for the wide (16-byte / u128) back-ref copy
-    /// (2026-06-16). Drives `emit_backref_ring` directly across a broad random
+    /// DIFFERENTIAL PROPTEST for the wide (16-byte / u128) back-ref copy.
+    /// Drives `emit_backref_ring` directly across a broad random
     /// space of (ring contents, pos, drained, distance, length, prior
     /// distance_marker) and asserts byte-for-byte equality of the `length`
     /// copied slots AND the recomputed marker counter against a NAIVE scalar
@@ -6006,7 +5967,7 @@ mod tests {
     }
 
     /// Deterministic OFF-BY-ONE battery for the branchless u64 backward
-    /// marker scan (2026-06-16). Drives `emit_backref_ring::<true>` through the
+    /// marker scan. Drives `emit_backref_ring::<true>` through the
     /// non-wrap branch with EXACT marker placements — no markers, all markers,
     /// single marker at the first / last / each interior copied index — across
     /// every length boundary (1..=3 below the u64 stride, 4 exact stride, 5..=8,
@@ -6110,7 +6071,7 @@ mod tests {
         );
     }
 
-    // ── Rung (d) increment 1 differential (git history (campaign plan, removed) §5) ──
+    // ── DistTable marker distance-decode differential ──
     //
     // The marker fast loop's DistTable distance decode (ON arm) vs the exact
     // pre-change dist_hc chain (OFF arm, via MARKER_DIST_LUT_OVERRIDE) on the
@@ -6327,7 +6288,7 @@ mod tests {
         }
     }
 
-    // ── ENGINE-W INC-1 / N2: local-Bits mirror kill-switch differential ──
+    // ── Local-Bits mirror kill-switch differential ──
     //
     // Verifies that the lb arm and the struct-field arm produce bit-identical
     // u16 output + final cursor state across the same marker-mode streams, and
@@ -6508,7 +6469,7 @@ mod tests {
         }
     }
 
-    // ── M2b (DIV-5): vendor stored-block special cases ───────────────────
+    // ── Vendor stored-block special cases ───────────────────
     //
     // Each test runs BOTH kill-switch arms (via STORED_FLIP_OVERRIDE, since
     // the env read is OnceLock-cached) and asserts byte-identical resolved
@@ -6684,7 +6645,7 @@ mod tests {
         }
 
         /// Case 1 after MARKERS — the arming-divergence shape: vendor flips
-        /// at the >=32 KiB stored block; the pre-M2b path stays in marker
+        /// at the >=32 KiB stored block; the pre-change path stays in marker
         /// mode (needs 64 Ki consecutive clean after a marker). Resolved
         /// bytes must be identical; the width at end differs.
         #[test]
@@ -7130,7 +7091,7 @@ mod tests {
         }
 
         /// Truncated stored payload: the availability gate must keep the
-        /// pre-M2b per-byte commit-then-Err semantics in BOTH arms (same
+        /// pre-change per-byte commit-then-Err semantics in BOTH arms (same
         /// partial output, same residual state, same error).
         #[test]
         fn truncated_stored_keeps_per_byte_error_path() {
@@ -7347,7 +7308,7 @@ mod tests {
         );
     }
 
-    /// P3.4 item 1 differential (permanent): `DistTable::rebuild` (allocation
+    /// Differential (permanent): `DistTable::rebuild` (allocation
     /// reuse) must produce a table BEHAVIORALLY IDENTICAL to a fresh
     /// `DistTable::build` for every code-length set, in any rebuild ORDER
     /// (shallow→deep grows the entries Vec, deep→shallow exercises the
@@ -7427,7 +7388,7 @@ mod tests {
         }
     }
 
-    /// P3.4 item 1 stream-level differential (permanent): a MULTI-BLOCK raw
+    /// Stream-level differential (permanent): a MULTI-BLOCK raw
     /// DEFLATE stream decoded through ONE `Block` instance on the contig clean
     /// path must match the flate2 oracle byte-for-byte. Full-flush chunk
     /// boundaries force separate dynamic blocks; the repeated chunk content
@@ -7540,7 +7501,7 @@ mod tests {
         );
     }
 
-    /// P3.4 item 2 differential (permanent): `emit_backref_contig` (the
+    /// Differential (permanent): `emit_backref_contig` (the
     /// libdeflate-shape copy: 5-word burst for dist>=8, broadcast RLE for
     /// dist==1, stride-dist word trick for dist 2..7) must write EXACTLY the
     /// sequential-copy reference bytes in `[*pos, *pos+length)` and touch
@@ -7608,7 +7569,7 @@ mod tests {
         }
     }
 
-    /// P3.2 differential (permanent, modeled on
+    /// Differential (permanent, modeled on
     /// `dist_table_matches_dist_hc_differential`): the contig fast loop's
     /// RUNTIME LITERAL CHAIN emission (lit1 arm: consume up to LIT_CHAIN_MAX
     /// extra lone literals inline, carry the final un-consumed packet,

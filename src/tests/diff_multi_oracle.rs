@@ -1,10 +1,9 @@
 //! Broad multi-oracle differential net for the pure-Rust inflate path.
 //!
-//! WHY (campaign): the upcoming copy-free-to-final clean-tail refactor and the
-//! inner-Huffman rate work (BMI2 PEXT/BZHI, wider multi-literal, packed-u32 LUT)
-//! are the riskiest correctness-sensitive rewrites in the campaign. This file
-//! is the STANDING wide-coverage backstop so a subtle byte divergence in any of
-//! those lands RED here, not on a user's archive.
+//! This file is the STANDING wide-coverage backstop so a subtle byte divergence
+//! in a correctness-sensitive inflate change (clean-tail handling, inner-Huffman
+//! decode via BMI2 PEXT/BZHI, wider multi-literal, packed-u32 LUT, marker
+//! resolution) lands RED here, not on a user's archive.
 //!
 //! It differs from the existing nets as follows:
 //!   - `three_oracle_diff.rs` validates the SINGLE-THREADED inflate primitive
@@ -396,15 +395,13 @@ mod tests {
         assert_parallel_sm_matches_all_oracles(&gz, "mixed_l9");
     }
 
-    /// REAL-CORPUS differential for the MARKER-KERNEL Lever 1 inline change
-    /// (huffman_short_bits_cached::decode `#[inline(always)]`). Decodes the real
-    /// silesia gzip corpus through the production parallel-SM marker pipeline at
-    /// SEVERAL `GZIPPY_CHUNK_KIB` granularities (smaller chunks → more chunks →
-    /// more window-absent marker chunks + more careful-tail entries, where the
-    /// inlined dist `decode` lives), comparing every chunk size against TWO
-    /// independent oracles (flate2/zlib-ng + libdeflate). Synthetic fixtures
-    /// don't reproduce real gzip-9 bit patterns at the marker/careful boundaries
-    /// (feedback_real_corpus_test_with_lever), so this ships with the lever.
+    /// REAL-CORPUS differential: decodes the real silesia gzip corpus through the
+    /// production parallel-SM marker pipeline at SEVERAL chunk granularities
+    /// (smaller chunks → more chunks → more window-absent marker chunks + more
+    /// careful-tail entries, where the inlined dist `decode` lives), comparing
+    /// every chunk size against TWO independent oracles (flate2/zlib-ng +
+    /// libdeflate). Synthetic fixtures don't reproduce real gzip-9 bit patterns
+    /// at the marker/careful boundaries, so the real corpus is exercised here.
     /// Skips gracefully when `benchmark_data/silesia-gzip.tar.gz` is absent
     /// (CI/laptop); the bench boxes carry the corpus.
     #[test]

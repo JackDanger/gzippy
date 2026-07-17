@@ -17,16 +17,15 @@
 //!                   : std::make_optional(CompressionType::NONE);             // → Some(NONE)
 //!   ```
 //! With sparsity off the 32 KiB `getUsedWindowSymbols` scan is skipped on every
-//! chunk finalize — per mechanism measurement: ~8.5 ms × 51 chunks ~= 430 ms
-//! thread-summed at T8, ~⅔ of the decodeBlock CPU gap vs rapidgzip.
+//! chunk finalize.
 //!
 //! The `GZIPPY_WINDOW_SPARSITY=1` kill-switch (which restored the old
-//! always-on behavior) was removed 2026-07-07 (batch 4f) — sparsity is always
+//! always-on behavior) was removed 2026-07-07 — sparsity is always
 //! OFF (the faithful keepIndex=false default).
 
 /// Whether the pre-port always-on window-sparsity behavior is active.
 /// Hardcoded OFF (shipped default; the `GZIPPY_WINDOW_SPARSITY=1` kill-switch
-/// that used to restore it was removed as dead — batch 4f, byte-transparent).
+/// that used to restore it was removed as dead — byte-transparent).
 fn window_sparsity_kill_switch() -> bool {
     false
 }
@@ -113,7 +112,7 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     let expected_crc = footer.crc32;
     let expected_size = footer.uncompressed_size as usize;
 
-    // Ratio-informed upfront reserve (DIS-14/DIS-17 / box-proven +41% model-T8).
+    // Ratio-informed upfront reserve.
     // ratio_ceiling = ceil((ISIZE / compressed_len) × 1.25), minimum 2.
     // = ceil(ISIZE × 5 / (compressed_len × 4)), minimum 2.
     // ISIZE is mod 2^32 so files >4 GiB raw may wrap → under-ratio → safe
@@ -155,40 +154,28 @@ fn read_parallel_sm_inner<W: std::io::Write>(
         multi_member: false,
     };
 
-    // THIN-T1 PRODUCTION PATH (route-A scaffold shed). At T==1 the decode is
+    // THIN-T1 PRODUCTION PATH. At T==1 the decode is
     // strictly sequential front-to-back, so EVERY block already has its 32 KiB
     // predecessor window — the parallel block-finder / WindowMap / marker arming
     // / prefetch / threadpool scaffold is pure overhead. The thin serial rolling-
-    // window driver over the SAME shared `decode_chunk` kernel sheds it (route-A
-    // oracle: thin/libdeflate≈1.08 vs prod/libdeflate≈1.22 on this box). CRC32 +
+    // window driver over the SAME shared `decode_chunk` kernel sheds it. CRC32 +
     // ISIZE are verified below exactly as for the parallel path, and bytes_written
     // is captured so the multi-member-misroute resume net still works.
     // T1 serial-eligible: strictly T==1.
     let t1_serial = parallelization <= 1;
-    // T1-MONOLITH (igzip-shaped single-buffer path) and T1-MONOLITH-STREAMING
-    // were deliberate, T1-gated divergences from the rapidgzip chunk pipeline
-    // toward an igzip-shaped monolith, both opt-in only (`GZIPPY_MONOLITH=1` /
-    // `GZIPPY_STREAM_MONOLITH=1`). Both were gate-measured and never won: the
-    // full-ISIZE monolith FALSIFIED (regresses past thin-T1 — the single ISIZE
-    // buffer first-touches the whole output, ~4x igzip's page faults, the cost
-    // igzip's streaming small reused buffer avoids); the streaming variant fixed
-    // the fault-storm and shed per-chunk scaffold INSTRUCTIONS but fulcrum optgate
-    // REFUSED the wall win as INSTRUCTION-ONLY (cyc/byte did not improve beyond
-    // spread). Removed 2026-07-07 (batch 4f) — production T1 stays thin-T1.
+    // Production T1 stays thin-T1.
     let use_thin_t1 = t1_serial;
-    // Tiny-file lever (#189/#199 lever-2b): a tiny thin-T1 decode makes exactly
+    // Tiny-file lever: a tiny thin-T1 decode makes exactly
     // ONE rpmalloc-backed allocation (its huge chunk-output reserve), and that
     // allocation triggers rpmalloc process+thread init — pure overhead for a
-    // single-buffer single-thread decode (MEASURED: instr/byte RESOLVED-improved
-    // on 40-400 KiB files, both arches, when the decode runs on the system
-    // allocator). While this RAII scope is alive on THIS thread, new huge
-    // slab-routed allocations are system-backed, so the tiny decode never
-    // initializes rpmalloc. PER-DECODE and thread-local (no process latch, no
-    // cross-decode state): a big decode after a tiny one behaves exactly as if
-    // it were the process's first. Large thin-T1 decodes (> 8 MiB output:
-    // weights, silesia-T1) keep rpmalloc + the resident slab (its measured win);
-    // T>1 workers never enter the scope, so the parallel path is unchanged by
-    // construction. See `rpmalloc_alloc::SystemHugeScope`.
+    // single-buffer single-thread decode. While this RAII scope is alive on THIS
+    // thread, new huge slab-routed allocations are system-backed, so the tiny
+    // decode never initializes rpmalloc. PER-DECODE and thread-local (no process
+    // latch, no cross-decode state): a big decode after a tiny one behaves exactly
+    // as if it were the process's first. Large thin-T1 decodes (> 8 MiB output:
+    // weights, silesia-T1) keep rpmalloc + the resident slab; T>1 workers never
+    // enter the scope, so the parallel path is unchanged by construction. See
+    // `rpmalloc_alloc::SystemHugeScope`.
     const SYSTEM_ALLOC_MAX_OUTPUT: usize = 8 * 1024 * 1024;
     let _sys_huge_scope = if use_thin_t1 && expected_size <= SYSTEM_ALLOC_MAX_OUTPUT {
         Some(crate::decompress::parallel::rpmalloc_alloc::SystemHugeScope::enter())
@@ -469,9 +456,8 @@ pub fn read_parallel_sm_grid<W: std::io::Write>(
     // Expansion-ratio reserve hint (§5a). The old code recomputed this from a
     // FULL-FILE `scan_member_boundaries_fast` pass — a T-invariant serial scan of
     // the whole compressed file, run again here AFTER `classify_gzip` already
-    // scanned it, so the grid critical path paid the O(file) scan TWICE. On a
-    // large compressible-dominant multi-member stream those two scans were ~50%
-    // of the T16 wall (Amdahl). We drop this scan entirely and pass 0 (unknown) →
+    // scanned it, so the grid critical path paid the O(file) scan TWICE. We drop
+    // this scan entirely and pass 0 (unknown) →
     // the per-chunk reserve uses the historical 8× fallback in
     // `compute_initial_reserve`, which is grow-safe (a wrong hint only affects
     // initial capacity, never correctness — per-member CRC/ISIZE is the oracle)

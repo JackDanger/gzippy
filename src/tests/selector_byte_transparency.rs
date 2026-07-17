@@ -1,11 +1,10 @@
 //! Selector byte-transparency differential + proptest.
 //!
-//! WHY (campaign): `effective_parallel_threads`
+//! WHY: `effective_parallel_threads`
 //! (`src/decompress/parallel/single_member.rs`) is a PURE thread-count selector
 //! with FOUR decision dimensions —
 //!   1. the serial-clean crossover margin (also the sole owner of high-ratio
-//!      routing since the T-blind hard ratio cap env knob
-//!      was deleted, 2026-07-05),
+//!      routing since the T-blind hard ratio cap env knob was deleted),
 //!   2. the small-output serial FLOOR (8 MiB),
 //!   3. the large-output notch bonus,
 //!   4. the small-file chunk-size adjustment (min-work-per-thread,
@@ -28,9 +27,9 @@
 //! (e.g. a serial/parallel seam divergence that only manifests under a
 //! particular thread count) it lands RED here.
 //!
-//! (2026-07: the five parallel-selector env
-//! knobs that used to drive configs (b)/(c) were frozen to their campaign-
-//! measured defaults and the env reads deleted — see
+//! (The five parallel-selector env
+//! knobs that used to drive configs (b)/(c) were frozen to their defaults and
+//! the env reads deleted — see
 //! `single_member::effective_parallel_threads_with`, the now-pure
 //! parameterized core. Configs (b)/(c) are reproduced here by calling
 //! `sm_driver::read_parallel_sm_capturing` directly with an explicit
@@ -424,13 +423,13 @@ mod tests {
         );
 
         // ============================================================
-        // 2. HIGH-RATIO ROUTING (blind cap deleted on x86_64, 2026-07-05).
+        // 2. HIGH-RATIO ROUTING (blind cap deleted on x86_64).
         //    x86_64: routing is the T-aware crossover's decision alone — ratio 10
         //    at T8 (below its crossover 10) routes serial VIA THE SELECTOR
         //    (counter proves it); the same stream at T16 (>= crossover)
         //    parallelizes — impossible under the old blind cap.
         //    aarch64: the prestack cap remains (selector disabled there; cap
-        //    removal regresses M1 2.1-2.6× — see single_member.rs) → serial at
+        //    removal regresses M1 — see single_member.rs) → serial at
         //    both T8 and T16.
         //    margin pinned to 1.0 (vendor-independent) and the floor disabled,
         //    isolating the crossover/prestack-cap decision under test.

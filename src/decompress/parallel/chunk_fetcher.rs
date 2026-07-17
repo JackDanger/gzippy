@@ -258,22 +258,19 @@ const INPUT_RELEASE_MARGIN: usize = 4 * 1024 * 1024;
 /// thread, not one per chunk). The batch cap directly bounds the behind-frontier
 /// resident lag to `MARGIN + STRIDE`. The high-thread default is 8 MiB (≤ 12 MiB
 /// behind-frontier resident); the low/mid-thread value is 1 MiB (≤ 5 MiB) — a
-/// byte-transparent peak-RSS reduction (storedheavy-512M-T4: 71→64 MiB dedicated
-/// maxrss, frozen solvency AMD, load-immune min-of-7). The safety MARGIN is
+/// byte-transparent peak-RSS reduction. The safety MARGIN is
 /// UNCHANGED in both, so no worker/prefetch read cursor gains any new re-fault
 /// exposure; only the release cadence tightens.
 ///
 /// WHY POOL-SIZE-GATED (`reaper_stride_for`): `MADV_DONTNEED` on a shared
 /// file-backed mmap triggers a TLB shootdown IPI to every thread mapping it, so
 /// the tighter (more frequent) cadence costs O(pool_size) per call. At low/mid T
-/// the shootdown is cheap and the ~64 ms consumer slack (Gate-2 drain-delay
-/// injection at storedheavy-T4) absorbs it — measured wall-NEUTRAL at T4/T8. At
-/// T16 the 1 MiB cadence RESOLVED-regressed the wall +1.35% (frozen solvency,
-/// paired N=51, CI excl 0) via the 16-way shootdown storm, with no compensating
-/// RSS gain worth it — so T > 8 keeps the coarse 8 MiB stride. The residual gap
-/// to rapidgzip (~53 MiB) is the AHEAD-of-frontier read-ahead inherent to gz's
+/// the shootdown is cheap and the consumer slack absorbs it. At
+/// T16 the tighter 1 MiB cadence's 16-way shootdown storm outweighs the RSS gain,
+/// so T > 8 keeps the coarse 8 MiB stride. The residual gap
+/// to rapidgzip is the AHEAD-of-frontier read-ahead inherent to gz's
 /// zero-copy whole-file mmap decode (rg streams input into bounded copies and
-/// holds ~5 MiB file-backed) — NOT reachable by tightening a behind-frontier
+/// holds a small file-backed set) — NOT reachable by tightening a behind-frontier
 /// reaper.
 #[cfg(parallel_sm)]
 const INPUT_RELEASE_STRIDE: usize = 8 * 1024 * 1024;
@@ -282,7 +279,7 @@ const INPUT_RELEASE_STRIDE: usize = 8 * 1024 * 1024;
 #[cfg(parallel_sm)]
 const INPUT_RELEASE_STRIDE_LOWT: usize = 1024 * 1024;
 /// Pool-size threshold at/below which the tighter [`INPUT_RELEASE_STRIDE_LOWT`]
-/// applies. Above it, the shootdown storm dominates (T16 +1.35% regression), so
+/// applies. Above it, the shootdown storm dominates, so
 /// the coarse [`INPUT_RELEASE_STRIDE`] is used.
 #[cfg(parallel_sm)]
 const INPUT_RELEASE_LOWT_MAX_POOL: usize = 8;
@@ -317,15 +314,13 @@ fn reaper_page_size() -> usize {
     }
 }
 
-/// STEP-3 (storedheavy exit-teardown lever, gated 2026-07-10). On a large
-/// single-member decode gz holds the ENTIRE input mmap resident until the
-/// `Mmap::drop` at the end of `decompress_file` — where a single serial
-/// `munmap` of the ~100 MB input costs ~3–7 ms at process exit (strace-measured
-/// on AMD Zen2: `munmap(100016878) <0.006816>` immediately before
-/// `exit_group`). rapidgzip pays ~0 there because it keeps a bounded resident
-/// set (~50 MB). This reaper releases consumed input pages DURING decode,
-/// overlapped with the parallel decode work, so the resident set — and thus the
-/// final teardown — shrinks toward rapidgzip's.
+/// STEP-3. On a large single-member decode gz holds the ENTIRE input mmap
+/// resident until the `Mmap::drop` at the end of `decompress_file` — where a
+/// single serial `munmap` of the large input costs a few ms at process exit.
+/// rapidgzip pays ~0 there because it keeps a bounded resident set. This reaper
+/// releases consumed input pages DURING decode, overlapped with the parallel
+/// decode work, so the resident set — and thus the final teardown — shrinks
+/// toward rapidgzip's.
 ///
 /// Correctness: the input is a file-backed mmap, so `MADV_DONTNEED` only drops
 /// resident pages; any later access re-faults them from the page cache with the
@@ -499,24 +494,20 @@ pub fn drive_capturing<W: std::io::Write>(
 
 /// THIN-T1 serial driver — the production T1 single-member path.
 ///
-/// The MINIMAL clean driver the BEAT-IGZIP TASK 2 brief calls for: a
+/// A minimal clean driver: a
 /// single SERIAL rolling-window loop over chunks calling the SHARED
 /// `decode_chunk` kernel with NO parallel bulk whatsoever — no `block_finder`,
 /// no `BlockFetcher`/prefetch, no `WindowMap` publish/handoff, no marker arming
 /// (never fires — every chunk gets a full 32 KiB predecessor window), no
 /// `ThreadPool`/`std::thread::scope`, no `Arc` chunk lifecycle, no pending
-/// queue. It is the candidate THIN-T1-DRIVER spine measured in isolation: the
-/// ENTIRE process (perf-stat over the whole binary) is this clean serial decode
-/// plus the same CLI/mmap/header prologue both arms share — so cyc/B over the
-/// process attributes to the shared kernel + serial driver, not the scaffold.
+/// queue.
 ///
 /// It does NOT run a speculative Pass 1 and
 /// has NO separate untimed Phase A: the rolling window IS derived inline as the
 /// loop advances (each chunk's true trailing 32 KiB becomes the next chunk's
-/// dict), so there is exactly ONE decode of the stream and nothing the perf
-/// counter sees that is not the thin-T1 path. Output is byte-correct (real
+/// dict), so there is exactly ONE decode of the stream. Output is byte-correct (real
 /// rolling windows) and markers never fire — both verified by the caller's
-/// CRC/size check (Gate-0 non-inert + markers==0).
+/// CRC/size check.
 #[cfg(parallel_sm)]
 pub fn drive_thin_t1_oracle<W: std::io::Write>(
     input: &[u8],
@@ -526,13 +517,11 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
 ) -> Result<(u32, usize), FetchError> {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
-    // Cache-residency lever (b): activate the T1 resident-pool scope for THIS
+    // Activate the T1 resident-pool scope for THIS
     // (single, serial) decode thread. While active, the chunk output buffer is
     // taken from / returned to the manual per-thread pool AND its reserve is
     // pinned to the fixed resident cap, so consecutive chunks decode into ONE
-    // resident buffer instead of a fresh ratio-sized alloc per chunk — the
-    // GATED `GZIPPY_RESIDENT_OUTPUT_POOL` mechanism (minor-faults drop toward
-    // igzip, monorepo wall 1.39→1.29 both arches; former plans/T1-CACHE-RESIDENCY-RESULTS).
+    // resident buffer instead of a fresh ratio-sized alloc per chunk.
     // SCOPED to this thread (RAII): the T>1 parallel workers never set it, so the
     // faithful per-chunk reserve/pool path is unchanged at T>1.
     let _resident = crate::decompress::parallel::chunk_buffer_pool::T1ResidentScope::enter();
@@ -675,15 +664,13 @@ fn drive_impl<W: std::io::Write>(
     // ── m_blockFinder (vendor GzipChunkFetcher.hpp:283) ─────────────
     // AMD/Zen2 T3 TAIL-TAPER (byte-transparent; gated). At 3 workers the in-order
     // pull-queue's makespan is set by a STRAGGLER: the last decode round leaves 2
-    // of 3 workers idle while one finishes a full 4 MiB chunk (traced:
-    // ideal makespan 223.6 ms vs actual 249.8 ms — a ~26 ms / ~10% imbalance; the
-    // final-ending span is a full ~38 ms chunk). A GLOBAL finer chunk size regresses
-    // T3 (its own optimum is 4 MiB; at 3 workers whole-file per-chunk overhead > tail
-    // saved), so we subdivide ONLY the trailing region: the bulk keeps 4 MiB, the
-    // last few chunks run short so the final round's straggler is small. NO vendor
-    // counterpart — rapidgzip's GzipBlockFinder uses one uniform spacing (its last
-    // chunk is just the remainder). Scoped to cpu_is_amd() && pool_size==3; every
-    // other cell/arch takes the byte-identical uniform finder.
+    // of 3 workers idle while one finishes a full 4 MiB chunk. A GLOBAL finer chunk
+    // size costs more (its own optimum is 4 MiB; at 3 workers whole-file per-chunk
+    // overhead > tail saved), so we subdivide ONLY the trailing region: the bulk
+    // keeps 4 MiB, the last few chunks run short so the final round's straggler is
+    // small. NO vendor counterpart — rapidgzip's GzipBlockFinder uses one uniform
+    // spacing (its last chunk is just the remainder). Scoped to cpu_is_amd() &&
+    // pool_size==3; every other cell/arch takes the byte-identical uniform finder.
     let block_finder = Arc::new(build_block_finder(
         configuration.split_chunk_size,
         total_bits,
@@ -755,7 +742,7 @@ fn drive_impl<W: std::io::Write>(
     // threads so submitted tasks run INLINE (deferred), avoiding a cross-thread
     // handoff that can't be overlapped. gzippy passed `pool_size` straight through
     // (one real worker), which made the eager full-scan's apply_window submits pure
-    // overhead at T1 (+16% regression). Apply the `==1 ? 0` ONLY at pool construction;
+    // overhead at T1. Apply the `==1 ? 0` ONLY at pool construction;
     // the cache/prefetch sizing above keeps reading the true `pool_size` (vendor sizes
     // m_prefetchCache off m_parallelization, which stays 1 → 2, not 0).
     let pool_threads = if pool_size == 1 { 0 } else { pool_size };
@@ -764,11 +751,9 @@ fn drive_impl<W: std::io::Write>(
     // only, empty pinning → the OS scheduler places threads). gzippy previously
     // added speculative worker-pinning (`with_pinning_for_capacity`) rapidgzip
     // never had; on an SMT box the default `get_core_ids()` cycling order packed
-    // workers onto SMT-sibling logical cores of the same physical core, costing
-    // +18-20% on silesia-T4. The PIN-DISCRIMINATOR measurement (FROZEN Intel,
-    // N=13, former plans/PIN-DISCRIMINATOR-2026-06-21.md) proved the unpinned pool ties
-    // rapidgzip (silesia-T4 1.028 vs pinned 1.198) and the OS spreads the workers
-    // across distinct physical cores on its own — so the pinning is deleted.
+    // workers onto SMT-sibling logical cores of the same physical core. The
+    // unpinned pool lets the OS spread the workers across distinct
+    // physical cores on its own — so the pinning is deleted.
     let thread_pool = Arc::new(ThreadPool::new(
         pool_threads,
         crate::decompress::parallel::thread_pool::ThreadPinning::new(),
@@ -792,7 +777,7 @@ fn drive_impl<W: std::io::Write>(
     // The in-order consumer (this thread runs `consumer_loop` inline) is left
     // unpinned — faithful to rapidgzip, which never pins its reader thread; the
     // OS schedules it alongside the unpinned decode workers (see the decode-pool
-    // construction above and former plans/PIN-DISCRIMINATOR-2026-06-21.md).
+    // construction above).
     let consumer_result = consumer_loop(
         input_view,
         writer,
@@ -907,9 +892,9 @@ fn consumer_loop<W: std::io::Write>(
     // marker-replace futures while blocked on the current chunk's future.
     let mut eager_completed: EagerCompleted = std::collections::HashMap::new();
     // Keep the last N drained chunks' buffers off the pool until the
-    // pipeline moves on (lone-drain CRC bisect 2026-06-05: 1-chunk defer
-    // insufficient at T>1; byte diff at chunk 4 boundary when lone emit
-    // races worker fill of successor buffers). The depth + lone-drain
+    // pipeline moves on (a 1-chunk defer is insufficient at T>1: a byte diff
+    // appears at a chunk boundary when a lone emit races worker fill of
+    // successor buffers). The depth + lone-drain
     // policy is T1-tuned (depth 0 + drain-lone at pool_size==1, where the
     // pool runs inline with no racing workers); see `RecycleDeferral`.
     let mut recycle_deferral = RecycleDeferral::new(pool_size);
@@ -1083,7 +1068,7 @@ fn consumer_loop<W: std::io::Write>(
         // chunk's prefetch. Without this asymmetry, the loop at
         // `prefetch_new_blocks` line 589 skips the last prefetch in
         // any file, leaving 1 prefetch dispatched instead of 3 on
-        // the 221 MB / 3-partition fixture (bench-2026-05-18).
+        // the 221 MB / 3-partition fixture.
         let lookup_next_block_offset = |idx: usize| -> Option<usize> {
             match block_finder.get(idx) {
                 (Some(offset), GetReturnCode::Success) => Some(offset),
@@ -1184,13 +1169,10 @@ fn consumer_loop<W: std::io::Write>(
                 // it — the dispatch drive only existed on the miss path
                 // (inside `get_with_prefetch`) and in the 1ms blocked-pump
                 // ticks — so during a drain of already-ready prefetched chunks
-                // the dispatcher went COMPLETELY silent (masked trace
-                // 2026-06-09, model.gz T8: zero dispatch calls for 53ms of
-                // drain, then a ~17ms on-demand stall at the first
-                // un-prefetched partition, repeating every ~13 chunks; 5
-                // on-demand fetches == the 5 consumer stalls; pool fill
-                // factor 53%). Driving here keeps the prefetch horizon
-                // advancing one call per consumed chunk, exactly like vendor.
+                // the dispatcher went COMPLETELY silent, stalling on-demand at
+                // the first un-prefetched partition. Driving here keeps the
+                // prefetch horizon advancing one call per consumed chunk,
+                // exactly like vendor.
                 // Miss-path ordering is untouched: on-demand submit still
                 // precedes the dispatch drive (vendor BlockFetcher.hpp:276
                 // before :297), so the head-of-line task cannot queue behind
@@ -1432,8 +1414,7 @@ fn consumer_loop<W: std::io::Write>(
             // `if ( !m_windowMap->get( windowOffset ) )`): only compute+publish this chunk's
             // end window if it is NOT already published. With the eager full-scan
             // (queuePrefetchedChunkPostProcessing) publishing end-windows ahead, the consumer's
-            // recompute was REDUNDANT — measured get_last_window calls=102 for ~39 chunks
-            // (~1.5ms each). get_last_window is deterministic given the same predecessor, so
+            // recompute was REDUNDANT. get_last_window is deterministic given the same predecessor, so
             // the eager-published window is byte-identical; skipping the recompute is byte-exact.
             {
                 let window_bytes = materialize_window(&window);
@@ -1456,8 +1437,7 @@ fn consumer_loop<W: std::io::Write>(
         // Vendor GzipChunkFetcher.hpp:343-357 — `postProcessChunk` (blocking
         // `future.get()` on pool `applyWindow`), then `setEncodedOffset`, then
         // `appendSubchunksToIndexes`. Previously gzippy appended BEFORE
-        // post-process and queued Async writes — ordering skew vs vendor and
-        // measured publish-chain inflation (Fulcrum L_resolve / dispatch_recv).
+        // post-process and queued Async writes — ordering skew vs vendor.
         {
             harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
             let (mut chunk, eager_already_done) = chunk_holder.into_chunk_data(
@@ -1528,8 +1508,8 @@ fn consumer_loop<W: std::io::Write>(
         // it reaches the FIFO head (GzipChunkFetcher.hpp:333-342 writes
         // inline after `postProcessChunk` returns). Previously gzippy only
         // drained when `pending.len() > pool_size`, leaving Ready chunks
-        // holding warm rpmalloc buffers until the cap filled — the measured
-        // buffer-return-latency gap at T16 (chunk_buffer_pool.rs:176-179).
+        // holding warm rpmalloc buffers until the cap filled — a
+        // buffer-return-latency gap (chunk_buffer_pool.rs:176-179).
         drain_ready_pending_heads(
             &mut pending,
             window_map,
@@ -1623,18 +1603,11 @@ fn build_block_finder(
     use crate::decompress::parallel::single_member::cpu_is_amd;
     // (chunks, divisor). chunks = # of trailing full spacings to subdivide;
     // divisor = spacing / divisor for that region. Gated default for AMD T3.
-    // Per-T tail-taper schedule (AMD/Zen2 only). T3=5:2 (locked at 1364b07c);
-    // T4=8:2 and T7=8:2 close the last two silesia TIE cells. The wall CAUSALLY
-    // tracks the taper amount (Gate-2 sweep, silesia/Zen2 vs rapidgzip-native,
-    // load-immune interleaved N=31, /dev/null, sha==oracle):
-    //   T4 off 0.988 TIE → 8:2 0.975 WIN (Δ0.0055>spread0.0032; paired 25/31
-    //       p=9e-4; best-of-N min-ratio 0.977),
-    //   T7 off 0.980 TIE → 8:2 0.963 WIN (Δ0.0065>spread0.0054; paired 27/31
-    //       p<1e-4; best-of-N min-ratio 0.956).
+    // Per-T tail-taper schedule (AMD/Zen2 only): T3=5:2, T4=8:2, T7=8:2.
     // Non-monotonic optimum: 3:2 under-tapers (leaves a full straggler), 10:2
-    // over-tapers (per-chunk overhead at low workers > tail saved) and REGRESSES
-    // to LOSS — so the taper depth is gated per-T, not a smooth formula. Every
-    // other T and every non-AMD arch takes the byte-identical uniform finder.
+    // over-tapers (per-chunk overhead at low workers > tail saved) — so the
+    // taper depth is gated per-T, not a smooth formula. Every other T and every
+    // non-AMD arch takes the byte-identical uniform finder.
     let gated: Option<(usize, usize)> = if cpu_is_amd() {
         match pool_size {
             3 => Some((TAIL_TAPER_CHUNKS_DEFAULT, TAIL_TAPER_DIVISOR_DEFAULT)),
@@ -1655,35 +1628,22 @@ fn build_block_finder(
 }
 
 /// AMD/Zen2 T3 tail-taper gated defaults (# trailing full spacings subdivided;
-/// spacing divisor). LOCKED from the `fulcrum abmeasure` sweep (silesia/Zen2 vs
-/// rapidgzip-native, load-immune, /dev/null, sha-gated to oracle 028bd002…):
-/// subdividing the last 5 spacings by 2 (4 MiB → 2 MiB in the trailing region)
-/// is the sweep optimum. The response is a plateau at 4–5 chunks and falls off
-/// sharply on either side (paired base→after, after/rg):
-///   1:2 4/15  2:2 4/15  3:2 19/30 (1.011 TIE)  4:2 30/30 (1.001)
-///   **5:2 29/30 (0.999 WIN)**  6:2 6/15 (1.015 TIE)  8:2 0/15 (1.027 REGRESS).
-/// At 5:2, N=30: base gz/rg 1.014 → after 0.999 (105.9% of the gap closed),
-/// cyc/byte 10.816→10.659, paired sign-test p=5.77e-8. Fewer tapered chunks leave
-/// a full-4 MiB straggler in the final round; more pay per-chunk overhead that at
-/// 3 workers exceeds the tail saved (the same wall the base 9fd76daa commit hit
-/// with GLOBAL finer chunks).
+/// spacing divisor): subdividing the last 5 spacings by 2 (4 MiB → 2 MiB in the
+/// trailing region). Fewer tapered chunks leave a full-4 MiB straggler in the
+/// final round; more pay per-chunk overhead that at 3 workers exceeds the tail
+/// saved (the same wall a GLOBAL finer-chunk configuration hits).
 #[cfg(parallel_sm)]
 const TAIL_TAPER_CHUNKS_DEFAULT: usize = 5;
 #[cfg(parallel_sm)]
 const TAIL_TAPER_DIVISOR_DEFAULT: usize = 2;
 
 /// AMD/Zen2 T4 & T7 tail-taper chunk count (divisor reuses
-/// [`TAIL_TAPER_DIVISOR_DEFAULT`] = 2, i.e. 8:2). LOCKED from the Gate-2 sweep
-/// (silesia/Zen2 vs rapidgzip-native, load-immune interleaved N=31, /dev/null,
-/// sha==oracle): subdividing the last 8 spacings by 2 is the optimum for both the
-/// T4 (4 MiB base) and T7 (2.5 MiB base) cells. Response is non-monotonic — 3:2
-/// under-tapers (a full straggler survives the final round → TIE), 10:2
-/// over-tapers (per-chunk overhead at 4/7 workers exceeds the tail saved →
-/// LOSS). At 8:2: T4 off 0.988 TIE → 0.975 WIN (Δ0.0055>spread0.0032, paired
-/// 25/31 p=9e-4); T7 off 0.980 TIE → 0.963 WIN (Δ0.0065>spread0.0054, paired
-/// 27/31 p<1e-4). STEP 1 trace showed these two cells carry the largest
-/// last-wave tail imbalance (T4/T7 ≈15–22% vs the T8 WIN cell's ≈10%); the taper
-/// shrinks the trailing chunks so the final decode round finishes fast.
+/// [`TAIL_TAPER_DIVISOR_DEFAULT`] = 2, i.e. 8:2): subdividing the last 8 spacings
+/// by 2 for both the T4 (4 MiB base) and T7 (2.5 MiB base) cells. Response is
+/// non-monotonic — 3:2 under-tapers (a full straggler survives the final round),
+/// 10:2 over-tapers (per-chunk overhead at 4/7 workers exceeds the tail saved).
+/// These two cells carry the largest last-wave tail imbalance; the taper shrinks
+/// the trailing chunks so the final decode round finishes fast.
 #[cfg(parallel_sm)]
 const TAIL_TAPER_CHUNKS_T4_T7: usize = 8;
 
@@ -1708,9 +1668,9 @@ fn stop_hint_bit_for(
     // to `floor` so we don't decode a degenerate tiny chunk. It was `spacing`,
     // which ALSO rejected the next partition boundary P+1 when `floor` is an
     // OVERSHOOT TAIL just past P (gap to P+1 = spacing − overshoot ≈ 0.99·spacing
-    // < spacing) — bumping the on-demand decode to P+2, a 2× chunk (~16-21MB,
-    // ~130ms) decoded SYNCHRONOUSLY on the consumer's critical path (the measured
-    // head-of-line stalls, ≈40% of the T8 wall). Half a spacing still skips the
+    // < spacing) — bumping the on-demand decode to P+2, a 2× chunk (~16-21MB)
+    // decoded SYNCHRONOUSLY on the consumer's critical path (head-of-line
+    // stalls). Half a spacing still skips the
     // genuinely-tiny gaps (the 5-bit test case) while accepting a near-full P+1.
     // Size off the SMALLEST guess stride (the tapered tail stride when the AMD-T3
     // tail-taper is on) so a legitimately-short tapered chunk is not rejected and
@@ -1833,11 +1793,9 @@ fn submit_decode_to_pool(
 /// → `run_post_process_in_place`, which mutates the SHARED `ChunkData` IN
 /// PLACE via `SharedChunkData` (`Arc<UnsafeCell<ChunkData>>` = vendor's
 /// `shared_ptr`), byte-for-byte faithful to vendor `GzipChunkFetcher.hpp:579-582`
-/// — NO clone (landed 3b24dd0e, 2026-06-06). The residual
-/// `SharedChunkData::take_or_clone` is a cold correctness fallback (measured
-/// MISSES=0 across workloads to T16). This function's CLONE approach was
-/// retired; its doc misled a 2026-07-02 source-read into a phantom "gz clones"
-/// divergence. Kept only as a reference for the abandoned eager-probe shape.
+/// — NO clone. The residual `SharedChunkData::take_or_clone` is a cold
+/// correctness fallback. This function's CLONE approach was retired; kept only
+/// as a reference for the abandoned eager-probe shape.
 ///
 /// Eager post-process probe — gated port of vendor's
 /// `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
@@ -2147,18 +2105,15 @@ fn queue_prefetched_marker_postprocess(
         // The window that resolves THIS chunk's markers must be the one valid at the
         // chunk's OWN decode-start (`max_acceptable_start_bit`). Re-keying this lookup
         // to the offset-sorted predecessor's published end (`prev.encoded_offset_bits
-        // + prev.encoded_size_bits`, the §3.1 experiment) was REJECTED: for range-
-        // speculative chunks that key names a DIFFERENT published window, and the
-        // dense window map usually contains it, so the chunk gets resolved against the
-        // wrong predecessor window → CRC32 mismatch (test_coalesce_fixed_huffman /
-        // silesia parallel-SM, green on the seed key, red on the predecessor key).
+        // + prev.encoded_size_bits`) is WRONG: for range-speculative chunks that key
+        // names a DIFFERENT published window, and the dense window map usually
+        // contains it, so the chunk would resolve against the wrong predecessor
+        // window → CRC32 mismatch.
         let handoff_bit = chunk_consumer_handoff_bit(arc.as_ref());
-        // F1 instrument: RESOLVE_AHEAD_* / HANDOFF_WINDOW_PUBLISHED were declared but
-        // NEVER incremented (the dead-counter trap behind `--verbose`'s "Worker
-        // resolve-ahead" / "handoff_key" lines, which always read 0). Count one
+        // The RESOLVE_AHEAD_* / HANDOFF_WINDOW_PUBLISHED counters track one
         // attempt per chunk entering the predecessor lookup; the eligibility gate
-        // above (`chunk_may_resolve_markers_early`) pre-screens window presence, so OK
-        // tracks ATTEMPTS, but both are now LIVE on the production resolve-ahead path.
+        // above (`chunk_may_resolve_markers_early`) pre-screens window presence, so
+        // they track ATTEMPTS. Both are live on the production resolve-ahead path.
         let Some((pred_key, predecessor_window)) =
             confirmed_predecessor_window(window_map, handoff_bit)
         else {
@@ -2210,9 +2165,7 @@ fn run_post_process_task(
 /// in `src` MUST be < 256 (post-`apply_window` invariant). AVX2 path
 /// uses `_mm256_packus_epi16` for 16-lane parallel narrowing
 /// (saturating pack — since values are already < 256, saturation is
-/// a no-op). Scalar tail handles the remainder. AVX-256 downclock
-/// concern from an earlier session was empirically refuted on neurotic
-/// via injection probe (see `git history (campaign plan, removed)` §4).
+/// a no-op). Scalar tail handles the remainder.
 #[cfg(parallel_sm)]
 #[allow(dead_code)]
 fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
@@ -2538,10 +2491,9 @@ impl ConsumerChunkHold {
 // apply_window for prefetched SUCCESSOR chunks whose predecessor window
 // is already published, instead of waiting to reach them in order.
 //
-// These counters are the deliverable: a prior pump attempt TIED because
-// it found 0 ready successors. We MUST distinguish "the lever works"
-// (many eager submits) from "the cache is empty during the stall" (the
-// real lever is prefetch DEPTH, not eagerness).
+// These counters distinguish "many eager submits" from "the cache is empty
+// during the stall" — i.e. whether the prefetch depth reaches ahead far enough
+// for eager post-processing to find ready successors.
 
 /// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`,
 /// GzipChunk.hpp:712-734): always `decodeChunkWithRapidgzip` with
@@ -2602,9 +2554,8 @@ fn try_speculative_decode_candidate(
         if footer_end + 2 <= input.len() {
             // At least 2 bytes after the footer — check for valid gzip magic,
             // and when a 3rd byte is in-bounds also require CM=8 (deflate),
-            // matching vendor readHeader more closely (advisor hardening:
-            // cuts magic false-accept odds 256x; false-accept only reverts
-            // to the pre-fix consume-time discard, so this is perf-only).
+            // matching vendor readHeader more closely. A false-accept only
+            // reverts to the consume-time discard, so this is perf-only.
             let looks_like_gzip = input[footer_end] == 0x1f
                 && input[footer_end + 1] == 0x8b
                 && input.get(footer_end + 2).is_none_or(|&cm| cm == 0x08);
@@ -2799,13 +2750,10 @@ enum PendingWrite {
 ///
 /// At `parallelization == 1` the thread pool runs INLINE (`pool_threads == 0`,
 /// see `drive_impl`) with NO concurrent workers, so a lone Ready can drain without
-/// the worker-fill race that forces lone-hold at T>1 (the 2026-06-05
-/// lone-drain CRC bisect: "byte diff at chunk 4 boundary when lone emit races
-/// worker fill of successor buffers"). Shrinking the T1 live-ChunkData working
-/// set 4→1 is byte-exact at T1 and a measured win (BEAT-IGZIP-T1 night4, Intel:
-/// nasa −22.9% cyc/B / −21% wall, silesia −3.2% cyc/B / −4.4% wall, RSS
-/// −64%/−30%, both p<0.005, sha-identical) — the smaller resident output
-/// working-set cuts page-faults (nasa −73%, silesia −42%) that feed the kernel.
+/// the worker-fill race that forces lone-hold at T>1 (a byte diff appears at a
+/// chunk boundary when a lone emit races worker fill of successor buffers).
+/// Shrinking the T1 live-ChunkData working set 4→1 is byte-exact at T1: the
+/// smaller resident output working-set cuts page-faults that feed the kernel.
 /// It is INCORRECT at T>1 (a global lone-drain corrupts silesia at T4/T8) so the
 /// T1 tuning is GATED on `pool_size == 1`.
 #[cfg(parallel_sm)]
@@ -2825,8 +2773,8 @@ struct RecycleDeferral {
 impl RecycleDeferral {
     fn new(pool_size: usize) -> Self {
         let t1 = pool_size == 1;
-        // T1: drain lone (single inline worker, no worker-fill race; measured
-        // win). T>1: hold lone (correctness — worker-fill race).
+        // T1: drain lone (single inline worker, no worker-fill race).
+        // T>1: hold lone (correctness — worker-fill race).
         let drain_lone = t1;
         Self {
             drain_lone,
@@ -3356,7 +3304,7 @@ mod tests {
         ));
     }
 
-    /// Regression for neurotic `make profile-decompression-x86_64` (64 MiB
+    /// Regression for `make profile-decompression-x86_64` (64 MiB
     /// silesia → **gzip(1) -9 -c**, T=2). Skipped when benchmark_data is absent.
     #[test]
     #[ignore = "requires benchmark_data/silesia-large.bin; run with --ignored"]

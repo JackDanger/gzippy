@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// Pre-existing parallel-module dead code, exposed by the default-feature flip; delete in a dedicated cleanup.
 
 //! SIMD-accelerated marker replacement.
 //!
@@ -121,8 +121,7 @@ fn replace_markers_lut(data: &mut [u16], window: &[u8]) {
 /// `target[i] = fullWindow[chunk[i]]`. Single read of `src[i]` and
 /// single write of `dst[i]` per element, vs gzippy's prior
 /// `replace_markers_lut` (u16→u16 in-place) + `narrow_u16_to_u8`
-/// (u16→u8) which was two full passes over the buffer (~24ms / 3.3MiB
-/// per chunk per `git history (campaign plan, removed)` consumer-narrow finding).
+/// (u16→u8) which was two full passes over the buffer.
 ///
 /// `dst` is cleared and grown to `src.len()`. The LUT layout matches
 /// `replace_markers_lut`: literals pass through, markers (≥32768)
@@ -366,8 +365,7 @@ mod tests {
     /// (`DecodedData.hpp:314-338`). Exercises the ≥ 128 KiB threshold
     /// that triggers `replace_markers_lut` and asserts byte-equivalent
     /// output against the scalar reference path. Previously NO test
-    /// hit the LUT branch — flagged by advisor #10 after commit
-    /// ec55351 landed.
+    /// hit the LUT branch.
     #[test]
     fn lut_path_matches_scalar_above_threshold() {
         // 200K-element buffer: well over the 128 KiB threshold.

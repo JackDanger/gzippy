@@ -45,7 +45,7 @@
 
 #[cfg(parallel_sm)]
 pub mod apply_window;
-/// ASM-campaign rung (c): the contig clean fast loop's `asm!` kernel
+/// The contig clean fast loop's `asm!` kernel
 /// (feature `asm-kernel`, x86_64-only; pure-Rust path always compiled).
 #[cfg(parallel_sm)]
 pub mod asm_kernel;

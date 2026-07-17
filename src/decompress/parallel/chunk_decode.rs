@@ -69,14 +69,13 @@ const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 ///
 /// The pure-Rust DEFLATE engine is the SOLE production decode path; ISA-L
 /// clean-tail decode was a measurement oracle only, controlled by
-/// `GZIPPY_ISAL_ENGINE_ORACLE`. The env override was removed 2026-07-07
-/// (batch 4f, confirmed no production ISA-L decode exists — the decode graph
-/// is pure-Rust; C-FFI is compression-only per CLAUDE.md) — hardcoded OFF
-/// (pure-Rust identity). The oracle-only `finish_decode_chunk_isal_oracle`
-/// call site this used to gate was a mechanically dead consequence and has
-/// been removed (2026-07-07, x86-finish batch), along with its
-/// `isal_incremental_growth` sizing knob (`GZIPPY_ISAL_GROW_MIB` /
-/// `GZIPPY_ISAL_INITIAL_FACTOR` / `GZIPPY_ISAL_INCREMENTAL_GROWTH`) — both
+/// `GZIPPY_ISAL_ENGINE_ORACLE`. The env override was removed 2026-07-07 —
+/// hardcoded OFF (pure-Rust identity); no production ISA-L decode exists, the
+/// decode graph is pure-Rust and C-FFI is compression-only per CLAUDE.md. The
+/// oracle-only `finish_decode_chunk_isal_oracle` call site this used to gate
+/// was a mechanically dead consequence and has been removed (2026-07-07),
+/// along with its `isal_incremental_growth` sizing knob (`GZIPPY_ISAL_GROW_MIB`
+/// / `GZIPPY_ISAL_INITIAL_FACTOR` / `GZIPPY_ISAL_INCREMENTAL_GROWTH`) — both
 /// had zero remaining callers once this predicate went hardcoded OFF.
 #[cfg(parallel_sm)]
 #[inline]
@@ -87,7 +86,7 @@ fn isal_engine_oracle_enabled() -> bool {
 /// M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
 /// `deflate::Block` engine. Was previously kill-switchable via
 /// `GZIPPY_SEEDED_BLOCK=0` (restoring the pre-M3 wrapper path); the env
-/// override was removed 2026-07-07 (batch 4f) — hardcoded to the shipped
+/// override was removed 2026-07-07 — hardcoded to the shipped
 /// default (ON). Production proof of which engine decoded each seeded chunk:
 /// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (`--verbose` dump).
 #[cfg(parallel_sm)]
@@ -108,7 +107,7 @@ fn seeded_block_route_enabled() -> bool {
 /// M4 (DIV-1 part 2): window-seeded UNTIL-EXACT chunks decode on the ONE
 /// `deflate::Block` engine. Was previously kill-switchable via
 /// `GZIPPY_EXACT_BLOCK=0` (restoring the pre-M4 wrapper path); the env
-/// override was removed 2026-07-07 (batch 4f) — hardcoded to the shipped
+/// override was removed 2026-07-07 — hardcoded to the shipped
 /// default (ON). Production proof of which engine decoded each exact chunk:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (`--verbose` dump).
 #[cfg(parallel_sm)]
@@ -310,11 +309,11 @@ fn finish_decode_chunk_impl(
     chunk.set_output_ceiling_for_input(input.len());
 
     // The ISA-L clean-tail measurement-oracle branch that used to sit here
-    // (`GZIPPY_ISAL_ENGINE_ORACLE`) was removed 2026-07-07 (batch 4f) —
-    // confirmed no production ISA-L decode graph exists (single-member decode
+    // (`GZIPPY_ISAL_ENGINE_ORACLE`) was removed 2026-07-07 —
+    // no production ISA-L decode graph exists (single-member decode
     // is pure-Rust ParallelSM at every T; C-FFI is compression-only per
     // CLAUDE.md). `finish_decode_chunk_isal_oracle` and `isal_incremental_growth`
-    // were themselves deleted (x86-finish batch, 2026-07-07) — zero remaining
+    // were themselves deleted (2026-07-07) — zero remaining
     // callers once this branch was removed.
 
     let read_cap = if until_exact {
@@ -546,7 +545,7 @@ fn decode_chunk_with_rapidgzip_impl(
         if until_exact {
             // M4 (DIV-1 part 2): until-exact decodes on the ONE `deflate::Block`
             // engine (always ON — see `exact_block_route_enabled`; the wrapper
-            // fallback arm this used to have was removed 2026-07-07, batch 4f).
+            // fallback arm this used to have was removed 2026-07-07).
             // See `finish_decode_chunk_exact_block_native` for the labeled
             // deviation + pre-registered contract.
             debug_assert!(exact_block_route_enabled());
@@ -561,7 +560,7 @@ fn decode_chunk_with_rapidgzip_impl(
             // M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
             // `deflate::Block` engine (vendor GzipChunk.hpp:454-458; always ON —
             // see `seeded_block_route_enabled`; the wrapper fallback arm this
-            // used to have was removed 2026-07-07, batch 4f) instead of the
+            // used to have was removed 2026-07-07) instead of the
             // second clean engine (`StreamingInflateWrapper`/`unified::Inflate`).
             debug_assert!(seeded_block_route_enabled());
             finish_decode_chunk_seeded_block_native(
@@ -605,18 +604,10 @@ fn decode_chunk_with_rapidgzip_impl(
 /// (`marker_inflate::drain_to_output`) the post-flip clean tail is fully
 /// copy-free (ring slice -> chunk.data in one memcpy). Holds disjoint field
 /// borrows so `push_slice` (markers) and `push_clean_u8` (clean data) never
-/// alias. This recovered +0.059× of the T8 wall (native_fold 0.678× -> 0.737× rg,
-/// quiet-box banked, sha-exact; the loaded 6-pass split showed the same recovery
-/// monotonic across copy#1 + copy#2/3/grow but load-inflated, so the banked
-/// number is +0.059×). Vendor decodes the clean tail straight into one contiguous
+/// alias. Vendor decodes the clean tail straight into one contiguous
 /// DecodedData buffer (DecodedData.hpp:278-289). NOTE: this ContigFoldSink ring
 /// path is the ~1% marker-loop dribble on gzippy-native; the BULK clean tail is
-/// u8-direct via `decode_clean_into_contig` (no ring, no drain). The
-/// A drain/CRC-split measurement measured the remaining drain+CRC second-touch at
-/// ~0-1ms (frozen host N=21), so the gap to the ISA-L `ocl_cf` ceiling
-/// (matched-comparator 0.945× rg) is ~36ms of essentially PURE symbol rate on the
-/// SAME covered chunks — NOT an upper bound padded by ring cost (that earlier
-/// caveat is STALE for the contig bulk). See git history (campaign plan, removed).
+/// u8-direct via `decode_clean_into_contig` (no ring, no drain).
 #[cfg(parallel_sm)]
 struct ContigFoldSink<'a> {
     markers: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
@@ -875,21 +866,11 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
     // ring slices straight to the sink) and `ContigFoldSink` (writes those slices
     // DIRECTLY into `chunk.data`, no `pending_clean` middle-man, no second
     // `append_clean` copy), the post-flip clean tail drops the per-block u8buf
-    // alloc + the pending_clean double-copy. This recovered +0.059× of the T8
-    // wall (native_fold 0.678× -> 0.737× rg, quiet-box banked, sha-exact; the
-    // loaded 6-pass split confirmed the recovery is monotonic across copy#1 +
-    // copy#2/3/grow but load-inflated). NOTE (2026-06-08, measured): on the
-    // gzippy-native build the BULK clean tail does NOT take this ContigFoldSink
-    // ring path at all — it takes `finish_decode_chunk_contig_native` ->
-    // `decode_clean_into_contig` (u8-DIRECT into chunk.data, no ring, no drain;
-    // this sink governs only the ~1% marker-loop dribble). A drain/CRC-split
-    // measurement measured the remaining drain+CRC
-    // second-touch at ~0-1ms (frozen host, N=21), so the gap to the engine-removed
-    // ceiling (ocl_cf, matched-comparator 0.945× rg) is ~36ms of essentially PURE
-    // pure-Rust-vs-ISA-L SYMBOL RATE on the SAME covered chunks (coverage symmetry
-    // confirmed: native flip_to_clean=12 finished_no_flip=4 window_seeded=2 ==
-    // ocl_cf's 14 covered). The earlier "ring-write+drain remain, upper bound only"
-    // caveat is STALE for the contig bulk path. See git history (campaign plan, removed).
+    // alloc + the pending_clean double-copy. NOTE: on the gzippy-native build the
+    // BULK clean tail does NOT take this ContigFoldSink ring path at all — it
+    // takes `finish_decode_chunk_contig_native` -> `decode_clean_into_contig`
+    // (u8-DIRECT into chunk.data, no ring, no drain; this sink governs only the
+    // ~1% marker-loop dribble).
     {
         // RATIO-INFORMED upfront reserve (shared with the ISA-L oracle path):
         // size from the member's KNOWN ISIZE/compressed ratio
@@ -1061,7 +1042,7 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
 // `parallel/mod.rs:76-81`): when `false` the cross-member continuation at BFINAL
 // (footer consume + next-header parse + empty-window reset) is compiled OUT, so
 // the single-member instantiation is codegen-identical to the pre-port driver
-// (verified by the §7 disasm diff). When `true`, the driver walks
+// (verified by the disasm diff). When `true`, the driver walks
 // `… deflate block → BFINAL → gzip footer → next gzip header → next member …`
 // exactly like rapidgzip's `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654).
 fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
@@ -1075,7 +1056,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     // prefetch / subchunk-split (T>1 scaffold). Every remaining caller passes
     // `true` — the former T1-MONOLITH divergence that passed `false` (no
     // boundary recording, pure T>1 scaffold skipped) was removed 2026-07-07
-    // (batch 4f, dead opt-in path).
+    // (dead opt-in path).
     record_boundaries: bool,
 ) -> Result<(), ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
@@ -1415,7 +1396,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 /// `set_initial_window` → `WidthRing::seed_window`, deflate.hpp:1750-1759)
 /// and decode every deflate block u8-DIRECT into `chunk.data`'s contiguous
 /// tail via `decode_clean_into_contig` — the design's single clean-destination
-/// contract (git history (campaign plan, removed) §4.3), the same machinery the FOLD
+/// contract, the same machinery the FOLD
 /// post-flip tail already runs ([`finish_decode_chunk_contig_native`]).
 ///
 /// The 32 KiB seed is installed as a NON-OUTPUT dictionary prefix at
@@ -1435,7 +1416,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 ///
 /// Route: [`seeded_block_route_enabled`] (hardcoded ON; the wrapper arm now
 /// runs only on the gzippy-isal build — the `GZIPPY_SEEDED_BLOCK=0` env
-/// kill-switch was removed 2026-07-07, batch 4f).
+/// kill-switch was removed 2026-07-07).
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_seeded_block_native(
     chunk: &mut ChunkData,
@@ -1609,7 +1590,7 @@ pub(crate) fn decode_multi_member_native(
 /// continues into the following gzip member (`finish_decode_chunk_contig_native`
 /// BFINAL arm). Stays 0 on every single-member decode (the continuation is
 /// compiled out of the `false` instantiation), so a single-member corpus run
-/// asserting this == 0 is the §7 non-execution proof; a multi-member decode
+/// asserting this == 0 is the non-execution proof; a multi-member decode
 /// asserting it advanced proves the port ran.
 pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1623,7 +1604,7 @@ pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
 /// no faithful wrapper engine to hand the chunk to; gzippy-isal keeps the
 /// faithful wrapper path untouched, see `exact_block_route_enabled`).
 ///
-/// PRE-REGISTERED CONTRACT (git history (campaign plan, removed) GATE AMENDMENTS §2) —
+/// PRE-REGISTERED CONTRACT —
 /// Block must replicate from the `unified::Inflate` wrapper arm
 /// (`finish_decode_chunk_impl`, until_exact=true):
 ///
@@ -1660,7 +1641,7 @@ pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
 ///
 /// Route: [`exact_block_route_enabled`] (hardcoded ON; the wrapper arm now
 /// runs only on the gzippy-isal build — the `GZIPPY_EXACT_BLOCK=0` env
-/// kill-switch was removed 2026-07-07, batch 4f). Engine proof:
+/// kill-switch was removed 2026-07-07). Engine proof:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`].
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_exact_block_native(
@@ -2428,7 +2409,7 @@ mod tests {
         assert_eq!(flatten(&chunk), payload);
     }
 
-    /// ADVERSARIAL FLIP-SEAM test (advisor trap A): force the marker→clean flip
+    /// ADVERSARIAL FLIP-SEAM test: force the marker→clean flip
     /// and then issue MAX-DISTANCE (32768) back-references that reach across the
     /// flip seam into the OLDEST part of the pre-flip window. silesia's
     /// differential does NOT reliably exercise a 32768-distance ref landing
@@ -2500,7 +2481,7 @@ mod tests {
         // payload = A repeated 6× (192 KiB). The Block flip is checked only AFTER
         // a marker-mode read() call returns, and a call is capped at
         // RING_SIZE - MAX_RUN_LENGTH = 65278 bytes — so the flip fires near
-        // ~65278, NOT at 32768 (advisor caveat). By repeating A six times the
+        // ~65278, NOT at 32768. By repeating A six times the
         // 4th/5th/6th copies' distance-32768 back-refs are UNAMBIGUOUSLY in the
         // post-flip u8 region, reading the value-downcasted repacked window. The
         // sentinel check below targets byte 5*32768 = 163840 (well past the flip)
@@ -2570,7 +2551,7 @@ mod tests {
         assert!(chunk_end >= stop_hint_bits);
     }
 
-    /// Neurotic profile fixture: gzip(1) -9 on 64 MiB silesia head. Chunk 0
+    /// Profile fixture: gzip(1) -9 on 64 MiB silesia head. Chunk 0
     /// stops at a non-byte-aligned bit; chunk 1 must resume with the published
     /// 32 KiB window. Fails with `InvalidBlock` when handoff is wrong.
     ///
@@ -2889,7 +2870,7 @@ mod native_fold_parity {
         let mut total = 0usize;
         let mut diverged = 0usize;
         let mut flips = 0usize;
-        // SEAM RECONCILIATION (advisor residual on the fold milestone): the native
+        // SEAM RECONCILIATION: the native
         // fold stops at a DIFFERENT bit than the retired two-phase tail. The
         // consumer reconciles that seam via `furthest_decoded_bit` /
         // `block_finder.insert(chunk_end_bit)` (chunk_fetcher.rs:1074, 1419). The
@@ -3066,7 +3047,7 @@ mod native_fold_parity {
         );
     }
 
-    // ── Stage-2 copy-free-to-final owed cases (advisor D + landmine) ─────────
+    // ── Stage-2 copy-free-to-final owed cases ────────────────────────────────
     //
     // These drive the REAL production native contig tail
     // (`finish_decode_chunk_contig_native`) via `decode_chunk_window_absent` on

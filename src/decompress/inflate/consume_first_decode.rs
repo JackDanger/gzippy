@@ -361,8 +361,7 @@ fn prefetch_read(ptr: *const u8) {
 /// into L1 data cache, "keep" temporal locality hint. Universally
 /// available on aarch64 (no extension needed). Stable Rust inline-asm
 /// is the correct path since `core::arch::aarch64::_prefetch` is
-/// unstable. Lever T5 (tight-Huffman plan, advisor-named lever for
-/// arm64 measurability).
+/// unstable.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn prefetch_read(ptr: *const u8) {
@@ -423,7 +422,7 @@ unsafe fn fill_byte_avx2(mut dst: *mut u8, end: *const u8, byte: u8) {
 /// (`lib/decompress_template.h:633-712`). vs the prior gzippy body this removes
 /// (a) the per-match `len > 40` prefetch branch and (b) the leading
 /// `dist >= 32 && len >= 64` SIMD branch that the common short-match path
-/// (silesia avg ~10 B/match) had to fall through before reaching `dist >= 8`.
+/// had to fall through before reaching `dist >= 8`.
 /// Here `offset >= WORDBYTES` (`dist >= 8`) is tested FIRST — exactly
 /// libdeflate's order — and all copies are scalar unaligned machine words with
 /// libdeflate's unroll (5× main, 4× RLE, 2× small-dist do-while). This is
@@ -1079,20 +1078,17 @@ pub fn decode_dynamic_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) ->
     decode_dynamic(bits, output, out_pos)
 }
 
-/// Non-inert counter for the Step-0.5 A/B harness: every call to the flat
-/// libdeflate-style decoder (engine A) increments this. The harness asserts it
-/// advanced by exactly the rep count after each timed loop, PROVING the flat
-/// kernel actually executed on aarch64 (Gate-0c) — not a silently-skipped/inert
-/// path.
+/// Non-inert counter: every call to the flat libdeflate-style decoder
+/// (engine A) increments this. A harness asserts it advanced by exactly the
+/// rep count after each timed loop, proving the flat kernel actually executed
+/// — not a silently-skipped/inert path.
 pub static FLAT_DECODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Step-0.5 A/B harness entry: the engine-A (flat-table libdeflate-style) clean
-/// decoder, called with PRE-BUILT tables so a kernel-only A/B can amortize
-/// table-build outside the timed loop and start at the SAME body bit as engine B
-/// (`Block::decode_clean_into_contig`). Byte-exactness is enforced by the harness
-/// (output == engine B == flate2/gzip). This is a thin transparent wrapper around
-/// the production `decode_huffman_libdeflate_style` (consume_first_decode.rs:632) —
-/// the SAME function bgzf/scan/multi-member run — with a non-inert call counter.
+/// Flat-table (libdeflate-style) clean decoder, called with PRE-BUILT tables
+/// so table-build can be amortized outside a timed loop and start at the SAME
+/// body bit as engine B (`Block::decode_clean_into_contig`). A thin transparent
+/// wrapper around the production `decode_huffman_libdeflate_style` — the SAME
+/// function bgzf/scan/multi-member run — with a non-inert call counter.
 #[doc(hidden)]
 pub fn decode_flat_clean_pub(
     bits: &mut Bits,
@@ -1105,23 +1101,23 @@ pub fn decode_flat_clean_pub(
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
 
-/// Non-inert Gate-0 counter: every call to the parallel-SM clean-path bounded
-/// flat fastloop (engine A wired into `decode_clean_into_contig`) increments
-/// this. A wire-in measurement asserts it advanced (>0) so the flat kernel is
+/// Non-inert counter: every call to the parallel-SM clean-path bounded
+/// flat fastloop (engine A, wired into `decode_clean_into_contig`) increments
+/// this. A measurement asserts it advanced (>0) so the flat kernel is
 /// PROVEN to have run on the production ParallelSM clean path (not inert /
 /// silently-skipped on an arch-gate).
 pub static FLAT_CONTIG_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Companion byte counter (bytes emitted by the bounded flat fastloop).
 pub static FLAT_CONTIG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Non-inert Gate-0 counter: every call to the engine-A flat CLEAN *careful
+/// Non-inert counter: every call to the engine-A flat CLEAN *careful
 /// tail* (`decode_clean_careful_flat`, wired into the parallel-SM clean contig
 /// path to finish the <FASTLOOP_MARGIN residual + the exact `n_max`/EOB
 /// boundary that the bounded fastloop stops short of) increments this. A
 /// positive count PROVES the clean path is 100% engine A — the engine-B
 /// two-level careful loop no longer runs on the clean path.
 pub static FLAT_CAREFUL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Non-inert Gate-0 counter: every time the parallel-SM clean contig path
+/// Non-inert counter: every time the parallel-SM clean contig path
 /// FALLS BACK to building the engine-B two-level `lut_litlen` table (i.e. the
 /// flat engine A did NOT take the block). On a pure-clean run this stays 0,
 /// PROVING the double table-build is gone from the clean path.
@@ -1564,8 +1560,8 @@ pub(crate) fn decode_huffman_fastloop_bounded(
 ///
 /// Byte-for-byte the same OUTPUT as [`decode_huffman_fastloop_bounded`] and the
 /// SAME [`FlatFastloopExit`] resumable contract; the ONLY differences are the
-/// loop *organization* the disasm diff identified as the one remaining structural
-/// divergence vs libdeflate (`former plans/disasm/`, `project_aarch64_disasm_diff_2026_06_21`):
+/// loop *organization* that is the one remaining structural divergence vs
+/// libdeflate:
 ///   1. **No top-of-loop refill gate.** The baseline opens each iteration with
 ///      `if bitsleft < REFILL_THRESHOLD { refill }`; libdeflate instead WEAVES the
 ///      refills into the symbol chain (template lines 413/431/572). Every body path
@@ -1584,8 +1580,8 @@ pub(crate) fn decode_huffman_fastloop_bounded(
 /// libdeflate-faithful in the baseline (preload next litlen + refill before the
 /// copy) and is carried over unchanged.
 ///
-/// Gated AB only — selected at the call site by `pipelined_kernel_enabled()`;
-/// production default remains the baseline until a gated win flips it.
+/// Selected at the call site by `pipelined_kernel_enabled()`; the production
+/// default remains the baseline.
 ///
 /// # Safety contract
 /// Identical to [`decode_huffman_fastloop_bounded`].
@@ -1788,7 +1784,7 @@ pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
         // via the guard added above), so the low LITLEN_TABLEBITS index bits are
         // unchanged by the refill. The refill then tops bitbuf up for next iter.
         //
-        // GATE-A GUARD (2026-06-30): the reorder is byte-identical ONLY when
+        // Byte-identical guard: the reorder is byte-identical ONLY when
         // bitsleft >= LitLenTable::TABLE_BITS at THIS preload. Assert it loudly so
         // future cfg/code drift (e.g. a wider TABLE_BITS, or a change to the `<32`
         // guard or the subtable-offset guard refill above) TRIPS in debug/test
@@ -2187,8 +2183,7 @@ fn get_fixed_specialized_decoder(
 }
 
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
-    // Use the same fast path as dynamic Huffman for maximum speed
-    // The libdeflate-style path achieves 99% of libdeflate vs 69% for specialized path
+    // Use the same fast path as dynamic Huffman for maximum speed.
     let (litlen, dist) = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
@@ -2197,10 +2192,8 @@ fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<us
 /// `BFINAL|BTYPE` has been consumed) and return `(litlen_lengths,
 /// dist_lengths)`, leaving `bits` positioned at the block BODY.
 ///
-/// This is the single source of truth for the dynamic-header parse: `decode_dynamic`
-/// calls it, and the `kernel_ab_aarch64` Step-0.5 harness calls it to build the
-/// flat tables for the engine-A (libdeflate-style) decoder so the engine-A vs
-/// engine-B A/B starts both engines at the SAME body bit with tables pre-built.
+/// This is the single source of truth for the dynamic-header parse:
+/// `decode_dynamic` calls it.
 pub fn parse_dynamic_header(bits: &mut Bits) -> Result<(Vec<u8>, Vec<u8>)> {
     // Read dynamic Huffman table header
     if bits.available() < 14 {
@@ -2310,10 +2303,7 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
         &dist_lengths,
     );
 
-    // Use libdeflate-style decoder for all dynamic blocks
-    // This achieves 99-112% of libdeflate performance across all datasets.
-    // The specialized decoder was slower for match-heavy content (SOFTWARE, LOGS)
-    // due to its inline extra-bits handling vs libdeflate's saved_bitbuf pattern.
+    // Use libdeflate-style decoder for all dynamic blocks.
     SPEC_STATS.with(|s| s.borrow_mut().1 += 1);
     decode_dynamic_fallback(
         bits,
@@ -2972,12 +2962,10 @@ mod tests {
         }
     }
 
-    /// DISPROOF (advisor-required): does `Bits::at_bit_offset` (the bulk
-    /// clean-tail re-entry constructor) produce the SAME bit stream as the
-    /// marker phase's `Bits::new(&data[byte..]) + consume(skip)` construction,
-    /// for NON-byte-aligned offsets? The 29 resumable_fallbacks on silesia all
-    /// fire on the FIRST post-handoff block via `at_bit_offset`; resumable
-    /// succeeds from the SAME offset. If this test FAILS at some offset,
+    /// Does `Bits::at_bit_offset` (the bulk clean-tail re-entry constructor)
+    /// produce the SAME bit stream as the marker phase's
+    /// `Bits::new(&data[byte..]) + consume(skip)` construction, for
+    /// NON-byte-aligned offsets? If this test FAILS at some offset,
     /// `at_bit_offset` is the cursor-handoff bug.
     #[test]
     fn at_bit_offset_matches_new_plus_consume() {
@@ -3416,7 +3404,7 @@ mod tests {
         eprintln!("=====================================\n");
     }
 
-    /// SEAM DIFFERENTIAL (CLEAN-KERNEL-DESIGN §5): the bounded flat fastloop
+    /// SEAM DIFFERENTIAL: the bounded flat fastloop
     /// (`decode_huffman_fastloop_bounded`, the engine-A wire-in for the
     /// parallel-SM clean contig path) must be byte-exact AND cleanly RESUMABLE
     /// at EVERY output-budget boundary `k` — the cap may land inside a
