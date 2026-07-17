@@ -283,7 +283,6 @@ fn finish_decode_chunk_with_inexact_offset(
     inflate_start_bit: usize,
     stop_hint_bits: usize,
     initial_window: &[u8],
-    record_decode_duration: bool,
 ) -> Result<(), ChunkDecodeError> {
     finish_decode_chunk_impl(
         chunk,
@@ -291,7 +290,6 @@ fn finish_decode_chunk_with_inexact_offset(
         inflate_start_bit,
         stop_hint_bits,
         initial_window,
-        record_decode_duration,
         false,
     )
 }
@@ -303,7 +301,6 @@ fn finish_decode_chunk_impl(
     inflate_start_bit: usize,
     stop_hint_bits: usize,
     initial_window: &[u8],
-    record_decode_duration: bool,
     until_exact: bool,
 ) -> Result<(), ChunkDecodeError> {
     // DoS/OOM guard: bound decoded output to what this compressed input could
@@ -318,10 +315,7 @@ fn finish_decode_chunk_impl(
     // is pure-Rust ParallelSM at every T; C-FFI is compression-only per
     // CLAUDE.md). `finish_decode_chunk_isal_oracle` and `isal_incremental_growth`
     // were themselves deleted (x86-finish batch, 2026-07-07) — zero remaining
-    // callers once this branch was removed. The ISAL_ENGINE_ORACLE_* counters
-    // stay (still read by the `--verbose` dump in `chunk_fetcher.rs`) but
-    // are now permanently zero.
-    let t_decode = std::time::Instant::now();
+    // callers once this branch was removed.
 
     let read_cap = if until_exact {
         stop_hint_bits
@@ -496,10 +490,6 @@ fn finish_decode_chunk_impl(
         }
     }
 
-    if record_decode_duration {
-        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    }
-
     let final_bit = if until_exact {
         wrapper.tell_compressed()
     } else if stopping_point_reached {
@@ -551,9 +541,6 @@ fn decode_chunk_with_rapidgzip_impl(
 ) -> Result<ChunkData, ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
-    // Envelope span: `chunk_fetcher::run_decode_task` (`worker.decode_chunk`).
-    let t_decode = std::time::Instant::now();
-
     if initial_window.len() == MAX_WINDOW_SIZE {
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
@@ -585,7 +572,6 @@ fn decode_chunk_with_rapidgzip_impl(
                 initial_window,
             )?;
         }
-        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
         return Ok(chunk);
     }
 
@@ -593,7 +579,7 @@ fn decode_chunk_with_rapidgzip_impl(
     // STAGE-2d: the whole-file grid sets `configuration.multi_member`, selecting the
     // `MULTI_MEMBER=true` instantiation that walks member boundaries. Single-member
     // decode keeps `::<false>` (byte-identical — the continuation compiles out).
-    let mut chunk = if configuration.multi_member {
+    let chunk = if configuration.multi_member {
         decode_chunk_unified_marker::<true>(
             input,
             encoded_offset_bits,
@@ -608,7 +594,6 @@ fn decode_chunk_with_rapidgzip_impl(
             configuration,
         )?
     };
-    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     Ok(chunk)
 }
 
@@ -990,7 +975,6 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
                     end_bit_offset,
                     stop_hint_bits,
                     &clean_window,
-                    false,
                 )?;
                 return Ok(chunk);
             }
@@ -1722,8 +1706,8 @@ fn finish_decode_chunk_exact_block_native(
 }
 
 /// Vendor `decodeChunkWithInflateWrapper`-shaped envelope for the M4 Block
-/// route: fresh `ChunkData` + window-seeded exact decode + decode-duration
-/// accounting (mirror of `decode_chunk_with_inflate_wrapper`'s envelope).
+/// route: fresh `ChunkData` + window-seeded exact decode (mirror of
+/// `decode_chunk_with_inflate_wrapper`'s envelope).
 #[cfg(parallel_sm)]
 fn decode_chunk_exact_block_native(
     input: &[u8],
@@ -1732,7 +1716,6 @@ fn decode_chunk_exact_block_native(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    let t_decode = std::time::Instant::now();
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     finish_decode_chunk_exact_block_native(
         &mut chunk,
@@ -1741,7 +1724,6 @@ fn decode_chunk_exact_block_native(
         stop_hint_bits,
         initial_window,
     )?;
-    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     Ok(chunk)
 }
 
@@ -3479,15 +3461,8 @@ mod seeded_block_parity {
         cfg: ChunkConfiguration,
     ) -> ChunkData {
         let mut chunk = ChunkData::new(0, cfg);
-        finish_decode_chunk_with_inexact_offset(
-            &mut chunk,
-            input,
-            0,
-            stop_hint_bits,
-            window,
-            false,
-        )
-        .expect("seeded wrapper decode");
+        finish_decode_chunk_with_inexact_offset(&mut chunk, input, 0, stop_hint_bits, window)
+            .expect("seeded wrapper decode");
         chunk
     }
 
@@ -3932,8 +3907,7 @@ mod exact_block_parity {
         cfg: ChunkConfiguration,
     ) -> Result<ChunkData, ChunkDecodeError> {
         let mut chunk = ChunkData::new(0, cfg);
-        finish_decode_chunk_impl(&mut chunk, input, 0, stop_hint_bits, window, false, true)
-            .map(|()| chunk)
+        finish_decode_chunk_impl(&mut chunk, input, 0, stop_hint_bits, window, true).map(|()| chunk)
     }
 
     /// Enumerate non-final EOB boundaries `(bit, decoded_offset)` via the

@@ -47,16 +47,11 @@ pub struct Subchunk {
     pub used_window_symbols: Vec<bool>,
 }
 
-/// Per-chunk timing + counter statistics. Subset of rapidgzip's
+/// Per-chunk counter statistics. Subset of rapidgzip's
 /// `ChunkData::Statistics` (ChunkData.hpp:147-180); we surface only the
 /// counters used by bench-sm telemetry.
 #[derive(Debug, Default, Clone, Copy)]
-#[allow(dead_code)] // timing fields populated for future diagnostics
 pub struct ChunkStatistics {
-    pub decode_duration_ns: u64,
-    pub apply_window_duration_ns: u64,
-    pub compute_checksum_duration_ns: u64,
-    pub append_duration_ns: u64,
     pub marker_count: u64,
     pub non_marker_count: u64,
 }
