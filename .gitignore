@@ -74,3 +74,8 @@ artifacts/kernel-gate/
 scratchpad/
 artifacts/imatrix/
 artifacts/insnattr_postlutskip_m1_silesia_t1.json
+
+# Internal campaign run-outputs / process docs (not for the public repo)
+artifacts/
+score/
+plans/
