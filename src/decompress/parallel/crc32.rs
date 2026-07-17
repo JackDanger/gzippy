@@ -931,64 +931,6 @@ mod tests {
         assert_eq!(running, whole, "chained PMULL fold != single fold");
     }
 
-    /// Standalone GB/s microbench: PMULL fold vs `crc32x` fold3 on M1.
-    /// IGNORED in normal runs; invoke with
-    ///   cargo test --release --no-default-features --features pure-rust-inflate \
-    ///     -- --ignored --nocapture crc_pmull_vs_crc32x_gbps
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    #[ignore]
-    fn crc_pmull_vs_crc32x_gbps() {
-        if !hw_pmull::available() {
-            eprintln!("skip: no aes+crc");
-            return;
-        }
-        use std::time::Instant;
-        // ~4 MiB working set (cache-resident, the per-chunk CRC regime).
-        let n = 4 << 20;
-        let mut buf = vec![0u8; n];
-        let mut x: u32 = 0x1357_9BDF;
-        for b in buf.iter_mut() {
-            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            *b = (x >> 16) as u8;
-        }
-        let iters = 200usize;
-        // Warm + correctness cross-check before timing.
-        let a = unsafe { hw_pmull::crc32_arm_pmull(0, &buf) };
-        let b = unsafe { hw_crc::fold3(0, &buf) };
-        assert_eq!(a, b, "bench inputs disagree — refusing to report GB/s");
-
-        let bench = |f: &dyn Fn(u32, &[u8]) -> u32| -> f64 {
-            // best-of-7 to suppress scheduler noise. The running `acc` is fed
-            // back as the seed AND the buffer is black_box'd each iteration so
-            // the optimizer cannot CSE/hoist the pure call out of the loop
-            // (the phantom-GB/s trap). The seed dependency serializes calls.
-            let mut best = f64::INFINITY;
-            for _ in 0..7 {
-                let t = Instant::now();
-                let mut acc = 0u32;
-                for _ in 0..iters {
-                    acc = f(acc, std::hint::black_box(&buf));
-                }
-                std::hint::black_box(acc);
-                let s = t.elapsed().as_secs_f64();
-                if s < best {
-                    best = s;
-                }
-            }
-            (n as f64 * iters as f64) / best / 1e9
-        };
-        let pmull = bench(&|c, d| unsafe { hw_pmull::crc32_arm_pmull(c, d) });
-        let crc32x = bench(&|c, d| unsafe { hw_crc::fold3(c, d) });
-        eprintln!(
-            "CRC32 standalone microbench (M1, {} MiB x{iters}, best-of-7):",
-            n >> 20
-        );
-        eprintln!("  crc32x fold3  : {crc32x:7.2} GB/s");
-        eprintln!("  PMULL  fold12 : {pmull:7.2} GB/s");
-        eprintln!("  PMULL/crc32x  : {:.3}x", pmull / crc32x);
-    }
-
     /// The dispatched `crc32_fold` (aarch64 3-way `crc32x` interleave + tail,
     /// else crc32fast continuation) MUST equal crc32fast byte-for-byte across
     /// sizes that exercise the small-input path, the 3-way body, the

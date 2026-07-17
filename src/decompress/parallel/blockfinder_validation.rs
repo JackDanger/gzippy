@@ -508,45 +508,6 @@ impl<'a> DeflateBlockValidator<'a> {
             .next()
     }
 
-    /// Count validated DYNAMIC deflate block headers in `[start_bit, end_bit)`,
-    /// stopping as soon as `need` are found. DIAGNOSTIC-ONLY (the ignored
-    /// `marker_density_measure` test in `single_member.rs`) — not on any
-    /// production path.
-    ///
-    /// Kept as the instrument that FALSIFIED the "block-boundary density
-    /// separates marker-heavy from marker-dormant" hypothesis (2026-07-05):
-    /// measured mean dynamic-block gap logs=5 KiB / software=6 KiB /
-    /// silesia=25 KiB — the high-ratio "marker-heavy" corpora have DENSER
-    /// boundaries than silesia, so no density predicate can serialize them.
-    /// Counts DYNAMIC headers only (each candidate has passed
-    /// `validate_precode` + full canonical-Huffman validation); the stored
-    /// `LEN/~LEN` finder is excluded (16-bit coincidence, high false-positive
-    /// rate). Steps in bounded sub-windows; never materializes the whole
-    /// range's candidate set.
-    #[cfg(test)]
-    pub(crate) fn count_dynamic_boundaries_capped(
-        &self,
-        start_bit: usize,
-        end_bit: usize,
-        need: usize,
-    ) -> usize {
-        const SUBWINDOW_BITS: usize = 32 * 1024 * 8;
-        if need == 0 || start_bit >= end_bit {
-            return 0;
-        }
-        let mut count = 0usize;
-        let mut pos = start_bit;
-        while pos < end_bit {
-            let win_end = pos.saturating_add(SUBWINDOW_BITS).min(end_bit);
-            count += self.find_dynamic_blocks(pos, win_end).len();
-            if count >= need {
-                return count;
-            }
-            pos = win_end;
-        }
-        count
-    }
-
     /// Dynamic-Huffman block finder. Direct port of rapidgzip's
     /// `seekToNonFinalDynamicDeflateBlock` (DynamicHuffman.hpp:168-298) —
     /// the BRANCHLESS dual-sliding-bit-buffer scan.
