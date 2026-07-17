@@ -173,7 +173,7 @@ pub const EXIT_RECLASS_MARKER: u64 = 8; // src<out_base (window-absent backref �
 /// unit-testable. `enabled()` (env + CPU) is checked separately by the call
 /// site; this covers the per-call state.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)] // mirrors the knob list 1:1 (charter §3.5)
+#[allow(clippy::too_many_arguments)] // mirrors the knob list 1:1
 pub fn dispatch_allowed(
     prof_on: bool,
     oracle_nostore: bool,
@@ -517,7 +517,7 @@ mod imp {
                 //    so bits above the trailing are already 0 for every cnt. {t4}
                 //    is the scratch shift.
                 "lea {t4:e}, [{t3:e}*8 - 8]",         // shift = 8*(cnt-1)
-                "shrx {t5}, {t1}, {t4}",              // {t5} = trailing (clean; NIGHT34 igzip _04 0x38d25 converge: & 0xFFFF removed)
+                "shrx {t5}, {t1}, {t4}",              // {t5} = trailing (clean)
                 // ── SPECULATIVE STORE + advance by cnt (igzip 518-519),
                 //    UNCONDITIONAL: store the masked {t1} (bits 0..24) directly
                 //    and advance dst by the full sym_count assuming a pure-
@@ -698,7 +698,7 @@ mod imp {
                 // ── oversize trailing (>512): restore + RECLASS, tag by cnt
                 //    (lone → 0 via 8:, multi → 3 via 83:).
                 "30:",
-                "sub {d0}, {t3}",                     // NIGHT40 short oversize: d0 = top (cmp below re-sets flags)
+                "sub {d0}, {t3}",                     // short oversize: d0 = top (cmp below re-sets flags)
                 "cmp {t3:e}, 1",
                 "je 8f",                              // lone oversize → tag 0
                 "jmp 83f",                            // multi oversize → tag 3
@@ -876,7 +876,7 @@ mod imp {
                 "jg 71b",                             // remainder (> 0) → large
                 "74:",
                 "mov {dst}, {ret}",                   // dst advances by exactly length
-                "mov {ret}, 1",                       // NIGHT36: restore hoisted BOUNDARY ({ret} clobbered as copy cursor)
+                "mov {ret}, 1",                       // restore hoisted BOUNDARY ({ret} clobbered as copy cursor)
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
                 // The dist>=8 5-word SCALAR burst below is a large fraction of
@@ -970,7 +970,7 @@ mod imp {
                 "jmp 57b",
                 "59:",
                 "mov {dst}, {t2}",                    // dst advances by exactly length
-                "mov {ret}, 1",                       // NIGHT36: restore hoisted BOUNDARY ({ret} clobbered as scalar cursor)
+                "mov {ret}, 1",                       // restore hoisted BOUNDARY ({ret} clobbered as scalar cursor)
                 "mov {t1:e}, {t3:e}",                 // carried packet → top classify
                 "jmp 2b",
                 // ── RECLASS un-consume via FROM-DATA RE-READ (X2). The igzip-
@@ -1029,7 +1029,7 @@ mod imp {
                 "93:",
                 "mov {ret}, 8",                       // RECLASS marker (src<out_base; out of scope)
                 "jmp 85f",
-                "81:",                                // NIGHT40 short-EOB stub: d0 = top (was top+cnt snapshot)
+                "81:",                                // short-EOB stub: d0 = top (was top+cnt snapshot)
                 "sub {d0}, {t3}",
                 "82:",
                 "mov {ret}, 2",                       // RECLASS, lone-EOB tag (long EOB enters here, d0 already top)

@@ -381,7 +381,7 @@ mod tests {
         let Some(compressed) = crate::tests::datasets::load_silesia_gzip() else {
             eprintln!(
                 "corpus_silesia_if_available: benchmark_data/silesia-gzip.tar.gz \
-                 missing on this host; skipping. Run on neurotic for the \
+                 missing on this host; skipping. Run on the perf box for the \
                  production-shape decode."
             );
             return;

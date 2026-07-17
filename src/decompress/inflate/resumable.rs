@@ -184,8 +184,8 @@ impl SlidingWindow {
 
     /// Bulk-copy `n` bytes starting at logical position `start_logical`
     /// into `dst[..n]`. Handles the ring-buffer wrap with up to two
-    /// memcpys — LLVM lowers each to `memcpy` (SIMD'd by the libc on
-    /// neurotic). Caller guarantees `start_logical + n <= self.len()`.
+    /// memcpys — LLVM lowers each to `memcpy` (SIMD'd by the libc).
+    /// Caller guarantees `start_logical + n <= self.len()`.
     ///
     /// Replaces the per-byte `byte_at_logical` loop in
     /// `copy_match_windowed`'s slow path when the source range is
@@ -678,7 +678,7 @@ impl<'a> ResumableInflate2<'a> {
                             "ResumableInflate2 no-progress mid-body: \
                              bit_position={} cap={} block_state={:?} — \
                              a sub-decoder yielded without transitioning \
-                             state; refusing to silently truncate (advisor D4)",
+                             state; refusing to silently truncate",
                             self.bits.bit_position(),
                             self.encoded_until_bits,
                             self.block_state

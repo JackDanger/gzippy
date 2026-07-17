@@ -5730,7 +5730,7 @@ mod tests {
             assert_eq!(
                 written, expected,
                 "back-ref at distance=MAX_WINDOW_SIZE wrote {written:#x} at ring[{}] but expected literal {expected:#x} — \
-                 this would mean the advisor's bug claim is real",
+                 this would mean the invariant is violated",
                 MAX_WINDOW_SIZE + i
             );
             // And critically: the written value MUST NOT be a

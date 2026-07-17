@@ -858,7 +858,7 @@ mod tests {
     /// REAL-CORPUS correctness gate. Per memory rule
     /// `feedback-real-corpus-test-with-lever`: any new inner-decoder
     /// lever must include a silesia (or equivalent) differential test
-    /// IN THE SAME COMMIT as the lever.
+    /// in the same commit as the code it validates.
     #[test]
     fn decode_block_byte_perfect_silesia_if_available() {
         let candidates = [

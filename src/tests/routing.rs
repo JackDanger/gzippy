@@ -1112,7 +1112,7 @@ mod tests {
             block_after > block_before,
             "SEEDED_BLOCK_CHUNKS did not increment ({block_before} -> {block_after}); \
              window-seeded inexact chunks must decode on the ONE `deflate::Block` \
-             engine (M3, vendor GzipChunk.hpp:454-458)"
+             engine (window-seeded inexact path, vendor GzipChunk.hpp:454-458)"
         );
         assert_eq!(
             wrapper_after, wrapper_before,
@@ -1160,7 +1160,7 @@ mod tests {
             wrapper_after, wrapper_before,
             "EXACT_WRAPPER_CHUNKS moved ({wrapper_before} -> {wrapper_after}); an until-exact \
              chunk took the second engine (`StreamingInflateWrapper`) on gzippy-native \
-             without the kill-switch (M4, labeled deviation — see \
+             without the kill-switch (until-exact path, a labeled deviation — see \
              `finish_decode_chunk_exact_block_native`)"
         );
     }
@@ -1250,7 +1250,7 @@ mod tests {
              the asymmetric lookup_next_block_offset at chunk_fetcher.rs (mirror of \
              vendor BlockFetcher.hpp:533-535) is unreachable. Without this asymmetry, \
              the last prefetch in any file is skipped — visible on the 3-partition \
-             fixture as a 1.24-CPU serial bottleneck on a 16-core machine."
+             fixture as a serial bottleneck on a many-core machine."
         );
         #[cfg(not(parallel_sm))]
         let _ = (before, after);

@@ -83,9 +83,9 @@ fn isal_engine_oracle_enabled() -> bool {
     false
 }
 
-/// M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
-/// `deflate::Block` engine. Was previously kill-switchable via
-/// `GZIPPY_SEEDED_BLOCK=0` (restoring the pre-M3 wrapper path); the env
+/// Window-seeded INEXACT clean-decode engine: window-seeded INEXACT chunks
+/// decode on the ONE `deflate::Block` engine. Was previously kill-switchable via
+/// `GZIPPY_SEEDED_BLOCK=0` (restoring the older wrapper path); the env
 /// override was removed 2026-07-07 — hardcoded to the shipped
 /// default (ON). Production proof of which engine decoded each seeded chunk:
 /// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (`--verbose` dump).
@@ -94,7 +94,7 @@ fn seeded_block_enabled() -> bool {
     true
 }
 
-/// Whether the M3 seeded-Block route is taken for a window-seeded inexact
+/// Whether the seeded-Block route is taken for a window-seeded inexact
 /// chunk: always ON (see [`seeded_block_enabled`] — the
 /// `GZIPPY_ISAL_ENGINE_ORACLE` term was dropped 2026-07-07, confirmed no
 /// production ISA-L decode graph exists to preserve — single-member decode
@@ -104,9 +104,10 @@ fn seeded_block_route_enabled() -> bool {
     seeded_block_enabled()
 }
 
-/// M4 (DIV-1 part 2): window-seeded UNTIL-EXACT chunks decode on the ONE
+/// Window-seeded UNTIL-EXACT clean-decode engine (a labeled deviation from the
+/// vendor blueprint): window-seeded UNTIL-EXACT chunks decode on the ONE
 /// `deflate::Block` engine. Was previously kill-switchable via
-/// `GZIPPY_EXACT_BLOCK=0` (restoring the pre-M4 wrapper path); the env
+/// `GZIPPY_EXACT_BLOCK=0` (restoring the older wrapper path); the env
 /// override was removed 2026-07-07 — hardcoded to the shipped
 /// default (ON). Production proof of which engine decoded each exact chunk:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (`--verbose` dump).
@@ -115,7 +116,7 @@ fn exact_block_enabled() -> bool {
     true
 }
 
-/// Whether the M4 exact-Block route is taken for a window-seeded UNTIL-EXACT
+/// Whether the exact-Block route is taken for a window-seeded UNTIL-EXACT
 /// chunk: always ON (see [`exact_block_enabled`] — the
 /// `GZIPPY_ISAL_ENGINE_ORACLE` term was dropped 2026-07-07, confirmed no
 /// production ISA-L decode graph exists to preserve — single-member decode
@@ -152,7 +153,7 @@ pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ce
     const RESERVE_FLOOR: usize = 4 * 1024 * 1024; // never start below 4 MiB
     const RESERVE_CAP: usize = 64 * 1024 * 1024; // upfront ceiling; growth may exceed on demand
                                                  // RESIDENT-OUTPUT-POOL ORACLE (GZIPPY_RESIDENT_OUTPUT_POOL=1, byte-transparent,
-                                                 // MEASUREMENT-ONLY). Determination tool for BEAT-IGZIP-T1: pin EVERY chunk's
+                                                 // MEASUREMENT-ONLY). Pin EVERY chunk's
                                                  // upfront reserve to a single fixed size so all pooled output buffers share an
                                                  // IDENTICAL capacity. Combined with the manual LIFO pool (which retains Vec
                                                  // capacity via `clear()` instead of dropping), the recycled buffer is never
@@ -162,7 +163,7 @@ pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ce
     if crate::decompress::parallel::chunk_buffer_pool::resident_output_pool_enabled() {
         // Same value as RESERVE_CAP; the shared constant keeps
         // `SegmentedU8::ensure_buf`'s first-take capacity and this pin in
-        // lockstep (one source of truth — lever-2b relies on first-take ==
+        // lockstep (one source of truth — the fast path relies on first-take ==
         // pinned reserve so the buffer's FIRST allocation is already huge).
         return crate::decompress::parallel::chunk_buffer_pool::RESIDENT_PINNED_CAPACITY;
     }
@@ -250,7 +251,7 @@ pub fn decode_chunk_until_exact(
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
     if initial_window.len() == MAX_WINDOW_SIZE && until_exact {
-        // M4 (DIV-1 part 2): window-seeded UNTIL-EXACT chunks decode on the
+        // Window-seeded UNTIL-EXACT chunks decode on the
         // ONE `deflate::Block` engine (always ON — see `exact_block_route_enabled`).
         debug_assert!(exact_block_route_enabled());
         return decode_chunk_exact_block_native(
@@ -543,7 +544,7 @@ fn decode_chunk_with_rapidgzip_impl(
     if initial_window.len() == MAX_WINDOW_SIZE {
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
-            // M4 (DIV-1 part 2): until-exact decodes on the ONE `deflate::Block`
+            // Until-exact decodes on the ONE `deflate::Block`
             // engine (always ON — see `exact_block_route_enabled`; the wrapper
             // fallback arm this used to have was removed 2026-07-07).
             // See `finish_decode_chunk_exact_block_native` for the labeled
@@ -557,7 +558,7 @@ fn decode_chunk_with_rapidgzip_impl(
                 initial_window,
             )?;
         } else {
-            // M3 (DIV-1 part 1): window-seeded INEXACT chunks decode on the ONE
+            // Window-seeded INEXACT chunks decode on the ONE
             // `deflate::Block` engine (vendor GzipChunk.hpp:454-458; always ON —
             // see `seeded_block_route_enabled`; the wrapper fallback arm this
             // used to have was removed 2026-07-07) instead of the
@@ -1007,7 +1008,7 @@ fn decode_chunk_unified_marker<const MULTI_MEMBER: bool>(
 /// clean phase only. The isal two-phase path (`finish_decode_chunk_with_inexact_offset`)
 /// is unchanged.
 ///
-/// `until_exact` (M4, DIV-1 part 2) switches the stop condition from the
+/// `until_exact` (the until-exact clean-decode engine) switches the stop condition from the
 /// inexact "first block boundary at-or-past `stop_hint_bits`" to the EXACT
 /// contract of the wrapper arm (`finish_decode_chunk_impl` with
 /// `until_exact=true`, whose bit reader is hard-capped at `stop_hint_bits`
@@ -1379,7 +1380,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     })
 }
 
-/// M3 (DIV-1 part 1) — vendor `GzipChunk.hpp:454-458` (non-ISAL build):
+/// Window-seeded INEXACT clean-decode engine — vendor `GzipChunk.hpp:454-458` (non-ISAL build):
 ///
 /// ```c++
 /// auto block = std::make_shared<deflate::Block</* CRC32 */ false,
@@ -1409,8 +1410,8 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 ///
 /// This REPLACES `StreamingInflateWrapper`/`unified::Inflate`
 /// (inflate_wrapper.rs:153-161) on the gzippy-native window-seeded INEXACT
-/// path — the DIV-1 second clean engine. The until-exact path stays on the
-/// wrapper until M4 (its stopping-point/footer contract is pre-registered
+/// path — the second clean engine. The until-exact path stays on the
+/// wrapper until the until-exact engine (its stopping-point/footer contract is pre-registered
 /// there); the gzippy-isal clean-tail handoff is untouched (faithful
 /// rapidgzip WITH_ISAL, GzipChunk.hpp:440-444/520-526).
 ///
@@ -1595,7 +1596,7 @@ pub(crate) fn decode_multi_member_native(
 pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// M4 (DIV-1 part 2) — LABELED DEVIATION from the vendor blueprint.
+/// Window-seeded UNTIL-EXACT clean-decode engine — LABELED DEVIATION from the vendor blueprint.
 ///
 /// Vendor's exact-stop path is `decodeChunkWithInflateWrapper<ZlibInflateWrapper/
 /// IsalInflateWrapper>` (GzipChunk.hpp:192-265) — a C-FFI inflate wrapper, NOT
@@ -3175,7 +3176,7 @@ mod native_fold_parity {
 }
 
 // =========================================================================
-// M3 differential gate (DIV-1 part 1): seeded-Block vs seeded-wrapper
+// Window-seeded INEXACT differential gate: seeded-Block vs seeded-wrapper
 // =========================================================================
 // For window-seeded INEXACT chunks the gzippy-native production route moved
 // from `StreamingInflateWrapper`/`unified::Inflate` onto the ONE
@@ -3695,7 +3696,7 @@ mod seeded_block_parity {
 }
 
 // =========================================================================
-// M4 differential gate (DIV-1 part 2): exact-Block vs exact-wrapper
+// Window-seeded UNTIL-EXACT differential gate: exact-Block vs exact-wrapper
 // =========================================================================
 // For window-seeded UNTIL-EXACT chunks the gzippy-native production route
 // moved from `StreamingInflateWrapper`/`unified::Inflate` onto the ONE
