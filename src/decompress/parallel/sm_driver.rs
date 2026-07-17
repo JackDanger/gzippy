@@ -22,8 +22,7 @@
 //!
 //! The `GZIPPY_WINDOW_SPARSITY=1` kill-switch (which restored the old
 //! always-on behavior) was removed 2026-07-07 (batch 4f) — sparsity is always
-//! OFF (the faithful keepIndex=false default). Effect counter
-//! `SPARSITY_DECODE_COUNT` in `chunk_data` tracks actual executions.
+//! OFF (the faithful keepIndex=false default).
 
 /// Whether the pre-port always-on window-sparsity behavior is active.
 /// Hardcoded OFF (shipped default; the `GZIPPY_WINDOW_SPARSITY=1` kill-switch
