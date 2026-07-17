@@ -1933,27 +1933,13 @@ fn run_decode_task(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
-    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
+    // Retained for call-site/signature parity with vendor `decodeBlock`; the
+    // former `decodeAndMeasureBlock` timing that consumed it was removed.
+    _block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkArc, ChunkDecodeError> {
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
-
-    let t0 = std::time::Instant::now();
-
-    // Vendor's `decodeAndMeasureBlock` (BlockFetcher.hpp:649-672):
-    // record decode start timestamp, decode wall time, decode end
-    // timestamp. Drives the `Pool Efficiency` stat printed by
-    // --verbose at end-of-decode. Without this, all four timer
-    // entries in the stats dump are 0.0.
-    let task_start_secs = std::time::UNIX_EPOCH
-        .elapsed()
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    block_fetcher
-        .statistics
-        .base
-        .note_decode_block_start(task_start_secs);
 
     // Audit step 5: WindowMap is now Condvar-free (vendor
     // WindowMap.hpp:19-186 has no condition_variable). Workers do
@@ -2010,26 +1996,7 @@ fn run_decode_task(
 
     // Wrap in `ChunkArc` to match BlockFetcher's `Value` type (vendor's
     // `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
-    let result = chunk_result.map(SharedChunkData::new);
-
-    // Vendor's `decodeAndMeasureBlock` (BlockFetcher.hpp:660-672)
-    // accumulates the decode wall time per task and records the end
-    // timestamp.
-    let decode_elapsed = t0.elapsed().as_secs_f64();
-    block_fetcher
-        .statistics
-        .base
-        .add_decode_block_time(decode_elapsed);
-    let task_end_secs = std::time::UNIX_EPOCH
-        .elapsed()
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    block_fetcher
-        .statistics
-        .base
-        .note_decode_block_end(task_end_secs);
-
-    result
+    chunk_result.map(SharedChunkData::new)
 }
 
 /// True when pool post-process finished for this handoff (vendor

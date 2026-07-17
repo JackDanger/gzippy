@@ -98,7 +98,7 @@ where
             prefetch_cache: Mutex::new(Cache::new(prefetch_capacity)),
             prefetching: Mutex::new(HashMap::new()),
             fetching_strategy: Mutex::new(fetching_strategy),
-            statistics: ChunkFetcherStatistics::new(parallelization),
+            statistics: ChunkFetcherStatistics::new(),
             failed_prefetch: Mutex::new(HashSet::new()),
             parallelization,
         }
@@ -339,20 +339,7 @@ where
         // `try_take_prefetched_pumping`.
         W: FnMut(),
     {
-        // Vendor's `BlockFetcher::get` timing at BlockFetcher.hpp:280-322:
-        //   tGetStart = now();                            // line 280
-        //   ... wait on future ...
-        //   tFutureGetStart = now();                      // line 311
-        //   queuedResult.wait_for(1ms)*                   // line 314
-        //   futureGetDuration = duration(tFutureGetStart);
-        //   m_statistics.futureWaitTotalTime += futureGetDuration;  // line 324
-        //   m_statistics.getTotalTime += duration(tGetStart);       // line 325
-        let t_get_start = std::time::Instant::now();
-
         if let Some(v) = self.get_if_available(&block_offset) {
-            self.statistics
-                .base
-                .add_get_time(t_get_start.elapsed().as_secs_f64());
             return (Ok(v), 0);
         }
 
@@ -386,17 +373,10 @@ where
         // event (with a liveness fallback), re-filling the prefetch queue at
         // ~0 latency each time a worker frees up — converging to rg's blocking
         // consumer.
-        let t_future_wait_start = std::time::Instant::now();
         let value = loop {
             match rx.try_recv() {
                 Ok(Ok(v)) => break v,
                 Ok(Err(e)) => {
-                    self.statistics
-                        .base
-                        .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
-                    self.statistics
-                        .base
-                        .add_get_time(t_get_start.elapsed().as_secs_f64());
                     return (Err(e), prefetched);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -421,18 +401,12 @@ where
                 }
             }
         };
-        self.statistics
-            .base
-            .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
         // Lever G: do NOT insert into the cache after on-demand fetch.
         // See note at `try_take_prefetched` — the cache-insert held a
         // second Arc ref forcing the consumer's `Arc::try_unwrap` to
         // fail and deep-clone the ~MB-sized ChunkData. Vendor's cache
         // insert is only used to satisfy CONCURRENT lookups against
         // the same key, which the single-pass consumer never issues.
-        self.statistics
-            .base
-            .add_get_time(t_get_start.elapsed().as_secs_f64());
         (Ok(value), prefetched)
     }
 
