@@ -1402,13 +1402,6 @@ impl Block {
         if avail < n {
             return None; // truncated payload: keep the per-byte error path
         }
-        // PATH-ACCOUNTING (phase-timing): time the stored-block bulk-copy work
-        // (case1 ≥window / case2 crossing / case3 clean bulk). The rare
-        // markers+small fall-through below also runs under this guard but emits
-        // 0 bytes and no call increment.
-        let _pa_stored_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
-            crate::decompress::parallel::phase_timing::add_stored_special_ns,
-        );
         if n >= MAX_WINDOW_SIZE {
             // Case 1 (deflate.hpp:1214-1219). n <= 65535 < U8_RING_SIZE.
             // SAFETY: ring8 valid for [0, U8_RING_SIZE); n < U8_RING_SIZE;
@@ -1494,8 +1487,6 @@ impl Block {
         self.uncompressed_size = 0;
         self.decoded_bytes += n;
         self.at_end_of_block = true;
-        crate::decompress::parallel::phase_timing::add_stored_special(n as u64);
-        crate::decompress::parallel::phase_timing::inc_stored_special_calls();
         Some(n)
     }
 
@@ -1518,12 +1509,6 @@ impl Block {
         if let Some(n) = self.try_read_stored_special(bits) {
             return Ok(n);
         }
-        // PATH-ACCOUNTING (phase-timing): time the stored-block PER-BYTE
-        // fallback (special cases declined — truncated payload / markers+small).
-        let _pa_perbyte_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
-            crate::decompress::parallel::phase_timing::add_stored_perbyte_ns,
-        );
-        crate::decompress::parallel::phase_timing::inc_stored_perbyte_calls();
         // Stored blocks have no back-refs and no markers — every output
         // is a pure literal byte. We still write to the ring so the
         // public `read()` wrapper's drain emits these bytes in order
@@ -1553,7 +1538,6 @@ impl Block {
                 if self.ring.is_marker() {
                     self.ring.distance_to_last_marker += read_count;
                 }
-                crate::decompress::parallel::phase_timing::add_stored_perbyte(read_count as u64);
                 return Err(e);
             }
             let byte = (bits.peek() & 0xFF) as u16;
@@ -1583,7 +1567,6 @@ impl Block {
         if self.uncompressed_size == 0 {
             self.at_end_of_block = true;
         }
-        crate::decompress::parallel::phase_timing::add_stored_perbyte(read_count as u64);
         Ok(read_count)
     }
 
@@ -1956,23 +1939,6 @@ impl Block {
         let mut pos = *pos_io;
         let mut emitted = *emitted_io;
         let mut distance_marker = *distance_marker_io;
-        // PATH-ACCOUNTING (phase-timing): split marker-fast-loop output into
-        // literal vs back-ref bytes via non-atomic stack `Cell`s (zero cost per
-        // iteration); the guard flushes both counts + the whole-loop wall-time +
-        // one invocation on ANY exit (incl. the macro's internal returns).
-        #[cfg(feature = "phase-timing")]
-        let pa_mf_lit = std::cell::Cell::new(0u64);
-        #[cfg(feature = "phase-timing")]
-        let pa_mf_backref = std::cell::Cell::new(0u64);
-        #[cfg(feature = "phase-timing")]
-        let _pa_mf_guard = crate::decompress::parallel::phase_timing::PathPairGuard::new(
-            &pa_mf_lit,
-            &pa_mf_backref,
-            crate::decompress::parallel::phase_timing::add_mfast_lit,
-            crate::decompress::parallel::phase_timing::add_mfast_backref,
-            crate::decompress::parallel::phase_timing::add_mfast_ns,
-            crate::decompress::parallel::phase_timing::inc_mfast_calls,
-        );
         // ── Rung (d) increment 1 (git history (campaign plan, removed) §4/N1) ──────
         // The fast loop's distance decode goes through the libdeflate-shape
         // `DistTable` — ONE entry load + in-register `consume_entry` /
@@ -2003,26 +1969,6 @@ impl Block {
         // per backref below (the field-path SHARED borrow ends before the
         // `&mut self` sparsity call, so it cannot be hoisted across the loop).
         let in_end = bits.data.len();
-        // Store-elimination removal oracle (`storeprobe` feature): resolve
-        // the hot scratch sink's base pointer ONCE per invocation — exactly
-        // like `ring_ptr` above is a plain hoisted parameter, not
-        // re-resolved per iteration — so the per-symbol store below differs
-        // from baseline ONLY in its destination address, never in a
-        // per-iteration lookup cost. See `storeprobe.rs`.
-        #[cfg(feature = "storeprobe")]
-        let probe_sink_ptr = crate::decompress::parallel::storeprobe::sink_ptr();
-        // Diagnostic-only 2nd control (`storeprobe-stack`, OFF by default,
-        // mutually exclusive with `storeprobe`/`storeprobe-ctrl`): SAME
-        // relocation as `storeprobe` (small hot buffer instead of the
-        // ring) but via a plain on-stack array instead of a
-        // `thread_local!`-derived pointer — isolates whether a regression
-        // is caused by genuine memory/cache effects of relocating the
-        // store vs. by LLVM alias-analysis/codegen quality differing for a
-        // TLS-provenance pointer vs. an ordinary stack-local one.
-        #[cfg(feature = "storeprobe-stack")]
-        let mut probe_stack_sink: [u16; 68] = [0u16; 68];
-        #[cfg(feature = "storeprobe-stack")]
-        let probe_stack_ptr: *mut u16 = probe_stack_sink.as_mut_ptr();
         bits.refill();
         // WINDOW-ABSENT CONVERGE (Lever A): backstop-free `decode_prefilled`,
         // matching the clean asm path's litlen decode (chunk_decode contig path
@@ -2099,16 +2045,6 @@ impl Block {
                     }
                     $cur.consume(bit_count0);
 
-                    // Gate-2 Arm H (storedheavy sub-cause brief, `perturb`
-                    // feature, OFF by default): injected exactly here — AFTER
-                    // the litlen decode/consume completes, BEFORE the ring
-                    // write below — to test Huffman/bit-reader COMPUTE
-                    // sensitivity. See `perturb.rs`.
-                    #[cfg(feature = "perturb")]
-                    crate::decompress::parallel::perturb::maybe_inject(
-                        crate::decompress::parallel::perturb::ARM_H,
-                    );
-
                     // ── T3 MARKER-ILP LEVER #3: SPECULATIVE DIST-ENTRY PRELOAD ──
                     // Issue the FIRST-level distance table load NOW — right after
                     // the litlen `consume` shifts `$cur.bitbuf` so its low
@@ -2155,76 +2091,8 @@ impl Block {
                         let p = sym0 as u64;
                         let widened: u64 =
                             (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
-                        // Store-elimination removal oracle (`storeprobe`
-                        // feature, OFF by default; storedheavy sub-cause
-                        // brief, 2026-07-09): redirect this store to a
-                        // small L1-hot thread-local scratch buffer instead
-                        // of the 128 KiB ring, isolating the ring's
-                        // memory-spread cost from decode compute for a
-                        // gz-vs-gz wall A/B. BYTE-INEXACT when on (later
-                        // backref copies read stale ring content) — every
-                        // OTHER computation (`dst_phys`, `sym0`, `pos`,
-                        // `emitted`, `distance_marker`, loop trip count) is
-                        // untouched, so the decode stays live and iterates
-                        // identically to baseline. See `storeprobe.rs`.
-                        #[cfg(feature = "storeprobe")]
-                        {
-                            crate::decompress::parallel::storeprobe::probe_store_widened(
-                                probe_sink_ptr,
-                                dst_phys,
-                                widened,
-                            );
-                        }
-                        // Diagnostic-only CONTROL arm (`storeprobe-ctrl`,
-                        // OFF by default, mutually exclusive with
-                        // `storeprobe`): same destination/footprint as
-                        // baseline (the real 128 KiB ring, same address),
-                        // ONLY switched from `write_unaligned` to
-                        // `write_volatile` — isolates whatever cost
-                        // `write_volatile` itself adds (fence/ordering,
-                        // lost store-coalescing, etc.) from the cost of
-                        // relocating the store's destination, so a probe-
-                        // vs-baseline delta can be attributed correctly.
-                        #[cfg(all(
-                            feature = "storeprobe-ctrl",
-                            not(feature = "storeprobe"),
-                            not(feature = "storeprobe-stack")
-                        ))]
-                        {
-                            (ring_ptr.add(dst_phys) as *mut u64).write_volatile(widened);
-                        }
-                        // Diagnostic-only 2nd control (`storeprobe-stack`):
-                        // same relocation as `storeprobe` but via a plain
-                        // stack array — see the declaration-site doc above.
-                        #[cfg(all(
-                            feature = "storeprobe-stack",
-                            not(feature = "storeprobe"),
-                            not(feature = "storeprobe-ctrl")
-                        ))]
-                        {
-                            let idx = dst_phys & 63;
-                            (probe_stack_ptr.add(idx) as *mut u64).write_volatile(widened);
-                        }
-                        #[cfg(not(any(
-                            feature = "storeprobe",
-                            feature = "storeprobe-ctrl",
-                            feature = "storeprobe-stack"
-                        )))]
-                        {
-                            (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
-                        }
+                        (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
                     }
-
-                    // Gate-2 Arm M (storedheavy sub-cause brief, `perturb`
-                    // feature, OFF by default): injected exactly here —
-                    // immediately AFTER the widened u16 ring store above — to
-                    // test u16-store memory-BANDWIDTH sensitivity, isolated
-                    // from the litlen compute tested by Arm H. See
-                    // `perturb.rs`.
-                    #[cfg(feature = "perturb")]
-                    crate::decompress::parallel::perturb::maybe_inject(
-                        crate::decompress::parallel::perturb::ARM_M,
-                    );
 
                     // ── T3 MARKER-ILP LEVER (branchless leading-literal count) ──
                     // Replaces the per-symbol `while remaining > 0` walk (a serial
@@ -2258,8 +2126,6 @@ impl Block {
                     emitted += lit_prefix;
                     // Vendor: per clean literal `++m_distanceToLastMarkerByte`.
                     distance_marker += lit_prefix;
-                    #[cfg(feature = "phase-timing")]
-                    pa_mf_lit.set(pa_mf_lit.get() + lit_prefix as u64);
 
                     if have_trailing {
                         let code = trailing_code;
@@ -2409,8 +2275,6 @@ impl Block {
                                 self.record_backreference_for_sparsity(distance, length, emitted);
                             }
                             emitted += length;
-                            #[cfg(feature = "phase-timing")]
-                            pa_mf_backref.set(pa_mf_backref.get() + length as u64);
                         }
                     }
 
@@ -2550,20 +2414,6 @@ impl Block {
         let mut pos = *pos_io;
         let mut emitted = *emitted_io;
         let distance_marker = *distance_marker_io;
-        // PATH-ACCOUNTING (phase-timing): clean (post-flip) fast-loop split.
-        #[cfg(feature = "phase-timing")]
-        let pa_cf_lit = std::cell::Cell::new(0u64);
-        #[cfg(feature = "phase-timing")]
-        let pa_cf_backref = std::cell::Cell::new(0u64);
-        #[cfg(feature = "phase-timing")]
-        let _pa_cf_guard = crate::decompress::parallel::phase_timing::PathPairGuard::new(
-            &pa_cf_lit,
-            &pa_cf_backref,
-            crate::decompress::parallel::phase_timing::add_cfast_lit,
-            crate::decompress::parallel::phase_timing::add_cfast_backref,
-            crate::decompress::parallel::phase_timing::add_cfast_ns,
-            crate::decompress::parallel::phase_timing::inc_cfast_calls,
-        );
         let ring8_fast = ring8;
         let in_end = bits.data.len();
         // Preload (igzip pipeline): decode the first symbol before entering
@@ -2627,8 +2477,6 @@ impl Block {
             }
             pos += lit_prefix;
             emitted += lit_prefix;
-            #[cfg(feature = "phase-timing")]
-            pa_cf_lit.set(pa_cf_lit.get() + lit_prefix as u64);
 
             if have_trailing {
                 let code = trailing_code;
@@ -2707,8 +2555,6 @@ impl Block {
                     }
                     self.record_backreference_for_sparsity(distance, length, emitted);
                     emitted += length;
-                    #[cfg(feature = "phase-timing")]
-                    pa_cf_backref.set(pa_cf_backref.get() + length as u64);
                 }
             }
 
@@ -2769,25 +2615,11 @@ impl Block {
         let mut pos = *pos_io;
         let mut emitted = *emitted_io;
         let mut distance_marker = *distance_marker_io;
-        // PATH-ACCOUNTING (phase-timing): careful-tail bytes = the emitted
-        // delta produced by THIS call (entry `emitted` was carried in from the
-        // fast loop). Timer + one invocation over the whole call.
-        #[cfg(feature = "phase-timing")]
-        let pa_careful_start = emitted;
-        #[cfg(feature = "phase-timing")]
-        let _pa_careful_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
-            crate::decompress::parallel::phase_timing::add_careful_ns,
-        );
-        crate::decompress::parallel::phase_timing::inc_careful_calls();
         macro_rules! commit {
             ($result:expr) => {{
                 self.ring.pos = pos;
                 self.decoded_bytes += emitted;
                 self.ring.distance_to_last_marker = distance_marker;
-                #[cfg(feature = "phase-timing")]
-                crate::decompress::parallel::phase_timing::add_careful_bytes(
-                    (emitted - pa_careful_start) as u64,
-                );
                 return $result;
             }};
         }
@@ -2945,10 +2777,6 @@ impl Block {
         self.ring.pos = pos;
         self.decoded_bytes += emitted;
         self.ring.distance_to_last_marker = distance_marker;
-        #[cfg(feature = "phase-timing")]
-        crate::decompress::parallel::phase_timing::add_careful_bytes(
-            (emitted - pa_careful_start) as u64,
-        );
         Ok(emitted)
     }
 
@@ -3174,19 +3002,10 @@ impl Block {
 
         let mut emitted: usize = 0;
 
-        // PATH-ACCOUNTING (phase-timing): window-PRESENT contiguous clean decode
-        // (incl. the asm-kernel `run_contig` path). `emitted` starts at 0 and is
-        // this call's byte count. Timer + one invocation over the whole call.
-        let _pa_contig_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
-            crate::decompress::parallel::phase_timing::add_contig_ns,
-        );
-        crate::decompress::parallel::phase_timing::inc_contig_calls();
-
         macro_rules! commit {
             ($result:expr) => {{
                 let __r: Result<usize, BlockError> = $result;
                 self.decoded_bytes += emitted;
-                crate::decompress::parallel::phase_timing::add_contig_bytes(emitted as u64);
                 return __r;
             }};
         }
@@ -3474,7 +3293,6 @@ impl Block {
                     sync_local_bits!();
                     let __r: Result<usize, BlockError> = $result;
                     self.decoded_bytes += emitted;
-                    crate::decompress::parallel::phase_timing::add_contig_bytes(emitted as u64);
                     return __r;
                 }};
             }
@@ -3972,7 +3790,6 @@ impl Block {
             }
         }
         self.decoded_bytes += emitted;
-        crate::decompress::parallel::phase_timing::add_contig_bytes(emitted as u64);
         Ok(emitted)
     }
 
@@ -4022,13 +3839,6 @@ impl Block {
         if !stored_flip_disabled() {
             let avail = (bits.available() / 8) as usize + (bits.data.len() - bits.pos);
             if avail >= to_read {
-                // PATH-ACCOUNTING (phase-timing): window-PRESENT stored bulk
-                // copy — same `read_stored_bytes_aligned` bulk operation as the
-                // ring path's `try_read_stored_special`, folded into the same
-                // STORED-bulk bucket.
-                let _pa_stored_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
-                    crate::decompress::parallel::phase_timing::add_stored_special_ns,
-                );
                 // SAFETY: `base` valid for [0, cap); `to_read <= spare = cap -
                 // *pos`; `bits.data` and the chunk buffer never alias.
                 let dst = unsafe { std::slice::from_raw_parts_mut(base.add(*pos), to_read) };
@@ -4043,22 +3853,14 @@ impl Block {
                 STORED_CONTIG_BULK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 #[cfg(test)]
                 STORED_CONTIG_BULK_TL.with(|c| c.set(c.get() + 1));
-                crate::decompress::parallel::phase_timing::add_stored_special(to_read as u64);
-                crate::decompress::parallel::phase_timing::inc_stored_special_calls();
                 return Ok(to_read);
             }
         }
-        // PATH-ACCOUNTING (phase-timing): window-PRESENT stored per-byte fallback.
-        let _pa_perbyte_guard = crate::decompress::parallel::phase_timing::PhaseGuard::new(
-            crate::decompress::parallel::phase_timing::add_stored_perbyte_ns,
-        );
-        crate::decompress::parallel::phase_timing::inc_stored_perbyte_calls();
         let mut read_count: usize = 0;
         for _ in 0..to_read {
             if let Err(e) = ensure_bits(bits, 8) {
                 self.uncompressed_size -= read_count;
                 self.decoded_bytes += read_count;
-                crate::decompress::parallel::phase_timing::add_stored_perbyte(read_count as u64);
                 return Err(e);
             }
             let byte = (bits.peek() & 0xFF) as u8;
@@ -4075,7 +3877,6 @@ impl Block {
         if self.uncompressed_size == 0 {
             self.at_end_of_block = true;
         }
-        crate::decompress::parallel::phase_timing::add_stored_perbyte(read_count as u64);
         Ok(read_count)
     }
 }

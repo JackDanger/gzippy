@@ -74,40 +74,6 @@ default = ["pure-rust-inflate"]
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation
-# Diagnostic phase-breakdown emitter (mirrors the `coz` feature's wiring
-# style: OFF by default, every call site compiles to a true no-op without
-# it). Instruments 6 exact sites in `src/decompress/parallel/chunk_fetcher.rs`
-# and emits one JSON line per decode (see `phase_timing.rs`) consumed by
-# `fulcrum phasebreak`. NEVER in the default/CI feature set — diagnostic
-# only; zero effect on production decode bytes or timing.
-phase-timing = []
-# Gate-2 causal-perturbation instrument (storedheavy sub-cause brief,
-# 2026-07-09): injects a calibrated, env-selected delay at one of two named
-# sites in the worker marker-decode fast loop (`GZIPPY_PERTURB_ARM=H|M`,
-# `GZIPPY_PERTURB_NS=<u64>`) to discriminate compute-bound (H) vs
-# u16-store-bandwidth-bound (M) vs scheduling. OFF by default; every call
-# site is a true no-op without it. See `perturb.rs`.
-perturb = []
-# Store-elimination removal oracle (storedheavy sub-cause brief, 2026-07-09):
-# redirects the marker-fast-loop widened-literal ring store to a small
-# L1-hot thread-local scratch buffer (128 bytes vs the ring's 128 KiB),
-# isolating the ring's memory-spread cost from decode compute. BYTE-INEXACT
-# when on (output is garbage) — OFF by default, NEVER in prod, never in the
-# default/CI feature set. See `storeprobe.rs`.
-storeprobe = []
-# Diagnostic-only control for `storeprobe`: same store DESTINATION as
-# baseline (the real ring, same address/footprint), only switched from
-# `write_unaligned` to `write_volatile` — isolates the cost of the
-# volatile-write mechanism itself from the cost of relocating the store.
-# Mutually exclusive with `storeprobe`. OFF by default, never in prod.
-storeprobe-ctrl = []
-# 2nd diagnostic control for `storeprobe`: relocates the store to a small
-# hot buffer LIKE `storeprobe`, but via a plain on-stack array instead of a
-# `thread_local!`-derived pointer — isolates genuine memory/cache effects
-# of relocating the store from LLVM alias-analysis/codegen differences
-# tied to TLS pointer provenance. Mutually exclusive with `storeprobe`/
-# `storeprobe-ctrl`. OFF by default, never in prod.
-storeprobe-stack = []
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the
 # parallel-SM decode so `coz run` can measure per-region wall-elasticity
 # (∂wall/∂speed). OFF by default — no fulcrum dep, probes compile to no-ops.
