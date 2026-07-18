@@ -379,8 +379,17 @@ impl GzippyArgs {
                             args.no_time = false;
                         }
                         '0'..='9' => {
-                            let level = chars[j] as u8 - b'0';
-                            args.compression_level = level;
+                            // Consume ALL consecutive digits so a multi-digit level
+                            // (`-10`/`-11`/`-12`) parses as ONE number. Previously each
+                            // digit was its own single-digit level flag, so `-12` set
+                            // level 1 then 2 (last-wins) and `-10` set level 0 (stored) —
+                            // levels 10-12 were unreachable via the `-N` short form.
+                            let start = j;
+                            while j + 1 < chars.len() && chars[j + 1].is_ascii_digit() {
+                                j += 1;
+                            }
+                            let num: String = chars[start..=j].iter().collect();
+                            args.compression_level = parse_compression_level(&num)?;
                         }
                         'I' => args.zopfli_no_split = true,
                         'b' | 'p' | 'S' | 'C' | 'A' | 'F' | 'J' => {
