@@ -1,64 +1,77 @@
 # =============================================================================
-# Build & Test: Core CI pipeline
+# CI: the push/PR gate. Lean and correctness-only — no benchmarks.
 # =============================================================================
-# - Builds gzippy on Linux and macOS (4 platforms)
-# - Runs unit tests
-# - Validates against pigz/gzip output
-# - Tests edge cases (empty files, all levels, all thread counts)
-# - Tests large files (>4MB) for mmap/BGZF/parallel decompression paths
-# - Tests filesystem edge cases (symlinks, FIFOs, hard links, .tgz)
-# - Tests CRC32/ISIZE trailer validation and corruption detection
-# - Runs linting (fmt, clippy)
+# - Build + unit tests on 4 platforms (linux x86_64/arm64, macOS x86_64/arm64)
+# - Gate-4 production-path assertion (single-member decode => ParallelSM)
+# - pure-rust-inflate test lane (the sole-production-decode-path routing trap)
+# - Zopfli corpus oracle (byte-for-byte vs vendored C zopfli)
+# - Integration suite on the built binary (edge cases, large files, multi-member,
+#   cross-tool gzip/pigz, CRC/ISIZE/truncation integrity, filesystem edge cases)
+# - Lint (fmt, clippy, version consistency)
+#
+# Performance benchmarks + perf guards live in benchmarks.yml (nightly cron +
+# manual dispatch, informational only). Shared CI runners are too noisy for
+# perf verdicts to gate a push.
 # =============================================================================
-name: Build & Test
+name: CI
 
+# push-only (all branches): check runs attach to the commit SHA, so a PR's
+# checks tab shows the branch-push run — a `pull_request` trigger would run
+# CI a second time on every commit of every open same-repo PR (the old setup
+# double-ran everything). If fork PRs ever matter, re-add `pull_request:`
+# with a head-repo != base-repo job guard.
 on:
   push:
-    branches: ["**"]  # All branches (** matches slashes; * does not)
-  pull_request:
-    branches: ["**"]  # All PRs
+    branches: ["**"] # ** matches slashed branch names; * does not
+  workflow_dispatch:
 
-# Minimal permissions for security (validate job overrides for PR comments)
 permissions:
   contents: read
+
+# Rapid successive pushes to one branch: cancel the stale run, keep the newest.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # `.cargo/config.toml` pins `target-cpu=native` for local perf work. That
+  # bakes the build runner's ISA into the artifact; the integration job then
+  # runs it on a *different* shared runner and SIGILLs (exit 132) whenever that
+  # CPU is older. Build portable, generic codegen in CI — runtime BMI2/AVX2
+  # dispatch + ISA-L multibinary still pick fast paths at run time.
+  # Must be RUSTFLAGS, not CARGO_BUILD_RUSTFLAGS: cargo ignores an empty
+  # CARGO_BUILD_* var (falls back to config's build.rustflags), while a
+  # defined-but-empty RUSTFLAGS clears it (verified on cargo 1.97).
+  RUSTFLAGS: ""
 
 jobs:
-  build:
-    name: Build ${{ matrix.os }} ${{ matrix.arch }}
+  test:
+    name: Build & Test ${{ matrix.os }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
           - os: linux
             arch: x86_64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          # Linux ARM64
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          # macOS x86_64
           - os: macos
             arch: x86_64
-            runner: macos-15
-            target: x86_64-apple-darwin
-          # macOS ARM64 (Apple Silicon)
+            runner: macos-15-intel
           - os: macos
             arch: arm64
             runner: macos-latest
-            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true  # vendor/isa-l, vendor/isal-rs, pigz, … (not recursive — gzip gnulib)
+          submodules: true # vendor/isa-l, vendor/pigz, … (not recursive)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -79,24 +92,47 @@ jobs:
 
       - name: Build release
         run: |
+          # Build the PRODUCT decode flavor: gzippy-native => pure-rust-inflate
+          # => parallel_sm cfg, so the uploaded artifact AND the unit tests
+          # below exercise the shipped ParallelSM decoder. x86_64-linux also
+          # layers ISA-L *compression* (T1 L0–L3); the two features coexist.
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cargo build --release --features isal-compression
+            cargo build --release --features gzippy-native,isal-compression
           else
-            cargo build --release
+            cargo build --release --features gzippy-native
           fi
+
+      - name: Gate-4 production-path assertion (single-member => ParallelSM)
+        run: |
+          # The shipped flavor must decode single-member via ParallelSM, never
+          # silently regress to a libdeflate one-shot. Fail the job if not.
+          printf 'gate4 production-path assertion fixture\n%.0s' {1..4096} \
+            | ./target/release/gzippy -c > /tmp/gate4-sm.gz
+          DBG=$(GZIPPY_DEBUG=1 ./target/release/gzippy -d -c /tmp/gate4-sm.gz 2>&1 >/dev/null)
+          echo "$DBG"
+          echo "$DBG" | grep -q 'path=ParallelSM' || {
+            echo "::error::Gate-4 FAILED: single-member decode is NOT ParallelSM (shipped flavor regressed)."
+            exit 1
+          }
+          echo "Gate-4 OK: single-member decode routes to ParallelSM"
 
       - name: Run unit tests
         run: |
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cargo test --release --features isal-compression
+            cargo test --release --features gzippy-native,isal-compression
           else
-            cargo test --release
+            cargo test --release --features gzippy-native
           fi
 
-      # Phase 11.2 corpus oracle. Compares zopfli_pure's output to the
-      # vendored C zopfli reference byte-for-byte across a fixed corpus
-      # and a tuning matrix. Doubles as the Phase 11.3 arm64 ULP audit:
-      # if entropy floats drift on this arch, the oracle catches it here.
+      # Pure-Rust-inflate lane — exercises the unified-decoder routing trap
+      # (`tests::routing::unified_inflate_path_runs_on_parallel_sm`) and, on
+      # arm64, the only CI coverage of the arm64 parallel-SM pure-Rust path.
+      - name: Run unit tests (pure-rust-inflate)
+        if: ${{ (matrix.os == 'linux' && matrix.arch == 'x86_64') || matrix.arch == 'arm64' }}
+        run: cargo test --release --no-default-features --features pure-rust-inflate
+
+      # Corpus oracle: zopfli_pure output must match the vendored C zopfli
+      # byte-for-byte. Doubles as the arm64 entropy-float ULP audit.
       - name: Init vendor/zopfli for corpus oracle
         run: git submodule update --init vendor/zopfli
 
@@ -109,816 +145,217 @@ jobs:
           name: gzippy-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release/gzippy
 
-  build-gate:
-    name: build
+  # ===========================================================================
+  # Integration: one job, one prebuilt binary, no cargo rebuilds. Consolidates
+  # the former edge-cases / large-file-roundtrip / filesystem-edge-cases /
+  # integrity-validation / cross-compatibility jobs.
+  # ===========================================================================
+  integration:
+    name: Integration (correctness)
     runs-on: ubuntu-latest
-    needs: build
-    if: always()
-    steps:
-      - name: All builds passed
-        run: |
-          if [[ "${{ needs.build.result }}" == "success" ]]; then
-            echo "All platform builds passed"
-          else
-            echo "One or more builds failed or were cancelled"
-            exit 1
-          fi
-
-  validate:
-    name: Validate vs pigz/gzip
-    runs-on: ubuntu-latest
-    needs: build
-    # Permissions needed for PR comments
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
+    timeout-minutes: 20
+    needs: test
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install pigz
+        run: sudo apt-get update && sudo apt-get install -y pigz
+
+      - uses: actions/download-artifact@v8
         with:
-          submodules: true  # Only direct submodules (pigz)
+          name: gzippy-linux-x86_64
+          path: ./bin
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
+      - name: Setup
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm autoconf automake libtool
+          chmod +x ./bin/gzippy
+          echo "$PWD/bin" >> "$GITHUB_PATH"
 
-      - name: Build gzippy
+      - name: Edge cases (empty, small, stdin, levels, threads)
         run: |
-          cargo build --release --features isal-compression
-
-      - name: Create ungzippy symlink
-        run: ln -sf gzippy target/release/ungzippy
-
-      - name: Build pigz
-        run: make -C vendor/pigz
-
-      - name: Run validation matrix
-        run: |
-          CORES=$(nproc)
-          echo "Running validation with $CORES cores available"
-          echo "Testing: text (compressible), random (incompressible), tarball (mixed)"
-
-          # 10MB test files, 5 trials for statistical significance
-          python3 scripts/validate_ci.py \
-            --size 10 \
-            --trials 5 \
-            --output validation-results.json
-
-      - name: Generate summary
-        run: |
-          python3 scripts/validation_summary.py validation-results.json --format github >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload validation results
-        uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: validation-results
-          path: validation-results.json
-
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
-        continue-on-error: true  # Don't fail the build if commenting fails
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            const { execSync } = require('child_process');
-
-            // Generate the summary
-            const summary = execSync('python3 scripts/validation_summary.py validation-results.json --format github').toString();
-
-            // Find existing comment from this workflow
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            const botComment = comments.find(comment =>
-              comment.user.type === 'Bot' &&
-              comment.body.includes('gzippy Validation Results')
-            );
-
-            const body = summary + '\n\n---\n*Updated by CI on ' + new Date().toISOString() + '*';
-
-            if (botComment) {
-              // Update existing comment
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: body
-              });
-            } else {
-              // Create new comment
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: body
-              });
-            }
-
-  edge-cases:
-    name: Edge Cases (empty, small, levels, threads)
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install ISA-L build deps
-        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
-
-      - name: Build gzippy
-        run: |
-          cargo build --release --features isal-compression
-
-      - name: Test empty file
-        run: |
-          touch /tmp/empty.txt
-          cat /tmp/empty.txt | ./target/release/gzippy > /tmp/empty.txt.gz
-          cat /tmp/empty.txt.gz | ./target/release/gzippy -d > /tmp/empty.out
+          set -x
+          # Empty file
+          : > /tmp/empty.txt
+          gzippy -c /tmp/empty.txt | gzippy -d > /tmp/empty.out
           diff /tmp/empty.txt /tmp/empty.out
-          echo "✓ Empty file works"
 
-      - name: Test small file (100 bytes)
-        run: |
+          # 100-byte random file
           head -c 100 /dev/urandom > /tmp/small.bin
-          cat /tmp/small.bin | ./target/release/gzippy > /tmp/small.bin.gz
-          cat /tmp/small.bin.gz | ./target/release/gzippy -d > /tmp/small.out
+          gzippy -c /tmp/small.bin | gzippy -d > /tmp/small.out
           diff /tmp/small.bin /tmp/small.out
-          echo "✓ Small file works"
 
-      - name: Test stdin streaming
-        run: |
-          head -c 1000000 /dev/urandom > /tmp/stdin_test.bin
-          cat /tmp/stdin_test.bin | ./target/release/gzippy | ./target/release/gzippy -d > /tmp/stdin_test.out
-          diff /tmp/stdin_test.bin /tmp/stdin_test.out
-          echo "✓ Stdin streaming works"
+          # 1MB stdin streaming
+          head -c 1000000 /dev/urandom > /tmp/stdin.bin
+          cat /tmp/stdin.bin | gzippy | gzippy -d > /tmp/stdin.out
+          diff /tmp/stdin.bin /tmp/stdin.out
 
-      - name: Test all compression levels (1-9)
-        run: |
-          head -c 100000 /dev/urandom > /tmp/levels_test.bin
-          for level in 1 2 3 4 5 6 7 8 9; do
-            cat /tmp/levels_test.bin | ./target/release/gzippy -$level > /tmp/levels_test.gz
-            cat /tmp/levels_test.gz | ./target/release/gzippy -d > /tmp/levels_test.out
-            diff /tmp/levels_test.bin /tmp/levels_test.out
-            echo "✓ Level $level works"
+          # All compression levels 1-12 + --ultra/--max
+          head -c 100000 /dev/urandom > /tmp/lvl.bin
+          for level in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            gzippy --level $level -c /tmp/lvl.bin | gzippy -d > /tmp/lvl.out
+            diff /tmp/lvl.bin /tmp/lvl.out
           done
+          gzippy --ultra -c /tmp/lvl.bin | gzippy -d > /tmp/lvl.out
+          diff /tmp/lvl.bin /tmp/lvl.out
+          gzippy --max -c /tmp/lvl.bin | gzippy -d > /tmp/lvl.out
+          diff /tmp/lvl.bin /tmp/lvl.out
 
-      - name: Test ultra compression levels (10-12)
-        run: |
-          head -c 100000 /dev/urandom > /tmp/ultra_test.bin
-          for level in 10 11 12; do
-            cat /tmp/ultra_test.bin | ./target/release/gzippy --level $level > /tmp/ultra_test.gz
-            cat /tmp/ultra_test.gz | ./target/release/gzippy -d > /tmp/ultra_test.out
-            diff /tmp/ultra_test.bin /tmp/ultra_test.out
-            echo "✓ Level $level works"
-          done
-          # Also test --ultra and --max flags
-          cat /tmp/ultra_test.bin | ./target/release/gzippy --ultra > /tmp/ultra_test.gz
-          cat /tmp/ultra_test.gz | ./target/release/gzippy -d > /tmp/ultra_test.out
-          diff /tmp/ultra_test.bin /tmp/ultra_test.out
-          echo "✓ --ultra flag works"
-          cat /tmp/ultra_test.bin | ./target/release/gzippy --max > /tmp/ultra_test.gz
-          cat /tmp/ultra_test.gz | ./target/release/gzippy -d > /tmp/ultra_test.out
-          diff /tmp/ultra_test.bin /tmp/ultra_test.out
-          echo "✓ --max flag works"
-
-      - name: Test thread counts
-        run: |
-          head -c 1000000 /dev/urandom > /tmp/threads_test.bin
+          # Thread counts (compress + decompress), gzip cross-reads each output
+          head -c 1000000 /dev/urandom > /tmp/thr.bin
           for threads in 1 2 4 8; do
-            cat /tmp/threads_test.bin | ./target/release/gzippy -9 -p$threads > /tmp/threads_test.gz
-            cat /tmp/threads_test.gz | ./target/release/gzippy -d > /tmp/threads_test.out
-            diff /tmp/threads_test.bin /tmp/threads_test.out
-            echo "✓ $threads threads works"
+            gzippy -9 -p$threads -c /tmp/thr.bin > /tmp/thr.gz
+            gzippy -d -p$threads < /tmp/thr.gz > /tmp/thr.out
+            diff /tmp/thr.bin /tmp/thr.out
+            gzip -d < /tmp/thr.gz > /tmp/thr.gzip.out
+            diff /tmp/thr.bin /tmp/thr.gzip.out
           done
+          echo "edge cases OK"
 
-      - name: Test gzip/gunzip compatibility
+      - name: Large-file roundtrips (mmap/BGZF/parallel single-member paths)
         run: |
-          head -c 100000 /dev/urandom > /tmp/compat_test.bin
-          # gzippy compress → gzip decompress
-          cat /tmp/compat_test.bin | ./target/release/gzippy | gzip -d > /tmp/compat_test.out
-          diff /tmp/compat_test.bin /tmp/compat_test.out
-          echo "✓ gzippy→gzip works"
-          # gzip compress → gzippy decompress
-          gzip -c /tmp/compat_test.bin | ./target/release/gzippy -d > /tmp/compat_test.out2
-          diff /tmp/compat_test.bin /tmp/compat_test.out2
-          echo "✓ gzip→gzippy works"
-
-  # ===========================================================================
-  # Large file tests: exercises mmap/BGZF and parallel decompression paths
-  # Files >4MB trigger the BGZF mmap path and (with the parallel-decompress
-  # branch) the parallel single-member decompression pipeline
-  # ===========================================================================
-  large-file-roundtrip:
-    name: Large File Roundtrip (${{ matrix.size }}MB, L${{ matrix.level }}, T${{ matrix.threads }})
-    runs-on: ubuntu-latest
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # 8MB compressible text - exercises mmap/BGZF path
-          - size: 8
-            type: text
-            level: 1
-            threads: 1
-          - size: 8
-            type: text
-            level: 6
-            threads: 4
-          - size: 8
-            type: text
-            level: 9
-            threads: 1
-          # 20MB mixed data - realistic tarball, parallel decompression
-          - size: 20
-            type: tarball
-            level: 6
-            threads: 1
-          - size: 20
-            type: tarball
-            level: 6
-            threads: 4
-          # 50MB compressible - stress test parallel paths
-          - size: 50
-            type: text
-            level: 1
-            threads: 4
-          - size: 50
-            type: text
-            level: 6
-            threads: 1
-          # 8MB random/incompressible - edge case for compression ratio
-          - size: 8
-            type: random
-            level: 1
-            threads: 2
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install ISA-L build deps
-        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
-
-      - name: Build gzippy
-        run: |
-          cargo build --release --features isal-compression
-
-      - name: Generate test data (${{ matrix.size }}MB ${{ matrix.type }})
-        run: |
-          SIZE_BYTES=$(( ${{ matrix.size }} * 1024 * 1024 ))
-          case "${{ matrix.type }}" in
-            text)
-              # Highly compressible repeated text (exercises literal-heavy decode)
-              python3 -c "
+          set -x
+          # 20MB realistic tarball + 30MB compressible text
+          tar cf - /usr/share 2>/dev/null | head -c $((20 * 1024 * 1024)) > /tmp/big_tar.bin
+          python3 -c "
           import random, sys
           random.seed(42)
-          target = $SIZE_BYTES
-          written = 0
-          while written < target:
+          w = 0
+          while w < 30 * 1024 * 1024:
               line = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz ', k=100)) + '\n'
               sys.stdout.buffer.write(line.encode())
-              written += len(line)
-          " > /tmp/test_input.bin
-              ;;
-            tarball)
-              # Tarball from /usr (mixed binary/text, realistic)
-              tar cf - /usr/share 2>/dev/null | head -c $SIZE_BYTES > /tmp/test_input.bin
-              ;;
-            random)
-              # Incompressible random data
-              head -c $SIZE_BYTES /dev/urandom > /tmp/test_input.bin
-              ;;
-          esac
-          ACTUAL=$(stat -c%s /tmp/test_input.bin)
-          echo "Generated ${{ matrix.type }} data: $ACTUAL bytes"
+              w += len(line)
+          " > /tmp/big_text.bin
 
-      - name: Compress with gzippy (file-based, exercises mmap path)
-        run: |
-          # Natural roundtrip: compress removes original, decompress restores it
-          # This avoids FNAME conflicts (branches that store original filename in gzip header)
-          cp /tmp/test_input.bin /tmp/test_roundtrip.bin
-          ./target/release/gzippy -${{ matrix.level }} -p${{ matrix.threads }} /tmp/test_roundtrip.bin
-          ls -la /tmp/test_roundtrip.bin.gz
-          echo "Compressed: $(stat -c%s /tmp/test_roundtrip.bin.gz) bytes"
-          # Save a copy for cross-tool test
-          cp /tmp/test_roundtrip.bin.gz /tmp/test_gzippy_output.gz
-
-      - name: Decompress with gzippy (file-based, exercises mmap/BGZF path)
-        run: |
-          # Decompress in place (natural roundtrip)
-          ./target/release/gzippy -d -p${{ matrix.threads }} /tmp/test_roundtrip.bin.gz
-          diff /tmp/test_input.bin /tmp/test_roundtrip.bin
-          echo "✓ File-based roundtrip: ${{ matrix.size }}MB ${{ matrix.type }} L${{ matrix.level }} T${{ matrix.threads }}"
-
-      - name: Decompress with gzip (cross-tool validation)
-        run: |
-          gzip -d -c /tmp/test_gzippy_output.gz > /tmp/test_gzip_out.bin
-          diff /tmp/test_input.bin /tmp/test_gzip_out.bin
-          echo "✓ gzip can read gzippy file-based output"
-
-      - name: Compress with gzip, decompress with gzippy (file-based)
-        run: |
-          # Single-member gzip (no BGZF), exercises single-member parallel decompress
-          cp /tmp/test_input.bin /tmp/test_gzip_roundtrip.bin
-          gzip -${{ matrix.level }} /tmp/test_gzip_roundtrip.bin
-          ./target/release/gzippy -d -p${{ matrix.threads }} /tmp/test_gzip_roundtrip.bin.gz
-          diff /tmp/test_input.bin /tmp/test_gzip_roundtrip.bin
-          echo "✓ gzippy file-decompress of single-member gzip: ${{ matrix.size }}MB L${{ matrix.level }} T${{ matrix.threads }}"
-
-      - name: Test concatenated multi-member gzip
-        run: |
-          # Split input into 3 parts, gzip each, concatenate → multi-member gzip
-          THIRD=$(( $(stat -c%s /tmp/test_input.bin) / 3 ))
-          head -c $THIRD /tmp/test_input.bin > /tmp/part1.bin
-          tail -c +$(( THIRD + 1 )) /tmp/test_input.bin | head -c $THIRD > /tmp/part2.bin
-          tail -c +$(( 2 * THIRD + 1 )) /tmp/test_input.bin > /tmp/part3.bin
-
-          gzip -c /tmp/part1.bin > /tmp/multi.gz
-          gzip -c /tmp/part2.bin >> /tmp/multi.gz
-          gzip -c /tmp/part3.bin >> /tmp/multi.gz
-
-          # Decompress multi-member with gzippy
-          ./target/release/gzippy -d -c /tmp/multi.gz > /tmp/multi_out.bin
-
-          # Verify: concatenated parts should equal full output
-          cat /tmp/part1.bin /tmp/part2.bin /tmp/part3.bin > /tmp/expected_multi.bin
-          diff /tmp/expected_multi.bin /tmp/multi_out.bin
-          echo "✓ Multi-member gzip decompression works"
-
-  # ===========================================================================
-  # Filesystem edge cases: symlinks, FIFOs, hard links, .tgz support
-  # ===========================================================================
-  filesystem-edge-cases:
-    name: Filesystem Edge Cases
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install ISA-L build deps
-        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
-
-      - name: Build gzippy
-        run: |
-          cargo build --release --features isal-compression
-
-      - name: Setup test files
-        run: |
-          mkdir -p /tmp/fs_tests
-          echo "hello world from gzippy" > /tmp/fs_tests/original.txt
-          ./target/release/gzippy -k /tmp/fs_tests/original.txt
-
-      - name: Test symlink handling (compress)
-        run: |
-          # Create symlink to a regular file
-          ln -sf /tmp/fs_tests/original.txt /tmp/fs_tests/symlink.txt
-
-          # Without -f: should skip symlink with warning
-          OUTPUT=$(./target/release/gzippy -k /tmp/fs_tests/symlink.txt 2>&1 || true)
-          echo "Symlink compress output: $OUTPUT"
-          # gzip behavior: processes symlinks by default (follows them)
-          # If gzippy skips with a warning, that's the correctness-validation behavior
-          echo "✓ Symlink compress handled (no crash)"
-
-      - name: Test symlink handling (decompress)
-        run: |
-          # Create symlink to a .gz file
-          ln -sf /tmp/fs_tests/original.txt.gz /tmp/fs_tests/symlink.txt.gz
-
-          # Without -f: should skip or follow
-          OUTPUT=$(./target/release/gzippy -d -k /tmp/fs_tests/symlink.txt.gz 2>&1 || true)
-          echo "Symlink decompress output: $OUTPUT"
-          echo "✓ Symlink decompress handled (no crash)"
-
-      - name: Test FIFO handling
-        run: |
-          mkfifo /tmp/fs_tests/test_fifo
-
-          # Attempting to compress a FIFO should not hang or crash
-          # Use timeout to prevent infinite hang
-          timeout 5 ./target/release/gzippy /tmp/fs_tests/test_fifo 2>&1 || EXIT=$?
-          echo "FIFO compress exit code: ${EXIT:-0}"
-          echo "✓ FIFO handled gracefully (no hang/crash)"
-          rm -f /tmp/fs_tests/test_fifo
-
-      - name: Test hard link detection
-        run: |
-          echo "hard link test data" > /tmp/fs_tests/hardlink_source.txt
-          ln /tmp/fs_tests/hardlink_source.txt /tmp/fs_tests/hardlink_target.txt
-
-          # Compress both - gzip warns about hard links
-          ./target/release/gzippy -k /tmp/fs_tests/hardlink_source.txt 2>&1 || true
-          echo "✓ Hard link compress handled (no crash)"
-
-      - name: Test .tgz extension support
-        run: |
-          # Create a .tgz file (tarball compressed with gzip)
-          mkdir -p /tmp/tgz_test/subdir
-          echo "file1" > /tmp/tgz_test/subdir/a.txt
-          echo "file2" > /tmp/tgz_test/subdir/b.txt
-          tar czf /tmp/fs_tests/archive.tgz -C /tmp/tgz_test subdir
-
-          # Decompress .tgz → should produce .tar
-          cp /tmp/fs_tests/archive.tgz /tmp/fs_tests/archive_test.tgz
-          ./target/release/gzippy -d /tmp/fs_tests/archive_test.tgz 2>&1 || true
-          # Check that output is a valid tar (either .tar or the decompressed file)
-          if [ -f /tmp/fs_tests/archive_test.tar ]; then
-            tar tf /tmp/fs_tests/archive_test.tar > /dev/null
-            echo "✓ .tgz → .tar decompression works"
-          else
-            echo "✓ .tgz decompression completed (output naming may vary)"
-          fi
-
-      - name: Test --keep flag preserves input
-        run: |
-          echo "keep test" > /tmp/fs_tests/keep_test.txt
-          ./target/release/gzippy -k /tmp/fs_tests/keep_test.txt
-          # Both original and compressed should exist
-          test -f /tmp/fs_tests/keep_test.txt
-          test -f /tmp/fs_tests/keep_test.txt.gz
-          echo "✓ --keep preserves input file"
-
-      - name: Test --stdout flag
-        run: |
-          echo "stdout test data" > /tmp/fs_tests/stdout_test.txt
-          ./target/release/gzippy -c /tmp/fs_tests/stdout_test.txt > /tmp/fs_tests/stdout_out.gz
-          ./target/release/gzippy -dc /tmp/fs_tests/stdout_out.gz > /tmp/fs_tests/stdout_result.txt
-          diff /tmp/fs_tests/stdout_test.txt /tmp/fs_tests/stdout_result.txt
-          echo "✓ --stdout roundtrip works"
-
-      - name: Test --test flag
-        run: |
-          echo "test flag data" > /tmp/fs_tests/testflag.txt
-          ./target/release/gzippy -k /tmp/fs_tests/testflag.txt
-          ./target/release/gzippy -t /tmp/fs_tests/testflag.txt.gz
-          echo "✓ --test validates without decompressing"
-
-      - name: Test --list flag
-        run: |
-          echo "list flag data for testing" > /tmp/fs_tests/listflag.txt
-          ./target/release/gzippy -k /tmp/fs_tests/listflag.txt
-          OUTPUT=$(./target/release/gzippy -l /tmp/fs_tests/listflag.txt.gz)
-          echo "$OUTPUT"
-          # Should show compressed/uncompressed sizes
-          echo "$OUTPUT" | grep -q "compressed" || echo "$OUTPUT" | grep -qE "[0-9]"
-          echo "✓ --list shows file info"
-
-      - name: Summary
-        run: |
-          echo "## Filesystem Edge Cases" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Symlink compress | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Symlink decompress | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| FIFO handling | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Hard link detection | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| .tgz extension | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| --keep flag | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| --stdout flag | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| --test flag | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| --list flag | Passed |" >> $GITHUB_STEP_SUMMARY
-
-  # ===========================================================================
-  # CRC32/ISIZE trailer validation and corruption detection
-  # ===========================================================================
-  integrity-validation:
-    name: CRC32 & Trailer Integrity
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install ISA-L build deps
-        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
-
-      - name: Build gzippy
-        run: |
-          cargo build --release --features isal-compression
-
-      - name: Test valid CRC32 roundtrip (pipe-based)
-        run: |
-          head -c 500000 /dev/urandom > /tmp/crc_test.bin
-          cat /tmp/crc_test.bin | ./target/release/gzippy | ./target/release/gzippy -d > /tmp/crc_pipe_out.bin
-          diff /tmp/crc_test.bin /tmp/crc_pipe_out.bin
-          echo "✓ CRC32 valid through pipe roundtrip"
-
-      - name: Test valid CRC32 roundtrip (file-based / mmap path)
-        run: |
-          # 5MB file to ensure mmap/BGZF path is used
-          python3 -c "
-          import random
-          random.seed(123)
-          with open('/tmp/crc_mmap_test.bin', 'wb') as f:
-              for _ in range(5 * 1024):
-                  f.write(bytes(random.getrandbits(8) for _ in range(1024)))
-          "
-          # Natural roundtrip: compress removes original, decompress restores it
-          cp /tmp/crc_mmap_test.bin /tmp/crc_mmap_roundtrip.bin
-          ./target/release/gzippy /tmp/crc_mmap_roundtrip.bin
-          ./target/release/gzippy -d /tmp/crc_mmap_roundtrip.bin.gz
-          diff /tmp/crc_mmap_test.bin /tmp/crc_mmap_roundtrip.bin
-          echo "✓ CRC32 valid through file-based (mmap) roundtrip"
-
-      - name: Test CRC32 corruption detection
-        run: |
-          echo "test data for CRC corruption" > /tmp/crc_corrupt_input.txt
-          ./target/release/gzippy -k /tmp/crc_corrupt_input.txt
-
-          # Corrupt the CRC32 field in the gzip trailer (last 8 bytes: 4 CRC32 + 4 ISIZE)
-          cp /tmp/crc_corrupt_input.txt.gz /tmp/crc_corrupted.gz
-          FILE_SIZE=$(stat -c%s /tmp/crc_corrupted.gz)
-          # Flip a bit in the CRC32 (4 bytes before ISIZE, which is at end-8 to end-4)
-          python3 -c "
-          data = bytearray(open('/tmp/crc_corrupted.gz', 'rb').read())
-          # CRC32 is at offset len-8 to len-4
-          crc_offset = len(data) - 8
-          data[crc_offset] ^= 0x01  # flip one bit
-          open('/tmp/crc_corrupted.gz', 'wb').write(data)
-          "
-
-          # Decompress should still produce output but may warn about CRC
-          # (behavior depends on whether correctness-validation branch is merged)
-          set +e
-          OUTPUT=$(./target/release/gzippy -d -c /tmp/crc_corrupted.gz 2>&1 > /tmp/crc_corrupt_out.bin)
-          EXIT_CODE=$?
-          set -e
-          echo "CRC corruption decompress exit code: $EXIT_CODE"
-          echo "CRC corruption stderr: $OUTPUT"
-          echo "✓ CRC corruption handled (no crash, exit=$EXIT_CODE)"
-
-      - name: Test ISIZE corruption detection
-        run: |
-          echo "test data for ISIZE corruption" > /tmp/isize_corrupt_input.txt
-          ./target/release/gzippy -k /tmp/isize_corrupt_input.txt
-
-          # Corrupt the ISIZE field (last 4 bytes of gzip)
-          cp /tmp/isize_corrupt_input.txt.gz /tmp/isize_corrupted.gz
-          python3 -c "
-          data = bytearray(open('/tmp/isize_corrupted.gz', 'rb').read())
-          # ISIZE is at offset len-4 to len
-          isize_offset = len(data) - 4
-          data[isize_offset] ^= 0xFF  # corrupt ISIZE
-          open('/tmp/isize_corrupted.gz', 'wb').write(data)
-          "
-
-          set +e
-          OUTPUT=$(./target/release/gzippy -d -c /tmp/isize_corrupted.gz 2>&1 > /tmp/isize_corrupt_out.bin)
-          EXIT_CODE=$?
-          set -e
-          echo "ISIZE corruption decompress exit code: $EXIT_CODE"
-          echo "ISIZE corruption stderr: $OUTPUT"
-          echo "✓ ISIZE corruption handled (no crash, exit=$EXIT_CODE)"
-
-      - name: Test truncated gzip detection
-        run: |
-          head -c 100000 /dev/urandom > /tmp/trunc_input.bin
-          cat /tmp/trunc_input.bin | ./target/release/gzippy > /tmp/trunc_full.gz
-          # Truncate to half size
-          HALF=$(( $(stat -c%s /tmp/trunc_full.gz) / 2 ))
-          head -c $HALF /tmp/trunc_full.gz > /tmp/trunc_half.gz
-
-          set +e
-          ./target/release/gzippy -d -c /tmp/trunc_half.gz > /dev/null 2>&1
-          EXIT_CODE=$?
-          set -e
-          echo "Truncated gzip exit code: $EXIT_CODE"
-          # Should fail with non-zero exit
-          if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "✓ Truncated gzip detected correctly"
-          else
-            echo "⚠ Truncated gzip did not error (may be acceptable for partial output)"
-          fi
-
-      - name: Test --test flag validates integrity
-        run: |
-          head -c 100000 /dev/urandom > /tmp/test_integrity.bin
-          cat /tmp/test_integrity.bin | ./target/release/gzippy > /tmp/test_integrity.gz
-
-          # Valid file should pass
-          ./target/release/gzippy -t /tmp/test_integrity.gz
-          echo "✓ --test passes on valid file"
-
-          # Corrupted file should fail
-          cp /tmp/test_integrity.gz /tmp/test_integrity_bad.gz
-          python3 -c "
-          data = bytearray(open('/tmp/test_integrity_bad.gz', 'rb').read())
-          # Corrupt middle of compressed data
-          mid = len(data) // 2
-          data[mid] ^= 0xFF
-          open('/tmp/test_integrity_bad.gz', 'wb').write(data)
-          "
-          set +e
-          ./target/release/gzippy -t /tmp/test_integrity_bad.gz 2>&1
-          EXIT_CODE=$?
-          set -e
-          if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "✓ --test detects data corruption"
-          else
-            echo "⚠ --test did not detect corruption (may depend on corruption location)"
-          fi
-
-      - name: Summary
-        run: |
-          echo "## CRC32 & Integrity Validation" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Pipe roundtrip CRC32 | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| File/mmap roundtrip CRC32 | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| CRC32 corruption detection | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| ISIZE corruption detection | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Truncated gzip detection | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| --test integrity check | Passed |" >> $GITHUB_STEP_SUMMARY
-
-  # Cross-tool compatibility: verify gzippy output can be read by all tools and vice versa
-  cross-compatibility:
-    name: Cross-Tool Compatibility
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev cmake nasm autoconf automake libtool
-
-      - name: Build gzippy
-        run: |
-          cargo build --release --features isal-compression
-
-      - name: Build pigz
-        run: make -C vendor/pigz
-
-      - name: Build igzip
-        run: |
-          cd vendor/isa-l
-          rm -rf build
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-          make -j$(nproc) igzip
-
-      - name: Create tarball test data from /usr/
-        run: |
-          echo "Creating 10MB tarball from /usr/share..."
-          # Create tarball from /usr/share, truncate to 10MB
-          tar cf - /usr/share 2>/dev/null | head -c $((10 * 1024 * 1024)) > /tmp/test_tarball.bin
-          ACTUAL_SIZE=$(stat -c%s /tmp/test_tarball.bin)
-          echo "Created test data: $ACTUAL_SIZE bytes"
-
-          # Also create text data for comparison
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test_text.bin', 'w') as f:
-              for _ in range(100000):
-                  f.write(''.join(random.choices('abcdefghij klmnopqrs tuvwxyz ', k=100)) + '\n')
-          "
-          echo "Created text data: $(stat -c%s /tmp/test_text.bin) bytes"
-
-      - name: Test gzippy output readable by all tools
-        run: |
-          echo "=== Testing gzippy output compatibility ==="
-
-          for data_type in tarball text; do
-            INPUT="/tmp/test_${data_type}.bin"
-            echo ""
-            echo "--- Testing $data_type data ---"
-
+          for f in /tmp/big_tar.bin /tmp/big_text.bin; do
             for level in 1 6 9; do
-              # Compress with gzippy
-              ./target/release/gzippy -$level -c "$INPUT" > /tmp/gzippy_output.gz
-              GZ_SIZE=$(stat -c%s /tmp/gzippy_output.gz)
-              echo "gzippy -$level compressed to $GZ_SIZE bytes"
-
-              # Decompress with each tool and verify
-              for tool in gzip pigz igzip; do
-                case $tool in
-                  gzip)   CMD="gzip -d" ;;
-                  pigz)   CMD="./vendor/pigz/unpigz" ;;
-                  igzip)  CMD="./vendor/isa-l/build/igzip -d" ;;
-                esac
-
-                $CMD < /tmp/gzippy_output.gz > /tmp/decompressed.bin 2>/dev/null
-                if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
-                  echo "  ✓ $tool can decompress gzippy -$level output (byte-identical)"
-                else
-                  echo "  ✗ FAIL: $tool cannot decompress gzippy -$level output correctly!"
-                  exit 1
-                fi
+              for threads in 1 4; do
+                # File-based natural roundtrip (compress removes original,
+                # decompress restores it) — exercises the mmap paths.
+                cp "$f" /tmp/rt.bin
+                gzippy -$level -p$threads /tmp/rt.bin
+                gzippy -d -p$threads /tmp/rt.bin.gz
+                diff "$f" /tmp/rt.bin
+                rm -f /tmp/rt.bin /tmp/rt.bin.gz
               done
             done
           done
 
-          echo ""
-          echo "All tools can read gzippy output"
-
-      - name: Test gzippy can read all tool outputs
-        run: |
-          echo "=== Testing gzippy decompression compatibility ==="
-
-          for data_type in tarball text; do
-            INPUT="/tmp/test_${data_type}.bin"
-            echo ""
-            echo "--- Testing $data_type data ---"
-
-            # Test gzip output
-            for level in 1 6 9; do
-              gzip -$level -c "$INPUT" > /tmp/gzip_output.gz
-              ./target/release/gzippy -d < /tmp/gzip_output.gz > /tmp/decompressed.bin
-              if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
-                echo "  ✓ gzippy can decompress gzip -$level output (byte-identical)"
-              else
-                echo "  ✗ FAIL: gzippy cannot decompress gzip -$level output!"
-                exit 1
-              fi
-            done
-
-            # Test pigz output
-            for level in 1 6 9; do
-              ./vendor/pigz/pigz -$level -c "$INPUT" > /tmp/pigz_output.gz
-              ./target/release/gzippy -d < /tmp/pigz_output.gz > /tmp/decompressed.bin
-              if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
-                echo "  ✓ gzippy can decompress pigz -$level output (byte-identical)"
-              else
-                echo "  ✗ FAIL: gzippy cannot decompress pigz -$level output!"
-                exit 1
-              fi
-            done
-
-            # Test igzip output (only has levels 0-3)
-            for level in 0 1 2 3; do
-              ./vendor/isa-l/build/igzip -$level -c "$INPUT" > /tmp/igzip_output.gz
-              ./target/release/gzippy -d < /tmp/igzip_output.gz > /tmp/decompressed.bin
-              if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
-                echo "  ✓ gzippy can decompress igzip -$level output (byte-identical)"
-              else
-                echo "  ✗ FAIL: gzippy cannot decompress igzip -$level output!"
-                exit 1
-              fi
-            done
+          # Single-member gzip (gzip(1) output) through the parallel decoder
+          for threads in 1 4; do
+            gzip -6 -c /tmp/big_tar.bin > /tmp/sm.gz
+            gzippy -d -p$threads < /tmp/sm.gz > /tmp/sm.out
+            diff /tmp/big_tar.bin /tmp/sm.out
           done
 
-          echo ""
-          echo "gzippy can read all tool outputs"
+          # Concatenated multi-member gzip
+          THIRD=$(( $(stat -c%s /tmp/big_tar.bin) / 3 ))
+          head -c $THIRD /tmp/big_tar.bin | gzip -c > /tmp/multi.gz
+          tail -c +$(( THIRD + 1 )) /tmp/big_tar.bin | head -c $THIRD | gzip -c >> /tmp/multi.gz
+          tail -c +$(( 2 * THIRD + 1 )) /tmp/big_tar.bin | gzip -c >> /tmp/multi.gz
+          gzippy -d -c /tmp/multi.gz > /tmp/multi.out
+          diff /tmp/big_tar.bin /tmp/multi.out
+          echo "large-file roundtrips OK"
 
-      - name: Summary
+      - name: Cross-tool compatibility (gzip, pigz — both directions)
         run: |
-          echo "## Cross-Tool Compatibility" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Compression | Decompression | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------------|---------------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| gzippy | gzip | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| gzippy | pigz | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| gzippy | igzip | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| gzip | gzippy | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| pigz | gzippy | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| igzip | gzippy | Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All outputs verified byte-identical on both text and tarball data." >> $GITHUB_STEP_SUMMARY
+          set -x
+          for f in /tmp/big_tar.bin /tmp/big_text.bin; do
+            for level in 1 6 9; do
+              # gzippy output readable by gzip and pigz
+              gzippy -$level -c "$f" > /tmp/x.gz
+              gzip -d  < /tmp/x.gz > /tmp/x1.out; diff "$f" /tmp/x1.out
+              unpigz -c < /tmp/x.gz > /tmp/x2.out; diff "$f" /tmp/x2.out
+              # gzip + pigz output readable by gzippy
+              gzip -$level -c "$f" | gzippy -d > /tmp/x3.out; diff "$f" /tmp/x3.out
+              pigz -$level -c "$f" | gzippy -d > /tmp/x4.out; diff "$f" /tmp/x4.out
+            done
+          done
+          echo "cross-tool compatibility OK"
+
+      - name: Integrity (CRC32/ISIZE corruption, truncation, --test, --list)
+        run: |
+          set -x
+          head -c 100000 /dev/urandom > /tmp/int.bin
+          gzippy -c /tmp/int.bin > /tmp/int.gz
+
+          # Valid file: -t passes, -l prints sizes
+          gzippy -t /tmp/int.gz
+          gzippy -l /tmp/int.gz
+
+          corrupt() { # corrupt <in> <out> <offset-from-end> (xor 0xFF)
+            python3 -c "
+          import sys
+          data = bytearray(open(sys.argv[1], 'rb').read())
+          data[len(data) - int(sys.argv[3])] ^= 0xFF
+          open(sys.argv[2], 'wb').write(data)
+          " "$1" "$2" "$3"
+          }
+
+          # CRC32 corruption (trailer offset -8) must fail
+          corrupt /tmp/int.gz /tmp/int_crc.gz 8
+          if gzippy -d -c /tmp/int_crc.gz > /dev/null 2>&1; then
+            echo "::error::CRC32 corruption NOT detected"; exit 1
+          fi
+          # ISIZE corruption (trailer offset -4) must fail
+          corrupt /tmp/int.gz /tmp/int_isize.gz 4
+          if gzippy -d -c /tmp/int_isize.gz > /dev/null 2>&1; then
+            echo "::error::ISIZE corruption NOT detected"; exit 1
+          fi
+          # Truncated stream must fail
+          head -c $(( $(stat -c%s /tmp/int.gz) / 2 )) /tmp/int.gz > /tmp/int_trunc.gz
+          if gzippy -d -c /tmp/int_trunc.gz > /dev/null 2>&1; then
+            echo "::error::Truncated gzip NOT detected"; exit 1
+          fi
+          # Mid-stream data corruption must fail -t
+          corrupt /tmp/int.gz /tmp/int_mid.gz $(( $(stat -c%s /tmp/int.gz) / 2 ))
+          if gzippy -t /tmp/int_mid.gz > /dev/null 2>&1; then
+            echo "::error::--test did NOT detect data corruption"; exit 1
+          fi
+          echo "integrity checks OK"
+
+      - name: Filesystem edge cases (symlink, FIFO, hard link, .tgz, flags)
+        run: |
+          set -x
+          mkdir -p /tmp/fs
+          echo "hello world from gzippy" > /tmp/fs/orig.txt
+          gzippy -k /tmp/fs/orig.txt
+          test -f /tmp/fs/orig.txt && test -f /tmp/fs/orig.txt.gz  # --keep
+
+          # Symlinks must not crash (skip-with-warning or follow are both fine)
+          ln -sf /tmp/fs/orig.txt /tmp/fs/link.txt
+          gzippy -k /tmp/fs/link.txt 2>&1 || true
+          ln -sf /tmp/fs/orig.txt.gz /tmp/fs/link.txt.gz
+          gzippy -d -k /tmp/fs/link.txt.gz 2>&1 || true
+
+          # FIFO must not hang or crash
+          mkfifo /tmp/fs/fifo
+          timeout 5 gzippy /tmp/fs/fifo 2>&1 || true
+          rm -f /tmp/fs/fifo
+
+          # Hard links must not crash
+          echo "hard link data" > /tmp/fs/hl_src.txt
+          ln /tmp/fs/hl_src.txt /tmp/fs/hl_dst.txt
+          gzippy -k /tmp/fs/hl_src.txt 2>&1 || true
+
+          # .tgz decompresses to a valid .tar
+          mkdir -p /tmp/tgz/sub
+          echo a > /tmp/tgz/sub/a.txt
+          tar czf /tmp/fs/arch.tgz -C /tmp/tgz sub
+          gzippy -d /tmp/fs/arch.tgz
+          tar tf /tmp/fs/arch.tar > /dev/null
+
+          # --stdout roundtrip
+          echo "stdout test" > /tmp/fs/so.txt
+          gzippy -c /tmp/fs/so.txt > /tmp/fs/so.gz
+          gzippy -dc /tmp/fs/so.gz > /tmp/fs/so.out
+          diff /tmp/fs/so.txt /tmp/fs/so.out
+          echo "filesystem edge cases OK"
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
@@ -937,8 +374,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Run clippy
-        run: |
-          cargo clippy --release --features isal-compression -- -D warnings
+        run: cargo clippy --release --all-targets --features isal-compression -- -D warnings
 
       - name: Check version consistency
         run: |
@@ -949,11 +385,38 @@ jobs:
           [ "$VERSION" = "$CARGO_VERSION" ] || { echo "VERSION ($VERSION) != Cargo.toml ($CARGO_VERSION)"; exit 1; }
 
           # Formula may use a dynamic read (version File.read(...)) or a static string.
-          # Dynamic read is always consistent with VERSION by construction; skip comparison.
           if grep -q 'version File.read' Formula/gzippy.rb; then
             echo "Formula uses dynamic VERSION read — always consistent with VERSION file"
           else
             FORMULA_VERSION=$(grep "version \"" Formula/gzippy.rb | sed 's/.*version "\(.*\)".*/\1/')
             [ "$VERSION" = "$FORMULA_VERSION" ] || { echo "VERSION ($VERSION) != Formula ($FORMULA_VERSION)"; exit 1; }
           fi
-          echo "✓ All versions match"
+          echo "All versions match"
+
+  # ---------------------------------------------------------------------------
+  # Aggregate required-status gate.
+  #
+  # The `main` branch ruleset requires ONE status check named `build`. The CI
+  # jobs above report as "Build & Test …", "Integration (correctness)", "Lint"
+  # — none of which is `build` — so without this job the required check is never
+  # reported and every PR stays BLOCKED even when fully green. This fans all
+  # real jobs into a single stable `build` check: branch protection depends only
+  # on this one name, immune to matrix/job renames. It passes only if every
+  # upstream job succeeded.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: [test, integration, lint]
+    if: always()
+    steps:
+      - name: Require all CI jobs to have succeeded
+        run: |
+          echo "test=${{ needs.test.result }} integration=${{ needs.integration.result }} lint=${{ needs.lint.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] \
+          || [ "${{ needs.integration.result }}" != "success" ] \
+          || [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "::error::One or more required CI jobs did not succeed."
+            exit 1
+          fi
+          echo "All required CI jobs passed."

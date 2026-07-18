@@ -209,23 +209,29 @@ impl LitLenEntry {
 
     /// Decode length value using saved_bitbuf
     /// Length = base + extra_bits_value
-    /// Decode length from saved_bitbuf (branchless)
+    ///
+    /// Delegates extras extraction to `bmi2::decode_extra_bits`, which uses
+    /// the BZHI instruction on BMI2-capable builds. Matches vendor pattern at
+    /// `consume_first_decode.rs:1071-1072, :1111-1112` and the
+    /// symmetric `decode_distance` below.
     #[inline(always)]
     pub fn decode_length(self, saved_bitbuf: u64) -> u32 {
         let base = self.length_base() as u32;
-        let codeword_bits = self.codeword_bits();
-        let total_bits = self.total_bits();
-        let extra_bits = total_bits - codeword_bits;
-        // Branchless: when extra_bits is 0, mask is 0 and extra_value is 0
-        let extra_mask = (1u64 << extra_bits).wrapping_sub(1);
-        let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
-        base + extra_value as u32
+        // libdeflate-form extraction from the two pre-baked fields — no
+        // per-symbol `total_bits - codeword_bits` subtract (the diffuse
+        // ALU-op cost vs libdeflate; decompress_template.h:495-496).
+        let extra_value = crate::decompress::inflate::bmi2::extract_varbits(
+            saved_bitbuf,
+            self.codeword_bits(),
+            self.total_bits(),
+        ) as u32;
+        base + extra_value
     }
 }
 
 /// A distance table entry
 #[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
+#[repr(transparent)] // asm-kernel also reads entries as raw u32s (asm_kernel.rs)
 pub struct DistEntry(u32);
 
 impl DistEntry {
@@ -311,14 +317,11 @@ impl DistEntry {
     #[inline(always)]
     pub fn decode_distance(self, saved_bitbuf: u64) -> u32 {
         let base = self.distance_base() as u32;
-        let codeword_bits = self.codeword_bits();
-        let total_bits = self.total_bits();
-        let extra_bits = total_bits - codeword_bits;
-        // Use BMI2 _bzhi_u64 when available for faster bit extraction
-        let extra_value = crate::decompress::inflate::bmi2::decode_extra_bits(
+        // libdeflate-form extraction — no per-symbol subtract (see decode_length).
+        let extra_value = crate::decompress::inflate::bmi2::extract_varbits(
             saved_bitbuf,
-            codeword_bits,
-            extra_bits,
+            self.codeword_bits(),
+            self.total_bits(),
         ) as u32;
         base + extra_value
     }
@@ -334,10 +337,23 @@ pub struct LitLenTable {
 }
 
 impl LitLenTable {
-    /// Number of bits for main table lookup (11 bits = 8KB table).
-    /// Benchmarked 11-15 on ARM64: 11-bit is fastest due to L1d cache locality.
-    /// Larger tables (12-15 bit) reduce subtable lookups but cause cache misses.
+    /// Number of bits for main table lookup.
+    ///
+    /// aarch64: 11 bits (8 KB table), matching libdeflate's
+    /// LITLEN_TABLEBITS=11 (deflate_decompress.c:372) — best for L1d
+    /// locality on ARM64.
+    ///
+    /// x86_64: 12 bits. A larger main table → fewer subtable hits on
+    /// common code lengths, removing a dependent load from the hot path
+    /// of every symbol that previously hit the subtable. 12-bit table =
+    /// 16 KB, still fits in 48 KB L1d on Raptor Lake. rapidgzip uses
+    /// larger main tables for the same reason (vendor's HuffmanCoding*
+    /// variants). Byte-exact vs 11 (table geometry only; identical
+    /// decoded output).
+    #[cfg(target_arch = "aarch64")]
     pub const TABLE_BITS: u8 = 11;
+    #[cfg(not(target_arch = "aarch64"))]
+    pub const TABLE_BITS: u8 = 12;
     /// Maximum number of subtable bits for codes longer than TABLE_BITS
     pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
 
@@ -491,6 +507,20 @@ impl LitLenTable {
         unsafe { *self.entries.get_unchecked(subtable_start + idx) }
     }
 
+    /// Look up subtable entry from already-shifted bitbuf (libdeflate
+    /// fastloop pattern). Use when bitbuf has already been shifted by
+    /// `main_table_bits`. Mirrors `DistTable::lookup_subtable_direct`
+    /// (`:668-674`). Vendor pattern: `consume_first_decode.rs:1042-1046`
+    /// — vendor uses post-consume bitbuf directly with no extra shift.
+    #[inline(always)]
+    pub fn lookup_subtable_direct(&self, entry: LitLenEntry, shifted_bits: u64) -> LitLenEntry {
+        let subtable_start = entry.subtable_start() as usize;
+        let subtable_bits = entry.subtable_bits();
+        let idx = (shifted_bits as usize) & ((1usize << subtable_bits) - 1);
+        // SAFETY: subtable entries are allocated during build
+        unsafe { *self.entries.get_unchecked(subtable_start + idx) }
+    }
+
     /// Resolve an entry (handle subtables)
     #[inline(always)]
     pub fn resolve(&self, bits: u64) -> LitLenEntry {
@@ -517,23 +547,95 @@ impl LitLenTable {
     }
 }
 
-/// Distance decode table
+/// Inline capacity for the distance table: `main(1<<TABLE_BITS) + worst-case
+/// subtables ((1<<MAX_SUBTABLE_BITS) × up-to-32 codes longer than table_bits)`.
+/// 32 = the 5-bit hdist ceiling, covering any legal distance alphabet (≤30 real
+/// codes). The cap MUST track `DistTable::{TABLE_BITS, MAX_SUBTABLE_BITS}`,
+/// which are arch-dependent (aarch64 uses a narrower TABLE_BITS=8 → wider
+/// MAX_SUBTABLE_BITS=7 → 2× the per-long-code subtable reservation):
+///   * x86:     512 + 64*32  = 2560   (TABLE_BITS=9, MAX_SUBTABLE_BITS=6)
+///   * aarch64: 256 + 128*32 = 4352   (TABLE_BITS=8, MAX_SUBTABLE_BITS=7)
+///
+/// Undersizing it makes `DistTable::rebuild` return false for deep distance
+/// trees that `dist_hc` accepts — a real arch-specific divergence (the
+/// `!dist_valid` careful fallback keeps output byte-exact, but the fast path
+/// is silently lost and the `dist_table_matches_dist_hc_differential`
+/// invariant breaks). Element A (single-state-base): the entries live INLINE
+/// so the asm addresses them `[{ctx}+DIST_OFF+idx*4]` off the one `ctx` base
+/// (igzip `[state+_dist_huff_code+...]`).
+#[cfg(target_arch = "aarch64")]
+pub const DIST_CAP: usize = (1 << 8) + (1 << 7) * 32;
+#[cfg(not(target_arch = "aarch64"))]
+pub const DIST_CAP: usize = (1 << 9) + (1 << 6) * 32;
+
+/// Distance decode table.
+///
+/// `#[repr(C)]` + `entries` FIRST: element A inlines the entries inside the
+/// boxed `AsmState` (asm_kernel.rs) so `offset_of!(DistTable, entries) == 0`
+/// and the asm reaches them via `[{ctx}+DIST_OFF+idx*4]`. Entries are a
+/// fixed `[DistEntry; DIST_CAP]` (was `Vec`) so the table is built IN PLACE
+/// (zero-copy) — a per-region copy of ~10 KiB × ~7465 blocks/silesia would
+/// negate the win. `used` is the count of live entries (main + subtables).
 #[derive(Clone)]
+#[repr(C)]
 pub struct DistTable {
-    /// Main table (size: 1 << table_bits)
-    entries: Vec<DistEntry>,
+    /// Main table + subtables, inline (capacity `DIST_CAP`); `used` valid.
+    pub entries: [DistEntry; DIST_CAP],
+    /// Number of live entries (main_size + subtable fan-out).
+    used: usize,
     /// Number of bits for main table lookup
     table_bits: u8,
 }
 
 impl DistTable {
-    /// Number of bits for main table
+    /// Number of bits for main table.
+    ///
+    /// aarch64: 8 bits, matching libdeflate's OFFSET_TABLEBITS=8
+    /// (deflate_decompress.c:374).
+    ///
+    /// x86_64: 9 bits (512 entries) — same rationale as
+    /// LitLenTable::TABLE_BITS, fewer subtable hits on common distance
+    /// codes. Byte-exact vs 8 (table geometry only).
+    #[cfg(target_arch = "aarch64")]
     pub const TABLE_BITS: u8 = 8;
+    #[cfg(not(target_arch = "aarch64"))]
+    pub const TABLE_BITS: u8 = 9;
     /// Maximum number of subtable bits
-    pub const MAX_SUBTABLE_BITS: u8 = 7; // 15 - 8
+    pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
+
+    /// An all-zero (no valid codes) table — the initial inline state before
+    /// the first block builds into it (element A: `AsmState.dist`).
+    pub fn new_empty() -> Self {
+        Self {
+            entries: [DistEntry(0); DIST_CAP],
+            used: 1usize << Self::TABLE_BITS,
+            table_bits: Self::TABLE_BITS,
+        }
+    }
 
     /// Build a distance decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
+        let mut t = Self {
+            entries: [DistEntry(0); DIST_CAP],
+            used: 0,
+            table_bits: Self::TABLE_BITS,
+        };
+        if !t.rebuild(code_lengths) {
+            return None;
+        }
+        Some(t)
+    }
+
+    /// Rebuild this table in place from new code lengths, REUSING the
+    /// `entries` allocation: the per-block lazy build in the contig clean
+    /// fast loop would otherwise pay a fresh `Vec` alloc + zero-fill +
+    /// truncate + free on EVERY Huffman block. Reusing the buffer keeps the
+    /// resulting table BYTE-IDENTICAL to a fresh `build` by construction:
+    /// the fill below writes exactly the same entries over a zeroed
+    /// prefix of the same computed size, and the table is a pure function
+    /// of `code_lengths` (differential: `dist_table_rebuild_matches_fresh
+    /// _build` in marker_inflate.rs).
+    pub fn rebuild(&mut self, code_lengths: &[u8]) -> bool {
         let table_bits = Self::TABLE_BITS;
         let main_size = 1usize << table_bits;
 
@@ -553,10 +655,24 @@ impl DistTable {
             first_code[len] = code;
         }
 
-        // Allocate table with space for subtables
+        // Allocate table with space for subtables (allocation reused across
+        // rebuilds: clear + resize re-zeroes without a malloc/free round-trip
+        // once capacity has grown to the high-water mark).
         let max_subtable_entries = (1usize << Self::MAX_SUBTABLE_BITS)
             * code_lengths.iter().filter(|&&l| l > table_bits).count();
-        let mut entries = vec![DistEntry(0); main_size + max_subtable_entries];
+        let needed = main_size + max_subtable_entries;
+        if needed > DIST_CAP {
+            // Out of inline capacity (malformed alphabet) — fail; the asm
+            // dispatch gate (dist valid) then forces the careful path.
+            self.used = 0;
+            return false;
+        }
+        // Zero the live prefix in place (the build relies on a zeroed table so
+        // `is_subtable_ptr()` reads false before a subtable is installed).
+        let entries = &mut self.entries;
+        for e in entries[..needed].iter_mut() {
+            *e = DistEntry(0);
+        }
         let mut subtable_next = main_size;
 
         // Assign codes to symbols
@@ -613,11 +729,9 @@ impl DistTable {
             }
         }
 
-        entries.truncate(subtable_next);
-        Some(Self {
-            entries,
-            table_bits,
-        })
+        self.used = subtable_next;
+        self.table_bits = table_bits;
+        true
     }
 
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
@@ -650,6 +764,15 @@ impl DistTable {
         let idx = (shifted_bits as usize) & ((1usize << subtable_bits) - 1);
         // SAFETY: subtable entries are allocated during build
         unsafe { *self.entries.get_unchecked(subtable_start + idx) }
+    }
+
+    /// Raw entries base pointer for the asm-kernel's `[dist_tbl + idx*4]`
+    /// gathers (rung (c)); entries are `#[repr(transparent)]` u32s. The
+    /// pointer is valid for `main_size + subtables` entries for the life of
+    /// the table (contract E5: tables immutable while the asm runs).
+    #[inline(always)]
+    pub fn entries_ptr(&self) -> *const DistEntry {
+        self.entries.as_ptr()
     }
 
     /// Resolve an entry (handle subtables)

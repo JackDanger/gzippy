@@ -56,70 +56,53 @@ def find_binary(binaries_dir: Path, name: str) -> str | None:
     return None
 
 
-def benchmark_decompression(
-    tool: str,
-    bin_path: str,
-    compressed_file: str,
-    output_file: str,
-    original_file: str,
-    threads: int,
-) -> dict:
-    """Benchmark decompression for a single tool."""
-
-    original_size = os.path.getsize(original_file)
-    compressed_size = os.path.getsize(compressed_file)
-
-    # Build command based on tool
-    if tool == "gzippy":
-        cmd = [bin_path, "-d", f"-p{threads}"]
-    elif tool == "pigz":
-        cmd = [bin_path, "-d", f"-p{threads}"]
+def build_decompress_cmd(tool: str, bin_path: str, threads: int) -> list | None:
+    """Stdin→stdout decompress command for a tool (no file args)."""
+    if tool in ("gzippy", "pigz"):
+        return [bin_path, "-d", f"-p{threads}"]
     elif tool == "unpigz":
-        cmd = [bin_path, f"-p{threads}"]
-    elif tool == "gzip":
-        cmd = [bin_path, "-d"]
-    elif tool == "igzip":
-        cmd = [bin_path, "-d"]
+        return [bin_path, f"-p{threads}"]
+    elif tool in ("gzip", "igzip"):
+        return [bin_path, "-d"]
     elif tool == "rapidgzip":
-        cmd = [bin_path, "-d", "-P", str(threads)]
-    else:
-        return {"error": f"unknown tool: {tool}"}
+        return [bin_path, "-d", "-P", str(threads)]
+    elif tool == "libdeflate":
+        # libdeflate-gunzip: single-threaded; stdin->stdout decompress.
+        return [bin_path, "-d", "-c"]
+    return None
 
-    def run_decompress():
-        with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
-            result = subprocess.run(cmd, stdin=fin, stdout=fout, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
 
-    # Warmup
-    if not run_decompress():
-        return {"error": f"{tool} decompression failed on warmup"}
-
-    # Verify correctness
+def prepare_tool(cmd: list, compressed_file: str, output_file: str, original_file: str) -> str | None:
+    """Warmup decode to a real file + correctness check. Returns an error
+    string, or None on success. The timed trials write to /dev/null (SINK
+    LAW); this is the ONLY decode that touches the disk, so the 221 MB write
+    cannot inject disk-writeback stalls into the measured wall."""
+    with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
+        result = subprocess.run(cmd, stdin=fin, stdout=fout, stderr=subprocess.DEVNULL)
+    if result.returncode != 0:
+        return "decompression failed on warmup"
     if not filecmp.cmp(original_file, output_file, shallow=False):
-        return {"error": f"{tool} decompression produced incorrect output", "status": "fail"}
+        return "decompression produced incorrect output"
+    return None
 
-    # Adaptive benchmark with trimmed statistics
-    times = []
-    converged = False
 
-    for trial in range(MAX_TRIALS):
+def run_timed(cmd: list, compressed_file: str) -> tuple:
+    """One timed decode to /dev/null (SINK LAW). Returns (seconds, ok)."""
+    with open(compressed_file, 'rb') as fin:
         start = time.perf_counter()
-        if not run_decompress():
-            return {"error": f"{tool} decompression failed"}
-        times.append(time.perf_counter() - start)
+        result = subprocess.run(cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elapsed = time.perf_counter() - start
+    return elapsed, result.returncode == 0
 
-        if len(times) >= MIN_TRIALS:
-            _, _, _, cv = trimmed_stats(times)
-            if cv < TARGET_CV:
-                converged = True
-                break
 
+def finalize_stats(tool: str, times: list, converged: bool,
+                   original_size: int, compressed_size: int) -> dict:
+    """Build the per-tool result dict (schema unchanged) from its trial times."""
     trimmed, t_mean, t_stdev, t_cv = trimmed_stats(times)
     median = statistics.median(trimmed)
     sorted_trimmed = sorted(trimmed)
     p10 = sorted_trimmed[max(0, len(sorted_trimmed) // 10)]
     p90 = sorted_trimmed[min(len(sorted_trimmed) - 1, len(sorted_trimmed) * 9 // 10)]
-
     return {
         "tool": tool,
         "operation": "decompress",
@@ -136,6 +119,7 @@ def benchmark_decompression(
         "speed_mbps": original_size / median / 1_000_000,
         "p10_speed_mbps": original_size / p90 / 1_000_000,
         "p90_speed_mbps": original_size / p10 / 1_000_000,
+        "timed_sink": "devnull",
         "status": "pass",
     }
 
@@ -182,6 +166,7 @@ def main():
         "unpigz": find_binary(binaries_dir, "unpigz"),
         "igzip": find_binary(binaries_dir, "igzip"),
         "rapidgzip": find_binary(binaries_dir, "rapidgzip"),
+        "libdeflate": find_binary(binaries_dir, "libdeflate-gunzip"),
         "gzip": "/usr/bin/gzip",
     }
 
@@ -213,33 +198,70 @@ def main():
         decomp_tools.append(("igzip", tools["igzip"]))
     if tools["rapidgzip"]:
         decomp_tools.append(("rapidgzip", tools["rapidgzip"]))
+    if tools["libdeflate"]:
+        decomp_tools.append(("libdeflate", tools["libdeflate"]))
     decomp_tools.append(("gzip", tools["gzip"]))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
+        # Phase 1 — prepare every tool: warmup decode to a real file + correctness
+        # check. Tools that fail here are recorded as errors and excluded from the
+        # timed loop. The valid set is then timed INTERLEAVED (round-robin per
+        # trial) to /dev/null — the project's Gate-0d SINK LAW + Gate-1
+        # interleaving. The old harness ran all N trials of one tool then all N of
+        # the next, writing 221 MB to disk every trial; on a shared runner the
+        # disk-writeback stalls landed in the FASTER tool's window (gzippy),
+        # making its distribution bimodal and manufacturing a phantom sign-flip.
+        valid = []  # [(tool_name, cmd)]
+        times_by_tool = {}
         for tool_name, bin_path in decomp_tools:
             # gzip can't parallelise; skip it in multi-threaded runs (pigz covers that comparison).
             # igzip is also single-threaded but runs in every job so guards can assert
             # that gzippy at T>1 beats igzip at T1.
             if tool_name == "gzip" and args.threads > 1:
                 continue
-
+            cmd = build_decompress_cmd(tool_name, bin_path, args.threads)
+            if cmd is None:
+                continue
             out_file = str(tmpdir / f"out-{tool_name}.bin")
-            result = benchmark_decompression(
-                tool_name, bin_path, args.compressed_file, out_file,
-                args.original_file, args.threads
+            err = prepare_tool(cmd, args.compressed_file, out_file, args.original_file)
+            if err is not None:
+                print(f"  {tool_name}: {err}")
+                results["results"].append({
+                    "tool": tool_name, "operation": "decompress",
+                    "error": f"{tool_name} {err}",
+                    "status": "fail" if "incorrect" in err else "error",
+                    "archive_type": args.archive_type, "threads": args.threads,
+                })
+                continue
+            valid.append((tool_name, cmd))
+            times_by_tool[tool_name] = []
+
+        # Phase 2 — interleaved timed trials to /dev/null.
+        converged = False
+        for trial in range(MAX_TRIALS):
+            for tool_name, cmd in valid:
+                elapsed, ok = run_timed(cmd, args.compressed_file)
+                if not ok:
+                    # Should not happen after a passing warmup; record and drop.
+                    times_by_tool[tool_name].append(float("inf"))
+                else:
+                    times_by_tool[tool_name].append(elapsed)
+            if trial + 1 >= MIN_TRIALS:
+                if all(trimmed_stats(times_by_tool[t])[3] < TARGET_CV for t, _ in valid):
+                    converged = True
+                    break
+
+        # Phase 3 — finalize per-tool stats (schema unchanged).
+        for tool_name, _ in valid:
+            result = finalize_stats(
+                tool_name, times_by_tool[tool_name], converged,
+                original_size, compressed_size,
             )
-
-            if "error" not in result:
-                ci = ""
-                if "p10_speed_mbps" in result:
-                    ci = f" [{result['p10_speed_mbps']:.0f}-{result['p90_speed_mbps']:.0f}]"
-                print(f"  {tool_name}: {result['speed_mbps']:.1f} MB/s{ci}, "
-                      f"{result['trials']} trials, CV={result.get('cv', 0):.1%}")
-            else:
-                print(f"  {tool_name}: {result.get('error', 'failed')}")
-
+            ci = f" [{result['p10_speed_mbps']:.0f}-{result['p90_speed_mbps']:.0f}]"
+            print(f"  {tool_name}: {result['speed_mbps']:.1f} MB/s{ci}, "
+                  f"{result['trials']} trials, CV={result.get('cv', 0):.1%}")
             result["archive_type"] = args.archive_type
             result["threads"] = args.threads
             results["results"].append(result)

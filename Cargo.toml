@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/gzippy-inflate"]
+resolver = "2"
+
 [package]
 name = "gzippy"
 version = "0.8.0"
@@ -25,6 +29,30 @@ include = [
     "rust-toolchain.toml",
 ]
 
+# Lint levels applied package-wide to every target (lib, bin, tests, benches,
+# examples). Flipping `default` to `pure-rust-inflate` brought the large
+# pure-Rust parallel-decode engine into the bare `cargo clippy --all-targets`
+# lint gate for the first time. These lints fire on INTENTIONAL, perf-deliberate
+# patterns in the hot decode/table-build code (index loops over parallel arrays,
+# hand-rolled clamps/memcpy/div in the bit-twiddling kernels) and on doc-comment
+# formatting — they are pre-existing style, not correctness issues, so they are
+# allowed here rather than rewriting hot loops (which risks the byte-exact
+# contract). Real correctness/clarity lints stay enabled.
+[lints.clippy]
+needless_range_loop = "allow"
+manual_clamp = "allow"
+manual_memcpy = "allow"
+manual_checked_ops = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+nonminimal_bool = "allow"
+explicit_counter_loop = "allow"
+if_same_then_else = "allow"
+unusual_byte_groupings = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
 [lib]
 name = "gzippy"
 path = "src/lib.rs"
@@ -34,10 +62,24 @@ name = "gzippy"
 path = "src/main.rs"
 
 [features]
-default = []
+# The pure-Rust parallel single-member decoder (the `parallel_sm` cfg, emitted
+# by `pure-rust-inflate`) is the SOLE production decode path: every build —
+# including the bare `cargo build` / lint gate — compiles the parallel module and
+# decodes ALL gzip formats (single-member, multi-member, BGZF, raw DEFLATE) via
+# pure-Rust with NO C-FFI in the decode graph. The legacy serial libdeflate/
+# zlib-ng one-shot single-member path and the ISA-L FFI decode path have been
+# removed. (C-FFI remains ONLY for COMPRESSION — ISA-L/libdeflate/zlib-ng — and
+# behind dev/test code as differential oracles.)
+default = ["pure-rust-inflate"]
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
-isal-compression = ["isal-rs"]  # ISA-L compression for fast levels (L0-L3)
+isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation
+# Coz causal profiling: wires fulcrum::probe scopes/progress into the
+# parallel-SM decode so `coz run` can measure per-region wall-elasticity
+# (∂wall/∂speed). OFF by default — no fulcrum dep, probes compile to no-ops.
+# Build with `--features pure-rust-inflate,coz` and run the coz_bench example
+# under `coz run`. See examples/coz_bench.rs.
+coz = ["dep:fulcrum", "fulcrum/coz"]
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
 counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in test builds)
@@ -46,8 +88,74 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);
 # does not affect production binaries. See plan.md Phase 11.2.
 oracle = []
+# Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
+# Pulls `asm-kernel` (DEFAULT-ON since the §9 F-c SHIP + the four flip
+# preconditions, plans/asm-campaign.md §10): every production decode build
+# enables `pure-rust-inflate`, so this is the default-flip wire. Non-Linux and
+# non-x86_64 builds are bit-for-bit unaffected (every kernel call site is
+# compile-gated on the build.rs `asm_kernel` cfg = feature + x86_64 + Linux;
+# Darwin x86_64 cannot compile the 15-GPR asm region — rbp is reserved).
+pure-rust-inflate = ["rpmalloc-caches", "asm-kernel"]
+# ── ASM campaign (plans/asm-campaign.md) ─────────────────────────────────────
+# Rung (c): the contig clean fast loop's per-symbol hot path as ONE asm!
+# region (asm_kernel.rs) — seam amortized to ~once per fast-loop run (the
+# increment-(a) falsifier's mechanism). Linux-x86_64-only (compile-gated per
+# call site via the build.rs `asm_kernel` cfg — the asm names 15 GPRs, which
+# does not allocate on Darwin where rbp is the reserved frame pointer);
+# runtime-dispatched (BMI2 detect) with the GZIPPY_ASM_KERNEL=0
+# kill-switch; the pure-Rust loop is ALWAYS compiled and is the sole path on
+# every other arch/CPU. DEFAULT-ON via `pure-rust-inflate` since the §9 F-c
+# SHIP gate + §10 flip preconditions (T1 silesia -19.2% vs base, byte-exact,
+# asm_frac 0.998); the kill-switch and the BMI2 runtime fallback stay.
+asm-kernel = []
+# ── Phase-2 two-path decode (2026-06-06) ──────────────────────────────────────
+# gzippy-native (intended DEFAULT production once parallel-module lint debt is
+# cleared): ONE unified pure-Rust decode engine, NO C-FFI in the DECODE graph, on
+# every arch. It is a pure alias of `pure-rust-inflate`, so a native build is
+# byte-identical to today's shipped decode. NOTE: the FFI-free mandate is
+# DECODE-ONLY — x86_64 release builds may still ADD `isal-compression` on the
+# command line for the ISA-L *compression* backend (T1 L0–L3); that is layered by
+# the build/CI scripts per-target, NOT pulled here, so arm64 native stays C-free.
+gzippy-native = ["pure-rust-inflate"]
+arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
+# Allocator-visibility tooling: enable rpmalloc's ENABLE_STATISTICS so
+# dump_global_stats() reports mapped_total / unmapped_total / cached /
+# huge_alloc_peak — i.e. whether segments are warm-reused (span cache) or
+# re-mapped (faults). Measurement only; dump gated at runtime by
+# GZIPPY_RPMALLOC_STATS.
+rpmalloc-stats = ["arena-allocator", "rpmalloc-sys/statistics"]
+# The rpmalloc span-cache TUNING KNOBS (the lever): global cache for
+# cross-thread span reuse + thread cache + adaptive sizing. Toggleable so
+# they can be A/B'd against the default rpmalloc-sys build.
+rpmalloc-caches = [
+    "arena-allocator",
+    "rpmalloc-sys/global_cache",
+    "rpmalloc-sys/thread_cache",
+    "rpmalloc-sys/adaptive_thread_cache",
+]
+# Activates `#[global_allocator] = rpmalloc::RpMalloc` in src/main.rs.
+# Test for the "pipeline idle is allocator contention" hypothesis.
+global-rpmalloc = ["dep:rpmalloc"]
+libdeflate = []
+streaming-libdeflate-rs = ["dep:streaming-libdeflate-rs"]
+dynasm = ["dep:dynasm"]
+dynasmrt = ["dep:dynasmrt"]
+# Route C: per-block hand-written x86_64 assembly inflate via dynasm-rs
+# (plans/unified-decoder.md §3.1 / §4.3 / §5.1). x86_64-only for v1.
+route-c-dynasm = ["dynasm", "dynasmrt"]
 
 [dependencies]
+# Causal profiler probes (optional; pulled ONLY under --features coz, which is
+# never enabled by default/CI builds — see the `coz` feature). Declared as a GIT
+# dep (not a `../fulcrum` path dep): cargo loads an optional path-dependency's
+# manifest at RESOLVE time even when the feature is off, so a `path = "../fulcrum"`
+# made every default/CI build fail (`failed to load manifest for dependency
+# 'fulcrum'`) in checkouts without a sibling ../fulcrum. A git source resolves
+# without a local checkout and is only fetched/compiled when `coz` is enabled.
+# For local iteration ON fulcrum, override with an UNCOMMITTED patch in your
+# .cargo/config.toml: [patch."https://github.com/JackDanger/fulcrum.git"]
+#   fulcrum = { path = "../fulcrum" }
+fulcrum = { git = "https://github.com/JackDanger/fulcrum.git", optional = true }
 # Compression: flate2 with zlib-ng for maximum performance
 # zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
@@ -84,6 +192,14 @@ memchr = "2.7"
 # System utilities
 core_affinity = "0.8"
 libc = "0.2"
+allocator-api2 = { version = "0.2", optional = true }
+rpmalloc-sys = { version = "0.2", optional = true }
+# Global rpmalloc allocator — vendor parity test. Gated behind
+# `global-rpmalloc` feature; only activated for the perf experiment.
+rpmalloc = { version = "0.2", optional = true }
+streaming-libdeflate-rs = { version = "0.2", optional = true }
+dynasm = { version = "5", optional = true }
+dynasmrt = { version = "5", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -92,6 +208,62 @@ cc = "1"
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+# Property-based + fuzz-loop differential testing of the pure-Rust inflate path
+# (src/tests/inflate_proptest.rs, src/tests/inflate_fuzz_loop.rs). Default
+# features (rand-based generation + shrinking); no extra transitive C deps.
+proptest = "1"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+gzippy-inflate = { path = "crates/gzippy-inflate", features = ["route-c-dynasm"] }
+# Phase 0.6 spike: iai-callgrind for SIMD-fidelity test.
+# See plans/inner-loop-execution.md Phase 0.6.
+iai-callgrind = "0.13"
+# Phase 1.2 microbench harness.
+criterion = "0.5"
+
+[[example]]
+name = "coz_bench"
+required-features = ["pure-rust-inflate"]
+
+[[example]]
+name = "kernel_ab_aarch64"
+required-features = ["pure-rust-inflate"]
+
+[[example]]
+name = "streaming_thin"
+required-features = ["pure-rust-inflate"]
+
+[[bench]]
+name = "inflate_isal_vs_pure_rust"
+harness = false
+required-features = ["isal-compression"]
+
+[[bench]]
+name = "engine_isolation"
+harness = false
+required-features = ["pure-rust-inflate", "isal-compression"]
+
+[[bench]]
+name = "bootstrap_marker_overhead"
+harness = false
+required-features = ["pure-rust-inflate"]
+
+[[bench]]
+name = "iai_simd_spike"
+harness = false
+
+[[bench]]
+name = "inflate_block"
+harness = false
+required-features = ["pure-rust-inflate"]
+
+[[bench]]
+name = "tight_huffman_baseline"
+harness = false
+required-features = ["pure-rust-inflate"]
+
+[[bench]]
+name = "alloc_pattern"
+harness = false
 
 [profile.release]
 lto = "fat"           # Full cross-crate LTO (slower build, faster binary)
@@ -99,6 +271,31 @@ codegen-units = 1     # Single codegen unit for maximum optimization
 panic = "abort"       # Smaller binary, no unwinding overhead
 opt-level = 3         # Maximum optimization
 strip = true          # Remove symbols for smaller binary
+
+# iai-callgrind requires debug symbols to find its instrumented sentinels;
+# the stripped release profile breaks it. Keep release-grade optimization
+# but retain full debug info for cachegrind output parsing.
+# LTO disabled here because iai-callgrind's sentinel-finder doesn't work
+# well with fat LTO (sentinels can be merged across translation units).
+[profile.bench]
+inherits = "release"
+strip = false
+debug = true
+lto = false
+
+# Fast CORRECTNESS-test profile: release-grade opt (so the asm kernel + differential
+# tests run fast on big corpora) but LTO OFF + parallel codegen + unwind, so the test
+# harness BUILDS in ~1-2 min instead of the ~15-20 min fat-LTO release-test build.
+# Correctness (byte-exact output) is opt-/LTO-independent, so this is a safe ~10x faster
+# gate. Use: `cargo test --profile quicktest --no-default-features --features gzippy-native`.
+# PERF (cyc/B) gating still uses the real `--release` binary.
+[profile.quicktest]
+inherits = "release"
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = false
+incremental = true
 
 # Enable native CPU optimizations when building locally
 # (commented out for portable binaries - uncomment for max local perf)

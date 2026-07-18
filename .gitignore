@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+**/target/
 Cargo.lock
 
 # Test data (generated, not the seed)
@@ -43,3 +44,46 @@ __pycache__/
 
 # GPG private key — export to 1Password, never commit
 gzippy-apt-signing-key.asc
+
+# Fulcrum decide artifacts: raw trace JSON files are regenerable; exclude to keep
+# the repo lean. Keep TABLE.txt/manifest/wall_*/verbose/prof/effect_* artifacts.
+artifacts/decide/**/*.json
+# fulcrum decide run artifacts: keep only small text evidence; traces/sinks regenerable
+artifacts/decide/**/*.bin
+artifacts/decide/**/trace.json
+artifacts/decide/decide_*/
+!artifacts/decide/decide_20260611T052041Z/
+!artifacts/decide/decide_20260611T052041Z/**/
+!artifacts/decide/decide_20260611T052041Z/**/*.txt
+
+# fulcrum: self-test stamp is machine-local (SELF-TEST-OR-NO-TRUST)
+tools/fulcrum/.selftest-stamp.json
+tools/fulcrum/**/__pycache__/
+!artifacts/decide/decide_20260611T193035Z/
+!artifacts/decide/decide_20260611T193035Z/**/
+!artifacts/decide/decide_20260611T193035Z/**/*.txt
+
+# machine-local fulcrum config + regenerable measurement artifacts
+.fulcrum/
+artifacts/standing/
+artifacts/kernel-gate/
+!.fulcrum/findings.jsonl
+
+# Process-accumulated scratch / measurement detritus (never part of the branch)
+.pi/
+scratchpad/
+artifacts/imatrix/
+artifacts/insnattr_postlutskip_m1_silesia_t1.json
+
+# Internal campaign run-outputs / process docs (not for the public repo)
+artifacts/
+score/
+plans/
+
+# Campaign/fulcrum internal + editor AI config
+.fulcrum/
+.cursor/
+.cursorrules
+fulcrum-*.json
+fulcrum-*.spec.json
+.neurotic-*.json

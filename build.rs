@@ -23,8 +23,107 @@ fn main() {
     println!("cargo:rerun-if-changed=scripts/pre-push");
     install_git_hooks();
 
+    emit_parallel_sm_cfgs();
+
     if std::env::var("CARGO_FEATURE_ORACLE").is_ok() {
         build_zopfli_oracle();
+    }
+}
+
+/// Emit the compile-time `cfg` aliases that gate the parallel single-member
+/// decode pipeline. Centralizing the predicate here (instead of repeating a
+/// multi-clause `all(...)` at ~140 call sites) makes the architecture/feature
+/// matrix auditable in ONE place — the exact concern raised in the arm64
+/// enablement task ("the cfg generalization must not silently drop a needed
+/// gate or mis-route").
+///
+/// Two aliases:
+///
+/// * `parallel_sm` — the whole chunked parallel-SM orchestration
+///   (chunk_fetcher / chunk_decode / inflate_wrapper / sm_driver / …) is
+///   compiled in. True when EITHER:
+///     - `x86_64` with `isal-compression` OR `pure-rust-inflate`
+///       (x86 historically ran ISA-L; `pure-rust-inflate` is the
+///       C-FFI-free path), OR
+///     - `aarch64` with `pure-rust-inflate` (NEW: the pure-Rust inner
+///       decoder compiles + runs natively on arm64; ISA-L's C library is
+///       x86-only and is intentionally NOT required here).
+///
+/// * `pure_inflate_decode` — the pure-Rust inner decode wrapper
+///   (`Inflate<Clean, Generic, Streaming>`) is the active decoder. True on
+///   `x86_64` or `aarch64` when `pure-rust-inflate` is enabled. This is the
+///   subset of `parallel_sm` that previously read
+///   `all(target_arch = "x86_64", feature = "pure-rust-inflate")`.
+///
+/// Anything that genuinely needs the ISA-L **C** library stays gated on
+/// `all(feature = "isal-compression", target_arch = "x86_64")` and is NOT
+/// covered by these aliases.
+fn emit_parallel_sm_cfgs() {
+    // Declare the custom cfgs so `--cfg`/`cfg!()` uses don't trip the
+    // `unexpected_cfgs` lint (required since Rust 1.80).
+    println!("cargo::rustc-check-cfg=cfg(parallel_sm)");
+    println!("cargo::rustc-check-cfg=cfg(pure_inflate_decode)");
+    println!("cargo::rustc-check-cfg=cfg(asm_kernel)");
+
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let is_x86_64 = arch == "x86_64";
+    let is_aarch64 = arch == "aarch64";
+
+    // Cargo exposes enabled features as CARGO_FEATURE_<NAME> (uppercased,
+    // `-` → `_`).
+    let has_pure_rust_inflate = std::env::var_os("CARGO_FEATURE_PURE_RUST_INFLATE").is_some();
+
+    // The single-member parallel decode (the rapidgzip-shaped path) exists in
+    // EXACTLY ONE config: pure-Rust. `isal-compression` only keeps the ISA-L
+    // *compression* backend; it does NOT enable any production decode. So the
+    // parallel decode is always the pure-Rust decoder, and
+    // `pure_inflate_decode == parallel_sm`.
+    let parallel_sm = (is_x86_64 || is_aarch64) && has_pure_rust_inflate;
+    let pure_inflate_decode = parallel_sm;
+
+    if parallel_sm {
+        println!("cargo::rustc-cfg=parallel_sm");
+    }
+    if pure_inflate_decode {
+        println!("cargo::rustc-cfg=pure_inflate_decode");
+    }
+
+    // `asm_kernel` — the whole-fast-loop x86_64 `asm!` region in
+    // `parallel/asm_kernel.rs` is compiled in and dispatched to. Requires the
+    // `asm-kernel` feature AND x86_64 AND **Linux**: the asm region names 15
+    // general-purpose registers, which allocates on Linux (rbp is available)
+    // but NOT on Darwin, where the frame pointer is reserved — an
+    // x86_64-apple-darwin build dies with "inline assembly requires more
+    // registers than available". Linux x86_64 is also the only platform the
+    // kernel was ever measured/shipped on; every other target takes the
+    // byte-identical pure-Rust fast loop.
+    let has_asm_kernel_feature = std::env::var_os("CARGO_FEATURE_ASM_KERNEL").is_some();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let asm_kernel = has_asm_kernel_feature && is_x86_64 && target_os == "linux";
+    if asm_kernel {
+        println!("cargo::rustc-cfg=asm_kernel");
+    }
+
+    // BUILD_FLAVOR: compile-time &'static str consumed by `env!("BUILD_FLAVOR")`.
+    //   "parallel-sm+pure"  — parallel_sm (gzippy-native / pure-rust-inflate, the
+    //                         pure-Rust DEFLATE engine, x86_64 + aarch64). The product.
+    //   "legacy-serial"     — no parallel_sm (a bare no-feature build). NOT the
+    //                         product and no longer a working decode build (the
+    //                         legacy C-FFI one-shot decode path was removed); a
+    //                         `cargo::warning` is emitted below.
+    let flavor = if parallel_sm {
+        "parallel-sm+pure"
+    } else {
+        "legacy-serial"
+    };
+    println!("cargo::rustc-env=BUILD_FLAVOR={flavor}");
+
+    if !parallel_sm {
+        println!(
+            "cargo::warning=building without the pure-Rust parallel decoder (no parallel_sm) — \
+             this build has NO working decode path. \
+             Use the default build or `--no-default-features --features gzippy-native`."
+        );
     }
 }
 

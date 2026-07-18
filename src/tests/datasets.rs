@@ -5,6 +5,25 @@ use std::path::Path;
 #[allow(dead_code)]
 pub const DATASET_SIZE: usize = 211 * 1024 * 1024; // ~211 MB matching silesia
 
+/// Write `data` to `path` atomically: write to a per-thread temp file, then
+/// `rename` it into place. cargo runs `#[test]`s concurrently and several call
+/// `prepare_datasets()`, so a plain `fs::write` lets one thread observe a
+/// 0-byte / half-written fixture mid-write — the source of the transient
+/// `gz[3]` index-out-of-bounds panics in the bench/corpus tests. `rename` is
+/// atomic on POSIX, so a concurrent reader sees either the old file or the
+/// complete new one, never a partial.
+#[allow(dead_code)]
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Generate a synthetic software archive (source code patterns)
 #[allow(dead_code)]
 pub fn generate_software_archive(path: &Path) -> Result<()> {
@@ -116,10 +135,17 @@ pub fn prepare_datasets() -> Result<Vec<(&'static str, String, String)>> {
             generate_repetitive_logs(raw_path)?;
         }
 
-        // Ensure compressed version exists
-        if raw_path.exists() && !gz_path.exists() {
+        // Ensure compressed version exists. Skip if the raw source is empty
+        // (e.g. silesia.tar still mid-extraction in a sibling test) — writing a
+        // gz for empty input would yield a tiny member the corpus assertions
+        // then reject; better to leave the fixture absent and let consumers
+        // skip cleanly. The gz is written atomically (see `atomic_write`).
+        if raw_path.exists() && !gz_path.exists() && std::fs::metadata(raw_path)?.len() > 0 {
             eprintln!("[BENCH] Encoding {} into distinct format {}...", name, gz);
             let raw_data = std::fs::read(raw_path)?;
+            if raw_data.is_empty() {
+                continue;
+            }
 
             if name == "software" {
                 // SOFTWARE: Single-member, libdeflate L12 (Deep match search)
@@ -130,7 +156,7 @@ pub fn prepare_datasets() -> Result<Vec<(&'static str, String, String)>> {
                     .gzip_compress(&raw_data, &mut compressed)
                     .unwrap();
                 compressed.truncate(size);
-                std::fs::write(gz_path, &compressed)?;
+                atomic_write(gz_path, &compressed)?;
             } else if name == "logs" {
                 // LOGS: Single-member, libdeflate L1 (Fastest, often produces fixed Huffman blocks)
                 let mut compressed = vec![0u8; raw_data.len() + 1024];
@@ -140,7 +166,7 @@ pub fn prepare_datasets() -> Result<Vec<(&'static str, String, String)>> {
                     .gzip_compress(&raw_data, &mut compressed)
                     .unwrap();
                 compressed.truncate(size);
-                std::fs::write(gz_path, &compressed)?;
+                atomic_write(gz_path, &compressed)?;
             } else {
                 // SILESIA: Single-member (flate2 best)
                 let mut compressed = Vec::new();
@@ -149,7 +175,7 @@ pub fn prepare_datasets() -> Result<Vec<(&'static str, String, String)>> {
                 let mut enc = GzEncoder::new(&mut compressed, Compression::best());
                 enc.write_all(&raw_data)?;
                 enc.finish()?;
-                std::fs::write(gz_path, &compressed)?;
+                atomic_write(gz_path, &compressed)?;
             }
         }
 
@@ -159,4 +185,24 @@ pub fn prepare_datasets() -> Result<Vec<(&'static str, String, String)>> {
     }
 
     Ok(results)
+}
+
+/// Load the real silesia gzip benchmark file if present on disk.
+/// Returns `None` when `benchmark_data/silesia-gzip.tar.gz` is missing
+/// (typical in CI; the bench host has the corpus).
+#[cfg(all(test, parallel_sm))]
+pub fn load_silesia_gzip() -> Option<Vec<u8>> {
+    let path = Path::new("benchmark_data/silesia-gzip.tar.gz");
+    if !path.exists() {
+        return None;
+    }
+    // Treat an empty/short file as absent: a sibling test can transiently
+    // race `prepare_datasets()` on this fixture and observe a 0-byte or
+    // partially-written file. A valid gzip member is at least 18 bytes
+    // (10-byte header + 8-byte trailer); anything shorter is not usable, so
+    // skip instead of handing a truncated buffer to the corpus assertions.
+    match std::fs::read(path) {
+        Ok(d) if d.len() >= 18 => Some(d),
+        _ => None,
+    }
 }

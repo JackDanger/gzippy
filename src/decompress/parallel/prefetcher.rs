@@ -33,6 +33,26 @@ pub trait FetchingStrategy {
     /// Decide which indexes to prefetch next, up to
     /// `max_amount_to_prefetch`. Returned vector is in prefetch-order.
     fn prefetch(&self, max_amount_to_prefetch: usize) -> Vec<usize>;
+
+    /// Notify the strategy that the index `index_to_split` actually
+    /// represents `split_count` sequential indexes (a chunk split into
+    /// subchunks). Mirror of vendor's
+    /// `FetchNextAdaptive::splitIndex` call from
+    /// `GzipChunkFetcher::appendSubchunksToIndexes` at
+    /// `vendor/.../rapidgzip/GzipChunkFetcher.hpp:382`.
+    ///
+    /// Without this, the strategy keeps its `last_fetched` /
+    /// `previous_indexes` accounting in CHUNK units while the
+    /// BlockFinder accumulates SUBCHUNK indexes — the two diverge by
+    /// the cumulative split count, and `prefetch()` returns indexes
+    /// that are ALREADY in `block_offsets` (confirmed sub-partition
+    /// offsets). Those offsets feed `BlockFetcher::prefetch_new_blocks`,
+    /// which emits sub-partition prefetches vendor never emits.
+    /// Empirically: on silesia-large 16T, this gap is 26 sub-partition
+    /// emits worth ~50 ms wall (falsification commit aba6b59).
+    ///
+    /// Default no-op for strategies that don't track per-index history.
+    fn split_index(&mut self, _index_to_split: usize, _split_count: usize) {}
 }
 
 /// Prefetch the next N indexes after the last access. Mirror of
@@ -175,6 +195,39 @@ impl FetchNextAdaptive {
 }
 
 impl FetchingStrategy for FetchNextAdaptive {
+    fn split_index(&mut self, index_to_split: usize, split_count: usize) {
+        if split_count <= 1 {
+            return;
+        }
+        // Reindex `previous_indexes` such that one index is interpreted
+        // as `split_count` separate sequential indexes (mirror of the
+        // inherent method `Self::split_index` defined above; trait impl
+        // duplicates the body to avoid the inherent/trait dispatch
+        // ambiguity when both share a name).
+        let mut new_indexes = VecDeque::new();
+        for &index in &self.previous_indexes {
+            if index == index_to_split {
+                for i in 0..split_count {
+                    new_indexes.push_back(index + split_count - 1 - i);
+                }
+            } else if index > index_to_split {
+                new_indexes.push_back(index + split_count - 1);
+            } else {
+                new_indexes.push_back(index);
+            }
+        }
+        self.previous_indexes = new_indexes;
+        // Also advance `last_fetched` past the split so the next
+        // prefetch returns indexes past the new boundary. Vendor's
+        // `Prefetcher.hpp:204-214` does this implicitly by replacing
+        // the index with the highest of the expanded indexes.
+        if let Some(li) = self.last_fetched.as_mut() {
+            if *li >= index_to_split {
+                *li += split_count - 1;
+            }
+        }
+    }
+
     fn fetch(&mut self, index: usize) {
         self.last_fetched = Some(index);
         // Ignore duplicate accesses (rapidgzip Prefetcher.hpp:104-106).
@@ -263,6 +316,10 @@ impl FetchingStrategy for FetchMultiStream {
 
     fn is_sequential(&self) -> bool {
         self.adaptive.is_sequential()
+    }
+
+    fn split_index(&mut self, index_to_split: usize, split_count: usize) {
+        FetchingStrategy::split_index(&mut self.adaptive, index_to_split, split_count);
     }
 
     fn prefetch(&self, max_amount_to_prefetch: usize) -> Vec<usize> {

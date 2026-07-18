@@ -55,6 +55,11 @@
 
 // ── Shared infrastructure (same module tree as the binary) ───────────────────
 mod backends;
+// Doc-hidden re-export so the `engine_isolation` bench can reach the ISA-L
+// from-bit FFI oracle (`backends::isal_decompress::decompress_deflate_from_bit`).
+// Measurement-only surface; does NOT touch the decode routing graph.
+#[doc(hidden)]
+pub use backends::isal_decompress as isal_decompress_oracle;
 mod cli;
 mod format;
 mod infra;
@@ -82,6 +87,8 @@ pub fn set_output_file(_path: Option<String>) {}
 // Items under `compress::` / `decompress::` are not covered by semver.
 #[doc(hidden)]
 pub mod compress;
+#[doc(hidden)]
+pub mod coz_probe;
 #[doc(hidden)]
 pub mod decompress;
 #[doc(hidden)]

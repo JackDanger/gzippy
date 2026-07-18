@@ -192,7 +192,7 @@ impl<const MAX_SYMBOL_COUNT: usize> Default for HuffmanCodingSymbolsPerLength<MA
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompress::parallel::block_finder::BitReader;
+    use crate::decompress::parallel::bit_reader::BitReader;
 
     /// Build the RFC 1951 fixed tree and decode every symbol class.
     #[test]

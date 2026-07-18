@@ -306,7 +306,7 @@ mod tests {
     fn test_libdeflate_empty() {
         let gz = compress_single_member(b"");
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert!(out.is_empty());
     }
 
@@ -315,7 +315,7 @@ mod tests {
         for b in [0u8, 1, 127, 128, 254, 255] {
             let gz = compress_single_member(&[b]);
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+            crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
             assert_eq!(out, vec![b], "byte {}", b);
         }
     }
@@ -325,7 +325,7 @@ mod tests {
         let data = make_zeros(1_000_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -334,7 +334,7 @@ mod tests {
         let data = make_random_seeded(1_000_000, 42);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -343,7 +343,7 @@ mod tests {
         let data = make_mixed(2_000_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -530,7 +530,7 @@ mod tests {
         assert!(!crate::decompress::format::has_bgzf_markers(&single));
         assert!(!crate::decompress::format::is_likely_multi_member(&single));
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&single, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&single, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -547,7 +547,7 @@ mod tests {
 
         // libdeflate (production gzip path)
         let mut ld_out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut ld_out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut ld_out).unwrap();
         assert_eq!(ld_out, data, "{}: libdeflate", label);
 
         // consume_first (experimental pure-Rust)
@@ -616,7 +616,7 @@ mod tests {
         let multi = compress_multi_member(&data);
 
         let mut t1 = Vec::new();
-        crate::decompress::decompress_multi_member_sequential(&multi, &mut t1).unwrap();
+        crate::decompress::decompress_multi_member_sequential(&multi, &mut t1, false).unwrap();
         assert_eq!(t1, data, "T1 sequential");
 
         for t in 2..=8 {
@@ -659,7 +659,7 @@ mod tests {
         let single = compress_single_member(&data);
         let t = std::time::Instant::now();
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&single, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&single, &mut out).unwrap();
         let mbps = out.len() as f64 / t.elapsed().as_secs_f64() / 1e6;
         assert_eq!(out, data);
         assert!(mbps > 50.0, "single-member: {:.0} MB/s too slow", mbps);
@@ -702,7 +702,7 @@ mod tests {
         let data = vec![b'A'; 10_000_000];
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -712,7 +712,7 @@ mod tests {
         let gz = compress_single_member(&data);
         assert!(gz.len() > data.len() * 95 / 100);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -729,7 +729,7 @@ mod tests {
         let data = make_mixed(100_000);
         let multi = compress_multi_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_multi_member_sequential(&multi, &mut out).unwrap();
+        crate::decompress::decompress_multi_member_sequential(&multi, &mut out, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -744,7 +744,7 @@ mod tests {
         let mid = gz.len() / 2;
         gz[mid] ^= 0xFF;
         let mut out = Vec::new();
-        let result = crate::decompress::decompress_single_member_libdeflate(&gz, &mut out);
+        let result = crate::decompress::decompress_single_member_pure(&gz, &mut out);
         assert!(result.is_err() || out != data);
     }
 
@@ -754,7 +754,7 @@ mod tests {
         let gz = compress_single_member(&data);
         let truncated = &gz[..gz.len() - 100];
         let mut out = Vec::new();
-        let result = crate::decompress::decompress_single_member_libdeflate(truncated, &mut out);
+        let result = crate::decompress::decompress_single_member_pure(truncated, &mut out);
         assert!(result.is_err());
     }
 
@@ -785,7 +785,7 @@ mod tests {
             "BGZF data must be detected as BGZF"
         );
         let mut output = Vec::new();
-        crate::decompress::decompress_gzip_libdeflate(&bgzf, &mut output, 4).unwrap();
+        crate::decompress::decompress_gzip_libdeflate(&bgzf, &mut output, 4, false).unwrap();
         assert_eq!(output, data, "BGZF through router must match original");
     }
 
@@ -802,7 +802,7 @@ mod tests {
             "multi-member must be detected as multi-member"
         );
         let mut output = Vec::new();
-        crate::decompress::decompress_gzip_libdeflate(&multi, &mut output, 4).unwrap();
+        crate::decompress::decompress_gzip_libdeflate(&multi, &mut output, 4, false).unwrap();
         assert_eq!(
             output, data,
             "multi-member through router must match original"
@@ -822,7 +822,7 @@ mod tests {
             "single-member must not be detected as multi-member"
         );
         let mut output = Vec::new();
-        crate::decompress::decompress_gzip_libdeflate(&single, &mut output, 4).unwrap();
+        crate::decompress::decompress_gzip_libdeflate(&single, &mut output, 4, false).unwrap();
         assert_eq!(
             output, data,
             "single-member through router must match original"
@@ -834,7 +834,7 @@ mod tests {
         let data = make_mixed(200_000);
         let bgzf = compress_bgzf(&data);
         let mut output = Vec::new();
-        crate::decompress::decompress_gzip_libdeflate(&bgzf, &mut output, 1).unwrap();
+        crate::decompress::decompress_gzip_libdeflate(&bgzf, &mut output, 1, false).unwrap();
         assert_eq!(output, data, "BGZF T1 through router must match");
     }
 
@@ -843,7 +843,7 @@ mod tests {
         let data = make_mixed(500_000);
         let multi = compress_multi_member(&data);
         let mut output = Vec::new();
-        crate::decompress::decompress_gzip_libdeflate(&multi, &mut output, 1).unwrap();
+        crate::decompress::decompress_gzip_libdeflate(&multi, &mut output, 1, false).unwrap();
         assert_eq!(output, data, "multi-member T1 through router must match");
     }
 
@@ -876,7 +876,7 @@ mod tests {
         let data = make_mixed(200_000);
         let single = compress_single_member(&data);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&single, &mut output, 1).unwrap();
+        crate::decompress::decompress_single_member(&single, &mut output, 1, false).unwrap();
         assert_eq!(
             output, data,
             "decompress_single_member must produce correct output"
@@ -888,7 +888,7 @@ mod tests {
         let data = make_mixed(200_000);
         let single = compress_single_member(&data);
         let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&single, &mut output, 4).unwrap();
+        crate::decompress::decompress_single_member(&single, &mut output, 4, false).unwrap();
         assert_eq!(output, data);
     }
 
@@ -1240,7 +1240,7 @@ mod tests {
         let non_gzip = b"this is not gzip data at all";
         let mut output = Vec::new();
         let bytes =
-            crate::decompress::decompress_gzip_libdeflate(non_gzip, &mut output, 4).unwrap();
+            crate::decompress::decompress_gzip_libdeflate(non_gzip, &mut output, 4, false).unwrap();
         assert_eq!(bytes, 0, "non-gzip must return 0 bytes written");
         assert!(output.is_empty());
     }
@@ -1301,7 +1301,7 @@ mod tests {
         // But decompress_single_member_libdeflate_pub uses gzip_decompress_ex
         // which verifies the trailer. A wrong ISIZE = bad data.
         let mut out = Vec::new();
-        let result = crate::decompress::decompress_single_member_libdeflate(&gz, &mut out);
+        let result = crate::decompress::decompress_single_member_pure(&gz, &mut out);
         // Either error (CRC/ISIZE mismatch) or the data is wrong
         assert!(result.is_err() || out != data);
     }
@@ -1317,7 +1317,7 @@ mod tests {
         gz[len - 2] = 0;
         gz[len - 1] = 0;
         let mut out = Vec::new();
-        let result = crate::decompress::decompress_single_member_libdeflate(&gz, &mut out);
+        let result = crate::decompress::decompress_single_member_pure(&gz, &mut out);
         assert!(result.is_err() || out != data);
     }
 
@@ -1332,7 +1332,7 @@ mod tests {
         let mid = gz.len() / 2;
         gz[mid] ^= 0xFF;
         let mut out = Vec::new();
-        let result = crate::decompress::decompress_single_member(&gz, &mut out, 1);
+        let result = crate::decompress::decompress_single_member(&gz, &mut out, 1, false);
         // Must error or produce wrong output — never silently succeed with wrong data
         assert!(
             result.is_err() || out != data,
@@ -1345,7 +1345,7 @@ mod tests {
         let data = make_zeros(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 1).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 1, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1354,7 +1354,7 @@ mod tests {
         let data = make_sequential(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 1).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 1, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1363,7 +1363,7 @@ mod tests {
         let data = make_random_seeded(200_000, 42);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 1).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 1, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1372,7 +1372,7 @@ mod tests {
         let data = make_mixed(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 1).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 1, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1381,7 +1381,7 @@ mod tests {
         let data = make_binary(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 1).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 1, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1390,7 +1390,7 @@ mod tests {
         let data = make_single_byte(200_000, 0xAA);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 1).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 1, false).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1403,7 +1403,7 @@ mod tests {
         let data = make_mixed(5 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 4).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 4, false).unwrap();
         assert_eq!(out, data, "parallel single-member 5MB must match original");
     }
 
@@ -1423,11 +1423,251 @@ mod tests {
         let data = make_mixed(5 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member(&gz, &mut out, 2).unwrap();
+        crate::decompress::decompress_single_member(&gz, &mut out, 2, false).unwrap();
         assert_eq!(
             out, data,
             "parallel at T2 must still produce correct output"
         );
+    }
+
+    /// Regression (2026-05-29): a multi-member gzip whose SECOND member starts
+    /// past the 16 MiB `is_likely_multi_member` detection window is misrouted
+    /// to the single-member backend. The single-member backends (ISA-L
+    /// `decompress_gzip_stream` and `decompress_single_member_libdeflate`) must
+    /// consume-and-loop residual members so the FULL output is produced — not
+    /// silently truncated to member 1. Real-world shape: `cat big.gz small.gz`.
+    /// Before the fix this produced member 1 only (silent corruption).
+    // (Fixed, task #8 step 2): the pure-Rust SM path now resumes trailing
+    // members of a misrouted multi-member stream. When the single-stream decode
+    // fails at member 1's gzip footer (the second member begins past the 16 MiB
+    // `is_likely_multi_member` window), `decompress_parallel` walks each member's
+    // deflate boundary (pure-Rust, no C-FFI) and decodes the remaining members
+    // with per-member CRC32 + ISIZE verification, resuming past the prefix
+    // already streamed — faithful to gzip(1) multi-member semantics.
+    #[test]
+    fn test_concatenated_members_large_first_member_no_truncation() {
+        // Serialize against the other parallel-SM tests via the shared lock:
+        // this fixture deliberately trips the process-global
+        // `MISROUTE_REENTRY_APPLIED` counter that `multi_member_chunked.rs`'s
+        // deletion-trap tests snapshot before/after a decode — without this
+        // lock the two race under the default parallel test harness.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // member 1: 17 MiB incompressible → > 16 MiB compressed → the 2nd
+        // member's magic falls outside the scan window → misrouted single.
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x9e3779b97f4a7c15u64;
+        for b in &mut m1 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let m2 = b"second member payload after a >16MiB first member".to_vec();
+        let mut gz = compress_single_member(&m1);
+        gz.extend_from_slice(&compress_single_member(&m2));
+
+        // Guard: the fixture must actually trigger the single-member misroute.
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (2nd member past 16 MiB)"
+        );
+
+        let mut expected = m1.clone();
+        expected.extend_from_slice(&m2);
+        for t in [1usize, 4] {
+            let out = crate::decompress::decompress_gzip_to_vec(&gz, t).unwrap();
+            assert_eq!(
+                out.len(),
+                expected.len(),
+                "T{t}: multi-member output truncated (silent corruption regression)"
+            );
+            assert_eq!(out, expected, "T{t}: multi-member output mismatch");
+        }
+    }
+
+    /// Companion to the truncation test: a first member whose COMPRESSED size
+    /// exceeds the 16 MiB detection window, followed by SEVERAL trailing members
+    /// (compressible + incompressible). Exercises (a) more than one resumed
+    /// member and (b) per-member CRC32/ISIZE verification across the member loop.
+    /// Decoded through BOTH the Vec entry and the writer-based
+    /// `decompress_single_member` entry (the streaming/out_fd sink).
+    #[test]
+    fn test_concatenated_members_past_window_multiple_trailing() {
+        // Serialize against the other parallel-SM tests via the shared lock
+        // (see `test_concatenated_members_large_first_member_no_truncation`):
+        // this fixture also trips `MISROUTE_REENTRY_APPLIED`.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Member 1: 17 MiB incompressible → compressed > 16 MiB so the second
+        // member's magic falls outside the scan window (misroute to single).
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x243f6a8885a308d3u64;
+        for b in &mut m1 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        let m2 = b"middle member: short compressible text payload, repeated. \
+                   short compressible text payload, repeated."
+            .to_vec();
+        let mut m3 = vec![0u8; 700 * 1024];
+        let mut s3 = 0xdeadbeefcafef00du64;
+        for b in &mut m3 {
+            s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s3 >> 33) as u8; // incompressible
+        }
+
+        let mut gz = compress_single_member(&m1);
+        gz.extend_from_slice(&compress_single_member(&m2));
+        gz.extend_from_slice(&compress_single_member(&m3));
+
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (members past 16 MiB)"
+        );
+
+        let mut expected = m1.clone();
+        expected.extend_from_slice(&m2);
+        expected.extend_from_slice(&m3);
+
+        for t in [1usize, 4] {
+            // Vec entry.
+            let out = crate::decompress::decompress_gzip_to_vec(&gz, t).unwrap();
+            assert_eq!(out.len(), expected.len(), "T{t}: Vec entry length");
+            assert_eq!(out, expected, "T{t}: Vec entry bytes");
+
+            // Writer-based single-member entry (streaming sink).
+            let mut wout = Vec::new();
+            crate::decompress::decompress_single_member(&gz, &mut wout, t, false).unwrap();
+            assert_eq!(wout.len(), expected.len(), "T{t}: writer entry length");
+            assert_eq!(wout, expected, "T{t}: writer entry bytes");
+        }
+    }
+
+    /// A genuinely CORRUPT single-member stream (truncated deflate body, no
+    /// valid trailing member) must surface a terminal error — the multi-member
+    /// resume must NOT silently swallow corruption or loop forever.
+    #[test]
+    fn test_corrupt_single_member_is_terminal_error_not_resumed() {
+        let data = make_mixed(6 * 1024 * 1024);
+        let mut gz = compress_single_member(&data);
+        // Corrupt the middle of the deflate body so the decode fails but there
+        // is no second gzip member to resume into.
+        let mid = gz.len() / 2;
+        for b in &mut gz[mid..mid + 64] {
+            *b ^= 0xff;
+        }
+        let mut out = Vec::new();
+        let r = crate::decompress::decompress_single_member(&gz, &mut out, 4, false);
+        assert!(
+            r.is_err(),
+            "corrupt single-member stream must be a terminal error, not silently resumed"
+        );
+    }
+
+    /// DoS termination guard (2026-06-08): `deflate_stream_byte_len` runs on the
+    /// multi-member FAILURE path over UNTRUSTED trailing bytes. Adversarial
+    /// garbage (`0xaa` ⇒ bfinal=0/btype=01) used to drive an INFINITE LOOP —
+    /// the shared decoder synthesizes zero-length stored blocks from
+    /// refill-past-EOF zeros that return Ok without BFINAL and without advancing
+    /// the bit cursor, and the walk loop (exits only on BFINAL/Err) spun forever.
+    /// The fix converts non-advancement / EOF-without-BFINAL into a terminal Err.
+    /// Wrapped in a 5s watchdog so a regression FAILS (panics) instead of hanging
+    /// CI forever.
+    #[test]
+    fn test_deflate_stream_byte_len_terminates_on_adversarial_garbage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let r = crate::decompress::scan_inflate::deflate_stream_byte_len(&[0xaa; 4096]);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(is_err) => {
+                handle.join().ok();
+                assert!(
+                    is_err,
+                    "deflate_stream_byte_len on adversarial 0xaa garbage must return Err"
+                );
+            }
+            Err(_) => panic!(
+                "deflate_stream_byte_len HUNG on adversarial 0xaa garbage \
+                 (DoS termination guard regression)"
+            ),
+        }
+    }
+
+    /// End-to-end companion to the watchdog unit test: a VALID large single
+    /// member (>16 MiB so it routes to the pure-Rust single-member path),
+    /// followed by gzip magic + 0xaa garbage that is NOT a real second member.
+    /// The trailing-member resume must surface a terminal Err — NOT hang and NOT
+    /// silently truncate. Wrapped in a 30s watchdog (the member is large) so a
+    /// hang regression fails rather than wedging CI.
+    ///
+    /// Gated on `parallel_sm`: the multi-member trailing-byte RESUME (and thus
+    /// the `deflate_stream_byte_len` boundary walk where the hang lived) only
+    /// exists on the pure-Rust parallel-SM single-member path. Under the
+    /// non-parallel-SM routing this input takes a different backend that decodes
+    /// member 1 and ignores the non-member trailing bytes (no resume, no hang),
+    /// so the terminal-Err invariant asserted here applies only when the resume
+    /// path is compiled in. The config-independent guard is covered by
+    /// `test_deflate_stream_byte_len_terminates_on_adversarial_garbage`.
+    #[cfg(parallel_sm)]
+    #[test]
+    fn test_big_member_plus_gzip_magic_garbage_is_terminal_not_hang() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Serialize against the other parallel-SM tests via the shared lock
+        // (see `test_concatenated_members_large_first_member_no_truncation`):
+        // the fake trailing gzip magic also trips `MISROUTE_REENTRY_APPLIED`
+        // before the resume attempt fails.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // 17 MiB incompressible member → compressed > 16 MiB → routes single.
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x51ed270b8e1d2a3fu64;
+        for b in &mut m1 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let mut gz = compress_single_member(&m1);
+        // gzip magic + flags that look like a member header, then pure garbage
+        // (NOT a valid deflate member / no real trailer).
+        gz.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00]);
+        gz.extend_from_slice(&[0xaa; 4096]);
+
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (garbage past 16 MiB)"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let r = crate::decompress::decompress_single_member(&gz, &mut out, 4, false);
+            let _ = tx.send(r.is_err());
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(is_err) => {
+                handle.join().ok();
+                assert!(
+                    is_err,
+                    "valid big.gz + gzip-magic + 0xaa garbage must be a terminal Err, \
+                     not silent truncation"
+                );
+            }
+            Err(_) => panic!(
+                "decompress_single_member HUNG on big.gz + gzip-magic + 0xaa garbage \
+                 (DoS termination guard regression)"
+            ),
+        }
     }
 
     #[test]
@@ -1437,7 +1677,7 @@ mod tests {
         let mut results = Vec::new();
         for threads in [2, 4, 8] {
             let mut out = Vec::new();
-            crate::decompress::decompress_single_member(&gz, &mut out, threads).unwrap();
+            crate::decompress::decompress_single_member(&gz, &mut out, threads, false).unwrap();
             results.push(out);
         }
         for (i, r) in results.iter().enumerate().skip(1) {
@@ -1469,7 +1709,7 @@ mod tests {
         let data = make_mixed(2 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_streaming(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data, "streaming decompress must match original");
     }
 
@@ -1478,7 +1718,7 @@ mod tests {
         let data = make_zeros(5 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_streaming(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data, "streaming zeros must match");
     }
 
@@ -1487,7 +1727,7 @@ mod tests {
         let data = make_random_seeded(1024 * 1024, 0xdeadbeef);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_streaming(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data, "streaming random data must match");
     }
 
@@ -1496,16 +1736,24 @@ mod tests {
         let data = make_mixed(3 * 1024 * 1024);
         let gz = compress_single_member(&data);
 
-        let mut streaming_out = Vec::new();
-        crate::decompress::decompress_single_member_streaming(&gz, &mut streaming_out).unwrap();
+        // Pure-Rust production single-member decode.
+        let mut pure_out = Vec::new();
+        crate::decompress::decompress_single_member_pure(&gz, &mut pure_out).unwrap();
 
-        let mut libdeflate_out = Vec::new();
-        crate::decompress::decompress_single_member_libdeflate(&gz, &mut libdeflate_out).unwrap();
+        // Differential oracle: libdeflate FFI (test-only). The production decode
+        // graph no longer uses libdeflate, but it remains a fuzz/differential
+        // oracle — the pure-Rust decode must be byte-identical to it.
+        let mut oracle_out = vec![0u8; data.len() + 1024];
+        let res = crate::backends::libdeflate::DecompressorEx::new()
+            .gzip_decompress_ex(&gz, &mut oracle_out)
+            .expect("libdeflate oracle decode");
+        oracle_out.truncate(res.output_size);
 
         assert_eq!(
-            streaming_out, libdeflate_out,
-            "streaming and libdeflate must produce byte-identical output"
+            pure_out, oracle_out,
+            "pure-Rust decode must be byte-identical to the libdeflate oracle"
         );
+        assert_eq!(pure_out, data, "decode must match the original");
     }
 
     #[test]
@@ -1513,7 +1761,7 @@ mod tests {
         let data = b"hello world streaming test".to_vec();
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_streaming(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1522,7 +1770,7 @@ mod tests {
         let data = Vec::new();
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompress::decompress_single_member_streaming(&gz, &mut out).unwrap();
+        crate::decompress::decompress_single_member_pure(&gz, &mut out).unwrap();
         assert!(out.is_empty());
     }
 

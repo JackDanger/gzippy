@@ -228,9 +228,11 @@ fn decompress_multi_member_parallel() {
 fn classify_single_member_t1() {
     let compressed = gzip_encode_with_flate2(&make_text(4096), 6);
     let path = gzippy::classify(&compressed, 1);
-    // ISA-L on x86_64, LibdeflateSingle elsewhere.
+    // Single-member always routes to the pure-Rust ParallelSM pipeline (or the
+    // non-speculative pure-Rust StoredParallel split for stored-dominated input).
+    // The C-FFI one-shot decode backends and ISA-L decode are off the graph.
     assert!(
-        matches!(path, DecodePath::IsalSingle | DecodePath::LibdeflateSingle),
+        matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
         "unexpected path {path:?} for T1 single-member"
     );
 }
@@ -241,7 +243,7 @@ fn classify_single_member_t4() {
     let path = gzippy::classify(&compressed, 4);
     // Still single-member (no multi-block markers) even with T4.
     assert!(
-        matches!(path, DecodePath::IsalSingle | DecodePath::LibdeflateSingle),
+        matches!(path, DecodePath::ParallelSM | DecodePath::StoredParallel),
         "unexpected path {path:?} for T4 single-member"
     );
 }
@@ -250,7 +252,12 @@ fn classify_single_member_t4() {
 fn classify_multi_member_t1_vs_t4() {
     let compressed = multi_member_gzip(&[&make_text(10_000), &make_text(10_000)]);
     assert_eq!(gzippy::classify(&compressed, 1), DecodePath::MultiMemberSeq);
-    assert_eq!(gzippy::classify(&compressed, 4), DecodePath::MultiMemberPar);
+    // STAGE-2d: 2 members at T4 → fewer members than workers, so member-per-worker
+    // cannot saturate the pool (fast_path_ok false) → the whole-file grid.
+    assert_eq!(
+        gzippy::classify(&compressed, 4),
+        DecodePath::MultiMemberGrid
+    );
 }
 
 #[test]

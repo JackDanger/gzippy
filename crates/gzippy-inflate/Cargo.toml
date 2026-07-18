@@ -1,0 +1,50 @@
+[package]
+name = "gzippy-inflate"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust DEFLATE / gzip inflate primitive — public surface for gzippy"
+license = "Zlib"
+repository = "https://github.com/jackdanger/gzippy"
+keywords = ["gzip", "deflate", "decompression", "inflate"]
+categories = ["compression"]
+readme = "README.md"
+build = "build.rs"
+
+# Per plans/unified-decoder.md §3.11: this sub-crate is intended to be
+# `no_std` + `alloc` compatible at the core, with optional std-only
+# helpers behind the `std` feature. v0.1.0 scaffold ships the public
+# API surface only; the actual inflate implementation continues to
+# live in the gzippy parent crate until v0.2.0 when it migrates here.
+
+[features]
+default = ["std"]
+std = []
+
+# §3.12 async API: AsyncInflate gated on the `async` feature so
+# no-std builds don't pull in tokio/futures.
+async = ["std", "dep:futures", "dep:tokio"]
+
+# §3.9 GPU offload backend stubs. Per-backend feature flags so
+# users only pull in the deps they need. v0.1 ships the API only —
+# enabling these does nothing yet; v0.2+ adds real Metal/CUDA/Vulkan
+# implementations (multi-month per plan §11).
+gpu-metal = ["std"]
+gpu-cuda = ["std"]
+gpu-vulkan = ["std"]
+
+# §3.1 Route C v3 dynasm-emit hand asm — x86_64-only. Pulls in the
+# dynasm-rs crates as optional deps so default builds don't.
+route-c-dynasm = ["dep:dynasm", "dep:dynasmrt"]
+
+[dependencies]
+# Sync API uses libdeflater (same as parent crate today) until v0.2.0
+# migrates the pure-Rust path.
+libdeflater = "1.0"
+
+# §3.12 async deps (optional)
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }
+
+# Route C v3 dynasm-emit; only used when `route-c-dynasm` is enabled.
+dynasm = { version = "5", optional = true }
+dynasmrt = { version = "5", optional = true }

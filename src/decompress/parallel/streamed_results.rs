@@ -1,10 +1,12 @@
-#![cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 //! Literal port of `rapidgzip::StreamedResults`
 //! (vendor/rapidgzip/librapidarchive/src/core/StreamedResults.hpp:27-158).
 //!
 //! Append-only result queue with `push` / `finalise` on the producer side
 //! and blocking `get(position, timeout)` on consumers. Used by the async
-//! raw block-finder coordinator (`raw_block_finder.rs`), mirroring vendor
+//! raw block-finder coordinator (`async_block_finder.rs`), mirroring vendor
 //! `core/BlockFinder<RawFinder>`'s `m_blockOffsets` member
 //! (BlockFinder.hpp:202).
 

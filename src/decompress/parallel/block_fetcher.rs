@@ -1,4 +1,4 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(parallel_sm)]
 
 //! Literal port of `rapidgzip::BlockFetcher`
 //! (vendor/.../core/BlockFetcher.hpp:38-688).
@@ -44,7 +44,7 @@ use super::statistics::ChunkFetcherStatistics;
 /// `Strategy` defaults to LRU; `Prefetch` defaults to nothing — caller
 /// picks a `FetchingStrategy` implementor.
 pub struct BlockFetcher<
-    Key: Hash + Eq + Clone + Ord,
+    Key: Hash + Eq + Clone + Ord + std::fmt::Debug,
     Value: Clone,
     Prefetch: FetchingStrategy,
     Err = (),
@@ -83,7 +83,7 @@ pub struct BlockFetcher<
 
 impl<Key, Value, Prefetch, Err> BlockFetcher<Key, Value, Prefetch, Err>
 where
-    Key: Hash + Eq + Clone + Ord,
+    Key: Hash + Eq + Clone + Ord + std::fmt::Debug,
     Value: Clone,
     Prefetch: FetchingStrategy,
 {
@@ -98,7 +98,7 @@ where
             prefetch_cache: Mutex::new(Cache::new(prefetch_capacity)),
             prefetching: Mutex::new(HashMap::new()),
             fetching_strategy: Mutex::new(fetching_strategy),
-            statistics: ChunkFetcherStatistics::new(parallelization),
+            statistics: ChunkFetcherStatistics::new(),
             failed_prefetch: Mutex::new(HashSet::new()),
             parallelization,
         }
@@ -145,6 +145,7 @@ where
     /// `get()` does cache lookup + prefetch take + dispatch + wait +
     /// cache-insert in a single call. Underlying thread-pool unification
     /// is a follow-up.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn get<S>(&self, block_offset: Key, submit: S) -> Result<Value, Err>
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
@@ -210,25 +211,76 @@ where
     /// (GzipChunkFetcher.hpp:646-654). Re-keying under the real offset
     /// here would pollute the cache: a wrong-range chunk would short-
     /// circuit the next `get_if_available(realOffset)` check.
-    pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
-        if let Some(v) = self.get_if_available(block_offset) {
+    /// `pump_prefetch` is called once per 1ms wait tick while `rx.recv`
+    /// is blocking — the caller threads in `prefetch_new_blocks` with its
+    /// closures captured. Vendor parity: BlockFetcher.hpp:314-316
+    /// `while ( queuedResult.wait_for(1ms) == timeout ) prefetchNewBlocks(...)`.
+    /// Previously gzippy did a bare `rx.recv()` here, which parked the
+    /// consumer thread without dispatching new prefetches — `pool.pick`
+    /// stayed at 2.3s of idle worker capacity while consumer waited
+    /// 89-171 ms per session on in-flight prefetches that took 20-25 ms
+    /// each (`ttp.rx_recv_block` trace bucket).
+    pub fn try_take_prefetched_pumping<F, W>(
+        &self,
+        block_offset: &Key,
+        mut pump_prefetch: F,
+        mut wait_ready: W,
+    ) -> Option<Result<Value, Err>>
+    where
+        F: FnMut(),
+        // EVENT-DRIVEN wakeup: block until any worker completes (or a short
+        // liveness fallback elapses), then re-check. Replaces the fixed
+        // `recv_timeout(1ms)` poll so the consumer re-advances the prefetch
+        // horizon at ~0 latency on each completion. The production caller passes
+        // a `ThreadPool::wait_for_completion`-backed closure; tests pass a small
+        // sleep (same 1ms cadence as the old poll).
+        W: FnMut(),
+    {
+        if let Some(v) = { self.get_if_available(block_offset) } {
             return Some(Ok(v));
         }
-        let rx = self.take_prefetch(block_offset)?;
-        // Vendor `queuedResult.get()` at BlockFetcher.hpp:317. A
-        // matched prefetch is in flight — wait on it. Dropping is a
-        // broken-promise panic, same as `get()`.
-        match rx.recv() {
-            Ok(Ok(v)) => {
-                self.insert(block_offset.clone(), v.clone());
-                Some(Ok(v))
+        let rx = { self.take_prefetch(block_offset)? };
+        // Record the AWAITED chunk's encoded offset so the consumer wait can be
+        // decomposed (Fulcrum) against that exact chunk's decode span — robust
+        // keyed correlation, not overlap-heuristic blame. This is THE wait that
+        // gates the in-order wall (~97% of it), so knowing which chunk it waits
+        // on, and what that chunk was doing, is the indisputable measurement.
+        // Lever H (event-driven): pump the prefetch horizon on each worker
+        // completion, not on a fixed 1ms tick (vendor BlockFetcher.hpp:314-316
+        // uses a 1ms `wait_for`; we converge to rg's blocking consumer by waking
+        // on the completion event instead). Keeps the horizon advancing so by
+        // the time chunk N arrives, chunks N+1..N+k are already in flight or
+        // done — at ~0 latency after a worker frees up.
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(v)) => return Some(Ok(v)),
+                Ok(Err(e)) => return Some(Err(e)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    pump_prefetch();
+                    // Block until a worker completes (immediate wakeup) or the
+                    // liveness fallback elapses, then loop and re-check `rx`.
+                    wait_ready();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!(
+                    "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
+                     (broken promise)"
+                ),
             }
-            Ok(Err(e)) => Some(Err(e)),
-            Err(_) => panic!(
-                "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
-                 (broken promise)"
-            ),
         }
+    }
+
+    /// Back-compat wrapper for callers that don't want to thread a pump
+    /// closure (tests). Production callers must use the pumping variant.
+    #[allow(dead_code)]
+    pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
+        // No pool to wake us here (tests / non-production callers); the fallback
+        // waiter is a short sleep so an empty `try_recv` doesn't busy-spin —
+        // preserving the old 1ms poll cadence for this path.
+        self.try_take_prefetched_pumping(
+            block_offset,
+            || {},
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        )
     }
 
     /// Like `get`, plus the `prefetchNewBlocks` body interleaved
@@ -257,7 +309,7 @@ where
     /// Returns `(value, prefetches_submitted_count)` so the caller can
     /// log / stat-record without re-querying.
     #[allow(clippy::too_many_arguments)]
-    pub fn get_with_prefetch<S, L, LN, P, F, PO>(
+    pub fn get_with_prefetch<S, L, LN, P, F, PO, W>(
         &self,
         block_offset: Key,
         submit: S,
@@ -267,6 +319,7 @@ where
         is_finalized_and_index_too_high: F,
         partition_offset_for: PO,
         should_drive_prefetch: bool,
+        mut wait_ready: W,
     ) -> (Result<Value, Err>, usize)
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
@@ -280,21 +333,13 @@ where
         P: Fn(Key, Key) -> Receiver<Result<Value, Err>>,
         F: Fn(usize) -> bool,
         PO: Fn(&Key) -> Key,
+        // EVENT-DRIVEN wakeup while blocked on the on-demand decode: block until
+        // a worker completes (or a liveness fallback), then re-check + re-pump.
+        // Replaces the fixed `recv_timeout(1ms)` poll — see
+        // `try_take_prefetched_pumping`.
+        W: FnMut(),
     {
-        // Vendor's `BlockFetcher::get` timing at BlockFetcher.hpp:280-322:
-        //   tGetStart = now();                            // line 280
-        //   ... wait on future ...
-        //   tFutureGetStart = now();                      // line 311
-        //   queuedResult.wait_for(1ms)*                   // line 314
-        //   futureGetDuration = duration(tFutureGetStart);
-        //   m_statistics.futureWaitTotalTime += futureGetDuration;  // line 324
-        //   m_statistics.getTotalTime += duration(tGetStart);       // line 325
-        let t_get_start = std::time::Instant::now();
-
         if let Some(v) = self.get_if_available(&block_offset) {
-            self.statistics
-                .base
-                .add_get_time(t_get_start.elapsed().as_secs_f64());
             return (Ok(v), 0);
         }
 
@@ -323,24 +368,18 @@ where
         }
 
         // BlockFetcher.hpp:312-316 — `while ( queuedResult.wait_for(1ms)
-        // == timeout ) prefetchNewBlocks(...)`. We approximate with
-        // mpsc::Receiver::recv_timeout in a short loop so the prefetch
-        // queue keeps filling while we wait. The 1ms tick matches
-        // vendor exactly.
-        let t_future_wait_start = std::time::Instant::now();
+        // == timeout ) prefetchNewBlocks(...)`. EVENT-DRIVEN: instead of a
+        // fixed 1ms poll we `try_recv` then block on the worker-completion
+        // event (with a liveness fallback), re-filling the prefetch queue at
+        // ~0 latency each time a worker frees up — converging to rg's blocking
+        // consumer.
         let value = loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+            match rx.try_recv() {
                 Ok(Ok(v)) => break v,
                 Ok(Err(e)) => {
-                    self.statistics
-                        .base
-                        .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
-                    self.statistics
-                        .base
-                        .add_get_time(t_get_start.elapsed().as_secs_f64());
                     return (Err(e), prefetched);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if should_drive_prefetch {
                         prefetched += self.prefetch_new_blocks(
                             &lookup_block_offset,
@@ -350,8 +389,11 @@ where
                             &partition_offset_for,
                         );
                     }
+                    // Block until a worker completes (immediate wakeup) or the
+                    // liveness fallback elapses, then loop and re-check `rx`.
+                    wait_ready();
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     panic!(
                         "block_fetcher::get_with_prefetch: dispatch worker dropped reply \
                          (broken promise)"
@@ -359,13 +401,12 @@ where
                 }
             }
         };
-        self.statistics
-            .base
-            .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
-        self.insert(block_offset.clone(), value.clone());
-        self.statistics
-            .base
-            .add_get_time(t_get_start.elapsed().as_secs_f64());
+        // Lever G: do NOT insert into the cache after on-demand fetch.
+        // See note at `try_take_prefetched` — the cache-insert held a
+        // second Arc ref forcing the consumer's `Arc::try_unwrap` to
+        // fail and deep-clone the ~MB-sized ChunkData. Vendor's cache
+        // insert is only used to satisfy CONCURRENT lookups against
+        // the same key, which the single-pass consumer never issues.
         (Ok(value), prefetched)
     }
 
@@ -384,15 +425,20 @@ where
             let mut pc = self.prefetch_cache.lock().unwrap();
             if let Some(v) = pc.get(block_offset) {
                 self.statistics.base.record_prefetch_cache_hit(true);
-                // Remove from prefetch cache (the "take" semantic) and
-                // promote to main cache so subsequent gets are direct
-                // main-cache hits. Mirror BlockFetcher.hpp:392-410.
+                // cache.get_outcome: per-lookup result. Pairs against
+                // each `coord.prefetch_emit` span so the diff can
+                // attribute every emitted prefetch to either a
+                // consume ("source":"prefetch") or a wasted decode
+                // (no matching cache.get_outcome → discarded by
+                // clear_prefetch_cache at end-of-decode).
+                // Lever G: previously this evicted from prefetch_cache
+                // and PROMOTED a clone into self.cache for "subsequent
+                // gets". The single-pass forward consumer never re-gets
+                // the same key, so the promotion held a redundant Arc
+                // ref that forced the consumer's `Arc::try_unwrap` to
+                // deep-clone (~7ms × 24 chunks). Drop the promote —
+                // just evict from prefetch_cache and return.
                 pc.evict(block_offset);
-                drop(pc);
-                self.cache
-                    .lock()
-                    .unwrap()
-                    .insert(block_offset.clone(), v.clone());
                 return Some(v);
             }
         }
@@ -430,6 +476,7 @@ where
     /// Insert a prefetched block into the prefetch cache. Stats:
     /// records the prefetch (rapidgzip's BlockFetcher tracks this via
     /// `prefetchCount` increment on prefetch submission).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn insert_prefetched(&self, block_offset: Key, block_data: Value) {
         self.prefetch_cache
             .lock()
@@ -455,6 +502,7 @@ where
     }
 
     /// True iff a prefetch task at `block_offset` is in flight.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetch_in_flight(&self, block_offset: &Key) -> bool {
         self.prefetching.lock().unwrap().contains_key(block_offset)
     }
@@ -464,6 +512,7 @@ where
     /// `BlockFetcher::get` call. Mirror of vendor's
     /// `m_prefetching.emplace(*prefetchBlockOffset, std::move(prefetchedFuture))`
     /// at BlockFetcher.hpp:558.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn submit_prefetch(&self, block_offset: Key, rx: Receiver<Result<Value, Err>>) {
         self.prefetching.lock().unwrap().insert(block_offset, rx);
     }
@@ -472,6 +521,7 @@ where
     /// Mirror of vendor's `processReadyPrefetches` cleanup
     /// (BlockFetcher.hpp:431-450) — receivers whose consumer no longer
     /// cares are dropped, the worker's `reply.send` then fails silently.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn drop_prefetches_matching<F: FnMut(&Key) -> bool>(&self, mut pred: F) {
         self.prefetching.lock().unwrap().retain(|k, _| !pred(k));
     }
@@ -483,12 +533,26 @@ where
     }
 
     /// Snapshot of the in-flight prefetch keys.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetching_keys(&self) -> Vec<Key> {
         self.prefetching.lock().unwrap().keys().cloned().collect()
     }
 
+    /// Snapshot of `(key, value)` pairs in the prefetch cache, sorted by
+    /// key. Does NOT touch LRU/stats and does NOT evict — the consumer's
+    /// later `get_if_available` still finds the entries. Mirror of
+    /// vendor's `prefetchCache().contents()` consumed by
+    /// `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:524-528).
+    #[cfg_attr(not(parallel_sm), allow(dead_code))]
+    pub fn prefetch_cache_contents_sorted(&self) -> Vec<(Key, Value)> {
+        let mut v = self.prefetch_cache.lock().unwrap().contents_snapshot();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
     /// Vendor's `m_parallelization` cap on simultaneous prefetches
     /// (BlockFetcher.hpp:467: `m_threadPool.capacity()`).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn parallelization(&self) -> usize {
         self.parallelization
     }
@@ -496,6 +560,7 @@ where
     /// Mark a block offset as a failed prefetch (rapidgzip
     /// `m_failedPrefetchCache`). Future `is_failed_prefetch` lookups
     /// return true so the caller doesn't re-issue.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn mark_failed_prefetch(&self, block_offset: Key) {
         self.failed_prefetch.lock().unwrap().insert(block_offset);
     }
@@ -510,6 +575,36 @@ where
             .lock()
             .unwrap()
             .fetch(data_block_index);
+    }
+
+    /// Notify the fetching strategy that a chunk at `index_to_split`
+    /// has expanded into `split_count` sequential subchunk indexes.
+    /// Mirror of vendor's call at
+    /// `GzipChunkFetcher::appendSubchunksToIndexes`
+    /// (`vendor/.../rapidgzip/GzipChunkFetcher.hpp:382`):
+    ///
+    /// ```cpp
+    /// if ( subchunks.size() > 1 ) {
+    ///     BaseType::m_fetchingStrategy.splitIndex(
+    ///         m_nextUnprocessedBlockIndex, subchunks.size() );
+    /// }
+    /// ```
+    ///
+    /// Without this call the strategy's `previous_indexes` /
+    /// `last_fetched` accounting stays in CHUNK units while the
+    /// BlockFinder accumulates SUBCHUNK indexes, and the next
+    /// `prefetch_new_blocks` call queries indexes that are already
+    /// in `block_offsets` — returning confirmed sub-partition
+    /// offsets that get emitted as wasted sub-partition prefetches.
+    /// Falsification commit aba6b59 showed ~50 ms wall savings on
+    /// silesia-large 16T from suppressing those emits via env-gated
+    /// skip; this is the upstream fix that makes the emits never
+    /// generated in the first place.
+    pub fn split_index(&self, index_to_split: usize, split_count: usize) {
+        self.fetching_strategy
+            .lock()
+            .unwrap()
+            .split_index(index_to_split, split_count);
     }
 
     /// Fill the prefetch queue (`m_prefetching`) with up to
@@ -597,6 +692,40 @@ where
             strategy.prefetch(cap)
         };
 
+        // BlockFetcher.hpp:476-491 — resolve the prefetch INDEXES to a
+        // `blockOffsetsToPrefetch` set up-front (including partition
+        // offsets) so we can (a) protect them from eviction via touch
+        // below and (b) reference them in the cache-pollution stop in
+        // the loop. Vendor builds this with the timeout-0 lookup; we use
+        // the same `lookup_block_offset` the loop uses.
+        let mut block_offsets_to_prefetch: Vec<Key> =
+            Vec::with_capacity(block_indexes_to_prefetch.len());
+        for &index in &block_indexes_to_prefetch {
+            if let Some(off) = lookup_block_offset(index) {
+                let partition_offset = partition_offset_for(&off);
+                if partition_offset != off {
+                    block_offsets_to_prefetch.push(partition_offset);
+                }
+                block_offsets_to_prefetch.push(off);
+            }
+        }
+
+        // BlockFetcher.hpp:493-497 — touch all to-be-prefetched offsets
+        // (reverse order, vendor) in BOTH caches so that prefetching one
+        // block cannot evict another block we also intend to prefetch.
+        // The touch makes the to-be-prefetched set most-recently-used, so
+        // `next_nth_eviction` below returns a genuinely-stale candidate.
+        // Lock order is cache-then-prefetch_cache to match `test()`
+        // (block_fetcher.rs:111-113) and avoid a deadlock.
+        {
+            let mut c = self.cache.lock().unwrap();
+            let mut pc = self.prefetch_cache.lock().unwrap();
+            for off in block_offsets_to_prefetch.iter().rev() {
+                c.touch(off);
+                pc.touch(off);
+            }
+        }
+
         let mut submitted = 0usize;
         for index in block_indexes_to_prefetch {
             // BlockFetcher.hpp:500-502 — stop when the pool is full.
@@ -642,19 +771,46 @@ where
             // index lookup above remains SUCCESS-only.
             let next_prefetch_block_offset = match lookup_next_block_offset(index + 1) {
                 Some(o) => o,
-                None => continue,
+                None => {
+                    continue;
+                }
             };
 
+            // BlockFetcher.hpp:544-551 — avoid cache pollution: if
+            // submitting this prefetch would (on the (prefetching+1)-th
+            // hypothetical insert — the "+1" for the on-demand task the
+            // consumer is waiting on, plus the in-flight prefetches that
+            // also insert before our eviction of interest) evict a block
+            // we ourselves intend to prefetch, STOP. There is no point
+            // prefetching block X if doing so evicts block Y we also want.
+            if let Some(offset_to_be_evicted) = self
+                .prefetch_cache
+                .lock()
+                .unwrap()
+                .next_nth_eviction(self.prefetching_len() + 1)
+            {
+                if block_offsets_to_prefetch.contains(&offset_to_be_evicted) {
+                    break;
+                }
+            }
+
             // BlockFetcher.hpp:553-557 — submit prefetch task.
+            //
+            // `offset_eq_partition`: true means this is a
+            // partition-aligned prefetch (the "main" one for a
+            // partition); false means a sub-partition speculative
+            // prefetch — those are the candidates for the missing
+            // vendor `nextNthEviction` cache-pollution guard
+            // (BlockFetcher.hpp:544-551).
             self.statistics.base.record_prefetch();
             let rx = submit_for(prefetch_block_offset.clone(), next_prefetch_block_offset);
             // BlockFetcher.hpp:558 — `m_prefetching.emplace(offset, std::move(future))`.
             // We bypass `submit_prefetch` here to avoid double-counting
             // record_prefetch (already done above).
-            self.prefetching
-                .lock()
-                .unwrap()
-                .insert(prefetch_block_offset, rx);
+            {
+                let mut p = self.prefetching.lock().unwrap();
+                p.insert(prefetch_block_offset, rx);
+            }
             submitted += 1;
         }
 
@@ -662,6 +818,7 @@ where
     }
 
     /// Ask the fetching strategy which indexes to prefetch.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetch_indexes(&self, max_amount_to_prefetch: usize) -> Vec<usize> {
         self.fetching_strategy
             .lock()
@@ -674,6 +831,7 @@ where
         self.fetching_strategy.lock().unwrap().last_fetched()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
     }
@@ -704,7 +862,10 @@ where
                         prefetching.remove(&key);
                         // Insert into prefetch cache.
                         drop(prefetching);
-                        self.prefetch_cache.lock().unwrap().insert(key, value);
+                        {
+                            let mut pc = self.prefetch_cache.lock().unwrap();
+                            pc.insert(key, value);
+                        }
                         prefetching = self.prefetching.lock().unwrap();
                         moved += 1;
                     }
@@ -733,6 +894,11 @@ where
         // each remaining one counts as a cache_unused_entry. Mirrors
         // the LRU eviction-callback path vendor uses.
         let unused = pc.size();
+        // cache.discard_unused: emit per-entry so the diff can show
+        // exactly which offsets in `coord.prefetch_emit` were never
+        // consumed. Sum equals the (count of `coord.prefetch_emit`
+        // spans) - (count of `cache.get_outcome source=prefetch`
+        // events) modulo any still-in-flight in `prefetching`.
         for _ in 0..unused {
             self.statistics.base.record_cache_unused_entry();
         }
@@ -742,6 +908,7 @@ where
     /// Lock + snapshot both caches' statistics + the chunk-extra
     /// counters. Mirror of `BlockFetcher::statistics`
     /// (BlockFetcher.hpp:337-348).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn cache_statistics(
         &self,
     ) -> (super::cache::CacheStatistics, super::cache::CacheStatistics) {
@@ -751,14 +918,17 @@ where
         )
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn cache_size(&self) -> usize {
         self.cache.lock().unwrap().size()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetch_cache_size(&self) -> usize {
         self.prefetch_cache.lock().unwrap().size()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn in_flight_count(&self) -> usize {
         self.prefetching.lock().unwrap().len()
     }
@@ -833,15 +1003,20 @@ mod tests {
     }
 
     #[test]
-    fn prefetched_block_promotes_to_main_cache_on_get() {
+    fn prefetched_block_is_evicted_on_get_without_promotion() {
+        // Lever G (commit 4890e81): the single-pass forward consumer never
+        // re-gets the same key, so the old prefetch→main-cache PROMOTE held
+        // a redundant Arc ref that forced the consumer's `Arc::try_unwrap`
+        // to deep-clone (~7ms × 24 chunks). Behavior changed: `get_if_available`
+        // on a prefetch hit now EVICTS from prefetch_cache and returns the
+        // value WITHOUT promoting to the main cache.
         let bf = new_fetcher();
         bf.insert_prefetched(200, "pre-200".into());
         assert_eq!(bf.prefetch_cache_size(), 1);
         let v = bf.get_if_available(&200);
         assert_eq!(v, Some("pre-200".into()));
-        // After promotion, main cache has it (prefetch_cache still has it
-        // too — Cache::get does NOT evict; promotion just inserts into main).
-        assert_eq!(bf.cache_size(), 1);
+        // Post-Lever-G: prefetch evicted, main cache NOT populated.
+        assert_eq!(bf.cache_size(), 0);
     }
 
     #[test]
@@ -872,14 +1047,18 @@ mod tests {
 
     #[test]
     fn statistics_track_hits_and_prefetch_count() {
+        // Lever G (4890e81): no promotion. The second `get_if_available`
+        // after the first one drained the prefetch_cache returns None
+        // — it's a miss, not a main-cache hit. Statistics still record
+        // the original prefetch insertion + the one prefetch hit.
         let bf = new_fetcher();
         bf.insert_prefetched(500, "p".into());
-        let _ = bf.get_if_available(&500); // prefetch hit
-        let _ = bf.get_if_available(&500); // main cache hit (promoted)
+        let _ = bf.get_if_available(&500); // prefetch hit, evicts
+        let _ = bf.get_if_available(&500); // miss (no promotion under Lever G)
         let snap = bf.statistics.base.snapshot();
         assert!(snap.prefetch_count >= 1);
         assert!(snap.prefetch_cache_hits >= 1);
-        assert!(snap.gets >= 1);
+        // Prefetch hits do not touch the main cache (`record_get` is main-cache only).
     }
 
     #[test]
@@ -940,9 +1119,13 @@ mod tests {
             .unwrap();
         assert_eq!(v, "prefetched");
         assert!(!dispatched);
-        // Prefetch receiver was consumed; cache holds the result now.
+        // Prefetch receiver was consumed. Lever G (4890e81): no promotion
+        // to main cache — single-pass forward consumer never re-gets the
+        // same key, so the prefetch→main-cache promote was holding a
+        // redundant Arc ref. Post-Lever-G, the in-flight receiver is
+        // drained and the result is returned WITHOUT entering main cache.
         assert!(!bf.prefetch_in_flight(&900));
-        assert_eq!(bf.cache_size(), 1);
+        assert_eq!(bf.cache_size(), 0);
     }
 
     #[test]

@@ -1,3 +1,7 @@
+#![cfg(parallel_sm)]
+#![allow(dead_code)]
+// Pre-existing parallel-module dead code, exposed by the default-feature flip; delete in a dedicated cleanup.
+
 //! Cross-thread Vec recycler for `ChunkData`'s `data` (`Vec<u8>`) and
 //! `data_with_markers` (`Vec<u16>`) buffers.
 //!
@@ -41,7 +45,10 @@
 //! allocation time. This preserves Vec **capacity** across chunks on
 //! the same worker — avoiding re-faulting pages on re-take — but does
 //! **not** replace a true per-thread rpmalloc arena (freed pages may
-//! still be munmapped by `System` when the pool is full or on miss).
+//! still be munmapped when the pool is full or on miss). With the
+//! `arena-allocator` feature, `take_*` / `return_*` use
+//! `Vec<T, RpmallocAlloc>` so freed pages stay in rpmalloc's per-thread
+//! free list (vendor `FasterVector.hpp:120-128`).
 //!
 //! ## Lifecycle
 //!
@@ -64,20 +71,18 @@
 //!
 //! ## Page-fault gap vs vendor (open)
 //!
-//! Neurotic x86_64 silesia profile: gzippy spends ~40% of CPU in
-//! `asm_exc_page_fault` + `clear_page_erms`; rapidgzip spends ~17%.
-//! The gap is rpmalloc's per-thread arena keeping pages warm across
+//! rpmalloc's per-thread arena keeps pages warm across
 //! malloc/free cycles within a process. `std::alloc::System` munmaps
 //! large-Vec deallocations and remaps fresh on next allocation,
 //! re-faulting every page. Per-worker LIFO pools address part of this
-//! (capacity reuse on the same worker) but have **not** been measured
-//! to close the 40%→17% gap — treat as an open empirical question.
+//! (capacity reuse on the same worker) but do **not** replace a true
+//! per-thread arena — treat the residual as an open empirical question.
 //!
 //! A previous experiment pre-warmed the pool by touching pages on the
-//! consumer thread before workers spawn. Measured -50% throughput on
-//! the bench (each fresh CLI process paid ~170 ms of pre-touch work
-//! on a ~750 ms decode). Reverted; **do not re-add a prewarm call
-//! without a daemon-mode caller AND a 20-trial bench-on-branch gate.**
+//! consumer thread before workers spawn. It regressed throughput on the
+//! bench (each fresh CLI process paid pre-touch work on a short decode).
+//! Reverted; **do not re-add a prewarm call without a daemon-mode caller
+//! AND a bench-on-branch gate.**
 //!
 //! Closing the remaining gap still requires one of:
 //!   - `allocator-api2` polyfill + `Vec<T, RpmallocAlloc>` for chunk
@@ -90,23 +95,48 @@
 use std::cell::Cell;
 use std::sync::{Mutex, OnceLock};
 
+use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
+
 /// Cap on pool size per worker per Vec type. Sized to a handful of
 /// in-flight chunks per worker (not the old shared cap of 64).
-const MAX_POOLED: usize = 8;
+// Sized for T16 in-flight depth: eager Ready-drain returns buffers sooner,
+// but several Async heads can still hold buffers while workers decode ahead.
+const MAX_POOLED: usize = 12;
 const MAX_WORKERS: usize = 64;
 
 thread_local! {
     static WORKER_POOL_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-fn u8_pools() -> &'static [Mutex<Vec<Vec<u8>>>] {
-    static POOLS: OnceLock<Vec<Mutex<Vec<Vec<u8>>>>> = OnceLock::new();
+// A shared cross-worker pool variant was tried and dropped in favor of the per-worker LIFO pools below.
+
+fn u8_pools() -> &'static [Mutex<Vec<U8>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<U8>>>> = OnceLock::new();
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
 }
 
-fn u16_pools() -> &'static [Mutex<Vec<Vec<u16>>>] {
-    static POOLS: OnceLock<Vec<Mutex<Vec<Vec<u16>>>>> = OnceLock::new();
+#[allow(dead_code)]
+fn u16_pools() -> &'static [Mutex<Vec<U16>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<U16>>>> = OnceLock::new();
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
+}
+
+/// TEST-ONLY: drop every pooled buffer so the next take is a guaranteed pool
+/// MISS (fresh allocation). The latch-interleave test uses this to prove the
+/// per-decode `SystemHugeScope` re-arms on a fresh tiny decode — without it, a
+/// tiny decode after any earlier T1 decode silently (and correctly) reuses the
+/// pooled buffer and allocates nothing at all.
+#[cfg(test)]
+pub fn drain_pools_for_test() {
+    for p in u8_pools() {
+        p.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    for p in u16_pools() {
+        p.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    for p in marker_segment_pools() {
+        p.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 }
 
 /// Called once per `ThreadPool` worker thread on entry to `worker_main`,
@@ -127,48 +157,134 @@ fn pool_index_for_take() -> usize {
     current_worker_pool_index().unwrap_or(0)
 }
 
+thread_local! {
+    /// T1 cache-residency scope (set only by `drive_thin_t1_oracle`, on the
+    /// single serial decode thread, via [`T1ResidentScope`]). When active it
+    /// turns ON the manual buffer pool AND pins every reserve to the fixed
+    /// resident cap — the shipped default behavior, but
+    /// SCOPED to the T1 thread so the T>1 parallel workers (which never set it)
+    /// keep their faithful per-chunk ratio-informed reserve + pooling behavior.
+    static T1_RESIDENT_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that activates the T1 cache-residency scope for the current thread
+/// and restores the prior value on drop (panic-safe).
+pub struct T1ResidentScope {
+    prev: bool,
+}
+
+impl T1ResidentScope {
+    pub fn enter() -> Self {
+        let prev = T1_RESIDENT_SCOPE.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for T1ResidentScope {
+    fn drop(&mut self) {
+        T1_RESIDENT_SCOPE.with(|c| c.set(self.prev));
+    }
+}
+
+#[inline]
+fn t1_resident_scope_active() -> bool {
+    T1_RESIDENT_SCOPE.with(|c| c.get())
+}
+
+fn manual_buffer_pool_enabled() -> bool {
+    t1_resident_scope_active()
+}
+
+/// Eager per-chunk page release at recycle time — currently a NO-OP.
+///
+/// The idea: gzippy holds each chunk's decoded bulk (and marker) buffer resident
+/// until it is recycled; with the default (no manual pool) allocator, freed
+/// buffers can linger in the arena (glibc's dynamic mmap threshold) instead of
+/// being returned to the OS, inflating at-exit RSS. rapidgzip's rpmalloc returns
+/// pages to the OS incrementally. This would mirror that: at recycle time — which
+/// under the deferral invariant is AFTER the chunk's output was written and its
+/// window published, i.e. the buffer's contents are dead — `MADV_DONTNEED` the
+/// buffer's resident pages, returning them to the OS immediately. Byte-transparent:
+/// the virtual mapping is retained; if the buffer is later re-taken from the manual
+/// pool it re-faults to zero pages that the next decode overwrites before any read.
+///
+/// This was gated-measured net-negative (the per-chunk `MADV_DONTNEED` runs on the
+/// serial consumer thread and the returned pages re-fault on the next allocation, a
+/// cost exceeding the teardown it saves), so the shipped default (no eager release)
+/// is hardcoded and `dontneed_alloc` is a no-op. A profitable variant would have to
+/// overlap the page-return onto the PARALLEL worker threads (as rpmalloc does)
+/// rather than the serial consumer — unvalidated.
+#[inline]
+fn dontneed_alloc(_base: *const u8, _bytes: usize) {}
+
+/// Whether the T1 resident-output-pool behavior is active: pins every chunk's
+/// upfront reserve to a single fixed size (see `compute_initial_reserve`) so
+/// recycled output buffers share one capacity, are never realloc'd on reuse,
+/// and keep their pages RESIDENT across chunks. Was previously also
+/// controllable via `GZIPPY_RESIDENT_OUTPUT_POOL=1` (measurement oracle,
+/// removed) — the T1 scope activation (the shipped default) is preserved.
+pub fn resident_output_pool_enabled() -> bool {
+    t1_resident_scope_active()
+}
+
+/// The fixed capacity every resident-scope output buffer is pinned to (the
+/// `compute_initial_reserve` resident arm and `SegmentedU8::ensure_buf` both
+/// use it — ONE source of truth). Equal to the historical `RESERVE_CAP`
+/// upfront ceiling: virtual reserve only, pages fault as touched.
+pub const RESIDENT_PINNED_CAPACITY: usize = 64 * 1024 * 1024;
+
 /// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).
 /// Decode tasks run on pool workers and record the correct index; trial
 /// decodes on the consumer thread bucket returns to worker 0's pool.
-pub fn take_u8(min_capacity: usize) -> Vec<u8> {
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = u8_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.clear();
-            if v.capacity() < min_capacity {
-                v.reserve(min_capacity - v.capacity());
+pub fn take_u8(min_capacity: usize) -> U8 {
+    // Vendor FasterVector.hpp: rpmalloc per-thread cache only — no manual LIFO pool,
+    // except within the T1 resident-scope (see `manual_buffer_pool_enabled`).
+    if manual_buffer_pool_enabled() {
+        let idx = pool_index_for_take();
+        if let Ok(mut pool) = u8_pools()[idx].lock() {
+            if let Some(mut v) = pool.pop() {
+                v.clear();
+                if v.capacity() < min_capacity {
+                    v.reserve(min_capacity - v.capacity());
+                }
+                return v;
             }
-            return v;
         }
     }
-    TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Vec::with_capacity(min_capacity)
+    types::u8_with_capacity(min_capacity)
 }
 
 /// Take a `Vec<u16>` from the current worker's pool.
-pub fn take_u16(min_capacity: usize) -> Vec<u16> {
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = u16_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.clear();
-            if v.capacity() < min_capacity {
-                v.reserve(min_capacity - v.capacity());
+#[allow(dead_code)]
+pub fn take_u16(min_capacity: usize) -> U16 {
+    if manual_buffer_pool_enabled() {
+        let idx = pool_index_for_take();
+        if let Ok(mut pool) = u16_pools()[idx].lock() {
+            if let Some(mut v) = pool.pop() {
+                v.clear();
+                if v.capacity() < min_capacity {
+                    v.reserve(min_capacity - v.capacity());
+                }
+                return v;
             }
-            return v;
         }
     }
-    TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Vec::with_capacity(min_capacity)
+    types::u16_with_capacity(min_capacity)
 }
 
 /// Return a `Vec<u8>` to the pool for `owner_worker` (recorded at take time).
-pub fn return_u8_to_worker(owner_worker: usize, mut v: Vec<u8>) {
+pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     if v.capacity() == 0 {
         return;
     }
-    RETURN_U8_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Return this recycled buffer's resident pages to the OS now,
+    // before it is pooled (re-fault on reuse) or dropped (freed). Lowers
+    // peak/at-exit RSS. Contents are dead
+    // at recycle time. Fires in BOTH the manual-pool and default (drop) modes.
+    dontneed_alloc(v.as_ptr(), v.capacity());
+    if !manual_buffer_pool_enabled() {
+        return; // drop — rpmalloc thread cache retains pages (vendor model)
+    }
     let idx = owner_worker.min(MAX_WORKERS - 1);
     if let Ok(mut pool) = u8_pools()[idx].lock() {
         if pool.len() < MAX_POOLED {
@@ -179,11 +295,19 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: Vec<u8>) {
 }
 
 /// Return a `Vec<u16>` to the pool for `owner_worker`.
-pub fn return_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
+#[allow(dead_code)]
+pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     if v.capacity() == 0 {
         return;
     }
-    RETURN_U16_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Page-release before pool/drop (see return_u8_to_worker).
+    dontneed_alloc(
+        v.as_ptr() as *const u8,
+        v.capacity() * std::mem::size_of::<u16>(),
+    );
+    if !manual_buffer_pool_enabled() {
+        return;
+    }
     let idx = owner_worker.min(MAX_WORKERS - 1);
     if let Ok(mut pool) = u16_pools()[idx].lock() {
         if pool.len() < MAX_POOLED {
@@ -193,12 +317,63 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
     }
 }
 
-pub static TAKE_U8_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static TAKE_U8_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static RETURN_U8_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static TAKE_U16_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static TAKE_U16_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static RETURN_U16_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// ── Per-worker pool of 128 KiB U16 marker segments (SegmentedU16) ─────────
+const MARKER_SEGMENT_ELEMENTS: usize = 64 * 1024;
+const MAX_POOLED_SEGMENTS: usize = 64;
+
+fn marker_segment_pools() -> &'static [Mutex<Vec<U16>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<U16>>>> = OnceLock::new();
+    POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
+}
+
+/// Take one 128 KiB rpmalloc-backed marker segment (`len == 0`).
+pub fn take_marker_segment() -> U16 {
+    if manual_buffer_pool_enabled() {
+        let idx = pool_index_for_take();
+        if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
+            if let Some(mut v) = pool.pop() {
+                v.clear();
+                if v.capacity() < MARKER_SEGMENT_ELEMENTS {
+                    v.reserve(MARKER_SEGMENT_ELEMENTS - v.capacity());
+                }
+                return v;
+            }
+        }
+    }
+    types::u16_with_capacity(MARKER_SEGMENT_ELEMENTS)
+}
+
+/// Return marker segments to the owner worker's pool.
+pub fn return_marker_segments_to_worker(owner_worker: usize, segments: Vec<U16>) {
+    if segments.is_empty() {
+        return;
+    }
+    // Page-release each marker segment before pool/drop.
+    for v in &segments {
+        if v.capacity() != 0 {
+            dontneed_alloc(
+                v.as_ptr() as *const u8,
+                v.capacity() * std::mem::size_of::<u16>(),
+            );
+        }
+    }
+    if !manual_buffer_pool_enabled() {
+        return;
+    }
+    let idx = owner_worker.min(MAX_WORKERS - 1);
+    if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
+        for mut v in segments {
+            if v.capacity() == 0 {
+                continue;
+            }
+            if pool.len() >= MAX_POOLED_SEGMENTS {
+                break;
+            }
+            v.clear();
+            pool.push(v);
+        }
+    }
+}
 
 // Unit tests intentionally omitted: the pool is a process-global LIFO
 // that other tests (via `ChunkData::new`) concurrently take/return

@@ -6,17 +6,15 @@
 //!
 //! Two-layer structure that matches rapidgzip's layout:
 //! - [`FetcherStatistics`] — base counters tracked by `BlockFetcher`:
-//!   cache hits/misses, prefetch counts, per-stage durations, pool
-//!   utilization.
-//! - [`ChunkFetcherStatistics`] — extends with chunk-level counters
-//!   `preemptive_stop_count` + `queue_post_processing_duration`.
+//!   cache hits/misses, prefetch counts.
+//! - [`ChunkFetcherStatistics`] — extends with the chunk-level counter
+//!   `preemptive_stop_count`.
 //!
 //! Both are thread-safe via internal mutex (rapidgzip uses
 //! `std::scoped_lock` on a mutex member).
 
 use std::fmt;
 use std::sync::Mutex;
-use std::time::Instant;
 
 /// Snapshot taken by `FetcherStatistics::print`. Fields mirror
 /// rapidgzip's `--verbose` output (BlockFetcher.hpp:73-124).
@@ -33,17 +31,6 @@ pub struct FetcherStatsSnapshot {
     pub prefetch_cache_misses: u64,
     pub prefetch_cache_unused_entries: u64,
     pub wait_on_block_finder_count: u64,
-    /// Total CPU time spent in chunk decode (sum across workers).
-    pub decode_block_total_time: f64,
-    /// Total wall time spent waiting on `std::future::get` in rapidgzip.
-    pub future_wait_total_time: f64,
-    /// Total wall time spent inside the `get` (consumer) entry point.
-    pub get_total_time: f64,
-    /// First chunk-decode start; last chunk-decode end. Used to
-    /// compute wall-clock duration for pool efficiency.
-    pub decode_block_start: Option<f64>,
-    pub decode_block_end: Option<f64>,
-    pub parallelization: usize,
 }
 
 impl FetcherStatsSnapshot {
@@ -55,20 +42,6 @@ impl FetcherStatsSnapshot {
             return 0.0;
         }
         self.prefetch_cache_unused_entries as f64 / total as f64
-    }
-
-    /// Pool efficiency = (decode CPU total / parallelization) /
-    /// decode wall duration. Mirror of BlockFetcher.hpp:83-84.
-    pub fn pool_efficiency(&self) -> f64 {
-        let decode_duration = match (self.decode_block_start, self.decode_block_end) {
-            (Some(s), Some(e)) if e > s => e - s,
-            _ => return 0.0,
-        };
-        if decode_duration <= 0.0 || self.parallelization == 0 {
-            return 0.0;
-        }
-        let optimal = self.decode_block_total_time / self.parallelization as f64;
-        optimal / decode_duration
     }
 }
 
@@ -101,25 +74,6 @@ impl fmt::Display for FetcherStatsSnapshot {
             f,
             "    Prefetch Stall by BlockFinder     : {}",
             self.wait_on_block_finder_count
-        )?;
-        writeln!(
-            f,
-            "    Time spent in:\n        decodeBlock                   : {:.6} s\n        std::future::get              : {:.6} s\n        get                           : {:.6} s",
-            self.decode_block_total_time, self.future_wait_total_time, self.get_total_time
-        )?;
-        let decode_duration = match (self.decode_block_start, self.decode_block_end) {
-            (Some(s), Some(e)) => e - s,
-            _ => 0.0,
-        };
-        let optimal = if self.parallelization > 0 {
-            self.decode_block_total_time / self.parallelization as f64
-        } else {
-            0.0
-        };
-        writeln!(
-            f,
-            "    Thread Pool Utilization:\n        Total Real Decode Duration    : {:.6} s\n        Theoretical Optimal Duration  : {:.6} s\n        Pool Efficiency (Fill Factor) : {:.2} %",
-            decode_duration, optimal, self.pool_efficiency() * 100.0
         )?;
         // Cache stats — mirror of vendor's BlockFetcher.hpp:97-118
         // (the section vendor labels "Prefetch Cache" + "Cache Hit
@@ -158,12 +112,9 @@ pub struct FetcherStatistics {
 }
 
 impl FetcherStatistics {
-    pub fn new(parallelization: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: Mutex::new(FetcherStatsSnapshot {
-                parallelization,
-                ..Default::default()
-            }),
+            inner: Mutex::new(FetcherStatsSnapshot::default()),
         }
     }
 
@@ -210,33 +161,6 @@ impl FetcherStatistics {
         g.wait_on_block_finder_count += 1;
     }
 
-    pub fn add_decode_block_time(&self, seconds: f64) {
-        let mut g = self.inner.lock().unwrap();
-        g.decode_block_total_time += seconds;
-    }
-
-    pub fn add_future_wait_time(&self, seconds: f64) {
-        let mut g = self.inner.lock().unwrap();
-        g.future_wait_total_time += seconds;
-    }
-
-    pub fn add_get_time(&self, seconds: f64) {
-        let mut g = self.inner.lock().unwrap();
-        g.get_total_time += seconds;
-    }
-
-    pub fn note_decode_block_start(&self, t: f64) {
-        let mut g = self.inner.lock().unwrap();
-        if g.decode_block_start.is_none() {
-            g.decode_block_start = Some(t);
-        }
-    }
-
-    pub fn note_decode_block_end(&self, t: f64) {
-        let mut g = self.inner.lock().unwrap();
-        g.decode_block_end = Some(t);
-    }
-
     pub fn set_block_count(&self, count: usize, finalized: bool) {
         let mut g = self.inner.lock().unwrap();
         g.block_count = count;
@@ -260,13 +184,12 @@ pub struct ChunkFetcherStatistics {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChunkExtraSnapshot {
     pub preemptive_stop_count: u64,
-    pub queue_post_processing_duration: f64,
 }
 
 impl ChunkFetcherStatistics {
-    pub fn new(parallelization: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            base: FetcherStatistics::new(parallelization),
+            base: FetcherStatistics::new(),
             inner: Mutex::new(ChunkExtraSnapshot::default()),
         }
     }
@@ -276,38 +199,8 @@ impl ChunkFetcherStatistics {
         g.preemptive_stop_count += 1;
     }
 
-    pub fn add_queue_post_processing_duration(&self, seconds: f64) {
-        let mut g = self.inner.lock().unwrap();
-        g.queue_post_processing_duration += seconds;
-    }
-
     pub fn extra_snapshot(&self) -> ChunkExtraSnapshot {
         *self.inner.lock().unwrap()
-    }
-}
-
-/// Helper to time a region of code and add to a counter. Returned guard
-/// records elapsed seconds when dropped.
-pub struct TimerGuard<'a, F: FnMut(f64)> {
-    start: Instant,
-    record: F,
-    _marker: std::marker::PhantomData<&'a ()>,
-}
-
-impl<'a, F: FnMut(f64)> TimerGuard<'a, F> {
-    pub fn new(record: F) -> Self {
-        Self {
-            start: Instant::now(),
-            record,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<F: FnMut(f64)> Drop for TimerGuard<'_, F> {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed().as_secs_f64();
-        (self.record)(elapsed);
     }
 }
 
@@ -317,7 +210,7 @@ mod tests {
 
     #[test]
     fn counters_increment_thread_safely() {
-        let s = FetcherStatistics::new(4);
+        let s = FetcherStatistics::new();
         s.record_get();
         s.record_get();
         s.record_prefetch();
@@ -333,25 +226,14 @@ mod tests {
 
     #[test]
     fn cache_unused_fraction_zero_when_empty() {
-        let s = FetcherStatistics::new(4);
+        let s = FetcherStatistics::new();
         let snap = s.snapshot();
         assert_eq!(snap.cache_unused_fraction(), 0.0);
     }
 
     #[test]
-    fn pool_efficiency_computes_from_decode_window() {
-        let s = FetcherStatistics::new(4);
-        s.note_decode_block_start(0.0);
-        s.note_decode_block_end(1.0); // 1 second wall
-        s.add_decode_block_time(2.0); // 2 seconds of CPU across 4 threads
-        let snap = s.snapshot();
-        // optimal = 2.0 / 4 = 0.5; pool_efficiency = 0.5 / 1.0 = 0.5
-        assert!((snap.pool_efficiency() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
     fn snapshot_display_includes_all_sections() {
-        let s = FetcherStatistics::new(16);
+        let s = FetcherStatistics::new();
         s.record_prefetch();
         s.record_on_demand_fetch();
         s.set_block_count(39, true);
@@ -359,7 +241,7 @@ mod tests {
         let printed = format!("{}", snap);
         assert!(printed.contains("Total Existing"));
         assert!(printed.contains("Total Fetched"));
-        assert!(printed.contains("Thread Pool Utilization"));
+        assert!(printed.contains("Prefetch Cache"));
     }
 
     #[test]
@@ -368,10 +250,8 @@ mod tests {
         // catcher for the --verbose port (commits 52b398a..8e77404).
         // If a future commit drops or renames any of these sections,
         // gzippy's --verbose stops being directly comparable to
-        // rapidgzip --verbose — which advisor passes rely on for
-        // cross-tool diagnosis (used to find the chunk-size mismatch
-        // and chunk-finalize divergence this session).
-        let s = FetcherStatistics::new(16);
+        // rapidgzip --verbose.
+        let s = FetcherStatistics::new();
         s.record_prefetch();
         s.record_prefetch();
         s.record_on_demand_fetch();
@@ -379,27 +259,14 @@ mod tests {
         s.record_prefetch_cache_miss();
         s.record_cache_unused_entry();
         s.set_block_count(42, true);
-        s.note_decode_block_start(0.0);
-        s.note_decode_block_end(0.5);
-        s.add_decode_block_time(3.0);
-        s.add_future_wait_time(0.1);
-        s.add_get_time(0.15);
         let printed = format!("{}", s.snapshot());
-        // vendor BlockFetcher.hpp:73-124 sections.
+        // vendor BlockFetcher.hpp:73-124 count sections (timing sections removed).
         for needle in [
             "Total Existing",
             "Total Fetched",
             "Prefetched",
             "Fetched On-demand",
             "Prefetch Stall by BlockFinder",
-            "Time spent in:",
-            "decodeBlock",
-            "std::future::get",
-            "get ",
-            "Thread Pool Utilization:",
-            "Total Real Decode Duration",
-            "Theoretical Optimal Duration",
-            "Pool Efficiency (Fill Factor)",
             "Prefetch Cache:",
             "Hits",
             "Misses",
@@ -416,12 +283,10 @@ mod tests {
 
     #[test]
     fn chunk_extra_counts_preemptive_stops() {
-        let s = ChunkFetcherStatistics::new(4);
+        let s = ChunkFetcherStatistics::new();
         s.record_preemptive_stop();
         s.record_preemptive_stop();
-        s.add_queue_post_processing_duration(0.1);
         let extra = s.extra_snapshot();
         assert_eq!(extra.preemptive_stop_count, 2);
-        assert!((extra.queue_post_processing_duration - 0.1).abs() < 1e-9);
     }
 }

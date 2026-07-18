@@ -69,6 +69,23 @@ impl CompressedVector {
         }
     }
 
+    /// Wrap an already-owned `Vec<u8>` as a `CompressionType::None`
+    /// window WITHOUT copying. `decompressed_size == len`, the bytes are
+    /// stored verbatim. This is the zero-copy publish path: the consumer
+    /// builds exactly one freshly-allocated tail `Vec<u8>` and hands its
+    /// ownership straight into the map, eliminating the `to_vec()` second
+    /// copy that `from_bytes(&[u8], None)` would incur. The read side
+    /// (`raw_bytes()`, `decompress()`, None branch) is byte-identical to
+    /// the bytes that would have resulted from `from_bytes(&bytes, None)`.
+    pub fn from_owned_none(bytes: Vec<u8>) -> Self {
+        let decompressed_size = bytes.len();
+        Self {
+            compression_type: CompressionType::None,
+            decompressed_size,
+            data: Arc::new(bytes),
+        }
+    }
+
     /// Construct from already-compressed bytes (e.g., loaded from an
     /// index file). Mirrors the third rapidgzip constructor at
     /// CompressedVector.hpp:140-147.

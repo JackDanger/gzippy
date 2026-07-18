@@ -3,6 +3,16 @@
 //! A drop-in replacement for gzip that uses multiple processors for compression.
 //! Inspired by [pigz](https://zlib.net/pigz/) by Mark Adler.
 
+// Global rpmalloc experiment — gated behind `global-rpmalloc` feature.
+// Prior history (below) noted mimalloc + jemalloc both regressed. rpmalloc
+// has different characteristics (lock-free per-thread heaps); worth one
+// fresh data point especially since vendor uses rpmalloc as their per-Vec
+// allocator. NOT recommended for production — vendor explicitly avoids
+// global rpmalloc per `ChunkData.hpp:24` ("memory slab reuse issues").
+#[cfg(feature = "global-rpmalloc")]
+#[global_allocator]
+static GLOBAL: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+
 // Global allocator: system default (glibc on Linux).
 //
 // History note (2026-05-19): tried mimalloc and jemalloc as global
@@ -40,6 +50,7 @@ mod utils;
 
 // ── Compression & decompression stacks ───────────────────────────────────────
 mod compress; // engine (mod.rs) + io, parallel, pipelined, optimization, simple
+mod coz_probe; // Coz causal-profiling probe shim (no-op without --features coz)
 mod decompress; // engine (mod.rs) + io, format, bgzf, SIMD tables, scan_inflate
 
 // ── Hardware backends (ISA-L, libdeflate FFI) ─────────────────────────────────
@@ -55,7 +66,18 @@ mod tests;
 use cli::GzippyArgs;
 use error::GzippyError;
 
-const VERSION: &str = concat!("gzippy ", env!("CARGO_PKG_VERSION"));
+/// Compile-time build flavor string: "parallel-sm+isal", "parallel-sm+pure", or
+/// "legacy-serial". Derived from cfg predicates in build.rs and surfaced via
+/// `--version` output and the first `GZIPPY_DEBUG=1` line.
+pub(crate) const BUILD_FLAVOR: &str = env!("BUILD_FLAVOR");
+
+const VERSION: &str = concat!(
+    "gzippy ",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BUILD_FLAVOR"),
+    ")",
+);
 
 /// Track the current output file so signal handlers can clean it up.
 /// When set, an incomplete output file exists that should be deleted on abort.
@@ -106,7 +128,7 @@ fn main() {
     let result = run();
 
     match result {
-        Ok(exit_code) => process::exit(exit_code),
+        Ok(exit_code) => fast_exit_success(exit_code),
         Err(e) => {
             eprintln!("gzippy: {}", e);
             process::exit(1);
@@ -114,8 +136,53 @@ fn main() {
     }
 }
 
+/// Verified-success process exit.
+///
+/// On the clean-success path (exit_code == 0) EVERY side effect is already
+/// complete before we get here: all output has been written AND flushed to the
+/// OS by the decompress/compress entry points (their `BufWriter`s call
+/// `flush()?`), CRC32+ISIZE were verified against the gzip trailer inside the
+/// decode driver, the source file was removed and metadata preserved (see
+/// `decompress::io::decompress_file`'s `Ok` branch), and — because `run()`
+/// processes every requested file before returning — this fires only after the
+/// LAST unit of work. There is nothing left to do in userspace except tear
+/// down the address space, which the kernel's `exit_group` does regardless.
+///
+/// So we `libc::_exit` directly, skipping the redundant *userspace* teardown
+/// that `process::exit`'s `libc::exit()` would run first: the allocator's
+/// `madvise(MADV_DONTNEED)` span-decommit flood, C static destructors from the
+/// linked codecs, and any atexit handlers. That teardown cost is proportional
+/// to peak RSS (the measured AMD-Zen2 mid-T loss vs rapidgzip) and is pure
+/// overhead once the output is durable.
+///
+/// Byte-transparency guarantees:
+///  - Only `exit_code == 0` (fully-verified success) fast-exits; every non-zero
+///    Ok code (skipped symlink=2, per-file error=1) and every `Err` takes the
+///    normal `process::exit`, which preserves exit codes AND lets
+///    `decompress_file` delete a partial dest on CRC/size failure.
+///  - We flush the process-wide `stdout`/`stderr` handles first, covering any
+///    `println!`/`eprintln!` (stats, `-v`) still sitting in the global
+///    `LineWriter` buffer. The bulk data path is already flushed to the fd.
+fn fast_exit_success(exit_code: i32) -> ! {
+    if exit_code == 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` is async-signal-safe and simply issues the
+        // exit_group syscall. All userspace state we care about (output bytes)
+        // is already flushed to the OS above and inside the entry points.
+        unsafe { libc::_exit(0) };
+    }
+    process::exit(exit_code);
+}
+
 fn run() -> Result<i32, GzippyError> {
     let args = GzippyArgs::parse()?;
+
+    // First GZIPPY_DEBUG=1 line: build flavor (before any routing or path prints).
+    if crate::utils::debug_enabled() {
+        eprintln!("[gzippy] build-flavor={BUILD_FLAVOR}");
+    }
 
     if args.version {
         println!("{}", VERSION);
@@ -155,19 +222,14 @@ fn run() -> Result<i32, GzippyError> {
         || program_name == "zcat"
         || program_name == "gzcat";
 
-    // --verbose flows to the parallel-SM driver via env var (matches
-    // the GZIPPY_DEBUG plumbing pattern). Drains FetcherStatistics +
+    // `--verbose` flows to the parallel-SM driver as a real `verbose: bool`
+    // parameter threaded through the decode call graph (decompress::io ->
+    // decompress::mod -> parallel::single_member -> parallel::sm_driver ->
+    // parallel::chunk_fetcher::drive_impl), which drains FetcherStatistics +
     // ChunkFetcherStatistics + the deletion-trap counters to stderr at
-    // end-of-decode. Mirror of vendor's `args.verbose` →
-    // `setStatisticsEnabled(true)` at tools/rapidgzip.cpp:164.
-    if args.verbose {
-        // SAFETY: single-threaded at this point (worker pool not yet
-        // spawned). The decompression entry points read this env var
-        // exactly once on startup.
-        unsafe {
-            std::env::set_var("GZIPPY_VERBOSE", "1");
-        }
-    }
+    // end-of-decode. Mirror of vendor's `args.verbose` ->
+    // `setStatisticsEnabled(true)` at tools/rapidgzip.cpp:164. (Previously an
+    // internal env-var round-trip; replaced batch 4g.)
 
     // zcat/gzcat imply decompress-to-stdout
     let stdout_mode = args.stdout || program_name == "zcat" || program_name == "gzcat";

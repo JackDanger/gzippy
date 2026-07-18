@@ -118,6 +118,18 @@ impl WindowMap {
         self.insert_bytes_with_compression(encoded_offset_bits, bytes, self.compression);
     }
 
+    /// Zero-copy `CompressionType::None` insert: takes OWNERSHIP of a
+    /// freshly-built tail `Vec<u8>` and wraps it directly in the map's
+    /// `Arc<CompressedVector>`, with NO `to_vec()`. Behaviourally
+    /// identical to `insert_bytes_with_compression(offset, &bytes,
+    /// CompressionType::None)` but saves the second 32 KiB heap copy on
+    /// the consumer's serial publish path (the gate for successor
+    /// dispatch). See `CompressedVector::from_owned_none`.
+    pub fn insert_owned_none(&self, encoded_offset_bits: usize, bytes: Vec<u8>) {
+        let cv = Arc::new(CompressedVector::from_owned_none(bytes));
+        self.insert(encoded_offset_bits, cv);
+    }
+
     /// Mirror of vendor `WindowMap::emplace(offset, window, compressionType)`.
     pub fn insert_bytes_with_compression(
         &self,
@@ -131,6 +143,11 @@ impl WindowMap {
 
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().entries.len()
+    }
+
+    /// Diagnostic: snapshot all published window keys (encoded bit offsets).
+    pub fn keys_snapshot(&self) -> Vec<usize> {
+        self.state.lock().unwrap().entries.keys().copied().collect()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -1,41 +1,123 @@
 //! Parallel single-member decompression (production path).
 //!
 //! Entry: [`single_member::decompress_parallel`] → [`sm_driver::read_parallel_sm`]
-//! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_isal`]
-//! or [`gzip_chunk::decode_chunk_marker_bootstrap_then_isal`] (prefetch).
+//! → [`chunk_fetcher::drive`] → [`chunk_decode::decode_chunk_with_rapidgzip`].
+//!
+//! # gzippy → rapidgzip ROLE MAP (which gz module ports which rg source)
+//!
+//! Faithful structural port of rapidgzip's chunked single-member decode. Vendor
+//! source: `vendor/rapidgzip/src/rapidgzip/`. When a gz module "works but looks
+//! structurally off", the cited vendor `file` is the reference.
+//!
+//! | gzippy module          | rapidgzip counterpart                         |
+//! |------------------------|-----------------------------------------------|
+//! | `single_member`        | `ParallelGzipReader` (entry / orchestration)  |
+//! | `sm_driver`            | `ParallelGzipReader::read*` driver loop       |
+//! | `chunk_fetcher`        | `GzipChunkFetcher` + `BlockFetcher` consumer  |
+//! | `block_fetcher`        | `BlockFetcher` (prefetch/cache coordinator)   |
+//! | `blockfinder_validation` | `blockfinder/{DynamicHuffman,Uncompressed}.hpp` (per-position validators) |
+//! | `gzip_block_finder`    | `GzipBlockFinder.hpp` (offset partitioner)    |
+//! | `async_block_finder`   | `core/BlockFinder<RawFinder>` (BlockFinder.hpp async coordinator) |
+//! | `bit_reader`           | `core/BitReader.hpp` (shared LSB bit reader)  |
+//! | `chunk_decode`         | `GzipChunkFetcher::decodeChunk*` (per-chunk decode driver) |
+//! | `marker_inflate`       | `deflate::Block` (u16 marker-ring decode)     |
+//! | `apply_window`/`replace_markers` | window application / marker resolution |
+//! | `window_map`/`block_map` | `WindowMap` / `BlockMap`                    |
+//! | `huffman_*`/`lut_*`    | `huffman/*` coding tables                      |
+//! | `chunk_data`/`segmented_*` | `ChunkData` + `MarkerReplacement` buffers  |
+//! | `crc32`                | `gzip/crc32.hpp`                              |
+//! | `thread_pool`          | `ThreadPool`                                  |
+//!
+//! ## Multi-member routing (2026-07-05)
+//!
+//! [`crate::decompress::DecodePath::MultiMemberChunked`] →
+//! [`sm_driver::read_parallel_sm_multi`] walks each member and inflates it with
+//! the full within-member parallel engine (per-member CRC32 + ISIZE verified). It
+//! is the deterministic route for MIXED "GZ" ++ plain concatenations
+//! ([`crate::decompress::bgzf::gz_coverage_is_pure`]), which the BGZF fast path
+//! would truncate. Plain dominant/few-member distributions stay on the
+//! member-per-worker split (`MultiMemberPar`): routing them to this member-walk
+//! was MEASURED to REGRESS on M1 (per-member pipeline spinup + thread
+//! oversubscription at high T). The located dominant-member plateau needs the
+//! rapidgzip-faithful whole-file-block-finder cross-member port (one pool, one
+//! chunk grid spanning members, vendor `GzipChunk.hpp:468-654`) — the gate-phase
+//! core (see `scratchpad/MM-PARALLELSM-DESIGN.md`).
 
+#[cfg(parallel_sm)]
 pub mod apply_window;
+/// The contig clean fast loop's `asm!` kernel
+/// (feature `asm-kernel`, x86_64-only; pure-Rust path always compiled).
+#[cfg(parallel_sm)]
+pub mod asm_kernel;
+#[cfg(parallel_sm)]
+pub mod async_block_finder;
 pub mod bit_manipulation;
+pub mod bit_reader;
+#[cfg(parallel_sm)]
 pub mod block_fetcher;
-pub mod block_finder;
+#[cfg(parallel_sm)]
 pub mod block_map;
+pub mod blockfinder_validation;
 pub mod cache;
+#[cfg(parallel_sm)]
 pub mod chunk_buffer_pool;
+#[cfg(parallel_sm)]
 pub mod chunk_data;
+#[cfg(parallel_sm)]
+pub mod chunk_decode;
+#[cfg(parallel_sm)]
 pub mod chunk_fetcher;
+#[cfg(parallel_sm)]
+pub mod chunk_handle;
 pub mod compressed_vector;
 pub mod crc32;
-// Bootstrap-only (speculative prefetch): marker emit via `deflate_block::Block`.
-pub mod deflate_block;
 pub mod error;
+#[cfg(parallel_sm)]
+pub mod fd_vectored_write;
 pub mod gzip_block_finder;
-pub mod gzip_chunk;
 pub mod gzip_definitions;
 pub mod gzip_format;
 pub mod huffman_base;
+pub mod huffman_reversed_bits_cached;
+pub mod huffman_short_bits_cached;
 pub mod huffman_symbols_per_length;
+#[cfg(parallel_sm)]
 pub mod inflate_wrapper;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub mod isal_huffman;
+#[cfg(parallel_sm)]
+pub mod lut_bulk_inflate;
+#[cfg(parallel_sm)]
+pub mod lut_huffman;
+/// Window-absent marker decoder: literal port of `rapidgzip::deflate::Block`
+/// (vendor/.../gzip/deflate.hpp:513-1156) — the u16-marker ring + pre-seeded
+/// marker zone decode loops shared by the unified single-member path. (Formerly
+/// `deflate_block`; renamed to retire the "deflate_block bootstrap" name.)
+#[cfg(parallel_sm)]
+pub mod marker_inflate;
+#[cfg(all(unix, parallel_sm))]
+pub mod output_writer;
 pub mod prefetcher;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub mod raw_block_finder;
+#[cfg(parallel_sm)]
 pub mod replace_markers;
+#[cfg(parallel_sm)]
+pub mod rpmalloc_alloc;
+pub mod segmented_buffer;
+#[cfg(parallel_sm)]
+pub mod segmented_markers;
 pub mod single_member;
+pub mod sm_cfg;
+#[cfg(parallel_sm)]
 pub mod sm_driver;
 pub mod statistics;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+/// Non-speculative parallel decode for stored-block-dominated (incompressible)
+/// single-member streams. Portable (depends only on crc32 + gzip_format), so it
+/// is NOT cfg-gated; routing to it lives in [`crate::decompress::classify_gzip`].
+pub mod stored_split;
+#[cfg(parallel_sm)]
 pub mod streamed_results;
+#[cfg(parallel_sm)]
 pub mod thread_pool;
-pub mod trace;
+#[cfg(parallel_sm)]
+pub mod used_window_symbols;
+#[cfg(parallel_sm)]
+pub mod width_ring;
 pub mod window_map;

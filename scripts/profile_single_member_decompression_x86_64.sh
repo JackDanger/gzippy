@@ -17,7 +17,7 @@
 #   5. stdout ends with RESULT + local profiling guide (paths, scp, next steps)
 #
 # Config (override via env):
-#   GZIPPY_REMOTE_SSH         ssh target (default: -J neurotic root@10.30.0.199)
+#   GZIPPY_REMOTE_SSH         ssh target (default: root@$YOUR_BENCH_HOST)
 #   GZIPPY_REMOTE_DIR         repo on remote (default: gzippy)
 #   GZIPPY_FIXTURE_MB         raw MiB (default: 64)
 #   GZIPPY_THREAD_SWEEP       thread counts (default: "1 2 4 8 9 12 16")
@@ -28,7 +28,7 @@
 #   GZIPPY_SKIP_PROFILE=1     correctness only, no perf capture
 set -euo pipefail
 
-REMOTE_SSH="${GZIPPY_REMOTE_SSH:--J neurotic root@10.30.0.199}"
+REMOTE_SSH="${GZIPPY_REMOTE_SSH:-root@$YOUR_BENCH_HOST}"
 REMOTE_DIR="${GZIPPY_REMOTE_DIR:-gzippy}"
 FIXTURE_MB="${GZIPPY_FIXTURE_MB:-64}"
 THREAD_SWEEP="${GZIPPY_THREAD_SWEEP:-1 2 4 8 9 12 16}"

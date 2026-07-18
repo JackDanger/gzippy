@@ -57,6 +57,13 @@ pub fn decompress_deflate_from_bit_with_end(
 
 // ── zlib-ng path (all platforms, primary on arm64) ───────────────────────────
 
+// NOTE (2026-05-28): this zlib-ng fallback's `inflatePrime` convention does not
+// currently match the arbitrary-bit-offset resume contract the ISA-L impl above
+// provides (the cross_chunk_resume test, gated to isal-compression, exercises
+// that contract). It has NO production resume caller — the pure-rust parallel-SM
+// path resumes via ResumableInflate2 — so this gap blocks nothing today.
+// Tracked future work for arm64 parallel-SM enablement (which will also route
+// through ResumableInflate2, not this fn).
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit(

@@ -1,4 +1,4 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(parallel_sm)]
 
 //! Literal port of `rapidgzip::ThreadPool`
 //! (vendor/rapidgzip/librapidarchive/src/core/ThreadPool.hpp:33-248).
@@ -48,6 +48,33 @@ use std::thread::{self, JoinHandle};
 /// (ThreadPool.hpp:36 `using ThreadPinning = std::unordered_map<size_t, uint32_t>`).
 pub type ThreadPinning = HashMap<usize, u32>;
 
+/// Bounded busy-spin window (in microseconds) that a worker polls the
+/// lock-free `pending_tasks` hint BEFORE parking in the condvar.
+///
+/// **Why this exists (no rapidgzip counterpart — byte-transparent perf knob).**
+/// Under an `ondemand`-style cpufreq governor, gzippy's
+/// worker pool parks in the condvar during the short, frequent inter-chunk
+/// gaps. Idle cores let the governor drop to a lower P-state, so the pool
+/// clocks lower than rapidgzip (which spins). A bounded spin keeps the core warm across
+/// the gap so the governor holds the clock, WITHOUT burning cores when
+/// saturated: the spin only runs while `pending_tasks == 0` (a genuine
+/// idle gap) and bails the instant a task is queued — in the throughput-
+/// saturated case a finishing worker almost always sees `pending > 0` and
+/// never spins.
+///
+/// Frozen to [`DEFAULT_POOL_SPIN_US`].
+fn pool_spin_us() -> u64 {
+    DEFAULT_POOL_SPIN_US
+}
+
+/// Baked default spin window, in microseconds. `0` restores exact
+/// park-immediately behavior.
+const DEFAULT_POOL_SPIN_US: u64 = 2000;
+
+/// Number of `spin_loop()` hints between wall-clock deadline checks in the
+/// worker spin, amortizing the `Instant::now()` cost across the busy-poll.
+const SPIN_BATCH: u32 = 64;
+
 /// Default thread count.
 ///
 /// Mirror of `availableCores()` (AffinityHelpers.hpp:18-21 / 104-130). The
@@ -55,23 +82,9 @@ pub type ThreadPinning = HashMap<usize, u32>;
 /// `sched_getaffinity`-derived counts on Linux. `num_cpus::get()` (already a
 /// gzippy dependency) honors cgroup/cpuset bounds on Linux and falls back
 /// to `hardware_concurrency` elsewhere — same intent.
+#[allow(dead_code)] // vendor parity or unit-test surface
 fn available_cores() -> usize {
     num_cpus::get()
-}
-
-/// Build a worker-index → logical-core map for `thread_count` workers.
-/// Cycles through `core_affinity::get_core_ids()` when there are fewer
-/// cores than workers (mirror of vendor AffinityHelpers).
-pub fn pinning_for_capacity(thread_count: usize) -> ThreadPinning {
-    let cores = core_affinity::get_core_ids().unwrap_or_default();
-    let mut map = ThreadPinning::new();
-    if cores.is_empty() || thread_count == 0 {
-        return map;
-    }
-    for i in 0..thread_count {
-        map.insert(i, cores[i % cores.len()].id as u32);
-    }
-    map
 }
 
 /// A move-only handle to the eventual result of a submitted task.
@@ -101,6 +114,7 @@ impl<T> Future<T> {
     /// thread was destroyed before the task ran, which only happens
     /// across [`ThreadPool::stop`] races; `std::future` would throw a
     /// `broken_promise` here.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn wait(self) -> Result<T, FutureError> {
         self.rx.recv().map_err(|_| FutureError::Cancelled)
     }
@@ -121,6 +135,7 @@ impl<T> Future<T> {
 
 /// Errors observable on a [`Future`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // vendor ThreadPool.hpp parity; used by Future::wait in unit tests
 pub enum FutureError {
     /// The pool was stopped before the task could run.
     /// Equivalent to `std::future_errc::broken_promise`.
@@ -188,6 +203,27 @@ pub struct ThreadPool {
     shared: Arc<Mutex<PoolShared>>,
     /// `m_pingWorkers` (ThreadPool.hpp:241).
     ping_workers: Arc<Condvar>,
+    /// Lock-free hint of the number of queued-but-not-yet-dequeued tasks.
+    /// Incremented under `shared` lock in `submit` (paired with the
+    /// `push_back`), decremented in `worker_main` when a worker pops a
+    /// task. It is ONLY a hint for the pre-park busy-spin — the
+    /// authoritative wait predicate remains `has_unprocessed_tasks` under
+    /// the mutex, so a stale read here can never cause a lost wakeup
+    /// (a false-positive makes a worker acquire the lock, find nothing,
+    /// and park; a task push always happens-before the condvar notify).
+    /// No rapidgzip counterpart — supports the byte-transparent spin knob.
+    pending_tasks: Arc<AtomicUsize>,
+    /// EVENT-DRIVEN CONSUMER WAKEUP (no rapidgzip counterpart — rg's consumer
+    /// blocks on `std::future` directly; ours blocks on an mpsc `Receiver`).
+    /// A monotonic generation counter bumped + `notify_all`'d AFTER every task
+    /// body returns — at which point the task's result is already in its oneshot
+    /// channel (`submit`'s `tx.send(task())`). The single-pass in-order consumer,
+    /// while waiting for the NEXT chunk it needs, blocks on this condvar (with a
+    /// 1 ms fallback) instead of polling `recv_timeout(1ms)`, so it wakes
+    /// IMMEDIATELY when any worker frees up and re-advances the prefetch horizon
+    /// at ~0 latency. Byte-transparent: only changes WHEN
+    /// the consumer wakes to pump/re-check, never what it decodes.
+    task_completed: Arc<(Mutex<u64>, Condvar)>,
     /// `m_threads` (ThreadPool.hpp:247). `JoiningThread` becomes a
     /// `JoinHandle` we explicitly join in `stop()`. Wrapped in `Mutex`
     /// so the `&self`-callable `submit` can push freshly spawned
@@ -214,26 +250,50 @@ impl ThreadPool {
                 running: true,
             })),
             ping_workers: Arc::new(Condvar::new()),
+            pending_tasks: Arc::new(AtomicUsize::new(0)),
+            task_completed: Arc::new((Mutex::new(0), Condvar::new())),
             threads: Mutex::new(Vec::with_capacity(thread_count)),
         }
+    }
+
+    /// Current task-completion generation (see [`ThreadPool::task_completed`]).
+    /// A consumer snapshots this BEFORE its non-blocking `try_recv` + prefetch
+    /// pump, then hands it to [`wait_for_completion`](Self::wait_for_completion);
+    /// because the counter is monotonic, a completion that lands during the pump
+    /// makes the subsequent wait return immediately — no lost wakeup.
+    pub fn completion_gen(&self) -> u64 {
+        *self
+            .task_completed
+            .0
+            .lock()
+            .expect("task_completed poisoned")
+    }
+
+    /// Block until the completion generation advances past `last_seen` or
+    /// `timeout` elapses, returning the current generation. The `timeout` is a
+    /// liveness fallback only — under load the condvar notify fires first, so the
+    /// consumer wakes at ~0 latency on each worker completion. On the rare
+    /// tiny-file / idle path the fallback keeps the old poll cadence, so there is
+    /// no extra wakeup cost when there is nothing completing.
+    pub fn wait_for_completion(&self, last_seen: u64, timeout: std::time::Duration) -> u64 {
+        let (lock, cv) = &*self.task_completed;
+        let guard = lock.lock().expect("task_completed poisoned");
+        let (guard, _) = cv
+            .wait_timeout_while(guard, timeout, |g| *g == last_seen)
+            .expect("task_completed poisoned during wait");
+        *guard
     }
 
     /// Convenience constructor using [`available_cores`] and an empty
     /// pinning map. Mirror of the default-argument form on
     /// ThreadPool.hpp:101-103.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn with_default_capacity() -> Self {
         Self::new(available_cores(), ThreadPinning::new())
     }
 
-    /// Construct a pool with one logical core pinned per worker index.
-    /// Mirror of vendor's `ThreadPool(threadCount, threadPinning)` where
-    /// the caller pre-populates the pinning map
-    /// (`ThreadPool.hpp:101-108`, `AffinityHelpers.hpp`).
-    pub fn with_pinning_for_capacity(thread_count: usize) -> Self {
-        Self::new(thread_count, pinning_for_capacity(thread_count))
-    }
-
     /// `size_t capacity() const` (ThreadPool.hpp:166-170).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn capacity(&self) -> usize {
         self.thread_count
     }
@@ -243,8 +303,20 @@ impl ThreadPool {
     /// test-only reads. Vendor has no public accessor; we expose this
     /// to support the on-demand-spawn unit test that asserts
     /// `m_threads.size() == N` after submitting N blocking tasks.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn spawned_threads(&self) -> usize {
         self.threads.lock().unwrap().len()
+    }
+
+    /// Current count of worker threads parked in the condvar wait
+    /// (`m_idleThreadCount`, ThreadPool.hpp:235). Diagnostic-only read:
+    /// `busy = spawned_threads() - idle_thread_count()`, and
+    /// `idle_capacity = idle_thread_count() + (capacity() - spawned_threads())`
+    /// (lazy-spawn means an un-spawned slot is also available capacity). A
+    /// relaxed atomic read — an instantaneous snapshot, no decode effect.
+    #[allow(dead_code)] // diagnostic / probe surface
+    pub fn idle_thread_count(&self) -> usize {
+        self.idle_thread_count.load(Ordering::Relaxed)
     }
 
     /// `size_t unprocessedTasksCount(std::optional<int> priority = {}) const`
@@ -253,6 +325,7 @@ impl ThreadPool {
     /// `priority = None` sums all priority buckets via
     /// `std::accumulate` (ThreadPool.hpp:180-181). `priority = Some(p)`
     /// returns the size of that single bucket (ThreadPool.hpp:176-179).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn unprocessed_tasks_count(&self, priority: Option<i32>) -> usize {
         let shared = self.shared.lock().expect("ThreadPool mutex poisoned");
         match priority {
@@ -307,6 +380,12 @@ impl ThreadPool {
                 .entry(priority)
                 .or_default()
                 .push_back(packaged);
+            // Publish the queue-depth hint for the worker pre-park spin.
+            // Under the lock (paired with push_back) so it is consistent
+            // with has_unprocessed_tasks; workers read it Relaxed while
+            // spinning. See `pending_tasks` field doc for the no-lost-
+            // wakeup argument.
+            self.pending_tasks.fetch_add(1, Ordering::Relaxed);
 
             // (m_threads.size() < m_threadCount) && (m_idleThreadCount == 0)
             // (ThreadPool.hpp:157). Vendor reads `m_threads.size()`
@@ -369,10 +448,21 @@ impl ThreadPool {
         let cv = Arc::clone(&self.ping_workers);
         let idle = Arc::clone(&self.idle_thread_count);
         let running = Arc::clone(&self.running);
+        let pending = Arc::clone(&self.pending_tasks);
+        let task_completed = Arc::clone(&self.task_completed);
         let pin = self.thread_pinning.get(&index).copied();
 
         let handle = thread::spawn(move || {
-            worker_main(index, shared, cv, idle, running, pin);
+            worker_main(
+                index,
+                shared,
+                cv,
+                idle,
+                running,
+                pending,
+                task_completed,
+                pin,
+            );
         });
         threads.push(handle);
     }
@@ -404,14 +494,21 @@ fn worker_main(
     cv: Arc<Condvar>,
     idle: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
+    task_completed: Arc<(Mutex<u64>, Condvar)>,
     pin: Option<u32>,
 ) {
+    let spin_us = pool_spin_us();
     crate::decompress::parallel::chunk_buffer_pool::bind_worker_pool_index(thread_index);
     if let Some(core_id) = pin {
         // Mirror of `pinThreadToLogicalCore(static_cast<int>(pinning->second))`
         // (ThreadPool.hpp:199). `core_affinity` is portable across the
         // platforms gzippy targets; the rapidgzip implementation uses
-        // raw `sched_setaffinity` on Linux and is a no-op elsewhere.
+        // raw `sched_setaffinity` on Linux and is a no-op elsewhere. The
+        // production decode pool constructs with an EMPTY pinning map (see
+        // chunk_fetcher.rs and BlockFetcher.hpp:185), so `pin` is None there
+        // and the OS schedules the workers; this branch keeps the generic
+        // vendor ThreadPool pinning surface for any caller that supplies a map.
         let ids = core_affinity::get_core_ids().unwrap_or_default();
         if let Some(id) = ids.into_iter().find(|c| c.id as u32 == core_id) {
             let _ = core_affinity::set_for_current(id);
@@ -419,6 +516,31 @@ fn worker_main(
     }
 
     while running.load(Ordering::Acquire) {
+        // ADAPTIVE PRE-PARK SPIN (byte-transparent; no rapidgzip
+        // counterpart — see `pool_spin_us` doc). During the short,
+        // frequent inter-chunk idle gaps, busy-poll the lock-free
+        // `pending_tasks` hint for a BOUNDED window before falling
+        // through to the condvar park. This keeps the core warm so the
+        // `ondemand` governor holds the clock (closes the AMD-Zen2 mid-T
+        // loss). Correctness: this only DELAYS parking; the authoritative
+        // wait predicate is still `has_unprocessed_tasks` under the mutex
+        // in `wait_while` below, so a task queued during (or after) the
+        // spin is never missed. Adaptive by construction: the loop bails
+        // the instant `pending > 0`, so in the throughput-saturated case
+        // (a task is essentially always queued) it spins ~zero — it only
+        // burns cycles when there is genuinely nothing to do, which is
+        // exactly the idle gap we want to keep the core warm across.
+        if spin_us > 0 && running.load(Ordering::Acquire) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_micros(spin_us);
+            while pending.load(Ordering::Relaxed) == 0 {
+                if !running.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                for _ in 0..SPIN_BATCH {
+                    std::hint::spin_loop();
+                }
+            }
+        }
         let mut guard = shared.lock().expect("ThreadPool mutex poisoned");
 
         // ++m_idleThreadCount (ThreadPool.hpp:205) — must happen under
@@ -447,8 +569,24 @@ fn worker_main(
         drop(guard);
 
         if let Some(t) = task {
+            // Popped one task — retire its queue-depth hint (paired with
+            // the fetch_add in `submit`). Only on Some, so the counter
+            // can never underflow.
+            pending.fetch_sub(1, Ordering::Relaxed);
             // task() (ThreadPool.hpp:219).
             t();
+            // EVENT-DRIVEN CONSUMER WAKEUP (see `ThreadPool::task_completed`).
+            // The task body has returned, so its result is already in its
+            // oneshot channel (`submit`'s `tx.send(task())` ran inside `t()`);
+            // bump the generation + wake any consumer blocked waiting for the
+            // next chunk so it re-checks + re-advances the prefetch horizon at
+            // ~0 latency instead of on a fixed 1ms poll tick.
+            let (lock, cv) = &*task_completed;
+            {
+                let mut g = lock.lock().expect("task_completed poisoned");
+                *g = g.wrapping_add(1);
+            }
+            cv.notify_all();
         }
         // No task: loop and re-wait. This can happen if another worker
         // raced us to the front of the queue; the C++ has the same
@@ -465,7 +603,7 @@ fn has_unprocessed_tasks(tasks: &BTreeMap<i32, std::collections::VecDeque<Task>>
 /// Pop the front task from the lowest-priority non-empty bucket.
 /// Mirror of ThreadPool.hpp:213-218.
 fn first_pending_task(tasks: &mut BTreeMap<i32, std::collections::VecDeque<Task>>) -> Option<Task> {
-    for (_priority, queue) in tasks.iter_mut() {
+    for queue in tasks.values_mut() {
         if let Some(t) = queue.pop_front() {
             return Some(t);
         }
@@ -629,6 +767,44 @@ mod tests {
         drop(tx); // simulate the worker never running
         let f: Future<i32> = Future { rx };
         assert_eq!(f.wait(), Err(FutureError::Cancelled));
+    }
+
+    #[test]
+    fn completion_gen_advances_and_wakes_a_waiter() {
+        // Event-driven consumer wakeup: after a task body returns, the pool
+        // bumps `task_completed` and notifies. A consumer that snapshotted the
+        // gen and then blocks in `wait_for_completion` must wake with an
+        // advanced gen well within the (generous) fallback timeout.
+        let pool = ThreadPool::new(1, ThreadPinning::new());
+        let before = pool.completion_gen();
+        let f = pool.submit(|| 1_u32, 0);
+        assert_eq!(f.wait().unwrap(), 1);
+        // The notify fires after t() returns; a wait from `before` must observe
+        // an advanced gen (either already advanced → returns immediately, or via
+        // the condvar notify) far inside the 5s liveness fallback.
+        let g = pool.wait_for_completion(before, Duration::from_secs(5));
+        assert!(g > before, "completion gen must advance after a task runs");
+    }
+
+    #[test]
+    fn wait_for_completion_returns_immediately_when_gen_already_advanced() {
+        // No lost wakeup: if a completion landed between the consumer's snapshot
+        // and its wait (the monotonic-counter race the pump path relies on), the
+        // wait must return immediately rather than block for the fallback.
+        let pool = ThreadPool::new(2, ThreadPinning::new());
+        let start = std::time::Instant::now();
+        // A stale `last_seen` (u64::MAX never equals a real small gen, but the
+        // predicate is `*g == last_seen`; use `before` snapshot then advance).
+        let before = pool.completion_gen();
+        pool.submit(|| 0_u32, 0).wait().unwrap();
+        // Gen is now > before. Waiting from `before` must not block on the 10s
+        // fallback — it should see the advanced gen and return at once.
+        let g = pool.wait_for_completion(before, Duration::from_secs(10));
+        assert!(g > before);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait must not consume the fallback when gen already advanced"
+        );
     }
 
     #[test]

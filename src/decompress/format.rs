@@ -57,17 +57,28 @@ pub(crate) fn is_likely_multi_member(data: &[u8]) -> bool {
     // `scan_detect` band in the 2026-05-19 profile diff).
     //
     // Trade-off: a multi-member stream whose SECOND member starts past
-    // byte 16 MiB will be misrouted as single-member. Single-member
-    // decode of that file fails with a clear CRC mismatch (the gzip
-    // trailer at offset 16+ MiB won't validate against the first
-    // member's CRC), which the routing layer surfaces as an error
-    // rather than silent corruption. Files of this shape are
-    // pathological — no real-world producer creates a single member
-    // larger than 16 MiB compressed and then concatenates more.
+    // byte 16 MiB is misrouted as single-member. This is SAFE for
+    // correctness: the single-member backends (ISA-L `decompress_gzip_stream`
+    // and `decompress_single_member_libdeflate`) consume-and-loop residual
+    // members, so a misrouted multi-member file still decodes in full. (This
+    // was NOT always true — before that fix, misrouting silently truncated to
+    // the first member; an earlier version of this comment wrongly claimed it
+    // failed loudly with a CRC mismatch. It did not: member 1 has a valid
+    // self-consistent trailer.) The misroute now only costs the parallel
+    // multi-member path's speedup, never correctness. Such files are rare
+    // (`cat big.gz small.gz`); pigz/bgzip members are ~128 KiB, detected here.
     const SCAN_LIMIT_BYTES: usize = 16 * 1024 * 1024;
     let scan_end = data.len().min(SCAN_LIMIT_BYTES);
     let finder = memmem::Finder::new(GZIP_MAGIC);
     let mut pos = header_size + 1;
+    // A malformed first header can make `parse_gzip_header_size` report a size
+    // past the end of `data` (e.g. a bogus FEXTRA XLEN), making `pos` exceed
+    // `scan_end`; `data[pos..scan_end]` would then panic with "range start out
+    // of range". There is no second member to find beyond the buffer, so treat
+    // it as single-member. (Found by the parallel-SM cargo-fuzz target.)
+    if pos >= scan_end {
+        return false;
+    }
     while let Some(offset) = finder.find(&data[pos..scan_end]) {
         let header_pos = pos + offset;
         if header_pos + 10 > data.len() {
@@ -195,4 +206,25 @@ pub(crate) fn extract_gzip_fname(data: &[u8]) -> Option<String> {
         return None;
     }
     String::from_utf8(data[start..pos].to_vec()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a malformed gzip header (FLG=0xbc claims FEXTRA/FNAME/
+    /// FCOMMENT so `parse_gzip_header_size` reports a size past the buffer)
+    /// used to panic with "range start index out of range" at the
+    /// `data[pos..scan_end]` slice. Must now return false, not panic.
+    /// (Discovered by the parallel-SM cargo-fuzz target,
+    /// fuzz/fuzz_targets/parallel_sm_roundtrip.rs.)
+    #[test]
+    fn is_likely_multi_member_no_panic_on_malformed_oversized_header() {
+        let crash = [
+            31u8, 139, 8, 188, 188, 188, 188, 188, 188, 188, 188, 0, 0, 0, 0, 0, 0, 0, 248, 142,
+            251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251,
+            251, 251, 251, 251, 251, 251, 251,
+        ];
+        assert!(!is_likely_multi_member(&crash));
+    }
 }

@@ -7,7 +7,20 @@
 
 use std::fs::File;
 use std::io::{self, stdin, stdout, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+#[cfg(unix)]
+#[inline]
+fn out_fd_of<F: AsRawFd>(f: &F) -> Option<i32> {
+    Some(f.as_raw_fd())
+}
+#[cfg(not(unix))]
+#[inline]
+fn out_fd_of<F>(_f: &F) -> Option<i32> {
+    None
+}
 
 struct CountingWriter<W: Write> {
     inner: W,
@@ -35,6 +48,7 @@ use crate::cli::GzippyArgs;
 use crate::decompress::format::{
     extract_gzip_fname, extract_gzip_mtime, has_bgzf_markers, is_likely_multi_member,
 };
+
 use crate::error::{GzippyError, GzippyResult};
 use crate::format::CompressionFormat;
 use crate::utils::{debug_enabled, preserve_metadata, strip_compression_extension};
@@ -141,14 +155,18 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let result = if args.stdout {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        let r = decompress_to_writer(&mmap, &mut writer, format, args);
+        writer.flush()?;
+        let out_fd = out_fd_of(writer.get_ref());
+        let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
         writer.flush()?;
         r
     } else {
         let output_path = output_path.clone().unwrap();
         let output_file = File::create(&output_path)?;
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-        let r = decompress_to_writer(&mmap, &mut writer, format, args);
+        writer.flush()?;
+        let out_fd = out_fd_of(writer.get_ref());
+        let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
         writer.flush()?;
         r
     };
@@ -278,8 +296,21 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
-            let is_bgzf = has_bgzf_markers(input_data);
-            let is_multi = !is_bgzf && is_likely_multi_member(input_data);
+            // A first-member "GZ" hit only takes the BGZF fast path when the
+            // WHOLE file is pure GZ (every member carries the subfield, walk ends
+            // at EOF). A mixed concatenation (GZ ++ plain) is treated as
+            // multi-member so it routes through the cross-member-capable path
+            // instead of desyncing the BGZF block walk. [R2-#3]
+            // Compute the two format-detection scans ONCE and reuse them both for
+            // this routing decision AND the single-member classifier (threaded via
+            // `decompress_single_member_prescanned`), so the ~16 MiB
+            // `is_likely_multi_member` memmem walk is not repeated inside
+            // `classify_gzip`. `raw_multi` is the bare scan result;
+            // `is_multi` keeps the existing bgzf-exclusive routing semantics.
+            let bgzf_markers = has_bgzf_markers(input_data);
+            let is_bgzf = bgzf_markers && crate::decompress::bgzf::gz_coverage_is_pure(input_data);
+            let raw_multi = is_likely_multi_member(input_data);
+            let is_multi = !is_bgzf && raw_multi;
             let can_parallelize = args.processes > 1 && (is_bgzf || is_multi);
 
             if debug_enabled() {
@@ -304,10 +335,13 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                 let output = crate::decompress::decompress_gzip_to_vec(input_data, args.processes)?;
                 counted.write_all(&output)?;
             } else {
-                crate::decompress::decompress_single_member(
+                crate::decompress::decompress_single_member_prescanned(
                     input_data,
                     &mut counted,
                     args.processes,
+                    args.verbose,
+                    bgzf_markers,
+                    raw_multi,
                 )?;
             }
         }
@@ -362,6 +396,7 @@ fn decompress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 fn decompress_to_writer<W: Write>(
     mmap: &Mmap,
     writer: &mut W,
+    out_fd: Option<i32>,
     format: CompressionFormat,
     args: &GzippyArgs,
 ) -> GzippyResult<u64> {
@@ -371,8 +406,17 @@ fn decompress_to_writer<W: Write>(
             if !is_gzip {
                 return Ok(0);
             }
-            let bgzf = has_bgzf_markers(&mmap[..]);
-            let multi = is_likely_multi_member(&mmap[..]);
+            // Pure-GZ only takes the BGZF fast path; a mixed GZ ++ plain
+            // concatenation routes as multi-member. [R2-#3]
+            // Compute both format-detection scans ONCE; reuse for this dispatch AND
+            // the single-member classifier (via `decompress_single_member_fd_prescanned`)
+            // so the ~16 MiB `is_likely_multi_member` walk is not repeated inside
+            // `classify_gzip`. `raw_multi` is the bare scan; `multi` keeps the existing
+            // bgzf-exclusive routing semantics.
+            let bgzf_markers = has_bgzf_markers(&mmap[..]);
+            let bgzf = bgzf_markers && crate::decompress::bgzf::gz_coverage_is_pure(&mmap[..]);
+            let raw_multi = is_likely_multi_member(&mmap[..]);
+            let multi = raw_multi;
             let can_parallelize = args.processes > 1 && (bgzf || multi);
 
             if debug_enabled() {
@@ -397,7 +441,15 @@ fn decompress_to_writer<W: Write>(
                 writer.write_all(&output)?;
                 Ok(len)
             } else {
-                crate::decompress::decompress_single_member(&mmap[..], writer, args.processes)
+                crate::decompress::decompress_single_member_fd_prescanned(
+                    &mmap[..],
+                    writer,
+                    out_fd,
+                    args.processes,
+                    args.verbose,
+                    bgzf_markers,
+                    raw_multi,
+                )
             }
         }
         CompressionFormat::Zlib => crate::decompress::decompress_zlib_turbo(&mmap[..], writer),

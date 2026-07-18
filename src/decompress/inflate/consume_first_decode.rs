@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 #[cfg(target_arch = "aarch64")]
+#[allow(unused_imports)]
 use std::arch::aarch64::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -213,6 +214,32 @@ impl<'a> Bits<'a> {
         bits
     }
 
+    /// Seek to a non-byte-aligned bit offset in `data`.
+    pub fn at_bit_offset(data: &'a [u8], bit_offset: usize) -> Self {
+        let byte_idx = bit_offset / 8;
+        let skip = (bit_offset % 8) as u32;
+        let mut bits = Self {
+            data,
+            pos: byte_idx,
+            bitbuf: 0,
+            bitsleft: 0,
+        };
+        if skip != 0 && byte_idx < data.len() {
+            bits.bitbuf = (data[byte_idx] as u64) >> skip;
+            bits.bitsleft = 8 - skip;
+            bits.pos = byte_idx + 1;
+        } else {
+            bits.refill();
+        }
+        bits
+    }
+
+    /// Absolute bit position of the next bit to consume.
+    pub fn bit_position(&self) -> usize {
+        let unread = (self.bitsleft as u8).min(64) as usize;
+        self.pos.saturating_mul(8).saturating_sub(unread)
+    }
+
     /// Branchless refill matching libdeflate
     /// CRITICAL: Handles underflow where bitsleft has wrapped to > 64
     #[inline(always)]
@@ -270,7 +297,13 @@ impl<'a> Bits<'a> {
     #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.bitbuf >>= n as u8;
-        self.bitsleft -= n;
+        // `wrapping_sub` matches the sibling `consume_entry` and libdeflate's
+        // "garbage allowed in the high bits of bitsleft" model (`available()`
+        // reads only the low 8 bits). For any valid stream `bitsleft >= n`, so
+        // this is byte-identical; on malformed input it wraps instead of
+        // panicking under overflow-checks. (Found by the parallel-SM fuzz
+        // target via parse_dynamic_header on a crafted deflate header.)
+        self.bitsleft = self.bitsleft.wrapping_sub(n);
     }
 
     /// Consume using entry's low 5 bits
@@ -324,10 +357,26 @@ fn prefetch_read(ptr: *const u8) {
     }
 }
 
-// Note: ARM64 prefetch intrinsics are unstable in Rust, so we skip prefetch on ARM
-#[cfg(not(target_arch = "x86_64"))]
+/// Prefetch hint for arm64 via inline asm. `prfm pldl1keep` = preload
+/// into L1 data cache, "keep" temporal locality hint. Universally
+/// available on aarch64 (no extension needed). Stable Rust inline-asm
+/// is the correct path since `core::arch::aarch64::_prefetch` is
+/// unstable.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn prefetch_read(_ptr: *const u8) {}
+pub(crate) fn prefetch_read(ptr: *const u8) {
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+pub(crate) fn prefetch_read(_ptr: *const u8) {}
 
 /// AVX2 copy for large non-overlapping matches (distance >= 32, length >= 64).
 /// Uses 32-byte stores for 4x throughput vs scalar 8-byte copies.
@@ -366,10 +415,32 @@ unsafe fn fill_byte_avx2(mut dst: *mut u8, end: *const u8, byte: u8) {
     }
 }
 
-/// Fast match copy for fastloop - may write up to 40 bytes beyond length
+/// Fast match copy for fastloop - may write up to 40 bytes beyond length.
 /// ONLY use when you have FASTLOOP_MARGIN bytes of buffer margin!
+///
+/// Faithful port of libdeflate 1.25's MATCH_COPY
+/// (`lib/decompress_template.h:633-712`). vs the prior gzippy body this removes
+/// (a) the per-match `len > 40` prefetch branch and (b) the leading
+/// `dist >= 32 && len >= 64` SIMD branch that the common short-match path
+/// had to fall through before reaching `dist >= 8`.
+/// Here `offset >= WORDBYTES` (`dist >= 8`) is tested FIRST — exactly
+/// libdeflate's order — and all copies are scalar unaligned machine words with
+/// libdeflate's unroll (5× main, 4× RLE, 2× small-dist do-while). This is
+/// branchless within each (dist,len) class and correct for OVERLAPPING copies
+/// (`dist < len`): for `dist >= 8` each 8-byte read is at least one full word
+/// behind `dst` (fully materialized); for `dist == 1` it is an RLE byte fill;
+/// for `dist` in 2..=7 the stride-by-`dist` word copy lets each iteration
+/// finalize exactly `dist` correct bytes ahead of the frontier. Max overrun
+/// stays < 40 bytes (within the FASTLOOP overwrite budget), same contract as
+/// before. Exhaustively gated by
+/// `copy_match_fast_matches_naive_reference_all_dist_len`.
 #[inline(always)]
-fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
+pub(crate) fn copy_match_fast(
+    output: &mut [u8],
+    out_pos: usize,
+    distance: u32,
+    length: u32,
+) -> usize {
     let dist = distance as usize;
     let len = length as usize;
 
@@ -379,128 +450,69 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
         let mut src = out_ptr.add(out_pos - dist);
         let end = dst.add(len);
 
-        // Prefetch for long matches
-        if len > 40 {
-            prefetch_read(src.add(40));
-        }
-
-        if dist >= 32 && len >= 64 {
-            // SIMD fast path for large non-overlapping matches
-            #[cfg(target_arch = "aarch64")]
-            {
-                while dst.add(32) <= end {
-                    let v0 = vld1q_u8(src);
-                    let v1 = vld1q_u8(src.add(16));
-                    vst1q_u8(dst, v0);
-                    vst1q_u8(dst.add(16), v1);
-                    src = src.add(32);
-                    dst = dst.add(32);
-                }
-                while dst.add(16) <= end {
-                    let v = vld1q_u8(src);
-                    vst1q_u8(dst, v);
-                    src = src.add(16);
-                    dst = dst.add(16);
-                }
-                while dst < end {
-                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                    src = src.add(8);
-                    dst = dst.add(8);
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") {
-                    copy_match_avx2(dst, src, end);
-                } else {
-                    while dst < end {
-                        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                        src = src.add(8);
-                        dst = dst.add(8);
-                    }
-                }
-            }
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-            {
-                while dst < end {
-                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                    src = src.add(8);
-                    dst = dst.add(8);
-                }
-            }
-        } else if dist >= 8 {
-            // Fast path: offset >= WORDBYTES (8)
-            // Unconditionally copy 5 words first (40 bytes - covers most matches)
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(8);
-            dst = dst.add(8);
-
-            // Loop for longer matches
-            while dst < end {
+        // Copy one unaligned machine word src->dst and advance both by 8.
+        macro_rules! cw {
+            () => {{
                 (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                 src = src.add(8);
                 dst = dst.add(8);
+            }};
+        }
+
+        if dist >= 8 {
+            // offset >= WORDBYTES (decompress_template.h:633-665): 5 unconditional
+            // words then a 5×-unrolled word loop.
+            cw!();
+            cw!();
+            cw!();
+            cw!();
+            cw!();
+            while dst < end {
+                cw!();
+                cw!();
+                cw!();
+                cw!();
+                cw!();
             }
         } else if dist == 1 {
-            // RLE path: use SIMD broadcast for large fills
-            let byte = *src;
-            #[cfg(target_arch = "aarch64")]
-            {
-                if len >= 32 {
-                    let pattern = vdupq_n_u8(byte);
-                    while dst.add(32) <= end {
-                        vst1q_u8(dst, pattern);
-                        vst1q_u8(dst.add(16), pattern);
-                        dst = dst.add(32);
-                    }
-                    while dst.add(16) <= end {
-                        vst1q_u8(dst, pattern);
-                        dst = dst.add(16);
-                    }
-                }
+            // RLE (decompress_template.h:666-691): broadcast byte, 4 unconditional
+            // words then a 4×-unrolled fill loop (kept a multiple of 16 bytes so
+            // the autovectorizer can widen it).
+            let v = 0x0101010101010101u64 * (*src as u64);
+            macro_rules! fw {
+                () => {{
+                    (dst as *mut u64).write_unaligned(v);
+                    dst = dst.add(8);
+                }};
             }
-            #[cfg(target_arch = "x86_64")]
-            {
-                if len >= 64 && is_x86_feature_detected!("avx2") {
-                    fill_byte_avx2(dst, end, byte);
-                    return out_pos + len;
-                }
-            }
-            let v = 0x0101010101010101u64 * (byte as u64);
+            fw!();
+            fw!();
+            fw!();
+            fw!();
             while dst < end {
-                (dst as *mut u64).write_unaligned(v);
-                dst = dst.add(8);
+                fw!();
+                fw!();
+                fw!();
+                fw!();
             }
         } else {
-            // Small distance (2-7): word copy with stride = offset
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-            src = src.add(dist);
-            dst = dst.add(dist);
-            while dst < end {
-                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                src = src.add(dist);
-                dst = dst.add(dist);
+            // Small distance 2..=7 (decompress_template.h:692-706): word copy with
+            // stride = offset, 2 unconditional words then a do-while of 2.
+            macro_rules! sw {
+                () => {{
+                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                    src = src.add(dist);
+                    dst = dst.add(dist);
+                }};
+            }
+            sw!();
+            sw!();
+            loop {
+                sw!();
+                sw!();
+                if dst >= end {
+                    break;
+                }
             }
         }
     }
@@ -537,119 +549,6 @@ fn copy_match_safe(output: &mut [u8], out_pos: usize, distance: u32, length: u32
 // =============================================================================
 // Main Decode Function - Matching libdeflate's Structure EXACTLY
 // =============================================================================
-
-/// Decode a Huffman block using consume-first pattern
-///
-/// This matches libdeflate's decompress_template.h lines 340-580
-/// Huffman decode with Vector Huffman multi-literal optimization
-fn decode_huffman_cf_vector(
-    bits: &mut Bits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    litlen: &LitLenTable,
-    dist_table: &DistTable,
-    vector_table: &crate::decompress::inflate::vector_huffman::VectorTable,
-) -> Result<usize> {
-    const FASTLOOP_MARGIN: usize = 320;
-
-    // FASTLOOP with multi-literal optimization
-    while out_pos + FASTLOOP_MARGIN <= output.len() && bits.pos < bits.data.len() {
-        if bits.available() < 32 {
-            bits.refill();
-        }
-
-        // Try multi-literal lookahead (up to 4 literals)
-        let (symbols, count, bits_count) =
-            crate::decompress::inflate::vector_huffman::decode_multi_literals(
-                bits.peek(),
-                &vector_table.table,
-            );
-        if count > 0 {
-            output[out_pos..(out_pos + count)].copy_from_slice(&symbols[..count]);
-            out_pos += count;
-            bits.consume(bits_count);
-            continue;
-        }
-
-        // Fallback to standard decode (lengths/exceptional/overflow)
-        let saved_bitbuf = bits.peek();
-        let mut entry = litlen.lookup(saved_bitbuf);
-        bits.consume_entry(entry.raw());
-
-        if (entry.raw() as i32) < 0 {
-            // Literal
-            output[out_pos] = entry.literal_value();
-            out_pos += 1;
-            continue;
-        }
-
-        if entry.is_exceptional() {
-            if entry.is_end_of_block() {
-                return Ok(out_pos);
-            }
-
-            // Subtable
-            let sub_saved = bits.peek();
-            entry = litlen.lookup_subtable(entry, saved_bitbuf);
-            bits.consume_entry(entry.raw());
-
-            if entry.is_end_of_block() {
-                return Ok(out_pos);
-            }
-
-            if (entry.raw() as i32) < 0 {
-                // Literal from subtable
-                output[out_pos] = entry.literal_value();
-                out_pos += 1;
-                continue;
-            }
-
-            // Length from subtable
-            let length_val = entry.decode_length(sub_saved);
-            out_pos = decode_huffman_match(bits, output, out_pos, length_val, dist_table)?;
-        } else {
-            // Length
-            let length_val = entry.decode_length(saved_bitbuf);
-            out_pos = decode_huffman_match(bits, output, out_pos, length_val, dist_table)?;
-        }
-    }
-
-    // Generic loop for remainder
-    decode_huffman_cf(bits, output, out_pos, litlen, dist_table)
-}
-
-fn decode_huffman_match(
-    bits: &mut Bits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    length: u32,
-    dist_table: &DistTable,
-) -> Result<usize> {
-    bits.refill();
-    let dist_saved = bits.peek();
-    let mut dist_entry = dist_table.lookup(dist_saved);
-
-    if dist_entry.is_subtable_ptr() {
-        bits.consume(DistTable::TABLE_BITS as u32);
-        dist_entry = dist_table.lookup_subtable(dist_entry, dist_saved);
-    }
-
-    let dist_extra_saved = bits.peek();
-    bits.consume_entry(dist_entry.raw());
-    let distance = dist_entry.decode_distance(dist_extra_saved);
-
-    if distance == 0 || distance as usize > out_pos {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Invalid distance {} at pos {}", distance, out_pos),
-        ));
-    }
-
-    // Copy match
-    out_pos = copy_match_fast(output, out_pos, distance, length);
-    bits.refill();
-    Ok(out_pos)
-}
 
 /// Debug logging for decode operations
 /// Set DEBUG_POS environment variable to log around a specific position
@@ -1125,276 +1024,6 @@ fn decode_huffman_libdeflate_style(
     decode_huffman_cf(bits, output, out_pos, litlen, dist)
 }
 
-/// Optimized decode loop with BZHI-style bit extraction
-/// Works on all platforms - uses efficient masking for bit extraction
-#[inline(never)]
-fn decode_huffman_optimized(
-    bits: &mut Bits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    litlen: &LitLenTable,
-    dist: &DistTable,
-) -> Result<usize> {
-    const FASTLOOP_MARGIN: usize = 320;
-    const LITLEN_TABLEMASK: u64 = (1u64 << LitLenTable::TABLE_BITS) - 1;
-
-    let out_ptr = output.as_mut_ptr();
-    let out_end = output.len();
-    let litlen_ptr = litlen.entries_ptr();
-
-    // Local copies for register allocation
-    let mut bitbuf = bits.bitbuf;
-    let mut bitsleft = bits.bitsleft;
-    let mut in_pos = bits.pos;
-    let in_data = bits.data;
-
-    // Inline branchless refill - handles underflow where bitsleft > 64
-    macro_rules! refill_branchless {
-        () => {
-            // Detect and handle underflow
-            let mut bits_u8 = bitsleft as u8;
-            if bits_u8 > 64 {
-                bits_u8 = 0;
-                bitbuf = 0;
-            }
-            if in_pos + 8 <= in_data.len() {
-                let word = unsafe { (in_data.as_ptr().add(in_pos) as *const u64).read_unaligned() };
-                let word = u64::from_le(word);
-                bitbuf |= word << bits_u8;
-                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
-                bitsleft = (bits_u8 as u32) | 56;
-            } else {
-                while bits_u8 <= 56 && in_pos < in_data.len() {
-                    bitbuf |= (in_data[in_pos] as u64) << bits_u8;
-                    in_pos += 1;
-                    bits_u8 = bits_u8.wrapping_add(8);
-                }
-                bitsleft = bits_u8 as u32;
-            }
-        };
-    }
-
-    macro_rules! lookup {
-        () => {
-            unsafe { (*litlen_ptr.add((bitbuf & LITLEN_TABLEMASK) as usize)).raw() }
-        };
-    }
-
-    // BZHI-style bit extraction - uses efficient masking on all platforms
-    macro_rules! bzhi {
-        ($val:expr, $bits:expr) => {
-            bzhi_u64($val, $bits)
-        };
-    }
-
-    // HUFFDEC micro-ops (same as in libdeflate_style, see docs there)
-    macro_rules! consume {
-        ($entry:expr) => {{
-            let saved = bitbuf;
-            bitbuf >>= $entry as u8;
-            bitsleft = bitsleft.wrapping_sub($entry);
-            saved
-        }};
-    }
-    macro_rules! huffdec {
-        ($entry:expr) => {{
-            bitbuf >>= $entry as u8;
-            bitsleft = bitsleft.wrapping_sub($entry);
-            $entry = lookup!();
-        }};
-    }
-
-    refill_branchless!();
-    let mut entry = lookup!();
-
-    // Same threshold as decode_huffman_libdeflate_style
-    const REFILL_THRESHOLD2: u8 = if LitLenTable::TABLE_BITS * 4 <= 56 {
-        LitLenTable::TABLE_BITS * 4
-    } else {
-        56
-    };
-
-    // FASTLOOP
-    while out_pos + FASTLOOP_MARGIN <= out_end {
-        // CRITICAL: Ensure enough bits before multi-literal batch (see decode_huffman_libdeflate_style)
-        if (bitsleft as u8) < REFILL_THRESHOLD2 {
-            refill_branchless!();
-        }
-
-        let saved_bitbuf = consume!(entry);
-
-        if (entry as i32) < 0 {
-            // LITERAL PATH - multi-literal decode with huffdec! micro-op
-            // Note: E1 was already consumed above. Bare lookup for E2.
-            let lit1 = (entry >> 16) as u8;
-            entry = lookup!();
-
-            if (entry as i32) < 0 {
-                let lit2 = (entry >> 16) as u8;
-                huffdec!(entry);
-
-                if (entry as i32) < 0 {
-                    let lit3 = (entry >> 16) as u8;
-                    // For TABLE_BITS > 13: refill after 3rd literal
-                    if LitLenTable::TABLE_BITS > 13 && (bitsleft as u8) < 32 {
-                        refill_branchless!();
-                    }
-                    huffdec!(entry);
-
-                    if (entry as i32) < 0 {
-                        let lit4 = (entry >> 16) as u8;
-                        // Refill BEFORE lookup to ensure entry matches post-refill bitbuf
-                        consume!(entry);
-                        refill_branchless!();
-                        entry = lookup!();
-
-                        // Write 4 literals packed
-                        let packed = (lit1 as u32)
-                            | ((lit2 as u32) << 8)
-                            | ((lit3 as u32) << 16)
-                            | ((lit4 as u32) << 24);
-                        unsafe { (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed) };
-                        out_pos += 4;
-                        continue;
-                    }
-
-                    let packed = (lit1 as u32) | ((lit2 as u32) << 8) | ((lit3 as u32) << 16);
-                    unsafe { (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed) };
-                    out_pos += 3;
-                    if (bitsleft as u8) < 32 {
-                        refill_branchless!();
-                    }
-                    continue;
-                }
-
-                let packed = (lit1 as u16) | ((lit2 as u16) << 8);
-                unsafe { (out_ptr.add(out_pos) as *mut u16).write_unaligned(packed) };
-                out_pos += 2;
-                if (bitsleft as u8) < 32 {
-                    refill_branchless!();
-                }
-                continue;
-            }
-
-            unsafe { *out_ptr.add(out_pos) = lit1 };
-            out_pos += 1;
-            if (bitsleft as u8) < 32 {
-                refill_branchless!();
-            }
-            continue;
-        }
-
-        // EXCEPTIONAL
-        if (entry & 0x8000) != 0 {
-            if (entry & 0x2000) != 0 {
-                bits.bitbuf = bitbuf;
-                bits.bitsleft = bitsleft;
-                bits.pos = in_pos;
-                return Ok(out_pos);
-            }
-
-            let subtable_start = (entry >> 16) as usize;
-            let subtable_bits = (entry >> 8) & 0x3F;
-            let sub_idx = bzhi!(bitbuf, subtable_bits) as usize;
-            entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
-
-            let saved_sub = consume!(entry);
-
-            if (entry as i32) < 0 {
-                let lit = ((entry >> 16) & 0xFF) as u8;
-                // Refill BEFORE lookup to ensure entry matches post-refill bitbuf
-                refill_branchless!();
-                entry = lookup!();
-                unsafe { *out_ptr.add(out_pos) = lit };
-                out_pos += 1;
-                continue;
-            }
-            if (entry & 0x2000) != 0 {
-                bits.bitbuf = bitbuf;
-                bits.bitsleft = bitsleft;
-                bits.pos = in_pos;
-                return Ok(out_pos);
-            }
-
-            // Length from subtable - use BMI2 BZHI
-            let length = (entry >> 16)
-                + (bzhi!(saved_sub, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
-
-            refill_branchless!();
-            let mut dist_entry = dist.lookup(bitbuf);
-
-            if dist_entry.is_subtable_ptr() {
-                bitbuf >>= DistTable::TABLE_BITS;
-                bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
-                dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
-            }
-
-            let dist_extra_saved = bitbuf;
-            let dist_raw = dist_entry.raw();
-            bitbuf >>= dist_raw as u8;
-            bitsleft = bitsleft.wrapping_sub(dist_raw);
-            // BMI2 BZHI for distance
-            let distance = (dist_raw >> 16)
-                + (bzhi!(dist_extra_saved, (dist_raw as u8) as u32) >> ((dist_raw >> 8) as u8))
-                    as u32;
-
-            if distance == 0 || distance as usize > out_pos {
-                bits.bitbuf = bitbuf;
-                bits.bitsleft = bitsleft;
-                bits.pos = in_pos;
-                return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
-            }
-
-            // Refill BEFORE lookup to ensure entry matches post-refill bitbuf
-            refill_branchless!();
-            entry = lookup!();
-            out_pos = copy_match_fast(output, out_pos, distance, length);
-            continue;
-        }
-
-        // LENGTH CODE - BMI2 BZHI for extra bits
-        let length = (entry >> 16)
-            + (bzhi!(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
-
-        let mut dist_entry = dist.lookup(bitbuf);
-        if (bitsleft as u8) < 32 {
-            refill_branchless!();
-        }
-
-        if dist_entry.is_subtable_ptr() {
-            bitbuf >>= DistTable::TABLE_BITS;
-            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
-            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
-        }
-
-        let dist_extra_saved = bitbuf;
-        let dist_raw = dist_entry.raw();
-        bitbuf >>= dist_raw as u8;
-        bitsleft = bitsleft.wrapping_sub(dist_raw);
-        // BMI2 BZHI for distance
-        let distance = (dist_raw >> 16)
-            + (bzhi!(dist_extra_saved, (dist_raw as u8) as u32) >> ((dist_raw >> 8) as u8)) as u32;
-
-        if distance == 0 || distance as usize > out_pos {
-            bits.bitbuf = bitbuf;
-            bits.bitsleft = bitsleft;
-            bits.pos = in_pos;
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
-        }
-
-        // Refill BEFORE lookup to ensure entry matches post-refill bitbuf
-        refill_branchless!();
-        entry = lookup!();
-        out_pos = copy_match_fast(output, out_pos, distance, length);
-    }
-
-    bits.bitbuf = bitbuf;
-    bits.bitsleft = bitsleft & 0xFF;
-    bits.pos = in_pos;
-
-    decode_huffman_cf(bits, output, out_pos, litlen, dist)
-}
-
 /// Dispatch function - uses libdeflate-style decode with BZHI bit extraction
 fn decode_huffman_with_dispatch(
     bits: &mut Bits,
@@ -1405,80 +1034,6 @@ fn decode_huffman_with_dispatch(
 ) -> Result<usize> {
     // Use the original libdeflate-style decoder with bzhi_u64 for bit extraction
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
-}
-
-/// Flat literal loop decoder - avoids deep nesting for better branch prediction
-fn decode_huffman_flat(
-    bits: &mut Bits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    litlen: &LitLenTable,
-    dist: &DistTable,
-) -> Result<usize> {
-    const FASTLOOP_MARGIN: usize = 320;
-    let out_ptr = output.as_mut_ptr();
-    let out_end = output.len();
-
-    // FASTLOOP
-    'fastloop: while out_pos + FASTLOOP_MARGIN <= out_end {
-        bits.refill();
-
-        // Inner literal loop - process up to 8 literals before checking bits
-        'literals: loop {
-            let saved_bitbuf = bits.peek();
-            let entry = litlen.lookup(saved_bitbuf);
-            bits.consume_entry(entry.raw());
-
-            // Check literal (bit 31 set = negative)
-            if (entry.raw() as i32) >= 0 {
-                // Not a literal - break out to handle length/EOB
-                // Need to handle this entry
-                if entry.is_exceptional() {
-                    if entry.is_end_of_block() {
-                        return Ok(out_pos);
-                    }
-                    // Subtable
-                    let sub_entry = litlen.lookup_subtable(entry, saved_bitbuf);
-                    let sub_saved = bits.peek();
-                    bits.consume_entry(sub_entry.raw());
-
-                    if sub_entry.is_end_of_block() {
-                        return Ok(out_pos);
-                    }
-                    if (sub_entry.raw() as i32) < 0 {
-                        // Literal from subtable
-                        unsafe {
-                            *out_ptr.add(out_pos) = sub_entry.literal_value();
-                        }
-                        out_pos += 1;
-                        continue 'literals;
-                    }
-                    // Length from subtable
-                    let length = sub_entry.decode_length(sub_saved);
-                    out_pos = decode_match_inline(bits, output, out_pos, length, dist)?;
-                    continue 'fastloop;
-                }
-                // Length code
-                let length = entry.decode_length(saved_bitbuf);
-                out_pos = decode_match_inline(bits, output, out_pos, length, dist)?;
-                continue 'fastloop;
-            }
-
-            // Literal - write and continue
-            unsafe {
-                *out_ptr.add(out_pos) = entry.literal_value();
-            }
-            out_pos += 1;
-
-            // Check if we need to refill (consumed ~9 bits per literal, so check after a few)
-            if bits.available() < 32 {
-                continue 'fastloop;
-            }
-        }
-    }
-
-    // Generic loop for remainder
-    decode_huffman_cf(bits, output, out_pos, litlen, dist)
 }
 
 /// Inline match decode for flat loop
@@ -1510,17 +1065,6 @@ fn decode_match_inline(
     Ok(copy_match_fast(output, out_pos, distance, length))
 }
 
-/// Decode Huffman stream using consume-first pattern (public for use by optimized decoders)
-pub fn decode_huffman_cf_pub(
-    bits: &mut Bits,
-    output: &mut [u8],
-    out_pos: usize,
-    litlen: &LitLenTable,
-    dist: &DistTable,
-) -> Result<usize> {
-    decode_huffman_cf(bits, output, out_pos, litlen, dist)
-}
-
 /// Public wrappers for block-level decode functions (used by two-pass parallel)
 pub fn decode_stored_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
     decode_stored(bits, output, out_pos)
@@ -1532,6 +1076,733 @@ pub fn decode_fixed_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> R
 
 pub fn decode_dynamic_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
     decode_dynamic(bits, output, out_pos)
+}
+
+/// Non-inert counter: every call to the flat libdeflate-style decoder
+/// (engine A) increments this. A harness asserts it advanced by exactly the
+/// rep count after each timed loop, proving the flat kernel actually executed
+/// — not a silently-skipped/inert path.
+pub static FLAT_DECODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Flat-table (libdeflate-style) clean decoder, called with PRE-BUILT tables
+/// so table-build can be amortized outside a timed loop and start at the SAME
+/// body bit as engine B (`Block::decode_clean_into_contig`). A thin transparent
+/// wrapper around the production `decode_huffman_libdeflate_style` — the SAME
+/// function bgzf/scan/multi-member run — with a non-inert call counter.
+#[doc(hidden)]
+pub fn decode_flat_clean_pub(
+    bits: &mut Bits,
+    output: &mut [u8],
+    out_pos: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> Result<usize> {
+    FLAT_DECODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
+}
+
+/// Non-inert counter: every call to the parallel-SM clean-path bounded
+/// flat fastloop (engine A, wired into `decode_clean_into_contig`) increments
+/// this. A measurement asserts it advanced (>0) so the flat kernel is
+/// PROVEN to have run on the production ParallelSM clean path (not inert /
+/// silently-skipped on an arch-gate).
+pub static FLAT_CONTIG_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Companion byte counter (bytes emitted by the bounded flat fastloop).
+pub static FLAT_CONTIG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Non-inert counter: every call to the engine-A flat CLEAN *careful
+/// tail* (`decode_clean_careful_flat`, wired into the parallel-SM clean contig
+/// path to finish the <FASTLOOP_MARGIN residual + the exact `n_max`/EOB
+/// boundary that the bounded fastloop stops short of) increments this. A
+/// positive count PROVES the clean path is 100% engine A — the engine-B
+/// two-level careful loop no longer runs on the clean path.
+pub static FLAT_CAREFUL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Non-inert counter: every time the parallel-SM clean contig path
+/// FALLS BACK to building the engine-B two-level `lut_litlen` table (i.e. the
+/// flat engine A did NOT take the block). On a pure-clean run this stays 0,
+/// PROVING the double table-build is gone from the clean path.
+pub static CLEAN_LUT_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Outcome of one bounded flat-CLEAN careful-tail call.
+pub enum FlatCarefulExit {
+    /// Reached HUFFDEC_END_OF_BLOCK; `out_pos` is the byte just past EOB.
+    EndOfBlock(usize),
+    /// `out_pos` reached the `n_max`/`out_room` cap at a clean SYMBOL boundary
+    /// (`bits` left consistent — `bit_position()` is exact). The block is NOT
+    /// finished; the caller resumes from `bits` next call.
+    Stopped(usize),
+    /// Decoded an invalid backref distance (distance==0 or > available output).
+    /// All `out_pos` bytes so far are valid; the caller surfaces a terminal
+    /// error after committing them.
+    InvalidDistance(usize),
+}
+
+/// Engine A's flat, RESUMABLE, CLEAN careful tail — the per-symbol decode that
+/// finishes a block after [`decode_huffman_fastloop_bounded`] stops short of the
+/// budget (by FASTLOOP_MARGIN) or runs out of input margin. It is byte-for-byte
+/// the SAME per-symbol decode as [`decode_huffman_cf`]'s generic loop (the
+/// proven production careful decode used by bgzf / scan_inflate / multi-member),
+/// using the SAME flat `LitLenTable` / `DistTable` the bounded fastloop uses, so
+/// the seam between the two is byte-exact BY CONSTRUCTION (identical tables,
+/// identical entry-decode helpers, resuming from the canonical re-read `bits`).
+///
+/// Contract differences from `decode_huffman_cf` that make it the parallel-SM
+/// CLEAN careful tail (replacing engine B's two-level careful loop):
+///   * **Bounded + resumable.** Yields [`FlatCarefulExit::Stopped`] when
+///     `out_pos >= out_cap_end` at a symbol boundary instead of running to
+///     `output.len()`. This mirrors engine B's `while emitted < local_cap`
+///     exactly: the cap is checked at the TOP of each iteration, so ONE full
+///     symbol may overshoot `out_cap_end` by ≤ `MAX_RUN_LENGTH-1` bytes — the
+///     identical overshoot semantics engine B had, which the caller's `out_room`
+///     reservation (`cap - MAX_RUN_LENGTH - 8`) keeps in-bounds.
+///   * **Exit enum, not Result.** EOB → `EndOfBlock`; a bad backref →
+///     `InvalidDistance` (the caller maps it to a terminal `BlockError`). No
+///     fallback hides the error.
+///   * **`copy_match_safe`** (byte-by-byte, no copy overshoot) so a backref
+///     landing at the cap never writes past the reserved headroom.
+///
+/// # Safety / bounds
+/// `output.len() >= out_cap_end + MAX_RUN_LENGTH` so a full backref at the cap
+/// stays in-bounds (the caller passes `out_cap_end <= cap - MAX_RUN_LENGTH - 8`).
+pub(crate) fn decode_clean_careful_flat(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    out_cap_end: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> FlatCarefulExit {
+    FLAT_CAREFUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        // Resumable cap: yield at a clean symbol boundary (block NOT finished).
+        if out_pos >= out_cap_end {
+            return FlatCarefulExit::Stopped(out_pos);
+        }
+        // Always refill at the top — handles end-of-input gracefully (mirror of
+        // `decode_huffman_cf`'s generic loop).
+        bits.refill();
+        let mut saved_bitbuf = bits.peek();
+        let mut entry = litlen.lookup(saved_bitbuf);
+        if entry.is_subtable_ptr() {
+            bits.consume(LitLenTable::TABLE_BITS as u32);
+            entry = litlen.lookup_subtable(entry, saved_bitbuf);
+            saved_bitbuf = bits.peek();
+            bits.consume_entry(entry.raw());
+        } else {
+            bits.consume_entry(entry.raw());
+        }
+
+        if (entry.raw() as i32) < 0 {
+            // LITERAL. `out_pos < out_cap_end <= output.len()` (top guard).
+            output[out_pos] = entry.literal_value();
+            out_pos += 1;
+            continue;
+        }
+
+        if entry.is_end_of_block() {
+            return FlatCarefulExit::EndOfBlock(out_pos);
+        }
+
+        // LENGTH code — decode from saved_bitbuf, then DISTANCE.
+        let length = entry.decode_length(saved_bitbuf);
+        bits.refill();
+        let dist_saved = bits.peek();
+        let mut dist_entry = dist.lookup(dist_saved);
+        if dist_entry.is_subtable_ptr() {
+            bits.consume(DistTable::TABLE_BITS as u32);
+            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+        }
+        let dist_extra_saved = bits.peek();
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_extra_saved);
+        if distance == 0 || distance as usize > out_pos {
+            return FlatCarefulExit::InvalidDistance(out_pos);
+        }
+        out_pos = copy_match_safe(output, out_pos, distance, length);
+    }
+}
+
+/// Outcome of one bounded-flat-fastloop call.
+pub enum FlatFastloopExit {
+    /// Reached HUFFDEC_END_OF_BLOCK; `out_pos` is the byte just past EOB.
+    EndOfBlock(usize),
+    /// Stopped on the output budget or input margin at a clean SYMBOL boundary
+    /// (`bits` written back canonically — re-readable by any decoder). The
+    /// block is NOT finished; the caller's resumable careful tail continues
+    /// from `bits`.
+    Stopped(usize),
+    /// Decoded an invalid backref distance (distance==0 or > available output).
+    /// All `out_pos` bytes emitted so far are valid; the caller must surface a
+    /// terminal error after committing them. (`bits` left written-back.)
+    InvalidDistance(usize),
+}
+
+/// Engine A's fastloop, parameterized by an EXPLICIT output budget end
+/// (`out_fastloop_end`) that is decoupled from the slice length so the callable
+/// can decode into a contiguous buffer that has copy-overshoot headroom beyond
+/// the budget. Byte-for-byte the same per-symbol logic as
+/// `decode_huffman_libdeflate_style`'s fastloop (consume_first_decode.rs:763)
+/// with TWO differences:
+///   1. the loop bound is `out_pos + FASTLOOP_MARGIN <= out_fastloop_end`
+///      (the caller's `*pos + budget`), NOT `output.len()`;
+///   2. on exit it returns a [`FlatFastloopExit`] instead of chaining into the
+///      non-resumable generic tail (`decode_huffman_cf`) — the parallel-SM
+///      caller owns a RESUMABLE careful tail (engine B) for the <FASTLOOP_MARGIN
+///      residual + the exact n_max boundary.
+///
+/// On a `Stopped`/`EndOfBlock` exit the bit cursor sits at a clean symbol
+/// boundary and `bits` is written back so `bits.bit_position()` is exact — the
+/// caller re-reads a canonical `Bits` from that position (the N32-safe
+/// reclass_reread seam) before handing to the careful tail.
+///
+/// # Safety contract (caller-enforced)
+/// `output` must be valid for `[0, output.len())` and
+/// `output.len() >= out_fastloop_end + MAX_RUN_LENGTH + copy_overshoot` so the
+/// match-copy / 8-literal-store overshoot past `out_fastloop_end` stays
+/// in-bounds. `out_fastloop_end <= output.len()`.
+pub(crate) fn decode_huffman_fastloop_bounded(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    out_fastloop_end: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> FlatFastloopExit {
+    const FASTLOOP_MARGIN: usize = 320;
+    const LITLEN_TABLEMASK: u64 = (1u64 << LitLenTable::TABLE_BITS) - 1;
+
+    let out_ptr = output.as_mut_ptr();
+    let litlen_ptr = litlen.entries_ptr();
+
+    let mut bitbuf = bits.bitbuf;
+    let mut bitsleft = bits.bitsleft;
+    let mut in_pos = bits.pos;
+    let in_data = bits.data;
+    let in_ptr = in_data.as_ptr();
+    let in_fastloop_end = in_data.len().saturating_sub(32);
+
+    macro_rules! refill_branchless_fast {
+        () => {
+            unsafe {
+                let bits_u8 = bitsleft as u8;
+                let word = (in_ptr.add(in_pos) as *const u64).read_unaligned();
+                let word = u64::from_le(word);
+                bitbuf |= word << bits_u8;
+                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                bitsleft = (bits_u8 as u32) | 56;
+            }
+        };
+    }
+    macro_rules! lookup {
+        () => {
+            unsafe { (*litlen_ptr.add((bitbuf & LITLEN_TABLEMASK) as usize)).raw() }
+        };
+    }
+    macro_rules! consume {
+        ($entry:expr) => {{
+            let saved = bitbuf;
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            saved
+        }};
+    }
+    macro_rules! huffdec {
+        ($entry:expr) => {{
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            $entry = lookup!();
+        }};
+    }
+    macro_rules! writeback_stopped {
+        () => {{
+            bits.bitbuf = bitbuf;
+            bits.bitsleft = bitsleft & 0xFF;
+            bits.pos = in_pos;
+        }};
+    }
+
+    // PRELOAD first entry BEFORE loop (libdeflate pattern). The fastloop input
+    // margin guards the read; if the chunk's compressed tail is within 8 bytes
+    // of the end we never enter the loop and the caller's careful tail starts
+    // from the unmodified `bits`.
+    if in_pos + 8 > in_data.len() {
+        return FlatFastloopExit::Stopped(out_pos);
+    }
+    refill_branchless_fast!();
+    let mut entry = lookup!();
+
+    const REFILL_THRESHOLD: u8 = if LitLenTable::TABLE_BITS * 4 <= 56 {
+        LitLenTable::TABLE_BITS * 4
+    } else {
+        56
+    };
+
+    while in_pos < in_fastloop_end && out_pos + FASTLOOP_MARGIN <= out_fastloop_end {
+        if (bitsleft as u8) < REFILL_THRESHOLD {
+            refill_branchless_fast!();
+        }
+
+        let saved_bitbuf = consume!(entry);
+
+        if (entry as i32) < 0 {
+            let lit1 = (entry >> 16) as u8;
+            entry = lookup!();
+            if (entry as i32) < 0 {
+                let lit2 = (entry >> 16) as u8;
+                huffdec!(entry);
+                if (entry as i32) < 0 {
+                    let lit3 = (entry >> 16) as u8;
+                    if LitLenTable::TABLE_BITS > 13 && (bitsleft as u8) < 32 {
+                        refill_branchless_fast!();
+                    }
+                    huffdec!(entry);
+                    if (entry as i32) < 0 {
+                        let lit4 = (entry >> 16) as u8;
+                        consume!(entry);
+                        refill_branchless_fast!();
+                        entry = lookup!();
+                        if (entry as i32) < 0 {
+                            let lit5 = (entry >> 16) as u8;
+                            huffdec!(entry);
+                            if (entry as i32) < 0 {
+                                let lit6 = (entry >> 16) as u8;
+                                huffdec!(entry);
+                                if (entry as i32) < 0 {
+                                    let lit7 = (entry >> 16) as u8;
+                                    consume!(entry);
+                                    refill_branchless_fast!();
+                                    entry = lookup!();
+                                    if (entry as i32) < 0 {
+                                        let lit8 = (entry >> 16) as u8;
+                                        huffdec!(entry);
+                                        let packed = (lit1 as u64)
+                                            | ((lit2 as u64) << 8)
+                                            | ((lit3 as u64) << 16)
+                                            | ((lit4 as u64) << 24)
+                                            | ((lit5 as u64) << 32)
+                                            | ((lit6 as u64) << 40)
+                                            | ((lit7 as u64) << 48)
+                                            | ((lit8 as u64) << 56);
+                                        unsafe {
+                                            (out_ptr.add(out_pos) as *mut u64)
+                                                .write_unaligned(packed);
+                                        }
+                                        out_pos += 8;
+                                        continue;
+                                    }
+                                    let packed = (lit1 as u64)
+                                        | ((lit2 as u64) << 8)
+                                        | ((lit3 as u64) << 16)
+                                        | ((lit4 as u64) << 24)
+                                        | ((lit5 as u64) << 32)
+                                        | ((lit6 as u64) << 40)
+                                        | ((lit7 as u64) << 48);
+                                    unsafe {
+                                        (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
+                                    }
+                                    out_pos += 7;
+                                    continue;
+                                }
+                                let packed = (lit1 as u64)
+                                    | ((lit2 as u64) << 8)
+                                    | ((lit3 as u64) << 16)
+                                    | ((lit4 as u64) << 24)
+                                    | ((lit5 as u64) << 32)
+                                    | ((lit6 as u64) << 40);
+                                unsafe {
+                                    (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
+                                }
+                                out_pos += 6;
+                                refill_branchless_fast!();
+                                continue;
+                            }
+                            let packed = (lit1 as u64)
+                                | ((lit2 as u64) << 8)
+                                | ((lit3 as u64) << 16)
+                                | ((lit4 as u64) << 24)
+                                | ((lit5 as u64) << 32);
+                            unsafe {
+                                (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
+                            }
+                            out_pos += 5;
+                            refill_branchless_fast!();
+                            continue;
+                        }
+                        let packed = (lit1 as u32)
+                            | ((lit2 as u32) << 8)
+                            | ((lit3 as u32) << 16)
+                            | ((lit4 as u32) << 24);
+                        unsafe {
+                            (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed);
+                        }
+                        out_pos += 4;
+                        continue;
+                    }
+                    let packed = (lit1 as u32) | ((lit2 as u32) << 8) | ((lit3 as u32) << 16);
+                    unsafe {
+                        (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed);
+                    }
+                    out_pos += 3;
+                    if (bitsleft as u8) < 32 {
+                        refill_branchless_fast!();
+                    }
+                    continue;
+                }
+                let packed = (lit1 as u16) | ((lit2 as u16) << 8);
+                unsafe {
+                    (out_ptr.add(out_pos) as *mut u16).write_unaligned(packed);
+                }
+                out_pos += 2;
+                if (bitsleft as u8) < 32 {
+                    refill_branchless_fast!();
+                }
+                continue;
+            }
+            unsafe {
+                *out_ptr.add(out_pos) = lit1;
+            }
+            out_pos += 1;
+            if (bitsleft as u8) < 32 {
+                refill_branchless_fast!();
+            }
+            continue;
+        }
+
+        // Not a literal - check EXCEPTIONAL (subtable or EOB)
+        if (entry & 0x8000) != 0 {
+            if (entry & 0x2000) != 0 {
+                writeback_stopped!();
+                return FlatFastloopExit::EndOfBlock(out_pos);
+            }
+            let subtable_start = (entry >> 16) as usize;
+            let subtable_bits = ((entry >> 8) & 0x3F) as u64;
+            let sub_idx = (bitbuf & ((1u64 << subtable_bits) - 1)) as usize;
+            entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
+            let saved_sub = consume!(entry);
+            if (entry as i32) < 0 {
+                let lit = ((entry >> 16) & 0xFF) as u8;
+                refill_branchless_fast!();
+                entry = lookup!();
+                unsafe {
+                    *out_ptr.add(out_pos) = lit;
+                }
+                out_pos += 1;
+                continue;
+            }
+            if (entry & 0x2000) != 0 {
+                writeback_stopped!();
+                return FlatFastloopExit::EndOfBlock(out_pos);
+            }
+            let length = (entry >> 16)
+                + (extract_bits(saved_sub, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+            refill_branchless_fast!();
+            let mut dist_entry = dist.lookup(bitbuf);
+            if dist_entry.is_subtable_ptr() {
+                bitbuf >>= DistTable::TABLE_BITS;
+                bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+            }
+            let dist_extra_saved = bitbuf;
+            let dist_raw = dist_entry.raw();
+            bitbuf >>= dist_raw as u8;
+            bitsleft = bitsleft.wrapping_sub(dist_raw);
+            let distance = (dist_raw >> 16)
+                + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32)
+                    >> ((dist_raw >> 8) as u8)) as u32;
+            if distance == 0 || distance as usize > out_pos {
+                writeback_stopped!();
+                return FlatFastloopExit::InvalidDistance(out_pos);
+            }
+            refill_branchless_fast!();
+            entry = lookup!();
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            continue;
+        }
+
+        // LENGTH CODE
+        let mut dist_entry = dist.lookup(bitbuf);
+        let length = (entry >> 16)
+            + (extract_bits(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+        if (bitsleft as u8) < 32 {
+            refill_branchless_fast!();
+        }
+        if dist_entry.is_subtable_ptr() {
+            bitbuf >>= DistTable::TABLE_BITS;
+            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+        }
+        let dist_extra_saved = bitbuf;
+        let dist_raw = dist_entry.raw();
+        bitbuf >>= dist_raw as u8;
+        bitsleft = bitsleft.wrapping_sub(dist_raw);
+        let distance = (dist_raw >> 16)
+            + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32) >> ((dist_raw >> 8) as u8))
+                as u32;
+        if distance == 0 || distance as usize > out_pos {
+            writeback_stopped!();
+            return FlatFastloopExit::InvalidDistance(out_pos);
+        }
+        refill_branchless_fast!();
+        entry = lookup!();
+        out_pos = copy_match_fast(output, out_pos, distance, length);
+    }
+
+    // Budget/input-margin exit at a clean symbol boundary: the preloaded `entry`
+    // was NOT consumed, so (bitbuf,bitsleft,pos) describe the next-to-decode
+    // position. Write back; the caller re-reads a canonical Bits and resumes.
+    writeback_stopped!();
+    FlatFastloopExit::Stopped(out_pos)
+}
+
+/// ROUTE-B (aarch64): FAITHFUL PORT of libdeflate 1.25's SOFTWARE-PIPELINED
+/// fastloop ORGANIZATION (`libdeflate-sys-1.25.2/libdeflate/lib/decompress_template.h`
+/// fastloop, lines 344-671) into the engine-A bounded contiguous fastloop.
+///
+/// Byte-for-byte the same OUTPUT as [`decode_huffman_fastloop_bounded`] and the
+/// SAME [`FlatFastloopExit`] resumable contract; the ONLY differences are the
+/// loop *organization* that is the one remaining structural divergence vs
+/// libdeflate:
+///   1. **No top-of-loop refill gate.** The baseline opens each iteration with
+///      `if bitsleft < REFILL_THRESHOLD { refill }`; libdeflate instead WEAVES the
+///      refills into the symbol chain (template lines 413/431/572). Every body path
+///      here still hits ≥1 refill, so the gate is removable.
+///   2. **Software-pipelined literal chain (template lines 366-435).** Instead of
+///      the baseline's pack-≤8-literals-into-one-u64 (which DEFERS stores), this
+///      issues the NEXT litlen table load EARLY (`entry = lookup!()`) and stores the
+///      *current* literal as a single byte immediately AFTER, so the load-use
+///      latency of the table read is hidden behind the store. Capped at 2 extra
+///      fast literals + a 3rd "in lieu of primary" (exactly libdeflate's bound for
+///      LITLEN_TABLEBITS=11 on a 64-bit bitbuffer: 3*11=33 ≤ CONSUMABLE_NBITS=56).
+///
+/// KEPT from gz (superior to libdeflate's scalar word-copy, do NOT regress):
+/// `copy_match_fast` (NEON-128 + prefetch), `*mut`/`get_unchecked` raw stores (no
+/// bounds checks), the branchless u64 refill. The match/offset decode is already
+/// libdeflate-faithful in the baseline (preload next litlen + refill before the
+/// copy) and is carried over unchanged.
+///
+/// Selected at the call site by `pipelined_kernel_enabled()`; the production
+/// default remains the baseline.
+///
+/// # Safety contract
+/// Identical to [`decode_huffman_fastloop_bounded`].
+pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    out_fastloop_end: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> FlatFastloopExit {
+    const FASTLOOP_MARGIN: usize = 320;
+    const LITLEN_TABLEMASK: u64 = (1u64 << LitLenTable::TABLE_BITS) - 1;
+
+    let out_ptr = output.as_mut_ptr();
+    let litlen_ptr = litlen.entries_ptr();
+
+    let mut bitbuf = bits.bitbuf;
+    let mut bitsleft = bits.bitsleft;
+    let mut in_pos = bits.pos;
+    let in_data = bits.data;
+    let in_ptr = in_data.as_ptr();
+    let in_fastloop_end = in_data.len().saturating_sub(32);
+
+    macro_rules! refill_branchless_fast {
+        () => {
+            unsafe {
+                let bits_u8 = bitsleft as u8;
+                let word = (in_ptr.add(in_pos) as *const u64).read_unaligned();
+                let word = u64::from_le(word);
+                bitbuf |= word << bits_u8;
+                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                bitsleft = (bits_u8 as u32) | 56;
+            }
+        };
+    }
+    macro_rules! lookup {
+        () => {
+            unsafe { (*litlen_ptr.add((bitbuf & LITLEN_TABLEMASK) as usize)).raw() }
+        };
+    }
+    macro_rules! consume {
+        ($entry:expr) => {{
+            let saved = bitbuf;
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            saved
+        }};
+    }
+    macro_rules! writeback_stopped {
+        () => {{
+            bits.bitbuf = bitbuf;
+            bits.bitsleft = bitsleft & 0xFF;
+            bits.pos = in_pos;
+        }};
+    }
+    macro_rules! store_lit {
+        ($lit:expr) => {{
+            unsafe {
+                *out_ptr.add(out_pos) = $lit;
+            }
+            out_pos += 1;
+        }};
+    }
+
+    // PRELOAD first entry BEFORE loop (libdeflate template line 346-347).
+    if in_pos + 8 > in_data.len() {
+        return FlatFastloopExit::Stopped(out_pos);
+    }
+    refill_branchless_fast!();
+    let mut entry = lookup!();
+
+    while in_pos < in_fastloop_end && out_pos + FASTLOOP_MARGIN <= out_fastloop_end {
+        // Consume the (preloaded, unconsumed) primary entry; save pre-consume
+        // bitbuf for length/offset extra-bit extraction (template line 358-360).
+        let mut saved_bitbuf = consume!(entry);
+
+        // ── LITERAL: software-pipelined chain (template lines 366-435) ──
+        if (entry as i32) < 0 {
+            // 1st extra fast literal: store primary AFTER issuing next load.
+            let lit = (entry >> 16) as u8;
+            entry = lookup!();
+            saved_bitbuf = consume!(entry);
+            store_lit!(lit);
+            if (entry as i32) < 0 {
+                // 2nd extra fast literal.
+                let lit = (entry >> 16) as u8;
+                entry = lookup!();
+                saved_bitbuf = consume!(entry);
+                store_lit!(lit);
+                if (entry as i32) < 0 {
+                    // 3rd literal in lieu of primary: load next (unconsumed),
+                    // refill, store, and loop (template lines 411-415).
+                    let lit = (entry >> 16) as u8;
+                    entry = lookup!();
+                    refill_branchless_fast!();
+                    store_lit!(lit);
+                    continue;
+                }
+            }
+            // Fell through: `entry` is the first NON-literal symbol, already
+            // consumed, `saved_bitbuf` = its pre-consume bitbuf. Drop into the
+            // exceptional / length-match handling below.
+        }
+
+        // ── EXCEPTIONAL: subtable pointer or end-of-block (template 442-483) ──
+        if (entry & 0x8000) != 0 {
+            if (entry & 0x2000) != 0 {
+                writeback_stopped!();
+                return FlatFastloopExit::EndOfBlock(out_pos);
+            }
+            let subtable_start = (entry >> 16) as usize;
+            let subtable_bits = ((entry >> 8) & 0x3F) as u64;
+            let sub_idx = (bitbuf & ((1u64 << subtable_bits) - 1)) as usize;
+            entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
+            let saved_sub = consume!(entry);
+            if (entry as i32) < 0 {
+                // Subtable literal (template 472-478): refill, preload, store.
+                let lit = ((entry >> 16) & 0xFF) as u8;
+                refill_branchless_fast!();
+                entry = lookup!();
+                store_lit!(lit);
+                continue;
+            }
+            if (entry & 0x2000) != 0 {
+                writeback_stopped!();
+                return FlatFastloopExit::EndOfBlock(out_pos);
+            }
+            // Subtable length.
+            let length = (entry >> 16)
+                + (extract_bits(saved_sub, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+            refill_branchless_fast!();
+            let mut dist_entry = dist.lookup(bitbuf);
+            if dist_entry.is_subtable_ptr() {
+                bitbuf >>= DistTable::TABLE_BITS;
+                bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+            }
+            let dist_extra_saved = bitbuf;
+            let dist_raw = dist_entry.raw();
+            bitbuf >>= dist_raw as u8;
+            bitsleft = bitsleft.wrapping_sub(dist_raw);
+            let distance = (dist_raw >> 16)
+                + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32)
+                    >> ((dist_raw >> 8) as u8)) as u32;
+            if distance == 0 || distance as usize > out_pos {
+                writeback_stopped!();
+                return FlatFastloopExit::InvalidDistance(out_pos);
+            }
+            refill_branchless_fast!();
+            entry = lookup!();
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            continue;
+        }
+
+        // ── LENGTH CODE (no subtable) + match (template 485-572) ──
+        let mut dist_entry = dist.lookup(bitbuf);
+        let length = (entry >> 16)
+            + (extract_bits(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+        if (bitsleft as u8) < 32 {
+            refill_branchless_fast!();
+        }
+        if dist_entry.is_subtable_ptr() {
+            bitbuf >>= DistTable::TABLE_BITS;
+            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+            // INVARIANT GUARD for the load-before-refill preload below.
+            // After the primary `<32` refill (line above), the FAST offset path
+            // leaves bitsleft >= 32 - OFFSET_MAXFASTBITS(21) = 11, so the next
+            // litlen preload can read the CURRENT (pre-refill) bitbuf: the refill
+            // only ORs bits ABOVE position `bitsleft`, so the low LITLEN_TABLEBITS
+            // (11) — the preload index — are preserved iff bitsleft >= 11.
+            // The SUBTABLE offset path consumes TABLE_BITS(8) here + up to ~21
+            // more, which can drop bitsleft below 11. Refill now so that after the
+            // subtable-offset consume bitsleft still >= 11 and the pre-refill
+            // preload stays byte-identical. Rare path; refill is a hint-free
+            // in-margin read (see FASTLOOP read-margin, in_fastloop_end = len-32).
+            if (bitsleft as u8) < 32 {
+                refill_branchless_fast!();
+            }
+            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+        }
+        let dist_extra_saved = bitbuf;
+        let dist_raw = dist_entry.raw();
+        bitbuf >>= dist_raw as u8;
+        bitsleft = bitsleft.wrapping_sub(dist_raw);
+        let distance = (dist_raw >> 16)
+            + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32) >> ((dist_raw >> 8) as u8))
+                as u32;
+        if distance == 0 || distance as usize > out_pos {
+            writeback_stopped!();
+            return FlatFastloopExit::InvalidDistance(out_pos);
+        }
+        // Preload next litlen entry, THEN refill — mirrors libdeflate template
+        // lines 571-572 (load at 571 BEFORE refill at 572). The preload reads the
+        // CURRENT (pre-refill) bitbuf, so its address does NOT depend on the
+        // refill's word-load+shift+or; the M1 out-of-order core can issue this
+        // dependent table load in parallel with the refill instead of serializing
+        // the ~3-4cyc load latency behind it. Byte-identical: bitsleft >= 11 is
+        // guaranteed at this point (fast path via the `<32` guard; subtable path
+        // via the guard added above), so the low LITLEN_TABLEBITS index bits are
+        // unchanged by the refill. The refill then tops bitbuf up for next iter.
+        //
+        // Byte-identical guard: the reorder is byte-identical ONLY when
+        // bitsleft >= LitLenTable::TABLE_BITS at THIS preload. Assert it loudly so
+        // future cfg/code drift (e.g. a wider TABLE_BITS, or a change to the `<32`
+        // guard or the subtable-offset guard refill above) TRIPS in debug/test
+        // instead of silently corrupting output. Uses the type-level TABLE_BITS
+        // constant, not a hardcoded 11, so a cfg flip to 12 tightens the guard.
+        debug_assert!(
+            (bitsleft as u8) >= LitLenTable::TABLE_BITS,
+            "load-before-refill preload invariant violated: bitsleft={} < LITLEN_TABLEBITS={}",
+            bitsleft as u8,
+            LitLenTable::TABLE_BITS,
+        );
+        entry = lookup!();
+        refill_branchless_fast!();
+        out_pos = copy_match_fast(output, out_pos, distance, length);
+    }
+
+    writeback_stopped!();
+    FlatFastloopExit::Stopped(out_pos)
 }
 
 fn decode_huffman_cf(
@@ -1825,10 +2096,20 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
     let nlen = bits.read_u16();
 
     if len != !nlen {
-        eprintln!(
-            "Invalid stored block: len={:#x}, nlen={:#x}, !nlen={:#x}, pos={}, out_pos={}",
-            len, nlen, !nlen, bits.pos, out_pos
-        );
+        // Past the final block, trailing zero bytes can look like len=nlen=0.
+        if len == 0 && nlen == 0 && bits.pos >= bits.data.len().saturating_sub(2) {
+            return Ok(out_pos);
+        }
+        // Gated: in the parallel-SM speculative path this fires routinely on
+        // partition-stride seed offsets that aren't real block boundaries (the
+        // bulk LUT declines and ResumableInflate2 re-syncs — byte-exact). It is
+        // a normal speculation re-sync, not an error worth spamming to stderr.
+        if std::env::var_os("GZIPPY_DEBUG").is_some() {
+            eprintln!(
+                "Invalid stored block: len={:#x}, nlen={:#x}, !nlen={:#x}, pos={}, out_pos={}, bit_pos={}",
+                len, nlen, !nlen, bits.pos, out_pos, bits.bit_position()
+            );
+        }
         return Err(Error::new(ErrorKind::InvalidData, "Invalid stored block"));
     }
 
@@ -1876,18 +2157,6 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
     Ok(out_pos)
 }
 
-/// Cached double-literal cache for fixed Huffman (built once)
-fn get_fixed_double_lit_cache(
-) -> &'static crate::decompress::inflate::double_literal::DoubleLitCache {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<crate::decompress::inflate::double_literal::DoubleLitCache> =
-        OnceLock::new();
-    CACHE.get_or_init(|| {
-        let tables = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
-        crate::decompress::inflate::double_literal::DoubleLitCache::build(&tables.0)
-    })
-}
-
 /// Get or build the specialized decoder for fixed Huffman (cached)
 fn get_fixed_specialized_decoder(
 ) -> &'static crate::decompress::inflate::specialized_decode::SpecializedDecoder {
@@ -1914,154 +2183,18 @@ fn get_fixed_specialized_decoder(
 }
 
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
-    // Use the same fast path as dynamic Huffman for maximum speed
-    // The libdeflate-style path achieves 99% of libdeflate vs 69% for specialized path
+    // Use the same fast path as dynamic Huffman for maximum speed.
     let (litlen, dist) = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
 
-/// Huffman decode with double-literal cache optimization
-/// Uses DoubleLitCache for the fastloop to decode 2 literals at once when possible
-fn decode_huffman_cf_double(
-    bits: &mut Bits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    litlen: &LitLenTable,
-    dist: &DistTable,
-    double_cache: &crate::decompress::inflate::double_literal::DoubleLitCache,
-) -> Result<usize> {
-    #![allow(unused_imports)]
-    use crate::decompress::inflate::double_literal::DoubleLitEntry;
-
-    const FASTLOOP_MARGIN: usize = 320;
-
-    // FASTLOOP with double-literal optimization
-    while out_pos + FASTLOOP_MARGIN <= output.len() && bits.available() >= 16 {
-        // Try double-literal lookup first
-        let saved_bitbuf = bits.peek();
-        let double_entry = double_cache.lookup(saved_bitbuf);
-
-        if double_entry.is_literal() {
-            if double_entry.has_second() {
-                // DOUBLE LITERAL - decode 2 at once
-                let out_ptr = output.as_mut_ptr();
-                unsafe {
-                    *out_ptr.add(out_pos) = double_entry.symbol1();
-                    *out_ptr.add(out_pos + 1) = double_entry.symbol2();
-                }
-                out_pos += 2;
-                bits.consume(double_entry.total_bits() as u32);
-
-                // Continue with double-literal attempts
-                bits.refill();
-                continue;
-            } else {
-                // SINGLE LITERAL from double cache
-                let out_ptr = output.as_mut_ptr();
-                unsafe {
-                    *out_ptr.add(out_pos) = double_entry.symbol1();
-                }
-                out_pos += 1;
-                bits.consume(double_entry.total_bits() as u32);
-
-                // Try to continue with more literals via regular path
-                bits.refill();
-                continue;
-            }
-        }
-
-        // NOT A LITERAL - fall back to regular decode path
-        let entry = litlen.lookup(saved_bitbuf);
-        bits.consume_entry(entry.raw());
-
-        // Check for EXCEPTIONAL (subtable or EOB)
-        if entry.is_exceptional() {
-            if entry.is_end_of_block() {
-                return Ok(out_pos);
-            }
-
-            // Check for subtable
-            let sub_saved = bits.peek();
-            let sub_entry = litlen.lookup_subtable(entry, saved_bitbuf);
-            bits.consume_entry(sub_entry.raw());
-
-            if sub_entry.is_end_of_block() {
-                return Ok(out_pos);
-            }
-
-            if (sub_entry.raw() as i32) < 0 {
-                // Literal from subtable
-                let lit = sub_entry.literal_value();
-                let out_ptr = output.as_mut_ptr();
-                unsafe {
-                    *out_ptr.add(out_pos) = lit;
-                }
-                out_pos += 1;
-                bits.refill();
-                continue;
-            }
-
-            // Length from subtable
-            let length = sub_entry.decode_length(sub_saved);
-
-            bits.refill();
-            let dist_saved = bits.peek();
-            let mut dist_entry = dist.lookup(dist_saved);
-
-            if dist_entry.is_subtable_ptr() {
-                bits.consume(DistTable::TABLE_BITS as u32);
-                dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
-            }
-
-            let dist_extra_saved = bits.peek();
-            bits.consume_entry(dist_entry.raw());
-            let distance = dist_entry.decode_distance(dist_extra_saved);
-
-            if distance == 0 || distance as usize > out_pos {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Invalid distance {} at pos {}", distance, out_pos),
-                ));
-            }
-
-            bits.refill();
-            out_pos = copy_match_fast(output, out_pos, distance, length);
-            continue;
-        }
-
-        // Length code from main table
-        let length = entry.decode_length(saved_bitbuf);
-
-        bits.refill();
-        let dist_saved = bits.peek();
-        let mut dist_entry = dist.lookup(dist_saved);
-
-        if dist_entry.is_subtable_ptr() {
-            bits.consume(DistTable::TABLE_BITS as u32);
-            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
-        }
-
-        let dist_extra_saved = bits.peek();
-        bits.consume_entry(dist_entry.raw());
-        let distance = dist_entry.decode_distance(dist_extra_saved);
-
-        if distance == 0 || distance as usize > out_pos {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Invalid distance {} at pos {}", distance, out_pos),
-            ));
-        }
-
-        bits.refill();
-        out_pos = copy_match_fast(output, out_pos, distance, length);
-    }
-
-    // Fall back to generic path for remaining output
-    // (reuse the regular decode_huffman_cf for the generic loop)
-    decode_huffman_cf(bits, output, out_pos, litlen, dist)
-}
-
-fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+/// Parse a dynamic-Huffman block header (called AFTER the 3-bit block header
+/// `BFINAL|BTYPE` has been consumed) and return `(litlen_lengths,
+/// dist_lengths)`, leaving `bits` positioned at the block BODY.
+///
+/// This is the single source of truth for the dynamic-header parse:
+/// `decode_dynamic` calls it.
+pub fn parse_dynamic_header(bits: &mut Bits) -> Result<(Vec<u8>, Vec<u8>)> {
     // Read dynamic Huffman table header
     if bits.available() < 14 {
         bits.refill();
@@ -2156,26 +2289,28 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
         }
     }
 
-    let litlen_lengths = &all_lengths[..hlit];
-    let dist_lengths = &all_lengths[hlit..];
+    let litlen_lengths = all_lengths[..hlit].to_vec();
+    let dist_lengths = all_lengths[hlit..].to_vec();
+    Ok((litlen_lengths, dist_lengths))
+}
+
+fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen_lengths, dist_lengths) = parse_dynamic_header(bits)?;
 
     // Compute fingerprint for table caching
     let fingerprint = crate::decompress::inflate::jit_decode::TableFingerprint::combined(
-        litlen_lengths,
-        dist_lengths,
+        &litlen_lengths,
+        &dist_lengths,
     );
 
-    // Use libdeflate-style decoder for all dynamic blocks
-    // This achieves 99-112% of libdeflate performance across all datasets.
-    // The specialized decoder was slower for match-heavy content (SOFTWARE, LOGS)
-    // due to its inline extra-bits handling vs libdeflate's saved_bitbuf pattern.
+    // Use libdeflate-style decoder for all dynamic blocks.
     SPEC_STATS.with(|s| s.borrow_mut().1 += 1);
     decode_dynamic_fallback(
         bits,
         output,
         out_pos,
-        litlen_lengths,
-        dist_lengths,
+        &litlen_lengths,
+        &dist_lengths,
         fingerprint,
     )
 }
@@ -2559,207 +2694,7 @@ fn decode_dynamic_speculative(
     decode_huffman_with_dispatch(bits, output, out_pos, litlen, dist)
 }
 
-/// Inlined monolithic decoder - all hot functions inlined for maximum speed
-/// Key insight: Eliminate ALL function call overhead in the hot path
-#[inline(never)] // Don't inline the outer function, but inline everything inside
-fn decode_dynamic_hyperfast(
-    bits: &mut Bits,
-    output: &mut [u8],
-    mut out_pos: usize,
-    litlen: &LitLenTable,
-    dist: &DistTable,
-) -> Result<usize> {
-    const FASTLOOP_MARGIN: usize = 320;
-
-    let litlen_ptr = litlen.entries_ptr();
-    let out_ptr = output.as_mut_ptr();
-    let out_end = output.len();
-
-    // PRELOAD first entry
-    bits.refill();
-
-    // FASTLOOP - fully inlined
-    while out_pos + FASTLOOP_MARGIN <= out_end {
-        // CRITICAL: Ensure enough bits before multi-literal batch to prevent underflow
-        if bits.available() < 48 {
-            bits.refill();
-        }
-
-        // Inline peek
-        let saved_bitbuf = bits.bitbuf;
-
-        // Inline lookup - direct table access, get raw u32
-        let entry = unsafe { (*litlen_ptr.add((saved_bitbuf as usize) & 0x7FF)).raw() };
-
-        // Inline consume_entry - shift and subtract
-        bits.bitbuf >>= entry as u8;
-        bits.bitsleft = bits.bitsleft.wrapping_sub(entry & 0x1F);
-
-        // Check literal (bit 31 = negative)
-        if (entry as i32) < 0 {
-            // LITERAL - inline write
-            let lit = ((entry >> 16) & 0xFF) as u8;
-            unsafe {
-                *out_ptr.add(out_pos) = lit;
-            }
-            out_pos += 1;
-
-            // Unrolled literal 2
-            let entry2 = unsafe { (*litlen_ptr.add((bits.bitbuf as usize) & 0x7FF)).raw() };
-            if (entry2 as i32) < 0 {
-                bits.bitbuf >>= entry2 as u8;
-                bits.bitsleft = bits.bitsleft.wrapping_sub(entry2 & 0x1F);
-                let lit2 = ((entry2 >> 16) & 0xFF) as u8;
-                unsafe {
-                    *out_ptr.add(out_pos) = lit2;
-                }
-                out_pos += 1;
-
-                // Unrolled literal 3
-                let entry3 = unsafe { (*litlen_ptr.add((bits.bitbuf as usize) & 0x7FF)).raw() };
-                if (entry3 as i32) < 0 {
-                    bits.bitbuf >>= entry3 as u8;
-                    bits.bitsleft = bits.bitsleft.wrapping_sub(entry3 & 0x1F);
-                    let lit3 = ((entry3 >> 16) & 0xFF) as u8;
-                    unsafe {
-                        *out_ptr.add(out_pos) = lit3;
-                    }
-                    out_pos += 1;
-
-                    // Unrolled literal 4
-                    let entry4 = unsafe { (*litlen_ptr.add((bits.bitbuf as usize) & 0x7FF)).raw() };
-                    if (entry4 as i32) < 0 {
-                        bits.bitbuf >>= entry4 as u8;
-                        bits.bitsleft = bits.bitsleft.wrapping_sub(entry4 & 0x1F);
-                        let lit4 = ((entry4 >> 16) & 0xFF) as u8;
-                        unsafe {
-                            *out_ptr.add(out_pos) = lit4;
-                        }
-                        out_pos += 1;
-
-                        // Refill after 4 literals
-                        if (bits.bitsleft as u8) < 32 {
-                            bits.refill();
-                        }
-
-                        // Unrolled literal 5
-                        let entry5 =
-                            unsafe { (*litlen_ptr.add((bits.bitbuf as usize) & 0x7FF)).raw() };
-                        if (entry5 as i32) < 0 {
-                            bits.bitbuf >>= entry5 as u8;
-                            bits.bitsleft = bits.bitsleft.wrapping_sub(entry5 & 0x1F);
-                            let lit5 = ((entry5 >> 16) & 0xFF) as u8;
-                            unsafe {
-                                *out_ptr.add(out_pos) = lit5;
-                            }
-                            out_pos += 1;
-                            bits.refill();
-                            continue;
-                        }
-                        continue;
-                    }
-                    if (bits.bitsleft as u8) < 32 {
-                        bits.refill();
-                    }
-                    continue;
-                }
-                if (bits.bitsleft as u8) < 32 {
-                    bits.refill();
-                }
-                continue;
-            }
-            if (bits.bitsleft as u8) < 32 {
-                bits.refill();
-            }
-            continue;
-        }
-
-        // Not a literal - use regular path for exceptional/length
-        let entry = crate::decompress::inflate::libdeflate_entry::LitLenEntry::from_raw(entry);
-
-        if entry.is_exceptional() {
-            if entry.is_end_of_block() {
-                return Ok(out_pos);
-            }
-
-            // Subtable
-            let sub_entry = litlen.lookup_subtable(entry, saved_bitbuf);
-            let sub_saved = bits.peek();
-            bits.consume_entry(sub_entry.raw());
-
-            if (sub_entry.raw() as i32) < 0 {
-                // Literal from subtable
-                unsafe {
-                    *out_ptr.add(out_pos) = sub_entry.literal_value();
-                }
-                out_pos += 1;
-                bits.refill();
-                continue;
-            }
-            if sub_entry.is_end_of_block() {
-                return Ok(out_pos);
-            }
-
-            // Length from subtable
-            let length = sub_entry.decode_length(sub_saved);
-
-            bits.refill();
-            let dist_saved = bits.peek();
-            let mut dist_entry = dist.lookup(dist_saved);
-
-            if dist_entry.is_subtable_ptr() {
-                bits.consume(DistTable::TABLE_BITS as u32);
-                dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
-            }
-
-            let dist_extra_saved = bits.peek();
-            bits.consume_entry(dist_entry.raw());
-            let distance = dist_entry.decode_distance(dist_extra_saved);
-
-            if distance == 0 || distance as usize > out_pos {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Invalid distance {} at pos {}", distance, out_pos),
-                ));
-            }
-
-            bits.refill();
-            out_pos = copy_match_fast(output, out_pos, distance, length);
-            continue;
-        }
-
-        // Length code from main table - entry is already a LitLenEntry from above
-        let length = entry.decode_length(saved_bitbuf);
-
-        bits.refill();
-        let dist_saved = bits.peek();
-        let mut dist_entry = dist.lookup(dist_saved);
-
-        if dist_entry.is_subtable_ptr() {
-            bits.consume(DistTable::TABLE_BITS as u32);
-            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
-        }
-
-        let dist_extra_saved = bits.peek();
-        bits.consume_entry(dist_entry.raw());
-        let distance = dist_entry.decode_distance(dist_extra_saved);
-
-        if distance == 0 || distance as usize > out_pos {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Invalid distance {} at pos {}", distance, out_pos),
-            ));
-        }
-
-        bits.refill();
-        out_pos = copy_match_fast(output, out_pos, distance, length);
-    }
-
-    // Generic loop for remainder
-    decode_huffman_cf(bits, output, out_pos, litlen, dist)
-}
-
-fn build_code_length_table(lengths: &[u8; 19]) -> Result<[u16; 128]> {
+pub(crate) fn build_code_length_table(lengths: &[u8; 19]) -> Result<[u16; 128]> {
     let mut table = [0u16; 128];
 
     let mut count = [0u16; 8];
@@ -2817,6 +2752,8 @@ pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
 /// Decode a deflate stream from a Bits reader
 pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
     let mut out_pos = 0;
+    // DoS/liveness guard counter — see the guard at the bottom of the loop.
+    let mut blocks_after_input_end: u32 = 0;
 
     loop {
         if bits.available() < 3 {
@@ -2861,6 +2798,31 @@ pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<
             // Align bits to byte boundary at end of deflate stream
             bits.align_to_byte();
             return Ok(out_pos);
+        }
+
+        // DoS/liveness guard (per-block boundary — NOT the hot per-symbol loop,
+        // so perf-neutral; this runs once per DEFLATE block). Once every input
+        // byte has been pulled into the bit reader (`bits.pos >= data.len()`), at
+        // most ~64 buffered bits remain, so a well-formed stream MUST reach its
+        // BFINAL block within a small, bounded number of further blocks (≤ ~7:
+        // the minimum valid block is ~10 bits). Malformed/truncated input instead
+        // lets the reader fabricate endless empty "blocks" from the zero-padding
+        // past end-of-input — `bfinal`/`btype` read as 0 → `decode_stored`'s
+        // trailing-zero tolerance returns Ok with no progress, and the loop spins
+        // forever (observed: >18 min CPU on a 5-byte body; `bitsleft` wraps so
+        // `bit_position()` is not a usable progress metric — `bits.pos` pinned at
+        // EOF is). Cap the post-exhaustion non-final blocks and error instead of
+        // hanging. Byte-transparent: no valid stream decodes anywhere near 64
+        // blocks after its input is exhausted.
+        if bits.pos >= bits.data.len() {
+            blocks_after_input_end += 1;
+            if blocks_after_input_end > 64 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "deflate stream did not terminate: no BFINAL block before end of input \
+                     (malformed/truncated)",
+                ));
+            }
         }
     }
 }
@@ -2930,219 +2892,10 @@ impl<'a> DecodeLane<'a> {
     #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.bitbuf >>= n as u8;
-        self.bitsleft -= n;
+        // See the sibling `Bits::consume` above: wrapping is byte-identical for
+        // valid streams (bitsleft >= n) and panic-free on malformed input.
+        self.bitsleft = self.bitsleft.wrapping_sub(n);
     }
-}
-
-/// Decode 4 independent deflate blocks simultaneously (for BGZF)
-/// Returns total bytes written across all outputs
-pub fn decode_interleaved_4(
-    blocks: [&[u8]; 4],
-    outputs: [&mut [u8]; 4],
-    litlen: &LitLenTable,
-    dist: &DistTable,
-) -> Result<[usize; 4]> {
-    const LITLEN_TABLEMASK: u64 = (1u64 << LitLenTable::TABLE_BITS) - 1;
-    let litlen_ptr = litlen.entries_ptr();
-
-    // Initialize 4 lanes
-    let mut lanes: [DecodeLane; 4] = [
-        DecodeLane::new(blocks[0]),
-        DecodeLane::new(blocks[1]),
-        DecodeLane::new(blocks[2]),
-        DecodeLane::new(blocks[3]),
-    ];
-
-    // Get output pointers
-    let out_ptrs: [*mut u8; 4] = [
-        outputs[0].as_mut_ptr(),
-        outputs[1].as_mut_ptr(),
-        outputs[2].as_mut_ptr(),
-        outputs[3].as_mut_ptr(),
-    ];
-    let _out_ends: [usize; 4] = [
-        outputs[0].len(),
-        outputs[1].len(),
-        outputs[2].len(),
-        outputs[3].len(),
-    ];
-
-    // Preload entries for all 4 lanes
-    let mut entries: [u32; 4] = [
-        unsafe { (*litlen_ptr.add((lanes[0].peek() & LITLEN_TABLEMASK) as usize)).raw() },
-        unsafe { (*litlen_ptr.add((lanes[1].peek() & LITLEN_TABLEMASK) as usize)).raw() },
-        unsafe { (*litlen_ptr.add((lanes[2].peek() & LITLEN_TABLEMASK) as usize)).raw() },
-        unsafe { (*litlen_ptr.add((lanes[3].peek() & LITLEN_TABLEMASK) as usize)).raw() },
-    ];
-
-    // Interleaved decode loop - process all 4 lanes in lockstep for literals
-    loop {
-        let mut all_done = true;
-        let mut any_literal = false;
-
-        // Check which lanes have literals
-        for i in 0..4 {
-            if lanes[i].done {
-                continue;
-            }
-            all_done = false;
-
-            if (entries[i] as i32) < 0 {
-                // Literal
-                any_literal = true;
-            }
-        }
-
-        if all_done {
-            break;
-        }
-
-        // Process literals for all lanes that have them
-        if any_literal {
-            for i in 0..4 {
-                if lanes[i].done || (entries[i] as i32) >= 0 {
-                    continue;
-                }
-
-                // Decode literal
-                let lit = (entries[i] >> 16) as u8;
-                lanes[i].bitbuf >>= entries[i] as u8;
-                lanes[i].bitsleft = lanes[i].bitsleft.wrapping_sub(entries[i]);
-
-                unsafe {
-                    *out_ptrs[i].add(lanes[i].out_pos) = lit;
-                }
-                lanes[i].out_pos += 1;
-
-                // Refill and lookup next entry
-                if lanes[i].bitsleft < 32 {
-                    lanes[i].refill();
-                }
-                entries[i] = unsafe {
-                    (*litlen_ptr.add((lanes[i].peek() & LITLEN_TABLEMASK) as usize)).raw()
-                };
-            }
-            continue;
-        }
-
-        // No literals - handle exceptional cases (EOB, length codes) for each lane
-        for i in 0..4 {
-            if lanes[i].done {
-                continue;
-            }
-
-            let entry =
-                crate::decompress::inflate::libdeflate_entry::LitLenEntry::from_raw(entries[i]);
-            let saved = lanes[i].peek();
-            lanes[i].bitbuf >>= entries[i] as u8;
-            lanes[i].bitsleft = lanes[i].bitsleft.wrapping_sub(entries[i]);
-
-            if entry.is_exceptional() {
-                if entry.is_end_of_block() {
-                    lanes[i].done = true;
-                    continue;
-                }
-
-                // Subtable - use slow path
-                let sub_entry = litlen.lookup_subtable(entry, saved);
-                let sub_saved = lanes[i].peek();
-                lanes[i].bitbuf >>= sub_entry.raw() as u8;
-                lanes[i].bitsleft = lanes[i].bitsleft.wrapping_sub(sub_entry.raw());
-
-                if (sub_entry.raw() as i32) < 0 {
-                    unsafe {
-                        *out_ptrs[i].add(lanes[i].out_pos) = sub_entry.literal_value();
-                    }
-                    lanes[i].out_pos += 1;
-                    lanes[i].refill();
-                    entries[i] = unsafe {
-                        (*litlen_ptr.add((lanes[i].peek() & LITLEN_TABLEMASK) as usize)).raw()
-                    };
-                    continue;
-                }
-                if sub_entry.is_end_of_block() {
-                    lanes[i].done = true;
-                    continue;
-                }
-
-                // Length from subtable - fall through to length handling below
-                let length = sub_entry.decode_length(sub_saved);
-                decode_match_for_lane(&mut lanes[i], outputs[i], out_ptrs[i], length, dist)?;
-                entries[i] = unsafe {
-                    (*litlen_ptr.add((lanes[i].peek() & LITLEN_TABLEMASK) as usize)).raw()
-                };
-                continue;
-            }
-
-            // Length code
-            let length = entry.decode_length(saved);
-            decode_match_for_lane(&mut lanes[i], outputs[i], out_ptrs[i], length, dist)?;
-            entries[i] =
-                unsafe { (*litlen_ptr.add((lanes[i].peek() & LITLEN_TABLEMASK) as usize)).raw() };
-        }
-    }
-
-    Ok([
-        lanes[0].out_pos,
-        lanes[1].out_pos,
-        lanes[2].out_pos,
-        lanes[3].out_pos,
-    ])
-}
-
-/// Helper to decode a match for a single lane
-#[inline(always)]
-fn decode_match_for_lane(
-    lane: &mut DecodeLane,
-    _output: &mut [u8],
-    out_ptr: *mut u8,
-    length: u32,
-    dist: &DistTable,
-) -> Result<()> {
-    lane.refill();
-    let dist_saved = lane.peek();
-    let mut dist_entry = dist.lookup(dist_saved);
-
-    if dist_entry.is_subtable_ptr() {
-        lane.consume(DistTable::TABLE_BITS as u32);
-        dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
-    }
-
-    let dist_extra_saved = lane.peek();
-    lane.bitbuf >>= dist_entry.raw() as u8;
-    lane.bitsleft = lane.bitsleft.wrapping_sub(dist_entry.raw());
-    let distance = dist_entry.decode_distance(dist_extra_saved);
-
-    if distance == 0 || distance as usize > lane.out_pos {
-        return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
-    }
-
-    lane.refill();
-
-    // Copy match
-    let dist_usize = distance as usize;
-    let len_usize = length as usize;
-    unsafe {
-        let dst = out_ptr.add(lane.out_pos);
-        let src = out_ptr.add(lane.out_pos - dist_usize);
-        if dist_usize >= 8 {
-            let mut s = src;
-            let mut d = dst;
-            let end = dst.add(len_usize);
-            while d < end {
-                (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
-                s = s.add(8);
-                d = d.add(8);
-            }
-        } else {
-            for j in 0..len_usize {
-                *dst.add(j) = *src.add(j % dist_usize);
-            }
-        }
-    }
-    lane.out_pos += len_usize;
-
-    Ok(())
 }
 
 // =============================================================================
@@ -3153,6 +2906,99 @@ fn decode_match_for_lane(
 mod tests {
     use super::*;
     use crate::assert_slices_eq;
+
+    /// Exhaustive byte-exactness gate for the production `copy_match_fast`
+    /// (libdeflate-faithful unrolled scalar word copy). For every (distance,
+    /// length) pair in the legal DEFLATE range this lays down an LZ77
+    /// back-reference with the production `copy_match_fast` and compares the
+    /// produced `length` bytes against a naive byte-by-byte LZ77 reference that
+    /// handles arbitrary overlap. Covers the OVERLAPPING danger zone
+    /// (`dist < len`) across every branch (dist==1 RLE, dist 2..=7 small-stride,
+    /// dist>=8 word) and every loop-trip count.
+    #[test]
+    fn copy_match_fast_matches_naive_reference_all_dist_len() {
+        // Generous tail so the fast path's <40-byte overwrite never runs off
+        // the end (production callers guarantee FASTLOOP_MARGIN headroom).
+        const TAIL: usize = 512;
+        // Distances: every small/RLE value plus boundary values around the
+        // 8-byte (WORDBYTES) and 32-byte thresholds, plus large ones.
+        let dists: Vec<usize> = (1usize..=40)
+            .chain([48, 63, 64, 65, 100, 127, 128, 200, 255, 256, 257, 300])
+            .collect();
+        for &dist in &dists {
+            // Lengths: full DEFLATE match range 3..=258.
+            for len in 3usize..=258 {
+                let prefix = dist; // valid history == exactly `dist` bytes
+                let total = prefix + len + TAIL;
+
+                // Deterministic, dist-dependent history so RLE/overlap patterns
+                // are non-trivial.
+                let mut got = vec![0u8; total];
+                for (i, b) in got.iter_mut().enumerate().take(prefix) {
+                    *b = ((i * 31 + dist * 7 + 13) & 0xff) as u8;
+                }
+                let mut want = got.clone();
+
+                // Naive reference: byte-by-byte LZ77 copy (handles any overlap).
+                let out_pos = prefix;
+                for i in 0..len {
+                    want[out_pos + i] = want[out_pos + i - dist];
+                }
+
+                let ret = copy_match_fast(&mut got, out_pos, dist as u32, len as u32);
+                assert_eq!(ret, out_pos + len, "dist={dist} len={len} return");
+                assert_eq!(
+                    &got[out_pos..out_pos + len],
+                    &want[out_pos..out_pos + len],
+                    "copy_match_fast mismatch at dist={dist} len={len}"
+                );
+                // Bytes BEFORE the match must be untouched.
+                assert_eq!(
+                    &got[..out_pos],
+                    &want[..out_pos],
+                    "prefix clobbered dist={dist} len={len}"
+                );
+            }
+        }
+    }
+
+    /// Does `Bits::at_bit_offset` (the bulk clean-tail re-entry constructor)
+    /// produce the SAME bit stream as the marker phase's
+    /// `Bits::new(&data[byte..]) + consume(skip)` construction, for
+    /// NON-byte-aligned offsets? If this test FAILS at some offset,
+    /// `at_bit_offset` is the cursor-handoff bug.
+    #[test]
+    fn at_bit_offset_matches_new_plus_consume() {
+        let data: Vec<u8> = (0..96u32)
+            .map(|i| (i.wrapping_mul(73).wrapping_add(11)) as u8)
+            .collect();
+        for offset in 0..(64 * 8usize) {
+            let byte_idx = offset / 8;
+            let skip = (offset % 8) as u32;
+            // bulk re-entry constructor
+            let mut a = Bits::at_bit_offset(&data, offset);
+            a.refill();
+            // marker-phase constructor
+            let mut b = Bits::new(&data[byte_idx..]);
+            if skip > 0 {
+                b.consume(skip);
+            }
+            b.refill();
+            // Compare the next 32 readable bits (well within both buffers).
+            assert_eq!(
+                a.bitbuf & 0xFFFF_FFFF,
+                b.bitbuf & 0xFFFF_FFFF,
+                "bitbuf diverged at offset {offset} (byte {byte_idx}, skip {skip})"
+            );
+            // And the absolute bit position must round-trip to the seek offset
+            // exactly (refill must not perturb it).
+            assert_eq!(
+                a.bit_position(),
+                offset,
+                "bit_position drift at offset {offset}"
+            );
+        }
+    }
 
     /// Helper for benchmarking a single dataset
     fn run_bench(name: &str, gz_path: &str) {
@@ -3166,6 +3012,21 @@ mod tests {
                 return;
             }
         };
+
+        // A gzip member is a 10-byte header + 8-byte trailer, so anything
+        // shorter cannot be valid and would panic the `gz[3]` / `gz[len-8]`
+        // indexing below. This can happen transiently when a sibling test
+        // races `prepare_datasets()` on the same fixture file; skip rather
+        // than panic.
+        if gz.len() < 18 {
+            eprintln!(
+                "Skipping {} benchmark - fixture too short ({} bytes): {}",
+                name,
+                gz.len(),
+                gz_path
+            );
+            return;
+        }
 
         // Parse gzip header properly
         let mut pos = 10;
@@ -3541,6 +3402,393 @@ mod tests {
 
         eprintln!("(Interleaved decode requires per-block table building - testing concept)");
         eprintln!("=====================================\n");
+    }
+
+    /// SEAM DIFFERENTIAL: the bounded flat fastloop
+    /// (`decode_huffman_fastloop_bounded`, the engine-A wire-in for the
+    /// parallel-SM clean contig path) must be byte-exact AND cleanly RESUMABLE
+    /// at EVERY output-budget boundary `k` — the cap may land inside a
+    /// multi-literal lookahead batch or mid-back-ref. For every `k` we assert:
+    ///   (1) the bytes it emitted == the oracle prefix;
+    ///   (2) on a budget Stop, the canonical bit-cursor re-read
+    ///       (`bit_position()` → `at_bit_offset`, the N32-safe reclass_reread
+    ///       seam) lets a fresh decode RESUME and reproduce the FULL block
+    ///       (concatenation == full decode);
+    ///   (3) a budget ≥ block_out + FASTLOOP_MARGIN reaches EndOfBlock with the
+    ///       exact byte count.
+    /// A coarse sha grid would MISS a mid-batch seam bug; this fuzzes the cap at
+    /// every bit position in a window around the block end + a coarse sweep of
+    /// every mid-block resume point.
+    #[test]
+    fn seam_bounded_fastloop_resumes_byte_exact_at_every_budget() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        // A dynamic block carrying BOTH dense literal runs AND back-refs so the
+        // cap lands in 8-literal batches, length codes, dist codes, and copies.
+        let mut data: Vec<u8> = Vec::with_capacity(120_000);
+        let mut x: u32 = 0x1234_5678;
+        for i in 0..120_000usize {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Mostly a small alphabet (literal-heavy → dynamic) with periodic
+            // long repeats (back-refs).
+            if i % 64 < 40 {
+                data.push((x >> 24) as u8 & 0x1F);
+            } else {
+                data.push(b"the quick brown fox "[i % 20]);
+            }
+        }
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(&data).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        // Parse the FIRST block header; require dynamic so we exercise subtables.
+        let mut hbits = Bits::at_bit_offset(&deflate, 0);
+        hbits.refill();
+        let btype = ((hbits.peek() >> 1) & 3) as u8;
+        assert_eq!(btype, 2, "first block must be dynamic for this test");
+        hbits.consume(3);
+        let (ll, dl) = parse_dynamic_header(&mut hbits).expect("parse dynamic header");
+        let litlen = LitLenTable::build(&ll).expect("LitLenTable::build");
+        let dist = DistTable::build(&dl).expect("DistTable::build");
+
+        // Body cursor (immediately after the dynamic header).
+        let body_bit = hbits.bit_position();
+
+        // Oracle: full first-block decode via the production flat engine.
+        let mut oracle = vec![0u8; data.len() + 1024];
+        let mut obits = Bits::at_bit_offset(&deflate, body_bit);
+        let block_out = decode_flat_clean_pub(&mut obits, &mut oracle, 0, &litlen, &dist)
+            .expect("oracle decode");
+        oracle.truncate(block_out);
+        assert!(block_out > 4_000, "block too small to be meaningful");
+
+        const FASTLOOP_MARGIN: usize = 320;
+        let cap = block_out + 1024;
+
+        let check_budget = |k: usize| {
+            let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+            let mut out = vec![0u8; cap];
+            let exit = decode_huffman_fastloop_bounded(&mut bits, &mut out, 0, k, &litlen, &dist);
+            match exit {
+                FlatFastloopExit::EndOfBlock(p) => {
+                    assert_eq!(p, block_out, "EOB at wrong count (budget {k})");
+                    assert_eq!(&out[..p], &oracle[..], "EOB bytes mismatch (budget {k})");
+                }
+                FlatFastloopExit::Stopped(p) => {
+                    assert!(
+                        p <= k.max(FASTLOOP_MARGIN),
+                        "Stopped past budget (k {k}, p {p})"
+                    );
+                    assert_eq!(
+                        &out[..p],
+                        &oracle[..p],
+                        "prefix mismatch (budget {k}, p {p})"
+                    );
+                    // Canonical re-read seam, then resume to completion.
+                    let bp = bits.bit_position();
+                    let mut rbits = Bits::at_bit_offset(&deflate, bp);
+                    let total = decode_flat_clean_pub(&mut rbits, &mut out, p, &litlen, &dist)
+                        .expect("resume decode");
+                    assert_eq!(total, block_out, "resume count mismatch (budget {k})");
+                    assert_eq!(
+                        &out[..total],
+                        &oracle[..],
+                        "resume bytes mismatch (budget {k})"
+                    );
+                }
+                FlatFastloopExit::InvalidDistance(p) => {
+                    panic!("unexpected InvalidDistance at budget {k}, p {p}");
+                }
+            }
+        };
+
+        // (a) every bit position in a wide window around the block end (the
+        //     highest-risk caps: inside the trailing lookahead batch / EOB).
+        let lo = block_out.saturating_sub(FASTLOOP_MARGIN + 258 + 64);
+        for k in lo..=(block_out + FASTLOOP_MARGIN + 64) {
+            check_budget(k);
+        }
+        // (b) coarse sweep of every mid-block resume point (prime step so the
+        //     stop lands at varied intra-batch offsets across the whole block).
+        let mut k = 1usize;
+        while k < block_out {
+            check_budget(k);
+            k += 97;
+        }
+    }
+
+    /// ROUTE-B SEAM DIFFERENTIAL for the libdeflate-software-pipelined fastloop
+    /// port (`decode_huffman_fastloop_bounded_pipelined`). The faithful port MUST
+    /// be byte-IDENTICAL to (a) the flate2 oracle, (b) the production flat engine
+    /// oracle, and (c) the baseline fastloop — at EVERY output-budget boundary `k`
+    /// (the budget IS the per-chunk cap, so this sweeps "multiple chunk sizes"
+    /// densely: every bit position around the block end + a coarse full-block
+    /// sweep). The cap deliberately lands inside the pipelined 2-extra+lieu literal
+    /// chain (the changed code), mid-length, mid-dist, and mid-copy. Two block
+    /// shapes: a literal/back-ref mix AND a literal-heavy block that stresses the
+    /// 3-literal cap path. Ships in the SAME commit as the kernel per the
+    /// real-corpus-test rule.
+    #[test]
+    fn seam_pipelined_fastloop_matches_baseline_and_flate2_at_every_budget() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::{Read as _, Write as _};
+
+        // Two block shapes: mixed (literals + back-refs) and literal-heavy.
+        for shape in 0..2u8 {
+            let mut data: Vec<u8> = Vec::with_capacity(120_000);
+            let mut x: u32 = 0x1234_5678 ^ ((shape as u32) << 24);
+            for i in 0..120_000usize {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if shape == 0 {
+                    // mixed: small alphabet + periodic long repeats (back-refs)
+                    if i % 64 < 40 {
+                        data.push((x >> 24) as u8 & 0x1F);
+                    } else {
+                        data.push(b"the quick brown fox "[i % 20]);
+                    }
+                } else {
+                    // literal-heavy: skewed 64-symbol alphabet, few exploitable
+                    // matches → stays dynamic-Huffman but exercises the 2-extra+lieu
+                    // literal chain hardest (random bytes would emit a STORED block).
+                    let b = (x >> 24) as u8 & 0x3F;
+                    // Bias toward a few common symbols so Huffman (dynamic) wins.
+                    data.push(if b < 0x10 { b & 0x07 } else { b });
+                }
+            }
+
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+            enc.write_all(&data).unwrap();
+            let deflate = enc.finish().unwrap();
+
+            let mut hbits = Bits::at_bit_offset(&deflate, 0);
+            hbits.refill();
+            let btype = ((hbits.peek() >> 1) & 3) as u8;
+            // Only the dynamic-block shape exercises subtables; require it.
+            assert_eq!(btype, 2, "shape {shape}: first block must be dynamic");
+            hbits.consume(3);
+            let (ll, dl) = parse_dynamic_header(&mut hbits).expect("parse dynamic header");
+            let litlen = LitLenTable::build(&ll).expect("LitLenTable::build");
+            let dist = DistTable::build(&dl).expect("DistTable::build");
+            let body_bit = hbits.bit_position();
+
+            // Oracle 1: production flat engine.
+            let mut oracle = vec![0u8; data.len() + 1024];
+            let mut obits = Bits::at_bit_offset(&deflate, body_bit);
+            let block_out = decode_flat_clean_pub(&mut obits, &mut oracle, 0, &litlen, &dist)
+                .expect("oracle decode");
+            oracle.truncate(block_out);
+            assert!(block_out > 4_000, "shape {shape}: block too small");
+
+            // Oracle 2 (independent): flate2 raw-deflate decode of the WHOLE
+            // stream — its prefix of length block_out must equal the flat oracle.
+            let mut f2 = Vec::new();
+            flate2::read::DeflateDecoder::new(&deflate[..])
+                .read_to_end(&mut f2)
+                .expect("flate2 decode");
+            assert!(f2.len() >= block_out, "shape {shape}: flate2 short");
+            assert_eq!(
+                &f2[..block_out],
+                &oracle[..],
+                "shape {shape}: flate2 vs flat-engine oracle disagree"
+            );
+
+            const FASTLOOP_MARGIN: usize = 320;
+            let cap = block_out + 1024;
+
+            // Decode the WHOLE block through `arm` at budget `k`; assert byte-exact
+            // vs the oracle (= flate2) and, on a budget Stop, that the canonical
+            // re-read seam resumes to the exact full block. NOTE: the pipelined and
+            // baseline kernels legitimately hit the FASTLOOP_MARGIN budget at
+            // DIFFERENT granularities (3-literal vs 8-literal batches), so they may
+            // return DIFFERENT exit variants (EOB vs Stopped) at the same `k` — that
+            // is correct; only the emitted/resumed BYTES must match. Both arms are
+            // run so the test exercises the production (pipe) AND escape (base) paths
+            // identically; their byte-exactness is the gate (transitively pipe==base
+            // since both == oracle).
+            let check_arm = |k: usize, arm: u8| {
+                let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+                let mut out = vec![0u8; cap];
+                let exit = if arm == 0 {
+                    decode_huffman_fastloop_bounded_pipelined(
+                        &mut bits, &mut out, 0, k, &litlen, &dist,
+                    )
+                } else {
+                    decode_huffman_fastloop_bounded(&mut bits, &mut out, 0, k, &litlen, &dist)
+                };
+                let who = if arm == 0 { "pipe" } else { "base" };
+                match exit {
+                    FlatFastloopExit::EndOfBlock(p) => {
+                        assert_eq!(p, block_out, "shape {shape} {who}: EOB count k={k}");
+                        assert_eq!(
+                            &out[..p],
+                            &oracle[..],
+                            "shape {shape} {who}: EOB bytes k={k}"
+                        );
+                    }
+                    FlatFastloopExit::Stopped(p) => {
+                        assert!(
+                            p <= k.max(FASTLOOP_MARGIN),
+                            "shape {shape} {who}: Stopped past budget k={k} p={p}"
+                        );
+                        assert_eq!(
+                            &out[..p],
+                            &oracle[..p],
+                            "shape {shape} {who}: prefix k={k} p={p}"
+                        );
+                        let bp = bits.bit_position();
+                        let mut rbits = Bits::at_bit_offset(&deflate, bp);
+                        let total = decode_flat_clean_pub(&mut rbits, &mut out, p, &litlen, &dist)
+                            .expect("resume");
+                        assert_eq!(total, block_out, "shape {shape} {who}: resume count k={k}");
+                        assert_eq!(
+                            &out[..total],
+                            &oracle[..],
+                            "shape {shape} {who}: resume k={k}"
+                        );
+                    }
+                    FlatFastloopExit::InvalidDistance(p) => {
+                        panic!("shape {shape} {who}: unexpected InvalidDistance k={k} p={p}")
+                    }
+                }
+            };
+            let check_budget = |k: usize| {
+                check_arm(k, 0);
+                check_arm(k, 1);
+            };
+
+            let lo = block_out.saturating_sub(FASTLOOP_MARGIN + 258 + 64);
+            for k in lo..=(block_out + FASTLOOP_MARGIN + 64) {
+                check_budget(k);
+            }
+            let mut k = 1usize;
+            while k < block_out {
+                check_budget(k);
+                k += 97;
+            }
+        }
+    }
+
+    /// SEAM DIFFERENTIAL for the engine-A flat CLEAN *careful tail*
+    /// (`decode_clean_careful_flat`) — the convergence that makes the parallel-SM
+    /// clean path 100% engine A (no engine-B two-level careful loop). Two arms:
+    ///   (A) fastloop(k) → Stopped → canonical re-read → careful tail to EOB must
+    ///       reproduce the FULL block, for EVERY budget `k` (the cap lands at
+    ///       every intra-batch offset / mid-back-ref / EOB);
+    ///   (B) the careful tail's OWN resumable cap: drive the whole block through
+    ///       the careful tail alone in tiny `out_cap_end` steps (1,2,3,7,17,64,
+    ///       259 bytes) with a canonical re-read between calls — concatenation
+    ///       must equal the oracle and reach EOB exactly. A mid-symbol cap bug or
+    ///       a seam desync is caught here, invisible to a coarse sha grid.
+    #[test]
+    fn seam_flat_careful_tail_byte_exact_and_resumable() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut data: Vec<u8> = Vec::with_capacity(120_000);
+        let mut x: u32 = 0x1234_5678;
+        for i in 0..120_000usize {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if i % 64 < 40 {
+                data.push((x >> 24) as u8 & 0x1F);
+            } else {
+                data.push(b"the quick brown fox "[i % 20]);
+            }
+        }
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(&data).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let mut hbits = Bits::at_bit_offset(&deflate, 0);
+        hbits.refill();
+        let btype = ((hbits.peek() >> 1) & 3) as u8;
+        assert_eq!(btype, 2, "first block must be dynamic for this test");
+        hbits.consume(3);
+        let (ll, dl) = parse_dynamic_header(&mut hbits).expect("parse dynamic header");
+        let litlen = LitLenTable::build(&ll).expect("LitLenTable::build");
+        let dist = DistTable::build(&dl).expect("DistTable::build");
+        let body_bit = hbits.bit_position();
+
+        let mut oracle = vec![0u8; data.len() + 1024];
+        let mut obits = Bits::at_bit_offset(&deflate, body_bit);
+        let block_out =
+            decode_flat_clean_pub(&mut obits, &mut oracle, 0, &litlen, &dist).expect("oracle");
+        oracle.truncate(block_out);
+        assert!(block_out > 4_000, "block too small");
+
+        const FASTLOOP_MARGIN: usize = 320;
+        let cap = block_out + 1024;
+        // > block_out so the careful tail decodes the EOB symbol (no output).
+        let eob_cap_end = block_out + 512;
+
+        // (A) fastloop → careful-tail completion at every budget.
+        let check = |k: usize| {
+            let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+            let mut out = vec![0u8; cap];
+            let start =
+                match decode_huffman_fastloop_bounded(&mut bits, &mut out, 0, k, &litlen, &dist) {
+                    FlatFastloopExit::EndOfBlock(p) => {
+                        assert_eq!(p, block_out, "fastloop EOB count k={k}");
+                        assert_eq!(&out[..p], &oracle[..], "fastloop EOB bytes k={k}");
+                        return;
+                    }
+                    FlatFastloopExit::Stopped(p) => {
+                        let bp = bits.bit_position();
+                        bits = Bits::at_bit_offset(&deflate, bp); // canonical re-read seam
+                        p
+                    }
+                    FlatFastloopExit::InvalidDistance(p) => panic!("invalid dist k={k} p={p}"),
+                };
+            match decode_clean_careful_flat(&mut bits, &mut out, start, eob_cap_end, &litlen, &dist)
+            {
+                FlatCarefulExit::EndOfBlock(p) => {
+                    assert_eq!(p, block_out, "careful EOB count k={k}");
+                    assert_eq!(&out[..p], &oracle[..], "careful bytes k={k}");
+                }
+                FlatCarefulExit::Stopped(p) => panic!("careful never reached EOB k={k} p={p}"),
+                FlatCarefulExit::InvalidDistance(p) => panic!("careful invalid dist k={k} p={p}"),
+            }
+        };
+        let lo = block_out.saturating_sub(FASTLOOP_MARGIN + 258 + 64);
+        for k in lo..=(block_out + FASTLOOP_MARGIN + 64) {
+            check(k);
+        }
+        let mut k = 1usize;
+        while k < block_out {
+            check(k);
+            k += 97;
+        }
+
+        // (B) careful tail's own resumable cap, tiny steps, whole block.
+        for step in [1usize, 2, 3, 7, 17, 64, 259] {
+            let mut bits = Bits::at_bit_offset(&deflate, body_bit);
+            let mut out = vec![0u8; cap];
+            let mut pos = 0usize;
+            loop {
+                let cap_end = (pos + step).min(eob_cap_end);
+                match decode_clean_careful_flat(&mut bits, &mut out, pos, cap_end, &litlen, &dist) {
+                    FlatCarefulExit::Stopped(p) => {
+                        assert!(p >= pos, "step {step}: regressed");
+                        assert_eq!(&out[pos..p], &oracle[pos..p], "step {step} prefix at {pos}");
+                        pos = p;
+                        let bp = bits.bit_position();
+                        bits = Bits::at_bit_offset(&deflate, bp); // canonical re-read
+                    }
+                    FlatCarefulExit::EndOfBlock(p) => {
+                        assert_eq!(p, block_out, "step {step} EOB count");
+                        assert_eq!(&out[..p], &oracle[..], "step {step} EOB bytes");
+                        break;
+                    }
+                    FlatCarefulExit::InvalidDistance(p) => {
+                        panic!("step {step} invalid dist at {p}")
+                    }
+                }
+            }
+        }
     }
 
     /// Verify AVX2 is detected and used on x86_64 CI runners.

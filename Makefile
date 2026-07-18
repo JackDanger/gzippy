@@ -16,6 +16,8 @@ RESULTS_DIR := test_results
 # Build targets
 GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
 UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
+# Parallel single-member decode is pure-Rust-only (rapidgzip-shaped, no ISA-L C).
+GZIPPY_CARGO_FLAGS := --no-default-features --features pure-rust-inflate
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 IGZIP_BIN := $(ISAL_DIR)/build/igzip
 RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
@@ -94,8 +96,8 @@ $(RAPIDGZIP_BIN):
 	@echo "✓ Built rapidgzip"
 
 $(GZIPPY_BIN): FORCE
-	@echo "Building gzippy..."
-	@cd $(GZIPPY_DIR) && cargo build --release 2>&1 | grep -E "(Compiling gzippy|Finished|error)"
+	@echo "Building gzippy (pure-rust-inflate — parallel SM matches rapidgzip in Rust)..."
+	@cd $(GZIPPY_DIR) && cargo build --release --no-default-features --features pure-rust-inflate 2>&1 | grep -E "(Compiling gzippy|Finished|error)"
 	@test -f $(GZIPPY_BIN) || (echo "✗ gzippy build failed"; exit 1)
 	@echo "✓ Built gzippy"
 
@@ -119,14 +121,14 @@ FORCE:
 quick: $(GZIPPY_BIN)
 	@echo "══ make quick ══════════════════════════════════════════"
 	@echo "── Stage 1: correctness + routing smoke ────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release correctness 2>&1 | tail -3
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release routing 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) correctness 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) routing 2>&1 | tail -3
 	@echo "── Stage 2: allocation budget ──────────────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release alloc_budget 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) alloc_budget 2>&1 | tail -3
 	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release diff_ratio 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release hot_path 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --profile quicktest $(GZIPPY_CARGO_FLAGS) hot_path 2>&1 | tail -3
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
@@ -169,7 +171,7 @@ profile-decompression-x86_64: profile-single-member-decompression-x86_64
 # is the only place the isal-compression / parallel single-member path
 # builds and runs — local arm64 macOS cannot. Used by `ship`, `bench-sm`,
 # and `test-x86_64`.
-NEUROTIC_SSH := ssh -o ConnectTimeout=15 -J neurotic root@10.30.0.199
+NEUROTIC_SSH := ssh -o ConnectTimeout=15 -J neurotic root@REDACTED_IP
 
 # Shell snippet (run on neurotic) that hard-syncs the /root/gzippy checkout
 # to origin/$BRANCH — $BRANCH must be set in the calling recipe's shell.
@@ -280,8 +282,8 @@ bench-sm: ship-precheck
 	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
 	  $(NEUROTIC_SYNC); \
-	  echo '  building gzippy (--features isal-compression)...'; \
-	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  echo '  building gzippy (--features pure-rust-inflate — the SOLE pure-Rust single-member decode path, task #8)...'; \
+	  cargo build --release --no-default-features --features pure-rust-inflate 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
 	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
 	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
 	    echo '  building rapidgzip (first time only)...'; \
@@ -317,6 +319,111 @@ bench-sm: ship-precheck
 	  echo 'Full JSON: /tmp/bench-sm-result.json'"
 	@echo ""
 	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
+# bench-sm-pure-rust: same as bench-sm but builds gzippy with
+# `--no-default-features --features pure-rust-inflate` so the parallel-SM
+# path goes through ResumableInflate2 instead of the ISA-L C FFI. This is
+# the A/B that settles whether the tight-Huffman work has reached
+# vendor-competitive performance with ISA-L.
+#
+# Produces two `gzippy` binaries on neurotic:
+#   /tmp/bench-sm-bin/gzippy-isal   (current production path)
+#   /tmp/bench-sm-bin/gzippy-purerust (pure-Rust decoder path)
+# Both are run against rapidgzip; reports both ratios.
+# =============================================================================
+bench-sm-pure-rust: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── bench-sm-pure-rust: A/B gzippy{isal,pure-rust} vs rapidgzip ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting" >&2 && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  $(NEUROTIC_SYNC); \
+	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
+	  echo '  building gzippy (--features isal-compression)...'; \
+	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  cp target/release/gzippy \"\$$BDIR/gzippy-isal\"; \
+	  echo '  building gzippy (--no-default-features --features pure-rust-inflate)...'; \
+	  cargo build --release --no-default-features --features pure-rust-inflate 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  cp target/release/gzippy \"\$$BDIR/gzippy-purerust\"; \
+	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
+	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
+	  BD=benchmark_data; \
+	  SL=\$$BD/silesia-large.bin; \
+	  SLG=\$$BD/silesia-large.gz; \
+	  THREADS=\$$(nproc); \
+	  echo ''; \
+	  bench_one() { \
+	    local label=\"\$$1\" bin=\"\$$2\" args=\"\$$3\"; \
+	    echo \"=== \$$label ===\"; \
+	    for trial in 1 2 3 4 5; do \
+	      local t0=\$$(date +%s.%N); \
+	      \"\$$bin\" \$$args > /dev/null; \
+	      local t1=\$$(date +%s.%N); \
+	      local elapsed=\$$(awk \"BEGIN{printf \\\"%.3f\\\", \$$t1 - \$$t0}\"); \
+	      local mbps=\$$(awk \"BEGIN{printf \\\"%.0f\\\", 503.6 / \$$elapsed}\"); \
+	      echo \"  trial \$$trial: \$${elapsed}s = \$${mbps} MB/s\"; \
+	    done; \
+	    echo ''; \
+	  }; \
+	  bench_one 'A: gzippy-isal (current production, ISA-L FFI)' \"\$$BDIR/gzippy-isal\" \"-d -c -p \$$THREADS \$$SLG\"; \
+	  bench_one 'B: gzippy-purerust (this branch, ResumableInflate2)' \"\$$BDIR/gzippy-purerust\" \"-d -c -p \$$THREADS \$$SLG\"; \
+	  bench_one 'C: rapidgzip (reference)' \"\$$BDIR/rapidgzip\" \"-d -P \$$THREADS -c \$$SLG\"; \
+	  echo 'Input: silesia-large.gz (503.6 MB raw, gzip -9)'"
+	@echo ""
+	@echo "✓ bench-sm-pure-rust complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
+# perf-pure-rust: profile the pure-Rust decoder on neurotic to find waste.
+#
+# Builds gzippy with --no-default-features --features pure-rust-inflate AND
+# debuginfo (RUSTFLAGS adds -C debuginfo=1 -C force-frame-pointers=yes -C
+# strip=none). Runs perf record on a single silesia decode; prints the top
+# hot symbols. Use this AFTER bench-sm-pure-rust meets a gate to find
+# what's burning the remaining cycles.
+# =============================================================================
+perf-pure-rust: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── perf-pure-rust: profile ResumableInflate2 on neurotic ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  git push origin $$BRANCH || (echo "PUSH FAILED" >&2 && exit 1); \
+	fi; \
+	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  $(NEUROTIC_SYNC); \
+	  echo '  building gzippy with debuginfo...'; \
+	  RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes -C strip=none' \
+	    cargo build --release --no-default-features --features pure-rust-inflate \
+	    2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  SLG=benchmark_data/silesia-large.gz; \
+	  THREADS=\$$(nproc); \
+	  PERF_DATA=/tmp/perf-pure-rust.data; \
+	  rm -f \"\$$PERF_DATA\"; \
+	  echo ''; \
+	  echo '── perf record: 5 silesia-large decodes (16T) ──'; \
+	  perf record -F 999 --call-graph dwarf,8192 -o \"\$$PERF_DATA\" -- bash -c \"\
+	    for i in 1 2 3 4 5; do \
+	      target/release/gzippy -d -c -p \$$THREADS \$$SLG > /dev/null; \
+	    done\" 2>&1 | tail -3; \
+	  echo ''; \
+	  echo '── top 30 self-time symbols (--no-children) ──'; \
+	  perf report -i \"\$$PERF_DATA\" --no-children --stdio 2>/dev/null \
+	    | grep -E '^[[:space:]]+[0-9]+\\.[0-9]+%' | head -30; \
+	  echo ''; \
+	  echo '── top 30 caller-view symbols ──'; \
+	  perf report -i \"\$$PERF_DATA\" -g graph,1,caller --stdio 2>/dev/null \
+	    | head -50"
+	@echo ""
+	@echo "✓ perf-pure-rust complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # =============================================================================
 # test-x86_64: verify the x86_64-only code on the homelab box. The parallel
