@@ -65,6 +65,12 @@ impl SimpleOptimizer {
         // L10-L12: Ultra compression using libdeflate high levels
         // These use exhaustive search for near-zopfli compression ratios
         if self.config.compression_level >= 10 {
+            crate::compress::debug_encode_path(
+                "ParallelGz",
+                self.config.compression_level,
+                optimal_threads,
+                "parallel",
+            );
             let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
             encoder.set_header_info(self.header_info.clone());
             return encoder.compress(reader, writer);
@@ -73,12 +79,24 @@ impl SimpleOptimizer {
         // L6-L9: Use pipelined compression with dictionary sharing like pigz
         // This ensures we match or beat pigz's compression ratio at all levels
         if self.config.compression_level >= 6 && optimal_threads > 1 {
+            crate::compress::debug_encode_path(
+                "PipelinedGz",
+                self.config.compression_level,
+                optimal_threads,
+                "pipelined",
+            );
             let mut encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
             encoder.set_header_info(self.header_info.clone());
             return encoder.compress(reader, writer);
         }
 
         // L1-L5: Use independent blocks for parallel decompression (fast)
+        crate::compress::debug_encode_path(
+            "ParallelGz",
+            self.config.compression_level,
+            optimal_threads,
+            "parallel",
+        );
         let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
         encoder.set_header_info(self.header_info.clone());
         encoder.compress(reader, writer)
@@ -101,6 +119,12 @@ impl SimpleOptimizer {
 
         // L10-L12: Ultra compression using libdeflate high levels
         if self.config.compression_level >= 10 {
+            crate::compress::debug_encode_path(
+                "ParallelGz",
+                self.config.compression_level,
+                optimal_threads,
+                "parallel",
+            );
             let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
             encoder.set_header_info(self.header_info.clone());
             return encoder.compress_file(path, writer);
@@ -110,11 +134,23 @@ impl SimpleOptimizer {
         if optimal_threads == 1 {
             if self.config.compression_level >= 6 {
                 // L6-L9: pipelined zlib-ng for maximum compression ratio
+                crate::compress::debug_encode_path(
+                    "PipelinedGz",
+                    self.config.compression_level,
+                    optimal_threads,
+                    "pipelined",
+                );
                 let mut encoder = PipelinedGzEncoder::new(compression_level, 1);
                 encoder.set_header_info(self.header_info.clone());
                 return encoder.compress_file(path, writer);
             }
             // L1-L5: libdeflate/ISA-L for maximum speed
+            crate::compress::debug_encode_path(
+                "LibdeflateOneShot",
+                self.config.compression_level,
+                optimal_threads,
+                "libdeflate",
+            );
             let file = std::fs::File::open(&path)?;
             let mmap = unsafe { memmap2::Mmap::map(&file)? };
             let mut writer = writer;
@@ -129,12 +165,24 @@ impl SimpleOptimizer {
 
         // L6-L9: Use pipelined compression with dictionary sharing
         if self.config.compression_level >= 6 {
+            crate::compress::debug_encode_path(
+                "PipelinedGz",
+                self.config.compression_level,
+                optimal_threads,
+                "pipelined",
+            );
             let mut encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
             encoder.set_header_info(self.header_info.clone());
             return encoder.compress_file(path, writer);
         }
 
         // L1-L5: Use mmap-based parallel compression with independent blocks
+        crate::compress::debug_encode_path(
+            "ParallelGz",
+            self.config.compression_level,
+            optimal_threads,
+            "parallel",
+        );
         let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
         encoder.set_header_info(self.header_info.clone());
         encoder.compress_file(path, writer)
@@ -149,6 +197,12 @@ impl SimpleOptimizer {
     ) -> io::Result<u64> {
         // zlib-ng level 1 uses a different strategy that produces worse output.
         // Map level 1 → 2 for better compression ratio with similar speed.
+        crate::compress::debug_encode_path(
+            "Flate2Stream",
+            self.config.compression_level,
+            self.config.thread_count,
+            "flate2",
+        );
         let adjusted_level = if self.config.compression_level == 1 {
             2
         } else {

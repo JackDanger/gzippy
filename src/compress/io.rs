@@ -172,6 +172,12 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         if args.verbosity >= 2 {
             eprintln!("gzippy: using rsyncable compression");
         }
+        crate::compress::debug_encode_path(
+            "Rsyncable",
+            args.compression_level,
+            opt_config.thread_count,
+            "parallel",
+        );
         let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
         if args.stdout {
             crate::compress::parallel::compress_rsyncable(

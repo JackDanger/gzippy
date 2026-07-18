@@ -19,6 +19,24 @@ use crate::compress::parallel::GzipHeaderInfo;
 use crate::compress::simple::SimpleOptimizer;
 use crate::error::GzippyResult;
 
+/// Emit the COMPRESSION path fingerprint (Gate-4 for the encode side).
+///
+/// Analogous to the decode `path=` line in `src/decompress/mod.rs`, this
+/// prints a single deterministic line naming the route actually taken so a
+/// measurement harness can assert which compression route ran. Gated on
+/// `GZIPPY_DEBUG` via the same `crate::utils::debug_enabled()` check the
+/// decode fingerprint uses, printed to stderr. Pure diagnostic: no behavior
+/// or perf effect on the non-debug path.
+///
+/// Called at each route's decision point (immediately before dispatch) so the
+/// printed route can never disagree with the branch actually executed.
+#[inline]
+pub(crate) fn debug_encode_path(route: &str, level: u8, threads: usize, flavor: &str) {
+    if crate::utils::debug_enabled() {
+        eprintln!("encode-path={route} level={level} threads={threads} flavor={flavor}");
+    }
+}
+
 /// Select the fastest available compression backend and drive it to completion.
 ///
 /// Routing (matches CLAUDE.md compression table):
@@ -42,6 +60,12 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
                 args.zopfli_iterations.unwrap_or(15)
             );
         }
+        debug_encode_path(
+            "Zopfli",
+            args.compression_level,
+            opt_config.thread_count,
+            "zopfli",
+        );
         let tuning = crate::backends::zopfli_compress::ZopfliTuning::from_args(args);
         // thread_count + block_size are intentionally not passed: the
         // zopfli path is single-member by ratio mandate (plan.md
@@ -62,6 +86,12 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
             if args.verbosity >= 2 {
                 eprintln!("gzippy: using ISA-L single-threaded streaming compression");
             }
+            debug_encode_path(
+                "IsalStream",
+                args.compression_level,
+                opt_config.thread_count,
+                "isal",
+            );
             let bytes = crate::backends::isal_compress::compress_gzip_stream_direct(
                 &mut reader,
                 writer,
@@ -94,6 +124,12 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
                 if args.verbosity >= 2 {
                     eprintln!("gzippy: using libdeflate single-threaded path");
                 }
+                debug_encode_path(
+                    "LibdeflateOneShot",
+                    args.compression_level,
+                    opt_config.thread_count,
+                    "libdeflate",
+                );
                 let mut input_data = probe_buf;
                 reader.read_to_end(&mut input_data)?;
                 let bytes = input_data.len() as u64;
@@ -111,6 +147,12 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
             if args.verbosity >= 2 {
                 eprintln!("gzippy: using flate2 single-threaded path (highly compressible)");
             }
+            debug_encode_path(
+                "Flate2Stream",
+                args.compression_level,
+                opt_config.thread_count,
+                "flate2",
+            );
             let adjusted_level = if args.compression_level == 1 {
                 2
             } else {
@@ -136,6 +178,12 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
         if args.verbosity >= 2 {
             eprintln!("gzippy: using direct flate2 single-threaded path");
         }
+        debug_encode_path(
+            "Flate2Stream",
+            args.compression_level,
+            opt_config.thread_count,
+            "flate2",
+        );
         let compression = if args.huffman || args.rle {
             flate2::Compression::new(1)
         } else {
