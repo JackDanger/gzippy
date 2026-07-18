@@ -3,6 +3,7 @@
 //! Entry points for the I/O layer are in `io`. This module contains
 //! `compress_with_pipeline` (routing engine) and `compress_bytes` (library API).
 
+pub mod deflate;
 pub mod deflate64;
 pub mod io;
 pub mod optimization;
