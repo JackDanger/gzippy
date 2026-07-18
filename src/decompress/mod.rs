@@ -651,10 +651,7 @@ fn decompress_single_member_for<W: Write>(
             writer.flush()?;
             // Non-inert proof for the engine-A clean-path fastloop: dump the
             // calls/bytes it actually decoded (process-global).
-            #[cfg(all(
-                pure_inflate_decode,
-                not(all(feature = "asm-kernel", target_arch = "x86_64"))
-            ))]
+            #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
             if crate::utils::debug_enabled() {
                 use std::sync::atomic::Ordering::Relaxed;
                 eprintln!(

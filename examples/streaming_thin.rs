@@ -577,6 +577,9 @@ fn run_igzipbarecheap(file: &[u8], batch: usize) -> (f64, usize) {
 #[cfg(all(pure_inflate_decode, feature = "isal-compression"))]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ablate {
+    // Baseline arm: selected by measurement drivers via the parse path, not
+    // constructed in this file — dead_code is a false positive here.
+    #[allow(dead_code)]
     None,
     NoSink,
     NoZero,
@@ -633,7 +636,10 @@ fn igzip_bare_cheap_ab<S: FnMut(&[u8])>(
     };
     // NoZero / BigBuf: uninitialized alloc (skip the cap zeroing). Safe here:
     // every byte read back (window prefix + flushed slice) was written by decode
-    // or copy_within before any read.
+    // or copy_within before any read. The uninit alloc IS the ablation being
+    // measured (remove-the-zeroing removal oracle), so the lint is suppressed
+    // deliberately — do NOT "fix" this to zero-init.
+    #[allow(clippy::uninit_vec)]
     let mut buf: Vec<u8> = if ab == Ablate::NoZero || ab == Ablate::BigBuf {
         let mut v = Vec::with_capacity(cap);
         unsafe { v.set_len(cap) };

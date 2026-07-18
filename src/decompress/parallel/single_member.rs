@@ -131,6 +131,36 @@ pub(crate) fn adjusted_chunk_size_bytes(
     default_chunk_size: usize,
     isize_deflate_ratio: f64,
 ) -> usize {
+    adjusted_chunk_size_bytes_with(
+        file_size,
+        num_threads,
+        default_chunk_size,
+        isize_deflate_ratio,
+        cpu_is_amd(),
+        physical_core_count,
+    )
+}
+
+/// Host-parameterized core of [`adjusted_chunk_size_bytes`]. The CPU vendor and
+/// the physical-core-count probe are PARAMETERS (`is_amd`, `physical_cores`) so
+/// the selector is a pure function of its inputs: tests pin explicit values and
+/// assert deterministic, host-independent outputs (a `cpu_is_amd()` +
+/// `physical_core_count()`-dependent assertion is a hardware-fingerprint flake —
+/// it fired only on AMD CI runners). Production calls it through the thin wrapper
+/// above with the real vendor + topology; `physical_cores` stays a lazily-invoked
+/// fn pointer so the one-time `/sys` topology scan still only happens on the
+/// large-incompressible branch that needs it (see
+/// [`INCOMPRESSIBLE_CAP_MIN_FILE_BYTES`]). Behavior is byte-identical to the
+/// pre-refactor code.
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
+fn adjusted_chunk_size_bytes_with(
+    file_size: usize,
+    num_threads: usize,
+    default_chunk_size: usize,
+    isize_deflate_ratio: f64,
+    is_amd: bool,
+    physical_cores: fn() -> usize,
+) -> usize {
     let threads = num_threads.max(1);
     // AMD/Zen2 VERY-HIGH-THREAD finer-chunk dispatch: Zen's wide CCX pool
     // wins with MORE, smaller chunks once the worker count is high — finer
@@ -144,7 +174,7 @@ pub(crate) fn adjusted_chunk_size_bytes(
     // every T — so Intel / other x86 / aarch64 keep the vendor formula unchanged
     // (byte-identical wall). Dispatch is by `cpu_is_amd()` (cached cpuid vendor
     // string) and only moves chunk BOUNDARIES — decoded output is byte-identical.
-    if cpu_is_amd() && threads > 8 {
+    if is_amd && threads > 8 {
         // MID-RATIO COARSENING: a large mid-ratio stream (ratio ∈ [LOW, HIGH))
         // over-chunks under the finer `file/T²` formula and its per-chunk consumer
         // marker-resolution cost sets the wall. Skip the finer formula and fall
@@ -176,7 +206,12 @@ pub(crate) fn adjusted_chunk_size_bytes(
             // `/sys` topology scan is a per-process tax on a tiny decode,
             // negligible on the 500 MiB+ files the cap targets). 32 MiB is a safe
             // lower bound (`floor · physical²` for physical≥8).
-            let refine = incompressible_refine_divisor(isize_deflate_ratio, file_size, threads);
+            let refine = incompressible_refine_divisor(
+                isize_deflate_ratio,
+                file_size,
+                threads,
+                physical_cores,
+            );
             return adjusted_chunk_size_amd(file_size, refine, default_chunk_size);
         }
     }
@@ -186,7 +221,7 @@ pub(crate) fn adjusted_chunk_size_bytes(
     // `amd_midt_chunk_cap`). threads>8 already refines via the AMD branch above;
     // threads==1 is the serial T1 path. `min` preserves the vendor small-file
     // shrink (never coarsens); only shrinks large-file chunks.
-    if cpu_is_amd() && (2..=8).contains(&threads) {
+    if is_amd && (2..=8).contains(&threads) {
         return vendor.min(amd_midt_chunk_cap(threads));
     }
     vendor
@@ -249,9 +284,10 @@ fn incompressible_refine_divisor(
     isize_deflate_ratio: f64,
     file_size: usize,
     threads: usize,
+    physical_cores: fn() -> usize,
 ) -> usize {
     if isize_deflate_ratio < MID_RATIO_COARSE_LOW && file_size > INCOMPRESSIBLE_CAP_MIN_FILE_BYTES {
-        threads.min(physical_core_count())
+        threads.min(physical_cores())
     } else {
         threads
     }
@@ -1965,34 +2001,102 @@ mod tests {
             assert!(MID_RATIO_COARSE_HIGH > 1.09 && MID_RATIO_COARSE_HIGH <= 2.30);
         }
 
-        // ratio arg only bites on AMD + T>8; every other host is byte-identical
-        // regardless of ratio, so the assertions below are AMD-gated.
-        #[cfg(not(target_arch = "aarch64"))]
-        if cpu_is_amd() {
-            let mid = adjusted_chunk_size_bytes(file, 16, TARGET_COMPRESSED_CHUNK_BYTES, 1.09);
-            let stored = adjusted_chunk_size_bytes(file, 16, TARGET_COMPRESSED_CHUNK_BYTES, 1.003);
-            let compressible =
-                adjusted_chunk_size_bytes(file, 16, TARGET_COMPRESSED_CHUNK_BYTES, 3.11);
-            // mid-ratio → vendor (coarse); the other two → finer AMD formula.
-            assert_eq!(mid, vendor, "mid-ratio must take the vendor partition");
-            assert_eq!(
-                stored, amd_fine,
-                "pure-stored must keep the finer AMD partition"
-            );
-            assert_eq!(
-                compressible, amd_fine,
-                "compressible must keep the finer AMD partition"
-            );
-            assert!(mid > stored, "mid-ratio coarser than pure-stored");
-            // Below T>8 the band is never consulted (only the T>8 branch reads it),
-            // so T8 is ratio-invariant.
-            let t8_mid = adjusted_chunk_size_bytes(file, 8, TARGET_COMPRESSED_CHUNK_BYTES, 1.09);
-            let t8_hi = adjusted_chunk_size_bytes(file, 8, TARGET_COMPRESSED_CHUNK_BYTES, 3.11);
-            assert_eq!(
-                t8_mid, t8_hi,
-                "T<=8 must be byte-identically routed for any ratio"
-            );
-        }
+        // The ratio arg only bites on AMD + T>8. Pin the host parameters
+        // explicitly (`is_amd = true`, 16 physical cores) so the assertions are
+        // deterministic on EVERY runner — the previous `if cpu_is_amd()` form
+        // asserted through the runtime dispatcher, whose incompressible-cap arm
+        // reads the HOST's physical-core count: on an AMD CI runner with fewer
+        // than 16 physical cores the pure-stored expectation silently changed
+        // (a hardware-fingerprint flake, not a code regression).
+        let mid = adjusted_chunk_size_bytes_with(
+            file,
+            16,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            1.09,
+            true,
+            || 16,
+        );
+        let stored = adjusted_chunk_size_bytes_with(
+            file,
+            16,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            1.003,
+            true,
+            || 16,
+        );
+        let compressible = adjusted_chunk_size_bytes_with(
+            file,
+            16,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            3.11,
+            true,
+            || 16,
+        );
+        // mid-ratio → vendor (coarse); the other two → finer AMD formula.
+        // (T=16 <= 16 physical cores, so the incompressible cap is an identity
+        // here and pure-stored keeps the full file/T² refinement.)
+        assert_eq!(mid, vendor, "mid-ratio must take the vendor partition");
+        assert_eq!(
+            stored, amd_fine,
+            "pure-stored must keep the finer AMD partition"
+        );
+        assert_eq!(
+            compressible, amd_fine,
+            "compressible must keep the finer AMD partition"
+        );
+        assert!(mid > stored, "mid-ratio coarser than pure-stored");
+
+        // On an SMT-oversubscribed host (8 physical cores, T=16) the pure-stored
+        // stream instead reuses the winning T=physical grid — the incompressible
+        // high-T chunk-COUNT cap (see `incompressible_refine_divisor`).
+        let stored_smt = adjusted_chunk_size_bytes_with(
+            file,
+            16,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            1.003,
+            true,
+            || 8,
+        );
+        assert_eq!(
+            stored_smt,
+            adjusted_chunk_size_amd(file, 8, TARGET_COMPRESSED_CHUNK_BYTES),
+            "pure-stored at T>physical must reuse the T=physical AMD grid"
+        );
+
+        // Below T>8 the band is never consulted (only the T>8 branch reads it),
+        // so T8 is ratio-invariant.
+        let t8_mid = adjusted_chunk_size_bytes_with(
+            file,
+            8,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            1.09,
+            true,
+            || 16,
+        );
+        let t8_hi = adjusted_chunk_size_bytes_with(
+            file,
+            8,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            3.11,
+            true,
+            || 16,
+        );
+        assert_eq!(
+            t8_mid, t8_hi,
+            "T<=8 must be byte-identically routed for any ratio"
+        );
+
+        // Non-AMD hosts never consult the ratio at any T (vendor partition, with
+        // no AMD mid-T cap): pinned is_amd = false.
+        let non_amd = adjusted_chunk_size_bytes_with(
+            file,
+            16,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            1.09,
+            false,
+            || 16,
+        );
+        assert_eq!(non_amd, vendor, "non-AMD hosts take the vendor partition");
     }
 
     // --- Shipped lever (commit 4062efe3): the incompressible high-T chunk-COUNT cap.
@@ -2002,29 +2106,34 @@ mod tests {
     //     divisor selector + the >32 MiB file-size gate + the AMD call-site routing. ---
     #[test]
     fn incompressible_cap_reuses_physical_grid_above_physical_cores() {
-        let phys = physical_core_count();
-        assert!(phys >= 1, "physical core count must be at least 1");
+        // Pin the physical-core count (12) so the expectations are deterministic
+        // on every host — the selector takes it as an explicit parameter.
+        let phys = 12usize;
+        let phys_fn: fn() -> usize = || 12;
         let large = 723 * 1024 * 1024usize; // > INCOMPRESSIBLE_CAP_MIN_FILE_BYTES
         let stored = 1.003_f64; // ratio < MID_RATIO_COARSE_LOW (incompressible)
         let compressible = 3.11_f64; // ratio >= MID_RATIO_COARSE_LOW
 
         // threads <= physical → the divisor is the identity (byte-identical grid).
-        assert_eq!(incompressible_refine_divisor(stored, large, 1), 1);
-        assert_eq!(incompressible_refine_divisor(stored, large, phys), phys);
+        assert_eq!(incompressible_refine_divisor(stored, large, 1, phys_fn), 1);
+        assert_eq!(
+            incompressible_refine_divisor(stored, large, phys, phys_fn),
+            phys
+        );
 
         // threads > physical on a large incompressible stream → capped at physical.
         let over = phys + 1;
         assert_eq!(
-            incompressible_refine_divisor(stored, large, over),
+            incompressible_refine_divisor(stored, large, over, phys_fn),
             phys,
             "incompressible T>physical must reuse the T=physical divisor"
         );
         // The cap only ever SHRINKS the divisor (coarser grid), never grows it.
-        assert!(incompressible_refine_divisor(stored, large, over) <= over);
+        assert!(incompressible_refine_divisor(stored, large, over, phys_fn) <= over);
 
         // Compressible stream (ratio >= LOW) → the cap arm is NOT taken; full divisor.
         assert_eq!(
-            incompressible_refine_divisor(compressible, large, over),
+            incompressible_refine_divisor(compressible, large, over, phys_fn),
             over,
             "compressible streams keep the finer file/threads² grid at every T"
         );
@@ -2033,41 +2142,54 @@ mod tests {
         // for T>physical (skips the physical_core_count /sys probe on small decodes);
         // just above it, the cap engages.
         assert_eq!(
-            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES, over),
+            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES, over, phys_fn),
             over,
             "at exactly the gate size the cap is a no-op (strict >)"
         );
         assert_eq!(
-            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES - 1, over),
+            incompressible_refine_divisor(
+                stored,
+                INCOMPRESSIBLE_CAP_MIN_FILE_BYTES - 1,
+                over,
+                phys_fn
+            ),
             over
         );
         assert_eq!(
-            incompressible_refine_divisor(stored, INCOMPRESSIBLE_CAP_MIN_FILE_BYTES + 1, over),
+            incompressible_refine_divisor(
+                stored,
+                INCOMPRESSIBLE_CAP_MIN_FILE_BYTES + 1,
+                over,
+                phys_fn
+            ),
             phys,
             "just above the gate the cap engages"
         );
 
-        // AMD call-site integration: cpu_is_amd() && threads>8 is the only path that
-        // reads the ratio, so the routing assertion is AMD-gated. A large stored
-        // stream at T>8 AND T>physical sizes chunks by the T=physical grid — coarser
-        // than (or equal to) the uncapped file/threads² grid.
-        #[cfg(not(target_arch = "aarch64"))]
-        if cpu_is_amd() {
-            let threads = core::cmp::max(9, phys + 1); // > 8 (call-site gate) and > physical
-            let capped =
-                adjusted_chunk_size_bytes(large, threads, TARGET_COMPRESSED_CHUNK_BYTES, stored);
-            let physical_grid = adjusted_chunk_size_amd(large, phys, TARGET_COMPRESSED_CHUNK_BYTES);
-            let uncapped_grid =
-                adjusted_chunk_size_amd(large, threads, TARGET_COMPRESSED_CHUNK_BYTES);
-            assert_eq!(
-                capped, physical_grid,
-                "AMD incompressible T>physical must size chunks by the T=physical grid"
-            );
-            assert!(
-                capped >= uncapped_grid,
-                "capped grid must be coarser-or-equal to the uncapped file/threads² grid"
-            );
-        }
+        // AMD call-site integration: is_amd && threads>8 is the only path that
+        // reads the ratio. A large stored stream at T>8 AND T>physical sizes
+        // chunks by the T=physical grid — coarser than (or equal to) the
+        // uncapped file/threads² grid. Host parameters pinned → deterministic
+        // everywhere (no cpu_is_amd() / topology dependence).
+        let threads = core::cmp::max(9, phys + 1); // > 8 (call-site gate) and > physical
+        let capped = adjusted_chunk_size_bytes_with(
+            large,
+            threads,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+            stored,
+            true,
+            phys_fn,
+        );
+        let physical_grid = adjusted_chunk_size_amd(large, phys, TARGET_COMPRESSED_CHUNK_BYTES);
+        let uncapped_grid = adjusted_chunk_size_amd(large, threads, TARGET_COMPRESSED_CHUNK_BYTES);
+        assert_eq!(
+            capped, physical_grid,
+            "AMD incompressible T>physical must size chunks by the T=physical grid"
+        );
+        assert!(
+            capped >= uncapped_grid,
+            "capped grid must be coarser-or-equal to the uncapped file/threads² grid"
+        );
     }
 
     // --- AMD/Zen2 mid-thread (2..=8) per-T chunk-size cap: shrink the chunk size

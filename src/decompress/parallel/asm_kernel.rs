@@ -141,7 +141,7 @@
 
 #![allow(dead_code)]
 
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(asm_kernel)]
 use crate::decompress::inflate::consume_first_decode::Bits;
 
 /// Stricter input guard margin (bytes) — see IN_MARGIN proof in the module
@@ -276,7 +276,7 @@ const _: () =
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!(crate::decompress::inflate::libdeflate_entry::DistTable::TABLE_BITS == 9);
 
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(asm_kernel)]
 mod imp {
     use super::{AsmState, Bits, ASM_DIST_OFF, ASM_LIT_LONG_OFF, ASM_LIT_SHORT_OFF};
     #[cfg(test)]
@@ -1093,9 +1093,9 @@ mod imp {
     }
 }
 
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(asm_kernel)]
 pub use imp::{enabled, run_contig};
-#[cfg(all(test, feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(all(test, asm_kernel))]
 pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
 
 /// Pure-Rust REFERENCE MODEL of the asm region's contract — the exact
@@ -1107,7 +1107,7 @@ pub use imp::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
 /// differential test pins asm == ref on (exit, bit cursor, dst, output
 /// bytes); the ref's own equivalence to the production loop is by line-map
 /// inspection (see `run_contig` doc) and by the guest suite/sha grid.
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(asm_kernel)]
 pub fn run_contig_ref(
     lut: &super::lut_huffman::LutLitLenCode,
     dist: &crate::decompress::inflate::libdeflate_entry::DistTable,
@@ -1156,7 +1156,7 @@ pub struct RefArmStats {
 /// the 450-line asm region. `BIAS = 0` is bit-for-bit the production
 /// reference model (the wrapper above delegates here), so the control shares
 /// every instruction with the real harness.
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(asm_kernel)]
 pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
     lut: &super::lut_huffman::LutLitLenCode,
     dist: &crate::decompress::inflate::libdeflate_entry::DistTable,
@@ -1285,7 +1285,7 @@ pub fn run_contig_ref_biased<const CONSUME_BIAS: u32>(
 /// only re-running `decode_prefilled(&lb)` (never inspecting the cursor shape).
 /// `byte + 8 <= data.len()` is guaranteed by IN_MARGIN inside the asm region
 /// (`p0>>3 <= pos < in_lim = len-40`).
-#[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+#[cfg(asm_kernel)]
 #[inline]
 fn reclass_reread(lb: &mut Bits<'_>, p0: usize) {
     let byte = p0 >> 3;
@@ -1319,7 +1319,7 @@ mod tests {
     /// dst bit-for-bit unchanged and a valid exit code, for both guard
     /// outcomes. (Executes only where the asm path is compiled; the guest
     /// gauntlet is the authoritative run.)
-    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[cfg(asm_kernel)]
     #[test]
     fn c1_seam_roundtrip_state_unchanged() {
         let data = vec![0xA5u8; 256];
@@ -1375,7 +1375,7 @@ mod tests {
     /// (pos/bitbuf/bitsleft — X1 state equality), dst advance, and every
     /// output byte below dst (X3). Skips the asm half without BMI2 (local
     /// Rosetta); the guest gauntlet is authoritative.
-    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[cfg(asm_kernel)]
     #[test]
     fn c2_differential_asm_vs_ref_random_streams() {
         use crate::decompress::parallel::lut_huffman::LutLitLenCode;
@@ -1520,7 +1520,7 @@ mod tests {
     /// by the mutation, not the inputs). Proves the harness is live for
     /// consume-count drift — the one failure class the three c3 controls
     /// (lit store, dist base shift, multi advance) did not cover.
-    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[cfg(asm_kernel)]
     #[test]
     fn positive_control_consume_off_by_one_trips_cursor_asserts() {
         use crate::decompress::inflate::libdeflate_entry::DistTable;
@@ -1671,7 +1671,7 @@ mod tests {
     /// Compares exit, full cursor, dst advance, and every byte above the
     /// shared window. Coverage floor asserted on the (lenny × small) cell
     /// so the test cannot silently degrade to literals-only.
-    #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+    #[cfg(asm_kernel)]
     #[test]
     fn c3_differential_asm_vs_ref_windowed_backrefs() {
         use crate::decompress::inflate::libdeflate_entry::DistTable;

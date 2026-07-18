@@ -63,6 +63,7 @@ fn emit_parallel_sm_cfgs() {
     // `unexpected_cfgs` lint (required since Rust 1.80).
     println!("cargo::rustc-check-cfg=cfg(parallel_sm)");
     println!("cargo::rustc-check-cfg=cfg(pure_inflate_decode)");
+    println!("cargo::rustc-check-cfg=cfg(asm_kernel)");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let is_x86_64 = arch == "x86_64";
@@ -85,6 +86,22 @@ fn emit_parallel_sm_cfgs() {
     }
     if pure_inflate_decode {
         println!("cargo::rustc-cfg=pure_inflate_decode");
+    }
+
+    // `asm_kernel` — the whole-fast-loop x86_64 `asm!` region in
+    // `parallel/asm_kernel.rs` is compiled in and dispatched to. Requires the
+    // `asm-kernel` feature AND x86_64 AND **Linux**: the asm region names 15
+    // general-purpose registers, which allocates on Linux (rbp is available)
+    // but NOT on Darwin, where the frame pointer is reserved — an
+    // x86_64-apple-darwin build dies with "inline assembly requires more
+    // registers than available". Linux x86_64 is also the only platform the
+    // kernel was ever measured/shipped on; every other target takes the
+    // byte-identical pure-Rust fast loop.
+    let has_asm_kernel_feature = std::env::var_os("CARGO_FEATURE_ASM_KERNEL").is_some();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let asm_kernel = has_asm_kernel_feature && is_x86_64 && target_os == "linux";
+    if asm_kernel {
+        println!("cargo::rustc-cfg=asm_kernel");
     }
 
     // BUILD_FLAVOR: compile-time &'static str consumed by `env!("BUILD_FLAVOR")`.

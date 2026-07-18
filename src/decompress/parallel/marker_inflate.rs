@@ -573,16 +573,10 @@ pub struct Block {
     /// as `dist_table_lens`); FixedHuffman uses the process-wide static
     /// `get_fixed_tables().0` and leaves this `None`. Only present on the
     /// pure-Rust clean path that runs the flat fastloop.
-    #[cfg(all(
-        pure_inflate_decode,
-        not(all(feature = "asm-kernel", target_arch = "x86_64"))
-    ))]
+    #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
     flat_litlen: Option<crate::decompress::inflate::libdeflate_entry::LitLenTable>,
     /// Litlen code lengths the cached `flat_litlen` was built from (cache key).
-    #[cfg(all(
-        pure_inflate_decode,
-        not(all(feature = "asm-kernel", target_arch = "x86_64"))
-    ))]
+    #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
     flat_litlen_lens: Vec<u8>,
 }
 
@@ -664,15 +658,9 @@ impl Block {
             block_huffman_luts_ready: false,
             #[cfg(pure_inflate_decode)]
             dist_hc_built: false,
-            #[cfg(all(
-                pure_inflate_decode,
-                not(all(feature = "asm-kernel", target_arch = "x86_64"))
-            ))]
+            #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
             flat_litlen: None,
-            #[cfg(all(
-                pure_inflate_decode,
-                not(all(feature = "asm-kernel", target_arch = "x86_64"))
-            ))]
+            #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
             flat_litlen_lens: Vec::new(),
         }
     }
@@ -1083,7 +1071,7 @@ impl Block {
                 not(feature = "pure-rust-inflate"),
                 target_arch = "x86_64"
             ),
-            all(pure_inflate_decode, feature = "asm-kernel", target_arch = "x86_64")
+            all(pure_inflate_decode, asm_kernel)
         ))]
         {
             self.build_huffman_luts_for_block()?;
@@ -2797,10 +2785,7 @@ impl Block {
     /// caller uses the process-wide static `get_fixed_tables().0`.
     ///
     /// Returns `true` if a usable table is available (static-fixed or cached).
-    #[cfg(all(
-        pure_inflate_decode,
-        not(all(feature = "asm-kernel", target_arch = "x86_64"))
-    ))]
+    #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
     fn ensure_flat_litlen(&mut self) -> bool {
         use crate::decompress::inflate::libdeflate_entry::LitLenTable;
         match self.compression_type {
@@ -2989,10 +2974,7 @@ impl Block {
         // engine A implements none of them). Compiled out on x86 WITH the BMI2
         // asm kernel (x86 asm path untouched); present on aarch64 and
         // on the x86 asm-OFF arm.
-        #[cfg(all(
-            pure_inflate_decode,
-            not(all(feature = "asm-kernel", target_arch = "x86_64"))
-        ))]
+        #[cfg(all(pure_inflate_decode, not(asm_kernel)))]
         {
             use crate::decompress::inflate::consume_first_decode::{
                 decode_huffman_fastloop_bounded_pipelined, FlatFastloopExit, FLAT_CONTIG_BYTES,
@@ -3196,7 +3178,7 @@ impl Block {
             // only &mut self.asm in the region; the loop then only reads it
             // (`run_contig(&self.asm,…)`, `decode_prefilled`, dist lookups all
             // SHARED — the anchor stores that needed &mut are gone).
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            #[cfg(asm_kernel)]
             {
                 self.asm.in_ptr = lb.data.as_ptr() as u64;
                 self.asm.in_lim = in_end.saturating_sub(super::asm_kernel::IN_MARGIN) as u64;
@@ -3227,7 +3209,7 @@ impl Block {
             // (any measurement knob forces the pure-Rust
             // loop). OFF ⇒ the loop below is the sole path; it is ALWAYS
             // compiled regardless.
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            #[cfg(asm_kernel)]
             let mut asm_on: bool = super::asm_kernel::enabled()
                 && super::asm_kernel::dispatch_allowed(
                     // Measurement knobs removed: these are always the OFF values,
@@ -3284,7 +3266,7 @@ impl Block {
                 // (asm_kernel.rs EXIT-STATE CONTRACT). Re-entry via
                 // `continue 'fast`. `prof_on` true ⇒ `asm_on` false, so the
                 // profiler block above never brackets asm iterations.
-                #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+                #[cfg(asm_kernel)]
                 if $use_asm && asm_on {
                     // SAFETY: contract E1-E6 hold here — this IS the Rust
                     // loop's iteration top (fresh un-consumed packet, clean
@@ -3614,7 +3596,7 @@ impl Block {
                 };
             }
             // Variant selection — once per region run (see macro doc above).
-            #[cfg(all(feature = "asm-kernel", target_arch = "x86_64"))]
+            #[cfg(asm_kernel)]
             {
                 if asm_on {
                     fast_loop_run!(true);
@@ -3622,7 +3604,7 @@ impl Block {
                     fast_loop_run!(false);
                 }
             }
-            #[cfg(not(all(feature = "asm-kernel", target_arch = "x86_64")))]
+            #[cfg(not(asm_kernel))]
             fast_loop_run!(false);
             // FALL THROUGH: `pre` was decoded but NOT consumed (every break leaves
             // a fresh un-consumed `pre`), so the bit cursor sits exactly before
@@ -5045,7 +5027,7 @@ mod tests {
     /// (pos/bitbuf/bitsleft — the X1 contract at stream end). ON-arm
     /// engagement is effect-verified via `TEST_RUN_CONTIG_CALLS`, never
     /// assumed. Skips gracefully without BMI2.
-    #[cfg(all(pure_inflate_decode, feature = "asm-kernel", target_arch = "x86_64"))]
+    #[cfg(all(pure_inflate_decode, asm_kernel))]
     #[test]
     fn asm_kernel_on_off_fuzz_random_gzip_members() {
         use crate::decompress::parallel::asm_kernel::{TEST_FORCE, TEST_RUN_CONTIG_CALLS};
@@ -5106,7 +5088,7 @@ mod tests {
                         // RLE run (dist==1 broadcast arm)
                         let b = next() as u8;
                         let n = 16 + (next() as usize % 2048);
-                        payload.extend(std::iter::repeat(b).take(n));
+                        payload.extend(std::iter::repeat_n(b, n));
                     }
                     4 => {
                         // self-copy of an earlier slice (long distances)
@@ -5122,7 +5104,7 @@ mod tests {
                     _ => {
                         // zeros (max-length RLE backrefs)
                         let n = 16 + (next() as usize % 2048);
-                        payload.extend(std::iter::repeat(0u8).take(n));
+                        payload.extend(std::iter::repeat_n(0u8, n));
                     }
                 }
             }

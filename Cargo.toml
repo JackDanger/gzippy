@@ -91,15 +91,18 @@ oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
 # Pulls `asm-kernel` (DEFAULT-ON since the §9 F-c SHIP + the four flip
 # preconditions, plans/asm-campaign.md §10): every production decode build
-# enables `pure-rust-inflate`, so this is the default-flip wire. Non-x86_64
-# builds are bit-for-bit unaffected (every kernel call site is compile-gated
-# on target_arch = "x86_64").
+# enables `pure-rust-inflate`, so this is the default-flip wire. Non-Linux and
+# non-x86_64 builds are bit-for-bit unaffected (every kernel call site is
+# compile-gated on the build.rs `asm_kernel` cfg = feature + x86_64 + Linux;
+# Darwin x86_64 cannot compile the 15-GPR asm region — rbp is reserved).
 pure-rust-inflate = ["rpmalloc-caches", "asm-kernel"]
 # ── ASM campaign (plans/asm-campaign.md) ─────────────────────────────────────
 # Rung (c): the contig clean fast loop's per-symbol hot path as ONE asm!
 # region (asm_kernel.rs) — seam amortized to ~once per fast-loop run (the
-# increment-(a) falsifier's mechanism). x86_64-only (compile-gated per call
-# site); runtime-dispatched (BMI2 detect) with the GZIPPY_ASM_KERNEL=0
+# increment-(a) falsifier's mechanism). Linux-x86_64-only (compile-gated per
+# call site via the build.rs `asm_kernel` cfg — the asm names 15 GPRs, which
+# does not allocate on Darwin where rbp is the reserved frame pointer);
+# runtime-dispatched (BMI2 detect) with the GZIPPY_ASM_KERNEL=0
 # kill-switch; the pure-Rust loop is ALWAYS compiled and is the sole path on
 # every other arch/CPU. DEFAULT-ON via `pure-rust-inflate` since the §9 F-c
 # SHIP gate + §10 flip preconditions (T1 silesia -19.2% vs base, byte-exact,
