@@ -392,3 +392,31 @@ jobs:
             [ "$VERSION" = "$FORMULA_VERSION" ] || { echo "VERSION ($VERSION) != Formula ($FORMULA_VERSION)"; exit 1; }
           fi
           echo "All versions match"
+
+  # ---------------------------------------------------------------------------
+  # Aggregate required-status gate.
+  #
+  # The `main` branch ruleset requires ONE status check named `build`. The CI
+  # jobs above report as "Build & Test …", "Integration (correctness)", "Lint"
+  # — none of which is `build` — so without this job the required check is never
+  # reported and every PR stays BLOCKED even when fully green. This fans all
+  # real jobs into a single stable `build` check: branch protection depends only
+  # on this one name, immune to matrix/job renames. It passes only if every
+  # upstream job succeeded.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: [test, integration, lint]
+    if: always()
+    steps:
+      - name: Require all CI jobs to have succeeded
+        run: |
+          echo "test=${{ needs.test.result }} integration=${{ needs.integration.result }} lint=${{ needs.lint.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] \
+          || [ "${{ needs.integration.result }}" != "success" ] \
+          || [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "::error::One or more required CI jobs did not succeed."
+            exit 1
+          fi
+          echo "All required CI jobs passed."
