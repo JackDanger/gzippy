@@ -55,7 +55,7 @@ mod bench {
     /// Best-of-N timing after `warmup` warmup iterations. Both timers
     /// follow the same shape: allocate output buffer outside the timed
     /// region; construct any decoder state outside the timed region;
-    /// time only the decode. Advisor item E1-E3: bench harness must be
+    /// time only the decode. The bench harness must be
     /// symmetric.
     /// Monolithic decode: one giant output buffer, decoder fills in one
     /// call. Favors decoders that benefit from large contiguous writes.
@@ -106,7 +106,7 @@ mod bench {
 
     /// Chunked decode: read into a 64 KiB output window at a time, like
     /// a streaming consumer would. Tests whether the win from monolithic
-    /// decode is real or just bench-construction artifact (advisor item B1).
+    /// decode is real or just bench-construction artifact.
     fn time_resumable_chunked(
         deflate: &[u8],
         expected_out: usize,
@@ -166,8 +166,7 @@ mod bench {
         let mut best_ns_per_byte = f64::MAX;
         for _ in 0..iters {
             // Symmetric with time_resumable: decoder construction outside
-            // the timed region. This corrects the previous asymmetry
-            // (advisor item E1).
+            // the timed region.
             let mut decoder = flate2::read::DeflateDecoder::new(deflate);
             let start = Instant::now();
             let total = decoder.read(&mut out).unwrap();
@@ -587,12 +586,12 @@ mod bench {
     }
 
     pub fn run() {
-        const ITERS: usize = 30; // advisor item E6: best-of-30 after warmup
+        const ITERS: usize = 30; // best-of-30 after warmup
         const WARMUP: usize = 5;
 
         // Cases: small + large variants. Small fits L1+L2 (best-case);
         // large forces L2/L3 misses and reflects realistic workloads.
-        // (Advisor item E5: 524 KiB alone hides cache-miss costs.)
+        // (524 KiB alone hides cache-miss costs.)
         let cases: Vec<(&str, Vec<u8>, u32)> = vec![
             // Huffman-dominated text — small (fits L2).
             ("text_words", make_text(512), 6),
@@ -691,7 +690,7 @@ mod bench {
             ));
         }
 
-        // Per advisor item B7: FASTLOOP must fire across the corpus. If
+        // FASTLOOP must fire across the corpus. If
         // not, the bench is meaningless because we're measuring the
         // safe-loop path, not the optimized fastloop.
         println!();

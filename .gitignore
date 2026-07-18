@@ -79,3 +79,11 @@ artifacts/insnattr_postlutskip_m1_silesia_t1.json
 artifacts/
 score/
 plans/
+
+# Campaign/fulcrum internal + editor AI config
+.fulcrum/
+.cursor/
+.cursorrules
+fulcrum-*.json
+fulcrum-*.spec.json
+.neurotic-*.json

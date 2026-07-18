@@ -1,4 +1,4 @@
-//! Engine isolation microbench — CLAUDE.md rule-3 "isolation oracle".
+//! Engine isolation microbench — the isolation oracle.
 //!
 //! Decodes ONE known-window CLEAN silesia deflate chunk three ways, byte-exact
 //! each, and reports the per-variant CLEAN decode RATE (MB/s). This BOUNDS the
@@ -25,15 +25,12 @@
 //! Byte-exactness is the ABSOLUTE gate: all three outputs must be identical over
 //! the first N bytes or the rate numbers are VOID.
 //!
-//! Self-test (RECALIBRATED round-2): on a clean single-thread chunk pure ISA-L
-//! is ~3x gzippy's current scalar-u16 inner loop. The round-1 band [1.7x,2.6x]
-//! was MIS-CALIBRATED — it was lifted from the 2.1-2.38x system-vs-system wall
-//! ratio, but THIS bench's (iii) is a PURE ISA-L clean decode (no marker
-//! machinery, no CRC), a purer/faster denominator that yields a LARGER honest
-//! ratio (advisor-confirmed iii/ii ~= 3.10x, iii/i ~= 3.29x). PASS band
-//! (iii)/(i) in [2.5x, 3.6x] (guest ratio; under Rosetta the absolute MB/s
-//! differ but the ratio should still hold — note if it does not; the guest run
-//! is authoritative).
+//! Self-test: on a clean single-thread chunk pure ISA-L is ~3x gzippy's current
+//! scalar-u16 inner loop. THIS bench's (iii) is a PURE ISA-L clean decode (no
+//! marker machinery, no CRC), a purer/faster denominator than a system-vs-system
+//! wall ratio (iii/ii ~= 3.10x, iii/i ~= 3.29x). PASS band (iii)/(i) in
+//! [2.5x, 3.6x] (guest ratio; under Rosetta the absolute MB/s differ but the
+//! ratio should still hold — note if it does not; the guest run is authoritative).
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -201,7 +198,7 @@ mod bench {
 
     // ── Variant (v): FLAT-u8 packed-table + SPECULATIVE SOFTWARE-PIPELINED loop ─
     //
-    // This is the inner-Huffman-kernel LEVER (plans/inner-huffman-kernel.md): igzip's
+    // This is the inner-Huffman kernel: igzip's
     // speculative pipeline (igzip_decode_block_stateless.asm:507-627), built on the
     // FLAT-u8 path the faithful u8 rewrite enabled. It reuses the EXISTING igzip
     // packed-flat-short-code table (LutLitLenCode/LutDistCode, lut_huffman.rs — trick
@@ -1135,9 +1132,9 @@ mod bench {
 
     // ── Variant (vii): INLINE-ASM literal-run hot loop (igzip transliteration) ─
     //
-    // This is the CHARTER Phase-2 prototype: an inline `core::arch::asm!` hot loop
+    // This is an inline `core::arch::asm!` hot loop
     // that transliterates the part of igzip's AVX2 clean-decode loop LLVM provably
-    // does NOT emit from idiomatic Rust (source-map plans/phase1-source-map, asm
+    // does NOT emit from idiomatic Rust (asm
     // igzip_decode_block_stateless.asm:507-556):
     //
     //   F1 — ONE-ITERATION-AHEAD literal-table gather hoisted ACROSS the back-edge
@@ -1189,7 +1186,7 @@ mod bench {
 
         const LONG_MASK: u64 = (1u64 << ISAL_DECODE_LONG_BITS) - 1;
 
-        // Coverage counters (the advisor's owed instrument): how many bytes the asm
+        // Coverage counters: how many bytes the asm
         // hot loop emitted vs how many the Rust careful tail emitted, to prove the
         // asm is actually on the dominant path (not just a tiny leading prefix).
         let cov = std::env::var_os("GZIPPY_VII_COVERAGE").is_some();
@@ -1436,7 +1433,7 @@ mod bench {
                 // in Rust via litlen.decode (the validated long-code path), emit its
                 // literal(s) or back-ref, then RE-ENTER the asm — so a long code does
                 // NOT kick the whole rest of the block to the careful loop. This keeps
-                // the asm on the dominant path (the advisor's coverage concern).
+                // the asm on the dominant path.
                 if exit_code == 1 {
                     let tail_before = out_pos;
                     let one = decode_one_symbol(
@@ -1537,24 +1534,24 @@ mod bench {
         ("VAR_III_isal", decode_var_iii),
         // (VAR_IV read_clean_e234 stacks deleted in M5 with the bench-only
         // `read_clean_e234` / `drain_clean_u8` engine entry points.)
-        // VAR_V is the inner-Huffman-kernel LEVER: igzip packed-flat-short-code
+        // VAR_V is the inner-Huffman kernel: igzip packed-flat-short-code
         // table (trick #1) + the speculative software-pipelined loop (trick #2) on
         // a FLAT-u8 linear buffer (the missing piece — production stores one u8 per
-        // iter with a ring modulo and never preloads). This is the variant the
-        // pre-registered falsifier gates: PASS if (V)/(III isal) >= 0.85.
+        // iter with a ring modulo and never preloads). Pass gate:
+        // (V)/(III isal) >= 0.85.
         ("VAR_V_specflat", decode_var_v),
         // VAR_VI = VAR_V + BMI2 BZHI/SHRX bit extraction + AVX2/SSE MOVDQU wide
-        // overlap-copy back-ref. This is the variant the ceiling falsifier gates:
-        // PASS (pure-Rust IS igzip-class) if (VI)/(III isal) >= 0.85.
+        // overlap-copy back-ref. Pass gate: (VI)/(III isal) >= 0.85
+        // (pure-Rust is igzip-class).
         ("VAR_VI_specbmi2avx", decode_var_vi),
-        // VAR_VII = the CHARTER Phase-2 INLINE-ASM transliteration: igzip's
+        // VAR_VII = the INLINE-ASM transliteration: igzip's
         // literal-run hot loop as a `core::arch::asm!` block (one-iteration-ahead
         // table-gather hoist + unconditional flag-free SHLX/SHRX refill+consume +
         // register-pinned loop state + 8-byte packed-literal store), exiting to the
-        // validated Rust careful tail on any length/long/boundary. This is the
-        // variant the GO/NO-GO gate measures: GO if (VII)/(III isal) materially
-        // exceeds (VI)/(III isal) toward igzip-class (~0.945 ocl_cf); PLATEAU if
-        // (VII) ≈ (VI) (inline asm cannot beat LLVM here).
+        // validated Rust careful tail on any length/long/boundary. Compares
+        // (VII)/(III isal) against (VI)/(III isal): a gain toward igzip-class
+        // (~0.945 ocl_cf) vs a plateau where (VII) ≈ (VI) (inline asm cannot beat
+        // LLVM here).
         ("VAR_VII_asm", decode_var_vii),
     ];
 
@@ -1737,7 +1734,7 @@ mod bench {
             );
         }
 
-        // Self-test on the MEDIAN chunk (the 50% pick), preserved from round-2:
+        // Self-test on the MEDIAN chunk (the 50% pick):
         // (iii)/(i) should land in [2.5x, 3.6x] on the guest. Under Rosetta the
         // absolute MB/s are garbage so the ratio can drift — the guest run is
         // authoritative; we only HARD-gate byte-exactness here.

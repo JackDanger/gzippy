@@ -264,7 +264,7 @@ explicit env-var or feature gate. They are measurement instruments and oracles, 
 production paths.
 
 - **`GZIPPY_CLEAN_WINDOW_ORACLE`** — `sm_driver.rs:45`: replaces the speculative
-  pipeline with a known-window oracle; broken in one campaign run (commit `64eb6df`),
+  pipeline with a known-window oracle; broken in commit `64eb6df`,
   retained for future validated use. Not a production decode path.
 
 - **`GZIPPY_BYPASS_CAPTURE / _DECODE / _FORCE_CLEAN / _META_ONLY / _REBUILD`** —
@@ -281,7 +281,7 @@ production paths.
   byte-identical but adds wall time by design.
 
 - **`GZIPPY_ISAL_PURE_BULK`** — `chunk_decode.rs:169`: the stateless ISA-L-LUT bulk
-  decoder (`src/decompress/parallel/isal_lut_bulk.rs`). Pending neurotic
+  decoder (`src/decompress/parallel/isal_lut_bulk.rs`). Pending benchmark-box
   confirmation before becoming the production default.
 
 - **`GZIPPY_STORED_NO_OVERLAP` / `_INLINE_COPY`** — `stored_split.rs`: overlap and
@@ -297,8 +297,8 @@ production paths.
   current default before treating this as inactive.
 
 - **`global-rpmalloc` feature** — `#[global_allocator] = rpmalloc::RpMalloc` in
-  `src/main.rs`. FALSIFIED at +167% wall (+41% faults) on file output
-  (campaign 2026-05-28). Not in default feature set.
+  `src/main.rs`. Not in the default feature set — measured slower on file
+  output (higher wall and page-fault count).
 
 - **`GZIPPY_LEGACY_INFLATE`** — kill switch back to `ResumableInflate2`; the new
   `Inflate<>` path is the production default when the feature is active.

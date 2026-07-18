@@ -1,10 +1,10 @@
 # Structural gap: gzippy vs rapidgzip (parallel single-member)
 
 **Branch:** `reimplement-isa-l` (pure-rust-inflate production path)  
-**Ground truth:** locked Fulcrum on neurotic, silesia-large, frozen host, byte-exact  
+**Ground truth:** locked Fulcrum on the benchmark box, silesia-large, frozen host, byte-exact  
 **Wall today:** gzippy ~2.0–2.6× slower than rapidgzip at T8–T16 (trace ~955 ms vs ~463 ms; interleaved min ~1.2 s vs ~0.48 s)
 
-This document maps **structure** (vendor `vendor/rapidgzip/librapidarchive/src/rapidgzip/` ↔ gzippy `src/decompress/parallel/`), not attribution guesses. Fulcrum proposes; **causal perturbation** (slow-inject, oracle removal) disposes.
+This document maps **structure** (vendor `vendor/rapidgzip/librapidarchive/src/rapidgzip/` ↔ gzippy `src/decompress/parallel/`).
 
 ---
 
@@ -95,7 +95,7 @@ Causal: `GZIPPY_SLOW_BOOTSTRAP` +100% → wall +48–61% (decode on critical pat
 | Parallel cost | `applyWindow` on pool | fused LUT `post_process` ~**298 ms wc** vs rg **~215 ms** busy |
 | Model binding | `N·L_resolve` when chain slow | Fulcrum model: publish-chain bound at T8 |
 
-**Divergence #3 (data plane):** `ChunkData::getLastWindow` on segmented storage vs vendor `FasterVector` contiguous tail — suspected **~122 ms** `window_publish_marker` serial tax. Arc deep-clone hypothesis **falsified** (`try_unwrap` misses=0).
+**Divergence #3 (data plane):** `ChunkData::getLastWindow` on segmented storage vs vendor `FasterVector` contiguous tail.
 
 ---
 

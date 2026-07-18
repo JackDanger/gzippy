@@ -1,15 +1,13 @@
-//! Phase B step-1 diagnostic — isolate marker-bookkeeping cost from
+//! Diagnostic — isolate marker-bookkeeping cost from
 //! u16-ring/decoder costs in `bootstrap_with_marker_inflate`'s hot loop.
 //!
-//! `plans/pure-rust-perf.md` step-zero finding: bootstrap takes
-//! p50=14.2ms per chunk while the inflate-only bench shows 334 MB/s
-//! pure-Rust → expected ~5-8ms. Per-block bootstrap is ~14× the
-//! bench rate.
+//! Context: the marker bootstrap runs at ~p50=14.2ms per chunk while the
+//! inflate-only bench shows 334 MB/s pure-Rust (expected ~5-8ms), so
+//! per-block bootstrap is ~14× the bench rate.
 //!
 //! Both code paths use multi-symbol Huffman caching (bench uses
-//! libdeflate-style scalar; bootstrap used a vendor MultiCached.hpp-style
-//! TRIPLE_SYM cache). So the gap is NOT scalar-vs-SIMD as
-//! `plans/rust-rapidgzip.md` work item #1(b) framed it.
+//! libdeflate-style scalar; bootstrap uses a vendor MultiCached.hpp-style
+//! TRIPLE_SYM cache), so the gap is not scalar-vs-SIMD.
 //!
 //! This bench monomorphizes the `read_internal_compressed_specialized
 //! <CONTAINS_MARKERS>` template on identical input:
@@ -23,7 +21,7 @@
 //! Small gap (both slow): cost is in u16-ring writes + modulo or
 //! decoder cache footprint; next bench isolates ring vs decoder.
 //!
-//! Run on neurotic:
+//! Run:
 //! ```text
 //! cargo bench --features pure-rust-inflate --bench bootstrap_marker_overhead -- --nocapture
 //! ```
@@ -99,8 +97,8 @@ mod bench {
     /// throughput minus the drain copy. Back-refs (≤32 KiB lookback)
     /// still resolve from the ring's recent history, so decode stays
     /// correct; only the (discarded) output differs. Ratio of the
-    /// drained markers-ON rate to THIS rate = the drain copy cost,
-    /// the 150-vs-340 hypothesis.
+    /// drained markers-ON rate to THIS rate = the drain copy cost
+    /// (the 150-vs-340 MB/s gap).
     fn decode_full_stream_no_drain(deflate: &[u8]) -> (usize, usize) {
         use gzippy::decompress::parallel::marker_inflate::CompressionType;
         let mut block = Block::new();

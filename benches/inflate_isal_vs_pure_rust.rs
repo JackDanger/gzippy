@@ -1,6 +1,6 @@
-//! Track B4: compare patched ISA-L vs pure-Rust resumable inflate throughput.
+//! Compare patched ISA-L vs pure-Rust resumable inflate throughput.
 //!
-//! Run on neurotic (silesia corpus):
+//! Run (silesia corpus):
 //! ```text
 //! cargo bench --release --features isal-compression -- \
 //!   --bench inflate_isal_vs_pure_rust -- --nocapture

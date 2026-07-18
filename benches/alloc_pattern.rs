@@ -1,15 +1,14 @@
-//! Framework Step 4 — `alloc_pattern` microbench
+//! `alloc_pattern` microbench
 //!
 //! Purpose: reproduce gzippy's exact memory shape (16 workers × 12 MiB
 //! target × BTYPE-mixed writes + consumer read-side sweep) so we can
 //! measure the impact of allocator + chunk-shape changes in 30s
-//! instead of a 20-trial neurotic A/B.
+//! instead of a 20-trial A/B on the benchmark box.
 //!
-//! Mirrors the empirically-attributed write path: the marker bootstrap
-//! + chunk-data extend_from_slice pattern (see
-//!   `docs/perf/2026-05-28-framework-step2-pebs-attribution.md`).
+//! Mirrors the write path: the marker bootstrap
+//! + chunk-data extend_from_slice pattern.
 //!
-//! Test matrix (advisor-locked, all six combinations run by default):
+//! Test matrix (all six combinations run by default):
 //!
 //! Allocator  × Chunk shape        × Read sweep
 //! ----------------------------------------------------------
@@ -30,9 +29,9 @@
 //! GZIPPY_ALLOC_PF=1 cargo bench --bench alloc_pattern -- --nocapture
 //! ```
 //!
-//! Pass gate (advisor-locked): a variant must show ≥10% page-fault
+//! Pass gate: a variant must show ≥10% page-fault
 //! reduction AND ≥5% cycle reduction vs gzippy-baseline (glibc +
-//! single-Vec) before promoting to the production A/B in Step 5.
+//! single-Vec) before promoting to the production A/B.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

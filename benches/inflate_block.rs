@@ -1,4 +1,4 @@
-//! Phase 1.2 microbench harness (see plans/inner-loop-execution.md).
+//! Inner-loop decode microbench harness.
 //!
 //! Measures gzippy's inner-loop decode rate on the `corpus/silesia_blocks/`
 //! corpus. Two bench groups:
@@ -10,7 +10,7 @@
 //!
 //! Headline metric: aggregate MB/s across all 30 blocks (weighted by
 //! decoded bytes). Per-block MB/s is a shape-regression detector only,
-//! not the optimization target (per Opus advisor: large blocks hit
+//! not the optimization target (large blocks hit
 //! warm-cache, small blocks hit cold-start; per-block MB/s is misleading
 //! as a primary metric).
 
@@ -155,9 +155,8 @@ fn bench_corpus_aggregate(c: &mut Criterion) {
     });
 
     // Synthetic bootstrap path: the CONTAINS_MARKERS=true instantiation
-    // of `run_multi_cached_loop`. This is where the 1.54× per-byte gap
-    // with rapidgzip lives (per plans/pure-rust-perf.md Lever I).
-    // Phase 0.2 pivot table gates on THIS measurement, not inner_loop_only.
+    // of `run_multi_cached_loop` — the marker-emitting bootstrap decode
+    // rate.
     group.bench_function("bootstrap_path", |b| {
         b.iter(|| {
             for block_data in &corpus {
