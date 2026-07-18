@@ -36,6 +36,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # `.cargo/config.toml` pins `target-cpu=native` for local perf work. The build
+  # job's artifact is re-run on separate benchmark runners, so native codegen
+  # SIGILLs (exit 132) on any older CPU. Build portable — this also matches how
+  # gzippy actually ships (release.yml builds generic), keeping the comparison
+  # honest; runtime BMI2/AVX2 dispatch + ISA-L multibinary still pick fast paths.
+  # Must be RUSTFLAGS, not CARGO_BUILD_RUSTFLAGS: cargo ignores an empty
+  # CARGO_BUILD_* var (falls back to config's build.rustflags), while a
+  # defined-but-empty RUSTFLAGS clears it (verified on cargo 1.97).
+  RUSTFLAGS: ""
 
 jobs:
   # ============================================================================
