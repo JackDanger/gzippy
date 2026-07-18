@@ -72,6 +72,12 @@ path = "src/main.rs"
 # behind dev/test code as differential oracles.)
 default = ["pure-rust-inflate"]
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
+# Measurement routing for the pure-Rust DEFLATE encoder (src/compress/deflate).
+# When ON, T1 compression at levels 2-9 routes through the new pure-Rust
+# greedy/lazy encoder (`deflate::compress_gzip`) instead of the production
+# libdeflate/flate2 backends. Compile-time only (no env var); the default build
+# (feature OFF) keeps production routing byte-for-byte unchanged.
+pure-rust-encoder = []
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the

@@ -4,3 +4,4 @@
 //! binary-tree / hash-table finders come in later increments.
 
 pub mod common;
+pub mod hc;

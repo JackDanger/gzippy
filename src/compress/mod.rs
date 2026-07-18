@@ -54,6 +54,23 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     }
 
     if opt_config.thread_count == 1 && args.compression_level <= 9 {
+        // Measurement routing: pure-Rust DEFLATE encoder for T1 L2–L9.
+        // Compile-time gated (`pure-rust-encoder`); OFF in the default build.
+        #[cfg(feature = "pure-rust-encoder")]
+        if (2..=9).contains(&args.compression_level) && !args.huffman && !args.rle {
+            if args.verbosity >= 2 {
+                eprintln!("gzippy: using pure-Rust DEFLATE encoder (T1 L2–L9)");
+            }
+            let mut input = Vec::new();
+            reader.read_to_end(&mut input)?;
+            let bytes = input.len() as u64;
+            let gz = crate::compress::deflate::compress_gzip(&input, args.compression_level as u32);
+            let mut writer = writer;
+            writer.write_all(&gz)?;
+            writer.flush()?;
+            return Ok(bytes);
+        }
+
         // ISA-L: T1 L0–L3 on x86_64 with AVX2
         if args.compression_level <= 3
             && !args.huffman

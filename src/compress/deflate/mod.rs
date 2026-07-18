@@ -1,56 +1,45 @@
-//! Pure-Rust DEFLATE encoder — Increment 1 (foundation substrate).
+//! Pure-Rust DEFLATE encoder — Increment 2 (hash-chain matchfinder + parsers).
 //!
 //! This module is the entry point for a from-scratch, pure-Rust DEFLATE/gzip
 //! compressor whose structure transliterates libdeflate
-//! (`vendor/libdeflate/lib/deflate_compress.c`). Increment 1 lands the proven
+//! (`vendor/libdeflate/lib/deflate_compress.c`). Increment 1 landed the proven
 //! substrate — constant [`tables`], the word-oriented [`bitstream`], the
 //! length-limited canonical [`huffman`] builder + dynamic-block header, the
-//! [`block_split`] statistic, and the shared [`matchfinder`] primitives — all
-//! unit-tested, plus a **literals-only** engine wired end-to-end so the whole
-//! stack is exercised against three independent decoders.
+//! [`block_split`] statistic, and the shared [`matchfinder`] primitives.
 //!
-//! The literals-only engine performs NO match finding: every input byte is
-//! emitted as a literal in a DEFLATE **dynamic** Huffman block built from the
-//! literal frequencies (a valid, fully-decodable DEFLATE stream), with a stored
-//! block chosen when that is smaller (incompressible / tiny input). Real match
-//! finding, greedy/lazy/near-optimal parsing, and static blocks arrive in later
-//! increments.
+//! Increment 2 adds REAL compression: the hash-chains matchfinder
+//! ([`matchfinder::hc`], a port of `hc_matchfinder.h`), the level→params table
+//! ([`level`]), and the greedy / lazy / lazy2 [`parse`]rs (levels 2-9). Each
+//! block chooses the cheapest of a stored, static-Huffman, or dynamic-Huffman
+//! encoding of the parsed literal/back-reference token stream. Matches share a
+//! 32 KiB window across block boundaries, exactly as DEFLATE allows.
 //!
-//! NOT wired into production routing yet (see CLAUDE.md): this increment only
-//! adds the module tree + tests.
+//! Correctness is pinned by `src/tests/deflate_encoder_matches.rs`: byte-exact
+//! roundtrip through flate2, libdeflate (FFI), and system `gzip -d` for every
+//! implemented level, plus a proptest generator. Wired into production T1
+//! routing only under the `pure-rust-encoder` cargo feature (compile-time; the
+//! default build is unchanged).
 //!
-//! Several primitives (offset-slot lookup, static-code frequencies, the
-//! matchfinder hooks, block-splitting) are the substrate for later increments
-//! and are not yet called from the literals-only path, so `dead_code` is
-//! allowed module-wide for this increment.
+//! Some substrate primitives are used only by later increments (near-optimal
+//! parsing), so `dead_code` is allowed module-wide.
 #![allow(dead_code)]
 
 pub mod bitstream;
 pub mod block_split;
 pub mod huffman;
+pub mod level;
 pub mod matchfinder;
+pub mod parse;
 pub mod tables;
 
 use bitstream::BitWriter;
-use huffman::build_dynamic_header;
-use tables::{
-    DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN, DEFLATE_BLOCKTYPE_UNCOMPRESSED, DEFLATE_END_OF_BLOCK,
-    DEFLATE_NUM_LITLEN_SYMS, DEFLATE_NUM_OFFSET_SYMS, MAX_LITLEN_CODEWORD_LEN,
-    MAX_OFFSET_CODEWORD_LEN,
-};
-
-/// Maximum input bytes per logical block. Kept below `2^18` so per-symbol
-/// frequencies stay well under the `2^22` packing limit of the Huffman builder,
-/// and so long inputs are split into several independently-coded blocks.
-const BLOCK_CHUNK: usize = 1 << 18;
+use level::Strategy;
+use tables::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 
 /// Largest payload of a single stored (BTYPE=00) sub-block.
 const MAX_STORED_SUBBLOCK: usize = 65535;
 
-/// Compress `data` into a raw DEFLATE stream (no gzip/zlib framing).
-///
-/// `level` is accepted for API compatibility but ignored in this increment
-/// (the literals-only engine has no tunable parser yet).
+/// Compress `data` into a raw DEFLATE stream (no gzip/zlib framing) at `level`.
 pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 2 + 64);
     compress_block(data, &[], level, &mut out);
@@ -59,9 +48,11 @@ pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
 
 /// Compress `data` into a raw DEFLATE stream, appending to `out`.
 ///
-/// `dict` is a preset-dictionary hook for later increments; the literals-only
-/// engine emits no matches, so it is currently ignored.
-pub fn compress_block(data: &[u8], _dict: &[u8], _level: u32, out: &mut Vec<u8>) {
+/// `dict` is an optional preset-dictionary window: its bytes are seeded into the
+/// matchfinder so back-references in the coded output may point into it, but the
+/// dictionary itself is not emitted. The decoder must have the identical window
+/// preloaded. Pass `&[]` for no dictionary (the gzip/single-member case).
+pub fn compress_block(data: &[u8], dict: &[u8], level: u32, out: &mut Vec<u8>) {
     let mut bw = BitWriter::with_capacity(data.len() / 2 + 64);
 
     if data.is_empty() {
@@ -70,14 +61,25 @@ pub fn compress_block(data: &[u8], _dict: &[u8], _level: u32, out: &mut Vec<u8>)
         return;
     }
 
-    let mut off = 0usize;
-    while off < data.len() {
-        let end = (off + BLOCK_CHUNK).min(data.len());
-        let chunk = &data[off..end];
-        let is_final = end == data.len();
-        emit_best_block(&mut bw, chunk, is_final);
-        off = end;
+    let params = level::params(level);
+    if params.strategy == Strategy::Stored {
+        // Level 0: uncompressed blocks over the whole input.
+        emit_stored_block(&mut bw, data, true);
+        out.extend_from_slice(&bw.finish());
+        return;
     }
+
+    // Build a padded working buffer [dict | data | pad] so the matchfinder's
+    // speculative word loads always stay in bounds, and parse over the data
+    // region with the dictionary seeded ahead of it.
+    let dict_len = dict.len();
+    let in_end = dict_len + data.len();
+    let mut buf = Vec::with_capacity(in_end + parse::BUF_PAD);
+    buf.extend_from_slice(dict);
+    buf.extend_from_slice(data);
+    buf.resize(in_end + parse::BUF_PAD, 0);
+
+    parse::compress(&buf, dict_len, in_end, &params, &mut bw);
 
     out.extend_from_slice(&bw.finish());
 }
@@ -96,94 +98,6 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out
-}
-
-/// Choose the cheaper of a dynamic Huffman block and a stored block for this
-/// chunk, and emit it.
-fn emit_best_block(bw: &mut BitWriter, chunk: &[u8], is_final: bool) {
-    let plan = DynamicPlan::build(chunk);
-    let stored_bits = stored_block_bits(chunk.len());
-
-    if plan.total_bits() <= stored_bits {
-        plan.emit(bw, chunk, is_final);
-    } else {
-        emit_stored_block(bw, chunk, is_final);
-    }
-}
-
-/// A prepared dynamic Huffman block: the litlen/offset codes, the header, and
-/// the precomputed encoded-data bit cost.
-struct DynamicPlan {
-    litcode: huffman::HuffmanCode,
-    header: huffman::DynamicHeader,
-    data_bits: u64,
-}
-
-impl DynamicPlan {
-    fn build(chunk: &[u8]) -> DynamicPlan {
-        let mut litlen_freqs = vec![0u32; DEFLATE_NUM_LITLEN_SYMS];
-        litlen_freqs[DEFLATE_END_OF_BLOCK] = 1; // end-of-block symbol
-        for &b in chunk {
-            litlen_freqs[b as usize] += 1;
-        }
-        // Literals-only: no offset symbols are used.
-        let offset_freqs = vec![0u32; DEFLATE_NUM_OFFSET_SYMS];
-
-        let litcode = huffman::make_huffman_code(
-            DEFLATE_NUM_LITLEN_SYMS,
-            MAX_LITLEN_CODEWORD_LEN,
-            &litlen_freqs,
-        );
-        let offcode = huffman::make_huffman_code(
-            DEFLATE_NUM_OFFSET_SYMS,
-            MAX_OFFSET_CODEWORD_LEN,
-            &offset_freqs,
-        );
-
-        let header = build_dynamic_header(&litcode.lens, &offcode.lens);
-
-        // Bits for the coded literals + the EOB symbol.
-        let mut data_bits: u64 = 0;
-        for &b in chunk {
-            data_bits += litcode.lens[b as usize] as u64;
-        }
-        data_bits += litcode.lens[DEFLATE_END_OF_BLOCK] as u64;
-
-        DynamicPlan {
-            litcode,
-            header,
-            data_bits,
-        }
-    }
-
-    /// Total bits: 3 (BFINAL+BTYPE) + header + coded data.
-    fn total_bits(&self) -> u64 {
-        3 + self.header.header_bits() + self.data_bits
-    }
-
-    fn emit(&self, bw: &mut BitWriter, chunk: &[u8], is_final: bool) {
-        bw.add_bits(is_final as u64, 1);
-        bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
-        self.header.emit(bw);
-        for &b in chunk {
-            bw.add_bits(
-                self.litcode.codewords[b as usize] as u64,
-                self.litcode.lens[b as usize] as u32,
-            );
-        }
-        bw.add_bits(
-            self.litcode.codewords[DEFLATE_END_OF_BLOCK] as u64,
-            self.litcode.lens[DEFLATE_END_OF_BLOCK] as u32,
-        );
-    }
-}
-
-/// Approximate bit cost of storing `len` bytes as stored (BTYPE=00) sub-blocks.
-fn stored_block_bits(len: usize) -> u64 {
-    let subblocks = (len / MAX_STORED_SUBBLOCK) + 1;
-    // Per sub-block: 3 header bits + up to 7 pad + 32 bits LEN/NLEN, then the
-    // raw bytes. Rounded to whole bytes.
-    (8 * (len + 5 * subblocks)) as u64
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
@@ -214,4 +128,51 @@ fn write_stored_subblock(bw: &mut BitWriter, sub: &[u8], bfinal: bool) {
     bw.write_u16_le(len);
     bw.write_u16_le(!len);
     bw.write_aligned_bytes(sub);
+}
+
+#[cfg(test)]
+mod dict_tests {
+    use super::*;
+
+    /// An empty preset dictionary must yield byte-identical output to the
+    /// no-dictionary path (regression guard on the seeding wiring).
+    #[test]
+    fn empty_dict_equals_no_dict() {
+        let data: Vec<u8> = b"the pure-rust deflate encoder must roundtrip. ".repeat(400);
+        for level in [2u32, 6, 9] {
+            let mut with_empty = Vec::new();
+            compress_block(&data, &[], level, &mut with_empty);
+            let no_dict = compress_oneshot(&data, level);
+            assert_eq!(with_empty, no_dict, "empty dict diverged at L{level}");
+        }
+    }
+
+    /// A dictionary whose bytes appear in the data must let the parser reference
+    /// it, producing a strictly smaller stream than compressing without it.
+    /// This exercises the `skip_bytes` dictionary-seeding path (matches point
+    /// back into `buf[..data_start]`).
+    #[test]
+    fn matching_dict_shrinks_output() {
+        // Data begins with content that only exists in the dictionary, so the
+        // opening bytes can only be coded as matches into the seeded window.
+        let dict: Vec<u8> =
+            b"PRESET-DICTIONARY-CONTENT-abcdefghijklmnopqrstuvwxyz-0123456789-".repeat(30);
+        let data: Vec<u8> = {
+            let mut d = dict.clone(); // fully present in the dictionary window
+            d.extend_from_slice(b" and then some novel trailing text to code as literals.");
+            d
+        };
+        for level in [4u32, 6, 9] {
+            let with_dict = {
+                let mut v = Vec::new();
+                compress_block(&data, &dict, level, &mut v);
+                v.len()
+            };
+            let without = compress_oneshot(&data, level).len();
+            assert!(
+                with_dict < without,
+                "L{level}: dict-seeded {with_dict} not smaller than no-dict {without}",
+            );
+        }
+    }
 }
