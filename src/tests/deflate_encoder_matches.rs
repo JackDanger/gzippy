@@ -348,4 +348,115 @@ mod tests {
             prop_assert_eq!(decoded, input);
         }
     }
+
+    // ======================================================================
+    // Increment 3 — near-optimal parser (L10-12) correctness net.
+    // ======================================================================
+
+    /// The near-optimal levels: bt matchfinder + iterative min-cost-path DP.
+    const NEAR_LEVELS: [u32; 3] = [10, 11, 12];
+
+    /// libdeflate raw-DEFLATE size at `level` (the ratio oracle).
+    fn libdeflate_deflate_size(data: &[u8], level: i32) -> usize {
+        let lvl = libdeflater::CompressionLvl::new(level).expect("valid level");
+        let mut c = libdeflater::Compressor::new(lvl);
+        let bound = c.deflate_compress_bound(data.len());
+        let mut out = vec![0u8; bound];
+        c.deflate_compress(data, &mut out)
+            .expect("libdeflate compress")
+    }
+
+    /// Roundtrip a deep near-optimal stream through all three oracles. Uses a
+    /// silesia slice of at least 2×SOFT_MAX_BLOCK_LENGTH so the driver spans
+    /// multiple blocks AND exercises the rewind-on-split path.
+    #[test]
+    fn near_optimal_deep_roundtrip_three_oracles() {
+        // 2 * SOFT_MAX_BLOCK_LENGTH = 600_000; take a bit more so a real split
+        // and rewind occur.
+        let Some(data) = silesia_slice(700_000) else {
+            eprintln!("note: silesia.tar missing; skipped near-optimal deep roundtrip");
+            return;
+        };
+        for &level in &NEAR_LEVELS {
+            let n = assert_roundtrips_level(&data, "silesia-700k-near-optimal", level);
+            // Confirm all present oracles actually ran (never a silent skip).
+            let expected = if gzip_available() { 3 } else { 2 };
+            assert_eq!(n, expected, "L{level}: an oracle was skipped");
+        }
+    }
+
+    /// Smaller near-optimal roundtrips exercising the adversarial corners.
+    #[test]
+    fn near_optimal_roundtrip_adversarial() {
+        for &level in &NEAR_LEVELS {
+            assert_roundtrips_level(b"", "empty", level);
+            assert_roundtrips_level(b"a", "one-byte", level);
+            assert_roundtrips_level(b"abcabcabc", "tiny-repeat", level);
+            // Highly redundant: exercises the long-match-skip path.
+            assert_roundtrips_level(&vec![b'Q'; 400_000], "all-same-400k", level);
+            let block: Vec<u8> = (0..137u32).map(|i| (i * 13) as u8).collect();
+            let repeated: Vec<u8> = block.iter().cloned().cycle().take(650_000).collect();
+            assert_roundtrips_level(&repeated, "block137-repeat-650k", level);
+            // Incompressible: exercises the only-literals / stored path.
+            let mut incompressible = vec![0u8; 90_000];
+            Rng::new(0xBADCAFE).fill(&mut incompressible);
+            assert_roundtrips_level(&incompressible, "incompressible-90k", level);
+            // Window-straddling distant repeat.
+            let pattern: Vec<u8> = (0..500u32)
+                .map(|i| (i.wrapping_mul(151) ^ 0x33) as u8)
+                .collect();
+            let mut d = pattern.clone();
+            d.resize(d.len() + 33_000, 0u8);
+            d.extend_from_slice(&pattern);
+            assert_roundtrips_level(&d, "window-straddle", level);
+        }
+    }
+
+    /// THE coverage proof: the near-optimal L12 output must reach the
+    /// compression CEILING — strictly smaller than libdeflate L9 AND within
+    /// 0.1% of libdeflate L12 — on a silesia slice. A correct-but-too-big DP
+    /// (wrong cost model / lost matches) roundtrips fine but FAILS here.
+    #[test]
+    fn near_optimal_reaches_ratio_ceiling() {
+        let Some(data) = silesia_slice(4_000_000) else {
+            eprintln!("note: silesia.tar missing; skipped ratio-ceiling assertion");
+            return;
+        };
+        let ours_l12 = compress_oneshot(&data, 12).len();
+        let libdeflate_l9 = libdeflate_deflate_size(&data, 9);
+        let libdeflate_l12 = libdeflate_deflate_size(&data, 12);
+
+        eprintln!(
+            "ratio ceiling (silesia 4 MiB): ours_L12={ours_l12} \
+             libdeflate_L9={libdeflate_l9} libdeflate_L12={libdeflate_l12} \
+             (ours/L9={:.4}, ours/L12={:.4})",
+            ours_l12 as f64 / libdeflate_l9 as f64,
+            ours_l12 as f64 / libdeflate_l12 as f64,
+        );
+
+        // (1) Beats libdeflate L9 — the ceiling gzippy could not previously reach.
+        assert!(
+            ours_l12 < libdeflate_l9,
+            "L12 near-optimal {ours_l12} not smaller than libdeflate L9 {libdeflate_l9}"
+        );
+        // (2) Matches libdeflate L12 to within 0.1%.
+        let bound = (libdeflate_l12 as f64 * 1.001) as usize;
+        assert!(
+            ours_l12 <= bound,
+            "L12 near-optimal {ours_l12} exceeds libdeflate L12 {libdeflate_l12} by >0.1% (bound {bound})"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 96, max_shrink_iters: 3000, ..ProptestConfig::default() })]
+
+        /// Roundtrip near-optimal output over the adversarial generator. Fewer
+        /// cases than the L2-9 proptest because the DP is heavier.
+        #[test]
+        fn prop_near_optimal_roundtrip_flate2(input in adversarial_bytes(), level in 10u32..=12u32) {
+            let gz = compress_gzip(&input, level);
+            let decoded = decode_flate2(&gz);
+            prop_assert_eq!(decoded, input);
+        }
+    }
 }

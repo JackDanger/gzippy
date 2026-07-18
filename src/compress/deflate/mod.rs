@@ -26,6 +26,7 @@
 
 pub mod bitstream;
 pub mod block_split;
+pub mod costs;
 pub mod huffman;
 pub mod level;
 pub mod matchfinder;

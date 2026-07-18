@@ -30,6 +30,7 @@ use super::tables::{
 
 mod greedy;
 mod lazy;
+mod near_optimal;
 
 /// Number of trailing pad bytes appended to the matchfinder's working buffer so
 /// its speculative 4-byte / 8-byte loads never read out of bounds.
@@ -158,6 +159,7 @@ pub(super) fn compress(
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw),
         Strategy::Lazy => lazy::run(buf, data_start, in_end, params, &statics, bw, false),
         Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true),
+        Strategy::NearOptimal => near_optimal::run(buf, data_start, in_end, params, &statics, bw),
         Strategy::Stored => unreachable!("stored strategy is handled by the caller"),
     }
 }
@@ -203,7 +205,7 @@ fn continue_block(
 // ---- minimum-match-length heuristics ----
 
 /// `choose_min_match_len`.
-fn choose_min_match_len(num_used_literals: u32, max_search_depth: u32) -> u32 {
+pub(crate) fn choose_min_match_len(num_used_literals: u32, max_search_depth: u32) -> u32 {
     // map from num_used_literals to min_len (`min_lens[]`, the rest is 3).
     const MIN_LENS: [u8; 80] = [
         9, 9, 9, 9, 9, 9, 8, 8, 7, 7, 6, 6, 6, 6, 6, 6, //

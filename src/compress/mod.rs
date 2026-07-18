@@ -35,6 +35,29 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     opt_config: &OptimizationConfig,
     header_info: &GzipHeaderInfo,
 ) -> GzippyResult<u64> {
+    // Measurement routing: pure-Rust near-optimal DEFLATE encoder for T1 L10–L12.
+    // Compile-time gated (`pure-rust-encoder`); OFF in the default build. Placed
+    // before the zopfli fast-path so that, with the feature on, L11 exercises the
+    // near-optimal engine rather than zopfli.
+    #[cfg(feature = "pure-rust-encoder")]
+    if opt_config.thread_count == 1
+        && (10..=12).contains(&args.compression_level)
+        && !args.huffman
+        && !args.rle
+    {
+        if args.verbosity >= 2 {
+            eprintln!("gzippy: using pure-Rust near-optimal DEFLATE encoder (T1 L10–L12)");
+        }
+        let mut input = Vec::new();
+        reader.read_to_end(&mut input)?;
+        let bytes = input.len() as u64;
+        let gz = crate::compress::deflate::compress_gzip(&input, args.compression_level as u32);
+        let mut writer = writer;
+        writer.write_all(&gz)?;
+        writer.flush()?;
+        return Ok(bytes);
+    }
+
     // Zopfli path: L11 or any zopfli tuning flag triggers true zopfli
     if args.use_zopfli() {
         if args.verbosity >= 2 {

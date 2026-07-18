@@ -5,11 +5,10 @@
 //! ~:3920-4005). Each level selects a PARSE STRATEGY plus the two tuning knobs
 //! the greedy/lazy parsers consume: `max_search_depth` and `nice_match_length`.
 //!
-//! Increment 2 implements the greedy (L2-4) and lazy/lazy2 (L5-9) strategies.
-//! Levels whose native strategy is not yet built fall back to the closest
-//! implemented one with an explicit TODO:
+//! Increment 2 implements the greedy (L2-4) and lazy/lazy2 (L5-9) strategies;
+//! Increment 3 adds the near-optimal (L10-12) strategy. The one remaining
+//! fallback:
 //!   * L1  (`deflate_compress_fastest`, ht_matchfinder) → **greedy** (TODO Inc4).
-//!   * L10-12 (`deflate_compress_near_optimal`)         → **lazy2** (TODO Inc3).
 //! L0 stays a pure stored-block passthrough.
 
 use super::tables::DEFLATE_MAX_MATCH_LEN;
@@ -25,6 +24,23 @@ pub enum Strategy {
     Lazy,
     /// Lazy2 parse: look ahead two positions.
     Lazy2,
+    /// Near-optimal parse: bt matchfinder + iterative min-cost-path DP (L10-12).
+    NearOptimal,
+}
+
+/// Extra knobs for the near-optimal parser (`deflate_compress_near_optimal`).
+#[derive(Clone, Copy, Debug)]
+pub struct NearOptimalParams {
+    /// `max_optim_passes` — max min-cost-path passes per block.
+    pub max_optim_passes: u32,
+    /// `min_improvement_to_continue` — stop passes early below this bit gain.
+    pub min_improvement_to_continue: u32,
+    /// `min_bits_to_use_nonfinal_path` — recover a prior pass's path if the
+    /// final pass regressed by at least this many bits.
+    pub min_bits_to_use_nonfinal_path: u32,
+    /// `max_len_to_optimize_static_block` — block length below which to also
+    /// optimize a static-Huffman solution.
+    pub max_len_to_optimize_static_block: u32,
 }
 
 /// The parser parameters for a compression level.
@@ -35,6 +51,8 @@ pub struct LevelParams {
     pub max_search_depth: u32,
     /// Stop searching once a match this long is found (`c->nice_match_length`).
     pub nice_match_length: u32,
+    /// Near-optimal-only knobs (meaningful iff `strategy == NearOptimal`).
+    pub near_optimal: NearOptimalParams,
 }
 
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
@@ -44,11 +62,19 @@ pub struct LevelParams {
 /// strategies not yet implemented in this increment (see the module docs).
 pub fn params(level: u32) -> LevelParams {
     let max_match = DEFLATE_MAX_MATCH_LEN;
+    // Placeholder near-optimal knobs for the non-near-optimal levels (unused).
+    const NONE_NO: NearOptimalParams = NearOptimalParams {
+        max_optim_passes: 0,
+        min_improvement_to_continue: 0,
+        min_bits_to_use_nonfinal_path: 0,
+        max_len_to_optimize_static_block: 0,
+    };
     match level {
         0 => LevelParams {
             strategy: Strategy::Stored,
             max_search_depth: 0,
             nice_match_length: 32,
+            near_optimal: NONE_NO,
         },
         // TODO(Increment 4): native L1 is `deflate_compress_fastest`
         // (ht_matchfinder, fixed-length blocks). Until it exists, route L1
@@ -57,66 +83,100 @@ pub fn params(level: u32) -> LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 32,
+            near_optimal: NONE_NO,
         },
         2 => LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 10,
+            near_optimal: NONE_NO,
         },
         3 => LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 12,
             nice_match_length: 14,
+            near_optimal: NONE_NO,
         },
         4 => LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 16,
             nice_match_length: 30,
+            near_optimal: NONE_NO,
         },
         5 => LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 16,
             nice_match_length: 30,
+            near_optimal: NONE_NO,
         },
         6 => LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 35,
             nice_match_length: 65,
+            near_optimal: NONE_NO,
         },
         7 => LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 100,
             nice_match_length: 130,
+            near_optimal: NONE_NO,
         },
         8 => LevelParams {
             strategy: Strategy::Lazy2,
             max_search_depth: 300,
             nice_match_length: max_match,
+            near_optimal: NONE_NO,
         },
         9 => LevelParams {
             strategy: Strategy::Lazy2,
             max_search_depth: 600,
             nice_match_length: max_match,
+            near_optimal: NONE_NO,
         },
-        // TODO(Increment 3): native L10-12 is `deflate_compress_near_optimal`
-        // (cost-model minimum-cost parse). Until it exists, route L10-12
-        // through lazy2 with the vendor near-optimal search knobs.
+        // Native near-optimal parser (`deflate_compress_near_optimal`,
+        // deflate_compress.c:3974-4004).
         10 => LevelParams {
-            strategy: Strategy::Lazy2,
+            strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 75,
+            near_optimal: NearOptimalParams {
+                max_optim_passes: 2,
+                min_improvement_to_continue: 32,
+                min_bits_to_use_nonfinal_path: 32,
+                max_len_to_optimize_static_block: 0,
+            },
         },
         11 => LevelParams {
-            strategy: Strategy::Lazy2,
+            strategy: Strategy::NearOptimal,
             max_search_depth: 100,
             nice_match_length: 150,
+            near_optimal: NearOptimalParams {
+                max_optim_passes: 4,
+                min_improvement_to_continue: 16,
+                min_bits_to_use_nonfinal_path: 16,
+                max_len_to_optimize_static_block: 1000,
+            },
         },
         _ => LevelParams {
-            strategy: Strategy::Lazy2,
+            strategy: Strategy::NearOptimal,
             max_search_depth: 300,
             nice_match_length: max_match,
+            near_optimal: NearOptimalParams {
+                max_optim_passes: 10,
+                min_improvement_to_continue: 1,
+                min_bits_to_use_nonfinal_path: 1,
+                max_len_to_optimize_static_block: 10000,
+            },
         },
     }
+}
+
+/// `max_passthrough_size` (`deflate_compress.c:3918`): inputs at or below this
+/// size are emitted as a stored block without running the parser. `55 - 4*level`
+/// for the near-optimal levels (negative/overflow clamps to 0 for lower levels
+/// which are handled by their own passthrough).
+pub fn max_passthrough_size(level: u32) -> usize {
+    (55i64 - 4 * level as i64).max(0) as usize
 }
 
 #[cfg(test)]
@@ -137,7 +197,7 @@ mod tests {
             assert_eq!(params(l).strategy, Strategy::Lazy2, "level {l}");
         }
         for l in 10..=12 {
-            assert_eq!(params(l).strategy, Strategy::Lazy2, "level {l} fallback");
+            assert_eq!(params(l).strategy, Strategy::NearOptimal, "level {l}");
         }
     }
 
@@ -147,5 +207,25 @@ mod tests {
         assert_eq!(params(6).nice_match_length, 65);
         assert_eq!(params(9).max_search_depth, 600);
         assert_eq!(params(9).nice_match_length, DEFLATE_MAX_MATCH_LEN);
+    }
+
+    #[test]
+    fn near_optimal_knob_values() {
+        let l10 = params(10);
+        assert_eq!(l10.max_search_depth, 35);
+        assert_eq!(l10.nice_match_length, 75);
+        assert_eq!(l10.near_optimal.max_optim_passes, 2);
+        assert_eq!(l10.near_optimal.min_improvement_to_continue, 32);
+        assert_eq!(l10.near_optimal.max_len_to_optimize_static_block, 0);
+
+        let l12 = params(12);
+        assert_eq!(l12.max_search_depth, 300);
+        assert_eq!(l12.nice_match_length, DEFLATE_MAX_MATCH_LEN);
+        assert_eq!(l12.near_optimal.max_optim_passes, 10);
+        assert_eq!(l12.near_optimal.min_improvement_to_continue, 1);
+        assert_eq!(l12.near_optimal.max_len_to_optimize_static_block, 10000);
+
+        assert_eq!(max_passthrough_size(10), 15);
+        assert_eq!(max_passthrough_size(12), 7);
     }
 }

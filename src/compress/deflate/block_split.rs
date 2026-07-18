@@ -66,8 +66,28 @@ impl BlockSplitStats {
         self.num_new_observations += 1;
     }
 
+    /// Running (merged) observation counts, for the cross-block cost blend.
+    #[inline]
+    pub fn observations(&self) -> &[u32; NUM_OBSERVATION_TYPES] {
+        &self.observations
+    }
+
+    /// Number of merged observations.
+    #[inline]
+    pub fn num_observations(&self) -> u32 {
+        self.num_observations
+    }
+
+    /// Zero the running (merged) observations, keeping the not-yet-merged
+    /// `new_observations` (`deflate_near_optimal_clear_old_stats`, obs part).
+    #[inline]
+    pub fn clear_old_observations(&mut self) {
+        self.observations = [0; NUM_OBSERVATION_TYPES];
+        self.num_observations = 0;
+    }
+
     /// `merge_new_observations`: fold the recent window into the running totals.
-    fn merge_new_observations(&mut self) {
+    pub fn merge_new_observations(&mut self) {
         for i in 0..NUM_OBSERVATION_TYPES {
             self.observations[i] += self.new_observations[i];
             self.new_observations[i] = 0;
