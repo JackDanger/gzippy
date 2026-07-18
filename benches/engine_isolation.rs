@@ -41,7 +41,7 @@ mod bench {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
     use gzippy::decompress::parallel::lut_huffman::MAX_LIT_LEN_SYM;
     use gzippy::decompress::parallel::lut_huffman::{
-        LutDistCode, LutLitLenCode, ISAL_DECODE_LONG_BITS, LARGE_FLAG_BIT, LARGE_SHORT_SYM_MASK,
+        LutDistCode, LutLitLenCode, ISAL_DECODE_LONG_BITS, LARGE_SHORT_SYM_MASK,
         LARGE_SYM_COUNT_MASK, LARGE_SYM_COUNT_OFFSET,
     };
     use gzippy::decompress::parallel::marker_inflate::{
@@ -1229,8 +1229,6 @@ mod bench {
             };
             let short_tbl = litlen.table.short_code_lookup.as_ptr();
 
-            let mut at_eob = false;
-
             // ── INLINE-ASM hot loop, RE-ENTERED after every back-ref ──────────
             // The asm fast loop runs the literal-dominant run; on a length code it
             // exits (code 0), Rust resolves ONLY that one back-ref (dist decode +
@@ -1403,7 +1401,6 @@ mod bench {
                     // (b) the last element is the length/EOB code.
                     let last = (s & 0xFFFF) as u16;
                     if last == END_OF_BLOCK_SYMBOL {
-                        at_eob = true;
                         break 'asm_reentry;
                     } else if (last as u32) > MAX_LIT_LEN_SYM {
                         return out[base..out_pos.min(target_end)].to_vec();
@@ -1456,7 +1453,6 @@ mod bench {
                             continue 'asm_reentry;
                         }
                         OneSym::Eob => {
-                            at_eob = true;
                             break 'asm_reentry;
                         }
                         OneSym::Bail => return out[base..out_pos.min(target_end)].to_vec(),
@@ -1743,7 +1739,7 @@ mod bench {
         let r_iii_i = median_chunk_idx
             .map(|i| results[i].r_iii_i)
             .unwrap_or(results[0].r_iii_i);
-        let selftest = r_iii_i >= 2.5 && r_iii_i <= 3.6;
+        let selftest = (2.5..=3.6).contains(&r_iii_i);
         println!(
             "\nSHA_ALL_EQUAL={}  SELFTEST={}  (median-chunk iii/i={:.3})",
             sha_all,
