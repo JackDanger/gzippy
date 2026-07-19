@@ -153,15 +153,20 @@ pub(super) fn compress(
     data_start: usize,
     in_end: usize,
     params: &LevelParams,
+    is_last: bool,
     bw: &mut BitWriter,
 ) {
     let statics = StaticCodes::build();
     match params.strategy {
-        Strategy::Fast => fast::run(buf, data_start, in_end, &statics, bw),
-        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw),
-        Strategy::Lazy => lazy::run(buf, data_start, in_end, params, &statics, bw, false),
-        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true),
-        Strategy::NearOptimal => near_optimal::run(buf, data_start, in_end, params, &statics, bw),
+        Strategy::Fast => fast::run(buf, data_start, in_end, &statics, bw, is_last),
+        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw, is_last),
+        Strategy::Lazy => lazy::run(
+            buf, data_start, in_end, params, &statics, bw, false, is_last,
+        ),
+        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true, is_last),
+        Strategy::NearOptimal => {
+            near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
+        }
         Strategy::Stored => unreachable!("stored strategy is handled by the caller"),
     }
 }

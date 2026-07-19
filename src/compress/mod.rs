@@ -210,6 +210,36 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
         return Ok(bytes);
     }
 
+    // Multi-threaded pure-Rust DEFLATE encoder (Increment 6). Compile-time
+    // gated (`pure-rust-encoder`); OFF in the default build. Sits ALONGSIDE the
+    // default SimpleOptimizer path below (Inc7 flips the default). Produces a
+    // single-member STANDARD gzip stream (header + concatenated per-chunk
+    // DEFLATE with sync-flush seams + combined CRC/ISIZE) via
+    // `PipelinedGzEncoder::compress_buffer_pure`. NOT the "GZ" multiblock format.
+    #[cfg(feature = "pure-rust-encoder")]
+    if opt_config.thread_count > 1
+        && (1..=12).contains(&args.compression_level)
+        && !args.huffman
+        && !args.rle
+    {
+        if args.verbosity >= 2 {
+            eprintln!(
+                "gzippy: using pure-Rust parallel DEFLATE encoder ({} threads)",
+                opt_config.thread_count,
+            );
+        }
+        let mut input = Vec::new();
+        reader.read_to_end(&mut input)?;
+        let bytes = input.len() as u64;
+        let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+            args.compression_level as u32,
+            opt_config.thread_count,
+        );
+        encoder.set_header_info(header_info.clone());
+        encoder.compress_buffer_pure(&input, writer)?;
+        return Ok(bytes);
+    }
+
     // Multi-threaded: SimpleOptimizer dispatches to ParallelGzEncoder or PipelinedGzEncoder
     if args.verbosity >= 2 {
         eprintln!(

@@ -382,6 +382,7 @@ pub(super) fn run(
     params: &LevelParams,
     statics: &StaticCodes,
     bw: &mut BitWriter,
+    is_last: bool,
 ) {
     let mut opt = Box::new(Optimizer::new());
     let mut bt_mf = BtMatchfinder::new();
@@ -606,7 +607,10 @@ pub(super) fn run(
         } else {
             let block_length = in_next - in_block_begin;
             let is_first = in_block_begin == data_start;
-            let is_final = in_next == in_end;
+            // BFINAL only on the last internal block AND only if this is the
+            // last chunk of the stream; a non-final chunk closes with the
+            // caller-appended sync-flush marker instead.
+            let is_final = is_last && in_next == in_end;
 
             merge_stats(
                 &mut split_stats,

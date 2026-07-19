@@ -54,33 +54,71 @@ pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
 /// dictionary itself is not emitted. The decoder must have the identical window
 /// preloaded. Pass `&[]` for no dictionary (the gzip/single-member case).
 pub fn compress_block(data: &[u8], dict: &[u8], level: u32, out: &mut Vec<u8>) {
+    // A standalone single final block: BFINAL is set on the last internal
+    // block and no sync-flush marker is appended. `bw.finish()` byte-aligns
+    // the tail. This is the T1 / single-member framing.
+    compress_block_streaming(data, dict, level, true, out);
+}
+
+/// Compress `data` into a raw DEFLATE stream for use as ONE CHUNK of a larger
+/// concatenated single-member stream, appending to `out`.
+///
+/// Identical to [`compress_block`] except for the stream-position semantics
+/// controlled by `is_last`:
+///
+/// * `is_last == true` — this chunk closes the stream. The last internal block
+///   carries `BFINAL=1` and NOTHING is appended after it; `bw.finish()`
+///   byte-aligns the tail. With an empty `dict` this is byte-identical to
+///   [`compress_block`] (the single-member case).
+/// * `is_last == false` — this chunk is followed by more chunks. Every internal
+///   block (including the last) stays `BFINAL=0`, and a byte-aligned empty
+///   stored block — the standard `Z_SYNC_FLUSH` marker
+///   `[BFINAL=0][BTYPE=00][align][LEN=0000][NLEN=FFFF]` — is appended so the
+///   chunk ends on a clean, byte-aligned block boundary.
+///
+/// The sync-flush suffix is the load-bearing correctness detail: independently
+/// compressed chunks concatenate into ONE valid single-member DEFLATE stream
+/// only when every non-final chunk ends byte-aligned, so a decoder reads chunk
+/// N's tail and then chunk N+1's header with no stray bits between them. Each
+/// chunk's back-references may point into `dict` (the preceding window, seeded
+/// into the matchfinder but not emitted), which the decoder already holds as
+/// the tail of the output decoded so far.
+pub fn compress_block_streaming(
+    data: &[u8],
+    dict: &[u8],
+    level: u32,
+    is_last: bool,
+    out: &mut Vec<u8>,
+) {
     let mut bw = BitWriter::with_capacity(data.len() / 2 + 64);
 
     if data.is_empty() {
-        emit_stored_block(&mut bw, &[], true);
-        out.extend_from_slice(&bw.finish());
-        return;
+        emit_stored_block(&mut bw, &[], is_last);
+    } else {
+        let params = level::params(level);
+        if params.strategy == Strategy::Stored {
+            // Level 0: uncompressed blocks over the whole input.
+            emit_stored_block(&mut bw, data, is_last);
+        } else {
+            // Build a padded working buffer [dict | data | pad] so the
+            // matchfinder's speculative word loads always stay in bounds, and
+            // parse over the data region with the dictionary seeded ahead of it.
+            let dict_len = dict.len();
+            let in_end = dict_len + data.len();
+            let mut buf = Vec::with_capacity(in_end + parse::BUF_PAD);
+            buf.extend_from_slice(dict);
+            buf.extend_from_slice(data);
+            buf.resize(in_end + parse::BUF_PAD, 0);
+
+            parse::compress(&buf, dict_len, in_end, &params, is_last, &mut bw);
+        }
     }
 
-    let params = level::params(level);
-    if params.strategy == Strategy::Stored {
-        // Level 0: uncompressed blocks over the whole input.
-        emit_stored_block(&mut bw, data, true);
-        out.extend_from_slice(&bw.finish());
-        return;
+    // Non-final chunk: close on a clean byte boundary with a sync-flush marker
+    // so the next chunk's stream concatenates without stray bits.
+    if !is_last {
+        emit_stored_block(&mut bw, &[], false);
     }
-
-    // Build a padded working buffer [dict | data | pad] so the matchfinder's
-    // speculative word loads always stay in bounds, and parse over the data
-    // region with the dictionary seeded ahead of it.
-    let dict_len = dict.len();
-    let in_end = dict_len + data.len();
-    let mut buf = Vec::with_capacity(in_end + parse::BUF_PAD);
-    buf.extend_from_slice(dict);
-    buf.extend_from_slice(data);
-    buf.resize(in_end + parse::BUF_PAD, 0);
-
-    parse::compress(&buf, dict_len, in_end, &params, &mut bw);
 
     out.extend_from_slice(&bw.finish());
 }
@@ -129,6 +167,127 @@ fn write_stored_subblock(bw: &mut BitWriter, sub: &[u8], bfinal: bool) {
     bw.write_u16_le(len);
     bw.write_u16_le(!len);
     bw.write_aligned_bytes(sub);
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    /// Deterministic mixed text+binary corpus of `len` bytes.
+    fn mixed_corpus(len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        let phrases: [&[u8]; 4] = [
+            b"the quick brown fox jumps over the lazy dog; ",
+            b"DEFLATE back-references span chunk boundaries. ",
+            b"lorem ipsum dolor sit amet consectetur adipiscing; ",
+            b"0123456789abcdef repeated structure repeated structure ",
+        ];
+        let mut i = 0usize;
+        while v.len() < len {
+            v.extend_from_slice(phrases[i % phrases.len()]);
+            // Sprinkle pseudo-random binary bytes so blocks aren't trivially RLE.
+            let x = (i.wrapping_mul(2654435761)) as u32;
+            v.extend_from_slice(&x.to_le_bytes());
+            i += 1;
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// Wrap a raw DEFLATE stream in minimal gzip framing over `original`.
+    fn wrap_gzip(deflate: &[u8], original: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(deflate.len() + 18);
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+        out.extend_from_slice(deflate);
+        out.extend_from_slice(&crc32fast::hash(original).to_le_bytes());
+        out.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        out
+    }
+
+    fn decode_flate2(gz: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(gz)
+            .read_to_end(&mut out)
+            .expect("flate2 failed to decode concatenated stream");
+        out
+    }
+
+    /// `gzip -dc` decode; `None` only when no `gzip` binary is on PATH.
+    fn decode_system_gzip(gz: &[u8]) -> Option<Vec<u8>> {
+        let mut child = Command::new("gzip")
+            .arg("-dc")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let buf = gz.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&buf);
+        });
+        let mut out = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+        writer.join().unwrap();
+        assert!(child.wait().unwrap().success(), "gzip -dc exited non-zero");
+        Some(out)
+    }
+
+    /// Three independently-compressed chunks (chunk k seeds the previous chunk's
+    /// 32 KiB tail as its dictionary; only the last is `is_last`) concatenate
+    /// into ONE valid single-member gzip stream that decodes byte-exact.
+    #[test]
+    fn three_chunks_concatenate_and_roundtrip() {
+        let input = mixed_corpus(300_003);
+        let n = input.len();
+        let bounds = [0usize, n / 3, 2 * n / 3, n];
+
+        for level in [1u32, 6, 9, 12] {
+            let mut deflate = Vec::new();
+            for c in 0..3 {
+                let start = bounds[c];
+                let end = bounds[c + 1];
+                let dict_start = start.saturating_sub(32 * 1024);
+                let dict = &input[dict_start..start];
+                let is_last = c == 2;
+                compress_block_streaming(&input[start..end], dict, level, is_last, &mut deflate);
+            }
+            let gz = wrap_gzip(&deflate, &input);
+
+            assert_eq!(
+                decode_flate2(&gz),
+                input,
+                "flate2 roundtrip mismatch at L{level}"
+            );
+            if let Some(sys) = decode_system_gzip(&gz) {
+                assert_eq!(sys, input, "gzip -dc roundtrip mismatch at L{level}");
+            }
+        }
+    }
+
+    /// `compress_block_streaming(data, &[], level, true, ..)` must be
+    /// byte-identical to the single-block [`compress_block`] (no sync marker,
+    /// BFINAL set) — the regression guard the brief requires.
+    #[test]
+    fn is_last_no_dict_equals_compress_block() {
+        let cases: [Vec<u8>; 3] = [Vec::new(), b"tiny".to_vec(), mixed_corpus(200_000)];
+        for data in &cases {
+            for level in [0u32, 1, 2, 6, 9, 12] {
+                let mut streaming = Vec::new();
+                compress_block_streaming(data, &[], level, true, &mut streaming);
+                let mut block = Vec::new();
+                compress_block(data, &[], level, &mut block);
+                assert_eq!(
+                    streaming,
+                    block,
+                    "streaming(is_last=true) diverged from compress_block at L{level}, len={}",
+                    data.len()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
