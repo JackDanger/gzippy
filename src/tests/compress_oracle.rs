@@ -105,6 +105,70 @@ mod tests {
         data
     }
 
+    /// Increment 7 differential oracle: the pure-Rust PRODUCTION encoder's
+    /// output must round-trip byte-exact through the C-FFI decoders (flate2 /
+    /// zlib-ng and libdeflate), and its size at matched level is reported
+    /// against the FFI *encoders*. Gated behind `ffi-oracle` (CI runs it; the
+    /// shipped binary never compiles the FFI encoders it compares against).
+    ///
+    /// NOTE — we deliberately do NOT assert a strict `pure <= ffi` size bound.
+    /// The pure encoder is ratio-competitive but NOT universally smaller at
+    /// matched level: measured pure/zlib-ng ≈ 1.05 at L6 on mixed data and
+    /// pure/libdeflate ≈ 1.7 at L1 on pure-RLE. Closing those matched-level
+    /// ratio cells is the compression campaign's job, gated separately on the
+    /// frozen frontier — not an Increment-7 (FFI-removal) invariant. Here we
+    /// assert correctness (strict, the real oracle guarantee) + a loose
+    /// no-blowup guard, and print the ratios for the frontier gate to consume.
+    #[cfg(feature = "ffi-oracle")]
+    #[test]
+    fn pure_encoder_roundtrips_through_ffi_decoders() {
+        use crate::compress::deflate::compress_gzip as pure_gzip;
+        let corpora = [
+            ("mixed-512KiB", make_mixed_data(512 * 1024)),
+            ("literal-512KiB", make_literal_data(512 * 1024)),
+            ("rle-512KiB", make_rle_data(512 * 1024)),
+        ];
+        for (name, data) in &corpora {
+            for lvl in [0u32, 1, 6, 9, 12] {
+                let gz = pure_gzip(data, lvl);
+
+                // (a) CORRECTNESS through two independent C-FFI decoders.
+                assert_eq!(
+                    &decompress_reference(&gz),
+                    data,
+                    "flate2/zlib-ng failed to decode pure output ({name} L{lvl})"
+                );
+                let mut ld = libdeflater::Decompressor::new();
+                let mut out = vec![0u8; data.len()];
+                let n = ld
+                    .gzip_decompress(&gz, &mut out)
+                    .expect("libdeflate failed to decode pure output");
+                assert_eq!(
+                    &out[..n],
+                    &data[..],
+                    "libdeflate decoded pure output incorrectly ({name} L{lvl})"
+                );
+
+                // (b) SIZE vs the FFI ENCODERS at matched level (report + loose
+                // guard — see the note above on why this is not a strict `<=`).
+                let flate2_sz = compress_flate2(data, lvl.min(9)).len();
+                let libdeflate_sz = compress_libdeflate(data, lvl).len();
+                let best_ffi = flate2_sz.min(libdeflate_sz);
+                eprintln!(
+                    "oracle {name} L{lvl}: pure={} flate2={flate2_sz} libdeflate={libdeflate_sz} \
+                     (pure/best_ffi={:.3})",
+                    gz.len(),
+                    gz.len() as f64 / best_ffi as f64
+                );
+                assert!(
+                    gz.len() <= best_ffi * 2,
+                    "pure encoder blew up at {name} L{lvl}: {} bytes > 2x best FFI ({best_ffi})",
+                    gz.len()
+                );
+            }
+        }
+    }
+
     // =========================================================================
     // Compression path helpers
     // =========================================================================
