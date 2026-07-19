@@ -127,6 +127,22 @@ impl HcMatchfinder {
             return (best_len, (in_next - best_matchptr) as u32);
         }
 
+        // Lever 1 (SF5): hoist the three table base pointers into raw locals so
+        // each in-loop table access is a single element load, not a RawVec
+        // data-pointer load followed by the element load. In-loop table WRITES
+        // (the chain inserts) otherwise block LLVM from hoisting `self.*_tab`'s
+        // data pointer via LICM (the 18.3% raw_vec/mod.rs Dr in cachegrind).
+        // SAFETY: `longest_match` performs its only `slide_window` above (before
+        // this point), and `slide_window`/`matchfinder_rebase` (common.rs) rewrite
+        // table CONTENTS in place through `iter_mut()` and NEVER reallocate, so
+        // these `*mut i16` remain valid for the whole call. Every index below is
+        // bounded by the module soundness invariant (`hash3 < HASH3_SIZE`,
+        // `hash4 < HASH4_SIZE`, masked chain index `< WINDOW_SIZE`), the same
+        // bounds the prior `get_unchecked` sites relied on; debug_asserts kept.
+        let h3 = self.hash3_tab.as_mut_ptr();
+        let h4 = self.hash4_tab.as_mut_ptr();
+        let nt = self.next_tab.as_mut_ptr();
+
         // Raw buffer pointer + length for the unchecked loads. `blen` is only used
         // by the debug_assert bounds checks, so it is dead in release builds.
         let base = buf.as_ptr();
@@ -140,12 +156,12 @@ impl HcMatchfinder {
         // `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`.
         let (cur_node3, mut cur_node4) = unsafe {
             debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
-            let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
-            let cur_node4 = *self.hash4_tab.get_unchecked(hash4);
+            let cur_node3 = *h3.add(hash3);
+            let cur_node4 = *h4.add(hash4);
             // Insert the current sequence: replace hash3 singleton, prepend to hash4.
-            *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
-            *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
-            *self.next_tab.get_unchecked_mut(cur_pos) = cur_node4;
+            *h3.add(hash3) = cur_pos as i16;
+            *h4.add(hash4) = cur_pos as i16;
+            *nt.add(cur_pos) = cur_node4;
             (cur_node3, cur_node4)
         };
 
@@ -163,8 +179,8 @@ impl HcMatchfinder {
         // SAFETY: `next_hashes[0] < HASH3_SIZE` and `next_hashes[1] < HASH4_SIZE`
         // (lz_hash order-15/16 outputs), so both `.add` land in-allocation.
         unsafe {
-            prefetch_write(self.hash3_tab.as_ptr().add(next_hashes[0] as usize) as *const u8);
-            prefetch_write(self.hash4_tab.as_ptr().add(next_hashes[1] as usize) as *const u8);
+            prefetch_write(h3.add(next_hashes[0] as usize) as *const u8);
+            prefetch_write(h4.add(next_hashes[1] as usize) as *const u8);
         }
 
         // SAFETY: same as above — `in_next + 4 <= in_end <= buf.len()`.
@@ -212,11 +228,7 @@ impl HcMatchfinder {
                 // and the resulting match are byte-identical (pinned by
                 // `matches_equal_scalar_*`). The prefetch is a pure hint.
                 // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
-                let mut next_node = unsafe {
-                    *self
-                        .next_tab
-                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                };
+                let mut next_node = unsafe { *nt.add((cur_node4 as u16 & WINDOW_MASK) as usize) };
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                     // Prefetch the next node's match data one iteration ahead.
@@ -242,11 +254,7 @@ impl HcMatchfinder {
                         break 'search;
                     }
                     // SAFETY: masked chain index `< next_tab.len()`.
-                    next_node = unsafe {
-                        *self
-                            .next_tab
-                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                    };
+                    next_node = unsafe { *nt.add((cur_node4 as u16 & WINDOW_MASK) as usize) };
                 }
 
                 // Found a length-4 match; extend it fully.
@@ -276,11 +284,7 @@ impl HcMatchfinder {
             // here (both entry paths guarantee it); precompute the next chain
             // node so the compare can overlap the following candidate's prefetch.
             // SAFETY: masked chain index `< next_tab.len()`.
-            let mut next_node = unsafe {
-                *self
-                    .next_tab
-                    .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-            };
+            let mut next_node = unsafe { *nt.add((cur_node4 as u16 & WINDOW_MASK) as usize) };
             loop {
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -316,11 +320,7 @@ impl HcMatchfinder {
                         break 'search;
                     }
                     // SAFETY: masked chain index `< next_tab.len()`.
-                    next_node = unsafe {
-                        *self
-                            .next_tab
-                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                    };
+                    next_node = unsafe { *nt.add((cur_node4 as u16 & WINDOW_MASK) as usize) };
                 }
 
                 let len = lz_extend(buf, in_next, matchptr, 4, max_len);
@@ -341,11 +341,7 @@ impl HcMatchfinder {
                     break 'search;
                 }
                 // SAFETY: masked chain index `< next_tab.len()`.
-                next_node = unsafe {
-                    *self
-                        .next_tab
-                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                };
+                next_node = unsafe { *nt.add((cur_node4 as u16 & WINDOW_MASK) as usize) };
             }
         }
 
@@ -378,6 +374,15 @@ impl HcMatchfinder {
         let mut hash3 = next_hashes[0] as usize;
         let mut hash4 = next_hashes[1] as usize;
         let mut remaining = count;
+        // Lever 1 (SF5): hoist the table base pointers (see `longest_match`).
+        // SAFETY: the in-loop `slide_window` (below) rewrites table CONTENTS in
+        // place via `matchfinder_rebase` and NEVER reallocates, so these
+        // `*mut i16` stay valid for the whole call, including across a slide.
+        // Every index is bounded by the module invariant (`hash3 < HASH3_SIZE`,
+        // `hash4 < HASH4_SIZE`, `cur_pos < WINDOW_SIZE`); debug_asserts kept.
+        let h3 = self.hash3_tab.as_mut_ptr();
+        let h4 = self.hash4_tab.as_mut_ptr();
+        let nt = self.next_tab.as_mut_ptr();
         loop {
             if cur_pos == WINDOW_SIZE {
                 self.slide_window();
@@ -388,9 +393,9 @@ impl HcMatchfinder {
             // and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()` (reset above).
             unsafe {
                 debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
-                *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
-                *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab.get_unchecked(hash4);
-                *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
+                *h3.add(hash3) = cur_pos as i16;
+                *nt.add(cur_pos) = *h4.add(hash4);
+                *h4.add(hash4) = cur_pos as i16;
             }
 
             in_next += 1;
@@ -413,8 +418,8 @@ impl HcMatchfinder {
         // final position in an exclusive state. Pure hint; no effect on state.
         // SAFETY: `hash3 < HASH3_SIZE` and `hash4 < HASH4_SIZE` (lz_hash outputs).
         unsafe {
-            prefetch_write(self.hash3_tab.as_ptr().add(hash3) as *const u8);
-            prefetch_write(self.hash4_tab.as_ptr().add(hash4) as *const u8);
+            prefetch_write(h3.add(hash3) as *const u8);
+            prefetch_write(h4.add(hash4) as *const u8);
         }
         next_hashes[0] = hash3 as u32;
         next_hashes[1] = hash4 as u32;
