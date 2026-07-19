@@ -23,7 +23,8 @@ use crate::error::GzippyResult;
 /// Select the fastest available compression backend and drive it to completion.
 ///
 /// Routing (matches CLAUDE.md compression table):
-///   L11 / -F / -I / -J       → Zopfli (true zopfli compression)
+///   T1 L10–L12               → pure-Rust near-optimal DEFLATE encoder (default)
+///   -F / -I / -J (zopfli)    → Zopfli (true zopfli compression)
 ///   T1 L0–L3 ISA-L available → ISA-L streaming
 ///   T1 L1–L5                 → libdeflate one-shot (ratio probe) or flate2 streaming
 ///   T1 L6–L9                 → flate2/zlib-ng streaming
@@ -35,11 +36,17 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     opt_config: &OptimizationConfig,
     header_info: &GzipHeaderInfo,
 ) -> GzippyResult<u64> {
-    // Measurement routing: pure-Rust near-optimal DEFLATE encoder for T1 L10–L12.
-    // Compile-time gated (`pure-rust-encoder`); OFF in the default build. Placed
-    // before the zopfli fast-path so that, with the feature on, L11 exercises the
-    // near-optimal engine rather than zopfli.
-    #[cfg(feature = "pure-rust-encoder")]
+    // Production routing: pure-Rust near-optimal DEFLATE encoder for T1 L10–L12.
+    // This is the DEFAULT build path (flipped from behind `pure-rust-encoder`
+    // 2026-07-18): the pure-Rust engine at L10–L12 is byte-identical in size to
+    // libdeflate's high levels, roundtrips clean, and curve-dominates libdeflate's
+    // L11/L12 tail on both arches — with zero measured downside. It replaces the
+    // old T1-L10–L12 fall-through (SimpleOptimizer → ParallelGzEncoder →
+    // libdeflate high-level), which is now unreachable for T1 L10–L12 but is
+    // retained because T>1 L10–L12 still routes through it. Placed before the
+    // zopfli fast-path so that L11 exercises the near-optimal engine rather than
+    // zopfli. L2–L9 remain behind `pure-rust-encoder` (see below) — they still
+    // trail libdeflate's C-SIMD on speed.
     if opt_config.thread_count == 1
         && (10..=12).contains(&args.compression_level)
         && !args.huffman
