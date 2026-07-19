@@ -79,6 +79,7 @@ pub(super) fn run(
     in_end: usize,
     statics: &StaticCodes,
     bw: &mut BitWriter,
+    is_last: bool,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -166,7 +167,18 @@ pub(super) fn run(
         }
 
         // Flush the block: cheapest of per-block dynamic / static / stored.
-        emit_block(bw, buf, block_begin, &sink, statics, pos == in_end);
+        // The BFINAL bit is set only on the last internal block AND only when
+        // this chunk is the last chunk of the whole stream (`is_last`). A
+        // non-final chunk's blocks stay BFINAL=0 so the sync-flush marker the
+        // caller appends can close the chunk on a clean boundary.
+        emit_block(
+            bw,
+            buf,
+            block_begin,
+            &sink,
+            statics,
+            is_last && pos == in_end,
+        );
         if pos == in_end {
             break;
         }

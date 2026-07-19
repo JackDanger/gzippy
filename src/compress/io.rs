@@ -164,6 +164,20 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let header_info = build_header_info(input_path, args);
     let use_mmap = opt_config.thread_count > 1 && file_size > 128 * 1024;
 
+    // Increment 6: the pure-Rust parallel DEFLATE encoder produces a STANDARD
+    // single-member gzip stream for T>1 L1–12. Compile-time gated
+    // (`pure-rust-encoder`); ALWAYS false in the default build, so the default
+    // mmap SimpleOptimizer path below is byte-for-byte unchanged.
+    #[cfg(feature = "pure-rust-encoder")]
+    let use_pure_parallel = use_mmap
+        && !args.rsyncable
+        && !args.use_zopfli()
+        && (1..=12).contains(&args.compression_level)
+        && !args.huffman
+        && !args.rle;
+    #[cfg(not(feature = "pure-rust-encoder"))]
+    let use_pure_parallel = false;
+
     if let Some(ref output_path) = output_path {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
     }
@@ -192,6 +206,42 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 output_file,
             )
             .map_err(|e| e.into())
+        }
+    } else if use_pure_parallel {
+        #[cfg(feature = "pure-rust-encoder")]
+        {
+            if args.verbosity >= 2 {
+                eprintln!(
+                    "gzippy: using pure-Rust parallel DEFLATE encoder with {} threads",
+                    opt_config.thread_count,
+                );
+            }
+            // SAFETY: the input file is opened read-only and mapped for the
+            // duration of this compression; it is not mutated concurrently by
+            // gzippy, matching every other mmap read path in this module.
+            let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+            #[cfg(unix)]
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+            let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+                args.compression_level as u32,
+                opt_config.thread_count,
+            );
+            encoder.set_header_info(header_info.clone());
+            if args.stdout {
+                let out = BufWriter::with_capacity(1024 * 1024, stdout());
+                encoder
+                    .compress_buffer_pure(&mmap, out)
+                    .map_err(|e| e.into())
+            } else {
+                let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
+                encoder
+                    .compress_buffer_pure(&mmap, output_file)
+                    .map_err(|e| e.into())
+            }
+        }
+        #[cfg(not(feature = "pure-rust-encoder"))]
+        {
+            unreachable!("use_pure_parallel is always false without the feature")
         }
     } else if use_mmap && !args.use_zopfli() {
         if args.verbosity >= 2 {
@@ -363,6 +413,39 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         // would produce a "GZ" FEXTRA multi-member stream at L11, costing
         // +2% ratio vs C zopfli. Plan.md Phase 11.1.A pinned this for
         // compress_with_pipeline but didn't reach this branch.
+        // Increment 6: pure-Rust parallel encoder (standard single-member gzip)
+        // for T>1 L1–12. Feature-gated; the default build keeps the existing
+        // PipelinedGzEncoder / ParallelGzEncoder split below unchanged.
+        #[cfg(feature = "pure-rust-encoder")]
+        let use_pure_parallel = opt_config.thread_count > 1
+            && !args.use_zopfli()
+            && (1..=12).contains(&args.compression_level)
+            && !args.huffman
+            && !args.rle;
+        #[cfg(not(feature = "pure-rust-encoder"))]
+        let use_pure_parallel = false;
+
+        if use_pure_parallel {
+            #[cfg(feature = "pure-rust-encoder")]
+            {
+                let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+                    compression_level,
+                    opt_config.thread_count,
+                );
+                encoder.set_header_info(header_info.clone());
+                encoder.compress_buffer_pure(input_data, &mut counted)?;
+                counted.flush()?;
+                if verbose {
+                    print_stdin_stats(file_size, counted.count, args);
+                }
+                return Ok(0);
+            }
+            #[cfg(not(feature = "pure-rust-encoder"))]
+            {
+                unreachable!("use_pure_parallel is always false without the feature")
+            }
+        }
+
         if opt_config.thread_count > 1 && !args.use_zopfli() {
             if args.compression_level >= 6 && args.compression_level <= 9 {
                 let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(

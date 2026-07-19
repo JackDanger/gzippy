@@ -80,6 +80,62 @@ impl PipelinedGzEncoder {
         self.header_info = info;
     }
 
+    /// Raw gzip header bytes (magic, CM=8, FLG, MTIME, XFL=0, OS=255, then any
+    /// FNAME/FCOMMENT) matching the layout written by the parallel/sequential
+    /// paths below.
+    #[cfg(feature = "pure-rust-encoder")]
+    fn gzip_header_bytes(&self) -> Vec<u8> {
+        let mut header = Vec::with_capacity(64);
+        let mut flags: u8 = 0x00;
+        if self.header_info.filename.is_some() {
+            flags |= 0x08;
+        }
+        if self.header_info.comment.is_some() {
+            flags |= 0x10;
+        }
+        header.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
+        header.extend_from_slice(&self.header_info.mtime.to_le_bytes());
+        header.extend_from_slice(&[0x00, 0xff]);
+        if let Some(ref name) = self.header_info.filename {
+            header.extend_from_slice(name.as_bytes());
+            header.push(0);
+        }
+        if let Some(ref comment) = self.header_info.comment {
+            header.extend_from_slice(comment.as_bytes());
+            header.push(0);
+        }
+        header
+    }
+
+    /// Compress a pre-read buffer to a single-member gzip stream using the
+    /// pure-Rust DEFLATE engine (feature `pure-rust-encoder`). Multi-threaded
+    /// parallel-pipeline path; empty input yields a valid empty gzip member.
+    #[cfg(feature = "pure-rust-encoder")]
+    pub fn compress_buffer_pure<W: Write + Send>(
+        &self,
+        data: &[u8],
+        mut writer: W,
+    ) -> io::Result<u64> {
+        if data.is_empty() {
+            // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
+            writer.write_all(&self.gzip_header_bytes())?;
+            let mut body = Vec::new();
+            crate::compress::deflate::compress_block_streaming(
+                &[],
+                &[],
+                self.compression_level,
+                true,
+                &mut body,
+            );
+            writer.write_all(&body)?;
+            writer.write_all(&0u32.to_le_bytes())?; // CRC32 of empty input
+            writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
+            return Ok(0);
+        }
+        self.compress_parallel_pipeline_pure(data, writer)?;
+        Ok(data.len() as u64)
+    }
+
     /// Build a flate2 GzBuilder with FNAME/MTIME/FCOMMENT from header_info
     fn gz_builder(&self) -> flate2::GzBuilder {
         let mut builder = flate2::GzBuilder::new();
@@ -247,6 +303,88 @@ impl PipelinedGzEncoder {
         let combined_crc = combined_hasher.finalize();
 
         // Write gzip trailer
+        let isize = (data_len as u32).to_le_bytes();
+        writer.write_all(&combined_crc.to_le_bytes())?;
+        writer.write_all(&isize)?;
+
+        Ok(())
+    }
+
+    /// Parallel pipelined compression using the pure-Rust DEFLATE engine.
+    ///
+    /// Byte-for-byte the same framing and scheduling as
+    /// [`Self::compress_parallel_pipeline`] — single-member gzip (header +
+    /// concatenated per-chunk DEFLATE + combined CRC/ISIZE), the same
+    /// data-length-only block grid, the same dictionary-from-previous-chunk, the
+    /// same in-order streaming writer and CRC-combine — EXCEPT each chunk is
+    /// compressed by [`deflate::compress_block_streaming`] instead of
+    /// flate2/zlib-ng. Non-final chunks are closed with a sync-flush marker by
+    /// that function so the concatenation is one valid DEFLATE stream.
+    ///
+    /// The grid ([`pipelined_block_size`]) depends only on `data.len()`, and the
+    /// per-chunk dictionary and compression are deterministic, so the output is
+    /// byte-identical regardless of `num_threads`.
+    #[cfg(feature = "pure-rust-encoder")]
+    fn compress_parallel_pipeline_pure<W: Write + Send>(
+        &self,
+        data: &[u8],
+        mut writer: W,
+    ) -> io::Result<()> {
+        use crate::compress::deflate;
+
+        // Pass the real compression level (1..=12) straight through — the
+        // pure-Rust engine has its own per-level parser table and does NOT need
+        // the zlib-ng L1→L2 remap that `adjust_compression_level` applies.
+        let level = self.compression_level;
+        let data_len = data.len();
+        let block_size = pipelined_block_size(data_len, self.num_threads, level);
+        let num_blocks = data_len.div_ceil(block_size);
+
+        // Write gzip header before spawning threads (identical to the flate2 path).
+        writer.write_all(&self.gzip_header_bytes())?;
+
+        // Per-block CRC parts, combined in order after all workers join.
+        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
+            .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+            .collect();
+
+        let mut writer = compress_parallel(
+            data,
+            block_size,
+            self.num_threads,
+            writer,
+            |block_idx, block, dict, is_last, output| {
+                // Compress this chunk with the pure-Rust engine. A non-final
+                // chunk is closed with a sync-flush marker inside the callee.
+                output.clear();
+                deflate::compress_block_streaming(
+                    block,
+                    dict.unwrap_or(&[]),
+                    level,
+                    is_last,
+                    output,
+                );
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(block);
+                // SAFETY: each slot is written by exactly one worker (block_idx
+                // is claimed atomically) before all threads join.
+                unsafe {
+                    *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
+                }
+            },
+        )?;
+
+        // Combine CRCs in order.
+        let mut combined_hasher = crc32fast::Hasher::new();
+        for part in &crc_parts {
+            // SAFETY: every slot was initialized by its worker above.
+            let hasher = unsafe { (*part.0.get()).assume_init_read() };
+            combined_hasher.combine(&hasher);
+        }
+        let combined_crc = combined_hasher.finalize();
+
+        // Write gzip trailer (combined CRC32 + ISIZE over the whole input).
         let isize = (data_len as u32).to_le_bytes();
         writer.write_all(&combined_crc.to_le_bytes())?;
         writer.write_all(&isize)?;

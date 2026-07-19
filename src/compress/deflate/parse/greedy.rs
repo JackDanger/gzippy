@@ -21,6 +21,7 @@ pub(super) fn run(
     params: &LevelParams,
     statics: &StaticCodes,
     bw: &mut BitWriter,
+    is_last: bool,
 ) {
     let mut mf = HcMatchfinder::new();
     let mut in_base = 0usize;
@@ -78,7 +79,14 @@ pub(super) fn run(
             }
         }
 
-        emit_block(bw, buf, block_begin, &sink, statics, in_next == in_end);
+        emit_block(
+            bw,
+            buf,
+            block_begin,
+            &sink,
+            statics,
+            is_last && in_next == in_end,
+        );
         if in_next == in_end {
             break;
         }

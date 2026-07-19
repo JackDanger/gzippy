@@ -23,6 +23,8 @@ pub mod inflate_proptest;
 pub mod latch_interleave;
 pub mod multi_member_chunked;
 pub mod phantom_eos_probe;
+#[cfg(feature = "pure-rust-encoder")]
+pub mod pure_parallel_encoder;
 pub mod pure_rust_inflate_corpus;
 pub mod resumable_correctness;
 pub mod routing;

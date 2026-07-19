@@ -39,6 +39,7 @@ pub(super) fn run(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     lazy2: bool,
+    is_last: bool,
 ) {
     let depth = params.max_search_depth;
     let mut mf = HcMatchfinder::new();
@@ -179,7 +180,14 @@ pub(super) fn run(
             }
         }
 
-        emit_block(bw, buf, block_begin, &sink, statics, in_next == in_end);
+        emit_block(
+            bw,
+            buf,
+            block_begin,
+            &sink,
+            statics,
+            is_last && in_next == in_end,
+        );
         if in_next == in_end {
             break;
         }
