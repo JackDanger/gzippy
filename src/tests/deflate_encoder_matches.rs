@@ -144,11 +144,19 @@ mod tests {
     }
 
     fn silesia_slice(n: usize) -> Option<Vec<u8>> {
+        silesia_slice_at(1 << 16, n)
+    }
+
+    /// A `n`-byte slice of `benchmark_data/silesia.tar` starting at byte
+    /// `offset`. Distinct offsets land in different member files (silesia is a
+    /// tar of heterogeneous corpora — text, binaries, DB dumps), giving the
+    /// multi-corpus ratio guard genuinely different byte statistics.
+    fn silesia_slice_at(offset: u64, n: usize) -> Option<Vec<u8>> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark_data/silesia.tar");
         let mut f = std::fs::File::open(path).ok()?;
         let mut buf = vec![0u8; n];
         use std::io::Seek;
-        f.seek(std::io::SeekFrom::Start(1 << 16)).ok()?;
+        f.seek(std::io::SeekFrom::Start(offset)).ok()?;
         f.read_exact(&mut buf).ok()?;
         Some(buf)
     }
@@ -543,73 +551,175 @@ mod tests {
         }
     }
 
-    /// Ratio sanity: on a compressible corpus, L1 must actually shrink the input
-    /// and stay in a sane band vs `gzip -1` (fast mode may run a bit larger — the
-    /// static-Huffman speed trade — but a wild blowup signals a bug). Reports the
-    /// real numbers vs gzip -1 (and igzip -1 if that binary is on PATH).
+    /// gzip-framed size of `data` under libdeflate at `level` (the tighter ratio
+    /// reference: `size_fastL1 <= libdeflate -1` is the aspiration, `<= gzip -1`
+    /// the hard floor).
+    fn libdeflate_gzip_size(data: &[u8], level: i32) -> usize {
+        let lvl = libdeflater::CompressionLvl::new(level).expect("valid level");
+        let mut c = libdeflater::Compressor::new(lvl);
+        let bound = c.gzip_compress_bound(data.len());
+        let mut out = vec![0u8; bound];
+        c.gzip_compress(data, &mut out).expect("libdeflate gzip")
+    }
+
+    /// A text-heavy generated corpus (~`n` bytes): recurring English phrases with
+    /// periodic markers, so the byte statistics differ sharply from the binary
+    /// corpus below and from raw silesia slices.
+    fn text_corpus(n: usize) -> Vec<u8> {
+        let phrases: [&[u8]; 4] = [
+            b"the pure-rust deflate encoder must roundtrip byte for byte. ",
+            b"lempel-ziv parsing finds the longest match at each position. ",
+            b"dynamic huffman codes adapt to the local symbol frequencies. ",
+            b"a stored block escapes when the data will not compress at all. ",
+        ];
+        let mut out = Vec::with_capacity(n + 128);
+        let mut i = 0usize;
+        while out.len() < n {
+            out.extend_from_slice(phrases[i % phrases.len()]);
+            if i.is_multiple_of(11) {
+                out.extend_from_slice(format!("<<marker {i} @ {}>> ", out.len()).as_bytes());
+            }
+            i += 1;
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// A binary-heavy generated corpus (~`n` bytes): little-endian record structs
+    /// with a slowly-varying key and a repeating payload, i.e. compressible but
+    /// with very different statistics from text (few printable bytes, structural
+    /// periodicity at the record stride rather than the word stride).
+    fn binary_corpus(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n + 64);
+        let payload: [u8; 12] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0xFF, 0xEE, 0xDD, 0xCC,
+        ];
+        let mut key: u32 = 0;
+        while out.len() < n {
+            out.extend_from_slice(&key.to_le_bytes());
+            out.extend_from_slice(&(key.wrapping_mul(2654435761)).to_le_bytes());
+            out.extend_from_slice(&payload);
+            // Slowly advance the key so records mostly repeat but drift.
+            if key.is_multiple_of(5) {
+                key = key.wrapping_add(1);
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// THE ratio guard (BLOCKING, multi-corpus). On THREE distinct corpora with
+    /// genuinely different byte statistics — a text-heavy slice, a binary-heavy
+    /// slice, and silesia slices at distinct offsets (different member files) —
+    /// the fast-L1 gzip stream MUST be no larger than `gzip -1`. This is the
+    /// guard the earlier single-corpus sanity lacked: it missed a 28% blowup that
+    /// a per-corpus assert would have caught. Reports fast-L1 vs gzip-1 vs
+    /// libdeflate-1 (and a rough in-process compress-time vs libdeflate-1) for
+    /// every corpus.
     #[test]
-    fn fast_l1_ratio_sanity() {
-        let data = silesia_slice(4_000_000).unwrap_or_else(|| {
-            // Fallback compressible corpus if silesia is unavailable.
-            let phrase = b"the quick brown fox jumps over the lazy dog. ";
-            phrase.iter().cloned().cycle().take(2_000_000).collect()
-        });
-
-        let ours = compress_gzip(&data, 1).len();
-        let gzip1 = flate2_gzip_size(&data, 1);
-        let gzip6 = flate2_gzip_size(&data, 6);
-
-        // Optional igzip -1 reference (best-effort; not required to be present).
-        let igzip1 = igzip_cli_size(&data, 1);
-
-        eprintln!(
-            "L1 ratio sanity: raw={} ours_L1={ours} ({:.3}x raw)  gzip_L1={gzip1} \
-             (ours/gzip1={:.3})  gzip_L6={gzip6}{}",
-            data.len(),
-            ours as f64 / data.len() as f64,
-            ours as f64 / gzip1 as f64,
-            match igzip1 {
-                Some(s) => format!("  igzip_L1={s} (ours/igzip1={:.3})", ours as f64 / s as f64),
-                None => "  igzip_L1=n/a".to_string(),
-            },
+    fn fast_l1_ratio_multi_corpus() {
+        // Always-present generated corpora, plus silesia offsets when the tar is
+        // available (distinct offsets land in different file types).
+        let mut corpora: Vec<(String, Vec<u8>)> = vec![
+            ("text-heavy-2MiB".to_string(), text_corpus(2_000_000)),
+            ("binary-heavy-2MiB".to_string(), binary_corpus(2_000_000)),
+        ];
+        for (label, off) in [
+            ("silesia@64KiB", 1u64 << 16),
+            ("silesia@40MiB", 40 << 20),
+            ("silesia@120MiB", 120 << 20),
+        ] {
+            if let Some(d) = silesia_slice_at(off, 4_000_000) {
+                corpora.push((label.to_string(), d));
+            }
+        }
+        assert!(
+            corpora.len() >= 3,
+            "need >=3 corpora for the multi-corpus guard (silesia.tar missing? \
+             only {} available)",
+            corpora.len()
         );
 
-        // (1) It actually compresses.
+        let mut failures = Vec::new();
+        for (label, data) in &corpora {
+            // Rough in-process compress time (non-gated sanity that it's fast).
+            let t0 = std::time::Instant::now();
+            let ours = compress_gzip(data, 1).len();
+            let ours_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            let tl = std::time::Instant::now();
+            let ld1 = libdeflate_gzip_size(data, 1);
+            let ld1_ms = tl.elapsed().as_secs_f64() * 1e3;
+
+            let gzip1 = flate2_gzip_size(data, 1);
+
+            eprintln!(
+                "L1 [{label}]: raw={} fastL1={ours} ({:.3}x raw, {ours_ms:.1}ms)  \
+                 gzip-1={gzip1} (fastL1/gzip1={:.3})  \
+                 libdeflate-1={ld1} (fastL1/ld1={:.3}, {ld1_ms:.1}ms)",
+                data.len(),
+                ours as f64 / data.len() as f64,
+                ours as f64 / gzip1 as f64,
+                ours as f64 / ld1 as f64,
+            );
+
+            // (1) It actually compresses (unless the corpus is incompressible,
+            // which none of these are).
+            assert!(
+                ours < data.len(),
+                "L1 [{label}]: output {ours} not smaller than raw {}",
+                data.len()
+            );
+            // (2) THE guard: no larger than gzip -1 on EVERY corpus.
+            if ours > gzip1 {
+                failures.push(format!(
+                    "[{label}] fastL1={ours} > gzip-1={gzip1} ({:.3}x)",
+                    ours as f64 / gzip1 as f64
+                ));
+            }
+        }
         assert!(
-            ours < data.len(),
-            "L1 output {ours} not smaller than raw {}",
-            data.len()
-        );
-        // (2) Within a sane band of gzip -1 (allow the static-Huffman trade).
-        let bound = (gzip1 as f64 * 1.15) as usize;
-        assert!(
-            ours <= bound,
-            "L1 output {ours} exceeds gzip -1 {gzip1} by >15% (bound {bound}) — likely a bug",
+            failures.is_empty(),
+            "fast-L1 exceeded gzip -1 on {}/{} corpora: {}",
+            failures.len(),
+            corpora.len(),
+            failures.join("; ")
         );
     }
 
-    /// gzip-framed size under the `igzip` CLI at `level`, or `None` if `igzip`
-    /// is not installed / fails (e.g. non-x86 boxes).
-    fn igzip_cli_size(data: &[u8], level: u32) -> Option<usize> {
-        let mut child = Command::new("igzip")
-            .arg(format!("-{level}"))
-            .arg("-c")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let mut stdin = child.stdin.take()?;
-        let buf = data.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&buf);
-        });
-        let out = child.wait_with_output().ok()?;
-        let _ = writer.join();
-        if !out.status.success() {
-            return None;
+    /// The STORED-block escape must fire on incompressible data: a per-block
+    /// dynamic/static Huffman coding of random bytes would EXPAND the input
+    /// (>= 1x), so the cheapest-of selector must fall back to a stored block,
+    /// keeping the gzip output within a tiny per-block header of the raw size.
+    /// (RFC-fixed one-block coding could not escape — this is what the ratio
+    /// blowup was.)
+    #[test]
+    fn fast_l1_incompressible_uses_stored_escape() {
+        // A few incompressible sizes spanning the 64 KiB block boundary.
+        for &n in &[64 * 1024usize, 200_000, 1 << 20] {
+            let mut data = vec![0u8; n];
+            Rng::new(0xBADC0DE ^ n as u64).fill(&mut data);
+
+            let gz = compress_gzip(&data, 1);
+            // Roundtrips (stored blocks must still decode).
+            assert_eq!(
+                decode_flate2(&gz),
+                data,
+                "stored-escape roundtrip failed (n={n})"
+            );
+
+            // Stored coding adds ~6 header bytes per <=64 KiB sub-block (~n/5000),
+            // so a stored stream is <= ~1.0003x n. A Huffman coding of random
+            // bytes would run ~1.05x+ n. A 1.016x ceiling (n + n/64 + 256) cleanly
+            // proves the STORED escape fired and not a Huffman expansion.
+            let ceiling = n + n / 64 + 256;
+            assert!(
+                gz.len() <= ceiling,
+                "incompressible n={n}: fast-L1 gzip {} exceeds stored ceiling {ceiling} \
+                 — the STORED escape did not fire (Huffman-expanded instead)",
+                gz.len()
+            );
         }
-        Some(out.stdout.len())
     }
 
     proptest! {
@@ -622,6 +732,23 @@ mod tests {
             let gz = compress_gzip(&input, 1);
             let decoded = decode_flate2(&gz);
             prop_assert_eq!(decoded, input);
+        }
+
+        /// The stored escape must fire for EVERY random (incompressible) block:
+        /// output stays within a small per-block header of the raw size.
+        #[test]
+        fn prop_fast_l1_incompressible_stored_escape(
+            data in proptest::collection::vec(any::<u8>(), 4096..80_000)
+        ) {
+            let n = data.len();
+            let gz = compress_gzip(&data, 1);
+            prop_assert_eq!(decode_flate2(&gz), data.clone());
+            let ceiling = n + n / 64 + 256;
+            prop_assert!(
+                gz.len() <= ceiling,
+                "n={}: gz {} > stored ceiling {} — stored escape did not fire",
+                n, gz.len(), ceiling
+            );
         }
     }
 }

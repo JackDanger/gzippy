@@ -1,15 +1,24 @@
 //! Level-1 igzip-class one-pass FAST parser.
 //!
-//! Port of igzip's level-0/1 deflate body
-//! (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`, :27-113, and the
-//! matching `isal_deflate_finish_base` tail, :114-215). Unlike the
-//! greedy/lazy/near-optimal parsers (which buffer a token stream and build a
-//! dynamic Huffman code per block), this path is a single streaming pass that
-//! emits DIRECTLY into the bitstream through a FIXED (RFC 1951 static) Huffman
-//! table. That trades a little ratio (static vs dynamic Huffman) for igzip-class
-//! throughput — the whole point of the fast mode.
+//! The match finder is a port of igzip's level-0/1 deflate body
+//! (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`, :27-113): a
+//! chainless single-probe hash with `LIMIT_HASH_UPDATE`, the igzip-class speed
+//! lever. Where this path DIFFERS from the greedy/lazy/near-optimal parsers is
+//! only in the finder — it does one probe per position, no chains, no depth
+//! loop — NOT in how blocks are coded.
 //!
-//! The mechanisms ported from igzip:
+//! For coding it reuses the SHARED L2-9 backend ([`Sink`] + [`emit_block`]):
+//! tokens stream into the sequence buffer while litlen + offset frequency
+//! histograms accumulate as-you-go (no extra pass), a block is flushed every
+//! [`FAST_BLOCK_LENGTH`] input bytes (and at end-of-input), and each flush picks
+//! the cheapest of a per-block DYNAMIC Huffman code, the RFC-1951 static code, or
+//! a STORED block. The old fast path direct-emitted one whole-input static block:
+//! fast, but 1.2-1.3x larger than `gzip -1` on some corpora, and it could not
+//! escape to STORED on incompressible data. Per-block dynamic Huffman + the
+//! stored escape recover competitive ratio while the single-probe finder keeps
+//! the speed.
+//!
+//! The mechanisms ported from igzip (finder only):
 //!   1. **Chainless single-probe hash** (`igzip_base.c:60-64`): one small head
 //!      table storing the last position per hash; overwrite on collision; ONE
 //!      candidate per position — no chains, no depth loop.
@@ -18,20 +27,16 @@
 //!      cursor by the whole match length (skip the interior stores).
 //!   3. **compare258 match-extend** (`huffman.h:260-314`): 8-byte XOR +
 //!      trailing-zero-count, reusing Increment 1's [`lz_extend`].
-//!   4. **Direct-emit via a precomputed Huffman LUT** (`igzip_lib.h:409-413`):
-//!      a literal is one LUT read + one `add_bits_raw`; a match is a
-//!      full-length-codeword LUT read + a distance-codeword read + `add_bits_raw`.
-//!   5. **64-bit branchless bit buffer**: the shared [`BitWriter`] fast path
-//!      (`add_bits_raw` / `flush_word_unchecked`).
 //!
-//! The whole input is coded as ONE static-Huffman block (BFINAL=1, BTYPE=01),
-//! so there is no per-block tree build or block-split statistic at all.
+//! Block emission (mechanisms 4-5: full-length-codeword LUT, 4-literals-per-
+//! flush, branchless word-store FLUSH, cheapest-of-{dynamic,static,stored}) all
+//! lives in the shared [`emit_block`]/`emit_tokens` machinery — this file does
+//! not duplicate it.
 
 use super::super::bitstream::BitWriter;
 use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash};
-use super::super::tables::{offset_slot, DEFLATE_END_OF_BLOCK};
-use super::super::tables::{DEFLATE_MAX_MATCH_LEN, OFFSET_EXTRA_BITS, OFFSET_SLOT_BASE};
-use super::{FullLenCodewords, StaticCodes};
+use super::super::tables::DEFLATE_MAX_MATCH_LEN;
+use super::{emit_block, Sink, StaticCodes};
 
 /// Log2 of the head-table size. igzip's level-0 hash table is
 /// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`).
@@ -50,8 +55,17 @@ const SHORTEST_MATCH: u32 = 4;
 /// DEFLATE sliding-window size — the largest legal back-reference distance.
 const WINDOW: usize = 32768;
 
-/// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending a
-/// single static-Huffman DEFLATE block to `bw`.
+/// Input bytes covered per DEFLATE block in the fast path.
+///
+/// A per-block dynamic Huffman code adapts to LOCAL statistics, so a moderate
+/// block (vs one whole-input block) improves ratio on heterogeneous input; at
+/// 64 KiB the ~dozens-of-bytes dynamic header amortizes to well under 1%. This
+/// is the fast path's one ratio/speed tuning knob — it does not affect
+/// correctness (any block boundary roundtrips).
+const FAST_BLOCK_LENGTH: usize = 1 << 16;
+
+/// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending one
+/// or more DEFLATE blocks to `bw`.
 ///
 /// `buf` MUST carry at least [`super::BUF_PAD`] trailing pad bytes beyond
 /// `in_end` (upheld by the caller in `deflate::compress_block`) so the
@@ -69,12 +83,6 @@ pub(super) fn run(
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
 
-    let litcode = &statics.litcode;
-    let offcode = &statics.offcode;
-    // Precompute the "litlen symbol + extra length bits" packed codeword per
-    // match length, so a match's length field is a single LUT read + one add.
-    let full_len = FullLenCodewords::build(litcode);
-
     // Chainless head table: one slot per hash, holding the most recent position.
     let mut head = vec![NO_POS; HASH_SIZE];
     let base = buf.as_ptr();
@@ -90,112 +98,77 @@ pub(super) fn run(
         p += 1;
     }
 
-    // Reserve worst-case output capacity up front (every byte a 9-bit literal =
-    // input * 9/8 bytes, plus header/EOB slack). This bounds the total bytes
-    // written so every `flush_word_unchecked` below keeps its required 8 spare
-    // bytes: capacity - out.len() stays >= 8 for the whole batch.
-    let data_len = in_end - data_start;
-    bw.reserve(data_len + data_len / 8 + 256);
-
-    // Single static-Huffman block header: BFINAL=1, BTYPE=01. Uses the
-    // auto-flushing `add_bits`; only 3 bits, so afterwards bitcount == 3 (<= 7),
-    // satisfying the raw fast-path invariant with no explicit drain.
-    bw.add_bits(1, 1);
-    bw.add_bits(1, 2);
-
+    // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
+    let mut sink = Sink::new();
     let mut pos = data_start;
-    while pos < in_end {
-        let remaining = in_end - pos;
-        let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
-            DEFLATE_MAX_MATCH_LEN
-        } else {
-            remaining as u32
-        };
 
-        if max_len >= SHORTEST_MATCH {
-            // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
-            let seq = unsafe { load_u32(base, pos) };
-            let h = lz_hash(seq, HASH_BITS) as usize;
-            let cand = head[h];
-            head[h] = pos as u32;
+    loop {
+        // Start a new block. It ends after FAST_BLOCK_LENGTH input bytes (a match
+        // straddling the boundary is allowed to overrun it slightly) or at EOF.
+        let block_begin = pos;
+        sink.begin();
+        let block_end_target = (block_begin + FAST_BLOCK_LENGTH).min(in_end);
 
-            // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
-            // the window range instead of panicking on underflow.
-            let dist = pos.wrapping_sub(cand as usize);
-            if (1..=WINDOW).contains(&dist) {
-                let cand_pos = cand as usize;
-                // Byte-exact extend (never trusts the hash): a spurious
-                // candidate simply yields length < SHORTEST_MATCH -> literal.
-                let length = lz_extend(buf, pos, cand_pos, 0, max_len);
-                if length >= SHORTEST_MATCH {
-                    // LIMIT_HASH_UPDATE: insert the hash for only positions
-                    // pos+1, pos+2 (igzip's `end = next_hash + 3`), then jump the
-                    // cursor over the whole match. length >= 4 guarantees these
-                    // interior positions are inside the match.
-                    let limit = pos + 3;
-                    let mut nh = pos + 1;
-                    while nh < limit {
-                        // SAFETY: nh <= pos+2 < pos+length <= in_end, and buf's
-                        // pad covers the 4-byte load past in_end.
-                        let s = unsafe { load_u32(base, nh) };
-                        head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
-                        nh += 1;
+        while pos < in_end {
+            let remaining = in_end - pos;
+            let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
+                DEFLATE_MAX_MATCH_LEN
+            } else {
+                remaining as u32
+            };
+
+            if max_len >= SHORTEST_MATCH {
+                // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
+                let seq = unsafe { load_u32(base, pos) };
+                let h = lz_hash(seq, HASH_BITS) as usize;
+                let cand = head[h];
+                head[h] = pos as u32;
+
+                // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
+                // the window range instead of panicking on underflow.
+                let dist = pos.wrapping_sub(cand as usize);
+                if (1..=WINDOW).contains(&dist) {
+                    let cand_pos = cand as usize;
+                    // Byte-exact extend (never trusts the hash): a spurious
+                    // candidate simply yields length < SHORTEST_MATCH -> literal.
+                    let length = lz_extend(buf, pos, cand_pos, 0, max_len);
+                    if length >= SHORTEST_MATCH {
+                        // LIMIT_HASH_UPDATE: insert the hash for only positions
+                        // pos+1, pos+2 (igzip's `end = next_hash + 3`), then jump
+                        // the cursor over the whole match. length >= 4 guarantees
+                        // these interior positions are inside the match.
+                        let limit = pos + 3;
+                        let mut nh = pos + 1;
+                        while nh < limit {
+                            // SAFETY: nh <= pos+2 < pos+length <= in_end, and buf's
+                            // pad covers the 4-byte load past in_end.
+                            let s = unsafe { load_u32(base, nh) };
+                            head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
+                            nh += 1;
+                        }
+
+                        sink.push_match(length, dist as u32);
+                        pos += length as usize;
+                        if pos >= block_end_target {
+                            break;
+                        }
+                        continue;
                     }
-
-                    emit_match(bw, &full_len, offcode, length, dist as u32);
-                    pos += length as usize;
-                    continue;
                 }
+            }
+
+            // Literal.
+            sink.push_literal(buf[pos]);
+            pos += 1;
+            if pos >= block_end_target {
+                break;
             }
         }
 
-        // Literal.
-        let b = buf[pos];
-        bw.add_bits_raw(
-            litcode.codewords[b as usize] as u64,
-            litcode.lens[b as usize] as u32,
-        );
-        // SAFETY: reserve() above guarantees 8 spare bytes for every flush; a
-        // literal adds <= 9 bits to a buffer holding <= 7, well under 63.
-        unsafe { bw.flush_word_unchecked() };
-        pos += 1;
+        // Flush the block: cheapest of per-block dynamic / static / stored.
+        emit_block(bw, buf, block_begin, &sink, statics, pos == in_end);
+        if pos == in_end {
+            break;
+        }
     }
-
-    // End-of-block symbol, then a final flush.
-    bw.add_bits_raw(
-        litcode.codewords[DEFLATE_END_OF_BLOCK] as u64,
-        litcode.lens[DEFLATE_END_OF_BLOCK] as u32,
-    );
-    // SAFETY: see above; the reserved slack covers this final flush.
-    unsafe { bw.flush_word_unchecked() };
-}
-
-/// Emit one back-reference: the packed length codeword, then the distance
-/// codeword + extra distance bits, then a single whole-word flush.
-///
-/// The accumulator holds <= 7 bits on entry; a match adds at most
-/// `14 (full len) + 5 (dist sym) + 13 (dist extra) = 32` bits, so 7 + 32 = 39
-/// stays under the 63-bit ceiling — one flush per match, no intermediate drain.
-#[inline]
-fn emit_match(
-    bw: &mut BitWriter,
-    full_len: &FullLenCodewords,
-    offcode: &super::super::huffman::HuffmanCode,
-    length: u32,
-    dist: u32,
-) {
-    debug_assert!((1..=WINDOW as u32).contains(&dist));
-    bw.add_bits_raw(
-        full_len.codewords[length as usize] as u64,
-        full_len.lens[length as usize] as u32,
-    );
-    let os = offset_slot(dist) as usize;
-    bw.add_bits_raw(offcode.codewords[os] as u64, offcode.lens[os] as u32);
-    bw.add_bits_raw(
-        (dist - OFFSET_SLOT_BASE[os]) as u64,
-        OFFSET_EXTRA_BITS[os] as u32,
-    );
-    // SAFETY: the caller (`run`) reserved worst-case output capacity, so 8 spare
-    // bytes are available for this flush.
-    unsafe { bw.flush_word_unchecked() };
 }
