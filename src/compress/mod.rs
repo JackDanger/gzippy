@@ -84,12 +84,14 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     }
 
     if opt_config.thread_count == 1 && args.compression_level <= 9 {
-        // Measurement routing: pure-Rust DEFLATE encoder for T1 L2–L9.
+        // Measurement routing: pure-Rust DEFLATE encoder for T1 L1–L9.
         // Compile-time gated (`pure-rust-encoder`); OFF in the default build.
+        // L1 takes the igzip-class one-pass FAST path (Increment 4); L2–L9 take
+        // the greedy/lazy/near-optimal parsers.
         #[cfg(feature = "pure-rust-encoder")]
-        if (2..=9).contains(&args.compression_level) && !args.huffman && !args.rle {
+        if (1..=9).contains(&args.compression_level) && !args.huffman && !args.rle {
             if args.verbosity >= 2 {
-                eprintln!("gzippy: using pure-Rust DEFLATE encoder (T1 L2–L9)");
+                eprintln!("gzippy: using pure-Rust DEFLATE encoder (T1 L1–L9)");
             }
             let mut input = Vec::new();
             reader.read_to_end(&mut input)?;

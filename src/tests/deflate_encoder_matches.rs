@@ -459,4 +459,169 @@ mod tests {
             prop_assert_eq!(decoded, input);
         }
     }
+
+    // ======================================================================
+    // Increment 4 — igzip-class one-pass FAST path (L1) correctness + sanity.
+    // ======================================================================
+    //
+    // L1 is a NEW mode: a single static-Huffman block emitted directly from a
+    // chainless single-probe matchfinder. It is not byte-identical to any tool;
+    // the only correctness contract is that its gzip stream decodes BACK to the
+    // exact input through every oracle. Ratio is a soft "actually compresses,
+    // no wild blowup" sanity — NOT a perf/ratio claim (the caller gates that).
+
+    /// gzip-framed size of `data` under flate2/zlib-ng at `level` (the stable,
+    /// always-present ratio reference, comparable to `gzip -level`).
+    fn flate2_gzip_size(data: &[u8], level: u32) -> usize {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+        e.write_all(data).unwrap();
+        e.finish().unwrap().len()
+    }
+
+    /// The L1 fast path must roundtrip-decode through all three oracles across
+    /// the full adversarial corner corpus.
+    #[test]
+    fn fast_l1_roundtrip_three_oracles() {
+        // empty / tiny / hello×N.
+        assert_roundtrips_level(b"", "empty", 1);
+        assert_roundtrips_level(b"A", "one-byte", 1);
+        assert_roundtrips_level(b"ab", "two-byte", 1);
+        assert_roundtrips_level(b"abc", "three-byte", 1);
+        assert_roundtrips_level(b"abcd", "four-byte", 1);
+        assert_roundtrips_level(b"hello", "hello", 1);
+        assert_roundtrips_level(&b"hello".repeat(1000), "hello-x1000", 1);
+        assert_roundtrips_level(b"hello, world! hello, world!", "short-text", 1);
+
+        // all-same-byte (maximal back-to-back matches) + a small-block repeat.
+        assert_roundtrips_level(&vec![b'Z'; 300_000], "all-same-300k", 1);
+        let block: Vec<u8> = (0..100u32).map(|i| (i * 7) as u8).collect();
+        let repeated: Vec<u8> = block.iter().cloned().cycle().take(250_000).collect();
+        assert_roundtrips_level(&repeated, "block100-repeat", 1);
+
+        // incompressible-64K (only-literals path; may expand slightly — must
+        // still roundtrip). Plus a just-over-64KiB boundary case.
+        let mut incompressible = vec![0u8; 64 * 1024];
+        Rng::new(0xC0FFEE).fill(&mut incompressible);
+        assert_roundtrips_level(&incompressible, "incompressible-64k", 1);
+        let mut boundary = vec![0u8; 65_536 + 100];
+        Rng::new(7).fill(&mut boundary);
+        assert_roundtrips_level(&boundary, "stored-boundary", 1);
+
+        // long matches + distant window-straddling repeats (high offset slots).
+        let pattern: Vec<u8> = (0..400u32)
+            .map(|i| (i.wrapping_mul(131) ^ 0x5A) as u8)
+            .collect();
+        let mut rng = Rng::new(0xD157A17);
+        let mut filler = vec![0u8; 31_000];
+        rng.fill(&mut filler);
+        let mut data = Vec::new();
+        data.extend_from_slice(&pattern);
+        data.extend_from_slice(&filler);
+        data.extend_from_slice(&pattern); // distant repeat (~31 KiB back)
+        data.extend_from_slice(&filler[..5000]);
+        data.extend_from_slice(&pattern);
+        assert_roundtrips_level(&data, "distant-repeats", 1);
+
+        // multi-chunk / large text with recurring phrases.
+        let phrase = b"the pure-rust deflate encoder must roundtrip byte for byte. ";
+        let mut text = Vec::new();
+        for i in 0..4000 {
+            text.extend_from_slice(phrase);
+            if i % 7 == 0 {
+                text.extend_from_slice(format!("[marker {i}] ").as_bytes());
+            }
+        }
+        assert_roundtrips_level(&text, "recurring-phrases", 1);
+
+        // >= 1 MiB silesia slice through all three oracles; assert none skipped.
+        if let Some(sil) = silesia_slice(1 << 20) {
+            let n = assert_roundtrips_level(&sil, "silesia-1MiB", 1);
+            let expected = if gzip_available() { 3 } else { 2 };
+            assert_eq!(n, expected, "L1: an oracle was skipped");
+        } else {
+            eprintln!("note: silesia.tar missing; skipped L1 silesia roundtrip");
+        }
+    }
+
+    /// Ratio sanity: on a compressible corpus, L1 must actually shrink the input
+    /// and stay in a sane band vs `gzip -1` (fast mode may run a bit larger — the
+    /// static-Huffman speed trade — but a wild blowup signals a bug). Reports the
+    /// real numbers vs gzip -1 (and igzip -1 if that binary is on PATH).
+    #[test]
+    fn fast_l1_ratio_sanity() {
+        let data = silesia_slice(4_000_000).unwrap_or_else(|| {
+            // Fallback compressible corpus if silesia is unavailable.
+            let phrase = b"the quick brown fox jumps over the lazy dog. ";
+            phrase.iter().cloned().cycle().take(2_000_000).collect()
+        });
+
+        let ours = compress_gzip(&data, 1).len();
+        let gzip1 = flate2_gzip_size(&data, 1);
+        let gzip6 = flate2_gzip_size(&data, 6);
+
+        // Optional igzip -1 reference (best-effort; not required to be present).
+        let igzip1 = igzip_cli_size(&data, 1);
+
+        eprintln!(
+            "L1 ratio sanity: raw={} ours_L1={ours} ({:.3}x raw)  gzip_L1={gzip1} \
+             (ours/gzip1={:.3})  gzip_L6={gzip6}{}",
+            data.len(),
+            ours as f64 / data.len() as f64,
+            ours as f64 / gzip1 as f64,
+            match igzip1 {
+                Some(s) => format!("  igzip_L1={s} (ours/igzip1={:.3})", ours as f64 / s as f64),
+                None => "  igzip_L1=n/a".to_string(),
+            },
+        );
+
+        // (1) It actually compresses.
+        assert!(
+            ours < data.len(),
+            "L1 output {ours} not smaller than raw {}",
+            data.len()
+        );
+        // (2) Within a sane band of gzip -1 (allow the static-Huffman trade).
+        let bound = (gzip1 as f64 * 1.15) as usize;
+        assert!(
+            ours <= bound,
+            "L1 output {ours} exceeds gzip -1 {gzip1} by >15% (bound {bound}) — likely a bug",
+        );
+    }
+
+    /// gzip-framed size under the `igzip` CLI at `level`, or `None` if `igzip`
+    /// is not installed / fails (e.g. non-x86 boxes).
+    fn igzip_cli_size(data: &[u8], level: u32) -> Option<usize> {
+        let mut child = Command::new("igzip")
+            .arg(format!("-{level}"))
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let buf = data.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&buf);
+        });
+        let out = child.wait_with_output().ok()?;
+        let _ = writer.join();
+        if !out.status.success() {
+            return None;
+        }
+        Some(out.stdout.len())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 240, max_shrink_iters: 4000, ..ProptestConfig::default() })]
+
+        /// Roundtrip the L1 fast path over the adversarial generator: every input
+        /// must decode back byte-exact through flate2.
+        #[test]
+        fn prop_fast_l1_roundtrip_flate2(input in adversarial_bytes()) {
+            let gz = compress_gzip(&input, 1);
+            let decoded = decode_flate2(&gz);
+            prop_assert_eq!(decoded, input);
+        }
+    }
 }

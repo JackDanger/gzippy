@@ -6,9 +6,9 @@
 //! the greedy/lazy parsers consume: `max_search_depth` and `nice_match_length`.
 //!
 //! Increment 2 implements the greedy (L2-4) and lazy/lazy2 (L5-9) strategies;
-//! Increment 3 adds the near-optimal (L10-12) strategy. The one remaining
-//! fallback:
-//!   * L1  (`deflate_compress_fastest`, ht_matchfinder) → **greedy** (TODO Inc4).
+//! Increment 3 adds the near-optimal (L10-12) strategy; Increment 4 adds the
+//! igzip-class one-pass FAST strategy for L1 (chainless single-probe hash table
+//! + direct-emit static Huffman — a port of igzip `isal_deflate_body_base`).
 //! L0 stays a pure stored-block passthrough.
 
 use super::tables::DEFLATE_MAX_MATCH_LEN;
@@ -18,6 +18,11 @@ use super::tables::DEFLATE_MAX_MATCH_LEN;
 pub enum Strategy {
     /// Level 0: emit stored (uncompressed) blocks only — no match finding.
     Stored,
+    /// Level 1: igzip-class one-pass fast path — chainless single-probe
+    /// hash-table matchfinder + direct-emit through a fixed (static) Huffman
+    /// table. No hash chains, no per-block histogram/tree build, no block
+    /// splitting (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`).
+    Fast,
     /// Greedy parse: always take the longest match at each position.
     Greedy,
     /// Lazy parse: defer a match one byte to check for a longer one.
@@ -76,12 +81,14 @@ pub fn params(level: u32) -> LevelParams {
             nice_match_length: 32,
             near_optimal: NONE_NO,
         },
-        // TODO(Increment 4): native L1 is `deflate_compress_fastest`
-        // (ht_matchfinder, fixed-length blocks). Until it exists, route L1
-        // through the greedy parser with light search settings.
+        // Native L1 is the igzip-class one-pass FAST path (Increment 4):
+        // chainless single-probe hash table + direct-emit static Huffman. The
+        // search-depth / nice-len knobs are unused by `Strategy::Fast` (it does
+        // exactly one probe per position); they are left at the vendor-ish
+        // values only so the struct is populated.
         1 => LevelParams {
-            strategy: Strategy::Greedy,
-            max_search_depth: 6,
+            strategy: Strategy::Fast,
+            max_search_depth: 1,
             nice_match_length: 32,
             near_optimal: NONE_NO,
         },
@@ -186,7 +193,7 @@ mod tests {
     #[test]
     fn strategy_mapping_matches_increment_scope() {
         assert_eq!(params(0).strategy, Strategy::Stored);
-        assert_eq!(params(1).strategy, Strategy::Greedy); // fallback
+        assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
         for l in 2..=4 {
             assert_eq!(params(l).strategy, Strategy::Greedy, "level {l}");
         }

@@ -28,6 +28,7 @@ use super::tables::{
     MAX_OFFSET_CODEWORD_LEN, OFFSET_EXTRA_BITS, OFFSET_SLOT_BASE,
 };
 
+mod fast;
 mod greedy;
 mod lazy;
 mod near_optimal;
@@ -156,6 +157,7 @@ pub(super) fn compress(
 ) {
     let statics = StaticCodes::build();
     match params.strategy {
+        Strategy::Fast => fast::run(buf, data_start, in_end, &statics, bw),
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw),
         Strategy::Lazy => lazy::run(buf, data_start, in_end, params, &statics, bw, false),
         Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true),
