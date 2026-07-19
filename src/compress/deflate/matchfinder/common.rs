@@ -21,16 +21,45 @@ const WORDBYTES: usize = 8;
 ///
 /// `lz_hash(seq, bits) = (seq * 0x1E35A7BD) >> (32 - bits)` with wrapping
 /// multiply.
-#[inline]
+#[inline(always)]
 pub fn lz_hash(seq: u32, num_bits: u32) -> u32 {
     seq.wrapping_mul(0x1E35A7BD) >> (32 - num_bits)
 }
 
-#[inline]
-fn load_u64(data: &[u8], pos: usize) -> u64 {
-    // Safe unaligned little-endian 8-byte load; caller guarantees the bytes
-    // exist (pos + 8 <= data.len()).
-    u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())
+/// Unaligned little-endian 4-byte load from `base.add(off)` (port of libdeflate
+/// `get_unaligned_le32`). Raw-pointer codegen — no slice bounds check, mirroring
+/// the C hot loop.
+///
+/// # Safety
+/// The caller MUST guarantee the 4 bytes `[off, off + 4)` are within the
+/// allocation `base` points into. Every call site in the matchfinder pairs this
+/// with a `debug_assert!(off + 4 <= buf.len())` proving that from the module's
+/// soundness invariant.
+#[inline(always)]
+pub unsafe fn load_u32(base: *const u8, off: usize) -> u32 {
+    // read_unaligned tolerates any alignment; `.to_le()`/`from_le` normalizes to
+    // little-endian to match `get_unaligned_le32` on every target.
+    u32::from_le(core::ptr::read_unaligned(base.add(off) as *const u32))
+}
+
+/// Unaligned little-endian low-3-byte load (port of `load_u24_unaligned`):
+/// a `load_u32` masked to its low 24 bits.
+///
+/// # Safety
+/// Same contract as [`load_u32`]: the 4 bytes `[off, off + 4)` must be in bounds
+/// (the u24 path always has >= 4 readable bytes at the call site).
+#[inline(always)]
+pub unsafe fn load_u24(base: *const u8, off: usize) -> u32 {
+    load_u32(base, off) & 0x00FF_FFFF
+}
+
+/// Unaligned little-endian 8-byte load from `base.add(off)`.
+///
+/// # Safety
+/// The 8 bytes `[off, off + 8)` must be within the allocation `base` points into.
+#[inline(always)]
+unsafe fn load_u64(base: *const u8, off: usize) -> u64 {
+    u64::from_le(core::ptr::read_unaligned(base.add(off) as *const u64))
 }
 
 /// Return the length of the match between the bytes at `str_pos` and
@@ -40,7 +69,7 @@ fn load_u64(data: &[u8], pos: usize) -> u64 {
 /// Word-at-a-time XOR + trailing-zero-count fast path (port of `lz_extend`).
 /// Contract: `str_pos + max_len <= data.len()` and `match_pos + max_len <=
 /// data.len()`, so the word loads never read out of bounds.
-#[inline]
+#[inline(always)]
 pub fn lz_extend(
     data: &[u8],
     str_pos: usize,
@@ -50,18 +79,31 @@ pub fn lz_extend(
 ) -> u32 {
     let mut len = start_len as usize;
     let max = max_len as usize;
+    let base = data.as_ptr();
 
-    while len + WORDBYTES <= max {
-        let v = load_u64(data, match_pos + len) ^ load_u64(data, str_pos + len);
-        if v != 0 {
-            // Little-endian: the first differing byte is at trailing_zeros/8.
-            return (len + (v.trailing_zeros() as usize >> 3)) as u32;
+    // SAFETY: the contract is `str_pos + max_len <= data.len()` and
+    // `match_pos + max_len <= data.len()` (documented above; upheld by
+    // `adjust_max_and_nice_len` clamping max_len to the remaining input). Every
+    // load below reads bytes at offset `< str_pos + max` or `< match_pos + max`,
+    // all `<= data.len()`. The debug_asserts trap any caller that breaks it.
+    debug_assert!(str_pos + max <= data.len());
+    debug_assert!(match_pos + max <= data.len());
+    unsafe {
+        while len + WORDBYTES <= max {
+            // Reads [match_pos+len, +8) and [str_pos+len, +8); len+8 <= max.
+            let v = load_u64(base, match_pos + len) ^ load_u64(base, str_pos + len);
+            if v != 0 {
+                // Little-endian: the first differing byte is at trailing_zeros/8.
+                return (len + (v.trailing_zeros() as usize >> 3)) as u32;
+            }
+            len += WORDBYTES;
         }
-        len += WORDBYTES;
-    }
 
-    while len < max && data[str_pos + len] == data[match_pos + len] {
-        len += 1;
+        while len < max
+            && *data.get_unchecked(str_pos + len) == *data.get_unchecked(match_pos + len)
+        {
+            len += 1;
+        }
     }
     len as u32
 }
