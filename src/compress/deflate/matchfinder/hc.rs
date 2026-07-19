@@ -95,7 +95,29 @@ impl HcMatchfinder {
     /// returned length is `best_len_in` and the offset is meaningless (0). The
     /// caller must ensure `buf` is padded so 4-byte loads up to
     /// `in_next + best_len + 1` stay in bounds.
-    #[inline(always)]
+    ///
+    /// ## Codegen: outlined on x86_64 (`#[inline(never)]`), inlined elsewhere
+    /// libdeflate force-inlines its `hc_matchfinder_longest_match` into the
+    /// greedy/lazy parse loop, but on x86_64 (15 GPRs) rustc's register
+    /// allocator does *not* match that: fusing this finder into
+    /// `parse::lazy::run` (which contains TWO finder call sites — greedy pos +
+    /// lazy+1 lookahead — plus the skip/hash insert and histogram) exhausts the
+    /// integer register file, so rustc spills the loop-invariant
+    /// window/buffer/chain bases to the stack and reloads them on every chain
+    /// step (measured: an 18-instruction inner cycle with four `mov …(%rsp)`
+    /// reloads, vs libdeflate's ~11). Giving the finder its own function
+    /// boundary on x86_64 lets rustc allocate the hot chain-walk with clean
+    /// register pressure — the invariants pin in registers and the inner cycle
+    /// drops to 14 instructions with zero stack reloads.
+    ///
+    /// On register-rich ISAs (aarch64 has 31 GPRs) the fused loop does NOT
+    /// spill, so the outline is pure call overhead — a measured M1 single-thread
+    /// regression. There the finder stays inlined (`#[inline(always)]`). The
+    /// `#[cfg_attr]` split changes only WHERE the loop compiles per-arch, never
+    /// which matches it finds; output is byte-identical on every arch, pinned by
+    /// the `matches_equal_scalar_*` nets and the corpus differential.
+    #[cfg_attr(target_arch = "x86_64", inline(never))]
+    #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
     #[allow(clippy::too_many_arguments)]
     pub fn longest_match(
         &mut self,
@@ -131,6 +153,23 @@ impl HcMatchfinder {
         // by the debug_assert bounds checks, so it is dead in release builds.
         let base = buf.as_ptr();
         let blen = buf.len();
+
+        // Codegen: the single combined window base. A candidate at chain node
+        // `cur_node` lives at buffer offset `in_base_v + cur_node`, i.e. at the
+        // pointer `base + in_base_v + cur_node`. libdeflate holds this as ONE
+        // `in_base` pointer and forms `matchptr = in_base + cur_node` with a
+        // single `add`; rustc, given the two separate values `base` (buf) and
+        // `in_base_v` (window offset), instead emits an `add` (in_base) AND a
+        // `lea` (buf base) on every chain step. Precomputing the fused pointer
+        // `win = base + in_base_v` (loop-invariant, hoisted out of the walk)
+        // lets each candidate address form as a single `win + cur_node`. Every
+        // dereferenced candidate has `cur_node > cutoff`, so
+        // `in_base_v + cur_node ∈ [0, in_next)` is in bounds; `wrapping_offset`
+        // (below, on the signed chain node) keeps pointer formation defined for
+        // the off-object chain-end prefetch. `in_base_v <= in_next <= buf.len()`,
+        // so `win` itself is in bounds (or one-past); `wrapping_add` avoids the
+        // `usize as isize` round-trip.
+        let win = base.wrapping_add(in_base_v);
 
         let hash3 = next_hashes[0] as usize;
         let hash4 = next_hashes[1] as usize;
@@ -218,17 +257,24 @@ impl HcMatchfinder {
                         .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
                 };
                 loop {
-                    matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
+                    // Candidate address `win + cur_node == base + matchptr`
+                    // formed as a single `lea` (see `win`).
+                    let cand_ptr = win.wrapping_offset(cur_node4 as isize);
                     // Prefetch the next node's match data one iteration ahead.
                     // `wrapping_offset` keeps pointer formation defined even when
                     // `next_node <= cutoff` (a chain end maps off-object); the
                     // prefetch itself never faults.
-                    prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
+                    prefetch_read(win.wrapping_offset(next_node as isize));
                     // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
-                    // `matchptr + 4 <= in_next + 4 <= buf.len()`.
+                    // `matchptr + 4 <= in_next + 4 <= buf.len()`; `cand_ptr` is
+                    // `base + matchptr`, so `load_u32(cand_ptr, 0)` reads those
+                    // in-bounds 4 bytes.
                     let cand = unsafe {
-                        debug_assert!(matchptr < in_next && matchptr + 4 <= blen);
-                        load_u32(base, matchptr)
+                        debug_assert!(
+                            ((in_base_v as isize + cur_node4 as isize) as usize) < in_next
+                                && (in_base_v as isize + cur_node4 as isize) as usize + 4 <= blen
+                        );
+                        load_u32(cand_ptr, 0)
                     };
                     if cand == seq4 {
                         break;
@@ -249,7 +295,10 @@ impl HcMatchfinder {
                     };
                 }
 
-                // Found a length-4 match; extend it fully.
+                // Found a length-4 match; extend it fully. `cur_node4` is the
+                // matched node (the loop breaks without advancing it), so
+                // `matchptr` is its buffer offset.
+                matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                 best_matchptr = matchptr;
                 best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
                 if best_len >= nice_len {
@@ -283,10 +332,12 @@ impl HcMatchfinder {
             };
             loop {
                 loop {
-                    matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
+                    // Candidate address `win + cur_node == base + matchptr`,
+                    // formed as a single `lea` (see `win`).
+                    let cand_ptr = win.wrapping_offset(cur_node4 as isize);
                     // Prefetch the next node's match data one iteration ahead
                     // (see the length-4 walk for the correctness argument).
-                    prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
+                    prefetch_read(win.wrapping_offset(next_node as isize));
                     // Prefilter: compare the last 4 and the first 4 bytes before
                     // attempting a full extension.
                     let off = best_len as usize - 3;
@@ -294,13 +345,20 @@ impl HcMatchfinder {
                     // with `best_len <= max_len`, so `in_next + off + 4 <=
                     // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
                     // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
+                    // `cand_ptr == base + matchptr`, so `load_u32(cand_ptr, k)`
+                    // reads `[matchptr + k, matchptr + k + 4)`.
                     let (m_hi, n_hi, m_lo, n_lo) = unsafe {
-                        debug_assert!(matchptr < in_next);
-                        debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
+                        debug_assert!(
+                            ((in_base_v as isize + cur_node4 as isize) as usize) < in_next
+                        );
+                        debug_assert!(
+                            (in_base_v as isize + cur_node4 as isize) as usize + off + 4 <= blen
+                                && in_next + off + 4 <= blen
+                        );
                         (
-                            load_u32(base, matchptr + off),
+                            load_u32(cand_ptr, off),
                             load_u32(base, in_next + off),
-                            load_u32(base, matchptr),
+                            load_u32(cand_ptr, 0),
                             load_u32(base, in_next),
                         )
                     };
@@ -323,6 +381,9 @@ impl HcMatchfinder {
                     };
                 }
 
+                // `cur_node4` is the matched node (the inner loop breaks without
+                // advancing it); recover its buffer offset for the extension.
+                matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                 let len = lz_extend(buf, in_next, matchptr, 4, max_len);
                 if len > best_len {
                     best_len = len;
