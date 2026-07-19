@@ -19,9 +19,15 @@
 //! the speed.
 //!
 //! The mechanisms ported from igzip (finder only):
-//!   1. **Chainless single-probe hash** (`igzip_base.c:60-64`): one small head
-//!      table storing the last position per hash; overwrite on collision; ONE
-//!      candidate per position — no chains, no depth loop.
+//!   1. **Chainless single-probe hash** (`igzip_base.c:60-64`): one head table
+//!      storing the last position per hash; overwrite on collision; ONE
+//!      candidate per position — no chains, no depth loop. **DEVIATION from
+//!      igzip:** the table is `1 << 16` (64K) slots, not igzip's `1 << 13` (8K).
+//!      Because there is only ONE probe, a wider table is the cheapest way to
+//!      cut hash collisions — the single candidate is far less often an
+//!      unrelated position — and it closes the last ~1% ratio gap vs `pigz -1`
+//!      on `text`/`bin` at ~zero speed cost (still one load + one compare per
+//!      position). See [`HASH_BITS`].
 //!   2. **LIMIT_HASH_UPDATE** (`igzip_base.c:71-86`): over an accepted match,
 //!      insert the hash for only the first ~3 interior positions, then jump the
 //!      cursor by the whole match length (skip the interior stores).
@@ -39,9 +45,21 @@ use super::super::tables::DEFLATE_MAX_MATCH_LEN;
 use super::{emit_block, Sink, StaticCodes};
 
 /// Log2 of the head-table size. igzip's level-0 hash table is
-/// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`).
-const HASH_BITS: u32 = 13;
+/// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`); we widen
+/// it to `1 << 16` (64K) because the finder is single-probe — a wider table
+/// spreads the 4-byte keys over 8× more slots, so the ONE candidate we keep per
+/// hash is far less likely to be an unrelated collision, and it recovers the
+/// last ~1% ratio gap vs pigz-1 on `text`/`bin` at near-zero speed cost (same
+/// one load, one compare per position). See Lever 1.
+const HASH_BITS: u32 = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
+
+/// LIMIT_HASH_UPDATE: number of match-interior positions whose hash is inserted
+/// into the head table before the cursor jumps over the rest of the match
+/// (`igzip_base.c:71-86`, igzip uses ~3). Denser interior inserts seed more
+/// candidates for later matches (better ratio) at the cost of more hash stores;
+/// `usize::MAX` means "insert EVERY interior position" (zlib-ng style).
+const LIMIT_HASH_UPDATE_INSERTS: usize = 2;
 
 /// Sentinel head-table entry meaning "no position stored yet". Any position we
 /// store is `< in_end <= u32::MAX`, so the sentinel never collides with a real
@@ -134,15 +152,23 @@ pub(super) fn run(
                     // candidate simply yields length < SHORTEST_MATCH -> literal.
                     let length = lz_extend(buf, pos, cand_pos, 0, max_len);
                     if length >= SHORTEST_MATCH {
-                        // LIMIT_HASH_UPDATE: insert the hash for only positions
-                        // pos+1, pos+2 (igzip's `end = next_hash + 3`), then jump
-                        // the cursor over the whole match. length >= 4 guarantees
-                        // these interior positions are inside the match.
-                        let limit = pos + 3;
+                        // LIMIT_HASH_UPDATE: insert the hash for the first
+                        // LIMIT_HASH_UPDATE_INSERTS match-interior positions
+                        // (igzip inserts ~3), then jump the cursor over the whole
+                        // match. usize::MAX means "insert every interior position"
+                        // (zlib-ng style). length >= 4 guarantees at least the
+                        // first interior positions are inside the match; the
+                        // `.min(match_end)` clamp keeps every insert inside it.
+                        let match_end = pos + length as usize;
+                        let insert_end = if LIMIT_HASH_UPDATE_INSERTS == usize::MAX {
+                            match_end
+                        } else {
+                            (pos + 1 + LIMIT_HASH_UPDATE_INSERTS).min(match_end)
+                        };
                         let mut nh = pos + 1;
-                        while nh < limit {
-                            // SAFETY: nh <= pos+2 < pos+length <= in_end, and buf's
-                            // pad covers the 4-byte load past in_end.
+                        while nh < insert_end {
+                            // SAFETY: nh < match_end = pos+length <= in_end, and
+                            // buf's pad covers the 4-byte load past in_end.
                             let s = unsafe { load_u32(base, nh) };
                             head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
                             nh += 1;

@@ -486,6 +486,32 @@ mod tests {
         e.finish().unwrap().len()
     }
 
+    /// `pigz -{level} -c` output size via the system binary, or `None` when
+    /// `pigz` is not on PATH (CI without pigz) so the caller skips the pigz
+    /// assertion rather than failing. This is the actual rival the Lever-1
+    /// fast-L1 ratio target is stated against.
+    fn pigz_gzip_size(data: &[u8], level: u32) -> Option<usize> {
+        let mut child = Command::new("pigz")
+            .arg(format!("-{level}"))
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let buf = data.to_vec();
+        let w = std::thread::spawn(move || {
+            let _ = stdin.write_all(&buf);
+        });
+        let out = child.wait_with_output().ok()?;
+        w.join().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(out.stdout.len())
+    }
+
     /// The L1 fast path must roundtrip-decode through all three oracles across
     /// the full adversarial corner corpus.
     #[test]
@@ -652,10 +678,16 @@ mod tests {
             let ld1_ms = tl.elapsed().as_secs_f64() * 1e3;
 
             let gzip1 = flate2_gzip_size(data, 1);
+            // pigz -1 (the stated Lever-1 rival). None when pigz is absent.
+            let pigz1 = pigz_gzip_size(data, 1);
+            let pigz_str = match pigz1 {
+                Some(p) => format!("pigz-1={p} (fastL1/pigz1={:.3})", ours as f64 / p as f64),
+                None => "pigz-1=<absent>".to_string(),
+            };
 
             eprintln!(
                 "L1 [{label}]: raw={} fastL1={ours} ({:.3}x raw, {ours_ms:.1}ms)  \
-                 gzip-1={gzip1} (fastL1/gzip1={:.3})  \
+                 gzip-1={gzip1} (fastL1/gzip1={:.3})  {pigz_str}  \
                  libdeflate-1={ld1} (fastL1/ld1={:.3}, {ld1_ms:.1}ms)",
                 data.len(),
                 ours as f64 / data.len() as f64,
@@ -676,6 +708,23 @@ mod tests {
                     "[{label}] fastL1={ours} > gzip-1={gzip1} ({:.3}x)",
                     ours as f64 / gzip1 as f64
                 ));
+            }
+            // (3) Lever-1 target: fast-L1 must be no larger than pigz -1 on the
+            // TEXT corpus — the cell the lever set out to close (widening the
+            // single-probe hash 8K->64K flips text from ~1.007x to ~0.97x pigz).
+            // Checked only when pigz is on PATH. Binary and silesia are RECORDED
+            // (eprintln above) but NOT asserted: the chainless single-probe
+            // finder is ~1% over pigz's short-hash-chain greedy on binary data —
+            // a characterized floor that needs chain depth (out of Lever-1
+            // scope) to close, and bin's actual open cell is orchestration.
+            if let Some(p) = pigz1 {
+                if label.contains("text") && ours > p {
+                    failures.push(format!(
+                        "[{label}] fastL1={ours} > pigz-1={p} ({:.3}x) — TEXT ratio \
+                         target regressed",
+                        ours as f64 / p as f64
+                    ));
+                }
             }
         }
         assert!(
