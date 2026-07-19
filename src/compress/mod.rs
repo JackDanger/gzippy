@@ -79,7 +79,15 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
         let mut input = Vec::new();
         reader.read_to_end(&mut input)?;
         let bytes = input.len() as u64;
-        let gz = crate::compress::deflate::compress_gzip(&input, args.compression_level as u32);
+        // Pad the read buffer in place with the matchfinder's trailing slack so
+        // the compressor parses IN PLACE — no second full-input work buffer.
+        let logical_len = input.len();
+        input.resize(logical_len + crate::compress::deflate::INPLACE_TAIL_PAD, 0);
+        let gz = crate::compress::deflate::compress_gzip_padded(
+            &input,
+            logical_len,
+            args.compression_level as u32,
+        );
         let mut writer = writer;
         writer.write_all(&gz)?;
         writer.flush()?;

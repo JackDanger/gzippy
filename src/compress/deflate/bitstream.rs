@@ -55,6 +55,21 @@ impl BitWriter {
         }
     }
 
+    /// Adopt `out` as the (byte-aligned) sink and append the DEFLATE stream
+    /// directly to it. The caller's existing bytes are preserved as the prefix;
+    /// [`finish`](Self::finish) hands the same `Vec` back with the stream
+    /// appended. This is the write-through constructor that lets the encoder emit
+    /// straight into the caller's output buffer instead of building a second Vec
+    /// and copying it over.
+    #[inline]
+    pub fn from_vec(out: Vec<u8>) -> Self {
+        BitWriter {
+            bitbuf: 0,
+            bitcount: 0,
+            out,
+        }
+    }
+
     /// Number of bits currently buffered (not yet flushed to bytes).
     #[inline]
     pub fn buffered_bits(&self) -> u32 {

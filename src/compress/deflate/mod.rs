@@ -48,6 +48,13 @@ pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
     out
 }
 
+/// Number of trailing pad bytes a caller-owned buffer must carry past the
+/// logical input end so the matchfinder's speculative word loads always stay in
+/// bounds. Re-exported for the in-place T1 path, which pads its read buffer once
+/// (`resize(len + PAD, 0)`) rather than copying the input into a second padded
+/// buffer. Must equal [`parse::BUF_PAD`].
+pub const INPLACE_TAIL_PAD: usize = parse::BUF_PAD;
+
 /// Compress `data` into a raw DEFLATE stream, appending to `out`.
 ///
 /// `dict` is an optional preset-dictionary window: its bytes are seeded into the
@@ -91,37 +98,90 @@ pub fn compress_block_streaming(
     is_last: bool,
     out: &mut Vec<u8>,
 ) {
-    let mut bw = BitWriter::with_capacity(data.len() / 2 + 64);
+    // Output write-through: emit the DEFLATE stream straight into the caller's
+    // `out` (adopting it as the sink) instead of building a second Vec and
+    // copying it over. `mem::take` moves the existing buffer in and `finish`
+    // moves it back, so the caller's bytes are preserved as the prefix and no
+    // output-sized buffer is duplicated.
+    let mut bw = BitWriter::from_vec(std::mem::take(out));
 
-    if data.is_empty() {
-        emit_stored_block(&mut bw, &[], is_last);
+    if dict.is_empty() {
+        // No preset dictionary: build a padded working buffer [data | pad] so
+        // the matchfinder's speculative loads stay in bounds. (Callers holding a
+        // buffer that already carries the pad — the T1 hot path — should use
+        // `compress_gzip_padded` / `deflate_padded_in_place` to skip this copy.)
+        let mut buf = Vec::with_capacity(data.len() + parse::BUF_PAD);
+        buf.extend_from_slice(data);
+        buf.resize(data.len() + parse::BUF_PAD, 0);
+        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last);
+    } else {
+        // Preset-dictionary chunk: prepend the dictionary into one padded buffer
+        // [dict | data | pad] and parse over the data region with the dictionary
+        // seeded ahead of it (matches may point back into it).
+        let dict_len = dict.len();
+        let in_end = dict_len + data.len();
+        let mut buf = Vec::with_capacity(in_end + parse::BUF_PAD);
+        buf.extend_from_slice(dict);
+        buf.extend_from_slice(data);
+        buf.resize(in_end + parse::BUF_PAD, 0);
+        deflate_into(&mut bw, &buf, dict_len, in_end, level, is_last);
+    }
+
+    *out = bw.finish();
+}
+
+/// Shared parse core: encode `buf[data_start..in_end]` into `bw`, treating
+/// `buf[..data_start]` as a seeded (but un-emitted) preset-dictionary window.
+///
+/// `buf` MUST carry at least [`parse::BUF_PAD`] trailing bytes past `in_end`
+/// that read as ZERO (the matchfinder's speculative loads reach up to `in_end +
+/// 1`, and the emitted bytes are byte-identical only when those pad bytes are
+/// zero — matches are clamped to `in_end` so the pad never enters the output).
+fn deflate_into(
+    bw: &mut BitWriter,
+    buf: &[u8],
+    data_start: usize,
+    in_end: usize,
+    level: u32,
+    is_last: bool,
+) {
+    debug_assert!(buf.len() >= in_end + parse::BUF_PAD);
+    if in_end == data_start {
+        emit_stored_block(bw, &[], is_last);
     } else {
         let params = level::params(level);
         if params.strategy == Strategy::Stored {
-            // Level 0: uncompressed blocks over the whole input.
-            emit_stored_block(&mut bw, data, is_last);
+            // Level 0: uncompressed blocks over the whole (new) input.
+            emit_stored_block(bw, &buf[data_start..in_end], is_last);
         } else {
-            // Build a padded working buffer [dict | data | pad] so the
-            // matchfinder's speculative word loads always stay in bounds, and
-            // parse over the data region with the dictionary seeded ahead of it.
-            let dict_len = dict.len();
-            let in_end = dict_len + data.len();
-            let mut buf = Vec::with_capacity(in_end + parse::BUF_PAD);
-            buf.extend_from_slice(dict);
-            buf.extend_from_slice(data);
-            buf.resize(in_end + parse::BUF_PAD, 0);
-
-            parse::compress(&buf, dict_len, in_end, &params, is_last, &mut bw);
+            parse::compress(buf, data_start, in_end, &params, is_last, bw);
         }
     }
 
     // Non-final chunk: close on a clean byte boundary with a sync-flush marker
     // so the next chunk's stream concatenates without stray bits.
     if !is_last {
-        emit_stored_block(&mut bw, &[], false);
+        emit_stored_block(bw, &[], false);
     }
+}
 
-    out.extend_from_slice(&bw.finish());
+/// Encode `buf[..logical_len]` (no preset dictionary) as a single final DEFLATE
+/// block, appended to `out` with no intermediate output buffer.
+///
+/// `buf` MUST already carry at least [`INPLACE_TAIL_PAD`] trailing zero bytes
+/// past `logical_len` (`buf.len() >= logical_len + INPLACE_TAIL_PAD`). This is
+/// the copy-free entry point: the caller pads its own read buffer once, so the
+/// input is parsed IN PLACE rather than copied into a second padded buffer, and
+/// the output is written through into `out`. Output is byte-identical to
+/// `compress_block(&buf[..logical_len], &[], level, out)`.
+pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: &mut Vec<u8>) {
+    assert!(
+        buf.len() >= logical_len + INPLACE_TAIL_PAD,
+        "deflate_padded_in_place: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
+    );
+    let mut bw = BitWriter::from_vec(std::mem::take(out));
+    deflate_into(&mut bw, buf, 0, logical_len, level, true);
+    *out = bw.finish();
 }
 
 /// Compress `data` into a gzip-framed stream (gzip header + DEFLATE + CRC32 +
@@ -137,6 +197,27 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
     let crc = crc32fast::hash(data);
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+/// Gzip-framed compression that parses IN PLACE over a caller-padded buffer.
+///
+/// `buf[..logical_len]` is the input; `buf` MUST carry at least
+/// [`INPLACE_TAIL_PAD`] trailing zero bytes past `logical_len`. This is the
+/// allocation-lean T1 entry point: the caller reads the input once (e.g. via
+/// `read_to_end`) and pads that same buffer (`resize(len + INPLACE_TAIL_PAD,
+/// 0)`), so the compressor neither copies the input into a second work buffer
+/// nor builds a separate output buffer. Output is byte-identical to
+/// `compress_gzip(&buf[..logical_len], level)`.
+pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(logical_len / 2 + 32);
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+
+    deflate_padded_in_place(buf, logical_len, level, &mut out);
+
+    let crc = crc32fast::hash(&buf[..logical_len]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(logical_len as u32).to_le_bytes());
     out
 }
 
@@ -288,6 +369,112 @@ mod streaming_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod inplace_tests {
+    use super::*;
+
+    /// Pad `data` into a fresh buffer the way the T1 hot path pads its read
+    /// buffer in place, then return `(padded, logical_len)`.
+    fn padded(data: &[u8]) -> (Vec<u8>, usize) {
+        let mut buf = data.to_vec();
+        buf.resize(data.len() + INPLACE_TAIL_PAD, 0);
+        (buf, data.len())
+    }
+
+    /// The copy-free in-place gzip path must be byte-identical to the reference
+    /// `compress_gzip` (which builds a separate padded work buffer).
+    fn assert_padded_gzip_matches(data: &[u8], level: u32) {
+        let reference = compress_gzip(data, level);
+        let (buf, logical_len) = padded(data);
+        let inplace = compress_gzip_padded(&buf, logical_len, level);
+        assert_eq!(
+            reference,
+            inplace,
+            "compress_gzip_padded diverged at L{level}, len={}",
+            data.len()
+        );
+    }
+
+    /// The raw-DEFLATE in-place path must match `compress_block` (append form).
+    fn assert_padded_block_matches(data: &[u8], level: u32) {
+        let mut reference = Vec::new();
+        compress_block(data, &[], level, &mut reference);
+        let (buf, logical_len) = padded(data);
+        let mut inplace = Vec::new();
+        deflate_padded_in_place(&buf, logical_len, level, &mut inplace);
+        assert_eq!(
+            reference,
+            inplace,
+            "deflate_padded_in_place diverged at L{level}, len={}",
+            data.len()
+        );
+    }
+
+    #[test]
+    fn inplace_matches_reference_edge_sizes() {
+        // Tiny inputs (< BUF_PAD), inputs exactly at the pad boundary, and a few
+        // multiples — the sizes where a speculative tail load is most likely to
+        // read into the pad region.
+        let motif = b"the quick brown fox 0123456789 ";
+        for &len in &[
+            0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 255, 256, 257, 511, 512,
+            4096, 4097,
+        ] {
+            let data: Vec<u8> = motif.iter().cloned().cycle().take(len).collect();
+            for level in [0u32, 1, 2, 6, 8, 9, 12] {
+                assert_padded_gzip_matches(&data, level);
+                assert_padded_block_matches(&data, level);
+            }
+        }
+        // Incompressible tail sizes too (chain misses, no long matches).
+        for &len in &[13usize, 16, 19, 258, 259, 300] {
+            let data: Vec<u8> = (0..len as u32)
+                .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+                .collect();
+            for level in [1u32, 6, 9, 12] {
+                assert_padded_gzip_matches(&data, level);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(192))]
+
+        /// On ANY input — including empty, sub-BUF_PAD, and boundary-straddling
+        /// lengths — the in-place path is byte-identical to the copy-based
+        /// reference at every strategy class.
+        #[test]
+        fn inplace_byte_identical_proptest(data in gen_data()) {
+            for level in [0u32, 1, 6, 9, 12] {
+                assert_padded_gzip_matches(&data, level);
+                assert_padded_block_matches(&data, level);
+            }
+        }
+    }
+
+    /// Adversarial generator biased toward the small / boundary lengths that
+    /// exercise the near-EOF speculative loads, plus runs and repeats.
+    fn gen_data() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        prop_oneof![
+            // Short random (straddles the max_len<5 gate and BUF_PAD).
+            proptest::collection::vec(any::<u8>(), 0..40),
+            // Runs (deep chains / long matches near EOF).
+            (any::<u8>(), 0usize..300).prop_map(|(b, n)| vec![b; n]),
+            // Repeated motif of a boundary-ish length.
+            (proptest::collection::vec(any::<u8>(), 1..20), 0usize..40).prop_map(|(seed, reps)| {
+                seed.iter()
+                    .cloned()
+                    .cycle()
+                    .take(seed.len() * reps)
+                    .collect()
+            }),
+            // Larger mixed buffer.
+            proptest::collection::vec(any::<u8>(), 0..2048),
+        ]
     }
 }
 
