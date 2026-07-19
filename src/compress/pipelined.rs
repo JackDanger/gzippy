@@ -28,9 +28,6 @@ thread_local! {
     static PIPELINED_COMPRESS: RefCell<Option<(u32, Compress)>> = const { RefCell::new(None) };
 }
 
-/// Default block size for pipelined compression - matches pigz (128KB)
-const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
-
 /// Dictionary size (DEFLATE maximum is 32KB)
 const DICT_SIZE: usize = 32 * 1024;
 
@@ -38,20 +35,49 @@ struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
 // Safety: each slot is written by exactly one worker before all threads join.
 unsafe impl Sync for CrcSlot {}
 
-/// Block size for pipelined compression.
+/// Largest parallel chunk. Each chunk pays exactly one CRC-combine and one
+/// sync-flush seam, so orchestration cost falls as the chunk grows; 512KB
+/// roughly halves the chunk count of the old 192KB grid while still leaving
+/// ≥~4 chunks/thread at T16 on our smallest (35MB) corpus (35MB/512KB = 68
+/// chunks). Bigger chunks also *shrink* output (fewer Huffman-table resets and
+/// fewer stored sync-flush seams), so ratio holds-or-improves. See Lever 2.
+const MAX_PARALLEL_BLOCK_SIZE: usize = 512 * 1024;
+
+/// Smallest parallel chunk for the small-file floor. Keeps tiny inputs split
+/// into a few chunks (a 1MB file becomes ~8×128KB, not one chunk) so the
+/// parallel path still has work to hand out.
+const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
+
+/// Target number of parallel chunks for inputs below the large-file cutoff.
+/// Used only to derive the small-file block size from `input_len`.
+const SMALL_FILE_TARGET_CHUNKS: usize = 16;
+
+/// Block size for the parallel pipelined chunk grid.
 ///
-/// For GHA's 4-vCPU environment with 100MB+ files, the coordination overhead
-/// of 780+ blocks dominates. Use slightly larger blocks (192KB) for very large
-/// files to reduce block count while staying within compression ratio limits.
+/// **HARD INVARIANT: a pure function of `input_len` (and `level`) ONLY — NEVER
+/// `num_threads`.** The parallel path relies on this to produce byte-identical
+/// output at every thread count; reintroducing thread-count scaling (the old
+/// `get_optimal_block_size` trap) would make the grid — and therefore the
+/// bytes — depend on T. `_num_threads` MUST stay unused.
+///
+/// Large files use the fixed [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) to minimize
+/// per-chunk orchestration (one CRC-combine + one sync-flush seam per chunk).
+/// Small files fall back to an `input_len`-derived size so they still split
+/// into ~[`SMALL_FILE_TARGET_CHUNKS`] chunks, floored at
+/// [`MIN_PARALLEL_BLOCK_SIZE`] and capped at the large-file size.
 #[inline]
 fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
-    if input_len >= 50 * 1024 * 1024 {
-        // For files >= 50MB, use 192KB blocks (520 blocks for 100MB)
-        // This is a compromise between pigz's 128KB and our tested 256KB
-        192 * 1024
+    // Large-file cutoff: at/above this, one 512KB chunk grid gives plenty of
+    // chunks-per-thread even at T16 (8MB/512KB = 16 chunks). Below it, derive
+    // the size from input_len so small inputs stay well-split.
+    const LARGE_FILE_CUTOFF: usize = SMALL_FILE_TARGET_CHUNKS * MAX_PARALLEL_BLOCK_SIZE;
+    if input_len >= LARGE_FILE_CUTOFF {
+        MAX_PARALLEL_BLOCK_SIZE
     } else {
-        // Match pigz for smaller files
-        DEFAULT_BLOCK_SIZE
+        // ~SMALL_FILE_TARGET_CHUNKS chunks, floored so tiny inputs don't
+        // over-fragment and capped at the large-file size.
+        (input_len / SMALL_FILE_TARGET_CHUNKS)
+            .clamp(MIN_PARALLEL_BLOCK_SIZE, MAX_PARALLEL_BLOCK_SIZE)
     }
 }
 

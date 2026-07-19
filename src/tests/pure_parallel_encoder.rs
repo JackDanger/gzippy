@@ -111,15 +111,22 @@ fn mixed_corpus(len: usize) -> Vec<u8> {
 /// Output is byte-identical across thread counts (grid is data-length-only).
 #[test]
 fn deterministic_across_thread_counts() {
-    let input = mixed_corpus(1_200_000); // ~9 chunks at 128 KiB
-    for level in [1u32, 6, 9, 12] {
-        let t1 = compress_pure(&input, level, 1);
-        let t4 = compress_pure(&input, level, 4);
-        let t16 = compress_pure(&input, level, 16);
-        assert_eq!(t1, t4, "T1 != T4 at L{level}");
-        assert_eq!(t1, t16, "T1 != T16 at L{level}");
-        // And it must still be a correct stream.
-        assert_three_oracle(&t1, &input, &format!("determinism L{level}"));
+    // Two sizes so BOTH block-grid regimes are exercised for T-invariance:
+    //   - 1.2 MB  → small-file floor (input_len-derived, ~128 KiB chunks)
+    //   - 10 MB   → large-file grid (fixed 512 KiB MAX_PARALLEL_BLOCK_SIZE,
+    //               above the 8 MiB LARGE_FILE_CUTOFF), so the Lever-2 512KB
+    //               path is proven byte-identical across T, not just the floor.
+    for &len in &[1_200_000usize, 10 * 1024 * 1024] {
+        let input = mixed_corpus(len);
+        for level in [1u32, 6, 9, 12] {
+            let t1 = compress_pure(&input, level, 1);
+            let t4 = compress_pure(&input, level, 4);
+            let t16 = compress_pure(&input, level, 16);
+            assert_eq!(t1, t4, "T1 != T4 at L{level} (len={len})");
+            assert_eq!(t1, t16, "T1 != T16 at L{level} (len={len})");
+            // And it must still be a correct stream.
+            assert_three_oracle(&t1, &input, &format!("determinism L{level} len={len}"));
+        }
     }
 }
 
