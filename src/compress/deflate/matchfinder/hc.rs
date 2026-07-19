@@ -37,8 +37,8 @@
 //!   Each `load_u32`/`load_u24` site carries a `debug_assert!` proving `off+4 <= len`.
 
 use super::common::{
-    load_u24, load_u32, lz_extend, lz_hash, matchfinder_init, matchfinder_rebase,
-    MATCHFINDER_INITVAL,
+    load_u24, load_u32, lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetch_read,
+    prefetch_write, MATCHFINDER_INITVAL,
 };
 
 pub const HC_HASH3_ORDER: u32 = 15;
@@ -157,6 +157,15 @@ impl HcMatchfinder {
         };
         next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER);
         next_hashes[1] = lz_hash(next_hashseq, HC_HASH4_ORDER);
+        // Vendor `prefetchw` (hc_matchfinder.h:238-239): warm the hash buckets
+        // for `in_next + 1` in an exclusive state — they are stored to on the
+        // next call. Pure hint; cannot change which match is found.
+        // SAFETY: `next_hashes[0] < HASH3_SIZE` and `next_hashes[1] < HASH4_SIZE`
+        // (lz_hash order-15/16 outputs), so both `.add` land in-allocation.
+        unsafe {
+            prefetch_write(self.hash3_tab.as_ptr().add(next_hashes[0] as usize) as *const u8);
+            prefetch_write(self.hash4_tab.as_ptr().add(next_hashes[1] as usize) as *const u8);
+        }
 
         // SAFETY: same as above — `in_next + 4 <= in_end <= buf.len()`.
         let seq4 = unsafe {
@@ -192,8 +201,29 @@ impl HcMatchfinder {
                 if (cur_node4 as i32) <= cutoff {
                     break 'search;
                 }
+                // Software-pipelined chain walk (Increment 5b). Hoist the NEXT
+                // chain node one step ahead so this iteration can prefetch the
+                // FOLLOWING candidate's match data — the second, reducible
+                // dependent load, which sits off the chain's critical path —
+                // while the current node's compare runs. `next_tab` is never
+                // mutated during a walk, so reading a node early yields the
+                // identical value the un-pipelined form read at the loop bottom;
+                // the sequence of `cur_node4` visited, every cutoff/depth check,
+                // and the resulting match are byte-identical (pinned by
+                // `matches_equal_scalar_*`). The prefetch is a pure hint.
+                // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
+                let mut next_node = unsafe {
+                    *self
+                        .next_tab
+                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                };
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
+                    // Prefetch the next node's match data one iteration ahead.
+                    // `wrapping_offset` keeps pointer formation defined even when
+                    // `next_node <= cutoff` (a chain end maps off-object); the
+                    // prefetch itself never faults.
+                    prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
                     // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
                     // `matchptr + 4 <= in_next + 4 <= buf.len()`.
                     let cand = unsafe {
@@ -203,12 +233,7 @@ impl HcMatchfinder {
                     if cand == seq4 {
                         break;
                     }
-                    // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
-                    cur_node4 = unsafe {
-                        *self
-                            .next_tab
-                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                    };
+                    cur_node4 = next_node;
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
@@ -216,6 +241,12 @@ impl HcMatchfinder {
                     if depth_remaining == 0 {
                         break 'search;
                     }
+                    // SAFETY: masked chain index `< next_tab.len()`.
+                    next_node = unsafe {
+                        *self
+                            .next_tab
+                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                    };
                 }
 
                 // Found a length-4 match; extend it fully.
@@ -224,12 +255,9 @@ impl HcMatchfinder {
                 if best_len >= nice_len {
                     break 'search;
                 }
-                // SAFETY: masked chain index `< next_tab.len()` (see above).
-                cur_node4 = unsafe {
-                    *self
-                        .next_tab
-                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                };
+                // Advance to the next node — already loaded by the pipeline
+                // (`next_node == next_tab[cur_node4 & MASK]` holds at the break).
+                cur_node4 = next_node;
                 if (cur_node4 as i32) <= cutoff {
                     break 'search;
                 }
@@ -243,10 +271,22 @@ impl HcMatchfinder {
                 }
             }
 
-            // Length >= 5 loop.
+            // Length >= 5 loop, software-pipelined identically to the length-4
+            // walk above. `cur_node4 > cutoff` and `depth_remaining > 0` hold
+            // here (both entry paths guarantee it); precompute the next chain
+            // node so the compare can overlap the following candidate's prefetch.
+            // SAFETY: masked chain index `< next_tab.len()`.
+            let mut next_node = unsafe {
+                *self
+                    .next_tab
+                    .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+            };
             loop {
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
+                    // Prefetch the next node's match data one iteration ahead
+                    // (see the length-4 walk for the correctness argument).
+                    prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
                     // Prefilter: compare the last 4 and the first 4 bytes before
                     // attempting a full extension.
                     let off = best_len as usize - 3;
@@ -267,12 +307,7 @@ impl HcMatchfinder {
                     if m_hi == n_hi && m_lo == n_lo {
                         break;
                     }
-                    // SAFETY: masked chain index `< next_tab.len()`.
-                    cur_node4 = unsafe {
-                        *self
-                            .next_tab
-                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                    };
+                    cur_node4 = next_node;
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
@@ -280,6 +315,12 @@ impl HcMatchfinder {
                     if depth_remaining == 0 {
                         break 'search;
                     }
+                    // SAFETY: masked chain index `< next_tab.len()`.
+                    next_node = unsafe {
+                        *self
+                            .next_tab
+                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                    };
                 }
 
                 let len = lz_extend(buf, in_next, matchptr, 4, max_len);
@@ -290,12 +331,8 @@ impl HcMatchfinder {
                         break 'search;
                     }
                 }
-                // SAFETY: masked chain index `< next_tab.len()`.
-                cur_node4 = unsafe {
-                    *self
-                        .next_tab
-                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                };
+                // Advance to the next node — already loaded by the pipeline.
+                cur_node4 = next_node;
                 if (cur_node4 as i32) <= cutoff {
                     break 'search;
                 }
@@ -303,6 +340,12 @@ impl HcMatchfinder {
                 if depth_remaining == 0 {
                     break 'search;
                 }
+                // SAFETY: masked chain index `< next_tab.len()`.
+                next_node = unsafe {
+                    *self
+                        .next_tab
+                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                };
             }
         }
 
@@ -365,6 +408,13 @@ impl HcMatchfinder {
             if remaining == 0 {
                 break;
             }
+        }
+        // Vendor `prefetchw` (hc_matchfinder.h:395-396): warm the buckets for the
+        // final position in an exclusive state. Pure hint; no effect on state.
+        // SAFETY: `hash3 < HASH3_SIZE` and `hash4 < HASH4_SIZE` (lz_hash outputs).
+        unsafe {
+            prefetch_write(self.hash3_tab.as_ptr().add(hash3) as *const u8);
+            prefetch_write(self.hash4_tab.as_ptr().add(hash4) as *const u8);
         }
         next_hashes[0] = hash3 as u32;
         next_hashes[1] = hash4 as u32;

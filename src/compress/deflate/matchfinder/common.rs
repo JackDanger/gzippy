@@ -108,6 +108,68 @@ pub fn lz_extend(
     len as u32
 }
 
+/// Prefetch the cache line at `ptr` into L1 for READING (port of libdeflate
+/// `prefetchr`, `common_defs.h:246-257`).
+///
+/// A prefetch is a pure hardware hint: `ptr` need not be dereferenceable, the
+/// instruction never faults regardless of the address, and it has no observable
+/// effect on program state. It is therefore sound to call with a pointer formed
+/// off-object (e.g. one node past a chain end), so this is a safe function.
+#[inline(always)]
+pub(super) fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `_mm_prefetch` is a pure hint; any address is accepted, it cannot
+    // fault, and it touches no architectural state.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm pldl1keep` is a hint instruction; it never faults for any
+    // address and writes no memory (readonly, nostack, preserves flags).
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// Prefetch the cache line at `ptr` into L1 for WRITING (port of libdeflate
+/// `prefetchw`, `common_defs.h:260-271`).
+///
+/// Same purity and safety as [`prefetch_read`]: a pure hint that never faults
+/// and mutates nothing. The write/exclusive variant hints that the line will be
+/// stored to next (the hash-bucket update), so the cache can fetch it in an
+/// exclusive state and avoid a later read-for-ownership stall.
+#[inline(always)]
+pub(super) fn prefetch_write(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `_mm_prefetch` is a pure hint; any address is accepted, it cannot
+    // fault, and it touches no architectural state.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm pstl1keep` is a hint instruction; it never faults for any
+    // address and writes no memory (nostack, preserves flags).
+    unsafe {
+        core::arch::asm!(
+            "prfm pstl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = ptr;
+    }
+}
+
 /// Initialize a matchfinder position table to `MATCHFINDER_INITVAL`
 /// (port of `matchfinder_init`).
 #[inline]
