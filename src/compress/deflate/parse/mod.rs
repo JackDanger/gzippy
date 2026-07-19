@@ -299,8 +299,15 @@ fn emit_block(
     );
     let header = build_dynamic_header(&litcode.lens, &offcode.lens);
 
-    let dynamic_bits = 3 + header.header_bits() + data_bits(&sink.tokens, &litcode, &offcode);
-    let static_bits = 3 + data_bits(&sink.tokens, &statics.litcode, &statics.offcode);
+    let dynamic_bits = 3
+        + header.header_bits()
+        + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
+    let static_bits = 3 + cost_from_freqs(
+        &litlen_freqs,
+        &sink.offset_freqs,
+        &statics.litcode,
+        &statics.offcode,
+    );
     let stored_bits = stored_block_bits(sink.block_length);
 
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
@@ -321,23 +328,40 @@ fn emit_block(
     }
 }
 
-/// Exact coded-data bit cost of the token stream (including the EOB symbol) for
-/// a given litlen/offset code.
-fn data_bits(tokens: &[Token], litcode: &HuffmanCode, offcode: &HuffmanCode) -> u64 {
+/// Exact coded-data bit cost (including the EOB symbol) of a token stream whose
+/// per-symbol histogram is `litlen_freqs` / `offset_freqs`, coded with the given
+/// litlen/offset code. `litlen_freqs[DEFLATE_END_OF_BLOCK]` must already include
+/// the one EOB symbol.
+///
+/// Port of the cost half of `deflate_compute_true_cost`
+/// (`deflate_compress.c:2889-2921`) — the frequency-array × code-length sum. This
+/// replaces walking every token twice (once per candidate code) with two passes
+/// over the fixed-size frequency arrays. Because the frequencies ARE the token
+/// histogram (Sink bumps them inline as tokens are pushed), the sum is
+/// bit-for-bit identical to the old per-token walk (`data_bits` in the tests),
+/// so the dyn/static/stored decision — and thus the emitted bytes — is unchanged.
+fn cost_from_freqs(
+    litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
+    offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+    litcode: &HuffmanCode,
+    offcode: &HuffmanCode,
+) -> u64 {
     let mut bits = 0u64;
-    for &t in tokens {
-        match t {
-            Token::Literal(b) => bits += litcode.lens[b as usize] as u64,
-            Token::Match { length, offset } => {
-                let ls = length_slot(length as u32) as usize;
-                bits +=
-                    litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u64 + LENGTH_EXTRA_BITS[ls] as u64;
-                let os = offset_slot(offset as u32) as usize;
-                bits += offcode.lens[os] as u64 + OFFSET_EXTRA_BITS[os] as u64;
-            }
-        }
+    // Literals 0..=255 and the EOB symbol (256) — plain codeword lengths.
+    for sym in 0..DEFLATE_FIRST_LEN_SYM {
+        bits += litlen_freqs[sym] as u64 * litcode.lens[sym] as u64;
     }
-    bits += litcode.lens[DEFLATE_END_OF_BLOCK] as u64;
+    // Length symbols: codeword length + extra length bits for the slot.
+    for slot in 0..LENGTH_EXTRA_BITS.len() {
+        let sym = DEFLATE_FIRST_LEN_SYM + slot;
+        bits +=
+            litlen_freqs[sym] as u64 * (litcode.lens[sym] as u64 + LENGTH_EXTRA_BITS[slot] as u64);
+    }
+    // Offset symbols: codeword length + extra offset bits for the slot.
+    for slot in 0..OFFSET_EXTRA_BITS.len() {
+        bits += offset_freqs[slot] as u64
+            * (offcode.lens[slot] as u64 + OFFSET_EXTRA_BITS[slot] as u64);
+    }
     bits
 }
 
@@ -541,6 +565,88 @@ mod emit_tests {
         bw.add_bits(
             litcode.codewords[DEFLATE_END_OF_BLOCK] as u64,
             litcode.lens[DEFLATE_END_OF_BLOCK] as u32,
+        );
+    }
+
+    /// The PRE-lever cost model: an exact per-token walk of the coded-data bit
+    /// cost (including the EOB codeword). Kept verbatim as the byte-for-byte
+    /// reference `cost_from_freqs` (the frequency-array sum) must equal.
+    fn data_bits(tokens: &[Token], litcode: &HuffmanCode, offcode: &HuffmanCode) -> u64 {
+        let mut bits = 0u64;
+        for &t in tokens {
+            match t {
+                Token::Literal(b) => bits += litcode.lens[b as usize] as u64,
+                Token::Match { length, offset } => {
+                    let ls = length_slot(length as u32) as usize;
+                    bits += litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u64
+                        + LENGTH_EXTRA_BITS[ls] as u64;
+                    let os = offset_slot(offset as u32) as usize;
+                    bits += offcode.lens[os] as u64 + OFFSET_EXTRA_BITS[os] as u64;
+                }
+            }
+        }
+        bits += litcode.lens[DEFLATE_END_OF_BLOCK] as u64;
+        bits
+    }
+
+    /// Build the litlen (with EOB) + offset histograms for a token stream, the
+    /// way [`Sink`] does inline, so the two cost models can be compared.
+    fn histograms_with_eob(
+        tokens: &[Token],
+    ) -> (
+        [u32; DEFLATE_NUM_LITLEN_SYMS],
+        [u32; DEFLATE_NUM_OFFSET_SYMS],
+    ) {
+        let mut litlen = [0u32; DEFLATE_NUM_LITLEN_SYMS];
+        let mut offset = [0u32; DEFLATE_NUM_OFFSET_SYMS];
+        for &t in tokens {
+            match t {
+                Token::Literal(b) => litlen[b as usize] += 1,
+                Token::Match {
+                    length,
+                    offset: off,
+                } => {
+                    litlen[DEFLATE_FIRST_LEN_SYM + length_slot(length as u32) as usize] += 1;
+                    offset[offset_slot(off as u32) as usize] += 1;
+                }
+            }
+        }
+        litlen[DEFLATE_END_OF_BLOCK] += 1;
+        (litlen, offset)
+    }
+
+    #[test]
+    fn cost_from_freqs_equals_token_walk() {
+        // Static codes and a skewed dynamic code, over the mixed fixture.
+        let statics = StaticCodes::build();
+        let tokens = fixture_tokens();
+        let (litlen_freqs, offset_freqs) = histograms_with_eob(&tokens);
+
+        assert_eq!(
+            cost_from_freqs(
+                &litlen_freqs,
+                &offset_freqs,
+                &statics.litcode,
+                &statics.offcode
+            ),
+            data_bits(&tokens, &statics.litcode, &statics.offcode),
+            "cost_from_freqs != data_bits (static code)"
+        );
+
+        let litcode = make_huffman_code(
+            DEFLATE_NUM_LITLEN_SYMS,
+            MAX_LITLEN_CODEWORD_LEN,
+            &litlen_freqs,
+        );
+        let offcode = make_huffman_code(
+            DEFLATE_NUM_OFFSET_SYMS,
+            MAX_OFFSET_CODEWORD_LEN,
+            &offset_freqs,
+        );
+        assert_eq!(
+            cost_from_freqs(&litlen_freqs, &offset_freqs, &litcode, &offcode),
+            data_bits(&tokens, &litcode, &offcode),
+            "cost_from_freqs != data_bits (dynamic code)"
         );
     }
 
