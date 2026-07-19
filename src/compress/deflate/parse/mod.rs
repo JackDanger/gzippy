@@ -45,15 +45,55 @@ const SEQ_STORE_LENGTH: usize = 50_000;
 /// Number of DEFLATE literal symbols (0..=255).
 const NUM_LITERALS: usize = 256;
 
-/// One parsed token: a literal byte or a back-reference.
-#[derive(Clone, Copy)]
-enum Token {
-    Literal(u8),
-    /// `length` in 3..=258, `offset` in 1..=32768.
-    Match {
-        length: u16,
-        offset: u16,
-    },
+/// One parsed token, packed into a `u32` (was a 6-byte `enum { Literal(u8),
+/// Match { length: u16, offset: u16 } }`). The tighter representation shrinks the
+/// per-block token buffer by a third and makes the literal/match discriminant a
+/// single-bit test in the emit hot loop.
+///
+/// Layout (bit 31 is the literal tag; a match's value never reaches bit 31
+/// because `offset <= 32768` puts its highest set bit at 24):
+///   * Literal `b`  →  `TOK_LITERAL_FLAG | b`            (b in bits 0..8)
+///   * Match l/o    →  `l | (o << TOK_OFF_SHIFT)`         (l in bits 0..9,
+///                                                          o in bits 9..25)
+type Token = u32;
+
+/// Bit 31: set iff the token is a literal.
+const TOK_LITERAL_FLAG: u32 = 0x8000_0000;
+/// Low 9 bits hold a match length (3..=258 fits in 9 bits).
+const TOK_LEN_MASK: u32 = 0x1FF;
+/// A match offset (1..=32768, 16 bits) starts at bit 9.
+const TOK_OFF_SHIFT: u32 = 9;
+
+#[inline]
+fn pack_literal(b: u8) -> Token {
+    TOK_LITERAL_FLAG | b as u32
+}
+
+#[inline]
+fn pack_match(length: u32, offset: u32) -> Token {
+    debug_assert!(length <= TOK_LEN_MASK);
+    debug_assert!(offset <= 0xFFFF);
+    length | (offset << TOK_OFF_SHIFT)
+}
+
+#[inline]
+fn tok_is_literal(t: Token) -> bool {
+    t & TOK_LITERAL_FLAG != 0
+}
+
+#[inline]
+fn tok_literal_byte(t: Token) -> u8 {
+    t as u8
+}
+
+#[inline]
+fn tok_match_len(t: Token) -> u32 {
+    t & TOK_LEN_MASK
+}
+
+#[inline]
+fn tok_match_off(t: Token) -> u32 {
+    (t >> TOK_OFF_SHIFT) & 0xFFFF
 }
 
 /// The precomputed RFC 1951 fixed (static) Huffman codes, built once per parse.
@@ -123,7 +163,7 @@ impl Sink {
             *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
         }
         self.stats.observe_literal(lit);
-        self.tokens.push(Token::Literal(lit));
+        self.tokens.push(pack_literal(lit));
         self.block_length += 1;
     }
 
@@ -144,10 +184,7 @@ impl Sink {
             *self.offset_freqs.get_unchecked_mut(os) += 1;
         }
         self.stats.observe_match(length);
-        self.tokens.push(Token::Match {
-            length: length as u16,
-            offset: offset as u16,
-        });
+        self.tokens.push(pack_match(length, offset));
         self.num_seqs += 1;
         self.block_length += length as usize;
     }
@@ -468,7 +505,7 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
         // in groups of 4 (one flush per group), then the 1-3-literal tail.
         let run_start = i;
         // SAFETY: `i < n` is checked first, so the token read is in bounds.
-        while i < n && matches!(unsafe { *tokens.get_unchecked(i) }, Token::Literal(_)) {
+        while i < n && tok_is_literal(unsafe { *tokens.get_unchecked(i) }) {
             i += 1;
         }
         let mut p = run_start;
@@ -476,16 +513,15 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
         while litrunlen >= 4 {
             for _ in 0..4 {
                 // SAFETY: `p` walks `run_start..i`, positions the scan above
-                // proved are all `Token::Literal`, so `p < n` (in-bounds token)
-                // and the pattern always matches. `b` is a u8, so `b as usize`
-                // is < 256 <= the litcode arrays' length (DEFLATE_NUM_LITLEN_SYMS).
-                if let Token::Literal(b) = unsafe { *tokens.get_unchecked(p) } {
-                    unsafe {
-                        bw.add_bits_raw(
-                            *litcode.codewords.get_unchecked(b as usize) as u64,
-                            *litcode.lens.get_unchecked(b as usize) as u32,
-                        );
-                    }
+                // proved are all literals, so `p < n` (in-bounds token). `b` is a
+                // u8, so `b as usize` is < 256 <= the litcode arrays' length
+                // (DEFLATE_NUM_LITLEN_SYMS).
+                let b = tok_literal_byte(unsafe { *tokens.get_unchecked(p) });
+                unsafe {
+                    bw.add_bits_raw(
+                        *litcode.codewords.get_unchecked(b as usize) as u64,
+                        *litcode.lens.get_unchecked(b as usize) as u32,
+                    );
                 }
                 p += 1;
             }
@@ -496,13 +532,12 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
         if litrunlen != 0 {
             for _ in 0..litrunlen {
                 // SAFETY: as above — `p < i <= n` and the token is a literal.
-                if let Token::Literal(b) = unsafe { *tokens.get_unchecked(p) } {
-                    unsafe {
-                        bw.add_bits_raw(
-                            *litcode.codewords.get_unchecked(b as usize) as u64,
-                            *litcode.lens.get_unchecked(b as usize) as u32,
-                        );
-                    }
+                let b = tok_literal_byte(unsafe { *tokens.get_unchecked(p) });
+                unsafe {
+                    bw.add_bits_raw(
+                        *litcode.codewords.get_unchecked(b as usize) as u64,
+                        *litcode.lens.get_unchecked(b as usize) as u32,
+                    );
                 }
                 p += 1;
             }
@@ -514,12 +549,13 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
             break;
         }
 
-        // The run was terminated by a match (or end-of-stream, handled above).
+        // The run was terminated by a match (the end-of-stream case broke above).
         // SAFETY: the outer `while i < n` guard and the `i >= n` break above
         // guarantee `i < n`, so `tokens[i]` is in bounds.
-        if let Token::Match { length, offset } = unsafe { *tokens.get_unchecked(i) } {
-            let length = length as u32;
-            let offset = offset as u32;
+        {
+            let t = unsafe { *tokens.get_unchecked(i) };
+            let length = tok_match_len(t);
+            let offset = tok_match_off(t);
             let os = offset_slot(offset) as usize;
             // SAFETY: `length` is 3..=258 so it indexes the `full_len` arrays
             // (length DEFLATE_MAX_MATCH_LEN+1 = 259); `offset_slot` returns
@@ -579,32 +615,30 @@ mod emit_tests {
         offcode: &HuffmanCode,
     ) {
         for &t in tokens {
-            match t {
-                Token::Literal(b) => {
-                    bw.add_bits(
-                        litcode.codewords[b as usize] as u64,
-                        litcode.lens[b as usize] as u32,
-                    );
-                }
-                Token::Match { length, offset } => {
-                    let length = length as u32;
-                    let offset = offset as u32;
-                    let ls = length_slot(length) as usize;
-                    bw.add_bits(
-                        litcode.codewords[DEFLATE_FIRST_LEN_SYM + ls] as u64,
-                        litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u32,
-                    );
-                    bw.add_bits(
-                        (length - LENGTH_SLOT_BASE[ls]) as u64,
-                        LENGTH_EXTRA_BITS[ls] as u32,
-                    );
-                    let os = offset_slot(offset) as usize;
-                    bw.add_bits(offcode.codewords[os] as u64, offcode.lens[os] as u32);
-                    bw.add_bits(
-                        (offset - OFFSET_SLOT_BASE[os]) as u64,
-                        OFFSET_EXTRA_BITS[os] as u32,
-                    );
-                }
+            if tok_is_literal(t) {
+                let b = tok_literal_byte(t);
+                bw.add_bits(
+                    litcode.codewords[b as usize] as u64,
+                    litcode.lens[b as usize] as u32,
+                );
+            } else {
+                let length = tok_match_len(t);
+                let offset = tok_match_off(t);
+                let ls = length_slot(length) as usize;
+                bw.add_bits(
+                    litcode.codewords[DEFLATE_FIRST_LEN_SYM + ls] as u64,
+                    litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u32,
+                );
+                bw.add_bits(
+                    (length - LENGTH_SLOT_BASE[ls]) as u64,
+                    LENGTH_EXTRA_BITS[ls] as u32,
+                );
+                let os = offset_slot(offset) as usize;
+                bw.add_bits(offcode.codewords[os] as u64, offcode.lens[os] as u32);
+                bw.add_bits(
+                    (offset - OFFSET_SLOT_BASE[os]) as u64,
+                    OFFSET_EXTRA_BITS[os] as u32,
+                );
             }
         }
         bw.add_bits(
@@ -619,15 +653,14 @@ mod emit_tests {
     fn data_bits(tokens: &[Token], litcode: &HuffmanCode, offcode: &HuffmanCode) -> u64 {
         let mut bits = 0u64;
         for &t in tokens {
-            match t {
-                Token::Literal(b) => bits += litcode.lens[b as usize] as u64,
-                Token::Match { length, offset } => {
-                    let ls = length_slot(length as u32) as usize;
-                    bits += litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u64
-                        + LENGTH_EXTRA_BITS[ls] as u64;
-                    let os = offset_slot(offset as u32) as usize;
-                    bits += offcode.lens[os] as u64 + OFFSET_EXTRA_BITS[os] as u64;
-                }
+            if tok_is_literal(t) {
+                bits += litcode.lens[tok_literal_byte(t) as usize] as u64;
+            } else {
+                let ls = length_slot(tok_match_len(t)) as usize;
+                bits +=
+                    litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u64 + LENGTH_EXTRA_BITS[ls] as u64;
+                let os = offset_slot(tok_match_off(t)) as usize;
+                bits += offcode.lens[os] as u64 + OFFSET_EXTRA_BITS[os] as u64;
             }
         }
         bits += litcode.lens[DEFLATE_END_OF_BLOCK] as u64;
@@ -645,15 +678,11 @@ mod emit_tests {
         let mut litlen = [0u32; DEFLATE_NUM_LITLEN_SYMS];
         let mut offset = [0u32; DEFLATE_NUM_OFFSET_SYMS];
         for &t in tokens {
-            match t {
-                Token::Literal(b) => litlen[b as usize] += 1,
-                Token::Match {
-                    length,
-                    offset: off,
-                } => {
-                    litlen[DEFLATE_FIRST_LEN_SYM + length_slot(length as u32) as usize] += 1;
-                    offset[offset_slot(off as u32) as usize] += 1;
-                }
+            if tok_is_literal(t) {
+                litlen[tok_literal_byte(t) as usize] += 1;
+            } else {
+                litlen[DEFLATE_FIRST_LEN_SYM + length_slot(tok_match_len(t)) as usize] += 1;
+                offset[offset_slot(tok_match_off(t)) as usize] += 1;
             }
         }
         litlen[DEFLATE_END_OF_BLOCK] += 1;
@@ -697,7 +726,7 @@ mod emit_tests {
 
     fn lit_run(v: &mut Vec<Token>, bytes: &[u8]) {
         for &b in bytes {
-            v.push(Token::Literal(b));
+            v.push(pack_literal(b));
         }
     }
 
@@ -709,38 +738,20 @@ mod emit_tests {
         // 10 literals => two groups of 4 + a 2-literal tail.
         lit_run(&mut t, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         // Min-length / min-offset match.
-        t.push(Token::Match {
-            length: 3,
-            offset: 1,
-        });
+        t.push(pack_match(3, 1));
         // Exactly 4 literals => one group, empty tail.
         lit_run(&mut t, &[10, 20, 30, 40]);
         // Max-length / max-offset match (largest length + offset slots).
-        t.push(Token::Match {
-            length: 258,
-            offset: 32768,
-        });
+        t.push(pack_match(258, 32768));
         // Back-to-back matches, no literals between, interior slots.
-        t.push(Token::Match {
-            length: 24,
-            offset: 100,
-        });
-        t.push(Token::Match {
-            length: 130,
-            offset: 5000,
-        });
+        t.push(pack_match(24, 100));
+        t.push(pack_match(130, 5000));
         // 1-literal tail.
         lit_run(&mut t, &[200]);
-        t.push(Token::Match {
-            length: 11,
-            offset: 300,
-        });
+        t.push(pack_match(11, 300));
         // 3-literal tail.
         lit_run(&mut t, &[201, 202, 203]);
-        t.push(Token::Match {
-            length: 66,
-            offset: 12000,
-        });
+        t.push(pack_match(66, 12000));
         // A long literal run to exercise many packed groups + a 2-tail.
         let long: Vec<u8> = (0..50).map(|i| (i * 5) as u8).collect();
         lit_run(&mut t, &long);
@@ -789,7 +800,7 @@ mod emit_tests {
     fn fast_emit_matches_reference_on_all_literals() {
         let statics = StaticCodes::build();
         let bytes: Vec<u8> = (0..=255u16).map(|b| b as u8).collect();
-        let tokens: Vec<Token> = bytes.iter().map(|&b| Token::Literal(b)).collect();
+        let tokens: Vec<Token> = bytes.iter().map(|&b| pack_literal(b)).collect();
 
         let mut fast = BitWriter::new();
         emit_tokens(&mut fast, &tokens, &statics.litcode, &statics.offcode);
