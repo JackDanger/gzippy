@@ -117,7 +117,11 @@ impl Sink {
     /// and lazy do).
     #[inline]
     fn push_literal(&mut self, lit: u8) {
-        self.litlen_freqs[lit as usize] += 1;
+        // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
+        // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
+        unsafe {
+            *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
+        }
         self.stats.observe_literal(lit);
         self.tokens.push(Token::Literal(lit));
         self.block_length += 1;
@@ -130,8 +134,15 @@ impl Sink {
         debug_assert!((1..=32768).contains(&offset));
         let ls = length_slot(length) as usize;
         let os = offset_slot(offset) as usize;
-        self.litlen_freqs[DEFLATE_FIRST_LEN_SYM + ls] += 1;
-        self.offset_freqs[os] += 1;
+        // SAFETY: `length_slot` returns 0..=28 so `DEFLATE_FIRST_LEN_SYM + ls`
+        // (257..=285) is < DEFLATE_NUM_LITLEN_SYMS (288); `offset_slot` returns
+        // 0..=29 so `os` is < DEFLATE_NUM_OFFSET_SYMS (32). Both are in bounds.
+        unsafe {
+            *self
+                .litlen_freqs
+                .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
+            *self.offset_freqs.get_unchecked_mut(os) += 1;
+        }
         self.stats.observe_match(length);
         self.tokens.push(Token::Match {
             length: length as u16,
@@ -346,21 +357,34 @@ fn cost_from_freqs(
     litcode: &HuffmanCode,
     offcode: &HuffmanCode,
 ) -> u64 {
+    // SAFETY (whole body): `litcode.lens` has DEFLATE_NUM_LITLEN_SYMS entries and
+    // `offcode.lens` has DEFLATE_NUM_OFFSET_SYMS entries (make_huffman_code
+    // asserts `freqs.len() == num_syms`). The litlen loops index 0..286 (< 288)
+    // and the offset loop indexes 0..30 (< 32), all in bounds; the `litlen_freqs`
+    // / `offset_freqs` array refs match those loop bounds by type.
     let mut bits = 0u64;
     // Literals 0..=255 and the EOB symbol (256) — plain codeword lengths.
     for sym in 0..DEFLATE_FIRST_LEN_SYM {
-        bits += litlen_freqs[sym] as u64 * litcode.lens[sym] as u64;
+        bits += unsafe {
+            *litlen_freqs.get_unchecked(sym) as u64 * *litcode.lens.get_unchecked(sym) as u64
+        };
     }
     // Length symbols: codeword length + extra length bits for the slot.
     for slot in 0..LENGTH_EXTRA_BITS.len() {
         let sym = DEFLATE_FIRST_LEN_SYM + slot;
-        bits +=
-            litlen_freqs[sym] as u64 * (litcode.lens[sym] as u64 + LENGTH_EXTRA_BITS[slot] as u64);
+        bits += unsafe {
+            *litlen_freqs.get_unchecked(sym) as u64
+                * (*litcode.lens.get_unchecked(sym) as u64
+                    + *LENGTH_EXTRA_BITS.get_unchecked(slot) as u64)
+        };
     }
     // Offset symbols: codeword length + extra offset bits for the slot.
     for slot in 0..OFFSET_EXTRA_BITS.len() {
-        bits += offset_freqs[slot] as u64
-            * (offcode.lens[slot] as u64 + OFFSET_EXTRA_BITS[slot] as u64);
+        bits += unsafe {
+            *offset_freqs.get_unchecked(slot) as u64
+                * (*offcode.lens.get_unchecked(slot) as u64
+                    + *OFFSET_EXTRA_BITS.get_unchecked(slot) as u64)
+        };
     }
     bits
 }
@@ -443,18 +467,25 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
         // Gather the run of consecutive literals starting at `i`, then emit it
         // in groups of 4 (one flush per group), then the 1-3-literal tail.
         let run_start = i;
-        while i < n && matches!(tokens[i], Token::Literal(_)) {
+        // SAFETY: `i < n` is checked first, so the token read is in bounds.
+        while i < n && matches!(unsafe { *tokens.get_unchecked(i) }, Token::Literal(_)) {
             i += 1;
         }
         let mut p = run_start;
         let mut litrunlen = i - run_start;
         while litrunlen >= 4 {
             for _ in 0..4 {
-                if let Token::Literal(b) = tokens[p] {
-                    bw.add_bits_raw(
-                        litcode.codewords[b as usize] as u64,
-                        litcode.lens[b as usize] as u32,
-                    );
+                // SAFETY: `p` walks `run_start..i`, positions the scan above
+                // proved are all `Token::Literal`, so `p < n` (in-bounds token)
+                // and the pattern always matches. `b` is a u8, so `b as usize`
+                // is < 256 <= the litcode arrays' length (DEFLATE_NUM_LITLEN_SYMS).
+                if let Token::Literal(b) = unsafe { *tokens.get_unchecked(p) } {
+                    unsafe {
+                        bw.add_bits_raw(
+                            *litcode.codewords.get_unchecked(b as usize) as u64,
+                            *litcode.lens.get_unchecked(b as usize) as u32,
+                        );
+                    }
                 }
                 p += 1;
             }
@@ -464,11 +495,14 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
         }
         if litrunlen != 0 {
             for _ in 0..litrunlen {
-                if let Token::Literal(b) = tokens[p] {
-                    bw.add_bits_raw(
-                        litcode.codewords[b as usize] as u64,
-                        litcode.lens[b as usize] as u32,
-                    );
+                // SAFETY: as above — `p < i <= n` and the token is a literal.
+                if let Token::Literal(b) = unsafe { *tokens.get_unchecked(p) } {
+                    unsafe {
+                        bw.add_bits_raw(
+                            *litcode.codewords.get_unchecked(b as usize) as u64,
+                            *litcode.lens.get_unchecked(b as usize) as u32,
+                        );
+                    }
                 }
                 p += 1;
             }
@@ -481,25 +515,36 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
         }
 
         // The run was terminated by a match (or end-of-stream, handled above).
-        if let Token::Match { length, offset } = tokens[i] {
+        // SAFETY: the outer `while i < n` guard and the `i >= n` break above
+        // guarantee `i < n`, so `tokens[i]` is in bounds.
+        if let Token::Match { length, offset } = unsafe { *tokens.get_unchecked(i) } {
             let length = length as u32;
             let offset = offset as u32;
-            // Litlen symbol + extra length bits as ONE add (mechanism 1).
-            bw.add_bits_raw(
-                full_len.codewords[length as usize] as u64,
-                full_len.lens[length as usize] as u32,
-            );
-            // Offset symbol, then extra offset bits. The intermediate
-            // `CAN_BUFFER` flushes are elided (see the const assertion above), so
-            // the whole match costs one flush.
             let os = offset_slot(offset) as usize;
-            bw.add_bits_raw(offcode.codewords[os] as u64, offcode.lens[os] as u32);
-            bw.add_bits_raw(
-                (offset - OFFSET_SLOT_BASE[os]) as u64,
-                OFFSET_EXTRA_BITS[os] as u32,
-            );
-            // SAFETY: see above.
-            unsafe { bw.flush_word_unchecked() };
+            // SAFETY: `length` is 3..=258 so it indexes the `full_len` arrays
+            // (length DEFLATE_MAX_MATCH_LEN+1 = 259); `offset_slot` returns
+            // 0..=29 so `os` < 32 = the offcode arrays' length and < 30 = the
+            // OFFSET_* tables' length.
+            unsafe {
+                // Litlen symbol + extra length bits as ONE add (mechanism 1).
+                bw.add_bits_raw(
+                    *full_len.codewords.get_unchecked(length as usize) as u64,
+                    *full_len.lens.get_unchecked(length as usize) as u32,
+                );
+                // Offset symbol, then extra offset bits. The intermediate
+                // `CAN_BUFFER` flushes are elided (see the const assertion
+                // above), so the whole match costs one flush.
+                bw.add_bits_raw(
+                    *offcode.codewords.get_unchecked(os) as u64,
+                    *offcode.lens.get_unchecked(os) as u32,
+                );
+                bw.add_bits_raw(
+                    (offset - *OFFSET_SLOT_BASE.get_unchecked(os)) as u64,
+                    *OFFSET_EXTRA_BITS.get_unchecked(os) as u32,
+                );
+                // SAFETY: reserve() guarantees 8 spare bytes for every flush.
+                bw.flush_word_unchecked();
+            }
         }
         i += 1;
     }
