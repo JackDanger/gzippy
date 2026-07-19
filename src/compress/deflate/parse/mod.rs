@@ -334,41 +334,152 @@ fn data_bits(tokens: &[Token], litcode: &HuffmanCode, offcode: &HuffmanCode) -> 
     bits
 }
 
-/// Emit the token stream (and the trailing EOB codeword) with the given codes.
-fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offcode: &HuffmanCode) {
-    for &t in tokens {
-        match t {
-            Token::Literal(b) => {
-                bw.add_bits(
-                    litcode.codewords[b as usize] as u64,
-                    litcode.lens[b as usize] as u32,
-                );
-            }
-            Token::Match { length, offset } => {
-                let length = length as u32;
-                let offset = offset as u32;
-                let ls = length_slot(length) as usize;
-                bw.add_bits(
-                    litcode.codewords[DEFLATE_FIRST_LEN_SYM + ls] as u64,
-                    litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u32,
-                );
-                bw.add_bits(
-                    (length - LENGTH_SLOT_BASE[ls]) as u64,
-                    LENGTH_EXTRA_BITS[ls] as u32,
-                );
-                let os = offset_slot(offset) as usize;
-                bw.add_bits(offcode.codewords[os] as u64, offcode.lens[os] as u32);
-                bw.add_bits(
-                    (offset - OFFSET_SLOT_BASE[os]) as u64,
-                    OFFSET_EXTRA_BITS[os] as u32,
-                );
-            }
+/// Precomputed "full" match-length codewords: the litlen codeword concatenated
+/// with the extra-length bits, one packed value + one length per match length.
+///
+/// Port of `deflate_compute_full_len_codewords` (C:1638-1658). Building this
+/// once per block lets a match's length field emit with ONE `add_bits` instead
+/// of a symbol-then-extra pair.
+struct FullLenCodewords {
+    /// `codewords[len] = litlen_cw | (extra_bits << litlen_len)`, len 3..=258.
+    codewords: [u32; DEFLATE_MAX_MATCH_LEN as usize + 1],
+    /// `lens[len] = litlen_len + extra_length_bits[slot]`.
+    lens: [u8; DEFLATE_MAX_MATCH_LEN as usize + 1],
+}
+
+impl FullLenCodewords {
+    #[inline]
+    fn build(litcode: &HuffmanCode) -> Self {
+        // MAX_LITLEN_CODEWORD_LEN (14) + max extra length bits (5) <= 32, so the
+        // concatenation fits in a u32 (C's STATIC_ASSERT at :1642).
+        let mut codewords = [0u32; DEFLATE_MAX_MATCH_LEN as usize + 1];
+        let mut lens = [0u8; DEFLATE_MAX_MATCH_LEN as usize + 1];
+        for len in DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN {
+            let slot = length_slot(len) as usize;
+            let sym = DEFLATE_FIRST_LEN_SYM + slot;
+            let extra_bits = len - LENGTH_SLOT_BASE[slot];
+            let litlen_len = litcode.lens[sym] as u32;
+            codewords[len as usize] = litcode.codewords[sym] | (extra_bits << litlen_len);
+            lens[len as usize] = litcode.lens[sym] + LENGTH_EXTRA_BITS[slot];
         }
+        FullLenCodewords { codewords, lens }
     }
-    bw.add_bits(
+}
+
+/// Compile-time proof that the 64-bit accumulator can buffer a full match
+/// (length codeword + offset symbol + offset extra) after a single flush, and a
+/// run of 4 literals, without any intermediate flush. When these hold, the
+/// `CAN_BUFFER`-gated flushes inside `WRITE_MATCH` (C:1660-1694) are elided,
+/// leaving exactly one flush per match / per 4 literals.
+const _: () = {
+    use super::bitstream::can_buffer;
+    let match_bits = MAX_LITLEN_CODEWORD_LEN + 5 /* DEFLATE_MAX_EXTRA_LENGTH_BITS */
+        + MAX_OFFSET_CODEWORD_LEN + 13 /* DEFLATE_MAX_EXTRA_OFFSET_BITS */;
+    assert!(can_buffer(match_bits), "match cannot buffer in one word");
+    assert!(
+        can_buffer(4 * MAX_LITLEN_CODEWORD_LEN),
+        "4-literal run cannot buffer"
+    );
+};
+
+/// Emit the token stream (and the trailing EOB codeword) with the given codes.
+///
+/// Port of the literals/matches output loop in `deflate_flush_block`
+/// (C:1938-2024): a precomputed full-length-codeword LUT (mechanism 1), a
+/// 4-literals-per-flush packed run (mechanism 2), whole-word branchless flushes
+/// (mechanism 3), `CAN_BUFFER`-elided match flushes (mechanism 4), and pure
+/// accumulate `add_bits_raw` (mechanism 5).
+fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offcode: &HuffmanCode) {
+    let full_len = FullLenCodewords::build(litcode);
+
+    // Normalize the accumulator to <= 7 buffered bits before the raw
+    // `add_bits_raw`/`flush_word_unchecked` batch. libdeflate reaches this loop
+    // with `bitcount <= 7` because its header emission ends in FLUSH_BITS
+    // (C:2021 asserts `bitcount <= 7`); gzippy's block-type prefix + dynamic
+    // header use the auto-flushing `add_bits`, which can leave up to 63 bits
+    // buffered. Draining full bytes here (NOT byte-aligning — that would inject
+    // zero pad bits) restores the invariant the raw path relies on, without
+    // changing the emitted bit sequence.
+    bw.flush_bits();
+
+    // Ensure every whole-word flush in this batch has 8 spare bytes: a token
+    // codes to at most 47 bits (< 6 bytes) and the EOB to <= 2 bytes.
+    bw.reserve(tokens.len() * 6 + 16);
+
+    let n = tokens.len();
+    let mut i = 0usize;
+    while i < n {
+        // Gather the run of consecutive literals starting at `i`, then emit it
+        // in groups of 4 (one flush per group), then the 1-3-literal tail.
+        let run_start = i;
+        while i < n && matches!(tokens[i], Token::Literal(_)) {
+            i += 1;
+        }
+        let mut p = run_start;
+        let mut litrunlen = i - run_start;
+        while litrunlen >= 4 {
+            for _ in 0..4 {
+                if let Token::Literal(b) = tokens[p] {
+                    bw.add_bits_raw(
+                        litcode.codewords[b as usize] as u64,
+                        litcode.lens[b as usize] as u32,
+                    );
+                }
+                p += 1;
+            }
+            // SAFETY: reserve() above guarantees 8 spare bytes for every flush.
+            unsafe { bw.flush_word_unchecked() };
+            litrunlen -= 4;
+        }
+        if litrunlen != 0 {
+            for _ in 0..litrunlen {
+                if let Token::Literal(b) = tokens[p] {
+                    bw.add_bits_raw(
+                        litcode.codewords[b as usize] as u64,
+                        litcode.lens[b as usize] as u32,
+                    );
+                }
+                p += 1;
+            }
+            // SAFETY: see above.
+            unsafe { bw.flush_word_unchecked() };
+        }
+
+        if i >= n {
+            break;
+        }
+
+        // The run was terminated by a match (or end-of-stream, handled above).
+        if let Token::Match { length, offset } = tokens[i] {
+            let length = length as u32;
+            let offset = offset as u32;
+            // Litlen symbol + extra length bits as ONE add (mechanism 1).
+            bw.add_bits_raw(
+                full_len.codewords[length as usize] as u64,
+                full_len.lens[length as usize] as u32,
+            );
+            // Offset symbol, then extra offset bits. The intermediate
+            // `CAN_BUFFER` flushes are elided (see the const assertion above), so
+            // the whole match costs one flush.
+            let os = offset_slot(offset) as usize;
+            bw.add_bits_raw(offcode.codewords[os] as u64, offcode.lens[os] as u32);
+            bw.add_bits_raw(
+                (offset - OFFSET_SLOT_BASE[os]) as u64,
+                OFFSET_EXTRA_BITS[os] as u32,
+            );
+            // SAFETY: see above.
+            unsafe { bw.flush_word_unchecked() };
+        }
+        i += 1;
+    }
+
+    // End-of-block symbol.
+    bw.add_bits_raw(
         litcode.codewords[DEFLATE_END_OF_BLOCK] as u64,
         litcode.lens[DEFLATE_END_OF_BLOCK] as u32,
     );
+    // SAFETY: reserve() left 16 slack bytes beyond the token bytes for the EOB.
+    unsafe { bw.flush_word_unchecked() };
 }
 
 /// Approximate bit cost of storing `len` bytes as stored (BTYPE=00) sub-blocks.
@@ -376,4 +487,190 @@ fn emit_tokens(bw: &mut BitWriter, tokens: &[Token], litcode: &HuffmanCode, offc
 fn stored_block_bits(len: usize) -> u64 {
     let subblocks = (len / 65535) + 1;
     (8 * (len + 5 * subblocks)) as u64
+}
+
+#[cfg(test)]
+mod emit_tests {
+    use super::*;
+
+    /// The PRE-lever emit: symbol-then-extra, one `add_bits` per field, per-call
+    /// auto-flush. Kept verbatim as the byte-for-byte reference the fast path
+    /// must match.
+    fn emit_tokens_reference(
+        bw: &mut BitWriter,
+        tokens: &[Token],
+        litcode: &HuffmanCode,
+        offcode: &HuffmanCode,
+    ) {
+        for &t in tokens {
+            match t {
+                Token::Literal(b) => {
+                    bw.add_bits(
+                        litcode.codewords[b as usize] as u64,
+                        litcode.lens[b as usize] as u32,
+                    );
+                }
+                Token::Match { length, offset } => {
+                    let length = length as u32;
+                    let offset = offset as u32;
+                    let ls = length_slot(length) as usize;
+                    bw.add_bits(
+                        litcode.codewords[DEFLATE_FIRST_LEN_SYM + ls] as u64,
+                        litcode.lens[DEFLATE_FIRST_LEN_SYM + ls] as u32,
+                    );
+                    bw.add_bits(
+                        (length - LENGTH_SLOT_BASE[ls]) as u64,
+                        LENGTH_EXTRA_BITS[ls] as u32,
+                    );
+                    let os = offset_slot(offset) as usize;
+                    bw.add_bits(offcode.codewords[os] as u64, offcode.lens[os] as u32);
+                    bw.add_bits(
+                        (offset - OFFSET_SLOT_BASE[os]) as u64,
+                        OFFSET_EXTRA_BITS[os] as u32,
+                    );
+                }
+            }
+        }
+        bw.add_bits(
+            litcode.codewords[DEFLATE_END_OF_BLOCK] as u64,
+            litcode.lens[DEFLATE_END_OF_BLOCK] as u32,
+        );
+    }
+
+    fn lit_run(v: &mut Vec<Token>, bytes: &[u8]) {
+        for &b in bytes {
+            v.push(Token::Literal(b));
+        }
+    }
+
+    /// A token list exercising: literal runs of every remainder class (0/1/2/3
+    /// past a multiple of 4), matches spanning the extreme and interior
+    /// length/offset slots, and back-to-back matches with no literals between.
+    fn fixture_tokens() -> Vec<Token> {
+        let mut t = Vec::new();
+        // 10 literals => two groups of 4 + a 2-literal tail.
+        lit_run(&mut t, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        // Min-length / min-offset match.
+        t.push(Token::Match {
+            length: 3,
+            offset: 1,
+        });
+        // Exactly 4 literals => one group, empty tail.
+        lit_run(&mut t, &[10, 20, 30, 40]);
+        // Max-length / max-offset match (largest length + offset slots).
+        t.push(Token::Match {
+            length: 258,
+            offset: 32768,
+        });
+        // Back-to-back matches, no literals between, interior slots.
+        t.push(Token::Match {
+            length: 24,
+            offset: 100,
+        });
+        t.push(Token::Match {
+            length: 130,
+            offset: 5000,
+        });
+        // 1-literal tail.
+        lit_run(&mut t, &[200]);
+        t.push(Token::Match {
+            length: 11,
+            offset: 300,
+        });
+        // 3-literal tail.
+        lit_run(&mut t, &[201, 202, 203]);
+        t.push(Token::Match {
+            length: 66,
+            offset: 12000,
+        });
+        // A long literal run to exercise many packed groups + a 2-tail.
+        let long: Vec<u8> = (0..50).map(|i| (i * 5) as u8).collect();
+        lit_run(&mut t, &long);
+        t
+    }
+
+    #[test]
+    fn fast_emit_is_byte_identical_to_reference() {
+        let statics = StaticCodes::build();
+        let tokens = fixture_tokens();
+
+        // Try several starting bitcounts, including > 7, since real blocks reach
+        // emit_tokens with up to 63 bits still buffered from the (auto-flushing)
+        // header emission — the raw fast path must normalize that first.
+        for seed_bits in [0u32, 3, 7, 8, 20, 40, 63] {
+            let seed_val = if seed_bits == 0 {
+                0
+            } else {
+                0x5A5A_5A5A_5A5A_5A5Au64 & ((1u64 << seed_bits) - 1)
+            };
+
+            // Fast (lever) path.
+            let mut fast = BitWriter::new();
+            if seed_bits != 0 {
+                fast.add_bits(seed_val, seed_bits);
+            }
+            emit_tokens(&mut fast, &tokens, &statics.litcode, &statics.offcode);
+            let fast_bytes = fast.finish();
+
+            // Reference path with an identical seed.
+            let mut refr = BitWriter::new();
+            if seed_bits != 0 {
+                refr.add_bits(seed_val, seed_bits);
+            }
+            emit_tokens_reference(&mut refr, &tokens, &statics.litcode, &statics.offcode);
+            let ref_bytes = refr.finish();
+
+            assert_eq!(
+                fast_bytes, ref_bytes,
+                "fast emit diverged from the reference emit (seed_bits={seed_bits})"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_emit_matches_reference_on_all_literals() {
+        let statics = StaticCodes::build();
+        let bytes: Vec<u8> = (0..=255u16).map(|b| b as u8).collect();
+        let tokens: Vec<Token> = bytes.iter().map(|&b| Token::Literal(b)).collect();
+
+        let mut fast = BitWriter::new();
+        emit_tokens(&mut fast, &tokens, &statics.litcode, &statics.offcode);
+        let fast_bytes = fast.finish();
+
+        let mut refr = BitWriter::new();
+        emit_tokens_reference(&mut refr, &tokens, &statics.litcode, &statics.offcode);
+        let ref_bytes = refr.finish();
+
+        assert_eq!(fast_bytes, ref_bytes);
+    }
+
+    #[test]
+    fn fast_emit_matches_reference_with_dynamic_codes() {
+        // Build non-static codes from a skewed frequency distribution so the
+        // codeword lengths differ from the fixed code, then check equality.
+        let mut litfreqs = [0u32; DEFLATE_NUM_LITLEN_SYMS];
+        for (i, f) in litfreqs.iter_mut().enumerate() {
+            *f = ((i * 7 + 1) % 13 + 1) as u32;
+        }
+        litfreqs[DEFLATE_END_OF_BLOCK] += 1;
+        let mut offfreqs = [0u32; DEFLATE_NUM_OFFSET_SYMS];
+        for (i, f) in offfreqs.iter_mut().enumerate() {
+            *f = ((i * 3 + 2) % 11 + 1) as u32;
+        }
+        let litcode =
+            make_huffman_code(DEFLATE_NUM_LITLEN_SYMS, MAX_LITLEN_CODEWORD_LEN, &litfreqs);
+        let offcode =
+            make_huffman_code(DEFLATE_NUM_OFFSET_SYMS, MAX_OFFSET_CODEWORD_LEN, &offfreqs);
+        let tokens = fixture_tokens();
+
+        let mut fast = BitWriter::new();
+        emit_tokens(&mut fast, &tokens, &litcode, &offcode);
+        let fast_bytes = fast.finish();
+
+        let mut refr = BitWriter::new();
+        emit_tokens_reference(&mut refr, &tokens, &litcode, &offcode);
+        let ref_bytes = refr.finish();
+
+        assert_eq!(fast_bytes, ref_bytes);
+    }
 }

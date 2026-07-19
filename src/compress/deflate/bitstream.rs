@@ -81,6 +81,72 @@ impl BitWriter {
         self.bitcount += n;
     }
 
+    /// `ADD_BITS` — pure accumulate with no flush and no bounds check.
+    ///
+    /// This is the libdeflate hot-path primitive (C:717-722): the caller is
+    /// responsible for having flushed recently enough that `bitcount + n <=
+    /// BITBUF_NBITS`. Used by the block-body emitter, which interleaves these
+    /// with [`flush_word_unchecked`](Self::flush_word_unchecked) at the exact
+    /// points the vendor's `WRITE_MATCH` / 4-literal loop flush.
+    #[inline]
+    pub fn add_bits_raw(&mut self, val: u64, n: u32) {
+        debug_assert!(
+            self.bitcount + n <= BITBUF_NBITS,
+            "add_bits_raw overflow: bitcount={} n={n}",
+            self.bitcount
+        );
+        debug_assert!(
+            n == 0 || val < (1u64 << n),
+            "add_bits_raw value has bits above n"
+        );
+        self.bitbuf |= val << self.bitcount;
+        self.bitcount += n;
+    }
+
+    /// Reserve space for at least `additional` more output bytes.
+    ///
+    /// Callers that then use [`flush_word_unchecked`](Self::flush_word_unchecked)
+    /// must reserve enough that every flush in the batch has 8 spare bytes.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.out.reserve(additional);
+    }
+
+    /// Branchless whole-word `FLUSH_BITS` (C:734-751), assuming buffer room.
+    ///
+    /// Emits the complete bytes of the accumulator with a SINGLE unaligned
+    /// 64-bit store (not a per-byte loop nor a variable-length `extend`), then
+    /// keeps only the partial trailing byte. After this at most 7 bits remain.
+    ///
+    /// # Safety
+    /// The output buffer must have at least 8 bytes of spare capacity
+    /// (`self.out.capacity() - self.out.len() >= 8`). The batch emitter guards
+    /// this by [`reserve`](Self::reserve)-ing `6 * tokens + slack` up front (a
+    /// token codes to at most 47 bits < 6 bytes), which bounds the total bytes
+    /// written so every intermediate flush stays 8 bytes inside capacity.
+    #[inline]
+    pub unsafe fn flush_word_unchecked(&mut self) {
+        let len = self.out.len();
+        debug_assert!(
+            self.out.capacity() - len >= 8,
+            "flush_word_unchecked without 8 spare bytes (len={len} cap={})",
+            self.out.capacity()
+        );
+        // SAFETY: caller guarantees capacity >= len + 8, so the 8-byte
+        // unaligned store lands entirely inside the allocation. We store the
+        // native-order representation of `bitbuf.to_le()`, i.e. the little-endian
+        // byte sequence DEFLATE requires, on both endiannesses.
+        let dst = self.out.as_mut_ptr().add(len) as *mut u64;
+        dst.write_unaligned(self.bitbuf.to_le());
+        let nbytes = (self.bitcount >> 3) as usize;
+        // SAFETY: nbytes <= 7 (bitcount <= 63) and len + nbytes <= len + 8 <= cap;
+        // those bytes were just initialized by the store above.
+        self.out.set_len(len + nbytes);
+        // `bitcount & !7` is at most 56, so the shift is well-defined.
+        self.bitbuf >>= self.bitcount & !7;
+        self.bitcount &= 7;
+    }
+
     /// Flush whole bytes from the accumulator into the output buffer.
     ///
     /// This is the branchless whole-word flush: write the eight little-endian
