@@ -481,6 +481,14 @@ impl GzippyArgs {
         Ok(args)
     }
 
+    /// Whether zopfli semantics are requested (level 11 or an explicit
+    /// -F/-I/-J tuning flag).
+    ///
+    /// Increment 7: the compress router no longer calls this — it distinguishes
+    /// *explicit* zopfli tuning (which forces the zopfli encoder) from a plain
+    /// `-11` (which uses the pure near-optimal engine), so it inspects the
+    /// individual flags directly. Retained as a public CLI predicate.
+    #[allow(dead_code)]
     pub fn use_zopfli(&self) -> bool {
         self.compression_level == 11
             || self.zopfli_iterations.is_some()

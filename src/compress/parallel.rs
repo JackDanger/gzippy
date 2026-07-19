@@ -14,12 +14,32 @@
 //! - libdeflate for L1-L6 (30-50% faster than zlib-ng)
 //! - BGZF-style block size markers in FEXTRA for fast parallel decompression
 
+// Increment 7: the C-FFI encoders here are compiled only for tests / the
+// `ffi-oracle` feature. In a NON-test `ffi-oracle` build they have no in-crate
+// caller (the callers are tests), so allow dead code in that one config only —
+// the default and test builds keep full dead-code detection for the pure code.
+#![cfg_attr(all(feature = "ffi-oracle", not(test)), allow(dead_code))]
+
+// The C-FFI parallel encoders below (ParallelGzEncoder, compress_single_member,
+// the BGZF block compressors) are Increment-7 differential oracles: OFF the
+// production routing graph, compiled only under `ffi-oracle`. `GzipHeaderInfo`,
+// `GZ_SUBFIELD_ID`, `split_rsyncable`, and the now-pure `compress_rsyncable`
+// stay unconditional (the decode format detector reads `GZ_SUBFIELD_ID`, and the
+// pure production path uses `GzipHeaderInfo`).
+#[cfg(any(test, feature = "ffi-oracle"))]
 use crate::infra::scheduler::compress_parallel_independent;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use flate2::Compression;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use memmap2::Mmap;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use std::cell::RefCell;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use std::fs::File;
-use std::io::{self, Read, Write};
+#[cfg(any(test, feature = "ffi-oracle"))]
+use std::io::Read;
+use std::io::{self, Write};
+#[cfg(any(test, feature = "ffi-oracle"))]
 use std::path::Path;
 
 /// BGZF-style subfield ID for block size markers
@@ -44,6 +64,7 @@ pub struct GzipHeaderInfo {
 ///
 /// However, since L7-L9 never uses L1, this mapping is only relevant for
 /// the pipelined compressor which uses zlib-ng directly.
+#[cfg(any(test, feature = "ffi-oracle"))]
 #[inline]
 pub fn adjust_compression_level(level: u32) -> u32 {
     // Only needed for zlib-ng (pipelined compressor at L7-L9)
@@ -64,6 +85,7 @@ pub fn adjust_compression_level(level: u32) -> u32 {
 ///
 /// Block size is also scaled based on file size to ensure enough blocks for
 /// parallelism on small files while reducing overhead on large files.
+#[cfg(any(test, feature = "ffi-oracle"))]
 #[inline]
 pub fn get_block_size_for_level(level: u32) -> usize {
     match level {
@@ -86,6 +108,7 @@ pub fn get_block_size_for_level(level: u32) -> usize {
 /// This ensures we have enough blocks for parallelism while keeping per-block
 /// overhead low. At L1, libdeflate's hash table init is ~0.1ms per block,
 /// so fewer larger blocks scale much better.
+#[cfg(any(test, feature = "ffi-oracle"))]
 #[inline]
 pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) -> usize {
     let base_block_size = get_block_size_for_level(level);
@@ -110,6 +133,7 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
 }
 
 // Thread-local compression buffer to avoid per-block allocation
+#[cfg(any(test, feature = "ffi-oracle"))]
 thread_local! {
     static COMPRESS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     // Cache libdeflate Compressor by level to avoid per-block allocation
@@ -120,15 +144,18 @@ thread_local! {
 /// Default block size for parallel compression
 /// BGZF format stores block size as u16, so max is 65535 bytes
 /// We use 64KB to stay within this limit while maximizing parallelism
+#[cfg(any(test, feature = "ffi-oracle"))]
 const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Parallel gzip compression using custom scheduler
+#[cfg(any(test, feature = "ffi-oracle"))]
 pub struct ParallelGzEncoder {
     compression_level: u32,
     num_threads: usize,
     header_info: GzipHeaderInfo,
 }
 
+#[cfg(any(test, feature = "ffi-oracle"))]
 impl ParallelGzEncoder {
     pub fn new(compression_level: u32, num_threads: usize) -> Self {
         Self {
@@ -226,6 +253,7 @@ impl ParallelGzEncoder {
     }
 
     /// Compress a file using memory-mapped I/O for zero-copy access
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
         &self,
         path: P,
@@ -343,6 +371,7 @@ impl ParallelGzEncoder {
 ///
 /// The output includes a standard gzip header with FNAME/MTIME and a BGZF-compatible
 /// block size marker in FEXTRA. This is valid gzip readable by any decompressor.
+#[cfg(any(test, feature = "ffi-oracle"))]
 pub fn compress_single_member<W: Write>(
     writer: &mut W,
     input: &[u8],
@@ -383,6 +412,7 @@ pub fn compress_single_member<W: Write>(
 /// but enables gzippy to find block boundaries without inflating.
 ///
 /// Uses libdeflate for L1-L6 (faster, no dictionary needed).
+#[cfg(any(test, feature = "ffi-oracle"))]
 pub fn compress_block_bgzf_libdeflate(
     output: &mut Vec<u8>,
     block: &[u8],
@@ -491,6 +521,7 @@ pub fn compress_block_bgzf_libdeflate(
 /// Uses the same header format as compress_block_bgzf_libdeflate so blocks
 /// from either compressor can be mixed.
 /// Compresses directly into the output buffer to avoid per-block allocation.
+#[cfg(any(test, feature = "ffi-oracle"))]
 fn compress_block_bgzf_isal(
     output: &mut Vec<u8>,
     block: &[u8],
@@ -620,14 +651,22 @@ pub fn split_rsyncable(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Compress data with rsyncable block boundaries.
-/// Each content-determined block becomes an independent gzip member.
+/// Each content-determined block becomes an independent standard gzip member.
+///
+/// Increment 7: each block is compressed with the pure-Rust DEFLATE engine
+/// (`deflate::compress_gzip` — one self-contained gzip member per block), so
+/// `--rsyncable` carries ZERO C-FFI compressor. `header_info` no longer flows
+/// into per-block headers (each pure member uses the minimal gzip header); the
+/// content-defined boundaries from `split_rsyncable` are what rsync relies on.
 pub fn compress_rsyncable<W: Write + Send>(
     data: &[u8],
     compression_level: u32,
     num_threads: usize,
-    header_info: &GzipHeaderInfo,
+    _header_info: &GzipHeaderInfo,
     mut writer: W,
 ) -> io::Result<u64> {
+    use crate::compress::deflate;
+
     let blocks = split_rsyncable(data);
 
     if blocks.is_empty() {
@@ -638,8 +677,7 @@ pub fn compress_rsyncable<W: Write + Send>(
     if blocks.len() == 1 || num_threads <= 1 {
         let mut total = 0u64;
         for block in &blocks {
-            let mut output = Vec::new();
-            compress_block_bgzf_libdeflate(&mut output, block, compression_level, header_info);
+            let output = deflate::compress_gzip(block, compression_level);
             writer.write_all(&output)?;
             total += block.len() as u64;
         }
@@ -666,12 +704,7 @@ pub fn compress_rsyncable<W: Write + Send>(
                     break;
                 }
                 let mut output = outputs[idx].lock().unwrap();
-                compress_block_bgzf_libdeflate(
-                    &mut output,
-                    blocks[idx],
-                    compression_level,
-                    header_info,
-                );
+                *output = deflate::compress_gzip(blocks[idx], compression_level);
             });
         }
     });
@@ -687,6 +720,8 @@ pub fn compress_rsyncable<W: Write + Send>(
     Ok(total)
 }
 
+// These tests exercise the C-FFI ParallelGzEncoder / BGZF block compressors,
+// which are Increment-7 differential oracles compiled only under `ffi-oracle`.
 #[cfg(test)]
 mod tests {
     use super::*;

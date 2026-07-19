@@ -16,9 +16,10 @@
 //!
 //! Correctness is pinned by `src/tests/deflate_encoder_matches.rs`: byte-exact
 //! roundtrip through flate2, libdeflate (FFI), and system `gzip -d` for every
-//! implemented level, plus a proptest generator. Wired into production T1
-//! routing only under the `pure-rust-encoder` cargo feature (compile-time; the
-//! default build is unchanged).
+//! implemented level, plus a proptest generator. As of Increment 7 this is the
+//! SOLE production compress engine — every level 0–12, T1 and T>1 (via
+//! `pipelined::compress_buffer_pure`) — with the C-FFI backends removed from the
+//! routing graph.
 //!
 //! Some substrate primitives are used only by later increments (near-optimal
 //! parsing), so `dead_code` is allowed module-wide.

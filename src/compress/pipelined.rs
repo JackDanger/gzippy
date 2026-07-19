@@ -14,21 +14,42 @@
 //!
 //! This is used when compression_level >= 7 and threads > 1.
 
-use crate::compress::parallel::{adjust_compression_level, GzipHeaderInfo};
+// Increment 7: the flate2 dictionary-sharing FFI methods are compiled only for
+// tests / the `ffi-oracle` feature. In a NON-test `ffi-oracle` build they have
+// no in-crate caller, so allow dead code in that one config only; the default
+// and test builds keep full dead-code detection for the pure pipeline.
+#![cfg_attr(all(feature = "ffi-oracle", not(test)), allow(dead_code))]
+
+use crate::compress::parallel::GzipHeaderInfo;
 use crate::infra::scheduler::compress_parallel;
-use flate2::{Compress, Compression, FlushCompress, Status};
-use std::cell::{RefCell, UnsafeCell};
-use std::io::{self, Read, Write};
+use std::cell::UnsafeCell;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
+
+// Increment 7: the flate2/zlib-ng dictionary-sharing compress methods below are
+// differential oracles compiled only under `ffi-oracle`. The pure production
+// path (`compress_buffer_pure` → `compress_parallel_pipeline_pure`) uses the
+// pure-Rust DEFLATE engine and none of these imports.
+#[cfg(any(test, feature = "ffi-oracle"))]
+use crate::compress::parallel::adjust_compression_level;
+#[cfg(any(test, feature = "ffi-oracle"))]
+use flate2::{Compress, Compression, FlushCompress, Status};
+#[cfg(any(test, feature = "ffi-oracle"))]
+use std::cell::RefCell;
+#[cfg(any(test, feature = "ffi-oracle"))]
+use std::io::Read;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use std::path::Path;
 
 // Thread-local Compress object to avoid reinitializing zlib state (~300KB) per block
 // Note: We store Option<(level, Compress)> to cache by level
+#[cfg(any(test, feature = "ffi-oracle"))]
 thread_local! {
     static PIPELINED_COMPRESS: RefCell<Option<(u32, Compress)>> = const { RefCell::new(None) };
 }
 
 /// Dictionary size (DEFLATE maximum is 32KB)
+#[cfg(any(test, feature = "ffi-oracle"))]
 const DICT_SIZE: usize = 32 * 1024;
 
 struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
@@ -109,7 +130,6 @@ impl PipelinedGzEncoder {
     /// Raw gzip header bytes (magic, CM=8, FLG, MTIME, XFL=0, OS=255, then any
     /// FNAME/FCOMMENT) matching the layout written by the parallel/sequential
     /// paths below.
-    #[cfg(feature = "pure-rust-encoder")]
     fn gzip_header_bytes(&self) -> Vec<u8> {
         let mut header = Vec::with_capacity(64);
         let mut flags: u8 = 0x00;
@@ -134,9 +154,9 @@ impl PipelinedGzEncoder {
     }
 
     /// Compress a pre-read buffer to a single-member gzip stream using the
-    /// pure-Rust DEFLATE engine (feature `pure-rust-encoder`). Multi-threaded
-    /// parallel-pipeline path; empty input yields a valid empty gzip member.
-    #[cfg(feature = "pure-rust-encoder")]
+    /// pure-Rust DEFLATE engine — the SOLE production T>1 compress path
+    /// (Increment 7). Multi-threaded parallel-pipeline path; empty input yields
+    /// a valid empty gzip member.
     pub fn compress_buffer_pure<W: Write + Send>(
         &self,
         data: &[u8],
@@ -162,6 +182,7 @@ impl PipelinedGzEncoder {
         Ok(data.len() as u64)
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Build a flate2 GzBuilder with FNAME/MTIME/FCOMMENT from header_info
     fn gz_builder(&self) -> flate2::GzBuilder {
         let mut builder = flate2::GzBuilder::new();
@@ -175,7 +196,9 @@ impl PipelinedGzEncoder {
         builder
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Compress a pre-read buffer directly, avoiding the extra copy from Reader→Vec.
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn compress_buffer<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<u64> {
         if data.is_empty() {
             let encoder = self
@@ -193,6 +216,7 @@ impl PipelinedGzEncoder {
         Ok(data.len() as u64)
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Compress data with dictionary sharing
     pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data
@@ -216,7 +240,9 @@ impl PipelinedGzEncoder {
         Ok(bytes_read)
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Compress file using memory-mapped I/O with dictionary sharing
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
         &self,
         path: P,
@@ -263,6 +289,7 @@ impl PipelinedGzEncoder {
     /// - Zero work-stealing overhead (uniform block sizes)
     /// - Streaming output (no bulk collection)
     /// - Pre-allocated buffers (no allocation in hot path)
+    #[cfg(any(test, feature = "ffi-oracle"))]
     fn compress_parallel_pipeline<W: Write + Send>(
         &self,
         data: &[u8],
@@ -350,7 +377,6 @@ impl PipelinedGzEncoder {
     /// The grid ([`pipelined_block_size`]) depends only on `data.len()`, and the
     /// per-chunk dictionary and compression are deterministic, so the output is
     /// byte-identical regardless of `num_threads`.
-    #[cfg(feature = "pure-rust-encoder")]
     fn compress_parallel_pipeline_pure<W: Write + Send>(
         &self,
         data: &[u8],
@@ -419,6 +445,7 @@ impl PipelinedGzEncoder {
     }
 
     /// Sequential compression (single-threaded, for -p1)
+    #[cfg(any(test, feature = "ffi-oracle"))]
     fn compress_sequential<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
         use crc32fast::Hasher;
 
@@ -508,6 +535,7 @@ impl PipelinedGzEncoder {
 /// Compress a single block with optional dictionary
 ///
 /// Uses thread-local Compress object to avoid per-block allocation.
+#[cfg(any(test, feature = "ffi-oracle"))]
 fn compress_block_with_dict(
     block: &[u8],
     dict: Option<&[u8]>,
@@ -582,6 +610,8 @@ fn compress_block_with_dict(
     })
 }
 
+// These tests exercise the C-FFI flate2 dictionary compress path and the ParallelGzEncoder
+// oracle, both compiled only under `ffi-oracle`.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,6 +8,11 @@
 //! - Global thread pool to avoid per-call initialization
 //! - System zlib for gzip-compatible output at all compression levels
 //! - Cache-aware block sizing based on detected L2 cache
+//!
+//! Increment 7: `SimpleOptimizer` is a C-FFI differential oracle (off the
+//! production compress graph), compiled only for tests / the `ffi-oracle`
+//! feature. In a NON-test `ffi-oracle` build it has no in-crate caller.
+#![cfg_attr(all(feature = "ffi-oracle", not(test)), allow(dead_code))]
 
 use flate2::Compression;
 use std::io::{self, Read, Write};
@@ -31,6 +36,7 @@ impl SimpleOptimizer {
         }
     }
 
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn with_header_info(mut self, info: GzipHeaderInfo) -> Self {
         self.header_info = info;
         self
@@ -91,6 +97,7 @@ impl SimpleOptimizer {
     /// - L10-L12: libdeflate ultra compression (near-zopfli ratio)
     /// - L7-L9: pipelined zlib-ng for gzip-compatible ratio
     /// - L1-L6: independent blocks for parallel decompression
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
         &self,
         path: P,

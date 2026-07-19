@@ -1,5 +1,5 @@
 //! Correctness net for the pure-Rust PARALLEL DEFLATE encoder (Increment 6:
-//! `PipelinedGzEncoder::compress_buffer_pure`, gated on `pure-rust-encoder`).
+//! `PipelinedGzEncoder::compress_buffer_pure` — the sole production T>1 path).
 //!
 //! The parallel path splits the input on a deterministic, data-length-only
 //! block grid, compresses each chunk independently with the previous chunk's
@@ -16,9 +16,10 @@
 //!      and cross-chunk-boundary match inputs stay valid.
 //!   4. CRC32 + ISIZE trailer bytes are correct.
 //!
-//! Run: `cargo test --release --features pure-rust-encoder pure_parallel_encoder`.
-
-#![cfg(feature = "pure-rust-encoder")]
+//! Run: `cargo test --release pure_parallel_encoder`.
+//!
+//! Increment 7: the pure parallel encoder is the SOLE production T>1 compress
+//! path, so this module is compiled unconditionally (no longer feature-gated).
 
 use crate::compress::pipelined::PipelinedGzEncoder;
 use std::io::{Read, Write};
