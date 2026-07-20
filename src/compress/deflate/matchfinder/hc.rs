@@ -61,9 +61,9 @@ const WINDOW_MASK: u16 = (WINDOW_SIZE - 1) as u16;
 /// passed/constructed by value.
 pub struct HcMatchfinder {
     /// Singleton nodes for length-3 matches (`hash3_tab`).
-    hash3_tab: Vec<i16>,
+    hash3_tab: [i16; HASH3_SIZE],
     /// First node of each length-4+ chain (`hash4_tab`).
-    hash4_tab: Vec<i16>,
+    hash4_tab: [i16; HASH4_SIZE],
     /// `next_tab[pos]` = the node following `pos` in its chain.
     next_tab: [i16; WINDOW_SIZE],
 }
@@ -77,16 +77,21 @@ impl HcMatchfinder {
     pub fn new() -> Box<Self> {
         let mut boxed = Box::<Self>::new_uninit();
         // SAFETY: `new_uninit` gives an aligned, fully-owned allocation for one
-        // `HcMatchfinder`. We initialize EVERY field before `assume_init`:
-        // `ptr::write` the two `Vec` fields (initializing without dropping the
-        // uninitialized old value), and fill all `WINDOW_SIZE` `i16`s of the
-        // inline `next_tab` with `MATCHFINDER_INITVAL` (the exact value
+        // `HcMatchfinder`. We initialize EVERY `i16` of all three inline tables
+        // before `assume_init`, writing `MATCHFINDER_INITVAL` (the exact value
         // `matchfinder_init` writes — a `-WINDOW_SIZE`/`0x8000` sentinel, NOT
-        // zero). `addr_of_mut!` avoids forming a reference to uninit memory.
+        // zero). `addr_of_mut!` avoids forming a reference to uninit memory;
+        // each `.add(i)` for `i < LEN` stays inside its `[i16; LEN]` field.
         unsafe {
             let p = boxed.as_mut_ptr();
-            core::ptr::addr_of_mut!((*p).hash3_tab).write(vec![MATCHFINDER_INITVAL; HASH3_SIZE]);
-            core::ptr::addr_of_mut!((*p).hash4_tab).write(vec![MATCHFINDER_INITVAL; HASH4_SIZE]);
+            let h3 = core::ptr::addr_of_mut!((*p).hash3_tab) as *mut i16;
+            for i in 0..HASH3_SIZE {
+                h3.add(i).write(MATCHFINDER_INITVAL);
+            }
+            let h4 = core::ptr::addr_of_mut!((*p).hash4_tab) as *mut i16;
+            for i in 0..HASH4_SIZE {
+                h4.add(i).write(MATCHFINDER_INITVAL);
+            }
             let nt = core::ptr::addr_of_mut!((*p).next_tab) as *mut i16;
             for i in 0..WINDOW_SIZE {
                 nt.add(i).write(MATCHFINDER_INITVAL);
@@ -97,16 +102,16 @@ impl HcMatchfinder {
 
     /// Re-initialize all tables for a new input buffer.
     pub fn reset(&mut self) {
-        matchfinder_init(&mut self.hash3_tab);
-        matchfinder_init(&mut self.hash4_tab);
+        matchfinder_init(&mut self.hash3_tab[..]);
+        matchfinder_init(&mut self.hash4_tab[..]);
         matchfinder_init(&mut self.next_tab[..]);
     }
 
     /// `hc_matchfinder_slide_window`: rebase every stored position by one window.
     #[inline]
     fn slide_window(&mut self) {
-        matchfinder_rebase(&mut self.hash3_tab);
-        matchfinder_rebase(&mut self.hash4_tab);
+        matchfinder_rebase(&mut self.hash3_tab[..]);
+        matchfinder_rebase(&mut self.hash4_tab[..]);
         matchfinder_rebase(&mut self.next_tab[..]);
     }
 
@@ -803,11 +808,11 @@ mod tests {
         assert_eq!(base_new, base_ref, "in_base diverged {ctx}");
         assert_eq!(nh_new, nh_ref, "next_hashes diverged {ctx}");
         assert!(
-            mf_new.hash3_tab == mf_ref.hash3_tab,
+            mf_new.hash3_tab[..] == mf_ref.hash3_tab[..],
             "hash3_tab diverged {ctx}"
         );
         assert!(
-            mf_new.hash4_tab == mf_ref.hash4_tab,
+            mf_new.hash4_tab[..] == mf_ref.hash4_tab[..],
             "hash4_tab diverged {ctx}"
         );
         assert!(
