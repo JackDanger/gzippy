@@ -446,6 +446,48 @@ fn add_lz77_block_auto_type(
     }
 }
 
+/// Re-squeeze one final block's byte range under BLOCK-LOCAL prices.
+///
+/// The per-greedy-chunk squeeze in `deflate_part` prices each chunk over a
+/// coarse, often heterogeneous region; the recursive exact-cost re-split then
+/// moves block boundaries to places that squeeze never priced against. Running
+/// the full multi-seed `lz77_optimal` over the FINAL block's exact byte range
+/// recovers block-local length/distance statistics, which is what the
+/// optimal-parse frontier (ECT) achieves and what lets it keep medium near
+/// matches (len 17-32 / dist 1-64) that the coarser prices under-took — the
+/// measured parse residual. Returns the re-squeezed store only when it is
+/// strictly cheaper by true auto-type cost, so a block can never regress.
+fn resqueeze_block<'a>(
+    options: &ZopfliOptions,
+    in_: &'a [u8],
+    lz77: &LZ77Store<'_>,
+    start: usize,
+    end: usize,
+) -> Option<LZ77Store<'a>> {
+    if start == end {
+        return None;
+    }
+    let instart = lz77.pos[start];
+    let inend = instart + lz77.byte_range(start, end);
+    let mut s = BlockState::new(options, instart, inend, true);
+    let mut cand = LZ77Store::new(in_);
+    lz77_optimal(
+        &mut s,
+        in_,
+        instart,
+        inend,
+        options.numiterations,
+        &mut cand,
+    );
+    let cand_cost = calculate_block_size_auto_type(&cand, 0, cand.size());
+    let orig_cost = calculate_block_size_auto_type(lz77, start, end);
+    if cand_cost < orig_cost {
+        Some(cand)
+    } else {
+        None
+    }
+}
+
 // ── Step 15: deflate driver ──────────────────────────────────────────────────
 
 /// Compress `in_[instart..inend]` into one deflate sub-stream. `bp` is the
@@ -587,6 +629,60 @@ pub fn deflate_part(
         };
         if partition_cost(&splitpoints2) < partition_cost(&splitpoints) {
             splitpoints = splitpoints2;
+        }
+
+        // Per-final-block re-squeeze with block-local prices. See
+        // `resqueeze_block`: the recursive re-split lands boundaries the coarse
+        // per-chunk squeeze never priced against, so each final block's tokens
+        // can be under-matched relative to its own local statistics. Re-squeeze
+        // every final block over its exact byte range and keep the cheaper of
+        // (original tokens, re-squeezed) — monotone, so no block regresses.
+        {
+            let np = splitpoints.len();
+            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(np + 1);
+            for i in 0..=np {
+                let start = if i == 0 { 0 } else { splitpoints[i - 1] };
+                let end = if i == np { lz77.size() } else { splitpoints[i] };
+                ranges.push((start, end));
+            }
+            let winners: Vec<Option<LZ77Store<'_>>> = if options.thread_budget == 1 {
+                ranges
+                    .iter()
+                    .map(|&(s, e)| resqueeze_block(options, in_, &lz77, s, e))
+                    .collect()
+            } else {
+                let lz = &lz77;
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = ranges
+                        .iter()
+                        .map(|&(s, e)| scope.spawn(move || resqueeze_block(options, in_, lz, s, e)))
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
+            if winners.iter().any(|w| w.is_some()) {
+                let mut refined = LZ77Store::new(in_);
+                let mut new_splits: Vec<usize> = Vec::new();
+                for (i, &(start, end)) in ranges.iter().enumerate() {
+                    match &winners[i] {
+                        Some(cand) => refined.append_from(cand),
+                        None => {
+                            for k in start..end {
+                                refined.store_lit_len_dist(
+                                    lz77.litlens[k],
+                                    lz77.dists[k],
+                                    lz77.pos[k],
+                                );
+                            }
+                        }
+                    }
+                    if i < np {
+                        new_splits.push(refined.size());
+                    }
+                }
+                lz77 = refined;
+                splitpoints = new_splits;
+            }
         }
     }
 
