@@ -52,32 +52,54 @@ pub const WINDOW_SIZE: usize = 1 << 15;
 const WINDOW_MASK: u16 = (WINDOW_SIZE - 1) as u16;
 
 /// The hash-chains matchfinder state.
+///
+/// `next_tab` is stored as an INLINE fixed-size array rather than a `Vec<i16>`
+/// (libdeflate's representation): a chain-walk read is then `self + const_offset
+/// + i*2` (one x86 addressing mode, disp32 immediate) instead of a `RawVec`
+/// pointer deref, and no register is tied up holding the table base. The struct
+/// is >64 KiB, so it is always heap-boxed (`new` returns `Box<Self>`) and never
+/// passed/constructed by value.
 pub struct HcMatchfinder {
     /// Singleton nodes for length-3 matches (`hash3_tab`).
     hash3_tab: Vec<i16>,
     /// First node of each length-4+ chain (`hash4_tab`).
     hash4_tab: Vec<i16>,
     /// `next_tab[pos]` = the node following `pos` in its chain.
-    next_tab: Vec<i16>,
+    next_tab: [i16; WINDOW_SIZE],
 }
 
 impl HcMatchfinder {
     /// `hc_matchfinder_init`: allocate and initialize every table to the sentinel.
-    pub fn new() -> Self {
-        let mut mf = HcMatchfinder {
-            hash3_tab: vec![MATCHFINDER_INITVAL; HASH3_SIZE],
-            hash4_tab: vec![MATCHFINDER_INITVAL; HASH4_SIZE],
-            next_tab: vec![MATCHFINDER_INITVAL; WINDOW_SIZE],
-        };
-        mf.reset();
-        mf
+    ///
+    /// Returns a heap `Box` (the struct is >64 KiB with the inline `next_tab`).
+    /// Built through `Box::new_uninit` so no 64 KiB+ temporary ever lands on the
+    /// stack; every field is written before `assume_init`.
+    pub fn new() -> Box<Self> {
+        let mut boxed = Box::<Self>::new_uninit();
+        // SAFETY: `new_uninit` gives an aligned, fully-owned allocation for one
+        // `HcMatchfinder`. We initialize EVERY field before `assume_init`:
+        // `ptr::write` the two `Vec` fields (initializing without dropping the
+        // uninitialized old value), and fill all `WINDOW_SIZE` `i16`s of the
+        // inline `next_tab` with `MATCHFINDER_INITVAL` (the exact value
+        // `matchfinder_init` writes — a `-WINDOW_SIZE`/`0x8000` sentinel, NOT
+        // zero). `addr_of_mut!` avoids forming a reference to uninit memory.
+        unsafe {
+            let p = boxed.as_mut_ptr();
+            core::ptr::addr_of_mut!((*p).hash3_tab).write(vec![MATCHFINDER_INITVAL; HASH3_SIZE]);
+            core::ptr::addr_of_mut!((*p).hash4_tab).write(vec![MATCHFINDER_INITVAL; HASH4_SIZE]);
+            let nt = core::ptr::addr_of_mut!((*p).next_tab) as *mut i16;
+            for i in 0..WINDOW_SIZE {
+                nt.add(i).write(MATCHFINDER_INITVAL);
+            }
+            boxed.assume_init()
+        }
     }
 
     /// Re-initialize all tables for a new input buffer.
     pub fn reset(&mut self) {
         matchfinder_init(&mut self.hash3_tab);
         matchfinder_init(&mut self.hash4_tab);
-        matchfinder_init(&mut self.next_tab);
+        matchfinder_init(&mut self.next_tab[..]);
     }
 
     /// `hc_matchfinder_slide_window`: rebase every stored position by one window.
@@ -85,7 +107,7 @@ impl HcMatchfinder {
     fn slide_window(&mut self) {
         matchfinder_rebase(&mut self.hash3_tab);
         matchfinder_rebase(&mut self.hash4_tab);
-        matchfinder_rebase(&mut self.next_tab);
+        matchfinder_rebase(&mut self.next_tab[..]);
     }
 
     /// Find the longest match longer than `best_len_in` at `in_next`.
@@ -418,12 +440,6 @@ impl HcMatchfinder {
         }
         next_hashes[0] = hash3 as u32;
         next_hashes[1] = hash4 as u32;
-    }
-}
-
-impl Default for HcMatchfinder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -795,7 +811,7 @@ mod tests {
             "hash4_tab diverged {ctx}"
         );
         assert!(
-            mf_new.next_tab == mf_ref.next_tab,
+            mf_new.next_tab[..] == mf_ref.next_tab[..],
             "next_tab diverged {ctx}"
         );
     }
