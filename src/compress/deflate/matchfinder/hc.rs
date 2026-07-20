@@ -308,32 +308,40 @@ impl HcMatchfinder {
                     .next_tab
                     .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
             };
+            // Prefilter operands, hoisted like the vendor's C compiler does
+            // (hc_matchfinder.h:305-309): `off` and the `in_next`-side words
+            // change only when `best_len` grows, so keep them in locals and
+            // recompute at the two points `best_len` can change. The first-4
+            // word at `in_next` is `seq4`, already loaded above — same
+            // immutable bytes, same value. This makes the common reject path
+            // a SINGLE candidate load (`m_hi`, anchored at `best_len - 3`, the
+            // word containing the byte that would extend the match) compared
+            // against a register.
+            let mut off = best_len as usize - 3;
+            // SAFETY: `off = best_len-3` with `best_len <= max_len`, so
+            // `in_next + off + 4 <= in_next + max_len + 1 <= in_end + 1 <
+            // buf.len()` (BUF_PAD>=16).
+            let mut n_hi = unsafe {
+                debug_assert!(in_next + off + 4 <= blen);
+                load_u32(base, in_next + off)
+            };
             loop {
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                     // Prefetch the next node's match data one iteration ahead
                     // (see the length-4 walk for the correctness argument).
                     prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
-                    // Prefilter: compare the last 4 bytes FIRST — the vendor's
-                    // short-circuit order (hc_matchfinder.h:305-309). The
-                    // `best_len - 3`-anchored load covers the byte that would
-                    // extend the match, so ONE candidate load rejects most
-                    // chain nodes; the first-4 load+compare runs only on a
-                    // hi-hit. (The `in_next`-side loads are inner-loop
-                    // invariants — `off` changes only when `best_len` does —
-                    // and LICM keeps them in registers.) Same predicate over
-                    // immutable memory as the eager 4-load form: the node
-                    // walk and the selected match are byte-identical.
-                    let off = best_len as usize - 3;
-                    // SAFETY: `matchptr < in_next` (cutoff guard). `off = best_len-3`
-                    // with `best_len <= max_len`, so `in_next + off + 4 <=
-                    // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
-                    // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
+                    // Short-circuit prefilter: last-4 anchored word first —
+                    // one load kills most nodes — then first-4 vs `seq4`.
+                    // Identical predicate over immutable memory to the eager
+                    // 4-load form: the node walk, the selected match, and the
+                    // output bytes are unchanged.
+                    // SAFETY: `matchptr < in_next` (cutoff guard), so
+                    // `matchptr + off + 4 < in_next + off + 4 <= buf.len()`.
                     let hit = unsafe {
                         debug_assert!(matchptr < in_next);
-                        debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
-                        load_u32(base, matchptr + off) == load_u32(base, in_next + off)
-                            && load_u32(base, matchptr) == load_u32(base, in_next)
+                        debug_assert!(matchptr + off + 4 <= blen);
+                        load_u32(base, matchptr + off) == n_hi && load_u32(base, matchptr) == seq4
                     };
                     if hit {
                         break;
@@ -361,6 +369,13 @@ impl HcMatchfinder {
                     if best_len >= nice_len {
                         break 'search;
                     }
+                    // `best_len` grew: refresh the hoisted prefilter operands.
+                    off = best_len as usize - 3;
+                    // SAFETY: same bound as the initial `n_hi` load.
+                    n_hi = unsafe {
+                        debug_assert!(in_next + off + 4 <= blen);
+                        load_u32(base, in_next + off)
+                    };
                 }
                 // Advance to the next node — already loaded by the pipeline.
                 cur_node4 = next_node;
