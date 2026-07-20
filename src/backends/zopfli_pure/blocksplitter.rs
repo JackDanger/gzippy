@@ -269,7 +269,18 @@ pub fn block_split_lz77(
 ///
 /// `auto_type == false` uses dynamic-only cost (`calculate_block_size(..,2)`),
 /// matching ECT's `SplitCost` (3 + GetDynamicLengths + CalculateTreeSize);
-/// `true` uses the stored/fixed/dynamic best-of-three (`_auto_type`).
+/// `true` uses the stored/fixed/dynamic best-of-three (`_auto_type`), matching
+/// the reference optimal-parse frontier's `Splitter` (fulcrum
+/// `src/ratio/squeeze.rs`), which always prices candidates with the true
+/// best-of-3 (`block_cost_exact`/`plan_block`) — this is what lets it see
+/// UNDER-split cases dynamic-only pricing is blind to (a near-random
+/// sub-region is far cheaper isolated into its own STORED block than forced
+/// through a shared dynamic table). But its narrowing walks a different cost
+/// surface and can converge to a different — occasionally worse — local
+/// optimum than `false`'s (measured on tool.bin). `deflate::deflate_part`
+/// therefore runs BOTH as independent whole `(lz77, splitpoints)`
+/// trajectories via `refine_split_and_squeeze` and keeps whichever final
+/// result is cheaper by true cost, rather than picking one exclusively.
 struct RecursiveSplitter<'a, 'b> {
     lz77: &'a LZ77Store<'b>,
     memo: HashMap<(usize, usize), f64>,

@@ -5,7 +5,7 @@
 
 use super::blocksplitter::block_split;
 use super::deflate_size::{
-    build_rle, calculate_block_size, calculate_block_size_auto_type, get_dynamic_lengths,
+    build_rle, calculate_block_size, calculate_block_size_auto_type, get_dynamic_lengths_final,
     get_fixed_tree, CL_ORDER_PUB,
 };
 use super::lz77::{BlockState, LZ77Store};
@@ -316,7 +316,10 @@ fn add_lz77_block(
     } else {
         debug_assert_eq!(btype, 2);
         let detect_tree_size = w.out.len();
-        get_dynamic_lengths(lz77, lstart, lend, &mut ll_lengths, &mut d_lengths);
+        // FourWay table-shaping: block boundaries are final by this point
+        // (see `get_dynamic_lengths_final`'s doc), so the extra smoothing
+        // candidates can only shrink this block's emitted size.
+        get_dynamic_lengths_final(lz77, lstart, lend, &mut ll_lengths, &mut d_lengths);
         add_dynamic_tree(&ll_lengths, &d_lengths, w);
         if options.verbose != 0 {
             eprintln!("treesize: {}", w.out.len() - detect_tree_size);
@@ -488,6 +491,138 @@ fn resqueeze_block<'a>(
     }
 }
 
+/// True auto-type cost of a full block partition (sum of best-of-3 per-block
+/// costs). Used to compare candidate (lz77, splitpoints) trajectories.
+fn partition_true_cost(lz77: &LZ77Store<'_>, splitpoints: &[usize]) -> f64 {
+    let n = splitpoints.len();
+    let mut c = 0.0f64;
+    for i in 0..=n {
+        let start = if i == 0 { 0 } else { splitpoints[i - 1] };
+        let end = if i == n { lz77.size() } else { splitpoints[i] };
+        c += calculate_block_size_auto_type(lz77, start, end);
+    }
+    c
+}
+
+/// Re-split + re-squeeze one FIXED-STRATEGY trajectory for `rounds` rounds,
+/// mirroring ECT's `twice` mode (ect-10009 = twice=1: the optimal parse is
+/// fed back through block-splitting + squeeze one extra time). Each round is:
+///   (a) recursive exact-cost re-split (optimal-parse frontier / ECT port),
+///       adopted only when strictly cheaper by the true auto-type cost;
+///   (b) per-final-block re-squeeze with block-local prices, keeping the
+///       cheaper of (original tokens, re-squeezed) per block.
+/// Both sub-steps only ever lower total cost, so a round can never regress
+/// the trajectory it started from; a round that changes nothing ends the
+/// loop early (converged).
+///
+/// `recursive_auto_type` selects the recursive splitter's per-candidate cost
+/// model (see `blocksplitter::RecursiveSplitter`): `false` is the original
+/// dynamic-only-cost search (ECT's `SplitCost` shape); `true` prices every
+/// candidate with the TRUE best-of-{stored,fixed,dynamic} cost, matching the
+/// reference optimal-parse frontier's `Splitter` (fulcrum
+/// `src/ratio/squeeze.rs`, always calls `block_cost_exact`/`plan_block` —
+/// never dynamic-only). `true` sees under-split cases `false` is blind to
+/// (isolating a near-random sub-region into its own STORED block is far
+/// cheaper than forcing it through a shared dynamic table) and over-split
+/// cases where a split `false` judges marginally cheaper has header overhead
+/// a true best-of-3 read recognizes as not worth it — but its narrowing
+/// walks a DIFFERENT cost surface and can converge to a different (measured:
+/// occasionally worse) local optimum than `false`'s. Callers run BOTH
+/// strategies as independent whole trajectories from the same starting
+/// point and keep whichever FINAL result is cheaper by true cost
+/// (`partition_true_cost`) — never a regression vs either strategy alone.
+#[allow(clippy::too_many_arguments)]
+fn refine_split_and_squeeze<'a>(
+    options: &ZopfliOptions,
+    in_: &'a [u8],
+    mut lz77: LZ77Store<'a>,
+    mut splitpoints: Vec<usize>,
+    recursive_auto_type: bool,
+    rounds: usize,
+) -> (LZ77Store<'a>, Vec<usize>) {
+    if options.blocksplitting == 0 {
+        return (lz77, splitpoints);
+    }
+    let recursive_maxblocks = match options.blocksplittingmax {
+        0 => 0,
+        m => (m as usize).max(64),
+    };
+    for _round in 0..rounds {
+        let mut changed = false;
+
+        // (a) recursive exact-cost re-split. Always runs (even for a single
+        // squeezed chunk) so boundary placement is decided by exact cost,
+        // not carried over from the coarse greedy chunk split. The per-master
+        // cap matches the frontier's 64 blocks (honoring a larger override).
+        let splitpoints2 = super::blocksplitter::block_split_lz77_recursive(
+            &lz77,
+            recursive_maxblocks,
+            recursive_auto_type,
+        );
+
+        if splitpoints2 != splitpoints
+            && partition_true_cost(&lz77, &splitpoints2) < partition_true_cost(&lz77, &splitpoints)
+        {
+            splitpoints = splitpoints2;
+            changed = true;
+        }
+
+        // (b) per-final-block re-squeeze with block-local prices. See
+        // `resqueeze_block`: the recursive re-split lands boundaries the
+        // coarse per-chunk squeeze never priced against, so a final block's
+        // tokens can be under-matched relative to its own local statistics.
+        // Re-squeeze every final block over its exact byte range and keep
+        // the cheaper of (original tokens, re-squeezed) — no block regresses.
+        let np = splitpoints.len();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(np + 1);
+        for i in 0..=np {
+            let start = if i == 0 { 0 } else { splitpoints[i - 1] };
+            let end = if i == np { lz77.size() } else { splitpoints[i] };
+            ranges.push((start, end));
+        }
+        let winners: Vec<Option<LZ77Store<'_>>> = if options.thread_budget == 1 {
+            ranges
+                .iter()
+                .map(|&(s, e)| resqueeze_block(options, in_, &lz77, s, e))
+                .collect()
+        } else {
+            let lz = &lz77;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranges
+                    .iter()
+                    .map(|&(s, e)| scope.spawn(move || resqueeze_block(options, in_, lz, s, e)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        };
+        if winners.iter().any(|w| w.is_some()) {
+            let mut refined = LZ77Store::new(in_);
+            let mut new_splits: Vec<usize> = Vec::new();
+            for (i, &(start, end)) in ranges.iter().enumerate() {
+                match &winners[i] {
+                    Some(cand) => refined.append_from(cand),
+                    None => {
+                        for k in start..end {
+                            refined.store_lit_len_dist(lz77.litlens[k], lz77.dists[k], lz77.pos[k]);
+                        }
+                    }
+                }
+                if i < np {
+                    new_splits.push(refined.size());
+                }
+            }
+            lz77 = refined;
+            splitpoints = new_splits;
+            changed = true;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+    (lz77, splitpoints)
+}
+
 // ── Step 15: deflate driver ──────────────────────────────────────────────────
 
 /// Compress `in_[instart..inend]` into one deflate sub-stream. `bp` is the
@@ -598,108 +733,33 @@ pub fn deflate_part(
         }
     }
 
-    // Re-split + re-squeeze the squeezed LZ77 stream, run for TWO rounds to
-    // mirror ECT's `twice` mode (ect-10009 = twice=1: the optimal parse is fed
-    // back through block-splitting + squeeze one extra time). Each round is:
-    //   (a) recursive exact-cost re-split (optimal-parse frontier / ECT port),
-    //       adopted only when strictly cheaper by the true auto-type cost;
-    //   (b) per-final-block re-squeeze with block-local prices, keeping the
-    //       cheaper of (original tokens, re-squeezed) per block.
-    // Both sub-steps only ever lower total cost, so a round can never regress
-    // the output; a round that changes nothing ends the loop early (converged).
+    // Re-split + re-squeeze the squeezed LZ77 stream: run TWO independent
+    // whole trajectories (dynamic-only recursive-split search, and true
+    // best-of-3 recursive-split search — see `refine_split_and_squeeze` doc)
+    // from the SAME starting (lz77, splitpoints), each for two rounds
+    // (mirrors ECT's `twice` mode), then keep whichever FINAL trajectory has
+    // the lower true auto-type total cost. A per-round greedy mix of the two
+    // search strategies was tried and measured to regress tool.bin net (the
+    // strategies' resqueeze side-effects diverge after round 1, so a
+    // locally-cheaper choice mid-trajectory is not globally cheaper) — running
+    // both as committed, independent trajectories and comparing only the
+    // final result is the version that cannot regress vs either strategy
+    // alone, because "dynamic-only, unchanged from before this campaign" is
+    // literally one of the two candidates.
     if options.blocksplitting != 0 {
-        let recursive_maxblocks = match options.blocksplittingmax {
-            0 => 0,
-            m => (m as usize).max(64),
-        };
-        for _round in 0..2 {
-            let mut changed = false;
+        let (lz77_dyn, splitpoints_dyn) =
+            refine_split_and_squeeze(options, in_, lz77.clone(), splitpoints.clone(), false, 2);
+        let (lz77_auto, splitpoints_auto) =
+            refine_split_and_squeeze(options, in_, lz77.clone(), splitpoints.clone(), true, 2);
 
-            // (a) recursive exact-cost re-split. Always runs (even for a single
-            // squeezed chunk) so boundary placement is decided by exact cost,
-            // not carried over from the coarse greedy chunk split. The per-master
-            // cap matches the frontier's 64 blocks (honoring a larger override).
-            let splitpoints2 =
-                super::blocksplitter::block_split_lz77_recursive(&lz77, recursive_maxblocks, false);
-
-            // Score both partitions with the true emission cost model (best of
-            // stored/fixed/dynamic per block), matching what the auto-type
-            // emitter actually picks. Dynamic-only here would wrongly accept
-            // splits on incompressible blocks — where emission falls back to a
-            // stored block and the extra per-block tree/header overhead loses.
-            let partition_cost = |points: &[usize]| -> f64 {
-                let n = points.len();
-                let mut c = 0.0f64;
-                for i in 0..=n {
-                    let start = if i == 0 { 0 } else { points[i - 1] };
-                    let end = if i == n { lz77.size() } else { points[i] };
-                    c += calculate_block_size_auto_type(&lz77, start, end);
-                }
-                c
-            };
-            if splitpoints2 != splitpoints
-                && partition_cost(&splitpoints2) < partition_cost(&splitpoints)
-            {
-                splitpoints = splitpoints2;
-                changed = true;
-            }
-
-            // (b) per-final-block re-squeeze with block-local prices. See
-            // `resqueeze_block`: the recursive re-split lands boundaries the
-            // coarse per-chunk squeeze never priced against, so a final block's
-            // tokens can be under-matched relative to its own local statistics.
-            // Re-squeeze every final block over its exact byte range and keep
-            // the cheaper of (original tokens, re-squeezed) — no block regresses.
-            let np = splitpoints.len();
-            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(np + 1);
-            for i in 0..=np {
-                let start = if i == 0 { 0 } else { splitpoints[i - 1] };
-                let end = if i == np { lz77.size() } else { splitpoints[i] };
-                ranges.push((start, end));
-            }
-            let winners: Vec<Option<LZ77Store<'_>>> = if options.thread_budget == 1 {
-                ranges
-                    .iter()
-                    .map(|&(s, e)| resqueeze_block(options, in_, &lz77, s, e))
-                    .collect()
-            } else {
-                let lz = &lz77;
-                std::thread::scope(|scope| {
-                    let handles: Vec<_> = ranges
-                        .iter()
-                        .map(|&(s, e)| scope.spawn(move || resqueeze_block(options, in_, lz, s, e)))
-                        .collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                })
-            };
-            if winners.iter().any(|w| w.is_some()) {
-                let mut refined = LZ77Store::new(in_);
-                let mut new_splits: Vec<usize> = Vec::new();
-                for (i, &(start, end)) in ranges.iter().enumerate() {
-                    match &winners[i] {
-                        Some(cand) => refined.append_from(cand),
-                        None => {
-                            for k in start..end {
-                                refined.store_lit_len_dist(
-                                    lz77.litlens[k],
-                                    lz77.dists[k],
-                                    lz77.pos[k],
-                                );
-                            }
-                        }
-                    }
-                    if i < np {
-                        new_splits.push(refined.size());
-                    }
-                }
-                lz77 = refined;
-                splitpoints = new_splits;
-                changed = true;
-            }
-
-            if !changed {
-                break;
-            }
+        let cost_dyn = partition_true_cost(&lz77_dyn, &splitpoints_dyn);
+        let cost_auto = partition_true_cost(&lz77_auto, &splitpoints_auto);
+        if cost_auto < cost_dyn {
+            lz77 = lz77_auto;
+            splitpoints = splitpoints_auto;
+        } else {
+            lz77 = lz77_dyn;
+            splitpoints = splitpoints_dyn;
         }
     }
 
