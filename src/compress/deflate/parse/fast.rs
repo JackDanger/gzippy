@@ -40,7 +40,7 @@
 //! not duplicate it.
 
 use super::super::bitstream::BitWriter;
-use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash};
+use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_write};
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
 use super::{emit_block, Sink, StaticCodes};
 
@@ -53,6 +53,15 @@ use super::{emit_block, Sink, StaticCodes};
 /// one load, one compare per position). See Lever 1.
 const HASH_BITS: u32 = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
+
+/// Software-pipeline distance for the head-table prefetch (SF1-C). Each fastloop
+/// iteration prefetches the head slot for the position it will probe `PF_DIST`
+/// steps ahead, so the dependent `head[h]` load — cachegrind-named as 69% of the
+/// L1 fast path's D1 read misses, and perf-confirmed as the IPC collapse vs igzip
+/// on binary data (IPC 1.32 vs 2.46) — is already warm when consumed. Pure hint:
+/// it warms a cache line, never changes a value the finder reads, so output stays
+/// byte-identical. Same technique as the hc.rs chain-walk prefetch.
+const PF_DIST: usize = 4;
 
 /// LIMIT_HASH_UPDATE: number of match-interior positions whose hash is inserted
 /// into the head table before the cursor jumps over the rest of the match
@@ -142,6 +151,17 @@ pub(super) fn run(
         // identical bytes.
         let fast_end = block_end_target.min(in_end.saturating_sub(DEFLATE_MAX_MATCH_LEN as usize));
         while pos < fast_end {
+            // SF1-C software-pipeline: warm the head-table line for the position
+            // PF_DIST ahead. `pos + PF_DIST` is speculative (a match jumps the
+            // cursor past it); a wrong prefetch only wastes bandwidth. SAFETY:
+            // `pos < fast_end <= in_end - 258` and `PF_DIST` is small, so
+            // `pos + PF_DIST + 4 <= in_end`, in bounds for the 4-byte load; the
+            // prefetch address is a pure hint that never faults.
+            unsafe {
+                let fseq = load_u32(base, pos + PF_DIST);
+                let fh = lz_hash(fseq, HASH_BITS) as usize;
+                prefetch_write(head.as_ptr().add(fh) as *const u8);
+            }
             // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
             let seq = unsafe { load_u32(base, pos) };
             let h = lz_hash(seq, HASH_BITS) as usize;

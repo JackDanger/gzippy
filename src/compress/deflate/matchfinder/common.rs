@@ -147,7 +147,7 @@ pub(super) fn prefetch_read(ptr: *const u8) {
 /// stored to next (the hash-bucket update), so the cache can fetch it in an
 /// exclusive state and avoid a later read-for-ownership stall.
 #[inline(always)]
-pub(super) fn prefetch_write(ptr: *const u8) {
+pub fn prefetch_write(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: `_mm_prefetch` is a pure hint; any address is accepted, it cannot
     // fault, and it touches no architectural state.
