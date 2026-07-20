@@ -5,7 +5,8 @@
 
 use super::blocksplitter::block_split;
 use super::deflate_size::{
-    build_rle, calculate_block_size, get_dynamic_lengths, get_fixed_tree, CL_ORDER_PUB,
+    build_rle, calculate_block_size, calculate_block_size_auto_type, get_dynamic_lengths,
+    get_fixed_tree, CL_ORDER_PUB,
 };
 use super::lz77::{BlockState, LZ77Store};
 use super::squeeze::{lz77_optimal, lz77_optimal_fixed};
@@ -479,7 +480,6 @@ pub fn deflate_part(
     // btype == 2
     let mut splitpoints_uncompressed: Vec<usize> = Vec::new();
     let mut splitpoints: Vec<usize> = Vec::new();
-    let mut totalcost: f64 = 0.0;
     let mut lz77 = LZ77Store::new(in_);
 
     if options.blocksplitting != 0 {
@@ -550,33 +550,42 @@ pub fn deflate_part(
     };
 
     for (i, store) in stores.iter().enumerate() {
-        totalcost += calculate_block_size(store, 0, store.size(), 2);
         lz77.append_from(store);
         if i < npoints {
             splitpoints.push(lz77.size());
         }
     }
 
-    // Second block-splitting attempt: re-split the squeezed LZ77 stream
-    // and use the new split iff it's strictly cheaper.
-    if options.blocksplitting != 0 && npoints > 1 {
-        let splitpoints2 = super::blocksplitter::block_split_lz77(
-            options,
-            &lz77,
-            options.blocksplittingmax as usize,
-        );
-        let np2 = splitpoints2.len();
-        let mut totalcost2 = 0.0f64;
-        for i in 0..=np2 {
-            let start = if i == 0 { 0 } else { splitpoints2[i - 1] };
-            let end = if i == np2 {
-                lz77.size()
-            } else {
-                splitpoints2[i]
-            };
-            totalcost2 += calculate_block_size(&lz77, start, end, 2);
-        }
-        if totalcost2 < totalcost {
+    // Second block-splitting attempt: re-split the squeezed LZ77 stream with
+    // the recursive exact-cost splitter (optimal-parse frontier / ECT port)
+    // and use the new split iff it's strictly cheaper. Always runs (even for a
+    // single squeezed chunk) so boundary placement is decided by exact cost,
+    // not carried over from the coarse greedy chunk split. The per-master cap
+    // matches the frontier's 64 blocks (honoring a larger user override).
+    if options.blocksplitting != 0 {
+        let recursive_maxblocks = match options.blocksplittingmax {
+            0 => 0,
+            m => (m as usize).max(64),
+        };
+        let splitpoints2 =
+            super::blocksplitter::block_split_lz77_recursive(&lz77, recursive_maxblocks, false);
+
+        // Score both partitions with the true emission cost model (best of
+        // stored/fixed/dynamic per block), matching what the auto-type emitter
+        // actually picks. Dynamic-only here would wrongly accept splits on
+        // incompressible blocks — where emission falls back to a stored block
+        // and the extra per-block tree/header overhead is a net loss.
+        let partition_cost = |points: &[usize]| -> f64 {
+            let n = points.len();
+            let mut c = 0.0f64;
+            for i in 0..=n {
+                let start = if i == 0 { 0 } else { points[i - 1] };
+                let end = if i == n { lz77.size() } else { points[i] };
+                c += calculate_block_size_auto_type(&lz77, start, end);
+            }
+            c
+        };
+        if partition_cost(&splitpoints2) < partition_cost(&splitpoints) {
             splitpoints = splitpoints2;
         }
     }
