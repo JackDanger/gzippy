@@ -9,6 +9,7 @@ pub mod gzip;
 pub mod hash;
 pub mod katajainen;
 pub mod lz77;
+pub mod lzfind;
 pub mod squeeze;
 pub mod symbols;
 pub mod tree;
