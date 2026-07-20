@@ -598,46 +598,58 @@ pub fn deflate_part(
         }
     }
 
-    // Second block-splitting attempt: re-split the squeezed LZ77 stream with
-    // the recursive exact-cost splitter (optimal-parse frontier / ECT port)
-    // and use the new split iff it's strictly cheaper. Always runs (even for a
-    // single squeezed chunk) so boundary placement is decided by exact cost,
-    // not carried over from the coarse greedy chunk split. The per-master cap
-    // matches the frontier's 64 blocks (honoring a larger user override).
+    // Re-split + re-squeeze the squeezed LZ77 stream, run for TWO rounds to
+    // mirror ECT's `twice` mode (ect-10009 = twice=1: the optimal parse is fed
+    // back through block-splitting + squeeze one extra time). Each round is:
+    //   (a) recursive exact-cost re-split (optimal-parse frontier / ECT port),
+    //       adopted only when strictly cheaper by the true auto-type cost;
+    //   (b) per-final-block re-squeeze with block-local prices, keeping the
+    //       cheaper of (original tokens, re-squeezed) per block.
+    // Both sub-steps only ever lower total cost, so a round can never regress
+    // the output; a round that changes nothing ends the loop early (converged).
     if options.blocksplitting != 0 {
         let recursive_maxblocks = match options.blocksplittingmax {
             0 => 0,
             m => (m as usize).max(64),
         };
-        let splitpoints2 =
-            super::blocksplitter::block_split_lz77_recursive(&lz77, recursive_maxblocks, false);
+        for _round in 0..2 {
+            let mut changed = false;
 
-        // Score both partitions with the true emission cost model (best of
-        // stored/fixed/dynamic per block), matching what the auto-type emitter
-        // actually picks. Dynamic-only here would wrongly accept splits on
-        // incompressible blocks — where emission falls back to a stored block
-        // and the extra per-block tree/header overhead is a net loss.
-        let partition_cost = |points: &[usize]| -> f64 {
-            let n = points.len();
-            let mut c = 0.0f64;
-            for i in 0..=n {
-                let start = if i == 0 { 0 } else { points[i - 1] };
-                let end = if i == n { lz77.size() } else { points[i] };
-                c += calculate_block_size_auto_type(&lz77, start, end);
+            // (a) recursive exact-cost re-split. Always runs (even for a single
+            // squeezed chunk) so boundary placement is decided by exact cost,
+            // not carried over from the coarse greedy chunk split. The per-master
+            // cap matches the frontier's 64 blocks (honoring a larger override).
+            let splitpoints2 =
+                super::blocksplitter::block_split_lz77_recursive(&lz77, recursive_maxblocks, false);
+
+            // Score both partitions with the true emission cost model (best of
+            // stored/fixed/dynamic per block), matching what the auto-type
+            // emitter actually picks. Dynamic-only here would wrongly accept
+            // splits on incompressible blocks — where emission falls back to a
+            // stored block and the extra per-block tree/header overhead loses.
+            let partition_cost = |points: &[usize]| -> f64 {
+                let n = points.len();
+                let mut c = 0.0f64;
+                for i in 0..=n {
+                    let start = if i == 0 { 0 } else { points[i - 1] };
+                    let end = if i == n { lz77.size() } else { points[i] };
+                    c += calculate_block_size_auto_type(&lz77, start, end);
+                }
+                c
+            };
+            if splitpoints2 != splitpoints
+                && partition_cost(&splitpoints2) < partition_cost(&splitpoints)
+            {
+                splitpoints = splitpoints2;
+                changed = true;
             }
-            c
-        };
-        if partition_cost(&splitpoints2) < partition_cost(&splitpoints) {
-            splitpoints = splitpoints2;
-        }
 
-        // Per-final-block re-squeeze with block-local prices. See
-        // `resqueeze_block`: the recursive re-split lands boundaries the coarse
-        // per-chunk squeeze never priced against, so each final block's tokens
-        // can be under-matched relative to its own local statistics. Re-squeeze
-        // every final block over its exact byte range and keep the cheaper of
-        // (original tokens, re-squeezed) — monotone, so no block regresses.
-        {
+            // (b) per-final-block re-squeeze with block-local prices. See
+            // `resqueeze_block`: the recursive re-split lands boundaries the
+            // coarse per-chunk squeeze never priced against, so a final block's
+            // tokens can be under-matched relative to its own local statistics.
+            // Re-squeeze every final block over its exact byte range and keep
+            // the cheaper of (original tokens, re-squeezed) — no block regresses.
             let np = splitpoints.len();
             let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(np + 1);
             for i in 0..=np {
@@ -682,6 +694,11 @@ pub fn deflate_part(
                 }
                 lz77 = refined;
                 splitpoints = new_splits;
+                changed = true;
+            }
+
+            if !changed {
+                break;
             }
         }
     }
