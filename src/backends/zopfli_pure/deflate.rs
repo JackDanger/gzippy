@@ -392,8 +392,7 @@ fn add_lz77_block_auto_type(
     if expensivefixed {
         let instart = lz77.pos[lstart];
         let inend = instart + lz77.byte_range(lstart, lend);
-        let mut s = BlockState::new(options, instart, inend, true);
-        lz77_optimal_fixed(&mut s, lz77.data, instart, inend, &mut fixedstore);
+        lz77_optimal_fixed(lz77.data, instart, inend, &mut fixedstore);
         fixedcost = calculate_block_size(&fixedstore, 0, fixedstore.size(), 1);
     }
 
@@ -471,8 +470,7 @@ pub fn deflate_part(
 
     if btype == 1 {
         let mut store = LZ77Store::new(in_);
-        let mut s = BlockState::new(options, instart, inend, true);
-        lz77_optimal_fixed(&mut s, in_, instart, inend, &mut store);
+        lz77_optimal_fixed(in_, instart, inend, &mut store);
         let size = store.size();
         add_lz77_block(options, btype, final_, &store, 0, size, 0, &mut w);
         return w.bp;
