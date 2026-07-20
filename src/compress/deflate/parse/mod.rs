@@ -167,6 +167,42 @@ impl Sink {
         self.block_length += 1;
     }
 
+    /// Fast-path literal push: frequencies + token only.
+    ///
+    /// The fast (L1) parser never calls `should_end_block`, so the block-split
+    /// stats `push_literal` gathers are DEAD there (cachegrind: ~34M Ir/6MiB of
+    /// `block_split.rs` attributed to the L1 bin run, none of it consulted), and
+    /// the fast parser derives `block_length` once at flush (`pos - block_begin`)
+    /// instead of a per-push `+= 1`. Emitted bytes are identical: `emit_block`
+    /// consumes only `litlen_freqs`/`offset_freqs`/`tokens`/`block_length`.
+    #[inline]
+    fn push_literal_fast(&mut self, lit: u8) {
+        // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
+        // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
+        unsafe {
+            *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
+        }
+        self.tokens.push(pack_literal(lit));
+    }
+
+    /// Fast-path match push: frequencies + token only (see [`Self::push_literal_fast`]).
+    #[inline]
+    fn push_match_fast(&mut self, length: u32, offset: u32) {
+        debug_assert!((DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN).contains(&length));
+        debug_assert!((1..=32768).contains(&offset));
+        let ls = length_slot(length) as usize;
+        let os = offset_slot(offset) as usize;
+        // SAFETY: as in `push_match` — `length_slot` returns 0..=28 and
+        // `offset_slot` returns 0..=29, so both indices are in bounds.
+        unsafe {
+            *self
+                .litlen_freqs
+                .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
+            *self.offset_freqs.get_unchecked_mut(os) += 1;
+        }
+        self.tokens.push(pack_match(length, offset));
+    }
+
     /// `deflate_choose_match`.
     #[inline]
     fn push_match(&mut self, length: u32, offset: u32) {

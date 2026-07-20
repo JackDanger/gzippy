@@ -128,7 +128,70 @@ pub(super) fn run(
         sink.begin();
         let block_end_target = (block_begin + FAST_BLOCK_LENGTH).min(in_end);
 
-        while pos < in_end {
+        // FASTLOOP / TAIL split (igzip loop2 shape). While
+        // `pos < in_end - DEFLATE_MAX_MATCH_LEN`, `remaining` strictly exceeds
+        // the longest possible match, so `max_len == DEFLATE_MAX_MATCH_LEN` is a
+        // constant and the per-position `remaining`/`max_len`/`>= SHORTEST_MATCH`
+        // computations fold away; folding the block-end break into the loop
+        // condition removes the second per-token branch. Token equivalence with
+        // the previous single loop: a token starting at `p` was processed iff
+        // `p < block_end_target` (the break was checked AFTER each token, and
+        // `block_end_target <= in_end`), which is exactly the pre-checked loop
+        // condition here; positions below `fast_end` additionally satisfied
+        // `max_len == DEFLATE_MAX_MATCH_LEN`. Identical token decisions ⇒
+        // identical bytes.
+        let fast_end = block_end_target.min(in_end.saturating_sub(DEFLATE_MAX_MATCH_LEN as usize));
+        while pos < fast_end {
+            // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
+            let seq = unsafe { load_u32(base, pos) };
+            let h = lz_hash(seq, HASH_BITS) as usize;
+            // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
+            let cand = unsafe { *head.get_unchecked(h) };
+            unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+
+            // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
+            // the window range instead of panicking on underflow.
+            let dist = pos.wrapping_sub(cand as usize);
+            if (1..=WINDOW).contains(&dist) {
+                let cand_pos = cand as usize;
+                // Byte-exact extend (never trusts the hash): a spurious
+                // candidate simply yields length < SHORTEST_MATCH -> literal.
+                let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
+                if length >= SHORTEST_MATCH {
+                    // LIMIT_HASH_UPDATE (see the tail loop for the full note).
+                    let match_end = pos + length as usize;
+                    let insert_end = if LIMIT_HASH_UPDATE_INSERTS == usize::MAX {
+                        match_end
+                    } else {
+                        (pos + 1 + LIMIT_HASH_UPDATE_INSERTS).min(match_end)
+                    };
+                    let mut nh = pos + 1;
+                    while nh < insert_end {
+                        // SAFETY: nh < match_end = pos+length <= in_end, and
+                        // buf's pad covers the 4-byte load past in_end.
+                        let s = unsafe { load_u32(base, nh) };
+                        // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
+                        unsafe {
+                            *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32
+                        };
+                        nh += 1;
+                    }
+
+                    sink.push_match_fast(length, dist as u32);
+                    pos += length as usize;
+                    continue;
+                }
+            }
+
+            // Literal.
+            // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
+            sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+            pos += 1;
+        }
+
+        // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
+        // block), where `max_len` must be clamped per position.
+        while pos < block_end_target {
             let remaining = in_end - pos;
             let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
                 DEFLATE_MAX_MATCH_LEN
@@ -174,23 +237,21 @@ pub(super) fn run(
                             nh += 1;
                         }
 
-                        sink.push_match(length, dist as u32);
+                        sink.push_match_fast(length, dist as u32);
                         pos += length as usize;
-                        if pos >= block_end_target {
-                            break;
-                        }
                         continue;
                     }
                 }
             }
 
             // Literal.
-            sink.push_literal(buf[pos]);
+            sink.push_literal_fast(buf[pos]);
             pos += 1;
-            if pos >= block_end_target {
-                break;
-            }
         }
+
+        // The fast-path pushes skip per-push `block_length` bookkeeping; the
+        // covered length is exactly the cursor distance walked this block.
+        sink.block_length = pos - block_begin;
 
         // Flush the block: cheapest of per-block dynamic / static / stored.
         // The BFINAL bit is set only on the last internal block AND only when
