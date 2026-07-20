@@ -314,24 +314,28 @@ impl HcMatchfinder {
                     // Prefetch the next node's match data one iteration ahead
                     // (see the length-4 walk for the correctness argument).
                     prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
-                    // Prefilter: compare the last 4 and the first 4 bytes before
-                    // attempting a full extension.
+                    // Prefilter: compare the last 4 bytes FIRST — the vendor's
+                    // short-circuit order (hc_matchfinder.h:305-309). The
+                    // `best_len - 3`-anchored load covers the byte that would
+                    // extend the match, so ONE candidate load rejects most
+                    // chain nodes; the first-4 load+compare runs only on a
+                    // hi-hit. (The `in_next`-side loads are inner-loop
+                    // invariants — `off` changes only when `best_len` does —
+                    // and LICM keeps them in registers.) Same predicate over
+                    // immutable memory as the eager 4-load form: the node
+                    // walk and the selected match are byte-identical.
                     let off = best_len as usize - 3;
                     // SAFETY: `matchptr < in_next` (cutoff guard). `off = best_len-3`
                     // with `best_len <= max_len`, so `in_next + off + 4 <=
                     // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
                     // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
-                    let (m_hi, n_hi, m_lo, n_lo) = unsafe {
+                    let hit = unsafe {
                         debug_assert!(matchptr < in_next);
                         debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
-                        (
-                            load_u32(base, matchptr + off),
-                            load_u32(base, in_next + off),
-                            load_u32(base, matchptr),
-                            load_u32(base, in_next),
-                        )
+                        load_u32(base, matchptr + off) == load_u32(base, in_next + off)
+                            && load_u32(base, matchptr) == load_u32(base, in_next)
                     };
-                    if m_hi == n_hi && m_lo == n_lo {
+                    if hit {
                         break;
                     }
                     cur_node4 = next_node;
