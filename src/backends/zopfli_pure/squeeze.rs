@@ -122,6 +122,23 @@ impl SymbolStats {
         s.calculate_statistics();
         s
     }
+
+    /// Seed statistics from an ALL-LITERAL parse of `in_[instart..inend]`:
+    /// every byte is counted as a literal, no matches. Length/dist symbols get
+    /// zero count, so `calculate_entropy` prices them at `log2(n)` — expensive
+    /// enough that the squeeze DP only takes matches that genuinely beat the
+    /// literal run. This anchors the iterated-price fixed point in the
+    /// literal-dominant basin, which the greedy seed misses on low-entropy
+    /// data (DNA, long runs), where the true optimal parse is literal-heavy.
+    pub fn from_literals(in_: &[u8], instart: usize, inend: usize) -> Self {
+        let mut s = Self::new();
+        for &b in &in_[instart..inend] {
+            s.litlens[b as usize] += 1;
+        }
+        s.litlens[256] = 1;
+        s.calculate_statistics();
+        s
+    }
 }
 
 // ── RanState (Marsaglia MWC) ─────────────────────────────────────────────────
@@ -700,6 +717,63 @@ pub fn lz77_optimal<'a>(
             lastrandomstep = i;
         }
         lastcost = cost;
+    }
+
+    // Second seed: the literal-dominant basin. The greedy seed above over-
+    // matches low-entropy data (DNA, long runs) and zopfli's iterated-price
+    // loop is a basin-preserving fixed point, so it never reaches the
+    // literal-heavy optimum. Re-running the same iteration from an all-literal
+    // seed lands in that basin; we keep the global argmin by true block cost,
+    // so higher-entropy inputs (where the greedy seed already wins) never
+    // regress. The match cache is already primed, so every iteration here is a
+    // cheap replay.
+    {
+        let mut stats = SymbolStats::from_literals(in_, instart, inend);
+        let mut lbeststats = SymbolStats::new();
+        let mut llastcost: f64 = 0.0;
+        let mut lran_state = RanState::new();
+        let mut llastrandomstep: i32 = -1;
+        let mut lbestcost = ZOPFLI_LARGE_FLOAT;
+        for i in 0..numiterations {
+            currentstore.reset();
+            let model = StatCost(&stats);
+            let mode = Mode::Replay(&mut cache);
+            lz77_optimal_run(
+                in_,
+                instart,
+                inend,
+                &mut path,
+                &mut length_array,
+                &model,
+                &mut currentstore,
+                &mut costs,
+                mode,
+            );
+            let cost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
+            if cost < lbestcost {
+                lbeststats.copy_from(&stats);
+                lbestcost = cost;
+            }
+            if cost < bestcost {
+                store.reset();
+                store.append_from(&currentstore);
+                bestcost = cost;
+            }
+            laststats.copy_from(&stats);
+            stats.clear_freqs();
+            stats = SymbolStats::from_store(&currentstore);
+            if llastrandomstep != -1 {
+                stats.add_weighted(1.0, &laststats, 0.5);
+                stats.calculate_statistics();
+            }
+            if i > 5 && cost == llastcost {
+                stats.copy_from(&lbeststats);
+                lran_state.randomize_stat_freqs(&mut stats);
+                stats.calculate_statistics();
+                llastrandomstep = i;
+            }
+            llastcost = cost;
+        }
     }
 }
 
