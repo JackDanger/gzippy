@@ -719,61 +719,137 @@ pub fn lz77_optimal<'a>(
         lastcost = cost;
     }
 
-    // Second seed: the literal-dominant basin. The greedy seed above over-
-    // matches low-entropy data (DNA, long runs) and zopfli's iterated-price
-    // loop is a basin-preserving fixed point, so it never reaches the
-    // literal-heavy optimum. Re-running the same iteration from an all-literal
-    // seed lands in that basin; we keep the global argmin by true block cost,
-    // so higher-entropy inputs (where the greedy seed already wins) never
-    // regress. The match cache is already primed, so every iteration here is a
-    // cheap replay.
-    {
-        let mut stats = SymbolStats::from_literals(in_, instart, inend);
-        let mut lbeststats = SymbolStats::new();
-        let mut llastcost: f64 = 0.0;
-        let mut lran_state = RanState::new();
-        let mut llastrandomstep: i32 = -1;
-        let mut lbestcost = ZOPFLI_LARGE_FLOAT;
-        for i in 0..numiterations {
-            currentstore.reset();
-            let model = StatCost(&stats);
-            let mode = Mode::Replay(&mut cache);
-            lz77_optimal_run(
-                in_,
-                instart,
-                inend,
-                &mut path,
-                &mut length_array,
-                &model,
-                &mut currentstore,
-                &mut costs,
-                mode,
-            );
-            let cost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
-            if cost < lbestcost {
-                lbeststats.copy_from(&stats);
-                lbestcost = cost;
-            }
-            if cost < bestcost {
-                store.reset();
-                store.append_from(&currentstore);
-                bestcost = cost;
-            }
-            laststats.copy_from(&stats);
-            stats.clear_freqs();
-            stats = SymbolStats::from_store(&currentstore);
-            if llastrandomstep != -1 {
-                stats.add_weighted(1.0, &laststats, 0.5);
-                stats.calculate_statistics();
-            }
-            if i > 5 && cost == llastcost {
-                stats.copy_from(&lbeststats);
-                lran_state.randomize_stat_freqs(&mut stats);
-                stats.calculate_statistics();
-                llastrandomstep = i;
-            }
-            llastcost = cost;
+    // Extra seeds: the greedy seed above lands in a single basin, and zopfli's
+    // iterated-price loop is a basin-preserving fixed point. Two failure modes
+    // measured against the optimal-parse frontier: low-entropy data (DNA, runs)
+    // gets stuck OVER-matching (greedy over-matches → literals priced high),
+    // and structured/high-entropy data (CSV, binaries) gets stuck UNDER-matching
+    // (greedy under-anchors matches). Re-run the same iterated loop from two
+    // extra basin anchors and keep the global argmin by true block cost, so no
+    // input regresses:
+    //   • literal seed  → the literal-dominant basin (fixes DNA over-matching);
+    //   • fixed-price seed → the match-heavy basin (fixes structured
+    //     under-matching), mirroring the frontier's fixed-price iteration-0.
+    // The match cache is already primed, so every iteration below is a cheap
+    // replay.
+    let literal_seed = SymbolStats::from_literals(in_, instart, inend);
+    squeeze_from_seed(
+        in_,
+        instart,
+        inend,
+        numiterations,
+        literal_seed,
+        &mut cache,
+        &mut path,
+        &mut length_array,
+        &mut costs,
+        &mut currentstore,
+        store,
+        &mut bestcost,
+    );
+
+    // Fixed-price seed: one static-Huffman DP parse (replayed off the cache)
+    // seeds a match-heavy histogram.
+    currentstore.reset();
+    lz77_optimal_run(
+        in_,
+        instart,
+        inend,
+        &mut path,
+        &mut length_array,
+        &FixedCost,
+        &mut currentstore,
+        &mut costs,
+        Mode::Replay(&mut cache),
+    );
+    let fixed_cost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
+    if fixed_cost < bestcost {
+        store.reset();
+        store.append_from(&currentstore);
+        bestcost = fixed_cost;
+    }
+    let fixed_seed = SymbolStats::from_store(&currentstore);
+    squeeze_from_seed(
+        in_,
+        instart,
+        inend,
+        numiterations,
+        fixed_seed,
+        &mut cache,
+        &mut path,
+        &mut length_array,
+        &mut costs,
+        &mut currentstore,
+        store,
+        &mut bestcost,
+    );
+}
+
+/// One iterated-price squeeze pass from a given `init` seed, replaying the
+/// already-primed match `cache`. Writes the caller's `store`/`bestcost`
+/// whenever a run beats the running global argmin (by true block cost), so
+/// adding a seed can only improve the result, never regress it. Factored out
+/// of `lz77_optimal` so the literal- and fixed-price basin anchors share one
+/// implementation.
+#[allow(clippy::too_many_arguments)]
+fn squeeze_from_seed<'a>(
+    in_: &'a [u8],
+    instart: usize,
+    inend: usize,
+    numiterations: i32,
+    mut stats: SymbolStats,
+    cache: &mut LzCache,
+    path: &mut Vec<u32>,
+    length_array: &mut [u32],
+    costs: &mut [f32],
+    currentstore: &mut LZ77Store<'a>,
+    store: &mut LZ77Store<'a>,
+    bestcost: &mut f64,
+) {
+    let mut beststats = SymbolStats::new();
+    let mut laststats = SymbolStats::new();
+    let mut lastcost: f64 = 0.0;
+    let mut ran_state = RanState::new();
+    let mut lastrandomstep: i32 = -1;
+    let mut seedbest = ZOPFLI_LARGE_FLOAT;
+    for i in 0..numiterations {
+        currentstore.reset();
+        let model = StatCost(&stats);
+        lz77_optimal_run(
+            in_,
+            instart,
+            inend,
+            path,
+            length_array,
+            &model,
+            currentstore,
+            costs,
+            Mode::Replay(cache),
+        );
+        let cost = calculate_block_size(currentstore, 0, currentstore.size(), 2);
+        if cost < seedbest {
+            beststats.copy_from(&stats);
+            seedbest = cost;
         }
+        if cost < *bestcost {
+            store.reset();
+            store.append_from(currentstore);
+            *bestcost = cost;
+        }
+        laststats.copy_from(&stats);
+        stats.clear_freqs();
+        stats = SymbolStats::from_store(currentstore);
+        if lastrandomstep != -1 {
+            stats.add_weighted(1.0, &laststats, 0.5);
+            stats.calculate_statistics();
+        }
+        if i > 5 && cost == lastcost {
+            stats.copy_from(&beststats);
+            ran_state.randomize_stat_freqs(&mut stats);
+            stats.calculate_statistics();
+            lastrandomstep = i;
+        }
+        lastcost = cost;
     }
 }
 
