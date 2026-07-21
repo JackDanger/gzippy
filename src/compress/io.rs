@@ -32,9 +32,8 @@ impl<W: Write> Write for CountingWriter<W> {
 use crate::cli::GzippyArgs;
 use crate::compress::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::compress::parallel::GzipHeaderInfo;
-use crate::compress::simple::SimpleOptimizer;
 use crate::error::{GzippyError, GzippyResult};
-use crate::utils::{debug_enabled, preserve_metadata};
+use crate::utils::preserve_metadata;
 
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
@@ -164,6 +163,17 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let header_info = build_header_info(input_path, args);
     let use_mmap = opt_config.thread_count > 1 && file_size > 128 * 1024;
 
+    // Increment 7: the pure-Rust parallel DEFLATE encoder is the SOLE production
+    // T>1 compress path — it produces a STANDARD single-member gzip stream for
+    // every level 0–12 (and `--huffman` / `--rle`). Explicit zopfli tuning
+    // (-F/-I/-J) still routes single-member through `compress_with_pipeline`;
+    // `--rsyncable` keeps its content-defined split (also pure now). The former
+    // mmap SimpleOptimizer (flate2/libdeflate C-FFI) path is gone from routing
+    // and survives only behind the dev `ffi-oracle` feature as an oracle.
+    let explicit_zopfli =
+        args.zopfli_iterations.is_some() || args.zopfli_no_split || args.zopfli_split_max.is_some();
+    let use_pure_parallel = use_mmap && !args.rsyncable && !explicit_zopfli;
+
     if let Some(ref output_path) = output_path {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
     }
@@ -193,24 +203,33 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             )
             .map_err(|e| e.into())
         }
-    } else if use_mmap && !args.use_zopfli() {
+    } else if use_pure_parallel {
         if args.verbosity >= 2 {
             eprintln!(
-                "gzippy: using mmap parallel backend with {} threads",
+                "gzippy: using pure-Rust parallel DEFLATE encoder with {} threads",
                 opt_config.thread_count,
             );
         }
-        let optimizer =
-            SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
+        // SAFETY: the input file is opened read-only and mapped for the
+        // duration of this compression; it is not mutated concurrently by
+        // gzippy, matching every other mmap read path in this module.
+        let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+            args.compression_level as u32,
+            opt_config.thread_count,
+        );
+        encoder.set_header_info(header_info.clone());
         if args.stdout {
             let out = BufWriter::with_capacity(1024 * 1024, stdout());
-            optimizer
-                .compress_file(input_path, out)
+            encoder
+                .compress_buffer_pure(&mmap, out)
                 .map_err(|e| e.into())
         } else {
             let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
-            optimizer
-                .compress_file(input_path, output_file)
+            encoder
+                .compress_buffer_pure(&mmap, output_file)
                 .map_err(|e| e.into())
         }
     } else if args.stdout {
@@ -267,45 +286,11 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let can_parallelize = args.processes > 1;
     let verbose = args.verbose && !args.quiet;
 
-    // T1 L0-L3 ISA-L streaming fast path: directly pipe stdin→stdout with ~2MB memory.
-    if !can_parallelize
-        && args.compression_level <= 3
-        && !args.huffman
-        && !args.rle
-        && crate::backends::isal_compress::is_available()
-    {
-        let mut input = stdin();
-        let mut counted = CountingWriter::new(BufWriter::with_capacity(1024 * 1024, stdout()));
-        let compression_level = args.compression_level as u32;
-        let in_bytes = if debug_enabled() {
-            let t0 = std::time::Instant::now();
-            let bytes = crate::backends::isal_compress::compress_gzip_stream_direct(
-                &mut input,
-                &mut counted,
-                compression_level,
-            )?;
-            let elapsed = t0.elapsed();
-            eprintln!(
-                "[gzippy] compress T1 ISA-L L{} streaming: {:.1}ms, {:.1} MB/s ({} bytes in)",
-                compression_level,
-                elapsed.as_secs_f64() * 1000.0,
-                bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0,
-                bytes
-            );
-            bytes
-        } else {
-            crate::backends::isal_compress::compress_gzip_stream_direct(
-                &mut input,
-                &mut counted,
-                compression_level,
-            )?
-        };
-        counted.flush()?;
-        if verbose {
-            print_stdin_stats(in_bytes, counted.count, args);
-        }
-        return Ok(0);
-    }
+    // Increment 7: the single-thread stdin fast path uses the pure-Rust DEFLATE
+    // encoder (the sole production compress path). The former T1 L0–L3 ISA-L
+    // streaming shortcut was C-FFI and has been removed from the routing graph;
+    // it falls through to `compress_with_pipeline` (pure) below. ISA-L compress
+    // survives only behind the dev `ffi-oracle` feature as a differential oracle.
 
     // Try to mmap stdin when it's a regular file (< file redirection).
     // For pipes, mmap_data stays None and we fall through to streaming.
@@ -357,35 +342,31 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             content_type,
         );
         let compression_level = args.compression_level as u32;
-        // L11 / zopfli tuning flags: always route through compress_with_pipeline
-        // so the single-member zopfli encoder runs. The stdin+regular-file
-        // multi-thread path was historically bypassing this — ParallelGzEncoder
-        // would produce a "GZ" FEXTRA multi-member stream at L11, costing
-        // +2% ratio vs C zopfli. Plan.md Phase 11.1.A pinned this for
-        // compress_with_pipeline but didn't reach this branch.
-        if opt_config.thread_count > 1 && !args.use_zopfli() {
-            if args.compression_level >= 6 && args.compression_level <= 9 {
-                let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
-                    compression_level,
-                    opt_config.thread_count,
-                );
-                encoder.set_header_info(header_info.clone());
-                encoder.compress_buffer(input_data, &mut counted)?;
-            } else {
-                let mut encoder = crate::compress::parallel::ParallelGzEncoder::new(
-                    compression_level,
-                    opt_config.thread_count,
-                );
-                encoder.set_header_info(header_info.clone());
-                encoder.compress_buffer(input_data, &mut counted)?;
-            }
+        // Increment 7: the pure-Rust parallel DEFLATE encoder is the SOLE
+        // production T>1 compress path (standard single-member gzip, every level
+        // 0–12). Explicit zopfli tuning (-F/-I/-J) still routes single-member
+        // through `compress_with_pipeline` so the zopfli encoder runs. The former
+        // PipelinedGzEncoder / ParallelGzEncoder C-FFI split (flate2/libdeflate)
+        // is retained only behind the dev `ffi-oracle` feature as an oracle.
+        let explicit_zopfli = args.zopfli_iterations.is_some()
+            || args.zopfli_no_split
+            || args.zopfli_split_max.is_some();
+
+        if opt_config.thread_count > 1 && !explicit_zopfli {
+            let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+                compression_level,
+                opt_config.thread_count,
+            );
+            encoder.set_header_info(header_info.clone());
+            encoder.compress_buffer_pure(input_data, &mut counted)?;
             counted.flush()?;
             if verbose {
                 print_stdin_stats(file_size, counted.count, args);
             }
             return Ok(0);
         }
-        // Single-threaded with mmap'd file: stream through compress_with_pipeline.
+        // Single-threaded (or explicit zopfli) with mmap'd file: stream through
+        // compress_with_pipeline.
         let opt_config_t1 =
             OptimizationConfig::new(1, file_size, args.compression_level, content_type);
         crate::compress::compress_with_pipeline(

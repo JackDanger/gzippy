@@ -14,44 +14,91 @@
 //!
 //! This is used when compression_level >= 7 and threads > 1.
 
-use crate::compress::parallel::{adjust_compression_level, GzipHeaderInfo};
+// Increment 7: the flate2 dictionary-sharing FFI methods are compiled only for
+// tests / the `ffi-oracle` feature. In a NON-test `ffi-oracle` build they have
+// no in-crate caller, so allow dead code in that one config only; the default
+// and test builds keep full dead-code detection for the pure pipeline.
+#![cfg_attr(all(feature = "ffi-oracle", not(test)), allow(dead_code))]
+
+use crate::compress::parallel::GzipHeaderInfo;
 use crate::infra::scheduler::compress_parallel;
-use flate2::{Compress, Compression, FlushCompress, Status};
-use std::cell::{RefCell, UnsafeCell};
-use std::io::{self, Read, Write};
+use std::cell::UnsafeCell;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
+
+// Increment 7: the flate2/zlib-ng dictionary-sharing compress methods below are
+// differential oracles compiled only under `ffi-oracle`. The pure production
+// path (`compress_buffer_pure` → `compress_parallel_pipeline_pure`) uses the
+// pure-Rust DEFLATE engine and none of these imports.
+#[cfg(any(test, feature = "ffi-oracle"))]
+use crate::compress::parallel::adjust_compression_level;
+#[cfg(any(test, feature = "ffi-oracle"))]
+use flate2::{Compress, Compression, FlushCompress, Status};
+#[cfg(any(test, feature = "ffi-oracle"))]
+use std::cell::RefCell;
+#[cfg(any(test, feature = "ffi-oracle"))]
+use std::io::Read;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use std::path::Path;
 
 // Thread-local Compress object to avoid reinitializing zlib state (~300KB) per block
 // Note: We store Option<(level, Compress)> to cache by level
+#[cfg(any(test, feature = "ffi-oracle"))]
 thread_local! {
     static PIPELINED_COMPRESS: RefCell<Option<(u32, Compress)>> = const { RefCell::new(None) };
 }
 
-/// Default block size for pipelined compression - matches pigz (128KB)
-const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
-
 /// Dictionary size (DEFLATE maximum is 32KB)
+#[cfg(any(test, feature = "ffi-oracle"))]
 const DICT_SIZE: usize = 32 * 1024;
 
 struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
 // Safety: each slot is written by exactly one worker before all threads join.
 unsafe impl Sync for CrcSlot {}
 
-/// Block size for pipelined compression.
+/// Largest parallel chunk. Each chunk pays exactly one CRC-combine and one
+/// sync-flush seam, so orchestration cost falls as the chunk grows; 512KB
+/// roughly halves the chunk count of the old 192KB grid while still leaving
+/// ≥~4 chunks/thread at T16 on our smallest (35MB) corpus (35MB/512KB = 68
+/// chunks). Bigger chunks also *shrink* output (fewer Huffman-table resets and
+/// fewer stored sync-flush seams), so ratio holds-or-improves. See Lever 2.
+const MAX_PARALLEL_BLOCK_SIZE: usize = 512 * 1024;
+
+/// Smallest parallel chunk for the small-file floor. Keeps tiny inputs split
+/// into a few chunks (a 1MB file becomes ~8×128KB, not one chunk) so the
+/// parallel path still has work to hand out.
+const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
+
+/// Target number of parallel chunks for inputs below the large-file cutoff.
+/// Used only to derive the small-file block size from `input_len`.
+const SMALL_FILE_TARGET_CHUNKS: usize = 16;
+
+/// Block size for the parallel pipelined chunk grid.
 ///
-/// For GHA's 4-vCPU environment with 100MB+ files, the coordination overhead
-/// of 780+ blocks dominates. Use slightly larger blocks (192KB) for very large
-/// files to reduce block count while staying within compression ratio limits.
+/// **HARD INVARIANT: a pure function of `input_len` (and `level`) ONLY — NEVER
+/// `num_threads`.** The parallel path relies on this to produce byte-identical
+/// output at every thread count; reintroducing thread-count scaling (the old
+/// `get_optimal_block_size` trap) would make the grid — and therefore the
+/// bytes — depend on T. `_num_threads` MUST stay unused.
+///
+/// Large files use the fixed [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) to minimize
+/// per-chunk orchestration (one CRC-combine + one sync-flush seam per chunk).
+/// Small files fall back to an `input_len`-derived size so they still split
+/// into ~[`SMALL_FILE_TARGET_CHUNKS`] chunks, floored at
+/// [`MIN_PARALLEL_BLOCK_SIZE`] and capped at the large-file size.
 #[inline]
 fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
-    if input_len >= 50 * 1024 * 1024 {
-        // For files >= 50MB, use 192KB blocks (520 blocks for 100MB)
-        // This is a compromise between pigz's 128KB and our tested 256KB
-        192 * 1024
+    // Large-file cutoff: at/above this, one 512KB chunk grid gives plenty of
+    // chunks-per-thread even at T16 (8MB/512KB = 16 chunks). Below it, derive
+    // the size from input_len so small inputs stay well-split.
+    const LARGE_FILE_CUTOFF: usize = SMALL_FILE_TARGET_CHUNKS * MAX_PARALLEL_BLOCK_SIZE;
+    if input_len >= LARGE_FILE_CUTOFF {
+        MAX_PARALLEL_BLOCK_SIZE
     } else {
-        // Match pigz for smaller files
-        DEFAULT_BLOCK_SIZE
+        // ~SMALL_FILE_TARGET_CHUNKS chunks, floored so tiny inputs don't
+        // over-fragment and capped at the large-file size.
+        (input_len / SMALL_FILE_TARGET_CHUNKS)
+            .clamp(MIN_PARALLEL_BLOCK_SIZE, MAX_PARALLEL_BLOCK_SIZE)
     }
 }
 
@@ -80,6 +127,62 @@ impl PipelinedGzEncoder {
         self.header_info = info;
     }
 
+    /// Raw gzip header bytes (magic, CM=8, FLG, MTIME, XFL=0, OS=255, then any
+    /// FNAME/FCOMMENT) matching the layout written by the parallel/sequential
+    /// paths below.
+    fn gzip_header_bytes(&self) -> Vec<u8> {
+        let mut header = Vec::with_capacity(64);
+        let mut flags: u8 = 0x00;
+        if self.header_info.filename.is_some() {
+            flags |= 0x08;
+        }
+        if self.header_info.comment.is_some() {
+            flags |= 0x10;
+        }
+        header.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
+        header.extend_from_slice(&self.header_info.mtime.to_le_bytes());
+        header.extend_from_slice(&[0x00, 0xff]);
+        if let Some(ref name) = self.header_info.filename {
+            header.extend_from_slice(name.as_bytes());
+            header.push(0);
+        }
+        if let Some(ref comment) = self.header_info.comment {
+            header.extend_from_slice(comment.as_bytes());
+            header.push(0);
+        }
+        header
+    }
+
+    /// Compress a pre-read buffer to a single-member gzip stream using the
+    /// pure-Rust DEFLATE engine — the SOLE production T>1 compress path
+    /// (Increment 7). Multi-threaded parallel-pipeline path; empty input yields
+    /// a valid empty gzip member.
+    pub fn compress_buffer_pure<W: Write + Send>(
+        &self,
+        data: &[u8],
+        mut writer: W,
+    ) -> io::Result<u64> {
+        if data.is_empty() {
+            // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
+            writer.write_all(&self.gzip_header_bytes())?;
+            let mut body = Vec::new();
+            crate::compress::deflate::compress_block_streaming(
+                &[],
+                &[],
+                self.compression_level,
+                true,
+                &mut body,
+            );
+            writer.write_all(&body)?;
+            writer.write_all(&0u32.to_le_bytes())?; // CRC32 of empty input
+            writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
+            return Ok(0);
+        }
+        self.compress_parallel_pipeline_pure(data, writer)?;
+        Ok(data.len() as u64)
+    }
+
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Build a flate2 GzBuilder with FNAME/MTIME/FCOMMENT from header_info
     fn gz_builder(&self) -> flate2::GzBuilder {
         let mut builder = flate2::GzBuilder::new();
@@ -93,7 +196,9 @@ impl PipelinedGzEncoder {
         builder
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Compress a pre-read buffer directly, avoiding the extra copy from Reader→Vec.
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn compress_buffer<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<u64> {
         if data.is_empty() {
             let encoder = self
@@ -111,6 +216,7 @@ impl PipelinedGzEncoder {
         Ok(data.len() as u64)
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Compress data with dictionary sharing
     pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data
@@ -134,7 +240,9 @@ impl PipelinedGzEncoder {
         Ok(bytes_read)
     }
 
+    #[cfg(any(test, feature = "ffi-oracle"))]
     /// Compress file using memory-mapped I/O with dictionary sharing
+    #[allow(dead_code)] // C-FFI oracle method; no in-crate caller
     pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
         &self,
         path: P,
@@ -181,6 +289,7 @@ impl PipelinedGzEncoder {
     /// - Zero work-stealing overhead (uniform block sizes)
     /// - Streaming output (no bulk collection)
     /// - Pre-allocated buffers (no allocation in hot path)
+    #[cfg(any(test, feature = "ffi-oracle"))]
     fn compress_parallel_pipeline<W: Write + Send>(
         &self,
         data: &[u8],
@@ -254,7 +363,89 @@ impl PipelinedGzEncoder {
         Ok(())
     }
 
+    /// Parallel pipelined compression using the pure-Rust DEFLATE engine.
+    ///
+    /// Byte-for-byte the same framing and scheduling as
+    /// [`Self::compress_parallel_pipeline`] — single-member gzip (header +
+    /// concatenated per-chunk DEFLATE + combined CRC/ISIZE), the same
+    /// data-length-only block grid, the same dictionary-from-previous-chunk, the
+    /// same in-order streaming writer and CRC-combine — EXCEPT each chunk is
+    /// compressed by [`deflate::compress_block_streaming`] instead of
+    /// flate2/zlib-ng. Non-final chunks are closed with a sync-flush marker by
+    /// that function so the concatenation is one valid DEFLATE stream.
+    ///
+    /// The grid ([`pipelined_block_size`]) depends only on `data.len()`, and the
+    /// per-chunk dictionary and compression are deterministic, so the output is
+    /// byte-identical regardless of `num_threads`.
+    fn compress_parallel_pipeline_pure<W: Write + Send>(
+        &self,
+        data: &[u8],
+        mut writer: W,
+    ) -> io::Result<()> {
+        use crate::compress::deflate;
+
+        // Pass the real compression level (1..=12) straight through — the
+        // pure-Rust engine has its own per-level parser table and does NOT need
+        // the zlib-ng L1→L2 remap that `adjust_compression_level` applies.
+        let level = self.compression_level;
+        let data_len = data.len();
+        let block_size = pipelined_block_size(data_len, self.num_threads, level);
+        let num_blocks = data_len.div_ceil(block_size);
+
+        // Write gzip header before spawning threads (identical to the flate2 path).
+        writer.write_all(&self.gzip_header_bytes())?;
+
+        // Per-block CRC parts, combined in order after all workers join.
+        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
+            .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+            .collect();
+
+        let mut writer = compress_parallel(
+            data,
+            block_size,
+            self.num_threads,
+            writer,
+            |block_idx, block, dict, is_last, output| {
+                // Compress this chunk with the pure-Rust engine. A non-final
+                // chunk is closed with a sync-flush marker inside the callee.
+                output.clear();
+                deflate::compress_block_streaming(
+                    block,
+                    dict.unwrap_or(&[]),
+                    level,
+                    is_last,
+                    output,
+                );
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(block);
+                // SAFETY: each slot is written by exactly one worker (block_idx
+                // is claimed atomically) before all threads join.
+                unsafe {
+                    *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
+                }
+            },
+        )?;
+
+        // Combine CRCs in order.
+        let mut combined_hasher = crc32fast::Hasher::new();
+        for part in &crc_parts {
+            // SAFETY: every slot was initialized by its worker above.
+            let hasher = unsafe { (*part.0.get()).assume_init_read() };
+            combined_hasher.combine(&hasher);
+        }
+        let combined_crc = combined_hasher.finalize();
+
+        // Write gzip trailer (combined CRC32 + ISIZE over the whole input).
+        let isize = (data_len as u32).to_le_bytes();
+        writer.write_all(&combined_crc.to_le_bytes())?;
+        writer.write_all(&isize)?;
+
+        Ok(())
+    }
+
     /// Sequential compression (single-threaded, for -p1)
+    #[cfg(any(test, feature = "ffi-oracle"))]
     fn compress_sequential<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
         use crc32fast::Hasher;
 
@@ -344,6 +535,7 @@ impl PipelinedGzEncoder {
 /// Compress a single block with optional dictionary
 ///
 /// Uses thread-local Compress object to avoid per-block allocation.
+#[cfg(any(test, feature = "ffi-oracle"))]
 fn compress_block_with_dict(
     block: &[u8],
     dict: Option<&[u8]>,
@@ -418,6 +610,8 @@ fn compress_block_with_dict(
     })
 }
 
+// These tests exercise the C-FFI flate2 dictionary compress path and the ParallelGzEncoder
+// oracle, both compiled only under `ffi-oracle`.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,18 @@ pub const ZOPFLI_MAX_MATCH: usize = 258;
 pub const ZOPFLI_MIN_MATCH: usize = 3;
 pub const ZOPFLI_WINDOW_SIZE: usize = 32_768;
 pub const ZOPFLI_WINDOW_MASK: usize = ZOPFLI_WINDOW_SIZE - 1;
-pub const ZOPFLI_MASTER_BLOCK_SIZE: usize = 1_000_000;
+// MASTER-5MB (crown-caps, 2026-07-20): bumped from 1_000_000 to match ECT's
+// master-block granularity (util.h:61). At 1MB, gzippy forces a block
+// boundary at every megabyte regardless of what the (now-uncapped) splitter
+// would have chosen, which is a structural cap on cross-boundary block
+// placement that ECT does not carry. No hidden dependency found: this
+// constant is consumed only in `deflate::deflate`'s top-level chaining loop
+// (deflate.rs:779-822), which is fully sequential — no outer parallelism or
+// threading assumption keys off the 1MB granularity (see
+// `src/compress/zopfli.rs`, whose only parallelism is *intra*-block via
+// `ZopfliOptions::thread_budget` inside `deflate_part`, independent of
+// master-block size).
+pub const ZOPFLI_MASTER_BLOCK_SIZE: usize = 5_000_000;
 pub const ZOPFLI_LARGE_FLOAT: f64 = 1e30;
 pub const ZOPFLI_CACHE_LENGTH: usize = 8;
 pub const ZOPFLI_MAX_CHAIN_HITS: i32 = 8192;

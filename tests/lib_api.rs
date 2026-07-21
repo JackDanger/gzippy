@@ -129,8 +129,13 @@ fn compress_to_writer_with_threads_parallel_round_trip() {
     let mut compressed = Vec::new();
     gzippy::compress_to_writer_with_threads(reader, &mut compressed, 3, 4).unwrap();
 
-    // Parallel L3 → GzippyParallel format; decompressible by gzippy.
-    assert_eq!(gzippy::classify(&compressed, 4), DecodePath::GzippyParallel);
+    // Increment 7: T>1 L1–12 routes to the pure-Rust parallel encoder (the sole
+    // production path), which emits STANDARD single-member gzip readable by
+    // stock tools.
+    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data, "pure parallel output must be standard gzip");
     let decompressed = gzippy::decompress_with_threads(&compressed, 4).unwrap();
     assert_eq!(decompressed, data);
 }
@@ -260,16 +265,17 @@ fn classify_multi_member_t1_vs_t4() {
     );
 }
 
+/// Increment 7: the T>1 low-level path produces STANDARD single-member gzip
+/// (readable by stock tools), not the legacy "GZ" multi-block format.
 #[test]
-fn classify_gzippy_parallel_format() {
+fn pure_parallel_low_level_is_standard_gzip() {
     let data = make_text(512 * 1024);
     let compressed = gzippy::compress_with_threads(&data, 3, 4).unwrap();
-    let path = gzippy::classify(&compressed, 4);
-    assert_eq!(
-        path,
-        DecodePath::GzippyParallel,
-        "T>1 L3 should produce gzippy GZ multi-block format"
-    );
+
+    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data, "pure parallel T>1 L3 must be standard gzip");
 }
 
 // ── format interop ────────────────────────────────────────────────────────────
@@ -296,26 +302,6 @@ fn pipelined_parallel_high_level_is_standard_gzip() {
     let mut out = Vec::new();
     dec.read_to_end(&mut out).unwrap();
     assert_eq!(out, data);
-}
-
-#[test]
-fn parallel_low_level_gz_format_not_readable_by_standard_tools() {
-    // T>1 L0–5 → ParallelGzEncoder → gzippy "GZ" multi-block format.
-    // Standard tools see the BGZF-style header and fail or produce wrong output.
-    let data = make_text(512 * 1024);
-    let compressed = gzippy::compress_with_threads(&data, 3, 4).unwrap();
-
-    // Confirm it is the gzippy format.
-    assert_eq!(gzippy::classify(&compressed, 1), DecodePath::GzippyParallel);
-
-    // flate2 GzDecoder will not produce the correct output for this format.
-    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
-    let mut out = Vec::new();
-    let _ = dec.read_to_end(&mut out); // may error or produce partial output
-    assert_ne!(
-        out, data,
-        "gzippy GZ format should NOT be readable by standard flate2 GzDecoder"
-    );
 }
 
 #[test]

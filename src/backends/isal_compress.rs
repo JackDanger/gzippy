@@ -5,6 +5,12 @@
 //! achieving 2-3 GB/s — 3-5x faster than zlib-ng at these levels.
 //!
 //! Falls back to zlib-ng when ISA-L is not available (ARM, or feature disabled).
+//!
+//! Increment 7: this backend is a differential oracle (off the production
+//! compress graph). Depending on the enabling cfg (`test` / `ffi-oracle` /
+//! `isal-compression`) some entry points have no in-crate caller, so dead-code
+//! is allowed module-wide rather than per-fn.
+#![allow(dead_code)]
 
 /// Check if ISA-L compression is available at compile time
 pub fn is_available() -> bool {

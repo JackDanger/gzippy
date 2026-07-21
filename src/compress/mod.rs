@@ -3,11 +3,16 @@
 //! Entry points for the I/O layer are in `io`. This module contains
 //! `compress_with_pipeline` (routing engine) and `compress_bytes` (library API).
 
+pub mod deflate;
 pub mod deflate64;
 pub mod io;
 pub mod optimization;
 pub mod parallel;
 pub mod pipelined;
+// Increment 7: `SimpleOptimizer` is the C-FFI (flate2 / libdeflate / ISA-L)
+// parallel-compress dispatcher. It is OFF the production routing graph and kept
+// only as a differential oracle behind `ffi-oracle`.
+#[cfg(any(test, feature = "ffi-oracle"))]
 pub mod simple;
 pub mod zopfli;
 
@@ -16,17 +21,16 @@ use std::io::{Read, Write};
 use crate::cli::GzippyArgs;
 use crate::compress::optimization::OptimizationConfig;
 use crate::compress::parallel::GzipHeaderInfo;
-use crate::compress::simple::SimpleOptimizer;
 use crate::error::GzippyResult;
 
-/// Select the fastest available compression backend and drive it to completion.
+/// Drive the pure-Rust compression engine to completion (Increment 7 — the sole
+/// production compress path; no C-FFI compressor in the routing graph).
 ///
-/// Routing (matches CLAUDE.md compression table):
-///   L11 / -F / -I / -J       → Zopfli (true zopfli compression)
-///   T1 L0–L3 ISA-L available → ISA-L streaming
-///   T1 L1–L5                 → libdeflate one-shot (ratio probe) or flate2 streaming
-///   T1 L6–L9                 → flate2/zlib-ng streaming
-///   T>1                      → SimpleOptimizer (parallel_compress / pipelined_compress)
+/// Routing:
+///   -F / -I / -J (explicit zopfli tuning) → zopfli (pure `zopfli_pure`)
+///   T1  L0–L12  → `deflate::compress_gzip` (pure single-member gzip)
+///   T>1 L0–L12  → `PipelinedGzEncoder::compress_buffer_pure` (pure parallel,
+///                 standard single-member gzip, byte-identical across T)
 pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     mut reader: R,
     writer: W,
@@ -34,8 +38,13 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     opt_config: &OptimizationConfig,
     header_info: &GzipHeaderInfo,
 ) -> GzippyResult<u64> {
-    // Zopfli path: L11 or any zopfli tuning flag triggers true zopfli
-    if args.use_zopfli() {
+    // Explicit zopfli tuning flags (-F iterations / -I no-split / -J split-max)
+    // force the true zopfli encoder (the pure-Rust `zopfli_pure` port — NO
+    // C-FFI). Plain `-11` does NOT: it falls through to the pure near-optimal
+    // DEFLATE engine below, matching the pre-Inc7 ordering intent.
+    let explicit_zopfli =
+        args.zopfli_iterations.is_some() || args.zopfli_no_split || args.zopfli_split_max.is_some();
+    if explicit_zopfli {
         if args.verbosity >= 2 {
             eprintln!(
                 "gzippy: using zopfli compression ({} iterations)",
@@ -52,123 +61,66 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
         return encoder.compress(reader, writer).map_err(|e| e.into());
     }
 
-    if opt_config.thread_count == 1 && args.compression_level <= 9 {
-        // ISA-L: T1 L0–L3 on x86_64 with AVX2
-        if args.compression_level <= 3
-            && !args.huffman
-            && !args.rle
-            && crate::backends::isal_compress::is_available()
-        {
-            if args.verbosity >= 2 {
-                eprintln!("gzippy: using ISA-L single-threaded streaming compression");
-            }
-            let bytes = crate::backends::isal_compress::compress_gzip_stream_direct(
-                &mut reader,
-                writer,
-                args.compression_level as u32,
-            )?;
-            return Ok(bytes);
-        }
-
-        // libdeflate one-shot: T1 L1–L5 (ratio probe decides vs flate2)
-        if args.compression_level >= 1 && args.compression_level <= 5 && !args.huffman && !args.rle
-        {
-            let mut probe_buf = Vec::with_capacity(65536);
-            reader.by_ref().take(65536).read_to_end(&mut probe_buf)?;
-
-            let use_libdeflate = if probe_buf.len() >= 65536 {
-                let lvl = libdeflater::CompressionLvl::new(args.compression_level as i32)
-                    .unwrap_or_default();
-                let mut comp = libdeflater::Compressor::new(lvl);
-                let bound = comp.deflate_compress_bound(probe_buf.len());
-                let mut out = vec![0u8; bound];
-                let actual = comp
-                    .deflate_compress(&probe_buf, &mut out)
-                    .unwrap_or(probe_buf.len());
-                (actual as f64 / probe_buf.len() as f64) >= 0.10
-            } else {
-                true
-            };
-
-            if use_libdeflate {
-                if args.verbosity >= 2 {
-                    eprintln!("gzippy: using libdeflate single-threaded path");
-                }
-                let mut input_data = probe_buf;
-                reader.read_to_end(&mut input_data)?;
-                let bytes = input_data.len() as u64;
-                let mut writer = writer;
-                crate::compress::parallel::compress_single_member(
-                    &mut writer,
-                    &input_data,
-                    args.compression_level as u32,
-                    header_info,
-                )?;
-                return Ok(bytes);
-            }
-
-            // Highly compressible data: stream through flate2/zlib-ng
-            if args.verbosity >= 2 {
-                eprintln!("gzippy: using flate2 single-threaded path (highly compressible)");
-            }
-            let adjusted_level = if args.compression_level == 1 {
-                2
-            } else {
-                args.compression_level
-            };
-            let compression = flate2::Compression::new(adjusted_level as u32);
-            let mut builder = flate2::GzBuilder::new();
-            if let Some(ref name) = header_info.filename {
-                builder = builder.filename(name.as_bytes());
-            }
-            builder = builder.mtime(header_info.mtime);
-            if let Some(ref comment) = header_info.comment {
-                builder = builder.comment(comment.as_bytes());
-            }
-            let mut chained = std::io::Cursor::new(probe_buf).chain(reader);
-            let mut encoder = builder.write(writer, compression);
-            let bytes = std::io::copy(&mut chained, &mut encoder)?;
-            encoder.finish()?;
-            return Ok(bytes);
-        }
-
-        // T1 L6–L9: flate2/zlib-ng streaming
+    // Increment 7: the pure-Rust DEFLATE encoder is the SOLE production
+    // single-thread compress path for EVERY level 0–12. All C-FFI compressors
+    // (ISA-L / libdeflate one-shot / flate2-zlib-ng) have been removed from the
+    // production routing graph; they remain compilable only behind the dev
+    // `ffi-oracle` feature as differential fuzz oracles. `compress_gzip` picks
+    // the cheapest of stored / static-Huffman / dynamic-Huffman per block, so it
+    // subsumes the old L0 stored passthrough and the `--huffman` / `--rle`
+    // fall-throughs while always emitting a valid single-member gzip stream.
+    if opt_config.thread_count == 1 {
         if args.verbosity >= 2 {
-            eprintln!("gzippy: using direct flate2 single-threaded path");
-        }
-        let compression = if args.huffman || args.rle {
-            flate2::Compression::new(1)
-        } else {
-            let adjusted_level = if args.compression_level == 1 {
-                2
-            } else {
+            eprintln!(
+                "gzippy: using pure-Rust DEFLATE encoder (T1 L{})",
                 args.compression_level
-            };
-            flate2::Compression::new(adjusted_level as u32)
-        };
-        let mut builder = flate2::GzBuilder::new();
-        if let Some(ref name) = header_info.filename {
-            builder = builder.filename(name.as_bytes());
+            );
         }
-        builder = builder.mtime(header_info.mtime);
-        if let Some(ref comment) = header_info.comment {
-            builder = builder.comment(comment.as_bytes());
-        }
-        let mut encoder = builder.write(writer, compression);
-        let bytes = std::io::copy(&mut reader, &mut encoder)?;
-        encoder.finish()?;
+        let mut input = Vec::new();
+        reader.read_to_end(&mut input)?;
+        let bytes = input.len() as u64;
+        // Pad the read buffer in place with the matchfinder's trailing slack so
+        // the compressor parses IN PLACE — no second full-input work buffer.
+        let logical_len = input.len();
+        input.resize(logical_len + crate::compress::deflate::INPLACE_TAIL_PAD, 0);
+        let gz = crate::compress::deflate::compress_gzip_padded(
+            &input,
+            logical_len,
+            args.compression_level as u32,
+        );
+        let mut writer = writer;
+        writer.write_all(&gz)?;
+        writer.flush()?;
         return Ok(bytes);
     }
 
-    // Multi-threaded: SimpleOptimizer dispatches to ParallelGzEncoder or PipelinedGzEncoder
+    // Increment 7: multi-threaded pure-Rust parallel DEFLATE encoder — now the
+    // SOLE production T>1 compress path (the `pure-rust-encoder` gate is removed;
+    // Inc6 landed it alongside SimpleOptimizer, Inc7 makes it unconditional).
+    // Produces a single-member STANDARD gzip stream (header + concatenated
+    // per-chunk DEFLATE with sync-flush seams + combined CRC/ISIZE) via
+    // `PipelinedGzEncoder::compress_buffer_pure` — NOT the "GZ" multiblock
+    // format. The former SimpleOptimizer → ParallelGzEncoder / PipelinedGzEncoder
+    // C-FFI path (flate2/libdeflate/ISA-L) is retained only behind the dev
+    // `ffi-oracle` feature as a differential oracle. `compress_buffer_pure`
+    // covers every level 0–12 and the `--huffman` / `--rle` modes (the pure
+    // engine picks the cheapest per-block encoding regardless).
     if args.verbosity >= 2 {
         eprintln!(
-            "gzippy: using parallel backend with {} threads",
+            "gzippy: using pure-Rust parallel DEFLATE encoder ({} threads)",
             opt_config.thread_count,
         );
     }
-    let optimizer = SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
-    optimizer.compress(reader, writer).map_err(|e| e.into())
+    let mut input = Vec::new();
+    reader.read_to_end(&mut input)?;
+    let bytes = input.len() as u64;
+    let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+        args.compression_level as u32,
+        opt_config.thread_count,
+    );
+    encoder.set_header_info(header_info.clone());
+    encoder.compress_buffer_pure(&input, writer)?;
+    Ok(bytes)
 }
 
 // =============================================================================
@@ -177,44 +129,24 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
 
 /// Compress `data` to raw DEFLATE (RFC 1951) at `level` — no gzip framing.
 ///
-/// Routes to ISA-L SIMD on x86_64 for levels 0–3, then libdeflate one-shot.
-/// `level` is clamped to `0..=12`.
+/// Increment 7: routes to the pure-Rust DEFLATE encoder for every level 0–12
+/// (the sole production compress path; no C-FFI compressor). `level` is clamped
+/// to `0..=12`.
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn compress_raw_bytes(data: &[u8], level: u8) -> crate::error::GzippyResult<Vec<u8>> {
-    use crate::error::GzippyError;
-
     let level = level.clamp(0, 12);
-
-    // ISA-L: fastest on x86_64 for levels 0–3
-    if level <= 3 && crate::backends::isal_compress::is_available() {
-        if let Some(compressed) =
-            crate::backends::isal_compress::compress_deflate(data, level as u32)
-        {
-            return Ok(compressed);
-        }
-    }
-
-    // libdeflate one-shot for all levels
-    let lvl = libdeflater::CompressionLvl::new(level as i32).expect("level clamped to 0–12");
-    let mut comp = libdeflater::Compressor::new(lvl);
-    let bound = comp.deflate_compress_bound(data.len());
-    let mut out = vec![0u8; bound];
-    let n = comp
-        .deflate_compress(data, &mut out)
-        .map_err(|_| GzippyError::compression("raw DEFLATE compression failed"))?;
-    out.truncate(n);
-    Ok(out)
+    Ok(crate::compress::deflate::compress_oneshot(
+        data,
+        level as u32,
+    ))
 }
 
 /// Compress data using gzippy's full routing table.
 ///
-/// Selects the fastest backend for the given `level` (0–12) and `threads`:
-/// - T1 L0–3 + ISA-L  → ISA-L SIMD streaming
-/// - T1 L1–5          → libdeflate one-shot (ratio probe) or flate2/zlib-ng
-/// - T1 L6–9          → flate2/zlib-ng streaming
-/// - T>1 L0–5         → `ParallelGzEncoder` (gzippy "GZ" multi-block format)
-/// - T>1 L6–9         → `PipelinedGzEncoder` (single-member gzip-compatible)
-/// - L11              → Zopfli
+/// Increment 7: routes through the pure-Rust DEFLATE engine for the given
+/// `level` (0–12) and `threads` — T1 single-member, T>1 pure parallel
+/// single-member — with explicit zopfli tuning (-F/-I/-J) taking the pure
+/// zopfli path. No C-FFI compressor is on this graph.
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn compress_bytes<R: Read, W: Write + Send>(
     reader: R,

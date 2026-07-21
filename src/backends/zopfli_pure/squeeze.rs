@@ -5,13 +5,14 @@
 //! 11 (`get_best_lengths`, `trace_backwards`, `follow_path`), and
 //! 12 (`lz77_optimal`, `lz77_optimal_fixed`, end-to-end FFI oracle).
 
-use super::deflate_size::calculate_block_size;
+use super::deflate_size::{calculate_block_size, optimize_huffman_for_rle};
 use super::hash::ZopfliHash;
-use super::lz77::{find_longest_match, lz77_greedy, verify_len_dist, BlockState, LZ77Store};
+use super::katajainen::length_limited_code_lengths;
+use super::lz77::{lz77_greedy, verify_len_dist, BlockState, LZ77Store};
+use super::lzfind::{MatchFinder, MAX_MATCH_U16};
 use super::symbols::{
     dist_extra_bits, dist_symbol, length_extra_bits, length_symbol, ZOPFLI_LARGE_FLOAT,
-    ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK,
-    ZOPFLI_WINDOW_SIZE,
+    ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_SIZE,
 };
 use super::tree::calculate_entropy;
 
@@ -93,6 +94,51 @@ impl SymbolStats {
         self.rebuild_len_cost();
     }
 
+    /// Periodic real-Huffman re-anchor (ECT squeeze.c ~995-1019, the
+    /// `i == 9 || i == 30 || (i == numiterations-1 && numiterations>5)`
+    /// gate): overwrite `self.ll_symbols`/`self.d_symbols` (and rebuild
+    /// `len_cost`) with REAL RLE-optimized, length-limited canonical
+    /// Huffman code lengths computed from `freqs_from`'s frequency
+    /// histograms, in place of the `calculate_entropy` proxy estimate.
+    ///
+    /// The proxy (`tree::calculate_entropy`) is a continuous, unlimited
+    /// idealized bit-length; the actual encoder emits INTEGER,
+    /// 15-bit-limited, RLE-smoothed code lengths (`optimize_huffman_for_rle`
+    /// + `length_limited_code_lengths`, the same building blocks
+    /// `deflate_size`/`katajainen` use to emit the real tree). Pricing the
+    /// squeeze DP against the real lengths periodically lets it correct for
+    /// proxy drift the entropy estimate can't see (RLE collapsing, the
+    /// 15-bit cap, package-merge's integer rounding), which ECT's mechanism
+    /// study measured as a real cost drop at the anchor iterations.
+    ///
+    /// Leaves `self` untouched if the length-limited solver reports failure
+    /// (lossless no-op fallback — the proxy stays in effect for this
+    /// iteration; can only happen on pathological weight overflow, never on
+    /// a legal 288/32-symbol DEFLATE alphabet in practice).
+    pub fn apply_real_huffman_lengths(&mut self, freqs_from: &Self) {
+        let mut ll_counts = freqs_from.litlens;
+        let mut d_counts = freqs_from.dists;
+        optimize_huffman_for_rle(&mut ll_counts);
+        optimize_huffman_for_rle(&mut d_counts);
+
+        let mut ll_bits = [0u32; ZOPFLI_NUM_LL];
+        if length_limited_code_lengths(&ll_counts, 15, &mut ll_bits).is_err() {
+            return;
+        }
+        let mut d_bits = [0u32; ZOPFLI_NUM_D];
+        if length_limited_code_lengths(&d_counts, 15, &mut d_bits).is_err() {
+            return;
+        }
+
+        for i in 0..ZOPFLI_NUM_LL {
+            self.ll_symbols[i] = ll_bits[i] as f64;
+        }
+        for i in 0..ZOPFLI_NUM_D {
+            self.d_symbols[i] = d_bits[i] as f64;
+        }
+        self.rebuild_len_cost();
+    }
+
     /// Refreshes `len_cost` from the current `ll_symbols`. Lockstep
     /// helper for the invariant on the field.
     fn rebuild_len_cost(&mut self) {
@@ -117,6 +163,23 @@ impl SymbolStats {
                 s.litlens[ls] += 1;
                 s.dists[ds] += 1;
             }
+        }
+        s.litlens[256] = 1;
+        s.calculate_statistics();
+        s
+    }
+
+    /// Seed statistics from an ALL-LITERAL parse of `in_[instart..inend]`:
+    /// every byte is counted as a literal, no matches. Length/dist symbols get
+    /// zero count, so `calculate_entropy` prices them at `log2(n)` — expensive
+    /// enough that the squeeze DP only takes matches that genuinely beat the
+    /// literal run. This anchors the iterated-price fixed point in the
+    /// literal-dominant basin, which the greedy seed misses on low-entropy
+    /// data (DNA, long runs), where the true optimal parse is literal-heavy.
+    pub fn from_literals(in_: &[u8], instart: usize, inend: usize) -> Self {
+        let mut s = Self::new();
+        for &b in &in_[instart..inend] {
+            s.litlens[b as usize] += 1;
         }
         s.litlens[256] = 1;
         s.calculate_statistics();
@@ -225,6 +288,16 @@ pub trait CostModel {
     fn literal_cost(&self, byte: u8) -> f64 {
         self.cost(byte as u32, 0)
     }
+
+    /// Length-only component of a match cost (the length symbol code length
+    /// plus its extra bits), without the distance component. Split out so the
+    /// ECT-shaped DP can precompute `litlentable[3..=258]` and `disttable[..]`
+    /// separately and sum them in the inner loop (see `get_best_lengths`).
+    fn len_cost(&self, len: u32) -> f64;
+
+    /// Distance-only component of a match cost (the distance symbol code length
+    /// plus its extra bits).
+    fn dist_cost(&self, dist: u32) -> f64;
 }
 
 pub struct FixedCost;
@@ -242,6 +315,19 @@ impl CostModel for FixedCost {
             9.0
         }
     }
+
+    #[inline]
+    fn len_cost(&self, len: u32) -> f64 {
+        let lsym = length_symbol(len as i32);
+        let lbits = length_extra_bits(len as i32);
+        ((if lsym <= 279 { 7 } else { 8 }) + lbits) as f64
+    }
+
+    #[inline]
+    fn dist_cost(&self, dist: u32) -> f64 {
+        // Every distance symbol has code length 5 in the fixed tree.
+        (5 + dist_extra_bits(dist as i32)) as f64
+    }
 }
 
 pub struct StatCost<'a>(pub &'a SymbolStats);
@@ -255,62 +341,125 @@ impl CostModel for StatCost<'_> {
     fn literal_cost(&self, byte: u8) -> f64 {
         self.0.ll_symbols[byte as usize]
     }
-}
 
-/// Distances that introduce a new dist symbol per RFC 1951 §3.2.5. Probing
-/// only these covers all 30 dist symbols without iterating all 32K distances.
-const DSYMBOLS: [u32; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-];
-
-/// The minimum cost any (length, distance) pair can produce under `model`.
-/// Mirrors C `GetCostModelMinCost` exactly: scan lengths with dist=1, scan
-/// dist symbols with length=3, then return `model(bestlength, bestdist)`.
-pub fn cost_model_min_cost<C: CostModel>(model: &C) -> f64 {
-    let mut bestlength: u32 = 0;
-    let mut mincost = ZOPFLI_LARGE_FLOAT;
-    for i in 3..259u32 {
-        let c = model.cost(i, 1);
-        if c < mincost {
-            bestlength = i;
-            mincost = c;
-        }
+    #[inline]
+    fn len_cost(&self, len: u32) -> f64 {
+        self.0.len_cost[(len as usize) - ZOPFLI_MIN_MATCH]
     }
 
-    let mut bestdist: u32 = 0;
-    let mut mincost = ZOPFLI_LARGE_FLOAT;
-    for &d in &DSYMBOLS {
-        let c = model.cost(3, d);
-        if c < mincost {
-            bestdist = d;
-            mincost = c;
-        }
+    #[inline]
+    fn dist_cost(&self, dist: u32) -> f64 {
+        let dsym = dist_symbol(dist as i32) as usize;
+        dist_extra_bits(dist as i32) as f64 + self.0.d_symbols[dsym]
     }
-
-    model.cost(bestlength, bestdist)
 }
 
-// ── Step 11: get_best_lengths / trace_backwards / follow_path / optimal_run ──
+// ── LzFind-driven optimal DP (ECT `GetBestLengths` shape) ────────────────────
 
-/// Forward DP pass. For every byte `j` in `[0, blocksize]`, `length_array[j]`
-/// is filled with the optimal length to reach byte `j` from a previous byte;
-/// `costs[j]` is the cost of that path under `model`. Returns the cost of the
-/// full path (`costs[blocksize]`).
+/// Bit width by which a distance is shifted when packed alongside a length in a
+/// `length_array` entry (`entry = len | (dist << 9)`; `len` occupies the low 9
+/// bits, max 258 < 512).
+const DIST_SHIFT: u32 = 9;
+/// Mask isolating the length component of a packed `length_array` entry.
+const LEN_MASK: u32 = (1 << DIST_SHIFT) - 1;
+
+/// ECT's `LZCache`: on the first optimal-parse iteration the matchfinder's
+/// emitted pairs are recorded here; every later iteration (which uses a new
+/// cost model but sees the *same* matches) replays them instead of re-running
+/// the binary-tree search. This is what makes 15–60 iterations affordable.
 ///
-/// **Floating-point widths are load-bearing.** `costs[]` is `f32`; cost-model
-/// returns are `f64`; comparisons promote the f32 to f64 with explicit `as
-/// f64` and stores narrow with explicit `as f32`. Pinned by the plan FAQ.
-#[allow(clippy::too_many_arguments)]
+/// Layout: for every position that runs the matchfinder, one length-prefixed
+/// record `[count, len, dist, len, dist, …]` where `count` is the number of
+/// following `u16` values (`= 2 * numPairs`, `<= 512`). Positions skipped by
+/// the `ML_RLE` fast path emit no record — the replay walks the identical fast
+/// path and skips them too, so the read cursor stays aligned.
+pub struct LzCache {
+    data: Vec<u16>,
+    read_pos: usize,
+}
+
+impl LzCache {
+    fn new(blocksize: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(blocksize + 513),
+            read_pos: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.read_pos = 0;
+    }
+
+    fn reset_read(&mut self) {
+        self.read_pos = 0;
+    }
+
+    /// Appends one record for the pairs in `pairs` (`pairs.len() == 2*numPairs`).
+    fn store(&mut self, pairs: &[u16]) {
+        self.data.push(pairs.len() as u16);
+        self.data.extend_from_slice(pairs);
+    }
+
+    /// Copies the next record's pairs into `out`, returning the count of `u16`.
+    fn read_into(&mut self, out: &mut [u16]) -> usize {
+        let count = self.data[self.read_pos] as usize;
+        self.read_pos += 1;
+        out[..count].copy_from_slice(&self.data[self.read_pos..self.read_pos + count]);
+        self.read_pos += count;
+        count
+    }
+}
+
+/// Source of match pairs for the DP: run the matchfinder and discard, run it
+/// and record into the cache, or replay a previously recorded cache.
+pub(crate) enum Mode<'c> {
+    NoCache,
+    Store(&'c mut LzCache),
+    Replay(&'c mut LzCache),
+}
+
+/// Length of the run of `in_[i-1]` starting at `i` (distance-1 match), returned
+/// as an absolute end index in `in_`. Used by the `ML_RLE` fast path. Mirrors
+/// ECT's `GetMatch(&in[i], &in[i-1], …)`.
+fn run_end_dist1(in_: &[u8], i: usize, inend: usize) -> usize {
+    let mut s = i;
+    let mut m = i - 1;
+    let safe = inend.saturating_sub(8);
+    while s < safe {
+        let a = u64::from_le_bytes(in_[s..s + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(in_[m..m + 8].try_into().unwrap());
+        let x = a ^ b;
+        if x != 0 {
+            return s + (x.trailing_zeros() >> 3) as usize;
+        }
+        s += 8;
+        m += 8;
+    }
+    while s < inend && in_[s] == in_[m] {
+        s += 1;
+        m += 1;
+    }
+    s
+}
+
+/// Forward DP pass, ECT `GetBestLengths` shape. For every byte `j` in
+/// `[0, blocksize]`, `length_array[j]` receives the optimal packed
+/// `len | (dist << 9)` to reach byte `j` from a previous byte (`dist == 0` for
+/// a literal, encoded as the bare value `1`); `costs[j]` is that path's cost.
+/// Returns `costs[blocksize]`.
+///
+/// The DP is driven by the LzFind binary-tree matchfinder's match frontier
+/// (or its cached replay), relaxing every `(len, dist)` pair with ECT's
+/// `+6.0` promise-pruning heuristic and its `ML_RLE` long-run fast path.
 pub(crate) fn get_best_lengths<C: CostModel>(
-    s: &mut BlockState<'_>,
     in_: &[u8],
     instart: usize,
     inend: usize,
     model: &C,
-    length_array: &mut [u16],
-    h: &mut ZopfliHash,
+    length_array: &mut [u32],
     costs: &mut [f32],
+    mut mode: Mode<'_>,
 ) -> f64 {
     if instart == inend {
         return 0.0;
@@ -319,106 +468,166 @@ pub(crate) fn get_best_lengths<C: CostModel>(
     let blocksize = inend - instart;
     let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
 
-    let mincost: f64 = cost_model_min_cost(model);
-
-    h.reset(ZOPFLI_WINDOW_SIZE);
-    h.warmup(in_, windowstart, inend);
-    for i in windowstart..instart {
-        h.update(in_, i, inend);
+    // Precompute the cost tables hoisted out of the inner loop. Kept in `f64`
+    // (with the DP relaxation summed in `f64`, `costs[]` stored as `f32`) so the
+    // parse tie-breaking matches stock zopfli's precision exactly — the BT
+    // frontier then yields the same parse as the hash chain where the chain
+    // wasn't capped, and a better one where it was.
+    let mut litlentable = [0f64; 259];
+    for (k, slot) in litlentable
+        .iter_mut()
+        .enumerate()
+        .take(ZOPFLI_MAX_MATCH + 1)
+        .skip(ZOPFLI_MIN_MATCH)
+    {
+        *slot = model.len_cost(k as u32);
     }
+    let mut disttable = vec![0f64; ZOPFLI_WINDOW_SIZE];
+    for (d, slot) in disttable.iter_mut().enumerate().skip(1) {
+        *slot = model.dist_cost(d as u32);
+    }
+    let mut literals = [0f64; 256];
+    for (b, slot) in literals.iter_mut().enumerate() {
+        *slot = model.literal_cost(b as u8);
+    }
+    // Cost of one distance-1 max-match, used by the ML_RLE fast path.
+    let symbolcost = litlentable[ZOPFLI_MAX_MATCH] + disttable[1];
 
+    let large = ZOPFLI_LARGE_FLOAT as f32;
     for c in &mut costs[1..=blocksize] {
-        *c = ZOPFLI_LARGE_FLOAT as f32;
+        *c = large;
     }
     costs[0] = 0.0;
-    length_array[0] = 0;
 
-    let mut sublen = [0u16; 259];
+    // Lower bound on the cost of any single length/distance symbol, used for
+    // the lossless DP prune below (stock-zopfli `GetCostModelMinCost`): the
+    // match cost is separable into `len_cost + dist_cost`, so the global
+    // minimum is the min of each table.
+    let min_len = litlentable[ZOPFLI_MIN_MATCH..=ZOPFLI_MAX_MATCH]
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let min_dist = disttable[1..].iter().copied().fold(f64::INFINITY, f64::min);
+    let mincost = min_len + min_dist;
+
+    // Matchfinder is only needed when we're actually searching (NoCache/Store).
+    let mut mf = match mode {
+        Mode::Replay(ref mut c) => {
+            c.reset_read();
+            None
+        }
+        Mode::Store(ref mut c) => {
+            c.clear();
+            Some(MatchFinder::new(in_, windowstart, instart, inend))
+        }
+        Mode::NoCache => Some(MatchFinder::new(in_, windowstart, instart, inend)),
+    };
+
+    let mut scratch = [0u16; MAX_MATCH_U16];
+    let mut match_type_rle = false;
+
     let mut i = instart;
     while i < inend {
         let mut j = i - instart;
-        h.update(in_, i, inend);
 
-        // ZOPFLI_SHORTCUT_LONG_REPETITIONS: skip ZOPFLI_MAX_MATCH bytes
-        // ahead when we're inside a long uniform run, both before and after
-        // the current position.
-        if h.same[i & ZOPFLI_WINDOW_MASK] as usize > ZOPFLI_MAX_MATCH * 2
-            && i > instart + ZOPFLI_MAX_MATCH + 1
-            && i + ZOPFLI_MAX_MATCH * 2 + 1 < inend
-            && h.same[(i - ZOPFLI_MAX_MATCH) & ZOPFLI_WINDOW_MASK] as usize > ZOPFLI_MAX_MATCH
-        {
-            let symbolcost: f64 = model.cost(ZOPFLI_MAX_MATCH as u32, 1);
-            for _ in 0..ZOPFLI_MAX_MATCH {
-                costs[j + ZOPFLI_MAX_MATCH] = (costs[j] as f64 + symbolcost) as f32;
-                length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
-                i += 1;
-                j += 1;
-                h.update(in_, i, inend);
+        // ML_RLE: inside a long distance-1 run, force a max-match at every
+        // position and skip the matchfinder past the whole run. Exact shortcut
+        // (a run's optimal parse is always max-matches at distance 1).
+        if match_type_rle {
+            let match_end = run_end_dist1(in_, i, inend);
+            if match_end >= i + ZOPFLI_MAX_MATCH {
+                let matchn = match_end - i - ZOPFLI_MAX_MATCH + 1;
+                for _ in 0..matchn {
+                    costs[j + ZOPFLI_MAX_MATCH] = (costs[j] as f64 + symbolcost) as f32;
+                    length_array[j + ZOPFLI_MAX_MATCH] =
+                        ZOPFLI_MAX_MATCH as u32 | (1u32 << DIST_SHIFT);
+                    j += 1;
+                }
+                if let Some(mf) = mf.as_mut() {
+                    mf.skip2(matchn);
+                }
+                i += matchn;
+            }
+            match_type_rle = false;
+        }
+
+        // Fetch this position's match frontier.
+        let count = match &mut mode {
+            Mode::NoCache => mf.as_mut().unwrap().get_matches(&mut scratch),
+            Mode::Store(cache) => {
+                let c = mf.as_mut().unwrap().get_matches(&mut scratch);
+                cache.store(&scratch[..c]);
+                c
+            }
+            Mode::Replay(cache) => cache.read_into(&mut scratch),
+        };
+
+        if count != 0 {
+            let costj = costs[j] as f64;
+            // A distance-1 max-length match means we're entering a run; arm the
+            // ML_RLE fast path for the next position (in a run the nearest match
+            // is dist 1 and already maxes out, so it is `scratch[0..2]`).
+            if scratch[0] as usize == ZOPFLI_MAX_MATCH && scratch[1] == 1 {
+                match_type_rle = true;
+            }
+
+            // Full relaxation over the binary-tree frontier. The strictly
+            // increasing `(len, dist)` pairs encode `sublen[k]` exactly (for
+            // `k` in `(prev_len, len]`, the closest distance is `dist`), so this
+            // is stock-zopfli's optimal-parse relaxation — never worse than the
+            // hash chain — but driven by the uncapped BT finder. The `mincost`
+            // guard is a lossless skip (a slot already at the theoretical floor
+            // can't be improved). Sum order matches stock zopfli exactly:
+            // `(dist_cost + len_cost) + costs[j]`.
+            let mincostaddcostj = mincost + costj;
+            let mut curr = ZOPFLI_MIN_MATCH;
+            let mut p = 0;
+            while p < count {
+                let len = scratch[p] as usize;
+                let dist = scratch[p + 1] as usize;
+                p += 2;
+                let dcost = disttable[dist];
+                while curr <= len {
+                    if (costs[j + curr] as f64) > mincostaddcostj {
+                        let x = dcost + litlentable[curr] + costj;
+                        if x < costs[j + curr] as f64 {
+                            costs[j + curr] = x as f32;
+                            length_array[j + curr] = curr as u32 | ((dist as u32) << DIST_SHIFT);
+                        }
+                    }
+                    curr += 1;
+                }
             }
         }
 
-        let mut leng: u16 = 0;
-        let mut dist: u16 = 0;
-        find_longest_match(
-            s,
-            h,
-            in_,
-            i,
-            inend,
-            ZOPFLI_MAX_MATCH,
-            Some(&mut sublen),
-            &mut dist,
-            &mut leng,
-        );
-
-        // Literal candidate.
-        if i < inend {
-            let new_cost: f64 = model.literal_cost(in_[i]) + costs[j] as f64;
-            debug_assert!(new_cost >= 0.0);
-            if new_cost < costs[j + 1] as f64 {
-                costs[j + 1] = new_cost as f32;
-                length_array[j + 1] = 1;
-            }
-        }
-
-        // Length candidates.
-        let kend = (leng as usize).min(inend - i);
-        let mincostaddcostj: f64 = mincost + costs[j] as f64;
-        for k in ZOPFLI_MIN_MATCH..=kend {
-            if (costs[j + k] as f64) <= mincostaddcostj {
-                continue;
-            }
-            let new_cost: f64 = model.cost(k as u32, sublen[k] as u32) + costs[j] as f64;
-            debug_assert!(new_cost >= 0.0);
-            if new_cost < costs[j + k] as f64 {
-                debug_assert!(k <= ZOPFLI_MAX_MATCH);
-                costs[j + k] = new_cost as f32;
-                length_array[j + k] = k as u16;
-            }
+        // Literal candidate. Sum order matches stock zopfli: `literal + costs[j]`.
+        let new_cost = literals[in_[i] as usize] + costs[j] as f64;
+        if new_cost < costs[j + 1] as f64 {
+            costs[j + 1] = new_cost as f32;
+            length_array[j + 1] = 1;
         }
 
         i += 1;
     }
 
-    debug_assert!(costs[blocksize] >= 0.0);
     costs[blocksize] as f64
 }
 
-/// Walks `length_array` from the end back to 0, recording the picked lengths,
-/// then mirrors them in place. Output buffer is `path`; the C version
-/// allocates and returns size, we just push.
-pub(crate) fn trace_backwards(size: usize, length_array: &[u16], path: &mut Vec<u16>) {
+/// Walks `length_array` from the end back to 0, recording the picked packed
+/// entries, then mirrors them into forward order in `path`.
+pub(crate) fn trace_backwards(size: usize, length_array: &[u32], path: &mut Vec<u32>) {
     if size == 0 {
         return;
     }
     let mut index = size;
     loop {
-        let l = length_array[index];
-        path.push(l);
-        debug_assert!((l as usize) <= index);
-        debug_assert!((l as usize) <= ZOPFLI_MAX_MATCH);
+        let e = length_array[index];
+        path.push(e);
+        let l = (e & LEN_MASK) as usize;
+        debug_assert!(l <= index);
+        debug_assert!(l <= ZOPFLI_MAX_MATCH);
         debug_assert!(l != 0);
-        index -= l as usize;
+        index -= l;
         if index == 0 {
             break;
         }
@@ -426,91 +635,44 @@ pub(crate) fn trace_backwards(size: usize, length_array: &[u16], path: &mut Vec<
     path.reverse();
 }
 
-/// Replays `path` against the input, populating `store` with literals and
-/// length/dist pairs; recovers each distance via a fresh `find_longest_match`
-/// call (cheap because the LMC is already populated from the forward pass).
-pub(crate) fn follow_path(
-    s: &mut BlockState<'_>,
-    in_: &[u8],
-    instart: usize,
-    inend: usize,
-    path: &[u16],
-    store: &mut LZ77Store<'_>,
-    h: &mut ZopfliHash,
-) {
-    if instart == inend {
-        return;
-    }
-
-    let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
-
-    h.reset(ZOPFLI_WINDOW_SIZE);
-    h.warmup(in_, windowstart, inend);
-    for i in windowstart..instart {
-        h.update(in_, i, inend);
-    }
-
+/// Replays the packed `path` against the input, populating `store`. The
+/// distance is read straight from each packed entry — no re-search — with
+/// `verify_len_dist` kept as a debug safety check.
+pub(crate) fn follow_path(in_: &[u8], instart: usize, path: &[u32], store: &mut LZ77Store<'_>) {
     let mut pos = instart;
-    for &raw_length in path {
-        debug_assert!(pos < inend);
-
-        h.update(in_, pos, inend);
-
-        let length: u16 = if (raw_length as usize) >= ZOPFLI_MIN_MATCH {
-            // Recover the distance with the same window search; the assert
-            // matches the C code's sanity check that the longest match
-            // returned now is the same length we picked in the forward pass
-            // (or both fall under the 2-byte threshold).
-            let mut dist: u16 = 0;
-            let mut dummy_length: u16 = 0;
-            find_longest_match(
-                s,
-                h,
-                in_,
-                pos,
-                inend,
-                raw_length as usize,
-                None,
-                &mut dist,
-                &mut dummy_length,
-            );
-            debug_assert!(!(dummy_length != raw_length && raw_length > 2 && dummy_length > 2));
-            verify_len_dist(in_, pos, dist, raw_length);
-            store.store_lit_len_dist(raw_length, dist, pos);
-            raw_length
+    for &e in path {
+        let length = (e & LEN_MASK) as u16;
+        if length as usize >= ZOPFLI_MIN_MATCH {
+            let dist = (e >> DIST_SHIFT) as u16;
+            verify_len_dist(in_, pos, dist, length);
+            store.store_lit_len_dist(length, dist, pos);
+            pos += length as usize;
         } else {
             store.store_lit_len_dist(in_[pos] as u16, 0, pos);
-            1
-        };
-
-        debug_assert!(pos + length as usize <= inend);
-        for j in 1..length as usize {
-            h.update(in_, pos + j, inend);
+            pos += 1;
         }
-        pos += length as usize;
     }
 }
 
 /// One squeeze iteration: forward DP → trace → follow. Returns the DP cost.
-/// The `path`, `length_array`, and `costs` scratch buffers are reused
-/// across iterations by the caller.
+/// The `path`, `length_array`, and `costs` scratch buffers are reused across
+/// iterations by the caller; `mode` selects fresh-search / record / replay.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lz77_optimal_run<C: CostModel>(
-    s: &mut BlockState<'_>,
     in_: &[u8],
     instart: usize,
     inend: usize,
-    path: &mut Vec<u16>,
-    length_array: &mut [u16],
+    path: &mut Vec<u32>,
+    length_array: &mut [u32],
     model: &C,
     store: &mut LZ77Store<'_>,
-    h: &mut ZopfliHash,
     costs: &mut [f32],
+    mode: Mode<'_>,
 ) -> f64 {
-    let cost = get_best_lengths(s, in_, instart, inend, model, length_array, h, costs);
+    let cost = get_best_lengths(in_, instart, inend, model, length_array, costs, mode);
     path.clear();
     trace_backwards(inend - instart, length_array, path);
-    follow_path(s, in_, instart, inend, path, store, h);
+    follow_path(in_, instart, path, store);
     debug_assert!(cost < ZOPFLI_LARGE_FLOAT);
     cost
 }
@@ -531,9 +693,12 @@ pub fn lz77_optimal<'a>(
     store: &mut LZ77Store<'a>,
 ) {
     let blocksize = inend - instart;
-    let mut length_array = vec![0u16; blocksize + 1];
+    let mut length_array = vec![0u32; blocksize + 1];
     let mut costs = vec![0f32; blocksize + 1];
-    let mut path: Vec<u16> = Vec::new();
+    let mut path: Vec<u32> = Vec::new();
+    // First iteration records the matchfinder's pairs; later iterations replay
+    // them (same matches, new cost model).
+    let mut cache = LzCache::new(blocksize);
 
     let mut currentstore = LZ77Store::new(in_);
     let mut h = ZopfliHash::new(ZOPFLI_WINDOW_SIZE);
@@ -552,9 +717,22 @@ pub fn lz77_optimal<'a>(
 
     for i in 0..numiterations {
         currentstore.reset();
+        // Periodic real-Huffman re-anchor (ECT squeeze.c ~995-1019): at
+        // iterations 9, 30, and the last iteration (numiterations>5), price
+        // this iteration's DP against REAL RLE-optimized, length-limited
+        // code lengths derived from the best frequencies found so far,
+        // instead of the `calculate_entropy` proxy. See
+        // `SymbolStats::apply_real_huffman_lengths` doc.
+        if i == 9 || i == 30 || (i == numiterations - 1 && numiterations > 5) {
+            stats.apply_real_huffman_lengths(&beststats);
+        }
         let model = StatCost(&stats);
+        let mode = if i == 0 {
+            Mode::Store(&mut cache)
+        } else {
+            Mode::Replay(&mut cache)
+        };
         lz77_optimal_run(
-            s,
             in_,
             instart,
             inend,
@@ -562,8 +740,8 @@ pub fn lz77_optimal<'a>(
             &mut length_array,
             &model,
             &mut currentstore,
-            &mut h,
             &mut costs,
+            mode,
         );
         let cost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
         if s.options.verbose_more != 0 || (s.options.verbose != 0 && cost < bestcost) {
@@ -595,29 +773,206 @@ pub fn lz77_optimal<'a>(
         }
         lastcost = cost;
     }
+
+    // Extra seeds: the greedy seed above lands in a single basin, and zopfli's
+    // iterated-price loop is a basin-preserving fixed point. Two failure modes
+    // measured against the optimal-parse frontier: low-entropy data (DNA, runs)
+    // gets stuck OVER-matching (greedy over-matches → literals priced high),
+    // and structured/high-entropy data (CSV, binaries) gets stuck UNDER-matching
+    // (greedy under-anchors matches). Re-run the same iterated loop from two
+    // extra basin anchors and keep the global argmin by true block cost, so no
+    // input regresses:
+    //   • literal seed  → the literal-dominant basin (fixes DNA over-matching);
+    //   • fixed-price seed → the match-heavy basin (fixes structured
+    //     under-matching), mirroring the frontier's fixed-price iteration-0.
+    // The match cache is already primed, so every iteration below is a cheap
+    // replay.
+    let literal_seed = SymbolStats::from_literals(in_, instart, inend);
+    squeeze_from_seed(
+        in_,
+        instart,
+        inend,
+        numiterations,
+        literal_seed,
+        &mut cache,
+        &mut path,
+        &mut length_array,
+        &mut costs,
+        &mut currentstore,
+        store,
+        &mut bestcost,
+    );
+
+    // Fixed-price seed: one static-Huffman DP parse (replayed off the cache)
+    // seeds a match-heavy histogram.
+    currentstore.reset();
+    lz77_optimal_run(
+        in_,
+        instart,
+        inend,
+        &mut path,
+        &mut length_array,
+        &FixedCost,
+        &mut currentstore,
+        &mut costs,
+        Mode::Replay(&mut cache),
+    );
+    let fixed_cost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
+    if fixed_cost < bestcost {
+        store.reset();
+        store.append_from(&currentstore);
+        bestcost = fixed_cost;
+    }
+    let fixed_seed = SymbolStats::from_store(&currentstore);
+    squeeze_from_seed(
+        in_,
+        instart,
+        inend,
+        numiterations,
+        fixed_seed,
+        &mut cache,
+        &mut path,
+        &mut length_array,
+        &mut costs,
+        &mut currentstore,
+        store,
+        &mut bestcost,
+    );
+
+    // Ultra post-loop refinement (ECT squeeze.c ~1076-1096, the `ultra1`
+    // stage): re-squeeze the CURRENT global-best output against REAL
+    // RLE-optimized, length-limited Huffman code lengths derived from its
+    // own statistics (not the entropy proxy), replaying the already-primed
+    // match cache. Repeat while a candidate is strictly cheaper, stopping
+    // once the marginal improvement drops below ECT's ~80-bit threshold (or
+    // the candidate stops improving at all). This is the same real-Huffman
+    // idea as the periodic re-anchor above, but iterated to a fixed point
+    // AFTER all three basin-seeded loops (greedy/literal/fixed) have
+    // already settled — recovering the residual proxy-drift gap between
+    // `calculate_entropy`'s idealized cost and what the tree emitter will
+    // actually pay for the winning parse. Unconditional (not gated on
+    // `--ultra`/high `-F`): each round is one cheap cache replay, and the
+    // loop can never regress `store`/`bestcost` since a round only commits
+    // when strictly cheaper by true block cost.
+    loop {
+        let best_stats = SymbolStats::from_store(store);
+        let mut real_stats = best_stats.clone();
+        real_stats.apply_real_huffman_lengths(&best_stats);
+        currentstore.reset();
+        lz77_optimal_run(
+            in_,
+            instart,
+            inend,
+            &mut path,
+            &mut length_array,
+            &StatCost(&real_stats),
+            &mut currentstore,
+            &mut costs,
+            Mode::Replay(&mut cache),
+        );
+        let newcost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
+        if newcost < bestcost {
+            let improv = bestcost - newcost;
+            bestcost = newcost;
+            store.reset();
+            store.append_from(&currentstore);
+            if improv < 80.0 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// One iterated-price squeeze pass from a given `init` seed, replaying the
+/// already-primed match `cache`. Writes the caller's `store`/`bestcost`
+/// whenever a run beats the running global argmin (by true block cost), so
+/// adding a seed can only improve the result, never regress it. Factored out
+/// of `lz77_optimal` so the literal- and fixed-price basin anchors share one
+/// implementation.
+#[allow(clippy::too_many_arguments)]
+fn squeeze_from_seed<'a>(
+    in_: &'a [u8],
+    instart: usize,
+    inend: usize,
+    numiterations: i32,
+    mut stats: SymbolStats,
+    cache: &mut LzCache,
+    path: &mut Vec<u32>,
+    length_array: &mut [u32],
+    costs: &mut [f32],
+    currentstore: &mut LZ77Store<'a>,
+    store: &mut LZ77Store<'a>,
+    bestcost: &mut f64,
+) {
+    let mut beststats = SymbolStats::new();
+    let mut laststats = SymbolStats::new();
+    let mut lastcost: f64 = 0.0;
+    let mut ran_state = RanState::new();
+    let mut lastrandomstep: i32 = -1;
+    let mut seedbest = ZOPFLI_LARGE_FLOAT;
+    for i in 0..numiterations {
+        currentstore.reset();
+        // Periodic real-Huffman re-anchor — see the identical gate in
+        // `lz77_optimal`'s main loop and `SymbolStats::apply_real_huffman_lengths`.
+        if i == 9 || i == 30 || (i == numiterations - 1 && numiterations > 5) {
+            stats.apply_real_huffman_lengths(&beststats);
+        }
+        let model = StatCost(&stats);
+        lz77_optimal_run(
+            in_,
+            instart,
+            inend,
+            path,
+            length_array,
+            &model,
+            currentstore,
+            costs,
+            Mode::Replay(cache),
+        );
+        let cost = calculate_block_size(currentstore, 0, currentstore.size(), 2);
+        if cost < seedbest {
+            beststats.copy_from(&stats);
+            seedbest = cost;
+        }
+        if cost < *bestcost {
+            store.reset();
+            store.append_from(currentstore);
+            *bestcost = cost;
+        }
+        laststats.copy_from(&stats);
+        stats.clear_freqs();
+        stats = SymbolStats::from_store(currentstore);
+        if lastrandomstep != -1 {
+            stats.add_weighted(1.0, &laststats, 0.5);
+            stats.calculate_statistics();
+        }
+        if i > 5 && cost == lastcost {
+            stats.copy_from(&beststats);
+            ran_state.randomize_stat_freqs(&mut stats);
+            stats.calculate_statistics();
+            lastrandomstep = i;
+        }
+        lastcost = cost;
+    }
 }
 
 /// Single-shot squeeze under the fixed Huffman tree (btype=01). Mirrors
 /// `ZopfliLZ77OptimalFixed`. No iteration; the fixed tree is known so
 /// `FixedCost` is the optimal cost model.
 pub fn lz77_optimal_fixed<'a>(
-    s: &mut BlockState<'_>,
     in_: &'a [u8],
     instart: usize,
     inend: usize,
     store: &mut LZ77Store<'a>,
 ) {
     let blocksize = inend - instart;
-    let mut length_array = vec![0u16; blocksize + 1];
+    let mut length_array = vec![0u32; blocksize + 1];
     let mut costs = vec![0f32; blocksize + 1];
-    let mut path: Vec<u16> = Vec::new();
-    let mut h = ZopfliHash::new(ZOPFLI_WINDOW_SIZE);
-
-    s.blockstart = instart;
-    s.blockend = inend;
+    let mut path: Vec<u32> = Vec::new();
 
     lz77_optimal_run(
-        s,
         in_,
         instart,
         inend,
@@ -625,8 +980,8 @@ pub fn lz77_optimal_fixed<'a>(
         &mut length_array,
         &FixedCost,
         store,
-        &mut h,
         &mut costs,
+        Mode::NoCache,
     );
 }
 
@@ -695,10 +1050,13 @@ mod tests {
     }
 
     #[test]
-    fn cost_model_min_cost_fixed_is_finite() {
-        let m = cost_model_min_cost(&FixedCost);
-        assert!(m.is_finite());
-        assert!(m > 0.0);
+    fn len_dist_cost_split_sums_to_cost() {
+        // len_cost + dist_cost must equal the combined match cost for both
+        // models (the DP relies on this decomposition).
+        let f = FixedCost;
+        for &(len, dist) in &[(3u32, 1u32), (10, 5), (258, 32_768), (128, 1234)] {
+            assert!((f.len_cost(len) + f.dist_cost(dist) - f.cost(len, dist)).abs() < 1e-9);
+        }
     }
 
     #[test]

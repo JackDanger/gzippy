@@ -72,6 +72,24 @@ path = "src/main.rs"
 # behind dev/test code as differential oracles.)
 default = ["pure-rust-inflate"]
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
+# NO-OP since Increment 7. Historically this gated the pure-Rust DEFLATE encoder
+# onto the T1/T>1 routing alongside the C-FFI backends. As of Inc7 the pure-Rust
+# encoder is the SOLE production compress path unconditionally, so this feature
+# gates nothing. Retained as a defined (harmless) feature so any external
+# `--features pure-rust-encoder` invocation still resolves.
+pure-rust-encoder = []
+# ── Increment 7: differential-oracle C-FFI COMPRESSORS ────────────────────────
+# The pure-Rust DEFLATE encoder is the SOLE production compress path. The legacy
+# C-FFI compressors (flate2/zlib-ng streaming, libdeflate one-shot + "GZ"
+# multi-block ParallelGzEncoder, the SimpleOptimizer dispatcher, and the
+# PipelinedGzEncoder flate2 dictionary path) are removed from the production
+# routing graph but kept COMPILABLE behind this dev feature so the differential
+# oracle tests can assert the pure engine roundtrips through — and is no larger
+# than — the reference encoders at matched level. The shipped binary builds
+# WITHOUT `ffi-oracle`, so the default `cargo build` links ZERO FFI compressor.
+# (ISA-L compression is separately gated on `isal-compression`; DECODE FFI is a
+# distinct, always-available differential oracle and is out of scope here.)
+ffi-oracle = []
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the

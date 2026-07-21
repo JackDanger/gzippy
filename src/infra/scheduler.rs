@@ -299,6 +299,11 @@ fn worker_loop_timed<F>(
 ///
 /// Uses same pigz model: N workers + dedicated writer thread.
 /// Returns the writer so caller can write any trailer.
+///
+/// Increment 7: the only caller is the C-FFI `ParallelGzEncoder` ("GZ"
+/// multi-block) differential oracle, so this is compiled only under
+/// `ffi-oracle`. The pure production path uses `compress_parallel` instead.
+#[cfg(any(test, feature = "ffi-oracle"))]
 pub fn compress_parallel_independent<W, F>(
     input: &[u8],
     block_size: usize,

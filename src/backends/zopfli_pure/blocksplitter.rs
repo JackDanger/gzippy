@@ -1,21 +1,28 @@
 //! Block splitter: greedy bisection of an LZ77 stream into cheaper blocks.
 //! Port of Google Zopfli blocksplitter.c.
 
-use super::deflate_size::calculate_block_size_auto_type;
+use super::deflate_size::{calculate_block_size, calculate_block_size_auto_type};
 use super::hash::ZopfliHash;
 use super::lz77::{lz77_greedy, BlockState, LZ77Store};
 use super::symbols::{ZOPFLI_LARGE_FLOAT, ZOPFLI_WINDOW_SIZE};
 use super::ZopfliOptions;
+use std::collections::HashMap;
 
 /// Split-point search granularity for the recursive bisection. The C code
 /// hard-codes 9; keep it.
 const FIND_MINIMUM_NUM: usize = 9;
 
 /// Estimated bit cost of encoding `lz77[lstart..lend]` as a single block.
-/// Mirrors C `EstimateCost`; just dispatches to the auto-type sizer.
+///
+/// A/B (crown-secondary variant A): ECT's greedy splitter (blocksplitter.c
+/// `EstimateCost`, lines 44-98) prices candidate splits with the
+/// DYNAMIC-only cost, not gzippy's best-of-three (stored/fixed/dynamic)
+/// auto-type sizer. Switch the GREEDY SPLITTER's cost callback only — the
+/// final per-block emission still uses `calculate_block_size_auto_type`
+/// elsewhere (deflate.rs), unaffected by this function.
 #[inline]
 fn estimate_cost(lz77: &LZ77Store<'_>, lstart: usize, lend: usize) -> f64 {
-    calculate_block_size_auto_type(lz77, lstart, lend)
+    calculate_block_size(lz77, lstart, lend, 2)
 }
 
 /// `cost(start, i) + cost(i, end)` — the cost of splitting at `i`.
@@ -244,7 +251,13 @@ pub fn block_split_lz77(
             }
         }
 
-        if lend - lstart < 10 {
+        // UNCAP (crown-caps): ECT's ZopfliBlockSplitLZ77 carries no
+        // block-count ceiling — its only stop conditions are "no interval
+        // improves cost" (handled above via `done[lstart] = 1`) and "the
+        // remaining interval is <100 LZ77 symbols" (original zopfli used
+        // 10; bumped to mirror ECT and avoid runaway near-single-symbol
+        // recursion once `maxblocks` no longer bounds the loop).
+        if lend - lstart < 100 {
             break;
         }
     }
@@ -254,6 +267,160 @@ pub fn block_split_lz77(
     }
 
     splitpoints
+}
+
+// ── Recursive exact-cost splitter (optimal-parse frontier / ECT port) ────────
+
+/// Recursive divide-and-conquer block splitter over the LZ77 index range.
+/// Mirrors the optimal-parse frontier's `Splitter` (which produces block
+/// counts identical to ECT): at each node find the best interior split via
+/// 9-way narrowing *plus a brute-force scan over the final ≤9-position window*
+/// (the precision the greedy `find_minimum` omits — it breaks out of the
+/// narrowing without evaluating those last positions), and if it strictly
+/// reduces the exact block cost, split and recurse into BOTH halves.
+///
+/// `auto_type == false` uses dynamic-only cost (`calculate_block_size(..,2)`),
+/// matching ECT's `SplitCost` (3 + GetDynamicLengths + CalculateTreeSize);
+/// `true` uses the stored/fixed/dynamic best-of-three (`_auto_type`), matching
+/// the reference optimal-parse frontier's `Splitter` (fulcrum
+/// `src/ratio/squeeze.rs`), which always prices candidates with the true
+/// best-of-3 (`block_cost_exact`/`plan_block`) — this is what lets it see
+/// UNDER-split cases dynamic-only pricing is blind to (a near-random
+/// sub-region is far cheaper isolated into its own STORED block than forced
+/// through a shared dynamic table). But its narrowing walks a different cost
+/// surface and can converge to a different — occasionally worse — local
+/// optimum than `false`'s (measured on tool.bin). `deflate::deflate_part`
+/// therefore runs BOTH as independent whole `(lz77, splitpoints)`
+/// trajectories via `refine_split_and_squeeze` and keeps whichever final
+/// result is cheaper by true cost, rather than picking one exclusively.
+struct RecursiveSplitter<'a, 'b> {
+    lz77: &'a LZ77Store<'b>,
+    memo: HashMap<(usize, usize), f64>,
+    auto_type: bool,
+}
+
+impl RecursiveSplitter<'_, '_> {
+    /// Exact block cost of `lz77[a..b]`, memoized per `(a, b)`.
+    fn cost(&mut self, a: usize, b: usize) -> f64 {
+        if let Some(&c) = self.memo.get(&(a, b)) {
+            return c;
+        }
+        let c = if self.auto_type {
+            calculate_block_size_auto_type(self.lz77, a, b)
+        } else {
+            calculate_block_size(self.lz77, a, b, 2)
+        };
+        self.memo.insert((a, b), c);
+        c
+    }
+
+    /// Minimise `cost(a,s)+cost(s,b)` over `s` in `(a, b)` with zopfli's 9-way
+    /// narrowing, then brute-force the final window. Returns `(best_s,
+    /// best_c)`; `best_c == ZOPFLI_LARGE_FLOAT` ⇒ no interior split exists.
+    fn best_split_in(&mut self, a: usize, b: usize) -> (usize, f64) {
+        if b < a + 2 {
+            return (a, ZOPFLI_LARGE_FLOAT);
+        }
+        let start = a + 1;
+        let end = b - 1; // inclusive search bounds for s
+        const NUM: usize = FIND_MINIMUM_NUM;
+        if end - start < NUM {
+            let mut best_s = start;
+            let mut best_c = ZOPFLI_LARGE_FLOAT;
+            for s in start..=end {
+                let c = self.cost(a, s) + self.cost(s, b);
+                if c < best_c {
+                    best_c = c;
+                    best_s = s;
+                }
+            }
+            return (best_s, best_c);
+        }
+        let mut lo = start;
+        let mut hi = end;
+        let mut best_s = start;
+        let mut best_c = ZOPFLI_LARGE_FLOAT;
+        let mut last = ZOPFLI_LARGE_FLOAT;
+        loop {
+            if hi - lo < NUM {
+                for s in lo..=hi {
+                    let c = self.cost(a, s) + self.cost(s, b);
+                    if c < best_c {
+                        best_c = c;
+                        best_s = s;
+                    }
+                }
+                break;
+            }
+            let step = (hi - lo) / (NUM + 1);
+            let mut p = [0usize; NUM];
+            let mut vp = [0f64; NUM];
+            let mut bi = 0;
+            for i in 0..NUM {
+                p[i] = lo + (i + 1) * step;
+                vp[i] = self.cost(a, p[i]) + self.cost(p[i], b);
+                if vp[i] < vp[bi] {
+                    bi = i;
+                }
+            }
+            if vp[bi] < best_c {
+                best_c = vp[bi];
+                best_s = p[bi];
+            }
+            if vp[bi] >= last {
+                break;
+            }
+            last = vp[bi];
+            lo = if bi == 0 { lo } else { p[bi - 1] };
+            hi = if bi == NUM - 1 { hi } else { p[bi + 1] };
+        }
+        (best_s, best_c)
+    }
+
+    /// Split `(a, b)` at its best interior boundary iff that strictly reduces
+    /// the exact cost, then recurse into both halves. `cap` bounds the total
+    /// number of interior split points collected.
+    fn recurse(&mut self, a: usize, b: usize, splits: &mut Vec<usize>, cap: usize) {
+        if splits.len() >= cap || b < a + 2 {
+            return;
+        }
+        let whole = self.cost(a, b);
+        let (best_s, best_c) = self.best_split_in(a, b);
+        if best_c < whole && best_s > a && best_s < b {
+            splits.push(best_s);
+            self.recurse(a, best_s, splits, cap);
+            self.recurse(best_s, b, splits, cap);
+        }
+    }
+}
+
+/// Recursive exact-cost split of an already-built LZ77 stream. Returns the
+/// sorted LZ77-index split points. `maxblocks` caps the block count (as in the
+/// greedy splitter: at most `maxblocks - 1` interior splits); `0` ⇒ unbounded.
+/// `auto_type` selects the cost model (see `RecursiveSplitter`).
+pub fn block_split_lz77_recursive(
+    lz77: &LZ77Store<'_>,
+    maxblocks: usize,
+    auto_type: bool,
+) -> Vec<usize> {
+    if lz77.size() < 10 {
+        return Vec::new();
+    }
+    let cap = if maxblocks > 0 {
+        maxblocks.saturating_sub(1)
+    } else {
+        usize::MAX
+    };
+    let mut sp = RecursiveSplitter {
+        lz77,
+        memo: HashMap::new(),
+        auto_type,
+    };
+    let mut splits: Vec<usize> = Vec::new();
+    sp.recurse(0, lz77.size(), &mut splits, cap);
+    splits.sort_unstable();
+    splits.dedup();
+    splits
 }
 
 /// Convenience wrapper: greedy-parse `in_[instart..inend]`, split the LZ77

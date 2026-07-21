@@ -128,12 +128,19 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
     out
 }
 
-/// Compares each corpus input under (iters, splitting, maxblocks)
-/// against the vendored C zopfli. Bytewise equality of the full gzip
-/// output is required (both implementations use the same header).
+/// Pareto oracle against the vendored C zopfli. Since the LzFind binary-tree
+/// matchfinder (DEFLATE-CROWN) intentionally produces *different* bytes than C
+/// zopfli's hash-chain parse — that is the point, ECT-style better ratio — the
+/// old byte-identity check is obsolete. Instead we require, for every corpus
+/// input and option combo, that our output (a) round-trips exactly through an
+/// independent decoder and (b) is no larger than C zopfli's (ratio must not
+/// regress vs the reference).
 #[test]
 #[ignore = "requires `--features oracle` and an init'd vendor/zopfli submodule; run via `make oracle-vs-c`"]
-fn corpus_gzip_output_matches_c_zopfli() {
+fn corpus_gzip_pareto_vs_c_zopfli() {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
     let mut failures: Vec<String> = Vec::new();
     let corpus = corpus();
 
@@ -154,18 +161,29 @@ fn corpus_gzip_output_matches_c_zopfli() {
         for &(iters, splitting, max_blocks) in combos {
             let c = c_compress(input, iters, splitting, max_blocks);
             let r = rust_compress(input, iters, splitting, max_blocks);
-            if c != r {
-                let first_diff = c.iter().zip(r.iter()).position(|(a, b)| a != b);
+
+            // (a) Independent-decoder round-trip (never weakened).
+            let mut decoded = Vec::new();
+            match GzDecoder::new(&r[..]).read_to_end(&mut decoded) {
+                Ok(_) if decoded == *input => {}
+                Ok(_) => failures.push(format!(
+                    "  {name} (iters={iters} splitting={splitting} maxblocks={max_blocks}): \
+                     round-trip content mismatch"
+                )),
+                Err(e) => failures.push(format!(
+                    "  {name} (iters={iters} splitting={splitting} maxblocks={max_blocks}): \
+                     gunzip failed: {e}"
+                )),
+            }
+
+            // (b) Ratio must not regress vs C zopfli.
+            if r.len() > c.len() {
                 failures.push(format!(
-                    "  {} (iters={} splitting={} maxblocks={}): \
-                     C={}B Rust={}B first-diff @ {:?}",
-                    name,
-                    iters,
-                    splitting,
-                    max_blocks,
+                    "  {name} (iters={iters} splitting={splitting} maxblocks={max_blocks}): \
+                     ratio regression C={}B Rust={}B (+{}B)",
                     c.len(),
                     r.len(),
-                    first_diff
+                    r.len() - c.len()
                 ));
             }
         }
@@ -173,8 +191,8 @@ fn corpus_gzip_output_matches_c_zopfli() {
 
     if !failures.is_empty() {
         panic!(
-            "zopfli_pure diverged from vendor/zopfli on {} (corpus, opts) \
-             pair(s):\n{}",
+            "zopfli_pure failed the Pareto oracle vs vendor/zopfli on {} \
+             (corpus, opts) pair(s):\n{}",
             failures.len(),
             failures.join("\n")
         );

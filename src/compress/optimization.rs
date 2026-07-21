@@ -24,6 +24,9 @@ pub struct OptimizationConfig {
     pub content_type: ContentType,
     #[allow(dead_code)]
     pub use_numa_pinning: bool,
+    // Read only by the C-FFI `SimpleOptimizer` oracle (Increment 7); the pure
+    // production path takes the level straight from `GzippyArgs`.
+    #[allow(dead_code)]
     pub compression_level: u8,
 }
 

@@ -11,6 +11,8 @@ pub mod fixtures; // generated test fixtures (deterministic random data)
 pub mod alloc_budget;
 pub mod compress_oracle;
 pub mod correctness;
+pub mod deflate_encoder_foundation;
+pub mod deflate_encoder_matches;
 pub mod diff_multi_oracle;
 pub mod diff_ratio;
 pub mod golden;
@@ -21,6 +23,7 @@ pub mod inflate_proptest;
 pub mod latch_interleave;
 pub mod multi_member_chunked;
 pub mod phantom_eos_probe;
+pub mod pure_parallel_encoder;
 pub mod pure_rust_inflate_corpus;
 pub mod resumable_correctness;
 pub mod routing;
