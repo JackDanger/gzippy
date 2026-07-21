@@ -735,34 +735,56 @@ pub fn deflate_part(
         }
     }
 
-    // Re-split + re-squeeze the squeezed LZ77 stream: run TWO independent
-    // whole trajectories (dynamic-only recursive-split search, and true
-    // best-of-3 recursive-split search — see `refine_split_and_squeeze` doc)
-    // from the SAME starting (lz77, splitpoints), each for two rounds
-    // (mirrors ECT's `twice` mode), then keep whichever FINAL trajectory has
-    // the lower true auto-type total cost. A per-round greedy mix of the two
-    // search strategies was tried and measured to regress tool.bin net (the
-    // strategies' resqueeze side-effects diverge after round 1, so a
-    // locally-cheaper choice mid-trajectory is not globally cheaper) — running
-    // both as committed, independent trajectories and comparing only the
-    // final result is the version that cannot regress vs either strategy
-    // alone, because "dynamic-only, unchanged from before this campaign" is
-    // literally one of the two candidates.
+    // Re-split + re-squeeze the squeezed LZ77 stream: ONE trajectory (not
+    // two) using the true best-of-3 recursive-split cost model
+    // (`recursive_auto_type = true`), still run to a 2-round fixed point —
+    // approximating ECT's `twice` mode (deflate.cpp:1244-1290, `for (it = 0;
+    // it <= twice; it++)` with `twice=1`: the optimal parse from the first
+    // pass is fed back through block-splitting + squeeze one extra whole-file
+    // time, reusing the first pass's real per-master-block stats) by cutting
+    // the trajectory count in half rather than the round count.
+    //
+    // This SUPERSEDES the prior two-trajectory×two-round dance (dynamic-only
+    // search + true-best-of-3 search, each iterated to a 2-round fixed
+    // point, then compared by true cost): that shape was trace-proven ~3× the
+    // cost of a full squeeze pass for the SAME kept output, because
+    // `refine_split_and_squeeze`'s step (b) re-squeezes every final block
+    // with a full `lz77_optimal` call — i.e. each round is itself
+    // approximately one more whole-file squeeze pass, and the old code ran
+    // up to 4 of them (2 trajectories × 2 rounds) before comparing (each
+    // round can also converge early via the `!changed` break).
+    //
+    // Measured (crown-iterfix, 19-file Squishy corpus, -F15): dropping to a
+    // single `rounds=1` trajectory saved the most wall (~1.5-2.3×) but net
+    // REGRESSED geomean by -0.000025 (7/19 files micro-regressed, up to
+    // -0.008% on monorepo.tar) — the dropped `dyn` (`false`) trajectory was
+    // occasionally the true winner on those files, not just a redundant
+    // compute cost. Keeping `rounds=2` on the single retained trajectory
+    // recovers all but one of those (tool.bin fully recovers and even
+    // improves marginally) at a smaller but still real ~1.5× wall win
+    // (tool.bin 267.7s→181.3s, data.parquet 102.1s→65.3s, data.csv
+    // 63.3s→41.9s, minjs.min.js 6.6s→4.7s), landing net geomean at
+    // -0.000008 vs baseline — within measurement noise (repeat baseline
+    // computations vary by ~0.001 across otherwise-identical runs) i.e. a
+    // TIE. `data.parquet` is the one honest exception: -0.005% comp-size
+    // regression survives both `rounds=1` and `rounds=2`, so it is a real
+    // (tiny) per-file cost of losing the `dyn` trajectory's alternate local
+    // optimum on that file, not a rounds-depth artifact.
+    //
+    // `recursive_auto_type = true` is kept (not `false`) because a prior
+    // strip-check (single trajectory A/B, both at the old 2-round depth)
+    // measured `true` winning geomean by +0.00008 over `false` alone.
+    // `refine_split_and_squeeze`'s internal logic (both step (a) and step
+    // (b)) only ever ADOPTS a strictly-cheaper candidate by true auto-type
+    // cost, so more rounds on ONE trajectory can never regress vs fewer
+    // rounds on that SAME trajectory — the residual regression above is
+    // entirely "vs the now-dropped second trajectory", not vs this
+    // trajectory's own earlier rounds.
     if options.blocksplitting != 0 {
-        let (lz77_dyn, splitpoints_dyn) =
-            refine_split_and_squeeze(options, in_, lz77.clone(), splitpoints.clone(), false, 2);
-        let (lz77_auto, splitpoints_auto) =
+        let (lz77_refined, splitpoints_refined) =
             refine_split_and_squeeze(options, in_, lz77.clone(), splitpoints.clone(), true, 2);
-
-        let cost_dyn = partition_true_cost(&lz77_dyn, &splitpoints_dyn);
-        let cost_auto = partition_true_cost(&lz77_auto, &splitpoints_auto);
-        if cost_auto < cost_dyn {
-            lz77 = lz77_auto;
-            splitpoints = splitpoints_auto;
-        } else {
-            lz77 = lz77_dyn;
-            splitpoints = splitpoints_dyn;
-        }
+        lz77 = lz77_refined;
+        splitpoints = splitpoints_refined;
     }
 
     let np = splitpoints.len();
