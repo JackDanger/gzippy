@@ -13,10 +13,16 @@ use std::collections::HashMap;
 const FIND_MINIMUM_NUM: usize = 9;
 
 /// Estimated bit cost of encoding `lz77[lstart..lend]` as a single block.
-/// Mirrors C `EstimateCost`; just dispatches to the auto-type sizer.
+///
+/// A/B (crown-secondary variant A): ECT's greedy splitter (blocksplitter.c
+/// `EstimateCost`, lines 44-98) prices candidate splits with the
+/// DYNAMIC-only cost, not gzippy's best-of-three (stored/fixed/dynamic)
+/// auto-type sizer. Switch the GREEDY SPLITTER's cost callback only — the
+/// final per-block emission still uses `calculate_block_size_auto_type`
+/// elsewhere (deflate.rs), unaffected by this function.
 #[inline]
 fn estimate_cost(lz77: &LZ77Store<'_>, lstart: usize, lend: usize) -> f64 {
-    calculate_block_size_auto_type(lz77, lstart, lend)
+    calculate_block_size(lz77, lstart, lend, 2)
 }
 
 /// `cost(start, i) + cost(i, end)` — the cost of splitting at `i`.
