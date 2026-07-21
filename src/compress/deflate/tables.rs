@@ -17,7 +17,6 @@ pub const DEFLATE_MAX_MATCH_LEN: u32 = 258;
 pub const DEFLATE_NUM_PRECODE_SYMS: usize = 19;
 pub const DEFLATE_NUM_LITLEN_SYMS: usize = 288;
 pub const DEFLATE_NUM_OFFSET_SYMS: usize = 32;
-pub const DEFLATE_MAX_NUM_SYMS: usize = 288;
 
 /// First litlen symbol that represents a match length (symbol 257 => slot 0).
 pub const DEFLATE_FIRST_LEN_SYM: usize = 257;
@@ -26,7 +25,6 @@ pub const DEFLATE_END_OF_BLOCK: usize = 256;
 
 pub const DEFLATE_MAX_PRE_CODEWORD_LEN: u32 = 7;
 pub const DEFLATE_MAX_OFFSET_CODEWORD_LEN: u32 = 15;
-pub const DEFLATE_MAX_CODEWORD_LEN: u32 = 15;
 
 // libdeflate uses a slightly-tighter litlen limit than the format max; it is
 // still a valid, decodable code (2^14 >= 288).

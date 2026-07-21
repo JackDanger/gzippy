@@ -21,9 +21,20 @@
 //! `pipelined::compress_buffer_pure`) — with the C-FFI backends removed from the
 //! routing graph.
 //!
-//! Some substrate primitives are used only by later increments (near-optimal
-//! parsing), so `dead_code` is allowed module-wide.
-#![allow(dead_code)]
+//! Dead-code audit (Stage E, docs/compressor-architecture.md §5-E,
+//! 2026-07-21): the blanket `#![allow(dead_code)]` this module carried since
+//! Increment 1 ("some substrate primitives are used only by later
+//! increments") is REMOVED — near-optimal/ultra landed in Stages A-D, so the
+//! excuse no longer holds, and a `cargo build --release` with the allow
+//! stripped is now warning-clean. Five genuinely-unreferenced items found
+//! that way were deleted (`BitWriter::with_capacity`/`buffered_bits`,
+//! `HcMatchfinder::reset`, `tables::DEFLATE_MAX_NUM_SYMS`/
+//! `DEFLATE_MAX_CODEWORD_LEN` — zero callers in production OR tests). One
+//! item, `level::max_passthrough_size`, has test coverage but no production
+//! call site (a libdeflate port never wired into the near-optimal entry
+//! point); it keeps its own narrow `#[allow(dead_code)]` with a doc note
+//! rather than a blanket module allow, so the compiler will flag anything
+//! ELSE that goes dead in the future.
 
 pub mod bitstream;
 pub mod block_split;
@@ -220,7 +231,13 @@ pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u
 /// Port of the uncompressed-block emission in `deflate_flush_block` (~:1826).
 /// A stored sub-block carries at most 65535 bytes, so long inputs use several;
 /// `is_final` marks the last sub-block BFINAL.
-fn emit_stored_block(bw: &mut BitWriter, data: &[u8], is_final: bool) {
+///
+/// `pub(crate)` (Stage E, docs/compressor-architecture.md §5-E): also the
+/// single source of stored-block FRAMING for `compress::deflate64`'s
+/// empty-input special case (BFINAL=1/BTYPE=00/LEN=0/NLEN=0xFFFF) — the
+/// wire format is format-law, not tier-specific, so it dedupes across both
+/// encoders exactly like the gzip wrapper.
+pub(crate) fn emit_stored_block(bw: &mut BitWriter, data: &[u8], is_final: bool) {
     if data.is_empty() {
         write_stored_subblock(bw, &[], is_final);
         return;

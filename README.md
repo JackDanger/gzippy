@@ -88,12 +88,6 @@ let n = gzippy::compress_to_writer(reader, writer, 6)?;
 
 `decompress_to_writer` streams the other direction. Full API: `cargo doc --open`.
 
-## One caveat
-
-With `threads > 1` at levels 0-5, gzippy emits its own "GZ" multi-block
-format for maximum parallel speed. Only gzippy reads it. Use one thread or
-levels 6-9 when the output must be plain gzip. Details in `man gzippy-format`.
-
 ## Credits
 
 Built on ideas and code from [pigz](https://zlib.net/pigz/) (Mark Adler),

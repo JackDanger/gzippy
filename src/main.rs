@@ -565,7 +565,7 @@ fn print_help() {
     println!("  -1..-9              Compression level (1=fast, 9=best, default=6)");
     println!("  --level N           Set compression level 1-12");
     println!("  --ultra             True zopfli (level 11, single-member; -p tunes intra-block parallelism only)");
-    println!("  --max               Maximum compression (level 12, libdeflate near-zopfli)");
+    println!("  --max               Maximum compression (level 12, near-optimal parse, near-zopfli ratio)");
     println!("  -c, --stdout        Write to stdout, keep original files");
     println!("  -d, --decompress    Decompress");
     println!("  -f, --force         Force overwrite / compress links / pass-through");
@@ -592,10 +592,9 @@ fn print_help() {
     println!("  -V, --version       Show version");
     println!("  -L, --license       Show license");
     println!();
-    println!("Compression levels:");
-    println!("  1-6              Fast (libdeflate, parallel decompress)");
-    println!("  7-9              Balanced (zlib-ng, gzip-compatible)");
-    println!("  10,12            libdeflate ultra (near-zopfli ratio, parallel)");
+    println!("Compression levels (one pure-Rust DEFLATE engine, no C-FFI compressor):");
+    println!("  1-9              Fast/balanced (hash-chain + lazy parse; ratio tracks libdeflate)");
+    println!("  10,12            Near-optimal parse (near-zopfli ratio, parallel)");
     println!("  11               True zopfli (single-member, slowest, best ratio)");
     println!();
     println!("Examples:");

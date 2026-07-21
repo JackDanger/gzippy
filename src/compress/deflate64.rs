@@ -2,15 +2,71 @@
 ///
 /// Produces a raw Deflate64 bitstream.  Greedy LZ77 + dynamic Huffman per block.
 /// Hash-3 chain match finder; window = 65536; chain depth = 32; max length = 65538.
-use crate::error::{GzippyError, GzippyResult};
+///
+/// CLI-unreachable (public library API only, re-exported at the crate root as
+/// [`crate::compress_deflate64`] / [`crate::compress_deflate64_to_writer`]); it
+/// carries no byte-identity constituency (see
+/// `docs/compressor-architecture.md` §5-E "Stage E: POLISH"), so — unlike the
+/// main `compress::deflate` engine — its output may change so long as it stays
+/// correct (decodable, byte-perfect roundtrip through
+/// [`crate::decompress::deflate64::decompress_deflate64`]).
+///
+/// Bitstream emission, exact length-limited Huffman construction, the
+/// dynamic-header RLE wire format, and stored-block framing are ALL format-
+/// LAW shared with the main `compress::deflate` engine (see
+/// `docs/compressor-architecture.md` §2/§5-E) and are instantiated directly
+/// from `compress::deflate::{bitstream, huffman::optimal, huffman::header}`
+/// below — no format-agnostic logic is reimplemented here.
+///
+/// Two pieces stay genuinely private because the FORMAT differs, not by
+/// oversight:
+///
+/// - **Length/distance code tables** ([`LENGTH_BASE`]/[`LENGTH_EXTRA`]/
+///   [`DIST_BASE`]/[`DIST_EXTRA`]): Deflate64 extends litlen symbol 285 to a
+///   16-extra-bit code (length up to 65538, vs. plain DEFLATE's fixed
+///   length-258 symbol 285) and adds distance codes 30/31 for the 64 KiB
+///   window (vs. plain DEFLATE's 30-code, 32 KiB table in
+///   `compress::deflate::tables`). Different RFC tables, not a dedup gap.
+/// - **The match finder** ([`MatchFinder`]): `compress::deflate::matchfinder::hc`
+///   (the shared hash-chain matchfinder) hard-codes a 32 KiB window via
+///   SIGNED `i16` chain positions (`WINDOW_SIZE = 1 << 15`,
+///   `MATCHFINDER_INITVAL = i16::MIN`, sentinel/rebase arithmetic throughout
+///   `matchfinder/common.rs` + `matchfinder/hc.rs`); `i16` cannot address a
+///   64 KiB window at all (max magnitude 32768 < 65536), so Deflate64 cannot
+///   reuse it without widening every position field to `i32`/`u32` across a
+///   heavily pinned, gated hot module — out of scope for a format module with
+///   no performance constituency. Likewise `matchfinder::common::LzMatch`
+///   (the shared match-list vocabulary type used by `bt`/`lzfind`) packs
+///   length/offset as `u16`, which cannot represent Deflate64's length-65538 /
+///   offset-65536 range either way. [`MatchFinder`] DOES reuse
+///   `matchfinder::common::lz_extend` for the match-length extension inner
+///   loop (see below) — that primitive's contract (`str_pos + max_len <=
+///   data.len()`) is format-independent and Deflate64's own bounds satisfy it
+///   exactly.
+use crate::compress::deflate::bitstream::BitWriter;
+use crate::compress::deflate::emit_stored_block;
+use crate::compress::deflate::huffman::header::build_dynamic_header;
+use crate::compress::deflate::huffman::optimal::{calculate_bit_lengths, lengths_to_symbols};
+use crate::compress::deflate::matchfinder::common::lz_extend;
+use crate::error::GzippyResult;
 
 // ---------------------------------------------------------------------------
-// Constants — identical to the decoder's tables.
+// Constants — identical to the decoder's tables. Deflate64-specific (see
+// module doc: extended length code 285 / distance codes 30-31 vs. the
+// 32 KiB-window RFC tables in `compress::deflate::tables`).
 // ---------------------------------------------------------------------------
 
 const WINDOW: usize = 65536;
 const BLOCK_TOKENS: usize = 16384;
 const CHAIN_DEPTH: usize = 32;
+
+/// Number of literal/length symbols Deflate64 ever emits (0..=285); the
+/// shared [`build_dynamic_header`] trims/pads alphabets itself, so this is
+/// sized to exactly what this encoder uses (no reserved 286/287 filler).
+const NUM_LITLEN_SYMS: usize = 286;
+/// Number of distance symbols (Deflate64 adds slots 30/31 for the 64 KiB
+/// window; plain DEFLATE stops at 30).
+const NUM_DIST_SYMS: usize = 32;
 
 #[rustfmt::skip]
 const LENGTH_BASE: [u32; 29] = [
@@ -48,14 +104,13 @@ const DIST_EXTRA: [u8; 32] = [
     14, 14,
 ];
 
-const CL_ORDER: [usize; 19] = [
-    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-];
-
 // ---------------------------------------------------------------------------
 // Token
 // ---------------------------------------------------------------------------
 
+/// Not `matchfinder::common::LzMatch` — see module doc (`LzMatch`'s `u16`
+/// length/offset fields cannot hold Deflate64's length-65538/offset-65536
+/// range).
 #[derive(Clone, Copy)]
 enum Token {
     Literal(u8),
@@ -63,77 +118,13 @@ enum Token {
 }
 
 // ---------------------------------------------------------------------------
-// Bit writer — LSB-first within bytes, MSB-first for Huffman codes.
-// ---------------------------------------------------------------------------
-
-struct BitWriter {
-    out: Vec<u8>,
-    cur: u8,
-    nbits: u8,
-}
-
-impl BitWriter {
-    fn new() -> Self {
-        Self {
-            out: Vec::new(),
-            cur: 0,
-            nbits: 0,
-        }
-    }
-
-    #[inline]
-    fn write_bit(&mut self, bit: u8) {
-        self.cur |= bit << self.nbits;
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
-        }
-    }
-
-    /// Write `n` bits of `val`, LSB first (block headers, extra bits, etc.).
-    #[inline]
-    fn write_lsb(&mut self, mut val: u64, n: u8) {
-        for _ in 0..n {
-            self.write_bit((val & 1) as u8);
-            val >>= 1;
-        }
-    }
-
-    /// Write a canonical Huffman code: `n` bits, MSB first.
-    /// The encoder stores codes in natural (MSB-first) form; to emit via
-    /// LSB-first writer we reverse the bits within the code length.
-    #[inline]
-    fn write_code(&mut self, code: u32, len: u8) {
-        // Reverse `len` bits of `code` then emit LSB-first.
-        let mut rev = 0u32;
-        let mut v = code;
-        for _ in 0..len {
-            rev = (rev << 1) | (v & 1);
-            v >>= 1;
-        }
-        self.write_lsb(rev as u64, len);
-    }
-
-    fn flush(mut self) -> Vec<u8> {
-        if self.nbits > 0 {
-            self.out.push(self.cur);
-        }
-        self.out
-    }
-
-    /// Flush only fully-completed bytes to `w`; the partial byte in `self.cur`
-    /// is retained so subsequent blocks continue in the same bit stream.
-    fn flush_to<W: std::io::Write>(&mut self, w: &mut W) -> GzippyResult<()> {
-        w.write_all(&self.out)?;
-        self.out.clear();
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Match finder — hash-3 chain, window = 65536, depth = 32.
+//
+// Genuinely private: see the module doc for why the shared
+// `matchfinder::hc::HcMatchfinder` (32 KiB window, `i16` positions) cannot
+// address Deflate64's 64 KiB window. The match-length EXTENSION step below
+// does reuse the shared, format-independent `lz_extend` word-at-a-time
+// primitive in place of a hand-rolled byte loop.
 // ---------------------------------------------------------------------------
 
 struct MatchFinder {
@@ -203,10 +194,12 @@ impl MatchFinder {
             }
             // Quick check: first bytes must match.
             if data[cur_pos] == data[pos] {
-                let mut ml = 1u32;
-                while ml < max_len && data[cur_pos + ml as usize] == data[pos + ml as usize] {
-                    ml += 1;
-                }
+                // `lz_extend`'s contract (`str_pos + max_len <= data.len()` and
+                // `match_pos + max_len <= data.len()`) holds here: `cur_pos <
+                // pos` and `max_len <= n - pos`, so `cur_pos + max_len < pos +
+                // max_len <= n == data.len()` (and likewise for `pos`). Byte 0
+                // is already confirmed equal above, hence `start_len = 1`.
+                let ml = lz_extend(data, pos, cur_pos, 1, max_len);
                 if ml >= 3 && ml > best_len {
                     best_len = ml;
                     best_dist = dist as u32;
@@ -251,171 +244,21 @@ fn dist_code(dist: u32) -> (u32, u8, u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Package-merge length-limited Huffman (max_len bits, RFC 1951 §3.2.2).
-// ---------------------------------------------------------------------------
-
-fn package_merge(freqs: &[u32], max_len: u8) -> Vec<u8> {
-    let n = freqs.len();
-    // Symbols with freq > 0.
-    let active: Vec<usize> = (0..n).filter(|&i| freqs[i] > 0).collect();
-    let m = active.len();
-
-    if m == 0 {
-        return vec![0u8; n];
-    }
-    if m == 1 {
-        // Single symbol — assign length 1 (can't have length 0 in a valid tree).
-        let mut lens = vec![0u8; n];
-        lens[active[0]] = 1;
-        return lens;
-    }
-
-    // Package-merge requires per-symbol counts, not a set: the same symbol can
-    // appear in multiple selected packages, and its code length = total appearances.
-    // u16 fits 2^15 = 32768 (max possible count at level 15).
-    let mut items: Vec<(u64, Vec<u16>)> = active
-        .iter()
-        .enumerate()
-        .map(|(idx, &sym)| {
-            let mut counts = vec![0u16; m];
-            counts[idx] = 1;
-            (freqs[sym] as u64, counts)
-        })
-        .collect();
-    items.sort_by_key(|(w, _)| *w);
-
-    let mut prev_level = items.clone();
-    for _ in 0..(max_len - 1) {
-        let mut packages: Vec<(u64, Vec<u16>)> = prev_level
-            .chunks(2)
-            .filter(|c| c.len() == 2)
-            .map(|c| {
-                let w = c[0].0.saturating_add(c[1].0);
-                let mut counts = c[0].1.clone();
-                for (a, b) in counts.iter_mut().zip(c[1].1.iter()) {
-                    *a = a.saturating_add(*b);
-                }
-                (w, counts)
-            })
-            .collect();
-
-        packages.extend_from_slice(&items);
-        packages.sort_by_key(|(w, _)| *w);
-        prev_level = packages;
-    }
-
-    let take = 2 * m - 2;
-    let selected = &prev_level[..take.min(prev_level.len())];
-
-    let mut totals = vec![0u32; m];
-    for (_, counts) in selected {
-        for (i, &c) in counts.iter().enumerate() {
-            totals[i] += c as u32;
-        }
-    }
-
-    let mut lens = vec![0u8; n];
-    for (idx, &sym) in active.iter().enumerate() {
-        lens[sym] = totals[idx] as u8;
-    }
-    lens
-}
-
-// ---------------------------------------------------------------------------
-// Canonical code assignment from lengths (RFC 1951 §3.2.2).
-// ---------------------------------------------------------------------------
-
-fn assign_codes(lens: &[u8]) -> Vec<u32> {
-    let max_len = *lens.iter().max().unwrap_or(&0) as usize;
-    let mut bl_count = vec![0u32; max_len + 1];
-    for &l in lens {
-        if l > 0 {
-            bl_count[l as usize] += 1;
-        }
-    }
-    let mut next_code = vec![0u32; max_len + 2];
-    let mut code = 0u32;
-    for bits in 1..=max_len {
-        code = (code + bl_count[bits - 1]) << 1;
-        next_code[bits] = code;
-    }
-    let mut codes = vec![0u32; lens.len()];
-    for (i, &l) in lens.iter().enumerate() {
-        if l > 0 {
-            codes[i] = next_code[l as usize];
-            next_code[l as usize] += 1;
-        }
-    }
-    codes
-}
-
-// ---------------------------------------------------------------------------
-// RLE-encode combined lit+dist length array using the CL alphabet.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-enum ClSym {
-    Lit(u8),      // 0..=15
-    Repeat16(u8), // 16: repeat prev, extra = count-3 (0..=3)
-    Zeros17(u8),  // 17: repeat zero, extra = count-3 (0..=7)
-    Zeros18(u8),  // 18: repeat zero, extra = count-11 (0..=127)
-}
-
-fn rle_lengths(lens: &[u8]) -> Vec<ClSym> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lens.len() {
-        let l = lens[i];
-        if l == 0 {
-            // Count run of zeros.
-            let mut run = 1;
-            while i + run < lens.len() && lens[i + run] == 0 && run < 138 {
-                run += 1;
-            }
-            if run >= 11 {
-                out.push(ClSym::Zeros18((run - 11) as u8));
-            } else if run >= 3 {
-                out.push(ClSym::Zeros17((run - 3) as u8));
-            } else {
-                for _ in 0..run {
-                    out.push(ClSym::Lit(0));
-                }
-            }
-            i += run;
-        } else {
-            out.push(ClSym::Lit(l));
-            i += 1;
-            // Count run of identical non-zero value.
-            let mut run = 0;
-            while i + run < lens.len() && lens[i + run] == l && run < 6 {
-                run += 1;
-            }
-            if run >= 3 {
-                out.push(ClSym::Repeat16((run - 3) as u8));
-                i += run;
-            }
-        }
-    }
-    out
-}
-
-fn cl_sym_index(sym: &ClSym) -> usize {
-    match sym {
-        ClSym::Lit(l) => *l as usize,
-        ClSym::Repeat16(_) => 16,
-        ClSym::Zeros17(_) => 17,
-        ClSym::Zeros18(_) => 18,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Block encoder — build tokens, Huffman tables, emit dynamic block.
+//
+// Huffman construction (exact length-limiting) and the dynamic-header
+// precode/RLE wire format are instantiated from the shared modules —
+// `huffman::optimal` (Zopfli-class boundary-PM package-merge, the same
+// algorithm class this file used to hand-roll) and `huffman::header`
+// (libdeflate-derived precode/RLE builder, format-agnostic: it operates on
+// arbitrary-length litlen/offset codeword-length slices, trimming/padding
+// alphabets itself). See the module doc for what stays private and why.
 // ---------------------------------------------------------------------------
 
-fn emit_block(tokens: &[Token], bfinal: u8, bw: &mut BitWriter) -> GzippyResult<()> {
+fn emit_block(tokens: &[Token], bfinal: u8, bw: &mut BitWriter) {
     // --- Frequency counting ---
-    let mut lit_freq = [0u32; 286];
-    let mut dist_freq = [0u32; 32];
+    let mut lit_freq = [0usize; NUM_LITLEN_SYMS];
+    let mut dist_freq = [0usize; NUM_DIST_SYMS];
     lit_freq[256] = 1; // EOB
     for &tok in tokens {
         match tok {
@@ -429,108 +272,57 @@ fn emit_block(tokens: &[Token], bfinal: u8, bw: &mut BitWriter) -> GzippyResult<
         }
     }
 
-    // Ensure at least one dist symbol so HuffTable::build succeeds.
+    // Ensure at least one dist symbol so the length-limited builder (and the
+    // decoder, which requires a non-empty dist code) has something to build.
     if dist_freq.iter().all(|&f| f == 0) {
         dist_freq[0] = 1;
     }
 
-    // --- Build length-limited Huffman lengths ---
-    let lit_lens = package_merge(&lit_freq, 15);
-    let mut dist_lens = package_merge(&dist_freq, 15);
+    // --- Exact length-limited Huffman lengths (Zopfli-class package-merge) ---
+    let mut lit_lens_u32 = [0u32; NUM_LITLEN_SYMS];
+    calculate_bit_lengths(&lit_freq, 15, &mut lit_lens_u32);
+    let mut dist_lens_u32 = [0u32; NUM_DIST_SYMS];
+    calculate_bit_lengths(&dist_freq, 15, &mut dist_lens_u32);
 
-    // Guarantee at least one dist code with length > 0.
-    if dist_lens.iter().all(|&l| l == 0) {
-        dist_lens[0] = 1;
-    }
+    let mut lit_codes = [0u32; NUM_LITLEN_SYMS];
+    lengths_to_symbols(&lit_lens_u32, 15, &mut lit_codes);
+    let mut dist_codes = [0u32; NUM_DIST_SYMS];
+    lengths_to_symbols(&dist_lens_u32, 15, &mut dist_codes);
 
-    let lit_codes = assign_codes(&lit_lens);
-    let dist_codes = assign_codes(&dist_lens);
+    let lit_lens: Vec<u8> = lit_lens_u32.iter().map(|&l| l as u8).collect();
+    let dist_lens: Vec<u8> = dist_lens_u32.iter().map(|&l| l as u8).collect();
 
-    // --- Determine HLIT and HDIST ---
-    let hlit = lit_lens[..286]
-        .iter()
-        .rposition(|&l| l > 0)
-        .map(|p| p + 1)
-        .unwrap_or(257)
-        .max(257);
-    let hdist = dist_lens[..32]
-        .iter()
-        .rposition(|&l| l > 0)
-        .map(|p| p + 1)
-        .unwrap_or(1)
-        .max(1);
+    // --- Emit block header + dynamic Huffman tables ---
+    bw.add_bits(bfinal as u64, 1);
+    bw.add_bits(0b10, 2); // BTYPE = dynamic Huffman
+    let header = build_dynamic_header(&lit_lens, &dist_lens);
+    header.emit(bw);
 
-    // --- Combined length array for CL encoding ---
-    let mut combined = Vec::with_capacity(hlit + hdist);
-    combined.extend_from_slice(&lit_lens[..hlit]);
-    combined.extend_from_slice(&dist_lens[..hdist]);
-    let cl_syms = rle_lengths(&combined);
-
-    // CL symbol frequencies.
-    let mut cl_freq = [0u32; 19];
-    for s in &cl_syms {
-        cl_freq[cl_sym_index(s)] += 1;
-    }
-    let cl_lens_raw = package_merge(&cl_freq, 7);
-    let cl_codes = assign_codes(&cl_lens_raw);
-
-    // HCLEN: trim trailing zero CL codes (but at least 4).
-    let hclen = CL_ORDER
-        .iter()
-        .rposition(|&i| cl_lens_raw[i] > 0)
-        .map(|p| p + 1)
-        .unwrap_or(4)
-        .max(4);
-
-    // --- Emit block header ---
-    bw.write_lsb(bfinal as u64, 1);
-    bw.write_lsb(0b10, 2); // BTYPE = dynamic Huffman
-
-    bw.write_lsb((hlit - 257) as u64, 5);
-    bw.write_lsb((hdist - 1) as u64, 5);
-    bw.write_lsb((hclen - 4) as u64, 4);
-
-    for i in 0..hclen {
-        bw.write_lsb(cl_lens_raw[CL_ORDER[i]] as u64, 3);
-    }
-
-    // --- Emit RLE-encoded lengths ---
-    for s in &cl_syms {
-        let idx = cl_sym_index(s);
-        bw.write_code(cl_codes[idx], cl_lens_raw[idx]);
-        match s {
-            ClSym::Lit(_) => {}
-            ClSym::Repeat16(extra) => bw.write_lsb(*extra as u64, 2),
-            ClSym::Zeros17(extra) => bw.write_lsb(*extra as u64, 3),
-            ClSym::Zeros18(extra) => bw.write_lsb(*extra as u64, 7),
-        }
-    }
-
-    // --- Emit tokens ---
+    // --- Emit tokens. `add_huffman_bits` takes the codeword MSB-first
+    // (non-reversed) — exactly the form `lengths_to_symbols` produces. ---
     for &tok in tokens {
         match tok {
             Token::Literal(b) => {
                 let sym = b as usize;
-                bw.write_code(lit_codes[sym], lit_lens[sym]);
+                bw.add_huffman_bits(lit_codes[sym], lit_lens_u32[sym]);
             }
             Token::Match { length, dist } => {
                 let (lcode, lextra, lval) = length_code(length);
-                bw.write_code(lit_codes[lcode as usize], lit_lens[lcode as usize]);
+                bw.add_huffman_bits(lit_codes[lcode as usize], lit_lens_u32[lcode as usize]);
                 if lextra > 0 {
-                    bw.write_lsb(lval as u64, lextra);
+                    bw.add_bits(lval as u64, lextra as u32);
                 }
                 let (dcode, dextra, dval) = dist_code(dist);
-                bw.write_code(dist_codes[dcode as usize], dist_lens[dcode as usize]);
+                bw.add_huffman_bits(dist_codes[dcode as usize], dist_lens_u32[dcode as usize]);
                 if dextra > 0 {
-                    bw.write_lsb(dval as u64, dextra);
+                    bw.add_bits(dval as u64, dextra as u32);
                 }
             }
         }
     }
 
     // EOB
-    bw.write_code(lit_codes[256], lit_lens[256]);
-    Ok(())
+    bw.add_huffman_bits(lit_codes[256], lit_lens_u32[256]);
 }
 
 // ---------------------------------------------------------------------------
@@ -552,19 +344,23 @@ pub fn compress_deflate64_to_writer<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> GzippyResult<u64> {
+    let mut bw = BitWriter::new();
+
     if data.is_empty() {
-        // Empty stored block: BFINAL=1, BTYPE=00, LEN=0, NLEN=0xFFFF.
-        let block = [0x01u8, 0x00, 0x00, 0xFF, 0xFF];
+        // Single empty stored block: BFINAL=1, BTYPE=00, LEN=0, NLEN=0xFFFF.
+        // Shared framing (`compress::deflate::emit_stored_block`) — see
+        // module doc, "stored-block framing" is format law, not tier-
+        // specific.
+        emit_stored_block(&mut bw, &[], true);
+        let block = bw.finish();
         writer.write_all(&block)?;
-        return Ok(5);
+        return Ok(block.len() as u64);
     }
 
     let mut mf = MatchFinder::new();
-    let mut bw = BitWriter::new();
     let mut tokens: Vec<Token> = Vec::with_capacity(BLOCK_TOKENS + 16);
     let n = data.len();
     let mut pos = 0usize;
-    let mut written = 0u64;
 
     while pos < n {
         tokens.clear();
@@ -587,19 +383,12 @@ pub fn compress_deflate64_to_writer<W: std::io::Write>(
         }
 
         let is_last = pos >= n;
-        emit_block(&tokens, if is_last { 1 } else { 0 }, &mut bw)
-            .map_err(|e| GzippyError::compression(e.to_string()))?;
-
-        // Flush complete bytes to the writer; partial byte stays in bw.
-        let flushed = bw.out.len() as u64;
-        bw.flush_to(writer)?;
-        written += flushed;
+        emit_block(&tokens, if is_last { 1 } else { 0 }, &mut bw);
     }
 
-    // Emit final partial byte (if any).
-    let remaining = bw.flush();
-    written += remaining.len() as u64;
-    writer.write_all(&remaining)?;
+    let out = bw.finish();
+    let written = out.len() as u64;
+    writer.write_all(&out)?;
     Ok(written)
 }
 
@@ -707,5 +496,39 @@ mod tests {
         data.extend_from_slice(&vec![b'Z'; 10_000]);
         data.extend((0u8..=255).cycle().take(5000));
         roundtrip(&data);
+    }
+
+    /// Real-corpus differential (Stage E, docs/compressor-architecture.md
+    /// §5-E): every prior test above drives synthetic/adversarial patterns;
+    /// this exercises the rewritten Huffman-construction + dynamic-header
+    /// path (now instantiated from `compress::deflate::huffman::{optimal,
+    /// header}` instead of this file's own package-merge/RLE code) against
+    /// real text — mixed literal/match frequency distributions no synthetic
+    /// generator above produces. Same slice-of-a-tar-file convention as
+    /// `matchfinder::hc`'s `matches_equal_scalar_silesia`.
+    #[test]
+    fn test_silesia_slice_roundtrip() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark_data/silesia.tar");
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            eprintln!(
+                "note: {} missing; skipped silesia roundtrip",
+                path.display()
+            );
+            return;
+        };
+        use std::io::{Read, Seek};
+        // Two independent slices: one straddling multiple 16384-token blocks
+        // of real text, one from further into the archive (different
+        // literal/match mix).
+        for (start, len) in [(1 << 16, 300 * 1024), (4 << 20, 150 * 1024)] {
+            let mut data = vec![0u8; len];
+            f.seek(std::io::SeekFrom::Start(start)).unwrap();
+            if f.read_exact(&mut data).is_err() {
+                eprintln!("note: silesia.tar too small at offset {start}; skipped");
+                continue;
+            }
+            roundtrip(&data);
+        }
     }
 }
