@@ -21,6 +21,10 @@ use super::common::{
     lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, MATCHFINDER_INITVAL,
     MATCHFINDER_WINDOW_SIZE,
 };
+// `LzMatch` is the shared matchfinder vocabulary type (Stage D, matchfinder/mod.rs) —
+// moved to `common` since near_optimal.rs already imports it from this module path;
+// re-exported here so that import keeps working unchanged.
+pub use super::common::LzMatch;
 
 pub const BT_MATCHFINDER_HASH3_ORDER: u32 = 16;
 pub const BT_MATCHFINDER_HASH3_WAYS: usize = 2;
@@ -44,19 +48,6 @@ const CHILD_OFF: usize = HASH3_LEN + HASH4_LEN;
 /// Length of the initialized hash prefix (`BT_MATCHFINDER_TOTAL_HASH_SIZE / sizeof`).
 const TOTAL_HASH_LEN: usize = HASH3_LEN + HASH4_LEN;
 const TOTAL_LEN: usize = HASH3_LEN + HASH4_LEN + CHILD_LEN;
-
-/// A match found by the bt matchfinder. Port of `struct lz_match` (`:79-86`).
-///
-/// In the near-optimal match cache a "header" entry reuses this struct: `length`
-/// holds the number of matches found at the position and `offset` holds the
-/// literal byte there.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LzMatch {
-    /// Number of bytes matched.
-    pub length: u16,
-    /// Distance back from the current position that was matched.
-    pub offset: u16,
-}
 
 /// Unaligned little-endian 4-byte load. Caller guarantees `pos + 4 <= buf.len()`.
 #[inline]

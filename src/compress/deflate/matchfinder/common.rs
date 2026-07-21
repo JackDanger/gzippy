@@ -16,6 +16,30 @@ pub const MATCHFINDER_INITVAL: i16 = (-MATCHFINDER_WINDOW_SIZE) as i16;
 
 const WORDBYTES: usize = 8;
 
+/// A match found by a matchfinder that reports a LIST of candidates at a
+/// position (currently: [`super::bt::BtMatchfinder`], for the near-optimal
+/// DP's match cache). Port of `struct lz_match` (libdeflate
+/// `bt_matchfinder.h:79-86`).
+///
+/// This is the shared vocabulary type for tiers whose signatures already
+/// agree on "list of (length, offset) pairs, sorted by strictly-increasing
+/// length" — see `matchfinder/mod.rs`'s module doc for why the OTHER two
+/// tiers (`hc`, `lzfind`) deliberately do NOT return this type: `hc` reports
+/// a single best match by design (greedy/lazy commit immediately, no list is
+/// ever needed), and `lzfind` packs its frontier as raw interleaved `u16`
+/// pairs for its own perf reasons (cache-line-dense, no per-match struct
+/// padding, the DP's inner loop reads `scratch[p]`/`scratch[p+1]` directly).
+/// Forcing either onto this type would touch a hot loop for no shared benefit
+/// — exactly the risk `docs/compressor-architecture.md` §5 Stage D says not
+/// to take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LzMatch {
+    /// Number of bytes matched.
+    pub length: u16,
+    /// Distance back from the current position that was matched.
+    pub offset: u16,
+}
+
 /// The matchfinder hash: multiply the low bits of a sequence by a large
 /// constant and take the top `num_bits` bits of the 32-bit product.
 ///

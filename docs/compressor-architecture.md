@@ -86,7 +86,7 @@ in a later cleanup.
 | Dynamic-header wire format | BOTH (`huffman::header` + ultra's `deflate`/`deflate_size`) | **residual duplication, recorded not merged (Stage C, 2026-07-21).** Both emit the identical RFC-1951 precode/RLE wire format (`compute_precode_items`/`build_dynamic_header`/`DynamicHeader::emit` in `huffman/header.rs` vs `build_rle`/`encode_tree_emit`/`add_dynamic_tree` in `parse/ultra/{deflate_size,deflate}.rs`), but their COST-ACCOUNTING shapes differ: the level engine always tries all 3 RLE flags and trims precode length by codeword length; ultra re-walks all 8 use-16/17/18 combinations per block via `build_rle`'s shared size/emit walk and threads `hlit`/`hdist`/`hclen` through histogram-driven counts. Force-merging would couple that cost-accounting difference across engines for a wire-format match that is already achieved independently — not attempted this stage. `huffman/header.rs`'s module doc carries the pointer; unmerge is intentional, not oversight. |
 | Splitting (hot) | SAD streaming | O(1)/token, carries byte-identity L2-12. |
 | Splitting (exact) | uncapped recursive exact-cost | crown-gated (+0.00116 geomean lever). |
-| Matchfinder seed for squeeze | hc (replaces zopfli legacy hash/lz77 chain finder) | legacy finder is demoted duty; hc is faster and maintained. GATED: crown score must hold ≥ 3.205795 (seed changes outputs — score gate, not byte gate). If it loses ratio, keep legacy finder — measurement decides. |
+| Matchfinder seed for squeeze | **legacy zopfli hash/lz77 chain finder (KEPT, measured 2026-07-21)** | Stage D part 2 built an hc-matchfinder-driven greedy replacement (`greedy_hc.rs`, L9 depth/nice-len) for both consumers (squeeze seed + block-splitter greedy pre-pass) and scored it: on a fresh own-binary F15 baseline of 3.205250 (19-file geomean, this box/corpus), the replacement scored 3.204923 (FAILS the ≥-baseline bar); the spliced F80 estimate (8 fresh + 11 `squishy_f80_local.jsonl` reference) scored 3.205685 vs the 3.205752 ect-10009-crossing bar (also FAILS). Both misses are small — inside the ~0.001 geomean noise this codebase has documented elsewhere for repeat runs — but the pre-registered rule carried no noise margin, so the revert trigger fired on both legs; wall was also not clearly faster (contaminated by one outlier file, see commit message). Per the pre-registered rule: **reverted in full** (`greedy_hc.rs` deleted, `hash.rs`/`cache.rs`/`lz77::find_longest_match`/`lz77_greedy` restored) — the legacy finder earns its LOC. Part 1 (the matchfinder tier module doc + the `LzMatch` vocabulary-type move) shipped independently; it does not depend on this outcome. Re-open trigger: a future measurement wants to retry with a deeper HC search or a genuine multi-run significance test (N≥7) to separate the ~0.02-0.1% miss from noise. |
 | Token reps | BOTH (Seq + LZ77Store) | different access shapes serve different DPs; forcing one rep is elegance-by-deletion, not by design. Documented side by side. |
 | Gzip wrapper / stored blocks | mod.rs single implementation | three wrappers → one; framing is format law, not strategy. |
 
@@ -130,11 +130,44 @@ in a later cleanup.
   row for why. Gate: byte-identity both engines (L0/L1/L2/L6/L9/L12 × T1/T4 ×
   {dickens, data.parquet} + `-F 15`/`-F 80` × 5-file ratio corpus, all
   sha256-equal vs pre-stage HEAD); full test suite green; clippy/fmt clean.
-- **D. MATCHFINDER CONSOLIDATION (measured, riskiest)**: one trait over ht/hc/bt/
-  lzfind; retire the zopfli legacy chain finder by seeding squeeze + the greedy
-  splitter pre-pass from hc. Gate: crown score ≥ 3.205795 (this changes ultra
-  bytes); if score drops, the legacy finder stays and the stage closes as
-  "measured: legacy seed earns its LOC".
+- **D. MATCHFINDER CONSOLIDATION (measured, riskiest) — DONE 2026-07-21, mixed
+  outcome, both parts closed.**
+  - **Part 1 (structural, byte-identity gate) — KEPT.** `matchfinder/mod.rs`
+    carries a module-doc table of all four tiers (ht/hc/bt/lzfind), their
+    consumers, output shapes, and position models, plus an explicit
+    documented reason `ht` stays fused into `parse/fast.rs` rather than being
+    extracted (codegen risk to the SF1-A/C prefetch/pipeline work — no
+    measured need). The one piece of shared vocabulary two tiers'
+    signatures already agreed on — `bt`'s per-position match LIST — moved
+    to `matchfinder::common::LzMatch` (bt.rs re-exports it, so no call site
+    changed); `hc` (single best match) and `lzfind` (packed `u16` frontier)
+    stay their own shapes, documented as a deliberate non-unification, not
+    an oversight. Gate: byte-identity (L0/L1/L2/L6/L9/L12 × T1/T4 × {dickens,
+    data.parquet} + `-F 15`/`-F 80` × {dickens, data.parquet, markup.xml},
+    all sha256-equal vs pre-stage HEAD) — 30/30 PASSED.
+  - **Part 2 (measured, retire the legacy zopfli chain finder) — REVERTED.**
+    Built `parse/ultra/greedy_hc.rs`: an `HcMatchfinder`-driven greedy walk
+    (level engine's L9 depth=600/nice_len=258) replacing `lz77::lz77_greedy`
+    at both call sites (squeeze's DP seed, the block splitter's greedy
+    pre-pass), deleting `hash.rs`+`cache.rs`+`find_longest_match`+
+    `lz77_greedy` (~700 LOC) in exchange for ~290 LOC of new driver+tests.
+    Scored on the 19-file Squishy corpus against a FRESH own-binary
+    before/after pair (not the stale 3.203126/3.205795 numbers this doc
+    previously cited — those predate this session's measurement):
+    F15 geomean 3.205250 (before) → 3.204923 (after, **FAILS** the
+    ≥-baseline bar); spliced F80 geomean (8 fresh + 11
+    `squishy_f80_local.jsonl` reference) 3.205685 vs the 3.205752
+    ect-10009-crossing bar (**FAILS**). Both misses are small (~0.01-0.02%,
+    comparable to the ~0.001 repeat-run geomean noise documented elsewhere
+    in this doc) but the pre-registered rule carried no noise margin, so
+    both legs of the AND-gate fired the revert trigger — per the
+    pre-registered rule this REVERTS IN FULL: `greedy_hc.rs` deleted,
+    `hash.rs`/`cache.rs`/`lz77::find_longest_match`/`lz77_greedy`/
+    `BlockState`'s `LongestMatchCache` field all restored verbatim from
+    pre-stage HEAD. "measured: legacy seed earns its LOC" — closed, not
+    open. Re-open trigger: a multi-run (N≥7) significance test that
+    actually separates this miss from noise, or a deeper/differently-tuned
+    HC seed.
 - **E. POLISH**: deflate64 internals on shared modules; docs/compressor-
   architecture.md (this file) lands in-repo; lib.rs API docs rewritten from the
   actual routing; LOC and dead-code audit re-run.
