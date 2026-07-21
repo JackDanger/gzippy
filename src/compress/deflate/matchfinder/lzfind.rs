@@ -25,7 +25,9 @@
 //!    to the adjacent block via thread-local state; we always create fresh and
 //!    warm the pre-window with `skip`, matching ECT's common `else` branch.
 
-use super::symbols::{ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_WINDOW_SIZE};
+use crate::compress::deflate::parse::ultra::symbols::{
+    ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_WINDOW_SIZE,
+};
 
 const WINDOW: usize = ZOPFLI_WINDOW_SIZE; // 32768
 const WINDOW_MASK: u32 = (ZOPFLI_WINDOW_SIZE as u32) - 1; // 32767

@@ -7,14 +7,14 @@
 
 use super::deflate_size::{calculate_block_size, optimize_huffman_for_rle};
 use super::hash::ZopfliHash;
-use super::katajainen::length_limited_code_lengths;
 use super::lz77::{lz77_greedy, verify_len_dist, BlockState, LZ77Store};
-use super::lzfind::{MatchFinder, MAX_MATCH_U16};
 use super::symbols::{
     dist_extra_bits, dist_symbol, length_extra_bits, length_symbol, ZOPFLI_LARGE_FLOAT,
     ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_SIZE,
 };
-use super::tree::calculate_entropy;
+use crate::compress::deflate::huffman::katajainen::length_limited_code_lengths;
+use crate::compress::deflate::huffman::tree::calculate_entropy;
+use crate::compress::deflate::matchfinder::lzfind::{MatchFinder, MAX_MATCH_U16};
 
 // ── SymbolStats ──────────────────────────────────────────────────────────────
 
@@ -208,6 +208,14 @@ impl RanState {
         Self { m_w: 1, m_z: 2 }
     }
 
+    // Stage A structural move (docs/compressor-architecture.md) newly
+    // exposes this fn under the crate's already-public `compress::` tree
+    // (previously nested under the private `mod backends;`), activating
+    // clippy's `Iterator::next`-confusion lint for the first time. This is
+    // a faithful port of Zopfli's `MSVCRT` xorshift `RanState::next` —
+    // kept as-is (not renamed) per the no-signature-change rule for a
+    // structural move.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> u32 {
         self.m_z = 36969u32

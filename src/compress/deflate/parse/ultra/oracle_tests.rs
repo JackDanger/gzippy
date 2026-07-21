@@ -15,10 +15,18 @@
 
 // Imported via `crate::` rather than `super::` because this file is included
 // by `src/lib.rs` directly (via `#[path]`), so its module parent is the crate
-// root, not `crate::backends::zopfli_pure`. See lib.rs / zopfli_pure/mod.rs
-// for the rationale (avoids dual lib/bin compilation of an FFI-using test).
-use crate::backends::zopfli_pure::{compress, ZopfliFormat, ZopfliOptions};
+// root, not `crate::compress::deflate::parse::ultra`. See lib.rs /
+// ultra/mod.rs for the rationale (avoids dual lib/bin compilation of an
+// FFI-using test).
+use crate::compress::deflate::parse::ultra::{compress, ZopfliFormat, ZopfliOptions};
 
+// `blocksplittingmax` (and `blocksplittinglast`) are dead on the Rust side
+// (`ZopfliOptions` no longer carries them — the splitter has been
+// unconditionally uncapped since the crown-caps change, see
+// `deflate.rs`'s "UNCAP" comment) but this struct's layout MUST still
+// mirror the real C `ZopfliOptions` (`vendor/zopfli/src/zopfli/zopfli.h`)
+// byte-for-byte for the FFI call below to be sound — so the fields stay
+// here, in this FFI shim only.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CZopfliOptions {
@@ -75,13 +83,15 @@ fn c_compress(input: &[u8], iters: i32, splitting: i32, max_blocks: i32) -> Vec<
     }
 }
 
-fn rust_compress(input: &[u8], iters: i32, splitting: i32, max_blocks: i32) -> Vec<u8> {
+// `_max_blocks` kept for signature symmetry with `c_compress` above (same
+// combos are driven through both) even though the Rust `ZopfliOptions` no
+// longer has a field to carry it into — see the `CZopfliOptions` doc comment.
+fn rust_compress(input: &[u8], iters: i32, splitting: i32, _max_blocks: i32) -> Vec<u8> {
     let opts = ZopfliOptions {
         verbose: 0,
         verbose_more: 0,
         numiterations: iters,
         blocksplitting: splitting,
-        blocksplittingmax: max_blocks,
         thread_budget: 0,
     };
     compress(&opts, ZopfliFormat::Gzip, input)

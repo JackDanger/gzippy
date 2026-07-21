@@ -198,7 +198,12 @@ impl GzippyArgs {
                         args.fast = true;
                         args.compression_level = 1;
                     }
-                    // Ultra compression: true zopfli (very slow)
+                    // Ultra compression: level 11. NOTE: -11 alone does NOT
+                    // route to the zopfli/crown engine — it falls through to
+                    // the pure-Rust near-optimal DEFLATE parse tier, same as
+                    // any other level. Only an explicit -F/-I/-J tuning flag
+                    // forces the zopfli encoder (see `explicit_zopfli` in
+                    // compress/mod.rs).
                     "--ultra" => {
                         args.compression_level = 11;
                     }
@@ -479,21 +484,6 @@ impl GzippyArgs {
         }
 
         Ok(args)
-    }
-
-    /// Whether zopfli semantics are requested (level 11 or an explicit
-    /// -F/-I/-J tuning flag).
-    ///
-    /// Increment 7: the compress router no longer calls this — it distinguishes
-    /// *explicit* zopfli tuning (which forces the zopfli encoder) from a plain
-    /// `-11` (which uses the pure near-optimal engine), so it inspects the
-    /// individual flags directly. Retained as a public CLI predicate.
-    #[allow(dead_code)]
-    pub fn use_zopfli(&self) -> bool {
-        self.compression_level == 11
-            || self.zopfli_iterations.is_some()
-            || self.zopfli_no_split
-            || self.zopfli_split_max.is_some()
     }
 }
 

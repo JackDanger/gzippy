@@ -11,6 +11,14 @@ struct Node {
 /// Computes length-limited Huffman code lengths.
 ///
 /// Returns Ok(()) on success, Err(()) if (1<<maxbits) < numsymbols or weight overflow.
+// Stage A structural move (docs/compressor-architecture.md) newly exposes
+// this fn under the crate's already-public `compress::` tree (it was
+// previously nested under the private `mod backends;`), which activates
+// clippy's public-API-shape lint for the first time. This is a faithful
+// port of Zopfli's `ZopfliLengthLimitedCodeLengths` — a bool-shaped
+// Result<(), ()> — kept as-is rather than "improved" per the no-behavior-
+// change rule for a structural move.
+#[allow(clippy::result_unit_err)]
 pub fn length_limited_code_lengths(
     frequencies: &[usize],
     maxbits: i32,

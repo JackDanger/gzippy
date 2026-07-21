@@ -14,7 +14,6 @@ pub mod pipelined;
 // only as a differential oracle behind `ffi-oracle`.
 #[cfg(any(test, feature = "ffi-oracle"))]
 pub mod simple;
-pub mod zopfli;
 
 use std::io::{Read, Write};
 
@@ -51,12 +50,13 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
                 args.zopfli_iterations.unwrap_or(15)
             );
         }
-        let tuning = crate::backends::zopfli_compress::ZopfliTuning::from_args(args);
+        let tuning = crate::compress::deflate::parse::ultra::ZopfliTuning::from_args(args);
         // thread_count + block_size are intentionally not passed: the
         // zopfli path is single-member by ratio mandate (plan.md
         // Phase 11.1.A). Intra-block parallelism inside `deflate_part`
         // still uses the machine.
-        let mut encoder = crate::compress::zopfli::ZopfliGzEncoder::new(tuning);
+        let mut encoder =
+            crate::compress::deflate::parse::ultra::encoder::ZopfliGzEncoder::new(tuning);
         encoder.set_header_info(header_info.clone());
         return encoder.compress(reader, writer).map_err(|e| e.into());
     }

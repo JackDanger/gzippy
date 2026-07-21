@@ -251,7 +251,7 @@ state unless noted otherwise.
 | `GZIPPY_SLEEP_DECODE_NS` | Requires `GZIPPY_BYPASS_DECODE`. Replace the Huffman decode with a fixed sleep of `N` nanoseconds and return a correct-SIZE, zero-filled, fully-clean `ChunkData`. Matches the rapidgzip sleep-patch for apples-to-apples coordination measurement. CRC/ISIZE verification is skipped in `sm_driver` when this is set. Output is garbage (zeros). | ORACLE / MEASUREMENT |
 | `GZIPPY_STORED_NO_OVERLAP` | Force the stored-split parallel decoder to use sequential prefix→body order instead of overlapped execution. Control lever for the overlap A/B. | ORACLE / MEASUREMENT |
 | `GZIPPY_STORED_INLINE_COPY` | Force the stored-split decoder to use the inline copy path at any thread count. | ORACLE / MEASUREMENT |
-| `GZIPPY_REGEN_FIXTURES` | (Test-only) Regenerate zopfli golden fixtures instead of checking them. Read in `src/backends/zopfli_pure/tests.rs:58`. | TEST-ONLY |
+| `GZIPPY_REGEN_FIXTURES` | (Test-only) Regenerate zopfli golden fixtures instead of checking them. Read in `src/compress/deflate/parse/ultra/tests.rs:58`. | TEST-ONLY |
 
 **Total: 33 flags** (GZIPPY_DEBUG appears in multiple modules but is one logical flag).
 
