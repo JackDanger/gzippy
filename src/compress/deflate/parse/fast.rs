@@ -72,9 +72,25 @@ const PF_DIST: usize = 4;
 /// LIMIT_HASH_UPDATE: number of match-interior positions whose hash is inserted
 /// into the head table before the cursor jumps over the rest of the match
 /// (`igzip_base.c:71-86`, igzip uses ~3). Denser interior inserts seed more
-/// candidates for later matches (better ratio) at the cost of more hash stores;
-/// `usize::MAX` means "insert EVERY interior position" (zlib-ng style).
-const LIMIT_HASH_UPDATE_INSERTS: usize = 2;
+/// candidates for later matches (better ratio) at the cost of more hash
+/// stores; `usize::MAX` means "insert EVERY interior position" (zlib-ng
+/// style). Passed as a runtime `run()` parameter (not a `const`) because L0
+/// and L1 want DIFFERENT values sharing the SAME finder code: bumping it
+/// helps ratio on both, but the extra hash stores are pure overhead for L0
+/// (whose bar is speed + beating igzip -0, already cleared with room to
+/// spare) — a shared constant would make L0 pay for an L1-only ratio lever
+/// (measured: INSERTS=4 already cost L1 alone ~14.5% wall on `text6` for a
+/// ~2.3% ratio gain — igzip's own ~3 turned out to be close to the true
+/// speed/ratio knee for THIS finder; higher values were tried and reverted,
+/// see the commit message).
+pub(super) const LIMIT_HASH_UPDATE_INSERTS_L0: usize = 2;
+/// L1 gets one step denser than L0 (matches igzip's own "~3"): measured
+/// near-zero wall cost (`text6` 22.9ms→22.6ms, `bin6` 37.7ms→38.3ms, both
+/// within run-to-run noise) for a real ratio win (`text6` -1.7%, `bin6`
+/// -0.3% vs `LIMIT_HASH_UPDATE_INSERTS_L0`). Higher values (4, 8, MAX) give
+/// more ratio but blow well past a 10% L1 wall budget — not shipped, see the
+/// commit message for the measured numbers.
+pub(super) const LIMIT_HASH_UPDATE_INSERTS_L1: usize = 3;
 
 /// Sentinel head-table entry meaning "no position stored yet". Any position we
 /// store is `< in_end <= u32::MAX`, so the sentinel never collides with a real
@@ -166,6 +182,7 @@ pub(super) fn run<const ACCEL: bool>(
     is_last: bool,
     block_length: usize,
     use_dynamic: bool,
+    limit_hash_update_inserts: usize,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -244,10 +261,10 @@ pub(super) fn run<const ACCEL: bool>(
                 if length >= SHORTEST_MATCH {
                     // LIMIT_HASH_UPDATE (see the tail loop for the full note).
                     let match_end = pos + length as usize;
-                    let insert_end = if LIMIT_HASH_UPDATE_INSERTS == usize::MAX {
+                    let insert_end = if limit_hash_update_inserts == usize::MAX {
                         match_end
                     } else {
-                        (pos + 1 + LIMIT_HASH_UPDATE_INSERTS).min(match_end)
+                        (pos + 1 + limit_hash_update_inserts).min(match_end)
                     };
                     let mut nh = pos + 1;
                     while nh < insert_end {
@@ -339,10 +356,10 @@ pub(super) fn run<const ACCEL: bool>(
                         // first interior positions are inside the match; the
                         // `.min(match_end)` clamp keeps every insert inside it.
                         let match_end = pos + length as usize;
-                        let insert_end = if LIMIT_HASH_UPDATE_INSERTS == usize::MAX {
+                        let insert_end = if limit_hash_update_inserts == usize::MAX {
                             match_end
                         } else {
-                            (pos + 1 + LIMIT_HASH_UPDATE_INSERTS).min(match_end)
+                            (pos + 1 + limit_hash_update_inserts).min(match_end)
                         };
                         let mut nh = pos + 1;
                         while nh < insert_end {

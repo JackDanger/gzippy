@@ -245,6 +245,7 @@ pub(super) fn compress(
             is_last,
             fast::FAST0_BLOCK_LENGTH,
             true,
+            fast::LIMIT_HASH_UPDATE_INSERTS_L0,
         ),
         Strategy::Fast => fast::run::<false>(
             buf,
@@ -255,6 +256,7 @@ pub(super) fn compress(
             is_last,
             fast::FAST_BLOCK_LENGTH,
             true,
+            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
         ),
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw, is_last),
         Strategy::Lazy => lazy::run(
