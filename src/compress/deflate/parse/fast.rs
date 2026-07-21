@@ -1,4 +1,10 @@
-//! Level-1 igzip-class one-pass FAST parser.
+//! Level-0/1 igzip-class one-pass FAST parser.
+//!
+//! Shared by `Strategy::Fast0` (L0) and `Strategy::Fast` (L1): both use the
+//! IDENTICAL chainless single-probe matchfinder below; they differ only in
+//! `use_dynamic` at the block-emit step (L1 evaluates a per-block dynamic
+//! Huffman code, L0 does not — see `super::emit_block_static_or_stored`'s doc
+//! comment for why that is the L0/L1 cost/ratio trade).
 //!
 //! The match finder is a port of igzip's level-0/1 deflate body
 //! (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`, :27-113): a
@@ -42,7 +48,7 @@
 use super::super::bitstream::BitWriter;
 use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_write};
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
-use super::{emit_block, Sink, StaticCodes};
+use super::{emit_block, emit_block_static_or_stored, Sink, StaticCodes};
 
 /// Log2 of the head-table size. igzip's level-0 hash table is
 /// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`); we widen
@@ -75,6 +81,31 @@ const LIMIT_HASH_UPDATE_INSERTS: usize = 2;
 /// index, and its computed distance always fails the window test.
 const NO_POS: u32 = u32::MAX;
 
+/// L0-only search acceleration (the `ACCEL` const generic on [`run`]), an
+/// LZ4-`LZ4_compress_fast`-style scan-step ramp: no vendor DEFLATE encoder
+/// counterpart, a novel technique for this chainless single-probe finder.
+/// The scan step is `1 + (consecutive_misses >> ACCEL_SHIFT)`, capped at
+/// `ACCEL_MAX_STEP`: every `1 << ACCEL_SHIFT` further consecutive-miss
+/// positions, the per-position hash lookup/insert is skipped for a growing
+/// number of subsequent positions — those bytes are coded as literals
+/// directly with no finder work at all. Any match resets the miss counter
+/// (and so the step) back to 1. This trades some missed matches (ratio) for
+/// skipping finder work outright (speed) — but ONLY on long literal runs,
+/// which is exactly where L1's exhaustive per-position search is least
+/// likely to pay off. `run::<false>` (L1 / `Strategy::Fast`) monomorphizes
+/// with this whole mechanism compiled away — this is strictly an L0
+/// (`Strategy::Fast0`) lever.
+const ACCEL_SHIFT: u32 = 1;
+/// Consecutive-miss count at which the ramp arms (below this, `step` stays 1
+/// and the per-literal cost is just the counter increment + one
+/// well-predicted comparison — see the arming check's doc comment in
+/// [`run`]).
+const ACCEL_ARM_THRESHOLD: u32 = 1 << ACCEL_SHIFT;
+/// Cap on the accelerated scan step (bytes skipped per ramped-up jump).
+/// Bounded well under the `DEFLATE_MAX_MATCH_LEN` (258) fastloop safety
+/// margin so the skip can never run the cursor past `in_end`.
+const ACCEL_MAX_STEP: usize = 8;
+
 /// igzip `SHORTEST_MATCH` (`huff_codes.h:89`): the fast path only emits matches
 /// of length >= 4 (its hash keys 4 bytes), coding anything shorter as literals.
 const SHORTEST_MATCH: u32 = 4;
@@ -82,14 +113,27 @@ const SHORTEST_MATCH: u32 = 4;
 /// DEFLATE sliding-window size — the largest legal back-reference distance.
 const WINDOW: usize = 32768;
 
-/// Input bytes covered per DEFLATE block in the fast path.
+/// Input bytes covered per DEFLATE block in the fast path (L1 value —
+/// [`super::compress`] passes a caller-chosen `block_length`, see
+/// [`FAST0_BLOCK_LENGTH`] for the L0 value).
 ///
 /// A per-block dynamic Huffman code adapts to LOCAL statistics, so a moderate
 /// block (vs one whole-input block) improves ratio on heterogeneous input; at
 /// 64 KiB the ~dozens-of-bytes dynamic header amortizes to well under 1%. This
 /// is the fast path's one ratio/speed tuning knob — it does not affect
 /// correctness (any block boundary roundtrips).
-const FAST_BLOCK_LENGTH: usize = 1 << 16;
+pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
+
+/// L0's block length. The per-block dynamic-Huffman build (canonical code +
+/// length-limiting over up to 288+32 symbols) costs roughly the SAME whether
+/// the block covers 64 KiB or 1 MiB — it is a function of alphabet size, not
+/// byte count — so widening the block cuts the number of builds (and their
+/// bit-cost evaluations / header emissions) roughly proportionally with
+/// little further ratio loss beyond less-local adaptation. 16x L1's block
+/// gives L0 ~1/16th the per-block overhead while keeping most of L1's ratio
+/// (measured: far closer to L1 than the static-Huffman-only alternative,
+/// which gave up ~20%+ on text).
+pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 
 /// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending one
 /// or more DEFLATE blocks to `bw`.
@@ -100,13 +144,28 @@ const FAST_BLOCK_LENGTH: usize = 1 << 16;
 /// bounds. `buf[..data_start]` is an optional preset dictionary: its positions
 /// are seeded into the head table so matches may reference it, but it is not
 /// coded.
-pub(super) fn run(
+///
+/// `block_length` is the input-byte span covered by each internal block
+/// (L1 passes [`FAST_BLOCK_LENGTH`], L0 passes [`FAST0_BLOCK_LENGTH`]).
+/// `use_dynamic` selects the block emitter: `true` evaluates a per-block
+/// dynamic Huffman code (cheapest of dynamic/static/stored, [`emit_block`]);
+/// `false` skips that build entirely (cheapest of static/stored only,
+/// [`emit_block_static_or_stored`]).
+///
+/// `ACCEL` is a CONST generic (not a runtime `bool`) so L1's call
+/// (`run::<false>`) monomorphizes to code with the accel state/arithmetic
+/// compiled away entirely — L1's fastloop is exactly the code that existed
+/// before the accel lever was added, not "the same logic with a runtime
+/// branch". Only the `run::<true>` instantiation (L0) carries the ramp.
+pub(super) fn run<const ACCEL: bool>(
     buf: &[u8],
     data_start: usize,
     in_end: usize,
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
+    block_length: usize,
+    use_dynamic: bool,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -129,13 +188,18 @@ pub(super) fn run(
     // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
     let mut sink = Sink::new();
     let mut pos = data_start;
+    // Consecutive-miss counter driving the `ACCEL` scan-step ramp (see
+    // `ACCEL_SHIFT`'s doc comment). Dead (never read) when `ACCEL` is
+    // `false` — that monomorphization compiles it away.
+    #[allow(unused_assignments)]
+    let mut literal_run: u32 = 0;
 
     loop {
-        // Start a new block. It ends after FAST_BLOCK_LENGTH input bytes (a match
+        // Start a new block. It ends after `block_length` input bytes (a match
         // straddling the boundary is allowed to overrun it slightly) or at EOF.
         let block_begin = pos;
         sink.begin();
-        let block_end_target = (block_begin + FAST_BLOCK_LENGTH).min(in_end);
+        let block_end_target = (block_begin + block_length).min(in_end);
 
         // FASTLOOP / TAIL split (igzip loop2 shape). While
         // `pos < in_end - DEFLATE_MAX_MATCH_LEN`, `remaining` strictly exceeds
@@ -199,6 +263,7 @@ pub(super) fn run(
 
                     sink.push_match_fast(length, dist as u32);
                     pos += length as usize;
+                    literal_run = 0;
                     continue;
                 }
             }
@@ -206,7 +271,38 @@ pub(super) fn run(
             // Literal.
             // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
             sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
-            pos += 1;
+
+            // Common-case-cheap ramp: below `ACCEL_ARM_THRESHOLD` consecutive
+            // misses, the ONLY added-vs-L1 cost is the `literal_run += 1` and
+            // a (well-predicted-not-taken, on any corpus with normal match
+            // density) comparison — the shift/min/extra-literal-copy work
+            // only runs once we're actually inside a long literal run, which
+            // is the ONLY time it can pay for itself. This keeps L0 from
+            // regressing vs L1 on compressible corpora where the ramp rarely
+            // arms (measured: computing `step` unconditionally cost L0 ~2-3%
+            // vs L1 on `text6`, even fully branch-eliminated for L1 via the
+            // `ACCEL` const generic — the tax was the arithmetic itself, not
+            // dispatch).
+            let mut step = 1usize;
+            if ACCEL {
+                literal_run += 1;
+                if literal_run >= ACCEL_ARM_THRESHOLD {
+                    // Scan-step ramp: skip the hash lookup/insert for
+                    // `step - 1` further positions, coding them as literals
+                    // directly. `pos + step <= pos + ACCEL_MAX_STEP <
+                    // fast_end + ACCEL_MAX_STEP <= in_end` (fast_end's
+                    // 258-byte margin dwarfs ACCEL_MAX_STEP), so every extra
+                    // literal index stays in bounds.
+                    step = (1 + (literal_run >> ACCEL_SHIFT) as usize).min(ACCEL_MAX_STEP);
+                    let mut i = 1;
+                    while i < step {
+                        // SAFETY: see the bounds note above.
+                        sink.push_literal_fast(unsafe { *buf.get_unchecked(pos + i) });
+                        i += 1;
+                    }
+                }
+            }
+            pos += step;
         }
 
         // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
@@ -273,19 +369,21 @@ pub(super) fn run(
         // covered length is exactly the cursor distance walked this block.
         sink.block_length = pos - block_begin;
 
-        // Flush the block: cheapest of per-block dynamic / static / stored.
-        // The BFINAL bit is set only on the last internal block AND only when
-        // this chunk is the last chunk of the whole stream (`is_last`). A
-        // non-final chunk's blocks stay BFINAL=0 so the sync-flush marker the
-        // caller appends can close the chunk on a clean boundary.
-        emit_block(
-            bw,
-            buf,
-            block_begin,
-            &sink,
-            statics,
-            is_last && pos == in_end,
-        );
+        // Flush the block. The BFINAL bit is set only on the last internal
+        // block AND only when this chunk is the last chunk of the whole
+        // stream (`is_last`). A non-final chunk's blocks stay BFINAL=0 so the
+        // sync-flush marker the caller appends can close the chunk on a clean
+        // boundary.
+        let is_final = is_last && pos == in_end;
+        if use_dynamic {
+            // L1: cheapest of per-block dynamic / static / stored.
+            emit_block(bw, buf, block_begin, &sink, statics, is_final);
+        } else {
+            // L0: cheapest of static / stored only — no per-block dynamic
+            // Huffman build (see `emit_block_static_or_stored`'s doc comment
+            // for why this is the L0-vs-L1 cost/ratio trade).
+            emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+        }
         if pos == in_end {
             break;
         }

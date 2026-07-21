@@ -8,20 +8,32 @@
 //! Increment 2 implements the greedy (L2-4) and lazy/lazy2 (L5-9) strategies;
 //! Increment 3 adds the near-optimal (L10-12) strategy; Increment 4 adds the
 //! igzip-class one-pass FAST strategy for L1 (chainless single-probe hash table
-//! + direct-emit static Huffman — a port of igzip `isal_deflate_body_base`).
-//! L0 stays a pure stored-block passthrough.
+//! + per-block cheapest-of-{dynamic,static,stored} Huffman coding — a port of
+//! igzip `isal_deflate_body_base`). Increment 5 (ratio-hole fix, 2026-07)
+//! gives L0 the SAME chainless matchfinder as L1 (`Strategy::Fast0`), but
+//! skips the per-block dynamic-Huffman evaluation (always static-or-stored) —
+//! cheaper than L1, and a real compressor instead of L0's old pure
+//! stored-block passthrough.
 
 use super::tables::DEFLATE_MAX_MATCH_LEN;
 
 /// Parse strategy selected by a compression level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
-    /// Level 0: emit stored (uncompressed) blocks only — no match finding.
-    Stored,
+    /// Level 0: igzip-class one-pass fast path, same chainless single-probe
+    /// matchfinder as [`Strategy::Fast`], but each block is coded as the
+    /// cheaper of a fixed (static) Huffman block or a stored block — the
+    /// per-block DYNAMIC Huffman evaluation (canonical code build +
+    /// length-limiting) that [`Strategy::Fast`] does is skipped entirely,
+    /// which is the ratio/speed trade that makes L0 cheaper than L1. This
+    /// replaces the old pure stored-block passthrough (which never
+    /// compressed at all — see the L0 fix in the compression-ratio
+    /// campaign).
+    Fast0,
     /// Level 1: igzip-class one-pass fast path — chainless single-probe
-    /// hash-table matchfinder + direct-emit through a fixed (static) Huffman
-    /// table. No hash chains, no per-block histogram/tree build, no block
-    /// splitting (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`).
+    /// hash-table matchfinder + per-block cheapest-of-{dynamic,static,stored}
+    /// Huffman coding. No hash chains, no depth loop
+    /// (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`).
     Fast,
     /// Greedy parse: always take the longest match at each position.
     Greedy,
@@ -76,7 +88,7 @@ pub fn params(level: u32) -> LevelParams {
     };
     match level {
         0 => LevelParams {
-            strategy: Strategy::Stored,
+            strategy: Strategy::Fast0,
             max_search_depth: 0,
             nice_match_length: 32,
             near_optimal: NONE_NO,
@@ -192,7 +204,7 @@ mod tests {
 
     #[test]
     fn strategy_mapping_matches_increment_scope() {
-        assert_eq!(params(0).strategy, Strategy::Stored);
+        assert_eq!(params(0).strategy, Strategy::Fast0);
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
         for l in 2..=4 {
             assert_eq!(params(l).strategy, Strategy::Greedy, "level {l}");

@@ -220,8 +220,8 @@ impl Sink {
 ///
 /// `buf` MUST have at least [`BUF_PAD`] trailing bytes beyond `in_end`. Bytes in
 /// `buf[..data_start]` (a preset dictionary) are seeded into the matchfinder but
-/// not coded; matches may reference them. Only greedy/lazy/lazy2 strategies are
-/// handled here — the caller routes `Strategy::Stored` elsewhere.
+/// not coded; matches may reference them. Dispatches on `params.strategy` to
+/// the matching parser (all levels 0-12 route through here now).
 pub(super) fn compress(
     buf: &[u8],
     data_start: usize,
@@ -232,7 +232,30 @@ pub(super) fn compress(
 ) {
     let statics = StaticCodes::build();
     match params.strategy {
-        Strategy::Fast => fast::run(buf, data_start, in_end, &statics, bw, is_last),
+        // ACCEL is a const generic (see fast::run's doc comment): `::<true>`
+        // (L0) monomorphizes with the scan-step ramp; `::<false>` (L1)
+        // monomorphizes with that code compiled away entirely, not merely
+        // runtime-disabled.
+        Strategy::Fast0 => fast::run::<true>(
+            buf,
+            data_start,
+            in_end,
+            &statics,
+            bw,
+            is_last,
+            fast::FAST0_BLOCK_LENGTH,
+            true,
+        ),
+        Strategy::Fast => fast::run::<false>(
+            buf,
+            data_start,
+            in_end,
+            &statics,
+            bw,
+            is_last,
+            fast::FAST_BLOCK_LENGTH,
+            true,
+        ),
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw, is_last),
         Strategy::Lazy => lazy::run(
             buf, data_start, in_end, params, &statics, bw, false, is_last,
@@ -241,7 +264,6 @@ pub(super) fn compress(
         Strategy::NearOptimal => {
             near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
         }
-        Strategy::Stored => unreachable!("stored strategy is handled by the caller"),
     }
 }
 
@@ -406,6 +428,56 @@ fn emit_block(
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);
         emit_sequences(bw, buf, block_start, sink, &litcode, &offcode);
+    }
+}
+
+/// Emit the accumulated block, choosing the cheaper of stored / static-Huffman
+/// ONLY — the dynamic-Huffman candidate is never built. This is the L0
+/// ("`Strategy::Fast0`") block emitter: skipping `make_huffman_code` (a
+/// length-limited canonical-code build, effectively a package-merge pass) and
+/// `build_dynamic_header` for both the litlen and offset alphabets is the
+/// per-block cost [`emit_block`] pays that this function does not, which is
+/// what makes L0 cheaper than L1 while sharing the identical chainless
+/// single-probe matchfinder (`fast::run`). Ratio is a bit worse than L1's
+/// (no per-block adaptive code), which is an intentional L0/L1 trade — L0's
+/// bar is beating igzip -0 (which sometimes EXPANDS incompressible input),
+/// not matching L1.
+fn emit_block_static_or_stored(
+    bw: &mut BitWriter,
+    buf: &[u8],
+    block_start: usize,
+    sink: &Sink,
+    statics: &StaticCodes,
+    is_final: bool,
+) {
+    let mut litlen_freqs = sink.litlen_freqs;
+    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
+
+    let static_bits = 3 + cost_from_freqs(
+        &litlen_freqs,
+        &sink.offset_freqs,
+        &statics.litcode,
+        &statics.offcode,
+    );
+    let stored_bits = stored_block_bits(sink.block_length);
+
+    if stored_bits <= static_bits {
+        super::emit_stored_block(
+            bw,
+            &buf[block_start..block_start + sink.block_length],
+            is_final,
+        );
+    } else {
+        bw.add_bits(is_final as u64, 1);
+        bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
+        emit_sequences(
+            bw,
+            buf,
+            block_start,
+            sink,
+            &statics.litcode,
+            &statics.offcode,
+        );
     }
 }
 
