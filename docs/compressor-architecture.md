@@ -83,6 +83,7 @@ in a later cleanup.
 | Bit emission | level engine's word BitWriter | crown's own doc: bit-emit speed is irrelevant to squeeze wall → adopting the fast writer is pure simplification; must preserve bp threading + MSB-first helper. Gate: crown outputs byte-identical. |
 | Huffman (hot) | libdeflate approximate | carries L2-12 byte-identity. |
 | Huffman (exact) | katajainen + RLE shaping | provably optimal + crown-gated; becomes available (not default) to other tiers. |
+| Dynamic-header wire format | BOTH (`huffman::header` + ultra's `deflate`/`deflate_size`) | **residual duplication, recorded not merged (Stage C, 2026-07-21).** Both emit the identical RFC-1951 precode/RLE wire format (`compute_precode_items`/`build_dynamic_header`/`DynamicHeader::emit` in `huffman/header.rs` vs `build_rle`/`encode_tree_emit`/`add_dynamic_tree` in `parse/ultra/{deflate_size,deflate}.rs`), but their COST-ACCOUNTING shapes differ: the level engine always tries all 3 RLE flags and trims precode length by codeword length; ultra re-walks all 8 use-16/17/18 combinations per block via `build_rle`'s shared size/emit walk and threads `hlit`/`hdist`/`hclen` through histogram-driven counts. Force-merging would couple that cost-accounting difference across engines for a wire-format match that is already achieved independently — not attempted this stage. `huffman/header.rs`'s module doc carries the pointer; unmerge is intentional, not oversight. |
 | Splitting (hot) | SAD streaming | O(1)/token, carries byte-identity L2-12. |
 | Splitting (exact) | uncapped recursive exact-cost | crown-gated (+0.00116 geomean lever). |
 | Matchfinder seed for squeeze | hc (replaces zopfli legacy hash/lz77 chain finder) | legacy finder is demoted duty; hc is faster and maintained. GATED: crown score must hold ≥ 3.205795 (seed changes outputs — score gate, not byte gate). If it loses ratio, keep legacy finder — measurement decides. |
@@ -111,9 +112,24 @@ in a later cleanup.
   EVERYWHERE (L0-12 + ultra), tests green. Pure `git mv` + import surgery.
 - **B. ONE BITSTREAM**: ultra emits through the word BitWriter. Gate: crown outputs
   byte-identical (emission is representation-independent), score unchanged.
-- **C. ONE HUFFMAN MODULE**: colocate fast/optimal builders + single header
-  emitter; near-optimal keeps the approximate builder (byte-identity); ultra keeps
-  katajainen. Gate: byte-identity both engines.
+- **C. ONE HUFFMAN MODULE (DONE 2026-07-21)**: `huffman/` is now a directory
+  module — `mod.rs` (shared `HuffmanCode` + re-exports), `fast.rs` (libdeflate
+  approximate builder, unchanged, still used by near-optimal + every hot
+  level), `optimal.rs` (katajainen + the RLE-aware count shaping
+  `optimize_huffman_for_rle`/`try_optimize_huffman_for_rle`/`ShapeDepth`,
+  MOVED here from `parse::ultra::deflate_size` since they shape Huffman
+  counts, not block-size math — `deflate_size` keeps calling them via the new
+  path and stays the home of the true-cost helpers they call back into),
+  `header.rs` (the level engine's ONE dynamic-header build+emit, moved from
+  the old `huffman.rs`). `tree.rs` (zopfli `tree.c` port) is dissolved:
+  `calculate_bit_lengths`/`lengths_to_symbols` (Huffman construction) joined
+  `optimal.rs`; `calculate_entropy` (a cost-model proxy, single consumer)
+  moved into `parse::ultra::squeeze`, its sole call site. Ultra's OWN
+  dynamic-header emitter (`deflate_size::build_rle` + `deflate::encode_tree_emit`)
+  is UNMERGED with `huffman::header` — see §3's "Dynamic-header wire format"
+  row for why. Gate: byte-identity both engines (L0/L1/L2/L6/L9/L12 × T1/T4 ×
+  {dickens, data.parquet} + `-F 15`/`-F 80` × 5-file ratio corpus, all
+  sha256-equal vs pre-stage HEAD); full test suite green; clippy/fmt clean.
 - **D. MATCHFINDER CONSOLIDATION (measured, riskiest)**: one trait over ht/hc/bt/
   lzfind; retire the zopfli legacy chain finder by seeding squeeze + the greedy
   splitter pre-pass from hc. Gate: crown score ≥ 3.205795 (this changes ultra
