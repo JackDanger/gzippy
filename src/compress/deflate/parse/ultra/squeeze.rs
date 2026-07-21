@@ -5,16 +5,56 @@
 //! 11 (`get_best_lengths`, `trace_backwards`, `follow_path`), and
 //! 12 (`lz77_optimal`, `lz77_optimal_fixed`, end-to-end FFI oracle).
 
-use super::deflate_size::{calculate_block_size, optimize_huffman_for_rle};
+use super::deflate_size::calculate_block_size;
 use super::hash::ZopfliHash;
 use super::lz77::{lz77_greedy, verify_len_dist, BlockState, LZ77Store};
 use super::symbols::{
     dist_extra_bits, dist_symbol, length_extra_bits, length_symbol, ZOPFLI_LARGE_FLOAT,
     ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_SIZE,
 };
-use crate::compress::deflate::huffman::katajainen::length_limited_code_lengths;
-use crate::compress::deflate::huffman::tree::calculate_entropy;
+use crate::compress::deflate::huffman::optimal::{
+    length_limited_code_lengths, optimize_huffman_for_rle,
+};
 use crate::compress::deflate::matchfinder::lzfind::{MatchFinder, MAX_MATCH_U16};
+
+// ── entropy cost model (port of Google Zopfli tree.c's ZopfliCalculateEntropy) ──
+
+// Must match C exactly — uses ln * kInvLog2, NOT log2().
+// The C code uses the truncated constant 1.4426950408889 (not LOG2_E =
+// 1.4426950408889634), which produces slightly different results.
+#[allow(clippy::approx_constant)]
+const K_INV_LOG2: f64 = 1.4426950408889;
+
+/// Idealized (continuous, unlimited) per-symbol bit-length cost estimate from
+/// a frequency histogram — the squeeze DP's cost-model proxy for what a real
+/// Huffman code would charge. Port of Google Zopfli `tree.c`'s
+/// `ZopfliCalculateEntropy`.
+///
+/// Lives here (not in `huffman::optimal`, alongside the OTHER `tree.c` half —
+/// `calculate_bit_lengths`/`lengths_to_symbols`) because it computes a COST
+/// MODEL quantity, not a Huffman code; `SymbolStats::calculate_statistics`
+/// below is its sole consumer (see `docs/compressor-architecture.md` §5
+/// Stage C).
+fn calculate_entropy(count: &[usize], bitlengths: &mut [f64]) {
+    let n = count.len();
+    let sum: u32 = count.iter().map(|&c| c as u32).sum();
+    let log2sum = (if sum == 0 {
+        (n as f64).ln()
+    } else {
+        (sum as f64).ln()
+    }) * K_INV_LOG2;
+
+    for i in 0..n {
+        if count[i] == 0 {
+            bitlengths[i] = log2sum;
+        } else {
+            bitlengths[i] = log2sum - (count[i] as f64).ln() * K_INV_LOG2;
+        }
+        if bitlengths[i] < 0.0 && bitlengths[i] > -1e-5 {
+            bitlengths[i] = 0.0;
+        }
+    }
+}
 
 // ── SymbolStats ──────────────────────────────────────────────────────────────
 
@@ -101,11 +141,11 @@ impl SymbolStats {
     /// Huffman code lengths computed from `freqs_from`'s frequency
     /// histograms, in place of the `calculate_entropy` proxy estimate.
     ///
-    /// The proxy (`tree::calculate_entropy`) is a continuous, unlimited
+    /// The proxy (`calculate_entropy` above) is a continuous, unlimited
     /// idealized bit-length; the actual encoder emits INTEGER,
     /// 15-bit-limited, RLE-smoothed code lengths (`optimize_huffman_for_rle`
     /// + `length_limited_code_lengths`, the same building blocks
-    /// `deflate_size`/`katajainen` use to emit the real tree). Pricing the
+    /// `huffman::optimal` uses to emit the real tree). Pricing the
     /// squeeze DP against the real lengths periodically lets it correct for
     /// proxy drift the entropy estimate can't see (RLE collapsing, the
     /// 15-bit cap, package-merge's integer rounding), which ECT's mechanism
@@ -1082,5 +1122,33 @@ mod tests {
         assert_eq!(a.dists[3], 6);
         // End symbol must always be 1.
         assert_eq!(a.litlens[256], 1);
+    }
+
+    #[test]
+    fn entropy_nonnegative() {
+        let counts = vec![1usize, 2, 3, 4, 5, 6, 7, 8];
+        let mut bl = vec![0.0f64; 8];
+        calculate_entropy(&counts, &mut bl);
+        for &b in &bl {
+            assert!(b >= 0.0, "negative entropy {}", b);
+        }
+    }
+
+    #[test]
+    fn entropy_uniform_is_log2n() {
+        // For n uniform symbols the entropy per symbol is log2(n).
+        let n = 8;
+        let counts = vec![1usize; n];
+        let mut bl = vec![0.0f64; n];
+        calculate_entropy(&counts, &mut bl);
+        let expected = (n as f64).log2();
+        for &b in &bl {
+            assert!(
+                (b - expected).abs() < 1e-9,
+                "expected {} got {}",
+                expected,
+                b
+            );
+        }
     }
 }

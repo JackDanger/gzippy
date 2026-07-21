@@ -1,13 +1,23 @@
-//! Block-size estimation, dynamic-tree size, RLE optimizer.
+//! Block-size estimation, dynamic-tree size.
 //! Size-only half of Google Zopfli deflate.c (lines 74-621).
 //! The bit-emitting half lives in `deflate.rs` (Step 14-15).
+//!
+//! The RLE-aware Huffman-count shaping (`optimize_huffman_for_rle` /
+//! `try_optimize_huffman_for_rle` / `ShapeDepth`) MOVED to
+//! [`crate::compress::deflate::huffman::optimal`] (Stage C,
+//! `docs/compressor-architecture.md`) — it shapes Huffman symbol counts, not
+//! block-size math. This module keeps calling it via that path and stays the
+//! home of the true-cost helpers (`calculate_tree_size`,
+//! `calculate_block_symbol_size_given_counts`) that function calls back into.
 
 use super::lz77::LZ77Store;
 use super::symbols::{
     dist_symbol, dist_symbol_extra_bits, length_symbol, length_symbol_extra_bits, ZOPFLI_NUM_D,
     ZOPFLI_NUM_LL,
 };
-use crate::compress::deflate::huffman::tree::calculate_bit_lengths;
+use crate::compress::deflate::huffman::optimal::{
+    calculate_bit_lengths, try_optimize_huffman_for_rle, ShapeDepth,
+};
 
 /// Ensures there are at least 2 distance codes (some decoders require it).
 pub fn patch_distance_codes_for_buggy_decoders(d_lengths: &mut [u32; ZOPFLI_NUM_D]) {
@@ -242,7 +252,7 @@ fn calculate_block_symbol_size_small(
     result
 }
 
-fn calculate_block_symbol_size_given_counts(
+pub(crate) fn calculate_block_symbol_size_given_counts(
     ll_counts: &[usize; ZOPFLI_NUM_LL],
     d_counts: &[usize; ZOPFLI_NUM_D],
     ll_lengths: &[u32; ZOPFLI_NUM_LL],
@@ -286,160 +296,6 @@ fn calculate_block_symbol_size(
     calculate_block_symbol_size_given_counts(
         &ll_counts, &d_counts, ll_lengths, d_lengths, lz77, lstart, lend,
     )
-}
-
-/// In-place histogram smoothing that biases the upcoming RLE encoding toward
-/// reusable runs. Mirrors the C `OptimizeHuffmanForRle` exactly.
-pub fn optimize_huffman_for_rle(counts: &mut [usize]) {
-    let mut length = counts.len() as isize;
-    // Trim trailing zeros — we may not modify them (would lengthen the code).
-    loop {
-        if length == 0 {
-            return;
-        }
-        if counts[(length - 1) as usize] != 0 {
-            break;
-        }
-        length -= 1;
-    }
-    let length = length as usize;
-
-    let mut good_for_rle = vec![false; length];
-
-    // Mark existing reasonable runs so they don't get smoothed away.
-    let mut symbol = counts[0];
-    let mut stride: usize = 0;
-    for i in 0..=length {
-        if i == length || counts[i] != symbol {
-            if (symbol == 0 && stride >= 5) || (symbol != 0 && stride >= 7) {
-                for k in 0..stride {
-                    good_for_rle[i - k - 1] = true;
-                }
-            }
-            stride = 1;
-            if i != length {
-                symbol = counts[i];
-            }
-        } else {
-            stride += 1;
-        }
-    }
-
-    // Replace counts that promise more rle codes if collapsed.
-    let mut stride: usize = 0;
-    let mut limit: usize = counts[0];
-    let mut sum: usize = 0;
-    for i in 0..=length {
-        if i == length || good_for_rle[i] || counts[i].abs_diff(limit) >= 4 {
-            if stride >= 4 || (stride >= 3 && sum == 0) {
-                let mut count = (sum + stride / 2) / stride;
-                if count < 1 {
-                    count = 1;
-                }
-                if sum == 0 {
-                    count = 0;
-                }
-                for k in 0..stride {
-                    counts[i - k - 1] = count;
-                }
-            }
-            stride = 0;
-            sum = 0;
-            limit = if i + 3 < length {
-                (counts[i] + counts[i + 1] + counts[i + 2] + counts[i + 3] + 2) / 4
-            } else if i < length {
-                counts[i]
-            } else {
-                0
-            };
-        }
-        stride += 1;
-        if i != length {
-            sum += counts[i];
-        }
-    }
-}
-
-/// Table-shaping search depth for the RLE-smoothing candidate set. `TwoWay`
-/// is the original zopfli behavior ({raw,raw} vs {smoothed,smoothed} — ll and
-/// d counts smoothed only together); `FourWay` additionally tries smoothing
-/// ll/d independently ({smoothed,raw}, {raw,smoothed}), mirroring the
-/// reference optimal-parse frontier's `plan_dynamic` (fulcrum
-/// `src/ratio/encode.rs`), which found those two combos matter (never a
-/// regression AT A FIXED BLOCK: strictly more candidates, keep-min).
-///
-/// Kept SEPARATE from block-PLACEMENT decisions on purpose: measured, letting
-/// `FourWay` costing leak into the recursive/greedy block-splitter's search
-/// perturbs the split-position search (a non-exhaustive narrowing walk) onto
-/// a different, occasionally WORSE, local optimum for the chosen boundaries
-/// — even though each individual per-block table choice only ever improves.
-/// So every SEARCH/cost-estimation call site (`calculate_block_size`,
-/// `calculate_block_size_auto_type`, and therefore the block splitters) uses
-/// `TwoWay`, bit-for-bit reproducing the pre-table-shaping search/placement
-/// trajectory; only the literal FINAL emission call
-/// (`get_dynamic_lengths_final`, `deflate.rs`'s `add_lz77_block`) uses
-/// `FourWay`, so table-shaping can only ever shrink whatever block placement
-/// search already chose — never move the boundaries.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ShapeDepth {
-    TwoWay,
-    FourWay,
-}
-
-fn try_optimize_huffman_for_rle(
-    lz77: &LZ77Store<'_>,
-    lstart: usize,
-    lend: usize,
-    ll_counts: &[usize; ZOPFLI_NUM_LL],
-    d_counts: &[usize; ZOPFLI_NUM_D],
-    ll_lengths: &mut [u32; ZOPFLI_NUM_LL],
-    d_lengths: &mut [u32; ZOPFLI_NUM_D],
-    depth: ShapeDepth,
-) -> f64 {
-    let treesize = calculate_tree_size(ll_lengths, d_lengths) as f64;
-    let datasize = calculate_block_symbol_size_given_counts(
-        ll_counts, d_counts, ll_lengths, d_lengths, lz77, lstart, lend,
-    ) as f64;
-    let mut best_total = treesize + datasize;
-    let mut best_ll = *ll_lengths;
-    let mut best_d = *d_lengths;
-
-    let mut sll_counts = *ll_counts;
-    optimize_huffman_for_rle(&mut sll_counts);
-    let mut sd_counts = *d_counts;
-    optimize_huffman_for_rle(&mut sd_counts);
-
-    let mut sll_lengths = [0u32; ZOPFLI_NUM_LL];
-    calculate_bit_lengths(&sll_counts, 15, &mut sll_lengths);
-    let mut sd_lengths = [0u32; ZOPFLI_NUM_D];
-    calculate_bit_lengths(&sd_counts, 15, &mut sd_lengths);
-    patch_distance_codes_for_buggy_decoders(&mut sd_lengths);
-
-    // TwoWay: only {smoothed, smoothed} (the original zopfli candidate).
-    // FourWay: additionally {smoothed, raw} and {raw, smoothed}.
-    let mut candidates: Vec<(&[u32; ZOPFLI_NUM_LL], &[u32; ZOPFLI_NUM_D])> = Vec::with_capacity(3);
-    if depth == ShapeDepth::FourWay {
-        candidates.push((&sll_lengths, d_lengths));
-        candidates.push((ll_lengths, &sd_lengths));
-    }
-    candidates.push((&sll_lengths, &sd_lengths));
-
-    for (cand_ll, cand_d) in candidates {
-        let treesize_c = calculate_tree_size(cand_ll, cand_d) as f64;
-        let datasize_c = calculate_block_symbol_size_given_counts(
-            ll_counts, d_counts, cand_ll, cand_d, lz77, lstart, lend,
-        ) as f64;
-        let total_c = treesize_c + datasize_c;
-        if total_c < best_total {
-            best_total = total_c;
-            best_ll = *cand_ll;
-            best_d = *cand_d;
-        }
-    }
-
-    *ll_lengths = best_ll;
-    *d_lengths = best_d;
-    best_total
 }
 
 fn get_dynamic_lengths_impl(

@@ -31,7 +31,7 @@ use super::symbols::{
 };
 use super::ZopfliOptions;
 use crate::compress::deflate::bitstream::BitWriter;
-use crate::compress::deflate::huffman::tree::lengths_to_symbols;
+use crate::compress::deflate::huffman::optimal::lengths_to_symbols;
 
 // ── Step 15: tree emission ───────────────────────────────────────────────────
 
@@ -57,7 +57,7 @@ fn encode_tree_emit(
         Some(&mut rle_bits),
     );
 
-    use crate::compress::deflate::huffman::tree::calculate_bit_lengths;
+    use crate::compress::deflate::huffman::optimal::calculate_bit_lengths;
     let mut clcl = [0u32; 19];
     calculate_bit_lengths(&clcounts, 7, &mut clcl);
     let mut clsymbols = [0u32; 19];
@@ -126,7 +126,7 @@ fn encode_tree_size_local(
     use_17: bool,
     use_18: bool,
 ) -> usize {
-    use crate::compress::deflate::huffman::tree::calculate_bit_lengths;
+    use crate::compress::deflate::huffman::optimal::calculate_bit_lengths;
     let (clcounts, hclen, _hlit, _hdist) =
         build_rle(ll_lengths, d_lengths, use_16, use_17, use_18, None, None);
 
