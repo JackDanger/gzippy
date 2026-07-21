@@ -2,6 +2,21 @@
 //! 15 (tree emission, block emission, deflate driver).
 //!
 //! Port of the bit-emitting half of Google Zopfli deflate.c.
+//!
+//! Bit emission goes through the shared word-oriented [`BitWriter`]
+//! (`compress::deflate::bitstream`) — the same writer the level engine
+//! (`parse/{greedy,lazy,fast,near_optimal}.rs`) uses (compressor-architecture
+//! Stage B unification). Zopfli's own bit-at-a-time writer (`out`+`bp`
+//! threading) was measured to cost zero wall-clock on `--ultra` workloads
+//! (a Step-27 whole-byte-fragment prototype showed no improvement — the
+//! squeeze loop dominates, not bit emission) and has been retired; its
+//! differential unit test against an independent bit-at-a-time reference
+//! now lives on the shared writer in `bitstream.rs`.
+//!
+//! DEFLATE canonical codewords are MSB-first (RFC 1951 §3.2.2); everything
+//! else (extra bits, header fields, RLE counts) is LSB-first. The shared
+//! writer's `add_huffman_bits` handles the MSB-first reversal so zopfli's
+//! ordinary (non-reversed) `lengths_to_symbols` tables plug in unchanged.
 
 use super::blocksplit::block_split;
 use super::deflate_size::{
@@ -15,69 +30,8 @@ use super::symbols::{
     length_extra_bits_value, length_symbol, ZOPFLI_MASTER_BLOCK_SIZE, ZOPFLI_NUM_D, ZOPFLI_NUM_LL,
 };
 use super::ZopfliOptions;
+use crate::compress::deflate::bitstream::BitWriter;
 use crate::compress::deflate::huffman::tree::lengths_to_symbols;
-
-/// Bit-level writer that appends to a byte buffer. The C code uses a
-/// `(out, outsize, bp)` triple where `bp` is the bit pointer in `[0, 7]`;
-/// when `bp == 0` a fresh zero byte is appended before any bits land.
-///
-/// Note: a Step-27 prototype that wrote whole byte-fragments per
-/// iteration showed zero measurable wall-clock improvement on the
-/// `--ultra` workloads (the squeeze loop dominates, not bit emission),
-/// so we kept the literal one-bit-per-iteration C port.
-pub struct BitWriter<'a> {
-    pub out: &'a mut Vec<u8>,
-    pub bp: u8,
-}
-
-impl<'a> BitWriter<'a> {
-    /// Creates a new writer wrapping `out`. `bp` is the bit pointer for
-    /// the *current* tail byte: 0 means the next bit will allocate a new
-    /// byte; 1..=7 means there is a half-filled tail byte already.
-    pub fn new(out: &'a mut Vec<u8>, bp: u8) -> Self {
-        debug_assert!(bp < 8);
-        Self { out, bp }
-    }
-
-    /// Append a single bit (0 or 1).
-    pub fn add_bit(&mut self, bit: u8) {
-        debug_assert!(bit <= 1);
-        if self.bp == 0 {
-            self.out.push(0);
-        }
-        let n = self.out.len();
-        self.out[n - 1] |= bit << self.bp;
-        self.bp = (self.bp + 1) & 7;
-    }
-
-    /// Append `length` bits of `symbol`, LSB-first. Used for everything
-    /// except canonical Huffman codes.
-    pub fn add_bits(&mut self, symbol: u32, length: u32) {
-        for i in 0..length {
-            let bit = ((symbol >> i) & 1) as u8;
-            if self.bp == 0 {
-                self.out.push(0);
-            }
-            let n = self.out.len();
-            self.out[n - 1] |= bit << self.bp;
-            self.bp = (self.bp + 1) & 7;
-        }
-    }
-
-    /// Append `length` bits of `symbol`, MSB-first. The DEFLATE spec
-    /// requires this orientation for canonical Huffman codes.
-    pub fn add_huffman_bits(&mut self, symbol: u32, length: u32) {
-        for i in 0..length {
-            let bit = ((symbol >> (length - i - 1)) & 1) as u8;
-            if self.bp == 0 {
-                self.out.push(0);
-            }
-            let n = self.out.len();
-            self.out[n - 1] |= bit << self.bp;
-            self.bp = (self.bp + 1) & 7;
-        }
-    }
-}
 
 // ── Step 15: tree emission ───────────────────────────────────────────────────
 
@@ -89,7 +43,7 @@ fn encode_tree_emit(
     use_16: bool,
     use_17: bool,
     use_18: bool,
-    w: &mut BitWriter<'_>,
+    w: &mut BitWriter,
 ) {
     let mut rle: Vec<u32> = Vec::new();
     let mut rle_bits: Vec<u32> = Vec::new();
@@ -109,21 +63,21 @@ fn encode_tree_emit(
     let mut clsymbols = [0u32; 19];
     lengths_to_symbols(&clcl, 7, &mut clsymbols);
 
-    w.add_bits(hlit as u32, 5);
-    w.add_bits(hdist as u32, 5);
-    w.add_bits(hclen as u32, 4);
+    w.add_bits(hlit as u64, 5);
+    w.add_bits(hdist as u64, 5);
+    w.add_bits(hclen as u64, 4);
 
     for i in 0..hclen + 4 {
-        w.add_bits(clcl[CL_ORDER_PUB[i]], 3);
+        w.add_bits(clcl[CL_ORDER_PUB[i]] as u64, 3);
     }
 
     for i in 0..rle.len() {
         let sym = rle[i] as usize;
         w.add_huffman_bits(clsymbols[sym], clcl[sym]);
         match sym {
-            16 => w.add_bits(rle_bits[i], 2),
-            17 => w.add_bits(rle_bits[i], 3),
-            18 => w.add_bits(rle_bits[i], 7),
+            16 => w.add_bits(rle_bits[i] as u64, 2),
+            17 => w.add_bits(rle_bits[i] as u64, 3),
+            18 => w.add_bits(rle_bits[i] as u64, 7),
             _ => {}
         }
     }
@@ -136,7 +90,7 @@ fn encode_tree_emit(
 fn add_dynamic_tree(
     ll_lengths: &[u32; ZOPFLI_NUM_LL],
     d_lengths: &[u32; ZOPFLI_NUM_D],
-    w: &mut BitWriter<'_>,
+    w: &mut BitWriter,
 ) {
     let mut best = 0u32;
     let mut best_size: usize = 0;
@@ -204,7 +158,7 @@ fn add_lz77_data(
     ll_lengths: &[u32; ZOPFLI_NUM_LL],
     d_symbols: &[u32; ZOPFLI_NUM_D],
     d_lengths: &[u32; ZOPFLI_NUM_D],
-    w: &mut BitWriter<'_>,
+    w: &mut BitWriter,
 ) {
     let mut testlength: usize = 0;
     for i in lstart..lend {
@@ -223,12 +177,12 @@ fn add_lz77_data(
             debug_assert!(d_lengths[ds] > 0);
             w.add_huffman_bits(ll_symbols[lls], ll_lengths[lls]);
             w.add_bits(
-                length_extra_bits_value(litlen as i32) as u32,
+                length_extra_bits_value(litlen as i32) as u64,
                 length_extra_bits(litlen as i32) as u32,
             );
             w.add_huffman_bits(d_symbols[ds], d_lengths[ds]);
             w.add_bits(
-                dist_extra_bits_value(dist as i32) as u32,
+                dist_extra_bits_value(dist as i32) as u64,
                 dist_extra_bits(dist as i32) as u32,
             );
             testlength += litlen as usize;
@@ -246,7 +200,7 @@ fn add_non_compressed_block(
     in_: &[u8],
     instart: usize,
     inend: usize,
-    w: &mut BitWriter<'_>,
+    w: &mut BitWriter,
 ) {
     let mut pos = instart;
     loop {
@@ -257,23 +211,17 @@ fn add_non_compressed_block(
         let currentfinal = pos + blocksize as usize >= inend;
         let nlen: u16 = !blocksize;
 
-        w.add_bit(if final_ && currentfinal { 1 } else { 0 });
+        w.add_bits(if final_ && currentfinal { 1 } else { 0 }, 1);
         // BTYPE 00 (LSB-first: two zero bits).
-        w.add_bit(0);
-        w.add_bit(0);
+        w.add_bits(0, 2);
 
         // Align to next byte boundary; any leftover bits in the current
         // byte are zero-padded (they were already zero-initialised).
-        w.bp = 0;
+        w.align_to_byte();
 
-        w.out.push((blocksize & 0xFF) as u8);
-        w.out.push(((blocksize >> 8) & 0xFF) as u8);
-        w.out.push((nlen & 0xFF) as u8);
-        w.out.push(((nlen >> 8) & 0xFF) as u8);
-
-        for i in 0..blocksize as usize {
-            w.out.push(in_[pos + i]);
-        }
+        w.write_u16_le(blocksize);
+        w.write_u16_le(nlen);
+        w.write_aligned_bytes(&in_[pos..pos + blocksize as usize]);
 
         if currentfinal {
             break;
@@ -294,7 +242,7 @@ fn add_lz77_block(
     lstart: usize,
     lend: usize,
     expected_data_size: usize,
-    w: &mut BitWriter<'_>,
+    w: &mut BitWriter,
 ) {
     if btype == 0 {
         let length = lz77.byte_range(lstart, lend);
@@ -304,9 +252,9 @@ fn add_lz77_block(
         return;
     }
 
-    w.add_bit(if final_ { 1 } else { 0 });
-    w.add_bit((btype & 1) as u8);
-    w.add_bit(((btype & 2) >> 1) as u8);
+    w.add_bits(if final_ { 1 } else { 0 }, 1);
+    w.add_bits((btype & 1) as u64, 1);
+    w.add_bits(((btype & 2) >> 1) as u64, 1);
 
     let mut ll_lengths = [0u32; ZOPFLI_NUM_LL];
     let mut d_lengths = [0u32; ZOPFLI_NUM_D];
@@ -315,14 +263,14 @@ fn add_lz77_block(
         get_fixed_tree(&mut ll_lengths, &mut d_lengths);
     } else {
         debug_assert_eq!(btype, 2);
-        let detect_tree_size = w.out.len();
+        let detect_tree_size = w.byte_len();
         // FourWay table-shaping: block boundaries are final by this point
         // (see `get_dynamic_lengths_final`'s doc), so the extra smoothing
         // candidates can only shrink this block's emitted size.
         get_dynamic_lengths_final(lz77, lstart, lend, &mut ll_lengths, &mut d_lengths);
         add_dynamic_tree(&ll_lengths, &d_lengths, w);
         if options.verbose != 0 {
-            eprintln!("treesize: {}", w.out.len() - detect_tree_size);
+            eprintln!("treesize: {}", w.byte_len() - detect_tree_size);
         }
     }
 
@@ -331,7 +279,7 @@ fn add_lz77_block(
     lengths_to_symbols(&ll_lengths, 15, &mut ll_symbols);
     lengths_to_symbols(&d_lengths, 15, &mut d_symbols);
 
-    let detect_block_size = w.out.len();
+    let detect_block_size = w.byte_len();
     add_lz77_data(
         lz77,
         lstart,
@@ -355,7 +303,7 @@ fn add_lz77_block(
                 lz77.litlens[i] as usize
             };
         }
-        let compressed_size = w.out.len() - detect_block_size;
+        let compressed_size = w.byte_len() - detect_block_size;
         eprintln!(
             "compressed block size: {} ({}k) (unc: {})",
             compressed_size,
@@ -376,7 +324,7 @@ fn add_lz77_block_auto_type(
     lstart: usize,
     lend: usize,
     expected_data_size: usize,
-    w: &mut BitWriter<'_>,
+    w: &mut BitWriter,
 ) {
     let uncompressedcost = calculate_block_size(lz77, lstart, lend, 0);
     let mut fixedcost = calculate_block_size(lz77, lstart, lend, 1);
@@ -626,9 +574,12 @@ fn refine_split_and_squeeze<'a>(
 
 // ── Step 15: deflate driver ──────────────────────────────────────────────────
 
-/// Compress `in_[instart..inend]` into one deflate sub-stream. `bp` is the
-/// initial bit pointer; the new bit pointer is returned. For `btype == 2`
-/// this can produce multiple deflate blocks via the splitter.
+/// Compress `in_[instart..inend]` into one deflate sub-stream, writing
+/// through the caller's shared `w` (state — the pending sub-byte bits —
+/// carries across calls the same way the old `bp` threading did, since
+/// `w` is never flushed to a byte boundary between blocks or master-block
+/// chunks). For `btype == 2` this can produce multiple deflate blocks via
+/// the splitter.
 #[allow(clippy::too_many_arguments)]
 pub fn deflate_part(
     options: &ZopfliOptions,
@@ -637,22 +588,19 @@ pub fn deflate_part(
     in_: &[u8],
     instart: usize,
     inend: usize,
-    bp: u8,
-    out: &mut Vec<u8>,
-) -> u8 {
-    let mut w = BitWriter::new(out, bp);
-
+    w: &mut BitWriter,
+) {
     if btype == 0 {
-        add_non_compressed_block(options, final_, in_, instart, inend, &mut w);
-        return w.bp;
+        add_non_compressed_block(options, final_, in_, instart, inend, w);
+        return;
     }
 
     if btype == 1 {
         let mut store = LZ77Store::new(in_);
         lz77_optimal_fixed(in_, instart, inend, &mut store);
         let size = store.size();
-        add_lz77_block(options, btype, final_, &store, 0, size, 0, &mut w);
-        return w.bp;
+        add_lz77_block(options, btype, final_, &store, 0, size, 0, w);
+        return;
     }
 
     // btype == 2
@@ -791,29 +739,22 @@ pub fn deflate_part(
     for i in 0..=np {
         let start = if i == 0 { 0 } else { splitpoints[i - 1] };
         let end = if i == np { lz77.size() } else { splitpoints[i] };
-        add_lz77_block_auto_type(options, i == np && final_, &lz77, start, end, 0, &mut w);
+        add_lz77_block_auto_type(options, i == np && final_, &lz77, start, end, 0, w);
     }
-
-    w.bp
 }
 
 /// Top-level deflate. Slices `in_` into ≤1 MB master blocks (per
-/// `ZOPFLI_MASTER_BLOCK_SIZE`) and chains `deflate_part` calls. The returned
-/// bit pointer is appended at the very end.
-pub fn deflate(
-    options: &ZopfliOptions,
-    btype: i32,
-    final_: bool,
-    in_: &[u8],
-    bp: u8,
-    out: &mut Vec<u8>,
-) -> u8 {
+/// `ZOPFLI_MASTER_BLOCK_SIZE`) and chains `deflate_part` calls over one
+/// shared writer (adopting `out` write-through, same as the level engine's
+/// `BitWriter::from_vec` — see `mod.rs`), then hands the finished bytes
+/// (any trailing partial byte zero-padded) back to `out`.
+pub fn deflate(options: &ZopfliOptions, btype: i32, final_: bool, in_: &[u8], out: &mut Vec<u8>) {
     let offset = out.len();
     let insize = in_.len();
-    let mut bp = bp;
+    let mut w = BitWriter::from_vec(std::mem::take(out));
     let mut i: usize = 0;
     if ZOPFLI_MASTER_BLOCK_SIZE == 0 {
-        bp = deflate_part(options, btype, final_, in_, 0, insize, bp, out);
+        deflate_part(options, btype, final_, in_, 0, insize, &mut w);
     } else {
         loop {
             let masterfinal = i + ZOPFLI_MASTER_BLOCK_SIZE >= insize;
@@ -823,13 +764,14 @@ pub fn deflate(
             } else {
                 ZOPFLI_MASTER_BLOCK_SIZE
             };
-            bp = deflate_part(options, btype, final2, in_, i, i + size, bp, out);
+            deflate_part(options, btype, final2, in_, i, i + size, &mut w);
             i += size;
             if i >= insize {
                 break;
             }
         }
     }
+    *out = w.finish();
     if options.verbose != 0 {
         let written = out.len() - offset;
         let saved = if insize > 0 {
@@ -841,125 +783,5 @@ pub fn deflate(
             "Original Size: {}, Deflate: {}, Compression: {}% Removed",
             insize, written, saved
         );
-    }
-    bp
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a writer, run a closure, return the resulting (bytes, bp).
-    fn run<F: FnOnce(&mut BitWriter<'_>)>(f: F) -> (Vec<u8>, u8) {
-        let mut out = Vec::new();
-        let mut w = BitWriter::new(&mut out, 0);
-        f(&mut w);
-        let bp = w.bp;
-        (out, bp)
-    }
-
-    #[test]
-    fn add_bit_packs_lsb_first() {
-        let (bytes, bp) = run(|w| {
-            // Write 1, 0, 1, 1 → byte = 0b0000_1101 = 0x0D, bp = 4.
-            w.add_bit(1);
-            w.add_bit(0);
-            w.add_bit(1);
-            w.add_bit(1);
-        });
-        assert_eq!(bytes, vec![0x0D]);
-        assert_eq!(bp, 4);
-    }
-
-    #[test]
-    fn add_bits_lsb_first_eight_bits_makes_one_byte() {
-        let (bytes, bp) = run(|w| {
-            // 0xA5 = 0b1010_0101 — written LSB-first as bits 1,0,1,0,0,1,0,1.
-            w.add_bits(0xA5, 8);
-        });
-        assert_eq!(bytes, vec![0xA5]);
-        // 8 bits modulo 8 == 0 → bp wraps back to 0.
-        assert_eq!(bp, 0);
-    }
-
-    #[test]
-    fn add_bits_spans_two_bytes() {
-        let (bytes, bp) = run(|w| {
-            // 12 bits of 0xABC = 0b1010_1011_1100, LSB-first.
-            // First 8 bits land in byte 0: bits 0..8 of 0xABC = 0xBC.
-            // Next 4 bits land in byte 1, low nibble: 0xA.
-            w.add_bits(0xABC, 12);
-        });
-        assert_eq!(bytes, vec![0xBC, 0x0A]);
-        assert_eq!(bp, 4);
-    }
-
-    #[test]
-    fn add_huffman_bits_msb_first() {
-        let (bytes, bp) = run(|w| {
-            // Symbol 0b101, length 3. MSB-first → emit 1, 0, 1.
-            // LSB-stuffed into byte 0 → bits 0..3 = 1,0,1 → 0b0000_0101 = 0x05.
-            w.add_huffman_bits(0b101, 3);
-        });
-        assert_eq!(bytes, vec![0x05]);
-        assert_eq!(bp, 3);
-    }
-
-    #[test]
-    fn matches_c_addbits_addhuffmanbits_for_random_sequence() {
-        // Mirror the C routines bit-for-bit using a literal port; build a
-        // reference byte stream and assert our writer matches.
-        fn ref_add_bits(out: &mut Vec<u8>, bp: &mut u8, symbol: u32, length: u32) {
-            for i in 0..length {
-                let bit = ((symbol >> i) & 1) as u8;
-                if *bp == 0 {
-                    out.push(0);
-                }
-                let n = out.len();
-                out[n - 1] |= bit << *bp;
-                *bp = (*bp + 1) & 7;
-            }
-        }
-        fn ref_add_huffman(out: &mut Vec<u8>, bp: &mut u8, symbol: u32, length: u32) {
-            for i in 0..length {
-                let bit = ((symbol >> (length - i - 1)) & 1) as u8;
-                if *bp == 0 {
-                    out.push(0);
-                }
-                let n = out.len();
-                out[n - 1] |= bit << *bp;
-                *bp = (*bp + 1) & 7;
-            }
-        }
-
-        // Deterministic LCG so the test is reproducible.
-        let mut s: u32 = 0xDEADBEEF;
-        let mut next = || -> u32 {
-            s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            s
-        };
-
-        let mut ref_out = Vec::new();
-        let mut ref_bp: u8 = 0;
-        let mut got_out = Vec::new();
-        let got_bp;
-        {
-            let mut w = BitWriter::new(&mut got_out, 0);
-            for _ in 0..200 {
-                let r = next();
-                let length = (r % 16) + 1; // 1..=16 bits
-                let symbol = next() & ((1u32 << length) - 1);
-                if r & 0x10 == 0 {
-                    ref_add_bits(&mut ref_out, &mut ref_bp, symbol, length);
-                    w.add_bits(symbol, length);
-                } else {
-                    ref_add_huffman(&mut ref_out, &mut ref_bp, symbol, length);
-                    w.add_huffman_bits(symbol, length);
-                }
-            }
-            got_bp = w.bp;
-        }
-        assert_eq!(got_out, ref_out);
-        assert_eq!(got_bp, ref_bp);
     }
 }

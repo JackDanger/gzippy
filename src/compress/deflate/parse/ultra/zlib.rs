@@ -44,7 +44,7 @@ pub fn zlib_compress(options: &ZopfliOptions, in_: &[u8], out: &mut Vec<u8>) {
     out.push((cmfflg / 256) as u8);
     out.push((cmfflg % 256) as u8);
 
-    deflate(options, 2, true, in_, 0, out);
+    deflate(options, 2, true, in_, out);
 
     out.push(((checksum >> 24) & 0xff) as u8);
     out.push(((checksum >> 16) & 0xff) as u8);

@@ -28,7 +28,7 @@ pub fn gzip_compress(options: &ZopfliOptions, in_: &[u8], out: &mut Vec<u8>) {
     out.push(2); // XFL = best compression
     out.push(3); // OS = Unix
 
-    deflate(options, 2, true, in_, 0, out);
+    deflate(options, 2, true, in_, out);
 
     // CRC32 (little-endian).
     out.push((crcvalue & 0xff) as u8);
