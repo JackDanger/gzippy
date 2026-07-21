@@ -35,7 +35,6 @@ pub mod parse;
 pub mod tables;
 
 use bitstream::BitWriter;
-use level::Strategy;
 use tables::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 
 /// Largest payload of a single stored (BTYPE=00) sub-block.
@@ -150,12 +149,7 @@ fn deflate_into(
         emit_stored_block(bw, &[], is_last);
     } else {
         let params = level::params(level);
-        if params.strategy == Strategy::Stored {
-            // Level 0: uncompressed blocks over the whole (new) input.
-            emit_stored_block(bw, &buf[data_start..in_end], is_last);
-        } else {
-            parse::compress(buf, data_start, in_end, &params, is_last, bw);
-        }
+        parse::compress(buf, data_start, in_end, &params, is_last, bw);
     }
 
     // Non-final chunk: close on a clean byte boundary with a sync-flush marker
