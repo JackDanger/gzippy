@@ -90,7 +90,7 @@ pub fn compress(options: &ZopfliOptions, format: ZopfliFormat, in_: &[u8]) -> Ve
         ZopfliFormat::Gzip => gzip::gzip_compress(options, in_, &mut out),
         ZopfliFormat::Zlib => zlib::zlib_compress(options, in_, &mut out),
         ZopfliFormat::Deflate => {
-            deflate::deflate(options, 2, true, in_, 0, &mut out);
+            deflate::deflate(options, 2, true, in_, &mut out);
         }
     }
     out

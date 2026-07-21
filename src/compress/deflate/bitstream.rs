@@ -76,6 +76,16 @@ impl BitWriter {
         self.bitcount
     }
 
+    /// Number of complete bytes already flushed to the sink. Diagnostics
+    /// only (e.g. `--verbose` block-size reporting) — does NOT include the
+    /// up-to-7 pending bits still held in the accumulator, so two readings
+    /// straddling a flush boundary can differ from a byte-exact tally by a
+    /// byte. No production/gated code path depends on the exact value.
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.out.len()
+    }
+
     /// Add the low `n` bits of `val` to the stream.
     ///
     /// `add_bits`/`ADD_BITS` in libdeflate requires the caller to flush often
@@ -94,6 +104,32 @@ impl BitWriter {
         }
         self.bitbuf |= val << self.bitcount;
         self.bitcount += n;
+    }
+
+    /// Add a canonical Huffman codeword, MSB-first (the DEFLATE spec's
+    /// orientation for codewords, RFC 1951 §3.2.2 — "Huffman codes are
+    /// packed starting with the most-significant bit of the code"). Every
+    /// OTHER bit written by this module — literal/length/distance extra
+    /// bits, header fields, RLE repeat counts — is LSB-first via
+    /// [`add_bits`](Self::add_bits); only codewords need the reversal.
+    ///
+    /// Implemented by reversing the low `length` bits of `symbol` and
+    /// feeding the result through the same LSB-first accumulator as
+    /// `add_bits`, so a canonical code table can be built in ordinary
+    /// (non-reversed) form and handed straight to this method — the
+    /// counterpart convention to `mod.rs`'s dynamic-header path, which
+    /// instead pre-reverses codewords at table-build time and emits them
+    /// with plain `add_bits`. Both conventions produce byte-identical
+    /// output; this one is what `parse/ultra` (the zopfli-class encoder)
+    /// was ported from (`libdeflate`/zopfli's bit-at-a-time `AddHuffmanBits`).
+    #[inline]
+    pub fn add_huffman_bits(&mut self, symbol: u32, length: u32) {
+        debug_assert!(length <= 32, "add_huffman_bits length={length} too large");
+        if length == 0 {
+            return;
+        }
+        let reversed = (symbol as u64).reverse_bits() >> (64 - length);
+        self.add_bits(reversed, length);
     }
 
     /// `ADD_BITS` — pure accumulate with no flush and no bounds check.
@@ -180,14 +216,39 @@ impl BitWriter {
 
     /// Pad with zero bits up to the next byte boundary and flush.
     ///
-    /// The pad bits are implicitly zero because only the low `bitcount` bits of
-    /// `bitbuf` are ever set.
+    /// Correctness note (found while porting `parse::ultra`'s stored-block
+    /// emitter onto this writer, 2026-07-20): an earlier version computed
+    /// `pad = (8 - (bitcount & 7)) & 7` and added it to `bitcount` BEFORE
+    /// flushing. For any incoming `bitcount` in `57..=63` that lands
+    /// EXACTLY on `bitcount + pad == 64`, and `flush_bits`'s
+    /// `bitbuf >>= bitcount & !7` becomes `bitbuf >>= 64` — undefined for a
+    /// Rust shift, and on x86-64 the hardware SHR/SHL masks the count to 6
+    /// bits, so `>> 64` silently compiles to a no-op shift (`>> 0`) instead
+    /// of clearing the accumulator. `bitbuf` then still holds the just-flushed
+    /// bits, and the NEXT `add_bits` ORs new bits on top of that stale word,
+    /// corrupting the stream. Confirmed with a minimal repro (63 one-bits,
+    /// then `align_to_byte()`, then one zero-bit: the trailing byte comes out
+    /// `0x7f` instead of `0x00`) and reproduced for real via
+    /// `parse::ultra::deflate`'s stored-block path on `data.parquet -F15`
+    /// (decodes correctly for the first ~10.8 of 20.8 MB, then diverges —
+    /// `ultra`'s frequent STORED blocks on binary/columnar data land on the
+    /// unlucky `bitcount` window far more often than the mostly-text
+    /// corpus files that passed byte-identity clean).
+    ///
+    /// Fixed by never manufacturing a `bitcount > 63` value at all: flush
+    /// whatever complete bytes are already safely flushable (`bitcount` here
+    /// is always `<= 63`, so this is the ordinary safe path), then — exactly
+    /// like [`finish`](Self::finish)'s trailing-byte handling — push the
+    /// remaining `< 8` pending bits as one zero-padded byte directly.
     #[inline]
     pub fn align_to_byte(&mut self) {
-        let pad = (8 - (self.bitcount & 7)) & 7;
-        self.bitcount += pad;
         self.flush_bits();
-        debug_assert_eq!(self.bitcount, 0);
+        if self.bitcount > 0 {
+            debug_assert!(self.bitcount < 8);
+            self.out.push(self.bitbuf as u8);
+            self.bitbuf = 0;
+            self.bitcount = 0;
+        }
     }
 
     /// Append raw bytes. The stream MUST already be byte-aligned (call
@@ -266,6 +327,37 @@ mod tests {
     }
 
     #[test]
+    fn align_to_byte_handles_all_bitcounts_up_to_63() {
+        // Regression test for a real bug found 2026-07-20 while porting
+        // `parse::ultra`'s stored-block emitter onto this writer: for any
+        // incoming `bitcount` in 57..=63, the OLD `align_to_byte`
+        // (`pad = (8 - (bitcount & 7)) & 7; bitcount += pad; flush_bits()`)
+        // landed exactly on `bitcount == 64`, and `flush_bits`'s
+        // `bitbuf >>= bitcount & !7` became `bitbuf >>= 64` — on x86-64 the
+        // hardware shift masks the count to 6 bits, silently turning that
+        // into a no-op (`>> 0`) instead of clearing the accumulator, so
+        // stale bits leaked into the next write. Exhaustively drive every
+        // reachable `bitcount` (0..=63) into `align_to_byte` and check the
+        // byte immediately after is clean (a fresh single 0-bit must flush
+        // to exactly `0x00`, never stale high bits from the aligned word).
+        for bitcount in 0u32..=63 {
+            let mut w = BitWriter::new();
+            for _ in 0..bitcount {
+                w.add_bits(1, 1); // drive to the exact bitcount with all-1 bits
+            }
+            w.align_to_byte();
+            w.add_bits(0, 1); // one clean zero bit
+            w.flush_bits();
+            let last = *w.finish().last().unwrap();
+            assert_eq!(
+                last, 0x00,
+                "bitcount={bitcount}: expected trailing byte 0x00 after align_to_byte + \
+                 one zero bit, got {last:#04x} (stale accumulator bits leaked through)"
+            );
+        }
+    }
+
+    #[test]
     fn align_then_raw_bytes() {
         let mut w = BitWriter::new();
         w.add_bits(0b101, 3); // 3 bits pending
@@ -291,5 +383,76 @@ mod tests {
             acc |= (*b as u64) << (8 * i);
         }
         assert_eq!(acc & 0xFFFFF, 0xABCDE);
+    }
+
+    // ── Ported from the retired `parse::ultra::deflate::BitWriter` unit
+    // tests (Stage B of the compressor-architecture unification: ultra's
+    // bit-at-a-time writer was deleted, its emitters ported onto this
+    // shared writer). These two are the ones with independent value beyond
+    // what the tests above already cover: a direct MSB-first spot check and
+    // a differential fuzz against a from-scratch reference implementation.
+
+    #[test]
+    fn add_huffman_bits_msb_first() {
+        // Symbol 0b101, length 3. MSB-first -> emit 1, 0, 1.
+        // LSB-stuffed into byte 0 -> bits 0..3 = 1,0,1 -> 0b0000_0101 = 0x05.
+        let mut w = BitWriter::new();
+        w.add_huffman_bits(0b101, 3);
+        assert_eq!(w.finish(), vec![0x05]);
+    }
+
+    #[test]
+    fn add_huffman_bits_matches_bit_at_a_time_reference() {
+        // Independent reference: the exact bit-at-a-time algorithm the old
+        // `parse::ultra::deflate::BitWriter` used (out+bp threading), run
+        // against a deterministic LCG sequence of (op, symbol, length)
+        // triples covering both add_bits (LSB-first) and add_huffman_bits
+        // (MSB-first). The two writers must agree byte-for-byte.
+        fn ref_add_bits(out: &mut Vec<u8>, bp: &mut u8, symbol: u32, length: u32) {
+            for i in 0..length {
+                let bit = ((symbol >> i) & 1) as u8;
+                if *bp == 0 {
+                    out.push(0);
+                }
+                let n = out.len();
+                out[n - 1] |= bit << *bp;
+                *bp = (*bp + 1) & 7;
+            }
+        }
+        fn ref_add_huffman(out: &mut Vec<u8>, bp: &mut u8, symbol: u32, length: u32) {
+            for i in 0..length {
+                let bit = ((symbol >> (length - i - 1)) & 1) as u8;
+                if *bp == 0 {
+                    out.push(0);
+                }
+                let n = out.len();
+                out[n - 1] |= bit << *bp;
+                *bp = (*bp + 1) & 7;
+            }
+        }
+
+        // Deterministic LCG so the test is reproducible.
+        let mut s: u32 = 0xDEADBEEF;
+        let mut next = || -> u32 {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            s
+        };
+
+        let mut ref_out = Vec::new();
+        let mut ref_bp: u8 = 0;
+        let mut w = BitWriter::new();
+        for _ in 0..200 {
+            let r = next();
+            let length = (r % 16) + 1; // 1..=16 bits
+            let symbol = next() & ((1u32 << length) - 1);
+            if r & 0x10 == 0 {
+                ref_add_bits(&mut ref_out, &mut ref_bp, symbol, length);
+                w.add_bits(symbol as u64, length);
+            } else {
+                ref_add_huffman(&mut ref_out, &mut ref_bp, symbol, length);
+                w.add_huffman_bits(symbol, length);
+            }
+        }
+        assert_eq!(w.finish(), ref_out);
     }
 }
