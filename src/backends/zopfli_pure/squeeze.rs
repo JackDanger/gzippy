@@ -5,8 +5,9 @@
 //! 11 (`get_best_lengths`, `trace_backwards`, `follow_path`), and
 //! 12 (`lz77_optimal`, `lz77_optimal_fixed`, end-to-end FFI oracle).
 
-use super::deflate_size::calculate_block_size;
+use super::deflate_size::{calculate_block_size, optimize_huffman_for_rle};
 use super::hash::ZopfliHash;
+use super::katajainen::length_limited_code_lengths;
 use super::lz77::{lz77_greedy, verify_len_dist, BlockState, LZ77Store};
 use super::lzfind::{MatchFinder, MAX_MATCH_U16};
 use super::symbols::{
@@ -90,6 +91,51 @@ impl SymbolStats {
     pub fn calculate_statistics(&mut self) {
         calculate_entropy(&self.litlens, &mut self.ll_symbols);
         calculate_entropy(&self.dists, &mut self.d_symbols);
+        self.rebuild_len_cost();
+    }
+
+    /// Periodic real-Huffman re-anchor (ECT squeeze.c ~995-1019, the
+    /// `i == 9 || i == 30 || (i == numiterations-1 && numiterations>5)`
+    /// gate): overwrite `self.ll_symbols`/`self.d_symbols` (and rebuild
+    /// `len_cost`) with REAL RLE-optimized, length-limited canonical
+    /// Huffman code lengths computed from `freqs_from`'s frequency
+    /// histograms, in place of the `calculate_entropy` proxy estimate.
+    ///
+    /// The proxy (`tree::calculate_entropy`) is a continuous, unlimited
+    /// idealized bit-length; the actual encoder emits INTEGER,
+    /// 15-bit-limited, RLE-smoothed code lengths (`optimize_huffman_for_rle`
+    /// + `length_limited_code_lengths`, the same building blocks
+    /// `deflate_size`/`katajainen` use to emit the real tree). Pricing the
+    /// squeeze DP against the real lengths periodically lets it correct for
+    /// proxy drift the entropy estimate can't see (RLE collapsing, the
+    /// 15-bit cap, package-merge's integer rounding), which ECT's mechanism
+    /// study measured as a real cost drop at the anchor iterations.
+    ///
+    /// Leaves `self` untouched if the length-limited solver reports failure
+    /// (lossless no-op fallback — the proxy stays in effect for this
+    /// iteration; can only happen on pathological weight overflow, never on
+    /// a legal 288/32-symbol DEFLATE alphabet in practice).
+    pub fn apply_real_huffman_lengths(&mut self, freqs_from: &Self) {
+        let mut ll_counts = freqs_from.litlens;
+        let mut d_counts = freqs_from.dists;
+        optimize_huffman_for_rle(&mut ll_counts);
+        optimize_huffman_for_rle(&mut d_counts);
+
+        let mut ll_bits = [0u32; ZOPFLI_NUM_LL];
+        if length_limited_code_lengths(&ll_counts, 15, &mut ll_bits).is_err() {
+            return;
+        }
+        let mut d_bits = [0u32; ZOPFLI_NUM_D];
+        if length_limited_code_lengths(&d_counts, 15, &mut d_bits).is_err() {
+            return;
+        }
+
+        for i in 0..ZOPFLI_NUM_LL {
+            self.ll_symbols[i] = ll_bits[i] as f64;
+        }
+        for i in 0..ZOPFLI_NUM_D {
+            self.d_symbols[i] = d_bits[i] as f64;
+        }
         self.rebuild_len_cost();
     }
 
@@ -671,6 +717,15 @@ pub fn lz77_optimal<'a>(
 
     for i in 0..numiterations {
         currentstore.reset();
+        // Periodic real-Huffman re-anchor (ECT squeeze.c ~995-1019): at
+        // iterations 9, 30, and the last iteration (numiterations>5), price
+        // this iteration's DP against REAL RLE-optimized, length-limited
+        // code lengths derived from the best frequencies found so far,
+        // instead of the `calculate_entropy` proxy. See
+        // `SymbolStats::apply_real_huffman_lengths` doc.
+        if i == 9 || i == 30 || (i == numiterations - 1 && numiterations > 5) {
+            stats.apply_real_huffman_lengths(&beststats);
+        }
         let model = StatCost(&stats);
         let mode = if i == 0 {
             Mode::Store(&mut cache)
@@ -814,6 +869,11 @@ fn squeeze_from_seed<'a>(
     let mut seedbest = ZOPFLI_LARGE_FLOAT;
     for i in 0..numiterations {
         currentstore.reset();
+        // Periodic real-Huffman re-anchor — see the identical gate in
+        // `lz77_optimal`'s main loop and `SymbolStats::apply_real_huffman_lengths`.
+        if i == 9 || i == 30 || (i == numiterations - 1 && numiterations > 5) {
+            stats.apply_real_huffman_lengths(&beststats);
+        }
         let model = StatCost(&stats);
         lz77_optimal_run(
             in_,
