@@ -3,7 +3,7 @@
 //!
 //! Port of the bit-emitting half of Google Zopfli deflate.c.
 
-use super::blocksplitter::block_split;
+use super::blocksplit::block_split;
 use super::deflate_size::{
     build_rle, calculate_block_size, calculate_block_size_auto_type, get_dynamic_lengths_final,
     get_fixed_tree, CL_ORDER_PUB,
@@ -14,8 +14,8 @@ use super::symbols::{
     dist_extra_bits, dist_extra_bits_value, dist_symbol, length_extra_bits,
     length_extra_bits_value, length_symbol, ZOPFLI_MASTER_BLOCK_SIZE, ZOPFLI_NUM_D, ZOPFLI_NUM_LL,
 };
-use super::tree::lengths_to_symbols;
 use super::ZopfliOptions;
+use crate::compress::deflate::huffman::tree::lengths_to_symbols;
 
 /// Bit-level writer that appends to a byte buffer. The C code uses a
 /// `(out, outsize, bp)` triple where `bp` is the bit pointer in `[0, 7]`;
@@ -103,7 +103,7 @@ fn encode_tree_emit(
         Some(&mut rle_bits),
     );
 
-    use super::tree::calculate_bit_lengths;
+    use crate::compress::deflate::huffman::tree::calculate_bit_lengths;
     let mut clcl = [0u32; 19];
     calculate_bit_lengths(&clcounts, 7, &mut clcl);
     let mut clsymbols = [0u32; 19];
@@ -172,7 +172,7 @@ fn encode_tree_size_local(
     use_17: bool,
     use_18: bool,
 ) -> usize {
-    use super::tree::calculate_bit_lengths;
+    use crate::compress::deflate::huffman::tree::calculate_bit_lengths;
     let (clcounts, hclen, _hlit, _hdist) =
         build_rle(ll_lengths, d_lengths, use_16, use_17, use_18, None, None);
 
@@ -555,7 +555,7 @@ fn refine_split_and_squeeze<'a>(
         // squeezed chunk) so boundary placement is decided by exact cost,
         // not carried over from the coarse greedy chunk split. The per-master
         // cap matches the frontier's 64 blocks (honoring a larger override).
-        let splitpoints2 = super::blocksplitter::block_split_lz77_recursive(
+        let splitpoints2 = super::blocksplit::block_split_lz77_recursive(
             &lz77,
             recursive_maxblocks,
             recursive_auto_type,

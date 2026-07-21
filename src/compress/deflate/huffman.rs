@@ -16,6 +16,14 @@ use super::tables::{
     DEFLATE_NUM_PRECODE_SYMS, MAX_PRE_CODEWORD_LEN, PRECODE_EXTRA_BITS, PRECODE_LENS_PERMUTATION,
 };
 
+/// Exact length-limited code length assignment (Katajainen et al.) — the
+/// crown engine's (`parse::ultra`) huffman builder. Distinct from this
+/// file's own APPROXIMATE libdeflate-style builder below; kept as a sibling
+/// submodule rather than merged, per Stage A (structural move only).
+pub mod katajainen;
+/// Zopfli's own bit-length / entropy tree helpers, used by the crown engine.
+pub mod tree;
+
 const NUM_SYMBOL_BITS: u32 = 10;
 const SYMBOL_MASK: u32 = (1 << NUM_SYMBOL_BITS) - 1;
 const FREQ_MASK: u32 = !SYMBOL_MASK;

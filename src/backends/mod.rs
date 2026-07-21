@@ -15,5 +15,3 @@ pub mod libdeflate;
 #[cfg(any(test, feature = "ffi-oracle", feature = "isal-compression"))]
 pub mod isal_compress;
 pub mod isal_decompress;
-pub mod zopfli_compress;
-pub mod zopfli_pure;

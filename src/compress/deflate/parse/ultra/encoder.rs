@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::backends::zopfli_compress::{compress_deflate, ZopfliTuning};
+use super::{compress_deflate, ZopfliTuning};
 use crate::compress::parallel::GzipHeaderInfo;
 
 /// Zopfli-based gzip encoder. Always emits a single gzip member; the

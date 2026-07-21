@@ -1,9 +1,8 @@
 //! gzippy — embed the world's fastest gzip in your Rust program.
 //!
 //! Every function routes through the same backend-selection logic as the
-//! gzippy CLI, so you automatically get ISA-L SIMD, libdeflate, parallel
-//! multi-block, Zopfli, and multi-member decompression without any extra
-//! configuration.
+//! gzippy CLI: a single pure-Rust DEFLATE engine serves every level and
+//! thread count, with no C-FFI compressor on the routing graph.
 //!
 //! # Quick start
 //!
@@ -16,28 +15,27 @@
 //!
 //! # Choosing a compression level
 //!
-//! | Level | Backend | Notes |
-//! |-------|---------|-------|
-//! | 0     | Store (no compression) | |
-//! | 1–3   | ISA-L SIMD (x86_64), libdeflate/zlib-ng (other) | fastest |
-//! | 4–5   | libdeflate one-shot | balanced |
-//! | 6     | zlib-ng streaming | gzip default |
-//! | 7–9   | zlib-ng streaming | high ratio |
-//! | 10,12 | libdeflate ultra | near-zopfli ratio |
-//! | 11    | Zopfli | best ratio, very slow |
+//! | Level | Notes |
+//! |-------|-------|
+//! | 0     | Store (no compression) |
+//! | 1–9   | Pure-Rust DEFLATE engine (hash-chain / lazy parse); ratio tracks libdeflate |
+//! | 10,12 | Pure-Rust DEFLATE engine, near-optimal parse — near-zopfli ratio |
+//! | 11    | Same near-optimal parse as 10/12 — level 11 alone does **not** invoke the much slower Zopfli "crown" engine, which this library API does not currently expose (CLI-only, via `-F`/`-I`/`-J`) |
 //!
 //! # Threading and output format
 //!
-//! `threads = 1` always produces a **standard single-member gzip** stream
-//! decompressible by any tool.
+//! Every level and thread count produces a **standard single-member gzip**
+//! stream, decompressible by any tool:
+//! - **`threads = 1`**: [`compress::deflate::compress_gzip_padded`] (the T1
+//!   entry point).
+//! - **`threads > 1`**: [`PipelinedGzEncoder`] (`compress_buffer_pure`) —
+//!   a pure parallel encoder whose output is byte-identical across thread
+//!   counts.
 //!
-//! `threads > 1` behaviour depends on level:
-//! - **L0–5**: [`ParallelGzEncoder`] produces a gzippy "GZ" multi-block
-//!   stream. This is **not** decompressible by standard tools (gunzip, pigz,
-//!   etc.) — only by gzippy itself (CLI or this library). Use it when both
-//!   ends of the pipe run gzippy.
-//! - **L6–9**: [`PipelinedGzEncoder`] produces a standard single-member
-//!   stream that any tool can decompress.
+//! gzippy's own "GZ" multi-block format ([`ParallelGzEncoder`]) still
+//! exists and is still decompressible (see below), but it is not reachable
+//! from this crate's compress routing table — it is retained only as a
+//! differential test oracle behind the `ffi-oracle` feature.
 //!
 //! [`ParallelGzEncoder`]: compress::parallel::ParallelGzEncoder
 //! [`PipelinedGzEncoder`]: compress::pipelined::PipelinedGzEncoder
@@ -69,10 +67,10 @@ mod utils;
 mod tests;
 
 // Lib-only oracle corpus test. See note in
-// `src/backends/zopfli_pure/mod.rs` for why this is declared here rather
-// than under the `mod backends;` tree.
+// `src/compress/deflate/parse/ultra/mod.rs` for why this is declared here
+// rather than under the `mod compress;` tree.
 #[cfg(all(test, feature = "oracle"))]
-#[path = "backends/zopfli_pure/oracle_tests.rs"]
+#[path = "compress/deflate/parse/ultra/oracle_tests.rs"]
 mod zopfli_oracle_tests;
 
 // `compress::io` and `decompress::io` call `crate::set_output_file` to register

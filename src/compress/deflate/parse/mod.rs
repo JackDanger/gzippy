@@ -32,6 +32,10 @@ mod fast;
 mod greedy;
 mod lazy;
 mod near_optimal;
+/// The crown engine (zopfli port + LzFind/squeeze/recursive-splitter Pareto
+/// tier). Reached only via `-F`/`-I`/`-J`. See
+/// `docs/compressor-architecture.md` for the full module map.
+pub mod ultra;
 
 /// Number of trailing pad bytes appended to the matchfinder's working buffer so
 /// its speculative 4-byte / 8-byte loads never read out of bounds.

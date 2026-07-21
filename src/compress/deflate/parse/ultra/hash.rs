@@ -139,7 +139,7 @@ impl ZopfliHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::zopfli_pure::symbols::ZOPFLI_WINDOW_SIZE;
+    use crate::compress::deflate::parse::ultra::symbols::ZOPFLI_WINDOW_SIZE;
 
     #[test]
     fn hash_initial_state() {

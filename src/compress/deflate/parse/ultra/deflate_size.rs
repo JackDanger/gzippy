@@ -7,7 +7,7 @@ use super::symbols::{
     dist_symbol, dist_symbol_extra_bits, length_symbol, length_symbol_extra_bits, ZOPFLI_NUM_D,
     ZOPFLI_NUM_LL,
 };
-use super::tree::calculate_bit_lengths;
+use crate::compress::deflate::huffman::tree::calculate_bit_lengths;
 
 /// Ensures there are at least 2 distance codes (some decoders require it).
 pub fn patch_distance_codes_for_buggy_decoders(d_lengths: &mut [u32; ZOPFLI_NUM_D]) {

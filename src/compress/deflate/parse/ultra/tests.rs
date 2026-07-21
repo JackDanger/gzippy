@@ -7,7 +7,7 @@
 //! surface here without needing the C library.
 //!
 //! To regenerate after a deliberate encoder change, run
-//! `GZIPPY_REGEN_FIXTURES=1 cargo test -p gzippy --release zopfli_pure::tests`
+//! `GZIPPY_REGEN_FIXTURES=1 cargo test -p gzippy --release compress::deflate::parse::ultra::tests`
 //! once; the test writes the new bytes to `fixtures/*.hex` and then
 //! re-asserts.
 
@@ -45,7 +45,7 @@ fn from_hex(s: &str) -> Vec<u8> {
 
 fn fixture_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("src/backends/zopfli_pure/fixtures");
+    p.push("src/compress/deflate/parse/ultra/fixtures");
     p.push(format!("{name}.hex"));
     p
 }
