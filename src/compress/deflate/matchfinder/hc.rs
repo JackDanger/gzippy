@@ -37,8 +37,8 @@
 //!   Each `load_u32`/`load_u24` site carries a `debug_assert!` proving `off+4 <= len`.
 
 use super::common::{
-    load_u24, load_u32, lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetch_read,
-    prefetch_write, MATCHFINDER_INITVAL,
+    load_u24, load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_read, prefetch_write,
+    MATCHFINDER_INITVAL,
 };
 
 pub const HC_HASH3_ORDER: u32 = 15;
@@ -98,13 +98,6 @@ impl HcMatchfinder {
             }
             boxed.assume_init()
         }
-    }
-
-    /// Re-initialize all tables for a new input buffer.
-    pub fn reset(&mut self) {
-        matchfinder_init(&mut self.hash3_tab[..]);
-        matchfinder_init(&mut self.hash4_tab[..]);
-        matchfinder_init(&mut self.next_tab[..]);
     }
 
     /// `hc_matchfinder_slide_window`: rebase every stored position by one window.

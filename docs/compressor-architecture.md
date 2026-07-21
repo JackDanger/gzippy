@@ -105,12 +105,12 @@ in a later cleanup.
 
 ## 5. Migration stages (each independently shippable, gated, revertable)
 
-- **A. STRUCTURAL MOVE (no behavior)**: relocate zopfli_pure → parse/ultra/ +
+- **A. STRUCTURAL MOVE (no behavior) — DONE (`449d064a`, PR #140).** relocate zopfli_pure → parse/ultra/ +
   routing/level unification (-F/-I/-J through level.rs; delete use_zopfli dead code,
   ZopfliGzEncoder's private header writer, gzip.rs/zlib.rs test-only wrappers,
   blocksplittingmax dead field; fix stale lib.rs/cli.rs docs). Gate: byte-identity
   EVERYWHERE (L0-12 + ultra), tests green. Pure `git mv` + import surgery.
-- **B. ONE BITSTREAM**: ultra emits through the word BitWriter. Gate: crown outputs
+- **B. ONE BITSTREAM — DONE (`6797fcdb`, PR #141).** ultra emits through the word BitWriter. Gate: crown outputs
   byte-identical (emission is representation-independent), score unchanged.
 - **C. ONE HUFFMAN MODULE (DONE 2026-07-21)**: `huffman/` is now a directory
   module — `mod.rs` (shared `HuffmanCode` + re-exports), `fast.rs` (libdeflate
@@ -168,9 +168,16 @@ in a later cleanup.
     open. Re-open trigger: a multi-run (N≥7) significance test that
     actually separates this miss from noise, or a deeper/differently-tuned
     HC seed.
-- **E. POLISH**: deflate64 internals on shared modules; docs/compressor-
-  architecture.md (this file) lands in-repo; lib.rs API docs rewritten from the
-  actual routing; LOC and dead-code audit re-run.
+- **E. POLISH — DONE (2026-07-21).** deflate64 internals rebuilt on shared
+  modules (bitstream, exact Huffman construction, dynamic-header wire format,
+  stored-block framing — see §7 for exactly what moved and what stayed
+  private and why); docs/compressor-architecture.md (this file) lands
+  in-repo; main.rs `--help` / README.md corrected to describe the actual
+  unified routing (no more "libdeflate for 1-6 / zlib-ng for 7-9" — that
+  split predates this campaign and was never true post-Increment-7); LOC and
+  dead-code audit re-run (5 genuinely-dead items deleted, the module-wide
+  `#![allow(dead_code)]` in `compress::deflate` removed in favor of one
+  narrow, documented allow). Full outcome in §7.
 
 ## 6. What this buys
 
@@ -178,8 +185,199 @@ in a later cleanup.
   and the gzippy-original SF-chain + crown session wins) reachable from ONE policy
   table, individually selectable per level — the original "level.rs is the only
   tuning source" promise, now including the crown tier.
-- ~1.5-2k LOC of duplicated framing/plumbing deleted; three gzip writers → one;
-  four matchfinders → four *documented tiers behind one trait* (with a gated path
-  to three).
+- Three gzip writers → one; four matchfinders → four *documented tiers behind
+  one trait* (with a gated path to three); duplicated stored-block framing,
+  dynamic-header emission, and exact-Huffman construction collapsed to one
+  call site each (deflate64 now instantiates the SAME shared modules the main
+  engine uses, rather than reimplementing them — §7).
 - The routing inconsistencies (-11 vs -F, stale docs, dead predicates) resolved by
   construction: there is only one dispatcher and it reads level.rs.
+- **Correction (Stage E, §7): the "~1.5-2k LOC deleted" estimate below this
+  line in earlier drafts of this document did NOT hold under measurement.**
+  Raw LOC across the unified surface is nearly FLAT end-to-end (+134 lines,
+  measured — see §7): the framing/plumbing genuinely deleted was offset by
+  the (much larger, and much more valuable) volume of documentation this
+  campaign's convention requires for every "merged" AND every "deliberately
+  NOT merged" decision, plus real new tests (Stage D's built-then-reverted
+  `greedy_hc.rs`, this stage's deflate64 real-corpus differential). The win
+  this campaign banks is NOT a LOC count — it is ONE location (not two split
+  across `compress::deflate` and `backends::zopfli_pure`), ONE tuning surface
+  (`level.rs`), and every remaining duplication EXPLICITLY DOCUMENTED with
+  the reason it wasn't collapsed, instead of silently re-implemented.
+
+## 7. Outcome (Stage E, 2026-07-21) — measured, not estimated
+
+Every number below is a direct `wc -l` / `git diff --stat` measurement against
+this repo at the stated commits — re-derivable by anyone, not a narrative
+estimate. "Initial" = `3064c1b2` (the commit immediately before Stage A's
+`docs: add compressor unification architecture` landed); "final" = this
+stage's HEAD.
+
+### LOC: initial two-engine layout vs final unified layout
+
+| Location | Initial (`3064c1b2`) | Final (this HEAD) |
+|---|---:|---:|
+| `src/compress/**` (level engine + deflate64 + fragments) | 10,620 | 16,719 |
+| `src/backends/zopfli_pure/**` (crown engine, separate tree) | 5,965 | 0 (moved) |
+| **Total (two locations → one)** | **16,585** | **16,719 (+134, +0.8%)** |
+
+Raw LOC is essentially FLAT — see the §6 correction above for why a "LOC
+deleted" framing is the wrong scoreboard here. What DID change, precisely:
+
+- **Two module trees → one.** `src/backends/zopfli_pure/` (5,965 LOC) no
+  longer exists; every byte of it lives under `src/compress/deflate/parse/ultra/`
+  now (Stage A, `449d064a`). There is no longer a "which tree has the crown
+  engine" question.
+- **Per-file breakdown of the current unified tree** (`src/compress/**`,
+  16,719 LOC total):
+
+  | Subtree | LOC | Role |
+  |---|---:|---|
+  | `deflate/{mod,bitstream,block_split,costs,level,tables}.rs` | 2,231 | entry points, THE policy table, shared bitstream/tables |
+  | `deflate/huffman/{mod,fast,optimal,header}.rs` | 1,228 | ONE Huffman module tree (Stage C) — approximate (hot) + exact (katajainen) builders + the dynamic-header emitter |
+  | `deflate/matchfinder/{mod,common,hc,bt,lzfind}.rs` | 2,319 | four documented tiers behind one vocabulary (`ht` stays fused into `parse/fast.rs`, not its own file — Stage D pt.1) |
+  | `deflate/parse/{mod,fast,greedy,lazy,near_optimal}.rs` | 2,499 | hot-level parsers (levels 0-9) |
+  | `deflate/parse/ultra/**` | 5,162 | the crown engine (relocated, Stage A; bitstream unified, Stage B) |
+  | `deflate64.rs` | 534 | Deflate64/ZIP-method-9, now built on the shared bitstream/huffman/header modules (Stage E, this stage) |
+  | `mod.rs`, `io.rs`, `parallel.rs`, `pipelined.rs`, `simple.rs`, `optimization.rs` | 2,746 | routing, gzip I/O, the C-FFI oracle backends (`ffi-oracle`-gated, off the production graph) |
+
+### What was deleted/merged/documented-as-residual, by stage
+
+- **Stage A** (`449d064a`, PR #140): `zopfli_pure` → `parse/ultra/` relocated
+  whole; `use_zopfli` dead routing code, `ZopfliGzEncoder`'s private header
+  writer, `gzip.rs`/`zlib.rs` test-only wrappers, and a dead
+  `blocksplittingmax` field deleted; stale lib.rs/cli.rs docs fixed at the
+  time.
+- **Stage B** (`6797fcdb`, PR #141): ultra's own bit-at-a-time `BitWriter`
+  deleted; every ultra emitter ported onto the shared word `BitWriter`
+  (`bitstream.rs`). Two ultra-specific unit tests (a direct MSB-first check +
+  a differential fuzz vs a from-scratch reference) were PORTED onto the
+  shared writer's test module rather than dropped — they still exist, just
+  relocated (`bitstream.rs`'s `add_huffman_bits_msb_first` /
+  `add_huffman_bits_matches_bit_at_a_time_reference`). A real bug
+  (`align_to_byte`'s `>> 64` UB on `bitcount` landing exactly on 64) was
+  found and fixed during this port — documented in `bitstream.rs` with a
+  regression test, not just fixed silently.
+- **Stage C** (`1c6410a9`, PR #141): `huffman.rs` (level engine) +
+  `parse::ultra::deflate_size`'s RLE-shaping functions + zopfli `tree.c`'s
+  non-entropy half MERGED into one `huffman/` directory module
+  (`fast`/`optimal`/`header`). `tree.rs` dissolved into `optimal.rs` +
+  `squeeze.rs`. The dynamic-header WIRE FORMAT duplication (level engine's
+  `huffman::header` vs ultra's `deflate`/`deflate_size` RLE builder) was
+  identified, measured to be cost-accounting-incompatible, and RECORDED as
+  intentional residual rather than force-merged (§3 table).
+- **Stage D part 1** (`5d9d0d46`, PR #142, byte-identity KEPT): matchfinder
+  tier module doc + the shared `LzMatch` vocabulary type extracted for the
+  one tier-pair (`bt`) that already agreed on a match-list shape; `hc` and
+  `lzfind` documented as deliberately NOT unified (single-best-match vs.
+  packed-frontier are different consumption patterns, not oversight).
+- **Stage D part 2** (measured, REVERTED in full): a from-scratch
+  `greedy_hc.rs` (HC-matchfinder-driven greedy walk replacing the legacy
+  zopfli hash/lz77 chain finder) was built, gated on the Squishy score bar,
+  FAILED both legs (F15 and spliced F80 geomean), and was reverted verbatim
+  per the pre-registered rule — `hash.rs`/`cache.rs`/`lz77::find_longest_match`
+  restored. Recorded as a FALSIFY entry (§5 Stage D), not deleted from the
+  record.
+- **Stage E** (this stage, 2026-07-21):
+  - `compress/deflate64.rs` (711 → 534 LOC net, despite ADDING ~45 lines of
+    module doc and a new ~28-line real-corpus test — the implementation
+    portion alone, excluding `#[cfg(test)]`, shrank from 605 to 398 lines,
+    -34%): its private
+    `BitWriter` (struct + 4 methods, ~65 LOC), `package_merge` (~65 LOC),
+    `assign_codes` (~22 LOC), and the entire precode/RLE machinery (`ClSym`,
+    `rle_lengths`, `cl_sym_index`, `CL_ORDER`, hlit/hdist/hclen computation,
+    ~110 LOC combined) DELETED and replaced with direct calls into
+    `compress::deflate::bitstream::BitWriter`,
+    `huffman::optimal::{calculate_bit_lengths, lengths_to_symbols}` (the
+    same package-merge/boundary-PM algorithm class deflate64 used to
+    hand-roll), and `huffman::header::build_dynamic_header` (which turned out
+    to be fully format-agnostic — it trims/pads litlen/offset alphabets
+    itself, so it needed zero changes to accept Deflate64's 286/32-symbol
+    arrays). The empty-input stored-block special case now calls the shared
+    `emit_stored_block` (newly `pub(crate)`) instead of hardcoding
+    `[0x01,0x00,0x00,0xFF,0xFF]`. The match-length extension loop was
+    switched from a hand-rolled byte compare to the shared
+    `matchfinder::common::lz_extend` word-at-a-time primitive (contract
+    satisfied exactly by deflate64's own bounds).
+  - What STAYED private, and why (documented in the module's own doc
+    comment, not just here): the length/distance code TABLES
+    (`LENGTH_BASE`/`LENGTH_EXTRA`/`DIST_BASE`/`DIST_EXTRA`) — Deflate64
+    extends litlen symbol 285 to 16 extra bits (length up to 65538) and adds
+    distance codes 30/31 for the 64 KiB window, genuinely different RFC
+    tables from `compress::deflate::tables`'s 32 KiB set, not a dedup gap.
+    The match finder itself — `matchfinder::hc::HcMatchfinder` hard-codes a
+    32 KiB window via SIGNED `i16` chain positions
+    (`WINDOW_SIZE = 1 << 15`, `MATCHFINDER_INITVAL = i16::MIN`); `i16`
+    cannot address a 64 KiB window at all (max magnitude 32768 < 65536), so
+    reuse would require widening every position field to `i32`/`u32` across
+    a heavily-pinned, gated hot module for a CLI-unreachable format with no
+    performance constituency — verified by reading the type, not assumed.
+    `matchfinder::common::LzMatch` (the shared match-LIST vocabulary type)
+    was also checked and rejected: it packs length/offset as `u16`, which
+    cannot represent Deflate64's length-65538/offset-65536 range either way
+    (confirmed: `u16::MAX == 65535`).
+  - Correctness: deflate64's existing 18 tests (9 compress + 9 decompress,
+    covering code 285, dist codes 30/31, multi-block, LCG fuzz sizes) all
+    pass unchanged, PLUS one new test added this stage
+    (`test_silesia_slice_roundtrip`, two real-text slices from
+    `benchmark_data/silesia.tar`, exercising the rewritten Huffman/header
+    path against a literal/match frequency distribution no synthetic
+    generator in the existing suite produces). 19/19 green.
+  - Dead-code audit: the module-wide `#![allow(dead_code)]` in
+    `compress::deflate::mod.rs` (present since Increment 1, excused as
+    "some substrate primitives are used only by later increments") was
+    REMOVED — near-optimal/ultra landed in Stages A-D, so the excuse no
+    longer held, and a `cargo build --release` with the allow stripped
+    surfaced exactly 5 warnings, all genuinely dead in BOTH production and
+    tests (zero references anywhere in the repo): `BitWriter::with_capacity`,
+    `BitWriter::buffered_bits`, `HcMatchfinder::reset` (plus its now-orphaned
+    `matchfinder_init` import), `tables::DEFLATE_MAX_NUM_SYMS`,
+    `tables::DEFLATE_MAX_CODEWORD_LEN` — all deleted. One item,
+    `level::max_passthrough_size` (a libdeflate port,
+    `deflate_compress.c:3918`, formula-pinned by its own unit test but never
+    wired into the near-optimal parse entry point), was KEPT with a narrow
+    `#[allow(dead_code)]` and a doc note rather than deleted — wiring it in
+    would change L10-12 output for tiny inputs (an algorithmic change, out
+    of scope for a polish stage) but it is correct, cited, and tested, so
+    deleting a real unexploited lever would be throwing away work for no
+    reason. The module is now warning-clean WITHOUT a blanket suppression,
+    so anything that goes dead in the future will be caught immediately.
+  - Docs: `main.rs`'s `--help` "Compression levels" block described a
+    pre-unification split ("1-6 libdeflate", "7-9 zlib-ng", "10,12 libdeflate
+    ultra") that stopped being true when Increment 7 removed C-FFI from the
+    compress routing graph — corrected to describe the one pure-Rust engine.
+    `README.md`'s "One caveat" section claimed `threads > 1` at levels 0-5
+    still emits gzippy's own "GZ" multi-block format by default — also
+    stale (confirmed via `compress::io.rs`: the CLI entry point never
+    constructs `ParallelGzEncoder`; it is compiled only under the
+    `ffi-oracle` feature as a differential oracle) — removed, since every
+    level/thread-count combination now produces standard single-member gzip
+    and there is no longer a caveat to state.
+
+### Residuals NOT touched by Stage E (honest, not silent)
+
+- **`man/gzippy.1` and `man/gzippy-format.5`** still describe the
+  pre-unification decode routing table (per-format ISA-L/libdeflate/zlib-ng
+  dispatch) and compression backend split. This stage's gate was scoped to
+  "lib.rs + README.md" (mission brief); the man pages are a real, separately-
+  sized staleness surface (decode routing, not compress) and were left
+  alone rather than half-fixed under time pressure. Flagged for a follow-up
+  pass.
+- **`--no-default-features` build is BROKEN independent of this stage.**
+  Confirmed by temporarily reverting this stage's two touched files back to
+  HEAD and rebuilding: the failure reproduces identically (`E0432`
+  unresolved import `crate::decompress::parallel::sm_driver`, `E0433`
+  missing `fd_vectored_write`/`chunk_data` in `parallel`, three `E0433`
+  missing `Ordering` imports) — all in `src/decompress/parallel/{single_member,
+  stored_split}.rs`, entirely outside `src/compress/**`. This is a
+  structural feature-gating bug in the decode module, pre-existing at
+  `e20b7736` (this stage's start commit), NOT introduced by anything in
+  Stage E, and NOT a trivial one-line fix (it spans several missing
+  symbols/imports suggesting a cfg-gating mismatch, not a single typo).
+  Left unfixed rather than risking an under-scoped patch to an unrelated,
+  gated decode module during a compress-only polish stage; the default
+  build (what actually ships) is unaffected and fully green.
+- **Dynamic-header wire-format duplication** (Stage C's residual, §3) and
+  **the legacy zopfli matchfinder for squeeze** (Stage D part 2's FALSIFY
+  entry) both stand as recorded, deliberate non-merges — re-checked during
+  this audit and still accurate as written; not re-litigated.

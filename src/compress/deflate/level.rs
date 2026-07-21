@@ -194,6 +194,18 @@ pub fn params(level: u32) -> LevelParams {
 /// size are emitted as a stored block without running the parser. `55 - 4*level`
 /// for the near-optimal levels (negative/overflow clamps to 0 for lower levels
 /// which are handled by their own passthrough).
+///
+/// Ported (formula pinned by the tests below) but not yet wired into
+/// [`super::parse::near_optimal`]'s entry point — no call site skips the
+/// parser for tiny near-optimal-level inputs today. Left as a documented,
+/// tested residual (Stage E dead-code audit,
+/// docs/compressor-architecture.md §5-E) rather than deleted: wiring it in
+/// would change L10-12 output for inputs at/below the threshold, which is an
+/// algorithmic change out of scope for a polish stage, but deleting a
+/// correct, vendor-cited, unit-tested port for no reason would just be
+/// throwing the work away. Re-open trigger: wiring this in is a real
+/// (untried) small near-optimal-levels win, gated like any other lever.
+#[allow(dead_code)]
 pub fn max_passthrough_size(level: u32) -> usize {
     (55i64 - 4 * level as i64).max(0) as usize
 }

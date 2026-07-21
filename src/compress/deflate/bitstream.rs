@@ -46,15 +46,6 @@ impl BitWriter {
         }
     }
 
-    #[inline]
-    pub fn with_capacity(cap: usize) -> Self {
-        BitWriter {
-            bitbuf: 0,
-            bitcount: 0,
-            out: Vec::with_capacity(cap),
-        }
-    }
-
     /// Adopt `out` as the (byte-aligned) sink and append the DEFLATE stream
     /// directly to it. The caller's existing bytes are preserved as the prefix;
     /// [`finish`](Self::finish) hands the same `Vec` back with the stream
@@ -68,12 +59,6 @@ impl BitWriter {
             bitcount: 0,
             out,
         }
-    }
-
-    /// Number of bits currently buffered (not yet flushed to bytes).
-    #[inline]
-    pub fn buffered_bits(&self) -> u32 {
-        self.bitcount
     }
 
     /// Number of complete bytes already flushed to the sink. Diagnostics
