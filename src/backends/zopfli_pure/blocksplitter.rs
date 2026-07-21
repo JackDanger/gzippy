@@ -245,7 +245,13 @@ pub fn block_split_lz77(
             }
         }
 
-        if lend - lstart < 10 {
+        // UNCAP (crown-caps): ECT's ZopfliBlockSplitLZ77 carries no
+        // block-count ceiling — its only stop conditions are "no interval
+        // improves cost" (handled above via `done[lstart] = 1`) and "the
+        // remaining interval is <100 LZ77 symbols" (original zopfli used
+        // 10; bumped to mirror ECT and avoid runaway near-single-symbol
+        // recursion once `maxblocks` no longer bounds the loop).
+        if lend - lstart < 100 {
             break;
         }
     }

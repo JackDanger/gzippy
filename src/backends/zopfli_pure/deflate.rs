@@ -543,10 +543,11 @@ fn refine_split_and_squeeze<'a>(
     if options.blocksplitting == 0 {
         return (lz77, splitpoints);
     }
-    let recursive_maxblocks = match options.blocksplittingmax {
-        0 => 0,
-        m => (m as usize).max(64),
-    };
+    // UNCAP (crown-caps): unconditionally unbounded — see the note at the
+    // greedy `block_split` call site in `deflate_part`. ECT's splitter has
+    // no per-master block-count ceiling; the previous `m.max(64)` floor
+    // silently re-imposed a cap even when the caller asked for more.
+    let recursive_maxblocks = 0usize;
     for _round in 0..rounds {
         let mut changed = false;
 
@@ -660,13 +661,14 @@ pub fn deflate_part(
     let mut lz77 = LZ77Store::new(in_);
 
     if options.blocksplitting != 0 {
-        splitpoints_uncompressed = block_split(
-            options,
-            in_,
-            instart,
-            inend,
-            options.blocksplittingmax as usize,
-        );
+        // UNCAP (crown-caps): `options.blocksplittingmax` is neutralized here
+        // — ECT's ZopfliBlockSplitLZ77 carries no block-count ceiling at all;
+        // its only stop conditions are "no interval improves cost" and "the
+        // remaining interval is <100 LZ77 symbols" (see the threshold in
+        // `block_split_lz77`). Passing `0` reuses the splitter's existing
+        // "0 = unlimited" contract (blocksplitter.rs) rather than adding new
+        // cap logic, so this makes the initial greedy split ECT-faithful.
+        splitpoints_uncompressed = block_split(options, in_, instart, inend, 0);
     }
 
     let npoints = splitpoints_uncompressed.len();
