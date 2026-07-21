@@ -204,7 +204,6 @@ pub struct BlockState<'opt> {
     pub options: &'opt ZopfliOptions,
     pub lmc: Option<LongestMatchCache>,
     pub blockstart: usize,
-    pub blockend: usize,
 }
 
 impl<'opt> BlockState<'opt> {
@@ -218,7 +217,6 @@ impl<'opt> BlockState<'opt> {
             options,
             lmc,
             blockstart: start,
-            blockend: end,
         }
     }
 }

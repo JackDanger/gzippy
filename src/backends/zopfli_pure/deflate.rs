@@ -5,7 +5,8 @@
 
 use super::blocksplitter::block_split;
 use super::deflate_size::{
-    build_rle, calculate_block_size, get_dynamic_lengths, get_fixed_tree, CL_ORDER_PUB,
+    build_rle, calculate_block_size, calculate_block_size_auto_type, get_dynamic_lengths_final,
+    get_fixed_tree, CL_ORDER_PUB,
 };
 use super::lz77::{BlockState, LZ77Store};
 use super::squeeze::{lz77_optimal, lz77_optimal_fixed};
@@ -315,7 +316,10 @@ fn add_lz77_block(
     } else {
         debug_assert_eq!(btype, 2);
         let detect_tree_size = w.out.len();
-        get_dynamic_lengths(lz77, lstart, lend, &mut ll_lengths, &mut d_lengths);
+        // FourWay table-shaping: block boundaries are final by this point
+        // (see `get_dynamic_lengths_final`'s doc), so the extra smoothing
+        // candidates can only shrink this block's emitted size.
+        get_dynamic_lengths_final(lz77, lstart, lend, &mut ll_lengths, &mut d_lengths);
         add_dynamic_tree(&ll_lengths, &d_lengths, w);
         if options.verbose != 0 {
             eprintln!("treesize: {}", w.out.len() - detect_tree_size);
@@ -392,8 +396,7 @@ fn add_lz77_block_auto_type(
     if expensivefixed {
         let instart = lz77.pos[lstart];
         let inend = instart + lz77.byte_range(lstart, lend);
-        let mut s = BlockState::new(options, instart, inend, true);
-        lz77_optimal_fixed(&mut s, lz77.data, instart, inend, &mut fixedstore);
+        lz77_optimal_fixed(lz77.data, instart, inend, &mut fixedstore);
         fixedcost = calculate_block_size(&fixedstore, 0, fixedstore.size(), 1);
     }
 
@@ -446,6 +449,181 @@ fn add_lz77_block_auto_type(
     }
 }
 
+/// Re-squeeze one final block's byte range under BLOCK-LOCAL prices.
+///
+/// The per-greedy-chunk squeeze in `deflate_part` prices each chunk over a
+/// coarse, often heterogeneous region; the recursive exact-cost re-split then
+/// moves block boundaries to places that squeeze never priced against. Running
+/// the full multi-seed `lz77_optimal` over the FINAL block's exact byte range
+/// recovers block-local length/distance statistics, which is what the
+/// optimal-parse frontier (ECT) achieves and what lets it keep medium near
+/// matches (len 17-32 / dist 1-64) that the coarser prices under-took — the
+/// measured parse residual. Returns the re-squeezed store only when it is
+/// strictly cheaper by true auto-type cost, so a block can never regress.
+fn resqueeze_block<'a>(
+    options: &ZopfliOptions,
+    in_: &'a [u8],
+    lz77: &LZ77Store<'_>,
+    start: usize,
+    end: usize,
+) -> Option<LZ77Store<'a>> {
+    if start == end {
+        return None;
+    }
+    let instart = lz77.pos[start];
+    let inend = instart + lz77.byte_range(start, end);
+    let mut s = BlockState::new(options, instart, inend, true);
+    let mut cand = LZ77Store::new(in_);
+    lz77_optimal(
+        &mut s,
+        in_,
+        instart,
+        inend,
+        options.numiterations,
+        &mut cand,
+    );
+    let cand_cost = calculate_block_size_auto_type(&cand, 0, cand.size());
+    let orig_cost = calculate_block_size_auto_type(lz77, start, end);
+    if cand_cost < orig_cost {
+        Some(cand)
+    } else {
+        None
+    }
+}
+
+/// True auto-type cost of a full block partition (sum of best-of-3 per-block
+/// costs). Used to compare candidate (lz77, splitpoints) trajectories.
+fn partition_true_cost(lz77: &LZ77Store<'_>, splitpoints: &[usize]) -> f64 {
+    let n = splitpoints.len();
+    let mut c = 0.0f64;
+    for i in 0..=n {
+        let start = if i == 0 { 0 } else { splitpoints[i - 1] };
+        let end = if i == n { lz77.size() } else { splitpoints[i] };
+        c += calculate_block_size_auto_type(lz77, start, end);
+    }
+    c
+}
+
+/// Re-split + re-squeeze one FIXED-STRATEGY trajectory for `rounds` rounds,
+/// mirroring ECT's `twice` mode (ect-10009 = twice=1: the optimal parse is
+/// fed back through block-splitting + squeeze one extra time). Each round is:
+///   (a) recursive exact-cost re-split (optimal-parse frontier / ECT port),
+///       adopted only when strictly cheaper by the true auto-type cost;
+///   (b) per-final-block re-squeeze with block-local prices, keeping the
+///       cheaper of (original tokens, re-squeezed) per block.
+/// Both sub-steps only ever lower total cost, so a round can never regress
+/// the trajectory it started from; a round that changes nothing ends the
+/// loop early (converged).
+///
+/// `recursive_auto_type` selects the recursive splitter's per-candidate cost
+/// model (see `blocksplitter::RecursiveSplitter`): `false` is the original
+/// dynamic-only-cost search (ECT's `SplitCost` shape); `true` prices every
+/// candidate with the TRUE best-of-{stored,fixed,dynamic} cost, matching the
+/// reference optimal-parse frontier's `Splitter` (fulcrum
+/// `src/ratio/squeeze.rs`, always calls `block_cost_exact`/`plan_block` —
+/// never dynamic-only). `true` sees under-split cases `false` is blind to
+/// (isolating a near-random sub-region into its own STORED block is far
+/// cheaper than forcing it through a shared dynamic table) and over-split
+/// cases where a split `false` judges marginally cheaper has header overhead
+/// a true best-of-3 read recognizes as not worth it — but its narrowing
+/// walks a DIFFERENT cost surface and can converge to a different (measured:
+/// occasionally worse) local optimum than `false`'s. Callers run BOTH
+/// strategies as independent whole trajectories from the same starting
+/// point and keep whichever FINAL result is cheaper by true cost
+/// (`partition_true_cost`) — never a regression vs either strategy alone.
+#[allow(clippy::too_many_arguments)]
+fn refine_split_and_squeeze<'a>(
+    options: &ZopfliOptions,
+    in_: &'a [u8],
+    mut lz77: LZ77Store<'a>,
+    mut splitpoints: Vec<usize>,
+    recursive_auto_type: bool,
+    rounds: usize,
+) -> (LZ77Store<'a>, Vec<usize>) {
+    if options.blocksplitting == 0 {
+        return (lz77, splitpoints);
+    }
+    // UNCAP (crown-caps): unconditionally unbounded — see the note at the
+    // greedy `block_split` call site in `deflate_part`. ECT's splitter has
+    // no per-master block-count ceiling; the previous `m.max(64)` floor
+    // silently re-imposed a cap even when the caller asked for more.
+    let recursive_maxblocks = 0usize;
+    for _round in 0..rounds {
+        let mut changed = false;
+
+        // (a) recursive exact-cost re-split. Always runs (even for a single
+        // squeezed chunk) so boundary placement is decided by exact cost,
+        // not carried over from the coarse greedy chunk split. The per-master
+        // cap matches the frontier's 64 blocks (honoring a larger override).
+        let splitpoints2 = super::blocksplitter::block_split_lz77_recursive(
+            &lz77,
+            recursive_maxblocks,
+            recursive_auto_type,
+        );
+
+        if splitpoints2 != splitpoints
+            && partition_true_cost(&lz77, &splitpoints2) < partition_true_cost(&lz77, &splitpoints)
+        {
+            splitpoints = splitpoints2;
+            changed = true;
+        }
+
+        // (b) per-final-block re-squeeze with block-local prices. See
+        // `resqueeze_block`: the recursive re-split lands boundaries the
+        // coarse per-chunk squeeze never priced against, so a final block's
+        // tokens can be under-matched relative to its own local statistics.
+        // Re-squeeze every final block over its exact byte range and keep
+        // the cheaper of (original tokens, re-squeezed) — no block regresses.
+        let np = splitpoints.len();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(np + 1);
+        for i in 0..=np {
+            let start = if i == 0 { 0 } else { splitpoints[i - 1] };
+            let end = if i == np { lz77.size() } else { splitpoints[i] };
+            ranges.push((start, end));
+        }
+        let winners: Vec<Option<LZ77Store<'_>>> = if options.thread_budget == 1 {
+            ranges
+                .iter()
+                .map(|&(s, e)| resqueeze_block(options, in_, &lz77, s, e))
+                .collect()
+        } else {
+            let lz = &lz77;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranges
+                    .iter()
+                    .map(|&(s, e)| scope.spawn(move || resqueeze_block(options, in_, lz, s, e)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        };
+        if winners.iter().any(|w| w.is_some()) {
+            let mut refined = LZ77Store::new(in_);
+            let mut new_splits: Vec<usize> = Vec::new();
+            for (i, &(start, end)) in ranges.iter().enumerate() {
+                match &winners[i] {
+                    Some(cand) => refined.append_from(cand),
+                    None => {
+                        for k in start..end {
+                            refined.store_lit_len_dist(lz77.litlens[k], lz77.dists[k], lz77.pos[k]);
+                        }
+                    }
+                }
+                if i < np {
+                    new_splits.push(refined.size());
+                }
+            }
+            lz77 = refined;
+            splitpoints = new_splits;
+            changed = true;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+    (lz77, splitpoints)
+}
+
 // ── Step 15: deflate driver ──────────────────────────────────────────────────
 
 /// Compress `in_[instart..inend]` into one deflate sub-stream. `bp` is the
@@ -471,8 +649,7 @@ pub fn deflate_part(
 
     if btype == 1 {
         let mut store = LZ77Store::new(in_);
-        let mut s = BlockState::new(options, instart, inend, true);
-        lz77_optimal_fixed(&mut s, in_, instart, inend, &mut store);
+        lz77_optimal_fixed(in_, instart, inend, &mut store);
         let size = store.size();
         add_lz77_block(options, btype, final_, &store, 0, size, 0, &mut w);
         return w.bp;
@@ -481,17 +658,17 @@ pub fn deflate_part(
     // btype == 2
     let mut splitpoints_uncompressed: Vec<usize> = Vec::new();
     let mut splitpoints: Vec<usize> = Vec::new();
-    let mut totalcost: f64 = 0.0;
     let mut lz77 = LZ77Store::new(in_);
 
     if options.blocksplitting != 0 {
-        splitpoints_uncompressed = block_split(
-            options,
-            in_,
-            instart,
-            inend,
-            options.blocksplittingmax as usize,
-        );
+        // UNCAP (crown-caps): `options.blocksplittingmax` is neutralized here
+        // — ECT's ZopfliBlockSplitLZ77 carries no block-count ceiling at all;
+        // its only stop conditions are "no interval improves cost" and "the
+        // remaining interval is <100 LZ77 symbols" (see the threshold in
+        // `block_split_lz77`). Passing `0` reuses the splitter's existing
+        // "0 = unlimited" contract (blocksplitter.rs) rather than adding new
+        // cap logic, so this makes the initial greedy split ECT-faithful.
+        splitpoints_uncompressed = block_split(options, in_, instart, inend, 0);
     }
 
     let npoints = splitpoints_uncompressed.len();
@@ -552,35 +729,62 @@ pub fn deflate_part(
     };
 
     for (i, store) in stores.iter().enumerate() {
-        totalcost += calculate_block_size(store, 0, store.size(), 2);
         lz77.append_from(store);
         if i < npoints {
             splitpoints.push(lz77.size());
         }
     }
 
-    // Second block-splitting attempt: re-split the squeezed LZ77 stream
-    // and use the new split iff it's strictly cheaper.
-    if options.blocksplitting != 0 && npoints > 1 {
-        let splitpoints2 = super::blocksplitter::block_split_lz77(
-            options,
-            &lz77,
-            options.blocksplittingmax as usize,
-        );
-        let np2 = splitpoints2.len();
-        let mut totalcost2 = 0.0f64;
-        for i in 0..=np2 {
-            let start = if i == 0 { 0 } else { splitpoints2[i - 1] };
-            let end = if i == np2 {
-                lz77.size()
-            } else {
-                splitpoints2[i]
-            };
-            totalcost2 += calculate_block_size(&lz77, start, end, 2);
-        }
-        if totalcost2 < totalcost {
-            splitpoints = splitpoints2;
-        }
+    // Re-split + re-squeeze the squeezed LZ77 stream: ONE trajectory (not
+    // two) using the true best-of-3 recursive-split cost model
+    // (`recursive_auto_type = true`), still run to a 2-round fixed point —
+    // approximating ECT's `twice` mode (deflate.cpp:1244-1290, `for (it = 0;
+    // it <= twice; it++)` with `twice=1`: the optimal parse from the first
+    // pass is fed back through block-splitting + squeeze one extra whole-file
+    // time, reusing the first pass's real per-master-block stats) by cutting
+    // the trajectory count in half rather than the round count.
+    //
+    // This SUPERSEDES the prior two-trajectory×two-round dance (dynamic-only
+    // search + true-best-of-3 search, each iterated to a 2-round fixed
+    // point, then compared by true cost): that shape was trace-proven ~3× the
+    // cost of a full squeeze pass for the SAME kept output, because
+    // `refine_split_and_squeeze`'s step (b) re-squeezes every final block
+    // with a full `lz77_optimal` call — i.e. each round is itself
+    // approximately one more whole-file squeeze pass, and the old code ran
+    // up to 4 of them (2 trajectories × 2 rounds) before comparing (each
+    // round can also converge early via the `!changed` break).
+    //
+    // Measured (crown-iterfix, 19-file Squishy corpus, -F15): dropping to a
+    // single `rounds=1` trajectory saved the most wall (~1.5-2.3×) but net
+    // REGRESSED geomean by -0.000025 (7/19 files micro-regressed, up to
+    // -0.008% on monorepo.tar) — the dropped `dyn` (`false`) trajectory was
+    // occasionally the true winner on those files, not just a redundant
+    // compute cost. Keeping `rounds=2` on the single retained trajectory
+    // recovers all but one of those (tool.bin fully recovers and even
+    // improves marginally) at a smaller but still real ~1.5× wall win
+    // (tool.bin 267.7s→181.3s, data.parquet 102.1s→65.3s, data.csv
+    // 63.3s→41.9s, minjs.min.js 6.6s→4.7s), landing net geomean at
+    // -0.000008 vs baseline — within measurement noise (repeat baseline
+    // computations vary by ~0.001 across otherwise-identical runs) i.e. a
+    // TIE. `data.parquet` is the one honest exception: -0.005% comp-size
+    // regression survives both `rounds=1` and `rounds=2`, so it is a real
+    // (tiny) per-file cost of losing the `dyn` trajectory's alternate local
+    // optimum on that file, not a rounds-depth artifact.
+    //
+    // `recursive_auto_type = true` is kept (not `false`) because a prior
+    // strip-check (single trajectory A/B, both at the old 2-round depth)
+    // measured `true` winning geomean by +0.00008 over `false` alone.
+    // `refine_split_and_squeeze`'s internal logic (both step (a) and step
+    // (b)) only ever ADOPTS a strictly-cheaper candidate by true auto-type
+    // cost, so more rounds on ONE trajectory can never regress vs fewer
+    // rounds on that SAME trajectory — the residual regression above is
+    // entirely "vs the now-dropped second trajectory", not vs this
+    // trajectory's own earlier rounds.
+    if options.blocksplitting != 0 {
+        let (lz77_refined, splitpoints_refined) =
+            refine_split_and_squeeze(options, in_, lz77.clone(), splitpoints.clone(), true, 2);
+        lz77 = lz77_refined;
+        splitpoints = splitpoints_refined;
     }
 
     let np = splitpoints.len();

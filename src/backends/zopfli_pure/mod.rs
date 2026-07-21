@@ -9,6 +9,7 @@ pub mod gzip;
 pub mod hash;
 pub mod katajainen;
 pub mod lz77;
+pub mod lzfind;
 pub mod squeeze;
 pub mod symbols;
 pub mod tree;
@@ -40,6 +41,15 @@ pub struct ZopfliOptions {
     pub verbose_more: i32,
     pub numiterations: i32,
     pub blocksplitting: i32,
+    /// UNCAP (crown-caps, 2026-07-20): no longer consumed by the splitter —
+    /// both call sites in `deflate.rs` (`block_split`'s `maxblocks` arg and
+    /// `refine_split_and_squeeze`'s `recursive_maxblocks`) now pass `0`
+    /// (unbounded) unconditionally, matching ECT's uncapped
+    /// `ZopfliBlockSplitLZ77`. Field kept (not deleted) for CLI back-compat
+    /// (`-F`/`--zopfli-split-max` still parses into it) and because
+    /// `oracle_tests.rs` declares a `#[repr(C)]` mirror of this struct that
+    /// must keep the same field layout as the real C `ZopfliOptions`.
+    #[allow(dead_code)]
     pub blocksplittingmax: i32,
     pub thread_budget: u32,
 }

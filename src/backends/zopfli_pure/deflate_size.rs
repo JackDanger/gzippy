@@ -360,6 +360,32 @@ pub fn optimize_huffman_for_rle(counts: &mut [usize]) {
     }
 }
 
+/// Table-shaping search depth for the RLE-smoothing candidate set. `TwoWay`
+/// is the original zopfli behavior ({raw,raw} vs {smoothed,smoothed} — ll and
+/// d counts smoothed only together); `FourWay` additionally tries smoothing
+/// ll/d independently ({smoothed,raw}, {raw,smoothed}), mirroring the
+/// reference optimal-parse frontier's `plan_dynamic` (fulcrum
+/// `src/ratio/encode.rs`), which found those two combos matter (never a
+/// regression AT A FIXED BLOCK: strictly more candidates, keep-min).
+///
+/// Kept SEPARATE from block-PLACEMENT decisions on purpose: measured, letting
+/// `FourWay` costing leak into the recursive/greedy block-splitter's search
+/// perturbs the split-position search (a non-exhaustive narrowing walk) onto
+/// a different, occasionally WORSE, local optimum for the chosen boundaries
+/// — even though each individual per-block table choice only ever improves.
+/// So every SEARCH/cost-estimation call site (`calculate_block_size`,
+/// `calculate_block_size_auto_type`, and therefore the block splitters) uses
+/// `TwoWay`, bit-for-bit reproducing the pre-table-shaping search/placement
+/// trajectory; only the literal FINAL emission call
+/// (`get_dynamic_lengths_final`, `deflate.rs`'s `add_lz77_block`) uses
+/// `FourWay`, so table-shaping can only ever shrink whatever block placement
+/// search already chose — never move the boundaries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShapeDepth {
+    TwoWay,
+    FourWay,
+}
+
 fn try_optimize_huffman_for_rle(
     lz77: &LZ77Store<'_>,
     lstart: usize,
@@ -368,50 +394,61 @@ fn try_optimize_huffman_for_rle(
     d_counts: &[usize; ZOPFLI_NUM_D],
     ll_lengths: &mut [u32; ZOPFLI_NUM_LL],
     d_lengths: &mut [u32; ZOPFLI_NUM_D],
+    depth: ShapeDepth,
 ) -> f64 {
     let treesize = calculate_tree_size(ll_lengths, d_lengths) as f64;
     let datasize = calculate_block_symbol_size_given_counts(
         ll_counts, d_counts, ll_lengths, d_lengths, lz77, lstart, lend,
     ) as f64;
+    let mut best_total = treesize + datasize;
+    let mut best_ll = *ll_lengths;
+    let mut best_d = *d_lengths;
 
-    let mut ll_counts2 = *ll_counts;
-    let mut d_counts2 = *d_counts;
-    optimize_huffman_for_rle(&mut ll_counts2);
-    optimize_huffman_for_rle(&mut d_counts2);
+    let mut sll_counts = *ll_counts;
+    optimize_huffman_for_rle(&mut sll_counts);
+    let mut sd_counts = *d_counts;
+    optimize_huffman_for_rle(&mut sd_counts);
 
-    let mut ll_lengths2 = [0u32; ZOPFLI_NUM_LL];
-    let mut d_lengths2 = [0u32; ZOPFLI_NUM_D];
-    calculate_bit_lengths(&ll_counts2, 15, &mut ll_lengths2);
-    calculate_bit_lengths(&d_counts2, 15, &mut d_lengths2);
-    patch_distance_codes_for_buggy_decoders(&mut d_lengths2);
+    let mut sll_lengths = [0u32; ZOPFLI_NUM_LL];
+    calculate_bit_lengths(&sll_counts, 15, &mut sll_lengths);
+    let mut sd_lengths = [0u32; ZOPFLI_NUM_D];
+    calculate_bit_lengths(&sd_counts, 15, &mut sd_lengths);
+    patch_distance_codes_for_buggy_decoders(&mut sd_lengths);
 
-    let treesize2 = calculate_tree_size(&ll_lengths2, &d_lengths2) as f64;
-    let datasize2 = calculate_block_symbol_size_given_counts(
-        ll_counts,
-        d_counts,
-        &ll_lengths2,
-        &d_lengths2,
-        lz77,
-        lstart,
-        lend,
-    ) as f64;
-
-    if treesize2 + datasize2 < treesize + datasize {
-        *ll_lengths = ll_lengths2;
-        *d_lengths = d_lengths2;
-        return treesize2 + datasize2;
+    // TwoWay: only {smoothed, smoothed} (the original zopfli candidate).
+    // FourWay: additionally {smoothed, raw} and {raw, smoothed}.
+    let mut candidates: Vec<(&[u32; ZOPFLI_NUM_LL], &[u32; ZOPFLI_NUM_D])> = Vec::with_capacity(3);
+    if depth == ShapeDepth::FourWay {
+        candidates.push((&sll_lengths, d_lengths));
+        candidates.push((ll_lengths, &sd_lengths));
     }
-    treesize + datasize
+    candidates.push((&sll_lengths, &sd_lengths));
+
+    for (cand_ll, cand_d) in candidates {
+        let treesize_c = calculate_tree_size(cand_ll, cand_d) as f64;
+        let datasize_c = calculate_block_symbol_size_given_counts(
+            ll_counts, d_counts, cand_ll, cand_d, lz77, lstart, lend,
+        ) as f64;
+        let total_c = treesize_c + datasize_c;
+        if total_c < best_total {
+            best_total = total_c;
+            best_ll = *cand_ll;
+            best_d = *cand_d;
+        }
+    }
+
+    *ll_lengths = best_ll;
+    *d_lengths = best_d;
+    best_total
 }
 
-/// Computes (ll_lengths, d_lengths) for the dynamic block and returns the
-/// total bit cost of tree+data (excluding the 3-bit block header).
-pub fn get_dynamic_lengths(
+fn get_dynamic_lengths_impl(
     lz77: &LZ77Store<'_>,
     lstart: usize,
     lend: usize,
     ll_lengths: &mut [u32; ZOPFLI_NUM_LL],
     d_lengths: &mut [u32; ZOPFLI_NUM_D],
+    depth: ShapeDepth,
 ) -> f64 {
     let mut ll_counts = [0usize; ZOPFLI_NUM_LL];
     let mut d_counts = [0usize; ZOPFLI_NUM_D];
@@ -421,7 +458,51 @@ pub fn get_dynamic_lengths(
     calculate_bit_lengths(&d_counts, 15, d_lengths);
     patch_distance_codes_for_buggy_decoders(d_lengths);
     try_optimize_huffman_for_rle(
-        lz77, lstart, lend, &ll_counts, &d_counts, ll_lengths, d_lengths,
+        lz77, lstart, lend, &ll_counts, &d_counts, ll_lengths, d_lengths, depth,
+    )
+}
+
+/// Computes (ll_lengths, d_lengths) for the dynamic block and returns the
+/// total bit cost of tree+data (excluding the 3-bit block header). Used by
+/// every SEARCH/cost-estimation path (`calculate_block_size` and therefore
+/// the block splitters) — `ShapeDepth::TwoWay`, matching the original zopfli
+/// search exactly so table-shaping never perturbs block placement.
+pub fn get_dynamic_lengths(
+    lz77: &LZ77Store<'_>,
+    lstart: usize,
+    lend: usize,
+    ll_lengths: &mut [u32; ZOPFLI_NUM_LL],
+    d_lengths: &mut [u32; ZOPFLI_NUM_D],
+) -> f64 {
+    get_dynamic_lengths_impl(
+        lz77,
+        lstart,
+        lend,
+        ll_lengths,
+        d_lengths,
+        ShapeDepth::TwoWay,
+    )
+}
+
+/// Same as `get_dynamic_lengths` but with the FourWay table-shaping search
+/// (see `ShapeDepth`). Reserved for the literal final-emission call site
+/// (`deflate::add_lz77_block`'s btype==2 arm) where the block boundaries are
+/// already fixed and cannot be perturbed — so the extra candidates can only
+/// shrink the emitted size, never regress it.
+pub fn get_dynamic_lengths_final(
+    lz77: &LZ77Store<'_>,
+    lstart: usize,
+    lend: usize,
+    ll_lengths: &mut [u32; ZOPFLI_NUM_LL],
+    d_lengths: &mut [u32; ZOPFLI_NUM_D],
+) -> f64 {
+    get_dynamic_lengths_impl(
+        lz77,
+        lstart,
+        lend,
+        ll_lengths,
+        d_lengths,
+        ShapeDepth::FourWay,
     )
 }
 
