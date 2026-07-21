@@ -838,6 +838,51 @@ pub fn lz77_optimal<'a>(
         store,
         &mut bestcost,
     );
+
+    // Ultra post-loop refinement (ECT squeeze.c ~1076-1096, the `ultra1`
+    // stage): re-squeeze the CURRENT global-best output against REAL
+    // RLE-optimized, length-limited Huffman code lengths derived from its
+    // own statistics (not the entropy proxy), replaying the already-primed
+    // match cache. Repeat while a candidate is strictly cheaper, stopping
+    // once the marginal improvement drops below ECT's ~80-bit threshold (or
+    // the candidate stops improving at all). This is the same real-Huffman
+    // idea as the periodic re-anchor above, but iterated to a fixed point
+    // AFTER all three basin-seeded loops (greedy/literal/fixed) have
+    // already settled — recovering the residual proxy-drift gap between
+    // `calculate_entropy`'s idealized cost and what the tree emitter will
+    // actually pay for the winning parse. Unconditional (not gated on
+    // `--ultra`/high `-F`): each round is one cheap cache replay, and the
+    // loop can never regress `store`/`bestcost` since a round only commits
+    // when strictly cheaper by true block cost.
+    loop {
+        let best_stats = SymbolStats::from_store(store);
+        let mut real_stats = best_stats.clone();
+        real_stats.apply_real_huffman_lengths(&best_stats);
+        currentstore.reset();
+        lz77_optimal_run(
+            in_,
+            instart,
+            inend,
+            &mut path,
+            &mut length_array,
+            &StatCost(&real_stats),
+            &mut currentstore,
+            &mut costs,
+            Mode::Replay(&mut cache),
+        );
+        let newcost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
+        if newcost < bestcost {
+            let improv = bestcost - newcost;
+            bestcost = newcost;
+            store.reset();
+            store.append_from(&currentstore);
+            if improv < 80.0 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 }
 
 /// One iterated-price squeeze pass from a given `init` seed, replaying the
