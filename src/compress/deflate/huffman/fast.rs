@@ -48,8 +48,13 @@ const BITREVERSE_TAB: [u8; 256] = {
 /// codewords). `len <= 16`.
 #[inline]
 fn reverse_codeword(codeword: u32, len: u8) -> u32 {
-    let cw = ((BITREVERSE_TAB[(codeword & 0xff) as usize] as u32) << 8)
-        | (BITREVERSE_TAB[((codeword >> 8) & 0xff) as usize] as u32);
+    // SAFETY: `codeword & 0xff` and `(codeword >> 8) & 0xff` are always
+    // `0..=255` by construction of the mask, in bounds for the 256-entry
+    // `BITREVERSE_TAB` regardless of `codeword`'s value.
+    let cw = unsafe {
+        (*BITREVERSE_TAB.get_unchecked((codeword & 0xff) as usize) as u32) << 8
+            | (*BITREVERSE_TAB.get_unchecked(((codeword >> 8) & 0xff) as usize) as u32)
+    };
     cw >> (16 - len as u32)
 }
 
@@ -58,23 +63,37 @@ fn reverse_codeword(codeword: u32, len: u8) -> u32 {
 #[inline]
 fn heapify_subtree(a: &mut [u32], length: usize, subtree_idx: usize) {
     // 1-based indices, so a[idx] maps to slice a[idx-1].
-    let v = a[subtree_idx - 1];
+    //
+    // SAFETY (whole body): caller passes `1 <= subtree_idx <= length <=
+    // a.len()` (heapify_array/heap_sort's call sites). The loop only enters
+    // a body when `child_idx <= length`, so every `child_idx - 1` /
+    // `parent_idx - 1` index used below is `< length <= a.len()` — the same
+    // 1-based sift-down invariant libdeflate's C `heapify_subtree` relies on
+    // with raw pointers (no bounds checking there either).
+    debug_assert!(subtree_idx >= 1 && subtree_idx <= length && length <= a.len());
+    let v = unsafe { *a.get_unchecked(subtree_idx - 1) };
     let mut parent_idx = subtree_idx;
     loop {
         let mut child_idx = parent_idx * 2;
         if child_idx > length {
             break;
         }
-        if child_idx < length && a[child_idx] > a[child_idx - 1] {
+        if child_idx < length
+            && unsafe { *a.get_unchecked(child_idx) > *a.get_unchecked(child_idx - 1) }
+        {
             child_idx += 1;
         }
-        if v >= a[child_idx - 1] {
+        if v >= unsafe { *a.get_unchecked(child_idx - 1) } {
             break;
         }
-        a[parent_idx - 1] = a[child_idx - 1];
+        unsafe {
+            *a.get_unchecked_mut(parent_idx - 1) = *a.get_unchecked(child_idx - 1);
+        }
         parent_idx = child_idx;
     }
-    a[parent_idx - 1] = v;
+    unsafe {
+        *a.get_unchecked_mut(parent_idx - 1) = v;
+    }
 }
 
 fn heapify_array(a: &mut [u32], length: usize) {
@@ -109,9 +128,18 @@ fn sort_symbols(freqs: &[u32], lens: &mut [u8], symout: &mut [u32]) -> usize {
     let num_counters = num_syms;
     let mut counters = vec![0u32; num_counters];
 
+    // SAFETY (whole body): `idx = f.min(num_counters - 1)` is clamped to
+    // `< num_counters == counters.len()` on every use below, and
+    // `counters[idx]` is a running count that counting-sort's own postcondition
+    // keeps `< num_used_syms <= num_syms == symout.len()`, mirroring
+    // libdeflate's C `sort_symbols` (same counting-sort over raw arrays, no
+    // bounds checks there either). `num_counters >= 2` is guaranteed by
+    // `make_huffman_code`'s `assert!(num_syms >= 2)`.
     for &f in freqs.iter() {
         let idx = f.min((num_counters - 1) as u32) as usize;
-        counters[idx] += 1;
+        unsafe {
+            *counters.get_unchecked_mut(idx) += 1;
+        }
     }
 
     // Make counters cumulative (ignoring counter 0 = zero-frequency symbols).
@@ -125,16 +153,24 @@ fn sort_symbols(freqs: &[u32], lens: &mut [u8], symout: &mut [u32]) -> usize {
     for (sym, &freq) in freqs.iter().enumerate() {
         if freq != 0 {
             let idx = freq.min((num_counters - 1) as u32) as usize;
-            symout[counters[idx] as usize] = sym as u32 | (freq << NUM_SYMBOL_BITS);
-            counters[idx] += 1;
+            unsafe {
+                let slot = counters.get_unchecked_mut(idx);
+                *symout.get_unchecked_mut(*slot as usize) = sym as u32 | (freq << NUM_SYMBOL_BITS);
+                *slot += 1;
+            }
         } else {
-            lens[sym] = 0;
+            // SAFETY: `sym` comes from `freqs.iter().enumerate()`, and `lens`
+            // has the same length as `freqs` (`num_syms`, asserted by the
+            // caller), so `sym < lens.len()`.
+            unsafe {
+                *lens.get_unchecked_mut(sym) = 0;
+            }
         }
     }
 
     // Sort the high-frequency symbols that all landed in the last counter.
-    let lo = counters[num_counters - 2] as usize;
-    let hi = counters[num_counters - 1] as usize;
+    let lo = unsafe { *counters.get_unchecked(num_counters - 2) as usize };
+    let hi = unsafe { *counters.get_unchecked(num_counters - 1) as usize };
     heap_sort(&mut symout[lo..hi]);
 
     num_used_syms as usize
@@ -151,26 +187,55 @@ fn build_tree(a: &mut [u32], sym_count: usize) {
     let mut b = 0usize; // next lowest-freq non-leaf needing a parent
     let mut e = 0usize; // next slot for a non-leaf
 
+    debug_assert!(sym_count >= 2 && sym_count <= a.len());
+
+    // SAFETY (whole body): this is a direct port of libdeflate's C
+    // `build_tree`, which runs the identical index arithmetic over a raw
+    // `uint32_t[]` with no bounds checking. Its loop invariant is `i <=
+    // sym_count`, `b <= e`, and `e < last_idx` (the loop's own break
+    // condition) throughout, so every `a[i]`, `a[i+1]`, `a[b]`, `a[b+1]`, and
+    // `a[e]` access below stays `< sym_count <= a.len()`:
+    //   - the two-leaves arm only runs when `i < last_idx`, so `i+1 <=
+    //     last_idx < sym_count`;
+    //   - the two-non-leaves arm only runs when `b + 2 <= e < last_idx <
+    //     sym_count`, so `b+1 < sym_count`;
+    //   - the fallback arm requires `i <= last_idx < sym_count` (the two-
+    //     leaves guard having failed) and `b < e < sym_count`;
+    //   - `e` is checked `< sym_count` by the loop's break test using
+    //     `last_idx = sym_count - 1` before every write to `a[e]`.
     loop {
         let new_freq;
-        if i < last_idx && (b == e || (a[i + 1] & FREQ_MASK) <= (a[b] & FREQ_MASK)) {
-            // Two leaves.
-            new_freq = (a[i] & FREQ_MASK) + (a[i + 1] & FREQ_MASK);
-            i += 2;
-        } else if b + 2 <= e && (i > last_idx || (a[b + 1] & FREQ_MASK) < (a[i] & FREQ_MASK)) {
-            // Two non-leaves.
-            new_freq = (a[b] & FREQ_MASK) + (a[b + 1] & FREQ_MASK);
-            a[b] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b] & SYMBOL_MASK);
-            a[b + 1] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b + 1] & SYMBOL_MASK);
-            b += 2;
-        } else {
-            // One leaf and one non-leaf.
-            new_freq = (a[i] & FREQ_MASK) + (a[b] & FREQ_MASK);
-            a[b] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b] & SYMBOL_MASK);
-            i += 1;
-            b += 1;
+        unsafe {
+            if i < last_idx
+                && (b == e
+                    || (*a.get_unchecked(i + 1) & FREQ_MASK) <= (*a.get_unchecked(b) & FREQ_MASK))
+            {
+                // Two leaves.
+                new_freq =
+                    (*a.get_unchecked(i) & FREQ_MASK) + (*a.get_unchecked(i + 1) & FREQ_MASK);
+                i += 2;
+            } else if b + 2 <= e
+                && (i > last_idx
+                    || (*a.get_unchecked(b + 1) & FREQ_MASK) < (*a.get_unchecked(i) & FREQ_MASK))
+            {
+                // Two non-leaves.
+                new_freq =
+                    (*a.get_unchecked(b) & FREQ_MASK) + (*a.get_unchecked(b + 1) & FREQ_MASK);
+                *a.get_unchecked_mut(b) =
+                    ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b) & SYMBOL_MASK);
+                *a.get_unchecked_mut(b + 1) =
+                    ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b + 1) & SYMBOL_MASK);
+                b += 2;
+            } else {
+                // One leaf and one non-leaf.
+                new_freq = (*a.get_unchecked(i) & FREQ_MASK) + (*a.get_unchecked(b) & FREQ_MASK);
+                *a.get_unchecked_mut(b) =
+                    ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b) & SYMBOL_MASK);
+                i += 1;
+                b += 1;
+            }
+            *a.get_unchecked_mut(e) = new_freq | (*a.get_unchecked(e) & SYMBOL_MASK);
         }
-        a[e] = new_freq | (a[e] & SYMBOL_MASK);
         e += 1;
         if e >= last_idx {
             break;
@@ -183,34 +248,57 @@ fn build_tree(a: &mut [u32], sym_count: usize) {
 /// Determine how many codewords have each length, honoring the length limit.
 /// Port of `compute_length_counts`.
 fn compute_length_counts(a: &mut [u32], root_idx: usize, len_counts: &mut [u32], max_len: usize) {
+    // `len_counts` is always the caller's `[0u32; MAX_CODEWORD_LEN + 2]`
+    // (17 entries) and `max_len <= MAX_CODEWORD_LEN` (15), so indices
+    // `0..=max_len` and `depth`/`depth+1` (both `<= max_len + 1 <= 16`) stay
+    // `< len_counts.len()`.
+    debug_assert!(max_len + 1 < len_counts.len());
     for lc in len_counts.iter_mut().take(max_len + 1) {
         *lc = 0;
     }
     len_counts[1] = 2;
 
-    // Root node's depth = 0.
-    a[root_idx] &= SYMBOL_MASK;
+    // Root node's depth = 0. `root_idx < a.len()` by construction (it is
+    // `num_used_syms - 2`, a valid non-leaf slot build_tree just wrote).
+    debug_assert!(root_idx < a.len());
+    unsafe {
+        *a.get_unchecked_mut(root_idx) &= SYMBOL_MASK;
+    }
 
+    // SAFETY (loop body): this is a direct port of libdeflate's C
+    // `compute_length_counts`, which walks the same tree with no bounds
+    // checking. `node` ranges `0..root_idx < a.len()`. `parent` is the
+    // parent-index field build_tree wrote into a non-leaf slot strictly
+    // between `node+1` and `root_idx` inclusive, so `parent <= root_idx <
+    // a.len()`. `depth`/`depth+1` are clamped to `<= max_len + 1 <
+    // len_counts.len()` by the `depth >= max_len` branch below before every
+    // `len_counts` access.
     for node in (0..root_idx).rev() {
-        let parent = (a[node] >> NUM_SYMBOL_BITS) as usize;
-        let parent_depth = a[parent] >> NUM_SYMBOL_BITS;
+        let parent = unsafe { (*a.get_unchecked(node) >> NUM_SYMBOL_BITS) as usize };
+        debug_assert!(parent <= root_idx);
+        let parent_depth = unsafe { *a.get_unchecked(parent) >> NUM_SYMBOL_BITS };
         let mut depth = parent_depth as usize + 1;
 
-        a[node] = (a[node] & SYMBOL_MASK) | ((depth as u32) << NUM_SYMBOL_BITS);
+        unsafe {
+            *a.get_unchecked_mut(node) =
+                (*a.get_unchecked(node) & SYMBOL_MASK) | ((depth as u32) << NUM_SYMBOL_BITS);
+        }
 
         if depth >= max_len {
             depth = max_len;
             // Move down to the largest length that already has a codeword.
             loop {
                 depth -= 1;
-                if len_counts[depth] != 0 {
+                if unsafe { *len_counts.get_unchecked(depth) != 0 } {
                     break;
                 }
             }
         }
 
-        len_counts[depth] -= 1;
-        len_counts[depth + 1] += 2;
+        unsafe {
+            *len_counts.get_unchecked_mut(depth) -= 1;
+            *len_counts.get_unchecked_mut(depth + 1) += 2;
+        }
     }
 }
 
@@ -225,14 +313,25 @@ fn gen_codewords(
     max_len: usize,
     num_syms: usize,
 ) {
+    debug_assert!(max_len < len_counts.len() && max_len < MAX_CODEWORD_LEN + 1);
     // Assign lengths (decreasing) to symbols sorted by increasing frequency.
+    //
+    // SAFETY: `len` only ranges `1..=max_len < len_counts.len()`. `i` walks
+    // 0..num_used_syms as `count` sums to `num_used_syms` over the loop (the
+    // codeword-length-count invariant `compute_length_counts` established),
+    // and `num_used_syms <= num_syms == a.len() == lens.len()`, so `a[i]`
+    // stays in bounds and the derived `sym = a[i] & SYMBOL_MASK` is an
+    // original symbol index `< num_syms == lens.len()` (packed by
+    // `sort_symbols`).
     let mut i = 0usize;
     let mut len = max_len;
     while len >= 1 {
-        let mut count = len_counts[len];
+        let mut count = unsafe { *len_counts.get_unchecked(len) };
         while count > 0 {
-            let sym = (a[i] & SYMBOL_MASK) as usize;
-            lens[sym] = len as u8;
+            let sym = unsafe { (*a.get_unchecked(i) & SYMBOL_MASK) as usize };
+            unsafe {
+                *lens.get_unchecked_mut(sym) = len as u8;
+            }
             i += 1;
             count -= 1;
         }
@@ -243,14 +342,25 @@ fn gen_codewords(
     let mut next_codewords = [0u32; MAX_CODEWORD_LEN + 1];
     next_codewords[0] = 0;
     next_codewords[1] = 0;
+    // SAFETY: `len` ranges `2..=max_len < MAX_CODEWORD_LEN + 1 ==
+    // next_codewords.len()`, and `len_counts.len() > max_len >= len - 1`.
     for len in 2..=max_len {
-        next_codewords[len] = (next_codewords[len - 1] + len_counts[len - 1]) << 1;
+        next_codewords[len] =
+            (next_codewords[len - 1] + unsafe { *len_counts.get_unchecked(len - 1) }) << 1;
     }
 
+    // SAFETY: `sym` ranges `0..num_syms == a.len() == lens.len()`. `l =
+    // lens[sym]` was assigned above from the `1..=max_len` loop (or left 0
+    // for an unused symbol only when `l==0` can't reach this table — every
+    // used symbol got a length `<= max_len`), so `l as usize <= max_len <
+    // next_codewords.len()`.
     for sym in 0..num_syms {
-        let l = lens[sym];
-        a[sym] = reverse_codeword(next_codewords[l as usize], l);
-        next_codewords[l as usize] += 1;
+        let l = unsafe { *lens.get_unchecked(sym) };
+        let next = unsafe { next_codewords.get_unchecked_mut(l as usize) };
+        unsafe {
+            *a.get_unchecked_mut(sym) = reverse_codeword(*next, l);
+        }
+        *next += 1;
     }
 }
 
