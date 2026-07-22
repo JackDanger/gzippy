@@ -108,6 +108,34 @@ impl Optimizer {
     /// `cache_end` is the index one past the block's last position header in
     /// `match_cache` (the C `cache_ptr`). The nodes at `block_length+1 ..` must
     /// already be pinned to `0x8000_0000` by the caller.
+    ///
+    /// ## Soundness invariant (unchecked-index hot loop)
+    ///
+    /// The body below drops Rust's bounds checks to match libdeflate's C
+    /// codegen (measured: ~21-23% of this function's excess instruction count
+    /// vs `deflate_find_min_cost_path` at L10-12 is inlined
+    /// `core::slice::index` panic-path overhead). Every elided check is
+    /// discharged by construction, same as the `hc.rs` matchfinder hot loop:
+    ///  * **`cptr` walks `match_cache` backward.** It starts at `cache_end
+    ///    <= match_cache.len()` and only decreases (by 1 per node, and by
+    ///    `num_matches` when rewound to `first`), always landing on a header
+    ///    or match slot the FORWARD pass already wrote contiguously below
+    ///    `cache_end` — so `cptr`/`mi` stay in `0..match_cache.len()`.
+    ///  * **`node` walks `optimum_nodes` backward**, from `block_length` down
+    ///    to `0`. `node+1` and `node+len` (`len <= m.length <= MAX_MATCH_LEN`)
+    ///    stay `<= hi < optimum_nodes.len()` because the caller
+    ///    (`optimize_and_flush`) pins `optimum_nodes[block_length..=hi]`
+    ///    (`hi = min(block_length-1+MAX_MATCH_LEN, optimum_nodes.len()-1)`)
+    ///    before calling — the exact invariant the checked code already
+    ///    relied on to read sentinel costs past the block end.
+    ///  * **`literal`** is a cache-header byte (`buf[pos] as u16` widened to
+    ///    `u32`), so always `< 256 == costs.literal.len()`.
+    ///  * **`len`** ranges `MIN_MATCH_LEN..=m.length` with `m.length <=
+    ///    MAX_MATCH_LEN`, so always `< costs.length.len() ==
+    ///    MAX_MATCH_LEN+1`.
+    ///  * **`offset_slot`** comes from `OffsetSlotFull::slot_unchecked`,
+    ///    itself bound to `offset in 1..=MAX_MATCH_OFFSET`, and the map only
+    ///    ever emits the 30 real slots, so `< 32 == costs.offset_slot.len()`.
     fn find_min_cost_path(&mut self, block_length: usize, cache_end: usize) -> PathCodes {
         let mut node = block_length;
         self.optimum_nodes[node].cost_to_end = 0;
@@ -116,13 +144,23 @@ impl Optimizer {
         loop {
             node -= 1;
             cptr -= 1;
-            let header = self.match_cache[cptr];
+            // SAFETY: see the soundness invariant above (`cptr` bound).
+            debug_assert!(cptr < self.match_cache.len());
+            let header = unsafe { *self.match_cache.get_unchecked(cptr) };
             let num_matches = header.length as usize;
             let literal = header.offset as u32;
 
             // A literal is always available.
-            let mut best_cost = self.costs.literal[literal as usize]
-                .wrapping_add(self.optimum_nodes[node + 1].cost_to_end);
+            // SAFETY: `literal < 256`; `node + 1 <= hi < optimum_nodes.len()`
+            // (invariant above).
+            debug_assert!((literal as usize) < self.costs.literal.len());
+            debug_assert!(node + 1 < self.optimum_nodes.len());
+            let mut best_cost = unsafe {
+                self.costs
+                    .literal
+                    .get_unchecked(literal as usize)
+                    .wrapping_add(self.optimum_nodes.get_unchecked(node + 1).cost_to_end)
+            };
             let mut best_item = (literal << OPTIMUM_OFFSET_SHIFT) | 1;
 
             if num_matches != 0 {
@@ -130,14 +168,27 @@ impl Optimizer {
                 let mut mi = first;
                 let mut len = MIN_MATCH_LEN as usize;
                 loop {
-                    let m = self.match_cache[mi];
+                    // SAFETY: `mi < cptr <= match_cache.len()` (invariant above).
+                    debug_assert!(mi < self.match_cache.len());
+                    let m = unsafe { *self.match_cache.get_unchecked(mi) };
                     let offset = m.offset as u32;
-                    let offset_slot = self.offset_slot_full.slot(offset);
-                    let offset_cost = self.costs.offset_slot[offset_slot];
+                    // SAFETY: `offset` is a valid DEFLATE match offset
+                    // (`1..=MAX_MATCH_OFFSET`) — see `slot_unchecked`'s own
+                    // debug_assert.
+                    let offset_slot = unsafe { self.offset_slot_full.slot_unchecked(offset) };
+                    debug_assert!(offset_slot < self.costs.offset_slot.len());
+                    let offset_cost = unsafe { *self.costs.offset_slot.get_unchecked(offset_slot) };
                     loop {
+                        // SAFETY: `len <= m.length <= MAX_MATCH_LEN` and
+                        // `node + len <= hi < optimum_nodes.len()` (invariant
+                        // above).
+                        debug_assert!(len < self.costs.length.len());
+                        debug_assert!(node + len < self.optimum_nodes.len());
                         let cost_to_end = offset_cost
-                            .wrapping_add(self.costs.length[len])
-                            .wrapping_add(self.optimum_nodes[node + len].cost_to_end);
+                            .wrapping_add(unsafe { *self.costs.length.get_unchecked(len) })
+                            .wrapping_add(unsafe {
+                                self.optimum_nodes.get_unchecked(node + len).cost_to_end
+                            });
                         if cost_to_end < best_cost {
                             best_cost = cost_to_end;
                             best_item = (len as u32) | (offset << OPTIMUM_OFFSET_SHIFT);
@@ -155,8 +206,13 @@ impl Optimizer {
                 cptr = first;
             }
 
-            self.optimum_nodes[node].item = best_item;
-            self.optimum_nodes[node].cost_to_end = best_cost;
+            // SAFETY: `node < optimum_nodes.len()` (invariant above).
+            debug_assert!(node < self.optimum_nodes.len());
+            unsafe {
+                let n = self.optimum_nodes.get_unchecked_mut(node);
+                n.item = best_item;
+                n.cost_to_end = best_cost;
+            }
             if node == 0 {
                 break;
             }
