@@ -162,6 +162,7 @@ impl BitWriter {
     /// written so every intermediate flush stays 8 bytes inside capacity.
     #[inline]
     pub unsafe fn flush_word_unchecked(&mut self) {
+        crate::anatomy_count!(bitstream_flush_word_calls);
         let len = self.out.len();
         debug_assert!(
             self.out.capacity() - len >= 8,
