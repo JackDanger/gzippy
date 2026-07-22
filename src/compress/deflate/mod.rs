@@ -36,6 +36,7 @@
 //! rather than a blanket module allow, so the compiler will flag anything
 //! ELSE that goes dead in the future.
 
+pub mod anatomy_counters;
 pub mod bitstream;
 pub mod block_split;
 pub mod costs;
@@ -53,7 +54,10 @@ const MAX_STORED_SUBBLOCK: usize = 65535;
 
 /// Compress `data` into a raw DEFLATE stream (no gzip/zlib framing) at `level`.
 pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    let cap = data.len() / 2 + 64;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, cap);
+    let mut out = Vec::with_capacity(cap);
     compress_block(data, &[], level, &mut out);
     out
 }
@@ -120,7 +124,10 @@ pub fn compress_block_streaming(
         // the matchfinder's speculative loads stay in bounds. (Callers holding a
         // buffer that already carries the pad — the T1 hot path — should use
         // `compress_gzip_padded` / `deflate_padded_in_place` to skip this copy.)
-        let mut buf = Vec::with_capacity(data.len() + parse::BUF_PAD);
+        let cap = data.len() + parse::BUF_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
         deflate_into(&mut bw, &buf, 0, data.len(), level, is_last);
@@ -130,7 +137,10 @@ pub fn compress_block_streaming(
         // seeded ahead of it (matches may point back into it).
         let dict_len = dict.len();
         let in_end = dict_len + data.len();
-        let mut buf = Vec::with_capacity(in_end + parse::BUF_PAD);
+        let cap = in_end + parse::BUF_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(dict);
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
@@ -192,7 +202,10 @@ pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: 
 /// Compress `data` into a gzip-framed stream (gzip header + DEFLATE + CRC32 +
 /// ISIZE). This is the variant the roundtrip oracles consume.
 pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() / 2 + 32);
+    let cap = data.len() / 2 + 32;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, cap);
+    let mut out = Vec::with_capacity(cap);
     // Minimal gzip header: magic, CM=8 (deflate), FLG=0, MTIME=0, XFL=0,
     // OS=255 (unknown).
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
@@ -215,7 +228,10 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
 /// nor builds a separate output buffer. Output is byte-identical to
 /// `compress_gzip(&buf[..logical_len], level)`.
 pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(logical_len / 2 + 32);
+    let cap = logical_len / 2 + 32;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, cap);
+    let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
     deflate_padded_in_place(buf, logical_len, level, &mut out);
@@ -252,6 +268,22 @@ pub(crate) fn emit_stored_block(bw: &mut BitWriter, data: &[u8], is_final: bool)
 }
 
 fn write_stored_subblock(bw: &mut BitWriter, sub: &[u8], bfinal: bool) {
+    // The ONE physical-block emission site for every BTYPE=00 (stored) block
+    // gzippy ever writes — not just the parser's cost-comparison "stored
+    // wins" branch (`parse::emit_block`/`emit_block_static_or_stored`) but
+    // ALSO the T>1 pipelined path's per-chunk sync-flush marker and the
+    // empty-input special case (both call `emit_stored_block` directly from
+    // `deflate_into`, above, bypassing the parser entirely). A first cut of
+    // this counter lived in `parse/mod.rs`'s two `emit_block*` functions
+    // instead and UNDERCOUNTED: a closed-loop check against fulcrum's
+    // token-level block count (which counts every physical BTYPE=00 block
+    // regardless of why it was emitted) found 15 stored blocks at the token
+    // level vs 0 here on a T>1 pipelined run of `dd79_text6` L1 — exactly
+    // the sync-flush markers between pipeline chunks. Counting HERE instead
+    // (removed from the two `emit_block*` call sites, which route through
+    // `emit_stored_block` -> here, so counting there too would double-count)
+    // reconciles exactly against the token-level count on every path.
+    crate::anatomy_count!(blocks_emitted_stored);
     debug_assert!(sub.len() <= MAX_STORED_SUBBLOCK);
     bw.add_bits(bfinal as u64, 1);
     bw.add_bits(DEFLATE_BLOCKTYPE_UNCOMPRESSED as u64, 2);

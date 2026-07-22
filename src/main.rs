@@ -127,6 +127,13 @@ fn main() {
 
     let result = run();
 
+    // `anatomy-counters` feature (default OFF, compiles to nothing when off):
+    // one machine-parsable line on stderr at process end, ahead of both exit
+    // paths below (including the fast `libc::_exit` success path, which skips
+    // normal userspace teardown).
+    #[cfg(feature = "anatomy-counters")]
+    compress::deflate::anatomy_counters::flush_to_stderr();
+
     match result {
         Ok(exit_code) => fast_exit_success(exit_code),
         Err(e) => {

@@ -126,7 +126,10 @@ pub fn build_dynamic_header(litlen_lens: &[u8], offset_lens: &[u8]) -> DynamicHe
     }
 
     // Contiguous litlen+offset lengths (replaces libdeflate's in-place memmove).
-    let mut combined: Vec<u8> = Vec::with_capacity(num_litlen_syms + num_offset_syms);
+    let combined_cap = num_litlen_syms + num_offset_syms;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, combined_cap);
+    let mut combined: Vec<u8> = Vec::with_capacity(combined_cap);
     combined.extend_from_slice(&litlen_lens[..num_litlen_syms]);
     combined.extend_from_slice(&offset_lens[..num_offset_syms]);
 

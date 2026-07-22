@@ -141,6 +141,8 @@ impl Sink {
     /// and lazy do).
     #[inline]
     fn push_literal(&mut self, lit: u8) {
+        crate::anatomy_count!(literals_emitted);
+        crate::anatomy_count!(histogram_updates);
         // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
         // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
         unsafe {
@@ -161,6 +163,9 @@ impl Sink {
     /// consumes only the freqs/seqs/litrun/`block_length`.
     #[inline]
     fn push_literal_fast(&mut self, lit: u8) {
+        crate::anatomy_count!(literals_emitted);
+        crate::anatomy_count!(literals_emitted_fast);
+        crate::anatomy_count!(histogram_updates);
         // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
         // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
         unsafe {
@@ -183,6 +188,10 @@ impl Sink {
     /// Fast-path match push: frequencies + sequence only (see [`Self::push_literal_fast`]).
     #[inline]
     fn push_match_fast(&mut self, length: u32, offset: u32) {
+        crate::anatomy_count!(matches_emitted);
+        crate::anatomy_count!(matches_emitted_fast);
+        crate::anatomy_count!(histogram_updates, 2u64);
+        crate::anatomy_count!(match_length_bytes_total, length);
         debug_assert!((DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN).contains(&length));
         debug_assert!((1..=32768).contains(&offset));
         let ls = length_slot(length) as usize;
@@ -201,6 +210,9 @@ impl Sink {
     /// `deflate_choose_match`.
     #[inline]
     fn push_match(&mut self, length: u32, offset: u32) {
+        crate::anatomy_count!(matches_emitted);
+        crate::anatomy_count!(histogram_updates, 2u64);
+        crate::anatomy_count!(match_length_bytes_total, length);
         debug_assert!((DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN).contains(&length));
         debug_assert!((1..=32768).contains(&offset));
         let ls = length_slot(length) as usize;
@@ -413,12 +425,17 @@ fn emit_block(
     let stored_bits = stored_block_bits(sink.block_length);
 
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
+        // blocks_emitted_stored is counted in `write_stored_subblock`
+        // (deflate/mod.rs) — the single physical-BTYPE=00-block emission
+        // site, shared with the T>1 pipelined sync-flush path — not here,
+        // to avoid double-counting (see that function's doc comment).
         super::emit_stored_block(
             bw,
             &buf[block_start..block_start + sink.block_length],
             is_final,
         );
     } else if static_bits <= dynamic_bits {
+        crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
         emit_sequences(
@@ -430,6 +447,7 @@ fn emit_block(
             &statics.offcode,
         );
     } else {
+        crate::anatomy_count!(blocks_emitted_dynamic);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);
@@ -468,12 +486,15 @@ fn emit_block_static_or_stored(
     let stored_bits = stored_block_bits(sink.block_length);
 
     if stored_bits <= static_bits {
+        // See the sibling `emit_block`'s comment: counted in
+        // `write_stored_subblock`, not here.
         super::emit_stored_block(
             bw,
             &buf[block_start..block_start + sink.block_length],
             is_final,
         );
     } else {
+        crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
         emit_sequences(

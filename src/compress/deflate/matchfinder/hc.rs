@@ -41,6 +41,36 @@ use super::common::{
     MATCHFINDER_INITVAL,
 };
 
+/// Per-`longest_match`-call local accumulator for the chain-walk counters
+/// (`anatomy-counters` feature only). The walk visits O(`max_search_depth`)
+/// chain nodes per call, so an atomic `fetch_add` at every visited node
+/// (measured: ~10-14% wall overhead at L6-L9, where chains run deep) costs
+/// far more than accumulating in plain locals and flushing with ONE
+/// `fetch_add` per counter at the single return point below — same exact
+/// final counts (this is a pure batching of the same events), far fewer
+/// atomic ops.
+#[cfg(feature = "anatomy-counters")]
+#[derive(Default)]
+struct HcLocalCounters {
+    attempts: u64,
+    miss: u64,
+    too_short: u64,
+    accepted: u64,
+    chain_reads: u64,
+}
+
+#[cfg(feature = "anatomy-counters")]
+impl HcLocalCounters {
+    #[inline(always)]
+    fn flush(self) {
+        crate::anatomy_count!(hc_probe_attempts, self.attempts);
+        crate::anatomy_count!(hc_probe_outcome_miss, self.miss);
+        crate::anatomy_count!(hc_probe_outcome_too_short, self.too_short);
+        crate::anatomy_count!(hc_probe_outcome_accepted, self.accepted);
+        crate::anatomy_count!(hc_chain_table_reads, self.chain_reads);
+    }
+}
+
 pub const HC_HASH3_ORDER: u32 = 15;
 pub const HC_HASH4_ORDER: u32 = 16;
 
@@ -152,12 +182,17 @@ impl HcMatchfinder {
         let base = buf.as_ptr();
         let blen = buf.len();
 
+        #[cfg(feature = "anatomy-counters")]
+        let mut local = HcLocalCounters::default();
+
         let hash3 = next_hashes[0] as usize;
         let hash4 = next_hashes[1] as usize;
 
         // SAFETY: `hash3 < HASH3_SIZE` and `hash4 < HASH4_SIZE` by the module
         // soundness invariant (they are `lz_hash` outputs of order 15/16), and
         // `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`.
+        crate::anatomy_count!(hc_head_table_reads, 2u64);
+        crate::anatomy_count!(hc_head_table_writes, 2u64);
         let (cur_node3, mut cur_node4) = unsafe {
             debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
             let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
@@ -177,6 +212,7 @@ impl HcMatchfinder {
         };
         next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER);
         next_hashes[1] = lz_hash(next_hashseq, HC_HASH4_ORDER);
+        crate::anatomy_count!(hc_hash_computations);
         // Vendor `prefetchw` (hc_matchfinder.h:238-239): warm the hash buckets
         // for `in_next + 1` in an exclusive state — they are stored to on the
         // next call. Pure hint; cannot change which match is found.
@@ -237,6 +273,10 @@ impl HcMatchfinder {
                         .next_tab
                         .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
                 };
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.chain_reads += 1;
+                }
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                     // Prefetch the next node's match data one iteration ahead.
@@ -250,8 +290,16 @@ impl HcMatchfinder {
                         debug_assert!(matchptr < in_next && matchptr + 4 <= blen);
                         load_u32(base, matchptr)
                     };
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.attempts += 1;
+                    }
                     if cand == seq4 {
                         break;
+                    }
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.miss += 1;
                     }
                     cur_node4 = next_node;
                     if (cur_node4 as i32) <= cutoff {
@@ -267,11 +315,19 @@ impl HcMatchfinder {
                             .next_tab
                             .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
                     };
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.chain_reads += 1;
+                    }
                 }
 
                 // Found a length-4 match; extend it fully.
                 best_matchptr = matchptr;
                 best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.accepted += 1;
+                }
                 if best_len >= nice_len {
                     break 'search;
                 }
@@ -301,6 +357,10 @@ impl HcMatchfinder {
                     .next_tab
                     .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
             };
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.chain_reads += 1;
+            }
             loop {
                 loop {
                     matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -324,8 +384,16 @@ impl HcMatchfinder {
                             load_u32(base, in_next),
                         )
                     };
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.attempts += 1;
+                    }
                     if m_hi == n_hi && m_lo == n_lo {
                         break;
+                    }
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.miss += 1;
                     }
                     cur_node4 = next_node;
                     if (cur_node4 as i32) <= cutoff {
@@ -341,14 +409,27 @@ impl HcMatchfinder {
                             .next_tab
                             .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
                     };
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.chain_reads += 1;
+                    }
                 }
 
                 let len = lz_extend(buf, in_next, matchptr, 4, max_len);
                 if len > best_len {
                     best_len = len;
                     best_matchptr = matchptr;
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.accepted += 1;
+                    }
                     if best_len >= nice_len {
                         break 'search;
+                    }
+                } else {
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.too_short += 1;
                     }
                 }
                 // Advance to the next node — already loaded by the pipeline.
@@ -366,9 +447,15 @@ impl HcMatchfinder {
                         .next_tab
                         .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
                 };
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.chain_reads += 1;
+                }
             }
         }
 
+        #[cfg(feature = "anatomy-counters")]
+        local.flush();
         (best_len, (in_next - best_matchptr) as u32)
     }
 
@@ -391,6 +478,7 @@ impl HcMatchfinder {
         if count + 5 > in_end - in_next {
             return;
         }
+        crate::anatomy_count!(hc_positions_skipped, count);
         let base = buf.as_ptr();
         let blen = buf.len();
         let mut in_next = in_next;

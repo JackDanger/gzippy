@@ -372,6 +372,7 @@ fn gen_codewords(
 /// including the "fewer than 2 used symbols" practice-not-spec special case
 /// (emit two 1-bit codewords).
 pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> HuffmanCode {
+    crate::anatomy_count!(huffman_make_code_calls);
     assert_eq!(freqs.len(), num_syms);
     assert!(num_syms >= 2);
     let max_len = max_len as usize;

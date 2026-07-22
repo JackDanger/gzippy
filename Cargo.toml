@@ -101,6 +101,14 @@ coz = ["dep:fulcrum", "fulcrum/coz"]
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
 counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in test builds)
+# Semantic-work-unit counters for `fulcrum anatomy`'s execution level (see
+# src/compress/deflate/anatomy_counters.rs). DEFAULT OFF: with the feature
+# off, every counter/call site compiles to nothing (verified byte-identical
+# release binary vs the feature-off baseline). With the feature on, gzippy
+# prints one line to stderr at process end: `ANATOMY_COUNTERS={json}`. No env
+# var gates behavior (measurement-output only), consistent with "NO env vars
+# in the production path" — this module does not exist in a default build.
+anatomy-counters = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);
