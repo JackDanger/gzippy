@@ -134,6 +134,7 @@ impl BtMatchfinder {
         max_depth: u32,
         next_hashes: &mut [u32; 2],
     ) {
+        crate::anatomy_count!(bt_positions_skipped);
         // C passes max_len = nice_len for the skip path.
         self.advance::<false>(
             buf,
@@ -196,11 +197,14 @@ impl BtMatchfinder {
         let hash4 = next_hashes[1] as usize;
         next_hashes[0] = lz_hash(next_hashseq & 0x00FF_FFFF, BT_MATCHFINDER_HASH3_ORDER);
         next_hashes[1] = lz_hash(next_hashseq, BT_MATCHFINDER_HASH4_ORDER);
+        crate::anatomy_count!(bt_hash_computations);
 
         // ---- hash3: 2-way LRU, records at most one length-3 match ----
         let h3_base = hash3 * BT_MATCHFINDER_HASH3_WAYS;
         // SAFETY: see the soundness invariant above (`h3_base`/`h3_base+1` bound).
         debug_assert!(h3_base + 1 < self.tab.len());
+        crate::anatomy_count!(bt_head_table_reads, 2u64);
+        crate::anatomy_count!(bt_head_table_writes, 2u64);
         let cur_node3 = unsafe { *self.tab.get_unchecked(h3_base) as i32 };
         unsafe {
             *self.tab.get_unchecked_mut(h3_base) = cur_pos as i16;
@@ -242,6 +246,8 @@ impl BtMatchfinder {
         // ---- hash4: root of the binary tree for length-4+ matches ----
         // SAFETY: see the soundness invariant above (`HASH4_OFF + hash4` bound).
         debug_assert!(HASH4_OFF + hash4 < self.tab.len());
+        crate::anatomy_count!(bt_head_table_reads);
+        crate::anatomy_count!(bt_head_table_writes);
         let mut cur_node = unsafe { *self.tab.get_unchecked(HASH4_OFF + hash4) as i32 };
         unsafe {
             *self.tab.get_unchecked_mut(HASH4_OFF + hash4) = cur_pos as i16;
@@ -254,6 +260,7 @@ impl BtMatchfinder {
             // SAFETY: see the soundness invariant above (child-index bound —
             // pure modular arithmetic, holds for any `node`).
             debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
+            crate::anatomy_count!(bt_child_table_writes, 2u64);
             unsafe {
                 *self.tab.get_unchecked_mut(pending_lt) = MATCHFINDER_INITVAL;
                 *self.tab.get_unchecked_mut(pending_gt) = MATCHFINDER_INITVAL;
@@ -284,6 +291,7 @@ impl BtMatchfinder {
             debug_assert!(matchptr < in_next && matchptr + (len as usize) < buf.len());
             debug_assert!(in_next + (len as usize) <= buf.len());
 
+            crate::anatomy_count!(bt_probe_attempts);
             if unsafe {
                 *buf.get_unchecked(matchptr + len as usize)
                     == *buf.get_unchecked(in_next + len as usize)
@@ -297,6 +305,7 @@ impl BtMatchfinder {
                             offset: (in_next - matchptr) as u16,
                         };
                         n_out += 1;
+                        crate::anatomy_count!(bt_probe_outcome_accepted);
                     }
                     if len >= nice_len {
                         // Re-root: the current node's subtrees become pending.
@@ -310,6 +319,8 @@ impl BtMatchfinder {
                                 && pending_lt < self.tab.len()
                                 && pending_gt < self.tab.len()
                         );
+                        crate::anatomy_count!(bt_child_table_reads, 2u64);
+                        crate::anatomy_count!(bt_child_table_writes, 2u64);
                         unsafe {
                             let lc = *self.tab.get_unchecked(lc_idx);
                             let rc = *self.tab.get_unchecked(rc_idx);
@@ -318,7 +329,11 @@ impl BtMatchfinder {
                         }
                         return n_out;
                     }
+                } else if REC {
+                    crate::anatomy_count!(bt_probe_outcome_too_short);
                 }
+            } else {
+                crate::anatomy_count!(bt_probe_outcome_miss);
             }
 
             // SAFETY: same bound as the equality compare above (`len` hasn't
@@ -333,11 +348,13 @@ impl BtMatchfinder {
                 // SAFETY: see the soundness invariant above (child-index bound,
                 // pure modular arithmetic — holds for any `cur_node`/`pending_lt`).
                 debug_assert!(pending_lt < self.tab.len());
+                crate::anatomy_count!(bt_child_table_writes);
                 unsafe {
                     *self.tab.get_unchecked_mut(pending_lt) = cur_node as i16;
                 }
                 pending_lt = self.right_child_idx(cur_node);
                 debug_assert!(pending_lt < self.tab.len());
+                crate::anatomy_count!(bt_child_table_reads);
                 cur_node = unsafe { *self.tab.get_unchecked(pending_lt) as i32 };
                 best_lt_len = len;
                 if best_gt_len < len {
@@ -345,11 +362,13 @@ impl BtMatchfinder {
                 }
             } else {
                 debug_assert!(pending_gt < self.tab.len());
+                crate::anatomy_count!(bt_child_table_writes);
                 unsafe {
                     *self.tab.get_unchecked_mut(pending_gt) = cur_node as i16;
                 }
                 pending_gt = self.left_child_idx(cur_node);
                 debug_assert!(pending_gt < self.tab.len());
+                crate::anatomy_count!(bt_child_table_reads);
                 cur_node = unsafe { *self.tab.get_unchecked(pending_gt) as i32 };
                 best_gt_len = len;
                 if best_lt_len < len {
@@ -360,6 +379,7 @@ impl BtMatchfinder {
             depth_remaining -= 1;
             if cur_node <= cutoff || depth_remaining == 0 {
                 debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
+                crate::anatomy_count!(bt_child_table_writes, 2u64);
                 unsafe {
                     *self.tab.get_unchecked_mut(pending_lt) = MATCHFINDER_INITVAL;
                     *self.tab.get_unchecked_mut(pending_gt) = MATCHFINDER_INITVAL;

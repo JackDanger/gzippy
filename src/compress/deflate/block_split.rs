@@ -53,6 +53,7 @@ impl BlockSplitStats {
     /// `observe_literal`: top-2 bits + low-1 bit => one of 8 literal types.
     #[inline]
     pub fn observe_literal(&mut self, lit: u8) {
+        crate::anatomy_count!(block_split_observations);
         let idx = (((lit >> 5) & 0x6) | (lit & 1)) as usize;
         self.new_observations[idx] += 1;
         self.num_new_observations += 1;
@@ -61,6 +62,7 @@ impl BlockSplitStats {
     /// `observe_match`: short (<9) vs long (>=9) match.
     #[inline]
     pub fn observe_match(&mut self, length: u32) {
+        crate::anatomy_count!(block_split_observations);
         let idx = NUM_LITERAL_OBSERVATION_TYPES + (length >= 9) as usize;
         self.new_observations[idx] += 1;
         self.num_new_observations += 1;

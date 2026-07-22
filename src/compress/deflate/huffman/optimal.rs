@@ -48,6 +48,7 @@ pub fn length_limited_code_lengths(
     maxbits: i32,
     bitlengths: &mut [u32],
 ) -> Result<(), ()> {
+    crate::anatomy_count!(huffman_length_limited_calls);
     let n = frequencies.len();
 
     for b in bitlengths.iter_mut() {
@@ -168,6 +169,7 @@ fn boundary_pm(
     pool_next: &mut usize,
     index: usize,
 ) {
+    crate::anatomy_count!(huffman_tree_nodes_visited);
     let lastcount = arena[lists[index][1] as usize].count;
 
     if index == 0 && lastcount >= numsymbols {
@@ -208,6 +210,7 @@ fn boundary_pm_final(
     pool_next: &mut usize,
     index: usize,
 ) {
+    crate::anatomy_count!(huffman_tree_nodes_visited);
     let lastcount = arena[lists[index][1] as usize].count;
     let sum =
         arena[lists[index - 1][0] as usize].weight + arena[lists[index - 1][1] as usize].weight;
