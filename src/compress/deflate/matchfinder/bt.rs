@@ -18,8 +18,8 @@
 //! matching the C `s32`/`mf_pos_t` split.
 
 use super::common::{
-    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, MATCHFINDER_INITVAL,
-    MATCHFINDER_WINDOW_SIZE,
+    load_u24, load_u32, lz_extend, lz_hash, matchfinder_init, matchfinder_rebase,
+    MATCHFINDER_INITVAL, MATCHFINDER_WINDOW_SIZE,
 };
 // `LzMatch` is the shared matchfinder vocabulary type (Stage D, matchfinder/mod.rs) —
 // moved to `common` since near_optimal.rs already imports it from this module path;
@@ -48,18 +48,6 @@ const CHILD_OFF: usize = HASH3_LEN + HASH4_LEN;
 /// Length of the initialized hash prefix (`BT_MATCHFINDER_TOTAL_HASH_SIZE / sizeof`).
 const TOTAL_HASH_LEN: usize = HASH3_LEN + HASH4_LEN;
 const TOTAL_LEN: usize = HASH3_LEN + HASH4_LEN + CHILD_LEN;
-
-/// Unaligned little-endian 4-byte load. Caller guarantees `pos + 4 <= buf.len()`.
-#[inline]
-fn load_u32(buf: &[u8], pos: usize) -> u32 {
-    u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
-}
-
-/// Low 3 bytes at `pos` (`load_u24_unaligned`).
-#[inline]
-fn load_u24(buf: &[u8], pos: usize) -> u32 {
-    load_u32(buf, pos) & 0x00FF_FFFF
-}
 
 /// The binary-tree matchfinder state (~512 KiB).
 pub struct BtMatchfinder {
@@ -161,6 +149,24 @@ impl BtMatchfinder {
 
     /// Port of `bt_matchfinder_advance_one_byte` (`:140-262`), monomorphized on
     /// `REC` (record_matches).
+    ///
+    /// ## Soundness invariant (unchecked `tab` indexing — hash/child tables)
+    ///
+    /// `self.tab` (`TOTAL_LEN` slots) is indexed only three ways below, each
+    /// bounded by construction (no external invariant needed, same as the
+    /// `hc.rs` Increment 5 hash-table indices):
+    ///  * **`h3_base` / `h3_base + 1`.** `hash3 = next_hashes[0] < 2^16`
+    ///    (produced by `lz_hash(_, BT_MATCHFINDER_HASH3_ORDER=16)`, or `0` on
+    ///    the very first call), so `h3_base = hash3 * 2 < 2 * 2^16 ==
+    ///    HASH3_LEN`, and `h3_base` is even, so `h3_base + 1 <= HASH3_LEN - 1`.
+    ///  * **`HASH4_OFF + hash4`.** `hash4 = next_hashes[1] < 2^16 == HASH4_LEN`
+    ///    (same `lz_hash` construction), so `HASH4_OFF + hash4 < HASH4_OFF +
+    ///    HASH4_LEN == TOTAL_HASH_LEN <= TOTAL_LEN`.
+    ///  * **`left_child_idx` / `right_child_idx`.** Both are `CHILD_OFF + 2 *
+    ///    ((node as u32) & WINDOW_MASK) [+ 1]`; `& WINDOW_MASK` masks into
+    ///    `0..WINDOW_SIZE` unconditionally, so the result is always `<
+    ///    CHILD_OFF + CHILD_LEN == TOTAL_LEN`, for ANY `node` value (the
+    ///    functions are pure modular arithmetic, no caller invariant needed).
     #[allow(clippy::too_many_arguments)]
     fn advance<const REC: bool>(
         &mut self,
@@ -179,7 +185,13 @@ impl BtMatchfinder {
         let mut n_out = 0usize;
         let mut best_len: u32 = 3;
 
-        let next_hashseq = load_u32(buf, in_next + 1);
+        // SAFETY (word loads): the caller contract is `max_len >=
+        // BT_MATCHFINDER_REQUIRED_NBYTES (5)` and (from `adjust_max_and_nice_len`
+        // in the parse driver) `in_next + max_len <= in_end <= buf.len() -
+        // BUF_PAD`, so `in_next + 5 <= buf.len()` always — the same bound
+        // `hc.rs`'s Increment 5 relies on for its next-hash read.
+        debug_assert!(in_next + 1 + 4 <= buf.len());
+        let next_hashseq = unsafe { load_u32(buf.as_ptr(), in_next + 1) };
         let hash3 = next_hashes[0] as usize;
         let hash4 = next_hashes[1] as usize;
         next_hashes[0] = lz_hash(next_hashseq & 0x00FF_FFFF, BT_MATCHFINDER_HASH3_ORDER);
@@ -187,15 +199,28 @@ impl BtMatchfinder {
 
         // ---- hash3: 2-way LRU, records at most one length-3 match ----
         let h3_base = hash3 * BT_MATCHFINDER_HASH3_WAYS;
-        let cur_node3 = self.tab[h3_base] as i32;
-        self.tab[h3_base] = cur_pos as i16;
-        let cur_node3_2 = self.tab[h3_base + 1] as i32;
-        self.tab[h3_base + 1] = cur_node3 as i16;
+        // SAFETY: see the soundness invariant above (`h3_base`/`h3_base+1` bound).
+        debug_assert!(h3_base + 1 < self.tab.len());
+        let cur_node3 = unsafe { *self.tab.get_unchecked(h3_base) as i32 };
+        unsafe {
+            *self.tab.get_unchecked_mut(h3_base) = cur_pos as i16;
+        }
+        let cur_node3_2 = unsafe { *self.tab.get_unchecked(h3_base + 1) as i32 };
+        unsafe {
+            *self.tab.get_unchecked_mut(h3_base + 1) = cur_node3 as i16;
+        }
 
         if REC && cur_node3 > cutoff {
-            let seq3 = load_u24(buf, in_next);
+            // SAFETY: `in_next + 4 <= buf.len()` (word-load bound above, since
+            // `4 < 5`). `mp`/`mp2` are earlier tree-node positions (`< in_next`,
+            // the same "stored position is always earlier" matchfinder
+            // invariant `hc.rs` relies on for its own candidate reads), so
+            // `mp + 4 < in_next + 4 <= buf.len()` (same for `mp2`).
+            debug_assert!(in_next + 4 <= buf.len());
+            let seq3 = unsafe { load_u24(buf.as_ptr(), in_next) };
             let mp = (in_base as isize + cur_node3 as isize) as usize;
-            if seq3 == load_u24(buf, mp) {
+            debug_assert!(mp < in_next && mp + 4 <= buf.len());
+            if seq3 == unsafe { load_u24(buf.as_ptr(), mp) } {
                 out[n_out] = LzMatch {
                     length: 3,
                     offset: (in_next - mp) as u16,
@@ -203,7 +228,8 @@ impl BtMatchfinder {
                 n_out += 1;
             } else if cur_node3_2 > cutoff {
                 let mp2 = (in_base as isize + cur_node3_2 as isize) as usize;
-                if seq3 == load_u24(buf, mp2) {
+                debug_assert!(mp2 < in_next && mp2 + 4 <= buf.len());
+                if seq3 == unsafe { load_u24(buf.as_ptr(), mp2) } {
                     out[n_out] = LzMatch {
                         length: 3,
                         offset: (in_next - mp2) as u16,
@@ -214,15 +240,24 @@ impl BtMatchfinder {
         }
 
         // ---- hash4: root of the binary tree for length-4+ matches ----
-        let mut cur_node = self.tab[HASH4_OFF + hash4] as i32;
-        self.tab[HASH4_OFF + hash4] = cur_pos as i16;
+        // SAFETY: see the soundness invariant above (`HASH4_OFF + hash4` bound).
+        debug_assert!(HASH4_OFF + hash4 < self.tab.len());
+        let mut cur_node = unsafe { *self.tab.get_unchecked(HASH4_OFF + hash4) as i32 };
+        unsafe {
+            *self.tab.get_unchecked_mut(HASH4_OFF + hash4) = cur_pos as i16;
+        }
 
         let mut pending_lt = self.left_child_idx(cur_pos as i32);
         let mut pending_gt = self.right_child_idx(cur_pos as i32);
 
         if cur_node <= cutoff {
-            self.tab[pending_lt] = MATCHFINDER_INITVAL;
-            self.tab[pending_gt] = MATCHFINDER_INITVAL;
+            // SAFETY: see the soundness invariant above (child-index bound —
+            // pure modular arithmetic, holds for any `node`).
+            debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
+            unsafe {
+                *self.tab.get_unchecked_mut(pending_lt) = MATCHFINDER_INITVAL;
+                *self.tab.get_unchecked_mut(pending_gt) = MATCHFINDER_INITVAL;
+            }
             return n_out;
         }
 
@@ -230,10 +265,29 @@ impl BtMatchfinder {
         let mut best_gt_len: u32 = 0;
         let mut len: u32 = 0;
 
+        // SAFETY (tree-walk single-byte compares below): `len` only ever
+        // decreases or holds (it is reassigned to `min(len, best_lt_len)` /
+        // `min(len, best_gt_len)`, and both of those were themselves earlier
+        // values of `len`), and it starts at `0` then is only ever set from
+        // `lz_extend`'s return value, which is bounded by `max_len` (its own
+        // documented contract). So `len <= max_len` holds on every iteration,
+        // hence `in_next + len <= in_next + max_len <= buf.len()` (the
+        // word-load bound above). `matchptr = in_base + cur_node` is always a
+        // STRICTLY EARLIER tree position than `in_next = in_base + cur_pos`
+        // (the standard matchfinder invariant: a stored node was inserted at
+        // an earlier position than the one now querying it, or it fails the
+        // `cutoff`/`MATCHFINDER_INITVAL` gate before reaching this loop — the
+        // same invariant `hc.rs` documents for its own candidate reads), so
+        // `matchptr + len < in_next + len <= buf.len()`.
         loop {
             let matchptr = (in_base as isize + cur_node as isize) as usize;
+            debug_assert!(matchptr < in_next && matchptr + (len as usize) < buf.len());
+            debug_assert!(in_next + (len as usize) <= buf.len());
 
-            if buf[matchptr + len as usize] == buf[in_next + len as usize] {
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    == *buf.get_unchecked(in_next + len as usize)
+            } {
                 len = lz_extend(buf, in_next, matchptr, len + 1, max_len);
                 if !REC || len > best_len {
                     if REC {
@@ -246,27 +300,57 @@ impl BtMatchfinder {
                     }
                     if len >= nice_len {
                         // Re-root: the current node's subtrees become pending.
-                        let lc = self.tab[self.left_child_idx(cur_node)];
-                        let rc = self.tab[self.right_child_idx(cur_node)];
-                        self.tab[pending_lt] = lc;
-                        self.tab[pending_gt] = rc;
+                        // SAFETY: see the soundness invariant above (child-index
+                        // bound, pure modular arithmetic).
+                        let lc_idx = self.left_child_idx(cur_node);
+                        let rc_idx = self.right_child_idx(cur_node);
+                        debug_assert!(
+                            lc_idx < self.tab.len()
+                                && rc_idx < self.tab.len()
+                                && pending_lt < self.tab.len()
+                                && pending_gt < self.tab.len()
+                        );
+                        unsafe {
+                            let lc = *self.tab.get_unchecked(lc_idx);
+                            let rc = *self.tab.get_unchecked(rc_idx);
+                            *self.tab.get_unchecked_mut(pending_lt) = lc;
+                            *self.tab.get_unchecked_mut(pending_gt) = rc;
+                        }
                         return n_out;
                     }
                 }
             }
 
-            if buf[matchptr + len as usize] < buf[in_next + len as usize] {
-                self.tab[pending_lt] = cur_node as i16;
+            // SAFETY: same bound as the equality compare above (`len` hasn't
+            // changed since, or was just set from `lz_extend`, still `<= max_len`).
+            debug_assert!(
+                matchptr + (len as usize) < buf.len() && in_next + (len as usize) <= buf.len()
+            );
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    < *buf.get_unchecked(in_next + len as usize)
+            } {
+                // SAFETY: see the soundness invariant above (child-index bound,
+                // pure modular arithmetic — holds for any `cur_node`/`pending_lt`).
+                debug_assert!(pending_lt < self.tab.len());
+                unsafe {
+                    *self.tab.get_unchecked_mut(pending_lt) = cur_node as i16;
+                }
                 pending_lt = self.right_child_idx(cur_node);
-                cur_node = self.tab[pending_lt] as i32;
+                debug_assert!(pending_lt < self.tab.len());
+                cur_node = unsafe { *self.tab.get_unchecked(pending_lt) as i32 };
                 best_lt_len = len;
                 if best_gt_len < len {
                     len = best_gt_len;
                 }
             } else {
-                self.tab[pending_gt] = cur_node as i16;
+                debug_assert!(pending_gt < self.tab.len());
+                unsafe {
+                    *self.tab.get_unchecked_mut(pending_gt) = cur_node as i16;
+                }
                 pending_gt = self.left_child_idx(cur_node);
-                cur_node = self.tab[pending_gt] as i32;
+                debug_assert!(pending_gt < self.tab.len());
+                cur_node = unsafe { *self.tab.get_unchecked(pending_gt) as i32 };
                 best_gt_len = len;
                 if best_lt_len < len {
                     len = best_lt_len;
@@ -275,8 +359,11 @@ impl BtMatchfinder {
 
             depth_remaining -= 1;
             if cur_node <= cutoff || depth_remaining == 0 {
-                self.tab[pending_lt] = MATCHFINDER_INITVAL;
-                self.tab[pending_gt] = MATCHFINDER_INITVAL;
+                debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
+                unsafe {
+                    *self.tab.get_unchecked_mut(pending_lt) = MATCHFINDER_INITVAL;
+                    *self.tab.get_unchecked_mut(pending_gt) = MATCHFINDER_INITVAL;
+                }
                 return n_out;
             }
         }
