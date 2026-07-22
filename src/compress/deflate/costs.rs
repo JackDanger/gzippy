@@ -102,6 +102,23 @@ impl OffsetSlotFull {
     pub fn slot(&self, offset: u32) -> usize {
         self.map[offset as usize] as usize
     }
+
+    /// Unchecked twin of [`Self::slot`] for the near-optimal DP hot loop
+    /// (`find_min_cost_path`), which has already proven `offset` is a valid
+    /// DEFLATE match offset (`1..=MAX_MATCH_OFFSET`) before calling this.
+    ///
+    /// # Safety
+    /// `offset as usize` must be `< self.map.len()` (`== MAX_MATCH_OFFSET + 1`),
+    /// i.e. `offset <= MAX_MATCH_OFFSET`.
+    #[inline]
+    pub unsafe fn slot_unchecked(&self, offset: u32) -> usize {
+        debug_assert!(
+            (offset as usize) < self.map.len(),
+            "offset {offset} out of range for offset_slot_full (len {})",
+            self.map.len()
+        );
+        *self.map.get_unchecked(offset as usize) as usize
+    }
 }
 
 impl Default for OffsetSlotFull {
