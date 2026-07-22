@@ -111,6 +111,94 @@
 //!   into a production/release build, so instrumenting them would count
 //!   test-fixture allocations, not production ones. Skipped; documented here
 //!   rather than silently dropped.
+//!
+//! ## `fast_*` — L0/L1 single-probe matchfinder (`parse/fast.rs`)
+//!
+//! Added 2026-07-22 to close a coverage gap: `fast.rs` is the ONLY parser
+//! with zero anatomy instrumentation before this — a calibration run
+//! confirmed `hc_probe_attempts`/`bt_probe_attempts` sit at exactly 0 at L1
+//! (the fast path never touches the hash-chain/binary-tree finders at all).
+//! `fast.rs`'s finder logic is spread across three functions
+//! (`process_position_l1`, `fastloop_l0`, `fastloop_l1`) plus `run`'s own
+//! tail loop and preset-dictionary seed loop — unlike `hc.rs`/`bt.rs` where
+//! one function holds the whole hot loop, so there is no single scope to
+//! declare one local accumulator in. `FastLocalCounters` is threaded through
+//! as an extra parameter, present ONLY when the feature is on
+//! (`#[cfg(feature = "anatomy-counters")]` on the parameter declaration AND
+//! on the argument at every call site — confirmed to compile to a
+//! zero-parameter signature when off, not merely an unused one, matching
+//! this module's "the call site itself compiles to zero bytes" contract).
+//! One `FastLocalCounters` is created per `run()` invocation (which processes
+//! the WHOLE input passed to it, however many internal 64 KiB/1 MiB blocks
+//! that spans) and flushed ONCE at `run`'s return — coarser than "per block"
+//! but the same zero-cost intent taken one step further (fewer flushes, same
+//! exact final counts): the fast path visits every uncompressed byte at least
+//! once (unlike `hc`'s chain walk, which only runs on the subset of positions
+//! with a candidate), so per-position atomics here would cost at least as
+//! much as the pre-batching hc/bt numbers, likely more.
+//!
+//! - **`fast_positions_processed`/`fast_positions_skipped`** — a byte-exact
+//!   partition of `[data_start, in_end)` (the coded span; the preset-
+//!   dictionary prefix `[0, data_start)` is seeded into the head table but
+//!   never coded, so it is excluded from both). `processed` is incremented by
+//!   the number of bytes resolved via the actual finder path: 1 per literal
+//!   (including a lazy-peek DEFER, which still cost a real probe) or `length`
+//!   per accepted-and-emitted match. `skipped` is incremented by `step - 1`
+//!   in `fastloop_l0`'s ACCEL ramp — the extra literal positions coded with
+//!   NO hash lookup at all, which is the entire point of the ramp
+//!   (L1/`fastloop_l1` never activates ACCEL, so `fast_positions_skipped` is
+//!   always 0 there). `processed + skipped == in_end - data_start` by
+//!   construction (every coded byte lands in exactly one bucket) — the
+//!   mission's reconciliation invariant.
+//! - **`fast_hash_computations`/`fast_head_table_reads`/
+//!   `fast_head_table_writes`** — every real (non-speculative) `lz_hash`
+//!   call, `head[h]` read, and `head[h] = pos` write across the primary
+//!   per-position probe, the L1 lazy-peek's own read/hash at `pos + 1`
+//!   (write-free — see its call site doc comment), the LIMIT_HASH_UPDATE
+//!   interior-insert loop (hash + write, no read), the tail loop, and the
+//!   preset-dictionary seed loop (hash + write, no read; NOT part of
+//!   `fast_positions_processed`, see above). **Deliberately excluded**: the
+//!   SF1-C/SF2 software-pipeline prefetch hash computations
+//!   (`fastloop_l0`/`fastloop_l1`'s `PF_DIST`-ahead `lz_hash` calls feeding
+//!   `prefetch_write`) — purely speculative, and the SAME position gets its
+//!   hash computed again for real when actually reached, so counting the
+//!   prefetch's hash too would double-count that position's real work
+//!   without representing a real decision.
+//! - **`fast_probe_attempts`/`fast_probe_outcome_{miss,too_short,accepted,
+//!   deferred}`** — one attempt per primary per-position probe (i.e. per
+//!   call to the per-position body, NOT per lazy peek — the peek is a
+//!   sub-probe of an already-counted attempt, see `fast_lazy_peek_events`).
+//!   `miss` = no candidate in window range at all; `too_short` = a candidate
+//!   existed but `lz_extend` returned `< SHORTEST_MATCH`; `accepted` = a
+//!   match of `>= SHORTEST_MATCH` was actually emitted via `push_match_fast`
+//!   (so `fast_probe_outcome_accepted == matches_emitted_fast` EXACTLY — the
+//!   mission's cross-check); `deferred` **DEVIATES from the spec's literal
+//!   3-bucket list** (miss/too-short/accepted) — `process_position_l1`'s lazy
+//!   peek can find a `>= SHORTEST_MATCH` candidate and then DEFER it (emit a
+//!   literal instead, see `LAZY_PEEK_MAX_LEN`'s doc comment), which is
+//!   neither a miss nor too-short (a real match existed) nor accepted (it
+//!   was never emitted). Folding it into `accepted` would break the
+//!   `accepted == matches_emitted_fast` invariant; folding it into `miss` or
+//!   `too_short` would misrepresent what happened. A 4th bucket keeps
+//!   `attempts == miss + too_short + accepted + deferred` an exact partition
+//!   AND keeps `accepted` exact — added, not silently dropped, per this
+//!   module's existing deviation convention.
+//! - **`fast_lazy_peek_events`/`fast_lazy_peek_defers`** — `events` counts
+//!   every time `process_position_l1` enters the lazy-peek block (the
+//!   `90c9d1d5` lever: gated to short, far accepted matches); `defers`
+//!   counts the subset that actually chose to defer (`fast_probe_outcome_
+//!   deferred`'s trigger). `defers <= events` always; the spec named only
+//!   "lazy-peek events" but splitting attempted-vs-acted-on is free (one more
+//!   plain-local field) and is exactly the distinction `LAZY_PEEK_MAX_LEN`/
+//!   `LAZY_PEEK_MIN_DIST`'s doc comment already describes qualitatively —
+//!   this makes it measurable.
+//! - **`fast_k2_batch_iterations`** — the SF2 two-position software-pipeline
+//!   lever (`fastloop_l1`'s doc comment): incremented once per outer-loop
+//!   iteration that takes the `pos + 1 < fast_end` batched branch (issuing
+//!   both `head[h0]`/`head[h1]` reads before consuming either), regardless of
+//!   how the batch resolves. The scalar boundary fallback (the lone leftover
+//!   position when `pos + 1 == fast_end`) does NOT increment this — it is
+//!   byte-for-byte the pre-SF2 single-position path.
 
 #[cfg(feature = "anatomy-counters")]
 use std::sync::atomic::AtomicU64;
@@ -184,6 +272,20 @@ define_counters!(
     bt_child_table_reads,
     bt_child_table_writes,
     bt_positions_skipped,
+    // Single-probe fast matchfinder (matchfinder-free, parse/fast.rs — L0/L1).
+    fast_positions_processed,
+    fast_positions_skipped,
+    fast_hash_computations,
+    fast_head_table_reads,
+    fast_head_table_writes,
+    fast_probe_attempts,
+    fast_probe_outcome_miss,
+    fast_probe_outcome_too_short,
+    fast_probe_outcome_accepted,
+    fast_probe_outcome_deferred,
+    fast_lazy_peek_events,
+    fast_lazy_peek_defers,
+    fast_k2_batch_iterations,
     // Token emission / histogram updates (parse/mod.rs Sink).
     literals_emitted,
     literals_emitted_fast,

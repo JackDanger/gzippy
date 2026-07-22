@@ -50,6 +50,94 @@ use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_w
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
 use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes};
 
+/// Per-`run()`-call local accumulator for the fast-path anatomy counters
+/// (`anatomy-counters` feature only; see `anatomy_counters.rs`'s `fast_*` doc
+/// comment for the full accounting story). Unlike `hc.rs`'s `HcLocalCounters`
+/// (which lives entirely inside one function, `longest_match`), this finder's
+/// hot logic spans `process_position_l1`/`fastloop_l0`/`fastloop_l1` and
+/// `run`'s own tail/seed loops — so one instance is created in `run`, threaded
+/// through as an extra parameter present ONLY when the feature is on
+/// (`#[cfg(feature = "anatomy-counters")]` on the parameter declaration and on
+/// the argument at every call site — a true zero-parameter signature when
+/// off, not an unused one), and flushed once at `run`'s return, after every
+/// internal block the call covers.
+///
+/// Two fields are DERIVED sums rather than directly-tracked totals — a
+/// second overhead pass (hyperfine, M1 Pro, `/dev/null`, interleaved, L1)
+/// found the direct-tracking version cost `bin6` ~13% (vs a ~6% PRE-EXISTING
+/// baseline from the Sink's own un-batched `push_*_fast` atomics — see the
+/// commit message for the full before/after table), and both derivations
+/// remove an unconditional field write from the hottest (most frequent)
+/// per-position branches without losing any information, because each is a
+/// genuine structural identity of this parser, not a guess:
+///
+/// - `fast_positions_processed = positions_processed_matches +
+///   probe_outcome_miss + probe_outcome_too_short + probe_outcome_deferred +
+///   no_probe_literals`: every miss/too-short/deferred outcome consumes
+///   EXACTLY one byte (by construction — it is coded as a single literal),
+///   and `no_probe_literals` covers the one case with no outcome bucket at
+///   all (the tail loop's near-EOF `max_len < SHORTEST_MATCH`, where no
+///   probe is attempted). This is true across `process_position_l1`,
+///   `fastloop_l0`, and the tail loop uniformly, so no site needs its own
+///   unconditional `+= 1`.
+/// - `fast_head_table_writes = probe_attempts + interior_writes +
+///   dict_seed_writes`: the primary `head[h] = pos` insert is unconditional
+///   at the top of every REAL probe (never at a no-probe near-EOF literal)
+///   and fires EXACTLY once per probe attempt, so `probe_attempts` (already
+///   tracked for its own sake) already equals that contribution exactly;
+///   `interior_writes` is the separate LIMIT_HASH_UPDATE contribution
+///   (accepted matches only) and `dict_seed_writes` the preset-dictionary
+///   seed loop's (outside the coded span entirely).
+#[cfg(feature = "anatomy-counters")]
+#[derive(Default)]
+struct FastLocalCounters {
+    positions_processed_matches: u64,
+    no_probe_literals: u64,
+    positions_skipped: u64,
+    hash_computations: u64,
+    head_table_reads: u64,
+    interior_writes: u64,
+    dict_seed_writes: u64,
+    probe_attempts: u64,
+    probe_outcome_miss: u64,
+    probe_outcome_too_short: u64,
+    probe_outcome_accepted: u64,
+    probe_outcome_deferred: u64,
+    lazy_peek_events: u64,
+    lazy_peek_defers: u64,
+    k2_batch_iterations: u64,
+}
+
+#[cfg(feature = "anatomy-counters")]
+impl FastLocalCounters {
+    #[inline(always)]
+    fn flush(self) {
+        crate::anatomy_count!(
+            fast_positions_processed,
+            self.positions_processed_matches
+                + self.probe_outcome_miss
+                + self.probe_outcome_too_short
+                + self.probe_outcome_deferred
+                + self.no_probe_literals
+        );
+        crate::anatomy_count!(fast_positions_skipped, self.positions_skipped);
+        crate::anatomy_count!(fast_hash_computations, self.hash_computations);
+        crate::anatomy_count!(fast_head_table_reads, self.head_table_reads);
+        crate::anatomy_count!(
+            fast_head_table_writes,
+            self.probe_attempts + self.interior_writes + self.dict_seed_writes
+        );
+        crate::anatomy_count!(fast_probe_attempts, self.probe_attempts);
+        crate::anatomy_count!(fast_probe_outcome_miss, self.probe_outcome_miss);
+        crate::anatomy_count!(fast_probe_outcome_too_short, self.probe_outcome_too_short);
+        crate::anatomy_count!(fast_probe_outcome_accepted, self.probe_outcome_accepted);
+        crate::anatomy_count!(fast_probe_outcome_deferred, self.probe_outcome_deferred);
+        crate::anatomy_count!(fast_lazy_peek_events, self.lazy_peek_events);
+        crate::anatomy_count!(fast_lazy_peek_defers, self.lazy_peek_defers);
+        crate::anatomy_count!(fast_k2_batch_iterations, self.k2_batch_iterations);
+    }
+}
+
 /// Log2 of the head-table size. igzip's level-0 hash table is
 /// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`); we widen
 /// it to `1 << 16` (64K) because the finder is single-probe — a wider table
@@ -264,6 +352,7 @@ pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 /// LIMIT_HASH_UPDATE loads — stays in bounds because
 /// `fast_end <= in_end - DEFLATE_MAX_MATCH_LEN` (see [`run`]'s `fast_end`).
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn process_position_l1(
     pos: usize,
     h: usize,
@@ -273,9 +362,16 @@ fn process_position_l1(
     head: &mut [u32],
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
+    #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
     unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+    // `head_table_writes`/`probe_attempts`'s "1 per call" contribution is
+    // counted by the CALLER instead of here (see `fastloop_l1`'s call
+    // sites) — the caller already knows statically how many times it is
+    // about to invoke this function, so folding these two unconditional
+    // per-call bumps out of the hottest inlined body trims two field writes
+    // from the common (miss/too-short) path without losing any count.
 
     // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
     // the window range instead of panicking on underflow.
@@ -291,17 +387,29 @@ fn process_position_l1(
             // matches are longer, or the position is a miss and never
             // reaches here).
             if length <= LAZY_PEEK_MAX_LEN && dist > LAZY_PEEK_MIN_DIST {
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.lazy_peek_events += 1;
+                }
                 // SAFETY: caller-upheld `pos < fast_end <= in_end - 258`,
                 // so `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
                 // both the 4-byte load and the up-to-258-byte
                 // `lz_extend` below stay in bounds.
                 let seq1 = unsafe { load_u32(base, pos + 1) };
                 let h1 = lz_hash(seq1, HASH_BITS) as usize;
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.hash_computations += 1;
+                }
                 // SAFETY: same as the primary lookup above; this is a
                 // READ ONLY -- the peek does not insert `pos + 1` into
                 // `head`, so the caller's next position (whether this
                 // match is deferred or taken) is not a double-insert.
                 let cand1 = unsafe { *head.get_unchecked(h1) };
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.head_table_reads += 1;
+                }
                 let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
                 if (1..=WINDOW).contains(&dist1) {
                     let next_len =
@@ -315,6 +423,11 @@ fn process_position_l1(
                         // byte later. Emit `pos` as a literal; the
                         // caller discovers `pos + 1`'s match fresh
                         // (including its own head-table insert).
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.lazy_peek_defers += 1;
+                            local.probe_outcome_deferred += 1;
+                        }
                         // SAFETY: `pos < fast_end <= in_end`.
                         sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
                         return pos + 1;
@@ -322,6 +435,11 @@ fn process_position_l1(
                 }
             }
 
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.probe_outcome_accepted += 1;
+                local.positions_processed_matches += length as u64;
+            }
             // LIMIT_HASH_UPDATE (see the tail loop for the full note).
             let match_end = pos + length as usize;
             let insert_end = if limit_hash_update_inserts == usize::MAX {
@@ -338,13 +456,36 @@ fn process_position_l1(
                 unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
                 nh += 1;
             }
+            // Counted ONCE for the whole interior loop (not per iteration —
+            // `insert_end - (pos + 1)` is exactly the iteration count above,
+            // known without re-walking): this branch only runs on an
+            // ACCEPTED match, already the less-frequent outcome, so this is
+            // a smaller win than the miss/too-short derivations above, but
+            // free to take.
+            #[cfg(feature = "anatomy-counters")]
+            {
+                let interior = (insert_end - (pos + 1)) as u64;
+                local.hash_computations += interior;
+                local.interior_writes += interior;
+            }
 
             sink.push_match_fast(length, dist as u32);
             return pos + length as usize;
         }
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.probe_outcome_too_short += 1;
+        }
+    } else {
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.probe_outcome_miss += 1;
+        }
     }
 
-    // Literal.
+    // Literal (miss or too-short — `positions_processed`'s +1 for this
+    // position is DERIVED at flush from the outcome bucket just set above,
+    // see `FastLocalCounters::flush`'s doc comment).
     // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
     sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
     pos + 1
@@ -376,6 +517,7 @@ fn fastloop_l0(
     head: &mut [u32],
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
+    #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
 ) -> usize {
     // Consecutive-miss counter driving the `ACCEL` scan-step ramp (see
     // `ACCEL_SHIFT`'s doc comment).
@@ -387,7 +529,10 @@ fn fastloop_l0(
         // wrong prefetch only wastes bandwidth. SAFETY: `pos < fast_end <=
         // in_end - 258` and `PF_DIST` is small, so `pos + PF_DIST + 4 <=
         // in_end`, in bounds for the 4-byte load; the prefetch address is a
-        // pure hint that never faults.
+        // pure hint that never faults. (Not counted as a `fast_hash_computations`
+        // event — see anatomy_counters.rs's fast_* doc comment: this hash is
+        // speculative and the same position's hash is computed again for real
+        // below.)
         unsafe {
             let fseq = load_u32(base, pos + PF_DIST);
             let fh = lz_hash(fseq, HASH_BITS) as usize;
@@ -396,9 +541,18 @@ fn fastloop_l0(
         // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
         let seq = unsafe { load_u32(base, pos) };
         let h = lz_hash(seq, HASH_BITS) as usize;
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.hash_computations += 1;
+        }
         // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
         let cand = unsafe { *head.get_unchecked(h) };
         unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.head_table_reads += 1;
+            local.probe_attempts += 1;
+        }
 
         // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
         // the window range instead of panicking on underflow.
@@ -409,6 +563,11 @@ fn fastloop_l0(
             // candidate simply yields length < SHORTEST_MATCH -> literal.
             let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
             if length >= SHORTEST_MATCH {
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.probe_outcome_accepted += 1;
+                    local.positions_processed_matches += length as u64;
+                }
                 // LIMIT_HASH_UPDATE (see the tail loop for the full note).
                 let match_end = pos + length as usize;
                 let insert_end = if limit_hash_update_inserts == usize::MAX {
@@ -425,15 +584,33 @@ fn fastloop_l0(
                     unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
                     nh += 1;
                 }
+                // Counted once for the whole loop — see `process_position_l1`'s
+                // matching comment.
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    let interior = (insert_end - (pos + 1)) as u64;
+                    local.hash_computations += interior;
+                    local.interior_writes += interior;
+                }
 
                 sink.push_match_fast(length, dist as u32);
                 pos += length as usize;
                 literal_run = 0;
                 continue;
             }
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.probe_outcome_too_short += 1;
+            }
+        } else {
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.probe_outcome_miss += 1;
+            }
         }
 
-        // Literal.
+        // Literal (miss or too-short — see `FastLocalCounters::flush`'s doc
+        // comment for the derivation that covers this position's count).
         // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
         sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
 
@@ -457,6 +634,10 @@ fn fastloop_l0(
                 // SAFETY: see the bounds note above.
                 sink.push_literal_fast(unsafe { *buf.get_unchecked(pos + i) });
                 i += 1;
+            }
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.positions_skipped += (step - 1) as u64;
             }
         }
         pos += step;
@@ -485,6 +666,7 @@ fn fastloop_l1(
     head: &mut [u32],
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
+    #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline: warm the head-table line for the
@@ -531,6 +713,12 @@ fn fastloop_l1(
             // loop forced).
             let cand0 = unsafe { *head.get_unchecked(h0) };
             let cand1_raw = unsafe { *head.get_unchecked(h1) };
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.hash_computations += 2;
+                local.head_table_reads += 2;
+                local.k2_batch_iterations += 1;
+            }
 
             let after0 = process_position_l1(
                 pos,
@@ -541,7 +729,13 @@ fn fastloop_l1(
                 head,
                 sink,
                 limit_hash_update_inserts,
+                #[cfg(feature = "anatomy-counters")]
+                local,
             );
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.probe_attempts += 1;
+            }
             if after0 == pos + 1 {
                 // Position `pos` resolved to a plain one-byte literal (no
                 // match, including a lazy-peek DEFER) — exactly the case
@@ -566,7 +760,13 @@ fn fastloop_l1(
                     head,
                     sink,
                     limit_hash_update_inserts,
+                    #[cfg(feature = "anatomy-counters")]
+                    local,
                 );
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.probe_attempts += 1;
+                }
             } else {
                 // Position `pos` was a match: it consumed `pos + 1` (or
                 // jumped past it), so the batch's `cand1_raw` was never
@@ -585,8 +785,16 @@ fn fastloop_l1(
         // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
         let seq = unsafe { load_u32(base, pos) };
         let h = lz_hash(seq, HASH_BITS) as usize;
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.hash_computations += 1;
+        }
         // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
         let cand = unsafe { *head.get_unchecked(h) };
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.head_table_reads += 1;
+        }
         pos = process_position_l1(
             pos,
             h,
@@ -596,7 +804,13 @@ fn fastloop_l1(
             head,
             sink,
             limit_hash_update_inserts,
+            #[cfg(feature = "anatomy-counters")]
+            local,
         );
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.probe_attempts += 1;
+        }
     }
     pos
 }
@@ -641,14 +855,30 @@ pub(super) fn run<const ACCEL: bool>(
     let mut head = vec![NO_POS; HASH_SIZE];
     let base = buf.as_ptr();
 
+    // One accumulator for the WHOLE `run()` call (every internal block this
+    // call emits), flushed once at the end — see `FastLocalCounters`'s doc
+    // comment for why (spans multiple functions, so it can't live as a plain
+    // local the way `hc.rs`'s `HcLocalCounters` does).
+    #[cfg(feature = "anatomy-counters")]
+    let mut local = FastLocalCounters::default();
+
     // Seed the preset dictionary (positions < data_start) into the head table.
     // Each has >= 4 readable bytes because data follows the dict in `buf`.
+    // NOT part of `fast_positions_processed`/`fast_positions_skipped` — the
+    // dictionary prefix is seeded but never coded, so it is outside the
+    // "input bytes consumed by the parse" the reconciliation invariant covers
+    // (see anatomy_counters.rs's fast_* doc comment).
     let mut p = 0usize;
     while p < data_start {
         // SAFETY: p < data_start <= in_end, and buf has BUF_PAD >= 16 bytes past
         // in_end, so [p, p+4) is in bounds.
         let seq = unsafe { load_u32(base, p) };
         head[lz_hash(seq, HASH_BITS) as usize] = p as u32;
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.hash_computations += 1;
+            local.dict_seed_writes += 1;
+        }
         p += 1;
     }
 
@@ -693,6 +923,8 @@ pub(super) fn run<const ACCEL: bool>(
                 &mut head,
                 &mut sink,
                 limit_hash_update_inserts,
+                #[cfg(feature = "anatomy-counters")]
+                &mut local,
             )
         } else {
             fastloop_l1(
@@ -703,6 +935,8 @@ pub(super) fn run<const ACCEL: bool>(
                 &mut head,
                 &mut sink,
                 limit_hash_update_inserts,
+                #[cfg(feature = "anatomy-counters")]
+                &mut local,
             )
         };
 
@@ -720,8 +954,17 @@ pub(super) fn run<const ACCEL: bool>(
                 // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
                 let seq = unsafe { load_u32(base, pos) };
                 let h = lz_hash(seq, HASH_BITS) as usize;
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.hash_computations += 1;
+                }
                 let cand = head[h];
                 head[h] = pos as u32;
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.head_table_reads += 1;
+                    local.probe_attempts += 1;
+                }
 
                 // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
                 // the window range instead of panicking on underflow.
@@ -732,6 +975,11 @@ pub(super) fn run<const ACCEL: bool>(
                     // candidate simply yields length < SHORTEST_MATCH -> literal.
                     let length = lz_extend(buf, pos, cand_pos, 0, max_len);
                     if length >= SHORTEST_MATCH {
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.probe_outcome_accepted += 1;
+                            local.positions_processed_matches += length as u64;
+                        }
                         // LIMIT_HASH_UPDATE: insert the hash for the first
                         // LIMIT_HASH_UPDATE_INSERTS match-interior positions
                         // (igzip inserts ~3), then jump the cursor over the whole
@@ -751,6 +999,11 @@ pub(super) fn run<const ACCEL: bool>(
                             // buf's pad covers the 4-byte load past in_end.
                             let s = unsafe { load_u32(base, nh) };
                             head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
+                            #[cfg(feature = "anatomy-counters")]
+                            {
+                                local.hash_computations += 1;
+                                local.interior_writes += 1;
+                            }
                             nh += 1;
                         }
 
@@ -758,10 +1011,30 @@ pub(super) fn run<const ACCEL: bool>(
                         pos += length as usize;
                         continue;
                     }
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.probe_outcome_too_short += 1;
+                    }
+                } else {
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.probe_outcome_miss += 1;
+                    }
                 }
             }
 
-            // Literal.
+            // Literal. When `max_len >= SHORTEST_MATCH`, this position was
+            // probed and already landed in `probe_outcome_miss`/`_too_short`
+            // above — its "+1 processed" is DERIVED at flush (see
+            // `FastLocalCounters::flush`'s doc comment), no explicit count
+            // needed here. The one case with NO outcome bucket at all is
+            // near-EOF `max_len < SHORTEST_MATCH` (not enough lookahead to
+            // probe, the `if` above never ran) — `no_probe_literals` is
+            // exactly that case, and only that case.
+            #[cfg(feature = "anatomy-counters")]
+            if max_len < SHORTEST_MATCH {
+                local.no_probe_literals += 1;
+            }
             sink.push_literal_fast(buf[pos]);
             pos += 1;
         }
@@ -789,4 +1062,8 @@ pub(super) fn run<const ACCEL: bool>(
             break;
         }
     }
+
+    // One flush for the whole call — see `FastLocalCounters`'s doc comment.
+    #[cfg(feature = "anatomy-counters")]
+    local.flush();
 }

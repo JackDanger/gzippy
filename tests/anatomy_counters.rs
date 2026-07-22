@@ -70,6 +70,32 @@ fn mixed_corpus(min_len: usize) -> Vec<u8> {
     data
 }
 
+/// A mostly-incompressible corpus (a xorshift-style PRNG stream, occasional
+/// short repeats spliced in) — long consecutive-miss runs are exactly what
+/// arms `fast.rs`'s L0-only ACCEL scan-step ramp (`ACCEL_ARM_THRESHOLD`
+/// consecutive misses), so this is the fixture that proves
+/// `fast_positions_skipped` is a LIVE counter, not a permanent zero.
+fn low_redundancy_corpus(min_len: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut x: u32 = 0x9E3779B9;
+    while data.len() < min_len {
+        // Every 64th byte, splice in a short repeat of the last 6 bytes so
+        // the finder still sees SOME matches (a pure-noise stream would
+        // never exercise the probe/accept path at all).
+        if data.len() >= 6 && data.len() % 64 < 6 {
+            let start = data.len() - 6;
+            let b = data[start];
+            data.push(b);
+        } else {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            data.push((x >> 16) as u8);
+        }
+    }
+    data
+}
+
 /// Run `gzippy -{level} -c -p 1` over `data` via stdin, returning
 /// `(compressed_stdout, counters_map_from_stderr)`.
 fn compress_with_counters(data: &[u8], level: u32) -> (Vec<u8>, BTreeMap<String, u64>) {
@@ -198,4 +224,221 @@ fn counters_are_absent_from_a_feature_off_style_quiet_run() {
     let (_out, c) = compress_with_counters(b"tiny", 1);
     assert!(c.contains_key("alloc_events"));
     assert!(c.get("alloc_events").copied().unwrap_or(0) > 0);
+}
+
+// ============================================================================
+// fast_* (parse/fast.rs, L0/L1 single-probe matchfinder) reconciliation.
+//
+// Before this counter set, `fast.rs` was the ONE parser with zero anatomy
+// coverage: a calibration run confirmed hc_probe_attempts/bt_probe_attempts
+// sit at exactly 0 at L1 (the fast path never touches those finders). These
+// tests close the loop the same way the L1-block test above does: run a real
+// gzippy subprocess, decode+verify the output, then check the fast_* counters
+// against facts derivable from that SAME run (byte conservation via the
+// input length, and cross-checks against the shared Sink counters that ONLY
+// fast.rs increments through the `_fast` push variants).
+// ============================================================================
+
+/// Assertions common to both L0 and L1: `fast_*` must account for every input
+/// byte, and the accepted-probe count must equal the shared Sink's
+/// `matches_emitted_fast` (the mission's "accepted probes == matches_emitted_fast"
+/// cross-check) — plus the outcome buckets must partition attempts exactly.
+fn assert_fast_common_invariants(c: &BTreeMap<String, u64>, data_len: u64) {
+    let get = |k: &str| *c.get(k).unwrap_or_else(|| panic!("missing counter {k}"));
+
+    let processed = get("fast_positions_processed");
+    let skipped = get("fast_positions_skipped");
+    let attempts = get("fast_probe_attempts");
+    let miss = get("fast_probe_outcome_miss");
+    let too_short = get("fast_probe_outcome_too_short");
+    let accepted = get("fast_probe_outcome_accepted");
+    let deferred = get("fast_probe_outcome_deferred");
+    let lazy_events = get("fast_lazy_peek_events");
+    let lazy_defers = get("fast_lazy_peek_defers");
+    let hash_computations = get("fast_hash_computations");
+    let head_reads = get("fast_head_table_reads");
+    let head_writes = get("fast_head_table_writes");
+    let matches_fast = get("matches_emitted_fast");
+    let lits = get("literals_emitted");
+    let match_bytes = get("match_length_bytes_total");
+
+    // The mission's headline reconciliation invariant: every coded input byte
+    // lands in exactly one of "processed via the probe path" or "skipped by
+    // ACCEL with no finder touch at all" (see anatomy_counters.rs's fast_*
+    // doc comment for the exact partition definition).
+    assert_eq!(
+        processed + skipped,
+        data_len,
+        "fast_positions_processed + fast_positions_skipped must equal input bytes consumed"
+    );
+
+    // "accepted probes == matches_emitted_fast": every accepted-and-not-
+    // deferred probe calls push_match_fast exactly once, and push_match_fast
+    // is called from nowhere else in the fast path.
+    assert_eq!(
+        accepted, matches_fast,
+        "fast_probe_outcome_accepted must equal matches_emitted_fast exactly"
+    );
+
+    // Outcome buckets are an exact partition of attempts (miss/too-short/
+    // accepted/deferred — deferred is the justified 4th bucket documented in
+    // anatomy_counters.rs: a lazy-peek DEFER is neither a miss, too-short,
+    // nor an emitted match).
+    assert_eq!(
+        attempts,
+        miss + too_short + accepted + deferred,
+        "fast_probe_attempts must partition exactly into miss+too_short+accepted+deferred"
+    );
+
+    // Every probe attempt does at least one primary head-table write (the
+    // unconditional insert at the top of the per-position body) and, when
+    // batched, at least one read feeding it — so both must be >= attempts.
+    assert!(
+        head_writes >= attempts,
+        "fast_head_table_writes ({head_writes}) must be >= fast_probe_attempts ({attempts})"
+    );
+    assert!(
+        head_reads >= attempts,
+        "fast_head_table_reads ({head_reads}) must be >= fast_probe_attempts ({attempts})"
+    );
+    assert!(hash_computations > 0, "fast_hash_computations must fire");
+    assert!(
+        attempts > 0,
+        "fixture must exercise the finder at least once"
+    );
+
+    // Lazy-peek defers are a subset of lazy-peek attempts.
+    assert!(
+        lazy_defers <= lazy_events,
+        "fast_lazy_peek_defers ({lazy_defers}) must be <= fast_lazy_peek_events ({lazy_events})"
+    );
+
+    // Token-level reconciliation still holds with fast.rs in the mix (same
+    // invariant the L1 test above checks, restated here so THIS test is
+    // self-contained): every input byte is exactly one literal or one
+    // position of exactly one match.
+    assert_eq!(
+        lits + match_bytes,
+        data_len,
+        "literal+match-length byte count must equal total input bytes parsed"
+    );
+}
+
+/// A real-text slice big enough, and with enough long-range repeat structure,
+/// to reliably arm the L1-only lazy-peek lever (`LAZY_PEEK_MIN_DIST = 8192`
+/// gates it to short matches at distances the small synthetic `mixed_corpus`
+/// rarely produces). Mirrors the precedent in `matchfinder/hc.rs`'s
+/// `matches_equal_scalar_silesia` test: same fixture file, same graceful
+/// skip-if-missing (the file is `.gitignore`d — `benchmark_data/silesia.tar.xz`
+/// is the tracked, compressed form; a fresh checkout without it extracted
+/// simply skips this fixture's assertions rather than failing CI).
+fn silesia_slice(min_len: usize) -> Option<Vec<u8>> {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark_data/silesia.tar");
+    let mut f = std::fs::File::open(&path).ok()?;
+    use std::io::{Read, Seek};
+    let mut data = vec![0u8; min_len];
+    f.seek(std::io::SeekFrom::Start(1 << 16)).ok()?;
+    f.read_exact(&mut data).ok()?;
+    Some(data)
+}
+
+#[test]
+fn fast_path_reconciliation_invariants_hold_at_l1() {
+    let Some(data) = silesia_slice(900_000) else {
+        eprintln!("note: benchmark_data/silesia.tar missing; skipped fast_path L1 fixture");
+        return;
+    };
+    let (compressed, c) = compress_with_counters(&data, 1);
+
+    let mut decoded = Vec::new();
+    {
+        use std::io::Read;
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .expect("gzippy stdout must be a valid gzip stream");
+    }
+    assert_eq!(decoded, data, "roundtrip sanity check failed");
+
+    assert_fast_common_invariants(&c, data.len() as u64);
+
+    let get = |k: &str| *c.get(k).unwrap_or_else(|| panic!("missing counter {k}"));
+
+    // L1 (`Strategy::Fast`, `ACCEL == false`) never activates the scan-step
+    // ramp at all — `fastloop_l0` is a physically separate function L1 never
+    // calls (see fast.rs's module doc comment).
+    assert_eq!(
+        get("fast_positions_skipped"),
+        0,
+        "L1 must never skip positions via ACCEL (that mechanism is L0-only)"
+    );
+
+    // The SF2 two-position software pipeline is L1-only and this fixture
+    // (900 KB, mixed literals+matches) is far bigger than one batch pair, so
+    // it must engage at least once.
+    assert!(
+        get("fast_k2_batch_iterations") > 0,
+        "L1's SF2 batch pipeline must engage on a fixture this size"
+    );
+
+    // The lazy-peek lever (short, far accepted matches) should fire at least
+    // once on a corpus with real match variety; if this ever reads 0 the
+    // fixture stopped exercising the lever, not that the counter is dead
+    // (cross-checked against `fast_probe_outcome_deferred` below).
+    assert!(
+        get("fast_lazy_peek_events") > 0,
+        "expected at least one lazy-peek attempt on this fixture"
+    );
+    assert_eq!(
+        get("fast_lazy_peek_defers"),
+        get("fast_probe_outcome_deferred"),
+        "every lazy-peek defer must be reflected in the deferred outcome bucket"
+    );
+}
+
+#[test]
+fn fast_path_reconciliation_invariants_hold_at_l0() {
+    let data = low_redundancy_corpus(900_000);
+    let (compressed, c) = compress_with_counters(&data, 0);
+
+    let mut decoded = Vec::new();
+    {
+        use std::io::Read;
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .expect("gzippy stdout must be a valid gzip stream");
+    }
+    assert_eq!(decoded, data, "roundtrip sanity check failed");
+
+    assert_fast_common_invariants(&c, data.len() as u64);
+
+    let get = |k: &str| *c.get(k).unwrap_or_else(|| panic!("missing counter {k}"));
+
+    // L0 (`Strategy::Fast0`, `ACCEL == true`) is the ramp's ONLY caller; a
+    // low-redundancy fixture with long miss runs must arm it at least once —
+    // proving `fast_positions_skipped` is a live counter, not a permanent
+    // zero (mirrored by the L1 test's assertion that it's ALWAYS zero there).
+    assert!(
+        get("fast_positions_skipped") > 0,
+        "expected the ACCEL ramp to skip at least one position on a low-redundancy fixture"
+    );
+
+    // L0 shares NEITHER the lazy peek NOR the SF2 batch pipeline with L1 —
+    // `fastloop_l0` is a dedicated, non-generic function that never calls
+    // `process_position_l1` (see fast.rs's module doc comment on why).
+    assert_eq!(
+        get("fast_lazy_peek_events"),
+        0,
+        "L0 must never attempt a lazy peek (L1-only mechanism)"
+    );
+    assert_eq!(
+        get("fast_k2_batch_iterations"),
+        0,
+        "L0 must never engage the SF2 batch pipeline (L1-only mechanism)"
+    );
+    assert_eq!(
+        get("fast_probe_outcome_deferred"),
+        0,
+        "L0 can never defer (no lazy peek to defer through)"
+    );
 }
