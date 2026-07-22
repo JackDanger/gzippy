@@ -646,46 +646,72 @@ unsafe fn add_entry(bw: &mut BitWriter, e: u32) {
 /// whole-word flush per group), then the 1-3-literal tail. Returns the position
 /// one past the run.
 ///
-/// Dispatches to the AVX2 batch-of-8 emitter ([`avx2_emit::emit_literal_run_avx2`])
-/// when the CPU supports it at runtime (checked once per call via the cached
-/// `is_x86_feature_detected!`, the same pattern as
-/// `decompress::parallel::replace_markers::replace_markers`); otherwise, and on
-/// every non-x86_64 target, falls straight through to
-/// [`emit_literal_run_scalar`] — the exact pre-AVX2 code, unchanged. The AVX2
-/// function is `cfg(target_arch = "x86_64")`-gated out entirely on aarch64/M1,
-/// so that build is structurally identical to before this lever, not just
-/// numerically equal.
+/// FALSIFIED (2026-07-22, AVX2 gather+vpsllvq attempt — the reopen trigger
+/// named by the scalar-prefix-sum FALSIFIED note on [`emit_sequences`]):
+/// replaced this loop with a batch-of-8 AVX2 emitter (`vpgatherdd` fetching 8
+/// packed `codeword | nbits << 24` LUT entries in one instruction, split into
+/// two groups of 4 for a real `vpsllvq`-based merge — exclusive prefix-sum of
+/// bit-widths via 2-step Hillis-Steele, `_mm256_sllv_epi64` variable shift on
+/// 64-bit-widened codewords, horizontal OR-reduce), dispatched at runtime via
+/// `is_x86_feature_detected!("avx2")` (mirroring
+/// `decompress::parallel::replace_markers::replace_markers`), scalar fallback
+/// unchanged. Byte-identical (L0-12 x T1/T4 x {dd79_text6, dd79_bin6,
+/// dickens, data.parquet}, 104/104 cells + roundtrip-verified via system
+/// `gunzip` on solvency AMD Zen2) but a measured NET REGRESSION, and by a
+/// much larger margin than the scalar attempt: `perf stat -r 15`
+/// (`-C target-cpu=native`, `/root/gzippy-locate5`) showed whole-program
+/// instructions UP in every one of the 4 {corpus x level} cells tested —
+/// text6 L1 +13.3%, text6 L6 +3.0%, bin6 L1 +1.25%, bin6 L6 +5.6% — and wall
+/// UP correspondingly, confirmed by a genuinely INTERLEAVED paired-diff
+/// (alternating lever/base each iteration, N=21, `/dev/null` sink): median
+/// lever/base wall ratio 1.096 (text6 L1), 1.028 (text6 L6), 1.078 (bin6 L1),
+/// 1.051 (bin6 L6) — 20-21 of 21 pairs worse in every cell, far beyond the
+/// ~0.3-1.5% per-cell spread. Whole-program `valgrind --tool=cachegrind`
+/// I-refs independently corroborated the perf-stat instruction delta (text6
+/// L1: 231.75M vs 203.03M, +14.1%); per-function attribution was not
+/// obtainable (the shipped profile is `lto="fat"` + `strip=true`, the
+/// documented "LTO lesson" — own-function deltas are not trustworthy under
+/// that build shape). M1/aarch64: the AVX2 code was `cfg(target_arch =
+/// "x86_64")`-gated out entirely — confirmed zero-change by construction
+/// (cargo build/test/clippy/fmt clean, the AVX2 differential tests do not
+/// appear in the M1 test list because the module does not exist there).
+///
+/// Root cause (Gate-2 CAUSAL, not inferred): a follow-up diagnostic variant
+/// on solvency replaced ONLY the `vpgatherdd` with 8 independent scalar
+/// table loads assembled into the same vectors via `_mm_set_epi32`, keeping
+/// the identical `vpsllvq` merge — and instructions/wall were statistically
+/// indistinguishable from the gather version (e.g. text6 L1: 246.36M instr
+/// vs the gather version's 246.48M; bin6 L6: 728.44M vs 728.14M). So
+/// `vpgatherdd` is NOT the cost driver on this Zen2 box — the merge math
+/// itself (the widen/shift/OR-reduce sequence replacing 4 dependent
+/// `add_bits_raw` calls) costs more total instructions than it saves, for
+/// the same reason the pure-scalar attempt found: the OOO scheduler already
+/// hides that short dependency chain's latency, so shortening it with more
+/// numerous vector instructions is a pure loss, independent of whether the
+/// per-lane loads are scalar or gathered. This strengthens (does not merely
+/// repeat) the original falsification's hypothesis, now with a Gate-2
+/// isolation, not just an inference.
+///
+/// Reopen trigger: none identified this session for THIS merge shape on
+/// this arch. An unexplored variant — skip the prefix-sum/shift/OR merge
+/// entirely and use the gather (or scalar loads) only to prefetch/batch the
+/// table lookups while keeping 4 independent scalar `add_bits_raw` calls per
+/// group (i.e. vectorize ONLY the load, not the merge) — was NOT tried and
+/// is a distinct hypothesis from both falsified attempts; Intel (non-Zen2)
+/// hardware, where `vpgatherdd`/shuffle throughput characteristics differ,
+/// was also not tested. The exact falsified diff (both the gather variant
+/// and the no-gather diagnostic) is reproduced in full in the commit that
+/// introduced this note (`git log --grep=FALSIFIED -p` on this file; the
+/// gather implementation itself, before revert, is preserved verbatim in
+/// commit `e63316ba`) so a future session can rebuild and re-measure either
+/// variant, or the untried load-only-vectorize hypothesis, without
+/// re-deriving the technique from scratch.
 ///
 /// # Safety
 /// `p + litrunlen <= buf.len()`, and the output buffer must have been
 /// `reserve`d so every `flush_word_unchecked` has 8 spare bytes.
 #[inline(always)]
 unsafe fn emit_literal_run(
-    bw: &mut BitWriter,
-    buf: &[u8],
-    p: usize,
-    litrunlen: usize,
-    lit: &[u32; NUM_LITERALS],
-) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: avx2 just confirmed at runtime; the rest of the
-            // contract is the caller's, forwarded unchanged.
-            return unsafe { avx2_emit::emit_literal_run_avx2(bw, buf, p, litrunlen, lit) };
-        }
-    }
-    // SAFETY: forwarded from caller.
-    unsafe { emit_literal_run_scalar(bw, buf, p, litrunlen, lit) }
-}
-
-/// The scalar literal-run emitter (pre-AVX2-lever code, unchanged): groups of
-/// 4 literals per whole-word flush, then the 1-3-literal tail.
-///
-/// # Safety
-/// Same contract as [`emit_literal_run`].
-#[inline(always)]
-unsafe fn emit_literal_run_scalar(
     bw: &mut BitWriter,
     buf: &[u8],
     mut p: usize,
@@ -715,284 +741,6 @@ unsafe fn emit_literal_run_scalar(
         p += litrunlen;
     }
     p
-}
-
-/// AVX2 batch-of-8 literal emitter — the reopen-trigger attempt named in
-/// [`emit_sequences`]'s FALSIFIED doc comment: real explicit-width SIMD
-/// (`vpgatherdd` + `vpsllvq` + a horizontal OR-reduce), not the scalar
-/// prefix-sum-and-OR merge that was tried and measured a net regression
-/// (same math, done with independent scalar instructions instead of vector
-/// ones, so it only shortened the dependency chain the OOO scheduler was
-/// already hiding — it didn't change the instruction-COUNT term). This
-/// module changes the instruction count: one `vpgatherdd` replaces 8
-/// independent scalar table loads, and one `vpsllvq` replaces 4 dependent
-/// shift-and-OR steps per group.
-#[cfg(target_arch = "x86_64")]
-mod avx2_emit {
-    use super::{emit_literal_run_scalar, BitWriter, NUM_LITERALS};
-    use std::arch::x86_64::*;
-
-    /// Batch-of-8 literal-run emitter: one `vpgatherdd` fetches all 8
-    /// `codeword | nbits << 24` entries in a single instruction (the LUT
-    /// layout — [`super::EmitTables::lit`] — was built exactly so this
-    /// gather can read codeword and length together), then the 8 lanes
-    /// split into two groups of 4 for [`merge_group4`] + one
-    /// `flush_word_unchecked` each — the same 4-wide safe-buffering window
-    /// the scalar path uses (the `can_buffer(4 * MAX_LITLEN_CODEWORD_LEN)`
-    /// const assertion in the parent module), so this is a strict
-    /// instruction-count optimization of the existing group-of-4 flush
-    /// cadence, not a new buffering scheme. Falls back to
-    /// [`emit_literal_run_scalar`] for the tail (0..=7 remaining literals)
-    /// and whenever fewer than 8 literals remain.
-    ///
-    /// # Safety
-    /// Same contract as [`super::emit_literal_run`], PLUS the caller has
-    /// confirmed `is_x86_feature_detected!("avx2")`.
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn emit_literal_run_avx2(
-        bw: &mut BitWriter,
-        buf: &[u8],
-        mut p: usize,
-        mut litrunlen: usize,
-        lit: &[u32; NUM_LITERALS],
-    ) -> usize {
-        while litrunlen >= 8 {
-            // SAFETY: litrunlen >= 8 and p + litrunlen <= buf.len() (caller
-            // contract), so the 8-byte unaligned load at buf[p..p+8] is in
-            // bounds.
-            let bytes = _mm_loadl_epi64(buf.as_ptr().add(p) as *const __m128i);
-            // Zero-extend the 8 literal bytes to 8x i32 gather indices
-            // (VPMOVZXBD) — one instruction, replacing 8 independent
-            // byte-to-usize scalar widenings.
-            let idx = _mm256_cvtepu8_epi32(bytes);
-            // SAFETY: `lit` has NUM_LITERALS=256 u32 entries and every lane
-            // of `idx` is a zero-extended u8 (0..=255), so every gathered
-            // element is in bounds. Scale=4 because `lit`'s element size is
-            // 4 bytes (u32), matching the array's natural stride.
-            let entries = _mm256_i32gather_epi32::<4>(lit.as_ptr() as *const i32, idx);
-            let lo4 = _mm256_castsi256_si128(entries);
-            let hi4 = _mm256_extracti128_si256::<1>(entries);
-            let (m0, n0) = merge_group4(lo4);
-            bw.add_bits_raw(m0, n0);
-            // SAFETY: reserve() in emit_sequences guarantees 8 spare bytes
-            // for every flush in the batch.
-            bw.flush_word_unchecked();
-            let (m1, n1) = merge_group4(hi4);
-            bw.add_bits_raw(m1, n1);
-            bw.flush_word_unchecked();
-            p += 8;
-            litrunlen -= 8;
-        }
-        // SAFETY: litrunlen < 8 remains, still within [p, buf.len()) per the
-        // forwarded caller contract.
-        unsafe { emit_literal_run_scalar(bw, buf, p, litrunlen, lit) }
-    }
-
-    /// Gather-merge one group of 4 packed `codeword | nbits << 24` entries
-    /// (already loaded into `entries`'s four 32-bit lanes) into a single
-    /// `(bits, total_nbits)` pair, ready for one `add_bits_raw` — the real-
-    /// SIMD analog of 4 sequential `add_entry` calls.
-    ///
-    /// 1. Exclusive prefix-sum of the 4 bit-widths (`vpsrld` to extract
-    ///    `nbits`, then a 2-step Hillis-Steele scan with `pslldq`/`vpaddd`)
-    ///    gives each lane's shift amount within the merged word.
-    /// 2. `_mm256_sllv_epi64` (`vpsllvq`) shifts all 4 codewords by their own
-    ///    lane's amount in ONE instruction. This needs 64-bit lanes (hence
-    ///    AVX2's 256-bit width, not SSE's 128-bit): a shifted codeword can
-    ///    need up to `14 + 42 = 56` bits (`MAX_LITLEN_CODEWORD_LEN` times 4),
-    ///    which overflows a 32-bit lane, so the codewords are widened first
-    ///    (`_mm256_cvtepu32_epi64`, VPMOVZXDQ).
-    /// 3. A horizontal OR-reduce (2 `por`s: 256-bit lanes 0..1 vs 2..3, then
-    ///    the resulting two 64-bit halves) collapses the 4 shifted lanes —
-    ///    order doesn't matter since OR is commutative/associative — into
-    ///    the one scalar `u64` DEFLATE's LSB-first accumulator expects.
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn merge_group4(entries: __m128i) -> (u64, u32) {
-        let nbits32 = _mm_srli_epi32::<24>(entries);
-        // Hillis-Steele inclusive prefix sum over 4 32-bit lanes.
-        let t1 = _mm_add_epi32(nbits32, _mm_slli_si128::<4>(nbits32));
-        let incl = _mm_add_epi32(t1, _mm_slli_si128::<8>(t1));
-        // Exclusive = inclusive shifted up by one lane (lane 0 <- 0).
-        let excl = _mm_slli_si128::<4>(incl);
-        let total = _mm_extract_epi32::<3>(incl) as u32;
-
-        let codewords32 = _mm_and_si128(entries, _mm_set1_epi32(0x00FF_FFFF));
-        let codewords64 = _mm256_cvtepu32_epi64(codewords32);
-        let shifts64 = _mm256_cvtepu32_epi64(excl);
-        let shifted = _mm256_sllv_epi64(codewords64, shifts64);
-
-        let lo = _mm256_castsi256_si128(shifted);
-        let hi = _mm256_extracti128_si256::<1>(shifted);
-        let or1 = _mm_or_si128(lo, hi);
-        let or2 = _mm_or_si128(or1, _mm_srli_si128::<8>(or1));
-        let merged = _mm_cvtsi128_si64(or2) as u64;
-
-        (merged, total)
-    }
-
-    #[cfg(test)]
-    mod avx2_tests {
-        use super::*;
-
-        /// Scalar reference: the exact sequence of `add_entry`/`add_bits_raw`
-        /// operations the pre-AVX2 code performs for a group of 4 literals,
-        /// replayed from a zero base. `add_bits_raw` only ORs `val <<
-        /// bitcount` and advances `bitcount` — independent of whatever was
-        /// already in the accumulator — so the (merged_bits, total_nbits)
-        /// pair this produces from a zero base is exactly what
-        /// [`merge_group4`] must reproduce, regardless of the real
-        /// accumulator's starting `bitcount`.
-        fn scalar_group4(lit: &[u32; NUM_LITERALS], b: [u8; 4]) -> (u64, u32) {
-            let mut bitbuf: u64 = 0;
-            let mut bitcount: u32 = 0;
-            for &byte in &b {
-                let e = lit[byte as usize];
-                let val = (e & 0x00FF_FFFF) as u64;
-                let n = e >> 24;
-                bitbuf |= val << bitcount;
-                bitcount += n;
-            }
-            (bitbuf, bitcount)
-        }
-
-        /// Build a `lit` table with real per-symbol codeword lengths (not a
-        /// synthetic one) by running an actual Huffman code build over a
-        /// skewed frequency distribution, so the test exercises the full
-        /// realistic length range (1..=`MAX_LITLEN_CODEWORD_LEN`).
-        fn realistic_lit_table() -> [u32; NUM_LITERALS] {
-            use super::super::DEFLATE_NUM_LITLEN_SYMS;
-            let mut freqs = [1u32; DEFLATE_NUM_LITLEN_SYMS];
-            // Skew heavily like real text/binary data so code lengths span
-            // the full range (a flat distribution degenerates to ~uniform
-            // 8-bit codes and would under-test the merge's shift-overflow
-            // edge).
-            let mut s: u64 = 0xD1B54A32D192ED03;
-            let mut next = move || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            for f in freqs.iter_mut().take(256) {
-                *f = 1 + (next() % 100_000) as u32;
-            }
-            let code = super::super::make_huffman_code(
-                DEFLATE_NUM_LITLEN_SYMS,
-                super::super::MAX_LITLEN_CODEWORD_LEN,
-                &freqs,
-            );
-            let mut lit = [0u32; NUM_LITERALS];
-            for (b, e) in lit.iter_mut().enumerate() {
-                *e = code.codewords[b] | ((code.lens[b] as u32) << 24);
-            }
-            lit
-        }
-
-        #[test]
-        fn merge_group4_matches_scalar_random() {
-            if !std::arch::is_x86_feature_detected!("avx2") {
-                eprintln!("SKIP: no AVX2 at runtime");
-                return;
-            }
-            let lit = realistic_lit_table();
-            let mut s: u64 = 0x9E3779B97F4A7C15;
-            let mut next = move || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            for _ in 0..200_000 {
-                let b = [
-                    (next() & 0xFF) as u8,
-                    (next() & 0xFF) as u8,
-                    (next() & 0xFF) as u8,
-                    (next() & 0xFF) as u8,
-                ];
-                // SAFETY: avx2 confirmed above; entries is a well-formed
-                // 4x32-bit vector built from `lit`.
-                let entries = unsafe {
-                    let mut tmp = [0i32; 4];
-                    for (i, &byte) in b.iter().enumerate() {
-                        tmp[i] = lit[byte as usize] as i32;
-                    }
-                    _mm_loadu_si128(tmp.as_ptr() as *const __m128i)
-                };
-                let (got_val, got_n) = unsafe { merge_group4(entries) };
-                let (want_val, want_n) = scalar_group4(&lit, b);
-                assert_eq!(
-                    (got_val, got_n),
-                    (want_val, want_n),
-                    "mismatch for bytes {b:?}"
-                );
-            }
-        }
-
-        #[test]
-        fn merge_group4_worst_case_56_bits() {
-            if !std::arch::is_x86_feature_detected!("avx2") {
-                eprintln!("SKIP: no AVX2 at runtime");
-                return;
-            }
-            // Every symbol codes to the max 14-bit length so a group of 4
-            // hits the full 56-bit `can_buffer` bound.
-            let mut lit = [0u32; NUM_LITERALS];
-            for (b, e) in lit.iter_mut().enumerate() {
-                let codeword = ((b as u32).wrapping_mul(0x2001) ^ 0x3FFF) & 0x3FFF;
-                *e = codeword | (14u32 << 24);
-            }
-            let b = [1u8, 250, 7, 249];
-            let entries = unsafe {
-                let mut tmp = [0i32; 4];
-                for (i, &byte) in b.iter().enumerate() {
-                    tmp[i] = lit[byte as usize] as i32;
-                }
-                _mm_loadu_si128(tmp.as_ptr() as *const __m128i)
-            };
-            let (got_val, got_n) = unsafe { merge_group4(entries) };
-            let (want_val, want_n) = scalar_group4(&lit, b);
-            assert_eq!((got_val, got_n), (want_val, want_n));
-            assert_eq!(got_n, 56);
-        }
-
-        /// Full-loop differential: [`emit_literal_run_avx2`] vs
-        /// [`emit_literal_run_scalar`] on a `BitWriter`, over literal runs of
-        /// every length 0..=40 (crossing several 8-groups + every possible
-        /// tail size) and random bytes, using the same
-        /// [`EmitTables::build`]-shaped table the production path uses.
-        #[test]
-        fn emit_literal_run_avx2_matches_scalar_end_to_end() {
-            if !std::arch::is_x86_feature_detected!("avx2") {
-                eprintln!("SKIP: no AVX2 at runtime");
-                return;
-            }
-            let lit = realistic_lit_table();
-            let mut s: u64 = 0xC0FFEE_1234_5678;
-            let mut next = move || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            for len in 0..=40usize {
-                let buf: Vec<u8> = (0..len + 16).map(|_| (next() & 0xFF) as u8).collect();
-                let mut w_avx2 = BitWriter::new();
-                w_avx2.reserve(len * 2 + 32);
-                let mut w_scalar = BitWriter::new();
-                w_scalar.reserve(len * 2 + 32);
-                unsafe {
-                    emit_literal_run_avx2(&mut w_avx2, &buf, 0, len, &lit);
-                    emit_literal_run_scalar(&mut w_scalar, &buf, 0, len, &lit);
-                }
-                assert_eq!(
-                    w_avx2.finish(),
-                    w_scalar.finish(),
-                    "mismatch at literal run length {len}"
-                );
-            }
-        }
-    }
 }
 
 /// Emit the block body (literal runs + matches + trailing EOB codeword) with the
