@@ -237,6 +237,370 @@ pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 /// which gave up ~20%+ on text).
 pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 
+/// Process ONE L1 position given its hash `h` and an ALREADY-LOADED candidate
+/// `cand` (the caller is responsible for having read `head[h]` — this
+/// function never re-reads it, only writes the insert). Returns the new
+/// cursor after consuming this position: `pos + 1` for a plain literal
+/// (including a lazy-peek DEFER, which is also a plain one-byte literal), or
+/// `pos + length` for an accepted match.
+///
+/// L1-ONLY (no `ACCEL` ramp — see [`fastloop_l1`]'s doc comment for why L0
+/// does not share this function at all, even behind a dead branch).
+/// Factoring this out of the fastloop is what makes the two-position
+/// software pipeline in [`fastloop_l1`] possible without duplicating the
+/// ~70-line match/literal body: the SAME per-position logic runs whether
+/// `cand` came from a fresh `head[h]` read (the boundary case) or from a
+/// batch-issued read that raced ahead of the insert (SF2). A free function
+/// rather than a closure: a closure capturing `head`/`sink` mutably for its
+/// whole lifetime would prevent the caller from also touching `head`
+/// directly between calls (the SF2 batch's own two `head[h]` reads) — the
+/// borrow checker requires ordinary `&mut` parameters passed per call
+/// instead.
+///
+/// Callers MUST uphold `pos < fast_end` (the same invariant the pre-SF2
+/// single-position loop required): every load inside — the primary 4-byte
+/// hash load's caller, the up-to-258-byte `lz_extend`, the lazy peek's OWN
+/// 4-byte load + 258-byte `lz_extend` at `pos + 1`, and the interior
+/// LIMIT_HASH_UPDATE loads — stays in bounds because
+/// `fast_end <= in_end - DEFLATE_MAX_MATCH_LEN` (see [`run`]'s `fast_end`).
+#[inline(always)]
+fn process_position_l1(
+    pos: usize,
+    h: usize,
+    cand: u32,
+    buf: &[u8],
+    base: *const u8,
+    head: &mut [u32],
+    sink: &mut Sink,
+    limit_hash_update_inserts: usize,
+) -> usize {
+    // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
+    unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+
+    // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
+    // the window range instead of panicking on underflow.
+    let dist = pos.wrapping_sub(cand as usize);
+    if (1..=WINDOW).contains(&dist) {
+        let cand_pos = cand as usize;
+        // Byte-exact extend (never trusts the hash): a spurious
+        // candidate simply yields length < SHORTEST_MATCH -> literal.
+        let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
+        if length >= SHORTEST_MATCH {
+            // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
+            // short accepted matches only, so this branch is rare (most
+            // matches are longer, or the position is a miss and never
+            // reaches here).
+            if length <= LAZY_PEEK_MAX_LEN && dist > LAZY_PEEK_MIN_DIST {
+                // SAFETY: caller-upheld `pos < fast_end <= in_end - 258`,
+                // so `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
+                // both the 4-byte load and the up-to-258-byte
+                // `lz_extend` below stay in bounds.
+                let seq1 = unsafe { load_u32(base, pos + 1) };
+                let h1 = lz_hash(seq1, HASH_BITS) as usize;
+                // SAFETY: same as the primary lookup above; this is a
+                // READ ONLY -- the peek does not insert `pos + 1` into
+                // `head`, so the caller's next position (whether this
+                // match is deferred or taken) is not a double-insert.
+                let cand1 = unsafe { *head.get_unchecked(h1) };
+                let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
+                if (1..=WINDOW).contains(&dist1) {
+                    let next_len =
+                        lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN);
+                    if next_len >= length
+                        && 4 * (next_len as i32 - length as i32)
+                            + (bsr32(dist as u32) as i32 - bsr32(dist1 as u32) as i32)
+                            > 2
+                    {
+                        // Defer: a meaningfully better match starts one
+                        // byte later. Emit `pos` as a literal; the
+                        // caller discovers `pos + 1`'s match fresh
+                        // (including its own head-table insert).
+                        // SAFETY: `pos < fast_end <= in_end`.
+                        sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+                        return pos + 1;
+                    }
+                }
+            }
+
+            // LIMIT_HASH_UPDATE (see the tail loop for the full note).
+            let match_end = pos + length as usize;
+            let insert_end = if limit_hash_update_inserts == usize::MAX {
+                match_end
+            } else {
+                (pos + 1 + limit_hash_update_inserts).min(match_end)
+            };
+            let mut nh = pos + 1;
+            while nh < insert_end {
+                // SAFETY: nh < match_end = pos+length <= in_end, and
+                // buf's pad covers the 4-byte load past in_end.
+                let s = unsafe { load_u32(base, nh) };
+                // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
+                unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+                nh += 1;
+            }
+
+            sink.push_match_fast(length, dist as u32);
+            return pos + length as usize;
+        }
+    }
+
+    // Literal.
+    // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
+    sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+    pos + 1
+}
+
+/// L0's fastloop (`Strategy::Fast0`, `ACCEL == true`): the ORIGINAL
+/// SF1-C-only single-position loop, verbatim — a dedicated, non-generic
+/// function (not a `run::<true>` monomorphization sharing source with
+/// [`fastloop_l1`]) so L0's codegen can NEVER be perturbed by anything about
+/// L1's SF2 batching, even a provably-dead branch.
+///
+/// BACKGROUND: an earlier version of this lever put both fastloops in the
+/// SAME `run<const ACCEL: bool>` body gated by `if !ACCEL { batch } else {
+/// scalar }` — logically dead for `run::<true>`, and Apple M1 confirmed L0
+/// was a true no-op there (instruction count delta -0.02% to +0.05%, noise).
+/// But the AMD EPYC (x86_64) box showed a REPRODUCIBLE +1-4% instruction and
+/// wall regression for L0 with that shared-function shape, confirmed stable
+/// across repeated runs AND with the co-resident `llama-server` fully
+/// SIGSTOPped (ruling out co-tenant contention) — i.e. a genuine, if small,
+/// x86_64-specific codegen interaction between L0's monomorphization and the
+/// dead L1 branch living in the same source function. Splitting into two
+/// physically separate functions removes any such channel entirely.
+#[allow(clippy::too_many_arguments)]
+fn fastloop_l0(
+    mut pos: usize,
+    fast_end: usize,
+    buf: &[u8],
+    base: *const u8,
+    head: &mut [u32],
+    sink: &mut Sink,
+    limit_hash_update_inserts: usize,
+) -> usize {
+    // Consecutive-miss counter driving the `ACCEL` scan-step ramp (see
+    // `ACCEL_SHIFT`'s doc comment).
+    let mut literal_run: u32 = 0;
+
+    while pos < fast_end {
+        // SF1-C software-pipeline: warm the head-table line for the position
+        // PF_DIST ahead. Speculative (a match jumps the cursor past it); a
+        // wrong prefetch only wastes bandwidth. SAFETY: `pos < fast_end <=
+        // in_end - 258` and `PF_DIST` is small, so `pos + PF_DIST + 4 <=
+        // in_end`, in bounds for the 4-byte load; the prefetch address is a
+        // pure hint that never faults.
+        unsafe {
+            let fseq = load_u32(base, pos + PF_DIST);
+            let fh = lz_hash(fseq, HASH_BITS) as usize;
+            prefetch_write(head.as_ptr().add(fh) as *const u8);
+        }
+        // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
+        let seq = unsafe { load_u32(base, pos) };
+        let h = lz_hash(seq, HASH_BITS) as usize;
+        // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
+        let cand = unsafe { *head.get_unchecked(h) };
+        unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+
+        // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
+        // the window range instead of panicking on underflow.
+        let dist = pos.wrapping_sub(cand as usize);
+        if (1..=WINDOW).contains(&dist) {
+            let cand_pos = cand as usize;
+            // Byte-exact extend (never trusts the hash): a spurious
+            // candidate simply yields length < SHORTEST_MATCH -> literal.
+            let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
+            if length >= SHORTEST_MATCH {
+                // LIMIT_HASH_UPDATE (see the tail loop for the full note).
+                let match_end = pos + length as usize;
+                let insert_end = if limit_hash_update_inserts == usize::MAX {
+                    match_end
+                } else {
+                    (pos + 1 + limit_hash_update_inserts).min(match_end)
+                };
+                let mut nh = pos + 1;
+                while nh < insert_end {
+                    // SAFETY: nh < match_end = pos+length <= in_end, and
+                    // buf's pad covers the 4-byte load past in_end.
+                    let s = unsafe { load_u32(base, nh) };
+                    // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
+                    unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+                    nh += 1;
+                }
+
+                sink.push_match_fast(length, dist as u32);
+                pos += length as usize;
+                literal_run = 0;
+                continue;
+            }
+        }
+
+        // Literal.
+        // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
+        sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+
+        // Common-case-cheap ramp: below `ACCEL_ARM_THRESHOLD` consecutive
+        // misses, the ONLY added cost is the `literal_run += 1` and a
+        // (well-predicted-not-taken, on any corpus with normal match
+        // density) comparison — the shift/min/extra-literal-copy work only
+        // runs once we're actually inside a long literal run, which is the
+        // ONLY time it can pay for itself.
+        literal_run += 1;
+        let mut step = 1usize;
+        if literal_run >= ACCEL_ARM_THRESHOLD {
+            // Scan-step ramp: skip the hash lookup/insert for `step - 1`
+            // further positions, coding them as literals directly.
+            // `pos + step <= pos + ACCEL_MAX_STEP < fast_end +
+            // ACCEL_MAX_STEP <= in_end` (fast_end's 258-byte margin dwarfs
+            // ACCEL_MAX_STEP), so every extra literal index stays in bounds.
+            step = (1 + (literal_run >> ACCEL_SHIFT) as usize).min(ACCEL_MAX_STEP);
+            let mut i = 1;
+            while i < step {
+                // SAFETY: see the bounds note above.
+                sink.push_literal_fast(unsafe { *buf.get_unchecked(pos + i) });
+                i += 1;
+            }
+        }
+        pos += step;
+    }
+    pos
+}
+
+/// L1's fastloop (`Strategy::Fast`, `ACCEL == false`): SF2 two-position
+/// software pipeline. Issues BOTH head-table reads for `pos` and `pos + 1`
+/// before consuming EITHER, so their independent cache-miss latency can
+/// overlap in the OOO window instead of serializing behind position `pos`'s
+/// insert+compare+branch — the mechanism SF1-C's prefetch already targeted,
+/// pushed one step further (MLP instead of a hint).
+///
+/// Measured on M1 + AMD EPYC (2026-07): CPI dropped 7-14% on every L1 cell
+/// (confirming the latency-overlap mechanism fires on both arches), netting
+/// a real (if modest) wall win: -1.1% to -4.8% across both arches, all 3
+/// corpora (text6/bin6/sil40), both boxes. See [`fastloop_l0`]'s doc comment
+/// for why L0 does NOT share this function even behind a dead branch.
+#[allow(clippy::too_many_arguments)]
+fn fastloop_l1(
+    mut pos: usize,
+    fast_end: usize,
+    buf: &[u8],
+    base: *const u8,
+    head: &mut [u32],
+    sink: &mut Sink,
+    limit_hash_update_inserts: usize,
+) -> usize {
+    while pos < fast_end {
+        // SF1-C software-pipeline: warm the head-table line for the
+        // position PF_DIST ahead. Speculative (a match jumps the cursor
+        // past it); a wrong prefetch only wastes bandwidth. SAFETY:
+        // `pos < fast_end <= in_end - 258` and `PF_DIST` is small, so
+        // `pos + PF_DIST + 4 <= in_end`, in bounds for the 4-byte load;
+        // the prefetch address is a pure hint that never faults.
+        unsafe {
+            let fseq0 = load_u32(base, pos + PF_DIST);
+            let fh0 = lz_hash(fseq0, HASH_BITS) as usize;
+            prefetch_write(head.as_ptr().add(fh0) as *const u8);
+        }
+
+        // SF2 (this lever): gated to `pos + 1 < fast_end` so position
+        // `pos + 1` ALSO independently satisfies the `pos < fast_end` bound
+        // `process_position_l1` requires (its own lazy peek reads as far as
+        // `pos + 2`) — see `fast_end`'s derivation in [`run`]. The lone
+        // leftover position when `pos + 1 == fast_end` falls through to the
+        // scalar path below, byte-for-byte the pre-SF2 loop body.
+        if pos + 1 < fast_end {
+            // Second half of the prefetch pair: this branch processes up to
+            // TWO positions per outer iteration (vs one before), so without
+            // this the `pos + 1 + PF_DIST` bucket would only get a prefetch
+            // every OTHER position instead of every position — a coverage
+            // gap vs the pre-SF2 density. Same bounds reasoning as above
+            // (`pos + 1 <= fast_end`).
+            unsafe {
+                let fseq1 = load_u32(base, pos + 1 + PF_DIST);
+                let fh1 = lz_hash(fseq1, HASH_BITS) as usize;
+                prefetch_write(head.as_ptr().add(fh1) as *const u8);
+            }
+            // SAFETY: `pos + 1 < fast_end <= in_end - 258`, so both
+            // `pos + 4 <= in_end` and `pos + 1 + 4 <= in_end`.
+            let seq0 = unsafe { load_u32(base, pos) };
+            let h0 = lz_hash(seq0, HASH_BITS) as usize;
+            let seq1 = unsafe { load_u32(base, pos + 1) };
+            let h1 = lz_hash(seq1, HASH_BITS) as usize;
+            // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE.
+            // Two independent loads, issued back to back with no
+            // intervening write, so a superscalar core can have both
+            // outstanding misses in flight at once (unlike the serial
+            // read-modify-write-then-read-next-slot the single-position
+            // loop forced).
+            let cand0 = unsafe { *head.get_unchecked(h0) };
+            let cand1_raw = unsafe { *head.get_unchecked(h1) };
+
+            let after0 = process_position_l1(
+                pos,
+                h0,
+                cand0,
+                buf,
+                base,
+                head,
+                sink,
+                limit_hash_update_inserts,
+            );
+            if after0 == pos + 1 {
+                // Position `pos` resolved to a plain one-byte literal (no
+                // match, including a lazy-peek DEFER) — exactly the case
+                // where the ORIGINAL serial loop's next iteration would
+                // process `pos + 1` next, so `cand1_raw` is reusable
+                // PROVIDED it still reflects `head[h1]` as of right now.
+                // `process_position_l1(pos, h0, cand0, ...)` performed
+                // exactly one write, `head[h0] = pos`. If `h1 != h0` that
+                // write didn't touch bucket `h1`, so `cand1_raw` (read
+                // BEFORE the write, in parallel with `cand0`) still equals
+                // `head[h1]` — identical to what a fresh read would return.
+                // If `h1 == h0`, the write just set `head[h1]` to `pos`, so
+                // the up-to-date value is `pos` itself, not the stale
+                // pre-write `cand1_raw`.
+                let cand1 = if h1 == h0 { pos as u32 } else { cand1_raw };
+                pos = process_position_l1(
+                    after0,
+                    h1,
+                    cand1,
+                    buf,
+                    base,
+                    head,
+                    sink,
+                    limit_hash_update_inserts,
+                );
+            } else {
+                // Position `pos` was a match: it consumed `pos + 1` (or
+                // jumped past it), so the batch's `cand1_raw` was never
+                // valid for a *fresh* position `pos + 1` and must be
+                // discarded, not corrected — the next outer iteration
+                // re-issues both loads for whatever position `after0`
+                // actually is.
+                pos = after0;
+            }
+            continue;
+        }
+
+        // Boundary: exactly one position left in the fast region
+        // (`pos + 1 == fast_end`) — process it scalar, byte-for-byte the
+        // pre-SF2 loop body (fresh single `head[h]` read).
+        // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
+        let seq = unsafe { load_u32(base, pos) };
+        let h = lz_hash(seq, HASH_BITS) as usize;
+        // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
+        let cand = unsafe { *head.get_unchecked(h) };
+        pos = process_position_l1(
+            pos,
+            h,
+            cand,
+            buf,
+            base,
+            head,
+            sink,
+            limit_hash_update_inserts,
+        );
+    }
+    pos
+}
+
 /// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending one
 /// or more DEFLATE blocks to `bw`.
 ///
@@ -291,11 +655,6 @@ pub(super) fn run<const ACCEL: bool>(
     // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
     let mut sink = Sink::new();
     let mut pos = data_start;
-    // Consecutive-miss counter driving the `ACCEL` scan-step ramp (see
-    // `ACCEL_SHIFT`'s doc comment). Dead (never read) when `ACCEL` is
-    // `false` — that monomorphization compiles it away.
-    #[allow(unused_assignments)]
-    let mut literal_run: u32 = 0;
 
     loop {
         // Start a new block. It ends after `block_length` input bytes (a match
@@ -317,138 +676,35 @@ pub(super) fn run<const ACCEL: bool>(
         // `max_len == DEFLATE_MAX_MATCH_LEN`. Identical token decisions ⇒
         // identical bytes.
         let fast_end = block_end_target.min(in_end.saturating_sub(DEFLATE_MAX_MATCH_LEN as usize));
-        while pos < fast_end {
-            // SF1-C software-pipeline: warm the head-table line for the position
-            // PF_DIST ahead. `pos + PF_DIST` is speculative (a match jumps the
-            // cursor past it); a wrong prefetch only wastes bandwidth. SAFETY:
-            // `pos < fast_end <= in_end - 258` and `PF_DIST` is small, so
-            // `pos + PF_DIST + 4 <= in_end`, in bounds for the 4-byte load; the
-            // prefetch address is a pure hint that never faults.
-            unsafe {
-                let fseq = load_u32(base, pos + PF_DIST);
-                let fh = lz_hash(fseq, HASH_BITS) as usize;
-                prefetch_write(head.as_ptr().add(fh) as *const u8);
-            }
-            // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
-            let seq = unsafe { load_u32(base, pos) };
-            let h = lz_hash(seq, HASH_BITS) as usize;
-            // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
-            let cand = unsafe { *head.get_unchecked(h) };
-            unsafe { *head.get_unchecked_mut(h) = pos as u32 };
 
-            // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
-            // the window range instead of panicking on underflow.
-            let dist = pos.wrapping_sub(cand as usize);
-            if (1..=WINDOW).contains(&dist) {
-                let cand_pos = cand as usize;
-                // Byte-exact extend (never trusts the hash): a spurious
-                // candidate simply yields length < SHORTEST_MATCH -> literal.
-                let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
-                if length >= SHORTEST_MATCH {
-                    // L1-only lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment):
-                    // gated to short accepted matches only, so this branch is
-                    // both rare (most matches are longer, or the position is a
-                    // miss and never reaches here) and, for `ACCEL == true`
-                    // (L0), compiled away entirely (`!ACCEL` is `false` at
-                    // monomorphization time) -- L0's codegen and output are
-                    // byte-identical to before this lever existed.
-                    if !ACCEL && length <= LAZY_PEEK_MAX_LEN && dist > LAZY_PEEK_MIN_DIST {
-                        // SAFETY: `pos < fast_end <= in_end - 258`, so
-                        // `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
-                        // both the 4-byte load and the up-to-258-byte
-                        // `lz_extend` below stay in bounds.
-                        let seq1 = unsafe { load_u32(base, pos + 1) };
-                        let h1 = lz_hash(seq1, HASH_BITS) as usize;
-                        // SAFETY: same as the primary lookup above; this is a
-                        // READ ONLY -- the peek does not insert `pos + 1` into
-                        // `head`, so the next loop iteration's normal insert
-                        // there (whether this match is deferred or taken) is
-                        // not a double-insert.
-                        let cand1 = unsafe { *head.get_unchecked(h1) };
-                        let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
-                        if (1..=WINDOW).contains(&dist1) {
-                            let next_len =
-                                lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN);
-                            if next_len >= length
-                                && 4 * (next_len as i32 - length as i32)
-                                    + (bsr32(dist as u32) as i32 - bsr32(dist1 as u32) as i32)
-                                    > 2
-                            {
-                                // Defer: a meaningfully better match starts one
-                                // byte later. Emit `pos` as a literal; the next
-                                // loop iteration discovers `pos + 1`'s match
-                                // fresh (including its own head-table insert).
-                                // SAFETY: `pos < fast_end <= in_end`.
-                                sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
-                                pos += 1;
-                                literal_run = 0;
-                                continue;
-                            }
-                        }
-                    }
-
-                    // LIMIT_HASH_UPDATE (see the tail loop for the full note).
-                    let match_end = pos + length as usize;
-                    let insert_end = if limit_hash_update_inserts == usize::MAX {
-                        match_end
-                    } else {
-                        (pos + 1 + limit_hash_update_inserts).min(match_end)
-                    };
-                    let mut nh = pos + 1;
-                    while nh < insert_end {
-                        // SAFETY: nh < match_end = pos+length <= in_end, and
-                        // buf's pad covers the 4-byte load past in_end.
-                        let s = unsafe { load_u32(base, nh) };
-                        // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-                        unsafe {
-                            *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32
-                        };
-                        nh += 1;
-                    }
-
-                    sink.push_match_fast(length, dist as u32);
-                    pos += length as usize;
-                    literal_run = 0;
-                    continue;
-                }
-            }
-
-            // Literal.
-            // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
-            sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
-
-            // Common-case-cheap ramp: below `ACCEL_ARM_THRESHOLD` consecutive
-            // misses, the ONLY added-vs-L1 cost is the `literal_run += 1` and
-            // a (well-predicted-not-taken, on any corpus with normal match
-            // density) comparison — the shift/min/extra-literal-copy work
-            // only runs once we're actually inside a long literal run, which
-            // is the ONLY time it can pay for itself. This keeps L0 from
-            // regressing vs L1 on compressible corpora where the ramp rarely
-            // arms (measured: computing `step` unconditionally cost L0 ~2-3%
-            // vs L1 on `text6`, even fully branch-eliminated for L1 via the
-            // `ACCEL` const generic — the tax was the arithmetic itself, not
-            // dispatch).
-            let mut step = 1usize;
-            if ACCEL {
-                literal_run += 1;
-                if literal_run >= ACCEL_ARM_THRESHOLD {
-                    // Scan-step ramp: skip the hash lookup/insert for
-                    // `step - 1` further positions, coding them as literals
-                    // directly. `pos + step <= pos + ACCEL_MAX_STEP <
-                    // fast_end + ACCEL_MAX_STEP <= in_end` (fast_end's
-                    // 258-byte margin dwarfs ACCEL_MAX_STEP), so every extra
-                    // literal index stays in bounds.
-                    step = (1 + (literal_run >> ACCEL_SHIFT) as usize).min(ACCEL_MAX_STEP);
-                    let mut i = 1;
-                    while i < step {
-                        // SAFETY: see the bounds note above.
-                        sink.push_literal_fast(unsafe { *buf.get_unchecked(pos + i) });
-                        i += 1;
-                    }
-                }
-            }
-            pos += step;
-        }
+        // Dispatch to a fully separate, non-generic fastloop per level
+        // rather than sharing one `if ACCEL {...} else {...}`-gated body:
+        // see [`fastloop_l0`]'s doc comment for why (a measured x86_64-only
+        // codegen interaction through the shared-function shape, absent on
+        // aarch64). `ACCEL` is still a compile-time constant here, so this
+        // `if` itself compiles to a direct, unconditional call at each of
+        // `run`'s two monomorphizations — no runtime dispatch either.
+        pos = if ACCEL {
+            fastloop_l0(
+                pos,
+                fast_end,
+                buf,
+                base,
+                &mut head,
+                &mut sink,
+                limit_hash_update_inserts,
+            )
+        } else {
+            fastloop_l1(
+                pos,
+                fast_end,
+                buf,
+                base,
+                &mut head,
+                &mut sink,
+                limit_hash_update_inserts,
+            )
+        };
 
         // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
         // block), where `max_len` must be clamped per position.
