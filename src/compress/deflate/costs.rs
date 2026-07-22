@@ -98,7 +98,12 @@ impl OffsetSlotFull {
         OffsetSlotFull { map }
     }
 
+    /// Checked reference twin of [`Self::slot_unchecked`]; every production
+    /// call site now uses the unchecked form, so this is kept ONLY as the
+    /// differential-test oracle below (`offset_slot_full_matches_condensed_map`)
+    /// — hence `#[allow(dead_code)]` for non-test builds.
     #[inline]
+    #[allow(dead_code)]
     pub fn slot(&self, offset: u32) -> usize {
         self.map[offset as usize] as usize
     }

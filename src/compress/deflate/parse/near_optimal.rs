@@ -222,21 +222,54 @@ impl Optimizer {
     }
 
     /// `deflate_tally_item_list` (`:2843-2868`) + `deflate_make_huffman_codes`.
+    ///
+    /// ## Soundness invariant (unchecked-index path walk)
+    ///
+    /// Same DP-output invariants `find_min_cost_path` already established, walked
+    /// forward instead of backward:
+    ///  * **`node`** only ever holds a value `< block_length` at the point it
+    ///    indexes `optimum_nodes` — the loop reads `optimum_nodes[node]`, then
+    ///    advances `node += length` and breaks IMMEDIATELY if that lands exactly
+    ///    on `block_length` (a chosen path always partitions `0..block_length`
+    ///    exactly, per the DP), so `node < block_length <= MAX_BLOCK_LENGTH <
+    ///    optimum_nodes.len()` on every read.
+    ///  * **`hi` as a literal byte** (`length == 1`) is always `< 256 ==
+    ///    litlen_freqs.len()` by the DP's own encoding (`best_item = (literal <<
+    ///    SHIFT) | 1` with `literal < 256`, `find_min_cost_path`).
+    ///  * **`hi` as a match offset** (`length != 1`) is a valid DEFLATE offset,
+    ///    so `offset_slot_full.slot_unchecked(hi)` is sound (same contract as
+    ///    its other call site).
+    ///  * **`length`** is `MIN_MATCH_LEN..=MAX_MATCH_LEN`, so `length_slot`
+    ///    returns `< NUM_LEN_SLOTS` and `DEFLATE_FIRST_LEN_SYM + ls <= 257 + 28
+    ///    == 285 < 288 == litlen_freqs.len()`.
     fn tally_and_build_codes(&self, block_length: usize) -> PathCodes {
         let mut litlen_freqs = [0u32; DEFLATE_NUM_LITLEN_SYMS];
         let mut offset_freqs = [0u32; DEFLATE_NUM_OFFSET_SYMS];
 
         let mut node = 0usize;
         loop {
-            let item = self.optimum_nodes[node].item;
+            debug_assert!(node < self.optimum_nodes.len());
+            let item = unsafe { self.optimum_nodes.get_unchecked(node).item };
             let length = (item & OPTIMUM_LEN_MASK) as usize;
             let hi = item >> OPTIMUM_OFFSET_SHIFT;
             if length == 1 {
-                litlen_freqs[hi as usize] += 1;
+                debug_assert!((hi as usize) < litlen_freqs.len());
+                unsafe {
+                    *litlen_freqs.get_unchecked_mut(hi as usize) += 1;
+                }
             } else {
                 let ls = length_slot(length as u32) as usize;
-                litlen_freqs[DEFLATE_FIRST_LEN_SYM + ls] += 1;
-                offset_freqs[self.offset_slot_full.slot(hi)] += 1;
+                debug_assert!(DEFLATE_FIRST_LEN_SYM + ls < litlen_freqs.len());
+                unsafe {
+                    *litlen_freqs.get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
+                }
+                // SAFETY: `hi` is a valid DEFLATE match offset here (same
+                // contract as `slot_unchecked`'s other call site).
+                let slot = unsafe { self.offset_slot_full.slot_unchecked(hi) };
+                debug_assert!(slot < offset_freqs.len());
+                unsafe {
+                    *offset_freqs.get_unchecked_mut(slot) += 1;
+                }
             }
             node += length;
             if node == block_length {
@@ -501,6 +534,18 @@ pub(super) fn run(
             calculate_min_match_len(&buf[in_block_begin..in_max_block_end], depth)
         };
 
+        // ## Soundness invariant (unchecked `match_cache` writes — forward fill)
+        //
+        // `opt.match_cache` is sized `MATCH_CACHE_TOTAL == MATCH_CACHE_LENGTH +
+        // MAX_MATCHES_PER_POS + (MAX_MATCH_LEN - 1)` (`Optimizer::new`) — the
+        // exact libdeflate slop (`:571-573`) that guarantees room for one more
+        // FULL position's worth of writes (a header + up to `MAX_MATCHES_PER_POS`
+        // matches, or up to `MAX_MATCH_LEN - 1` skip-header writes) after the
+        // loop's own `cache_ptr >= MATCH_CACHE_LENGTH` overflow check fires. This
+        // is the SAME invariant `find_min_cost_path`'s Tranche-1 unchecked reads
+        // already trust ("cptr/mi walk match_cache within the forward pass's
+        // contiguous write region") — this increment makes the write side that
+        // produces that region unchecked too.
         loop {
             let remaining = in_end - in_next;
 
@@ -528,7 +573,13 @@ pub(super) fn run(
                 );
                 cache_ptr = matches_start + n;
                 if n > 0 {
-                    best_len = opt.match_cache[cache_ptr - 1].length as u32;
+                    // SAFETY: see the soundness invariant above; `cache_ptr - 1
+                    // == matches_start + n - 1` is a slot `get_matches` just
+                    // wrote (`n <= MAX_MATCHES_PER_POS` slots from
+                    // `matches_start`, within the cache's slop capacity).
+                    debug_assert!(cache_ptr - 1 < opt.match_cache.len());
+                    best_len =
+                        unsafe { opt.match_cache.get_unchecked(cache_ptr - 1).length as u32 };
                 }
             }
 
@@ -545,8 +596,13 @@ pub(super) fn run(
             }
 
             // Write this position's cache header (num matches, literal byte).
-            opt.match_cache[cache_ptr].length = (cache_ptr - matches_start) as u16;
-            opt.match_cache[cache_ptr].offset = buf[in_next] as u16;
+            // SAFETY: see the soundness invariant above (`cache_ptr` bound).
+            debug_assert!(cache_ptr < opt.match_cache.len());
+            unsafe {
+                let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
+                hdr.length = (cache_ptr - matches_start) as u16;
+                hdr.offset = buf[in_next] as u16;
+            }
             in_next += 1;
             cache_ptr += 1;
 
@@ -571,8 +627,13 @@ pub(super) fn run(
                             &mut next_hashes,
                         );
                     }
-                    opt.match_cache[cache_ptr].length = 0;
-                    opt.match_cache[cache_ptr].offset = buf[in_next] as u16;
+                    // SAFETY: see the soundness invariant above (`cache_ptr` bound).
+                    debug_assert!(cache_ptr < opt.match_cache.len());
+                    unsafe {
+                        let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
+                        hdr.length = 0;
+                        hdr.offset = buf[in_next] as u16;
+                    }
                     in_next += 1;
                     cache_ptr += 1;
                     skip -= 1;
@@ -620,10 +681,17 @@ pub(super) fn run(
             let mut num_bytes_to_rewind = in_next - in_block_end;
 
             // Rewind the match cache to the chosen block end.
+            // SAFETY: `cache_ptr` only ever walks backward here, starting
+            // `< orig_cache_ptr <= opt.match_cache.len()` and stepping onto
+            // header slots the forward fill above already wrote (a header's
+            // `length` is exactly its own match count, so subtracting it lands
+            // on the PRECEDING header) — the same backward-walk invariant
+            // `find_min_cost_path` relies on for the same array.
             let orig_cache_ptr = cache_ptr;
             while num_bytes_to_rewind != 0 {
                 cache_ptr -= 1;
-                cache_ptr -= opt.match_cache[cache_ptr].length as usize;
+                debug_assert!(cache_ptr < opt.match_cache.len());
+                cache_ptr -= unsafe { opt.match_cache.get_unchecked(cache_ptr).length as usize };
                 num_bytes_to_rewind -= 1;
             }
             let cache_len_rewound = orig_cache_ptr - cache_ptr;
