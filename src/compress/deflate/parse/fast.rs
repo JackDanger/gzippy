@@ -48,7 +48,11 @@
 use super::super::bitstream::BitWriter;
 use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_write};
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
-use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes};
+use super::{bsr32, Sink, StaticCodes};
+#[cfg(not(feature = "icf-emit"))]
+use super::{emit_block, emit_block_static_or_stored};
+#[cfg(feature = "icf-emit")]
+use super::{emit_block_icf, emit_block_static_or_stored_icf};
 
 /// Per-`run()`-call local accumulator for the fast-path anatomy counters
 /// (`anatomy-counters` feature only; see `anatomy_counters.rs`'s `fast_*` doc
@@ -1049,6 +1053,12 @@ pub(super) fn run<const ACCEL: bool>(
         // sync-flush marker the caller appends can close the chunk on a clean
         // boundary.
         let is_final = is_last && pos == in_end;
+        // ICF-ARCHITECTURE EXPERIMENT (see `parse::IcfRec`'s doc comment):
+        // when the `icf-emit` feature is on, this (L0/L1-only) call site
+        // routes to the uniform-record emit twins instead of the
+        // Seq/litrun-based `emit_block`/`emit_block_static_or_stored` —
+        // greedy/lazy/near_optimal (L2-9) are untouched either way.
+        #[cfg(not(feature = "icf-emit"))]
         if use_dynamic {
             // L1: cheapest of per-block dynamic / static / stored.
             emit_block(bw, buf, block_begin, &sink, statics, is_final);
@@ -1057,6 +1067,12 @@ pub(super) fn run<const ACCEL: bool>(
             // Huffman build (see `emit_block_static_or_stored`'s doc comment
             // for why this is the L0-vs-L1 cost/ratio trade).
             emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+        }
+        #[cfg(feature = "icf-emit")]
+        if use_dynamic {
+            emit_block_icf(bw, buf, block_begin, &sink, statics, is_final);
+        } else {
+            emit_block_static_or_stored_icf(bw, buf, block_begin, &sink, statics, is_final);
         }
         if pos == in_end {
             break;
