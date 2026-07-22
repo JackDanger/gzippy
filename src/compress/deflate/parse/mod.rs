@@ -671,6 +671,35 @@ unsafe fn emit_literal_run(
 /// 3), `CAN_BUFFER`-elided match flushes (mechanism 4), pure accumulate
 /// `add_bits_raw` (mechanism 5), plus merged codeword|nbits entries and a
 /// stored offset slot (one load per symbol, no emit-side `offset_slot()`).
+///
+/// FALSIFIED (2026-07-22): replacing this loop's four sequential
+/// `add_bits_raw` calls (per literal-run group-of-4) and the match's two
+/// sequential `add_bits_raw` calls with a scalar parallel-prefix-sum +
+/// variable-shift + OR-reduce merge (igzip `encode_df_0{4,6}.asm`'s
+/// vpgatherdd/vpsllvq technique, done as plain independent-operand scalar
+/// ops instead of AVX2 intrinsics, on the theory that it collapses N
+/// dependent read-modify-writes of `bw`'s accumulator into one) was byte-
+/// identical (L0-12 x p1/p4 x {dd79_text6,dd79_bin6,dickens,data.parquet},
+/// both roundtrip- and sha-verified) but was a measured NET REGRESSION, not
+/// a win: `perf stat -r 15` on solvency (AMD Zen2, `-C target-cpu=native`,
+/// /root/gzippy-locate5) showed whole-program instructions UP 0.1-2.0% (the
+/// merge math costs more total instructions than it saves) and wall UP in 3
+/// of 4 {corpus x level} cells (up to +3.5%, exceeding the <1% run-to-run
+/// spread) with the 4th cell an unreplicated tie; M1/aarch64 (same scalar
+/// code, no cfg split) showed a flat-to-slightly-worse wall and instructions
+/// up 0.1-0.55% too. Root cause (HYPOTHESIS, unvalidated): the OOO schedulers
+/// on both arches already hide the original chain's latency across loop
+/// iterations, so this trades real extra instructions for latency headroom
+/// that was never the bottleneck. Reopen trigger: an explicit-width SIMD
+/// version (real `vpgatherdd`/`vpsllvq`, one instruction per 4-8 lanes
+/// instead of one scalar instruction per lane) could still pay where the
+/// scalar analog didn't, since it changes the instruction-COUNT term the
+/// scalar attempt made worse, not just the dependency-depth term — untested,
+/// not this session's finding. The exact falsified diff (both increments,
+/// independently splittable) is reproduced in full in the commit message of
+/// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
+/// this file) so a future session can rebuild and re-measure it without
+/// re-deriving the technique from scratch.
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
