@@ -646,6 +646,67 @@ unsafe fn add_entry(bw: &mut BitWriter, e: u32) {
 /// whole-word flush per group), then the 1-3-literal tail. Returns the position
 /// one past the run.
 ///
+/// FALSIFIED (2026-07-22, AVX2 gather+vpsllvq attempt — the reopen trigger
+/// named by the scalar-prefix-sum FALSIFIED note on [`emit_sequences`]):
+/// replaced this loop with a batch-of-8 AVX2 emitter (`vpgatherdd` fetching 8
+/// packed `codeword | nbits << 24` LUT entries in one instruction, split into
+/// two groups of 4 for a real `vpsllvq`-based merge — exclusive prefix-sum of
+/// bit-widths via 2-step Hillis-Steele, `_mm256_sllv_epi64` variable shift on
+/// 64-bit-widened codewords, horizontal OR-reduce), dispatched at runtime via
+/// `is_x86_feature_detected!("avx2")` (mirroring
+/// `decompress::parallel::replace_markers::replace_markers`), scalar fallback
+/// unchanged. Byte-identical (L0-12 x T1/T4 x {dd79_text6, dd79_bin6,
+/// dickens, data.parquet}, 104/104 cells + roundtrip-verified via system
+/// `gunzip` on solvency AMD Zen2) but a measured NET REGRESSION, and by a
+/// much larger margin than the scalar attempt: `perf stat -r 15`
+/// (`-C target-cpu=native`, `/root/gzippy-locate5`) showed whole-program
+/// instructions UP in every one of the 4 {corpus x level} cells tested —
+/// text6 L1 +13.3%, text6 L6 +3.0%, bin6 L1 +1.25%, bin6 L6 +5.6% — and wall
+/// UP correspondingly, confirmed by a genuinely INTERLEAVED paired-diff
+/// (alternating lever/base each iteration, N=21, `/dev/null` sink): median
+/// lever/base wall ratio 1.096 (text6 L1), 1.028 (text6 L6), 1.078 (bin6 L1),
+/// 1.051 (bin6 L6) — 20-21 of 21 pairs worse in every cell, far beyond the
+/// ~0.3-1.5% per-cell spread. Whole-program `valgrind --tool=cachegrind`
+/// I-refs independently corroborated the perf-stat instruction delta (text6
+/// L1: 231.75M vs 203.03M, +14.1%); per-function attribution was not
+/// obtainable (the shipped profile is `lto="fat"` + `strip=true`, the
+/// documented "LTO lesson" — own-function deltas are not trustworthy under
+/// that build shape). M1/aarch64: the AVX2 code was `cfg(target_arch =
+/// "x86_64")`-gated out entirely — confirmed zero-change by construction
+/// (cargo build/test/clippy/fmt clean, the AVX2 differential tests do not
+/// appear in the M1 test list because the module does not exist there).
+///
+/// Root cause (Gate-2 CAUSAL, not inferred): a follow-up diagnostic variant
+/// on solvency replaced ONLY the `vpgatherdd` with 8 independent scalar
+/// table loads assembled into the same vectors via `_mm_set_epi32`, keeping
+/// the identical `vpsllvq` merge — and instructions/wall were statistically
+/// indistinguishable from the gather version (e.g. text6 L1: 246.36M instr
+/// vs the gather version's 246.48M; bin6 L6: 728.44M vs 728.14M). So
+/// `vpgatherdd` is NOT the cost driver on this Zen2 box — the merge math
+/// itself (the widen/shift/OR-reduce sequence replacing 4 dependent
+/// `add_bits_raw` calls) costs more total instructions than it saves, for
+/// the same reason the pure-scalar attempt found: the OOO scheduler already
+/// hides that short dependency chain's latency, so shortening it with more
+/// numerous vector instructions is a pure loss, independent of whether the
+/// per-lane loads are scalar or gathered. This strengthens (does not merely
+/// repeat) the original falsification's hypothesis, now with a Gate-2
+/// isolation, not just an inference.
+///
+/// Reopen trigger: none identified this session for THIS merge shape on
+/// this arch. An unexplored variant — skip the prefix-sum/shift/OR merge
+/// entirely and use the gather (or scalar loads) only to prefetch/batch the
+/// table lookups while keeping 4 independent scalar `add_bits_raw` calls per
+/// group (i.e. vectorize ONLY the load, not the merge) — was NOT tried and
+/// is a distinct hypothesis from both falsified attempts; Intel (non-Zen2)
+/// hardware, where `vpgatherdd`/shuffle throughput characteristics differ,
+/// was also not tested. The exact falsified diff (both the gather variant
+/// and the no-gather diagnostic) is reproduced in full in the commit that
+/// introduced this note (`git log --grep=FALSIFIED -p` on this file; the
+/// gather implementation itself, before revert, is preserved verbatim in
+/// commit `e63316ba`) so a future session can rebuild and re-measure either
+/// variant, or the untried load-only-vectorize hypothesis, without
+/// re-deriving the technique from scratch.
+///
 /// # Safety
 /// `p + litrunlen <= buf.len()`, and the output buffer must have been
 /// `reserve`d so every `flush_word_unchecked` has 8 spare bytes.
