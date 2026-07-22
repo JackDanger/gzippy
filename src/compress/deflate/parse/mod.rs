@@ -639,6 +639,7 @@ const _: () = {
 /// Caller upholds `add_bits_raw`'s contract (accumulator has room).
 #[inline(always)]
 unsafe fn add_entry(bw: &mut BitWriter, e: u32) {
+    crate::anatomy_count!(emit_body_bits, (e >> 24) as u64);
     bw.add_bits_raw((e & 0x00FF_FFFF) as u64, e >> 24);
 }
 
@@ -860,6 +861,95 @@ unsafe fn emit_literal_run(
 /// (`git show 522b7d96` on this file) so a future session can rebuild and
 /// re-measure a batched variant without re-deriving the tagged-record
 /// design from scratch.
+///
+/// FALSIFIED (2026-07-22, BATCHED-FLUSH micro-reopen — the "one untried emit
+/// variant" the ICF note's reopen trigger above named): pre-registered test
+/// of whether the flush CADENCE alone (not the Seq/emit representation, not
+/// codeword-assembly merging — both already falsified above) has headroom.
+/// Instrumented first, per the mission brief's go/no-go gate: added
+/// `emit_body_bits`/`bitstream_flush_word_calls` counters (KEPT — see
+/// `anatomy_counters.rs`, they're permanent now, unlike the rest of this
+/// note's instrumentation) and measured the average bits actually committed
+/// per `flush_word_unchecked` call against the ~56-bit safe budget
+/// (`BITBUF_NBITS - 7`) over dd79_text6/dd79_bin6/dickens/data.parquet at
+/// L1/L6/L9 (M1/aarch64, process-wide): only ~14-25 bits/flush of ~56
+/// available — 2.2x-4.4x more flushes than the `bits/token / 64` theoretical
+/// floor, i.e. real AGGREGATE headroom, not a near-floor no-op. That cleared
+/// the go/no-go gate, so two variants were built and gated:
+///
+/// - **v1**: a per-block-computed literal-run batch tier (4/5/6/8, widest
+///   safe for that block's ACTUAL max literal codeword length — read from
+///   `litcode.lens`, not the DEFLATE worst-case 14-bit constant), dispatched
+///   via a runtime `match` called from inside the per-Seq loop
+///   (`emit_literal_run_dispatch`, one dispatch per literal run — i.e. once
+///   per MATCH/token, up to ~1.1M times for dd79_text6 L1). Byte-identical
+///   (L0-12 x p1/p4 x all 4 corpora, 96/96 cells, both x86_64/solvency-AMD-
+///   Zen2 and M1/aarch64, sha256-verified). Measured `perf stat -r 15`
+///   (T1, `-C target-cpu=native`, `/root/gzippy-bflush`, `/dev/null` sink):
+///   whole-program instructions UP in ALL 8 {corpus x level} cells, +1.2% to
+///   +9.1% (dd79_text6 L1 +8.8%, dickens L1 +9.1% worst). Root cause: the
+///   dispatch `match` itself, paid once per token, cost more than the wider
+///   batches saved — a "dispatch cadence" tax replacing the "flush cadence"
+///   tax, same shape as the ICF note's per-record-flush finding above.
+/// - **v2** (the fix for v1's flaw): hoisted the dispatch to ONCE per BLOCK
+///   — `emit_body::<BATCH>` const-generic-specializes the ENTIRE per-Seq
+///   loop + trailing run, and `emit_sequences` picks ONE specialization via
+///   a single `match` before the loop starts (`sink.seqs` can run to 50,000
+///   entries — this is O(1) per block, not O(tokens)). Byte-identical again
+///   (96/96 cells, both arches). Still regressed in ALL 8 cells, though
+///   smaller: instructions +0.7% to +5.3% (dd79_text6 L1 +5.2%, dickens L1
+///   +5.3%); interleaved paired wall (N=21, T1, `/dev/null`) correspondingly
+///   flat-to-worse in every cell — no cell showed a clear win on either
+///   arch, M1 included.
+///
+/// Root cause (Gate-2, DIRECTLY MEASURED via a literal-token-weighted
+/// tier-usage counter added specifically to test this, not inferred): the
+/// static per-block max-literal-codeword-length gate almost never widens the
+/// batch on real text. `dd79_text6` and `dickens` — natural-language/source-
+/// text-like, high-symbol-cardinality literal alphabets — put 100% of
+/// literal TOKENS on the batch=4 tier (516,117/516,117 for text6 L1;
+/// 985,014/985,014 for dickens L1); batch=5/6/8 fired ZERO times in either
+/// file at any level tested. A length-limited canonical Huffman code over
+/// the full 256-symbol literal alphabet reliably pushes at least one
+/// actually-used RARE byte value past 11 bits in nearly every ~300KB block
+/// — so the AVERAGE bits/token being low (the aggregate measure that passed
+/// the go/no-go gate) says nothing about a block's WORST used symbol, which
+/// is what the safety bound is keyed on; these are different statistics of
+/// the same distribution, and the gate needs the latter. `dd79_bin6`/
+/// `data.parquet` (flatter byte-value distributions) DID get real partial
+/// widening (dd79_bin6 L1: 4,192,721 literals at tier5, 289,793 at tier6,
+/// ZERO at tier4) and STILL regressed (+1.1% to +2.5%) — even where the
+/// wider tier fires, the per-block max-scan + one-time dispatch overhead
+/// outweighs the flush-count savings.
+///
+/// So this is a THIRD, structurally distinct falsification of widening this
+/// function's flush cadence (after the scalar-merge and AVX2-merge attempts
+/// above, and related to the ICF note's per-record-flush finding): the
+/// AGGREGATE headroom is real and now permanently measurable
+/// (`emit_body_bits`/`bitstream_flush_word_calls`), but capturing it via a
+/// STATIC/per-block worst-case-gated batch size does not pay — the gate
+/// rarely fires on real-world skewed literal alphabets, and even when it
+/// does, the fixed overhead isn't cleared. The functional change (const-
+/// generic `emit_literal_run`/`emit_body`, `lit_batch_tier`, both dispatch
+/// variants) was reverted in full; only the two permanent counters remain.
+///
+/// Reopen trigger: a genuinely DIFFERENT mechanism for widening the safe
+/// batch bound — not a tuning knob on the tier thresholds (5/6/8 vs other
+/// cutoffs) or a smarter tier-selection heuristic, since the blocker is
+/// structural (the worst USED literal symbol sits near the length ceiling in
+/// most real blocks, not a threshold miscalibration). A true per-symbol
+/// runtime `CAN_BUFFER` check would remove the structural block but
+/// reintroduces the exact per-token branch cost this note (and the two
+/// FALSIFIED notes above it) repeatedly measured as a net loss — untested
+/// here, but faces the same headwind by construction; a candidate NOT tried
+/// this session is amortizing the check over N symbols via a running
+/// bit-budget compare cheaper than N per-symbol branches, rather than either
+/// a per-symbol check or a per-block static bound. The exact v1 and v2
+/// diffs are reproduced in full in the commit message of the commit that
+/// introduced this note (`git log --grep=FALSIFIED -p` on this file) so a
+/// future session can rebuild and re-measure either variant, or the untried
+/// amortized-runtime-check hypothesis, without re-deriving the const-generic
+/// batch-tier machinery from scratch.
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -911,6 +1001,7 @@ fn emit_sequences(
             let e = *tabs.off.get_unchecked(os);
             let cwlen = (e >> 16) & 0xFF;
             let extra = (seq.offset as u32 - *OFFSET_SLOT_BASE.get_unchecked(os)) as u64;
+            crate::anatomy_count!(emit_body_bits, (e >> 24) as u64);
             bw.add_bits_raw(((e & 0xFFFF) as u64) | (extra << cwlen), e >> 24);
             // SAFETY: reserve() guarantees 8 spare bytes for every flush.
             bw.flush_word_unchecked();

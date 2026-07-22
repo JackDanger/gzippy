@@ -293,6 +293,24 @@ define_counters!(
     matches_emitted_fast,
     histogram_updates,
     match_length_bytes_total,
+    // Flush-cadence efficiency (parse/mod.rs `emit_sequences`/`add_entry`,
+    // bitstream.rs `flush_word_unchecked`): `emit_body_bits` sums every bit
+    // width actually written by the block-body emitter (literal/litlen/
+    // length-extra codewords, offset/offset-extra codewords — NOT header
+    // bits); `bitstream_flush_word_calls` counts every whole-word flush.
+    // `emit_body_bits / bitstream_flush_word_calls` is the observed average
+    // bits committed per flush against the ~56-bit safe budget
+    // (`BITBUF_NBITS - 7`) — the headroom figure a batched-flush-cadence
+    // reopen would need (see `emit_sequences`'s FALSIFIED note, 2026-07-22:
+    // the aggregate headroom this pair measures — ~14-25 bits/flush of ~56 —
+    // does NOT translate into a safely widenable static batch, because the
+    // safety bound is set by a block's WORST single symbol, not its average,
+    // and that worst-symbol length sits near the ceiling in most real
+    // blocks). Kept as a permanent, zero-cost-when-off counter pair (not
+    // torn out with the rest of that experiment) because re-deriving them
+    // was most of the work the next flush-cadence idea would redo.
+    emit_body_bits,
+    bitstream_flush_word_calls,
     // Block-split observations (block_split.rs).
     block_split_observations,
     // Block emission (parse/mod.rs).
