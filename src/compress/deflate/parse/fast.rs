@@ -48,7 +48,7 @@
 use super::super::bitstream::BitWriter;
 use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_write};
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
-use super::{emit_block, emit_block_static_or_stored, Sink, StaticCodes};
+use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes};
 
 /// Log2 of the head-table size. igzip's level-0 hash table is
 /// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`); we widen
@@ -101,9 +101,9 @@ const NO_POS: u32 = u32::MAX;
 /// LZ4-`LZ4_compress_fast`-style scan-step ramp: no vendor DEFLATE encoder
 /// counterpart, a novel technique for this chainless single-probe finder.
 /// The scan step is `1 + (consecutive_misses >> ACCEL_SHIFT)`, capped at
-/// `ACCEL_MAX_STEP`: every `1 << ACCEL_SHIFT` further consecutive-miss
-/// positions, the per-position hash lookup/insert is skipped for a growing
-/// number of subsequent positions — those bytes are coded as literals
+/// `ACCEL_MAX_STEP`: once `ACCEL_ARM_THRESHOLD` consecutive-miss positions
+/// have been seen, the per-position hash lookup/insert is skipped for a
+/// growing number of subsequent positions — those bytes are coded as literals
 /// directly with no finder work at all. Any match resets the miss counter
 /// (and so the step) back to 1. This trades some missed matches (ratio) for
 /// skipping finder work outright (speed) — but ONLY on long literal runs,
@@ -111,20 +111,106 @@ const NO_POS: u32 = u32::MAX;
 /// likely to pay off. `run::<false>` (L1 / `Strategy::Fast`) monomorphizes
 /// with this whole mechanism compiled away — this is strictly an L0
 /// (`Strategy::Fast0`) lever.
-const ACCEL_SHIFT: u32 = 1;
+///
+/// `ACCEL_SHIFT = 0` (was 1): once armed, the step grows by 1 per additional
+/// consecutive miss (not 1 per 2 misses) — the growth-rate half of the ramp
+/// was measured to cost ~nothing extra on `text6`/`sil40` once decoupled from
+/// the ARM point (see `ACCEL_ARM_THRESHOLD`): `ACCEL_SHIFT=0` alone at the
+/// OLD `ACCEL_ARM_THRESHOLD=2` blew the igzip-0 size budget on `text6`
+/// (arms too eagerly on a corpus with short natural literal runs), but paired
+/// with the higher threshold below it stays under budget on text AND still
+/// closes a real chunk of the wall gap on the low-redundancy corpora where the
+/// ramp actually gets to run (measured on Apple M1, `-p1 -0`, N=15
+/// interleaved /dev/null, ~2026-07 gzippy-encoder campaign): `bin6` wall
+/// -7.2% (20.40ms med → 18.94ms), `sil40` wall -4.6% (119.42ms → 113.95ms),
+/// `text6` a noise-level tie (27.01ms → 26.98ms, matches are dense enough on
+/// text that the ramp rarely arms either way). Sizes stayed within the
+/// igzip-0 size-ratio budget on all three corpus classes (see the commit
+/// message for the exact numbers) — DIRECTIONAL on this box; re-gate on
+/// `scripts/measure.sh` / `fulcrum` before banking as a cross-arch finding.
+const ACCEL_SHIFT: u32 = 0;
 /// Consecutive-miss count at which the ramp arms (below this, `step` stays 1
 /// and the per-literal cost is just the counter increment + one
 /// well-predicted comparison — see the arming check's doc comment in
-/// [`run`]).
-const ACCEL_ARM_THRESHOLD: u32 = 1 << ACCEL_SHIFT;
+/// [`run`]). Decoupled from `ACCEL_SHIFT` (was `1 << ACCEL_SHIFT` = 2) so the
+/// arm point and the post-arm growth rate can be tuned independently —
+/// arming too eagerly on COMPRESSIBLE corpora (text/silesia) costs ratio
+/// budget for negligible wall gain (most literal runs there are short), so a
+/// slightly higher threshold (3, up from the old implied 2) buys back ratio
+/// margin at near-zero wall cost while `ACCEL_SHIFT=0` keeps the post-arm
+/// ramp aggressive for corpora where it actually engages.
+const ACCEL_ARM_THRESHOLD: u32 = 3;
 /// Cap on the accelerated scan step (bytes skipped per ramped-up jump).
 /// Bounded well under the `DEFLATE_MAX_MATCH_LEN` (258) fastloop safety
-/// margin so the skip can never run the cursor past `in_end`.
+/// margin so the skip can never run the cursor past `in_end`. Measured: raising
+/// this past 8 (16, 32) gave no further wall win at `ACCEL_ARM_THRESHOLD=3`
+/// (the remaining per-skipped-literal cost is the histogram bump / litrun
+/// counter, which `ACCEL` does NOT remove — only the matchfinder touch is
+/// skipped — so a bigger cap just means a bigger inner copy loop per
+/// activation, not less total work); kept at the original value.
 const ACCEL_MAX_STEP: usize = 8;
 
 /// igzip `SHORTEST_MATCH` (`huff_codes.h:89`): the fast path only emits matches
 /// of length >= 4 (its hash keys 4 bytes), coding anything shorter as literals.
 const SHORTEST_MATCH: u32 = 4;
+
+/// L1-only (`ACCEL == false`) one-position lazy peek, gated to short accepted
+/// matches at a far distance (see [`LAZY_PEEK_MIN_DIST`]).
+///
+/// BACKGROUND (L1-ratio-gap campaign, 2026-07): libdeflate's ACTUAL level-1
+/// matchfinder (vendor `lib/ht_matchfinder.h`, `HT_MATCHFINDER_BUCKET_SIZE ==
+/// 2`) keeps a SECOND candidate per hash slot and takes the better of the
+/// two on every lookup — not (as first hypothesized from the ratio-gap
+/// frontier analysis) a distance-cost accept/reject threshold, which lives
+/// only in libdeflate's HC-based `deflate_compress_greedy` (levels >= 2) and
+/// measurably does not fire here: a length-3 candidate from this finder's
+/// existing single 4-byte-hash probe is, by direct measurement, almost never
+/// a TRUE length-3 match (a length-3 accept/reject rule changed 0-3 bytes
+/// across text6/bin6/sil40 — falsified, not shipped).
+///
+/// A prior gzippy attempt ported the 2-way-bucket idea literally (a packed
+/// 2-way head table, second slot probed on EVERY lookup) and recovered real
+/// ratio (text6 under the libdeflate-1 target) but cost L1 +33.6% wall on
+/// text60 and +24.2% on bin60 (see `git log -1 e0e4c44d`'s commit message) —
+/// probing a second candidate on every lookup (hit AND miss) is the tax, and
+/// no gating threshold got it below ~15-20%.
+///
+/// This lever tries the SAME idea far more narrowly: instead of a second
+/// candidate at THIS position on every lookup, peek at the SAME single-probe
+/// candidate ONE position ahead (`pos + 1`) — but ONLY after a match is
+/// already ACCEPTED and it is both short (`length <= LAZY_PEEK_MAX_LEN`) and
+/// far (`dist > LAZY_PEEK_MIN_DIST`, see below). Even this narrower gate is
+/// NOT cheap: on these corpora, most accepted matches ARE short (confirming
+/// the ratio-gap frontier's own finding that most of the byte gap sits in
+/// 3-16-byte match decisions), so "peek on every short match" measured
+/// +9-15% wall on text6/sil40 (length-only gate, any threshold 4-8) — a
+/// SECOND independent confirmation, via a differently-shaped mechanism, of
+/// the same wall-cost floor the reverted 2-way-bucket attempt hit. Adding the
+/// distance gate cuts the peek rate further (most short matches here are
+/// near, not far) at the cost of most of the ratio recovery; the values below
+/// are the swept trade point that stays safely under a 5% wall budget
+/// (interleaved paired-diff N=25-30 on M1, `/dev/null` sink: text6 ~2.9-4.2%,
+/// sil40 ~1.8-3.0%, bin6 ~0.1-1.6%, all within noise-to-small) while still
+/// improving size with ZERO regressions on text6/bin6/sil40 (and the 19-file
+/// breadth corpus, see the commit message). This does NOT close the L1-vs-
+/// libdeflate-1 gap to parity — it closes roughly a tenth to a third of it
+/// per corpus; the residual is an HONEST, not a closed, gap (see the commit
+/// message for the exact before/after/ld1 numbers). Reuses the SAME cost
+/// tie-break as this codebase's existing HC lazy parser (`parse/lazy.rs`'s
+/// `better_match`, threshold 2):
+/// `4*(next_len-cur_len) + (bsr32(cur_offset)-bsr32(next_offset)) > 2`.
+const LAZY_PEEK_MAX_LEN: u32 = 4;
+
+/// Distance gate paired with [`LAZY_PEEK_MAX_LEN`] (see its doc comment for
+/// the full story): only peek when the ALREADY-ACCEPTED match's distance
+/// exceeds this. A short match at a NEAR distance is already cheap (small
+/// distance code, few extra bits) and rarely worth deferring; the expensive
+/// case worth the extra probe is a short match at a FAR distance (many
+/// distance extra-bits paid for few covered bytes). Swept empirically
+/// (0/256/1024/4096/8192/16384): lower values recover more ratio but cost
+/// more wall (0 costs +9-15%; 16384 is wall-safe but the smallest ratio
+/// recovery); 8192 is the chosen trade point.
+const LAZY_PEEK_MIN_DIST: usize = 8192;
 
 /// DEFLATE sliding-window size — the largest legal back-reference distance.
 const WINDOW: usize = 32768;
@@ -259,6 +345,48 @@ pub(super) fn run<const ACCEL: bool>(
                 // candidate simply yields length < SHORTEST_MATCH -> literal.
                 let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
                 if length >= SHORTEST_MATCH {
+                    // L1-only lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment):
+                    // gated to short accepted matches only, so this branch is
+                    // both rare (most matches are longer, or the position is a
+                    // miss and never reaches here) and, for `ACCEL == true`
+                    // (L0), compiled away entirely (`!ACCEL` is `false` at
+                    // monomorphization time) -- L0's codegen and output are
+                    // byte-identical to before this lever existed.
+                    if !ACCEL && length <= LAZY_PEEK_MAX_LEN && dist > LAZY_PEEK_MIN_DIST {
+                        // SAFETY: `pos < fast_end <= in_end - 258`, so
+                        // `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
+                        // both the 4-byte load and the up-to-258-byte
+                        // `lz_extend` below stay in bounds.
+                        let seq1 = unsafe { load_u32(base, pos + 1) };
+                        let h1 = lz_hash(seq1, HASH_BITS) as usize;
+                        // SAFETY: same as the primary lookup above; this is a
+                        // READ ONLY -- the peek does not insert `pos + 1` into
+                        // `head`, so the next loop iteration's normal insert
+                        // there (whether this match is deferred or taken) is
+                        // not a double-insert.
+                        let cand1 = unsafe { *head.get_unchecked(h1) };
+                        let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
+                        if (1..=WINDOW).contains(&dist1) {
+                            let next_len =
+                                lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN);
+                            if next_len >= length
+                                && 4 * (next_len as i32 - length as i32)
+                                    + (bsr32(dist as u32) as i32 - bsr32(dist1 as u32) as i32)
+                                    > 2
+                            {
+                                // Defer: a meaningfully better match starts one
+                                // byte later. Emit `pos` as a literal; the next
+                                // loop iteration discovers `pos + 1`'s match
+                                // fresh (including its own head-table insert).
+                                // SAFETY: `pos < fast_end <= in_end`.
+                                sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+                                pos += 1;
+                                literal_run = 0;
+                                continue;
+                            }
+                        }
+                    }
+
                     // LIMIT_HASH_UPDATE (see the tail loop for the full note).
                     let match_end = pos + length as usize;
                     let insert_end = if limit_hash_update_inserts == usize::MAX {
