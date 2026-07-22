@@ -101,9 +101,9 @@ const NO_POS: u32 = u32::MAX;
 /// LZ4-`LZ4_compress_fast`-style scan-step ramp: no vendor DEFLATE encoder
 /// counterpart, a novel technique for this chainless single-probe finder.
 /// The scan step is `1 + (consecutive_misses >> ACCEL_SHIFT)`, capped at
-/// `ACCEL_MAX_STEP`: every `1 << ACCEL_SHIFT` further consecutive-miss
-/// positions, the per-position hash lookup/insert is skipped for a growing
-/// number of subsequent positions — those bytes are coded as literals
+/// `ACCEL_MAX_STEP`: once `ACCEL_ARM_THRESHOLD` consecutive-miss positions
+/// have been seen, the per-position hash lookup/insert is skipped for a
+/// growing number of subsequent positions — those bytes are coded as literals
 /// directly with no finder work at all. Any match resets the miss counter
 /// (and so the step) back to 1. This trades some missed matches (ratio) for
 /// skipping finder work outright (speed) — but ONLY on long literal runs,
@@ -111,15 +111,43 @@ const NO_POS: u32 = u32::MAX;
 /// likely to pay off. `run::<false>` (L1 / `Strategy::Fast`) monomorphizes
 /// with this whole mechanism compiled away — this is strictly an L0
 /// (`Strategy::Fast0`) lever.
-const ACCEL_SHIFT: u32 = 1;
+///
+/// `ACCEL_SHIFT = 0` (was 1): once armed, the step grows by 1 per additional
+/// consecutive miss (not 1 per 2 misses) — the growth-rate half of the ramp
+/// was measured to cost ~nothing extra on `text6`/`sil40` once decoupled from
+/// the ARM point (see `ACCEL_ARM_THRESHOLD`): `ACCEL_SHIFT=0` alone at the
+/// OLD `ACCEL_ARM_THRESHOLD=2` blew the igzip-0 size budget on `text6`
+/// (arms too eagerly on a corpus with short natural literal runs), but paired
+/// with the higher threshold below it stays under budget on text AND still
+/// closes a real chunk of the wall gap on the low-redundancy corpora where the
+/// ramp actually gets to run (measured on Apple M1, `-p1 -0`, N=15
+/// interleaved /dev/null, ~2026-07 gzippy-encoder campaign): `bin6` wall
+/// -7.2% (20.40ms med → 18.94ms), `sil40` wall -4.6% (119.42ms → 113.95ms),
+/// `text6` a noise-level tie (27.01ms → 26.98ms, matches are dense enough on
+/// text that the ramp rarely arms either way). Sizes stayed within the
+/// igzip-0 size-ratio budget on all three corpus classes (see the commit
+/// message for the exact numbers) — DIRECTIONAL on this box; re-gate on
+/// `scripts/measure.sh` / `fulcrum` before banking as a cross-arch finding.
+const ACCEL_SHIFT: u32 = 0;
 /// Consecutive-miss count at which the ramp arms (below this, `step` stays 1
 /// and the per-literal cost is just the counter increment + one
 /// well-predicted comparison — see the arming check's doc comment in
-/// [`run`]).
-const ACCEL_ARM_THRESHOLD: u32 = 1 << ACCEL_SHIFT;
+/// [`run`]). Decoupled from `ACCEL_SHIFT` (was `1 << ACCEL_SHIFT` = 2) so the
+/// arm point and the post-arm growth rate can be tuned independently —
+/// arming too eagerly on COMPRESSIBLE corpora (text/silesia) costs ratio
+/// budget for negligible wall gain (most literal runs there are short), so a
+/// slightly higher threshold (3, up from the old implied 2) buys back ratio
+/// margin at near-zero wall cost while `ACCEL_SHIFT=0` keeps the post-arm
+/// ramp aggressive for corpora where it actually engages.
+const ACCEL_ARM_THRESHOLD: u32 = 3;
 /// Cap on the accelerated scan step (bytes skipped per ramped-up jump).
 /// Bounded well under the `DEFLATE_MAX_MATCH_LEN` (258) fastloop safety
-/// margin so the skip can never run the cursor past `in_end`.
+/// margin so the skip can never run the cursor past `in_end`. Measured: raising
+/// this past 8 (16, 32) gave no further wall win at `ACCEL_ARM_THRESHOLD=3`
+/// (the remaining per-skipped-literal cost is the histogram bump / litrun
+/// counter, which `ACCEL` does NOT remove — only the matchfinder touch is
+/// skipped — so a bigger cap just means a bigger inner copy loop per
+/// activation, not less total work); kept at the original value.
 const ACCEL_MAX_STEP: usize = 8;
 
 /// igzip `SHORTEST_MATCH` (`huff_codes.h:89`): the fast path only emits matches
