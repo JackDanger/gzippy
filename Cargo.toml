@@ -114,21 +114,6 @@ anatomy-counters = []
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);
 # does not affect production binaries. See plan.md Phase 11.2.
 oracle = []
-# ICF-ARCHITECTURE EXPERIMENT (2026-07-22, pre-registered kill rule — see the
-# commit message / mission brief for the full protocol): tests whether
-# igzip's fast-path emit economy comes from a UNIFORM per-token record (one
-# u32 per literal OR match, one flat loop, one huffman lookup + add_bits per
-# record, no inner literal-run loop, no re-reading `buf`) rather than SIMD.
-# Scoped to `Strategy::Fast`/`Fast0` (L0/L1) ONLY — `push_literal`/
-# `push_match` (greedy/lazy/near_optimal, L2-9) are UNTOUCHED, so L6 is
-# mechanically unaffected by this feature, not merely "expected" to be.
-# DEFAULT OFF: feature-off build is byte-identical to pre-experiment HEAD
-# (every new field/fn is `#[cfg(feature = "icf-emit")]`-gated, zero-cost when
-# off). KEEP only if the pre-registered whole-program-instructions + wall
-# gate (both arches, both dd79 corpora, N>=21 interleaved) passes; otherwise
-# this feature and its module are deleted, per CLAUDE.md's "Optimization
-# Branches" — see `src/compress/deflate/parse/mod.rs`'s `IcfRec` doc comment.
-icf-emit = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
 # Pulls `asm-kernel` (DEFAULT-ON since the §9 F-c SHIP + the four flip
 # preconditions, plans/asm-campaign.md §10): every production decode build

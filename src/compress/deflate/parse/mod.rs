@@ -75,70 +75,6 @@ const SEQ_LEN_MASK: u16 = 0x1FF;
 /// The offset slot starts at bit 9 of [`Seq::length_and_slot`].
 const SEQ_SLOT_SHIFT: u16 = 9;
 
-/// ICF-ARCHITECTURE EXPERIMENT (2026-07-22) — one packed `u32` record per
-/// TOKEN (literal OR match), the port of igzip's "Intermediate Compressed
-/// Format" pass-2 representation (`igzip_level_buf_structs.h`'s
-/// `deflate_icf_stream` / one `uint32_t` per LL/dist token). HYPOTHESIS under
-/// test: gzippy's fast-path emit is NESTED (outer loop over [`Seq`] →
-/// inner loop over `litrunlen` literals re-read from `buf` → match assembly)
-/// while igzip's pass-2 is a single UNIFORM flat loop, one huffman lookup +
-/// `add_bits` per record, no inner loops, no input re-reads — and that
-/// uniformity (not SIMD) is igzip's emit economy. The parse-side trade this
-/// makes explicit: a STORE per literal (record push) instead of a counter
-/// bump, in exchange for a branch-light flat emit loop.
-///
-/// Layout: bits 0..16 = offset (match) or the literal byte (literal, in the
-/// low 8 bits, rest zero); bits 16..32 = [`Seq::length_and_slot`] (match) or
-/// the sentinel `0xFFFF` (literal). This is a safe, exhaustive tag: a real
-/// match's `length_and_slot` maxes out at `258 | (29 << 9) == 0x3B02` (length
-/// 3..=258 in bits 0..9, offset slot 0..=29 in bits 9..14), which can never
-/// equal `0xFFFF`, so checking the top 16 bits against the sentinel
-/// unambiguously distinguishes the two record kinds with one comparison.
-///
-/// Scoped to [`fast::run`]'s [`Sink::push_literal_fast`]/
-/// [`Sink::push_match_fast`] ONLY (`Strategy::Fast`/`Fast0`, L0/L1) — greedy/
-/// lazy/near_optimal (L2-9) keep [`Sink::push_literal`]/[`Sink::push_match`]
-/// and the existing [`emit_sequences`] untouched, so L6 is mechanically
-/// unaffected by this feature (not merely expected to tie).
-///
-/// Gated entirely behind the `icf-emit` Cargo feature: with the feature off,
-/// this type, [`Sink::icf_records`], and [`emit_records_icf`] do not exist in
-/// the compiled artifact — feature-off is byte-identical to pre-experiment
-/// HEAD. See the pre-registered kill rule in the feature's `Cargo.toml` doc
-/// comment: KEEP only on a measured whole-program-instructions-down (x86, L1,
-/// both dd79 corpora) AND a wall win beyond spread on at least one corpus
-/// with the other non-regressing AND M1 non-regressing; else REVERT (delete
-/// this module) with the falsification recorded in the commit message,
-/// alongside the two same-day FALSIFIED `emit_sequences` SIMD/prefix-sum
-/// attempts this experiment is a structural sibling of (see
-/// [`emit_literal_run`]'s and [`emit_sequences`]'s doc comments).
-#[cfg(feature = "icf-emit")]
-#[derive(Clone, Copy)]
-struct IcfRec(u32);
-
-#[cfg(feature = "icf-emit")]
-impl IcfRec {
-    /// Sentinel for the upper 16 bits of a literal record — see the type doc
-    /// comment for why this never collides with a real match's
-    /// `length_and_slot`.
-    const LITERAL_TAG: u32 = 0xFFFF_0000;
-
-    #[inline(always)]
-    fn literal(byte: u8) -> Self {
-        IcfRec(Self::LITERAL_TAG | byte as u32)
-    }
-
-    #[inline(always)]
-    fn matc(offset: u16, length_and_slot: u16) -> Self {
-        IcfRec(((length_and_slot as u32) << 16) | offset as u32)
-    }
-
-    #[inline(always)]
-    fn is_literal(self) -> bool {
-        (self.0 & 0xFFFF_0000) == Self::LITERAL_TAG
-    }
-}
-
 /// The precomputed RFC 1951 fixed (static) Huffman codes, built once per parse.
 struct StaticCodes {
     litcode: HuffmanCode,
@@ -177,13 +113,6 @@ struct Sink {
     /// Input bytes covered by the current block so far.
     block_length: usize,
     stats: BlockSplitStats,
-    /// ICF-ARCHITECTURE EXPERIMENT record stream — see [`IcfRec`]'s doc
-    /// comment. Populated ONLY by [`Sink::push_literal_fast`]/
-    /// [`Sink::push_match_fast`] when the `icf-emit` feature is on; `seqs`/
-    /// `litrun` are unused by the fast path in that configuration (still
-    /// updated by `push_literal`/`push_match` for L2-9, untouched).
-    #[cfg(feature = "icf-emit")]
-    icf_records: Vec<IcfRec>,
 }
 
 impl Sink {
@@ -195,8 +124,6 @@ impl Sink {
             offset_freqs: [0; DEFLATE_NUM_OFFSET_SYMS],
             block_length: 0,
             stats: BlockSplitStats::new(),
-            #[cfg(feature = "icf-emit")]
-            icf_records: Vec::new(),
         }
     }
 
@@ -208,8 +135,6 @@ impl Sink {
         self.offset_freqs = [0; DEFLATE_NUM_OFFSET_SYMS];
         self.block_length = 0;
         self.stats.reset();
-        #[cfg(feature = "icf-emit")]
-        self.icf_records.clear();
     }
 
     /// `deflate_choose_literal` (with split-stat gathering always on, as greedy
@@ -236,7 +161,6 @@ impl Sink {
     /// the fast parser derives `block_length` once at flush (`pos - block_begin`)
     /// instead of a per-push `+= 1`. Emitted bytes are identical: `emit_block`
     /// consumes only the freqs/seqs/litrun/`block_length`.
-    #[cfg(not(feature = "icf-emit"))]
     #[inline]
     fn push_literal_fast(&mut self, lit: u8) {
         crate::anatomy_count!(literals_emitted);
@@ -248,23 +172,6 @@ impl Sink {
             *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
         }
         self.litrun += 1;
-    }
-
-    /// ICF-ARCHITECTURE EXPERIMENT variant of [`Self::push_literal_fast`]: no
-    /// run counter — push a whole [`IcfRec::literal`] record instead. See
-    /// [`IcfRec`]'s doc comment.
-    #[cfg(feature = "icf-emit")]
-    #[inline]
-    fn push_literal_fast(&mut self, lit: u8) {
-        crate::anatomy_count!(literals_emitted);
-        crate::anatomy_count!(literals_emitted_fast);
-        crate::anatomy_count!(histogram_updates);
-        // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
-        // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
-        unsafe {
-            *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
-        }
-        self.icf_records.push(IcfRec::literal(lit));
     }
 
     /// Push the pending literal run + this match as one [`Seq`].
@@ -279,7 +186,6 @@ impl Sink {
     }
 
     /// Fast-path match push: frequencies + sequence only (see [`Self::push_literal_fast`]).
-    #[cfg(not(feature = "icf-emit"))]
     #[inline]
     fn push_match_fast(&mut self, length: u32, offset: u32) {
         crate::anatomy_count!(matches_emitted);
@@ -299,34 +205,6 @@ impl Sink {
             *self.offset_freqs.get_unchecked_mut(os) += 1;
         }
         self.push_seq(length, offset, os);
-    }
-
-    /// ICF-ARCHITECTURE EXPERIMENT variant of [`Self::push_match_fast`]: push
-    /// one [`IcfRec::matc`] record instead of a [`Seq`] (no `litrun`
-    /// dependency — the record stream already carries every literal
-    /// individually). See [`IcfRec`]'s doc comment.
-    #[cfg(feature = "icf-emit")]
-    #[inline]
-    fn push_match_fast(&mut self, length: u32, offset: u32) {
-        crate::anatomy_count!(matches_emitted);
-        crate::anatomy_count!(matches_emitted_fast);
-        crate::anatomy_count!(histogram_updates, 2u64);
-        crate::anatomy_count!(match_length_bytes_total, length);
-        debug_assert!((DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN).contains(&length));
-        debug_assert!((1..=32768).contains(&offset));
-        let ls = length_slot(length) as usize;
-        let os = offset_slot(offset) as usize;
-        // SAFETY: as in `push_match` — `length_slot` returns 0..=28 and
-        // `offset_slot` returns 0..=29, so both indices are in bounds.
-        unsafe {
-            *self
-                .litlen_freqs
-                .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
-            *self.offset_freqs.get_unchecked_mut(os) += 1;
-        }
-        let length_and_slot = (length as u16) | ((os as u16) << SEQ_SLOT_SHIFT);
-        self.icf_records
-            .push(IcfRec::matc(offset as u16, length_and_slot));
     }
 
     /// `deflate_choose_match`.
@@ -588,7 +466,6 @@ fn emit_block(
 /// (no per-block adaptive code), which is an intentional L0/L1 trade — L0's
 /// bar is beating igzip -0 (which sometimes EXPANDS incompressible input),
 /// not matching L1.
-#[cfg(not(feature = "icf-emit"))]
 fn emit_block_static_or_stored(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -628,105 +505,6 @@ fn emit_block_static_or_stored(
             &statics.litcode,
             &statics.offcode,
         );
-    }
-}
-
-/// ICF-ARCHITECTURE EXPERIMENT twin of [`emit_block`]: IDENTICAL block-type
-/// (dynamic/static/stored) cost decision — it consumes only `sink`'s
-/// histograms/`block_length`, which are populated the same way regardless of
-/// `icf-emit` — but the dynamic/static body is emitted via
-/// [`emit_records_icf`] over `sink.icf_records` instead of [`emit_sequences`]
-/// over `sink.seqs`. Called ONLY from [`fast::run`] (`Strategy::Fast`, L1)
-/// when the `icf-emit` feature is on; see [`IcfRec`]'s doc comment.
-#[cfg(feature = "icf-emit")]
-fn emit_block_icf(
-    bw: &mut BitWriter,
-    buf: &[u8],
-    block_start: usize,
-    sink: &Sink,
-    statics: &StaticCodes,
-    is_final: bool,
-) {
-    let mut litlen_freqs = sink.litlen_freqs;
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
-
-    let litcode = make_huffman_code(
-        DEFLATE_NUM_LITLEN_SYMS,
-        MAX_LITLEN_CODEWORD_LEN,
-        &litlen_freqs,
-    );
-    let offcode = make_huffman_code(
-        DEFLATE_NUM_OFFSET_SYMS,
-        MAX_OFFSET_CODEWORD_LEN,
-        &sink.offset_freqs,
-    );
-    let header = build_dynamic_header(&litcode.lens, &offcode.lens);
-
-    let dynamic_bits = 3
-        + header.header_bits()
-        + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
-    let static_bits = 3 + cost_from_freqs(
-        &litlen_freqs,
-        &sink.offset_freqs,
-        &statics.litcode,
-        &statics.offcode,
-    );
-    let stored_bits = stored_block_bits(sink.block_length);
-
-    if stored_bits <= dynamic_bits && stored_bits <= static_bits {
-        super::emit_stored_block(
-            bw,
-            &buf[block_start..block_start + sink.block_length],
-            is_final,
-        );
-    } else if static_bits <= dynamic_bits {
-        crate::anatomy_count!(blocks_emitted_fixed);
-        bw.add_bits(is_final as u64, 1);
-        bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
-        emit_records_icf(bw, &sink.icf_records, &statics.litcode, &statics.offcode);
-    } else {
-        crate::anatomy_count!(blocks_emitted_dynamic);
-        bw.add_bits(is_final as u64, 1);
-        bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
-        header.emit(bw);
-        emit_records_icf(bw, &sink.icf_records, &litcode, &offcode);
-    }
-}
-
-/// ICF-ARCHITECTURE EXPERIMENT twin of [`emit_block_static_or_stored`] — see
-/// [`emit_block_icf`]'s doc comment; called from [`fast::run`]
-/// (`Strategy::Fast0`, L0) when `icf-emit` is on.
-#[cfg(feature = "icf-emit")]
-fn emit_block_static_or_stored_icf(
-    bw: &mut BitWriter,
-    buf: &[u8],
-    block_start: usize,
-    sink: &Sink,
-    statics: &StaticCodes,
-    is_final: bool,
-) {
-    let mut litlen_freqs = sink.litlen_freqs;
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
-
-    let static_bits = 3 + cost_from_freqs(
-        &litlen_freqs,
-        &sink.offset_freqs,
-        &statics.litcode,
-        &statics.offcode,
-    );
-    let stored_bits = stored_block_bits(sink.block_length);
-
-    if stored_bits <= static_bits {
-        super::emit_stored_block(
-            bw,
-            &buf[block_start..block_start + sink.block_length],
-            is_final,
-        );
-    } else {
-        crate::anatomy_count!(blocks_emitted_fixed);
-        bw.add_bits(is_final as u64, 1);
-        bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
-        emit_records_icf(bw, &sink.icf_records, &statics.litcode, &statics.offcode);
     }
 }
 
@@ -1004,6 +782,84 @@ unsafe fn emit_literal_run(
 /// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
 /// this file) so a future session can rebuild and re-measure it without
 /// re-deriving the technique from scratch.
+///
+/// FALSIFIED (2026-07-22, ICF-ARCHITECTURE experiment — a structural
+/// sibling of the note above, not a SIMD attempt): pre-registered test of
+/// the hypothesis that igzip's fast-path emit economy comes from a UNIFORM
+/// per-token record (one packed u32 per literal OR match, one flat loop, no
+/// nested literal-run loop, no re-reading `buf` — igzip's "Intermediate
+/// Compressed Format" pass-2 shape) rather than from SIMD. Implemented as a
+/// `Strategy::Fast`/`Fast0`-only (L0/L1) Cargo feature (`icf-emit`, default
+/// off): a tagged-u32 `IcfRec` (literal byte or `Seq::length_and_slot`/
+/// offset, distinguished by a `0xFFFF`-sentinel upper half no real match can
+/// produce), `Sink::push_literal_fast`/`push_match_fast` pushing one record
+/// per token instead of bumping `litrun`, and `emit_records_icf` — one flat
+/// loop, one merged-table lookup + `add_bits_raw` + `flush_word_unchecked`
+/// per record, replacing this function's nested Seq-loop/`emit_literal_run`
+/// shape. greedy/lazy/near_optimal (L2-9, this function) were entirely
+/// untouched by construction (separate cfg-gated call sites in `fast.rs`),
+/// so L6 was a true structural no-op, not merely an expected tie.
+///
+/// Byte-identical (L0-12 x p1/p4 x {dd79_text6,dd79_bin6,dickens,
+/// data.parquet}, 104/104 cells, sha256), roundtrip- and `gunzip -t`-
+/// verified, full `cargo test --release --lib compress` suite green in both
+/// feature states (802/802), clippy+fmt clean — but a measured NET
+/// REGRESSION on every gated axis, refuting the hypothesis outright rather
+/// than confirming it "only at L1" or "only on one arch":
+///
+/// - **M1/aarch64** (interleaved paired wall, N=21, `/dev/null` sink, L1
+///   p1; A/A control noise <0.3%): `dd79_text6` icf/base median wall ratio
+///   1.029 (18/21 pairs worse); `dd79_bin6` 1.045 (21/21 pairs worse). Both
+///   exceed the noise floor by 10-20x — a real regression, not a tie.
+/// - **x86_64/Zen2** (solvency AMD EPYC 7282, `-C target-cpu=native`,
+///   `perf stat -r 15` + independent `valgrind --tool=cachegrind`
+///   corroboration, both /dev/null; A/A control instruction noise <0.01%):
+///   whole-program instructions did NOT drop on both corpora as the KEEP
+///   rule required — `dd79_text6` DID drop (perf: 217.51M→211.55M, -2.7%;
+///   cachegrind I-refs: 203.03M→196.97M, -3.0%, cross-validated) but
+///   `dd79_bin6` went UP sharply (perf: 283.52M→360.91M, +27.3%;
+///   cachegrind: 264.75M→341.55M, +29.0%). Wall (interleaved, N=21)
+///   regressed on BOTH: `dd79_text6` icf/base 1.072 (0/21 faster);
+///   `dd79_bin6` 1.092 (0/21 faster) — both far beyond the <0.2% A/A wall
+///   noise, and in the WRONG direction on text6 despite its instruction
+///   drop (cycles rose 123.86M→132.33M there; IPC fell 1.76→1.60 — the
+///   per-record branch + per-record flush cost more cycles/instruction than
+///   the saved instructions bought back).
+/// - **L6 must-not-regress spot** (both corpora, `perf stat -r 10`):
+///   confirmed a true no-op as expected — instructions/cycles/wall
+///   statistically identical to baseline in all 4 cells (deltas <0.3%,
+///   within A/A noise), since `icf-emit` never touches this function.
+///
+/// Root cause (Gate-2-adjacent, from `anatomy-counters` token histograms,
+/// not merely inferred): the regression tracks LITERAL DENSITY, the
+/// opposite of what the hypothesis predicted. `dd79_text6` is match-heavy
+/// (1,085,137 matches vs 516,117 literals, 32% literal fraction) and
+/// regressed mildly; `dd79_bin6` is literal-heavy (391,515 matches vs
+/// 4,482,514 literals, 92% literal fraction) and regressed severely. The
+/// uniform-record design's parse-side trade — one `Vec` push per literal
+/// instead of a `litrun` counter bump, and (to stay within the accumulator's
+/// `CAN_BUFFER` bound for an arbitrary literal/match mix) one
+/// `flush_word_unchecked` per record instead of this function's batched-4
+/// `emit_literal_run` — is exactly the cost the mission brief named as "the
+/// experiment's honest trade," and on literal-dominated input it dominates:
+/// MORE total per-record overhead (store + branch + flush) than the nested
+/// loop it replaced saves by being "uniform." So gzippy's existing
+/// Seq/litrun run-length representation (this function) is confirmed, not
+/// merely retained by default — record uniformity is a NET LOSS here, not
+/// an untapped igzip lever.
+///
+/// Reopen trigger: none identified this session. A batched (not per-record)
+/// flush cadence for the uniform-record loop was NOT tried (it would need a
+/// type-aware batch-size cap to stay within `BITBUF_NBITS`, which
+/// reintroduces the literal/match branch this experiment set out to
+/// eliminate, so it is a materially different design, not a tuning knob on
+/// this one) — untested, not this session's finding. The exact falsified
+/// implementation (increment 1, `IcfRec`/`Sink::icf_records`/
+/// `emit_records_icf`/`emit_block_icf`/`emit_block_static_or_stored_icf`,
+/// Cargo feature `icf-emit`) is preserved verbatim in commit `522b7d96`
+/// (`git show 522b7d96` on this file) so a future session can rebuild and
+/// re-measure a batched variant without re-deriving the tagged-record
+/// design from scratch.
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -1069,75 +925,6 @@ fn emit_sequences(
     // slack bytes cover the EOB flush.
     unsafe {
         emit_literal_run(bw, buf, p, sink.litrun as usize, &tabs.lit);
-        add_entry(bw, tabs.eob);
-        bw.flush_word_unchecked();
-    }
-}
-
-/// ICF-ARCHITECTURE EXPERIMENT emit: a single FLAT loop over
-/// [`Sink::icf_records`] (one entry per literal OR match, no nested
-/// literal-run loop, no re-reading `buf`), one merged-table lookup +
-/// `add_bits_raw` per record, one flush per record. Byte-identical output to
-/// [`emit_sequences`] given the same underlying token stream: every symbol is
-/// encoded with the exact same [`EmitTables`] lookups and the same LSB-first
-/// bit order — flush cadence (per-record here vs. per-4-literals/per-match in
-/// `emit_sequences`) only changes WHEN complete bytes are drained from the
-/// accumulator into `out`, never WHICH bits are drained, so it cannot change
-/// the emitted byte stream. See [`IcfRec`]'s doc comment for the experiment
-/// this feeds and the kill rule.
-///
-/// # Safety (bound, not caller-facing)
-/// Every record's worst-case width is a match: litlen codeword (<=14 bits) +
-/// extra length bits (<=5) + offset codeword (<=15 bits) + extra offset bits
-/// (<=13) = 47 bits, so `reserve`'s `6` bytes/record (48 bits) covers every
-/// flush; `bw.flush_bits()` first normalizes to <=7 buffered bits, so no
-/// single record's raw add can ever exceed `7 + 47 = 54 <= BITBUF_NBITS`
-/// (the same bound [`emit_sequences`]'s per-match path already relies on).
-#[cfg(feature = "icf-emit")]
-fn emit_records_icf(
-    bw: &mut BitWriter,
-    records: &[IcfRec],
-    litcode: &HuffmanCode,
-    offcode: &HuffmanCode,
-) {
-    let tabs = EmitTables::build(litcode, offcode);
-
-    // See `emit_sequences`'s identical normalization comment.
-    bw.flush_bits();
-
-    // Worst case 6 output bytes per record (a match, see the fn's safety
-    // note) + slack for the EOB flush.
-    bw.reserve(records.len() * 6 + 16);
-
-    for &rec in records {
-        // SAFETY: see the fn's safety note above; `reserve` covers every
-        // flush in this loop.
-        unsafe {
-            if rec.is_literal() {
-                let byte = (rec.0 & 0xFF) as usize;
-                // SAFETY: `byte` is a u8 value, in bounds for the 256-entry table.
-                add_entry(bw, *tabs.lit.get_unchecked(byte));
-            } else {
-                let offset = rec.0 & 0xFFFF;
-                let length_and_slot = (rec.0 >> 16) as u16;
-                let length = (length_and_slot & SEQ_LEN_MASK) as usize;
-                let os = (length_and_slot >> SEQ_SLOT_SHIFT) as usize;
-                // SAFETY: `length` is 3..=258 (259-entry table); `os` is
-                // 0..=29 (in bounds for the 32-entry `off` table and the
-                // 30-entry OFFSET_SLOT_BASE).
-                add_entry(bw, *tabs.full_len.get_unchecked(length));
-                let e = *tabs.off.get_unchecked(os);
-                let cwlen = (e >> 16) & 0xFF;
-                let extra = (offset - *OFFSET_SLOT_BASE.get_unchecked(os)) as u64;
-                bw.add_bits_raw(((e & 0xFFFF) as u64) | (extra << cwlen), e >> 24);
-            }
-            // SAFETY: reserve() guarantees 8 spare bytes for every flush.
-            bw.flush_word_unchecked();
-        }
-    }
-
-    // SAFETY: reserve()'s 16 slack bytes cover the EOB flush.
-    unsafe {
         add_entry(bw, tabs.eob);
         bw.flush_word_unchecked();
     }
