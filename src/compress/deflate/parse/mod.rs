@@ -782,6 +782,84 @@ unsafe fn emit_literal_run(
 /// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
 /// this file) so a future session can rebuild and re-measure it without
 /// re-deriving the technique from scratch.
+///
+/// FALSIFIED (2026-07-22, ICF-ARCHITECTURE experiment — a structural
+/// sibling of the note above, not a SIMD attempt): pre-registered test of
+/// the hypothesis that igzip's fast-path emit economy comes from a UNIFORM
+/// per-token record (one packed u32 per literal OR match, one flat loop, no
+/// nested literal-run loop, no re-reading `buf` — igzip's "Intermediate
+/// Compressed Format" pass-2 shape) rather than from SIMD. Implemented as a
+/// `Strategy::Fast`/`Fast0`-only (L0/L1) Cargo feature (`icf-emit`, default
+/// off): a tagged-u32 `IcfRec` (literal byte or `Seq::length_and_slot`/
+/// offset, distinguished by a `0xFFFF`-sentinel upper half no real match can
+/// produce), `Sink::push_literal_fast`/`push_match_fast` pushing one record
+/// per token instead of bumping `litrun`, and `emit_records_icf` — one flat
+/// loop, one merged-table lookup + `add_bits_raw` + `flush_word_unchecked`
+/// per record, replacing this function's nested Seq-loop/`emit_literal_run`
+/// shape. greedy/lazy/near_optimal (L2-9, this function) were entirely
+/// untouched by construction (separate cfg-gated call sites in `fast.rs`),
+/// so L6 was a true structural no-op, not merely an expected tie.
+///
+/// Byte-identical (L0-12 x p1/p4 x {dd79_text6,dd79_bin6,dickens,
+/// data.parquet}, 104/104 cells, sha256), roundtrip- and `gunzip -t`-
+/// verified, full `cargo test --release --lib compress` suite green in both
+/// feature states (802/802), clippy+fmt clean — but a measured NET
+/// REGRESSION on every gated axis, refuting the hypothesis outright rather
+/// than confirming it "only at L1" or "only on one arch":
+///
+/// - **M1/aarch64** (interleaved paired wall, N=21, `/dev/null` sink, L1
+///   p1; A/A control noise <0.3%): `dd79_text6` icf/base median wall ratio
+///   1.029 (18/21 pairs worse); `dd79_bin6` 1.045 (21/21 pairs worse). Both
+///   exceed the noise floor by 10-20x — a real regression, not a tie.
+/// - **x86_64/Zen2** (solvency AMD EPYC 7282, `-C target-cpu=native`,
+///   `perf stat -r 15` + independent `valgrind --tool=cachegrind`
+///   corroboration, both /dev/null; A/A control instruction noise <0.01%):
+///   whole-program instructions did NOT drop on both corpora as the KEEP
+///   rule required — `dd79_text6` DID drop (perf: 217.51M→211.55M, -2.7%;
+///   cachegrind I-refs: 203.03M→196.97M, -3.0%, cross-validated) but
+///   `dd79_bin6` went UP sharply (perf: 283.52M→360.91M, +27.3%;
+///   cachegrind: 264.75M→341.55M, +29.0%). Wall (interleaved, N=21)
+///   regressed on BOTH: `dd79_text6` icf/base 1.072 (0/21 faster);
+///   `dd79_bin6` 1.092 (0/21 faster) — both far beyond the <0.2% A/A wall
+///   noise, and in the WRONG direction on text6 despite its instruction
+///   drop (cycles rose 123.86M→132.33M there; IPC fell 1.76→1.60 — the
+///   per-record branch + per-record flush cost more cycles/instruction than
+///   the saved instructions bought back).
+/// - **L6 must-not-regress spot** (both corpora, `perf stat -r 10`):
+///   confirmed a true no-op as expected — instructions/cycles/wall
+///   statistically identical to baseline in all 4 cells (deltas <0.3%,
+///   within A/A noise), since `icf-emit` never touches this function.
+///
+/// Root cause (Gate-2-adjacent, from `anatomy-counters` token histograms,
+/// not merely inferred): the regression tracks LITERAL DENSITY, the
+/// opposite of what the hypothesis predicted. `dd79_text6` is match-heavy
+/// (1,085,137 matches vs 516,117 literals, 32% literal fraction) and
+/// regressed mildly; `dd79_bin6` is literal-heavy (391,515 matches vs
+/// 4,482,514 literals, 92% literal fraction) and regressed severely. The
+/// uniform-record design's parse-side trade — one `Vec` push per literal
+/// instead of a `litrun` counter bump, and (to stay within the accumulator's
+/// `CAN_BUFFER` bound for an arbitrary literal/match mix) one
+/// `flush_word_unchecked` per record instead of this function's batched-4
+/// `emit_literal_run` — is exactly the cost the mission brief named as "the
+/// experiment's honest trade," and on literal-dominated input it dominates:
+/// MORE total per-record overhead (store + branch + flush) than the nested
+/// loop it replaced saves by being "uniform." So gzippy's existing
+/// Seq/litrun run-length representation (this function) is confirmed, not
+/// merely retained by default — record uniformity is a NET LOSS here, not
+/// an untapped igzip lever.
+///
+/// Reopen trigger: none identified this session. A batched (not per-record)
+/// flush cadence for the uniform-record loop was NOT tried (it would need a
+/// type-aware batch-size cap to stay within `BITBUF_NBITS`, which
+/// reintroduces the literal/match branch this experiment set out to
+/// eliminate, so it is a materially different design, not a tuning knob on
+/// this one) — untested, not this session's finding. The exact falsified
+/// implementation (increment 1, `IcfRec`/`Sink::icf_records`/
+/// `emit_records_icf`/`emit_block_icf`/`emit_block_static_or_stored_icf`,
+/// Cargo feature `icf-emit`) is preserved verbatim in commit `522b7d96`
+/// (`git show 522b7d96` on this file) so a future session can rebuild and
+/// re-measure a batched variant without re-deriving the tagged-record
+/// design from scratch.
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
