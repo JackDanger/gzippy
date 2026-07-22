@@ -72,7 +72,14 @@ fn compute_precode_items(lens: &[u8]) -> ([u32; DEFLATE_NUM_PRECODE_SYMS], Vec<u
             }
         } else if (run_end - run_start) >= 4 {
             // Symbol 16: repeat previous nonzero length 3..=6 times.
-            freqs[len as usize] += 1;
+            // SAFETY: `len` is a codeword length (max 14 for litlen, 15 for
+            // offset — both < DEFLATE_NUM_PRECODE_SYMS == 19 ==
+            // freqs.len()); `len as usize` here doubles as its own precode
+            // "literal length" symbol (RFC 1951's precode alphabet uses
+            // symbols 0..=15 for literal lengths verbatim).
+            unsafe {
+                *freqs.get_unchecked_mut(len as usize) += 1;
+            }
             items.push(len as u32);
             run_start += 1;
             loop {
@@ -88,7 +95,10 @@ fn compute_precode_items(lens: &[u8]) -> ([u32; DEFLATE_NUM_PRECODE_SYMS], Vec<u
 
         // Any remaining lengths emitted literally.
         while run_start != run_end {
-            freqs[len as usize] += 1;
+            // SAFETY: same bound as above (`len` is a codeword length <19).
+            unsafe {
+                *freqs.get_unchecked_mut(len as usize) += 1;
+            }
             items.push(len as u32);
             run_start += 1;
         }
@@ -151,9 +161,18 @@ impl DynamicHeader {
     /// lengths. Used by the stored-vs-dynamic decision.
     pub fn header_bits(&self) -> u64 {
         let mut bits = 5 + 5 + 4 + 3 * self.num_explicit_lens as u64;
+        // SAFETY: every `item` was pushed by `compute_precode_items` as
+        // either a literal codeword length (0..=15) or one of the RLE
+        // symbols 16/17/18 OR'd with an extra-bits value shifted left by 5;
+        // `item & 0x1F` recovers exactly that low symbol in all cases, so
+        // it is always `<= 18 < DEFLATE_NUM_PRECODE_SYMS (19)` ==
+        // `precode.lens.len()` == `PRECODE_EXTRA_BITS.len()`.
         for &item in &self.items {
             let sym = (item & 0x1F) as usize;
-            bits += self.precode.lens[sym] as u64 + PRECODE_EXTRA_BITS[sym] as u64;
+            unsafe {
+                bits += *self.precode.lens.get_unchecked(sym) as u64
+                    + *PRECODE_EXTRA_BITS.get_unchecked(sym) as u64;
+            }
         }
         bits
     }
@@ -171,13 +190,21 @@ impl DynamicHeader {
         }
 
         // RLE-encoded litlen + offset codeword lengths.
+        // SAFETY: see `header_bits` — `item & 0x1F` is always `<= 18 <
+        // precode.codewords.len() == precode.lens.len() ==
+        // PRECODE_EXTRA_BITS.len() (19)`.
         for &item in &self.items {
             let sym = (item & 0x1F) as usize;
-            bw.add_bits(
-                self.precode.codewords[sym] as u64,
-                self.precode.lens[sym] as u32,
-            );
-            bw.add_bits((item >> 5) as u64, PRECODE_EXTRA_BITS[sym] as u32);
+            unsafe {
+                bw.add_bits(
+                    *self.precode.codewords.get_unchecked(sym) as u64,
+                    *self.precode.lens.get_unchecked(sym) as u32,
+                );
+                bw.add_bits(
+                    (item >> 5) as u64,
+                    *PRECODE_EXTRA_BITS.get_unchecked(sym) as u32,
+                );
+            }
         }
     }
 }
