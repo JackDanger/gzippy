@@ -29,6 +29,14 @@ use super::tables::{
 };
 
 mod fast;
+// L1-band ratio-close-out config-space search (2026-07-22 campaign, `l1-tune`
+// Cargo feature, OFF by default): re-export `fast::tune` publicly ONLY under
+// the feature so `examples/l1_search.rs` (a separate binary crate depending
+// on this lib through its public API) can call `tune::set`/`get` to sweep
+// configs within one process. `fast` itself stays private in the default
+// build — this re-export is the sole surface the search tool needs.
+#[cfg(feature = "l1-tune")]
+pub use fast::tune;
 mod greedy;
 mod lazy;
 mod near_optimal;
@@ -263,6 +271,13 @@ pub(super) fn compress(
             true,
             fast::LIMIT_HASH_UPDATE_INSERTS_L0,
         ),
+        // `l1-tune` (2026-07-22 L1-band search campaign, OFF by default):
+        // block length and insert-depth are already plain runtime params to
+        // `fast::run`, so overriding them for the search is just swapping
+        // the two consts below for the env-var-backed tune values here — no
+        // change to `fast::run`'s signature needed. Byte-identical to the
+        // `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
+        #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,
             data_start,
@@ -274,6 +289,21 @@ pub(super) fn compress(
             true,
             fast::LIMIT_HASH_UPDATE_INSERTS_L1,
         ),
+        #[cfg(feature = "l1-tune")]
+        Strategy::Fast => {
+            let t = fast::tune::get();
+            fast::run::<false>(
+                buf,
+                data_start,
+                in_end,
+                &statics,
+                bw,
+                is_last,
+                t.block_length,
+                true,
+                t.insert_depth,
+            )
+        }
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw, is_last),
         Strategy::Lazy => lazy::run(
             buf, data_start, in_end, params, &statics, bw, false, is_last,
