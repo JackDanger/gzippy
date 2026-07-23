@@ -31,11 +31,29 @@ use crate::error::GzippyResult;
 ///   T>1 L0–L12  → `PipelinedGzEncoder::compress_buffer_pure` (pure parallel,
 ///                 standard single-member gzip, byte-identical across T)
 pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
+    reader: R,
+    writer: W,
+    args: &GzippyArgs,
+    opt_config: &OptimizationConfig,
+    header_info: &GzipHeaderInfo,
+) -> GzippyResult<u64> {
+    compress_with_pipeline_sized(reader, writer, args, opt_config, header_info, None)
+}
+
+/// Same as [`compress_with_pipeline`] but takes an optional exact-length
+/// `size_hint` (the caller's already-known file/mmap length) so the initial
+/// `Vec::with_capacity` for the whole-input read buffer is sized once up
+/// front instead of growing by doubling inside `read_to_end` and then again
+/// on the immediately-following `resize` that adds `INPLACE_TAIL_PAD`. Pass
+/// `None` when the length is unknown (pipe stdin) — behavior is identical to
+/// the old `Vec::new()` in that case, just funneled through one function.
+pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
     mut reader: R,
     writer: W,
     args: &GzippyArgs,
     opt_config: &OptimizationConfig,
     header_info: &GzipHeaderInfo,
+    size_hint: Option<usize>,
 ) -> GzippyResult<u64> {
     // Explicit zopfli tuning flags (-F iterations / -I no-split / -J split-max)
     // force the true zopfli encoder (the pure-Rust `zopfli_pure` port — NO
@@ -76,7 +94,15 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
                 args.compression_level
             );
         }
-        let mut input = Vec::new();
+        // Pre-size for the known (or hinted) length plus the matchfinder's
+        // trailing pad so neither `read_to_end` nor the following `resize`
+        // needs to grow-and-copy the buffer (was 2 reallocs touching ~2x the
+        // input in bytes — visible in DHAT as the `read_to_end` site).
+        let mut input = Vec::with_capacity(
+            size_hint
+                .map(|s| s + crate::compress::deflate::INPLACE_TAIL_PAD)
+                .unwrap_or(0),
+        );
         reader.read_to_end(&mut input)?;
         let bytes = input.len() as u64;
         // Pad the read buffer in place with the matchfinder's trailing slack so
@@ -111,7 +137,7 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
             opt_config.thread_count,
         );
     }
-    let mut input = Vec::new();
+    let mut input = Vec::with_capacity(size_hint.unwrap_or(0));
     reader.read_to_end(&mut input)?;
     let bytes = input.len() as u64;
     let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
