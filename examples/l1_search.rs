@@ -27,6 +27,12 @@
 //!        interleaved A/B driver — see the campaign report for the harness).
 //!   cargo run --release --features l1-tune --example l1_search -- list
 //!     -> print the config grid (name + knob values) without compressing.
+//!   cargo run --release --features l1-tune --example l1_search -- breadth <cfg1;cfg2;...>
+//!     -> per-file size/ratio/gate table over the ~/www/gzippy-bench/corpus
+//!        breadth files (19+, excluding dd79_text6/dd79_bin6) for each named
+//!        config (';'-separated — spec:k=v,k=v... configs use ',' internally),
+//!        plus a WIN/LOSS flip report vs the FIRST config in the list
+//!        (2026-07-22 hash3+detector composition mission).
 //!
 //! Build: cargo build --release --features l1-tune --example l1_search
 
@@ -111,6 +117,46 @@ struct Corpus {
     group: &'static str,
     label: String,
     data: Vec<u8>,
+}
+
+/// Breadth corpus: every file in `~/www/gzippy-bench/corpus` EXCEPT the
+/// `dd79_text6`/`dd79_bin6` fixtures already covered by `build_corpora`'s
+/// named text/bin groups — the "19+ breadth files" the composition mission
+/// (2026-07-22) requires every candidate be swept against, the same
+/// fixture directory the HASH3-PROBE and CONTENT-ADAPTIVE CHAIN MATCHING
+/// lever reports used for their breadth sweeps.
+fn breadth_corpus_dir() -> PathBuf {
+    PathBuf::from("/Users/jackdanger/www/gzippy-bench/corpus")
+}
+
+fn build_breadth_corpora() -> Vec<Corpus> {
+    let dir = breadth_corpus_dir();
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("l1_search: breadth corpus dir {dir:?} unreadable: {e}");
+            return out;
+        }
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n != "dd79_text6" && n != "dd79_bin6")
+        .collect();
+    names.sort();
+    for name in names {
+        match std::fs::read(dir.join(&name)) {
+            Ok(d) => out.push(Corpus {
+                group: "breadth",
+                label: name,
+                data: d,
+            }),
+            Err(e) => eprintln!("l1_search: breadth file {name} unreadable: {e}"),
+        }
+    }
+    out
 }
 
 /// The REAL fixtures the "13 non-WIN cells" claim was measured against
@@ -231,6 +277,25 @@ fn baseline() -> L1Tune {
         hash3_always_probe: false,
         hash3_max_dist: 4096,
         hash3_insert_always: true,
+        hash3_gated: false,
+        hash3_gate_lit_threshold_pct: 80,
+        hash3_gate_warm_insert: true,
+        hash3_gate_initial_active: true,
+    }
+}
+
+/// The measured-best HASH3-PROBE knobs (bits=15, max_dist=32768,
+/// insert_always=true, miss-only probe) from the 2026-07-22 HASH3-PROBE
+/// lever report — the composition mission's starting point ("compose the
+/// two proven l1-tune levers"), not re-derived here.
+fn hash3_best() -> L1Tune {
+    L1Tune {
+        hash3_enabled: true,
+        hash3_bits: 15,
+        hash3_always_probe: false,
+        hash3_max_dist: 32768,
+        hash3_insert_always: true,
+        ..baseline()
     }
 }
 
@@ -405,6 +470,36 @@ fn named_configs() -> Vec<(String, L1Tune)> {
                     ..base
                 },
             ));
+        }
+    }
+
+    // Axis H: HASH3-GATE composition (2026-07-22 "compose the two proven
+    // l1-tune levers" mission). Layers the CONTENT-ADAPTIVE CHAIN
+    // MATCHING lever's free literal-fraction detector onto the
+    // measured-best HASH3-PROBE knobs (`hash3_best()`), so hash3 only
+    // PROBES on blocks the preceding block's literal fraction flags as
+    // bin-like. Threshold x warm-insert x initial-active grid — the
+    // mission's named open question is exactly whether warm-insert
+    // (keep `head3` populated through a gated-off stretch) beats sparse
+    // gating (cheaper, but cold on re-activation).
+    let h3 = hash3_best();
+    for threshold in [50u32, 65, 80, 90] {
+        for warm_insert in [true, false] {
+            for initial_active in [true, false] {
+                v.push((
+                    format!(
+                        "hash3gate-t{threshold}-w{}-i{}",
+                        warm_insert as u8, initial_active as u8
+                    ),
+                    L1Tune {
+                        hash3_gated: true,
+                        hash3_gate_lit_threshold_pct: threshold,
+                        hash3_gate_warm_insert: warm_insert,
+                        hash3_gate_initial_active: initial_active,
+                        ..h3
+                    },
+                ));
+            }
         }
     }
 
@@ -703,6 +798,126 @@ fn run_wall_percorpus(name: &str, reps: usize) {
     }
 }
 
+/// Breadth accounting for the composition mission (2026-07-22): for each
+/// named config (comma-separated in `names`), compresses every breadth
+/// corpus file and reports size + ratios vs ld1/gzip1/pigz1, PLUS two gate
+/// columns per the mission's "both-column accounting":
+///   - strict: PASS iff size <= ld1*1.05 AND (pigz1 unavailable OR
+///     size <= pigz1*1.05) — every RIVAL L1 encoder, both axes, with the
+///     lever family's usual 1.05 slack.
+///   - family: PASS iff size <= pigz1 (when available) AND size <= gzip1 —
+///     the GNU-gzip-compatible family, no slack, "size <= everyone".
+/// Also classifies each (config, file) as WIN/LOSS/TIE vs pigz-1 (ratio <
+/// 1.0 / > 1.0 / == 1.0, matching the HASH3-PROBE/chain-mode lever
+/// reports' own WIN/LOSS terminology) and, relative to the FIRST config in
+/// `names` (the baseline for comparison), flags any WIN->LOSS or LOSS->WIN
+/// flip — the exact accounting the mission's "avoid regressions" /
+/// "gain the bin flips" bars need.
+fn run_breadth(names: &str) {
+    // Split on ';' (NOT ',') because a `spec:k=v,k=v,...` config's own
+    // key=value pairs are comma-separated — a ',' outer delimiter would
+    // shred a single spec into unparseable fragments.
+    let cfg_names: Vec<&str> = names.split(';').collect();
+    let configs: Vec<(String, L1Tune)> = cfg_names
+        .iter()
+        .map(|n| {
+            let all = named_configs();
+            let cfg = if let Some(spec) = n.strip_prefix("spec:") {
+                parse_spec(spec)
+            } else {
+                all.iter()
+                    .find(|(nm, _)| nm == n)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_else(|| {
+                        eprintln!("l1_search breadth: unknown config '{n}', using baseline");
+                        baseline()
+                    })
+            };
+            (n.to_string(), cfg)
+        })
+        .collect();
+
+    let corpora = build_breadth_corpora();
+    if corpora.is_empty() {
+        eprintln!("l1_search breadth: no breadth corpus files found");
+        std::process::exit(1);
+    }
+    eprintln!("l1_search breadth: {} files", corpora.len());
+
+    let refs: Vec<RefSizes> = corpora.iter().map(|c| ref_sizes(&c.data)).collect();
+
+    // config -> file -> size
+    let mut sizes: Vec<Vec<usize>> = Vec::with_capacity(configs.len());
+    for (_, cfg) in &configs {
+        tune::set(*cfg);
+        sizes.push(
+            corpora
+                .iter()
+                .map(|c| compress_gzip(&c.data, 1).len())
+                .collect(),
+        );
+    }
+
+    println!("config\tfile\tsize\tld1_ratio\tgzip1_ratio\tpigz1_ratio\tstrict\tfamily\tvs_pigz");
+    for (ci, (name, _)) in configs.iter().enumerate() {
+        for (fi, c) in corpora.iter().enumerate() {
+            let sz = sizes[ci][fi];
+            let r = &refs[fi];
+            let ld1_ratio = sz as f64 / r.ld1 as f64;
+            let gzip1_ratio = sz as f64 / r.gzip1 as f64;
+            let pigz1_ratio = r.pigz1.map(|p| sz as f64 / p as f64);
+            let strict = ld1_ratio <= 1.05 && pigz1_ratio.map(|v| v <= 1.05).unwrap_or(true);
+            let family = pigz1_ratio.map(|v| v <= 1.0).unwrap_or(true) && gzip1_ratio <= 1.0;
+            let vs_pigz = match pigz1_ratio {
+                Some(v) if v < 1.0 => "WIN",
+                Some(v) if v > 1.0 => "LOSS",
+                Some(_) => "TIE",
+                None => "NA",
+            };
+            println!(
+                "{name}\t{}\t{sz}\t{ld1_ratio:.4}\t{gzip1_ratio:.4}\t{}\t{}\t{}\t{vs_pigz}",
+                c.label,
+                pigz1_ratio
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or("NA".into()),
+                if strict { "PASS" } else { "FAIL" },
+                if family { "PASS" } else { "FAIL" },
+            );
+        }
+    }
+
+    // Flip accounting: config[0] is the reference baseline.
+    if configs.len() > 1 {
+        eprintln!("\nl1_search breadth: flip accounting vs '{}'", configs[0].0);
+        for (fi, c) in corpora.iter().enumerate() {
+            let r = &refs[fi];
+            let base_pigz = r
+                .pigz1
+                .map(|p| sizes[0][fi] as f64 / p as f64)
+                .unwrap_or(f64::NAN);
+            for ci in 1..configs.len() {
+                let cand_pigz = r
+                    .pigz1
+                    .map(|p| sizes[ci][fi] as f64 / p as f64)
+                    .unwrap_or(f64::NAN);
+                let base_win = base_pigz < 1.0;
+                let cand_win = cand_pigz < 1.0;
+                if base_win != cand_win {
+                    eprintln!(
+                        "  FLIP [{}] {}: {} -> {} (pigz ratio {:.4} -> {:.4})",
+                        configs[ci].0,
+                        c.label,
+                        if base_win { "WIN" } else { "LOSS" },
+                        if cand_win { "WIN" } else { "LOSS" },
+                        base_pigz,
+                        cand_pigz
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn parse_spec(spec: &str) -> L1Tune {
     let mut cfg = baseline();
     for kv in spec.split(',') {
@@ -721,6 +936,10 @@ fn parse_spec(spec: &str) -> L1Tune {
             "hash3always" => cfg.hash3_always_probe = v == "1" || v == "true",
             "hash3maxdist" => cfg.hash3_max_dist = v.parse().unwrap(),
             "hash3insertalways" => cfg.hash3_insert_always = v == "1" || v == "true",
+            "hash3gated" => cfg.hash3_gated = v == "1" || v == "true",
+            "hash3gatethreshold" => cfg.hash3_gate_lit_threshold_pct = v.parse().unwrap(),
+            "hash3gatewarm" => cfg.hash3_gate_warm_insert = v == "1" || v == "true",
+            "hash3gateinit" => cfg.hash3_gate_initial_active = v == "1" || v == "true",
             _ => eprintln!("l1_search: unknown spec key '{k}'"),
         }
     }
@@ -761,6 +980,13 @@ fn main() {
             run_wall_percorpus(&name, reps);
         }
         Some("list") => run_list(),
+        Some("breadth") => {
+            let names = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "baseline".to_string());
+            run_breadth(&names);
+        }
         _ => run_size_search(),
     }
 }
