@@ -121,6 +121,17 @@ pub fn params(level: u32) -> LevelParams {
         // the real 59507B gap; reach saturates by K~=32-48, see
         // ~/www/gzippy-bench/l3_diag/l3_diag_notes.txt §4/§7). Byte-identical
         // to today's shipped L3 (`Strategy::Greedy`) when the feature is off.
+        //
+        // RE-GATED 2026-07-23 under a STRICT-PARETO promotion rule (size
+        // strictly <= current-default on ALL 21 breadth files + 4 fixtures,
+        // zero larger) — FAILED leg (a): ecoli.fastq (+0.3146%) and
+        // weights.safetensors (+0.0378%) regress vs the Greedy default,
+        // reproduced byte-identical on both Apple M1 Pro (arm64) and AMD
+        // EPYC 7282 Zen2 (x86_64, solvency). This is a deterministic,
+        // zero-variance result (compressed size has no run-to-run noise),
+        // so it conclusively blocks promotion regardless of the downstream
+        // wall/rival legs — see the re-gate verdict commit for the full
+        // record. NOT PROMOTED; stays a documented, default-off experiment.
         3 => LevelParams {
             #[cfg(not(feature = "l3-tune"))]
             strategy: Strategy::Greedy,
@@ -234,7 +245,9 @@ mod tests {
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
 
         // L3's strategy flips to Lazy under the `l3-tune` experiment (see
-        // level.rs's level-3 arm); L2/L4 stay Greedy either way.
+        // level.rs's level-3 arm); L2/L4 stay Greedy either way. The
+        // strict-Pareto promotion re-gate (2026-07-23) FAILED leg (a)
+        // (2/21 breadth files regress), so the default stays Greedy.
         assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
         #[cfg(not(feature = "l3-tune"))]
         assert_eq!(params(3).strategy, Strategy::Greedy, "level 3");

@@ -145,6 +145,11 @@ l1-tune = []
 # byte-identical release binary vs feature-off baseline). See
 # `src/compress/deflate/level.rs`'s level-3 arm and
 # ~/www/gzippy-bench/l3_diag/l3_diag_notes.txt (the diagnosis this tests).
+#
+# RE-GATED 2026-07-23 under a strict-Pareto promotion rule (size <= current
+# default on every breadth file, zero larger) — FAILED (ecoli.fastq,
+# weights.safetensors regress), cross-arch-confirmed deterministic, so NOT
+# promoted. Stays default-off, kept for provenance per the l1-tune precedent.
 l3-tune = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
