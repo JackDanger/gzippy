@@ -510,15 +510,14 @@ pub(crate) enum Mode<'c> {
 // scalar's small perf benefit there.
 #[cfg(target_arch = "x86_64")]
 mod simd_dispatch {
-    use std::sync::OnceLock;
-    static AVX: OnceLock<bool> = OnceLock::new();
-
     /// Cached AVX-availability check. When built with `target-feature=+avx`
     /// (this crate's default `.cargo/config.toml` sets `target-cpu=native`,
     /// so this is the common case) this is a compile-time `true` with no
     /// runtime cost; otherwise it's a one-time `is_x86_feature_detected!`
-    /// probe so a portable (non-native-cpu) build still dispatches
-    /// correctly on an AVX-capable host.
+    /// probe (cached in a `OnceLock`, declared only in this branch so a
+    /// native-AVX build doesn't warn about an unused static) so a portable
+    /// (non-native-cpu) build still dispatches correctly on an AVX-capable
+    /// host.
     #[inline]
     pub(super) fn avx_available() -> bool {
         #[cfg(target_feature = "avx")]
@@ -527,6 +526,8 @@ mod simd_dispatch {
         }
         #[cfg(not(target_feature = "avx"))]
         {
+            use std::sync::OnceLock;
+            static AVX: OnceLock<bool> = OnceLock::new();
             *AVX.get_or_init(|| std::is_x86_feature_detected!("avx"))
         }
     }
