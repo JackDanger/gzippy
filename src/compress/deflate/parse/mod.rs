@@ -1024,6 +1024,105 @@ unsafe fn emit_literal_run(
 /// the amortized running-budget check is the only undischarged hypothesis,
 /// and it still needs a real implementation + gate, not another rebuild of
 /// the immediate-flush uniform-record shape already covered above.
+///
+/// FALSIFIED (2026-07-22, AMORTIZED RUNNING BIT-BUDGET FLUSH — the mechanism
+/// the note above named as the one genuinely untried form): built and gated
+/// the exact thing that note specified. `emit_literal_run` took a running
+/// `bits: u32` (bits added to the accumulator since the last flush) in and
+/// out instead of unconditionally flushing every 4 literals; the per-Seq
+/// match emit and the trailing EOB threaded the same counter through
+/// `emit_sequences`, so ONE continuous running total covered the whole block
+/// body (not just literal runs). The flush site became `if bits + next_bits >
+/// RUNNING_FLUSH_BUDGET (= BITBUF_NBITS - 7 = 56) { flush; bits = 0 }`,
+/// checked against the entry's ACTUAL bit width (from the merged-table
+/// lookup already in hand), not a per-group worst case — a real per-symbol
+/// dynamic check, but a data-dependent one (unlike the static per-block
+/// tiers above, which decided a fixed batch size once per block and never
+/// looked at the actual stream). No structural change to the outer per-Seq
+/// loop shape; `emit_sequences`'s final flush stayed unconditional so the
+/// function keeps its prior guarantee of returning freshly drained.
+///
+/// The mechanism's own falsifier — flush-count reduction — fired exactly as
+/// predicted, on both arches (identical counts, confirming the accounting is
+/// arch-independent): `bitstream_flush_word_calls` dropped 2.3x-3.5x (T1, L1
+/// and L6, `dd79_text6`/`dd79_bin6`): text6 L1 1,354,914 -> 436,963 (3.10x);
+/// text6 L6 1,124,807 -> 392,832 (2.86x); bin6 L1 1,658,601 -> 726,219
+/// (2.28x); bin6 L6 2,456,936 -> 712,701 (3.45x) — average bits/flush rose
+/// from ~15-23 to ~48-52, hitting the mission's "~50+ bits/flush" target.
+/// `emit_body_bits` (total bits committed) was IDENTICAL lever vs base in
+/// every cell, confirming flush timing didn't touch bit content, and the
+/// byte-identity gate (L0-12 x p1/p4 x {dd79_text6, dd79_bin6, dickens,
+/// data.parquet}, both x86_64/solvency-AMD-Zen2 and M1/aarch64) passed
+/// 96/96 + 96/96 cells, sha256-verified and roundtrip-verified via system
+/// `gunzip`; full `cargo test --release --lib` (1103 tests) and
+/// `--features anatomy-counters` both green, clippy/fmt clean.
+///
+/// But whole-program cost went UP, not down, on BOTH arches, in every one of
+/// the 4 measured cells — the SAME shape as every prior note in this chain
+/// (aggregate metric improves, real wall gets worse):
+///
+/// - **x86_64/Zen2** (solvency, AMD EPYC 7282, `perf stat -r 15`, `/dev/null`
+///   sink; an A/A rebuild-noise control — two independent from-scratch
+///   builds of the identical unmodified baseline source — produced a
+///   byte-IDENTICAL binary (sha256 match) and a paired-diff ratio of 1.000
+///   (10/21 and 14/21 "wins" — pure coin-flip noise), establishing the noise
+///   floor at effectively 0%, far below every delta reported here):
+///   instructions UP in all 4 cells — `dd79_text6` L1 217.66M -> 219.31M
+///   (+0.76%), L6 776.56M -> 778.47M (+0.25%); `dd79_bin6` L1 283.57M ->
+///   313.94M (+10.7%, the worst cell), L6 689.22M -> 693.78M (+0.66%).
+///   Interleaved paired-diff wall (N=21, alternating lever/base every
+///   iteration, not a sequential per-arm block) tracked the instruction
+///   deltas: `dd79_text6` L1 median ratio 1.054 (2/21 lever-faster), L6
+///   1.038 (1/21); `dd79_bin6` L1 1.042 (2/21), L6 1.016 (5/21) — every cell
+///   regressed beyond the ~0% A/A floor.
+/// - **M1/aarch64** (interleaved paired-diff, N=21, `/dev/null` sink, same
+///   methodology): `dd79_text6` L1 median ratio 1.053 (1/21 lever-faster),
+///   L6 1.014 (1/21); `dd79_bin6` L1 1.049 (1/21), L6 1.031 (3/21) — the
+///   same direction and a similar magnitude to x86_64, confirming this is
+///   NOT an arch-specific artifact.
+///
+/// Root cause (Gate-2-adjacent, from the mechanism's own design, not merely
+/// inferred): the running-budget check trades a smaller number of
+/// unconditional, perfectly-predicted `flush_word_unchecked` calls (the old
+/// groups-of-4 shape, which a branch predictor and the compiler's loop
+/// unroller both handle for free) for a per-literal DATA-DEPENDENT branch
+/// (`bits + nbits > RUNNING_FLUSH_BUDGET`) whose outcome depends on the
+/// actual codeword length of the byte just read — inherently less
+/// predictable than a fixed-modulo counter, and it also breaks the
+/// compiler's ability to unroll the literal loop into a fixed 4-wide
+/// pattern (the loop bound is now `while p < end` over individual bytes,
+/// not `while litrunlen >= 4`). This is the fourth distinct confirmation in
+/// this file that the OOO scheduler already hides the old design's
+/// dependency-chain latency for free, so ANY mechanism that pays a real,
+/// data-dependent per-symbol cost to shrink flush COUNT — whether by
+/// merging codewords (the two SIMD/scalar merge notes), uniformizing the
+/// record shape (ICF), statically widening the batch (the tier notes), or
+/// dynamically widening it via a running compare (this note) — loses to the
+/// simple unconditional fixed-cadence flush already shipped, because flush
+/// count was never the bottleneck; the extra per-symbol branch is.
+///
+/// The functional change (`RUNNING_FLUSH_BUDGET`, the `bits`-threading
+/// signature changes to `emit_literal_run`/`emit_sequences`) was reverted in
+/// full; the emit class's existing permanent counters
+/// (`emit_body_bits`/`bitstream_flush_word_calls`) already covered
+/// everything this attempt needed to self-validate, so nothing new was kept.
+///
+/// **This completes the FALSIFY chain 5-for-5**: per-group static flush
+/// (shipped baseline, the reference every note compares against), per-record
+/// flush (ICF), static per-block worst-case tiers (v1/v2), prefix-sum/SIMD
+/// codeword merges (scalar + AVX2), and now the amortized running bit-budget
+/// compare — every structurally distinct flush-cadence/emit-shape idea this
+/// file's FALSIFY chain identified has been built, gated, and found net
+/// negative on both arches. Reopen trigger: none identified. A future
+/// session should not re-attempt a flush-cadence or emit-shape change on
+/// this function without a NEW mechanism this chain didn't already cover
+/// (e.g. changing the OUTER per-Seq loop's structure itself, which every
+/// note including this one left untouched by design) — re-deriving any of
+/// the five covered forms from scratch is not new information. The exact
+/// diff (the `bits`-threading signature and the `RUNNING_FLUSH_BUDGET`
+/// constant, before revert) is reproduced in full in the commit message of
+/// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
+/// this file).
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
