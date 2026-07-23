@@ -206,6 +206,19 @@ fn run() -> Result<i32, GzippyError> {
         return Ok(0);
     }
 
+    // `--tune <spec>` (l1-tune feature only): apply the L1 matchfinder
+    // config override for every compress call this process makes. Applied
+    // once, up front — matches the "one process, one candidate config" shape
+    // `fulcrum l1search` drives (shells out to an l1-tune-built gzippy per
+    // (config, corpus) pair rather than looping `tune::set` in-process the
+    // way the deleted `examples/l1_search.rs` did).
+    #[cfg(feature = "l1-tune")]
+    if let Some(spec) = &args.tune {
+        let cfg = compress::deflate::parse::tune::parse_spec(spec)
+            .map_err(GzippyError::invalid_argument)?;
+        compress::deflate::parse::tune::set(cfg);
+    }
+
     // --analyze short-circuits the normal compress/decompress flow.
     if let Some(code) = analyze::maybe_run(&args) {
         return Ok(code);

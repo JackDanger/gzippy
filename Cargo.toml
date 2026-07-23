@@ -95,8 +95,16 @@ trace = []  # Enable decode tracing instrumentation
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the
 # parallel-SM decode so `coz run` can measure per-region wall-elasticity
 # (∂wall/∂speed). OFF by default — no fulcrum dep, probes compile to no-ops.
-# Build with `--features pure-rust-inflate,coz` and run the coz_bench example
-# under `coz run`. See examples/coz_bench.rs.
+# Build with `--features pure-rust-inflate,coz`. The in-process drive loop
+# that used to live at `examples/coz_bench.rs` (looping
+# `decompress::parallel::single_member::decompress_parallel` under `coz run`
+# so enough progress-point visits accumulate) was deleted 2026-07-25 as part
+# of the measurement-tooling-boundary migration (gzippy keeps knobs/counters,
+# drivers move to fulcrum or are deleted as superseded) — it served a
+# decode-campaign question that is now settled. Reviving Coz-driven
+# measurement is a fresh fulcrum subcommand using the SAME in-process-gzippy
+# path dependency the macOS `macmeasure` family already uses (fulcrum's
+# `Cargo.toml`), not a resurrection of this file.
 coz = ["dep:fulcrum", "fulcrum/coz"]
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
@@ -110,15 +118,23 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # in the production path" — this module does not exist in a default build.
 anatomy-counters = []
 # L1-band ratio-close-out empirical config-space search (2026-07-22 campaign).
-# Env-var-overridable runtime knobs for the L1 fast-path matchfinder (lazy-peek
-# gate, insert-depth, block length, and a new conditional-2nd-bucket-probe
-# lever) so a local grid search can sweep configs WITHOUT rebuilding per
-# candidate. DEFAULT OFF: with the feature off, every knob resolves to the
-# EXISTING shipped consts at compile time (verified byte-identical release
-# binary vs feature-off baseline) — this module does not exist in a default
-# build, consistent with "NO env vars in the production path". See
-# `src/compress/deflate/parse/fast.rs`'s `tune` submodule and
-# `examples/l1_search.rs`.
+# Runtime-tunable knobs for the L1 fast-path matchfinder (lazy-peek gate,
+# insert-depth, block length, bucket2/chain/hash3 levers) so a local grid
+# search can sweep configs WITHOUT rebuilding per candidate. DEFAULT OFF: with
+# the feature off, every knob resolves to the EXISTING shipped consts at
+# compile time (verified byte-identical release binary vs feature-off
+# baseline) — this module does not exist in a default build, consistent with
+# "NO env vars in the production path". See `src/compress/deflate/parse/
+# fast.rs`'s `tune` submodule (`tune::parse_spec`/`tune::set`/`tune::get`) and
+# the CLI's `--tune key=val,...` flag (`src/cli.rs`, `src/main.rs`) — the
+# sweep-driver channel. The in-process config-space sweep driver that used to
+# live at `examples/l1_search.rs` (corpus generation, the named-config grid,
+# breadth/file/filemt reporting) was ported to `fulcrum l1search` 2026-07-25
+# (measurement-tooling-boundary migration): it shells out to an
+# `l1-tune`-built gzippy with `--tune` per candidate instead of looping
+# `tune::set` in one process. `GZIPPY_L1TUNE_*` env vars (`tune::from_env`)
+# still work for local manual overrides but are no longer the sweep driver's
+# channel.
 l1-tune = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
@@ -174,12 +190,15 @@ rpmalloc-caches = [
 # Test for the "pipeline idle is allocator contention" hypothesis.
 global-rpmalloc = ["dep:rpmalloc"]
 libdeflate = []
-streaming-libdeflate-rs = ["dep:streaming-libdeflate-rs"]
-dynasm = ["dep:dynasm"]
-dynasmrt = ["dep:dynasmrt"]
-# Route C: per-block hand-written x86_64 assembly inflate via dynasm-rs
-# (plans/unified-decoder.md §3.1 / §4.3 / §5.1). x86_64-only for v1.
-route-c-dynasm = ["dynasm", "dynasmrt"]
+# streaming-libdeflate-rs / dynasm / dynasmrt / route-c-dynasm (Route A pure-
+# Rust libdeflate port bake-off + Route C per-block dynasm-emitted x86_64
+# inflate, `plans/unified-decoder.md` §3.1/§4.3/§5.1 — that plans/ file no
+# longer exists) were REMOVED 2026-07-25: their sole consumers were
+# `examples/bench_route_a.rs` and `examples/testbed_silesia.rs`, both deleted
+# as superseded/abandoned explorations (the shipped decode path is the
+# pure-Rust asm-kernel engine in `src/decompress/inflate/`, not either Route).
+# `crates/gzippy-inflate`'s own `route-c-dynasm` feature/modules are a
+# separate, still-standalone concern (unaffected, out of scope here).
 
 [dependencies]
 # Causal profiler probes (optional; pulled ONLY under --features coz, which is
@@ -234,9 +253,6 @@ rpmalloc-sys = { version = "0.2", optional = true }
 # Global rpmalloc allocator — vendor parity test. Gated behind
 # `global-rpmalloc` feature; only activated for the perf experiment.
 rpmalloc = { version = "0.2", optional = true }
-streaming-libdeflate-rs = { version = "0.2", optional = true }
-dynasm = { version = "5", optional = true }
-dynasmrt = { version = "5", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -250,28 +266,17 @@ predicates = "3.0"
 # features (rand-based generation + shrinking); no extra transitive C deps.
 proptest = "1"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
-gzippy-inflate = { path = "crates/gzippy-inflate", features = ["route-c-dynasm"] }
+# gzippy-inflate dev-dependency REMOVED 2026-07-25: its sole consumer was
+# `examples/testbed_silesia.rs` (deleted as a superseded/abandoned Route C
+# dynasm exploration — see the `route-c-dynasm` feature comment above). The
+# `crates/gzippy-inflate` workspace member still builds standalone
+# (`cargo build -p gzippy-inflate`); it is just no longer wired into the root
+# crate's dev-dependency graph.
 # Phase 0.6 spike: iai-callgrind for SIMD-fidelity test.
 # See plans/inner-loop-execution.md Phase 0.6.
 iai-callgrind = "0.13"
 # Phase 1.2 microbench harness.
 criterion = "0.5"
-
-[[example]]
-name = "coz_bench"
-required-features = ["pure-rust-inflate"]
-
-[[example]]
-name = "kernel_ab_aarch64"
-required-features = ["pure-rust-inflate"]
-
-[[example]]
-name = "streaming_thin"
-required-features = ["pure-rust-inflate"]
-
-[[example]]
-name = "l1_search"
-required-features = ["l1-tune"]
 
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
