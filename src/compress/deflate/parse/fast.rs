@@ -138,6 +138,106 @@ impl FastLocalCounters {
     }
 }
 
+/// Env-var-overridable runtime knobs for the L1-band ratio-close-out config-
+/// space search (2026-07-22 campaign; `l1-tune` Cargo feature, OFF by
+/// default). Every field defaults to the EXISTING shipped const (see each
+/// field's paired const below) so a feature-on build with NO env vars set
+/// behaves identically to a feature-off build; `examples/l1_search.rs` sweeps
+/// these via env vars across many process invocations (no rebuild per
+/// candidate — the whole point of threading them as runtime values instead of
+/// consts). Consumed ONLY by [`process_position_l1`]/[`fastloop_l1`]/[`run`]
+/// when `l1-tune` is compiled in; the default build has none of this code.
+#[cfg(feature = "l1-tune")]
+pub mod tune {
+    use std::sync::{OnceLock, RwLock};
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct L1Tune {
+        /// Overrides [`super::LAZY_PEEK_MAX_LEN`].
+        pub lazy_peek_max_len: u32,
+        /// Overrides [`super::LAZY_PEEK_MIN_DIST`].
+        pub lazy_peek_min_dist: usize,
+        /// Overrides [`super::LIMIT_HASH_UPDATE_INSERTS_L1`].
+        pub insert_depth: usize,
+        /// Overrides [`super::FAST_BLOCK_LENGTH`].
+        pub block_length: usize,
+        /// New lever (not in the shipped path): a conditional second-bucket
+        /// probe (`head2`, one generation behind `head`) consulted ONLY when
+        /// the primary probe already produced an ACCEPTED match no longer
+        /// than `bucket2_gate_max_len` — the "short-match acceptance" gate
+        /// named in the L1-band mission brief. Off by default (`false`);
+        /// when on, replaces the accepted match with the second candidate's
+        /// match iff it is both valid and strictly longer.
+        pub bucket2_enabled: bool,
+        /// Gate paired with `bucket2_enabled` (see its doc comment).
+        pub bucket2_gate_max_len: u32,
+    }
+
+    fn env_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    fn env_bool(name: &str, default: bool) -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(default)
+    }
+
+    impl L1Tune {
+        fn from_env() -> Self {
+            L1Tune {
+                lazy_peek_max_len: env_u32(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_MAX_LEN",
+                    super::LAZY_PEEK_MAX_LEN,
+                ),
+                lazy_peek_min_dist: env_usize(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_MIN_DIST",
+                    super::LAZY_PEEK_MIN_DIST,
+                ),
+                insert_depth: env_usize(
+                    "GZIPPY_L1TUNE_INSERT_DEPTH",
+                    super::LIMIT_HASH_UPDATE_INSERTS_L1,
+                ),
+                block_length: env_usize("GZIPPY_L1TUNE_BLOCK_LENGTH", super::FAST_BLOCK_LENGTH),
+                bucket2_enabled: env_bool("GZIPPY_L1TUNE_BUCKET2", false),
+                bucket2_gate_max_len: env_u32("GZIPPY_L1TUNE_BUCKET2_GATE_MAX_LEN", 8),
+            }
+        }
+    }
+
+    fn cell() -> &'static RwLock<L1Tune> {
+        static CELL: OnceLock<RwLock<L1Tune>> = OnceLock::new();
+        CELL.get_or_init(|| RwLock::new(L1Tune::from_env()))
+    }
+
+    /// Current tune parameters (env-var defaults unless overridden by
+    /// [`set`] in this process). `L1Tune` is `Copy`, so this is cheap: one
+    /// `RwLock::read` + a struct copy, called once per `run()` call (not per
+    /// position).
+    pub fn get() -> L1Tune {
+        *cell().read().unwrap()
+    }
+
+    /// Override the tune parameters for every subsequent `run()` call in
+    /// THIS process. Search-only API: `examples/l1_search.rs` sweeps configs
+    /// by calling this between candidates — one process, no rebuild and no
+    /// respawn per candidate (the env-var path alone can't do this: it is
+    /// read once and cached, by design, so a single process can't change it
+    /// via `std::env::set_var` after the first `get()`).
+    pub fn set(t: L1Tune) {
+        *cell().write().unwrap() = t;
+    }
+}
+
 /// Log2 of the head-table size. igzip's level-0 hash table is
 /// `IGZIP_LVL0_HASH_SIZE = 8 * 1024 = 1 << 13` (`igzip_lib.h:121-125`); we widen
 /// it to `1 << 16` (64K) because the finder is single-probe — a wider table
@@ -325,6 +425,40 @@ pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 /// which gave up ~20%+ on text).
 pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 
+/// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
+/// (2026-07-22 campaign): a conditional second-bucket probe. `head2[h]` holds
+/// the position ONE GENERATION behind `head[h]` (see the `cand2` capture at
+/// the top of [`process_position_l1`]); this helper is consulted ONLY when
+/// the primary probe already produced an ACCEPTED match no longer than
+/// `tune.bucket2_gate_max_len` (the "short-match acceptance" gate — never on
+/// every position, which is the always-2-bucket shape the mission brief
+/// measured too costly). Returns `(length, dist)` upgraded to the second
+/// candidate's match iff it is both a valid, in-window distance AND strictly
+/// longer than the primary; otherwise returns the inputs unchanged. Does not
+/// exist in the shipped path (`l1-tune` is a non-default Cargo feature).
+#[cfg(feature = "l1-tune")]
+#[inline(always)]
+fn bucket2_upgrade(
+    pos: usize,
+    buf: &[u8],
+    cand2: u32,
+    length: u32,
+    dist: usize,
+    tune: tune::L1Tune,
+) -> (u32, usize) {
+    if !tune.bucket2_enabled || length > tune.bucket2_gate_max_len {
+        return (length, dist);
+    }
+    let dist2 = pos.wrapping_sub(cand2 as usize);
+    if (1..=WINDOW).contains(&dist2) {
+        let length2 = lz_extend(buf, pos, cand2 as usize, 0, DEFLATE_MAX_MATCH_LEN);
+        if length2 >= SHORTEST_MATCH && length2 > length {
+            return (length2, dist2);
+        }
+    }
+    (length, dist)
+}
+
 /// Process ONE L1 position given its hash `h` and an ALREADY-LOADED candidate
 /// `cand` (the caller is responsible for having read `head[h]` — this
 /// function never re-reads it, only writes the insert). Returns the new
@@ -363,6 +497,8 @@ fn process_position_l1(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
+    #[cfg(feature = "l1-tune")] head2: &mut [u32],
+    #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
     unsafe { *head.get_unchecked_mut(h) = pos as u32 };
@@ -373,6 +509,22 @@ fn process_position_l1(
     // per-call bumps out of the hottest inlined body trims two field writes
     // from the common (miss/too-short) path without losing any count.
 
+    // `l1-tune` bucket2 lever (search-only, OFF the shipped path): `head2`
+    // holds the position ONE GENERATION behind `head` per hash slot. Read the
+    // current occupant (the candidate a bucket2 probe would consult) then
+    // shift `cand` — the value `head[h]` is about to be overwritten WITH —
+    // down into `head2[h]`, keeping the one-generation-behind invariant.
+    // Zero cost when the feature is off (the whole binding doesn't exist).
+    #[cfg(feature = "l1-tune")]
+    let cand2 = if tune.bucket2_enabled {
+        // SAFETY: `h < HASH_SIZE == head2.len()`.
+        let c2 = unsafe { *head2.get_unchecked(h) };
+        unsafe { *head2.get_unchecked_mut(h) = cand };
+        c2
+    } else {
+        NO_POS
+    };
+
     // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
     // the window range instead of panicking on underflow.
     let dist = pos.wrapping_sub(cand as usize);
@@ -382,11 +534,26 @@ fn process_position_l1(
         // candidate simply yields length < SHORTEST_MATCH -> literal.
         let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
         if length >= SHORTEST_MATCH {
+            // `l1-tune` bucket2 upgrade (search-only lever (b) from the
+            // L1-band mission brief): consult the SECOND candidate ONLY on a
+            // short-match ACCEPTANCE (this `if` is already gated on
+            // `length >= SHORTEST_MATCH`), never on every position (that is
+            // the always-2-bucket approach the mission brief says was
+            // measured too costly). Shadows `length`/`dist` with the
+            // upgraded pair when bucket2 finds something longer; a no-op
+            // (returns the inputs unchanged) when the feature is off, the
+            // lever is disabled, or the gate/candidate doesn't pay off.
+            #[cfg(feature = "l1-tune")]
+            let (length, dist) = bucket2_upgrade(pos, buf, cand2, length, dist, tune);
             // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
             // short accepted matches only, so this branch is rare (most
             // matches are longer, or the position is a miss and never
             // reaches here).
-            if length <= LAZY_PEEK_MAX_LEN && dist > LAZY_PEEK_MIN_DIST {
+            #[cfg(not(feature = "l1-tune"))]
+            let (peek_max_len, peek_min_dist) = (LAZY_PEEK_MAX_LEN, LAZY_PEEK_MIN_DIST);
+            #[cfg(feature = "l1-tune")]
+            let (peek_max_len, peek_min_dist) = (tune.lazy_peek_max_len, tune.lazy_peek_min_dist);
+            if length <= peek_max_len && dist > peek_min_dist {
                 #[cfg(feature = "anatomy-counters")]
                 {
                     local.lazy_peek_events += 1;
@@ -667,6 +834,8 @@ fn fastloop_l1(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
+    #[cfg(feature = "l1-tune")] head2: &mut [u32],
+    #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline: warm the head-table line for the
@@ -731,6 +900,10 @@ fn fastloop_l1(
                 limit_hash_update_inserts,
                 #[cfg(feature = "anatomy-counters")]
                 local,
+                #[cfg(feature = "l1-tune")]
+                head2,
+                #[cfg(feature = "l1-tune")]
+                tune,
             );
             #[cfg(feature = "anatomy-counters")]
             {
@@ -762,6 +935,10 @@ fn fastloop_l1(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     local,
+                    #[cfg(feature = "l1-tune")]
+                    head2,
+                    #[cfg(feature = "l1-tune")]
+                    tune,
                 );
                 #[cfg(feature = "anatomy-counters")]
                 {
@@ -806,6 +983,10 @@ fn fastloop_l1(
             limit_hash_update_inserts,
             #[cfg(feature = "anatomy-counters")]
             local,
+            #[cfg(feature = "l1-tune")]
+            head2,
+            #[cfg(feature = "l1-tune")]
+            tune,
         );
         #[cfg(feature = "anatomy-counters")]
         {
@@ -854,6 +1035,21 @@ pub(super) fn run<const ACCEL: bool>(
     // Chainless head table: one slot per hash, holding the most recent position.
     let mut head = vec![NO_POS; HASH_SIZE];
     let base = buf.as_ptr();
+
+    // `l1-tune` bucket2 lever's second table (search-only; see `tune`'s doc
+    // comment). `ACCEL` is a const generic so `if !ACCEL` folds away at each
+    // monomorphization: L0's (`ACCEL == true`) instantiation never allocates
+    // this (empty `Vec`, zero cost), matching how `fastloop_l0` never
+    // receives it. `tune::get()` reads env vars ONCE per `run()` call (cached
+    // after the first call via its own `OnceLock`).
+    #[cfg(feature = "l1-tune")]
+    let mut head2: Vec<u32> = if !ACCEL {
+        vec![NO_POS; HASH_SIZE]
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "l1-tune")]
+    let l1_tune = tune::get();
 
     // One accumulator for the WHOLE `run()` call (every internal block this
     // call emits), flushed once at the end — see `FastLocalCounters`'s doc
@@ -937,6 +1133,10 @@ pub(super) fn run<const ACCEL: bool>(
                 limit_hash_update_inserts,
                 #[cfg(feature = "anatomy-counters")]
                 &mut local,
+                #[cfg(feature = "l1-tune")]
+                &mut head2,
+                #[cfg(feature = "l1-tune")]
+                l1_tune,
             )
         };
 

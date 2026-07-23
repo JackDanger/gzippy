@@ -109,6 +109,17 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # var gates behavior (measurement-output only), consistent with "NO env vars
 # in the production path" — this module does not exist in a default build.
 anatomy-counters = []
+# L1-band ratio-close-out empirical config-space search (2026-07-22 campaign).
+# Env-var-overridable runtime knobs for the L1 fast-path matchfinder (lazy-peek
+# gate, insert-depth, block length, and a new conditional-2nd-bucket-probe
+# lever) so a local grid search can sweep configs WITHOUT rebuilding per
+# candidate. DEFAULT OFF: with the feature off, every knob resolves to the
+# EXISTING shipped consts at compile time (verified byte-identical release
+# binary vs feature-off baseline) — this module does not exist in a default
+# build, consistent with "NO env vars in the production path". See
+# `src/compress/deflate/parse/fast.rs`'s `tune` submodule and
+# `examples/l1_search.rs`.
+l1-tune = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);
@@ -257,6 +268,10 @@ required-features = ["pure-rust-inflate"]
 [[example]]
 name = "streaming_thin"
 required-features = ["pure-rust-inflate"]
+
+[[example]]
+name = "l1_search"
+required-features = ["l1-tune"]
 
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
