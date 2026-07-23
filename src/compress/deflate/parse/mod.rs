@@ -37,6 +37,16 @@ mod fast;
 // build — this re-export is the sole surface the search tool needs.
 #[cfg(feature = "l1-tune")]
 pub use fast::tune;
+/// DETECTOR-GATED LAZY-L3 (2026-07-23 mission, `l3-tune` feature): composes
+/// `greedy`/`lazy`'s extracted per-block loops under a two-sided
+/// content-detector gate. See `gated.rs`'s module doc comment. Unlike
+/// `fast::tune` (re-exported publicly above for `--tune` CLI / `l1search`
+/// use), `gated::tune` has no CLI/external-sweep-driver channel wired up yet
+/// — env vars (`GZIPPY_L3TUNE_GATE_*`) are the only sweep surface this
+/// session built; a `--tune`-style channel + `fulcrum l3search` are a real,
+/// named, un-taken next step (mirror `fast::tune::parse_spec`'s precedent)
+/// if this composition needs further search.
+mod gated;
 mod greedy;
 mod lazy;
 mod near_optimal;
@@ -309,6 +319,10 @@ pub(super) fn compress(
             buf, data_start, in_end, params, &statics, bw, false, is_last,
         ),
         Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true, is_last),
+        // DETECTOR-GATED LAZY-L3 (`l3-tune` feature): see `gated.rs`'s module
+        // doc comment. `level.rs`'s L3 arm is the only producer of this
+        // strategy; not reachable from a default (non-`l3-tune`) build.
+        Strategy::LazyGated => gated::run(buf, data_start, in_end, params, &statics, bw, is_last),
         Strategy::NearOptimal => {
             near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
         }

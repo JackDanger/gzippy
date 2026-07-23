@@ -41,6 +41,13 @@ pub enum Strategy {
     Lazy,
     /// Lazy2 parse: look ahead two positions.
     Lazy2,
+    /// DETECTOR-GATED LAZY-L3 (`l3-tune` feature, 2026-07-23 mission): per-block
+    /// GREEDY-vs-LAZY dispatch under a two-sided content detector — see
+    /// `parse::gated`'s module doc comment. Only ever produced by this
+    /// module's level-3 arm under `l3-tune`; a default build never selects
+    /// it (dead code path there, kept exhaustive-match-compatible).
+    #[cfg_attr(not(feature = "l3-tune"), allow(dead_code))]
+    LazyGated,
     /// Near-optimal parse: bt matchfinder + iterative min-cost-path DP (L10-12).
     NearOptimal,
 }
@@ -131,12 +138,39 @@ pub fn params(level: u32) -> LevelParams {
         // zero-variance result (compressed size has no run-to-run noise),
         // so it conclusively blocks promotion regardless of the downstream
         // wall/rival legs — see the re-gate verdict commit for the full
-        // record. NOT PROMOTED; stays a documented, default-off experiment.
+        // record. The plain-lazy config is NOT PROMOTED.
+        //
+        // DETECTOR-GATED LAZY-L3 (2026-07-23, `l3-tune`, same feature):
+        // the re-gate's own failure named its next configuration —
+        // content-detector-gate the lazy dispatch per block (the hash3-gate
+        // precedent, `parse::gated`) so ecoli/weights-class blocks keep
+        // GREEDY while everything else gets LAZY. L3's arm now selects
+        // `Strategy::LazyGated` (-> `parse::gated::run`) instead of plain
+        // `Strategy::Lazy` under `l3-tune`; plain lazy is still fully
+        // reproducible through the SAME entry point via
+        // `gated::tune::L3GateTune::enabled = false` (the sweep's control
+        // arm — see `gated.rs`'s doc comment). Byte-identical to today's
+        // shipped L3 (`Strategy::Greedy`) when `l3-tune` is off.
+        //
+        // VERDICT (2026-07-23, see [`super::parse::gated::L3_GATE_ENABLED`]'s
+        // doc comment for the full numbers): SIZE leg CLEARS — 21/21 strict
+        // Pareto on the 21-file breadth corpus at T1/T4/T16, INCLUDING the
+        // two files (`ecoli.fastq`, `weights.safetensors`) that blocked the
+        // plain-lazy re-gate above. WALL leg FAILS — the pre-registered
+        // `self-tax <= +10%` bar is missed by several stays-LAZY middle-band
+        // files (`aozora.txt` +25%, `dd79_bin6` +13%, `dickens` +11%, local
+        // M1 N>=21 `hyperfine`), traced to `Strategy::Lazy`'s OWN inherent
+        // per-position lookahead cost (a control run with the gate DISABLED
+        // shows the SAME tax, so the detector/dispatch machinery itself is
+        // not the cost). NOT PROMOTED, same disposition as the plain-lazy
+        // re-gate above — `l3-tune` stays default-off; the full frozen
+        // solvency gate was correctly not run (mission's own "any leg fails
+        // -> keep default, record" escape hatch).
         3 => LevelParams {
             #[cfg(not(feature = "l3-tune"))]
             strategy: Strategy::Greedy,
             #[cfg(feature = "l3-tune")]
-            strategy: Strategy::Lazy,
+            strategy: Strategy::LazyGated,
             max_search_depth: 12,
             nice_match_length: 14,
             near_optimal: NONE_NO,
@@ -244,15 +278,17 @@ mod tests {
         assert_eq!(params(0).strategy, Strategy::Fast0);
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
 
-        // L3's strategy flips to Lazy under the `l3-tune` experiment (see
-        // level.rs's level-3 arm); L2/L4 stay Greedy either way. The
-        // strict-Pareto promotion re-gate (2026-07-23) FAILED leg (a)
-        // (2/21 breadth files regress), so the default stays Greedy.
+        // L3's strategy flips to LazyGated under the `l3-tune` experiment
+        // (see level.rs's level-3 arm); L2/L4 stay Greedy either way. Plain
+        // Lazy's strict-Pareto promotion re-gate (2026-07-23) FAILED leg (a)
+        // (2/21 breadth files regress), so the default stays Greedy; the
+        // DETECTOR-GATED composition (`parse::gated`) is the re-gate's named
+        // next configuration.
         assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
         #[cfg(not(feature = "l3-tune"))]
         assert_eq!(params(3).strategy, Strategy::Greedy, "level 3");
         #[cfg(feature = "l3-tune")]
-        assert_eq!(params(3).strategy, Strategy::Lazy, "level 3 (l3-tune)");
+        assert_eq!(params(3).strategy, Strategy::LazyGated, "level 3 (l3-tune)");
         assert_eq!(params(4).strategy, Strategy::Greedy, "level 4");
         for l in 5..=7 {
             assert_eq!(params(l).strategy, Strategy::Lazy, "level {l}");
