@@ -708,6 +708,17 @@ mod tests {
                             hash3_always_probe: always_probe,
                             hash3_max_dist: max_dist,
                             hash3_insert_always: insert_always,
+                            // Explicit `false`: this test targets the
+                            // HASH3-PROBE lever in isolation across its own
+                            // axes (bits/policy/insert/max_dist). Since the
+                            // 2026-07-22 ship promotion, `base` (the
+                            // process default) now has `hash3_gated: true`
+                            // — leaving the gate on here would make most
+                            // combinations exercise the GATED composition
+                            // instead (covered separately by
+                            // `hash3_gate_roundtrip_adversarial` below),
+                            // silently narrowing this test's own coverage.
+                            hash3_gated: false,
                             ..base
                         });
                         let tag = format!(
@@ -1012,16 +1023,38 @@ mod tests {
             // (3) Lever-1 target: fast-L1 must be no larger than pigz -1 on the
             // TEXT corpus — the cell the lever set out to close (widening the
             // single-probe hash 8K->64K flips text from ~1.007x to ~0.97x pigz).
-            // Checked only when pigz is on PATH. Binary and silesia are RECORDED
-            // (eprintln above) but NOT asserted: the chainless single-probe
-            // finder is ~1% over pigz's short-hash-chain greedy on binary data —
-            // a characterized floor that needs chain depth (out of Lever-1
-            // scope) to close, and bin's actual open cell is orchestration.
+            // Checked only when pigz is on PATH. Silesia is RECORDED (eprintln
+            // above) but NOT asserted (mixed content, no single guaranteed
+            // relation to pigz-1 across offsets).
+            //
+            // TIGHTENED 2026-07-22 (HASH3-GATE promotion to the L1 default,
+            // commit `7f735755`): the composed HASH3-PROBE + literal-fraction
+            // GATE lever closes the chainless-vs-pigz binary gap that used to
+            // sit here un-asserted (~4% baseline on the real `dd79_bin6`
+            // breadth corpus, see `L1_HASH3_BITS`'s doc comment) — pigz-1 is
+            // now a real bound on binary content too, not just text. This
+            // generated `binary_corpus` fixture is a different byte
+            // distribution from the real breadth file the lever was measured
+            // against (it does not literally SURPASS pigz-1 here, unlike the
+            // real corpus) but the composed lever brings it to within ~0.3%,
+            // down from a ~4% pre-lever deficit — asserted at a tight 1.01x
+            // ceiling (not the strict `<=` the TEXT class gets) so this guard
+            // still catches a real regression of the gate/probe lever without
+            // over-claiming a bound this particular synthetic generator
+            // doesn't quite cross.
             if let Some(p) = pigz1 {
                 if label.contains("text") && ours > p {
                     failures.push(format!(
                         "[{label}] fastL1={ours} > pigz-1={p} ({:.3}x) — TEXT ratio \
                          target regressed",
+                        ours as f64 / p as f64
+                    ));
+                }
+                if label.contains("binary") && (ours as f64) > (p as f64) * 1.01 {
+                    failures.push(format!(
+                        "[{label}] fastL1={ours} > pigz-1*1.01={:.0} ({:.3}x) — the \
+                         HASH3-GATE composed-lever binary ratio target regressed",
+                        p as f64 * 1.01,
                         ours as f64 / p as f64
                     ));
                 }
