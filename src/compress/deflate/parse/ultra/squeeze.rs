@@ -467,6 +467,278 @@ pub(crate) enum Mode<'c> {
     Replay(&'c mut LzCache),
 }
 
+// ── SIMD DP-relax (port of ECT PR #146's vectorized min-relax) ─────────────
+//
+// ECT (Efficient-Compression-Tool) PR #146
+// (github.com/fhanau/Efficient-Compression-Tool/pull/146,
+// `src/zopfli/squeeze.c` `GetBestLengths2`) vectorizes exactly the
+// relaxation `get_best_lengths` performs below: for a match candidate
+// `(len, dist)`, every `curr` in `[curr, len]` gets
+// `cost = price2 + litlentable[curr]; if cost < costs[j+curr] { costs[j+curr]
+// = cost; length_array[j+curr] = curr | (dist<<9) }`. That is an elementwise
+// vector-min over `costs` plus a masked-select over `length_array` on
+// whichever lanes improved. min/select don't care what order lanes are
+// visited in, so vectorizing this is BYTE-IDENTICAL to the scalar loop it
+// replaces — verified below by the corpus differential + zopfli fixtures.
+//
+// NOTE ON FIDELITY: the ECT PR's own vectorized code (`squeeze.c` AVX2
+// branch) references an undefined `cmp_mask` and (in the non-SSE4.1 branch)
+// an undefined `old_vlength` — as posted it does not compile. This is a
+// re-derivation of the intended semantics (vector-min the candidate cost
+// against the old cost, derive an "improved" lane mask from that SAME
+// comparison, select `length_array` on that mask) rather than a
+// transliteration of those two broken branches.
+//
+// gzippy keeps the DP relaxation in f64 precision (`litlentable`/`dcost`/
+// `costj` below are all f64; only the `costs[]` STORAGE is f32 — see the
+// doc comment on `get_best_lengths`) for stock-zopfli tie-break parity, so
+// this is a 4-wide f64 AVX loop / 2-wide f64 NEON loop — NOT ECT's 8-wide
+// f32 AVX loop (switching to f32 arithmetic would change output; forbidden
+// per CLAUDE.md).
+//
+// `get_best_lengths`'s scalar loop additionally guards each `curr` with
+// `if costs[j+curr] as f64 > mincostaddcostj` before computing `x` — a
+// redundant-work skip, not a correctness gate: on the branch it would skip,
+// `costs[j+curr] <= mincostaddcostj == mincost + costj <= (dcost +
+// litlentable[curr]) + costj == x` (since `mincost` is defined as the min
+// over ALL valid `dcost`/`litlentable` entries), so `x < costs[j+curr]`
+// can never hold there anyway — the guarded branch never fires an update.
+// The vector routines below always compute-and-compare (there is no cheap
+// per-lane early-out), which is therefore provably equivalent; the guard is
+// kept ONLY in the scalar tail (the `< WIDTH` leftover, or non-SIMD
+// targets) where it costs nothing to keep and preserves the original
+// scalar's small perf benefit there.
+#[cfg(target_arch = "x86_64")]
+mod simd_dispatch {
+    /// Cached AVX-availability check. When built with `target-feature=+avx`
+    /// (this crate's default `.cargo/config.toml` sets `target-cpu=native`,
+    /// so this is the common case) this is a compile-time `true` with no
+    /// runtime cost; otherwise it's a one-time `is_x86_feature_detected!`
+    /// probe (cached in a `OnceLock`, declared only in this branch so a
+    /// native-AVX build doesn't warn about an unused static) so a portable
+    /// (non-native-cpu) build still dispatches correctly on an AVX-capable
+    /// host.
+    #[inline]
+    pub(super) fn avx_available() -> bool {
+        #[cfg(target_feature = "avx")]
+        {
+            true
+        }
+        #[cfg(not(target_feature = "avx"))]
+        {
+            use std::sync::OnceLock;
+            static AVX: OnceLock<bool> = OnceLock::new();
+            *AVX.get_or_init(|| std::is_x86_feature_detected!("avx"))
+        }
+    }
+}
+
+/// Relax `costs[j+curr..=j+len]` / `length_array[j+curr..=j+len]` against one
+/// match candidate (`dcost` = `disttable[dist]`, `dist_shifted` = `(dist as
+/// u32) << DIST_SHIFT`), taking SIMD lanes for the bulk of the range where
+/// available and a scalar tail (identical to the pre-vectorization loop
+/// body, guard included) for the remainder. `curr` is threaded through by
+/// mutable reference so the caller's cross-pair state carries forward
+/// exactly as it did before vectorization.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn relax_range(
+    litlentable: &[f64; 259],
+    costs: &mut [f32],
+    length_array: &mut [u32],
+    j: usize,
+    curr: &mut usize,
+    len: usize,
+    dcost: f64,
+    costj: f64,
+    dist_shifted: u32,
+    mincostaddcostj: f64,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd_dispatch::avx_available() {
+            *curr = unsafe {
+                relax_range_avx(
+                    litlentable,
+                    costs,
+                    length_array,
+                    j,
+                    *curr,
+                    len,
+                    dcost,
+                    costj,
+                    dist_shifted,
+                )
+            };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64 — no runtime feature check needed.
+        *curr = unsafe {
+            relax_range_neon(
+                litlentable,
+                costs,
+                length_array,
+                j,
+                *curr,
+                len,
+                dcost,
+                costj,
+                dist_shifted,
+            )
+        };
+    }
+    // Scalar tail: the < WIDTH leftover after a SIMD chunk above, or the
+    // FULL range on targets with no SIMD path here. Byte-identical to the
+    // original (pre-vectorization) loop body, guard included.
+    while *curr <= len {
+        if costs[j + *curr] as f64 > mincostaddcostj {
+            let x = dcost + litlentable[*curr] + costj;
+            if x < costs[j + *curr] as f64 {
+                costs[j + *curr] = x as f32;
+                length_array[j + *curr] = *curr as u32 | dist_shifted;
+            }
+        }
+        *curr += 1;
+    }
+}
+
+/// AVX (not AVX2 — base AVX covers every intrinsic used here) 4-wide f64
+/// relax. `#[target_feature(enable = "avx")]` lets this compile
+/// unconditionally (regardless of the crate's baseline target-features);
+/// callers gate on [`simd_dispatch::avx_available`] before calling.
+///
+/// # Safety
+/// Caller must ensure AVX is available on the current CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn relax_range_avx(
+    litlentable: &[f64; 259],
+    costs: &mut [f32],
+    length_array: &mut [u32],
+    j: usize,
+    mut curr: usize,
+    len: usize,
+    dcost: f64,
+    costj: f64,
+    dist_shifted: u32,
+) -> usize {
+    use std::arch::x86_64::*;
+    const WIDTH: usize = 4;
+
+    let dcost_v = _mm256_set1_pd(dcost);
+    let costj_v = _mm256_set1_pd(costj);
+
+    // Tightest correct bound: only enter the SIMD body when a FULL WIDTH
+    // chunk fits inside [curr, len] (inclusive) — `curr + WIDTH - 1 <= len`.
+    // (ECT's own AVX loop uses the looser `curr + 8 < len`, leaving an extra
+    // trailing element to the scalar tail every time; this bound vectorizes
+    // strictly more of the range without changing any computed value — see
+    // the module doc for why the SIMD/scalar split point can't affect
+    // output.)
+    while curr + WIDTH - 1 <= len {
+        let base = j + curr;
+
+        let lit_v = _mm256_loadu_pd(litlentable.as_ptr().add(curr));
+        // (dcost + litlentable[curr]) + costj — same left-to-right f64
+        // addition order as the scalar `dcost + litlentable[curr] + costj`
+        // (Rust's `+` is left-associative), so identical per-lane rounding.
+        // NOT ECT's own order (`price2 = price + disttable[dist]` computed
+        // first, i.e. `(costj + dcost) + litlentable[curr]`).
+        let sum1 = _mm256_add_pd(dcost_v, lit_v);
+        let x_v = _mm256_add_pd(sum1, costj_v);
+
+        let old_f32 = _mm_loadu_ps(costs.as_ptr().add(base));
+        let old_v = _mm256_cvtps_pd(old_f32);
+
+        // Strict less-than, ordered/non-signaling — matches scalar `x <
+        // costs[j+curr] as f64` exactly (no NaNs occur here, so the
+        // ordered/unordered distinction is moot; `_CMP_LT_OQ` is the
+        // natural translation of `<`).
+        let cmp = _mm256_cmp_pd(x_v, old_v, _CMP_LT_OQ);
+        let improved_mask = _mm256_movemask_pd(cmp) as u32;
+
+        // MINPD returns the first operand when it is strictly smaller, else
+        // the second — i.e. `min(x, old)` keeps `old` on an exact tie,
+        // matching the scalar's "only update on strict improvement".
+        let min_v = _mm256_min_pd(x_v, old_v);
+        let new_f32 = _mm256_cvtpd_ps(min_v); // round-to-nearest-even, same as `as f32`.
+        _mm_storeu_ps(costs.as_mut_ptr().add(base), new_f32);
+
+        if improved_mask != 0 {
+            for (lane, cell) in length_array[base..base + WIDTH].iter_mut().enumerate() {
+                if improved_mask & (1 << lane) != 0 {
+                    *cell = (curr + lane) as u32 | dist_shifted;
+                }
+            }
+        }
+
+        curr += WIDTH;
+    }
+    curr
+}
+
+/// NEON 2-wide f64 relax (aarch64 baseline — no feature-gate needed, NEON is
+/// mandatory on aarch64).
+///
+/// # Safety
+/// NEON is always available on aarch64; this has no additional preconditions
+/// beyond the slice-bounds contract shared with the scalar loop (the caller
+/// guarantees `j + curr .. j + len` and `curr .. len` are in-bounds for
+/// `costs`/`length_array`/`litlentable`, same as the original scalar code).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn relax_range_neon(
+    litlentable: &[f64; 259],
+    costs: &mut [f32],
+    length_array: &mut [u32],
+    j: usize,
+    mut curr: usize,
+    len: usize,
+    dcost: f64,
+    costj: f64,
+    dist_shifted: u32,
+) -> usize {
+    use std::arch::aarch64::*;
+    const WIDTH: usize = 2;
+
+    let dcost_v = vdupq_n_f64(dcost);
+    let costj_v = vdupq_n_f64(costj);
+
+    while curr + WIDTH - 1 <= len {
+        let base = j + curr;
+
+        let lit_v = vld1q_f64(litlentable.as_ptr().add(curr));
+        // Same left-to-right order as scalar / the AVX path above.
+        let sum1 = vaddq_f64(dcost_v, lit_v);
+        let x_v = vaddq_f64(sum1, costj_v);
+
+        let old_f32 = vld1_f32(costs.as_ptr().add(base));
+        let old_v = vcvt_f64_f32(old_f32);
+
+        // uint64x2_t lane = all-1s where x < old, all-0s otherwise.
+        let cmp = vcltq_f64(x_v, old_v);
+
+        let min_v = vminq_f64(x_v, old_v);
+        let new_f32 = vcvt_f32_f64(min_v); // round-to-nearest-even, same as `as f32`.
+        vst1_f32(costs.as_mut_ptr().add(base), new_f32);
+
+        if vgetq_lane_u64(cmp, 0) != 0 {
+            length_array[base] = curr as u32 | dist_shifted;
+        }
+        if vgetq_lane_u64(cmp, 1) != 0 {
+            length_array[base + 1] = (curr + 1) as u32 | dist_shifted;
+        }
+
+        curr += WIDTH;
+    }
+    curr
+}
+
 /// Length of the run of `in_[i-1]` starting at `i` (distance-1 match), returned
 /// as an absolute end index in `in_`. Used by the `ML_RLE` fast path. Mirrors
 /// ECT's `GetMatch(&in[i], &in[i-1], …)`.
@@ -635,16 +907,18 @@ pub(crate) fn get_best_lengths<C: CostModel>(
                 let dist = scratch[p + 1] as usize;
                 p += 2;
                 let dcost = disttable[dist];
-                while curr <= len {
-                    if (costs[j + curr] as f64) > mincostaddcostj {
-                        let x = dcost + litlentable[curr] + costj;
-                        if x < costs[j + curr] as f64 {
-                            costs[j + curr] = x as f32;
-                            length_array[j + curr] = curr as u32 | ((dist as u32) << DIST_SHIFT);
-                        }
-                    }
-                    curr += 1;
-                }
+                relax_range(
+                    &litlentable,
+                    costs,
+                    length_array,
+                    j,
+                    &mut curr,
+                    len,
+                    dcost,
+                    costj,
+                    (dist as u32) << DIST_SHIFT,
+                    mincostaddcostj,
+                );
             }
         }
 
