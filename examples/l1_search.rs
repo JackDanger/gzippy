@@ -226,6 +226,11 @@ fn baseline() -> L1Tune {
         chain_enabled: false,
         chain_lit_threshold_pct: 80,
         chain_max_search_depth: 16,
+        hash3_enabled: false,
+        hash3_bits: 13,
+        hash3_always_probe: false,
+        hash3_max_dist: 4096,
+        hash3_insert_always: true,
     }
 }
 
@@ -343,6 +348,66 @@ fn named_configs() -> Vec<(String, L1Tune)> {
         }
     }
 
+    // Axis G: HASH3-PROBE (the last unmeasured member of the L1 probe-adding
+    // family — see `tune::L1Tune::hash3_enabled`'s doc comment). Table-size x
+    // max-dist grid at the cheaper "miss-only" probe policy first (policy
+    // (a)), insert_always=true (the cheaper insert policy, tried first).
+    for bits in [12u32, 13, 14, 15] {
+        for max_dist in [256usize, 1024, 4096, 16384, 32768] {
+            v.push((
+                format!("hash3-b{bits}-d{max_dist}"),
+                L1Tune {
+                    hash3_enabled: true,
+                    hash3_bits: bits,
+                    hash3_always_probe: false,
+                    hash3_max_dist: max_dist,
+                    hash3_insert_always: true,
+                    ..base
+                },
+            ));
+        }
+    }
+    // Axis G2: probe-policy x insert-policy grid at a fixed mid-size table
+    // (bits=13) and mid max_dist (4096), to isolate each axis independently
+    // of the table-size sweep above.
+    for always_probe in [false, true] {
+        for insert_always in [true, false] {
+            v.push((
+                format!(
+                    "hash3-policy-probe{}-ins{}",
+                    always_probe as u8, insert_always as u8
+                ),
+                L1Tune {
+                    hash3_enabled: true,
+                    hash3_bits: 13,
+                    hash3_always_probe: always_probe,
+                    hash3_max_dist: 4096,
+                    hash3_insert_always: insert_always,
+                    ..base
+                },
+            ));
+        }
+    }
+    // Hand-picked combined: hash3 (miss-only, insert-always, mid table)
+    // stacked on top of the dominant insert-depth/bucket2 combo above, to
+    // see whether the hash3 lever composes with the rest of the frontier.
+    for depth in [8usize, 16] {
+        for bits in [13u32, 14] {
+            v.push((
+                format!("hand-hash3-depth{depth}-b{bits}"),
+                L1Tune {
+                    insert_depth: depth,
+                    hash3_enabled: true,
+                    hash3_bits: bits,
+                    hash3_always_probe: false,
+                    hash3_max_dist: 4096,
+                    hash3_insert_always: true,
+                    ..base
+                },
+            ));
+        }
+    }
+
     v
 }
 
@@ -451,6 +516,8 @@ fn run_size_search() {
             "block"
         } else if name.starts_with("bucket2") {
             "bucket2"
+        } else if name.starts_with("hash3") {
+            "hash3"
         } else {
             "other"
         }
@@ -649,6 +716,11 @@ fn parse_spec(spec: &str) -> L1Tune {
             "block" => cfg.block_length = v.parse().unwrap(),
             "bucket2" => cfg.bucket2_enabled = v == "1" || v == "true",
             "gate" => cfg.bucket2_gate_max_len = v.parse().unwrap(),
+            "hash3" => cfg.hash3_enabled = v == "1" || v == "true",
+            "hash3bits" => cfg.hash3_bits = v.parse().unwrap(),
+            "hash3always" => cfg.hash3_always_probe = v == "1" || v == "true",
+            "hash3maxdist" => cfg.hash3_max_dist = v.parse().unwrap(),
+            "hash3insertalways" => cfg.hash3_insert_always = v == "1" || v == "true",
             _ => eprintln!("l1_search: unknown spec key '{k}'"),
         }
     }
