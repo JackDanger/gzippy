@@ -148,13 +148,23 @@ impl FastLocalCounters {
 
 /// Env-var-overridable runtime knobs for the L1-band ratio-close-out config-
 /// space search (2026-07-22 campaign; `l1-tune` Cargo feature, OFF by
-/// default). Every field defaults to the EXISTING shipped const (see each
+/// default). Most fields default to the EXISTING shipped const (see each
 /// field's paired const below) so a feature-on build with NO env vars set
-/// behaves identically to a feature-off build; `examples/l1_search.rs` sweeps
-/// these via env vars across many process invocations (no rebuild per
-/// candidate — the whole point of threading them as runtime values instead of
-/// consts). Consumed ONLY by [`process_position_l1`]/[`fastloop_l1`]/[`run`]
-/// when `l1-tune` is compiled in; the default build has none of this code.
+/// behaves identically to a feature-off build for THOSE fields; the
+/// `hash3_*` fields are the one documented EXCEPTION (2026-07-24) — they
+/// default to the measured-best GATED composed config (see `hash3_gate_lit_
+/// threshold_pct`/`hash3_gate_initial_active`'s doc comments), so a
+/// feature-on build with no env override runs that lever by default even
+/// though the feature-off (production) build has no hash3 lever compiled in
+/// at all. This is deliberate: the config is a dev-harness/frozen-ship-gate
+/// candidate, not a production default (see `L1Tune::from_env`'s doc
+/// comment) — promoting it to the actual `Strategy::Fast` default path is a
+/// separate, supervisor-gated decision this change does not make.
+/// `examples/l1_search.rs` sweeps these via env vars across many process
+/// invocations (no rebuild per candidate — the whole point of threading
+/// them as runtime values instead of consts). Consumed ONLY by
+/// [`process_position_l1`]/[`fastloop_l1`]/[`run`] when `l1-tune` is
+/// compiled in; the default build has none of this code.
 #[cfg(feature = "l1-tune")]
 pub mod tune {
     use std::sync::{OnceLock, RwLock};
@@ -359,6 +369,39 @@ pub mod tune {
         /// (same formula as `chain_lit_threshold_pct`, an independent knob
         /// so the two levers' thresholds can be tuned separately even when
         /// composed in the same run).
+        ///
+        /// MEASURED (2026-07-24 targeted micro-sweep, re-opened after the
+        /// 2026-07-22 promotion attempt — commit `4c50ee47` — was reverted
+        /// at `4c50ee47`'s own frozen ship gate: `threshold=50` LOST the
+        /// mission's own named target fixture, `dd79_bin6`, to pigz-1 by
+        /// exactly 0.10% at T1 (4,496,278 vs a local pigz-1 measurement of
+        /// 4,491,283 bytes; the frozen ship-gate box measured pigz-1 at
+        /// 4,491,598 — pigz/box version drift, same ~0.10% gap either way)
+        /// and by MORE at every T>1 (size_ratio 1.0078, see
+        /// [`Self::hash3_gate_initial_active`]'s doc comment for why). The
+        /// prior doc comment's "47-51, all equally good — not a knife-edge"
+        /// claim was measured on the 19-file AGGREGATE breadth set, not
+        /// per-file on the actual named target — `dd79_bin6` on its own
+        /// IS a knife-edge exactly at 50: `examples/l1_search.rs file
+        /// dd79_bin6` shows threshold 49 -> ratio 1.0000 (bare tie),
+        /// 47/48 -> 0.9986 (solid WIN), 50 -> 1.0011 (LOSS), 51 -> 1.0023
+        /// (worse LOSS) — a real 2-point-wide cliff, not a plateau.
+        /// `threshold=48` (2 points below the cliff, not the edge itself)
+        /// combined with [`Self::hash3_gate_initial_active`]`=true` (see
+        /// that field's doc comment — REQUIRED for the T>1 fix) reaches
+        /// `dd79_bin6` WIN at T1 (0.9986) AND T4/T8/T16 (0.9990, identical
+        /// across T>1 since the file bottoms out at the pipeline's one
+        /// 512KB chunk grid regardless of thread count) with ZERO WIN/LOSS
+        /// flips across the full 19-file `~/www/gzippy-bench/corpus`
+        /// breadth set at both T1 and T4 vs the `threshold=50` baseline
+        /// (`examples/l1_search.rs breadth`, both configs run in the same
+        /// process) — `access.log`/`markup.xml`/`minjs.min.js` all stay
+        /// WIN, unflipped, the exact regression `threshold=50` was chosen
+        /// to avoid. At T4 the new config ALSO flips two more breadth
+        /// files LOSS -> WIN that `threshold=50` still lost
+        /// (`armexe.elf` 1.0030 -> 0.9856, `winexe.exe` 1.0061 -> 0.9882) —
+        /// a side effect of the `hash3_gate_initial_active` fix, not this
+        /// field alone.
         pub hash3_gate_lit_threshold_pct: u32,
         /// Insert-under-gating policy, the mission brief's named open
         /// question: `true` keeps `head3` WARM by inserting on every
@@ -384,6 +427,15 @@ pub mod tune {
         /// offsetting ratio benefit here). Verdict: use `false` — the
         /// mission's named open question resolves in favor of the
         /// cheaper policy, not the warm one.
+        ///
+        /// RE-CHECKED (2026-07-24, at the corrected `threshold=48` from
+        /// [`Self::hash3_gate_lit_threshold_pct`]'s doc comment, on
+        /// `dd79_bin6` specifically — the file the original sweep's
+        /// "sub-0.1%, noise level" aggregate verdict was hiding a real
+        /// per-file margin on): `warm_insert=true` gives 4,484,937 bytes
+        /// vs `false`'s 4,485,202 — a 265-byte (0.006%) difference, still
+        /// noise-level, still not worth the extra stores. Verdict
+        /// unchanged: `false`.
         pub hash3_gate_warm_insert: bool,
         /// Starting state (before any block has produced a literal-fraction
         /// signal) for [`Self::hash3_gated`]'s per-block decision — mirrors
@@ -395,14 +447,45 @@ pub mod tune {
         /// `false` treats it as probe-silent (conservative, zero tax on a
         /// file that turns out to be text-like end to end).
         ///
-        /// MEASURED: `false` is the better default — at `threshold=50` it
-        /// is what makes several large text-like breadth files
-        /// (`dickens`, `aozora.txt`, `data.csv`, `ecoli.fastq`) come out
-        /// BYTE-IDENTICAL to the ungated baseline (they never trip 50%
-        /// literal fraction on any later block either, so the only
-        /// possible divergence — the first block — is closed off too);
-        /// `true` costs a few bytes on those same files for no measured
-        /// benefit anywhere in the breadth set.
+        /// MEASURED-THEN-REVERSED (T1 said `false`, 2026-07-22; T>1 says
+        /// `true`, 2026-07-24 — `true` is now the measured-best default;
+        /// see the T1-only story below for why the original call was
+        /// reasonable but incomplete). At T1, `false` looked strictly
+        /// better: at `threshold=50` it is what makes several large
+        /// text-like breadth files (`dickens`, `aozora.txt`, `data.csv`,
+        /// `ecoli.fastq`) come out BYTE-IDENTICAL to the ungated baseline
+        /// (they never trip the literal-fraction threshold on any later
+        /// block either, so the only possible divergence — the first
+        /// block — is closed off too); `true` costs a few bytes on those
+        /// same files for a benefit that, measured ONLY at T1, looked
+        /// negligible.
+        ///
+        /// THE T1-ONLY MEASUREMENT MISSED THE DOMINANT COST: `run()` is
+        /// called ONCE PER FILE at T1 but ONCE PER 512KB CHUNK at T>1
+        /// (`compress::pipelined::compress_parallel_pipeline_pure`'s
+        /// per-block `compress_block_streaming` call, `MAX_PARALLEL_
+        /// BLOCK_SIZE`), and [`Self::hash3_gate_initial_active`]'s "silent
+        /// until the first block's signal is known" cost is paid AT THE
+        /// START OF EVERY CHUNK, not once per file. On `dd79_bin6`
+        /// (6,291,456 bytes / 512KB ≈ 12 chunks at T4+): `false` costs
+        /// ~12x what it cost at T1, which is exactly why the
+        /// (`threshold=50`, `initial_active=false`) config `4c50ee47`
+        /// shipped-then-reverted measured size_ratio 1.0079 at T4/T8/T16
+        /// vs pigz-1 — WORSE than T1's already-losing 1.0011, not
+        /// noise. Flipping to `true` (measured 2026-07-24,
+        /// `examples/l1_search.rs filemt dd79_bin6 <T>` at the corrected
+        /// `threshold=48`): T1 4,485,202 (`false`) -> 4,481,407 (`true`),
+        /// both WIN; T4/T8/T16 4,521,845 (`false`, STILL A LOSS at 1.0068)
+        /// -> 4,486,585 (`true`, WIN at 0.9990) — the T>1 shape is
+        /// entirely closed by this one flip, composed with the
+        /// `threshold` fix. Full 19-file breadth re-check at T4
+        /// (`examples/l1_search.rs filemt <file> 4 ...` per file) shows
+        /// zero WIN -> LOSS flips vs the `threshold=50`/`initial_active=
+        /// false` baseline, and two additional LOSS -> WIN flips
+        /// (`armexe.elf`, `winexe.exe`) that the old config still lost at
+        /// T4. Verdict: `true` — the T1-only "byte-identical text files"
+        /// property was a real but SMALL win that does not survive
+        /// composition with the T>1 chunk-reset cost, which is large.
         pub hash3_gate_initial_active: bool,
     }
 
@@ -426,6 +509,22 @@ pub mod tune {
     }
 
     impl L1Tune {
+        // 2026-07-24: the hash3_* defaults below are the measured-best
+        // GATED composed config from the "close the dd79_bin6 gate-blocker"
+        // micro-sweep (see the doc comments on `hash3_gate_lit_threshold_
+        // pct` and `hash3_gate_initial_active` for the full story + numbers)
+        // — a `l1-tune`-feature build with NO env override now reproduces
+        // this config directly, so the frozen ship gate can be re-run
+        // without a manual `spec:` string. `hash3_enabled`/`hash3_gated`
+        // stay env-overridable (default `true` here, matching every other
+        // field's "this IS the measured-best config" convention) but this
+        // does NOT touch the non-`l1-tune` production default path — see
+        // `Hash3Cfg` in the parent module, which is compiled instead of
+        // this struct when `l1-tune` is off, and still hard-disables the
+        // lever in production. Promoting THIS config to that path is a
+        // separate, supervisor-gated decision (the frozen ship gate that
+        // reverted `4c50ee47`), not implied by changing a dev-harness
+        // default.
         fn from_env() -> Self {
             L1Tune {
                 lazy_peek_max_len: env_u32(
@@ -446,14 +545,14 @@ pub mod tune {
                 chain_enabled: env_bool("GZIPPY_L1TUNE_CHAIN", false),
                 chain_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_CHAIN_THRESHOLD_PCT", 80),
                 chain_max_search_depth: env_u32("GZIPPY_L1TUNE_CHAIN_DEPTH", 16),
-                hash3_enabled: env_bool("GZIPPY_L1TUNE_HASH3", false),
-                hash3_bits: env_u32("GZIPPY_L1TUNE_HASH3_BITS", 13),
+                hash3_enabled: env_bool("GZIPPY_L1TUNE_HASH3", true),
+                hash3_bits: env_u32("GZIPPY_L1TUNE_HASH3_BITS", 15),
                 hash3_always_probe: env_bool("GZIPPY_L1TUNE_HASH3_ALWAYS", false),
-                hash3_max_dist: env_usize("GZIPPY_L1TUNE_HASH3_MAX_DIST", 4096),
+                hash3_max_dist: env_usize("GZIPPY_L1TUNE_HASH3_MAX_DIST", 32768),
                 hash3_insert_always: env_bool("GZIPPY_L1TUNE_HASH3_INSERT_ALWAYS", true),
-                hash3_gated: env_bool("GZIPPY_L1TUNE_HASH3_GATED", false),
-                hash3_gate_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_HASH3_GATE_THRESHOLD_PCT", 80),
-                hash3_gate_warm_insert: env_bool("GZIPPY_L1TUNE_HASH3_GATE_WARM_INSERT", true),
+                hash3_gated: env_bool("GZIPPY_L1TUNE_HASH3_GATED", true),
+                hash3_gate_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_HASH3_GATE_THRESHOLD_PCT", 48),
+                hash3_gate_warm_insert: env_bool("GZIPPY_L1TUNE_HASH3_GATE_WARM_INSERT", false),
                 hash3_gate_initial_active: env_bool(
                     "GZIPPY_L1TUNE_HASH3_GATE_INITIAL_ACTIVE",
                     true,
