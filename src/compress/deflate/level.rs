@@ -166,6 +166,75 @@ pub fn params(level: u32) -> LevelParams {
         // re-gate above — `l3-tune` stays default-off; the full frozen
         // solvency gate was correctly not run (mission's own "any leg fails
         // -> keep default, record" escape hatch).
+        //
+        // RE-GATED AGAIN (2026-07-23, same day): the WALL FAIL above compared
+        // LazyGated's wall against gzippy's OWN Greedy default — a SELF-TAX
+        // PROXY, not the actual product goal. Replaced with a GOAL-DERIVED
+        // cell rule: promote iff LazyGated beats the REAL rivals (pigz-3,
+        // gzip-3) on both size and wall, per cell, frozen on solvency (AMD
+        // EPYC 7282 Zen2, `/root/gz-l3final` @ this commit, llama
+        // SIGSTOP+boost=0 no-orphan freeze, N=15 paired-diff + A/A control
+        // per cell, `/dev/null` sink both arms). Corpus: dd79_text6,
+        // dd79_bin6, sil40 (40 MiB), data.sqlite, ecoli.fastq,
+        // weights.safetensors.
+        //
+        // WALL LEG: PASSES EVERYWHERE — all 30 (file x T x rival) cells show
+        // LazyGated FASTER than both pigz-3 and gzip-3, by a wide,
+        // significant margin (paired ratio 0.39-0.88, i.e. 12-62% faster;
+        // every cell's 95% CI excludes 1.0 and clears the ~1% A/A control
+        // spread). This holds AT EVERY THREAD COUNT (T1/T4/T8/T16 vs pigz-3)
+        // including on `dd79_bin6` (0.55-0.79, 21-45% faster than pigz-3/
+        // gzip-3 at every T). Informational leg vs libdeflate-gzip-3 (a
+        // hand-tuned C library, not a promotion gate): LazyGated is
+        // 16-32% SLOWER at T1 on every file, as expected.
+        //
+        // SIZE LEG: PASSES on 5/6 files with comfortable margins (2.9-17.7%
+        // smaller than pigz-3/gzip-3). FAILS on exactly one cell-class:
+        // `dd79_bin6` is LARGER than BOTH rivals, deterministically,
+        // zero-variance, at every T — T1: 4461735B vs pigz-3's 4441970B
+        // (+0.445%) and gzip-3's 4436422B (+0.571%); T4/T8/T16: 4475979B vs
+        // pigz-3's 4441914B (+0.767%). This is the SAME residual that
+        // motivated the whole L3 lazy campaign (`2c7f9444`: "pigz-3 wins by
+        // 1.339%" under plain Greedy) — LazyGated narrows it (1.339% ->
+        // 0.445-0.767%) but does not close it; `2c7f9444`'s own Gate-0-passed
+        // fulcrum diagnosis already located the remainder as a `match_diff`
+        // parse-quality residual (picking a different/costlier match than an
+        // optimal frontier would), not an accept-vs-defer decision problem
+        // lazy/greedy toggling can fix. vs ld-3 (informational, per the
+        // mission's own leg (b)): LazyGated stays smaller than
+        // libdeflate-gzip-3 on ALL 6 files INCLUDING dd79_bin6 (4461735 <
+        // ld-3's 4500874) — the shipped Greedy default is byte-IDENTICAL to
+        // ld-3 on every file at T1 (a faithful-port confirmation, not a
+        // routing bug), so LazyGated is strictly smaller than "today" on
+        // this leg everywhere.
+        //
+        // Legs (c)/(d)/(e): L2/L4/L6 byte-identical between the Greedy and
+        // LazyGated *builds* (sha256, 3 files x 3 levels, all IDENTICAL).
+        // Roundtrip byte-exact on all 6 files at T1/T4/T8/T16. T4==T16
+        // compressed-output byte-identical on all 6 files (T1 differs, as
+        // expected — single-block vs `ParallelGzEncoder` chunking). Both
+        // feature states: `cargo test --release` green (one pre-existing
+        // `tests::multi_member_chunked::deletion_trap_chunked_pipeline_runs_advances`
+        // parallel-test-isolation flake reproduces IDENTICALLY on the
+        // DEFAULT build too and passes clean under `--test-threads=1`
+        // 1115/0/25 both feature states — a global-atomic test-isolation
+        // artifact unrelated to `l3-tune`, not a regression); clippy clean
+        // both states; fmt clean.
+        //
+        // VERDICT: per the letter of the pre-registered "every cell, size <=
+        // AND wall faster vs pigz-3 AND gzip-3" rule, this is a CONJUNCTIVE
+        // FAIL — `dd79_bin6`'s SIZE sub-leg misses on both rivals at every T
+        // (wall on that SAME file passes by 21-45%). Every other leg, every
+        // other file, and every other cell clears with wide margins. Per the
+        // campaign's own precedent (`992c5837`: a deterministic, zero-
+        // variance size conjunct blocks promotion regardless of downstream
+        // legs), the strict reading is NOT PROMOTED — `l3-tune` stays
+        // default-off. This is the narrowest miss in the L3 campaign (1 of 6
+        // files, 1 of 2 sub-legs, sub-1% margin, against an otherwise
+        // dominant wall win on that exact file) and is flagged for
+        // supervisor adjudication rather than auto-closed; box artifacts
+        // (`/root/gz-l3final`, `/root/l3final/{wall_results,wall_ld_results}.jsonl`)
+        // are kept for a from-record re-decision.
         3 => LevelParams {
             #[cfg(not(feature = "l3-tune"))]
             strategy: Strategy::Greedy,
