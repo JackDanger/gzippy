@@ -49,7 +49,10 @@ use super::super::bitstream::BitWriter;
 use super::super::matchfinder::common::{load_u24, load_u32, lz_extend, lz_hash, prefetch_write};
 #[cfg(feature = "l1-tune")]
 use super::super::matchfinder::hc::HcMatchfinder;
-use super::super::tables::{DEFLATE_FIRST_LEN_SYM, DEFLATE_MAX_MATCH_LEN};
+use super::super::tables::{
+    length_slot, offset_slot, DEFLATE_FIRST_LEN_SYM, DEFLATE_MAX_MATCH_LEN, LENGTH_EXTRA_BITS,
+    OFFSET_EXTRA_BITS,
+};
 use super::NUM_LITERALS;
 use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes};
 
@@ -170,6 +173,17 @@ pub mod tune {
         pub lazy_peek_max_len: u32,
         /// Overrides [`super::LAZY_PEEK_MIN_DIST`].
         pub lazy_peek_min_dist: usize,
+        /// Overrides [`super::LAZY_PEEK_COST_GATE_ENABLED`] — the
+        /// bit-cost-comparison refinement of the lazy-peek accept/defer
+        /// decision (see that const's doc comment for the
+        /// `greedy_over_match` bucket it targets).
+        pub lazy_peek_cost_gate_enabled: bool,
+        /// Overrides [`super::LAZY_PEEK_COST_GATE_MARGIN_BITS`] — slack
+        /// added to the literal side of the standalone-reject comparison
+        /// (see that const's doc comment): a match is rejected only when
+        /// its estimated cost exceeds `literal_bits + margin`, so larger
+        /// values make the gate more conservative (fewer rejections).
+        pub lazy_peek_cost_margin_bits: i32,
         /// Overrides [`super::LIMIT_HASH_UPDATE_INSERTS_L1`].
         pub insert_depth: usize,
         /// Overrides [`super::FAST_BLOCK_LENGTH`].
@@ -530,6 +544,14 @@ pub mod tune {
                     "GZIPPY_L1TUNE_LAZY_PEEK_MIN_DIST",
                     super::LAZY_PEEK_MIN_DIST,
                 ),
+                lazy_peek_cost_gate_enabled: env_bool(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_COST_GATE",
+                    super::LAZY_PEEK_COST_GATE_ENABLED,
+                ),
+                lazy_peek_cost_margin_bits: std::env::var("GZIPPY_L1TUNE_LAZY_PEEK_COST_MARGIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(super::LAZY_PEEK_COST_GATE_MARGIN_BITS),
                 insert_depth: env_usize(
                     "GZIPPY_L1TUNE_INSERT_DEPTH",
                     super::LIMIT_HASH_UPDATE_INSERTS_L1,
@@ -609,6 +631,8 @@ pub mod tune {
         L1Tune {
             lazy_peek_max_len: 4,
             lazy_peek_min_dist: 8192,
+            lazy_peek_cost_gate_enabled: false,
+            lazy_peek_cost_margin_bits: 0,
             insert_depth: 3,
             block_length: 65536,
             bucket2_enabled: false,
@@ -652,6 +676,8 @@ pub mod tune {
             match k {
                 "peekmax" => cfg.lazy_peek_max_len = field(k, v)?,
                 "peekdist" => cfg.lazy_peek_min_dist = field(k, v)?,
+                "peekcost" => cfg.lazy_peek_cost_gate_enabled = v == "1" || v == "true",
+                "peekcostmargin" => cfg.lazy_peek_cost_margin_bits = field(k, v)?,
                 "depth" => cfg.insert_depth = field(k, v)?,
                 "block" => cfg.block_length = field(k, v)?,
                 "bucket2" => cfg.bucket2_enabled = v == "1" || v == "true",
@@ -1170,6 +1196,95 @@ const LAZY_PEEK_MAX_LEN: u32 = 16;
 /// config's wall cost (see the promotion commit message).
 const LAZY_PEEK_MIN_DIST: usize = 0;
 
+/// COST-GATE refinement of the lazy peek (2026-07 campaign, the falsifier
+/// run of the `LAZY_PEEK_MAX_LEN`/`LAZY_PEEK_MIN_DIST` widening above):
+/// `fulcrum ratio map --raw data.sqlite --enc gzippy=... --finder-model
+/// singleton` shows the widened peek leaves a 1,028,294-bit
+/// `greedy_over_match` bucket (428,798 divergence regions) where gzippy
+/// TOOK an accepted match the optimal parse's frontier would rather have
+/// spent as literals — the length-gated `better_match` delta test below
+/// only ever asks "is the NEXT position's candidate clearly better than
+/// this one", never "is THIS match worth taking at all".
+///
+/// FALSIFIED (2026-07-23, same session that added this lever — kept as
+/// tested, documented `l1-tune` infrastructure per this file's own
+/// convention for measured-but-unshipped axes, e.g. `bucket2_enabled`/
+/// `chain_enabled`; `false` here means the default build is BYTE-IDENTICAL
+/// to before this lever existed). Two designs were tried:
+///   - REPLACING the `better_next` test below with a single span-
+///     normalized bits(accept) vs bits(defer) comparison shrinks the
+///     `greedy_over_match` bucket for real (1,028,294 -> 886,965 bits,
+///     -13.7%, `match_diff` does not regress: 1,265,603 -> 1,252,384) but
+///     FLIPS `dd79_bin6` WIN -> LOSS vs `pigz -1` (0.9987 -> 1.0011,
+///     disqualifying — this file is the campaign's own named target for
+///     "must hold").
+///   - The ADDITIVE design actually wired up here (`better_next ||
+///     not_worth_it`, `not_worth_it` a standalone bits(match) vs
+///     bits(length literals) reject, independent of `next`) is SAFE: zero
+///     WIN->LOSS flips vs `pigz -1` across the full 21-file
+///     `~/www/gzippy-bench/corpus` breadth set at `LAZY_PEEK_COST_GATE_
+///     MARGIN_BITS=0` (the widest margin with any effect at all — `>= 4`
+///     is byte-identical to off, `<= -4` re-introduces the `dd79_bin6`
+///     flip). But `fulcrum paired --mode compress` (N=21, /dev/null sink,
+///     clean A/A certificates, sha+roundtrip verified) shows this design
+///     ADDS a real, RESOLVED (not TIE) wall tax ON TOP of the already-
+///     shipped widened-peek/hash3-gate baseline on EVERY fixture tested —
+///     sqlite +5.6%, text6 +4.2%, bin6 +4.6-4.7% (replicated twice), sil40
+///     +3.3% — while the paired, thread-grid-matched size delta is
+///     noise-level and INCONSISTENTLY signed (±0.03-0.19%, unlike the
+///     larger, one-off CLI-only size reads that motivated trying this in
+///     the first place: those used the default auto-detected thread
+///     count, which changes the block grid and is not paired against the
+///     wall numbers). The mission's own wall budget ("tax <= current
+///     +3.8-7.2%, ideally LOWER") is violated in the wrong direction —
+///     this STACKS tax, it does not reduce it — for a size "win" that
+///     does not survive a rigorous same-grid remeasurement. NOT promoted;
+///     `LAZY_PEEK_COST_GATE_ENABLED` stays `false`. Re-open trigger: a
+///     future design that recovers `greedy_over_match` bits WITHOUT
+///     converting an accepted multi-byte match into several individual
+///     per-position literal decisions (the likely wall-cost mechanism —
+///     a batched match-skip becomes N un-batched positions) would need to
+///     re-run this exact `fulcrum paired` protocol before reconsidering.
+const LAZY_PEEK_COST_GATE_ENABLED: bool = false;
+
+/// Slack (in [`est_match_bits`]-scale bits) added to the literal side of the
+/// COST-GATE standalone-reject test: a match is rejected only when
+/// `est_match_bits(length, dist) > EST_LITERAL_BITS * length + margin`.
+/// `0` (strict apples-to-apples) is the swept starting point; a positive
+/// margin trades away some of the `greedy_over_match` recovery for fewer
+/// false-positive rejections on content where the flat literal/fixed-code
+/// estimate is itself imprecise (see [`est_match_bits`]'s doc comment — it
+/// is a static RFC 1951 fixed-code approximation, not the block's real
+/// adaptive dynamic-Huffman cost, so it can be wrong in either direction
+/// near the accept/reject boundary).
+const LAZY_PEEK_COST_GATE_MARGIN_BITS: i32 = 0;
+
+/// Cheap O(1) match bit-cost estimate for the lazy-peek COST-GATE tie-break
+/// (see [`LAZY_PEEK_COST_GATE_ENABLED`]). NOT the real per-block adaptive
+/// cost (`costs.rs`'s `DeflateCosts`/`DEFAULT_LITLEN_COSTS`, built for the
+/// near-optimal parser from actual frequency stats this fast path never
+/// computes) — a flat RFC 1951 §3.2.6 FIXED-Huffman code-length estimate
+/// (length symbols 257-279 => 7 bits, 280-285 => 8 bits; distance symbols
+/// always 5 bits) plus the EXACT extra-bit counts this codebase already
+/// tables (`LENGTH_EXTRA_BITS`/`OFFSET_EXTRA_BITS` + `length_slot`/
+/// `offset_slot`, the same tables `costs.rs` uses for ITS OWN default-cost
+/// bootstrap). Two table lookups and a handful of adds — no new probes, no
+/// allocation, no per-block state.
+#[inline(always)]
+fn est_match_bits(len: u32, dist: usize) -> u32 {
+    let lslot = length_slot(len) as usize;
+    let len_sym_bits = if lslot < 24 { 7 } else { 8 };
+    let dslot = offset_slot(dist as u32) as usize;
+    len_sym_bits + LENGTH_EXTRA_BITS[lslot] as u32 + 5 + OFFSET_EXTRA_BITS[dslot] as u32
+}
+
+/// Flat per-literal bit estimate paired with [`est_match_bits`] — the RFC
+/// 1951 fixed code's common-case rate (symbols 0-143 => 8 bits; the
+/// 144-255 => 9-bit half is not modeled). A slight UNDER-estimate of
+/// average literal cost, which biases the COST-GATE toward keeping matches
+/// rather than over-rejecting them.
+const EST_LITERAL_BITS: u32 = 8;
+
 /// DEFLATE sliding-window size — the largest legal back-reference distance.
 const WINDOW: usize = 32768;
 
@@ -1475,32 +1590,81 @@ fn process_position_l1(
                 local.head_table_reads += 1;
             }
             let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
-            if (1..=WINDOW).contains(&dist1) {
-                let next_len = lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN);
-                if next_len >= length
-                    && 4 * (next_len as i32 - length as i32)
-                        + (bsr32(dist as u32) as i32 - bsr32(dist1 as u32) as i32)
+            // SAFETY/cost: `lz_extend` (the only new work vs the plain
+            // accept path) only runs when `dist1` is a genuine in-window
+            // candidate — same gate as before this refinement, so the
+            // COST-GATE below adds no new probes over the un-gated peek.
+            let next = if (1..=WINDOW).contains(&dist1) {
+                Some((
+                    lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN),
+                    dist1,
+                ))
+            } else {
+                None
+            };
+
+            #[cfg(not(feature = "l1-tune"))]
+            let (cost_gate, cost_margin) =
+                (LAZY_PEEK_COST_GATE_ENABLED, LAZY_PEEK_COST_GATE_MARGIN_BITS);
+            #[cfg(feature = "l1-tune")]
+            let (cost_gate, cost_margin) = (
+                tune.lazy_peek_cost_gate_enabled,
+                tune.lazy_peek_cost_margin_bits,
+            );
+
+            // Original `better_match`-style delta test (see `parse/lazy.rs`'s
+            // `better_match`, threshold 2), UNCHANGED: defer when a
+            // next-position candidate at least as long as the current match
+            // wins the length/distance cost tie-break. Left untouched (not
+            // folded into the cost-gate math below) because it is already
+            // well-tuned for the "genuinely better match one byte later"
+            // case — the cost-gate targets a DIFFERENT, ORTHOGONAL failure
+            // mode (see below) and composes with this as a plain `||`
+            // rather than replacing it, so this comparison's proven
+            // behavior on text6/bin6/sil40 cannot regress from the new
+            // lever alone.
+            let better_next = match next {
+                Some((next_len, next_dist)) if next_len >= length => {
+                    4 * (next_len as i32 - length as i32)
+                        + (bsr32(dist as u32) as i32 - bsr32(next_dist as u32) as i32)
                         > 2
-                {
-                    // Defer: a meaningfully better match starts one
-                    // byte later. Emit `pos` as a literal; the
-                    // caller discovers `pos + 1`'s match fresh
-                    // (including its own head-table insert).
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.lazy_peek_defers += 1;
-                        local.probe_outcome_deferred += 1;
-                    }
-                    // HASH3-PROBE sparse insert policy: `pos` resolves to
-                    // a literal here, so a deferred sparse insert fires
-                    // now (see the top-of-function comment).
-                    if hash3_touch && !hash3.insert_always {
-                        unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
-                    }
-                    // SAFETY: `pos < fast_end <= in_end`.
-                    sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
-                    return pos + 1;
                 }
+                _ => false,
+            };
+
+            // COST-GATE standalone reject (see `LAZY_PEEK_COST_GATE_ENABLED`'s
+            // doc comment for the `greedy_over_match` bucket this targets):
+            // independent of whatever `pos + 1` offers, is the CURRENTLY
+            // ACCEPTED `(length, dist)` match even worth taking at all,
+            // compared to just encoding its own `length` bytes as literals?
+            // A blunt "accept any match at least this short" rule loses
+            // exactly here — a match's own span is the ONLY span in play
+            // (no `next`-length asymmetry to normalize, unlike a
+            // match-vs-match comparison), so this is a plain, symmetric
+            // apples-to-apples bit-cost comparison over the SAME `length`
+            // bytes on both sides.
+            let not_worth_it = cost_gate
+                && est_match_bits(length, dist) as i32
+                    > (EST_LITERAL_BITS * length) as i32 + cost_margin;
+
+            if better_next || not_worth_it {
+                // Defer: emit `pos` as a literal; the caller discovers
+                // `pos + 1`'s match fresh (including its own head-table
+                // insert).
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.lazy_peek_defers += 1;
+                    local.probe_outcome_deferred += 1;
+                }
+                // HASH3-PROBE sparse insert policy: `pos` resolves to
+                // a literal here, so a deferred sparse insert fires
+                // now (see the top-of-function comment).
+                if hash3_touch && !hash3.insert_always {
+                    unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
+                }
+                // SAFETY: `pos < fast_end <= in_end`.
+                sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+                return pos + 1;
             }
         }
 
