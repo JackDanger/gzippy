@@ -136,6 +136,16 @@ anatomy-counters = []
 # still work for local manual overrides but are no longer the sweep driver's
 # channel.
 l1-tune = []
+# L3-STRATEGY experiment (2026-07-23 residual-diagnosis mission): routes L3
+# through the SAME lazy parser used unmodified by L5-7 (`Strategy::Lazy` ->
+# `lazy::run`) instead of `Strategy::Greedy`, with L3's `max_search_depth`/
+# `nice_match_length` knobs UNCHANGED — isolates the accept-vs-defer decision
+# from finder reach. DEFAULT OFF: with the feature off, L3 resolves to the
+# EXISTING shipped `Strategy::Greedy` arm at compile time (verified
+# byte-identical release binary vs feature-off baseline). See
+# `src/compress/deflate/level.rs`'s level-3 arm and
+# ~/www/gzippy-bench/l3_diag/l3_diag_notes.txt (the diagnosis this tests).
+l3-tune = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);
