@@ -664,6 +664,111 @@ mod tests {
         }
     }
 
+    /// HASH3-PROBE lever roundtrip differential (2026-07-22 campaign): the
+    /// last unmeasured member of the L1 probe-adding family — see
+    /// `parse::tune::L1Tune::hash3_enabled`'s doc comment for the full
+    /// mechanism (a genuine 3-byte-key `head3` table making length-3
+    /// matches VISIBLE, unlike the falsified accept-flip which reused the
+    /// 4-byte-hash candidate). Sweeps table size, both probe policies
+    /// (miss-only vs always-probe), and both insert policies (always vs
+    /// literal-only-sparse) across the same adversarial corners
+    /// `chain_mode_roundtrip_adversarial` uses (empty, one byte, all-same,
+    /// incompressible, distant-repeats, and a literal-dense corpus sized to
+    /// exercise multiple 64 KiB blocks) — every combination MUST roundtrip
+    /// byte-for-byte through every available oracle, since this lever
+    /// changes ACCEPT decisions (a new class of match becomes emittable),
+    /// the single place a bit-exact bug would most likely hide.
+    ///
+    /// Test isolation: same `Drop`-guard restore pattern as
+    /// `chain_mode_roundtrip_adversarial` (see that test's doc comment for
+    /// why this is safe against the shared process-global `tune` cell).
+    #[cfg(feature = "l1-tune")]
+    #[test]
+    fn hash3_probe_roundtrip_adversarial() {
+        use crate::compress::deflate::parse::tune::{self, L1Tune};
+
+        struct RestoreTune(L1Tune);
+        impl Drop for RestoreTune {
+            fn drop(&mut self) {
+                tune::set(self.0);
+            }
+        }
+        let _restore = RestoreTune(tune::get());
+
+        let base = tune::get();
+        let literal_dense = binary_corpus(400_000);
+
+        for bits in [12u32, 15] {
+            for always_probe in [false, true] {
+                for insert_always in [true, false] {
+                    for max_dist in [0usize, 4096, 32768] {
+                        tune::set(L1Tune {
+                            hash3_enabled: true,
+                            hash3_bits: bits,
+                            hash3_always_probe: always_probe,
+                            hash3_max_dist: max_dist,
+                            hash3_insert_always: insert_always,
+                            ..base
+                        });
+                        let tag = format!(
+                            "hash3-b{bits}-ap{}-ia{}-d{max_dist}",
+                            always_probe as u8, insert_always as u8
+                        );
+
+                        assert_roundtrips_level(b"", &format!("{tag}-empty"), 1);
+                        assert_roundtrips_level(b"A", &format!("{tag}-one-byte"), 1);
+                        assert_roundtrips_level(b"AB", &format!("{tag}-two-bytes"), 1);
+                        assert_roundtrips_level(b"ABC", &format!("{tag}-three-bytes"), 1);
+                        assert_roundtrips_level(
+                            &vec![b'Z'; 300_000],
+                            &format!("{tag}-all-same"),
+                            1,
+                        );
+                        // Dense 3-byte-periodic repeats: the exact shape a
+                        // genuine hash3 candidate should surface most often
+                        // (a length-3-ish run at a short, then a long,
+                        // distance).
+                        let mut triples = Vec::new();
+                        for i in 0..100_000u32 {
+                            triples.extend_from_slice(&[
+                                (i % 251) as u8,
+                                ((i / 3) % 251) as u8,
+                                ((i * 7) % 251) as u8,
+                            ]);
+                        }
+                        assert_roundtrips_level(&triples, &format!("{tag}-triples"), 1);
+                        let mut incompressible = vec![0u8; 64 * 1024 + 37];
+                        Rng::new(0xC0FFEE ^ bits as u64 ^ max_dist as u64)
+                            .fill(&mut incompressible);
+                        assert_roundtrips_level(
+                            &incompressible,
+                            &format!("{tag}-incompressible"),
+                            1,
+                        );
+                        let pattern: Vec<u8> = (0..400u32)
+                            .map(|i| (i.wrapping_mul(131) ^ 0x5A) as u8)
+                            .collect();
+                        let mut rng = Rng::new(0xD157A17 ^ bits as u64 ^ max_dist as u64);
+                        let mut filler = vec![0u8; 31_000];
+                        rng.fill(&mut filler);
+                        let mut data = Vec::new();
+                        data.extend_from_slice(&pattern);
+                        data.extend_from_slice(&filler);
+                        data.extend_from_slice(&pattern);
+                        data.extend_from_slice(&filler[..5000]);
+                        data.extend_from_slice(&pattern);
+                        assert_roundtrips_level(&data, &format!("{tag}-distant-repeats"), 1);
+
+                        let n =
+                            assert_roundtrips_level(&literal_dense, &format!("{tag}-bindense"), 1);
+                        let expected = if gzip_available() { 3 } else { 2 };
+                        assert_eq!(n, expected, "{tag}: an oracle was silently skipped");
+                    }
+                }
+            }
+        }
+    }
+
     /// gzip-framed size of `data` under libdeflate at `level` (the tighter ratio
     /// reference: `size_fastL1 <= libdeflate -1` is the aspiration, `<= gzip -1`
     /// the hard floor).

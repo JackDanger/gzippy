@@ -46,6 +46,8 @@
 //! not duplicate it.
 
 use super::super::bitstream::BitWriter;
+#[cfg(feature = "l1-tune")]
+use super::super::matchfinder::common::load_u24;
 use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_write};
 #[cfg(feature = "l1-tune")]
 use super::super::matchfinder::hc::HcMatchfinder;
@@ -206,6 +208,96 @@ pub mod tune {
         /// `max_search_depth` passed to `HcMatchfinder::longest_match` for a
         /// chain-mode block (the depth-sweep knob from the mission brief).
         pub chain_max_search_depth: u32,
+        /// HASH3-PROBE lever (2026-07-22 campaign, the last unmeasured
+        /// member of the L1 probe-adding family): a genuine 3-byte-key hash
+        /// table (`head3`, mirrors `matchfinder::hc::HcMatchfinder`'s
+        /// `hash3_tab`) so length-3 matches become VISIBLE to the fast
+        /// path. Distinct from both prior falsified/costly attempts: NOT
+        /// the accept-flip (which reused the existing 4-byte-hash
+        /// candidate and found it is almost never a true length-3 match —
+        /// falsified, see [`super::SHORTEST_MATCH`]'s doc comment) and NOT
+        /// the 2-way-bucket port (`bucket2_enabled` above, still a 4-byte
+        /// key, reverted for wall cost) — this table is keyed on the low 3
+        /// bytes only, so a hit is a REAL length-3 candidate, not a
+        /// coincidental extension of a 4-byte-hash slot. Off by default
+        /// (`false`).
+        ///
+        /// MEASURED (2026-07-22, closes the probe-adding family — the
+        /// mission's own falsifier, both directions, M1 Pro + AMD EPYC
+        /// 7282 cross-arch replicated): unlike every prior member of this
+        /// family, this lever does not merely close PART of the pigz-1
+        /// bin-content edge — at `bits=15, max_dist=32768,
+        /// hash3_insert_always=true` (policy (a), miss-only probe) it
+        /// REVERSES it on the named target (`dd79_bin6`): gzippy-1 goes
+        /// from 1.0438x pigz-1 / 1.0043x libdeflate-1 (baseline) to
+        /// 0.9978x pigz-1 / 0.9600x libdeflate-1 — a real, size-verified
+        /// win against BOTH rivals, not just a partial close. `dd79_text6`
+        /// stays a comfortable pigz-1 win (0.9573x, down from 0.9516x) and
+        /// a real 40 MiB silesia slice IMPROVES (0.9813x, down from
+        /// 0.9922x) — the mission's falsifier ("text6 doesn't regress",
+        /// read as "stays a win vs pigz") holds on both non-bin corpora.
+        /// Confirmed on a REAL 19-file corpus breadth sweep (not just the
+        /// 3 named classes): 3 binary-executable-like files flip
+        /// pigz-1 LOSS -> WIN (`armexe.elf`, `tool.bin`, `winexe.exe`,
+        /// matching the mechanism's target), 1 flips WIN -> LOSS
+        /// (`access.log`), and 2 cross the strict `ld1 * 1.05` gate from
+        /// PASS to FAIL (`markup.xml`, `minjs.min.js`) — honest, real
+        /// regressions this lever causes, not zero-sum.
+        ///
+        /// The cost is real and NOT cheap: +12-28% self-relative L1 wall
+        /// on M1 Pro (bin6 worst, ~23-28%; text6 ~12-16%; sil40 ~20-25%)
+        /// and +22% on AMD EPYC 7282 (bin6) — squarely in the SAME costly
+        /// range as the reverted 2-way-bucket lever (+24-34%), not the
+        /// cheap lazy-peek (+9-15%); the mission's pre-registered "no free
+        /// lunch" prior holds for the SELF-relative comparison. But
+        /// unlike prior levers, the self-relative tax was checked against
+        /// the actual rival's wall, not just gzippy's own baseline:
+        /// gzippy+hash3 remains 1.6-1.9x FASTER than pigz-1's measured
+        /// wall time on every corpus on BOTH arches even after the tax
+        /// (M1 bin6: 54.8ms vs pigz-1's 86.8ms; AMD EPYC bin6: 83.4ms vs
+        /// pigz-1's 141.1ms) — it is slower than libdeflate-1's own wall
+        /// (~1.2-1.3x) but libdeflate-1 is not the mission's named rival
+        /// (pigz-1 is). Reported, not resolved: whether this trade is
+        /// worth shipping is a POLICY call (self-relative-wall-budget vs
+        /// beat-the-actual-rival), not a technical one — this note
+        /// deliberately does not pick a side. See the commit that
+        /// introduced this note for the full sweep tables, per-cell flip
+        /// accounting under both gate policies, and the roundtrip
+        /// differential (`hash3_probe_roundtrip_adversarial`) that
+        /// verifies every policy/table-size combination byte-exact.
+        pub hash3_enabled: bool,
+        /// `log2` size of `head3` (entries, not bytes): sweep 12 (4K) to 15
+        /// (32K), mirroring `matchfinder::hc::HC_HASH3_ORDER` (15/32K) at
+        /// the top of the range.
+        pub hash3_bits: u32,
+        /// Probe policy: `false` (cheapest, the mission brief's policy
+        /// (a)) probes `head3` ONLY when the primary 4-byte probe did not
+        /// already produce an emittable match (miss or too-short); `true`
+        /// (policy (b)) probes `head3` on EVERY position, even one the
+        /// primary probe already accepted, and upgrades to the hash3
+        /// candidate iff it wins the same length/distance cost tie-break
+        /// the lazy peek uses (see `hash3_better`).
+        pub hash3_always_probe: bool,
+        /// Profitability distance gate for an accepted length-EXACTLY-3
+        /// match found via `head3` (both policies apply this): a length-3
+        /// match at a far distance often costs more bits than 3 literals
+        /// (many distance extra-bits paid for 3 covered bytes), so a
+        /// length-3 hash3 candidate is only accepted when `dist <=
+        /// hash3_max_dist`. Length>=4 candidates found via `head3` (the
+        /// narrower key occasionally surfaces a longer match the wider
+        /// 4-byte hash missed, e.g. after a collision eviction) skip this
+        /// gate — unconditionally profitable by the same margin the
+        /// primary accept already uses.
+        pub hash3_max_dist: usize,
+        /// Insert policy: `true` inserts `head3[h3] = pos` unconditionally
+        /// at every position (mirrors the primary `head` table's
+        /// unconditional insert); `false` ("sparse", the mission brief's
+        /// cheaper alternative) inserts ONLY at positions that resolve to
+        /// a plain literal — a match's start position and its
+        /// LIMIT_HASH_UPDATE interior positions are never inserted into
+        /// `head3`, trading candidate density for fewer stores per
+        /// position.
+        pub hash3_insert_always: bool,
     }
 
     fn env_u32(name: &str, default: u32) -> u32 {
@@ -248,6 +340,11 @@ pub mod tune {
                 chain_enabled: env_bool("GZIPPY_L1TUNE_CHAIN", false),
                 chain_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_CHAIN_THRESHOLD_PCT", 80),
                 chain_max_search_depth: env_u32("GZIPPY_L1TUNE_CHAIN_DEPTH", 16),
+                hash3_enabled: env_bool("GZIPPY_L1TUNE_HASH3", false),
+                hash3_bits: env_u32("GZIPPY_L1TUNE_HASH3_BITS", 13),
+                hash3_always_probe: env_bool("GZIPPY_L1TUNE_HASH3_ALWAYS", false),
+                hash3_max_dist: env_usize("GZIPPY_L1TUNE_HASH3_MAX_DIST", 4096),
+                hash3_insert_always: env_bool("GZIPPY_L1TUNE_HASH3_INSERT_ALWAYS", true),
             }
         }
     }
@@ -487,6 +584,16 @@ const ACCEL_MAX_STEP: usize = 8;
 /// of length >= 4 (its hash keys 4 bytes), coding anything shorter as literals.
 const SHORTEST_MATCH: u32 = 4;
 
+/// `l1-tune`-only: the minimum accepted length for a candidate found via
+/// [`tune::L1Tune::hash3_enabled`]'s 3-byte-key `head3` table (see that
+/// field's doc comment for the full HASH3-PROBE lever story). DEFLATE's
+/// actual floor (`SHORTEST_MATCH` in zlib/pigz terms is 3, not igzip's 4);
+/// this constant, not [`SHORTEST_MATCH`], is what makes a genuine length-3
+/// match reachable — [`SHORTEST_MATCH`] still gates the primary 4-byte
+/// probe unchanged.
+#[cfg(feature = "l1-tune")]
+const SHORTEST_MATCH3: u32 = 3;
+
 /// L1-only (`ACCEL == false`) one-position lazy peek, gated to short accepted
 /// matches at a far distance (see [`LAZY_PEEK_MIN_DIST`]).
 ///
@@ -604,6 +711,53 @@ fn bucket2_upgrade(
     (length, dist)
 }
 
+/// HASH3-PROBE lever (see [`tune::L1Tune::hash3_enabled`]'s doc comment for
+/// the full story): given an already-read `head3` candidate `cand3`, extend
+/// it byte-exact and return `Some((length, dist))` iff it is a genuinely
+/// profitable candidate — either length >= 4 (accepted unconditionally, same
+/// bar the primary probe uses) or EXACTLY length 3 gated by
+/// `tune.hash3_max_dist` (a length-3 match at a far distance often costs more
+/// bits than 3 literals). Returns `None` on an out-of-window/stale slot or an
+/// unprofitable length-3 candidate — the caller falls back to whatever the
+/// primary probe already decided (or a literal).
+#[cfg(feature = "l1-tune")]
+#[inline(always)]
+fn hash3_candidate(pos: usize, buf: &[u8], cand3: u32, tune: tune::L1Tune) -> Option<(u32, usize)> {
+    if cand3 == NO_POS {
+        return None;
+    }
+    let dist3 = pos.wrapping_sub(cand3 as usize);
+    if !(1..=WINDOW).contains(&dist3) {
+        return None;
+    }
+    let length3 = lz_extend(buf, pos, cand3 as usize, 0, DEFLATE_MAX_MATCH_LEN);
+    if length3 < SHORTEST_MATCH3 {
+        return None;
+    }
+    if length3 == SHORTEST_MATCH3 && dist3 > tune.hash3_max_dist {
+        return None;
+    }
+    Some((length3, dist3))
+}
+
+/// Cost-aware tie-break between the primary probe's ALREADY-ACCEPTED
+/// `(cur_len, cur_dist)` and a hash3 candidate `(next_len, next_dist)`: reuses
+/// the SAME formula as this codebase's HC lazy parser (`parse/lazy.rs`'s
+/// `better_match`, threshold 2) and the lazy-peek lever above —
+/// `4*(next_len-cur_len) + (bsr32(cur_dist)-bsr32(next_dist)) > 2`. Only
+/// consulted when `tune.hash3_always_probe` is set (policy (b): probe every
+/// position, even one the primary probe already accepted); policy (a) (the
+/// default, cheaper) only reaches `hash3_candidate` when the primary probe
+/// produced NO accepted match at all, so there is nothing to tie-break
+/// against.
+#[cfg(feature = "l1-tune")]
+#[inline(always)]
+fn hash3_better(cur_len: u32, cur_dist: usize, next_len: u32, next_dist: usize) -> bool {
+    4 * (next_len as i32 - cur_len as i32)
+        + (bsr32(cur_dist as u32) as i32 - bsr32(next_dist as u32) as i32)
+        > 2
+}
+
 /// Process ONE L1 position given its hash `h` and an ALREADY-LOADED candidate
 /// `cand` (the caller is responsible for having read `head[h]` — this
 /// function never re-reads it, only writes the insert). Returns the new
@@ -643,6 +797,7 @@ fn process_position_l1(
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
     #[cfg(feature = "l1-tune")] head2: &mut [u32],
+    #[cfg(feature = "l1-tune")] head3: &mut [u32],
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
@@ -670,123 +825,46 @@ fn process_position_l1(
         NO_POS
     };
 
+    // HASH3-PROBE lever (see `tune::L1Tune::hash3_enabled`'s doc comment):
+    // read the `head3` slot for `pos` up front, regardless of what the
+    // primary probe below decides. The insert (when `hash3_insert_always`)
+    // happens unconditionally here, same as the primary `head` table above,
+    // so later positions can find `pos` as a candidate; under the sparse
+    // insert policy (`!hash3_insert_always`) the write is deferred to
+    // whichever exit path below actually resolves `pos` to a plain literal.
+    #[cfg(feature = "l1-tune")]
+    let (h3, cand3) = if tune.hash3_enabled {
+        // SAFETY: same bound as the primary probe's `load_u32` below —
+        // caller upholds `pos < fast_end <= in_end - 258`.
+        let seq3 = unsafe { load_u24(base, pos) };
+        let h3 = lz_hash(seq3, tune.hash3_bits) as usize;
+        // SAFETY: `lz_hash(_, tune.hash3_bits)` output is `< 1 <<
+        // tune.hash3_bits == head3.len()` (allocated to that size in `run`).
+        let c3 = unsafe { *head3.get_unchecked(h3) };
+        if tune.hash3_insert_always {
+            unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
+        }
+        (h3, c3)
+    } else {
+        (0usize, NO_POS)
+    };
+
     // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
     // the window range instead of panicking on underflow.
     let dist = pos.wrapping_sub(cand as usize);
+    let mut accepted: Option<(u32, usize)> = None;
     if (1..=WINDOW).contains(&dist) {
         let cand_pos = cand as usize;
         // Byte-exact extend (never trusts the hash): a spurious
         // candidate simply yields length < SHORTEST_MATCH -> literal.
         let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
         if length >= SHORTEST_MATCH {
-            // `l1-tune` bucket2 upgrade (search-only lever (b) from the
-            // L1-band mission brief): consult the SECOND candidate ONLY on a
-            // short-match ACCEPTANCE (this `if` is already gated on
-            // `length >= SHORTEST_MATCH`), never on every position (that is
-            // the always-2-bucket approach the mission brief says was
-            // measured too costly). Shadows `length`/`dist` with the
-            // upgraded pair when bucket2 finds something longer; a no-op
-            // (returns the inputs unchanged) when the feature is off, the
-            // lever is disabled, or the gate/candidate doesn't pay off.
-            #[cfg(feature = "l1-tune")]
-            let (length, dist) = bucket2_upgrade(pos, buf, cand2, length, dist, tune);
-            // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
-            // short accepted matches only, so this branch is rare (most
-            // matches are longer, or the position is a miss and never
-            // reaches here).
-            #[cfg(not(feature = "l1-tune"))]
-            let (peek_max_len, peek_min_dist) = (LAZY_PEEK_MAX_LEN, LAZY_PEEK_MIN_DIST);
-            #[cfg(feature = "l1-tune")]
-            let (peek_max_len, peek_min_dist) = (tune.lazy_peek_max_len, tune.lazy_peek_min_dist);
-            if length <= peek_max_len && dist > peek_min_dist {
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.lazy_peek_events += 1;
-                }
-                // SAFETY: caller-upheld `pos < fast_end <= in_end - 258`,
-                // so `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
-                // both the 4-byte load and the up-to-258-byte
-                // `lz_extend` below stay in bounds.
-                let seq1 = unsafe { load_u32(base, pos + 1) };
-                let h1 = lz_hash(seq1, HASH_BITS) as usize;
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.hash_computations += 1;
-                }
-                // SAFETY: same as the primary lookup above; this is a
-                // READ ONLY -- the peek does not insert `pos + 1` into
-                // `head`, so the caller's next position (whether this
-                // match is deferred or taken) is not a double-insert.
-                let cand1 = unsafe { *head.get_unchecked(h1) };
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.head_table_reads += 1;
-                }
-                let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
-                if (1..=WINDOW).contains(&dist1) {
-                    let next_len =
-                        lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN);
-                    if next_len >= length
-                        && 4 * (next_len as i32 - length as i32)
-                            + (bsr32(dist as u32) as i32 - bsr32(dist1 as u32) as i32)
-                            > 2
-                    {
-                        // Defer: a meaningfully better match starts one
-                        // byte later. Emit `pos` as a literal; the
-                        // caller discovers `pos + 1`'s match fresh
-                        // (including its own head-table insert).
-                        #[cfg(feature = "anatomy-counters")]
-                        {
-                            local.lazy_peek_defers += 1;
-                            local.probe_outcome_deferred += 1;
-                        }
-                        // SAFETY: `pos < fast_end <= in_end`.
-                        sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
-                        return pos + 1;
-                    }
-                }
-            }
-
+            accepted = Some((length, dist));
+        } else {
             #[cfg(feature = "anatomy-counters")]
             {
-                local.probe_outcome_accepted += 1;
-                local.positions_processed_matches += length as u64;
+                local.probe_outcome_too_short += 1;
             }
-            // LIMIT_HASH_UPDATE (see the tail loop for the full note).
-            let match_end = pos + length as usize;
-            let insert_end = if limit_hash_update_inserts == usize::MAX {
-                match_end
-            } else {
-                (pos + 1 + limit_hash_update_inserts).min(match_end)
-            };
-            let mut nh = pos + 1;
-            while nh < insert_end {
-                // SAFETY: nh < match_end = pos+length <= in_end, and
-                // buf's pad covers the 4-byte load past in_end.
-                let s = unsafe { load_u32(base, nh) };
-                // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-                unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
-                nh += 1;
-            }
-            // Counted ONCE for the whole interior loop (not per iteration —
-            // `insert_end - (pos + 1)` is exactly the iteration count above,
-            // known without re-walking): this branch only runs on an
-            // ACCEPTED match, already the less-frequent outcome, so this is
-            // a smaller win than the miss/too-short derivations above, but
-            // free to take.
-            #[cfg(feature = "anatomy-counters")]
-            {
-                let interior = (insert_end - (pos + 1)) as u64;
-                local.hash_computations += interior;
-                local.interior_writes += interior;
-            }
-
-            sink.push_match_fast(length, dist as u32);
-            return pos + length as usize;
-        }
-        #[cfg(feature = "anatomy-counters")]
-        {
-            local.probe_outcome_too_short += 1;
         }
     } else {
         #[cfg(feature = "anatomy-counters")]
@@ -795,9 +873,162 @@ fn process_position_l1(
         }
     }
 
-    // Literal (miss or too-short — `positions_processed`'s +1 for this
-    // position is DERIVED at flush from the outcome bucket just set above,
-    // see `FastLocalCounters::flush`'s doc comment).
+    // HASH3-PROBE decision. Policy (a) (default, `!hash3_always_probe`)
+    // only reaches `hash3_candidate` when the primary probe did NOT already
+    // accept (`accepted.is_none()`) — the cheapest shape, matching the
+    // mission brief's policy (a). Policy (b) (`hash3_always_probe`) also
+    // tries when the primary DID accept, upgrading iff the hash3 candidate
+    // wins the same cost tie-break the lazy peek uses.
+    #[cfg(feature = "l1-tune")]
+    if tune.hash3_enabled && (accepted.is_none() || tune.hash3_always_probe) {
+        if let Some((l3, d3)) = hash3_candidate(pos, buf, cand3, tune) {
+            let take = match accepted {
+                None => true,
+                Some((cur_len, cur_dist)) => hash3_better(cur_len, cur_dist, l3, d3),
+            };
+            if take {
+                accepted = Some((l3, d3));
+            }
+        }
+    }
+
+    if let Some((length, dist)) = accepted {
+        // `l1-tune` bucket2 upgrade (search-only lever (b) from the
+        // L1-band mission brief): consult the SECOND candidate ONLY on a
+        // short-match ACCEPTANCE, never on every position (that is the
+        // always-2-bucket approach the mission brief says was measured too
+        // costly). Shadows `length`/`dist` with the upgraded pair when
+        // bucket2 finds something longer; a no-op (returns the inputs
+        // unchanged) when the feature is off, the lever is disabled, or
+        // the gate/candidate doesn't pay off.
+        #[cfg(feature = "l1-tune")]
+        let (length, dist) = bucket2_upgrade(pos, buf, cand2, length, dist, tune);
+        // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
+        // short accepted matches only, so this branch is rare (most
+        // matches are longer, or the position is a miss and never
+        // reaches here).
+        #[cfg(not(feature = "l1-tune"))]
+        let (peek_max_len, peek_min_dist) = (LAZY_PEEK_MAX_LEN, LAZY_PEEK_MIN_DIST);
+        #[cfg(feature = "l1-tune")]
+        let (peek_max_len, peek_min_dist) = (tune.lazy_peek_max_len, tune.lazy_peek_min_dist);
+        if length <= peek_max_len && dist > peek_min_dist {
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.lazy_peek_events += 1;
+            }
+            // SAFETY: caller-upheld `pos < fast_end <= in_end - 258`,
+            // so `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
+            // both the 4-byte load and the up-to-258-byte
+            // `lz_extend` below stay in bounds.
+            let seq1 = unsafe { load_u32(base, pos + 1) };
+            let h1 = lz_hash(seq1, HASH_BITS) as usize;
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.hash_computations += 1;
+            }
+            // SAFETY: same as the primary lookup above; this is a
+            // READ ONLY -- the peek does not insert `pos + 1` into
+            // `head`, so the caller's next position (whether this
+            // match is deferred or taken) is not a double-insert.
+            let cand1 = unsafe { *head.get_unchecked(h1) };
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.head_table_reads += 1;
+            }
+            let dist1 = (pos + 1).wrapping_sub(cand1 as usize);
+            if (1..=WINDOW).contains(&dist1) {
+                let next_len = lz_extend(buf, pos + 1, cand1 as usize, 0, DEFLATE_MAX_MATCH_LEN);
+                if next_len >= length
+                    && 4 * (next_len as i32 - length as i32)
+                        + (bsr32(dist as u32) as i32 - bsr32(dist1 as u32) as i32)
+                        > 2
+                {
+                    // Defer: a meaningfully better match starts one
+                    // byte later. Emit `pos` as a literal; the
+                    // caller discovers `pos + 1`'s match fresh
+                    // (including its own head-table insert).
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.lazy_peek_defers += 1;
+                        local.probe_outcome_deferred += 1;
+                    }
+                    // HASH3-PROBE sparse insert policy: `pos` resolves to
+                    // a literal here, so a deferred sparse insert fires
+                    // now (see the top-of-function comment).
+                    #[cfg(feature = "l1-tune")]
+                    if tune.hash3_enabled && !tune.hash3_insert_always {
+                        unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
+                    }
+                    // SAFETY: `pos < fast_end <= in_end`.
+                    sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
+                    return pos + 1;
+                }
+            }
+        }
+
+        #[cfg(feature = "anatomy-counters")]
+        {
+            local.probe_outcome_accepted += 1;
+            local.positions_processed_matches += length as u64;
+        }
+        // LIMIT_HASH_UPDATE (see the tail loop for the full note).
+        let match_end = pos + length as usize;
+        let insert_end = if limit_hash_update_inserts == usize::MAX {
+            match_end
+        } else {
+            (pos + 1 + limit_hash_update_inserts).min(match_end)
+        };
+        let mut nh = pos + 1;
+        while nh < insert_end {
+            // SAFETY: nh < match_end = pos+length <= in_end, and
+            // buf's pad covers the 4-byte load past in_end.
+            let s = unsafe { load_u32(base, nh) };
+            // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
+            unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+            nh += 1;
+        }
+        // HASH3-PROBE interior insert (gated the SAME as the top-of-function
+        // insert policy: only under `hash3_insert_always` — under the sparse
+        // policy, a match's interior positions never enter `head3`, matching
+        // "insert only on literal emit" literally).
+        #[cfg(feature = "l1-tune")]
+        if tune.hash3_enabled && tune.hash3_insert_always {
+            let mut nh3 = pos + 1;
+            while nh3 < insert_end {
+                // SAFETY: same bound as the `head` interior loop above.
+                let s3 = unsafe { load_u24(base, nh3) };
+                let h3i = lz_hash(s3, tune.hash3_bits) as usize;
+                unsafe { *head3.get_unchecked_mut(h3i) = nh3 as u32 };
+                nh3 += 1;
+            }
+        }
+        // Counted ONCE for the whole interior loop (not per iteration —
+        // `insert_end - (pos + 1)` is exactly the iteration count above,
+        // known without re-walking): this branch only runs on an
+        // ACCEPTED match, already the less-frequent outcome, so this is
+        // a smaller win than the miss/too-short derivations above, but
+        // free to take.
+        #[cfg(feature = "anatomy-counters")]
+        {
+            let interior = (insert_end - (pos + 1)) as u64;
+            local.hash_computations += interior;
+            local.interior_writes += interior;
+        }
+
+        sink.push_match_fast(length, dist as u32);
+        return pos + length as usize;
+    }
+
+    // Literal (miss, too-short, or the hash3 lever declined —
+    // `positions_processed`'s +1 for this position is DERIVED at flush from
+    // the outcome bucket just set above, see `FastLocalCounters::flush`'s
+    // doc comment).
+    // HASH3-PROBE sparse insert policy: `pos` resolves to a literal here, so
+    // a deferred sparse insert fires now (see the top-of-function comment).
+    #[cfg(feature = "l1-tune")]
+    if tune.hash3_enabled && !tune.hash3_insert_always {
+        unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
+    }
     // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
     sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
     pos + 1
@@ -980,6 +1211,7 @@ fn fastloop_l1(
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
     #[cfg(feature = "l1-tune")] head2: &mut [u32],
+    #[cfg(feature = "l1-tune")] head3: &mut [u32],
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
 ) -> usize {
     while pos < fast_end {
@@ -1048,6 +1280,8 @@ fn fastloop_l1(
                 #[cfg(feature = "l1-tune")]
                 head2,
                 #[cfg(feature = "l1-tune")]
+                head3,
+                #[cfg(feature = "l1-tune")]
                 tune,
             );
             #[cfg(feature = "anatomy-counters")]
@@ -1082,6 +1316,8 @@ fn fastloop_l1(
                     local,
                     #[cfg(feature = "l1-tune")]
                     head2,
+                    #[cfg(feature = "l1-tune")]
+                    head3,
                     #[cfg(feature = "l1-tune")]
                     tune,
                 );
@@ -1130,6 +1366,8 @@ fn fastloop_l1(
             local,
             #[cfg(feature = "l1-tune")]
             head2,
+            #[cfg(feature = "l1-tune")]
+            head3,
             #[cfg(feature = "l1-tune")]
             tune,
         );
@@ -1195,6 +1433,18 @@ pub(super) fn run<const ACCEL: bool>(
     };
     #[cfg(feature = "l1-tune")]
     let l1_tune = tune::get();
+    // HASH3-PROBE lever's table (search-only; see `tune::L1Tune::hash3_enabled`'s
+    // doc comment). Sized dynamically off `l1_tune.hash3_bits` (the size-sweep
+    // axis) rather than a fixed const like `head`/`head2` — only allocated
+    // (and only non-empty) when both `!ACCEL` (L1-only, mirrors `head2`) AND
+    // the lever is actually on, so a feature-on build with the lever OFF
+    // pays zero extra allocation.
+    #[cfg(feature = "l1-tune")]
+    let mut head3: Vec<u32> = if !ACCEL && l1_tune.hash3_enabled {
+        vec![NO_POS; 1usize << l1_tune.hash3_bits]
+    } else {
+        Vec::new()
+    };
 
     // One accumulator for the WHOLE `run()` call (every internal block this
     // call emits), flushed once at the end — see `FastLocalCounters`'s doc
@@ -1350,6 +1600,8 @@ pub(super) fn run<const ACCEL: bool>(
                 &mut local,
                 #[cfg(feature = "l1-tune")]
                 &mut head2,
+                #[cfg(feature = "l1-tune")]
+                &mut head3,
                 #[cfg(feature = "l1-tune")]
                 l1_tune,
             )
