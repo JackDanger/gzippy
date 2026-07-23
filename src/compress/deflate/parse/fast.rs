@@ -298,6 +298,112 @@ pub mod tune {
         /// `head3`, trading candidate density for fewer stores per
         /// position.
         pub hash3_insert_always: bool,
+        /// HASH3-GATE composition lever (2026-07-22 campaign, "compose the
+        /// two proven l1-tune levers" mission): reuses the CONTENT-ADAPTIVE
+        /// CHAIN MATCHING lever's zero-cost detector signal (`chain_enabled`'s
+        /// doc comment: literal fraction of the PRECEDING block, read free
+        /// off `Sink::litlen_freqs`) to gate the HASH3-PROBE lever itself,
+        /// instead of running it unconditionally for the whole file. Off by
+        /// default (`false`): when off, `hash3_enabled` behaves EXACTLY as
+        /// documented on that field (always on, every block) — this field
+        /// only changes behavior when both it and `hash3_enabled` are set.
+        /// When on, a block only PROBES `head3` (the wall-costing half of
+        /// the lever) when the preceding block's literal fraction is `>=
+        /// hash3_gate_lit_threshold_pct`, aiming to fire on bin-like blocks
+        /// (the measured win target) and stay silent on text-like blocks
+        /// (where the lever caused the measured `access.log`/`markup.xml`/
+        /// `minjs.min.js` regressions) — same one-block lag as chain mode,
+        /// same "first block has no signal yet" scope gap.
+        ///
+        /// MEASURED (2026-07-22, "compose the two proven l1-tune levers"
+        /// mission, size sweep via `examples/l1_search.rs`'s `breadth`
+        /// subcommand over the real 19-file `~/www/gzippy-bench/corpus`
+        /// breadth set, cross-arch wall-priced on Apple M1 Pro + AMD EPYC
+        /// 7282 + Intel i7-13700T, N=21 each): at
+        /// `hash3_gate_lit_threshold_pct=50` (a real 5-point window,
+        /// 47-51, all equally good — not a knife-edge), composed on top of
+        /// the measured-best ungated HASH3-PROBE knobs
+        /// (`hash3_bits=15`/`hash3_max_dist=32768`/`hash3_insert_always=
+        /// true`/`hash3_always_probe=false`), the gate reaches the ideal
+        /// the mission asked for on this breadth set: ALL FOUR of the
+        /// ungated lever's pigz-1 flips survive (`armexe.elf`,
+        /// `data.parquet`, `tool.bin`, `winexe.exe`, all LOSS -> WIN), the
+        /// `access.log` WIN -> LOSS regression is GONE (ratio 0.9966 ->
+        /// 0.9967, noise), and `markup.xml`/`minjs.min.js` no longer cross
+        /// the strict `ld1*1.05` gate (markup 1.0513 FAIL -> 1.0394 PASS,
+        /// essentially baseline; minjs 1.0515 FAIL -> 1.0471 PASS). Two
+        /// large text-like breadth files (`dickens`, `aozora.txt`,
+        /// `data.csv`, `ecoli.fastq`) come out byte-IDENTICAL to baseline
+        /// at `hash3_gate_initial_active=false` (never trip 50% literal
+        /// fraction, so the detector never once fires on them) — the
+        /// closest this composition gets to the mission's "byte-near-
+        /// identical" bar, exceeding it. Remaining honest cost: three
+        /// breadth files take a small real tax that doesn't cross any gate
+        /// (`data.json` +1.2%, `weights.safetensors` +0.35%, `minjs.min.js`
+        /// +0.35% even after the strict-gate fix) — blocks whose literal
+        /// fraction crosses 50% but whose match-heavy interior means the
+        /// hash3 probe's cost isn't recovered in ratio. On WALL: the
+        /// composed lever pulls the non-bin self-relative tax toward zero
+        /// as intended — `text6` (M1: +6.7% ungated -> +0.7% gated; AMD:
+        /// +5.8% -> -1.7% i.e. faster than baseline; Intel: +6.5% -> -1.5%)
+        /// and `sil40` (M1: +26.9% -> +20.4%; AMD: +21.2% -> +16.8%; Intel:
+        /// +24.4% -> +17.8%) both improve on every arch tested; `bin6`
+        /// (where the gate is nearly always active, by design) stays close
+        /// to the ungated lever's tax, as expected — the gate cannot make
+        /// the WIN itself cheaper, only avoid paying for it where it
+        /// doesn't win. See `hash3_gate_warm_insert`'s doc comment for the
+        /// insert-policy verdict (measured: does not matter for size,
+        /// `false` is strictly cheaper — use it).
+        pub hash3_gated: bool,
+        /// Literal-fraction threshold in PERCENT for [`Self::hash3_gated`]
+        /// (same formula as `chain_lit_threshold_pct`, an independent knob
+        /// so the two levers' thresholds can be tuned separately even when
+        /// composed in the same run).
+        pub hash3_gate_lit_threshold_pct: u32,
+        /// Insert-under-gating policy, the mission brief's named open
+        /// question: `true` keeps `head3` WARM by inserting on every
+        /// position/match-interior regardless of whether the block is
+        /// currently gated ON for probing (only the PROBE is skipped on a
+        /// gated-off block, so a later re-activation finds a table that
+        /// was never allowed to go stale); `false` gates the insert
+        /// identically to the probe (cheaper — no `head3` writes at all
+        /// outside an active block — but a re-activated block's `head3`
+        /// slots reflect whatever was last written before the LAST active
+        /// stretch, i.e. genuinely cold/stale candidates until the active
+        /// stretch repopulates them).
+        ///
+        /// MEASURED (2026-07-22, same sweep as `hash3_gated`'s doc
+        /// comment): warm-insert does NOT measurably help size at
+        /// `threshold=50` — `false` (sparse, gate the insert too) was
+        /// tied-or-marginally-better than `true` on every one of the 19
+        /// breadth files (sub-0.1% differences, both directions, noise
+        /// level) AND strictly cheaper on wall (fewer `head3` stores
+        /// during inactive stretches — `warm_insert=true` measured
+        /// slightly WORSE than `false` on `text6`/`sil40` wall on M1: the
+        /// extra stores through inactive blocks are pure overhead with no
+        /// offsetting ratio benefit here). Verdict: use `false` — the
+        /// mission's named open question resolves in favor of the
+        /// cheaper policy, not the warm one.
+        pub hash3_gate_warm_insert: bool,
+        /// Starting state (before any block has produced a literal-fraction
+        /// signal) for [`Self::hash3_gated`]'s per-block decision — mirrors
+        /// chain mode's "first block always starts chainless" scope gap,
+        /// except here the choice is a real knob (chain mode always starts
+        /// `false`) because a single-block small file never gets a second
+        /// chance: `true` treats the unknown first block as probe-worthy
+        /// (matches un-gated `hash3_enabled` behavior for that one block);
+        /// `false` treats it as probe-silent (conservative, zero tax on a
+        /// file that turns out to be text-like end to end).
+        ///
+        /// MEASURED: `false` is the better default — at `threshold=50` it
+        /// is what makes several large text-like breadth files
+        /// (`dickens`, `aozora.txt`, `data.csv`, `ecoli.fastq`) come out
+        /// BYTE-IDENTICAL to the ungated baseline (they never trip 50%
+        /// literal fraction on any later block either, so the only
+        /// possible divergence — the first block — is closed off too);
+        /// `true` costs a few bytes on those same files for no measured
+        /// benefit anywhere in the breadth set.
+        pub hash3_gate_initial_active: bool,
     }
 
     fn env_u32(name: &str, default: u32) -> u32 {
@@ -345,6 +451,13 @@ pub mod tune {
                 hash3_always_probe: env_bool("GZIPPY_L1TUNE_HASH3_ALWAYS", false),
                 hash3_max_dist: env_usize("GZIPPY_L1TUNE_HASH3_MAX_DIST", 4096),
                 hash3_insert_always: env_bool("GZIPPY_L1TUNE_HASH3_INSERT_ALWAYS", true),
+                hash3_gated: env_bool("GZIPPY_L1TUNE_HASH3_GATED", false),
+                hash3_gate_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_HASH3_GATE_THRESHOLD_PCT", 80),
+                hash3_gate_warm_insert: env_bool("GZIPPY_L1TUNE_HASH3_GATE_WARM_INSERT", true),
+                hash3_gate_initial_active: env_bool(
+                    "GZIPPY_L1TUNE_HASH3_GATE_INITIAL_ACTIVE",
+                    true,
+                ),
             }
         }
     }
@@ -799,6 +912,15 @@ fn process_position_l1(
     #[cfg(feature = "l1-tune")] head2: &mut [u32],
     #[cfg(feature = "l1-tune")] head3: &mut [u32],
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
+    // HASH3-GATE composition lever (see `tune::L1Tune::hash3_gated`'s doc
+    // comment): THIS BLOCK's gate decision, already resolved by the caller
+    // from the preceding block's literal-fraction histogram — a plain
+    // per-call `bool`, not part of `tune`, because it changes every block
+    // while `tune` is fixed for the whole `run()` call (same reason
+    // `chain_mode_next` lives outside `L1Tune`). Always `true` when
+    // `tune.hash3_gated` is `false`, so an ungated build's behavior is
+    // untouched.
+    #[cfg(feature = "l1-tune")] hash3_active: bool,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
     unsafe { *head.get_unchecked_mut(h) = pos as u32 };
@@ -825,6 +947,17 @@ fn process_position_l1(
         NO_POS
     };
 
+    // HASH3-GATE composition lever: whether `head3` is touched AT ALL this
+    // position — either the block is actively probing (`hash3_active`) or
+    // the warm-insert policy keeps writing through a gated-off block so a
+    // later re-activation doesn't find a cold table (see
+    // `tune::L1Tune::hash3_gate_warm_insert`'s doc comment). Ungated builds
+    // (`!tune.hash3_gated`) always have `hash3_active == true` (the caller's
+    // invariant), so `hash3_touch == tune.hash3_enabled` exactly — byte-for-
+    // byte the pre-gating behavior.
+    #[cfg(feature = "l1-tune")]
+    let hash3_touch = tune.hash3_enabled && (hash3_active || tune.hash3_gate_warm_insert);
+
     // HASH3-PROBE lever (see `tune::L1Tune::hash3_enabled`'s doc comment):
     // read the `head3` slot for `pos` up front, regardless of what the
     // primary probe below decides. The insert (when `hash3_insert_always`)
@@ -833,7 +966,7 @@ fn process_position_l1(
     // insert policy (`!hash3_insert_always`) the write is deferred to
     // whichever exit path below actually resolves `pos` to a plain literal.
     #[cfg(feature = "l1-tune")]
-    let (h3, cand3) = if tune.hash3_enabled {
+    let (h3, cand3) = if hash3_touch {
         // SAFETY: same bound as the primary probe's `load_u32` below —
         // caller upholds `pos < fast_end <= in_end - 258`.
         let seq3 = unsafe { load_u24(base, pos) };
@@ -878,9 +1011,11 @@ fn process_position_l1(
     // accept (`accepted.is_none()`) — the cheapest shape, matching the
     // mission brief's policy (a). Policy (b) (`hash3_always_probe`) also
     // tries when the primary DID accept, upgrading iff the hash3 candidate
-    // wins the same cost tie-break the lazy peek uses.
+    // wins the same cost tie-break the lazy peek uses. Gated on
+    // `hash3_active` (NOT `hash3_touch` — a warm-insert-only block must
+    // still never PROBE, only keep the table populated).
     #[cfg(feature = "l1-tune")]
-    if tune.hash3_enabled && (accepted.is_none() || tune.hash3_always_probe) {
+    if tune.hash3_enabled && hash3_active && (accepted.is_none() || tune.hash3_always_probe) {
         if let Some((l3, d3)) = hash3_candidate(pos, buf, cand3, tune) {
             let take = match accepted {
                 None => true,
@@ -956,7 +1091,7 @@ fn process_position_l1(
                     // a literal here, so a deferred sparse insert fires
                     // now (see the top-of-function comment).
                     #[cfg(feature = "l1-tune")]
-                    if tune.hash3_enabled && !tune.hash3_insert_always {
+                    if hash3_touch && !tune.hash3_insert_always {
                         unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
                     }
                     // SAFETY: `pos < fast_end <= in_end`.
@@ -992,7 +1127,7 @@ fn process_position_l1(
         // policy, a match's interior positions never enter `head3`, matching
         // "insert only on literal emit" literally).
         #[cfg(feature = "l1-tune")]
-        if tune.hash3_enabled && tune.hash3_insert_always {
+        if hash3_touch && tune.hash3_insert_always {
             let mut nh3 = pos + 1;
             while nh3 < insert_end {
                 // SAFETY: same bound as the `head` interior loop above.
@@ -1026,7 +1161,7 @@ fn process_position_l1(
     // HASH3-PROBE sparse insert policy: `pos` resolves to a literal here, so
     // a deferred sparse insert fires now (see the top-of-function comment).
     #[cfg(feature = "l1-tune")]
-    if tune.hash3_enabled && !tune.hash3_insert_always {
+    if hash3_touch && !tune.hash3_insert_always {
         unsafe { *head3.get_unchecked_mut(h3) = pos as u32 };
     }
     // SAFETY: `pos < fast_end <= in_end <= buf.len()`.
@@ -1213,6 +1348,11 @@ fn fastloop_l1(
     #[cfg(feature = "l1-tune")] head2: &mut [u32],
     #[cfg(feature = "l1-tune")] head3: &mut [u32],
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
+    // HASH3-GATE composition lever: this BLOCK's gate decision (see
+    // `process_position_l1`'s matching parameter doc comment) — constant
+    // for this whole `fastloop_l1` call (one block), passed through
+    // unchanged to every `process_position_l1` call site below.
+    #[cfg(feature = "l1-tune")] hash3_active: bool,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline: warm the head-table line for the
@@ -1283,6 +1423,8 @@ fn fastloop_l1(
                 head3,
                 #[cfg(feature = "l1-tune")]
                 tune,
+                #[cfg(feature = "l1-tune")]
+                hash3_active,
             );
             #[cfg(feature = "anatomy-counters")]
             {
@@ -1320,6 +1462,8 @@ fn fastloop_l1(
                     head3,
                     #[cfg(feature = "l1-tune")]
                     tune,
+                    #[cfg(feature = "l1-tune")]
+                    hash3_active,
                 );
                 #[cfg(feature = "anatomy-counters")]
                 {
@@ -1370,6 +1514,8 @@ fn fastloop_l1(
             head3,
             #[cfg(feature = "l1-tune")]
             tune,
+            #[cfg(feature = "l1-tune")]
+            hash3_active,
         );
         #[cfg(feature = "anatomy-counters")]
         {
@@ -1497,12 +1643,28 @@ pub(super) fn run<const ACCEL: bool>(
     #[cfg(feature = "l1-tune")]
     let mut chain_mode_next: bool = false;
 
+    // HASH3-GATE composition lever state (see `tune::L1Tune::hash3_gated`'s
+    // doc comment): an INDEPENDENT one-block-lag detector from
+    // `chain_mode_next` above (own threshold knob, own initial-state knob),
+    // even though both read the same free `litlen_freqs` signal. When
+    // `!l1_tune.hash3_gated`, this stays `true` for the whole call — see
+    // `process_position_l1`'s `hash3_active` parameter doc comment for the
+    // byte-identical-to-ungated guarantee that depends on that.
+    #[cfg(feature = "l1-tune")]
+    let mut hash3_active_next: bool = !l1_tune.hash3_gated || l1_tune.hash3_gate_initial_active;
+
     loop {
         // Start a new block. It ends after `block_length` input bytes (a match
         // straddling the boundary is allowed to overrun it slightly) or at EOF.
         let block_begin = pos;
         sink.begin();
         let block_end_target = (block_begin + block_length).min(in_end);
+        // This block's HASH3-GATE decision, captured before any recompute
+        // below (the chainless dispatch path consumes it; the chain-mode
+        // arm below does not touch `head3` at all, so it just recomputes
+        // `hash3_active_next` for whichever block runs after it).
+        #[cfg(feature = "l1-tune")]
+        let hash3_active = hash3_active_next;
 
         // `!ACCEL` is a compile-time-constant branch (ACCEL is a const
         // generic) so L0's monomorphization never carries this dead code —
@@ -1548,6 +1710,10 @@ pub(super) fn run<const ACCEL: bool>(
                 && total > 0
                 && (literal_count as u64 * 100)
                     >= (l1_tune.chain_lit_threshold_pct as u64 * total as u64);
+            hash3_active_next = !l1_tune.hash3_gated
+                || (total > 0
+                    && (literal_count as u64 * 100)
+                        >= (l1_tune.hash3_gate_lit_threshold_pct as u64 * total as u64));
             if pos == in_end {
                 break;
             }
@@ -1604,6 +1770,8 @@ pub(super) fn run<const ACCEL: bool>(
                 &mut head3,
                 #[cfg(feature = "l1-tune")]
                 l1_tune,
+                #[cfg(feature = "l1-tune")]
+                hash3_active,
             )
         };
 
@@ -1759,6 +1927,10 @@ pub(super) fn run<const ACCEL: bool>(
                 && total > 0
                 && (literal_count as u64 * 100)
                     >= (l1_tune.chain_lit_threshold_pct as u64 * total as u64);
+            hash3_active_next = !l1_tune.hash3_gated
+                || (total > 0
+                    && (literal_count as u64 * 100)
+                        >= (l1_tune.hash3_gate_lit_threshold_pct as u64 * total as u64));
         }
 
         if pos == in_end {

@@ -769,6 +769,110 @@ mod tests {
         }
     }
 
+    /// HASH3-GATE composition roundtrip differential (2026-07-22 "compose
+    /// the two proven l1-tune levers" mission): `hash3_gated` reuses the
+    /// content-adaptive chain matching lever's literal-fraction detector to
+    /// gate the HASH3-PROBE lever's per-block probe/insert, a genuinely
+    /// different code path (`process_position_l1`'s `hash3_touch`/
+    /// `hash3_active` split, and `run`'s independent `hash3_active_next`
+    /// one-block-lag state machine) from either lever alone — neither
+    /// `chain_mode_roundtrip_adversarial` nor `hash3_probe_roundtrip_
+    /// adversarial` exercises the gate transition itself (a block flipping
+    /// from probe-silent to probe-active mid-file, and the warm-insert vs
+    /// sparse-insert policies at that transition). Same adversarial-corner
+    /// + literal-dense-multi-block shape as the two lever tests above,
+    /// swept across threshold x warm-insert x initial-active.
+    ///
+    /// Test isolation: same `Drop`-guard restore pattern as the two lever
+    /// tests above.
+    #[cfg(feature = "l1-tune")]
+    #[test]
+    fn hash3_gate_roundtrip_adversarial() {
+        use crate::compress::deflate::parse::tune::{self, L1Tune};
+
+        struct RestoreTune(L1Tune);
+        impl Drop for RestoreTune {
+            fn drop(&mut self) {
+                tune::set(self.0);
+            }
+        }
+        let _restore = RestoreTune(tune::get());
+
+        let base = tune::get();
+        // Sized for several 64 KiB blocks so the one-block-lag gate both
+        // arms (active->inactive and inactive->active) within one file.
+        let literal_dense = binary_corpus(400_000);
+
+        for threshold in [50u32, 80] {
+            for warm_insert in [true, false] {
+                for initial_active in [true, false] {
+                    tune::set(L1Tune {
+                        hash3_enabled: true,
+                        hash3_bits: 15,
+                        hash3_always_probe: false,
+                        hash3_max_dist: 32768,
+                        hash3_insert_always: true,
+                        hash3_gated: true,
+                        hash3_gate_lit_threshold_pct: threshold,
+                        hash3_gate_warm_insert: warm_insert,
+                        hash3_gate_initial_active: initial_active,
+                        ..base
+                    });
+                    let tag = format!(
+                        "hash3gate-t{threshold}-w{}-i{}",
+                        warm_insert as u8, initial_active as u8
+                    );
+
+                    assert_roundtrips_level(b"", &format!("{tag}-empty"), 1);
+                    assert_roundtrips_level(b"A", &format!("{tag}-one-byte"), 1);
+                    assert_roundtrips_level(b"AB", &format!("{tag}-two-bytes"), 1);
+                    assert_roundtrips_level(b"ABC", &format!("{tag}-three-bytes"), 1);
+                    assert_roundtrips_level(&vec![b'Z'; 300_000], &format!("{tag}-all-same"), 1);
+                    let mut triples = Vec::new();
+                    for i in 0..100_000u32 {
+                        triples.extend_from_slice(&[
+                            (i % 251) as u8,
+                            ((i / 3) % 251) as u8,
+                            ((i * 7) % 251) as u8,
+                        ]);
+                    }
+                    assert_roundtrips_level(&triples, &format!("{tag}-triples"), 1);
+                    let mut incompressible = vec![0u8; 64 * 1024 + 37];
+                    Rng::new(0xC0FFEE ^ threshold as u64 ^ warm_insert as u64)
+                        .fill(&mut incompressible);
+                    assert_roundtrips_level(&incompressible, &format!("{tag}-incompressible"), 1);
+                    let pattern: Vec<u8> = (0..400u32)
+                        .map(|i| (i.wrapping_mul(131) ^ 0x5A) as u8)
+                        .collect();
+                    let mut rng = Rng::new(0xD157A17 ^ threshold as u64 ^ warm_insert as u64);
+                    let mut filler = vec![0u8; 31_000];
+                    rng.fill(&mut filler);
+                    let mut data = Vec::new();
+                    data.extend_from_slice(&pattern);
+                    data.extend_from_slice(&filler);
+                    data.extend_from_slice(&pattern);
+                    data.extend_from_slice(&filler[..5000]);
+                    data.extend_from_slice(&pattern);
+                    assert_roundtrips_level(&data, &format!("{tag}-distant-repeats"), 1);
+
+                    // Mixed content: a low-literal-fraction (match-heavy)
+                    // prefix followed by a high-literal-fraction (bin-like)
+                    // suffix, sized to span multiple blocks — exercises the
+                    // gate flipping ACTIVE mid-file (`initial_active=false`
+                    // starts silent, the bin suffix should trip it on).
+                    let mut mixed = text_corpus(300_000);
+                    mixed.extend_from_slice(&binary_corpus(300_000));
+                    let n = assert_roundtrips_level(&mixed, &format!("{tag}-mixed"), 1);
+                    let expected = if gzip_available() { 3 } else { 2 };
+                    assert_eq!(n, expected, "{tag}: an oracle was silently skipped");
+
+                    let n2 = assert_roundtrips_level(&literal_dense, &format!("{tag}-bindense"), 1);
+                    assert_eq!(n2, expected, "{tag}: an oracle was silently skipped");
+                }
+            }
+        }
+    }
+
     /// gzip-framed size of `data` under libdeflate at `level` (the tighter ratio
     /// reference: `size_fastL1 <= libdeflate -1` is the aspiration, `<= gzip -1`
     /// the hard floor).
