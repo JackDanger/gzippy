@@ -87,6 +87,13 @@ struct Optimizer {
     offset_slot_full: OffsetSlotFull,
     /// Merged approximate greedy match-length histogram (`match_len_freqs`).
     match_len_freqs: Vec<u32>,
+    /// Per-block sequence sink, reused across blocks via `begin()` (which
+    /// `.clear()`s `seqs` without dropping its capacity) instead of being
+    /// reconstructed fresh per block. A brand-new `Sink::new()` per block
+    /// forces `seqs` to regrow from empty every time — DHAT on the L10
+    /// bin6/parquet corpora showed this as the #1-by-count allocation site
+    /// (`push_seq`, thousands of allocs, one growth spurt per block).
+    sink: Sink,
 }
 
 impl Optimizer {
@@ -98,6 +105,7 @@ impl Optimizer {
             costs_saved: DeflateCosts::default(),
             offset_slot_full: OffsetSlotFull::new(),
             match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
+            sink: Sink::new(),
         }
     }
 
@@ -401,11 +409,13 @@ impl Optimizer {
         }
         // else: optimum_nodes already holds the final (good) path.
 
-        // Build the token stream for the chosen path and emit.
-        let mut sink = Sink::new();
+        // Build the token stream for the chosen path and emit. Reuse the
+        // persistent `self.sink` (cleared, capacity kept) instead of a fresh
+        // `Sink::new()` per block — see the field doc comment.
+        self.sink.begin();
         if used_only_literals {
             for &b in block {
-                sink.push_literal(b);
+                self.sink.push_literal(b);
             }
         } else {
             let mut node = 0usize;
@@ -414,15 +424,15 @@ impl Optimizer {
                 let length = (item & OPTIMUM_LEN_MASK) as usize;
                 let hi = item >> OPTIMUM_OFFSET_SHIFT;
                 if length == 1 {
-                    sink.push_literal(hi as u8);
+                    self.sink.push_literal(hi as u8);
                     node += 1;
                 } else {
-                    sink.push_match(length as u32, hi);
+                    self.sink.push_match(length as u32, hi);
                     node += length;
                 }
             }
         }
-        emit_block(bw, buf, block_begin, &sink, statics, is_final);
+        emit_block(bw, buf, block_begin, &self.sink, statics, is_final);
 
         used_only_literals
     }
