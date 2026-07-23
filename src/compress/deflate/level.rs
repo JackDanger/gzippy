@@ -110,8 +110,22 @@ pub fn params(level: u32) -> LevelParams {
             nice_match_length: 10,
             near_optimal: NONE_NO,
         },
+        // L3-STRATEGY experiment (`l3-tune` Cargo feature, OFF by default):
+        // routes L3 through the SAME lazy parser (`Strategy::Lazy` ->
+        // `lazy::run`, already wired and used unmodified by L5-7) instead of
+        // `Strategy::Greedy`, with L3's knobs UNCHANGED
+        // (max_search_depth=12, nice_match_length=14) — only the
+        // accept-immediately-vs-defer-one-byte decision changes, isolating
+        // "parse decision quality" from "finder reach" per the residual
+        // diagnosis (dd79_bin6 vs pigz-3: decision headroom 190185B is 3.2x
+        // the real 59507B gap; reach saturates by K~=32-48, see
+        // ~/www/gzippy-bench/l3_diag/l3_diag_notes.txt §4/§7). Byte-identical
+        // to today's shipped L3 (`Strategy::Greedy`) when the feature is off.
         3 => LevelParams {
+            #[cfg(not(feature = "l3-tune"))]
             strategy: Strategy::Greedy,
+            #[cfg(feature = "l3-tune")]
+            strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
             near_optimal: NONE_NO,
@@ -218,9 +232,15 @@ mod tests {
     fn strategy_mapping_matches_increment_scope() {
         assert_eq!(params(0).strategy, Strategy::Fast0);
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
-        for l in 2..=4 {
-            assert_eq!(params(l).strategy, Strategy::Greedy, "level {l}");
-        }
+
+        // L3's strategy flips to Lazy under the `l3-tune` experiment (see
+        // level.rs's level-3 arm); L2/L4 stay Greedy either way.
+        assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
+        #[cfg(not(feature = "l3-tune"))]
+        assert_eq!(params(3).strategy, Strategy::Greedy, "level 3");
+        #[cfg(feature = "l3-tune")]
+        assert_eq!(params(3).strategy, Strategy::Lazy, "level 3 (l3-tune)");
+        assert_eq!(params(4).strategy, Strategy::Greedy, "level 4");
         for l in 5..=7 {
             assert_eq!(params(l).strategy, Strategy::Lazy, "level {l}");
         }
