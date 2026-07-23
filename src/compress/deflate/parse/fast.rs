@@ -47,7 +47,13 @@
 
 use super::super::bitstream::BitWriter;
 use super::super::matchfinder::common::{load_u32, lz_extend, lz_hash, prefetch_write};
+#[cfg(feature = "l1-tune")]
+use super::super::matchfinder::hc::HcMatchfinder;
+#[cfg(feature = "l1-tune")]
+use super::super::tables::DEFLATE_FIRST_LEN_SYM;
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
+#[cfg(feature = "l1-tune")]
+use super::NUM_LITERALS;
 use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes};
 
 /// Per-`run()`-call local accumulator for the fast-path anatomy counters
@@ -171,6 +177,35 @@ pub mod tune {
         pub bucket2_enabled: bool,
         /// Gate paired with `bucket2_enabled` (see its doc comment).
         pub bucket2_gate_max_len: u32,
+        /// CONTENT-ADAPTIVE CHAIN MATCHING lever (2026-07-22 campaign,
+        /// mission: "content-adaptive chain matching at L1" — the
+        /// un-falsified ratio lever for the binary-class cells; pigz-1 is
+        /// 4.4% smaller than gzippy-1 and 4% smaller than libdeflate-1 on
+        /// `dd79_bin6`, and no chainless config in the l1-tune frontier
+        /// closes it at any cost). When enabled, a block's matching switches
+        /// from the chainless single-probe finder to the hash-chains finder
+        /// ([`super::super::matchfinder::hc::HcMatchfinder`], the SAME
+        /// finder greedy/lazy already use at L2+) iff the PRECEDING block's
+        /// literal fraction (literals / (literals + matches), read for free
+        /// off the already-populated `Sink::litlen_freqs` histogram — no
+        /// extra scan, no probe pass) is `>= chain_lit_threshold_pct`. Text
+        /// content (low literal fraction, match-heavy) never trips the
+        /// detector so those blocks are byte-identical to the un-tuned
+        /// path; bin-like content (high literal fraction, e.g. dd79_bin6
+        /// measured 92% literal at L1 in the ICF-ARCHITECTURE FALSIFY note
+        /// above) does. One-block lag by construction (a file's FIRST block
+        /// always starts chainless — there is no preceding block to read a
+        /// signal from); a whole-file-in-one-block input therefore never
+        /// adapts, a known scope gap, not a correctness issue. Off by
+        /// default (`false`).
+        pub chain_enabled: bool,
+        /// Literal-fraction threshold in PERCENT (0-100): the next block
+        /// switches to chain mode iff `100*literals >= chain_lit_threshold_pct
+        /// * (literals+matches)` for the block just finished.
+        pub chain_lit_threshold_pct: u32,
+        /// `max_search_depth` passed to `HcMatchfinder::longest_match` for a
+        /// chain-mode block (the depth-sweep knob from the mission brief).
+        pub chain_max_search_depth: u32,
     }
 
     fn env_u32(name: &str, default: u32) -> u32 {
@@ -210,6 +245,9 @@ pub mod tune {
                 block_length: env_usize("GZIPPY_L1TUNE_BLOCK_LENGTH", super::FAST_BLOCK_LENGTH),
                 bucket2_enabled: env_bool("GZIPPY_L1TUNE_BUCKET2", false),
                 bucket2_gate_max_len: env_u32("GZIPPY_L1TUNE_BUCKET2_GATE_MAX_LEN", 8),
+                chain_enabled: env_bool("GZIPPY_L1TUNE_CHAIN", false),
+                chain_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_CHAIN_THRESHOLD_PCT", 80),
+                chain_max_search_depth: env_u32("GZIPPY_L1TUNE_CHAIN_DEPTH", 16),
             }
         }
     }
@@ -272,6 +310,113 @@ const PF_DIST: usize = 4;
 /// speed/ratio knee for THIS finder; higher values were tried and reverted,
 /// see the commit message).
 pub(super) const LIMIT_HASH_UPDATE_INSERTS_L0: usize = 2;
+/// `l1-tune`-only CONTENT-ADAPTIVE CHAIN MATCHING: process one block's range
+/// `[pos, block_end_target)` with the hash-chains finder instead of the
+/// chainless single-probe finder, pushing into the SAME `sink` the chainless
+/// path uses (so [`emit_block`] is completely unaware which finder produced
+/// the tokens — no emit-side change at all). Mirrors `greedy::run`'s inner
+/// loop exactly (same `longest_match`/`skip_bytes` call shape, proven
+/// correct there) but with a FIXED min-match of [`SHORTEST_MATCH`] (matching
+/// this fast path's existing accept bar) instead of libdeflate's
+/// content-adaptive `calculate_min_match_len`, and `nice_len == max_len` (no
+/// early-exit heuristic — `max_search_depth` alone bounds the cost, kept
+/// simple for the depth sweep this lever exists to run).
+///
+/// `mf`/`in_base`/`next_hashes` are threaded from the caller (`run`) and
+/// MUST have been kept in continuous sync up to `pos` (via this function's
+/// own advances or the caller's `hc_catchup`) — the finder's `i16`-relative
+/// window-slide arithmetic requires every position from its creation onward
+/// to pass through exactly one of `longest_match`/`skip_bytes`, with no
+/// gaps (see `hc_catchup`'s doc comment for the full contiguity contract).
+#[cfg(feature = "l1-tune")]
+#[allow(clippy::too_many_arguments)]
+fn chain_block(
+    buf: &[u8],
+    mut pos: usize,
+    block_end_target: usize,
+    in_end: usize,
+    mf: &mut HcMatchfinder,
+    in_base: &mut usize,
+    next_hashes: &mut [u32; 2],
+    sink: &mut Sink,
+    max_search_depth: u32,
+) -> usize {
+    while pos < block_end_target {
+        let remaining = in_end - pos;
+        let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
+            DEFLATE_MAX_MATCH_LEN
+        } else {
+            remaining as u32
+        };
+        let (length, offset) = mf.longest_match(
+            buf,
+            in_base,
+            pos,
+            SHORTEST_MATCH - 1,
+            max_len,
+            max_len,
+            max_search_depth,
+            next_hashes,
+        );
+        if length >= SHORTEST_MATCH {
+            sink.push_match_fast(length, offset);
+            // SAFETY-relevant contract only (no unsafe here): keeps `mf` in
+            // lockstep with `pos` exactly like `greedy::run`'s own
+            // post-match `skip_bytes` call.
+            mf.skip_bytes(
+                buf,
+                in_base,
+                pos + 1,
+                in_end,
+                (length - 1) as usize,
+                next_hashes,
+            );
+            pos += length as usize;
+        } else {
+            sink.push_literal_fast(buf[pos]);
+            pos += 1;
+        }
+    }
+    pos
+}
+
+/// `l1-tune`-only: bring the hash-chains finder's coverage from `from` up to
+/// `to` via a single bulk `skip_bytes` call, WITHOUT running any searches —
+/// used (a) once, when chain mode first activates, to catch `mf` up from
+/// `data_start` to the activating block's start, and (b) after every
+/// chainless block once `mf` has been created at least once, so a LATER
+/// re-activation never needs a large catch-up and the finder's position
+/// tracking stays exactly contiguous (see [`HcMatchfinder::skip_bytes`]'s
+/// `i16`-relative window-slide arithmetic, which silently corrupts if fed a
+/// non-contiguous jump — every byte from the finder's first touch onward
+/// MUST pass through `longest_match` or `skip_bytes` exactly once, in order).
+///
+/// `skip_bytes` itself silently no-ops within 5 bytes of `in_end` (it needs
+/// a 4-byte hash lookahead); this helper pre-caps the count so it never asks
+/// for more than that, which is always safe here because a gap that close to
+/// `in_end` can only occur at the very end of the whole input, where no
+/// subsequent chain-mode block exists to need the sync.
+#[cfg(feature = "l1-tune")]
+fn hc_catchup(
+    buf: &[u8],
+    mf: &mut HcMatchfinder,
+    in_base: &mut usize,
+    next_hashes: &mut [u32; 2],
+    from: usize,
+    to: usize,
+    in_end: usize,
+) {
+    if to <= from {
+        return;
+    }
+    let cap = (in_end - from).saturating_sub(5);
+    let count = (to - from).min(cap);
+    if count == 0 {
+        return;
+    }
+    mf.skip_bytes(buf, in_base, from, in_end, count, next_hashes);
+}
+
 /// L1 gets one step denser than L0 (matches igzip's own "~3"): measured
 /// near-zero wall cost (`text6` 22.9ms→22.6ms, `bin6` 37.7ms→38.3ms, both
 /// within run-to-run noise) for a real ratio win (`text6` -1.7%, `bin6`
@@ -1082,12 +1227,82 @@ pub(super) fn run<const ACCEL: bool>(
     let mut sink = Sink::new();
     let mut pos = data_start;
 
+    // CONTENT-ADAPTIVE CHAIN MATCHING state (`l1-tune` only; see
+    // `tune::L1Tune::chain_enabled`'s doc comment). `chain_hc` is created
+    // lazily on the first block that trips the detector — a file that never
+    // trips it (e.g. text-dominant, low literal fraction) pays literally
+    // zero extra cost: no allocation, no extra hashing, byte-identical
+    // output to the un-tuned path. `hc_synced_up_to` tracks how far the
+    // finder's contiguous coverage extends (see `hc_catchup`'s doc comment);
+    // `chain_mode_next` is the one-block-lag decision read off the PREVIOUS
+    // block's already-computed `sink.litlen_freqs` histogram.
+    #[cfg(feature = "l1-tune")]
+    let mut chain_hc: Option<Box<HcMatchfinder>> = None;
+    #[cfg(feature = "l1-tune")]
+    let mut chain_in_base: usize = 0;
+    #[cfg(feature = "l1-tune")]
+    let mut chain_next_hashes: [u32; 2] = [0, 0];
+    #[cfg(feature = "l1-tune")]
+    let mut hc_synced_up_to: usize = data_start;
+    #[cfg(feature = "l1-tune")]
+    let mut chain_mode_next: bool = false;
+
     loop {
         // Start a new block. It ends after `block_length` input bytes (a match
         // straddling the boundary is allowed to overrun it slightly) or at EOF.
         let block_begin = pos;
         sink.begin();
         let block_end_target = (block_begin + block_length).min(in_end);
+
+        // `!ACCEL` is a compile-time-constant branch (ACCEL is a const
+        // generic) so L0's monomorphization never carries this dead code —
+        // content-adaptive chain matching is L1-only, per the mission scope.
+        // The whole block is `l1-tune`-only; when the feature is off this
+        // arm does not exist, so a default build is byte-for-byte the
+        // pre-lever code path (not merely a runtime `false` branch of it).
+        #[cfg(feature = "l1-tune")]
+        if !ACCEL && l1_tune.chain_enabled && chain_mode_next {
+            let mf = chain_hc.get_or_insert_with(HcMatchfinder::new);
+            hc_catchup(
+                buf,
+                mf,
+                &mut chain_in_base,
+                &mut chain_next_hashes,
+                hc_synced_up_to,
+                block_begin,
+                in_end,
+            );
+            pos = chain_block(
+                buf,
+                pos,
+                block_end_target,
+                in_end,
+                mf,
+                &mut chain_in_base,
+                &mut chain_next_hashes,
+                &mut sink,
+                l1_tune.chain_max_search_depth,
+            );
+            hc_synced_up_to = pos;
+            sink.block_length = pos - block_begin;
+            let is_final = is_last && pos == in_end;
+            if use_dynamic {
+                emit_block(bw, buf, block_begin, &sink, statics, is_final);
+            } else {
+                emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+            }
+            let literal_count: u32 = sink.litlen_freqs[..NUM_LITERALS].iter().sum();
+            let match_count: u32 = sink.litlen_freqs[DEFLATE_FIRST_LEN_SYM..].iter().sum();
+            let total = literal_count + match_count;
+            chain_mode_next = l1_tune.chain_enabled
+                && total > 0
+                && (literal_count as u64 * 100)
+                    >= (l1_tune.chain_lit_threshold_pct as u64 * total as u64);
+            if pos == in_end {
+                break;
+            }
+            continue;
+        }
 
         // FASTLOOP / TAIL split (igzip loop2 shape). While
         // `pos < in_end - DEFLATE_MAX_MATCH_LEN`, `remaining` strictly exceeds
@@ -1258,6 +1473,42 @@ pub(super) fn run<const ACCEL: bool>(
             // for why this is the L0-vs-L1 cost/ratio trade).
             emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
         }
+
+        // CONTENT-ADAPTIVE CHAIN MATCHING bookkeeping for a block that just
+        // ran the CHAINLESS path (the chain-mode arm above `continue`s
+        // before reaching here, so this only runs for chainless blocks).
+        // Two independent things, both `l1-tune`-only and both no-ops on a
+        // file that never trips the detector (matching `chain_hc.is_none()`
+        // — no allocation ever happened, so this is one `is_some()` check
+        // and one histogram scan, zero extra hashing):
+        //   1. If the finder has EVER been created this call, keep its
+        //      contiguous coverage current (`hc_catchup`) so a LATER
+        //      re-activation doesn't need a large catch-up walk.
+        //   2. Decide chain mode for the NEXT block from THIS block's
+        //      already-populated `litlen_freqs` (free — no extra scan).
+        #[cfg(feature = "l1-tune")]
+        {
+            if let Some(mf) = chain_hc.as_deref_mut() {
+                hc_catchup(
+                    buf,
+                    mf,
+                    &mut chain_in_base,
+                    &mut chain_next_hashes,
+                    hc_synced_up_to,
+                    pos,
+                    in_end,
+                );
+                hc_synced_up_to = pos;
+            }
+            let literal_count: u32 = sink.litlen_freqs[..NUM_LITERALS].iter().sum();
+            let match_count: u32 = sink.litlen_freqs[DEFLATE_FIRST_LEN_SYM..].iter().sum();
+            let total = literal_count + match_count;
+            chain_mode_next = l1_tune.chain_enabled
+                && total > 0
+                && (literal_count as u64 * 100)
+                    >= (l1_tune.chain_lit_threshold_pct as u64 * total as u64);
+        }
+
         if pos == in_end {
             break;
         }

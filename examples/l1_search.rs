@@ -223,6 +223,9 @@ fn baseline() -> L1Tune {
         block_length: 65536,
         bucket2_enabled: false,
         bucket2_gate_max_len: 8,
+        chain_enabled: false,
+        chain_lit_threshold_pct: 80,
+        chain_max_search_depth: 16,
     }
 }
 
@@ -302,6 +305,24 @@ fn named_configs() -> Vec<(String, L1Tune)> {
                 ..base
             },
         ));
+    }
+
+    // Axis F: CONTENT-ADAPTIVE CHAIN MATCHING (2026-07-22 mission) —
+    // literal-density threshold x chain search-depth grid. Threshold is a
+    // PERCENT (literal fraction of the preceding block); depth is
+    // `max_search_depth` for the hash-chains finder on a fired block.
+    for threshold in [50u32, 65, 80, 90] {
+        for depth in [4u32, 8, 16, 32, 64, 128] {
+            v.push((
+                format!("chain-t{threshold}-d{depth}"),
+                L1Tune {
+                    chain_enabled: true,
+                    chain_lit_threshold_pct: threshold,
+                    chain_max_search_depth: depth,
+                    ..base
+                },
+            ));
+        }
     }
 
     // Hand-picked combined candidates (not just the greedy best-of-axis
@@ -576,6 +597,45 @@ fn run_wall(name: &str, reps: usize) {
     println!("config={name} reps={reps} median_ms={median:.3} all_ms={ms:?}");
 }
 
+/// Like `run_wall` but times EACH corpus file separately and prints one line
+/// per corpus (needed because the mission's per-cell kill rule is per
+/// CORPUS CLASS — bin vs sil vs text each have a different pigz-1 wall
+/// budget; the combined-loop `wall` mode conflates them, dominated by
+/// whichever corpus is largest).
+fn run_wall_percorpus(name: &str, reps: usize) {
+    let all: Vec<(String, L1Tune)> = named_configs();
+    let cfg = if let Some(spec) = name.strip_prefix("spec:") {
+        parse_spec(spec)
+    } else {
+        all.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or_else(|| {
+                eprintln!("l1_search wallpc: unknown config '{name}', using baseline");
+                baseline()
+            })
+    };
+    tune::set(cfg);
+
+    let corpora = build_corpora();
+    for c in &corpora {
+        std::hint::black_box(compress_gzip(&c.data, 1).len());
+        let mut ms = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            let sz = compress_gzip(&c.data, 1).len();
+            std::hint::black_box(sz);
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = ms[ms.len() / 2];
+        println!(
+            "config={name} corpus={}[{}] reps={reps} median_ms={median:.3}",
+            c.label, c.group
+        );
+    }
+}
+
 fn parse_spec(spec: &str) -> L1Tune {
     let mut cfg = baseline();
     for kv in spec.split(',') {
@@ -619,6 +679,14 @@ fn main() {
                 .unwrap_or_else(|| "baseline".to_string());
             let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
             run_wall(&name, reps);
+        }
+        Some("wallpc") => {
+            let name = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "baseline".to_string());
+            let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
+            run_wall_percorpus(&name, reps);
         }
         Some("list") => run_list(),
         _ => run_size_search(),
