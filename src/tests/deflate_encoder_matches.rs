@@ -626,6 +626,13 @@ mod tests {
                     chain_enabled: true,
                     chain_lit_threshold_pct: threshold,
                     chain_max_search_depth: depth,
+                    // 2026-07-24: `L1Tune::from_env()`'s hash3_enabled
+                    // default flipped to `true` (see that fn's doc
+                    // comment) — pin it OFF here so this test stays
+                    // isolated to chain mode's own territory, not a
+                    // silent chain+hash3 composition `hash3_gate_
+                    // roundtrip_adversarial` already covers deliberately.
+                    hash3_enabled: false,
                     ..base
                 });
                 let tag = format!("chain-t{threshold}-d{depth}");
@@ -708,6 +715,17 @@ mod tests {
                             hash3_always_probe: always_probe,
                             hash3_max_dist: max_dist,
                             hash3_insert_always: insert_always,
+                            // 2026-07-24: `L1Tune::from_env()`'s hash3_gated
+                            // default flipped to `true` (see that fn's doc
+                            // comment) — pin it OFF here so this test
+                            // targets the UNGATED lever in isolation across
+                            // its own axes, matching the isolation
+                            // `hash3_gate_roundtrip_adversarial` already
+                            // provides for the gated composition (an
+                            // inherited `true` here would silently narrow
+                            // this test's coverage to mostly re-test that
+                            // other test's territory instead).
+                            hash3_gated: false,
                             ..base
                         });
                         let tag = format!(

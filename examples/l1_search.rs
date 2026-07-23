@@ -33,6 +33,15 @@
 //!        config (';'-separated — spec:k=v,k=v... configs use ',' internally),
 //!        plus a WIN/LOSS flip report vs the FIRST config in the list
 //!        (2026-07-22 hash3+detector composition mission).
+//!   cargo run --release --features l1-tune --example l1_search -- file <path> <cfg1;cfg2;...>
+//!     -> T1 (`compress_gzip`) size/ratio table for ONE explicit file — the
+//!        targeted single-fixture micro-sweep tool (e.g. dd79_bin6, which
+//!        `breadth` deliberately excludes).
+//!   cargo run --release --features l1-tune --example l1_search -- filemt <path> <threads> <cfg1;cfg2;...>
+//!     -> same, but through the REAL T>1 production path (`compress_bytes`
+//!        -> `PipelinedGzEncoder::compress_buffer_pure`, 512KB per-chunk
+//!        `compress_block_streaming`) to measure the per-chunk gate-state-
+//!        reset shape directly instead of inferring it from T1 numbers.
 //!
 //! Build: cargo build --release --features l1-tune --example l1_search
 
@@ -41,6 +50,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use gzippy::compress::compress_bytes;
 use gzippy::compress::deflate::compress_gzip;
 use gzippy::compress::deflate::parse::tune::{self, L1Tune};
 
@@ -482,8 +492,18 @@ fn named_configs() -> Vec<(String, L1Tune)> {
     // mission's named open question is exactly whether warm-insert
     // (keep `head3` populated through a gated-off stretch) beats sparse
     // gating (cheaper, but cold on re-activation).
+    //
+    // 47/48/49 added (2026-07-24 targeted micro-sweep, closing the
+    // `dd79_bin6` promotion-gate blocker): `threshold=50` is a real
+    // per-file knife-edge on `dd79_bin6` specifically (the 2026-07-22
+    // aggregate-only sweep's "47-51 plateau" call missed this — see
+    // `tune::L1Tune::hash3_gate_lit_threshold_pct`'s doc comment).
+    // `hash3gate-t48-w0-i1` is the measured-best composed config found by
+    // that sweep (T1 AND T4 WIN on `dd79_bin6` vs pigz-1, zero breadth
+    // flips) — also now `L1Tune::from_env()`'s default, so a plain
+    // `l1-tune`-feature build with no env override reproduces it.
     let h3 = hash3_best();
-    for threshold in [50u32, 65, 80, 90] {
+    for threshold in [47u32, 48, 49, 50, 65, 80, 90] {
         for warm_insert in [true, false] {
             for initial_active in [true, false] {
                 v.push((
@@ -960,9 +980,159 @@ fn run_list() {
     }
 }
 
+/// Targeted single-file micro-sweep support (2026-07-24 hash3-gate bin6
+/// close-out mission): sweeps a ';'-separated list of named/`spec:`
+/// configs (same grammar as `breadth`) against ONE explicit file path (not
+/// restricted to the breadth corpus dir's exclusion of dd79_text6/dd79_bin6
+/// — the mission's target fixture IS one of those) and prints size +
+/// ratios vs ld1/gzip1/pigz1 per config, T1 only (`compress_gzip`, same
+/// engine `run()` call as `breadth`/`size`).
+fn run_file(path: &str, names: &str) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("l1_search file: {path} unreadable: {e}");
+            std::process::exit(1);
+        }
+    };
+    let cfg_names: Vec<&str> = names.split(';').collect();
+    let configs: Vec<(String, L1Tune)> = cfg_names
+        .iter()
+        .map(|n| {
+            let all = named_configs();
+            let cfg = if let Some(spec) = n.strip_prefix("spec:") {
+                parse_spec(spec)
+            } else {
+                all.iter()
+                    .find(|(nm, _)| nm == n)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_else(|| {
+                        eprintln!("l1_search file: unknown config '{n}', using baseline");
+                        baseline()
+                    })
+            };
+            (n.to_string(), cfg)
+        })
+        .collect();
+
+    let r = ref_sizes(&data);
+    eprintln!(
+        "l1_search file: {path} ({} bytes) ld1={} gzip1={} pigz1={}",
+        data.len(),
+        r.ld1,
+        r.gzip1,
+        r.pigz1.map(|v| v.to_string()).unwrap_or("<absent>".into())
+    );
+    println!("config\tsize\tld1_ratio\tgzip1_ratio\tpigz1_ratio\tvs_pigz");
+    for (name, cfg) in &configs {
+        tune::set(*cfg);
+        let sz = compress_gzip(&data, 1).len();
+        let ld1_ratio = sz as f64 / r.ld1 as f64;
+        let gzip1_ratio = sz as f64 / r.gzip1 as f64;
+        let pigz1_ratio = r.pigz1.map(|p| sz as f64 / p as f64);
+        let vs_pigz = match pigz1_ratio {
+            Some(v) if v < 1.0 => "WIN",
+            Some(v) if v > 1.0 => "LOSS",
+            Some(_) => "TIE",
+            None => "NA",
+        };
+        println!(
+            "{name}\t{sz}\t{ld1_ratio:.4}\t{gzip1_ratio:.4}\t{}\t{vs_pigz}",
+            pigz1_ratio
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or("NA".into())
+        );
+    }
+}
+
+/// Multi-threaded shape of the SAME single-file sweep: routes through
+/// `compress_bytes` (the real production T>1 entry point,
+/// `PipelinedGzEncoder::compress_buffer_pure` → 512KB-block
+/// `compress_block_streaming` per chunk) instead of the T1-only
+/// `compress_gzip`, so the mission's "does the per-chunk gate-state reset
+/// cost bin6 at T4" question is measured on the ACTUAL T>1 code path, not
+/// inferred. `tune::set` is a process-global `RwLock`, so it applies to
+/// every worker thread `compress_bytes` spawns.
+fn run_file_mt(path: &str, threads: usize, names: &str) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("l1_search filemt: {path} unreadable: {e}");
+            std::process::exit(1);
+        }
+    };
+    let cfg_names: Vec<&str> = names.split(';').collect();
+    let configs: Vec<(String, L1Tune)> = cfg_names
+        .iter()
+        .map(|n| {
+            let all = named_configs();
+            let cfg = if let Some(spec) = n.strip_prefix("spec:") {
+                parse_spec(spec)
+            } else {
+                all.iter()
+                    .find(|(nm, _)| nm == n)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_else(|| {
+                        eprintln!("l1_search filemt: unknown config '{n}', using baseline");
+                        baseline()
+                    })
+            };
+            (n.to_string(), cfg)
+        })
+        .collect();
+
+    let r = ref_sizes(&data);
+    eprintln!(
+        "l1_search filemt: {path} T{threads} ({} bytes) ld1={} gzip1={} pigz1={}",
+        data.len(),
+        r.ld1,
+        r.gzip1,
+        r.pigz1.map(|v| v.to_string()).unwrap_or("<absent>".into())
+    );
+    println!("config\tthreads\tsize\tld1_ratio\tgzip1_ratio\tpigz1_ratio\tvs_pigz");
+    for (name, cfg) in &configs {
+        tune::set(*cfg);
+        let mut out = Vec::new();
+        compress_bytes(std::io::Cursor::new(&data), &mut out, 1, threads).expect("compress");
+        let sz = out.len();
+        let ld1_ratio = sz as f64 / r.ld1 as f64;
+        let gzip1_ratio = sz as f64 / r.gzip1 as f64;
+        let pigz1_ratio = r.pigz1.map(|p| sz as f64 / p as f64);
+        let vs_pigz = match pigz1_ratio {
+            Some(v) if v < 1.0 => "WIN",
+            Some(v) if v > 1.0 => "LOSS",
+            Some(_) => "TIE",
+            None => "NA",
+        };
+        println!(
+            "{name}\t{threads}\t{sz}\t{ld1_ratio:.4}\t{gzip1_ratio:.4}\t{}\t{vs_pigz}",
+            pigz1_ratio
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or("NA".into())
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
+        Some("file") => {
+            let path = args.get(2).cloned().unwrap_or_default();
+            let names = args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| "baseline".to_string());
+            run_file(&path, &names);
+        }
+        Some("filemt") => {
+            let path = args.get(2).cloned().unwrap_or_default();
+            let threads: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let names = args
+                .get(4)
+                .cloned()
+                .unwrap_or_else(|| "baseline".to_string());
+            run_file_mt(&path, threads, &names);
+        }
         Some("wall") => {
             let name = args
                 .get(2)
