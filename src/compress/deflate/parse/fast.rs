@@ -685,6 +685,45 @@ pub(super) const L1_HASH3_GATE_WARM_INSERT: bool = false;
 /// T1 win; see this module's `Hash3Cfg` doc comment.
 pub(super) const L1_HASH3_GATE_INITIAL_ACTIVE: bool = true;
 
+// FROZEN SHIP GATE: PASSED (2026-07-24, solvency root@10.0.2.240, AMD EPYC
+// 7282, RUSTFLAGS="-C target-cpu=native", commit `c7274688` built fresh in
+// a bare-repo worktree AFTER=/root/gz-h3rerun-after (sha256 3b87acdc...),
+// BEFORE=/root/gz-h3rerun-before at `0da3f80f` (sha256 598a8fd1...), N=15
+// interleaved hyperfine, /dev/null sink, correctness roundtrip-verified on
+// every cell used; llama-server frozen for the wall runs via SIGSTOP +
+// 1200s orphan-backstop watchdog, restored (STAT Sl, no orphan) after).
+//
+// The PRE-REGISTERED SHIP RULE ("vs pigz-1+gzip-1: size <= AND wall faster
+// on ALL corpora/T ... zero LOSS cells anywhere") is MET, closing the exact
+// two blockers `9783ee93` cited against the `threshold=50`/
+// `initial_active=false` config:
+//   - dd79_bin6 vs pigz-1 T1: size_ratio 0.9978 (was 1.0010 LOSS), wall
+//     1.85x FASTER (pigz -1 -p1, apples-to-apples single-thread).
+//   - dd79_bin6 vs pigz-1 T4/T8/T16: size_ratio 0.9990 at every T (was
+//     1.0078 LOSS at every T), wall 1.22-1.53x FASTER at every T.
+//   - dd79_text6 and sil40: WIN on size (0.9515-0.9977 vs pigz-1/gzip-1)
+//     and FASTER on wall (1.18-2.34x) at every T tested, unchanged in
+//     character from the first attempt's clean legs.
+// LEG 2 (vs ld1/igzip, informational not blocking): dd79_bin6 size 0.9600
+// vs ld1 (WIN, matches the "real win vs ld1" framing), wall 1.19x SLOWER
+// (an expected/predicted tax, same shape as `9783ee93`'s 1.162x); text6
+// size unchanged within noise (0.007%) vs the pre-lever baseline. Spot
+// L0/L2/L6 byte-identical before/after on all 3 corpora (0 diffs).
+// T1==T4==T16 determinism holds (byte-identical per corpus across T>1).
+// A/A self-test (gzippy-after vs itself) measured 1.01x — the 1.85-2.34x
+// pigz-1 wins are far outside the instrument's own noise floor.
+//
+// Box artifacts (left in place, not cleaned up): /root/gz-h3rerun-after,
+// /root/gz-h3rerun-before (worktrees off /root/gz-hash3gate-ship-wt),
+// /root/wall_*.json and /root/wall_fixed_*.json (hyperfine --export-json
+// per cell), /root/gate_matrix.sh + /root/gate_wall.sh +
+// /root/gate_wall_t1_fixed.sh (the gate scripts themselves), /root/sil40
+// (the 4MB@40MiB silesia slice extracted from /root/gate-fixtures/
+// silesia.tar for this gate).
+//
+// The commit that promoted this config (this one) is KEPT — no revert
+// follows.
+
 /// Ship-defaults / dev-search-tunable knobs for the composed HASH3-GATE
 /// lever, unified into one small `Copy` struct so [`process_position_l1`],
 /// [`fastloop_l1`], and [`run`] thread ONE value regardless of build
