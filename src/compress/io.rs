@@ -234,15 +234,23 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
     } else if args.stdout {
         let out = BufWriter::with_capacity(1024 * 1024, stdout());
-        crate::compress::compress_with_pipeline(input_file, out, args, &opt_config, &header_info)
+        crate::compress::compress_with_pipeline_sized(
+            input_file,
+            out,
+            args,
+            &opt_config,
+            &header_info,
+            Some(file_size as usize),
+        )
     } else {
         let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
-        crate::compress::compress_with_pipeline(
+        crate::compress::compress_with_pipeline_sized(
             input_file,
             output_file,
             args,
             &opt_config,
             &header_info,
+            Some(file_size as usize),
         )
     };
 
@@ -369,12 +377,13 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         // compress_with_pipeline.
         let opt_config_t1 =
             OptimizationConfig::new(1, file_size, args.compression_level, content_type);
-        crate::compress::compress_with_pipeline(
+        crate::compress::compress_with_pipeline_sized(
             Cursor::new(input_data),
             &mut counted,
             args,
             &opt_config_t1,
             &header_info,
+            Some(input_data.len()),
         )?
     } else {
         // Pipe stdin: stream directly without buffering all input first.
