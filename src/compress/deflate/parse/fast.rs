@@ -221,6 +221,50 @@ pub mod tune {
         /// bytes only, so a hit is a REAL length-3 candidate, not a
         /// coincidental extension of a 4-byte-hash slot. Off by default
         /// (`false`).
+        ///
+        /// MEASURED (2026-07-22, closes the probe-adding family — the
+        /// mission's own falsifier, both directions, M1 Pro + AMD EPYC
+        /// 7282 cross-arch replicated): unlike every prior member of this
+        /// family, this lever does not merely close PART of the pigz-1
+        /// bin-content edge — at `bits=15, max_dist=32768,
+        /// hash3_insert_always=true` (policy (a), miss-only probe) it
+        /// REVERSES it on the named target (`dd79_bin6`): gzippy-1 goes
+        /// from 1.0438x pigz-1 / 1.0043x libdeflate-1 (baseline) to
+        /// 0.9978x pigz-1 / 0.9600x libdeflate-1 — a real, size-verified
+        /// win against BOTH rivals, not just a partial close. `dd79_text6`
+        /// stays a comfortable pigz-1 win (0.9573x, down from 0.9516x) and
+        /// a real 40 MiB silesia slice IMPROVES (0.9813x, down from
+        /// 0.9922x) — the mission's falsifier ("text6 doesn't regress",
+        /// read as "stays a win vs pigz") holds on both non-bin corpora.
+        /// Confirmed on a REAL 19-file corpus breadth sweep (not just the
+        /// 3 named classes): 3 binary-executable-like files flip
+        /// pigz-1 LOSS -> WIN (`armexe.elf`, `tool.bin`, `winexe.exe`,
+        /// matching the mechanism's target), 1 flips WIN -> LOSS
+        /// (`access.log`), and 2 cross the strict `ld1 * 1.05` gate from
+        /// PASS to FAIL (`markup.xml`, `minjs.min.js`) — honest, real
+        /// regressions this lever causes, not zero-sum.
+        ///
+        /// The cost is real and NOT cheap: +12-28% self-relative L1 wall
+        /// on M1 Pro (bin6 worst, ~23-28%; text6 ~12-16%; sil40 ~20-25%)
+        /// and +22% on AMD EPYC 7282 (bin6) — squarely in the SAME costly
+        /// range as the reverted 2-way-bucket lever (+24-34%), not the
+        /// cheap lazy-peek (+9-15%); the mission's pre-registered "no free
+        /// lunch" prior holds for the SELF-relative comparison. But
+        /// unlike prior levers, the self-relative tax was checked against
+        /// the actual rival's wall, not just gzippy's own baseline:
+        /// gzippy+hash3 remains 1.6-1.9x FASTER than pigz-1's measured
+        /// wall time on every corpus on BOTH arches even after the tax
+        /// (M1 bin6: 54.8ms vs pigz-1's 86.8ms; AMD EPYC bin6: 83.4ms vs
+        /// pigz-1's 141.1ms) — it is slower than libdeflate-1's own wall
+        /// (~1.2-1.3x) but libdeflate-1 is not the mission's named rival
+        /// (pigz-1 is). Reported, not resolved: whether this trade is
+        /// worth shipping is a POLICY call (self-relative-wall-budget vs
+        /// beat-the-actual-rival), not a technical one — this note
+        /// deliberately does not pick a side. See the commit that
+        /// introduced this note for the full sweep tables, per-cell flip
+        /// accounting under both gate policies, and the roundtrip
+        /// differential (`hash3_probe_roundtrip_adversarial`) that
+        /// verifies every policy/table-size combination byte-exact.
         pub hash3_enabled: bool,
         /// `log2` size of `head3` (entries, not bytes): sweep 12 (4K) to 15
         /// (32K), mirroring `matchfinder::hc::HC_HASH3_ORDER` (15/32K) at
