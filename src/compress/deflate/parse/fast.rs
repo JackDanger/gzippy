@@ -1129,7 +1129,26 @@ const SHORTEST_MATCH3: u32 = 3;
 /// tie-break as this codebase's existing HC lazy parser (`parse/lazy.rs`'s
 /// `better_match`, threshold 2):
 /// `4*(next_len-cur_len) + (bsr32(cur_offset)-bsr32(next_offset)) > 2`.
-const LAZY_PEEK_MAX_LEN: u32 = 4;
+///
+/// PROMOTED 2026-07-23 (data-derived lazy-peek widening, l1-tune A/B +
+/// decision-diff session): the narrow `4`/`8192` gate above was swept over
+/// a hand-picked 3-corpus set (text6/bin6/sil40) that has NO sqlite-shaped
+/// member; re-running the l1-tune config-space sweep with `data.sqlite`
+/// (48 MiB, real-world DB file, heavy long-range structural repetition) in
+/// the corpus set found this narrow gate leaves the single largest lever
+/// on the table: `data.sqlite` was a 6.1% LOSS vs `pigz -1` under
+/// `4`/`8192` and becomes a 12.4% WIN (−16.1% size) under `16`/`0` — every
+/// short match, at ANY distance, gets the one-position-ahead peek. The
+/// wider gate also IMPROVES `dd79_text6` (−1.5%) and holds `dd79_bin6`
+/// flat (the peek/no-peek byte counts differ by well under 0.1%, noise-
+/// level, not a regression). See the frozen solvency-gate verdict recorded
+/// below (or the promotion commit message) for the wall-cost accounting —
+/// an EARLIER config-space sweep measured `peekdist=0` ALONE (this file's
+/// prior `8192` paired with a swept `0`, not the joint `16`/`0` config
+/// here) at +6.6-6.8% wall, over the 5% budget cited above; the frozen
+/// paired-diff gate is the arbiter between that number and the informal
+/// M1 read of +2-5% (noise) for the COMBINED widened config.
+const LAZY_PEEK_MAX_LEN: u32 = 16;
 
 /// Distance gate paired with [`LAZY_PEEK_MAX_LEN`] (see its doc comment for
 /// the full story): only peek when the ALREADY-ACCEPTED match's distance
@@ -1138,9 +1157,18 @@ const LAZY_PEEK_MAX_LEN: u32 = 4;
 /// case worth the extra probe is a short match at a FAR distance (many
 /// distance extra-bits paid for few covered bytes). Swept empirically
 /// (0/256/1024/4096/8192/16384): lower values recover more ratio but cost
-/// more wall (0 costs +9-15%; 16384 is wall-safe but the smallest ratio
-/// recovery); 8192 is the chosen trade point.
-const LAZY_PEEK_MIN_DIST: usize = 8192;
+/// more wall (0 costs +9-15% self-relative on the narrow `MAX_LEN=4` text6/
+/// sil40 sweep; 16384 is wall-safe but the smallest ratio recovery).
+///
+/// PROMOTED 2026-07-23 (see [`LAZY_PEEK_MAX_LEN`]'s doc comment for the
+/// full data-derived-widening story): paired with the `MAX_LEN` widening
+/// to `16`, the distance gate is dropped to `0` (peek unconditionally on
+/// every short-enough accepted match, regardless of distance) — this is
+/// the joint config the `data.sqlite` lever needs (most of that file's
+/// short-match structure is at NEAR distances the old `8192` gate
+/// excluded entirely). Frozen solvency gate is the arbiter of this
+/// config's wall cost (see the promotion commit message).
+const LAZY_PEEK_MIN_DIST: usize = 0;
 
 /// DEFLATE sliding-window size — the largest legal back-reference distance.
 const WINDOW: usize = 32768;
