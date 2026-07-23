@@ -39,9 +39,13 @@ use gzippy::compress::deflate::compress_gzip;
 use gzippy::compress::deflate::parse::tune::{self, L1Tune};
 
 // ---- corpus generators (ported verbatim from
-// src/tests/deflate_encoder_matches.rs's fast_l1_ratio_multi_corpus so the
-// size numbers here are directly comparable to that shipped ratio guard) ----
-
+// src/tests/deflate_encoder_matches.rs's fast_l1_ratio_multi_corpus). NO
+// LONGER USED by `build_corpora` (2026-07-22 coordinator correction): the
+// REAL dd79_text6/dd79_bin6 fixtures are available locally and are what the
+// "13 non-WIN cells" claim was actually measured against — see
+// `build_corpora`'s doc comment. Kept (not deleted) as a documented fallback
+// / for a future breadth pass beyond the single dd79 fixture pair.
+#[allow(dead_code)]
 fn text_corpus(n: usize) -> Vec<u8> {
     let phrases: [&[u8]; 4] = [
         b"the pure-rust deflate encoder must roundtrip byte for byte. ",
@@ -62,6 +66,7 @@ fn text_corpus(n: usize) -> Vec<u8> {
     out
 }
 
+#[allow(dead_code)]
 fn binary_corpus(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n + 64);
     let payload: [u8; 12] = [
@@ -108,55 +113,61 @@ struct Corpus {
     data: Vec<u8>,
 }
 
+/// The REAL fixtures the "13 non-WIN cells" claim was measured against
+/// (coordinator correction, 2026-07-22): `dd79_text6`/`dd79_bin6` are exact
+/// 6 MiB (6,291,456-byte) files in `~/www/gzippy-bench/corpus/`, not the
+/// generated stand-ins this tool used in its first pass (that synthetic
+/// `bin` corpus turned out to be a much harder, unrepresentative regime —
+/// 2.28x ld1 vs the real fixture's measured 1.009-1.049x band, see below).
+fn dd79_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from("/Users/jackdanger/www/gzippy-bench/corpus").join(name)
+}
+
+fn read_file_or_none(path: &PathBuf) -> Option<Vec<u8>> {
+    std::fs::read(path).ok()
+}
+
 fn build_corpora() -> Vec<Corpus> {
     let mut out = Vec::new();
-    // text: 6 distinct sizes (distinct phrase-cycle lengths -> distinct byte
-    // statistics per "file").
-    for (i, n) in [
-        500_000, 1_000_000, 1_500_000, 2_000_000, 2_500_000, 3_000_000,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        out.push(Corpus {
+
+    match read_file_or_none(&dd79_fixture_path("dd79_text6")) {
+        Some(d) => out.push(Corpus {
             group: "text",
-            label: format!("text{i}-{n}B"),
-            data: text_corpus(n),
-        });
+            label: "dd79_text6".to_string(),
+            data: d,
+        }),
+        None => eprintln!(
+            "l1_search: gzippy-bench/corpus/dd79_text6 absent — text group skipped; \
+             falling back to the synthetic generator would NOT be the real fixture, \
+             refusing to substitute silently"
+        ),
     }
-    // bin: 6 distinct sizes.
-    for (i, n) in [
-        500_000, 1_000_000, 1_500_000, 2_000_000, 2_500_000, 3_000_000,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        out.push(Corpus {
+    match read_file_or_none(&dd79_fixture_path("dd79_bin6")) {
+        Some(d) => out.push(Corpus {
             group: "bin",
-            label: format!("bin{i}-{n}B"),
-            data: binary_corpus(n),
-        });
+            label: "dd79_bin6".to_string(),
+            data: d,
+        }),
+        None => eprintln!(
+            "l1_search: gzippy-bench/corpus/dd79_bin6 absent — bin group skipped; \
+             falling back to the synthetic generator would NOT be the real fixture, \
+             refusing to substitute silently"
+        ),
     }
-    // sil: 40 slices spread across the tar (real heterogeneous content).
-    let tar_len = std::fs::metadata(silesia_tar_path()).map(|m| m.len()).ok();
-    if let Some(tar_len) = tar_len {
-        let slice_n = 4_000_000usize;
-        let step = (tar_len / 40).max(slice_n as u64 + 1);
-        for i in 0..40u64 {
-            let off = i * step;
-            if let Some(d) = silesia_slice_at(off, slice_n) {
-                out.push(Corpus {
-                    group: "sil",
-                    label: format!("sil{i}@{off}"),
-                    data: d,
-                });
-            }
+    // sil: ONE real 40 MiB (41,943,040-byte) contiguous slice of
+    // benchmark_data/silesia.tar — "sil40" by the same naming convention as
+    // the 6 MiB text6/bin6 fixtures (a size, not a file count; the first
+    // pass's 40-separate-4MB-slices reading was wrong).
+    let sil_n = 40 * 1024 * 1024;
+    match silesia_slice_at(0, sil_n) {
+        Some(d) => out.push(Corpus {
+            group: "sil",
+            label: format!("silesia@0+{sil_n}B"),
+            data: d,
+        }),
+        None => {
+            eprintln!("l1_search: benchmark_data/silesia.tar absent or short — sil group skipped")
         }
-    } else {
-        eprintln!(
-            "l1_search: benchmark_data/silesia.tar absent — sil group skipped \
-             (text+bin groups still run)"
-        );
     }
     out
 }
