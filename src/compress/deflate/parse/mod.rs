@@ -980,6 +980,50 @@ unsafe fn emit_literal_run(
 /// future session can rebuild and re-measure either variant, or the untried
 /// amortized-runtime-check hypothesis, without re-deriving the const-generic
 /// batch-tier machinery from scratch.
+///
+/// PRE-EMPTED (2026-07-22, same day, no rebuild): a follow-up mission brief
+/// ("TWO-PASS FAST TIER, INCREMENT 1") proposed splitting the fast path into
+/// PASS 1 (parse to a packed-u32 token buffer + inline histogram, no emit
+/// state) and PASS 2 (build the Huffman code, then a "minimal streaming emit
+/// loop" over the packed buffer — load record, one/two table lookups,
+/// accumulate, flush on budget; explicitly "no Sink, no histogram updates
+/// ..., no capacity checks"), on the premise that this differs from prior
+/// grafts because it removes emit state from being interleaved with parsing.
+/// Before building it, comparison against the ICF-ARCHITECTURE note above
+/// showed the two are the SAME design: [`IcfRec`]/`Sink::icf_records` (commit
+/// `522b7d96`) IS a pass-1 packed-token-buffer with zero emit state (the
+/// parse-side push writes a tagged record or bumps a histogram slot, never
+/// touches `BitWriter`), and `emit_records_icf` IS the described pass-2 — a
+/// flat loop, one merged-table lookup + `add_bits_raw`/flush per record, no
+/// Sink/histogram/capacity check inside it. The v1/v2 "flush on budget"
+/// batched variants were also already tried (see the note above) for the
+/// closest analogous cadence change. The one literal difference — pass-1
+/// pre-sizing the buffer vs `icf_records`'s `Vec::new()` grown by push — does
+/// not touch the Gate-2-identified root cause (measured via added counters,
+/// not inferred: per-record store+branch+flush cost, worse on literal-heavy
+/// corpora, not allocation), so it does not predict a different verdict.
+/// Applying Increment 1's own pre-registered kill rule ("graduates iff ...
+/// whole-program wall improves beyond the rebuild-noise floor on x86 with M1
+/// non-regressing") to the ALREADY-GATED numbers above (N=21 interleaved,
+/// `/dev/null`, cachegrind-corroborated, both arches) answers it without a
+/// rebuild: x86_64 wall ratio 1.072 (`dd79_text6`, 0/21 pairs faster) and
+/// 1.092 (`dd79_bin6`, 0/21 faster); M1 1.029 (`dd79_text6`, 18/21 worse) and
+/// 1.045 (`dd79_bin6`, 21/21 worse) — a regression on every cell on both
+/// arches, not an improvement on either. NO-GO, no new box time spent. The
+/// two figures the mission brief cited as "confirmed structural fact"
+/// (igzip emit "11-13% of its budget"; gzippy "3-4.6x per token") do not
+/// appear anywhere in this repo's history (`git log --all -p --grep=...`
+/// across `src/compress/deflate` found no match) — they are UNGROUNDED
+/// narrative, not a Fulcrum-gated finding, and should not be treated as one.
+/// The one mechanism this file's FALSIFY chain still marks genuinely untried
+/// — a RUNNING bit-budget compare amortized over N symbols, flushing only
+/// when near the buffer's safe capacity (the reopen trigger two notes above)
+/// — requires a per-record capacity check, which Increment 1's own brief
+/// explicitly excludes ("no capacity checks"); so even the one open reopen
+/// trigger is outside what was proposed here. If this direction is revisited,
+/// the amortized running-budget check is the only undischarged hypothesis,
+/// and it still needs a real implementation + gate, not another rebuild of
+/// the immediate-flush uniform-record shape already covered above.
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
