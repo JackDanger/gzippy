@@ -577,6 +577,93 @@ mod tests {
         }
     }
 
+    /// CONTENT-ADAPTIVE CHAIN MATCHING (2026-07-22 mission) correctness net:
+    /// `l1-tune`'s `chain_enabled` lever switches a block's matcher from the
+    /// chainless single-probe finder to the hash-chains finder mid-parse —
+    /// a genuinely different code path (`fast::chain_block`/`hc_catchup` in
+    /// `parse/fast.rs`) that the OTHER tests in this file never exercise
+    /// (they never call `tune::set`, so `chain_enabled` stays at its `false`
+    /// env-var default). Runs the SAME three-oracle roundtrip net as
+    /// [`fast_l1_roundtrip_three_oracles`] but with chain mode forced on
+    /// across a (threshold, depth) grid, over both the adversarial corner
+    /// corpus (empty/tiny/all-same/distant-repeats/boundary cases — the
+    /// finder-switch mid-block-loop is exactly where an off-by-one in the
+    /// `hc_catchup` contiguity contract would corrupt output) and a
+    /// generated literal-dense (`binary_corpus`) corpus sized to guarantee
+    /// multiple 64 KiB blocks so the one-block-lag detector actually flips
+    /// mid-file.
+    ///
+    /// Test isolation: `tune::set` mutates PROCESS-GLOBAL state (by design —
+    /// see `tune::set`'s doc comment), so this restores the prior snapshot
+    /// via a `Drop` guard even on panic, keeping every OTHER test in this
+    /// binary unaffected once this test returns. A transient window where
+    /// truly-concurrent tests could observe `chain_enabled=true` remains
+    /// (inherent to the global-tune design also used by `examples/
+    /// l1_search.rs`) — benign here because chain mode is monotonically
+    /// size-non-increasing and never changes roundtrip correctness, so it
+    /// cannot flip a passing assertion in another test to failing; no
+    /// existing test in this file asserts an exact byte count that chain
+    /// mode could perturb.
+    #[cfg(feature = "l1-tune")]
+    #[test]
+    fn chain_mode_roundtrip_adversarial() {
+        use crate::compress::deflate::parse::tune::{self, L1Tune};
+
+        struct RestoreTune(L1Tune);
+        impl Drop for RestoreTune {
+            fn drop(&mut self) {
+                tune::set(self.0);
+            }
+        }
+        let _restore = RestoreTune(tune::get());
+
+        let base = tune::get();
+        let literal_dense = binary_corpus(400_000); // several 64 KiB blocks
+
+        for threshold in [50u32, 80] {
+            for depth in [4u32, 32] {
+                tune::set(L1Tune {
+                    chain_enabled: true,
+                    chain_lit_threshold_pct: threshold,
+                    chain_max_search_depth: depth,
+                    ..base
+                });
+                let tag = format!("chain-t{threshold}-d{depth}");
+
+                // Adversarial corner cases (mirrors
+                // `fast_l1_roundtrip_three_oracles`, chain-mode-forced).
+                assert_roundtrips_level(b"", &format!("{tag}-empty"), 1);
+                assert_roundtrips_level(b"A", &format!("{tag}-one-byte"), 1);
+                assert_roundtrips_level(&vec![b'Z'; 300_000], &format!("{tag}-all-same"), 1);
+                let mut incompressible = vec![0u8; 64 * 1024 + 37];
+                Rng::new(0xC0FFEE ^ threshold as u64 ^ depth as u64).fill(&mut incompressible);
+                assert_roundtrips_level(&incompressible, &format!("{tag}-incompressible"), 1);
+                let pattern: Vec<u8> = (0..400u32)
+                    .map(|i| (i.wrapping_mul(131) ^ 0x5A) as u8)
+                    .collect();
+                let mut rng = Rng::new(0xD157A17 ^ threshold as u64 ^ depth as u64);
+                let mut filler = vec![0u8; 31_000];
+                rng.fill(&mut filler);
+                let mut data = Vec::new();
+                data.extend_from_slice(&pattern);
+                data.extend_from_slice(&filler);
+                data.extend_from_slice(&pattern);
+                data.extend_from_slice(&filler[..5000]);
+                data.extend_from_slice(&pattern);
+                assert_roundtrips_level(&data, &format!("{tag}-distant-repeats"), 1);
+
+                // The literal-dense corpus this lever targets: enough blocks
+                // (400_000 / 65536 ~= 6) for the one-block-lag detector to
+                // both fire (block 2+) and, at threshold=80, sometimes NOT
+                // fire (exercising the chainless<->chain toggle both ways in
+                // one `run()` call, the `hc_catchup` resync path).
+                let n = assert_roundtrips_level(&literal_dense, &format!("{tag}-bindense"), 1);
+                let expected = if gzip_available() { 3 } else { 2 };
+                assert_eq!(n, expected, "{tag}: an oracle was silently skipped");
+            }
+        }
+    }
+
     /// gzip-framed size of `data` under libdeflate at `level` (the tighter ratio
     /// reference: `size_fastL1 <= libdeflate -1` is the aspiration, `<= gzip -1`
     /// the hard floor).
