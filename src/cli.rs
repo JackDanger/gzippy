@@ -45,6 +45,17 @@ pub struct GzippyArgs {
     pub zopfli_iterations: Option<u32>,
     pub zopfli_no_split: bool,
     pub zopfli_split_max: Option<u32>,
+    /// `--tune <spec>` — L1 fast-path matchfinder config override, parsed by
+    /// `compress::deflate::parse::fast::tune::parse_spec`. ONLY recognized
+    /// when the crate is built with the `l1-tune` feature (a measurement/dev
+    /// knob, never the production path); the arg-parse loop below gates
+    /// recognition on `#[cfg(feature = "l1-tune")]`, so a feature-off build
+    /// falls through to the "Unknown option" error automatically. Replaces
+    /// the `GZIPPY_L1TUNE_*` env-var pile as the sweep driver's channel —
+    /// see `fulcrum l1search` (fulcrum repo), which shells out to an
+    /// l1-tune-built gzippy with this flag per candidate config.
+    #[cfg(feature = "l1-tune")]
+    pub tune: Option<String>,
 }
 
 impl Default for GzippyArgs {
@@ -91,6 +102,8 @@ impl Default for GzippyArgs {
             zopfli_iterations: None,
             zopfli_no_split: false,
             zopfli_split_max: None,
+            #[cfg(feature = "l1-tune")]
+            tune: None,
         }
     }
 }
@@ -264,6 +277,18 @@ impl GzippyArgs {
                                     value
                                 ))
                             })?);
+                        } else if let Some(_value) = arg.strip_prefix("--tune=") {
+                            #[cfg(feature = "l1-tune")]
+                            {
+                                args.tune = Some(_value.to_string());
+                            }
+                            #[cfg(not(feature = "l1-tune"))]
+                            {
+                                return Err(GzippyError::invalid_argument(
+                                    "Unknown option: --tune (requires the l1-tune build feature)"
+                                        .to_string(),
+                                ));
+                            }
                         } else if arg == "--level"
                             || arg == "--blocksize"
                             || arg == "--processes"
@@ -272,6 +297,7 @@ impl GzippyArgs {
                             || arg == "--alias"
                             || arg == "--zopfli-iterations"
                             || arg == "--block-split-max"
+                            || (cfg!(feature = "l1-tune") && arg == "--tune")
                         {
                             // These require the next argument
                             if i + 1 >= argv.len() {
@@ -315,6 +341,8 @@ impl GzippyArgs {
                                         ))
                                     })?)
                                 }
+                                #[cfg(feature = "l1-tune")]
+                                "--tune" => args.tune = Some(value.to_string()),
                                 _ => unreachable!(),
                             }
                         } else {

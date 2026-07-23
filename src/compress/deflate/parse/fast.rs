@@ -598,6 +598,90 @@ pub mod tune {
     pub fn set(t: L1Tune) {
         *cell().write().unwrap() = t;
     }
+
+    /// The un-tuned "no levers" starting point [`parse_spec`] fills in
+    /// from — the SAME literal struct the deleted `examples/l1_search.rs`
+    /// used as every named config's `..base`. Distinct from
+    /// [`L1Tune::from_env`]'s default, which reproduces the CURRENT SHIPPED
+    /// `l1-tune`-off behavior (hash3-gate ON): `baseline` is the
+    /// all-levers-off reference point sweeps compare against.
+    pub fn baseline() -> L1Tune {
+        L1Tune {
+            lazy_peek_max_len: 4,
+            lazy_peek_min_dist: 8192,
+            insert_depth: 3,
+            block_length: 65536,
+            bucket2_enabled: false,
+            bucket2_gate_max_len: 8,
+            chain_enabled: false,
+            chain_lit_threshold_pct: 80,
+            chain_max_search_depth: 16,
+            hash3_enabled: false,
+            hash3_bits: 13,
+            hash3_always_probe: false,
+            hash3_max_dist: 4096,
+            hash3_insert_always: true,
+            hash3_gated: false,
+            hash3_gate_lit_threshold_pct: 80,
+            hash3_gate_warm_insert: true,
+            hash3_gate_initial_active: true,
+        }
+    }
+
+    /// Parse a `--tune` CLI spec: comma-separated `key=value` pairs applied
+    /// on top of [`baseline`] — the exact grammar the deleted
+    /// `examples/l1_search.rs`'s `spec:` prefix used (minus the prefix; the
+    /// CLI flag itself now plays that role). Ported verbatim (2026-07-25
+    /// measurement-tooling-boundary migration, see
+    /// `docs/parallel-decode-architecture.md`-adjacent CLAUDE.md rule: "ALL
+    /// measurement DRIVERS migrate to fulcrum") so `fulcrum l1search` can
+    /// shell out to an `l1-tune`-built gzippy with ONE well-defined flag
+    /// instead of setting a pile of `GZIPPY_L1TUNE_*` env vars per candidate.
+    /// `from_env` (env-var overrides) still exists for local manual
+    /// debugging; it is no longer the sweep driver's channel.
+    pub fn parse_spec(spec: &str) -> Result<L1Tune, String> {
+        fn field<T: std::str::FromStr>(key: &str, v: &str) -> Result<T, String> {
+            v.parse::<T>()
+                .map_err(|_| format!("--tune: invalid value for '{key}': '{v}'"))
+        }
+        let mut cfg = baseline();
+        for kv in spec.split(',') {
+            let mut it = kv.splitn(2, '=');
+            let k = it.next().unwrap_or("");
+            let v = it.next().unwrap_or("");
+            match k {
+                "peekmax" => cfg.lazy_peek_max_len = field(k, v)?,
+                "peekdist" => cfg.lazy_peek_min_dist = field(k, v)?,
+                "depth" => cfg.insert_depth = field(k, v)?,
+                "block" => cfg.block_length = field(k, v)?,
+                "bucket2" => cfg.bucket2_enabled = v == "1" || v == "true",
+                "gate" => cfg.bucket2_gate_max_len = field(k, v)?,
+                // Added 2026-07-25 (measurement-tooling-boundary migration):
+                // the deleted `examples/l1_search.rs`'s `named_configs`' axis
+                // F (CONTENT-ADAPTIVE CHAIN MATCHING, "chain-t{threshold}-
+                // d{depth}") built these directly via `L1Tune{ chain_enabled:
+                // true, .. }` struct literals in-process and was NEVER
+                // reachable through this `spec:` grammar — `fulcrum
+                // l1search`'s only channel to gzippy is now `--tune`, so the
+                // keys must exist here for that axis to stay reproducible.
+                "chain" => cfg.chain_enabled = v == "1" || v == "true",
+                "chainthreshold" => cfg.chain_lit_threshold_pct = field(k, v)?,
+                "chaindepth" => cfg.chain_max_search_depth = field(k, v)?,
+                "hash3" => cfg.hash3_enabled = v == "1" || v == "true",
+                "hash3bits" => cfg.hash3_bits = field(k, v)?,
+                "hash3always" => cfg.hash3_always_probe = v == "1" || v == "true",
+                "hash3maxdist" => cfg.hash3_max_dist = field(k, v)?,
+                "hash3insertalways" => cfg.hash3_insert_always = v == "1" || v == "true",
+                "hash3gated" => cfg.hash3_gated = v == "1" || v == "true",
+                "hash3gatethreshold" => cfg.hash3_gate_lit_threshold_pct = field(k, v)?,
+                "hash3gatewarm" => cfg.hash3_gate_warm_insert = v == "1" || v == "true",
+                "hash3gateinit" => cfg.hash3_gate_initial_active = v == "1" || v == "true",
+                "" => {}
+                _ => return Err(format!("--tune: unknown spec key '{k}'")),
+            }
+        }
+        Ok(cfg)
+    }
 }
 
 /// SHIP DECISION (2026-07-24, RE-RUN with the corrected config after
