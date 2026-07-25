@@ -1137,6 +1137,58 @@ unsafe fn emit_literal_run(
 /// constant, before revert) is reproduced in full in the commit message of
 /// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
 /// this file).
+///
+/// PRE-EMPTED AGAIN (2026-07-25, "TRACK 3 — two-pass ICF fast path" mission
+/// brief): a second, independently-worded mission brief re-proposed the same
+/// design the 2026-07-22 PRE-EMPTED note above already killed without a
+/// rebuild (`git show bbcbb9c6`) — pass 1 parses to a packed record stream +
+/// histograms with NO emit state, pass 2 builds the Huffman code and runs a
+/// "tight uniform loop over records" with a per-block-computed flush budget.
+/// This is `IcfRec`/`Sink::icf_records`/`emit_records_icf` (commit
+/// `522b7d96`, the ICF-ARCHITECTURE note above) again, verified by a FRESH
+/// re-read this session (not by re-trusting old prose), addressing the new
+/// brief's three specific load-bearing claims for why it would differ:
+///
+/// 1. "Known-histogram flush budget, computable per block, not pessimistic"
+///    — this is the exact mechanism the BATCHED-FLUSH v1/v2 note above
+///    already built (reading `litcode.lens` for the block's actual max
+///    codeword length, tiers 4/5/6/8) and gated as a NET REGRESSION in all 8
+///    {corpus x level} cells (+1.2% to +9.1% instructions). Already
+///    falsified by rebuild+measurement, not merely by analogy.
+/// 2. "Register pressure — pass 1 with no emit state should free registers
+///    for the matchfinder" — checked by a fresh read of `fast::run` (this
+///    file's sibling `fast.rs`) and `lazy::run` this session: parse and emit
+///    are ALREADY two separate function calls in every strategy that
+///    exists — `fastloop_l0`/`fastloop_l1`/`lazy::run`'s inner loop populate
+///    `Sink` only (no `BitWriter` touched), and `emit_block`/
+///    `emit_block_static_or_stored` are called AFTER that loop returns, once
+///    per block. There is no fused parse+emit loop anywhere in this module
+///    for a two-pass split to un-fuse. (The SF3/SF5/SF7 register-pressure
+///    fixes elsewhere in this codebase's history — `git log --grep=SF[0-9]`
+///    — are entirely about the hash-chain matchfinder's OWN internal
+///    register allocation, e.g. hoisting table base pointers in `hc.rs`;
+///    they are unrelated to any parse/emit fusion and do not support this
+///    claim.) This premise does not hold for the code as it exists.
+/// 3. "Measured target shape... igzip 83-86%/11-13%, gzippy 4.61x/3.02x
+///    Ir/token" — re-checked this session: these figures still do not
+///    appear anywhere in this repository (`grep -rn` across `src/`, `docs/`,
+///    and `vendor/` for both figures, this session, found nothing beyond
+///    this sentence itself). Same conclusion the 2026-07-22 note already
+///    reached; still ungrounded, not a Fulcrum finding.
+///
+/// All three claims fail on inspection alone (not on trusting old notes'
+/// verdicts), so no rebuild was performed — rebuilding would exactly
+/// reproduce `522b7d96`'s already-gated (both arches, N=21 interleaved
+/// paired wall, cachegrind-corroborated) net-regression result. No new box
+/// time spent (M1 or otherwise); no `twopass` Cargo feature was added.
+///
+/// Reopen trigger: unchanged from the 2026-07-22 note — a mechanism that
+/// changes the OUTER per-Seq loop's structure itself (not flush cadence, not
+/// record shape, not codeword-merge math — six variants across those three
+/// axes are now falsified). A future session proposing another "two-pass"
+/// or "ICF" design for this fast path should diff its concrete mechanism
+/// against `522b7d96` FIRST; if the mechanism is the same, this note (and
+/// its numbers) already answers it.
 fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
