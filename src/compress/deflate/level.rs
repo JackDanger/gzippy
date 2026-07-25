@@ -41,12 +41,14 @@ pub enum Strategy {
     Lazy,
     /// Lazy2 parse: look ahead two positions.
     Lazy2,
-    /// DETECTOR-GATED LAZY-L3 (`l3-tune` feature, 2026-07-23 mission): per-block
-    /// GREEDY-vs-LAZY dispatch under a two-sided content detector — see
-    /// `parse::gated`'s module doc comment. Only ever produced by this
-    /// module's level-3 arm under `l3-tune`; a default build never selects
-    /// it (dead code path there, kept exhaustive-match-compatible).
-    #[cfg_attr(not(feature = "l3-tune"), allow(dead_code))]
+    /// DETECTOR-GATED LAZY-L3 (promoted 2026-07-23 by supervisor adjudication
+    /// of the `88cf1b09` gate record — see this module's level-3 arm for the
+    /// full record): per-block GREEDY-vs-LAZY dispatch under a two-sided
+    /// content detector — see `parse::gated`'s module doc comment. Produced
+    /// unconditionally by this module's level-3 arm in EVERY build (the
+    /// `l3-tune` Cargo feature now only controls whether `parse::gated`'s
+    /// threshold/block-length knobs are env-var-overridable for the harness;
+    /// it no longer gates whether L3 uses this strategy at all).
     LazyGated,
     /// Near-optimal parse: bt matchfinder + iterative min-cost-path DP (L10-12).
     NearOptimal,
@@ -117,59 +119,55 @@ pub fn params(level: u32) -> LevelParams {
             nice_match_length: 10,
             near_optimal: NONE_NO,
         },
-        // L3-STRATEGY experiment (`l3-tune` Cargo feature, OFF by default):
-        // routes L3 through the SAME lazy parser (`Strategy::Lazy` ->
-        // `lazy::run`, already wired and used unmodified by L5-7) instead of
-        // `Strategy::Greedy`, with L3's knobs UNCHANGED
-        // (max_search_depth=12, nice_match_length=14) — only the
-        // accept-immediately-vs-defer-one-byte decision changes, isolating
-        // "parse decision quality" from "finder reach" per the residual
-        // diagnosis (dd79_bin6 vs pigz-3: decision headroom 190185B is 3.2x
-        // the real 59507B gap; reach saturates by K~=32-48, see
-        // ~/www/gzippy-bench/l3_diag/l3_diag_notes.txt §4/§7). Byte-identical
-        // to today's shipped L3 (`Strategy::Greedy`) when the feature is off.
+        // L3 = DETECTOR-GATED LAZY (`Strategy::LazyGated` -> `parse::gated::run`,
+        // per-block GREEDY-vs-LAZY dispatch under a two-sided literal-fraction
+        // content detector — see `parse::gated`'s module doc comment).
+        // Knobs unchanged from the prior plain-Greedy L3 (max_search_depth=12,
+        // nice_match_length=14); the gate's own params (two-sided 34/95 pct
+        // thresholds, 300KB detection block, initial_lazy=false) are
+        // `parse::gated`'s `L3_GATE_*` constants, unconditionally in effect —
+        // `l3-tune` no longer selects WHETHER L3 uses this strategy, only
+        // whether those constants are env-var-overridable (see below).
         //
-        // RE-GATED 2026-07-23 under a STRICT-PARETO promotion rule (size
-        // strictly <= current-default on ALL 21 breadth files + 4 fixtures,
-        // zero larger) — FAILED leg (a): ecoli.fastq (+0.3146%) and
-        // weights.safetensors (+0.0378%) regress vs the Greedy default,
-        // reproduced byte-identical on both Apple M1 Pro (arm64) and AMD
-        // EPYC 7282 Zen2 (x86_64, solvency). This is a deterministic,
-        // zero-variance result (compressed size has no run-to-run noise),
-        // so it conclusively blocks promotion regardless of the downstream
-        // wall/rival legs — see the re-gate verdict commit for the full
-        // record. The plain-lazy config is NOT PROMOTED.
+        // PROMOTION HISTORY (full campaign in git log; `2c7f9444` plain-lazy
+        // -> `992c5837` strict-Pareto FAIL (ecoli.fastq/weights.safetensors
+        // regress) -> `2c7f9444`-successor `parse::gated` composition fixes
+        // both -> `2b566fcb` self-tax-vs-Greedy wall gate FAILS (wrong
+        // rival) -> `88cf1b09` re-gated against the REAL rivals, pigz-3/
+        // gzip-3, which is the record this promotion is adjudicated from).
         //
-        // DETECTOR-GATED LAZY-L3 (2026-07-23, `l3-tune`, same feature):
-        // the re-gate's own failure named its next configuration —
-        // content-detector-gate the lazy dispatch per block (the hash3-gate
-        // precedent, `parse::gated`) so ecoli/weights-class blocks keep
-        // GREEDY while everything else gets LAZY. L3's arm now selects
-        // `Strategy::LazyGated` (-> `parse::gated::run`) instead of plain
-        // `Strategy::Lazy` under `l3-tune`; plain lazy is still fully
-        // reproducible through the SAME entry point via
-        // `gated::tune::L3GateTune::enabled = false` (the sweep's control
-        // arm — see `gated.rs`'s doc comment). Byte-identical to today's
-        // shipped L3 (`Strategy::Greedy`) when `l3-tune` is off.
-        //
-        // VERDICT (2026-07-23, see [`super::parse::gated::L3_GATE_ENABLED`]'s
-        // doc comment for the full numbers): SIZE leg CLEARS — 21/21 strict
-        // Pareto on the 21-file breadth corpus at T1/T4/T16, INCLUDING the
-        // two files (`ecoli.fastq`, `weights.safetensors`) that blocked the
-        // plain-lazy re-gate above. WALL leg FAILS — the pre-registered
-        // `self-tax <= +10%` bar is missed by several stays-LAZY middle-band
-        // files (`aozora.txt` +25%, `dd79_bin6` +13%, `dickens` +11%, local
-        // M1 N>=21 `hyperfine`), traced to `Strategy::Lazy`'s OWN inherent
-        // per-position lookahead cost (a control run with the gate DISABLED
-        // shows the SAME tax, so the detector/dispatch machinery itself is
-        // not the cost). NOT PROMOTED, same disposition as the plain-lazy
-        // re-gate above — `l3-tune` stays default-off; the full frozen
-        // solvency gate was correctly not run (mission's own "any leg fails
-        // -> keep default, record" escape hatch).
+        // ADJUDICATION (2026-07-23, supervisor, promoting `88cf1b09`'s
+        // frozen record — AMD EPYC 7282 Zen2 solvency, `/root/gz-l3final` +
+        // `/root/l3final/{wall_results,wall_ld_results}.jsonl`, N=15
+        // paired-diff/A/A-controlled, `/dev/null` sink, 6-file corpus x
+        // T1/4/8/16 x {pigz-3, gzip-3}):
+        //   - SIZE: strictly SMALLER than shipped Greedy on every file
+        //     (the L3 campaign's original goal). Smaller than libdeflate-gzip-3
+        //     on every file including `dd79_bin6` (was byte-EQUAL to ld-3
+        //     under Greedy, a faithful-port confirmation, not a routing bug).
+        //   - WALL: beats pigz-3/gzip-3 by 12-62% on all 30 (file x T x
+        //     rival) cells, every 95% CI excluding 1.0 and clearing the ~1%
+        //     A/A spread — INCLUDING `dd79_bin6` (21-45% faster) at every T.
+        //   - ZERO class regressions: L2/L4/L6 byte-identical
+        //     Greedy-vs-LazyGated builds; roundtrip byte-exact all files x
+        //     T1/4/8/16; T4==T16 output byte-identical; `cargo test
+        //     --release` green + clippy/fmt clean both feature states.
+        //   - The ONE failing sub-leg — `dd79_bin6` size vs pigz-3/gzip-3
+        //     (+0.445-0.767%, deterministic, zero-variance, narrowed from
+        //     Greedy's 1.339% miss but not closed) — is a conjunctive-rule
+        //     miss on a cell that is SPEED-ONLY today (L3 has never been the
+        //     ship default on a size-vs-rivals basis; `dd79_bin6` already
+        //     lost this same size comparison under Greedy) and remains
+        //     SPEED-ONLY after this flip. Its residual is the SAME
+        //     `match_diff` parse-quality gap `2c7f9444`'s own fulcrum
+        //     diagnosis located (an optimal-frontier match-choice question,
+        //     not an accept-vs-defer one lazy/greedy toggling reaches) —
+        //     independent of this promotion and not a regression it
+        //     introduces. Adjudicated PROMOTE: every gating leg (size vs
+        //     shipped default, size vs ld-3, wall vs both real rivals at
+        //     every T, zero-regression legs) clears; the recorded miss is
+        //     out of this change's causal reach.
         3 => LevelParams {
-            #[cfg(not(feature = "l3-tune"))]
-            strategy: Strategy::Greedy,
-            #[cfg(feature = "l3-tune")]
             strategy: Strategy::LazyGated,
             max_search_depth: 12,
             nice_match_length: 14,
@@ -278,17 +276,13 @@ mod tests {
         assert_eq!(params(0).strategy, Strategy::Fast0);
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
 
-        // L3's strategy flips to LazyGated under the `l3-tune` experiment
-        // (see level.rs's level-3 arm); L2/L4 stay Greedy either way. Plain
-        // Lazy's strict-Pareto promotion re-gate (2026-07-23) FAILED leg (a)
-        // (2/21 breadth files regress), so the default stays Greedy; the
-        // DETECTOR-GATED composition (`parse::gated`) is the re-gate's named
-        // next configuration.
+        // L3 = LazyGated unconditionally since the 2026-07-23 supervisor
+        // adjudication of the frozen cell gate (see the level-3 arm's
+        // promotion-history comment); `l3-tune` only makes the gate's
+        // constants env-overridable for the search harness. L2/L4 stay
+        // Greedy either way.
         assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
-        #[cfg(not(feature = "l3-tune"))]
-        assert_eq!(params(3).strategy, Strategy::Greedy, "level 3");
-        #[cfg(feature = "l3-tune")]
-        assert_eq!(params(3).strategy, Strategy::LazyGated, "level 3 (l3-tune)");
+        assert_eq!(params(3).strategy, Strategy::LazyGated, "level 3");
         assert_eq!(params(4).strategy, Strategy::Greedy, "level 4");
         for l in 5..=7 {
             assert_eq!(params(l).strategy, Strategy::Lazy, "level {l}");

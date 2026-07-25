@@ -1,5 +1,7 @@
-//! DETECTOR-GATED LAZY-L3 (`l3-tune` feature; NOT a production strategy in
-//! the default build — see `level.rs`'s level-3 arm).
+//! DETECTOR-GATED LAZY-L3 — THE PRODUCTION L3 STRATEGY since the 2026-07-23
+//! supervisor adjudication of the frozen cell gate (`level.rs`'s level-3 arm
+//! carries the full promotion history; `l3-tune` now only makes this module's
+//! `L3_GATE_*` constants env-overridable for the search harness).
 //!
 //! Mission: plain lazy-at-L3 (`2c7f9444`, `Strategy::Lazy` under `l3-tune`,
 //! L3's knobs unchanged) is 19/21 strictly smaller than the shipped Greedy
