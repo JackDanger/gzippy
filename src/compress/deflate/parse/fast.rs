@@ -169,10 +169,70 @@ pub mod tune {
 
     #[derive(Clone, Copy, Debug)]
     pub struct L1Tune {
-        /// Overrides [`super::LAZY_PEEK_MAX_LEN`].
+        /// Overrides [`super::LAZY_PEEK_MAX_LEN`] — the WIDE pair used when
+        /// [`Self::lazy_peek_gated`] is off, or when it is on AND the
+        /// current block is gate-ACTIVE (see that field's doc comment).
         pub lazy_peek_max_len: u32,
-        /// Overrides [`super::LAZY_PEEK_MIN_DIST`].
+        /// Overrides [`super::LAZY_PEEK_MIN_DIST`] (paired with
+        /// `lazy_peek_max_len`, see its doc comment).
         pub lazy_peek_min_dist: usize,
+        /// LAZY-PEEK-GATE lever (2026-07-25 campaign, "repair the
+        /// libdeflate x dd79_text6 x L1 both-axes LOSS" mission): reuses the
+        /// SAME free per-block literal-fraction detector the HASH3-GATE
+        /// lever introduced (`Hash3Cfg`'s doc comment) to gate the LAZY-PEEK
+        /// WIDENING itself, instead of running the widened
+        /// `16`/`0` peek unconditionally for the whole file. Off by default
+        /// (`false`): when off, the peek behaves EXACTLY as documented on
+        /// `lazy_peek_max_len`/`lazy_peek_min_dist` (always that pair, every
+        /// block) — this field only changes behavior when it is on. When
+        /// on, a block's lazy peek uses the WIDE pair
+        /// (`lazy_peek_max_len`/`lazy_peek_min_dist`) iff the preceding
+        /// block's literal fraction is `>= lazy_peek_gate_lit_threshold_pct`
+        /// (bin/sqlite-class — the lever's measured win target) and the
+        /// NARROW pair (`lazy_peek_narrow_max_len`/`lazy_peek_narrow_min_
+        /// dist`, the pre-widening `4`/`8192` gate) otherwise — aiming to
+        /// keep the wide peek's ratio win where it pays (bin/sqlite-class
+        /// content) and revert to the cheap peek where it doesn't
+        /// (text-class content, the measured both-axes LOSS this lever
+        /// exists to close). Same one-block-lag / "first block has no
+        /// signal yet" scope gap as `chain_enabled`/`hash3_gated`.
+        ///
+        /// FALSIFIED (2026-07-25 — see [`super::LAZY_PEEK_GATED`]'s doc
+        /// comment for the full sweep + isolation story): a fine per-file
+        /// threshold sweep (5-45) finds a smooth, non-knife-edge ramp on
+        /// `dd79_text6` and a threshold in `[37,40]` that fully reverts it
+        /// while leaving `dd79_bin6`/`data.sqlite` untouched — the detector
+        /// and threshold work exactly as designed. But even a full revert
+        /// only moves `dd79_text6`'s wall vs `libdeflate-gzip -1` from
+        /// 1.133 to 1.080 (real, but not under 1.0 — does not clear the
+        /// ship rule). Isolation attributes the remaining ~8-9 points to
+        /// HASH3-GATE's mere PRESENCE in the hot loop, confirmed
+        /// insensitive to ITS OWN gate threshold (raising `hash3gate
+        /// threshold` to 90 leaves `dd79_text6`'s wall unchanged while
+        /// visibly breaking `dd79_bin6`'s own hash3 win) — a structural
+        /// codegen tax, not a probe-frequency one, so no threshold on
+        /// either lever's detector closes it. Stays `false`
+        /// (byte-identical AND wall-identical to before this lever
+        /// existed, confirmed on a prod build); not promoted.
+        pub lazy_peek_gated: bool,
+        /// Literal-fraction threshold in PERCENT for
+        /// [`Self::lazy_peek_gated`] (same formula as
+        /// `hash3_gate_lit_threshold_pct`, an independent knob so the two
+        /// composed gates can be tuned separately).
+        pub lazy_peek_gate_lit_threshold_pct: u32,
+        /// Starting state (before any block has produced a literal-fraction
+        /// signal) for [`Self::lazy_peek_gated`]'s per-block decision —
+        /// same knob shape as `hash3_gate_initial_active` (see its doc
+        /// comment for the T1-vs-T>1 chunk-reset story that made `true`
+        /// the measured-best choice there).
+        pub lazy_peek_gate_initial_active: bool,
+        /// The NARROW pair used by [`Self::lazy_peek_gated`] on a
+        /// gate-inactive (text-class) block — defaults to the pre-widening
+        /// `4`/`8192` gate (see [`super::LAZY_PEEK_MAX_LEN`]'s doc comment
+        /// for that gate's own history).
+        pub lazy_peek_narrow_max_len: u32,
+        /// Paired with [`Self::lazy_peek_narrow_max_len`].
+        pub lazy_peek_narrow_min_dist: usize,
         /// Overrides [`super::LAZY_PEEK_COST_GATE_ENABLED`] — the
         /// bit-cost-comparison refinement of the lazy-peek accept/defer
         /// decision (see that const's doc comment for the
@@ -544,6 +604,29 @@ pub mod tune {
                     "GZIPPY_L1TUNE_LAZY_PEEK_MIN_DIST",
                     super::LAZY_PEEK_MIN_DIST,
                 ),
+                // Mirrors every other field's convention: `from_env`'s
+                // fallback is `super::LAZY_PEEK_*`, the production const —
+                // so a `l1-tune`-feature build with NO env override
+                // reproduces whatever the shipped default currently is
+                // (still OFF as of this comment; see [`super::
+                // LAZY_PEEK_GATED`]'s doc comment for the promotion state).
+                lazy_peek_gated: env_bool("GZIPPY_L1TUNE_LAZY_PEEK_GATED", super::LAZY_PEEK_GATED),
+                lazy_peek_gate_lit_threshold_pct: env_u32(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_GATE_THRESHOLD_PCT",
+                    super::LAZY_PEEK_GATE_LIT_THRESHOLD_PCT,
+                ),
+                lazy_peek_gate_initial_active: env_bool(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_GATE_INITIAL_ACTIVE",
+                    super::LAZY_PEEK_GATE_INITIAL_ACTIVE,
+                ),
+                lazy_peek_narrow_max_len: env_u32(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_NARROW_MAX_LEN",
+                    super::LAZY_PEEK_NARROW_MAX_LEN,
+                ),
+                lazy_peek_narrow_min_dist: env_usize(
+                    "GZIPPY_L1TUNE_LAZY_PEEK_NARROW_MIN_DIST",
+                    super::LAZY_PEEK_NARROW_MIN_DIST,
+                ),
                 lazy_peek_cost_gate_enabled: env_bool(
                     "GZIPPY_L1TUNE_LAZY_PEEK_COST_GATE",
                     super::LAZY_PEEK_COST_GATE_ENABLED,
@@ -631,6 +714,11 @@ pub mod tune {
         L1Tune {
             lazy_peek_max_len: 4,
             lazy_peek_min_dist: 8192,
+            lazy_peek_gated: false,
+            lazy_peek_gate_lit_threshold_pct: 80,
+            lazy_peek_gate_initial_active: true,
+            lazy_peek_narrow_max_len: 4,
+            lazy_peek_narrow_min_dist: 8192,
             lazy_peek_cost_gate_enabled: false,
             lazy_peek_cost_margin_bits: 0,
             insert_depth: 3,
@@ -676,6 +764,11 @@ pub mod tune {
             match k {
                 "peekmax" => cfg.lazy_peek_max_len = field(k, v)?,
                 "peekdist" => cfg.lazy_peek_min_dist = field(k, v)?,
+                "peekgated" => cfg.lazy_peek_gated = v == "1" || v == "true",
+                "peekgatethreshold" => cfg.lazy_peek_gate_lit_threshold_pct = field(k, v)?,
+                "peekgateinit" => cfg.lazy_peek_gate_initial_active = v == "1" || v == "true",
+                "peeknarrowmax" => cfg.lazy_peek_narrow_max_len = field(k, v)?,
+                "peeknarrowdist" => cfg.lazy_peek_narrow_min_dist = field(k, v)?,
                 "peekcost" => cfg.lazy_peek_cost_gate_enabled = v == "1" || v == "true",
                 "peekcostmargin" => cfg.lazy_peek_cost_margin_bits = field(k, v)?,
                 "depth" => cfg.insert_depth = field(k, v)?,
@@ -1196,6 +1289,92 @@ const LAZY_PEEK_MAX_LEN: u32 = 16;
 /// config's wall cost (see the promotion commit message).
 const LAZY_PEEK_MIN_DIST: usize = 0;
 
+/// LAZY-PEEK-GATE lever (2026-07-25 campaign, "repair the libdeflate x
+/// dd79_text6 x L1 both-axes LOSS" mission — see `l1-tune`'s
+/// `tune::L1Tune::lazy_peek_gated` doc comment for the full mechanism: reuse
+/// the HASH3-GATE composition's free per-block literal-fraction detector to
+/// gate the LAZY-PEEK WIDENING itself, keeping the WIDE `LAZY_PEEK_MAX_LEN`/
+/// `LAZY_PEEK_MIN_DIST` pair on bin/sqlite-class blocks (the widening's
+/// measured win target) and reverting to the pre-widening NARROW pair
+/// (`LAZY_PEEK_NARROW_MAX_LEN`/`LAZY_PEEK_NARROW_MIN_DIST`) on text-class
+/// blocks, where the wide peek's extra probes measurably cost more wall
+/// than the size it recovers (the `libdeflate x dd79_text6 x L1` regression
+/// this lever exists to close).
+///
+/// FALSIFIED (2026-07-25, same mission — kept as tested, measured `l1-tune`
+/// infrastructure per this file's own convention, e.g.
+/// `LAZY_PEEK_COST_GATE_ENABLED`/`bucket2_enabled`; `false` here means the
+/// default build is BYTE-IDENTICAL and WALL-IDENTICAL to before this lever
+/// existed — confirmed directly: a prod (`l1-tune`-off) build of this
+/// lever's code with the const left `false` reproduced the pre-lever
+/// baseline's `dd79_text6`/`dd79_bin6`/`data.sqlite` sizes byte-for-byte AND
+/// its wall within noise on solvency, AMD EPYC 7282, N=21 interleaved
+/// paired vs `libdeflate-gzip -1`).
+///
+/// A per-file, fine-grained (not aggregate) threshold sweep (5-45 in steps
+/// of 1, `l1-tune`'s size-only path, so build-flavor-independent) found a
+/// SMOOTH ramp on `dd79_text6` — not a knife-edge like `L1_HASH3_GATE_LIT_
+/// THRESHOLD_PCT`'s `dd79_bin6` cliff at 50 — from byte-identical-to-wide
+/// below 25 to a fully-reverted plateau at 40+, while `dd79_bin6` stayed
+/// BYTE-IDENTICAL to the wide-peek default at every threshold up to at
+/// least 90 and `data.sqlite` only started moving past 37 (negligible,
+/// +0.02%, until threshold 48+). So a threshold in `[37, 40]` gates
+/// `dd79_text6` to a full revert while leaving `dd79_bin6`/`data.sqlite`
+/// untouched — the detector and threshold ARE exactly what the mission
+/// asked for.
+///
+/// But even a FULL revert (threshold 40, matching an unconditional
+/// `LAZY_PEEK_NARROW_MAX_LEN`/`LAZY_PEEK_NARROW_MIN_DIST`-everywhere build)
+/// only moves `dd79_text6`'s wall ratio vs `libdeflate-gzip -1` from 1.133
+/// (shipped) to 1.080 — real (outside the ~1-2% inter-run spread) but
+/// NOT under 1.0, so it does NOT clear the ship rule's leg (a) ("EXITS the
+/// LOSS class — either WIN or at minimum SPEED-ONLY with wall < 1.0"). A
+/// direct isolation (const-patched prod builds, same protocol) attributes
+/// the residual: reverting ONLY the peek (`LAZY_PEEK_MAX_LEN`/`MIN_DIST`
+/// back to 4/8192 file-wide, HASH3-GATE left at its shipped default)
+/// measures 1.090; reverting BOTH the peek AND `Hash3Cfg::shipped().enabled`
+/// measures 1.008 (a NOISY near-tie) — an ~8-9 percentage-point gap
+/// attributable to HASH3-GATE's mere PRESENCE in the hot per-position loop,
+/// not to how often it fires. Confirmed decisively: raising `L1_HASH3_GATE_
+/// LIT_THRESHOLD_PCT` alone (shipped peek unchanged) to 90 — so high the
+/// gate barely ever activates even on `dd79_bin6` (whose OWN size regresses
+/// from 0.960x to 0.988x libdeflate at that threshold, proving the gate
+/// really did almost stop firing there) — leaves `dd79_text6`'s wall
+/// UNCHANGED at 1.137 (statistically identical to shipped's 1.133). The tax
+/// is paid on every position regardless of the gate's runtime value — a
+/// structural/codegen cost (the extra `Hash3Cfg` parameter, the `head3`
+/// touch/probe branches, likely reduced inlining or register pressure in
+/// `process_position_l1`/`fastloop_l1`) from the mere PRESENCE of the
+/// HASH3-GATE machinery, not a probe-frequency-dependent one — so no
+/// threshold on either detector (this lever's OR hash3's own) can close it.
+///
+/// Not promotable within this mission's scope: fully closing this cell
+/// would require making HASH3-GATE (and the wide peek) compile OUT of the
+/// hot loop entirely for text-classified stretches — a genuinely separate,
+/// leaner monomorphized fast-loop variant selected by a coarser dispatch —
+/// not a runtime gate on the existing shared function, and touching
+/// `Hash3Cfg::shipped().enabled` at all is independently disqualified: it
+/// would give back `dd79_bin6`'s own hash3-earned win vs `pigz -1`, the
+/// exact cell HASH3-GATE was promoted to fix. `false` stays the shipped
+/// default; this is a FALSIFY entry (re-open trigger: a monomorphized
+/// hash3-off/peek-off fast-loop specialization, not another threshold
+/// sweep on this same shared-function shape).
+const LAZY_PEEK_GATED: bool = false;
+/// Literal-fraction threshold in PERCENT for [`LAZY_PEEK_GATED`] (mirrors
+/// [`L1_HASH3_GATE_LIT_THRESHOLD_PCT`]'s formula, an independent knob).
+const LAZY_PEEK_GATE_LIT_THRESHOLD_PCT: u32 = 48;
+/// Starting state for [`LAZY_PEEK_GATED`]'s per-block decision before any
+/// block has produced a signal (mirrors [`L1_HASH3_GATE_INITIAL_ACTIVE`]'s
+/// T1-vs-T>1 chunk-reset reasoning).
+const LAZY_PEEK_GATE_INITIAL_ACTIVE: bool = true;
+/// The pre-widening NARROW pair [`LAZY_PEEK_GATED`] reverts to on a
+/// gate-inactive (text-class) block — see [`LAZY_PEEK_MAX_LEN`]'s doc
+/// comment for that pair's own history as the shipped default before the
+/// 2026-07-23 widening.
+const LAZY_PEEK_NARROW_MAX_LEN: u32 = 4;
+/// Paired with [`LAZY_PEEK_NARROW_MAX_LEN`].
+const LAZY_PEEK_NARROW_MIN_DIST: usize = 8192;
+
 /// COST-GATE refinement of the lazy peek (2026-07 campaign, the falsifier
 /// run of the `LAZY_PEEK_MAX_LEN`/`LAZY_PEEK_MIN_DIST` widening above):
 /// `fulcrum ratio map --raw data.sqlite --enc gzippy=... --finder-model
@@ -1443,6 +1622,12 @@ fn process_position_l1(
     // call (same reason `chain_mode_next` lives outside `L1Tune`). Always
     // `true` when `hash3.gated` is `false`.
     hash3_active: bool,
+    // LAZY-PEEK-GATE lever: THIS BLOCK's gate decision, resolved by the
+    // caller the same way as `hash3_active` (independent detector instance,
+    // own threshold — see [`LAZY_PEEK_GATED`]'s doc comment). Always
+    // irrelevant when the gate itself is off (see the `peek_max_len`/
+    // `peek_min_dist` derivation below).
+    peek_active: bool,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
     unsafe { *head.get_unchecked_mut(h) = pos as u32 };
@@ -1561,10 +1746,27 @@ fn process_position_l1(
         // short accepted matches only, so this branch is rare (most
         // matches are longer, or the position is a miss and never
         // reaches here).
+        //
+        // LAZY-PEEK-GATE (see `LAZY_PEEK_GATED`'s doc comment): when the
+        // gate is on, use the WIDE pair on a gate-active (bin/sqlite-class)
+        // block and the NARROW (pre-widening) pair otherwise; when the gate
+        // is off, always use the WIDE pair — byte-identical to before this
+        // lever existed.
         #[cfg(not(feature = "l1-tune"))]
-        let (peek_max_len, peek_min_dist) = (LAZY_PEEK_MAX_LEN, LAZY_PEEK_MIN_DIST);
+        let (peek_max_len, peek_min_dist) = if LAZY_PEEK_GATED && !peek_active {
+            (LAZY_PEEK_NARROW_MAX_LEN, LAZY_PEEK_NARROW_MIN_DIST)
+        } else {
+            (LAZY_PEEK_MAX_LEN, LAZY_PEEK_MIN_DIST)
+        };
         #[cfg(feature = "l1-tune")]
-        let (peek_max_len, peek_min_dist) = (tune.lazy_peek_max_len, tune.lazy_peek_min_dist);
+        let (peek_max_len, peek_min_dist) = if tune.lazy_peek_gated && !peek_active {
+            (
+                tune.lazy_peek_narrow_max_len,
+                tune.lazy_peek_narrow_min_dist,
+            )
+        } else {
+            (tune.lazy_peek_max_len, tune.lazy_peek_min_dist)
+        };
         if length <= peek_max_len && dist > peek_min_dist {
             #[cfg(feature = "anatomy-counters")]
             {
@@ -1919,6 +2121,9 @@ fn fastloop_l1(
     // for this whole `fastloop_l1` call (one block), passed through
     // unchanged to every `process_position_l1` call site below.
     hash3_active: bool,
+    // LAZY-PEEK-GATE lever: this BLOCK's gate decision, same shape as
+    // `hash3_active` (own independent detector instance).
+    peek_active: bool,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline: warm the head-table line for the
@@ -1990,6 +2195,7 @@ fn fastloop_l1(
                 tune,
                 hash3,
                 hash3_active,
+                peek_active,
             );
             #[cfg(feature = "anatomy-counters")]
             {
@@ -2028,6 +2234,7 @@ fn fastloop_l1(
                     tune,
                     hash3,
                     hash3_active,
+                    peek_active,
                 );
                 #[cfg(feature = "anatomy-counters")]
                 {
@@ -2079,6 +2286,7 @@ fn fastloop_l1(
             tune,
             hash3,
             hash3_active,
+            peek_active,
         );
         #[cfg(feature = "anatomy-counters")]
         {
@@ -2151,6 +2359,23 @@ pub(super) fn run<const ACCEL: bool>(
     let hash3 = Hash3Cfg::shipped();
     #[cfg(feature = "l1-tune")]
     let hash3 = Hash3Cfg::from_tune(l1_tune);
+    // LAZY-PEEK-GATE lever config (see [`LAZY_PEEK_GATED`]'s doc comment):
+    // shipped consts in a default build, `tune::L1Tune`-derived under
+    // `l1-tune`. Plain locals rather than a `Hash3Cfg`-style struct — only
+    // three fields, and unlike `hash3` there is no per-position table to
+    // size off it.
+    #[cfg(not(feature = "l1-tune"))]
+    let (peek_gated, peek_gate_threshold_pct, peek_gate_initial_active) = (
+        LAZY_PEEK_GATED,
+        LAZY_PEEK_GATE_LIT_THRESHOLD_PCT,
+        LAZY_PEEK_GATE_INITIAL_ACTIVE,
+    );
+    #[cfg(feature = "l1-tune")]
+    let (peek_gated, peek_gate_threshold_pct, peek_gate_initial_active) = (
+        l1_tune.lazy_peek_gated,
+        l1_tune.lazy_peek_gate_lit_threshold_pct,
+        l1_tune.lazy_peek_gate_initial_active,
+    );
     // HASH3-PROBE lever's table. Sized dynamically off `hash3.bits` (the
     // size-sweep axis) rather than a fixed const like `head`/`head2` — only
     // allocated (and only non-empty) when both `!ACCEL` (L1-only, mirrors
@@ -2225,6 +2450,10 @@ pub(super) fn run<const ACCEL: bool>(
     // is ALWAYS gated (`hash3.gated == true`), so this state machine is now
     // load-bearing for the default L1 build too.
     let mut hash3_active_next: bool = !hash3.gated || hash3.gate_initial_active;
+    // LAZY-PEEK-GATE lever: same one-block-lag state machine as
+    // `hash3_active_next`, independent threshold/initial-state knobs (see
+    // `LAZY_PEEK_GATED`'s doc comment).
+    let mut peek_active_next: bool = !peek_gated || peek_gate_initial_active;
 
     loop {
         // Start a new block. It ends after `block_length` input bytes (a match
@@ -2237,6 +2466,9 @@ pub(super) fn run<const ACCEL: bool>(
         // arm below does not touch `head3` at all, so it just recomputes
         // `hash3_active_next` for whichever block runs after it).
         let hash3_active = hash3_active_next;
+        // This block's LAZY-PEEK-GATE decision (see `hash3_active`'s doc
+        // comment above — same capture-before-recompute shape).
+        let peek_active = peek_active_next;
 
         // `!ACCEL` is a compile-time-constant branch (ACCEL is a const
         // generic) so L0's monomorphization never carries this dead code —
@@ -2286,6 +2518,10 @@ pub(super) fn run<const ACCEL: bool>(
                 || (total > 0
                     && (literal_count as u64 * 100)
                         >= (hash3.gate_lit_threshold_pct as u64 * total as u64));
+            peek_active_next = !peek_gated
+                || (total > 0
+                    && (literal_count as u64 * 100)
+                        >= (peek_gate_threshold_pct as u64 * total as u64));
             if pos == in_end {
                 break;
             }
@@ -2343,6 +2579,7 @@ pub(super) fn run<const ACCEL: bool>(
                 l1_tune,
                 hash3,
                 hash3_active,
+                peek_active,
             )
         };
 
@@ -2477,6 +2714,10 @@ pub(super) fn run<const ACCEL: bool>(
                 || (total > 0
                     && (literal_count as u64 * 100)
                         >= (hash3.gate_lit_threshold_pct as u64 * total as u64));
+            peek_active_next = !peek_gated
+                || (total > 0
+                    && (literal_count as u64 * 100)
+                        >= (peek_gate_threshold_pct as u64 * total as u64));
         }
 
         // CONTENT-ADAPTIVE CHAIN MATCHING bookkeeping for a block that just
