@@ -58,19 +58,26 @@ pub(super) fn run(
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
 
-        in_next = run_block(
-            buf,
-            in_next,
-            block_begin,
-            in_max_block_end,
-            in_end,
-            params,
-            lazy2,
-            &mut mf,
-            &mut in_base,
-            &mut next_hashes,
-            &mut sink,
-        );
+        // `anatomy-wall` region: `parse_match` — see `greedy.rs`'s sibling
+        // call site for the fused-bucket rationale (identical here: the
+        // lazy/lazy2 per-block token loop has no call boundary between
+        // "probing" and "emission" without per-position timing). Zero cost
+        // when `anatomy-wall` is off.
+        in_next = crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            run_block(
+                buf,
+                in_next,
+                block_begin,
+                in_max_block_end,
+                in_end,
+                params,
+                lazy2,
+                &mut mf,
+                &mut in_base,
+                &mut next_hashes,
+                &mut sink,
+            )
+        });
 
         emit_block(
             bw,

@@ -42,18 +42,29 @@ pub(super) fn run(
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
 
-        in_next = run_block(
-            buf,
-            in_next,
-            block_begin,
-            in_max_block_end,
-            in_end,
-            params,
-            &mut mf,
-            &mut in_base,
-            &mut next_hashes,
-            &mut sink,
-        );
+        // `anatomy-wall` region: `parse_match` — one timer per INTERNAL
+        // BLOCK, matching `fast.rs`'s L0/L1 convention (see
+        // `anatomy_wall` module docs). For the greedy parser (L2/L4) this
+        // wraps the WHOLE per-block token loop (`run_block`): match probe
+        // + accept/literal decision + `Sink::push_{literal,match}` emission
+        // are ALSO fused here, same rationale as the fast parser's fused
+        // bucket — there is no call boundary inside `run_block` to split
+        // "probing" from "emission" without going to per-position
+        // granularity (disallowed). Zero cost when `anatomy-wall` is off.
+        in_next = crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            run_block(
+                buf,
+                in_next,
+                block_begin,
+                in_max_block_end,
+                in_end,
+                params,
+                &mut mf,
+                &mut in_base,
+                &mut next_hashes,
+                &mut sink,
+            )
+        });
 
         emit_block(
             bw,

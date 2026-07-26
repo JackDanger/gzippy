@@ -388,34 +388,44 @@ pub(super) fn run(
         sink.begin();
 
         let use_lazy = use_lazy_next;
-        in_next = if use_lazy {
-            lazy::run_block(
-                buf,
-                in_next,
-                block_begin,
-                in_max_block_end,
-                in_end,
-                params,
-                false, // lazy (not lazy2) — L3 never uses the lazy2 tie-break.
-                &mut mf,
-                &mut in_base,
-                &mut next_hashes,
-                &mut sink,
-            )
-        } else {
-            greedy::run_block(
-                buf,
-                in_next,
-                block_begin,
-                in_max_block_end,
-                in_end,
-                params,
-                &mut mf,
-                &mut in_base,
-                &mut next_hashes,
-                &mut sink,
-            )
-        };
+        // `anatomy-wall` region: `parse_match` — ONE timer per gate-block
+        // regardless of which sub-strategy (`lazy::run_block` vs
+        // `greedy::run_block`) this block dispatches to, so L3's per-block
+        // GREEDY-vs-LAZY switching folds into the SAME named region the
+        // plain greedy/lazy parsers use (see those modules' sibling call
+        // sites) — matching libdeflate's side, which has no such gate at
+        // all and reports one `parse_match` bucket regardless. Zero cost
+        // when `anatomy-wall` is off.
+        in_next = crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            if use_lazy {
+                lazy::run_block(
+                    buf,
+                    in_next,
+                    block_begin,
+                    in_max_block_end,
+                    in_end,
+                    params,
+                    false, // lazy (not lazy2) — L3 never uses the lazy2 tie-break.
+                    &mut mf,
+                    &mut in_base,
+                    &mut next_hashes,
+                    &mut sink,
+                )
+            } else {
+                greedy::run_block(
+                    buf,
+                    in_next,
+                    block_begin,
+                    in_max_block_end,
+                    in_end,
+                    params,
+                    &mut mf,
+                    &mut in_base,
+                    &mut next_hashes,
+                    &mut sink,
+                )
+            }
+        });
 
         emit_block(
             bw,
