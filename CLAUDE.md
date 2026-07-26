@@ -136,6 +136,28 @@ balanced corpus spread before the claim is anything but a HYPOTHESIS.
 feature-set fingerprint (a mislabeled native-as-isal binary produced a false "ISA-L
 dormant" bombshell); sha-verified output (a speed win with wrong bytes is a loss).
 
+**GATE 4b — THE BUILD TAX (added 2026-07-25, after it silently inflated a banked
+number).** A non-default Cargo feature can make the binary SLOWER while leaving its
+OUTPUT BYTE-IDENTICAL, so every correctness check passes and nothing looks wrong.
+MEASURED: `--features l1-tune`, tuned to the shipped constants, byte-identical output,
+is **1.1702× slower than vanilla `cargo build --release`** at the same commit (solvency,
+n=15, sign 15/15, spread 0.0117). Cause: `Hash3Cfg::from_tune()` rebinds compile-time
+consts to a runtime `OnceLock<RwLock<L1Tune>>`, defeating LLVM's folding of ~52 branch
+sites, plus a 256 KB alloc/zero per `run()`. `l3-tune` has the identical shape.
+Consequences, enforced:
+  (a) the tax is INVISIBLE in a tuned-vs-tuned A/B — both arms carry it — so a
+      tuned-build sweep is still valid AGAINST ITSELF;
+  (b) **NEVER quote a tuned/instrumented build's ratio against a RIVAL** — it is
+      inflated, and it inflated `weights.safetensors` vs libdeflate-1 from a true
+      1.4515× to a banked 1.6914× (`7ee0ea2e` → corrected `358edf88`);
+  (c) any vs-rival number must come from a vanilla `cargo build --release` binary, or
+      state its measured tax;
+  (d) before trusting a NEW instrument feature, MEASURE its tax the same way
+      (interleaved, byte-identity verified, n≥15) — do not assume it is free because
+      it is "off by default" in production.
+Note the asymmetry that hid this: the tax makes gzippy look WORSE, so it never
+triggered suspicion. Audit the results that FLATTER you (see the preamble's F5).
+
 **GATE 5 — EVIDENCE TIER + SCOPE STAMP (how you must price every claim).** Tier the
 evidence and never over-bet: removal-oracle / causal-perturbation = STRONG;
 cross-tool frozen matrix = STRONG; self-validated tool attribution = HYPOTHESIS;
@@ -447,7 +469,7 @@ This is the governing rule; the specific tactics below are just consequences:
 | `src/decompress/parallel/{sm_driver,chunk_fetcher,block_fetcher}.rs` | Driver loop / `GzipChunkFetcher::processNextChunk` consumer / `BlockFetcher` prefetch+cache coordinator |
 | `src/decompress/parallel/marker_inflate.rs` | Window-absent u16-marker decoder — port of rg `deflate::Block` (`deflate.hpp:513-1156`); the `read_internal_compressed_specialized<CONTAINS_MARKERS>` dispatcher splits into `decode_clean_fast_loop` / `decode_marker_fast_loop` / `decode_careful_tail` |
 | `src/decompress/parallel/{apply_window,replace_markers}.rs` | Window application / marker resolution (rg `ChunkData::applyWindow` + `MarkerReplacement`) |
-| `src/decompress/parallel/{perturb,phase_timing,storeprobe}.rs` | Campaign measurement instruments (Cargo-feature-gated `perturb`/`phase-timing`/`storeprobe`, all OFF by default → no-op on the production build, NO rg counterpart) |
+| `src/compress/deflate/anatomy_counters.rs` | The one live campaign instrument in `src/` (Cargo feature `anatomy-counters`, OFF by default; `fulcrum anatomy --counters-from-stderr` ingests it). Gives EXACT work VOLUME, never time. **Known bug (2026-07-25): double-counts `fast_probe_outcome_*` and `fast_positions_processed` by exactly the hash3-rescue count — other counters reconcile to raw_len.** The old `{perturb,phase_timing,storeprobe}.rs` row here was STALE: those modules were deleted in `0e638d81`. `trace`, `counters` and `libdeflate` are declared in Cargo.toml with ZERO `cfg` consumers in `src/` — dead flags, their doc comments lie |
 | `src/decompress/parallel/mod.rs` | Module map + canonical gz→rg ROLE MAP (see also `docs/parallel-decode-architecture.md`) |
 | `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
 | `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,staged_bits,unified,resumable,bmi2}.rs` | Huffman/inflate building blocks |
