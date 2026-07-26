@@ -392,8 +392,14 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
 
     match result {
         Ok(_) => {
-            if !args.quiet {
-                eprintln!("{}: OK", filename);
+            // gzip's contract, established by execution: `gzip -t` is SILENT on
+            // success and only `gzip -tv` reports. We printed unconditionally
+            // (unless --quiet), which inverts the standard failure check
+            // `gzip -t f 2>&1 | grep -q .` for every drop-in user. Errors below
+            // still report unconditionally. (pigz is silent even with -tv; we
+            // follow gzip, the primary drop-in target.)
+            if args.verbose {
+                eprintln!("{}:\t OK", filename);
             }
             Ok(0)
         }
@@ -420,8 +426,9 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
 
     match result {
         Ok(_) => {
-            if !args.quiet {
-                eprintln!("stdin: OK");
+            // See the note on the file path above: silent on success unless -v.
+            if args.verbose {
+                eprintln!("stdin:\t OK");
             }
             Ok(0)
         }
