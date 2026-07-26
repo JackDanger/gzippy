@@ -162,6 +162,16 @@ impl PipelinedGzEncoder {
         data: &[u8],
         mut writer: W,
     ) -> io::Result<u64> {
+        // Gate-4 (CLAUDE.md measurement PROTOCOL): print at the call site of
+        // the function that actually executes, not at either of the two
+        // decision sites that route here (`io.rs`'s mmap fast path and
+        // `compress::compress_with_pipeline_sized`'s T>1 fallback) — this
+        // print fires identically regardless of which one reached it.
+        crate::compress::route::emit(
+            crate::compress::route::PURE_PARALLEL_PIPELINE,
+            self.compression_level,
+            self.num_threads,
+        );
         if data.is_empty() {
             // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
             writer.write_all(&self.gzip_header_bytes())?;
