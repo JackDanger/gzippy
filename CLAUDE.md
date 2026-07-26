@@ -314,18 +314,40 @@ Input → decompress::mod: decompress_gzip_libdeflate
 
 ### Compression
 
+**CORRECTED 2026-07-25 — the previous table here was STALE in the same way the
+decompression table's `MIN_PARALLEL_COMPRESSED` line was.** It described a 5-way
+C-FFI-backed level/thread split (ISA-L at T1 L0–L3, a libdeflate ratio probe, flate2
+streaming, and `ParallelGzEncoder` emitting "GZ" multi-block at T>1 L0–L5). None of
+that is production. The code is a 4-route pure-Rust graph and has been since the
+"Increment 7" work. Every route now ASSERTS itself — `GZIPPY_DEBUG=1` prints
+`[gzippy] compress path=<Route> level=<n> threads=<t>` from inside the EXECUTING
+function, so this table is checkable in one command instead of trusted:
+
 ```
-T1 L0–L3, ISA-L available → backends::isal_compress::compress_gzip_{to_writer,stream_direct}
-T1 L1–L5                  → libdeflate one-shot (ratio probe) or flate2 streaming (zlib-ng)
-T1 L6–L9                  → flate2 streaming (zlib-ng)
-T>1 L6–L9                 → compress::pipelined::PipelinedGzEncoder → single-member output
-T>1 L0–L5                 → compress::parallel::ParallelGzEncoder  → "GZ" subfield multi-block
+--rsyncable (any level, any T)     → Rsyncable              (compress::parallel::compress_rsyncable)
+explicit -F / -I / -J (any T)      → Zopfli
+T1,  EVERY level 0–12              → PureT1                 (deflate::compress_gzip_padded)
+T>1, EVERY level 0–12              → PureParallelPipeline   (pipelined::PipelinedGzEncoder::
+                                                             compress_buffer_pure)
+                                     → standard SINGLE-MEMBER gzip output
+stdin as a PIPE                    → PureT1 regardless of -p (no mmap ⇒ forced T1);
+                                     stdin as `< file` is mmap'able and takes the T>1 route
 ```
 
-**"GZ" subfield**: gzippy's own parallel format (not standard BGZF). Files produced by
-`ParallelGzEncoder` carry a "GZ" FEXTRA subfield with per-block size info; decompression
-routes them to `bgzf::decompress_bgzf_parallel`. `PipelinedGzEncoder` output is plain
-single-member — decompresses on the single-member path.
+There is **no level split** on either the T1 or the T>1 side, and no ratio probe.
+Verified on aarch64 (Apple Silicon, no ISA-L). **x86_64 is UNVERIFIED — do not assume
+it matches.** Reachability analysis says it should (see below), but that is a
+`HYPOTHESIS (unvalidated)` until the same `GZIPPY_DEBUG` table is captured on an
+x86_64 box.
+
+**ISA-L compression is UNREACHABLE from the CLI on every arch.**
+`backends::isal_compress` is called only from `compress::parallel::ParallelGzEncoder`,
+which is called only from `compress::simple.rs` under
+`#[cfg(any(test, feature = "ffi-oracle"))]`. So the **"GZ" FEXTRA subfield format is
+oracle/test-only and is never produced by the shipped binary** — the decompressor's
+"GZ" handling remains live for reading files older versions wrote. Do not reason about
+compression performance as if ISA-L, libdeflate or flate2 were on the path; they are
+not.
 
 ## Optimization Branches
 
