@@ -860,6 +860,16 @@ pub(super) const L1_HASH3_BITS: u32 = 15;
 ///   size vs libdeflate-1  1.003656 -> 1.000108  (97% of the size gap closed,
 ///                                                but never reaches <= 1.0)
 ///   wall vs libdeflate-1  1.6914x  -> 1.6743x   (~1% -- i.e. flat)
+/// CORRECTION (same day, same rig): BOTH arms above ran on an `l1-tune` feature
+/// build (required -- `max_dist` is only runtime-settable there). That build is
+/// ~17% SLOWER than what ships, for knob-plumbing reasons unrelated to any lever:
+/// interleaved A/B of the l1-tune binary (tuned to the shipped consts, output
+/// BYTE-IDENTICAL, size_ratio=1.0) vs a vanilla `cargo build --release` binary at
+/// the same commit gave ratio=1.1702, sign 15/15, spread 0.0117. The RELATIVE
+/// result above is unaffected (both arms carry the same tax) but the ABSOLUTE
+/// deficit is inflated. Production deficit vs libdeflate-1 on this file is
+/// **1.4515x** (sign 15/15, spread 0.0057). Never quote an l1-tune build's ratio
+/// against a RIVAL; it is only valid against another l1-tune build.
 /// A Gate-2 perturbation of >=2 magnitudes that moves the wall 1% means hash3
 /// is NOT on this cell's critical wall path. Both LOSS axes therefore survive
 /// full shutoff. Second, independent blocker: the same shutoff destroys
@@ -868,11 +878,16 @@ pub(super) const L1_HASH3_BITS: u32 = 15;
 ///
 /// REDIRECT implied by the same run (recorded so the next reader does not
 /// repeat the mis-sizing): this LOSS cell is **0.37% on size and 69% on the
-/// wall**. Prior work on it targeted the size axis (length-3 match census,
+/// wall** (0.37% / 45%, using the corrected production wall above). Prior work on
+/// it targeted the size axis (length-3 match census,
 /// `entropy_tables` share) because size is deterministic and cheap to
 /// instrument. Any further work on this cell belongs on the wall axis; a
 /// content-adaptive hash3 gate separating weights from bin6 would, even if it
-/// worked perfectly, close 0.37% of a 69% deficit.
+/// worked perfectly, close 0.37% of a 45% deficit. And the deficit is NOT
+/// weights-specific: same rig, production binary, n=15, /dev/null both arms --
+/// photo.jpg 1.4627x, armexe.elf 1.3558x, monorepo.tar 1.0145x, access.log
+/// 0.9519x (gzippy FASTER). It is a content-class relationship (binary /
+/// high-entropy slow, plain text fast), not a property of this file.
 pub(super) const L1_HASH3_MAX_DIST: usize = WINDOW;
 /// Probe policy: `false` (policy (a), miss-only — the cheapest, measured
 /// best) probes `head3` ONLY when the primary 4-byte probe did not already
