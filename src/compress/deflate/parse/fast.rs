@@ -851,6 +851,28 @@ pub(super) const L1_HASH3_BITS: u32 = 15;
 /// candidate (see [`hash3_candidate`]'s doc comment) — the DEFLATE window
 /// size, i.e. the gate never rejects a length-3 candidate purely for
 /// distance (measured best on the composed sweep).
+///
+/// FALSIFY (2026-07-25, solvency AMD Zen2, `fulcrum paired` n=15, A/A clean,
+/// /dev/null both arms, roundtrip + exact-size gates): **lowering this constant
+/// is NOT an exit for the `weights.safetensors x libdeflate-1` LOSS cell, and
+/// this constant is not a WALL lever at all.** Driving it 32768 -> 0 (full
+/// hash3 shutoff) on `weights.safetensors`:
+///   size vs libdeflate-1  1.003656 -> 1.000108  (97% of the size gap closed,
+///                                                but never reaches <= 1.0)
+///   wall vs libdeflate-1  1.6914x  -> 1.6743x   (~1% -- i.e. flat)
+/// A Gate-2 perturbation of >=2 magnitudes that moves the wall 1% means hash3
+/// is NOT on this cell's critical wall path. Both LOSS axes therefore survive
+/// full shutoff. Second, independent blocker: the same shutoff destroys
+/// `dd79_bin6`'s pigz-1 size win (0.997516 -> 1.040685), so the constant cannot
+/// be lowered corpus-wide regardless.
+///
+/// REDIRECT implied by the same run (recorded so the next reader does not
+/// repeat the mis-sizing): this LOSS cell is **0.37% on size and 69% on the
+/// wall**. Prior work on it targeted the size axis (length-3 match census,
+/// `entropy_tables` share) because size is deterministic and cheap to
+/// instrument. Any further work on this cell belongs on the wall axis; a
+/// content-adaptive hash3 gate separating weights from bin6 would, even if it
+/// worked perfectly, close 0.37% of a 69% deficit.
 pub(super) const L1_HASH3_MAX_DIST: usize = WINDOW;
 /// Probe policy: `false` (policy (a), miss-only — the cheapest, measured
 /// best) probes `head3` ONLY when the primary 4-byte probe did not already
