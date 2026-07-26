@@ -50,6 +50,38 @@ un-self-validated instruments (file-sink A/B, inert oracle, hardcoded `pred_avai
 contaminated perf-annotate); over-banking interpretation (memory accreting disproven
 "the lever is X" claims that misguide the next session).
 
+## ⛔ SUPERVISOR DRIFT CATALOG D1–D10 (observed on THIS campaign; each has a receipt)
+
+The preamble above lists biases in the abstract. These are the ones actually caught in
+flight, with dates. Re-read at every drift check. Full receipts:
+`memory/feedback_my_drift_catalog.md`.
+
+**D1 SCOPE-RATIFICATION PAUSE** — ending a turn asking permission for what was already
+instructed (2026-07-26, immediately after a correction). If the next action is implied by
+a standing instruction, DO IT.
+**D2 DRILLING** — working a level below the right question. Spent a session locating a
+5–8% gap at the L5 *label* while `fulcrum frontier` already existed to ask the
+label-agnostic question ("a level is a KNOB POSITION, not an operating point"). Before any
+locate: is there a label-agnostic form, and does a tool already answer it?
+**D3 SINGLE-CASE GENERALIZATION** — 3× in one day (ecoli→LazyGated "innocent"; data.json
+→ "the win evaporates at T>1"; an L1 slice → "the size axis is failing"). Run the
+denominator before characterizing an axis.
+**D4 AXIS EXCLUSION, INCLUDING IN MY OWN FRAMING** — called the size axis "settled" from a
+census run entirely at `-p1`, while arguing against axis exclusion. Name level, rival,
+corpus, THREADS and arch in every claim.
+**D5 TRUSTING MY OWN TEST** — `git diff -w` doesn't cancel reflows; whitespace-stripping
+doesn't cancel trailing commas (accused a worker who was right); a rounded ratio column
+under-counted failing cells 39 vs 40. Ask what the test would say if the hypothesis were
+false. Run the control.
+**D6 READING-AS-EVIDENCE** — see GATE 5a. A grep called three Cargo features "dead";
+executing it (control first) showed all three change the binary.
+**D7 ATTRIBUTION-AS-VERDICT** — a tool proving its own consistency does not prove its
+blame. Gate 2, with the interpretation stated before the numbers.
+**D8 VOCABULARY INFLATION** — name the condition, never the honorific.
+**D9 ASYMMETRIC SKEPTICISM** — every instrument bug here was found because output
+DISPLEASED. Once per phase, audit the result you liked most.
+**D10 INSTRUMENT-REPAIR AS PROGRESS** — count goal CELLS closed, not tools built.
+
 ## Prime Directive
 
 **gzippy aims to be the fastest gzip implementation ever created — but the OPERATING
