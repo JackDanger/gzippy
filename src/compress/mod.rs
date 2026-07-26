@@ -22,6 +22,41 @@ use crate::compress::optimization::OptimizationConfig;
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::GzippyResult;
 
+/// Gate-4 compression route names (measurement PROTOCOL, CLAUDE.md) — a
+/// closed const set so the `GZIPPY_DEBUG=1` diagnostic string can never drift
+/// from the code that emits it. Each name is printed at the exact call site
+/// of the encoder that is about to run (never from a routing/decision
+/// function that merely picks a path — see `docs`/CLAUDE.md Gate-4: the point
+/// is to observe what EXECUTED). Mirrors the existing decompress-side style
+/// (`[gzippy] path=... threads=... bytes=...` in `src/decompress/mod.rs`).
+pub(crate) mod route {
+    /// Explicit zopfli tuning (`-F`/`-I`/`-J`) — pure-Rust `zopfli_pure`
+    /// (`ZopfliGzEncoder`), single-member, any thread count.
+    pub const ZOPFLI: &str = "Zopfli";
+    /// T1 pure-Rust single-member DEFLATE (`deflate::compress_gzip_padded`).
+    pub const PURE_T1: &str = "PureT1";
+    /// T>1 pure-Rust parallel pipeline (`PipelinedGzEncoder::compress_buffer_pure`).
+    /// Reached from two call sites (the `io.rs` mmap fast path and the
+    /// `compress_with_pipeline_sized` fallback) that both invoke the same
+    /// executing function — the print lives inside that function so it can
+    /// never diverge from which call site reached it.
+    pub const PURE_PARALLEL_PIPELINE: &str = "PureParallelPipeline";
+    /// `--rsyncable` content-defined-chunk pure-Rust path (`compress_rsyncable`).
+    pub const RSYNCABLE: &str = "Rsyncable";
+
+    /// Emit the one-line Gate-4 route assertion. Reads `GZIPPY_DEBUG` via the
+    /// process-wide cached `OnceLock` in `crate::utils::debug_enabled` — no
+    /// per-call/per-block env lookup, so this costs nothing on the hot path
+    /// (one relaxed load of an already-resident bool) and nothing at all when
+    /// the env var is unset (checked once, ever, per process).
+    #[inline]
+    pub(crate) fn emit(name: &str, level: u32, threads: usize) {
+        if crate::utils::debug_enabled() {
+            eprintln!("[gzippy] compress path={name} level={level} threads={threads}");
+        }
+    }
+}
+
 /// Drive the pure-Rust compression engine to completion (Increment 7 — the sole
 /// production compress path; no C-FFI compressor in the routing graph).
 ///
@@ -73,6 +108,11 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         // zopfli path is single-member by ratio mandate (plan.md
         // Phase 11.1.A). Intra-block parallelism inside `deflate_part`
         // still uses the machine.
+        route::emit(
+            route::ZOPFLI,
+            args.compression_level as u32,
+            args.processes.max(1),
+        );
         let mut encoder =
             crate::compress::deflate::parse::ultra::encoder::ZopfliGzEncoder::new(tuning);
         encoder.set_header_info(header_info.clone());
@@ -94,6 +134,7 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
                 args.compression_level
             );
         }
+        route::emit(route::PURE_T1, args.compression_level as u32, 1);
         // Pre-size for the known (or hinted) length plus the matchfinder's
         // trailing pad so neither `read_to_end` nor the following `resize`
         // needs to grow-and-copy the buffer (was 2 reallocs touching ~2x the

@@ -667,6 +667,16 @@ pub fn compress_rsyncable<W: Write + Send>(
 ) -> io::Result<u64> {
     use crate::compress::deflate;
 
+    // Gate-4 (CLAUDE.md measurement PROTOCOL): the sole call site of
+    // `compress_rsyncable`'s two production entry points in `io.rs` — print
+    // here so it can't diverge from which branch (stdout vs file writer)
+    // reached it.
+    crate::compress::route::emit(
+        crate::compress::route::RSYNCABLE,
+        compression_level,
+        num_threads,
+    );
+
     let blocks = split_rsyncable(data);
 
     if blocks.is_empty() {
