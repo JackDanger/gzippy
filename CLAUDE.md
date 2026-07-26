@@ -158,6 +158,25 @@ Consequences, enforced:
 Note the asymmetry that hid this: the tax makes gzippy look WORSE, so it never
 triggered suspicion. Audit the results that FLATTER you (see the preamble's F5).
 
+**GATE 5a — READING CODE IS NOT EVIDENCE (user rule, 2026-07-26; OVERRIDES the tiering
+below wherever they conflict).** A source-read is not a weaker grade of evidence — it is
+NOT evidence. It may PRODUCE A QUESTION; the question is then answered by an executing
+Fulcrum measurement, or it stays unanswered. **Fulcrum is where every question goes to be
+answered by executing code.**
+RECEIPT: the Compression routing table in this very file was produced by a careful
+reading of the source and was wrong in every particular (it claimed ISA-L at T1 L0–L3, a
+libdeflate ratio probe, flate2 streaming, "GZ" multi-block at T>1). Every agent and the
+supervisor reasoned from it for weeks. Making the binary ASSERT ITS OWN ROUTE falsified
+it in one command (`50e4f957`). Second receipt the same day: gzippy emits BYTE-IDENTICAL
+output to libdeflate at L2/L4/L5/L6/L7 — invisible in the source, no comment, no shared
+code, no FFI; it exists only as a sha256 comparison of EXECUTED output, and it is the
+most consequential architectural fact on the board.
+Mechanically: a grep proving a `cfg` has no consumers is READING (build both ways and
+compare instead); a mechanism story ("LLVM folds N branches", "these phases are fused and
+cannot be split") is READING (measure the tax or the split); a reachability claim
+("unreachable on every arch") is READING (run it on that arch and capture the assertion).
+When Fulcrum cannot yet answer the question, EXTEND FULCRUM — never substitute a read.
+
 **GATE 5 — EVIDENCE TIER + SCOPE STAMP (how you must price every claim).** Tier the
 evidence and never over-bet: removal-oracle / causal-perturbation = STRONG;
 cross-tool frozen matrix = STRONG; self-validated tool attribution = HYPOTHESIS;
