@@ -241,6 +241,79 @@ fn conservation_and_granularity_hold_on_a_real_gzippy_invocation() {
     assert!(crc_ns > 0, "crc_ns must be nonzero");
 }
 
+/// Coverage-hole closure test (2026-07-26): `parse_match` was ONLY wired
+/// into the L0/L1 fast parser (`fast.rs`) when this module was first built,
+/// so every OTHER level's match-finding time silently folded into
+/// RESIDUAL — exactly the gap that made a gzippy-vs-libdeflate phase
+/// comparison meaningless at L2-L9 (libdeflate's own instrumented build
+/// reports 90-93% in `parse_match` at those levels; gzippy read 0%). This
+/// asserts, for EVERY level 0-9 (Fast0, Fast, Greedy x2, LazyGated,
+/// Lazy x3, Lazy2 x2 — see `level.rs::params`), that:
+///   - the run reconciles (Gate 0: named regions do not exceed root),
+///   - `parse_match_ns` is now NONZERO (the coverage-hole assertion itself
+///     — a regression back to the hole would silently zero this again),
+///   - `parse_match_calls` is block-granular (>1 call, far fewer calls
+///     than input bytes -- not per-invocation, not per-position),
+///   - the compressed stream still round-trips byte-exact (the wall timers
+///     must be pure observation, never change what is encoded).
+/// L10-12 (near-optimal: bt matchfinder + iterative min-cost-path DP) are
+/// OUT OF SCOPE for this closure -- their match-caching/DP-pass loop has no
+/// per-block call boundary of the same shape as greedy/lazy's `run_block`,
+/// and are not claimed to be covered here.
+#[test]
+fn parse_match_covers_every_level_0_through_9() {
+    // 3.5 MiB: comfortably exceeds L0's own 1 MiB internal block length
+    // (`fast::FAST0_BLOCK_LENGTH`, the largest of any level's block unit)
+    // so EVERY level's `parse_match_calls` is forced above 1 on this input.
+    let data = mixed_corpus(3_500_000);
+    for level in 0..=9u32 {
+        let (compressed, w) = compress_with_wall(&data, level);
+
+        let mut decoded = Vec::new();
+        {
+            use std::io::Read;
+            flate2::read::GzDecoder::new(&compressed[..])
+                .read_to_end(&mut decoded)
+                .unwrap_or_else(|e| panic!("level {level}: gzip decode failed: {e}"));
+        }
+        assert_eq!(
+            decoded, data,
+            "level {level}: roundtrip sanity check failed"
+        );
+
+        let root_ns = get_num(&w, "root_ns");
+        let parse_ns = get_num(&w, "parse_match_ns");
+        let parse_calls = get_num(&w, "parse_match_calls");
+        let table_ns = get_num(&w, "huffman_table_ns");
+        let encode_ns = get_num(&w, "huffman_encode_ns");
+        let crc_ns = get_num(&w, "crc_ns");
+        let residual_ns = get_num(&w, "residual_ns");
+        let conserved = get_bool(&w, "conserved");
+
+        assert!(conserved, "level {level}: conservation must hold");
+        assert_eq!(
+            root_ns,
+            parse_ns + table_ns + encode_ns + crc_ns + residual_ns,
+            "level {level}: root_ns must equal named-region sum + residual exactly"
+        );
+        assert!(
+            parse_ns > 0,
+            "level {level}: parse_match_ns must be NONZERO -- coverage hole regressed \
+             (this is the exact bug this test exists to catch)"
+        );
+        assert!(
+            parse_calls > 1,
+            "level {level}: expected multiple internal blocks on a 900KB input, got \
+             parse_match_calls={parse_calls}"
+        );
+        assert!(
+            (parse_calls as usize) < data.len() / 100,
+            "level {level}: parse_match_calls ({parse_calls}) must be block-granular, \
+             not position-granular"
+        );
+    }
+}
+
 #[test]
 fn wall_output_is_absent_from_a_feature_off_style_but_present_here() {
     // Not feature-off (this whole file is feature-gated), but confirms the
