@@ -133,6 +133,50 @@ anatomy-counters = []
 # `ANATOMY_WALL={json}`. No env var gates behavior, consistent with "NO env
 # vars in the production path".
 anatomy-wall = []
+# ── Bucket-split-oracle session (2026-07-26) ────────────────────────────────
+# The `parse_match` anatomy-wall bucket is FUSED (probe + accept/defer +
+# `Sink::push_*` emission + histogram/stats all inlined in one per-position
+# loop body with no call boundary that isn't per-position -- see
+# `parse/greedy.rs:45-53`, `parse/lazy.rs:61-64`, `parse/gated.rs:391-399`
+# and this module's own doc comment). A wall-clock read is materially more
+# expensive than the position work itself (measured, see `anatomy_wall.rs`),
+# so sub-region timing INSIDE the fused loop is not attempted. These three
+# features instead sub-divide via ELIMINATION ORACLE: each stubs OUT one
+# region's real work while leaving the surrounding control flow bit-for-bit
+# intact, so `parse_match_ns` (the SAME existing per-block timer, unchanged)
+# measures the fused loop with that one region's cost removed. The DELTA vs
+# a feature-off run bounds that region's contribution. DEV-ONLY / DEFAULT
+# OFF: with all three off, every stub call site compiles to nothing
+# (verified byte-identical release binary vs baseline). Output is NOT
+# byte-identical to a real compress when any of these are ON (expected --
+# these are measurement ORACLES, not alternate production paths); each
+# still produces a valid, roundtrippable (if smaller/larger/lossy) gzip
+# stream -- see the bucket-split-oracle session report for exactly what
+# differs. At most ONE of these three should be enabled at a time; enabling
+# more than one is untested and its number would be meaningless.
+#
+# `bucket-oracle-null-mf`: `HcMatchfinder::longest_match` (matchfinder/hc.rs)
+# returns "no match" immediately, before touching any hash/chain table --
+# the DEGENERATE matchfinder Task B's ceiling oracle calls for. Because no
+# match is ever found, the accept/defer DECISION code (the lazy parser's
+# `better_match`/lookahead branches) never executes either -- this oracle
+# therefore bounds PROBE + DECISION jointly, not probe alone (they are not
+# separable by elimination without also removing the reason decision runs).
+bucket-oracle-null-mf = []
+# `bucket-oracle-no-histogram`: `Sink::push_literal`/`push_match`
+# (parse/mod.rs) skip the `litlen_freqs`/`offset_freqs` increments and
+# `BlockSplitStats::observe_*`, but still push the real token
+# (`push_seq`)/litrun/block_length bookkeeping. Bounds histogram/stats-update
+# cost. NOTE: `continue_block`'s block-split decision reads these same
+# frozen-at-zero stats, so block boundaries (not total position count) may
+# shift under this oracle -- a secondary confound, disclosed not hidden.
+bucket-oracle-no-histogram = []
+# `bucket-oracle-no-emission`: `Sink::push_literal`/`push_match` keep the
+# real histogram/stats updates but skip the token write (`push_seq`) and
+# litrun/block_length bookkeeping. Bounds sink-emission cost. Output tokens
+# are incomplete (a real decoder would not reconstruct the full input) --
+# expected for an elimination oracle, see the feature-group doc above.
+bucket-oracle-no-emission = []
 # L1-band ratio-close-out empirical config-space search (2026-07-22 campaign).
 # Runtime-tunable knobs for the L1 fast-path matchfinder (lazy-peek gate,
 # insert-depth, block length, bucket2/chain/hash3 levers) so a local grid

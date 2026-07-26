@@ -367,7 +367,10 @@ pub(super) fn run(
     #[cfg(feature = "l3-tune")]
     let cfg = GateCfg::from_tune(tune::get());
 
-    let mut mf = HcMatchfinder::new();
+    // Task C (bucket-split-oracle): time the per-`run()` allocation itself
+    // (see `anatomy_wall.rs`'s `mf_new_ns` doc comment). Per-invocation, not
+    // per-position -- zero cost when `anatomy-wall` is off.
+    let mut mf = crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, { HcMatchfinder::new() });
     let mut in_base = 0usize;
     let mut next_hashes = [0u32; 2];
     let mut sink = Sink::new();

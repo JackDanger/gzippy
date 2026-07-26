@@ -158,116 +158,229 @@ impl HcMatchfinder {
         max_search_depth: u32,
         next_hashes: &mut [u32; 2],
     ) -> (u32, u32) {
-        debug_assert!(max_search_depth >= 1, "max_search_depth must be >= 1");
-        let mut best_len = best_len_in;
-        let mut depth_remaining = max_search_depth;
-        let mut best_matchptr = in_next; // absolute offset into `buf`
-
-        let mut cur_pos = in_next - *in_base;
-        if cur_pos == WINDOW_SIZE {
-            self.slide_window();
-            *in_base += WINDOW_SIZE;
-            cur_pos = 0;
+        // `bucket-oracle-null-mf` (Cargo.toml doc comment): the CEILING
+        // ORACLE for Task B/matchfinder-share bounding. Returns "no match"
+        // before touching hash3_tab/hash4_tab/next_tab or walking any chain
+        // -- the caller's `length >= min_len` accept check always fails
+        // (`best_len_in` is exactly `min_len - 1`), so every position takes
+        // the literal path and the lazy parser's accept/defer DECISION code
+        // (never reached without a candidate match) is bounded jointly with
+        // probe, not separately -- see the feature's doc comment for why
+        // that joint bound is the honest claim here. `next_hashes` is left
+        // un-updated: fine for an oracle (never referenced again on this
+        // path) but means this build must never be used for anything but
+        // wall-time bounding.
+        #[cfg(feature = "bucket-oracle-null-mf")]
+        {
+            let _ = (
+                buf,
+                in_base,
+                in_next,
+                max_len,
+                nice_len,
+                max_search_depth,
+                next_hashes,
+            );
+            return (best_len_in, 1);
         }
-        let in_base_v = *in_base;
-        let cutoff: i32 = cur_pos as i32 - WINDOW_SIZE as i32;
+        #[cfg(not(feature = "bucket-oracle-null-mf"))]
+        {
+            debug_assert!(max_search_depth >= 1, "max_search_depth must be >= 1");
+            let mut best_len = best_len_in;
+            let mut depth_remaining = max_search_depth;
+            let mut best_matchptr = in_next; // absolute offset into `buf`
 
-        // Can we read 4 bytes from `in_next + 1`?
-        if max_len < 5 {
-            return (best_len, (in_next - best_matchptr) as u32);
-        }
+            let mut cur_pos = in_next - *in_base;
+            if cur_pos == WINDOW_SIZE {
+                self.slide_window();
+                *in_base += WINDOW_SIZE;
+                cur_pos = 0;
+            }
+            let in_base_v = *in_base;
+            let cutoff: i32 = cur_pos as i32 - WINDOW_SIZE as i32;
 
-        // Raw buffer pointer + length for the unchecked loads. `blen` is only used
-        // by the debug_assert bounds checks, so it is dead in release builds.
-        let base = buf.as_ptr();
-        let blen = buf.len();
+            // Can we read 4 bytes from `in_next + 1`?
+            if max_len < 5 {
+                return (best_len, (in_next - best_matchptr) as u32);
+            }
 
-        #[cfg(feature = "anatomy-counters")]
-        let mut local = HcLocalCounters::default();
+            // Raw buffer pointer + length for the unchecked loads. `blen` is only used
+            // by the debug_assert bounds checks, so it is dead in release builds.
+            let base = buf.as_ptr();
+            let blen = buf.len();
 
-        let hash3 = next_hashes[0] as usize;
-        let hash4 = next_hashes[1] as usize;
+            #[cfg(feature = "anatomy-counters")]
+            let mut local = HcLocalCounters::default();
 
-        // SAFETY: `hash3 < HASH3_SIZE` and `hash4 < HASH4_SIZE` by the module
-        // soundness invariant (they are `lz_hash` outputs of order 15/16), and
-        // `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`.
-        crate::anatomy_count!(hc_head_table_reads, 2u64);
-        crate::anatomy_count!(hc_head_table_writes, 2u64);
-        let (cur_node3, mut cur_node4) = unsafe {
-            debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
-            let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
-            let cur_node4 = *self.hash4_tab.get_unchecked(hash4);
-            // Insert the current sequence: replace hash3 singleton, prepend to hash4.
-            *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
-            *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
-            *self.next_tab.get_unchecked_mut(cur_pos) = cur_node4;
-            (cur_node3, cur_node4)
-        };
+            let hash3 = next_hashes[0] as usize;
+            let hash4 = next_hashes[1] as usize;
 
-        // SAFETY: `max_len >= 5` (checked above) and `in_next + max_len <= in_end`
-        // (parser clamp), so `in_next + 1 + 4 <= in_end + 4 <= buf.len()` (BUF_PAD).
-        let next_hashseq = unsafe {
-            debug_assert!(in_next + 1 + 4 <= blen);
-            load_u32(base, in_next + 1)
-        };
-        next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER);
-        next_hashes[1] = lz_hash(next_hashseq, HC_HASH4_ORDER);
-        crate::anatomy_count!(hc_hash_computations);
-        // Vendor `prefetchw` (hc_matchfinder.h:238-239): warm the hash buckets
-        // for `in_next + 1` in an exclusive state — they are stored to on the
-        // next call. Pure hint; cannot change which match is found.
-        // SAFETY: `next_hashes[0] < HASH3_SIZE` and `next_hashes[1] < HASH4_SIZE`
-        // (lz_hash order-15/16 outputs), so both `.add` land in-allocation.
-        unsafe {
-            prefetch_write(self.hash3_tab.as_ptr().add(next_hashes[0] as usize) as *const u8);
-            prefetch_write(self.hash4_tab.as_ptr().add(next_hashes[1] as usize) as *const u8);
-        }
+            // SAFETY: `hash3 < HASH3_SIZE` and `hash4 < HASH4_SIZE` by the module
+            // soundness invariant (they are `lz_hash` outputs of order 15/16), and
+            // `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`.
+            crate::anatomy_count!(hc_head_table_reads, 2u64);
+            crate::anatomy_count!(hc_head_table_writes, 2u64);
+            let (cur_node3, mut cur_node4) = unsafe {
+                debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
+                let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
+                let cur_node4 = *self.hash4_tab.get_unchecked(hash4);
+                // Insert the current sequence: replace hash3 singleton, prepend to hash4.
+                *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
+                *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
+                *self.next_tab.get_unchecked_mut(cur_pos) = cur_node4;
+                (cur_node3, cur_node4)
+            };
 
-        // SAFETY: same as above — `in_next + 4 <= in_end <= buf.len()`.
-        let seq4 = unsafe {
-            debug_assert!(in_next + 4 <= blen);
-            load_u32(base, in_next)
-        };
+            // SAFETY: `max_len >= 5` (checked above) and `in_next + max_len <= in_end`
+            // (parser clamp), so `in_next + 1 + 4 <= in_end + 4 <= buf.len()` (BUF_PAD).
+            let next_hashseq = unsafe {
+                debug_assert!(in_next + 1 + 4 <= blen);
+                load_u32(base, in_next + 1)
+            };
+            next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER);
+            next_hashes[1] = lz_hash(next_hashseq, HC_HASH4_ORDER);
+            crate::anatomy_count!(hc_hash_computations);
+            // Vendor `prefetchw` (hc_matchfinder.h:238-239): warm the hash buckets
+            // for `in_next + 1` in an exclusive state — they are stored to on the
+            // next call. Pure hint; cannot change which match is found.
+            // SAFETY: `next_hashes[0] < HASH3_SIZE` and `next_hashes[1] < HASH4_SIZE`
+            // (lz_hash order-15/16 outputs), so both `.add` land in-allocation.
+            unsafe {
+                prefetch_write(self.hash3_tab.as_ptr().add(next_hashes[0] as usize) as *const u8);
+                prefetch_write(self.hash4_tab.as_ptr().add(next_hashes[1] as usize) as *const u8);
+            }
 
-        // `matchptr` carries the candidate that entered the length>=5 loop.
-        let mut matchptr;
+            // SAFETY: same as above — `in_next + 4 <= in_end <= buf.len()`.
+            let seq4 = unsafe {
+                debug_assert!(in_next + 4 <= blen);
+                load_u32(base, in_next)
+            };
 
-        'search: {
-            if best_len < 4 {
-                // Length-3 match check.
-                if (cur_node3 as i32) <= cutoff {
-                    break 'search;
-                }
-                if best_len < 3 {
-                    let mp = (in_base_v as isize + cur_node3 as isize) as usize;
-                    // SAFETY: `cutoff < cur_node3` so `mp < in_next`, and it points
-                    // into processed input; the u24 load reads 4 bytes at `mp` and
-                    // `mp + 4 <= in_next + 4 <= buf.len()`.
-                    let cand = unsafe {
-                        debug_assert!(mp < in_next && mp + 4 <= blen);
-                        load_u24(base, mp)
+            // `matchptr` carries the candidate that entered the length>=5 loop.
+            let mut matchptr;
+
+            'search: {
+                if best_len < 4 {
+                    // Length-3 match check.
+                    if (cur_node3 as i32) <= cutoff {
+                        break 'search;
+                    }
+                    if best_len < 3 {
+                        let mp = (in_base_v as isize + cur_node3 as isize) as usize;
+                        // SAFETY: `cutoff < cur_node3` so `mp < in_next`, and it points
+                        // into processed input; the u24 load reads 4 bytes at `mp` and
+                        // `mp + 4 <= in_next + 4 <= buf.len()`.
+                        let cand = unsafe {
+                            debug_assert!(mp < in_next && mp + 4 <= blen);
+                            load_u24(base, mp)
+                        };
+                        if cand == seq4 & 0xFF_FFFF {
+                            best_len = 3;
+                            best_matchptr = mp;
+                        }
+                    }
+
+                    // Length-4 match check.
+                    if (cur_node4 as i32) <= cutoff {
+                        break 'search;
+                    }
+                    // Software-pipelined chain walk (Increment 5b). Hoist the NEXT
+                    // chain node one step ahead so this iteration can prefetch the
+                    // FOLLOWING candidate's match data — the second, reducible
+                    // dependent load, which sits off the chain's critical path —
+                    // while the current node's compare runs. `next_tab` is never
+                    // mutated during a walk, so reading a node early yields the
+                    // identical value the un-pipelined form read at the loop bottom;
+                    // the sequence of `cur_node4` visited, every cutoff/depth check,
+                    // and the resulting match are byte-identical (pinned by
+                    // `matches_equal_scalar_*`). The prefetch is a pure hint.
+                    // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
+                    let mut next_node = unsafe {
+                        *self
+                            .next_tab
+                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
                     };
-                    if cand == seq4 & 0xFF_FFFF {
-                        best_len = 3;
-                        best_matchptr = mp;
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.chain_reads += 1;
+                    }
+                    loop {
+                        matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
+                        // Prefetch the next node's match data one iteration ahead.
+                        // `wrapping_offset` keeps pointer formation defined even when
+                        // `next_node <= cutoff` (a chain end maps off-object); the
+                        // prefetch itself never faults.
+                        prefetch_read(
+                            base.wrapping_offset(in_base_v as isize + next_node as isize),
+                        );
+                        // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
+                        // `matchptr + 4 <= in_next + 4 <= buf.len()`.
+                        let cand = unsafe {
+                            debug_assert!(matchptr < in_next && matchptr + 4 <= blen);
+                            load_u32(base, matchptr)
+                        };
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.attempts += 1;
+                        }
+                        if cand == seq4 {
+                            break;
+                        }
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.miss += 1;
+                        }
+                        cur_node4 = next_node;
+                        if (cur_node4 as i32) <= cutoff {
+                            break 'search;
+                        }
+                        depth_remaining -= 1;
+                        if depth_remaining == 0 {
+                            break 'search;
+                        }
+                        // SAFETY: masked chain index `< next_tab.len()`.
+                        next_node = unsafe {
+                            *self
+                                .next_tab
+                                .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                        };
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.chain_reads += 1;
+                        }
+                    }
+
+                    // Found a length-4 match; extend it fully.
+                    best_matchptr = matchptr;
+                    best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.accepted += 1;
+                    }
+                    if best_len >= nice_len {
+                        break 'search;
+                    }
+                    // Advance to the next node — already loaded by the pipeline
+                    // (`next_node == next_tab[cur_node4 & MASK]` holds at the break).
+                    cur_node4 = next_node;
+                    if (cur_node4 as i32) <= cutoff {
+                        break 'search;
+                    }
+                    depth_remaining -= 1;
+                    if depth_remaining == 0 {
+                        break 'search;
+                    }
+                } else {
+                    if (cur_node4 as i32) <= cutoff || best_len >= nice_len {
+                        break 'search;
                     }
                 }
 
-                // Length-4 match check.
-                if (cur_node4 as i32) <= cutoff {
-                    break 'search;
-                }
-                // Software-pipelined chain walk (Increment 5b). Hoist the NEXT
-                // chain node one step ahead so this iteration can prefetch the
-                // FOLLOWING candidate's match data — the second, reducible
-                // dependent load, which sits off the chain's critical path —
-                // while the current node's compare runs. `next_tab` is never
-                // mutated during a walk, so reading a node early yields the
-                // identical value the un-pipelined form read at the loop bottom;
-                // the sequence of `cur_node4` visited, every cutoff/depth check,
-                // and the resulting match are byte-identical (pinned by
-                // `matches_equal_scalar_*`). The prefetch is a pure hint.
-                // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
+                // Length >= 5 loop, software-pipelined identically to the length-4
+                // walk above. `cur_node4 > cutoff` and `depth_remaining > 0` hold
+                // here (both entry paths guarantee it); precompute the next chain
+                // node so the compare can overlap the following candidate's prefetch.
+                // SAFETY: masked chain index `< next_tab.len()`.
                 let mut next_node = unsafe {
                     *self
                         .next_tab
@@ -278,29 +391,79 @@ impl HcMatchfinder {
                     local.chain_reads += 1;
                 }
                 loop {
-                    matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                    // Prefetch the next node's match data one iteration ahead.
-                    // `wrapping_offset` keeps pointer formation defined even when
-                    // `next_node <= cutoff` (a chain end maps off-object); the
-                    // prefetch itself never faults.
-                    prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
-                    // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
-                    // `matchptr + 4 <= in_next + 4 <= buf.len()`.
-                    let cand = unsafe {
-                        debug_assert!(matchptr < in_next && matchptr + 4 <= blen);
-                        load_u32(base, matchptr)
-                    };
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.attempts += 1;
+                    loop {
+                        matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
+                        // Prefetch the next node's match data one iteration ahead
+                        // (see the length-4 walk for the correctness argument).
+                        prefetch_read(
+                            base.wrapping_offset(in_base_v as isize + next_node as isize),
+                        );
+                        // Prefilter: compare the last 4 and the first 4 bytes before
+                        // attempting a full extension.
+                        let off = best_len as usize - 3;
+                        // SAFETY: `matchptr < in_next` (cutoff guard). `off = best_len-3`
+                        // with `best_len <= max_len`, so `in_next + off + 4 <=
+                        // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
+                        // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
+                        let (m_hi, n_hi, m_lo, n_lo) = unsafe {
+                            debug_assert!(matchptr < in_next);
+                            debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
+                            (
+                                load_u32(base, matchptr + off),
+                                load_u32(base, in_next + off),
+                                load_u32(base, matchptr),
+                                load_u32(base, in_next),
+                            )
+                        };
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.attempts += 1;
+                        }
+                        if m_hi == n_hi && m_lo == n_lo {
+                            break;
+                        }
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.miss += 1;
+                        }
+                        cur_node4 = next_node;
+                        if (cur_node4 as i32) <= cutoff {
+                            break 'search;
+                        }
+                        depth_remaining -= 1;
+                        if depth_remaining == 0 {
+                            break 'search;
+                        }
+                        // SAFETY: masked chain index `< next_tab.len()`.
+                        next_node = unsafe {
+                            *self
+                                .next_tab
+                                .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                        };
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.chain_reads += 1;
+                        }
                     }
-                    if cand == seq4 {
-                        break;
+
+                    let len = lz_extend(buf, in_next, matchptr, 4, max_len);
+                    if len > best_len {
+                        best_len = len;
+                        best_matchptr = matchptr;
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.accepted += 1;
+                        }
+                        if best_len >= nice_len {
+                            break 'search;
+                        }
+                    } else {
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.too_short += 1;
+                        }
                     }
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.miss += 1;
-                    }
+                    // Advance to the next node — already loaded by the pipeline.
                     cur_node4 = next_node;
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
@@ -320,143 +483,12 @@ impl HcMatchfinder {
                         local.chain_reads += 1;
                     }
                 }
-
-                // Found a length-4 match; extend it fully.
-                best_matchptr = matchptr;
-                best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.accepted += 1;
-                }
-                if best_len >= nice_len {
-                    break 'search;
-                }
-                // Advance to the next node — already loaded by the pipeline
-                // (`next_node == next_tab[cur_node4 & MASK]` holds at the break).
-                cur_node4 = next_node;
-                if (cur_node4 as i32) <= cutoff {
-                    break 'search;
-                }
-                depth_remaining -= 1;
-                if depth_remaining == 0 {
-                    break 'search;
-                }
-            } else {
-                if (cur_node4 as i32) <= cutoff || best_len >= nice_len {
-                    break 'search;
-                }
             }
 
-            // Length >= 5 loop, software-pipelined identically to the length-4
-            // walk above. `cur_node4 > cutoff` and `depth_remaining > 0` hold
-            // here (both entry paths guarantee it); precompute the next chain
-            // node so the compare can overlap the following candidate's prefetch.
-            // SAFETY: masked chain index `< next_tab.len()`.
-            let mut next_node = unsafe {
-                *self
-                    .next_tab
-                    .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-            };
             #[cfg(feature = "anatomy-counters")]
-            {
-                local.chain_reads += 1;
-            }
-            loop {
-                loop {
-                    matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                    // Prefetch the next node's match data one iteration ahead
-                    // (see the length-4 walk for the correctness argument).
-                    prefetch_read(base.wrapping_offset(in_base_v as isize + next_node as isize));
-                    // Prefilter: compare the last 4 and the first 4 bytes before
-                    // attempting a full extension.
-                    let off = best_len as usize - 3;
-                    // SAFETY: `matchptr < in_next` (cutoff guard). `off = best_len-3`
-                    // with `best_len <= max_len`, so `in_next + off + 4 <=
-                    // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
-                    // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
-                    let (m_hi, n_hi, m_lo, n_lo) = unsafe {
-                        debug_assert!(matchptr < in_next);
-                        debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
-                        (
-                            load_u32(base, matchptr + off),
-                            load_u32(base, in_next + off),
-                            load_u32(base, matchptr),
-                            load_u32(base, in_next),
-                        )
-                    };
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.attempts += 1;
-                    }
-                    if m_hi == n_hi && m_lo == n_lo {
-                        break;
-                    }
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.miss += 1;
-                    }
-                    cur_node4 = next_node;
-                    if (cur_node4 as i32) <= cutoff {
-                        break 'search;
-                    }
-                    depth_remaining -= 1;
-                    if depth_remaining == 0 {
-                        break 'search;
-                    }
-                    // SAFETY: masked chain index `< next_tab.len()`.
-                    next_node = unsafe {
-                        *self
-                            .next_tab
-                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                    };
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.chain_reads += 1;
-                    }
-                }
-
-                let len = lz_extend(buf, in_next, matchptr, 4, max_len);
-                if len > best_len {
-                    best_len = len;
-                    best_matchptr = matchptr;
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.accepted += 1;
-                    }
-                    if best_len >= nice_len {
-                        break 'search;
-                    }
-                } else {
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.too_short += 1;
-                    }
-                }
-                // Advance to the next node — already loaded by the pipeline.
-                cur_node4 = next_node;
-                if (cur_node4 as i32) <= cutoff {
-                    break 'search;
-                }
-                depth_remaining -= 1;
-                if depth_remaining == 0 {
-                    break 'search;
-                }
-                // SAFETY: masked chain index `< next_tab.len()`.
-                next_node = unsafe {
-                    *self
-                        .next_tab
-                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                };
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.chain_reads += 1;
-                }
-            }
-        }
-
-        #[cfg(feature = "anatomy-counters")]
-        local.flush();
-        (best_len, (in_next - best_matchptr) as u32)
+            local.flush();
+            (best_len, (in_next - best_matchptr) as u32)
+        } // #[cfg(not(feature = "bucket-oracle-null-mf"))]
     }
 
     /// `hc_matchfinder_skip_bytes`: insert `count` positions without searching.

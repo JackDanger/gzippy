@@ -161,14 +161,25 @@ impl Sink {
     fn push_literal(&mut self, lit: u8) {
         crate::anatomy_count!(literals_emitted);
         crate::anatomy_count!(histogram_updates);
-        // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
-        // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
-        unsafe {
-            *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
+        // `bucket-oracle-no-histogram` (Cargo.toml doc comment): skip the
+        // freq/stats histogram work, keep the real emission bookkeeping.
+        #[cfg(not(feature = "bucket-oracle-no-histogram"))]
+        {
+            // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
+            // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
+            unsafe {
+                *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
+            }
+            self.stats.observe_literal(lit);
         }
-        self.stats.observe_literal(lit);
-        self.litrun += 1;
-        self.block_length += 1;
+        // `bucket-oracle-no-emission` (Cargo.toml doc comment): skip the
+        // emission bookkeeping that feeds the eventual token, keep the real
+        // histogram work above.
+        #[cfg(not(feature = "bucket-oracle-no-emission"))]
+        {
+            self.litrun += 1;
+            self.block_length += 1;
+        }
     }
 
     /// Fast-path literal push: frequency bump + run counter only.
@@ -235,18 +246,29 @@ impl Sink {
         debug_assert!((1..=32768).contains(&offset));
         let ls = length_slot(length) as usize;
         let os = offset_slot(offset) as usize;
-        // SAFETY: `length_slot` returns 0..=28 so `DEFLATE_FIRST_LEN_SYM + ls`
-        // (257..=285) is < DEFLATE_NUM_LITLEN_SYMS (288); `offset_slot` returns
-        // 0..=29 so `os` is < DEFLATE_NUM_OFFSET_SYMS (32). Both are in bounds.
-        unsafe {
-            *self
-                .litlen_freqs
-                .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
-            *self.offset_freqs.get_unchecked_mut(os) += 1;
+        // `bucket-oracle-no-histogram` (Cargo.toml doc comment): skip the
+        // freq/stats histogram work, keep the real emission bookkeeping.
+        #[cfg(not(feature = "bucket-oracle-no-histogram"))]
+        {
+            // SAFETY: `length_slot` returns 0..=28 so `DEFLATE_FIRST_LEN_SYM + ls`
+            // (257..=285) is < DEFLATE_NUM_LITLEN_SYMS (288); `offset_slot` returns
+            // 0..=29 so `os` is < DEFLATE_NUM_OFFSET_SYMS (32). Both are in bounds.
+            unsafe {
+                *self
+                    .litlen_freqs
+                    .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
+                *self.offset_freqs.get_unchecked_mut(os) += 1;
+            }
+            self.stats.observe_match(length);
         }
-        self.stats.observe_match(length);
-        self.push_seq(length, offset, os);
-        self.block_length += length as usize;
+        // `bucket-oracle-no-emission` (Cargo.toml doc comment): skip the
+        // token write + emission bookkeeping, keep the real histogram work
+        // above.
+        #[cfg(not(feature = "bucket-oracle-no-emission"))]
+        {
+            self.push_seq(length, offset, os);
+            self.block_length += length as usize;
+        }
     }
 }
 
