@@ -53,9 +53,30 @@ use tables::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 /// Largest payload of a single stored (BTYPE=00) sub-block.
 const MAX_STORED_SUBBLOCK: usize = 65535;
 
+/// Output-buffer capacity estimate for a one-shot compress of `len` bytes at
+/// `level`, plus `framing_slack` bytes for whatever header/trailer the caller
+/// adds around the raw DEFLATE stream (gzip header + CRC32 + ISIZE = 18 for
+/// the gzip entry points; the raw-DEFLATE entry points pass a smaller slack).
+///
+/// Levels 1-12 keep the pre-existing `len/2 + slack` guess (real compression,
+/// unknown ratio ahead of time). Level 0 is now genuine STORED-only (see
+/// `deflate_into`'s `level == 0` branch): output is `len` plus 5 bytes of
+/// framing per 65535-byte sub-block, so `len/2` would under-size by ~2x and
+/// force `Vec` to repeatedly grow-and-copy while writing what is otherwise a
+/// memcpy-class encode — exactly the constant-factor tax a stored mode must
+/// not carry if it is to race pigz's memcpy at the wall.
+#[inline]
+fn estimate_output_cap(len: usize, level: u32, framing_slack: usize) -> usize {
+    if level == 0 {
+        len + len.div_ceil(MAX_STORED_SUBBLOCK).max(1) * 5 + framing_slack
+    } else {
+        len / 2 + framing_slack
+    }
+}
+
 /// Compress `data` into a raw DEFLATE stream (no gzip/zlib framing) at `level`.
 pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
-    let cap = data.len() / 2 + 64;
+    let cap = estimate_output_cap(data.len(), level, 64);
     crate::anatomy_count!(alloc_events);
     crate::anatomy_count!(alloc_bytes, cap);
     let mut out = Vec::with_capacity(cap);
@@ -158,6 +179,20 @@ pub fn compress_block_streaming(
 /// that read as ZERO (the matchfinder's speculative loads reach up to `in_end +
 /// 1`, and the emitted bytes are byte-identical only when those pad bytes are
 /// zero — matches are clamped to `in_end` so the pad never enters the output).
+///
+/// `level == 0` is a genuine STORED-only mode (BTYPE=00 every block, no
+/// matchfinder/Huffman coding at all) — the same contract zlib/pigz/gzip give
+/// `Z_NO_COMPRESSION`/`-0` (gzip(1) and libdeflate-gzip reject `-0` outright;
+/// pigz treats it as stored). This bypasses `level::params`/`parse::compress`
+/// entirely rather than routing through `Strategy::Fast0` (which does real
+/// LZ77 + per-block static-or-stored Huffman coding — see `level.rs`'s
+/// `Strategy::Fast0` doc comment): a real compressor is not "as fast as a
+/// memcpy, at worst as small as stored" the way peers' L0 is, so it can never
+/// win the "at-least-as-fast, at-least-as-small" contract L0 is measured
+/// against. `Strategy::Fast0`/`fast::run::<true>` stay in the tree (still
+/// unit-tested via `level::params(0)`) but are no longer reachable from this
+/// production call path. Levels 1-12 are completely unaffected — this is the
+/// only new branch, guarded on `level == 0` alone.
 fn deflate_into(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -169,6 +204,8 @@ fn deflate_into(
     debug_assert!(buf.len() >= in_end + parse::BUF_PAD);
     if in_end == data_start {
         emit_stored_block(bw, &[], is_last);
+    } else if level == 0 {
+        emit_stored_block(bw, &buf[data_start..in_end], is_last);
     } else {
         let params = level::params(level);
         parse::compress(buf, data_start, in_end, &params, is_last, bw);
@@ -209,7 +246,7 @@ pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: 
 /// wall-clock phase timers measure against.
 pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
     crate::anatomy_wall_root!({
-        let cap = data.len() / 2 + 32;
+        let cap = estimate_output_cap(data.len(), level, 32);
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
         let mut out = Vec::with_capacity(cap);
@@ -237,7 +274,7 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
 /// `compress_gzip(&buf[..logical_len], level)`.
 pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
     crate::anatomy_wall_root!({
-        let cap = logical_len / 2 + 32;
+        let cap = estimate_output_cap(logical_len, level, 32);
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
         let mut out = Vec::with_capacity(cap);
