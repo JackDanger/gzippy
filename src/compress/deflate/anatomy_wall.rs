@@ -180,6 +180,16 @@ define_wall_regions!(
     huffman_table_ns / huffman_table_calls,
     huffman_encode_ns / huffman_encode_calls,
     crc_ns / crc_calls,
+    // Task C (2026-07-26 bucket-split-oracle session): `HcMatchfinder::new()`
+    // is a per-`run()`-call allocation (~256 KiB of scalar sentinel writes
+    // across `hash3_tab`/`hash4_tab`/`next_tab` -- see `matchfinder/hc.rs`'s
+    // `new()` doc comment). `run()` fires once per T1 whole-file parse but
+    // once per ~512 KiB chunk on the T>1 `PipelinedGzEncoder` path
+    // (`pipelined.rs::MAX_PARALLEL_BLOCK_SIZE`), so this region's CALL COUNT
+    // is itself the falsifiable claim under review, not just its ns. One
+    // timer per `run()` invocation (never per-position) -- cheapest
+    // granularity in this module.
+    mf_new_ns / mf_new_calls,
 );
 
 /// Reset every counter. Only exists when `anatomy-wall` is on (see
