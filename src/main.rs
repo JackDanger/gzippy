@@ -134,6 +134,12 @@ fn main() {
     #[cfg(feature = "anatomy-counters")]
     compress::deflate::anatomy_counters::flush_to_stderr();
 
+    // `anatomy-wall` feature (default OFF, compiles to nothing when off):
+    // the wall-clock phase-timer sibling of `anatomy-counters` above — see
+    // src/compress/deflate/anatomy_wall.rs module docs.
+    #[cfg(feature = "anatomy-wall")]
+    compress::deflate::anatomy_wall::flush_to_stderr();
+
     match result {
         Ok(exit_code) => fast_exit_success(exit_code),
         Err(e) => {

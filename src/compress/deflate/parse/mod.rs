@@ -440,39 +440,58 @@ fn emit_block(
     statics: &StaticCodes,
     is_final: bool,
 ) {
-    // Add the end-of-block symbol to the litlen frequencies (as the vendor does
-    // in deflate_flush_block).
-    let mut litlen_freqs = sink.litlen_freqs;
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
+    // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
+    // this block, before any bit is written: both candidate Huffman codes,
+    // the dynamic header, and the three-way stored/static/dynamic cost
+    // comparison. Zero cost when `anatomy-wall` is off.
+    let (litcode, offcode, header, dynamic_bits, static_bits, stored_bits) =
+        crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
+            // Add the end-of-block symbol to the litlen frequencies (as the
+            // vendor does in deflate_flush_block).
+            let mut litlen_freqs = sink.litlen_freqs;
+            litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-    let litcode = make_huffman_code(
-        DEFLATE_NUM_LITLEN_SYMS,
-        MAX_LITLEN_CODEWORD_LEN,
-        &litlen_freqs,
-    );
-    let offcode = make_huffman_code(
-        DEFLATE_NUM_OFFSET_SYMS,
-        MAX_OFFSET_CODEWORD_LEN,
-        &sink.offset_freqs,
-    );
-    let header = build_dynamic_header(&litcode.lens, &offcode.lens);
+            let litcode = make_huffman_code(
+                DEFLATE_NUM_LITLEN_SYMS,
+                MAX_LITLEN_CODEWORD_LEN,
+                &litlen_freqs,
+            );
+            let offcode = make_huffman_code(
+                DEFLATE_NUM_OFFSET_SYMS,
+                MAX_OFFSET_CODEWORD_LEN,
+                &sink.offset_freqs,
+            );
+            let header = build_dynamic_header(&litcode.lens, &offcode.lens);
 
-    let dynamic_bits = 3
-        + header.header_bits()
-        + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
-    let static_bits = 3 + cost_from_freqs(
-        &litlen_freqs,
-        &sink.offset_freqs,
-        &statics.litcode,
-        &statics.offcode,
-    );
-    let stored_bits = stored_block_bits(sink.block_length);
+            let dynamic_bits = 3
+                + header.header_bits()
+                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
+            let static_bits = 3 + cost_from_freqs(
+                &litlen_freqs,
+                &sink.offset_freqs,
+                &statics.litcode,
+                &statics.offcode,
+            );
+            let stored_bits = stored_block_bits(sink.block_length);
+            (
+                litcode,
+                offcode,
+                header,
+                dynamic_bits,
+                static_bits,
+                stored_bits,
+            )
+        });
 
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
         // blocks_emitted_stored is counted in `write_stored_subblock`
         // (deflate/mod.rs) — the single physical-BTYPE=00-block emission
         // site, shared with the T>1 pipelined sync-flush path — not here,
-        // to avoid double-counting (see that function's doc comment).
+        // to avoid double-counting (see that function's doc comment). Note
+        // for `anatomy-wall`: a stored block never enters `huffman_encode`
+        // at all (no Huffman machinery involved) — its byte-copy cost
+        // lands in RESIDUAL, which is correct: it genuinely isn't Huffman
+        // encoding time.
         super::emit_stored_block(
             bw,
             &buf[block_start..block_start + sink.block_length],
@@ -482,20 +501,30 @@ fn emit_block(
         crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
-        emit_sequences(
-            bw,
-            buf,
-            block_start,
-            sink,
-            &statics.litcode,
-            &statics.offcode,
-        );
+        // `anatomy-wall` region: `huffman_encode` — walks this block's
+        // tokens and writes codeword bits via `BitWriter`. Bitstream
+        // flush/serialization (`BitWriter::add_bits`'s internal
+        // `flush_word_unchecked`) is FUSED into this region, not
+        // separately timed — see `anatomy_wall` module docs for why
+        // (fires roughly once per ~56 bits, thousands of times per block).
+        crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
+            emit_sequences(
+                bw,
+                buf,
+                block_start,
+                sink,
+                &statics.litcode,
+                &statics.offcode,
+            );
+        });
     } else {
         crate::anatomy_count!(blocks_emitted_dynamic);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);
-        emit_sequences(bw, buf, block_start, sink, &litcode, &offcode);
+        crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
+            emit_sequences(bw, buf, block_start, sink, &litcode, &offcode);
+        });
     }
 }
 
@@ -518,16 +547,20 @@ fn emit_block_static_or_stored(
     statics: &StaticCodes,
     is_final: bool,
 ) {
-    let mut litlen_freqs = sink.litlen_freqs;
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
+    let (static_bits, stored_bits) =
+        crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
+            let mut litlen_freqs = sink.litlen_freqs;
+            litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-    let static_bits = 3 + cost_from_freqs(
-        &litlen_freqs,
-        &sink.offset_freqs,
-        &statics.litcode,
-        &statics.offcode,
-    );
-    let stored_bits = stored_block_bits(sink.block_length);
+            let static_bits = 3 + cost_from_freqs(
+                &litlen_freqs,
+                &sink.offset_freqs,
+                &statics.litcode,
+                &statics.offcode,
+            );
+            let stored_bits = stored_block_bits(sink.block_length);
+            (static_bits, stored_bits)
+        });
 
     if stored_bits <= static_bits {
         // See the sibling `emit_block`'s comment: counted in
@@ -541,14 +574,16 @@ fn emit_block_static_or_stored(
         crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
-        emit_sequences(
-            bw,
-            buf,
-            block_start,
-            sink,
-            &statics.litcode,
-            &statics.offcode,
-        );
+        crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
+            emit_sequences(
+                bw,
+                buf,
+                block_start,
+                sink,
+                &statics.litcode,
+                &statics.offcode,
+            );
+        });
     }
 }
 

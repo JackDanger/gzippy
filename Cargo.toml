@@ -117,6 +117,22 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # var gates behavior (measurement-output only), consistent with "NO env vars
 # in the production path" — this module does not exist in a default build.
 anatomy-counters = []
+# Wall-clock phase timers for `fulcrum anatomy`'s execution level (see
+# src/compress/deflate/anatomy_wall.rs) — the sibling of `anatomy-counters`
+# that answers "where does the TIME go" instead of "how much semantic work
+# happened": `anatomy-counters` is exact WORK VOLUME (probe attempts, table
+# reads, tokens pushed) but never reports time; cachegrind Ir-share
+# (`fulcrum anatomy --exec`) is WEAK whole-program attribution. This feature
+# adds region-granularity (per-block, never per-position) `Instant`-based
+# timers around match-finding/parsing, Huffman table construction, Huffman
+# symbol encoding, and CRC, plus a root span and a derived RESIDUAL bucket
+# ("everything else") so every nanosecond is accounted for. DEFAULT OFF: with
+# the feature off, every timer call site compiles to nothing (verified
+# byte-identical release binary vs the feature-off baseline). With the
+# feature on, gzippy prints one line to stderr at process end:
+# `ANATOMY_WALL={json}`. No env var gates behavior, consistent with "NO env
+# vars in the production path".
+anatomy-wall = []
 # L1-band ratio-close-out empirical config-space search (2026-07-22 campaign).
 # Runtime-tunable knobs for the L1 fast-path matchfinder (lazy-peek gate,
 # insert-depth, block length, bucket2/chain/hash3 levers) so a local grid

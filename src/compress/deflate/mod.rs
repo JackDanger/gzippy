@@ -37,6 +37,7 @@
 //! ELSE that goes dead in the future.
 
 pub mod anatomy_counters;
+pub mod anatomy_wall;
 pub mod bitstream;
 pub mod block_split;
 pub mod costs;
@@ -201,21 +202,28 @@ pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: 
 
 /// Compress `data` into a gzip-framed stream (gzip header + DEFLATE + CRC32 +
 /// ISIZE). This is the variant the roundtrip oracles consume.
+///
+/// Wrapped in [`crate::anatomy_wall_root!`] (the `anatomy-wall` feature's
+/// root span, see `anatomy_wall` module docs): this is one of the two
+/// production T1 entry points (the other being [`compress_gzip_padded`]) the
+/// wall-clock phase timers measure against.
 pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
-    let cap = data.len() / 2 + 32;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, cap);
-    let mut out = Vec::with_capacity(cap);
-    // Minimal gzip header: magic, CM=8 (deflate), FLG=0, MTIME=0, XFL=0,
-    // OS=255 (unknown).
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    crate::anatomy_wall_root!({
+        let cap = data.len() / 2 + 32;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut out = Vec::with_capacity(cap);
+        // Minimal gzip header: magic, CM=8 (deflate), FLG=0, MTIME=0, XFL=0,
+        // OS=255 (unknown).
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-    compress_block(data, &[], level, &mut out);
+        compress_block(data, &[], level, &mut out);
 
-    let crc = crc32fast::hash(data);
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out
+        let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    })
 }
 
 /// Gzip-framed compression that parses IN PLACE over a caller-padded buffer.
@@ -228,18 +236,21 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
 /// nor builds a separate output buffer. Output is byte-identical to
 /// `compress_gzip(&buf[..logical_len], level)`.
 pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
-    let cap = logical_len / 2 + 32;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, cap);
-    let mut out = Vec::with_capacity(cap);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    crate::anatomy_wall_root!({
+        let cap = logical_len / 2 + 32;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut out = Vec::with_capacity(cap);
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-    deflate_padded_in_place(buf, logical_len, level, &mut out);
+        deflate_padded_in_place(buf, logical_len, level, &mut out);
 
-    let crc = crc32fast::hash(&buf[..logical_len]);
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&(logical_len as u32).to_le_bytes());
-    out
+        let crc =
+            crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(&buf[..logical_len]) });
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(logical_len as u32).to_le_bytes());
+        out
+    })
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
