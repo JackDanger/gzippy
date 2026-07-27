@@ -70,30 +70,28 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         return Ok(2);
     }
 
-    // Refuse to compress files that already carry the target suffix in-place
-    // (e.g. foo.gz -> foo.gz.gz). Contract established by execution (gzip
-    // 1.14, pigz 2.8 on macOS + Linux):
-    //   - `-c`: there is no output-FILENAME collision to protect (output
-    //     goes to stdout) so gzip ALWAYS compresses through regardless of
-    //     this file's name, with or without -f. (pigz disagrees here — it
-    //     skips and emits empty stdout — but gzip is the primary drop-in
-    //     target, so we match gzip: skip this check entirely when
-    //     `args.stdout`.)
-    //   - in-place, without -f: gzip leaves the file COMPLETELY UNCHANGED
-    //     and exits 0 -- a no-op NOTICE, not an error (both gzip and pigz
-    //     agree: real `gzip already.gz` prints this message and exits 0).
-    //   - in-place, with -f: `args.force` already short-circuits this
-    //     branch (the condition below), so -f compresses anyway
-    //     (foo.gz -> foo.gz.gz), matching gzip.
-    if !args.stdout && !args.force && filename.ends_with(args.suffix.as_str()) {
-        if !args.quiet {
-            eprintln!(
-                "gzippy: {}: already has {} suffix -- unchanged",
-                filename, args.suffix
-            );
-        }
-        return Ok(0);
-    }
+    // Precondition ordering below is established BY EXECUTION against real
+    // gzip 1.14 (never inferred from reading gzip's source): permission
+    // (openability) beats EVERY other precondition and is never overridden
+    // by `-f`; hardlink-refusal beats the already-suffix notice and the
+    // refuse-overwrite notice, and IS overridden by `-f`. Concretely,
+    // `gzip already.gz` where `already.gz` is mode 000 reports "Permission
+    // denied" (exit 1), and where `already.gz` has a second hardlink reports
+    // "has 1 other link -- file ignored" (exit 2) — in BOTH cases gzip never
+    // reaches its "already has .gz suffix" no-op notice, even though the
+    // filename triggers that check too. gzippy previously ran the
+    // already-suffix check (and the hardlink check) before ever attempting
+    // to open the file, so a mode-000 or hardlinked file already ending in
+    // the target suffix short-circuited to the wrong (successful, no-op)
+    // exit code instead of reporting the real precondition failure — a
+    // compound-fixture divergence the drop-in census caught
+    // (`fulcrum dropin`, fixture `already-named.gz` x {mode000, hardlink}).
+    //
+    // Opening the file here (rather than at its old, later position) is
+    // what actually performs the permission check; the handle is reused
+    // below instead of being opened a second time.
+    let input_file = File::open(input_path)?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -120,6 +118,31 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 return Ok(2);
             }
         }
+    }
+
+    // Refuse to compress files that already carry the target suffix in-place
+    // (e.g. foo.gz -> foo.gz.gz). Contract established by execution (gzip
+    // 1.14, pigz 2.8 on macOS + Linux):
+    //   - `-c`: there is no output-FILENAME collision to protect (output
+    //     goes to stdout) so gzip ALWAYS compresses through regardless of
+    //     this file's name, with or without -f. (pigz disagrees here — it
+    //     skips and emits empty stdout — but gzip is the primary drop-in
+    //     target, so we match gzip: skip this check entirely when
+    //     `args.stdout`.)
+    //   - in-place, without -f: gzip leaves the file COMPLETELY UNCHANGED
+    //     and exits 0 -- a no-op NOTICE, not an error (both gzip and pigz
+    //     agree: real `gzip already.gz` prints this message and exits 0).
+    //   - in-place, with -f: `args.force` already short-circuits this
+    //     branch (the condition below), so -f compresses anyway
+    //     (foo.gz -> foo.gz.gz), matching gzip.
+    if !args.stdout && !args.force && filename.ends_with(args.suffix.as_str()) {
+        if !args.quiet {
+            eprintln!(
+                "gzippy: {}: already has {} suffix -- unchanged",
+                filename, args.suffix
+            );
+        }
+        return Ok(0);
     }
 
     let output_path = if args.stdout {
@@ -165,7 +188,6 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
     }
 
-    let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();
 
     let content_type = if args.processes <= 1 || args.compression_level <= 3 {
