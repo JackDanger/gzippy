@@ -332,6 +332,133 @@ const STREAM_HISTORY: usize = 32 * 1024;
 /// 2.009x the input size.
 pub const STREAM_CHUNK: usize = MAX_STORED_SUBBLOCK * 64;
 
+/// Single-pass streaming with NO chunk seam in the output.
+///
+/// The plain chunked path calls the parser once per chunk, and each call emits
+/// complete blocks over its own input range — so a block is forced to end at
+/// every seam. That cost real bytes: against libdeflate, at the levels where
+/// our output is otherwise byte-identical, multi-chunk files came out +66 to
+/// +532 bytes larger, which flipped nine tied per-label SIZE cells to failing.
+///
+/// Here ONE [`parse::ParseState`] (matchfinder + `in_base` + `next_hashes`)
+/// and ONE parse position span the whole file. Each pass parses only COMPLETE
+/// blocks that had at least [`parse::STREAM_BLOCK_LOOKAHEAD`] bytes of input
+/// behind them, and carries the unconsumed tail — always under ~305 KB —
+/// into the next refill. That margin is what makes every block-boundary
+/// decision identical to a whole-buffer encode.
+///
+/// Buffer layout is `[history | unconsumed | free]`, and it slides rather than
+/// grows: once more than two windows of history accumulate, contents move down
+/// by a whole number of `WINDOW_SIZE`s and `ParseState::shift_down` decrements
+/// `in_base` by the same amount. Because the matchfinder stores every position
+/// as `pos - in_base`, that is an O(1) pointer-rebase with no table rewrite —
+/// the same trick zlib's sliding window uses.
+fn stream_resumable<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    stream_chunk: usize,
+) -> std::io::Result<u64> {
+    use std::io::ErrorKind;
+
+    let params = level::params(level);
+    // Room for the most history the slide rule can leave behind (two windows),
+    // the largest tail the parser can decline to consume, one refill, and the
+    // matchfinder's speculative-load pad.
+    let cap = 2 * matchfinder::hc::WINDOW_SIZE
+        + parse::STREAM_BLOCK_LOOKAHEAD
+        + stream_chunk
+        + INPLACE_TAIL_PAD;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, cap);
+    let mut buf = vec![0u8; cap];
+
+    let mut state = parse::ParseState::new();
+    let mut in_next = 0usize; // parse position, in buffer coordinates
+    let mut avail = 0usize; // valid bytes in buf
+    let mut eof = false;
+    let mut crc = crc32fast::Hasher::new();
+    let mut total: u64 = 0;
+
+    let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    let mut bw = BitWriter::from_vec(out);
+
+    loop {
+        // Refill. CRC covers exactly the new bytes, while they are still hot in
+        // cache from the read — not a second sweep of the whole input.
+        let fill_to = cap - INPLACE_TAIL_PAD;
+        while !eof && avail < fill_to {
+            match reader.read(&mut buf[avail..fill_to]) {
+                Ok(0) => eof = true,
+                Ok(k) => {
+                    crc.update(&buf[avail..avail + k]);
+                    total += k as u64;
+                    avail += k;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Speculative loads read past the logical end; those bytes must read as
+        // zero for the output to be byte-exact.
+        buf[avail..avail + INPLACE_TAIL_PAD].fill(0);
+
+        // Nothing left to parse. The whole-buffer path guards this inside
+        // `deflate_into` (`in_end == data_start` emits an empty block); calling
+        // the parser directly means guarding it here instead. Without this the
+        // parser starts a block at the buffer end, reads the byte past it, and
+        // walks off — an empty input, or an input whose last byte lands exactly
+        // on a block boundary, panics in `calculate_min_match_len`.
+        if in_next == avail {
+            if eof {
+                // Close the stream: a zero-length final block carrying BFINAL.
+                emit_stored_block(&mut bw, &[], true);
+                bw.drain_to(writer)?;
+                break;
+            }
+        } else {
+            in_next = parse::compress_resumable(
+                &buf[..avail + INPLACE_TAIL_PAD],
+                &mut state,
+                in_next,
+                avail,
+                &params,
+                eof,
+                eof,
+                &mut bw,
+            );
+            bw.drain_to(writer)?;
+        }
+
+        if eof {
+            break;
+        }
+
+        // Slide: reclaim everything the matchfinder can no longer reference.
+        // `max_shift` returns a whole number of windows and always leaves one
+        // full window of history behind `in_base`.
+        let shift = state.max_shift();
+        if shift > 0 {
+            buf.copy_within(shift..avail, 0);
+            avail -= shift;
+            in_next -= shift;
+            state.shift_down(shift);
+        }
+        debug_assert!(
+            avail < fill_to,
+            "slide must free space or the loop cannot make progress"
+        );
+    }
+
+    let mut tail = bw.finish();
+    tail.extend_from_slice(&crc.finalize().to_le_bytes());
+    tail.extend_from_slice(&(total as u32).to_le_bytes());
+    writer.write_all(&tail)?;
+    Ok(total)
+}
+
 /// Whether `level` may take the single-pass streaming encoder.
 ///
 /// Level 3 is the sole exclusion, and it is excluded for a MEASURED reason,
@@ -409,6 +536,13 @@ pub fn compress_gzip_streaming_chunked<R: std::io::Read, W: std::io::Write>(
 ) -> std::io::Result<u64> {
     use std::io::ErrorKind;
     let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
+
+    // Levels whose parser can resume take the SEAM-FREE path: one matchfinder
+    // and one parse position carried across the whole file, with blocks ending
+    // only where the block splitter says so.
+    if level > 0 && parse::level_has_resumable_parser(level) {
+        return stream_resumable(reader, writer, level, stream_chunk);
+    }
 
     crate::anatomy_count!(alloc_events);
     crate::anatomy_count!(

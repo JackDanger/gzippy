@@ -426,6 +426,70 @@ impl ParseState {
 /// since it exceeds `DEFLATE_MAX_MATCH_LEN` by three orders of magnitude.
 pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH;
 
+/// Whether `level`'s strategy has a resumable runner, so the streaming encoder
+/// can carry one matchfinder across chunks and emit byte-identical output.
+///
+/// Greedy / Lazy / Lazy2 cover levels 2 and 4-9 — which is exactly the set
+/// whose output is byte-identical to libdeflate's and whose ties the chunk
+/// seams broke. The rest keep the per-chunk path for now: level 0 is stored
+/// and already byte-identical by chunk alignment, level 1 (Fast) and levels
+/// 10-12 (NearOptimal) have their own runners, and level 3 (LazyGated) is
+/// excluded from streaming entirely because its content detector is
+/// chunk-sensitive. This list should GROW until it is every level.
+pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
+    matches!(
+        super::level::params(level).strategy,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    )
+}
+
+/// Resume a parse over `buf[from..in_end]` using caller-owned `state`.
+///
+/// See `greedy::run_resumable` for the `consume_all` / `is_last` distinction
+/// and why the lookahead margin keeps block boundaries identical to a
+/// whole-buffer encode. Returns the position after the last complete block.
+/// Callers must check [`level_has_resumable_parser`] first; other strategies
+/// panic rather than silently emitting a differently-shaped stream.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compress_resumable(
+    buf: &[u8],
+    state: &mut ParseState,
+    from: usize,
+    in_end: usize,
+    params: &LevelParams,
+    is_last: bool,
+    consume_all: bool,
+    bw: &mut BitWriter,
+) -> usize {
+    let statics = StaticCodes::build();
+    match params.strategy {
+        Strategy::Greedy => greedy::run_resumable(
+            buf,
+            state,
+            from,
+            in_end,
+            params,
+            &statics,
+            bw,
+            is_last,
+            consume_all,
+        ),
+        Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
+            buf,
+            state,
+            from,
+            in_end,
+            params,
+            &statics,
+            bw,
+            matches!(params.strategy, Strategy::Lazy2),
+            is_last,
+            consume_all,
+        ),
+        other => unreachable!("compress_resumable called for non-resumable strategy {other:?}"),
+    }
+}
+
 // ---- block-boundary helpers ----
 
 /// `choose_max_block_end`: the soft byte limit for a block starting at
