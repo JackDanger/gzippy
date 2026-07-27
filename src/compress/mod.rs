@@ -150,6 +150,23 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         // accumulation, leaving `cli_ns` at zero while every inner region
         // reported normally. (The `?` operators below can still return early,
         // but only on the error path, where no measurement is claimed.)
+        // Single-pass streaming route. Holds a fixed ~4.3 MB regardless of
+        // input size, where the buffered route below materializes BOTH the
+        // whole input and the whole output (measured peak RSS 2.009x the input
+        // at -0 on a 232 MiB file, against a flat 2.0 MB for gzip and pigz).
+        if crate::compress::deflate::level_streams(args.compression_level as u32) {
+            let mut writer = writer;
+            let bytes = crate::anatomy_wall_cli!({
+                crate::compress::deflate::compress_gzip_streaming(
+                    &mut reader,
+                    &mut writer,
+                    args.compression_level as u32,
+                )?
+            });
+            writer.flush()?;
+            return Ok(bytes);
+        }
+
         let bytes = crate::anatomy_wall_cli!({
             // Pre-size for the known (or hinted) length plus the matchfinder's
             // trailing pad so neither `read_to_end` nor the following `resize`

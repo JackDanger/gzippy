@@ -252,6 +252,28 @@ impl BitWriter {
         self.out.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Hand every COMPLETE byte accumulated so far to `w` and clear the
+    /// internal buffer, leaving the bit accumulator untouched so the stream
+    /// continues seamlessly across the drain.
+    ///
+    /// This is what makes a single-pass streaming encoder possible: without
+    /// it, a `BitWriter` grows a `Vec` holding the entire compressed output
+    /// (the T1 path's second full-size buffer). After [`flush_bits`] the
+    /// buffer holds only whole bytes and at most 7 bits remain in `bitbuf`,
+    /// so draining here is a clean cut — NOT byte-alignment. Deliberately not
+    /// [`align_to_byte`]: padding to a byte boundary at every drain would
+    /// inject stray zero bits into the middle of the DEFLATE stream and
+    /// change (indeed corrupt) the output. The drain point is therefore
+    /// invisible in the emitted bytes, which is exactly the property that
+    /// lets the streaming encoder stay byte-identical to the whole-buffer
+    /// one.
+    pub fn drain_to<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.flush_bits();
+        w.write_all(&self.out)?;
+        self.out.clear();
+        Ok(())
+    }
+
     /// Finish the stream: flush full bytes, emit any final partial byte
     /// (zero-padded), and return the accumulated output.
     pub fn finish(mut self) -> Vec<u8> {

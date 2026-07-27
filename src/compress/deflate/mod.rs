@@ -152,7 +152,7 @@ pub fn compress_block_streaming(
         let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
-        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last);
+        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true);
     } else {
         // Preset-dictionary chunk: prepend the dictionary into one padded buffer
         // [dict | data | pad] and parse over the data region with the dictionary
@@ -166,7 +166,7 @@ pub fn compress_block_streaming(
         buf.extend_from_slice(dict);
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
-        deflate_into(&mut bw, &buf, dict_len, in_end, level, is_last);
+        deflate_into(&mut bw, &buf, dict_len, in_end, level, is_last, true);
     }
 
     *out = bw.finish();
@@ -193,6 +193,16 @@ pub fn compress_block_streaming(
 /// unit-tested via `level::params(0)`) but are no longer reachable from this
 /// production call path. Levels 1-12 are completely unaffected — this is the
 /// only new branch, guarded on `level == 0` alone.
+///
+/// `sync_flush` controls whether a non-final chunk is closed with a
+/// byte-aligning empty stored block. It is REQUIRED when chunks are encoded
+/// into separate bit streams that are later concatenated (the T>1 path, and
+/// [`compress_block_streaming`]'s contract). It must be OFF for a
+/// single-threaded streaming encoder that keeps ONE continuous `BitWriter`
+/// across chunks: there the chunk seam does not exist in the bitstream at all,
+/// so aligning at it would both waste ~5 bytes per chunk and, more
+/// importantly, make the output depend on the chunk size — destroying
+/// byte-identity with the whole-buffer encoder.
 fn deflate_into(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -200,6 +210,7 @@ fn deflate_into(
     in_end: usize,
     level: u32,
     is_last: bool,
+    sync_flush: bool,
 ) {
     debug_assert!(buf.len() >= in_end + parse::BUF_PAD);
     if in_end == data_start {
@@ -211,9 +222,10 @@ fn deflate_into(
         parse::compress(buf, data_start, in_end, &params, is_last, bw);
     }
 
-    // Non-final chunk: close on a clean byte boundary with a sync-flush marker
-    // so the next chunk's stream concatenates without stray bits.
-    if !is_last {
+    // Non-final chunk in a CONCATENATED stream: close on a clean byte boundary
+    // with a sync-flush marker so the next chunk's stream joins without stray
+    // bits. Skipped when one continuous `BitWriter` spans every chunk.
+    if !is_last && sync_flush {
         emit_stored_block(bw, &[], false);
     }
 }
@@ -233,7 +245,7 @@ pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: 
         "deflate_padded_in_place: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
     let mut bw = BitWriter::from_vec(std::mem::take(out));
-    deflate_into(&mut bw, buf, 0, logical_len, level, true);
+    deflate_into(&mut bw, buf, 0, logical_len, level, true, true);
     *out = bw.finish();
 }
 
@@ -288,6 +300,203 @@ pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u
         out.extend_from_slice(&(logical_len as u32).to_le_bytes());
         out
     })
+}
+
+/// Bytes of already-emitted input kept as matchfinder context across chunk
+/// boundaries in the streaming encoder. DEFLATE's maximum back-reference
+/// distance is 32768, so a chunk that carries the preceding 32 KiB can reach
+/// every position the whole-buffer encoder could have reached from the same
+/// offset — which is why streaming does not have to cost ratio.
+const STREAM_HISTORY: usize = 32 * 1024;
+
+/// Input consumed per streaming iteration: 65535 x 64 = 4_194_240 (~4 MiB).
+///
+/// ONE constant for every level, every input and every machine — no detection,
+/// no per-archive tuning. Two measured properties chose it:
+///
+/// * **A multiple of [`MAX_STORED_SUBBLOCK`]**, so at level 0 the stored
+///   sub-block boundaries fall exactly where the whole-buffer encoder puts
+///   them and the streamed output is byte-identical, not merely equivalent.
+/// * **Large enough that forced block boundaries stop costing ratio.** Each
+///   chunk seam ends a DEFLATE block, so smaller chunks cost output size.
+///   Swept over the 21-file corpus x L0-L9, restricted to the 7 files >= 25 MiB
+///   (the ones genuinely multi-chunk at every sweep point), worst-case size
+///   regression versus whole-buffer encoding:
+///     1 MiB 0.0370% | 2 MiB 0.0411% | 4 MiB 0.0189% | 8 MiB 0.0196%
+///   (level 3 excluded — its content detector is separately chunk-sensitive,
+///   see `parse::gated`; that is a property of the detector, not of chunking,
+///   and it is why level 3 does NOT take this path yet.)
+///
+/// 4 MiB is where the ratio cost flattens. Peak RSS is then ~4.3 MB against
+/// gzip's 2.0 MB and libdeflate's 18.0 MB, versus the whole-buffer path's
+/// 2.009x the input size.
+pub const STREAM_CHUNK: usize = MAX_STORED_SUBBLOCK * 64;
+
+/// Whether `level` may take the single-pass streaming encoder.
+///
+/// Level 3 is the sole exclusion, and it is excluded for a MEASURED reason,
+/// not a suspected one: it is the only level whose strategy
+/// (`Strategy::LazyGated`) consults a content detector to dispatch
+/// greedy-vs-lazy per block. Chunking moves the detector's decision
+/// boundaries, and the resulting output is systematically larger — worst case
+/// on the corpus at a 4 MiB chunk was `data.sqlite` at +0.74%, against
+/// <=0.02% for every other level. Forcing level 3 to a plain lazy parse
+/// collapsed the whole-corpus level-3 regression from +384,581 to +16,171
+/// bytes, which is what identifies the detector rather than the chunking as
+/// the cause.
+///
+/// This is a level branch, not content detection: it looks only at the number
+/// the user typed. It should disappear rather than grow — the fix is to make
+/// level 3 not depend on a detector, not to teach the streamer about level 3.
+#[inline]
+pub fn level_streams(level: u32) -> bool {
+    level != 3
+}
+
+/// Compress `reader` into `writer` as a gzip stream in ONE pass, holding a
+/// fixed ~1.1 MiB of buffer regardless of input size.
+///
+/// This is the streaming counterpart to [`compress_gzip_padded`], which
+/// materializes the whole input in one `Vec` and the whole output in another.
+/// Measured peak RSS of that approach on a 232.2 MiB input was 2.009x the
+/// input at `-0` and input-plus-compressed-size at `-6`, against a flat 2.0 MB
+/// for both gzip and pigz — a difference that stops being a ratio and starts
+/// being a failure once the input approaches available memory.
+///
+/// Three structural properties, in the order they matter:
+///
+/// 1. **One continuous [`BitWriter`] spans every chunk.** Chunks are not
+///    separately-encoded streams that get concatenated, so no sync-flush
+///    marker is needed at the seams (`sync_flush = false`) and the seam leaves
+///    no trace in the output. [`BitWriter::drain_to`] hands off complete bytes
+///    after each chunk while the partial-bit accumulator carries over.
+/// 2. **CRC is folded into the chunk pass**, over data still hot in cache,
+///    instead of a separate monolithic sweep of the whole input. On the
+///    whole-buffer path that sweep measured 29.3 ms on 232 MiB — a third of
+///    the entire `-0` route.
+/// 3. **The history window slides inside one buffer.** Layout is
+///    `[STREAM_HISTORY | STREAM_CHUNK | INPLACE_TAIL_PAD]`; after each chunk
+///    the trailing 32 KiB is `copy_within`'d down to the history slot. The
+///    encoder parses in place and back-references reach into the history
+///    exactly as they would mid-buffer.
+///
+/// The one-byte lookahead exists because DEFLATE must mark the final block
+/// BFINAL *while encoding it*, and "did the reader end exactly on a chunk
+/// boundary" is not knowable otherwise. Reading one byte past a full chunk
+/// answers it; that byte becomes the first byte of the next chunk.
+pub fn compress_gzip_streaming<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+) -> std::io::Result<u64> {
+    compress_gzip_streaming_chunked(reader, writer, level, STREAM_CHUNK)
+}
+
+/// [`compress_gzip_streaming`] with the chunk size supplied by the caller.
+///
+/// A MEASUREMENT SEAM, not a tuning knob: production has exactly one chunk
+/// size, [`STREAM_CHUNK`], and no code path lets a user or an environment
+/// variable choose another. It exists because chunk size trades peak memory
+/// against output size (each chunk seam ends a block, and forced block
+/// boundaries cost ratio), and that curve has to be measured to pick the
+/// constant rather than guessed. `chunk` should be a multiple of
+/// [`MAX_STORED_SUBBLOCK`] to keep level 0 byte-identical.
+pub fn compress_gzip_streaming_chunked<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    chunk: usize,
+) -> std::io::Result<u64> {
+    use std::io::ErrorKind;
+    let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
+
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(
+        alloc_bytes,
+        STREAM_HISTORY + stream_chunk + INPLACE_TAIL_PAD
+    );
+    let mut buf = vec![0u8; STREAM_HISTORY + stream_chunk + INPLACE_TAIL_PAD];
+
+    // Valid history occupies `buf[STREAM_HISTORY - hist .. STREAM_HISTORY]`.
+    // Starting at zero matters: seeding the matchfinder with the buffer's
+    // initial zero fill would invent back-references to bytes that were never
+    // in the input.
+    let mut hist: usize = 0;
+    let mut carry: Option<u8> = None;
+    let mut crc = crc32fast::Hasher::new();
+    let mut total: u64 = 0;
+
+    let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    let mut bw = BitWriter::from_vec(out);
+
+    loop {
+        let data_at = STREAM_HISTORY;
+        let mut n = 0usize;
+        if let Some(b) = carry.take() {
+            buf[data_at] = b;
+            n = 1;
+        }
+        while n < stream_chunk {
+            match reader.read(&mut buf[data_at + n..data_at + stream_chunk]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // A short read means EOF. A full chunk is only final if one more read
+        // returns nothing.
+        let is_last = if n < stream_chunk {
+            true
+        } else {
+            let mut one = [0u8; 1];
+            loop {
+                match reader.read(&mut one) {
+                    Ok(0) => break true,
+                    Ok(_) => {
+                        carry = Some(one[0]);
+                        break false;
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+
+        crc.update(&buf[data_at..data_at + n]);
+        total += n as u64;
+
+        // The matchfinder's speculative loads read past the logical end; those
+        // bytes must be zero for the output to be byte-exact. Re-zeroed every
+        // iteration because the previous, longer chunk may have left data here.
+        buf[data_at + n..data_at + n + INPLACE_TAIL_PAD].fill(0);
+
+        // Hand the encoder `[history | chunk | pad]` with the history marked as
+        // preset dictionary. Slicing from `STREAM_HISTORY - hist` (not 0) keeps
+        // the not-yet-filled part of the history slot out of the dictionary.
+        let region = &buf[STREAM_HISTORY - hist..data_at + n + INPLACE_TAIL_PAD];
+        deflate_into(&mut bw, region, hist, hist + n, level, is_last, false);
+
+        bw.drain_to(writer)?;
+
+        // Slide the trailing window down for the next iteration.
+        let keep = (hist + n).min(STREAM_HISTORY);
+        let src_start = (data_at + n) - keep;
+        buf.copy_within(src_start..data_at + n, STREAM_HISTORY - keep);
+        hist = keep;
+
+        if is_last {
+            break;
+        }
+    }
+
+    let mut tail = bw.finish();
+    tail.extend_from_slice(&crc.finalize().to_le_bytes());
+    tail.extend_from_slice(&(total as u32).to_le_bytes());
+    writer.write_all(&tail)?;
+    Ok(total)
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
