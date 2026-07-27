@@ -461,23 +461,38 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
 
 /// Whether `level` may take the single-pass streaming encoder.
 ///
-/// Level 3 is the sole exclusion, and it is excluded for a MEASURED reason,
-/// not a suspected one: it is the only level whose strategy
-/// (`Strategy::LazyGated`) consults a content detector to dispatch
-/// greedy-vs-lazy per block. Chunking moves the detector's decision
-/// boundaries, and the resulting output is systematically larger — worst case
-/// on the corpus at a 4 MiB chunk was `data.sqlite` at +0.74%, against
-/// <=0.02% for every other level. Forcing level 3 to a plain lazy parse
-/// collapsed the whole-corpus level-3 regression from +384,581 to +16,171
-/// bytes, which is what identifies the detector rather than the chunking as
-/// the cause.
+/// THE RULE: a level streams only when its output is PROVABLY unaffected by
+/// streaming. Two ways to earn that, and no third:
 ///
-/// This is a level branch, not content detection: it looks only at the number
-/// the user typed. It should disappear rather than grow — the fix is to make
-/// level 3 not depend on a detector, not to teach the streamer about level 3.
+/// * **Level 0** — stored blocks, and [`STREAM_CHUNK`] is a multiple of
+///   [`MAX_STORED_SUBBLOCK`], so sub-block boundaries land exactly where the
+///   whole-buffer encoder puts them.
+/// * **A resumable parser** ([`parse::level_has_resumable_parser`]) — one
+///   matchfinder and one parse position span the file, so block boundaries
+///   come from the block splitter rather than from input refill.
+///
+/// Everything else keeps the whole-buffer path and its memory cost. That is a
+/// deliberate ordering: being at-least-as-small at the level the user typed is
+/// the contract, and peak RSS is not, so a level that cannot yet stream
+/// without growing its output does not stream.
+///
+/// THIS RULE WAS LEARNED THE EXPENSIVE WAY, TWICE. The first streaming
+/// version ran every level through a seamed chunk loop. At L2/4/5/6/7 that
+/// cost +66 to +532 bytes against libdeflate — levels where the buffered path
+/// was EXACTLY byte-identical to it — flipping nine tied per-label SIZE cells.
+/// Those were fixed by making greedy/lazy resumable. Then the SAME defect was
+/// found at L10-12 (NearOptimal, still seamed): +101 to +5944 bytes, six more
+/// passing cells flipped, and they had gone unmeasured because the corpus
+/// sweep only covered L0-L9. Both times the mistake was letting a level onto
+/// the streaming path without a proof that its bytes could not change.
+///
+/// This is a level branch, not content detection — it reads only the number
+/// the user typed. It should shrink by making more parsers resumable (Fast for
+/// L1, NearOptimal for L10-12, and L3 once its content detector is gone), not
+/// by relaxing the rule.
 #[inline]
 pub fn level_streams(level: u32) -> bool {
-    level != 3
+    level == 0 || parse::level_has_resumable_parser(level)
 }
 
 /// Compress `reader` into `writer` as a gzip stream in ONE pass, holding a
