@@ -143,10 +143,24 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                     return Ok(2);
                 }
             } else {
-                return Err(GzippyError::invalid_argument(format!(
-                    "Output file {} already exists",
-                    output_path.display()
-                )));
+                // Contract established by execution (gzip 1.14, non-interactive
+                // stdin — e.g. a script or a pipeline): gzip does NOT treat this
+                // as an error. It prints the exact same "already exists;\tnot
+                // overwritten" shape it would after a declined prompt and exits
+                // 2 (WARNING) -- it never actually blocks waiting for input, and
+                // it never returns 1. gzippy previously returned an
+                // InvalidArgument Err here (exit 1), which is wrong on two
+                // counts: wrong exit CLASS, and it would abort a multi-file
+                // invocation's remaining good files via the main-loop Err path
+                // instead of just skipping this one. pigz disagrees (exit 1,
+                // "skipping: F exists") -- gzip is the primary drop-in target.
+                if !args.quiet {
+                    eprintln!(
+                        "gzippy: {} already exists;\tnot overwritten",
+                        output_path.display()
+                    );
+                }
+                return Ok(2);
             }
         }
     }
