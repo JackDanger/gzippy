@@ -140,63 +140,26 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
             );
         }
         route::emit(route::PURE_T1, args.compression_level as u32, 1);
+        // ONE call for every level 0-12. `compress_gzip_streaming` streams when
+        // the level's bytes provably cannot change and falls back to the
+        // whole-buffer encoder otherwise, so this routing function carries no
+        // level-dependent branch of its own.
+        //
         // The `anatomy-wall` CLI span (feature default OFF, compiles to just
-        // the body when off). It encloses read + encode + write so the
-        // instrument's level-2 conservation check covers the WHOLE T1 route;
-        // before this span existed, `root` (the encoder call) reconciled
-        // cleanly while accounting for only half the observed wall.
-        // NOTE: this block must EVALUATE to `bytes` rather than `return` it —
-        // an early return would jump past the macro's elapsed-time
-        // accumulation, leaving `cli_ns` at zero while every inner region
-        // reported normally. (The `?` operators below can still return early,
-        // but only on the error path, where no measurement is claimed.)
-        // Single-pass streaming route. Holds a fixed ~4.3 MB regardless of
-        // input size, where the buffered route below materializes BOTH the
-        // whole input and the whole output (measured peak RSS 2.009x the input
-        // at -0 on a 232 MiB file, against a flat 2.0 MB for gzip and pigz).
-        if crate::compress::deflate::level_streams(args.compression_level as u32) {
-            let mut writer = writer;
-            let bytes = crate::anatomy_wall_cli!({
-                crate::compress::deflate::compress_gzip_streaming(
-                    &mut reader,
-                    &mut writer,
-                    args.compression_level as u32,
-                )?
-            });
-            writer.flush()?;
-            return Ok(bytes);
-        }
-
+        // the body) encloses the whole T1 route so the instrument's level-2
+        // conservation check covers it. This block must EVALUATE to `bytes`
+        // rather than `return` it — an early return would jump past the
+        // macro's elapsed-time accumulation, leaving `cli_ns` at zero while
+        // every inner region reported normally.
+        let mut writer = writer;
         let bytes = crate::anatomy_wall_cli!({
-            // Pre-size for the known (or hinted) length plus the matchfinder's
-            // trailing pad so neither `read_to_end` nor the following `resize`
-            // needs to grow-and-copy the buffer (was 2 reallocs touching ~2x the
-            // input in bytes — visible in DHAT as the `read_to_end` site).
-            let mut input = Vec::with_capacity(
-                size_hint
-                    .map(|s| s + crate::compress::deflate::INPLACE_TAIL_PAD)
-                    .unwrap_or(0),
-            );
-            let bytes = crate::anatomy_wall_time!(read_input_ns, read_input_calls, {
-                reader.read_to_end(&mut input)?;
-                input.len() as u64
-            });
-            // Pad the read buffer in place with the matchfinder's trailing slack so
-            // the compressor parses IN PLACE — no second full-input work buffer.
-            let logical_len = input.len();
-            input.resize(logical_len + crate::compress::deflate::INPLACE_TAIL_PAD, 0);
-            let gz = crate::compress::deflate::compress_gzip_padded(
-                &input,
-                logical_len,
+            crate::compress::deflate::compress_gzip_streaming(
+                &mut reader,
+                &mut writer,
                 args.compression_level as u32,
-            );
-            let mut writer = writer;
-            crate::anatomy_wall_time!(write_out_ns, write_out_calls, {
-                writer.write_all(&gz)?;
-                writer.flush()?;
-            });
-            bytes
+            )?
         });
+        writer.flush()?;
         return Ok(bytes);
     }
 

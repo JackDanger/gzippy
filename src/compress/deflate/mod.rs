@@ -302,13 +302,6 @@ pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u
     })
 }
 
-/// Bytes of already-emitted input kept as matchfinder context across chunk
-/// boundaries in the streaming encoder. DEFLATE's maximum back-reference
-/// distance is 32768, so a chunk that carries the preceding 32 KiB can reach
-/// every position the whole-buffer encoder could have reached from the same
-/// offset — which is why streaming does not have to cost ratio.
-const STREAM_HISTORY: usize = 32 * 1024;
-
 /// Input consumed per streaming iteration: 65535 x 64 = 4_194_240 (~4 MiB).
 ///
 /// ONE constant for every level, every input and every machine — no detection,
@@ -426,7 +419,23 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
         // parser starts a block at the buffer end, reads the byte past it, and
         // walks off — an empty input, or an input whose last byte lands exactly
         // on a block boundary, panics in `calculate_min_match_len`.
-        if in_next == avail {
+        if level == 0 {
+            // STORED: no parser, no matchfinder, no history window. Emit whole
+            // 65535-byte sub-blocks and carry the remainder, so boundaries land
+            // exactly where the whole-buffer encoder puts them and the output
+            // is byte-identical. Handling level 0 HERE is what lets ONE
+            // streaming loop serve every streaming level, instead of keeping a
+            // second seam-tolerant loop alive for the one level whose encoding
+            // is a memcpy.
+            let take = if eof {
+                avail - in_next
+            } else {
+                ((avail - in_next) / MAX_STORED_SUBBLOCK) * MAX_STORED_SUBBLOCK
+            };
+            emit_stored_block(&mut bw, &buf[in_next..in_next + take], eof);
+            in_next += take;
+            crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
+        } else if in_next == avail {
             if eof {
                 // Close the stream: a zero-length final block carrying BFINAL.
                 emit_stored_block(&mut bw, &[], true);
@@ -460,12 +469,21 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
         // Slide: reclaim everything the matchfinder can no longer reference.
         // `max_shift` returns a whole number of windows and always leaves one
         // full window of history behind `in_base`.
-        let shift = state.max_shift();
+        // Level 0 references nothing behind `in_next`, so everything already
+        // emitted is reclaimable; every other level must leave the matchfinder
+        // a full window, which is what `max_shift` guarantees.
+        let shift = if level == 0 {
+            in_next
+        } else {
+            state.max_shift()
+        };
         if shift > 0 {
             buf.copy_within(shift..avail, 0);
             avail -= shift;
             in_next -= shift;
-            state.shift_down(shift);
+            if level != 0 {
+                state.shift_down(shift);
+            }
         }
         debug_assert!(
             avail < fill_to,
@@ -570,103 +588,23 @@ pub fn compress_gzip_streaming_chunked<R: std::io::Read, W: std::io::Write>(
     level: u32,
     chunk: usize,
 ) -> std::io::Result<u64> {
-    use std::io::ErrorKind;
+    if !level_streams(level) {
+        // This level cannot yet stream without changing its bytes (see
+        // `level_streams`). Fall back to the whole-buffer encoder rather than
+        // refusing: the entry point stays TOTAL, so callers — including the
+        // CLI — have exactly one function to call and never a level-dependent
+        // branch of their own. The memory cost is real and is tracked as the
+        // reason to make the remaining parsers resumable, not as an API wart.
+        let mut input = Vec::new();
+        reader.read_to_end(&mut input)?;
+        let logical_len = input.len();
+        input.resize(logical_len + INPLACE_TAIL_PAD, 0);
+        let gz = compress_gzip_padded(&input, logical_len, level);
+        writer.write_all(&gz)?;
+        return Ok(logical_len as u64);
+    }
     let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
-
-    // Levels whose parser can resume take the SEAM-FREE path: one matchfinder
-    // and one parse position carried across the whole file, with blocks ending
-    // only where the block splitter says so.
-    if level > 0 && parse::level_has_resumable_parser(level) {
-        return stream_resumable(reader, writer, level, stream_chunk);
-    }
-
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(
-        alloc_bytes,
-        STREAM_HISTORY + stream_chunk + INPLACE_TAIL_PAD
-    );
-    let mut buf = vec![0u8; STREAM_HISTORY + stream_chunk + INPLACE_TAIL_PAD];
-
-    // Valid history occupies `buf[STREAM_HISTORY - hist .. STREAM_HISTORY]`.
-    // Starting at zero matters: seeding the matchfinder with the buffer's
-    // initial zero fill would invent back-references to bytes that were never
-    // in the input.
-    let mut hist: usize = 0;
-    let mut carry: Option<u8> = None;
-    let mut crc = crc32fast::Hasher::new();
-    let mut total: u64 = 0;
-
-    let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-    let mut bw = BitWriter::from_vec(out);
-
-    loop {
-        let data_at = STREAM_HISTORY;
-        let mut n = 0usize;
-        if let Some(b) = carry.take() {
-            buf[data_at] = b;
-            n = 1;
-        }
-        while n < stream_chunk {
-            match reader.read(&mut buf[data_at + n..data_at + stream_chunk]) {
-                Ok(0) => break,
-                Ok(k) => n += k,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        // A short read means EOF. A full chunk is only final if one more read
-        // returns nothing.
-        let is_last = if n < stream_chunk {
-            true
-        } else {
-            let mut one = [0u8; 1];
-            loop {
-                match reader.read(&mut one) {
-                    Ok(0) => break true,
-                    Ok(_) => {
-                        carry = Some(one[0]);
-                        break false;
-                    }
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-        };
-
-        crc.update(&buf[data_at..data_at + n]);
-        total += n as u64;
-
-        // The matchfinder's speculative loads read past the logical end; those
-        // bytes must be zero for the output to be byte-exact. Re-zeroed every
-        // iteration because the previous, longer chunk may have left data here.
-        buf[data_at + n..data_at + n + INPLACE_TAIL_PAD].fill(0);
-
-        // Hand the encoder `[history | chunk | pad]` with the history marked as
-        // preset dictionary. Slicing from `STREAM_HISTORY - hist` (not 0) keeps
-        // the not-yet-filled part of the history slot out of the dictionary.
-        let region = &buf[STREAM_HISTORY - hist..data_at + n + INPLACE_TAIL_PAD];
-        deflate_into(&mut bw, region, hist, hist + n, level, is_last, false);
-
-        bw.drain_to(writer)?;
-
-        // Slide the trailing window down for the next iteration.
-        let keep = (hist + n).min(STREAM_HISTORY);
-        let src_start = (data_at + n) - keep;
-        buf.copy_within(src_start..data_at + n, STREAM_HISTORY - keep);
-        hist = keep;
-
-        if is_last {
-            break;
-        }
-    }
-
-    let mut tail = bw.finish();
-    tail.extend_from_slice(&crc.finalize().to_le_bytes());
-    tail.extend_from_slice(&(total as u32).to_le_bytes());
-    writer.write_all(&tail)?;
-    Ok(total)
+    stream_resumable(reader, writer, level, stream_chunk)
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
