@@ -170,3 +170,166 @@ fn levels_1_through_12_never_get_larger_when_streamed() {
     }
     eprintln!("streamed==whole-buffer on {identical}/{compared} level-1..12 cases");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial readers.
+//
+// Every test above feeds a `&[u8]`, whose `Read` impl always fills the whole
+// buffer and never fails. That means the streaming encoder's fill loop — the
+// short-read retry, the `Interrupted` retry, and the one-byte lookahead that
+// decides BFINAL — was entirely unexercised, while the CLI hits exactly those
+// paths whenever its input is a pipe or stdin. A review flagged this as the
+// strongest missing test; it was right.
+// ---------------------------------------------------------------------------
+
+/// A `Read` that hands back at most `max_read` bytes per call and injects
+/// `ErrorKind::Interrupted` every `interrupt_every` calls. Both behaviours are
+/// legal for any `Read` implementation and both are common on pipes.
+struct HostileReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    max_read: usize,
+    interrupt_every: usize,
+    calls: usize,
+}
+
+impl<'a> HostileReader<'a> {
+    fn new(data: &'a [u8], max_read: usize, interrupt_every: usize) -> Self {
+        Self {
+            data,
+            pos: 0,
+            max_read,
+            interrupt_every,
+            calls: 0,
+        }
+    }
+}
+
+impl std::io::Read for HostileReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if self.interrupt_every != 0 && self.calls.is_multiple_of(self.interrupt_every) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected",
+            ));
+        }
+        let n = buf.len().min(self.max_read).min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn short_reads_and_interrupts_do_not_change_the_output() {
+    // Sizes that land on and around the chunk boundary, where a mis-handled
+    // short read would corrupt the is_last decision rather than the data.
+    let inputs = [
+        ("chunk minus one", corpus(CHUNK - 1, 96)),
+        ("exactly one chunk", corpus(CHUNK, 96)),
+        ("chunk plus one", corpus(CHUNK + 1, 96)),
+        ("two chunks plus tail", corpus(2 * CHUNK + 7777, 128)),
+    ];
+    // max_read of 1 is the pathological case: the fill loop must iterate
+    // millions of times and still assemble exactly the same chunks.
+    let shapes = [
+        (1usize, 0usize),
+        (7, 3),
+        (4096, 5),
+        (CHUNK / 3, 2),
+        (usize::MAX, 11),
+    ];
+
+    for (name, data) in &inputs {
+        let reference = streamed(data, 6);
+        for (max_read, interrupt_every) in shapes {
+            let mut r = HostileReader::new(data, max_read, interrupt_every);
+            let mut out = Vec::new();
+            let n = gzippy::compress::deflate::compress_gzip_streaming(&mut r, &mut out, 6)
+                .expect("hostile reader must not fail the encode");
+            assert_eq!(
+                n as usize,
+                data.len(),
+                "{name}: wrong input length reported"
+            );
+            assert_eq!(
+                out, reference,
+                "{name} (max_read={max_read}, interrupt_every={interrupt_every}): \
+                 output differs from the same input delivered in one piece"
+            );
+            assert_eq!(&roundtrip(&out), data, "{name}: roundtrip");
+        }
+    }
+}
+
+/// A `Read` that synthesizes `len` bytes procedurally so a multi-gigabyte input
+/// can be encoded without ever allocating it.
+struct HugeReader {
+    remaining: u64,
+    counter: u64,
+}
+
+impl std::io::Read for HugeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let n = (buf.len() as u64).min(self.remaining) as usize;
+        for b in buf.iter_mut().take(n) {
+            *b = (self.counter % 251) as u8;
+            self.counter += 1;
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// gzip's ISIZE field is 32 bits and is defined as the input length MODULO
+/// 2^32, so a >4 GiB member is not an error — it wraps, and every decoder
+/// (including gzip and pigz) accepts it. This pins that our streamed trailer
+/// wraps the same way, and incidentally proves the encoder survives an input
+/// far larger than RAM, which is the entire point of the streaming path.
+#[test]
+#[ignore = "encodes 4 GiB; run explicitly with --ignored"]
+fn input_larger_than_four_gib_wraps_isize_and_does_not_buffer() {
+    const LEN: u64 = (1u64 << 32) + 1_000_000;
+    let mut r = HugeReader {
+        remaining: LEN,
+        counter: 0,
+    };
+    let mut sink = CountingSink {
+        bytes: 0,
+        tail: Vec::new(),
+    };
+    let n = gzippy::compress::deflate::compress_gzip_streaming(&mut r, &mut sink, 0)
+        .expect("4 GiB encode");
+    assert_eq!(n, LEN, "reported input length");
+
+    let isize_field = u32::from_le_bytes(sink.tail[sink.tail.len() - 4..].try_into().unwrap());
+    assert_eq!(
+        u64::from(isize_field),
+        LEN % (1u64 << 32),
+        "ISIZE must be the input length mod 2^32, matching gzip and pigz"
+    );
+}
+
+/// Discards output but remembers the last 8 bytes, so the gzip trailer can be
+/// checked without holding a multi-gigabyte stream.
+struct CountingSink {
+    bytes: u64,
+    tail: Vec<u8>,
+}
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes += buf.len() as u64;
+        self.tail.extend_from_slice(buf);
+        let keep = self.tail.len().saturating_sub(8);
+        self.tail.drain(..keep);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
