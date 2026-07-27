@@ -52,7 +52,12 @@ pub(crate) mod route {
     #[inline]
     pub(crate) fn emit(name: &str, level: u32, threads: usize) {
         if crate::utils::debug_enabled() {
-            eprintln!("[gzippy] compress path={name} level={level} threads={threads}");
+            // `encode-path=` is the token `fulcrum cpreflight`'s ENCODE-FINGERPRINT gate
+            // (Gate-4) greps for; the older `compress path=` spelling silently failed
+            // that gate. Both are printed so existing scripts keep working.
+            eprintln!(
+                "[gzippy] compress path={name} encode-path={name} level={level} threads={threads}"
+            );
         }
     }
 }
