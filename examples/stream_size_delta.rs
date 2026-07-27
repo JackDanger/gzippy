@@ -9,17 +9,28 @@
 //! Usage: cargo run --release --example stream_size_delta -- <file>...
 
 use gzippy::compress::deflate::{
-    compress_gzip_padded, compress_gzip_streaming_chunked, INPLACE_TAIL_PAD,
+    compress_gzip_padded, compress_gzip_streaming_chunked, INPLACE_TAIL_PAD, STREAM_CHUNK,
 };
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // First arg may be `--chunk=N` (multiples of 65535). Measurement seam only.
-    let mut chunk = 65535 * 16;
-    if let Some(a) = args.first().cloned() {
+    // Leading `--chunk=N` (multiples of 65535) and `--levels=a,b,c` are
+    // measurement seams. Chunk defaults to the shipped STREAM_CHUNK so the
+    // default run measures what production actually does.
+    let mut chunk = STREAM_CHUNK;
+    let mut levels: Vec<u32> = (0..=9).collect();
+    while let Some(a) = args.first().cloned() {
         if let Some(v) = a.strip_prefix("--chunk=") {
             chunk = v.parse().expect("--chunk=<bytes>");
             args.remove(0);
+        } else if let Some(v) = a.strip_prefix("--levels=") {
+            levels = v
+                .split(',')
+                .map(|x| x.parse().expect("--levels=0,1,2"))
+                .collect();
+            args.remove(0);
+        } else {
+            break;
         }
     }
     eprintln!(
@@ -60,7 +71,7 @@ fn main() {
         padded.extend_from_slice(&data);
         padded.resize(data.len() + INPLACE_TAIL_PAD, 0);
 
-        for level in [0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+        for &level in &levels {
             let w = compress_gzip_padded(&padded, data.len(), level).len();
             let mut out = Vec::new();
             let mut src = data.as_slice();
