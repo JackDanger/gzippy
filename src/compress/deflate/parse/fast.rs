@@ -46,6 +46,7 @@
 //! not duplicate it.
 
 use super::super::bitstream::BitWriter;
+use super::super::huffman::HeaderScratch;
 use super::super::matchfinder::common::{load_u24, load_u32, lz_extend, lz_hash, prefetch_write};
 #[cfg(feature = "l1-tune")]
 use super::super::matchfinder::hc::HcMatchfinder;
@@ -2749,6 +2750,48 @@ fn fastloop_l1_lean(
     pos
 }
 
+thread_local! {
+    /// Per-thread recycled `head` table (see `acquire_head_table`).
+    static HEAD_POOL: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread recycled HASH3-PROBE `head3` table (see
+    /// `acquire_head_table`). Kept separate from `HEAD_POOL` because the two
+    /// tables have different sizes (`HASH_SIZE` fixed vs `1 << hash3.bits`)
+    /// and are both live at once within a single `run()` call.
+    static HEAD3_POOL: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Acquire a `len`-element `Vec<u32>` filled with [`NO_POS`], reused from
+/// this thread's pool (`HEAD_POOL`/`HEAD3_POOL`) when a previous chunk left
+/// one there, or freshly allocated on this thread's first use.
+///
+/// Same rationale as `HcMatchfinder::acquire`: `run()` is called once per
+/// CHUNK in the T>1 parallel path, but a single `infra::scheduler` worker
+/// thread processes many chunks sequentially (chunk count can exceed thread
+/// count), so pooling turns "one allocation per chunk" into "one allocation
+/// per THREAD, ever" — `thread_local!` means no cross-thread sharing, so
+/// chunk-independence is untouched (every chunk still starts from a
+/// fully-`NO_POS`-filled table, byte-identical to a fresh `vec![NO_POS; len]`).
+/// Give the table back with [`release_head_table`] once `run()` is done
+/// with it.
+fn acquire_head_table(
+    pool: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u32>>>,
+    len: usize,
+) -> Vec<u32> {
+    let mut v = pool.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    v.clear();
+    v.resize(len, NO_POS);
+    v
+}
+
+/// Return a table acquired via [`acquire_head_table`] to its thread-local
+/// pool for the next `run()` call on this thread.
+fn release_head_table(
+    pool: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u32>>>,
+    v: Vec<u32>,
+) {
+    pool.with(|cell| *cell.borrow_mut() = v);
+}
+
 /// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending one
 /// or more DEFLATE blocks to `bw`.
 ///
@@ -2785,8 +2828,11 @@ pub(super) fn run<const ACCEL: bool>(
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
 
-    // Chainless head table: one slot per hash, holding the most recent position.
-    let mut head = vec![NO_POS; HASH_SIZE];
+    // Chainless head table: one slot per hash, holding the most recent
+    // position. Pulled from a thread-local pool (see `acquire_head_table`'s
+    // doc comment) instead of freshly allocated every `run()` call — same
+    // per-chunk-vs-per-thread rationale as `HcMatchfinder::acquire`.
+    let mut head = acquire_head_table(&HEAD_POOL, HASH_SIZE);
     let base = buf.as_ptr();
 
     // `l1-tune` bucket2 lever's second table (search-only; see `tune`'s doc
@@ -2837,7 +2883,7 @@ pub(super) fn run<const ACCEL: bool>(
     // allocation. No longer `l1-tune`-only: this table backs the DEFAULT L1
     // path now.
     let mut head3: Vec<u32> = if !ACCEL && hash3.enabled {
-        vec![NO_POS; 1usize << hash3.bits]
+        acquire_head_table(&HEAD3_POOL, 1usize << hash3.bits)
     } else {
         Vec::new()
     };
@@ -2871,6 +2917,9 @@ pub(super) fn run<const ACCEL: bool>(
 
     // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
     let mut sink = Sink::new();
+    // One dynamic-header scratch buffer for the WHOLE `run()` call (see
+    // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
+    let mut header_scratch = HeaderScratch::new();
     let mut pos = data_start;
 
     // CONTENT-ADAPTIVE CHAIN MATCHING state (`l1-tune` only; see
@@ -2956,7 +3005,15 @@ pub(super) fn run<const ACCEL: bool>(
             sink.block_length = pos - block_begin;
             let is_final = is_last && pos == in_end;
             if use_dynamic {
-                emit_block(bw, buf, block_begin, &sink, statics, is_final);
+                emit_block(
+                    bw,
+                    buf,
+                    block_begin,
+                    &sink,
+                    statics,
+                    is_final,
+                    &mut header_scratch,
+                );
             } else {
                 emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
             }
@@ -3218,7 +3275,15 @@ pub(super) fn run<const ACCEL: bool>(
         let is_final = is_last && pos == in_end;
         if use_dynamic {
             // L1: cheapest of per-block dynamic / static / stored.
-            emit_block(bw, buf, block_begin, &sink, statics, is_final);
+            emit_block(
+                bw,
+                buf,
+                block_begin,
+                &sink,
+                statics,
+                is_final,
+                &mut header_scratch,
+            );
         } else {
             // L0: cheapest of static / stored only — no per-block dynamic
             // Huffman build (see `emit_block_static_or_stored`'s doc comment
@@ -3282,6 +3347,16 @@ pub(super) fn run<const ACCEL: bool>(
         if pos == in_end {
             break;
         }
+    }
+
+    // Return the head table(s) to this thread's pool for the next `run()`
+    // call (see `acquire_head_table`'s doc comment). `head3` is only
+    // released when it was actually acquired (mirrors the condition at its
+    // declaration) — releasing the `Vec::new()` placeholder from the
+    // not-enabled arm would stomp a real pooled buffer with an empty one.
+    release_head_table(&HEAD_POOL, head);
+    if !ACCEL && hash3.enabled {
+        release_head_table(&HEAD3_POOL, head3);
     }
 
     // One flush for the whole call — see `FastLocalCounters`'s doc comment.

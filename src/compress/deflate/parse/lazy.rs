@@ -7,6 +7,7 @@
 //! bsr(next_offset)) > 2` (lazy) / `> 6` (lazy2). Levels 5-7 use lazy, 8-9 lazy2.
 
 use super::super::bitstream::BitWriter;
+use super::super::huffman::HeaderScratch;
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
@@ -44,10 +45,13 @@ pub(super) fn run(
     // Task C (bucket-split-oracle): time the per-`run()` allocation itself
     // (see `anatomy_wall.rs`'s `mf_new_ns` doc comment). Per-invocation, not
     // per-position -- zero cost when `anatomy-wall` is off.
-    let mut mf = crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, { HcMatchfinder::new() });
+    let mut mf = crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, { HcMatchfinder::acquire() });
     let mut in_base = 0usize;
     let mut next_hashes = [0u32; 2];
     let mut sink = Sink::new();
+    // See `greedy.rs`'s sibling declaration: one scratch per `run()` call,
+    // reused across every internal block.
+    let mut header_scratch = HeaderScratch::new();
 
     if data_start > 0 {
         mf.skip_bytes(buf, &mut in_base, 0, in_end, data_start, &mut next_hashes);
@@ -89,6 +93,7 @@ pub(super) fn run(
             &sink,
             statics,
             is_last && in_next == in_end,
+            &mut header_scratch,
         );
         if in_next == in_end {
             break;

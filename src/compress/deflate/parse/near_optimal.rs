@@ -29,7 +29,7 @@ use super::super::costs::{
     set_initial_costs, DeflateCosts, OffsetSlotFull, OptimumNode, BIT_COST, OPTIMUM_LEN_MASK,
     OPTIMUM_OFFSET_SHIFT,
 };
-use super::super::huffman::{build_dynamic_header, make_huffman_code, HuffmanCode};
+use super::super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
 use super::super::level::LevelParams;
 use super::super::matchfinder::bt::{
     BtMatchfinder, LzMatch, BT_MATCHFINDER_REQUIRED_NBYTES, WINDOW_SIZE,
@@ -94,6 +94,12 @@ struct Optimizer {
     /// bin6/parquet corpora showed this as the #1-by-count allocation site
     /// (`push_seq`, thousands of allocs, one growth spurt per block).
     sink: Sink,
+    /// `build_dynamic_header`'s scratch buffers (see `HeaderScratch`'s doc
+    /// comment), reused the same way `sink` is: `compute_true_cost` calls
+    /// `build_dynamic_header` 2-4x per block (once per refinement pass) plus
+    /// once more in `optimize_and_flush`'s final emit, so a fresh `Vec` per
+    /// call was the same waste class as the pre-fix `sink`.
+    header_scratch: HeaderScratch,
 }
 
 impl Optimizer {
@@ -106,6 +112,7 @@ impl Optimizer {
             offset_slot_full: OffsetSlotFull::new(),
             match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
             sink: Sink::new(),
+            header_scratch: HeaderScratch::new(),
         }
     }
 
@@ -291,8 +298,12 @@ impl Optimizer {
 
     /// `deflate_compute_true_cost` (`:2889-2921`): exact whole-bit cost of the
     /// block if the tallied path were coded with the built Huffman codes.
-    fn compute_true_cost(&self, codes: &PathCodes) -> u32 {
-        let header = build_dynamic_header(&codes.litcode.lens, &codes.offcode.lens);
+    fn compute_true_cost(&mut self, codes: &PathCodes) -> u32 {
+        let header = build_dynamic_header(
+            &codes.litcode.lens,
+            &codes.offcode.lens,
+            &mut self.header_scratch,
+        );
         let mut cost: u64 = header.header_bits();
 
         for sym in 0..DEFLATE_FIRST_LEN_SYM {
@@ -432,7 +443,15 @@ impl Optimizer {
                 }
             }
         }
-        emit_block(bw, buf, block_begin, &self.sink, statics, is_final);
+        emit_block(
+            bw,
+            buf,
+            block_begin,
+            &self.sink,
+            statics,
+            is_final,
+            &mut self.header_scratch,
+        );
 
         used_only_literals
     }

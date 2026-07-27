@@ -98,6 +98,52 @@ pub struct HcMatchfinder {
     next_tab: [i16; WINDOW_SIZE],
 }
 
+thread_local! {
+    /// One recycled `HcMatchfinder` per thread (see [`HcMatchfinder::acquire`]).
+    /// `thread_local!` rather than a shared pool: each `infra::scheduler`
+    /// worker thread gets its own slot, so there is no cross-thread mutable
+    /// state and no synchronization — a fresh page-table entry per OS thread,
+    /// not a data structure that needs locking.
+    static HC_POOL: std::cell::RefCell<Option<Box<HcMatchfinder>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII handle returned by [`HcMatchfinder::acquire`]. `Deref`/`DerefMut` to
+/// `HcMatchfinder` so every existing `&mut mf` call site (which relies on the
+/// same deref-coercion `Box<HcMatchfinder>` already provided) needs no
+/// change. On drop, the box is returned to this thread's [`HC_POOL`] instead
+/// of being freed, so the NEXT `acquire()` on this same thread reuses the
+/// allocation rather than requesting a new one from the allocator.
+pub struct PooledHc(Option<Box<HcMatchfinder>>);
+
+impl std::ops::Deref for PooledHc {
+    type Target = HcMatchfinder;
+    #[inline]
+    fn deref(&self) -> &HcMatchfinder {
+        // SAFETY/invariant: `self.0` is `Some` for the entire lifetime of a
+        // `PooledHc` outside of `Drop::drop` (which is the only place it is
+        // taken and never observed again afterward).
+        self.0.as_deref().expect("PooledHc used after drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledHc {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut HcMatchfinder {
+        self.0.as_deref_mut().expect("PooledHc used after drop")
+    }
+}
+
+impl Drop for PooledHc {
+    fn drop(&mut self) {
+        if let Some(b) = self.0.take() {
+            HC_POOL.with(|cell| {
+                *cell.borrow_mut() = Some(b);
+            });
+        }
+    }
+}
+
 impl HcMatchfinder {
     /// `hc_matchfinder_init`: allocate and initialize every table to the sentinel.
     ///
@@ -128,6 +174,40 @@ impl HcMatchfinder {
             }
             boxed.assume_init()
         }
+    }
+
+    /// Re-arm every table to the sentinel value in place — the same
+    /// postcondition as [`Self::new`], but reusing the existing 256 KiB
+    /// allocation instead of requesting a fresh one. Used by [`Self::acquire`]
+    /// to recycle a thread-local instance across chunks.
+    fn reset(&mut self) {
+        self.hash3_tab.fill(MATCHFINDER_INITVAL);
+        self.hash4_tab.fill(MATCHFINDER_INITVAL);
+        self.next_tab.fill(MATCHFINDER_INITVAL);
+    }
+
+    /// Pooled equivalent of [`Self::new`]: hands back a `HcMatchfinder` reset
+    /// to its initial sentinel state, reused from a thread-local free list
+    /// when one is available (this thread already allocated one for an
+    /// earlier chunk) instead of paying the 256 KiB allocation again.
+    ///
+    /// This targets the T>1 parallel path, where `run()` (greedy/lazy/gated)
+    /// is invoked once per CHUNK, but chunk count can exceed thread count —
+    /// each `infra::scheduler` worker thread claims and processes MANY chunks
+    /// sequentially from the atomic work queue (`compress_parallel`'s
+    /// `worker_loop_timed`), so without pooling every one of those chunks pays
+    /// a fresh 256 KiB allocation + sentinel fill (DHAT: "1x / 9-28x = chunk
+    /// count" cadence). The pool is `thread_local!`, so each worker thread
+    /// gets its own instance — no state is EVER shared across threads, only
+    /// reused across the sequential chunks one thread claims, so this does
+    /// not break the chunk-independence the T>1 path relies on (each chunk
+    /// still starts from a freshly-reset matchfinder, byte-identical to a
+    /// brand-new `Self::new()`).
+    pub fn acquire() -> PooledHc {
+        let existing = HC_POOL.with(|cell| cell.borrow_mut().take());
+        let mut mf = existing.unwrap_or_else(Self::new);
+        mf.reset();
+        PooledHc(Some(mf))
     }
 
     /// `hc_matchfinder_slide_window`: rebase every stored position by one window.

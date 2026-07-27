@@ -18,7 +18,7 @@
 
 use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
-use super::huffman::{build_dynamic_header, make_huffman_code, HuffmanCode};
+use super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
 use super::level::{LevelParams, Strategy};
 use super::tables::{
     length_slot, offset_slot, static_litlen_freqs, static_offset_freqs,
@@ -461,6 +461,7 @@ fn emit_block(
     sink: &Sink,
     statics: &StaticCodes,
     is_final: bool,
+    header_scratch: &mut HeaderScratch,
 ) {
     // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
     // this block, before any bit is written: both candidate Huffman codes,
@@ -483,7 +484,7 @@ fn emit_block(
                 MAX_OFFSET_CODEWORD_LEN,
                 &sink.offset_freqs,
             );
-            let header = build_dynamic_header(&litcode.lens, &offcode.lens);
+            let header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
 
             let dynamic_bits = 3
                 + header.header_bits()

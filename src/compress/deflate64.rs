@@ -45,7 +45,7 @@
 ///   exactly.
 use crate::compress::deflate::bitstream::BitWriter;
 use crate::compress::deflate::emit_stored_block;
-use crate::compress::deflate::huffman::header::build_dynamic_header;
+use crate::compress::deflate::huffman::header::{build_dynamic_header, HeaderScratch};
 use crate::compress::deflate::huffman::optimal::{calculate_bit_lengths, lengths_to_symbols};
 use crate::compress::deflate::matchfinder::common::lz_extend;
 use crate::error::GzippyResult;
@@ -295,7 +295,10 @@ fn emit_block(tokens: &[Token], bfinal: u8, bw: &mut BitWriter) {
     // --- Emit block header + dynamic Huffman tables ---
     bw.add_bits(bfinal as u64, 1);
     bw.add_bits(0b10, 2); // BTYPE = dynamic Huffman
-    let header = build_dynamic_header(&lit_lens, &dist_lens);
+                          // deflate64.rs carries no perf constituency (see module doc comment) —
+                          // a fresh scratch per call matches the old always-fresh-`Vec` behavior.
+    let mut header_scratch = HeaderScratch::new();
+    let header = build_dynamic_header(&lit_lens, &dist_lens, &mut header_scratch);
     header.emit(bw);
 
     // --- Emit tokens. `add_huffman_bits` takes the codeword MSB-first

@@ -120,14 +120,43 @@ fn heap_sort(a: &mut [u32]) {
 
 // ---- sort_symbols ----
 
+thread_local! {
+    /// Reusable counting-sort scratch for [`sort_symbols`] — a fresh
+    /// `vec![0u32; num_counters]` was the #1-by-count DHAT site for the
+    /// hot-level parsers (`make_huffman_code` runs 2-3x per DEFLATE block:
+    /// litlen + offset + the header's own precode build), always immediately
+    /// dropped at function return with nothing else ever observing it. A
+    /// `thread_local` (not a param threaded through `make_huffman_code`'s many
+    /// callers) keeps this an invisible implementation detail while still
+    /// giving every worker thread in the T>1 parallel path its OWN buffer —
+    /// no cross-thread sharing, so chunk-independence is untouched. `.clear()`
+    /// + `.resize(n, 0)` reuses the underlying allocation whenever `n` is `<=`
+    /// a size already seen on this thread (steady state after the first
+    /// litlen-sized call, the largest alphabet: 288 counters / 1152 bytes).
+    static SORT_COUNTERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Count-sort symbols by frequency (secondary: symbol value), packing
 /// `sym | (freq << 10)` into `symout`. Zero-frequency symbols get `lens[sym]=0`.
 /// Returns the number of used (nonzero-frequency) symbols.
 fn sort_symbols(freqs: &[u32], lens: &mut [u8], symout: &mut [u32]) -> usize {
     let num_syms = freqs.len();
     let num_counters = num_syms;
-    let mut counters = vec![0u32; num_counters];
+    SORT_COUNTERS.with(|cell| {
+        let mut counters = cell.borrow_mut();
+        counters.clear();
+        counters.resize(num_counters, 0u32);
+        sort_symbols_inner(freqs, lens, symout, &mut counters, num_counters)
+    })
+}
 
+fn sort_symbols_inner(
+    freqs: &[u32],
+    lens: &mut [u8],
+    symout: &mut [u32],
+    counters: &mut [u32],
+    num_counters: usize,
+) -> usize {
     // SAFETY (whole body): `idx = f.min(num_counters - 1)` is clamped to
     // `< num_counters == counters.len()` on every use below, and
     // `counters[idx]` is a running count that counting-sort's own postcondition
