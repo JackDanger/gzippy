@@ -128,10 +128,11 @@ fn level_0_is_byte_identical_to_the_whole_buffer_encoder() {
 
 /// For levels 1-12 the two encoders legitimately disagree: the streaming one
 /// ends a block at each chunk seam, so block-splitting decisions differ. The
-/// cost of that is real but must stay negligible — measured across the
-/// 21-file corpus x L0-L9 at the shipped 4 MiB chunk, the worst regression on
-/// genuinely multi-chunk files was 0.0189%, and several cells came out
-/// SMALLER. The bound here is 0.5%: comfortably above the measured worst case
+/// cost of that is real but must stay negligible — measured at the shipped
+/// 4 MiB chunk, the worst regression on genuinely multi-chunk files was
+/// 0.0189% across the 21-file corpus x L0-L9, and 0.0732% across L10-L12
+/// (near-optimal, three multi-chunk files); several cells came out SMALLER.
+/// The bound here is 0.5%: comfortably above the measured worst case
 /// so ordinary block-splitting churn does not flake, far below the ~1% scale
 /// at which a per-label size cell against a rival could flip.
 ///
