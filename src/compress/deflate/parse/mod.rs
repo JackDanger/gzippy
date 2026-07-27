@@ -20,6 +20,7 @@ use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
 use super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
 use super::level::{LevelParams, Strategy};
+use super::matchfinder::hc::WINDOW_SIZE;
 use super::tables::{
     length_slot, offset_slot, static_litlen_freqs, static_offset_freqs,
     DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN, DEFLATE_BLOCKTYPE_STATIC_HUFFMAN, DEFLATE_END_OF_BLOCK,
@@ -350,6 +351,80 @@ pub(super) fn compress(
         }
     }
 }
+
+// ---- resumable (streaming) parse state ----
+
+/// Everything a parser must carry from one streaming chunk to the next.
+///
+/// The whole-buffer entry points build this fresh per call, so their behaviour
+/// is unchanged. The streaming encoder keeps ONE across the whole file, which
+/// is what makes streamed output byte-identical to whole-buffer output: match
+/// choices depend on the matchfinder's accumulated chains, so a matchfinder
+/// rebuilt per chunk would make different choices at every seam even though
+/// every candidate it could legally reference is within the 32 KiB window.
+pub(super) struct ParseState {
+    pub mf: crate::compress::deflate::matchfinder::hc::PooledHc,
+    /// Base offset the matchfinder's stored positions are relative to.
+    /// ALWAYS a multiple of [`WINDOW_SIZE`], with `in_next - in_base` in
+    /// `0..WINDOW_SIZE` — see `HcMatchfinder`'s slide condition.
+    pub in_base: usize,
+    pub next_hashes: [u32; 2],
+}
+
+impl ParseState {
+    pub fn new() -> Self {
+        Self {
+            mf: crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, {
+                crate::compress::deflate::matchfinder::hc::HcMatchfinder::acquire()
+            }),
+            in_base: 0,
+            next_hashes: [0u32; 2],
+        }
+    }
+
+    // Used by the sliding-buffer streaming loop, which lands next; the
+    // resumable parsers above are the half of that change that could be
+    // verified independently (whole-buffer output byte-identical, full suite
+    // green), so it is committed separately rather than as one large diff.
+    #[allow(dead_code)]
+    /// Largest amount the caller may shift buffer contents down by while
+    /// keeping at least one full window of history behind `in_base`.
+    ///
+    /// Returns a multiple of [`WINDOW_SIZE`], because the matchfinder stores
+    /// each position as `pos - in_base` and slides in exact window steps: a
+    /// shift that is not a whole number of windows would leave `in_next -
+    /// in_base` outside `0..WINDOW_SIZE` and corrupt every chain index.
+    pub fn max_shift(&self) -> usize {
+        self.in_base.saturating_sub(WINDOW_SIZE)
+    }
+
+    #[allow(dead_code)]
+    /// Tell the state the caller moved buffer contents down by `shift` bytes.
+    ///
+    /// O(1) and lossless: stored nodes are offsets from `in_base`, so
+    /// decrementing `in_base` by the same amount leaves every
+    /// `in_base + node` pointing at the same BYTE in the moved buffer. No
+    /// table rebase, no chain rebuild. `shift` must come from
+    /// [`max_shift`](Self::max_shift).
+    pub fn shift_down(&mut self, shift: usize) {
+        debug_assert_eq!(shift % WINDOW_SIZE, 0, "shift must be whole windows");
+        debug_assert!(shift <= self.in_base, "shift would push in_base negative");
+        self.in_base -= shift;
+    }
+}
+
+/// Bytes that must be available past a block's start before the streaming
+/// encoder may begin that block.
+///
+/// [`choose_max_block_end`] consults `in_end` ONLY when fewer than
+/// `SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH` bytes remain; above that it
+/// returns `block_begin + SOFT_MAX_BLOCK_LENGTH` regardless. So a streaming
+/// chunk that always has at least this much input in hand makes exactly the
+/// same block-boundary decisions as a whole-buffer encode — the seam becomes
+/// invisible instead of forcing a short block. The same margin also keeps
+/// `adjust_max_and_nice_len` from clamping match lengths near the buffer end,
+/// since it exceeds `DEFLATE_MAX_MATCH_LEN` by three orders of magnitude.
+pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH;
 
 // ---- block-boundary helpers ----
 

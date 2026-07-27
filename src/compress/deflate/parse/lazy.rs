@@ -13,7 +13,7 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, bsr32, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, recalculate_min_match_len, Sink, StaticCodes,
+    emit_block, recalculate_min_match_len, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
 };
 
 /// The offset-cost tie-break test shared by lazy and lazy2 (threshold differs).
@@ -45,21 +45,48 @@ pub(super) fn run(
     // Task C (bucket-split-oracle): time the per-`run()` allocation itself
     // (see `anatomy_wall.rs`'s `mf_new_ns` doc comment). Per-invocation, not
     // per-position -- zero cost when `anatomy-wall` is off.
-    let mut mf = crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, { HcMatchfinder::acquire() });
-    let mut in_base = 0usize;
-    let mut next_hashes = [0u32; 2];
-    let mut sink = Sink::new();
-    // See `greedy.rs`'s sibling declaration: one scratch per `run()` call,
-    // reused across every internal block.
-    let mut header_scratch = HeaderScratch::new();
-
+    let mut state = ParseState::new();
     if data_start > 0 {
-        mf.skip_bytes(buf, &mut in_base, 0, in_end, data_start, &mut next_hashes);
+        let ParseState {
+            mf,
+            in_base,
+            next_hashes,
+        } = &mut state;
+        mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
     }
+    run_resumable(
+        buf, &mut state, data_start, in_end, params, statics, bw, lazy2, is_last, true,
+    );
+}
 
-    let mut in_next = data_start;
+/// [`run`] with the matchfinder state supplied by the caller, so it can span
+/// several calls over a sliding buffer. See `greedy::run_resumable` for why
+/// `consume_all` and `is_last` are independent, and why the
+/// [`STREAM_BLOCK_LOOKAHEAD`] margin makes the chunk seam invisible in the
+/// emitted bytes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_resumable(
+    buf: &[u8],
+    state: &mut ParseState,
+    from: usize,
+    in_end: usize,
+    params: &LevelParams,
+    statics: &StaticCodes,
+    bw: &mut BitWriter,
+    lazy2: bool,
+    is_last: bool,
+    consume_all: bool,
+) -> usize {
+    let mut sink = Sink::new();
+    // See `greedy.rs`'s sibling declaration: one scratch per call, reused
+    // across every internal block.
+    let mut header_scratch = HeaderScratch::new();
+    let mut in_next = from;
 
     loop {
+        if !consume_all && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
+            return in_next;
+        }
         // Start a new DEFLATE block.
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);
@@ -79,9 +106,9 @@ pub(super) fn run(
                 in_end,
                 params,
                 lazy2,
-                &mut mf,
-                &mut in_base,
-                &mut next_hashes,
+                &mut state.mf,
+                &mut state.in_base,
+                &mut state.next_hashes,
                 &mut sink,
             )
         });
@@ -96,7 +123,7 @@ pub(super) fn run(
             &mut header_scratch,
         );
         if in_next == in_end {
-            break;
+            return in_next;
         }
     }
 }

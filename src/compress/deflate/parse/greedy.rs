@@ -12,7 +12,7 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, Sink, StaticCodes,
+    emit_block, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
 };
 
 pub(super) fn run(
@@ -24,27 +24,60 @@ pub(super) fn run(
     bw: &mut BitWriter,
     is_last: bool,
 ) {
-    // Task C (bucket-split-oracle): time the per-`run()` allocation itself
-    // (see `anatomy_wall.rs`'s `mf_new_ns` doc comment). Per-invocation, not
-    // per-position -- zero cost when `anatomy-wall` is off.
-    let mut mf = crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, { HcMatchfinder::acquire() });
-    let mut in_base = 0usize;
-    let mut next_hashes = [0u32; 2];
-    let mut sink = Sink::new();
-    // One dynamic-header scratch buffer for the WHOLE `run()` call, reused
-    // across every internal block (see `HeaderScratch`'s doc comment) instead
-    // of `build_dynamic_header` allocating a fresh `Vec` per block.
-    let mut header_scratch = HeaderScratch::new();
-
+    let mut state = ParseState::new();
     // Seed a preset dictionary into the matchfinder (positions before data_start
     // may be referenced by matches but are not coded).
     if data_start > 0 {
-        mf.skip_bytes(buf, &mut in_base, 0, in_end, data_start, &mut next_hashes);
+        let ParseState {
+            mf,
+            in_base,
+            next_hashes,
+        } = &mut state;
+        mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
     }
+    run_resumable(
+        buf, &mut state, data_start, in_end, params, statics, bw, is_last, true,
+    );
+}
 
-    let mut in_next = data_start;
+/// [`run`] with the matchfinder state supplied by the caller, so it can span
+/// several calls over a sliding buffer.
+///
+/// Returns the position after the last COMPLETE block emitted.
+///
+/// `consume_all` and `is_last` are INDEPENDENT and must not be conflated —
+/// doing so was a real bug caught by the concatenation tests. `is_last` marks
+/// BFINAL on the closing block; it is false for every non-final chunk of a
+/// CONCATENATED stream (the T>1 path), which nonetheless has to consume all
+/// the input it was handed. `consume_all` is what the single-pass streaming
+/// encoder sets to false: it means "this buffer will be refilled, so stop at
+/// the last block boundary that still had [`STREAM_BLOCK_LOOKAHEAD`] bytes of
+/// input behind it and let me carry the tail forward". That margin is exactly
+/// what makes every block-boundary decision identical to a whole-buffer
+/// encode, so the chunk seam leaves no trace in the emitted bytes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_resumable(
+    buf: &[u8],
+    state: &mut ParseState,
+    from: usize,
+    in_end: usize,
+    params: &LevelParams,
+    statics: &StaticCodes,
+    bw: &mut BitWriter,
+    is_last: bool,
+    consume_all: bool,
+) -> usize {
+    let mut sink = Sink::new();
+    // One dynamic-header scratch buffer for the WHOLE call, reused across
+    // every internal block (see `HeaderScratch`'s doc comment) instead of
+    // `build_dynamic_header` allocating a fresh `Vec` per block.
+    let mut header_scratch = HeaderScratch::new();
+    let mut in_next = from;
 
     loop {
+        if !consume_all && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
+            return in_next;
+        }
         // Start a new DEFLATE block.
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);
@@ -67,9 +100,9 @@ pub(super) fn run(
                 in_max_block_end,
                 in_end,
                 params,
-                &mut mf,
-                &mut in_base,
-                &mut next_hashes,
+                &mut state.mf,
+                &mut state.in_base,
+                &mut state.next_hashes,
                 &mut sink,
             )
         });
@@ -84,7 +117,7 @@ pub(super) fn run(
             &mut header_scratch,
         );
         if in_next == in_end {
-            break;
+            return in_next;
         }
     }
 }
