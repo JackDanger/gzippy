@@ -140,29 +140,46 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
             );
         }
         route::emit(route::PURE_T1, args.compression_level as u32, 1);
-        // Pre-size for the known (or hinted) length plus the matchfinder's
-        // trailing pad so neither `read_to_end` nor the following `resize`
-        // needs to grow-and-copy the buffer (was 2 reallocs touching ~2x the
-        // input in bytes — visible in DHAT as the `read_to_end` site).
-        let mut input = Vec::with_capacity(
-            size_hint
-                .map(|s| s + crate::compress::deflate::INPLACE_TAIL_PAD)
-                .unwrap_or(0),
-        );
-        reader.read_to_end(&mut input)?;
-        let bytes = input.len() as u64;
-        // Pad the read buffer in place with the matchfinder's trailing slack so
-        // the compressor parses IN PLACE — no second full-input work buffer.
-        let logical_len = input.len();
-        input.resize(logical_len + crate::compress::deflate::INPLACE_TAIL_PAD, 0);
-        let gz = crate::compress::deflate::compress_gzip_padded(
-            &input,
-            logical_len,
-            args.compression_level as u32,
-        );
-        let mut writer = writer;
-        writer.write_all(&gz)?;
-        writer.flush()?;
+        // The `anatomy-wall` CLI span (feature default OFF, compiles to just
+        // the body when off). It encloses read + encode + write so the
+        // instrument's level-2 conservation check covers the WHOLE T1 route;
+        // before this span existed, `root` (the encoder call) reconciled
+        // cleanly while accounting for only half the observed wall.
+        // NOTE: this block must EVALUATE to `bytes` rather than `return` it —
+        // an early return would jump past the macro's elapsed-time
+        // accumulation, leaving `cli_ns` at zero while every inner region
+        // reported normally. (The `?` operators below can still return early,
+        // but only on the error path, where no measurement is claimed.)
+        let bytes = crate::anatomy_wall_cli!({
+            // Pre-size for the known (or hinted) length plus the matchfinder's
+            // trailing pad so neither `read_to_end` nor the following `resize`
+            // needs to grow-and-copy the buffer (was 2 reallocs touching ~2x the
+            // input in bytes — visible in DHAT as the `read_to_end` site).
+            let mut input = Vec::with_capacity(
+                size_hint
+                    .map(|s| s + crate::compress::deflate::INPLACE_TAIL_PAD)
+                    .unwrap_or(0),
+            );
+            let bytes = crate::anatomy_wall_time!(read_input_ns, read_input_calls, {
+                reader.read_to_end(&mut input)?;
+                input.len() as u64
+            });
+            // Pad the read buffer in place with the matchfinder's trailing slack so
+            // the compressor parses IN PLACE — no second full-input work buffer.
+            let logical_len = input.len();
+            input.resize(logical_len + crate::compress::deflate::INPLACE_TAIL_PAD, 0);
+            let gz = crate::compress::deflate::compress_gzip_padded(
+                &input,
+                logical_len,
+                args.compression_level as u32,
+            );
+            let mut writer = writer;
+            crate::anatomy_wall_time!(write_out_ns, write_out_calls, {
+                writer.write_all(&gz)?;
+                writer.flush()?;
+            });
+            bytes
+        });
         return Ok(bytes);
     }
 

@@ -105,16 +105,34 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
 macro_rules! define_wall_regions {
-    ($($ns:ident / $calls:ident),+ $(,)?) => {
+    (
+        inner { $($ns:ident / $calls:ident),+ $(,)? }
+        outer { $($ons:ident / $ocalls:ident),+ $(,)? }
+    ) => {
         /// One relaxed `AtomicU64` pair (nanoseconds, call count) per timed
-        /// region, plus the root span. Relaxed ordering: independent
-        /// per-region tallies, no cross-region ordering requirement (same
-        /// rationale as `anatomy_counters::AnatomyCounters`).
+        /// region, plus the two nested span roots. Relaxed ordering:
+        /// independent per-region tallies, no cross-region ordering
+        /// requirement (same rationale as
+        /// `anatomy_counters::AnatomyCounters`).
+        ///
+        /// TWO NESTING LEVELS (added 2026-07-26). `root` is the encoder call
+        /// (`compress_gzip_padded`); `cli` is the whole end-to-end
+        /// single-thread CLI compress, which STRICTLY CONTAINS `root`. INNER
+        /// regions sit inside `root`; OUTER regions sit inside `cli` but
+        /// OUTSIDE `root` (reading the input, writing the output). The split
+        /// exists because a one-level instrument reported a conserved
+        /// `root` while HALF the observed wall was outside it and therefore
+        /// invisible -- on a 232 MiB `-0` run, `root` was 54.4 ms of a
+        /// 107.7 ms wall. The conservation check below is what makes that
+        /// gap impossible to report as "residual" again.
         #[cfg(feature = "anatomy-wall")]
         pub struct AnatomyWall {
             pub root_ns: AtomicU64,
             pub root_calls: AtomicU64,
+            pub cli_ns: AtomicU64,
+            pub cli_calls: AtomicU64,
             $(pub $ns: AtomicU64, pub $calls: AtomicU64,)+
+            $(pub $ons: AtomicU64, pub $ocalls: AtomicU64,)+
         }
 
         #[cfg(feature = "anatomy-wall")]
@@ -123,7 +141,10 @@ macro_rules! define_wall_regions {
                 Self {
                     root_ns: AtomicU64::new(0),
                     root_calls: AtomicU64::new(0),
+                    cli_ns: AtomicU64::new(0),
+                    cli_calls: AtomicU64::new(0),
                     $($ns: AtomicU64::new(0), $calls: AtomicU64::new(0),)+
+                    $($ons: AtomicU64::new(0), $ocalls: AtomicU64::new(0),)+
                 }
             }
 
@@ -134,13 +155,25 @@ macro_rules! define_wall_regions {
             pub fn reset(&self) {
                 self.root_ns.store(0, Relaxed);
                 self.root_calls.store(0, Relaxed);
+                self.cli_ns.store(0, Relaxed);
+                self.cli_calls.store(0, Relaxed);
                 $(self.$ns.store(0, Relaxed); self.$calls.store(0, Relaxed);)+
+                $(self.$ons.store(0, Relaxed); self.$ocalls.store(0, Relaxed);)+
             }
 
-            /// Sum of every NAMED region's nanoseconds (excludes root and
+            /// Sum of every INNER region's nanoseconds (excludes root and
             /// RESIDUAL, which is derived from this sum -- see [`reconcile`]).
             fn named_region_ns(&self) -> u64 {
                 0 $(+ self.$ns.load(Relaxed))+
+            }
+
+            /// Sum of every OUTER region's nanoseconds — spans inside `cli`
+            /// but outside `root`. Deliberately NOT folded into
+            /// [`named_region_ns`]: adding an outside-root span to the
+            /// inside-root sum would make `named > root` and trip the level-1
+            /// conservation check, which is the check working correctly.
+            fn outer_region_ns(&self) -> u64 {
+                0 $(+ self.$ons.load(Relaxed))+
             }
 
             /// Render the current snapshot as one flat JSON object: every
@@ -150,9 +183,16 @@ macro_rules! define_wall_regions {
             /// the invariant it represents).
             pub fn to_json(&self) -> String {
                 let root_ns = self.root_ns.load(Relaxed);
+                let cli_ns = self.cli_ns.load(Relaxed);
                 let named = self.named_region_ns();
+                let outer = self.outer_region_ns();
                 let residual_ns = root_ns.saturating_sub(named);
+                // Level-2 residual: wall inside the CLI span accounted for by
+                // neither the encoder call nor a named outer region.
+                let cli_residual_ns = cli_ns.saturating_sub(root_ns + outer);
                 let mut parts = vec![
+                    format!("\"cli_ns\":{}", cli_ns),
+                    format!("\"cli_calls\":{}", self.cli_calls.load(Relaxed)),
                     format!("\"root_ns\":{}", root_ns),
                     format!("\"root_calls\":{}", self.root_calls.load(Relaxed)),
                 ];
@@ -160,12 +200,21 @@ macro_rules! define_wall_regions {
                     parts.push(format!("\"{}\":{}", stringify!($ns), self.$ns.load(Relaxed)));
                     parts.push(format!("\"{}\":{}", stringify!($calls), self.$calls.load(Relaxed)));
                 )+
+                $(
+                    parts.push(format!("\"{}\":{}", stringify!($ons), self.$ons.load(Relaxed)));
+                    parts.push(format!("\"{}\":{}", stringify!($ocalls), self.$ocalls.load(Relaxed)));
+                )+
                 parts.push(format!("\"residual_ns\":{}", residual_ns));
+                parts.push(format!("\"cli_residual_ns\":{}", cli_residual_ns));
                 parts.push(format!(
                     "\"conserved\":{}",
-                    if root_ns >= named { "true" } else { "false" }
+                    if root_ns >= named && (cli_ns == 0 || cli_ns >= root_ns + outer) {
+                        "true"
+                    } else {
+                        "false"
+                    }
                 ));
-                parts.push("\"granularity\":\"per-block (parse_match/huffman_table/huffman_encode); per-invocation (crc/root)\"".to_string());
+                parts.push("\"granularity\":\"per-block (parse_match/huffman_table/huffman_encode); per-invocation (crc/root/read_input/write_out/cli)\"".to_string());
                 format!("{{{}}}", parts.join(","))
             }
         }
@@ -176,6 +225,7 @@ macro_rules! define_wall_regions {
 }
 
 define_wall_regions!(
+    inner {
     parse_match_ns / parse_match_calls,
     huffman_table_ns / huffman_table_calls,
     huffman_encode_ns / huffman_encode_calls,
@@ -190,6 +240,21 @@ define_wall_regions!(
     // timer per `run()` invocation (never per-position) -- cheapest
     // granularity in this module.
     mf_new_ns / mf_new_calls,
+    }
+    outer {
+    // OUTSIDE the encoder call, inside the CLI span. These two exist
+    // because the T1 CLI path materializes BOTH whole buffers: it reads the
+    // entire input into a `Vec` before calling the encoder, and the encoder
+    // hands back the entire compressed stream as a second `Vec` which is
+    // then copied into the writer. Measured peak RSS on a 232 MiB input is
+    // 2.009x the input at `-0` and exactly input+compressed at `-6`, versus
+    // a flat 2.0 MB for gzip and pigz. Whether those two buffer movements
+    // are also on the WALL critical path is precisely what these timers
+    // decide -- previously all of it landed outside the root span and was
+    // reported as nothing at all.
+    read_input_ns / read_input_calls,
+    write_out_ns / write_out_calls,
+    }
 );
 
 /// Reset every counter. Only exists when `anatomy-wall` is on (see
@@ -230,6 +295,21 @@ pub fn reconcile() -> Result<(), String> {
             root as i128 - named as i128
         ));
     }
+    // Level 2: the CLI span must strictly contain the encoder call plus every
+    // outer region. `cli == 0` means the CLI span was never armed (a
+    // library/test caller, or a route other than the instrumented T1 CLI
+    // path) -- level 1 alone still applies there, and the JSON's zeroed
+    // cli_ns makes the absence explicit rather than implying containment.
+    let cli = WALL.cli_ns.load(Relaxed);
+    let outer = WALL.outer_region_ns();
+    if cli > 0 && root + outer > cli {
+        return Err(format!(
+            "ANATOMY_WALL_RECONCILE=FAIL root_ns({root}) + outer_region_ns({outer}) = {} > \
+             cli_ns({cli}) -- an outer region overlapped the encoder call or the CLI span \
+             does not actually enclose it",
+            root + outer
+        ));
+    }
     Ok(())
 }
 
@@ -248,10 +328,13 @@ pub fn flush_to_stderr() {
         Ok(()) => {
             let root = WALL.root_ns.load(Relaxed);
             let named = WALL.named_region_ns();
+            let cli = WALL.cli_ns.load(Relaxed);
+            let outer = WALL.outer_region_ns();
             eprintln!(
                 "ANATOMY_WALL_RECONCILE=PASS root_ns={root} named_region_ns={named} \
-                 residual_ns={}",
-                root - named
+                 residual_ns={} cli_ns={cli} outer_region_ns={outer} cli_residual_ns={}",
+                root - named,
+                cli.saturating_sub(root + outer)
             );
         }
         Err(e) => eprintln!("{e}"),
@@ -320,6 +403,39 @@ macro_rules! anatomy_wall_root {
     }};
 }
 
+/// Time the CLI span — the whole end-to-end single-thread compress, which
+/// STRICTLY CONTAINS the `anatomy_wall_root!` encoder call plus the outer
+/// regions (`read_input`, `write_out`). Exactly one call site, on the T1 CLI
+/// route in `compress::compress_with_pipeline`. Distinct from
+/// `anatomy_wall_root!` so the two nesting levels each get their own
+/// conservation check ([`reconcile`]); nesting a root inside a cli span is
+/// the INTENDED shape here, unlike root-inside-root.
+#[macro_export]
+macro_rules! anatomy_wall_cli {
+    ($body:block) => {{
+        #[cfg(feature = "anatomy-wall")]
+        {
+            let __anatomy_wall_cli_start = ::std::time::Instant::now();
+            let __anatomy_wall_cli_ret = $body;
+            let __anatomy_wall_cli_elapsed = __anatomy_wall_cli_start.elapsed().as_nanos() as u64;
+            $crate::compress::deflate::anatomy_wall::WALL
+                .cli_ns
+                .fetch_add(
+                    __anatomy_wall_cli_elapsed,
+                    ::std::sync::atomic::Ordering::Relaxed,
+                );
+            $crate::compress::deflate::anatomy_wall::WALL
+                .cli_calls
+                .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+            __anatomy_wall_cli_ret
+        }
+        #[cfg(not(feature = "anatomy-wall"))]
+        {
+            $body
+        }
+    }};
+}
+
 #[cfg(all(test, feature = "anatomy-wall"))]
 mod tests {
     use super::*;
@@ -343,6 +459,38 @@ mod tests {
         assert!(j.contains("\"residual_ns\""));
         assert!(j.contains("\"granularity\""));
         let _ = reconcile();
+    }
+
+    /// The level-2 (CLI-span) conservation arithmetic. Mirrors
+    /// `conservation_arithmetic_catches_overshoot` for the outer nesting
+    /// level: the CLI span must contain the encoder call PLUS every outer
+    /// region, and a `cli_ns` of zero means "span not armed", which must be
+    /// treated as absent rather than as a containment violation — otherwise
+    /// every library/test caller (which never arms the CLI span) would report
+    /// a spurious FAIL.
+    #[test]
+    fn cli_span_conservation_arithmetic() {
+        // Contained: cli fully encloses root + outer.
+        let (cli, root, outer) = (100_000u64, 54_000u64, 40_000u64);
+        assert!(root + outer <= cli);
+        assert_eq!(cli - (root + outer), 6_000, "cli residual");
+
+        // Violation: outer regions overlap the encoder call. Must be DETECTED,
+        // not saturating-subbed to a plausible-looking zero.
+        let (cli2, root2, outer2) = (100_000u64, 54_000u64, 60_000u64);
+        assert!(root2 + outer2 > cli2, "must be treated as FAIL");
+        assert_eq!(
+            cli2.saturating_sub(root2 + outer2),
+            0,
+            "the clamp is exactly why reconcile() re-derives the raw comparison"
+        );
+
+        // Unarmed CLI span: absent, not a violation.
+        let cli3 = 0u64;
+        assert!(
+            !(cli3 > 0 && root + outer > cli3),
+            "an unarmed cli span must not be reported as a containment failure"
+        );
     }
 
     /// A hand-built `AnatomyWall`-shaped reconciliation check (bypassing the
