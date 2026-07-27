@@ -384,15 +384,30 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
     let mut bw = BitWriter::from_vec(out);
 
+    // NOTE: no `anatomy_wall_cli!` here. The CLI route in `compress::mod`
+    // already arms that span around this call, and arming a second one nests
+    // it inside the first — both accumulate into `cli_ns`, doubling it and
+    // leaving a `cli residual` of exactly 50%. That is what the first version
+    // of this instrumentation did, and `cli_calls=2` is what gave it away.
     loop {
         // Refill. CRC covers exactly the new bytes, while they are still hot in
         // cache from the read — not a second sweep of the whole input.
+        //
+        // `read_input` and `stream_crc` are SIBLING outer regions, not nested:
+        // timing them separately here keeps the production structure (crc
+        // interleaved with the reads, so each chunk is checksummed while hot)
+        // exactly as it is, while still letting the two costs be told apart.
         let fill_to = cap - INPLACE_TAIL_PAD;
         while !eof && avail < fill_to {
-            match reader.read(&mut buf[avail..fill_to]) {
+            let r = crate::anatomy_wall_time!(read_input_ns, read_input_calls, {
+                reader.read(&mut buf[avail..fill_to])
+            });
+            match r {
                 Ok(0) => eof = true,
                 Ok(k) => {
-                    crc.update(&buf[avail..avail + k]);
+                    crate::anatomy_wall_time!(stream_crc_ns, stream_crc_calls, {
+                        crc.update(&buf[avail..avail + k]);
+                    });
                     total += k as u64;
                     avail += k;
                 }
@@ -415,21 +430,27 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
             if eof {
                 // Close the stream: a zero-length final block carrying BFINAL.
                 emit_stored_block(&mut bw, &[], true);
-                bw.drain_to(writer)?;
+                crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
                 break;
             }
         } else {
-            in_next = parse::compress_resumable(
-                &buf[..avail + INPLACE_TAIL_PAD],
-                &mut state,
-                in_next,
-                avail,
-                &params,
-                eof,
-                eof,
-                &mut bw,
-            );
-            bw.drain_to(writer)?;
+            // The `root` span: the encoder call proper. Fires once per pass
+            // here rather than once per file, so `root_calls` is the pass
+            // count — the inner regions still sum inside it, which is what the
+            // level-1 conservation check needs.
+            in_next = crate::anatomy_wall_root!({
+                parse::compress_resumable(
+                    &buf[..avail + INPLACE_TAIL_PAD],
+                    &mut state,
+                    in_next,
+                    avail,
+                    &params,
+                    eof,
+                    eof,
+                    &mut bw,
+                )
+            });
+            crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
         }
 
         if eof {
@@ -455,7 +476,7 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
     let mut tail = bw.finish();
     tail.extend_from_slice(&crc.finalize().to_le_bytes());
     tail.extend_from_slice(&(total as u32).to_le_bytes());
-    writer.write_all(&tail)?;
+    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
     Ok(total)
 }
 

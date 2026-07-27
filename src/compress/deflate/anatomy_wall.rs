@@ -254,6 +254,15 @@ define_wall_regions!(
     // reported as nothing at all.
     read_input_ns / read_input_calls,
     write_out_ns / write_out_calls,
+    // CRC is an INNER region on the whole-buffer route (it happens inside
+    // `compress_gzip_padded`) but an OUTER one on the streaming route, where
+    // it is folded into the refill so each chunk is checksummed while still
+    // hot from the read. Same work, different nesting — and the nesting is
+    // what the conservation checks are about, so it needs its own name.
+    // Folding it into the inner sum would make `named > root` on the
+    // streaming route and trip the level-1 check for a reason that is not a
+    // bug.
+    stream_crc_ns / stream_crc_calls,
     }
 );
 
