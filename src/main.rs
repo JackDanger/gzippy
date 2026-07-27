@@ -189,6 +189,21 @@ fn fast_exit_success(exit_code: i32) -> ! {
     process::exit(exit_code);
 }
 
+/// gzip's real exit-code precedence, established by execution (gzip 1.14):
+/// ERROR (1) ALWAYS wins regardless of arrival order; WARNING (2) — e.g. "is
+/// a directory -- ignored" — only takes the code if nothing worse has been
+/// recorded yet. A multi-file invocation with `good1 baddir missing2 good2`
+/// still processes both good files AND settles on exit 1 (error), never 2,
+/// regardless of whether the directory-warning or the missing-file-error
+/// argument came first — verified both orders give exit 1 on real gzip.
+fn bump_exit_code(exit_code: &mut i32, new_code: i32) {
+    if new_code == 1 {
+        *exit_code = 1;
+    } else if new_code != 0 && *exit_code == 0 {
+        *exit_code = new_code;
+    }
+}
+
 fn run() -> Result<i32, GzippyError> {
     let args = GzippyArgs::parse()?;
 
@@ -309,6 +324,16 @@ fn run() -> Result<i32, GzippyError> {
         let mut total_comp = 0u64;
         let mut total_uncomp = 0u64;
         for file in &args.files {
+            if Path::new(file).is_dir() {
+                // Same contract as compress/decompress/-t (see comment on
+                // compress_file): exit 2, this exact message, skip the file,
+                // keep processing the rest.
+                if !args.quiet {
+                    eprintln!("gzippy: {} is a directory -- ignored", file);
+                }
+                bump_exit_code(&mut exit_code, 2);
+                continue;
+            }
             match list_file(file, &args) {
                 Ok((comp, uncomp)) => {
                     total_comp += comp;
@@ -316,7 +341,7 @@ fn run() -> Result<i32, GzippyError> {
                 }
                 Err(e) => {
                     eprintln!("gzippy: {}: {}", file, e);
-                    exit_code = 1;
+                    bump_exit_code(&mut exit_code, 1);
                 }
             }
         }
@@ -358,13 +383,11 @@ fn run() -> Result<i32, GzippyError> {
 
             match result {
                 Ok(code) => {
-                    if code != 0 {
-                        exit_code = code;
-                    }
+                    bump_exit_code(&mut exit_code, code);
                 }
                 Err(e) => {
                     eprintln!("gzippy: {}: {}", file, e);
-                    exit_code = 1;
+                    bump_exit_code(&mut exit_code, 1);
                 }
             }
         }
@@ -381,6 +404,15 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
     let input_path = Path::new(filename);
     if !input_path.exists() {
         return Err(GzippyError::FileNotFound(filename.to_string()));
+    }
+    if input_path.is_dir() {
+        // Same contract as compress_file/decompress_file: `gzip -t somedir`
+        // exits 2 (WARNING) with this exact message, established by
+        // execution (gzip 1.14). Never opens/mmaps the directory.
+        if !args.quiet {
+            eprintln!("gzippy: {} is a directory -- ignored", filename);
+        }
+        return Ok(2);
     }
 
     let input_file = File::open(input_path)?;

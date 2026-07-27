@@ -48,10 +48,16 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         return if args.recursive {
             compress_directory(filename, args)
         } else {
-            Err(GzippyError::invalid_argument(format!(
-                "{} is a directory",
-                filename
-            )))
+            // Contract established by execution (gzip 1.14 / pigz 2.8, macOS
+            // + Linux): `gzip somedir` (no -r) prints exactly this shape and
+            // exits 2 (WARNING, not ERROR) — never touches the directory,
+            // never halts a multi-file invocation's remaining good files.
+            // pigz disagrees (exit 1, "skipping: X is a directory"); gzip is
+            // the primary drop-in target so we match gzip.
+            if !args.quiet {
+                eprintln!("gzippy: {} is a directory -- ignored", filename);
+            }
+            Ok(2)
         };
     }
     if input_path.is_symlink() && !args.force {
@@ -64,15 +70,29 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         return Ok(2);
     }
 
-    // Refuse to compress files that already carry the target suffix (e.g. foo.gz → foo.gz.gz).
-    if !args.force && filename.ends_with(args.suffix.as_str()) {
+    // Refuse to compress files that already carry the target suffix in-place
+    // (e.g. foo.gz -> foo.gz.gz). Contract established by execution (gzip
+    // 1.14, pigz 2.8 on macOS + Linux):
+    //   - `-c`: there is no output-FILENAME collision to protect (output
+    //     goes to stdout) so gzip ALWAYS compresses through regardless of
+    //     this file's name, with or without -f. (pigz disagrees here — it
+    //     skips and emits empty stdout — but gzip is the primary drop-in
+    //     target, so we match gzip: skip this check entirely when
+    //     `args.stdout`.)
+    //   - in-place, without -f: gzip leaves the file COMPLETELY UNCHANGED
+    //     and exits 0 -- a no-op NOTICE, not an error (both gzip and pigz
+    //     agree: real `gzip already.gz` prints this message and exits 0).
+    //   - in-place, with -f: `args.force` already short-circuits this
+    //     branch (the condition below), so -f compresses anyway
+    //     (foo.gz -> foo.gz.gz), matching gzip.
+    if !args.stdout && !args.force && filename.ends_with(args.suffix.as_str()) {
         if !args.quiet {
             eprintln!(
                 "gzippy: {}: already has {} suffix -- unchanged",
                 filename, args.suffix
             );
         }
-        return Ok(1);
+        return Ok(0);
     }
     #[cfg(unix)]
     {
@@ -123,10 +143,24 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                     return Ok(2);
                 }
             } else {
-                return Err(GzippyError::invalid_argument(format!(
-                    "Output file {} already exists",
-                    output_path.display()
-                )));
+                // Contract established by execution (gzip 1.14, non-interactive
+                // stdin — e.g. a script or a pipeline): gzip does NOT treat this
+                // as an error. It prints the exact same "already exists;\tnot
+                // overwritten" shape it would after a declined prompt and exits
+                // 2 (WARNING) -- it never actually blocks waiting for input, and
+                // it never returns 1. gzippy previously returned an
+                // InvalidArgument Err here (exit 1), which is wrong on two
+                // counts: wrong exit CLASS, and it would abort a multi-file
+                // invocation's remaining good files via the main-loop Err path
+                // instead of just skipping this one. pigz disagrees (exit 1,
+                // "skipping: F exists") -- gzip is the primary drop-in target.
+                if !args.quiet {
+                    eprintln!(
+                        "gzippy: {} already exists;\tnot overwritten",
+                        output_path.display()
+                    );
+                }
+                return Ok(2);
             }
         }
     }
