@@ -478,15 +478,6 @@ impl HcMatchfinder {
                 {
                     local.chain_reads += 1;
                 }
-                // MINIMAL HOIST: only `n_lo`. It is invariant for the ENTIRE search
-                // (`in_next` never moves) so it needs no refresh, costing ONE extra
-                // live value. Hoisting `off`/`n_hi` too was measurably worse on
-                // x86: +60 instructions and +57 stack references in this function,
-                // because three extra live values do not fit in x86-64's 16 GP
-                // registers. aarch64's 31 absorb them, which is why that variant
-                // passed on M1 and failed on Intel and Zen2.
-                // SAFETY: `in_next + 4 <= blen` (BUF_PAD >= 16).
-                let n_lo = unsafe { load_u32(base, in_next) };
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -513,13 +504,14 @@ impl HcMatchfinder {
                         // with `best_len <= max_len`, so `in_next + off + 4 <=
                         // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
                         // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
-                        let (m_hi, n_hi, m_lo) = unsafe {
+                        let (m_hi, n_hi, m_lo, n_lo) = unsafe {
                             debug_assert!(matchptr < in_next);
                             debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
                             (
                                 load_u32(base, matchptr + off),
                                 load_u32(base, in_next + off),
                                 load_u32(base, matchptr),
+                                load_u32(base, in_next),
                             )
                         };
                         #[cfg(feature = "anatomy-counters")]
