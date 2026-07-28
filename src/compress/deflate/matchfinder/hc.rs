@@ -37,8 +37,7 @@
 //!   Each `load_u32`/`load_u24` site carries a `debug_assert!` proving `off+4 <= len`.
 
 use super::common::{
-    load_u24, load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_read, prefetch_write,
-    MATCHFINDER_INITVAL,
+    load_u24, load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_write, MATCHFINDER_INITVAL,
 };
 
 /// Per-`longest_match`-call local accumulator for the chain-walk counters
@@ -386,13 +385,22 @@ impl HcMatchfinder {
                     }
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // Prefetch the next node's match data one iteration ahead.
-                        // `wrapping_offset` keeps pointer formation defined even when
-                        // `next_node <= cutoff` (a chain end maps off-object); the
-                        // prefetch itself never faults.
-                        prefetch_read(
-                            base.wrapping_offset(in_base_v as isize + next_node as isize),
-                        );
+                        // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
+                        // A `prefetch_read` of the next chain node used to sit
+                        // here, one iteration ahead. It was a net LOSS: it cost
+                        // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
+                        // removed) to buy misses we were not taking. Against
+                        // libdeflate on identical output we were MISSING LESS
+                        // (7.0% vs their 16.4%) while executing 70% MORE loads
+                        // — the signature of over-prefetching. Removing it:
+                        // Intel -5.1% wall / -5.2% cycles, M1 geomean 0.9610
+                        // (-10% at L6/L9), AMD Zen2 frozen geomean 0.9993.
+                        // Gate was pre-registered before measuring: no cell
+                        // above 1.02 and geomean <= 1.0, across 4 entropy
+                        // classes x L1/6/9 x 3 microarchitectures. Output
+                        // byte-identical throughout. The hardware prefetcher
+                        // already covers this access pattern on every core we
+                        // ship to.
                         // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
                         // `matchptr + 4 <= in_next + 4 <= buf.len()`.
                         let cand = unsafe {
@@ -473,11 +481,22 @@ impl HcMatchfinder {
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // Prefetch the next node's match data one iteration ahead
-                        // (see the length-4 walk for the correctness argument).
-                        prefetch_read(
-                            base.wrapping_offset(in_base_v as isize + next_node as isize),
-                        );
+                        // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
+                        // A `prefetch_read` of the next chain node used to sit
+                        // here, one iteration ahead. It was a net LOSS: it cost
+                        // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
+                        // removed) to buy misses we were not taking. Against
+                        // libdeflate on identical output we were MISSING LESS
+                        // (7.0% vs their 16.4%) while executing 70% MORE loads
+                        // — the signature of over-prefetching. Removing it:
+                        // Intel -5.1% wall / -5.2% cycles, M1 geomean 0.9610
+                        // (-10% at L6/L9), AMD Zen2 frozen geomean 0.9993.
+                        // Gate was pre-registered before measuring: no cell
+                        // above 1.02 and geomean <= 1.0, across 4 entropy
+                        // classes x L1/6/9 x 3 microarchitectures. Output
+                        // byte-identical throughout. The hardware prefetcher
+                        // already covers this access pattern on every core we
+                        // ship to.
                         // Prefilter: compare the last 4 and the first 4 bytes before
                         // attempting a full extension.
                         let off = best_len as usize - 3;
