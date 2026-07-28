@@ -35,7 +35,7 @@ fn to_isal_level(level: u32) -> isal::CompressionLevel {
 /// Returns None if ISA-L is not available, allowing the caller to fall back.
 #[cfg(feature = "isal-compression")]
 #[allow(dead_code)]
-pub fn compress_gzip(data: &[u8], level: u32) -> Option<Vec<u8>> {
+pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Option<Vec<u8>> {
     // Worst case: incompressible data + gzip header/trailer overhead
     let max_size = data.len() + data.len() / 10 + 256;
     let mut output = vec![0u8; max_size];
@@ -47,7 +47,7 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Option<Vec<u8>> {
 
 #[cfg(not(feature = "isal-compression"))]
 #[allow(dead_code)]
-pub fn compress_gzip(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
+pub fn encode_gzip_bytes_to_vec(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
     None
 }
 
@@ -105,7 +105,7 @@ pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
 
     if input.is_empty() {
         // Write minimal gzip for empty input
-        let compressed = compress_gzip(&input, level)
+        let compressed = encode_gzip_bytes_to_vec(&input, level)
             .ok_or_else(|| std::io::Error::other("ISA-L compression failed"))?;
         writer.write_all(&compressed)?;
         return Ok(0);
@@ -286,7 +286,7 @@ mod tests {
     #[cfg(feature = "isal-compression")]
     fn test_compress_gzip_roundtrip() {
         let original = b"Hello, World! This is a test of ISA-L compression.";
-        let compressed = compress_gzip(original, 1).expect("compression failed");
+        let compressed = encode_gzip_bytes_to_vec(original, 1).expect("compression failed");
 
         // Verify it's valid gzip
         assert!(compressed.len() >= 10);
@@ -308,7 +308,7 @@ mod tests {
         let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
 
         for level in 0..=3 {
-            let compressed = compress_gzip(&data, level).expect("compression failed");
+            let compressed = encode_gzip_bytes_to_vec(&data, level).expect("compression failed");
             assert!(
                 compressed.len() < data.len(),
                 "level {} should compress",

@@ -565,7 +565,7 @@ pub mod tune {
         /// THE T1-ONLY MEASUREMENT MISSED THE DOMINANT COST: `run()` is
         /// called ONCE PER FILE at T1 but ONCE PER 512KB CHUNK at T>1
         /// (`compress::pipelined::compress_parallel_pipeline_pure`'s
-        /// per-block `compress_block_streaming` call, `MAX_PARALLEL_
+        /// per-block `encode_deflate_segment_to_sink` call, `MAX_PARALLEL_
         /// BLOCK_SIZE`), and [`Self::hash3_gate_initial_active`]'s "silent
         /// until the first block's signal is known" cost is paid AT THE
         /// START OF EVERY CHUNK, not once per file. On `dd79_bin6`
@@ -2796,7 +2796,7 @@ fn release_head_table(
 /// or more DEFLATE blocks to `bw`.
 ///
 /// `buf` MUST carry at least [`super::BUF_PAD`] trailing pad bytes beyond
-/// `in_end` (upheld by the caller in `deflate::compress_block`) so the
+/// `in_end` (upheld by the caller in `deflate::encode_deflate_bytes_to_sink`) so the
 /// speculative 4-byte hash loads and 8-byte match-extend loads never read out of
 /// bounds. `buf[..data_start]` is an optional preset dictionary: its positions
 /// are seeded into the head table so matches may reference it, but it is not

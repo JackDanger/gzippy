@@ -1,7 +1,7 @@
 //! Does the streaming T1 encoder emit the SAME BYTES as the whole-buffer one?
 //!
-//! `compress_gzip_streaming` holds a fixed ~4.3 MB of buffer where
-//! `compress_gzip_padded` holds the entire input plus the entire output. That
+//! `encode_gzip_reader_to_writer` holds a fixed ~4.3 MB of buffer where
+//! `encode_gzip_slack_padded_to_vec` holds the entire input plus the entire output. That
 //! is worth having on its own (measured 2.009x-input peak RSS versus a flat
 //! 2.0 MB for gzip and pigz), but only if the emitted stream does not get
 //! worse — a smaller memory footprint bought with a larger output would trade
@@ -21,7 +21,7 @@
 //! decodes on most inputs.
 
 use gzippy::compress::deflate::{
-    compress_gzip_padded, compress_gzip_streaming, INPLACE_TAIL_PAD, STREAM_CHUNK,
+    encode_gzip_reader_to_writer, encode_gzip_slack_padded_to_vec, INPLACE_TAIL_PAD, STREAM_CHUNK,
 };
 
 /// Track the production constant rather than copying its value: an earlier
@@ -54,13 +54,13 @@ fn whole_buffer(data: &[u8], level: u32) -> Vec<u8> {
     let mut padded = Vec::with_capacity(data.len() + INPLACE_TAIL_PAD);
     padded.extend_from_slice(data);
     padded.resize(data.len() + INPLACE_TAIL_PAD, 0);
-    compress_gzip_padded(&padded, data.len(), level)
+    encode_gzip_slack_padded_to_vec(&padded, data.len(), level)
 }
 
 fn streamed(data: &[u8], level: u32) -> Vec<u8> {
     let mut out = Vec::new();
     let mut src = data;
-    let n = compress_gzip_streaming(&mut src, &mut out, level).expect("streaming encode");
+    let n = encode_gzip_reader_to_writer(&mut src, &mut out, level).expect("streaming encode");
     assert_eq!(n, data.len() as u64, "reported input length");
     out
 }
@@ -247,7 +247,7 @@ fn short_reads_and_interrupts_do_not_change_the_output() {
         for (max_read, interrupt_every) in shapes {
             let mut r = HostileReader::new(data, max_read, interrupt_every);
             let mut out = Vec::new();
-            let n = gzippy::compress::deflate::compress_gzip_streaming(&mut r, &mut out, 6)
+            let n = gzippy::compress::deflate::encode_gzip_reader_to_writer(&mut r, &mut out, 6)
                 .expect("hostile reader must not fail the encode");
             assert_eq!(
                 n as usize,
@@ -303,7 +303,7 @@ fn input_larger_than_four_gib_wraps_isize_and_does_not_buffer() {
         bytes: 0,
         tail: Vec::new(),
     };
-    let n = gzippy::compress::deflate::compress_gzip_streaming(&mut r, &mut sink, 0)
+    let n = gzippy::compress::deflate::encode_gzip_reader_to_writer(&mut r, &mut sink, 0)
         .expect("4 GiB encode");
     assert_eq!(n, LEN, "reported input length");
 

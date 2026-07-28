@@ -54,11 +54,11 @@
 //!     this module exists to avoid. Documented as fused/UNMEASURABLE-
 //!     separately, not silently dropped.
 //!   - **`crc`** — one timer per invocation, wrapping the single
-//!     `crc32fast::hash` call `compress_gzip`/`compress_gzip_padded` makes
+//!     `crc32fast::hash` call `encode_gzip_bytes_to_vec`/`encode_gzip_slack_padded_to_vec` makes
 //!     over the WHOLE input (CRC in gzippy is not computed per-block).
 //!   - **root span** — one timer per invocation, wrapping the ENTIRE
-//!     `compress_gzip`/`compress_gzip_padded` body (gzip header write,
-//!     `compress_block`/`deflate_padded_in_place`, CRC, trailer). This is
+//!     `encode_gzip_bytes_to_vec`/`encode_gzip_slack_padded_to_vec` body (gzip header write,
+//!     `encode_deflate_bytes_to_sink`/`encode_deflate_slack_padded_to_sink`, CRC, trailer). This is
 //!     the span every other region's total must reconcile against.
 //!   - **RESIDUAL** — DERIVED, never independently timed: `root_ns -
 //!     (parse_match_ns + huffman_table_ns + huffman_encode_ns + crc_ns)`.
@@ -72,8 +72,8 @@
 //!
 //! ## Scope: T1 only (`-p 1`)
 //!
-//! The root/CRC timers wrap the T1 entry points ([`compress_gzip`]/
-//! [`compress_gzip_padded`], `src/compress/deflate/mod.rs`) ONLY. At T>1 the
+//! The root/CRC timers wrap the T1 entry points ([`encode_gzip_bytes_to_vec`]/
+//! [`encode_gzip_slack_padded_to_vec`], `src/compress/deflate/mod.rs`) ONLY. At T>1 the
 //! CLI's default thread count is "all CPUs" (see `src/compress/mod.rs`'s
 //! `run` doc comment) and routes through `compress::pipelined::
 //! PipelinedGzEncoder::compress_buffer_pure`, which drives the SAME
@@ -116,7 +116,7 @@ macro_rules! define_wall_regions {
         /// `anatomy_counters::AnatomyCounters`).
         ///
         /// TWO NESTING LEVELS (added 2026-07-26). `root` is the encoder call
-        /// (`compress_gzip_padded`); `cli` is the whole end-to-end
+        /// (`encode_gzip_slack_padded_to_vec`); `cli` is the whole end-to-end
         /// single-thread CLI compress, which STRICTLY CONTAINS `root`. INNER
         /// regions sit inside `root`; OUTER regions sit inside `cli` but
         /// OUTSIDE `root` (reading the input, writing the output). The split
@@ -255,7 +255,7 @@ define_wall_regions!(
     read_input_ns / read_input_calls,
     write_out_ns / write_out_calls,
     // CRC is an INNER region on the whole-buffer route (it happens inside
-    // `compress_gzip_padded`) but an OUTER one on the streaming route, where
+    // `encode_gzip_slack_padded_to_vec`) but an OUTER one on the streaming route, where
     // it is folded into the refill so each chunk is checksummed while still
     // hot from the read. Same work, different nesting — and the nesting is
     // what the conservation checks are about, so it needs its own name.
@@ -292,7 +292,7 @@ pub fn reconcile() -> Result<(), String> {
     if root == 0 && named == 0 {
         return Err(
             "ANATOMY_WALL_RECONCILE=VOID root_ns=0 named_ns=0 -- no invocation was timed \
-             (root timer never fired; are you calling compress_gzip/compress_gzip_padded?)"
+             (root timer never fired; are you calling encode_gzip_bytes_to_vec/encode_gzip_slack_padded_to_vec?)"
                 .to_string(),
         );
     }
@@ -381,7 +381,7 @@ macro_rules! anatomy_wall_time {
     }};
 }
 
-/// Time the ROOT span (the whole `compress_gzip`/`compress_gzip_padded`
+/// Time the ROOT span (the whole `encode_gzip_bytes_to_vec`/`encode_gzip_slack_padded_to_vec`
 /// invocation) — a distinct macro (not `anatomy_wall_time!`) because it
 /// writes `root_ns`/`root_calls` directly rather than taking a region-name
 /// pair, and because it is meant to wrap exactly ONE call site per

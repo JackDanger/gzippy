@@ -41,6 +41,7 @@ pub mod anatomy_wall;
 pub mod bitstream;
 pub mod block_split;
 pub mod costs;
+pub mod encode_types;
 pub mod huffman;
 pub mod level;
 pub mod matchfinder;
@@ -75,12 +76,12 @@ fn estimate_output_cap(len: usize, level: u32, framing_slack: usize) -> usize {
 }
 
 /// Compress `data` into a raw DEFLATE stream (no gzip/zlib framing) at `level`.
-pub fn compress_oneshot(data: &[u8], level: u32) -> Vec<u8> {
+pub fn encode_deflate_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
     let cap = estimate_output_cap(data.len(), level, 64);
     crate::anatomy_count!(alloc_events);
     crate::anatomy_count!(alloc_bytes, cap);
     let mut out = Vec::with_capacity(cap);
-    compress_block(data, &[], level, &mut out);
+    encode_deflate_bytes_to_sink(data, &[], level, &mut out);
     out
 }
 
@@ -97,23 +98,23 @@ pub const INPLACE_TAIL_PAD: usize = parse::BUF_PAD;
 /// matchfinder so back-references in the coded output may point into it, but the
 /// dictionary itself is not emitted. The decoder must have the identical window
 /// preloaded. Pass `&[]` for no dictionary (the gzip/single-member case).
-pub fn compress_block(data: &[u8], dict: &[u8], level: u32, out: &mut Vec<u8>) {
+pub fn encode_deflate_bytes_to_sink(data: &[u8], dict: &[u8], level: u32, out: &mut Vec<u8>) {
     // A standalone single final block: BFINAL is set on the last internal
     // block and no sync-flush marker is appended. `bw.finish()` byte-aligns
     // the tail. This is the T1 / single-member framing.
-    compress_block_streaming(data, dict, level, true, out);
+    encode_deflate_segment_to_sink(data, dict, level, true, out);
 }
 
 /// Compress `data` into a raw DEFLATE stream for use as ONE CHUNK of a larger
 /// concatenated single-member stream, appending to `out`.
 ///
-/// Identical to [`compress_block`] except for the stream-position semantics
+/// Identical to [`encode_deflate_bytes_to_sink`] except for the stream-position semantics
 /// controlled by `is_last`:
 ///
 /// * `is_last == true` — this chunk closes the stream. The last internal block
 ///   carries `BFINAL=1` and NOTHING is appended after it; `bw.finish()`
 ///   byte-aligns the tail. With an empty `dict` this is byte-identical to
-///   [`compress_block`] (the single-member case).
+///   [`encode_deflate_bytes_to_sink`] (the single-member case).
 /// * `is_last == false` — this chunk is followed by more chunks. Every internal
 ///   block (including the last) stays `BFINAL=0`, and a byte-aligned empty
 ///   stored block — the standard `Z_SYNC_FLUSH` marker
@@ -127,7 +128,7 @@ pub fn compress_block(data: &[u8], dict: &[u8], level: u32, out: &mut Vec<u8>) {
 /// chunk's back-references may point into `dict` (the preceding window, seeded
 /// into the matchfinder but not emitted), which the decoder already holds as
 /// the tail of the output decoded so far.
-pub fn compress_block_streaming(
+pub fn encode_deflate_segment_to_sink(
     data: &[u8],
     dict: &[u8],
     level: u32,
@@ -145,7 +146,7 @@ pub fn compress_block_streaming(
         // No preset dictionary: build a padded working buffer [data | pad] so
         // the matchfinder's speculative loads stay in bounds. (Callers holding a
         // buffer that already carries the pad — the T1 hot path — should use
-        // `compress_gzip_padded` / `deflate_padded_in_place` to skip this copy.)
+        // `encode_gzip_slack_padded_to_vec` / `encode_deflate_slack_padded_to_sink` to skip this copy.)
         let cap = data.len() + parse::BUF_PAD;
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
@@ -197,7 +198,7 @@ pub fn compress_block_streaming(
 /// `sync_flush` controls whether a non-final chunk is closed with a
 /// byte-aligning empty stored block. It is REQUIRED when chunks are encoded
 /// into separate bit streams that are later concatenated (the T>1 path, and
-/// [`compress_block_streaming`]'s contract). It must be OFF for a
+/// [`encode_deflate_segment_to_sink`]'s contract). It must be OFF for a
 /// single-threaded streaming encoder that keeps ONE continuous `BitWriter`
 /// across chunks: there the chunk seam does not exist in the bitstream at all,
 /// so aligning at it would both waste ~5 bytes per chunk and, more
@@ -238,11 +239,16 @@ fn deflate_into(
 /// the copy-free entry point: the caller pads its own read buffer once, so the
 /// input is parsed IN PLACE rather than copied into a second padded buffer, and
 /// the output is written through into `out`. Output is byte-identical to
-/// `compress_block(&buf[..logical_len], &[], level, out)`.
-pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: &mut Vec<u8>) {
+/// `encode_deflate_bytes_to_sink(&buf[..logical_len], &[], level, out)`.
+pub fn encode_deflate_slack_padded_to_sink(
+    buf: &[u8],
+    logical_len: usize,
+    level: u32,
+    out: &mut Vec<u8>,
+) {
     assert!(
         buf.len() >= logical_len + INPLACE_TAIL_PAD,
-        "deflate_padded_in_place: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
+        "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
     let mut bw = BitWriter::from_vec(std::mem::take(out));
     deflate_into(&mut bw, buf, 0, logical_len, level, true, true);
@@ -254,9 +260,9 @@ pub fn deflate_padded_in_place(buf: &[u8], logical_len: usize, level: u32, out: 
 ///
 /// Wrapped in [`crate::anatomy_wall_root!`] (the `anatomy-wall` feature's
 /// root span, see `anatomy_wall` module docs): this is one of the two
-/// production T1 entry points (the other being [`compress_gzip_padded`]) the
+/// production T1 entry points (the other being [`encode_gzip_slack_padded_to_vec`]) the
 /// wall-clock phase timers measure against.
-pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
+pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
     crate::anatomy_wall_root!({
         let cap = estimate_output_cap(data.len(), level, 32);
         crate::anatomy_count!(alloc_events);
@@ -266,7 +272,7 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
         // OS=255 (unknown).
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        compress_block(data, &[], level, &mut out);
+        encode_deflate_bytes_to_sink(data, &[], level, &mut out);
 
         let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
         out.extend_from_slice(&crc.to_le_bytes());
@@ -283,8 +289,8 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Vec<u8> {
 /// `read_to_end`) and pads that same buffer (`resize(len + INPLACE_TAIL_PAD,
 /// 0)`), so the compressor neither copies the input into a second work buffer
 /// nor builds a separate output buffer. Output is byte-identical to
-/// `compress_gzip(&buf[..logical_len], level)`.
-pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
+/// `encode_gzip_bytes_to_vec(&buf[..logical_len], level)`.
+pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
     crate::anatomy_wall_root!({
         let cap = estimate_output_cap(logical_len, level, 32);
         crate::anatomy_count!(alloc_events);
@@ -292,7 +298,7 @@ pub fn compress_gzip_padded(buf: &[u8], logical_len: usize, level: u32) -> Vec<u
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        deflate_padded_in_place(buf, logical_len, level, &mut out);
+        encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
 
         let crc =
             crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(&buf[..logical_len]) });
@@ -346,7 +352,7 @@ pub const STREAM_CHUNK: usize = MAX_STORED_SUBBLOCK * 64;
 /// `in_base` by the same amount. Because the matchfinder stores every position
 /// as `pos - in_base`, that is an O(1) pointer-rebase with no table rewrite —
 /// the same trick zlib's sliding window uses.
-fn stream_resumable<R: std::io::Read, W: std::io::Write>(
+fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
@@ -448,14 +454,24 @@ fn stream_resumable<R: std::io::Read, W: std::io::Write>(
             // count — the inner regions still sum inside it, which is what the
             // level-1 conservation check needs.
             in_next = crate::anatomy_wall_root!({
-                parse::compress_resumable(
+                parse::parse_resumable(
                     &buf[..avail + INPLACE_TAIL_PAD],
                     &mut state,
                     in_next,
                     avail,
                     &params,
-                    eof,
-                    eof,
+                    if eof {
+                        encode_types::BlockRole::Final
+                    } else {
+                        encode_types::BlockRole::Interior
+                    },
+                    // EOF is the only condition under which the parser must
+                    // consume everything: any earlier pass will be refilled.
+                    if eof {
+                        encode_types::InputMode::Drain
+                    } else {
+                        encode_types::InputMode::Bounded
+                    },
                     &mut bw,
                 )
             });
@@ -537,7 +553,7 @@ pub fn level_streams(level: u32) -> bool {
 /// Compress `reader` into `writer` as a gzip stream in ONE pass, holding a
 /// fixed ~1.1 MiB of buffer regardless of input size.
 ///
-/// This is the streaming counterpart to [`compress_gzip_padded`], which
+/// This is the streaming counterpart to [`encode_gzip_slack_padded_to_vec`], which
 /// materializes the whole input in one `Vec` and the whole output in another.
 /// Measured peak RSS of that approach on a 232.2 MiB input was 2.009x the
 /// input at `-0` and input-plus-compressed-size at `-6`, against a flat 2.0 MB
@@ -565,15 +581,15 @@ pub fn level_streams(level: u32) -> bool {
 /// BFINAL *while encoding it*, and "did the reader end exactly on a chunk
 /// boundary" is not knowable otherwise. Reading one byte past a full chunk
 /// answers it; that byte becomes the first byte of the next chunk.
-pub fn compress_gzip_streaming<R: std::io::Read, W: std::io::Write>(
+pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
 ) -> std::io::Result<u64> {
-    compress_gzip_streaming_chunked(reader, writer, level, STREAM_CHUNK)
+    encode_gzip_reader_to_writer_chunked(reader, writer, level, STREAM_CHUNK)
 }
 
-/// [`compress_gzip_streaming`] with the chunk size supplied by the caller.
+/// [`encode_gzip_reader_to_writer`] with the chunk size supplied by the caller.
 ///
 /// A MEASUREMENT SEAM, not a tuning knob: production has exactly one chunk
 /// size, [`STREAM_CHUNK`], and no code path lets a user or an environment
@@ -582,7 +598,7 @@ pub fn compress_gzip_streaming<R: std::io::Read, W: std::io::Write>(
 /// boundaries cost ratio), and that curve has to be measured to pick the
 /// constant rather than guessed. `chunk` should be a multiple of
 /// [`MAX_STORED_SUBBLOCK`] to keep level 0 byte-identical.
-pub fn compress_gzip_streaming_chunked<R: std::io::Read, W: std::io::Write>(
+pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
@@ -599,12 +615,12 @@ pub fn compress_gzip_streaming_chunked<R: std::io::Read, W: std::io::Write>(
         reader.read_to_end(&mut input)?;
         let logical_len = input.len();
         input.resize(logical_len + INPLACE_TAIL_PAD, 0);
-        let gz = compress_gzip_padded(&input, logical_len, level);
+        let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
         writer.write_all(&gz)?;
         return Ok(logical_len as u64);
     }
     let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
-    stream_resumable(reader, writer, level, stream_chunk)
+    encode_gzip_single_pass(reader, writer, level, stream_chunk)
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
@@ -742,7 +758,13 @@ mod streaming_tests {
                 let dict_start = start.saturating_sub(32 * 1024);
                 let dict = &input[dict_start..start];
                 let is_last = c == 2;
-                compress_block_streaming(&input[start..end], dict, level, is_last, &mut deflate);
+                encode_deflate_segment_to_sink(
+                    &input[start..end],
+                    dict,
+                    level,
+                    is_last,
+                    &mut deflate,
+                );
             }
             let gz = wrap_gzip(&deflate, &input);
 
@@ -757,8 +779,8 @@ mod streaming_tests {
         }
     }
 
-    /// `compress_block_streaming(data, &[], level, true, ..)` must be
-    /// byte-identical to the single-block [`compress_block`] (no sync marker,
+    /// `encode_deflate_segment_to_sink(data, &[], level, true, ..)` must be
+    /// byte-identical to the single-block [`encode_deflate_bytes_to_sink`] (no sync marker,
     /// BFINAL set) — the regression guard the brief requires.
     #[test]
     fn is_last_no_dict_equals_compress_block() {
@@ -766,13 +788,13 @@ mod streaming_tests {
         for data in &cases {
             for level in [0u32, 1, 2, 6, 9, 12] {
                 let mut streaming = Vec::new();
-                compress_block_streaming(data, &[], level, true, &mut streaming);
+                encode_deflate_segment_to_sink(data, &[], level, true, &mut streaming);
                 let mut block = Vec::new();
-                compress_block(data, &[], level, &mut block);
+                encode_deflate_bytes_to_sink(data, &[], level, &mut block);
                 assert_eq!(
                     streaming,
                     block,
-                    "streaming(is_last=true) diverged from compress_block at L{level}, len={}",
+                    "streaming(is_last=true) diverged from encode_deflate_bytes_to_sink at L{level}, len={}",
                     data.len()
                 );
             }
@@ -793,30 +815,30 @@ mod inplace_tests {
     }
 
     /// The copy-free in-place gzip path must be byte-identical to the reference
-    /// `compress_gzip` (which builds a separate padded work buffer).
+    /// `encode_gzip_bytes_to_vec` (which builds a separate padded work buffer).
     fn assert_padded_gzip_matches(data: &[u8], level: u32) {
-        let reference = compress_gzip(data, level);
+        let reference = encode_gzip_bytes_to_vec(data, level);
         let (buf, logical_len) = padded(data);
-        let inplace = compress_gzip_padded(&buf, logical_len, level);
+        let inplace = encode_gzip_slack_padded_to_vec(&buf, logical_len, level);
         assert_eq!(
             reference,
             inplace,
-            "compress_gzip_padded diverged at L{level}, len={}",
+            "encode_gzip_slack_padded_to_vec diverged at L{level}, len={}",
             data.len()
         );
     }
 
-    /// The raw-DEFLATE in-place path must match `compress_block` (append form).
+    /// The raw-DEFLATE in-place path must match `encode_deflate_bytes_to_sink` (append form).
     fn assert_padded_block_matches(data: &[u8], level: u32) {
         let mut reference = Vec::new();
-        compress_block(data, &[], level, &mut reference);
+        encode_deflate_bytes_to_sink(data, &[], level, &mut reference);
         let (buf, logical_len) = padded(data);
         let mut inplace = Vec::new();
-        deflate_padded_in_place(&buf, logical_len, level, &mut inplace);
+        encode_deflate_slack_padded_to_sink(&buf, logical_len, level, &mut inplace);
         assert_eq!(
             reference,
             inplace,
-            "deflate_padded_in_place diverged at L{level}, len={}",
+            "encode_deflate_slack_padded_to_sink diverged at L{level}, len={}",
             data.len()
         );
     }
@@ -897,8 +919,8 @@ mod dict_tests {
         let data: Vec<u8> = b"the pure-rust deflate encoder must roundtrip. ".repeat(400);
         for level in [2u32, 6, 9] {
             let mut with_empty = Vec::new();
-            compress_block(&data, &[], level, &mut with_empty);
-            let no_dict = compress_oneshot(&data, level);
+            encode_deflate_bytes_to_sink(&data, &[], level, &mut with_empty);
+            let no_dict = encode_deflate_bytes_to_vec(&data, level);
             assert_eq!(with_empty, no_dict, "empty dict diverged at L{level}");
         }
     }
@@ -921,10 +943,10 @@ mod dict_tests {
         for level in [4u32, 6, 9] {
             let with_dict = {
                 let mut v = Vec::new();
-                compress_block(&data, &dict, level, &mut v);
+                encode_deflate_bytes_to_sink(&data, &dict, level, &mut v);
                 v.len()
             };
-            let without = compress_oneshot(&data, level).len();
+            let without = encode_deflate_bytes_to_vec(&data, level).len();
             assert!(
                 with_dict < without,
                 "L{level}: dict-seeded {with_dict} not smaller than no-dict {without}",

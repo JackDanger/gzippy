@@ -9,7 +9,8 @@
 //! Usage: cargo run --release --example stream_size_delta -- <file>...
 
 use gzippy::compress::deflate::{
-    compress_gzip_padded, compress_gzip_streaming_chunked, INPLACE_TAIL_PAD, STREAM_CHUNK,
+    encode_gzip_reader_to_writer_chunked, encode_gzip_slack_padded_to_vec, INPLACE_TAIL_PAD,
+    STREAM_CHUNK,
 };
 
 fn main() {
@@ -72,10 +73,10 @@ fn main() {
         padded.resize(data.len() + INPLACE_TAIL_PAD, 0);
 
         for &level in &levels {
-            let w = compress_gzip_padded(&padded, data.len(), level).len();
+            let w = encode_gzip_slack_padded_to_vec(&padded, data.len(), level).len();
             let mut out = Vec::new();
             let mut src = data.as_slice();
-            compress_gzip_streaming_chunked(&mut src, &mut out, level, chunk).expect("stream");
+            encode_gzip_reader_to_writer_chunked(&mut src, &mut out, level, chunk).expect("stream");
             let s = out.len();
 
             let delta = s as i64 - w as i64;

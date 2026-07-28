@@ -471,7 +471,7 @@ pub(super) fn run(
 /// Correctness tests for the DETECTOR-GATED LAZY-L3 composition — only
 /// meaningfully exercised under `l3-tune` (level 3 is plain `Strategy::Greedy`
 /// otherwise, already covered by the rest of the suite). Mirrors
-/// `near_optimal.rs`'s own `compress_gzip` + `flate2::read::GzDecoder`
+/// `near_optimal.rs`'s own `encode_gzip_bytes_to_vec` + `flate2::read::GzDecoder`
 /// roundtrip pattern. Each fixture is sized to span SEVERAL
 /// [`L3_GATE_BLOCK_LEN`] (300_000-byte) gate-blocks so a roundtrip failure
 /// here would catch a real cross-block state bug (shared matchfinder handed
@@ -480,7 +480,7 @@ pub(super) fn run(
 /// which the pre-existing greedy/lazy test suites already cover.
 #[cfg(all(test, feature = "l3-tune"))]
 mod tests {
-    use super::super::super::{compress_gzip, compress_oneshot};
+    use super::super::super::{encode_deflate_bytes_to_vec, encode_gzip_bytes_to_vec};
     use std::io::Read;
 
     fn decode(gz: &[u8]) -> Vec<u8> {
@@ -547,21 +547,21 @@ mod tests {
         // ~2.4x L3_GATE_BLOCK_LEN so the gate must lock onto GREEDY and stay
         // there across a block boundary.
         let data = dna_like(720_000);
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
     #[test]
     fn gated_l3_roundtrips_random_like_multi_block() {
         let data = random_like(720_000);
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
     #[test]
     fn gated_l3_roundtrips_text_like_multi_block() {
         let data = text_like(720_000);
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
@@ -579,7 +579,7 @@ mod tests {
         data.extend(random_like(500_000));
         data.extend(text_like(400_000));
         data.extend(dna_like(350_000));
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
@@ -593,18 +593,18 @@ mod tests {
             text_like(500),
             vec![7u8; 1],
         ] {
-            let gz = compress_gzip(&data, 3);
+            let gz = encode_gzip_bytes_to_vec(&data, 3);
             assert_eq!(decode(&gz), data);
         }
     }
 
-    /// `compress_oneshot` (the raw-DEFLATE, no gzip-framing entry point) —
+    /// `encode_deflate_bytes_to_vec` (the raw-DEFLATE, no gzip-framing entry point) —
     /// a second call path into the same `Strategy::LazyGated` dispatch, with
     /// its own inflate oracle rather than `flate2`'s gzip framing.
     #[test]
     fn gated_l3_roundtrips_via_compress_oneshot() {
         let data = dna_like(650_000);
-        let compressed = compress_oneshot(&data, 3);
+        let compressed = encode_deflate_bytes_to_vec(&data, 3);
         let mut out = Vec::new();
         flate2::read::DeflateDecoder::new(&compressed[..])
             .read_to_end(&mut out)

@@ -13,7 +13,8 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, bsr32, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, recalculate_min_match_len, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
+    emit_block, recalculate_min_match_len, BlockRole, InputMode, ParseState, Sink, StaticCodes,
+    STREAM_BLOCK_LOOKAHEAD,
 };
 
 /// The offset-cost tie-break test shared by lazy and lazy2 (threshold differs).
@@ -55,7 +56,20 @@ pub(super) fn run(
         mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
     }
     run_resumable(
-        buf, &mut state, data_start, in_end, params, statics, bw, lazy2, is_last, true,
+        buf,
+        &mut state,
+        data_start,
+        in_end,
+        params,
+        statics,
+        bw,
+        lazy2,
+        if is_last {
+            BlockRole::Final
+        } else {
+            BlockRole::Interior
+        },
+        InputMode::Drain,
     );
 }
 
@@ -74,8 +88,8 @@ pub(super) fn run_resumable(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     lazy2: bool,
-    is_last: bool,
-    consume_all: bool,
+    role: BlockRole,
+    input_mode: InputMode,
 ) -> usize {
     let mut sink = Sink::new();
     // See `greedy.rs`'s sibling declaration: one scratch per call, reused
@@ -84,7 +98,7 @@ pub(super) fn run_resumable(
     let mut in_next = from;
 
     loop {
-        if !consume_all && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
+        if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
             return in_next;
         }
         // Start a new DEFLATE block.
@@ -119,7 +133,7 @@ pub(super) fn run_resumable(
             block_begin,
             &sink,
             statics,
-            is_last && in_next == in_end,
+            role.is_final() && in_next == in_end,
             &mut header_scratch,
         );
         if in_next == in_end {

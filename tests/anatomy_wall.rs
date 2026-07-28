@@ -196,7 +196,7 @@ fn conservation_and_granularity_hold_on_a_real_gzippy_invocation() {
     assert!(root_ns > 0, "root span must have measured nonzero time");
     assert_eq!(
         root_calls, 1,
-        "exactly one compress_gzip* invocation this run"
+        "exactly one encode_gzip_bytes_to_vec* invocation this run"
     );
     assert!(
         conserved,

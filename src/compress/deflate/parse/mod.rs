@@ -18,6 +18,7 @@
 
 use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
+use super::encode_types::{BlockRole, InputMode};
 use super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
 use super::level::{LevelParams, Strategy};
 use super::matchfinder::hc::WINDOW_SIZE;
@@ -451,28 +452,20 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
 /// Callers must check [`level_has_resumable_parser`] first; other strategies
 /// panic rather than silently emitting a differently-shaped stream.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn compress_resumable(
+pub(super) fn parse_resumable(
     buf: &[u8],
     state: &mut ParseState,
     from: usize,
     in_end: usize,
     params: &LevelParams,
-    is_last: bool,
-    consume_all: bool,
+    role: BlockRole,
+    input_mode: InputMode,
     bw: &mut BitWriter,
 ) -> usize {
     let statics = StaticCodes::build();
     match params.strategy {
         Strategy::Greedy => greedy::run_resumable(
-            buf,
-            state,
-            from,
-            in_end,
-            params,
-            &statics,
-            bw,
-            is_last,
-            consume_all,
+            buf, state, from, in_end, params, &statics, bw, role, input_mode,
         ),
         Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
             buf,
@@ -483,10 +476,10 @@ pub(super) fn compress_resumable(
             &statics,
             bw,
             matches!(params.strategy, Strategy::Lazy2),
-            is_last,
-            consume_all,
+            role,
+            input_mode,
         ),
-        other => unreachable!("compress_resumable called for non-resumable strategy {other:?}"),
+        other => unreachable!("parse_resumable called for non-resumable strategy {other:?}"),
     }
 }
 

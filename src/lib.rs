@@ -26,7 +26,7 @@
 //!
 //! Every level and thread count produces a **standard single-member gzip**
 //! stream, decompressible by any tool:
-//! - **`threads = 1`**: [`compress::deflate::compress_gzip_padded`] (the T1
+//! - **`threads = 1`**: [`compress::deflate::encode_gzip_slack_padded_to_vec`] (the T1
 //!   entry point).
 //! - **`threads > 1`**: [`PipelinedGzEncoder`] (`compress_buffer_pure`) —
 //!   a pure parallel encoder whose output is byte-identical across thread

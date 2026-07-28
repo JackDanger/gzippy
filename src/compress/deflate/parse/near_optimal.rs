@@ -837,9 +837,9 @@ fn save_stats(
 
 #[cfg(test)]
 mod tests {
-    // near_optimal -> parse(super) -> deflate(super::super); compress_gzip /
-    // compress_oneshot live in deflate::mod.
-    use super::super::super::{compress_gzip, compress_oneshot};
+    // near_optimal -> parse(super) -> deflate(super::super); encode_gzip_bytes_to_vec /
+    // encode_deflate_bytes_to_vec live in deflate::mod.
+    use super::super::super::{encode_deflate_bytes_to_vec, encode_gzip_bytes_to_vec};
     use std::io::Read;
 
     fn decode(gz: &[u8]) -> Vec<u8> {
@@ -861,7 +861,7 @@ mod tests {
             }
         }
         for level in [10u32, 11, 12] {
-            let gz = compress_gzip(&data, level);
+            let gz = encode_gzip_bytes_to_vec(&data, level);
             assert_eq!(decode(&gz), data, "L{level} roundtrip");
         }
     }
@@ -874,8 +874,8 @@ mod tests {
         for _ in 0..8000 {
             data.extend_from_slice(phrase);
         }
-        let l9 = compress_oneshot(&data, 9).len();
-        let l12 = compress_oneshot(&data, 12).len();
+        let l9 = encode_deflate_bytes_to_vec(&data, 9).len();
+        let l12 = encode_deflate_bytes_to_vec(&data, 12).len();
         assert!(
             l12 <= l9,
             "L12 near-optimal ({l12}) worse than L9 lazy2 ({l9})"

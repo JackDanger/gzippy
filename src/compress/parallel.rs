@@ -654,7 +654,7 @@ pub fn split_rsyncable(data: &[u8]) -> Vec<&[u8]> {
 /// Each content-determined block becomes an independent standard gzip member.
 ///
 /// Increment 7: each block is compressed with the pure-Rust DEFLATE engine
-/// (`deflate::compress_gzip` — one self-contained gzip member per block), so
+/// (`deflate::encode_gzip_bytes_to_vec` — one self-contained gzip member per block), so
 /// `--rsyncable` carries ZERO C-FFI compressor. `header_info` no longer flows
 /// into per-block headers (each pure member uses the minimal gzip header); the
 /// content-defined boundaries from `split_rsyncable` are what rsync relies on.
@@ -687,7 +687,7 @@ pub fn compress_rsyncable<W: Write + Send>(
     if blocks.len() == 1 || num_threads <= 1 {
         let mut total = 0u64;
         for block in &blocks {
-            let output = deflate::compress_gzip(block, compression_level);
+            let output = deflate::encode_gzip_bytes_to_vec(block, compression_level);
             writer.write_all(&output)?;
             total += block.len() as u64;
         }
@@ -714,7 +714,7 @@ pub fn compress_rsyncable<W: Write + Send>(
                     break;
                 }
                 let mut output = outputs[idx].lock().unwrap();
-                *output = deflate::compress_gzip(blocks[idx], compression_level);
+                *output = deflate::encode_gzip_bytes_to_vec(blocks[idx], compression_level);
             });
         }
     });

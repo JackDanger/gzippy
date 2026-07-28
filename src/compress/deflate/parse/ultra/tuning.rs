@@ -8,7 +8,7 @@
 use super::{compress, ZopfliFormat, ZopfliOptions};
 use crate::cli::GzippyArgs;
 
-// Note: there's no `compress_gzip` wrapper here — `ZopfliGzEncoder` (in
+// Note: there's no `encode_gzip_bytes_to_vec` wrapper here — `ZopfliGzEncoder` (in
 // `encoder.rs`) writes its own gzip header/trailer and calls
 // `compress_deflate` for the payload. The `ZopfliFormat::Gzip` arm of the
 // dispatcher is exercised by the regression fixtures in `tests.rs` and the

@@ -12,7 +12,7 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
+    emit_block, BlockRole, InputMode, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
 };
 
 pub(super) fn run(
@@ -36,7 +36,19 @@ pub(super) fn run(
         mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
     }
     run_resumable(
-        buf, &mut state, data_start, in_end, params, statics, bw, is_last, true,
+        buf,
+        &mut state,
+        data_start,
+        in_end,
+        params,
+        statics,
+        bw,
+        if is_last {
+            BlockRole::Final
+        } else {
+            BlockRole::Interior
+        },
+        InputMode::Drain,
     );
 }
 
@@ -64,8 +76,8 @@ pub(super) fn run_resumable(
     params: &LevelParams,
     statics: &StaticCodes,
     bw: &mut BitWriter,
-    is_last: bool,
-    consume_all: bool,
+    role: BlockRole,
+    input_mode: InputMode,
 ) -> usize {
     let mut sink = Sink::new();
     // One dynamic-header scratch buffer for the WHOLE call, reused across
@@ -75,7 +87,7 @@ pub(super) fn run_resumable(
     let mut in_next = from;
 
     loop {
-        if !consume_all && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
+        if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
             return in_next;
         }
         // Start a new DEFLATE block.
@@ -113,7 +125,7 @@ pub(super) fn run_resumable(
             block_begin,
             &sink,
             statics,
-            is_last && in_next == in_end,
+            role.is_final() && in_next == in_end,
             &mut header_scratch,
         );
         if in_next == in_end {

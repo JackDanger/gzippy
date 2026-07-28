@@ -176,7 +176,7 @@ impl PipelinedGzEncoder {
             // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::new();
-            crate::compress::deflate::compress_block_streaming(
+            crate::compress::deflate::encode_deflate_segment_to_sink(
                 &[],
                 &[],
                 self.compression_level,
@@ -205,7 +205,7 @@ impl PipelinedGzEncoder {
             // parallel pipeline entirely and emits ONE single-shot stored
             // pass over the whole buffer, `num_threads`-independent — the
             // body is byte-identical to the T1 path's
-            // (`compress_gzip_padded`/`compress_block_streaming` share the
+            // (`encode_gzip_slack_padded_to_vec`/`encode_deflate_segment_to_sink` share the
             // same `deflate_into` level-0 branch), so T>1 can never exceed T1
             // in size at this level, and there is no thread/orchestration
             // overhead to pay for a workload that is memory-bandwidth-, not
@@ -214,7 +214,7 @@ impl PipelinedGzEncoder {
             // for the framing-size cost above).
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::with_capacity(data.len() + data.len() / 65535 + 16);
-            crate::compress::deflate::compress_block_streaming(data, &[], 0, true, &mut body);
+            crate::compress::deflate::encode_deflate_segment_to_sink(data, &[], 0, true, &mut body);
             writer.write_all(&body)?;
             let crc = crc32fast::hash(data);
             writer.write_all(&crc.to_le_bytes())?;
@@ -413,7 +413,7 @@ impl PipelinedGzEncoder {
     /// concatenated per-chunk DEFLATE + combined CRC/ISIZE), the same
     /// data-length-only block grid, the same dictionary-from-previous-chunk, the
     /// same in-order streaming writer and CRC-combine — EXCEPT each chunk is
-    /// compressed by [`deflate::compress_block_streaming`] instead of
+    /// compressed by [`deflate::encode_deflate_segment_to_sink`] instead of
     /// flate2/zlib-ng. Non-final chunks are closed with a sync-flush marker by
     /// that function so the concatenation is one valid DEFLATE stream.
     ///
@@ -452,7 +452,7 @@ impl PipelinedGzEncoder {
                 // Compress this chunk with the pure-Rust engine. A non-final
                 // chunk is closed with a sync-flush marker inside the callee.
                 output.clear();
-                deflate::compress_block_streaming(
+                deflate::encode_deflate_segment_to_sink(
                     block,
                     dict.unwrap_or(&[]),
                     level,

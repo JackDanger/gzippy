@@ -2,7 +2,7 @@
 //! reconciliation against a REAL compression run).
 //!
 //! This spawns the actual `gzippy` binary as a fresh subprocess rather than
-//! calling `compress_oneshot` in-process: `AnatomyCounters` (`src/compress/
+//! calling `encode_deflate_bytes_to_vec` in-process: `AnatomyCounters` (`src/compress/
 //! deflate/anatomy_counters.rs`) is one process-wide static, and `cargo test`
 //! runs every test in the crate's unit-test binary concurrently by default —
 //! an in-process test asserting an EXACT count against that shared global

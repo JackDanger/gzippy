@@ -102,7 +102,7 @@
 //!   parsed` (every input byte is covered by exactly one literal or exactly
 //!   one position of exactly one match — the LZ77 parse invariant).
 //! - **`alloc_events`/`alloc_bytes`** — the `Vec::with_capacity` sites in
-//!   `deflate/mod.rs` (`:56` `compress_oneshot`, `:123`/`:133` the two padded-
+//!   `deflate/mod.rs` (`:56` `encode_deflate_bytes_to_vec`, `:123`/`:133` the two padded-
 //!   working-buffer shapes, `:195`/`:218` the two gzip-wrapper output
 //!   buffers) and `huffman/header.rs:129` (combined code-length buffer).
 //!   **DEVIATION:** the spec's `deflate/mod.rs:273`/`:294` sites are inside
