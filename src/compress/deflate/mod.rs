@@ -227,7 +227,37 @@ fn deflate_into(
     // with a sync-flush marker so the next chunk's stream joins without stray
     // bits. Skipped when one continuous `BitWriter` spans every chunk.
     if !is_last && sync_flush {
-        emit_stored_block(bw, &[], false);
+        // SEAM PADDING (pigz `pigz.c:1836-1845`). The seam only has to leave the
+        // stream byte-aligned so the next chunk's blocks start cleanly. A stored
+        // empty block (Z_SYNC_FLUSH) costs ~5 bytes: 3 header bits, padding to a
+        // byte, then LEN=0000 NLEN=FFFF. pigz instead emits EMPTY STATIC blocks,
+        // 10 bits each (BFINAL=0, BTYPE=01, then the 7-bit static end-of-block
+        // code, which is all zeros), until the stream lands on a byte boundary.
+        //
+        // Three cases, and two of them beat the stored block outright:
+        //   * already aligned  -> emit NOTHING; the ~5 bytes were pure waste.
+        //   * even bit offset  -> 1-3 pads, i.e. 10-30 bits (<= 3.75 bytes).
+        //   * ODD bit offset   -> unreachable: each pad is 10 bits and 10k mod 8
+        //                        is always even, so no number of them can fix an
+        //                        odd offset. Fall back to the stored block, which
+        //                        is exactly what pigz does (`bits & 1` test).
+        //
+        // Strictly fewer bytes and strictly less work than the stored block --
+        // it writes bits instead of bytes and adds no new pass over data.
+        let off = bw.bit_offset_in_byte();
+        if off == 0 {
+            // Already aligned: no marker needed at all.
+        } else if off & 1 == 1 {
+            emit_stored_block(bw, &[], false);
+        } else {
+            while bw.bit_offset_in_byte() != 0 {
+                // BFINAL=0 (1 bit), BTYPE=01 static (2 bits), then the static
+                // end-of-block symbol: literal/length code 256, whose static
+                // Huffman code is 7 zero bits.
+                bw.add_bits(0b010, 3);
+                bw.add_bits(0, 7);
+            }
+        }
     }
 }
 
