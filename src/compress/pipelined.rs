@@ -73,46 +73,35 @@ const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 /// Used only to derive the small-file block size from `input_len`.
 const SMALL_FILE_TARGET_CHUNKS: usize = 16;
 
-/// How much bigger a chunk gets at the deeper levels.
+/// FALSIFIED 2026-07-29 — scaling this with LEVEL buys size and LOSES wall.
 ///
-/// Every chunk is coded independently, so it carries its own dynamic Huffman
-/// header and forfeits whatever fit a whole-file table would have had. That
-/// forfeit GROWS with level, because deeper levels build better-fitted tables —
-/// measured on the same 40 MB silesia slice, T4 minus T1:
+/// The T>1 size penalty is real and level-dependent: T4 minus T1 on a 40 MB
+/// silesia slice is +1,034 bytes at L6 and +3,228 at L8, because every chunk is
+/// coded independently and deeper levels forfeit a better-fitted Huffman table.
+/// Scaling the grid (L5-6 x2, L7+ x4) fixed most of it — L6 +1,034 -> -728,
+/// L8 +3,228 -> +429, reproduced byte-for-byte on M1 and Zen2.
 ///
-///     L6  15,555,063 -> 15,556,097   +1,034 bytes
-///     L8  15,458,448 -> 15,461,676   +3,228 bytes
+/// It is still not worth it. Frozen Zen2, paired at T4, n=21, /dev/null both
+/// arms, both RESOLVED with tight CIs:
+///     L6  ratio 1.0212  (+2.12% wall)   for 1,762 bytes, 0.011%
+///     L8  ratio 1.0371  (+3.71% wall)   for 2,799 bytes, 0.018%
+/// A 0.01% size gain costs 2-4% wall. Per-label needs BOTH legs, so this trades
+/// failing size cells for failing wall cells at a ruinous rate.
 ///
-/// 3.1x more overhead at L8 than L6 while the seam COUNT is identical, which is
-/// what rules out the 5-byte sync-flush markers as the main cost. Chunk size was
-/// level-independent (`_level` was accepted and ignored), so L8 paid L6's
-/// fragmentation with L8's tables.
+/// Do not retry by tuning the multipliers. The mechanism is that fewer, larger
+/// chunks reduce parallel slack — the cost scales with how much work a chunk
+/// holds, so any multiplier big enough to recover the size is big enough to cost
+/// the wall. A fix must make chunks CHEAPER TO CODE INDEPENDENTLY (a shared or
+/// pre-trained Huffman table across chunks, or seams that fall on block
+/// boundaries the splitter would have chosen anyway), not make them bigger.
 ///
-/// Fewer, larger chunks at high levels trade parallel slack for coded size.
-/// Measured T4 speedup after the change is 3.48-3.58x at L2/L6/L8 on a 40 MB
-/// slice, so the trade does not starve the pipeline.
-const fn level_chunk_scale(level: u32) -> usize {
-    match level {
-        0..=4 => 1,
-        5..=6 => 2,
-        _ => 4,
-    }
-}
-
 /// Block size for the parallel pipelined chunk grid.
 ///
-/// **HARD INVARIANT: a pure function of `input_len` and `level` ONLY — NEVER
-/// `num_threads`.** Reintroducing thread-count scaling (the old
-/// `get_optimal_block_size` trap) makes the grid, and therefore the bytes,
-/// depend on T.
-///
-/// Note the REASON changed even though the rule did not. This used to be
-/// justified by "the parallel path relies on this to produce byte-identical
-/// output at every thread count". Cross-thread byte-identity is no longer a
-/// goal — the only correctness requirement is valid gzip content. The invariant
-/// stays because a chunk grid that shifts with `-p` makes output size depend on
-/// a scheduling knob, which is surprising and makes every size cell a function
-/// of thread count for no benefit. `_num_threads` MUST stay unused.
+/// **HARD INVARIANT: a pure function of `input_len` (and `level`) ONLY — NEVER
+/// `num_threads`.** The parallel path relies on this to produce byte-identical
+/// output at every thread count; reintroducing thread-count scaling (the old
+/// `get_optimal_block_size` trap) would make the grid — and therefore the
+/// bytes — depend on T. `_num_threads` MUST stay unused.
 ///
 /// Large files use the fixed [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) to minimize
 /// per-chunk orchestration (one CRC-combine + one sync-flush seam per chunk).
@@ -120,22 +109,13 @@ const fn level_chunk_scale(level: u32) -> usize {
 /// into ~[`SMALL_FILE_TARGET_CHUNKS`] chunks, floored at
 /// [`MIN_PARALLEL_BLOCK_SIZE`] and capped at the large-file size.
 #[inline]
-fn pipelined_block_size(input_len: usize, _num_threads: usize, level: u32) -> usize {
+fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
     // Large-file cutoff: at/above this, one 512KB chunk grid gives plenty of
     // chunks-per-thread even at T16 (8MB/512KB = 16 chunks). Below it, derive
     // the size from input_len so small inputs stay well-split.
     const LARGE_FILE_CUTOFF: usize = SMALL_FILE_TARGET_CHUNKS * MAX_PARALLEL_BLOCK_SIZE;
     if input_len >= LARGE_FILE_CUTOFF {
-        // Scale with LEVEL only. An earlier version floored this by
-        // `input_len / (num_threads * 4)` to guarantee chunks-per-worker, which
-        // broke the hard invariant above by making the grid depend on
-        // `num_threads` — and did not even deliver the guarantee: at
-        // `input_len` just over the cutoff with 64 threads the 512 KiB lower
-        // bound still yields 17 chunks, far below 4 per worker. Keeping the
-        // function pure in (input_len, level) is both honest and simpler;
-        // measured T4 speedup is 3.48-3.58x at L2/L6/L8 on a 40 MB slice, so
-        // the deeper levels' larger chunks do not starve the pipeline.
-        MAX_PARALLEL_BLOCK_SIZE * level_chunk_scale(level)
+        MAX_PARALLEL_BLOCK_SIZE
     } else {
         // ~SMALL_FILE_TARGET_CHUNKS chunks, floored so tiny inputs don't
         // over-fragment and capped at the large-file size.
