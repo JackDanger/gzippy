@@ -225,19 +225,6 @@ impl BitWriter {
     /// whatever complete bytes are already safely flushable (`bitcount` here
     /// is always `<= 63`, so this is the ordinary safe path), then — exactly
     /// like [`finish`](Self::finish)'s trailing-byte handling — push the
-    /// Bits emitted so far, modulo 8 — i.e. how far past a byte boundary the
-    /// stream currently sits. 0 means already aligned.
-    ///
-    /// Used by the chunk-seam padding to decide whether pigz's 10-bit
-    /// empty-static-block trick can reach a byte boundary at all (it cannot from
-    /// an ODD offset: each pad is 10 bits, and 10k mod 8 is always even).
-    #[inline]
-    pub fn bit_offset_in_byte(&self) -> u32 {
-        // `out` only ever holds whole bytes, so the offset is the pending
-        // bit count alone.
-        self.bitcount & 7
-    }
-
     /// remaining `< 8` pending bits as one zero-padded byte directly.
     #[inline]
     pub fn align_to_byte(&mut self) {

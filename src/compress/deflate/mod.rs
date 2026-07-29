@@ -227,50 +227,29 @@ fn deflate_into(
     // with a sync-flush marker so the next chunk's stream joins without stray
     // bits. Skipped when one continuous `BitWriter` spans every chunk.
     if !is_last && sync_flush {
-        // SEAM PADDING (pigz `pigz.c:1836-1845`). The seam only has to leave the
-        // stream byte-aligned so the next chunk's blocks start cleanly. A stored
-        // empty block (Z_SYNC_FLUSH) costs ~5 bytes: 3 header bits, padding to a
-        // byte, then LEN=0000 NLEN=FFFF. pigz instead emits EMPTY STATIC blocks,
-        // 10 bits each (BFINAL=0, BTYPE=01, then the 7-bit static end-of-block
-        // code, which is all zeros), until the stream lands on a byte boundary.
+        // FALSIFIED 2026-07-29 — pigz's empty-STATIC-block seam pad (J3,
+        // pigz.c:1836-1845) is SMALLER but SLOWER, and not marginally.
         //
-        // Three cases, and two of them beat the stored block outright:
-        //   * already aligned  -> emit NOTHING; the ~5 bytes were pure waste.
-        //   * even bit offset  -> 1-3 pads, i.e. 10-30 bits (<= 3.75 bytes).
-        //   * ODD bit offset   -> unreachable: each pad is 10 bits and 10k mod 8
-        //                        is always even, so no number of them can fix an
-        //                        odd offset. Fall back to the stored block, which
-        //                        is exactly what pigz does (`bits & 1` test).
+        // A seam only has to leave the stream byte-aligned. This stored block
+        // costs ~5 bytes; pigz instead emits 10-bit empty static blocks until
+        // aligned (0 when already aligned, 1-3 otherwise; an ODD bit offset is
+        // unreachable since 10k mod 8 is always even, so pigz falls back to
+        // exactly this stored block). It does save bytes — silesia 40 MB, T4:
+        //     L2  -783 -> -896     L6 +1034 -> +924     L8 +3228 -> +3135
+        // reproduced byte-identically on M1 and Zen2.
         //
-        // Strictly fewer bytes and strictly less work than the stored block --
-        // it writes bits instead of bytes and adds no new pass over data.
-        let off = bw.bit_offset_in_byte();
-        if off == 0 {
-            // Already aligned: no marker needed at all.
-        } else if off & 1 == 1 {
-            emit_stored_block(bw, &[], false);
-        } else {
-            // Pad count in closed form, emitted as ONE write. Each pad is 10
-            // bits, so reaching alignment from an even offset `b` needs
-            // `k = 4 - b/2` pads (b=2 -> 3, b=4 -> 2, b=6 -> 1), never more
-            // than 3, i.e. at most 30 bits — well inside the bit buffer.
-            //
-            // FALSIFY: the obvious loop form
-            //     while bw.bit_offset_in_byte() != 0 { add_bits(0b010,3); add_bits(0,7) }
-            // is SLOWER on the frozen box despite writing the same bits: L6
-            // ratio 1.0123, L8 1.0052, both RESOLVED. Re-reading the bit offset
-            // and issuing two writes per pad costs more than the ~5 stored-block
-            // bytes it saves. Compute once, write once.
-            //
-            // One pad, LSB-first: BFINAL=0, BTYPE=01, then the 7-bit static
-            // end-of-block code (all zeros) = 0b0000000_010 = 2.
-            let k = 4 - (off / 2);
-            let mut v: u64 = 0;
-            for i in 0..k {
-                v |= 2u64 << (10 * i);
-            }
-            bw.add_bits(v, 10 * k);
-        }
+        // But frozen Zen2, paired at T4, n=21, RESOLVED both times:
+        //     loop form         L6 1.0123   L8 1.0052
+        //     closed-form write L6 1.0089   L8 1.0074
+        // 0.7-0.9% wall for ~110 bytes (0.0007%). That breaches the promotion
+        // rule's 0.5% erosion cap on its own. Rewriting the pad as a single
+        // computed write barely moved it and made L8 worse, which rules out
+        // loop overhead as the cause — the cost is emitting extra DEFLATE
+        // blocks per seam, not how the bits are written.
+        //
+        // Do not retry by micro-optimising the emit. Anything that adds blocks
+        // at a seam pays this. A seam fix has to REMOVE work, not relocate it.
+        emit_stored_block(bw, &[], false);
     }
 }
 
