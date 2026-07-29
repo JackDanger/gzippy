@@ -161,3 +161,42 @@ liked (Lazy/3/10, Lazy/4/10) both failed once graded on the canonical corpus.
 `reference_compression_corpus` says to use squishy and to avoid ad-hoc corpora
 precisely for this reason. Size legs are cheap and deterministic — grade them
 on all 20 files, always.
+
+## Byte-identity with libdeflate is a CAGE — delete anything that guides toward it
+
+**This is not a goal and never was one.** Reproducing a vendor's bytes only ever
+certifies that we reproduce their algorithm, which is exactly why we run their
+algorithm slower than they do.
+
+Measured, and this is the whole argument: our L2 and L4-L9 output is
+byte-SIZE-identical to libdeflate's on **all 20 canonical corpus files, ratio
+1.00000 everywhere**. Those cells therefore have **zero size slack**. We cannot
+be smaller at the same level, so every one of those cells has to be won on wall
+alone, against an implementation of the identical algorithm. That is the worst
+possible board position and we built it ourselves by copying their level table.
+
+Beating them considerably on speed and/or size may require a **different
+encoding** — a different parse, a different block-splitting policy, a different
+symbol budget, a different level->config map. All of that is permitted. What is
+NOT permitted is treating a divergence from libdeflate's bytes as a defect.
+
+**Keep** (these are ours, and they are real invariants):
+* T>1 output byte-identical to T1, or never larger — the P8 invariant.
+* Streaming output byte-identical to whole-buffer output at the same level.
+* libdeflate/gzip/pigz used as independent DECODERS in the roundtrip oracle.
+* libdeflate's size at level N used as a BAR to beat.
+
+**Delete / do not write** (these are the cage):
+* Any test or gate asserting our compressed bytes equal a vendor's.
+* Any design decision justified by "this keeps us byte-identical to libdeflate".
+* Any framing of a divergence from their output as a regression. A cell that was
+  "tied" because we emitted their exact bytes was never a win — it was a
+  guarantee we could not beat them.
+
+Audited 2026-07-28: no test asserts vendor byte-equality (the `libdeflater`
+uses in `src/tests/` are decoder-oracle and size-bar, both legitimate). The
+rationale in `parse/mod.rs::level_has_resumable_parser` was reframed to say
+"identical to our own whole-buffer output". Module docs describing a file as a
+"faithful transliteration" of a libdeflate header record where the code CAME
+FROM; they do not impose an obligation to stay identical, and any of them may be
+rewritten the moment a measurement says a different structure is better.

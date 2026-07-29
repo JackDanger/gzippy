@@ -514,9 +514,23 @@ pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLO
 /// Whether `level`'s strategy has a resumable runner, so the streaming encoder
 /// can carry one matchfinder across chunks and emit byte-identical output.
 ///
-/// Greedy / Lazy / Lazy2 cover levels 2 and 4-9 — which is exactly the set
-/// whose output is byte-identical to libdeflate's and whose ties the chunk
-/// seams broke. The rest keep the per-chunk path for now: level 0 is stored
+/// "Byte-identical" here means identical to OUR OWN whole-buffer output at the
+/// same level — the T>1 == T1 invariant. It does NOT mean identical to
+/// libdeflate's, and must never be read that way.
+///
+/// FALSIFY: matching libdeflate's bytes is a CAGE, not an asset. It only ever
+/// certifies that we reproduce their algorithm, which is precisely why we run
+/// their algorithm slower than they do. Measured: our L2 and L4-L9 output is
+/// byte-SIZE-identical to libdeflate's on all 20 canonical corpus files (ratio
+/// 1.00000 everywhere), so those cells have ZERO size slack to trade for wall —
+/// we cannot be smaller, and any speedup must come from implementation alone.
+/// Beating them may well require a DIFFERENT ENCODING. The correctness oracle
+/// is a roundtrip through our own decoder at every thread count plus independent
+/// decoders; that is total, and it frees the encoder to emit bytes no vendor
+/// would emit and still be correct.
+///
+/// Greedy / Lazy / Lazy2 cover levels 2 and 4-9. The rest keep the per-chunk
+/// path for now: level 0 is stored
 /// and already byte-identical by chunk alignment, level 1 (Fast) and levels
 /// 10-12 (NearOptimal) have their own runners, and level 3 (LazyGated) is
 /// excluded from streaming entirely because its content detector is
