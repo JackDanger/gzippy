@@ -309,13 +309,23 @@ pub(crate) fn plausible_trial_decode_offset(data: &[u8], bit_offset: usize) -> b
 
 /// Peek `n` bits starting at absolute bit offset `bit` in `data`
 /// (LSB-first within bytes). Returns `None` if the read would overrun
-/// `data`. `n` must be ≤ 16.
+/// `data`. `n` must be ≤ 17.
+///
+/// FALSIFY: the bound is 17, not 16. This read loads three bytes (24 bits) and
+/// discards at most 7 to reach the starting bit, so 17 bits are always
+/// available — and the dynamic-header check above genuinely asks for 17
+/// (1 + 5 + 5 + 4 header bits, plus the two BTYPE bits it skips past). The
+/// assert said 16, so every debug-assertions build aborted on any stream whose
+/// parallel block-finder examined a dynamic header — `gzippy -d` died with
+/// "assertion failed: n <= 16" on ordinary 4 MiB input that gzip, pigz and
+/// libdeflate all decoded. Release builds compile the assert out and were
+/// always correct, which is why the board never showed it.
 #[inline]
 fn peek_bits_at(data: &[u8], bit: usize, n: u8) -> Option<u32> {
-    debug_assert!(n <= 16);
+    debug_assert!(n <= 17);
     let byte_idx = bit / 8;
     let bit_in_byte = (bit % 8) as u32;
-    // Need to read up to 3 bytes to get 16+7 = 23 bits' worth.
+    // Need to read up to 3 bytes to get 17+7 = 24 bits' worth.
     if byte_idx + 2 >= data.len() {
         // Tail of stream — be conservative and bail.
         return None;
@@ -1058,6 +1068,24 @@ pub fn find_blocks_parallel(data: &[u8], num_threads: usize) -> Vec<BlockBoundar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `plausible_trial_decode_offset` asks `peek_bits_at` for 17 bits when it
+    /// inspects a dynamic-Huffman header, but the assert inside it read
+    /// `n <= 16`. Release builds drop `debug_assert!` and were always right, so
+    /// the only builds that broke were the ones with checks turned on — and
+    /// `cargo test --release` turns them off too, which is why nothing here
+    /// caught it. Cover the exact width the caller uses, at every bit phase, so
+    /// a debug-assertions run fails in this file instead of inside `gzippy -d`.
+    #[test]
+    fn peek_bits_at_supports_the_17_bits_its_caller_asks_for() {
+        // Three bytes are loaded, so bit phases 0..=7 all have 17 bits spare.
+        let data = [0xA5u8, 0x3C, 0xF0, 0x00];
+        for phase in 0..8usize {
+            let got = peek_bits_at(&data, phase, 17).expect("17 bits are in range");
+            let combined = (data[0] as u32) | ((data[1] as u32) << 8) | ((data[2] as u32) << 16);
+            assert_eq!(got, (combined >> phase) & ((1 << 17) - 1), "phase {phase}");
+        }
+    }
 
     #[test]
     fn plausible_trial_rejects_reserved_btype() {
