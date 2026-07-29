@@ -87,13 +87,46 @@ const SMALL_FILE_TARGET_CHUNKS: usize = 16;
 /// into ~[`SMALL_FILE_TARGET_CHUNKS`] chunks, floored at
 /// [`MIN_PARALLEL_BLOCK_SIZE`] and capped at the large-file size.
 #[inline]
-fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
+/// How much bigger a chunk gets at the deeper levels.
+///
+/// Every chunk is coded independently, so it carries its own dynamic Huffman
+/// header and forfeits whatever fit a whole-file table would have had. That
+/// forfeit GROWS with level, because deeper levels build better-fitted tables —
+/// measured on the same 40 MB silesia slice, T4 minus T1:
+///
+///     L6  15,555,063 -> 15,556,097   +1,034 bytes
+///     L8  15,458,448 -> 15,461,676   +3,228 bytes
+///
+/// 3.1x more overhead at L8 than L6 while the seam COUNT is identical, which is
+/// what rules out the 5-byte sync-flush markers as the main cost. Chunk size was
+/// level-independent (`_level` was accepted and ignored), so L8 paid L6's
+/// fragmentation with L8's tables.
+///
+/// Fewer, larger chunks at high levels trade parallel slack for coded size. The
+/// floor below keeps enough chunks per thread that the trade cannot starve the
+/// pipeline.
+const fn level_chunk_scale(level: u32) -> usize {
+    match level {
+        0..=4 => 1,
+        5..=6 => 2,
+        _ => 4,
+    }
+}
+
+/// Minimum chunks per thread to keep every worker fed while scaling chunk size.
+const MIN_CHUNKS_PER_THREAD: usize = 4;
+
+fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) -> usize {
     // Large-file cutoff: at/above this, one 512KB chunk grid gives plenty of
     // chunks-per-thread even at T16 (8MB/512KB = 16 chunks). Below it, derive
     // the size from input_len so small inputs stay well-split.
     const LARGE_FILE_CUTOFF: usize = SMALL_FILE_TARGET_CHUNKS * MAX_PARALLEL_BLOCK_SIZE;
     if input_len >= LARGE_FILE_CUTOFF {
-        MAX_PARALLEL_BLOCK_SIZE
+        // Scale up with level, but never past the size that would leave fewer
+        // than MIN_CHUNKS_PER_THREAD chunks for each worker.
+        let scaled = MAX_PARALLEL_BLOCK_SIZE * level_chunk_scale(level);
+        let keep_fed = input_len / (num_threads.max(1) * MIN_CHUNKS_PER_THREAD);
+        scaled.min(keep_fed.max(MAX_PARALLEL_BLOCK_SIZE))
     } else {
         // ~SMALL_FILE_TARGET_CHUNKS chunks, floored so tiny inputs don't
         // over-fragment and capped at the large-file size.
