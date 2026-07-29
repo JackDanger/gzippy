@@ -140,8 +140,8 @@ fn params_inner(level: u32) -> LevelParams {
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
-            strategy: Strategy::Greedy,
-            max_search_depth: 6,
+            strategy: Strategy::Lazy,
+            max_search_depth: 4,
             nice_match_length: 10,
             near_optimal: NONE_NO,
         },
