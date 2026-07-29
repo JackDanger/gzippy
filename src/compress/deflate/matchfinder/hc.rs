@@ -617,75 +617,62 @@ impl HcMatchfinder {
         let mut hash3 = next_hashes[0] as usize;
         let mut hash4 = next_hashes[1] as usize;
         let mut remaining = count;
-
-        // One insert step. `cur_pos < WINDOW_SIZE` is a precondition at every
-        // expansion below; nothing here re-tests it.
-        macro_rules! insert_one {
-            () => {
-                // SAFETY: `hash3 < HASH3_SIZE`, `hash4 < HASH4_SIZE` (lz_hash
-                // outputs), and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`
-                // (bounded by the run length at each call site).
-                unsafe {
-                    debug_assert!(
-                        hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE
-                    );
-                    *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
-                    *self.next_tab.get_unchecked_mut(cur_pos) =
-                        *self.hash4_tab.get_unchecked(hash4);
-                    *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
-                }
-
-                in_next += 1;
-                // SAFETY: the `count + 5 > in_end - in_next` guard proves
-                // `in_next + count + 5 <= in_end`; here `in_next <= start + count`,
-                // so `in_next + 4 <= in_end <= buf.len()`.
-                let next_hashseq = unsafe {
-                    debug_assert!(in_next + 4 <= blen);
-                    load_u32(base, in_next)
-                };
-                hash3 = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER) as usize;
-                hash4 = lz_hash(next_hashseq, HC_HASH4_ORDER) as usize;
-                cur_pos += 1;
-            };
-        }
-
-        // The window-wrap test used to sit INSIDE the per-position loop, where
-        // it cost 2 Ir on every position but could only fire once per
-        // WINDOW_SIZE (32768) of them — 12.5M Ir, 2.26% of the whole program, at
-        // L2 on 8 MB of silesia.
+        // FALSIFY — hoisting this wrap test out of the loop is a TRAP. It looks
+        // free: the test costs 2 Ir on every position but can only fire once per
+        // WINDOW_SIZE (32768) of them, which is 12.5M Ir, 2.26% of the whole
+        // program, at L2 on 8 MB of silesia. Two ways of removing it were built
+        // and measured on the shipped build shape (lto=fat, cgu=1); BOTH lost.
         //
-        // FALSIFY — the obvious hoist is NOT enough, and the numbers say why.
-        // Chunking into `while remaining > 0 { run = min(remaining, WINDOW_SIZE
-        // - cur_pos); ... }` won L2 (-13.53M Ir, -2.44%; wall -2.35% on frozen
-        // Zen2) but LOST L6 (+3.69M Ir, +0.40%; wall +1.03%) and L9 (wall
-        // +0.70%). Greedy skips in long runs so the outer loop amortises; lazy
-        // calls this with SHORT counts, where the outer loop and the `min` are
-        // pure per-call overhead. Measuring Ir at one level and generalising is
-        // what produced that regression.
+        //                        L2 Ir                 L6 Ir
+        //   this loop        555,127,066            916,724,493
+        //   chunked runs     541,600,498 (-2.44%)   920,416,350 (+0.40%)
+        //   one test/call    552,888,310 (-0.40%)   925,234,382 (+0.93%)
         //
-        // So: test ONCE per call whether the run can reach the wrap at all. The
-        // overwhelmingly common answer is no, and that path is a plain counted
-        // loop with no wrap test and no outer loop.
-        if cur_pos + remaining <= WINDOW_SIZE {
-            // No wrap is reachable: `cur_pos` ends at `cur_pos + remaining`,
-            // which is `<= WINDOW_SIZE`, so every write above is in range.
-            for _ in 0..remaining {
-                insert_one!();
+        // "chunked runs" = `while remaining > 0 { run = min(remaining,
+        // WINDOW_SIZE - cur_pos); ... }`. On frozen Zen2 it measured wall 0.9765
+        // at L2 (RESOLVED) but 1.0103 at L6 and 1.0070 at L9 — both RESOLVED
+        // SLOWER. "one test/call" hoists the test to a single per-call check
+        // with a macro'd body; it is worse than chunking at BOTH levels, because
+        // duplicating the body costs more than the branch it removes.
+        //
+        // Do not retry either without an explanation for the DEEP-level loss.
+        // Mine was "lazy skips in short runs so the outer loop cannot amortise"
+        // — and that is WRONG: lazy runs a larger nice_len (65 vs 10), so its
+        // skips are LONGER, and chunking should have helped L6 more, not less.
+        // The regression is real (Ir is deterministic) but unexplained; suspect
+        // inlining/layout, since this body inlines into both greedy's and lazy's
+        // run_block. Measure Ir at L2 AND a deep level before believing any fix:
+        // measuring only L2 and generalising is exactly what produced the
+        // regression above.
+        loop {
+            if cur_pos == WINDOW_SIZE {
+                self.slide_window();
+                *in_base += WINDOW_SIZE;
+                cur_pos = 0;
             }
-        } else {
-            while remaining > 0 {
-                if cur_pos == WINDOW_SIZE {
-                    self.slide_window();
-                    *in_base += WINDOW_SIZE;
-                    cur_pos = 0;
-                }
-                // `cur_pos < WINDOW_SIZE` here, so this run is non-empty and
-                // cannot walk `cur_pos` past the end of `next_tab`.
-                let run = remaining.min(WINDOW_SIZE - cur_pos);
-                for _ in 0..run {
-                    insert_one!();
-                }
-                remaining -= run;
+            // SAFETY: `hash3 < HASH3_SIZE`, `hash4 < HASH4_SIZE` (lz_hash outputs),
+            // and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()` (reset above).
+            unsafe {
+                debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
+                *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
+                *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab.get_unchecked(hash4);
+                *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
+            }
+
+            in_next += 1;
+            // SAFETY: the `count + 5 > in_end - in_next` guard proves
+            // `in_next + count + 5 <= in_end`; here `in_next <= start + count`, so
+            // `in_next + 4 <= in_end <= buf.len()`.
+            let next_hashseq = unsafe {
+                debug_assert!(in_next + 4 <= blen);
+                load_u32(base, in_next)
+            };
+            hash3 = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER) as usize;
+            hash4 = lz_hash(next_hashseq, HC_HASH4_ORDER) as usize;
+            cur_pos += 1;
+            remaining -= 1;
+            if remaining == 0 {
+                break;
             }
         }
         // Vendor `prefetchw` (hc_matchfinder.h:395-396): warm the buckets for the
