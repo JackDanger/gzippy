@@ -363,26 +363,44 @@ impl HcMatchfinder {
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
-                    // The chain node is read at the loop BOTTOM, where it is used.
+                    // FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
+                    // looks vestigial: the prefetch it was written to feed was
+                    // measured as a loss and deleted, so "it now keeps a value
+                    // live for nothing" is the obvious reading. It is WRONG. The
+                    // hoist independently hides the DEPENDENT-LOAD LATENCY of the
+                    // pointer chase — `next_tab[cur_node4 & MASK]` feeds the next
+                    // iteration's address, so reading it at the loop bottom
+                    // serialises load->use on the chain's critical path.
+                    // De-pipelining both walks, frozen Zen2, n=31, output
+                    // byte-identical, vs its exact parent:
+                    //     L1 1.0016 noisy   L2 1.0131   L6 1.0624   L9 1.0992
+                    // all RESOLVED SLOWER, and worse the deeper the chain — the
+                    // signature of exposed load latency. It went the wrong way
+                    // even though it REMOVED instructions (L2 Ir -1.77%, L6
+                    // -2.91%) and cut L2 reads (Dr -3.87%). Fewer instructions,
+                    // far more wall: instruction and read counts LOCATE, they do
+                    // not predict.
                     //
-                    // It used to be software-pipelined one step ahead (Increment 5b)
-                    // so the iteration could prefetch the FOLLOWING candidate's
-                    // match data while the current compare ran. That prefetch was
-                    // measured as a net LOSS and deleted (see the FALSIFIED note in
-                    // the loop below) — which left the hoist itself vestigial: it
-                    // kept an extra value live across the whole walk to serve a
-                    // prefetch that no longer exists.
-                    //
-                    // A line-level Dr diff against libdeflate says that live value
-                    // is not free. On identical position counts (1,726,082) our
-                    // algorithmic loads MATCH theirs exactly — `next_tab[cur_pos] =
-                    // hash4_tab[hash4]` is 6,273,912 reads in both, the hash-table
-                    // head reads are 1,726,082 in both — yet our matchfinder issues
-                    // 51.2M reads against their 34.2M. The excess is loop state we
-                    // read from memory that they keep in registers (`cutoff`,
-                    // `nice_len`, `next_hashes[1]` each cost us 1.7-2.5M reads and
-                    // cost them zero) plus 13.7M reads, 27% of ours, in unattributed
-                    // spill/reload code. This is register pressure, not algorithm.
+                    // Software-pipelined chain walk (Increment 5b). Hoist the NEXT
+                    // chain node one step ahead so this iteration can prefetch the
+                    // FOLLOWING candidate's match data — the second, reducible
+                    // dependent load, which sits off the chain's critical path —
+                    // while the current node's compare runs. `next_tab` is never
+                    // mutated during a walk, so reading a node early yields the
+                    // identical value the un-pipelined form read at the loop bottom;
+                    // the sequence of `cur_node4` visited, every cutoff/depth check,
+                    // and the resulting match are byte-identical (pinned by
+                    // `matches_equal_scalar_*`). The prefetch is a pure hint.
+                    // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
+                    let mut next_node = unsafe {
+                        *self
+                            .next_tab
+                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                    };
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.chain_reads += 1;
+                    }
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                         // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
@@ -418,8 +436,16 @@ impl HcMatchfinder {
                         {
                             local.miss += 1;
                         }
+                        cur_node4 = next_node;
+                        if (cur_node4 as i32) <= cutoff {
+                            break 'search;
+                        }
+                        depth_remaining -= 1;
+                        if depth_remaining == 0 {
+                            break 'search;
+                        }
                         // SAFETY: masked chain index `< next_tab.len()`.
-                        cur_node4 = unsafe {
+                        next_node = unsafe {
                             *self
                                 .next_tab
                                 .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
@@ -427,13 +453,6 @@ impl HcMatchfinder {
                         #[cfg(feature = "anatomy-counters")]
                         {
                             local.chain_reads += 1;
-                        }
-                        if (cur_node4 as i32) <= cutoff {
-                            break 'search;
-                        }
-                        depth_remaining -= 1;
-                        if depth_remaining == 0 {
-                            break 'search;
                         }
                     }
 
@@ -447,17 +466,9 @@ impl HcMatchfinder {
                     if best_len >= nice_len {
                         break 'search;
                     }
-                    // Advance to the next node.
-                    // SAFETY: masked chain index `< next_tab.len()`.
-                    cur_node4 = unsafe {
-                        *self
-                            .next_tab
-                            .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
-                    };
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.chain_reads += 1;
-                    }
+                    // Advance to the next node — already loaded by the pipeline
+                    // (`next_node == next_tab[cur_node4 & MASK]` holds at the break).
+                    cur_node4 = next_node;
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
@@ -471,10 +482,20 @@ impl HcMatchfinder {
                     }
                 }
 
-                // Length >= 5 loop. De-pipelined for the same reason as the
-                // length-4 walk above: the chain node is read at the bottom, where
-                // it is used, instead of being hoisted a step ahead to feed a
-                // prefetch that was measured as a loss and removed.
+                // Length >= 5 loop, software-pipelined identically to the length-4
+                // walk above. `cur_node4 > cutoff` and `depth_remaining > 0` hold
+                // here (both entry paths guarantee it); precompute the next chain
+                // node so the compare can overlap the following candidate's prefetch.
+                // SAFETY: masked chain index `< next_tab.len()`.
+                let mut next_node = unsafe {
+                    *self
+                        .next_tab
+                        .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
+                };
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.chain_reads += 1;
+                }
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -553,8 +574,16 @@ impl HcMatchfinder {
                         {
                             local.miss += 1;
                         }
+                        cur_node4 = next_node;
+                        if (cur_node4 as i32) <= cutoff {
+                            break 'search;
+                        }
+                        depth_remaining -= 1;
+                        if depth_remaining == 0 {
+                            break 'search;
+                        }
                         // SAFETY: masked chain index `< next_tab.len()`.
-                        cur_node4 = unsafe {
+                        next_node = unsafe {
                             *self
                                 .next_tab
                                 .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
@@ -562,13 +591,6 @@ impl HcMatchfinder {
                         #[cfg(feature = "anatomy-counters")]
                         {
                             local.chain_reads += 1;
-                        }
-                        if (cur_node4 as i32) <= cutoff {
-                            break 'search;
-                        }
-                        depth_remaining -= 1;
-                        if depth_remaining == 0 {
-                            break 'search;
                         }
                     }
 
@@ -589,9 +611,17 @@ impl HcMatchfinder {
                             local.too_short += 1;
                         }
                     }
-                    // Advance to the next node.
+                    // Advance to the next node — already loaded by the pipeline.
+                    cur_node4 = next_node;
+                    if (cur_node4 as i32) <= cutoff {
+                        break 'search;
+                    }
+                    depth_remaining -= 1;
+                    if depth_remaining == 0 {
+                        break 'search;
+                    }
                     // SAFETY: masked chain index `< next_tab.len()`.
-                    cur_node4 = unsafe {
+                    next_node = unsafe {
                         *self
                             .next_tab
                             .get_unchecked((cur_node4 as u16 & WINDOW_MASK) as usize)
@@ -599,13 +629,6 @@ impl HcMatchfinder {
                     #[cfg(feature = "anatomy-counters")]
                     {
                         local.chain_reads += 1;
-                    }
-                    if (cur_node4 as i32) <= cutoff {
-                        break 'search;
-                    }
-                    depth_remaining -= 1;
-                    if depth_remaining == 0 {
-                        break 'search;
                     }
                 }
             }
