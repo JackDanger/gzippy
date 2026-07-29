@@ -126,3 +126,38 @@ Before proposing a change, name the vendor difference it is stealing and the
 measurement that shows the difference is real. A change with no vendor counterpart
 is allowed, but then say so explicitly — it means there is no existing proof that
 the idea pays, and the bar is a measurement rather than a precedent.
+
+## FALSIFIED — retuning the L2 level map (2026-07-28)
+
+Our L2 is a copy of libdeflate's Greedy/6/10, and is byte-SIZE-IDENTICAL to
+their -2 on ALL 20 files of the canonical corpus (`/root/archive/corpora`,
+ratio 1.00000 everywhere). Since the per-label rule only requires size <=
+theirs, the obvious move is to find a cheaper config that still clears the
+bound. Lazy finds better matches per position, so it should reach the bound at
+lower depth.
+
+It does — and it is much MORE expensive, not less:
+
+    L2 = Greedy/6/10 (shipped)   555,130,339 Ir
+    L2 = Lazy/4/10               684,902,744 Ir   (+23.4%)
+
+Lazy runs TWO searches per position; the lower depth does not come close to
+paying for that. The route cannot help the wall.
+
+It also fails the size leg independently. Lazy/4/10 is smaller on 16 of 20
+files (data.sqlite -9.0%, data.json -2.9%, data.csv -1.8%) but LARGER on four:
+access.log +0.49%, ecoli.fastq +0.61%, nasa-http +0.28%, aozora.txt +0.22% —
+token-structured, highly repetitive text, where deferring a match costs.
+Per-label means every file, so 16 wins do not buy the four losses.
+
+FALSIFY: do not re-open "retune the L2 knobs for wall" without first measuring
+the instruction cost of the candidate STRATEGY. Depth is not the cost; the
+strategy is. Measured Ir before a size sweep would have killed this in one run
+instead of several.
+
+A METHOD DEFECT this exposed, worth more than the result: the first pass of
+this sweep was graded on four ad-hoc local files, and the two candidates it
+liked (Lazy/3/10, Lazy/4/10) both failed once graded on the canonical corpus.
+`reference_compression_corpus` says to use squishy and to avoid ad-hoc corpora
+precisely for this reason. Size legs are cheap and deterministic — grade them
+on all 20 files, always.
