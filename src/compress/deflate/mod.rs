@@ -250,13 +250,26 @@ fn deflate_into(
         } else if off & 1 == 1 {
             emit_stored_block(bw, &[], false);
         } else {
-            while bw.bit_offset_in_byte() != 0 {
-                // BFINAL=0 (1 bit), BTYPE=01 static (2 bits), then the static
-                // end-of-block symbol: literal/length code 256, whose static
-                // Huffman code is 7 zero bits.
-                bw.add_bits(0b010, 3);
-                bw.add_bits(0, 7);
+            // Pad count in closed form, emitted as ONE write. Each pad is 10
+            // bits, so reaching alignment from an even offset `b` needs
+            // `k = 4 - b/2` pads (b=2 -> 3, b=4 -> 2, b=6 -> 1), never more
+            // than 3, i.e. at most 30 bits — well inside the bit buffer.
+            //
+            // FALSIFY: the obvious loop form
+            //     while bw.bit_offset_in_byte() != 0 { add_bits(0b010,3); add_bits(0,7) }
+            // is SLOWER on the frozen box despite writing the same bits: L6
+            // ratio 1.0123, L8 1.0052, both RESOLVED. Re-reading the bit offset
+            // and issuing two writes per pad costs more than the ~5 stored-block
+            // bytes it saves. Compute once, write once.
+            //
+            // One pad, LSB-first: BFINAL=0, BTYPE=01, then the 7-bit static
+            // end-of-block code (all zeros) = 0b0000000_010 = 2.
+            let k = 4 - (off / 2);
+            let mut v: u64 = 0;
+            for i in 0..k {
+                v |= 2u64 << (10 * i);
             }
+            bw.add_bits(v, 10 * k);
         }
     }
 }
