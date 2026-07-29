@@ -99,8 +99,13 @@ const SEQ_STORE_LENGTH: usize = 50_000;
 /// shape of fragile cross-module invariant that made the 50,000 sizing wrong.
 ///
 /// The surplus is address space no parser touches — pages are faulted in only
-/// as sequences are written (L6 on silesia touches ~42,000 of them), so the
-/// headroom costs no resident memory.
+/// as sequences are written (L6 on silesia touches ~42,000 of them). MEASURED,
+/// not assumed: peak RSS on frozen Zen2/Linux is identical either way (11.0 MB
+/// at L2/L4/L6/L9, 57.5 MB at L1); on macOS/aarch64 it rises about 1.4 MB
+/// (10.5 -> 11.9 MB at L6), so the headroom is not free on every allocator.
+/// If the RSS front (we hold far more than gzip's flat 2.0 MB) ever needs this
+/// back, the fix is a per-strategy capacity — NOT a return to a single cap that
+/// only two of the four parsers enforce.
 const SEQ_STORE_CAPACITY: usize = {
     let widest_block = if fast::FAST0_BLOCK_LENGTH > SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH {
         fast::FAST0_BLOCK_LENGTH
