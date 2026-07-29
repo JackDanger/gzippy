@@ -617,30 +617,14 @@ impl HcMatchfinder {
         let mut hash3 = next_hashes[0] as usize;
         let mut hash4 = next_hashes[1] as usize;
         let mut remaining = count;
-        // The window-wrap test is HOISTED out of the per-position loop: it can
-        // only fire once per WINDOW_SIZE (32768) positions, but as a loop-body
-        // branch it cost 2 Ir on every one of them — 12.5M Ir, 2.26% of the
-        // whole program, at L2 on 8 MB of silesia. Run instead in runs bounded
-        // by the distance to the wrap, so the inner loop is a counted loop with
-        // no wrap test at all.
-        //
-        // FALSIFY: do not "simplify" this back into a single loop with the
-        // check inside. `cur_pos` is bounded by construction here, not by that
-        // branch — the run length is exactly `WINDOW_SIZE - cur_pos`, so the
-        // `get_unchecked_mut(cur_pos)` below stays in range without it.
-        while remaining > 0 {
-            if cur_pos == WINDOW_SIZE {
-                self.slide_window();
-                *in_base += WINDOW_SIZE;
-                cur_pos = 0;
-            }
-            // `cur_pos < WINDOW_SIZE` here, so this run is non-empty and cannot
-            // walk `cur_pos` past the end of `next_tab`.
-            let run = remaining.min(WINDOW_SIZE - cur_pos);
-            for _ in 0..run {
+
+        // One insert step. `cur_pos < WINDOW_SIZE` is a precondition at every
+        // expansion below; nothing here re-tests it.
+        macro_rules! insert_one {
+            () => {
                 // SAFETY: `hash3 < HASH3_SIZE`, `hash4 < HASH4_SIZE` (lz_hash
                 // outputs), and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`
-                // (the run length above bounds it).
+                // (bounded by the run length at each call site).
                 unsafe {
                     debug_assert!(
                         hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE
@@ -653,8 +637,8 @@ impl HcMatchfinder {
 
                 in_next += 1;
                 // SAFETY: the `count + 5 > in_end - in_next` guard proves
-                // `in_next + count + 5 <= in_end`; here `in_next <= start + count`, so
-                // `in_next + 4 <= in_end <= buf.len()`.
+                // `in_next + count + 5 <= in_end`; here `in_next <= start + count`,
+                // so `in_next + 4 <= in_end <= buf.len()`.
                 let next_hashseq = unsafe {
                     debug_assert!(in_next + 4 <= blen);
                     load_u32(base, in_next)
@@ -662,8 +646,47 @@ impl HcMatchfinder {
                 hash3 = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER) as usize;
                 hash4 = lz_hash(next_hashseq, HC_HASH4_ORDER) as usize;
                 cur_pos += 1;
+            };
+        }
+
+        // The window-wrap test used to sit INSIDE the per-position loop, where
+        // it cost 2 Ir on every position but could only fire once per
+        // WINDOW_SIZE (32768) of them — 12.5M Ir, 2.26% of the whole program, at
+        // L2 on 8 MB of silesia.
+        //
+        // FALSIFY — the obvious hoist is NOT enough, and the numbers say why.
+        // Chunking into `while remaining > 0 { run = min(remaining, WINDOW_SIZE
+        // - cur_pos); ... }` won L2 (-13.53M Ir, -2.44%; wall -2.35% on frozen
+        // Zen2) but LOST L6 (+3.69M Ir, +0.40%; wall +1.03%) and L9 (wall
+        // +0.70%). Greedy skips in long runs so the outer loop amortises; lazy
+        // calls this with SHORT counts, where the outer loop and the `min` are
+        // pure per-call overhead. Measuring Ir at one level and generalising is
+        // what produced that regression.
+        //
+        // So: test ONCE per call whether the run can reach the wrap at all. The
+        // overwhelmingly common answer is no, and that path is a plain counted
+        // loop with no wrap test and no outer loop.
+        if cur_pos + remaining <= WINDOW_SIZE {
+            // No wrap is reachable: `cur_pos` ends at `cur_pos + remaining`,
+            // which is `<= WINDOW_SIZE`, so every write above is in range.
+            for _ in 0..remaining {
+                insert_one!();
             }
-            remaining -= run;
+        } else {
+            while remaining > 0 {
+                if cur_pos == WINDOW_SIZE {
+                    self.slide_window();
+                    *in_base += WINDOW_SIZE;
+                    cur_pos = 0;
+                }
+                // `cur_pos < WINDOW_SIZE` here, so this run is non-empty and
+                // cannot walk `cur_pos` past the end of `next_tab`.
+                let run = remaining.min(WINDOW_SIZE - cur_pos);
+                for _ in 0..run {
+                    insert_one!();
+                }
+                remaining -= run;
+            }
         }
         // Vendor `prefetchw` (hc_matchfinder.h:395-396): warm the buckets for the
         // final position in an exclusive state. Pure hint; no effect on state.
