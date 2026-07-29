@@ -64,7 +64,51 @@ pub(super) const BUF_PAD: usize = 16;
 /// `SOFT_MAX_BLOCK_LENGTH` — soft cap on the bytes covered by one block.
 const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
 /// `SEQ_STORE_LENGTH` — cap on the number of match "sequences" per block.
+///
+/// This is a POLICY cap, enforced by [`continue_block`], and only the greedy and
+/// lazy parsers consult it. It is NOT the size of the backing store; see
+/// [`SEQ_STORE_CAPACITY`].
 const SEQ_STORE_LENGTH: usize = 50_000;
+
+/// Allocated length of [`Sink::seqs`] — the worst-case number of sequences any
+/// parser can put in one block.
+///
+/// FALSIFY: do NOT size this at `SEQ_STORE_LENGTH`. Only greedy and lazy end a
+/// block on the sequence cap; `fast` and `near_optimal` never call
+/// [`continue_block`] and are bounded only by their block span. Because
+/// `push_seq` writes through reserved capacity with no growth check, sizing the
+/// store at 50,000 is a heap overflow waiting for a long block —
+/// `silesia.tar -10` already reaches 43,100 sequences (86% of it), and nothing
+/// in `near_optimal` would have stopped the next 16%.
+///
+/// The real bound is the widest block ANY parser can emit, over-approximated so
+/// it holds without depending on another module's behaviour:
+///   * greedy / lazy / near_optimal end a block at [`choose_max_block_end`],
+///     which returns `in_end` whenever the input remaining is under
+///     `SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH` — so at most that sum;
+///   * `fast` ends a block at its caller-chosen span, the larger of which is
+///     `FAST0_BLOCK_LENGTH` (1 MiB, used by L0);
+/// plus, in every case, one final match that may straddle the limit. Every
+/// sequence consumes at least `DEFLATE_MIN_MATCH_LEN` input bytes of match, so
+/// sequences per block cannot exceed that span divided by 3.
+///
+/// L0 in fact emits ZERO sequences today (it does no matching — see P7 in
+/// `docs/level-behaviour-hypothesis.md`; measured 0 on silesia, text and a
+/// short-match-dense 4 MiB input). Deliberately NOT relied upon: a bound that
+/// holds only while a different module declines to emit matches is the same
+/// shape of fragile cross-module invariant that made the 50,000 sizing wrong.
+///
+/// The surplus is address space no parser touches — pages are faulted in only
+/// as sequences are written (L6 on silesia touches ~42,000 of them), so the
+/// headroom costs no resident memory.
+const SEQ_STORE_CAPACITY: usize = {
+    let widest_block = if fast::FAST0_BLOCK_LENGTH > SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH {
+        fast::FAST0_BLOCK_LENGTH
+    } else {
+        SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH
+    };
+    (widest_block + DEFLATE_MAX_MATCH_LEN as usize) / DEFLATE_MIN_MATCH_LEN as usize + 1
+};
 
 /// Number of DEFLATE literal symbols (0..=255).
 const NUM_LITERALS: usize = 256;
@@ -80,7 +124,7 @@ const NUM_LITERALS: usize = 256;
 /// precomputed at push time (the parser already computes it for the frequency
 /// bump), eliminating the emit-side `offset_slot()` recompute (~8.9M Ir on
 /// `text` L1).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Seq {
     /// Number of literals preceding this match.
     litrunlen: u32,
@@ -124,6 +168,13 @@ impl StaticCodes {
 /// input buffer (as libdeflate's `deflate_flush_block` does), so a literal push
 /// is just a frequency bump + run-counter increment.
 struct Sink {
+    /// Backing store for `nseqs` sequences. Capacity is fixed at
+    /// `SEQ_STORE_LENGTH` and `len()` is deliberately left at 0 — elements are
+    /// written through the spare capacity, so the buffer is ALLOCATED but never
+    /// initialised. A `vec![Seq::default(); SEQ_STORE_LENGTH]` zeroes 400 KiB on
+    /// every `Sink::new()`, which measurably cost the deep levels (L5/L9
+    /// regressed up to 3.3% while L2/L4 improved) — that memory competes with
+    /// the 32 KiB window and the hash tables for cache.
     seqs: Vec<Seq>,
     /// Literals accumulated since the last match (the pending litrun; becomes
     /// the next `Seq::litrunlen`, or the block's trailing literals at flush).
@@ -133,23 +184,33 @@ struct Sink {
     /// Input bytes covered by the current block so far.
     block_length: usize,
     stats: BlockSplitStats,
+    /// Sequences written so far. Paired with the preallocated `seqs` store:
+    /// this replaces `Vec::len`, which `continue_block` had to LOAD on every
+    /// token where libdeflate compares a pointer already in a register.
+    nseqs: usize,
 }
 
 impl Sink {
     fn new() -> Self {
         Sink {
-            seqs: Vec::new(),
+            // Capacity for the worst-case block ANY parser can produce, never
+            // grown and never initialised. `Vec::push` cost a capacity check on
+            // EVERY match — 22.6M Ir of alloc/vec/mod.rs inlined into the L2 hot
+            // loop — against libdeflate's `seq->offset = ...; seq++` into a
+            // fixed array. The bound is not a hope; see `SEQ_STORE_CAPACITY`.
+            seqs: Vec::with_capacity(SEQ_STORE_CAPACITY),
             litrun: 0,
             litlen_freqs: [0; DEFLATE_NUM_LITLEN_SYMS],
             offset_freqs: [0; DEFLATE_NUM_OFFSET_SYMS],
             block_length: 0,
             stats: BlockSplitStats::new(),
+            nseqs: 0,
         }
     }
 
     /// `deflate_begin_sequences` + `init_block_split_stats`.
     fn begin(&mut self) {
-        self.seqs.clear();
+        self.nseqs = 0;
         self.litrun = 0;
         self.litlen_freqs = [0; DEFLATE_NUM_LITLEN_SYMS];
         self.offset_freqs = [0; DEFLATE_NUM_OFFSET_SYMS];
@@ -208,11 +269,29 @@ impl Sink {
     /// Push the pending literal run + this match as one [`Seq`].
     #[inline]
     fn push_seq(&mut self, length: u32, offset: u32, os: usize) {
-        self.seqs.push(Seq {
-            litrunlen: self.litrun,
-            offset: offset as u16,
-            length_and_slot: (length as u16) | ((os as u16) << SEQ_SLOT_SHIFT),
-        });
+        // SAFETY: `nseqs < SEQ_STORE_CAPACITY` on entry, for EVERY parser, and
+        // `begin()` resets `nseqs` to 0 for each block:
+        //   * greedy/lazy check `continue_block` after each push and stop at
+        //     `SEQ_STORE_LENGTH`, well below capacity;
+        //   * `fast` bounds its block at `FAST_BLOCK_LENGTH` (65536) bytes;
+        //   * `near_optimal` bounds its block at `choose_max_block_end`.
+        // In all three the block span is within `SEQ_STORE_CAPACITY * 3` bytes
+        // and each sequence eats at least 3 of them. The capacity test
+        // `Vec::push` performed here was therefore provably dead.
+        debug_assert!(self.nseqs < SEQ_STORE_CAPACITY);
+        debug_assert!(self.seqs.capacity() >= SEQ_STORE_CAPACITY);
+        // SAFETY: writing into reserved-but-uninitialised capacity. `nseqs` is
+        // below `SEQ_STORE_LENGTH` (see above) and capacity is at least that,
+        // so the slot is inside the allocation. `Seq` is `Copy` with no `Drop`,
+        // so overwriting a never-initialised slot is sound and leaks nothing.
+        unsafe {
+            self.seqs.as_mut_ptr().add(self.nseqs).write(Seq {
+                litrunlen: self.litrun,
+                offset: offset as u16,
+                length_and_slot: (length as u16) | ((os as u16) << SEQ_SLOT_SHIFT),
+            });
+        }
+        self.nseqs += 1;
         self.litrun = 0;
     }
 
@@ -515,7 +594,7 @@ fn continue_block(
     in_end: usize,
 ) -> bool {
     in_next < in_max_block_end
-        && sink.seqs.len() < SEQ_STORE_LENGTH
+        && sink.nseqs < SEQ_STORE_LENGTH
         && !sink
             .stats
             .should_end_block(in_next - block_begin, in_end - in_next)
@@ -1408,7 +1487,10 @@ fn emit_sequences(
     // `p` walks the input: each Seq's literals are exactly the input bytes
     // between the previous match's end and this match's start.
     let mut p = block_start;
-    for seq in &sink.seqs {
+    // SAFETY: `push_seq` has initialised exactly `nseqs` slots in the reserved
+    // capacity; `Vec::len` is deliberately 0, so the slice is built by hand.
+    let written = unsafe { std::slice::from_raw_parts(sink.seqs.as_ptr(), sink.nseqs) };
+    for seq in written {
         // SAFETY: every Seq was pushed with its literals + match inside the
         // block, so [p, p + litrunlen + length) stays within
         // `block_start + sink.block_length <= buf.len()`; reserve() above
@@ -1455,6 +1537,55 @@ fn emit_sequences(
 fn stored_block_bits(len: usize) -> u64 {
     let subblocks = (len / 65535) + 1;
     (8 * (len + 5 * subblocks)) as u64
+}
+
+#[cfg(test)]
+mod seq_store_bound_tests {
+    use super::*;
+
+    /// `push_seq` writes through reserved capacity with NO growth check, so
+    /// `SEQ_STORE_CAPACITY` is a memory-safety bound, not a tuning constant.
+    /// Pin the two facts it rests on: every block span a parser can choose is
+    /// covered, and every sequence eats at least `DEFLATE_MIN_MATCH_LEN` bytes.
+    /// Raising a block length without raising the store is a heap overflow, and
+    /// the failure would be silent in release — so it fails here instead.
+    #[test]
+    fn capacity_covers_every_parser_block_span() {
+        for (name, span) in [
+            (
+                "greedy/lazy/near_optimal",
+                SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH,
+            ),
+            ("fast L1", fast::FAST_BLOCK_LENGTH),
+            ("fast L0", fast::FAST0_BLOCK_LENGTH),
+        ] {
+            // Worst case: the block runs its full span, one final match
+            // straddles the limit, and every match is the 3-byte minimum.
+            let worst =
+                (span + DEFLATE_MAX_MATCH_LEN as usize).div_ceil(DEFLATE_MIN_MATCH_LEN as usize);
+            assert!(
+                worst <= SEQ_STORE_CAPACITY,
+                "{name}: a {span}-byte block can hold {worst} sequences, \
+                 above SEQ_STORE_CAPACITY {SEQ_STORE_CAPACITY}",
+            );
+        }
+    }
+
+    /// The policy cap greedy and lazy stop at must sit inside the allocation.
+    /// Both are consts, so this holds at compile time.
+    const _: () = assert!(SEQ_STORE_LENGTH <= SEQ_STORE_CAPACITY);
+
+    /// `Sink::new` must reserve the full bound up front — `push_seq` never grows.
+    #[test]
+    fn sink_reserves_the_full_bound() {
+        let sink = Sink::new();
+        assert!(sink.seqs.capacity() >= SEQ_STORE_CAPACITY);
+        assert_eq!(
+            sink.seqs.len(),
+            0,
+            "len stays 0; slots are written via spare capacity"
+        );
+    }
 }
 
 #[cfg(test)]
