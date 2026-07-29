@@ -617,36 +617,53 @@ impl HcMatchfinder {
         let mut hash3 = next_hashes[0] as usize;
         let mut hash4 = next_hashes[1] as usize;
         let mut remaining = count;
-        loop {
+        // The window-wrap test is HOISTED out of the per-position loop: it can
+        // only fire once per WINDOW_SIZE (32768) positions, but as a loop-body
+        // branch it cost 2 Ir on every one of them — 12.5M Ir, 2.26% of the
+        // whole program, at L2 on 8 MB of silesia. Run instead in runs bounded
+        // by the distance to the wrap, so the inner loop is a counted loop with
+        // no wrap test at all.
+        //
+        // FALSIFY: do not "simplify" this back into a single loop with the
+        // check inside. `cur_pos` is bounded by construction here, not by that
+        // branch — the run length is exactly `WINDOW_SIZE - cur_pos`, so the
+        // `get_unchecked_mut(cur_pos)` below stays in range without it.
+        while remaining > 0 {
             if cur_pos == WINDOW_SIZE {
                 self.slide_window();
                 *in_base += WINDOW_SIZE;
                 cur_pos = 0;
             }
-            // SAFETY: `hash3 < HASH3_SIZE`, `hash4 < HASH4_SIZE` (lz_hash outputs),
-            // and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()` (reset above).
-            unsafe {
-                debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
-                *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
-                *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab.get_unchecked(hash4);
-                *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
-            }
+            // `cur_pos < WINDOW_SIZE` here, so this run is non-empty and cannot
+            // walk `cur_pos` past the end of `next_tab`.
+            let run = remaining.min(WINDOW_SIZE - cur_pos);
+            for _ in 0..run {
+                // SAFETY: `hash3 < HASH3_SIZE`, `hash4 < HASH4_SIZE` (lz_hash
+                // outputs), and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()`
+                // (the run length above bounds it).
+                unsafe {
+                    debug_assert!(
+                        hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE
+                    );
+                    *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
+                    *self.next_tab.get_unchecked_mut(cur_pos) =
+                        *self.hash4_tab.get_unchecked(hash4);
+                    *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
+                }
 
-            in_next += 1;
-            // SAFETY: the `count + 5 > in_end - in_next` guard proves
-            // `in_next + count + 5 <= in_end`; here `in_next <= start + count`, so
-            // `in_next + 4 <= in_end <= buf.len()`.
-            let next_hashseq = unsafe {
-                debug_assert!(in_next + 4 <= blen);
-                load_u32(base, in_next)
-            };
-            hash3 = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER) as usize;
-            hash4 = lz_hash(next_hashseq, HC_HASH4_ORDER) as usize;
-            cur_pos += 1;
-            remaining -= 1;
-            if remaining == 0 {
-                break;
+                in_next += 1;
+                // SAFETY: the `count + 5 > in_end - in_next` guard proves
+                // `in_next + count + 5 <= in_end`; here `in_next <= start + count`, so
+                // `in_next + 4 <= in_end <= buf.len()`.
+                let next_hashseq = unsafe {
+                    debug_assert!(in_next + 4 <= blen);
+                    load_u32(base, in_next)
+                };
+                hash3 = lz_hash(next_hashseq & 0xFF_FFFF, HC_HASH3_ORDER) as usize;
+                hash4 = lz_hash(next_hashseq, HC_HASH4_ORDER) as usize;
+                cur_pos += 1;
             }
+            remaining -= run;
         }
         // Vendor `prefetchw` (hc_matchfinder.h:395-396): warm the buckets for the
         // final position in an exclusive state. Pure hint; no effect on state.
