@@ -4,7 +4,7 @@
 //!
 //! A wrong match length or distance corrupts the DEFLATE stream in ways the
 //! Huffman-only Increment-1 net could never produce. The contract: for EVERY
-//! implemented level (2..=9), the gzip-framed output of `compress_gzip` decodes
+//! implemented level (2..=9), the gzip-framed output of `encode_gzip_bytes_to_vec` decodes
 //! BACK to the exact input through THREE independent decoders — flate2/zlib-ng,
 //! libdeflate (FFI), and the system `gzip -d` — across an adversarial corpus
 //! that exercises long matches, the full 32 KiB window, and distance codes,
@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::compress::deflate::{compress_gzip, compress_oneshot};
+    use crate::compress::deflate::{encode_deflate_bytes_to_vec, encode_gzip_bytes_to_vec};
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -77,7 +77,7 @@ mod tests {
         static AVAIL: OnceLock<bool> = OnceLock::new();
         *AVAIL.get_or_init(|| {
             // Round-trip a known stream through our encoder and system gzip.
-            let gz = compress_gzip(b"gzip availability probe", 6);
+            let gz = encode_gzip_bytes_to_vec(b"gzip availability probe", 6);
             decode_system_gzip(&gz)
                 .map(|d| d == b"gzip availability probe")
                 .unwrap_or(false)
@@ -87,7 +87,7 @@ mod tests {
     /// Assert every available oracle recovers `input` byte-exact at `level`.
     /// Returns the number of oracles that actually decoded + compared.
     fn assert_roundtrips_level(input: &[u8], label: &str, level: u32) -> u32 {
-        let gz = compress_gzip(input, level);
+        let gz = encode_gzip_bytes_to_vec(input, level);
         let mut oracles = 0u32;
 
         let f = decode_flate2(&gz);
@@ -165,7 +165,7 @@ mod tests {
     fn oracles_present() {
         // flate2 + libdeflate are compiled-in; verify they actually decode our
         // stream, and report gzip availability loudly.
-        let gz = compress_gzip(b"the quick brown fox", 6);
+        let gz = encode_gzip_bytes_to_vec(b"the quick brown fox", 6);
         assert_eq!(decode_flate2(&gz), b"the quick brown fox");
         assert_eq!(decode_libdeflate(&gz, 19), b"the quick brown fox");
         if gzip_available() {
@@ -283,7 +283,7 @@ mod tests {
             return;
         };
         for &level in &[2u32, 6, 9] {
-            let ours = compress_oneshot(&data, level).len();
+            let ours = encode_deflate_bytes_to_vec(&data, level).len();
 
             let mut enc =
                 flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
@@ -351,7 +351,7 @@ mod tests {
 
         #[test]
         fn prop_roundtrip_flate2(input in adversarial_bytes(), level in 2u32..=9u32) {
-            let gz = compress_gzip(&input, level);
+            let gz = encode_gzip_bytes_to_vec(&input, level);
             let decoded = decode_flate2(&gz);
             prop_assert_eq!(decoded, input);
         }
@@ -430,7 +430,7 @@ mod tests {
             eprintln!("note: silesia.tar missing; skipped ratio-ceiling assertion");
             return;
         };
-        let ours_l12 = compress_oneshot(&data, 12).len();
+        let ours_l12 = encode_deflate_bytes_to_vec(&data, 12).len();
         let libdeflate_l9 = libdeflate_deflate_size(&data, 9);
         let libdeflate_l12 = libdeflate_deflate_size(&data, 12);
 
@@ -462,7 +462,7 @@ mod tests {
         /// cases than the L2-9 proptest because the DP is heavier.
         #[test]
         fn prop_near_optimal_roundtrip_flate2(input in adversarial_bytes(), level in 10u32..=12u32) {
-            let gz = compress_gzip(&input, level);
+            let gz = encode_gzip_bytes_to_vec(&input, level);
             let decoded = decode_flate2(&gz);
             prop_assert_eq!(decoded, input);
         }
@@ -988,7 +988,7 @@ mod tests {
         for (label, data) in &corpora {
             // Rough in-process compress time (non-gated sanity that it's fast).
             let t0 = std::time::Instant::now();
-            let ours = compress_gzip(data, 1).len();
+            let ours = encode_gzip_bytes_to_vec(data, 1).len();
             let ours_ms = t0.elapsed().as_secs_f64() * 1e3;
 
             let tl = std::time::Instant::now();
@@ -1087,7 +1087,7 @@ mod tests {
             let mut data = vec![0u8; n];
             Rng::new(0xBADC0DE ^ n as u64).fill(&mut data);
 
-            let gz = compress_gzip(&data, 1);
+            let gz = encode_gzip_bytes_to_vec(&data, 1);
             // Roundtrips (stored blocks must still decode).
             assert_eq!(
                 decode_flate2(&gz),
@@ -1116,7 +1116,7 @@ mod tests {
         /// must decode back byte-exact through flate2.
         #[test]
         fn prop_fast_l1_roundtrip_flate2(input in adversarial_bytes()) {
-            let gz = compress_gzip(&input, 1);
+            let gz = encode_gzip_bytes_to_vec(&input, 1);
             let decoded = decode_flate2(&gz);
             prop_assert_eq!(decoded, input);
         }
@@ -1128,7 +1128,7 @@ mod tests {
             data in proptest::collection::vec(any::<u8>(), 4096..80_000)
         ) {
             let n = data.len();
-            let gz = compress_gzip(&data, 1);
+            let gz = encode_gzip_bytes_to_vec(&data, 1);
             prop_assert_eq!(decode_flate2(&gz), data.clone());
             let ceiling = n + n / 64 + 256;
             prop_assert!(

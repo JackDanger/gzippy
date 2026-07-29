@@ -29,7 +29,7 @@ use super::super::costs::{
     set_initial_costs, DeflateCosts, OffsetSlotFull, OptimumNode, BIT_COST, OPTIMUM_LEN_MASK,
     OPTIMUM_OFFSET_SHIFT,
 };
-use super::super::huffman::{build_dynamic_header, make_huffman_code, HuffmanCode};
+use super::super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
 use super::super::level::LevelParams;
 use super::super::matchfinder::bt::{
     BtMatchfinder, LzMatch, BT_MATCHFINDER_REQUIRED_NBYTES, WINDOW_SIZE,
@@ -94,6 +94,12 @@ struct Optimizer {
     /// bin6/parquet corpora showed this as the #1-by-count allocation site
     /// (`push_seq`, thousands of allocs, one growth spurt per block).
     sink: Sink,
+    /// `build_dynamic_header`'s scratch buffers (see `HeaderScratch`'s doc
+    /// comment), reused the same way `sink` is: `compute_true_cost` calls
+    /// `build_dynamic_header` 2-4x per block (once per refinement pass) plus
+    /// once more in `optimize_and_flush`'s final emit, so a fresh `Vec` per
+    /// call was the same waste class as the pre-fix `sink`.
+    header_scratch: HeaderScratch,
 }
 
 impl Optimizer {
@@ -106,6 +112,7 @@ impl Optimizer {
             offset_slot_full: OffsetSlotFull::new(),
             match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
             sink: Sink::new(),
+            header_scratch: HeaderScratch::new(),
         }
     }
 
@@ -291,8 +298,12 @@ impl Optimizer {
 
     /// `deflate_compute_true_cost` (`:2889-2921`): exact whole-bit cost of the
     /// block if the tallied path were coded with the built Huffman codes.
-    fn compute_true_cost(&self, codes: &PathCodes) -> u32 {
-        let header = build_dynamic_header(&codes.litcode.lens, &codes.offcode.lens);
+    fn compute_true_cost(&mut self, codes: &PathCodes) -> u32 {
+        let header = build_dynamic_header(
+            &codes.litcode.lens,
+            &codes.offcode.lens,
+            &mut self.header_scratch,
+        );
         let mut cost: u64 = header.header_bits();
 
         for sym in 0..DEFLATE_FIRST_LEN_SYM {
@@ -432,7 +443,15 @@ impl Optimizer {
                 }
             }
         }
-        emit_block(bw, buf, block_begin, &self.sink, statics, is_final);
+        emit_block(
+            bw,
+            buf,
+            block_begin,
+            &self.sink,
+            statics,
+            is_final,
+            &mut self.header_scratch,
+        );
 
         used_only_literals
     }
@@ -818,9 +837,9 @@ fn save_stats(
 
 #[cfg(test)]
 mod tests {
-    // near_optimal -> parse(super) -> deflate(super::super); compress_gzip /
-    // compress_oneshot live in deflate::mod.
-    use super::super::super::{compress_gzip, compress_oneshot};
+    // near_optimal -> parse(super) -> deflate(super::super); encode_gzip_bytes_to_vec /
+    // encode_deflate_bytes_to_vec live in deflate::mod.
+    use super::super::super::{encode_deflate_bytes_to_vec, encode_gzip_bytes_to_vec};
     use std::io::Read;
 
     fn decode(gz: &[u8]) -> Vec<u8> {
@@ -842,7 +861,7 @@ mod tests {
             }
         }
         for level in [10u32, 11, 12] {
-            let gz = compress_gzip(&data, level);
+            let gz = encode_gzip_bytes_to_vec(&data, level);
             assert_eq!(decode(&gz), data, "L{level} roundtrip");
         }
     }
@@ -855,8 +874,8 @@ mod tests {
         for _ in 0..8000 {
             data.extend_from_slice(phrase);
         }
-        let l9 = compress_oneshot(&data, 9).len();
-        let l12 = compress_oneshot(&data, 12).len();
+        let l9 = encode_deflate_bytes_to_vec(&data, 9).len();
+        let l12 = encode_deflate_bytes_to_vec(&data, 12).len();
         assert!(
             l12 <= l9,
             "L12 near-optimal ({l12}) worse than L9 lazy2 ({l9})"

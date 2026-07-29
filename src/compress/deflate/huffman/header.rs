@@ -24,22 +24,53 @@ use crate::compress::deflate::tables::{
 };
 
 /// Everything needed to emit a DEFLATE dynamic-block header.
-pub struct DynamicHeader {
+///
+/// `items` borrows its storage from the caller's [`HeaderScratch`] (see that
+/// type's doc comment) rather than owning a fresh `Vec` — a `DynamicHeader`'s
+/// lifetime never outlives the `emit_block` call that built it, so there is
+/// no need for it to own the allocation.
+pub struct DynamicHeader<'s> {
     pub num_litlen_syms: usize,
     pub num_offset_syms: usize,
     pub num_explicit_lens: usize,
     /// RLE items: low 5 bits = precode symbol, high bits = extra-bit value.
-    pub items: Vec<u32>,
+    pub items: &'s [u32],
     /// Precode (19 symbols).
     pub precode: HuffmanCode,
 }
 
-/// Compute the precode RLE "items" and the precode symbol frequencies for a set
-/// of contiguous litlen+offset codeword lengths. Port of
-/// `deflate_compute_precode_items`.
-fn compute_precode_items(lens: &[u8]) -> ([u32; DEFLATE_NUM_PRECODE_SYMS], Vec<u32>) {
+/// Reusable scratch storage for [`build_dynamic_header`], threaded through by
+/// `&mut` from a caller that persists across many blocks (one per `run()`
+/// invocation — i.e. one per chunk in the T>1 parallel path — mirroring how
+/// [`super::super::parse::Sink`] is already cleared-and-reused rather than
+/// reallocated every block).
+///
+/// Both fields are pure scratch: `combined` is the contiguous litlen+offset
+/// codeword-length array `compute_precode_items` scans, and `items` is the
+/// RLE item list it produces. Neither is read after the owning
+/// `DynamicHeader` is dropped, so `.clear()`-and-refill (retaining capacity)
+/// is always correct — never a stale-data hazard.
+#[derive(Default)]
+pub struct HeaderScratch {
+    combined: Vec<u8>,
+    items: Vec<u32>,
+}
+
+impl HeaderScratch {
+    pub fn new() -> Self {
+        Self {
+            combined: Vec::new(),
+            items: Vec::new(),
+        }
+    }
+}
+
+/// Compute the precode RLE "items" (written into `items`, cleared first) and
+/// return the precode symbol frequencies for a set of contiguous
+/// litlen+offset codeword lengths. Port of `deflate_compute_precode_items`.
+fn compute_precode_items(lens: &[u8], items: &mut Vec<u32>) -> [u32; DEFLATE_NUM_PRECODE_SYMS] {
+    items.clear();
     let mut freqs = [0u32; DEFLATE_NUM_PRECODE_SYMS];
-    let mut items: Vec<u32> = Vec::new();
     let num_lens = lens.len();
 
     let mut run_start = 0usize;
@@ -108,12 +139,25 @@ fn compute_precode_items(lens: &[u8]) -> ([u32; DEFLATE_NUM_PRECODE_SYMS], Vec<u
         }
     }
 
-    (freqs, items)
+    freqs
 }
 
 /// Build the dynamic-block header from the full (untrimmed) litlen and offset
 /// codeword-length arrays. Port of `deflate_precompute_huffman_header`.
-pub fn build_dynamic_header(litlen_lens: &[u8], offset_lens: &[u8]) -> DynamicHeader {
+///
+/// `scratch` supplies the `combined` (litlen+offset) and `items` (precode RLE)
+/// working buffers — `.clear()`-and-refilled here rather than freshly
+/// allocated, so a caller that reuses the same `HeaderScratch` across many
+/// blocks (every hot parser: greedy/lazy/gated/fast) pays for the allocation
+/// at most once per `run()` call instead of once per DEFLATE block. A caller
+/// with no persistent scratch (near-optimal, deflate64) can just pass
+/// `&mut HeaderScratch::new()` inline — behaviorally identical to the old
+/// always-fresh-`Vec` code.
+pub fn build_dynamic_header<'s>(
+    litlen_lens: &[u8],
+    offset_lens: &[u8],
+    scratch: &'s mut HeaderScratch,
+) -> DynamicHeader<'s> {
     // Trim trailing zero litlen lengths (keep at least 257).
     let mut num_litlen_syms = litlen_lens.len();
     while num_litlen_syms > 257 && litlen_lens[num_litlen_syms - 1] == 0 {
@@ -125,15 +169,26 @@ pub fn build_dynamic_header(litlen_lens: &[u8], offset_lens: &[u8]) -> DynamicHe
         num_offset_syms -= 1;
     }
 
-    // Contiguous litlen+offset lengths (replaces libdeflate's in-place memmove).
+    // Contiguous litlen+offset lengths (replaces libdeflate's in-place
+    // memmove). `combined` retains its capacity across calls on a reused
+    // scratch — `reserve` after `clear()` is then a no-op once the buffer has
+    // grown to the largest block this run has seen, so steady state is a
+    // clear + two memcpys, zero allocation.
     let combined_cap = num_litlen_syms + num_offset_syms;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, combined_cap);
-    let mut combined: Vec<u8> = Vec::with_capacity(combined_cap);
-    combined.extend_from_slice(&litlen_lens[..num_litlen_syms]);
-    combined.extend_from_slice(&offset_lens[..num_offset_syms]);
+    if scratch.combined.capacity() < combined_cap {
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, combined_cap);
+    }
+    scratch.combined.clear();
+    scratch.combined.reserve(combined_cap);
+    scratch
+        .combined
+        .extend_from_slice(&litlen_lens[..num_litlen_syms]);
+    scratch
+        .combined
+        .extend_from_slice(&offset_lens[..num_offset_syms]);
 
-    let (precode_freqs, items) = compute_precode_items(&combined);
+    let precode_freqs = compute_precode_items(&scratch.combined, &mut scratch.items);
 
     let precode = make_huffman_code(
         DEFLATE_NUM_PRECODE_SYMS,
@@ -153,12 +208,12 @@ pub fn build_dynamic_header(litlen_lens: &[u8], offset_lens: &[u8]) -> DynamicHe
         num_litlen_syms,
         num_offset_syms,
         num_explicit_lens,
-        items,
+        items: &scratch.items,
         precode,
     }
 }
 
-impl DynamicHeader {
+impl<'s> DynamicHeader<'s> {
     /// Exact bit cost of the header body (everything after BFINAL+BTYPE):
     /// HLIT/HDIST/HCLEN + precode lengths + the RLE-encoded litlen/offset
     /// lengths. Used by the stored-vs-dynamic decision.
@@ -170,7 +225,7 @@ impl DynamicHeader {
         // `item & 0x1F` recovers exactly that low symbol in all cases, so
         // it is always `<= 18 < DEFLATE_NUM_PRECODE_SYMS (19)` ==
         // `precode.lens.len()` == `PRECODE_EXTRA_BITS.len()`.
-        for &item in &self.items {
+        for &item in self.items {
             let sym = (item & 0x1F) as usize;
             unsafe {
                 bits += *self.precode.lens.get_unchecked(sym) as u64
@@ -196,7 +251,7 @@ impl DynamicHeader {
         // SAFETY: see `header_bits` — `item & 0x1F` is always `<= 18 <
         // precode.codewords.len() == precode.lens.len() ==
         // PRECODE_EXTRA_BITS.len() (19)`.
-        for &item in &self.items {
+        for &item in self.items {
             let sym = (item & 0x1F) as usize;
             unsafe {
                 bw.add_bits(
@@ -223,7 +278,8 @@ mod tests {
         let lens: Vec<u8> = vec![
             5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 7, 7, 7, 7, 7, 7,
         ];
-        let (_freqs, items) = compute_precode_items(&lens);
+        let mut items: Vec<u32> = Vec::new();
+        let _freqs = compute_precode_items(&lens, &mut items);
         let mut out: Vec<u8> = Vec::new();
         let mut prev = 0u8;
         for &item in &items {

@@ -6,12 +6,13 @@
 //! heuristic (and the short-match offset guard), otherwise emit a literal.
 
 use super::super::bitstream::BitWriter;
+use super::super::huffman::HeaderScratch;
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, Sink, StaticCodes,
+    emit_block, BlockRole, InputMode, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
 };
 
 pub(super) fn run(
@@ -23,37 +24,100 @@ pub(super) fn run(
     bw: &mut BitWriter,
     is_last: bool,
 ) {
-    let mut mf = HcMatchfinder::new();
-    let mut in_base = 0usize;
-    let mut next_hashes = [0u32; 2];
-    let mut sink = Sink::new();
-
+    let mut state = ParseState::new();
     // Seed a preset dictionary into the matchfinder (positions before data_start
     // may be referenced by matches but are not coded).
     if data_start > 0 {
-        mf.skip_bytes(buf, &mut in_base, 0, in_end, data_start, &mut next_hashes);
+        let ParseState {
+            mf,
+            in_base,
+            next_hashes,
+        } = &mut state;
+        mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
     }
+    run_resumable(
+        buf,
+        &mut state,
+        data_start,
+        in_end,
+        params,
+        statics,
+        bw,
+        if is_last {
+            BlockRole::Final
+        } else {
+            BlockRole::Interior
+        },
+        InputMode::Drain,
+    );
+}
 
-    let mut in_next = data_start;
+/// [`run`] with the matchfinder state supplied by the caller, so it can span
+/// several calls over a sliding buffer.
+///
+/// Returns the position after the last COMPLETE block emitted.
+///
+/// `consume_all` and `is_last` are INDEPENDENT and must not be conflated —
+/// doing so was a real bug caught by the concatenation tests. `is_last` marks
+/// BFINAL on the closing block; it is false for every non-final chunk of a
+/// CONCATENATED stream (the T>1 path), which nonetheless has to consume all
+/// the input it was handed. `consume_all` is what the single-pass streaming
+/// encoder sets to false: it means "this buffer will be refilled, so stop at
+/// the last block boundary that still had [`STREAM_BLOCK_LOOKAHEAD`] bytes of
+/// input behind it and let me carry the tail forward". That margin is exactly
+/// what makes every block-boundary decision identical to a whole-buffer
+/// encode, so the chunk seam leaves no trace in the emitted bytes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_resumable(
+    buf: &[u8],
+    state: &mut ParseState,
+    from: usize,
+    in_end: usize,
+    params: &LevelParams,
+    statics: &StaticCodes,
+    bw: &mut BitWriter,
+    role: BlockRole,
+    input_mode: InputMode,
+) -> usize {
+    let mut sink = Sink::new();
+    // One dynamic-header scratch buffer for the WHOLE call, reused across
+    // every internal block (see `HeaderScratch`'s doc comment) instead of
+    // `build_dynamic_header` allocating a fresh `Vec` per block.
+    let mut header_scratch = HeaderScratch::new();
+    let mut in_next = from;
 
     loop {
+        if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
+            return in_next;
+        }
         // Start a new DEFLATE block.
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
 
-        in_next = run_block(
-            buf,
-            in_next,
-            block_begin,
-            in_max_block_end,
-            in_end,
-            params,
-            &mut mf,
-            &mut in_base,
-            &mut next_hashes,
-            &mut sink,
-        );
+        // `anatomy-wall` region: `parse_match` — one timer per INTERNAL
+        // BLOCK, matching `fast.rs`'s L0/L1 convention (see
+        // `anatomy_wall` module docs). For the greedy parser (L2/L4) this
+        // wraps the WHOLE per-block token loop (`run_block`): match probe
+        // + accept/literal decision + `Sink::push_{literal,match}` emission
+        // are ALSO fused here, same rationale as the fast parser's fused
+        // bucket — there is no call boundary inside `run_block` to split
+        // "probing" from "emission" without going to per-position
+        // granularity (disallowed). Zero cost when `anatomy-wall` is off.
+        in_next = crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            run_block(
+                buf,
+                in_next,
+                block_begin,
+                in_max_block_end,
+                in_end,
+                params,
+                &mut state.mf,
+                &mut state.in_base,
+                &mut state.next_hashes,
+                &mut sink,
+            )
+        });
 
         emit_block(
             bw,
@@ -61,10 +125,11 @@ pub(super) fn run(
             block_begin,
             &sink,
             statics,
-            is_last && in_next == in_end,
+            role.is_final() && in_next == in_end,
+            &mut header_scratch,
         );
         if in_next == in_end {
-            break;
+            return in_next;
         }
     }
 }

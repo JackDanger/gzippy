@@ -66,7 +66,7 @@ mod tests {
         }
 
         fn from_raw(data: &[u8]) -> Self {
-            let gz = compress_gzip(data);
+            let gz = encode_gzip_bytes_to_vec(data);
             Self::from_gzip(&gz)
         }
 
@@ -107,7 +107,7 @@ mod tests {
         }
     }
 
-    fn compress_gzip(data: &[u8]) -> Vec<u8> {
+    fn encode_gzip_bytes_to_vec(data: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
@@ -595,7 +595,7 @@ mod tests {
 
         for (name, gen) in patterns {
             let data = gen();
-            let gz = compress_gzip(&data);
+            let gz = encode_gzip_bytes_to_vec(&data);
             let header_size = crate::decompress::parallel::single_member::skip_gzip_header(&gz)
                 .expect("valid header");
             let deflate = &gz[header_size..gz.len() - 8];

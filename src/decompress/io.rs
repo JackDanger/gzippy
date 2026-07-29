@@ -68,10 +68,14 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         return if args.recursive {
             decompress_directory(filename, args)
         } else {
-            Err(GzippyError::invalid_argument(format!(
-                "{} is a directory",
-                filename
-            )))
+            // Same contract as compress_file (see comment there): gzip exits
+            // 2 (WARNING), prints this exact shape, never touches the
+            // directory. Established by executing gzip -d/-dc/-t/-l on a
+            // real directory, not by reasoning about it.
+            if !args.quiet {
+                eprintln!("gzippy: {} is a directory -- ignored", filename);
+            }
+            Ok(2)
         };
     }
     if input_path.is_symlink() && !args.force {
@@ -138,10 +142,18 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                     return Ok(2);
                 }
             } else {
-                return Err(GzippyError::invalid_argument(format!(
-                    "Output file {} already exists",
-                    output_path.display()
-                )));
+                // Same contract as compress_file (see the comment there):
+                // non-interactive gzip does not error, it prints this exact
+                // shape and exits 2 (WARNING), never blocking on input and
+                // never returning 1. Verified by executing `gzip -d` on a
+                // real file with an existing decompression target.
+                if !args.quiet {
+                    eprintln!(
+                        "gzippy: {} already exists;\tnot overwritten",
+                        output_path.display()
+                    );
+                }
+                return Ok(2);
             }
         }
     }

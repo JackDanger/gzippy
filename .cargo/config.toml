@@ -3,10 +3,27 @@
 [env]
 ISAL_SOURCE = { value = "vendor/isa-l", relative = true }
 
-# Per CLAUDE.md "Update 2026-05-27 (final)": for the tight-Huffman work
-# we need arch-specific compilation to compete with libdeflate/ISA-L
-# (which build with -march=native via CMake). Applies to all builds in
-# this checkout. For portable-binary CI work, override with
-# `CARGO_BUILD_RUSTFLAGS=""` in the environment.
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# NO `target-cpu=native`. Removed 2026-07-28; it was added on a premise that is
+# factually wrong and it was costing us wall time.
+#
+# The old comment read: "for the tight-Huffman work we need arch-specific
+# compilation to compete with libdeflate/ISA-L (which build with -march=native
+# via CMake)". libdeflate does NOT build with -march=native — its CMakeLists
+# contains no such flag. It compiles ONE portable binary and selects the
+# instruction set PER FUNCTION at runtime, via `_target_attribute("avx2")` plus
+# the CPUID detection in lib/x86/cpu_features.h. We inherited a belief about a
+# vendor habit that never existed.
+#
+# MEASURED COST of the flag, per-label vs libdeflate v1.25 built from
+# vendor/libdeflate, paired interleaved:
+#   Intel        WORSE at all 14 cells measured (+0.0006 to +0.0814)
+#   AMD Zen2     worse at deep levels; removing it CLOSES collide L9
+#                (1.0149 -> 0.9747). Zen2 cracks 256-bit AVX2 into two 128-bit
+#                micro-ops, so aggressive auto-vectorisation is a loss there.
+#   M1 (aarch64) a wash — every delta within +/-0.01, no cell flips, because
+#                NEON is baseline and the flag adds almost nothing.
+#
+# AND IT IS UNSHIPPABLE ANYWAY: a `target-cpu=native` binary runs only on the
+# CPU class it was built on. A drop-in replacement for gzip cannot be built that
+# way. If we later want per-ISA kernels, do what libdeflate does — runtime
+# dispatch to `#[target_feature]` functions — not a blanket global flag.

@@ -87,6 +87,32 @@ pub struct LevelParams {
 /// presets exactly; the strategy mapping substitutes a fallback for the two
 /// strategies not yet implemented in this increment (see the module docs).
 pub fn params(level: u32) -> LevelParams {
+    let p = params_inner(level);
+    // Report the knobs that were ACTUALLY RESOLVED by the production path, once
+    // per process. `fulcrum explain` reads this and asserts it against observed
+    // behaviour; without it, the tool would have to keep its own copy of this
+    // table, which would rot silently and would be a source-read rather than an
+    // observation. Emitting from inside `params` means what is reported is what
+    // executed. Feature-gated (default OFF) and compiles to nothing when off.
+    #[cfg(feature = "anatomy-counters")]
+    emit_declared_once(level, &p);
+    p
+}
+
+/// One line per process: `LEVEL_DECLARED={json}`.
+#[cfg(feature = "anatomy-counters")]
+fn emit_declared_once(level: u32, p: &LevelParams) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "LEVEL_DECLARED={{\"level\":{},\"strategy\":\"{:?}\",\"max_search_depth\":{},\"nice_match_length\":{}}}",
+            level, p.strategy, p.max_search_depth, p.nice_match_length
+        );
+    });
+}
+
+fn params_inner(level: u32) -> LevelParams {
     let max_match = DEFLATE_MAX_MATCH_LEN;
     // Placeholder near-optimal knobs for the non-near-optimal levels (unused).
     const NONE_NO: NearOptimalParams = NearOptimalParams {

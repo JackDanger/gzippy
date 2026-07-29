@@ -162,11 +162,21 @@ impl PipelinedGzEncoder {
         data: &[u8],
         mut writer: W,
     ) -> io::Result<u64> {
+        // Gate-4 (CLAUDE.md measurement PROTOCOL): print at the call site of
+        // the function that actually executes, not at either of the two
+        // decision sites that route here (`io.rs`'s mmap fast path and
+        // `compress::compress_with_pipeline_sized`'s T>1 fallback) — this
+        // print fires identically regardless of which one reached it.
+        crate::compress::route::emit(
+            crate::compress::route::PURE_PARALLEL_PIPELINE,
+            self.compression_level,
+            self.num_threads,
+        );
         if data.is_empty() {
             // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::new();
-            crate::compress::deflate::compress_block_streaming(
+            crate::compress::deflate::encode_deflate_segment_to_sink(
                 &[],
                 &[],
                 self.compression_level,
@@ -177,6 +187,39 @@ impl PipelinedGzEncoder {
             writer.write_all(&0u32.to_le_bytes())?; // CRC32 of empty input
             writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
             return Ok(0);
+        }
+        if self.compression_level == 0 {
+            // Genuine STORED mode (see `deflate::deflate_into`'s `level == 0`
+            // branch) has no compute to parallelize — it is a memcpy plus a
+            // fixed 5-byte-per-65535-byte framing tax, not a matchfinder/
+            // Huffman workload. Chunking it through `compress_parallel_pipeline_pure`
+            // like every other level would still roundtrip correctly, but it
+            // pays a REAL, measured cost for zero benefit: each of the
+            // (input_len / up-to-512KiB) parallel chunks gets its own
+            // sync-flush seam (`deflate_into`'s `!is_last` stored marker) so
+            // the chunked T>1 output is reproducibly a few hundred bytes
+            // LARGER than the single-shot T1 output on every multi-chunk file
+            // measured (e.g. dickens: T1=12,175,467 vs the old chunked
+            // T4=12,175,705, +238 bytes) — the opposite of the "T>1 must not
+            // be larger than T1" requirement. So L0 at T>1 bypasses the
+            // parallel pipeline entirely and emits ONE single-shot stored
+            // pass over the whole buffer, `num_threads`-independent — the
+            // body is byte-identical to the T1 path's
+            // (`encode_gzip_slack_padded_to_vec`/`encode_deflate_segment_to_sink` share the
+            // same `deflate_into` level-0 branch), so T>1 can never exceed T1
+            // in size at this level, and there is no thread/orchestration
+            // overhead to pay for a workload that is memory-bandwidth-, not
+            // CPU-, bound (a single `crc32fast::hash` pass over tens of MB is
+            // sub-millisecond — parallelizing it buys negligible wall time
+            // for the framing-size cost above).
+            writer.write_all(&self.gzip_header_bytes())?;
+            let mut body = Vec::with_capacity(data.len() + data.len() / 65535 + 16);
+            crate::compress::deflate::encode_deflate_segment_to_sink(data, &[], 0, true, &mut body);
+            writer.write_all(&body)?;
+            let crc = crc32fast::hash(data);
+            writer.write_all(&crc.to_le_bytes())?;
+            writer.write_all(&(data.len() as u32).to_le_bytes())?;
+            return Ok(data.len() as u64);
         }
         self.compress_parallel_pipeline_pure(data, writer)?;
         Ok(data.len() as u64)
@@ -370,7 +413,7 @@ impl PipelinedGzEncoder {
     /// concatenated per-chunk DEFLATE + combined CRC/ISIZE), the same
     /// data-length-only block grid, the same dictionary-from-previous-chunk, the
     /// same in-order streaming writer and CRC-combine — EXCEPT each chunk is
-    /// compressed by [`deflate::compress_block_streaming`] instead of
+    /// compressed by [`deflate::encode_deflate_segment_to_sink`] instead of
     /// flate2/zlib-ng. Non-final chunks are closed with a sync-flush marker by
     /// that function so the concatenation is one valid DEFLATE stream.
     ///
@@ -409,7 +452,7 @@ impl PipelinedGzEncoder {
                 // Compress this chunk with the pure-Rust engine. A non-final
                 // chunk is closed with a sync-flush marker inside the callee.
                 output.clear();
-                deflate::compress_block_streaming(
+                deflate::encode_deflate_segment_to_sink(
                     block,
                     dict.unwrap_or(&[]),
                     level,

@@ -64,6 +64,7 @@
 
 use super::super::bitstream::BitWriter;
 use super::super::block_split::MIN_BLOCK_LENGTH;
+use super::super::huffman::HeaderScratch;
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::DEFLATE_FIRST_LEN_SYM;
@@ -367,10 +368,16 @@ pub(super) fn run(
     #[cfg(feature = "l3-tune")]
     let cfg = GateCfg::from_tune(tune::get());
 
-    let mut mf = HcMatchfinder::new();
+    // Task C (bucket-split-oracle): time the per-`run()` allocation itself
+    // (see `anatomy_wall.rs`'s `mf_new_ns` doc comment). Per-invocation, not
+    // per-position -- zero cost when `anatomy-wall` is off.
+    let mut mf = crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, { HcMatchfinder::acquire() });
     let mut in_base = 0usize;
     let mut next_hashes = [0u32; 2];
     let mut sink = Sink::new();
+    // See `greedy.rs`'s sibling declaration: one scratch per `run()` call,
+    // reused across every internal block.
+    let mut header_scratch = HeaderScratch::new();
 
     if data_start > 0 {
         mf.skip_bytes(buf, &mut in_base, 0, in_end, data_start, &mut next_hashes);
@@ -388,34 +395,44 @@ pub(super) fn run(
         sink.begin();
 
         let use_lazy = use_lazy_next;
-        in_next = if use_lazy {
-            lazy::run_block(
-                buf,
-                in_next,
-                block_begin,
-                in_max_block_end,
-                in_end,
-                params,
-                false, // lazy (not lazy2) — L3 never uses the lazy2 tie-break.
-                &mut mf,
-                &mut in_base,
-                &mut next_hashes,
-                &mut sink,
-            )
-        } else {
-            greedy::run_block(
-                buf,
-                in_next,
-                block_begin,
-                in_max_block_end,
-                in_end,
-                params,
-                &mut mf,
-                &mut in_base,
-                &mut next_hashes,
-                &mut sink,
-            )
-        };
+        // `anatomy-wall` region: `parse_match` — ONE timer per gate-block
+        // regardless of which sub-strategy (`lazy::run_block` vs
+        // `greedy::run_block`) this block dispatches to, so L3's per-block
+        // GREEDY-vs-LAZY switching folds into the SAME named region the
+        // plain greedy/lazy parsers use (see those modules' sibling call
+        // sites) — matching libdeflate's side, which has no such gate at
+        // all and reports one `parse_match` bucket regardless. Zero cost
+        // when `anatomy-wall` is off.
+        in_next = crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            if use_lazy {
+                lazy::run_block(
+                    buf,
+                    in_next,
+                    block_begin,
+                    in_max_block_end,
+                    in_end,
+                    params,
+                    false, // lazy (not lazy2) — L3 never uses the lazy2 tie-break.
+                    &mut mf,
+                    &mut in_base,
+                    &mut next_hashes,
+                    &mut sink,
+                )
+            } else {
+                greedy::run_block(
+                    buf,
+                    in_next,
+                    block_begin,
+                    in_max_block_end,
+                    in_end,
+                    params,
+                    &mut mf,
+                    &mut in_base,
+                    &mut next_hashes,
+                    &mut sink,
+                )
+            }
+        });
 
         emit_block(
             bw,
@@ -424,6 +441,7 @@ pub(super) fn run(
             &sink,
             statics,
             is_last && in_next == in_end,
+            &mut header_scratch,
         );
 
         // One-block-lag detector: decide the NEXT gate-block's strategy from
@@ -453,7 +471,7 @@ pub(super) fn run(
 /// Correctness tests for the DETECTOR-GATED LAZY-L3 composition — only
 /// meaningfully exercised under `l3-tune` (level 3 is plain `Strategy::Greedy`
 /// otherwise, already covered by the rest of the suite). Mirrors
-/// `near_optimal.rs`'s own `compress_gzip` + `flate2::read::GzDecoder`
+/// `near_optimal.rs`'s own `encode_gzip_bytes_to_vec` + `flate2::read::GzDecoder`
 /// roundtrip pattern. Each fixture is sized to span SEVERAL
 /// [`L3_GATE_BLOCK_LEN`] (300_000-byte) gate-blocks so a roundtrip failure
 /// here would catch a real cross-block state bug (shared matchfinder handed
@@ -462,7 +480,7 @@ pub(super) fn run(
 /// which the pre-existing greedy/lazy test suites already cover.
 #[cfg(all(test, feature = "l3-tune"))]
 mod tests {
-    use super::super::super::{compress_gzip, compress_oneshot};
+    use super::super::super::{encode_deflate_bytes_to_vec, encode_gzip_bytes_to_vec};
     use std::io::Read;
 
     fn decode(gz: &[u8]) -> Vec<u8> {
@@ -529,21 +547,21 @@ mod tests {
         // ~2.4x L3_GATE_BLOCK_LEN so the gate must lock onto GREEDY and stay
         // there across a block boundary.
         let data = dna_like(720_000);
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
     #[test]
     fn gated_l3_roundtrips_random_like_multi_block() {
         let data = random_like(720_000);
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
     #[test]
     fn gated_l3_roundtrips_text_like_multi_block() {
         let data = text_like(720_000);
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
@@ -561,7 +579,7 @@ mod tests {
         data.extend(random_like(500_000));
         data.extend(text_like(400_000));
         data.extend(dna_like(350_000));
-        let gz = compress_gzip(&data, 3);
+        let gz = encode_gzip_bytes_to_vec(&data, 3);
         assert_eq!(decode(&gz), data);
     }
 
@@ -575,18 +593,18 @@ mod tests {
             text_like(500),
             vec![7u8; 1],
         ] {
-            let gz = compress_gzip(&data, 3);
+            let gz = encode_gzip_bytes_to_vec(&data, 3);
             assert_eq!(decode(&gz), data);
         }
     }
 
-    /// `compress_oneshot` (the raw-DEFLATE, no gzip-framing entry point) —
+    /// `encode_deflate_bytes_to_vec` (the raw-DEFLATE, no gzip-framing entry point) —
     /// a second call path into the same `Strategy::LazyGated` dispatch, with
     /// its own inflate oracle rather than `flate2`'s gzip framing.
     #[test]
     fn gated_l3_roundtrips_via_compress_oneshot() {
         let data = dna_like(650_000);
-        let compressed = compress_oneshot(&data, 3);
+        let compressed = encode_deflate_bytes_to_vec(&data, 3);
         let mut out = Vec::new();
         flate2::read::DeflateDecoder::new(&compressed[..])
             .read_to_end(&mut out)

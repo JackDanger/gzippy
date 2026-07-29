@@ -102,7 +102,7 @@
 //!   parsed` (every input byte is covered by exactly one literal or exactly
 //!   one position of exactly one match — the LZ77 parse invariant).
 //! - **`alloc_events`/`alloc_bytes`** — the `Vec::with_capacity` sites in
-//!   `deflate/mod.rs` (`:56` `compress_oneshot`, `:123`/`:133` the two padded-
+//!   `deflate/mod.rs` (`:56` `encode_deflate_bytes_to_vec`, `:123`/`:133` the two padded-
 //!   working-buffer shapes, `:195`/`:218` the two gzip-wrapper output
 //!   buffers) and `huffman/header.rs:129` (combined code-length buffer).
 //!   **DEVIATION:** the spec's `deflate/mod.rs:273`/`:294` sites are inside
@@ -335,13 +335,85 @@ pub fn reset() {
     COUNTERS.reset();
 }
 
+/// Cross-counter reconciliation, run once at dump time (see
+/// `flush_to_stderr`). Catches the double-count bug class the
+/// `fast_probe_outcome_*` counters had (2026-07-25 — a position hash3
+/// rescued was charged into BOTH its primary miss/too_short bucket AND its
+/// final accepted/deferred bucket, which ALSO inflated the derived
+/// `fast_positions_processed` sum by the same amount): every check here is
+/// an EXACT identity that must hold by construction. `FastLocalCounters::
+/// flush` already asserts the per-call local partition (`probe_attempts ==
+/// miss+too_short+accepted+deferred`) the instant it is violated; this
+/// function re-checks the PROCESS-WIDE totals (across every `run()` call
+/// this invocation made) plus the cross-module invariant that needs the
+/// Sink-level `literals_emitted`/`match_length_bytes_total` counters
+/// `FastLocalCounters` has no access to. Returns the list of violated
+/// invariants (empty = fully reconciled) rather than panicking: a
+/// measurement tool reading this output must be able to see BOTH that a
+/// check failed AND which one, without the process aborting before the
+/// rest of the counters are printed.
+#[cfg(feature = "anatomy-counters")]
+fn reconcile(counters: &AnatomyCounters) -> Vec<String> {
+    let mut fails = Vec::new();
+    let get = |c: &AtomicU64| c.load(Relaxed);
+
+    let attempts = get(&counters.fast_probe_attempts);
+    let miss = get(&counters.fast_probe_outcome_miss);
+    let too_short = get(&counters.fast_probe_outcome_too_short);
+    let accepted = get(&counters.fast_probe_outcome_accepted);
+    let deferred = get(&counters.fast_probe_outcome_deferred);
+    let outcome_sum = miss + too_short + accepted + deferred;
+    if attempts != outcome_sum {
+        fails.push(format!(
+            "fast_probe_attempts({attempts}) != outcome_sum({outcome_sum} = miss({miss}) + \
+             too_short({too_short}) + accepted({accepted}) + deferred({deferred}))"
+        ));
+    }
+
+    // The "positions_processed == literals + match_length_bytes" identity
+    // only holds when fast.rs is the EXCLUSIVE source of every literal/match
+    // this invocation emitted (a pure L0/L1 run) — at L2+ the hc/bt
+    // matchfinders also contribute to `literals_emitted`/
+    // `match_length_bytes_total` without touching any `fast_*` counter at
+    // all, so the identity would be a false alarm there. Gate on
+    // "fast ran, and neither other matchfinder did".
+    let hc_attempts = get(&counters.hc_probe_attempts);
+    let bt_attempts = get(&counters.bt_probe_attempts);
+    if attempts > 0 && hc_attempts == 0 && bt_attempts == 0 {
+        let processed = get(&counters.fast_positions_processed);
+        let skipped = get(&counters.fast_positions_skipped);
+        let lits = get(&counters.literals_emitted);
+        let match_bytes = get(&counters.match_length_bytes_total);
+        if processed + skipped != lits + match_bytes {
+            fails.push(format!(
+                "fast_positions_processed+skipped({}) != literals_emitted+match_length_bytes_total({}) \
+                 on a pure fast-path (L0/L1) run",
+                processed + skipped,
+                lits + match_bytes
+            ));
+        }
+    }
+
+    fails
+}
+
 /// Emit the current counter snapshot to stderr as one machine-parsable line:
-/// `ANATOMY_COUNTERS={json}`. Called once at process end (see `main.rs`).
+/// `ANATOMY_COUNTERS={json}`, preceded by a loud `ANATOMY_RECONCILE=PASS|
+/// FAIL` line (see `reconcile`). Called once at process end (see `main.rs`).
 /// Only exists when `anatomy-counters` is on (no env var, no behavior change
 /// — consistent with "NO env vars in the production path": this entire
 /// module does not exist in a production/default build).
 #[cfg(feature = "anatomy-counters")]
 pub fn flush_to_stderr() {
+    let fails = reconcile(&COUNTERS);
+    if fails.is_empty() {
+        eprintln!("ANATOMY_RECONCILE=PASS checks=2");
+    } else {
+        eprintln!("ANATOMY_RECONCILE=FAIL checks_failed={}", fails.len());
+        for f in &fails {
+            eprintln!("  {f}");
+        }
+    }
     eprintln!("ANATOMY_COUNTERS={}", COUNTERS.to_json());
 }
 
@@ -390,5 +462,91 @@ mod tests {
         assert!(json.contains("\"literals_emitted\":1"));
         c.reset();
         assert!(c.to_json().contains("\"hc_probe_attempts\":0"));
+    }
+
+    /// `reconcile` on a LOCAL instance (same isolation rationale as
+    /// `json_round_trips_shape`): a well-formed fast-path snapshot where
+    /// outcomes partition attempts exactly, and positions_processed matches
+    /// literals+match_bytes, must report zero failures.
+    #[test]
+    fn reconcile_passes_on_a_consistent_snapshot() {
+        let c = AnatomyCounters::zero();
+        // 10 attempts: 4 miss, 2 too_short, 3 accepted, 1 deferred.
+        c.fast_probe_attempts.fetch_add(10, Relaxed);
+        c.fast_probe_outcome_miss.fetch_add(4, Relaxed);
+        c.fast_probe_outcome_too_short.fetch_add(2, Relaxed);
+        c.fast_probe_outcome_accepted.fetch_add(3, Relaxed);
+        c.fast_probe_outcome_deferred.fetch_add(1, Relaxed);
+        // positions_processed: say the 3 accepted matches summed to 20 bytes
+        // (via positions_processed_matches, not tracked separately here —
+        // fast_positions_processed already IS the derived sum at flush
+        // time), plus 4+2+1 = 7 single-byte outcomes = 27, plus 0 skipped.
+        // literals_emitted + match_length_bytes_total must equal the same
+        // 27 for the identity to hold on a pure fast-path run.
+        c.fast_positions_processed.fetch_add(27, Relaxed);
+        c.fast_positions_skipped.fetch_add(0, Relaxed);
+        c.literals_emitted.fetch_add(7, Relaxed); // the 7 non-match outcomes
+        c.match_length_bytes_total.fetch_add(20, Relaxed); // the 3 matches' bytes
+        assert!(
+            reconcile(&c).is_empty(),
+            "expected a consistent snapshot to reconcile cleanly: {:?}",
+            reconcile(&c)
+        );
+    }
+
+    /// The exact bug this reconciliation exists to catch: a position's
+    /// outcome charged into BOTH a miss bucket AND the accepted bucket (the
+    /// pre-fix double-count shape) must be DETECTED, not silently accepted.
+    #[test]
+    fn reconcile_catches_the_double_count_regression() {
+        let c = AnatomyCounters::zero();
+        // 1 attempt, but miss=1 AND accepted=1 -- the double-count shape:
+        // outcome_sum(2) != attempts(1).
+        c.fast_probe_attempts.fetch_add(1, Relaxed);
+        c.fast_probe_outcome_miss.fetch_add(1, Relaxed);
+        c.fast_probe_outcome_accepted.fetch_add(1, Relaxed);
+        let fails = reconcile(&c);
+        assert!(
+            !fails.is_empty(),
+            "expected the attempts/outcome-sum mismatch to be caught"
+        );
+        assert!(fails[0].contains("fast_probe_attempts"));
+    }
+
+    /// The `positions_processed` cross-check must ALSO fire independently
+    /// (a run where attempts/outcomes reconcile fine, but the derived
+    /// positions_processed total drifted from literals+match_bytes anyway).
+    #[test]
+    fn reconcile_catches_positions_processed_drift() {
+        let c = AnatomyCounters::zero();
+        c.fast_probe_attempts.fetch_add(1, Relaxed);
+        c.fast_probe_outcome_accepted.fetch_add(1, Relaxed);
+        c.fast_positions_processed.fetch_add(999, Relaxed); // wrong on purpose
+        c.literals_emitted.fetch_add(0, Relaxed);
+        c.match_length_bytes_total.fetch_add(5, Relaxed);
+        let fails = reconcile(&c);
+        assert!(
+            fails.iter().any(|f| f.contains("fast_positions_processed")),
+            "expected the positions_processed drift to be caught: {fails:?}"
+        );
+    }
+
+    /// The positions_processed cross-check must NOT fire when hc/bt ran too
+    /// (a mixed/non-fast run where the identity is expected to be false) —
+    /// it should be silently skipped, not a false alarm.
+    #[test]
+    fn reconcile_skips_positions_processed_check_when_other_matchfinders_ran() {
+        let c = AnatomyCounters::zero();
+        c.fast_probe_attempts.fetch_add(1, Relaxed);
+        c.fast_probe_outcome_accepted.fetch_add(1, Relaxed);
+        c.hc_probe_attempts.fetch_add(5, Relaxed); // hc ALSO ran this invocation
+        c.fast_positions_processed.fetch_add(999, Relaxed); // would mismatch...
+        c.literals_emitted.fetch_add(0, Relaxed);
+        c.match_length_bytes_total.fetch_add(5, Relaxed);
+        assert!(
+            reconcile(&c).is_empty(),
+            "the positions_processed identity must be skipped, not a false alarm, \
+             when another matchfinder also ran"
+        );
     }
 }

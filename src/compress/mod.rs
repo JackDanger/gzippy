@@ -22,12 +22,52 @@ use crate::compress::optimization::OptimizationConfig;
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::GzippyResult;
 
+/// Gate-4 compression route names (measurement PROTOCOL, CLAUDE.md) — a
+/// closed const set so the `GZIPPY_DEBUG=1` diagnostic string can never drift
+/// from the code that emits it. Each name is printed at the exact call site
+/// of the encoder that is about to run (never from a routing/decision
+/// function that merely picks a path — see `docs`/CLAUDE.md Gate-4: the point
+/// is to observe what EXECUTED). Mirrors the existing decompress-side style
+/// (`[gzippy] path=... threads=... bytes=...` in `src/decompress/mod.rs`).
+pub(crate) mod route {
+    /// Explicit zopfli tuning (`-F`/`-I`/`-J`) — pure-Rust `zopfli_pure`
+    /// (`ZopfliGzEncoder`), single-member, any thread count.
+    pub const ZOPFLI: &str = "Zopfli";
+    /// T1 pure-Rust single-member DEFLATE (`deflate::encode_gzip_slack_padded_to_vec`).
+    pub const PURE_T1: &str = "PureT1";
+    /// T>1 pure-Rust parallel pipeline (`PipelinedGzEncoder::compress_buffer_pure`).
+    /// Reached from two call sites (the `io.rs` mmap fast path and the
+    /// `compress_with_pipeline_sized` fallback) that both invoke the same
+    /// executing function — the print lives inside that function so it can
+    /// never diverge from which call site reached it.
+    pub const PURE_PARALLEL_PIPELINE: &str = "PureParallelPipeline";
+    /// `--rsyncable` content-defined-chunk pure-Rust path (`compress_rsyncable`).
+    pub const RSYNCABLE: &str = "Rsyncable";
+
+    /// Emit the one-line Gate-4 route assertion. Reads `GZIPPY_DEBUG` via the
+    /// process-wide cached `OnceLock` in `crate::utils::debug_enabled` — no
+    /// per-call/per-block env lookup, so this costs nothing on the hot path
+    /// (one relaxed load of an already-resident bool) and nothing at all when
+    /// the env var is unset (checked once, ever, per process).
+    #[inline]
+    pub(crate) fn emit(name: &str, level: u32, threads: usize) {
+        if crate::utils::debug_enabled() {
+            // `encode-path=` is the token `fulcrum cpreflight`'s ENCODE-FINGERPRINT gate
+            // (Gate-4) greps for; the older `compress path=` spelling silently failed
+            // that gate. Both are printed so existing scripts keep working.
+            eprintln!(
+                "[gzippy] compress path={name} encode-path={name} level={level} threads={threads}"
+            );
+        }
+    }
+}
+
 /// Drive the pure-Rust compression engine to completion (Increment 7 — the sole
 /// production compress path; no C-FFI compressor in the routing graph).
 ///
 /// Routing:
 ///   -F / -I / -J (explicit zopfli tuning) → zopfli (pure `zopfli_pure`)
-///   T1  L0–L12  → `deflate::compress_gzip` (pure single-member gzip)
+///   T1  L0–L12  → `deflate::encode_gzip_bytes_to_vec` (pure single-member gzip)
 ///   T>1 L0–L12  → `PipelinedGzEncoder::compress_buffer_pure` (pure parallel,
 ///                 standard single-member gzip, byte-identical across T)
 pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
@@ -73,6 +113,11 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         // zopfli path is single-member by ratio mandate (plan.md
         // Phase 11.1.A). Intra-block parallelism inside `deflate_part`
         // still uses the machine.
+        route::emit(
+            route::ZOPFLI,
+            args.compression_level as u32,
+            args.processes.max(1),
+        );
         let mut encoder =
             crate::compress::deflate::parse::ultra::encoder::ZopfliGzEncoder::new(tuning);
         encoder.set_header_info(header_info.clone());
@@ -83,7 +128,7 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
     // single-thread compress path for EVERY level 0–12. All C-FFI compressors
     // (ISA-L / libdeflate one-shot / flate2-zlib-ng) have been removed from the
     // production routing graph; they remain compilable only behind the dev
-    // `ffi-oracle` feature as differential fuzz oracles. `compress_gzip` picks
+    // `ffi-oracle` feature as differential fuzz oracles. `encode_gzip_bytes_to_vec` picks
     // the cheapest of stored / static-Huffman / dynamic-Huffman per block, so it
     // subsumes the old L0 stored passthrough and the `--huffman` / `--rle`
     // fall-throughs while always emitting a valid single-member gzip stream.
@@ -94,28 +139,26 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
                 args.compression_level
             );
         }
-        // Pre-size for the known (or hinted) length plus the matchfinder's
-        // trailing pad so neither `read_to_end` nor the following `resize`
-        // needs to grow-and-copy the buffer (was 2 reallocs touching ~2x the
-        // input in bytes — visible in DHAT as the `read_to_end` site).
-        let mut input = Vec::with_capacity(
-            size_hint
-                .map(|s| s + crate::compress::deflate::INPLACE_TAIL_PAD)
-                .unwrap_or(0),
-        );
-        reader.read_to_end(&mut input)?;
-        let bytes = input.len() as u64;
-        // Pad the read buffer in place with the matchfinder's trailing slack so
-        // the compressor parses IN PLACE — no second full-input work buffer.
-        let logical_len = input.len();
-        input.resize(logical_len + crate::compress::deflate::INPLACE_TAIL_PAD, 0);
-        let gz = crate::compress::deflate::compress_gzip_padded(
-            &input,
-            logical_len,
-            args.compression_level as u32,
-        );
+        route::emit(route::PURE_T1, args.compression_level as u32, 1);
+        // ONE call for every level 0-12. `encode_gzip_reader_to_writer` streams when
+        // the level's bytes provably cannot change and falls back to the
+        // whole-buffer encoder otherwise, so this routing function carries no
+        // level-dependent branch of its own.
+        //
+        // The `anatomy-wall` CLI span (feature default OFF, compiles to just
+        // the body) encloses the whole T1 route so the instrument's level-2
+        // conservation check covers it. This block must EVALUATE to `bytes`
+        // rather than `return` it — an early return would jump past the
+        // macro's elapsed-time accumulation, leaving `cli_ns` at zero while
+        // every inner region reported normally.
         let mut writer = writer;
-        writer.write_all(&gz)?;
+        let bytes = crate::anatomy_wall_cli!({
+            crate::compress::deflate::encode_gzip_reader_to_writer(
+                &mut reader,
+                &mut writer,
+                args.compression_level as u32,
+            )?
+        });
         writer.flush()?;
         return Ok(bytes);
     }
@@ -161,7 +204,7 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn compress_raw_bytes(data: &[u8], level: u8) -> crate::error::GzippyResult<Vec<u8>> {
     let level = level.clamp(0, 12);
-    Ok(crate::compress::deflate::compress_oneshot(
+    Ok(crate::compress::deflate::encode_deflate_bytes_to_vec(
         data,
         level as u32,
     ))

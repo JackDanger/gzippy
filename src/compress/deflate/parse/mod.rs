@@ -18,8 +18,10 @@
 
 use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
-use super::huffman::{build_dynamic_header, make_huffman_code, HuffmanCode};
+use super::encode_types::{BlockRole, InputMode};
+use super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
 use super::level::{LevelParams, Strategy};
+use super::matchfinder::hc::WINDOW_SIZE;
 use super::tables::{
     length_slot, offset_slot, static_litlen_freqs, static_offset_freqs,
     DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN, DEFLATE_BLOCKTYPE_STATIC_HUFFMAN, DEFLATE_END_OF_BLOCK,
@@ -161,14 +163,25 @@ impl Sink {
     fn push_literal(&mut self, lit: u8) {
         crate::anatomy_count!(literals_emitted);
         crate::anatomy_count!(histogram_updates);
-        // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
-        // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
-        unsafe {
-            *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
+        // `bucket-oracle-no-histogram` (Cargo.toml doc comment): skip the
+        // freq/stats histogram work, keep the real emission bookkeeping.
+        #[cfg(not(feature = "bucket-oracle-no-histogram"))]
+        {
+            // SAFETY: `lit` is a u8 (0..=255) and `litlen_freqs` has
+            // DEFLATE_NUM_LITLEN_SYMS (288) entries, so `lit as usize` is in bounds.
+            unsafe {
+                *self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;
+            }
+            self.stats.observe_literal(lit);
         }
-        self.stats.observe_literal(lit);
-        self.litrun += 1;
-        self.block_length += 1;
+        // `bucket-oracle-no-emission` (Cargo.toml doc comment): skip the
+        // emission bookkeeping that feeds the eventual token, keep the real
+        // histogram work above.
+        #[cfg(not(feature = "bucket-oracle-no-emission"))]
+        {
+            self.litrun += 1;
+            self.block_length += 1;
+        }
     }
 
     /// Fast-path literal push: frequency bump + run counter only.
@@ -235,18 +248,29 @@ impl Sink {
         debug_assert!((1..=32768).contains(&offset));
         let ls = length_slot(length) as usize;
         let os = offset_slot(offset) as usize;
-        // SAFETY: `length_slot` returns 0..=28 so `DEFLATE_FIRST_LEN_SYM + ls`
-        // (257..=285) is < DEFLATE_NUM_LITLEN_SYMS (288); `offset_slot` returns
-        // 0..=29 so `os` is < DEFLATE_NUM_OFFSET_SYMS (32). Both are in bounds.
-        unsafe {
-            *self
-                .litlen_freqs
-                .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
-            *self.offset_freqs.get_unchecked_mut(os) += 1;
+        // `bucket-oracle-no-histogram` (Cargo.toml doc comment): skip the
+        // freq/stats histogram work, keep the real emission bookkeeping.
+        #[cfg(not(feature = "bucket-oracle-no-histogram"))]
+        {
+            // SAFETY: `length_slot` returns 0..=28 so `DEFLATE_FIRST_LEN_SYM + ls`
+            // (257..=285) is < DEFLATE_NUM_LITLEN_SYMS (288); `offset_slot` returns
+            // 0..=29 so `os` is < DEFLATE_NUM_OFFSET_SYMS (32). Both are in bounds.
+            unsafe {
+                *self
+                    .litlen_freqs
+                    .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM + ls) += 1;
+                *self.offset_freqs.get_unchecked_mut(os) += 1;
+            }
+            self.stats.observe_match(length);
         }
-        self.stats.observe_match(length);
-        self.push_seq(length, offset, os);
-        self.block_length += length as usize;
+        // `bucket-oracle-no-emission` (Cargo.toml doc comment): skip the
+        // token write + emission bookkeeping, keep the real histogram work
+        // above.
+        #[cfg(not(feature = "bucket-oracle-no-emission"))]
+        {
+            self.push_seq(length, offset, os);
+            self.block_length += length as usize;
+        }
     }
 }
 
@@ -326,6 +350,136 @@ pub(super) fn compress(
         Strategy::NearOptimal => {
             near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
         }
+    }
+}
+
+// ---- resumable (streaming) parse state ----
+
+/// Everything a parser must carry from one streaming chunk to the next.
+///
+/// The whole-buffer entry points build this fresh per call, so their behaviour
+/// is unchanged. The streaming encoder keeps ONE across the whole file, which
+/// is what makes streamed output byte-identical to whole-buffer output: match
+/// choices depend on the matchfinder's accumulated chains, so a matchfinder
+/// rebuilt per chunk would make different choices at every seam even though
+/// every candidate it could legally reference is within the 32 KiB window.
+pub(super) struct ParseState {
+    pub mf: crate::compress::deflate::matchfinder::hc::PooledHc,
+    /// Base offset the matchfinder's stored positions are relative to.
+    /// ALWAYS a multiple of [`WINDOW_SIZE`], with `in_next - in_base` in
+    /// `0..WINDOW_SIZE` — see `HcMatchfinder`'s slide condition.
+    pub in_base: usize,
+    pub next_hashes: [u32; 2],
+}
+
+impl ParseState {
+    pub fn new() -> Self {
+        Self {
+            mf: crate::anatomy_wall_time!(mf_new_ns, mf_new_calls, {
+                crate::compress::deflate::matchfinder::hc::HcMatchfinder::acquire()
+            }),
+            in_base: 0,
+            next_hashes: [0u32; 2],
+        }
+    }
+
+    // Used by the sliding-buffer streaming loop, which lands next; the
+    // resumable parsers above are the half of that change that could be
+    // verified independently (whole-buffer output byte-identical, full suite
+    // green), so it is committed separately rather than as one large diff.
+    #[allow(dead_code)]
+    /// Largest amount the caller may shift buffer contents down by while
+    /// keeping at least one full window of history behind `in_base`.
+    ///
+    /// Returns a multiple of [`WINDOW_SIZE`], because the matchfinder stores
+    /// each position as `pos - in_base` and slides in exact window steps: a
+    /// shift that is not a whole number of windows would leave `in_next -
+    /// in_base` outside `0..WINDOW_SIZE` and corrupt every chain index.
+    pub fn max_shift(&self) -> usize {
+        self.in_base.saturating_sub(WINDOW_SIZE)
+    }
+
+    #[allow(dead_code)]
+    /// Tell the state the caller moved buffer contents down by `shift` bytes.
+    ///
+    /// O(1) and lossless: stored nodes are offsets from `in_base`, so
+    /// decrementing `in_base` by the same amount leaves every
+    /// `in_base + node` pointing at the same BYTE in the moved buffer. No
+    /// table rebase, no chain rebuild. `shift` must come from
+    /// [`max_shift`](Self::max_shift).
+    pub fn shift_down(&mut self, shift: usize) {
+        debug_assert_eq!(shift % WINDOW_SIZE, 0, "shift must be whole windows");
+        debug_assert!(shift <= self.in_base, "shift would push in_base negative");
+        self.in_base -= shift;
+    }
+}
+
+/// Bytes that must be available past a block's start before the streaming
+/// encoder may begin that block.
+///
+/// [`choose_max_block_end`] consults `in_end` ONLY when fewer than
+/// `SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH` bytes remain; above that it
+/// returns `block_begin + SOFT_MAX_BLOCK_LENGTH` regardless. So a streaming
+/// chunk that always has at least this much input in hand makes exactly the
+/// same block-boundary decisions as a whole-buffer encode — the seam becomes
+/// invisible instead of forcing a short block. The same margin also keeps
+/// `adjust_max_and_nice_len` from clamping match lengths near the buffer end,
+/// since it exceeds `DEFLATE_MAX_MATCH_LEN` by three orders of magnitude.
+pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH;
+
+/// Whether `level`'s strategy has a resumable runner, so the streaming encoder
+/// can carry one matchfinder across chunks and emit byte-identical output.
+///
+/// Greedy / Lazy / Lazy2 cover levels 2 and 4-9 — which is exactly the set
+/// whose output is byte-identical to libdeflate's and whose ties the chunk
+/// seams broke. The rest keep the per-chunk path for now: level 0 is stored
+/// and already byte-identical by chunk alignment, level 1 (Fast) and levels
+/// 10-12 (NearOptimal) have their own runners, and level 3 (LazyGated) is
+/// excluded from streaming entirely because its content detector is
+/// chunk-sensitive. This list should GROW until it is every level.
+pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
+    matches!(
+        super::level::params(level).strategy,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    )
+}
+
+/// Resume a parse over `buf[from..in_end]` using caller-owned `state`.
+///
+/// See `greedy::run_resumable` for the `consume_all` / `is_last` distinction
+/// and why the lookahead margin keeps block boundaries identical to a
+/// whole-buffer encode. Returns the position after the last complete block.
+/// Callers must check [`level_has_resumable_parser`] first; other strategies
+/// panic rather than silently emitting a differently-shaped stream.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn parse_resumable(
+    buf: &[u8],
+    state: &mut ParseState,
+    from: usize,
+    in_end: usize,
+    params: &LevelParams,
+    role: BlockRole,
+    input_mode: InputMode,
+    bw: &mut BitWriter,
+) -> usize {
+    let statics = StaticCodes::build();
+    match params.strategy {
+        Strategy::Greedy => greedy::run_resumable(
+            buf, state, from, in_end, params, &statics, bw, role, input_mode,
+        ),
+        Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
+            buf,
+            state,
+            from,
+            in_end,
+            params,
+            &statics,
+            bw,
+            matches!(params.strategy, Strategy::Lazy2),
+            role,
+            input_mode,
+        ),
+        other => unreachable!("parse_resumable called for non-resumable strategy {other:?}"),
     }
 }
 
@@ -439,40 +593,60 @@ fn emit_block(
     sink: &Sink,
     statics: &StaticCodes,
     is_final: bool,
+    header_scratch: &mut HeaderScratch,
 ) {
-    // Add the end-of-block symbol to the litlen frequencies (as the vendor does
-    // in deflate_flush_block).
-    let mut litlen_freqs = sink.litlen_freqs;
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
+    // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
+    // this block, before any bit is written: both candidate Huffman codes,
+    // the dynamic header, and the three-way stored/static/dynamic cost
+    // comparison. Zero cost when `anatomy-wall` is off.
+    let (litcode, offcode, header, dynamic_bits, static_bits, stored_bits) =
+        crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
+            // Add the end-of-block symbol to the litlen frequencies (as the
+            // vendor does in deflate_flush_block).
+            let mut litlen_freqs = sink.litlen_freqs;
+            litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-    let litcode = make_huffman_code(
-        DEFLATE_NUM_LITLEN_SYMS,
-        MAX_LITLEN_CODEWORD_LEN,
-        &litlen_freqs,
-    );
-    let offcode = make_huffman_code(
-        DEFLATE_NUM_OFFSET_SYMS,
-        MAX_OFFSET_CODEWORD_LEN,
-        &sink.offset_freqs,
-    );
-    let header = build_dynamic_header(&litcode.lens, &offcode.lens);
+            let litcode = make_huffman_code(
+                DEFLATE_NUM_LITLEN_SYMS,
+                MAX_LITLEN_CODEWORD_LEN,
+                &litlen_freqs,
+            );
+            let offcode = make_huffman_code(
+                DEFLATE_NUM_OFFSET_SYMS,
+                MAX_OFFSET_CODEWORD_LEN,
+                &sink.offset_freqs,
+            );
+            let header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
 
-    let dynamic_bits = 3
-        + header.header_bits()
-        + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
-    let static_bits = 3 + cost_from_freqs(
-        &litlen_freqs,
-        &sink.offset_freqs,
-        &statics.litcode,
-        &statics.offcode,
-    );
-    let stored_bits = stored_block_bits(sink.block_length);
+            let dynamic_bits = 3
+                + header.header_bits()
+                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
+            let static_bits = 3 + cost_from_freqs(
+                &litlen_freqs,
+                &sink.offset_freqs,
+                &statics.litcode,
+                &statics.offcode,
+            );
+            let stored_bits = stored_block_bits(sink.block_length);
+            (
+                litcode,
+                offcode,
+                header,
+                dynamic_bits,
+                static_bits,
+                stored_bits,
+            )
+        });
 
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
         // blocks_emitted_stored is counted in `write_stored_subblock`
         // (deflate/mod.rs) — the single physical-BTYPE=00-block emission
         // site, shared with the T>1 pipelined sync-flush path — not here,
-        // to avoid double-counting (see that function's doc comment).
+        // to avoid double-counting (see that function's doc comment). Note
+        // for `anatomy-wall`: a stored block never enters `huffman_encode`
+        // at all (no Huffman machinery involved) — its byte-copy cost
+        // lands in RESIDUAL, which is correct: it genuinely isn't Huffman
+        // encoding time.
         super::emit_stored_block(
             bw,
             &buf[block_start..block_start + sink.block_length],
@@ -482,20 +656,30 @@ fn emit_block(
         crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
-        emit_sequences(
-            bw,
-            buf,
-            block_start,
-            sink,
-            &statics.litcode,
-            &statics.offcode,
-        );
+        // `anatomy-wall` region: `huffman_encode` — walks this block's
+        // tokens and writes codeword bits via `BitWriter`. Bitstream
+        // flush/serialization (`BitWriter::add_bits`'s internal
+        // `flush_word_unchecked`) is FUSED into this region, not
+        // separately timed — see `anatomy_wall` module docs for why
+        // (fires roughly once per ~56 bits, thousands of times per block).
+        crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
+            emit_sequences(
+                bw,
+                buf,
+                block_start,
+                sink,
+                &statics.litcode,
+                &statics.offcode,
+            );
+        });
     } else {
         crate::anatomy_count!(blocks_emitted_dynamic);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);
-        emit_sequences(bw, buf, block_start, sink, &litcode, &offcode);
+        crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
+            emit_sequences(bw, buf, block_start, sink, &litcode, &offcode);
+        });
     }
 }
 
@@ -518,16 +702,20 @@ fn emit_block_static_or_stored(
     statics: &StaticCodes,
     is_final: bool,
 ) {
-    let mut litlen_freqs = sink.litlen_freqs;
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
+    let (static_bits, stored_bits) =
+        crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
+            let mut litlen_freqs = sink.litlen_freqs;
+            litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-    let static_bits = 3 + cost_from_freqs(
-        &litlen_freqs,
-        &sink.offset_freqs,
-        &statics.litcode,
-        &statics.offcode,
-    );
-    let stored_bits = stored_block_bits(sink.block_length);
+            let static_bits = 3 + cost_from_freqs(
+                &litlen_freqs,
+                &sink.offset_freqs,
+                &statics.litcode,
+                &statics.offcode,
+            );
+            let stored_bits = stored_block_bits(sink.block_length);
+            (static_bits, stored_bits)
+        });
 
     if stored_bits <= static_bits {
         // See the sibling `emit_block`'s comment: counted in
@@ -541,14 +729,16 @@ fn emit_block_static_or_stored(
         crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
-        emit_sequences(
-            bw,
-            buf,
-            block_start,
-            sink,
-            &statics.litcode,
-            &statics.offcode,
-        );
+        crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
+            emit_sequences(
+                bw,
+                buf,
+                block_start,
+                sink,
+                &statics.litcode,
+                &statics.offcode,
+            );
+        });
     }
 }
 

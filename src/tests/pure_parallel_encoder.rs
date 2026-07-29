@@ -95,7 +95,7 @@ fn mixed_corpus(len: usize) -> Vec<u8> {
         b"the quick brown fox jumps over the lazy dog; ",
         b"cross-chunk back-references must resolve against the seeded window. ",
         b"lorem ipsum dolor sit amet consectetur adipiscing elit; ",
-        b"pub fn compress_block_streaming(data, dict, level, is_last, out) {} ",
+        b"pub fn encode_deflate_segment_to_sink(data, dict, level, is_last, out) {} ",
         b"0123456789abcdef 0123456789abcdef structure structure structure ",
     ];
     let mut i = 0usize;

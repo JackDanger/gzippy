@@ -122,7 +122,7 @@ mod tests {
     #[cfg(feature = "ffi-oracle")]
     #[test]
     fn pure_encoder_roundtrips_through_ffi_decoders() {
-        use crate::compress::deflate::compress_gzip as pure_gzip;
+        use crate::compress::deflate::encode_gzip_bytes_to_vec as pure_gzip;
         let corpora = [
             ("mixed-512KiB", make_mixed_data(512 * 1024)),
             ("literal-512KiB", make_literal_data(512 * 1024)),

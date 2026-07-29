@@ -134,6 +134,12 @@ fn main() {
     #[cfg(feature = "anatomy-counters")]
     compress::deflate::anatomy_counters::flush_to_stderr();
 
+    // `anatomy-wall` feature (default OFF, compiles to nothing when off):
+    // the wall-clock phase-timer sibling of `anatomy-counters` above — see
+    // src/compress/deflate/anatomy_wall.rs module docs.
+    #[cfg(feature = "anatomy-wall")]
+    compress::deflate::anatomy_wall::flush_to_stderr();
+
     match result {
         Ok(exit_code) => fast_exit_success(exit_code),
         Err(e) => {
@@ -181,6 +187,21 @@ fn fast_exit_success(exit_code: i32) -> ! {
         unsafe { libc::_exit(0) };
     }
     process::exit(exit_code);
+}
+
+/// gzip's real exit-code precedence, established by execution (gzip 1.14):
+/// ERROR (1) ALWAYS wins regardless of arrival order; WARNING (2) — e.g. "is
+/// a directory -- ignored" — only takes the code if nothing worse has been
+/// recorded yet. A multi-file invocation with `good1 baddir missing2 good2`
+/// still processes both good files AND settles on exit 1 (error), never 2,
+/// regardless of whether the directory-warning or the missing-file-error
+/// argument came first — verified both orders give exit 1 on real gzip.
+fn bump_exit_code(exit_code: &mut i32, new_code: i32) {
+    if new_code == 1 {
+        *exit_code = 1;
+    } else if new_code != 0 && *exit_code == 0 {
+        *exit_code = new_code;
+    }
 }
 
 fn run() -> Result<i32, GzippyError> {
@@ -303,6 +324,16 @@ fn run() -> Result<i32, GzippyError> {
         let mut total_comp = 0u64;
         let mut total_uncomp = 0u64;
         for file in &args.files {
+            if Path::new(file).is_dir() {
+                // Same contract as compress/decompress/-t (see comment on
+                // compress_file): exit 2, this exact message, skip the file,
+                // keep processing the rest.
+                if !args.quiet {
+                    eprintln!("gzippy: {} is a directory -- ignored", file);
+                }
+                bump_exit_code(&mut exit_code, 2);
+                continue;
+            }
             match list_file(file, &args) {
                 Ok((comp, uncomp)) => {
                     total_comp += comp;
@@ -310,7 +341,7 @@ fn run() -> Result<i32, GzippyError> {
                 }
                 Err(e) => {
                     eprintln!("gzippy: {}: {}", file, e);
-                    exit_code = 1;
+                    bump_exit_code(&mut exit_code, 1);
                 }
             }
         }
@@ -352,13 +383,11 @@ fn run() -> Result<i32, GzippyError> {
 
             match result {
                 Ok(code) => {
-                    if code != 0 {
-                        exit_code = code;
-                    }
+                    bump_exit_code(&mut exit_code, code);
                 }
                 Err(e) => {
                     eprintln!("gzippy: {}: {}", file, e);
-                    exit_code = 1;
+                    bump_exit_code(&mut exit_code, 1);
                 }
             }
         }
@@ -376,6 +405,15 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
     if !input_path.exists() {
         return Err(GzippyError::FileNotFound(filename.to_string()));
     }
+    if input_path.is_dir() {
+        // Same contract as compress_file/decompress_file: `gzip -t somedir`
+        // exits 2 (WARNING) with this exact message, established by
+        // execution (gzip 1.14). Never opens/mmaps the directory.
+        if !args.quiet {
+            eprintln!("gzippy: {} is a directory -- ignored", filename);
+        }
+        return Ok(2);
+    }
 
     let input_file = File::open(input_path)?;
     let mmap = unsafe { Mmap::map(&input_file)? };
@@ -386,8 +424,14 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
 
     match result {
         Ok(_) => {
-            if !args.quiet {
-                eprintln!("{}: OK", filename);
+            // gzip's contract, established by execution: `gzip -t` is SILENT on
+            // success and only `gzip -tv` reports. We printed unconditionally
+            // (unless --quiet), which inverts the standard failure check
+            // `gzip -t f 2>&1 | grep -q .` for every drop-in user. Errors below
+            // still report unconditionally. (pigz is silent even with -tv; we
+            // follow gzip, the primary drop-in target.)
+            if args.verbose {
+                eprintln!("{}:\t OK", filename);
             }
             Ok(0)
         }
@@ -414,8 +458,9 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
 
     match result {
         Ok(_) => {
-            if !args.quiet {
-                eprintln!("stdin: OK");
+            // See the note on the file path above: silent on success unless -v.
+            if args.verbose {
+                eprintln!("stdin:\t OK");
             }
             Ok(0)
         }

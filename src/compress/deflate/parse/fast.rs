@@ -46,6 +46,7 @@
 //! not duplicate it.
 
 use super::super::bitstream::BitWriter;
+use super::super::huffman::HeaderScratch;
 use super::super::matchfinder::common::{load_u24, load_u32, lz_extend, lz_hash, prefetch_write};
 #[cfg(feature = "l1-tune")]
 use super::super::matchfinder::hc::HcMatchfinder;
@@ -118,6 +119,38 @@ struct FastLocalCounters {
 impl FastLocalCounters {
     #[inline(always)]
     fn flush(self) {
+        // RECONCILIATION ASSERTION (2026-07-25, added alongside the
+        // double-count fix above): outcome buckets are DEFINED to be an
+        // exact partition of attempts — `attempts == miss + too_short +
+        // accepted + deferred` — because every attempt resolves to exactly
+        // one of those four outcomes (see `process_position_l1`'s doc
+        // comment on the charge-once-after-hash3-rescue fix). This is a
+        // real, non-tautological check on the ACTUAL local counts gathered
+        // this `run()` call, not a restatement of the formula below: a
+        // regression that reintroduces double-charging (or under-charging)
+        // any bucket trips this immediately, in every anatomy-counters
+        // build, not just under `tests/anatomy_counters.rs`'s specific
+        // fixtures. `assert_eq!` (not `debug_assert!`): this feature is
+        // already a diagnostic-only, off-by-default build with its own
+        // measured wall tax, so keeping the check compiled in release too
+        // costs nothing production cares about and this bug class must
+        // never return silently.
+        assert_eq!(
+            self.probe_attempts,
+            self.probe_outcome_miss
+                + self.probe_outcome_too_short
+                + self.probe_outcome_accepted
+                + self.probe_outcome_deferred,
+            "fast_probe_attempts ({}) must partition exactly into miss({}) + \
+             too_short({}) + accepted({}) + deferred({}) -- a mismatch here means \
+             a position's outcome was charged twice (or never), see the 2026-07-25 \
+             double-count fix in process_position_l1",
+            self.probe_attempts,
+            self.probe_outcome_miss,
+            self.probe_outcome_too_short,
+            self.probe_outcome_accepted,
+            self.probe_outcome_deferred,
+        );
         crate::anatomy_count!(
             fast_positions_processed,
             self.positions_processed_matches
@@ -532,7 +565,7 @@ pub mod tune {
         /// THE T1-ONLY MEASUREMENT MISSED THE DOMINANT COST: `run()` is
         /// called ONCE PER FILE at T1 but ONCE PER 512KB CHUNK at T>1
         /// (`compress::pipelined::compress_parallel_pipeline_pure`'s
-        /// per-block `compress_block_streaming` call, `MAX_PARALLEL_
+        /// per-block `encode_deflate_segment_to_sink` call, `MAX_PARALLEL_
         /// BLOCK_SIZE`), and [`Self::hash3_gate_initial_active`]'s "silent
         /// until the first block's signal is known" cost is paid AT THE
         /// START OF EVERY CHUNK, not once per file. On `dd79_bin6`
@@ -851,6 +884,43 @@ pub(super) const L1_HASH3_BITS: u32 = 15;
 /// candidate (see [`hash3_candidate`]'s doc comment) — the DEFLATE window
 /// size, i.e. the gate never rejects a length-3 candidate purely for
 /// distance (measured best on the composed sweep).
+///
+/// FALSIFY (2026-07-25, solvency AMD Zen2, `fulcrum paired` n=15, A/A clean,
+/// /dev/null both arms, roundtrip + exact-size gates): **lowering this constant
+/// is NOT an exit for the `weights.safetensors x libdeflate-1` LOSS cell, and
+/// this constant is not a WALL lever at all.** Driving it 32768 -> 0 (full
+/// hash3 shutoff) on `weights.safetensors`:
+///   size vs libdeflate-1  1.003656 -> 1.000108  (97% of the size gap closed,
+///                                                but never reaches <= 1.0)
+///   wall vs libdeflate-1  1.6914x  -> 1.6743x   (~1% -- i.e. flat)
+/// CORRECTION (same day, same rig): BOTH arms above ran on an `l1-tune` feature
+/// build (required -- `max_dist` is only runtime-settable there). That build is
+/// ~17% SLOWER than what ships, for knob-plumbing reasons unrelated to any lever:
+/// interleaved A/B of the l1-tune binary (tuned to the shipped consts, output
+/// BYTE-IDENTICAL, size_ratio=1.0) vs a vanilla `cargo build --release` binary at
+/// the same commit gave ratio=1.1702, sign 15/15, spread 0.0117. The RELATIVE
+/// result above is unaffected (both arms carry the same tax) but the ABSOLUTE
+/// deficit is inflated. Production deficit vs libdeflate-1 on this file is
+/// **1.4515x** (sign 15/15, spread 0.0057). Never quote an l1-tune build's ratio
+/// against a RIVAL; it is only valid against another l1-tune build.
+/// A Gate-2 perturbation of >=2 magnitudes that moves the wall 1% means hash3
+/// is NOT on this cell's critical wall path. Both LOSS axes therefore survive
+/// full shutoff. Second, independent blocker: the same shutoff destroys
+/// `dd79_bin6`'s pigz-1 size win (0.997516 -> 1.040685), so the constant cannot
+/// be lowered corpus-wide regardless.
+///
+/// REDIRECT implied by the same run (recorded so the next reader does not
+/// repeat the mis-sizing): this LOSS cell is **0.37% on size and 69% on the
+/// wall** (0.37% / 45%, using the corrected production wall above). Prior work on
+/// it targeted the size axis (length-3 match census,
+/// `entropy_tables` share) because size is deterministic and cheap to
+/// instrument. Any further work on this cell belongs on the wall axis; a
+/// content-adaptive hash3 gate separating weights from bin6 would, even if it
+/// worked perfectly, close 0.37% of a 45% deficit. And the deficit is NOT
+/// weights-specific: same rig, production binary, n=15, /dev/null both arms --
+/// photo.jpg 1.4627x, armexe.elf 1.3558x, monorepo.tar 1.0145x, access.log
+/// 0.9519x (gzippy FASTER). It is a content-class relationship (binary /
+/// high-entropy slow, plain text fast), not a property of this file.
 pub(super) const L1_HASH3_MAX_DIST: usize = WINDOW;
 /// Probe policy: `false` (policy (a), miss-only — the cheapest, measured
 /// best) probes `head3` ONLY when the primary 4-byte probe did not already
@@ -1691,6 +1761,28 @@ fn process_position_l1(
     // the window range instead of panicking on underflow.
     let dist = pos.wrapping_sub(cand as usize);
     let mut accepted: Option<(u32, usize)> = None;
+    // Primary-probe outcome classification, DEFERRED (2026-07-25 double-count
+    // fix) until AFTER the hash3 rescue check below has had its chance to
+    // turn this into an accept/defer. The bug this replaces: the ORIGINAL
+    // code incremented `probe_outcome_miss`/`probe_outcome_too_short`
+    // immediately here, before knowing whether hash3 would rescue the
+    // position — so a hash3-rescued position was charged into BOTH its
+    // primary miss/too-short bucket (here) AND its final accepted/deferred
+    // bucket (below, once `accepted` resolves), violating the outcome
+    // buckets' partition invariant (`fast_probe_attempts == miss + too_short
+    // + accepted + deferred`, `tests/anatomy_counters.rs`'s
+    // `assert_fast_common_invariants`) and inflating the DERIVED
+    // `fast_positions_processed` sum by the same double-counted position
+    // (see `FastLocalCounters::flush`'s doc comment: `positions_processed`
+    // sums `positions_processed_matches + miss + too_short + deferred +
+    // no_probe_literals` — a rescued position contributed to BOTH a
+    // miss/too_short term AND an accepted/deferred term, so the derived
+    // total gained 1 extra "processed" byte per rescue). `primary_too_short`
+    // is only ever READ when `accepted` is still `None` after the hash3
+    // check (see below); when the primary probe itself accepted (`accepted`
+    // set to `Some` in this same `if`), this flag is never consulted.
+    #[cfg(feature = "anatomy-counters")]
+    let mut primary_too_short = false;
     if (1..=WINDOW).contains(&dist) {
         let cand_pos = cand as usize;
         // Byte-exact extend (never trusts the hash): a spurious
@@ -1701,15 +1793,12 @@ fn process_position_l1(
         } else {
             #[cfg(feature = "anatomy-counters")]
             {
-                local.probe_outcome_too_short += 1;
+                primary_too_short = true;
             }
         }
-    } else {
-        #[cfg(feature = "anatomy-counters")]
-        {
-            local.probe_outcome_miss += 1;
-        }
     }
+    // (dist not in window at all -> primary_too_short stays false, i.e. the
+    // eventual charge below correctly falls to `probe_outcome_miss`.)
 
     // HASH3-PROBE decision. Policy (a) (shipped default, `!always_probe`)
     // only reaches `hash3_candidate` when the primary probe did NOT already
@@ -1727,6 +1816,24 @@ fn process_position_l1(
             };
             if take {
                 accepted = Some((l3, d3));
+            }
+        }
+    }
+
+    // Charge the primary-probe outcome bucket EXACTLY ONCE, now that the
+    // hash3 rescue above has had its chance: a position lands in
+    // `probe_outcome_miss`/`probe_outcome_too_short` only if it is STILL
+    // unaccepted at this point (hash3 disabled/inactive, or it tried and
+    // found nothing). If hash3 rescued it, `accepted` is `Some` here and
+    // this charge is skipped entirely — the position's outcome bucket gets
+    // set exactly once, below at the accepted/deferred sites, never twice.
+    #[cfg(feature = "anatomy-counters")]
+    {
+        if accepted.is_none() {
+            if primary_too_short {
+                local.probe_outcome_too_short += 1;
+            } else {
+                local.probe_outcome_miss += 1;
             }
         }
     }
@@ -2643,11 +2750,53 @@ fn fastloop_l1_lean(
     pos
 }
 
+thread_local! {
+    /// Per-thread recycled `head` table (see `acquire_head_table`).
+    static HEAD_POOL: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread recycled HASH3-PROBE `head3` table (see
+    /// `acquire_head_table`). Kept separate from `HEAD_POOL` because the two
+    /// tables have different sizes (`HASH_SIZE` fixed vs `1 << hash3.bits`)
+    /// and are both live at once within a single `run()` call.
+    static HEAD3_POOL: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Acquire a `len`-element `Vec<u32>` filled with [`NO_POS`], reused from
+/// this thread's pool (`HEAD_POOL`/`HEAD3_POOL`) when a previous chunk left
+/// one there, or freshly allocated on this thread's first use.
+///
+/// Same rationale as `HcMatchfinder::acquire`: `run()` is called once per
+/// CHUNK in the T>1 parallel path, but a single `infra::scheduler` worker
+/// thread processes many chunks sequentially (chunk count can exceed thread
+/// count), so pooling turns "one allocation per chunk" into "one allocation
+/// per THREAD, ever" — `thread_local!` means no cross-thread sharing, so
+/// chunk-independence is untouched (every chunk still starts from a
+/// fully-`NO_POS`-filled table, byte-identical to a fresh `vec![NO_POS; len]`).
+/// Give the table back with [`release_head_table`] once `run()` is done
+/// with it.
+fn acquire_head_table(
+    pool: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u32>>>,
+    len: usize,
+) -> Vec<u32> {
+    let mut v = pool.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    v.clear();
+    v.resize(len, NO_POS);
+    v
+}
+
+/// Return a table acquired via [`acquire_head_table`] to its thread-local
+/// pool for the next `run()` call on this thread.
+fn release_head_table(
+    pool: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u32>>>,
+    v: Vec<u32>,
+) {
+    pool.with(|cell| *cell.borrow_mut() = v);
+}
+
 /// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending one
 /// or more DEFLATE blocks to `bw`.
 ///
 /// `buf` MUST carry at least [`super::BUF_PAD`] trailing pad bytes beyond
-/// `in_end` (upheld by the caller in `deflate::compress_block`) so the
+/// `in_end` (upheld by the caller in `deflate::encode_deflate_bytes_to_sink`) so the
 /// speculative 4-byte hash loads and 8-byte match-extend loads never read out of
 /// bounds. `buf[..data_start]` is an optional preset dictionary: its positions
 /// are seeded into the head table so matches may reference it, but it is not
@@ -2679,8 +2828,11 @@ pub(super) fn run<const ACCEL: bool>(
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
 
-    // Chainless head table: one slot per hash, holding the most recent position.
-    let mut head = vec![NO_POS; HASH_SIZE];
+    // Chainless head table: one slot per hash, holding the most recent
+    // position. Pulled from a thread-local pool (see `acquire_head_table`'s
+    // doc comment) instead of freshly allocated every `run()` call — same
+    // per-chunk-vs-per-thread rationale as `HcMatchfinder::acquire`.
+    let mut head = acquire_head_table(&HEAD_POOL, HASH_SIZE);
     let base = buf.as_ptr();
 
     // `l1-tune` bucket2 lever's second table (search-only; see `tune`'s doc
@@ -2731,7 +2883,7 @@ pub(super) fn run<const ACCEL: bool>(
     // allocation. No longer `l1-tune`-only: this table backs the DEFAULT L1
     // path now.
     let mut head3: Vec<u32> = if !ACCEL && hash3.enabled {
-        vec![NO_POS; 1usize << hash3.bits]
+        acquire_head_table(&HEAD3_POOL, 1usize << hash3.bits)
     } else {
         Vec::new()
     };
@@ -2765,6 +2917,9 @@ pub(super) fn run<const ACCEL: bool>(
 
     // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
     let mut sink = Sink::new();
+    // One dynamic-header scratch buffer for the WHOLE `run()` call (see
+    // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
+    let mut header_scratch = HeaderScratch::new();
     let mut pos = data_start;
 
     // CONTENT-ADAPTIVE CHAIN MATCHING state (`l1-tune` only; see
@@ -2850,7 +3005,15 @@ pub(super) fn run<const ACCEL: bool>(
             sink.block_length = pos - block_begin;
             let is_final = is_last && pos == in_end;
             if use_dynamic {
-                emit_block(bw, buf, block_begin, &sink, statics, is_final);
+                emit_block(
+                    bw,
+                    buf,
+                    block_begin,
+                    &sink,
+                    statics,
+                    is_final,
+                    &mut header_scratch,
+                );
             } else {
                 emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
             }
@@ -2889,205 +3052,216 @@ pub(super) fn run<const ACCEL: bool>(
         // identical bytes.
         let fast_end = block_end_target.min(in_end.saturating_sub(DEFLATE_MAX_MATCH_LEN as usize));
 
-        // Dispatch to a fully separate, non-generic fastloop per level
-        // rather than sharing one `if ACCEL {...} else {...}`-gated body:
-        // see [`fastloop_l0`]'s doc comment for why (a measured x86_64-only
-        // codegen interaction through the shared-function shape, absent on
-        // aarch64). `ACCEL` is still a compile-time constant here, so this
-        // `if` itself compiles to a direct, unconditional call at each of
-        // `run`'s two monomorphizations — no runtime dispatch either.
-        //
-        // MONOMORPHIZED HASH3 SPECIALIZATION (default build only — see
-        // [`fastloop_l1_lean`]'s doc comment): a NON-ACCEL block ALSO
-        // dispatches on `hash3_active`, this block's own already-computed
-        // one-block-lag literal-fraction decision (the SAME value threaded
-        // into `fastloop_l1` below), choosing the full-featured
-        // `fastloop_l1` when the block is gate-active (bin/sqlite-class) and
-        // the leaner `fastloop_l1_lean` when it is gate-inactive
-        // (text-class) — see `process_position_l1_lean`'s doc comment for
-        // why this reuses (not recomputes) the existing detector state and
-        // is byte-identical to today's shared-function decisions for that
-        // block. `l1-tune` keeps calling `fastloop_l1` unconditionally: the
-        // dev search harness needs every knob reachable at runtime
-        // regardless of the block's gate state, so it must never take the
-        // hardcoded lean path.
-        #[cfg(feature = "l1-tune")]
-        {
-            pos = if ACCEL {
-                fastloop_l0(
-                    pos,
-                    fast_end,
-                    buf,
-                    base,
-                    &mut head,
-                    &mut sink,
-                    limit_hash_update_inserts,
-                    #[cfg(feature = "anatomy-counters")]
-                    &mut local,
-                )
-            } else {
-                fastloop_l1(
-                    pos,
-                    fast_end,
-                    buf,
-                    base,
-                    &mut head,
-                    &mut sink,
-                    limit_hash_update_inserts,
-                    #[cfg(feature = "anatomy-counters")]
-                    &mut local,
-                    &mut head2,
-                    &mut head3,
-                    l1_tune,
-                    hash3,
-                    hash3_active,
-                    peek_active,
-                )
-            };
-        }
-        #[cfg(not(feature = "l1-tune"))]
-        {
-            pos = if ACCEL {
-                fastloop_l0(
-                    pos,
-                    fast_end,
-                    buf,
-                    base,
-                    &mut head,
-                    &mut sink,
-                    limit_hash_update_inserts,
-                    #[cfg(feature = "anatomy-counters")]
-                    &mut local,
-                )
-            } else if hash3_active {
-                fastloop_l1(
-                    pos,
-                    fast_end,
-                    buf,
-                    base,
-                    &mut head,
-                    &mut sink,
-                    limit_hash_update_inserts,
-                    #[cfg(feature = "anatomy-counters")]
-                    &mut local,
-                    &mut head3,
-                    hash3,
-                    hash3_active,
-                    peek_active,
-                )
-            } else {
-                fastloop_l1_lean(
-                    pos,
-                    fast_end,
-                    buf,
-                    base,
-                    &mut head,
-                    &mut sink,
-                    limit_hash_update_inserts,
-                    #[cfg(feature = "anatomy-counters")]
-                    &mut local,
-                )
-            };
-        }
-
-        // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
-        // block), where `max_len` must be clamped per position.
-        while pos < block_end_target {
-            let remaining = in_end - pos;
-            let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
-                DEFLATE_MAX_MATCH_LEN
-            } else {
-                remaining as u32
-            };
-
-            if max_len >= SHORTEST_MATCH {
-                // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
-                let seq = unsafe { load_u32(base, pos) };
-                let h = lz_hash(seq, HASH_BITS) as usize;
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.hash_computations += 1;
-                }
-                let cand = head[h];
-                head[h] = pos as u32;
-                #[cfg(feature = "anatomy-counters")]
-                {
-                    local.head_table_reads += 1;
-                    local.probe_attempts += 1;
-                }
-
-                // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
-                // the window range instead of panicking on underflow.
-                let dist = pos.wrapping_sub(cand as usize);
-                if (1..=WINDOW).contains(&dist) {
-                    let cand_pos = cand as usize;
-                    // Byte-exact extend (never trusts the hash): a spurious
-                    // candidate simply yields length < SHORTEST_MATCH -> literal.
-                    let length = lz_extend(buf, pos, cand_pos, 0, max_len);
-                    if length >= SHORTEST_MATCH {
+        // `anatomy-wall` region: `parse_match` — one timer for THIS internal
+        // block's whole parse (fastloop dispatch below + the tail loop),
+        // fusing "match-finding/probing" and "match evaluation+emission"
+        // (see `anatomy_wall` module docs for why they can't be split
+        // further at this granularity: `process_position_l1` inlines
+        // probe/extend/accept/push into one per-position function body, so
+        // there is no call boundary to put a second clock on without either
+        // timing per-position — the disallowed granularity — or fabricating
+        // a distorted split). Zero cost when `anatomy-wall` is off.
+        crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            // Dispatch to a fully separate, non-generic fastloop per level
+            // rather than sharing one `if ACCEL {...} else {...}`-gated body:
+            // see [`fastloop_l0`]'s doc comment for why (a measured x86_64-only
+            // codegen interaction through the shared-function shape, absent on
+            // aarch64). `ACCEL` is still a compile-time constant here, so this
+            // `if` itself compiles to a direct, unconditional call at each of
+            // `run`'s two monomorphizations — no runtime dispatch either.
+            //
+            // MONOMORPHIZED HASH3 SPECIALIZATION (default build only — see
+            // [`fastloop_l1_lean`]'s doc comment): a NON-ACCEL block ALSO
+            // dispatches on `hash3_active`, this block's own already-computed
+            // one-block-lag literal-fraction decision (the SAME value threaded
+            // into `fastloop_l1` below), choosing the full-featured
+            // `fastloop_l1` when the block is gate-active (bin/sqlite-class) and
+            // the leaner `fastloop_l1_lean` when it is gate-inactive
+            // (text-class) — see `process_position_l1_lean`'s doc comment for
+            // why this reuses (not recomputes) the existing detector state and
+            // is byte-identical to today's shared-function decisions for that
+            // block. `l1-tune` keeps calling `fastloop_l1` unconditionally: the
+            // dev search harness needs every knob reachable at runtime
+            // regardless of the block's gate state, so it must never take the
+            // hardcoded lean path.
+            #[cfg(feature = "l1-tune")]
+            {
+                pos = if ACCEL {
+                    fastloop_l0(
+                        pos,
+                        fast_end,
+                        buf,
+                        base,
+                        &mut head,
+                        &mut sink,
+                        limit_hash_update_inserts,
                         #[cfg(feature = "anatomy-counters")]
-                        {
-                            local.probe_outcome_accepted += 1;
-                            local.positions_processed_matches += length as u64;
-                        }
-                        // LIMIT_HASH_UPDATE: insert the hash for the first
-                        // LIMIT_HASH_UPDATE_INSERTS match-interior positions
-                        // (igzip inserts ~3), then jump the cursor over the whole
-                        // match. usize::MAX means "insert every interior position"
-                        // (zlib-ng style). length >= 4 guarantees at least the
-                        // first interior positions are inside the match; the
-                        // `.min(match_end)` clamp keeps every insert inside it.
-                        let match_end = pos + length as usize;
-                        let insert_end = if limit_hash_update_inserts == usize::MAX {
-                            match_end
-                        } else {
-                            (pos + 1 + limit_hash_update_inserts).min(match_end)
-                        };
-                        let mut nh = pos + 1;
-                        while nh < insert_end {
-                            // SAFETY: nh < match_end = pos+length <= in_end, and
-                            // buf's pad covers the 4-byte load past in_end.
-                            let s = unsafe { load_u32(base, nh) };
-                            head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
+                        &mut local,
+                    )
+                } else {
+                    fastloop_l1(
+                        pos,
+                        fast_end,
+                        buf,
+                        base,
+                        &mut head,
+                        &mut sink,
+                        limit_hash_update_inserts,
+                        #[cfg(feature = "anatomy-counters")]
+                        &mut local,
+                        &mut head2,
+                        &mut head3,
+                        l1_tune,
+                        hash3,
+                        hash3_active,
+                        peek_active,
+                    )
+                };
+            }
+            #[cfg(not(feature = "l1-tune"))]
+            {
+                pos = if ACCEL {
+                    fastloop_l0(
+                        pos,
+                        fast_end,
+                        buf,
+                        base,
+                        &mut head,
+                        &mut sink,
+                        limit_hash_update_inserts,
+                        #[cfg(feature = "anatomy-counters")]
+                        &mut local,
+                    )
+                } else if hash3_active {
+                    fastloop_l1(
+                        pos,
+                        fast_end,
+                        buf,
+                        base,
+                        &mut head,
+                        &mut sink,
+                        limit_hash_update_inserts,
+                        #[cfg(feature = "anatomy-counters")]
+                        &mut local,
+                        &mut head3,
+                        hash3,
+                        hash3_active,
+                        peek_active,
+                    )
+                } else {
+                    fastloop_l1_lean(
+                        pos,
+                        fast_end,
+                        buf,
+                        base,
+                        &mut head,
+                        &mut sink,
+                        limit_hash_update_inserts,
+                        #[cfg(feature = "anatomy-counters")]
+                        &mut local,
+                    )
+                };
+            }
+
+            // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
+            // block), where `max_len` must be clamped per position.
+            while pos < block_end_target {
+                let remaining = in_end - pos;
+                let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
+                    DEFLATE_MAX_MATCH_LEN
+                } else {
+                    remaining as u32
+                };
+
+                if max_len >= SHORTEST_MATCH {
+                    // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
+                    let seq = unsafe { load_u32(base, pos) };
+                    let h = lz_hash(seq, HASH_BITS) as usize;
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.hash_computations += 1;
+                    }
+                    let cand = head[h];
+                    head[h] = pos as u32;
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.head_table_reads += 1;
+                        local.probe_attempts += 1;
+                    }
+
+                    // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
+                    // the window range instead of panicking on underflow.
+                    let dist = pos.wrapping_sub(cand as usize);
+                    if (1..=WINDOW).contains(&dist) {
+                        let cand_pos = cand as usize;
+                        // Byte-exact extend (never trusts the hash): a spurious
+                        // candidate simply yields length < SHORTEST_MATCH -> literal.
+                        let length = lz_extend(buf, pos, cand_pos, 0, max_len);
+                        if length >= SHORTEST_MATCH {
                             #[cfg(feature = "anatomy-counters")]
                             {
-                                local.hash_computations += 1;
-                                local.interior_writes += 1;
+                                local.probe_outcome_accepted += 1;
+                                local.positions_processed_matches += length as u64;
                             }
-                            nh += 1;
-                        }
+                            // LIMIT_HASH_UPDATE: insert the hash for the first
+                            // LIMIT_HASH_UPDATE_INSERTS match-interior positions
+                            // (igzip inserts ~3), then jump the cursor over the whole
+                            // match. usize::MAX means "insert every interior position"
+                            // (zlib-ng style). length >= 4 guarantees at least the
+                            // first interior positions are inside the match; the
+                            // `.min(match_end)` clamp keeps every insert inside it.
+                            let match_end = pos + length as usize;
+                            let insert_end = if limit_hash_update_inserts == usize::MAX {
+                                match_end
+                            } else {
+                                (pos + 1 + limit_hash_update_inserts).min(match_end)
+                            };
+                            let mut nh = pos + 1;
+                            while nh < insert_end {
+                                // SAFETY: nh < match_end = pos+length <= in_end, and
+                                // buf's pad covers the 4-byte load past in_end.
+                                let s = unsafe { load_u32(base, nh) };
+                                head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
+                                #[cfg(feature = "anatomy-counters")]
+                                {
+                                    local.hash_computations += 1;
+                                    local.interior_writes += 1;
+                                }
+                                nh += 1;
+                            }
 
-                        sink.push_match_fast(length, dist as u32);
-                        pos += length as usize;
-                        continue;
-                    }
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.probe_outcome_too_short += 1;
-                    }
-                } else {
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.probe_outcome_miss += 1;
+                            sink.push_match_fast(length, dist as u32);
+                            pos += length as usize;
+                            continue;
+                        }
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.probe_outcome_too_short += 1;
+                        }
+                    } else {
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.probe_outcome_miss += 1;
+                        }
                     }
                 }
-            }
 
-            // Literal. When `max_len >= SHORTEST_MATCH`, this position was
-            // probed and already landed in `probe_outcome_miss`/`_too_short`
-            // above — its "+1 processed" is DERIVED at flush (see
-            // `FastLocalCounters::flush`'s doc comment), no explicit count
-            // needed here. The one case with NO outcome bucket at all is
-            // near-EOF `max_len < SHORTEST_MATCH` (not enough lookahead to
-            // probe, the `if` above never ran) — `no_probe_literals` is
-            // exactly that case, and only that case.
-            #[cfg(feature = "anatomy-counters")]
-            if max_len < SHORTEST_MATCH {
-                local.no_probe_literals += 1;
+                // Literal. When `max_len >= SHORTEST_MATCH`, this position was
+                // probed and already landed in `probe_outcome_miss`/`_too_short`
+                // above — its "+1 processed" is DERIVED at flush (see
+                // `FastLocalCounters::flush`'s doc comment), no explicit count
+                // needed here. The one case with NO outcome bucket at all is
+                // near-EOF `max_len < SHORTEST_MATCH` (not enough lookahead to
+                // probe, the `if` above never ran) — `no_probe_literals` is
+                // exactly that case, and only that case.
+                #[cfg(feature = "anatomy-counters")]
+                if max_len < SHORTEST_MATCH {
+                    local.no_probe_literals += 1;
+                }
+                sink.push_literal_fast(buf[pos]);
+                pos += 1;
             }
-            sink.push_literal_fast(buf[pos]);
-            pos += 1;
-        }
+        }); // end anatomy_wall_time!(parse_match_ns, ...)
 
         // The fast-path pushes skip per-push `block_length` bookkeeping; the
         // covered length is exactly the cursor distance walked this block.
@@ -3101,7 +3275,15 @@ pub(super) fn run<const ACCEL: bool>(
         let is_final = is_last && pos == in_end;
         if use_dynamic {
             // L1: cheapest of per-block dynamic / static / stored.
-            emit_block(bw, buf, block_begin, &sink, statics, is_final);
+            emit_block(
+                bw,
+                buf,
+                block_begin,
+                &sink,
+                statics,
+                is_final,
+                &mut header_scratch,
+            );
         } else {
             // L0: cheapest of static / stored only — no per-block dynamic
             // Huffman build (see `emit_block_static_or_stored`'s doc comment
@@ -3165,6 +3347,16 @@ pub(super) fn run<const ACCEL: bool>(
         if pos == in_end {
             break;
         }
+    }
+
+    // Return the head table(s) to this thread's pool for the next `run()`
+    // call (see `acquire_head_table`'s doc comment). `head3` is only
+    // released when it was actually acquired (mirrors the condition at its
+    // declaration) — releasing the `Vec::new()` placeholder from the
+    // not-enabled arm would stomp a real pooled buffer with an empty one.
+    release_head_table(&HEAD_POOL, head);
+    if !ACCEL && hash3.enabled {
+        release_head_table(&HEAD3_POOL, head3);
     }
 
     // One flush for the whole call — see `FastLocalCounters`'s doc comment.

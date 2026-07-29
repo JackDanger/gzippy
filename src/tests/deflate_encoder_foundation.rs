@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::compress::deflate::compress_gzip;
+    use crate::compress::deflate::encode_gzip_bytes_to_vec;
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -65,7 +65,7 @@ mod tests {
 
     /// Assert every oracle recovers `input` byte-exact from our gzip stream.
     fn assert_roundtrips(input: &[u8], label: &str) {
-        let gz = compress_gzip(input, 6);
+        let gz = encode_gzip_bytes_to_vec(input, 6);
 
         let f = decode_flate2(&gz);
         assert_eq!(f, input, "flate2 roundtrip mismatch [{label}]");
@@ -199,7 +199,7 @@ mod tests {
 
         #[test]
         fn prop_roundtrip_flate2(input in adversarial_bytes()) {
-            let gz = compress_gzip(&input, 6);
+            let gz = encode_gzip_bytes_to_vec(&input, 6);
             let decoded = decode_flate2(&gz);
             prop_assert_eq!(decoded, input);
         }
