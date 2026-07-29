@@ -180,11 +180,29 @@ encoding** — a different parse, a different block-splitting policy, a differen
 symbol budget, a different level->config map. All of that is permitted. What is
 NOT permitted is treating a divergence from libdeflate's bytes as a defect.
 
-**Keep** (these are ours, and they are real invariants):
-* T>1 output byte-identical to T1, or never larger — the P8 invariant.
-* Streaming output byte-identical to whole-buffer output at the same level.
+**Keep** (these are ours, and they are real):
 * libdeflate/gzip/pigz used as independent DECODERS in the roundtrip oracle.
 * libdeflate's size at level N used as a BAR to beat.
+* Run-to-run determinism AT A FIXED thread count — same input, same level, same
+  -p, same bytes. That is a least-surprise property (reproducible builds depend
+  on it) and it is NOT the same thing as T-invariance.
+
+**Also NOT a goal: byte-identity to OURSELVES** (user, 2026-07-28). T>1 output
+does not need to equal T1 output, and streaming does not need to equal
+whole-buffer. The only requirement is the per-label one: at the level the user
+typed, output at least as small as the rival's and less wall time.
+
+Byte-identity across thread counts was never valuable in itself — it was
+serving as a cheap TOTAL ORACLE (if T4 bytes == T1 bytes and T1 is correct,
+then T4 is correct for free). Dropping it costs nothing, because the real
+oracle already exists and is stronger: roundtrip through our own decoder at
+every thread count, sha256 against the original, plus independent decoders.
+Vendors behave this way too — pigz's output depends on its thread count.
+
+What this changes in practice: the T>1 size failures (103 of 165 failing size
+cells) must be fixed by making seams SMALLER, not by making T4 reproduce T1.
+pigz's 10-bit empty-static-block pad is exactly that — a smaller seam, not a
+T-invariant one.
 
 **Delete / do not write** (these are the cage):
 * Any test or gate asserting our compressed bytes equal a vendor's.
