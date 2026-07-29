@@ -479,32 +479,6 @@ impl HcMatchfinder {
                     local.chain_reads += 1;
                 }
                 loop {
-                    // Prefilter operands for the CURRENT position, hoisted out of
-                    // the rejection walk below. `in_next` does not move during a
-                    // chain walk, and `best_len` changes only when a candidate is
-                    // ACCEPTED — which exits that inner loop — so both are
-                    // invariant across every rejected candidate.
-                    //
-                    // This is the load the profiler pointed at. On the worst cell
-                    // (L2, frozen Zen2, single-threaded, vs libdeflate) we execute
-                    // 1.30x their L1 data loads while BEATING them on IPC (2.27 vs
-                    // 2.07), frontend stalls (0.88x) and L1D miss rate (0.94x). The
-                    // deficit is load COUNT, not stalls or instruction selection,
-                    // and 61% of the whole instruction excess is loads. This
-                    // prefilter used to issue FOUR loads per candidate, two of them
-                    // re-reading the current position on every iteration.
-                    //
-                    // `n_lo` was `load_u32(base, in_next)` — exactly the `seq4`
-                    // already computed above, so it is used directly now.
-                    //
-                    // SAFETY: `off = best_len - 3` with `best_len <= max_len`, so
-                    // `in_next + off + 4 <= in_next + max_len + 1 <= in_end + 1 <
-                    // buf.len()` (BUF_PAD >= 16).
-                    let off = best_len as usize - 3;
-                    let n_hi = unsafe {
-                        debug_assert!(in_next + off + 4 <= blen);
-                        load_u32(base, in_next + off)
-                    };
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                         // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
@@ -523,25 +497,59 @@ impl HcMatchfinder {
                         // byte-identical throughout. The hardware prefetcher
                         // already covers this access pattern on every core we
                         // ship to.
+                        //
+                        // FALSIFIED 2026-07-28 (second time, different change) —
+                        // DO NOT hand-hoist the two operands below that describe
+                        // the CURRENT position. It looks like free money: this
+                        // prefilter reads four values per candidate, and two of
+                        // them (`in_next + off`, `in_next`) are loop-invariant
+                        // across the rejection walk — `in_next` does not move and
+                        // `best_len` only changes on acceptance, which exits the
+                        // loop. `load_u32(base, in_next)` is even just `seq4`,
+                        // already in a variable.
+                        //
+                        // LLVM ALREADY HOISTS THEM. Doing it by hand made things
+                        // WORSE, measured on the shipped build shape at L2 on 8 MB
+                        // of silesia:
+                        //     Ir  555,124,179 -> 552,722,907  (-0.43%)
+                        //     Dr  103,975,406 -> 104,103,912  (+0.12%)  <-- UP
+                        // Data reads went UP after removing two source-level loads
+                        // per candidate, which only happens if the loads were never
+                        // being issued and the extra live values cost spill
+                        // reloads. L6 regressed too: 916,724,493 -> 921,418,528
+                        // Ir (+0.51%).
+                        //
+                        // The lesson is general and cost this project two reverts
+                        // in one session: SOURCE-LEVEL LOAD COUNT IS NOT MACHINE-
+                        // LEVEL LOAD COUNT. The 1.30x load ratio against libdeflate
+                        // is real and measured (perf stat, worst cell), but it
+                        // cannot be attacked by reading this function and deleting
+                        // loads that look redundant — the compiler has already
+                        // taken those. Any future attempt here must show a Dr
+                        // DECREASE, not a source-level one.
+                        //
                         // Prefilter: compare the last 4 and the first 4 bytes before
-                        // attempting a full extension. Only the CANDIDATE side is
-                        // loaded here — `n_hi` and `seq4` describe the current
-                        // position and are hoisted above the rejection walk, since
-                        // neither `in_next` nor `best_len` changes until a candidate
-                        // is accepted. That halves this loop's data loads, which is
-                        // where the deficit actually lives (see the hoist comment).
-                        // SAFETY: `matchptr < in_next` (cutoff guard), so
-                        // `matchptr + off + 4 < in_next + off + 4 <= buf.len()`.
-                        let (m_hi, m_lo) = unsafe {
+                        // attempting a full extension.
+                        let off = best_len as usize - 3;
+                        // SAFETY: `matchptr < in_next` (cutoff guard). `off = best_len-3`
+                        // with `best_len <= max_len`, so `in_next + off + 4 <=
+                        // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
+                        // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
+                        let (m_hi, n_hi, m_lo, n_lo) = unsafe {
                             debug_assert!(matchptr < in_next);
-                            debug_assert!(matchptr + off + 4 <= blen);
-                            (load_u32(base, matchptr + off), load_u32(base, matchptr))
+                            debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
+                            (
+                                load_u32(base, matchptr + off),
+                                load_u32(base, in_next + off),
+                                load_u32(base, matchptr),
+                                load_u32(base, in_next),
+                            )
                         };
                         #[cfg(feature = "anatomy-counters")]
                         {
                             local.attempts += 1;
                         }
-                        if m_hi == n_hi && m_lo == seq4 {
+                        if m_hi == n_hi && m_lo == n_lo {
                             break;
                         }
                         #[cfg(feature = "anatomy-counters")]
