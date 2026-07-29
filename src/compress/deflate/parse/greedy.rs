@@ -8,8 +8,15 @@
 use super::super::bitstream::BitWriter;
 use super::super::huffman::HeaderScratch;
 use super::super::level::LevelParams;
+use super::super::matchfinder::common::lz_extend;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
+/// Consecutive same-offset emits allowed after a match hits the 258-byte cap
+/// before we resume searching. igzip's `MAX_EMIT_SIZE` is `258 * 16`
+/// (`igzip_body.asm:44`); the bound keeps a pathological run from starving the
+/// block-split checks.
+const LARGE_MATCH_MAX_EMITS: usize = 16;
+
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
     emit_block, BlockRole, InputMode, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
@@ -183,6 +190,55 @@ pub(super) fn run_block(
                 next_hashes,
             );
             in_next += length as usize;
+
+            // LARGE-MATCH EMIT (igzip `LARGE_MATCH_MIN 264` / `MAX_EMIT_SIZE
+            // 258*16`, `igzip_body.asm:41-44`). A match that hit the 258-byte
+            // cap is almost certainly a long run that CONTINUES at the same
+            // offset, so re-running the full chain search at the next position
+            // re-derives an answer we already have. libdeflate re-searches every
+            // 258 bytes; on a 10 KB run that is ~39 `longest_match` calls where
+            // igzip does ~3 emits.
+            //
+            // Extend at the SAME offset instead, and only fall back to a real
+            // search when the run actually ends. This is condition-triggered on
+            // a property of the MATCH ("did it hit the cap?"), not a guess about
+            // the data, so it is not a content detector.
+            //
+            // Cannot cost size: identical offsets, identical lengths, identical
+            // symbols — the same match the search would have found, found for
+            // free. The 16-emit bound is igzip's; past it we resume searching so
+            // a pathological input cannot starve the block-split checks.
+            if length == DEFLATE_MAX_MATCH_LEN {
+                let off = offset as usize;
+                for _ in 0..LARGE_MATCH_MAX_EMITS {
+                    adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - in_next);
+                    if max_len < min_len || in_next < off {
+                        break;
+                    }
+                    // SAFETY of the bound: `adjust_max_and_nice_len` guarantees
+                    // `in_next + max_len <= in_end`, and `in_next - off < in_next`,
+                    // so both spans `lz_extend` reads are inside the buffer.
+                    let run = lz_extend(buf, in_next, in_next - off, 0, max_len);
+                    if run < min_len {
+                        break;
+                    }
+                    sink.push_match(run, offset);
+                    mf.skip_bytes(
+                        buf,
+                        in_base,
+                        in_next + 1,
+                        in_end,
+                        (run - 1) as usize,
+                        next_hashes,
+                    );
+                    in_next += run as usize;
+                    if run < DEFLATE_MAX_MATCH_LEN
+                        || !continue_block(sink, in_next, block_begin, in_max_block_end, in_end)
+                    {
+                        break;
+                    }
+                }
+            }
         } else {
             sink.push_literal(buf[in_next]);
             in_next += 1;
