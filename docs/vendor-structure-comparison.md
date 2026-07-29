@@ -162,59 +162,48 @@ liked (Lazy/3/10, Lazy/4/10) both failed once graded on the canonical corpus.
 precisely for this reason. Size legs are cheap and deterministic — grade them
 on all 20 files, always.
 
-## Byte-identity with libdeflate is a CAGE — delete anything that guides toward it
+## THE ONLY CORRECTNESS REQUIREMENT: valid gzip content
 
-**This is not a goal and never was one.** Reproducing a vendor's bytes only ever
-certifies that we reproduce their algorithm, which is exactly why we run their
-algorithm slower than they do.
+User, 2026-07-28, after I twice tried to keep a weaker version of this rule:
 
-Measured, and this is the whole argument: our L2 and L4-L9 output is
-byte-SIZE-identical to libdeflate's on **all 20 canonical corpus files, ratio
-1.00000 everywhere**. Those cells therefore have **zero size slack**. We cannot
-be smaller at the same level, so every one of those cells has to be won on wall
-alone, against an implementation of the identical algorithm. That is the worst
-possible board position and we built it ourselves by copying their level table.
+**The output must be valid gzip content. That is the whole requirement.**
 
-Beating them considerably on speed and/or size may require a **different
-encoding** — a different parse, a different block-splitting policy, a different
-symbol budget, a different level->config map. All of that is permitted. What is
-NOT permitted is treating a divergence from libdeflate's bytes as a defect.
+Concretely: the bytes we emit decode back to the exact original input, through
+any conformant decoder (our own, gzip, pigz, libdeflate), and are format-legal
+per RFC 1951/1952. Verified by roundtrip + sha256 at every thread count.
 
-**Keep** (these are ours, and they are real):
-* libdeflate/gzip/pigz used as independent DECODERS in the roundtrip oracle.
-* libdeflate's size at level N used as a BAR to beat.
-* Run-to-run determinism AT A FIXED thread count — same input, same level, same
-  -p, same bytes. That is a least-surprise property (reproducible builds depend
-  on it) and it is NOT the same thing as T-invariance.
+Nothing else is required. Specifically NOT required:
 
-**Also NOT a goal: byte-identity to OURSELVES** (user, 2026-07-28). T>1 output
-does not need to equal T1 output, and streaming does not need to equal
-whole-buffer. The only requirement is the per-label one: at the level the user
-typed, output at least as small as the rival's and less wall time.
+* Byte-identity with libdeflate, or any vendor. Matching a vendor's bytes only
+  certifies that we reproduce their algorithm — which is exactly why we run
+  their algorithm slower than they do. Receipt: our L2 and L4-L9 output is
+  byte-SIZE-identical to libdeflate on all 20 canonical corpus files (ratio
+  1.00000 everywhere), so those cells have ZERO size slack and must be won on
+  wall alone against an implementation of the identical algorithm. We built that
+  position ourselves by copying their level table.
+* Byte-identity with our own T1 output. T>1 may emit different bytes.
+* Byte-identity between streaming and whole-buffer encodes.
+* Run-to-run determinism, even at a fixed thread count.
 
-Byte-identity across thread counts was never valuable in itself — it was
-serving as a cheap TOTAL ORACLE (if T4 bytes == T1 bytes and T1 is correct,
-then T4 is correct for free). Dropping it costs nothing, because the real
-oracle already exists and is stronger: roundtrip through our own decoder at
-every thread count, sha256 against the original, plus independent decoders.
-Vendors behave this way too — pigz's output depends on its thread count.
+The goal is per-label: at the level the user typed, output at least as small as
+the rival's AND less wall time. Any encoding that is valid gzip and achieves
+that is permitted — a different parse, block-splitting policy, symbol budget,
+level->config map, or an encoding no vendor would ever emit.
 
-What this changes in practice: the T>1 size failures (103 of 165 failing size
-cells) must be fixed by making seams SMALLER, not by making T4 reproduce T1.
-pigz's 10-bit empty-static-block pad is exactly that — a smaller seam, not a
-T-invariant one.
+**Delete on sight**: any test or gate asserting our compressed bytes equal some
+other bytes; any design decision justified by "this keeps us byte-identical to
+X"; any framing of a divergence as a regression. A cell that was "tied" because
+we emitted a vendor's exact bytes was never a win — it was a guarantee that we
+could not beat them.
 
-**Delete / do not write** (these are the cage):
-* Any test or gate asserting our compressed bytes equal a vendor's.
-* Any design decision justified by "this keeps us byte-identical to libdeflate".
-* Any framing of a divergence from their output as a regression. A cell that was
-  "tied" because we emitted their exact bytes was never a win — it was a
-  guarantee we could not beat them.
-
-Audited 2026-07-28: no test asserts vendor byte-equality (the `libdeflater`
-uses in `src/tests/` are decoder-oracle and size-bar, both legitimate). The
-rationale in `parse/mod.rs::level_has_resumable_parser` was reframed to say
-"identical to our own whole-buffer output". Module docs describing a file as a
-"faithful transliteration" of a libdeflate header record where the code CAME
-FROM; they do not impose an obligation to stay identical, and any of them may be
+Audited 2026-07-28: no test asserts byte-equality against a vendor. Every
+`libdeflater` use in `src/tests/` is either the roundtrip DECODER oracle or a
+size BAR to beat; both are legitimate and both stay. The rationale in
+`parse/mod.rs::level_has_resumable_parser` was reframed. Module docs calling a
+file a "faithful transliteration" of a libdeflate header record where the code
+CAME FROM — they impose no obligation to stay identical, and any of them may be
 rewritten the moment a measurement says a different structure is better.
+
+Practical consequence for #50 (103 of 165 failing size cells are T>1): fix it by
+making seams SMALLER, not by making T4 reproduce T1. pigz's 10-bit
+empty-static-block pad is exactly that.
