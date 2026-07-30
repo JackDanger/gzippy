@@ -58,6 +58,7 @@ mod greedy;
 // reverted, not feature-gated — because it is correct, it is the measured half of the
 // length-3-plus-2-way synthesis that REOPEN requires, and dead-but-compiled code that
 // still type-checks is far cheaper to revive than code recovered from a git log.
+#[allow(dead_code)]
 mod ht_fast;
 mod lazy;
 mod near_optimal;
@@ -468,11 +469,65 @@ pub(super) fn compress(
         // (fulcrum verify: 220 cells, 0 roundtrip failures through our own decoder at
         // every thread count plus gzip/pigz/libdeflate) and they are the measured
         // half of the synthesis. Only the ROUTING is reverted.
-        // REOPEN of the note above: `ht_fast` now carries a LENGTH-3 table as well as
-        // the 2-way bucket, which is the synthesis that note identified. Measured
-        // below; see `matchfinder::ht`'s module doc for the working-set arithmetic.
+        // FALSIFIED 2026-07-30, ON THE WALL — attempt 2, the synthesis (2-way bucket
+        // AND a length-3 table). The SIZE leg passed cleanly and the WALL leg killed
+        // it, which is the same way `17283ee6` (`c0f69036`) died in this class. The
+        // halved working set was a real reason to expect otherwise and it was not
+        // enough.
+        //
+        // `fulcrum try`, frozen solvency (AMD EPYC 7282, boost=0,
+        // governor=performance, tenants SIGSTOPped), paired interleaved, n=9,
+        // /dev/null both arms, L1+L6, T1, full TUNE set, 176 cells / 145 decidable,
+        // artifact /root/wall-l1-synth/try.json:
+        //
+        //   clause 1  OK   verify — zero roundtrip failures
+        //   clause 2  OK   arms differ (binary hashes distinct)
+        //   clause 3  OK   no pass->fail flips across 145 decidable cells
+        //   clause 4  OK   closed libdeflate:data.parquet:L1:T1:size and
+        //                  libdeflate:movie.mp4:L1:T1:size
+        //   clause 5  FAIL 19 WALL cells eroded past the 0.0050 budget
+        //   clause 6  FAIL improvement 0.1593 < 2x harm 2.0388
+        //
+        // The self-tax at L1, per-pair median ratio vs the rival (LOWER IS FASTER, so
+        // these are all still wins in absolute terms — we remain faster than gzip and
+        // pigz — but our own L1 got 15-50% slower):
+        //   gzip:data.json     0.4549 -> 0.6861      pigz:data.json  0.6029 -> 0.9044
+        //   gzip:data.csv      0.4068 -> 0.5589      pigz:data.csv   0.5444 -> 0.7418
+        //   gzip:tool.bin      0.4607 -> 0.5455      pigz:tool.bin   0.5424 -> 0.6358
+        //   gzip:dickens       0.4410 -> 0.5023      pigz:dickens    0.5493 -> 0.6203
+        // and 11 more. Against libdeflate we were ALREADY slower at L1 (symbols.dwarf
+        // 1.4407, movie.mp4 1.7129) so those cells did not flip — they were failing
+        // before and after.
+        //
+        // MECHANISM, and it is why "smaller working set" was the wrong thing to bank
+        // on: the size win comes from doing MORE WORK PER POSITION — two bucket
+        // candidates plus a third table read/write — and halving the bytes RESIDENT
+        // does not pay for the extra dependent loads ISSUED. Working-set arithmetic
+        // bounds cache pressure; it says nothing about the load count on the critical
+        // path, and this cell's known deficit is LOADS
+        // (`project_encoder_deficit_is_loads_not_stalls`: 61% of our excess over
+        // libdeflate at L2 is load instructions, with IPC and stalls already BETTER
+        // than theirs). I predicted from bytes-resident and the wall answered on
+        // loads-issued.
+        //
+        // REOPEN requires a mechanism that adds candidates WITHOUT adding dependent
+        // loads per position — igzip's two-positions-per-iteration pipeline (P12,
+        // which probes pos and pos+1 from one hash computation) and its literal-run
+        // skip (P13) are the vendor-precedented shapes; a third table probed on every
+        // position is not. A size-only argument is not sufficient for this class:
+        // that is now 2 for 2.
         #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => ht_fast::run(buf, data_start, in_end, params, &statics, bw, is_last),
+        Strategy::Fast => fast::run::<false>(
+            buf,
+            data_start,
+            in_end,
+            &statics,
+            bw,
+            is_last,
+            fast::FAST_BLOCK_LENGTH,
+            true,
+            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
+        ),
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
             let t = fast::tune::get();
