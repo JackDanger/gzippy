@@ -49,7 +49,6 @@ pub enum Strategy {
     /// `l3-tune` Cargo feature now only controls whether `parse::gated`'s
     /// threshold/block-length knobs are env-var-overridable for the harness;
     /// it no longer gates whether L3 uses this strategy at all).
-    LazyGated,
     /// Near-optimal parse: bt matchfinder + iterative min-cost-path DP (L10-12).
     NearOptimal,
 }
@@ -194,7 +193,7 @@ fn params_inner(level: u32) -> LevelParams {
         //     every T, zero-regression legs) clears; the recorded miss is
         //     out of this change's causal reach.
         3 => LevelParams {
-            strategy: Strategy::LazyGated,
+            strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
             near_optimal: NONE_NO,
@@ -308,7 +307,7 @@ mod tests {
         // constants env-overridable for the search harness. L2/L4 stay
         // Greedy either way.
         assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
-        assert_eq!(params(3).strategy, Strategy::LazyGated, "level 3");
+        assert_eq!(params(3).strategy, Strategy::Lazy, "level 3");
         assert_eq!(params(4).strategy, Strategy::Greedy, "level 4");
         for l in 5..=7 {
             assert_eq!(params(l).strategy, Strategy::Lazy, "level {l}");
