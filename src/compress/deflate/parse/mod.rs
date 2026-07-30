@@ -50,6 +50,16 @@ pub use fast::tune;
 // re-inherited by the next session that reads the file. A stale comment proposing
 // forbidden work is not inert documentation; it is an instruction.
 mod greedy;
+/// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
+/// `deflate_compress_fastest`. See its module doc for the vendor diff and the
+/// REOPEN it rests on.
+// Unused in a default build: the L1 routing to it is FALSIFIED as a REPLACEMENT (see
+// the `Strategy::Fast` arm below for the measured numbers). KEPT compiled — not
+// reverted, not feature-gated — because it is correct, it is the measured half of the
+// length-3-plus-2-way synthesis that REOPEN requires, and dead-but-compiled code that
+// still type-checks is far cheaper to revive than code recovered from a git log.
+#[allow(dead_code)]
+mod ht_fast;
 mod lazy;
 mod near_optimal;
 /// The crown engine (zopfli port + LzFind/squeeze/recursive-splitter Pareto
@@ -418,6 +428,47 @@ pub(super) fn compress(
         // the two consts below for the env-var-backed tune values here — no
         // change to `fast::run`'s signature needed. Byte-identical to the
         // `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
+        // FALSIFIED 2026-07-30 — do NOT route L1 to `ht_fast` AS A REPLACEMENT.
+        // The 2-way-bucket port is correct and is a large ratio win, and it still
+        // NO-SHIPS, because it throws away three files where our length-3 table
+        // beats libdeflate. Measured, `scripts/campaign/board-size.sh tune`,
+        // 4 rivals, 0 VOID, TUNE x L1-9 x T1,T4
+        // (~/www/gzippy-bench/campaign/size-tune-{bfd44096,htport}/):
+        //
+        //   clause 4 fail-gap  0.396822 -> 0.103242  (-73.98%)  <- large real win
+        //   failing cells      96 -> 94   (9 CLOSED, 7 OPENED)
+        //   clause 3           VIOLATED: 7 pass->fail flips, and clause 3 is absolute
+        //   clause 5           VIOLATED: armexe.elf erodes +0.0345 on a 0.0050 budget (6.9x)
+        //
+        // The 9 closed cells are all libdeflate L1 and every one lands at ratio
+        // EXACTLY 1.0000 — data.csv 1.0456->1.0000, aozora 1.0405->1.0000,
+        // minjs 1.0226->1.0000, dickens 1.0211->1.0000, data.json 1.0177->1.0000,
+        // engine.wasm 1.0125->1.0000 — so the transliteration is faithful: we now
+        // emit libdeflate's own L1 size on text and structured data.
+        //
+        // The 7 opened cells are ONE mechanism: on BINARIES we were WINNING and the
+        // port converges us onto libdeflate, giving the win up.
+        //   armexe.elf    T1  599,781 -> 621,027 B   (was 0.9658 vs libdeflate, a 3.4% WIN)
+        //   symbols.dwarf T1  394,736 -> 396,048 B   (was 0.9967)
+        //   tool.bin      T1  22,565,629 -> 22,673,676 B (was 0.9952)
+        // Those three wins come from `fast`'s `head3` LENGTH-3 match table, which
+        // `ht_matchfinder` deliberately does not have ("Due to its focus on speed,
+        // the ht_matchfinder doesn't support length 3 matches").
+        //
+        // SO THE FINDING IS A SYNTHESIS, NOT A CHOICE, and no vendor ships it:
+        // length-3 matches earn real bytes on binaries; 2-way bucketing earns far
+        // more on text/structured data. libdeflate L1 has buckets and no hash3; our
+        // `fast` has hash3 and one probe. REOPEN requires BOTH — ht's 128 KiB 2-way
+        // bucket PLUS a small length-3 table, replacing the 256 KiB `head`, which is
+        // still under today's ~384 KiB. Note `17283ee6` (`c0f69036`) is the nearest
+        // prior attempt at a combination and it died on WALL with a 12-29% self-tax,
+        // so a combination must show its working-set arithmetic and take a frozen
+        // paired wall run — a size-only argument is not enough for that shape.
+        //
+        // `ht_fast` and `matchfinder::ht` are KEPT, not reverted: they are correct
+        // (fulcrum verify: 220 cells, 0 roundtrip failures through our own decoder at
+        // every thread count plus gzip/pigz/libdeflate) and they are the measured
+        // half of the synthesis. Only the ROUTING is reverted.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,

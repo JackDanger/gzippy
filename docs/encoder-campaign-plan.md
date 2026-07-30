@@ -328,6 +328,54 @@ records that the dependent `head[h]` load is "69% of the L1 fast path's D1 read 
 and "the IPC collapse vs igzip, 1.32 vs 2.46"); igzip's large-match emit loop (M15); its
 literal-run skip (P13). Axis **size** for the cells, wall as a watch.
 
+> ### B1 ATTEMPT 1 (2026-07-30): libdeflate's `ht_matchfinder` ported. NO-SHIP, and it
+> located the real lever precisely.
+>
+> The vendor diff came from `fulcrum why libdeflate:data.csv:L1:T1:size` — the automated
+> diff, structure layer, on 26,500,000 B: we emitted **741,183 literals to libdeflate's
+> 256,099 (+189.41%)** and found **84,536 fewer matches (-4.58%)**, while header bits agreed
+> within 0.37% (166,614 vs 166,000). So the L1 gap is the PARSE, not block sizing and not
+> table quality. That also killed my first hypothesis — the missing L1 seq cap
+> (`FAST_SEQ_STORE_LENGTH` 8192) — before it cost anything: 614 header bits cannot account
+> for 1,434,580 total.
+>
+> Ported `vendor/libdeflate/lib/ht_matchfinder.h` at `BUCKET_SIZE 2` (2 candidates per
+> position, one 128 KiB table, no length-3 table) plus `deflate_compress_fastest`, and
+> routed L1 through it. `fulcrum verify`: **220 cells, 0 roundtrip failures.** Then
+> `scripts/campaign/board-size.sh tune`, 4 rivals, 0 VOID
+> (`~/www/gzippy-bench/campaign/size-tune-{bfd44096,htport}/`):
+>
+> | promotion-rule clause | result |
+> |---|---|
+> | 4 — fail-gap | **0.396822 -> 0.103242, -73.98%** — a large, real ratio win |
+> | failing cells | 96 -> 94 (**9 closed, 7 opened**) |
+> | **3 — no pass->fail flips** | **VIOLATED: 7 flips.** Clause 3 is absolute |
+> | **5 — erosion budget** | **VIOLATED: armexe.elf +0.0345 against a 0.0050 budget (6.9x)** |
+>
+> **The 9 closed cells are all libdeflate L1 and every one lands at ratio EXACTLY 1.0000** —
+> data.csv 1.0456, aozora 1.0405, minjs 1.0226, dickens 1.0211, data.json 1.0177,
+> engine.wasm 1.0125, all -> 1.0000. The transliteration is faithful.
+>
+> **The 7 opened cells are ONE mechanism: on BINARIES we were already WINNING, and
+> converging on libdeflate gave the win up.** armexe.elf T1 599,781 -> 621,027 B (it was
+> **0.9658** vs libdeflate — a 3.4% win, and it also beat gzip and pigz); symbols.dwarf
+> 394,736 -> 396,048; tool.bin 22,565,629 -> 22,673,676. Those wins are `fast`'s `head3`
+> LENGTH-3 table, which `ht_matchfinder` deliberately lacks — libdeflate's own header says
+> "Due to its focus on speed, the ht_matchfinder doesn't support length 3 matches."
+>
+> **SO THE LEVER IS A SYNTHESIS NO VENDOR SHIPS.** Length-3 matches earn real bytes on
+> binaries; 2-way bucketing earns far more on text and structured data. libdeflate L1 has
+> buckets and no hash3; our `fast` has hash3 and a single probe. REOPEN requires **both** —
+> ht's 128 KiB 2-way bucket PLUS a small length-3 table, replacing the 256 KiB `head`, which
+> still comes in under today's ~384 KiB. Caution, and it is the binding one: `17283ee6`
+> (`c0f69036`) is the nearest prior attempt at a combination and it died on WALL with a
+> 12-29% self-tax, so a combination must show its working-set arithmetic and take a frozen
+> paired wall run. A size-only argument is not sufficient for that shape.
+>
+> `matchfinder/ht.rs` and `parse/ht_fast.rs` are KEPT compiled and unit-tested but unrouted;
+> only the routing was reverted, verified by execution (L1 bytes back to main's exactly:
+> armexe.elf 599,781, data.csv 4,111,742). They are the measured half of the synthesis.
+
 **T1 wall — converge, then delete.** Flatten the parse/matchfinder interface so one loop
 owns its scalars, rather than hoisting inside the current shape (three failures). Our
 hot loop threads state by reference (`in_base: &mut usize`, `next_hashes: &mut [u32; 2]`)
