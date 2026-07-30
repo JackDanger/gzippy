@@ -19,6 +19,35 @@ pub const NUM_OBSERVATIONS_PER_BLOCK_CHECK: u32 = 512;
 
 /// Minimum input bytes before/around a candidate split (`MIN_BLOCK_LENGTH`).
 pub const MIN_BLOCK_LENGTH: usize = 5000;
+// FALSIFIED 2026-07-30 — do NOT lower the 4096 length-bias divisor unconditionally.
+//
+// The bias term `(block_length/4096) * num_observations` is the heuristic's ONLY
+// response to STATIONARY data. At the 512-observation cadence the cutoff is
+// `200 * num_observations`, so the bias alone fires at `block_length >= 200*4096 =
+// 819,200 B` — dead below any block budget we would ship. That is why raising
+// SOFT_MAX_BLOCK_LENGTH alone cost +660 B at T1 on near-random input.
+//
+// Lowering the divisor to 1250 (fires at 250,000 B) and raising the budget to 600K,
+// shipped as one pair, does fix the target case and BREAKS everything else. L6, gap
+// vs libdeflate, T1 / T4:
+//     shortmatch-4M  -409 / -659   PASS  (was +0 tied at 300K, +660 at 900K)
+//     logs.txt      +4157 / +10094 FAIL  (was -4796 T1 at 600K WITHOUT this change)
+//     text-1MB.txt   +230 / +531   FAIL  (was -39)
+//
+// The bias is UNCONDITIONAL, so firing it early on structured stationary data gives
+// back exactly the header amortisation the larger budget just bought. Structureless
+// data must split early; structured data must not — one divisor cannot express both.
+//
+// A pre-registered counterfactual (shortmatch T1 must not exceed its 300K bytes)
+// SURVIVED here while the change failed on two other files, so that gate was
+// necessary but not sufficient: a counterfactual naming only the target case cannot
+// see collateral damage. Gate on the full per-label corpus, not on the case you aimed at.
+//
+// The route that remains: make the bias CONDITIONAL on an emitted-symbol signal —
+// match fraction or estimated bits/input-byte read off the Sink histogram, which is
+// data already coded, never input ahead, so it is not a content detector. zlib-ng and
+// igzip sidestep the whole question with a fixed symbol/token quantum and no detector
+// at all (16,383 symbols / 65,536 tokens); that is the other candidate.
 
 #[derive(Clone)]
 pub struct BlockSplitStats {
