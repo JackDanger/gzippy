@@ -7,8 +7,8 @@ Read this before touching the encoder. Written to be picked up cold.
 
 ## 1. Where we stand
 
-**165 failing per-label SIZE cells.** Roundtrip-verified census, canonical 17-file
-corpus x L1-9 x 4 rivals x T1/T4; 1020 cells measured, 0 VOID.
+**165 failing per-label SIZE cells.** Roundtrip-verified census, canonical corpus (17 files staged of
+the 20 canonical members) x L1-9 x 4 rivals x T1/T4; 1020 cells measured, 0 VOID.
 
 | rival | T1 fails | T4 fails |
 |---|---|---|
@@ -46,7 +46,10 @@ All 133 failing T4 cells, gap-to-rival divided by (chunks x per-chunk overhead):
 **Front A — chunk overhead (~100 cells).** Measured per-chunk constant: **+18.7 B at
 L2, +32.1 B at L6** on 512 KiB chunks (silesia, 405 chunks) = 0.0036-0.0061% of input.
 Seams are only ~5.4 B; the dominant term is extra dynamic-header mass from restarting
-the block grid inside every chunk, and it grows with level.
+the block grid inside every chunk, and it grows with level. (Provenance: these two
+constants and the cell split below came from runs whose artifacts are not in-repo. They
+are consistent internally and with the census, but re-derive them before betting a large
+change on them — `CLAUDE.md` says a gate may only cite a dataset that exists.)
 
 **Front B — the L1 ratio class (33 cells).** Gaps of 60 K-636 K bytes: access.log at
 911x the chunk overhead, monorepo 515x, data.csv 421x, aozora 380x. Our `Fast` parser
@@ -135,15 +138,35 @@ precedent, a named axis, and a falsifier that costs one build. A2 depends on wha
 finds about safe block lengths. B1 is a separate front and can run in parallel by
 another hand. The T1 wall item needs the wall census (§1) built first.
 
-**A1 — diff the block-END heuristic against three vendors.** The budget sweep falsified
-the budget but located this: `shortmatch`'s T4 gap is **flat at +85 across every
-budget** while its T1 degrades to +660 — chunking HELPS near-random data, because more,
-smaller tables track drifting statistics better. So `should_end_block` should already be
-cutting blocks short where there is no exploitable structure, and it is not. Compare
-ours against libdeflate's `should_end_block`, zlib-ng's and igzip's. Data-responsive
-without being a content detector: it reads symbols already emitted, never input ahead.
-Axis **size**, targets Front A. Falsifier: deterministic size leg on all 20 canonical
-files — any file that gets bigger kills it.
+**A1 — block-end policy. The vendor diff is DONE; it lives here, not as a TODO.**
+
+An earlier draft said "diff our `should_end_block` against libdeflate's, zlib-ng's and
+igzip's". That was a category error: **two of the three have no such mechanism.**
+
+| implementation | end-of-block signal | parameters |
+|---|---|---|
+| **libdeflate + ours** (L2+) | first true of: soft byte cap, sequence cap, adaptive drift split | 300,000 B / 50,000 seqs / `should_end_block` over 10 observation classes, checked every 512 new observations, gated by `MIN_BLOCK_LENGTH` 5000 before and after |
+| **zlib-ng** | symbol buffer FULL — `sym_next == sym_end` | `lit_bufsize = 1 << (memLevel+6)` = 16,384 symbols at default memLevel |
+| **igzip L1-3** | ICF token buffer capacity exhausted — `icf_buf_avail_out <= 0` | capacity from `level_buf_size` (default `*_DEFAULT = *_LARGE`) |
+
+So the structural difference is not a better drift detector. **The vendors that win this
+region enforce a hard LOCAL CODING BUDGET; we enforce a byte cap plus a drift heuristic.**
+That reframes the sweep result: `shortmatch`'s T4 gap staying flat at +85 across every
+byte budget while its T1 degraded to +660 is what a missing symbol budget looks like —
+the byte cap lets a block run long on data whose statistics drift, and the drift detector
+does not cut it short.
+
+**A1.1, the first code lever:** keep `should_end_block`, add a hard symbol/token budget
+cap, and sweep a small grid around zlib-ng's 16,384. This is parameter tuning of a
+policy constant, not content detection — the budget is a fixed number, and the counter it
+tests reads symbols already emitted.
+
+Axis: **size** first (Front A), then wall. Kill gates, cheapest sound pair:
+1. Deterministic size leg on the canonical corpus — any file that gets bigger kills it.
+2. Paired interleaved wall leg to `/dev/null` at one shallow and one deep level, on one
+   drift/near-random file and one compressible file — any pass->fail flip or a wall
+   regression beyond noise kills it. A better splitter can cost search work, so size
+   alone is not a sufficient gate.
 
 **A2 — thread-aware chunk grid.** Chunks of `input/(k*T)` cut chunk count 25-100x,
 shrinking Front A's residual to a few hundred bytes per file. Now legal: the
