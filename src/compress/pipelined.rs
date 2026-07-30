@@ -97,11 +97,30 @@ const SMALL_FILE_TARGET_CHUNKS: usize = 16;
 ///
 /// Block size for the parallel pipelined chunk grid.
 ///
-/// **HARD INVARIANT: a pure function of `input_len` (and `level`) ONLY — NEVER
-/// `num_threads`.** The parallel path relies on this to produce byte-identical
-/// output at every thread count; reintroducing thread-count scaling (the old
-/// `get_optimal_block_size` trap) would make the grid — and therefore the
-/// bytes — depend on T. `_num_threads` MUST stay unused.
+/// **Currently a pure function of `input_len` (and `level`) only; `_num_threads` is
+/// unused.** This is a PRODUCT CHOICE, not an invariant — corrected 2026-07-30.
+///
+/// This comment previously read "HARD INVARIANT … NEVER `num_threads`", justified by
+/// "byte-identical output at every thread count". **That justification was retracted by
+/// the user on 2026-07-28, and `CLAUDE.md` STEP 2 now states the opposite:** "THE ONLY
+/// CORRECTNESS BAR, at every thread count, is VALID GZIP … T>1 may emit different bytes
+/// than T1 … Byte-identity to a vendor, to our own T1, or to our own previous run is never
+/// a goal and never a gate." The user had to state that three times, because each
+/// correction landed in a leaf document while sites like this one kept regenerating the
+/// cage. This was the fourth such site, and it was load-bearing: making T-invariance a
+/// "HARD INVARIANT" here is what forbade the thread-aware grid (campaign plan A2), which
+/// is the main structural lever against per-chunk overhead — about half the T4 board.
+///
+/// So a thread-aware grid is LEGAL to build. It is simply not built yet, and it is not
+/// free: read the FALSIFIED note above first. That falsification killed a LEVEL-scaled
+/// grid, which divided the per-chunk constant without buying any size slack and paid 2-4%
+/// wall to imbalance. A T-aware grid (`input/(k*T)` with a split tail) is a different
+/// shape and is unmeasured — but the same mechanism applies, so it needs a wall gate, not
+/// just a size win.
+///
+/// What must NOT come back is the old `get_optimal_block_size` trap on its own terms: a
+/// grid that varies with T for no measured reason, discovered by accident. Vary it
+/// deliberately, gate it on both axes, or leave it alone.
 ///
 /// Large files use the fixed [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) to minimize
 /// per-chunk orchestration (one CRC-combine + one sync-flush seam per chunk).

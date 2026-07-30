@@ -39,15 +39,16 @@ mod fast;
 // build — this re-export is the sole surface the search tool needs.
 #[cfg(feature = "l1-tune")]
 pub use fast::tune;
-/// DETECTOR-GATED LAZY-L3 (2026-07-23 mission, `l3-tune` feature): composes
-/// `greedy`/`lazy`'s extracted per-block loops under a two-sided
-/// content-detector gate. See `gated.rs`'s module doc comment. Unlike
-/// `fast::tune` (re-exported publicly above for `--tune` CLI / `l1search`
-/// use), `gated::tune` has no CLI/external-sweep-driver channel wired up yet
-/// — env vars (`GZIPPY_L3TUNE_GATE_*`) are the only sweep surface this
-/// session built; a `--tune`-style channel + `fulcrum l3search` are a real,
-/// named, un-taken next step (mirror `fast::tune::parse_spec`'s precedent)
-/// if this composition needs further search.
+// DELETED 2026-07-27 by user order: `gated.rs`, the detector-gated lazy-L3 parser.
+// A nine-line doc comment for it survived here until 2026-07-30, dangling on `mod
+// greedy;` and still advertising `GZIPPY_L3TUNE_GATE_*` env vars plus "a `--tune`-style
+// channel + `fulcrum l3search`" as "a real, named, un-taken next step". Both are
+// forbidden: `CLAUDE.md` non-negotiable #3 bans env-var knobs and content detectors
+// choosing a parser, and `fulcrum l1search` was deleted as constitutionally banned.
+//
+// Recorded because a retraction that does not reach every statement of the thing gets
+// re-inherited by the next session that reads the file. A stale comment proposing
+// forbidden work is not inert documentation; it is an instruction.
 mod greedy;
 mod lazy;
 mod near_optimal;
@@ -61,6 +62,29 @@ pub mod ultra;
 pub(super) const BUF_PAD: usize = 16;
 
 /// `SOFT_MAX_BLOCK_LENGTH` — soft cap on the bytes covered by one block.
+///
+/// FALSIFY: raising this ALONE does not ship. Sweeping 300K -> 450K/600K/900K buys real
+/// slack on compressible data (logs.txt L6 T1 -4,796 B at 600K, and its T4 cell FLIPS TO
+/// PASS at -745) but costs incompressible data, appearing above 300K and saturating at
+/// +660 B by 600K. No budget keeps one without the other, and per-label means every file,
+/// so a bare raise is a pass->fail flip machine under promotion-rule clause 3. It is NOT a
+/// mis-scaled threshold: the split check is budget-independent (`block_split.rs` fires
+/// every 512 observations and requires `MIN_BLOCK_LENGTH` 5000 B). It is an adaptivity
+/// trade — one Huffman table over more symbols loses to local statistical drift wherever
+/// there is no structure to exploit.
+///
+/// The paired lever is a recalibrated END-OF-BLOCK rule; the arithmetic, the falsified
+/// first attempt at it, and the two remaining routes are recorded at the top of
+/// `block_split.rs`. Read that note before touching this constant.
+///
+/// Also note: raising this roughly doubles the live `Sink` state, so state the RSS delta
+/// (D2) before proposing it, and establish whether the byte budget or `SEQ_STORE_LENGTH`
+/// produced any observed gain — the seq cap may bind first on matchy data.
+///
+/// ⚠ The measurements above are on files that are NOT declared corpus members
+/// (`logs.txt`, `text-1MB.txt`, `shortmatch-4M` are absent from `corpus_split.json`).
+/// The mechanism is falsified; the magnitudes need re-deriving with
+/// `scripts/campaign/board-size.sh`.
 const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
 /// `SEQ_STORE_LENGTH` — cap on the number of match "sequences" per block.
 ///

@@ -20,6 +20,55 @@ pub const NUM_OBSERVATIONS_PER_BLOCK_CHECK: u32 = 512;
 /// Minimum input bytes before/around a candidate split (`MIN_BLOCK_LENGTH`).
 pub const MIN_BLOCK_LENGTH: usize = 5000;
 
+// FALSIFIED 2026-07-30 — do NOT lower the 4096 length-bias divisor unconditionally.
+//
+// The bias term `(block_length/4096) * num_observations` is this heuristic's ONLY
+// response to STATIONARY data. At the 512-observation cadence the cutoff is
+// `200 * num_observations`, so the bias alone fires at `block_length >= 200*4096 =
+// 819,200 B` — calibrated dead below any block budget we would ship. That is why
+// raising `SOFT_MAX_BLOCK_LENGTH` alone cost +660 B at T1 on near-random input.
+//
+// Lowering the divisor to 1250 (fires at 250,000 B) and raising the budget to 600K,
+// shipped as one pair, fixes the target case and BREAKS everything else. L6, gap vs
+// libdeflate, T1 / T4:
+//     shortmatch-4M  -409 / -659   PASS  (was +0 tied at 300K, +660 at 900K)
+//     logs.txt      +4157 / +10094 FAIL  (was -4796 T1 at 600K WITHOUT this change)
+//     text-1MB.txt   +230 / +531   FAIL  (was -39)
+//
+// The bias is UNCONDITIONAL, so firing it early on structured stationary data gives
+// back exactly the header amortisation the larger budget just bought. Structureless
+// data must split early; structured data must not — one divisor cannot express both.
+//
+// ⚠ THE EVIDENCE ABOVE IS ON UNDECLARED FILES, so treat the mechanism as falsified but
+// the MAGNITUDES as unverified. `shortmatch-4M`, `logs.txt` and `text-1MB.txt` are
+// none of them members of `corpus_split.json`: the first is a gitignored local
+// generation, the other two are synthetics from `scripts/prepare_benchmark_data.sh`
+// and `scripts/generate_test_data.py`. Project memory already holds a case where a
+// synthetic said "+1 byte" and the real corpus said "+2.02%". Re-derive with
+// `scripts/campaign/board-size.sh`, which refuses undeclared members, before betting
+// a large change on these numbers.
+//
+// A pre-registered counterfactual (shortmatch T1 must not exceed its 300K bytes)
+// SURVIVED here while the change failed on two other files, so that gate was
+// necessary but not sufficient: a counterfactual naming only the target case cannot
+// see collateral damage. Gate on the full per-label corpus, not on the case you aimed at.
+//
+// TWO ROUTES REMAIN, and they are not equal:
+//   (a) Make the bias CONDITIONAL on an emitted-symbol signal (match fraction, or
+//       bits/input-byte off the `Sink` histogram). ⚠ THIS IS THE THIRD INSTANCE OF A
+//       MECHANISM `CLAUDE.md` NON-NEGOTIABLE #3 ORDERS DELETED. The L1 hash3 gate
+//       (`parse/fast.rs`, `L1_HASH3_GATE_LIT_THRESHOLD_PCT = 48`) already ships this
+//       exact shape with this exact justification — "free off the already-populated
+//       `Sink::litlen_freqs` histogram, no extra scan" — and its threshold is fitted
+//       two points off a single file's cliff. `parse/gated.rs` was the second and was
+//       deleted by user order. Do not build this without asking the user first.
+//   (b) Adopt a fixed symbol/token quantum and DELETE the detector, as zlib-ng
+//       (16,383 symbols) and igzip (65,536 tokens) do. 3 of 4 rivals have no drift
+//       detector at all; libdeflate is the only one that does, and this file is a
+//       verified term-for-term port of theirs, so there was never anything to steal
+//       from them here. This route removes a data-dependent branch instead of adding
+//       one, and it is vendor-precedented three times over.
+
 #[derive(Clone)]
 pub struct BlockSplitStats {
     new_observations: [u32; NUM_OBSERVATION_TYPES],

@@ -109,6 +109,36 @@ $(UNGZIPPY_BIN): $(GZIPPY_BIN)
 FORCE:
 
 # =============================================================================
+# ENCODER CAMPAIGN — the measurement loop. See docs/encoder-campaign-plan.md §8.
+#
+# These are the ONLY sanctioned way to grade an encoder change. Before they existed,
+# every census was an uncommitted shell script in ~/www/gzippy-bench (not a git repo),
+# each with its own corpus and rival set — which is how two binding FALSIFY records came
+# to rest on files that are not declared corpus members, and how the shipped size census
+# came to omit igzip silently. scripts/campaign/lib.sh refuses all four of those.
+#
+#   make board-size            SIZE axis on the TUNE set. Deterministic, arch-invariant,
+#                              roundtrip-VOIDed, no rig. The CHEAPEST FALSIFIER — run it
+#                              before any wall work (CLAUDE.md: cheapest falsifier first).
+#   make board-size-promote    SIZE axis on TUNE+GATE. Promotion only; corpus_split.json
+#                              voids any promotion that was FITTED on GATE.
+#   make lever REF=<ref>       Judge one change: docs/promotion-rule.md applied clause by
+#                              clause by `fulcrum try`. Add ARGS=--size-only for the cheap
+#                              leg. Both arms built from git refs; NO-OPs refused.
+# =============================================================================
+.PHONY: board-size board-size-promote lever
+
+board-size: $(GZIPPY_BIN)
+	@scripts/campaign/board-size.sh tune
+
+board-size-promote: $(GZIPPY_BIN)
+	@CAMPAIGN_PROMOTE=1 scripts/campaign/board-size.sh all
+
+lever:
+	@test -n "$(REF)" || { echo "usage: make lever REF=<git-ref> [ARGS=--size-only]" >&2; exit 2; }
+	@scripts/campaign/lever.sh "$(REF)" $(ARGS)
+
+# =============================================================================
 # Quick test suite — deterministic, layered, <30 seconds.
 # Replaces wall-clock benchmarks with proxies that fail specifically:
 #   Stage 1: correctness + routing smoke (cargo test)
