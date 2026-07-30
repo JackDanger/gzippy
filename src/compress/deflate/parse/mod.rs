@@ -83,6 +83,22 @@ pub(super) const BUF_PAD: usize = 16;
 /// trade — one Huffman table over more symbols loses to local statistical drift wherever
 /// there is no structure to exploit.
 ///
+/// LOWERING IS ALSO FALSIFIED (2026-07-30), so the dial is now closed in BOTH
+/// directions. The note above only ever tested raising. `fulcrum why
+/// gzip:minjs.min.js:L7:T1:size` showed gzip spending MORE header bits than us
+/// (48,511 vs 40,595) and getting FEWER data bits — i.e. gzip splits into more,
+/// better-fitted blocks — which is a direct argument for a smaller budget. Tested at
+/// L7 T1, exact bytes, budget 300,000 -> 150,000 -> 65,535:
+///     minjs.min.js  1,086,304 -> 1,086,829 -> 1,087,296
+///     aozora.txt    4,017,941 -> 4,019,082 -> 4,022,883
+///     dickens       4,512,043 -> 4,514,371 -> 4,520,958
+///     photo.jpg     6,472,036 -> 6,472,958 -> 6,475,330
+///     data.csv      3,335,724 -> 3,335,269 -> 3,334,506   (the ONLY improver, -1,218 B)
+/// Four of five files get monotonically worse. The shipped 300,000 is at or near a
+/// local optimum on this axis and neither direction ships. Do not re-sweep this
+/// constant; a block-length change has to come from a different mechanism (the
+/// end-of-block RULE, per the note above), not from moving the cap.
+///
 /// The paired lever is a recalibrated END-OF-BLOCK rule; the arithmetic, the falsified
 /// first attempt at it, and the two remaining routes are recorded at the top of
 /// `block_split.rs`. Read that note before touching this constant.
