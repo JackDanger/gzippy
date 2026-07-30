@@ -130,6 +130,11 @@ stream. Deterministic, no pipeline code.
 
 ## 5. Next actions, ranked
 
+**Start with A1.** It is the only item that already has a located mechanism, a vendor
+precedent, a named axis, and a falsifier that costs one build. A2 depends on what A1
+finds about safe block lengths. B1 is a separate front and can run in parallel by
+another hand. The T1 wall item needs the wall census (§1) built first.
+
 **A1 — diff the block-END heuristic against three vendors.** The budget sweep falsified
 the budget but located this: `shortmatch`'s T4 gap is **flat at +85 across every
 budget** while its T1 degrades to +660 — chunking HELPS near-random data, because more,
@@ -207,6 +212,11 @@ and silently disabled the first two for part of 2026-07-29.
 `commit-msg` is crude: it matches proximity to a FALSIFY note, not semantics. 3 correct
 refusals, 1 incorrect (it blocked a legitimate revert until `RESTORE:` was added as an
 escape). Expect misfires and fix it rather than routinely using `--no-verify`.
+
+**How to measure anything:** size is deterministic — build, run, compare bytes, and
+grade per-label against all four rivals on the canonical corpus, any file that gets
+bigger kills the change. Wall needs the frozen box, paired, with an A/A certificate.
+Never quote a ratio without the absolute figure beside it.
 
 Wall verdicts come from the frozen box (solvency, AMD Zen2). Size is bit-identical
 across aarch64/Zen2/Intel — verified — so size needs one box only. Neither remote box
