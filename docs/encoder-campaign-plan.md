@@ -5,6 +5,33 @@ Read this before touching the encoder. Written to be picked up cold.
 
 ---
 
+## STATUS: DEFERRED (2026-07-30) — blocked on decision D3, not on engineering
+
+**The board is 223 failing cells of 1,320** (squishy GATE+TUNE, 4 rivals, L1-9 x T1/T4,
+0 VOID, subject `d2e47469`). The campaign is **explicitly deferred**, not abandoned and
+not quietly stalled: every remaining route terminates in a decision the engineer is not
+permitted to take, and each is characterised well enough to resume from cold.
+
+| class | cells | terminates in |
+|---|---|---|
+| T4 chunk overhead | 133 (60%) | **D3** — clause 3, 9 flips all under 0.02%, FIVE grid shapes tried |
+| L1 ratio | 34 | insert-density vs write-traffic dial; 3 escapes tried, all trade back |
+| L4 monotonicity | ~22 | **D1** — clause 5, lazy-at-L4 costs 17.7% wall; `deflate_medium` unmeasured |
+
+**Nothing here is waiting on someone to think of an idea.** The levers are built,
+measured, and recorded; PR #189 holds a working change that closes 29 cells and is
+blocked by one clause. Resume by answering D3 (below) — or, if D3 is answered "clause 3
+stands", by taking the `deflate_medium` path in D1, which is the only remaining route
+that needs new code rather than a ruling.
+
+**What NOT to do on resume:** re-sweep `SOFT_MAX_BLOCK_LENGTH` (closed both directions),
+re-try chunk-grid constants (five shapes, all flip), re-try bounds-check elision or
+`LIMIT_HASH_UPDATE` on the ht finder (both falsified in code), or re-attempt the
+signal-gated block-end bias (third instance of a banned content detector). Seven levers
+are falsified at their sites; `fulcrum candidates` surfaces them.
+
+---
+
 ## 1. Where we stand
 
 **165 failing per-label SIZE cells.** Roundtrip-verified census, canonical corpus (17 files staged of
@@ -509,6 +536,40 @@ add a wall criterion on the frozen box — Dr closing with wall flat is banking 
 not a cell. Free oracle: output is byte-identical.
 
 ## 6. Open decisions for the user — not engineering
+
+**D3 — does promotion-rule clause 3 apply to sub-noise SIZE ties? THIS IS THE ONE THAT
+BLOCKS 60% OF THE BOARD.**
+
+A thread-aware chunk grid (PR #189, branch `perf/t-aware-chunk-grid`) takes the board
+from 223 to 203: **29 cells closed, 9 opened**, fail-gap 1.0184 -> 0.9995. It collapses
+the per-chunk seam cost — our own T4-T1 at L6 goes tool.bin 2,828 -> 80 B,
+weights.safetensors 2,962 -> -1 B, data.sqlite 2,258 -> 559 B. Correctness verified
+through our own decoder and gzip at T4.
+
+Clause 3 says "No pass -> fail flips. Not one." There are 9. Every one is a T4 cell whose
+margin was already under 0.02%: winexe.exe L9 **+59 B on 1.5 MB**, data.csv L8 +102 B,
+aozora.txt L2 +20 B, ecoli.fastq L6 +321 B.
+
+**Five grid shapes were tried and all flip** — including a plain 1 MiB fixed grid with no
+thread term at all, which flips 8. So the flips are not caused by thread-awareness or by
+seam alignment; they are caused by changing the chunk size AT ALL. Those cells are won by
+the SPECIFIC 512 KiB grid, not by anything robust. There is no shape with zero flips, and
+looking for one is a closed search.
+
+The question is therefore not "can this be engineered around" — it cannot — but "is a
+59-byte regression on 1.5 MB a pass->fail flip for the purposes of a size gate". Both
+answers are legitimate and both unblock work:
+
+* **"Clause 3 stands."** Record it, close the chunk-grid class permanently, and redirect
+  to the 90 fail-at-both cells (34 at L1, ~22 at L4/D1). PR #189 gets closed with the
+  falsification kept.
+* **"Sub-noise size ties are not flips."** Then per `docs/promotion-rule.md` the rule
+  change lands SEPARATELY and FIRST, with its own symmetry/timing/backtest justification,
+  and only then is #189 re-evaluated against it.
+
+It is deliberately NOT decided here. The rule forbids a rule change authored by the
+session whose result it would rescue, and this is that session.
+
 
 **D1 — P4 monotonicity at L4 (board #49).** `-4` yields a bigger file than `-3`
 (+143,807 B on silesia 40 MB). Lazy at L4 fixes it and beats all four rivals on size by
