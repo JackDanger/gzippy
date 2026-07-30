@@ -19,6 +19,17 @@ pub const NUM_OBSERVATIONS_PER_BLOCK_CHECK: u32 = 512;
 
 /// Minimum input bytes before/around a candidate split (`MIN_BLOCK_LENGTH`).
 pub const MIN_BLOCK_LENGTH: usize = 5000;
+
+/// Long-match percentage below which a block is treated as STRUCTURELESS and allowed to
+/// split early. Long matches (>=9 B) are what header amortisation pays off against; a
+/// block with almost none is coding near-random data and wants a smaller, better-fitted
+/// table instead of a bigger amortised one.
+pub const LONG_MATCH_PCT_FLOOR: u64 = 2;
+
+/// Length-bias divisor used only on structureless blocks. The cutoff at the
+/// 512-observation cadence is `200 * num_observations`, so the bias alone fires at
+/// `200 * divisor` bytes: 250,000 here against 819,200 for the default 4096.
+pub const STRUCTURELESS_BIAS_DIVISOR: u64 = 1250;
 // FALSIFIED 2026-07-30 — do NOT lower the 4096 length-bias divisor unconditionally.
 //
 // The bias term `(block_length/4096) * num_observations` is the heuristic's ONLY
@@ -148,7 +159,27 @@ impl BlockSplitStats {
                 cutoff += cutoff * (8192 - num_items as u64) / 8192;
             }
 
-            if total_delta as u64 + (block_length as u64 / 4096) * self.num_observations as u64
+            // Length bias, gated on an ALREADY-CODED signal.
+            //
+            // The unconditional form is falsified (see the note above the struct): one
+            // divisor cannot serve both classes, because structureless data must split
+            // early and structured data must not. The discriminator is free — the
+            // observation buckets already separate LONG matches (>=9 bytes, index
+            // NUM_LITERAL_OBSERVATION_TYPES+1) from literals and short matches.
+            // Structured data is long-match heavy; near-random data is literals plus
+            // 3-byte matches. This reads symbols already emitted into the block, never
+            // input ahead, so it is a property of coded output, not a content detector.
+            let long_matches = self.observations[NUM_LITERAL_OBSERVATION_TYPES + 1] as u64
+                + self.new_observations[NUM_LITERAL_OBSERVATION_TYPES + 1] as u64;
+            let items = num_items as u64;
+            let structureless = items > 0 && long_matches * 100 < items * LONG_MATCH_PCT_FLOOR;
+            let divisor = if structureless {
+                STRUCTURELESS_BIAS_DIVISOR
+            } else {
+                4096
+            };
+
+            if total_delta as u64 + (block_length as u64 / divisor) * self.num_observations as u64
                 >= cutoff
             {
                 return true;
