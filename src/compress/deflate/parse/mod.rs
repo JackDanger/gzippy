@@ -58,7 +58,6 @@ mod greedy;
 // reverted, not feature-gated — because it is correct, it is the measured half of the
 // length-3-plus-2-way synthesis that REOPEN requires, and dead-but-compiled code that
 // still type-checks is far cheaper to revive than code recovered from a git log.
-#[allow(dead_code)]
 mod ht_fast;
 mod lazy;
 mod near_optimal;
@@ -516,18 +515,12 @@ pub(super) fn compress(
         // skip (P13) are the vendor-precedented shapes; a third table probed on every
         // position is not. A size-only argument is not sufficient for this class:
         // that is now 2 for 2.
+        // REOPEN of the wall falsification above — see this commit's message. The
+        // falsified arm was bounds-CHECKED on every table access; this one elides them
+        // the way `matchfinder::hc` already does, so it is a different machine-level
+        // shape, not a retry of the same one.
         #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => fast::run::<false>(
-            buf,
-            data_start,
-            in_end,
-            &statics,
-            bw,
-            is_last,
-            fast::FAST_BLOCK_LENGTH,
-            true,
-            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
-        ),
+        Strategy::Fast => ht_fast::run(buf, data_start, in_end, params, &statics, bw, is_last),
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
             let t = fast::tune::get();
