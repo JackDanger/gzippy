@@ -156,7 +156,13 @@ pub const HT_MAX_LEN3_OFFSET: u32 = 4096;
 /// up. The struct is >64 KiB, so it is always heap-boxed and never constructed
 /// or passed by value.
 pub struct HtMatchfinder {
-    hash_tab: [[i16; HT_BUCKET_SIZE]; HT_TAB_LEN],
+    /// Two `i16` bucket entries packed into ONE naturally-aligned `u32`: entry 0 in
+    /// the low half, entry 1 in the high half. This is the representation, not an
+    /// optimisation applied to a `[[i16;2]]` — the whole bucket is read with one aligned
+    /// load and written with one aligned store, which is the only remaining direction
+    /// after every attempt to make inserts RARER was falsified (table density IS the
+    /// ratio here; see the module doc).
+    hash_tab: [u32; HT_TAB_LEN],
     /// Singleton nodes for LENGTH-3 matches, in the shape libdeflate's
     /// `hc_matchfinder` uses. `ht_matchfinder` has no such table — that is the
     /// documented reason it "doesn't support length 3 matches" — and adding it is
@@ -219,6 +225,8 @@ impl HtMatchfinder {
         // `i < HT_TAB_LEN * HT_BUCKET_SIZE` stays inside the field.
         unsafe {
             let p = boxed.as_mut_ptr();
+            // Written through an `i16` view: `[u32; N]` is layout-identical to
+            // `[i16; 2N]`, and the sentinel must be per-ENTRY, not per-bucket.
             let tab = core::ptr::addr_of_mut!((*p).hash_tab) as *mut i16;
             for i in 0..(HT_TAB_LEN * HT_BUCKET_SIZE) {
                 tab.add(i).write(MATCHFINDER_INITVAL);
@@ -369,22 +377,32 @@ impl HtMatchfinder {
         // The 4-byte search. `break 'four` rather than `return`, so that a miss
         // falls through to the length-3 check instead of discarding it.
         'four: {
-            // --- entry 0: read, then insert this position ---
+            // ONE aligned load for both entries, and ONE aligned store on either path.
+            //
+            // The two paths differ in WHAT is stored, and that asymmetry is libdeflate's,
+            // not an accident to tidy away (`ht_matchfinder.h`, BUCKET_SIZE==2 arm):
+            // entry 0 is written unconditionally, but entry 1 is written only AFTER the
+            // cutoff check passes. Collapsing both into one unconditional store would
+            // change the table state on the early-out path, hence the parse, hence the
+            // output. Kept exact; only the store COUNT changes.
+            //
             // SAFETY: `hash < HT_TAB_LEN` — see the module doc's soundness section.
-            let mut cur_node = unsafe { self.hash_tab.get_unchecked(hash)[0] } as i32;
-            unsafe { self.hash_tab.get_unchecked_mut(hash)[0] = cur_pos as i16 };
+            let packed = unsafe { *self.hash_tab.get_unchecked(hash) };
+            let mut cur_node = (packed as u16) as i16 as i32;
             if cur_node <= cutoff {
+                // Early out: entry 0 := cur_pos, entry 1 untouched.
+                unsafe {
+                    *self.hash_tab.get_unchecked_mut(hash) =
+                        (packed & 0xFFFF_0000) | (cur_pos as u16 as u32);
+                }
                 break 'four;
             }
+            // Shift-and-insert: entry 0 := cur_pos, entry 1 := old entry 0.
+            unsafe {
+                *self.hash_tab.get_unchecked_mut(hash) = (packed << 16) | (cur_pos as u16 as u32);
+            }
             let mut match_pos = in_base_now + cur_node as usize;
-
-            // --- entry 1: shift entry 0 down into it, unconditionally ---
-            // libdeflate copies entry 0 into entry 1 even when `nice_len` is reached
-            // on the first candidate; keeping that makes the parse decisions match.
-            let to_insert = cur_node;
-            // SAFETY: as above.
-            cur_node = unsafe { self.hash_tab.get_unchecked(hash)[1] } as i32;
-            unsafe { self.hash_tab.get_unchecked_mut(hash)[1] = to_insert as i16 };
+            cur_node = ((packed >> 16) as u16) as i16 as i32;
 
             unsafe {
                 if load_u32(base, match_pos) == seq {
@@ -498,34 +516,19 @@ impl HtMatchfinder {
         loop {
             debug_assert!(hash < HT_TAB_LEN && hash3 < HT_HASH3_SIZE);
             // Shift the bucket down by one and insert at the head.
-            // ONE 32-bit store for the whole bucket, not two 16-bit stores.
+            // ONE aligned store for the whole bucket: [cur_pos, old entry 0].
             //
-            // A `[i16; 2]` bucket is exactly 4 bytes, and the shift-then-insert is
-            // `[cur_pos, old[0]]` — a value computable from one load. Writing it as a
-            // single `u32` halves the STORES on the skip path, which is the path that
-            // measured 3.68x libdeflate's data writes (module doc). Density is
-            // untouched: every position is still inserted, and the resulting table
-            // state is bit-identical to the two-store form.
+            // The skip path runs once per byte inside every accepted match (~14 bytes
+            // average on this corpus), so it is the hottest store site in the L1
+            // encoder. Halving its stores is the only remaining direction: every attempt
+            // to make inserts RARER is falsified — LIMIT_HASH_UPDATE, head-only insert,
+            // and dropping the length-3 insert inside matches ALL cost ratio, because
+            // table density IS the ratio here.
             //
-            // This is the "make each insert CHEAPER, not rarer" route. Every attempt to
-            // make inserts RARER is now falsified — LIMIT_HASH_UPDATE, head-only, and
-            // dropping the length-3 insert inside matches all cost ratio, because table
-            // density IS the ratio here.
-            //
-            // SAFETY: `hash < HT_TAB_LEN` and `hash3 < HT_HASH3_SIZE` (module doc). The
-            // bucket is `[i16; 2]` — 4 bytes, aligned to 2 — and `read_unaligned` /
-            // `write_unaligned` tolerate that alignment. Little-endian layout puts
-            // element 0 in the low half, so `(old_lo << 16) | cur_pos` is exactly
-            // `[cur_pos, old[0]]`.
+            // SAFETY: `hash < HT_TAB_LEN` — see the module doc's soundness section.
             unsafe {
-                let bp = self.hash_tab.get_unchecked_mut(hash).as_mut_ptr() as *mut u32;
-                let old = core::ptr::read_unaligned(bp);
-                let packed = if cfg!(target_endian = "little") {
-                    (old << 16) | (cur_pos as u16 as u32)
-                } else {
-                    (old >> 16) | ((cur_pos as u16 as u32) << 16)
-                };
-                core::ptr::write_unaligned(bp, packed);
+                let b = self.hash_tab.get_unchecked_mut(hash);
+                *b = (*b << 16) | (cur_pos as u16 as u32);
             }
             // The length-3 table is a SINGLETON per key (no bucket to shift), so a
             // skipped run overwrites rather than shifts — same as
