@@ -252,3 +252,43 @@ Four verbs carry the campaign:
 - An emit-throughput budget per level (Ir/byte). Phase 1's scaling ceiling depends on
   it and it exists nowhere.
 - RSS as a stated axis with a number.
+
+## 8. FALSIFIED — the block budget alone (2026-07-29)
+
+Sweep at L6 vs libdeflate, T1 gap / T4 gap (negative = we are smaller):
+
+| budget | logs.txt | text-1MB | shortmatch-4M |
+|---|---|---|---|
+| 300K (shipped) | +0 / +5698 | +0 / +451 | +0 / +85 |
+| 450K | -4025 / +4861 | -39 / +451 | **+468** / +85 |
+| 600K | -4796 / **-745 PASS** | -39 / +451 | **+660** / +85 |
+| 900K | -5464 / **-745 PASS** | -39 / +451 | **+660** / +85 |
+
+**There is no knee.** The incompressible T1 regression appears as soon as the
+budget exceeds 300K and saturates at +660; the compressible gain saturates around
+600K. No budget keeps the gain without the loss, and per-label means every file.
+
+The split check is NOT the cause — it is budget-independent (`block_split.rs:18`
+fires every 512 observations, `:136` requires MIN_BLOCK_LENGTH 5000 B). This is an
+adaptivity trade: one table over more symbols loses to local statistical drift
+wherever there is no structure to exploit.
+
+**What the sweep located instead.** The three file classes want three different
+block lengths, and the data says so unambiguously:
+* `logs.txt` — bigger blocks win big (-4,796 at 600K), enough to flip its T4 cell.
+* `text-1MB` — nearly indifferent (-39 at any budget).
+* `shortmatch-4M` — bigger blocks LOSE at T1 (+660), and its T4 is FLAT at +85
+  across every budget, i.e. chunking HELPS near-random data because more, smaller
+  tables track drifting statistics better.
+
+So the budget is the wrong knob. **The block-END decision is the right one**:
+`should_end_block` should already be cutting blocks short where there is no
+exploitable structure, and it is not doing so at larger budgets. That is a
+splitter-QUALITY target, it is data-responsive without being a content detector
+(the heuristic reads symbols already emitted, not the input ahead), and it has
+three vendor implementations to diff against — libdeflate's `should_end_block`,
+zlib-ng's, and igzip's. Vendor-diff-shaped, which is the family that wins here.
+
+Corollary for Front A: raising the budget cannot cover the T4 chunk overhead on
+its own. Either the splitter improves so a large budget is safe on every class, or
+the thread-aware grid carries Front A alone.
