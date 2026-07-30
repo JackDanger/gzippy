@@ -1,78 +1,70 @@
-//! Hash-table matchfinder with 2-entry inline buckets (`ht_matchfinder`).
+//! Hash-table matchfinder: 2-entry inline buckets PLUS a length-3 table.
 //!
-//! Faithful port of `vendor/libdeflate/lib/ht_matchfinder.h` (Eric Biggers,
-//! 2022) — `ht_matchfinder_init` / `_slide_window` / `_longest_match` /
-//! `_skip_bytes`, at `HT_MATCHFINDER_BUCKET_SIZE == 2`, which is the
-//! hand-unrolled arm libdeflate actually ships at level 1.
+//! Port of `vendor/libdeflate/lib/ht_matchfinder.h` (Eric Biggers, 2022) at
+//! `HT_MATCHFINDER_BUCKET_SIZE == 2` — the hand-unrolled arm libdeflate ships at
+//! level 1 — **with a `hash3_tab` added in the shape libdeflate's OWN
+//! `hc_matchfinder` uses at levels 2-9.** That combination is the point of this
+//! module and no vendor ships it.
 //!
-//! # Why this exists, and why it is not another knob
+//! # Why, measured
 //!
-//! `parse::fast`'s fused finder is CHAINLESS SINGLE-PROBE: one `u32` head table
-//! of 64 K entries (256 KiB) plus a separate 3-byte-keyed `head3` side table
-//! (128 KiB), one candidate examined per position. libdeflate's level 1 instead
-//! keeps the chain INLINE in the bucket: `[[i16; 2]; 1 << 15]` — **128 KiB
-//! total, two candidates per position, and no length-3 table at all.**
+//! `fulcrum why libdeflate:data.csv:L1:T1:size` (the automated vendor diff,
+//! structure layer, 26,500,000 B input) found the L1 gap is the PARSE, not block
+//! sizing and not table quality — header bits agreed within 0.37%:
 //!
-//! The measured consequence of having one candidate instead of two, from
-//! `fulcrum why libdeflate:data.csv:L1:T1:size` (2026-07-30, the automated
-//! vendor diff, structure layer):
-//!
-//! | | ours | libdeflate |
+//! | | ours (`parse::fast`) | libdeflate L1 |
 //! |---|---|---|
 //! | matches | 1,846,129 | **1,930,665** (+4.58%) |
-//! | literals | **741,183** | 256,099 (**we emit 189% more**) |
+//! | literals | **741,183** | 256,099 (**+189.41%**) |
 //! | input covered by matches | 97.20% | **99.03%** |
-//! | header bits | 166,614 | 166,000 |
 //!
-//! Headers are within 0.4% of each other, so this is NOT block sizing and NOT
-//! table quality — the diff's own verdict is "POSITION COUNTS DIFFER: different
-//! parse decisions — the gap is ALGORITHMIC". We find slightly LONGER matches on
-//! average (13.95 B vs 13.59 B) while covering LESS input, which is the exact
-//! signature of a single-probe finder taking the first candidate its hash offers
-//! and missing the better one a second way would have held.
+//! A pure `ht_matchfinder` port then closed 9 libdeflate L1 cells — every one to
+//! ratio EXACTLY 1.0000 — and OPENED 7, because `ht_matchfinder` deliberately has
+//! no length-3 table ("Due to its focus on speed, the ht_matchfinder doesn't
+//! support length 3 matches") and three BINARIES were files where our `head3`
+//! table already BEAT libdeflate. See the FALSIFY note at the `Strategy::Fast`
+//! dispatch arm in `parse/mod.rs` for that full record.
 //!
-//! # REOPEN of the bucket2 falsification, and why this is a different mechanism
+//! So the two properties are complementary, not alternatives: **length-3 matches
+//! earn bytes on binaries; 2-way bucketing earns far more on text and structured
+//! data.** libdeflate has buckets without hash3 at L1 and hash3 without buckets
+//! at L2-9; `parse::fast` has hash3 with a single probe. This has both.
+//!
+//! # Working set — the arithmetic that makes this a REOPEN
 //!
 //! `c0f69036` recorded a FROZEN ship gate on `17283ee6` ("insert-depth=8 +
-//! bucket2(gate=64)"): **SIZE PASSED cleanly** — "a genuine, confirmed, LARGE
-//! ratio-only win" — and WALL FAILED DECISIVELY, a 12-29% self-tax at ~26
-//! standard deviations. It was reverted (`158af467`). That record names its own
-//! reopen condition verbatim:
+//! bucket2(gate=64)"): SIZE PASSED — "a genuine, confirmed, LARGE ratio-only win"
+//! — and WALL FAILED DECISIVELY at a 12-29% self-tax, ~26 standard deviations. Its
+//! stated reopen condition is "a materially cheaper way to get the same length-3-8
+//! reach / second-candidate signal". Cheaper is the whole claim:
 //!
-//! > "Not re-attempted without either (1) **a materially cheaper way to get the
-//! > same length-3-8 reach / second-candidate signal**, or (2) a re-scoped ship
-//! > rule that accepts size-only status."
+//! | | `parse::fast` (shipped) | falsified `17283ee6` | this |
+//! |---|---|---|---|
+//! | 4-byte table | `head` 64 K x u32 = 256 KiB | same, kept | **2-way `[[i16;2]; 32 K]` = 128 KiB** |
+//! | 3-byte table | `head3` = 128 KiB | same, kept | **`[i16; 32 K]` = 64 KiB** |
+//! | second candidate | none | ADDED, gated at 64 | inline in the bucket, ungated |
+//! | insert depth | 3 | raised to 8 | 1 per position |
+//! | **total** | **384 KiB** | **384 KiB + a third probe** | **192 KiB — exactly half** |
 //!
-//! This is condition (1), and the mechanism is REPLACE rather than ADD — which
-//! is precisely what the falsified attempt did not do:
+//! Half the memory touched per position, two 4-byte candidates instead of one, and
+//! one fewer probe site than the falsified attempt. The `i16` position encoding is
+//! what pays for it: libdeflate's `mf_pos_t` is 2 bytes against our `u32` heads.
 //!
-//! | | falsified `17283ee6` | this port |
-//! |---|---|---|
-//! | second candidate | ADDED, gated at 64 | inline in the bucket, ungated |
-//! | `head` 64 K × u32 | kept (256 KiB) | replaced |
-//! | `head3` side table | kept (128 KiB) | **deleted — no length-3 table** |
-//! | insert depth | raised to 8 | unchanged (1 insert/position) |
-//! | working set | ~384 KiB **and growing** | **128 KiB, 3x smaller** |
+//! It is also NOT a content detector, which matters because the competing lever is:
+//! both tables are read and written at EVERY position with no data-dependent
+//! branch, so there is nothing to gate and no threshold to fit. That is why this
+//! route can retire `L1_HASH3_GATE_LIT_THRESHOLD_PCT` — a constant fitted two
+//! points off a 2-point-wide cliff on the single file `dd79_bin6`, which
+//! `CLAUDE.md` non-negotiable #3 orders deleted — rather than join it.
 //!
-//! The falsified version paid for a second probe ON TOP OF an already-large
-//! two-table working set and deepened inserts as well; its self-tax is exactly
-//! what that predicts. Three times less memory touched per position, with one
-//! probe site instead of two different-key probes, is a different mechanism and
-//! not "another threshold sweep on this same shape". It is also NOT a content
-//! detector: the second bucket entry is read unconditionally at every position,
-//! so there is no data-dependent branch to gate and nothing to tune — which is
-//! the point, and why it can retire `L1_HASH3_GATE_LIT_THRESHOLD_PCT` (a
-//! constant fitted two points off one file's cliff) rather than join it.
-//!
-//! **The wall leg is still the binding risk and is NOT claimed here.** Size is
-//! deterministic and free, so per `CLAUDE.md` (cheapest falsifier first) it is
-//! measured first; a size win obliges a frozen paired wall run on solvency
-//! before anything ships, and the prior falsification is the reason to expect
-//! that leg to be hard rather than to assume the smaller table wins it.
+//! **NO WALL CLAIM IS MADE HERE.** The prior falsification in this class died on
+//! wall, so the working-set arithmetic above is a REASON TO MEASURE, not evidence.
+//! Size is deterministic and free and runs first; a size win obliges a frozen
+//! paired wall run on solvency before anything ships.
 
 use super::common::{
-    load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_write, MATCHFINDER_INITVAL,
-    MATCHFINDER_WINDOW_SIZE,
+    load_u24, load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_write,
+    MATCHFINDER_INITVAL, MATCHFINDER_WINDOW_SIZE,
 };
 
 /// `HT_MATCHFINDER_HASH_ORDER`.
@@ -88,6 +80,19 @@ pub const HT_MIN_MATCH_LEN: u32 = 4;
 /// `HT_MATCHFINDER_REQUIRED_NBYTES` — minimum `max_len` for [`HtMatchfinder::longest_match`].
 pub const HT_REQUIRED_NBYTES: u32 = 5;
 
+/// Hash order for the LENGTH-3 singleton table. Same order libdeflate's
+/// `hc_matchfinder` uses for its own `hash3_tab` (`HC_HASH3_ORDER` 15).
+pub const HT_HASH3_ORDER: u32 = 15;
+/// Entries in [`HtMatchfinder::hash3_tab`]. 32,768 x 2 B = 64 KiB.
+pub const HT_HASH3_SIZE: usize = 1 << HT_HASH3_ORDER;
+/// Longest length-3 match distance worth coding. A length-3 match at a large
+/// offset costs more bits than three literals, so libdeflate's greedy parser
+/// guards it with `length > DEFLATE_MIN_MATCH_LEN || offset <= 4096`
+/// (`deflate_compress.c` `deflate_compress_greedy`). `deflate_compress_fastest`
+/// has no such guard only because it has no length-3 matches to guard; adding
+/// them means adopting the guard with them.
+pub const HT_MAX_LEN3_OFFSET: u32 = 4096;
+
 /// `struct ht_matchfinder`. 128 KiB of inline `[i16; 2]` buckets.
 ///
 /// Inline fixed-size array rather than a `Vec`, for the same reason
@@ -97,6 +102,11 @@ pub const HT_REQUIRED_NBYTES: u32 = 5;
 /// or passed by value.
 pub struct HtMatchfinder {
     hash_tab: [[i16; HT_BUCKET_SIZE]; HT_TAB_LEN],
+    /// Singleton nodes for LENGTH-3 matches, in the shape libdeflate's
+    /// `hc_matchfinder` uses. `ht_matchfinder` has no such table — that is the
+    /// documented reason it "doesn't support length 3 matches" — and adding it is
+    /// the whole point of this variant. See the module doc.
+    hash3_tab: [i16; HT_HASH3_SIZE],
 }
 
 thread_local! {
@@ -158,6 +168,10 @@ impl HtMatchfinder {
             for i in 0..(HT_TAB_LEN * HT_BUCKET_SIZE) {
                 tab.add(i).write(MATCHFINDER_INITVAL);
             }
+            let t3 = core::ptr::addr_of_mut!((*p).hash3_tab) as *mut i16;
+            for i in 0..HT_HASH3_SIZE {
+                t3.add(i).write(MATCHFINDER_INITVAL);
+            }
             boxed.assume_init()
         }
     }
@@ -169,6 +183,7 @@ impl HtMatchfinder {
         // memset-shaped loop rather than N two-element fills.
         let flat: &mut [i16] = self.as_flat_mut();
         flat.fill(MATCHFINDER_INITVAL);
+        self.hash3_tab.fill(MATCHFINDER_INITVAL);
     }
 
     /// The bucket array viewed as one contiguous `[i16]`, for `fill`/rebase.
@@ -206,6 +221,7 @@ impl HtMatchfinder {
     #[inline]
     fn slide_window(&mut self) {
         matchfinder_rebase(self.as_flat_mut());
+        matchfinder_rebase(&mut self.hash3_tab[..]);
     }
 
     /// `ht_matchfinder_longest_match`. Returns `(best_len, offset)`; `best_len ==
@@ -232,6 +248,7 @@ impl HtMatchfinder {
         max_len: u32,
         nice_len: u32,
         next_hash: &mut u32,
+        next_hash3: &mut u32,
     ) -> (u32, u32) {
         debug_assert!(max_len >= HT_REQUIRED_NBYTES);
         debug_assert_eq!(HT_MIN_MATCH_LEN, 4);
@@ -264,12 +281,17 @@ impl HtMatchfinder {
         //     same pad argument therefore covers `match_pos + best_len + 1`.
         let base = buf.as_ptr();
         let seq = unsafe { load_u32(base, in_next) };
-        // The next position's hash is computed HERE, one position ahead, so the
-        // caller's loop never recomputes it — this is what makes
-        // HT_REQUIRED_NBYTES 5 rather than 4.
+        // The next position's hashes are computed HERE, one position ahead, so the
+        // caller's loop never recomputes them — this is what makes
+        // HT_REQUIRED_NBYTES 5 rather than 4. Both keys come from ONE 4-byte load
+        // of `in_next + 1`, so the length-3 table costs no extra input read.
         let hash = *next_hash as usize;
-        *next_hash = lz_hash(unsafe { load_u32(base, in_next + 1) }, HT_HASH_ORDER);
+        let hash3 = *next_hash3 as usize;
+        let next_seq = unsafe { load_u32(base, in_next + 1) };
+        *next_hash = lz_hash(next_seq, HT_HASH_ORDER);
+        *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
         debug_assert!((*next_hash as usize) < HT_TAB_LEN);
+        debug_assert!((*next_hash3 as usize) < HT_HASH3_SIZE);
         // Prefetch the bucket the NEXT position will touch, matching
         // libdeflate's `prefetchw(&mf->hash_tab[*next_hash])`.
         // SAFETY: `lz_hash(_, HT_HASH_ORDER)` returns < 1 << 15 == HT_TAB_LEN,
@@ -279,50 +301,89 @@ impl HtMatchfinder {
             prefetch_write(self.hash_tab.as_ptr().add(*next_hash as usize) as *const u8);
         }
 
-        // --- entry 0: read, then insert this position ---
-        let mut cur_node = self.hash_tab[hash][0] as i32;
-        self.hash_tab[hash][0] = cur_pos as i16;
-        if cur_node <= cutoff {
-            return (0, 0);
-        }
-        let mut match_pos = in_base_now + cur_node as usize;
+        // Read the length-3 singleton and insert this position, in the shape
+        // `hc_matchfinder` uses. Done BEFORE the 4-byte search so the insert
+        // happens exactly once per position on every control-flow path — the
+        // 4-byte search below has several early exits, and a table that skips
+        // inserts on some of them would silently degrade over the file.
+        debug_assert!(hash3 < HT_HASH3_SIZE);
+        let cur_node3 = self.hash3_tab[hash3] as i32;
+        self.hash3_tab[hash3] = cur_pos as i16;
 
-        // --- entry 1: shift entry 0 down into it, unconditionally ---
-        // libdeflate copies entry 0 into entry 1 even when `nice_len` is reached
-        // on the first candidate; keeping that makes the parse decisions match.
-        let to_insert = cur_node;
-        cur_node = self.hash_tab[hash][1] as i32;
-        self.hash_tab[hash][1] = to_insert as i16;
+        // The 4-byte search. `break 'four` rather than `return`, so that a miss
+        // falls through to the length-3 check instead of discarding it.
+        'four: {
+            // --- entry 0: read, then insert this position ---
+            let mut cur_node = self.hash_tab[hash][0] as i32;
+            self.hash_tab[hash][0] = cur_pos as i16;
+            if cur_node <= cutoff {
+                break 'four;
+            }
+            let mut match_pos = in_base_now + cur_node as usize;
 
-        unsafe {
-            if load_u32(base, match_pos) == seq {
-                best_len = lz_extend(buf, in_next, match_pos, HT_MIN_MATCH_LEN, max_len);
-                best_match_pos = match_pos;
-                if cur_node <= cutoff || best_len >= nice_len {
-                    return (best_len, (in_next - best_match_pos) as u32);
-                }
-                match_pos = in_base_now + cur_node as usize;
-                // Pre-screen: the same 4-byte head AND the 4 bytes ending at the
-                // incumbent's last matched byte. A candidate failing either
-                // cannot beat `best_len`, so it is rejected without extending.
-                if load_u32(base, match_pos) == seq
-                    && load_u32(base, match_pos + best_len as usize - 3)
-                        == load_u32(base, in_next + best_len as usize - 3)
-                {
-                    let len = lz_extend(buf, in_next, match_pos, HT_MIN_MATCH_LEN, max_len);
-                    if len > best_len {
-                        best_len = len;
-                        best_match_pos = match_pos;
-                    }
-                }
-            } else {
-                if cur_node <= cutoff {
-                    return (0, 0);
-                }
-                match_pos = in_base_now + cur_node as usize;
+            // --- entry 1: shift entry 0 down into it, unconditionally ---
+            // libdeflate copies entry 0 into entry 1 even when `nice_len` is reached
+            // on the first candidate; keeping that makes the parse decisions match.
+            let to_insert = cur_node;
+            cur_node = self.hash_tab[hash][1] as i32;
+            self.hash_tab[hash][1] = to_insert as i16;
+
+            unsafe {
                 if load_u32(base, match_pos) == seq {
                     best_len = lz_extend(buf, in_next, match_pos, HT_MIN_MATCH_LEN, max_len);
                     best_match_pos = match_pos;
+                    if cur_node <= cutoff || best_len >= nice_len {
+                        break 'four;
+                    }
+                    match_pos = in_base_now + cur_node as usize;
+                    // Pre-screen: the same 4-byte head AND the 4 bytes ending at the
+                    // incumbent's last matched byte. A candidate failing either
+                    // cannot beat `best_len`, so it is rejected without extending.
+                    if load_u32(base, match_pos) == seq
+                        && load_u32(base, match_pos + best_len as usize - 3)
+                            == load_u32(base, in_next + best_len as usize - 3)
+                    {
+                        let len = lz_extend(buf, in_next, match_pos, HT_MIN_MATCH_LEN, max_len);
+                        if len > best_len {
+                            best_len = len;
+                            best_match_pos = match_pos;
+                        }
+                    }
+                } else {
+                    if cur_node <= cutoff {
+                        break 'four;
+                    }
+                    match_pos = in_base_now + cur_node as usize;
+                    if load_u32(base, match_pos) == seq {
+                        best_len = lz_extend(buf, in_next, match_pos, HT_MIN_MATCH_LEN, max_len);
+                        best_match_pos = match_pos;
+                    }
+                }
+            }
+        }
+
+        // LENGTH-3 CHECK — the addition to libdeflate's `ht_matchfinder`, in the
+        // shape its own `hc_matchfinder` uses for `hash3_tab`. Only reached when the
+        // 4-byte search found nothing, so it costs one compare on the miss path and
+        // nothing at all on the hit path.
+        //
+        // The offset guard is not optional: a length-3 match beyond
+        // HT_MAX_LEN3_OFFSET costs more bits than three literals, which is why
+        // `deflate_compress_greedy` carries `length > DEFLATE_MIN_MATCH_LEN ||
+        // offset <= 4096`. Applying it here rather than in the parser keeps the
+        // parser a faithful `deflate_compress_fastest` (which accepts any match the
+        // finder returns) and puts the bit-cost knowledge where the length-3
+        // candidate is produced.
+        if best_len == 0 && cur_node3 > cutoff {
+            let mp = in_base_now + cur_node3 as usize;
+            let off = (in_next - mp) as u32;
+            if off <= HT_MAX_LEN3_OFFSET {
+                // SAFETY: `cur_node3 > cutoff` so `mp < in_next` and `mp` points into
+                // already-processed input; `load_u24` reads 4 bytes at `mp`, and
+                // `mp + 4 <= in_next + 4 <= buf.len()` given BUF_PAD.
+                let cand = unsafe { load_u24(base, mp) };
+                if cand == seq & 0xFF_FFFF {
+                    return (3, off);
                 }
             }
         }
@@ -356,6 +417,7 @@ impl HtMatchfinder {
         in_end: usize,
         count: u32,
         next_hash: &mut u32,
+        next_hash3: &mut u32,
     ) {
         if count as usize + HT_REQUIRED_NBYTES as usize > in_end - in_next {
             return;
@@ -372,10 +434,11 @@ impl HtMatchfinder {
         // `pos + 4 <= in_next + count + 5 <= in_end <= buf.len()`.
         let base = buf.as_ptr();
         let mut hash = *next_hash as usize;
+        let mut hash3 = *next_hash3 as usize;
         let mut pos = in_next;
         let mut remaining = count;
         loop {
-            debug_assert!(hash < HT_TAB_LEN);
+            debug_assert!(hash < HT_TAB_LEN && hash3 < HT_HASH3_SIZE);
             // Shift the bucket down by one and insert at the head.
             let mut i = HT_BUCKET_SIZE - 1;
             while i > 0 {
@@ -383,9 +446,17 @@ impl HtMatchfinder {
                 i -= 1;
             }
             self.hash_tab[hash][0] = cur_pos as i16;
+            // The length-3 table is a SINGLETON per key (no bucket to shift), so a
+            // skipped run overwrites rather than shifts — same as
+            // `hc_matchfinder_skip_positions` does for its `hash3_tab`. Skipping this
+            // insert would leave the length-3 table blind to every position inside a
+            // match, which is most of the input on compressible data.
+            self.hash3_tab[hash3] = cur_pos as i16;
 
             pos += 1;
-            hash = lz_hash(unsafe { load_u32(base, pos) }, HT_HASH_ORDER) as usize;
+            let seq = unsafe { load_u32(base, pos) };
+            hash = lz_hash(seq, HT_HASH_ORDER) as usize;
+            hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
             cur_pos += 1;
             remaining -= 1;
             if remaining == 0 {
@@ -397,6 +468,7 @@ impl HtMatchfinder {
             prefetch_write(self.hash_tab.as_ptr().add(hash) as *const u8);
         }
         *next_hash = hash as u32;
+        *next_hash3 = hash3 as u32;
     }
 }
 
@@ -454,12 +526,32 @@ mod tests {
         // SAFETY: `data` was padded by 64 bytes above, so a 4-byte load at 0 is
         // trivially in bounds.
         let mut next_hash = lz_hash(unsafe { load_u32(data.as_ptr(), 0) }, HT_HASH_ORDER);
+        let mut next_hash3 = lz_hash(
+            unsafe { load_u32(data.as_ptr(), 0) } & 0xFF_FFFF,
+            HT_HASH3_ORDER,
+        );
 
         // Insert positions 0..21 the way the parse loop would.
         for pos in 0..21 {
-            let _ = mf.longest_match(&data, &mut in_base, pos, 32, 258, &mut next_hash);
+            let _ = mf.longest_match(
+                &data,
+                &mut in_base,
+                pos,
+                32,
+                258,
+                &mut next_hash,
+                &mut next_hash3,
+            );
         }
-        let (len, off) = mf.longest_match(&data, &mut in_base, 21, 32, 258, &mut next_hash);
+        let (len, off) = mf.longest_match(
+            &data,
+            &mut in_base,
+            21,
+            32,
+            258,
+            &mut next_hash,
+            &mut next_hash3,
+        );
 
         // The best available match at 21 is against position 0 (16 bytes), not
         // the more recent position 16 (4 bytes).
