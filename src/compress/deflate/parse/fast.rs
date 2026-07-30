@@ -1201,6 +1201,11 @@ fn hc_catchup(
 /// -0.3% vs `LIMIT_HASH_UPDATE_INSERTS_L0`). Higher values (4, 8, MAX) give
 /// more ratio but blow well past a 10% L1 wall budget — not shipped, see the
 /// commit message for the measured numbers.
+// Dead in a default build since L1 moved to `super::ht_fast` (libdeflate's real
+// level-1 shape). Still live under `l1-tune`, and scheduled for deletion in step 2
+// of the transliteration plan — see `ht_fast`'s module doc. Kept rather than removed
+// now so this commit changes ONE thing: which parser L1 uses.
+#[allow(dead_code)]
 pub(super) const LIMIT_HASH_UPDATE_INSERTS_L1: usize = 3;
 
 /// Sentinel head-table entry meaning "no position stored yet". Any position we
@@ -1546,6 +1551,11 @@ const WINDOW: usize = 32768;
 /// 64 KiB the ~dozens-of-bytes dynamic header amortizes to well under 1%. This
 /// is the fast path's one ratio/speed tuning knob — it does not affect
 /// correctness (any block boundary roundtrips).
+// Dead in a default build since L1 moved to `super::ht_fast` (libdeflate's real
+// level-1 shape). Still live under `l1-tune`, and scheduled for deletion in step 2
+// of the transliteration plan — see `ht_fast`'s module doc. Kept rather than removed
+// now so this commit changes ONE thing: which parser L1 uses.
+#[allow(dead_code)]
 pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 
 /// L0's block length. The per-block dynamic-Huffman build (canonical code +

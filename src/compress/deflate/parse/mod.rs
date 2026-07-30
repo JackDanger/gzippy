@@ -50,6 +50,10 @@ pub use fast::tune;
 // re-inherited by the next session that reads the file. A stale comment proposing
 // forbidden work is not inert documentation; it is an instruction.
 mod greedy;
+/// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
+/// `deflate_compress_fastest`. See its module doc for the vendor diff and the
+/// REOPEN it rests on.
+mod ht_fast;
 mod lazy;
 mod near_optimal;
 /// The crown engine (zopfli port + LzFind/squeeze/recursive-splitter Pareto
@@ -418,18 +422,19 @@ pub(super) fn compress(
         // the two consts below for the env-var-backed tune values here — no
         // change to `fast::run`'s signature needed. Byte-identical to the
         // `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
+        // L1 now runs the 2-way hash-table matchfinder — libdeflate's actual
+        // level-1 shape. See `ht_fast`'s module doc for the vendor diff that
+        // motivated it (`fulcrum why libdeflate:data.csv:L1:T1:size`: we emitted
+        // 189% more literals and found 4.58% fewer matches, with header bits
+        // within 0.4%, so the gap is the parse, not the tables) and for the
+        // REOPEN of the `17283ee6` bucket2 falsification it rests on.
+        //
+        // `fast::run::<false>` is intentionally still here and still reachable
+        // from `Strategy::Fast0`/`l1-tune`: step 2 of the transliteration plan
+        // deletes what this makes dead, but only AFTER the size verdict, per the
+        // "converge before deleting" rule in docs/encoder-campaign-plan.md §3.
         #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => fast::run::<false>(
-            buf,
-            data_start,
-            in_end,
-            &statics,
-            bw,
-            is_last,
-            fast::FAST_BLOCK_LENGTH,
-            true,
-            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
-        ),
+        Strategy::Fast => ht_fast::run(buf, data_start, in_end, params, &statics, bw, is_last),
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
             let t = fast::tune::get();

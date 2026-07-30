@@ -67,6 +67,10 @@
 pub mod bt;
 pub mod common;
 pub mod hc;
+/// libdeflate's level-1 hash-table matchfinder: 2-entry inline buckets, 128 KiB,
+/// no length-3 table. See the module doc for the vendor diff that motivated the
+/// port and the REOPEN of the bucket2 falsification it rests on.
+pub mod ht;
 /// ECT-class BT4 full-Pareto matchfinder — the crown engine's (`parse::ultra`)
 /// seed matchfinder for the multi-seed iterated squeeze DP. Not used by any
 /// other level tier. See the module doc above for why it stays a distinct
