@@ -34,7 +34,10 @@ it before running a wall lever.
 
 ## 2. The board splits into two fronts
 
-All 133 failing T4 cells, gap-to-rival divided by (chunks x per-chunk overhead):
+The failing T4 cells, gap-to-rival divided by (chunks x per-chunk overhead), where
+chunks are the 512 KiB pipelined grid (`pipelined.rs:65`). NOTE: §1's rival table sums to
+134 and this decomposition covers 133 — recount before trusting either number; the
+missing cell is unidentified.
 
 | gap / chunk-overhead | cells | reading |
 |---|---|---|
@@ -50,6 +53,10 @@ the block grid inside every chunk, and it grows with level. (Provenance: these t
 constants and the cell split below came from runs whose artifacts are not in-repo. They
 are consistent internally and with the census, but re-derive them before betting a large
 change on them — `CLAUDE.md` says a gate may only cite a dataset that exists.)
+
+The **31 T1 fails are not decomposed here.** Assign each to a front (most are Front B's
+L1 class plus the D1/L4 monotonicity family) so every one of the 165 cells belongs to
+exactly one of Front A, Front B, or D1. A cell in no bucket is a plan gap.
 
 **Front B — the L1 ratio class (33 cells).** Gaps of 60 K-636 K bytes: access.log at
 911x the chunk overhead, monorepo 515x, data.csv 421x, aozora 380x. Our `Fast` parser
@@ -120,7 +127,8 @@ loses to local statistical drift wherever there is no structure to exploit.
 
 **Coding-locus rework, and why it died on paper.** "Workers hand the writer tokens; one
 writer emits with the T1 grid, closing ~103 cells by construction" is false. Histograms
-are built in the PARSE (`parse/mod.rs:121-131`) and the block grid is a per-symbol
+are built in the PARSE (at `Seq` push time in the `Sink`; `parse/mod.rs:121-131` is the
+`Seq` doc comment, the frequency bump is in the push path) and the block grid is a per-symbol
 observation stream with per-block state (`block_split.rs:14-61`), so a writer
 re-blocking across seams must re-run those observations serially over every literal
 byte — nowhere near the claimed 4-6% of work. If workers keep their own grid, the grid
@@ -138,35 +146,64 @@ precedent, a named axis, and a falsifier that costs one build. A2 depends on wha
 finds about safe block lengths. B1 is a separate front and can run in parallel by
 another hand. The T1 wall item needs the wall census (§1) built first.
 
-**A1 — block-end policy. The vendor diff is DONE; it lives here, not as a TODO.**
+**A1 — recalibrate the block-END rule so the budget can rise. This is the `REOPEN:` of
+the falsified "block budget 300K -> 900K" row, and it ships as a PAIR.**
 
-An earlier draft said "diff our `should_end_block` against libdeflate's, zlib-ng's and
-igzip's". That was a category error: **two of the three have no such mechanism.**
+The sweep's fact pair: budget 600K wins -4,796 B at T1 and flips T4 to PASS (-745) on
+logs.txt, and costs +660 B at T1 on shortmatch-4M, whose T4 gap is flat at +85 at every
+budget because the 512 KiB chunk grid (`pipelined.rs:65`) already gives near-random data
+the smaller tables it wants. So the lever is a recalibrated end-of-block rule that cuts
+structureless data short below the budget, PLUS `SOFT_MAX_BLOCK_LENGTH`
+(`parse/mod.rs:64`) raised. A splitter change alone at the shipped 300K budget is
+near-byte-identical, and per §3 a byte-identical change can never close a size cell.
 
-| implementation | end-of-block signal | parameters |
-|---|---|---|
-| **libdeflate + ours** (L2+) | first true of: soft byte cap, sequence cap, adaptive drift split | 300,000 B / 50,000 seqs / `should_end_block` over 10 observation classes, checked every 512 new observations, gated by `MIN_BLOCK_LENGTH` 5000 before and after |
-| **zlib-ng** | symbol buffer FULL — `sym_next == sym_end` | `lit_bufsize = 1 << (memLevel+6)` = 16,384 symbols at default memLevel |
-| **igzip L1-3** | ICF token buffer capacity exhausted — `icf_buf_avail_out <= 0` | capacity from `level_buf_size` (default `*_DEFAULT = *_LARGE`) |
+**The vendor diff is DONE. This table is the result — do not redo it.**
 
-So the structural difference is not a better drift detector. **The vendors that win this
-region enforce a hard LOCAL CODING BUDGET; we enforce a byte cap plus a drift heuristic.**
-That reframes the sweep result: `shortmatch`'s T4 gap staying flat at +85 across every
-byte budget while its T1 degraded to +660 is what a missing symbol budget looks like —
-the byte cap lets a block run long on data whose statistics drift, and the drift detector
-does not cut it short.
+| impl | end-of-block signal | parameters | where |
+|---|---|---|---|
+| ours L2-9 | drift detector AND byte budget AND seq cap | every 512 obs; cutoff 200/512; small-block penalty (<10000 B, <8192 obs); length bias `/4096`; 300,000 B; 50,000 seqs; MIN_BLOCK_LENGTH 5000 | `block_split.rs:14-147`, `parse/mod.rs:64`, `parse/mod.rs:606-618` |
+| libdeflate L2-9 | **identical — ours is a verified term-for-term port** | same five numbers | `deflate_compress.c:443,66,81,93`, `:2142-2197`, `:2591-2595` |
+| ours L1 | fixed byte quantum, no detector | 65,536 B | `parse/fast.rs:1549`; never calls `should_end_block` (`parse/mod.rs:254-256`) |
+| libdeflate L1 | fixed byte quantum + seq cap | 65,535 B / 8,192 seqs | `deflate_compress.c:102,108`, `:2469-2470` |
+| zlib-ng L2-9 | fixed SYMBOL quantum, no detector; then per-block cheapest-of-three | 16,383 symbols (`lit_bufsize-1`, memLevel 8) | `zlib-ng/deflate.c:289,311,357-360`, `deflate_p.h:84,114`, `trees.c:668,676,686` |
+| igzip L1-3 | fixed TOKEN quantum, no detector; per-block hufftables + stored compare | 65,536 tokens x 4 B (CLI default) | `igzip_lib.h:296,310-315`, `igzip.c:307-324`, `:406`, `:365-416` |
 
-**A1.1, the first code lever:** keep `should_end_block`, add a hard symbol/token budget
-cap, and sweep a small grid around zlib-ng's 16,384. This is parameter tuning of a
-policy constant, not content detection — the budget is a fixed number, and the counter it
-tests reads symbols already emitted.
+**What the diff teaches, and it is a calibration fact, not a bug.** libdeflate is the
+ONLY vendor with a drift detector and we ship it bit-for-bit — so there was never
+anything to steal from them here. The other three rivals get small tables on
+structureless data for free, from a fixed small quantum. Our detector's only
+structureless-data response is the length-bias term `(block_length/4096)*num_obs`
+(`block_split.rs:122` = `deflate_compress.c:2192`); at check time the cutoff is
+`200*num_obs`, so that term alone fires only at `block_length >= 200*4096 = 819,200 B`
+stationary — **calibrated dead below any budget we would ship.** That is the dial, and it
+is why the +660 regression saturates between the 600K and 900K rows.
 
-Axis: **size** first (Front A), then wall. Kill gates, cheapest sound pair:
-1. Deterministic size leg on the canonical corpus — any file that gets bigger kills it.
-2. Paired interleaved wall leg to `/dev/null` at one shallow and one deep level, on one
-   drift/near-random file and one compressible file — any pass->fail flip or a wall
-   regression beyond noise kills it. A better splitter can cost search work, so size
-   alone is not a sufficient gate.
+Candidate mechanisms, in order: (1) recalibrate the bias so stationary data self-splits
+near 150-300K, gated on an emitted-symbol signal (match fraction, or estimated
+bits/input-byte from the Sink histogram — reads symbols already emitted, never input
+ahead, so not a content detector); (2) zlib-ng-style per-block cost check at the 512-obs
+cadence. **The failure mode to design against:** the bias is unconditional, so firing
+early on STRUCTURED stationary data (text at 600K) gives back the amortisation the budget
+raise just bought. shortmatch must split early; text must not.
+
+State up front, before building: 600K roughly doubles `SEQ_STORE_CAPACITY`
+(`parse/mod.rs:108-115`) — give the RSS delta per D2. And `continue_block` also ends
+blocks at `SEQ_STORE_LENGTH` 50,000 seqs, which may bind before 600K on matchy data —
+establish which bound produced the logs.txt gain before assuming the byte budget did.
+
+Axis **size**, targets Front A via T1 slack. L1 is untouched by construction (the fast
+parser never calls `should_end_block`).
+
+**Falsifier: the promotion rule (`docs/promotion-rule.md`), both axes, cheapest first.**
+Size leg first — free and deterministic: one build, full canonical corpus x L1-9 x
+T1/T4, per-label against all four rivals. Clause 3 has real teeth here: this breaks
+byte-identity with libdeflate at every currently-tied cell BY DESIGN, so every tie is one
+bad file from a pass->fail flip. Wall leg only if size survives — this can cost wall
+twice (the check itself, and more blocks means more header builds and `min_match_len`
+recalcs): one paired interleaved run on the frozen box at L2/L6/L9, T1, n per clause 8.
+Counterfactual written first: **if shortmatch-4M T1 at the raised budget exceeds its
+300K-budget bytes with the new rule active, the recalibration failed and the whole pair
+reverts — the budget raise does not ship alone.**
 
 **A2 — thread-aware chunk grid.** Chunks of `input/(k*T)` cut chunk count 25-100x,
 shrinking Front A's residual to a few hundred bytes per file. Now legal: the
@@ -221,6 +258,13 @@ state needs the bound stated first.
   interface.
 - `pipelined.rs:77-90` presents T-invariant bytes as a "HARD INVARIANT". A product
   choice at most, and it is what forbids A2.
+- `vendor-structure-comparison.md` §2 omits igzip: it bounds blocks by ICF TOKENS,
+  65,536 x 4 B at CLI default (`igzip_lib.h:296,310-315`), with per-block hufftables
+  (`igzip.c:406`) and a stored-block cost compare (`igzip.c:365-416`).
+- `parse/fast.rs:675` still reads `GZIPPY_L1TUNE_BLOCK_LENGTH`; the L1TUNE/L3TUNE family
+  CLAUDE.md non-negotiable #3 orders deleted still exists and no board item carries the
+  deletion. B1's first commit should delete it — B1's measurements are meaningless while
+  a knob can vary the shape.
 - Board #50 overstates its case: per-chunk overhead owns about half the T4 board, not
   103 cells. §2 has the split.
 
