@@ -24,9 +24,14 @@ are <= gzip AND <= pigz AND <= libdeflate AND <= igzip on size and on wall.
 writing to a shared fd. Fulcrum proves no thread is ever starved and that reads and
 writes are scheduled correctly — the same starvation/causation/perturbation tooling
 that won parallel decode.
-INVARIANT: T>1 output is byte-identical to T1 output, or never larger. That single
-invariant closes the entire T>1 size leg at once and makes T>1 purely a wall problem
-with a free correctness oracle.
+THE ONLY CORRECTNESS BAR, at every thread count, is VALID GZIP: roundtrip sha256
+through our decoder plus one independent decoder. T>1 may emit different bytes than
+T1. The T>1 size leg is closed by making seams SMALLER — pad choice, chunk grid,
+block splitting — never by reproducing T1's bytes. (User, 2026-07-28, stated three
+times. Byte-identity to a vendor, to our own T1, or to our own previous run is never
+a goal and never a gate. This paragraph previously mandated T1==T4; that is WHY the
+rule had to be restated three times — each correction landed in a leaf doc while the
+root file kept regenerating the cage.)
 DONE WHEN: the same per-label bar holds at the default thread count and at T4/T8/T16.
 
 **STEP 3 — the exotic path (-10/-11/-12), separate again.** Our `parse/ultra` crown
@@ -59,8 +64,7 @@ vendor-fidelity rule, and no clause in this file that requires anyone's approval
 Read libdeflate, igzip, zlib-ng, zopfli, ECT, rapidgzip — steal every good idea.
 **Never inherit a vendor's decisions.** Our level->config map is currently a copy of
 libdeflate's, which is why we run their algorithm slower than they do; it is free to
-change. A technique with no vendor counterpart is equally welcome. A prior
-falsification measured against a different code shape is not binding — re-attempt it.
+change. A technique with no vendor counterpart is equally welcome. A prior falsification is BINDING until a NEW mechanism is named (see Hard stops).
 
 Decide, build, measure, report. Never ask permission.
 
@@ -94,15 +98,83 @@ file was once a careful code read and was wrong in every particular.
 
 Fulcrum finds where the time goes and proves a change worked. **It is never the
 deliverable.** A new instrument requires a named failing cell and the blocking
-question in its commit message. Before building one, spend thirty minutes running the
-actual binaries.
+question in its commit message.
 
 **The only progress metric is failing cells closed, by name.** Report it every
-session, and report zero as zero. Two consecutive sessions at zero means stop
-building and go run a profiler on the worst cell.
+session, and report zero as zero.
+
+**Two consecutive sessions at zero BLOCKS optimisation edits.** Not "should
+prompt reflection" — blocked. Only profiling, measurement, vendor-structure-diff,
+or landing-already-gated-work commits are allowed until a named worst cell and
+its blocking metric are recorded. The soft version of this rule was in force all
+session and was ignored eight times.
+
+## Hard stops
+
+These fail closed. They exist because the soft versions were each ignored at
+least once in a single session.
+
+1. **Diff the vendor BEFORE proposing a change.** Every win this project has ever
+   had came from comparing our implementation against a vendor's (3 for 3). Every
+   change found by opening our own profile and shaving its top line has failed
+   (3 for 3, plus 5 more). A change with no named vendor difference is allowed,
+   but the commit must say so explicitly — that declares there is no precedent
+   the idea pays, so the bar is a measurement rather than an argument.
+   Build the vendor with `-g` or its profile is one opaque symbol.
+
+2. **A FALSIFY note is BINDING.** Touching a function that carries one requires a
+   `REOPEN:` line in the commit message naming a NEW mechanism and what would
+   falsify it. "Different code shape now" is not a mechanism. Two attempts this
+   session were variants of an already-recorded falsification.
+
+3. **Never generalise a measurement across levels.** Any instruction, read, or
+   wall claim must be measured at a SHALLOW and a DEEP level before it is
+   believed. Measuring L2 alone and generalising shipped a 6.2% L6 and 9.9% L9
+   regression.
+
+4. **Source-level cost is not machine-level cost.** A claim about loads,
+   branches, or work must show the counter moving (Dr, Ir, cycles). Hand-hoisting
+   "obviously redundant" loop-invariant loads drove data reads UP, because LLVM
+   had already hoisted them and the hoist only added register pressure.
+
+5. **Land gated work before starting new work.** A win that has cleared the
+   promotion rule and sits in an open PR is worth more than any unstarted lever.
+   The one real win this session was earned early and landed last, after eight
+   failures, only when challenged.
+
+6. **Never hand-roll a measurement.** Check Fulcrum's command list first. A
+   hand-written size audit compared byte counts with no roundtrip check and would
+   have scored a corrupt-but-smaller output as a WIN; `sizecensus` already existed
+   and VOIDs that. If the tool is missing on a box, FIX THE BOX — a stale
+   instrument set is what produced the substitute.
+
+7. **A measurement from an unidentified binary is not a measurement.** Verify the
+   deployed commit before quoting a number from it.
 
 ## Working rules
 
+- **A retraction must reach the ROOT.** When the user retracts a goal or
+  constraint, grep CLAUDE.md, MEMORY.md and docs/ for every statement of it and fix
+  them all in the SAME commit. A retraction recorded only in a leaf doc is
+  re-inherited from the root file the next session reads. (Receipt: the
+  byte-identity rule needed three user corrections because STEP 2 kept mandating
+  T1==T4 while each correction landed elsewhere.)
+- **Land the win first.** A change that has cleared the promotion rule outranks
+  starting anything new, and an open PR holding a cleared win is item one at every
+  board check. No new lever starts while a cleared win sits unmerged or a
+  user-ordered deletion sits undone. (Receipt: the only landed win of 2026-07-28
+  sat in a PR through eight falsified levers.)
+- **Two strikes closes a class.** Two falsifications of the same mechanism close
+  that class for the session; reopening needs a vendor diff naming why the next
+  instance differs. Five of one session's eight levers were the same class —
+  hand-scheduling a loop LLVM had already scheduled — re-sampled after its verdict
+  was already known.
+- **Cheapest falsifier first.** Order a lever's legs by cost: deterministic size
+  and Ir on the canonical corpus before any wall run; a shallow AND a deep level
+  before any claim about "the levels"; both arches before any general conclusion.
+  This binds lever SELECTION, not only shipping.
+- **State the absolute next to the relative.** 87% of a 0.01% penalty is 0.01%. A
+  commit quoting a ratio names the artifact path holding it.
 - Branch + PR; main is protected. `make` before `make ship`.
 - One integration writer per checkout; worktrees for parallel work.
 - If a tool errors, diagnose the first failure before doing anything else. Never
