@@ -70,6 +70,10 @@ pub mod hc;
 /// libdeflate's level-1 hash-table matchfinder: 2-entry inline buckets, 128 KiB,
 /// no length-3 table. See the module doc for the vendor diff that motivated the
 /// port and the REOPEN of the bucket2 falsification it rests on.
+// See `parse::ht_fast` — the L1 replacement routing is falsified; this finder is
+// correct (fulcrum verify: 220 cells, 0 roundtrip failures) and is retained for the
+// synthesis lever. Its own unit tests keep it from rotting while it is unrouted.
+#[allow(dead_code)]
 pub mod ht;
 /// ECT-class BT4 full-Pareto matchfinder — the crown engine's (`parse::ultra`)
 /// seed matchfinder for the multi-seed iterated squeeze DP. Not used by any
