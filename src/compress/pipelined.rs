@@ -93,9 +93,25 @@ const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 /// session whose result it would rescue. Do not re-sweep grid constants hoping for a
 /// shape with zero flips; five have been tried.
 ///
-/// Chunks handed to each thread by the thread-aware grid. Oversubscription margin for
-/// the scheduler's atomic work queue — see [`pipelined_block_size`].
-const CHUNKS_PER_THREAD: usize = 4;
+/// Chunks handed to each thread by the thread-aware grid.
+///
+/// The structurally-pure value is 1 — one chunk per thread is the minimum number of
+/// seams that still uses every thread, and seams are what cost bytes. It is not 1
+/// because the scheduler hands chunks out from an atomic queue and a thread that draws
+/// an incompressible chunk must be able to pick up another; at k=1 the whole job is as
+/// slow as its unluckiest chunk, which is exactly how the level-scaled-grid attempt died
+/// (2-4% wall to imbalance).
+///
+/// 2 is the smallest oversubscription that keeps that safety valve. Measured T4-T1 seam
+/// cost at L6, exact bytes, k=4 -> k=2 -> k=1:
+///     dickens        787 ->  373 ->  221
+///     data.sqlite    671 ->  482 ->  346
+///     monorepo.tar  1206 ->  401 ->  130
+///     access.log     926 ->  675 ->  565
+///     tool.bin      -659 ->   68 -> 1186   <- k=1 is NON-MONOTONIC here
+/// k=1 wins on three files and loses badly on tool.bin, and it removes the balancing
+/// margin entirely. k=2 halves the seam cost against k=4 while keeping the valve.
+const CHUNKS_PER_THREAD: usize = 2;
 
 /// Ceiling on the thread-aware chunk size. Chunks are buffered in flight, so this is an
 /// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
