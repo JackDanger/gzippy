@@ -59,8 +59,7 @@ vendor-fidelity rule, and no clause in this file that requires anyone's approval
 Read libdeflate, igzip, zlib-ng, zopfli, ECT, rapidgzip — steal every good idea.
 **Never inherit a vendor's decisions.** Our level->config map is currently a copy of
 libdeflate's, which is why we run their algorithm slower than they do; it is free to
-change. A technique with no vendor counterpart is equally welcome. A prior
-falsification measured against a different code shape is not binding — re-attempt it.
+change. A technique with no vendor counterpart is equally welcome. A prior falsification is BINDING until a NEW mechanism is named (see Hard stops).
 
 Decide, build, measure, report. Never ask permission.
 
@@ -94,12 +93,58 @@ file was once a careful code read and was wrong in every particular.
 
 Fulcrum finds where the time goes and proves a change worked. **It is never the
 deliverable.** A new instrument requires a named failing cell and the blocking
-question in its commit message. Before building one, spend thirty minutes running the
-actual binaries.
+question in its commit message.
 
 **The only progress metric is failing cells closed, by name.** Report it every
-session, and report zero as zero. Two consecutive sessions at zero means stop
-building and go run a profiler on the worst cell.
+session, and report zero as zero.
+
+**Two consecutive sessions at zero BLOCKS optimisation edits.** Not "should
+prompt reflection" — blocked. Only profiling, measurement, vendor-structure-diff,
+or landing-already-gated-work commits are allowed until a named worst cell and
+its blocking metric are recorded. The soft version of this rule was in force all
+session and was ignored eight times.
+
+## Hard stops
+
+These fail closed. They exist because the soft versions were each ignored at
+least once in a single session.
+
+1. **Diff the vendor BEFORE proposing a change.** Every win this project has ever
+   had came from comparing our implementation against a vendor's (3 for 3). Every
+   change found by opening our own profile and shaving its top line has failed
+   (3 for 3, plus 5 more). A change with no named vendor difference is allowed,
+   but the commit must say so explicitly — that declares there is no precedent
+   the idea pays, so the bar is a measurement rather than an argument.
+   Build the vendor with `-g` or its profile is one opaque symbol.
+
+2. **A FALSIFY note is BINDING.** Touching a function that carries one requires a
+   `REOPEN:` line in the commit message naming a NEW mechanism and what would
+   falsify it. "Different code shape now" is not a mechanism. Two attempts this
+   session were variants of an already-recorded falsification.
+
+3. **Never generalise a measurement across levels.** Any instruction, read, or
+   wall claim must be measured at a SHALLOW and a DEEP level before it is
+   believed. Measuring L2 alone and generalising shipped a 6.2% L6 and 9.9% L9
+   regression.
+
+4. **Source-level cost is not machine-level cost.** A claim about loads,
+   branches, or work must show the counter moving (Dr, Ir, cycles). Hand-hoisting
+   "obviously redundant" loop-invariant loads drove data reads UP, because LLVM
+   had already hoisted them and the hoist only added register pressure.
+
+5. **Land gated work before starting new work.** A win that has cleared the
+   promotion rule and sits in an open PR is worth more than any unstarted lever.
+   The one real win this session was earned early and landed last, after eight
+   failures, only when challenged.
+
+6. **Never hand-roll a measurement.** Check Fulcrum's command list first. A
+   hand-written size audit compared byte counts with no roundtrip check and would
+   have scored a corrupt-but-smaller output as a WIN; `sizecensus` already existed
+   and VOIDs that. If the tool is missing on a box, FIX THE BOX — a stale
+   instrument set is what produced the substitute.
+
+7. **A measurement from an unidentified binary is not a measurement.** Verify the
+   deployed commit before quoting a number from it.
 
 ## Working rules
 
