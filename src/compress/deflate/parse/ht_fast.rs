@@ -100,6 +100,10 @@ pub(super) fn run(
     // `seq` compare in `longest_match` is what establishes a real match. Kept
     // identical rather than "fixed" so parse decisions match the vendor's.
     let mut next_hash = 0u32;
+    // Second key, for the length-3 singleton table. Same `0` seeding convention and
+    // the same reason it is harmless — the table only proposes a candidate, and the
+    // 3-byte compare in `longest_match` is what establishes a real match.
+    let mut next_hash3 = 0u32;
     let mut sink = Sink::new();
     // One dynamic-header scratch for the WHOLE call, reused across every
     // internal block, instead of `build_dynamic_header` allocating per block.
@@ -114,6 +118,7 @@ pub(super) fn run(
             in_end,
             data_start as u32,
             &mut next_hash,
+            &mut next_hash3,
         );
     }
 
@@ -175,8 +180,15 @@ pub(super) fn run(
                     nice_len = nice_len.min(max_len);
                 }
 
-                let (length, offset) =
-                    mf.longest_match(buf, &mut in_base, pos, max_len, nice_len, &mut next_hash);
+                let (length, offset) = mf.longest_match(
+                    buf,
+                    &mut in_base,
+                    pos,
+                    max_len,
+                    nice_len,
+                    &mut next_hash,
+                    &mut next_hash3,
+                );
 
                 if length != 0 {
                     // `fastest` accepts ANY match the finder returns — no
@@ -190,6 +202,7 @@ pub(super) fn run(
                         in_end,
                         length - 1,
                         &mut next_hash,
+                        &mut next_hash3,
                     );
                     pos += length as usize;
                 } else {
