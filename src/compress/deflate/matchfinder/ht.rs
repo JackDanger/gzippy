@@ -364,15 +364,10 @@ impl HtMatchfinder {
             prefetch_write(self.hash_tab.as_ptr().add(*next_hash as usize) as *const u8);
         }
 
-        // Read the length-3 singleton and insert this position, in the shape
-        // `hc_matchfinder` uses. Done BEFORE the 4-byte search so the insert
-        // happens exactly once per position on every control-flow path — the
-        // 4-byte search below has several early exits, and a table that skips
-        // inserts on some of them would silently degrade over the file.
         debug_assert!(hash3 < HT_HASH3_SIZE);
-        // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
-        let cur_node3 = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
-        unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+        // NOTE: the length-3 table is touched AFTER the 4-byte search, below. The store
+        // is unconditional (density is the ratio — proven, three ways); the READ is not,
+        // because `cur_node3` is consumed only when the 4-byte search misses.
 
         // The 4-byte search. `break 'four` rather than `return`, so that a miss
         // falls through to the length-3 check instead of discarding it.
@@ -450,18 +445,41 @@ impl HtMatchfinder {
         // parser a faithful `deflate_compress_fastest` (which accepts any match the
         // finder returns) and puts the bit-cost knowledge where the length-3
         // candidate is produced.
-        if best_len == 0 && cur_node3 > cutoff {
-            let mp = in_base_now + cur_node3 as usize;
-            let off = (in_next - mp) as u32;
-            if off <= HT_MAX_LEN3_OFFSET {
-                // SAFETY: `cur_node3 > cutoff` so `mp < in_next` and `mp` points into
-                // already-processed input; `load_u24` reads 4 bytes at `mp`, and
-                // `mp + 4 <= in_next + 4 <= buf.len()` given BUF_PAD.
-                let cand = unsafe { load_u24(base, mp) };
-                if cand == seq & 0xFF_FFFF {
-                    return (3, off);
+        // LENGTH-3 TABLE: store always, READ ONLY ON THE MISS PATH.
+        //
+        // `cur_node3` is consumed only when the 4-byte search found nothing, so loading
+        // it at every probed position spends a dependent read on the ~71% of positions
+        // that hit. Splitting the two paths keeps the table state — and therefore every
+        // candidate proposal and every output byte — bit-identical, while removing one
+        // D-read per hit position.
+        //
+        // This targets the counter this cell's FALSIFY record actually names. The
+        // recorded cause of death for this class is LOADS ("61% of our excess over
+        // libdeflate at L2 is load instructions, with IPC and stalls already BETTER than
+        // theirs"), and the REOPEN bar is "a mechanism that adds candidates WITHOUT
+        // adding dependent loads per position". Store-count reductions do not answer
+        // that bar and measured accordingly: a u32-packed bucket cut D writes 26,927,232
+        // -> 19,730,873 (-26.7%) and moved the frozen paired wall not at all.
+        //
+        // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
+        if best_len == 0 {
+            let cur_node3 = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            if cur_node3 > cutoff {
+                let mp = in_base_now + cur_node3 as usize;
+                let off = (in_next - mp) as u32;
+                if off <= HT_MAX_LEN3_OFFSET {
+                    // SAFETY: `cur_node3 > cutoff` so `mp < in_next` and points into
+                    // already-processed input; `load_u24` reads 4 bytes at `mp`, and
+                    // `mp + 4 <= in_next + 4 <= buf.len()` given BUF_PAD.
+                    let cand = unsafe { load_u24(base, mp) };
+                    if cand == seq & 0xFF_FFFF {
+                        return (3, off);
+                    }
                 }
             }
+        } else {
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
         }
 
         if best_len == 0 {
