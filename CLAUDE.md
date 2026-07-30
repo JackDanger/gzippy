@@ -153,6 +153,28 @@ least once in a single session.
 
 ## Working rules
 
+- **A retraction must reach the ROOT.** When the user retracts a goal or
+  constraint, grep CLAUDE.md, MEMORY.md and docs/ for every statement of it and fix
+  them all in the SAME commit. A retraction recorded only in a leaf doc is
+  re-inherited from the root file the next session reads. (Receipt: the
+  byte-identity rule needed three user corrections because STEP 2 kept mandating
+  T1==T4 while each correction landed elsewhere.)
+- **Land the win first.** A change that has cleared the promotion rule outranks
+  starting anything new, and an open PR holding a cleared win is item one at every
+  board check. No new lever starts while a cleared win sits unmerged or a
+  user-ordered deletion sits undone. (Receipt: the only landed win of 2026-07-28
+  sat in a PR through eight falsified levers.)
+- **Two strikes closes a class.** Two falsifications of the same mechanism close
+  that class for the session; reopening needs a vendor diff naming why the next
+  instance differs. Five of one session's eight levers were the same class —
+  hand-scheduling a loop LLVM had already scheduled — re-sampled after its verdict
+  was already known.
+- **Cheapest falsifier first.** Order a lever's legs by cost: deterministic size
+  and Ir on the canonical corpus before any wall run; a shallow AND a deep level
+  before any claim about "the levels"; both arches before any general conclusion.
+  This binds lever SELECTION, not only shipping.
+- **State the absolute next to the relative.** 87% of a 0.01% penalty is 0.01%. A
+  commit quoting a ratio names the artifact path holding it.
 - Branch + PR; main is protected. `make` before `make ship`.
 - One integration writer per checkout; worktrees for parallel work.
 - If a tool errors, diagnose the first failure before doing anything else. Never
