@@ -1546,6 +1546,18 @@ const WINDOW: usize = 32768;
 /// 64 KiB the ~dozens-of-bytes dynamic header amortizes to well under 1%. This
 /// is the fast path's one ratio/speed tuning knob — it does not affect
 /// correctness (any block boundary roundtrips).
+// FALSIFIED 2026-07-30 — do NOT "fix" this to 65,535 to match libdeflate's
+// FAST_SOFT_MAX_BLOCK_LENGTH (`deflate_compress.c:102`). The reasoning is seductive and
+// wrong: a DEFLATE stored block carries at most 65,535 B, so 1<<16 cannot be ONE stored
+// block and costs a second sub-block header for a single trailing byte. True, and it
+// buys nothing, because L1 does not choose stored on the data where it would matter.
+// Exact bytes at L1 T1, 1<<16 -> 65,535:
+//     photo.jpg   6,473,842 -> 6,473,842   UNCHANGED (L1 codes it dynamic, not stored)
+//     data.csv    4,111,742 -> 4,111,746   +4 B
+//     dickens     5,077,406 -> 5,077,412   +6 B
+// Strictly worse: nothing gained on incompressible input, a few bytes lost on
+// compressible input to the extra block header. The photo.jpg gzip cells it was aimed
+// at (+0.03% at L1/L2/L3) are NOT a stored-framing problem.
 pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 
 /// L0's block length. The per-block dynamic-Huffman build (canonical code +

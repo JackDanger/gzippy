@@ -1674,7 +1674,19 @@ fn emit_sequences(
 /// Approximate bit cost of storing `len` bytes as stored (BTYPE=00) sub-blocks.
 /// Mirrors the estimate in [`super`], used only for the block-type decision.
 fn stored_block_bits(len: usize) -> u64 {
-    let subblocks = (len / 65535) + 1;
+    // `div_ceil`, NOT `(len / 65535) + 1`. The old form over-counted by one whole
+    // sub-block whenever `len` is an exact multiple of 65,535 — charging 5 bytes that
+    // `emit_stored_block` never writes, so the three-way stored/static/dynamic compare
+    // could reject a STORED block that was in fact the cheapest. On incompressible
+    // input, where stored is the right answer, that is a direct loss.
+    //
+    // The codebase already had the correct formula for the same quantity
+    // (`estimate_output_cap` in `deflate/mod.rs` uses
+    // `len.div_ceil(MAX_STORED_SUBBLOCK).max(1) * 5`) and this site disagreed with it.
+    // Two formulas for one physical fact is how a cost model drifts from the emitter it
+    // prices; `emit_stored_block` writes exactly `ceil(len / MAX_STORED_SUBBLOCK)`
+    // sub-blocks, and this now says so.
+    let subblocks = len.div_ceil(65535).max(1);
     (8 * (len + 5 * subblocks)) as u64
 }
 
