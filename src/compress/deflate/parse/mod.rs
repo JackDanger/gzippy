@@ -48,7 +48,6 @@ pub use fast::tune;
 /// session built; a `--tune`-style channel + `fulcrum l3search` are a real,
 /// named, un-taken next step (mirror `fast::tune::parse_spec`'s precedent)
 /// if this composition needs further search.
-mod gated;
 mod greedy;
 mod lazy;
 mod near_optimal;
@@ -430,7 +429,6 @@ pub(super) fn compress(
         // DETECTOR-GATED LAZY-L3 (`l3-tune` feature): see `gated.rs`'s module
         // doc comment. `level.rs`'s L3 arm is the only producer of this
         // strategy; not reachable from a default (non-`l3-tune`) build.
-        Strategy::LazyGated => gated::run(buf, data_start, in_end, params, &statics, bw, is_last),
         Strategy::NearOptimal => {
             near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
         }
