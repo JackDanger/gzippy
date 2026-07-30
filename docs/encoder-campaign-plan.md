@@ -1,261 +1,105 @@
-# The encoder campaign plan
+# The encoder campaign: state, method, next actions
 
-Synthesised 2026-07-29 from three parallel mining passes over the DECODE campaign's
-968 MB transcript archive (what won, what stuck), plus an architecture audit of the
-encoder against `encoder-architecture.md`, `compressor-architecture.md`, and five
-vendored implementations.
-
-This file exists because the decode campaign's own forensics found **533
-conclusion-sentences against 1,127 reversal-sentences — reversals outnumbering
-conclusions 2:1, across 74 self-refuted "the lever is X" claims.** A session on
-2026-07-29 reproduced that fingerprint exactly: 9 levers attempted, 9 falsified,
-board unchanged at 165 failing cells. The plan's job is to not do that again.
+Read this before touching the encoder. Written to be picked up cold.
+`CLAUDE.md` has the rules; this has the board, what already failed, and what to do.
 
 ---
 
-## 1. What actually wins, counted
+## 1. Where we stand
 
-Decode's discovery-method tally across four winning months:
+**165 failing per-label SIZE cells.** Roundtrip-verified census, canonical 17-file
+corpus x L1-9 x 4 rivals x T1/T4; 1020 cells measured, 0 VOID.
 
-| method | wins | falsifications |
+| rival | T1 fails | T4 fails |
 |---|---|---|
-| vendor structural diff / convergence / port | ~9 | — |
-| **causal perturbation** (removal oracle, ablation, blocked-on decomposition) | **~8** | — |
-| self-profile top-line shaving | **0** | **>=8** |
-
-The encoder's own record is the same shape: 3/3 wins from vendor diffs, 0/8 from
-shaving our own profile's top line.
-
-**Two consequences.**
-
-1. A lever selected from our own profile is not a candidate. It is a coin flip with
-   a known-bad prior.
-2. **We have never built the second winning family.** Every decode win that was not
-   a vendor port came from a causal instrument — stub or delete a region, watch the
-   number respond. *"The oracle is what separated 'recoverable lever' from
-   'cycle-cheap slack' every time."* The encoder has no such instrument. That gap,
-   not any missing insight, is the largest single hole in this campaign.
-
-## 2. The ordering lesson, which is the reason the last session failed
-
-Decode's kernel-converge series **halved** the igzip T1 gap by *faithful structural
-transliteration* of igzip's loop shape. Only after that convergence did single-op
-deletions (`cursor2` single-refill, B2 pre-copy refill) become visible — and each was
-then worth 5-10%.
-
-The encoder has been attempting the deletions **without the convergence**. We
-"run libdeflate's algorithm slower than they do", which is precisely the
-pre-convergence state decode was in on 2026-06-18. The answer then was not knob
-search on our own shape; it was converging on the vendor's structure with the
-vendor's profile as the control.
-
-Decode's sequencing verdict, stated by the campaign's own retrospective: *"every
-attempt to optimize ahead of a trusted instrument produced the June circles; every
-post-`fulcrum score` week produced closed cells."* Decode drifted for weeks until one
-command generated the loss map, then went 30/40 -> 110/120 -> zero-loss in ten days.
-
-## 3. The board, as measured
-
-165 failing per-label SIZE cells (roundtrip-verified census, canonical 17-file
-corpus x L1-9 x 4 rivals x T1/T4; 1020 measured, 0 VOID).
-
-| rival | T1 | T4 |
-|---|---|---|
-| libdeflate | 11 | **113** |
+| libdeflate | 11 | 113 |
 | gzip | 11 | 12 |
 | pigz | 8 | 8 |
 | igzip | 1 | 1 |
 
-Failures are **uniformly distributed** across all 17 files (9-17 each, no outlier),
-which rules out content-shaped causes and points at a per-chunk fixed cost.
+**The wall axis has no census yet.** That is a gap: `CLAUDE.md` grades size AND wall,
+and several items below are wall questions with no board to score them against. Build
+it before running a wall lever.
 
-**Measured per-chunk constant** (silesia 212 MB, 405 chunks): **+18.7 B/chunk at L2,
-+32.1 B/chunk at L6.** Seams account for ~5.4 B. The dominant term is **extra
-dynamic-header mass from restarting the block grid inside every chunk** — 2-3x the
-seam cost, growing with level.
+**Two facts that shape everything:**
 
-That explains both banked T>1 reverts: the pigz 10-bit pad attacked only the sub-byte
-alignment sliver (0.0007% size, 0.7-0.9% wall), and the level-scaled chunk grid
-divided the constant rather than removing it (0.01% size, 2-4% wall).
+1. **Our T1 output is byte-size-identical to libdeflate at L2 and L4-L9** on all 20
+   canonical files. We ship their algorithm, so we have **zero size slack** at those
+   labels and every small T>1 overhead turns a tie into a failed cell. We chose this by
+   copying their level table; it is not a law.
+2. **At L2 we execute 1.12x libdeflate's instructions (555.1M vs 496.0M) at better
+   IPC**, with fewer frontend stalls and a lower L1D miss rate. 61% of the excess is
+   LOAD instructions. **Our emit path is already 0.90x theirs (57.4M vs 63.8M) — the
+   whole debt is parse+matchfinder.**
 
-**The structural conclusion:** the T4 size cells are unclosable while both (a) chunks
-are independently coded and (b) T1 ships libdeflate's exact sizes (zero slack at
-L2/L4-L9). One of (a) or (b) must change. (a) is the complete fix.
+## 2. The board splits into two fronts
 
-## 4. The plan
-
-### Phase 0 — trust the instrument before optimising anything
-
-Decode's most expensive mistake was **measuring an artifact that was not the
-product** — weeks of real, gated, cross-arch wins on a build flavour CI never
-shipped. Its most-recurred class: the stale routing table, the instrumented-build
-tax quoted against rivals, T10 measured as T1.
-
-0.1 **Land the gated work.** PRs #179 (rules + docs) and #180 (L3 win, env-channel
-    deletion, commit-msg hook). `docs/vendor-structure-comparison.md` and
-    `vendor-technique-index.md` are cited by CLAUDE.md as in-repo but exist only on
-    unmerged branches — one dead branch from losing the campaign's key artifacts.
-
-0.2 **Build the encoder removal oracle.** The missing win family. Region-stub arms
-    (lazy peek, a hash-insert tier, the block-split search, the prefilter, the
-    seq-store) each compiled out behind a non-shipping feature, then measured for
-    size AND wall response per level. Monotonic response => on the critical path;
-    flat => slack. This is what tells us which regions can pay before we spend a
-    lever on one.
-
-0.3 **Preflight on every measurement, refusing rather than warning:** route
-    assertion (`encode-path=`), binary sha matched to source commit, explicit
-    `-p1`/`-pN`, `/dev/null` both arms, same-run A/A bracketing 1.0.
-
-### Phase 1 — T>1: buy slack and cut chunk count (NOT a coding-locus rework)
-
-**The "parse in parallel, code serially / closes 103 cells by construction" plan was
-FALSIFIED on paper by adversarial review before any code was written.** Two reasons,
-both structural:
-
-* Histograms are built in the PARSE, not the emit (`parse/mod.rs:121-131`), and the
-  block grid is a per-symbol observation stream with per-block state
-  (`block_split.rs:14-61`). A writer that re-blocks across seams must re-run those
-  observations serially over every literal byte — nowhere near 4-6% of work.
-* If workers keep their own grid instead, the grid still restarts per segment, which
-  IS the dominant term. Deleting the 5.4 B seam while keeping the 13-27 B header term
-  closes almost nothing.
-
-Exactness is required, not approximation: T1 is byte-identical to libdeflate at
-L2/L4-L9, so +1 byte fails the cell. A seam-parsed token stream cannot reproduce T1's
-tokens exactly (pending lazy deferral, a match spanning the boundary, grid phase), and
-the divergence is sign-indefinite.
-
-**What the arithmetic actually says.** Per-chunk cost is 18.7-32.1 B on 512 KiB
-chunks = 0.0036-0.0061% of input. Census of all 133 failing T4 cells, gap-to-rival
-divided by (chunks x per-chunk constant):
+All 133 failing T4 cells, gap-to-rival divided by (chunks x per-chunk overhead):
 
 | gap / chunk-overhead | cells | reading |
 |---|---|---|
-| <= 1 | 38 (29%) | chunk overhead alone explains the failure |
+| <= 1 | 38 (29%) | chunk overhead alone explains it |
 | <= 2 | 30 (23%) | reachable with slack + grid together |
 | <= 5 | 32 (24%) | |
-| > 5 | 33 (25%) | REAL ratio deficit — almost all L1 |
+| > 5 | 33 (25%) | real ratio deficit — almost all L1 |
 
-So roughly **half the T4 board is chunk overhead** and is closable two cheap ways that
-need no pipeline rework:
+**Front A — chunk overhead (~100 cells).** Measured per-chunk constant: **+18.7 B at
+L2, +32.1 B at L6** on 512 KiB chunks (silesia, 405 chunks) = 0.0036-0.0061% of input.
+Seams are only ~5.4 B; the dominant term is extra dynamic-header mass from restarting
+the block grid inside every chunk, and it grows with level.
 
-1. **Buy ~0.01% of T1 slack.** Block sizing (zlib-ng's symbol budget is 3x smaller
-   than the number we inherited untested), TOO_FAR, insert policy. Any of these worth
-   0.01% puts T4-with-independent-chunks under the rival at every affected label —
-   and closes T1 size cells at the same time.
-2. **Thread-aware chunk grid.** Now legal: the T-invariance "HARD INVARIANT" in
-   `pipelined.rs:77-90` was retracted 2026-07-28. Chunks of `input/(k*T)` cut chunk
-   count 25-100x, shrinking residual overhead to a few hundred bytes per file. Note
-   the prior level-scaled-grid revert divided the constant WITHOUT slack and paid
-   2-4% wall from imbalance; a T-aware grid with a split tail is a different shape and
-   is unmeasured.
+**Front B — the L1 ratio class (33 cells).** Gaps of 60 K-636 K bytes: access.log at
+911x the chunk overhead, monorepo 515x, data.csv 421x, aozora 380x. Our `Fast` parser
+against libdeflate's `deflate_compress_fastest`. No grid, seam or coding-locus change
+touches it. Board task #25.
 
-**The remaining 33 cells are a different front — the L1 size class (#25).** Gaps of
-60 K-636 K bytes (access.log 911x the chunk overhead, monorepo 515x, data.csv 421x).
-That is our `Fast` parser against libdeflate's `deflate_compress_fastest`, and no
-seam, grid, or coding-locus change touches it.
+## 3. The method that wins here, counted
 
-**If both cheap routes fail**, the coding-locus rework returns as the fallback, and
-its gate is then the seam-token diff: parse dict-seeded segments, concatenate token
-streams, diff against T1's token stream. Deterministic, no pipeline code. NOT an
-instruction-count falsifier — "instruction counts LOCATE, they never predict the
-wall" is banked law and the earlier Ir-based gate violated it.
+Decode's four winning months, plus this campaign:
 
-### Phase 2 — T1: converge on libdeflate's flat loop, then delete
+| method | wins | falsifications |
+|---|---|---|
+| vendor structural diff / convergence / port | ~9 | — |
+| causal perturbation (removal oracle, ablation, blocked-on decomposition) | ~8 | — |
+| **shaving our own profile's top line** | **0** | **>= 17** |
 
-Not more hoisting. **Transliterate the structure**, then let the removal oracle find
-the deletions — decode's exact winning sequence.
+Rules that follow, all present in `CLAUDE.md` as hard stops:
 
-The target: our hot loop threads state by reference (`in_base: &mut usize`,
-`next_hashes: &mut [u32; 2]`) through `run_block` into an `#[inline(always)]`
-`longest_match`. LLVM must prove non-aliasing among `buf`, `sink` and those `&mut`s
-to keep `cutoff`/`nice_len`/`next_hashes[1]` in registers, and the operation diff
-shows it does not: 1.7-2.5M memory reads each where libdeflate pays zero, plus 27%
-of our matchfinder reads in unattributed spill/reload. libdeflate's equivalent is one
-flat loop body owning its scalars.
+- **A lever from our own profile is not a candidate.** Name the vendor difference it
+  steals, or state "no counterpart, bar is the measurement".
+- **Converge on the vendor's structure BEFORE deleting anything.** Decode halved the
+  igzip gap by faithful transliteration; only then did single-op deletions become
+  visible and worth 5-10% each. Deleting first is what produced this campaign's
+  falsifications.
+- **The causal-perturbation family has never been built here.** Every decode win that
+  was not a vendor port came from stubbing a region and watching the number respond.
+  Build it when a named cell needs it, not speculatively.
+- **Instruction counts LOCATE, they never predict the wall.** Receipt: a change that
+  cut Ir 1.77% and Dr 3.87% was 9.9% SLOWER at L9.
+- **Name the cell AND the axis before starting.** A byte-identical change can never
+  close a size cell. Two real wins landed here and moved the board by zero for exactly
+  that reason.
+- **Land gated work first.** `gh pr list` before starting anything.
 
-Measured context: at L2 we execute 1.12x libdeflate's instructions (555.1M vs 496.0M) at better
-IPC, with fewer frontend stalls and a lower L1D miss rate. 61% of the excess is LOAD
-instructions. Our emit path is already 0.90x theirs (57.4M vs 63.8M). **The entire debt is
-parse+matchfinder.**
+## 4. Already falsified — needs a NEW mechanism, not a retry
 
-Falsifier: flatten ONE parser (greedy/L2) so it owns every scalar, diff Ir/Dr against
-the banked baseline (555.1M/104.0M vs libdeflate's 496.0M/83.8M). If the ~20M excess
-Dr does not substantially close, stop.
+Each has a `FALSIFY` note at the tempting code site; the `commit-msg` hook requires a
+`REOPEN:` line naming a new mechanism to touch those sites.
 
-Free oracle: output is byte-identical, so this is a pure refactor — byte-identity's
-one legitimate use.
+| attempt | result |
+|---|---|
+| Window-wrap hoist in `skip_bytes` | wins L2, regresses L6/L9; mechanism unexplained |
+| Per-call variant of it | worse than the loop at both levels |
+| Hand-hoisting the prefilter's invariant loads | **Dr went UP** — LLVM already hoisted them; the hoist only added register pressure |
+| De-pipelining the chain walk | 1.0131 / 1.0624 / 1.0992 slower at L2/L6/L9 — the hoist hides dependent-load latency |
+| Level-scaled chunk grid | 0.01% size for 2-4% wall |
+| pigz 10-bit static seam pad | 0.0007% size for 0.7-0.9% wall |
+| L2 level-map retune (Lazy/4/10) | +23.4% instructions; lazy runs two searches per position |
+| L5 depth 16 -> 32 (gzip's chain) | closes ~10% of the gap on the failing file, regresses another |
+| Block budget 300K -> 900K | no knee — table below |
+| Coding-locus rework | falsified on paper before any code — below |
 
-### Phase 3 — own the level table
-
-The map is still libdeflate's verbatim, which is why zero slack exists at L2/L4-L9
-and why every tiny T>1 cost fails a cell. Fix L4 monotonicity (gzip and zlib-ng both
-go lazy at L4; we inherited libdeflate's outlier choice), sweep block sizing
-(zlib-ng's symbol budget is 3x smaller than the number we inherited untested), insert
-policy, TOO_FAR.
-
-**Blocked on a law decision:** promotion rule clause 5 caps erosion on a passing cell
-at 0.5%. Lazy-at-L4 costs 17.7% wall against passing gzip/pigz cells. Either the rule
-gets a pre-registered carve-out for deliberate level-semantics fixes — landed
-separately and first, per the rule's own discipline — or P4 stays broken. This needs
-an explicit decision, not silent drift.
-
-## 5. The command surface
-
-Four verbs carry the campaign:
-
-- **`fulcrum board`** — where do we stand. Failing cells only, ranked, stale-flagged
-  against the subject commit, denominator stated. The loss map is GENERATED, never
-  narrated.
-- **`fulcrum why <cell>`** — the automated vendor diff. Both binaries at the same
-  build shape (vendor with `-g` or it is one opaque symbol), per-line Ir+Dr, position
-  counts, matched-thread counters, declared-parameter diff.
-- **`fulcrum oracle <region>`** — the missing family. Stub a region, report size and
-  wall response per level. Monotonic => critical path; flat => slack.
-- **`fulcrum try <ref>`** — the gate. Both arms from git refs, NO-OP and stale-control
-  refusal, verify, size+wall censuses at a shallow AND a deep level, promotion rule
-  clause by clause, verdict SHIP / NO-SHIP(clause+numbers) / UNDECIDED(what to re-run).
-
-## 6. Standing hazards, with the refusal for each
-
-1. **A lever from our own profile is not a candidate.** Name the vendor difference or
-   declare "no counterpart, bar is the measurement".
-2. **"Floor" / "closed" / "no lever" is a bias firing, not a finding.** Five declared
-   floors in decode, five refuted; one "CAMPAIGN CLOSED" survived 17 hours before a
-   writev-gather flipped it. Banned unless a removal oracle has run AND the vendor is
-   shown to pay the same cost. "Finally" in our own prose is the documented tripwire.
-3. **Verify the artifact before the number.** No measurement counts without route
-   assertion, binary sha, explicit thread count, `/dev/null` both arms.
-4. **A win that cannot move a failing cell's axis, or that sits unmerged, is zero.**
-   Name the cell and the axis in writing first. `gh pr list` before any new lever.
-5. **Trust no instrument that has not been made to lie on purpose.** Decode's
-   governing scoreboard was wrong-SIGN (best-of-N), its sink hid losses (file write),
-   its classifier inverted verdicts on the exact case at issue while a 40-check
-   selftest passed. Every verdict needs a same-run A/A bracketing 1.0 and a selftest
-   containing the case being decided.
-
-## 7. What the architecture docs still need
-
-- The T>1 **coding-locus** decision. `encoder-architecture.md` says parallel
-  "segments the input, calls the T1 kernel per segment, orders output" — satisfiable
-  by a design that structurally cannot pass the board. Record the per-chunk constant,
-  the zero-slack interaction, and the token-handoff target.
-- Replace the stale "structural suspects" list (indirection, prefetch, bounds checks)
-  with the operation-level verdict: loads and register pressure at the
-  parse<->matchfinder interface.
-- `encoder-architecture.md:17-23` still calls byte-identity with libdeflate "a
-  contract". That is the cage codified in the target doc.
-- `pipelined.rs:77-90` declares T-invariant bytes a "HARD INVARIANT". It was retracted
-  as a requirement on 2026-07-28. Keep it as a product choice or drop it, but it is
-  not a correctness law and it is what forbids a thread-aware grid.
-- An emit-throughput budget per level (Ir/byte). Phase 1's scaling ceiling depends on
-  it and it exists nowhere.
-- RSS as a stated axis with a number.
-
-## 8. FALSIFIED — the block budget alone (2026-07-29)
-
-Sweep at L6 vs libdeflate, T1 gap / T4 gap (negative = we are smaller):
+**Block budget** (L6, gap vs libdeflate, T1 / T4):
 
 | budget | logs.txt | text-1MB | shortmatch-4M |
 |---|---|---|---|
@@ -264,31 +108,108 @@ Sweep at L6 vs libdeflate, T1 gap / T4 gap (negative = we are smaller):
 | 600K | -4796 / **-745 PASS** | -39 / +451 | **+660** / +85 |
 | 900K | -5464 / **-745 PASS** | -39 / +451 | **+660** / +85 |
 
-**There is no knee.** The incompressible T1 regression appears as soon as the
-budget exceeds 300K and saturates at +660; the compressible gain saturates around
-600K. No budget keeps the gain without the loss, and per-label means every file.
+The incompressible T1 regression appears above 300K and saturates at +660; the
+compressible gain saturates at 600K. No budget keeps one without the other, and
+per-label means every file. NOT a mis-scaled threshold — the split check is
+budget-independent (`block_split.rs:18` fires every 512 observations, `:136` requires
+`MIN_BLOCK_LENGTH` 5000 B). It is an adaptivity trade: one table over more symbols
+loses to local statistical drift wherever there is no structure to exploit.
 
-The split check is NOT the cause — it is budget-independent (`block_split.rs:18`
-fires every 512 observations, `:136` requires MIN_BLOCK_LENGTH 5000 B). This is an
-adaptivity trade: one table over more symbols loses to local statistical drift
-wherever there is no structure to exploit.
+**Coding-locus rework, and why it died on paper.** "Workers hand the writer tokens; one
+writer emits with the T1 grid, closing ~103 cells by construction" is false. Histograms
+are built in the PARSE (`parse/mod.rs:121-131`) and the block grid is a per-symbol
+observation stream with per-block state (`block_split.rs:14-61`), so a writer
+re-blocking across seams must re-run those observations serially over every literal
+byte — nowhere near the claimed 4-6% of work. If workers keep their own grid, the grid
+still restarts per segment, which IS the dominant term. And exactness is required: T1
+ties libdeflate at L2/L4-L9, so +1 byte fails, while seam-parsed tokens cannot
+reproduce T1's exactly (pending lazy deferral, a match spanning the boundary, grid
+phase) with sign-indefinite divergence. It returns only as a fallback, gated by a
+seam-token diff: parse dict-seeded segments, concatenate, diff against T1's token
+stream. Deterministic, no pipeline code.
 
-**What the sweep located instead.** The three file classes want three different
-block lengths, and the data says so unambiguously:
-* `logs.txt` — bigger blocks win big (-4,796 at 600K), enough to flip its T4 cell.
-* `text-1MB` — nearly indifferent (-39 at any budget).
-* `shortmatch-4M` — bigger blocks LOSE at T1 (+660), and its T4 is FLAT at +85
-  across every budget, i.e. chunking HELPS near-random data because more, smaller
-  tables track drifting statistics better.
+## 5. Next actions, ranked
 
-So the budget is the wrong knob. **The block-END decision is the right one**:
-`should_end_block` should already be cutting blocks short where there is no
-exploitable structure, and it is not doing so at larger budgets. That is a
-splitter-QUALITY target, it is data-responsive without being a content detector
-(the heuristic reads symbols already emitted, not the input ahead), and it has
-three vendor implementations to diff against — libdeflate's `should_end_block`,
-zlib-ng's, and igzip's. Vendor-diff-shaped, which is the family that wins here.
+**A1 — diff the block-END heuristic against three vendors.** The budget sweep falsified
+the budget but located this: `shortmatch`'s T4 gap is **flat at +85 across every
+budget** while its T1 degrades to +660 — chunking HELPS near-random data, because more,
+smaller tables track drifting statistics better. So `should_end_block` should already be
+cutting blocks short where there is no exploitable structure, and it is not. Compare
+ours against libdeflate's `should_end_block`, zlib-ng's and igzip's. Data-responsive
+without being a content detector: it reads symbols already emitted, never input ahead.
+Axis **size**, targets Front A. Falsifier: deterministic size leg on all 20 canonical
+files — any file that gets bigger kills it.
 
-Corollary for Front A: raising the budget cannot cover the T4 chunk overhead on
-its own. Either the splitter improves so a large budget is safe on every class, or
-the thread-aware grid carries Front A alone.
+**A2 — thread-aware chunk grid.** Chunks of `input/(k*T)` cut chunk count 25-100x,
+shrinking Front A's residual to a few hundred bytes per file. Now legal: the
+T-invariance "HARD INVARIANT" at `pipelined.rs:77-90` was retracted 2026-07-28 (the
+only bar is valid gzip). The prior level-scaled-grid revert divided the constant WITHOUT
+slack and paid 2-4% wall from imbalance; a T-aware grid with a split tail is a different
+shape and is unmeasured. Axis **size**, with a wall gate.
+
+**B1 — Front B: `Fast` vs `deflate_compress_fastest`.** The 33 remaining cells, up to
++10.28%. Pure vendor diff, candidates already cited in the technique index: igzip's 8K
+L1 head table (M1 — we widened it to 64K plus a 32K side table, and our own `fast.rs`
+records that the dependent `head[h]` load is "69% of the L1 fast path's D1 read misses"
+and "the IPC collapse vs igzip, 1.32 vs 2.46"); igzip's large-match emit loop (M15); its
+literal-run skip (P13). Axis **size** for the cells, wall as a watch.
+
+**T1 wall — converge, then delete.** Flatten the parse/matchfinder interface so one loop
+owns its scalars, rather than hoisting inside the current shape (three failures). Our
+hot loop threads state by reference (`in_base: &mut usize`, `next_hashes: &mut [u32; 2]`)
+into an `#[inline(always)]` `longest_match`; LLVM cannot prove non-aliasing against
+`buf`/`sink`, so `cutoff`/`nice_len`/`next_hashes[1]` live in memory where libdeflate
+keeps them in registers. Distinguish it from the failed hoists IN ADVANCE: name the
+spilled scalars, show them spilling in the current asm, predict their disappearance, and
+add a wall criterion on the frozen box — Dr closing with wall flat is banking a number,
+not a cell. Free oracle: output is byte-identical.
+
+## 6. Open decisions for the user — not engineering
+
+**D1 — P4 monotonicity at L4 (board #49).** `-4` yields a bigger file than `-3`
+(+143,807 B on silesia 40 MB). Lazy at L4 fixes it and beats all four rivals on size by
+1.2-3.1%, at **17.7% wall**. Greedy cannot fix it at any depth — parse strategy
+dominates depth. Promotion rule clause 5 caps erosion on a passing cell at 0.5%, so it
+is blocked without a pre-registered carve-out landed separately and first. libdeflate
+ships the same violation.
+*Possible third path, unmeasured:* `vendor-structure-comparison.md` §1 claims gzip and
+zlib-ng both go lazy at L4. **Wrong for zlib-ng as shipped** — its default L4 is
+`deflate_medium` (the `deflate_slow` row is inside `#ifdef NO_MEDIUM_STRATEGY`).
+`deflate_medium` exists to make L3-6 monotonic at a fraction of lazy's cost and may fit
+inside clause 5 with no law change. Fix that doc claim and measure this first.
+
+**D2 — RSS as a graded axis.** T>1 holds ~2.6-3x input plus ~5 MB/thread against pigz's
+flat 2 MB. Named user-visible, never given a number. Any Front A design that queues more
+state needs the bound stated first.
+
+## 7. Known-stale claims — fix, do not trust
+
+- `vendor-structure-comparison.md` §1 — the zlib-ng L4 claim above.
+- `encoder-architecture.md:17-23` still calls byte-identity with libdeflate "a
+  contract". Retracted 2026-07-28; the only bar is valid gzip.
+- `encoder-architecture.md` "structural suspects, in order" (indirection, prefetch,
+  bounds checks) predates the operation-level verdict and is effectively falsified for
+  the L2 band. The debt is loads and register pressure at the parse/matchfinder
+  interface.
+- `pipelined.rs:77-90` presents T-invariant bytes as a "HARD INVARIANT". A product
+  choice at most, and it is what forbids A2.
+- Board #50 overstates its case: per-chunk overhead owns about half the T4 board, not
+  103 cells. §2 has the split.
+
+## 8. Tooling
+
+Three git hooks, sourced from `scripts/` and installed by `build.rs` into the effective
+hooks dir: `pre-commit` (fmt/clippy/version), `pre-push` (refuses direct pushes to
+main), `commit-msg` (FALSIFY/`REOPEN:` discipline; an absolute figure and provenance
+beside any quoted ratio). **Do not set `core.hooksPath`** — it overrides `.git/hooks`
+and silently disabled the first two for part of 2026-07-29.
+
+`commit-msg` is crude: it matches proximity to a FALSIFY note, not semantics. 3 correct
+refusals, 1 incorrect (it blocked a legitimate revert until `RESTORE:` was added as an
+escape). Expect misfires and fix it rather than routinely using `--no-verify`.
+
+Wall verdicts come from the frozen box (solvency, AMD Zen2). Size is bit-identical
+across aarch64/Zen2/Intel — verified — so size needs one box only. Neither remote box
+currently passes the full Gate-0 suite (`profile rss` fails on both, `lib levelsweep` on
+solvency) and `make deploy` correctly refuses to certify them; fix those two gates
+before trusting a fresh instrument there.
