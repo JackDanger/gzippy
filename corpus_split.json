@@ -1,0 +1,110 @@
+{
+  "_rule": "F4 ENFORCEMENT (bias audit 2026-07-25): parameters were once fitted to the one file blocking a gate (L1 hash3 threshold 50->48), and BOTH later blowups landed off the tuning set. A gate corpus you tuned on is not a gate. This manifest makes the split structural rather than remembered.",
+  "_contract": [
+    "TUNE files may be used freely for exploration, sweeps, threshold fitting, locates, and perturbation.",
+    "GATE files are run ONLY at promotion time, by the census/goal tools, and NEVER inspected while choosing a parameter.",
+    "A promotion is judged on GATE. If a change was fitted on GATE, the promotion is void regardless of the numbers.",
+    "goal::MIN_CORPORA (dd79_text6, dd79_bin6, sil40, data.sqlite, ecoli.fastq, weights.safetensors) is a SUBSET of GATE by construction -- the mandated minimum surface must never be tunable.",
+    "Both sets deliberately span every content class present in the corpus, so neither is degenerate."
+  ],
+  "_content_classes": [
+    "prose-text",
+    "log-text",
+    "markup",
+    "structured-data",
+    "columnar-db",
+    "minified-code",
+    "native-binary",
+    "debug-symbols",
+    "scientific",
+    "already-compressed",
+    "archive",
+    "synthetic-mixed"
+  ],
+  "gate": {
+    "_note": "contains all six goal::MIN_CORPORA plus one representative of each class they omit",
+    "files": [
+      "dd79_text6",
+      "dd79_bin6",
+      "sil40",
+      "data.sqlite",
+      "ecoli.fastq",
+      "weights.safetensors",
+      "access.log",
+      "markup.xml",
+      "monorepo.tar",
+      "photo.jpg",
+      "winexe.exe"
+    ]
+  },
+  "tune": {
+    "_note": "same class spread, disjoint files -- explore here",
+    "files": [
+      "dickens",
+      "aozora.txt",
+      "data.json",
+      "data.csv",
+      "data.parquet",
+      "minjs.min.js",
+      "armexe.elf",
+      "tool.bin",
+      "engine.wasm",
+      "symbols.dwarf",
+      "movie.mp4"
+    ]
+  },
+  "_class_coverage_check": {
+    "prose-text": {
+      "gate": "dd79_text6",
+      "tune": "dickens / aozora.txt"
+    },
+    "log-text": {
+      "gate": "access.log",
+      "tune": "data.csv"
+    },
+    "markup": {
+      "gate": "markup.xml",
+      "tune": "data.json"
+    },
+    "structured-data": {
+      "gate": "data.sqlite",
+      "tune": "data.parquet"
+    },
+    "minified-code": {
+      "gate": "sil40",
+      "tune": "minjs.min.js"
+    },
+    "native-binary": {
+      "gate": "winexe.exe / dd79_bin6",
+      "tune": "armexe.elf / tool.bin / engine.wasm"
+    },
+    "debug-symbols": {
+      "gate": "(none -- symbols.dwarf is TUNE-only)",
+      "tune": "symbols.dwarf"
+    },
+    "scientific": {
+      "gate": "ecoli.fastq / weights.safetensors",
+      "tune": "(none -- both mandated to GATE)"
+    },
+    "already-compressed": {
+      "gate": "photo.jpg",
+      "tune": "movie.mp4"
+    },
+    "archive": {
+      "gate": "monorepo.tar",
+      "tune": "(none)"
+    }
+  },
+  "_known_asymmetries": [
+    "debug-symbols appears only in TUNE and archive/scientific only in GATE: goal::MIN_CORPORA forced both scientific files into GATE, and there is exactly one archive and one dwarf file in the corpus. A change fitted on symbols.dwarf therefore has no GATE sibling of its class -- treat a dwarf-driven win as UNREPLICATED until the corpus grows.",
+    "This split is by FILE, not by (file x level x threads). A parameter fitted at L1 on a TUNE file and gated at L1 on GATE files is honest; reusing the same file across both roles at different levels is NOT.",
+    "sil40 (40 MiB, sha 737ae7a404c66cd83e5eb2cb..., /root/recert_20260725/corpus/sil40) is a GATE file that exists ONLY on solvency, not on the local Mac. A GATE run on the Mac is therefore INCOMPLETE by one mandated corpus, and must say so rather than silently gating on 10 of 11 files."
+  ],
+  "_verified": {
+    "date": "2026-07-26",
+    "disjoint": "gate n=11, tune n=11, overlap empty",
+    "coverage": "all 21 local corpus files assigned; no file unassigned",
+    "min_corpora": "all six goal::MIN_CORPORA present in GATE, none in TUNE",
+    "sil40": "present on solvency only (41943040 bytes)"
+  }
+}
