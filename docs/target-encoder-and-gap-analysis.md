@@ -91,7 +91,56 @@ histogram. The first is 5 bytes; the other two are the expensive ones. See **G5*
 
 ## 2. The gaps, ranked by structural distance
 
-### G1 — L1's matchfinder is a different data structure from every other tier. **Largest.**
+### G1 — L1: we are ALREADY the instruction champion and still lose on ratio. **Reframed 2026-07-30.**
+
+**Measure this before doing anything else with L1.** Cachegrind, 6,000,000 B of data.csv
+at L1, AMD Zen2, same input, three binaries:
+
+| | I refs | vs libdeflate |
+|---|---|---|
+| **ours, shipped `parse::fast`** | **92,057,657** | **0.63x** |
+| libdeflate L1 (`ht_matchfinder`) | 147,160,910 | 1.00x |
+| our `ht` port (2-way + hash3) | 201,359,346 | 1.37x |
+
+Two facts fall out, and both contradict how this gap was framed before:
+
+1. **We are not bloated at L1 — we are LEANER than the vendor and worse anyway.** Our
+   single-probe fast path executes **37% fewer instructions than libdeflate** and still
+   emits 189% more literals. libdeflate BUYS its ratio with instructions; it is not
+   getting the ratio for free and we are not paying for ours. Any framing of L1 as "we
+   waste work libdeflate doesn't" is wrong and should not be repeated.
+2. **The port has a ~54M implementation gap against the algorithm it copies** — 1.37x
+   libdeflate for the same structure. That is almost exactly the per-position cost of the
+   `hash3` table libdeflate's ht does not have (one extra hash, one load, one store, over
+   ~6M positions). So the port is not "the ht structure measured"; it is the ht structure
+   plus a third table, and the third table is the difference.
+
+**Wall, frozen solvency, paired interleaved n=15, /dev/null both arms, L1 T1** — the ht
+port against shipped `parse::fast`: data.csv **1.3709**, tool.bin 1.1805, aozora 1.1481,
+dickens 1.1329, armexe.elf 1.0802. Slower everywhere, and NOT because of stores: reducing
+the skip path from 3 stores per position to 2 (u32-packed bucket, output bit-identical)
+cut D writes 26,927,232 -> 19,730,873 (**-26.7%**) and moved the wall not at all. Writes
+were never the binding cost; instructions were.
+
+**So the trade at L1 is explicit and it is a real trade, not an inefficiency to remove:**
+the second candidate and the length-3 table each buy ratio and each cost instructions.
+libdeflate pays for one of them (the bucket) and refuses the other (length-3, "due to its
+focus on speed"). We currently refuse both at L1 and pay for it in ratio.
+
+The unresolved question — and the ONLY one worth spending on here — is whether a second
+candidate can be had for materially less than the ~55M instructions our bucket costs.
+igzip's two-positions-per-iteration (P12) is the one shape that attacks exactly that: it
+derives the second probe from work already done for the first, instead of doing a second
+probe's worth of work. Everything else in this class is now closed:
+
+* insert-density reduction: LIMIT_HASH_UPDATE, head-only bucket, and dropping the
+  length-3 insert inside matches — **all three cost ratio.** Density IS the ratio.
+* store-count reduction: u32-packed bucket — **-26.7% writes, zero wall movement.**
+* bounds-check elision — byte-identical, zero movement, LLVM already did it.
+
+---
+
+### G1 (original framing, kept for the structure table)
 
 `parse::fast`'s finder is fused into the parse loop as a **u32 head table of 64 K entries
 (256 KiB) plus a 3-byte-keyed `head3` side table (128 KiB) = 384 KiB, single-probe**.
