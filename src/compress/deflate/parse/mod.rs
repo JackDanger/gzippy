@@ -111,7 +111,7 @@ pub(super) const BUF_PAD: usize = 16;
 /// (`logs.txt`, `text-1MB.txt`, `shortmatch-4M` are absent from `corpus_split.json`).
 /// The mechanism is falsified; the magnitudes need re-deriving with
 /// `scripts/campaign/board-size.sh`.
-const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
+pub(crate) const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
 /// `SEQ_STORE_LENGTH` — cap on the number of match "sequences" per block.
 ///
 /// This is a POLICY cap, enforced by [`continue_block`], and only the greedy and
