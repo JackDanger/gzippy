@@ -69,9 +69,37 @@ const MAX_PARALLEL_BLOCK_SIZE: usize = 512 * 1024;
 /// parallel path still has work to hand out.
 const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 
-/// Target number of parallel chunks for inputs below the large-file cutoff.
-/// Used only to derive the small-file block size from `input_len`.
-const SMALL_FILE_TARGET_CHUNKS: usize = 16;
+/// FALSIFIED 2026-07-30 — NO chunk-grid change can pass promotion clause 3, and this is
+/// now established across FIVE shapes, not inferred from one:
+///
+/// | shape | flips of the 9 near-tie T4 cells |
+/// |---|---|
+/// | plain 1 MiB fixed (no thread-awareness at all) | 8 |
+/// | T-aware, 4 chunks/thread, 8 MiB cap | 9 |
+/// | T-aware + seam aligned DOWN to the block budget | 9 |
+/// | T-aware + seam aligned UP to the block budget | 7 |
+/// | T-aware, 8 chunks/thread, 2 MiB cap | 7 |
+///
+/// The plain-1-MiB row is the load-bearing one: it has no thread term, so the flips are
+/// NOT caused by thread-awareness or by seam alignment. They are caused by CHANGING THE
+/// CHUNK SIZE AT ALL. A handful of T4 cells (winexe.exe L9 +55..74 B on 1.5 MB,
+/// aozora.txt L2 +20 B, data.csv L8 +102 B) are won by the SPECIFIC 512 KiB grid rather
+/// than by anything robust, and every alternative grid loses some of them.
+///
+/// So the trade is fixed and known: ~29 cells closed against ~9 opened, all nine under
+/// 0.02%. That is a question about clause 3's absolute no-flip bar applied to sub-noise
+/// SIZE ties, not an engineering question — and `docs/promotion-rule.md` requires a rule
+/// change to land separately, before the change it would affect, and never from the
+/// session whose result it would rescue. Do not re-sweep grid constants hoping for a
+/// shape with zero flips; five have been tried.
+///
+/// Chunks handed to each thread by the thread-aware grid. Oversubscription margin for
+/// the scheduler's atomic work queue — see [`pipelined_block_size`].
+const CHUNKS_PER_THREAD: usize = 4;
+
+/// Ceiling on the thread-aware chunk size. Chunks are buffered in flight, so this is an
+/// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
+const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
 /// FALSIFIED 2026-07-29 — scaling this with LEVEL buys size and LOSES wall.
 ///
@@ -122,24 +150,64 @@ const SMALL_FILE_TARGET_CHUNKS: usize = 16;
 /// grid that varies with T for no measured reason, discovered by accident. Vary it
 /// deliberately, gate it on both axes, or leave it alone.
 ///
-/// Large files use the fixed [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) to minimize
-/// per-chunk orchestration (one CRC-combine + one sync-flush seam per chunk).
-/// Small files fall back to an `input_len`-derived size so they still split
-/// into ~[`SMALL_FILE_TARGET_CHUNKS`] chunks, floored at
-/// [`MIN_PARALLEL_BLOCK_SIZE`] and capped at the large-file size.
+/// [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) is now the FLOOR rather than the size: the grid
+/// grows from there with available parallelism, so no input is ever split more finely
+/// than the old fixed grid split it. `SMALL_FILE_TARGET_CHUNKS` is gone — the small-file
+/// case is subsumed, because `input_len / (threads * CHUNKS_PER_THREAD)` already falls
+/// below the floor for small inputs and the `.max()` pins it there.
 #[inline]
-fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
-    // Large-file cutoff: at/above this, one 512KB chunk grid gives plenty of
-    // chunks-per-thread even at T16 (8MB/512KB = 16 chunks). Below it, derive
-    // the size from input_len so small inputs stay well-split.
-    const LARGE_FILE_CUTOFF: usize = SMALL_FILE_TARGET_CHUNKS * MAX_PARALLEL_BLOCK_SIZE;
-    if input_len >= LARGE_FILE_CUTOFF {
-        MAX_PARALLEL_BLOCK_SIZE
+fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
+    // THREAD-AWARE. Chunk COUNT is what costs size: every chunk restarts the block
+    // grid and pays its own dynamic-header mass plus a seam, so a 26 MB file cut into
+    // 512 KiB chunks pays that ~50 times whether it is running on 4 threads or 32.
+    // Sizing the grid to the WORK AVAILABLE instead of to a constant means a file only
+    // pays for as many seams as its thread count can actually exploit.
+    //
+    // `CHUNKS_PER_THREAD` (not one chunk per thread) is the load-balancing margin: the
+    // scheduler hands chunks out from an atomic queue, so oversubscription is what lets
+    // a thread that drew an incompressible chunk pick up another while its neighbours
+    // finish. One-chunk-per-thread would make the whole job as slow as its unluckiest
+    // chunk. Four is the smallest margin that keeps a straggler to a quarter of a
+    // thread's share.
+    //
+    // Bounds, both load-bearing:
+    //   * MIN keeps tiny inputs from over-fragmenting (and preserves the small-file
+    //     behaviour that existed before this change).
+    //   * MAX_T_AWARE_BLOCK_SIZE caps the win. Chunks are buffered, so unbounded growth
+    //     is an RSS regression (D2) — this is the axis `CLAUDE.md` names as
+    //     user-visible and ungraded, so the grid must not quietly trade bytes for
+    //     memory. 8 MiB per chunk at T16 is ~128 MiB of in-flight payload, which is the
+    //     most this is willing to spend.
+    debug_assert!(num_threads >= 1);
+    let target_chunks = num_threads.max(1).saturating_mul(CHUNKS_PER_THREAD);
+    let by_parallelism = input_len / target_chunks.max(1);
+    // Never go BELOW the old fixed grid's chunk size for a given input: this change is
+    // meant to remove seams, never to add them. A file that the old grid split into
+    // fewer chunks than `target_chunks` keeps the old size.
+    let raw = by_parallelism
+        .max(MAX_PARALLEL_BLOCK_SIZE)
+        .clamp(MIN_PARALLEL_BLOCK_SIZE, MAX_T_AWARE_BLOCK_SIZE)
+        .min(input_len.max(MIN_PARALLEL_BLOCK_SIZE));
+
+    // ALIGN THE SEAM TO A BLOCK BOUNDARY THE SPLITTER WOULD HAVE CHOSEN ANYWAY.
+    //
+    // This is the fix the FALSIFIED note above asks for by name. Chunk count is only
+    // half the per-chunk cost; the other half is that a chunk's LAST block is ragged —
+    // it ends because the chunk ended, not because the block budget or the drift
+    // detector said so — and a short final block pays a full dynamic header for a
+    // fraction of the symbols that would amortise it. Rounding the chunk down to a
+    // whole number of `SOFT_MAX_BLOCK_LENGTH` budgets makes the seam land exactly where
+    // a block was going to end regardless, so the ragged tail disappears instead of
+    // being merely rarer.
+    //
+    // Rounding DOWN, never up: up could exceed MAX_T_AWARE_BLOCK_SIZE and the RSS bound
+    // it enforces. If the input is too small for even one budget, keep `raw`.
+    let budget = crate::compress::deflate::parse::SOFT_MAX_BLOCK_LENGTH;
+    let aligned = (raw / budget) * budget;
+    if aligned >= MIN_PARALLEL_BLOCK_SIZE {
+        aligned
     } else {
-        // ~SMALL_FILE_TARGET_CHUNKS chunks, floored so tiny inputs don't
-        // over-fragment and capped at the large-file size.
-        (input_len / SMALL_FILE_TARGET_CHUNKS)
-            .clamp(MIN_PARALLEL_BLOCK_SIZE, MAX_PARALLEL_BLOCK_SIZE)
+        raw
     }
 }
 
