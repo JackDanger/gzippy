@@ -375,6 +375,45 @@ literal-run skip (P13). Axis **size** for the cells, wall as a watch.
 > `matchfinder/ht.rs` and `parse/ht_fast.rs` are KEPT compiled and unit-tested but unrouted;
 > only the routing was reverted, verified by execution (L1 bytes back to main's exactly:
 > armexe.elf 599,781, data.csv 4,111,742). They are the measured half of the synthesis.
+>
+> ### B1 ATTEMPT 2 (2026-07-30): the synthesis. SIZE LEG PASSES — 4 cells closed, 0 flips.
+> **WALL LEG OWED; it is the gate, and the prior falsification in this class died on wall.**
+>
+> Added a length-3 singleton table to the 2-way bucket, in the shape libdeflate's OWN
+> `hc_matchfinder` uses at L2-9. Working set is **192 KiB against the shipped 384 KiB —
+> exactly half** (2-way `[[i16;2]; 32K]` 128 KiB + `[i16; 32K]` 64 KiB, versus `head`
+> 64K x u32 256 KiB + `head3` 128 KiB); the `i16` position encoding pays for it. Both hash
+> keys come from one 4-byte load, so the second table costs no extra input read. No
+> data-dependent branch anywhere in it, so nothing to gate and no threshold to fit.
+>
+> `fulcrum verify`: **220 cells, 0 roundtrip failures.** Size census
+> (`~/www/gzippy-bench/campaign/size-tune-393625ac/`, subject `393625ac`, 4 rivals, 0 VOID):
+>
+> | clause | result |
+> |---|---|
+> | 3 — no pass->fail flips | **0 flips** ✓ |
+> | 4 — progress | fail-gap **0.396822 -> 0.127085, −67.97%** ✓ (needs >= 1%) |
+> | 5 — erosion budget | **worst delta +0.0000** on any passing cell ✓ |
+> | cells | 96 -> 92, **4 CLOSED** ✓ |
+>
+> **Cells closed, by name:** libdeflate L1 data.parquet T1 (1.0026 -> 0.9995) and T4
+> (1.0027 -> 0.9994); libdeflate L1 movie.mp4 T1 and T4 (1.0002 -> 1.0000).
+>
+> **Every L1 cell improved, and the existing wins deepened** — tool.bin 0.9952 -> **0.9787**
+> (22,565,629 -> 22,190,348 B, now 2.1% smaller than libdeflate), symbols.dwarf 0.9967 ->
+> 0.9909, armexe.elf 0.9658 -> 0.9640. The remaining L1 shortfalls collapsed from up to
+> +4.6% to at most +1.25%: data.csv 1.0456 -> **1.0006**, minjs 1.0226 -> 1.0019,
+> engine.wasm 1.0125 -> 1.0022, dickens 1.0211 -> 1.0047, aozora 1.0405 -> 1.0056,
+> data.json 1.0177 -> 1.0125.
+>
+> **What remains before it can ship, and it is not a formality.** The promotion rule needs
+> BOTH axes and clause 7 needs both arches. `17283ee6` (`c0f69036`) passed size and died on
+> WALL at a 12-29% self-tax, 26 standard deviations — a frozen paired run on solvency
+> (`root@10.0.2.240`) at L1, T1 and T>1, is the gate. The halved working set is a REASON to
+> expect better than that attempt, not evidence. Do not merge on the size leg alone.
+>
+> P4 is unchanged by this: all 12 monotonicity violations are the pre-existing L4>L3 family
+> (D1) plus two deep-level ties, identical to main's run, none at L1.
 
 **T1 wall — converge, then delete.** Flatten the parse/matchfinder interface so one loop
 owns its scalars, rather than hoisting inside the current shape (three failures). Our
