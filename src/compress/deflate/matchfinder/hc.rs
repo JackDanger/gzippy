@@ -363,6 +363,24 @@ impl HcMatchfinder {
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
+                    // FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
+                    // looks vestigial: the prefetch it was written to feed was
+                    // measured as a loss and deleted, so "it now keeps a value
+                    // live for nothing" is the obvious reading. It is WRONG. The
+                    // hoist independently hides the DEPENDENT-LOAD LATENCY of the
+                    // pointer chase — `next_tab[cur_node4 & MASK]` feeds the next
+                    // iteration's address, so reading it at the loop bottom
+                    // serialises load->use on the chain's critical path.
+                    // De-pipelining both walks, frozen Zen2, n=31, output
+                    // byte-identical, vs its exact parent:
+                    //     L1 1.0016 noisy   L2 1.0131   L6 1.0624   L9 1.0992
+                    // all RESOLVED SLOWER, and worse the deeper the chain — the
+                    // signature of exposed load latency. It went the wrong way
+                    // even though it REMOVED instructions (L2 Ir -1.77%, L6
+                    // -2.91%) and cut L2 reads (Dr -3.87%). Fewer instructions,
+                    // far more wall: instruction and read counts LOCATE, they do
+                    // not predict.
+                    //
                     // Software-pipelined chain walk (Increment 5b). Hoist the NEXT
                     // chain node one step ahead so this iteration can prefetch the
                     // FOLLOWING candidate's match data — the second, reducible
@@ -497,6 +515,37 @@ impl HcMatchfinder {
                         // byte-identical throughout. The hardware prefetcher
                         // already covers this access pattern on every core we
                         // ship to.
+                        //
+                        // FALSIFIED 2026-07-28 (second time, different change) —
+                        // DO NOT hand-hoist the two operands below that describe
+                        // the CURRENT position. It looks like free money: this
+                        // prefilter reads four values per candidate, and two of
+                        // them (`in_next + off`, `in_next`) are loop-invariant
+                        // across the rejection walk — `in_next` does not move and
+                        // `best_len` only changes on acceptance, which exits the
+                        // loop. `load_u32(base, in_next)` is even just `seq4`,
+                        // already in a variable.
+                        //
+                        // LLVM ALREADY HOISTS THEM. Doing it by hand made things
+                        // WORSE, measured on the shipped build shape at L2 on 8 MB
+                        // of silesia:
+                        //     Ir  555,124,179 -> 552,722,907  (-0.43%)
+                        //     Dr  103,975,406 -> 104,103,912  (+0.12%)  <-- UP
+                        // Data reads went UP after removing two source-level loads
+                        // per candidate, which only happens if the loads were never
+                        // being issued and the extra live values cost spill
+                        // reloads. L6 regressed too: 916,724,493 -> 921,418,528
+                        // Ir (+0.51%).
+                        //
+                        // The lesson is general and cost this project two reverts
+                        // in one session: SOURCE-LEVEL LOAD COUNT IS NOT MACHINE-
+                        // LEVEL LOAD COUNT. The 1.30x load ratio against libdeflate
+                        // is real and measured (perf stat, worst cell), but it
+                        // cannot be attacked by reading this function and deleting
+                        // loads that look redundant — the compiler has already
+                        // taken those. Any future attempt here must show a Dr
+                        // DECREASE, not a source-level one.
+                        //
                         // Prefilter: compare the last 4 and the first 4 bytes before
                         // attempting a full extension.
                         let off = best_len as usize - 3;
@@ -617,6 +666,33 @@ impl HcMatchfinder {
         let mut hash3 = next_hashes[0] as usize;
         let mut hash4 = next_hashes[1] as usize;
         let mut remaining = count;
+        // FALSIFY — hoisting this wrap test out of the loop is a TRAP. It looks
+        // free: the test costs 2 Ir on every position but can only fire once per
+        // WINDOW_SIZE (32768) of them, which is 12.5M Ir, 2.26% of the whole
+        // program, at L2 on 8 MB of silesia. Two ways of removing it were built
+        // and measured on the shipped build shape (lto=fat, cgu=1); BOTH lost.
+        //
+        //                        L2 Ir                 L6 Ir
+        //   this loop        555,127,066            916,724,493
+        //   chunked runs     541,600,498 (-2.44%)   920,416,350 (+0.40%)
+        //   one test/call    552,888,310 (-0.40%)   925,234,382 (+0.93%)
+        //
+        // "chunked runs" = `while remaining > 0 { run = min(remaining,
+        // WINDOW_SIZE - cur_pos); ... }`. On frozen Zen2 it measured wall 0.9765
+        // at L2 (RESOLVED) but 1.0103 at L6 and 1.0070 at L9 — both RESOLVED
+        // SLOWER. "one test/call" hoists the test to a single per-call check
+        // with a macro'd body; it is worse than chunking at BOTH levels, because
+        // duplicating the body costs more than the branch it removes.
+        //
+        // Do not retry either without an explanation for the DEEP-level loss.
+        // Mine was "lazy skips in short runs so the outer loop cannot amortise"
+        // — and that is WRONG: lazy runs a larger nice_len (65 vs 10), so its
+        // skips are LONGER, and chunking should have helped L6 more, not less.
+        // The regression is real (Ir is deterministic) but unexplained; suspect
+        // inlining/layout, since this body inlines into both greedy's and lazy's
+        // run_block. Measure Ir at L2 AND a deep level before believing any fix:
+        // measuring only L2 and generalising is exactly what produced the
+        // regression above.
         loop {
             if cur_pos == WINDOW_SIZE {
                 self.slide_window();

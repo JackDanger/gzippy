@@ -227,6 +227,28 @@ fn deflate_into(
     // with a sync-flush marker so the next chunk's stream joins without stray
     // bits. Skipped when one continuous `BitWriter` spans every chunk.
     if !is_last && sync_flush {
+        // FALSIFIED 2026-07-29 — pigz's empty-STATIC-block seam pad (J3,
+        // pigz.c:1836-1845) is SMALLER but SLOWER, and not marginally.
+        //
+        // A seam only has to leave the stream byte-aligned. This stored block
+        // costs ~5 bytes; pigz instead emits 10-bit empty static blocks until
+        // aligned (0 when already aligned, 1-3 otherwise; an ODD bit offset is
+        // unreachable since 10k mod 8 is always even, so pigz falls back to
+        // exactly this stored block). It does save bytes — silesia 40 MB, T4:
+        //     L2  -783 -> -896     L6 +1034 -> +924     L8 +3228 -> +3135
+        // reproduced byte-identically on M1 and Zen2.
+        //
+        // But frozen Zen2, paired at T4, n=21, RESOLVED both times:
+        //     loop form         L6 1.0123   L8 1.0052
+        //     closed-form write L6 1.0089   L8 1.0074
+        // 0.7-0.9% wall for ~110 bytes (0.0007%). That breaches the promotion
+        // rule's 0.5% erosion cap on its own. Rewriting the pad as a single
+        // computed write barely moved it and made L8 worse, which rules out
+        // loop overhead as the cause — the cost is emitting extra DEFLATE
+        // blocks per seam, not how the bits are written.
+        //
+        // Do not retry by micro-optimising the emit. Anything that adds blocks
+        // at a seam pays this. A seam fix has to REMOVE work, not relocate it.
         emit_stored_block(bw, &[], false);
     }
 }

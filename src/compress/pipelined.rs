@@ -73,6 +73,28 @@ const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 /// Used only to derive the small-file block size from `input_len`.
 const SMALL_FILE_TARGET_CHUNKS: usize = 16;
 
+/// FALSIFIED 2026-07-29 — scaling this with LEVEL buys size and LOSES wall.
+///
+/// The T>1 size penalty is real and level-dependent: T4 minus T1 on a 40 MB
+/// silesia slice is +1,034 bytes at L6 and +3,228 at L8, because every chunk is
+/// coded independently and deeper levels forfeit a better-fitted Huffman table.
+/// Scaling the grid (L5-6 x2, L7+ x4) fixed most of it — L6 +1,034 -> -728,
+/// L8 +3,228 -> +429, reproduced byte-for-byte on M1 and Zen2.
+///
+/// It is still not worth it. Frozen Zen2, paired at T4, n=21, /dev/null both
+/// arms, both RESOLVED with tight CIs:
+///     L6  ratio 1.0212  (+2.12% wall)   for 1,762 bytes, 0.011%
+///     L8  ratio 1.0371  (+3.71% wall)   for 2,799 bytes, 0.018%
+/// A 0.01% size gain costs 2-4% wall. Per-label needs BOTH legs, so this trades
+/// failing size cells for failing wall cells at a ruinous rate.
+///
+/// Do not retry by tuning the multipliers. The mechanism is that fewer, larger
+/// chunks reduce parallel slack — the cost scales with how much work a chunk
+/// holds, so any multiplier big enough to recover the size is big enough to cost
+/// the wall. A fix must make chunks CHEAPER TO CODE INDEPENDENTLY (a shared or
+/// pre-trained Huffman table across chunks, or seams that fall on block
+/// boundaries the splitter would have chosen anyway), not make them bigger.
+///
 /// Block size for the parallel pipelined chunk grid.
 ///
 /// **HARD INVARIANT: a pure function of `input_len` (and `level`) ONLY — NEVER
