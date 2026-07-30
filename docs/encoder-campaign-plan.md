@@ -406,7 +406,46 @@ literal-run skip (P13). Axis **size** for the cells, wall as a watch.
 > engine.wasm 1.0125 -> 1.0022, dickens 1.0211 -> 1.0047, aozora 1.0405 -> 1.0056,
 > data.json 1.0177 -> 1.0125.
 >
-> **What remains before it can ship, and it is not a formality.** The promotion rule needs
+> ### ⚠ WALL VERDICT (2026-07-30): NO-SHIP. Size passed, the WALL killed it — clause 5 + 6.
+>
+> `fulcrum try`, frozen solvency (AMD EPYC 7282, boost=0, governor=performance, tenants
+> SIGSTOPped and restored), paired interleaved, n=9, /dev/null both arms, L1+L6, T1, full
+> TUNE set, 176 cells / 145 decidable. Artifact `/root/wall-l1-synth/try.json`.
+>
+> | clause | result |
+> |---|---|
+> | 1 verify | OK — zero roundtrip failures |
+> | 3 flips | OK — none across 145 decidable cells |
+> | 4 progress | OK — closed `libdeflate:data.parquet:L1:T1:size`, `libdeflate:movie.mp4:L1:T1:size` |
+> | **5 erosion** | **FAIL — 19 WALL cells past the 0.0050 budget** |
+> | **6 net** | **FAIL — improvement 0.1593 < 2x harm 2.0388** |
+>
+> Self-tax at L1 (ratio vs rival, LOWER IS FASTER — we stay faster than gzip and pigz, but
+> our own L1 got 15-50% slower): `gzip:data.json` 0.4549 -> 0.6861, `pigz:data.json`
+> 0.6029 -> 0.9044, `gzip:data.csv` 0.4068 -> 0.5589, `gzip:tool.bin` 0.4607 -> 0.5455,
+> and 15 more.
+>
+> **WHY THE REOPEN ARGUMENT WAS WRONG, and this is the transferable part.** The REOPEN
+> rested on the working set being HALVED (192 KiB vs 384 KiB) where `17283ee6` had grown
+> it. The arithmetic was correct; the inference was not. The size win comes from doing
+> MORE WORK PER POSITION — two bucket candidates plus a third table read/write — and
+> halving the bytes RESIDENT does not pay for the extra dependent loads ISSUED. Working-set
+> size bounds cache pressure; it says nothing about load count on the critical path. This
+> campaign already knew that about this exact cell: §1 records that **61% of our excess over
+> libdeflate at L2 is LOAD INSTRUCTIONS**, with our IPC, stalls, cache and branch behaviour
+> all already better than theirs. I predicted from bytes-resident; the wall answered on
+> loads-issued.
+>
+> **REOPEN now needs a mechanism that adds candidates WITHOUT adding dependent loads per
+> position** — igzip's two-positions-per-iteration pipeline (M/P12: probes pos and pos+1
+> off ONE hash computation) and its literal-run skip (P13). A third table probed at every
+> position is not it. **A size-only argument is not sufficient for this class: 2 for 2.**
+>
+> `matchfinder/ht.rs` (with `hash3_tab`) and `parse/ht_fast.rs` stay compiled and
+> unit-tested but unrouted; routing reverted, verified by execution (L1 bytes back to
+> main's exactly). They are the working half of any P12-shaped retry.
+
+> **What the size leg alone had said, before the wall ran.** The promotion rule needs
 > BOTH axes and clause 7 needs both arches. `17283ee6` (`c0f69036`) passed size and died on
 > WALL at a 12-29% self-tax, 26 standard deviations — a frozen paired run on solvency
 > (`root@10.0.2.240`) at L1, T1 and T>1, is the gate. The halved working set is a REASON to
