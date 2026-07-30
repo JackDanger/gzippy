@@ -24,9 +24,14 @@ are <= gzip AND <= pigz AND <= libdeflate AND <= igzip on size and on wall.
 writing to a shared fd. Fulcrum proves no thread is ever starved and that reads and
 writes are scheduled correctly — the same starvation/causation/perturbation tooling
 that won parallel decode.
-INVARIANT: T>1 output is byte-identical to T1 output, or never larger. That single
-invariant closes the entire T>1 size leg at once and makes T>1 purely a wall problem
-with a free correctness oracle.
+THE ONLY CORRECTNESS BAR, at every thread count, is VALID GZIP: roundtrip sha256
+through our decoder plus one independent decoder. T>1 may emit different bytes than
+T1. The T>1 size leg is closed by making seams SMALLER — pad choice, chunk grid,
+block splitting — never by reproducing T1's bytes. (User, 2026-07-28, stated three
+times. Byte-identity to a vendor, to our own T1, or to our own previous run is never
+a goal and never a gate. This paragraph previously mandated T1==T4; that is WHY the
+rule had to be restated three times — each correction landed in a leaf doc while the
+root file kept regenerating the cage.)
 DONE WHEN: the same per-label bar holds at the default thread count and at T4/T8/T16.
 
 **STEP 3 — the exotic path (-10/-11/-12), separate again.** Our `parse/ultra` crown
