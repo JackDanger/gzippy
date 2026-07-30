@@ -532,6 +532,11 @@ pub(super) fn compress(
         // skip (P13) are the vendor-precedented shapes; a third table probed on every
         // position is not. A size-only argument is not sufficient for this class:
         // that is now 2 for 2.
+        // G1 NOT ROUTED — the finder is correct and its size verdict is strong, and it
+        // is 1.08-1.37x SLOWER on the frozen paired wall at L1 (data.csv 1.3709,
+        // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
+        // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
+        // closed search and what the 2.19x instruction gap actually is.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,
