@@ -1,0 +1,62 @@
+#!/bin/bash
+# Mechanical enforcement of two CLAUDE.md hard stops. These are checks, not advice,
+# because the advice versions were each violated in a single session on 2026-07-29
+# and the audit's finding was that this agent does not obey warnings it wrote itself.
+#
+# Install: git config core.hooksPath .githooks
+# Bypass:  git commit --no-verify  (and say so in the PR — an unexplained bypass
+#          is the failure this exists to catch)
+set -uo pipefail
+MSG_FILE="$1"
+MSG="$(cat "$MSG_FILE")"
+FAIL=0
+
+say() { printf '\033[1;31mcommit-msg: %s\033[0m\n' "$1" >&2; FAIL=1; }
+
+# Files staged in this commit.
+STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
+
+# ── Rule 1: a FALSIFY note is BINDING ────────────────────────────────────────
+# Touching a function that carries a FALSIFY record requires naming a NEW
+# mechanism. Receipt: two of eight levers in one session were variants of an
+# already-recorded falsification, licensed by a CLAUDE.md line since deleted.
+if [ -n "$STAGED" ]; then
+    for f in $STAGED; do
+        case "$f" in *.rs) ;; *) continue ;; esac
+        [ -f "$f" ] || continue
+        # Does this commit's diff touch a hunk within 40 lines of a FALSIFY note?
+        if git diff --cached -U40 -- "$f" | grep -q "FALSIFY"; then
+            if ! printf '%s' "$MSG" | grep -qE '^REOPEN:'; then
+                say "touches a FALSIFY record in $f without a 'REOPEN:' line."
+                say "  A prior falsification is BINDING. State the NEW mechanism and its"
+                say "  falsifier: 'REOPEN: <mechanism> — falsified by <measurement>'."
+                say "  'Different code shape now' is not a mechanism."
+            fi
+            break
+        fi
+    done
+fi
+
+# ── Rule 2: a quoted ratio needs an artifact and an absolute ─────────────────
+# Receipt: 'cuts the T4 size penalty by up to 87%' and 'buys 0.01% size' described
+# the SAME change; the shipping commit chose the flattering denominator.
+if printf '%s' "$MSG" | grep -qE '^(perf|measure)(\(|:)'; then
+    if printf '%s' "$MSG" | grep -qE '[0-9]+(\.[0-9]+)?%|ratio[= ]'; then
+        # Needs an absolute figure (bytes / ms / Ir counts) alongside the relative.
+        if ! printf '%s' "$MSG" | grep -qiE '[0-9][0-9,]*[[:space:]]*(bytes|byte|ms|Ir|Dr|cycles|instructions)|[0-9]{1,3}(,[0-9]{3})+'; then
+            say "quotes a ratio/percentage with no ABSOLUTE figure beside it."
+            say "  87% of a 0.01% penalty is 0.01%. State both."
+        fi
+        # Needs a pointer to where the number came from.
+        if ! printf '%s' "$MSG" | grep -qiE 'n=[0-9]+|frozen|paired|artifact:|/root/|census|silesia|corpus'; then
+            say "quotes a ratio with no provenance (n=, frozen box, artifact path, corpus)."
+            say "  A measurement whose source is not named is not a measurement."
+        fi
+    fi
+fi
+
+[ "$FAIL" -eq 0 ] || {
+    printf '\033[1;31mcommit-msg: REFUSED. Fix the message, or --no-verify and justify it.\033[0m\n' >&2
+    exit 1
+}
+exit 0
