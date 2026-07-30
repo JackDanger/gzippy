@@ -87,3 +87,9 @@ plans/
 fulcrum-*.json
 fulcrum-*.spec.json
 .neurotic-*.json
+empty-0B
+one-1B
+page-4095B
+small-256B
+sil*.tar
+shortmatch-*.bin

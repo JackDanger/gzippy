@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=scripts/pre-commit");
     println!("cargo:rerun-if-changed=scripts/pre-push");
+    println!("cargo:rerun-if-changed=scripts/commit-msg");
     install_git_hooks();
 
     emit_parallel_sm_cfgs();
@@ -183,6 +184,7 @@ fn install_git_hooks() {
     }
     install_hook("scripts/pre-commit", &hooks_dir.join("pre-commit"));
     install_hook("scripts/pre-push", &hooks_dir.join("pre-push"));
+    install_hook("scripts/commit-msg", &hooks_dir.join("commit-msg"));
 }
 
 fn install_hook(src: &str, dst: &std::path::Path) {

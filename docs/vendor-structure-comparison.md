@@ -20,7 +20,7 @@ Numbers here are for locating structure, never for optimising directly.
 | 1 | 4 | 4 | 8 | 4 | `deflate_fast` (zlib-ng: `deflate_quick`) |
 | 2 | 4 | 5 | 16 | 8 | `deflate_fast` |
 | 3 | 4 | 6 | 32 | 32 | `deflate_fast` |
-| 4 | 4 | 4 | 16 | 16 | **`deflate_slow` (lazy)** |
+| 4 | 4 | 12 | 32 | 24 | **zlib-ng: `deflate_medium`** / gzip: `deflate_slow` |
 | 5 | 8 | 16 | 32 | 32 | `deflate_slow` |
 | 6 | 8 | 16 | 128 | 128 | `deflate_slow` |
 | 7 | 8 | 32 | 128 | 256 | `deflate_slow` |
@@ -38,8 +38,15 @@ Numbers here are for locating structure, never for optimising directly.
 | 5 | lazy | 16 | 30 |
 | 6 | lazy | 35 | 65 |
 
-**Structural difference #1 — where lazy starts.** gzip and zlib-ng switch to lazy
-at L4. libdeflate stays greedy through L4 and switches at L5. We copied libdeflate.
+**Structural difference #1 — where lazy starts. CORRECTED 2026-07-30.** gzip switches to
+`deflate_slow` (lazy) at L4. **zlib-ng does NOT** — its default L4 is `deflate_medium`
+with knobs {4,12,32,24} (`vendor/zlib-ng/deflate.c:123-126`); the `deflate_slow` L4 row
+is inside `#ifdef NO_MEDIUM_STRATEGY`, and `WITH_NEW_STRATEGIES` is ON by default
+(`vendor/zlib-ng/CMakeLists.txt:102-103`). `deflate_medium` exists precisely to make
+L3-6 monotonic at a fraction of lazy's cost, so it is a candidate for the P4 fix that
+may fit inside promotion-rule clause 5 with no law change. The original claim here said
+both vendors go lazy at L4 and was used to justify a lazy-at-L4 experiment that measured
+17.7% wall. libdeflate stays greedy through L4 and switches at L5. We copied libdeflate.
 That is the direct cause of our P4 violation (typing `-4` yields a BIGGER file than
 `-3`): our L3 is `LazyGated` while our L4 is plain Greedy, so the ladder goes
 lazy → greedy → lazy. gzip's ladder never does this. The fix is not a new

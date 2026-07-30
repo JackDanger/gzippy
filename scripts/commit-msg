@@ -26,10 +26,16 @@ if [ -n "$STAGED" ]; then
         [ -f "$f" ] || continue
         # Does this commit's diff touch a hunk within 40 lines of a FALSIFY note?
         if git diff --cached -U40 -- "$f" | grep -q "FALSIFY"; then
-            if ! printf '%s' "$MSG" | grep -qE '^REOPEN:'; then
+            # A REVERT toward the recorded-safe value is what the FALSIFY note
+            # WANTS, but this check only sees proximity to the comment, not
+            # direction — so it blocked a legitimate revert on 2026-07-29.
+            # `RESTORE:` is the escape for that case: still explicit, still
+            # auditable, but it does not demand a "new mechanism" for going back.
+            if ! printf '%s' "$MSG" | grep -qE '^(REOPEN|RESTORE):'; then
                 say "touches a FALSIFY record in $f without a 'REOPEN:' line."
                 say "  A prior falsification is BINDING. State the NEW mechanism and its"
                 say "  falsifier: 'REOPEN: <mechanism> — falsified by <measurement>'."
+                say "  If you are RESTORING the recorded-safe value, say 'RESTORE: <what>'."
                 say "  'Different code shape now' is not a mechanism."
             fi
             break
