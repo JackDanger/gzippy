@@ -61,13 +61,13 @@ pub mod ultra;
 pub(super) const BUF_PAD: usize = 16;
 
 /// `SOFT_MAX_BLOCK_LENGTH` — soft cap on the bytes covered by one block.
-const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
+const SOFT_MAX_BLOCK_LENGTH: usize = 900_000;
 /// `SEQ_STORE_LENGTH` — cap on the number of match "sequences" per block.
 ///
 /// This is a POLICY cap, enforced by [`continue_block`], and only the greedy and
 /// lazy parsers consult it. It is NOT the size of the backing store; see
 /// [`SEQ_STORE_CAPACITY`].
-const SEQ_STORE_LENGTH: usize = 50_000;
+const SEQ_STORE_LENGTH: usize = 150_000;
 
 /// Allocated length of [`Sink::seqs`] — the worst-case number of sequences any
 /// parser can put in one block.
