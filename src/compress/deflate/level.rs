@@ -198,10 +198,26 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 14,
             near_optimal: NONE_NO,
         },
+        // L4 = LAZY, and spaced BETWEEN L3 and L5 so it is a real rung.
+        //
+        // It was Greedy/16/30 — a literal copy of libdeflate's table — while L5 is
+        // Lazy at the SAME 16/30. So L4 was the one rung that declined the better
+        // parse available at its own cost point, and that is exactly the P4
+        // violation: typing -4 gave a BIGGER file than -3 (15,852,476 vs
+        // 15,708,669 on silesia 40 MB, +143,807 bytes / +0.92%).
+        //
+        // Vendor precedent: gzip and zlib-ng BOTH switch to lazy at L4
+        // (gzip/deflate.c:249, zlib-ng/deflate.c:119 — deflate_slow with a rising
+        // chain). libdeflate is the outlier in staying greedy through L4, and we
+        // inherited its choice along with its table.
+        //
+        // Depth/nice sit between L3 (12/14) and L5 (16/30) so the rung is
+        // distinct: making L4 Lazy/16/30 would fix P4 but make L4 and L5 emit
+        // identical output, trading a contract violation for a decorative level.
         4 => LevelParams {
-            strategy: Strategy::Greedy,
-            max_search_depth: 16,
-            nice_match_length: 30,
+            strategy: Strategy::Lazy,
+            max_search_depth: 14,
+            nice_match_length: 20,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
@@ -308,7 +324,7 @@ mod tests {
         // Greedy either way.
         assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
         assert_eq!(params(3).strategy, Strategy::Lazy, "level 3");
-        assert_eq!(params(4).strategy, Strategy::Greedy, "level 4");
+        assert_eq!(params(4).strategy, Strategy::Lazy, "level 4");
         for l in 5..=7 {
             assert_eq!(params(l).strategy, Strategy::Lazy, "level {l}");
         }
