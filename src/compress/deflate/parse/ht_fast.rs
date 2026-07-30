@@ -195,6 +195,28 @@ pub(super) fn run(
                     // min-length heuristic, no short-match offset guard, no
                     // lazy peek. Selectivity lives in MIN_MATCH_LEN 4/nice_len.
                     sink.push_match_fast(length, offset);
+                    // FALSIFIED 2026-07-30 — do NOT swap this for `skip_bytes_limited`.
+                    // igzip's LIMIT_HASH_UPDATE is the obvious fix for the 3.68x write
+                    // traffic this finder pays (see `matchfinder::ht`'s module doc
+                    // for the cachegrind counters) and it TRADES THE RATIO STRAIGHT BACK,
+                    // exact bytes at L1 T1, inserts-every-position -> limit 3:
+                    //   data.csv    3,934,614 -> 4,325,561   (main: 4,111,742 — WORSE than main)
+                    //   aozora.txt  4,591,718 -> 4,697,942
+                    //   armexe.elf    598,647 ->   604,498   (main:   599,781 — WORSE than main)
+                    //   tool.bin   22,190,348 -> 22,533,037
+                    // The 2-entry bucket only earns its size win while the table stays
+                    // DENSELY populated: its whole advantage is holding more history per
+                    // key, which requires the inserts. So insert density and write
+                    // traffic are the same dial, and neither end of it ships.
+                    //
+                    // The lever is therefore to make each insert CHEAPER, not rarer.
+                    // Unmeasured candidates, in order: (a) write only bucket slot 0
+                    // inside a match and skip the shift — interior positions are
+                    // consecutive so slot 1 merely holds pos-1, which the probe rarely
+                    // wants; (b) drop the length-3 insert inside matches only, since
+                    // length-3 candidates pay off at match STARTS; (c) igzip's P12
+                    // two-positions-per-iteration shape, which amortises the hash
+                    // computation rather than the store.
                     mf.skip_bytes(
                         buf,
                         &mut in_base,

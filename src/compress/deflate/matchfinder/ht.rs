@@ -62,6 +62,61 @@
 //! Size is deterministic and free and runs first; a size win obliges a frozen
 //! paired wall run on solvency before anything ships.
 
+//! # MEASURED COST PROFILE — the wall regression is WRITE traffic
+//!
+//! Cachegrind, 6,000,000 B of data.csv at L1 T1 on Zen2, shipped `parse::fast` vs this
+//! finder:
+//!
+//! | | `parse::fast` | this | ratio |
+//! |---|---|---|---|
+//! | I refs | 92,057,699 | 190,151,913 | 2.07x |
+//! | D reads | 17,484,786 | 33,552,458 | 1.92x |
+//! | **D writes** | **7,320,227** | **26,927,232** | **3.68x** |
+//! | D1 misses | 799,400 | 2,065,774 | 2.58x |
+//!
+//! Reads at 1.92x are the expected price of a second candidate. **Writes at 3.68x are
+//! the regression**: a 2-entry bucket costs TWO stores per insert (shift + head) and
+//! the length-3 table a third, so inserting at every interior position of a ~14-byte
+//! average match is ~42 stores per match against `parse::fast`'s ~3 (it ships igzip's
+//! `LIMIT_HASH_UPDATE_INSERTS_L1 == 3`).
+//!
+//! **And the obvious fix is not available.** Limiting the inserts was tried and gives
+//! the ratio straight back, past `main` on two files — see the FALSIFY note at the
+//! `skip_bytes` call site in `parse::ht_fast`. Insert density and write traffic are
+//! the same dial, because a 2-entry bucket's whole advantage is holding more history
+//! per key and that requires the inserts. The lever is to make each insert CHEAPER,
+//! not rarer; the candidates are listed at that call site.
+//!
+//! # The elided bounds checks bought NOTHING — measured, keep them elided anyway
+//!
+//! FALSIFIED 2026-07-30 as a WALL lever: replacing checked table indexing with
+//! `get_unchecked` is byte-identical and, on a local interleaved paired read at L1 T1
+//! (7 reps, /dev/null, the same box for both arms), moved nothing measurable —
+//! tool.bin 0.32 s both arms, data.csv 0.07 s both arms. LLVM had already elided them.
+//! That is the same shape as this codebase's existing record for hand-hoisting the
+//! prefilter's invariant loads, where the hand version drove Dr UP.
+//!
+//! So this is NOT the explanation for the L1 wall regression recorded at the
+//! `Strategy::Fast` dispatch arm, and the next person should not re-try it. The form
+//! below is kept because it matches [`super::hc`] and libdeflate and costs nothing —
+//! not because it was worth anything.
+//!
+//! # Soundness of the elided bounds checks
+//!
+//! The hot loop drops Rust's bounds checks to match libdeflate's C codegen, exactly as
+//! [`super::hc`] does and for the same reasons. Every elided check is discharged by
+//! construction, not by inspection:
+//!
+//! * **Bucket / length-3 indices.** `hash = lz_hash(seq, HT_HASH_ORDER)` with
+//!   `HT_HASH_ORDER == 15`, so `hash < 2^15 == HT_TAB_LEN`; `hash3 = lz_hash(seq &
+//!   0xFF_FFFF, HT_HASH3_ORDER)` with the same order, so `hash3 < 2^15 ==
+//!   HT_HASH3_SIZE`. Both come straight out of `lz_hash` — never out of arithmetic —
+//!   so `hash_tab`/`hash3_tab` `get_unchecked[_mut]` are in bounds. `debug_assert!`s
+//!   pin this in test builds.
+//! * **Buffer reads.** The parser pads its working buffer by `BUF_PAD` (16) bytes past
+//!   `in_end` and the caller guarantees `max_len >= HT_REQUIRED_NBYTES`; see the
+//!   per-call SAFETY comment in [`HtMatchfinder::longest_match`].
+
 use super::common::{
     load_u24, load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_write,
     MATCHFINDER_INITVAL, MATCHFINDER_WINDOW_SIZE,
@@ -307,15 +362,17 @@ impl HtMatchfinder {
         // 4-byte search below has several early exits, and a table that skips
         // inserts on some of them would silently degrade over the file.
         debug_assert!(hash3 < HT_HASH3_SIZE);
-        let cur_node3 = self.hash3_tab[hash3] as i32;
-        self.hash3_tab[hash3] = cur_pos as i16;
+        // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
+        let cur_node3 = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
+        unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
 
         // The 4-byte search. `break 'four` rather than `return`, so that a miss
         // falls through to the length-3 check instead of discarding it.
         'four: {
             // --- entry 0: read, then insert this position ---
-            let mut cur_node = self.hash_tab[hash][0] as i32;
-            self.hash_tab[hash][0] = cur_pos as i16;
+            // SAFETY: `hash < HT_TAB_LEN` — see the module doc's soundness section.
+            let mut cur_node = unsafe { self.hash_tab.get_unchecked(hash)[0] } as i32;
+            unsafe { self.hash_tab.get_unchecked_mut(hash)[0] = cur_pos as i16 };
             if cur_node <= cutoff {
                 break 'four;
             }
@@ -325,8 +382,9 @@ impl HtMatchfinder {
             // libdeflate copies entry 0 into entry 1 even when `nice_len` is reached
             // on the first candidate; keeping that makes the parse decisions match.
             let to_insert = cur_node;
-            cur_node = self.hash_tab[hash][1] as i32;
-            self.hash_tab[hash][1] = to_insert as i16;
+            // SAFETY: as above.
+            cur_node = unsafe { self.hash_tab.get_unchecked(hash)[1] } as i32;
+            unsafe { self.hash_tab.get_unchecked_mut(hash)[1] = to_insert as i16 };
 
             unsafe {
                 if load_u32(base, match_pos) == seq {
@@ -440,18 +498,41 @@ impl HtMatchfinder {
         loop {
             debug_assert!(hash < HT_TAB_LEN && hash3 < HT_HASH3_SIZE);
             // Shift the bucket down by one and insert at the head.
-            let mut i = HT_BUCKET_SIZE - 1;
-            while i > 0 {
-                self.hash_tab[hash][i] = self.hash_tab[hash][i - 1];
-                i -= 1;
+            // ONE 32-bit store for the whole bucket, not two 16-bit stores.
+            //
+            // A `[i16; 2]` bucket is exactly 4 bytes, and the shift-then-insert is
+            // `[cur_pos, old[0]]` — a value computable from one load. Writing it as a
+            // single `u32` halves the STORES on the skip path, which is the path that
+            // measured 3.68x libdeflate's data writes (module doc). Density is
+            // untouched: every position is still inserted, and the resulting table
+            // state is bit-identical to the two-store form.
+            //
+            // This is the "make each insert CHEAPER, not rarer" route. Every attempt to
+            // make inserts RARER is now falsified — LIMIT_HASH_UPDATE, head-only, and
+            // dropping the length-3 insert inside matches all cost ratio, because table
+            // density IS the ratio here.
+            //
+            // SAFETY: `hash < HT_TAB_LEN` and `hash3 < HT_HASH3_SIZE` (module doc). The
+            // bucket is `[i16; 2]` — 4 bytes, aligned to 2 — and `read_unaligned` /
+            // `write_unaligned` tolerate that alignment. Little-endian layout puts
+            // element 0 in the low half, so `(old_lo << 16) | cur_pos` is exactly
+            // `[cur_pos, old[0]]`.
+            unsafe {
+                let bp = self.hash_tab.get_unchecked_mut(hash).as_mut_ptr() as *mut u32;
+                let old = core::ptr::read_unaligned(bp);
+                let packed = if cfg!(target_endian = "little") {
+                    (old << 16) | (cur_pos as u16 as u32)
+                } else {
+                    (old >> 16) | ((cur_pos as u16 as u32) << 16)
+                };
+                core::ptr::write_unaligned(bp, packed);
             }
-            self.hash_tab[hash][0] = cur_pos as i16;
             // The length-3 table is a SINGLETON per key (no bucket to shift), so a
             // skipped run overwrites rather than shifts — same as
             // `hc_matchfinder_skip_positions` does for its `hash3_tab`. Skipping this
             // insert would leave the length-3 table blind to every position inside a
             // match, which is most of the input on compressible data.
-            self.hash3_tab[hash3] = cur_pos as i16;
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
 
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
