@@ -55,7 +55,51 @@ solvency — a run, not a build.
    LOAD instructions. **Our emit path is already 0.90x theirs (57.4M vs 63.8M) — the
    whole debt is parse+matchfinder.**
 
-## 2. The board splits into two fronts
+## 2. THE BOARD, MEASURED (2026-07-30) — and it splits by THREAD COUNT, not by front
+
+First attested promotion board: `scripts/campaign/board-size.sh all`, subject `d2e47469`,
+squishy GATE+TUNE (22 members), 4 rivals, L1-9 x T1/T4, **1,320 cells measured, 0 VOID**.
+Artifact `~/www/gzippy-bench/campaign/size-all-d2e47469/`.
+
+**223 failing.** And GATE is WORSE than TUNE, which is exactly what the TUNE/GATE split
+exists to expose — parameters were historically fitted on TUNE, so the surface promotions
+are actually judged on had never been looked at:
+
+| | GATE (promotion surface) | TUNE |
+|---|---|---|
+| **total** | **127 / 660** | 96 / 660 |
+| libdeflate | 87 / 198 | 79 / 198 |
+| gzip | 24 / 198 | 9 / 198 |
+| pigz | 12 / 198 | 8 / 198 |
+| igzip | **4 / 66** | 0 / 66 |
+
+**THE DECOMPOSITION THAT MATTERS: 133 of the 223 — 60% — PASS AT T1 AND FAIL ONLY AT T4.**
+Median gap 567 B; 97 of 133 under 1,000 B; 132 of 133 under 5,000 B. Against our own
+T4-T1 deltas of 1,000-3,300 B on the big files, so **the gap IS the chunk-seam cost**, not
+a ratio deficit. The remaining 90 fail at both thread counts and are real ratio deficits,
+34 of them at L1.
+
+So the board is two problems, and the bigger one is T>1 framing:
+
+| class | cells | what it is |
+|---|---|---|
+| **T4-only** | **133** | chunk overhead. `CLAUDE.md` STEP 2 sanctions closing it by making seams smaller. **Characterised and BLOCKED — see below.** |
+| fail at both | 90 | real ratio; 34 at L1 (Front B), the rest spread L2-L9 |
+
+**The T4-only class is closable and is blocked on a RULE, not on engineering.** A
+thread-aware chunk grid takes the board to **203 (29 closed, 9 opened)** and collapses the
+seam cost (tool.bin T4-T1 2,828 -> 80 B; weights.safetensors 2,962 -> -1 B). It fails
+promotion clause 3 on 9 flips, every one a T4 cell with a margin under 0.02% (winexe.exe
+L9 +59 B on 1.5 MB). **FIVE grid shapes were tried and all flip** — including a plain
+1 MiB fixed grid with no thread term at all, which flips 8. The flips are caused by
+changing the chunk size AT ALL; those cells are won by the specific 512 KiB grid, not by
+anything robust. See `pipelined.rs` for the table and PR #189 for the probe.
+
+Whether clause 3's absolute no-flip bar should apply to sub-0.02% SIZE ties is a decision
+for the user. Until it is taken, the lever against 60% of the board is foreclosed — and
+that should be deliberate rather than a side effect.
+
+## 3. The pre-census framing (kept for its per-chunk arithmetic)
 
 The failing T4 cells, gap-to-rival divided by (chunks x per-chunk overhead), where
 chunks are the 512 KiB pipelined grid (`pipelined.rs:65`). NOTE: §1's rival table sums to
