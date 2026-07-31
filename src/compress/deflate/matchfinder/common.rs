@@ -228,9 +228,85 @@ pub fn matchfinder_init(data: &mut [i16]) {
 /// remaining ~46M is still unattributed and the same line-level diff should be run
 /// against `ht.rs` vs `ht_matchfinder.h` before anyone assumes SIMD closes L1.
 pub fn matchfinder_rebase(data: &mut [i16]) {
+    // SIMD FIRST — see the vendor-gap note above. The scalar body is kept verbatim
+    // below as the fallback and as the differential oracle for the unit test.
+    //
+    // EQUIVALENCE, proved exhaustively over all 65,536 i16 values by
+    // `rebase_simd_matches_scalar_exhaustive`: the branchless scalar form
+    // `0x8000 | (v & !(v >> 15))` IS a signed-saturating add of -32768.
+    //   v >= 0: v >> 15 == 0, so the result is 0x8000 | v == v - 32768 (no saturation,
+    //           since v < 32768 leaves the sign bit free).
+    //   v <  0: v >> 15 == -1, so `v & !(v>>15)` == 0 and the result is -32768, which
+    //           is exactly where a saturating add clamps.
+    // libdeflate uses the same identity (`_mm256_adds_epi16` in
+    // `lib/x86/matchfinder_impl.h`).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SSE2 is BASELINE on x86_64 — no runtime dispatch and no feature detection
+        // needed, so this cannot regress a machine that lacks it.
+        use core::arch::x86_64::{
+            __m128i, _mm_adds_epi16, _mm_loadu_si128, _mm_set1_epi16, _mm_storeu_si128,
+        };
+        let (head, mid, tail) = unsafe { data.align_to_mut::<[i16; 8]>() };
+        for d in head.iter_mut() {
+            let v = *d;
+            *d = (0x8000u16 as i16) | (v & !(v >> 15));
+        }
+        // SAFETY: `align_to_mut` guarantees `mid` is a whole number of 8-lane groups,
+        // correctly aligned for `[i16; 8]`; `loadu`/`storeu` do not require alignment
+        // anyway. The pointer is valid for the group's 16 bytes by construction.
+        unsafe {
+            let sub = _mm_set1_epi16(-32768);
+            for g in mid.iter_mut() {
+                let p = g.as_mut_ptr() as *mut __m128i;
+                _mm_storeu_si128(p, _mm_adds_epi16(_mm_loadu_si128(p as *const __m128i), sub));
+            }
+        }
+        for d in tail.iter_mut() {
+            let v = *d;
+            *d = (0x8000u16 as i16) | (v & !(v >> 15));
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64 — same argument as SSE2 above.
+        use core::arch::aarch64::{vdupq_n_s16, vld1q_s16, vqaddq_s16, vst1q_s16};
+        let (head, mid, tail) = unsafe { data.align_to_mut::<[i16; 8]>() };
+        for d in head.iter_mut() {
+            let v = *d;
+            *d = (0x8000u16 as i16) | (v & !(v >> 15));
+        }
+        // SAFETY: as the x86_64 arm; `vld1q_s16`/`vst1q_s16` are unaligned-tolerant.
+        unsafe {
+            let sub = vdupq_n_s16(-32768);
+            for g in mid.iter_mut() {
+                let p = g.as_mut_ptr();
+                vst1q_s16(p, vqaddq_s16(vld1q_s16(p), sub));
+            }
+        }
+        for d in tail.iter_mut() {
+            let v = *d;
+            *d = (0x8000u16 as i16) | (v & !(v >> 15));
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        for d in data.iter_mut() {
+            let v = *d;
+            // v >> 15 is an arithmetic shift: -1 for negatives, 0 for non-negatives.
+            *d = (0x8000u16 as i16) | (v & !(v >> 15));
+        }
+    }
+}
+
+/// The scalar form, retained as the differential oracle for the SIMD arms.
+#[cfg(test)]
+#[inline]
+fn rebase_scalar_ref(data: &mut [i16]) {
     for d in data.iter_mut() {
         let v = *d;
-        // v >> 15 is an arithmetic shift: -1 for negatives, 0 for non-negatives.
         *d = (0x8000u16 as i16) | (v & !(v >> 15));
     }
 }
@@ -303,6 +379,21 @@ mod tests {
         assert!(tab.iter().all(|&x| x == MATCHFINDER_INITVAL));
         assert_eq!(MATCHFINDER_INITVAL, i16::MIN);
         assert_eq!(MATCHFINDER_INITVAL, -32768);
+    }
+
+    #[test]
+    fn rebase_simd_matches_scalar_exhaustive() {
+        // EVERY i16 value, at every alignment offset within a 16-lane block, so the
+        // head/mid/tail split is exercised too. The SIMD arm must be
+        // indistinguishable from the scalar form it replaces.
+        let all: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        for off in 0..16usize {
+            let mut a = all[off..].to_vec();
+            let mut b = a.clone();
+            matchfinder_rebase(&mut a);
+            rebase_scalar_ref(&mut b);
+            assert_eq!(a, b, "SIMD/scalar divergence at offset {off}");
+        }
     }
 
     #[test]
