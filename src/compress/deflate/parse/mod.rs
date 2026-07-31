@@ -916,6 +916,31 @@ fn bsr32(x: u32) -> u32 {
 /// Emit the accumulated block, choosing the cheapest of stored / static-Huffman
 /// / dynamic-Huffman. `block_start` is the absolute offset of the block's first
 /// byte in `buf`.
+/// `#[inline(never)]` — LIBDEFLATE'S OWN FACTORING, and a measured structural fix.
+///
+/// Disassembly diff, 2026-07-31 (trainer, `nm -C -S` + `objdump -d`, both RelWithDebInfo):
+///
+///     libdeflate deflate_compress_fastest   2,466 B   frame 0x88  =   136 bytes
+///     libdeflate deflate_flush_block        3,696 B   frame 0x48  =    72 bytes
+///     OURS       parse::compress           29,543 B   frame 0x858 = 2,136 bytes
+///
+/// libdeflate keeps its block-flush in a SEPARATE function; we inlined the matchfinder,
+/// the parse loop, the block-split observations AND this emit path into one 29.5 KB
+/// function with a 2 KB stack frame — 15.7x their spill space, after pushing all six
+/// callee-saved registers. Every candidate in the match walk then touches spilled state,
+/// which is precisely the banked profile
+/// (`project_encoder_deficit_is_loads_not_stalls`): our IPC, stalls, cache and branch
+/// behaviour all BEAT libdeflate while we issue 61% MORE LOADS.
+///
+/// It is also why six source-level hypotheses failed on 2026-07-31 (the `lz_extend`
+/// unroll, hand-written SIMD rebase, the addressing hoist, the deferred `matchptr`, the
+/// skip-insert cap, the second-probe cost): they hunted for an expensive INSTRUCTION
+/// inside a function whose problem is that it is ONE FUNCTION. Ablating hash3 entirely
+/// still left 1.39x, which is what proved the cost is diffuse rather than local.
+///
+/// Emit runs ONCE PER BLOCK; the matchfinder runs once per POSITION. Inlining the rare
+/// path into the hot one is the wrong trade, and no vendor makes it.
+#[inline(never)]
 fn emit_block(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -1026,6 +1051,9 @@ fn emit_block(
 /// (no per-block adaptive code), which is an intentional L0/L1 trade — L0's
 /// bar is beating igzip -0 (which sometimes EXPANDS incompressible input),
 /// not matching L1.
+/// `#[inline(never)]` for the same reason as [`emit_block`]: a per-BLOCK path must not
+/// inflate the per-POSITION loop's register pressure.
+#[inline(never)]
 fn emit_block_static_or_stored(
     bw: &mut BitWriter,
     buf: &[u8],
