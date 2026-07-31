@@ -121,6 +121,23 @@ const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 /// margin entirely. k=2 halves the seam cost against k=4 while keeping the valve.
 const CHUNKS_PER_THREAD: usize = 2;
 
+/// MEASUREMENT-ONLY override, resolved once per process.
+///
+/// 154 of the 200 failing size cells are T4, not T1 — at T1 our output is byte-identical
+/// to libdeflate on every file tested, and the entire loss is the per-chunk SEAM. Each
+/// seam restarts the coder, and the wall board shows we beat libdeflate 2-3x at T4, so
+/// there is headroom to spend on fewer, larger chunks.
+fn chunks_per_thread() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("PROBE_CPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(CHUNKS_PER_THREAD)
+    })
+}
+
 /// Ceiling on the thread-aware chunk size. Chunks are buffered in flight, so this is an
 /// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
 const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
@@ -205,7 +222,7 @@ fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> us
     //     memory. 8 MiB per chunk at T16 is ~128 MiB of in-flight payload, which is the
     //     most this is willing to spend.
     debug_assert!(num_threads >= 1);
-    let target_chunks = num_threads.max(1).saturating_mul(CHUNKS_PER_THREAD);
+    let target_chunks = num_threads.max(1).saturating_mul(chunks_per_thread());
     let by_parallelism = input_len / target_chunks.max(1);
     // Never go BELOW the old fixed grid's chunk size for a given input: this change is
     // meant to remove seams, never to add them. A file that the old grid split into

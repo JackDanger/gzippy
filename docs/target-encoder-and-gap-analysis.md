@@ -711,3 +711,56 @@ Size: must not regress any currently-passing L5-L7 cell (clause 3 is absolute), 
 the full 22-file board at T1 and T4. Wall: must stay under the L6 erosion budget against
 gzip/pigz AND not flip any libdeflate cell — the depth lever died on exactly that leg, so
 wall is not optional here and a size-only argument is insufficient (3 for 3 in this class).
+
+## G14 — 77% OF THE FAILING BOARD IS THE T>1 PATH, NOT THE PARSE (2026-07-31)
+
+The single most useful cut of the banked board, and it was available all along. Failing size
+cells split by THREAD COUNT (`/root/sizeboard-all-12fcd0ed/census.json`, 1,320 measured):
+
+    band     T4    T1
+    L8-L9    35     2
+    L5-L7    61    15
+    L2-L4    41    11
+    L1       17    18
+    TOTAL   154    46
+
+**154 of 200 failing cells are T4.** At T1 our output is BYTE-IDENTICAL to libdeflate on
+every file tested at L6 and L9 — symbols.dwarf 366,624; data.csv 3,300,291; dickens
+4,480,689; sil40 15,452,666 — i.e. we TIE exactly and pass. The loss appears only when the
+input is cut into chunks:
+
+    file            L   T1           T4           seam cost
+    symbols.dwarf   9     366,624      366,918      +294
+    data.csv        9   3,300,291    3,301,579    +1,288
+    sil40           9  15,452,666   15,453,781    +1,115
+    dickens         9   4,480,689    4,480,950      +261
+
+And the wall board already showed we beat libdeflate **2-3x at T4** — so there is large wall
+headroom exactly where the size cells fail. That is the reverse of the T1 situation, where
+wall is the binding constraint.
+
+### The waste is named, and it is not "too many chunks"
+
+`CLAUDE.md` STEP 2 sanctions "making seams SMALLER — pad choice, chunk grid, block
+splitting", and G5 already states the mechanism: **every seam costs a sync-flush AND a
+block-grid restart AND a fresh Huffman histogram. The first is 5 bytes; the other two are the
+expensive ones.**
+
+Halving the chunk count (`CHUNKS_PER_THREAD` 2 -> 1) is only a PARAMETER against that waste.
+Measured at L8-L9 over 264 common cells: **8 closed, 3 opened** (net -5, still a clause-3
+failure). It recovers 65-80% of the per-file seam cost (data.csv L9 +1,288 -> +533; sil40
++1,115 -> +230; dickens +261 -> +25) by having fewer restarts — not by making a restart
+cheaper. It also spends the load-balancing margin that `CHUNKS_PER_THREAD` exists for.
+
+**The structural fix is to make the seam FREE, not rarer**: carry the coding state across the
+chunk boundary so a seam costs the 5-byte sync-flush and nothing else. That is G5, it is
+sanctioned by STEP 2, and it addresses 154 cells rather than the 46 the entire rest of this
+session was aimed at.
+
+### Method note
+
+This session spent ~11 levers on T1 parse mechanisms — matchfinder register pressure, hash
+geometry, cost model, block cadence — and closed zero cells. Ten were falsified. The board
+had the answer in a one-line group-by the whole time. **Before choosing a mechanism, cut the
+failing set by every axis you have (level, rival, thread count, file class) and work the
+largest block.** Thread count was the axis nobody had cut by.
