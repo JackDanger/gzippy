@@ -429,6 +429,34 @@ pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> Huffma
 /// this path allocates nothing. The arithmetic below is UNCHANGED from the
 /// allocating form — same `sort_symbols`, same tree build, same codeword
 /// generation — so the emitted bytes are identical by construction.
+// FALSIFY (2026-07-31): REPLACING THIS HEURISTIC WITH EXACT PACKAGE-MERGE IS NOT A
+// SIZE LEVER. Do not "upgrade" this builder to `super::optimal`'s exact Katajainen
+// length assignment, and do not add it as a costed second candidate. Both were built
+// and measured.
+//
+// Motivation was sound: the size census shows we are an EXACT BYTE TIE with libdeflate
+// at L2 and L4-L9 (154/198 T1 cells), so 109 T4 cells fail with ZERO headroom and need
+// only ~0.01% of margin; and unlike a parse change, Huffman construction is paid once
+// per BLOCK, not once per position. See docs/target-encoder-and-gap-analysis.md G15/G16.
+//
+// UNCONDITIONAL SWAP: a wash, and it OPENS cells. dickens L2 +10 B, data.csv L2 -326 B,
+// winexe.exe L6 +385 B, data.json L6 -737 B. Package-merge minimises CODED-DATA bits,
+// but the block also transmits its length vector in an RLE-coded header and the two
+// builders produce different vectors -- exact on data is NOT exact on total.
+//
+// COSTED DUAL CANDIDATE (build both, take the cheaper, strict `<` so ties keep this
+// one): the size invariant HELD -- 49 of 49 cells smaller, 0 worse, T1, all roundtrip
+// through our decoder + gzip + libdeflate. But the margin is ~0.001% (sil40 -122..-166 B
+// on 15.4 MB) and it costs 10-14% WALL: vs libdeflate on sil40 T1 the ratio went L2
+// 1.044->1.193, L5 1.038->1.150, L6 0.956->1.043, L7 0.922->0.986. L6 FLIPS from
+// WE WIN to WE LOSE, which clause 3 forbids outright.
+//
+// THE STRUCTURAL FACT, and the reason this closes a whole family: libdeflate's
+// heuristic length limiter is ALREADY WITHIN 0.001% OF EXACT. There is no meaningful
+// size left in Huffman code construction, at any wall price. The ~0.01% of margin the
+// zero-headroom cells need is not here -- look at block BOUNDARIES or the parse.
+// REOPEN requires a NEW mechanism, not a faster package-merge: a 0.001% ceiling is not
+// a speed problem.
 pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u32, freqs: &[u32]) {
     crate::anatomy_count!(huffman_make_code_calls);
     assert_eq!(freqs.len(), num_syms);

@@ -223,6 +223,17 @@ l3-tune = []
 # NOT a production knob (CLAUDE.md non-negotiable #3): the deliverable is a static
 # table, and this feature must never be enabled in a shipped build.
 ladder-tune = []
+# EXACT LENGTH-LIMITED HUFFMAN for the L2-L9 block coder (2026-07-31 probe).
+# `fast.rs` is libdeflate's HEURISTIC length-limiter (build_tree +
+# compute_length_counts); `optimal.rs` already holds the EXACT Katajainen
+# package-merge builder, but only deflate64/ultra/near_optimal call it. This
+# feature routes the mainline block coder through the exact builder. Motivation:
+# the size census shows we are an exact byte tie with libdeflate at L2 and L4-L9,
+# so we need ~0.01% of margin at seven levels at once for ~zero wall — and unlike
+# a parse change, Huffman construction is paid ONCE PER BLOCK, not per position.
+# DEFAULT OFF; marks the binary +INSTRUMENTED so no wall number can be quoted from
+# it against a rival.
+exact-huffman = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);

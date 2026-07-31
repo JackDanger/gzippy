@@ -953,3 +953,42 @@ BASE is within +-0.05% of libdeflate rather than exactly equal. The frontier SHA
 dominance at fixed depth, depth monotonicity, the sign of the wall costs) is what this
 section claims. Any absolute margin must be re-measured on solvency against the frozen rival
 before it gates anything.
+
+## G16 — the margin is NOT in Huffman construction: libdeflate's heuristic is within 0.001% of exact
+
+G15 concluded the ~0.01% of margin the 109 zero-headroom cells need must be ENCODER-side,
+because a parse improvement scales its cost per position while Huffman construction is paid
+once per block. That was the right cost shape and the wrong place. Both forms were built.
+
+UNCONDITIONAL SWAP (`fast.rs` heuristic -> `optimal.rs` exact Katajainen package-merge):
+a wash, and it OPENS cells.
+
+    dickens L2 +10 B | data.csv L2 -326 B | winexe.exe L6 +385 B | data.json L6 -737 B
+
+winexe.exe L6 goes from 178 B smaller than libdeflate to 207 B larger. Package-merge
+minimises CODED-DATA bits, but a dynamic block also transmits its length vector in an
+RLE-coded header and the two builders produce different vectors: EXACT ON DATA IS NOT
+EXACT ON TOTAL.
+
+COSTED DUAL CANDIDATE (build both codes, cost header+data for each, emit the cheaper;
+strict `<` so ties keep today's bytes). The size invariant held exactly as designed —
+**49 of 49 cells smaller, 0 worse**, T1, every one roundtripping through our decoder,
+gzip and libdeflate:
+
+    dickens -16..-33 | data.csv -7..-16 | winexe -5..-18
+    aozora  -21..-66 | markup   -2..-7  | sil40  -122..-166
+
+But the margin is ~0.001% and the wall cost is 10-14% (two extra Huffman builds, one
+extra header build, one extra cost evaluation per block). Against libdeflate, sil40, T1:
+
+    L2 1.044 -> 1.193 | L5 1.038 -> 1.150 | L6 0.956 -> 1.043 | L7 0.922 -> 0.986
+
+L6 FLIPS from WE WIN to WE LOSE. Clause 3 forbids a pass->fail flip, so this is reverted.
+
+THE FAMILY THIS CLOSES. The interesting number is not the wall cost, it is the 0.001%:
+libdeflate's heuristic length limiter is ALREADY within one part in 100,000 of the exact
+minimum-redundancy code. No amount of speeding up package-merge changes that ceiling. The
+whole "our Huffman leaves size on the table" family is dead — the margin is not in code
+CONSTRUCTION. What remains encoder-side is block BOUNDARY choice (where the tail-guard
+probe showed our splits are already earning their headers, but says nothing about whether
+a DIFFERENT boundary set is better) and the parse itself.
