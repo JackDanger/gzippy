@@ -835,3 +835,31 @@ The obstacle is named and real: the drift detector ends blocks EARLY and data-de
 the true block grid is not at multiples of the budget and cannot be predicted from the chunk
 span alone. Any alignment scheme has to reckon with a block boundary the parser chooses, not
 one the scheduler assigns. NOT YET BUILT.
+
+### FALSIFIED — the extra blocks are NOT runts, and a tail guard makes it worse
+
+If the +3 dynamic headers at T4 were runt blocks created by the drift detector splitting too
+close to a chunk end, refusing to split there would recover them. Ablated by raising the
+`bytes_remaining` threshold in `ready_to_check_block` (libdeflate's own value is
+MIN_BLOCK_LENGTH = 5,000), L9, `-p4`, exact bytes:
+
+    file        T1           guard 5,000   32,768       131,072      262,144
+    sil40       15,452,666   15,453,781    15,454,738   15,461,035   15,466,720
+    data.csv     3,300,291    3,301,579     3,301,587    3,302,154    3,302,080
+    dickens      4,480,689    4,480,950     4,480,950    4,480,947    4,481,224
+
+MONOTONICALLY WORSE. Those late splits EARN their headers — the data changed and a fresh
+table pays. The extra blocks are legitimate, not waste.
+
+So the +3 is genuinely the boundary MISMATCH: with 8 chunks there are 7 forced block
+boundaries, 4-5 of which happen to coincide with where the parser would have ended a block
+anyway, and 3 of which do not. Where the parser wants a boundary is DATA-DEPENDENT and not
+knowable when the scheduler assigns the grid.
+
+THAT is why the only remaining alignment fix is the one the review proposed: **let the PARSER
+choose the boundary and the scheduler follow it**, rather than the scheduler assigning a grid
+the parser must honour. Chunk boundaries become scheduling artifacts, not coding boundaries.
+Every cheaper approach is now measured and dead:
+    CHUNKS_PER_THREAD 2->1   8 closed / 3 opened at L8-L9 — a parameter, still misaligned
+    tail guard               monotonically worse (above)
+    G5 carry coding state    removes 40 B of flushes; the 1,115 B is not the restarts
