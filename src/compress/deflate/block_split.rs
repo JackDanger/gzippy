@@ -68,6 +68,33 @@ pub const MIN_BLOCK_LENGTH: usize = 5000;
 //       verified term-for-term port of theirs, so there was never anything to steal
 //       from them here. This route removes a data-dependent branch instead of adding
 //       one, and it is vendor-precedented three times over.
+//       *** FALSIFY 2026-07-31 — ROUTE (b) IS CLOSED. BUILT AND MEASURED. ***
+//       Removing the `should_end_block` term from `parse::continue_block` (leaving the
+//       300,000 B span cap and the 50,000-sequence quantum, both fixed constants, and
+//       leaving `near_optimal`'s own stats untouched) COSTS SIZE on heterogeneous input,
+//       at a SHALLOW and a DEEP level, on declared corpus members. Bytes, main vs
+//       detector-deleted, -p1, roundtrip-verified through our decoder AND gzip:
+//           armexe.elf  L2 590,859 -> 604,152   +2.250%   L9 574,689 -> 583,487  +1.531%
+//           sil40       L2 16,059,080 -> 16,328,627 +1.678%  L9 15,452,666 -> 15,664,034 +1.368%
+//           data.csv    L2 3,923,216 -> 3,937,975 +0.376%   L9 +0.276%
+//       It PAYS only on homogeneous text, and only slightly (aozora.txt L2 -0.132%,
+//       dickens L2 -0.025%). That split is the mechanism: sil40 is a TAR of many file
+//       types and armexe.elf has distinct code/data sections, which is exactly the input
+//       a drift detector exists for. One fixed quantum cannot straddle a section boundary
+//       it cannot see.
+//
+//       THE ARGUMENT ABOVE WAS WRONG IN A WAY WORTH KEEPING: "vendor-precedented three
+//       times over" counted rivals WITHOUT ASKING WHETHER THOSE RIVALS WIN ON THE AXIS
+//       IN QUESTION. zlib-ng and igzip have no detector and also lose to libdeflate on
+//       ratio; libdeflate is the size leader and is the one that HAS it. A precedent from
+//       an implementation we already beat on this axis is evidence about that axis in the
+//       WRONG direction. Count winning precedents, per axis — a 3-1 vote among rivals is
+//       not evidence when the 1 is the one setting the bar.
+//
+//       The detector's real cost is hot-loop work (`observe_literal` on EVERY literal,
+//       `observe_match` on every match, at L2-L9). That cost is REAL and unmeasured here.
+//       The live lever is therefore to make an observation CHEAPER, not to delete it —
+//       deleting it forfeits 1.4-2.3% on the two hardest size files to save it.
 
 #[derive(Clone)]
 pub struct BlockSplitStats {
