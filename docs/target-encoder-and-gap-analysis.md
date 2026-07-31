@@ -497,3 +497,48 @@ directions), any further chunk-grid constant (five shapes, all flip), bounds-che
 elision (LLVM already does it), `LIMIT_HASH_UPDATE` on the ht finder (costs ratio), and
 the signal-gated block-end bias (third instance of a banned detector). All seven are
 falsified at their code sites.
+
+## G8 — T>1 COPIES THE WHOLE INPUT FOR PADDING IT ALREADY HAS (verified 2026-07-31, NOT built)
+
+**Verified in code, not inferred.** `infra/scheduler.rs:271` and `:275` hand each worker
+
+```rust
+let block = &input[start..end];
+let dict  = Some(&input[dict_start..start]);   // dict_end == start
+```
+
+— two slices of ONE contiguous buffer that are **exactly adjacent**. `deflate/mod.rs:163-169`
+then allocates `dict.len() + data.len() + BUF_PAD` and copies BOTH in:
+
+```rust
+let mut buf = Vec::with_capacity(cap);
+buf.extend_from_slice(dict);
+buf.extend_from_slice(data);
+buf.resize(in_end + parse::BUF_PAD, 0);
+```
+
+The copy exists **only** to obtain `BUF_PAD` readable trailing bytes. `&input[dict_start..end]`
+is already the same bytes in the same order, and for every chunk except the last,
+`end < input.len()`, so those trailing bytes already exist in the mapping.
+
+T=1 already solved exactly this: `encode_deflate_slack_padded_to_sink` (`deflate/mod.rs:265`)
+takes a buffer that carries its own trailing pad and copies nothing. **T>1 never got the
+equivalent.** This is the largest remaining structural difference between the two drivers,
+and it is per-chunk.
+
+Cost: at T=1 the staging buffers are the two biggest allocations after the `Sink`
+(`mod.rs:395` 4,564,792 B and `mod.rs:404` 2,098,144 B on a 6 MB input); at T>1 the same
+copy runs once per chunk, over the entire input plus 32 KiB of dictionary per chunk.
+
+**Why it is not built here.** It is an unsafe-bounds change on the T>1 hot path. `BUF_PAD`
+exists so `load_u32` near `in_end` cannot read out of bounds; with a shared mapping those
+over-reads land in the NEXT chunk's bytes, which is valid readable memory, and the parser
+already clamps `max_len` so no match can be emitted past `in_end`. That argument is sound
+but it must be discharged for EVERY parser, not the one that is convenient —
+`feedback_unsafe_bound_must_cover_all_callers` records a SAFETY comment here that held for
+2 of 4 parsers while `silesia -10` was at 86% of the allocation. The final chunk genuinely
+has no slack and needs real padding.
+
+**Gate to pre-register before attempting:** allocated bytes DOWN at T4 and T16, output
+byte-identical at T1/T4/T8 across L1/L6/L9, roundtrip through our decoder AND gzip at every
+thread count, and the bound discharged in writing for all four parsers.
