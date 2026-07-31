@@ -1371,3 +1371,52 @@ grid measurable instead of hard-coded.
 NOT YET FIXED. Wiring it changes T>1 output whenever `-b` is passed, which is the correct
 behaviour but must be gated: roundtrip through our decoder + gzip + libdeflate at several
 `-b` values and thread counts, and a check that the DEFAULT path stays byte-identical.
+
+## G24 — the seam CANNOT be closed by grid tuning: the residual is always > 0
+
+Measurable for the first time because #223 made `-b` actually reach the chunk grid. sil40
+(40,000,000 B), L9, T4, local M1, vanilla build; size deterministic, wall by hyperfine n=5
+warmup 1, both arms to /dev/null.
+
+    grid                       output bytes   vs T1     wall       vs T4-default
+    T1 (reference)             15,452,666       ---     1.1357s        3.557x
+    T4 default (8 chunks)      15,453,781    +1,115     0.3193s        1.000x
+    T4 -b 10M  (4 chunks)      15,452,728       +62     0.3495s        1.095x
+    T4 -b 16M  (3 chunks)      15,452,697       +31     0.5963s        1.868x
+    T4 -b 64M  (1 chunk)       15,452,672        +6     1.1660s        3.652x
+
+ONE CHUNK PER THREAD REMOVES 94.4% OF THE SEAM FOR 9.5% WALL (+1,115 -> +62 B, 0.3193 ->
+0.3495 s). That is a far better exchange rate than anything the parse-config sweep offered.
+
+AND IT STILL DOES NOT CLOSE THE CELL. The residual never reaches zero: +62 at 4 chunks, +31
+at 3, +6 at 1 — and "1 chunk" is T1 with extra steps (wall 1.1660s vs T1's 1.1357s, i.e. we
+pay 2.7% to pretend to be parallel). Every chunk boundary costs bytes. Because we TIE
+libdeflate byte-for-byte at T1 (G15), a cell needs T4 <= T1, so even +6 B FAILS.
+
+    seam residual by boundary count (sil40 L9):
+      7 boundaries -> +1,115 B     3 -> +62 B     2 -> +31 B     0 -> +6 B
+
+The same shape holds on the other files measured: dickens L9 default +261 -> `-b 4M` -41
+(SMALLER than T1 — boundary placement can occasionally help); data.csv L9 default +1,288 ->
+`-b 64M` +9; sil40 L6 default -30 -> essentially flat.
+
+### What this settles
+
+The 109 zero-headroom cells have exactly two possible fixes, and grid tuning is NOT one of
+them:
+
+  1. SIZE MARGIN AT T1, so a small positive seam still lands under the rival. MEASURED AND
+     BLOCKED — G17: every configuration that is smaller on all files exceeds the wall budget,
+     and G16: the encoder side yields only 0.001% at 10-14% wall.
+  2. BOUNDARIES THAT DO NOT RESTART CODING — workers emit parse artifacts, the consumer owns
+     the final bitstream, so a chunk boundary is a scheduling artifact rather than a block
+     boundary. NOT ATTEMPTED. This is the only remaining route.
+
+Grid tuning improves the exchange rate but cannot reach zero, so it can never close a cell on
+its own. It is worth revisiting ONLY in combination with (1) — if T1 ever carries even ~0.01%
+of margin, a 4-chunk grid's +62 B would sit comfortably under it.
+
+DO NOT change the DEFAULT grid on the strength of this. `pipelined_block_size`'s own FALSIFY
+record requires a deliberate variation gated on BOTH axes, and CHUNKS_PER_THREAD 2->1 was
+already tried and scored 8 cells closed / 3 opened. The 9.5% wall here is a single file at a
+single level on a non-frozen box.
