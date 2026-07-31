@@ -1056,6 +1056,7 @@ fn emit_block(
         });
     } else {
         crate::anatomy_count!(blocks_emitted_dynamic);
+        crate::anatomy_count!(dynamic_header_bits_total, header.header_bits());
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);

@@ -1575,3 +1575,47 @@ CAVEAT: 350 B/header is inferred from the G14 seam accounting, not from a direct
 `header_bits()`. Before this gates anything, add that sum as a counter and measure it — a
 header-mass claim built on an inferred constant is exactly the kind of number this campaign has
 been burned by.
+
+## G27a — CORRECTION: header mass is 0.634%, not 2.07%. The seam is BAD PLACEMENT, not headers
+
+G27 argued block count was the next lever using ~350 B/header INFERRED from the seam
+accounting, and flagged that the inference had to be replaced by a direct sum before it gated
+anything. Done — `dynamic_header_bits_total` sums `header_bits()` over every dynamic block
+actually emitted (sil40 40,000,000 B and dickens, L9, T1, anatomy-counters build):
+
+    file      blocks   header bits   bytes    per header   share of output
+    sil40       913       783,318    97,914     107.2 B       0.634%
+    dickens      49        31,745     3,968      81.0 B       0.089%
+
+THE INFERRED 350 B/HEADER WAS 3.3x TOO HIGH, and header mass is 0.634% of sil40, not 2.07%.
+G27's headline number is withdrawn.
+
+WHY THE INFERENCE FAILED, and it is the useful part. The seam accounting measured that 3 EXTRA
+BLOCKS cost ~1,050 B (~350 B each). Only ~107 B of that is the header. The remaining ~240 B per
+extra block is the cost of splitting AT A FORCED CHUNK BOUNDARY instead of where the parse
+wanted to split — a worse-fitted pair of tables on both sides.
+
+So the T>1 seam is NOT primarily a header-count problem. It is a BOUNDARY-PLACEMENT problem,
+and ~70% of its cost is the misplacement rather than the extra header. That is consistent with
+the tail-guard falsification (G-note: suppressing late splits made every file WORSE, because
+well-placed splits earn their headers) and it explains why grid tuning moved the seam so much
+(G24: +1,115 B at 7 boundaries down to +6 B at 0) — fewer forced boundaries, not fewer headers.
+
+### What this does to the two candidate levers
+
+  BLOCK COUNT (fewer, larger blocks): headers are 0.634% of output, so a 20% cut is at most
+  0.13% BEFORE the data-bit penalty of worse-fitted tables. Still ~160x the Huffman margin
+  (0.0008%) and still far above the ~0.01% the zero-headroom cells need — but it is a
+  0.13% ceiling, not the 0.4% G27 claimed.
+
+  BOUNDARY PLACEMENT: ~70% of the seam is misplacement. This is the same conclusion G25 reached
+  from the scheduling side and G24 from the grid side, now from the byte accounting: what the
+  T>1 path needs is for chunk boundaries to stop FORCING block boundaries — the narrow
+  "consumer owns the seam blocks" form — not fewer or cheaper headers.
+
+Three independent accountings now name the same fix. That is the one to build.
+
+METHOD NOTE. This is the fifth claim of mine this session that measurement retracted, and the
+second where an INFERRED constant stood in for a measured one. The rule that caught it is the
+one already in CLAUDE.md — a gate may only cite a dataset that exists — and the fix each time
+was to add the counter rather than to argue about the constant.
