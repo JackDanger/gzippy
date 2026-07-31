@@ -29,11 +29,32 @@
 //! hunting for an expensive instruction inside a function whose problem is that it is
 //! ONE function.
 //!
-//! REOPEN CONDITION FOR THE L1 CLASS, restated on this evidence: the lever is not a
-//! cheaper construct and not fewer candidates. It is SPLITTING the monolith — an
-//! `#[inline(never)]` boundary around emit (libdeflate's own factoring), so the
-//! matchfinder loop keeps its live values in registers. That is a structural change with
-//! a deterministic falsifier (frame size + Ir), and it has never been tried.
+//! ⚠ BUILT AND FALSIFIED, SAME DAY — and the finding above needs a correction.
+//!
+//! `#[inline(never)]` on `emit_block` and `emit_block_static_or_stored` (libdeflate's own
+//! factoring) changed NOTHING: L1 136,990,252 -> 136,990,252 and L6 457,836,629 ->
+//! 457,836,629, exactly equal. `emit_block` did split into its own 3,319-byte symbol,
+//! comparable to libdeflate's `deflate_flush_block` (3,696) — and the hot loop did not
+//! move at all.
+//!
+//! THE ATTRIBUTION ERROR: the 29,543-byte / 2,136-byte-frame monolith is
+//! `parse::compress`, which is the **L2-L9** path. L1 runs `parse::fast::run`, a
+//! DIFFERENT function — 22,543 bytes, frame 0x6b8 = 1,720 bytes — byte-for-byte identical
+//! at the same address before and after the change. An L1 gap was attributed to a
+//! function L1 does not execute. The frame numbers are real; the level they belong to was
+//! wrong.
+//!
+//! LLVM was already making the right inlining choice for the hot loop; the annotation only
+//! changed which COLD symbol survived.
+//!
+//! WHAT STILL STANDS: `fast::run`'s frame is 1,720 bytes against libdeflate's 136 for the
+//! same L1 algorithm, and the 1.39x with hash3 fully ablated is unexplained. Register
+//! pressure remains the best hypothesis, but "split at the emit boundary" is not the
+//! lever — that boundary was already there.
+//!
+//! SEVEN falsifications on 2026-07-31. Six were source constructs that looked cheaper;
+//! this one was a real structural difference measured on the WRONG FUNCTION. Before the
+//! next L1 attempt, confirm which symbol the level actually executes.
 //!
 //! # ABLATION 2026-07-31 — THE L1 GAP IS DIFFUSE, NOT ANY ONE FEATURE
 //!
