@@ -183,14 +183,6 @@ pub const HT_HASH_ORDER: u32 = 15;
 /// `HT_MATCHFINDER_BUCKET_SIZE`. The port below is the hand-unrolled `== 2` arm;
 /// changing this constant alone does NOT change the algorithm.
 pub const HT_BUCKET_SIZE: usize = 2;
-/// How many positions of a SKIPPED run still get a length-3 insert.
-///
-/// igzip caps hash updates over an accepted match at 3 positions
-/// (`ISAL_LIMIT_HASH_UPDATE`, `igzip_base.c:74-78`) and `parse::fast` already ships the
-/// same idea on the L1 path. libdeflate's `ht_matchfinder` has no length-3 table at all,
-/// so it pays nothing here; we added one for the binary-file wins and were paying for it
-/// on every interior position of every match.
-pub const HT_SKIP_HASH3_LIMIT: u32 = 3;
 /// Number of buckets.
 pub const HT_TAB_LEN: usize = 1 << HT_HASH_ORDER;
 /// `HT_MATCHFINDER_MIN_MATCH_LEN`. Asserted throughout the port, exactly as
@@ -559,8 +551,6 @@ impl HtMatchfinder {
         let mut hash3 = *next_hash3 as usize;
         let mut pos = in_next;
         let mut remaining = count;
-        // Positions inserted into the length-3 table so far in THIS skipped run.
-        let mut skipped: u32 = 0;
         loop {
             debug_assert!(hash < HT_TAB_LEN && hash3 < HT_HASH3_SIZE);
             // Plain two-store shift, faithful to `ht_matchfinder_skip_bytes`.
@@ -612,25 +602,32 @@ impl HtMatchfinder {
             // 22,673,676). The synthesis is not expensive because it searches more; it is
             // expensive because it INSERTS more.
             //
-            // NAMED LEVER, NOT YET BUILT: both libdeflate and igzip cap hash updates
-            // inside long matches (`ISAL_LIMIT_HASH_UPDATE`; we already ship
-            // `fast::LIMIT_HASH_UPDATE_INSERTS_L1` on the L1 path). Capping the hash3
-            // insert during a skipped run would cut this loop's extra work while keeping
-            // length-3 coverage near the match boundaries where it pays. Unlike the five
-            // levers falsified on 2026-07-31, this REMOVES WORK the vendor does not do
-            // rather than betting that a different spelling codegens better — but it
-            // changes output, so it needs the full size board plus a wall leg.
-            // CAPPED, per igzip's `ISAL_LIMIT_HASH_UPDATE` (`igzip_base.c:74-78`, which
-            // uses `end = next_hash + 3` rather than `+ match_length`) and per the
-            // `LIMIT_HASH_UPDATE` our own `parse::fast` already ships on the L1 path.
-            // The BUCKET insert above still runs for every position — that is what
-            // libdeflate does — but the length-3 table is a singleton that gets
-            // overwritten anyway, so inserting it for the whole interior of a long match
-            // buys coverage that the next few positions immediately clobber.
-            if skipped < HT_SKIP_HASH3_LIMIT {
-                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
-            }
-            skipped += 1;
+            // FALSIFY 2026-07-31 (FALSIFIED) — capping this insert is NOT the lever, and
+            // the reasoning that produced it was invalid.
+            //
+            // BUILT: `HT_SKIP_HASH3_LIMIT = 3`, matching igzip's `ISAL_LIMIT_HASH_UPDATE`
+            // (`igzip_base.c:74-78`) and the `LIMIT_HASH_UPDATE` `parse::fast` already
+            // ships. The bucket insert still ran for every position, as libdeflate does.
+            // Measured, cachegrind, 4 MB dickens at L1 through this port:
+            //     uncapped  208,280,851 Ir      capped  208,148,005 Ir   (-132,846, -0.06%)
+            // and it COSTS size: access.log +1,767, monorepo.tar +16,147 (which flips it
+            // from BEATING libdeflate's 11,311,783 to losing), tool.bin +33,493.
+            //
+            // So the length-3 insert in the skip loop costs ~0.13M instructions, not the
+            // ~19M by which `ht.rs` (85.8M) exceeds `ht_matchfinder.h` (66.9M). This
+            // experiment is itself the measurement that settles it.
+            //
+            // THE INFERENCE THAT WAS WRONG, recorded because it is the more useful part:
+            // libdeflate's own profile shows 44% of its matchfinder in `skip_bytes`
+            // (23,478,992 + 6,135,256 of 66,904,754), and I concluded that OUR excess
+            // must therefore also be in the skip path. That does not follow — a vendor's
+            // internal distribution says nothing about where OUR extra work sits. The
+            // valid form is to measure our own split, or to ablate the suspected work and
+            // read the delta, which is what finally happened here.
+            //
+            // The ~19M remains unattributed. Do not guess again: ablate a candidate and
+            // read the delta, the way this note was produced.
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
 
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
