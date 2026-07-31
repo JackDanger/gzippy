@@ -136,6 +136,16 @@ thread_local! {
     static SORT_COUNTERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Reusable buffers for [`make_huffman_code_exact_into`] — the `usize` frequency copy
+    /// package-merge wants and its output bit-length vector. Fresh `Vec`s here were TWO
+    /// heap allocations per Huffman code per block, i.e. four per block, which is exactly
+    /// the per-block allocation `CLAUDE.md` STEP 1 forbids and which
+    /// [`make_huffman_code_into`]'s own doc comment records as the violation that scales.
+    static EXACT_SCRATCH: std::cell::RefCell<(Vec<usize>, Vec<u32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Count-sort symbols by frequency (secondary: symbol value), packing
 /// `sym | (freq << 10)` into `symout`. Zero-frequency symbols get `lens[sym]=0`.
 /// Returns the number of used (nonzero-frequency) symbols.
@@ -542,11 +552,18 @@ pub fn make_huffman_code_exact_into(
         lens[nonzero_idx] = 1;
         return;
     }
-    let freqs_usize: Vec<usize> = freqs.iter().map(|&f| f as usize).collect();
-    let mut bitlens = vec![0u32; num_syms];
-    if super::optimal::length_limited_code_lengths(&freqs_usize, max_len as i32, &mut bitlens)
-        .is_err()
-    {
+    // No per-block allocation (CLAUDE.md STEP 1). Same thread_local pattern as
+    // SORT_COUNTERS above: clear()+resize() reuses capacity after the first block, and each
+    // worker thread gets its own buffers so chunk-independence is untouched.
+    let err = EXACT_SCRATCH.with(|cell| {
+        let (freqs_usize, bitlens) = &mut *cell.borrow_mut();
+        freqs_usize.clear();
+        freqs_usize.extend(freqs.iter().map(|&f| f as usize));
+        bitlens.clear();
+        bitlens.resize(num_syms, 0u32);
+        super::optimal::length_limited_code_lengths(freqs_usize, max_len as i32, bitlens).is_err()
+    });
+    if err {
         build_tree(a, num_used_syms);
         let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
         compute_length_counts(a, num_used_syms - 2, &mut len_counts, max_len);
@@ -554,11 +571,14 @@ pub fn make_huffman_code_exact_into(
         return;
     }
     let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
-    for sym in 0..num_syms {
-        let l = bitlens[sym] as u8;
-        lens[sym] = l;
-        len_counts[l as usize] += 1;
-    }
+    EXACT_SCRATCH.with(|cell| {
+        let (_, bitlens) = &*cell.borrow();
+        for sym in 0..num_syms {
+            let l = bitlens[sym] as u8;
+            lens[sym] = l;
+            len_counts[l as usize] += 1;
+        }
+    });
     len_counts[0] = 0;
     let mut next_codewords = [0u32; MAX_CODEWORD_LEN + 1];
     for len in 2..=max_len {
