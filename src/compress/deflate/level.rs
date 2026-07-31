@@ -86,7 +86,11 @@ pub struct LevelParams {
 /// presets exactly; the strategy mapping substitutes a fallback for the two
 /// strategies not yet implemented in this increment (see the module docs).
 pub fn params(level: u32) -> LevelParams {
-    let p = params_inner(level);
+    #[allow(unused_mut)]
+    let mut p = params_inner(level);
+    // Measurement-only frontier override; compiles to nothing when the feature is off.
+    #[cfg(feature = "ladder-tune")]
+    ladder_tune::apply(&mut p);
     // Report the knobs that were ACTUALLY RESOLVED by the production path, once
     // per process. `fulcrum explain` reads this and asserts it against observed
     // behaviour; without it, the tool would have to keep its own copy of this
@@ -109,6 +113,63 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
             level, p.strategy, p.max_search_depth, p.nice_match_length
         );
     });
+}
+
+/// MEASUREMENT-ONLY level→params override, for deriving our own ladder instead of
+/// inheriting libdeflate's (see the `ladder-tune` feature comment in `Cargo.toml`).
+///
+/// WHY THIS EXISTS. A full T1 size census (`/root/sizeboard-all-12fcd0ed/census.json`,
+/// 22 corpus files x L1-9 x 4 rivals) found that against libdeflate we are an EXACT
+/// BYTE TIE on 154 of 198 cells — 22/22 files at every one of L2, L4, L5, L6, L7, L8,
+/// L9 — because `params_inner` transliterates their preset table. A tie is not a win:
+/// it leaves zero size headroom, so all 109 T4 cells that fail vs libdeflate fail by
+/// exactly the seam growth, with 0 bytes of slack to absorb it. L3 is the ONLY deep
+/// level where we diverge (Lazy where they run Greedy at the same knobs) and it is the
+/// only one where we hold a margin: smaller on 20/22 files, median 44 KB.
+///
+/// The frontier we need — a config that is BOTH smaller and cheaper than their level N
+/// — cannot be read off the vendor's 8 points, because every one of those points is a
+/// choice they made. It has to be measured.
+///
+/// This is NOT a production knob. CLAUDE.md non-negotiable #3 forbids env vars changing
+/// behaviour in the shipped path; the deliverable here is a STATIC table, and the
+/// feature is default-off, marks the binary `+INSTRUMENTED`, and is refused by
+/// `scripts/campaign/board-wall.sh`. Resolved exactly ONCE per process via `OnceLock`
+/// — reading the environment inside a per-position loop previously cost ~1.3 BILLION
+/// instructions and inflated an ablation by 10x.
+#[cfg(feature = "ladder-tune")]
+pub mod ladder_tune {
+    use super::{LevelParams, Strategy};
+
+    /// `GZIPPY_LADDER=<strategy>:<max_search_depth>:<nice_match_length>`,
+    /// e.g. `lazy:12:14`. Absent or unparseable => no override.
+    fn spec() -> Option<(Strategy, u32, u32)> {
+        static S: std::sync::OnceLock<Option<(Strategy, u32, u32)>> = std::sync::OnceLock::new();
+        *S.get_or_init(|| {
+            let raw = std::env::var("GZIPPY_LADDER").ok()?;
+            let mut it = raw.split(':');
+            let strategy = match it.next()? {
+                "fast0" => Strategy::Fast0,
+                "fast" => Strategy::Fast,
+                "greedy" => Strategy::Greedy,
+                "lazy" => Strategy::Lazy,
+                "lazy2" => Strategy::Lazy2,
+                "nearoptimal" => Strategy::NearOptimal,
+                other => panic!("GZIPPY_LADDER: unknown strategy {other:?}"),
+            };
+            let depth = it.next()?.parse().ok()?;
+            let nice = it.next()?.parse().ok()?;
+            Some((strategy, depth, nice))
+        })
+    }
+
+    pub fn apply(p: &mut LevelParams) {
+        if let Some((strategy, depth, nice)) = spec() {
+            p.strategy = strategy;
+            p.max_search_depth = depth;
+            p.nice_match_length = nice;
+        }
+    }
 }
 
 fn params_inner(level: u32) -> LevelParams {

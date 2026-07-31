@@ -863,3 +863,93 @@ Every cheaper approach is now measured and dead:
     CHUNKS_PER_THREAD 2->1   8 closed / 3 opened at L8-L9 — a parameter, still misaligned
     tail guard               monotonically worse (above)
     G5 carry coding state    removes 40 B of flushes; the 1,115 B is not the restarts
+
+## G15 — THE CAGE IS MEASURED: 77.8% of our T1 cells vs libdeflate are EXACT BYTE TIES
+
+Source: `/root/sizeboard-all-12fcd0ed/census.json` (solvency, frozen, 22 corpus files x L1-9 x
+{gzip,pigz,libdeflate,igzip} x T1/T4, 1,320 OK cells, 0 VOID).
+
+    T1 size vs each rival           n    EXACT TIE      we smaller   we bigger
+    gzip                          198     0 ( 0.0%)        182           16
+    pigz                          198     0 ( 0.0%)        188           10
+    igzip                          66     0 ( 0.0%)         63            3
+    libdeflate                    198   154 (77.8%)         27           17
+
+    libdeflate, per level (22 files each):
+      L1  tie  0   smaller  7   bigger 15     <- genuine deficit
+      L2  tie 22   smaller  0   bigger  0
+      L3  tie  0   smaller 20   bigger  2     <- the ONE level we diverged
+      L4  tie 22 | L5 tie 22 | L6 tie 22 | L7 tie 22 | L8 tie 22 | L9 tie 22
+
+`level.rs::params_inner` transliterates libdeflate's preset table, so at L2 and L4-L9 we run
+their strategy at their `max_search_depth` and their `nice_match_length` and emit their exact
+bytes on every file. L3 is the only deep level we changed (Lazy where they run Greedy at the
+same knobs) and it is the only one holding a margin: smaller on 20/22, median 44 KB.
+
+### Why this is the whole T4 story
+
+A tie is not a win — it is zero headroom. Of the 200 failing cells:
+
+    109  T4 fails / T1 passes vs libdeflate   deficit == T4-T1 growth EXACTLY, on all 109,
+                                              with T1 headroom = 0 bytes on all 109
+     29  L1 vs libdeflate                     genuine T1 deficit (15 T1 + 14 T4)
+     58  gzip/pigz/igzip                      genuine T1 deficit (T1 count == T4 count)
+      4  L3 vs libdeflate
+
+The 109 do not need a big size win. Their deficits are min 2 / median 255 / max 2,093 bytes —
+on sil40 that is 0.007%. ANY margin above ~0.01% closes all 109 at once.
+
+### The frontier is measured, and the parse-strategy route does not reach it
+
+`ladder-tune` (this PR) makes the level->params map overridable so the frontier can be
+observed rather than inherited. Validated three ways before use: L4 forced to `lazy:12:14`
+is byte-identical to real L3; forcing a level to its own values is a no-op; unset is inert.
+
+LAW FOUND (holds at every level tested): at a FIXED depth, the stronger parse strategy is
+strictly smaller. libdeflate spends depth where it should have spent a defer.
+
+    L2  their Greedy(6,10)     lazy:4:10     smaller on 4/4 at 2/3 their depth
+    L4  their Greedy(16,30)    lazy:8:30     smaller on 4/4 at HALF their depth
+    L5  their Lazy(16,30)      lazy2:16:30   smaller on 4/4 at equal depth
+    L6  their Lazy(35,65)      lazy2:35:65   smaller on 4/4 at equal depth
+
+BUT THE WALL DOES NOT PAY FOR IT. Wall slack vs libdeflate, T1, sil40, VANILLA build
+(hyperfine, 5 runs, both arms to /dev/null):
+
+    L2 ratio 1.044 WE LOSE | L4 0.998 tie | L5 1.038 WE LOSE | L6 0.956 +4.4% | L7 0.922 +7.8%
+
+    L4  lazy:8:30    +7.7% wall  (half depth still costs MORE than greedy at full depth --
+                                  lazy's overhead is per-POSITION, not per-probe)
+    L6  lazy2:35:65  +9.29% wall vs 4.4% slack   EXCEEDS
+    L6  lazy2:24:65  free, but winexe.exe -0.183%  FAILS SIZE
+    L7  lazy2:100:130 +11.02% vs 7.8% slack      EXCEEDS
+    L7  lazy2:70:130  +1.96%, but winexe.exe -0.103%  FAILS SIZE
+
+The binding file is a BINARY (winexe.exe), and the depth response is monotone with no
+crossing inside the budget:
+
+    L6 winexe vs libdeflate-6 by lazy2 depth:
+      24 -0.183%   28 -0.141%   30 -0.078%   32 -0.022%   35 +0.002%
+      cost at depth 24: free           cost at depth 35: +9.29%      slack: 4.4%
+
+Trading `nice_match_length` down to buy the time back is worse still: at L6, nice 50 and 40
+put data.json at -0.188% and -2.505%.
+
+FALSIFIED: the parse-strategy upgrade cannot fund the margin at L2/L4/L5/L6/L7. Every
+configuration that is smaller on all files costs more wall than we have.
+
+### What this implies — the margin must be ENCODER-SIDE
+
+The margin needed is ~0.01%, it is needed at SEVEN levels at once, and it must cost
+essentially zero wall. The parse is the wrong place to buy it: every parse improvement scales
+its cost with search effort. An ENCODING improvement (block-boundary choice, length-limited
+Huffman construction, code-length RLE) is paid once per block, not once per position, and
+would move all seven tied levels simultaneously -- INCLUDING L8/L9, where no stronger parse
+strategy exists below NearOptimal and the parse route is therefore not merely too expensive
+but unavailable.
+
+CAVEAT ON THESE MARGINS: measured on the local M1 with the local libdeflate build, where our
+BASE is within +-0.05% of libdeflate rather than exactly equal. The frontier SHAPE (strategy
+dominance at fixed depth, depth monotonicity, the sign of the wall costs) is what this
+section claims. Any absolute margin must be re-measured on solvency against the frozen rival
+before it gates anything.
