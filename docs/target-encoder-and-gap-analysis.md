@@ -601,3 +601,49 @@ then re-attempt the synthesis on top of it.
 
 **NOT BUILT.** Stated plainly so the next session does not mistake a located mechanism
 for a validated one.
+
+## G10 — THE L5-L7 DEPTH LEVER IS BLOCKED BY THE COST MODEL, NOT BY SEARCH (measured 2026-07-31)
+
+Matching zlib-ng's chain depths at **L5/L6/L7 only** (32/128/256; L8/L9 deliberately untouched)
+closes **65** failing size cells and flips **7**. Board artifact `/root/size-L567/`, 396 cells,
+0 VOID. Scoping to L5-L7 also removes the wall catastrophe that made the L5-L9 version NO-SHIP
+(`data.csv` L9 went 0.98s -> 2.39s at depth 4096; at L9 we already emit libdeflate's EXACT
+output while being faster than it, so there was never anything to win there).
+
+The 7 flips have one signature: **libdeflate, T1, near-incompressible data, and our baseline is
+BYTE-IDENTICAL to libdeflate.**
+
+    dd79_bin6           L5  4,461,731 -> 4,461,736      L6  4,461,731 -> 4,461,732
+    movie.mp4           L5 12,890,419 -> 12,890,473     L6 12,890,404 -> 12,890,464
+    photo.jpg           L7  6,472,036 -> 6,472,041
+    weights.safetensors L5 83,113,545 -> 83,113,685     L7 83,113,840 -> 83,113,842
+
+### The mechanism, measured — it is HUFFMAN, not the matchfinder
+
+`anatomy-counters`, movie.mp4 at L6, depth 35 vs depth 128:
+
+    literals_emitted          12,762,619  ->  12,762,598   (-21)
+    matches_emitted               47,029  ->      46,969   (-60)
+    match_length_bytes_total     179,638  ->     179,659   (+21)
+
+Deeper search emits **81 FEWER symbols** and covers **more input with matches** — strictly better
+by every match-finding metric — and the output is **60 bytes BIGGER**.
+
+So the loss is not in finding matches; it is in CODING them. On near-incompressible input the
+handful of matches present is what skews the litlen/dist distributions. Replacing 60 short
+matches with slightly longer ones flattens those distributions, and the extra bits-per-symbol
+exceed the symbols saved. We accept a longer match because it is longer, never asking whether
+it is CHEAPER IN BITS.
+
+### What follows
+
+* **No amount of parameter tuning fixes this.** Depth, `nice_match_length` and zlib's
+  `good_match` brake were each measured; none restores the flips (`good_match` makes
+  `data.csv` L9 worse, and changes output even at stock depth, so it is not free).
+* **The fix is cost-based match acceptance** — compare the bit cost of the match against the
+  literals it replaces, using the running symbol frequencies we already maintain in `Sink`.
+  That is what `near_optimal` does at L10-12 and what zlib-ng's `deflate_medium` does with its
+  deferred-match arithmetic. It is vendor-precedented twice and needs no content detection.
+* **Do not re-run the depth sweep before the cost model exists.** The size verdict is banked:
+  65 closed / 7 flipped at L5-L7, wall-neutral. The lever is worth 65 cells the day acceptance
+  becomes cost-aware, and clause 3 blocks it until then.
