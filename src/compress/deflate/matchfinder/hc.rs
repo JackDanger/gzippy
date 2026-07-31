@@ -73,6 +73,23 @@ impl HcLocalCounters {
 pub const HC_HASH3_ORDER: u32 = 15;
 pub const HC_HASH4_ORDER: u32 = 16;
 
+/// How many candidates to walk in the LENGTH-3 chain.
+///
+/// zlib and gzip hash three bytes into their single table and chain it through `prev[]`;
+/// ours was a SINGLETON (one position per 3-byte key). Measured on dd79_bin6 at L2, 64%
+/// of our matches came out of that one-deep table while gzip found 27% MORE matches with
+/// a SHALLOWER 4-byte chain — deepening a 4-byte chain cannot find what a 3-byte chain
+/// finds.
+///
+/// Depth sweep, exact bytes, `-p1` (d=1 reproduces the old singleton byte-for-byte, which
+/// is the control):
+///     dd79_bin6   L2  4,500,757 -> 4,496,288 (d=4)   L3  4,461,737 -> 4,450,433
+///     data.sqlite L2 14,865,280 -> 14,864,898        L3 12,678,753 -> 12,677,986
+///     dickens     L2/L3 UNCHANGED — on text the 4-byte chain already reaches
+///                 `best_len >= 3`, so this path is not taken and costs nothing.
+/// Gains saturate at 4; d=8 is identical or a byte worse.
+pub const HC_HASH3_CHAIN_DEPTH: u32 = 4;
+
 const HASH3_SIZE: usize = 1 << HC_HASH3_ORDER;
 const HASH4_SIZE: usize = 1 << HC_HASH4_ORDER;
 
@@ -95,6 +112,16 @@ pub struct HcMatchfinder {
     hash4_tab: [i16; HASH4_SIZE],
     /// `next_tab[pos]` = the node following `pos` in its chain.
     next_tab: [i16; WINDOW_SIZE],
+    /// `next3_tab[pos]` = the node following `pos` in its LENGTH-3 chain.
+    ///
+    /// zlib and gzip hash THREE bytes into their single table and chain it through
+    /// `prev[]`, so they can walk many length-3 candidates. Ours was a SINGLETON — one
+    /// position per 3-byte key, no chain — while `next_tab` chained only the 4-byte hash.
+    /// Measured on dd79_bin6 at L2: 64% of our matches (744,797 of 1,168,118) came out of
+    /// that one-deep table, and gzip found 27% MORE matches with a SHALLOWER 4-byte chain
+    /// (its chain 4 vs our depth 6). Deepening a 4-byte chain cannot find what a 3-byte
+    /// chain finds. A position lives in both chains, so it needs its own successor slot.
+    next3_tab: [i16; WINDOW_SIZE],
 }
 
 thread_local! {
@@ -167,6 +194,10 @@ impl HcMatchfinder {
             for i in 0..HASH4_SIZE {
                 h4.add(i).write(MATCHFINDER_INITVAL);
             }
+            let n3 = core::ptr::addr_of_mut!((*p).next3_tab) as *mut i16;
+            for i in 0..WINDOW_SIZE {
+                n3.add(i).write(MATCHFINDER_INITVAL);
+            }
             let nt = core::ptr::addr_of_mut!((*p).next_tab) as *mut i16;
             for i in 0..WINDOW_SIZE {
                 nt.add(i).write(MATCHFINDER_INITVAL);
@@ -183,6 +214,7 @@ impl HcMatchfinder {
         self.hash3_tab.fill(MATCHFINDER_INITVAL);
         self.hash4_tab.fill(MATCHFINDER_INITVAL);
         self.next_tab.fill(MATCHFINDER_INITVAL);
+        self.next3_tab.fill(MATCHFINDER_INITVAL);
     }
 
     /// Pooled equivalent of [`Self::new`]: hands back a `HcMatchfinder` reset
@@ -215,6 +247,7 @@ impl HcMatchfinder {
         matchfinder_rebase(&mut self.hash3_tab[..]);
         matchfinder_rebase(&mut self.hash4_tab[..]);
         matchfinder_rebase(&mut self.next_tab[..]);
+        matchfinder_rebase(&mut self.next3_tab[..]);
     }
 
     /// Find the longest match longer than `best_len_in` at `in_next`.
@@ -307,6 +340,7 @@ impl HcMatchfinder {
                 *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
                 *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
                 *self.next_tab.get_unchecked_mut(cur_pos) = cur_node4;
+                *self.next3_tab.get_unchecked_mut(cur_pos) = cur_node3;
                 (cur_node3, cur_node4)
             };
 
@@ -345,17 +379,38 @@ impl HcMatchfinder {
                         break 'search;
                     }
                     if best_len < 3 {
-                        let mp = (in_base_v as isize + cur_node3 as isize) as usize;
-                        // SAFETY: `cutoff < cur_node3` so `mp < in_next`, and it points
-                        // into processed input; the u24 load reads 4 bytes at `mp` and
-                        // `mp + 4 <= in_next + 4 <= buf.len()`.
-                        let cand = unsafe {
-                            debug_assert!(mp < in_next && mp + 4 <= blen);
-                            load_u24(base, mp)
-                        };
-                        if cand == seq4 & 0xFF_FFFF {
-                            best_len = 3;
-                            best_matchptr = mp;
+                        // WALK the length-3 chain instead of probing its head only.
+                        // Depth is env-gated for measurement; 1 reproduces the old
+                        // singleton behaviour exactly.
+                        let mut node3 = cur_node3;
+                        let mut left = HC_HASH3_CHAIN_DEPTH;
+                        loop {
+                            let mp = (in_base_v as isize + node3 as isize) as usize;
+                            // SAFETY: `cutoff < node3` so `mp < in_next`, and it points
+                            // into processed input; the u24 load reads 4 bytes at `mp`
+                            // and `mp + 4 <= in_next + 4 <= buf.len()`.
+                            let cand = unsafe {
+                                debug_assert!(mp < in_next && mp + 4 <= blen);
+                                load_u24(base, mp)
+                            };
+                            if cand == seq4 & 0xFF_FFFF {
+                                best_len = 3;
+                                best_matchptr = mp;
+                                break;
+                            }
+                            left -= 1;
+                            if left == 0 {
+                                break;
+                            }
+                            // SAFETY: masked chain index `< next3_tab.len()`.
+                            node3 = unsafe {
+                                *self
+                                    .next3_tab
+                                    .get_unchecked((node3 as u16 & WINDOW_MASK) as usize)
+                            };
+                            if (node3 as i32) <= cutoff {
+                                break;
+                            }
                         }
                     }
 
