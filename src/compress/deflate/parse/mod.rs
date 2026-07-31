@@ -524,7 +524,7 @@ pub(super) fn compress(
             buf,
             data_start,
             in_end,
-            &statics,
+            statics,
             bw,
             is_last,
             fast::FAST0_BLOCK_LENGTH,
@@ -635,7 +635,7 @@ pub(super) fn compress(
             buf,
             data_start,
             in_end,
-            &statics,
+            statics,
             bw,
             is_last,
             fast::FAST_BLOCK_LENGTH,
@@ -649,7 +649,7 @@ pub(super) fn compress(
                 buf,
                 data_start,
                 in_end,
-                &statics,
+                statics,
                 bw,
                 is_last,
                 t.block_length,
@@ -657,16 +657,14 @@ pub(super) fn compress(
                 t.insert_depth,
             )
         }
-        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw, is_last),
-        Strategy::Lazy => lazy::run(
-            buf, data_start, in_end, params, &statics, bw, false, is_last,
-        ),
-        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true, is_last),
+        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),
+        Strategy::Lazy => lazy::run(buf, data_start, in_end, params, statics, bw, false, is_last),
+        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, statics, bw, true, is_last),
         // DETECTOR-GATED LAZY-L3 (`l3-tune` feature): see `gated.rs`'s module
         // doc comment. `level.rs`'s L3 arm is the only producer of this
         // strategy; not reachable from a default (non-`l3-tune`) build.
         Strategy::NearOptimal => {
-            near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
+            near_optimal::run(buf, data_start, in_end, params, statics, bw, is_last)
         }
     }
 }
@@ -797,7 +795,7 @@ pub(super) fn parse_resumable(
     let statics = StaticCodes::get();
     match params.strategy {
         Strategy::Greedy => greedy::run_resumable(
-            buf, state, from, in_end, params, &statics, bw, role, input_mode,
+            buf, state, from, in_end, params, statics, bw, role, input_mode,
         ),
         Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
             buf,
@@ -805,7 +803,7 @@ pub(super) fn parse_resumable(
             from,
             in_end,
             params,
-            &statics,
+            statics,
             bw,
             matches!(params.strategy, Strategy::Lazy2),
             role,
