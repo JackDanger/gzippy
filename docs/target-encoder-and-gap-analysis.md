@@ -1619,3 +1619,28 @@ METHOD NOTE. This is the fifth claim of mine this session that measurement retra
 second where an INFERRED constant stood in for a measured one. The rule that caught it is the
 one already in CLAUDE.md — a gate may only cite a dataset that exists — and the fix each time
 was to add the counter rather than to argue about the constant.
+
+## G28 — the decomposition CONFIRMED on the frozen box (first authoritative board data this session)
+
+Every board number above this line was measured on the local M1. The base arm of the solvency
+wall run re-measures `origin/main` on the frozen authority, and the structure holds:
+
+    440 decidable cells (22 files x L2/L6/L9 x T1/T4 x 4 rivals; 88 ABSENT = igzip gaps)
+     68 failing on size (15.5%; the full L1-9 board is 200/1320 = 15.2% — consistent)
+
+    failing by rival and thread count:
+      libdeflate  T4   48      <- 70.6% of ALL failures
+      gzip        T1    6      gzip  T4   6
+      pigz        T1    4      pigz  T4   4
+      libdeflate  T1    0      <- we tie or beat libdeflate at EVERY T1 cell here
+
+`libdeflate T1 = 0` and `libdeflate T4 = 48` is the zero-headroom structure stated directly:
+at T1 we match or beat them everywhere in this level set, and every libdeflate failure is a
+T>1 cell where the seam pushes us over a tie. That is G15's finding, re-derived on the
+authority box from an independent run rather than inherited from the frozen census.
+
+It also sets the honest scale for what has been achieved: the T>1-vs-libdeflate class is
+70.6% of the board, the Huffman margin closes the handful of its cells whose seam is small
+enough (5 on the LOCAL corpus; the solvency verdict is still pending and already disagrees on
+at least one — `movie.mp4 L9 T4` shows us 19 B BIGGER there), and the remaining ~43 need the
+seam itself to go to zero.
