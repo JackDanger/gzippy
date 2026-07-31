@@ -91,7 +91,7 @@ pub(super) fn run_resumable(
     role: BlockRole,
     input_mode: InputMode,
 ) -> usize {
-    let mut sink = Sink::new();
+    let mut sink = Sink::acquire();
     // See `greedy.rs`'s sibling declaration: one scratch per call, reused
     // across every internal block.
     let mut header_scratch = HeaderScratch::new();
