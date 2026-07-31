@@ -89,6 +89,56 @@ histogram. The first is 5 bytes; the other two are the expensive ones. See **G5*
 
 ---
 
+## 1.5 THE WALL BOARD, measured at last (2026-07-30) — the only wall front is libdeflate at T1
+
+`fulcrum board wall`, frozen solvency (AMD EPYC 7282, boost=0, governor=performance,
+tenants SIGSTOPped and restored), paired interleaved, per-pair median, n=9, /dev/null
+sink, pin-gated. Scope declared: all 22 squishy members including `sil40`, **L6** (the
+level a drop-in user gets by default), T1 and T4, all four rivals. 160 declared cells.
+Artifact `/root/wallboard-L6/census.json`.
+
+    measured_ok 75    ABSENT 40    VOID 45    slower 19
+
+| rival | slower / measured |
+|---|---|
+| gzip | **0 / 20** |
+| pigz | **0 / 36** |
+| igzip | **0 / 0** (ABSENT — its CLI has no L6) |
+| **libdeflate** | **19 / 19 — every single one, and every one at T1** |
+
+**We beat gzip and pigz on every cell measured, usually by a lot** — gzip:ecoli.fastq
+0.1762, pigz:ecoli.fastq 0.2454, gzip:aozora.txt 0.2506, gzip:engine.wasm 0.2864. Three to
+five times faster.
+
+**And we lose to libdeflate on all 19 of its measurable cells, all at T1**, from 1.0433
+(access.log) to 1.2274 (photo.jpg), median ~1.10.
+
+So the wall front and the size front are THE SAME FRONT: libdeflate holds 142 of the 198
+failing size cells and 19 of 19 losing wall cells. **The campaign's entire remaining
+problem is libdeflate, and at T1.** gzip, pigz and igzip are not wall fronts at L6 at all.
+
+### The 45 VOIDs are an instrument limit, not a result — and it is a real gap
+
+41 of them read `pin-gate FAIL: ours cpu%=~400 (ok=true) rival cpu%=100.0 (ok=false)`.
+That is the gate working exactly as documented — it VOIDs a cell whose arm did not reach
+the declared concurrency — but the arm that missed is the RIVAL, and it missed because
+**gzip and libdeflate are single-threaded and have no `-p` flag to give them.** Every
+T>1 cell against a single-threaded rival therefore VOIDs, permanently.
+
+That is a genuine hole in the goal's coverage: "along every thread count" cannot be
+scored against gzip or libdeflate as the gate stands. The user-facing question is
+wall-clock at each tool's own default — a user types `gzip -6` and gets one thread,
+types `gzippy -6` and gets many — so the comparison is meaningful even though the
+concurrencies differ. Resolving it needs a declared-asymmetry mode in `wallcensus`
+(rival is structurally single-threaded, record it and score anyway) rather than a VOID.
+Until then, the T>1 wall board covers pigz only.
+
+The 4 remaining VOIDs are `aa_bias` (0.0030-0.0089) — the harness's own A/A certificate
+refusing cells where the two arms disagreed with themselves. That is the gate working
+and needs no fix.
+
+---
+
 ## 2. The gaps, ranked by structural distance
 
 ### G1 — L1: we are ALREADY the instruction champion and still lose on ratio. **Reframed 2026-07-30.**
