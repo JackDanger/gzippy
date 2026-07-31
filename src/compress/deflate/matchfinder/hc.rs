@@ -401,8 +401,25 @@ impl HcMatchfinder {
                     {
                         local.chain_reads += 1;
                     }
+                    // CHAIN BASE, hoisted out of the walk to free a register.
+                    //
+                    // The walk used to compute `matchptr = in_base_v + cur_node4` and then
+                    // `load_u32(base, matchptr)` — TWO adds, with `base` and `in_base_v`
+                    // both live across every iteration. Folding them into one pointer
+                    // leaves ONE add and ONE live value.
+                    //
+                    // A register-pressure fix, NOT a load hoist — the distinction matters
+                    // because load hoisting is falsified twice in this file. cg_annotate on
+                    // 6,000,000 B of dickens at L6 T1 attributed 30,311,345 DATA READS to
+                    // `matchptr = (in_base_v as isize + ...)`, a line that is an ADD OF TWO
+                    // LOCALS and should carry none. `in_base_v` was ALREADY a local, so this
+                    // was never aliasing and no by-value signature change could reach it.
+                    //
+                    // SAFETY: `wrapping_add` never dereferences; every load below is at
+                    // `cur_node4 > cutoff`, i.e. exactly the addresses the old `matchptr`
+                    // form produced, whose bounds the SAFETY note there covers.
+                    let chain_base = base.wrapping_add(in_base_v);
                     loop {
-                        matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                         // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
                         // A `prefetch_read` of the next chain node used to sit
                         // here, one iteration ahead. It was a net LOSS: it cost
@@ -421,9 +438,16 @@ impl HcMatchfinder {
                         // ship to.
                         // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
                         // `matchptr + 4 <= in_next + 4 <= buf.len()`.
+                        // SAFETY: as the chain_base note above.
                         let cand = unsafe {
-                            debug_assert!(matchptr < in_next && matchptr + 4 <= blen);
-                            load_u32(base, matchptr)
+                            #[cfg(debug_assertions)]
+                            {
+                                let mp = (in_base_v as isize + cur_node4 as isize) as usize;
+                                debug_assert!(mp < in_next && mp + 4 <= blen);
+                            }
+                            u32::from_le(core::ptr::read_unaligned(
+                                chain_base.wrapping_offset(cur_node4 as isize) as *const u32,
+                            ))
                         };
                         #[cfg(feature = "anatomy-counters")]
                         {
@@ -456,7 +480,9 @@ impl HcMatchfinder {
                         }
                     }
 
-                    // Found a length-4 match; extend it fully.
+                    // Found a length-4 match; extend it fully. `matchptr` is materialised
+                    // HERE, once, instead of on every walk iteration.
+                    matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                     best_matchptr = matchptr;
                     best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
                     #[cfg(feature = "anatomy-counters")]
@@ -496,6 +522,33 @@ impl HcMatchfinder {
                 {
                     local.chain_reads += 1;
                 }
+                // FALSIFY 2026-07-30 (FALSIFIED) — do NOT apply the `chain_base` hoist to
+                // THIS walk. It WINS on the length-4 walk above and LOSES here, and the
+                // difference is instructive.
+                //
+                // Same transformation, one loop lower: hoist `base + in_base_v` out, index
+                // the candidate by `cur_node4`, materialise `matchptr` only on a hit.
+                // Output byte-identical. Measured, 6,000,000 B of dickens at L6 T1:
+                //     hc.rs Dr    108,282,726 -> 86,198,253    (-20.4%)
+                //     program Dr  161,009,178 -> 142,887,715   (-11.3%)
+                //     program Dw   52,744,347 -> 58,688,632    (+11.3%)   <- the tell
+                // Frozen paired wall (solvency, n=15, /dev/null both arms) came back
+                // SLOWER: photo.jpg 1.0567, armexe.elf 1.0119, tool.bin 1.0095, dickens
+                // 1.0085, geomean ~1.012. photo.jpg is the file the length-4 hoist made
+                // 5.6% FASTER, so this is not noise and not the same effect twice.
+                //
+                // MECHANISM, legible in the counters: the reads did not vanish, they became
+                // STORES. Deferring `matchptr` keeps `cur_node4` live across a longer region
+                // in a loop that ALREADY needs `best_len`, `off`, `n_hi` and `n_lo`, and the
+                // allocator paid for it in spill writes. The length-4 walk has a much
+                // smaller live set, which is exactly why the identical change wins there.
+                // The transformation is not what matters; the live-set budget of the
+                // specific loop is.
+                //
+                // GENERAL: a -20% READ count in a matchfinder does not imply a faster wall.
+                // Two independent instances now — this, and the u32-packed bucket in
+                // `matchfinder::ht` (-26.7% writes, zero wall movement). Any counter-only
+                // argument here needs a frozen paired wall run before it is believed.
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
