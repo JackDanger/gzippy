@@ -1447,3 +1447,47 @@ That is the design the evidence supports: NOT "the consumer emits everything", b
 consumer owns only the seam blocks". Still unattempted, and still the only route to the 109
 cells — but it is now a bounded change to the boundary handling rather than a rewrite of the
 emission path.
+
+## G25 — "recover the grid cost by scheduling" is NOT available: 8 chunks is already the optimum
+
+#226's next-step list said the one-chunk-per-thread grid's ~11.4% wall could be recovered by
+scheduling rather than by widening the grid back. Measured (sil40 40,000,000 B, L9, T4,
+hyperfine n=5 warmup 1, /dev/null, local M1):
+
+    grid                    wall       user       CPU% (user/wall)
+    8 chunks (default)     0.3258 s   1.5386 s      472%
+    4 chunks (1/thread)    0.3639 s   1.5763 s      433%
+    16 chunks (-b 2.5M)    0.3585 s   1.5708 s      438%
+
+USER TIME IS FLAT (+2.4% from 8 to 4 chunks) while WALL rises 11.7%, so the regression is
+parallel efficiency, not extra work — that much of the #226 framing was right.
+
+BUT 8 CHUNKS IS ALREADY THE OPTIMUM, IN BOTH DIRECTIONS. 16 chunks is also slower (0.3585)
+than 8 (0.3258): past a point, per-chunk matchfinder warm-up costs more than the balance it
+buys. And below it, four uneven work units cannot be balanced across four threads by ANY
+scheduler — there is nothing to steal. `CHUNKS_PER_THREAD = 2` is not an untuned default; it
+is the measured peak.
+
+So the seam/balance conflict is structural, not a scheduling bug:
+  - few chunks  -> few seams, poor balance   (4 chunks: -66 B but +11.7% wall)
+  - many chunks -> good balance, many seams  (8 chunks: +1,115 B, best wall)
+and no chunk COUNT escapes it, because the chunk is simultaneously the scheduling unit and
+the coding unit.
+
+### Everything now converges on the same fix
+
+Three independent lines have arrived at the same place:
+  G24  grid tuning cannot reach a zero seam residual
+  G25  scheduling cannot recover the cost of a low chunk count (this section)
+  G24a the naive "consumer emits everything" is disqualified (11.2% serial -> T16 caps 5.96x)
+
+What survives all three is the NARROW form: keep the 8-chunk grid for scheduling, and have the
+CONSUMER own only the ~(T-1) blocks that span a chunk boundary — 3 of 916 blocks at T4, a
+~0.3% serial fraction. That decouples the scheduling unit from the coding unit, which is the
+single assumption every dead end above shares.
+
+Combined with the #226 composition (dual-candidate Huffman margin), the arithmetic then reads:
+seam ~0 instead of +62 B, and 122-166 B of margin still in hand — with the 8-chunk grid's
+wall, not the 4-chunk grid's.
+
+NOT ATTEMPTED. It is the only route left to the 109 zero-headroom cells.
