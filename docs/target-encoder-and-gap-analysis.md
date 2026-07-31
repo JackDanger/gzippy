@@ -1420,3 +1420,30 @@ DO NOT change the DEFAULT grid on the strength of this. `pipelined_block_size`'s
 record requires a deliberate variation gated on BOTH axes, and CHUNKS_PER_THREAD 2->1 was
 already tried and scored 8 cells closed / 3 opened. The 9.5% wall here is a single file at a
 single level on a non-frozen box.
+
+### G24a — the NAIVE form of route (2) is disqualified by a measured Amdahl bound
+
+Route (2) as previously sketched (adversarial review, and repeated in the G14 seam notes) was
+"workers emit parse artifacts; the CONSUMER owns final bitstream emission". Price it with the
+profile rather than adopting it: `emit_sequences` is 63,180,388 Ir of 562,981,991 = 11.2% of
+the program (trainer, L2, 8 MB; and libdeflate's counterpart `deflate_flush_block` is
+64,280,257, so this is not a gzippy inefficiency — it is what emission costs).
+
+Making that 11.2% serial:
+
+    T4  -> 2.99x of 4x ideal      T8 -> 4.48x of 8x      T16 -> 5.96x of 16x
+
+At T16 the wall would lose roughly a factor of 2.7. That trades 109 SIZE cells for a wall
+regression across every T8/T16 cell on the board — a strictly worse deal, and clause 3 forbids
+the pass->fail flips it would cause.
+
+WHAT SURVIVES IS THE NARROW FORM. The cross-chunk coordination is only needed where a block
+SPANS a chunk boundary — measured at 3 extra headers over 916 blocks at T4 (G14). So only
+~(T-1) blocks need the consumer to own their table and boundary; the other ~900 stay
+worker-local and fully parallel. Serial fraction becomes ~0.3% rather than 11.2%, and Amdahl
+at T16 is then ~15.5x instead of 5.96x.
+
+That is the design the evidence supports: NOT "the consumer emits everything", but "the
+consumer owns only the seam blocks". Still unattempted, and still the only route to the 109
+cells — but it is now a bounded change to the boundary handling rather than a rewrite of the
+emission path.
