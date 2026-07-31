@@ -97,14 +97,17 @@ sink, pin-gated. Scope declared: all 22 squishy members including `sil40`, **L6*
 level a drop-in user gets by default), T1 and T4, all four rivals. 160 declared cells.
 Artifact `/root/wallboard-L6/census.json`.
 
-    measured_ok 75    ABSENT 40    VOID 45    slower 19
+    measured_ok 111   ABSENT 40    VOID 9    slower 19
 
-| rival | slower / measured |
-|---|---|
-| gzip | **0 / 20** |
-| pigz | **0 / 36** |
-| igzip | **0 / 0** (ABSENT — its CLI has no L6) |
-| **libdeflate** | **19 / 19 — every single one, and every one at T1** |
+| rival | T1 | T4 |
+|---|---|---|
+| gzip | 0 slower / 18 | **0 slower / 19** — worst ratio 0.1941, i.e. 5x faster |
+| pigz | 0 slower / 16 | **0 slower / 20** |
+| igzip | ABSENT (its CLI has no L6) | ABSENT |
+| **libdeflate** | **19 slower / 19** | **0 slower / 19** — 0.3052 to 0.5693, i.e. 2-3x faster |
+
+**We are faster on 92 of 111 measured cells.** The 19 losses are ALL libdeflate and ALL
+T1. At T4 we beat libdeflate on every single file, by 2-3x.
 
 **We beat gzip and pigz on every cell measured, usually by a lot** — gzip:ecoli.fastq
 0.1762, pigz:ecoli.fastq 0.2454, gzip:aozora.txt 0.2506, gzip:engine.wasm 0.2864. Three to
@@ -117,7 +120,25 @@ So the wall front and the size front are THE SAME FRONT: libdeflate holds 142 of
 failing size cells and 19 of 19 losing wall cells. **The campaign's entire remaining
 problem is libdeflate, and at T1.** gzip, pigz and igzip are not wall fronts at L6 at all.
 
-### The 45 VOIDs are an instrument limit, not a result — and it is a real gap
+### The VOIDs were an instrument limit — FIXED, and it unlocked 38 cells
+
+First run: 45 VOID of 160, **41 of them** `pin-gate FAIL: ours cpu%=~400 (ok=true) rival
+cpu%=100.0 (ok=false)`. The gate was working as documented, but the arm that missed the
+declared concurrency was the RIVAL, and it missed because **gzip and libdeflate are
+single-threaded and have no `-p` flag to give them.** Every T>1 cell against a
+single-threaded rival VOIDed permanently, so "never lose at any thread count" could not be
+scored against them at all.
+
+Fixed in fulcrum (`rival_is_thread_pinnable` + a `rival_single_threaded` flag declared on
+the cell): a rival with no `{threads}` token in its template is a DECLARED ASYMMETRY, not a
+mis-pinned arm. Our own arm is still gated normally, and a rival that DOES carry
+`{threads}` and misses the window still VOIDs. Re-run: **VOID 45 -> 9, measured 75 -> 111,
+38 declared-asymmetric cells scored for the first time — and every one of them is a win.**
+
+The 9 remaining VOIDs are `aa_bias` — the A/A certificate refusing cells whose arms
+disagreed with themselves. That is the gate working and needs no fix.
+
+### Historical note on the original VOID diagnosis
 
 41 of them read `pin-gate FAIL: ours cpu%=~400 (ok=true) rival cpu%=100.0 (ok=false)`.
 That is the gate working exactly as documented — it VOIDs a cell whose arm did not reach
