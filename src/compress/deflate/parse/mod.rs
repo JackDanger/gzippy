@@ -196,13 +196,36 @@ const SEQ_LEN_MASK: u16 = 0x1FF;
 /// The offset slot starts at bit 9 of [`Seq::length_and_slot`].
 const SEQ_SLOT_SHIFT: u16 = 9;
 
-/// The precomputed RFC 1951 fixed (static) Huffman codes, built once per parse.
+/// The precomputed RFC 1951 fixed (static) Huffman codes.
+///
+/// PROCESS-WIDE, built exactly once — see [`StaticCodes::get`]. These are the FIXED
+/// codes of RFC 1951 section 3.2.6, derived from two compile-time constant frequency
+/// tables, so they are the same bytes on every call, forever.
 struct StaticCodes {
     litcode: HuffmanCode,
     offcode: HuffmanCode,
 }
 
+static STATIC_CODES: std::sync::OnceLock<StaticCodes> = std::sync::OnceLock::new();
+
 impl StaticCodes {
+    /// The process-wide RFC 1951 fixed codes.
+    ///
+    /// STRUCTURAL. `build()` was called on EVERY parser entry — `parse::compress` and
+    /// `parse::compress_resumable` — which is once per streaming pass at T=1 and ONCE PER
+    /// CHUNK at T>1. It runs two full `make_huffman_code` passes (symbol sort, package-merge
+    /// tree build, length-limiting, codeword generation) plus their allocations, to
+    /// reproduce a table that RFC 1951 fixes as a CONSTANT. Same constant frequency tables
+    /// in, same bytes out, every time.
+    ///
+    /// `OnceLock` rather than `thread_local!` (which is what `Sink` and `HcMatchfinder` use)
+    /// because this value is immutable and shared: every parser takes `&StaticCodes` and none
+    /// mutates it, so one process-wide copy is correct and costs one relaxed load per entry
+    /// instead of a per-thread rebuild.
+    fn get() -> &'static StaticCodes {
+        STATIC_CODES.get_or_init(StaticCodes::build)
+    }
+
     fn build() -> Self {
         StaticCodes {
             litcode: make_huffman_code(
@@ -491,7 +514,7 @@ pub(super) fn compress(
     is_last: bool,
     bw: &mut BitWriter,
 ) {
-    let statics = StaticCodes::build();
+    let statics = StaticCodes::get();
     match params.strategy {
         // ACCEL is a const generic (see fast::run's doc comment): `::<true>`
         // (L0) monomorphizes with the scan-step ramp; `::<false>` (L1)
@@ -501,7 +524,7 @@ pub(super) fn compress(
             buf,
             data_start,
             in_end,
-            &statics,
+            statics,
             bw,
             is_last,
             fast::FAST0_BLOCK_LENGTH,
@@ -612,7 +635,7 @@ pub(super) fn compress(
             buf,
             data_start,
             in_end,
-            &statics,
+            statics,
             bw,
             is_last,
             fast::FAST_BLOCK_LENGTH,
@@ -626,7 +649,7 @@ pub(super) fn compress(
                 buf,
                 data_start,
                 in_end,
-                &statics,
+                statics,
                 bw,
                 is_last,
                 t.block_length,
@@ -634,16 +657,14 @@ pub(super) fn compress(
                 t.insert_depth,
             )
         }
-        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, &statics, bw, is_last),
-        Strategy::Lazy => lazy::run(
-            buf, data_start, in_end, params, &statics, bw, false, is_last,
-        ),
-        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, &statics, bw, true, is_last),
+        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),
+        Strategy::Lazy => lazy::run(buf, data_start, in_end, params, statics, bw, false, is_last),
+        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, statics, bw, true, is_last),
         // DETECTOR-GATED LAZY-L3 (`l3-tune` feature): see `gated.rs`'s module
         // doc comment. `level.rs`'s L3 arm is the only producer of this
         // strategy; not reachable from a default (non-`l3-tune`) build.
         Strategy::NearOptimal => {
-            near_optimal::run(buf, data_start, in_end, params, &statics, bw, is_last)
+            near_optimal::run(buf, data_start, in_end, params, statics, bw, is_last)
         }
     }
 }
@@ -771,10 +792,10 @@ pub(super) fn parse_resumable(
     input_mode: InputMode,
     bw: &mut BitWriter,
 ) -> usize {
-    let statics = StaticCodes::build();
+    let statics = StaticCodes::get();
     match params.strategy {
         Strategy::Greedy => greedy::run_resumable(
-            buf, state, from, in_end, params, &statics, bw, role, input_mode,
+            buf, state, from, in_end, params, statics, bw, role, input_mode,
         ),
         Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
             buf,
@@ -782,7 +803,7 @@ pub(super) fn parse_resumable(
             from,
             in_end,
             params,
-            &statics,
+            statics,
             bw,
             matches!(params.strategy, Strategy::Lazy2),
             role,
