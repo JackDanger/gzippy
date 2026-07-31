@@ -429,6 +429,7 @@ pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> Huffma
 /// this path allocates nothing. The arithmetic below is UNCHANGED from the
 /// allocating form — same `sort_symbols`, same tree build, same codeword
 /// generation — so the emitted bytes are identical by construction.
+//
 // FALSIFY (2026-07-31): REPLACING THIS HEURISTIC WITH EXACT PACKAGE-MERGE IS NOT A
 // SIZE LEVER. Do not "upgrade" this builder to `super::optimal`'s exact Katajainen
 // length assignment, and do not add it as a costed second candidate. Both were built
@@ -455,8 +456,15 @@ pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> Huffma
 // heuristic length limiter is ALREADY WITHIN 0.001% OF EXACT. There is no meaningful
 // size left in Huffman code construction, at any wall price. The ~0.01% of margin the
 // zero-headroom cells need is not here -- look at block BOUNDARIES or the parse.
-// REOPEN requires a NEW mechanism, not a faster package-merge: a 0.001% ceiling is not
-// a speed problem.
+// REOPENED 2026-07-31 BY COMPOSITION (branch perf/compose-margin-and-grid). The verdict
+// above judged this candidate ALONE, against T1 wall. Both halves of that framing were
+// wrong for the T>1 board: at T4 the cost is +2.1%, not 10-14% (the per-block work
+// parallelises across threads), and the 0.001% is not meant to be a size win — it is the
+// MARGIN THAT ABSORBS THE T>1 SEAM. 122-166 B of margin against a 62 B residual seam at
+// one-chunk-per-thread is NEGATIVE, and the pair closes 4 of 6 test cells that neither
+// half closes alone. Still not promotable (wall regression, clause 3); see that branch.
+// What DOES stand from the note above: exact-on-data is not exact-on-total, and an
+// UNCONDITIONAL swap opens cells.
 pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u32, freqs: &[u32]) {
     crate::anatomy_count!(huffman_make_code_calls);
     assert_eq!(freqs.len(), num_syms);
@@ -497,6 +505,70 @@ pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u
     let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
     compute_length_counts(a, num_used_syms - 2, &mut len_counts, max_len);
     gen_codewords(a, lens, &len_counts, max_len, num_syms);
+}
+
+/// EXACT (Katajainen package-merge) length assignment, same signature/shape as
+/// [`make_huffman_code_into`] so the two are interchangeable CANDIDATES. Never an
+/// unconditional replacement — see the FALSIFY note below.
+pub fn make_huffman_code_exact_into(
+    out: &mut HuffmanCode,
+    num_syms: usize,
+    max_len: u32,
+    freqs: &[u32],
+) {
+    assert_eq!(freqs.len(), num_syms);
+    assert!(num_syms >= 2);
+    let max_len = max_len as usize;
+    out.lens.clear();
+    out.lens.resize(num_syms, 0);
+    out.codewords.clear();
+    out.codewords.resize(num_syms, 0);
+    let lens = &mut out.lens;
+    let a = &mut out.codewords;
+    let num_used_syms = sort_symbols(freqs, lens, a);
+    if num_used_syms < 2 {
+        let sym = if num_used_syms != 0 {
+            (a[0] & SYMBOL_MASK) as usize
+        } else {
+            0
+        };
+        let nonzero_idx = if sym != 0 { sym } else { 1 };
+        for l in lens.iter_mut() {
+            *l = 0;
+        }
+        a[0] = 0;
+        lens[0] = 1;
+        a[nonzero_idx] = 1;
+        lens[nonzero_idx] = 1;
+        return;
+    }
+    let freqs_usize: Vec<usize> = freqs.iter().map(|&f| f as usize).collect();
+    let mut bitlens = vec![0u32; num_syms];
+    if super::optimal::length_limited_code_lengths(&freqs_usize, max_len as i32, &mut bitlens)
+        .is_err()
+    {
+        build_tree(a, num_used_syms);
+        let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
+        compute_length_counts(a, num_used_syms - 2, &mut len_counts, max_len);
+        gen_codewords(a, lens, &len_counts, max_len, num_syms);
+        return;
+    }
+    let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
+    for sym in 0..num_syms {
+        let l = bitlens[sym] as u8;
+        lens[sym] = l;
+        len_counts[l as usize] += 1;
+    }
+    len_counts[0] = 0;
+    let mut next_codewords = [0u32; MAX_CODEWORD_LEN + 1];
+    for len in 2..=max_len {
+        next_codewords[len] = (next_codewords[len - 1] + len_counts[len - 1]) << 1;
+    }
+    for sym in 0..num_syms {
+        let l = lens[sym];
+        a[sym] = reverse_codeword(next_codewords[l as usize], l);
+        next_codewords[l as usize] += 1;
+    }
 }
 
 #[cfg(test)]
