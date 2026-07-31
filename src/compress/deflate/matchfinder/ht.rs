@@ -400,7 +400,10 @@ impl HtMatchfinder {
         let hash3 = *next_hash3 as usize;
         let next_seq = unsafe { load_u32(base, in_next + 1) };
         *next_hash = lz_hash(next_seq, HT_HASH_ORDER);
-        *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
+        let ablate3 = std::env::var_os("ABLATE_HASH3").is_some();
+        if !ablate3 {
+            *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
+        }
         debug_assert!((*next_hash as usize) < HT_TAB_LEN);
         debug_assert!((*next_hash3 as usize) < HT_HASH3_SIZE);
         // Prefetch the bucket the NEXT position will touch, matching
@@ -419,8 +422,13 @@ impl HtMatchfinder {
         // inserts on some of them would silently degrade over the file.
         debug_assert!(hash3 < HT_HASH3_SIZE);
         // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
-        let cur_node3 = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
-        unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+        let cur_node3 = if ablate3 {
+            cutoff
+        } else {
+            let c = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            c
+        };
 
         // The 4-byte search. `break 'four` rather than `return`, so that a miss
         // falls through to the length-3 check instead of discarding it.
@@ -627,7 +635,9 @@ impl HtMatchfinder {
             //
             // The ~19M remains unattributed. Do not guess again: ablate a candidate and
             // read the delta, the way this note was produced.
-            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            if std::env::var_os("ABLATE_HASH3").is_none() {
+                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            }
 
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
