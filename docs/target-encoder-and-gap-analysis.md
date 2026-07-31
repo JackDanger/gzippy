@@ -1491,3 +1491,44 @@ seam ~0 instead of +62 B, and 122-166 B of margin still in hand — with the 8-c
 wall, not the 4-chunk grid's.
 
 NOT ATTEMPTED. It is the only route left to the 109 zero-headroom cells.
+
+## G26 — RETRACTION of G-note #226's headline: "closes 4 of 6" was chunk-placement luck
+
+#226 reported that dual-candidate Huffman + one-chunk-per-thread closes 4 of 6 test cells.
+Those numbers came from hand-picked `-b` values, and THE SHIPPED GRID CANNOT PRODUCE THEM:
+`pipelined_block_size` rounds (dickens is 12,174,519 B, so one-chunk-per-thread is 3,000,000
+after rounding, not the 3,043,630 I passed to `-b`), and different rounding lands on different
+block boundaries.
+
+Baked in as a shippable default (`CHUNKS_PER_THREAD = 1`, no env, no `-b`):
+
+    file      L   libdeflate(=T1)   T4 shipped   delta   verdict
+    dickens   6      4,539,505       4,539,692    +187   fails
+    dickens   9      4,480,689       4,480,684      -5   CLOSES
+    data.csv  6      3,372,612       3,372,359    -253   CLOSES
+    data.csv  9      3,300,291       3,300,815    +524   fails
+    sil40     6     15,555,063      15,555,612    +549   fails
+    sil40     9     15,452,666      15,452,762     +96   fails
+
+TWO of six, not four — and a DIFFERENT two. The outcome is governed by where chunk boundaries
+fall, not by a mechanism: the margin (122-166 B) is the same order as the seam's variance
+across placements (hundreds of bytes). G24 already showed this (dickens L9: `-b 4M` -41 B but
+`-b 3.04M` +325 B) and I read it as noise rather than as the governing term.
+
+WHAT SURVIVES IS CHEAPER. At the DEFAULT grid (`CHUNKS_PER_THREAD = 2`, the measured wall
+optimum per G25) the Huffman margin ALONE closes the same count:
+
+    data.csv L6   3,372,268 vs  3,372,612  = -344  CLOSES
+    sil40    L6  15,554,873 vs 15,555,063  = -190  CLOSES
+
+2 of 6 for +2.3% wall, against 2 of 6 for +13.7% with the grid change. The grid half costs 6x
+the wall and buys nothing net. CHUNKS_PER_THREAD stays at 2.
+
+The structural point that resurrected the Huffman half still holds — G16 deleted a strict size
+win (49/49 smaller, 0 worse) over a wall cost that is 6x smaller at T4 than the T1 number it
+was judged on. What does NOT hold is the inference that COMPOSITION WITH THE GRID was the
+mechanism. It was placement.
+
+This strengthens G25's conclusion rather than weakening it: a margin this small cannot ride on
+a seam whose size swings by hundreds of bytes with placement. The seam has to be ~0, not merely
+smaller — the narrow "consumer owns the seam blocks" form.
