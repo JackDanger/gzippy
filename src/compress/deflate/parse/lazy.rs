@@ -189,6 +189,32 @@ pub(super) fn run_block(
             next_hashes,
         );
 
+        // FALSIFY 2026-07-31 (FALSIFIED) — do NOT extend the too-far rejection to
+        // length-4. Adding `|| (cur_len == MIN+1 && cur_offset > 16384)` was measured at
+        // L6, vanilla build, and it LOSES badly:
+        //     dickens    4,539,505 -> 4,554,296   (+14,791)
+        //     aozora.txt 4,072,294 ->  4,080,816   (+8,522)
+        //     photo.jpg  6,472,062 ->  6,473,073   (+1,011)
+        //     movie.mp4 12,890,404 -> 12,891,403     (+999)
+        //     data.csv   3,372,612 ->  3,372,536      (-76)  <- the only gain
+        //
+        // WHERE THE IDEA CAME FROM, AND WHY IT WAS WRONG. `fulcrum anatomy ratio map` on
+        // movie.mp4 shows the optimal-parse frontier beating BOTH us and libdeflate by
+        // 10,172 bits, and the winning regions look like:
+        //     ours     (4,18850)@2482408  (3,5796)@2482412       53 bits
+        //     frontier lit x2@2482408     (5,5796)@2482410       41 bits
+        // i.e. the frontier takes two LITERALS over a length-4 match at distance 18,850.
+        // I generalised a blanket distance threshold from that. The frontier was not
+        // applying a threshold — it chose literals BECAUSE IT KNEW a better match sat two
+        // positions later. That is LOOKAHEAD, and no static distance cutoff approximates
+        // it: length-4 matches at moderate distance are highly profitable on text, which
+        // is why dickens loses 14.7 KB.
+        //
+        // GENERAL: a single region from an optimal-parse diff shows you WHAT the optimum
+        // did, never WHY. Reading a rule out of one region and applying it unconditionally
+        // is the same error as generalising a measurement across levels. The frontier's
+        // headroom here is real and is worth 10,172 bits on this file — but it is
+        // reachable only by cost-based lookahead, not by another threshold.
         if cur_len < min_len || (cur_len == DEFLATE_MIN_MATCH_LEN && cur_offset > 8192) {
             // No (usable) match — emit a literal.
             sink.push_literal(buf[in_next]);
