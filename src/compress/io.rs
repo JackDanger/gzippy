@@ -278,6 +278,9 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             args.compression_level as u32,
             opt_config.thread_count,
         );
+        // Honour `-b` ONLY when the user typed it — `block_size` carries a 128 KiB default,
+        // so passing it unconditionally would change every existing T>1 output.
+        encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
         encoder.set_header_info(header_info.clone());
         if args.stdout {
             let out = BufWriter::with_capacity(1024 * 1024, stdout());
@@ -423,6 +426,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                 compression_level,
                 opt_config.thread_count,
             );
+            encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
             encoder.set_header_info(header_info.clone());
             encoder.compress_buffer_pure(input_data, &mut counted)?;
             counted.flush()?;

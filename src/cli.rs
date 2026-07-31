@@ -7,6 +7,11 @@ pub struct GzippyArgs {
     pub files: Vec<String>,
     pub compression_level: u8,
     pub block_size: usize,
+    /// TRUE only when the user actually passed `-b`/`--blocksize`. `block_size` carries a
+    /// 128 KiB default, so the value alone cannot distinguish "user asked for 131072" from
+    /// "never asked" — and the parallel grid must keep its computed default in the latter
+    /// case or every existing output changes. See `compress::pipelined::pipelined_block_size`.
+    pub block_size_explicit: bool,
     pub processes: usize,
     pub decompress: bool,
     pub test: bool,
@@ -64,6 +69,7 @@ impl Default for GzippyArgs {
             files: Vec::new(),
             compression_level: 6,
             block_size: 128 * 1024, // 128KB
+            block_size_explicit: false,
             processes: num_cpus::get().max(1),
             decompress: false,
             test: false,
@@ -234,6 +240,7 @@ impl GzippyArgs {
                             args.compression_level = parse_compression_level(value)?;
                         } else if let Some(value) = arg.strip_prefix("--blocksize=") {
                             args.block_size = parse_block_size(value)?;
+                            args.block_size_explicit = true;
                         } else if let Some(value) = arg.strip_prefix("--processes=") {
                             args.processes = value.parse().map_err(|_| {
                                 GzippyError::invalid_argument(format!(
@@ -313,7 +320,10 @@ impl GzippyArgs {
                                 "--level" => {
                                     args.compression_level = parse_compression_level(value)?
                                 }
-                                "--blocksize" => args.block_size = parse_block_size(value)?,
+                                "--blocksize" => {
+                                    args.block_size = parse_block_size(value)?;
+                                    args.block_size_explicit = true;
+                                }
                                 "--processes" => {
                                     args.processes = value.parse().map_err(|_| {
                                         GzippyError::invalid_argument(format!(
@@ -448,7 +458,10 @@ impl GzippyArgs {
                             };
 
                             match opt_char {
-                                'b' => args.block_size = parse_block_size(&value)?,
+                                'b' => {
+                                    args.block_size = parse_block_size(&value)?;
+                                    args.block_size_explicit = true;
+                                }
                                 'p' => {
                                     args.processes = value.parse().map_err(|_| {
                                         GzippyError::invalid_argument(format!(
