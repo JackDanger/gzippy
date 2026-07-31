@@ -764,3 +764,38 @@ geometry, cost model, block cadence — and closed zero cells. Ten were falsifie
 had the answer in a one-line group-by the whole time. **Before choosing a mechanism, cut the
 failing set by every axis you have (level, rival, thread count, file class) and work the
 largest block.** Thread count was the axis nobody had cut by.
+
+### The seam cost is MISALIGNMENT, not per-seam overhead — vendor-anchored
+
+pigz states its own seam cost in `vendor/pigz/pigz.c:233-240`: each chunk ends with a
+Z_SYNC_FLUSH empty stored block, "a very small four to five byte overhead (average **3.75
+bytes**) to the output for each input chunk", with the previous 32K supplied as a preset
+dictionary (`:248-252`). Its default block is **128 KiB**.
+
+Ours, measured at L9 (exact bytes, `-p1` baseline, local M1 vanilla build):
+
+    file        T2 /seam   T4 /seam   T8 /seam      pigz
+    sil40          76.7      159.3      107.7       3.75
+    dickens         8.3       37.3       35.8       3.75
+    data.csv      177.7      184.0       30.1       3.75
+
+**The cost is NON-MONOTONIC in seam count**: data.csv totals +1,288 B at T4 (7 seams) but
+only +452 B at T8 (15 seams). Twice the seams, a third of the cost. A fixed per-seam
+overhead cannot do that.
+
+So the waste is NOT "we restart the coder N times". It is WHERE THE CUT LANDS. pigz pays
+3.75 bytes because its seam coincides with a 128 KiB block boundary it was going to emit
+anyway — the seam is free by construction, and only the flush is charged. Our chunk boundary
+falls at an arbitrary offset relative to the block grid, so a chunk can end in a runt block
+whose header is not amortised, and the penalty is whatever that misalignment happens to
+break.
+
+`pipelined_block_size` already floors the chunk span to a multiple of `SOFT_MAX_BLOCK_LENGTH`
+— but the drift detector ends blocks EARLY and data-dependently, so actual block boundaries
+are not at multiples of the budget and the alignment is nominal only.
+
+THE STRUCTURAL FIX FOLLOWS, and it is pigz's: make the chunk boundary COINCIDE with a block
+boundary the parser was going to emit anyway, so the seam costs only the flush. That is
+different from CHUNKS_PER_THREAD (fewer seams, each still misaligned) and different from G5
+(carry coding state across the seam). It is the cheapest of the three and it is the one the
+vendor actually ships. NOT YET BUILT.
