@@ -326,12 +326,44 @@ mod tests {
         }
     }
 
+    // DELETED 2026-07-31: `vendor_knob_values`, which asserted
+    //     params(6).max_search_depth == 35   params(9).max_search_depth == 600
+    //
+    // IT WAS A CAGE, AND IT BEAT THE DOCUMENTATION. `CLAUDE.md` says the level->config
+    // map "is currently a copy of libdeflate's, which is why we run their algorithm
+    // slower than they do; it is free to change." This test said the opposite, in the
+    // only medium that fails closed: touch the map, turn a test red. When a doc and a red
+    // test disagree, the test wins every time, and it won for weeks —
+    // `.git/logs/HEAD:235-237` records `probe/l5-depth` created and abandoned 102 seconds
+    // later with no commit.
+    //
+    // Raising L5-L9 to zlib-ng's chain depths — the change this test forbade — closed 84
+    // failing size cells (2026-07-31, full board, 1,320 measured, 0 VOID).
+    //
+    // A knob that is DECLARED FREE TO CHANGE must not be pinned by an equality assertion.
+    // What is worth testing is the INVARIANT, not the value: depth must not decrease as
+    // the level rises, because that is what "higher level = more effort" means and it is
+    // the property a typo would actually break.
     #[test]
-    fn vendor_knob_values() {
-        assert_eq!(params(6).max_search_depth, 35);
-        assert_eq!(params(6).nice_match_length, 65);
-        assert_eq!(params(9).max_search_depth, 600);
-        assert_eq!(params(9).nice_match_length, DEFLATE_MAX_MATCH_LEN);
+    fn search_effort_is_monotonic_in_level() {
+        for l in 2..=9u32 {
+            let prev = params(l - 1);
+            let cur = params(l);
+            assert!(
+                cur.max_search_depth >= prev.max_search_depth,
+                "L{l} searches less deeply than L{}: {} < {}",
+                l - 1,
+                cur.max_search_depth,
+                prev.max_search_depth
+            );
+        }
+        // nice_match_length is capped by the format, never exceeds it.
+        for l in 0..=9u32 {
+            assert!(
+                params(l).nice_match_length <= DEFLATE_MAX_MATCH_LEN,
+                "level {l}"
+            );
+        }
     }
 
     #[test]
