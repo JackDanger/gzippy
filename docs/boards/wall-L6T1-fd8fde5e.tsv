@@ -1,0 +1,45 @@
+rival	corpus	level	threads	status	wall_class	wall_ratio	a_cpu_pct	b_cpu_pct	pin_ok	pin_unmeasurable	a_median_ms	b_median_ms	n	error
+gzip	dickens	6	1	OK	WIN	0.310334	100.1	100.0	true	false	286.7227	916.7504	9	
+pigz	dickens	6	1	OK	WIN	0.339702	100.1	100.0	true	false	286.4484	843.7336	9	
+libdeflate	dickens	6	1	OK	LOSS	1.058195	100.1	100.1	true	false	285.8407	269.9001	9	
+igzip	dickens	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	6	1	OK	WIN	0.249189	100.1	100.0	true	false	262.9123	1054.1232	9	
+pigz	aozora.txt	6	1	OK	WIN	0.279956	100.0	100.0	true	false	263.7506	943.0025	9	
+libdeflate	aozora.txt	6	1	VOID	VOID	1.065265	100.0	100.0	true	false	263.7486	246.0749	9	paired verdict: VOID-aa_bias=0.0052
+igzip	aozora.txt	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	6	1	OK	WIN	0.485048	100.3	100.0	true	false	119.6104	246.5898	9	
+pigz	data.json	6	1	OK	WIN	0.546608	100.2	100.1	true	false	119.6422	219.0191	9	
+libdeflate	data.json	6	1	VOID	VOID	1.090144	100.2	100.2	true	false	120.4051	109.7769	9	paired verdict: VOID-aa_bias=0.0041
+igzip	data.json	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	6	1	OK	WIN	0.441924	100.0	100.0	true	false	360.0005	816.0147	9	
+pigz	data.csv	6	1	OK	WIN	0.491990	100.0	100.0	true	false	360.2013	733.0167	9	
+libdeflate	data.csv	6	1	OK	LOSS	1.067943	100.1	100.0	true	false	359.7362	336.7354	9	
+igzip	data.csv	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	6	1	VOID	VOID	0.303424	100.0	100.0	true	false	393.6445	1300.5164	9	paired verdict: VOID-aa_bias=0.0051
+pigz	data.parquet	6	1	OK	WIN	0.346968	100.0	100.0	true	false	391.9914	1126.2500	9	
+libdeflate	data.parquet	6	1	OK	LOSS	1.073781	100.0	100.0	true	false	393.2379	366.3953	9	
+igzip	data.parquet	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	6	1	OK	WIN	0.426810	100.4	100.2	true	false	62.3080	146.3557	9	
+pigz	minjs.min.js	6	1	OK	WIN	0.472208	100.4	100.2	true	false	62.0029	131.6675	9	
+libdeflate	minjs.min.js	6	1	OK	LOSS	1.119863	100.4	100.3	true	false	62.4409	55.5400	9	
+igzip	minjs.min.js	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	6	1	OK	WIN	0.352920	101.0	100.2	true	false	25.6703	73.0493	9	
+pigz	armexe.elf	6	1	OK	WIN	0.385270	100.9	100.3	true	false	25.7053	66.6599	9	
+libdeflate	armexe.elf	6	1	OK	LOSS	1.138666	100.6	100.7	true	false	25.4442	22.3073	9	
+igzip	armexe.elf	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	6	1	OK	WIN	0.297462	100.0	100.0	true	false	982.9001	3310.9279	9	
+pigz	tool.bin	6	1	OK	WIN	0.333015	100.0	100.0	true	false	983.6397	2935.8725	9	
+libdeflate	tool.bin	6	1	OK	LOSS	1.061565	100.0	100.0	true	false	984.4582	927.1526	9	
+igzip	tool.bin	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	6	1	OK	WIN	0.285707	100.5	100.2	true	false	23.4477	81.7406	9	
+pigz	engine.wasm	6	1	OK	WIN	0.316215	100.6	100.1	true	false	23.4351	73.9549	9	
+libdeflate	engine.wasm	6	1	OK	LOSS	1.124046	100.7	100.7	true	false	23.3400	20.7414	9	
+igzip	engine.wasm	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	6	1	OK	WIN	0.332555	100.6	100.2	true	false	22.3138	67.1941	9	
+pigz	symbols.dwarf	6	1	OK	WIN	0.365235	100.8	100.2	true	false	22.2426	60.6795	9	
+libdeflate	symbols.dwarf	6	1	VOID	VOID	1.149800	101.1	100.5	true	false	22.2778	19.3976	9	paired verdict: VOID-aa_bias=0.0087
+igzip	symbols.dwarf	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	6	1	OK	WIN	0.463047	100.1	100.0	true	false	225.9978	489.8016	9	
+pigz	movie.mp4	6	1	OK	WIN	0.558926	100.1	100.1	true	false	225.7767	404.0448	9	
+libdeflate	movie.mp4	6	1	OK	LOSS	1.122208	100.1	100.1	true	false	225.7908	202.9411	9	
+igzip	movie.mp4	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	

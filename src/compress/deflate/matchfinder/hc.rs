@@ -545,10 +545,46 @@ impl HcMatchfinder {
                 // The transformation is not what matters; the live-set budget of the
                 // specific loop is.
                 //
+                // ⚠ PROVENANCE CORRECTION 2026-07-31, applies to BOTH verdicts above and
+                // to the length-4 hoist that shipped: `photo.jpg` is a GATE member
+                // (`corpus_split.json`), not TUNE. It was quoted as the headline for the
+                // shipped win ("0.9443", "our worst wall cell 1.2274 -> 1.159") and again
+                // here as the tell. No parameter was fitted to it, so no promotion is
+                // void — but the win is WEAKER than it was reported. Recomputed on TUNE
+                // members only: armexe.elf 0.9849, symbols.dwarf 0.9969, aozora.txt
+                // 0.9983, dickens 1.0023, data.csv 1.0081 => geomean 0.9981, i.e. 0.19%,
+                // INSIDE this rig's ~1.5% A/A noise floor, with only armexe.elf arguably
+                // outside it. The 0.9889 figure was carried by the gate file.
+                // Select and headline on TUNE; let GATE only ever confirm.
+                //
                 // GENERAL: a -20% READ count in a matchfinder does not imply a faster wall.
                 // Two independent instances now — this, and the u32-packed bucket in
                 // `matchfinder::ht` (-26.7% writes, zero wall movement). Any counter-only
                 // argument here needs a frozen paired wall run before it is believed.
+                //
+                // NEXT LEVER, FROM A VENDOR DIFF (2026-07-31) — NOT YET BUILT.
+                // The prefilter below is TERM-FOR-TERM libdeflate's (`hc_matchfinder.h`,
+                // "Check for matches of length >= 5"): same four u32 loads, same two
+                // comparisons, same order. So the 1.88x read excess (ours 108,282,726 Dr
+                // vs their 57,593,044, identical D1 misses) is NOT in the comparison
+                // shape. It is in the ADDRESSING MODE one level down:
+                //     libdeflate:  matchptr = &in_base[cur_node4];   // a real pointer
+                //                  load_u32_unaligned(matchptr + best_len - 3)
+                //     ours:        matchptr: usize                  // an INDEX
+                //                  load_u32(base, matchptr + off)  => base.add(idx + off)
+                // Ours keeps `base` live across the ENTIRE walk and pays a two-register
+                // add per load where libdeflate pays one register plus a displacement.
+                // That is the same defect the shipped `chain_base` hoist removed from the
+                // length-4 walk, which is why that hoist won.
+                //
+                // HOW THIS DIFFERS FROM THE FALSIFICATION RECORDED BELOW, which is the
+                // only reason it may be attempted at all: the falsified attempt DEFERRED
+                // materialising `matchptr` to after the walk, which extended `cur_node4`'s
+                // live range and turned reads into spill STORES (+11.3% Dw). libdeflate
+                // materialises the pointer IMMEDIATELY, every iteration, and never extends
+                // anything's live range. Change the TYPE (usize -> *const u8), not the
+                // TIMING. Any attempt must show Dr down AND Dw not up, then a frozen
+                // paired wall run on TUNE members before it is believed.
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;

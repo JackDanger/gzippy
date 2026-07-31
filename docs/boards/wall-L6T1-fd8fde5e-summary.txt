@@ -1,0 +1,28 @@
+WALLCENSUS gzippy_sha256=862548db2c0b commit=fd8fde5e8f5f01a0acf8d8f58109cf8a8052b56c host=Linux x86_64
+  rival gzip         gzip 1.12
+  rival pigz         pigz 2.8
+  rival libdeflate   gzip compression program v1.19
+  rival igzip        igzip command line interface 2.31.0
+  corpus files: 11 (shas stamped in the JSON artifact)
+
+FAILING CELLS (ours strictly SLOWER, beyond the paired significance gate): 8 of 29 measured cells
+
+vs gzip (0 of 10 measured, worst +0.0% wall):
+
+vs igzip: 0 of 0 measured (all cells structurally ABSENT)
+
+vs libdeflate (8 of 8 measured, worst +13.9% wall):
+  L6  T1  armexe.elf           ratio=1.1387  +13.9%
+  L6  T1  engine.wasm          ratio=1.1240  +12.4%
+  L6  T1  movie.mp4            ratio=1.1222  +12.2%
+  L6  T1  minjs.min.js         ratio=1.1199  +12.0%
+  L6  T1  data.parquet         ratio=1.0738  +7.4%
+  L6  T1  data.csv             ratio=1.0679  +6.8%
+  L6  T1  tool.bin             ratio=1.0616  +6.2%
+  L6  T1  dickens              ratio=1.0582  +5.8%
+
+vs pigz (0 of 11 measured, worst +0.0% wall):
+
+VOID CELLS: 4 (measurement failed — never a result; each names its own reason in the TSV/JSON error field)
+
+WALLCENSUS declared=44 measured_ok=29 absent=11 rival_unavailable=0 void=4 slower=8 gzip_slower=0 igzip_slower=0 libdeflate_slower=8 pigz_slower=0
