@@ -1,6 +1,40 @@
 //! Hash-table matchfinder: 2-entry inline buckets PLUS a length-3 table.
 //!
 //! Port of `vendor/libdeflate/lib/ht_matchfinder.h` (Eric Biggers, 2022) at
+//! # DISASSEMBLY DIFF 2026-07-31 — THE GAP IS FUNCTION SHAPE, AND HERE IS THE NUMBER
+//!
+//!     symbol                          code size     stack frame (sub %rsp)
+//!     libdeflate deflate_compress_fastest  2,466 B      0x88  =   136 bytes
+//!     libdeflate deflate_flush_block       3,696 B      0x48  =    72 bytes
+//!     OURS       parse::compress          29,543 B     0x858  = 2,136 bytes
+//!
+//! Our L1 hot function is 12x libdeflate's and reserves a **15.7x larger stack frame**,
+//! after pushing all six callee-saved registers (rbp, r15, r14, r13, r12, rbx). It has
+//! to: the matchfinder, the parse loop, the block-split observations and the emit path
+//! are ALL inlined into one function. libdeflate keeps `deflate_flush_block` as a
+//! separate 3.7 KB function and its hot loop needs 136 bytes of spill space.
+//!
+//! **That is the diffuse 1.39x.** Not a construct — a SHAPE. With a 2 KB frame every
+//! candidate in the walk touches spilled state, so the cost smears across every line and
+//! no single line looks hot. It is consistent with every measurement taken today:
+//!   * ablating hash3 entirely still leaves 1.39x (217.9M vs 157.2M);
+//!   * the skip-path inserts are 0.13M;
+//!   * `lz_extend`'s missing unroll is noise;
+//!   * hand-written SIMD rebase is a LOSS;
+//!   * and `project_encoder_deficit_is_loads_not_stalls` already banked that our IPC,
+//!     stalls, cache and branch behaviour all BEAT libdeflate while we issue 61% more
+//!     LOADS — which is exactly what a 2 KB spill frame produces.
+//!
+//! It also explains why six source-level hypotheses failed on 2026-07-31: they were all
+//! hunting for an expensive instruction inside a function whose problem is that it is
+//! ONE function.
+//!
+//! REOPEN CONDITION FOR THE L1 CLASS, restated on this evidence: the lever is not a
+//! cheaper construct and not fewer candidates. It is SPLITTING the monolith — an
+//! `#[inline(never)]` boundary around emit (libdeflate's own factoring), so the
+//! matchfinder loop keeps its live values in registers. That is a structural change with
+//! a deterministic falsifier (frame size + Ir), and it has never been tried.
+//!
 //! # ABLATION 2026-07-31 — THE L1 GAP IS DIFFUSE, NOT ANY ONE FEATURE
 //!
 //! Ablating hash3 ENTIRELY (every probe, every insert, every per-position hash) makes
