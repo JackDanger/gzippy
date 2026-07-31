@@ -227,7 +227,7 @@ fn deflate_into(
     // with a sync-flush marker so the next chunk's stream joins without stray
     // bits. Skipped when one continuous `BitWriter` spans every chunk.
     if !is_last && sync_flush {
-        // FALSIFIED 2026-07-29 — pigz's empty-STATIC-block seam pad (J3,
+        // FALSIFY/FALSIFIED 2026-07-29 — pigz's empty-STATIC-block seam pad (J3,
         // pigz.c:1836-1845) is SMALLER but SLOWER, and not marginally.
         //
         // A seam only has to leave the stream byte-aligned. This stored block

@@ -230,7 +230,7 @@ pub mod tune {
         /// exists to close). Same one-block-lag / "first block has no
         /// signal yet" scope gap as `chain_enabled`/`hash3_gated`.
         ///
-        /// FALSIFIED (2026-07-25 — see [`super::LAZY_PEEK_GATED`]'s doc
+        /// FALSIFY/FALSIFIED (2026-07-25 — see [`super::LAZY_PEEK_GATED`]'s doc
         /// comment for the full sweep + isolation story): a fine per-file
         /// threshold sweep (5-45) finds a smooth, non-knife-edge ramp on
         /// `dd79_text6` and a threshold in `[37,40]` that fully reverts it
@@ -1371,7 +1371,7 @@ const LAZY_PEEK_MIN_DIST: usize = 0;
 /// than the size it recovers (the `libdeflate x dd79_text6 x L1` regression
 /// this lever exists to close).
 ///
-/// FALSIFIED (2026-07-25, same mission — kept as tested, measured `l1-tune`
+/// FALSIFY/FALSIFIED (2026-07-25, same mission — kept as tested, measured `l1-tune`
 /// infrastructure per this file's own convention, e.g.
 /// `LAZY_PEEK_COST_GATE_ENABLED`/`bucket2_enabled`; `false` here means the
 /// default build is BYTE-IDENTICAL and WALL-IDENTICAL to before this lever
@@ -1455,7 +1455,7 @@ const LAZY_PEEK_NARROW_MIN_DIST: usize = 8192;
 /// only ever asks "is the NEXT position's candidate clearly better than
 /// this one", never "is THIS match worth taking at all".
 ///
-/// FALSIFIED (2026-07-23, same session that added this lever — kept as
+/// FALSIFY/FALSIFIED (2026-07-23, same session that added this lever — kept as
 /// tested, documented `l1-tune` infrastructure per this file's own
 /// convention for measured-but-unshipped axes, e.g. `bucket2_enabled`/
 /// `chain_enabled`; `false` here means the default build is BYTE-IDENTICAL
@@ -1546,7 +1546,7 @@ const WINDOW: usize = 32768;
 /// 64 KiB the ~dozens-of-bytes dynamic header amortizes to well under 1%. This
 /// is the fast path's one ratio/speed tuning knob — it does not affect
 /// correctness (any block boundary roundtrips).
-// FALSIFIED 2026-07-30 — do NOT "fix" this to 65,535 to match libdeflate's
+// FALSIFY 2026-07-30 (FALSIFY-record) — do NOT "fix" this to 65,535 to match libdeflate's
 // FAST_SOFT_MAX_BLOCK_LENGTH (`deflate_compress.c:102`). The reasoning is seductive and
 // wrong: a DEFLATE stored block carries at most 65,535 B, so 1<<16 cannot be ONE stored
 // block and costs a second sub-block header for a single trailing byte. True, and it
@@ -2082,7 +2082,7 @@ fn process_position_l1(
 /// peek/hash3 gates are independent, not composed, in the CURRENT shipped
 /// build (only a hypothetical `LAZY_PEEK_GATED = true` build would tie them
 /// together, and that lever is the one [`LAZY_PEEK_GATED`]'s doc comment
-/// records as FALSIFIED, not shipped). Narrowing the peek here would
+/// records as FALSIFY-record, not shipped). Narrowing the peek here would
 /// therefore be a genuine DECISION CHANGE for every gate-inactive block on
 /// every corpus with any short-far match, not a codegen-only change — a
 /// real difference confirmed empirically (`sha256` mismatches on

@@ -363,7 +363,7 @@ impl HcMatchfinder {
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
-                    // FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
+                    // FALSIFY/FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
                     // looks vestigial: the prefetch it was written to feed was
                     // measured as a loss and deleted, so "it now keeps a value
                     // live for nothing" is the obvious reading. It is WRONG. The
@@ -403,7 +403,7 @@ impl HcMatchfinder {
                     }
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
+                        // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
                         // A `prefetch_read` of the next chain node used to sit
                         // here, one iteration ahead. It was a net LOSS: it cost
                         // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
@@ -499,7 +499,7 @@ impl HcMatchfinder {
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
+                        // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
                         // A `prefetch_read` of the next chain node used to sit
                         // here, one iteration ahead. It was a net LOSS: it cost
                         // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
@@ -516,7 +516,7 @@ impl HcMatchfinder {
                         // already covers this access pattern on every core we
                         // ship to.
                         //
-                        // FALSIFIED 2026-07-28 (second time, different change) —
+                        // FALSIFY/FALSIFIED 2026-07-28 (second time, different change) —
                         // DO NOT hand-hoist the two operands below that describe
                         // the CURRENT position. It looks like free money: this
                         // prefilter reads four values per candidate, and two of

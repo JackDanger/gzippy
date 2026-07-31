@@ -195,7 +195,7 @@ pub(super) fn run(
                     // min-length heuristic, no short-match offset guard, no
                     // lazy peek. Selectivity lives in MIN_MATCH_LEN 4/nice_len.
                     sink.push_match_fast(length, offset);
-                    // FALSIFIED 2026-07-30 — do NOT swap this for `skip_bytes_limited`.
+                    // FALSIFY 2026-07-30 (FALSIFY-record) — do NOT swap this for `skip_bytes_limited`.
                     // igzip's LIMIT_HASH_UPDATE is the obvious fix for the 3.68x write
                     // traffic this finder pays (see `matchfinder::ht`'s module doc
                     // for the cachegrind counters) and it TRADES THE RATIO STRAIGHT BACK,
