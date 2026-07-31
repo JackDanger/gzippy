@@ -1232,3 +1232,57 @@ counters-never-predict-the-wall rule each caught a different half of the same mi
 REOPEN requires a mechanism that lowers reads WITHOUT adding a call per position and WITHOUT
 raising Dw — fewer simultaneously-live values in the caller is the candidate class, not
 relocating the callee — plus a wall measurement at a shallow AND a deep level.
+
+## G22 — the matchfinder is at PARITY; the instruction excess is the PARSE/EMIT path, and block splitting costs 14x
+
+Full Ir decomposition by ROLE from the same two profiles (trainer, L2, T1, identical
+8,000,000 B input; `/root/cg.ours2`, `/root/cg.ld`). Files summed to 99.7%/99.9% of each
+program's total, so nothing material is hidden below the cut.
+
+    role                          gzippy         libdeflate      ratio
+    matchfinder search+extend   349,349,702    346,344,561       1.009   <- PARITY
+    crc32                         2,625,024      2,250,004       1.17    (0.4% of program)
+    parse / emit / block split  207,177,313    151,190,672       1.370   <- THE EXCESS
+
+      gzippy side: parse/mod.rs 82,036,989 + greedy.rs 22,841,792 + bitstream.rs 22,775,726
+        + block_split.rs 21,816,711 + uint_macros.rs 20,566,683 + tables.rs 19,082,899
+        + const_ptr.rs 10,945,358 + slice/iter/macros.rs 3,593,348 + non_null 1,358,588
+        + range 1,357,998 + huffman/fast.rs 794,248
+      libdeflate side: deflate_compress.c 149,682,890 + common_defs.h(flush) 1,507,782
+
++55,986,641 instructions, which is 89% of the whole-program excess of +62,873,941.
+
+THIS INVERTS THE CAMPAIGN'S TARGET. The banked note
+(`project_encoder_deficit_is_loads_not_stalls`) said "hc.rs is 249.4M Ir, 44.9% of the program
+at L2 ... the entire excess is parse+matchfinder". Measured directly against the vendor, the
+MATCHFINDER IS AT PARITY (1.009) — it already runs slightly FEWER instructions than libdeflate's
+(G19) on identical probes (G18). Every remaining instruction of the gap is in the code AROUND
+the search.
+
+### The single largest component: block splitting, 14x
+
+    ours    block_split.rs                                  21,816,711 Ir
+    theirs  do_end_block_check 721,264 + calculate_min_match_len 790,842 = 1,512,106 Ir
+                                                                          ratio 14.4x
+
++20,304,605 instructions — a THIRD of the entire whole-program excess — in the component that
+decides where blocks end. libdeflate checks for a block boundary cheaply and rarely; we run
+per-position observation bookkeeping.
+
+Two supporting oddities on our side with no vendor counterpart at all:
+`uint_macros.rs` 20,566,683 Ir and `tables.rs` 19,082,899 Ir (39.6M combined, 7.0% of the
+program) — integer-helper and lookup-table code that libdeflate does not spend separately
+because the equivalent work is folded into `deflate_compress.c`.
+
+### Why this is the RIGHT target and the matchfinder was the wrong one
+
+G21 proved reads are not the wall-blocking quantity (deleting 25.6M of them at L9 LOST 1.77%
+of wall). Instructions remain the live candidate — Ir 1.126 whole-program against a wall ratio
+of roughly the same order. And the instruction excess is NOT in the matchfinder, which is where
+every previous session looked.
+
+CAVEAT, stated because G21 exists: this locates instructions, and instruction counts LOCATE,
+they never predict the wall. Nothing here is a promised win. The next step is to diff
+`block_split.rs` against `deflate_should_end_block`/`do_end_block_check` as ALGORITHMS — how
+often each runs and what it computes per call — and then measure Ir AND wall at a shallow and
+a deep level before believing anything.
