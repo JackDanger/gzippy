@@ -248,3 +248,51 @@ rewritten the moment a measurement says a different structure is better.
 Practical consequence for #50 (103 of 165 failing size cells are T>1): fix it by
 making seams SMALLER, not by making T4 reproduce T1. pigz's 10-bit
 empty-static-block pad is exactly that.
+
+## FALSIFIED 2026-07-31 — `good_match` does NOT rescue the deeper chain
+
+**The missing mechanism was real.** zlib shortens the chain to a quarter once the match in
+hand is already good (`zlib-ng/match_tpl.h:75-77`):
+
+    /* Do not waste too much time if we already have a good match */
+    if (best_len >= s->good_match) chain_length >>= 2;
+
+libdeflate has no equivalent, and our level map is a copy of libdeflate's, so **we had the
+deep-chain option without the brake** — one column of zlib's table and not the other. That
+diagnosis was correct and is worth keeping.
+
+**The fix it implied was wrong.** Implemented (`good_match` on `LevelParams`, threaded to
+`hc::longest_match`, zlib's per-level `good_length`: 4/4/4/8/8/8/32/32) and measured together
+with zlib's chain depths at L5-L9. It does NOT restore the 13 cells that the depth change
+flipped:
+
+    cell                     depth-only     depth + good_match     libdeflate
+    data.csv        L9       +226 B         +458 B                 3,300,291
+    movie.mp4       L6       +60 B          +105 B                12,890,404
+    photo.jpg       L7       +5 B           +5 B                   6,472,036
+    weights.saf.    L7       +2 B           +2 B                  83,113,840
+    dd79_bin6       L6       +1 B           +1 B                   4,461,731
+
+and on `data.csv` L9 it makes the gap WORSE. The cells the depth change closed stay closed
+(aozora.txt L6 4,013,389 vs 4,072,294; monorepo.tar 9,870,485 vs 9,951,696).
+
+**WHY, and this is the durable part.** At every flipped cell our stock output is
+BYTE-IDENTICAL to libdeflate's, because our stock config IS libdeflate's config. We win those
+cells by *being* libdeflate, so ANY deviation — deeper chain, shorter chain, brake or no
+brake — costs a few bytes. The flips are not a missing brake; they are the price of leaving a
+local optimum that we currently sit exactly on.
+
+That splits the board into two populations that one static config cannot satisfy:
+* ~84 cells where zlib's DEEPER SEARCH beats libdeflate (text, logs, tarballs).
+* ~13 cells where libdeflate's EXACT PARSE is optimal and search depth is irrelevant
+  (near-incompressible: movie.mp4, photo.jpg, weights.safetensors, dd79_bin6).
+
+Closing both needs a better PARSE, not more search — libdeflate wins the second group with
+better decisions, zlib wins the first with more candidates. Content detection is forbidden
+(non-negotiable #3) and would be the wrong answer anyway. The vendor-precedented shape is
+cost-based selection (`deflate_medium`'s deferred-match arithmetic, or our own
+`near_optimal`), evaluated at L5-L9 rather than only L10-12.
+
+`good_match` itself is NOT shipped here. It is a genuine mechanism we lack and it should
+help the WALL (it cuts search exactly when search is least useful), but it CHANGES OUTPUT,
+so it needs its own size+wall gate rather than riding along with a depth change.
