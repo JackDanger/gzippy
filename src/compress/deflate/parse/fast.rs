@@ -46,7 +46,7 @@
 //! not duplicate it.
 
 use super::super::bitstream::BitWriter;
-use super::super::huffman::HeaderScratch;
+use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::matchfinder::common::{load_u24, load_u32, lz_extend, lz_hash, prefetch_write};
 #[cfg(feature = "l1-tune")]
 use super::super::matchfinder::hc::HcMatchfinder;
@@ -2932,6 +2932,7 @@ pub(super) fn run<const ACCEL: bool>(
     // One dynamic-header scratch buffer for the WHOLE `run()` call (see
     // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
     let mut header_scratch = HeaderScratch::new();
+    let mut code_scratch = CodeScratch::default();
     let mut pos = data_start;
 
     // CONTENT-ADAPTIVE CHAIN MATCHING state (`l1-tune` only; see
@@ -3025,6 +3026,7 @@ pub(super) fn run<const ACCEL: bool>(
                     statics,
                     is_final,
                     &mut header_scratch,
+                    &mut code_scratch,
                 );
             } else {
                 emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
@@ -3295,6 +3297,7 @@ pub(super) fn run<const ACCEL: bool>(
                 statics,
                 is_final,
                 &mut header_scratch,
+                &mut code_scratch,
             );
         } else {
             // L0: cheapest of static / stored only — no per-block dynamic

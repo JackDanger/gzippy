@@ -19,7 +19,10 @@
 use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
 use super::encode_types::{BlockRole, InputMode};
-use super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
+use super::huffman::{
+    build_dynamic_header, make_huffman_code, make_huffman_code_into, CodeScratch, HeaderScratch,
+    HuffmanCode,
+};
 use super::level::{LevelParams, Strategy};
 use super::matchfinder::hc::WINDOW_SIZE;
 use super::tables::{
@@ -833,24 +836,32 @@ fn emit_block(
     statics: &StaticCodes,
     is_final: bool,
     header_scratch: &mut HeaderScratch,
+    code_scratch: &mut CodeScratch,
 ) {
     // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
     // this block, before any bit is written: both candidate Huffman codes,
     // the dynamic header, and the three-way stored/static/dynamic cost
     // comparison. Zero cost when `anatomy-wall` is off.
-    let (litcode, offcode, header, dynamic_bits, static_bits, stored_bits) =
+    // The two codes are built INTO `code_scratch`, which the caller owns and
+    // reuses for every block. See `huffman::CodeScratch`: building them fresh here
+    // was the per-block allocation that made our allocation count grow with input
+    // (733 allocs on 6 MB where libdeflate uses 3 and gzip 0).
+    let CodeScratch { litcode, offcode } = code_scratch;
+    let (header, dynamic_bits, static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
             // vendor does in deflate_flush_block).
             let mut litlen_freqs = sink.litlen_freqs;
             litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-            let litcode = make_huffman_code(
+            make_huffman_code_into(
+                litcode,
                 DEFLATE_NUM_LITLEN_SYMS,
                 MAX_LITLEN_CODEWORD_LEN,
                 &litlen_freqs,
             );
-            let offcode = make_huffman_code(
+            make_huffman_code_into(
+                offcode,
                 DEFLATE_NUM_OFFSET_SYMS,
                 MAX_OFFSET_CODEWORD_LEN,
                 &sink.offset_freqs,
@@ -859,7 +870,7 @@ fn emit_block(
 
             let dynamic_bits = 3
                 + header.header_bits()
-                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, &litcode, &offcode);
+                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, litcode, offcode);
             let static_bits = 3 + cost_from_freqs(
                 &litlen_freqs,
                 &sink.offset_freqs,
@@ -867,15 +878,9 @@ fn emit_block(
                 &statics.offcode,
             );
             let stored_bits = stored_block_bits(sink.block_length);
-            (
-                litcode,
-                offcode,
-                header,
-                dynamic_bits,
-                static_bits,
-                stored_bits,
-            )
+            (header, dynamic_bits, static_bits, stored_bits)
         });
+    let (litcode, offcode) = (&*litcode, &*offcode);
 
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
         // blocks_emitted_stored is counted in `write_stored_subblock`
@@ -917,7 +922,7 @@ fn emit_block(
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);
         crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
-            emit_sequences(bw, buf, block_start, sink, &litcode, &offcode);
+            emit_sequences(bw, buf, block_start, sink, litcode, offcode);
         });
     }
 }

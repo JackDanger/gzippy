@@ -53,7 +53,7 @@
 //! worst case any parser can produce; the seq cap here is far below it.
 
 use super::super::bitstream::BitWriter;
-use super::super::huffman::HeaderScratch;
+use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::ht::{HtMatchfinder, HT_REQUIRED_NBYTES};
 use super::super::tables::DEFLATE_MAX_MATCH_LEN;
@@ -108,6 +108,7 @@ pub(super) fn run(
     // One dynamic-header scratch for the WHOLE call, reused across every
     // internal block, instead of `build_dynamic_header` allocating per block.
     let mut header_scratch = HeaderScratch::new();
+    let mut code_scratch = CodeScratch::default();
 
     let mut in_next = data_start;
     if data_start > 0 {
@@ -145,6 +146,7 @@ pub(super) fn run(
             statics,
             role.is_final(),
             &mut header_scratch,
+            &mut code_scratch,
         );
         return;
     }
@@ -251,6 +253,7 @@ pub(super) fn run(
             statics,
             role.is_final() && in_next == in_end,
             &mut header_scratch,
+            &mut code_scratch,
         );
         if in_next >= in_end {
             return;

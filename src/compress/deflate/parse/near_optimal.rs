@@ -29,7 +29,9 @@ use super::super::costs::{
     set_initial_costs, DeflateCosts, OffsetSlotFull, OptimumNode, BIT_COST, OPTIMUM_LEN_MASK,
     OPTIMUM_OFFSET_SHIFT,
 };
-use super::super::huffman::{build_dynamic_header, make_huffman_code, HeaderScratch, HuffmanCode};
+use super::super::huffman::{
+    build_dynamic_header, make_huffman_code, CodeScratch, HeaderScratch, HuffmanCode,
+};
 use super::super::level::LevelParams;
 use super::super::matchfinder::bt::{
     BtMatchfinder, LzMatch, BT_MATCHFINDER_REQUIRED_NBYTES, WINDOW_SIZE,
@@ -100,6 +102,7 @@ struct Optimizer {
     /// once more in `optimize_and_flush`'s final emit, so a fresh `Vec` per
     /// call was the same waste class as the pre-fix `sink`.
     header_scratch: HeaderScratch,
+    code_scratch: CodeScratch,
 }
 
 impl Optimizer {
@@ -113,6 +116,7 @@ impl Optimizer {
             match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
             sink: Sink::new(),
             header_scratch: HeaderScratch::new(),
+            code_scratch: CodeScratch::default(),
         }
     }
 
@@ -451,6 +455,7 @@ impl Optimizer {
             statics,
             is_final,
             &mut self.header_scratch,
+            &mut self.code_scratch,
         );
 
         used_only_literals

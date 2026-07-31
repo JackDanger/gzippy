@@ -401,15 +401,50 @@ fn gen_codewords(
 /// including the "fewer than 2 used symbols" practice-not-spec special case
 /// (emit two 1-bit codewords).
 pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> HuffmanCode {
+    let mut out = HuffmanCode {
+        lens: Vec::new(),
+        codewords: Vec::new(),
+    };
+    make_huffman_code_into(&mut out, num_syms, max_len, freqs);
+    out
+}
+
+/// [`make_huffman_code`], writing into a CALLER-OWNED [`HuffmanCode`].
+///
+/// STRUCTURAL: this is the whole reason the function exists. The allocating form
+/// above builds its `lens` and `a` vectors fresh and RETURNS them as the code, so
+/// every call heap-allocates twice — and `emit_block` calls it once per Huffman
+/// code per block. Measured on this tree before the change (valgrind memcheck,
+/// 6,000,000 B of dickens, `-6 -p1`): 261 allocations totalling 13,647,061 bytes,
+/// of which ~108 blocks came from `make_huffman_code` alone, and the allocation
+/// COUNT GREW LINEARLY WITH INPUT (1.5 MB -> 356, 3 MB -> 501, 6 MB -> 733 at the
+/// default thread count). libdeflate compressing the same input allocates 3 times,
+/// total, and gzip allocates 0 — their Huffman state is a fixed array inside the
+/// compressor (`struct deflate_codes`), reused for every block.
+///
+/// `CLAUDE.md` STEP 1 requires "no per-block, per-run or per-chunk allocation".
+/// Per-block allocation here was the violation, and it is the one that scales.
+///
+/// `clear()` + `resize()` reuses the existing capacity, so after the first block
+/// this path allocates nothing. The arithmetic below is UNCHANGED from the
+/// allocating form — same `sort_symbols`, same tree build, same codeword
+/// generation — so the emitted bytes are identical by construction.
+pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u32, freqs: &[u32]) {
     crate::anatomy_count!(huffman_make_code_calls);
     assert_eq!(freqs.len(), num_syms);
     assert!(num_syms >= 2);
     let max_len = max_len as usize;
 
-    let mut lens = vec![0u8; num_syms];
-    let mut a = vec![0u32; num_syms]; // doubles as symout, tree, and codewords
+    // Reuse the caller's buffers. `clear` keeps the allocation; `resize` refills
+    // with zeros, matching `vec![0u8; num_syms]` / `vec![0u32; num_syms]` exactly.
+    out.lens.clear();
+    out.lens.resize(num_syms, 0);
+    out.codewords.clear();
+    out.codewords.resize(num_syms, 0);
+    let lens = &mut out.lens;
+    let a = &mut out.codewords; // doubles as symout, tree, and codewords
 
-    let num_used_syms = sort_symbols(freqs, &mut lens, &mut a);
+    let num_used_syms = sort_symbols(freqs, lens, a);
 
     if num_used_syms < 2 {
         let sym = if num_used_syms != 0 {
@@ -426,16 +461,14 @@ pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> Huffma
         lens[0] = 1;
         a[nonzero_idx] = 1;
         lens[nonzero_idx] = 1;
-        return HuffmanCode { lens, codewords: a };
+        return;
     }
 
-    build_tree(&mut a, num_used_syms);
+    build_tree(a, num_used_syms);
 
     let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
-    compute_length_counts(&mut a, num_used_syms - 2, &mut len_counts, max_len);
-    gen_codewords(&mut a, &mut lens, &len_counts, max_len, num_syms);
-
-    HuffmanCode { lens, codewords: a }
+    compute_length_counts(a, num_used_syms - 2, &mut len_counts, max_len);
+    gen_codewords(a, lens, &len_counts, max_len, num_syms);
 }
 
 #[cfg(test)]
