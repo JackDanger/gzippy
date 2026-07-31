@@ -224,7 +224,7 @@ impl StaticCodes {
 /// The literal bytes themselves are NOT stored — the emit reads them from the
 /// input buffer (as libdeflate's `deflate_flush_block` does), so a literal push
 /// is just a frequency bump + run-counter increment.
-struct Sink {
+pub(crate) struct Sink {
     /// Backing store for `nseqs` sequences. Capacity is fixed at
     /// `SEQ_STORE_LENGTH` and `len()` is deliberately left at 0 — elements are
     /// written through the spare capacity, so the buffer is ALLOCATED but never
@@ -245,6 +245,73 @@ struct Sink {
     /// this replaces `Vec::len`, which `continue_block` had to LOAD on every
     /// token where libdeflate compares a pointer already in a register.
     nseqs: usize,
+}
+
+thread_local! {
+    /// One recycled [`Sink`] per thread — the exact shape already used for
+    /// `HcMatchfinder` (`matchfinder/hc.rs`'s `HC_POOL`), for the same reason.
+    ///
+    /// STRUCTURAL. `Sink::new()` allocates `SEQ_STORE_CAPACITY` sequences =
+    /// **2,796,896 bytes**, and it was built fresh on EVERY parser invocation:
+    /// once per streaming pass at T=1, and ONCE PER CHUNK at T>1. The 262,144-byte
+    /// matchfinder beside it was pooled; the object ten times larger was not. That
+    /// asymmetry is most of why the T>1 path allocated 83,909,568 bytes to compress
+    /// 6,000,000 (T=1: 13,647,061) while libdeflate allocates 6,674,327 once.
+    ///
+    /// `thread_local!` rather than a shared pool, for the reason `HC_POOL` gives:
+    /// each `infra::scheduler` worker owns its slot, so there is no cross-thread
+    /// mutable state and no synchronisation.
+    static SINK_POOL: std::cell::RefCell<Option<Sink>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII handle from [`Sink::acquire`]. `Deref`/`DerefMut` to [`Sink`] so every
+/// existing `&mut sink` / `&sink` call site is unchanged. On drop the `Sink` goes
+/// back to this thread's [`SINK_POOL`] instead of being freed, so the next
+/// `acquire()` on the same thread reuses the 2.8 MB `seqs` allocation.
+pub(crate) struct PooledSink(Option<Sink>);
+
+impl std::ops::Deref for PooledSink {
+    type Target = Sink;
+    #[inline]
+    fn deref(&self) -> &Sink {
+        // SAFETY/invariant: `Some` for the whole lifetime outside `Drop::drop`.
+        self.0.as_ref().expect("PooledSink used after drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledSink {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Sink {
+        self.0.as_mut().expect("PooledSink used after drop")
+    }
+}
+
+impl Drop for PooledSink {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            SINK_POOL.with(|cell| {
+                *cell.borrow_mut() = Some(s);
+            });
+        }
+    }
+}
+
+impl Sink {
+    /// Take this thread's recycled [`Sink`], or build one on first use.
+    ///
+    /// The returned sink is `begin()`-reset, so it is indistinguishable from a
+    /// fresh `Sink::new()` to every caller — `begin()` already zeroes the
+    /// frequencies and resets `nseqs`/`litrun`/`block_length`, and `seqs` is
+    /// written through `nseqs` and never read past it. Emitted bytes are
+    /// therefore identical whether the sink is fresh or recycled.
+    pub(crate) fn acquire() -> PooledSink {
+        let mut s = SINK_POOL
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_else(Sink::new);
+        s.begin();
+        PooledSink(Some(s))
+    }
 }
 
 impl Sink {

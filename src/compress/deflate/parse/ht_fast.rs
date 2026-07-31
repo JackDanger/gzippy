@@ -104,7 +104,7 @@ pub(super) fn run(
     // the same reason it is harmless — the table only proposes a candidate, and the
     // 3-byte compare in `longest_match` is what establishes a real match.
     let mut next_hash3 = 0u32;
-    let mut sink = Sink::new();
+    let mut sink = Sink::acquire();
     // One dynamic-header scratch for the WHOLE call, reused across every
     // internal block, instead of `build_dynamic_header` allocating per block.
     let mut header_scratch = HeaderScratch::new();

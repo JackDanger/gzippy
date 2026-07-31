@@ -2928,7 +2928,7 @@ pub(super) fn run<const ACCEL: bool>(
     }
 
     // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
-    let mut sink = Sink::new();
+    let mut sink = Sink::acquire();
     // One dynamic-header scratch buffer for the WHOLE `run()` call (see
     // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
     let mut header_scratch = HeaderScratch::new();

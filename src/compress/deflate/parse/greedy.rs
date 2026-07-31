@@ -79,7 +79,7 @@ pub(super) fn run_resumable(
     role: BlockRole,
     input_mode: InputMode,
 ) -> usize {
-    let mut sink = Sink::new();
+    let mut sink = Sink::acquire();
     // One dynamic-header scratch buffer for the WHOLE call, reused across
     // every internal block (see `HeaderScratch`'s doc comment) instead of
     // `build_dynamic_header` allocating a fresh `Vec` per block.
