@@ -89,7 +89,7 @@
 //!
 //! # The elided bounds checks bought NOTHING — measured, keep them elided anyway
 //!
-//! FALSIFIED 2026-07-30 as a WALL lever: replacing checked table indexing with
+//! FALSIFY 2026-07-30 (FALSIFY-record) as a WALL lever: replacing checked table indexing with
 //! `get_unchecked` is byte-identical and, on a local interleaved paired read at L1 T1
 //! (7 reps, /dev/null, the same box for both arms), moved nothing measurable —
 //! tool.bin 0.32 s both arms, data.csv 0.07 s both arms. LLVM had already elided them.

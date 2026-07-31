@@ -20,7 +20,7 @@ pub const NUM_OBSERVATIONS_PER_BLOCK_CHECK: u32 = 512;
 /// Minimum input bytes before/around a candidate split (`MIN_BLOCK_LENGTH`).
 pub const MIN_BLOCK_LENGTH: usize = 5000;
 
-// FALSIFIED 2026-07-30 — do NOT lower the 4096 length-bias divisor unconditionally.
+// FALSIFY 2026-07-30 (FALSIFY-record) — do NOT lower the 4096 length-bias divisor unconditionally.
 //
 // The bias term `(block_length/4096) * num_observations` is this heuristic's ONLY
 // response to STATIONARY data. At the 512-observation cadence the cutoff is

@@ -33,3 +33,17 @@ if [ -n "$changed_rs" ]; then
     cargo clippy --all-targets -- -D warnings 2>&1 \
         || { echo "Fix clippy warnings before committing."; exit 1; }
 fi
+
+# ── FALSIFY-record visibility ────────────────────────────────────────────────
+# A falsification record the machinery cannot READ is not a record. Both the
+# `commit-msg` hook and `fulcrum candidates` find records by scanning code for the
+# literal token, and `"FALSIFY" in "FALSIFIED"` is False — the 7th character differs.
+# A 2026-07-30 audit found THIRTEEN records, dating back to 2026-07-22, that neither
+# mechanism could see, including the one guarding a five-shape chunk-grid search.
+# The checker and the records it checks had never been run against each other.
+if [ -n "$changed_rs" ]; then
+    if [ -x scripts/campaign/check-falsify-visible.py ]; then
+        scripts/campaign/check-falsify-visible.py \
+            || { echo "A FALSIFY record is invisible to the hook and to fulcrum. Fix it."; exit 1; }
+    fi
+fi

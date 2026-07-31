@@ -25,7 +25,14 @@ if [ -n "$STAGED" ]; then
         case "$f" in *.rs) ;; *) continue ;; esac
         [ -f "$f" ] || continue
         # Does this commit's diff touch a hunk within 40 lines of a FALSIFY note?
-        if git diff --cached -U40 -- "$f" | grep -q "FALSIFY"; then
+        # Match the STEM, not the exact word. A 2026-07-30 audit found the session's
+        # most important falsification records written as "FALSIFIED <date>" — and
+        # `grep -q "FALSIFY"` does not match "FALSIFIED" (the 7th character differs:
+        # Y vs I). Two whole files, `pipelined.rs` and `block_split.rs`, carried
+        # falsifications that were invisible to this hook AND to `fulcrum candidates`.
+        # The checker and the data it checks were written in the same session and never
+        # run against each other. Matching the stem makes the family unbreakable.
+        if git diff --cached -U40 -- "$f" | grep -qE "FALSIF(Y|IED|IES)"; then
             # A REVERT toward the recorded-safe value is what the FALSIFY note
             # WANTS, but this check only sees proximity to the comment, not
             # direction — so it blocked a legitimate revert on 2026-07-29.

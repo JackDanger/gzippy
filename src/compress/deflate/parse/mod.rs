@@ -53,7 +53,7 @@ mod greedy;
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
 /// REOPEN it rests on.
-// Unused in a default build: the L1 routing to it is FALSIFIED as a REPLACEMENT (see
+// Unused in a default build: the L1 routing to it is FALSIFY-record as a REPLACEMENT (see
 // the `Strategy::Fast` arm below for the measured numbers). KEPT compiled — not
 // reverted, not feature-gated — because it is correct, it is the measured half of the
 // length-3-plus-2-way synthesis that REOPEN requires, and dead-but-compiled code that
@@ -444,7 +444,7 @@ pub(super) fn compress(
         // the two consts below for the env-var-backed tune values here — no
         // change to `fast::run`'s signature needed. Byte-identical to the
         // `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
-        // FALSIFIED 2026-07-30 — do NOT route L1 to `ht_fast` AS A REPLACEMENT.
+        // FALSIFY 2026-07-30 (FALSIFY-record) — do NOT route L1 to `ht_fast` AS A REPLACEMENT.
         // The 2-way-bucket port is correct and is a large ratio win, and it still
         // NO-SHIPS, because it throws away three files where our length-3 table
         // beats libdeflate. Measured, `scripts/campaign/board-size.sh tune`,
@@ -485,7 +485,7 @@ pub(super) fn compress(
         // (fulcrum verify: 220 cells, 0 roundtrip failures through our own decoder at
         // every thread count plus gzip/pigz/libdeflate) and they are the measured
         // half of the synthesis. Only the ROUTING is reverted.
-        // FALSIFIED 2026-07-30, ON THE WALL — attempt 2, the synthesis (2-way bucket
+        // FALSIFY 2026-07-30 (FALSIFY-record), ON THE WALL — attempt 2, the synthesis (2-way bucket
         // AND a length-3 table). The SIZE leg passed cleanly and the WALL leg killed
         // it, which is the same way `17283ee6` (`c0f69036`) died in this class. The
         // halved working set was a real reason to expect otherwise and it was not
@@ -1120,8 +1120,8 @@ unsafe fn add_entry(bw: &mut BitWriter, e: u32) {
 /// whole-word flush per group), then the 1-3-literal tail. Returns the position
 /// one past the run.
 ///
-/// FALSIFIED (2026-07-22, AVX2 gather+vpsllvq attempt — the reopen trigger
-/// named by the scalar-prefix-sum FALSIFIED note on [`emit_sequences`]):
+/// FALSIFY/FALSIFIED (2026-07-22, AVX2 gather+vpsllvq attempt — the reopen trigger
+/// named by the scalar-prefix-sum FALSIFY-record note on [`emit_sequences`]):
 /// replaced this loop with a batch-of-8 AVX2 emitter (`vpgatherdd` fetching 8
 /// packed `codeword | nbits << 24` LUT entries in one instruction, split into
 /// two groups of 4 for a real `vpsllvq`-based merge — exclusive prefix-sum of
@@ -1175,7 +1175,7 @@ unsafe fn add_entry(bw: &mut BitWriter, e: u32) {
 /// hardware, where `vpgatherdd`/shuffle throughput characteristics differ,
 /// was also not tested. The exact falsified diff (both the gather variant
 /// and the no-gather diagnostic) is reproduced in full in the commit that
-/// introduced this note (`git log --grep=FALSIFIED -p` on this file; the
+/// introduced this note (`git log --grep=FALSIFY-record -p` on this file; the
 /// gather implementation itself, before revert, is preserved verbatim in
 /// commit `e63316ba`) so a future session can rebuild and re-measure either
 /// variant, or the untried load-only-vectorize hypothesis, without
@@ -1228,7 +1228,7 @@ unsafe fn emit_literal_run(
 /// `add_bits_raw` (mechanism 5), plus merged codeword|nbits entries and a
 /// stored offset slot (one load per symbol, no emit-side `offset_slot()`).
 ///
-/// FALSIFIED (2026-07-22): replacing this loop's four sequential
+/// FALSIFY/FALSIFIED (2026-07-22): replacing this loop's four sequential
 /// `add_bits_raw` calls (per literal-run group-of-4) and the match's two
 /// sequential `add_bits_raw` calls with a scalar parallel-prefix-sum +
 /// variable-shift + OR-reduce merge (igzip `encode_df_0{4,6}.asm`'s
@@ -1253,11 +1253,11 @@ unsafe fn emit_literal_run(
 /// scalar attempt made worse, not just the dependency-depth term — untested,
 /// not this session's finding. The exact falsified diff (both increments,
 /// independently splittable) is reproduced in full in the commit message of
-/// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
+/// the commit that introduced this note (`git log --grep=FALSIFY-record -p` on
 /// this file) so a future session can rebuild and re-measure it without
 /// re-deriving the technique from scratch.
 ///
-/// FALSIFIED (2026-07-22, ICF-ARCHITECTURE experiment — a structural
+/// FALSIFY/FALSIFIED (2026-07-22, ICF-ARCHITECTURE experiment — a structural
 /// sibling of the note above, not a SIMD attempt): pre-registered test of
 /// the hypothesis that igzip's fast-path emit economy comes from a UNIFORM
 /// per-token record (one packed u32 per literal OR match, one flat loop, no
@@ -1335,7 +1335,7 @@ unsafe fn emit_literal_run(
 /// re-measure a batched variant without re-deriving the tagged-record
 /// design from scratch.
 ///
-/// FALSIFIED (2026-07-22, BATCHED-FLUSH micro-reopen — the "one untried emit
+/// FALSIFY/FALSIFIED (2026-07-22, BATCHED-FLUSH micro-reopen — the "one untried emit
 /// variant" the ICF note's reopen trigger above named): pre-registered test
 /// of whether the flush CADENCE alone (not the Seq/emit representation, not
 /// codeword-assembly merging — both already falsified above) has headroom.
@@ -1413,13 +1413,13 @@ unsafe fn emit_literal_run(
 /// most real blocks, not a threshold miscalibration). A true per-symbol
 /// runtime `CAN_BUFFER` check would remove the structural block but
 /// reintroduces the exact per-token branch cost this note (and the two
-/// FALSIFIED notes above it) repeatedly measured as a net loss — untested
+/// FALSIFY-record notes above it) repeatedly measured as a net loss — untested
 /// here, but faces the same headwind by construction; a candidate NOT tried
 /// this session is amortizing the check over N symbols via a running
 /// bit-budget compare cheaper than N per-symbol branches, rather than either
 /// a per-symbol check or a per-block static bound. The exact v1 and v2
 /// diffs are reproduced in full in the commit message of the commit that
-/// introduced this note (`git log --grep=FALSIFIED -p` on this file) so a
+/// introduced this note (`git log --grep=FALSIFY-record -p` on this file) so a
 /// future session can rebuild and re-measure either variant, or the untried
 /// amortized-runtime-check hypothesis, without re-deriving the const-generic
 /// batch-tier machinery from scratch.
@@ -1468,7 +1468,7 @@ unsafe fn emit_literal_run(
 /// and it still needs a real implementation + gate, not another rebuild of
 /// the immediate-flush uniform-record shape already covered above.
 ///
-/// FALSIFIED (2026-07-22, AMORTIZED RUNNING BIT-BUDGET FLUSH — the mechanism
+/// FALSIFY/FALSIFIED (2026-07-22, AMORTIZED RUNNING BIT-BUDGET FLUSH — the mechanism
 /// the note above named as the one genuinely untried form): built and gated
 /// the exact thing that note specified. `emit_literal_run` took a running
 /// `bits: u32` (bits added to the accumulator since the last flush) in and
@@ -1564,7 +1564,7 @@ unsafe fn emit_literal_run(
 /// the five covered forms from scratch is not new information. The exact
 /// diff (the `bits`-threading signature and the `RUNNING_FLUSH_BUDGET`
 /// constant, before revert) is reproduced in full in the commit message of
-/// the commit that introduced this note (`git log --grep=FALSIFIED -p` on
+/// the commit that introduced this note (`git log --grep=FALSIFY-record -p` on
 /// this file).
 ///
 /// PRE-EMPTED AGAIN (2026-07-25, "TRACK 3 — two-pass ICF fast path" mission

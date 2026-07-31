@@ -69,7 +69,7 @@ const MAX_PARALLEL_BLOCK_SIZE: usize = 512 * 1024;
 /// parallel path still has work to hand out.
 const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 
-/// FALSIFIED 2026-07-30 — NO chunk-grid change can pass promotion clause 3, and this is
+/// FALSIFY 2026-07-30 (FALSIFY-record) — NO chunk-grid change can pass promotion clause 3, and this is
 /// now established across FIVE shapes, not inferred from one:
 ///
 /// | shape | flips of the 9 near-tie T4 cells |
@@ -117,7 +117,7 @@ const CHUNKS_PER_THREAD: usize = 2;
 /// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
 const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
-/// FALSIFIED 2026-07-29 — scaling this with LEVEL buys size and LOSES wall.
+/// FALSIFY 2026-07-29 (FALSIFY-record) — scaling this with LEVEL buys size and LOSES wall.
 ///
 /// The T>1 size penalty is real and level-dependent: T4 minus T1 on a 40 MB
 /// silesia slice is +1,034 bytes at L6 and +3,228 at L8, because every chunk is
@@ -156,7 +156,7 @@ const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 /// is the main structural lever against per-chunk overhead — about half the T4 board.
 ///
 /// So a thread-aware grid is LEGAL to build. It is simply not built yet, and it is not
-/// free: read the FALSIFIED note above first. That falsification killed a LEVEL-scaled
+/// free: read the FALSIFY-record note above first. That falsification killed a LEVEL-scaled
 /// grid, which divided the per-chunk constant without buying any size slack and paid 2-4%
 /// wall to imbalance. A T-aware grid (`input/(k*T)` with a split tail) is a different
 /// shape and is unmeasured — but the same mechanism applies, so it needs a wall gate, not
@@ -207,7 +207,7 @@ fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> us
 
     // ALIGN THE SEAM TO A BLOCK BOUNDARY THE SPLITTER WOULD HAVE CHOSEN ANYWAY.
     //
-    // This is the fix the FALSIFIED note above asks for by name. Chunk count is only
+    // This is the fix the FALSIFY-record note above asks for by name. Chunk count is only
     // half the per-chunk cost; the other half is that a chunk's LAST block is ragged —
     // it ends because the chunk ended, not because the block budget or the drift
     // detector said so — and a short final block pays a full dynamic header for a
