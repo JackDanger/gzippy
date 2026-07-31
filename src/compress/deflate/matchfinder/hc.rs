@@ -363,7 +363,7 @@ impl HcMatchfinder {
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
-                    // FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
+                    // FALSIFY/FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
                     // looks vestigial: the prefetch it was written to feed was
                     // measured as a loss and deleted, so "it now keeps a value
                     // live for nothing" is the obvious reading. It is WRONG. The
@@ -401,9 +401,28 @@ impl HcMatchfinder {
                     {
                         local.chain_reads += 1;
                     }
+                    // CHAIN BASE, hoisted out of the walk to free a register.
+                    //
+                    // The walk used to compute `matchptr = in_base_v + cur_node4` and then
+                    // `load_u32(base, matchptr)` — TWO adds, and `base` and `in_base_v`
+                    // both live across every iteration. Folding them into one pointer
+                    // leaves ONE add and ONE live value.
+                    //
+                    // This is a register-pressure fix, not a load hoist, and the
+                    // distinction matters because load hoisting is falsified here twice.
+                    // cg_annotate on 6,000,000 B of dickens at L6 T1 attributed
+                    // 30,311,345 DATA READS to `matchptr = (in_base_v as isize + ...)`, a
+                    // line that is an ADD of two locals and should cost none: LLVM was
+                    // spilling and reloading them every iteration because too much is live
+                    // across the walk. `in_base_v` was ALREADY a local, so this is not an
+                    // aliasing problem and no by-value signature change can reach it.
+                    //
+                    // SAFETY: `wrapping_offset` never dereferences; every use below is a
+                    // load at `cur_node4 > cutoff`, i.e. exactly the addresses the old
+                    // `matchptr` form produced, whose bounds the SAFETY note there covers.
+                    let chain_base = base.wrapping_add(in_base_v);
                     loop {
-                        matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
+                        // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
                         // A `prefetch_read` of the next chain node used to sit
                         // here, one iteration ahead. It was a net LOSS: it cost
                         // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
@@ -421,9 +440,17 @@ impl HcMatchfinder {
                         // ship to.
                         // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
                         // `matchptr + 4 <= in_next + 4 <= buf.len()`.
+                        // SAFETY: as the chain_base note above — `cur_node4 > cutoff`
+                        // means this address is `< in_next` and `+4 <= buf.len()`.
                         let cand = unsafe {
-                            debug_assert!(matchptr < in_next && matchptr + 4 <= blen);
-                            load_u32(base, matchptr)
+                            #[cfg(debug_assertions)]
+                            {
+                                let p = (in_base_v as isize + cur_node4 as isize) as usize;
+                                debug_assert!(p < in_next && p + 4 <= blen);
+                            }
+                            u32::from_le(core::ptr::read_unaligned(
+                                chain_base.wrapping_offset(cur_node4 as isize) as *const u32,
+                            ))
                         };
                         #[cfg(feature = "anatomy-counters")]
                         {
@@ -456,7 +483,9 @@ impl HcMatchfinder {
                         }
                     }
 
-                    // Found a length-4 match; extend it fully.
+                    // Found a length-4 match; extend it fully. `matchptr` is
+                    // materialised HERE, once, instead of on every walk iteration.
+                    matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
                     best_matchptr = matchptr;
                     best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
                     #[cfg(feature = "anatomy-counters")]
@@ -499,7 +528,7 @@ impl HcMatchfinder {
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
+                        // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
                         // A `prefetch_read` of the next chain node used to sit
                         // here, one iteration ahead. It was a net LOSS: it cost
                         // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
@@ -516,7 +545,7 @@ impl HcMatchfinder {
                         // already covers this access pattern on every core we
                         // ship to.
                         //
-                        // FALSIFIED 2026-07-28 (second time, different change) —
+                        // FALSIFY/FALSIFIED 2026-07-28 (second time, different change) —
                         // DO NOT hand-hoist the two operands below that describe
                         // the CURRENT position. It looks like free money: this
                         // prefilter reads four values per candidate, and two of
