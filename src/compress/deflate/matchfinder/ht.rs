@@ -28,12 +28,34 @@
 //! governs this cell (61% of our excess over libdeflate is load instructions, with IPC,
 //! stalls, cache and branch behaviour all already BETTER than theirs).
 //!
-//! That is why the synthesis passed SIZE cleanly and died on WALL, and it means the
-//! reopen condition in `parse/mod.rs` ("candidates WITHOUT added dependent loads per
-//! position") is not a tuning target — it is asking for more candidates at no load cost,
-//! which this measurement says the bucket cannot provide. igzip's P12 amortises the HASH
-//! computation across two positions; it does not remove a table load, so it does not
-//! satisfy the condition either. Anyone reopening this must say which LOAD disappears.
+//! That is why the synthesis passed SIZE cleanly and died on WALL.
+//!
+//! # ⚠ CORRECTION, SAME DAY — THE WALL LOSS IS OURS, NOT THE ALGORITHM'S
+//!
+//! The paragraph above originally concluded that the second candidate is simply
+//! unaffordable and that L1 was therefore closed. That conclusion was WRONG, and one
+//! measurement shows it. Cachegrind, 4,000,000 B of dickens, L1, vanilla builds:
+//!
+//!     arm              instructions      output bytes    vs libdeflate
+//!     ours (`fast`)     136,990,252        1,673,013     0.87x Ir, +2.06% size
+//!     this port (`ht`)  208,282,438        1,646,894     1.32x Ir, +0.47% size
+//!     libdeflate -1     157,286,577        1,639,188     —
+//!
+//! libdeflate runs the SAME algorithm this file ports — 2-way bucket, i16 positions —
+//! for **157.3M instructions**. We run it for **208.3M**. That is a ~51M instruction
+//! implementation gap on identical work, and it is 33% MORE than the vendor, not the
+//! irreducible price of a second probe.
+//!
+//! Note also what our shipping `fast` parser is: 0.87x libdeflate's instructions and
+//! 2.06% BIGGER output. We are not losing L1 to a better implementation — we sit at a
+//! different point on the speed/ratio curve, cheaper and worse.
+//!
+//! So the live L1 question is NOT "can we afford the second candidate" (libdeflate
+//! affords it at 157M) and NOT igzip's P12 (which amortises the HASH computation and
+//! removes no table load). It is: **where do our extra 51M instructions go, relative to
+//! `ht_matchfinder.h` doing the same thing?** That is a per-function diff against a
+//! `-g` build of libdeflate, and it has never been run for L1 — every prior L1
+//! comparison measured OUR arms against EACH OTHER.
 //!
 //! `HT_MATCHFINDER_BUCKET_SIZE == 2` — the hand-unrolled arm libdeflate ships at
 //! level 1 — **with a `hash3_tab` added in the shape libdeflate's OWN
