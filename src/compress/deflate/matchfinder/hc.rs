@@ -562,7 +562,48 @@ impl HcMatchfinder {
                 // `matchfinder::ht` (-26.7% writes, zero wall movement). Any counter-only
                 // argument here needs a frozen paired wall run before it is believed.
                 //
-                // NEXT LEVER, FROM A VENDOR DIFF (2026-07-31) — NOT YET BUILT.
+                // FALSIFY 2026-07-31 (FALSIFIED) — THE ADDRESSING-MODE FIX BELOW WAS BUILT
+                // AND IT IS THE SAME CHANGE AS THE DEFERRAL FALSIFIED ONE LOOP LOWER.
+                // This is the most useful result in this file, so read it before writing
+                // any new mechanism argument here.
+                //
+                // BUILT: `mp_base = base + in_base_v` and `in_ptr = base + in_next` hoisted
+                // once out of the walk; candidate loads become `mp_base + cur_node4` (one
+                // add) and `in_ptr + off`, taking `base` out of the inner loop. `matchptr`
+                // was still materialised IMMEDIATELY every iteration — the timing that was
+                // falsified was deliberately left alone. Output byte-identical to main at
+                // L2/L6/L9 on five corpus members (15/15 sha256 equal).
+                //
+                // GATE, pre-registered BEFORE measuring: Dr down AND Dw not up.
+                // Cachegrind, Intel i7-13700T (trainer), 6,000,000 B of dickens, -p1:
+                //     L2   Ir -3.36%   Dr +1.11%   Dw -0.80%   FAIL (Dr UP)
+                //     L6   Ir -0.05%   Dr -11.26%  Dw +11.27%  FAIL (Dw UP)
+                //     L9   Ir -3.66%   Dr -22.54%  Dw +15.25%  FAIL (Dw UP)
+                //
+                // THE FINDING: at L6 these counters reproduce the DEFERRAL falsification
+                // recorded below to within 0.004%:
+                //     deferral  Dr 161,009,178 -> 142,887,715   Dw 52,744,347 -> 58,688,632
+                //     this one  Dr 161,004,537 -> 142,882,856   Dw 52,742,337 -> 58,686,403
+                // Two source forms I argued were DIFFERENT MECHANISMS ("change the type,
+                // not the timing") compile to the same machine code. LLVM canonicalises
+                // both to the same schedule, and the spill trade is a property of the
+                // LOOP'S LIVE SET, not of how the address is spelled. The distinction was
+                // real in the source and absent in the object file.
+                //
+                // GENERAL, and this is the fourth receipt in this project: source-level
+                // cost is not machine-level cost — extended here to say that two source
+                // mechanisms can be ONE machine-level change. A mechanism argument that
+                // cannot be distinguished in the emitted code is not a new mechanism, and
+                // "it is a different transformation" does not reopen a falsification.
+                // To reopen this, first show the two forms differ in the DISASSEMBLY.
+                //
+                // Do not be tempted by L9's -22.54% Dr / -66.4M reads against +9.0M writes
+                // ("net memory ops are way down"): the identical counter profile already
+                // LOST a frozen paired wall run (geomean ~1.012, photo.jpg 1.0567). Net-ops
+                // is the wrong quantity; the banked profile says this cell is governed by
+                // dependent LOADS ISSUED and by spills.
+                //
+                // THE VENDOR DIFF THAT MOTIVATED IT still stands and is still unexplained:
                 // The prefilter below is TERM-FOR-TERM libdeflate's (`hc_matchfinder.h`,
                 // "Check for matches of length >= 5"): same four u32 loads, same two
                 // comparisons, same order. So the 1.88x read excess (ours 108,282,726 Dr
@@ -577,32 +618,14 @@ impl HcMatchfinder {
                 // That is the same defect the shipped `chain_base` hoist removed from the
                 // length-4 walk, which is why that hoist won.
                 //
-                // HOW THIS DIFFERS FROM THE FALSIFICATION RECORDED BELOW, which is the
-                // only reason it may be attempted at all: the falsified attempt DEFERRED
-                // materialising `matchptr` to after the walk, which extended `cur_node4`'s
-                // live range and turned reads into spill STORES (+11.3% Dw). libdeflate
-                // materialises the pointer IMMEDIATELY, every iteration, and never extends
-                // anything's live range. Change the TYPE (usize -> *const u8), not the
-                // TIMING. Any attempt must show Dr down AND Dw not up, then a frozen
-                // paired wall run on TUNE members before it is believed.
-                //
-                // ADDRESSING-MODE FIX, built from that diff. Both values below are
-                // loop-invariant across the entire walk and are computed ONCE:
-                //   `mp_base` makes the match side a real pointer, so a candidate is
-                //   `mp_base + cur_node4` (one add) instead of `base.add(idx + off)`
-                //   (two), matching libdeflate's `matchptr = &in_base[cur_node4]`.
-                //   `in_ptr` does the same for the `in_next` side, which never moves
-                //   inside this walk.
-                // Together they take `base` OUT of the inner loop entirely — this is a
-                // live-set reduction, not a load-count trick. `matchptr` is still
-                // materialised IMMEDIATELY every iteration (below); the timing is
-                // deliberately unchanged, because DEFERRING it is what was falsified.
-                // SAFETY: `wrapping_add`/`wrapping_offset` never dereference; every load
-                // is at `cur_node4 > cutoff`, i.e. exactly the addresses the old
-                // `load_u32(base, ..)` form produced, whose bounds the SAFETY note on the
-                // prefilter covers.
-                let mp_base = base.wrapping_add(in_base_v);
-                let in_ptr = base.wrapping_add(in_next);
+                // WHAT IS LEFT OF IT. The addressing difference is real in the SOURCE and
+                // was erased by the compiler, so it is not the lever. The 1.88x read excess
+                // therefore remains UNEXPLAINED by anything visible in this function, and
+                // three separate source-level attacks on it have now failed. The next
+                // honest step is not another rewrite of these loops: it is to diff the
+                // DISASSEMBLY of our walk against libdeflate's compiled walk and find where
+                // the extra loads actually are. Until that diff exists, a change here has
+                // no named vendor difference and the bar is a measurement, not an argument.
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -660,19 +683,14 @@ impl HcMatchfinder {
                         // with `best_len <= max_len`, so `in_next + off + 4 <=
                         // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
                         // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
-                        // These are exactly the four addresses the `load_u32(base, idx)`
-                        // form produced; only the ADDRESSING changed (see `mp_base`).
                         let (m_hi, n_hi, m_lo, n_lo) = unsafe {
                             debug_assert!(matchptr < in_next);
                             debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
-                            let mp = mp_base.wrapping_offset(cur_node4 as isize);
                             (
-                                u32::from_le(core::ptr::read_unaligned(mp.add(off) as *const u32)),
-                                u32::from_le(core::ptr::read_unaligned(
-                                    in_ptr.add(off) as *const u32
-                                )),
-                                u32::from_le(core::ptr::read_unaligned(mp as *const u32)),
-                                u32::from_le(core::ptr::read_unaligned(in_ptr as *const u32)),
+                                load_u32(base, matchptr + off),
+                                load_u32(base, in_next + off),
+                                load_u32(base, matchptr),
+                                load_u32(base, in_next),
                             )
                         };
                         #[cfg(feature = "anatomy-counters")]
