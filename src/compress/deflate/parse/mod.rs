@@ -636,6 +636,12 @@ pub(super) fn compress(
         // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
         // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
         // closed search and what the 2.19x instruction gap actually is.
+        // MEASUREMENT GATE (probe branch only, never merged): route L1 to the ht port
+        // so its instruction count can be compared against libdeflate's own L1.
+        #[cfg(not(feature = "l1-tune"))]
+        Strategy::Fast if std::env::var_os("PROBE_L1_HT").is_some() => {
+            ht_fast::run(buf, data_start, in_end, params, statics, bw, is_last)
+        }
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,
