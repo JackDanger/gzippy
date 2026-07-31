@@ -183,6 +183,14 @@ pub const HT_HASH_ORDER: u32 = 15;
 /// `HT_MATCHFINDER_BUCKET_SIZE`. The port below is the hand-unrolled `== 2` arm;
 /// changing this constant alone does NOT change the algorithm.
 pub const HT_BUCKET_SIZE: usize = 2;
+/// How many positions of a SKIPPED run still get a length-3 insert.
+///
+/// igzip caps hash updates over an accepted match at 3 positions
+/// (`ISAL_LIMIT_HASH_UPDATE`, `igzip_base.c:74-78`) and `parse::fast` already ships the
+/// same idea on the L1 path. libdeflate's `ht_matchfinder` has no length-3 table at all,
+/// so it pays nothing here; we added one for the binary-file wins and were paying for it
+/// on every interior position of every match.
+pub const HT_SKIP_HASH3_LIMIT: u32 = 3;
 /// Number of buckets.
 pub const HT_TAB_LEN: usize = 1 << HT_HASH_ORDER;
 /// `HT_MATCHFINDER_MIN_MATCH_LEN`. Asserted throughout the port, exactly as
@@ -551,6 +559,8 @@ impl HtMatchfinder {
         let mut hash3 = *next_hash3 as usize;
         let mut pos = in_next;
         let mut remaining = count;
+        // Positions inserted into the length-3 table so far in THIS skipped run.
+        let mut skipped: u32 = 0;
         loop {
             debug_assert!(hash < HT_TAB_LEN && hash3 < HT_HASH3_SIZE);
             // Plain two-store shift, faithful to `ht_matchfinder_skip_bytes`.
@@ -610,7 +620,17 @@ impl HtMatchfinder {
             // levers falsified on 2026-07-31, this REMOVES WORK the vendor does not do
             // rather than betting that a different spelling codegens better — but it
             // changes output, so it needs the full size board plus a wall leg.
-            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            // CAPPED, per igzip's `ISAL_LIMIT_HASH_UPDATE` (`igzip_base.c:74-78`, which
+            // uses `end = next_hash + 3` rather than `+ match_length`) and per the
+            // `LIMIT_HASH_UPDATE` our own `parse::fast` already ships on the L1 path.
+            // The BUCKET insert above still runs for every position — that is what
+            // libdeflate does — but the length-3 table is a singleton that gets
+            // overwritten anyway, so inserting it for the whole interior of a long match
+            // buys coverage that the next few positions immediately clobber.
+            if skipped < HT_SKIP_HASH3_LIMIT {
+                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            }
+            skipped += 1;
 
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
