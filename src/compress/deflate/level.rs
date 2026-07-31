@@ -144,6 +144,11 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 10,
             near_optimal: NONE_NO,
         },
+        // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
+        // `parse::gated.rs` NO LONGER EXIST (deleted by user order — `CLAUDE.md`
+        // non-negotiable #3 forbids content detectors choosing a parser). L3 routes to
+        // `Strategy::Lazy` unconditionally; see the `3 => LevelParams` arm below, which
+        // is the fact. The original note read:
         // L3 = DETECTOR-GATED LAZY (`Strategy::LazyGated` -> `parse::gated::run`,
         // per-block GREEDY-vs-LAZY dispatch under a two-sided literal-fraction
         // content detector — see `parse::gated`'s module doc comment).
@@ -301,6 +306,7 @@ mod tests {
         assert_eq!(params(0).strategy, Strategy::Fast0);
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
 
+        // ⚠ STALE: LazyGated is deleted; L3 is `Strategy::Lazy`. Original note:
         // L3 = LazyGated unconditionally since the 2026-07-23 supervisor
         // adjudication of the frozen cell gate (see the level-3 arm's
         // promotion-history comment); `l3-tune` only makes the gate's

@@ -69,7 +69,15 @@ pub(crate) mod route {
 ///   -F / -I / -J (explicit zopfli tuning) → zopfli (pure `zopfli_pure`)
 ///   T1  L0–L12  → `deflate::encode_gzip_bytes_to_vec` (pure single-member gzip)
 ///   T>1 L0–L12  → `PipelinedGzEncoder::compress_buffer_pure` (pure parallel,
-///                 standard single-member gzip, byte-identical across T)
+///                 standard single-member gzip)
+///
+/// T>1 IS NOT REQUIRED TO MATCH T1'S BYTES, and this comment used to claim it was.
+/// `CLAUDE.md` STEP 2: "THE ONLY CORRECTNESS BAR, at every thread count, is VALID
+/// GZIP: roundtrip sha256 through our decoder plus one independent decoder. T>1 may
+/// emit different bytes than T1." That retraction was issued three separate times
+/// precisely because statements like this one kept regenerating the rule from a
+/// leaf file after the root was corrected. The T>1 size leg is closed by making
+/// SEAMS smaller, never by reproducing T1's output.
 pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     reader: R,
     writer: W,

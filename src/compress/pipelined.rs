@@ -1,3 +1,11 @@
+//! T-SCOPE: **T>1 ONLY**. Nothing in this file is on the T=1 path.
+//!
+//! Grep discipline (user, 2026-07-31): the encoder has two drivers over one shared
+//! engine, and they must never be confused when searching. `T-SCOPE:` markers head
+//! every module under `src/compress/` so `grep -rn 'T-SCOPE: \*\*T>1' src/compress/`
+//! enumerates the parallel driver exactly, and the shared engine says so itself.
+//! Decompression lives in `src/decompress/` and is finished — never in scope here.
+//!
 //! Pipelined compression with dictionary sharing for maximum compression
 //!
 //! At high compression levels (L7-L9), users expect maximum compression ratio.
@@ -183,8 +191,10 @@ fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> us
     // scheduler hands chunks out from an atomic queue, so oversubscription is what lets
     // a thread that drew an incompressible chunk pick up another while its neighbours
     // finish. One-chunk-per-thread would make the whole job as slow as its unluckiest
-    // chunk. Four is the smallest margin that keeps a straggler to a quarter of a
-    // thread's share.
+    // chunk. TWO is the shipped margin (`CHUNKS_PER_THREAD` above): it keeps a straggler
+    // to half a thread's share while keeping chunks large enough to amortise the block
+    // header and the per-chunk matchfinder warm-up. This prose used to argue for FOUR
+    // while the constant said 2 — the constant is the fact.
     //
     // Bounds, both load-bearing:
     //   * MIN keeps tiny inputs from over-fragmenting (and preserves the small-file

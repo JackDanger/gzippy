@@ -1,3 +1,10 @@
+//! T-SCOPE: **MIXED** — read carefully before assuming.
+//!
+//! Despite the name this is not purely the T>1 driver: `GzipHeaderInfo` is a SHARED
+//! type used by `io.rs`, `mod.rs` and `pipelined.rs` at every thread count, and
+//! `compress_rsyncable` is its own `--rsyncable` path. The actual T>1 driver is
+//! `compress/pipelined.rs`. Splitting this file along the T axis is unfinished work.
+//!
 //! High-performance parallel gzip compression
 //!
 //! This module implements parallel compression using memory-mapped I/O and

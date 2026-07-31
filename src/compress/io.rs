@@ -1,3 +1,5 @@
+//! T-SCOPE: **DISPATCH** — chooses the driver; runs at every thread count.
+//!
 //! File, stdin, and directory I/O for compression.
 //!
 //! Entry points: `compress_file` and `compress_stdin`.
