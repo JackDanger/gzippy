@@ -715,3 +715,34 @@ split more often we pay the headers and gain nothing back. Ninth falsification o
 That leaves ONE named candidate standing at L2: the HASH GEOMETRY. zlib uses a 3-byte
 rolling hash into a 15-bit table and finds 27% more matches than our hash3+hash4 pair does
 with a DEEPER chain. Nothing else on the list survives measurement.
+
+### LOCATED: our length-3 table is a SINGLETON; zlib's 3-byte hash is CHAINED
+
+`anatomy-counters`, dd79_bin6 at L2 (input 6,291,456 B = 2,190,875 literals + 4,100,581
+match bytes):
+
+    hc_probe_attempts          1,665,913
+    hc_probe_outcome_miss      1,242,592     74.6% of probes MISS
+    hc_probe_outcome_accepted    423,321     <- only 36% of our matches came from the CHAIN
+    matches_emitted            1,168,118     avg match length 3.51
+      => 744,797 matches (64%) came from the LENGTH-3 TABLE, not the chain
+
+    gzip on the same file:     1,487,378 matches covering 4,909,980 B, avg 3.30
+      => MORE matches, SHORTER on average, covering 810 KB more input
+
+`hc.rs:92` declares it outright: **"Singleton nodes for length-3 matches"**. Our `hash3_tab`
+holds exactly ONE position per key and has no chain; `next_tab` chains only the 4-byte hash.
+zlib hashes THREE bytes into its single table and chains it through `prev[]`, so it can walk
+many length-3 candidates where we can only ever see the most recent one.
+
+That is exactly "more matches from a shallower chain", and it explains why depth, min_len and
+cadence all measured as irrelevant here: **zlib's chain is over 3-byte keys, ours is over
+4-byte keys with a one-deep 3-byte fallback** — and on this file 64% of our matches come out
+of that one-deep table. Deepening a 4-byte chain cannot find what a 3-byte chain finds.
+
+THE LEVER, not yet built: give `hash3_tab` a chain (or hash 3 bytes into the chained table,
+as zlib does). Vendor-precedented by both zlib and gzip. Cheapest falsifier is the
+deterministic size board at L2-L4. Cost stated up front: `matchfinder::ht`'s decomposition
+showed each extra candidate per position is one extra dependent load, and
+`project_encoder_deficit_is_loads_not_stalls` says loads govern this encoder — so this needs
+a wall leg, and a size-only argument is 3 for 3 wrong in this campaign.
