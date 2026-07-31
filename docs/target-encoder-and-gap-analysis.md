@@ -178,6 +178,57 @@ wall front: libdeflate at T1 (19 of 19 losing wall cells, 1.0433-1.2274 at L6).
 **Cache behaviour is IDENTICAL.** The gap is pure issued work, and the wall tracks it
 (photo.jpg has both the worst instruction ratio and the worst wall ratio).
 
+**VENDOR-ANCHORED, and this is the number that matters.** Both matchfinders cachegrinded
+on the same 6,000,000 B of dickens at L6, libdeflate built `-O2 -g` so its profile is not
+one opaque symbol (hard stop #1):
+
+| matchfinder, inlined into its lazy parser | Ir | **Dr** | D1 read misses |
+|---|---|---|---|
+| libdeflate `hc_matchfinder.h` | 358,511,770 | **57,593,044** | 26,260,946 |
+| ours `hc.rs` | 414,673,369 | **108,282,726** | 26,285,498 |
+| ratio | 1.157x | **1.880x** | **1.001x** |
+
+**We issue 1.88x libdeflate's DATA READS inside the matchfinder, for byte-identical output
+and an identical number of cache misses.** That is ~50.7M excess reads, and the whole
+program's excess is 49.9M (161.0M vs 111.1M). **The entire L6 T1 gap is this one number.**
+
+The misses matching to 0.1% is what makes it diagnostic: identical misses means identical
+memory FOOTPRINT and identical chain-node visits. Same algorithm, same nodes, same cache
+behaviour — twice the loads issued to walk them. Loads that hit L1 and do not exist in the
+vendor's version are, by elimination, **spill/reload traffic**.
+
+**LINE-FOR-LINE against the vendor, which narrows it further.** Same runs, both
+matchfinders annotated:
+
+| line | libdeflate Dr | ours Dr | ratio |
+|---|---|---|---|
+| pre-screen compare (`load_u32(matchptr + best_len - 3)` vs our `m_hi/m_lo`) | 16,161,531 | 16,737,027 | **1.04x — at parity** |
+| `next_tab[cur_pos] = hash4_tab[hash4]` | 3,920,446 | 3,920,446 | **identical** |
+| `if max_len < 5` | 2,079,550 | 2,079,550 | **identical** |
+| chain chase / walk body | 15,586,216 | ~31,588,577 | **~2.0x** |
+| the return (`*offset_ret = in_next - best_matchptr` vs our tuple) | 3,679,991 | 9,460,576 | **2.6x** |
+
+**Everything that touches memory for a REASON is already at parity.** The pre-screen
+compare, the table write and the tail check match to within 4%. The excess lives in
+exactly two places, and neither is algorithmic:
+
+* **the walk body, ~2x** — and note that de-pipelining it is FALSIFIED (1.0131 / 1.0624 /
+  1.0992 slower at L2/L6/L9), so the pipelining is earning its keep; the cost is the extra
+  live value it needs, not the pipelining itself.
+* **the return, 2.6x** — 5.8M reads to hand back two `u32`s that should be in registers.
+  `best_len` and `best_matchptr` are being spilled and reloaded at the return point.
+
+One vendor difference is visible and is NOT available to us: libdeflate issues
+`prefetchw(&mf->hash3_tab[next_hashes[0]])` for the NEXT position's head slot. Ours had a
+prefetch of the next CHAIN NODE and it is falsified (it cost 103M L1 loads on this very
+input). Those are different prefetches and the vendor's is untried here — but the falsified
+one is close enough that any retry needs its own REOPEN, not this note as cover.
+
+So the remaining target is exact and vendor-anchored: **get `hc.rs`'s Dr from 108M to
+~58M.** Output is byte-identical at L2 and L4-L9, so no size cell can move while doing it —
+a pure wall lever with a free correctness oracle.
+
+
 **Per-function:** `matchfinder/hc.rs`, inlined into `lazy::run_resumable`, is **61.3% of
 instructions and 68.2% of reads** — 112,415,312 reads, which alone is about libdeflate's
 ENTIRE program (111,064,646).
