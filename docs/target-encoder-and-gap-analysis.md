@@ -1286,3 +1286,55 @@ they never predict the wall. Nothing here is a promised win. The next step is to
 `block_split.rs` against `deflate_should_end_block`/`do_end_block_check` as ALGORITHMS — how
 often each runs and what it computes per call — and then measure Ir AND wall at a shallow and
 a deep level before believing anything.
+
+## G22a — RETRACTION of the "block splitting is 14x" line in G22
+
+WRONG, AND MINE. G22 compared our `block_split.rs` (21,816,711 Ir) against libdeflate's
+`do_end_block_check` (721,264) + `calculate_min_match_len` (790,842) and called it 14.4x.
+That is not like-for-like.
+
+libdeflate's PER-POSITION split cost is `observe_literal`/`observe_match`
+(`deflate_compress.c:2110,2121`), both `forceinline` and called from `deflate_compress_greedy`
+(`:3695-3700`). Their cost therefore lands inside `deflate_compress.c:deflate_compress_greedy`
+(84,045,480 Ir), NOT inside `do_end_block_check`, which is only the rare amortised check. Our
+21,816,711 in `block_split.rs` is the per-position observe PLUS the check, attributed to
+`greedy::run_resumable`. I compared our observe+check against their check alone.
+
+There is no measured 14x. The component may still be worse than theirs; this profile cannot
+say, because their observe cost is not separable from their parse loop.
+
+### What survives, restated honestly
+
+Role-level totals are unaffected (files sum to 99.7%/99.9% of program Ir):
+
+    role                          gzippy         libdeflate      ratio
+    matchfinder search+extend   349,349,702    346,344,561       1.009   PARITY
+    parse / emit / block split  207,177,313    151,190,672       1.370   THE EXCESS
+
+Splitting that second row by what the code DOES, using the one boundary the profiles agree
+on (per-position loop body vs per-block flush):
+
+    emit / flush                                 gzippy        libdeflate     ratio
+      ours: parse/mod.rs::emit_sequences 34,667,354 + bitstream.rs 22,775,726
+            + huffman/fast.rs 794,248            58,237,328
+      theirs: deflate_flush_block 62,772,475 + common_defs.h(flush) 1,507,782
+                                                             64,280,257      0.906  WE WIN
+
+    per-position parse loop body (all remaining non-matchfinder)
+      ours: parse/mod.rs(run_resumable) 47,256,132 + greedy.rs 22,841,792
+            + block_split.rs 21,816,711 + uint_macros.rs 20,566,683
+            + tables.rs 19,082,899 + const_ptr.rs 10,945,358 + slice/iter/macros.rs 3,593,348
+            + non_null 1,358,588 + range 1,357,998           148,819,509
+      theirs: deflate_compress.c::deflate_compress_greedy      84,045,480    1.771
+
+CAVEAT ON THAT 1.771: the ours-side grouping puts `const_ptr.rs`, `non_null.rs` and
+`slice/iter/macros.rs` (15,897,294 combined) in the parse row, but cachegrind attributes them
+only to `run_resumable`, which also contains the matchfinder. Some of that belongs in the
+matchfinder row. The ratio is therefore an UPPER bound; excluding all three gives
+132,922,215 / 84,045,480 = 1.582. The conclusion is the same at either end: the per-position
+parse loop body costs 1.6-1.8x libdeflate's, our emit path is CHEAPER than theirs (0.906), and
+the matchfinder is at parity.
+
+So the target is the non-matchfinder per-position work — sequence storage, the observe, the
+slot-table lookups — not the search, not the emit, and not (on this evidence) block splitting
+in particular.
