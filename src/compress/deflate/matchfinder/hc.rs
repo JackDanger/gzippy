@@ -585,6 +585,24 @@ impl HcMatchfinder {
                 // anything's live range. Change the TYPE (usize -> *const u8), not the
                 // TIMING. Any attempt must show Dr down AND Dw not up, then a frozen
                 // paired wall run on TUNE members before it is believed.
+                //
+                // ADDRESSING-MODE FIX, built from that diff. Both values below are
+                // loop-invariant across the entire walk and are computed ONCE:
+                //   `mp_base` makes the match side a real pointer, so a candidate is
+                //   `mp_base + cur_node4` (one add) instead of `base.add(idx + off)`
+                //   (two), matching libdeflate's `matchptr = &in_base[cur_node4]`.
+                //   `in_ptr` does the same for the `in_next` side, which never moves
+                //   inside this walk.
+                // Together they take `base` OUT of the inner loop entirely — this is a
+                // live-set reduction, not a load-count trick. `matchptr` is still
+                // materialised IMMEDIATELY every iteration (below); the timing is
+                // deliberately unchanged, because DEFERRING it is what was falsified.
+                // SAFETY: `wrapping_add`/`wrapping_offset` never dereference; every load
+                // is at `cur_node4 > cutoff`, i.e. exactly the addresses the old
+                // `load_u32(base, ..)` form produced, whose bounds the SAFETY note on the
+                // prefilter covers.
+                let mp_base = base.wrapping_add(in_base_v);
+                let in_ptr = base.wrapping_add(in_next);
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -642,14 +660,19 @@ impl HcMatchfinder {
                         // with `best_len <= max_len`, so `in_next + off + 4 <=
                         // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
                         // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
+                        // These are exactly the four addresses the `load_u32(base, idx)`
+                        // form produced; only the ADDRESSING changed (see `mp_base`).
                         let (m_hi, n_hi, m_lo, n_lo) = unsafe {
                             debug_assert!(matchptr < in_next);
                             debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
+                            let mp = mp_base.wrapping_offset(cur_node4 as isize);
                             (
-                                load_u32(base, matchptr + off),
-                                load_u32(base, in_next + off),
-                                load_u32(base, matchptr),
-                                load_u32(base, in_next),
+                                u32::from_le(core::ptr::read_unaligned(mp.add(off) as *const u32)),
+                                u32::from_le(core::ptr::read_unaligned(
+                                    in_ptr.add(off) as *const u32
+                                )),
+                                u32::from_le(core::ptr::read_unaligned(mp as *const u32)),
+                                u32::from_le(core::ptr::read_unaligned(in_ptr as *const u32)),
                             )
                         };
                         #[cfg(feature = "anatomy-counters")]
