@@ -640,3 +640,55 @@ which we already run per block via `recalculate_min_match_len(&sink.litlen_freqs
 But it is data-dependent, the rule is explicit, and it is NOT being built unilaterally.
 
 Recorded so the decision is visible rather than silently taken or silently avoided.
+
+
+## G13 — L2-L4 IS A THIRD, DIFFERENT MECHANISM (measured 2026-07-31; cause still open)
+
+52 of the 200 failing cells are at L2-L4, and I had never looked at them. They are NOT the
+L1 problem (register pressure) and NOT the L5-L9 problem (search depth).
+
+    L2-L4 failing: 52   by rival: libdeflate 34, gzip 10, pigz 6, igzip 2
+    worst offender by far: dd79_bin6 (10 cells)
+      gzip  dd79_bin6 L2 +41,747 B (+0.936%)     pigz dd79_bin6 L2 +36,570 B (+0.819%)
+      gzip  dd79_bin6 L3 +25,315 B (+0.571%)     pigz dd79_bin6 L3 +19,767 B (+0.445%)
+
+### `fulcrum why` says the parse decisions differ, not the search
+
+`fulcrum why gzip:dd79_bin6:L2:T1:size` (the tool built for this; layers 1 and 2 of 4 ran,
+3 and 4 skipped and named):
+
+    ours : 3,358,993 tokens (1,168,118 matches, 2,190,875 literals)  36,005,906 bits (42,812 header)
+    gzip : 2,868,854 tokens (1,487,378 matches, 1,381,476 literals)  35,675,122 bits (51,558 header)
+
+    matches       ours 0.6518/byte  gzip 0.7804/byte   gzip finds 27% MORE
+    literals      ours 0.3482/byte  gzip 0.2196/byte   we emit 59% MORE
+    match_len_L00 ours 0.1189       gzip 0.1796        gzip's excess is in the SHORTEST bucket
+
+Verdict: "different parse decisions — the gap is ALGORITHMIC". Note gzip spends MORE header
+bits (51,558 vs 42,812) — more, better-fitted blocks — and still wins on net.
+
+And the depth story from L5-L9 is INVERTED here: zlib's L2 is `{good 4, lazy 4, nice 8,
+chain 4}` while ours is Greedy/depth 6/nice 10. **We search DEEPER and find FEWER matches.**
+
+### FALSIFIED: it is not the min-match-length heuristic
+
+The obvious candidate was libdeflate's `choose_min_match_len(num_used_literals, ...)`, which
+we inherited and zlib has no equivalent of — it would explain rejecting short matches gzip
+accepts. Ablated (forced to `DEFLATE_MIN_MATCH_LEN` always):
+
+    dd79_bin6   L2 4,500,757 -> 4,500,757   L3 4,461,737 -> 4,461,737   IDENTICAL
+    ecoli.fastq L2 4,692,678 -> 4,704,502 (worse)   L3 4,614,619 -> 4,586,405 (better)
+    dickens     L2 4,772,260 -> 4,795,619 (worse)   L3 4,609,149 -> 4,625,681 (worse)
+
+`dd79_bin6` is byte-for-byte unchanged, so `min_len` was ALREADY 3 there — the heuristic
+rejects nothing on that file. Where it does fire, removing it is mostly worse. Eighth
+falsification of 2026-07-31.
+
+### What is still open
+
+gzip finds 27% more matches at L2 on this file with a SHALLOWER chain and no length-3
+rejection on our side. So the extra matches come from neither depth nor `min_len`. The
+remaining structural differences at L2 are the hash geometry (zlib's 3-byte rolling hash and
+15-bit table vs our hash3+hash4 pair) and the block-splitting cadence (zlib's fixed
+16,383-symbol quantum vs our drift detector — note gzip spends MORE header bits and wins).
+Both are measurable by ablation; neither has been measured.
