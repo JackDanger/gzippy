@@ -185,6 +185,16 @@ pub const HT_HASH_ORDER: u32 = 15;
 pub const HT_BUCKET_SIZE: usize = 2;
 /// Number of buckets.
 pub const HT_TAB_LEN: usize = 1 << HT_HASH_ORDER;
+
+/// MEASUREMENT-ONLY ablation flag, resolved ONCE per process.
+///
+/// The first version of this gate called `std::env::var_os` inside the per-position
+/// loops. That cost ~1.3 BILLION instructions on a 4 MB input and completely swamped
+/// the quantity being measured — the instrument changed the measurement. Read it once.
+fn ablate_hash3() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("ABLATE_HASH3").is_some())
+}
 /// `HT_MATCHFINDER_MIN_MATCH_LEN`. Asserted throughout the port, exactly as
 /// libdeflate's `STATIC_ASSERT` does: the 4-byte `seq` compare depends on it.
 pub const HT_MIN_MATCH_LEN: u32 = 4;
@@ -400,7 +410,7 @@ impl HtMatchfinder {
         let hash3 = *next_hash3 as usize;
         let next_seq = unsafe { load_u32(base, in_next + 1) };
         *next_hash = lz_hash(next_seq, HT_HASH_ORDER);
-        let ablate3 = std::env::var_os("ABLATE_HASH3").is_some();
+        let ablate3 = ablate_hash3();
         if !ablate3 {
             *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
         }
@@ -557,6 +567,7 @@ impl HtMatchfinder {
         let base = buf.as_ptr();
         let mut hash = *next_hash as usize;
         let mut hash3 = *next_hash3 as usize;
+        let ablate3_skip = ablate_hash3();
         let mut pos = in_next;
         let mut remaining = count;
         loop {
@@ -635,7 +646,7 @@ impl HtMatchfinder {
             //
             // The ~19M remains unattributed. Do not guess again: ablate a candidate and
             // read the delta, the way this note was produced.
-            if std::env::var_os("ABLATE_HASH3").is_none() {
+            if !ablate3_skip {
                 unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
             }
 
