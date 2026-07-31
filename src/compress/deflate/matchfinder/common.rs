@@ -112,36 +112,31 @@ pub fn lz_extend(
     // all `<= data.len()`. The debug_asserts trap any caller that breaks it.
     debug_assert!(str_pos + max <= data.len());
     debug_assert!(match_pos + max <= data.len());
+    // FALSIFY 2026-07-31 (FALSIFIED) — do NOT add libdeflate's 4x unrolled
+    // `COMPARE_WORD_STEP` block (`matchfinder_common.h:185-201`) here, and do not
+    // convert the two index expressions to hoisted pointers. Both were built, and both
+    // are noise:
+    //     arm            before        after         delta
+    //     fast L1     136,990,252   136,234,968    -755,284  (-0.55%)
+    //     ht port L1  208,282,438   208,468,631    +186,193  (+0.09%, WORSE)
+    // Cachegrind, trainer (Intel i7-13700T), 4,000,000 B of dickens, vanilla builds,
+    // output byte-identical throughout (dickens L6 = 4,539,505).
+    //
+    // WHY THE IDEA LOOKED GOOD AND WAS STILL WRONG: our `matchfinder/common.rs` costs
+    // 28,905,460 Ir against libdeflate's `matchfinder_common.h` at 17,358,093 (1.66x) on
+    // the same L1 work, and the vendor really does pay one bound check per 32 bytes
+    // where the loop below pays one per 8. That is a real source-level difference. It is
+    // not a machine-level one — LLVM had already unrolled this loop, so the explicit
+    // unroll only added code. Hard stop #4, fourth instance.
+    //
+    // The 1.66x is therefore still UNEXPLAINED and still worth explaining; it is simply
+    // not the unroll and not the addressing. Anyone attacking it next should get
+    // line-level attribution INSIDE this file first (the current profile inlines
+    // everything into `parse::compress`, which hides which helper is expensive).
     unsafe {
-        // 4x UNROLLED FAST PATH — libdeflate's `COMPARE_WORD_STEP` block
-        // (`matchfinder_common.h:185-201`). We had only the checked loop below, i.e.
-        // ONE BOUND CHECK PER 8 BYTES where the vendor pays one per 32. `lz_extend` is
-        // the hottest helper in the matchfinder and our `matchfinder/common.rs`
-        // measures 28.9M instructions against their `matchfinder_common.h`'s 17.4M
-        // (1.66x) on the same L1 work, so the missing unroll is a named vendor
-        // difference, not a guess.
-        //
-        // Pointers are formed ONCE outside the loop rather than recomputing
-        // `base + str_pos + len` and `base + match_pos + len` per step: that is the
-        // vendor's shape (it takes `strptr`/`matchptr` directly) and it is the same
-        // addressing-mode difference the shipped `chain_base` hoist removed from the
-        // hc length-4 walk.
-        let sp = base.add(str_pos);
-        let mp = base.add(match_pos);
-        if max - len >= 4 * WORDBYTES {
-            for _ in 0..4 {
-                let v = u64::from_le(core::ptr::read_unaligned(mp.add(len) as *const u64))
-                    ^ u64::from_le(core::ptr::read_unaligned(sp.add(len) as *const u64));
-                if v != 0 {
-                    return (len + (v.trailing_zeros() as usize >> 3)) as u32;
-                }
-                len += WORDBYTES;
-            }
-        }
         while len + WORDBYTES <= max {
             // Reads [match_pos+len, +8) and [str_pos+len, +8); len+8 <= max.
-            let v = u64::from_le(core::ptr::read_unaligned(mp.add(len) as *const u64))
-                ^ u64::from_le(core::ptr::read_unaligned(sp.add(len) as *const u64));
+            let v = load_u64(base, match_pos + len) ^ load_u64(base, str_pos + len);
             if v != 0 {
                 // Little-endian: the first differing byte is at trailing_zeros/8.
                 return (len + (v.trailing_zeros() as usize >> 3)) as u32;
