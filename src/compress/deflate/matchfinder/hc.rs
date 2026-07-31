@@ -545,6 +545,18 @@ impl HcMatchfinder {
                 // The transformation is not what matters; the live-set budget of the
                 // specific loop is.
                 //
+                // ⚠ PROVENANCE CORRECTION 2026-07-31, applies to BOTH verdicts above and
+                // to the length-4 hoist that shipped: `photo.jpg` is a GATE member
+                // (`corpus_split.json`), not TUNE. It was quoted as the headline for the
+                // shipped win ("0.9443", "our worst wall cell 1.2274 -> 1.159") and again
+                // here as the tell. No parameter was fitted to it, so no promotion is
+                // void — but the win is WEAKER than it was reported. Recomputed on TUNE
+                // members only: armexe.elf 0.9849, symbols.dwarf 0.9969, aozora.txt
+                // 0.9983, dickens 1.0023, data.csv 1.0081 => geomean 0.9981, i.e. 0.19%,
+                // INSIDE this rig's ~1.5% A/A noise floor, with only armexe.elf arguably
+                // outside it. The 0.9889 figure was carried by the gate file.
+                // Select and headline on TUNE; let GATE only ever confirm.
+                //
                 // GENERAL: a -20% READ count in a matchfinder does not imply a faster wall.
                 // Two independent instances now — this, and the u32-packed bucket in
                 // `matchfinder::ht` (-26.7% writes, zero wall movement). Any counter-only

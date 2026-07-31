@@ -120,6 +120,31 @@ So the wall front and the size front are THE SAME FRONT: libdeflate holds 142 of
 failing size cells and 19 of 19 losing wall cells. **The campaign's entire remaining
 problem is libdeflate, and at T1.** gzip, pigz and igzip are not wall fronts at L6 at all.
 
+### Re-measured 2026-07-31 on main @fd8fde5e — TUNE set, L6 T1, frozen, guarded
+
+First wall board run through `scripts/campaign/board-wall.sh` (the guarded path), so the
+binary is attested vanilla and the box was frozen. Artifacts: `docs/boards/wall-L6T1-fd8fde5e.tsv`.
+
+    declared=44  measured_ok=29  absent=11  void=4  slower=8
+    vs gzip        0 of 10 failing        vs pigz   0 of 11 failing
+    vs igzip       0 of 0  (all 11 cells structurally ABSENT — igzip's CLI has no level 6)
+    vs libdeflate  8 of 8 failing:
+      armexe.elf 1.1387 · engine.wasm 1.1240 · movie.mp4 1.1222 · minjs.min.js 1.1199
+      data.parquet 1.0738 · data.csv 1.0679 · tool.bin 1.0616 · dickens 1.0582
+
+**Every measured libdeflate cell at L6 T1 fails; every gzip and pigz cell passes.** That is
+the same shape as the older board and it is not improving: the worst cell is now
+`armexe.elf` at +13.9%.
+
+The 4 VOIDs are A/A harness bias 0.41–0.87% (aozora.txt, data.json, symbols.dwarf vs
+libdeflate; data.parquet vs gzip) — the census refusing to report a ratio when its own
+control drifted. Legitimate VOIDs, re-runnable, NOT results.
+
+⚠ The previous line's "1.2274 (photo.jpg)" is a GATE member and should never have been the
+headline. On TUNE members only, the chain-base win recomputes to geomean 0.9981 (0.19%) —
+inside the ~1.5% noise floor. See the provenance correction in
+`src/compress/deflate/matchfinder/hc.rs`. **Select and headline on TUNE; GATE only confirms.**
+
 ### The VOIDs were an instrument limit — FIXED, and it unlocked 38 cells
 
 First run: 45 VOID of 160, **41 of them** `pin-gate FAIL: ours cpu%=~400 (ok=true) rival
