@@ -162,6 +162,62 @@ and needs no fix.
 
 ## 2. The gaps, ranked by structural distance
 
+### G0 — THE L6 T1 WALL GAP IS REGISTER SPILL IN THE CHAIN WALK. **Located 2026-07-30. Start here.**
+
+This is the highest-value locate the campaign has produced, and it is the ONLY remaining
+wall front: libdeflate at T1 (19 of 19 losing wall cells, 1.0433-1.2274 at L6).
+
+**Whole-program, cachegrind, 6,000,000 B at L6 T1, Zen2, ours vs libdeflate:**
+
+| | dickens | photo.jpg |
+|---|---|---|
+| I refs | 1.24x | 1.38x |
+| D reads | **1.49x** | **1.36x** |
+| **D1 misses** | **1.003x** | **1.003x** |
+
+**Cache behaviour is IDENTICAL.** The gap is pure issued work, and the wall tracks it
+(photo.jpg has both the worst instruction ratio and the worst wall ratio).
+
+**Per-function:** `matchfinder/hc.rs`, inlined into `lazy::run_resumable`, is **61.3% of
+instructions and 68.2% of reads** — 112,415,312 reads, which alone is about libdeflate's
+ENTIRE program (111,064,646).
+
+**Per-line, and this is the finding.** Our excess over libdeflate is ~54M reads. These
+lines account for ~40M of it, and every one of them is arithmetic on values that should
+be in registers:
+
+| Dr | line | what it should cost |
+|---|---|---|
+| **30,311,345** | `matchptr = (in_base_v as isize + cur_node4 as isize) as usize;` | **~0 — an ADD of two locals** |
+| 33,425,344 | `<unknown (line 0)>` — the chain-walk inner loop | the real pointer chase |
+| 16,737,027 | `if m_hi == n_hi && m_lo == n_lo` | legitimate: loads the candidate's bytes |
+| 7,381,028 | `(best_len, (in_next - best_matchptr) as u32)` — the RETURN | **~0** |
+| 2,727,454 | `if best_len >= nice_len` | **~0 — `nice_len` is a parameter** |
+| 2,079,550 | `let mut cur_pos = in_next - *in_base;` | 1 load, not 2M |
+
+**It is REGISTER PRESSURE, not aliasing — and that distinction is load-bearing.**
+`in_base_v` is ALREADY a local (`let in_base_v = *in_base;` at the top of the function)
+and is still reloaded 30 million times. So the fix is NOT to change `&mut usize`
+parameters to by-value; the aliasing is already gone. LLVM is spilling because too many
+values are live across the chain-walk loop. The plan's older T1-wall hypothesis
+("LLVM cannot prove non-aliasing … so `cutoff`/`nice_len` live in memory") named the right
+SYMPTOM and the wrong CAUSE.
+
+**What that implies for the fix:** reduce what is live across the walk, not what is
+borrowed. Candidates, unmeasured: sink the `hash3` path out of the length-4 loop so its
+values are not live across it; drop `blen` (used only by `debug_assert!`, should be dead in
+release but costs a register if it is not); split the function so the chain walk is its own
+`#[inline(never)]` body with a minimal live set. Each is testable by re-running this exact
+cg_annotate and watching the 30M line.
+
+**Why this is NOT another instance of the "LLVM already did it" trap** (four instances
+recorded in `matchfinder::ht`): those were cases where the compiler had ALREADY performed
+the transform and hand-doing it added work. This is the opposite — a transform the compiler
+demonstrably has NOT performed, with the cost visible per line. The falsifier is the same
+command that found it, so a failed attempt costs one cachegrind run.
+
+---
+
 ### G1 — L1: we are ALREADY the instruction champion and still lose on ratio. **Reframed 2026-07-30.**
 
 **Measure this before doing anything else with L1.** Cachegrind, 6,000,000 B of data.csv
