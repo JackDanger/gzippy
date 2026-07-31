@@ -1644,3 +1644,66 @@ It also sets the honest scale for what has been achieved: the T>1-vs-libdeflate 
 enough (5 on the LOCAL corpus; the solvency verdict is still pending and already disagrees on
 at least one — `movie.mp4 L9 T4` shows us 19 B BIGGER there), and the remaining ~43 need the
 seam itself to go to zero.
+
+## G29 — THE FRONTIER RESULT WAS MEASURED AT THE WRONG COORDINATE. T4 has 249-330% wall slack
+
+G17 concluded that we sit ON libdeflate's size/wall frontier and that no parse configuration
+can win both axes. That conclusion measured WALL SLACK AT T1, where it is 0-8%. It is wrong
+for the cells that actually fail.
+
+libdeflate-gzip is SINGLE-THREADED. Our failures are overwhelmingly T4 (G28: 48 of 68, and
+libdeflate T1 = 0). At T4 the comparison is our 4 threads against their 1:
+
+    sil40, vanilla build, hyperfine n=5 warmup 1, /dev/null sink, local M1
+      L6   gzippy T4 0.1185 s   libdeflate 0.4135 s   we are 3.49x FASTER   slack 249%
+      L9   gzippy T4 0.3197 s   libdeflate 1.3742 s   we are 4.30x FASTER   slack 330%
+
+Every parse configuration G17 priced and rejected was rejected against a 0-8% budget. The
+budget where the cells fail is 249-330%.
+
+### What that buys, measured
+
+`lazy2:35:65` at L6 (the config G17 rejected at +9.29% against 4.4% of T1 slack), run at T4 on
+a clean tree (HEAD 05dda708, `ladder-tune` build, all four files):
+
+    file          libdeflate-6    ours T4 default      ours T4 lazy2:35:65
+    sil40         15,555,063      15,554,873  (-190)   15,535,712  (-19,351)
+    dickens        4,539,505       4,539,848  (+343)    4,520,157  (-19,348)   <- default FAILS
+    data.csv       3,372,612       3,372,268  (-344)    3,348,563  (-24,049)
+    winexe.exe     1,510,118       1,509,934  (-184)    1,510,071  (-47)
+
+    wall, sil40 L6:  libdeflate 0.4153 s | ours T4 default 0.1244 s (3.34x) |
+                     ours T4 lazy2 0.1380 s (3.01x, i.e. +10.9% of OUR time)
+
+19,000-24,000 B of margin — about 100x the seam it needs to absorb — while remaining 3x faster
+than the rival. This is the libdeflate-T4 class, 48 of the 68 failures on the frozen box.
+
+### The change this implies is SANCTIONED, not a knob
+
+The level->config map must become THREAD-COUNT-AWARE: keep today's config at T1 (little slack),
+spend the parallel slack at T>1. That is not an env var and not content detection — CLAUDE.md
+non-negotiable #3 explicitly permits "parameter tuning (write-buffer size, shared memory per
+thread count)", and STEP 2 states outright that "T>1 may emit different bytes than T1".
+
+### THE METHOD LESSON, which is the important part
+
+This was found by asking: when something is "measured dead with receipts", how do we know it
+was not a good idea whose co-parameter was simply unoptimised?
+
+The answer is a SIGNATURE. A verdict is coordinate-dependent, not intrinsic, when:
+  * the benefit is MONOTONE (non-worse by construction on some axis), and
+  * the cost is NOT intrinsic — it depends on a coordinate (thread count, level, what else is
+    enabled) that was held fixed and unexamined.
+
+Two receipts from this session alone:
+  * G16 killed the dual-candidate Huffman as "0.001% for 10-14% wall". Both halves were
+    coordinate artefacts: the cost is +2.3% at T4 (the work parallelises), and the 0.001% is
+    not a size win but SEAM ABSORPTION. It now has a SHIP verdict.
+  * G17 killed the whole parse-config space against a T1 budget. The cells fail at T4, where
+    the budget is 40x larger. This section.
+
+So a FALSIFY note must record the COORDINATE it was measured at and separate an INTRINSIC
+CEILING from a COORDINATE-DEPENDENT VERDICT. "libdeflate's heuristic is within 0.001% of the
+mathematical optimum" is intrinsic and permanent. "Therefore it is dead" was neither. And
+structurally-right-but-currently-losing work should be PARKED WITH ITS COORDINATE, never
+deleted — deleting it is what made G16 need rediscovering.
