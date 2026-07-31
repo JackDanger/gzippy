@@ -525,6 +525,12 @@ impl HcMatchfinder {
                 {
                     local.chain_reads += 1;
                 }
+                // CHAIN BASE for the longer-match walk — same fix as the length-4 walk
+                // above. `base` and `in_base_v` were both live across every iteration to
+                // compute `matchptr`; one pointer leaves one live value and one add.
+                // NOT a load hoist: the n_hi/n_lo note below records that hoisting THOSE
+                // drove Dr UP because LLVM had already taken them.
+                let chain_base2 = base.wrapping_add(in_base_v);
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
@@ -582,13 +588,23 @@ impl HcMatchfinder {
                         // with `best_len <= max_len`, so `in_next + off + 4 <=
                         // in_next + max_len + 1 <= in_end + 1 < buf.len()` (BUF_PAD>=16),
                         // and `matchptr + off + 4 < in_next + off + 4` likewise in bounds.
+                        // The candidate address is `chain_base2 + cur_node4`, i.e. exactly
+                        // `matchptr` — indexing the hoisted pointer keeps `base` out of the
+                        // walk's live set.
+                        // SAFETY: identical bounds to the previous form; `cur_node4 > cutoff`
+                        // keeps the address `< in_next`, and `off = best_len - 3` with
+                        // `best_len <= max_len` keeps both `+ off + 4` reads inside `buf`
+                        // given BUF_PAD >= 16.
+                        let cand_ptr = chain_base2.wrapping_offset(cur_node4 as isize);
                         let (m_hi, n_hi, m_lo, n_lo) = unsafe {
                             debug_assert!(matchptr < in_next);
                             debug_assert!(matchptr + off + 4 <= blen && in_next + off + 4 <= blen);
                             (
-                                load_u32(base, matchptr + off),
+                                u32::from_le(core::ptr::read_unaligned(
+                                    cand_ptr.add(off) as *const u32
+                                )),
                                 load_u32(base, in_next + off),
-                                load_u32(base, matchptr),
+                                u32::from_le(core::ptr::read_unaligned(cand_ptr as *const u32)),
                                 load_u32(base, in_next),
                             )
                         };
