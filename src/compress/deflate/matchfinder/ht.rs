@@ -578,6 +578,38 @@ impl HtMatchfinder {
             // `hc_matchfinder_skip_positions` does for its `hash3_tab`. Skipping this
             // insert would leave the length-3 table blind to every position inside a
             // match, which is most of the input on compressible data.
+            //
+            // ### WHERE THE SYNTHESIS'S COST ACTUALLY IS (line-level diff, 2026-07-31)
+            //
+            // libdeflate's `ht_matchfinder_skip_bytes` (`ht_matchfinder.h:219-228`) does
+            // the bucket shift and ONE `lz_hash` per position. It has NO hash3 table at
+            // all. This loop does the same shift PLUS a `hash3_tab` store PLUS a second
+            // hash computation, on every skipped position.
+            //
+            // That is not a codegen difference or a construct that merely looks costly —
+            // it is work the vendor does not do, in the loop their own profile says is
+            // the hottest thing in their matchfinder:
+            //
+            //     libdeflate ht_matchfinder.h, 4 MB dickens L1, cachegrind:
+            //       23,478,992 (14.9% of program)  `hash_tab[hash][0] = cur_pos;` (skip)
+            //        6,135,256  (3.9%)             `} while (--remaining);`
+            //     => ~29.6M of their 66.9M matchfinder total is SKIPPING, i.e. 44%.
+            //
+            // So the ~19M by which `ht.rs` (85.8M) exceeds `ht_matchfinder.h` (66.9M) is
+            // most plausibly concentrated HERE rather than in the search path — and it is
+            // the price of the length-3 table that earns our binary-file wins
+            // (armexe.elf 598,647 vs libdeflate 621,027; tool.bin 22,190,348 vs
+            // 22,673,676). The synthesis is not expensive because it searches more; it is
+            // expensive because it INSERTS more.
+            //
+            // NAMED LEVER, NOT YET BUILT: both libdeflate and igzip cap hash updates
+            // inside long matches (`ISAL_LIMIT_HASH_UPDATE`; we already ship
+            // `fast::LIMIT_HASH_UPDATE_INSERTS_L1` on the L1 path). Capping the hash3
+            // insert during a skipped run would cut this loop's extra work while keeping
+            // length-3 coverage near the match boundaries where it pays. Unlike the five
+            // levers falsified on 2026-07-31, this REMOVES WORK the vendor does not do
+            // rather than betting that a different spelling codegens better — but it
+            // changes output, so it needs the full size board plus a wall leg.
             unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
 
             pos += 1;
