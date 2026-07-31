@@ -82,9 +82,13 @@
 //! answer; that is why one does not subsume the other.
 
 use super::super::bitstream::BitWriter;
+use super::super::costs::{
+    choose_default_litlen_costs, default_length_cost, default_offset_slot_cost,
+};
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
+use super::super::tables::offset_slot;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::lazy::better_match;
 use super::{
@@ -154,6 +158,62 @@ fn fizzle(
     } else {
         None
     }
+}
+
+/// Is the fizzle trade cheaper IN BITS?
+///
+/// zlib commits on a SHAPE test (`current` collapsed to <= 1). That rule is calibrated
+/// for a GREEDY current match; with lazy's peek in front of it the current match has
+/// already been optimised, so dissolving it is wrong more often — measured: lazy+fizzle
+/// wins 53,985 B on monorepo.tar and 16,062 B on aozora.txt but LOSES on data.csv,
+/// movie.mp4 and photo.jpg, flipping cells that were tied with libdeflate.
+///
+/// The trade replaces `[match C @ oc] [match N @ on]` with
+/// `[(C - moved) literals] [match N+moved @ on]`, so:
+///
+///     delta = (C - moved) * lit_cost
+///           + len_cost(N + moved) - len_cost(N)
+///           - len_cost(C) - off_cost(oc)
+///
+/// `off_cost(on)` appears on both sides and cancels — the widened next match keeps its
+/// offset. Costs are libdeflate's BIT_COST-scaled defaults, the same ones `near_optimal`
+/// uses, so this introduces no new cost model and no content detection: `lit_cost` and
+/// `len_sym_cost` are computed once per block from the block's own bytes.
+///
+/// ⚠ FALSIFY 2026-07-31 (FALSIFIED) — THIS PREDICATE IS INERT, AND THAT IS THE RESULT.
+/// Instrumented over 400,000 B of data.csv at L6: **664 evaluations, `cheaper == true`
+/// on every one**, and the emitted bytes are IDENTICAL to the shape-rule version on all
+/// seven files tried. It cannot reject, and the closed form says why: fizzle deletes an
+/// ENTIRE match token, so it always saves `len_cost(C) + off_cost(oc)` while paying only
+/// `len_cost(N+moved) - len_cost(N)` plus at most one literal. A static per-token cost
+/// model therefore answers "always fizzle" — while measurement says fizzle LOSES on
+/// data.csv (+15,754 B) and dd79_bin6 (+43,536 B).
+///
+/// THE MISSING TERM IS THE DISTRIBUTION ITSELF. A literal's true cost depends on the
+/// literal distribution of the finished block, which depends on how many matches were
+/// dissolved — a feedback loop no single-pass per-token model can see. This is the same
+/// defect G10 measured from the other direction (81 FEWER symbols emitted, 60 bytes
+/// BIGGER output) and it is exactly what `near_optimal`'s `max_optim_passes: 2` exists
+/// for: recompute costs FROM the emitted distribution, then re-parse.
+///
+/// So the L5-L7 gap is not closable by a cheaper cost rule bolted onto a single pass.
+/// That is consistent with the vendor survey: NO implementation ships anything between
+/// lazy and a multi-pass optimal parser, and now there is a mechanism for why.
+#[inline]
+fn fizzle_is_cheaper(
+    cur_len: u32,
+    cur_offset: u32,
+    nxt_len: u32,
+    moved: u32,
+    lit_cost: u32,
+    len_sym_cost: u32,
+) -> bool {
+    let survivors = cur_len - moved;
+    let after = survivors * lit_cost + default_length_cost(nxt_len + moved, len_sym_cost);
+    let before = default_length_cost(nxt_len, len_sym_cost)
+        + default_length_cost(cur_len, len_sym_cost)
+        + default_offset_slot_cost(offset_slot(cur_offset) as usize);
+    after < before
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -294,6 +354,14 @@ pub(super) fn run_block(
     let mut min_len = calculate_min_match_len(&buf[in_next..in_end], depth);
     // The DEFLATE window; the same bound `hc` enforces on offsets.
     let max_dist = super::super::matchfinder::hc::WINDOW_SIZE;
+    // Per-BLOCK cost calibration, computed once (libdeflate calls the same function
+    // once per block in `set_initial_costs`). No per-position work, no detector.
+    let cost_span_end = in_max_block_end.min(in_end);
+    let (lit_cost, len_sym_cost) = choose_default_litlen_costs(
+        &buf[in_next..cost_span_end],
+        &[0u32; 1],
+        params.max_search_depth,
+    );
 
     // A match found by the forward probe and already paid for: emit it next
     // iteration rather than re-querying at a position the matchfinder has passed.
@@ -430,9 +498,12 @@ pub(super) fn run_block(
                 // called exactly once per position, which `hc` requires.
                 carried = Some((nxt_len, nxt_offset));
                 if nxt_len >= min_len && *in_base == base_before {
-                    if let Some(moved) =
-                        fizzle(buf, in_next, cur_len, after, nxt_len, nxt_offset, max_dist)
-                    {
+                    if let Some(moved) = fizzle(
+                        buf, in_next, cur_len, after, nxt_len, nxt_offset, max_dist,
+                    )
+                    .filter(|&m| {
+                        fizzle_is_cheaper(cur_len, cur_offset, nxt_len, m, lit_cost, len_sym_cost)
+                    }) {
                         // `cur` collapsed: emit its surviving bytes as literals, then
                         // carry the widened `next`, whose start moved left by `moved`.
                         let survivors = cur_len - moved;

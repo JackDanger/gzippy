@@ -215,7 +215,7 @@ fn adjust_cost(cost_p: &mut u32, default_cost: u32, change_amount: i32) {
 
 /// `deflate_default_length_cost`.
 #[inline]
-fn default_length_cost(len: u32, len_sym_cost: u32) -> u32 {
+pub(crate) fn default_length_cost(len: u32, len_sym_cost: u32) -> u32 {
     let slot = length_slot(len) as usize;
     let num_extra_bits = LENGTH_EXTRA_BITS[slot] as u32;
     len_sym_cost + num_extra_bits * BIT_COST
@@ -224,7 +224,7 @@ fn default_length_cost(len: u32, len_sym_cost: u32) -> u32 {
 /// `deflate_default_offset_slot_cost`. All offset symbols assumed equiprobable
 /// over ~30 slots: `int(-log2(1/30) * BIT_COST)` = `4*BIT_COST + 907*BIT_COST/1000`.
 #[inline]
-fn default_offset_slot_cost(slot: usize) -> u32 {
+pub(crate) fn default_offset_slot_cost(slot: usize) -> u32 {
     let num_extra_bits = OFFSET_EXTRA_BITS[slot] as u32;
     let offset_sym_cost = 4 * BIT_COST + (907 * BIT_COST) / 1000;
     offset_sym_cost + num_extra_bits * BIT_COST
