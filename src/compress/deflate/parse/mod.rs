@@ -64,6 +64,9 @@ mod greedy;
 #[allow(dead_code)]
 mod ht_fast;
 mod lazy;
+/// The MISSING RUNG between Lazy2 and NearOptimal — zlib-ng's `deflate_medium`
+/// plus `fizzle_matches`. See the module doc for the measurement that motivates it.
+mod medium;
 mod near_optimal;
 /// The crown engine (zopfli port + LzFind/squeeze/recursive-splitter Pareto
 /// tier). Reached only via `-F`/`-I`/`-J`. See
@@ -516,6 +519,9 @@ pub(super) fn compress(
 ) {
     let statics = StaticCodes::get();
     match params.strategy {
+        // The MISSING RUNG (see `medium.rs`): one forward probe at `pos + len` plus
+        // fizzle boundary-sliding. Not routed from any level yet — measured first.
+        Strategy::Medium => medium::run(buf, data_start, in_end, params, statics, bw, is_last),
         // ACCEL is a const generic (see fast::run's doc comment): `::<true>`
         // (L0) monomorphizes with the scan-step ramp; `::<false>` (L1)
         // monomorphizes with that code compiled away entirely, not merely

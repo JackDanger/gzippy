@@ -41,6 +41,20 @@ pub enum Strategy {
     Lazy,
     /// Lazy2 parse: look ahead two positions.
     Lazy2,
+    /// zlib-ng's `deflate_medium`: one forward probe at `pos + match_len` plus
+    /// `fizzle_matches` boundary sliding.
+    ///
+    /// NOT ROUTED FROM ANY LEVEL, and the reason is a corrected structural claim.
+    /// This was built believing it was the missing rung ABOVE `Lazy2`. It is not:
+    /// zlib-ng's own `configuration_table` puts `deflate_medium` at L4-L6 and
+    /// `deflate_slow` (lazy) at L7-L9, so medium sits BELOW lazy as a CHEAPER
+    /// option, not a better one. Measured at L6, medium is worse than our lazy on
+    /// every file tried (dickens +56,186 B, data.csv +105,742 B, monorepo.tar
+    /// +23,321 B). Kept because the port is correct and roundtrip-verified, and
+    /// because `fizzle` itself pays (-11,654 B on dickens when added to this path) —
+    /// the untested combination is lazy PLUS fizzle, which no vendor ships.
+    #[allow(dead_code)]
+    Medium,
     /// DETECTOR-GATED LAZY-L3 (promoted 2026-07-23 by supervisor adjudication
     /// of the `88cf1b09` gate record — see this module's level-3 arm for the
     /// full record): per-block GREEDY-vs-LAZY dispatch under a two-sided
