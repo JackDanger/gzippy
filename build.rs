@@ -112,10 +112,42 @@ fn emit_parallel_sm_cfgs() {
     //                         product and no longer a working decode build (the
     //                         legacy C-FFI one-shot decode path was removed); a
     //                         `cargo::warning` is emitted below.
-    let flavor = if parallel_sm {
+    let base = if parallel_sm {
         "parallel-sm+pure"
     } else {
         "legacy-serial"
+    };
+
+    // INSTRUMENTATION MUST BE VISIBLE IN THE BINARY'S OWN IDENTITY.
+    //
+    // CLAUDE.md: "a tuned/instrumented build is 1.17x slower — never quote one against a
+    // rival", and hard stop #7: "a measurement from an unidentified binary is not a
+    // measurement." Both were enforced only by PROSE — BUILD_FLAVOR distinguished
+    // parallel-sm from legacy-serial and said NOTHING about instrumentation, so
+    // `gzippy --version` was byte-identical between a vanilla build and one carrying
+    // anatomy counters. Nothing downstream could tell them apart, and the campaign's
+    // wall wrapper cannot guard what the binary will not admit.
+    //
+    // These four features compile counters and timers into the hot loops. Any of them
+    // makes a wall number un-quotable against a rival, so the binary now names them and
+    // `scripts/campaign/board-wall.sh` refuses to measure when the marker is present.
+    let instrumented: Vec<&str> = [
+        ("CARGO_FEATURE_ANATOMY_COUNTERS", "anatomy-counters"),
+        ("CARGO_FEATURE_ANATOMY_WALL", "anatomy-wall"),
+        ("CARGO_FEATURE_L1_TUNE", "l1-tune"),
+        ("CARGO_FEATURE_L3_TUNE", "l3-tune"),
+    ]
+    .iter()
+    .filter(|(var, _)| std::env::var_os(var).is_some())
+    .map(|(_, name)| *name)
+    .collect();
+
+    // The literal `INSTRUMENTED` is the token consumers grep for. Keep it in sync with
+    // scripts/campaign/board-wall.sh, which names this file as its counterpart.
+    let flavor = if instrumented.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}+INSTRUMENTED({})", instrumented.join(","))
     };
     println!("cargo::rustc-env=BUILD_FLAVOR={flavor}");
 
