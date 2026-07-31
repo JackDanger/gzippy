@@ -7,7 +7,7 @@
 //! bsr(next_offset)) > 2` (lazy) / `> 6` (lazy2). Levels 5-7 use lazy, 8-9 lazy2.
 
 use super::super::bitstream::BitWriter;
-use super::super::huffman::HeaderScratch;
+use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
@@ -95,6 +95,7 @@ pub(super) fn run_resumable(
     // See `greedy.rs`'s sibling declaration: one scratch per call, reused
     // across every internal block.
     let mut header_scratch = HeaderScratch::new();
+    let mut code_scratch = CodeScratch::default();
     let mut in_next = from;
 
     loop {
@@ -135,6 +136,7 @@ pub(super) fn run_resumable(
             statics,
             role.is_final() && in_next == in_end,
             &mut header_scratch,
+            &mut code_scratch,
         );
         if in_next == in_end {
             return in_next;

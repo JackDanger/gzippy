@@ -27,13 +27,28 @@ pub mod fast;
 pub mod header;
 pub mod optimal;
 
-pub use fast::make_huffman_code;
+pub use fast::{make_huffman_code, make_huffman_code_into};
 pub use header::{build_dynamic_header, HeaderScratch};
 
 /// A canonical Huffman code: per-symbol length (0 = unused) and bit-reversed
 /// codeword (right-justified, only the low `len` bits are meaningful).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct HuffmanCode {
     pub lens: Vec<u8>,
     pub codewords: Vec<u32>,
+}
+
+/// The two per-block Huffman codes, OWNED BY THE CALLER and reused for every
+/// block — libdeflate's `struct deflate_codes`, which lives inside the
+/// compressor and is never reallocated.
+///
+/// Before this existed, `emit_block` built both codes fresh per block, so the
+/// process allocation count grew linearly with input size (measured: 1.5 MB ->
+/// 356 allocs, 3 MB -> 501, 6 MB -> 733) against libdeflate's flat 3 and gzip's
+/// 0. `CLAUDE.md` STEP 1 forbids per-block allocation; this is what enforces it.
+/// Hold one per parser invocation, beside `HeaderScratch`.
+#[derive(Default)]
+pub struct CodeScratch {
+    pub litcode: HuffmanCode,
+    pub offcode: HuffmanCode,
 }

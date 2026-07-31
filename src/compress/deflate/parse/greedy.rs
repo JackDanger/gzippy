@@ -6,7 +6,7 @@
 //! heuristic (and the short-match offset guard), otherwise emit a literal.
 
 use super::super::bitstream::BitWriter;
-use super::super::huffman::HeaderScratch;
+use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
@@ -84,6 +84,7 @@ pub(super) fn run_resumable(
     // every internal block (see `HeaderScratch`'s doc comment) instead of
     // `build_dynamic_header` allocating a fresh `Vec` per block.
     let mut header_scratch = HeaderScratch::new();
+    let mut code_scratch = CodeScratch::default();
     let mut in_next = from;
 
     loop {
@@ -127,6 +128,7 @@ pub(super) fn run_resumable(
             statics,
             role.is_final() && in_next == in_end,
             &mut header_scratch,
+            &mut code_scratch,
         );
         if in_next == in_end {
             return in_next;
