@@ -321,6 +321,10 @@ define_counters!(
     huffman_tree_nodes_visited,
     huffman_length_limited_calls,
     huffman_make_code_calls,
+    // Times the EXACT (package-merge) dynamic candidate was strictly cheaper than the
+    // heuristic and was emitted (parse/mod.rs::emit_block). Ties keep the heuristic, so
+    // this counts only real wins; pair with blocks_emitted_dynamic for the hit rate.
+    huffman_exact_code_chosen,
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,

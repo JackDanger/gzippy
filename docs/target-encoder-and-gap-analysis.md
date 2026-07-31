@@ -1532,3 +1532,46 @@ mechanism. It was placement.
 This strengthens G25's conclusion rather than weakening it: a margin this small cannot ride on
 a seam whose size swings by hundreds of bytes with placement. The seam has to be ~0, not merely
 smaller — the narrow "consumer owns the seam blocks" form.
+
+## G27 — the next size lever is BLOCK COUNT: headers are 2.07% of output, 2,600x the Huffman margin
+
+Measured with `anatomy-counters` (sil40 40,000,000 B, L9, T1, local M1), plus the per-header
+cost already established by the G14 seam accounting (+3 dynamic blocks cost ~1,050 B, i.e.
+~350 B per header):
+
+    blocks_emitted_dynamic       913
+    blocks_emitted_fixed           1
+    blocks_emitted_stored          0
+    huffman_exact_code_chosen    145      (15.9% of dynamic blocks)
+
+    header mass  ~= 913 x 350 B = 319,550 B = 2.07% of the 15,452,666 B output
+    Huffman dual-candidate margin = 122 B = 0.0008% of output
+    ratio                                     ~2,600x
+
+The exact-code candidate WINS OFTEN (145 of 913 blocks) but each win is worth ~0.84 B. That is
+why it closes only the cells whose seam happens to be small: it is a real mechanism with a tiny
+amplitude.
+
+BLOCK COUNT IS THE LEVER WITH ACTUAL AMPLITUDE. Every dynamic block pays ~350 B to transmit
+its own literal/length and offset code lengths, RLE-coded through a precode. 913 of them is
+2.07% of the file. Cutting the block count 20% without worsening the data coding would be
+~0.4% — four hundred times what the Huffman candidate delivered, and comfortably more than any
+seam on the board.
+
+The catch is the same one the splitter already trades against: fewer blocks means each table
+fits its span worse, so data bits rise as header bits fall. Our splitter is a faithful port of
+libdeflate's (`block_split.rs` vs `deflate_should_end_block`/`do_end_block_check`), which is
+exactly why we tie their bytes — so we are currently making THEIR trade, not a better one.
+zopfli and ECT both beat that trade with real block-splitting search, which is where their 1-3%
+comes from.
+
+NOT ATTEMPTED. The candidate pattern that worked for the Huffman code applies directly and is
+non-worse by construction: cost the accumulated block as ONE block against the same tokens as
+TWO blocks split at a chosen point, and emit whichever is cheaper. Cost is per block, not per
+position — the affordable shape (G16/G17). Unlike the Huffman candidate, the amplitude is large
+enough to matter on its own.
+
+CAVEAT: 350 B/header is inferred from the G14 seam accounting, not from a direct sum of
+`header_bits()`. Before this gates anything, add that sum as a counter and measure it — a
+header-mass claim built on an inferred constant is exactly the kind of number this campaign has
+been burned by.
