@@ -746,3 +746,36 @@ deterministic size board at L2-L4. Cost stated up front: `matchfinder::ht`'s dec
 showed each extra candidate per position is one extra dependent load, and
 `project_encoder_deficit_is_loads_not_stalls` says loads govern this encoder — so this needs
 a wall leg, and a size-only argument is 3 for 3 wrong in this campaign.
+
+### FALSIFIED — chaining the length-3 table is net WORSE on the board
+
+BUILT: `next3_tab: [i16; WINDOW_SIZE]` (a real successor array — a position lives in both
+chains, so it needs its own slot), inserted alongside `next_tab`, rebased with it, and walked
+to depth 4 in the length-3 check. Depth 1 reproduces the old singleton BYTE-FOR-BYTE, which
+is the control. Roundtrip verified through our decoder AND gzip across 24 level x file
+combinations plus T4.
+
+Sampled files looked like a clear win:
+    dd79_bin6   L2  4,500,757 -> 4,496,288      L3  4,461,737 -> 4,450,433
+    data.sqlite L2 14,865,280 -> 14,864,898     L3 12,678,753 -> 12,677,986
+    dickens     L2/L3 UNCHANGED (free on text)
+
+THE FULL BOARD SAYS OTHERWISE. `board-size.sh all`, L2-L4, T1+T4, four rivals, 484 measured
+cells identical on both sides, 0 VOID:
+
+    baseline failing 52  ->  h3chain failing 55      CLOSED 11, OPENED 14
+
+Every CLOSED cell is T4; almost every OPENED cell is T1. The chain does not add compression —
+it PERTURBS a parse that was already byte-identical to libdeflate, and the perturbation wins
+some ties and loses more. Clause 3 is absolute in any case.
+
+⚠ METHOD: a first flip script reported "11 closed, 3 flipped, net +8" and I nearly reported
+that. It under-counted openings. The direct SET DIFF of failing cells (A-B and B-A, on the
+484 cells OK in both) is the sound form and says 11/14. When a derived count disagrees with
+the census's own `bigger=` total, the census is right and the script is wrong — reconcile
+before reporting, every time.
+
+Tenth falsification of 2026-07-31. What survives: the MECHANISM is still correct — our
+length-3 table is a singleton where zlib chains its 3-byte hash, and 64% of our L2 matches
+come out of that one-deep table. What is falsified is that deepening it helps the BOARD. The
+extra candidates find matches we did not have, and those matches are not worth their bits.
