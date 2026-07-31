@@ -1142,3 +1142,52 @@ already hoisted them and the hoist only added register pressure. The measurement
 the per-line Dr diff of our loop against theirs, and the candidate class is what keeps values
 live across the chain walk (`&mut` reference parameters that must be re-read after any
 aliasing store, slice fat-pointer lengths, and the number of simultaneously-live locals).
+
+## G20 — the reads have NO SOURCE LINE: 24.1M Dr of compiler-generated traffic, against libdeflate's ZERO
+
+Continuing G19's attribution down to the line, same artifacts (`/root/cg.ours2`, `/root/cg.ld`,
+trainer, L2, T1, identical 8,000,000 B input).
+
+FIRST, a port confirmation. libdeflate's bulk-insert line and ours cost the SAME to the byte:
+
+    ours    *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab...   6,274,515 Dr
+    theirs  mf->next_tab[cur_pos] = mf->hash4_tab[hash4];                    6,274,515 Dr
+
+Identical. Our hot lines that DO have source attribution match theirs. The gap is elsewhere.
+
+    profile        unknown-line (line 0) Dr entries
+    libdeflate     NONE. Every Dr in their profile attributes to a source line.
+    gzippy         24,099,848 (20.7% of ALL program reads) in hc.rs alone,
+                   plus ~3.3M more across common.rs / greedy.rs / parse/mod.rs
+
+Our whole-program Dr excess over libdeflate is 19,344,715, and the excess inside `hc` is
+26,208,116. The unattributed 24.1M accounts for essentially all of it. Code carrying no source
+line is compiler-generated — register spill/reload and moves.
+
+MACHINE-LEVEL CORROBORATION (objdump, same binaries):
+
+                              ours (greedy::run_resumable)   theirs (deflate_compress_greedy)
+    static instructions                987                              675
+    insns with memory operand          345                              268
+      of which stack-relative          263  (76%)                       128  (48%)
+    stack frame allocated            0x7b8 = 1,976 B                  0xb8 = 184 B   (10.7x)
+
+HONEST LIMIT OF THIS EVIDENCE. The frame is allocated once per CALL, not per position, so
+frame size alone does not prove the inner loop spills — it proves the function carries far
+more live state than libdeflate's equivalent. The load-bearing facts are the 24.1M
+unattributed Dr (dynamic, and matched by ZERO on their side) and the 2.05x stack-operand
+ratio (static). The CONFIRMING measurement, not yet run, is cachegrind `--dump-instr=yes` to
+get per-INSTRUCTION Dr inside the chain walk, which shows directly whether the executing
+spill traffic is in the loop body or in per-block prologue.
+
+WHY THIS IS NOT hard-stop-#4 TERRITORY. Hard stop #4 forbids hand-hoisting "obviously
+redundant" loop-invariant loads, because LLVM had already hoisted them and the hoist only
+added register pressure. This is the OPPOSITE direction: the finding is that we HAVE too much
+register pressure, and the lever is to REDUCE what is live across the chain walk, not to hoist
+more into it. A candidate worth measuring first: `emit_block` copies `sink.litlen_freqs`
+(`[u32; 288]` = 1,152 B) by value, and if that inlines into the same frame it is most of the
+1,976 B on its own.
+
+STILL FORBIDDEN: proposing any of this as a win without measuring Ir/Dr at a SHALLOW and a
+DEEP level (hard stop #3) and confirming on the wall (instruction counts LOCATE, they never
+predict the wall — receipts: a change that cut Ir 1.77% and Dr 3.87% was 9.9% SLOWER at L9).
