@@ -1191,3 +1191,44 @@ more into it. A candidate worth measuring first: `emit_block` copies `sink.litle
 STILL FORBIDDEN: proposing any of this as a win without measuring Ir/Dr at a SHALLOW and a
 DEEP level (hard stop #3) and confirming on the wall (instruction counts LOCATE, they never
 predict the wall — receipts: a change that cut Ir 1.77% and Dr 3.87% was 9.9% SLOWER at L9).
+
+## G21 — CORRECTION to G19/G20: removing a QUARTER of the reads made the wall WORSE
+
+G19/G20 located the deficit inside `hc` and named spill traffic as the mechanism. That
+localisation stands. The implied conclusion — that reads are the wall-blocking quantity —
+does NOT. It was tested and it failed.
+
+TEST: `#[inline(never)]` on `hc::longest_match`, which gives the chain walk its own small
+frame instead of sharing `greedy::run_resumable`'s 1,976-byte one. Output byte-IDENTICAL at
+L2/L6/L9 (sha256), so this is a clean A/B on the same bytes.
+
+    level          Ir                      Dr                         Dw
+    L2 (8 MB)  562,981,991 -> 577,918,803  116,446,149 -> 118,093,512  +12.6%
+    L9 (2 MB)  449,743,993 -> 450,076,251  106,693,133 ->  81,059,242  +27.9%
+                        (+0.07%)                    (-24.0%)
+
+    WALL (hyperfine n=7, 58 MB text, T1, both arms to /dev/null, trainer):
+    L2 1.0078s -> 1.0639s (1.0557 SLOWER)
+    L6 2.0238s -> 2.0910s (1.0332 SLOWER)
+    L9 5.5427s -> 5.6406s (1.0177 SLOWER)
+
+AT L9 WE DELETED 25,633,891 DATA READS, HELD Ir FLAT, AND LOST 1.77% OF WALL.
+
+Why: Dw rose 27.9% (arguments spilled to make the call) and every position gained call/return
+dependent latency. The spill READS are largely absorbed by the machine — which is exactly what
+the banked profile already implied, since our IPC, stalls, L1D miss rate and branch behaviour
+all BEAT libdeflate's. A machine that absorbs memory traffic well does not pay full price for
+extra loads, and does pay for added latency and stores.
+
+WHAT SURVIVES: `hc` is where the excess lives (G19 — same probes, fewer instructions, 1.855x
+reads, and an excess larger than the whole program's). What is NOT established, and was
+briefly asserted here, is that lowering that read count lowers the wall.
+
+WHAT IS ALSO NOW ON RECORD: measuring only L2 would have rejected this for the wrong reason
+(it looks bad on Ir AND Dr there), and measuring only L9 on counters alone would have promoted
+a 1.77% wall REGRESSION as a 24% win. Hard stop #3 (shallow AND deep) and the
+counters-never-predict-the-wall rule each caught a different half of the same mistake.
+
+REOPEN requires a mechanism that lowers reads WITHOUT adding a call per position and WITHOUT
+raising Dw — fewer simultaneously-live values in the caller is the candidate class, not
+relocating the callee — plus a wall measurement at a shallow AND a deep level.

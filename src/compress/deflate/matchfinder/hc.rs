@@ -224,6 +224,38 @@ impl HcMatchfinder {
     /// returned length is `best_len_in` and the offset is meaningless (0). The
     /// caller must ensure `buf` is padded so 4-byte loads up to
     /// `in_next + best_len + 1` stay in bounds.
+    // FALSIFY (2026-07-31): `#[inline(never)]` HERE IS SLOWER AT EVERY LEVEL, even though
+    // it removes a QUARTER of the data reads at L9. Do not re-try it, and do not treat this
+    // function's spill traffic as the wall deficit without re-reading this record.
+    //
+    // Motivation was measured, not guessed: callgrind showed 24,099,848 Dr inside hc.rs with
+    // NO SOURCE LINE (42.4% of this file's reads, 20.7% of the program's) against libdeflate's
+    // ZERO such reads, and the top line-0 instructions disassemble to loop-carried stack
+    // reloads (`mov 0x18(%rsp),%r12` 2,722,806 Dr; `mov 0x80(%rsp),%rax`, `mov 0x14(%rsp),%esi`,
+    // `mov 0x58(%rsp),%r11` 1,725,480 each; `cmpl $0x3,0x10(%rsp)` 1,545,657; and more —
+    // 13.4M reads across eight instructions in seven frame slots). Our frame is 1,976 B against
+    // libdeflate's 184 B and 76% of our memory operands are stack-relative against their 48%.
+    // Giving the chain walk its own frame should have relieved exactly that.
+    //
+    // IT DID, AND IT STILL LOST. Cachegrind, trainer, T1, output byte-IDENTICAL at L2/L6/L9:
+    //     L2 (8 MB)  Ir 562,981,991 -> 577,918,803 (+2.65%)  Dr 116,446,149 -> 118,093,512 (+1.4%)
+    //     L9 (2 MB)  Ir 449,743,993 -> 450,076,251 (+0.07%)  Dr 106,693,133 ->  81,059,242 (-24.0%)
+    // and the WALL (hyperfine n=7, 58 MB text, both arms to /dev/null) got WORSE everywhere:
+    //     L2 1.0078s -> 1.0639s (1.0557)   L6 2.0238 -> 2.0910 (1.0332)   L9 5.5427 -> 5.6406 (1.0177)
+    //
+    // At L9 we deleted 25,633,891 data reads and LOST 1.77% of wall. Dw rose 27.9% (arguments
+    // spilled for the call) and each position gained call/return dependent latency. So the
+    // spill READS are largely absorbed by the machine — consistent with the banked profile
+    // where our IPC, stalls, L1D miss rate and branch behaviour all BEAT libdeflate's.
+    //
+    // CORRECTION THIS FORCES on docs G19/G20: the Dr excess LOCATES the deficit to this
+    // function, it does NOT establish that reads are the wall-blocking quantity. One route
+    // that removed a quarter of them made the wall worse. "Instruction counts LOCATE, they
+    // never predict the wall" now has a receipt inside this campaign, not just in memory.
+    //
+    // REOPEN requires a mechanism that lowers reads WITHOUT adding a call per position and
+    // WITHOUT raising Dw — e.g. fewer simultaneously-live values in the caller — plus a wall
+    // measurement at a shallow AND a deep level. Ir/Dr alone may not move the wall at all.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub fn longest_match(
