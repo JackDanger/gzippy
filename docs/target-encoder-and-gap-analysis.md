@@ -1078,3 +1078,67 @@ built with `-g`. Probe count is now excluded as a variable, so any line-level Dr
 is the deficit itself. Do NOT hand-hoist "obviously redundant" loads first — hard stop #4
 records that doing so drove data reads UP, because LLVM had already hoisted them and the
 hoist only added register pressure.
+
+## G19 — the ENTIRE data-read deficit lives inside `hc`, which runs FEWER instructions than libdeflate
+
+G18 proved we visit exactly the same chain nodes as libdeflate at every level. This attributes
+the remaining gap by line, with probe count excluded as a variable.
+
+PROVENANCE: trainer (lxc199, Intel i7-13700T, x86_64 — the only box with valgrind), valgrind
+3.24 cachegrind `--cache-sim=yes`, L2, T1, identical input `/root/cg_text8` (8,000,000 B, head
+of `/root/frontier-corpora/text`). Ours built `CARGO_PROFILE_RELEASE_DEBUG=2
+CARGO_PROFILE_RELEASE_STRIP=false` (release profile otherwise untouched — lto=fat,
+codegen-units=1, opt-level=3; debug info does not change codegen). libdeflate built
+RelWithDebInfo `-O2 -g`. Counts are deterministic. Artifacts `/root/cg.ours2`, `/root/cg.ld`.
+
+WHOLE PROGRAM:
+
+                    gzippy         libdeflate      ratio
+    Ir         562,981,991        500,108,050      1.126
+    Dr         116,446,149         97,101,434      1.199
+    Dw          62,999,584         42,787,926      1.472
+
+Dw 1.472 is the WORST ratio and was never named before — the banked profile
+(`project_encoder_deficit_is_loads_not_stalls`) measured loads only.
+
+THE MATCHFINDER REGION, head to head:
+
+                             Ir             Dr             Dw
+    ours    hc.rs      251,331,366     56,872,118     35,498,696
+    theirs  hc_mf.h    254,868,099     30,664,002     25,363,595
+    ratio                     0.986          1.855          1.400
+
+WE EXECUTE FEWER INSTRUCTIONS AND NEARLY DOUBLE THE READS, for the same probes. The +26.2M
+read excess inside `hc` is LARGER than the whole program's +19.3M, so we are net BETTER than
+libdeflate everywhere else (parse + emit combined). The deficit is not spread; it is one
+function.
+
+Same algorithm, same node count, fewer instructions, 1.855x the reads is the signature of
+values being RE-MATERIALISED FROM MEMORY instead of held in registers — register pressure /
+spilling in the hot loop, not algorithm and not instruction selection. It is consistent with
+every microarchitectural fact already banked (our IPC, stalls, L1D miss rate and branch
+behaviour all BEAT theirs: we issue more memory ops and absorb them well).
+
+### A false lever caught by the vendor diff, recorded so it is not re-found
+
+The top single Dr line inside `hc.rs` is 6,274,515 Dr (5.4% of all program reads):
+
+    *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab.get_unchecked(hash4);
+
+in the bulk-insert path. It LOOKS like a redundant reload that a `cur_node4` local would kill.
+It is not: libdeflate's `hc_matchfinder_skip_bytes` does character-for-character the same
+thing —
+
+    mf->hash3_tab[hash3] = cur_pos;
+    mf->next_tab[cur_pos] = mf->hash4_tab[hash4];
+    mf->hash4_tab[hash4] = cur_pos;
+
+— so that read is matched by theirs and is not the difference. Diffing the vendor BEFORE
+proposing is what caught it.
+
+NEXT: the target is Dr inside `hc.rs::longest_match` with node count held fixed. Per hard
+stop #4, do NOT hand-hoist loads — that drove data reads UP last time because LLVM had
+already hoisted them and the hoist only added register pressure. The measurement to run is
+the per-line Dr diff of our loop against theirs, and the candidate class is what keeps values
+live across the chain walk (`&mut` reference parameters that must be re-read after any
+aliasing store, slice fat-pointer lengths, and the number of simultaneously-live locals).
