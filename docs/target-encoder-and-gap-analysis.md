@@ -1338,3 +1338,36 @@ the matchfinder is at parity.
 So the target is the non-matchfinder per-position work — sequence storage, the observe, the
 slot-table lookups — not the search, not the emit, and not (on this evidence) block splitting
 in particular.
+
+## G23 — DEFECT: `-b/--blocksize` is advertised, parsed, validated, and then silently ignored
+
+Found while testing whether the T>1 chunk grid could be widened to shrink the seam.
+
+    ours:  gzippy -6 -p4 -b {1024, 65536, 1048576, 8388608} -c dickens
+           -> ALL FOUR produce the IDENTICAL output sha256 (618d2590842e772e...)
+    pigz:  pigz  -6 -p4 -b 32   -c dickens -> 896cf24edf00dac8...  4,563,394 B
+           pigz  -6 -p4 -b 1024 -c dickens -> b8e991e0ae48e6a5...  4,550,145 B
+
+pigz's `-b` changes the block grid and therefore the output (13,249 B apart here, larger
+blocks being smaller). Ours changes nothing at all, across a 8192x range of values.
+
+The flag is REAL up to the last step: `src/main.rs:645` advertises it in `--help`,
+`src/cli.rs:9,66` defines it with a 128 KiB default, `src/cli.rs:235,316,451` parse all three
+spellings, and `src/cli.rs:508` rejects values below 1024. Then the compress path never reads
+it — `src/compress/pipelined.rs:200` computes the grid as
+`pipelined_block_size(input_len, num_threads, _level)`, a function whose parameters do not
+include the user's value, and `:495,:587,:672` are its only callers.
+
+This violates CLAUDE.md non-negotiable #4 (least surprise, cite the contract): pigz's CLI is
+the contract for `-b`, we advertise the same flag, and we honour it nowhere. A user tuning
+`-b` gets silence rather than an effect or an error.
+
+It is also a CAMPAIGN lever we currently cannot reach. The 109 zero-headroom cells are T4-only
+and caused by forced chunk boundaries; the grid is exactly the thing `-b` should control, and
+pigz's own numbers show the grid moves output size by far more than the ~255 B median deficit.
+Wiring it does NOT by itself close a cell (the board runs default flags), but it makes the
+grid measurable instead of hard-coded.
+
+NOT YET FIXED. Wiring it changes T>1 output whenever `-b` is passed, which is the correct
+behaviour but must be gated: roundtrip through our decoder + gzip + libdeflate at several
+`-b` values and thread counts, and a check that the DEFAULT path stays byte-identical.
