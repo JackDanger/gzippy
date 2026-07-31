@@ -692,3 +692,26 @@ remaining structural differences at L2 are the hash geometry (zlib's 3-byte roll
 15-bit table vs our hash3+hash4 pair) and the block-splitting cadence (zlib's fixed
 16,383-symbol quantum vs our drift detector — note gzip spends MORE header bits and wins).
 Both are measurable by ablation; neither has been measured.
+
+### FALSIFIED — it is not the block-split cadence either
+
+zlib-ng ends a block on a fixed 16,383-SYMBOL quantum; we end on a 300,000-byte span, a
+50,000-sequence cap and a drift detector. Since gzip spends MORE header bits and wins, more
+and smaller blocks was the natural read. Ablated with an explicit symbol quantum (measured at
+L2 and L3 specifically — the existing "budget dial is dead both ways" record was measured at
+L7, and hard stop #3 forbids carrying it across levels):
+
+    file        L   base        q=32768     q=16383     q=8192      gzip
+    dd79_bin6   2   4,500,757   4,500,899   4,501,757   4,504,817   4,459,419
+    dd79_bin6   3   4,461,737   4,461,846   4,462,857   4,466,630   4,436,422
+    dickens     2   4,772,260   4,773,155   4,776,217   4,783,122   5,160,974
+    dickens     3   4,609,149   4,609,621   4,612,487   4,618,826   4,930,065
+
+MONOTONICALLY WORSE — every quantum, every file, both levels, and worse the smaller it gets.
+So gzip's extra header bits are a SYMPTOM of its parse, not the CAUSE of its win: when we
+split more often we pay the headers and gain nothing back. Ninth falsification of
+2026-07-31.
+
+That leaves ONE named candidate standing at L2: the HASH GEOMETRY. zlib uses a 3-byte
+rolling hash into a 15-bit table and finds 27% more matches than our hash3+hash4 pair does
+with a DEEPER chain. Nothing else on the list survives measurement.
