@@ -37,6 +37,26 @@ Numbers here are for locating structure, never for optimising directly.
 | 4 | **greedy** | 16 | 30 |
 | 5 | lazy | 16 | 30 |
 | 6 | lazy | 35 | 65 |
+| 7 | lazy | 100 | 130 |
+| 8 | lazy2 | 300 | 258 |
+| 9 | lazy2 | 600 | 258 |
+
+⚠ **THIS TABLE USED TO STOP AT L6.** zlib-ng's table above runs to L9; ours stopped three
+rows short, so the LARGEST divergence in the whole comparison had no row to sit beside and
+was structurally invisible. Put the rows in before drawing a conclusion — a diff that omits
+the rows is not a diff. Side by side, the chain column reads:
+
+| L | zlib-ng chain | ours (max_search_depth) | we search |
+|---|---|---|---|
+| 5 | 32 | 16 | 2.0x shallower |
+| 6 | 128 | 35 | **3.7x shallower** |
+| 7 | 256 | 100 | 2.6x shallower |
+| 8 | 1024 | 300 | 3.4x shallower |
+| 9 | 4096 | 600 | **6.8x shallower** |
+
+gzip -9 IS chain 4096. We were faster than gzip at L9 because we were doing a seventh of
+the search, and bigger for exactly the same reason. Measured 2026-07-31: matching zlib's
+chain depths at L5-L9 closes **84** failing size cells (and opens 13 — see below).
 
 **Structural difference #1 — where lazy starts. CORRECTED 2026-07-30.** gzip switches to
 `deflate_slow` (lazy) at L4. **zlib-ng does NOT** — its default L4 is `deflate_medium`
@@ -158,9 +178,23 @@ token-structured, highly repetitive text, where deferring a match costs.
 Per-label means every file, so 16 wins do not buy the four losses.
 
 FALSIFY: do not re-open "retune the L2 knobs for wall" without first measuring
-the instruction cost of the candidate STRATEGY. Depth is not the cost; the
-strategy is. Measured Ir before a size sweep would have killed this in one run
-instead of several.
+the instruction cost of the candidate STRATEGY.
+
+⚠ **CORRECTION 2026-07-31 — the next sentence used to read "Depth is not the cost; the
+strategy is." That generalisation is FALSE and it was the single most expensive sentence in
+this file.** It was measured at **L2 ONLY**, which `CLAUDE.md` hard stop #3 forbids
+generalising ("never generalise a measurement across levels ... measured at a SHALLOW and a
+DEEP level before it is believed"). At L5-L9 depth IS the cost: raising `max_search_depth`
+to zlib-ng's chain values, changing NO strategy, closed 84 failing size cells. The claim
+holds where it was measured — at L2, against L2's Greedy/6/10 — and nowhere else.
+
+**A record can violate a hard stop and survive indefinitely, because hard stops are applied
+to CHANGES and never to RECORDS.** This sentence closed the depth class for every session
+that grepped it: `.git/logs/HEAD:235-237` shows `probe/l5-depth` created and abandoned 102
+seconds later with no commit. Scope every falsification to the levels it was measured at,
+in the sentence itself, or it will close a class it never tested.
+
+Measured Ir before a size sweep would have killed this in one run instead of several.
 
 A METHOD DEFECT this exposed, worth more than the result: the first pass of
 this sweep was graded on four ad-hoc local files, and the two candidates it

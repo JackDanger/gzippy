@@ -56,6 +56,12 @@ step is done, its cells stay closed — a regression in a closed cell blocks the
    parameter tuning (write-buffer size, shared memory per thread count).
 4. **Least surprise.** Cite a contract (zlib's API, gzip's CLI, POSIX) — never a
    vendor's habit.
+5. **Never pin a knob that is declared free to change.** An equality assertion in a test
+   beats a sentence in a doc, always, because only one of them fails closed. This file
+   said the level->config map "is free to change" while `level.rs` carried a
+   `vendor_knob_values` test asserting `params(6).max_search_depth == 35` and
+   `params(9) == 600`. The test won for weeks. Test the INVARIANT (effort rises with
+   level) not the VALUE.
 
 ## Every technique is in scope
 
@@ -127,7 +133,20 @@ least once in a single session.
    falsify it. "Different code shape now" is not a mechanism. Two attempts this
    session were variants of an already-recorded falsification.
 
-3. **Never generalise a measurement across levels.** Any instruction, read, or
+3. **Never generalise a measurement across levels — AND THIS APPLIES TO RECORDS, NOT
+   ONLY TO CHANGES.** The hard stops are enforced against edits: a commit hook reads
+   commit messages, `fulcrum candidates` reads FALSIFY notes. NOTHING enforces a hard
+   stop against the TEXT OF A RECORD, so a falsification may itself violate #3 and then
+   survive indefinitely, closing a class for every session that greps it. Receipt: a
+   2026-07-28 note measured L2 only and concluded "Depth is not the cost; the strategy
+   is." That sentence is false at L5-L9 — raising `max_search_depth` to zlib-ng's chain
+   values, changing no strategy, closed 84 failing size cells — and it cost weeks:
+   `.git/logs/HEAD:235-237` shows `probe/l5-depth` created and abandoned 102 seconds
+   later with no commit. **Scope every falsification to the levels it was measured at,
+   in the sentence itself.** A record that says "X is not the cost" without naming its
+   level is a class closure it never earned.
+
+   The original rule still stands: Any instruction, read, or
    wall claim must be measured at a SHALLOW and a DEEP level before it is
    believed. Measuring L2 alone and generalising shipped a 6.2% L6 and 9.9% L9
    regression.
