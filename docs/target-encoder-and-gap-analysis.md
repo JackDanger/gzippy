@@ -542,3 +542,62 @@ has no slack and needs real padding.
 **Gate to pre-register before attempting:** allocated bytes DOWN at T4 and T16, output
 byte-identical at T1/T4/T8 across L1/L6/L9, roundtrip through our decoder AND gzip at every
 thread count, and the bound discharged in writing for all four parsers.
+
+## G9 — L1 IS THE CAMPAIGN (full-board evidence, 2026-07-31)
+
+The FALSIFY record in `parse/mod.rs` that closed the L1 class was measured on the TUNE
+set only — 96 failing cells. The full board (`all`: 22 files, L1-9, T1+T4, four rivals,
+1,584 declared / 1,320 measured, **0 VOID**, artifact `/root/sizeboard-all-12fcd0ed/`)
+changes what we know about WHERE the campaign is stuck. Ranked by BYTES, not percent:
+
+    FAILING: 200 of 1,320
+      libdeflate  142 cells   4,326,245 bytes lost
+      gzip         32 cells     528,386
+      pigz         20 cells     370,271
+      igzip         6 cells     354,208
+
+    BY LEVEL:  L1 35 · L2 23 · L3 12 · L4 17 · L5 25 · L6 25 · L7 26 · L8 17 · L9 20
+
+    WORST CELLS — every one is L1 vs libdeflate:
+      access.log   L1  +10.32%  (+341,529 B)      monorepo.tar L1  +5.65% (+639,359 B)
+      data.csv     L1   +4.57%                    aozora.txt   L1  +4.05%
+      ecoli.fastq  L1   +2.83%                    markup.xml   L1  +2.52%
+      minjs.min.js L1   +2.26%                    dickens      L1  +2.12%
+
+**L1 has the most failing cells AND all of the large ones.** L2-L9 losses are almost all
+under 1% and many are under 0.01% (`tool.bin` L4 is 125 B on 21 MB). The board is not 200
+independent problems: it is one frontier at L1 plus a long sub-1% tail.
+
+### The L1 frontier is real, and both obvious routes are measured and closed
+
+See the two FALSIFY records at `parse/mod.rs`'s `Strategy::Fast` arm:
+* **Replacement** (route to `ht_fast`): 9 cells closed, every one landing at ratio
+  EXACTLY 1.0000 — the transliteration is faithful — but **7 opened**, all binaries,
+  one mechanism: our `head3` length-3 table beats libdeflate there and `ht_matchfinder`
+  deliberately has no length-3 support.
+* **Synthesis** (2-way bucket AND hash3): size passed cleanly, **wall killed it** — 19
+  cells eroded, our own L1 15-50% slower. Mechanism: the size win comes from more work
+  per position, and halving bytes-resident does not pay for extra dependent LOADS ISSUED.
+
+That is 2 for 2 against size-only arguments in this class, and it agrees with
+`project_encoder_deficit_is_loads_not_stalls` and with this session's independent
+`hc.rs` result (a -20.4% read count that lost the wall).
+
+### The sanctioned reopen, now vendor-located
+
+The record requires "a mechanism that adds candidates WITHOUT adding dependent loads per
+position", naming igzip's P12/P13. **P12 is located** (hard stop #1 discharged):
+`vendor/isa-l/igzip/igzip_icf_body_h1_gr_bt.asm` computes `hash` AND `hash2` in the same
+loop iteration (`:263-266`, `:298-311`) with `lea tmp3, [f_i + 1]` (`:358`) — it probes
+position i and i+1 from one iteration, interleaving two dependent load chains so they
+overlap instead of serialising. The C reference `igzip_base.c:55-100` does NOT do this;
+it is one position per iteration, so reading only the C would have missed it.
+
+Note what P12 is and is not: it is a LOADS/LATENCY mechanism, not a ratio mechanism. It
+does not close a size cell by itself. Its role is to buy back the per-position budget the
+synthesis overspent, making the synthesis's ratio win affordable on the wall. So the
+sequence is P12 first, measured on wall alone with size held byte-identical, and only
+then re-attempt the synthesis on top of it.
+
+**NOT BUILT.** Stated plainly so the next session does not mistake a located mechanism
+for a validated one.
