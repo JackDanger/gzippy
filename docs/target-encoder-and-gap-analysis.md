@@ -799,3 +799,39 @@ boundary the parser was going to emit anyway, so the seam costs only the flush. 
 different from CHUNKS_PER_THREAD (fewer seams, each still misaligned) and different from G5
 (carry coding state across the seam). It is the cheapest of the three and it is the one the
 vendor actually ships. NOT YET BUILT.
+
+### THE SEAM COST IS FULLY ACCOUNTED: 3 EXTRA BLOCK HEADERS, NOT 8 CODER RESTARTS
+
+`anatomy-counters`, sil40 at L9, same binary, T1 vs T4:
+
+    T1   blocks_dynamic 913   blocks_stored 0   make_code_calls 2744
+    T4   blocks_dynamic 916   blocks_stored 8   make_code_calls 2753
+
+    +3 dynamic block headers  (~350 B each)  ~ 1,050 B
+    +8 sync-flush stored blocks (~5 B each)  =    40 B
+                                             ~ 1,090 B
+    measured T4-T1 size delta                  +1,115 B
+
+The accounting closes. And it corrects the intuition: the cost is NOT eight coder restarts.
+Seven of the eight chunk boundaries cost essentially nothing — `pipelined_block_size` already
+floors the chunk span to a multiple of `SOFT_MAX_BLOCK_LENGTH`, and it mostly works. What
+costs is that **three chunks round UP to one extra block**, and an extra DYNAMIC header is
+~350 bytes.
+
+That also explains the non-monotonicity (data.csv +1,288 B at T4 with 7 seams but only +452 B
+at T8 with 15): the penalty tracks how many chunks happen to round up, not how many seams
+exist. More seams can round up less often.
+
+CONSEQUENCES for the three candidate fixes:
+* `CHUNKS_PER_THREAD` 2->1 — helps only by making fewer opportunities to round up. Measured
+  8 closed / 3 opened at L8-L9. A parameter, not a fix.
+* G5 "carry coding state across the seam" — would remove the 40 B of sync-flushes and the
+  restart, but the restarts are NOT where the 1,115 B is.
+* **ALIGNMENT — the actual target.** Make each chunk's span an exact whole number of blocks
+  so no chunk rounds up. Upper bound on the win is ~1,050 of the ~1,115 B on this cell, and
+  it costs nothing at the wall.
+
+The obstacle is named and real: the drift detector ends blocks EARLY and data-dependently, so
+the true block grid is not at multiples of the budget and cannot be predicted from the chunk
+span alone. Any alignment scheme has to reckon with a block boundary the parser chooses, not
+one the scheduler assigns. NOT YET BUILT.
