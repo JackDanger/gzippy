@@ -647,3 +647,67 @@ it is CHEAPER IN BITS.
 * **Do not re-run the depth sweep before the cost model exists.** The size verdict is banked:
   65 closed / 7 flipped at L5-L7, wall-neutral. The lever is worth 65 cells the day acceptance
   becomes cost-aware, and clause 3 blocks it until then.
+
+## G11 — THE MISSING MIDDLE IS `deflate_medium`'s `fizzle_matches` (located 2026-07-31, NOT built)
+
+Three independent instruments now agree the L5-L7 blocker is the PARSE, and this names the
+vendor mechanism that sits exactly in the wall gap.
+
+### The size headroom is PROVEN, with shipping code
+
+Routing L6 to `Strategy::NearOptimal` — no new code, the L10-12 parser — gives **0 of 132
+failing cells** at L6 (all four rivals, T1+T4, 0 VOID, artifact `/root/size-L6-nearopt/`),
+against 25 failing on main. Margins are large, not marginal:
+
+    aozora.txt  3,781,301 vs best rival 4,049,212   -6.6%
+    dickens     4,322,130 vs           4,539,505    -4.8%
+    dd79_bin6   4,285,099 vs           4,461,731    -4.0%
+
+Even the CHEAPEST near-optimal config (`max_search_depth: 6`, `max_optim_passes: 1`) still
+beats libdeflate on dickens by 3.0%. The headroom is not config-sensitive.
+
+### The wall cost, corrected — it is worse on text than on binaries
+
+    dickens L6      main 0.15s   libdeflate 0.17s
+      near-optimal  depth 35 / 2 passes  0.93s   6.2x
+                    depth 12 / 1 pass    0.76s   5.1x
+                    depth  6 / 1 pass    0.68s   4.5x
+
+⚠ An earlier note in this session said "~2.5x". That came from movie.mp4, photo.jpg and
+dd79_bin6 — all near-incompressible, so few matches and a cheap DP. On text it is 4.5-6.2x.
+Generalising from one file CLASS is the same defect as generalising across levels
+(hard stop #3). The 2.5x figure is retracted.
+
+Located cost, from `anatomy-counters` on dd79_bin6: near-optimal uses the binary-tree finder,
+which issues **2.1x the head-table reads of the hash-chain finder plus 16.4M child-table
+writes `hc` never makes** (bt 18,874,356 reads / 16,412,505 child writes vs hc 8,796,490 / 0).
+
+### THE MECHANISM, and it is not dynamic programming
+
+`fulcrum anatomy ratio map` on movie.mp4 shows the optimal-parse frontier beating both us and
+libdeflate by 10,172 bits, with gzippy vs libdeflate at Δ=0. Its winning regions look like:
+
+    ours      (4,18850)@2482408   (3,5796)@2482412        53 bits
+    frontier  lit x2@2482408      (5,5796)@2482410        41 bits
+
+The frontier moved the SECOND match two positions LEFT (length 3 -> 5) and dissolved the
+first into literals. That is exactly `fizzle_matches` in zlib-ng's
+`vendor/zlib-ng/deflate_medium.c:128-175`: it holds `current` and `next`, slides the boundary
+between them left while the bytes still match, and commits only if `current` collapses to <= 1
+(so it becomes literals) and `next` did not degenerate to length 2.
+
+**We do not have it.** `grep -rn "medium" src/compress/deflate/level.rs` returns nothing; our
+strategy ladder is Fast0/Fast/Greedy/Lazy/Lazy2/NearOptimal, with nothing between Lazy2 and
+NearOptimal. zlib-ng puts `deflate_medium` at L4-L6 by default.
+
+Why this is the right shape and a threshold was not: a blanket too-far rule for length-4 was
+built and FALSIFIED (dickens +14,791 B) precisely because the frontier's choice was
+CONTEXTUAL — it depended on a better match existing two positions on. `fizzle_matches` is
+bounded (one match pair, no table, no DP) and looks at exactly that context.
+
+### Pre-registered gate for the attempt
+
+Size: must not regress any currently-passing L5-L7 cell (clause 3 is absolute), measured on
+the full 22-file board at T1 and T4. Wall: must stay under the L6 erosion budget against
+gzip/pigz AND not flip any libdeflate cell — the depth lever died on exactly that leg, so
+wall is not optional here and a size-only argument is insufficient (3 for 3 in this class).
