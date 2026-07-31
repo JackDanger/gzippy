@@ -601,3 +601,42 @@ then re-attempt the synthesis on top of it.
 
 **NOT BUILT.** Stated plainly so the next session does not mistake a located mechanism
 for a validated one.
+
+## G12 — L6 IS TWO POPULATIONS, NOT ONE (measured 2026-07-31)
+
+From the banked full board (`/root/sizeboard-all-12fcd0ed/`), L6's 25 failing cells split by
+rival, and the two groups have DIFFERENT causes and differ in magnitude by 10-20x:
+
+    L6 failing by rival: libdeflate 13, gzip 6, pigz 6
+
+    gzip/pigz — LARGE, and only ever these three TEXT files:
+      monorepo.tar  +0.596% (+59,010 B)   aozora.txt +0.576%   minjs.min.js +0.342%
+    libdeflate — TINY, different files:
+      data.json     +0.039% (+608 B)      access.log +0.026% (+675 B)
+
+**Group 1 (gzip/pigz, text)** is the search-depth gap: zlib-ng runs chain 128 at L6 where we
+run 35. Raising depth closes these decisively (aozora 4,013,389 vs rival 4,049,212 — a WIN),
+and `fizzle` attacks the SAME cells from a different angle (-53,985 B on monorepo.tar,
+-16,062 B on aozora.txt — the two largest losses in the group, though not yet enough on their
+own: 59,010 and 23,338 were needed).
+
+**Group 2 (libdeflate, tiny)** is not a search gap at all — 608 and 675 bytes on
+multi-megabyte files, on inputs where our output is frequently byte-identical to theirs.
+
+### Why this matters for what to try next
+
+The depth lever's failure was never in group 1. It closed 65 cells across L5-L7 and FLIPPED 7
+— and every flip was a libdeflate cell on NEAR-INCOMPRESSIBLE data (dd79_bin6, movie.mp4,
+photo.jpg, weights.safetensors) where our output was byte-identical to libdeflate's and any
+deviation costs. Deeper search pays exactly where matches exist and costs where they do not.
+
+⚠ **THE OBVIOUS FIX IS BLOCKED BY NON-NEGOTIABLE #3 AND NEEDS THE USER.** Adapting search
+effort to observed match success would close group 1 without touching group 2. That is a
+DATA-DEPENDENT decision. `CLAUDE.md`: "If a data-dependent decision is ever proven necessary
+to win, bring it to the user first — and then only as parameter tuning." It is not obviously
+a "content detector choosing a parser" — the parser is fixed and only its depth would move,
+and libdeflate already ships the same SHAPE in `choose_min_match_len(num_used_literals, ...)`
+which we already run per block via `recalculate_min_match_len(&sink.litlen_freqs, depth)`.
+But it is data-dependent, the rule is explicit, and it is NOT being built unilaterally.
+
+Recorded so the decision is visible rather than silently taken or silently avoided.

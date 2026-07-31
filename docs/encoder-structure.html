@@ -1,0 +1,1226 @@
+<title>gzippy encoder — logic structure</title>
+
+<style>
+  :root {
+    --ground:   #F1F5F6;
+    --sheet:    #FFFFFF;
+    --panel:    #F7FAFB;
+    --ink:      #0D171C;
+    --ink-2:    #556A73;
+    --ink-3:    #8496A0;
+    --rule:     #C7D5DA;
+    --rule-2:   #E2EBEE;
+    --accent:   #0A6A7A;
+    --alloc:    #B32338;
+    --copy:     #96590A;
+    --loop:     #64379B;
+    --dead:     #7B8A92;
+    --shadow:   0 1px 0 rgba(13,23,28,.04);
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "DejaVu Sans Mono", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #080F13;
+      --sheet:  #0E181E;
+      --panel:  #121F26;
+      --ink:    #DEE9EE;
+      --ink-2:  #93A7B0;
+      --ink-3:  #6B7F89;
+      --rule:   #26363F;
+      --rule-2: #1A272E;
+      --accent: #4FCFC4;
+      --alloc:  #FF7E8E;
+      --copy:   #E4A75C;
+      --loop:   #B491E6;
+      --dead:   #6B7F89;
+      --shadow: 0 1px 0 rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="light"] {
+    --ground:#F1F5F6; --sheet:#FFFFFF; --panel:#F7FAFB; --ink:#0D171C; --ink-2:#556A73;
+    --ink-3:#8496A0; --rule:#C7D5DA; --rule-2:#E2EBEE; --accent:#0A6A7A; --alloc:#B32338;
+    --copy:#96590A; --loop:#64379B; --dead:#7B8A92; --shadow:0 1px 0 rgba(13,23,28,.04);
+  }
+  :root[data-theme="dark"] {
+    --ground:#080F13; --sheet:#0E181E; --panel:#121F26; --ink:#DEE9EE; --ink-2:#93A7B0;
+    --ink-3:#6B7F89; --rule:#26363F; --rule-2:#1A272E; --accent:#4FCFC4; --alloc:#FF7E8E;
+    --copy:#E4A75C; --loop:#B491E6; --dead:#6B7F89; --shadow:0 1px 0 rgba(0,0,0,.4);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 96px; }
+
+  /* ---- title block (drafting sheet convention) ---- */
+  .titleblock {
+    border: 1px solid var(--rule);
+    background: var(--sheet);
+    box-shadow: var(--shadow);
+    display: grid;
+    grid-template-columns: minmax(0,2.1fr) minmax(0,1fr);
+  }
+  .titleblock > div { padding: 22px 24px; }
+  .titleblock > div + div { border-left: 1px solid var(--rule); background: var(--panel); }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(26px, 4.2vw, 40px);
+    font-weight: 600;
+    letter-spacing: -.02em;
+    line-height: 1.08;
+    margin: 0 0 12px;
+    text-wrap: balance;
+  }
+  .lede { margin: 0; color: var(--ink-2); max-width: 62ch; font-size: 15px; }
+  .meta { font-family: var(--mono); font-size: 12px; line-height: 1.9; margin: 0; }
+  .meta dt { color: var(--ink-3); letter-spacing: .1em; text-transform: uppercase; font-size: 10px; }
+  .meta dd { margin: 0 0 10px; color: var(--ink); word-break: break-word; }
+
+  /* ---- sheets ---- */
+  section.sheet {
+    border: 1px solid var(--rule);
+    background: var(--sheet);
+    box-shadow: var(--shadow);
+    margin-top: 22px;
+  }
+  .sheet-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--rule);
+    background: var(--panel);
+  }
+  .sheet-no {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .18em;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
+  .sheet-head h2 {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    margin: 0;
+  }
+  .sheet-head .note { font-size: 13px; color: var(--ink-2); margin: 0; flex: 1 1 320px; }
+  .sheet-body { padding: 22px 24px 26px; }
+  .sheet-body > p { max-width: 74ch; color: var(--ink-2); font-size: 14.5px; }
+  .sheet-body > p:first-child { margin-top: 0; }
+
+  /* ---- diagram frame ---- */
+  .diagram {
+    overflow-x: auto;
+    border: 1px dashed var(--rule);
+    background: var(--panel);
+    padding: 14px;
+    margin: 18px 0 6px;
+  }
+  .diagram pre.mermaid { margin: 0; min-width: 560px; }
+  .cap {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    margin: 8px 0 0;
+    letter-spacing: .02em;
+  }
+
+  code, .anchor {
+    font-family: var(--mono);
+    font-size: .9em;
+  }
+  .anchor { color: var(--accent); white-space: nowrap; }
+
+  /* ---- tables ---- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule-2); margin: 18px 0 4px; }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule-2); vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--panel);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  td.mono, th.mono { font-family: var(--mono); }
+  tr.hot td { background: color-mix(in srgb, var(--alloc) 8%, transparent); }
+
+  /* ---- pills ---- */
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border: 1px solid currentColor;
+    white-space: nowrap;
+    line-height: 1.5;
+  }
+  .pill.proc   { color: var(--ink-3); }
+  .pill.pass   { color: var(--accent); }
+  .pill.chunk  { color: var(--copy); }
+  .pill.block  { color: var(--alloc); font-weight: 700; }
+  .pill.dead   { color: var(--dead); }
+  .pill.pooled { color: var(--accent); }
+
+  /* ---- level routing matrix ---- */
+  .matrix { display: grid; gap: 1px; background: var(--rule-2); border: 1px solid var(--rule-2); overflow-x: auto; }
+  .matrix-inner { display: grid; grid-template-columns: 132px repeat(13, minmax(58px, 1fr)); gap: 1px; min-width: 900px; }
+  .matrix-inner > div { background: var(--sheet); padding: 7px 6px; font-family: var(--mono); font-size: 11.5px; }
+  .matrix-inner > div.rowhead {
+    background: var(--panel); color: var(--ink-3); font-size: 10px;
+    letter-spacing: .1em; text-transform: uppercase; display: flex; align-items: center;
+  }
+  .matrix-inner > div.lvl { background: var(--panel); font-weight: 700; text-align: center; letter-spacing: .04em; }
+  .matrix-inner > div.c { text-align: center; font-variant-numeric: tabular-nums; }
+  .s-stored { color: var(--dead); }
+  .s-fast   { color: var(--copy); }
+  .s-greedy { color: var(--accent); }
+  .s-lazy   { color: var(--loop); }
+  .s-near   { color: var(--alloc); }
+  .yes { color: var(--accent); }
+  .no  { color: var(--ink-3); }
+
+  /* ---- legend ---- */
+  .legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(216px, 1fr)); gap: 1px; background: var(--rule-2); border: 1px solid var(--rule-2); }
+  .legend div { background: var(--sheet); padding: 12px 14px; }
+  .legend b { display: block; font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 4px; }
+  .legend p { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+  .swatch { display: inline-block; width: 11px; height: 11px; margin-right: 7px; vertical-align: -1px; border: 2px solid; }
+  .sw-alloc { border-color: var(--alloc); background: color-mix(in srgb, var(--alloc) 22%, transparent); }
+  .sw-copy  { border-color: var(--copy);  background: color-mix(in srgb, var(--copy) 22%, transparent); }
+  .sw-loop  { border-color: var(--loop);  background: color-mix(in srgb, var(--loop) 22%, transparent); }
+  .sw-core  { border-color: var(--accent);background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .sw-dead  { border-color: var(--dead);  background: transparent; }
+
+  /* ---- findings ---- */
+  ol.findings { list-style: none; counter-reset: f; padding: 0; margin: 6px 0 0; }
+  ol.findings > li {
+    counter-increment: f;
+    display: grid;
+    grid-template-columns: 44px minmax(0,1fr);
+    gap: 16px;
+    padding: 16px 0;
+    border-top: 1px solid var(--rule-2);
+  }
+  ol.findings > li:first-child { border-top: 0; }
+  ol.findings > li::before {
+    content: "F" counter(f, decimal-leading-zero);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: .04em;
+    padding-top: 2px;
+  }
+  ol.findings h3 { margin: 0 0 5px; font-size: 15px; font-weight: 650; letter-spacing: -.005em; }
+  ol.findings p { margin: 0 0 6px; font-size: 14px; color: var(--ink-2); max-width: 78ch; }
+  ol.findings p:last-child { margin-bottom: 0; }
+  .tag {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+    border: 1px solid currentColor; padding: 1px 6px; margin-left: 8px; vertical-align: 2px;
+  }
+  .t-alloc { color: var(--alloc); }
+  .t-copy  { color: var(--copy); }
+  .t-doc   { color: var(--ink-3); }
+  .t-dead  { color: var(--dead); }
+
+  .bar { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11.5px; }
+  .bar span.track { flex: 1; height: 8px; background: var(--rule-2); position: relative; min-width: 90px; }
+  .bar span.fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); }
+  .bar span.fill.ours { background: var(--alloc); }
+
+  hr.rule { border: 0; border-top: 1px solid var(--rule-2); margin: 24px 0; }
+  .caveat {
+    border-left: 3px solid var(--copy);
+    background: color-mix(in srgb, var(--copy) 7%, transparent);
+    padding: 12px 16px;
+    margin: 18px 0 0;
+    font-size: 13.5px;
+    color: var(--ink-2);
+  }
+  .caveat b { color: var(--ink); }
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<div class="wrap">
+
+<div class="titleblock">
+  <div>
+    <p class="eyebrow">gzippy · schematic sheet set</p>
+    <h1>The compression path,<br>drawn as logic</h1>
+    <p class="lede">Every node below is a real function at a real line. Two datapaths are drawn separately because
+    they <em>are</em> separate: <code>T=1</code> is a single-pass streaming encoder over one sliding buffer;
+    <code>T&gt;1</code> is a chunk grid, a thread pool and a writer thread. Allocation sites, buffer copies and
+    hot loops are marked on the traces.</p>
+  </div>
+  <div>
+    <dl class="meta">
+      <dt>Scope</dt><dd>encoder only — decode path excluded</dd>
+      <dt>Source rev</dt><dd>main @ ce43e4c7</dd>
+      <dt>Alloc ground truth</dt><dd>DHAT · 6,000,000 B dickens · <code>-6 -p1</code> · 261 allocs / 13,647,061 B</dd>
+      <dt>Hot-path ground truth</dt><dd>cachegrind · same input · L6 T1 · Zen2</dd>
+      <dt>Method</dt><dd>read from source; no build, no benchmark</dd>
+    </dl>
+  </div>
+</div>
+
+<!-- ============================= SHEET 1 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 1</span>
+    <h2>Top level — CLI to the T1/T&gt;1 fork</h2>
+    <p class="note">One decision, at <span class="anchor">compress/mod.rs:135</span>, separates the two datapaths.
+    The CLI default is <code>num_cpus()</code> threads, so an untyped invocation lands on the right-hand column.</p>
+  </div>
+  <div class="sheet-body">
+
+<div class="diagram">
+<pre class="mermaid">
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, SFMono-Regular, Menlo, monospace","fontSize":"12px","lineColor":"#7C8E97","clusterBkg":"transparent","clusterBorder":"#7C8E97","titleColor":"#7C8E97","edgeLabelBackground":"#E6EAED"}} }%%
+flowchart TD
+  M["main() · main.rs:125"]:::cli
+  R["run() · main.rs:207"]:::cli
+  ARGS["GzippyArgs::parse · cli.rs<br/>level default 6 (cli.rs:65)<br/>processes default = num_cpus (cli.rs:67)"]:::cli
+  FILES{"files given?<br/>main.rs:361"}:::dec
+  CS["compress::io::compress_stdin<br/>io.rs:349"]:::cli
+  CF["compress::io::compress_file<br/>io.rs:38"]:::cli
+
+  OPEN["File::open — permission gate<br/>io.rs:93"]:::cli
+  DET["detect_content_type — 8 KiB sample read<br/>io.rs:197 · optimization.rs:58"]:::deadn
+  OPT["OptimizationConfig::new<br/>io.rs:207 · optimization.rs:34<br/>thread_count = min(requested, num_cpus)"]:::cli
+  MM{"use_mmap = threads &gt; 1 AND size &gt; 128 KiB<br/>io.rs:220"}:::dec
+
+  RSY["--rsyncable · parallel::compress_rsyncable<br/>io.rs:243 · parallel.rs:661"]:::sidecar
+  PP["mmap + PipelinedGzEncoder::compress_buffer_pure<br/>io.rs:272 · io.rs:283"]:::t2
+  BUFW["BufWriter::with_capacity(1 MiB)<br/>io.rs:292"]:::alloc
+  CWP["compress_with_pipeline_sized<br/>compress/mod.rs:90"]:::core
+  ZOP{"-F/-I/-J explicit zopfli?<br/>mod.rs:104"}:::dec
+  ULTRA["ZopfliGzEncoder — parse/ultra<br/>mod.rs:122"]:::sidecar
+  FORK{"thread_count == 1 ?<br/>compress/mod.rs:135"}:::dec
+  T1["SHEET 2 · T=1 datapath<br/>deflate::encode_gzip_reader_to_writer<br/>mod.rs:156"]:::t1
+  RTE["read_to_end into Vec::with_capacity(size_hint)<br/>mod.rs:183"]:::copy
+  T2["SHEET 3 · T&gt;1 datapath<br/>PipelinedGzEncoder::compress_buffer_pure<br/>mod.rs:191"]:::t2
+
+  M --> R --> ARGS --> FILES
+  FILES -- "no" --> CS
+  FILES -- "yes" --> CF
+  CF --> OPEN --> DET --> OPT --> MM
+  MM -- "rsyncable" --> RSY
+  MM -- "yes" --> PP
+  MM -- "no" --> BUFW --> CWP
+  CS --> CWP
+  CWP --> ZOP
+  ZOP -- "yes" --> ULTRA
+  ZOP -- "no" --> FORK
+  FORK -- "yes" --> T1
+  FORK -- "no" --> RTE --> T2
+  PP --> T2
+
+  classDef cli fill:#E6EAED,stroke:#9AA9B1,stroke-width:1px,color:#0D171C;
+  classDef dec fill:#FBE8C0,stroke:#C0972F,stroke-width:1px,color:#0D171C;
+  classDef core fill:#C9E4E7,stroke:#4E9AA3,stroke-width:1px,color:#0D171C;
+  classDef t1 fill:#C9E4E7,stroke:#0A6A7A,stroke-width:3px,color:#0D171C;
+  classDef t2 fill:#F6DCC8,stroke:#B4720E,stroke-width:3px,color:#0D171C;
+  classDef alloc fill:#F8CED4,stroke:#B32338,stroke-width:3px,color:#0D171C;
+  classDef copy fill:#F7E3C4,stroke:#B4720E,stroke-width:3px,color:#0D171C;
+  classDef sidecar fill:#E9E4F4,stroke:#8A7BC8,stroke-width:1px,color:#0D171C;
+  classDef deadn fill:#EFF2F3,stroke:#7B8A92,stroke-width:1px,stroke-dasharray:4 3,color:#4A585F;
+</pre>
+</div>
+<p class="cap">Dashed grey = executes but changes nothing observable. Red = heap allocation. Amber = whole-input buffer copy.</p>
+
+<div class="caveat">
+  <b>Verified, and it surprised me:</b> <code>detect_content_type</code> at <span class="anchor">io.rs:197</span>
+  opens the input a second time, allocates an 8 KiB sample (<span class="anchor">optimization.rs:59</span>) and
+  classifies it — and the resulting <code>ContentType</code> reaches only <code>opt_config.buffer_size</code> and
+  <code>opt_config.backend</code>, both of which are read <em>only</em> inside the <code>verbosity &gt;= 2</code>
+  <code>eprintln!</code> at <span class="anchor">io.rs:209-216</span>. <code>optimal_thread_count</code>
+  (<span class="anchor">optimization.rs:154</span>) does not take content type. It is dead work on the production path.
+</div>
+
+  </div>
+</section>
+
+<!-- ============================= SHEET 2 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 2</span>
+    <h2>T = 1 — single-pass streaming datapath</h2>
+    <p class="note">One <code>BitWriter</code>, one <code>ParseState</code>, one buffer that slides. The input is never
+    copied into a second work buffer; the only bulk move is the window slide.</p>
+  </div>
+  <div class="sheet-body">
+
+<div class="diagram">
+<pre class="mermaid">
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, SFMono-Regular, Menlo, monospace","fontSize":"12px","lineColor":"#7C8E97","clusterBkg":"transparent","clusterBorder":"#7C8E97","titleColor":"#7C8E97","edgeLabelBackground":"#E6EAED"}} }%%
+flowchart TD
+  E["encode_gzip_reader_to_writer · deflate/mod.rs:606"]:::core
+  CH["encode_gzip_reader_to_writer_chunked · mod.rs:623"]:::core
+  LS{"level_streams(level)?<br/>mod.rs:571 · L0 or resumable parser"}:::dec
+
+  subgraph FB ["fallback — L1, L10, L11, L12"]
+    FB1["Vec::new() + read_to_end — WHOLE INPUT, no capacity hint<br/>mod.rs:636-637"]:::copy
+    FB2["resize(len + INPLACE_TAIL_PAD, 0)<br/>mod.rs:639"]:::copy
+    FB3["encode_gzip_slack_padded_to_vec · mod.rs:315<br/>out = Vec::with_capacity(len/2 + 32) · mod.rs:320"]:::alloc
+    FB4["deflate_into · mod.rs:207"]:::core
+    FB1 --> FB2 --> FB3 --> FB4
+  end
+
+  SP["encode_gzip_single_pass · mod.rs:377"]:::t1
+  B1["buf = vec![0u8; 2*WINDOW + LOOKAHEAD + CHUNK + PAD]<br/>= 4,564,792 B · mod.rs:395"]:::alloc
+  B2["out = Vec::with_capacity(CHUNK/2 + 1024)<br/>= 2,098,144 B · mod.rs:404"]:::alloc
+  BW["BitWriter::from_vec — adopts out, no second buffer<br/>mod.rs:406 · bitstream.rs:56"]:::core
+
+  RL["REFILL LOOP · mod.rs:422-438<br/>reader.read into buf[avail..fill_to] · mod.rs:424<br/>crc.update on the same hot bytes · mod.rs:430"]:::loop
+  PAD["buf[avail..avail+PAD].fill(0) — speculative-load pad · mod.rs:442"]:::core
+  L0Q{"level == 0 ?<br/>mod.rs:450"}:::dec
+  ST["emit_stored_block — 65535-B sub-blocks · mod.rs:463 / :659"]:::emit
+  PR["parse::parse_resumable · mod.rs:478 · parse/mod.rs:694<br/>SHEET 4"]:::t1
+  DR["bw.drain_to(writer) — complete bytes only, bit accumulator survives<br/>mod.rs:500 · bitstream.rs:270"]:::emit
+  SL["SLIDE · buf.copy_within(shift..avail, 0)<br/>mod.rs:519"]:::copy
+  SD["state.shift_down(shift) — O(1) rebase of in_base<br/>mod.rs:523 · parse/mod.rs:635"]:::core
+  TL["bw.finish() + CRC32 + ISIZE, one write_all<br/>mod.rs:532-535"]:::emit
+
+  E --> CH --> LS
+  LS -- "no" --> FB
+  LS -- "yes" --> SP
+  SP --> B1 --> B2 --> BW --> RL --> PAD --> L0Q
+  L0Q -- "yes" --> ST --> DR
+  L0Q -- "no" --> PR --> DR
+  DR --> SL --> SD --> RL
+  DR --> TL
+
+  classDef dec fill:#FBE8C0,stroke:#C0972F,stroke-width:1px,color:#0D171C;
+  classDef core fill:#C9E4E7,stroke:#4E9AA3,stroke-width:1px,color:#0D171C;
+  classDef t1 fill:#C9E4E7,stroke:#0A6A7A,stroke-width:3px,color:#0D171C;
+  classDef alloc fill:#F8CED4,stroke:#B32338,stroke-width:3px,color:#0D171C;
+  classDef copy fill:#F7E3C4,stroke:#B4720E,stroke-width:3px,color:#0D171C;
+  classDef loop fill:#E2D8F4,stroke:#64379B,stroke-width:3px,color:#0D171C;
+  classDef emit fill:#D7E9D1,stroke:#5F8F53,stroke-width:1px,color:#0D171C;
+</pre>
+</div>
+<p class="cap">
+  <code>STREAM_CHUNK = MAX_STORED_SUBBLOCK * 64 = 4,194,240 B</code> (<span class="anchor">mod.rs:354</span>).
+  Buffer arithmetic checks against DHAT exactly: 2·32768 + 305,000 + 4,194,240 + 16 = 4,564,792.
+</p>
+
+  </div>
+</section>
+
+<!-- ============================= SHEET 3 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 3</span>
+    <h2>T &gt; 1 — chunk grid, worker pool, writer thread</h2>
+    <p class="note">A different program. Chunks are independently encoded streams joined by sync-flush seams;
+    every chunk restages its own <code>[dict | data | pad]</code> buffer and every chunk's output is held in RAM
+    until the writer thread reaches it.</p>
+  </div>
+  <div class="sheet-body">
+
+<div class="diagram">
+<pre class="mermaid">
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, SFMono-Regular, Menlo, monospace","fontSize":"12px","lineColor":"#7C8E97","clusterBkg":"transparent","clusterBorder":"#7C8E97","titleColor":"#7C8E97","edgeLabelBackground":"#E6EAED"}} }%%
+flowchart TD
+  CB["PipelinedGzEncoder::compress_buffer_pure<br/>pipelined.rs:285"]:::t2
+  Z{"level == 0 ?<br/>pipelined.rs:316"}:::dec
+  Z0["single-shot stored, T-independent<br/>Vec::with_capacity(len + len/65535 + 16) — WHOLE OUTPUT<br/>pipelined.rs:341"]:::alloc
+  PPP["compress_parallel_pipeline_pure · pipelined.rs:548"]:::t2
+  BS["pipelined_block_size · pipelined.rs:175<br/>max(len/(T*2), 512 KiB) clamped 128 KiB..8 MiB,<br/>then floored to a whole SOFT_MAX_BLOCK_LENGTH (300 KB)"]:::core
+  HDR["gzip header written before any thread starts<br/>pipelined.rs:564"]:::emit
+  CRCV["crc_parts: Vec of one CrcSlot per chunk<br/>pipelined.rs:567"]:::alloc
+
+  SCH["infra::scheduler::compress_parallel · scheduler.rs:104"]:::t2
+  SLOTS["slots: Vec of BlockSlot, ONE PER CHUNK, all live at once<br/>each Vec::with_capacity(block + block/10 + 1024)<br/>scheduler.rs:135-138 · scheduler.rs:55"]:::alloc
+
+  subgraph WT ["writer thread — scheduler.rs:167"]
+    W1["spin on slot.is_ready() · scheduler.rs:39, :171"]:::loop
+    W2["w.write_all(slot.data()) in chunk order · scheduler.rs:175"]:::emit
+    W1 --> W2 --> W1
+  end
+
+  subgraph WK ["N worker threads — scheduler.rs:186-199"]
+    K1["claim block_idx via AtomicUsize::fetch_add · scheduler.rs:260"]:::loop
+    K2["dict = previous 32 KiB of input · scheduler.rs:271"]:::core
+    K3["encode_deflate_segment_to_sink · pipelined.rs:580 · deflate/mod.rs:131"]:::core
+    K4["buf = Vec::with_capacity(dict+data+pad) · mod.rs:166<br/>extend_from_slice(dict); extend_from_slice(data) · mod.rs:167-168<br/>PER-CHUNK STAGING COPY OF EVERY INPUT BYTE"]:::copy
+    K5["deflate_into → parse::compress · mod.rs:170 · parse/mod.rs:416<br/>SHEET 4 (whole-buffer, non-resumable entry)"]:::t2
+    K6["sync-flush seam if not last · mod.rs:252"]:::emit
+    K7["per-chunk crc32fast::Hasher · pipelined.rs:588"]:::core
+    K1 --> K2 --> K3 --> K4 --> K5 --> K6 --> K7 --> K1
+  end
+
+  CMB["combine per-chunk CRCs in order, write CRC32 + ISIZE<br/>pipelined.rs:599-610"]:::emit
+
+  CB --> Z
+  Z -- "yes" --> Z0
+  Z -- "no" --> PPP --> BS --> HDR --> CRCV --> SCH
+  SCH --> SLOTS
+  SLOTS --> WT
+  SLOTS --> WK
+  WK -. "mark_ready · scheduler.rs:294" .-> WT
+  WT --> CMB
+
+  classDef dec fill:#FBE8C0,stroke:#C0972F,stroke-width:1px,color:#0D171C;
+  classDef core fill:#C9E4E7,stroke:#4E9AA3,stroke-width:1px,color:#0D171C;
+  classDef t2 fill:#F6DCC8,stroke:#B4720E,stroke-width:3px,color:#0D171C;
+  classDef alloc fill:#F8CED4,stroke:#B32338,stroke-width:3px,color:#0D171C;
+  classDef copy fill:#F7E3C4,stroke:#B4720E,stroke-width:3px,color:#0D171C;
+  classDef loop fill:#E2D8F4,stroke:#64379B,stroke-width:3px,color:#0D171C;
+  classDef emit fill:#D7E9D1,stroke:#5F8F53,stroke-width:1px,color:#0D171C;
+</pre>
+</div>
+<p class="cap">
+  Structural difference from Sheet 2, in one line: T=1 parses the input <em>in place</em> and drains bytes to the fd
+  as it goes; T&gt;1 copies every input byte into a per-chunk staging buffer and holds the entire compressed output
+  in slot memory until the writer drains it.
+</p>
+
+  </div>
+</section>
+
+<!-- ============================= SHEET 4 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 4</span>
+    <h2>Parse core — strategy dispatch, matchfinders, block emit</h2>
+    <p class="note">Both datapaths converge here. Two entry points:
+    <code>parse::compress</code> (whole-buffer) and <code>parse::parse_resumable</code> (streaming).</p>
+  </div>
+  <div class="sheet-body">
+
+<div class="diagram">
+<pre class="mermaid">
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, SFMono-Regular, Menlo, monospace","fontSize":"12px","lineColor":"#7C8E97","clusterBkg":"transparent","clusterBorder":"#7C8E97","titleColor":"#7C8E97","edgeLabelBackground":"#E6EAED"}} }%%
+flowchart TD
+  DI["deflate_into · deflate/mod.rs:207"]:::core
+  L0["level == 0 → emit_stored_block, parser bypassed entirely<br/>mod.rs:219-220"]:::emit
+  LP["level::params(level) · mod.rs:222 · level.rs:88"]:::core
+  PC["parse::compress · parse/mod.rs:416"]:::core
+  PRS["parse::parse_resumable · parse/mod.rs:694"]:::core
+  SC["StaticCodes::build — 2x make_huffman_code, 4 allocs<br/>parse/mod.rs:424 and :704 · once per call"]:::alloc
+  DISP{"match params.strategy<br/>parse/mod.rs:425 / :705"}:::dec
+
+  F0["Fast0 → fast::run::&lt;true&gt; · parse/mod.rs:430<br/>UNREACHABLE — L0 short-circuits at mod.rs:219"]:::deadn
+  FA["Fast → fast::run::&lt;false&gt; · parse/mod.rs:541"]:::parse
+  GR["Greedy → greedy::run · parse/mod.rs:567"]:::parse
+  LZ["Lazy → lazy::run(lazy2=false) · parse/mod.rs:568"]:::parse
+  L2["Lazy2 → lazy::run(lazy2=true) · parse/mod.rs:571"]:::parse
+  NO["NearOptimal → near_optimal::run · parse/mod.rs:575"]:::parse
+  HT["ht_fast::run — NOT ROUTED<br/>parse/mod.rs:62 dead_code; FALSIFY at :447-534"]:::deadn
+
+  subgraph HCP ["hash-chain parsers — L2..L9"]
+    RR["run_resumable · greedy.rs:71 / lazy.rs:82"]:::parse
+    SK["Sink::new() — Vec::with_capacity(349,612 Seq) = 2,796,896 B<br/>greedy.rs:82 · lazy.rs:94 · parse/mod.rs:255"]:::alloc
+    HS["HeaderScratch::new() · greedy.rs:86 · lazy.rs:97"]:::alloc
+    BL["BLOCK LOOP · greedy.rs:89 · lazy.rs:100"]:::loop
+    TK["TOKEN LOOP (per input position)<br/>greedy.rs:162 · lazy.rs:171"]:::loop
+    MF["hc::HcMatchfinder::longest_match<br/>hc.rs:229 — called 1x (greedy) / 2-3x (lazy) per position"]:::mf
+    SKB["hc::skip_bytes over an accepted match · hc.rs:738"]:::mf
+    PUSH["Sink::push_literal / push_match / push_seq<br/>parse/mod.rs:278 / :376 / :325 — writes through spare capacity"]:::core
+    CBK["continue_block — byte budget, seq cap, split detector<br/>parse/mod.rs:749 · block_split.rs:218"]:::core
+    RR --> SK --> HS --> BL --> TK --> MF --> SKB --> PUSH --> CBK --> TK
+  end
+
+  subgraph MFB ["matchfinder state"]
+    PS["ParseState::new · parse/mod.rs:601"]:::mf
+    AQ["HcMatchfinder::acquire — thread_local pool<br/>hc.rs:205 · pool at hc.rs:100"]:::mf
+    NEW["HcMatchfinder::new — Box::new_uninit, 262,144 B<br/>hash3 64 KiB + hash4 128 KiB + next 64 KiB · hc.rs:91, :152"]:::alloc
+    RST["reset() — fill all three tables with the sentinel · hc.rs:182"]:::core
+    SW["slide_window → matchfinder_rebase x3<br/>hc.rs:214 · common.rs:180 — every 32 KiB of input"]:::copy
+    PS --> AQ --> NEW
+    AQ --> RST
+    RST --> SW
+  end
+
+  subgraph EM ["block emit — parse/mod.rs:828"]
+    E1["make_huffman_code(litlen) · parse/mod.rs:848"]:::alloc
+    E2["make_huffman_code(offset) · parse/mod.rs:853"]:::alloc
+    E3["build_dynamic_header · parse/mod.rs:858 · header.rs:156<br/>→ make_huffman_code(precode) · header.rs:193"]:::alloc
+    E4["three-way cost compare: stored vs static vs dynamic<br/>parse/mod.rs:880-914 · cost_from_freqs :996"]:::core
+    E5["EmitTables::build — 547 stack entries rebuilt per block<br/>parse/mod.rs:1059"]:::core
+    E6["emit_sequences — bw.reserve(2*block_length+16), then<br/>unchecked add_bits_raw + flush_word_unchecked<br/>parse/mod.rs:1621, :1644"]:::loop
+    E1 --> E2 --> E3 --> E4 --> E5 --> E6
+  end
+
+  DI --> L0
+  DI --> LP --> PC
+  PRS --> SC
+  PC --> SC --> DISP
+  DISP --> F0
+  DISP --> FA
+  DISP --> GR
+  DISP --> LZ
+  DISP --> L2
+  DISP --> NO
+  HT -.-> DISP
+  GR --> HCP
+  LZ --> HCP
+  L2 --> HCP
+  HCP --> MFB
+  CBK --> EM
+  FA --> EM
+  NO --> EM
+
+  classDef dec fill:#FBE8C0,stroke:#C0972F,stroke-width:1px,color:#0D171C;
+  classDef core fill:#C9E4E7,stroke:#4E9AA3,stroke-width:1px,color:#0D171C;
+  classDef parse fill:#DCD6F2,stroke:#8A7BC8,stroke-width:1px,color:#0D171C;
+  classDef mf fill:#F6D9C6,stroke:#B4720E,stroke-width:1px,color:#0D171C;
+  classDef alloc fill:#F8CED4,stroke:#B32338,stroke-width:3px,color:#0D171C;
+  classDef copy fill:#F7E3C4,stroke:#B4720E,stroke-width:3px,color:#0D171C;
+  classDef loop fill:#E2D8F4,stroke:#64379B,stroke-width:3px,color:#0D171C;
+  classDef emit fill:#D7E9D1,stroke:#5F8F53,stroke-width:1px,color:#0D171C;
+  classDef deadn fill:#EFF2F3,stroke:#7B8A92,stroke-width:1px,stroke-dasharray:4 3,color:#4A585F;
+</pre>
+</div>
+
+<hr class="rule">
+
+<h3 style="font-family:var(--mono);font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);margin:0 0 12px;">Level → strategy routing, read off the deciding lines</h3>
+<p style="margin-top:0;">The deciding code is <code>level::params_inner</code>'s <code>match level</code> at
+<span class="anchor">level.rs:123-272</span>, plus two overrides that never appear in that table:
+<span class="anchor">deflate/mod.rs:219</span> (L0 bypasses the parser) and
+<span class="anchor">parse/mod.rs:679</span> (which strategies may stream).</p>
+
+<div class="matrix">
+  <div class="matrix-inner">
+    <div class="rowhead">Level</div>
+    <div class="lvl">0</div><div class="lvl">1</div><div class="lvl">2</div><div class="lvl">3</div><div class="lvl">4</div>
+    <div class="lvl">5</div><div class="lvl">6</div><div class="lvl">7</div><div class="lvl">8</div><div class="lvl">9</div>
+    <div class="lvl">10</div><div class="lvl">11</div><div class="lvl">12</div>
+
+    <div class="rowhead">Strategy</div>
+    <div class="c s-stored">stored</div><div class="c s-fast">Fast</div><div class="c s-greedy">Greedy</div>
+    <div class="c s-lazy">Lazy</div><div class="c s-greedy">Greedy</div><div class="c s-lazy">Lazy</div>
+    <div class="c s-lazy">Lazy</div><div class="c s-lazy">Lazy</div><div class="c s-lazy">Lazy2</div>
+    <div class="c s-lazy">Lazy2</div><div class="c s-near">NearOpt</div><div class="c s-near">NearOpt</div>
+    <div class="c s-near">NearOpt</div>
+
+    <div class="rowhead">Parser file</div>
+    <div class="c">mod.rs<br>:219</div><div class="c">fast.rs</div><div class="c">greedy.rs</div><div class="c">lazy.rs</div>
+    <div class="c">greedy.rs</div><div class="c">lazy.rs</div><div class="c">lazy.rs</div><div class="c">lazy.rs</div>
+    <div class="c">lazy.rs</div><div class="c">lazy.rs</div><div class="c">near_<br>optimal.rs</div>
+    <div class="c">near_<br>optimal.rs</div><div class="c">near_<br>optimal.rs</div>
+
+    <div class="rowhead">Matchfinder</div>
+    <div class="c">—</div><div class="c">fused<br>head tab</div><div class="c">hc</div><div class="c">hc</div>
+    <div class="c">hc</div><div class="c">hc</div><div class="c">hc</div><div class="c">hc</div>
+    <div class="c">hc</div><div class="c">hc</div><div class="c">bt</div><div class="c">bt</div><div class="c">bt</div>
+
+    <div class="rowhead">search depth</div>
+    <div class="c">—</div><div class="c">1*</div><div class="c">6</div><div class="c">12</div><div class="c">16</div>
+    <div class="c">16</div><div class="c">35</div><div class="c">100</div><div class="c">300</div><div class="c">600</div>
+    <div class="c">35</div><div class="c">100</div><div class="c">300</div>
+
+    <div class="rowhead">nice length</div>
+    <div class="c">—</div><div class="c">32*</div><div class="c">10</div><div class="c">14</div><div class="c">30</div>
+    <div class="c">30</div><div class="c">65</div><div class="c">130</div><div class="c">258</div><div class="c">258</div>
+    <div class="c">75</div><div class="c">150</div><div class="c">258</div>
+
+    <div class="rowhead">streams (T1)</div>
+    <div class="c yes">yes</div><div class="c no">no</div><div class="c yes">yes</div><div class="c yes">yes</div>
+    <div class="c yes">yes</div><div class="c yes">yes</div><div class="c yes">yes</div><div class="c yes">yes</div>
+    <div class="c yes">yes</div><div class="c yes">yes</div><div class="c no">no</div><div class="c no">no</div>
+    <div class="c no">no</div>
+  </div>
+</div>
+<p class="cap">* L1's depth/nice knobs are populated but unread — <code>Strategy::Fast</code> does one probe per position
+  (<span class="anchor">level.rs:130-140</span>). "streams = no" means the level takes the whole-input fallback at
+  <span class="anchor">deflate/mod.rs:636</span>.</p>
+
+<div class="caveat">
+  <b>Two routing facts the surrounding comments get wrong.</b>
+  (1) <span class="anchor">level.rs:147-194</span> is a 48-line comment claiming L3 is a
+  <em>detector-gated</em> strategy called <code>LazyGated</code>; the code at
+  <span class="anchor">level.rs:195-200</span> emits plain <code>Strategy::Lazy</code>, and no
+  <code>LazyGated</code> variant exists in the enum (<span class="anchor">level.rs:22-54</span>) — the
+  orphaned doc paragraph now dangles above <code>NearOptimal</code>. The detector module was deleted
+  (<span class="anchor">parse/mod.rs:42-51</span>).
+  (2) Because L3 is plain <code>Lazy</code>, <code>level_has_resumable_parser</code>
+  (<span class="anchor">parse/mod.rs:679-684</span>) returns <b>true</b> for it, so <b>L3 does stream</b> —
+  directly contradicting <span class="anchor">parse/mod.rs:676-678</span> ("level 3 (LazyGated) is excluded from
+  streaming entirely"). Same for the <code>matchfinder/mod.rs</code> tier table, which still lists the fused
+  head-table finder as serving "L0-1" when L0 never reaches a parser at all.
+</div>
+
+  </div>
+</section>
+
+<!-- ============================= SHEET 5 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 5</span>
+    <h2>Allocation ledger</h2>
+    <p class="note">Every heap allocation on the encoder path, with its cadence. Per-block allocation is a
+    STEP 1 violation and is called out in red.</p>
+  </div>
+  <div class="sheet-body">
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr>
+      <th>Site</th><th class="mono">file:line</th><th>Bytes</th><th>Cadence</th><th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="hot">
+      <td><code>make_huffman_code</code> — <code>lens</code></td>
+      <td class="mono">huffman/fast.rs:409</td>
+      <td class="num">288 or 32</td>
+      <td><span class="pill block">per block</span></td>
+      <td>DHAT ~27 blocks. <b>3 calls per DEFLATE block</b> (litlen, offset, precode) × 2 Vecs = 6 allocations/block.
+          Being removed on <code>perf/no-per-block-alloc</code>.</td>
+    </tr>
+    <tr class="hot">
+      <td><code>make_huffman_code</code> — <code>codewords</code></td>
+      <td class="mono">huffman/fast.rs:410</td>
+      <td class="num">1,152 or 128</td>
+      <td><span class="pill block">per block</span></td>
+      <td>Same call, second Vec. Both are pure scratch: the result is consumed inside <code>emit_block</code>.</td>
+    </tr>
+    <tr class="hot">
+      <td><code>compute_precode_items</code> → <code>scratch.items</code></td>
+      <td class="mono">huffman/header.rs:191</td>
+      <td class="num">grows</td>
+      <td><span class="pill block">per block</span> (amortising)</td>
+      <td>DHAT 14 blocks. Scratch is reused across blocks (<span class="anchor">header.rs:54-66</span>) so
+          growth stops once the widest block is seen — but the first blocks of every <code>run()</code> pay it.</td>
+    </tr>
+    <tr>
+      <td><code>Sink::seqs</code> — the sequence store</td>
+      <td class="mono">parse/mod.rs:255</td>
+      <td class="num">2,796,896</td>
+      <td><span class="pill pass">per parse call</span></td>
+      <td>DHAT: 2 blocks / 5,593,792 B — exactly two <code>parse_resumable</code> passes over 6 MB.
+          349,612 × 8-byte <code>Seq</code>, sized off <code>FAST0_BLOCK_LENGTH</code>
+          (<span class="anchor">parse/mod.rs:158-165</span>). Never grown, never initialised.
+          <b>Not pooled</b>, unlike the matchfinder.</td>
+    </tr>
+    <tr>
+      <td>streaming work buffer <code>vec![0u8; cap]</code></td>
+      <td class="mono">deflate/mod.rs:395</td>
+      <td class="num">4,564,792</td>
+      <td><span class="pill proc">once per file</span></td>
+      <td>2×WINDOW + STREAM_BLOCK_LOOKAHEAD + STREAM_CHUNK + PAD. This is the whole T1 input residency.</td>
+    </tr>
+    <tr>
+      <td>streaming output buffer</td>
+      <td class="mono">deflate/mod.rs:404</td>
+      <td class="num">2,098,144</td>
+      <td><span class="pill proc">once per file</span></td>
+      <td><code>STREAM_CHUNK/2 + 1024</code>; adopted by <code>BitWriter::from_vec</code> and drained, never regrown
+          in steady state.</td>
+    </tr>
+    <tr>
+      <td><code>BufWriter::with_capacity</code> (stdout)</td>
+      <td class="mono">io.rs:292 (and :389)</td>
+      <td class="num">1,048,576</td>
+      <td><span class="pill proc">once per process</span></td>
+      <td>Only on the <code>-c</code> / stdin routes; the file route uses a default <code>BufWriter</code>
+          (<span class="anchor">io.rs:302</span>).</td>
+    </tr>
+    <tr>
+      <td><code>HcMatchfinder</code> box</td>
+      <td class="mono">matchfinder/hc.rs:152</td>
+      <td class="num">262,144</td>
+      <td><span class="pill pooled">once per thread</span></td>
+      <td>hash3 65,536 + hash4 131,072 + next 65,536. <code>thread_local</code> pool at
+          <span class="anchor">hc.rs:100</span>; <code>acquire()</code> re-arms in place
+          (<span class="anchor">hc.rs:205</span>) instead of reallocating per chunk.</td>
+    </tr>
+    <tr>
+      <td>L1 <code>head</code> table</td>
+      <td class="mono">parse/fast.rs:2847</td>
+      <td class="num">262,144</td>
+      <td><span class="pill pooled">once per thread</span></td>
+      <td><code>1&lt;&lt;16</code> u32 slots, pooled via <code>HEAD_POOL</code>
+          (<span class="anchor">fast.rs:2765</span>). Re-<code>resize</code>d to <code>NO_POS</code> per call.</td>
+    </tr>
+    <tr>
+      <td>L1 <code>head3</code> table</td>
+      <td class="mono">parse/fast.rs:2897</td>
+      <td class="num">131,072</td>
+      <td><span class="pill pooled">once per thread</span></td>
+      <td>The length-3 table that is L1's measured advantage over libdeflate on binaries
+          (<span class="anchor">parse/mod.rs:465-473</span>).</td>
+    </tr>
+    <tr>
+      <td><code>StaticCodes::build</code> (4 Vecs)</td>
+      <td class="mono">parse/mod.rs:424, :704</td>
+      <td class="num">1,600</td>
+      <td><span class="pill pass">per parse call</span></td>
+      <td>Builds the RFC 1951 <b>fixed</b> Huffman code — data-independent, identical every time — from
+          frequency tables, on every <code>compress</code>/<code>parse_resumable</code> entry. At T&gt;1 that is
+          per chunk.</td>
+    </tr>
+    <tr>
+      <td><code>HeaderScratch::new</code></td>
+      <td class="mono">greedy.rs:86 · lazy.rs:97 · fast.rs:2934</td>
+      <td class="num">0 then grows</td>
+      <td><span class="pill pass">per parse call</span></td>
+      <td>Two empty Vecs; the growth lands on <span class="anchor">header.rs:183/191</span> (rows above).</td>
+    </tr>
+    <tr>
+      <td><code>Optimizer::match_cache</code> (L10-12)</td>
+      <td class="mono">near_optimal.rs:108</td>
+      <td class="num">6,002,052</td>
+      <td><span class="pill pass">per parse call</span></td>
+      <td>1,500,513 × 4-byte <code>LzMatch</code>.</td>
+    </tr>
+    <tr>
+      <td><code>Optimizer::optimum_nodes</code> (L10-12)</td>
+      <td class="mono">near_optimal.rs:109</td>
+      <td class="num">2,440,000</td>
+      <td><span class="pill pass">per parse call</span></td>
+      <td>305,000 × 8-byte <code>OptimumNode</code> (<span class="anchor">costs.rs:73</span>).</td>
+    </tr>
+    <tr>
+      <td><code>BtMatchfinder::tab</code> (L10-12)</td>
+      <td class="mono">matchfinder/bt.rs:65</td>
+      <td class="num">524,288</td>
+      <td><span class="pill pass">per parse call</span></td>
+      <td>hash3 2-way 131,072 + hash4 65,536 + child 65,536 i16. <b>Not pooled</b> — no analogue of
+          <code>HcMatchfinder::acquire</code>.</td>
+    </tr>
+    <tr>
+      <td>T&gt;1 output slots</td>
+      <td class="mono">scheduler.rs:136-138</td>
+      <td class="num">N × (chunk×1.1 + 1024)</td>
+      <td><span class="pill chunk">once per file, N up front</span></td>
+      <td>All chunks' compressed output is resident simultaneously — roughly 1.1× input in the worst case.</td>
+    </tr>
+    <tr>
+      <td>T&gt;1 per-chunk staging buffer</td>
+      <td class="mono">deflate/mod.rs:166</td>
+      <td class="num">dict + chunk + 16</td>
+      <td><span class="pill chunk">per chunk</span></td>
+      <td>Allocated <em>and</em> filled by copy. See the copy ledger.</td>
+    </tr>
+    <tr>
+      <td>Non-streaming fallback input buffer</td>
+      <td class="mono">deflate/mod.rs:636</td>
+      <td class="num">whole input</td>
+      <td><span class="pill proc">once per file (L1, L10-12)</span></td>
+      <td><code>Vec::new()</code> with <b>no capacity hint</b> before <code>read_to_end</code> — doubling reallocs,
+          each copying everything read so far — then <code>resize</code> for the pad
+          (<span class="anchor">mod.rs:639</span>).</td>
+    </tr>
+    <tr>
+      <td>Non-streaming fallback output buffer</td>
+      <td class="mono">deflate/mod.rs:320</td>
+      <td class="num">len/2 + 32</td>
+      <td><span class="pill proc">once per file (L1, L10-12)</span></td>
+      <td>Grows-and-copies whenever the guess is short.</td>
+    </tr>
+    <tr>
+      <td><code>detect_content_type</code> sample</td>
+      <td class="mono">optimization.rs:59</td>
+      <td class="num">8,192</td>
+      <td><span class="pill dead">per file, T&gt;1 &amp; L&gt;3</span></td>
+      <td>Result is never read outside a verbose log line.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p class="cap">Cadence legend: <span class="pill proc">once per process/file</span>
+  <span class="pill pooled">once per thread</span>
+  <span class="pill pass">once per parser invocation</span>
+  <span class="pill chunk">once per chunk (T&gt;1)</span>
+  <span class="pill block">per DEFLATE block — STEP 1 violation</span></p>
+
+  </div>
+</section>
+
+<!-- ============================= SHEET 6 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 6</span>
+    <h2>Copy ledger — every bulk memory move</h2>
+  </div>
+  <div class="sheet-body">
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Move</th><th class="mono">file:line</th><th>Path</th><th>Volume</th><th>Avoidable?</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>input read into the work buffer</td>
+      <td class="mono">deflate/mod.rs:424</td><td>T1</td>
+      <td class="num">1× input</td>
+      <td>No — this is the read itself, and the CRC is folded into it at <span class="anchor">mod.rs:430</span> while
+          the bytes are hot.</td>
+    </tr>
+    <tr>
+      <td>window slide <code>buf.copy_within(shift..avail, 0)</code></td>
+      <td class="mono">deflate/mod.rs:519</td><td>T1</td>
+      <td class="num">≤ 2 windows + tail per refill</td>
+      <td>Bounded and deliberate; the matchfinder rebase it pairs with is O(1)
+          (<span class="anchor">parse/mod.rs:635</span>).</td>
+    </tr>
+    <tr>
+      <td>matchfinder table rebase ×3</td>
+      <td class="mono">hc.rs:215-217 · common.rs:180</td><td>T1 + T&gt;1</td>
+      <td class="num">262,144 B per 32 KiB of input</td>
+      <td>Vendor-identical (saturating subtract over three tables). Fires from
+          <span class="anchor">hc.rs:273-277</span> inside <code>longest_match</code>.</td>
+    </tr>
+    <tr>
+      <td>speculative-load pad fill</td>
+      <td class="mono">deflate/mod.rs:442</td><td>T1</td>
+      <td class="num">16 B per refill</td>
+      <td>No. Required for byte-exactness of the unchecked loads.</td>
+    </tr>
+    <tr>
+      <td><code>bw.drain_to</code> → <code>write_all</code></td>
+      <td class="mono">bitstream.rs:270-274</td><td>T1</td>
+      <td class="num">1× output</td>
+      <td>No — this is the write. Clears the buffer without byte-aligning, so the seam is invisible.</td>
+    </tr>
+    <tr class="hot">
+      <td><b>per-chunk staging</b> <code>[dict | data | pad]</code></td>
+      <td class="mono">deflate/mod.rs:167-168</td><td>T&gt;1</td>
+      <td class="num">1× input + 32 KiB/chunk</td>
+      <td><b>Looks avoidable.</b> The input is already one contiguous mmap
+          (<span class="anchor">io.rs:272</span>) and chunk N-1's tail is physically adjacent to chunk N.
+          The copy exists only to satisfy the "buffer must carry BUF_PAD trailing zeros" contract
+          (<span class="anchor">deflate/mod.rs:179-182</span>) — which holds for free everywhere except the
+          final chunk. A <code>encode_deflate_segment_slack_padded</code> analogue of
+          <span class="anchor">mod.rs:265</span> would delete this whole row.</td>
+    </tr>
+    <tr>
+      <td>no-dict staging copy</td>
+      <td class="mono">deflate/mod.rs:154-155</td><td>T&gt;1 chunk 0, library API</td>
+      <td class="num">1× chunk</td>
+      <td>Same mechanism, already documented as skippable at <span class="anchor">mod.rs:148-149</span>.</td>
+    </tr>
+    <tr>
+      <td>worker → slot, then writer thread → fd</td>
+      <td class="mono">scheduler.rs:282, :175</td><td>T&gt;1</td>
+      <td class="num">1× output, twice</td>
+      <td>The slot write is the encode sink (no extra copy); the writer thread's
+          <code>write_all</code> is the only additional traversal.</td>
+    </tr>
+    <tr>
+      <td>fallback <code>read_to_end</code> doubling</td>
+      <td class="mono">deflate/mod.rs:637</td><td>T1, L1 &amp; L10-12</td>
+      <td class="num">~2× input in realloc copies</td>
+      <td><b>Avoidable today.</b> <code>compress_with_pipeline_sized</code> already carries an exact
+          <code>size_hint</code> (<span class="anchor">compress/mod.rs:96</span>, filled at
+          <span class="anchor">io.rs:299</span>) and drops it before this call.</td>
+    </tr>
+    <tr>
+      <td><code>emit_stored_block</code> byte copy</td>
+      <td class="mono">deflate/mod.rs:659 · bitstream.rs:243</td><td>both</td>
+      <td class="num">1× stored payload</td>
+      <td>No — stored blocks are a memcpy by definition.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+  </div>
+</section>
+
+<!-- ============================= SHEET 7 ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 7</span>
+    <h2>Loop ledger — and where the time actually is</h2>
+    <p class="note">Four loop nests. One of them is the encoder.</p>
+  </div>
+  <div class="sheet-body">
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Loop</th><th class="mono">file:line</th><th>Trip count</th><th>Measured weight</th></tr>
+  </thead>
+  <tbody>
+    <tr class="hot">
+      <td><b>hc chain walk — length-4</b></td>
+      <td class="mono">hc.rs:422-481</td>
+      <td>≤ <code>max_search_depth</code> per position (35 at L6, 600 at L9)</td>
+      <td rowspan="2"><b>hc.rs = 108,282,726 Dr of the program's 161,009,178</b> — 67% of all data reads at L6 T1,
+          and 414,673,369 Ir. Against libdeflate's inlined <code>hc_matchfinder.h</code> on byte-identical output:
+          <b>1.88× the data reads, 1.001× the D1 misses.</b></td>
+    </tr>
+    <tr class="hot">
+      <td><b>hc chain walk — length ≥ 5</b></td>
+      <td class="mono">hc.rs:588-635</td>
+      <td>same budget, entered once a 4-byte match is accepted</td>
+    </tr>
+    <tr>
+      <td>parser token loop (greedy)</td>
+      <td class="mono">greedy.rs:162-193</td>
+      <td>1 per emitted token</td>
+      <td>Calls <code>longest_match</code> once, then <code>skip_bytes</code> over the accepted match.</td>
+    </tr>
+    <tr>
+      <td>parser token loop (lazy / lazy2)</td>
+      <td class="mono">lazy.rs:171, inner <code>'have_cur_match</code> at :196</td>
+      <td>1 per emitted token</td>
+      <td>2 (<code>Lazy</code>) or 3 (<code>Lazy2</code>) <code>longest_match</code> calls per position —
+          <span class="anchor">lazy.rs:179, :214, :236</span>. This is why L6-L9 sit on the hc line.</td>
+    </tr>
+    <tr>
+      <td>block loop</td>
+      <td class="mono">greedy.rs:89 · lazy.rs:100 · fast.rs:2972</td>
+      <td>input / ~300 KB</td>
+      <td>Ends on byte budget, <code>SEQ_STORE_LENGTH</code>, or the split detector
+          (<span class="anchor">block_split.rs:218</span>, checked every 512 observations).</td>
+    </tr>
+    <tr>
+      <td>emit / bitstream loop</td>
+      <td class="mono">parse/mod.rs:1621-1690</td>
+      <td>1 per <code>Seq</code> + 1 per literal</td>
+      <td>Fully unchecked after one <code>bw.reserve(2*block_length+16)</code>
+          (<span class="anchor">parse/mod.rs:1644</span>); one <code>flush_word_unchecked</code> per match.</td>
+    </tr>
+    <tr>
+      <td>refill loop</td>
+      <td class="mono">deflate/mod.rs:422-438</td>
+      <td>input / 4 MiB</td>
+      <td>Read + CRC interleaved.</td>
+    </tr>
+    <tr>
+      <td>worker claim loop / writer spin</td>
+      <td class="mono">scheduler.rs:258 · scheduler.rs:39</td>
+      <td>chunks / threads</td>
+      <td>The writer <em>spins</em> (<code>std::hint::spin_loop</code>), it does not park.</td>
+    </tr>
+    <tr>
+      <td>near-optimal DP passes</td>
+      <td class="mono">near_optimal.rs:553, :578, :265</td>
+      <td>2 / 4 / 10 passes per block at L10 / L11 / L12</td>
+      <td>Each pass rebuilds Huffman codes and calls <code>build_dynamic_header</code> again.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div style="margin-top:18px;display:grid;gap:9px;max-width:640px;">
+  <div class="bar"><span style="width:170px;">libdeflate hc Dr</span><span class="track"><span class="fill" style="width:53.2%"></span></span><span>57,593,044</span></div>
+  <div class="bar"><span style="width:170px;">gzippy hc.rs Dr</span><span class="track"><span class="fill ours" style="width:100%"></span></span><span>108,282,726</span></div>
+  <div class="bar"><span style="width:170px;">D1 read misses</span><span class="track"><span class="fill" style="width:99.9%"></span></span><span>1.001×</span></div>
+</div>
+<p class="cap">Identical misses, identical chain-node visits, twice the loads issued — recorded in
+  <code>docs/target-encoder-and-gap-analysis.md</code> §G0. Two FALSIFY notes bracket this loop
+  (<span class="anchor">hc.rs:366-393</span>, <span class="anchor">hc.rs:423-438</span>,
+  <span class="anchor">hc.rs:525-587</span>): de-pipelining it, re-adding the prefetch, and deferring
+  <code>matchptr</code> in the ≥5 walk are all measured losses.</p>
+
+  </div>
+</section>
+
+<!-- ============================= LEGEND ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">KEY</span>
+    <h2>Legend</h2>
+  </div>
+  <div class="sheet-body" style="padding-bottom:0;">
+    <div class="legend">
+      <div><b><span class="swatch sw-alloc"></span>Allocation</b><p>A heap allocation. Thick red border on the
+        schematic; red-tinted row in the ledger when the cadence is per-block.</p></div>
+      <div><b><span class="swatch sw-copy"></span>Copy / buffer shuffle</b><p>Bulk bytes moved: staging buffers,
+        window slides, table rebases, whole-input reads.</p></div>
+      <div><b><span class="swatch sw-loop"></span>Loop</b><p>A loop whose trip count scales with input. The two hc
+        chain walks are the measured hot spots.</p></div>
+      <div><b><span class="swatch sw-core"></span>Core / decision</b><p>Teal = engine, sand diamond = branch,
+        green = bit emission, lilac = parser, peach = matchfinder.</p></div>
+      <div><b><span class="swatch sw-dead"></span>Compiled, not routed</b><p>Dashed grey. Reachable in tests only,
+        or executes without affecting output.</p></div>
+      <div><b>Anchors</b><p>Every node carries <code>file.rs:line</code> against <code>main @ ce43e4c7</code>.
+        Nothing here is inferred from a comment; comments that disagree with the code are called out.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= FINDINGS ============================= -->
+<section class="sheet">
+  <div class="sheet-head">
+    <span class="sheet-no">SHEET 8</span>
+    <h2>Structural findings</h2>
+    <p class="note">What the drawing makes obvious that a file-by-file read does not.</p>
+  </div>
+  <div class="sheet-body">
+
+<ol class="findings">
+  <li>
+    <div>
+      <h3>Per-block allocation is entirely in the Huffman builder<span class="tag t-alloc">alloc</span></h3>
+      <p>Of the whole encoder, exactly one function allocates per DEFLATE block:
+      <code>make_huffman_code</code> (<span class="anchor">huffman/fast.rs:409-410</span>), two Vecs per call,
+      three calls per block — litlen at <span class="anchor">parse/mod.rs:848</span>, offset at
+      <span class="anchor">:853</span>, precode inside <code>build_dynamic_header</code> at
+      <span class="anchor">header.rs:193</span>. Six allocations per block, sized 288/1,152 (litlen), 32/128
+      (offset) and 19/76 (precode) bytes. Everything else in the parse core is either pooled or hoisted to
+      the <code>run()</code> call. The fix in flight on <code>perf/no-per-block-alloc</code> — caller-owned
+      Huffman codes — closes the last cadence class.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>The pooling is asymmetric: the matchfinder is recycled, the 2.8 MB sequence store is not<span class="tag t-alloc">alloc</span></h3>
+      <p><code>HcMatchfinder</code> (262 KB) has a <code>thread_local</code> pool
+      (<span class="anchor">hc.rs:100, :205</span>) explicitly because "chunk count can exceed thread count".
+      The L1 head tables have the same treatment (<span class="anchor">fast.rs:2765-2805</span>). But
+      <code>Sink::new()</code> — <b>2,796,896 bytes</b>, ten times larger — is called fresh at
+      <span class="anchor">greedy.rs:82</span>, <span class="anchor">lazy.rs:94</span> and
+      <span class="anchor">fast.rs:2931</span> on <em>every</em> parser invocation, i.e. per streaming pass at
+      T1 and <b>per chunk</b> at T&gt;1. <code>near_optimal.rs:92-97</code> records having already learned this
+      lesson one level down (it pooled <code>Sink</code> across blocks after DHAT named it) without carrying it
+      up to the call that creates the <code>Sink</code> in the first place. Same for
+      <code>BtMatchfinder::new()</code> (<span class="anchor">near_optimal.rs:506</span>, 524 KB, unpooled) and
+      the 6.0 MB + 2.4 MB <code>Optimizer</code>.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>The T&gt;1 path copies the entire input for no structural reason<span class="tag t-copy">copy</span></h3>
+      <p>The input arrives as one contiguous mmap (<span class="anchor">io.rs:272</span>). The scheduler hands each
+      worker a slice of it plus the 32 KiB immediately before it
+      (<span class="anchor">scheduler.rs:268-277</span>) — two <em>adjacent</em> regions of the same mapping.
+      <code>encode_deflate_segment_to_sink</code> then allocates a new buffer and copies both into it
+      (<span class="anchor">deflate/mod.rs:166-169</span>), purely so the buffer ends in
+      <code>BUF_PAD</code> zeros. Every chunk but the last already has readable bytes past its end. The T1 path
+      solved exactly this with <code>encode_deflate_slack_padded_to_sink</code>
+      (<span class="anchor">mod.rs:265</span>) and the T&gt;1 path never got the equivalent — so T&gt;1 pays
+      1× input in copies and ~1× input in allocations that T1 does not.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>L1 and L10-12 re-read the whole input with no size hint<span class="tag t-copy">copy</span></h3>
+      <p><code>level_streams</code> (<span class="anchor">deflate/mod.rs:571</span>) admits only L0 and the
+      Greedy/Lazy/Lazy2 levels, so L1, L10, L11 and L12 fall to
+      <span class="anchor">mod.rs:636</span>: <code>Vec::new()</code> then <code>read_to_end</code>. The exact
+      length is known two frames up — <code>compress_with_pipeline_sized</code> takes a
+      <code>size_hint</code> (<span class="anchor">compress/mod.rs:96</span>) that <code>io.rs:299</code> fills
+      from <code>metadata().len()</code> — and it is dropped at <span class="anchor">compress/mod.rs:156</span>
+      before <code>encode_gzip_reader_to_writer</code> is called. The fallback therefore pays doubling reallocs
+      plus a <code>resize</code>, and holds ~1.5× the input resident. Threading the hint through is a
+      signature change, not an algorithm change.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>The RFC 1951 fixed Huffman code is rebuilt from frequency tables on every parser entry<span class="tag t-alloc">alloc</span></h3>
+      <p><code>StaticCodes::build</code> (<span class="anchor">parse/mod.rs:202-217</span>) runs the full
+      length-limited canonical code builder twice — over <code>static_litlen_freqs()</code> and
+      <code>static_offset_freqs()</code>, which are constants — at
+      <span class="anchor">parse/mod.rs:424</span> and <span class="anchor">:704</span>. The result is
+      byte-identical every time, in every process, forever. Four allocations and a package-merge pass per
+      parser invocation; at T&gt;1 that is per chunk. It is a <code>const</code> table wearing a constructor.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>Level 0 does not reach a parser, and the strategy that says it does is dead code<span class="tag t-dead">dead</span></h3>
+      <p><code>deflate_into</code> short-circuits <code>level == 0</code> to
+      <code>emit_stored_block</code> at <span class="anchor">deflate/mod.rs:219-220</span>, and the streaming
+      loop does the same at <span class="anchor">mod.rs:450-465</span>. So
+      <code>Strategy::Fast0</code> → <code>fast::run::&lt;true&gt;</code>
+      (<span class="anchor">parse/mod.rs:430</span>), its <code>FAST0_BLOCK_LENGTH</code> (1 MiB), its
+      <code>ACCEL</code> monomorphisation and <code>emit_block_static_or_stored</code>
+      (<span class="anchor">parse/mod.rs:936</span>) are unreachable from production — yet
+      <code>FAST0_BLOCK_LENGTH</code> is what sizes <code>SEQ_STORE_CAPACITY</code>
+      (<span class="anchor">parse/mod.rs:159-165</span>) and therefore the 2.8 MB <code>Sink</code> that
+      <em>every</em> level pays for. A dead path is setting a live allocation's size; the real bound for the
+      routed parsers is <code>SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH = 305,000</code>, which would make the
+      store 101,760 entries — 814 KB instead of 2.8 MB.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>A content detector runs on the production path and changes nothing<span class="tag t-dead">dead</span></h3>
+      <p><span class="anchor">io.rs:193-198</span> opens the input a second time and classifies an 8 KiB sample
+      whenever threads &gt; 1 and level &gt; 3. The resulting <code>ContentType</code> reaches only
+      <code>buffer_size</code> and <code>backend</code>, and both are read exclusively by the
+      <code>verbosity &gt;= 2</code> log at <span class="anchor">io.rs:209-216</span>. It is not a
+      CLAUDE.md #3 violation in effect (no parser is selected by it) but it is an extra <code>open</code>,
+      <code>read</code> and allocation per file for a log line.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>Three doc comments describe a routing table that no longer exists<span class="tag t-doc">doc drift</span></h3>
+      <p>(a) <span class="anchor">level.rs:147-194</span> documents L3 as detector-gated <code>LazyGated</code>;
+      the code emits <code>Strategy::Lazy</code> and the variant is gone.
+      (b) <span class="anchor">parse/mod.rs:676-678</span> says L3 is excluded from streaming; because it is
+      plain <code>Lazy</code>, <code>level_has_resumable_parser</code> returns true and it streams.
+      (c) <code>matchfinder/mod.rs</code>'s tier table assigns the fused head-table finder to "L0-1"; L0 never
+      reaches it. A fourth, smaller one: <span class="anchor">pipelined.rs:182-187</span> argues that
+      "Four is the smallest margin" for <code>CHUNKS_PER_THREAD</code>, which is 2
+      (<span class="anchor">pipelined.rs:114</span>). CLAUDE.md's own warning — "the compression routing table
+      in this file was once a careful code read and was wrong in every particular" — is still live in the
+      source comments themselves.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>Two allocations are load-bearing for RSS and neither scales with input<span class="tag t-alloc">alloc</span></h3>
+      <p>The T1 streaming path is genuinely fixed-footprint: 4,564,792 + 2,098,144 + 2,796,896 + 262,144 ≈
+      9.7 MB regardless of file size. The T&gt;1 path is not: slots
+      (<span class="anchor">scheduler.rs:136</span>) hold the full compressed output and staging buffers hold
+      a chunk each, so peak RSS tracks input × (1.1 + chunk-parallelism). The <code>MAX_T_AWARE_BLOCK_SIZE</code>
+      cap at <span class="anchor">pipelined.rs:118</span> bounds the staging half; nothing bounds the slot half.</p>
+    </div>
+  </li>
+  <li>
+    <div>
+      <h3>The emit path allocates nothing but rebuilds 547 table entries per block</h3>
+      <p><code>EmitTables::build</code> (<span class="anchor">parse/mod.rs:1059-1085</span>) is stack-only —
+      256 literal entries, 259 length entries, 32 offset entries — but it is recomputed per block from the
+      Huffman code that was just built, and <code>cost_from_freqs</code>
+      (<span class="anchor">parse/mod.rs:996</span>) has already walked the same frequency arrays twice for the
+      dynamic/static decision. Three passes over the same histograms per block, in a path that never appears in
+      the hc profile and is therefore easy to leave alone.</p>
+    </div>
+  </li>
+</ol>
+
+<div class="caveat" style="margin-top:24px;">
+  <b>What this drawing is not.</b> Every anchor was read, not inferred, but nothing here was <em>executed</em>.
+  The DHAT and cachegrind figures are the ones supplied with the task plus the ones banked in
+  <code>docs/target-encoder-and-gap-analysis.md</code>; the arithmetic checks (4,564,792 = 2·32768 + 305,000 +
+  4,194,240 + 16; 5,593,792 = 2 × 349,612 × 8; 262,144 = 65,536 + 131,072 + 65,536) confirm which source line
+  each DHAT site corresponds to, and nothing more. Any claim about what the shipped binary <em>does</em> still
+  needs a route assertion and an output sha.
+</div>
+
+  </div>
+</section>
+
+</div>
