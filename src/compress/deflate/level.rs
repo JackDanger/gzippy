@@ -212,13 +212,13 @@ fn params_inner(level: u32) -> LevelParams {
         5 => LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 32,
-            nice_match_length: 32,
+            nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 128,
-            nice_match_length: 128,
+            nice_match_length: 65,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
@@ -229,13 +229,13 @@ fn params_inner(level: u32) -> LevelParams {
         },
         8 => LevelParams {
             strategy: Strategy::Lazy2,
-            max_search_depth: 1024,
+            max_search_depth: 300,
             nice_match_length: max_match,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
             strategy: Strategy::Lazy2,
-            max_search_depth: 4096,
+            max_search_depth: 600,
             nice_match_length: max_match,
             near_optimal: NONE_NO,
         },
