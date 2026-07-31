@@ -178,6 +178,30 @@ wall front: libdeflate at T1 (19 of 19 losing wall cells, 1.0433-1.2274 at L6).
 **Cache behaviour is IDENTICAL.** The gap is pure issued work, and the wall tracks it
 (photo.jpg has both the worst instruction ratio and the worst wall ratio).
 
+**VENDOR-ANCHORED, and this is the number that matters.** Both matchfinders cachegrinded
+on the same 6,000,000 B of dickens at L6, libdeflate built `-O2 -g` so its profile is not
+one opaque symbol (hard stop #1):
+
+| matchfinder, inlined into its lazy parser | Ir | **Dr** | D1 read misses |
+|---|---|---|---|
+| libdeflate `hc_matchfinder.h` | 358,511,770 | **57,593,044** | 26,260,946 |
+| ours `hc.rs` | 414,673,369 | **108,282,726** | 26,285,498 |
+| ratio | 1.157x | **1.880x** | **1.001x** |
+
+**We issue 1.88x libdeflate's DATA READS inside the matchfinder, for byte-identical output
+and an identical number of cache misses.** That is ~50.7M excess reads, and the whole
+program's excess is 49.9M (161.0M vs 111.1M). **The entire L6 T1 gap is this one number.**
+
+The misses matching to 0.1% is what makes it diagnostic: identical misses means identical
+memory FOOTPRINT and identical chain-node visits. Same algorithm, same nodes, same cache
+behaviour — twice the loads issued to walk them. Loads that hit L1 and do not exist in the
+vendor's version are, by elimination, **spill/reload traffic**.
+
+So the remaining target is exact and vendor-anchored: **get `hc.rs`'s Dr from 108M to
+~58M.** Output is byte-identical at L2 and L4-L9, so no size cell can move while doing it —
+a pure wall lever with a free correctness oracle.
+
+
 **Per-function:** `matchfinder/hc.rs`, inlined into `lazy::run_resumable`, is **61.3% of
 instructions and 68.2% of reads** — 112,415,312 reads, which alone is about libdeflate's
 ENTIRE program (111,064,646).
