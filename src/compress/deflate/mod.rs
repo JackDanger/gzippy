@@ -1,3 +1,11 @@
+//! T-SCOPE: **SHARED** by T=1 and T>1. This is the encoder ENGINE, not a driver.
+//!
+//! `CLAUDE.md`'s "three separate paths" is an ISOLATION constraint on the drivers,
+//! not an instruction to keep three copies of a parser: T=1 calls into this engine
+//! directly, and the T>1 driver (`compress/pipelined.rs`) calls the same engine once
+//! per chunk. A change here moves BOTH boards, so it must be measured at T=1 AND at
+//! a T>1 thread count before it is believed.
+//!
 //! Pure-Rust DEFLATE encoder — Increment 2 (hash-chain matchfinder + parsers).
 //!
 //! This module is the entry point for a from-scratch, pure-Rust DEFLATE/gzip
