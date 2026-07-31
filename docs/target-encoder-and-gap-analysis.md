@@ -1031,3 +1031,50 @@ depth: +0.4% to +1.4% size, i.e. 40-140x the ~0.01% the 109 zero-headroom cells 
 
 Order of work implied: (1) cut loads per position in `hc`, (2) re-measure slack, (3) spend
 the recovered slack on the parse upgrade the sweep already priced.
+
+## G18 — our search is a PERFECT clone of libdeflate's, probe-for-probe, at every level
+
+The frontier result (G17) said the only way off libdeflate's size/wall curve is running the
+SAME parse for fewer instructions, and the banked profile
+(`project_encoder_deficit_is_loads_not_stalls`) says 61% of the L2 wall gap is extra LOAD
+instructions: 991,837,377 vs 761,047,000 L1-dcache-loads, a ratio of 1.3033, while our IPC,
+stalls, L1D miss rate and branch behaviour all BEAT theirs.
+
+That leaves exactly two possibilities: we visit MORE chain nodes, or we pay MORE PER NODE.
+Ablated by instrumenting BOTH implementations to count the identical quantity — every
+chain-node evaluation in the hash-chain matchfinder.
+
+Method: `hc_probe_attempts` (already in `anatomy_counters`) vs a `g_hc_probes++` added to
+libdeflate's `hc_matchfinder_longest_match` at both sites that materialise `matchptr` from
+`cur_node4` (`lib/hc_matchfinder.h`, the `best_len < 4` loop and the `>= 5` loop). The
+instrumented libdeflate emits byte-identical output at every level tested, so the counter is
+behaviour-neutral. Deterministic counts, local M1, `dickens`, T1 — no wall run needed.
+
+    level   gzippy hc_probe_attempts   libdeflate g_hc_probes   ratio
+    L2              8,163,515                 8,163,515        1.0000
+    L4             14,940,322                14,940,322        1.0000
+    L6             34,629,888                34,629,888        1.0000
+    L9            100,451,406               100,451,406        1.0000
+
+EXACT EQUALITY, to the last digit, at a SHALLOW and a DEEP level (hard stop #3). Our
+matchfinder visits precisely the same chain nodes in precisely the same order as theirs.
+
+### The family this closes
+
+Every hypothesis of the form "our SEARCH does more work" is dead: hash geometry, hash3
+singleton-vs-chained, chain quality, cutoff handling, depth accounting, nice-length
+early-exit, insert policy. None of them can be the deficit, because none of them changed the
+node count and the node count is identical.
+
+Combined with the banked profile, the deficit is now pinned to a single quantity: LOADS
+ISSUED PER NODE (and per position), with the node count held fixed. That is a code-generation
+question, not an algorithm question — the candidates are Rust slice fat-pointers and their
+length reloads versus C raw pointers, redundant re-materialisation of `in_base`/`cutoff`
+across the loop, and the `i16` table loads' sign-extension shape.
+
+NEXT MEASUREMENT (not yet run): cachegrind/callgrind on trainer (the only box with valgrind)
+attributing Dr BY LINE inside `hc.rs::longest_match`, against the same region of libdeflate
+built with `-g`. Probe count is now excluded as a variable, so any line-level Dr difference
+is the deficit itself. Do NOT hand-hoist "obviously redundant" loads first — hard stop #4
+records that doing so drove data reads UP, because LLVM had already hoisted them and the
+hoist only added register pressure.
