@@ -18,8 +18,10 @@ use super::{
 };
 
 /// The offset-cost tie-break test shared by lazy and lazy2 (threshold differs).
+/// `pub(super)` so `medium` can reuse the SAME predicate — a lazy+fizzle arm that
+/// scored matches differently would not be a clean comparison against lazy.
 #[inline]
-fn better_match(
+pub(super) fn better_match(
     cur_len: u32,
     cur_offset: u32,
     next_len: u32,

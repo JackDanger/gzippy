@@ -51,6 +51,29 @@
 //! because the frontier's choice is CONTEXTUAL — it depends on a better match
 //! existing just ahead. Fizzle inspects exactly that context and nothing else.
 //!
+//! # MEASURED VERDICT — both arms, and why neither ships yet
+//!
+//! **greedy + fizzle (zlib's actual `deflate_medium`)** is WORSE than our lazy at L6 on
+//! every file tried: dickens +56,186, data.csv +105,742, monorepo.tar +23,321. That is
+//! not a defect in the port — zlib's own `configuration_table` puts `deflate_medium` at
+//! L4-L6 and `deflate_slow` (lazy) at L7-L9, so medium is the CHEAPER rung, not the
+//! better one. No vendor has anything between lazy and near-optimal.
+//!
+//! **lazy + fizzle** (this file's current shape — lazy's one-position peek KEPT, fizzle
+//! ADDED) is a combination no vendor ships, and it is a real mixed result at L6:
+//!     aozora.txt   -16,062      monorepo.tar -53,985
+//!     dickens         +853      data.csv     +15,754
+//!     movie.mp4       +201      photo.jpg       +334
+//! Net -52,905 bytes, but it FLIPS cells — `movie.mp4` and `photo.jpg` are exactly tied
+//! with libdeflate on main and go bigger — so clause 3 (absolute) fails.
+//!
+//! WHY IT LOSES WHERE IT LOSES, and this is the live lead: zlib's commit rule is
+//! `current.match_length <= 1 && next.match_length != 2`, calibrated for a GREEDY
+//! current match. In a lazy context the current match has already been optimised by the
+//! peek, so dissolving it into literals is wrong more often. The rule needs to ask
+//! whether the trade is cheaper IN BITS, not whether `current` happens to collapse —
+//! the same cost-model gap G10 identified from the other direction.
+//!
 //! # Structural difference from `lazy`
 //!
 //! `lazy` peeks at `in_next + 1` and may PROMOTE the later match, emitting one
@@ -63,6 +86,7 @@ use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
+use super::lazy::better_match;
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
     emit_block, recalculate_min_match_len, BlockRole, InputMode, ParseState, Sink, StaticCodes,
@@ -317,6 +341,39 @@ pub(super) fn run_block(
         // iteration later, because `recalculate_min_match_len` may LOWER `min_len`
         // between the probe and its use — observed emitting `len 4, offset 0`. Test the
         // sentinel explicitly rather than relying on the length comparison.
+        // LAZY PEEK, then fizzle. `medium` alone (greedy + fizzle) measured WORSE than
+        // lazy at L6 on every file, because fizzle does not REPLACE lookahead — zlib
+        // ships medium BELOW deflate_slow, not above it. Keeping lazy's one-position
+        // peek and ADDING fizzle is the combination no vendor ships, and it is the only
+        // reason this parser is still interesting.
+        let mut cur_len = cur_len;
+        let mut cur_offset = cur_offset;
+        if cur_offset != 0
+            && cur_len >= min_len
+            && cur_len < nice_len
+            && in_next + 1 < in_end
+            && mf_at < in_next + 1
+        {
+            adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - (in_next + 1));
+            let (nl, no) = mf.longest_match(
+                buf,
+                in_base,
+                in_next + 1,
+                cur_len - 1,
+                max_len,
+                nice_len,
+                depth >> 1,
+                next_hashes,
+            );
+            mf_at = mf_at.max(in_next + 1);
+            if no != 0 && better_match(cur_len, cur_offset, nl, no, 2) {
+                sink.push_literal(buf[in_next]);
+                in_next += 1;
+                cur_len = nl;
+                cur_offset = no;
+            }
+        }
+
         if cur_offset == 0
             || cur_len < min_len
             || (cur_len == DEFLATE_MIN_MATCH_LEN && cur_offset > 8192)
