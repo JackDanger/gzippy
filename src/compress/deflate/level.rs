@@ -216,10 +216,15 @@ fn params_inner(level: u32) -> LevelParams {
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
-            strategy: Strategy::Lazy,
+            strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 65,
-            near_optimal: NONE_NO,
+            near_optimal: NearOptimalParams {
+                max_optim_passes: 2,
+                min_improvement_to_continue: 32,
+                min_bits_to_use_nonfinal_path: 32,
+                max_len_to_optimize_static_block: 0,
+            },
         },
         7 => LevelParams {
             strategy: Strategy::Lazy,
