@@ -198,6 +198,35 @@ pub fn matchfinder_init(data: &mut [i16]) {
 /// `matchfinder_rebase`:
 /// `data[i] = 0x8000 | (data[i] & ~(data[i] >> 15))`.
 #[inline]
+/// # VENDOR GAP (located 2026-07-31 by line-level diff) — libdeflate REBASES WITH SIMD
+///
+/// This is the scalar branchless form, and it is character-for-character libdeflate's
+/// GENERIC FALLBACK (`matchfinder_common.h:142-152`). What they actually ship on x86 is
+/// `lib/x86/matchfinder_impl.h`, which rebases with `_mm256_adds_epi16` over four
+/// vectors per iteration (with `arm/` and `riscv/` siblings). **We have only the
+/// fallback.**
+///
+/// Measured, cachegrind, 4,000,000 B of dickens at L1 through the `ht` port
+/// (trainer / Intel i7-13700T, vanilla builds, deterministic counts):
+///
+///     ours   `*d = 0x8000 | (v & !(v >> 15))`      4,872,192
+///            `let v = *d`                          1,499,136   = 6,371,328
+///     theirs `p[0..3] = _mm_adds_epi16(p[0..3], v)`  999,424
+///            loop overhead                           499,712   = 1,499,136
+///
+/// A ~4.2x gap on this function, worth ~4.9M instructions of the ~51M by which our port
+/// of their algorithm exceeds their implementation of it (ours 208,282,438 Ir vs
+/// libdeflate 157,286,577 at L1 on the same input).
+///
+/// `CLAUDE.md` STEP 1 names this class explicitly: "Every optimization a C engineer
+/// reaches for, done in Rust: SIMD intrinsics, hand-written asm, runtime CPU dispatch,
+/// per-arch builds". This is the first NAMED, vendor-precedented piece of the L1 gap
+/// found by measurement rather than by guessing which construct looks costly — four such
+/// guesses were falsified the same day (unroll, addressing, second-probe cost, P12).
+///
+/// NOT BUILT YET. It is ~4.9M of ~51M, so it is a piece and not the answer; the
+/// remaining ~46M is still unattributed and the same line-level diff should be run
+/// against `ht.rs` vs `ht_matchfinder.h` before anyone assumes SIMD closes L1.
 pub fn matchfinder_rebase(data: &mut [i16]) {
     for d in data.iter_mut() {
         let v = *d;
