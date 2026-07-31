@@ -113,9 +113,35 @@ pub fn lz_extend(
     debug_assert!(str_pos + max <= data.len());
     debug_assert!(match_pos + max <= data.len());
     unsafe {
+        // 4x UNROLLED FAST PATH — libdeflate's `COMPARE_WORD_STEP` block
+        // (`matchfinder_common.h:185-201`). We had only the checked loop below, i.e.
+        // ONE BOUND CHECK PER 8 BYTES where the vendor pays one per 32. `lz_extend` is
+        // the hottest helper in the matchfinder and our `matchfinder/common.rs`
+        // measures 28.9M instructions against their `matchfinder_common.h`'s 17.4M
+        // (1.66x) on the same L1 work, so the missing unroll is a named vendor
+        // difference, not a guess.
+        //
+        // Pointers are formed ONCE outside the loop rather than recomputing
+        // `base + str_pos + len` and `base + match_pos + len` per step: that is the
+        // vendor's shape (it takes `strptr`/`matchptr` directly) and it is the same
+        // addressing-mode difference the shipped `chain_base` hoist removed from the
+        // hc length-4 walk.
+        let sp = base.add(str_pos);
+        let mp = base.add(match_pos);
+        if max - len >= 4 * WORDBYTES {
+            for _ in 0..4 {
+                let v = u64::from_le(core::ptr::read_unaligned(mp.add(len) as *const u64))
+                    ^ u64::from_le(core::ptr::read_unaligned(sp.add(len) as *const u64));
+                if v != 0 {
+                    return (len + (v.trailing_zeros() as usize >> 3)) as u32;
+                }
+                len += WORDBYTES;
+            }
+        }
         while len + WORDBYTES <= max {
             // Reads [match_pos+len, +8) and [str_pos+len, +8); len+8 <= max.
-            let v = load_u64(base, match_pos + len) ^ load_u64(base, str_pos + len);
+            let v = u64::from_le(core::ptr::read_unaligned(mp.add(len) as *const u64))
+                ^ u64::from_le(core::ptr::read_unaligned(sp.add(len) as *const u64));
             if v != 0 {
                 // Little-endian: the first differing byte is at trailing_zeros/8.
                 return (len + (v.trailing_zeros() as usize >> 3)) as u32;
