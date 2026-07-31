@@ -992,3 +992,42 @@ whole "our Huffman leaves size on the table" family is dead — the margin is no
 CONSTRUCTION. What remains encoder-side is block BOUNDARY choice (where the tail-guard
 probe showed our splits are already earning their headers, but says nothing about whether
 a DIFFERENT boundary set is better) and the parse itself.
+
+## G17 — every lever measured today SLIDES ALONG libdeflate's frontier; none MOVES it
+
+Collecting the day's measurements in one table. All T1, sil40 unless noted, vanilla builds,
+size deterministic, wall by hyperfine n=5 to /dev/null:
+
+    lever                                   size vs libdeflate     wall vs libdeflate
+    ------------------------------------    -------------------    ------------------
+    ship their config (L2, L4-L9)           EXACT TIE (0 bytes)    1.04 / 1.00 / 1.04 (L2/L4/L5)
+    L3 Lazy(12,14) vs their Greedy(12,14)   +1.331% SMALLER        1.215  WE LOSE
+    L4 lazy:8:30 (HALF their depth)         smaller on 4/4         +7.7%  vs ~0% slack
+    L6 lazy2:35:65 (equal depth)            smaller on 4/4         +9.29% vs 4.4% slack
+    L6 lazy2:24:65 (fits the wall)          winexe.exe -0.183%     free
+    L7 lazy2:100:130 (equal depth)          smaller on 4/4         +11.02% vs 7.8% slack
+    exact package-merge Huffman             49/49 smaller, 0 worse +10-14%, flips L6
+
+EVERY ONE IS A TRADE. Not one of them is smaller AND cheaper. We are sitting ON libdeflate's
+size/wall frontier: where we copy their config we reproduce their size exactly and pay a few
+percent more wall (we run their algorithm slower than they do); where we diverge we buy size
+with wall, at L3 at a rate of 21.5% wall for 1.33% size.
+
+THE PER-LABEL BAR CANNOT BE MET BY SLIDING. At level N we must be <= their level N on BOTH
+axes. Any configuration change moves us along the frontier, improving one axis by spending
+the other. That is why 11 of the last 13 levers failed on the axis they did not target, and
+it is a structural property of the search, not bad luck in picking knobs.
+
+WHAT MOVES THE FRONTIER is executing the SAME parse for fewer instructions — which is
+exactly what the banked profile already says the deficit is:
+`project_encoder_deficit_is_loads_not_stalls` — on the worst cell our IPC, stalls, cache and
+branch behaviour ALL BEAT libdeflate, and 61% of the gap is extra LOAD INSTRUCTIONS issued.
+
+That reorders the campaign. The lever is NOT "find a better level->config map" — today
+measured that space and every point in it is a trade. The lever is the per-position load
+count in the matchfinder. Close that and the wall slack appears at every level at once; a
+parse upgrade then becomes affordable, and we already know what it is worth (lazy2 at equal
+depth: +0.4% to +1.4% size, i.e. 40-140x the ~0.01% the 109 zero-headroom cells need).
+
+Order of work implied: (1) cut loads per position in `hc`, (2) re-measure slack, (3) spend
+the recovered slack on the parse upgrade the sweep already priced.
