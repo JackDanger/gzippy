@@ -1,6 +1,40 @@
 //! Hash-table matchfinder: 2-entry inline buckets PLUS a length-3 table.
 //!
 //! Port of `vendor/libdeflate/lib/ht_matchfinder.h` (Eric Biggers, 2022) at
+//! # DECOMPOSITION 2026-07-31 — THE SECOND BUCKET SLOT *IS* THE WIN
+//!
+//! An adversarial review noted that this port's size verdict and its wall cost had only
+//! ever been measured as a BUNDLE — "the second probe" was never separated from
+//! "everything else in the port" (the i16/rebase model, the pre-screen, hash3). That
+//! decomposition has now been run: a measurement-only bucket-1 arm (second slot skipped
+//! entirely — no read, no write, no second candidate), L1, vanilla build, sizes exact:
+//!
+//!     file            ours(fast)      bucket-1      bucket-2     libdeflate
+//!     access.log       3,650,576     3,619,977     3,346,031      3,310,166
+//!     monorepo.tar    11,950,941    12,019,022    11,311,220     11,311,783
+//!     data.csv         4,111,742     4,074,319     3,934,614      3,932,419
+//!     aozora.txt       4,751,200     4,814,569     4,591,718      4,566,347
+//!     armexe.elf         599,781       607,666       598,647        621,027
+//!
+//! Bucket-1 is barely better than the parser we ship, and WORSE on monorepo.tar,
+//! aozora.txt and armexe.elf. On access.log the second slot delivers 90% of the win
+//! (-30,599 B from everything else, -273,946 B from the second probe). On monorepo.tar
+//! it delivers ALL of it — bucket-1 loses to our fast parser and bucket-2 beats
+//! libdeflate.
+//!
+//! **So there is no cheap version of this port.** The size win is the second candidate,
+//! and the second candidate is exactly one extra dependent table load plus one extra
+//! store per position — the quantity `project_encoder_deficit_is_loads_not_stalls` says
+//! governs this cell (61% of our excess over libdeflate is load instructions, with IPC,
+//! stalls, cache and branch behaviour all already BETTER than theirs).
+//!
+//! That is why the synthesis passed SIZE cleanly and died on WALL, and it means the
+//! reopen condition in `parse/mod.rs` ("candidates WITHOUT added dependent loads per
+//! position") is not a tuning target — it is asking for more candidates at no load cost,
+//! which this measurement says the bucket cannot provide. igzip's P12 amortises the HASH
+//! computation across two positions; it does not remove a table load, so it does not
+//! satisfy the condition either. Anyone reopening this must say which LOAD disappears.
+//!
 //! `HT_MATCHFINDER_BUCKET_SIZE == 2` — the hand-unrolled arm libdeflate ships at
 //! level 1 — **with a `hash3_tab` added in the shape libdeflate's OWN
 //! `hc_matchfinder` uses at levels 2-9.** That combination is the point of this
