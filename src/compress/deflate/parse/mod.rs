@@ -2248,24 +2248,54 @@ mod l1_bakeoff {
         (fast_bytes, ht_bytes)
     }
 
-    /// libdeflate's OWN `-1` on the same bytes — the number we must beat.
-    /// Returns the DEFLATE payload size (gzip frame minus its 10-byte header and
-    /// 8-byte trailer) so it is comparable to the raw-block sizes above. `None`
-    /// if libdeflate-gzip is not on this box; the test then omits the column
-    /// rather than inventing a reference.
-    fn libdeflate_l1(block: &[u8]) -> Option<usize> {
+    /// The FOUR rivals the board actually grades against, at L1.
+    /// `-c` to stdout; thread-capable ones pinned to 1 so this is a T1 statement.
+    const RIVALS: &[(&str, &[&str])] = &[
+        ("libdeflate", &["-1", "-c"]),
+        ("gzip", &["-1", "-c"]),
+        ("pigz", &["-1", "-p", "1", "-c"]),
+        ("igzip", &["-1", "-T", "1", "-c"]),
+    ];
+
+    /// Resolve a rival binary. igzip is usually NOT on PATH but IS built in the
+    /// vendor tree — `scripts/campaign/lib.sh` checks exactly there first, and a
+    /// test that silently omits a rival has not evaluated the goal (the shipped
+    /// size census once measured three rivals and said nothing about the fourth).
+    fn rival_bin(name: &str) -> String {
+        if name == "igzip" {
+            for c in [
+                "vendor/isa-l/build/igzip",
+                "/root/gzippy/vendor/isa-l/build/igzip",
+            ] {
+                if std::path::Path::new(c).is_file() {
+                    return c.to_string();
+                }
+            }
+        }
+        match name {
+            "libdeflate" => "libdeflate-gzip".into(),
+            "gzip" => "gzip".into(),
+            "pigz" => "pigz".into(),
+            _ => "igzip".into(),
+        }
+    }
+
+    /// One rival's L1 output on the same bytes — the DEFLATE payload (gzip frame
+    /// minus its 10-byte header and 8-byte trailer) so it is comparable to the
+    /// raw-block sizes. `None` if that rival is not on this box; the file is then
+    /// reported without it rather than inventing a reference.
+    fn rival_l1(name: &str, args: &[&str], block: &[u8]) -> Option<usize> {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let mut c = Command::new("libdeflate-gzip")
-            .args(["-1", "-c"])
+        let mut c = Command::new(rival_bin(name))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        // TAKE the handle so dropping it closes the pipe and delivers EOF.
-        // Borrowing it hangs forever waiting for more input — that exact bug
-        // cost two stalled measurement runs elsewhere in this campaign.
+        // TAKE the handle: dropping it closes the pipe and delivers EOF.
+        // Borrowing hangs forever — that bug cost two stalled runs elsewhere.
         {
             let mut si = c.stdin.take()?;
             si.write_all(block).ok()?;
@@ -2291,8 +2321,17 @@ mod l1_bakeoff {
     /// Seeded 2026-08-01 from `ht_fast` as it stands. `Strategy::Fast` (shipped)
     /// is far worse on 7 of these 8 — that gap is the L1 class, and it is why
     /// this file exists.
+    /// Re-seeded 2026-08-01 from the WORST-OF-FOUR-RIVALS measurement. The first
+    /// seed used libdeflate only and was therefore wrong on `armexe.elf`, whose
+    /// binding rival is **pigz** (-3863) not libdeflate (-4013) — the ratchet
+    /// fired REGRESSION on its own seed data, which is the guard working.
+    ///
+    /// libdeflate is the binding rival on 7 of 8; gzip/pigz/igzip trail by
+    /// 2,600-11,600 B at L1. But "usually libdeflate" is not "always", and the
+    /// one exception is exactly the file the FALSIFY at `parse/mod.rs` warned
+    /// about losing.
     const RATCHET: &[(&str, i64)] = &[
-        ("armexe.elf", -4013),
+        ("armexe.elf", -3863),
         ("data.parquet", -984),
         ("data.csv", -210),
         ("engine.wasm", 61),
@@ -2305,25 +2344,24 @@ mod l1_bakeoff {
     #[test]
     fn l1_bakeoff() {
         const BLOCK: usize = 256 * 1024;
-        let root = corpus_roots().into_iter().find(|p| p.is_dir());
-        let Some(root) = root else {
+        let Some(root) = corpus_roots().into_iter().find(|p| p.is_dir()) else {
             eprintln!("l1_bakeoff: no corpus dir — SKIPPED (this is a real-corpus test)");
             return;
         };
 
         println!();
-        println!("L1 RATCHET — first {BLOCK} bytes, deterministic, load-immune");
+        println!("L1 RATCHET — first {BLOCK} bytes, ALL FOUR RIVALS, deterministic");
         println!("  corpus: {}", root.display());
         println!();
         println!(
-            "  {:<16} {:>9} {:>9} {:>10} {:>9} {:>9}",
-            "file", "Fast", "ht_fast", "libdeflate", "delta", "allowed"
+            "  {:<16} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
+            "file", "ht_fast", "libdefl", "gzip", "pigz", "igzip", "WORST", "allowed"
         );
 
-        let (mut tot_f, mut tot_h, mut tot_l) = (0usize, 0usize, 0usize);
         let mut regressions: Vec<String> = vec![];
         let mut improvements: Vec<String> = vec![];
         let mut measured = 0usize;
+        let (mut wins, mut ties, mut losses) = (0usize, 0usize, 0usize);
 
         for (f, allowed) in RATCHET {
             let Ok(data) = std::fs::read(root.join(f)) else {
@@ -2332,67 +2370,57 @@ mod l1_bakeoff {
             if data.len() < BLOCK {
                 continue;
             }
-            let (fa, ht) = bakeoff_one(&data[..BLOCK]);
-            let Some(ld) = libdeflate_l1(&data[..BLOCK]) else {
-                println!(
-                    "  {f:<16} {fa:>9} {ht:>9} {:>10} {:>9} {:>9}",
-                    "-", "-", allowed
-                );
-                continue;
-            };
+            let block = &data[..BLOCK];
+            let (_fa, ht) = bakeoff_one(block);
+
+            let mut cells: Vec<String> = vec![];
+            let mut worst: Option<i64> = None;
+            let mut worst_name = "";
+            for (name, args) in RIVALS {
+                match rival_l1(name, args, block) {
+                    Some(r) => {
+                        let d = ht as i64 - r as i64;
+                        cells.push(format!("{d:>+9}"));
+                        if worst.is_none_or(|w| d > w) {
+                            worst = Some(d);
+                            worst_name = name;
+                        }
+                    }
+                    None => cells.push(format!("{:>9}", "-")),
+                }
+            }
+            let Some(w) = worst else { continue };
             measured += 1;
-            tot_f += fa;
-            tot_h += ht;
-            tot_l += ld;
-            let delta = ht as i64 - ld as i64;
-            let mark = if delta > *allowed {
-                regressions.push(format!("{f}: {delta:+} worse than the allowed {allowed:+}"));
+            match w.cmp(&0) {
+                std::cmp::Ordering::Less => wins += 1,
+                std::cmp::Ordering::Equal => ties += 1,
+                std::cmp::Ordering::Greater => losses += 1,
+            }
+            let mark = if w > *allowed {
+                regressions.push(format!(
+                    "{f}: worst {w:+} (vs {worst_name}) exceeds allowed {allowed:+}"
+                ));
                 " <- REGRESSION"
-            } else if delta < *allowed {
-                improvements.push(format!("(\"{f}\", {delta}),"));
-                " <- improved, tighten it"
+            } else if w < *allowed {
+                improvements.push(format!("(\"{f}\", {w}),"));
+                " <- improved"
             } else {
                 ""
             };
-            println!("  {f:<16} {fa:>9} {ht:>9} {ld:>10} {delta:>+9} {allowed:>+9}{mark}");
-            // MACHINE-READABLE line, one per file. Tools must parse THIS, never
-            // the table above — a human table is not an interface, and a sweep
-            // that parsed it produced identical totals at different settings
-            // and +0 for every delta, all of which looked plausible.
-            println!("L1SWEEP file={f} fast={fa} ht={ht} ld={ld} delta={delta}");
+            println!(
+                "  {f:<16} {ht:>9} {} {w:>+9} {allowed:>+8}{mark}",
+                cells.join(" ")
+            );
+            println!("L1SWEEP file={f} ht={ht} worst={w} worst_rival={worst_name}");
         }
 
         if measured == 0 {
-            eprintln!(
-                "l1_bakeoff: no measurable file (corpus or libdeflate-gzip absent) — SKIPPED"
-            );
+            eprintln!("l1_bakeoff: nothing measurable — SKIPPED");
             return;
         }
-
         println!();
-        println!(
-            "  {:<16} {:>9} {:>9} {:>10} {:>+9}",
-            "TOTAL",
-            tot_f,
-            tot_h,
-            tot_l,
-            tot_h as i64 - tot_l as i64
-        );
-        println!(
-            "  Fast vs libdeflate {:+.3}%   ht_fast vs libdeflate {:+.3}%   (per-file is what grades)",
-            100.0 * (tot_f as f64 / tot_l as f64 - 1.0),
-            100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
-        );
-
-        println!(
-            "L1SWEEP TOTAL fast={} ht={} ld={} fast_pct={:+.3} ht_pct={:+.3}",
-            tot_f,
-            tot_h,
-            tot_l,
-            100.0 * (tot_f as f64 / tot_l as f64 - 1.0),
-            100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
-        );
-
+        println!("  ACROSS ALL FOUR RIVALS: {wins} win, {ties} tie, {losses} LOSE");
+        println!("L1SWEEP TOTAL win={wins} tie={ties} lose={losses}");
         if !improvements.is_empty() {
             println!();
             println!("  RATCHET DOWN — paste into RATCHET:");
@@ -2405,9 +2433,8 @@ mod l1_bakeoff {
         assert!(
             regressions.is_empty(),
             "L1 ratchet regressed on {} file(s):\n  {}\n\
-             The bar is per-file bytes vs libdeflate -1, not a total and not exact \
-             output. If a regression is intended, say why in the commit message and \
-             loosen the number deliberately.",
+             The bar is the WORST rival per file — losing to ANY of the four fails \
+             the cell. If a regression is intended, say why in the commit message.",
             regressions.len(),
             regressions.join("\n  ")
         );
