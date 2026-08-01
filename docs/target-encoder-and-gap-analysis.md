@@ -1489,3 +1489,49 @@ METHOD NOTE: this took one command. It was found by reading `fulcrum --help` aft
 whether existing tooling already covered what I was doing by hand — which it did, for the
 vendor diff (`why`), the technique survey (`candidates`) and this. Hard stop #6 says never
 hand-roll a measurement fulcrum already does; I spent hours doing exactly that first.
+
+## G36 — `fulcrum why` names the dd79_bin6 mechanism in one command: SHORT-MATCH DISCOVERY, not depth
+
+The one residual class with no known mechanism (G34: dd79_bin6 L2, 4 cells, worst ratio on the
+board at 1.0094) is answered by the tool that exists for exactly this:
+
+    fulcrum why 'gzip:dd79_bin6:L2:T1:size' --ours target/release/gzippy \
+        --rival-cmd 'gzip -{level} -c {input}' --corpus .../dd79_bin6
+
+    [1 STRUCTURE] POSITION COUNTS DIFFER (matches d21.46%, matched-positions d16.48%,
+                  literals d58.59%): different parse decisions — the gap is ALGORITHMIC.
+      ours : 3,358,993 tokens (1,168,118 matches, 2,190,875 literals), 36,005,906 bits (42,812 header)
+      rival: 2,868,854 tokens (1,487,378 matches, 1,381,476 literals), 35,675,122 bits (51,558 header)
+      positions_matched   ours 0.651770  rival 0.780420   (per input byte)
+      literals            ours 0.348230  rival 0.219580
+      match_len_L00       ours 0.118908  rival 0.179643   <- SHORTEST-length bucket
+      data_bits           ours 5.716180  rival 5.662213
+
+gzip finds 319,260 MORE MATCHES than we do and emits 58.59% fewer literals, covering 78.04% of
+input bytes with matches against our 65.18%. The excess is concentrated in the SHORTEST match
+bucket: `match_len_L00` 0.179643 vs our 0.118908, i.e. gzip finds ~51% more of them.
+
+THIS IS NOT A DEPTH DEFICIT, which is why every depth lever failed on this file: depth finds
+LONGER matches on chains we already walk, and G30/G33/G32a each measured no movement here
+(x8 +377, knobs 8/16 +47, lazy:48:16 still +2,316). What is missing is short-match DISCOVERY.
+
+MECHANISM: our `hash3_tab` is a ONE-DEEP SINGLETON — it holds only the most recent position for
+a 3-byte hash, so a len-3 match is found only if its previous occurrence was the last one. gzip
+runs a 3-byte rolling hash with a real chain (`UPDATE_HASH`, `vendor/gzip/deflate.c:282`,
+15-bit) and can walk to older len-3 candidates. `fulcrum candidates` lists this as [H3] and
+notes zlib-ng enables it at L9 specifically to get len-3 finds (technique M11).
+
+NOTE THE HEADER TRADE, which also falsifies "fewer blocks is better" for this file: gzip spends
+MORE on headers (51,558 bits vs our 42,812) and LESS on data (5.662 vs 5.716 bits/byte). It
+buys better-fitted tables with more of them.
+
+PRIOR ATTEMPT, and why it is not a repeat: chaining hash3 was tried in an earlier session and
+scored 11 cells closed / 14 opened. That was a blind swap with no per-cell target. This is the
+first time the mechanism has been ATTRIBUTED to a specific failing class with a measured
+position-count structure, so a retry needs to be aimed at these 4 cells and gated on the rest —
+not repeated globally.
+
+METHOD: one command, four layers, three of which SKIPPED with named reasons (valgrind absent on
+macOS, counters need the Linux box, params need an anatomy-counters build). The tool states its
+own denominator — "1 of 4 layers ran; skipped layers are NOT covered by any claim" — which is
+the discipline I spent this session failing to apply by hand.
