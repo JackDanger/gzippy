@@ -129,6 +129,7 @@ pub(super) fn run_resumable(
             role.is_final() && in_next == in_end,
             &mut header_scratch,
             &mut code_scratch,
+            params.try_exact_huffman,
         );
         if in_next == in_end {
             return in_next;

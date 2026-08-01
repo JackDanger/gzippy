@@ -3027,6 +3027,7 @@ pub(super) fn run<const ACCEL: bool>(
                     is_final,
                     &mut header_scratch,
                     &mut code_scratch,
+                    false,
                 );
             } else {
                 emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
@@ -3298,6 +3299,7 @@ pub(super) fn run<const ACCEL: bool>(
                 is_final,
                 &mut header_scratch,
                 &mut code_scratch,
+                false,
             );
         } else {
             // L0: cheapest of static / stored only — no per-block dynamic

@@ -147,6 +147,7 @@ pub(super) fn run(
             role.is_final(),
             &mut header_scratch,
             &mut code_scratch,
+            params.try_exact_huffman,
         );
         return;
     }
@@ -254,6 +255,7 @@ pub(super) fn run(
             role.is_final() && in_next == in_end,
             &mut header_scratch,
             &mut code_scratch,
+            params.try_exact_huffman,
         );
         if in_next >= in_end {
             return;

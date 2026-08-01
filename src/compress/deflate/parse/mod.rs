@@ -925,6 +925,7 @@ fn emit_block(
     is_final: bool,
     header_scratch: &mut HeaderScratch,
     code_scratch: &mut CodeScratch,
+    try_exact: bool,
 ) {
     // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
     // this block, before any bit is written: both candidate Huffman codes,
@@ -975,38 +976,46 @@ fn emit_block(
             // the only cost shape that can fund the ~0.01% of margin the 109
             // zero-headroom T4 cells need. See docs/target-encoder-and-gap-analysis.md
             // G15 for why the parse side cannot.
-            make_huffman_code_exact_into(
-                alt_litcode,
-                DEFLATE_NUM_LITLEN_SYMS,
-                MAX_LITLEN_CODEWORD_LEN,
-                &litlen_freqs,
-            );
-            make_huffman_code_exact_into(
-                alt_offcode,
-                DEFLATE_NUM_OFFSET_SYMS,
-                MAX_OFFSET_CODEWORD_LEN,
-                &sink.offset_freqs,
-            );
+            if try_exact {
+                make_huffman_code_exact_into(
+                    alt_litcode,
+                    DEFLATE_NUM_LITLEN_SYMS,
+                    MAX_LITLEN_CODEWORD_LEN,
+                    &litlen_freqs,
+                );
+                make_huffman_code_exact_into(
+                    alt_offcode,
+                    DEFLATE_NUM_OFFSET_SYMS,
+                    MAX_OFFSET_CODEWORD_LEN,
+                    &sink.offset_freqs,
+                );
+            }
 
             let heur_header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
             let heur_bits = 3
                 + heur_header.header_bits()
                 + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, litcode, offcode);
 
-            let exact_header =
-                build_dynamic_header(&alt_litcode.lens, &alt_offcode.lens, alt_header);
-            let exact_bits = 3
-                + exact_header.header_bits()
-                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, alt_litcode, alt_offcode);
-
-            // Strict `<` keeps the heuristic on ties, so a tie emits today's bytes.
-            let (header, dynamic_bits) = if exact_bits < heur_bits {
-                crate::anatomy_count!(huffman_exact_code_chosen);
-                std::mem::swap(litcode, alt_litcode);
-                std::mem::swap(offcode, alt_offcode);
-                (exact_header, exact_bits)
+            // The exact candidate is costed ONLY when enabled. Building its header
+            // unconditionally would both pay for work T1 must not pay for and read
+            // `alt_*code` scratch that was never filled. Strict `<` keeps the heuristic on
+            // ties, so a tie emits today's bytes.
+            let (header, dynamic_bits) = if try_exact {
+                let exact_header =
+                    build_dynamic_header(&alt_litcode.lens, &alt_offcode.lens, alt_header);
+                let exact_bits = 3
+                    + exact_header.header_bits()
+                    + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, alt_litcode, alt_offcode);
+                if exact_bits < heur_bits {
+                    crate::anatomy_count!(huffman_exact_code_chosen);
+                    std::mem::swap(litcode, alt_litcode);
+                    std::mem::swap(offcode, alt_offcode);
+                    (exact_header, exact_bits)
+                } else {
+                    drop(exact_header);
+                    (heur_header, heur_bits)
+                }
             } else {
-                drop(exact_header);
                 (heur_header, heur_bits)
             };
             let static_bits = 3 + cost_from_freqs(

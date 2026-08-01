@@ -71,6 +71,13 @@ pub struct NearOptimalParams {
 /// The parser parameters for a compression level.
 #[derive(Clone, Copy, Debug)]
 pub struct LevelParams {
+    /// Cost the EXACT (package-merge) Huffman code as a second per-block candidate and emit
+    /// whichever is cheaper. Non-worse than the heuristic BY CONSTRUCTION on SIZE, but it costs
+    /// 10-14% wall at T1 (serial) against only +2.3% at T4 (the per-block work parallelises).
+    /// Our T1 wall margin against libdeflate is 0-8%, so enabling it at T1 FLIPS wall cells —
+    /// measured, both arms: sil40 L6 T1 went 0.952 PASS -> 1.035 FAIL. It is therefore T>1 ONLY,
+    /// exactly like `max_search_depth` scaling, and set only by `params_parallel`.
+    pub try_exact_huffman: bool,
     pub strategy: Strategy,
     /// Cap on hash-chain nodes searched per position (`c->max_search_depth`).
     pub max_search_depth: u32,
@@ -155,6 +162,9 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // single-threaded; pigz is not): L2 2.73x/1.39x, L6 2.53x/2.18x, L9 2.15x/1.62x faster.
     // Even at L9, where this walks 2,400 chain nodes, we stay ahead of both.
     p.max_search_depth = p.max_search_depth.saturating_mul(4);
+    // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
+    // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
+    p.try_exact_huffman = true;
     p
 }
 
@@ -169,6 +179,7 @@ fn params_inner(level: u32) -> LevelParams {
     };
     match level {
         0 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Fast0,
             max_search_depth: 0,
             nice_match_length: 32,
@@ -180,12 +191,14 @@ fn params_inner(level: u32) -> LevelParams {
         // exactly one probe per position); they are left at the vendor-ish
         // values only so the struct is populated.
         1 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Fast,
             max_search_depth: 1,
             nice_match_length: 32,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 10,
@@ -245,42 +258,49 @@ fn params_inner(level: u32) -> LevelParams {
         //     every T, zero-regression legs) clears; the recorded miss is
         //     out of this change's causal reach.
         3 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
             near_optimal: NONE_NO,
         },
         4 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Greedy,
             max_search_depth: 16,
             nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 16,
             nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 35,
             nice_match_length: 65,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 100,
             nice_match_length: 130,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy2,
             max_search_depth: 300,
             nice_match_length: max_match,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy2,
             max_search_depth: 600,
             nice_match_length: max_match,
@@ -289,6 +309,7 @@ fn params_inner(level: u32) -> LevelParams {
         // Native near-optimal parser (`deflate_compress_near_optimal`,
         // deflate_compress.c:3974-4004).
         10 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 75,
@@ -300,6 +321,7 @@ fn params_inner(level: u32) -> LevelParams {
             },
         },
         11 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::NearOptimal,
             max_search_depth: 100,
             nice_match_length: 150,
@@ -311,6 +333,7 @@ fn params_inner(level: u32) -> LevelParams {
             },
         },
         _ => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::NearOptimal,
             max_search_depth: 300,
             nice_match_length: max_match,
