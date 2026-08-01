@@ -37,14 +37,28 @@ for V in "${@:-0 512 1024 2048 4096 8192 32768}"; do
     echo "len3_off=$V BUILD FAILED"
     continue
   fi
-  # ONE test invocation per value; parse both the per-file deltas and the total
-  # from the same output. (An earlier version ran the test twice per value,
-  # doubling an already slow loop for no reason.)
-  cargo test --release l1_bakeoff -- --nocapture 2>/dev/null \
-    | awk -v v="$V" '
-        /^  [a-z]/ && NF >= 5 { d[$1] = $5 }
-        /ht_fast vs libdeflate/ { tot = $4 }
-        END { printf "len3_off=%-6s total=%-9s", v, tot;
-              for (k in d) printf " %s=%s", k, d[k];
-              printf "\n" }'
+  # ⛔ DO NOT PARSE THE PRETTY TABLE. The first version of this loop did, and
+  # every number it printed was wrong in a way that LOOKED right:
+  #
+  #   len3_off=0      total=+1.634%   ...every delta +0...
+  #   len3_off=4096   total=+1.634%   data.json=+449 ... armexe.elf=-4013
+  #
+  # Three defects at once. (a) `total` was IDENTICAL at both values and equal to
+  # +1.634%, which is the *Fast* figure — the awk matched /ht_fast vs libdeflate/
+  # against a line carrying BOTH numbers and took field 4, which is Fast's.
+  # (b) Every delta at len3_off=0 read +0, which would mean we tie libdeflate
+  # exactly on all eight files. (c) The header row was captured as data
+  # (`file=delta`). A table formatted for humans is not a machine interface, and
+  # a parser with no cross-check will be wrong in some direction forever — the
+  # same lesson the callgrind `summary:` guard exists for.
+  #
+  # So the test now emits ONE machine-readable line per file and one TOTAL line,
+  # prefixed `L1SWEEP`, and this loop greps only that. If the prefix is missing
+  # the value is reported as MISSING rather than silently mis-parsed.
+  OUT=$(cargo test --release l1_bakeoff -- --nocapture 2>/dev/null | grep '^L1SWEEP')
+  if [ -z "$OUT" ]; then
+    echo "len3_off=$V MISSING (no L1SWEEP lines — did the test emit them?)"
+    continue
+  fi
+  printf 'len3_off=%-6s %s\n' "$V" "$(echo "$OUT" | tr '\n' ' ')"
 done

@@ -2355,6 +2355,11 @@ mod l1_bakeoff {
                 ""
             };
             println!("  {f:<16} {fa:>9} {ht:>9} {ld:>10} {delta:>+9} {allowed:>+9}{mark}");
+            // MACHINE-READABLE line, one per file. Tools must parse THIS, never
+            // the table above — a human table is not an interface, and a sweep
+            // that parsed it produced identical totals at different settings
+            // and +0 for every delta, all of which looked plausible.
+            println!("L1SWEEP file={f} fast={fa} ht={ht} ld={ld} delta={delta}");
         }
 
         if measured == 0 {
@@ -2375,6 +2380,15 @@ mod l1_bakeoff {
         );
         println!(
             "  Fast vs libdeflate {:+.3}%   ht_fast vs libdeflate {:+.3}%   (per-file is what grades)",
+            100.0 * (tot_f as f64 / tot_l as f64 - 1.0),
+            100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
+        );
+
+        println!(
+            "L1SWEEP TOTAL fast={} ht={} ld={} fast_pct={:+.3} ht_pct={:+.3}",
+            tot_f,
+            tot_h,
+            tot_l,
             100.0 * (tot_f as f64 / tot_l as f64 - 1.0),
             100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
         );
