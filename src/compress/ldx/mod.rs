@@ -83,6 +83,7 @@
 #![allow(dead_code)] // Ports land bottom-up; unused until the driver is ported.
 
 mod heap;
+mod huffman;
 
 // ---------------------------------------------------------------------------
 // C: vendor/libdeflate/lib/deflate_constants.h
