@@ -2255,3 +2255,217 @@ This is the THIRD independent class this session with a verified size win and no
 affordable wall: L1 `ht_fast@256` (10 board cells), the T4 seam (109 cells), and now L4.
 See `project_clause5_is_the_binding_constraint` — the pattern is now 4-for-4 and is the
 session's most reusable finding.
+
+## ⚠ THE FALSIFICATION CORPUS IS MOSTLY SINGLE-MACHINE — 5 of 42 records carry a multi-arch verdict
+
+Counted 2026-08-01 over every `FALSIF(Y|IED|IES)` block in `src/compress/` (a 20-line
+window after each marker — approximate, but the shape is not in doubt):
+
+```
+  blocks naming >= 2 arches (multi-arch verdict):    5
+  blocks naming exactly ONE arch:                    9
+  blocks naming NO arch at all:                     28
+```
+
+**37 of 42 do not record a multi-arch coordinate, and 28 record no machine at all** —
+against a charter whose STEP 1 says "on every corpus file, **on both arches**", and a
+standing rule that says RECORD THE COORDINATE.
+
+### This is not hypothetical: a record in the tree shows the verdict flipping by machine
+
+`matchfinder/hc.rs:455-470`, on removing a `prefetch_read`:
+
+```
+  Intel            -5.1% wall / -5.2% cycles
+  M1               geomean 0.9610   (-10% at L6/L9)
+  AMD Zen2 frozen  geomean 0.9993   (i.e. NEUTRAL)
+```
+
+**A change worth 10% on M1 measured as nothing on the box that issues verdicts.** That
+record is one of the 5 that did the multi-arch work, and it is precisely why it caught
+this. Had it been run on solvency alone it would read "no effect, not a lever" — and the
+10% would have been left on the floor on the arch most users are on.
+
+### What this does and does not put in doubt
+
+  * **DOES put in doubt: every WALL verdict decided on solvency alone.** Wall is a
+    property of a microarchitecture. 9 records name one arch and 28 name none; those are
+    verdicts about a machine, recorded as verdicts about a mechanism.
+  * **DOES NOT put in doubt: the instruction-count findings.** Ir is machine-independent
+    by construction. The measured 1.20-1.44x instruction excess over libdeflate at
+    byte-identical output (hand-verified with cachegrind: movie.mp4 1,650,693,672 vs
+    1,153,377,248; dickens 1,385,371,628 vs 1,155,052,955) holds on any box that runs
+    the same binaries. That is why it is the safest thing on this page to build on.
+  * **SIZE has a small arch term too, which was a surprise.** Same commit, L1: dickens
+    5,080,065 B on arm64 vs 5,081,832 B on x86 (~0.03%). Small, but it means cells that
+    tie libdeflate BYTE-FOR-BYTE on x86 need not tie on arm64 — and the tie cells are
+    the zero-tolerance ones.
+
+### ⛔ CORRECTED: the rule ALREADY requires multi-arch — clause 7. I looked in the wrong place.
+
+`docs/promotion-rule.md:62-66` names levels, rivals, corpus and both axes: "A change
+evaluated on a NARROWER SLICE HAS NOT BEEN EVALUATED." That section does not name the
+machine — but **clause 7 does, and I missed it**:
+
+    7. Cross-architecture. Rules 3-6 hold on every architecture we measure (aarch64,
+       Intel, AMD Zen2). A win on one architecture and a loss on another is not a win.
+       Wall verdicts come from the frozen box.
+
+**So the multi-arch requirement is ALREADY LAW.** The gap is not the rule — it is
+ENFORCEMENT. `fulcrum try` reports `archs_required: ['x86_64']`, a one-element list, and
+nothing fails closed when the aarch64 and Intel legs simply do not exist. By this
+project's own standard — "a gate may only cite a dataset that exists" — most clause-7
+legs currently cite no dataset.
+
+Note the trailing sentence, "Wall verdicts come from the frozen box." That is what
+practice has read as an override of the first two sentences, and it is why ~10 of ~13
+wall-bearing FALSIFY records are single-box despite clause 7 saying otherwise.
+
+Recorded as an OBSERVATION about enforcement, not a proposal to change the rule, which
+`CLAUDE.md` forbids. The rule text is fine; the instrument does not implement it.
+
+### Cheapest de-risking, in cost order — none of these is a rule change
+
+  1. **Make the arch part of every recorded verdict's coordinate.** Free. A record that
+     says "solvency only" is honest; one that says nothing invites the reader to assume
+     generality. 28 records currently invite that.
+  2. **Re-check the 9 single-arch WALL verdicts on a second machine before treating any
+     of them as closing a class.** The prefetch record shows the expected yield is not
+     zero.
+  3. Per-arch level tables would collide with the drop-in goal and with non-negotiable #3
+     — noted and NOT proposed.
+
+### TESTED: on the L4 lever the two arches AGREE — the concern is real in the RECORDS, not (here) in the numbers
+
+Having found that 37 of 42 falsifications do not record a multi-arch coordinate, the
+next honest step was to measure whether an arch change actually moves a verdict, rather
+than assume it. Same lever (L4 Lazy(10,30) vs shipped), same method
+(`fulcrum ab paired --mode compress`, n=15, /dev/null both arms, T4), two arches:
+
+```
+  file            M1 (arm64, local)        Intel (trainer)    delta
+  data.csv        1.0521  spread 0.0147    1.0460             +0.006
+  dickens         1.1025  spread 0.0214    1.1213             -0.019
+  symbols.dwarf   1.0220  NOISY (0.0537)   0.9519             +0.070   opposite signs
+```
+
+**On two of three files the arches agree to within 2%.** The self-tax of this lever is
+~1.05-1.10 on both an Apple M1 and an Intel Xeon-class part. For THIS lever, the
+clause-5 conclusion does not depend on the machine.
+
+The one real disagreement — `symbols.dwarf`, where Intel measured 0.9519 (FASTER than
+shipped) and M1 measured 1.0220 (slower) — is **flagged NOISY by the tool** (spread
+0.0537 against a delta of 0.022), so it is UNRESOLVED, not a contradiction. It is the
+obvious cell to re-measure under a freeze.
+
+**So the finding splits, and both halves matter:**
+  * The RECORDS are under-scoped: 37 of 42 do not establish the generality they are read
+    as having, and `hc.rs:455-470` proves a verdict CAN flip by machine (M1 -10%, AMD
+    neutral). That stands.
+  * But the SPECIFIC fear — "our clause-5 closures are Zen2 artifacts" — is NOT supported
+    by the one lever tested. Two arches, same answer.
+
+Which is the useful shape: the process gap is real and cheap to fix (record the arch);
+the substantive damage is unproven and should not be assumed. Do not use this as licence
+to re-open the four clause-5 closures — use it as the reason to record the coordinate so
+the question is answerable next time without re-measuring.
+
+METHOD NOTE: the first attempt at this used `/usr/bin/time -p`, which has 10 ms
+resolution against 0-30 ms runs and produced ratios of 0.0000 and 1.5000 — quantization,
+not measurement. Discarded unreported. `fulcrum ab paired` exists for exactly this
+regime (paired differences with an A/A certificate); it also REFUSED to run from a dirty
+build between paired arms until told the pin was deliberate. Both guards worked.
+
+### THE ADJUDICATOR ANSWERS BOTH QUESTIONS: clause 5 model VALIDATED, and clause 7 requires ONLY x86_64
+
+`fulcrum try origin/perf/l4-lazy10-real --levels 4,6 --threads 1,4`, trainer, artifact
+`/tmp/fulcrum-try-3425076/try.json`. Verdict **NO-SHIP**. Clause by clause, as the tool
+reports it:
+
+```
+  clause 2 OK   arms differ (binary hashes distinct)
+  clause 1 OK   verify — zero roundtrip failures
+  clause 3 OK   no pass->fail flips across 29 decidable cells
+  clause 4 OK   closed failing cell(s): libdeflate:data.csv:L4:T4:size
+  clause 5 FAIL erosion budget exceeded:
+                  gzip:data.csv:L4:T4:wall        0.1696 -> 0.1844, budget 0.0050
+                  gzip:dickens:L4:T1:wall         0.4654 -> 0.5242, budget 0.0050
+                  libdeflate:data.csv:L4:T4:wall  0.3213 -> 0.3328, budget 0.0050
+                  libdeflate:data.csv:L6:T4:wall  0.2973 -> 0.3119, budget 0.0050
+                  libdeflate:dickens:L4:T4:wall   0.3115 -> 0.3413, budget 0.0050
+  clause 6 FAIL improvement 0.0508 < 2x harm 0.1379
+  clause 7 OK   all required arch(s) covered: x86_64
+  clause 8      (method) paired interleaved, n stated, fixed before the run
+```
+
+**1. THE CLAUSE-5 MODEL IS VALIDATED.** The budget is a flat **0.0050 in every one of the
+five reported cells**, exactly as derived by hand from `promotion-rule.md:40-44` — the
+`0.25 * (1 - old_ratio)` term never binds because every ratio is far below 0.98. The four
+class closures (L1 ht_fast, the T4 seam, zlib depths, L4) rest on arithmetic the tool
+confirms. Worth stating because that model was INFERRED, and inferred constants have
+been wrong repeatedly here.
+
+**2. THERE IS A SECOND BLOCKER I NEVER MODELLED: CLAUSE 6.** "improvement 0.0508 < 2x
+harm 0.1379" — net improvement must exceed total harm by 2x. Every closure this session
+was reported as "fails clause 5"; at least this one ALSO fails clause 6, independently.
+So the classes are further from shippable than I said, not closer.
+
+**3. CLAUSE 7 EXISTS AND REQUIRES ONLY x86_64.** The artifact carries
+`arch: x86_64` and `archs_required: ['x86_64']`. So the promotion rule DOES enforce
+architecture coverage — and the required set is a single arch. Meanwhile `CLAUDE.md`
+STEP 1 states the goal as "on every corpus file, **on both arches**".
+
+**That is the concrete answer to "have we overfit to one machine": the charter asks for
+two arches and the gate requires one.** Not a hidden assumption — a visible, named
+clause with a one-element list. It also means the arch under-scoping in the FALSIFY
+records is downstream of the gate, not a lapse by whoever wrote them: they recorded what
+the gate required.
+
+Recorded as an observation about what the rule enforces, NOT as a proposal to change it.
+The cheap, rule-preserving move remains the one from the previous section: make the arch
+part of every recorded verdict's coordinate, so the question is answerable without
+re-measuring.
+
+**Also surfaced: the tool flags its own VOID cells for re-measurement** —
+`gzip:data.csv:L4:T1:wall`, `gzip:dickens:L4:T4:wall`,
+`libdeflate:data.csv:L4:T1:wall` all came back VOID on one arm. A verdict quoting those
+cells without re-running them would be quoting nothing.
+
+### ⛔ RETRACTED: "size is not arch-invariant". It is. My comparison did not pin `-p`.
+
+I claimed twice that SIZE carries a small architecture term — dickens L1 at 5,080,065 B
+on arm64 against 5,081,832 B on x86, "~0.03%" — and drew from it that cells tying
+libdeflate byte-for-byte on x86 need not tie on arm64. **That is wrong.** Measured with
+the thread count PINNED, same commit, same input:
+
+```
+                              arm64 (M1)     x86_64 (trainer)
+  dickens L1  -p1 PINNED       5,077,406       5,077,406      IDENTICAL
+  dickens L1  -p4 PINNED       5,078,221       5,078,221      IDENTICAL
+  dickens L1  no -p flag       5,080,065       5,081,832      <- what I compared
+                               (10 cores)      (16 cores)
+```
+
+**`-p` defaults to the core count, and `pipelined_block_size` depends on the thread
+count (`pipelined.rs:200`), so two machines at defaults legitimately produce different
+chunk grids and different bytes at the same commit.** A thread-count term wearing an
+arch costume. The 5,077,406 figure also matches the board census exactly, which should
+have been the tell — the census is x86 and my *pinned* arm64 run reproduces it to the
+byte.
+
+Consequences of the retraction:
+  * The tie cage is PORTABLE. Cells that tie libdeflate byte-for-byte on x86 tie on
+    arm64 too. The zero-tolerance analysis does not acquire an extra arch term.
+  * The size board generalises across machines. Every size-only FALSIFY record —
+    `block_split.rs:23/71`, `lazy.rs:192`, `parse/mod.rs:79/89/128/540`,
+    `fast.rs:1549/2085`, `pipelined.rs:80` — is arch-safe by construction.
+  * **METHODOLOGY: any cross-machine size comparison MUST pin `-pN`, or it is comparing
+    chunk grids rather than encoders.** This is the second time today a measurement was
+    invalidated by an unpinned default (the first: `fulcrum anatomy` invoking
+    `CMD -{level} -c {input}` with no `-p`, silently running ours at 16 threads against a
+    single-threaded rival).
+
+The arch concern therefore narrows, and narrowing it is the useful outcome: **it applies
+to WALL verdicts only.** That half stands and is if anything sharper — see the clause-7
+finding above, and the prefetch record where the same change is -10% on M1 and neutral
+on Zen2.
