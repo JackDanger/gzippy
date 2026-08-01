@@ -401,6 +401,87 @@ pub(crate) fn gen_codewords(
     }
 }
 
+/// C: `deflate_make_huffman_code(unsigned num_syms, unsigned max_codeword_len,
+/// const u32 freqs[], u8 lens[], u32 codewords[])` (:1320)
+///
+/// Create a canonical Huffman code with bit-reversed codewords. This is the entry
+/// point that wires `sort_symbols` -> `build_tree` -> `compute_length_counts` ->
+/// `gen_codewords` together.
+///
+/// * `num_syms` — number of symbols in the alphabet.
+/// * `max_codeword_len` — the maximum permissible codeword length.
+/// * `freqs` — frequency of each symbol.
+/// * `lens` — output: the length of each symbol's codeword (0 if unused).
+/// * `codewords` — output: each symbol's bit-reversed codeword. **Also used as the
+///   scratch array `A`** for the whole construction — that aliasing is deliberate in
+///   the C (`u32 *A = codewords;`) and is why no separate workspace is needed.
+///
+/// # The degenerate case, and why it cannot be skipped
+///
+/// `build_tree` requires at least 2 symbols. When fewer than 2 symbols actually
+/// occur, the C fabricates a 2-symbol code instead of building a tree:
+///
+/// ```text
+/// sym          = num_used_syms ? (A[0] & SYMBOL_MASK) : 0;
+/// nonzero_idx  = sym ? sym : 1;
+/// codewords[0] = 0;  lens[0] = 1;
+/// codewords[nonzero_idx] = 1;  lens[nonzero_idx] = 1;
+/// ```
+///
+/// Read that carefully — the `sym ? sym : 1` is the subtle part. If the single used
+/// symbol IS symbol 0, then `nonzero_idx` becomes 1, so symbol 0 gets codeword 0 and
+/// symbol *1* (which never occurs) gets codeword 1. Otherwise the used symbol gets
+/// codeword 1 and symbol 0 gets codeword 0. Either way TWO symbols end up with
+/// length-1 codewords.
+///
+/// That is not arbitrary: RFC 1951 has no encoding for a Huffman code with a single
+/// codeword, so a complete 1-bit code must be emitted even though one of its two
+/// symbols is dead. Emitting a genuine 1-symbol code here would produce a stream
+/// that other decoders reject. This case is reached for real — e.g. a block whose
+/// offset alphabet is unused, or an all-one-byte input.
+pub(crate) fn deflate_make_huffman_code(
+    num_syms: usize,
+    max_codeword_len: usize,
+    freqs: &[u32],
+    lens: &mut [u8],
+    codewords: &mut [u32],
+) {
+    // STATIC_ASSERT(DEFLATE_MAX_NUM_SYMS <= 1 << NUM_SYMBOL_BITS);
+    const _: () = assert!(DEFLATE_MAX_NUM_SYMS <= 1 << NUM_SYMBOL_BITS);
+    // (The C's second static assert bounds MAX_BLOCK_LENGTH against NUM_FREQ_BITS;
+    // it lands with the block-length constants, which are not ported yet.)
+
+    // u32 *A = codewords;  -- the output array doubles as the scratch array.
+    let num_used_syms = sort_symbols(num_syms, freqs, lens, codewords);
+
+    // Handle the special cases where less than 2 symbols were used.
+    if num_used_syms < 2 {
+        let sym = if num_used_syms != 0 {
+            (codewords[0] & SYMBOL_MASK) as usize
+        } else {
+            0
+        };
+        let nonzero_idx = if sym != 0 { sym } else { 1 };
+
+        codewords[0] = 0;
+        lens[0] = 1;
+        codewords[nonzero_idx] = 1;
+        lens[nonzero_idx] = 1;
+        return;
+    }
+
+    build_tree(codewords, num_used_syms);
+
+    let mut len_counts = [0u32; super::DEFLATE_MAX_CODEWORD_LEN as usize + 1];
+    compute_length_counts(
+        codewords,
+        num_used_syms - 2,
+        &mut len_counts,
+        max_codeword_len,
+    );
+    gen_codewords(codewords, lens, &len_counts, max_codeword_len, num_syms);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +759,80 @@ mod tests {
                 fib.push(n);
             }
             check_prefix_free(&fib, max);
+        }
+    }
+
+    /// The `num_used_syms < 2` branch fabricates a 2-symbol code because RFC 1951
+    /// cannot encode a 1-codeword Huffman code. Getting the `sym ? sym : 1` pivot
+    /// wrong here produces a stream other decoders reject, so each variant is pinned
+    /// explicitly rather than via a round-trip property.
+    #[test]
+    fn make_huffman_code_degenerate_zero_symbols_used() {
+        let freqs = [0u32; 8];
+        let mut lens = [9u8; 8];
+        let mut cw = [0xDEADu32; 8];
+        deflate_make_huffman_code(8, 15, &freqs, &mut lens, &mut cw);
+        // No symbol occurs: symbols 0 and 1 get the two length-1 codewords.
+        assert_eq!((cw[0], lens[0]), (0, 1));
+        assert_eq!((cw[1], lens[1]), (1, 1));
+    }
+
+    #[test]
+    fn make_huffman_code_degenerate_one_symbol_used_nonzero() {
+        let mut freqs = [0u32; 8];
+        freqs[5] = 42;
+        let mut lens = [9u8; 8];
+        let mut cw = [0xDEADu32; 8];
+        deflate_make_huffman_code(8, 15, &freqs, &mut lens, &mut cw);
+        // The used symbol is 5, so nonzero_idx = 5: symbol 0 gets 0, symbol 5 gets 1.
+        assert_eq!((cw[0], lens[0]), (0, 1));
+        assert_eq!((cw[5], lens[5]), (1, 1));
+    }
+
+    /// The subtle one: when the ONLY used symbol IS symbol 0, `sym ? sym : 1` pivots
+    /// to 1, so the dead symbol 1 receives the second codeword. A port that wrote
+    /// `nonzero_idx = sym` would assign codeword 1 to symbol 0 as well, overwriting
+    /// it and emitting an incomplete code.
+    #[test]
+    fn make_huffman_code_degenerate_one_symbol_used_is_symbol_zero() {
+        let mut freqs = [0u32; 8];
+        freqs[0] = 7;
+        let mut lens = [9u8; 8];
+        let mut cw = [0xDEADu32; 8];
+        deflate_make_huffman_code(8, 15, &freqs, &mut lens, &mut cw);
+        assert_eq!((cw[0], lens[0]), (0, 1), "symbol 0 keeps codeword 0");
+        assert_eq!((cw[1], lens[1]), (1, 1), "dead symbol 1 takes codeword 1");
+    }
+
+    /// The normal path must agree with driving the four stages by hand, which is how
+    /// every other test in this file reaches them.
+    #[test]
+    fn make_huffman_code_matches_the_hand_driven_chain() {
+        let cases: &[&[u32]] = &[
+            &[1, 2, 3, 4],
+            &[5, 0, 3, 0, 1, 9],
+            &[100, 1, 1, 1, 1, 1, 1, 1],
+            &[7; 32],
+        ];
+        for freqs in cases {
+            let num_syms = freqs.len();
+            let max = 15usize;
+
+            let mut lens_a = vec![0u8; num_syms];
+            let mut cw_a = vec![0u32; num_syms];
+            deflate_make_huffman_code(num_syms, max, freqs, &mut lens_a, &mut cw_a);
+
+            let mut lens_b = vec![0u8; num_syms];
+            let mut a = vec![0u32; num_syms];
+            let n = sort_symbols(num_syms, freqs, &mut lens_b, &mut a);
+            assert!(n >= 2, "case is not degenerate");
+            build_tree(&mut a, n);
+            let mut len_counts = vec![0u32; max + 2];
+            compute_length_counts(&mut a, n - 2, &mut len_counts, max);
+            gen_codewords(&mut a, &mut lens_b, &len_counts, max, num_syms);
+
+            assert_eq!(lens_a, lens_b, "lens differ (freqs={freqs:?})");
+            assert_eq!(cw_a, a, "codewords differ (freqs={freqs:?})");
         }
     }
 
