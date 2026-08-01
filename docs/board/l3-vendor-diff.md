@@ -132,3 +132,29 @@ REDUCED depth is a measured-productive direction one level away from L3.
 
 Nothing until the board finishes. Then check P1/P2/P3 against 11 files, and if
 P3 fails as expected, profile L3 specifically rather than retuning the ladder.
+
+---
+
+# ⛔ RETRACTION (same day, 2026-08-01) — P3's "unexplained 8.5-19.8%" was an artifact
+
+P3 computed L3's "unexplained" excess by interpolating the RATIO linearly in
+depth between L2 and L4, then multiplying by a lazy penalty measured at L4/L5.
+That is invalid: at L3 the two sides are in DIFFERENT strategy families (they
+run greedy, we run lazy), so a ratio-space interpolation of one family's trend
+does not describe the other side at all. The "+19.8% unexplained at L3" is an
+artifact of my own arithmetic, not a property of the encoder. There is no
+evidence for a second defect at L3.
+
+P1 ("monotone in depth") was also mis-tested: I sorted L2,L4,L5,L6-L9 by depth
+while mixing greedy, lazy and lazy2 rows, so L4-vs-L5 (same depth 16, different
+parser) registered as a non-monotone "crossing". WITHIN a family the ratio IS
+monotone in depth, which the clean sweep in `docs/board/fixed-vs-pernode.md`
+then confirmed directly on both sides at matched knobs.
+
+What replaces all of it is one number, measured rather than interpolated:
+**we pay 8.5 ms more FIXED per-pass cost and our chain walk is 17.3% CHEAPER
+per node, crossover at depth 15.5, and every failing wall cell is at depth
+<= 16.** See `docs/board/fixed-vs-pernode.md`.
+
+The vendor-diff TABLE at the top of this file stands — it is a source read of
+the two preset tables and nothing about it depended on the fits.

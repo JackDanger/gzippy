@@ -1,0 +1,45 @@
+diff --git a/lib/deflate_compress.c b/lib/deflate_compress.c
+index 4a1f327..6f1a5f7 100644
+--- a/lib/deflate_compress.c
++++ b/lib/deflate_compress.c
+@@ -25,6 +25,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include <stdlib.h>  /* gzippy measurement patch: getenv/atoi */
+ #include "deflate_compress.h"
+ #include "deflate_constants.h"
+ 
+@@ -4005,6 +4006,32 @@ libdeflate_alloc_compressor_ex(int compression_level,
+ #endif /* SUPPORT_NEAR_OPTIMAL_PARSING */
+ 	}
+ 
++	/* MEASUREMENT PATCH — gzippy, 2026-08-01. NOT upstream, NEVER shipped.
++	 *
++	 * libdeflate exposes no way to vary max_search_depth independently of
++	 * nice_match_length: every adjacent pair of its 9 presets moves BOTH at
++	 * once (L2->L4 is 6,10 -> 16,30; L5->L7 is 16,30 -> 100,130). Any
++	 * fixed-vs-per-node cost split fitted across its levels is therefore
++	 * confounded, and a fit that ignored this produced a prediction that
++	 * missed an out-of-sample point by 6 percentage points.
++	 *
++	 * gzippy's own `ladder-tune` feature already provides exactly this knob on
++	 * our side, which is why our curve is clean and theirs was not. This
++	 * mirrors it so the two can be compared at matched (depth, nice).
++	 *
++	 * Env-var, in a VENDOR tree, for MEASUREMENT ONLY. CLAUDE.md
++	 * non-negotiable #3 forbids env knobs in OUR shipped path; this binary is
++	 * a measuring instrument and is never quoted as a product.
++	 */
++	{
++		const char *ov = getenv("LIBDEFLATE_PROBE_DEPTH");
++		if (ov)
++			c->max_search_depth = (unsigned)atoi(ov);
++		ov = getenv("LIBDEFLATE_PROBE_NICE");
++		if (ov)
++			c->nice_match_length = (unsigned)atoi(ov);
++	}
++
+ 	deflate_init_static_codes(c);
+ 
+ 	return c;
