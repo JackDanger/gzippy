@@ -2205,3 +2205,53 @@ a coordinate artifact.
 
 Everything here remains a TUNE screen on a non-frozen box; GATE members are untouched
 and promotion needs `fulcrum try --threads 1,4`.
+
+## ⛔ L4 CLOSED ON THE RULE (pre-registered): depth 10 satisfies clause 3 and fails clause 5 on 9 of 11
+
+The previous section named ONE measurement that could still open the class — depth 10 at
+T4 — and declared in advance: *"Under a 1.026 self-tax on every file and it is a
+candidate; otherwise L4 is closed on the promotion rule as written at BOTH coordinates,
+and that closure is a property of the RULE rather than a coordinate artifact."*
+
+Measured, T4, 11 TUNE members, paired n=9, trainer:
+
+```
+  file            libdeflate-4      ours(d10)     saved B   T4 wall   <= 1.026?
+  symbols.dwarf       378,809       372,256        6,553    0.9519    YES (faster)
+  engine.wasm         409,051       401,197        7,854    1.0116    YES
+  data.csv          3,645,905     3,461,124      184,781    1.0460    no
+  data.json         1,736,197     1,648,936       87,261    1.0474    no
+  movie.mp4        12,891,391    12,890,786          605    1.0546    no
+  armexe.elf          586,728       578,183        8,545    1.0732    no
+  tool.bin         21,400,590    21,084,500      316,090    1.0825    no
+  minjs.min.js      1,129,252     1,108,654       20,598    1.0935    no
+  aozora.txt        4,197,277     4,189,888        7,389    1.1029    no
+  data.parquet     14,160,264    14,077,068       83,196    1.1210    no
+  dickens           4,672,714     4,623,432       49,282    1.1213    no
+```
+
+**SIZE: 11 of 11 beat libdeflate-4, ZERO cells opened — clause 3 fully satisfied**, with
+772,154 B of total wins where the shipped config ties or barely passes.
+**WALL: only 2 of 11 clear the threshold; nine exceed it.** So clause 5 blocks it.
+
+**L4 IS THEREFORE CLOSED ON THE PROMOTION RULE AS WRITTEN, AT BOTH COORDINATES.** The
+condition was declared before the measurement and it fired. Recorded and stopped, not
+re-sampled at other depths: 6 and 8 fail clause 3, 10 and 12 fail clause 5, and the
+monotone cost/size relationship between them leaves no interior point that could satisfy
+both.
+
+### Separate the ceiling from the verdict, as the rules require
+
+  * **INTRINSIC and permanent:** the L4 size win EXISTS and is large — 772,154 B across
+    11 TUNE files, 11/11 beating libdeflate-4, and `symbols.dwarf` is strictly
+    Pareto-dominant (6,553 B smaller AND 4.8% faster at T4). This does not expire and
+    should not be re-derived.
+  * **COORDINATE-DEPENDENT and contingent:** "unshippable" is a verdict about
+    `docs/promotion-rule.md` clause 5 as configured, NOT about the encoder. Every one of
+    these cells stays comfortably faster than gzip and pigz; what fails is an erosion
+    budget that permits ~1-2.6% of self-slowdown on cells we already win by 2-5x.
+
+This is the THIRD independent class this session with a verified size win and no
+affordable wall: L1 `ht_fast@256` (10 board cells), the T4 seam (109 cells), and now L4.
+See `project_clause5_is_the_binding_constraint` — the pattern is now 4-for-4 and is the
+session's most reusable finding.
