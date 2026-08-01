@@ -50,6 +50,11 @@ campaign_rival_args
 # it rather than discovering the refusal.
 #
 # ⚠ THIS SAMPLES 3 OF THE 9 LEVELS THAT CARRY FAILURES, AND CLAUSE 3 IS BLIND OUTSIDE THEM.
+# That is not merely a gap in coverage — it fails the promotion rule's OWN Scope clause,
+# `docs/promotion-rule.md:62-66`: "The board is per-label ... over the corpus. A change
+# evaluated on a NARROWER SLICE HAS NOT BEEN EVALUATED; say so rather than generalising
+# from it." Running the full-level SIZE leg is therefore the rule AS WRITTEN, not a
+# stricter standard.
 # Receipt, 2026-08-01: PR #227 scales max_search_depth in `params_parallel`, which applies
 # at EVERY level, and was gated at 2,6,9. It flipped libdeflate:engine.wasm:L8:{T2,T4}:size
 # from PASS to FAIL (libdeflate 396,254 B; ours 396,096 -> 396,302) and the gate could not
@@ -65,7 +70,9 @@ LEVELS="${CAMPAIGN_LEVELS:-2,6,9}"
 case ",$LEVELS," in
   *,1-9,*|*"1-9"*) ;;
   *)
-    note "levels" "WALL is sampled at $LEVELS — clause 3 is BLIND at the other levels."
+    note "levels" "SCOPE VIOLATION: promotion-rule.md:62-66 says a change evaluated on"
+    note "levels" "  a NARROWER SLICE HAS NOT BEEN EVALUATED. This grades $LEVELS —"
+    note "levels" "  3 of the 9 levels that carry failures. Clause 3 is BLIND at the rest."
     note "levels" "params_parallel-style changes act at EVERY level. Before trusting this"
     note "levels" "verdict, run the FULL-level size leg (it is deterministic and cheap):"
     note "levels" "    CAMPAIGN_LEVELS=1-9 make board-size          # this ref"
