@@ -1484,3 +1484,39 @@ DO NOT re-attempt a block-count change on this class without first measuring the
 both sides. Three readings of this class have now been wrong (G27 sign, G37a mechanism, G37b
 cap), every one of them from reasoning about block counts without measuring what the blocks
 actually cost.
+
+### G37d — the cap falsification RE-RUN with gzip's real constant: still worse, and now monotone
+
+G37c tested the cap at 16,384 symbols. THAT CONSTANT WAS WRONG. gzip's `LIT_BUFSIZE` chain
+(`vendor/gzip/trees.c:118-127`) is 0x2000 under `SMALL_MEM`, 0x4000 under `MEDIUM_MEM`, and
+**0x8000 = 32,768 by default** — neither macro is set in a normal build. I read the first
+`#define` in the chain instead of the effective one, the same error class as the header
+constant in G27.
+
+Re-run with 32,768 (T1, exact bytes, vanilla, vs gzip):
+
+    file                  L   gzip          baseline     cap 16,384    cap 32,768
+    photo.jpg             2   6,470,611     +2,881       +19,122       +10,722
+    weights.safetensors   9  83,099,652    +17,815      +115,744       +45,663
+
+THE CORRECT CONSTANT IS BETTER THAN MY WRONG ONE AND STILL WORSE THAN NO CAP. The response is
+MONOTONE in cap size — the larger the cap the smaller the harm — so the optimum of this family
+is the limit "no cap", which is exactly what we already ship. The falsification therefore does
+not depend on the constant, and G37c's verdict stands with its magnitudes corrected.
+
+WHAT THE ARITHMETIC SAYS, now that both sides are measured. Our photo.jpg blocks: 25 dynamic,
+0 stored, 0 fixed, 15,374 header bits — about 615 bits (77 B) per header. gzip spends 103,925
+header bits, so at a comparable per-header cost it is emitting roughly 169 blocks, ~6.8x ours.
+It pays ~11,066 B MORE header and wins ~14,013 B on data ((7.951478-7.934296) bits/byte over
+~6.52 MB), netting the ~2,881 B it beats us by. When the cap forced ~199-398 of our blocks we
+paid the header and did NOT get the data back.
+
+So gzip's blocks are not merely MORE NUMEROUS, they are BETTER PLACED: its extra tables each
+recover more data than ours do at similar counts. Block COUNT is not the variable; WHERE the
+boundaries fall is. That is consistent with the tail-guard result (well-placed splits earn
+their headers) and with G30 (the depth/size curve saturating) — three separate results now
+saying the same thing about placement versus quantity.
+
+STILL DO NOT re-attempt a count-based change here. The measurement that would advance this class
+is a per-block cost comparison at MATCHED counts — ours vs gzip with the same number of blocks
+— which isolates placement from quantity. Nothing else in this class should be built first.
