@@ -1447,3 +1447,40 @@ That is the design the evidence supports: NOT "the consumer emits everything", b
 consumer owns only the seam blocks". Still unattempted, and still the only route to the 109
 cells — but it is now a bounded change to the boundary handling rather than a rewrite of the
 emission path.
+
+### G37c — FALSIFIED: gzip's symbol cap makes OUR output worse. "We under-split" was the wrong reading
+
+G37b proposed porting gzip's unconditional `LIT_BUFSIZE` symbol cap (16,384 symbols/block) as
+the missing content-independent rule, with the falsifier stated in advance. Built and measured
+(T1, exact bytes, vanilla build, vs gzip):
+
+    file                  L   gzip          main-ish        with cap      delta
+    photo.jpg             2   6,470,611     (+2,881)        6,489,733     +19,122
+    weights.safetensors   9  83,099,652     (+17,815)      83,215,396    +115,744
+
+IT REGRESSED ITS OWN TARGET CLASS, by 6.6x on photo.jpg and 6.5x on weights.safetensors.
+Reverted.
+
+WHAT THIS FALSIFIES IS BROADER THAN THE CAP. The reading in G37/G37a/G37b was "gzip emits more
+blocks, therefore we under-split, therefore emit more blocks". The first clause is measured and
+true; the last does not follow. MORE BLOCKS COSTS US MORE THAN IT COSTS GZIP — so the operative
+difference is not the block COUNT but the per-block COST, and forcing our count toward theirs
+without matching that cost strictly loses.
+
+The header-mass numbers already hinted at this and I read them the wrong way round: on
+photo.jpg gzip spends 103,925 header bits across its blocks while we spend 15,374 across ours.
+If our headers were as cheap as theirs per block, matching their count would have landed near
+their size. It did not, so ours are not.
+
+OPEN QUESTION, and the honest state of this class: WHY is our per-block header more expensive
+than gzip's on near-incompressible data? Candidates worth measuring before anything else is
+built — what BTYPE each side actually emits per block (a static block carries no table at all,
+and stored carries 5 bytes; for incompressible input those often beat dynamic), and whether
+gzip's blocks there are predominantly static/stored while ours are dynamic. `emit_block` does
+pick cheapest-of-{stored,static,dynamic} per block, so if we are choosing dynamic where gzip
+chooses static, the cost model — not the splitter — is the defect.
+
+DO NOT re-attempt a block-count change on this class without first measuring the BTYPE mix on
+both sides. Three readings of this class have now been wrong (G27 sign, G37a mechanism, G37b
+cap), every one of them from reasoning about block counts without measuring what the blocks
+actually cost.
