@@ -1520,3 +1520,35 @@ saying the same thing about placement versus quantity.
 STILL DO NOT re-attempt a count-based change here. The measurement that would advance this class
 is a per-block cost comparison at MATCHED counts — ours vs gzip with the same number of blocks
 — which isolates placement from quantity. Nothing else in this class should be built first.
+
+### G37e — MATCHED-COUNT probe: block COUNT is definitively not the variable
+
+G37d named the one measurement that should precede anything else in this class: compare our
+per-block cost against gzip's AT THE SAME BLOCK COUNT, isolating placement from quantity. Run
+(photo.jpg L2, T1, exact bytes; our count forced with a probe symbol cap of 38,600, tuned to
+land on gzip's ~169):
+
+    our blocks   our total     vs gzip
+        25       6,473,492      +2,881     natural splitting
+       169       6,479,916      +9,305     forced to gzip's count
+    gzip 169     6,470,611          —
+
+AT MATCHED BLOCK COUNTS GZIP IS 9,305 B SMALLER — more than 3x the gap at our natural count.
+Forcing our count toward theirs makes us WORSE, monotonically, at every value tested
+(16,384 -> +19,122; 32,768 -> +10,722; 38,600 -> +9,305; no cap -> +2,881).
+
+THE COUNT-BASED FAMILY IS DEAD. Not "the constant was wrong" and not "the cap was the wrong
+shape" — at gzip's own count we are further behind than at ours, so no policy that only moves
+the count can close this class. That covers G27's sign, G37a's sparsity rule, G37b's cap,
+G37d's constant, and this probe: five readings, one conclusion.
+
+WHAT IS LEFT is per-block COST at fixed count — either our tables are more expensive to
+transmit than gzip's for the same data, or our boundaries land worse than gzip's do at equal
+spacing, or both. Distinguishing those needs a per-block dump on both sides (BTYPE, header
+bits, data bits, boundary offset), not another global policy change.
+
+RECORDED SO IT IS NOT RE-DERIVED: our blocks on this file are 25 dynamic, 0 stored, 0 fixed, at
+~615 bits (77 B) of header each. gzip spends 103,925 header bits total. The BTYPE mix on gzip's
+side is still unmeasured and is the cheapest remaining unknown — if gzip is emitting static or
+stored blocks where we emit dynamic, the defect is in `emit_block`'s cost model rather than in
+the splitter at all.
