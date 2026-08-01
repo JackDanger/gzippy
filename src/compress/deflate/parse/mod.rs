@@ -2174,3 +2174,138 @@ mod emit_tests {
         assert_eq!(a.finish(), b.finish());
     }
 }
+
+#[cfg(test)]
+mod l1_bakeoff {
+    //! A ONE-BLOCK, SUB-SECOND optimisation loop for the L1 matchfinder.
+    //!
+    //! WHY THIS EXISTS. The L1 deficit is the largest remaining SIZE class on the
+    //! board (16 of 37 residual cells after #227, and the largest level in the
+    //! 22-file census at 35 cells). `fulcrum why` established that it is
+    //! ALGORITHMIC, not implementation — at `data.csv:L01:T01` we emit
+    //! **741,183 literals against libdeflate's 256,099 (2.89x)** and find 4.4%
+    //! fewer matches, while header bits are near-identical. Every other level
+    //! reports POSITION COUNTS MATCH at delta 0.00%; L1 is the one that parses
+    //! differently.
+    //!
+    //! Iterating on that through the board is hopeless: a census is hours and a
+    //! wall run needs a quiet box. But match quality is DETERMINISTIC — it does
+    //! not care about load, arch, or thread count — so one block through both
+    //! matchfinders answers "did that change find more matches?" in under a
+    //! second, on any machine, with no instrument between the code and the number.
+    //!
+    //! `Strategy::Fast` (shipped) is igzip-class chainless SINGLE-PROBE.
+    //! `ht_fast` is the libdeflate-class 2-ENTRY-BUCKET synthesis that also keeps
+    //! our length-3 table. Both are already in the tree and both are
+    //! `fulcrum verify`-clean; only the ROUTING was reverted (see the FALSIFY at
+    //! the `Strategy::Fast` dispatch arm).
+    //!
+    //! HOW TO USE IT:
+    //!     cargo test --release l1_bakeoff -- --nocapture
+    //! Smaller `ht_fast` bytes = the 2-way bucket is finding matches the single
+    //! probe misses. This is a SIZE proxy only — it says nothing about the wall,
+    //! and the routing decision needs a frozen paired wall run either way.
+
+    use super::*;
+
+    /// Real corpus, never synthetic: a synthetic input once said "+1 byte" where
+    /// the real corpus said "+2.02%".
+    fn corpus_roots() -> Vec<std::path::PathBuf> {
+        let mut v = vec![];
+        if let Ok(h) = std::env::var("HOME") {
+            v.push(std::path::PathBuf::from(&h).join("www/gzippy-bench/corpus"));
+        }
+        v.push(std::path::PathBuf::from("/root/gzippy-bench/corpus"));
+        v
+    }
+
+    /// Compress ONE block with the shipped L1 path and with `ht_fast`, and
+    /// return (fast_bytes, ht_bytes). Both get the identical padded buffer.
+    fn bakeoff_one(block: &[u8]) -> (usize, usize) {
+        let mut buf = Vec::with_capacity(block.len() + BUF_PAD);
+        buf.extend_from_slice(block);
+        buf.resize(block.len() + BUF_PAD, 0);
+        let in_end = block.len();
+        let statics = StaticCodes::get();
+
+        let params = crate::compress::deflate::level::params(1);
+        let mut a = BitWriter::new();
+        compress(&buf, 0, in_end, &params, true, &mut a);
+        let fast_bytes = a.finish().len();
+
+        let mut b = BitWriter::new();
+        ht_fast::run(&buf, 0, in_end, &params, statics, &mut b, true);
+        let ht_bytes = b.finish().len();
+
+        (fast_bytes, ht_bytes)
+    }
+
+    #[test]
+    fn l1_bakeoff() {
+        const BLOCK: usize = 256 * 1024;
+        let root = corpus_roots().into_iter().find(|p| p.is_dir());
+        let Some(root) = root else {
+            eprintln!("l1_bakeoff: no corpus dir found — SKIPPED (this is a real-corpus test)");
+            return;
+        };
+
+        let files = [
+            "data.csv",
+            "data.json",
+            "aozora.txt",
+            "dickens",
+            "minjs.min.js",
+            "data.parquet",
+            "armexe.elf",
+            "engine.wasm",
+        ];
+        println!();
+        println!("L1 ONE-BLOCK BAKEOFF — first {BLOCK} bytes, deterministic, load-immune");
+        println!("  corpus: {}", root.display());
+        println!();
+        println!(
+            "  {:<16} {:>10} {:>10} {:>9}  {}",
+            "file", "Fast", "ht_fast", "delta", "verdict"
+        );
+        let mut any = false;
+        let (mut tot_f, mut tot_h) = (0usize, 0usize);
+        for f in files {
+            let path = root.join(f);
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            if data.len() < BLOCK {
+                continue;
+            }
+            any = true;
+            let (fa, ht) = bakeoff_one(&data[..BLOCK]);
+            tot_f += fa;
+            tot_h += ht;
+            let d = ht as i64 - fa as i64;
+            let verdict = if d < 0 {
+                "ht_fast SMALLER"
+            } else if d > 0 {
+                "Fast smaller"
+            } else {
+                "tie"
+            };
+            println!("  {f:<16} {fa:>10} {ht:>10} {d:>+9}  {verdict}");
+        }
+        if !any {
+            eprintln!("l1_bakeoff: corpus dir found but no file >= {BLOCK} B — SKIPPED");
+            return;
+        }
+        println!();
+        println!(
+            "  {:<16} {:>10} {:>10} {:>+9}  ({:+.3}%)",
+            "TOTAL",
+            tot_f,
+            tot_h,
+            tot_h as i64 - tot_f as i64,
+            100.0 * (tot_h as f64 / tot_f as f64 - 1.0)
+        );
+        println!();
+        println!("  Reference (whole data.csv, L1, fulcrum why): ours 741,183 literals");
+        println!("  vs libdeflate 256,099 — 2.89x. Fewer literals => better parse.");
+    }
+}
