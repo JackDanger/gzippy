@@ -870,3 +870,43 @@ which is the composition rule from `CLAUDE.md`'s rule 5 stated in advance rather
 
 NOT ATTEMPTED. It touches the T1 table, so it must clear T1 wall against libdeflate, which is
 the tightest budget on the board.
+
+## G32a — FALSIFIED, and I predicted it in advance: `good_match` + zlib's L2 knobs does NOT close the worst cell
+
+G32 proposed the PAIR — the `good_match` early exit plus zlib's L2 knobs (depth 8, nice 16) —
+on the argument that neither half alone moves `pigz:dd79_bin6:L2` and the exit would pay for
+the extra depth. Built and measured (detached worktree off `main`, the foreign `good_match`
+patch plus the knob change, vanilla build, T1, exact bytes):
+
+    file          pigz         libdeflate   main         composed     verdict
+    dd79_bin6     4,464,656    4,500,757    4,500,757    4,500,804    WORSE than main (+47)
+    data.csv      4,425,984    3,923,216    3,923,216    3,941,022    OPENS a cell (+17,806)
+    dickens       5,167,504    4,772,260    4,772,260    4,737,378    beats both
+    winexe.exe    1,637,306    1,569,179    1,569,179    1,561,372    beats both
+    photo.jpg     6,480,485    6,473,516    6,473,516    6,473,492    beats both
+    sil40        16,869,300   16,059,080   16,059,080   15,972,405    beats both
+
+THE TARGET CELL DID NOT MOVE — it got 47 B worse — and `data.csv` REGRESSED by 17,806 B,
+turning a passing cell into a failing one. The proposal is dead as stated.
+
+WHY, and it is a correction to G32's reading of the vendor. zlib's `good_match` does not
+merely exist alongside the chain bound; it SHORTENS THE SEARCH when a good-enough match is
+found (zlib reduces `chain_length` once `len >= good_match`). At L2 with `good_match = 4`, a
+4-byte match is found almost immediately on binary data, so the exit fires at once and the
+EFFECTIVE depth drops BELOW the nominal 8 — which is why raising the bound to 8 bought
+nothing on `dd79_bin6` and why a file that depends on longer searches (`data.csv`) lost.
+
+So `good_match` is not a free way to buy depth. It is a trade: cheaper on inputs where short
+matches are good enough, WORSE on inputs where they are not. That is a data-dependent effect
+in a static parameter — the same shape as the Greedy/Lazy failure in #236, where lazy helped
+dense-match data and hurt sparse-match data.
+
+WHAT SURVIVES. G31a's measurement stands on its own terms: the foreign `good_match` patch
+UNCHANGED (depth 6, nice 10) closes four L6 T1 cells. That is its owner's result and this
+falsification does not touch it. What is falsified is MY proposal to combine it with raised L2
+knobs.
+
+REOPEN would require a mechanism that explains why `data.csv` regressed and `dd79_bin6` did
+not move — not another (depth, nice, good_match) triple. Do not sweep the triple; the failure
+is not a bad point in that space, it is that the space itself trades one input class against
+another.
