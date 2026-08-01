@@ -239,6 +239,13 @@ time each one has cost.
   instance differs. Five of one session's eight levers were the same class —
   hand-scheduling a loop LLVM had already scheduled — re-sampled after its verdict
   was already known.
+- **Run `scripts/campaign/tie-guard.sh <ref>` before any change that alters T1 output.** We are
+  byte-identical to libdeflate on nearly every T1 cell (66 of 66 at L2/L6/L9). A tie PASSES but
+  has ZERO tolerance — one byte either way flips it, and clause 3 refuses that absolutely. The
+  bar is NON-WORSE ON EVERY TIE, not net-positive: two levers that were net T1 IMPROVEMENTS died
+  here (hash3 chaining 6 closed/12 flipped; zlib good_match 31 closed/17 flipped, with data.csv
+  L2 going 1.0000 -> 1.0431). The guard runs the tie subset in ~2 min instead of ~20, and a
+  hand-picked 9-file sample missed the two worst files entirely — enumerate, do not sample.
 - **Cheapest falsifier first.** Order a lever's legs by cost: deterministic size
   and Ir on the canonical corpus before any wall run; a shallow AND a deep level
   before any claim about "the levels"; both arches before any general conclusion.
