@@ -200,3 +200,34 @@ own notes (`/root/wallboard-L6/`, quoted in
 
 A banked result that covers less than yours is not thereby weaker. **On the
 overlap it is a direct test, and this one failed.** Check the overlap FIRST.
+
+---
+
+## What IS established across architectures: the BYTES, not the time
+
+Verified 2026-08-01, commit `120bfa9c`, dickens, L2, **explicit `-p1`**:
+
+    local M1 (aarch64)      output sha256[0:16] = 9dfdacf9740e1951
+    trainer (x86-64 Intel)  output sha256[0:16] = 9dfdacf9740e1951
+
+**Byte-identical.** Size is arch-invariant by construction and this confirms it
+on two architectures for this exact commit.
+
+⚠ A trainer sha of `d608c061737bce1c` appears in earlier notes for "the same"
+run. It is not the same run — it was taken WITHOUT `-p1`, so it is the T16
+output. That is the third appearance of the missing-`-p1` trap in one day
+(the first two: a whole T16 callgrind profile mislabelled T1, and a retracted
+`memcpy` finding built on it). `board-wall.sh:99` carries the warning; every
+instance came from hand-rolling the invocation instead of using the script.
+
+## Why that makes the L6 contradiction sharper, not softer
+
+The encoder does NOT make different decisions on AMD. It emits the same bytes
+and takes **6.6–8.1% longer than libdeflate** at L6/T1 there, while being
+**4.5–9.4% faster** on M1. Identical work, different time.
+
+So the L6 question is not "what does the parser choose" — it is a MACHINE-level
+question about the same instruction stream. That is a much narrower search:
+the candidates are microarchitectural (issue width, load/store, branch
+prediction, cache geometry) or they are commit drift, and a third architecture
+discriminates them.
