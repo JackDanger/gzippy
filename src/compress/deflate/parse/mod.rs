@@ -2240,6 +2240,35 @@ mod l1_bakeoff {
         (fast_bytes, ht_bytes)
     }
 
+    /// libdeflate's OWN `-1` on the same bytes — the number we must beat.
+    /// Returns the DEFLATE payload size (gzip frame minus its 10-byte header and
+    /// 8-byte trailer) so it is comparable to the raw-block sizes above. `None`
+    /// if libdeflate-gzip is not on this box; the test then omits the column
+    /// rather than inventing a reference.
+    fn libdeflate_l1(block: &[u8]) -> Option<usize> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("libdeflate-gzip")
+            .args(["-1", "-c"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        // TAKE the handle so dropping it closes the pipe and delivers EOF.
+        // Borrowing it hangs forever waiting for more input — that exact bug
+        // cost two stalled measurement runs elsewhere in this campaign.
+        {
+            let mut si = c.stdin.take()?;
+            si.write_all(block).ok()?;
+        }
+        let out = c.wait_with_output().ok()?;
+        if !out.status.success() || out.stdout.len() < 18 {
+            return None;
+        }
+        Some(out.stdout.len() - 18)
+    }
+
     #[test]
     fn l1_bakeoff() {
         const BLOCK: usize = 256 * 1024;
@@ -2264,11 +2293,12 @@ mod l1_bakeoff {
         println!("  corpus: {}", root.display());
         println!();
         println!(
-            "  {:<16} {:>10} {:>10} {:>9}  {}",
-            "file", "Fast", "ht_fast", "delta", "verdict"
+            "  {:<16} {:>10} {:>10} {:>10} {:>10}",
+            "file", "Fast", "ht_fast", "libdeflate", "ht-vs-ld"
         );
         let mut any = false;
-        let (mut tot_f, mut tot_h) = (0usize, 0usize);
+        let (mut tot_f, mut tot_h, mut tot_l) = (0usize, 0usize, 0usize);
+        let mut have_ld = false;
         for f in files {
             let path = root.join(f);
             let Ok(data) = std::fs::read(&path) else {
@@ -2281,29 +2311,51 @@ mod l1_bakeoff {
             let (fa, ht) = bakeoff_one(&data[..BLOCK]);
             tot_f += fa;
             tot_h += ht;
-            let d = ht as i64 - fa as i64;
-            let verdict = if d < 0 {
-                "ht_fast SMALLER"
-            } else if d > 0 {
-                "Fast smaller"
-            } else {
-                "tie"
-            };
-            println!("  {f:<16} {fa:>10} {ht:>10} {d:>+9}  {verdict}");
+            match libdeflate_l1(&data[..BLOCK]) {
+                Some(ld) => {
+                    have_ld = true;
+                    tot_l += ld;
+                    println!(
+                        "  {f:<16} {fa:>10} {ht:>10} {ld:>10} {:>+10}",
+                        ht as i64 - ld as i64
+                    );
+                }
+                None => println!("  {f:<16} {fa:>10} {ht:>10} {:>10} {:>10}", "-", "-"),
+            }
         }
         if !any {
             eprintln!("l1_bakeoff: corpus dir found but no file >= {BLOCK} B — SKIPPED");
             return;
         }
         println!();
-        println!(
-            "  {:<16} {:>10} {:>10} {:>+9}  ({:+.3}%)",
-            "TOTAL",
-            tot_f,
-            tot_h,
-            tot_h as i64 - tot_f as i64,
-            100.0 * (tot_h as f64 / tot_f as f64 - 1.0)
-        );
+        if have_ld {
+            println!(
+                "  {:<16} {:>10} {:>10} {:>10} {:>+10}",
+                "TOTAL",
+                tot_f,
+                tot_h,
+                tot_l,
+                tot_h as i64 - tot_l as i64
+            );
+            println!();
+            println!(
+                "  Fast    vs libdeflate: {:+.3}%   <- the shipped L1 gap",
+                100.0 * (tot_f as f64 / tot_l as f64 - 1.0)
+            );
+            println!(
+                "  ht_fast vs libdeflate: {:+.3}%   <- MINIMISE THIS",
+                100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
+            );
+            println!(
+                "  ht_fast vs Fast:       {:+.3}%",
+                100.0 * (tot_h as f64 / tot_f as f64 - 1.0)
+            );
+        } else {
+            println!(
+                "  {:<16} {:>10} {:>10}   (libdeflate-gzip not on this box)",
+                "TOTAL", tot_f, tot_h
+            );
+        }
         println!();
         println!("  Reference (whole data.csv, L1, fulcrum why): ours 741,183 literals");
         println!("  vs libdeflate 256,099 — 2.89x. Fewer literals => better parse.");
