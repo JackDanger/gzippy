@@ -96,3 +96,59 @@ levers aimed there; a fourth would be the fourth.
 
 **OPENS:** the parse loop, at +48.7% and 81.8% of the excess, at the exact
 level and thread count where every failing wall cell lives.
+
+---
+
+## CLASS CLOSED: "help LLVM do what it already does" — two receipts, both 2026
+
+The 89.1M Ir of `core::ptr` / `core::num` / `core::slice` scaffolding in our
+parse loop (39.6% of the group) has an obvious-looking cause: we index a
+`&[u8]` (`buf[in_next]`, `mf.longest_match(buf, ..)`) where libdeflate walks raw
+pointers (`*in_next++`). That is a real structural difference and it is the right
+shape for the profile.
+
+**Do not act on it as a bounds-check-elision lever.** Two independent
+falsifications now say this class does not pay in this codebase:
+
+1. `src/compress/deflate/matchfinder/ht.rs:92` — FALSIFY 2026-07-30. Replacing
+   checked table indexing with `get_unchecked` is byte-identical and moved
+   nothing measurable at L1/T1 (tool.bin 0.32 s both arms, data.csv 0.07 s both
+   arms). **"LLVM had already elided them."** The form is kept only because it
+   matches libdeflate, "not because it was worth anything."
+2. `src/compress/deflate/parse/mod.rs` — FALSIFY 2026-08-01 (today). A `#[cold]`
+   /`#[inline(never)]` hint on `adjust_max_and_nice_len`, matching libdeflate's
+   `unlikely()` exactly and carrying 21.06M Ir of attributed cost, measured
+   **1.97% SLOWER at L5** and undetectable at L2.
+
+Plus the standing receipt in CLAUDE.md hard stop #4: hand-hoisting loop-invariant
+loads drove data reads UP because LLVM had already hoisted them.
+
+Three results, one mechanism: **telling LLVM what it has already worked out costs
+register pressure and buys nothing.** CLAUDE.md's "two strikes closes a class"
+applies. Reopening needs a vendor diff naming why the next instance DIFFERS, not
+another instance of the same idea.
+
+⚠ SCOPE of receipt (1), because it matters: it is `ht.rs` (the chainless L1
+matchfinder's HASH-TABLE indexing) at L1/T1, on a hand-rolled paired read of 7
+reps that predates the `aa_bias` discipline. It does NOT directly cover the parse
+loop's BUFFER indexing at L2. It is cited here for its MECHANISM, which receipts
+(2) and (3) independently corroborate — not as coverage of this exact code.
+
+## What a DIFFERENT mechanism would look like
+
+Not "remove a check LLVM already removed", but changing what the loop has to keep
+live. `fulcrum candidates libdeflate:dickens:L02:T01:wall` lists two with vendor
+precedent:
+
+- **[C2] single-allocation state carving + cacheline grouping** — zlib-ng carves
+  window/prev/head/pending_buf from ONE alloc with 64-byte-aligned sub-buffers and
+  an `ALIGNED_(64)` state struct grouped by cacheline (`deflate.c:165-227`,
+  `deflate.h:138-314`). Ours: per-object boxing with thread-local pooling and **no
+  deliberate cacheline grouping of hot loop state.**
+- **[G5] SIMD histogram** — igzip's `isal_update_histogram` asm
+  (`igzip_update_histogram.asm:257`) against our scalar frequency counting in the
+  Sink. That one lands on BLOCK EMISSION (+27.4%, 29.4% of the excess), not the
+  parse loop.
+
+Neither has been measured. Both are structural rather than compiler-hinting, which
+is the only distinction that matters after three strikes.
