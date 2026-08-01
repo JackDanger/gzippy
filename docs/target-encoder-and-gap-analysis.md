@@ -1620,3 +1620,57 @@ headers. That result and this one agree — we split too little, not too much.
 IMPLEMENTATION NOTE: this changes T1 output on every file, so it needs the full graded gate,
 and the tied-file caution from G33 applies — the cells where we are byte-identical to
 libdeflate have zero tolerance and must be checked first.
+
+### G37b — CORRECTION and convergence: it is not gzip's sparsity rule, it is gzip's UNCONDITIONAL SYMBOL CAP
+
+G37a named gzip's periodic sparsity flush ([D3], `vendor/gzip/trees.c:990-1005`) as the
+mechanism. Reading the vendor source properly refutes that:
+
+    if (level > 2 && (last_lit & 0xfff) == 0) {
+        ... out_length = last_lit*8 + sum(dist_freq * (5 + extra_dbits)) ; out_length >>= 3;
+        if (last_dist < last_lit/2 && out_length < in_length/2) return 1;
+    }
+    return (last_lit == LIT_BUFSIZE-1 || last_dist == DIST_BUFSIZE);
+
+The sparsity flush requires `out_length < in_length/2` — the block must be compressing better
+than 2x. photo.jpg compresses at 7.95 bits/byte (i.e. barely), so THAT CONDITION IS NEVER TRUE
+THERE. The sparsity rule cannot be what splits photo.jpg.
+
+The line AFTER it is: `last_lit == LIT_BUFSIZE-1`, an UNCONDITIONAL HARD CAP on symbols per
+block (`LIT_BUFSIZE` 0x4000 = 16,384; `vendor/gzip/trees.c:120-123`). gzip ends a block every
+16,384 symbols no matter what the data looks like. On 6.4M literals that is ~390 blocks,
+against our ~50 — which is the 15,374 vs 103,925 header-bit gap measured in G37.
+
+### This converges with the FALSIFY record already in `block_split.rs`
+
+That record (2026-07-30, lines 23-48) hit the SAME case from the other side and states the
+structure exactly:
+
+    "The bias term (block_length/4096) * num_observations is this heuristic's ONLY response to
+     STATIONARY data ... the bias alone fires at block_length >= 200*4096 = 819,200 B —
+     calibrated dead below any block budget we would ship."
+    "Structureless data must split early; structured data must not — ONE DIVISOR CANNOT
+     EXPRESS BOTH."
+
+A previous session met this exact under-splitting case, tried to fix it by lowering the divisor
+and raising the budget as a pair, fixed the target file and BROKE structured data
+(logs.txt +4,157/+10,094; text-1MB.txt +230/+531).
+
+GZIP DOES NOT HAVE THAT PROBLEM BECAUSE IT DOES NOT USE ONE KNOB FOR BOTH JOBS. It has two
+independent mechanisms: a CONTENT heuristic (drift/sparsity) for structured data, and an
+UNCONDITIONAL SYMBOL CAP for everything. The cap needs no calibration against content because
+it does not respond to content at all — which is precisely why it cannot break structured data
+the way a re-tuned divisor did.
+
+REOPEN BASIS (this is a NEW mechanism, not a variant of the falsified one): the falsification
+binds LOWERING THE LENGTH-BIAS DIVISOR — a change to the CONTENT-RESPONSIVE term. An
+unconditional symbol cap is content-independent by construction, adds a second rule rather than
+re-tuning the first, and is a direct vendor port with a cited constant. FALSIFIED BY: any
+structured-data cell regressing, which is the exact failure the divisor change produced and
+must be checked first.
+
+CAVEATS CARRIED FORWARD FROM THAT RECORD: its magnitudes were measured on UNDECLARED corpus
+members (`shortmatch-4M`, `logs.txt`, `text-1MB.txt` are none of them in `corpus_split.json`),
+so the mechanism is binding but the numbers are not. Any implementation re-derives with
+`scripts/campaign/board-size.sh`, which refuses undeclared members — and per G33, the files
+where we TIE libdeflate byte-for-byte have zero tolerance and must be checked first.
