@@ -2018,3 +2018,44 @@ scale nearly linearly.
 
 Recorded so the next session does not re-derive it: the smallest failing file in this class is
 868 KB and still hits 1.94x. There is no size floor below which the seam is free.
+
+## G42 — the T1 front needs a lever 20-900x bigger than anything we have, and it must not flip a tie
+
+Byte-identity is NOT a goal — it is the cage. So the right question about the T>1 gating of the
+exact-Huffman candidate is not "does T1 stay identical" but "do we LOSE anything by declining
+those bytes at T1". Measured from the after-arm of the gated change:
+
+    every failing T1 cell, and the margin it needs
+      gzip  dd79_bin6           L2  1.00927   needs 0.927%
+      pigz  dd79_bin6           L2  1.00809   needs 0.809%
+      gzip  monorepo.tar        L6  1.00592   needs 0.592%
+      gzip  aozora.txt          L6  1.00570   needs 0.570%
+      pigz  monorepo.tar        L6  1.00540   needs 0.540%
+      pigz  aozora.txt          L6  1.00452   needs 0.452%
+      gzip  minjs.min.js        L6  1.00342   needs 0.342%
+      pigz  minjs.min.js        L6  1.00311   needs 0.311%
+      gzip  photo.jpg           L2  1.00045   needs 0.045%
+      gzip  weights.safetensors L9  1.00021   needs 0.021%
+
+    exact-Huffman candidate: ~0.001% (122-166 B on 15.4 MB)
+
+THE SMALLEST T1 DEFICIT IS 20x THE LARGEST T1 LEVER WE HAVE. So declining those bytes at T1
+costs ZERO cells — the gating is right on cell-closing grounds as well as on the wall budget,
+which are independent arguments reaching the same place.
+
+### What the T1 front actually requires
+
+A size lever worth 0.02% to 0.93% — twenty to nine hundred times the Huffman candidate — that
+ALSO does not flip any of the 66 tied cells. Those two requirements are in tension, and that
+tension is the whole T1 problem:
+
+  * `good_match` has the right MAGNITUDE (0.5-1.4%: aozora -35,823 B, monorepo -27,716 B) and
+    fails the tie test (17 flips, data.csv L2 1.0000 -> 1.0431).
+  * hash3 chaining likewise: right direction, 12 flips.
+  * The exact-Huffman candidate passes the tie test BY CONSTRUCTION and is 20x too small.
+
+Nothing measured so far is both big enough and safe enough. A lever for this front must be
+sized against 0.02%-0.93% AND run through `scripts/campaign/tie-guard.sh` before anything else.
+Note the two cheapest cells — photo.jpg L2 (0.045%) and weights.safetensors L9 (0.021%) — are a
+different, much lower bar than the 0.3-0.9% cluster, and may be reachable by something the
+larger cells are not.
