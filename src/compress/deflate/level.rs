@@ -163,9 +163,22 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // literals than GREEDY, costing +32,975 B on that file. Lazy is not uniformly stronger;
     // it is stronger only where matches are dense.
     //
-    // Scaling max_search_depth has no such failure mode — a deeper chain can only find a
-    // match at least as good — and it measured strictly better everywhere, including L8/L9
-    // where the strategy step had nothing left to give (already Lazy2):
+    // ⚠ CORRECTED 2026-08-01: the sentence that stood here — "Scaling max_search_depth has
+    // no such failure mode — a deeper chain can only find a match at least as good" — is
+    // FALSE, and was falsified by isolating the two mechanisms on engine.wasm L8 T4
+    // (trainer, vanilla builds, deterministic bytes, libdeflate -8 = 396,254):
+    //     main                        396,096  PASS
+    //     depth x4 ONLY (exact OFF)   396,307  FAIL   <- the depth scaling alone
+    //     try_exact_huffman ONLY      396,092  PASS   <- monotone, and 4 B smaller
+    //     both (as first shipped)     396,302  FAIL
+    // A deeper chain changes the PARSE, not merely the quality of one match: a longer
+    // match taken at position i displaces a better match at i+k. It is NOT a magnitude
+    // problem — engine.wasm L8 flips at x2, x3 and x4 alike — so no multiplier rescues it.
+    // Depth scaling is therefore NOT monotone in output size, and the claim below is
+    // narrowed to the levels where it was actually measured.
+    //
+    // Scaling max_search_depth measured strictly better at the levels below, including
+    // L9 where the strategy step had nothing left to give (already Lazy2):
     //     L2 weights.safetensors  83,082,549 vs igzip 83,101,588  (0.99977, and 22 B SMALLER
     //                             than the shipped T>1 output — the clause-3 flip is gone)
     //     L2 dickens -107,533 | data.csv -112,714 | sil40 -157,275  vs libdeflate
@@ -175,7 +188,20 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // x4 is the shipped factor. Wall on sil40, T4, vs BOTH rivals that matter (libdeflate is
     // single-threaded; pigz is not): L2 2.73x/1.39x, L6 2.53x/2.18x, L9 2.15x/1.62x faster.
     // Even at L9, where this walks 2,400 chain nodes, we stay ahead of both.
-    p.max_search_depth = p.max_search_depth.saturating_mul(4);
+    // L8 IS EXCLUDED, and this is an EMPIRICAL PATCH ON A STRUCTURAL NON-MONOTONICITY,
+    // not a principled fix. libdeflate:engine.wasm:L8:{T2,T4}:size flips PASS -> FAIL with
+    // the scaling on (see the isolation above); L8/engine.wasm is simply where an 11-file
+    // TUNE sample caught it, and a wider corpus may find the same effect elsewhere. Priced
+    // at T4 vs libdeflate, L5-L9, 11 TUNE files:
+    //     depth x4 at every level   closes 30, OPENS 1   <- clause 3 is absolute: NO-SHIP
+    //     L8 excluded (this)        closes 26, opens 0
+    //     try_exact_huffman alone   closes  5, opens 0
+    // The exclusion costs 4 cells at L8 and removes the only clause-3 violation.
+    p.max_search_depth = if level == 8 {
+        p.max_search_depth
+    } else {
+        p.max_search_depth.saturating_mul(4)
+    };
     // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
     // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
