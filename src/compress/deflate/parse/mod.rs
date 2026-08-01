@@ -1170,8 +1170,31 @@ fn emit_block_static_or_stored(
 /// shaping moves `dynamic_bits`, which feeds the stored/static/dynamic choice and
 /// the block splitter), and `huffman_table_ns` was never the phase being tripled.
 ///
-/// Until that third measurement exists, NEITHER the 1.4% ceiling NOR the
-/// allocation diagnosis may be cited.
+/// RESOLVED 2026-08-01 by the third measurement. The discriminator was built
+/// (all the work, then `return None` unconditionally). It produces output
+/// BYTE-IDENTICAL TO BASELINE — verified, engine.wasm 398123 and tool.bin 20825308
+/// both arms — and still costs:
+///
+///     engine.wasm 1.83x   symbols.dwarf 1.96x   data.parquet 6.13x   tool.bin 6.35x
+///
+/// So **the cost is the WORK, not the changed output**. The
+/// more-blocks/block-splitter hypothesis is DEAD; do not re-propose it.
+///
+/// WHAT IS NOW OPEN, and it is a defect in an INSTRUMENT, not in this lever:
+/// `anatomy-wall` reports `huffman_table_ns` at 1.4% of the run, yet adding two
+/// `make_huffman_code_into` + two `build_dynamic_header` + two `cost_from_freqs`
+/// calls per block costs 83-535%. Those calls are INSIDE the `huffman_table_ns`
+/// region. One of these is lying, and it is load-bearing for every future "where
+/// does encoder time go" decision. Do not cite `huffman_table_ns` until it is
+/// reconciled.
+///
+/// The leading unfalsified candidate, NOT yet measured: `optimize_huffman_for_rle`
+/// smooths counts toward equality, and a near-uniform histogram may be a worst
+/// case for the length-limited code builder (package-merge), so the SHAPED build
+/// costs far more than the raw build the phase timer was calibrated on. That
+/// predicts a SECOND consequence to check: time `make_huffman_code_into` alone on
+/// a raw vs a smoothed histogram, same block. If they differ by ~100x, that is the
+/// mechanism and `huffman_table_ns` is honest but non-linear in its input.
 ///
 /// Returns the histograms to build the block's codes from.
 fn shaped_freqs_if_smaller(
