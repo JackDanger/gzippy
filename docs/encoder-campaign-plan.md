@@ -2255,3 +2255,66 @@ This is the THIRD independent class this session with a verified size win and no
 affordable wall: L1 `ht_fast@256` (10 board cells), the T4 seam (109 cells), and now L4.
 See `project_clause5_is_the_binding_constraint` — the pattern is now 4-for-4 and is the
 session's most reusable finding.
+
+## ⚠ THE FALSIFICATION CORPUS IS MOSTLY SINGLE-MACHINE — 5 of 42 records carry a multi-arch verdict
+
+Counted 2026-08-01 over every `FALSIF(Y|IED|IES)` block in `src/compress/` (a 20-line
+window after each marker — approximate, but the shape is not in doubt):
+
+```
+  blocks naming >= 2 arches (multi-arch verdict):    5
+  blocks naming exactly ONE arch:                    9
+  blocks naming NO arch at all:                     28
+```
+
+**37 of 42 do not record a multi-arch coordinate, and 28 record no machine at all** —
+against a charter whose STEP 1 says "on every corpus file, **on both arches**", and a
+standing rule that says RECORD THE COORDINATE.
+
+### This is not hypothetical: a record in the tree shows the verdict flipping by machine
+
+`matchfinder/hc.rs:455-470`, on removing a `prefetch_read`:
+
+```
+  Intel            -5.1% wall / -5.2% cycles
+  M1               geomean 0.9610   (-10% at L6/L9)
+  AMD Zen2 frozen  geomean 0.9993   (i.e. NEUTRAL)
+```
+
+**A change worth 10% on M1 measured as nothing on the box that issues verdicts.** That
+record is one of the 5 that did the multi-arch work, and it is precisely why it caught
+this. Had it been run on solvency alone it would read "no effect, not a lever" — and the
+10% would have been left on the floor on the arch most users are on.
+
+### What this does and does not put in doubt
+
+  * **DOES put in doubt: every WALL verdict decided on solvency alone.** Wall is a
+    property of a microarchitecture. 9 records name one arch and 28 name none; those are
+    verdicts about a machine, recorded as verdicts about a mechanism.
+  * **DOES NOT put in doubt: the instruction-count findings.** Ir is machine-independent
+    by construction. The measured 1.20-1.44x instruction excess over libdeflate at
+    byte-identical output (hand-verified with cachegrind: movie.mp4 1,650,693,672 vs
+    1,153,377,248; dickens 1,385,371,628 vs 1,155,052,955) holds on any box that runs
+    the same binaries. That is why it is the safest thing on this page to build on.
+  * **SIZE has a small arch term too, which was a surprise.** Same commit, L1: dickens
+    5,080,065 B on arm64 vs 5,081,832 B on x86 (~0.03%). Small, but it means cells that
+    tie libdeflate BYTE-FOR-BYTE on x86 need not tie on arm64 — and the tie cells are
+    the zero-tolerance ones.
+
+### The rule's Scope clause does not mention microarchitecture
+
+`docs/promotion-rule.md:62-66` names levels, rivals, corpus and both axes: "A change
+evaluated on a NARROWER SLICE HAS NOT BEEN EVALUATED." It does not name the machine.
+Recorded here as an OBSERVATION about what the rule covers — not as a proposal to change
+it, which `CLAUDE.md` forbids.
+
+### Cheapest de-risking, in cost order — none of these is a rule change
+
+  1. **Make the arch part of every recorded verdict's coordinate.** Free. A record that
+     says "solvency only" is honest; one that says nothing invites the reader to assume
+     generality. 28 records currently invite that.
+  2. **Re-check the 9 single-arch WALL verdicts on a second machine before treating any
+     of them as closing a class.** The prefetch record shows the expected yield is not
+     zero.
+  3. Per-arch level tables would collide with the drop-in goal and with non-negotiable #3
+     — noted and NOT proposed.
