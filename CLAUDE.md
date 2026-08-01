@@ -273,12 +273,17 @@ time each one has cost.
 
 ## Working rules
 
-- **A retraction must reach the ROOT.** When the user retracts a goal or
-  constraint, grep CLAUDE.md, MEMORY.md and docs/ for every statement of it and fix
-  them all in the SAME commit. A retraction recorded only in a leaf doc is
-  re-inherited from the root file the next session reads. (Receipt: the
-  byte-identity rule needed three user corrections because STEP 2 kept mandating
-  T1==T4 while each correction landed elsewhere.)
+- **A retraction must reach EVERY copy, root and leaf.** When the user retracts a
+  goal or constraint, grep CLAUDE.md, MEMORY.md, **every file in the memory
+  directory**, and docs/ for every statement of it and fix them all in the SAME
+  sweep. Quote-and-strike beats delete: a claim that has regenerated once will
+  regenerate again unless the retraction is louder than the claim, in the same
+  place. (Receipt, and it is worse than the version this replaces: the byte-identity
+  rule needed three user corrections because each correction landed in one file
+  while another kept re-emitting it. The rule as first written said "root" and named
+  three paths — the memory LEAF files were not among them, so on 2026-08-01 the cage
+  was still sitting in `project_compression_state.md`, tagged ★★★, in a file
+  MEMORY.md advertised as live state, long after the root was clean.)
 - **Land the win first.** A change that has cleared the promotion rule outranks
   starting anything new, and an open PR holding a cleared win is item one at every
   board check. No new lever starts while a cleared win sits unmerged or a
