@@ -466,6 +466,9 @@ pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> Huffma
 // heuristic length limiter is ALREADY WITHIN 0.001% OF EXACT. There is no meaningful
 // size left in Huffman code construction, at any wall price. The ~0.01% of margin the
 // zero-headroom cells need is not here -- look at block BOUNDARIES or the parse.
+// REOPEN requires a NEW mechanism, not a faster package-merge: a 0.001% ceiling is not
+// a speed problem.
+//
 // REOPENED 2026-07-31 BY COMPOSITION (branch perf/compose-margin-and-grid). The verdict
 // above judged this candidate ALONE, against T1 wall. Both halves of that framing were
 // wrong for the T>1 board: at T4 the cost is +2.1%, not 10-14% (the per-block work
