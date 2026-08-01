@@ -2190,9 +2190,29 @@ mod l1_bakeoff {
     //!
     //! Iterating on that through the board is hopeless: a census is hours and a
     //! wall run needs a quiet box. But match quality is DETERMINISTIC — it does
-    //! not care about load, arch, or thread count — so one block through both
-    //! matchfinders answers "did that change find more matches?" in under a
+    //! not care about load, arch, or thread count — so one 256 KiB slice through
+    //! both matchfinders answers "did that change find more matches?" in under a
     //! second, on any machine, with no instrument between the code and the number.
+    //! (One SLICE, not one DEFLATE block: both arms and libdeflate split it into
+    //! ~4 blocks; `ht_fast` shares libdeflate's 65,535 B soft max, `Fast`
+    //! flushes at 65,536. The split cost ships, so it belongs in the numbers.)
+    //!
+    //! VERIFIED 2026-08-01 (local M1, by execution, not by reading):
+    //! - The `-18` frame subtraction is exact for all four rivals on all 8
+    //!   blocks: headers parsed field-by-field, FLG=0x00, single member, payload
+    //!   raw-inflates to the input. Holds for STDIN input only (see `rival_l1`).
+    //! - With `HT_MAX_LEN3_OFFSET = 0`, `ht_fast` is **BYTE-IDENTICAL** to
+    //!   `libdeflate -1`'s DEFLATE payload on 8/8 files (sha256 of stripped
+    //!   payload vs our raw output) — the port is bit-exact, not merely
+    //!   size-exact, and the two arms' block geometry is libdeflate's own.
+    //! - The ratchet FAILS when it should: the same off=0 build fired 3
+    //!   REGRESSION rows — armexe.elf `+150 vs pigz` (off=0 LOSES a worst-of-four
+    //!   cell that the libdeflate-only reading called clean), and parquet/csv at
+    //!   `+0 > allowed`, because a seeded WIN decaying to a tie is also a
+    //!   regression. The ratchet guards headroom, not just non-loss.
+    //! - Neither arm reads the `BUF_PAD` tail as data: every table row is
+    //!   compressed twice, padding filled 0x00 then 0xAA, outputs asserted
+    //!   byte-equal (`bakeoff_one`).
     //!
     //! ⚠ WHAT THIS RATCHET GUARDS. `ht_fast` is **NOT ROUTED IN PRODUCTION** —
     //! its only call site in the whole tree is this test (`grep -rn 'ht_fast::run'
@@ -2227,25 +2247,50 @@ mod l1_bakeoff {
         v
     }
 
-    /// Compress ONE block with the shipped L1 path and with `ht_fast`, and
-    /// return (fast_bytes, ht_bytes). Both get the identical padded buffer.
-    fn bakeoff_one(block: &[u8]) -> (usize, usize) {
+    /// Compress the slice with the shipped L1 path and with `ht_fast`, with the
+    /// trailing [`BUF_PAD`] bytes filled with `pad`. Returns the two payloads.
+    ///
+    /// "One slice" is NOT "one DEFLATE block": both encoders split 256 KiB into
+    /// ~4 blocks (`ht_fast` and `libdeflate -1` share the 65,535 B
+    /// `FAST_SOFT_MAX_BLOCK_LENGTH`; shipped `Fast` flushes every 65,536). The
+    /// header cost of that split is part of what ships, so it belongs in the
+    /// comparison.
+    fn compress_padded(block: &[u8], pad: u8) -> (Vec<u8>, Vec<u8>) {
         let mut buf = Vec::with_capacity(block.len() + BUF_PAD);
         buf.extend_from_slice(block);
-        buf.resize(block.len() + BUF_PAD, 0);
+        buf.resize(block.len() + BUF_PAD, pad);
         let in_end = block.len();
         let statics = StaticCodes::get();
 
         let params = crate::compress::deflate::level::params(1);
+        // Route assertion: arm (a) must be the SHIPPED L1 strategy, or the
+        // "Fast" column is measuring something that does not ship.
+        assert!(
+            matches!(params.strategy, Strategy::Fast),
+            "params(1).strategy is no longer Fast — the bakeoff's shipped arm is stale"
+        );
         let mut a = BitWriter::new();
         compress(&buf, 0, in_end, &params, true, &mut a);
-        let fast_bytes = a.finish().len();
 
         let mut b = BitWriter::new();
         ht_fast::run(&buf, 0, in_end, &params, statics, &mut b, true);
-        let ht_bytes = b.finish().len();
 
-        (fast_bytes, ht_bytes)
+        (a.finish(), b.finish())
+    }
+
+    /// Compress ONE 256 KiB slice with both arms and return
+    /// (fast_bytes, ht_bytes) — SIZES of the raw DEFLATE payloads.
+    ///
+    /// Each arm runs twice, with the padding bytes past `in_end` filled 0x00
+    /// and then 0xAA, and the outputs must be byte-identical: the pad exists
+    /// for bounds-free reads, never as input. A pad leak here would poison
+    /// every delta in the table (verified clean 2026-08-01, both arms, 8/8).
+    fn bakeoff_one(block: &[u8]) -> (usize, usize) {
+        let (fa0, ht0) = compress_padded(block, 0x00);
+        let (fa1, ht1) = compress_padded(block, 0xAA);
+        assert_eq!(fa0, fa1, "shipped L1 output depends on bytes past in_end");
+        assert_eq!(ht0, ht1, "ht_fast output depends on bytes past in_end");
+        (fa0.len(), ht0.len())
     }
 
     /// The FOUR rivals the board actually grades against, at L1.
@@ -2282,8 +2327,14 @@ mod l1_bakeoff {
 
     /// One rival's L1 output on the same bytes — the DEFLATE payload (gzip frame
     /// minus its 10-byte header and 8-byte trailer) so it is comparable to the
-    /// raw-block sizes. `None` if that rival is not on this box; the file is then
-    /// reported without it rather than inventing a reference.
+    /// raw-block sizes. `None` if that rival is not on this box.
+    ///
+    /// The flat `-18` was VERIFIED BY EXECUTION 2026-08-01 (local M1): all four
+    /// rivals, all 8 corpus blocks, headers parsed field-by-field — every one is
+    /// a single member with `FLG=0x00` (no FNAME/FEXTRA/FCOMMENT/FHCRC), and
+    /// the stripped payload raw-inflates back to the exact input. This holds
+    /// BECAUSE input arrives on stdin: give gzip/pigz/igzip a filename argument
+    /// instead and they emit FNAME, and 18 becomes wrong. Keep the pipe.
     fn rival_l1(name: &str, args: &[&str], block: &[u8]) -> Option<usize> {
         use std::io::Write;
         use std::process::{Command, Stdio};
@@ -2349,29 +2400,52 @@ mod l1_bakeoff {
             return;
         };
 
+        // PREFLIGHT, fail-closed: once the corpus is present, every rival must
+        // answer or the test FAILS — it may not silently grade against a subset.
+        // A missing binding rival (libdeflate on 7 of 8 files) would turn every
+        // row into a phantom win and invite pasting bogus tightened allowances.
+        // Receipt: the shipped size census once measured three rivals and said
+        // nothing about the fourth; this file's own first seed repeated the
+        // mistake with ONE.
+        let absent: Vec<&str> = RIVALS
+            .iter()
+            .filter(|(name, args)| rival_l1(name, args, b"rival preflight").is_none())
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            absent.is_empty(),
+            "l1_bakeoff: rival(s) missing: {absent:?}. The ratchet grades the WORST \
+             of all four; with one absent it measures a different, easier goal. \
+             igzip lives at vendor/isa-l/build/igzip (cd vendor/isa-l && make -f \
+             Makefile.unx prog); the rest come from the package manager.",
+        );
+
         println!();
         println!("L1 RATCHET — first {BLOCK} bytes, ALL FOUR RIVALS, deterministic");
         println!("  corpus: {}", root.display());
+        println!("  (columns d-*: ht_fast payload minus that rival's DEFLATE payload, bytes)");
         println!();
         println!(
-            "  {:<16} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
-            "file", "ht_fast", "libdefl", "gzip", "pigz", "igzip", "WORST", "allowed"
+            "  {:<16} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
+            "file", "Fast", "ht_fast", "d-libdefl", "d-gzip", "d-pigz", "d-igzip", "WORST", "allowed"
         );
 
         let mut regressions: Vec<String> = vec![];
         let mut improvements: Vec<String> = vec![];
-        let mut measured = 0usize;
+        let mut unmeasured: Vec<String> = vec![];
         let (mut wins, mut ties, mut losses) = (0usize, 0usize, 0usize);
 
         for (f, allowed) in RATCHET {
             let Ok(data) = std::fs::read(root.join(f)) else {
+                unmeasured.push(format!("{f}: missing from {}", root.display()));
                 continue;
             };
             if data.len() < BLOCK {
+                unmeasured.push(format!("{f}: only {} bytes, need {BLOCK}", data.len()));
                 continue;
             }
             let block = &data[..BLOCK];
-            let (_fa, ht) = bakeoff_one(block);
+            let (fa, ht) = bakeoff_one(block);
 
             let mut cells: Vec<String> = vec![];
             let mut worst: Option<i64> = None;
@@ -2386,11 +2460,13 @@ mod l1_bakeoff {
                             worst_name = name;
                         }
                     }
-                    None => cells.push(format!("{:>9}", "-")),
+                    None => {
+                        unmeasured.push(format!("{f}: rival {name} vanished mid-run"));
+                        cells.push(format!("{:>9}", "-"));
+                    }
                 }
             }
             let Some(w) = worst else { continue };
-            measured += 1;
             match w.cmp(&0) {
                 std::cmp::Ordering::Less => wins += 1,
                 std::cmp::Ordering::Equal => ties += 1,
@@ -2408,16 +2484,20 @@ mod l1_bakeoff {
                 ""
             };
             println!(
-                "  {f:<16} {ht:>9} {} {w:>+9} {allowed:>+8}{mark}",
+                "  {f:<16} {fa:>9} {ht:>9} {} {w:>+9} {allowed:>+8}{mark}",
                 cells.join(" ")
             );
-            println!("L1SWEEP file={f} ht={ht} worst={w} worst_rival={worst_name}");
+            println!("L1SWEEP file={f} fast={fa} ht={ht} worst={w} worst_rival={worst_name}");
         }
 
-        if measured == 0 {
-            eprintln!("l1_bakeoff: nothing measurable — SKIPPED");
-            return;
-        }
+        assert!(
+            unmeasured.is_empty(),
+            "l1_bakeoff: corpus at {} is present but {} row(s) could not be \
+             measured — a partial table must not pass as a full one:\n  {}",
+            root.display(),
+            unmeasured.len(),
+            unmeasured.join("\n  ")
+        );
         println!();
         println!("  ACROSS ALL FOUR RIVALS: {wins} win, {ties} tie, {losses} LOSE");
         println!("L1SWEEP TOTAL win={wins} tie={ties} lose={losses}");

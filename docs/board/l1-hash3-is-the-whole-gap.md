@@ -24,8 +24,12 @@ parquet, minified JS, an ELF binary and a wasm module. `ht_fast` minus hash3 IS
 libdeflate's `deflate_compress_fastest` + `ht_matchfinder`. The transliteration
 is exact, and this is the cleanest confirmation of that we have ever had.
 
-(Size-identical, not proven byte-identical — that needs a sha compare. But eight
-files of eight types agreeing to the byte count is not coincidence.)
+~~(Size-identical, not proven byte-identical — that needs a sha compare. But eight
+files of eight types agreeing to the byte count is not coincidence.)~~
+**UPGRADED 2026-08-01: proven BYTE-IDENTICAL, 8/8.** sha256 of our raw `ht_fast`
+output at `HT_MAX_LEN3_OFFSET = 0` equals sha256 of libdeflate's DEFLATE payload
+(gzip frame stripped by parsed header, not by assuming 18) on every file. Bit-exact,
+so the block geometry (65,535 B soft max, 8,192-seq cap) is libdeflate's own too.
 
 ## So hash3's effect is measurable against an EXACT baseline
 
@@ -196,3 +200,20 @@ Extend `l1_bakeoff` to all four rivals and re-read every table above. Until then
 - **The offset recommendation does NOT stand.** "256 dominates 4096" and
   "off=0 has zero losses" are both one-rival readings, and the one rival they
   omit is where the prior attempt actually died.
+
+### DONE 2026-08-01 — the four-rival re-read, measured
+
+`l1_bakeoff` now grades the WORST of gzip/pigz/libdeflate/igzip, fails closed if
+any rival is absent, and the prediction above is confirmed BY EXECUTION:
+
+- **"off=0 has zero losses" is REFUTED.** At `HT_MAX_LEN3_OFFSET = 0` we tie
+  libdeflate on all 8 (byte-identical) but **LOSE `armexe.elf` to pigz by
+  +150 B** — worst-of-four: 0 win, 7 tie, **1 lose**. The clean off=0 column was
+  exactly the one-rival artifact §2 predicted.
+- **off=4096 (shipped constant) on worst-of-four: 3 win, 0 tie, 5 lose** —
+  libdeflate binds on 7 of 8; armexe.elf's binding rival is pigz (−3863, tighter
+  than libdeflate's −4013).
+- **off=256 on worst-of-four: win 4, tie 1, lose 3** (inferred by pairing this
+  file's off=256 deltas with the measured rival payloads, not from a fresh
+  build): armexe.elf stays a win vs pigz at −2027. The keeps-55%/sheds-89%
+  arithmetic checks out. Still one box, 256 KiB slices, SIZE only.
