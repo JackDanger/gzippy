@@ -1,0 +1,47 @@
+rows=186  OK=171  LOSE(ratio>1.0)=12
+
+=== LOSING cells by rival x thread ===
+  gzip         T01    0 LOSE of  34 graded
+  gzip         T04    0 LOSE of  31 graded
+  igzip        T01    0 LOSE of   8 graded
+  libdeflate   T01   12 LOSE of  26 graded
+  libdeflate   T04    0 LOSE of  24 graded
+  pigz         T01    0 LOSE of  25 graded
+  pigz         T04    0 LOSE of  23 graded
+
+=== LOSING cells by level ===
+  L01    2 of  23
+  L02    3 of  21
+  L03    3 of  21
+  L04    1 of  16
+  L05    3 of  20
+  L06    0 of  17
+  L07    0 of  20
+  L08    0 of  16
+  L09    0 of  17
+
+=== LOSING cells by file ===
+  dickens              4 of  50
+  aozora.txt           4 of  55
+  data.json            4 of  52
+  data.csv             0 of  14
+
+=== every LOSING cell, worst first ===
+  libdeflate   dickens            L03 T01  1.2393
+  libdeflate   aozora.txt         L03 T01  1.1948
+  libdeflate   data.json          L03 T01  1.1422
+  libdeflate   aozora.txt         L01 T01  1.0585
+  libdeflate   data.json          L05 T01  1.0466
+  libdeflate   data.json          L02 T01  1.0455
+  libdeflate   dickens            L01 T01  1.0453
+  libdeflate   aozora.txt         L02 T01  1.0404
+  libdeflate   data.json          L04 T01  1.0298
+  libdeflate   dickens            L02 T01  1.0231
+  libdeflate   dickens            L05 T01  1.0175
+  libdeflate   aozora.txt         L05 T01  1.0148
+
+=== files fully graded so far ===
+  dickens             57 rows
+  aozora.txt          57 rows
+  data.json           57 rows
+  data.csv            15 rows
