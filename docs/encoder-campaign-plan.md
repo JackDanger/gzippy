@@ -1935,3 +1935,36 @@ come first."*
 
 Coordinate: L6, T1, movie.mp4 (TUNE), origin/main, trainer, both arms symbolised,
 fulcrum with the repaired parser. Top-8 lines per arm — a locate, not a budget.
+
+### The 8 hc.rs falsifications cover the WALK; the measured cost is the PROLOGUE
+
+`make falsified Q=hc` lists eight binding records in `matchfinder/hc.rs`, at lines 227,
+398, 455, 557, 597, 664, 681 and 831. **Every one is inside the chain-walk loop** —
+`#[inline(never)]`, de-pipelining a hoist, the `chain_base` hoist, an addressing-mode
+fix, hand-hoisting current-position operands, hoisting the wrap test out of the loop.
+
+The hot lines measured at the failing coordinate are **`hc.rs:304` (51.3M) and
+`hc.rs:388` (40.5M)** — the per-position PROLOGUE, before any chain walking, and both
+BELOW the first record at :398. On these files the walk barely executes at all (0.32
+candidates per position at declared depth 600). So the heavily-falsified region and the
+expensive region are DIFFERENT CODE, and no record covers the prologue.
+
+⚠ **But line attribution here is weak evidence, and it must not be treated as a pin.**
+`[profile.release]` is `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`. Under whole-
+program inlining, callgrind attributes an instruction to wherever the optimiser recorded
+it, which need not be the statement that "owns" the work. `hc.rs:304` is
+`let mut cur_pos = in_next - *in_base;` — one subtraction, credited 4 Ir per position.
+That is not a subtraction's cost; it is a bucket for surrounding inlined work.
+
+So the honest statement is: **the excess is in the per-position prologue REGION, which
+carries no falsification** — not "line 304 is slow". Pinning it further needs
+instruction-level attribution (`--dump-instr=yes`) or a targeted ablation, and the
+FALSIFY family above says the thing NOT to do is guess at a statement and hand-hoist it:
+that is 3-for-3 against, and hard stop #4 exists because hoisting "obviously redundant"
+loads drove Dr UP when LLVM had already hoisted them.
+
+`fulcrum candidates` orders this class explicitly: *"Our register-pressure findings
+(structure-comparison §4) are exactly the problem asm solves; Rust-side alternatives
+(fewer live locals, monomorphized loops) come first."* Neither Rust-side alternative
+appears in the eight records — both are about the WALK — so both remain open, on the
+prologue, with the attribution caveat above governing how they are aimed.
