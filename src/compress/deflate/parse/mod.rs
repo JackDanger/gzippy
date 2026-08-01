@@ -640,20 +640,29 @@ pub(super) fn compress(
         //     one real figure was `matchfinder::ht`'s 2.07x, and both of ITS arms are
         //     ours too. No comparison against libdeflate had ever been run.
         //   * Measured 2026-08-01 (cachegrind, 6 MB data.csv, L1, -p1, libdeflate built
-        //     with -g): ours 196,854,205 Ir vs libdeflate 146,098,195 = **1.35x**, of
-        //     which 46.5M of the 52.4M excess (89%) is inside the matchfinder.
-        //   * "a closed search" does not follow. At `HT_MAX_LEN3_OFFSET = 0` our payload
-        //     is BYTE-IDENTICAL to libdeflate's (sha256 `62a4e450aca4b522`, full 6 MB
-        //     multi-block file). Identical bytes means identical parse decisions, so
-        //     that 46.5M is the same work priced 1.60x higher — an implementation gap
-        //     with a vendor reference implementation to diff against, which is this
-        //     project's 3-for-3 method, not its 0-for-3 one.
+        //     with -g): ours 196,854,205 Ir vs libdeflate 146,098,195.
+        //   * At `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to libdeflate's
+        //     (sha256 `62a4e450aca4b522`, full 6 MB multi-block file) and insert counts
+        //     match exactly (5,507,374 both sides), so the parse is identical.
         //
-        // The two FALSIFY notes above still STAND on their own terms: attempt 1 opened
-        // 7 cells on size, attempt 2 failed clauses 5 and 6 on the wall. Nothing here
-        // re-tries either. What is retracted is only the claim that the wall cost is
-        // intrinsic to this shape — no measurement ever supported that, and the vendor
-        // runs this same algorithm, emitting these same bytes, for 1.35x less.
+        // ⚠ AND THE CONCLUSION DRAWN FROM THAT, THE SAME DAY, WAS WRONG. This comment
+        // briefly said the excess "is the same work priced 1.60x higher — an
+        // implementation gap with a vendor reference implementation to diff against".
+        // An output-preserving ablation (off=0, hash3 MAINTENANCE removed, so the bytes
+        // cannot move) measured 143,777,158 Ir against libdeflate's 146,098,195:
+        // **our port is 1.6% FASTER than the vendor's C, and the whole 52.4M excess is
+        // the length-3 table at 54,690,301 Ir.** There is no implementation gap to
+        // close. See `matchfinder::ht` for the full table and for why off=0 is NOT
+        // "hash3 off" — it disables acceptance, not maintenance, which is exactly the
+        // misreading that produced the retracted claim.
+        //
+        // So BOTH FALSIFY notes above stand, and the wall verdict now stands on a
+        // vendor measurement rather than on an inference: `main` (`parse::fast`) runs
+        // data.csv L1 T1 in 176.4 ms against libdeflate's 176.2 ms — ALREADY PARITY —
+        // while this finder, even with the length-3 table ablated entirely, takes
+        // 209.6 ms. Routing it turns a passing wall cell into a ~1.19x failure, and
+        // clause 3 is absolute. The deficit is 2.36x LLC misses, not instructions
+        // (elasticity ~0.22), and it lives in the buffering path that BOTH arms share.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,

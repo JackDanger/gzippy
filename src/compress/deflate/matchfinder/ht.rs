@@ -90,28 +90,71 @@
 //! It has now been. Cachegrind, the SAME 6,000,000 B of data.csv, L1, `-p1` (see the
 //! thread trap below), trainer/Intel, `libdeflate-gzip` built with `-g`:
 //!
-//! | arm | total Ir | matchfinder | output |
-//! |---|---|---|---|
-//! | this finder, `HT_MAX_LEN3_OFFSET = 4096` | 196,854,205 | 123.43M (62.7%) | 881,712 |
-//! | this finder, `HT_MAX_LEN3_OFFSET = 0` | 198,467,459 | 123.57M (62.3%) | 881,550 |
-//! | **libdeflate `-1`** | **146,098,195** | **77.02M (52.7%)** | **881,550** |
+//! | arm | total Ir | output |
+//! |---|---|---|
+//! | this finder, `HT_MAX_LEN3_OFFSET = 4096` | 196,854,205 | 881,712 |
+//! | this finder, `HT_MAX_LEN3_OFFSET = 0` | 198,467,459 | 881,550 |
+//! | **this finder, off=0 AND hash3 MAINTENANCE ablated** | **143,777,158** | **881,550** |
+//! | **libdeflate `-1`** | **146,098,195** | **881,550** |
 //!
-//! Ours = `ht.rs` + `common.rs`; theirs = `ht_matchfinder.h`, which inlines both.
+//! **THERE IS NO IMPLEMENTATION GAP. Our faithful `ht_matchfinder` port executes 1.6%
+//! FEWER instructions than the vendor's C, on byte-identical output.** The entire
+//! excess is one feature: the length-3 table costs **54,690,301 Ir, 104% of the whole
+//! 52.4M difference**. `lz_hash` costs 2.0 Ir/call on BOTH sides (libdeflate
+//! 11,999,974 Ir / 5,999,987 calls; ours 24.38M / 11,999,974 calls) — we simply call
+//! it twice per position, once for the 4-byte key and once for the 3-byte key.
 //!
-//! Three things this establishes, none of which the table above could:
+//! ⚠ THE ABLATION IS THE ONLY VALID WAY TO PRICE THIS TABLE, and the reason is the
+//! trap that produced a false record here on 2026-08-01 (retracted below):
+//! `HT_MAX_LEN3_OFFSET = 0` disables length-3 ACCEPTANCE, not MAINTENANCE. At off=0
+//! the second `lz_hash`, the load, the store and the extra 64 KiB rebase per window
+//! slide are all still paid, for a table that is never read. Only removing the
+//! maintenance prices the feature, and doing it AT off=0 keeps the output identical
+//! by construction, so the ablation cannot change what is being compared.
 //!
-//! 1. **The gap against the vendor is 1.35x total and 1.60x in the matchfinder** —
-//!    and 89% of the whole excess (46.5M of 52.4M) is inside the matchfinder.
-//!    "Spread evenly, therefore intrinsic" was the falsifier; it is not spread.
-//! 2. **At `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to libdeflate's**
-//!    — sha256 `62a4e450aca4b522` both sides, on the full 6 MB multi-block file, not
-//!    just a single 256 KiB block. Identical bytes means identical parse decisions,
-//!    so that 46.5M is not a different algorithm and not a different amount of
-//!    matching work. It is the same work, costing us 1.60x.
-//! 3. **The length-3 table is not the tax.** Turning it off made us 1.6M
-//!    instructions SLOWER (198.47M vs 196.85M), because the matches it finds skip
-//!    matchfinder work that then has to be done position-by-position. Any future
-//!    note blaming hash3 for the L1 wall must beat this measurement first.
+//! ⚠ RETRACTED, same day, by the ablation above: this note previously said "**The
+//! length-3 table is not the tax.** Turning it off made us 1.6M instructions SLOWER
+//! (198.47M vs 196.85M) ... Any future note blaming hash3 for the L1 wall must beat
+//! this measurement first." That is FALSE, and it is false for a nameable reason
+//! rather than by bad luck: off=0 was read as "hash3 off" when it only means "hash3
+//! unused". The 1.6M is real but it measures the cost of length-3 matches NOT BEING
+//! TAKEN while still being maintained; it says nothing about the table's cost. The
+//! table's cost is 54.69M.
+//!
+//! It also previously claimed the gap was "1.35x total and 1.60x in the matchfinder,
+//! 89% of it inside the matchfinder". The 1.60x was not apples-to-apples: libdeflate's
+//! matchfinder is `ht_matchfinder.h` 77.02M PLUS `matchfinder_common.h` 18.87M,
+//! `common_defs.h` 2.81M, `x86/matchfinder_impl.h` 2.64M and `emmintrin.h` 3.00M =
+//! 104.34M, against our 151.17M across `ht.rs`, `common.rs`, `uint_macros.rs`,
+//! `ptr/mod.rs`, `sse.rs` and `slice/iter/macros.rs`. Like for like that is 1.45x,
+//! and the ablation shows even that is the feature and not the implementation.
+//!
+//! What DOES survive: at `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to
+//! libdeflate's — sha256 `62a4e450aca4b522`, full 6 MB multi-block file. Insert counts
+//! match exactly (5,507,374 both sides), confirming an identical parse. That is why
+//! the ablation is sound, and it is the one claim here that was never in doubt.
+//!
+//! # THE WALL IS NOT THE INSTRUCTIONS — it is LLC traffic, and `main` already wins
+//!
+//! `perf stat`, FULL data.csv (26,500,039 B), `taskset -c 2`, L1 T1:
+//!
+//! | arm | Ir | cycles | IPC | LLC miss | wall |
+//! |---|---|---|---|---|---|
+//! | this finder, ablated (byte-identical to libdeflate) | 678.1M | 287.2M | 2.36 | **1.366M** | 209.6 ms |
+//! | `main` (`parse::fast`) | 444.6M | 242.4M | 1.83 | 1.346M | **176.4 ms** |
+//! | libdeflate `-1` | 657.4M | 242.1M | 2.71 | **0.579M** | 176.2 ms |
+//!
+//! At 1.032x libdeflate's instructions we take 1.186x their cycles, on 2.36x their LLC
+//! misses. **`main` is ALREADY at wall parity with libdeflate on this cell**, so routing
+//! this finder converts a PASSING wall cell into a ~1.19-1.29x failure — clause 3 is
+//! absolute, and closing every instruction named above still leaves ~213 ms against
+//! `main`'s 177 ms. Instruction elasticity here is ~0.22, not 1: adding the 53M hash3
+//! instructions RAISED IPC to 2.89 and cost only 8% wall.
+//!
+//! The excess LLC misses scale linearly with input (~2 extra input-sized passes:
+//! armexe 3.35, data.csv 1.94, tool.bin 2.15 excess bytes per input byte) and `main`
+//! carries the SAME fixed excess. So the L1 wall deficit lives in the buffering/IO
+//! path that both arms share — not in the matchfinder, and not in this finder.
 //!
 //! ⚠ THREAD TRAP: `gzippy -1 -c FILE` with no `-p` uses `num_cpus`. On the 16-core
 //! trainer that silently measures T16. Both arms above are `-p1`; the T16 output on
