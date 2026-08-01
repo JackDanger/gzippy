@@ -1379,9 +1379,31 @@ multiple:
   #227 (x4)    64   140   400   1200   2400
 ```
 
-So #227's x4 straddles zlib's shape but under-searches at L6/L9 and over-searches at
-L5/L7. Moving T>1 depths from "x4" toward zlib's measured per-level values is the
-follow-on, worth ~28 cells beyond #227 on SIZE.
+⚠ **CORRECTED — the "~28 cells beyond #227" claim first written here is WRONG, and
+backwards.** Read the table again: zlib is SHALLOWER than x4 at L5, L6, L7 and L8, and
+deeper only at L9. And #227's gate runs `--levels 2,6,9` while the zlib census covers
+L1-L9, so 70-vs-42 was never apples-to-apples. Restricted to the comparable coordinate:
+
+```
+  ALL levels, ALL threads                  closed 84  opened 13  net +71
+  ALL levels, T4 only                      closed 70  opened  1  net +69
+  L2/L6/L9 only                            closed 31  opened  5  net +26
+  L2/L6/L9, T4 only  <-- #227's coordinate closed 25  opened  0  net +25
+```
+
+**zlib's depths close 25 where #227 closes 42.** #227's configuration is BETTER at the
+levels it gates — exactly what the shallower-at-L5-L8 table predicts. There is no
+"+28 cells" to collect by switching to zlib's numbers.
+
+**THE REAL FINDING IS WHERE THE OTHER CLOSURES LIVE.** The 70 T4 closures split by
+level as `L5:18  L6:16  L7:17  L8:10  L9:9`. **45 of the 70 are at L5, L7 and L8 —
+levels the standard gate never measures.** `--levels 2,6,9` samples 3 of the 9 levels
+that carry failures, while `params_parallel` applies at EVERY level. So **#227's "42
+cells closed" is a FLOOR on its board effect, not a measurement of it**, and the same
+undercount applies to every lever ever graded at L2/L6/L9.
+
+ACTION when #227's gate returns: re-measure the FULL board across all levels rather
+than quoting 42.
 
 ### WHAT IS NOT ESTABLISHED — the wall, and it is the binding constraint
 
