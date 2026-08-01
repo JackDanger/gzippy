@@ -175,7 +175,19 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // x4 is the shipped factor. Wall on sil40, T4, vs BOTH rivals that matter (libdeflate is
     // single-threaded; pigz is not): L2 2.73x/1.39x, L6 2.53x/2.18x, L9 2.15x/1.62x faster.
     // Even at L9, where this walks 2,400 chain nodes, we stay ahead of both.
-    p.max_search_depth = p.max_search_depth.saturating_mul(4);
+    // MEASUREMENT ABLATION (branch measure/zlib-depths-parallel, NEVER MERGE):
+    // zlib-ng's actual per-level chain depths instead of the uniform x4, to price the
+    // ~28 extra SIZE cells the census diff attributes to zlib's shape (70 vs 42 at T4).
+    //   level   L5   L6   L7    L8    L9      (ours 16/35/100/300/600)
+    //   zlib    32  128  256  1024  4096
+    p.max_search_depth = match level {
+        5 => 32,
+        6 => 128,
+        7 => 256,
+        8 => 1024,
+        9 => 4096,
+        _ => p.max_search_depth.saturating_mul(4),
+    };
     // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
     // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
