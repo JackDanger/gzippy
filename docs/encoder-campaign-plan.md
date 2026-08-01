@@ -1035,3 +1035,51 @@ ablation's own measured 81,416 B gap closure almost exactly. The tell was that t
 result was implausibly good, and the disconfirmation was structural: the ONLY
 arch-divergent code in the L1 path is `prefetch_write` (`matchfinder/common.rs:144`),
 a pure hint that cannot change output bytes. Verify the BINARY, not the checkout.
+
+### FALSIFIED: no single length-3 distance threshold closes L1. The text LOSS and the binary WIN are the SAME bytes.
+
+Hypothesis (mine, from the ablation above): the length-3 matches that cost bytes on
+text are the FAR ones, so one global `HT_MAX_LEN3_OFFSET` should drop those while
+keeping the near ones that pay on binaries. **Measured and false.**
+
+Sweep on `measure/l1-htfast-ablation` (L1 routed to `ht_fast`), local arm64, vanilla
+release, L1, TUNE members only. Ratios vs `libdeflate-gzip -1` (<= 1.0 PASSES; the
+libdeflate references were verified equal to the board census on all five files):
+
+```
+  thresh    dickens   aozora.txt   data.csv   armexe.elf   symbols.dwarf
+   4096     1.00484    1.00568     1.00055     0.96437       0.98883
+   1024     1.00292    1.00426     0.99875     0.96962       0.98814
+    256     1.00181    1.00271     0.99847     0.97775       0.98861
+     64     1.00100    1.00142     0.99884     0.98690       0.99041
+      0     1.00016    1.00014     1.00002     0.99952       0.99988
+```
+
+**Text improves monotonically as the gate tightens and NEVER crosses 1.0** — 1.00484
+-> 1.00016 on dickens, still failing at full length-3 shutoff. **And the binary win
+collapses in lockstep**: armexe.elf 0.96437 -> 0.99952, a 3.6% win reduced to 0.05%.
+At threshold 0 all five files converge to ~1.0000: we simply become libdeflate, which
+is attempt 1's result reached from the other direction.
+
+**THE STRUCTURAL FACT: the text loss and the binary win are the SAME BYTES.** Both are
+length-3 matches at distance <= 4096. There is no distance at which one is present and
+the other is not, so no single global constant separates them. This is not a tuning
+failure; it is the shape of the problem.
+
+That is exactly why a CONTENT GATE was written here
+(`L1_HASH3_GATE_LIT_THRESHOLD_PCT = 48`, `parse/fast.rs:945`) — it is the only device
+that separates these two populations, and `CLAUDE.md` non-negotiable #3 forbids it AND
+orders it deleted. So this class is genuinely hard rather than merely unattempted: the
+one mechanism that resolves the tradeoff is banned, on purpose.
+
+What the sweep DOES establish, and is worth keeping:
+  * `HT_MAX_LEN3_OFFSET = 256` passes 3 of these 5 cells against 4096's 2 (data.csv
+    1.00055 -> 0.99847 crosses), so the inherited 4096 is not the best constant for
+    this path even though no constant closes the class.
+  * The length>=4 candidates that `head3` surfaces contribute almost nothing: at
+    threshold 0, where only length-EXACTLY-3 is rejected, every file sits within
+    0.02% of libdeflate.
+
+NOT a wall claim, and NOT a promotion proposal: the `ht_fast` routing this sweep runs
+on is already NO-SHIP twice (clause 3 on binaries; clause 5/6 on the wall at T1).
+Scope L1, five TUNE files, one arch.
