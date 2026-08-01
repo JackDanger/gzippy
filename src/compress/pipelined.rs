@@ -264,6 +264,18 @@ pub struct PipelinedGzEncoder {
     compression_level: u32,
     num_threads: usize,
     header_info: GzipHeaderInfo,
+    /// User's `-b`/`--blocksize`, present ONLY when they actually passed it.
+    ///
+    /// `-b` was advertised in `--help`, parsed in three spellings and range-checked in
+    /// `cli.rs`, and then read by nothing: the grid came from [`pipelined_block_size`],
+    /// whose parameters never included the user's value. Measured before the fix: `-b`
+    /// 1024 / 65536 / 1048576 / 8388608 on the same input all produced the IDENTICAL
+    /// output sha256, across an 8192x range, while `pigz -b 32` vs `-b 1024` differ by
+    /// 13,249 bytes. pigz's CLI is the contract (CLAUDE.md non-negotiable #4).
+    ///
+    /// `None` MUST keep the computed grid: `block_size` carries a 128 KiB default, so
+    /// honouring it unconditionally would silently change every existing T>1 output.
+    block_size_override: Option<usize>,
 }
 
 impl PipelinedGzEncoder {
@@ -272,7 +284,20 @@ impl PipelinedGzEncoder {
             compression_level,
             num_threads,
             header_info: GzipHeaderInfo::default(),
+            block_size_override: None,
         }
+    }
+
+    /// Honour the user's `-b`. Pass `None` (the default) to keep the computed grid.
+    pub fn set_block_size_override(&mut self, block_size: Option<usize>) {
+        self.block_size_override = block_size;
+    }
+
+    /// The chunk grid: the user's `-b` when they gave one, else [`pipelined_block_size`].
+    #[inline]
+    fn grid_block_size(&self, input_len: usize, num_threads: usize, level: u32) -> usize {
+        self.block_size_override
+            .unwrap_or_else(|| pipelined_block_size(input_len, num_threads, level))
     }
 
     pub fn set_header_info(&mut self, info: GzipHeaderInfo) {
@@ -492,7 +517,7 @@ impl PipelinedGzEncoder {
     ) -> io::Result<()> {
         let level = adjust_compression_level(self.compression_level);
         let data_len = data.len();
-        let block_size = pipelined_block_size(data_len, self.num_threads, level);
+        let block_size = self.grid_block_size(data_len, self.num_threads, level);
         let num_blocks = data_len.div_ceil(block_size);
 
         // Write gzip header before spawning threads
@@ -584,7 +609,7 @@ impl PipelinedGzEncoder {
         // the zlib-ng L1→L2 remap that `adjust_compression_level` applies.
         let level = self.compression_level;
         let data_len = data.len();
-        let block_size = pipelined_block_size(data_len, self.num_threads, level);
+        let block_size = self.grid_block_size(data_len, self.num_threads, level);
         let num_blocks = data_len.div_ceil(block_size);
 
         // Write gzip header before spawning threads (identical to the flate2 path).
@@ -669,7 +694,7 @@ impl PipelinedGzEncoder {
         writer.write_all(&header)?;
 
         let mut compress = Compress::new(Compression::new(level), false);
-        let block_size = pipelined_block_size(data.len(), 1, level);
+        let block_size = self.grid_block_size(data.len(), 1, level);
         let mut output_buf = vec![0u8; block_size * 2];
         let mut crc_hasher = Hasher::new();
 
