@@ -55,6 +55,13 @@ for V in "${@:-0 512 1024 2048 4096 8192 32768}"; do
   # So the test now emits ONE machine-readable line per file and one TOTAL line,
   # prefixed `L1SWEEP`, and this loop greps only that. If the prefix is missing
   # the value is reported as MISSING rather than silently mis-parsed.
+  # A RATCHET FAILURE HERE IS EXPECTED AND CORRECT. The ratchet asserts that no
+  # file got worse than its recorded allowance, and a sweep deliberately moves
+  # the implementation off its recorded point — so every value except the
+  # committed one will trip it. That is the ratchet working, not the sweep
+  # breaking. We read stdout regardless: the L1SWEEP lines are printed BEFORE
+  # the assert, and `--nocapture` streams them, so a failing run still yields
+  # its numbers. Exit status is deliberately ignored for this reason.
   OUT=$(cargo test --release l1_bakeoff -- --nocapture 2>/dev/null | grep '^L1SWEEP')
   if [ -z "$OUT" ]; then
     echo "len3_off=$V MISSING (no L1SWEEP lines — did the test emit them?)"
