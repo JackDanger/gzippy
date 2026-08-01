@@ -138,6 +138,12 @@ lever:
 	@test -n "$(REF)" || { echo "usage: make lever REF=<git-ref> [ARGS=--size-only]" >&2; exit 2; }
 	@scripts/campaign/lever.sh "$(REF)" $(ARGS)
 
+# What has already been tried and refuted — run this BEFORE proposing anything.
+#   make falsified            every record, one line each
+#   make falsified Q=huffman  only records matching a file path or text
+falsified:
+	@python3 scripts/campaign/falsified-index.py $(Q)
+
 # =============================================================================
 # Quick test suite — deterministic, layered, <30 seconds.
 # Replaces wall-clock benchmarks with proxies that fail specifically:

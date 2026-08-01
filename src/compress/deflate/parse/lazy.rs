@@ -121,9 +121,7 @@ pub(super) fn run_resumable(
                 in_end,
                 params,
                 lazy2,
-                &mut state.mf,
-                &mut state.in_base,
-                &mut state.next_hashes,
+                state,
                 &mut sink,
             )
         });
@@ -160,11 +158,23 @@ pub(super) fn run_block(
     in_end: usize,
     params: &LevelParams,
     lazy2: bool,
-    mf: &mut HcMatchfinder,
-    in_base: &mut usize,
-    next_hashes: &mut [u32; 2],
+    // ONE state root, not three. `ParseState` already owns the matchfinder, `in_base`
+    // and `next_hashes`; the caller used to split it back into three separate `&mut`
+    // borrows here, so after `#[inline(always)]` fusion LLVM saw three independent
+    // pointer roots it had to keep live across the whole token loop. libdeflate's
+    // equivalent is one `struct libdeflate_compressor *c` at a fixed displacement.
+    // Output is IDENTICAL by construction — this is pure code motion.
+    state: &mut ParseState,
     sink: &mut Sink,
 ) -> usize {
+    let ParseState {
+        mf,
+        in_base,
+        next_hashes,
+    } = state;
+    let mf: &mut HcMatchfinder = mf;
+    let in_base: &mut usize = in_base;
+    let next_hashes: &mut [u32; 2] = next_hashes;
     let depth = params.max_search_depth;
     let mut max_len = DEFLATE_MAX_MATCH_LEN;
     let mut nice_len = params.nice_match_length.min(max_len);

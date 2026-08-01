@@ -128,14 +128,16 @@ const CHUNKS_PER_THREAD: usize = 2;
 /// seam restarts the coder, and the wall board shows we beat libdeflate 2-3x at T4, so
 /// there is headroom to spend on fewer, larger chunks.
 fn chunks_per_thread() -> usize {
-    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *C.get_or_init(|| {
-        std::env::var("PROBE_CPT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v >= 1)
-            .unwrap_or(CHUNKS_PER_THREAD)
-    })
+    // NO ENV READ HERE. `CLAUDE.md` non-negotiable #3: "No env var changes behaviour."
+    // This function used to consult `PROBE_CPT`, UNGATED, in the shipped T>1 path — not
+    // behind a Cargo feature like `l1-tune`/`ladder-tune`, so it was live in every
+    // release build. Proven by execution on dickens L6 T4 before removal:
+    //     unset        sha dbb4533555a560d5   4,539,878 B
+    //     PROBE_CPT=1  sha 4e65fced798c7026   4,539,726 B
+    //     PROBE_CPT=8  sha 6cba9acc3d8fc88b   4,541,013 B
+    // Three different outputs from the same binary and input. The chunk grid decides
+    // seam placement, so the variable moved real bytes.
+    CHUNKS_PER_THREAD
 }
 
 /// Ceiling on the thread-aware chunk size. Chunks are buffered in flight, so this is an

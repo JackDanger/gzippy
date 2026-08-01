@@ -939,10 +939,20 @@ wall is the binding constraint.
 
 ### The waste is named, and it is not "too many chunks"
 
-`CLAUDE.md` STEP 2 sanctions "making seams SMALLER — pad choice, chunk grid, block
-splitting", and G5 already states the mechanism: **every seam costs a sync-flush AND a
-block-grid restart AND a fresh Huffman histogram. The first is 5 bytes; the other two are the
-expensive ones.**
+G5 states the mechanism: **every seam costs a sync-flush AND a block-grid restart AND a
+fresh Huffman histogram. The first is 5 bytes; the other two are the expensive ones.**
+
+**But shrinking that cost cannot close the class — RETRACTED 2026-08-01.** This section
+used to cite `CLAUDE.md` STEP 2's "making seams SMALLER — pad choice, chunk grid, block
+splitting" as the sanctioned route. STEP 2 no longer says that, because the census says
+it is false: of the libdeflate cells that fail only at T4, **all 109 tie libdeflate
+byte-for-byte at T1 (headroom min=0, median=0, max=0)**. The class has zero partial
+credit — cutting the seam tax by 90% closes 0 of 109; only cutting it to exactly 0 closes
+any. The route is a **monotone T1 size win that buys headroom**, not a smaller seam.
+See `CLAUDE.md` STEP 2 for the full table, and G15/G16 below — which recorded the same
+zero-headroom fact first, and then closed Huffman CONSTRUCTION as the source of that
+headroom (~0.001% available against ~0.01% needed). Block boundaries and the parse are
+what remain.
 
 Halving the chunk count (`CHUNKS_PER_THREAD` 2 -> 1) is only a PARAMETER against that waste.
 Measured at L8-L9 over 264 common cells: **8 closed, 3 opened** (net -5, still a clause-3
@@ -2059,3 +2069,230 @@ sized against 0.02%-0.93% AND run through `scripts/campaign/tie-guard.sh` before
 Note the two cheapest cells — photo.jpg L2 (0.045%) and weights.safetensors L9 (0.021%) — are a
 different, much lower bar than the 0.3-0.9% cluster, and may be reachable by something the
 larger cells are not.
+## G35 — the DROP-IN axis was never measured, and it is GREEN against the contract
+
+`fulcrum dropin` describes itself as "the missing half of the goal scoreboard: level x rival x
+corpus x threads can go 100% green while a real invocation like `gzip file` silently behaves
+differently." The 200-cell board measures SIZE and WALL only. The goal is "same commands, same
+observable behaviour" — and that half had never been run this campaign.
+
+It is also the tool that would have caught the `-b/--blocksize` no-op systematically instead of
+by accident.
+
+RUN: `fulcrum dropin --ours target/release/gzippy --rival gzip=gzip --rival pigz=pigz`,
+4 fixtures, gzip 1.14 / pigz 2.8, Darwin arm64.
+
+    DROPIN declared=208 matched=189 divergent=19 declared_exception=0 error=0
+
+ALL NINETEEN ARE AGAINST PIGZ. ZERO AGAINST GZIP.
+
+That distinction is the whole finding, because `CLAUDE.md` non-negotiable #4 says to cite a
+CONTRACT (zlib's API, gzip's CLI, POSIX) and never a vendor's habit. Verified by hand, three
+scenarios, executing all three binaries directly:
+
+    scenario                gzip                gzippy              pigz
+    refuse overwrite        exit 2              exit 2              exit 1
+    mode-000 input          exit 1              exit 1              exit 13
+    hardlinked input        exit 2, no file     exit 2, no file     exit 1, CREATES the .gz
+
+We match gzip exactly in every case. The hardlink row is the important one: gzip REFUSES a file
+with link count > 1 (compressing it would break the link), we refuse identically, and pigz
+compresses it anyway. Matching pigz there would be a regression, not a fix.
+
+VERDICT: the drop-in axis is GREEN against the contract. The 19 divergences are pigz deviating
+from gzip, not defects in gzippy, and they must NOT be "fixed" by chasing pigz's exit codes.
+
+WHAT THIS CHANGES. The goal has three axes — size, wall, and drop-in behaviour — and only two
+were ever on the board. This one is now measured and passing, so the 200 failing cells really
+are the whole remaining gap rather than the visible part of a larger one. That is worth
+knowing before spending another session on the other two.
+
+METHOD NOTE: this took one command. It was found by reading `fulcrum --help` after being asked
+whether existing tooling already covered what I was doing by hand — which it did, for the
+vendor diff (`why`), the technique survey (`candidates`) and this. Hard stop #6 says never
+hand-roll a measurement fulcrum already does; I spent hours doing exactly that first.
+
+## G36 — `fulcrum why` names the dd79_bin6 mechanism in one command: SHORT-MATCH DISCOVERY, not depth
+
+The one residual class with no known mechanism (G34: dd79_bin6 L2, 4 cells, worst ratio on the
+board at 1.0094) is answered by the tool that exists for exactly this:
+
+    fulcrum why 'gzip:dd79_bin6:L2:T1:size' --ours target/release/gzippy \
+        --rival-cmd 'gzip -{level} -c {input}' --corpus .../dd79_bin6
+
+    [1 STRUCTURE] POSITION COUNTS DIFFER (matches d21.46%, matched-positions d16.48%,
+                  literals d58.59%): different parse decisions — the gap is ALGORITHMIC.
+      ours : 3,358,993 tokens (1,168,118 matches, 2,190,875 literals), 36,005,906 bits (42,812 header)
+      rival: 2,868,854 tokens (1,487,378 matches, 1,381,476 literals), 35,675,122 bits (51,558 header)
+      positions_matched   ours 0.651770  rival 0.780420   (per input byte)
+      literals            ours 0.348230  rival 0.219580
+      match_len_L00       ours 0.118908  rival 0.179643   <- SHORTEST-length bucket
+      data_bits           ours 5.716180  rival 5.662213
+
+gzip finds 319,260 MORE MATCHES than we do and emits 58.59% fewer literals, covering 78.04% of
+input bytes with matches against our 65.18%. The excess is concentrated in the SHORTEST match
+bucket: `match_len_L00` 0.179643 vs our 0.118908, i.e. gzip finds ~51% more of them.
+
+THIS IS NOT A DEPTH DEFICIT, which is why every depth lever failed on this file: depth finds
+LONGER matches on chains we already walk, and G30/G33/G32a each measured no movement here
+(x8 +377, knobs 8/16 +47, lazy:48:16 still +2,316). What is missing is short-match DISCOVERY.
+
+MECHANISM: our `hash3_tab` is a ONE-DEEP SINGLETON — it holds only the most recent position for
+a 3-byte hash, so a len-3 match is found only if its previous occurrence was the last one. gzip
+runs a 3-byte rolling hash with a real chain (`UPDATE_HASH`, `vendor/gzip/deflate.c:282`,
+15-bit) and can walk to older len-3 candidates. `fulcrum candidates` lists this as [H3] and
+notes zlib-ng enables it at L9 specifically to get len-3 finds (technique M11).
+
+NOTE THE HEADER TRADE, which also falsifies "fewer blocks is better" for this file: gzip spends
+MORE on headers (51,558 bits vs our 42,812) and LESS on data (5.662 vs 5.716 bits/byte). It
+buys better-fitted tables with more of them.
+
+PRIOR ATTEMPT, and why it is not a repeat: chaining hash3 was tried in an earlier session and
+scored 11 cells closed / 14 opened. That was a blind swap with no per-cell target. This is the
+first time the mechanism has been ATTRIBUTED to a specific failing class with a measured
+position-count structure, so a retry needs to be aimed at these 4 cells and gated on the rest —
+not repeated globally.
+
+METHOD: one command, four layers, three of which SKIPPED with named reasons (valgrind absent on
+macOS, counters need the Linux box, params need an anatomy-counters build). The tool states its
+own denominator — "1 of 4 layers ran; skipped layers are NOT covered by any claim" — which is
+the discipline I spent this session failing to apply by hand.
+
+## G37 — the last two unknown classes: we UNDER-SPLIT on near-incompressible data
+
+`fulcrum why` on the remaining unattributed cells (photo.jpg L2 and weights.safetensors L9,
+2 cells each, vs gzip, T1):
+
+    photo.jpg L2        matches      literals      header bits   data bits/byte
+      ours                29,691     6,396,519          15,374      7.951478
+      gzip               104,185     6,175,812         103,925      7.934296
+
+    weights.safetensors L9
+      ours             1,054,549    86,872,198         181,445      7.315616
+      gzip               890,804    87,346,026       1,586,350      7.298585
+
+TWO DIFFERENT-LOOKING CELLS, ONE MECHANISM.
+
+On photo.jpg gzip finds 3.5x our matches AND spends 6.8x our header bits. On
+weights.safetensors WE FIND MORE MATCHES THAN GZIP (1,054,549 vs 890,804) AND STILL LOSE,
+because gzip spends 8.7x more on headers (1,586,350 vs 181,445 bits) and wins it back on data
+(7.298585 vs 7.315616 bits/byte). The data saving exceeds the header cost.
+
+The common term is BLOCK COUNT: gzip emits far more, smaller blocks with tighter-fitted Huffman
+tables on near-incompressible input. We under-split there.
+
+THIS CONTRADICTS G27, WHICH I GOT BACKWARDS. G27 argued block count was a lever because headers
+are output mass to be REDUCED. G27a already corrected the magnitude (0.634%, not 2.07%); this
+corrects the SIGN for this input class. On incompressible data more headers are worth buying,
+not saving. It is also consistent with the tail-guard falsification — suppressing splits made
+every file worse, because well-placed splits earn their headers.
+
+Note weights.safetensors is the SAME FILE that flipped on the Greedy->Lazy step (#236): more
+matches did not help there either. Both facts point the same way — for this class the parse is
+not the problem, the block structure is.
+
+### The complete residual map (29 cells, every one attributed)
+
+    cells  class                          mechanism                              status
+      15   libdeflate T4                  pure seam; consumer owns seam blocks   NOT ATTEMPTED
+       6   gzip/pigz L6 T1                zlib good_match early exit             VERIFIED (G31a,
+                                                                                 another writer's)
+       4   dd79_bin6 L2 (gzip+pigz)       short-match discovery; hash3 is a      ATTRIBUTED (G36)
+                                          one-deep singleton, gzip chains len-3
+       4   photo.jpg L2 / weights L9      under-splitting on incompressible      ATTRIBUTED (this)
+                                          data; gzip buys 7-9x the header mass
+
+Four mechanisms, four classes, no residue. That is the first time this campaign has had every
+failing cell attributed to a named, measured cause.
+
+### G37a — WHY we under-split: our block-end check has no SPARSITY term, only a drift detector
+
+`block_split.rs` is a port of libdeflate's `do_end_block_check`, which fires on DISTRIBUTION
+DRIFT — it compares the symbol distribution of recent observations against older ones and ends
+the block when they diverge. Verified: `grep -c 'sparse|literal_frac|match_frac|matches_per'
+src/compress/deflate/block_split.rs` returns **0**. There is no sparsity term anywhere.
+
+ON NEAR-INCOMPRESSIBLE DATA THE DISTRIBUTION DOES NOT DRIFT. photo.jpg and weights.safetensors
+are close to uniform, so recent and older observations look alike, the detector never fires,
+and we emit very few blocks — 15,374 header bits on photo.jpg against gzip's 103,925.
+
+gzip carries a SECOND, independent rule that fires on SPARSITY rather than drift: every 4096
+symbols (`(last_lit & 0xfff) == 0`, level > 2) it ends the block early if matches are sparse
+and the estimated output is under half the input (`vendor/gzip/trees.c:995-1005`). That rule is
+exactly what covers the case libdeflate's drift detector cannot see, and it is why gzip buys
+7-9x our header mass and wins on total.
+
+`fulcrum candidates` lists this as **[D3] Periodic estimated-cost early flush — Ours: NO (we
+have D2 instead, which subsumes it)**. THE "SUBSUMES" CLAIM IS FALSE, and this is the
+measurement that shows it: D2 is the drift detector, and drift is precisely the signal that
+goes silent on the inputs where D3 fires.
+
+NOT BLOCKED BY THE EXISTING FALSIFY RECORDS, and this matters because `candidates` surfaces
+three of them next to [D3]. All three (`parse/mod.rs:1431` batched-flush, `:1564` amortized
+running bit-budget flush, `:1646` per-group static flush) are about BITWRITER FLUSH CADENCE and
+the ICF/emit representation — instruction-count and wall concerns, measured in bits committed
+per `flush_word_unchecked` call. gzip's [D3] is a BLOCK-BOUNDARY heuristic for SIZE. They share
+the word "flush" and nothing else. Any implementation must say so explicitly in its commit
+rather than relying on this note.
+
+SUPPORTED BY AN EARLIER FALSIFICATION OF MINE: the tail-guard probe suppressed splits near
+chunk ends and made every file monotonically WORSE, because well-placed splits earn their
+headers. That result and this one agree — we split too little, not too much.
+
+IMPLEMENTATION NOTE: this changes T1 output on every file, so it needs the full graded gate,
+and the tied-file caution from G33 applies — the cells where we are byte-identical to
+libdeflate have zero tolerance and must be checked first.
+
+### G37b — CORRECTION and convergence: it is not gzip's sparsity rule, it is gzip's UNCONDITIONAL SYMBOL CAP
+
+G37a named gzip's periodic sparsity flush ([D3], `vendor/gzip/trees.c:990-1005`) as the
+mechanism. Reading the vendor source properly refutes that:
+
+    if (level > 2 && (last_lit & 0xfff) == 0) {
+        ... out_length = last_lit*8 + sum(dist_freq * (5 + extra_dbits)) ; out_length >>= 3;
+        if (last_dist < last_lit/2 && out_length < in_length/2) return 1;
+    }
+    return (last_lit == LIT_BUFSIZE-1 || last_dist == DIST_BUFSIZE);
+
+The sparsity flush requires `out_length < in_length/2` — the block must be compressing better
+than 2x. photo.jpg compresses at 7.95 bits/byte (i.e. barely), so THAT CONDITION IS NEVER TRUE
+THERE. The sparsity rule cannot be what splits photo.jpg.
+
+The line AFTER it is: `last_lit == LIT_BUFSIZE-1`, an UNCONDITIONAL HARD CAP on symbols per
+block (`LIT_BUFSIZE` 0x4000 = 16,384; `vendor/gzip/trees.c:120-123`). gzip ends a block every
+16,384 symbols no matter what the data looks like. On 6.4M literals that is ~390 blocks,
+against our ~50 — which is the 15,374 vs 103,925 header-bit gap measured in G37.
+
+### This converges with the FALSIFY record already in `block_split.rs`
+
+That record (2026-07-30, lines 23-48) hit the SAME case from the other side and states the
+structure exactly:
+
+    "The bias term (block_length/4096) * num_observations is this heuristic's ONLY response to
+     STATIONARY data ... the bias alone fires at block_length >= 200*4096 = 819,200 B —
+     calibrated dead below any block budget we would ship."
+    "Structureless data must split early; structured data must not — ONE DIVISOR CANNOT
+     EXPRESS BOTH."
+
+A previous session met this exact under-splitting case, tried to fix it by lowering the divisor
+and raising the budget as a pair, fixed the target file and BROKE structured data
+(logs.txt +4,157/+10,094; text-1MB.txt +230/+531).
+
+GZIP DOES NOT HAVE THAT PROBLEM BECAUSE IT DOES NOT USE ONE KNOB FOR BOTH JOBS. It has two
+independent mechanisms: a CONTENT heuristic (drift/sparsity) for structured data, and an
+UNCONDITIONAL SYMBOL CAP for everything. The cap needs no calibration against content because
+it does not respond to content at all — which is precisely why it cannot break structured data
+the way a re-tuned divisor did.
+
+REOPEN BASIS (this is a NEW mechanism, not a variant of the falsified one): the falsification
+binds LOWERING THE LENGTH-BIAS DIVISOR — a change to the CONTENT-RESPONSIVE term. An
+unconditional symbol cap is content-independent by construction, adds a second rule rather than
+re-tuning the first, and is a direct vendor port with a cited constant. FALSIFIED BY: any
+structured-data cell regressing, which is the exact failure the divisor change produced and
+must be checked first.
+
+CAVEATS CARRIED FORWARD FROM THAT RECORD: its magnitudes were measured on UNDECLARED corpus
+members (`shortmatch-4M`, `logs.txt`, `text-1MB.txt` are none of them in `corpus_split.json`),
+so the mechanism is binding but the numbers are not. Any implementation re-derives with
+`scripts/campaign/board-size.sh`, which refuses undeclared members — and per G33, the files
+where we TIE libdeflate byte-for-byte have zero tolerance and must be checked first.

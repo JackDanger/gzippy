@@ -361,6 +361,18 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 14,
             near_optimal: NONE_NO,
         },
+        // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
+        // TUNE files (772,154 B total vs libdeflate-4, ZERO cells opened, clause 3 fully
+        // satisfied) and FAILS clause 5 on 9 of 11 at T4. See the L4 sections of
+        // docs/encoder-campaign-plan.md. Depths 6 and 8 are cheaper on the wall but OPEN
+        // cells (clause 3); 10 and 12 satisfy clause 3 and cost too much wall. The
+        // monotone cost/size relation leaves no interior point satisfying both, so this
+        // is closed on the promotion rule AS WRITTEN — not on the encoder, and not on a
+        // coordinate. The size win is intrinsic and does not expire; if the wall budget
+        // ever changes, this is the configuration to re-measure FIRST.
+        //     4 => Strategy::Lazy, max_search_depth: 10, nice_match_length: 30
+        // symbols.dwarf is strictly Pareto-dominant there: 6,553 B smaller AND 4.8%
+        // faster at T4 (wall ratio 0.9519).
         4 => LevelParams {
             try_exact_huffman: false,
             strategy: Strategy::Greedy,
