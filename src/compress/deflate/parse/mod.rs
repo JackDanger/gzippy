@@ -1109,6 +1109,37 @@ fn emit_block_static_or_stored(
 /// what makes it eligible under promotion clause 3, which no parse-strength lever
 /// has ever satisfied.
 ///
+/// FALSIFY 2026-08-01 — NOT the mechanism, the IMPLEMENTATION. This function as
+/// written is **1.8x-6.4x slower** than baseline (`engine.wasm` 1.81, `symbols.dwarf`
+/// 1.96, `data.parquet` 6.08, `tool.bin` 6.40 — L6 T1, interleaved n=15, M1, both
+/// arms to /dev/null). The size win is real and verified (44/44 cells smaller); the
+/// cost is not.
+///
+/// The reasoning that produced it was "O(288) per block, negligible" — a
+/// SOURCE-LEVEL cost argument, which hard stop #4 says is not machine-level cost.
+/// It was wrong by ~6x. What the instrument says (`--features anatomy-wall`,
+/// `ANATOMY_WALL` stderr JSON, tool.bin L6):
+///
+///     parse_match_ns     489.9 ms   89.1% of cli_ns
+///     huffman_encode_ns   37.3 ms    6.8%
+///     huffman_table_ns     7.8 ms    1.4%   <- the phase this doubles
+///
+/// So the MECHANISM's ceiling is ~1.4%, and 540% of overhead is this function's
+/// per-block allocation: two `make_huffman_code` (allocating, vs the
+/// `_into` form the hot path uses), a fresh `HeaderScratch::new()`, and the
+/// `vec![false; length]` inside `optimize_huffman_for_rle` — all called TWICE per
+/// block by `price()`.
+///
+/// REOPEN requires: hoisting all four allocations into the caller-owned
+/// `CodeScratch`/`HeaderScratch` (add `alt_litcode`/`alt_offcode`/`alt_header`/
+/// `rle_flags` fields, and an `optimize_huffman_for_rle_into` taking the flag
+/// buffer), then re-measuring the wall. Falsified if the hoisted version still
+/// exceeds ~1% at T1 — that would mean the cost is the shaping math rather than
+/// the allocation, and the mechanism is dead rather than the code.
+///
+/// MEASURE THE PHASE SHARE BEFORE OPTIMISING A PHASE. One `anatomy-wall` run would
+/// have given both the ceiling (1.4%) and the real target (parse_match, 89%).
+///
 /// Returns the histograms to build the block's codes from.
 fn shaped_freqs_if_smaller(
     litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
