@@ -1447,3 +1447,45 @@ That is the design the evidence supports: NOT "the consumer emits everything", b
 consumer owns only the seam blocks". Still unattempted, and still the only route to the 109
 cells — but it is now a bounded change to the boundary handling rather than a rewrite of the
 emission path.
+## G35 — the DROP-IN axis was never measured, and it is GREEN against the contract
+
+`fulcrum dropin` describes itself as "the missing half of the goal scoreboard: level x rival x
+corpus x threads can go 100% green while a real invocation like `gzip file` silently behaves
+differently." The 200-cell board measures SIZE and WALL only. The goal is "same commands, same
+observable behaviour" — and that half had never been run this campaign.
+
+It is also the tool that would have caught the `-b/--blocksize` no-op systematically instead of
+by accident.
+
+RUN: `fulcrum dropin --ours target/release/gzippy --rival gzip=gzip --rival pigz=pigz`,
+4 fixtures, gzip 1.14 / pigz 2.8, Darwin arm64.
+
+    DROPIN declared=208 matched=189 divergent=19 declared_exception=0 error=0
+
+ALL NINETEEN ARE AGAINST PIGZ. ZERO AGAINST GZIP.
+
+That distinction is the whole finding, because `CLAUDE.md` non-negotiable #4 says to cite a
+CONTRACT (zlib's API, gzip's CLI, POSIX) and never a vendor's habit. Verified by hand, three
+scenarios, executing all three binaries directly:
+
+    scenario                gzip                gzippy              pigz
+    refuse overwrite        exit 2              exit 2              exit 1
+    mode-000 input          exit 1              exit 1              exit 13
+    hardlinked input        exit 2, no file     exit 2, no file     exit 1, CREATES the .gz
+
+We match gzip exactly in every case. The hardlink row is the important one: gzip REFUSES a file
+with link count > 1 (compressing it would break the link), we refuse identically, and pigz
+compresses it anyway. Matching pigz there would be a regression, not a fix.
+
+VERDICT: the drop-in axis is GREEN against the contract. The 19 divergences are pigz deviating
+from gzip, not defects in gzippy, and they must NOT be "fixed" by chasing pigz's exit codes.
+
+WHAT THIS CHANGES. The goal has three axes — size, wall, and drop-in behaviour — and only two
+were ever on the board. This one is now measured and passing, so the 200 failing cells really
+are the whole remaining gap rather than the visible part of a larger one. That is worth
+knowing before spending another session on the other two.
+
+METHOD NOTE: this took one command. It was found by reading `fulcrum --help` after being asked
+whether existing tooling already covered what I was doing by hand — which it did, for the
+vendor diff (`why`), the technique survey (`candidates`) and this. Hard stop #6 says never
+hand-roll a measurement fulcrum already does; I spent hours doing exactly that first.
