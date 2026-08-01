@@ -1968,3 +1968,60 @@ loads drove Dr UP when LLVM had already hoisted them.
 (fewer live locals, monomorphized loops) come first."* Neither Rust-side alternative
 appears in the eight records — both are about the WALK — so both remain open, on the
 prologue, with the attribution caveat above governing how they are aimed.
+
+## COMPOSED: L4 Lazy + a DEPTH REDUCTION — 3x less wall than Lazy(12), and Pareto-dominant on data.csv
+
+"COMPOSE BEFORE CONCLUDING: two changes that each miss the bar can clear it together."
+L4 Lazy(12,30) wins on size and dies on clause 5 at 17.8x over. The reason is
+mechanical: **lazy runs ~2 searches per position against greedy's 1**, so Lazy(D) costs
+~2D probes where the shipped Greedy(16) costs 16. Lazy(12) is ~24 probes — a 50% budget
+increase bought with no compensation. Compose it with a depth cut to hold the budget.
+
+Size, T1, 11 TUNE members, x86 (trainer), vanilla builds:
+
+```
+  config                      beats libdeflate-4   L3>=L4 monotone   ~probes
+  Greedy(16,30)  [SHIPPED]         0/11 (ties)          1/11            16
+  Lazy( 6,30)                      9/11                 2/11           ~12
+  Lazy( 8,30)                     10/11                 5/11           ~16   <- cost-neutral
+  Lazy(10,30)                     11/11                 7/11           ~20
+  Lazy(12,30)                     11/11                11/11           ~24
+```
+
+Wall, `fulcrum ab paired --mode compress`, n=15, /dev/null both arms, T1, L4, trainer
+(a SCREEN — not the frozen box):
+
+```
+  Lazy(8,30) vs shipped   dickens   wall 1.0578 (+5.8%)   size 0.994396 (-0.56%)
+                          data.csv  wall 0.9909 (-0.9%)   size 0.955756 (-4.4%)
+  (Lazy(12,30) for contrast:  dickens wall 1.1844, +18.4%)
+```
+
+**On data.csv, Lazy(8,30) is FASTER AND SMALLER than the shipped config** — strictly
+Pareto-dominant, the first such result this session. On dickens it costs 5.8%, a 3x
+reduction from Lazy(12)'s 18.4%.
+
+### Still not clean, and the honest arithmetic
+
+Clause 5 on dickens: our L4 T1 ratio vs gzip is 0.4619, so a 5.78% self-tax gives
+0.4619 x 1.0578 = 0.4886, **erosion 0.0267 against the 0.005 budget = 5.3x over** —
+down from 17.8x but still failing. data.csv, being faster, has NEGATIVE erosion and no
+clause-5 exposure at all. So the verdict is FILE-DEPENDENT, which means this needs the
+full board rather than two files before any promotion claim.
+
+### What the frontier says
+
+There is a real Pareto frontier here, and the shipped point is not on it:
+
+  * Greedy(16,30) — the SHIPPED config — is dominated: 0/11 per-label (all exact ties
+    with libdeflate) at 16 probes, while Lazy(8,30) gets 10/11 at the same ~16 probes.
+  * Depth buys per-label (9 -> 10 -> 11 of 11) and P4 monotonicity (2 -> 5 -> 7 -> 11)
+    at ~2 probes per unit of depth.
+  * The cheapest point that wins per-label on every file is Lazy(10,30) at ~20 probes
+    (+25%), not Lazy(12,30) at ~24 (+50%). Lazy(12) buys only P4, which is a separate
+    (and pre-existing-broken) property.
+
+NEXT, and NOT done here: size + wall on the full TUNE set at Lazy(8,30) and Lazy(10,30),
+then `fulcrum try --threads 1,4` on the frozen box. Two files is a direction, not a
+verdict — this document has already been burned once this session by generalising from
+a subset.
