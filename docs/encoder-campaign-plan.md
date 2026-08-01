@@ -1540,3 +1540,53 @@ literal path" is the shape of the lever rather than any microarchitectural fix.
   * Coordinate: L6, T1, movie.mp4, main. NOT generalised to other levels or files; the
     next step is to repeat it on symbols.dwarf and armexe.elf (both TUNE, both failing
     wall cells) before treating "the literal path" as the class.
+
+### PREDICTION TESTED AND WEAKENED: the excess is GLOBAL, not literal-path
+
+The section above hypothesised that the 2.16x instruction excess lives on the LITERAL
+path, because movie.mp4 at L6 runs 271 literals per match. Per "ONE MEASUREMENT
+SUPPORTS ONE CLAIM — name the mechanism, then predict a SECOND consequence and check
+it", the prediction was: a high-match-density file should come in much closer to 1.0.
+
+Same command, same coordinate, dickens (TUNE, match-dominated):
+
+```
+                 lit/match    ours Ir           rival Ir          ratio
+  movie.mp4        271.4      20,125,529,337    9,315,411,125     2.16
+  dickens            0.57     16,710,714,581    9,291,141,632     1.80
+```
+
+**A 475x change in composition moves the ratio only from 2.16 to 1.80.** The prediction
+is directionally right and quantitatively wrong: if the excess were literal-path work,
+a match-dominated file should have shed most of it. It shed about a fifth.
+
+Normalised per input byte (movie.mp4 12,942,257 B; dickens 12,174,519 B):
+
+```
+              ours Ir/byte   rival Ir/byte   excess/byte
+  movie.mp4       1,555            720           +835
+  dickens         1,373            763           +610
+```
+
+Two things fall out, and the second is the more interesting:
+
+1. **Our excess is ~610-835 instructions PER INPUT BYTE on both files** — of the same
+   order regardless of whether the input is 99.6% literals or 64% matches. So the
+   dominant term is a GLOBAL per-position overhead, not literal-specific work. The
+   "literal path" framing in the previous section is DOWNGRADED to a secondary effect
+   worth at most the 2.16-vs-1.80 difference.
+2. **libdeflate's instruction count is nearly content-independent at L6** — 9,315M vs
+   9,291M Ir (0.3% apart) across two files with completely different match structure,
+   while ours moves 20,126M -> 16,711M (17% apart). Their cost is flat in content;
+   ours is not. That asymmetry is itself a structural clue and was not visible from
+   either file alone.
+
+What this does NOT change: position counts still match exactly on both files, output is
+still byte-identical on both, and the excess is still IMPLEMENTATION rather than
+algorithm. What it changes is the target — "make the literal path cheaper" is not the
+lever; the lever is whatever costs us ~600+ instructions per position that costs
+libdeflate ~0.
+
+Coordinate: L6, T1, main, TUNE members only, trainer. Ir LOCATES and never predicts the
+wall (movie.mp4 is 2.16x Ir at 1.1883x wall). Per-line attribution remains unusable —
+libdeflate is built without `-g`.
