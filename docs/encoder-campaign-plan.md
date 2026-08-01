@@ -1137,3 +1137,53 @@ STATUS AND WHAT IS STILL MISSING — this is the SIZE case only:
     by less than that — `engine.wasm` 0.99951 and `movie.mp4` 0.99994 are inside the
     arch delta. Those specific cells must be re-measured on the frozen box before any
     claim that they close.
+
+### x86 CONFIRMATION AT T1 **AND** T4: 10 board cells close on SIZE, 0 open
+
+Re-run on trainer (Intel x86, the same arch family the board is measured on), byte
+counts, both thread counts. **The `shipped` column reproduces the board census
+EXACTLY** — aozora 4,751,200; data.csv 4,111,742; dickens 5,077,406; engine.wasm
+426,271; minjs 1,211,746; movie.mp4 12,903,670; data.parquet 14,424,479 — so these are
+the actual board cells, not a lookalike.
+
+```
+=== L1 T1 ===                                  === L1 T4 ===
+file           libdeflate    shipped     ht256      shipped     ht256
+aozora.txt      4,566,347  4,751,200  4,578,206   4,751,416  4,578,509   fail->fail
+armexe.elf        621,027    599,781    607,417     600,310    607,211   PASS->PASS
+data.csv        3,932,419  4,111,742  3,926,359   4,112,086  3,926,566   CLOSES
+data.parquet   14,386,710 14,424,479 14,383,856  14,426,706 14,383,721   CLOSES
+dickens         4,972,688  5,077,406  4,981,078   5,078,221  4,981,395   fail->fail
+engine.wasm       421,013    426,271    420,714     425,688    420,809   CLOSES
+minjs.min.js    1,184,930  1,211,746  1,180,722   1,211,684  1,181,042   CLOSES
+movie.mp4      12,901,167 12,903,670 12,899,895  12,903,821 12,900,349   CLOSES
+symbols.dwarf     396,048    394,736    391,698     394,830    391,539   PASS->PASS
+                            2/9    ->    7/9        2/9    ->    7/9
+```
+
+**Five files close at T1 and the same five at T4 = 10 of the 200 failing board cells,
+with ZERO opened.** It holds at T4, which is the coordinate where half the L1 board
+fails and where the two prior attempts never measured.
+
+The arm64 caveat from the previous section is RESOLVED in the right direction and was
+warranted: on arm64 the shipped path passed `movie.mp4` (0.99986) while on x86 it
+FAILS (12,903,670 > 12,901,167). That is exactly the ~0.03% arch sensitivity flagged
+earlier, landing on exactly the cell flagged. x86 is what the board uses, so x86 is the
+number that counts, and it is the STRONGER of the two (2/9 -> 7/9, versus 4/11 -> 8/11
+on arm).
+
+EROSION TO WATCH AT PROMOTION (clause 5, not a flip): `armexe.elf` stays PASS but grows
+599,781 -> 607,417 B (+7,636 B, +1.27%) — the binary length-3 win being partly given
+up, exactly as the threshold sweep predicts. `symbols.dwarf` improves, 394,736 ->
+391,698 B.
+
+WHAT THIS IS NOT:
+  * **NOT a wall result.** The `ht_fast` routing is NO-SHIP on the wall (attempt 2,
+    clause 5/6, `L1+L6, T1`), and nothing here re-opens that. The size leg being
+    strong at T4 is the ARGUMENT for measuring the wall at T4 — it is not a
+    substitute. Trainer is not the frozen box and no timing was taken.
+  * **NOT the full board.** 9 of 22 corpus files. The others are GATE members (must
+    not be inspected while choosing 256) or were not staged (tool.bin, data.json;
+    data.json failed at 1.00358 on arm64 and is the likeliest non-closer).
+  * **NOT promotable as-is.** 256 was fitted on TUNE; promotion is judged on GATE via
+    `fulcrum try --threads 1,4`, on the frozen box, from a vanilla build.
