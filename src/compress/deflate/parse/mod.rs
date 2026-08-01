@@ -1202,13 +1202,35 @@ fn emit_block_static_or_stored(
 /// is dead: **the cost is purely the CALL COUNT**, and `huffman_table_ns` is not
 /// non-linear, it is WRONG.
 ///
-/// STANDING CONCLUSION: `anatomy-wall` under-reports the Huffman-table phase by
-/// ~2 orders of magnitude. Roughly 2 extra `make_huffman_code_into` + 2
-/// `build_dynamic_header` + 2 `cost_from_freqs` per block cost 82-520% of a run
-/// in which that whole region is reported as 1.4%. DO NOT CITE ANY `anatomy-wall`
-/// PHASE NUMBER until the emitter is audited — including `parse_match_ns` at
-/// 89.1%, which comes from the same instrument and has been the campaign's picture
-/// of where encoder time goes.
+/// AUDITED 2026-08-01 — the TIMER IS HONEST; the BUILD is not comparable.
+/// Building the discriminator WITH `--features anatomy-wall` and re-reading the
+/// counters (tool.bin L6 T1, 1,396 blocks in both arms):
+///
+///     huffman_table_ns   7,770,858 -> 22,845,334   (2.94x for 3x the work: CORRECT)
+///     huffman_table_calls    1,396 ->      1,396   (unchanged, as expected)
+///
+/// So the region tracks its own work faithfully and `anatomy_wall_time!`
+/// accumulates correctly. The defect is elsewhere:
+///
+///     instrumented baseline  cli_ns = 537.8 ms
+///     vanilla baseline       wall   =  89.3 ms      -> 6.0x INSTRUMENTATION TAX
+///
+/// `CLAUDE.md` states an instrumented build is 1.17x slower and must never be
+/// quoted against a rival. This one is 6x. Because the tax is not spread evenly,
+/// every PHASE SHARE from this instrument is a share of an inflated denominator:
+/// `huffman_table` is 1.4% of the INSTRUMENTED 537.8 ms but 8.7% of the vanilla
+/// 89.3 ms — and the marginal cost of tripling it is ~468 ms of vanilla wall, not
+/// the ~15 ms the instrumented delta suggests.
+///
+/// USE IT FOR: relative change within one instrumented build (it caught the 3x).
+/// NEVER FOR: "phase X is N% of the shipped run". That includes `parse_match_ns`
+/// at 89.1%, which is the campaign's picture of where encoder time goes and is a
+/// share of the same inflated total.
+///
+/// FALSIFIED sub-hypothesis: "parse_match_ns wraps a per-POSITION region so its
+/// timer calls dominate". It does not — `parse_match_calls` is 1,396, exactly the
+/// block count, at 344 us/call. The source of the 6x tax is NOT timer granularity
+/// in that region and remains unidentified.
 ///
 /// Returns the histograms to build the block's codes from.
 fn shaped_freqs_if_smaller(
