@@ -76,6 +76,10 @@ pub struct LevelParams {
     pub max_search_depth: u32,
     /// Stop searching once a match this long is found (`c->nice_match_length`).
     pub nice_match_length: u32,
+    /// zlib's `good_length`: once the match in hand is at least this long, the hash
+    /// chain is cut to a quarter (`zlib-ng/match_tpl.h:75-77`). libdeflate has no
+    /// equivalent, so copying its map gave us deep chains with no brake.
+    pub good_match: u32,
     /// Near-optimal-only knobs (meaningful iff `strategy == NearOptimal`).
     pub near_optimal: NearOptimalParams,
 }
@@ -184,6 +188,7 @@ fn params_inner(level: u32) -> LevelParams {
     match level {
         0 => LevelParams {
             strategy: Strategy::Fast0,
+            good_match: 0,
             max_search_depth: 0,
             nice_match_length: 32,
             near_optimal: NONE_NO,
@@ -195,12 +200,14 @@ fn params_inner(level: u32) -> LevelParams {
         // values only so the struct is populated.
         1 => LevelParams {
             strategy: Strategy::Fast,
+            good_match: 0,
             max_search_depth: 1,
             nice_match_length: 32,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
             strategy: Strategy::Greedy,
+            good_match: 4,
             max_search_depth: 6,
             nice_match_length: 10,
             near_optimal: NONE_NO,
@@ -260,43 +267,50 @@ fn params_inner(level: u32) -> LevelParams {
         //     out of this change's causal reach.
         3 => LevelParams {
             strategy: Strategy::Lazy,
+            good_match: 4,
             max_search_depth: 12,
             nice_match_length: 14,
             near_optimal: NONE_NO,
         },
         4 => LevelParams {
             strategy: Strategy::Greedy,
+            good_match: 4,
             max_search_depth: 16,
             nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
             strategy: Strategy::Lazy,
-            max_search_depth: 16,
+            good_match: 8,
+            max_search_depth: 32,
             nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
             strategy: Strategy::Lazy,
-            max_search_depth: 35,
+            good_match: 8,
+            max_search_depth: 128,
             nice_match_length: 65,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
             strategy: Strategy::Lazy,
-            max_search_depth: 100,
+            good_match: 8,
+            max_search_depth: 256,
             nice_match_length: 130,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
             strategy: Strategy::Lazy2,
-            max_search_depth: 300,
+            good_match: 32,
+            max_search_depth: 1024,
             nice_match_length: max_match,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
             strategy: Strategy::Lazy2,
-            max_search_depth: 600,
+            good_match: 32,
+            max_search_depth: 4096,
             nice_match_length: max_match,
             near_optimal: NONE_NO,
         },
@@ -304,6 +318,7 @@ fn params_inner(level: u32) -> LevelParams {
         // deflate_compress.c:3974-4004).
         10 => LevelParams {
             strategy: Strategy::NearOptimal,
+            good_match: 8,
             max_search_depth: 35,
             nice_match_length: 75,
             near_optimal: NearOptimalParams {
@@ -315,6 +330,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         11 => LevelParams {
             strategy: Strategy::NearOptimal,
+            good_match: 32,
             max_search_depth: 100,
             nice_match_length: 150,
             near_optimal: NearOptimalParams {
@@ -326,6 +342,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         _ => LevelParams {
             strategy: Strategy::NearOptimal,
+            good_match: 32,
             max_search_depth: 300,
             nice_match_length: max_match,
             near_optimal: NearOptimalParams {

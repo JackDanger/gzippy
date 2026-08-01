@@ -267,6 +267,7 @@ impl HcMatchfinder {
         max_len: u32,
         nice_len: u32,
         max_search_depth: u32,
+        good_match: u32,
         next_hashes: &mut [u32; 2],
     ) -> (u32, u32) {
         // `bucket-oracle-null-mf` (Cargo.toml doc comment): the CEILING
@@ -298,7 +299,25 @@ impl HcMatchfinder {
         {
             debug_assert!(max_search_depth >= 1, "max_search_depth must be >= 1");
             let mut best_len = best_len_in;
-            let mut depth_remaining = max_search_depth;
+            // zlib's `good_match` chain-shortening (`zlib-ng/match_tpl.h:75-77`):
+            //     /* Do not waste too much time if we already have a good match */
+            //     if (best_len >= s->good_match) chain_length >>= 2;
+            //
+            // WHY THIS IS HERE. libdeflate has no such rule, and our level map is a copy
+            // of libdeflate's, so we inherited the deep chain WITHOUT the brake. That is
+            // half an algorithm: zlib's chain depths (L6 128, L9 4096) are only safe
+            // BECAUSE the chain collapses to a quarter once a good match is already in
+            // hand. Taking one column of a vendor's table and not the other is how you
+            // get their cost without their benefit.
+            //
+            // It is not a content detector: `best_len_in` is the match the LAZY parser
+            // already holds at this position, exactly as `s->prev_length` is in zlib. No
+            // input is inspected and no per-file decision is made.
+            let mut depth_remaining = if best_len >= good_match {
+                (max_search_depth >> 2).max(1)
+            } else {
+                max_search_depth
+            };
             let mut best_matchptr = in_next; // absolute offset into `buf`
 
             let mut cur_pos = in_next - *in_base;

@@ -165,6 +165,7 @@ pub(super) fn run_block(
     sink: &mut Sink,
 ) -> usize {
     let depth = params.max_search_depth;
+    let good_match = params.good_match;
     let mut max_len = DEFLATE_MAX_MATCH_LEN;
     let mut nice_len = params.nice_match_length.min(max_len);
     let mut next_recalc_min_len = in_next + (in_end - in_next).min(10000);
@@ -186,6 +187,7 @@ pub(super) fn run_block(
             max_len,
             nice_len,
             depth,
+            good_match,
             next_hashes,
         );
 
@@ -247,6 +249,7 @@ pub(super) fn run_block(
                     max_len,
                     nice_len,
                     depth >> 1,
+                    good_match,
                     next_hashes,
                 );
                 in_next += 1;
@@ -269,6 +272,7 @@ pub(super) fn run_block(
                         max_len,
                         nice_len,
                         depth >> 2,
+                        good_match,
                         next_hashes,
                     );
                     in_next += 1;

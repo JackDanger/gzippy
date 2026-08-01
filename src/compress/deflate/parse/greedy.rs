@@ -171,6 +171,7 @@ pub(super) fn run_block(
             max_len,
             nice_len,
             params.max_search_depth,
+            params.good_match,
             next_hashes,
         );
 
