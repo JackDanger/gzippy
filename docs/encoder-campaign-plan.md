@@ -1656,3 +1656,49 @@ the construction; they are not the finding.
 Coordinate: L0-9, T1, movie.mp4 + dickens (TUNE), origin/main, trainer.
 NOT generalised to the other failing wall files — confirm on symbols.dwarf and
 armexe.elf before treating "literal-dense => inert ladder" as the class.
+
+## ⚠ TOOL DEFECT: `fulcrum anatomy --exec` returns a STALE CACHED total_ir
+
+Discovered 2026-08-01 on trainer, fulcrum 0.3.0 (8364a059). The `--exec` layer's
+`total_ir` and its per-bucket `ir=` figures are **identical to the digit across
+different input files and do not vary with `--level`**:
+
+```
+  engine.wasm  raw=   868,202    total_ir=1703992455
+  dickens      raw=12,174,519    total_ir=1703992455
+  movie.mp4    raw=12,942,257    total_ir=1703992455
+  --level 1  -> no exec output at all
+  --level 6  -> total_ir=1703992455   match_finder ir=785217966
+  --level 9  -> no exec output at all
+```
+
+Three files spanning 15x in size return the same instruction count. That cannot be a
+measurement. The value is the one produced by the FIRST `--exec` invocation in the
+session (movie.mp4, L6, with the encoder UNPINNED so it ran at the box's default thread
+count), replayed thereafter.
+
+`fulcrum selftest "anatomy"` PASSES (RATIO_SELFTEST=PASS checks=5) — the Gate-0 covers
+the ratio pipeline, not the exec layer's cache key. So a green selftest does NOT cover
+this.
+
+**Consequences for anything quoted from that layer:**
+  * Its bucket shares compare OURS AT THE DEFAULT THREAD COUNT against LIBDEFLATE AT T1
+    — a mismatched-thread comparison — and are then replayed for unrelated inputs.
+  * The `match_finder 46.08% vs 47.20% / block_split 11.32% vs 11.27%` reading is VOID.
+    It was quoted here as "the part that survives instrument disagreement"; it does not
+    survive, because it comes from the same cached run.
+  * The layer already self-labels "UNCALIBRATED ... Measurement-Gate-5 WEAK/HYPOTHESIS
+    tier, never a Gate-2 finding". That warning should be read as literal.
+
+**What this resolves:** the 12x disagreement between `fulcrum why`'s callgrind totals
+(movie.mp4 20,125,529,337; dickens 16,710,714,581 — they VARY with the input, as a real
+measurement must) and `anatomy --exec`'s cachegrind total (constant). The callgrind
+numbers behave like measurements; the cachegrind ones do not. Reconciliation resolves in
+favour of `fulcrum why`.
+
+**Method receipt, and it is the uncomfortable one:** I first diagnosed the discrepancy as
+a thread mismatch, then RETRACTED that diagnosis because "the exec numbers were identical
+across both runs, so threads weren't the cause". The identity WAS the evidence — of
+caching, not of thread-independence. A number that refuses to move when an input changes
+is not a stable measurement, it is not a measurement. The discriminating test cost one
+command: run it on a file 15x smaller and see whether the count moves.
