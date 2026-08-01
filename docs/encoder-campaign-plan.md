@@ -1775,3 +1775,71 @@ COUNT IT, NEVER INFER IT applies to the instrument as much as to the constant.
 Hand-rolling was justified here ONLY because the tool was demonstrably wrong — hard
 stop #6's "if the tool is missing on a box, FIX THE BOX" extends to a tool that lies.
 The fix belongs in fulcrum; these numbers are the reference to fix it against.
+
+## WITH THE INSTRUMENT FIXED: the attribution is real, and block_split is 28% of our excess
+
+Re-run of `fulcrum why libdeflate:movie.mp4:L6:T1:wall` with the repaired callgrind
+parser (see the fulcrum commits `c07f24e`, `f585650`) and BOTH arms symbolised — ours a
+release build with debug info whose output is byte-identical to shipped, libdeflate
+built `-g` per hard stop #1.
+
+**The fixed parser reproduces hand-measured ground truth on both arms**, which is what
+makes the attribution trustworthy this time:
+
+```
+              fulcrum why (fixed)   hand cachegrind     agreement
+  ours          1,650,068,646        1,650,693,672        0.04%
+  libdeflate    1,146,907,002        1,153,377,248        0.6%
+  TRUE RATIO           1.439
+```
+
+Top SELF costs (previously unusable — the old parser reported call-chain inclusive
+frames like `main.rs:381` and `libc-start.c:363`):
+
+```
+  OURS                                          RIVAL
+  12.99%  hc.rs:0                214,327,137    6.68%  :2112                 76,575,714
+   5.46%  parse/mod.rs:832        90,039,243    4.51%  matchfinder_common.h   51,686,687
+   5.40%  block_split.rs:212      89,102,895    4.47%  :2800                 51,269,578
+   3.11%  hc.rs:304               51,323,614    3.36%  hc_matchfinder.h:201   38,570,028
+   3.10%  parse/mod.rs:847        51,220,492    3.36%  hc_matchfinder.h:223   38,570,019
+   3.09%  block_split.rs:133      51,050,476    3.35%  :2644                 38,416,851
+   2.46%  hc.rs:388               40,544,723    2.83%  hc_matchfinder.h:252   32,418,684
+```
+
+### The named target, and a FALSIFY record predicted it exactly
+
+`block_split.rs` accounts for **140,153,371 Ir — 8.5% of our total and 28% of our
+503M excess over libdeflate**:
+
+  * `block_split.rs:212` = `ready_to_check_block`, **89,102,895 Ir**. Three comparisons
+    (`num_new_observations >= 512 && bytes_in_block >= MIN_BLOCK_LENGTH &&
+    bytes_remaining >= MIN_BLOCK_LENGTH`) evaluated at EVERY position — ~7 Ir across
+    ~12.7M positions — to fire roughly once per 512 observations.
+  * `block_split.rs:133` = `observe_literal`, **51,050,476 Ir**, called on every literal
+    (12,762,619 of them on this file).
+
+That file's own FALSIFY record, written before any of this was measured, says:
+
+    The detector's real cost is hot-loop work (`observe_literal` on EVERY literal,
+    `observe_match` on every match, at L2-L9). That cost is REAL and unmeasured here.
+    The live lever is therefore to make an observation CHEAPER, not to delete it —
+    deleting it forfeits 1.4-2.3% on the two hardest size files to save it.
+
+**It is now measured.** The prescription stands unchanged and is now quantified: the
+prize for making the observation cheaper is up to 140M Ir on this cell, and route (b)
+— deleting the detector — remains closed (+2.250% armexe.elf L2, +1.678% sil40 L2).
+
+### Caveats that bound this
+
+  * Ir LOCATES, never predicts the wall. The measured wall ratio for this cell is
+    1.1883 while Ir is 1.439 — we retire more instructions per unit time than
+    libdeflate, so a 140M Ir saving is an upper bound on the opportunity, not a wall
+    prediction. Any change must be confirmed paired, on the frozen box.
+  * The RIVAL side cannot be compared line-for-line here: libdeflate's hot lines are
+    bare `:2112`/`:2800`/`:2644` — inside `deflate_compress.c`, where its own block
+    splitter lives, but not separably attributed. So "we spend 8.5% on block_split" is
+    ours-only; it is NOT "libdeflate spends less on the same thing".
+  * `hc.rs:0` at 12.99% is a whole-file bucket (line 0 = unattributed within the file),
+    not a single site.
+  * Coordinate: L6, T1, movie.mp4 (TUNE), origin/main, trainer.
