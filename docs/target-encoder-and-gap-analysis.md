@@ -711,3 +711,42 @@ Size: must not regress any currently-passing L5-L7 cell (clause 3 is absolute), 
 the full 22-file board at T1 and T4. Wall: must stay under the L6 erosion budget against
 gzip/pigz AND not flip any libdeflate cell — the depth lever died on exactly that leg, so
 wall is not optional here and a size-only argument is insufficient (3 for 3 in this class).
+
+## G33 — FALSIFIED: the L2-knobs change is redundant with #236 and I broke my own rule 1
+
+G32/#242 raised L2 from libdeflate's depth 6 / nice 10 to stock zlib's 8 / 16, on the argument
+that the T1 wall budget is ~66% (against PASSING rivals) rather than the 4% I had assumed
+against libdeflate, whose L2 T1 wall cell already fails. The budget argument is CORRECT and
+survives. The change does not.
+
+Graded `fulcrum try`, promotion corpus, 528 cells:
+
+    clause 4 OK:  13 failing cells closed — EVERY ONE of them L2 T4
+    clause 3 FAIL: 2 pass->fail flips
+        libdeflate:dd79_bin6:L2:T1            (1.0000 -> 1.0000)
+        libdeflate:weights.safetensors:L2:T1  (1.0000 -> 1.0000)
+    VERDICT: NO-SHIP
+
+TWO REASONS IT DIES, and the second is the instructive one.
+
+1. REDUNDANT. All 13 closed cells are L2 T4, and every one is already closed by #236's
+   T>1 depth scaling. This change buys nothing #236 does not already buy, and costs 2 cells.
+
+2. I OPTIMISED WHERE CELLS DO NOT FAIL. The headline T1 numbers were real and large —
+   data.csv 3,923,216 -> 3,719,456, a 203,760 B improvement that beats every rival — and they
+   closed ZERO cells, because those T1 cells were ALREADY PASSING. `CLAUDE.md` rule 1 says to
+   name the class and its share of the board before optimising; the only FAILING L2 T1 size
+   cell is pigz:dd79_bin6, and this change moves dd79_bin6 by +47 B, the wrong way. I wrote
+   that rule earlier in this same session and then broke it.
+
+THE FLIPS ARE THE CAGE IN REVERSE. Both flipped cells sit at ratio 1.0000 -> 1.0000: we were
+BYTE-IDENTICAL to libdeflate on those files (G15), so a 47-byte increase is enough to flip
+pass -> fail. Zero headroom cuts both ways — it is why the T>1 seam fails cells, and it is why
+any T1 perturbation on a tied file fails one too. Any future change touching a level where we
+tie libdeflate must check the tied files first, because they have no tolerance at all.
+
+WHAT SURVIVES: the BUDGET correction. The wall budget at a given cell is set by the tightest
+PASSING rival, not the tightest rival — clause 3 protects passes, and an already-failing cell
+cannot be flipped. At L2 T1 that is pigz at 0.603 and gzip at 0.544 (a ~66% budget), not
+libdeflate at 1.045 (already failing). That reasoning is sound and reusable; it simply did not
+have a failing cell to spend itself on here.
