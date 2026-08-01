@@ -2318,3 +2318,44 @@ it, which `CLAUDE.md` forbids.
      zero.
   3. Per-arch level tables would collide with the drop-in goal and with non-negotiable #3
      — noted and NOT proposed.
+
+### TESTED: on the L4 lever the two arches AGREE — the concern is real in the RECORDS, not (here) in the numbers
+
+Having found that 37 of 42 falsifications do not record a multi-arch coordinate, the
+next honest step was to measure whether an arch change actually moves a verdict, rather
+than assume it. Same lever (L4 Lazy(10,30) vs shipped), same method
+(`fulcrum ab paired --mode compress`, n=15, /dev/null both arms, T4), two arches:
+
+```
+  file            M1 (arm64, local)        Intel (trainer)    delta
+  data.csv        1.0521  spread 0.0147    1.0460             +0.006
+  dickens         1.1025  spread 0.0214    1.1213             -0.019
+  symbols.dwarf   1.0220  NOISY (0.0537)   0.9519             +0.070   opposite signs
+```
+
+**On two of three files the arches agree to within 2%.** The self-tax of this lever is
+~1.05-1.10 on both an Apple M1 and an Intel Xeon-class part. For THIS lever, the
+clause-5 conclusion does not depend on the machine.
+
+The one real disagreement — `symbols.dwarf`, where Intel measured 0.9519 (FASTER than
+shipped) and M1 measured 1.0220 (slower) — is **flagged NOISY by the tool** (spread
+0.0537 against a delta of 0.022), so it is UNRESOLVED, not a contradiction. It is the
+obvious cell to re-measure under a freeze.
+
+**So the finding splits, and both halves matter:**
+  * The RECORDS are under-scoped: 37 of 42 do not establish the generality they are read
+    as having, and `hc.rs:455-470` proves a verdict CAN flip by machine (M1 -10%, AMD
+    neutral). That stands.
+  * But the SPECIFIC fear — "our clause-5 closures are Zen2 artifacts" — is NOT supported
+    by the one lever tested. Two arches, same answer.
+
+Which is the useful shape: the process gap is real and cheap to fix (record the arch);
+the substantive damage is unproven and should not be assumed. Do not use this as licence
+to re-open the four clause-5 closures — use it as the reason to record the coordinate so
+the question is answerable next time without re-measuring.
+
+METHOD NOTE: the first attempt at this used `/usr/bin/time -p`, which has 10 ms
+resolution against 0-30 ms runs and produced ratios of 0.0000 and 1.5000 — quantization,
+not measurement. Discarded unreported. `fulcrum ab paired` exists for exactly this
+regime (paired differences with an A/A certificate); it also REFUSED to run from a dirty
+build between paired arms until told the pin was deliberate. Both guards worked.
