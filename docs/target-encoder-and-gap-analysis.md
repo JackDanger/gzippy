@@ -825,3 +825,48 @@ halves, and together they cover the class.
 COORDINATION, not a claim: this work is not mine, is not on a branch, and is not gated. It
 needs its owner to land it through `fulcrum try` like anything else. Recorded so that (a) the
 measurement exists, and (b) nobody re-implements it.
+
+## G32 — the worst cell on the board (dd79_bin6 L2, ratio 1.0082): we are WEAKER at L2 than zlib
+
+`pigz:dd79_bin6:L2` is the largest ratio deficit on the frozen board (+36,101 B, 1.0082).
+Profiled across levels (6,291,456 B input, T1, exact bytes, local M1):
+
+    L    pigz         ours         delta        libdeflate    ours-vs-ld
+    1    4,491,598    4,480,440    -11,158      4,667,981     -187,541
+    2    4,464,656    4,500,757    +36,101      4,500,757            0   <- THE CELL
+    3    4,441,970    4,461,737    +19,767      4,500,874      -39,137
+    4    4,527,176    4,500,874    -26,302      4,500,874            0
+    6    4,493,254    4,461,731    -31,523      4,461,731            0
+    9    4,493,254    4,452,384    -40,870      4,452,384            0
+
+THREE FACTS, none of which is "we need a better parser":
+
+1. WE ARE BYTE-IDENTICAL TO LIBDEFLATE AT L2, L4, L6 AND L9 on this file (delta exactly 0).
+   The cage (G15) again: at those labels we ARE libdeflate, so we inherit their L2 weakness.
+
+2. PIGZ IS NON-MONOTONIC HERE: its L4 (4,527,176) is WORSE than its L2 (4,464,656), and its
+   L6 and L9 are identical (4,493,254). zlib's own ladder is not ordered on this input.
+
+3. OUR L3 ALREADY BEATS PIGZ'S L2 — 4,461,737 vs 4,464,656. The capability exists in our own
+   ladder; it is on the wrong label.
+
+VENDOR DIFF (stock zlib, which pigz uses — note this differs from zlib-ng's table read in
+G31): zlib L2 is `good=4 lazy=5 nice=16 chain=8`; ours is `Greedy depth=6 nice=10`. At L2 we
+search SHALLOWER (6 vs 8) with a lower nice-length (10 vs 16). We are weaker at L2, and the
+G31 story (we are shallower than zlib) holds at L2 as well as L6 — the numbers are just
+smaller.
+
+### Why this cell is the hardest one on the board
+
+L2 at T1 is the one place both constraints bind at once. On SIZE we need a STRONGER L2 (zlib's
+8/16 rather than our 6/10). On WALL we are already LOSING at L2 T1 — 1.044 against libdeflate
+on sil40 — so we cannot simply spend more search. Stronger and faster, simultaneously.
+
+That is exactly the shape `good_match` fixes, and it is why the tested `good_match` patch
+(G31a) did NOT move this cell: it adds the early exit at L2 but leaves depth at 6 and nice at
+10. The proposal that follows from both diffs is the PAIR — early exit AND zlib's L2 knobs
+(depth 8, nice 16) — where the exit pays for the extra depth. Neither half alone does it,
+which is the composition rule from `CLAUDE.md`'s rule 5 stated in advance rather than after.
+
+NOT ATTEMPTED. It touches the T1 table, so it must clear T1 wall against libdeflate, which is
+the tightest budget on the board.
