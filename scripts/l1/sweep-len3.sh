@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
+# ⛔⛔ THIS TOOL HAS FAILED TWICE AND ITS OUTPUT IS NOT TRUSTWORTHY.
+# Do not draw a conclusion from it until the two defects below are fixed and it
+# is re-verified against a known answer.
+#
+# FAILURE 1 (table parsing). Reported identical totals at different settings
+# (+1.634% both times — the *Fast* figure, because the awk matched a line
+# carrying BOTH percentages and took the wrong field), every delta as +0, and
+# captured the header row as data. Fixed by emitting the `L1SWEEP` contract.
+#
+# FAILURE 2 (after that fix, still wrong):
+#   * `len3_off=0` produced NO LINE AT ALL — not a result, not BUILD FAILED, not
+#     MISSING. An entire data point vanished silently. UNEXPLAINED.
+#   * `len3_off=4096` emitted its L1SWEEP block TWICE, identically. CAUSE KNOWN:
+#     `cargo test` runs the test in BOTH the lib and bin targets, so it executes
+#     twice per invocation. Use `--lib` to pin one target.
+#
+# The silent data loss is the disqualifying one: a sweep that can drop a point
+# without saying so cannot support "value X is better than value Y", which is
+# the only question it exists to answer.
+#
+# BETTER DESIGN, if someone picks this up: stop rebuilding per value. Seven
+# fat-LTO rebuilds is ~10 minutes for eight numbers, and every rebuild is a
+# chance to measure the wrong binary. Either make the test iterate the parameter
+# in-process, or write each value's output to its OWN file and assert the file
+# count at the end so a missing point is loud.
 # Sweep HT_MAX_LEN3_OFFSET and read the L1 ratchet at each value.
 #
 # WHY. `ht_fast` beats libdeflate on every BINARY file in the ratchet
