@@ -1843,3 +1843,51 @@ prize for making the observation cheaper is up to 140M Ir on this cell, and rout
   * `hc.rs:0` at 12.99% is a whole-file bucket (line 0 = unattributed within the file),
     not a single site.
   * Coordinate: L6, T1, movie.mp4 (TUNE), origin/main, trainer.
+
+### ⚠ CORRECTION: block_split is NOT where the excess is — libdeflate spends the same there
+
+The section above reported block_split at "28% of our excess", caveated as OURS-ONLY
+because libdeflate's hot lines were bare `:2112`/`:2800`. Those map, and the caveat
+resolves AGAINST the finding:
+
+```
+  deflate_compress.c:2112  =  stats->new_observations[((lit >> 5) & 0x6) | (lit & 1)]++;
+                              i.e. observe_literal's body
+  deflate_compress.c:2800  =  the seq/should_end_block loop condition (greedy parse)
+  deflate_compress.c:2644/2670 = inside deflate_compress_lazy_generic (the parse loop)
+```
+
+Comparable totals:
+
+```
+                        OURS                              LIBDEFLATE
+  observe_literal   block_split.rs:133   51,050,476   :2112   76,575,714  <- THEIRS MORE
+  split check       block_split.rs:212   89,102,895   :2800   51,269,578
+                                        -----------          -----------
+                                         140,153,371          127,845,292
+```
+
+**Difference 12,308,079 Ir = 2.4% of our 503M excess, not 28%.** libdeflate's
+`observe_literal` is in fact MORE expensive than ours (76.6M vs 51.1M). Block splitting
+is a real per-position cost in BOTH encoders and is not the deficit. Its FALSIFY record
+is still right that the cost is real; it is NOT where we lose to libdeflate.
+
+### Where the excess actually sits, from the same (top-8) attribution
+
+```
+  matchfinder   ours hc.rs 214.3M + 51.3M + 40.5M      = 306.1M
+                theirs matchfinder_common.h 51.7M
+                     + hc_matchfinder.h 38.6+38.6+32.4 = 161.3M     -> +145M
+  parse         ours parse/mod.rs 90.0M + 51.2M + 51.2M = 192.4M
+                theirs :2644 38.4M + :2670 38.3M        =  76.7M     -> +116M
+```
+
+Those two account for ~261M of the 503M excess on the visible lines alone. **The
+matchfinder and the parse loop are the class; block_split is not.** This is only the
+top-8 lines per arm, so it is a locate, not a budget — but it points somewhere very
+different from the previous section.
+
+**Method note:** the previous section's number was not wrong so much as UNCOMPARABLE,
+and it said so. Writing the caveat is what made the correction possible one command
+later; a confident "28% of our excess" without it would have sent the next lever at
+`observe_literal` — a function where we are already CHEAPER than the vendor.
