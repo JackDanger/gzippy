@@ -871,3 +871,55 @@ part of its coordinate, and a measurement's corpus SUBSET is part of its result.
 errors here came from reading "9 cells closed" as a statement about the board when it
 was a statement about TUNE. Before citing any cell as evidence, check which set it is
 in; before citing any prior measurement, read the corpus it ran on.
+
+### MEASURED: the L1 deficit is MATCH COVERAGE. Headers are NOT the cause.
+
+`fulcrum why libdeflate:<file>:L1:T1:size`, three TUNE members, trainer (Intel LXC),
+gzippy `8d948cef` sha `f7a53025`, fulcrum `8364a059`, corpus sha-verified against
+solvency. Solvency was untouched — it was holding a paired wall gate.
+
+```
+dickens     ours 3,133,556 tok (1,923,158 M, 1,210,398 L)  40,619,097 b (117,739 hdr)
+            rival 2,827,981 tok (2,025,030 M,   802,951 L)  39,781,354 b (154,454 hdr)
+data.csv    ours 2,587,312 tok (1,846,129 M,   741,183 L)  32,893,788 b (166,614 hdr)
+            rival 2,186,764 tok (1,930,665 M,   256,099 L)  31,459,208 b (166,000 hdr)
+aozora.txt  ours 2,997,325 tok (1,683,389 M, 1,313,936 L)  38,009,450 b (111,502 hdr)
+            rival 2,678,110 tok (1,735,132 M,   942,978 L)  36,530,632 b (123,678 hdr)
+
+  file        literals Δ    matched-positions Δ    header (ours vs rival)
+  dickens       +50.74%           -3.58%           117,739  <  154,454
+  data.csv     +189.41%           -1.85%           166,614  ~= 166,000
+  aozora.txt    +39.34%           -3.35%           111,502  <  123,678
+```
+
+**Explanations 1 and 2 are REFUTED.** Our header mass is SMALLER than libdeflate's on
+two of three files and equal on the third — we are already AHEAD on headers by 36,715
+bits on dickens and 12,176 on aozora. Block geometry and the per-block
+dynamic/static/stored decision cannot be the cause of a deficit we are winning.
+
+**The whole deficit is DATA bits, and the mechanism is literal emission.** dickens
+total delta 837,743 bits = 104,718 B, which reproduces the census excess for that
+cell EXACTLY (+104,718 B) — an independent confirmation that this diff explains the
+whole cell and not a fraction of it. We emit 39-189% more literals because libdeflate
+matches at 1.85-3.58% more POSITIONS. Every position we fail to match costs a literal.
+
+**And we carry an EXTRA table while matching less.** `parse::fast` has a length-3
+`head3` table that libdeflate's `ht_matchfinder` deliberately does not ("Due to its
+focus on speed, the ht_matchfinder doesn't support length 3 matches"), and we still
+find FEWER matches. The single-probe limitation dominates the length-3 advantage.
+That is a size argument for the bucket independent of the earlier routing attempts.
+
+**Live explanation, narrowed to one class:** whatever raises match COVERAGE at L1 —
+the 2-way bucket (more history per slot ⇒ more candidates) and/or the insert/skip
+policy (`ht_matchfinder_skip_bytes` vs our `LIMIT_HASH_UPDATE_INSERTS_L1`, which
+changes what history later positions can SEE). These are not yet separated from each
+other; both are coverage mechanisms and the diff above cannot distinguish them.
+
+DENOMINATOR, as the tool reports it: **2 of 4 layers ran.** [3 COUNTERS] skipped (the
+gzip oracle exited 1 on this box) and [4 PARAMS] skipped (the vanilla binary emits no
+`LEVEL_DECLARED`; that needs `--features anatomy-counters`, which must NOT be the
+binary any wall claim is quoted from). No claim here rests on those two layers — this
+is a SIZE/structure finding only, and no wall claim is made.
+
+Scope: L1 only, three TUNE files. Hard stop #3 forbids generalising across levels —
+do not read this as a statement about L2-L9, which have their own (tie-cage) shape.
