@@ -68,3 +68,30 @@ gating needs `params_parallel()`, which exists only on that branch.
 - SIZE axis only. `--size-only` was used deliberately: size is an exact integer
   byte count, arch-invariant and load-immune, so it runs on a busy box.
 - 132 of 792 cells are ABSENT (igzip has no L4-L9). Correctly declared, not a gap.
+
+## ✅ CLAUDE.md's "the needed margin is ~0.01%" CHECKS OUT — do not "correct" it
+
+`CLAUDE.md:54` states *"The needed margin is ~0.01%"*. I nearly filed that as
+superseded by today's measurement, and it would have been a conflation of two
+DIFFERENT quantities. Recording the check so the next reader does not repeat it:
+
+- **"Needed margin"** = how much smaller a lever must make our output to close a
+  **SEAM** cell — a cell that already essentially ties libdeflate. For the 15
+  residual cells within 0.1% of a tie, the gaps run **5 ppm (0.0005%) to 0.1%**,
+  which brackets 0.01% exactly. The banked
+  `project_t4_seam_is_a_step_function` independently says median 255 B ≈ 0.006%.
+  **Consistent. The claim stands.**
+- **My "median gap to a tie = 0.2406%"** is computed across ALL 37 residual
+  cells, which MIXES the seam class with the L1 coding-deficit class (up to
+  4.6%). It is a different population and answers a different question.
+
+The two numbers are not in tension; they describe different subsets. A
+"correction" replacing 0.01% with 0.24% would have made the doc wrong and would
+have mis-sized every future seam lever by ~40x — the same order as the 40x
+budget error that closed the parse-config space against the wrong coordinate.
+
+**Rule this illustrates:** before retracting a banked constant, check that your
+number measures the SAME POPULATION. Today's session has three receipts for the
+opposite failure (a T16 profile labelled T1, a 3-file class generalised to 11, a
+module total divided by an excess as if the vendor paid nothing) — all of them
+right arithmetic on the wrong set.
