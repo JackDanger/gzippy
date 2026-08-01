@@ -6,6 +6,9 @@
 pub mod deflate;
 pub mod deflate64;
 pub mod io;
+/// A faithful pure-Rust port of libdeflate's compressor. Not yet routed —
+/// see the module docs for the verification ladder that gates it.
+pub mod ldx;
 pub mod optimization;
 pub mod parallel;
 pub mod pipelined;
