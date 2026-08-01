@@ -170,6 +170,57 @@ least once in a single session.
 7. **A measurement from an unidentified binary is not a measurement.** Verify the
    deployed commit before quoting a number from it.
 
+## Finding STRUCTURE instead of chasing a number
+
+Every rule here has a receipt from a session that violated it. They are ordered by how much
+time each one has cost.
+
+1. **Name the CLASS, not the cell — and state what fraction of the board it holds, split by
+   rival AND thread count, before optimising anything.** Receipt: `libdeflate`-at-T4 is 48 of
+   68 failures on the frozen box while `libdeflate`-at-T1 is ZERO. Work aimed at the T1
+   matchfinder could not have closed a single failing cell no matter how well it went.
+
+2. **Measure at the coordinate where the cells FAIL.** Budget, slack and cost all move with
+   level, thread count and file. Receipt: the entire parse-config space was closed as
+   "unaffordable" against T1 wall slack of 0-8%. The failing cells are T4, where the rival is
+   single-threaded and our slack is 249-330% — a 40x budget error that made every
+   configuration look impossible.
+
+3. **A falsification must record its COORDINATE, and separate an INTRINSIC CEILING from a
+   COORDINATE-DEPENDENT VERDICT.** "libdeflate's heuristic is within 0.001% of the
+   mathematical optimum" is intrinsic and permanent. "Therefore it is dead" was neither — it
+   was true only at T1, standalone, on the default grid. Write the ceiling and the coordinate
+   as separate sentences.
+
+4. **PARK monotone work; never DELETE it.** If a change is non-worse BY CONSTRUCTION on some
+   axis and only loses on another, its cost is a candidate for a coordinate artefact. Receipt:
+   a strict size win (49/49 cells smaller, 0 worse) was deleted for a wall cost that is 6x
+   smaller at T4 than the T1 number it was judged on. It had to be rediscovered, and the
+   FALSIFY note left behind actively told the next session not to look.
+
+5. **Compose before concluding.** Two changes that each miss the bar can clear it together.
+   Receipt: ~150 B of margin ("too small to matter") plus a seam reduction ("still fails")
+   compose into cells that close. Ask what ELSE would have to be true for a rejected change to
+   pay, and test that, before writing the falsification.
+
+6. **COUNT it; never INFER it.** Every inferred constant this campaign has leaned on was
+   wrong. Receipts: 350 B/header inferred from a seam delta vs 107 B measured (3.3x); a wall
+   run estimated at 47 hours from a 3-cell startup sample vs ~3 hours actual. If a claim rests
+   on a constant, add the counter first — that is cheaper than the retraction.
+
+7. **Identify the tree and the binary before EVERY measurement, not just before shipping.**
+   Receipt: a result showing a 55 KB improvement came from an uncommitted change belonging to
+   no branch in this checkout. The tell was that the number was implausibly good.
+   Implausibly-good is a provenance alarm, not a win.
+
+8. **A number is a symptom. Name the MECHANISM, then predict a second consequence and check
+   it.** Receipt: 24.1M unattributed data reads correctly located the deficit inside `hc`, and
+   the inference "therefore reads are the wall-blocking quantity" was false — deleting 25.6M
+   of them made the wall 1.77% WORSE. One measurement supports one claim.
+
+9. **Report the class you closed and the class you did not.** "5 cells closed" means little
+   without "of 48 in that class, and the other 43 need a different mechanism."
+
 ## Working rules
 
 - **A retraction must reach the ROOT.** When the user retracts a goal or
