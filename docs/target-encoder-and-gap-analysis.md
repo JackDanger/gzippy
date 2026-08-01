@@ -1905,3 +1905,54 @@ CEILING from a COORDINATE-DEPENDENT VERDICT. "libdeflate's heuristic is within 0
 mathematical optimum" is intrinsic and permanent. "Therefore it is dead" was neither. And
 structurally-right-but-currently-losing work should be PARKED WITH ITS COORDINATE, never
 deleted — deleting it is what made G16 need rediscovering.
+
+## G38 — after the 42-cell composition: 26 residual cells, and 6 of them belong to work already verified
+
+Residual computed from the AFTER arm of the combined lever
+(`lever-combined2/try.json`, 528 cells / 440 decidable) — measured, not projected.
+
+    base failing 68  ->  after failing 26   (42 closed)
+
+    libdeflate T4  12 | gzip T1 6 | pigz T1 4 | gzip T4 3 | pigz T4 1
+
+    worst first
+      gzip  T4  dd79_bin6           L2  1.00935      libdeflate T4 data.csv    L9  1.00034
+      gzip  T1  dd79_bin6           L2  1.00927      libdeflate T4 data.json   L9  1.00022
+      pigz  T4  dd79_bin6           L2  1.00818      gzip       T4 weights     L9  1.00022
+      pigz  T1  dd79_bin6           L2  1.00809      gzip       T1 weights     L9  1.00021
+      gzip  T1  monorepo.tar        L6  1.00592      libdeflate T4 engine.wasm L9  1.00014
+      gzip  T1  aozora.txt          L6  1.00568      libdeflate T4 dd79_bin6   L2  1.00008
+      pigz  T1  monorepo.tar        L6  1.00540      libdeflate T4 dd79_bin6   L9  1.00006
+      pigz  T1  aozora.txt          L6  1.00450      libdeflate T4 minjs       L9  1.00003
+      gzip  T1  minjs.min.js        L6  1.00341      libdeflate T4 photo.jpg   L9  1.00001
+      pigz  T1  minjs.min.js        L6  1.00311      libdeflate T4 movie.mp4   L6  1.00001
+      gzip  T4  photo.jpg           L2  1.00046      libdeflate T4 photo.jpg   L6  1.00001
+      gzip  T1  photo.jpg           L2  1.00045      libdeflate T4 weights     L2  1.00001
+                                                     libdeflate T4 photo.jpg   L2  1.00001
+                                                     libdeflate T4 weights     L9  1.00000
+
+### Three groups, and only one of them is open work for me
+
+**(a) SIX L6 T1 CELLS — already solved by someone else.** monorepo.tar, aozora.txt and
+minjs.min.js against BOTH gzip and pigz. G31a measured the foreign `good_match` patch closing
+exactly these (aozora -35,823 B, monorepo -27,716 B, minjs to 1,087,222 vs gzip's 1,088,768).
+They are T1 cells and the composed change is T>1-only, so the two are disjoint and should ADD:
+26 - 6 = 20 residual. THIS IS NOT MINE TO LAND. Its owner should gate it; I have only measured
+it. Duplicating it would be the worse outcome.
+
+**(b) TWELVE libdeflate T4 CELLS AT RATIO <= 1.00034, most at 1.00001.** One part in 100,000 —
+on a 6.4 MB file that is ~64 B. These are the pure-seam cells (G34): T1 already ties libdeflate
+byte-for-byte, so the entire deficit is the T>1 seam and the margin needed is tiny. Every
+mechanism that could supply it cheaply has now been measured: parse depth (saturates, G30),
+block count (dead at matched counts, G37e), exact Huffman (already in the composed change).
+What is left for them is the seam itself.
+
+**(c) EIGHT CELLS ON dd79_bin6 / photo.jpg / weights.safetensors.** dd79_bin6 L2 is the worst
+on the board (1.00935) and G36 attributed it to SHORT-MATCH DISCOVERY — gzip finds 319,260 more
+matches, concentrated in the shortest bucket, because our hash3 is a one-deep singleton.
+photo.jpg and weights are the per-block-COST class whose count-based readings are all falsified
+(G37e); their remaining unknown is gzip's BTYPE mix, which no tool currently reports.
+
+So of 26: 6 belong to work already verified and owned elsewhere, 12 need the seam
+re-architecture, and 8 need either hash3 chaining (attributed, 4 cells) or a per-block cost
+measurement that does not yet exist (4 cells).
