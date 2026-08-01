@@ -250,6 +250,14 @@ time each one has cost.
 - If a tool errors, diagnose the first failure before doing anything else. Never
   `python3 -c` with multiple lines — write a `.py` file. Wrap hang-prone commands in
   `timeout`. Check `df -h` around big builds.
+- **ZSH DOES NOT WORD-SPLIT UNQUOTED PARAMETERS.** `set -- $spec`, `cmd $flags`, and
+  `pgrep -f "$pat"` do not behave as they would in bash: `$spec="a b c"` arrives as ONE
+  argument. This produced FOUR phantom findings in a single session — a "rejected `-b`
+  flag", a "missing `board goal` subcommand", a "missing `profile excess` subcommand"
+  (both of which exist and always did), and a self-matching `pkill -f` that killed the ssh
+  session issuing it. Two of them were reported to another agent as tool defects and had to
+  be retracted. Use `read -r a b c`, an explicit array, or quote-and-split deliberately —
+  and when a probe reports that something does not exist, RUN IT BY HAND before believing it.
 - Never `rm -rf` a path from a variable, argument or glob without resolving it
   absolute and asserting it is strictly inside an expected root.
 - Delete anything a measurement beats. Nothing is precious. Cost is never a technical
