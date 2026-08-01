@@ -630,11 +630,37 @@ pub(super) fn compress(
         // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
         // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
         // closed search and what the 2.19x instruction gap actually is.
-        // ⚠ PROBE BRANCH ONLY — `probe/ht-implementation-gap`. This routing is NOT a
-        // ship proposal and must never be merged: it is the subject arm of a
-        // MEASUREMENT of where our 2.19x instruction gap against libdeflate's own
-        // `ht_matchfinder` lives. Both FALSIFY notes above stand; neither is being
-        // re-tried. See the commit message for the REOPEN mechanism.
+        // ROUTED 2026-08-01 — the SYNTHESIS the first FALSIFY note above asked for.
+        //
+        // That note ends: "SO THE FINDING IS A SYNTHESIS, NOT A CHOICE... REOPEN
+        // requires BOTH — ht's 2-way bucket PLUS a small length-3 table". Both are
+        // here. What neither previous attempt had is a rule for WHEN the length-3
+        // table should be consulted, and the missing rule was never ours to invent:
+        // libdeflate already answers it at levels 2-9 with `choose_min_match_len`,
+        // which we already ship in `greedy`/`lazy`. Their level 1 does not need it
+        // only because its matchfinder has no length-3 table to govern.
+        //
+        // Attempt 1 (pure port, no length-3) closed 9 libdeflate L1 cells and OPENED
+        // 7, all on BINARIES, because converging on libdeflate gave up wins our
+        // `head3` table had. Attempt 2 (fixed `HT_MAX_LEN3_OFFSET`) passed size and
+        // failed the wall. The literal-count rule addresses attempt 1's failure
+        // directly: binaries use many distinct literals, score `min_len == 3`, keep
+        // their length-3 matches and keep the win; text uses few, scores >= 4, and
+        // becomes byte-identical to libdeflate.
+        //
+        // Measured, this checkout, full files, `-p1`, vs libdeflate -1 (main -> here):
+        //   access.log   +10.284% -> +0.000%    armexe.elf     -3.421% -> -3.604%
+        //   monorepo.tar  +5.650% -> -0.002%    symbols.dwarf  -0.331% -> -0.911%
+        //   data.csv      +4.560% -> +0.000%    data.parquet   +0.263% -> -0.084%
+        //   aozora.txt    +4.048% -> +0.045%    engine.wasm    +1.249% -> +0.219%
+        //   dickens       +2.106% -> +0.000%    dd79_bin6      -4.018% -> -3.359%
+        //   markup.xml    +2.471% -> +0.000%    ecoli.fastq    +2.817% -> +0.000%
+        //   data.json     +1.775% -> +0.000%    minjs.min.js   +2.263% -> -0.014%
+        // 13 of 14 improve; `dd79_bin6` keeps a 3.36% win, narrowed from 4.02%.
+        // Roundtrip: 8 files x T1,T4 x gzip/pigz/libdeflate = 48 checks, sha256-exact.
+        //
+        // ⚠ THE WALL LEG IS THE OPEN QUESTION AND IS WHAT KILLED ATTEMPT 2. Size is
+        // not sufficient for this class — that is 2 for 2. No wall claim is made here.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => ht_fast::run(buf, data_start, in_end, params, statics, bw, is_last),
         #[cfg(feature = "l1-tune")]
