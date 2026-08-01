@@ -1956,3 +1956,41 @@ photo.jpg and weights are the per-block-COST class whose count-based readings ar
 So of 26: 6 belong to work already verified and owned elsewhere, 12 need the seam
 re-architecture, and 8 need either hash3 chaining (attributed, 4 cells) or a per-block cost
 measurement that does not yet exist (4 cells).
+
+## G39 — FALSIFIED: the grid change does NOT compose with the margin either
+
+G38 left 12 pure-seam libdeflate T4 cells needing ~64 B. `CHUNKS_PER_THREAD 2->1` shrinks the
+seam ~94%, and its FALSIFY record (`pipelined.rs`, 2026-07-30) reports ~29 closed against ~9
+OPENED, "all nine under 0.02%" — every flip a near-tie cell with no headroom. The composed
+change now SUPPLIES headroom, so the reopen basis was that the flip mechanism might no longer
+fire. Built on top of the 42-cell composition and measured (T1/T4, exact bytes, vs libdeflate):
+
+    file                  L   libdeflate     ours T4     was        now
+    photo.jpg             2    6,473,516   6,473,555   ~+64       +39
+    photo.jpg             6    6,472,062   6,472,121   ~+64       +59
+    photo.jpg             9    6,472,024   6,472,096   ~+64       +72
+    weights.safetensors   2   83,081,675  83,082,525   ~+830      +850
+    movie.mp4             6   12,890,404  12,890,476   ~+129      +72
+    engine.wasm           9      396,244     396,299   ~+55       +55
+    minjs.min.js          9    1,079,072   1,079,302   ~+32      +230
+    data.csv              9    3,300,291   3,301,702  ~+1,122   +1,411
+
+NOT ONE CLOSED, and several got WORSE (minjs L9 +32 -> +230; data.csv L9 +1,122 -> +1,411).
+Reverted.
+
+WHY THE REOPEN WAS WRONG. The record's flips and these cells are not the same population. The
+record describes near-tie cells flipping BECAUSE the grid perturbs them; the margin does protect
+against that. But these 12 cells fail because the seam EXISTS AT ALL, and a coarser grid does
+not remove the seam — it relocates the boundaries, which on files this incompressible changes
+which bytes land where without reducing the total. Headroom cannot help a cell whose deficit is
+not a perturbation.
+
+THE THIRD COMPOSITION ATTEMPT, AND THE FIRST TO FAIL. Depth + Huffman composed (42 cells,
+G-note above). Depth alone and Huffman alone each worked. This one does not, and the rule
+"compose before concluding" does not promise that every pair composes — it says test the pair
+before concluding from the parts. Tested; concluded.
+
+WHAT THIS LEAVES for the 12 seam cells: nothing cheap. Depth saturates (G30), block count is
+dead at matched counts (G37e), exact Huffman is already spent, and now the grid is dead even
+with margin. The seam re-architecture (consumer owns the seam blocks, ~0.3% serial per G24a) is
+the only route left, and it is now the ONLY route left rather than the preferred one.
