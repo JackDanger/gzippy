@@ -191,3 +191,53 @@ this preserve our current output" — that filter is the cage this project has
 removed three times, and it excludes exactly the block-boundary and
 header/Huffman mechanisms the T4 seam analysis says are the ones with any
 headroom left.
+
+---
+
+## ⚠ QUALIFICATION: "zero wall losses at T4" is weaker than it sounds — VOID is 2.5x heavier there
+
+Counted from the census ARTIFACT (`wall-tune-ce5506a8/cells/*.json`), not the
+log, using the tool's own `wall_class`/`status` fields. **Partial read — the
+board is still running.**
+
+| status | T01 | T04 |
+|---|---|---|
+| OK | 98 | 86 |
+| **VOID** | **8** | **20** |
+| ABSENT | 18 | 18 |
+
+Every LOSS so far is `libdeflate @ T1` (11 of 25 graded), and there are zero
+LOSS cells at T4 against any rival. **But 20 T4 cells did not resolve.** The
+honest statement is:
+
+> zero losses among the 86 T4 cells that RESOLVED; 20 T4 cells are UNMEASURED.
+
+not "zero losses at T4". A VOID cell is not a passing cell.
+
+### The VOIDs are not one thing, and the second kind is the concerning one
+
+The cells carry `pin_ok` / `pin_unmeasurable`:
+
+- **`pin_ok: false`** — igzip at T4 (9 cells). `pin_gate_ok` requires observed
+  CPU within [50%,160%] of `threads*100`, so T4 demands >=200%; igzip never
+  averages two cores on these inputs. The gate is correct and this is a real
+  property of the rival, not an instrument fault.
+- **`pin_ok: true`** — the pin was fine and the PAIRED TEST could not separate
+  the arms. That happens when the effect is small, i.e. **near ratio 1.0** —
+  which is exactly where a marginal loss would live. These cannot be assumed to
+  be wins.
+
+So the T4 conclusion has a hole shaped precisely like the cells that would
+weaken it. This is the same shape as the banked
+`project_t_gt_1_serial_term` finding, where `make lever` VOIDed 10 wall cells,
+**10 of 10 at exactly L02-T04**, with `pin_ok=false`.
+
+### What would close it
+
+Re-run the VOID cells at higher `--n`. A paired test that cannot resolve at
+n=9 may resolve at n=21; if it still cannot, the cell is a genuine tie and
+should be recorded as one rather than silently dropped from the denominator.
+**Do not quote a T4 pass rate without stating the VOID count beside it.**
+
+ABSENT (36 cells) is entirely igzip at L4-L9, which has no such levels. That is
+correctly declared and is not a gap.
