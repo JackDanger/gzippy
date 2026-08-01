@@ -2078,3 +2078,51 @@ sits on the Pareto frontier; it is simply at the wall-favouring end of it.
 is available, the wall budget is not. That is three independent classes killed by
 clause 5 today, which is itself the finding —
 see `project_clause5_is_the_binding_constraint`.
+
+### ⚠ COORDINATE CORRECTION: that falsification was measured at T1; the L4 cells fail at T4
+
+The section above closed the L4 class on a T1-only sweep. **The L4 board fails at T4** —
+13 of its 17 failing cells are `libdeflate`@T4. Measuring at the coordinate that fails
+changes the answer, exactly as hard stop #3 and the 40x receipt warn.
+
+The clause-5 threshold is not a constant: erosion = `ratio_vs_gzip x (self_tax - 1)`, so
+the permitted self-tax is `1 + 0.005/ratio_vs_gzip`. At T1 (ratio ~0.46) that is
+**1.011**; at T4 (ratio ~0.19, four threads against a single-threaded gzip) it is
+**1.026** — 2.4x looser.
+
+Lazy(8,30) vs shipped Greedy(16,30), same paired method, n=9, both coordinates:
+
+```
+  file            T1       T4      within the T4 threshold (1.026)?
+  data.csv       1.0001   0.9843   YES  -- FASTER than shipped at T4
+  armexe.elf     1.0994   1.0218   YES
+  data.json      1.0256   1.0216   YES
+  engine.wasm    1.0967   1.0245   YES
+  dickens        1.0527   1.0348   no
+  tool.bin       1.0680   1.0408   no
+  minjs.min.js   1.0691   1.0420   no
+  aozora.txt     1.0158   1.0489   no  (and its SIZE is worse than shipped)
+  movie.mp4      1.0751   1.0553   no
+  data.parquet   1.0954   1.0843   no
+  symbols.dwarf  1.0416   1.1591   no  -- WORSE at T4 than at T1
+```
+
+**4 of 11 clear at T4 against 1 of 11 at T1.** The coordinate alone is worth a 4x
+difference in how many cells survive.
+
+**So "the L4 class is closed on the wall" is RETRACTED as stated.** The accurate verdict
+is: at the coordinate where the cells actually fail, Lazy(8,30) is affordable on 4 of 11
+TUNE files and not on 7. That is a coordinate-dependent verdict, not an intrinsic
+ceiling — the distinction the rules demand and that I collapsed one commit ago.
+
+Two things worth noting in the data itself:
+  * The self-tax is NOT uniformly smaller at T4. `symbols.dwarf` gets WORSE (1.0416 ->
+    1.1591) and `aozora.txt` too (1.0158 -> 1.0489). Any model that assumes "T>1 always
+    dilutes the tax" is wrong; it must be measured per cell.
+  * `data.csv` is faster than shipped at BOTH coordinates (1.0001 T1, 0.9843 T4) while
+    161,310 B smaller. It is not a rounding artifact.
+
+STILL NOT A LEVER: 7 of 11 exceed the T4 threshold, and the promotion run must be
+`fulcrum try --threads 1,4` on the frozen box over the GATE set, not a TUNE screen on
+trainer. What this establishes is that the class deserves that run rather than a
+dismissal.
