@@ -77,6 +77,16 @@ pub struct LevelParams {
     /// Our T1 wall margin against libdeflate is 0-8%, so enabling it at T1 FLIPS wall cells —
     /// measured, both arms: sil40 L6 T1 went 0.952 PASS -> 1.035 FAIL. It is therefore T>1 ONLY,
     /// exactly like `max_search_depth` scaling, and set only by `params_parallel`.
+    ///
+    /// THE REASON IS THE WALL BUDGET, NOT BYTE-IDENTITY. T1 output happening to stay identical
+    /// to `main` is a CONSEQUENCE of this gating, not a goal, and must never become one:
+    /// byte-identity with libdeflate is the cage `CLAUDE.md` and the campaign memory both name
+    /// as the thing that keeps us running their algorithm slower than they do. On SIZE this
+    /// candidate is strictly better at T1 too (49 of 49 cells smaller, 0 worse, non-worse by
+    /// construction) and we would take those bytes gladly. We decline them only because
+    /// 10-14% of T1 wall is not available to buy them with. If the T1 wall deficit is ever
+    /// closed, turn this on at T1 and take the size — do not preserve identity for its own
+    /// sake.
     pub try_exact_huffman: bool,
     pub strategy: Strategy,
     /// Cap on hash-chain nodes searched per position (`c->max_search_depth`).
