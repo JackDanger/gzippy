@@ -1187,3 +1187,55 @@ WHAT THIS IS NOT:
     data.json failed at 1.00358 on arm64 and is the likeliest non-closer).
   * **NOT promotable as-is.** 256 was fitted on TUNE; promotion is judged on GATE via
     `fulcrum try --threads 1,4`, on the frozen box, from a vanilla build.
+
+### CORRECTNESS: ht_fast@256 output IS valid gzip. The `verdict FAIL` is P4, and P4 fails on main too.
+
+Non-negotiable #1 before any size claim counts. `fulcrum verify` (compress, decompress
+with OUR OWN decoder at every thread count, sha256 vs original, plus `gzip -dc` as the
+independent cross-check), 5 corpus files x L0-9 x compress-threads 1,2,4 = 150 cells:
+
+```
+  main    binary sha f7a53025:  cells 150 | failed 0 | verdict FAIL
+                                P4 MONOTONIC SIZE VIOLATED
+  ht256   binary sha fc12a8d8:  cells 150 | failed 0 | verdict FAIL
+                                P4 MONOTONIC SIZE VIOLATED
+```
+
+**Zero roundtrip failures on both arms** — the encoder is correct and the output is
+valid gzip. The `FAIL` verdict is `fulcrum verify`'s OTHER gating assertion, P4
+(monotonic size: a higher level must not give a bigger file), and **main fails it
+identically**. So P4 is PRE-EXISTING and this change neither causes nor worsens it.
+Reporting the verdict alone without the paired main arm would have looked like the
+change broke correctness; it does not.
+
+(Decode ran at `--decode-threads 16` on the user's suggestion — the decoder is finished
+and parallel, so the oracle costs almost nothing at max parallelism.)
+
+### The P4 violation is the L3/L4 STRATEGY ABUTMENT, and `LazyGated` no longer exists
+
+`params_inner` currently ladders:
+
+```
+  L2  Greedy  depth  6  nice 10
+  L3  Lazy    depth 12  nice 14
+  L4  Greedy  depth 16  nice 30     <-- lazy -> GREEDY -> lazy
+  L5  Lazy    depth 16  nice 30
+```
+
+Lazy beats greedy at comparable knobs, and L4's deeper search (16 vs 12) does not
+always compensate — so `-4` can be BIGGER than `-3`. L4 is greedy only because our
+table transliterates libdeflate's, which stays greedy through L4; CLAUDE.md says that
+table is explicitly ours to change.
+
+⚠ DOC BUG, worth fixing separately: `level.rs:44-51` still carries a doc comment
+describing `Strategy::LazyGated` ("per-block GREEDY-vs-LAZY dispatch under a two-sided
+content detector") as though it ships. It does NOT — that variant and `parse/gated.rs`
+were deleted by user order under non-negotiable #3. The `Strategy` enum today is
+`Fast0, Fast, Greedy, Lazy, Lazy2, NearOptimal`. Anyone reading that comment would
+believe L3 is detector-gated; the `3 =>` arm is plain `Strategy::Lazy`.
+
+The candidate the vendor diff already names (`docs/vendor-structure-comparison.md` §1):
+zlib-ng's `deflate_medium`, a THIRD strategy that is neither greedy nor lazy and
+"exists precisely to make L3-6 monotonic at a fraction of lazy's cost". Note a prior
+naive lazy-at-L4 experiment measured 17.7% wall, so the cheap-monotonic property is the
+whole point.
