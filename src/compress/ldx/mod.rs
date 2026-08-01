@@ -82,8 +82,32 @@
 
 #![allow(dead_code)] // Ports land bottom-up; unused until the driver is ported.
 
+mod codes;
 mod heap;
 mod huffman;
+mod length;
+mod precode;
+mod tables;
+
+// ---------------------------------------------------------------------------
+// C: deflate_compress.c:118-120 — libdeflate's OWN codeword length limits, which
+// are not the same as the format's.
+// ---------------------------------------------------------------------------
+
+/// C: `#define MAX_LITLEN_CODEWORD_LEN 14` (:118)
+///
+/// **14, not the format's 15, and that is deliberate.** libdeflate caps litlen
+/// codewords one bit below the RFC limit so that a litlen codeword plus its extra
+/// length bits plus an offset codeword plus its extra offset bits always fit in one
+/// 64-bit bitbuffer refill (see `WRITE_MATCH`, :1662). Raising it to 15 emits a legal
+/// but different stream, and costs the emitter a flush.
+pub const MAX_LITLEN_CODEWORD_LEN: usize = 14;
+
+/// C: `#define MAX_OFFSET_CODEWORD_LEN DEFLATE_MAX_OFFSET_CODEWORD_LEN` (:119)
+pub const MAX_OFFSET_CODEWORD_LEN: usize = DEFLATE_MAX_OFFSET_CODEWORD_LEN as usize;
+
+/// C: `#define MAX_PRE_CODEWORD_LEN DEFLATE_MAX_PRE_CODEWORD_LEN` (:120)
+pub const MAX_PRE_CODEWORD_LEN: usize = DEFLATE_MAX_PRE_CODEWORD_LEN as usize;
 
 // ---------------------------------------------------------------------------
 // C: vendor/libdeflate/lib/deflate_constants.h
