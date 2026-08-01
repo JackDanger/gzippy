@@ -1188,13 +1188,27 @@ fn emit_block_static_or_stored(
 /// does encoder time go" decision. Do not cite `huffman_table_ns` until it is
 /// reconciled.
 ///
-/// The leading unfalsified candidate, NOT yet measured: `optimize_huffman_for_rle`
-/// smooths counts toward equality, and a near-uniform histogram may be a worst
-/// case for the length-limited code builder (package-merge), so the SHAPED build
-/// costs far more than the raw build the phase timer was calibrated on. That
-/// predicts a SECOND consequence to check: time `make_huffman_code_into` alone on
-/// a raw vs a smoothed histogram, same block. If they differ by ~100x, that is the
-/// mechanism and `huffman_table_ns` is honest but non-linear in its input.
+/// THAT CANDIDATE IS ALSO FALSIFIED (2026-08-01, fourth measurement). Variant B
+/// feeds the RAW histogram to both builds — identical call count, no smoothed
+/// input anywhere — and costs the same as the shaped version:
+///
+///     file           shaped+raw   raw+raw
+///     engine.wasm       1.83x      1.82x
+///     symbols.dwarf     1.96x      1.94x
+///     data.parquet      6.13x      5.90x
+///     tool.bin          6.35x      6.20x
+///
+/// Both arms emit BASELINE-IDENTICAL output. So the package-merge-worst-case story
+/// is dead: **the cost is purely the CALL COUNT**, and `huffman_table_ns` is not
+/// non-linear, it is WRONG.
+///
+/// STANDING CONCLUSION: `anatomy-wall` under-reports the Huffman-table phase by
+/// ~2 orders of magnitude. Roughly 2 extra `make_huffman_code_into` + 2
+/// `build_dynamic_header` + 2 `cost_from_freqs` per block cost 82-520% of a run
+/// in which that whole region is reported as 1.4%. DO NOT CITE ANY `anatomy-wall`
+/// PHASE NUMBER until the emitter is audited — including `parse_match_ns` at
+/// 89.1%, which comes from the same instrument and has been the campaign's picture
+/// of where encoder time goes.
 ///
 /// Returns the histograms to build the block's codes from.
 fn shaped_freqs_if_smaller(
