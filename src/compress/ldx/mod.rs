@@ -82,7 +82,9 @@
 
 #![allow(dead_code)] // Ports land bottom-up; unused until the driver is ported.
 
+mod bitstream;
 mod codes;
+mod flush;
 mod heap;
 mod huffman;
 mod length;
