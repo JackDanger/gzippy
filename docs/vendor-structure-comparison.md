@@ -245,9 +245,13 @@ file a "faithful transliteration" of a libdeflate header record where the code
 CAME FROM — they impose no obligation to stay identical, and any of them may be
 rewritten the moment a measurement says a different structure is better.
 
-Practical consequence for #50 (103 of 165 failing size cells are T>1): fix it by
-making seams SMALLER, not by making T4 reproduce T1. pigz's 10-bit
-empty-static-block pad is exactly that.
+Practical consequence for #50 (103 of 165 failing size cells are T>1): NOT by making
+T4 reproduce T1 — and, **RETRACTED 2026-08-01, not by making seams smaller either.**
+This line used to prescribe pigz's 10-bit empty-static-block pad as the fix. The
+census kills that route: all 109 libdeflate cells that fail only at T4 tie libdeflate
+byte-for-byte at T1 (headroom min=median=max=0), so a smaller seam earns no partial
+credit — 90% off closes 0 of 109. The pad is still a real technique, but it can only
+pay once a **monotone T1 size win** has bought headroom for it to fit inside.
 
 ## FALSIFIED 2026-07-31 — `good_match` does NOT rescue the deeper chain
 

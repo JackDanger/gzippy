@@ -26,12 +26,31 @@ writes are scheduled correctly — the same starvation/causation/perturbation to
 that won parallel decode.
 THE ONLY CORRECTNESS BAR, at every thread count, is VALID GZIP: roundtrip sha256
 through our decoder plus one independent decoder. T>1 may emit different bytes than
-T1. The T>1 size leg is closed by making seams SMALLER — pad choice, chunk grid,
-block splitting — never by reproducing T1's bytes. (User, 2026-07-28, stated three
-times. Byte-identity to a vendor, to our own T1, or to our own previous run is never
-a goal and never a gate. This paragraph previously mandated T1==T4; that is WHY the
-rule had to be restated three times — each correction landed in a leaf doc while the
-root file kept regenerating the cage.)
+T1. Byte-identity to a vendor, to our own T1, or to our own previous run is never a
+goal and never a gate. (User, 2026-07-28, stated three times. This paragraph once
+mandated T1==T4; that is WHY the rule had to be restated three times — each
+correction landed in a leaf doc while the root file kept regenerating the cage.)
+
+**The T>1 size leg is NOT closed by making seams smaller.** This paragraph used to
+say it was — "pad choice, chunk grid, block splitting" — and that was MEASURED FALSE
+on 2026-08-01 from `/root/sizeboard-all-12fcd0ed/census.json`. Pairing every
+libdeflate cell's T1 and T4 rows:
+
+    fail-at-T4-only=109   fail-both=16   pass-both=72
+    T4-only excess: min=2  median=255  max=2,093  total=35,084 B
+    the SAME cells at T1, headroom (rival - ours): min=0  median=0  max=0
+    cells closed if the seam tax were cut 25/50/75/90% -> 0, 0, 0, 0.  By 100% -> 109.
+
+All 109 tie libdeflate BYTE-FOR-BYTE at T1, so the class has ZERO partial credit: a
+2-byte seam fails the cell exactly as hard as a 2,093-byte one. That is why grid
+tuning, pad choice, chunk-count matching and block splitting each closed nothing —
+not because they failed, but because "smaller" is not on this class's scoring
+function. The seam leg is therefore closed by **monotone T1 size wins that buy
+headroom to spend** — a change that can only ever make a block smaller (e.g. costing
+an exact package-merge code beside the heuristic one and taking the cheaper) breaks
+the tie in our favour, cannot flip a passing cell under clause 3, and makes the T1
+and T4 size legs the SAME problem. Do not propose a seam-shrinking lever without
+first showing the target cells have headroom.
 DONE WHEN: the same per-label bar holds at the default thread count and at T4/T8/T16.
 
 **STEP 3 — the exotic path (-10/-11/-12), separate again.** Our `parse/ultra` crown
