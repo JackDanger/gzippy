@@ -317,6 +317,7 @@ impl PipelinedGzEncoder {
                 self.compression_level,
                 true,
                 &mut body,
+                false,
             );
             writer.write_all(&body)?;
             writer.write_all(&0u32.to_le_bytes())?; // CRC32 of empty input
@@ -349,7 +350,14 @@ impl PipelinedGzEncoder {
             // for the framing-size cost above).
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::with_capacity(data.len() + data.len() / 65535 + 16);
-            crate::compress::deflate::encode_deflate_segment_to_sink(data, &[], 0, true, &mut body);
+            crate::compress::deflate::encode_deflate_segment_to_sink(
+                data,
+                &[],
+                0,
+                true,
+                &mut body,
+                false,
+            );
             writer.write_all(&body)?;
             let crc = crc32fast::hash(data);
             writer.write_all(&crc.to_le_bytes())?;
@@ -587,12 +595,17 @@ impl PipelinedGzEncoder {
                 // Compress this chunk with the pure-Rust engine. A non-final
                 // chunk is closed with a sync-flush marker inside the callee.
                 output.clear();
+                // `parallel = true`: this IS the T>1 chunk worker, so it uses
+                // `level::params_parallel` — the stronger parse the T4 wall slack pays for.
+                // The T1 path (`encode_gzip_slack_padded_to_vec`) never reaches here and is
+                // byte-unchanged.
                 deflate::encode_deflate_segment_to_sink(
                     block,
                     dict.unwrap_or(&[]),
                     level,
                     is_last,
                     output,
+                    true,
                 );
 
                 let mut hasher = crc32fast::Hasher::new();

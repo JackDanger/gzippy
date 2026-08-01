@@ -110,7 +110,7 @@ pub fn encode_deflate_bytes_to_sink(data: &[u8], dict: &[u8], level: u32, out: &
     // A standalone single final block: BFINAL is set on the last internal
     // block and no sync-flush marker is appended. `bw.finish()` byte-aligns
     // the tail. This is the T1 / single-member framing.
-    encode_deflate_segment_to_sink(data, dict, level, true, out);
+    encode_deflate_segment_to_sink(data, dict, level, true, out, false);
 }
 
 /// Compress `data` into a raw DEFLATE stream for use as ONE CHUNK of a larger
@@ -142,6 +142,7 @@ pub fn encode_deflate_segment_to_sink(
     level: u32,
     is_last: bool,
     out: &mut Vec<u8>,
+    parallel: bool,
 ) {
     // Output write-through: emit the DEFLATE stream straight into the caller's
     // `out` (adopting it as the sink) instead of building a second Vec and
@@ -161,7 +162,7 @@ pub fn encode_deflate_segment_to_sink(
         let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
-        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true);
+        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true, parallel);
     } else {
         // Preset-dictionary chunk: prepend the dictionary into one padded buffer
         // [dict | data | pad] and parse over the data region with the dictionary
@@ -175,7 +176,9 @@ pub fn encode_deflate_segment_to_sink(
         buf.extend_from_slice(dict);
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
-        deflate_into(&mut bw, &buf, dict_len, in_end, level, is_last, true);
+        deflate_into(
+            &mut bw, &buf, dict_len, in_end, level, is_last, true, parallel,
+        );
     }
 
     *out = bw.finish();
@@ -220,6 +223,7 @@ fn deflate_into(
     level: u32,
     is_last: bool,
     sync_flush: bool,
+    parallel: bool,
 ) {
     debug_assert!(buf.len() >= in_end + parse::BUF_PAD);
     if in_end == data_start {
@@ -227,7 +231,13 @@ fn deflate_into(
     } else if level == 0 {
         emit_stored_block(bw, &buf[data_start..in_end], is_last);
     } else {
-        let params = level::params(level);
+        // T>1 spends its parallel wall slack on a stronger parse — see
+        // `level::params_parallel`. T1 is untouched.
+        let params = if parallel {
+            level::params_parallel(level)
+        } else {
+            level::params(level)
+        };
         parse::compress(buf, data_start, in_end, &params, is_last, bw);
     }
 
@@ -281,7 +291,7 @@ pub fn encode_deflate_slack_padded_to_sink(
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
     let mut bw = BitWriter::from_vec(std::mem::take(out));
-    deflate_into(&mut bw, buf, 0, logical_len, level, true, true);
+    deflate_into(&mut bw, buf, 0, logical_len, level, true, true, false);
     *out = bw.finish();
 }
 
@@ -794,6 +804,7 @@ mod streaming_tests {
                     level,
                     is_last,
                     &mut deflate,
+                    false,
                 );
             }
             let gz = wrap_gzip(&deflate, &input);
@@ -818,7 +829,7 @@ mod streaming_tests {
         for data in &cases {
             for level in [0u32, 1, 2, 6, 9, 12] {
                 let mut streaming = Vec::new();
-                encode_deflate_segment_to_sink(data, &[], level, true, &mut streaming);
+                encode_deflate_segment_to_sink(data, &[], level, true, &mut streaming, false);
                 let mut block = Vec::new();
                 encode_deflate_bytes_to_sink(data, &[], level, &mut block);
                 assert_eq!(

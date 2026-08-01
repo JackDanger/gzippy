@@ -111,6 +111,38 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
     });
 }
 
+/// The level->params map for the PARALLEL (T>1) path.
+///
+/// WHY THIS EXISTS, and why it is not a knob. libdeflate-gzip is SINGLE-THREADED. Our board
+/// failures are overwhelmingly T4 cells against it — 48 of 68 on the frozen box, with
+/// libdeflate-at-T1 at ZERO — so the budget that matters is our 4 threads against their 1.
+/// Measured (sil40, hyperfine n=5, /dev/null): at T4 we are 3.49x faster at L6 and 4.30x at
+/// L9, i.e. 249-330% of wall slack. The whole parse-config space was once closed as
+/// "unaffordable" against T1 slack of 0-8% — a budget 40x too small for the cells that fail.
+///
+/// Spending that slack: at L6, `Lazy2(35,65)` instead of `Lazy(35,65)` costs +10.9% of OUR
+/// time (still 3.01x faster than the rival) and buys 19,000-24,000 B per file — roughly 100x
+/// the T>1 seam it has to absorb. dickens L6 T4 goes from +343 B (FAILING) to -19,348 B.
+///
+/// SANCTIONED, not a content detector: `CLAUDE.md` non-negotiable #3 permits "parameter
+/// tuning (write-buffer size, shared memory per thread count)", and STEP 2 states that "T>1
+/// may emit different bytes than T1". Nothing here inspects the DATA — only the thread count
+/// the user asked for.
+///
+/// The rule applied is one step of parse strategy at UNCHANGED knobs, which the ladder sweep
+/// measured as strictly smaller at fixed depth. Levels with no stronger strategy available
+/// (L0/L1 chainless, L3 already Lazy, L8/L9 already Lazy2, L10-12 already NearOptimal) are
+/// returned unchanged, so T>1 output at those levels is untouched.
+pub fn params_parallel(level: u32) -> LevelParams {
+    let mut p = params_inner(level);
+    p.strategy = match p.strategy {
+        Strategy::Greedy => Strategy::Lazy,
+        Strategy::Lazy => Strategy::Lazy2,
+        other => other,
+    };
+    p
+}
+
 fn params_inner(level: u32) -> LevelParams {
     let max_match = DEFLATE_MAX_MATCH_LEN;
     // Placeholder near-optimal knobs for the non-near-optimal levels (unused).
