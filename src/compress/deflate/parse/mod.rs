@@ -942,17 +942,26 @@ fn emit_block(
             let mut litlen_freqs = sink.litlen_freqs;
             litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
+            // PROBE: build the codes from the RLE-shaped histogram when that is
+            // strictly cheaper. `cost_from_freqs` below still charges the TRUE
+            // frequencies, so the dyn/static/stored comparison is unaffected.
+            let shaped = shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs);
+            let (build_lit, build_off) = match shaped {
+                Some((ref l, ref o)) => (l, o),
+                None => (&litlen_freqs, &sink.offset_freqs),
+            };
+
             make_huffman_code_into(
                 litcode,
                 DEFLATE_NUM_LITLEN_SYMS,
                 MAX_LITLEN_CODEWORD_LEN,
-                &litlen_freqs,
+                build_lit,
             );
             make_huffman_code_into(
                 offcode,
                 DEFLATE_NUM_OFFSET_SYMS,
                 MAX_OFFSET_CODEWORD_LEN,
-                &sink.offset_freqs,
+                build_off,
             );
             let header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
 
@@ -1086,6 +1095,68 @@ fn emit_block_static_or_stored(
 /// histogram (Sink bumps them inline as tokens are pushed), the sum is
 /// bit-for-bit identical to the old per-token walk (`data_bits` in the tests),
 /// so the dyn/static/stored decision — and thus the emitted bytes — is unchanged.
+/// PROBE (2026-08-01, size-only, NOT SHIPPABLE AS WRITTEN — allocates per call).
+///
+/// zopfli's `TryOptimizeHuffmanForRle` (`deflate.c:434-560`): reshape the symbol
+/// histogram to favour precode-RLE-able codeword-length runs, build the code from
+/// the reshaped histogram, and price the result with the TRUE counts. Keep it only
+/// if the total (tree + data) is smaller. libdeflate has no counterpart, and our
+/// level engine has none either — `optimize_huffman_for_rle` already lives in the
+/// shared `huffman::optimal` but only `parse::ultra` calls it.
+///
+/// MONOTONE BY CONSTRUCTION: the raw histogram is the incumbent and a candidate
+/// replaces it only on a strict improvement, so a block can never grow. That is
+/// what makes it eligible under promotion clause 3, which no parse-strength lever
+/// has ever satisfied.
+///
+/// Returns the histograms to build the block's codes from.
+fn shaped_freqs_if_smaller(
+    litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
+    offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+) -> Option<(
+    [u32; DEFLATE_NUM_LITLEN_SYMS],
+    [u32; DEFLATE_NUM_OFFSET_SYMS],
+)> {
+    use super::huffman::optimal::optimize_huffman_for_rle;
+
+    // Price a (litlen, offset) histogram pair by building its codes and its
+    // dynamic header, then charging the DATA with the true frequencies.
+    let price = |lf: &[u32; DEFLATE_NUM_LITLEN_SYMS], of: &[u32; DEFLATE_NUM_OFFSET_SYMS]| -> u64 {
+        let litcode = make_huffman_code(DEFLATE_NUM_LITLEN_SYMS, MAX_LITLEN_CODEWORD_LEN, lf);
+        let offcode = make_huffman_code(DEFLATE_NUM_OFFSET_SYMS, MAX_OFFSET_CODEWORD_LEN, of);
+        let mut hs = HeaderScratch::new();
+        let header = build_dynamic_header(&litcode.lens, &offcode.lens, &mut hs);
+        header.header_bits()
+            + cost_from_freqs(litlen_freqs, offset_freqs, &litcode, &offcode)
+    };
+
+    let mut s_lit = [0usize; DEFLATE_NUM_LITLEN_SYMS];
+    for (d, &s) in s_lit.iter_mut().zip(litlen_freqs.iter()) {
+        *d = s as usize;
+    }
+    let mut s_off = [0usize; DEFLATE_NUM_OFFSET_SYMS];
+    for (d, &s) in s_off.iter_mut().zip(offset_freqs.iter()) {
+        *d = s as usize;
+    }
+    optimize_huffman_for_rle(&mut s_lit);
+    optimize_huffman_for_rle(&mut s_off);
+
+    let mut shaped_lit = [0u32; DEFLATE_NUM_LITLEN_SYMS];
+    for (d, &s) in shaped_lit.iter_mut().zip(s_lit.iter()) {
+        *d = s as u32;
+    }
+    let mut shaped_off = [0u32; DEFLATE_NUM_OFFSET_SYMS];
+    for (d, &s) in shaped_off.iter_mut().zip(s_off.iter()) {
+        *d = s as u32;
+    }
+
+    if price(&shaped_lit, &shaped_off) < price(litlen_freqs, offset_freqs) {
+        Some((shaped_lit, shaped_off))
+    } else {
+        None
+    }
+}
+
 fn cost_from_freqs(
     litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
     offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
