@@ -198,3 +198,83 @@ from the other end.
 
 So the depth-independent per-pass cost is real and `block_split.rs` carries it;
 the `memcpy` half of the earlier claim does not exist at T1.
+
+---
+
+# ⛔ CORRECTION 3 — "36.8% of the excess" compared our module against ZERO. It is <= 12.0%.
+
+The previous section reported `block_split.rs` = 33,152,259 Ir = **36.8% of the
+entire T1 instruction excess**. That divided OUR module total by the excess, as
+if libdeflate paid nothing for block splitting. It pays plenty — its
+`observe_literal`/`observe_match`/`ready_to_check_block` are `forceinline` and
+land inside `deflate_compress_greedy`, which is exactly why they never appeared
+as a separate line and why the earlier note said "no counterpart in their
+top-99%". That note was about their PROFILE LAYOUT and I then used it as if it
+were about their COST.
+
+Measured per source line on their side:
+
+| libdeflate block-splitting | Ir |
+|---|---|
+| `observe_literal` | 5,244,687 |
+| `observe_match` | 11,298,612 |
+| `ready_to_check_block` | 5,528,392 |
+| `merge_new_observations` | 150,030 |
+| `do_end_block_check` (attributed part) | 99,560 |
+| **total (a LOWER bound — see caveat)** | **22,321,281** |
+
+    ours   33,152,259 Ir   (own file, fully attributed)
+    theirs 22,321,281 Ir   (inlined, attributed lines only)
+    gap    <= 10,830,978 Ir  =  <= 12.0% of the 90,030,697 T1 excess
+
+⚠ Their figure is a LOWER bound and the gap an UPPER bound: their block-split
+code is inlined into `deflate_compress_greedy`, so any unattributed remainder
+falls into that function's bucket and cannot be separated. Our own module
+carries 4,616,982 Ir of "unidentified lines" that ARE visible precisely because
+it is a separate file. Comparing a fully-attributed module against a partially-
+attributed inlined one biases the gap UPWARD, which is the direction that
+flatters the finding.
+
+## What the per-line diff DID establish — and it is exact
+
+| | ours | libdeflate | delta |
+|---|---|---|---|
+| `observe_literal` | 5,244,687 | 5,244,687 | **0 — identical to the instruction** |
+| `observe_match` | 15,064,816 | 11,298,612 | **+3,766,204 = exactly +2.0 Ir/match** |
+
+1,883,102 matches x 2 Ir = 3,766,204 exactly. The literal path is
+instruction-for-instruction equal, so this is NOT generic Rust-vs-C overhead —
+it is two specific instructions in `observe_match`, and it localises further:
+`num_new_observations += 1` costs **4 Ir in our match path, 1 Ir in theirs**
+(their compiler keeps the field in a register across the inlined call; ours
+reloads it), while our index computation is 1 Ir cheaper. Net +2.
+
+The other named item is `ready_to_check_block`: ours 7,989,750 Ir on its first
+condition alone (3.04 Ir per token, called per position) against their 5,528,392
+for all three conditions.
+
+## Full accounting of our module (sums to the total, exactly)
+
+| | Ir | share |
+|---|---|---|
+| observers | 20,309,503 | 61.3% |
+| `ready_to_check_block` first condition | 7,989,750 | 24.1% |
+| unidentified lines | 4,616,982 | 13.9% |
+| `do_end_block_check` (the real work) | 236,024 | 0.7% |
+| **total** | **33,152,259** | 100% |
+
+The actual split DECISION is 0.7% of the module. Ninety-nine percent of block
+splitting's cost is the per-position bookkeeping that feeds it.
+
+## Standing after three corrections
+
+- matchfinder at T1: **2.20% CHEAPER than theirs**. Unchanged, still the
+  strongest result of the day, still kills matchfinder inner-loop levers.
+- non-matchfinder half: **+39.4%**, +100,969,707 Ir, 112.2% of the excess.
+  Unchanged.
+- block splitting's contribution to that: **<= 12.0%**, not 36.8%.
+- The remaining ~88% of the excess is still UNATTRIBUTED to a named component.
+  `parse/mod.rs` (71.8M), `emit_sequences` (51.9M), `bitstream.rs` (34.1M),
+  `tables.rs` (28.2M) and the `core::ptr`/`uint_macros` rows are where it must
+  be, and none of them has been diffed against the vendor line-by-line yet.
+  **That is the next measurement.**
