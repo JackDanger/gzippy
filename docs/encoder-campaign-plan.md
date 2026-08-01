@@ -2126,3 +2126,48 @@ STILL NOT A LEVER: 7 of 11 exceed the T4 threshold, and the promotion run must b
 `fulcrum try --threads 1,4` on the frozen box over the GATE set, not a TUNE screen on
 trainer. What this establishes is that the class deserves that run rather than a
 dismissal.
+
+### THE L4 FRONTIER, measured at T4 on both axes: ~4 of 11 files clear BOTH
+
+Lazy(6,30) vs shipped Greedy(16,30), T4, paired n=9, trainer. Threshold 1.026:
+
+```
+  file            wall     size(vs shipped)   wall OK?   size beats libdeflate-4?
+  data.csv       0.9487      0.968084          YES        YES   <- 5.1% faster, 3.2% smaller
+  dickens        0.9507      1.002194          YES        no    (size WORSE than shipped)
+  aozora.txt     0.9796      1.015732          YES        no    (size WORSE)
+  symbols.dwarf  0.9898      0.987677          YES        YES   <- faster AND smaller
+  data.json      0.9908      0.959831          YES        YES   <- faster AND 4.0% smaller
+  engine.wasm    1.0101      0.986057          YES        YES
+  tool.bin       1.0354      0.992227          no         YES
+  movie.mp4      1.0541      0.999920          no         YES
+  data.parquet   1.0725      0.994857          no         YES
+  minjs.min.js   1.0931      0.989985          no         YES
+  armexe.elf     1.0976      0.988777          no         YES
+```
+
+**6 of 11 clear the wall threshold; 3 are strictly Pareto-dominant** (faster AND smaller
+than a config that exactly TIES libdeflate). Intersecting both axes: **4 files clear
+everything — data.csv, symbols.dwarf, data.json, engine.wasm.**
+
+Depth 8 reaches the same intersection of 4 by a different route (4 wall-OK at T4, all of
+them size-OK). So the frontier converges on ~4 of 11 TUNE files either way, i.e. up to
+8 board cells (4 files x T1,T4) — real, but modest, and NOT the whole L4 class.
+
+```
+  config            size (beats ld-4)   wall-OK at T4   BOTH
+  Greedy(16,30)         0/11 (ties)         n/a          0
+  Lazy( 6,30)           9/11                6/11         4
+  Lazy( 8,30)          10/11                4/11         4
+  Lazy(10,30)          11/11                 ?           ?
+  Lazy(12,30)          11/11                 ?           ?   (T1 tax 1.1844: far over)
+```
+
+**The honest verdict on L4: neither an intrinsic ceiling nor a clean win.** The size is
+fully available (11/11 at depth 12) but the wall budget only affords it on ~4 of 11
+files, and WHICH files differ by depth. A shipping config would have to hold at every
+cell, and none measured here does.
+
+What is NOT yet measured and would complete the picture: wall at depths 10 and 12 at T4,
+and the same sweep on GATE members via `fulcrum try --threads 1,4` on the frozen box.
+Everything above is a TUNE screen on a non-frozen box (`freeze_checked=false`).
