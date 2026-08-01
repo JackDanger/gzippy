@@ -1481,3 +1481,62 @@ and nothing here does.
 PROVENANCE CAVEAT: this artifact is L6-only and predates current main (`e6e6ad30`,
 2026-07-31 01:14). The SHAPE (all wall failures are libdeflate T1; T4 rescues them all)
 is what is being claimed, not the exact ratios. Re-measure before quoting a number.
+
+## THE WALL DEFICIT AT L6 IS 2.16x THE INSTRUCTIONS FOR BYTE-IDENTICAL OUTPUT
+
+`fulcrum why libdeflate:movie.mp4:L6:T1:wall`, trainer, vanilla `cargo build --release`,
+main. movie.mp4 is a TUNE member (GATE files were not inspected).
+
+```
+[1 STRUCTURE] POSITION COUNTS MATCH (matches, matched-positions, literals all Δ0.00%)
+  ours : 12,809,648 tokens (47,029 matches, 12,762,619 literals), 103,123,085 bits
+  rival: 12,809,648 tokens (47,029 matches, 12,762,619 literals), 103,123,085 bits
+    -> identical parse decisions AND byte-identical output
+
+[2 LINES]
+  ours  total Ir: 20,125,529,337
+  rival total Ir:  9,315,411,125          -> WE EXECUTE 2.16x THE INSTRUCTIONS
+```
+
+The tool's own verdict: **"same algorithm; the excess is IMPLEMENTATION."** 10.8 BILLION
+excess instructions on a single 12.9 MB file, for output that is byte-for-byte the same.
+
+### This is an order of magnitude worse than the figure the campaign has been using
+
+`docs/vendor-structure-comparison.md` §4 records the operation-level gap as **496.0M vs
+555.1M Ir = 11.9%**, measured at **L2 on silesia 8 MB**. At **L6 on movie.mp4 it is
+116%**. Hard stop #3 — "never generalise a measurement across levels" — exists for
+precisely this, and §4's number has been the campaign's working figure for the
+implementation gap. It does not describe the coordinate that fails.
+
+### What the composition says the target is
+
+movie.mp4 at L6 is **12,762,619 literals against 47,029 matches** — 271 literals per
+match. The hot path on this file is therefore almost entirely the LITERAL path: the
+matchfinder searching and FAILING, plus literal emission. That is a much narrower target
+than "the matchfinder", and it is consistent with the wall board's shape (the failing
+libdeflate-T1 cells are led by photo.jpg, movie.mp4, symbols.dwarf, armexe.elf,
+weights, engine.wasm — the low-match-density files).
+
+### Ir LOCATES, it does not predict the wall — and here the ratio proves it
+
+Ir is 2.16x while the measured wall ratio for this cell is 1.1883 (+18.8%). So we retire
+~1.8x more instructions per unit time than libdeflate: our IPC is far higher and the
+deficit is instruction COUNT, not stalls. That agrees with
+`project_encoder_deficit_is_loads_not_stalls`, which found our IPC, stalls, cache and
+branch behaviour all BEAT libdeflate — and it is why "reduce instructions on the
+literal path" is the shape of the lever rather than any microarchitectural fix.
+
+### DENOMINATOR AND CAVEATS, as the tool states them
+
+  * **2 of 4 layers ran.** [3 COUNTERS] skipped (the gzip oracle exited 1 on this file)
+    and [4 PARAMS] skipped (the vanilla binary emits no `LEVEL_DECLARED`; that needs
+    `--features anatomy-counters`, which must never be the binary a wall claim is quoted
+    from). No claim here rests on those layers.
+  * **The per-line attribution is NOT usable**: the rival shows `???:0` at 75.37%, i.e.
+    libdeflate is built without `-g` and is one opaque symbol. Hard stop #1 warns about
+    exactly this. The TOTAL Ir is still valid — callgrind counts instructions regardless
+    of symbolisation — so the 2.16x stands while "which line" does not.
+  * Coordinate: L6, T1, movie.mp4, main. NOT generalised to other levels or files; the
+    next step is to repeat it on symbols.dwarf and armexe.elf (both TUNE, both failing
+    wall cells) before treating "the literal path" as the class.
