@@ -2018,3 +2018,39 @@ scale nearly linearly.
 
 Recorded so the next session does not re-derive it: the smallest failing file in this class is
 868 KB and still hits 1.94x. There is no size floor below which the seam is free.
+
+## G41 — hash3 chaining: 6 cells closed, 12 TIED cells flipped. The cage is a trap for ANY T1 change
+
+G36 attributed the dd79_bin6 class to short-match discovery and noted the prior hash3-chaining
+attempt (11 closed / 14 opened) was a blind global swap with no per-cell target. Retried ON TOP
+of the 42-cell composition, on the reopen basis that the margin might protect the cells the
+earlier attempt flipped. Graded on the promotion corpus against `perf/combined`:
+
+    clause 4 OK: 6 cells CLOSED — libdeflate dd79_bin6 L2/L9 T4, engine.wasm L9 T4,
+                 photo.jpg L2/L6/L9 T4
+    clause 3 FAIL: 12 pass->fail flips, EVERY ONE at ratio 1.0000:
+                 engine.wasm L6/L9 T1, monorepo.tar L2/L6/L9 T1, symbols.dwarf L2/L9 T1,
+                 weights.safetensors L2/L6/L9 T1 + L6 T4, winexe.exe L2 T1
+    clause 5 FAIL: erosion budget exceeded on 3 more
+    clause 6 FAIL: improvement 0.0099 < 2x harm 0.0054
+    VERDICT: NO-SHIP
+
+WHY IT CLOSED SIX. Chaining hash3 makes T1 SMALLER, and a smaller T1 is margin that absorbs the
+T>1 seam — the same mechanism as the dual-candidate Huffman. Note WHICH six: they are seam
+cells (photo.jpg at three levels, engine.wasm, dd79_bin6 T4), not the T1 cells the change was
+aimed at. It closed a class it was not targeting.
+
+WHY IT FLIPPED TWELVE, and this is the general lesson. Every flip sits at ratio 1.0000 — the
+cells where we are BYTE-IDENTICAL to libdeflate (G15: 154 of 198 T1 cells). Zero headroom means
+any change to T1 output flips them unless it is non-worse on EVERY tied file simultaneously.
+"Different" is enough; it does not have to be worse on average. Here the change is a net T1
+IMPROVEMENT and still lost, because improvement-on-average is not the bar.
+
+THE STRUCTURAL CONSTRAINT, stated once so it is not rediscovered: A CHANGE THAT ALTERS T1 OUTPUT
+MUST BE NON-WORSE ON ALL 154 TIED FILES, NOT NET-POSITIVE. That is why the T>1-only changes
+(depth scaling, and the Huffman candidate which is non-worse BY CONSTRUCTION) pass while T1
+changes keep failing: the first two cannot touch a tied cell, and the third cannot lose one.
+
+This also retires the composition hope for this class. Margin at T4 cannot protect a T1 tied
+cell, because the flip happens at T1 where the margin does not exist. Third composition attempt,
+second failure — depth+Huffman worked; grid+margin (G39) and this did not.
