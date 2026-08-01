@@ -630,7 +630,12 @@ pub(super) fn compress(
         // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
         // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
         // closed search and what the 2.19x instruction gap actually is.
+        // MEASUREMENT-ONLY ABLATION (branch measure/l1-htfast-ablation, NEVER MERGE):
+        // routed to ht_fast to COUNT whether the 2-way bucket closes the literal gap
+        // that `fulcrum why` measured (+39-189% literals vs libdeflate on 3 TUNE files).
         #[cfg(not(feature = "l1-tune"))]
+        Strategy::Fast => ht_fast::run(buf, data_start, in_end, params, statics, bw, is_last),
+        #[cfg(any())]
         Strategy::Fast => fast::run::<false>(
             buf,
             data_start,
