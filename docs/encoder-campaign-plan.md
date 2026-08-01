@@ -1239,3 +1239,1019 @@ zlib-ng's `deflate_medium`, a THIRD strategy that is neither greedy nor lazy and
 "exists precisely to make L3-6 monotonic at a fraction of lazy's cost". Note a prior
 naive lazy-at-L4 experiment measured 17.7% wall, so the cheap-monotonic property is the
 whole point.
+
+### FULL TUNE SET on x86, T1 AND T4: 10 board cells close, 0 open — and the WALL kills it anyway
+
+All 11 TUNE members, trainer (Intel x86), vanilla builds, exact byte counts:
+
+```
+=== L1 T1 ===                                       === L1 T4 ===
+                libdeflate    shipped      ht256      shipped      ht256
+aozora.txt         4566347    4751200    4578206     4751416    4578509   fail
+armexe.elf          621027     599781     607417      600310     607211   PASS
+data.csv           3932419    4111742    3926359     4112086    3926566   CLOSES
+data.json          1840461    1873127    1846101     1873815    1846239   fail
+data.parquet      14386710   14424479   14383856    14426706   14383721   CLOSES
+dickens            4972688    5077406    4981078     5078221    4981395   fail
+engine.wasm         421013     426271     420714      425688     420809   CLOSES
+minjs.min.js       1184930    1211746    1180722     1211684    1181042   CLOSES
+movie.mp4         12901167   12903670   12899895    12903821   12900349   CLOSES
+symbols.dwarf       396048     394736     391698      394830     391539   PASS
+tool.bin          22673676   22565629   22196465    22565472   22195660   PASS
+                 shipped 3/11 -> ht256 8/11        shipped 3/11 -> ht256 8/11
+```
+
+**10 of the 200 failing board cells close, ZERO open.** `tool.bin` also improves
+369,164 B while already passing. The three that resist (aozora, data.json, dickens) are
+exactly the text files the length-3 mechanism predicts will resist.
+
+### THE PRE-REGISTERED NO-SHIP FIRES: clause 5 fails at T4 too
+
+The pre-registered rule above said: "NO-SHIP if clause 5 fails at T4 ... this class is
+then closed on the wall at BOTH coordinates — record it and stop, do not re-sample."
+
+`fulcrum ab paired --mode compress`, n=15, /dev/null both arms, A/A certificate clean,
+minjs.min.js L1, trainer (NOT the frozen box — this is a SCREEN, `freeze_checked=false`):
+
+```
+  ht256 vs shipped  T1: ratio 1.2097  a=69.321ms b=55.919ms  sign 15/15  (+13.40 ms)
+  ht256 vs shipped  T4: ratio 1.1098  a=25.832ms b=23.373ms  sign 14/15  (+ 2.46 ms)
+
+  vs gzip at T4:  shipped ratio 0.1949  |  ht256 ratio 0.2090
+                  EROSION 0.0141  against the clause-5 budget 0.0050  =  2.8x OVER
+```
+
+T4 helps enormously — the absolute penalty is 5.4x smaller than T1's, and the erosion
+falls from attempt 2's T1 figure of 0.2312 (46x over budget) to 0.0141 (2.8x over), a
+16x improvement. **It still misses.** The 21% T1 self-tax independently reproduces
+attempt 2's recorded 15-50%.
+
+**VERDICT: the `ht_fast` routing is NO-SHIP at BOTH coordinates.** The coordinate
+argument — the one genuinely untried axis — is now spent. Recorded and stopped, not
+re-sampled on other files until one passes.
+
+SEPARATE THE CEILING FROM THE VERDICT: the 10-cell SIZE result is real, roundtrip-clean,
+and does not expire. What is closed is winning it *via this routing at this wall cost*.
+
+THE NAMED REOPEN CANDIDATE, for a session that has not spent its two strikes on
+load-shaving: `matchfinder/ht.rs`'s `longest_match` reads AND writes `hash3_tab`
+UNCONDITIONALLY before the 4-byte search, yet `cur_node3` is only USED when that search
+misses. Reordering (search first; on hit, blind-store with no load; on miss,
+load-then-store) preserves table quality exactly and removes one dependent load per HIT
+position — which is literally attempt 2's stated reopen condition ("a mechanism that
+adds candidates WITHOUT adding dependent loads per position"). NOT BUILT HERE: this is
+load-shaving, and `project_encoder_deficit_is_loads_not_stalls` is 2-for-2 against that
+class (deleting 25.6M loads at L9 made the wall WORSE), so CLAUDE.md's two-strikes rule
+closes it for this session. The store touches the same cache line either way; only the
+latency ordering changes.
+
+### PROVENANCE FAILURE CAUGHT BY THE CENSUS MATCH
+
+An uncommitted `L1_HASH3_MAX_DIST = 4096` patch was left in the local working tree and
+rode along across several `git checkout`s (uncommitted changes survive branch switches).
+It contaminated ONE reported figure: the local arm64 "shipped-fast 4/11" baseline was
+built WITH it (dickens 5,078,617, not clean main's 5,080,065).
+
+**The x86 results are provably clean, and the check that proves it is the census match:**
+trainer's tree was clean and its `shipped` column reproduces
+`/root/sizeboard-all-12fcd0ed/census.json` byte-for-byte (dickens 5,077,406), which a
+patched build cannot do. That is why "does the baseline reproduce the board?" is worth
+running on every measurement — it caught a contamination that discipline did not.
+The patch is now parked on `measure/l1-hash3-maxdist`; the tree rebuilds to 5,080,065.
+
+## THE BIGGEST LEVER ON THE BOARD: zlib chain depths at T>1 — 70 cells, 1 flip
+
+`docs/vendor-structure-comparison.md` records "matching zlib's chain depths at L5-L9
+closes 84 failing size cells (and opens 13)". Diffing the artifact behind that claim
+(`/root/size-zlibdepths/census.json`, ours_sha `276a941c`) against the baseline board
+(`/root/sizeboard-all-12fcd0ed/census.json`) over the 1,320 common cells shows what
+those 13 openings actually ARE:
+
+```
+CLOSED 84:  70 at T4,  14 at T1
+OPENED 13:  12 at T1,   1 at T4
+```
+
+**All 13 openings are libdeflate, and 12 of the 12 T1 openings are EXACT BYTE TIES in
+the base board** — the zero-headroom cage, perturbed by as little as ONE byte:
+
+```
+  dd79_bin6      L6 T1   4,461,731 = rival        ->  +1 B over
+  weights        L7/L8/L9 T1                      ->  +2 B over each
+  dd79_bin6      L5 T1                            ->  +4 B
+  photo.jpg      L7 T1                            ->  +5 B
+  movie.mp4      L5 / L6 T1                       -> +54 / +60 B
+  symbols.dwarf  L8 T1                            -> +125 B
+  weights        L5 T1                            -> +138 B
+  data.csv       L9 T1                            -> +226 B
+  engine.wasm    L8 T4  (the ONLY non-tie: was a 158 B WIN) -> +57 B
+```
+
+### The cage is sidestepped by construction, not by tuning
+
+Apply the depth change in `params_parallel` (T>1) ONLY:
+
+```
+  closes 70, opens 1   ->  net +69, clause 3 sees ONE flip
+  closed@T4 by rival:  libdeflate 56, gzip 7, pigz 7
+  opened@T4:           libdeflate engine.wasm L8, +57 B
+```
+
+T1 output is untouched, so all 12 tie-cage openings vanish **by construction rather
+than by fitting**. And T4 output depends only on `params_parallel`, so the census's T4
+column carries over exactly — this is a re-reading of an existing measurement, not an
+extrapolation.
+
+**70 of the 200 failing cells is 35% of the board**, the largest single lever measured
+this campaign, and it needs one flip resolved rather than thirteen.
+
+### Relationship to PR #227 — same family, and #227 is the conservative member
+
+#227 ships `p.max_search_depth = p.max_search_depth.saturating_mul(4)` in
+`params_parallel` and closes 42 cells. zlib's actual per-level depths are not a uniform
+multiple:
+
+```
+  level        L5    L6    L7     L8     L9
+  ours         16    35   100    300    600
+  zlib         32   128   256   1024   4096
+  ratio       2.0x  3.66x 2.56x  3.41x  6.83x
+  #227 (x4)    64   140   400   1200   2400
+```
+
+⚠ **CORRECTED — the "~28 cells beyond #227" claim first written here is WRONG, and
+backwards.** Read the table again: zlib is SHALLOWER than x4 at L5, L6, L7 and L8, and
+deeper only at L9. And #227's gate runs `--levels 2,6,9` while the zlib census covers
+L1-L9, so 70-vs-42 was never apples-to-apples. Restricted to the comparable coordinate:
+
+```
+  ALL levels, ALL threads                  closed 84  opened 13  net +71
+  ALL levels, T4 only                      closed 70  opened  1  net +69
+  L2/L6/L9 only                            closed 31  opened  5  net +26
+  L2/L6/L9, T4 only  <-- #227's coordinate closed 25  opened  0  net +25
+```
+
+**zlib's depths close 25 where #227 closes 42.** #227's configuration is BETTER at the
+levels it gates — exactly what the shallower-at-L5-L8 table predicts. There is no
+"+28 cells" to collect by switching to zlib's numbers.
+
+**THE REAL FINDING IS WHERE THE OTHER CLOSURES LIVE.** The 70 T4 closures split by
+level as `L5:18  L6:16  L7:17  L8:10  L9:9`. **45 of the 70 are at L5, L7 and L8 —
+levels the standard gate never measures.** `--levels 2,6,9` samples 3 of the 9 levels
+that carry failures, while `params_parallel` applies at EVERY level. So **#227's "42
+cells closed" is a FLOOR on its board effect, not a measurement of it**, and the same
+undercount applies to every lever ever graded at L2/L6/L9.
+
+ACTION when #227's gate returns: re-measure the FULL board across all levels rather
+than quoting 42.
+
+### WHAT IS NOT ESTABLISHED — the wall, and it is the binding constraint
+
+This is a SIZE re-reading of an existing artifact. **No wall number is quoted and none
+exists for the T>1-only configuration.** Deeper chains cost time in direct proportion:
+L9 at 4096 walks 6.83x our current 600. The T4 budget is 249-330% slack, which is large
+but not unlimited, and #227's own note reports that even x4 at L9 (2,400 nodes) stays
+ahead of both rivals — so the marginal question is 2,400 -> 4,096, not 600 -> 4,096.
+
+Provenance caveat: `/root/size-zlibdepths/meta.json` carries `"attested": false`, so the
+84/13 artifact is un-attested. The DIFF above is sound as a description of that
+artifact; promoting anything from it requires a fresh gated run.
+
+ORDER OF WORK: this composes with, and partly supersedes, #227. Land #227 on its
+running wall gate FIRST (land-gated-work-first), then tune `params_parallel` depths
+toward zlib's per-level values and gate that, with the single engine.wasm L8 T4 flip as
+the known blocker to resolve.
+
+## THE WALL BOARD REDUCES TO ONE CELL CLASS: libdeflate at T1
+
+`/root/wallboard-L6/census.json` (L6, 20 corpus files, 4 rivals, T1+T4, commit
+`e6e6ad30`, gzippy sha `eb9a0a50`, 111 measured cells, 19 failing). Split by rival and
+thread count:
+
+```
+  gzip        T1   18 measured,  0 failing   worst ratio 0.5305
+  gzip        T4   19 measured,  0 failing   worst ratio 0.1941
+  pigz        T1   16 measured,  0 failing   worst ratio 0.6045
+  pigz        T4   20 measured,  0 failing   worst ratio 0.7948
+  libdeflate  T1   19 measured, 19 FAILING   worst ratio 1.2092
+  libdeflate  T4   19 measured,  0 failing   worst ratio 0.5693
+```
+
+**Every wall failure on the board is libdeflate at T1, and it is ALL of them — 19 of
+19.** We are 8-21% slower there (photo.jpg 1.2092, movie.mp4 1.1883, symbols.dwarf
+1.1700, armexe.elf 1.1613, weights 1.1523, engine.wasm 1.1512). **At T4 the same 19
+cells all PASS** (0.3940-0.5693). Against gzip and pigz we never lose on wall at any
+thread count.
+
+### Composed with the size board, this is the campaign's hard core
+
+```
+  vs libdeflate at T1:  TIE on size (154/198 cells byte-identical)  +  LOSE on wall 19/19
+  vs libdeflate at T4:  lose on size only by the SEAM               +  WIN on wall 19/19
+  vs gzip / pigz:       win on wall everywhere; size gaps are 0.02-1.1%
+```
+
+**The T1-vs-libdeflate cell has zero headroom in BOTH directions simultaneously** —
+byte-identical on size, 8-21% behind on wall. That is why no lever moves it: there is
+nothing to trade.
+
+### This sharpens the clause-5 finding rather than replacing it
+
+Clause 5 does not block size levers in the abstract. **It blocks them to protect our
+2-5x margin over gzip and pigz** — the cells at ratio 0.19-0.79, all passing
+comfortably, which is where every measured erosion landed (gzip:minjs:T4,
+gzip:dickens:L4:T1, gzip:data.json:T1). Meanwhile the cell class we ACTUALLY lose on
+wall, libdeflate T1, is unprotected by clause 5 because it is already failing.
+
+So the rule is spending its entire protective budget on margins we do not need, against
+rivals we dominate, while the real competitive deficit sits outside its scope. Stated as
+an observation only — `CLAUDE.md` forbids rewriting a promotion rule to fit a result,
+and nothing here does.
+
+### What this implies for lever selection, concretely
+
+  * A size lever that costs wall is affordable ONLY where the wall cell is already
+    failing (libdeflate T1) or where the margin is large enough that 0.005 is not the
+    binding term (`old_ratio > 0.98`). Neither is the common case.
+  * **The libdeflate-T1 WALL deficit is a first-class target in its own right** and is
+    NOT blocked by clause 5 — those 19 cells are already failing, so improving them
+    cannot flip anything. This is the one axis where work is unconstrained.
+  * T>1 is not where the wall problem is. At T4 we already win every libdeflate cell.
+
+PROVENANCE CAVEAT: this artifact is L6-only and predates current main (`e6e6ad30`,
+2026-07-31 01:14). The SHAPE (all wall failures are libdeflate T1; T4 rescues them all)
+is what is being claimed, not the exact ratios. Re-measure before quoting a number.
+
+## THE WALL DEFICIT AT L6 IS 2.16x THE INSTRUCTIONS FOR BYTE-IDENTICAL OUTPUT
+
+`fulcrum why libdeflate:movie.mp4:L6:T1:wall`, trainer, vanilla `cargo build --release`,
+main. movie.mp4 is a TUNE member (GATE files were not inspected).
+
+```
+[1 STRUCTURE] POSITION COUNTS MATCH (matches, matched-positions, literals all Δ0.00%)
+  ours : 12,809,648 tokens (47,029 matches, 12,762,619 literals), 103,123,085 bits
+  rival: 12,809,648 tokens (47,029 matches, 12,762,619 literals), 103,123,085 bits
+    -> identical parse decisions AND byte-identical output
+
+[2 LINES]
+  ours  total Ir: 20,125,529,337
+  rival total Ir:  9,315,411,125          -> WE EXECUTE 2.16x THE INSTRUCTIONS
+```
+
+The tool's own verdict: **"same algorithm; the excess is IMPLEMENTATION."** 10.8 BILLION
+excess instructions on a single 12.9 MB file, for output that is byte-for-byte the same.
+
+### This is an order of magnitude worse than the figure the campaign has been using
+
+`docs/vendor-structure-comparison.md` §4 records the operation-level gap as **496.0M vs
+555.1M Ir = 11.9%**, measured at **L2 on silesia 8 MB**. At **L6 on movie.mp4 it is
+116%**. Hard stop #3 — "never generalise a measurement across levels" — exists for
+precisely this, and §4's number has been the campaign's working figure for the
+implementation gap. It does not describe the coordinate that fails.
+
+### What the composition says the target is
+
+movie.mp4 at L6 is **12,762,619 literals against 47,029 matches** — 271 literals per
+match. The hot path on this file is therefore almost entirely the LITERAL path: the
+matchfinder searching and FAILING, plus literal emission. That is a much narrower target
+than "the matchfinder", and it is consistent with the wall board's shape (the failing
+libdeflate-T1 cells are led by photo.jpg, movie.mp4, symbols.dwarf, armexe.elf,
+weights, engine.wasm — the low-match-density files).
+
+### Ir LOCATES, it does not predict the wall — and here the ratio proves it
+
+Ir is 2.16x while the measured wall ratio for this cell is 1.1883 (+18.8%). So we retire
+~1.8x more instructions per unit time than libdeflate: our IPC is far higher and the
+deficit is instruction COUNT, not stalls. That agrees with
+`project_encoder_deficit_is_loads_not_stalls`, which found our IPC, stalls, cache and
+branch behaviour all BEAT libdeflate — and it is why "reduce instructions on the
+literal path" is the shape of the lever rather than any microarchitectural fix.
+
+### DENOMINATOR AND CAVEATS, as the tool states them
+
+  * **2 of 4 layers ran.** [3 COUNTERS] skipped (the gzip oracle exited 1 on this file)
+    and [4 PARAMS] skipped (the vanilla binary emits no `LEVEL_DECLARED`; that needs
+    `--features anatomy-counters`, which must never be the binary a wall claim is quoted
+    from). No claim here rests on those layers.
+  * **The per-line attribution is NOT usable**: the rival shows `???:0` at 75.37%, i.e.
+    libdeflate is built without `-g` and is one opaque symbol. Hard stop #1 warns about
+    exactly this. The TOTAL Ir is still valid — callgrind counts instructions regardless
+    of symbolisation — so the 2.16x stands while "which line" does not.
+  * Coordinate: L6, T1, movie.mp4, main. NOT generalised to other levels or files; the
+    next step is to repeat it on symbols.dwarf and armexe.elf (both TUNE, both failing
+    wall cells) before treating "the literal path" as the class.
+
+### PREDICTION TESTED AND WEAKENED: the excess is GLOBAL, not literal-path
+
+The section above hypothesised that the 2.16x instruction excess lives on the LITERAL
+path, because movie.mp4 at L6 runs 271 literals per match. Per "ONE MEASUREMENT
+SUPPORTS ONE CLAIM — name the mechanism, then predict a SECOND consequence and check
+it", the prediction was: a high-match-density file should come in much closer to 1.0.
+
+Same command, same coordinate, dickens (TUNE, match-dominated):
+
+```
+                 lit/match    ours Ir           rival Ir          ratio
+  movie.mp4        271.4      20,125,529,337    9,315,411,125     2.16
+  dickens            0.57     16,710,714,581    9,291,141,632     1.80
+```
+
+**A 475x change in composition moves the ratio only from 2.16 to 1.80.** The prediction
+is directionally right and quantitatively wrong: if the excess were literal-path work,
+a match-dominated file should have shed most of it. It shed about a fifth.
+
+Normalised per input byte (movie.mp4 12,942,257 B; dickens 12,174,519 B):
+
+```
+              ours Ir/byte   rival Ir/byte   excess/byte
+  movie.mp4       1,555            720           +835
+  dickens         1,373            763           +610
+```
+
+Two things fall out, and the second is the more interesting:
+
+1. **Our excess is ~610-835 instructions PER INPUT BYTE on both files** — of the same
+   order regardless of whether the input is 99.6% literals or 64% matches. So the
+   dominant term is a GLOBAL per-position overhead, not literal-specific work. The
+   "literal path" framing in the previous section is DOWNGRADED to a secondary effect
+   worth at most the 2.16-vs-1.80 difference.
+2. **libdeflate's instruction count is nearly content-independent at L6** — 9,315M vs
+   9,291M Ir (0.3% apart) across two files with completely different match structure,
+   while ours moves 20,126M -> 16,711M (17% apart). Their cost is flat in content;
+   ours is not. That asymmetry is itself a structural clue and was not visible from
+   either file alone.
+
+What this does NOT change: position counts still match exactly on both files, output is
+still byte-identical on both, and the excess is still IMPLEMENTATION rather than
+algorithm. What it changes is the target — "make the literal path cheaper" is not the
+lever; the lever is whatever costs us ~600+ instructions per position that costs
+libdeflate ~0.
+
+Coordinate: L6, T1, main, TUNE members only, trainer. Ir LOCATES and never predicts the
+wall (movie.mp4 is 2.16x Ir at 1.1883x wall). Per-line attribution remains unusable —
+libdeflate is built without `-g`.
+
+## STRUCTURE, NOT RATIOS: the level knobs are INERT on exactly the cells we lose
+
+`fulcrum anatomy explain` — the tool that "puts each level's DECLARED knobs beside the
+OBSERVED behaviour and refuses loudly when they disagree". Two TUNE members, L0-9, T1,
+origin/main built `--features anatomy-counters` (an instrumented build — it emits no
+score and NO WALL NUMBER IS QUOTED FROM IT).
+
+Mean chain-walk candidates per search:
+
+```
+              L2    L3    L4    L5    L6    L7    L8    L9     declared depth 6 -> 600
+  dickens    3.10  4.52  5.91  5.46  8.22 12.63 15.84 17.58    knob ACTIVE
+  movie.mp4  0.32  0.32  0.32  0.32  0.33  0.33  0.34  0.34    knob INERT
+```
+
+**On movie.mp4 every level from L2 to L9 does the SAME work.** The tool's verdict:
+
+    max_search_depth=600 is INERT: only 0.1% of it is ever used (0.34 candidates/search)
+    nice_match_length=258 is INERT: mean accepted match is 3.83 bytes, 1.5% of it
+    search effort is not monotonic in level (P3): L3 walks 0.32 but L4 walks 0.32
+
+The mechanism is plain once seen: on near-random input the hash chains are EMPTY (no
+collisions to walk), so the search terminates immediately no matter how deep it is
+allowed to go.
+
+### Why this matters more than any ratio measured today
+
+**Every failing wall cell is a literal-dense file** — photo.jpg, movie.mp4,
+symbols.dwarf, armexe.elf, weights.safetensors, engine.wasm, winexe.exe (see the wall
+board section above, 19 of 19 libdeflate T1). On exactly those cells the level ladder is
+a NO-OP and **100% of our cost is the FIXED PER-POSITION PATH** — hash computation,
+table insertion, bookkeeping done at every position whether or not a search happens.
+
+That closes the loop on the two Ir results above, which I had been refining as numbers:
+  * our excess is ~610-835 instructions PER INPUT BYTE, roughly independent of content —
+    because it is per-position fixed cost, not search;
+  * libdeflate's instruction count is content-INDEPENDENT (9,315M vs 9,291M, 0.3% apart)
+    — because their fixed per-position cost is small and flat, while ours is large.
+**The target is the fixed per-position path, NOT the search and NOT the literal path.**
+Every depth-based lever measured today was operating on a knob that does nothing here.
+
+### The ladder is also mostly inert at DEEP levels on match-dense input
+
+dickens: L8 uses 5.3% of its declared 300 (15.84 walked); L9 uses 2.9% of 600 (17.58).
+`nice_match_length` is INERT everywhere measured — mean accepted match is 3.8-7.3 bytes
+against declared 65/130/258, so early termination essentially never fires.
+
+Per the tool's own NEXT line: **"a declared knob that does not move observed behaviour
+is a defect, not a tuning opportunity."** Our L7/L8/L9 declare 100/300/600 and walk
+12.6/15.8/17.6. Whatever separates those levels, it is not what the table says.
+
+### METHOD NOTE — recorded because it cost four turns
+
+I measured this gap four times, at increasing precision (2.16x, then 1.80x, then
+610-835 Ir/byte), without once asking what libdeflate's loop DOES differently. The user
+asked "are you fixated on numbers again instead of looking at structure?" and "did you
+forget about fulcrum?" — both landed. I had also just hand-rolled `valgrind
+--tool=callgrind` + `callgrind_annotate` for attribution, which is hard stop #6 verbatim,
+while `fulcrum anatomy explain` was sitting in the guide index answering exactly this.
+ONE command produced more than four turns of ratio-refinement. Numbers teach you about
+the construction; they are not the finding.
+
+Coordinate: L0-9, T1, movie.mp4 + dickens (TUNE), origin/main, trainer.
+NOT generalised to the other failing wall files — confirm on symbols.dwarf and
+armexe.elf before treating "literal-dense => inert ladder" as the class.
+
+## ⚠ TOOL DEFECT: `fulcrum anatomy --exec` returns a STALE CACHED total_ir
+
+Discovered 2026-08-01 on trainer, fulcrum 0.3.0 (8364a059). The `--exec` layer's
+`total_ir` and its per-bucket `ir=` figures are **identical to the digit across
+different input files and do not vary with `--level`**:
+
+```
+  engine.wasm  raw=   868,202    total_ir=1703992455
+  dickens      raw=12,174,519    total_ir=1703992455
+  movie.mp4    raw=12,942,257    total_ir=1703992455
+  --level 1  -> no exec output at all
+  --level 6  -> total_ir=1703992455   match_finder ir=785217966
+  --level 9  -> no exec output at all
+```
+
+Three files spanning 15x in size return the same instruction count. That cannot be a
+measurement. The value is the one produced by the FIRST `--exec` invocation in the
+session (movie.mp4, L6, with the encoder UNPINNED so it ran at the box's default thread
+count), replayed thereafter.
+
+`fulcrum selftest "anatomy"` PASSES (RATIO_SELFTEST=PASS checks=5) — the Gate-0 covers
+the ratio pipeline, not the exec layer's cache key. So a green selftest does NOT cover
+this.
+
+**Consequences for anything quoted from that layer:**
+  * Its bucket shares compare OURS AT THE DEFAULT THREAD COUNT against LIBDEFLATE AT T1
+    — a mismatched-thread comparison — and are then replayed for unrelated inputs.
+  * The `match_finder 46.08% vs 47.20% / block_split 11.32% vs 11.27%` reading is VOID.
+    It was quoted here as "the part that survives instrument disagreement"; it does not
+    survive, because it comes from the same cached run.
+  * The layer already self-labels "UNCALIBRATED ... Measurement-Gate-5 WEAK/HYPOTHESIS
+    tier, never a Gate-2 finding". That warning should be read as literal.
+
+**What this resolves:** the 12x disagreement between `fulcrum why`'s callgrind totals
+(movie.mp4 20,125,529,337; dickens 16,710,714,581 — they VARY with the input, as a real
+measurement must) and `anatomy --exec`'s cachegrind total (constant). The callgrind
+numbers behave like measurements; the cachegrind ones do not. Reconciliation resolves in
+favour of `fulcrum why`.
+
+**Method receipt, and it is the uncomfortable one:** I first diagnosed the discrepancy as
+a thread mismatch, then RETRACTED that diagnosis because "the exec numbers were identical
+across both runs, so threads weren't the cause". The identity WAS the evidence — of
+caching, not of thread-independence. A number that refuses to move when an input changes
+is not a stable measurement, it is not a measurement. The discriminating test cost one
+command: run it on a file 15x smaller and see whether the count moves.
+
+## ⛔ RETRACTION: the "2.16x instructions" finding was a BROKEN INSTRUMENT. True ratio is 1.43x.
+
+Both fulcrum Ir layers are wrong, in different ways, and everything I derived from them
+above is void. Hand-measured ground truth — cachegrind, `--cache-sim=no
+--branch-sim=no`, binaries invoked DIRECTLY (no shell wrapper: valgrind does not follow
+`exec` by default and will silently profile only `/bin/sh`), ours = the symbolised
+release build whose output is byte-identical to the shipped one:
+
+```
+                     ours Ir        Ir/B    libdeflate Ir     Ir/B   TRUE ratio
+  movie.mp4     1,650,693,672        128    1,153,377,248       89       1.43
+  dickens       1,385,371,628        114    1,155,052,955       95       1.20
+  engine.wasm     100,723,312        116            —            —        —
+
+  fulcrum why (callgrind) CLAIMED:  movie.mp4 2.16   dickens 1.80
+  fulcrum anatomy --exec CLAIMED:   1,703,992,455 for EVERY file, every level
+```
+
+**`fulcrum why`'s callgrind layer inflates ASYMMETRICALLY** — our arm x12.06, the rival's
+x8.04 on dickens — which manufactures a 1.80 where the truth is 1.20. A symmetric
+inflation would have preserved the ratio; this does not. So the ratio could not be
+rescued from it either.
+
+**`fulcrum anatomy --exec` returns a constant** (see the section above): 1,703,992,455
+for engine.wasm (true 100,723,312 — 17x off), dickens and movie.mp4 alike.
+
+### What is retracted, by name
+
+  * "we execute 2.16x libdeflate's instructions for byte-identical output" — FALSE, it
+    is 1.43x on movie.mp4 and 1.20x on dickens.
+  * "the campaign's 11.9% figure is an L2 number and the real gap at L6 is 116%" —
+    FALSE. `vendor-structure-comparison.md` §4's 11.9% (L2/silesia) is much closer to
+    the truth than anything I claimed; the L6 gap is 20-43%, not 116%.
+  * "our excess is ~610-835 instructions per input byte" — FALSE, it is 19-38 Ir/byte.
+  * "reconciliation resolves in favour of `fulcrum why`" — FALSE. Both layers are wrong.
+
+### What SURVIVES, and is now hand-confirmed rather than tool-reported
+
+  * **libdeflate's instruction count really is content-independent**: 1,153,377,248
+    (movie.mp4) vs 1,155,052,955 (dickens) — **0.15% apart** across inputs with utterly
+    different match structure — while ours moves 19% (1,650M vs 1,385M). Their inner
+    loop has a flat per-position cost; ours does not. This was the interesting half and
+    it holds.
+  * **The excess IS content-dependent, and the "literal path" hypothesis REVIVES.**
+    Excess per input byte: **38 Ir/B on literal-dense movie.mp4 vs 19 Ir/B on
+    match-dense dickens — a clean 2x.** With the broken numbers this looked like 1.37x
+    and I "corrected" the hypothesis to a global overhead. With true numbers the
+    decomposition is roughly: ~19 Ir/byte GLOBAL excess, plus ~19 Ir/byte MORE on
+    literal-dense input.
+  * The `anatomy explain` finding is untouched — it reads deterministic counters out of
+    our own binary, not either broken Ir layer: on movie.mp4 the chain walk is 0.32-0.34
+    at every declared depth from 6 to 600, i.e. the level knobs are INERT on exactly the
+    cells we lose.
+
+### Method receipt — the failure chain, because it repeated three times
+
+1. Quoted `fulcrum why`'s Ir totals without sanity-checking Ir-per-byte. 1,555 Ir/byte
+   for a mostly-literal file should have been implausible on its face; the true 128 is.
+2. When a second instrument disagreed 12x, I "reconciled" by REASONING about which was
+   more plausible instead of measuring a third time.
+3. Diagnosed the disagreement as a thread mismatch, then retracted that diagnosis on the
+   grounds that the numbers did not move between runs — when NOT MOVING WAS THE
+   EVIDENCE (of caching).
+
+The discriminating test in every case was the same and cost one command: **change the
+input and see whether the number moves.** A constant across a 15x size range is not a
+measurement; an Ir/byte that differs 12x from a sane estimate is not a measurement.
+COUNT IT, NEVER INFER IT applies to the instrument as much as to the constant.
+
+Hand-rolling was justified here ONLY because the tool was demonstrably wrong — hard
+stop #6's "if the tool is missing on a box, FIX THE BOX" extends to a tool that lies.
+The fix belongs in fulcrum; these numbers are the reference to fix it against.
+
+## WITH THE INSTRUMENT FIXED: the attribution is real, and block_split is 28% of our excess
+
+Re-run of `fulcrum why libdeflate:movie.mp4:L6:T1:wall` with the repaired callgrind
+parser (see the fulcrum commits `c07f24e`, `f585650`) and BOTH arms symbolised — ours a
+release build with debug info whose output is byte-identical to shipped, libdeflate
+built `-g` per hard stop #1.
+
+**The fixed parser reproduces hand-measured ground truth on both arms**, which is what
+makes the attribution trustworthy this time:
+
+```
+              fulcrum why (fixed)   hand cachegrind     agreement
+  ours          1,650,068,646        1,650,693,672        0.04%
+  libdeflate    1,146,907,002        1,153,377,248        0.6%
+  TRUE RATIO           1.439
+```
+
+Top SELF costs (previously unusable — the old parser reported call-chain inclusive
+frames like `main.rs:381` and `libc-start.c:363`):
+
+```
+  OURS                                          RIVAL
+  12.99%  hc.rs:0                214,327,137    6.68%  :2112                 76,575,714
+   5.46%  parse/mod.rs:832        90,039,243    4.51%  matchfinder_common.h   51,686,687
+   5.40%  block_split.rs:212      89,102,895    4.47%  :2800                 51,269,578
+   3.11%  hc.rs:304               51,323,614    3.36%  hc_matchfinder.h:201   38,570,028
+   3.10%  parse/mod.rs:847        51,220,492    3.36%  hc_matchfinder.h:223   38,570,019
+   3.09%  block_split.rs:133      51,050,476    3.35%  :2644                 38,416,851
+   2.46%  hc.rs:388               40,544,723    2.83%  hc_matchfinder.h:252   32,418,684
+```
+
+### The named target, and a FALSIFY record predicted it exactly
+
+`block_split.rs` accounts for **140,153,371 Ir — 8.5% of our total and 28% of our
+503M excess over libdeflate**:
+
+  * `block_split.rs:212` = `ready_to_check_block`, **89,102,895 Ir**. Three comparisons
+    (`num_new_observations >= 512 && bytes_in_block >= MIN_BLOCK_LENGTH &&
+    bytes_remaining >= MIN_BLOCK_LENGTH`) evaluated at EVERY position — ~7 Ir across
+    ~12.7M positions — to fire roughly once per 512 observations.
+  * `block_split.rs:133` = `observe_literal`, **51,050,476 Ir**, called on every literal
+    (12,762,619 of them on this file).
+
+That file's own FALSIFY record, written before any of this was measured, says:
+
+    The detector's real cost is hot-loop work (`observe_literal` on EVERY literal,
+    `observe_match` on every match, at L2-L9). That cost is REAL and unmeasured here.
+    The live lever is therefore to make an observation CHEAPER, not to delete it —
+    deleting it forfeits 1.4-2.3% on the two hardest size files to save it.
+
+**It is now measured.** The prescription stands unchanged and is now quantified: the
+prize for making the observation cheaper is up to 140M Ir on this cell, and route (b)
+— deleting the detector — remains closed (+2.250% armexe.elf L2, +1.678% sil40 L2).
+
+### Caveats that bound this
+
+  * Ir LOCATES, never predicts the wall. The measured wall ratio for this cell is
+    1.1883 while Ir is 1.439 — we retire more instructions per unit time than
+    libdeflate, so a 140M Ir saving is an upper bound on the opportunity, not a wall
+    prediction. Any change must be confirmed paired, on the frozen box.
+  * The RIVAL side cannot be compared line-for-line here: libdeflate's hot lines are
+    bare `:2112`/`:2800`/`:2644` — inside `deflate_compress.c`, where its own block
+    splitter lives, but not separably attributed. So "we spend 8.5% on block_split" is
+    ours-only; it is NOT "libdeflate spends less on the same thing".
+  * `hc.rs:0` at 12.99% is a whole-file bucket (line 0 = unattributed within the file),
+    not a single site.
+  * Coordinate: L6, T1, movie.mp4 (TUNE), origin/main, trainer.
+
+### ⚠ CORRECTION: block_split is NOT where the excess is — libdeflate spends the same there
+
+The section above reported block_split at "28% of our excess", caveated as OURS-ONLY
+because libdeflate's hot lines were bare `:2112`/`:2800`. Those map, and the caveat
+resolves AGAINST the finding:
+
+```
+  deflate_compress.c:2112  =  stats->new_observations[((lit >> 5) & 0x6) | (lit & 1)]++;
+                              i.e. observe_literal's body
+  deflate_compress.c:2800  =  the seq/should_end_block loop condition (greedy parse)
+  deflate_compress.c:2644/2670 = inside deflate_compress_lazy_generic (the parse loop)
+```
+
+Comparable totals:
+
+```
+                        OURS                              LIBDEFLATE
+  observe_literal   block_split.rs:133   51,050,476   :2112   76,575,714  <- THEIRS MORE
+  split check       block_split.rs:212   89,102,895   :2800   51,269,578
+                                        -----------          -----------
+                                         140,153,371          127,845,292
+```
+
+**Difference 12,308,079 Ir = 2.4% of our 503M excess, not 28%.** libdeflate's
+`observe_literal` is in fact MORE expensive than ours (76.6M vs 51.1M). Block splitting
+is a real per-position cost in BOTH encoders and is not the deficit. Its FALSIFY record
+is still right that the cost is real; it is NOT where we lose to libdeflate.
+
+### Where the excess actually sits, from the same (top-8) attribution
+
+```
+  matchfinder   ours hc.rs 214.3M + 51.3M + 40.5M      = 306.1M
+                theirs matchfinder_common.h 51.7M
+                     + hc_matchfinder.h 38.6+38.6+32.4 = 161.3M     -> +145M
+  parse         ours parse/mod.rs 90.0M + 51.2M + 51.2M = 192.4M
+                theirs :2644 38.4M + :2670 38.3M        =  76.7M     -> +116M
+```
+
+Those two account for ~261M of the 503M excess on the visible lines alone. **The
+matchfinder and the parse loop are the class; block_split is not.** This is only the
+top-8 lines per arm, so it is a locate, not a budget — but it points somewhere very
+different from the previous section.
+
+**Method note:** the previous section's number was not wrong so much as UNCOMPARABLE,
+and it said so. Writing the caveat is what made the correction possible one command
+later; a confident "28% of our excess" without it would have sent the next lever at
+`observe_literal` — a function where we are already CHEAPER than the vendor.
+
+### LINE-FOR-LINE: the same statements cost us 1.25-1.33x. §4 was right; my "116%" was the broken parser.
+
+The hot matchfinder lines map onto each other exactly:
+
+```
+  ours   hc.rs:304   let mut cur_pos = in_next - *in_base;         51,323,614
+  theirs hc_mf.h:201 u32 cur_pos = in_next - *in_base_p;           38,570,028   1.33x
+
+  ours   hc.rs:388   load_u24(base, mp) ... == seq4 & 0xFF_FFFF    40,544,723
+  theirs hc_mf.h:252 load_u24_unaligned(m) == loaded_u32_to_u24()  32,418,684   1.25x
+```
+
+Identical statements, identical operations, byte-identical output, position counts
+matching to the digit — and 25-33% more instructions. **We are not doing different work;
+we are doing the same work in more instructions.**
+
+That is precisely `docs/vendor-structure-comparison.md` §4's conclusion, reached at L2 on
+silesia: *"Structural difference #4: register pressure, not algorithm. Our
+`longest_match` keeps more state live than theirs."* **§4 was right, and the earlier
+claim in this document that its 11.9% "does not describe the coordinate that fails" was
+an artifact of the broken callgrind parser.** The true L6 ratio (1.44 on movie.mp4, 1.20
+on dickens) is the same order as §4's L2 figure — the gap does not explode at depth.
+
+Composed with `anatomy explain`: on movie.mp4 the chain walk is 0.32-0.34 candidates at
+every declared depth from 6 to 600, so the matchfinder barely SEARCHES on this file.
+Costing 306M against their 161M while doing near-zero search means the excess is in the
+PER-POSITION PROLOGUE — hash, table read/write, bookkeeping — which reads
+structurally identical to libdeflate's (both: 3 loads, 3 stores, 2 hashes from one
+4-byte load, 2 prefetches). Same shape, more instructions: codegen.
+
+**Consequence for lever selection.** The deficit class is CODEGEN (register pressure /
+spills on an already-correct algorithm), not algorithm, not search depth, not block
+splitting. That class has a long falsification record here — hand-hoisting
+loop-invariant loads drove Dr UP because LLVM had already hoisted them (hard stop #4),
+and `hc.rs` carries eight FALSIFY notes of that family. The remaining
+vendor-precedented shape is G7 from `fulcrum candidates`: igzip's hand-written kernels
+(body/finish/icf_body/encode/map are asm on x86 AND aarch64). `candidates` states the
+ordering plainly: *"Our register-pressure findings (structure-comparison §4) are exactly
+the problem asm solves; Rust-side alternatives (fewer live locals, monomorphized loops)
+come first."*
+
+Coordinate: L6, T1, movie.mp4 (TUNE), origin/main, trainer, both arms symbolised,
+fulcrum with the repaired parser. Top-8 lines per arm — a locate, not a budget.
+
+### The 8 hc.rs falsifications cover the WALK; the measured cost is the PROLOGUE
+
+`make falsified Q=hc` lists eight binding records in `matchfinder/hc.rs`, at lines 227,
+398, 455, 557, 597, 664, 681 and 831. **Every one is inside the chain-walk loop** —
+`#[inline(never)]`, de-pipelining a hoist, the `chain_base` hoist, an addressing-mode
+fix, hand-hoisting current-position operands, hoisting the wrap test out of the loop.
+
+The hot lines measured at the failing coordinate are **`hc.rs:304` (51.3M) and
+`hc.rs:388` (40.5M)** — the per-position PROLOGUE, before any chain walking, and both
+BELOW the first record at :398. On these files the walk barely executes at all (0.32
+candidates per position at declared depth 600). So the heavily-falsified region and the
+expensive region are DIFFERENT CODE, and no record covers the prologue.
+
+⚠ **But line attribution here is weak evidence, and it must not be treated as a pin.**
+`[profile.release]` is `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`. Under whole-
+program inlining, callgrind attributes an instruction to wherever the optimiser recorded
+it, which need not be the statement that "owns" the work. `hc.rs:304` is
+`let mut cur_pos = in_next - *in_base;` — one subtraction, credited 4 Ir per position.
+That is not a subtraction's cost; it is a bucket for surrounding inlined work.
+
+So the honest statement is: **the excess is in the per-position prologue REGION, which
+carries no falsification** — not "line 304 is slow". Pinning it further needs
+instruction-level attribution (`--dump-instr=yes`) or a targeted ablation, and the
+FALSIFY family above says the thing NOT to do is guess at a statement and hand-hoist it:
+that is 3-for-3 against, and hard stop #4 exists because hoisting "obviously redundant"
+loads drove Dr UP when LLVM had already hoisted them.
+
+`fulcrum candidates` orders this class explicitly: *"Our register-pressure findings
+(structure-comparison §4) are exactly the problem asm solves; Rust-side alternatives
+(fewer live locals, monomorphized loops) come first."* Neither Rust-side alternative
+appears in the eight records — both are about the WALK — so both remain open, on the
+prologue, with the attribution caveat above governing how they are aimed.
+
+## COMPOSED: L4 Lazy + a DEPTH REDUCTION — 3x less wall than Lazy(12), and Pareto-dominant on data.csv
+
+"COMPOSE BEFORE CONCLUDING: two changes that each miss the bar can clear it together."
+L4 Lazy(12,30) wins on size and dies on clause 5 at 17.8x over. The reason is
+mechanical: **lazy runs ~2 searches per position against greedy's 1**, so Lazy(D) costs
+~2D probes where the shipped Greedy(16) costs 16. Lazy(12) is ~24 probes — a 50% budget
+increase bought with no compensation. Compose it with a depth cut to hold the budget.
+
+Size, T1, 11 TUNE members, x86 (trainer), vanilla builds:
+
+```
+  config                      beats libdeflate-4   L3>=L4 monotone   ~probes
+  Greedy(16,30)  [SHIPPED]         0/11 (ties)          1/11            16
+  Lazy( 6,30)                      9/11                 2/11           ~12
+  Lazy( 8,30)                     10/11                 5/11           ~16   <- cost-neutral
+  Lazy(10,30)                     11/11                 7/11           ~20
+  Lazy(12,30)                     11/11                11/11           ~24
+```
+
+Wall, `fulcrum ab paired --mode compress`, n=15, /dev/null both arms, T1, L4, trainer
+(a SCREEN — not the frozen box):
+
+```
+  Lazy(8,30) vs shipped   dickens   wall 1.0578 (+5.8%)   size 0.994396 (-0.56%)
+                          data.csv  wall 0.9909 (-0.9%)   size 0.955756 (-4.4%)
+  (Lazy(12,30) for contrast:  dickens wall 1.1844, +18.4%)
+```
+
+**On data.csv, Lazy(8,30) is FASTER AND SMALLER than the shipped config** — strictly
+Pareto-dominant, the first such result this session. On dickens it costs 5.8%, a 3x
+reduction from Lazy(12)'s 18.4%.
+
+### Still not clean, and the honest arithmetic
+
+Clause 5 on dickens: our L4 T1 ratio vs gzip is 0.4619, so a 5.78% self-tax gives
+0.4619 x 1.0578 = 0.4886, **erosion 0.0267 against the 0.005 budget = 5.3x over** —
+down from 17.8x but still failing. data.csv, being faster, has NEGATIVE erosion and no
+clause-5 exposure at all. So the verdict is FILE-DEPENDENT, which means this needs the
+full board rather than two files before any promotion claim.
+
+### What the frontier says
+
+There is a real Pareto frontier here, and the shipped point is not on it:
+
+  * Greedy(16,30) — the SHIPPED config — is dominated: 0/11 per-label (all exact ties
+    with libdeflate) at 16 probes, while Lazy(8,30) gets 10/11 at the same ~16 probes.
+  * Depth buys per-label (9 -> 10 -> 11 of 11) and P4 monotonicity (2 -> 5 -> 7 -> 11)
+    at ~2 probes per unit of depth.
+  * The cheapest point that wins per-label on every file is Lazy(10,30) at ~20 probes
+    (+25%), not Lazy(12,30) at ~24 (+50%). Lazy(12) buys only P4, which is a separate
+    (and pre-existing-broken) property.
+
+NEXT, and NOT done here: size + wall on the full TUNE set at Lazy(8,30) and Lazy(10,30),
+then `fulcrum try --threads 1,4` on the frozen box. Two files is a direction, not a
+verdict — this document has already been burned once this session by generalising from
+a subset.
+
+### ⛔ FALSIFIED: Lazy(8,30) is NOT cost-neutral. 10 of 11 files exceed the clause-5 threshold.
+
+The section above argued Lazy(8,30) is cost-neutral because "lazy runs ~2 searches per
+position, so Lazy(8) ~= 16 probes = the shipped Greedy(16,30)". **That is an INFERENCE,
+and it is wrong.** Measured across the full TUNE set (`fulcrum ab paired --mode
+compress`, n=9, /dev/null both arms, T1, L4, trainer; ratios are Lazy(8,30) vs shipped):
+
+```
+  file            wall     size      within the 1.011 clause-5 threshold?
+  data.csv       1.0001  0.955756    YES  (wall-neutral AND 161,310 B smaller)
+  aozora.txt     1.0158  1.005166    no   -- and its SIZE is WORSE than shipped
+  data.json      1.0256  0.954288    no
+  symbols.dwarf  1.0416  0.983963    no
+  dickens        1.0527  0.994396    no
+  tool.bin       1.0680  0.988007    no
+  minjs.min.js   1.0691  0.985189    no
+  movie.mp4      1.0751  0.999937    no
+  data.parquet   1.0954  0.994415    no
+  engine.wasm    1.0967  0.982711    no
+  armexe.elf     1.0994  0.987064    no
+```
+
+**Only data.csv clears it.** The threshold comes from the clause-5 arithmetic: erosion =
+`ratio_vs_gzip x (self_tax - 1)`, so at a T1 ratio of ~0.46 the 0.005 budget permits a
+self-tax of only 1.011. Ten files land at 1.016-1.099.
+
+**The probe model was too crude.** Lazy's cost is not merely "one extra search of depth
+D": there is deferral bookkeeping, a second candidate to hold live, and an extra branch
+per position, none of which the 2D estimate captured. COUNT IT, NEVER INFER IT applies
+to cost models exactly as much as to constants — this is the fourth inferred figure to
+fail this session.
+
+### Correction to the frontier claim
+
+The previous section said "the shipped Greedy(16,30) is DOMINATED". **It is not.** It is
+dominated on SIZE (0/11 per-label against Lazy(8,30)'s 10/11) but it is the CHEAPEST
+point on wall — every lazy variant measured costs more on 10 of 11 files. Greedy(16,30)
+sits on the Pareto frontier; it is simply at the wall-favouring end of it.
+
+### What survives
+
+  * **data.csv remains strictly Pareto-dominant**: 3,645,905 B (an exact tie with
+    libdeflate-4) -> 3,484,595 B, i.e. **161,310 B smaller at a wall ratio of 1.0001**.
+    One file is not a lever, but it does prove the frontier has slack somewhere.
+  * The SIZE frontier stands and was separately measured: 9/11, 10/11, 11/11, 11/11 at
+    depths 6/8/10/12 against the shipped 0/11.
+  * The P4 result stands: violations 13 -> 4 at Lazy(12,30).
+
+**The L4 class is now closed on the wall the same way L1 and the seam were**: the size
+is available, the wall budget is not. That is three independent classes killed by
+clause 5 today, which is itself the finding —
+see `project_clause5_is_the_binding_constraint`.
+
+### ⚠ COORDINATE CORRECTION: that falsification was measured at T1; the L4 cells fail at T4
+
+The section above closed the L4 class on a T1-only sweep. **The L4 board fails at T4** —
+13 of its 17 failing cells are `libdeflate`@T4. Measuring at the coordinate that fails
+changes the answer, exactly as hard stop #3 and the 40x receipt warn.
+
+The clause-5 threshold is not a constant: erosion = `ratio_vs_gzip x (self_tax - 1)`, so
+the permitted self-tax is `1 + 0.005/ratio_vs_gzip`. At T1 (ratio ~0.46) that is
+**1.011**; at T4 (ratio ~0.19, four threads against a single-threaded gzip) it is
+**1.026** — 2.4x looser.
+
+Lazy(8,30) vs shipped Greedy(16,30), same paired method, n=9, both coordinates:
+
+```
+  file            T1       T4      within the T4 threshold (1.026)?
+  data.csv       1.0001   0.9843   YES  -- FASTER than shipped at T4
+  armexe.elf     1.0994   1.0218   YES
+  data.json      1.0256   1.0216   YES
+  engine.wasm    1.0967   1.0245   YES
+  dickens        1.0527   1.0348   no
+  tool.bin       1.0680   1.0408   no
+  minjs.min.js   1.0691   1.0420   no
+  aozora.txt     1.0158   1.0489   no  (and its SIZE is worse than shipped)
+  movie.mp4      1.0751   1.0553   no
+  data.parquet   1.0954   1.0843   no
+  symbols.dwarf  1.0416   1.1591   no  -- WORSE at T4 than at T1
+```
+
+**4 of 11 clear at T4 against 1 of 11 at T1.** The coordinate alone is worth a 4x
+difference in how many cells survive.
+
+**So "the L4 class is closed on the wall" is RETRACTED as stated.** The accurate verdict
+is: at the coordinate where the cells actually fail, Lazy(8,30) is affordable on 4 of 11
+TUNE files and not on 7. That is a coordinate-dependent verdict, not an intrinsic
+ceiling — the distinction the rules demand and that I collapsed one commit ago.
+
+Two things worth noting in the data itself:
+  * The self-tax is NOT uniformly smaller at T4. `symbols.dwarf` gets WORSE (1.0416 ->
+    1.1591) and `aozora.txt` too (1.0158 -> 1.0489). Any model that assumes "T>1 always
+    dilutes the tax" is wrong; it must be measured per cell.
+  * `data.csv` is faster than shipped at BOTH coordinates (1.0001 T1, 0.9843 T4) while
+    161,310 B smaller. It is not a rounding artifact.
+
+STILL NOT A LEVER: 7 of 11 exceed the T4 threshold, and the promotion run must be
+`fulcrum try --threads 1,4` on the frozen box over the GATE set, not a TUNE screen on
+trainer. What this establishes is that the class deserves that run rather than a
+dismissal.
+
+### THE L4 FRONTIER, measured at T4 on both axes: ~4 of 11 files clear BOTH
+
+Lazy(6,30) vs shipped Greedy(16,30), T4, paired n=9, trainer. Threshold 1.026:
+
+```
+  file            wall     size(vs shipped)   wall OK?   size beats libdeflate-4?
+  data.csv       0.9487      0.968084          YES        YES   <- 5.1% faster, 3.2% smaller
+  dickens        0.9507      1.002194          YES        no    (size WORSE than shipped)
+  aozora.txt     0.9796      1.015732          YES        no    (size WORSE)
+  symbols.dwarf  0.9898      0.987677          YES        YES   <- faster AND smaller
+  data.json      0.9908      0.959831          YES        YES   <- faster AND 4.0% smaller
+  engine.wasm    1.0101      0.986057          YES        YES
+  tool.bin       1.0354      0.992227          no         YES
+  movie.mp4      1.0541      0.999920          no         YES
+  data.parquet   1.0725      0.994857          no         YES
+  minjs.min.js   1.0931      0.989985          no         YES
+  armexe.elf     1.0976      0.988777          no         YES
+```
+
+**6 of 11 clear the wall threshold; 3 are strictly Pareto-dominant** (faster AND smaller
+than a config that exactly TIES libdeflate). Intersecting both axes: **4 files clear
+everything — data.csv, symbols.dwarf, data.json, engine.wasm.**
+
+Depth 8 reaches the same intersection of 4 by a different route (4 wall-OK at T4, all of
+them size-OK). So the frontier converges on ~4 of 11 TUNE files either way, i.e. up to
+8 board cells (4 files x T1,T4) — real, but modest, and NOT the whole L4 class.
+
+```
+  config            size (beats ld-4)   wall-OK at T4   BOTH
+  Greedy(16,30)         0/11 (ties)         n/a          0
+  Lazy( 6,30)           9/11                6/11         4
+  Lazy( 8,30)          10/11                4/11         4
+  Lazy(10,30)          11/11                 ?           ?
+  Lazy(12,30)          11/11                 ?           ?   (T1 tax 1.1844: far over)
+```
+
+**The honest verdict on L4: neither an intrinsic ceiling nor a clean win.** The size is
+fully available (11/11 at depth 12) but the wall budget only affords it on ~4 of 11
+files, and WHICH files differ by depth. A shipping config would have to hold at every
+cell, and none measured here does.
+
+What is NOT yet measured and would complete the picture: wall at depths 10 and 12 at T4,
+and the same sweep on GATE members via `fulcrum try --threads 1,4` on the frozen box.
+Everything above is a TUNE screen on a non-frozen box (`freeze_checked=false`).
+
+### THE SHARP STATEMENT: clause 3 forces depth >= 10; clause 5 forbids depth >= 10
+
+The frontier table above under-read its own data. `size_ratio` there is Lazy(D) vs the
+SHIPPED config — and the shipped config **exactly ties libdeflate-4 on all 11 files**.
+So any `size_ratio > 1` is not merely "smaller win", it is a **pass -> fail flip**, and
+clause 3 is ABSOLUTE:
+
+```
+  depth  6:  aozora 1.015732, dickens 1.002194   ->  OPENS 2 cells  ->  clause 3 FAIL
+  depth  8:  aozora 1.005166                     ->  OPENS 1 cell   ->  clause 3 FAIL
+  depth 10:  11/11 beat libdeflate-4             ->  opens 0        ->  clause 3 OK
+  depth 12:  11/11 beat libdeflate-4             ->  opens 0        ->  clause 3 OK
+```
+
+**So the two depths that were affordable on the wall (6 and 8) are disqualified by
+clause 3, and the two that satisfy clause 3 (10 and 12) are the expensive ones** —
+depth 12's T1 self-tax is 1.1844, far past the 1.011 threshold; depth 10 sits between
+and is unmeasured on the wall.
+
+**L4 is squeezed from both sides**: clause 3 forces depth >= 10, clause 5 forbids the
+wall cost that depth >= 10 carries. That is a much stronger statement than "4 of 11
+clear both axes", and it supersedes that framing — the per-file intersection is
+irrelevant once a single opened cell fails the change outright.
+
+**The one measurement that could still open the class**: depth 10 at T4. It is the only
+point that satisfies clause 3 while being cheaper than depth 12, and its wall is the
+single unmeasured cell in the table. If depth 10's T4 self-tax lands under 1.026 on
+every file it is a candidate; if not, L4 is closed on the promotion rule as written, at
+BOTH coordinates, and that closure is then an intrinsic property of the rule rather than
+a coordinate artifact.
+
+Everything here remains a TUNE screen on a non-frozen box; GATE members are untouched
+and promotion needs `fulcrum try --threads 1,4`.
+
+## ⛔ L4 CLOSED ON THE RULE (pre-registered): depth 10 satisfies clause 3 and fails clause 5 on 9 of 11
+
+The previous section named ONE measurement that could still open the class — depth 10 at
+T4 — and declared in advance: *"Under a 1.026 self-tax on every file and it is a
+candidate; otherwise L4 is closed on the promotion rule as written at BOTH coordinates,
+and that closure is a property of the RULE rather than a coordinate artifact."*
+
+Measured, T4, 11 TUNE members, paired n=9, trainer:
+
+```
+  file            libdeflate-4      ours(d10)     saved B   T4 wall   <= 1.026?
+  symbols.dwarf       378,809       372,256        6,553    0.9519    YES (faster)
+  engine.wasm         409,051       401,197        7,854    1.0116    YES
+  data.csv          3,645,905     3,461,124      184,781    1.0460    no
+  data.json         1,736,197     1,648,936       87,261    1.0474    no
+  movie.mp4        12,891,391    12,890,786          605    1.0546    no
+  armexe.elf          586,728       578,183        8,545    1.0732    no
+  tool.bin         21,400,590    21,084,500      316,090    1.0825    no
+  minjs.min.js      1,129,252     1,108,654       20,598    1.0935    no
+  aozora.txt        4,197,277     4,189,888        7,389    1.1029    no
+  data.parquet     14,160,264    14,077,068       83,196    1.1210    no
+  dickens           4,672,714     4,623,432       49,282    1.1213    no
+```
+
+**SIZE: 11 of 11 beat libdeflate-4, ZERO cells opened — clause 3 fully satisfied**, with
+772,154 B of total wins where the shipped config ties or barely passes.
+**WALL: only 2 of 11 clear the threshold; nine exceed it.** So clause 5 blocks it.
+
+**L4 IS THEREFORE CLOSED ON THE PROMOTION RULE AS WRITTEN, AT BOTH COORDINATES.** The
+condition was declared before the measurement and it fired. Recorded and stopped, not
+re-sampled at other depths: 6 and 8 fail clause 3, 10 and 12 fail clause 5, and the
+monotone cost/size relationship between them leaves no interior point that could satisfy
+both.
+
+### Separate the ceiling from the verdict, as the rules require
+
+  * **INTRINSIC and permanent:** the L4 size win EXISTS and is large — 772,154 B across
+    11 TUNE files, 11/11 beating libdeflate-4, and `symbols.dwarf` is strictly
+    Pareto-dominant (6,553 B smaller AND 4.8% faster at T4). This does not expire and
+    should not be re-derived.
+  * **COORDINATE-DEPENDENT and contingent:** "unshippable" is a verdict about
+    `docs/promotion-rule.md` clause 5 as configured, NOT about the encoder. Every one of
+    these cells stays comfortably faster than gzip and pigz; what fails is an erosion
+    budget that permits ~1-2.6% of self-slowdown on cells we already win by 2-5x.
+
+This is the THIRD independent class this session with a verified size win and no
+affordable wall: L1 `ht_fast@256` (10 board cells), the T4 seam (109 cells), and now L4.
+See `project_clause5_is_the_binding_constraint` — the pattern is now 4-for-4 and is the
+session's most reusable finding.
