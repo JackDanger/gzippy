@@ -159,7 +159,11 @@ pub(super) fn run_block(
     state: &mut ParseState,
     sink: &mut Sink,
 ) -> usize {
-    let ParseState { mf, in_base, next_hashes } = state;
+    let ParseState {
+        mf,
+        in_base,
+        next_hashes,
+    } = state;
     let mf: &mut HcMatchfinder = mf;
     let in_base: &mut usize = in_base;
     let next_hashes: &mut [u32; 2] = next_hashes;
