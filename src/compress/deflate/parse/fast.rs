@@ -921,7 +921,7 @@ pub(super) const L1_HASH3_BITS: u32 = 15;
 /// photo.jpg 1.4627x, armexe.elf 1.3558x, monorepo.tar 1.0145x, access.log
 /// 0.9519x (gzippy FASTER). It is a content-class relationship (binary /
 /// high-entropy slow, plain text fast), not a property of this file.
-pub(super) const L1_HASH3_MAX_DIST: usize = WINDOW;
+pub(super) const L1_HASH3_MAX_DIST: usize = 4096;
 /// Probe policy: `false` (policy (a), miss-only — the cheapest, measured
 /// best) probes `head3` ONLY when the primary 4-byte probe did not already
 /// produce an emittable match.
