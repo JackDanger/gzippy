@@ -161,7 +161,26 @@ least once in a single session.
    The one real win this session was earned early and landed last, after eight
    failures, only when challenged.
 
-6. **Never hand-roll a measurement.** Check Fulcrum's command list first. A
+6. **Never hand-roll a measurement.** Check Fulcrum's command list first. The list, because
+   "check first" without it is what a session ignored for hours while rebuilding three of
+   these by hand:
+
+   | question | command |
+   |---|---|
+   | why does this cell fail? | `fulcrum why <cell> --ours BIN --rival-cmd 'CMD -{level} -c {input}' --corpus F` |
+   | what could I do about it? | `fulcrum candidates <cell> --repo .` |
+   | is this change good? | `fulcrum try <ref> --threads 1,4` |
+   | did I break CLI behaviour? | `fulcrum dropin --ours BIN --rival gzip=gzip …` |
+   | where do we stand? | `fulcrum board size` / `board wall` |
+   | where does the time go? | `fulcrum profile …` / `ab ablate` / `trace …` (T>1 causation) |
+
+   `why` returns the vendor diff — position counts (match/literal/header/data per byte) name
+   the MECHANISM in one command — and it states which of its four layers it SKIPPED, so a
+   partial run cannot be mistaken for a whole one. `candidates` surfaces FALSIFY records
+   loudly. `dropin` is the THIRD goal axis (CLI behaviour) and went unmeasured for the whole
+   campaign. **`fulcrum try` defaults to `--threads 1`** — a T>1 change judged without
+   `--threads 1,4` is measured on cells it cannot affect, and will read NO-SHIP for the
+   wrong reason. A
    hand-written size audit compared byte counts with no roundtrip check and would
    have scored a corrupt-but-smaller output as a WIN; `sizecensus` already existed
    and VOIDs that. If the tool is missing on a box, FIX THE BOX — a stale
