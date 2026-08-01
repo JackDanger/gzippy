@@ -2171,3 +2171,37 @@ cell, and none measured here does.
 What is NOT yet measured and would complete the picture: wall at depths 10 and 12 at T4,
 and the same sweep on GATE members via `fulcrum try --threads 1,4` on the frozen box.
 Everything above is a TUNE screen on a non-frozen box (`freeze_checked=false`).
+
+### THE SHARP STATEMENT: clause 3 forces depth >= 10; clause 5 forbids depth >= 10
+
+The frontier table above under-read its own data. `size_ratio` there is Lazy(D) vs the
+SHIPPED config — and the shipped config **exactly ties libdeflate-4 on all 11 files**.
+So any `size_ratio > 1` is not merely "smaller win", it is a **pass -> fail flip**, and
+clause 3 is ABSOLUTE:
+
+```
+  depth  6:  aozora 1.015732, dickens 1.002194   ->  OPENS 2 cells  ->  clause 3 FAIL
+  depth  8:  aozora 1.005166                     ->  OPENS 1 cell   ->  clause 3 FAIL
+  depth 10:  11/11 beat libdeflate-4             ->  opens 0        ->  clause 3 OK
+  depth 12:  11/11 beat libdeflate-4             ->  opens 0        ->  clause 3 OK
+```
+
+**So the two depths that were affordable on the wall (6 and 8) are disqualified by
+clause 3, and the two that satisfy clause 3 (10 and 12) are the expensive ones** —
+depth 12's T1 self-tax is 1.1844, far past the 1.011 threshold; depth 10 sits between
+and is unmeasured on the wall.
+
+**L4 is squeezed from both sides**: clause 3 forces depth >= 10, clause 5 forbids the
+wall cost that depth >= 10 carries. That is a much stronger statement than "4 of 11
+clear both axes", and it supersedes that framing — the per-file intersection is
+irrelevant once a single opened cell fails the change outright.
+
+**The one measurement that could still open the class**: depth 10 at T4. It is the only
+point that satisfies clause 3 while being cheaper than depth 12, and its wall is the
+single unmeasured cell in the table. If depth 10's T4 self-tax lands under 1.026 on
+every file it is a candidate; if not, L4 is closed on the promotion rule as written, at
+BOTH coordinates, and that closure is then an intrinsic property of the rule rather than
+a coordinate artifact.
+
+Everything here remains a TUNE screen on a non-frozen box; GATE members are untouched
+and promotion needs `fulcrum try --threads 1,4`.
