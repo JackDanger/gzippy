@@ -136,6 +136,16 @@ thread_local! {
     static SORT_COUNTERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Reusable buffers for [`make_huffman_code_exact_into`] — the `usize` frequency copy
+    /// package-merge wants and its output bit-length vector. Fresh `Vec`s here were TWO
+    /// heap allocations per Huffman code per block, i.e. four per block, which is exactly
+    /// the per-block allocation `CLAUDE.md` STEP 1 forbids and which
+    /// [`make_huffman_code_into`]'s own doc comment records as the violation that scales.
+    static EXACT_SCRATCH: std::cell::RefCell<(Vec<usize>, Vec<u32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Count-sort symbols by frequency (secondary: symbol value), packing
 /// `sym | (freq << 10)` into `symout`. Zero-frequency symbols get `lens[sym]=0`.
 /// Returns the number of used (nonzero-frequency) symbols.
@@ -429,6 +439,42 @@ pub fn make_huffman_code(num_syms: usize, max_len: u32, freqs: &[u32]) -> Huffma
 /// this path allocates nothing. The arithmetic below is UNCHANGED from the
 /// allocating form — same `sort_symbols`, same tree build, same codeword
 /// generation — so the emitted bytes are identical by construction.
+//
+// FALSIFY (2026-07-31): REPLACING THIS HEURISTIC WITH EXACT PACKAGE-MERGE IS NOT A
+// SIZE LEVER. Do not "upgrade" this builder to `super::optimal`'s exact Katajainen
+// length assignment, and do not add it as a costed second candidate. Both were built
+// and measured.
+//
+// Motivation was sound: the size census shows we are an EXACT BYTE TIE with libdeflate
+// at L2 and L4-L9 (154/198 T1 cells), so 109 T4 cells fail with ZERO headroom and need
+// only ~0.01% of margin; and unlike a parse change, Huffman construction is paid once
+// per BLOCK, not once per position. See docs/target-encoder-and-gap-analysis.md G15/G16.
+//
+// UNCONDITIONAL SWAP: a wash, and it OPENS cells. dickens L2 +10 B, data.csv L2 -326 B,
+// winexe.exe L6 +385 B, data.json L6 -737 B. Package-merge minimises CODED-DATA bits,
+// but the block also transmits its length vector in an RLE-coded header and the two
+// builders produce different vectors -- exact on data is NOT exact on total.
+//
+// COSTED DUAL CANDIDATE (build both, take the cheaper, strict `<` so ties keep this
+// one): the size invariant HELD -- 49 of 49 cells smaller, 0 worse, T1, all roundtrip
+// through our decoder + gzip + libdeflate. But the margin is ~0.001% (sil40 -122..-166 B
+// on 15.4 MB) and it costs 10-14% WALL: vs libdeflate on sil40 T1 the ratio went L2
+// 1.044->1.193, L5 1.038->1.150, L6 0.956->1.043, L7 0.922->0.986. L6 FLIPS from
+// WE WIN to WE LOSE, which clause 3 forbids outright.
+//
+// THE STRUCTURAL FACT, and the reason this closes a whole family: libdeflate's
+// heuristic length limiter is ALREADY WITHIN 0.001% OF EXACT. There is no meaningful
+// size left in Huffman code construction, at any wall price. The ~0.01% of margin the
+// zero-headroom cells need is not here -- look at block BOUNDARIES or the parse.
+// REOPENED 2026-07-31 BY COMPOSITION (branch perf/compose-margin-and-grid). The verdict
+// above judged this candidate ALONE, against T1 wall. Both halves of that framing were
+// wrong for the T>1 board: at T4 the cost is +2.1%, not 10-14% (the per-block work
+// parallelises across threads), and the 0.001% is not meant to be a size win — it is the
+// MARGIN THAT ABSORBS THE T>1 SEAM. 122-166 B of margin against a 62 B residual seam at
+// one-chunk-per-thread is NEGATIVE, and the pair closes 4 of 6 test cells that neither
+// half closes alone. Still not promotable (wall regression, clause 3); see that branch.
+// What DOES stand from the note above: exact-on-data is not exact-on-total, and an
+// UNCONDITIONAL swap opens cells.
 pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u32, freqs: &[u32]) {
     crate::anatomy_count!(huffman_make_code_calls);
     assert_eq!(freqs.len(), num_syms);
@@ -469,6 +515,80 @@ pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u
     let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
     compute_length_counts(a, num_used_syms - 2, &mut len_counts, max_len);
     gen_codewords(a, lens, &len_counts, max_len, num_syms);
+}
+
+/// EXACT (Katajainen package-merge) length assignment, same signature/shape as
+/// [`make_huffman_code_into`] so the two are interchangeable CANDIDATES. Never an
+/// unconditional replacement — see the FALSIFY note below.
+pub fn make_huffman_code_exact_into(
+    out: &mut HuffmanCode,
+    num_syms: usize,
+    max_len: u32,
+    freqs: &[u32],
+) {
+    assert_eq!(freqs.len(), num_syms);
+    assert!(num_syms >= 2);
+    let max_len = max_len as usize;
+    out.lens.clear();
+    out.lens.resize(num_syms, 0);
+    out.codewords.clear();
+    out.codewords.resize(num_syms, 0);
+    let lens = &mut out.lens;
+    let a = &mut out.codewords;
+    let num_used_syms = sort_symbols(freqs, lens, a);
+    if num_used_syms < 2 {
+        let sym = if num_used_syms != 0 {
+            (a[0] & SYMBOL_MASK) as usize
+        } else {
+            0
+        };
+        let nonzero_idx = if sym != 0 { sym } else { 1 };
+        for l in lens.iter_mut() {
+            *l = 0;
+        }
+        a[0] = 0;
+        lens[0] = 1;
+        a[nonzero_idx] = 1;
+        lens[nonzero_idx] = 1;
+        return;
+    }
+    // No per-block allocation (CLAUDE.md STEP 1). Same thread_local pattern as
+    // SORT_COUNTERS above: clear()+resize() reuses capacity after the first block, and each
+    // worker thread gets its own buffers so chunk-independence is untouched.
+    let err = EXACT_SCRATCH.with(|cell| {
+        let (freqs_usize, bitlens) = &mut *cell.borrow_mut();
+        freqs_usize.clear();
+        freqs_usize.extend(freqs.iter().map(|&f| f as usize));
+        bitlens.clear();
+        bitlens.resize(num_syms, 0u32);
+        super::optimal::length_limited_code_lengths(freqs_usize, max_len as i32, bitlens).is_err()
+    });
+    if err {
+        build_tree(a, num_used_syms);
+        let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
+        compute_length_counts(a, num_used_syms - 2, &mut len_counts, max_len);
+        gen_codewords(a, lens, &len_counts, max_len, num_syms);
+        return;
+    }
+    let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
+    EXACT_SCRATCH.with(|cell| {
+        let (_, bitlens) = &*cell.borrow();
+        for sym in 0..num_syms {
+            let l = bitlens[sym] as u8;
+            lens[sym] = l;
+            len_counts[l as usize] += 1;
+        }
+    });
+    len_counts[0] = 0;
+    let mut next_codewords = [0u32; MAX_CODEWORD_LEN + 1];
+    for len in 2..=max_len {
+        next_codewords[len] = (next_codewords[len - 1] + len_counts[len - 1]) << 1;
+    }
+    for sym in 0..num_syms {
+        let l = lens[sym];
+        a[sym] = reverse_codeword(next_codewords[l as usize], l);
+        next_codewords[l as usize] += 1;
+    }
 }
 
 #[cfg(test)]

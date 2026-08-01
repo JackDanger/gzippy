@@ -195,6 +195,13 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         args.compression_level as u32,
         opt_config.thread_count,
     );
+    // Honour `-b` ONLY when the user actually typed it: `block_size` carries a 128 KiB
+    // default, so passing it unconditionally would change every existing T>1 output.
+    encoder.set_block_size_override(if args.block_size_explicit {
+        Some(args.block_size)
+    } else {
+        None
+    });
     encoder.set_header_info(header_info.clone());
     encoder.compress_buffer_pure(&input, writer)?;
     Ok(bytes)

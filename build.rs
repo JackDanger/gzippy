@@ -136,6 +136,8 @@ fn emit_parallel_sm_cfgs() {
         ("CARGO_FEATURE_ANATOMY_WALL", "anatomy-wall"),
         ("CARGO_FEATURE_L1_TUNE", "l1-tune"),
         ("CARGO_FEATURE_L3_TUNE", "l3-tune"),
+        ("CARGO_FEATURE_LADDER_TUNE", "ladder-tune"),
+        ("CARGO_FEATURE_EXACT_HUFFMAN", "exact-huffman"),
     ]
     .iter()
     .filter(|(var, _)| std::env::var_os(var).is_some())

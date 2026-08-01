@@ -20,8 +20,8 @@ use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
 use super::encode_types::{BlockRole, InputMode};
 use super::huffman::{
-    build_dynamic_header, make_huffman_code, make_huffman_code_into, CodeScratch, HeaderScratch,
-    HuffmanCode,
+    build_dynamic_header, make_huffman_code, make_huffman_code_exact_into, make_huffman_code_into,
+    CodeScratch, HeaderScratch, HuffmanCode,
 };
 use super::level::{LevelParams, Strategy};
 use super::matchfinder::hc::WINDOW_SIZE;
@@ -934,7 +934,13 @@ fn emit_block(
     // reuses for every block. See `huffman::CodeScratch`: building them fresh here
     // was the per-block allocation that made our allocation count grow with input
     // (733 allocs on 6 MB where libdeflate uses 3 and gzip 0).
-    let CodeScratch { litcode, offcode } = code_scratch;
+    let CodeScratch {
+        litcode,
+        offcode,
+        alt_litcode,
+        alt_offcode,
+        alt_header,
+    } = code_scratch;
     let (header, dynamic_bits, static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
@@ -954,11 +960,55 @@ fn emit_block(
                 MAX_OFFSET_CODEWORD_LEN,
                 &sink.offset_freqs,
             );
-            let header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
 
-            let dynamic_bits = 3
-                + header.header_bits()
+            // SECOND DYNAMIC CANDIDATE: the same two codes under the EXACT
+            // (Katajainen package-merge) length assignment.
+            //
+            // Package-merge minimises the CODED-DATA bits, but a dynamic block also
+            // transmits its length vector in an RLE-coded header, and the two builders
+            // produce different vectors — so "exact" is exact on data, NOT on total.
+            // Measured: swapping unconditionally is a wash (data.json L6 -737 B but
+            // winexe.exe L6 +385 B, which flips that cell from 178 B smaller than
+            // libdeflate to 207 B larger). Costing BOTH and taking the cheaper is
+            // non-worse than the heuristic BY CONSTRUCTION, so it cannot open a size
+            // cell, and it is paid ONCE PER BLOCK rather than once per position —
+            // the only cost shape that can fund the ~0.01% of margin the 109
+            // zero-headroom T4 cells need. See docs/target-encoder-and-gap-analysis.md
+            // G15 for why the parse side cannot.
+            make_huffman_code_exact_into(
+                alt_litcode,
+                DEFLATE_NUM_LITLEN_SYMS,
+                MAX_LITLEN_CODEWORD_LEN,
+                &litlen_freqs,
+            );
+            make_huffman_code_exact_into(
+                alt_offcode,
+                DEFLATE_NUM_OFFSET_SYMS,
+                MAX_OFFSET_CODEWORD_LEN,
+                &sink.offset_freqs,
+            );
+
+            let heur_header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
+            let heur_bits = 3
+                + heur_header.header_bits()
                 + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, litcode, offcode);
+
+            let exact_header =
+                build_dynamic_header(&alt_litcode.lens, &alt_offcode.lens, alt_header);
+            let exact_bits = 3
+                + exact_header.header_bits()
+                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, alt_litcode, alt_offcode);
+
+            // Strict `<` keeps the heuristic on ties, so a tie emits today's bytes.
+            let (header, dynamic_bits) = if exact_bits < heur_bits {
+                crate::anatomy_count!(huffman_exact_code_chosen);
+                std::mem::swap(litcode, alt_litcode);
+                std::mem::swap(offcode, alt_offcode);
+                (exact_header, exact_bits)
+            } else {
+                drop(exact_header);
+                (heur_header, heur_bits)
+            };
             let static_bits = 3 + cost_from_freqs(
                 &litlen_freqs,
                 &sink.offset_freqs,
@@ -1006,6 +1056,7 @@ fn emit_block(
         });
     } else {
         crate::anatomy_count!(blocks_emitted_dynamic);
+        crate::anatomy_count!(dynamic_header_bits_total, header.header_bits());
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);

@@ -211,6 +211,29 @@ l1-tune = []
 # weights.safetensors regress), cross-arch-confirmed deterministic, so NOT
 # promoted. Stays default-off, kept for provenance per the l1-tune precedent.
 l3-tune = []
+# LADDER FRONTIER SWEEP (2026-07-31). Measurement-only. Makes the level->params
+# map overridable so the (strategy, max_search_depth, nice_match_length) frontier
+# can be OBSERVED instead of inherited. It exists because a full size census showed
+# our table IS libdeflate's at L2 and L4-L9: 154 of 198 T1 cells vs libdeflate are
+# an EXACT BYTE TIE, so our size margin there is zero BY CONSTRUCTION and every T>1
+# seam cost fails a cell outright. Finding a config that is both smaller and cheaper
+# requires points libdeflate never chose, i.e. points only a sweep can supply.
+# DEFAULT OFF; compiles to nothing when off; marks the binary +INSTRUMENTED so
+# scripts/campaign/board-wall.sh refuses to quote a wall number from it.
+# NOT a production knob (CLAUDE.md non-negotiable #3): the deliverable is a static
+# table, and this feature must never be enabled in a shipped build.
+ladder-tune = []
+# EXACT LENGTH-LIMITED HUFFMAN for the L2-L9 block coder (2026-07-31 probe).
+# `fast.rs` is libdeflate's HEURISTIC length-limiter (build_tree +
+# compute_length_counts); `optimal.rs` already holds the EXACT Katajainen
+# package-merge builder, but only deflate64/ultra/near_optimal call it. This
+# feature routes the mainline block coder through the exact builder. Motivation:
+# the size census shows we are an exact byte tie with libdeflate at L2 and L4-L9,
+# so we need ~0.01% of margin at seven levels at once for ~zero wall — and unlike
+# a parse change, Huffman construction is paid ONCE PER BLOCK, not per position.
+# DEFAULT OFF; marks the binary +INSTRUMENTED so no wall number can be quoted from
+# it against a rival.
+exact-huffman = []
 # Compile vendored C zopfli for the corpus oracle test that compares
 # zopfli_pure deflate output byte-for-byte against the C reference.
 # Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);

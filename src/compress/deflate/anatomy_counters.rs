@@ -321,6 +321,15 @@ define_counters!(
     huffman_tree_nodes_visited,
     huffman_length_limited_calls,
     huffman_make_code_calls,
+    // Times the EXACT (package-merge) dynamic candidate was strictly cheaper than the
+    // heuristic and was emitted (parse/mod.rs::emit_block). Ties keep the heuristic, so
+    // this counts only real wins; pair with blocks_emitted_dynamic for the hit rate.
+    huffman_exact_code_chosen,
+    // Exact sum of header_bits() over every DYNAMIC block actually emitted
+    // (parse/mod.rs::emit_block). Direct measurement of dynamic-header mass — the figure
+    // the block-count lever is argued from. Previously INFERRED at ~350 B/header from the
+    // seam accounting; this counter replaces the inference.
+    dynamic_header_bits_total,
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,
