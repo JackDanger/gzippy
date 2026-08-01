@@ -1891,3 +1891,47 @@ different from the previous section.
 and it said so. Writing the caveat is what made the correction possible one command
 later; a confident "28% of our excess" without it would have sent the next lever at
 `observe_literal` — a function where we are already CHEAPER than the vendor.
+
+### LINE-FOR-LINE: the same statements cost us 1.25-1.33x. §4 was right; my "116%" was the broken parser.
+
+The hot matchfinder lines map onto each other exactly:
+
+```
+  ours   hc.rs:304   let mut cur_pos = in_next - *in_base;         51,323,614
+  theirs hc_mf.h:201 u32 cur_pos = in_next - *in_base_p;           38,570,028   1.33x
+
+  ours   hc.rs:388   load_u24(base, mp) ... == seq4 & 0xFF_FFFF    40,544,723
+  theirs hc_mf.h:252 load_u24_unaligned(m) == loaded_u32_to_u24()  32,418,684   1.25x
+```
+
+Identical statements, identical operations, byte-identical output, position counts
+matching to the digit — and 25-33% more instructions. **We are not doing different work;
+we are doing the same work in more instructions.**
+
+That is precisely `docs/vendor-structure-comparison.md` §4's conclusion, reached at L2 on
+silesia: *"Structural difference #4: register pressure, not algorithm. Our
+`longest_match` keeps more state live than theirs."* **§4 was right, and the earlier
+claim in this document that its 11.9% "does not describe the coordinate that fails" was
+an artifact of the broken callgrind parser.** The true L6 ratio (1.44 on movie.mp4, 1.20
+on dickens) is the same order as §4's L2 figure — the gap does not explode at depth.
+
+Composed with `anatomy explain`: on movie.mp4 the chain walk is 0.32-0.34 candidates at
+every declared depth from 6 to 600, so the matchfinder barely SEARCHES on this file.
+Costing 306M against their 161M while doing near-zero search means the excess is in the
+PER-POSITION PROLOGUE — hash, table read/write, bookkeeping — which reads
+structurally identical to libdeflate's (both: 3 loads, 3 stores, 2 hashes from one
+4-byte load, 2 prefetches). Same shape, more instructions: codegen.
+
+**Consequence for lever selection.** The deficit class is CODEGEN (register pressure /
+spills on an already-correct algorithm), not algorithm, not search depth, not block
+splitting. That class has a long falsification record here — hand-hoisting
+loop-invariant loads drove Dr UP because LLVM had already hoisted them (hard stop #4),
+and `hc.rs` carries eight FALSIFY notes of that family. The remaining
+vendor-precedented shape is G7 from `fulcrum candidates`: igzip's hand-written kernels
+(body/finish/icf_body/encode/map are asm on x86 AND aarch64). `candidates` states the
+ordering plainly: *"Our register-pressure findings (structure-comparison §4) are exactly
+the problem asm solves; Rust-side alternatives (fewer live locals, monomorphized loops)
+come first."*
+
+Coordinate: L6, T1, movie.mp4 (TUNE), origin/main, trainer, both arms symbolised,
+fulcrum with the repaired parser. Top-8 lines per arm — a locate, not a budget.
