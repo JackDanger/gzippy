@@ -53,3 +53,35 @@ impl InputMode {
         matches!(self, InputMode::Drain)
     }
 }
+
+/// How much wall time this encode path can afford to spend shrinking a block
+/// header. A property of the PATH, not of the level — which is why it is not a
+/// field on [`LevelParams`](super::level::LevelParams).
+///
+/// T1 races a single-threaded rival and the thinnest PASSING wall margin on the
+/// board is 0.0065 (`libdeflate:tool.bin:L4:T1`), so ~0.6% of self-slowdown
+/// flips a cell. At T>1 those rivals are still single-threaded while we are not:
+/// measured slack 249-330%, clause 5 budget ~2.6%.
+///
+/// Receipt (`fulcrum try`, 2aa0e101): RLE header shaping applied EVERYWHERE
+/// closed 6 cells — every one `libdeflate T4 size` — and flipped 3 — every one
+/// `libdeflate L4 T1 wall`. Win and harm separate cleanly on this axis.
+///
+/// `Lean` is the DEFAULT so that any construction site nobody threads fails
+/// SAFE (shaping off, T1 bytes unchanged) rather than silently opting in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HeaderBudget {
+    /// Wall-critical path (T1). Build codes from the true histogram only.
+    #[default]
+    Lean,
+    /// Wall-slack path (T>1). Also try the RLE-shaped histogram, keep it when
+    /// strictly cheaper.
+    Generous,
+}
+
+impl HeaderBudget {
+    #[inline]
+    pub fn may_shape(self) -> bool {
+        matches!(self, HeaderBudget::Generous)
+    }
+}

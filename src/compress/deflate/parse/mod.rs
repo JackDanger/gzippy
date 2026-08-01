@@ -938,7 +938,9 @@ fn emit_block(
         litcode,
         offcode,
         shape,
+        budget,
     } = code_scratch;
+    let budget = *budget;
     let (header, dynamic_bits, static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
@@ -949,7 +951,11 @@ fn emit_block(
             // PROBE: build the codes from the RLE-shaped histogram when that is
             // strictly cheaper. `cost_from_freqs` below still charges the TRUE
             // frequencies, so the dyn/static/stored comparison is unaffected.
-            let shaped = shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs, shape);
+            let shaped = if budget.may_shape() {
+                shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs, shape)
+            } else {
+                None
+            };
             let (build_lit, build_off) = match shaped {
                 Some((ref l, ref o)) => (l, o),
                 None => (&litlen_freqs, &sink.offset_freqs),

@@ -57,6 +57,10 @@ pub struct CodeScratch {
     /// the two codes above — caller-owned and reused, so evaluating the candidate
     /// costs no per-block allocation.
     pub shape: ShapeScratch,
+    /// What this encode path can afford to spend on the header. Defaults to
+    /// [`HeaderBudget::Lean`], so a site that never threads it keeps T1
+    /// behaviour byte-identical.
+    pub budget: crate::compress::deflate::encode_types::HeaderBudget,
 }
 
 /// Per-block working set for the RLE-shaped Huffman candidate. Held inside
