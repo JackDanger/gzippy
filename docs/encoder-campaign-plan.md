@@ -827,3 +827,47 @@ states which of its four layers it skipped, naming the mechanism in ONE run.
 Run that, and `blockcensus` on both outputs, BEFORE the routing lever. If the bytes
 are in headers rather than data, explanations 1-2 are the class and the matchfinder
 is the wrong lever entirely.
+
+### ⚠⚠ CORRECTION TO BOTH SECTIONS ABOVE — access.log AND monorepo.tar ARE **GATE** FILES
+
+`corpus_split.json` splits the corpus and states the contract: *"GATE files are run
+ONLY at promotion time, by the census/goal tools, and NEVER inspected while choosing
+a parameter. A promotion is judged on GATE. If a change was fitted on GATE, the
+promotion is void regardless of the numbers."*
+
+```
+GATE: access.log data.sqlite dd79_bin6 dd79_text6 ecoli.fastq markup.xml
+      monorepo.tar photo.jpg sil40 weights.safetensors winexe.exe
+TUNE: aozora.txt armexe.elf data.csv data.json data.parquet dickens
+      engine.wasm minjs.min.js movie.mp4 symbols.dwarf tool.bin
+```
+
+**access.log and monorepo.tar — the two cells the section above builds its whole
+argument on — are GATE.** Two consequences, and the second one retracts a claim:
+
+**(a) The diagnostic as written would VOID the promotion.** The section above
+prescribes `fulcrum why libdeflate:access.log:L1:T1` to decide which lever to build.
+That is inspecting a GATE file while choosing a parameter. It is exactly the failure
+`_rule` in `corpus_split.json` was written to prevent ("parameters were once fitted
+to the one file blocking a gate ... BOTH later blowups landed off the tuning set").
+**Run the diagnostic on TUNE members only** — data.csv (1.0456), aozora.txt (1.0405)
+and dickens (1.0211) are the largest L1 deficits that are legal to inspect.
+
+**(b) "The two worst cells survived the matchfinder swap" is RETRACTED.** It is
+unsupported. Attempt 1's record states its own coordinate — `board-size.sh tune`,
+**TUNE x L1-9 x T1,T4** — and access.log and monorepo.tar are GATE, so they were
+NEVER IN THAT MEASUREMENT. All six files it names as closing (data.csv, aozora.txt,
+minjs.min.js, dickens, data.json, engine.wasm) are TUNE members. The swap did not
+fail on the two largest deficits; it was never tested against them.
+
+So the matchfinder explanation is STRONGER than the previous section allowed: on the
+TUNE set it closed essentially every libdeflate L1 cell available to it. The three
+alternative explanations (block geometry, the per-block BTYPE decision, insert/skip
+policy) remain UNEXCLUDED and still need `fulcrum why` — but they no longer have the
+"two worst survived" evidence behind them, because that evidence does not exist.
+
+**THE GENERAL LESSON, which is the reusable part:** a cell's TUNE/GATE membership is
+part of its coordinate, and a measurement's corpus SUBSET is part of its result. Two
+errors here came from reading "9 cells closed" as a statement about the board when it
+was a statement about TUNE. Before citing any cell as evidence, check which set it is
+in; before citing any prior measurement, read the corpus it ran on.
