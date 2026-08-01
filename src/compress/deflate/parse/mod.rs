@@ -827,6 +827,55 @@ fn choose_max_block_end(block_begin: usize, in_end: usize) -> usize {
 }
 
 /// `adjust_max_and_nice_len`: clamp match lengths near the end of input.
+/// FALSIFY (2026-08-01, local M1, dickens, T1, `fulcrum ab paired` n=11).
+/// **A `#[cold]`/`#[inline(never)]` cold-path split of the taken branch below
+/// is 1.97% SLOWER at L5 and undetectable at L2. Reverted. Do not retry it
+/// without a NEW mechanism.**
+///
+/// THE VENDOR DIFF WAS REAL — this is libdeflate
+/// `lib/deflate_compress.c:2272-2278` line for line, with exactly one
+/// difference: its guard is `if (unlikely(remaining < DEFLATE_MAX_MATCH_LEN))`
+/// and the fn is `forceinline`; ours is `#[inline]` with no hint. And the
+/// callgrind attribution (trainer/Intel, dickens, L2 T1, byte-identical output,
+/// `docs/board/l2-component-map.md`) made it look like the single biggest item
+/// on the board:
+///
+///     ours   body guard 15,794,058 Ir + call site 5,264,686 Ir = 21,058,744
+///     theirs attributed lines                                  =        268
+///
+/// 21.06M Ir = 23.4% of our whole 90.03M T1 instruction excess at L2, on a
+/// branch false for all but the last 258 bytes of input.
+///
+/// MEASURED RESULT of adding the hint (output byte-identical at L1/2/3/5/9,
+/// `size_ratio=1.000000`, `roundtrip_ok=true`, so this is a pure codegen A/B):
+///
+///     L2 T1  VOID     ratio 0.9989  CI [-0.0079,0.0058]  sign 6/11  aa_bias 0.0074
+///     L5 T1  RESOLVED ratio 0.9807  CI [-0.0315,-0.0076] sign 8/11  aa_bias 0.0017
+///                     -> the cold arm is 1.97% SLOWER
+///
+/// At L2 the effect is smaller than the A/A noise floor — UNDETERMINED, not
+/// "no effect". At L5 it is a real regression. LLVM's existing layout of this
+/// branch is better than the one `unlikely()` asks for, so `unlikely()` buys
+/// libdeflate nothing we lack, and the 21.06M Ir is NOT a missing cold hint.
+///
+/// ⚠ A PROCESS RECEIPT WORTH MORE THAN THE LEVER. I first "falsified" this by
+/// comparing release-binary shas and got IDENTICAL shas for main and the lever
+/// — and then a doc-comment-only change produced a DIFFERENT sha. Both were
+/// artifacts of a polluted build sequence (a `git checkout` leaves mtimes older
+/// than the artifact, so `cargo build` reports "Finished in 0.04s" and silently
+/// keeps the previous binary). Rebuilt cleanly with `touch` first, main is
+/// `32d01b55c464d6a5` and the lever `644ebdc7be7f8451` — different, as it always
+/// was. **Binary-sha comparison is only a valid discriminator once both arms are
+/// proven to have actually rebuilt; verify the build ran before trusting what it
+/// produced.** The wall measurement above is what settled it.
+///
+/// STILL OPEN: the 21.06M Ir is real cost somewhere. What is falsified is that a
+/// cold hint moves it. Untested: (a) changing the SIGNATURE (return the pair by
+/// value instead of `&mut` through an `#[inline]` boundary) is a DIFFERENT
+/// mechanism and may reopen this; (b) callgrind may be smearing surrounding-loop
+/// cost onto this guard across the inline boundary, in which case the line is
+/// innocent and the cost belongs to the parse loop generally. Discriminating
+/// them needs an ablation, not another edit.
 #[inline]
 fn adjust_max_and_nice_len(max_len: &mut u32, nice_len: &mut u32, remaining: usize) {
     if remaining < DEFLATE_MAX_MATCH_LEN as usize {
