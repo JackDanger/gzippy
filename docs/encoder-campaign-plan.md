@@ -696,10 +696,22 @@ L4 Lazy(12,30)               gzip:dickens:L4:T1         0.4619 -> 0.5507  0.0888
 (recorded) L1 synthesis      gzip:data.json:T1          0.4549 -> 0.6861  0.2312   0.0050 46.2x
 ```
 
-**The mechanism is arithmetic, and it is worth stating plainly.** Clause 5's budget is
-an ABSOLUTE 0.0050 on the ratio `ours / rival`. On a cell where we are already ~2x
-faster than gzip (ratio ~0.46), a 1% self-slowdown moves the ratio by 0.0046 — the
-entire budget. On a T4 cell where we are 5x faster (ratio ~0.19), 2.5% of self-slowdown
+**The mechanism is arithmetic, and it is worth stating precisely** — quoting
+`docs/promotion-rule.md:40-44` rather than paraphrasing it:
+
+    5. Erosion budget on passing cells. A passing cell may degrade only by the smaller
+       of a quarter of its margin and 0.5%:
+           new_ratio - old_ratio  <=  min(0.25 * (1.0 - old_ratio), 0.005)
+
+The rule has TWO terms and was evidently designed so that a cell with a big margin can
+afford a proportionally bigger degradation. **The flat 0.005 cap makes that intent
+inert.** For dickens L4 T1 vs gzip, `old_ratio` 0.4619 gives a margin of 0.5381 and a
+quarter-margin of 0.1345 — 27x the cap — so `min()` returns 0.005. The margin term only
+binds when `old_ratio > 0.98`, i.e. on cells that are already barely passing.
+
+So in practice the budget is a flat 0.005 on `ours / rival` for every cell we win
+comfortably. On a cell where we are ~2x faster than gzip (ratio ~0.46), a 1%
+self-slowdown moves the ratio by 0.0046 — the entire budget. On a T4 cell where we are 5x faster (ratio ~0.19), 2.5% of self-slowdown
 spends it. **No parse-strengthening change costs less than that.** Lazy searches more
 than greedy; a 2-way bucket probes more than one; a deeper chain walks further. The
 cheapest of the three above still cost 11%.
