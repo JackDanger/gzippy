@@ -1998,3 +1998,23 @@ It is not, on this class: headers are 0 extra on half the cells measured. The co
 seam block would fix term 2 and term 3 (it removes the forced boundary entirely) but NOT term
 1 unless the concatenation also goes bit-level. Both halves are needed for this class, and the
 cheaper half alone was about to be built on a one-file reading.
+
+### G40a — FALSIFIED before building: a small-file parallel bypass would cost 2-3x wall
+
+L0 at T>1 already bypasses the parallel pipeline entirely (`pipelined.rs`) because chunking made
+T>1 larger than T1 and L0 is memory-bandwidth-bound, so the parallelism bought nothing. The
+obvious extension for the seam class is a size threshold: below some input size, skip chunking
+and pay no seam. Measured the premise first (hyperfine n=8 warmup 2, vanilla build):
+
+    file             input bytes   T1        T4        speedup
+    engine.wasm          868,202   0.0233s   0.0120s    1.94x
+    minjs.min.js       3,598,158   0.0670s   0.0227s    2.96x
+    photo.jpg          6,511,067   0.0759s   0.0257s    2.95x
+
+THE PREMISE IS FALSE. These files parallelise well — 1.94x to 2.96x at T4 — so a bypass would
+trade 2-3x of wall for ~40-70 B of size. The L0 precedent does not extend: L0 is
+memory-bandwidth-bound and genuinely gains nothing from threads, while these are CPU-bound and
+scale nearly linearly.
+
+Recorded so the next session does not re-derive it: the smallest failing file in this class is
+868 KB and still hits 1.94x. There is no size floor below which the seam is free.
