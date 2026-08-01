@@ -1421,3 +1421,63 @@ ORDER OF WORK: this composes with, and partly supersedes, #227. Land #227 on its
 running wall gate FIRST (land-gated-work-first), then tune `params_parallel` depths
 toward zlib's per-level values and gate that, with the single engine.wasm L8 T4 flip as
 the known blocker to resolve.
+
+## THE WALL BOARD REDUCES TO ONE CELL CLASS: libdeflate at T1
+
+`/root/wallboard-L6/census.json` (L6, 20 corpus files, 4 rivals, T1+T4, commit
+`e6e6ad30`, gzippy sha `eb9a0a50`, 111 measured cells, 19 failing). Split by rival and
+thread count:
+
+```
+  gzip        T1   18 measured,  0 failing   worst ratio 0.5305
+  gzip        T4   19 measured,  0 failing   worst ratio 0.1941
+  pigz        T1   16 measured,  0 failing   worst ratio 0.6045
+  pigz        T4   20 measured,  0 failing   worst ratio 0.7948
+  libdeflate  T1   19 measured, 19 FAILING   worst ratio 1.2092
+  libdeflate  T4   19 measured,  0 failing   worst ratio 0.5693
+```
+
+**Every wall failure on the board is libdeflate at T1, and it is ALL of them — 19 of
+19.** We are 8-21% slower there (photo.jpg 1.2092, movie.mp4 1.1883, symbols.dwarf
+1.1700, armexe.elf 1.1613, weights 1.1523, engine.wasm 1.1512). **At T4 the same 19
+cells all PASS** (0.3940-0.5693). Against gzip and pigz we never lose on wall at any
+thread count.
+
+### Composed with the size board, this is the campaign's hard core
+
+```
+  vs libdeflate at T1:  TIE on size (154/198 cells byte-identical)  +  LOSE on wall 19/19
+  vs libdeflate at T4:  lose on size only by the SEAM               +  WIN on wall 19/19
+  vs gzip / pigz:       win on wall everywhere; size gaps are 0.02-1.1%
+```
+
+**The T1-vs-libdeflate cell has zero headroom in BOTH directions simultaneously** —
+byte-identical on size, 8-21% behind on wall. That is why no lever moves it: there is
+nothing to trade.
+
+### This sharpens the clause-5 finding rather than replacing it
+
+Clause 5 does not block size levers in the abstract. **It blocks them to protect our
+2-5x margin over gzip and pigz** — the cells at ratio 0.19-0.79, all passing
+comfortably, which is where every measured erosion landed (gzip:minjs:T4,
+gzip:dickens:L4:T1, gzip:data.json:T1). Meanwhile the cell class we ACTUALLY lose on
+wall, libdeflate T1, is unprotected by clause 5 because it is already failing.
+
+So the rule is spending its entire protective budget on margins we do not need, against
+rivals we dominate, while the real competitive deficit sits outside its scope. Stated as
+an observation only — `CLAUDE.md` forbids rewriting a promotion rule to fit a result,
+and nothing here does.
+
+### What this implies for lever selection, concretely
+
+  * A size lever that costs wall is affordable ONLY where the wall cell is already
+    failing (libdeflate T1) or where the margin is large enough that 0.005 is not the
+    binding term (`old_ratio > 0.98`). Neither is the common case.
+  * **The libdeflate-T1 WALL deficit is a first-class target in its own right** and is
+    NOT blocked by clause 5 — those 19 cells are already failing, so improving them
+    cannot flip anything. This is the one axis where work is unconstrained.
+  * T>1 is not where the wall problem is. At T4 we already win every libdeflate cell.
+
+PROVENANCE CAVEAT: this artifact is L6-only and predates current main (`e6e6ad30`,
+2026-07-31 01:14). The SHAPE (all wall failures are libdeflate T1; T4 rescues them all)
+is what is being claimed, not the exact ratios. Re-measure before quoting a number.
