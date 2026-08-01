@@ -1590,3 +1590,69 @@ libdeflate ~0.
 Coordinate: L6, T1, main, TUNE members only, trainer. Ir LOCATES and never predicts the
 wall (movie.mp4 is 2.16x Ir at 1.1883x wall). Per-line attribution remains unusable —
 libdeflate is built without `-g`.
+
+## STRUCTURE, NOT RATIOS: the level knobs are INERT on exactly the cells we lose
+
+`fulcrum anatomy explain` — the tool that "puts each level's DECLARED knobs beside the
+OBSERVED behaviour and refuses loudly when they disagree". Two TUNE members, L0-9, T1,
+origin/main built `--features anatomy-counters` (an instrumented build — it emits no
+score and NO WALL NUMBER IS QUOTED FROM IT).
+
+Mean chain-walk candidates per search:
+
+```
+              L2    L3    L4    L5    L6    L7    L8    L9     declared depth 6 -> 600
+  dickens    3.10  4.52  5.91  5.46  8.22 12.63 15.84 17.58    knob ACTIVE
+  movie.mp4  0.32  0.32  0.32  0.32  0.33  0.33  0.34  0.34    knob INERT
+```
+
+**On movie.mp4 every level from L2 to L9 does the SAME work.** The tool's verdict:
+
+    max_search_depth=600 is INERT: only 0.1% of it is ever used (0.34 candidates/search)
+    nice_match_length=258 is INERT: mean accepted match is 3.83 bytes, 1.5% of it
+    search effort is not monotonic in level (P3): L3 walks 0.32 but L4 walks 0.32
+
+The mechanism is plain once seen: on near-random input the hash chains are EMPTY (no
+collisions to walk), so the search terminates immediately no matter how deep it is
+allowed to go.
+
+### Why this matters more than any ratio measured today
+
+**Every failing wall cell is a literal-dense file** — photo.jpg, movie.mp4,
+symbols.dwarf, armexe.elf, weights.safetensors, engine.wasm, winexe.exe (see the wall
+board section above, 19 of 19 libdeflate T1). On exactly those cells the level ladder is
+a NO-OP and **100% of our cost is the FIXED PER-POSITION PATH** — hash computation,
+table insertion, bookkeeping done at every position whether or not a search happens.
+
+That closes the loop on the two Ir results above, which I had been refining as numbers:
+  * our excess is ~610-835 instructions PER INPUT BYTE, roughly independent of content —
+    because it is per-position fixed cost, not search;
+  * libdeflate's instruction count is content-INDEPENDENT (9,315M vs 9,291M, 0.3% apart)
+    — because their fixed per-position cost is small and flat, while ours is large.
+**The target is the fixed per-position path, NOT the search and NOT the literal path.**
+Every depth-based lever measured today was operating on a knob that does nothing here.
+
+### The ladder is also mostly inert at DEEP levels on match-dense input
+
+dickens: L8 uses 5.3% of its declared 300 (15.84 walked); L9 uses 2.9% of 600 (17.58).
+`nice_match_length` is INERT everywhere measured — mean accepted match is 3.8-7.3 bytes
+against declared 65/130/258, so early termination essentially never fires.
+
+Per the tool's own NEXT line: **"a declared knob that does not move observed behaviour
+is a defect, not a tuning opportunity."** Our L7/L8/L9 declare 100/300/600 and walk
+12.6/15.8/17.6. Whatever separates those levels, it is not what the table says.
+
+### METHOD NOTE — recorded because it cost four turns
+
+I measured this gap four times, at increasing precision (2.16x, then 1.80x, then
+610-835 Ir/byte), without once asking what libdeflate's loop DOES differently. The user
+asked "are you fixated on numbers again instead of looking at structure?" and "did you
+forget about fulcrum?" — both landed. I had also just hand-rolled `valgrind
+--tool=callgrind` + `callgrind_annotate` for attribution, which is hard stop #6 verbatim,
+while `fulcrum anatomy explain` was sitting in the guide index answering exactly this.
+ONE command produced more than four turns of ratio-refinement. Numbers teach you about
+the construction; they are not the finding.
+
+Coordinate: L0-9, T1, movie.mp4 + dickens (TUNE), origin/main, trainer.
+NOT generalised to the other failing wall files — confirm on symbols.dwarf and
+armexe.elf before treating "literal-dense => inert ladder" as the class.
