@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a one-line index of every FALSIFY record in `src/`.
+"""Print a one-line index of every FALSIFY and PARK record in `src/`.
 
 WHY THIS EXISTS
 ---------------
@@ -34,7 +34,14 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "src")
-STEM = re.compile(r"FALSIF(?:Y|IED|IES)")
+# FALSIFY *and* PARK. A PARKED note is a measured result that did not ship —
+# `CLAUDE.md` says "PARK monotone work; never DELETE it", so it is binding
+# evidence in exactly the way a falsification is, and re-deriving one costs the
+# same session time. On 2026-08-01 the L4 `Lazy(depth 10)` PARK at
+# `level.rs:267-278` (depths 6/8/10/12 all measured, no interior point satisfies
+# clauses 3 and 5 together) was re-derived from scratch BECAUSE this pattern
+# matched FALSIFY only and the one command built to prevent that could not see it.
+STEM = re.compile(r"FALSIF(?:Y|IED|IES)|PARKED?\b")
 # Leading comment punctuation: `//`, `///`, `//!`, `#`, and any `*** ` banner.
 LEAD = re.compile(r"^\s*(?://[/!]?|#)\s*|^\s*\*+\s*")
 
@@ -79,7 +86,7 @@ def main():
                 found.append((rel, i + 1, text))
 
     if not found:
-        print("no FALSIFY records matched %r" % query if query else "no FALSIFY records")
+        print("no FALSIFY/PARK records matched %r" % query if query else "no FALSIFY/PARK records")
         return 1
 
     width = max(len("%s:%d" % (f, n)) for f, n, _ in found)
@@ -89,7 +96,7 @@ def main():
             print()
             last = rel
         print("  %-*s  %s" % (width, "%s:%d" % (rel, num), text))
-    print("\n%d records. A FALSIFY note is BINDING (hard stop #2): touching one needs a" % len(found))
+    print("\n%d records (FALSIFY + PARK). A FALSIFY note is BINDING (hard stop #2):" % len(found))
     print("REOPEN: line naming a NEW mechanism. Prose that PRESCRIBES one needs the same check.")
     return 0
 

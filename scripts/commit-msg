@@ -32,15 +32,24 @@ if [ -n "$STAGED" ]; then
         # falsifications that were invisible to this hook AND to `fulcrum candidates`.
         # The checker and the data it checks were written in the same session and never
         # run against each other. Matching the stem makes the family unbreakable.
-        if git diff --cached -U40 -- "$f" | grep -qE "FALSIF(Y|IED|IES)"; then
+        # ...and PARKED records too. A PARK is a MEASURED result that did not ship
+        # ("PARK monotone work; never DELETE it"), so touching one silently is the
+        # same failure as touching a falsification silently. Receipt 2026-08-01: the
+        # L4 `Lazy(depth 10)` PARK at `level.rs:267-278` — depths 6/8/10/12 all
+        # measured, no interior point satisfies clauses 3 and 5 together — was
+        # re-derived from scratch over most of a session. `make falsified` could not
+        # see it either (fixed in the same PR). Same lesson as the FALSIFY/FALSIFIED
+        # stem bug above: the checker and the records it checks must cover the same
+        # vocabulary, or the gap is invisible from both sides.
+        if git diff --cached -U40 -- "$f" | grep -qE "FALSIF(Y|IED|IES)|PARKED"; then
             # A REVERT toward the recorded-safe value is what the FALSIFY note
             # WANTS, but this check only sees proximity to the comment, not
             # direction — so it blocked a legitimate revert on 2026-07-29.
             # `RESTORE:` is the escape for that case: still explicit, still
             # auditable, but it does not demand a "new mechanism" for going back.
             if ! printf '%s' "$MSG" | grep -qE '^(REOPEN|RESTORE):'; then
-                say "touches a FALSIFY record in $f without a 'REOPEN:' line."
-                say "  A prior falsification is BINDING. State the NEW mechanism and its"
+                say "touches a FALSIFY or PARK record in $f without a 'REOPEN:' line."
+                say "  A prior falsification or PARK is BINDING. State the NEW mechanism and its"
                 say "  falsifier: 'REOPEN: <mechanism> — falsified by <measurement>'."
                 say "  If you are RESTORING the recorded-safe value, say 'RESTORE: <what>'."
                 say "  'Different code shape now' is not a mechanism."
