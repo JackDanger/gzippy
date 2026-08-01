@@ -1956,3 +1956,45 @@ photo.jpg and weights are the per-block-COST class whose count-based readings ar
 So of 26: 6 belong to work already verified and owned elsewhere, 12 need the seam
 re-architecture, and 8 need either hash3 chaining (attributed, 4 cells) or a per-block cost
 measurement that does not yet exist (4 cells).
+
+## G40 — the T>1 seam DECOMPOSED per cell: three terms, and no single one dominates
+
+The 12 residual libdeflate T4 cells fail by ~40-1,400 B. Measured what that is actually made
+of, T1 vs T4, with the block-type counters (anatomy-counters build, exact bytes):
+
+    file             L   T1 dyn/stored   T4 dyn/stored   seam    stored x5 B   unexplained
+    photo.jpg        6      25 / 0          25 / 10       +70         50           ~20
+    engine.wasm      9      17 / 0          17 /  2       +61         10           ~51
+    minjs.min.js     9      66 / 0          69 / 11       +39         55           -16
+    movie.mp4        6      54 / 0          55 /  9      +195         45          ~150
+
+THREE TERMS, NONE DOMINANT:
+  1. SYNC-FLUSH overhead — the stored blocks, 5 B each, one per chunk seam.
+  2. EXTRA DYNAMIC HEADERS — 0 on photo.jpg and engine.wasm, +3 on minjs, +1 on movie.mp4.
+  3. A RESIDUAL that neither explains — +150 B on movie.mp4 with only 9 flushes and 1 extra
+     header; NEGATIVE on minjs (its 11 flushes and 3 headers "should" cost 55+ B, yet the
+     total seam is only 39 B, so something at T4 is SMALLER).
+
+Term 3 is boundary MISPLACEMENT: a chunk edge forces a block to end where the parse did not
+want one, so the tables either side fit worse — and occasionally BETTER, which is why minjs
+comes out under its own overhead.
+
+### An overclaim caught by checking a second file
+
+photo.jpg alone reads as "the seam is ENTIRELY sync flushes": same dynamic count, 10 stored
+blocks, +70 B against 50 B of flush overhead. That reading would have justified building
+bit-level concatenation to remove the flushes, on the strength of one file. engine.wasm
+refutes it immediately — same dynamic count, only 2 flushes (10 B), and still +61 B.
+
+So REMOVING THE SYNC FLUSHES ALONE WOULD NOT CLOSE MOST OF THESE CELLS. It would close
+photo.jpg L6 (+70 -> ~+20, and our T1 is 6,472,061 against libdeflate's 6,472,062) and leave
+engine.wasm, movie.mp4 and the rest failing. That is worth knowing BEFORE building it: the
+bit-shift concatenation is real work and it buys one cell of this class, not twelve.
+
+### What this does to the re-architecture estimate
+
+G24a scoped "consumer owns the seam blocks" as the fix, on the assumption the seam is headers.
+It is not, on this class: headers are 0 extra on half the cells measured. The consumer-owned
+seam block would fix term 2 and term 3 (it removes the forced boundary entirely) but NOT term
+1 unless the concatenation also goes bit-level. Both halves are needed for this class, and the
+cheaper half alone was about to be built on a one-file reading.
