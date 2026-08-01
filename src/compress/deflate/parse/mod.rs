@@ -934,11 +934,7 @@ fn emit_block(
     // reuses for every block. See `huffman::CodeScratch`: building them fresh here
     // was the per-block allocation that made our allocation count grow with input
     // (733 allocs on 6 MB where libdeflate uses 3 and gzip 0).
-    let CodeScratch {
-        litcode,
-        offcode,
-        shape,
-    } = code_scratch;
+    let CodeScratch { litcode, offcode } = code_scratch;
     let (header, dynamic_bits, static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
@@ -946,26 +942,17 @@ fn emit_block(
             let mut litlen_freqs = sink.litlen_freqs;
             litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-            // PROBE: build the codes from the RLE-shaped histogram when that is
-            // strictly cheaper. `cost_from_freqs` below still charges the TRUE
-            // frequencies, so the dyn/static/stored comparison is unaffected.
-            let shaped = shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs, shape);
-            let (build_lit, build_off) = match shaped {
-                Some((ref l, ref o)) => (l, o),
-                None => (&litlen_freqs, &sink.offset_freqs),
-            };
-
             make_huffman_code_into(
                 litcode,
                 DEFLATE_NUM_LITLEN_SYMS,
                 MAX_LITLEN_CODEWORD_LEN,
-                build_lit,
+                &litlen_freqs,
             );
             make_huffman_code_into(
                 offcode,
                 DEFLATE_NUM_OFFSET_SYMS,
                 MAX_OFFSET_CODEWORD_LEN,
-                build_off,
+                &sink.offset_freqs,
             );
             let header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
 
@@ -1099,262 +1086,6 @@ fn emit_block_static_or_stored(
 /// histogram (Sink bumps them inline as tokens are pushed), the sum is
 /// bit-for-bit identical to the old per-token walk (`data_bits` in the tests),
 /// so the dyn/static/stored decision — and thus the emitted bytes — is unchanged.
-/// PROBE (2026-08-01, size-only, NOT SHIPPABLE AS WRITTEN — allocates per call).
-///
-/// zopfli's `TryOptimizeHuffmanForRle` (`deflate.c:434-560`): reshape the symbol
-/// histogram to favour precode-RLE-able codeword-length runs, build the code from
-/// the reshaped histogram, and price the result with the TRUE counts. Keep it only
-/// if the total (tree + data) is smaller. libdeflate has no counterpart, and our
-/// level engine has none either — `optimize_huffman_for_rle` already lives in the
-/// shared `huffman::optimal` but only `parse::ultra` calls it.
-///
-/// MONOTONE BY CONSTRUCTION: the raw histogram is the incumbent and a candidate
-/// replaces it only on a strict improvement, so a block can never grow. That is
-/// what makes it eligible under promotion clause 3, which no parse-strength lever
-/// has ever satisfied.
-///
-/// FALSIFY 2026-08-01 — NOT the mechanism, the IMPLEMENTATION. This function as
-/// written is **1.8x-6.4x slower** than baseline (`engine.wasm` 1.81, `symbols.dwarf`
-/// 1.96, `data.parquet` 6.08, `tool.bin` 6.40 — L6 T1, interleaved n=15, M1, both
-/// arms to /dev/null). The size win is real and verified (44/44 cells smaller); the
-/// cost is not.
-///
-/// The reasoning that produced it was "O(288) per block, negligible" — a
-/// SOURCE-LEVEL cost argument, which hard stop #4 says is not machine-level cost.
-/// It was wrong by ~6x. What the instrument says (`--features anatomy-wall`,
-/// `ANATOMY_WALL` stderr JSON, tool.bin L6):
-///
-///     parse_match_ns     489.9 ms   89.1% of cli_ns
-///     huffman_encode_ns   37.3 ms    6.8%
-///     huffman_table_ns     7.8 ms    1.4%   <- the phase this doubles
-///
-/// So the MECHANISM's ceiling is ~1.4%, and 540% of overhead is this function's
-/// per-block allocation: two `make_huffman_code` (allocating, vs the
-/// `_into` form the hot path uses), a fresh `HeaderScratch::new()`, and the
-/// `vec![false; length]` inside `optimize_huffman_for_rle` — all called TWICE per
-/// block by `price()`.
-///
-/// REOPEN requires: hoisting all four allocations into the caller-owned
-/// `CodeScratch`/`HeaderScratch` (add `alt_litcode`/`alt_offcode`/`alt_header`/
-/// `rle_flags` fields, and an `optimize_huffman_for_rle_into` taking the flag
-/// buffer), then re-measuring the wall. Falsified if the hoisted version still
-/// exceeds ~1% at T1 — that would mean the cost is the shaping math rather than
-/// the allocation, and the mechanism is dead rather than the code.
-///
-/// MEASURE THE PHASE SHARE BEFORE OPTIMISING A PHASE. One `anatomy-wall` run would
-/// have given both the ceiling (1.4%) and the real target (parse_match, 89%).
-///
-/// FALSIFY 2026-08-01 (SECOND, same function, different claim) — the "it is the
-/// allocations" diagnosis above is ALSO WRONG. All four per-block allocations were
-/// hoisted into caller-owned scratch (`ShapeScratch`: candidate codes built with
-/// `make_huffman_code_into`, two reused `HeaderScratch`, and a reused
-/// `good_for_rle` buffer via `optimize_huffman_for_rle_into`). Output stayed
-/// byte-identical to the allocating probe on 4/4 files. The wall did not move:
-///
-///     file           allocating   hoisted
-///     engine.wasm       1.81x      1.83x
-///     symbols.dwarf     1.96x      2.00x
-///     data.parquet      6.08x      5.94x
-///     tool.bin          6.40x      6.21x
-///
-/// TWO INSTRUMENTS NOW DISAGREE BY ~200x AND THIS IS UNRECONCILED:
-///   - `anatomy-wall` says `huffman_table_ns` is 7.8 ms of a 549.6 ms run (1.4%),
-///     so roughly tripling that phase should cost ~3%.
-///   - the paired wall says it costs 520%.
-/// `MEMORY.md`: "a result contradicting a banked one is measurement error until
-/// reconciled" and "when two instruments disagree, measure a THIRD time — do not
-/// reason". DO NOT pick a side by argument. The cheapest discriminator, unrun:
-/// make this function do all its work and then `return None` unconditionally. If
-/// the wall stays ~6x the cost is the WORK; if it collapses, the cost is
-/// downstream of the changed histogram (most likely many more, smaller blocks —
-/// shaping moves `dynamic_bits`, which feeds the stored/static/dynamic choice and
-/// the block splitter), and `huffman_table_ns` was never the phase being tripled.
-///
-/// RESOLVED 2026-08-01 by the third measurement. The discriminator was built
-/// (all the work, then `return None` unconditionally). It produces output
-/// BYTE-IDENTICAL TO BASELINE — verified, engine.wasm 398123 and tool.bin 20825308
-/// both arms — and still costs:
-///
-///     engine.wasm 1.83x   symbols.dwarf 1.96x   data.parquet 6.13x   tool.bin 6.35x
-///
-/// So **the cost is the WORK, not the changed output**. The
-/// more-blocks/block-splitter hypothesis is DEAD; do not re-propose it.
-///
-/// WHAT IS NOW OPEN, and it is a defect in an INSTRUMENT, not in this lever:
-/// `anatomy-wall` reports `huffman_table_ns` at 1.4% of the run, yet adding two
-/// `make_huffman_code_into` + two `build_dynamic_header` + two `cost_from_freqs`
-/// calls per block costs 83-535%. Those calls are INSIDE the `huffman_table_ns`
-/// region. One of these is lying, and it is load-bearing for every future "where
-/// does encoder time go" decision. Do not cite `huffman_table_ns` until it is
-/// reconciled.
-///
-/// THAT CANDIDATE IS ALSO FALSIFIED (2026-08-01, fourth measurement). Variant B
-/// feeds the RAW histogram to both builds — identical call count, no smoothed
-/// input anywhere — and costs the same as the shaped version:
-///
-///     file           shaped+raw   raw+raw
-///     engine.wasm       1.83x      1.82x
-///     symbols.dwarf     1.96x      1.94x
-///     data.parquet      6.13x      5.90x
-///     tool.bin          6.35x      6.20x
-///
-/// Both arms emit BASELINE-IDENTICAL output. So the package-merge-worst-case story
-/// is dead: **the cost is purely the CALL COUNT**, and `huffman_table_ns` is not
-/// non-linear, it is WRONG.
-///
-/// AUDITED 2026-08-01 — the TIMER IS HONEST; the BUILD is not comparable.
-/// Building the discriminator WITH `--features anatomy-wall` and re-reading the
-/// counters (tool.bin L6 T1, 1,396 blocks in both arms):
-///
-///     huffman_table_ns   7,770,858 -> 22,845,334   (2.94x for 3x the work: CORRECT)
-///     huffman_table_calls    1,396 ->      1,396   (unchanged, as expected)
-///
-/// So the region tracks its own work faithfully and `anatomy_wall_time!`
-/// accumulates correctly. The defect is elsewhere:
-///
-///     instrumented baseline  cli_ns = 537.8 ms
-///     vanilla baseline       wall   =  89.3 ms      -> 6.0x INSTRUMENTATION TAX
-///
-/// `CLAUDE.md` states an instrumented build is 1.17x slower and must never be
-/// quoted against a rival. This one is 6x. Because the tax is not spread evenly,
-/// every PHASE SHARE from this instrument is a share of an inflated denominator:
-/// `huffman_table` is 1.4% of the INSTRUMENTED 537.8 ms but 8.7% of the vanilla
-/// 89.3 ms — and the marginal cost of tripling it is ~468 ms of vanilla wall, not
-/// the ~15 ms the instrumented delta suggests.
-///
-/// USE IT FOR: relative change within one instrumented build (it caught the 3x).
-/// NEVER FOR: "phase X is N% of the shipped run". That includes `parse_match_ns`
-/// at 89.1%, which is the campaign's picture of where encoder time goes and is a
-/// share of the same inflated total.
-///
-/// FALSIFIED sub-hypothesis: "parse_match_ns wraps a per-POSITION region so its
-/// timer calls dominate". It does not — `parse_match_calls` is 1,396, exactly the
-/// block count, at 344 us/call.
-///
-/// ALSO RULED OUT, by execution: the self-report is not the liar. Timing the
-/// instrumented binary directly against vanilla gives 541.2 ms vs 88.6 ms
-/// (6.11x, n=11) while `cli_ns` self-reports 542.7 ms for the same run — accurate
-/// to 0.3%. The build really is 6x slower, and it is not timer VOLUME either:
-/// 16 sites x ~1,396 calls of `Instant::now()` is microseconds.
-///
-/// LEADING HYPOTHESIS, NOT YET TESTED — stated as a hypothesis because four
-/// mechanism claims were falsified in this same investigation today. The macro
-/// wraps hot-loop bodies (`greedy.rs:108`, `lazy.rs:115`, `ht_fast.rs:165`,
-/// `fast.rs:3078-3278`) in `Instant::now()` ... `elapsed()` plus two relaxed
-/// atomic RMWs. That is an optimization BARRIER across the exact boundary STEP 1
-/// depends on: `#[inline(always)]` fusion of the matchfinder into the parse loop.
-/// If so the tax is not measurement overhead at all, it is lost inlining.
-///
-/// THE TEST, one build: keep `--features anatomy-wall` (so every cfg site and all
-/// the emitter code still compiles in) but make `anatomy_wall_time!` expand to
-/// `$body` alone. Re-time vs vanilla. Returns to ~1.0x => the barrier is the
-/// mechanism and the fix is to move the timers OUT of the fused region (time whole
-/// phases at their call sites, never inside the token loop). Stays ~6x => the
-/// barrier is not it and something else in the feature is responsible.
-///
-/// Returns the histograms to build the block's codes from.
-fn shaped_freqs_if_smaller(
-    litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
-    offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
-    shape: &mut super::huffman::ShapeScratch,
-) -> Option<(
-    [u32; DEFLATE_NUM_LITLEN_SYMS],
-    [u32; DEFLATE_NUM_OFFSET_SYMS],
-)> {
-    use super::huffman::optimal::optimize_huffman_for_rle_into;
-
-    let mut s_lit = [0usize; DEFLATE_NUM_LITLEN_SYMS];
-    for (d, &s) in s_lit.iter_mut().zip(litlen_freqs.iter()) {
-        *d = s as usize;
-    }
-    let mut s_off = [0usize; DEFLATE_NUM_OFFSET_SYMS];
-    for (d, &s) in s_off.iter_mut().zip(offset_freqs.iter()) {
-        *d = s as usize;
-    }
-    optimize_huffman_for_rle_into(&mut s_lit, &mut shape.rle_flags);
-    optimize_huffman_for_rle_into(&mut s_off, &mut shape.rle_flags);
-
-    let mut shaped_lit = [0u32; DEFLATE_NUM_LITLEN_SYMS];
-    for (d, &s) in shaped_lit.iter_mut().zip(s_lit.iter()) {
-        *d = s as u32;
-    }
-    let mut shaped_off = [0u32; DEFLATE_NUM_OFFSET_SYMS];
-    for (d, &s) in shaped_off.iter_mut().zip(s_off.iter()) {
-        *d = s as u32;
-    }
-
-    // Nothing to evaluate if shaping did not move the histogram.
-    if shaped_lit == *litlen_freqs && shaped_off == *offset_freqs {
-        return None;
-    }
-
-    // Price both, allocation-free: codes built INTO the scratch, headers built
-    // into the scratch's two buffers. DATA is charged with the TRUE frequencies
-    // in both arms (zopfli prices candidates with true counts), so the
-    // comparison is only ever about tree shape.
-    make_huffman_code_into(
-        &mut shape.cand_litcode,
-        DEFLATE_NUM_LITLEN_SYMS,
-        MAX_LITLEN_CODEWORD_LEN,
-        &shaped_lit,
-    );
-    make_huffman_code_into(
-        &mut shape.cand_offcode,
-        DEFLATE_NUM_OFFSET_SYMS,
-        MAX_OFFSET_CODEWORD_LEN,
-        &shaped_off,
-    );
-    let cand_bits = {
-        let h = build_dynamic_header(
-            &shape.cand_litcode.lens,
-            &shape.cand_offcode.lens,
-            &mut shape.cand_header,
-        );
-        h.header_bits()
-    } + cost_from_freqs(
-        litlen_freqs,
-        offset_freqs,
-        &shape.cand_litcode,
-        &shape.cand_offcode,
-    );
-
-    // The incumbent: reuse the candidate code slots is NOT possible here (they
-    // hold the candidate), so the raw arm builds into the same slots only after
-    // the candidate has been priced. Build raw into cand_* is destructive, so
-    // price raw with its own build into the header scratch pair.
-    make_huffman_code_into(
-        &mut shape.cand_litcode,
-        DEFLATE_NUM_LITLEN_SYMS,
-        MAX_LITLEN_CODEWORD_LEN,
-        litlen_freqs,
-    );
-    make_huffman_code_into(
-        &mut shape.cand_offcode,
-        DEFLATE_NUM_OFFSET_SYMS,
-        MAX_OFFSET_CODEWORD_LEN,
-        offset_freqs,
-    );
-    let raw_bits = {
-        let h = build_dynamic_header(
-            &shape.cand_litcode.lens,
-            &shape.cand_offcode.lens,
-            &mut shape.raw_header,
-        );
-        h.header_bits()
-    } + cost_from_freqs(
-        litlen_freqs,
-        offset_freqs,
-        &shape.cand_litcode,
-        &shape.cand_offcode,
-    );
-
-    if cand_bits < raw_bits {
-        Some((shaped_lit, shaped_off))
-    } else {
-        None
-    }
-}
-
 fn cost_from_freqs(
     litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
     offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
