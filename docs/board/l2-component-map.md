@@ -152,3 +152,42 @@ precedent:
 
 Neither has been measured. Both are structural rather than compiler-hinting, which
 is the only distinction that matters after three strikes.
+
+---
+
+## ⚠ BYTE-IDENTITY IS NOT THE BAR FOR ANY LEVER OFF THIS MAP
+
+Byte-identity appears throughout this document and the ones beside it, and in
+EVERY case it is a **control**, never a goal:
+
+- ours-vs-libdeflate byte-identical at matched `(depth, nice)` — this is what
+  licenses "same work, so the Ir difference is implementation". Without it the
+  component comparison would be meaningless.
+- the `#[cold]` lever's `size_ratio=1.000000` — this is what makes its wall
+  result a PURE CODEGEN A/B with no size confound.
+
+**Neither is a requirement on a candidate.** CLAUDE.md STEP 2 is explicit, and
+the user has had to restate it three times: *"Byte-identity to a vendor, to our
+own T1, or to our own previous run is never a goal and never a gate."*
+
+This MATTERS HERE, because the parse loop is the biggest open target on the
+board (+48.7%, 81.8% of the excess) and the cheapest-looking levers in it —
+block-splitting bookkeeping, the accept test, the sequence buffer — all CHANGE
+WHAT BYTES COME OUT. A candidate that reorganises block boundaries or the
+split heuristic is fully in scope.
+
+The actual bar, in order:
+
+1. **Valid gzip** — roundtrip byte-exact through gzip, pigz AND libdeflate.
+   sha256, never `wc -c`. This is the only correctness gate.
+2. **Per-label size non-worse** — at level N against their level N, no cell
+   flips PASS->FAIL (clause 3, absolute). This is about the SIZE COMPARISON,
+   not about matching any previous output.
+3. **Wall**, by paired A/B with its `aa_bias` read.
+
+A lever that emits different bytes and is smaller-or-equal per label with no
+flips has cleared everything that matters. Do not filter candidates by "would
+this preserve our current output" — that filter is the cage this project has
+removed three times, and it excludes exactly the block-boundary and
+header/Huffman mechanisms the T4 seam analysis says are the ones with any
+headroom left.
