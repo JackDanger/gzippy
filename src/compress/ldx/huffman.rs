@@ -118,6 +118,101 @@ pub(crate) fn sort_symbols(
     num_used_syms
 }
 
+/// C: `build_tree(u32 A[], unsigned sym_count)` (:941)
+///
+/// Build a Huffman tree.
+///
+/// This is an implementation of Algorithm FGK from "Van Leeuwen, J. (1976). On the
+/// construction of Huffman trees" — the two-queue method. It takes the symbols
+/// already sorted by frequency (as `sort_symbols` leaves them) and merges in O(n)
+/// without any heap, because a sorted leaf queue plus a naturally-sorted internal
+/// queue means the two smallest items are always at one of two heads.
+///
+/// # Input
+///
+/// `A[0..sym_count]` holds the symbols sorted primarily by frequency and
+/// secondarily by symbol value, packed as `(freq << NUM_SYMBOL_BITS) | symbol`.
+///
+/// # Output
+///
+/// `A[0..sym_count - 1]` becomes the tree's internal nodes. Node `A[e]` has its
+/// frequency in the high bits; a node's PARENT index is written into the high bits
+/// of its children. The last node, `A[sym_count - 2]`, is the root.
+///
+/// # The two queues
+///
+/// * `i` — head of the LEAF queue: symbols not yet merged, already sorted.
+/// * `b` — head of the INTERNAL queue: nodes created by earlier merges. These come
+///   out in nondecreasing frequency automatically, which is the whole reason no
+///   heap is needed.
+/// * `e` — the node currently being written.
+///
+/// Each iteration picks the two smallest available items from the two queue heads.
+/// The three-way branch is exactly that choice: two leaves, two internals, or one
+/// of each. **The comparison operators are load-bearing** — the first branch uses
+/// `<=` and the second `<`, which is what breaks ties toward taking leaves. Swap
+/// either and the tree shape changes, which changes codeword lengths, which changes
+/// the emitted bytes. Do not "normalise" them.
+///
+/// # Precondition
+///
+/// `sym_count >= 2`. The C's callers guarantee this — `deflate_make_huffman_code`
+/// handles the 0-symbol and 1-symbol cases separately, because a do-while with
+/// `last_idx == 0` would merge a node with itself.
+// `i + 1 <= last_idx` and `b + 2 <= e` are clippy::int_plus_one hits. They are
+// EXACTLY the C's expressions (deflate_compress.c:947, :955) and are kept
+// character-for-character on purpose: this file's contract is that a reader can
+// diff it against the C line by line. The rewrite clippy wants (`i < last_idx`) is
+// arithmetically identical here, which is precisely why taking it costs a real
+// review property and buys nothing.
+#[allow(clippy::int_plus_one)]
+pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
+    debug_assert!(
+        sym_count >= 2,
+        "build_tree requires >= 2 symbols; callers special-case 0 and 1"
+    );
+
+    let last_idx = sym_count - 1;
+
+    // Index of the next parentless node in the leaf queue.
+    let mut i: usize = 0;
+    // Index of the next parentless node in the internal (branch) queue.
+    let mut b: usize = 0;
+    // Index of the next node to be created.
+    let mut e: usize = 0;
+
+    // C: do { ... } while (++e < last_idx);
+    loop {
+        let new_freq: u32;
+
+        if i + 1 <= last_idx && (b == e || (a[i + 1] & FREQ_MASK) <= (a[b] & FREQ_MASK)) {
+            // Two leaves are the cheapest pair.
+            new_freq = (a[i] & FREQ_MASK) + (a[i + 1] & FREQ_MASK);
+            i += 2;
+        } else if b + 2 <= e && (i > last_idx || (a[b + 1] & FREQ_MASK) < (a[i] & FREQ_MASK)) {
+            // Two internal nodes are the cheapest pair. Record `e` as their parent.
+            new_freq = (a[b] & FREQ_MASK) + (a[b + 1] & FREQ_MASK);
+            a[b] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b] & SYMBOL_MASK);
+            a[b + 1] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b + 1] & SYMBOL_MASK);
+            b += 2;
+        } else {
+            // One leaf and one internal node. Only the internal node needs its
+            // parent recorded here; the leaf's parent is recorded when the leaf
+            // slot is later overwritten as a node (see the C's comment).
+            new_freq = (a[i] & FREQ_MASK) + (a[b] & FREQ_MASK);
+            a[b] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b] & SYMBOL_MASK);
+            i += 1;
+            b += 1;
+        }
+        a[e] = new_freq | (a[e] & SYMBOL_MASK);
+
+        e += 1;
+        if e >= last_idx {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +266,57 @@ mod tests {
         // Every frequency >= num_syms - 1 = 15 saturates into the last bucket.
         let freqs: Vec<u32> = vec![100, 3, 99, 1, 15, 2, 40, 0, 16, 7, 15, 0, 250, 1, 60, 4];
         check(num_syms, &freqs);
+    }
+
+    /// `build_tree`'s strongest checkable invariant without the rest of the chain
+    /// ported: the ROOT's frequency must equal the sum of every input frequency,
+    /// because every leaf is merged in exactly once. A wrong branch condition, a
+    /// double-consumed queue head, or an off-by-one in `last_idx` all break this.
+    fn build_tree_root_freq_equals_total(freqs: &[u32]) {
+        let num_syms = freqs.len();
+        let mut lens = vec![0u8; num_syms];
+        let mut a = vec![0u32; num_syms];
+        let n = sort_symbols(num_syms, freqs, &mut lens, &mut a);
+        if n < 2 {
+            return; // build_tree's precondition; callers special-case these.
+        }
+
+        let total: u32 = freqs.iter().sum();
+        build_tree(&mut a, n);
+
+        // Root is A[sym_count - 2]; its frequency lives in the high bits.
+        let root_freq = (a[n - 2] & FREQ_MASK) >> NUM_SYMBOL_BITS;
+        assert_eq!(root_freq, total, "root freq != total (freqs={freqs:?})");
+    }
+
+    #[test]
+    fn build_tree_conserves_frequency() {
+        build_tree_root_freq_equals_total(&[1, 1]);
+        build_tree_root_freq_equals_total(&[1, 2, 3]);
+        build_tree_root_freq_equals_total(&[1, 1, 1, 1]);
+        build_tree_root_freq_equals_total(&[5, 0, 3, 0, 1, 9]);
+        build_tree_root_freq_equals_total(&[100, 1, 1, 1, 1, 1, 1, 1]);
+        // Powers of two: the shape that makes the internal queue overtake the leaf
+        // queue earliest, exercising the two-internals branch hardest.
+        build_tree_root_freq_equals_total(&[1, 2, 4, 8, 16, 32, 64, 128]);
+        // Flat: every merge is a tie, so this is where the `<=` vs `<` operators
+        // decide the tree shape.
+        build_tree_root_freq_equals_total(&[7u32; 32]);
+    }
+
+    #[test]
+    fn build_tree_conserves_frequency_on_random_spreads() {
+        let mut state: u32 = 0xBEEF_0042;
+        for trial in 0..64 {
+            let num_syms = 2 + (trial % 60);
+            let freqs: Vec<u32> = (0..num_syms)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (state >> 20) % 1000
+                })
+                .collect();
+            build_tree_root_freq_equals_total(&freqs);
+        }
     }
 
     /// Full litlen alphabet with a deterministic spread, including many zeros and a
