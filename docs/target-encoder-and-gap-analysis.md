@@ -711,3 +711,155 @@ Size: must not regress any currently-passing L5-L7 cell (clause 3 is absolute), 
 the full 22-file board at T1 and T4. Wall: must stay under the L6 erosion budget against
 gzip/pigz AND not flip any libdeflate cell — the depth lever died on exactly that leg, so
 wall is not optional here and a size-only argument is insufficient (3 for 3 in this class).
+
+## G14 — 77% OF THE FAILING BOARD IS THE T>1 PATH, NOT THE PARSE (2026-07-31)
+
+The single most useful cut of the banked board, and it was available all along. Failing size
+cells split by THREAD COUNT (`/root/sizeboard-all-12fcd0ed/census.json`, 1,320 measured):
+
+    band     T4    T1
+    L8-L9    35     2
+    L5-L7    61    15
+    L2-L4    41    11
+    L1       17    18
+    TOTAL   154    46
+
+**154 of 200 failing cells are T4.** At T1 our output is BYTE-IDENTICAL to libdeflate on
+every file tested at L6 and L9 — symbols.dwarf 366,624; data.csv 3,300,291; dickens
+4,480,689; sil40 15,452,666 — i.e. we TIE exactly and pass. The loss appears only when the
+input is cut into chunks:
+
+    file            L   T1           T4           seam cost
+    symbols.dwarf   9     366,624      366,918      +294
+    data.csv        9   3,300,291    3,301,579    +1,288
+    sil40           9  15,452,666   15,453,781    +1,115
+    dickens         9   4,480,689    4,480,950      +261
+
+And the wall board already showed we beat libdeflate **2-3x at T4** — so there is large wall
+headroom exactly where the size cells fail. That is the reverse of the T1 situation, where
+wall is the binding constraint.
+
+### The waste is named, and it is not "too many chunks"
+
+`CLAUDE.md` STEP 2 sanctions "making seams SMALLER — pad choice, chunk grid, block
+splitting", and G5 already states the mechanism: **every seam costs a sync-flush AND a
+block-grid restart AND a fresh Huffman histogram. The first is 5 bytes; the other two are the
+expensive ones.**
+
+Halving the chunk count (`CHUNKS_PER_THREAD` 2 -> 1) is only a PARAMETER against that waste.
+Measured at L8-L9 over 264 common cells: **8 closed, 3 opened** (net -5, still a clause-3
+failure). It recovers 65-80% of the per-file seam cost (data.csv L9 +1,288 -> +533; sil40
++1,115 -> +230; dickens +261 -> +25) by having fewer restarts — not by making a restart
+cheaper. It also spends the load-balancing margin that `CHUNKS_PER_THREAD` exists for.
+
+**The structural fix is to make the seam FREE, not rarer**: carry the coding state across the
+chunk boundary so a seam costs the 5-byte sync-flush and nothing else. That is G5, it is
+sanctioned by STEP 2, and it addresses 154 cells rather than the 46 the entire rest of this
+session was aimed at.
+
+### Method note
+
+This session spent ~11 levers on T1 parse mechanisms — matchfinder register pressure, hash
+geometry, cost model, block cadence — and closed zero cells. Ten were falsified. The board
+had the answer in a one-line group-by the whole time. **Before choosing a mechanism, cut the
+failing set by every axis you have (level, rival, thread count, file class) and work the
+largest block.** Thread count was the axis nobody had cut by.
+
+### The seam cost is MISALIGNMENT, not per-seam overhead — vendor-anchored
+
+pigz states its own seam cost in `vendor/pigz/pigz.c:233-240`: each chunk ends with a
+Z_SYNC_FLUSH empty stored block, "a very small four to five byte overhead (average **3.75
+bytes**) to the output for each input chunk", with the previous 32K supplied as a preset
+dictionary (`:248-252`). Its default block is **128 KiB**.
+
+Ours, measured at L9 (exact bytes, `-p1` baseline, local M1 vanilla build):
+
+    file        T2 /seam   T4 /seam   T8 /seam      pigz
+    sil40          76.7      159.3      107.7       3.75
+    dickens         8.3       37.3       35.8       3.75
+    data.csv      177.7      184.0       30.1       3.75
+
+**The cost is NON-MONOTONIC in seam count**: data.csv totals +1,288 B at T4 (7 seams) but
+only +452 B at T8 (15 seams). Twice the seams, a third of the cost. A fixed per-seam
+overhead cannot do that.
+
+So the waste is NOT "we restart the coder N times". It is WHERE THE CUT LANDS. pigz pays
+3.75 bytes because its seam coincides with a 128 KiB block boundary it was going to emit
+anyway — the seam is free by construction, and only the flush is charged. Our chunk boundary
+falls at an arbitrary offset relative to the block grid, so a chunk can end in a runt block
+whose header is not amortised, and the penalty is whatever that misalignment happens to
+break.
+
+`pipelined_block_size` already floors the chunk span to a multiple of `SOFT_MAX_BLOCK_LENGTH`
+— but the drift detector ends blocks EARLY and data-dependently, so actual block boundaries
+are not at multiples of the budget and the alignment is nominal only.
+
+THE STRUCTURAL FIX FOLLOWS, and it is pigz's: make the chunk boundary COINCIDE with a block
+boundary the parser was going to emit anyway, so the seam costs only the flush. That is
+different from CHUNKS_PER_THREAD (fewer seams, each still misaligned) and different from G5
+(carry coding state across the seam). It is the cheapest of the three and it is the one the
+vendor actually ships. NOT YET BUILT.
+
+### THE SEAM COST IS FULLY ACCOUNTED: 3 EXTRA BLOCK HEADERS, NOT 8 CODER RESTARTS
+
+`anatomy-counters`, sil40 at L9, same binary, T1 vs T4:
+
+    T1   blocks_dynamic 913   blocks_stored 0   make_code_calls 2744
+    T4   blocks_dynamic 916   blocks_stored 8   make_code_calls 2753
+
+    +3 dynamic block headers  (~350 B each)  ~ 1,050 B
+    +8 sync-flush stored blocks (~5 B each)  =    40 B
+                                             ~ 1,090 B
+    measured T4-T1 size delta                  +1,115 B
+
+The accounting closes. And it corrects the intuition: the cost is NOT eight coder restarts.
+Seven of the eight chunk boundaries cost essentially nothing — `pipelined_block_size` already
+floors the chunk span to a multiple of `SOFT_MAX_BLOCK_LENGTH`, and it mostly works. What
+costs is that **three chunks round UP to one extra block**, and an extra DYNAMIC header is
+~350 bytes.
+
+That also explains the non-monotonicity (data.csv +1,288 B at T4 with 7 seams but only +452 B
+at T8 with 15): the penalty tracks how many chunks happen to round up, not how many seams
+exist. More seams can round up less often.
+
+CONSEQUENCES for the three candidate fixes:
+* `CHUNKS_PER_THREAD` 2->1 — helps only by making fewer opportunities to round up. Measured
+  8 closed / 3 opened at L8-L9. A parameter, not a fix.
+* G5 "carry coding state across the seam" — would remove the 40 B of sync-flushes and the
+  restart, but the restarts are NOT where the 1,115 B is.
+* **ALIGNMENT — the actual target.** Make each chunk's span an exact whole number of blocks
+  so no chunk rounds up. Upper bound on the win is ~1,050 of the ~1,115 B on this cell, and
+  it costs nothing at the wall.
+
+The obstacle is named and real: the drift detector ends blocks EARLY and data-dependently, so
+the true block grid is not at multiples of the budget and cannot be predicted from the chunk
+span alone. Any alignment scheme has to reckon with a block boundary the parser chooses, not
+one the scheduler assigns. NOT YET BUILT.
+
+### FALSIFIED — the extra blocks are NOT runts, and a tail guard makes it worse
+
+If the +3 dynamic headers at T4 were runt blocks created by the drift detector splitting too
+close to a chunk end, refusing to split there would recover them. Ablated by raising the
+`bytes_remaining` threshold in `ready_to_check_block` (libdeflate's own value is
+MIN_BLOCK_LENGTH = 5,000), L9, `-p4`, exact bytes:
+
+    file        T1           guard 5,000   32,768       131,072      262,144
+    sil40       15,452,666   15,453,781    15,454,738   15,461,035   15,466,720
+    data.csv     3,300,291    3,301,579     3,301,587    3,302,154    3,302,080
+    dickens      4,480,689    4,480,950     4,480,950    4,480,947    4,481,224
+
+MONOTONICALLY WORSE. Those late splits EARN their headers — the data changed and a fresh
+table pays. The extra blocks are legitimate, not waste.
+
+So the +3 is genuinely the boundary MISMATCH: with 8 chunks there are 7 forced block
+boundaries, 4-5 of which happen to coincide with where the parser would have ended a block
+anyway, and 3 of which do not. Where the parser wants a boundary is DATA-DEPENDENT and not
+knowable when the scheduler assigns the grid.
+
+THAT is why the only remaining alignment fix is the one the review proposed: **let the PARSER
+choose the boundary and the scheduler follow it**, rather than the scheduler assigning a grid
+the parser must honour. Chunk boundaries become scheduling artifacts, not coding boundaries.
+Every cheaper approach is now measured and dead:
+    CHUNKS_PER_THREAD 2->1   8 closed / 3 opened at L8-L9 — a parameter, still misaligned
+    tail guard               monotonically worse (above)
+    G5 carry coding state    removes 40 B of flushes; the 1,115 B is not the restarts

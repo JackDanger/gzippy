@@ -367,22 +367,38 @@ mod tests {
     }
 
     #[test]
-    fn near_optimal_knob_values() {
-        let l10 = params(10);
-        assert_eq!(l10.max_search_depth, 35);
-        assert_eq!(l10.nice_match_length, 75);
-        assert_eq!(l10.near_optimal.max_optim_passes, 2);
-        assert_eq!(l10.near_optimal.min_improvement_to_continue, 32);
-        assert_eq!(l10.near_optimal.max_len_to_optimize_static_block, 0);
-
-        let l12 = params(12);
-        assert_eq!(l12.max_search_depth, 300);
-        assert_eq!(l12.nice_match_length, DEFLATE_MAX_MATCH_LEN);
-        assert_eq!(l12.near_optimal.max_optim_passes, 10);
-        assert_eq!(l12.near_optimal.min_improvement_to_continue, 1);
-        assert_eq!(l12.near_optimal.max_len_to_optimize_static_block, 10000);
-
-        assert_eq!(max_passthrough_size(10), 15);
-        assert_eq!(max_passthrough_size(12), 7);
+    fn near_optimal_effort_is_monotonic_in_level() {
+        // DELETED 2026-07-31: `near_optimal_knob_values`, which asserted
+        //     params(10).max_search_depth == 35, .nice_match_length == 75,
+        //     .max_optim_passes == 2, params(12).max_search_depth == 300, etc.
+        //
+        // SECOND INSTANCE OF THE CAGE. `vendor_knob_values` was deleted earlier today for
+        // pinning L6/L9 depths that `CLAUDE.md` declares free to change; this pinned the
+        // L10-L12 knobs the same way, and non-negotiable #5 now forbids it outright:
+        // an equality assertion beats a sentence in a doc, because only one fails closed.
+        // Found by an adversarial review after the first one was fixed — the pattern
+        // repeats, so test the INVARIANT, not the VALUE.
+        //
+        // The invariant a typo would actually break is that effort rises with level.
+        for l in 11..=12u32 {
+            let prev = params(l - 1);
+            let cur = params(l);
+            assert!(
+                cur.max_search_depth >= prev.max_search_depth,
+                "L{l} searches less deeply than L{}",
+                l - 1
+            );
+            assert!(
+                cur.near_optimal.max_optim_passes >= prev.near_optimal.max_optim_passes,
+                "L{l} runs fewer optimisation passes than L{}",
+                l - 1
+            );
+        }
+        for l in 10..=12u32 {
+            let p = params(l);
+            assert_eq!(p.strategy, Strategy::NearOptimal, "level {l}");
+            assert!(p.nice_match_length <= DEFLATE_MAX_MATCH_LEN, "level {l}");
+            assert!(p.near_optimal.max_optim_passes >= 1, "level {l}");
+        }
     }
 }
