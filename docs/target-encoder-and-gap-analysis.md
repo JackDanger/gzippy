@@ -794,3 +794,34 @@ it at a discount". The lever is the early exit, not the bound.
 NOT ATTEMPTED HERE. Note that an uncommitted `good_match` implementation was found in this
 checkout belonging to no branch (see the contamination note in G29) — another writer is
 already on this. Coordinate before duplicating it.
+
+## G31a — the `good_match` work (ANOTHER WRITER'S, not mine) closes the T1 gzip/pigz class
+
+G31 predicted that the T1 halves of the gzip/pigz class need zlib's `good_match` early exit
+rather than more depth. There is an uncommitted `good_match` implementation in this checkout
+belonging to no branch (found as contamination, G29). Its level table is `4,4,4,8,8,8,32,32` —
+zlib-ng's `good` column exactly, so it is a direct port of the mechanism G31 named.
+
+TESTED WITHOUT TOUCHING THE OTHER WRITER'S TREE: applied to a detached worktree off `main`
+(`git worktree add --detach`), vendor symlinked, built vanilla. Sizes are deterministic, T1,
+local M1. This measures THEIR work; it is recorded here only so the result is not lost.
+
+    file           L  rival   rival bytes   main T1      +good_match   verdict
+    aozora.txt     6  gzip      4,049,212   4,072,294    4,013,389     CLOSES (-35,823)
+    aozora.txt     6  pigz      4,053,967   4,072,294    4,013,389     CLOSES
+    monorepo.tar   6  pigz      9,898,201   9,951,696    9,870,485     CLOSES (-27,716)
+    minjs.min.js   6  gzip      1,088,768   1,092,487    1,087,222     CLOSES
+    dd79_bin6      2  pigz      4,464,656   4,500,757    4,500,757     unchanged
+
+FOUR OF FIVE CLOSE, and they are the four the mechanism predicts: all L6, where zlib walks 128
+chain nodes to our 35 and pays for it with the early exit. `dd79_bin6` at L2 is untouched —
+a separate cell needing a separate mechanism, and it should not be attributed to this lever.
+
+This is the second prediction from the G31 vendor diff to be confirmed by execution (the first
+was #236's depth x4 closing exactly the T4 halves of the same class). The two levers are
+complementary, not competing: depth-at-T>1 closes the T4 halves, `good_match` closes the T1
+halves, and together they cover the class.
+
+COORDINATION, not a claim: this work is not mine, is not on a branch, and is not gated. It
+needs its owner to land it through `fulcrum try` like anything else. Recorded so that (a) the
+measurement exists, and (b) nobody re-implements it.
