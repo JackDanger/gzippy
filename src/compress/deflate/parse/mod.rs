@@ -630,18 +630,13 @@ pub(super) fn compress(
         // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
         // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
         // closed search and what the 2.19x instruction gap actually is.
+        // ⚠ PROBE BRANCH ONLY — `probe/ht-implementation-gap`. This routing is NOT a
+        // ship proposal and must never be merged: it is the subject arm of a
+        // MEASUREMENT of where our 2.19x instruction gap against libdeflate's own
+        // `ht_matchfinder` lives. Both FALSIFY notes above stand; neither is being
+        // re-tried. See the commit message for the REOPEN mechanism.
         #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => fast::run::<false>(
-            buf,
-            data_start,
-            in_end,
-            statics,
-            bw,
-            is_last,
-            fast::FAST_BLOCK_LENGTH,
-            true,
-            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
-        ),
+        Strategy::Fast => ht_fast::run(buf, data_start, in_end, params, statics, bw, is_last),
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
             let t = fast::tune::get();
@@ -2427,7 +2422,15 @@ mod l1_bakeoff {
         println!();
         println!(
             "  {:<16} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
-            "file", "Fast", "ht_fast", "d-libdefl", "d-gzip", "d-pigz", "d-igzip", "WORST", "allowed"
+            "file",
+            "Fast",
+            "ht_fast",
+            "d-libdefl",
+            "d-gzip",
+            "d-pigz",
+            "d-igzip",
+            "WORST",
+            "allowed"
         );
 
         let mut regressions: Vec<String> = vec![];

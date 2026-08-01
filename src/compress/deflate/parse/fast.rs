@@ -1201,6 +1201,9 @@ fn hc_catchup(
 /// -0.3% vs `LIMIT_HASH_UPDATE_INSERTS_L0`). Higher values (4, 8, MAX) give
 /// more ratio but blow well past a 10% L1 wall budget — not shipped, see the
 /// commit message for the measured numbers.
+// PROBE BRANCH ONLY: `probe/ht-implementation-gap` routes L1 to `ht_fast`, so
+// this constant momentarily has no caller. It is NOT dead on main.
+#[allow(dead_code)]
 pub(super) const LIMIT_HASH_UPDATE_INSERTS_L1: usize = 3;
 
 /// Sentinel head-table entry meaning "no position stored yet". Any position we
@@ -1558,6 +1561,8 @@ const WINDOW: usize = 32768;
 // Strictly worse: nothing gained on incompressible input, a few bytes lost on
 // compressible input to the extra block header. The photo.jpg gzip cells it was aimed
 // at (+0.03% at L1/L2/L3) are NOT a stored-framing problem.
+// PROBE BRANCH ONLY: see `LIMIT_HASH_UPDATE_INSERTS_L1` above. Not dead on main.
+#[allow(dead_code)]
 pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 
 /// L0's block length. The per-block dynamic-Huffman build (canonical code +
