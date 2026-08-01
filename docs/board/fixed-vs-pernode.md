@@ -231,3 +231,60 @@ question about the same instruction stream. That is a much narrower search:
 the candidates are microarchitectural (issue width, load/store, branch
 prediction, cache geometry) or they are commit drift, and a third architecture
 discriminates them.
+
+---
+
+# ⭐ THE ANSWER: our L6 wall result is ARCHITECTURE-DEPENDENT. x86 loses, Apple silicon wins.
+
+Measured 2026-08-01. Same commit on all three boxes. Same input, same level,
+same rival, same thread count. **Byte-identical output everywhere** (verified:
+M1 and Intel both emit `9dfdacf9740e1951` at L2/T1), so this is identical work
+meeting different machines.
+
+| L6 T1 vs libdeflate | AMD Zen2 (solvency, AUTHORITY) | Intel i7-13700T (trainer) | Apple M1 (local) |
+|---|---|---|---|
+| dickens | **1.0661 LOSS** | **1.0230 LOSS** ⚠ | — |
+| aozora.txt | **1.0810 LOSS** | **1.0395 LOSS** | 0.9059 WIN |
+| data.json | **1.0754 LOSS** | **1.0599 LOSS** | 0.9550 WIN |
+
+Intel legs: `sign=9/9` on all three. `aa_bias` 0.0016 (aozora) and 0.0012
+(data.json) — clean. **dickens is DISCOUNTED: `aa_bias=0.0856` on a box at load
+average 21.44.** The two clean cells carry the conclusion; dickens only agrees
+with them.
+
+## What this settles
+
+1. **"L6–L9 are clean" was an Apple-silicon artifact.** Retracted above, and now
+   the mechanism is named rather than merely suspected.
+2. **It is NOT commit drift.** The banked AMD board is `e6e6ad30` and could have
+   been dismissed as old; Intel is on the SAME commit as the M1 run that
+   disagrees with it. Two candidate mechanisms were registered before this ran;
+   the measurement killed one.
+3. **The wall is the ONLY arch-exposed axis**, and this is why. Size is an exact
+   integer byte count and is arch-invariant by construction — confirmed on two
+   arches this session. Wall is not, and the gap here is 12–17 points.
+
+## What it means for the campaign
+
+**The authority box is solvency (AMD Zen2), not this laptop.** The rig manifest
+says so; today is the receipt. Every wall conclusion I drew from the local M1
+about WHICH LEVELS fail was measuring a machine the goal is not scored on.
+
+Promotion-rule clause 7 requires aarch64 + Intel + AMD for exactly this reason,
+and the banked meta-analysis (`0d5e0dc6`, #238) found **only 5 of 42 FALSIFY
+records carry a multi-arch verdict; 28 name no machine at all.** This result is
+what that gap looks like when it bites: a class boundary that exists on one
+vendor's silicon and not on the other's.
+
+## What is NOT claimed
+
+- **No mechanism yet.** "x86 loses, aarch64 wins" is a coordinate-dependent
+  VERDICT, not an intrinsic ceiling. Candidates — issue width, load/store
+  throughput, branch prediction, cache geometry, the compiler's per-arch codegen
+  — are untested. Naming one requires counters on both.
+- **Three files, one level.** L6 only, and all three are high-match-density
+  text/structured data. The banked AMD board covers 19 files at L6; the levels
+  either side are unmeasured on x86 at this commit.
+- The L2/T1 component map (`l2-component-map.md`) is a **trainer/Intel**
+  measurement and is therefore on the LOSING side of this split. It stands, and
+  this result makes it MORE relevant, not less.
