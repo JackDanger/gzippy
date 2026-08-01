@@ -1239,3 +1239,82 @@ zlib-ng's `deflate_medium`, a THIRD strategy that is neither greedy nor lazy and
 "exists precisely to make L3-6 monotonic at a fraction of lazy's cost". Note a prior
 naive lazy-at-L4 experiment measured 17.7% wall, so the cheap-monotonic property is the
 whole point.
+
+### FULL TUNE SET on x86, T1 AND T4: 10 board cells close, 0 open — and the WALL kills it anyway
+
+All 11 TUNE members, trainer (Intel x86), vanilla builds, exact byte counts:
+
+```
+=== L1 T1 ===                                       === L1 T4 ===
+                libdeflate    shipped      ht256      shipped      ht256
+aozora.txt         4566347    4751200    4578206     4751416    4578509   fail
+armexe.elf          621027     599781     607417      600310     607211   PASS
+data.csv           3932419    4111742    3926359     4112086    3926566   CLOSES
+data.json          1840461    1873127    1846101     1873815    1846239   fail
+data.parquet      14386710   14424479   14383856    14426706   14383721   CLOSES
+dickens            4972688    5077406    4981078     5078221    4981395   fail
+engine.wasm         421013     426271     420714      425688     420809   CLOSES
+minjs.min.js       1184930    1211746    1180722     1211684    1181042   CLOSES
+movie.mp4         12901167   12903670   12899895    12903821   12900349   CLOSES
+symbols.dwarf       396048     394736     391698      394830     391539   PASS
+tool.bin          22673676   22565629   22196465    22565472   22195660   PASS
+                 shipped 3/11 -> ht256 8/11        shipped 3/11 -> ht256 8/11
+```
+
+**10 of the 200 failing board cells close, ZERO open.** `tool.bin` also improves
+369,164 B while already passing. The three that resist (aozora, data.json, dickens) are
+exactly the text files the length-3 mechanism predicts will resist.
+
+### THE PRE-REGISTERED NO-SHIP FIRES: clause 5 fails at T4 too
+
+The pre-registered rule above said: "NO-SHIP if clause 5 fails at T4 ... this class is
+then closed on the wall at BOTH coordinates — record it and stop, do not re-sample."
+
+`fulcrum ab paired --mode compress`, n=15, /dev/null both arms, A/A certificate clean,
+minjs.min.js L1, trainer (NOT the frozen box — this is a SCREEN, `freeze_checked=false`):
+
+```
+  ht256 vs shipped  T1: ratio 1.2097  a=69.321ms b=55.919ms  sign 15/15  (+13.40 ms)
+  ht256 vs shipped  T4: ratio 1.1098  a=25.832ms b=23.373ms  sign 14/15  (+ 2.46 ms)
+
+  vs gzip at T4:  shipped ratio 0.1949  |  ht256 ratio 0.2090
+                  EROSION 0.0141  against the clause-5 budget 0.0050  =  2.8x OVER
+```
+
+T4 helps enormously — the absolute penalty is 5.4x smaller than T1's, and the erosion
+falls from attempt 2's T1 figure of 0.2312 (46x over budget) to 0.0141 (2.8x over), a
+16x improvement. **It still misses.** The 21% T1 self-tax independently reproduces
+attempt 2's recorded 15-50%.
+
+**VERDICT: the `ht_fast` routing is NO-SHIP at BOTH coordinates.** The coordinate
+argument — the one genuinely untried axis — is now spent. Recorded and stopped, not
+re-sampled on other files until one passes.
+
+SEPARATE THE CEILING FROM THE VERDICT: the 10-cell SIZE result is real, roundtrip-clean,
+and does not expire. What is closed is winning it *via this routing at this wall cost*.
+
+THE NAMED REOPEN CANDIDATE, for a session that has not spent its two strikes on
+load-shaving: `matchfinder/ht.rs`'s `longest_match` reads AND writes `hash3_tab`
+UNCONDITIONALLY before the 4-byte search, yet `cur_node3` is only USED when that search
+misses. Reordering (search first; on hit, blind-store with no load; on miss,
+load-then-store) preserves table quality exactly and removes one dependent load per HIT
+position — which is literally attempt 2's stated reopen condition ("a mechanism that
+adds candidates WITHOUT adding dependent loads per position"). NOT BUILT HERE: this is
+load-shaving, and `project_encoder_deficit_is_loads_not_stalls` is 2-for-2 against that
+class (deleting 25.6M loads at L9 made the wall WORSE), so CLAUDE.md's two-strikes rule
+closes it for this session. The store touches the same cache line either way; only the
+latency ordering changes.
+
+### PROVENANCE FAILURE CAUGHT BY THE CENSUS MATCH
+
+An uncommitted `L1_HASH3_MAX_DIST = 4096` patch was left in the local working tree and
+rode along across several `git checkout`s (uncommitted changes survive branch switches).
+It contaminated ONE reported figure: the local arm64 "shipped-fast 4/11" baseline was
+built WITH it (dickens 5,078,617, not clean main's 5,080,065).
+
+**The x86 results are provably clean, and the check that proves it is the census match:**
+trainer's tree was clean and its `shipped` column reproduces
+`/root/sizeboard-all-12fcd0ed/census.json` byte-for-byte (dickens 5,077,406), which a
+patched build cannot do. That is why "does the baseline reproduce the board?" is worth
+running on every measurement — it caught a contamination that discipline did not.
+The patch is now parked on `measure/l1-hash3-maxdist`; the tree rebuilds to 5,080,065.
