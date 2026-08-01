@@ -628,8 +628,32 @@ pub(super) fn compress(
         // G1 NOT ROUTED — the finder is correct and its size verdict is strong, and it
         // is 1.08-1.37x SLOWER on the frozen paired wall at L1 (data.csv 1.3709,
         // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
-        // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
-        // closed search and what the 2.19x instruction gap actually is.
+        // /dev/null both arms).
+        //
+        // ⚠ RETRACTED 2026-08-01 — this comment used to end "See `matchfinder::ht` for
+        // why micro-optimising it is a closed search and what the 2.19x instruction gap
+        // actually is." BOTH halves of that sentence were wrong, and the wall numbers
+        // above are measured against `parse::fast`, i.e. OURS, not against libdeflate.
+        //
+        //   * "the 2.19x instruction gap" HAD NO DEFINING MEASUREMENT — grep 2.19 across
+        //     `src/` and `docs/` and the only hit is this sentence citing itself. The
+        //     one real figure was `matchfinder::ht`'s 2.07x, and both of ITS arms are
+        //     ours too. No comparison against libdeflate had ever been run.
+        //   * Measured 2026-08-01 (cachegrind, 6 MB data.csv, L1, -p1, libdeflate built
+        //     with -g): ours 196,854,205 Ir vs libdeflate 146,098,195 = **1.35x**, of
+        //     which 46.5M of the 52.4M excess (89%) is inside the matchfinder.
+        //   * "a closed search" does not follow. At `HT_MAX_LEN3_OFFSET = 0` our payload
+        //     is BYTE-IDENTICAL to libdeflate's (sha256 `62a4e450aca4b522`, full 6 MB
+        //     multi-block file). Identical bytes means identical parse decisions, so
+        //     that 46.5M is the same work priced 1.60x higher — an implementation gap
+        //     with a vendor reference implementation to diff against, which is this
+        //     project's 3-for-3 method, not its 0-for-3 one.
+        //
+        // The two FALSIFY notes above still STAND on their own terms: attempt 1 opened
+        // 7 cells on size, attempt 2 failed clauses 5 and 6 on the wall. Nothing here
+        // re-tries either. What is retracted is only the claim that the wall cost is
+        // intrinsic to this shape — no measurement ever supported that, and the vendor
+        // runs this same algorithm, emitting these same bytes, for 1.35x less.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,

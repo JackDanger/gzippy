@@ -64,6 +64,12 @@
 
 //! # MEASURED COST PROFILE — the wall regression is WRITE traffic
 //!
+//! ⚠ **READ THE VENDOR SECTION BELOW BEFORE USING THIS TABLE.** Both arms here are
+//! OURS. This table compares this finder against `parse::fast`, our own previous
+//! path — it is not, and never was, a comparison against libdeflate. It says how
+//! much more this finder costs THAN US. It cannot say whether that cost is
+//! intrinsic to the algorithm, and it was read that way for two falsifications.
+//!
 //! Cachegrind, 6,000,000 B of data.csv at L1 T1 on Zen2, shipped `parse::fast` vs this
 //! finder:
 //!
@@ -73,6 +79,48 @@
 //! | D reads | 17,484,786 | 33,552,458 | 1.92x |
 //! | **D writes** | **7,320,227** | **26,927,232** | **3.68x** |
 //! | D1 misses | 799,400 | 2,065,774 | 2.58x |
+//!
+//! # THE VENDOR COMPARISON, measured 2026-08-01 — the gap is 1.35x, not 2.19x
+//!
+//! The dispatch arm in `parse/mod.rs` cited "the 2.19x instruction gap" against
+//! libdeflate. **That number had no defining measurement anywhere in `src/` or
+//! `docs/`** — grep it. The only real figure was the 2.07x in the table above, and
+//! both of its arms are ours. The vendor comparison had never been run.
+//!
+//! It has now been. Cachegrind, the SAME 6,000,000 B of data.csv, L1, `-p1` (see the
+//! thread trap below), trainer/Intel, `libdeflate-gzip` built with `-g`:
+//!
+//! | arm | total Ir | matchfinder | output |
+//! |---|---|---|---|
+//! | this finder, `HT_MAX_LEN3_OFFSET = 4096` | 196,854,205 | 123.43M (62.7%) | 881,712 |
+//! | this finder, `HT_MAX_LEN3_OFFSET = 0` | 198,467,459 | 123.57M (62.3%) | 881,550 |
+//! | **libdeflate `-1`** | **146,098,195** | **77.02M (52.7%)** | **881,550** |
+//!
+//! Ours = `ht.rs` + `common.rs`; theirs = `ht_matchfinder.h`, which inlines both.
+//!
+//! Three things this establishes, none of which the table above could:
+//!
+//! 1. **The gap against the vendor is 1.35x total and 1.60x in the matchfinder** —
+//!    and 89% of the whole excess (46.5M of 52.4M) is inside the matchfinder.
+//!    "Spread evenly, therefore intrinsic" was the falsifier; it is not spread.
+//! 2. **At `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to libdeflate's**
+//!    — sha256 `62a4e450aca4b522` both sides, on the full 6 MB multi-block file, not
+//!    just a single 256 KiB block. Identical bytes means identical parse decisions,
+//!    so that 46.5M is not a different algorithm and not a different amount of
+//!    matching work. It is the same work, costing us 1.60x.
+//! 3. **The length-3 table is not the tax.** Turning it off made us 1.6M
+//!    instructions SLOWER (198.47M vs 196.85M), because the matches it finds skip
+//!    matchfinder work that then has to be done position-by-position. Any future
+//!    note blaming hash3 for the L1 wall must beat this measurement first.
+//!
+//! ⚠ THREAD TRAP: `gzippy -1 -c FILE` with no `-p` uses `num_cpus`. On the 16-core
+//! trainer that silently measures T16. Both arms above are `-p1`; the T16 output on
+//! the same slice is 881,816, not 881,712, which is how the trap announces itself.
+//!
+//! ⚠ INSTRUMENT: `fulcrum why`'s layer [2] callgrind reported 2,406,284,393 Ir for
+//! the first arm — **12.66x the cachegrind figure**, matching the recorded parser
+//! inflation bug, with `Dr 0` on every row as the corroborating tell. Layer [1]
+//! (position counts) is independent of that path and was used; layer [2] was not.
 //!
 //! Reads at 1.92x are the expected price of a second candidate. **Writes at 3.68x are
 //! the regression**: a 2-entry bucket costs TWO stores per insert (shift + head) and
