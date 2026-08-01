@@ -251,7 +251,9 @@ This line used to prescribe pigz's 10-bit empty-static-block pad as the fix. The
 census kills that route: all 109 libdeflate cells that fail only at T4 tie libdeflate
 byte-for-byte at T1 (headroom min=median=max=0), so a smaller seam earns no partial
 credit — 90% off closes 0 of 109. The pad is still a real technique, but it can only
-pay once a **monotone T1 size win** has bought headroom for it to fit inside.
+pay once a **monotone T1 size win** has bought headroom for it to fit inside. Note
+that Huffman CONSTRUCTION is already closed as a source of that headroom
+(`src/compress/deflate/huffman/fast.rs:432`): ~0.001% available, ~0.01% needed.
 
 ## FALSIFIED 2026-07-31 — `good_match` does NOT rescue the deeper chain
 

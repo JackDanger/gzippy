@@ -46,11 +46,23 @@ All 109 tie libdeflate BYTE-FOR-BYTE at T1, so the class has ZERO partial credit
 tuning, pad choice, chunk-count matching and block splitting each closed nothing —
 not because they failed, but because "smaller" is not on this class's scoring
 function. The seam leg is therefore closed by **monotone T1 size wins that buy
-headroom to spend** — a change that can only ever make a block smaller (e.g. costing
-an exact package-merge code beside the heuristic one and taking the cheaper) breaks
-the tie in our favour, cannot flip a passing cell under clause 3, and makes the T1
-and T4 size legs the SAME problem. Do not propose a seam-shrinking lever without
-first showing the target cells have headroom.
+headroom to spend** — a change that can only ever make a block smaller breaks the tie
+in our favour, cannot flip a passing cell under clause 3, and makes the T1 and T4 size
+legs the SAME problem. Do not propose a seam-shrinking lever without first showing the
+target cells have headroom.
+
+**The needed margin is ~0.01%, and Huffman CONSTRUCTION cannot supply it.** The first
+version of this paragraph named "costing an exact package-merge code beside the
+heuristic one" as the example monotone win. That is a CLOSED class — see the binding
+FALSIFY record at `src/compress/deflate/huffman/fast.rs:432`, which built it BOTH ways
+and measured: the unconditional swap is a wash that OPENS cells, and the costed dual
+candidate holds its size invariant (49/49 smaller) at ~0.001% margin while costing
+10-14% WALL and flipping sil40 L6 from win to lose. libdeflate's heuristic length
+limiter is already within 0.001% of exact; the margin we need is an order of magnitude
+larger, so this is not a speed problem and REOPEN requires a genuinely new mechanism.
+Per that record, the remaining candidates are **block BOUNDARIES or the parse** —
+which is where `examples/blockspans` points too: gzip splits on a fixed ~34,000-symbol
+cadence (cv=0.023) while our spans run 8x longer at cv=0.373.
 DONE WHEN: the same per-label bar holds at the default thread count and at T4/T8/T16.
 
 **STEP 3 — the exotic path (-10/-11/-12), separate again.** Our `parse/ultra` crown

@@ -110,7 +110,7 @@ So the board is two problems, and the bigger one is T>1 framing:
 
 | class | cells | what it is |
 |---|---|---|
-| **T4-only** | **133** | chunk overhead. ~~STEP 2 sanctions closing it by making seams smaller~~ — **RETRACTED 2026-08-01: seam-shrinking cannot close this class at all.** All 109 such libdeflate cells tie byte-for-byte at T1 (headroom min=median=max=0), so there is ZERO partial credit; 90% off the seam tax closes 0 of 109. This is exactly why "FIVE grid shapes were tried and all flip" below — every one shrank the seam and none reached zero. The route is a **monotone T1 size win that buys headroom**. |
+| **T4-only** | **133** | chunk overhead. ~~STEP 2 sanctions closing it by making seams smaller~~ — **RETRACTED 2026-08-01: seam-shrinking cannot close this class at all.** All 109 such libdeflate cells tie byte-for-byte at T1 (headroom min=median=max=0), so there is ZERO partial credit; 90% off the seam tax closes 0 of 109. This is exactly why "FIVE grid shapes were tried and all flip" below — every one shrank the seam and none reached zero. The route is a **monotone T1 size win that buys headroom** — but NOT from Huffman construction, which is closed at ~0.001% against the ~0.01% needed (`src/compress/deflate/huffman/fast.rs:432`). Block boundaries or the parse. |
 | fail at both | 90 | real ratio; 34 at L1 (Front B), the rest spread L2-L9 |
 
 **The T4-only class is closable and is blocked on a RULE, not on engineering.** A
