@@ -1535,3 +1535,50 @@ METHOD: one command, four layers, three of which SKIPPED with named reasons (val
 macOS, counters need the Linux box, params need an anatomy-counters build). The tool states its
 own denominator — "1 of 4 layers ran; skipped layers are NOT covered by any claim" — which is
 the discipline I spent this session failing to apply by hand.
+
+## G37 — the last two unknown classes: we UNDER-SPLIT on near-incompressible data
+
+`fulcrum why` on the remaining unattributed cells (photo.jpg L2 and weights.safetensors L9,
+2 cells each, vs gzip, T1):
+
+    photo.jpg L2        matches      literals      header bits   data bits/byte
+      ours                29,691     6,396,519          15,374      7.951478
+      gzip               104,185     6,175,812         103,925      7.934296
+
+    weights.safetensors L9
+      ours             1,054,549    86,872,198         181,445      7.315616
+      gzip               890,804    87,346,026       1,586,350      7.298585
+
+TWO DIFFERENT-LOOKING CELLS, ONE MECHANISM.
+
+On photo.jpg gzip finds 3.5x our matches AND spends 6.8x our header bits. On
+weights.safetensors WE FIND MORE MATCHES THAN GZIP (1,054,549 vs 890,804) AND STILL LOSE,
+because gzip spends 8.7x more on headers (1,586,350 vs 181,445 bits) and wins it back on data
+(7.298585 vs 7.315616 bits/byte). The data saving exceeds the header cost.
+
+The common term is BLOCK COUNT: gzip emits far more, smaller blocks with tighter-fitted Huffman
+tables on near-incompressible input. We under-split there.
+
+THIS CONTRADICTS G27, WHICH I GOT BACKWARDS. G27 argued block count was a lever because headers
+are output mass to be REDUCED. G27a already corrected the magnitude (0.634%, not 2.07%); this
+corrects the SIGN for this input class. On incompressible data more headers are worth buying,
+not saving. It is also consistent with the tail-guard falsification — suppressing splits made
+every file worse, because well-placed splits earn their headers.
+
+Note weights.safetensors is the SAME FILE that flipped on the Greedy->Lazy step (#236): more
+matches did not help there either. Both facts point the same way — for this class the parse is
+not the problem, the block structure is.
+
+### The complete residual map (29 cells, every one attributed)
+
+    cells  class                          mechanism                              status
+      15   libdeflate T4                  pure seam; consumer owns seam blocks   NOT ATTEMPTED
+       6   gzip/pigz L6 T1                zlib good_match early exit             VERIFIED (G31a,
+                                                                                 another writer's)
+       4   dd79_bin6 L2 (gzip+pigz)       short-match discovery; hash3 is a      ATTRIBUTED (G36)
+                                          one-deep singleton, gzip chains len-3
+       4   photo.jpg L2 / weights L9      under-splitting on incompressible      ATTRIBUTED (this)
+                                          data; gzip buys 7-9x the header mass
+
+Four mechanisms, four classes, no residue. That is the first time this campaign has had every
+failing cell attributed to a named, measured cause.
