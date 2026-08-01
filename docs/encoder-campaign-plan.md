@@ -981,3 +981,57 @@ this measurement now describes without one.
 Scope: L1, dickens, T1. NOT generalised — the binaries claim (armexe.elf,
 symbols.dwarf, tool.bin) is inherited from attempt 1's record and has NOT been
 re-measured here.
+
+### L1_HASH3_MAX_DIST 4096: real, monotone on text, and ~1.4% of the gap — PARKED
+
+`L1_HASH3_MAX_DIST` (`parse/fast.rs`) ships as `WINDOW` (32,768), i.e. the length-3
+profitability gate NEVER rejects on distance — while its own doc comment states the
+cost model that justifies rejecting ("a length-3 match at a far distance often costs
+more bits than 3 literals"). gzip's `TOO_FAR` is 4096 (`vendor/gzip/deflate.c:130`)
+and our OWN sibling path uses 4096 (`matchfinder/ht.rs:149`, `HT_MAX_LEN3_OFFSET`).
+
+Measured, local arm64, vanilla release, L1, TUNE members only:
+
+```
+  file          WINDOW      4096        delta
+  dickens      5,080,065  5,078,617    -1,448
+  aozora.txt   4,751,582  4,750,647      -935
+  data.csv     4,112,512  4,111,870      -642
+```
+
+Smaller on all three. **But it is ~1.4% of the deficit** (-1,448 B against dickens'
++104,718 B), so it does not close cells. PARKED, not deleted, per the rule that
+monotone work is parked rather than discarded — it composes.
+
+REOPEN basis, recorded for the next reader: the binding FALSIFY on this constant
+(`parse/fast.rs`, 2026-07-25) measured `32768 -> 0` (FULL hash3 shutoff) and its
+blocker is that 0 destroys `dd79_bin6`'s pigz-1 size win (0.997516 -> 1.040685). That
+establishes 0 is fatal; it does NOT establish 4096 is, and 4096 is the intermediate
+both gzip and our own `ht` path use. Note `dd79_bin6` is a GATE member — that check
+belongs at promotion time, never while choosing the value.
+
+### ⚠ SIZE IS NOT STRICTLY ARCH-INVARIANT (~0.03%), and a stale binary nearly said 1.66%
+
+Same commit, vanilla release both arms, L1:
+
+```
+  file          arm64 (M1)   x86 (trainer)   delta
+  dickens        5,080,065     5,081,832     1,767 B  (0.035%)
+  aozora.txt     4,751,582     4,751,843       261 B
+  data.csv       4,112,512     4,114,243     1,731 B
+```
+
+Small, but NOT zero — which corrects an "arch-invariant" claim made earlier in this
+campaign, and it matters for the TIE CAGE: cells that tie libdeflate BYTE-FOR-BYTE on
+x86 need not tie on arm64, and `CLAUDE.md` STEP 1 requires both arches. The board is
+measured on x86 only.
+
+**HOW THIS WAS ALMOST REPORTED AS A 1.66% ARCH DIVERGENCE.** The first comparison ran
+trainer's `target/release/gzippy` after a `git checkout origin/main` WITHOUT a
+rebuild, so the binary was still the `measure/l1-htfast-ablation` build (sha
+`19da2d1a`, confirmed identical to the saved `/root/gzippy-htfast`). It reported
+dickens x86 at 4,997,100 — and 5,080,065 - 4,997,100 = 82,965 B, which reproduces the
+ablation's own measured 81,416 B gap closure almost exactly. The tell was that the
+result was implausibly good, and the disconfirmation was structural: the ONLY
+arch-divergent code in the L1 path is `prefetch_write` (`matchfinder/common.rs:144`),
+a pure hint that cannot change output bytes. Verify the BINARY, not the checkout.
