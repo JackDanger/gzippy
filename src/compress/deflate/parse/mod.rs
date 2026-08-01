@@ -2269,95 +2269,125 @@ mod l1_bakeoff {
         Some(out.stdout.len() - 18)
     }
 
+    /// THE RATCHET. One number per file: the worst `ht_fast - libdeflate` delta
+    /// we are willing to accept, in bytes, on the first `BLOCK` bytes.
+    /// **Negative means we are SMALLER than libdeflate and must stay that way.**
+    ///
+    /// This encodes the GOAL — non-negotiable #2, "at level N we beat their
+    /// level N", per file, never a curve or a total — and nothing about the
+    /// implementation. Any matchfinder, any hash, any bucket geometry is fair
+    /// game; the test only asks that no file gets worse. When a change improves
+    /// a file the test SAYS SO and prints the new number to paste in. Tighten
+    /// freely; loosening one needs a reason in the commit message.
+    ///
+    /// Seeded 2026-08-01 from `ht_fast` as it stands. `Strategy::Fast` (shipped)
+    /// is far worse on 7 of these 8 — that gap is the L1 class, and it is why
+    /// this file exists.
+    const RATCHET: &[(&str, i64)] = &[
+        ("armexe.elf", -4013),
+        ("data.parquet", -984),
+        ("data.csv", -210),
+        ("engine.wasm", 61),
+        ("minjs.min.js", 313),
+        ("data.json", 449),
+        ("aozora.txt", 550),
+        ("dickens", 644),
+    ];
+
     #[test]
     fn l1_bakeoff() {
         const BLOCK: usize = 256 * 1024;
         let root = corpus_roots().into_iter().find(|p| p.is_dir());
         let Some(root) = root else {
-            eprintln!("l1_bakeoff: no corpus dir found — SKIPPED (this is a real-corpus test)");
+            eprintln!("l1_bakeoff: no corpus dir — SKIPPED (this is a real-corpus test)");
             return;
         };
 
-        let files = [
-            "data.csv",
-            "data.json",
-            "aozora.txt",
-            "dickens",
-            "minjs.min.js",
-            "data.parquet",
-            "armexe.elf",
-            "engine.wasm",
-        ];
         println!();
-        println!("L1 ONE-BLOCK BAKEOFF — first {BLOCK} bytes, deterministic, load-immune");
+        println!("L1 RATCHET — first {BLOCK} bytes, deterministic, load-immune");
         println!("  corpus: {}", root.display());
         println!();
         println!(
-            "  {:<16} {:>10} {:>10} {:>10} {:>10}",
-            "file", "Fast", "ht_fast", "libdeflate", "ht-vs-ld"
+            "  {:<16} {:>9} {:>9} {:>10} {:>9} {:>9}",
+            "file", "Fast", "ht_fast", "libdeflate", "delta", "allowed"
         );
-        let mut any = false;
+
         let (mut tot_f, mut tot_h, mut tot_l) = (0usize, 0usize, 0usize);
-        let mut have_ld = false;
-        for f in files {
-            let path = root.join(f);
-            let Ok(data) = std::fs::read(&path) else {
+        let mut regressions: Vec<String> = vec![];
+        let mut improvements: Vec<String> = vec![];
+        let mut measured = 0usize;
+
+        for (f, allowed) in RATCHET {
+            let Ok(data) = std::fs::read(root.join(f)) else {
                 continue;
             };
             if data.len() < BLOCK {
                 continue;
             }
-            any = true;
             let (fa, ht) = bakeoff_one(&data[..BLOCK]);
+            let Some(ld) = libdeflate_l1(&data[..BLOCK]) else {
+                println!(
+                    "  {f:<16} {fa:>9} {ht:>9} {:>10} {:>9} {:>9}",
+                    "-", "-", allowed
+                );
+                continue;
+            };
+            measured += 1;
             tot_f += fa;
             tot_h += ht;
-            match libdeflate_l1(&data[..BLOCK]) {
-                Some(ld) => {
-                    have_ld = true;
-                    tot_l += ld;
-                    println!(
-                        "  {f:<16} {fa:>10} {ht:>10} {ld:>10} {:>+10}",
-                        ht as i64 - ld as i64
-                    );
-                }
-                None => println!("  {f:<16} {fa:>10} {ht:>10} {:>10} {:>10}", "-", "-"),
-            }
+            tot_l += ld;
+            let delta = ht as i64 - ld as i64;
+            let mark = if delta > *allowed {
+                regressions.push(format!("{f}: {delta:+} worse than the allowed {allowed:+}"));
+                " <- REGRESSION"
+            } else if delta < *allowed {
+                improvements.push(format!("(\"{f}\", {delta}),"));
+                " <- improved, tighten it"
+            } else {
+                ""
+            };
+            println!("  {f:<16} {fa:>9} {ht:>9} {ld:>10} {delta:>+9} {allowed:>+9}{mark}");
         }
-        if !any {
-            eprintln!("l1_bakeoff: corpus dir found but no file >= {BLOCK} B — SKIPPED");
+
+        if measured == 0 {
+            eprintln!(
+                "l1_bakeoff: no measurable file (corpus or libdeflate-gzip absent) — SKIPPED"
+            );
             return;
         }
+
         println!();
-        if have_ld {
-            println!(
-                "  {:<16} {:>10} {:>10} {:>10} {:>+10}",
-                "TOTAL",
-                tot_f,
-                tot_h,
-                tot_l,
-                tot_h as i64 - tot_l as i64
-            );
+        println!(
+            "  {:<16} {:>9} {:>9} {:>10} {:>+9}",
+            "TOTAL",
+            tot_f,
+            tot_h,
+            tot_l,
+            tot_h as i64 - tot_l as i64
+        );
+        println!(
+            "  Fast vs libdeflate {:+.3}%   ht_fast vs libdeflate {:+.3}%   (per-file is what grades)",
+            100.0 * (tot_f as f64 / tot_l as f64 - 1.0),
+            100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
+        );
+
+        if !improvements.is_empty() {
             println!();
-            println!(
-                "  Fast    vs libdeflate: {:+.3}%   <- the shipped L1 gap",
-                100.0 * (tot_f as f64 / tot_l as f64 - 1.0)
-            );
-            println!(
-                "  ht_fast vs libdeflate: {:+.3}%   <- MINIMISE THIS",
-                100.0 * (tot_h as f64 / tot_l as f64 - 1.0)
-            );
-            println!(
-                "  ht_fast vs Fast:       {:+.3}%",
-                100.0 * (tot_h as f64 / tot_f as f64 - 1.0)
-            );
-        } else {
-            println!(
-                "  {:<16} {:>10} {:>10}   (libdeflate-gzip not on this box)",
-                "TOTAL", tot_f, tot_h
-            );
+            println!("  RATCHET DOWN — paste into RATCHET:");
+            for i in &improvements {
+                println!("      {i}");
+            }
         }
         println!();
-        println!("  Reference (whole data.csv, L1, fulcrum why): ours 741,183 literals");
-        println!("  vs libdeflate 256,099 — 2.89x. Fewer literals => better parse.");
+
+        assert!(
+            regressions.is_empty(),
+            "L1 ratchet regressed on {} file(s):\n  {}\n\
+             The bar is per-file bytes vs libdeflate -1, not a total and not exact \
+             output. If a regression is intended, say why in the commit message and \
+             loosen the number deliberately.",
+            regressions.len(),
+            regressions.join("\n  ")
+        );
     }
 }
