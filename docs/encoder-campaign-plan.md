@@ -776,3 +776,54 @@ L1 AND a deep level (hard stop #3), frozen box, vanilla build:
 Cheapest falsifier first: run the SIZE leg at T1,T4 before any wall run. If the T4
 size win is not materially larger than attempt 2's 2 cells, the lever is not worth
 the wall risk and is dropped without a frozen-box run.
+
+### ⚠ DO NOT TREAT THE MATCHFINDER AS THE SOLE EXPLANATION
+
+The section above reaches for `ht_matchfinder` because a FALSIFY record handed that
+mechanism over ready-made. But that record proves the routing CLOSES CELLS; it does
+not prove the matchfinder CAUSES the whole L1 deficit, and two things say it does not:
+
+**The nine cells attempt 1 closed do not include the two worst.** The record names
+data.csv, aozora.txt, minjs.min.js, dickens, data.json and engine.wasm. The largest
+L1 deficits on the board — access.log at +340,410 B (1.1028) and monorepo.tar at
++639,158 B (1.0565) — are NOT among them. Whatever costs us 340 KB on access.log
+survived the matchfinder swap.
+
+**The spread is too wide for one mechanism.** L1 deficits run from +10.3%
+(access.log) to +0.02% (movie.mp4). A single cause producing both, on the same
+algorithm, is not credible; there are at least two.
+
+Three explanations that have NOT been excluded, each with its falsifier:
+
+1. **BLOCK GEOMETRY, not match finding.** Our L1 block budget
+   (`fast::FAST_BLOCK_LENGTH`, `LIMIT_HASH_UPDATE_INSERTS_L1`) vs libdeflate's
+   `FAST_SOFT_MAX_BLOCK_LENGTH` 65,535 / `FAST_SEQ_STORE_LENGTH` 8,192. Different
+   block sizes change header amortisation directly. `parse/fast.rs:1549` records
+   "do NOT fix this to 65,535 to match libdeflate" — so the constant has been
+   TOUCHED, which is not the same as EXONERATED as a cause.
+   FALSIFIER: `examples/blockcensus` on our L1 output vs libdeflate's — block count
+   and bits/block.
+
+2. **THE PER-BLOCK BTYPE DECISION, not the parse.** Our L1 costs
+   cheapest-of-{dynamic,static,stored} per block. If we choose dynamic where they
+   choose static we pay a header they never emit, which in aggregate bytes is
+   indistinguishable from a worse parse.
+   FALSIFIER: the same `blockcensus` run — the BTYPE mix. One command tests 1 and 2.
+
+3. **INSERTION/SKIP POLICY, not probe count.** libdeflate's fastest calls
+   `ht_matchfinder_skip_bytes` after every match; we use
+   `LIMIT_HASH_UPDATE_INSERTS_L1`. That changes what HISTORY later positions can
+   see, so "2-way buckets win" may really be "their insert policy retains better
+   history" — with the bucket taking credit for the skip.
+   FALSIFIER: match/literal counts and mean match length per byte.
+
+**THE DISCRIMINATING COMMAND IS `fulcrum why`, AND IT WAS NOT RUN.** Hard stop #6
+lists it first precisely for this: it reports match/literal/header/data per byte and
+states which of its four layers it skipped, naming the mechanism in ONE run.
+
+    fulcrum why libdeflate:access.log:L1:T1 --ours <bin> \
+        --rival-cmd 'libdeflate-gzip -{level} -c {input}' --corpus access.log
+
+Run that, and `blockcensus` on both outputs, BEFORE the routing lever. If the bytes
+are in headers rather than data, explanations 1-2 are the class and the matchfinder
+is the wrong lever entirely.
