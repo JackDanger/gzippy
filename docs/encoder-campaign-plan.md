@@ -681,3 +681,561 @@ across aarch64/Zen2/Intel — verified — so size needs one box only. Neither r
 currently passes the full Gate-0 suite (`profile rss` fails on both, `lib levelsweep` on
 solvency) and `make deploy` correctly refuses to certify them; fix those two gates
 before trusting a fresh instrument there.
+
+## L1 IS THE LARGEST FAILING CLASS, AND IT IS NOT THE SEAM (measured 2026-08-01)
+
+The board had been decomposed by rival x thread count, which surfaced the T4 seam
+(109 zero-headroom cells). Decomposing the SAME artifact by **level x rival** —
+`/root/sizeboard-all-12fcd0ed/census.json`, 1584 cells, 200 failing, commit
+`12fcd0ed` — shows a second class that is larger per level and far more tractable:
+
+```
+        gzip     pigz  libdeflate  igzip   tot
+  L1       2        0          29      4    35     <- largest level on the board
+  L2       4        2          17      0    23
+  L3       4        2           4      2    12
+  L4       2        2          13      0    17
+  L5       4        4          17      0    25
+  L6       6        6          13      0    25
+  L7       6        4          16      0    26
+  L8       2        0          15      0    17
+  L9       2        0          18      0    20
+```
+
+**L1 has none of the seam class's pathologies.** Its cells fail at T1 and T4 with
+near-identical ratios (access.log 1.1028 / 1.1032; monorepo.tar 1.0565 / 1.0565), so
+this is a PURE CODING DEFICIT, not seam growth. And where the seam cells tie
+libdeflate byte-for-byte with 0 bytes of headroom, these are 0.02%-10.3% BIGGER:
+
+```
+  libdeflate T1/T4  access.log    1.1028 / 1.1032   +340,410 / +341,529 B
+  libdeflate T1/T4  monorepo.tar  1.0565 / 1.0565   +639,158 / +639,359 B
+  libdeflate T1/T4  data.csv      1.0456 / 1.0457   +179,323 / +179,667 B
+  libdeflate T1/T4  aozora.txt    1.0405 / 1.0405   +184,853 / +185,069 B
+  libdeflate T1/T4  ecoli.fastq   1.0282 / 1.0283   +135,198 / +135,773 B
+  ... 24 more, down to movie.mp4 1.0002
+```
+
+Two consequences. Clause 3 cannot be tripped by improving an already-FAILING cell,
+so the zero-tolerance constraint that governs the tie cage does not apply here. And
+the margins are three orders of magnitude larger than the ~0.01% the seam needs — so
+unlike the seam, a partial improvement CLOSES CELLS.
+
+### The mechanism is already identified, and it is already in the tree
+
+We run **igzip's** L1 algorithm (`Strategy::Fast`: chainless, single probe, plus a
+length-3 `head3` table) while being graded against **libdeflate's** L1
+(`deflate_compress_fastest` + `ht_matchfinder`: 2-entry buckets, no length-3).
+`parse/mod.rs`'s two FALSIFY records already proved this is THE mechanism by
+execution: routing L1 to `ht_fast` lands nine libdeflate L1 cells at ratio EXACTLY
+1.0000 (data.csv 1.0456->1.0000, aozora 1.0405->1.0000, minjs 1.0226->1.0000,
+dickens 1.0211->1.0000, data.json 1.0177->1.0000, engine.wasm 1.0125->1.0000).
+
+Both prior attempts died, and NEITHER died on size:
+
+- **attempt 1**, route as a REPLACEMENT: 9 closed / 7 OPENED. Clause 3 violated. The
+  7 are one mechanism — on BINARIES our `head3` length-3 table beats libdeflate and
+  the port gives that win up (armexe.elf was a 3.4% WIN at 0.9658).
+- **attempt 2**, the SYNTHESIS (2-way bucket AND length-3, which `matchfinder::ht`
+  still IS today — only the routing was reverted): **clause 3 OK across 145
+  decidable cells, clause 4 closed 2, the SIZE LEG PASSED CLEANLY.** It died on
+  clause 5/6: 19 wall cells eroded, our own L1 15-50% slower.
+
+### What is untried: the COORDINATE
+
+Attempt 2's wall verdict was taken at **`L1+L6, T1`** (artifact
+`/root/wall-l1-synth/try.json`). Every clause-5 erosion it reports is a T1 ratio
+against a SINGLE-THREADED rival — gzip:data.json 0.4549 -> 0.6861, pigz:data.csv
+0.5444 -> 0.7418. At T4 those same cells run our 4 threads against their 1, where
+measured slack is 249-330% rather than T1's 0-8%; the same 15-50% self-tax erodes
+roughly a quarter as much in ratio terms. That is the 40x coordinate error this
+project has already made once, and the board says half the L1 cells are at T4.
+
+There is shipped precedent for the fix shape: `try_exact_huffman` and the
+`max_search_depth` x4 scaling are BOTH gated T>1-only for exactly this reason, in
+`level.rs`'s own words — "THE REASON IS THE WALL BUDGET ... It is therefore T>1
+ONLY". A T>1-only L1 routing is the same move on a change whose size leg has already
+passed.
+
+**This is NOT the size-only argument the record forbids** ("a size-only argument is
+not sufficient for this class: that is now 2 for 2"). The claim is about the WALL, at
+a thread count that verdict never measured.
+
+### Pre-registered rule, declared once, before any measurement
+
+Route `Strategy::Fast` to the `ht_fast` synthesis from `params_parallel` ONLY (T>1),
+leaving T1 byte-unchanged. Judged by `fulcrum try --threads 1,4`, full TUNE set,
+L1 AND a deep level (hard stop #3), frozen box, vanilla build:
+
+- SHIP iff clauses 1-6 all pass, INCLUDING clause 3 at T1 (which must be a no-op —
+  verify the T1 arms are byte-identical) and clause 5 at T4.
+- NO-SHIP if clause 5 fails at T4. That would mean the parallel budget does not
+  absorb the self-tax either, and this class is then closed on the wall at BOTH
+  coordinates — record it and stop, do not re-sample.
+
+Cheapest falsifier first: run the SIZE leg at T1,T4 before any wall run. If the T4
+size win is not materially larger than attempt 2's 2 cells, the lever is not worth
+the wall risk and is dropped without a frozen-box run.
+
+### ⚠ DO NOT TREAT THE MATCHFINDER AS THE SOLE EXPLANATION
+
+The section above reaches for `ht_matchfinder` because a FALSIFY record handed that
+mechanism over ready-made. But that record proves the routing CLOSES CELLS; it does
+not prove the matchfinder CAUSES the whole L1 deficit, and two things say it does not:
+
+**The nine cells attempt 1 closed do not include the two worst.** The record names
+data.csv, aozora.txt, minjs.min.js, dickens, data.json and engine.wasm. The largest
+L1 deficits on the board — access.log at +340,410 B (1.1028) and monorepo.tar at
++639,158 B (1.0565) — are NOT among them. Whatever costs us 340 KB on access.log
+survived the matchfinder swap.
+
+**The spread is too wide for one mechanism.** L1 deficits run from +10.3%
+(access.log) to +0.02% (movie.mp4). A single cause producing both, on the same
+algorithm, is not credible; there are at least two.
+
+Three explanations that have NOT been excluded, each with its falsifier:
+
+1. **BLOCK GEOMETRY, not match finding.** Our L1 block budget
+   (`fast::FAST_BLOCK_LENGTH`, `LIMIT_HASH_UPDATE_INSERTS_L1`) vs libdeflate's
+   `FAST_SOFT_MAX_BLOCK_LENGTH` 65,535 / `FAST_SEQ_STORE_LENGTH` 8,192. Different
+   block sizes change header amortisation directly. `parse/fast.rs:1549` records
+   "do NOT fix this to 65,535 to match libdeflate" — so the constant has been
+   TOUCHED, which is not the same as EXONERATED as a cause.
+   FALSIFIER: `examples/blockcensus` on our L1 output vs libdeflate's — block count
+   and bits/block.
+
+2. **THE PER-BLOCK BTYPE DECISION, not the parse.** Our L1 costs
+   cheapest-of-{dynamic,static,stored} per block. If we choose dynamic where they
+   choose static we pay a header they never emit, which in aggregate bytes is
+   indistinguishable from a worse parse.
+   FALSIFIER: the same `blockcensus` run — the BTYPE mix. One command tests 1 and 2.
+
+3. **INSERTION/SKIP POLICY, not probe count.** libdeflate's fastest calls
+   `ht_matchfinder_skip_bytes` after every match; we use
+   `LIMIT_HASH_UPDATE_INSERTS_L1`. That changes what HISTORY later positions can
+   see, so "2-way buckets win" may really be "their insert policy retains better
+   history" — with the bucket taking credit for the skip.
+   FALSIFIER: match/literal counts and mean match length per byte.
+
+**THE DISCRIMINATING COMMAND IS `fulcrum why`, AND IT WAS NOT RUN.** Hard stop #6
+lists it first precisely for this: it reports match/literal/header/data per byte and
+states which of its four layers it skipped, naming the mechanism in ONE run.
+
+    fulcrum why libdeflate:access.log:L1:T1 --ours <bin> \
+        --rival-cmd 'libdeflate-gzip -{level} -c {input}' --corpus access.log
+
+Run that, and `blockcensus` on both outputs, BEFORE the routing lever. If the bytes
+are in headers rather than data, explanations 1-2 are the class and the matchfinder
+is the wrong lever entirely.
+
+### ⚠⚠ CORRECTION TO BOTH SECTIONS ABOVE — access.log AND monorepo.tar ARE **GATE** FILES
+
+`corpus_split.json` splits the corpus and states the contract: *"GATE files are run
+ONLY at promotion time, by the census/goal tools, and NEVER inspected while choosing
+a parameter. A promotion is judged on GATE. If a change was fitted on GATE, the
+promotion is void regardless of the numbers."*
+
+```
+GATE: access.log data.sqlite dd79_bin6 dd79_text6 ecoli.fastq markup.xml
+      monorepo.tar photo.jpg sil40 weights.safetensors winexe.exe
+TUNE: aozora.txt armexe.elf data.csv data.json data.parquet dickens
+      engine.wasm minjs.min.js movie.mp4 symbols.dwarf tool.bin
+```
+
+**access.log and monorepo.tar — the two cells the section above builds its whole
+argument on — are GATE.** Two consequences, and the second one retracts a claim:
+
+**(a) The diagnostic as written would VOID the promotion.** The section above
+prescribes `fulcrum why libdeflate:access.log:L1:T1` to decide which lever to build.
+That is inspecting a GATE file while choosing a parameter. It is exactly the failure
+`_rule` in `corpus_split.json` was written to prevent ("parameters were once fitted
+to the one file blocking a gate ... BOTH later blowups landed off the tuning set").
+**Run the diagnostic on TUNE members only** — data.csv (1.0456), aozora.txt (1.0405)
+and dickens (1.0211) are the largest L1 deficits that are legal to inspect.
+
+**(b) "The two worst cells survived the matchfinder swap" is RETRACTED.** It is
+unsupported. Attempt 1's record states its own coordinate — `board-size.sh tune`,
+**TUNE x L1-9 x T1,T4** — and access.log and monorepo.tar are GATE, so they were
+NEVER IN THAT MEASUREMENT. All six files it names as closing (data.csv, aozora.txt,
+minjs.min.js, dickens, data.json, engine.wasm) are TUNE members. The swap did not
+fail on the two largest deficits; it was never tested against them.
+
+So the matchfinder explanation is STRONGER than the previous section allowed: on the
+TUNE set it closed essentially every libdeflate L1 cell available to it. The three
+alternative explanations (block geometry, the per-block BTYPE decision, insert/skip
+policy) remain UNEXCLUDED and still need `fulcrum why` — but they no longer have the
+"two worst survived" evidence behind them, because that evidence does not exist.
+
+**THE GENERAL LESSON, which is the reusable part:** a cell's TUNE/GATE membership is
+part of its coordinate, and a measurement's corpus SUBSET is part of its result. Two
+errors here came from reading "9 cells closed" as a statement about the board when it
+was a statement about TUNE. Before citing any cell as evidence, check which set it is
+in; before citing any prior measurement, read the corpus it ran on.
+
+### MEASURED: the L1 deficit is MATCH COVERAGE. Headers are NOT the cause.
+
+`fulcrum why libdeflate:<file>:L1:T1:size`, three TUNE members, trainer (Intel LXC),
+gzippy `8d948cef` sha `f7a53025`, fulcrum `8364a059`, corpus sha-verified against
+solvency. Solvency was untouched — it was holding a paired wall gate.
+
+```
+dickens     ours 3,133,556 tok (1,923,158 M, 1,210,398 L)  40,619,097 b (117,739 hdr)
+            rival 2,827,981 tok (2,025,030 M,   802,951 L)  39,781,354 b (154,454 hdr)
+data.csv    ours 2,587,312 tok (1,846,129 M,   741,183 L)  32,893,788 b (166,614 hdr)
+            rival 2,186,764 tok (1,930,665 M,   256,099 L)  31,459,208 b (166,000 hdr)
+aozora.txt  ours 2,997,325 tok (1,683,389 M, 1,313,936 L)  38,009,450 b (111,502 hdr)
+            rival 2,678,110 tok (1,735,132 M,   942,978 L)  36,530,632 b (123,678 hdr)
+
+  file        literals Δ    matched-positions Δ    header (ours vs rival)
+  dickens       +50.74%           -3.58%           117,739  <  154,454
+  data.csv     +189.41%           -1.85%           166,614  ~= 166,000
+  aozora.txt    +39.34%           -3.35%           111,502  <  123,678
+```
+
+**Explanations 1 and 2 are REFUTED.** Our header mass is SMALLER than libdeflate's on
+two of three files and equal on the third — we are already AHEAD on headers by 36,715
+bits on dickens and 12,176 on aozora. Block geometry and the per-block
+dynamic/static/stored decision cannot be the cause of a deficit we are winning.
+
+**The whole deficit is DATA bits, and the mechanism is literal emission.** dickens
+total delta 837,743 bits = 104,718 B, which reproduces the census excess for that
+cell EXACTLY (+104,718 B) — an independent confirmation that this diff explains the
+whole cell and not a fraction of it. We emit 39-189% more literals because libdeflate
+matches at 1.85-3.58% more POSITIONS. Every position we fail to match costs a literal.
+
+**And we carry an EXTRA table while matching less.** `parse::fast` has a length-3
+`head3` table that libdeflate's `ht_matchfinder` deliberately does not ("Due to its
+focus on speed, the ht_matchfinder doesn't support length 3 matches"), and we still
+find FEWER matches. The single-probe limitation dominates the length-3 advantage.
+That is a size argument for the bucket independent of the earlier routing attempts.
+
+**Live explanation, narrowed to one class:** whatever raises match COVERAGE at L1 —
+the 2-way bucket (more history per slot ⇒ more candidates) and/or the insert/skip
+policy (`ht_matchfinder_skip_bytes` vs our `LIMIT_HASH_UPDATE_INSERTS_L1`, which
+changes what history later positions can SEE). These are not yet separated from each
+other; both are coverage mechanisms and the diff above cannot distinguish them.
+
+DENOMINATOR, as the tool reports it: **2 of 4 layers ran.** [3 COUNTERS] skipped (the
+gzip oracle exited 1 on this box) and [4 PARAMS] skipped (the vanilla binary emits no
+`LEVEL_DECLARED`; that needs `--features anatomy-counters`, which must NOT be the
+binary any wall claim is quoted from). No claim here rests on those two layers — this
+is a SIZE/structure finding only, and no wall claim is made.
+
+Scope: L1 only, three TUNE files. Hard stop #3 forbids generalising across levels —
+do not read this as a statement about L2-L9, which have their own (tie-cage) shape.
+
+### ABLATION: routing L1 to `ht_fast` OVERSHOOTS — and the residual is LENGTH-3 MATCHES
+
+Branch `measure/l1-htfast-ablation` (MEASUREMENT ONLY, never merged), binary sha
+`19da2d1a` vs main's `f7a53025`, trainer, dickens L1 T1, `fulcrum why`:
+
+```
+                  literals   matched-pos/B   total_bits/B   match_len_L00/B
+  main (fast)    1,210,398      0.900579       3.336403         --
+  ablation (ht)    430,527      0.964637       3.282904      0.018815
+  libdeflate       802,951      0.934047       3.267591      0.000000
+```
+
+**Pre-registered prediction 1 held DIRECTIONALLY BUT OVERSHOT.** Literals did not
+approach libdeflate's 802,951 — they blew past it to 430,527, and we now match at MORE
+positions than libdeflate (0.9646 vs 0.9340).
+
+**Pre-registered prediction 2 FAILED, and that is the finding.** Total bits fell
+81,416 B of the 104,718 B gap. We remain **+23,302 B BIGGER while emitting MORE
+matches and FEWER literals.** More coverage is not the same as smaller output.
+
+**The residual is named by the tool: `match_len_L00`, ours 0.018815/B vs rival
+0.000000.** `len_code_index` (fulcrum `src/ratio/mod.rs:242`, base[0] = 3) makes that
+bucket EXACTLY length-3 matches — 229,064 of them on dickens, against libdeflate's
+zero. `ht_matchfinder` has no length-3 support at all; our port added a `hash3_tab`
+beside it. Those length-3 matches REPLACE literals AT A NET LOSS on text.
+
+Magnitude check (counted, then compared): 229,064 length-3 matches losing ~0.8 bits
+each against the ~3 literals they displace is ~22,900 B, against an observed residual
+of 23,302 B. The length-3 matches plausibly ARE the whole remaining gap.
+
+**THIS EXPLAINS BOTH PRIOR ATTEMPTS WITH ONE MECHANISM**, which neither record could
+do on its own:
+  - attempt 1 = the FAITHFUL port (buckets, NO hash3). Text lands at ratio EXACTLY
+    1.0000 — because that IS libdeflate's algorithm. Binaries lose, because length-3
+    matches genuinely pay there.
+  - attempt 2 = port + hash3. Binaries kept, but text no longer reaches 1.0000 —
+    because the length-3 matches it keeps cost bytes on text.
+
+**We already apply the too-far rule.** `HT_MAX_LEN3_OFFSET = 4096` in
+`matchfinder/ht.rs:149`, guarding `length > DEFLATE_MIN_MATCH_LEN || offset <= 4096`
+— the same constant as gzip's `TOO_FAR` (`vendor/gzip/deflate.c:130`, "Matches of
+length 3 are discarded if their distance exceeds TOO_FAR"). So all 229,064 are ALREADY
+within 4096 and still net-negative on text. The threshold was inherited, never tuned
+for L1, and no FALSIFY record covers it.
+
+⚠ **BEFORE ANY LEVER HERE: an outstanding USER-ORDERED DELETION is implicated.**
+`CLAUDE.md` non-negotiable #3 orders the L1 hash3 content gate deleted; it is still
+present as `L1_HASH3_GATE_LIT_THRESHOLD_PCT = 48` (`parse/fast.rs:945`). The
+measurement above explains WHY that gate was ever written: hash3 at L1 pays on
+binaries and costs on text, and a literal-fraction detector is exactly how that split
+gets papered over. The working rules say no new lever starts while a user-ordered
+deletion sits undone — and a content detector is precisely the wrong answer to a split
+this measurement now describes without one.
+
+Scope: L1, dickens, T1. NOT generalised — the binaries claim (armexe.elf,
+symbols.dwarf, tool.bin) is inherited from attempt 1's record and has NOT been
+re-measured here.
+
+### L1_HASH3_MAX_DIST 4096: real, monotone on text, and ~1.4% of the gap — PARKED
+
+`L1_HASH3_MAX_DIST` (`parse/fast.rs`) ships as `WINDOW` (32,768), i.e. the length-3
+profitability gate NEVER rejects on distance — while its own doc comment states the
+cost model that justifies rejecting ("a length-3 match at a far distance often costs
+more bits than 3 literals"). gzip's `TOO_FAR` is 4096 (`vendor/gzip/deflate.c:130`)
+and our OWN sibling path uses 4096 (`matchfinder/ht.rs:149`, `HT_MAX_LEN3_OFFSET`).
+
+Measured, local arm64, vanilla release, L1, TUNE members only:
+
+```
+  file          WINDOW      4096        delta
+  dickens      5,080,065  5,078,617    -1,448
+  aozora.txt   4,751,582  4,750,647      -935
+  data.csv     4,112,512  4,111,870      -642
+```
+
+Smaller on all three. **But it is ~1.4% of the deficit** (-1,448 B against dickens'
++104,718 B), so it does not close cells. PARKED, not deleted, per the rule that
+monotone work is parked rather than discarded — it composes.
+
+REOPEN basis, recorded for the next reader: the binding FALSIFY on this constant
+(`parse/fast.rs`, 2026-07-25) measured `32768 -> 0` (FULL hash3 shutoff) and its
+blocker is that 0 destroys `dd79_bin6`'s pigz-1 size win (0.997516 -> 1.040685). That
+establishes 0 is fatal; it does NOT establish 4096 is, and 4096 is the intermediate
+both gzip and our own `ht` path use. Note `dd79_bin6` is a GATE member — that check
+belongs at promotion time, never while choosing the value.
+
+### ⚠ SIZE IS NOT STRICTLY ARCH-INVARIANT (~0.03%), and a stale binary nearly said 1.66%
+
+Same commit, vanilla release both arms, L1:
+
+```
+  file          arm64 (M1)   x86 (trainer)   delta
+  dickens        5,080,065     5,081,832     1,767 B  (0.035%)
+  aozora.txt     4,751,582     4,751,843       261 B
+  data.csv       4,112,512     4,114,243     1,731 B
+```
+
+Small, but NOT zero — which corrects an "arch-invariant" claim made earlier in this
+campaign, and it matters for the TIE CAGE: cells that tie libdeflate BYTE-FOR-BYTE on
+x86 need not tie on arm64, and `CLAUDE.md` STEP 1 requires both arches. The board is
+measured on x86 only.
+
+**HOW THIS WAS ALMOST REPORTED AS A 1.66% ARCH DIVERGENCE.** The first comparison ran
+trainer's `target/release/gzippy` after a `git checkout origin/main` WITHOUT a
+rebuild, so the binary was still the `measure/l1-htfast-ablation` build (sha
+`19da2d1a`, confirmed identical to the saved `/root/gzippy-htfast`). It reported
+dickens x86 at 4,997,100 — and 5,080,065 - 4,997,100 = 82,965 B, which reproduces the
+ablation's own measured 81,416 B gap closure almost exactly. The tell was that the
+result was implausibly good, and the disconfirmation was structural: the ONLY
+arch-divergent code in the L1 path is `prefetch_write` (`matchfinder/common.rs:144`),
+a pure hint that cannot change output bytes. Verify the BINARY, not the checkout.
+
+### FALSIFIED: no single length-3 distance threshold closes L1. The text LOSS and the binary WIN are the SAME bytes.
+
+Hypothesis (mine, from the ablation above): the length-3 matches that cost bytes on
+text are the FAR ones, so one global `HT_MAX_LEN3_OFFSET` should drop those while
+keeping the near ones that pay on binaries. **Measured and false.**
+
+Sweep on `measure/l1-htfast-ablation` (L1 routed to `ht_fast`), local arm64, vanilla
+release, L1, TUNE members only. Ratios vs `libdeflate-gzip -1` (<= 1.0 PASSES; the
+libdeflate references were verified equal to the board census on all five files):
+
+```
+  thresh    dickens   aozora.txt   data.csv   armexe.elf   symbols.dwarf
+   4096     1.00484    1.00568     1.00055     0.96437       0.98883
+   1024     1.00292    1.00426     0.99875     0.96962       0.98814
+    256     1.00181    1.00271     0.99847     0.97775       0.98861
+     64     1.00100    1.00142     0.99884     0.98690       0.99041
+      0     1.00016    1.00014     1.00002     0.99952       0.99988
+```
+
+**Text improves monotonically as the gate tightens and NEVER crosses 1.0** — 1.00484
+-> 1.00016 on dickens, still failing at full length-3 shutoff. **And the binary win
+collapses in lockstep**: armexe.elf 0.96437 -> 0.99952, a 3.6% win reduced to 0.05%.
+At threshold 0 all five files converge to ~1.0000: we simply become libdeflate, which
+is attempt 1's result reached from the other direction.
+
+**THE STRUCTURAL FACT: the text loss and the binary win are the SAME BYTES.** Both are
+length-3 matches at distance <= 4096. There is no distance at which one is present and
+the other is not, so no single global constant separates them. This is not a tuning
+failure; it is the shape of the problem.
+
+That is exactly why a CONTENT GATE was written here
+(`L1_HASH3_GATE_LIT_THRESHOLD_PCT = 48`, `parse/fast.rs:945`) — it is the only device
+that separates these two populations, and `CLAUDE.md` non-negotiable #3 forbids it AND
+orders it deleted. So this class is genuinely hard rather than merely unattempted: the
+one mechanism that resolves the tradeoff is banned, on purpose.
+
+What the sweep DOES establish, and is worth keeping:
+  * `HT_MAX_LEN3_OFFSET = 256` passes 3 of these 5 cells against 4096's 2 (data.csv
+    1.00055 -> 0.99847 crosses), so the inherited 4096 is not the best constant for
+    this path even though no constant closes the class.
+  * The length>=4 candidates that `head3` surfaces contribute almost nothing: at
+    threshold 0, where only length-EXACTLY-3 is rejected, every file sits within
+    0.02% of libdeflate.
+
+NOT a wall claim, and NOT a promotion proposal: the `ht_fast` routing this sweep runs
+on is already NO-SHIP twice (clause 3 on binaries; clause 5/6 on the wall at T1).
+Scope L1, five TUNE files, one arch.
+
+### CORRECTION + RESULT: on the FULL TUNE set, `ht_fast` @ 256 doubles the passing L1 cells (4 -> 8), zero regressions
+
+The falsification above was measured on FIVE files and was too strong. Re-run on all
+ELEVEN TUNE members, L1, ratio vs `libdeflate-gzip -1`, PASS decided by exact integer
+compare (ours <= rival), `*` = PASS:
+
+```
+shipped-fast   pass= 4/11  aozora 1.04036  armexe .96952* data.csv 1.04563  data.json 1.01408
+                           data.parquet 1.00266  dickens 1.02130  engine.wasm 1.00934
+                           minjs 1.01698  movie.mp4 .99986* symbols .99497* tool.bin .99223*
+ht_fast@4096   pass= 5/11  aozora 1.00568  armexe .96437* data.csv 1.00055  data.json 1.01302
+                           data.parquet .99890* dickens 1.00484  engine.wasm 1.00304
+                           minjs 1.00228  movie.mp4 .99999* symbols .98883* tool.bin .97879*
+ht_fast@256    pass= 8/11  aozora 1.00271  armexe .97775* data.csv .99847* data.json 1.00358
+                           data.parquet .99939* dickens 1.00181  engine.wasm .99951*
+                           minjs .99671* movie.mp4 .99994* symbols .98861* tool.bin .97906*
+ht_fast@0      pass= 3/11  aozora 1.00014  armexe .99952* data.csv 1.00002  data.json 1.00051
+                           data.parquet .99962* dickens 1.00016  engine.wasm 1.00061
+                           minjs 1.00027  movie.mp4 1.00003  symbols .99988* tool.bin 1.00011
+```
+
+**`ht_fast` @ 256 doubles the passing cells, 4 -> 8, and regresses NOTHING.** All four
+cells the shipped path passes (armexe.elf, movie.mp4, symbols.dwarf, tool.bin) are
+retained; four more cross: data.csv 1.04563 -> 0.99847, data.parquet 1.00266 ->
+0.99939, engine.wasm 1.00934 -> 0.99951, minjs.min.js 1.01698 -> 0.99671. That is
+consistent with attempt 2's record, which also found clause 3 OK — but with the tuned
+threshold it closes FOUR cells on this set instead of two.
+
+**What was wrong with the five-file falsification, precisely:** the claim "no single
+global threshold closes L1" is still true in the strict sense — aozora (1.00271),
+dickens (1.00181) and data.json (1.00358) fail at every threshold tried. But I let
+that become "the class will not move", and the five-file sample simply did not contain
+the four files that flip. A negative result on a SUBSET is not a negative result on
+the class. The tradeoff between text loss and binary win is real; it just is not
+total.
+
+Note the curve is not monotone and 0 is NOT the optimum: at 0 we converge to
+libdeflate everywhere (3/11, worse than shipped's 4/11 because we give up the binary
+wins), and at 4096 the near-length-3 matches are too permissive on text. 256 sits at a
+genuine interior optimum, and engine.wasm/minjs.min.js pass ONLY there.
+
+STATUS AND WHAT IS STILL MISSING — this is the SIZE case only:
+  * The `ht_fast` routing remains NO-SHIP on the WALL (attempt 2, clause 5/6, measured
+    at `L1+L6, T1`). Nothing here changes that; the untried coordinate is T>1, whose
+    plumbing (`params_parallel`) is in the unmerged PR #227.
+  * 256 was FITTED ON TUNE, which is what TUNE is for. The promotion must be judged on
+    GATE (`corpus_split.json`), which has NOT been inspected and must not be until
+    promotion time.
+  * Local arm64, deterministic byte counts, one arch, L1 and T1 only. Size is NOT
+    strictly arch-invariant (~0.03%, measured above), and several of these cells pass
+    by less than that — `engine.wasm` 0.99951 and `movie.mp4` 0.99994 are inside the
+    arch delta. Those specific cells must be re-measured on the frozen box before any
+    claim that they close.
+
+### x86 CONFIRMATION AT T1 **AND** T4: 10 board cells close on SIZE, 0 open
+
+Re-run on trainer (Intel x86, the same arch family the board is measured on), byte
+counts, both thread counts. **The `shipped` column reproduces the board census
+EXACTLY** — aozora 4,751,200; data.csv 4,111,742; dickens 5,077,406; engine.wasm
+426,271; minjs 1,211,746; movie.mp4 12,903,670; data.parquet 14,424,479 — so these are
+the actual board cells, not a lookalike.
+
+```
+=== L1 T1 ===                                  === L1 T4 ===
+file           libdeflate    shipped     ht256      shipped     ht256
+aozora.txt      4,566,347  4,751,200  4,578,206   4,751,416  4,578,509   fail->fail
+armexe.elf        621,027    599,781    607,417     600,310    607,211   PASS->PASS
+data.csv        3,932,419  4,111,742  3,926,359   4,112,086  3,926,566   CLOSES
+data.parquet   14,386,710 14,424,479 14,383,856  14,426,706 14,383,721   CLOSES
+dickens         4,972,688  5,077,406  4,981,078   5,078,221  4,981,395   fail->fail
+engine.wasm       421,013    426,271    420,714     425,688    420,809   CLOSES
+minjs.min.js    1,184,930  1,211,746  1,180,722   1,211,684  1,181,042   CLOSES
+movie.mp4      12,901,167 12,903,670 12,899,895  12,903,821 12,900,349   CLOSES
+symbols.dwarf     396,048    394,736    391,698     394,830    391,539   PASS->PASS
+                            2/9    ->    7/9        2/9    ->    7/9
+```
+
+**Five files close at T1 and the same five at T4 = 10 of the 200 failing board cells,
+with ZERO opened.** It holds at T4, which is the coordinate where half the L1 board
+fails and where the two prior attempts never measured.
+
+The arm64 caveat from the previous section is RESOLVED in the right direction and was
+warranted: on arm64 the shipped path passed `movie.mp4` (0.99986) while on x86 it
+FAILS (12,903,670 > 12,901,167). That is exactly the ~0.03% arch sensitivity flagged
+earlier, landing on exactly the cell flagged. x86 is what the board uses, so x86 is the
+number that counts, and it is the STRONGER of the two (2/9 -> 7/9, versus 4/11 -> 8/11
+on arm).
+
+EROSION TO WATCH AT PROMOTION (clause 5, not a flip): `armexe.elf` stays PASS but grows
+599,781 -> 607,417 B (+7,636 B, +1.27%) — the binary length-3 win being partly given
+up, exactly as the threshold sweep predicts. `symbols.dwarf` improves, 394,736 ->
+391,698 B.
+
+WHAT THIS IS NOT:
+  * **NOT a wall result.** The `ht_fast` routing is NO-SHIP on the wall (attempt 2,
+    clause 5/6, `L1+L6, T1`), and nothing here re-opens that. The size leg being
+    strong at T4 is the ARGUMENT for measuring the wall at T4 — it is not a
+    substitute. Trainer is not the frozen box and no timing was taken.
+  * **NOT the full board.** 9 of 22 corpus files. The others are GATE members (must
+    not be inspected while choosing 256) or were not staged (tool.bin, data.json;
+    data.json failed at 1.00358 on arm64 and is the likeliest non-closer).
+  * **NOT promotable as-is.** 256 was fitted on TUNE; promotion is judged on GATE via
+    `fulcrum try --threads 1,4`, on the frozen box, from a vanilla build.
+
+### CORRECTNESS: ht_fast@256 output IS valid gzip. The `verdict FAIL` is P4, and P4 fails on main too.
+
+Non-negotiable #1 before any size claim counts. `fulcrum verify` (compress, decompress
+with OUR OWN decoder at every thread count, sha256 vs original, plus `gzip -dc` as the
+independent cross-check), 5 corpus files x L0-9 x compress-threads 1,2,4 = 150 cells:
+
+```
+  main    binary sha f7a53025:  cells 150 | failed 0 | verdict FAIL
+                                P4 MONOTONIC SIZE VIOLATED
+  ht256   binary sha fc12a8d8:  cells 150 | failed 0 | verdict FAIL
+                                P4 MONOTONIC SIZE VIOLATED
+```
+
+**Zero roundtrip failures on both arms** — the encoder is correct and the output is
+valid gzip. The `FAIL` verdict is `fulcrum verify`'s OTHER gating assertion, P4
+(monotonic size: a higher level must not give a bigger file), and **main fails it
+identically**. So P4 is PRE-EXISTING and this change neither causes nor worsens it.
+Reporting the verdict alone without the paired main arm would have looked like the
+change broke correctness; it does not.
+
+(Decode ran at `--decode-threads 16` on the user's suggestion — the decoder is finished
+and parallel, so the oracle costs almost nothing at max parallelism.)
+
+### The P4 violation is the L3/L4 STRATEGY ABUTMENT, and `LazyGated` no longer exists
+
+`params_inner` currently ladders:
+
+```
+  L2  Greedy  depth  6  nice 10
+  L3  Lazy    depth 12  nice 14
+  L4  Greedy  depth 16  nice 30     <-- lazy -> GREEDY -> lazy
+  L5  Lazy    depth 16  nice 30
+```
+
+Lazy beats greedy at comparable knobs, and L4's deeper search (16 vs 12) does not
+always compensate — so `-4` can be BIGGER than `-3`. L4 is greedy only because our
+table transliterates libdeflate's, which stays greedy through L4; CLAUDE.md says that
+table is explicitly ours to change.
+
+⚠ DOC BUG, worth fixing separately: `level.rs:44-51` still carries a doc comment
+describing `Strategy::LazyGated` ("per-block GREEDY-vs-LAZY dispatch under a two-sided
+content detector") as though it ships. It does NOT — that variant and `parse/gated.rs`
+were deleted by user order under non-negotiable #3. The `Strategy` enum today is
+`Fast0, Fast, Greedy, Lazy, Lazy2, NearOptimal`. Anyone reading that comment would
+believe L3 is detector-gated; the `3 =>` arm is plain `Strategy::Lazy`.
+
+The candidate the vendor diff already names (`docs/vendor-structure-comparison.md` §1):
+zlib-ng's `deflate_medium`, a THIRD strategy that is neither greedy nor lazy and
+"exists precisely to make L3-6 monotonic at a fraction of lazy's cost". Note a prior
+naive lazy-at-L4 experiment measured 17.7% wall, so the cheap-monotonic property is the
+whole point.
