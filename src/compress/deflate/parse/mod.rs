@@ -2194,6 +2194,14 @@ mod l1_bakeoff {
     //! matchfinders answers "did that change find more matches?" in under a
     //! second, on any machine, with no instrument between the code and the number.
     //!
+    //! ⚠ WHAT THIS RATCHET GUARDS. `ht_fast` is **NOT ROUTED IN PRODUCTION** —
+    //! its only call site in the whole tree is this test (`grep -rn 'ht_fast::run'
+    //! src/`). So the `ht_fast` column is what we COULD ship, not what we do, and
+    //! nothing measured here can change the shipped binary. The SHIPPED L1 is the
+    //! `Fast` column, and it is +1.634% vs libdeflate — that gap IS the L1 class.
+    //! The ratchet exists to keep the candidate honest until the routing lands
+    //! (blocked on #227's `params_parallel`, since it must be gated T>1).
+    //!
     //! `Strategy::Fast` (shipped) is igzip-class chainless SINGLE-PROBE.
     //! `ht_fast` is the libdeflate-class 2-ENTRY-BUCKET synthesis that also keeps
     //! our length-3 table. Both are already in the tree and both are
