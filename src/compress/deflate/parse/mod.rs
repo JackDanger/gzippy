@@ -656,6 +656,24 @@ pub(super) fn compress(
         // "hash3 off" — it disables acceptance, not maintenance, which is exactly the
         // misreading that produced the retracted claim.
         //
+        // PARKED, NOT FALSIFIED — branch `lever/l1-ht-minmatch` (31198766). It governs
+        // length-3 ACCEPTANCE with libdeflate's own `choose_min_match_len` (min match
+        // length from the count of distinct literals), which we already ship at levels
+        // 2-9, instead of a fixed offset. That is the rule attempt 1 lacked when it
+        // OPENED 7 cells on binaries. Size, full files, -p1, vs libdeflate:
+        // access.log +10.284%->+0.000%, monorepo.tar +5.650%->-0.002%, data.csv
+        // +4.560%->+0.000%, dickens +2.106%->+0.000%, markup.xml +2.471%->+0.000%,
+        // data.json +1.775%->+0.000%, ecoli.fastq +2.817%->+0.000%, minjs
+        // +2.263%->-0.014%, aozora +4.048%->+0.045%, armexe -3.421%->-3.604%,
+        // symbols.dwarf -0.331%->-0.911%, data.parquet +0.263%->-0.084%. 13 of 14
+        // improve; tie-guard at ALL NINE levels probed 198 cells, 154 tied, 0 flipped;
+        // roundtrip 48/48 sha256-exact. It is a MONOTONE size win.
+        //
+        // It is parked because it rides on `ht_fast`, and the wall numbers below kill
+        // the CARRIER, not the rule. Do NOT re-measure its size leg to revive it — that
+        // leg is banked and deterministic. UNPARK CONDITION: the shared buffering-path
+        // LLC excess is closed, at which point re-measure the WALL leg only.
+        //
         // So BOTH FALSIFY notes above stand, and the wall verdict now stands on a
         // vendor measurement rather than on an inference: `main` (`parse::fast`) runs
         // data.csv L1 T1 in 176.4 ms against libdeflate's 176.2 ms — ALREADY PARITY —
