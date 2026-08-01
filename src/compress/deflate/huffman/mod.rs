@@ -51,4 +51,21 @@ pub struct HuffmanCode {
 pub struct CodeScratch {
     pub litcode: HuffmanCode,
     pub offcode: HuffmanCode,
+    /// Scratch for the RLE-shaped header candidate (zopfli
+    /// `TryOptimizeHuffmanForRle`): the two candidate codes, the header buffers
+    /// used to price them, and the `good_for_rle` flag buffer. Same contract as
+    /// the two codes above — caller-owned and reused, so evaluating the candidate
+    /// costs no per-block allocation.
+    pub shape: ShapeScratch,
+}
+
+/// Per-block working set for the RLE-shaped Huffman candidate. Held inside
+/// [`CodeScratch`] so it lives for a whole parser invocation.
+#[derive(Default)]
+pub struct ShapeScratch {
+    pub cand_litcode: HuffmanCode,
+    pub cand_offcode: HuffmanCode,
+    pub raw_header: HeaderScratch,
+    pub cand_header: HeaderScratch,
+    pub rle_flags: Vec<bool>,
 }

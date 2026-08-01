@@ -934,7 +934,11 @@ fn emit_block(
     // reuses for every block. See `huffman::CodeScratch`: building them fresh here
     // was the per-block allocation that made our allocation count grow with input
     // (733 allocs on 6 MB where libdeflate uses 3 and gzip 0).
-    let CodeScratch { litcode, offcode } = code_scratch;
+    let CodeScratch {
+        litcode,
+        offcode,
+        shape,
+    } = code_scratch;
     let (header, dynamic_bits, static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
@@ -945,7 +949,7 @@ fn emit_block(
             // PROBE: build the codes from the RLE-shaped histogram when that is
             // strictly cheaper. `cost_from_freqs` below still charges the TRUE
             // frequencies, so the dyn/static/stored comparison is unaffected.
-            let shaped = shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs);
+            let shaped = shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs, shape);
             let (build_lit, build_off) = match shaped {
                 Some((ref l, ref o)) => (l, o),
                 None => (&litlen_freqs, &sink.offset_freqs),
@@ -1140,26 +1144,45 @@ fn emit_block_static_or_stored(
 /// MEASURE THE PHASE SHARE BEFORE OPTIMISING A PHASE. One `anatomy-wall` run would
 /// have given both the ceiling (1.4%) and the real target (parse_match, 89%).
 ///
+/// FALSIFY 2026-08-01 (SECOND, same function, different claim) — the "it is the
+/// allocations" diagnosis above is ALSO WRONG. All four per-block allocations were
+/// hoisted into caller-owned scratch (`ShapeScratch`: candidate codes built with
+/// `make_huffman_code_into`, two reused `HeaderScratch`, and a reused
+/// `good_for_rle` buffer via `optimize_huffman_for_rle_into`). Output stayed
+/// byte-identical to the allocating probe on 4/4 files. The wall did not move:
+///
+///     file           allocating   hoisted
+///     engine.wasm       1.81x      1.83x
+///     symbols.dwarf     1.96x      2.00x
+///     data.parquet      6.08x      5.94x
+///     tool.bin          6.40x      6.21x
+///
+/// TWO INSTRUMENTS NOW DISAGREE BY ~200x AND THIS IS UNRECONCILED:
+///   - `anatomy-wall` says `huffman_table_ns` is 7.8 ms of a 549.6 ms run (1.4%),
+///     so roughly tripling that phase should cost ~3%.
+///   - the paired wall says it costs 520%.
+/// `MEMORY.md`: "a result contradicting a banked one is measurement error until
+/// reconciled" and "when two instruments disagree, measure a THIRD time — do not
+/// reason". DO NOT pick a side by argument. The cheapest discriminator, unrun:
+/// make this function do all its work and then `return None` unconditionally. If
+/// the wall stays ~6x the cost is the WORK; if it collapses, the cost is
+/// downstream of the changed histogram (most likely many more, smaller blocks —
+/// shaping moves `dynamic_bits`, which feeds the stored/static/dynamic choice and
+/// the block splitter), and `huffman_table_ns` was never the phase being tripled.
+///
+/// Until that third measurement exists, NEITHER the 1.4% ceiling NOR the
+/// allocation diagnosis may be cited.
+///
 /// Returns the histograms to build the block's codes from.
 fn shaped_freqs_if_smaller(
     litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
     offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+    shape: &mut super::huffman::ShapeScratch,
 ) -> Option<(
     [u32; DEFLATE_NUM_LITLEN_SYMS],
     [u32; DEFLATE_NUM_OFFSET_SYMS],
 )> {
-    use super::huffman::optimal::optimize_huffman_for_rle;
-
-    // Price a (litlen, offset) histogram pair by building its codes and its
-    // dynamic header, then charging the DATA with the true frequencies.
-    let price = |lf: &[u32; DEFLATE_NUM_LITLEN_SYMS], of: &[u32; DEFLATE_NUM_OFFSET_SYMS]| -> u64 {
-        let litcode = make_huffman_code(DEFLATE_NUM_LITLEN_SYMS, MAX_LITLEN_CODEWORD_LEN, lf);
-        let offcode = make_huffman_code(DEFLATE_NUM_OFFSET_SYMS, MAX_OFFSET_CODEWORD_LEN, of);
-        let mut hs = HeaderScratch::new();
-        let header = build_dynamic_header(&litcode.lens, &offcode.lens, &mut hs);
-        header.header_bits()
-            + cost_from_freqs(litlen_freqs, offset_freqs, &litcode, &offcode)
-    };
+    use super::huffman::optimal::optimize_huffman_for_rle_into;
 
     let mut s_lit = [0usize; DEFLATE_NUM_LITLEN_SYMS];
     for (d, &s) in s_lit.iter_mut().zip(litlen_freqs.iter()) {
@@ -1169,8 +1192,8 @@ fn shaped_freqs_if_smaller(
     for (d, &s) in s_off.iter_mut().zip(offset_freqs.iter()) {
         *d = s as usize;
     }
-    optimize_huffman_for_rle(&mut s_lit);
-    optimize_huffman_for_rle(&mut s_off);
+    optimize_huffman_for_rle_into(&mut s_lit, &mut shape.rle_flags);
+    optimize_huffman_for_rle_into(&mut s_off, &mut shape.rle_flags);
 
     let mut shaped_lit = [0u32; DEFLATE_NUM_LITLEN_SYMS];
     for (d, &s) in shaped_lit.iter_mut().zip(s_lit.iter()) {
@@ -1181,7 +1204,72 @@ fn shaped_freqs_if_smaller(
         *d = s as u32;
     }
 
-    if price(&shaped_lit, &shaped_off) < price(litlen_freqs, offset_freqs) {
+    // Nothing to evaluate if shaping did not move the histogram.
+    if shaped_lit == *litlen_freqs && shaped_off == *offset_freqs {
+        return None;
+    }
+
+    // Price both, allocation-free: codes built INTO the scratch, headers built
+    // into the scratch's two buffers. DATA is charged with the TRUE frequencies
+    // in both arms (zopfli prices candidates with true counts), so the
+    // comparison is only ever about tree shape.
+    make_huffman_code_into(
+        &mut shape.cand_litcode,
+        DEFLATE_NUM_LITLEN_SYMS,
+        MAX_LITLEN_CODEWORD_LEN,
+        &shaped_lit,
+    );
+    make_huffman_code_into(
+        &mut shape.cand_offcode,
+        DEFLATE_NUM_OFFSET_SYMS,
+        MAX_OFFSET_CODEWORD_LEN,
+        &shaped_off,
+    );
+    let cand_bits = {
+        let h = build_dynamic_header(
+            &shape.cand_litcode.lens,
+            &shape.cand_offcode.lens,
+            &mut shape.cand_header,
+        );
+        h.header_bits()
+    } + cost_from_freqs(
+        litlen_freqs,
+        offset_freqs,
+        &shape.cand_litcode,
+        &shape.cand_offcode,
+    );
+
+    // The incumbent: reuse the candidate code slots is NOT possible here (they
+    // hold the candidate), so the raw arm builds into the same slots only after
+    // the candidate has been priced. Build raw into cand_* is destructive, so
+    // price raw with its own build into the header scratch pair.
+    make_huffman_code_into(
+        &mut shape.cand_litcode,
+        DEFLATE_NUM_LITLEN_SYMS,
+        MAX_LITLEN_CODEWORD_LEN,
+        litlen_freqs,
+    );
+    make_huffman_code_into(
+        &mut shape.cand_offcode,
+        DEFLATE_NUM_OFFSET_SYMS,
+        MAX_OFFSET_CODEWORD_LEN,
+        offset_freqs,
+    );
+    let raw_bits = {
+        let h = build_dynamic_header(
+            &shape.cand_litcode.lens,
+            &shape.cand_offcode.lens,
+            &mut shape.raw_header,
+        );
+        h.header_bits()
+    } + cost_from_freqs(
+        litlen_freqs,
+        offset_freqs,
+        &shape.cand_litcode,
+        &shape.cand_offcode,
+    );
+
+    if cand_bits < raw_bits {
         Some((shaped_lit, shaped_off))
     } else {
         None
