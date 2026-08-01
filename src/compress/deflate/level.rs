@@ -41,15 +41,20 @@ pub enum Strategy {
     Lazy,
     /// Lazy2 parse: look ahead two positions.
     Lazy2,
-    /// DETECTOR-GATED LAZY-L3 (promoted 2026-07-23 by supervisor adjudication
-    /// of the `88cf1b09` gate record — see this module's level-3 arm for the
-    /// full record): per-block GREEDY-vs-LAZY dispatch under a two-sided
-    /// content detector — see `parse::gated`'s module doc comment. Produced
-    /// unconditionally by this module's level-3 arm in EVERY build (the
-    /// `l3-tune` Cargo feature now only controls whether `parse::gated`'s
-    /// threshold/block-length knobs are env-var-overridable for the harness;
-    /// it no longer gates whether L3 uses this strategy at all).
     /// Near-optimal parse: bt matchfinder + iterative min-cost-path DP (L10-12).
+    //
+    // A 12-line doc comment describing a `LazyGated` DETECTOR-GATED LAZY-L3
+    // strategy used to sit HERE, above `NearOptimal`, with the one real
+    // `NearOptimal` line tacked on its end — so rustdoc rendered
+    // `NearOptimal` as "per-block GREEDY-vs-LAZY dispatch under a two-sided
+    // content detector". The `LazyGated` variant and `parse/gated.rs` were
+    // deleted by user order (non-negotiable #3: no content detector chooses a
+    // parser); the retraction reached the level-3 ARM (see its ⚠ STALE
+    // marker) but not this enum, so the stale text outlived its variant by
+    // attaching itself to the next one. That is the CLAUDE.md working rule
+    // "a retraction must reach the ROOT" failing in the smallest possible
+    // way: a deletion that removes a variant must also remove the doc
+    // comment that was above it, or Rust silently re-parents the prose.
     NearOptimal,
 }
 

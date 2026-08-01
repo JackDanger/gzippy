@@ -79,8 +79,43 @@ esac
 
 OUT="${CAMPAIGN_OUT:-$(campaign_outdir "wall-${SET_NAME}-$(git -C "$CAMPAIGN_REPO" rev-parse --short HEAD)")}"
 
+# --- W4: FROZEN BINARY ------------------------------------------------------------
+# W2 and W3 verify `$CAMPAIGN_REPO/target/release/gzippy` ONCE, here, and then the run
+# spends HOURS reading that same path out of a checkout that stays fully writable. A
+# single `cargo build --release` anywhere in the tree silently swaps the subject
+# mid-board, and nothing downstream notices: the launch banner still says
+# "vanilla: verified", the log lines carry no binary identity, and the rows before and
+# after the swap are indistinguishable.
+#
+# RECEIPT (2026-08-01). A wall board launched against a vanilla main build
+# (sha 54079f43) was 242 rows into ~792 when a doc-comment edit was build-checked with
+# `cargo build --release` in the same checkout — which was sitting on a LEVER branch,
+# 307 insertions across 11 files of `src/` ahead of main. The subject binary became
+# 1c812b24, a different compressor, with no error and no log line. The whole run had to
+# be discarded because the contamination BOUNDARY could not be recovered from the log.
+# This is the same class as the CAMPAIGN_REPO trap caught earlier the same day: a guard
+# that reads an input once and then trusts the world to hold still.
+#
+# The fix is to stop measuring a path that someone else can write. Copy the verified
+# binary into the run's own output directory and measure THAT. Three properties follow:
+# the subject is immutable for the run (nothing in the repo can reach it), the artifact
+# carries the exact binary that produced its numbers (hard stop #7 satisfied by
+# construction rather than by a note), and the checkout is free for ordinary work while
+# a multi-hour board runs — which is what will actually happen, so the guard has to
+# assume it.
+mkdir -p "$OUT" || die "cannot create out dir $OUT"
+GZ_FROZEN="$OUT/gzippy-subject"
+cp "$GZ" "$GZ_FROZEN" || die "cannot snapshot subject binary into $OUT"
+chmod a-w "$GZ_FROZEN" || die "cannot make snapshot read-only"
+FROZEN_SHA="$(shasum -a 256 "$GZ_FROZEN" | cut -d' ' -f1)"
+[ "$FROZEN_SHA" = "$GZ_SHA" ] || die "snapshot sha != verified sha" \
+    "verified=$GZ_SHA snapshot=$FROZEN_SHA" \
+    "The copy did not reproduce the binary that passed W2/W3."
+GZ="$GZ_FROZEN"
+
 # --- W3: IDENTIFIED BINARY --------------------------------------------------------
 note "binary" "gzippy sha256=${GZ_SHA:0:16} commit=$CAMPAIGN_GZIPPY_SHA (vanilla: verified)"
+note "subject" "frozen copy at $GZ_FROZEN (read-only; repo rebuilds cannot reach it)"
 note "method" "levels=$LEVELS threads=$THREADS n=$N sink=/dev/null (BOTH arms)"
 note "out" "$OUT"
 
