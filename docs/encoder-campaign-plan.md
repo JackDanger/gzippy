@@ -1083,3 +1083,57 @@ What the sweep DOES establish, and is worth keeping:
 NOT a wall claim, and NOT a promotion proposal: the `ht_fast` routing this sweep runs
 on is already NO-SHIP twice (clause 3 on binaries; clause 5/6 on the wall at T1).
 Scope L1, five TUNE files, one arch.
+
+### CORRECTION + RESULT: on the FULL TUNE set, `ht_fast` @ 256 doubles the passing L1 cells (4 -> 8), zero regressions
+
+The falsification above was measured on FIVE files and was too strong. Re-run on all
+ELEVEN TUNE members, L1, ratio vs `libdeflate-gzip -1`, PASS decided by exact integer
+compare (ours <= rival), `*` = PASS:
+
+```
+shipped-fast   pass= 4/11  aozora 1.04036  armexe .96952* data.csv 1.04563  data.json 1.01408
+                           data.parquet 1.00266  dickens 1.02130  engine.wasm 1.00934
+                           minjs 1.01698  movie.mp4 .99986* symbols .99497* tool.bin .99223*
+ht_fast@4096   pass= 5/11  aozora 1.00568  armexe .96437* data.csv 1.00055  data.json 1.01302
+                           data.parquet .99890* dickens 1.00484  engine.wasm 1.00304
+                           minjs 1.00228  movie.mp4 .99999* symbols .98883* tool.bin .97879*
+ht_fast@256    pass= 8/11  aozora 1.00271  armexe .97775* data.csv .99847* data.json 1.00358
+                           data.parquet .99939* dickens 1.00181  engine.wasm .99951*
+                           minjs .99671* movie.mp4 .99994* symbols .98861* tool.bin .97906*
+ht_fast@0      pass= 3/11  aozora 1.00014  armexe .99952* data.csv 1.00002  data.json 1.00051
+                           data.parquet .99962* dickens 1.00016  engine.wasm 1.00061
+                           minjs 1.00027  movie.mp4 1.00003  symbols .99988* tool.bin 1.00011
+```
+
+**`ht_fast` @ 256 doubles the passing cells, 4 -> 8, and regresses NOTHING.** All four
+cells the shipped path passes (armexe.elf, movie.mp4, symbols.dwarf, tool.bin) are
+retained; four more cross: data.csv 1.04563 -> 0.99847, data.parquet 1.00266 ->
+0.99939, engine.wasm 1.00934 -> 0.99951, minjs.min.js 1.01698 -> 0.99671. That is
+consistent with attempt 2's record, which also found clause 3 OK — but with the tuned
+threshold it closes FOUR cells on this set instead of two.
+
+**What was wrong with the five-file falsification, precisely:** the claim "no single
+global threshold closes L1" is still true in the strict sense — aozora (1.00271),
+dickens (1.00181) and data.json (1.00358) fail at every threshold tried. But I let
+that become "the class will not move", and the five-file sample simply did not contain
+the four files that flip. A negative result on a SUBSET is not a negative result on
+the class. The tradeoff between text loss and binary win is real; it just is not
+total.
+
+Note the curve is not monotone and 0 is NOT the optimum: at 0 we converge to
+libdeflate everywhere (3/11, worse than shipped's 4/11 because we give up the binary
+wins), and at 4096 the near-length-3 matches are too permissive on text. 256 sits at a
+genuine interior optimum, and engine.wasm/minjs.min.js pass ONLY there.
+
+STATUS AND WHAT IS STILL MISSING — this is the SIZE case only:
+  * The `ht_fast` routing remains NO-SHIP on the WALL (attempt 2, clause 5/6, measured
+    at `L1+L6, T1`). Nothing here changes that; the untried coordinate is T>1, whose
+    plumbing (`params_parallel`) is in the unmerged PR #227.
+  * 256 was FITTED ON TUNE, which is what TUNE is for. The promotion must be judged on
+    GATE (`corpus_split.json`), which has NOT been inspected and must not be until
+    promotion time.
+  * Local arm64, deterministic byte counts, one arch, L1 and T1 only. Size is NOT
+    strictly arch-invariant (~0.03%, measured above), and several of these cells pass
+    by less than that — `engine.wasm` 0.99951 and `movie.mp4` 0.99994 are inside the
+    arch delta. Those specific cells must be re-measured on the frozen box before any
+    claim that they close.
