@@ -213,6 +213,101 @@ pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
     }
 }
 
+/// C: `compute_length_counts(u32 A[], unsigned root_idx, unsigned len_counts[],
+/// unsigned max_codeword_len)` (:1024)
+///
+/// Given the stripped-down Huffman tree produced by `build_tree`, determine the
+/// number of codewords that should be assigned each possible length, taking into
+/// account the length-limited constraint.
+///
+/// # Inputs
+///
+/// * `A` — the array produced by `build_tree`, containing parent index information
+///   for the non-leaf nodes of the tree. Each entry in this array is a node; a
+///   node's parent always has a GREATER index than that of the node itself. This
+///   function will overwrite the parent index information in this array, so
+///   essentially it will destroy the tree. However, the data it needs will still be
+///   valid at the time it is used.
+/// * `root_idx` — the 0-based index of the root node in `A`, and consequently one
+///   less than the number of tree node entries.
+/// * `len_counts` — an array of length `max_codeword_len + 1` that will be filled in
+///   with the number of codewords having each length `<= max_codeword_len`.
+/// * `max_codeword_len` — the maximum permissible codeword length.
+///
+/// # How the length limit is enforced — and why it is NOT exact
+///
+/// The tree is walked from the root down (indices descending, which works because a
+/// node's parent always has a greater index). Each node's depth is one more than its
+/// parent's, and that depth is written back over the parent index — this is the
+/// "destroys the tree" part, and it is safe only because parents are always visited
+/// before their children.
+///
+/// When a node's depth would exceed `max_codeword_len`, it is clamped and the
+/// deficit is paid for by moving a codeword from some shorter length: the `do {
+/// depth--; } while (len_counts[depth] == 0)` scan walks DOWN to the nearest
+/// non-empty length and steals from it. That is a HEURISTIC rebalance, not the
+/// optimal length-limited code (package-merge would be optimal).
+///
+/// This matters for the campaign and is worth stating precisely: a binding
+/// falsification already exists at `src/compress/deflate/huffman/fast.rs:432`
+/// recording that libdeflate's heuristic limiter is within ~0.001% of the exact
+/// package-merge optimum, that building it both ways is a wash which OPENS cells,
+/// and that the costed dual-candidate variant holds size flat at ~0.001% while
+/// costing 10-14% wall. So: this heuristic is the thing to COPY, not to improve.
+/// Replacing it with an exact limiter is a known-dead lever, and doing so would also
+/// break byte-identity, which is the entire point of this module.
+pub(crate) fn compute_length_counts(
+    a: &mut [u32],
+    root_idx: usize,
+    len_counts: &mut [u32],
+    max_codeword_len: usize,
+) {
+    // for (len = 0; len <= max_codeword_len; len++) len_counts[len] = 0;
+    for len in 0..=max_codeword_len {
+        len_counts[len] = 0;
+    }
+
+    // The root node counts as 2 codewords of length 1: it has two children, and
+    // every codeword descends from one of them.
+    len_counts[1] = 2;
+
+    // Set the root node's depth to 0. (The high bits held its parent index, which
+    // is meaningless for the root.)
+    a[root_idx] &= SYMBOL_MASK;
+
+    // Walk from the root downward. `node` descends, and because a node's parent
+    // always has a GREATER index, every parent's depth is already computed by the
+    // time its children are visited.
+    //
+    // NOTE: the C uses a signed `int node` counting down to 0 inclusive, so the loop
+    // ends when node goes negative. A usize would wrap, so this is written as a
+    // descending range — the visit order is identical.
+    for node in (0..root_idx).rev() {
+        let parent = (a[node] >> NUM_SYMBOL_BITS) as usize;
+        let parent_depth = a[parent] >> NUM_SYMBOL_BITS;
+        let mut depth = parent_depth + 1;
+
+        // Overwrite the parent index with this node's depth, in place.
+        a[node] = (a[node] & SYMBOL_MASK) | (depth << NUM_SYMBOL_BITS);
+
+        // If needed, decrease the length to meet the length-limited constraint,
+        // paying for it by lengthening a codeword at some shorter, non-empty length.
+        if depth as usize >= max_codeword_len {
+            depth = max_codeword_len as u32;
+            // do { depth--; } while (len_counts[depth] == 0);
+            loop {
+                depth -= 1;
+                if len_counts[depth as usize] != 0 {
+                    break;
+                }
+            }
+        }
+
+        len_counts[depth as usize] -= 1;
+        len_counts[depth as usize + 1] += 2;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +411,77 @@ mod tests {
                 })
                 .collect();
             build_tree_root_freq_equals_total(&freqs);
+        }
+    }
+
+    /// `compute_length_counts` must produce a COMPLETE code: Kraft equality,
+    /// `sum(len_counts[l] * 2^-l) == 1`, checked in integers as
+    /// `sum(len_counts[l] << (max - l)) == 1 << max`.
+    ///
+    /// This is the strongest available check on the length-limiter. If the
+    /// `do { depth--; } while (len_counts[depth] == 0)` steal-scan took from the
+    /// wrong length, or the `len_counts[depth+1] += 2` accounting were off, the
+    /// codespace would over- or under-fill and this would catch it. It also pins
+    /// that the limit is actually RESPECTED: no count above `max_codeword_len`.
+    fn check_kraft(freqs: &[u32], max_codeword_len: usize) {
+        let num_syms = freqs.len();
+        let mut lens = vec![0u8; num_syms];
+        let mut a = vec![0u32; num_syms];
+        let n = sort_symbols(num_syms, freqs, &mut lens, &mut a);
+        if n < 2 {
+            return; // build_tree's precondition
+        }
+        build_tree(&mut a, n);
+
+        let mut len_counts = vec![0u32; max_codeword_len + 2];
+        compute_length_counts(&mut a, n - 2, &mut len_counts, max_codeword_len);
+
+        let mut space: u64 = 0;
+        for l in 1..=max_codeword_len {
+            space += (len_counts[l] as u64) << (max_codeword_len - l);
+        }
+        assert_eq!(
+            space,
+            1u64 << max_codeword_len,
+            "Kraft inequality not tight (n={n}, max={max_codeword_len}, counts={:?})",
+            &len_counts[..=max_codeword_len]
+        );
+
+        let total: u32 = len_counts[1..=max_codeword_len].iter().sum();
+        assert_eq!(total as usize, n, "codeword count != symbol count");
+    }
+
+    #[test]
+    fn compute_length_counts_produces_a_complete_code() {
+        for &max in &[7usize, 15] {
+            check_kraft(&[1, 1], max);
+            check_kraft(&[1, 2, 3], max);
+            check_kraft(&[1, 1, 1, 1], max);
+            check_kraft(&[5, 0, 3, 0, 1, 9], max);
+            check_kraft(&[7; 32], max);
+            // Fibonacci frequencies force the DEEPEST possible tree, which is the
+            // only shape that actually exercises the length-limiting steal-scan.
+            let mut fib = vec![1u32, 1];
+            while fib.len() < 30 {
+                let n = fib[fib.len() - 1] + fib[fib.len() - 2];
+                fib.push(n);
+            }
+            check_kraft(&fib, max);
+        }
+    }
+
+    #[test]
+    fn compute_length_counts_random_spreads_stay_complete() {
+        let mut state: u32 = 0x5EED_1234;
+        for trial in 0..48 {
+            let num_syms = 2 + (trial % 40);
+            let freqs: Vec<u32> = (0..num_syms)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    1 + (state >> 18) % 4000
+                })
+                .collect();
+            check_kraft(&freqs, 15);
         }
     }
 
