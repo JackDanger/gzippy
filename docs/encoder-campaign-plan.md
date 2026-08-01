@@ -681,3 +681,98 @@ across aarch64/Zen2/Intel — verified — so size needs one box only. Neither r
 currently passes the full Gate-0 suite (`profile rss` fails on both, `lib levelsweep` on
 solvency) and `make deploy` correctly refuses to certify them; fix those two gates
 before trusting a fresh instrument there.
+
+## L1 IS THE LARGEST FAILING CLASS, AND IT IS NOT THE SEAM (measured 2026-08-01)
+
+The board had been decomposed by rival x thread count, which surfaced the T4 seam
+(109 zero-headroom cells). Decomposing the SAME artifact by **level x rival** —
+`/root/sizeboard-all-12fcd0ed/census.json`, 1584 cells, 200 failing, commit
+`12fcd0ed` — shows a second class that is larger per level and far more tractable:
+
+```
+        gzip     pigz  libdeflate  igzip   tot
+  L1       2        0          29      4    35     <- largest level on the board
+  L2       4        2          17      0    23
+  L3       4        2           4      2    12
+  L4       2        2          13      0    17
+  L5       4        4          17      0    25
+  L6       6        6          13      0    25
+  L7       6        4          16      0    26
+  L8       2        0          15      0    17
+  L9       2        0          18      0    20
+```
+
+**L1 has none of the seam class's pathologies.** Its cells fail at T1 and T4 with
+near-identical ratios (access.log 1.1028 / 1.1032; monorepo.tar 1.0565 / 1.0565), so
+this is a PURE CODING DEFICIT, not seam growth. And where the seam cells tie
+libdeflate byte-for-byte with 0 bytes of headroom, these are 0.02%-10.3% BIGGER:
+
+```
+  libdeflate T1/T4  access.log    1.1028 / 1.1032   +340,410 / +341,529 B
+  libdeflate T1/T4  monorepo.tar  1.0565 / 1.0565   +639,158 / +639,359 B
+  libdeflate T1/T4  data.csv      1.0456 / 1.0457   +179,323 / +179,667 B
+  libdeflate T1/T4  aozora.txt    1.0405 / 1.0405   +184,853 / +185,069 B
+  libdeflate T1/T4  ecoli.fastq   1.0282 / 1.0283   +135,198 / +135,773 B
+  ... 24 more, down to movie.mp4 1.0002
+```
+
+Two consequences. Clause 3 cannot be tripped by improving an already-FAILING cell,
+so the zero-tolerance constraint that governs the tie cage does not apply here. And
+the margins are three orders of magnitude larger than the ~0.01% the seam needs — so
+unlike the seam, a partial improvement CLOSES CELLS.
+
+### The mechanism is already identified, and it is already in the tree
+
+We run **igzip's** L1 algorithm (`Strategy::Fast`: chainless, single probe, plus a
+length-3 `head3` table) while being graded against **libdeflate's** L1
+(`deflate_compress_fastest` + `ht_matchfinder`: 2-entry buckets, no length-3).
+`parse/mod.rs`'s two FALSIFY records already proved this is THE mechanism by
+execution: routing L1 to `ht_fast` lands nine libdeflate L1 cells at ratio EXACTLY
+1.0000 (data.csv 1.0456->1.0000, aozora 1.0405->1.0000, minjs 1.0226->1.0000,
+dickens 1.0211->1.0000, data.json 1.0177->1.0000, engine.wasm 1.0125->1.0000).
+
+Both prior attempts died, and NEITHER died on size:
+
+- **attempt 1**, route as a REPLACEMENT: 9 closed / 7 OPENED. Clause 3 violated. The
+  7 are one mechanism — on BINARIES our `head3` length-3 table beats libdeflate and
+  the port gives that win up (armexe.elf was a 3.4% WIN at 0.9658).
+- **attempt 2**, the SYNTHESIS (2-way bucket AND length-3, which `matchfinder::ht`
+  still IS today — only the routing was reverted): **clause 3 OK across 145
+  decidable cells, clause 4 closed 2, the SIZE LEG PASSED CLEANLY.** It died on
+  clause 5/6: 19 wall cells eroded, our own L1 15-50% slower.
+
+### What is untried: the COORDINATE
+
+Attempt 2's wall verdict was taken at **`L1+L6, T1`** (artifact
+`/root/wall-l1-synth/try.json`). Every clause-5 erosion it reports is a T1 ratio
+against a SINGLE-THREADED rival — gzip:data.json 0.4549 -> 0.6861, pigz:data.csv
+0.5444 -> 0.7418. At T4 those same cells run our 4 threads against their 1, where
+measured slack is 249-330% rather than T1's 0-8%; the same 15-50% self-tax erodes
+roughly a quarter as much in ratio terms. That is the 40x coordinate error this
+project has already made once, and the board says half the L1 cells are at T4.
+
+There is shipped precedent for the fix shape: `try_exact_huffman` and the
+`max_search_depth` x4 scaling are BOTH gated T>1-only for exactly this reason, in
+`level.rs`'s own words — "THE REASON IS THE WALL BUDGET ... It is therefore T>1
+ONLY". A T>1-only L1 routing is the same move on a change whose size leg has already
+passed.
+
+**This is NOT the size-only argument the record forbids** ("a size-only argument is
+not sufficient for this class: that is now 2 for 2"). The claim is about the WALL, at
+a thread count that verdict never measured.
+
+### Pre-registered rule, declared once, before any measurement
+
+Route `Strategy::Fast` to the `ht_fast` synthesis from `params_parallel` ONLY (T>1),
+leaving T1 byte-unchanged. Judged by `fulcrum try --threads 1,4`, full TUNE set,
+L1 AND a deep level (hard stop #3), frozen box, vanilla build:
+
+- SHIP iff clauses 1-6 all pass, INCLUDING clause 3 at T1 (which must be a no-op —
+  verify the T1 arms are byte-identical) and clause 5 at T4.
+- NO-SHIP if clause 5 fails at T4. That would mean the parallel budget does not
+  absorb the self-tax either, and this class is then closed on the wall at BOTH
+  coordinates — record it and stop, do not re-sample.
+
+Cheapest falsifier first: run the SIZE leg at T1,T4 before any wall run. If the T4
+size win is not materially larger than attempt 2's 2 cells, the lever is not worth
+the wall risk and is dropped without a frozen-box run.
