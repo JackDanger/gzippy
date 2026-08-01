@@ -923,3 +923,61 @@ is a SIZE/structure finding only, and no wall claim is made.
 
 Scope: L1 only, three TUNE files. Hard stop #3 forbids generalising across levels —
 do not read this as a statement about L2-L9, which have their own (tie-cage) shape.
+
+### ABLATION: routing L1 to `ht_fast` OVERSHOOTS — and the residual is LENGTH-3 MATCHES
+
+Branch `measure/l1-htfast-ablation` (MEASUREMENT ONLY, never merged), binary sha
+`19da2d1a` vs main's `f7a53025`, trainer, dickens L1 T1, `fulcrum why`:
+
+```
+                  literals   matched-pos/B   total_bits/B   match_len_L00/B
+  main (fast)    1,210,398      0.900579       3.336403         --
+  ablation (ht)    430,527      0.964637       3.282904      0.018815
+  libdeflate       802,951      0.934047       3.267591      0.000000
+```
+
+**Pre-registered prediction 1 held DIRECTIONALLY BUT OVERSHOT.** Literals did not
+approach libdeflate's 802,951 — they blew past it to 430,527, and we now match at MORE
+positions than libdeflate (0.9646 vs 0.9340).
+
+**Pre-registered prediction 2 FAILED, and that is the finding.** Total bits fell
+81,416 B of the 104,718 B gap. We remain **+23,302 B BIGGER while emitting MORE
+matches and FEWER literals.** More coverage is not the same as smaller output.
+
+**The residual is named by the tool: `match_len_L00`, ours 0.018815/B vs rival
+0.000000.** `len_code_index` (fulcrum `src/ratio/mod.rs:242`, base[0] = 3) makes that
+bucket EXACTLY length-3 matches — 229,064 of them on dickens, against libdeflate's
+zero. `ht_matchfinder` has no length-3 support at all; our port added a `hash3_tab`
+beside it. Those length-3 matches REPLACE literals AT A NET LOSS on text.
+
+Magnitude check (counted, then compared): 229,064 length-3 matches losing ~0.8 bits
+each against the ~3 literals they displace is ~22,900 B, against an observed residual
+of 23,302 B. The length-3 matches plausibly ARE the whole remaining gap.
+
+**THIS EXPLAINS BOTH PRIOR ATTEMPTS WITH ONE MECHANISM**, which neither record could
+do on its own:
+  - attempt 1 = the FAITHFUL port (buckets, NO hash3). Text lands at ratio EXACTLY
+    1.0000 — because that IS libdeflate's algorithm. Binaries lose, because length-3
+    matches genuinely pay there.
+  - attempt 2 = port + hash3. Binaries kept, but text no longer reaches 1.0000 —
+    because the length-3 matches it keeps cost bytes on text.
+
+**We already apply the too-far rule.** `HT_MAX_LEN3_OFFSET = 4096` in
+`matchfinder/ht.rs:149`, guarding `length > DEFLATE_MIN_MATCH_LEN || offset <= 4096`
+— the same constant as gzip's `TOO_FAR` (`vendor/gzip/deflate.c:130`, "Matches of
+length 3 are discarded if their distance exceeds TOO_FAR"). So all 229,064 are ALREADY
+within 4096 and still net-negative on text. The threshold was inherited, never tuned
+for L1, and no FALSIFY record covers it.
+
+⚠ **BEFORE ANY LEVER HERE: an outstanding USER-ORDERED DELETION is implicated.**
+`CLAUDE.md` non-negotiable #3 orders the L1 hash3 content gate deleted; it is still
+present as `L1_HASH3_GATE_LIT_THRESHOLD_PCT = 48` (`parse/fast.rs:945`). The
+measurement above explains WHY that gate was ever written: hash3 at L1 pays on
+binaries and costs on text, and a literal-fraction detector is exactly how that split
+gets papered over. The working rules say no new lever starts while a user-ordered
+deletion sits undone — and a content detector is precisely the wrong answer to a split
+this measurement now describes without one.
+
+Scope: L1, dickens, T1. NOT generalised — the binaries claim (armexe.elf,
+symbols.dwarf, tool.bin) is inherited from attempt 1's record and has NOT been
+re-measured here.
