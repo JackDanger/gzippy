@@ -741,10 +741,20 @@ wall is the binding constraint.
 
 ### The waste is named, and it is not "too many chunks"
 
-`CLAUDE.md` STEP 2 sanctions "making seams SMALLER — pad choice, chunk grid, block
-splitting", and G5 already states the mechanism: **every seam costs a sync-flush AND a
-block-grid restart AND a fresh Huffman histogram. The first is 5 bytes; the other two are the
-expensive ones.**
+G5 states the mechanism: **every seam costs a sync-flush AND a block-grid restart AND a
+fresh Huffman histogram. The first is 5 bytes; the other two are the expensive ones.**
+
+**But shrinking that cost cannot close the class — RETRACTED 2026-08-01.** This section
+used to cite `CLAUDE.md` STEP 2's "making seams SMALLER — pad choice, chunk grid, block
+splitting" as the sanctioned route. STEP 2 no longer says that, because the census says
+it is false: of the libdeflate cells that fail only at T4, **all 109 tie libdeflate
+byte-for-byte at T1 (headroom min=0, median=0, max=0)**. The class has zero partial
+credit — cutting the seam tax by 90% closes 0 of 109; only cutting it to exactly 0 closes
+any. The route is a **monotone T1 size win that buys headroom**, not a smaller seam.
+See `CLAUDE.md` STEP 2 for the full table, and G15/G16 below — which recorded the same
+zero-headroom fact first, and then closed Huffman CONSTRUCTION as the source of that
+headroom (~0.001% available against ~0.01% needed). Block boundaries and the parse are
+what remain.
 
 Halving the chunk count (`CHUNKS_PER_THREAD` 2 -> 1) is only a PARAMETER against that waste.
 Measured at L8-L9 over 264 common cells: **8 closed, 3 opened** (net -5, still a clause-3
