@@ -302,3 +302,59 @@ cost-based selection (`deflate_medium`'s deferred-match arithmetic, or our own
 `good_match` itself is NOT shipped here. It is a genuine mechanism we lack and it should
 help the WALL (it cuts search exactly when search is least useful), but it CHANGES OUTPUT,
 so it needs its own size+wall gate rather than riding along with a depth change.
+
+---
+
+## ⚠ SECTION 4's COMPONENT TABLE IS SUSPECT (2026-08-01). Its TOTALS are sound; its SPLIT is not.
+
+§4 concludes that our parse (~66.5M vs 79.5M) and our emit (~57.4M vs 63.8M) are
+CHEAPER than libdeflate's, and that the debt is therefore register pressure in
+the matchfinder ("Structural difference #4: register pressure, not algorithm").
+
+A re-measurement on 2026-08-01 (dickens 12.17 MB, L2, **explicit T1**, callgrind
+with both arms built `-g`, totals taken from callgrind's own `summary:` line —
+`docs/board/l2-component-map.md`) found the OPPOSITE for both components:
+
+| component | ours | libdeflate | delta |
+|---|---|---|---|
+| matchfinder | 485,630,547 | 496,567,178 | **-2.2%** (agrees with §4) |
+| parse loop | 224,855,684 | 151,228,259 | **+48.7%** (§4 says -16%) |
+| block emission | 122,778,195 | 96,346,506 | **+27.4%** (§4 says -10%) |
+
+**The two measurements agree exactly where it matters most.** Total ratio
+ours/theirs: §4 gives 555.1/496.0 = **1.1192**; the re-measurement gives
+842,856,205/752,825,508 = **1.1196**. Different corpus, different box, different
+day, four decimal places. Both totals are right, so the disagreement is in the
+ATTRIBUTION, not the measurement.
+
+**The mechanism.** §4's own components do not sum to §4's own totals:
+
+    libdeflate  457.9M of 496.0M attributed  ->  7.7% missing
+    gzippy      428.9M of 555.1M attributed  -> 22.7% missing
+
+A 23%-vs-8% ASYMMETRIC shortfall is the signature of the callgrind-parser defect
+found and fixed the same day (fulcrum PR #18): `fulcrum why`'s parser never
+recognised `-N` BACKWARD relative positions as cost lines and silently dropped
+them — 18.9% of a real libdeflate trace, and necessarily MORE on a Rust binary,
+whose optimised line emission is far less source-ordered. §4 noticed its own
+missing bucket and read it as "13.7M reads (27% of ours) in unattributed
+spill/reload code"; on this account it is not spill/reload, it is our parse and
+emit lines that were never counted. The re-measurement attributes 99.2%/99.1%.
+
+**Not proven:** that §4 was produced by that parser. Its component figures carry
+`~` markers, its totals came from somewhere reliable, and no artifact path is
+recorded, so the provenance cannot be checked. What IS established: the split is
+inconsistent with its own totals, asymmetrically, in the direction and magnitude
+the known defect produces.
+
+**What this changes.** §5 says "the emit path is the one place we already beat
+them (0.96x), so the debt is entirely parse+matchfinder" and points the reader at
+"register discipline in `longest_match`". The re-measurement says the matchfinder
+is where we are ALREADY AHEAD (-2.2%), and that parse (+48.7%) and emit (+27.4%)
+are the debt. **Levers aimed at `longest_match` register pressure on the strength
+of §4 are aimed at our strongest component.** Three matchfinder levers have
+already failed.
+
+Until §4 is re-run with the fixed parser, treat its TOTALS as good and its
+PER-COMPONENT SPLIT as void. `docs/board/l2-component-map.md` is the current
+attribution.
