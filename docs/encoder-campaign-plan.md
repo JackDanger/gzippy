@@ -1702,3 +1702,76 @@ across both runs, so threads weren't the cause". The identity WAS the evidence �
 caching, not of thread-independence. A number that refuses to move when an input changes
 is not a stable measurement, it is not a measurement. The discriminating test cost one
 command: run it on a file 15x smaller and see whether the count moves.
+
+## ⛔ RETRACTION: the "2.16x instructions" finding was a BROKEN INSTRUMENT. True ratio is 1.43x.
+
+Both fulcrum Ir layers are wrong, in different ways, and everything I derived from them
+above is void. Hand-measured ground truth — cachegrind, `--cache-sim=no
+--branch-sim=no`, binaries invoked DIRECTLY (no shell wrapper: valgrind does not follow
+`exec` by default and will silently profile only `/bin/sh`), ours = the symbolised
+release build whose output is byte-identical to the shipped one:
+
+```
+                     ours Ir        Ir/B    libdeflate Ir     Ir/B   TRUE ratio
+  movie.mp4     1,650,693,672        128    1,153,377,248       89       1.43
+  dickens       1,385,371,628        114    1,155,052,955       95       1.20
+  engine.wasm     100,723,312        116            —            —        —
+
+  fulcrum why (callgrind) CLAIMED:  movie.mp4 2.16   dickens 1.80
+  fulcrum anatomy --exec CLAIMED:   1,703,992,455 for EVERY file, every level
+```
+
+**`fulcrum why`'s callgrind layer inflates ASYMMETRICALLY** — our arm x12.06, the rival's
+x8.04 on dickens — which manufactures a 1.80 where the truth is 1.20. A symmetric
+inflation would have preserved the ratio; this does not. So the ratio could not be
+rescued from it either.
+
+**`fulcrum anatomy --exec` returns a constant** (see the section above): 1,703,992,455
+for engine.wasm (true 100,723,312 — 17x off), dickens and movie.mp4 alike.
+
+### What is retracted, by name
+
+  * "we execute 2.16x libdeflate's instructions for byte-identical output" — FALSE, it
+    is 1.43x on movie.mp4 and 1.20x on dickens.
+  * "the campaign's 11.9% figure is an L2 number and the real gap at L6 is 116%" —
+    FALSE. `vendor-structure-comparison.md` §4's 11.9% (L2/silesia) is much closer to
+    the truth than anything I claimed; the L6 gap is 20-43%, not 116%.
+  * "our excess is ~610-835 instructions per input byte" — FALSE, it is 19-38 Ir/byte.
+  * "reconciliation resolves in favour of `fulcrum why`" — FALSE. Both layers are wrong.
+
+### What SURVIVES, and is now hand-confirmed rather than tool-reported
+
+  * **libdeflate's instruction count really is content-independent**: 1,153,377,248
+    (movie.mp4) vs 1,155,052,955 (dickens) — **0.15% apart** across inputs with utterly
+    different match structure — while ours moves 19% (1,650M vs 1,385M). Their inner
+    loop has a flat per-position cost; ours does not. This was the interesting half and
+    it holds.
+  * **The excess IS content-dependent, and the "literal path" hypothesis REVIVES.**
+    Excess per input byte: **38 Ir/B on literal-dense movie.mp4 vs 19 Ir/B on
+    match-dense dickens — a clean 2x.** With the broken numbers this looked like 1.37x
+    and I "corrected" the hypothesis to a global overhead. With true numbers the
+    decomposition is roughly: ~19 Ir/byte GLOBAL excess, plus ~19 Ir/byte MORE on
+    literal-dense input.
+  * The `anatomy explain` finding is untouched — it reads deterministic counters out of
+    our own binary, not either broken Ir layer: on movie.mp4 the chain walk is 0.32-0.34
+    at every declared depth from 6 to 600, i.e. the level knobs are INERT on exactly the
+    cells we lose.
+
+### Method receipt — the failure chain, because it repeated three times
+
+1. Quoted `fulcrum why`'s Ir totals without sanity-checking Ir-per-byte. 1,555 Ir/byte
+   for a mostly-literal file should have been implausible on its face; the true 128 is.
+2. When a second instrument disagreed 12x, I "reconciled" by REASONING about which was
+   more plausible instead of measuring a third time.
+3. Diagnosed the disagreement as a thread mismatch, then retracted that diagnosis on the
+   grounds that the numbers did not move between runs — when NOT MOVING WAS THE
+   EVIDENCE (of caching).
+
+The discriminating test in every case was the same and cost one command: **change the
+input and see whether the number moves.** A constant across a 15x size range is not a
+measurement; an Ir/byte that differs 12x from a sane estimate is not a measurement.
+COUNT IT, NEVER INFER IT applies to the instrument as much as to the constant.
+
+Hand-rolling was justified here ONLY because the tool was demonstrably wrong — hard
+stop #6's "if the tool is missing on a box, FIX THE BOX" extends to a tool that lies.
+The fix belongs in fulcrum; these numbers are the reference to fix it against.
