@@ -2359,3 +2359,97 @@ resolution against 0-30 ms runs and produced ratios of 0.0000 and 1.5000 — qua
 not measurement. Discarded unreported. `fulcrum ab paired` exists for exactly this
 regime (paired differences with an A/A certificate); it also REFUSED to run from a dirty
 build between paired arms until told the pin was deliberate. Both guards worked.
+
+### THE ADJUDICATOR ANSWERS BOTH QUESTIONS: clause 5 model VALIDATED, and clause 7 requires ONLY x86_64
+
+`fulcrum try origin/perf/l4-lazy10-real --levels 4,6 --threads 1,4`, trainer, artifact
+`/tmp/fulcrum-try-3425076/try.json`. Verdict **NO-SHIP**. Clause by clause, as the tool
+reports it:
+
+```
+  clause 2 OK   arms differ (binary hashes distinct)
+  clause 1 OK   verify — zero roundtrip failures
+  clause 3 OK   no pass->fail flips across 29 decidable cells
+  clause 4 OK   closed failing cell(s): libdeflate:data.csv:L4:T4:size
+  clause 5 FAIL erosion budget exceeded:
+                  gzip:data.csv:L4:T4:wall        0.1696 -> 0.1844, budget 0.0050
+                  gzip:dickens:L4:T1:wall         0.4654 -> 0.5242, budget 0.0050
+                  libdeflate:data.csv:L4:T4:wall  0.3213 -> 0.3328, budget 0.0050
+                  libdeflate:data.csv:L6:T4:wall  0.2973 -> 0.3119, budget 0.0050
+                  libdeflate:dickens:L4:T4:wall   0.3115 -> 0.3413, budget 0.0050
+  clause 6 FAIL improvement 0.0508 < 2x harm 0.1379
+  clause 7 OK   all required arch(s) covered: x86_64
+  clause 8      (method) paired interleaved, n stated, fixed before the run
+```
+
+**1. THE CLAUSE-5 MODEL IS VALIDATED.** The budget is a flat **0.0050 in every one of the
+five reported cells**, exactly as derived by hand from `promotion-rule.md:40-44` — the
+`0.25 * (1 - old_ratio)` term never binds because every ratio is far below 0.98. The four
+class closures (L1 ht_fast, the T4 seam, zlib depths, L4) rest on arithmetic the tool
+confirms. Worth stating because that model was INFERRED, and inferred constants have
+been wrong repeatedly here.
+
+**2. THERE IS A SECOND BLOCKER I NEVER MODELLED: CLAUSE 6.** "improvement 0.0508 < 2x
+harm 0.1379" — net improvement must exceed total harm by 2x. Every closure this session
+was reported as "fails clause 5"; at least this one ALSO fails clause 6, independently.
+So the classes are further from shippable than I said, not closer.
+
+**3. CLAUSE 7 EXISTS AND REQUIRES ONLY x86_64.** The artifact carries
+`arch: x86_64` and `archs_required: ['x86_64']`. So the promotion rule DOES enforce
+architecture coverage — and the required set is a single arch. Meanwhile `CLAUDE.md`
+STEP 1 states the goal as "on every corpus file, **on both arches**".
+
+**That is the concrete answer to "have we overfit to one machine": the charter asks for
+two arches and the gate requires one.** Not a hidden assumption — a visible, named
+clause with a one-element list. It also means the arch under-scoping in the FALSIFY
+records is downstream of the gate, not a lapse by whoever wrote them: they recorded what
+the gate required.
+
+Recorded as an observation about what the rule enforces, NOT as a proposal to change it.
+The cheap, rule-preserving move remains the one from the previous section: make the arch
+part of every recorded verdict's coordinate, so the question is answerable without
+re-measuring.
+
+**Also surfaced: the tool flags its own VOID cells for re-measurement** —
+`gzip:data.csv:L4:T1:wall`, `gzip:dickens:L4:T4:wall`,
+`libdeflate:data.csv:L4:T1:wall` all came back VOID on one arm. A verdict quoting those
+cells without re-running them would be quoting nothing.
+
+### ⛔ RETRACTED: "size is not arch-invariant". It is. My comparison did not pin `-p`.
+
+I claimed twice that SIZE carries a small architecture term — dickens L1 at 5,080,065 B
+on arm64 against 5,081,832 B on x86, "~0.03%" — and drew from it that cells tying
+libdeflate byte-for-byte on x86 need not tie on arm64. **That is wrong.** Measured with
+the thread count PINNED, same commit, same input:
+
+```
+                              arm64 (M1)     x86_64 (trainer)
+  dickens L1  -p1 PINNED       5,077,406       5,077,406      IDENTICAL
+  dickens L1  -p4 PINNED       5,078,221       5,078,221      IDENTICAL
+  dickens L1  no -p flag       5,080,065       5,081,832      <- what I compared
+                               (10 cores)      (16 cores)
+```
+
+**`-p` defaults to the core count, and `pipelined_block_size` depends on the thread
+count (`pipelined.rs:200`), so two machines at defaults legitimately produce different
+chunk grids and different bytes at the same commit.** A thread-count term wearing an
+arch costume. The 5,077,406 figure also matches the board census exactly, which should
+have been the tell — the census is x86 and my *pinned* arm64 run reproduces it to the
+byte.
+
+Consequences of the retraction:
+  * The tie cage is PORTABLE. Cells that tie libdeflate byte-for-byte on x86 tie on
+    arm64 too. The zero-tolerance analysis does not acquire an extra arch term.
+  * The size board generalises across machines. Every size-only FALSIFY record —
+    `block_split.rs:23/71`, `lazy.rs:192`, `parse/mod.rs:79/89/128/540`,
+    `fast.rs:1549/2085`, `pipelined.rs:80` — is arch-safe by construction.
+  * **METHODOLOGY: any cross-machine size comparison MUST pin `-pN`, or it is comparing
+    chunk grids rather than encoders.** This is the second time today a measurement was
+    invalidated by an unpinned default (the first: `fulcrum anatomy` invoking
+    `CMD -{level} -c {input}` with no `-p`, silently running ours at 16 threads against a
+    single-threaded rival).
+
+The arch concern therefore narrows, and narrowing it is the useful outcome: **it applies
+to WALL verdicts only.** That half stands and is if anything sharper — see the clause-7
+finding above, and the prefetch record where the same change is -10% on M1 and neutral
+on Zen2.
