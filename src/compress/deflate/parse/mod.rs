@@ -1229,8 +1229,28 @@ fn emit_block_static_or_stored(
 ///
 /// FALSIFIED sub-hypothesis: "parse_match_ns wraps a per-POSITION region so its
 /// timer calls dominate". It does not — `parse_match_calls` is 1,396, exactly the
-/// block count, at 344 us/call. The source of the 6x tax is NOT timer granularity
-/// in that region and remains unidentified.
+/// block count, at 344 us/call.
+///
+/// ALSO RULED OUT, by execution: the self-report is not the liar. Timing the
+/// instrumented binary directly against vanilla gives 541.2 ms vs 88.6 ms
+/// (6.11x, n=11) while `cli_ns` self-reports 542.7 ms for the same run — accurate
+/// to 0.3%. The build really is 6x slower, and it is not timer VOLUME either:
+/// 16 sites x ~1,396 calls of `Instant::now()` is microseconds.
+///
+/// LEADING HYPOTHESIS, NOT YET TESTED — stated as a hypothesis because four
+/// mechanism claims were falsified in this same investigation today. The macro
+/// wraps hot-loop bodies (`greedy.rs:108`, `lazy.rs:115`, `ht_fast.rs:165`,
+/// `fast.rs:3078-3278`) in `Instant::now()` ... `elapsed()` plus two relaxed
+/// atomic RMWs. That is an optimization BARRIER across the exact boundary STEP 1
+/// depends on: `#[inline(always)]` fusion of the matchfinder into the parse loop.
+/// If so the tax is not measurement overhead at all, it is lost inlining.
+///
+/// THE TEST, one build: keep `--features anatomy-wall` (so every cfg site and all
+/// the emitter code still compiles in) but make `anatomy_wall_time!` expand to
+/// `$body` alone. Re-time vs vanilla. Returns to ~1.0x => the barrier is the
+/// mechanism and the fix is to move the timers OUT of the fused region (time whole
+/// phases at their call sites, never inside the token loop). Stays ~6x => the
+/// barrier is not it and something else in the feature is responsible.
 ///
 /// Returns the histograms to build the block's codes from.
 fn shaped_freqs_if_smaller(
