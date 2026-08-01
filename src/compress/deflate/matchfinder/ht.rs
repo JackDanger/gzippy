@@ -80,14 +80,29 @@
 //! | **D writes** | **7,320,227** | **26,927,232** | **3.68x** |
 //! | D1 misses | 799,400 | 2,065,774 | 2.58x |
 //!
-//! # THE VENDOR COMPARISON, measured 2026-08-01 — the gap is 1.35x, not 2.19x
+//! # THE VENDOR COMPARISON, measured 2026-08-01
 //!
-//! The dispatch arm in `parse/mod.rs` cited "the 2.19x instruction gap" against
-//! libdeflate. **That number had no defining measurement anywhere in `src/` or
-//! `docs/`** — grep it. The only real figure was the 2.07x in the table above, and
-//! both of its arms are ours. The vendor comparison had never been run.
+//! The dispatch arm in `parse/mod.rs` cites "the 2.19x instruction gap". **That number
+//! IS defined and IS correct**: commit `df475791` (#194) measured "the finder executes
+//! 201,359,346 instructions against `parse::fast`'s 92,057,657 — 2.19x, from probing
+//! twice and hashing a third table" (201,359,346 / 92,057,657 = 2.1873).
 //!
-//! It has now been. Cachegrind, the SAME 6,000,000 B of data.csv, L1, `-p1` (see the
+//! ⚠ RETRACTED, same day: an earlier version of this section said "**That number had
+//! no defining measurement anywhere in `src/` or `docs/`** — grep it." That is FALSE,
+//! and the way it went wrong is worth more than the claim was: **the grep covered the
+//! WORKING TREE, and this project keeps its receipts in COMMIT MESSAGES.** `git log
+//! -S2.19 --all` finds it in two seconds. Before asserting that a record does not
+//! exist, search the history, not just `src/` and `docs/`.
+//!
+//! What is true, and is the only reason this section exists: 2.19x is `ht` against
+//! `parse::fast` — OURS against OURS, like the 2.07x table above. No comparison
+//! against libdeflate had been run. That is what follows.
+//!
+//! And #194 named the MECHANISM correctly at the time — "probing twice and hashing a
+//! third table". The ablation below confirms it exactly: the third table is
+//! 54,690,301 Ir. #194 was right; it simply never priced the alternative.
+//!
+//! Cachegrind, the SAME 6,000,000 B of data.csv, L1, `-p1` (see the
 //! thread trap below), trainer/Intel, `libdeflate-gzip` built with `-g`:
 //!
 //! | arm | total Ir | output |
@@ -161,9 +176,13 @@
 //! the same slice is 881,816, not 881,712, which is how the trap announces itself.
 //!
 //! ⚠ INSTRUMENT: `fulcrum why`'s layer [2] callgrind reported 2,406,284,393 Ir for
-//! the first arm — **12.66x the cachegrind figure**, matching the recorded parser
-//! inflation bug, with `Dr 0` on every row as the corroborating tell. Layer [1]
-//! (position counts) is independent of that path and was used; layer [2] was not.
+//! the first arm — **12.22x the cachegrind figure** (2,406,284,393 / 196,854,205),
+//! matching the recorded parser inflation bug, with `Dr 0` on every row as the
+//! corroborating tell. Layer [1] (position counts) is independent of that path and
+//! was used; layer [2] was not. (This said "12.66x the cachegrind figure", which is
+//! the ratio against the BANKED 190,151,913, not against the cachegrind run it names.
+//! Corrected rather than left, because a mislabelled ratio inside a record-hygiene
+//! note is the same defect the note exists to fix.)
 //!
 //! Reads at 1.92x are the expected price of a second candidate. **Writes at 3.68x are
 //! the regression**: a 2-entry bucket costs TWO stores per insert (shift + head) and

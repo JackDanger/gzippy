@@ -635,10 +635,19 @@ pub(super) fn compress(
         // actually is." BOTH halves of that sentence were wrong, and the wall numbers
         // above are measured against `parse::fast`, i.e. OURS, not against libdeflate.
         //
-        //   * "the 2.19x instruction gap" HAD NO DEFINING MEASUREMENT — grep 2.19 across
-        //     `src/` and `docs/` and the only hit is this sentence citing itself. The
-        //     one real figure was `matchfinder::ht`'s 2.07x, and both of ITS arms are
-        //     ours too. No comparison against libdeflate had ever been run.
+        //   * ⚠ AND THE FIRST HALF WAS RETRACTED THE SAME DAY. This briefly said "the
+        //     2.19x instruction gap HAD NO DEFINING MEASUREMENT — grep 2.19 across
+        //     `src/` and `docs/`". FALSE: `df475791` (#194) measured it — "the finder
+        //     executes 201,359,346 instructions against `parse::fast`'s 92,057,657 —
+        //     2.19x, from probing twice and hashing a third table". The grep covered
+        //     the WORKING TREE; this project keeps receipts in COMMIT MESSAGES, and
+        //     `git log -S2.19 --all` finds it instantly. Search the history before
+        //     asserting a record does not exist.
+        //   * #194 also named the MECHANISM correctly — "hashing a third table" — and
+        //     the ablation below prices it at 54,690,301 Ir, confirming #194 rather
+        //     than overturning it. What #194 never did was price the ALTERNATIVE.
+        //   * What survives: 2.19x is `ht` vs `parse::fast`, ours vs ours, exactly like
+        //     `matchfinder::ht`'s 2.07x. No comparison against libdeflate had been run.
         //   * Measured 2026-08-01 (cachegrind, 6 MB data.csv, L1, -p1, libdeflate built
         //     with -g): ours 196,854,205 Ir vs libdeflate 146,098,195.
         //   * At `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to libdeflate's
@@ -673,6 +682,25 @@ pub(super) fn compress(
         // the CARRIER, not the rule. Do NOT re-measure its size leg to revive it — that
         // leg is banked and deterministic. UNPARK CONDITION: the shared buffering-path
         // LLC excess is closed, at which point re-measure the WALL leg only.
+        //
+        // ⚠ THE RULE HAS THREE MEASURED EXCEPTIONS, and its own stated falsifier was
+        // "any corpus file where the rule's verdict and the measured sign of the
+        // length-3 delta disagree". That falsifier FIRES. Isolated with a forced
+        // `set_allow_len3(false)` build, which reproduces libdeflate byte-exactly:
+        //   * engine.wasm  — 99 distinct literals, rule says ENABLE, length-3 COSTS
+        //                    +922 B (421,935 vs 421,013). Verdict and sign disagree.
+        //   * weights.safetensors — length-3 costs +89,205 B; the cell improves
+        //                    (+0.366% -> +0.107%) but does NOT close.
+        //   * aozora.txt   — whole-file count says DISABLE, but the shipped code samples
+        //                    the first 4 KiB PER BLOCK, so some blocks enable it:
+        //                    +2,061 B vs libdeflate. THE COUNTED QUANTITY IS NOT THE
+        //                    SHIPPED QUANTITY — a whole-file statistic was used to
+        //                    predict a per-block decision. "COUNT it; never INFER it."
+        // Also unrecorded until now: data.sqlite gives back 1.81 MB of MARGIN
+        // (-15.91% -> -4.35% vs libdeflate; still passing), and photo.jpg's margin
+        // erodes 4,816 -> 736 B. sil40 and dd79_text6 CLOSE.
+        // So the rule is directionally right and NOT exact; any unpark must re-derive
+        // it per block, on TUNE only, and re-check the sign on every file.
         //
         // So BOTH FALSIFY notes above stand, and the wall verdict now stands on a
         // vendor measurement rather than on an inference: `main` (`parse::fast`) runs
