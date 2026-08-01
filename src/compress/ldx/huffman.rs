@@ -308,6 +308,99 @@ pub(crate) fn compute_length_counts(
     }
 }
 
+/// C: `reverse_codeword(u32 codeword, u8 len)` (:1105 rbit32 variant / :1146 table
+/// variant)
+///
+/// Reverse the bits of a codeword. DEFLATE requires Huffman codewords to be
+/// transmitted least-significant-bit first, while the canonical assignment below
+/// produces them MSB-first, so every codeword is reversed exactly once here.
+///
+/// # Shape note — the one place this port deviates, and why it is legitimate
+///
+/// The C ships TWO implementations of this function and picks by platform: a
+/// single `rbit32` instruction (:1105) where the architecture has one, and a
+/// 256-entry `bitreverse_tab` doing `tab[cw & 0xff] << 8 | tab[cw >> 8]` (:1146)
+/// otherwise. Both are bit-identical by construction — the C does not consider
+/// either canonical.
+///
+/// Rust's `u16::reverse_bits()` is the same operation, and lowers to `rbit` on
+/// aarch64 and to a table-free shift/mask sequence on x86-64 — i.e. it is the
+/// portable spelling of the C's own fast path. Since the C already treats the two
+/// spellings as interchangeable, matching the *operation* rather than one of the
+/// two *shapes* is faithful. `reverse_codeword_via_table` below is the C's table
+/// variant, kept solely so the test can prove the two agree on every input.
+#[inline]
+pub(crate) fn reverse_codeword(codeword: u32, len: u8) -> u32 {
+    // STATIC_ASSERT(DEFLATE_MAX_CODEWORD_LEN <= 16);
+    const _: () = assert!(super::DEFLATE_MAX_CODEWORD_LEN <= 16);
+    ((codeword as u16).reverse_bits() as u32) >> (16 - len as u32)
+}
+
+/// C: `gen_codewords(u32 A[], u8 lens[], const unsigned len_counts[],
+/// unsigned max_codeword_len, unsigned num_syms)` (:1179)
+///
+/// Generate the codewords for a canonical Huffman code.
+///
+/// * `A` — on entry, the symbols sorted by frequency (from `sort_symbols`, as left
+///   by `build_tree`/`compute_length_counts`). On exit, the CODEWORD for each
+///   symbol, indexed by symbol.
+/// * `lens` — on exit, the codeword length for each symbol.
+/// * `len_counts` — the number of codewords of each length, from
+///   `compute_length_counts`.
+///
+/// # Two passes, and the ordering that makes it canonical
+///
+/// **Pass 1** assigns lengths. It walks lengths from `max_codeword_len` DOWN to 1,
+/// consuming `A` front-to-back. Because `A` is sorted by increasing frequency, the
+/// least frequent symbols are consumed first and get the LONGEST codewords — which
+/// is the whole point. `A[i] & SYMBOL_MASK` recovers the symbol from the packed
+/// entry.
+///
+/// **Pass 2** assigns codewords. `next_codewords[len]` is the next unused codeword
+/// of that length; the recurrence
+/// `next_codewords[len] = (next_codewords[len - 1] + len_counts[len - 1]) << 1`
+/// is the standard canonical-code construction (RFC 1951 §3.2.2). Symbols are then
+/// walked in SYMBOL order, so within a length, codewords are assigned by increasing
+/// symbol value. That ordering is what makes the code canonical and therefore
+/// reconstructible by the decoder from the lengths alone.
+///
+/// Note `next_codewords[0] = 0` is set but never used for a real symbol: length 0
+/// means "symbol does not occur". Assigning to it is harmless and keeps the
+/// indexing uniform, exactly as the C does.
+pub(crate) fn gen_codewords(
+    a: &mut [u32],
+    lens: &mut [u8],
+    len_counts: &[u32],
+    max_codeword_len: usize,
+    num_syms: usize,
+) {
+    let mut next_codewords = [0u32; super::DEFLATE_MAX_CODEWORD_LEN as usize + 1];
+
+    // Pass 1: assign lengths, longest first, to the least frequent symbols.
+    let mut i: usize = 0;
+    for len in (1..=max_codeword_len).rev() {
+        let mut count = len_counts[len];
+        while count != 0 {
+            lens[(a[i] & SYMBOL_MASK) as usize] = len as u8;
+            i += 1;
+            count -= 1;
+        }
+    }
+
+    // Pass 2: canonical codeword assignment.
+    next_codewords[0] = 0;
+    next_codewords[1] = 0;
+    for len in 2..=max_codeword_len {
+        next_codewords[len] = (next_codewords[len - 1] + len_counts[len - 1]) << 1;
+    }
+
+    for sym in 0..num_syms {
+        let len = lens[sym];
+        a[sym] = reverse_codeword(next_codewords[len as usize], len);
+        next_codewords[len as usize] += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +575,109 @@ mod tests {
                 })
                 .collect();
             check_kraft(&freqs, 15);
+        }
+    }
+
+    /// C: `bitreverse_tab` (:1110-1144) — the table variant's lookup table, built
+    /// here the same way the C's generated table is defined: entry i is the 8-bit
+    /// reversal of i.
+    fn bitreverse_tab() -> [u8; 256] {
+        let mut t = [0u8; 256];
+        for (i, e) in t.iter_mut().enumerate() {
+            *e = (i as u8).reverse_bits();
+        }
+        t
+    }
+
+    /// C: the table variant of `reverse_codeword` (:1146-1151), verbatim.
+    fn reverse_codeword_via_table(codeword: u32, len: u8) -> u32 {
+        let tab = bitreverse_tab();
+        let cw = ((tab[(codeword & 0xff) as usize] as u32) << 8)
+            | (tab[(codeword >> 8) as usize] as u32);
+        cw >> (16 - len as u32)
+    }
+
+    /// The port uses `u16::reverse_bits()` where the C picks between `rbit32` and a
+    /// table. All three must agree. This proves it EXHAUSTIVELY over every 16-bit
+    /// codeword and every legal length — 2^16 x 16 cases — so the shape deviation
+    /// documented on `reverse_codeword` is backed by a proof, not an argument.
+    #[test]
+    fn reverse_codeword_agrees_with_the_c_table_variant_exhaustively() {
+        for len in 1..=16u8 {
+            for cw in 0..=u16::MAX {
+                let ours = reverse_codeword(cw as u32, len);
+                let theirs = reverse_codeword_via_table(cw as u32, len);
+                assert_eq!(ours, theirs, "cw={cw:#06x} len={len}");
+            }
+        }
+    }
+
+    /// End-to-end over the whole Huffman chain: sort_symbols -> build_tree ->
+    /// compute_length_counts -> gen_codewords must yield a valid PREFIX-FREE code.
+    ///
+    /// Checked directly: expand every codeword to its full `max_codeword_len`-bit
+    /// prefix set and assert no two symbols' sets intersect. That is the property
+    /// the decoder actually depends on, and it fails loudly if the canonical
+    /// recurrence, the length assignment order, or the bit reversal is wrong.
+    fn check_prefix_free(freqs: &[u32], max_codeword_len: usize) {
+        let num_syms = freqs.len();
+        let mut lens = vec![0u8; num_syms];
+        let mut a = vec![0u32; num_syms];
+        let n = sort_symbols(num_syms, freqs, &mut lens, &mut a);
+        if n < 2 {
+            return;
+        }
+        build_tree(&mut a, n);
+        let mut len_counts = vec![0u32; max_codeword_len + 2];
+        compute_length_counts(&mut a, n - 2, &mut len_counts, max_codeword_len);
+        gen_codewords(&mut a, &mut lens, &len_counts, max_codeword_len, num_syms);
+
+        // Mark every leaf of the codespace covered by each codeword. Codewords are
+        // stored LSB-first (reversed), so read bit j of the codeword as level j.
+        let mut covered = vec![false; 1usize << max_codeword_len];
+        for sym in 0..num_syms {
+            let len = lens[sym] as usize;
+            if len == 0 {
+                assert_eq!(freqs[sym], 0, "sym {sym} has len 0 but nonzero freq");
+                continue;
+            }
+            assert!(len <= max_codeword_len, "sym {sym} len {len} exceeds limit");
+            let cw = a[sym];
+            // Every suffix extension of this codeword is claimed by it.
+            let stride = 1usize << len;
+            let base = cw as usize;
+            assert!(
+                base < stride,
+                "codeword {cw:#x} has bits above its length {len}"
+            );
+            let mut leaf = base;
+            while leaf < covered.len() {
+                assert!(!covered[leaf], "NOT prefix-free: leaf {leaf} claimed twice");
+                covered[leaf] = true;
+                leaf += stride;
+            }
+        }
+        assert!(
+            covered.iter().all(|&c| c),
+            "code is incomplete (codespace gap)"
+        );
+    }
+
+    #[test]
+    fn huffman_chain_yields_a_complete_prefix_free_code() {
+        for &max in &[7usize, 15] {
+            check_prefix_free(&[1, 1], max);
+            check_prefix_free(&[1, 2, 3], max);
+            check_prefix_free(&[1, 1, 1, 1], max);
+            check_prefix_free(&[5, 0, 3, 0, 1, 9], max);
+            check_prefix_free(&[7; 32], max);
+            check_prefix_free(&[100, 1, 1, 1, 1, 1, 1, 1], max);
+            let mut fib = vec![1u32, 1];
+            while fib.len() < 24 {
+                let n = fib[fib.len() - 1] + fib[fib.len() - 2];
+                fib.push(n);
+            }
+            check_prefix_free(&fib, max);
         }
     }
 
