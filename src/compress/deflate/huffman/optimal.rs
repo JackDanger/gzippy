@@ -328,21 +328,7 @@ pub(crate) enum ShapeDepth {
 
 /// In-place histogram smoothing that biases the upcoming RLE encoding toward
 /// reusable runs. Mirrors the C `OptimizeHuffmanForRle` exactly.
-/// Caller-owned-buffer form of [`optimize_huffman_for_rle`]. Identical output; the
-/// only difference is that `good_for_rle` comes from `flags` instead of a fresh
-/// `vec![false; length]`, so a hot caller pays no per-block allocation
-/// (`CLAUDE.md` STEP 1). `flags` is cleared and resized here; its contents on
-/// entry are irrelevant.
-pub fn optimize_huffman_for_rle_into(counts: &mut [usize], flags: &mut Vec<bool>) {
-    optimize_huffman_for_rle_impl(counts, flags)
-}
-
 pub fn optimize_huffman_for_rle(counts: &mut [usize]) {
-    let mut flags = Vec::new();
-    optimize_huffman_for_rle_impl(counts, &mut flags)
-}
-
-fn optimize_huffman_for_rle_impl(counts: &mut [usize], good_for_rle_buf: &mut Vec<bool>) {
     let mut length = counts.len() as isize;
     // Trim trailing zeros — we may not modify them (would lengthen the code).
     loop {
@@ -356,9 +342,7 @@ fn optimize_huffman_for_rle_impl(counts: &mut [usize], good_for_rle_buf: &mut Ve
     }
     let length = length as usize;
 
-    good_for_rle_buf.clear();
-    good_for_rle_buf.resize(length, false);
-    let good_for_rle = &mut good_for_rle_buf[..];
+    let mut good_for_rle = vec![false; length];
 
     // Mark existing reasonable runs so they don't get smoothed away.
     let mut symbol = counts[0];
