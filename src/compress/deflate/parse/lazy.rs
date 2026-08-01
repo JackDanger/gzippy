@@ -6,6 +6,7 @@
 //! the `bsr32` offset-cost tie-break `4*(next_len-cur_len) + (bsr(cur_offset) -
 //! bsr(next_offset)) > 2` (lazy) / `> 6` (lazy2). Levels 5-7 use lazy, 8-9 lazy2.
 
+use super::super::encode_types::HeaderBudget;
 use super::super::bitstream::BitWriter;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
@@ -42,6 +43,7 @@ pub(super) fn run(
     bw: &mut BitWriter,
     lazy2: bool,
     is_last: bool,
+    budget: HeaderBudget,
 ) {
     // Task C (bucket-split-oracle): time the per-`run()` allocation itself
     // (see `anatomy_wall.rs`'s `mf_new_ns` doc comment). Per-invocation, not
@@ -70,6 +72,7 @@ pub(super) fn run(
             BlockRole::Interior
         },
         InputMode::Drain,
+        budget,
     );
 }
 
@@ -90,12 +93,14 @@ pub(super) fn run_resumable(
     lazy2: bool,
     role: BlockRole,
     input_mode: InputMode,
+    budget: HeaderBudget,
 ) -> usize {
     let mut sink = Sink::acquire();
     // See `greedy.rs`'s sibling declaration: one scratch per call, reused
     // across every internal block.
     let mut header_scratch = HeaderScratch::new();
     let mut code_scratch = CodeScratch::default();
+    code_scratch.budget = budget;
     let mut in_next = from;
 
     loop {

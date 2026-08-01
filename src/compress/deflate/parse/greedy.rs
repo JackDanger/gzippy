@@ -5,6 +5,7 @@
 //! take the longest match; accept it when it clears the min-match-length
 //! heuristic (and the short-match offset guard), otherwise emit a literal.
 
+use super::super::encode_types::HeaderBudget;
 use super::super::bitstream::BitWriter;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
@@ -23,6 +24,7 @@ pub(super) fn run(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
+    budget: HeaderBudget,
 ) {
     let mut state = ParseState::new();
     // Seed a preset dictionary into the matchfinder (positions before data_start
@@ -49,6 +51,7 @@ pub(super) fn run(
             BlockRole::Interior
         },
         InputMode::Drain,
+        budget,
     );
 }
 
@@ -78,6 +81,7 @@ pub(super) fn run_resumable(
     bw: &mut BitWriter,
     role: BlockRole,
     input_mode: InputMode,
+    budget: HeaderBudget,
 ) -> usize {
     let mut sink = Sink::acquire();
     // One dynamic-header scratch buffer for the WHOLE call, reused across
@@ -85,6 +89,7 @@ pub(super) fn run_resumable(
     // `build_dynamic_header` allocating a fresh `Vec` per block.
     let mut header_scratch = HeaderScratch::new();
     let mut code_scratch = CodeScratch::default();
+    code_scratch.budget = budget;
     let mut in_next = from;
 
     loop {

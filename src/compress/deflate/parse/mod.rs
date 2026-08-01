@@ -512,6 +512,7 @@ pub(super) fn compress(
     in_end: usize,
     params: &LevelParams,
     is_last: bool,
+    budget: super::encode_types::HeaderBudget,
     bw: &mut BitWriter,
 ) {
     let statics = StaticCodes::get();
@@ -530,6 +531,7 @@ pub(super) fn compress(
             fast::FAST0_BLOCK_LENGTH,
             true,
             fast::LIMIT_HASH_UPDATE_INSERTS_L0,
+            budget,
         ),
         // `l1-tune` (2026-07-22 L1-band search campaign, OFF by default):
         // block length and insert-depth are already plain runtime params to
@@ -641,6 +643,7 @@ pub(super) fn compress(
             fast::FAST_BLOCK_LENGTH,
             true,
             fast::LIMIT_HASH_UPDATE_INSERTS_L1,
+            budget,
         ),
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
@@ -657,14 +660,14 @@ pub(super) fn compress(
                 t.insert_depth,
             )
         }
-        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),
-        Strategy::Lazy => lazy::run(buf, data_start, in_end, params, statics, bw, false, is_last),
-        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, statics, bw, true, is_last),
+        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last, budget),
+        Strategy::Lazy => lazy::run(buf, data_start, in_end, params, statics, bw, false, is_last, budget),
+        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, statics, bw, true, is_last, budget),
         // DETECTOR-GATED LAZY-L3 (`l3-tune` feature): see `gated.rs`'s module
         // doc comment. `level.rs`'s L3 arm is the only producer of this
         // strategy; not reachable from a default (non-`l3-tune`) build.
         Strategy::NearOptimal => {
-            near_optimal::run(buf, data_start, in_end, params, statics, bw, is_last)
+            near_optimal::run(buf, data_start, in_end, params, statics, bw, is_last, budget)
         }
     }
 }
@@ -794,8 +797,19 @@ pub(super) fn parse_resumable(
 ) -> usize {
     let statics = StaticCodes::get();
     match params.strategy {
+        // `parse_resumable` is the SINGLE-PASS STREAMING entry
+        // (`encode_gzip_single_pass`), a T1 path: no header budget to spend.
         Strategy::Greedy => greedy::run_resumable(
-            buf, state, from, in_end, params, statics, bw, role, input_mode,
+            buf,
+            state,
+            from,
+            in_end,
+            params,
+            statics,
+            bw,
+            role,
+            input_mode,
+            super::encode_types::HeaderBudget::Lean,
         ),
         Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
             buf,
@@ -808,6 +822,7 @@ pub(super) fn parse_resumable(
             matches!(params.strategy, Strategy::Lazy2),
             role,
             input_mode,
+            super::encode_types::HeaderBudget::Lean,
         ),
         other => unreachable!("parse_resumable called for non-resumable strategy {other:?}"),
     }

@@ -45,6 +45,7 @@
 //! lives in the shared [`emit_block`]/`emit_tokens` machinery — this file does
 //! not duplicate it.
 
+use super::super::encode_types::HeaderBudget;
 use super::super::bitstream::BitWriter;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::matchfinder::common::{load_u24, load_u32, lz_extend, lz_hash, prefetch_write};
@@ -2836,6 +2837,7 @@ pub(super) fn run<const ACCEL: bool>(
     block_length: usize,
     use_dynamic: bool,
     limit_hash_update_inserts: usize,
+    budget: HeaderBudget,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -2933,6 +2935,7 @@ pub(super) fn run<const ACCEL: bool>(
     // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
     let mut header_scratch = HeaderScratch::new();
     let mut code_scratch = CodeScratch::default();
+    code_scratch.budget = budget;
     let mut pos = data_start;
 
     // CONTENT-ADAPTIVE CHAIN MATCHING state (`l1-tune` only; see

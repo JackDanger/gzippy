@@ -110,7 +110,7 @@ pub fn encode_deflate_bytes_to_sink(data: &[u8], dict: &[u8], level: u32, out: &
     // A standalone single final block: BFINAL is set on the last internal
     // block and no sync-flush marker is appended. `bw.finish()` byte-aligns
     // the tail. This is the T1 / single-member framing.
-    encode_deflate_segment_to_sink(data, dict, level, true, out);
+    encode_deflate_segment_to_sink(data, dict, level, true, encode_types::HeaderBudget::Lean, out);
 }
 
 /// Compress `data` into a raw DEFLATE stream for use as ONE CHUNK of a larger
@@ -141,6 +141,7 @@ pub fn encode_deflate_segment_to_sink(
     dict: &[u8],
     level: u32,
     is_last: bool,
+    budget: encode_types::HeaderBudget,
     out: &mut Vec<u8>,
 ) {
     // Output write-through: emit the DEFLATE stream straight into the caller's
@@ -161,7 +162,7 @@ pub fn encode_deflate_segment_to_sink(
         let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
-        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true);
+        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true, budget);
     } else {
         // Preset-dictionary chunk: prepend the dictionary into one padded buffer
         // [dict | data | pad] and parse over the data region with the dictionary
@@ -175,7 +176,7 @@ pub fn encode_deflate_segment_to_sink(
         buf.extend_from_slice(dict);
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
-        deflate_into(&mut bw, &buf, dict_len, in_end, level, is_last, true);
+        deflate_into(&mut bw, &buf, dict_len, in_end, level, is_last, true, budget);
     }
 
     *out = bw.finish();
@@ -220,6 +221,7 @@ fn deflate_into(
     level: u32,
     is_last: bool,
     sync_flush: bool,
+    budget: encode_types::HeaderBudget,
 ) {
     debug_assert!(buf.len() >= in_end + parse::BUF_PAD);
     if in_end == data_start {
@@ -228,7 +230,7 @@ fn deflate_into(
         emit_stored_block(bw, &buf[data_start..in_end], is_last);
     } else {
         let params = level::params(level);
-        parse::compress(buf, data_start, in_end, &params, is_last, bw);
+        parse::compress(buf, data_start, in_end, &params, is_last, budget, bw);
     }
 
     // Non-final chunk in a CONCATENATED stream: close on a clean byte boundary
@@ -281,7 +283,7 @@ pub fn encode_deflate_slack_padded_to_sink(
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
     let mut bw = BitWriter::from_vec(std::mem::take(out));
-    deflate_into(&mut bw, buf, 0, logical_len, level, true, true);
+    deflate_into(&mut bw, buf, 0, logical_len, level, true, true, encode_types::HeaderBudget::Lean);
     *out = bw.finish();
 }
 

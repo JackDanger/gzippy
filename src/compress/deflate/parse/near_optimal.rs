@@ -23,6 +23,7 @@
 //! final decision `deflate_flush_block` makes. The near-optimal work (which
 //! *path* to code) is the DP's; the coding choice is emit_block's.
 
+use super::super::encode_types::HeaderBudget;
 use super::super::bitstream::BitWriter;
 use super::super::block_split::{BlockSplitStats, NUM_OBSERVATION_TYPES};
 use super::super::costs::{
@@ -506,8 +507,10 @@ pub(super) fn run(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
+    budget: HeaderBudget,
 ) {
     let mut opt = Box::new(Optimizer::new());
+    opt.code_scratch.budget = budget;
     let mut bt_mf = BtMatchfinder::new();
 
     let depth = params.max_search_depth;

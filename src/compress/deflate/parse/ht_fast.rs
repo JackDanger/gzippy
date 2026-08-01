@@ -52,6 +52,7 @@
 //! bounded only by their block span, which is why the store is sized for the
 //! worst case any parser can produce; the seq cap here is far below it.
 
+use super::super::encode_types::HeaderBudget;
 use super::super::bitstream::BitWriter;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
@@ -91,6 +92,7 @@ pub(super) fn run(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
+    budget: HeaderBudget,
 ) {
     let mut mf = HtMatchfinder::acquire();
     let mut in_base = 0usize;
@@ -109,6 +111,7 @@ pub(super) fn run(
     // internal block, instead of `build_dynamic_header` allocating per block.
     let mut header_scratch = HeaderScratch::new();
     let mut code_scratch = CodeScratch::default();
+    code_scratch.budget = budget;
 
     let mut in_next = data_start;
     if data_start > 0 {
