@@ -48,7 +48,30 @@ campaign_rival_args
 # measuring L2 alone and generalising shipped a 6.2% L6 and a 9.9% L9 regression. fulcrum
 # try refuses a level set that does not span shallow<=4 and deep>=6; this default satisfies
 # it rather than discovering the refusal.
+#
+# ⚠ THIS SAMPLES 3 OF THE 9 LEVELS THAT CARRY FAILURES, AND CLAUSE 3 IS BLIND OUTSIDE THEM.
+# Receipt, 2026-08-01: PR #227 scales max_search_depth in `params_parallel`, which applies
+# at EVERY level, and was gated at 2,6,9. It flipped libdeflate:engine.wasm:L8:{T2,T4}:size
+# from PASS to FAIL (libdeflate 396,254 B; ours 396,096 -> 396,302) and the gate could not
+# see the cell. The same blind spot UNDERCOUNTS the benefit: 21 of that change's 30 T4
+# closures are at L5/L7/L8. An 11-hour frozen-box run would have returned SHIP on a
+# clause-3 violation.
+#
+# The SIZE census is deterministic and cheap and `board-size.sh` already defaults to 1-9.
+# The wall census is what makes a full-level sweep expensive. So: keep the WALL at a
+# sampled set, and run the SIZE leg across ALL levels before trusting any verdict.
 LEVELS="${CAMPAIGN_LEVELS:-2,6,9}"
+
+case ",$LEVELS," in
+  *,1-9,*|*"1-9"*) ;;
+  *)
+    note "levels" "WALL is sampled at $LEVELS — clause 3 is BLIND at the other levels."
+    note "levels" "params_parallel-style changes act at EVERY level. Before trusting this"
+    note "levels" "verdict, run the FULL-level size leg (it is deterministic and cheap):"
+    note "levels" "    CAMPAIGN_LEVELS=1-9 make board-size          # this ref"
+    note "levels" "and diff its census against main's. Receipt: #227, engine.wasm L8."
+    ;;
+esac
 OUT="${CAMPAIGN_OUT:-$(campaign_outdir "lever-$(echo "$AFTER" | tr '/' '-')")}"
 
 note "lever" "after=$AFTER set=$SET_NAME levels=$LEVELS"

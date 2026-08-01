@@ -26,12 +26,43 @@ writes are scheduled correctly — the same starvation/causation/perturbation to
 that won parallel decode.
 THE ONLY CORRECTNESS BAR, at every thread count, is VALID GZIP: roundtrip sha256
 through our decoder plus one independent decoder. T>1 may emit different bytes than
-T1. The T>1 size leg is closed by making seams SMALLER — pad choice, chunk grid,
-block splitting — never by reproducing T1's bytes. (User, 2026-07-28, stated three
-times. Byte-identity to a vendor, to our own T1, or to our own previous run is never
-a goal and never a gate. This paragraph previously mandated T1==T4; that is WHY the
-rule had to be restated three times — each correction landed in a leaf doc while the
-root file kept regenerating the cage.)
+T1. Byte-identity to a vendor, to our own T1, or to our own previous run is never a
+goal and never a gate. (User, 2026-07-28, stated three times. This paragraph once
+mandated T1==T4; that is WHY the rule had to be restated three times — each
+correction landed in a leaf doc while the root file kept regenerating the cage.)
+
+**The T>1 size leg is NOT closed by making seams smaller.** This paragraph used to
+say it was — "pad choice, chunk grid, block splitting" — and that was MEASURED FALSE
+on 2026-08-01 from `/root/sizeboard-all-12fcd0ed/census.json`. Pairing every
+libdeflate cell's T1 and T4 rows:
+
+    fail-at-T4-only=109   fail-both=16   pass-both=72
+    T4-only excess: min=2  median=255  max=2,093  total=35,084 B
+    the SAME cells at T1, headroom (rival - ours): min=0  median=0  max=0
+    cells closed if the seam tax were cut 25/50/75/90% -> 0, 0, 0, 0.  By 100% -> 109.
+
+All 109 tie libdeflate BYTE-FOR-BYTE at T1, so the class has ZERO partial credit: a
+2-byte seam fails the cell exactly as hard as a 2,093-byte one. That is why grid
+tuning, pad choice, chunk-count matching and block splitting each closed nothing —
+not because they failed, but because "smaller" is not on this class's scoring
+function. The seam leg is therefore closed by **monotone T1 size wins that buy
+headroom to spend** — a change that can only ever make a block smaller breaks the tie
+in our favour, cannot flip a passing cell under clause 3, and makes the T1 and T4 size
+legs the SAME problem. Do not propose a seam-shrinking lever without first showing the
+target cells have headroom.
+
+**The needed margin is ~0.01%, and Huffman CONSTRUCTION cannot supply it.** The first
+version of this paragraph named "costing an exact package-merge code beside the
+heuristic one" as the example monotone win. That is a CLOSED class — see the binding
+FALSIFY record at `src/compress/deflate/huffman/fast.rs:432`, which built it BOTH ways
+and measured: the unconditional swap is a wash that OPENS cells, and the costed dual
+candidate holds its size invariant (49/49 smaller) at ~0.001% margin while costing
+10-14% WALL and flipping sil40 L6 from win to lose. libdeflate's heuristic length
+limiter is already within 0.001% of exact; the margin we need is an order of magnitude
+larger, so this is not a speed problem and REOPEN requires a genuinely new mechanism.
+Per that record, the remaining candidates are **block BOUNDARIES or the parse** —
+which is where `examples/blockspans` points too: gzip splits on a fixed ~34,000-symbol
+cadence (cv=0.023) while our spans run 8x longer at cv=0.373.
 DONE WHEN: the same per-label bar holds at the default thread count and at T4/T8/T16.
 
 **STEP 3 — the exotic path (-10/-11/-12), separate again.** Our `parse/ultra` crown
@@ -161,7 +192,26 @@ least once in a single session.
    The one real win this session was earned early and landed last, after eight
    failures, only when challenged.
 
-6. **Never hand-roll a measurement.** Check Fulcrum's command list first. A
+6. **Never hand-roll a measurement.** Check Fulcrum's command list first. The list, because
+   "check first" without it is what a session ignored for hours while rebuilding three of
+   these by hand:
+
+   | question | command |
+   |---|---|
+   | why does this cell fail? | `fulcrum why <cell> --ours BIN --rival-cmd 'CMD -{level} -c {input}' --corpus F` |
+   | what could I do about it? | `fulcrum candidates <cell> --repo .` |
+   | is this change good? | `fulcrum try <ref> --threads 1,4` |
+   | did I break CLI behaviour? | `fulcrum dropin --ours BIN --rival gzip=gzip …` |
+   | where do we stand? | `fulcrum board size` / `board wall` |
+   | where does the time go? | `fulcrum profile …` / `ab ablate` / `trace …` (T>1 causation) |
+
+   `why` returns the vendor diff — position counts (match/literal/header/data per byte) name
+   the MECHANISM in one command — and it states which of its four layers it SKIPPED, so a
+   partial run cannot be mistaken for a whole one. `candidates` surfaces FALSIFY records
+   loudly. `dropin` is the THIRD goal axis (CLI behaviour) and went unmeasured for the whole
+   campaign. **`fulcrum try` defaults to `--threads 1`** — a T>1 change judged without
+   `--threads 1,4` is measured on cells it cannot affect, and will read NO-SHIP for the
+   wrong reason. A
    hand-written size audit compared byte counts with no roundtrip check and would
    have scored a corrupt-but-smaller output as a WIN; `sizecensus` already existed
    and VOIDs that. If the tool is missing on a box, FIX THE BOX — a stale
