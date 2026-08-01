@@ -138,10 +138,31 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 32,
             near_optimal: NONE_NO,
         },
+        // L2 KNOBS ARE OURS NOW, NOT libdeflate's. Their preset is depth 6 / nice 10; stock
+        // zlib's L2 (what gzip and pigz run) is chain 8 / nice 16, and we were losing L2 size
+        // cells to the zlib family while emitting libdeflate's exact bytes (see the cage in
+        // docs/target-encoder-and-gap-analysis.md G15/G32).
+        //
+        // The wall budget for this is NOT the 4% slack against libdeflate. Clause 3 protects
+        // PASSING cells, and the libdeflate L2 T1 wall cell ALREADY FAILS (measured: ratio
+        // 1.045 on dd79_bin6, 1.053 on data.csv). The tightest PASSING wall cells at L2 T1 are
+        // pigz at 0.603/0.600 and gzip at 0.544/0.556 — a ~66% budget, not 4%.
+        //
+        // Measured, T1, exact bytes, against the BEST rival on each file:
+        //   data.csv   3,923,216 -> 3,719,456  (-203,760, beats all)
+        //   sil40     16,059,080 -> 15,971,472  (-87,608, beats all)
+        //   dickens    4,772,260 ->  4,732,637  (-39,623, beats all)
+        //   winexe.exe 1,569,179 ->  1,561,372   (-7,807, beats all)
+        // dd79_bin6 is UNMOVED by depth (+47) and needs a different mechanism entirely; do not
+        // attribute it to this change.
+        //
+        // WITHOUT `good_match`, deliberately: pairing these knobs with zlib's early exit was
+        // built and FALSIFIED (G32a) — the exit SHORTENS the search, and data.csv went to
+        // 3,941,022 (worse than baseline) instead of 3,719,456.
         2 => LevelParams {
             strategy: Strategy::Greedy,
-            max_search_depth: 6,
-            nice_match_length: 10,
+            max_search_depth: 8,
+            nice_match_length: 16,
             near_optimal: NONE_NO,
         },
         // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
