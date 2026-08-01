@@ -143,3 +143,56 @@ choose it. Non-negotiable #3 is not engaged.
 - `ht_fast` is still NOT routed. The shipped L1 is `Strategy::Fast` at +1.634%.
   Routing is blocked on #227's `params_parallel` since it must be gated T>1.
 - The corpus here is the 8-file bakeoff set, not the 22-file board.
+
+---
+
+# ⚠ TWO CORRECTIONS TO MY OWN READING OF THE ABOVE
+
+## 1. A TIE IS NOT A LOSS — and that inverts which offset looks best
+
+The goal is *"never LOSE to gzip/pigz/libdeflate/igzip"*. The board classifies
+WIN / TIE / LOSS separately; a tie does not fail. Re-reading the same numbers on
+the bar that actually grades:
+
+| offset | wins | ties | **LOSSES** |
+|---|---|---|---|
+| **0** | 0 | **8** | **0** |
+| 256 | 4 | 1 | 3 |
+| 512 | 4 | 0 | 4 |
+| 4096 (shipped) | 3 | 0 | 5 |
+
+**`off=0` leaves ZERO failing cells** against libdeflate on this sample. I had
+been reading "win 4, lose 3" as better than "tie 8", which is a
+curve-dominance instinct — exactly what non-negotiable #2 says never grades.
+Wins buy nothing; losses are the whole metric.
+
+## 2. ⛔ THIS ENTIRE FILE MEASURES ONE RIVAL. THE BOARD HAS FOUR.
+
+`l1_bakeoff` compares only against `libdeflate-gzip -1`. The board grades
+per-label against **gzip, pigz, libdeflate AND igzip**. That is a serious scope
+limit on every number above, and it has a specific, known consequence:
+
+The binding FALSIFY at `parse/mod.rs:540` records that routing L1 to the
+no-length-3 port **OPENED 7 cells on binaries** — *"on BINARIES we were WINNING
+and the port converges us onto libdeflate, giving the win up"* (armexe.elf was
+0.9658 vs libdeflate, a 3.4% win, and went to 621,027 B).
+
+But removing hash3 makes us **TIE** libdeflate, not lose to it — this file
+measures exactly that. So those 7 opened cells were almost certainly against
+**gzip / pigz / igzip**, where our length-3 advantage was what kept us ahead.
+**`off=0` looking clean here is an artifact of only asking libdeflate.**
+
+That is very likely also why the FALSIFY's attempt 1 died on clause 3 while this
+test sees nothing wrong: clause 3 counts flips against ALL rivals.
+
+### What has to happen before any of this is actionable
+
+Extend `l1_bakeoff` to all four rivals and re-read every table above. Until then:
+
+- The **exact-port result stands** — `ht_fast` minus hash3 equals libdeflate's
+  output size on 8/8 files. That is a statement about libdeflate and needs no
+  other rival.
+- The **content split stands** — hash3 earns on binaries, costs on text.
+- **The offset recommendation does NOT stand.** "256 dominates 4096" and
+  "off=0 has zero losses" are both one-rival readings, and the one rival they
+  omit is where the prior attempt actually died.
