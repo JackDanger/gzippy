@@ -2301,12 +2301,28 @@ this. Had it been run on solvency alone it would read "no effect, not a lever" �
     tie libdeflate BYTE-FOR-BYTE on x86 need not tie on arm64 — and the tie cells are
     the zero-tolerance ones.
 
-### The rule's Scope clause does not mention microarchitecture
+### ⛔ CORRECTED: the rule ALREADY requires multi-arch — clause 7. I looked in the wrong place.
 
 `docs/promotion-rule.md:62-66` names levels, rivals, corpus and both axes: "A change
-evaluated on a NARROWER SLICE HAS NOT BEEN EVALUATED." It does not name the machine.
-Recorded here as an OBSERVATION about what the rule covers — not as a proposal to change
-it, which `CLAUDE.md` forbids.
+evaluated on a NARROWER SLICE HAS NOT BEEN EVALUATED." That section does not name the
+machine — but **clause 7 does, and I missed it**:
+
+    7. Cross-architecture. Rules 3-6 hold on every architecture we measure (aarch64,
+       Intel, AMD Zen2). A win on one architecture and a loss on another is not a win.
+       Wall verdicts come from the frozen box.
+
+**So the multi-arch requirement is ALREADY LAW.** The gap is not the rule — it is
+ENFORCEMENT. `fulcrum try` reports `archs_required: ['x86_64']`, a one-element list, and
+nothing fails closed when the aarch64 and Intel legs simply do not exist. By this
+project's own standard — "a gate may only cite a dataset that exists" — most clause-7
+legs currently cite no dataset.
+
+Note the trailing sentence, "Wall verdicts come from the frozen box." That is what
+practice has read as an override of the first two sentences, and it is why ~10 of ~13
+wall-bearing FALSIFY records are single-box despite clause 7 saying otherwise.
+
+Recorded as an OBSERVATION about enforcement, not a proposal to change the rule, which
+`CLAUDE.md` forbids. The rule text is fine; the instrument does not implement it.
 
 ### Cheapest de-risking, in cost order — none of these is a rule change
 
