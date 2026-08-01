@@ -711,3 +711,33 @@ Size: must not regress any currently-passing L5-L7 cell (clause 3 is absolute), 
 the full 22-file board at T1 and T4. Wall: must stay under the L6 erosion budget against
 gzip/pigz AND not flip any libdeflate cell — the depth lever died on exactly that leg, so
 wall is not optional here and a size-only argument is insufficient (3 for 3 in this class).
+
+## G30 — the depth/size curve SATURATES, and the saturation point is absolute, not relative
+
+The shipped T>1 change (#236) scales `max_search_depth` x4. That factor was a first guess.
+Measuring the curve rather than sweeping for a better number (sil40, T4, exact bytes):
+
+    level      x2           x4           x8           x16          libdeflate
+    L2    15,964,129   15,901,805   15,869,951   15,849,165   16,059,080
+    L6    15,516,055   15,494,305   15,482,185   15,477,116   15,555,063
+    L9    15,451,122   15,450,182   15,450,724   15,450,696   15,452,666
+                        ^ best       ^ WORSE
+
+L9 SATURATES AT x4 AND REGRESSES BEYOND IT. L2 and L6 are still improving at x16 (L2 gains
+another 52,640 B from x4 to x16; L6 another 17,189 B).
+
+The mechanism is that saturation is roughly constant in ABSOLUTE depth, not in the multiplier.
+L9 already searches 600 nodes; x4 puts it at 2,400, past the point where another chain node
+finds a better match often enough to pay for itself — and past it, the extra work can pick a
+different (slightly worse) match at equal length. L2 searches 6; even x16 leaves it at 96,
+still shallow.
+
+So a uniform multiplier is the wrong SHAPE: it over-spends at deep levels and under-spends at
+shallow ones. The structurally right form is a multiplier with an ABSOLUTE CAP — around x8
+capped near 2,400 would take L2 to 48 and L6 to 280 (both at their x8 sizes) while leaving L9
+at its x4 optimum, i.e. strictly better than the shipped x4 on all three.
+
+NOT CHANGED HERE. #236's x4 is under graded adjudication on the frozen box with a SHIP verdict
+already banked on the size axis (39 cells closed, 0 opened). Hard stop #5 says land gated work
+before starting new work; changing the constant now would void that run. The cap is the
+follow-up, and it must be re-gated on its own.
