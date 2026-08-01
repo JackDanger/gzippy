@@ -88,3 +88,58 @@ confirmed hypothesis several hours.
 - `ht_fast` is NOT routed in production; the shipped L1 is `Strategy::Fast`, at
   +1.634% vs libdeflate. See `docs/board/l1-next-lever.md` for the routing
   blocker (#227's `params_parallel`, since it must be gated T>1).
+
+---
+
+# ⭐ MEASURED: offset 256 STRICTLY DOMINATES 4096 on the per-label bar
+
+The separation the section above predicted exists, and it is large. Same test,
+same 256 KB blocks, `HT_MAX_LEN3_OFFSET` swept by hand (one build per value,
+each written to its own file):
+
+| file | off=0 | **off=256** | off=4096 (shipped default) |
+|---|---|---|---|
+| armexe.elf | 0 | **−2177** | −4013 |
+| data.parquet | 0 | **−428** | −984 |
+| data.csv | 0 | **−253** | −210 |
+| engine.wasm | 0 | **0** | +61 |
+| minjs.min.js | 0 | **−274** | +313 |
+| data.json | 0 | **+102** | +449 |
+| aozora.txt | 0 | **+163** | +550 |
+| dickens | 0 | **+232** | +644 |
+
+    binaries (3):  off=256  −2858   vs  off=4096  −5207   (keeps 55% of the gain)
+    text     (5):  off=256   +223   vs  off=4096  +2017   (sheds 89% of the cost)
+
+**Per-file, which is the only thing that grades:**
+
+    off=4096   win 3, lose 5
+    off=256    win 4, TIE 1, lose 3
+
+Two files flip outright — `minjs.min.js` +313 → **−274**, `engine.wasm` +61 → an
+exact tie — and `data.csv` is *better* at 256 (−253) than at 4096 (−210). The
+three remaining losses shrink from +449/+550/+644 to **+102/+163/+232**.
+
+## Why this is principled, not fitted
+
+`HT_MAX_LEN3_OFFSET` is gzip's TOO_FAR rule: *a length-3 match beyond this
+offset costs more bits than three literals*. That is a BIT-COST statement, and
+bit cost depends on the Huffman code — which differs sharply between text and
+binary. 4096 is gzip's constant, inherited unexamined. The measurement says the
+tradeoff for THIS matchfinder flips much earlier.
+
+It is also a STATIC RULE, not a content detector: nothing inspects the data to
+choose it. Non-negotiable #3 is not engaged.
+
+## What is NOT claimed
+
+- **256 is not established as the optimum.** It was the SMALLEST value probed;
+  the trend suggests lower may be better still for text. 64 and 128 are untested,
+  and 512/1024/2048 were still building when this was written.
+- 256 KB blocks, L1 only, SIZE only, 8 files, one box. Says nothing about the
+  wall — and the wall is what killed this lever at T1 before. A smaller offset
+  should if anything be CHEAPER (fewer length-3 candidates accepted), but that is
+  an argument, not a measurement.
+- `ht_fast` is still NOT routed. The shipped L1 is `Strategy::Fast` at +1.634%.
+  Routing is blocked on #227's `params_parallel` since it must be gated T>1.
+- The corpus here is the 8-file bakeoff set, not the 22-file board.
