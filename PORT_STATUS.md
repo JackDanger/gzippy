@@ -27,44 +27,91 @@ divergence, consistent with L2/L4-L9 being 154/154 byte ties.
 27 wins, 17 losses). **15 of the 17 are L1.** So L1 — where we ship igzip's chainless
 finder instead of their `ht_matchfinder` — is essentially the entire phase-1 gap.
 
-## Done (6 commits, 17 tests passing)
+## Done (9 commits, 47 tests passing) — **`ldx` NOW EMITS VALID DEFLATE BYTES**
 
-| C | item | commit |
-|---|---|---|
-| `deflate_constants.h` | constants, verbatim | `4e35dc5c` |
-| `:761-814` | `heapify_subtree` / `heapify_array` / `heap_sort` | `4e35dc5c` |
-| `:848` | `sort_symbols` (counting sort + heapsort tail) | `bb0d4d47` |
-| `:941` | `build_tree` (Van Leeuwen two-queue) | `65d60dd2` |
-| `:1024` | `compute_length_counts` (heuristic length limiter) | `17a3297d` |
-| `:1105/:1146`, `:1179` | `reverse_codeword`, `gen_codewords` | `71829415` |
-| `:1320` | `deflate_make_huffman_code` | `475ae4d5` |
+| C | item | file | commit |
+|---|---|---|---|
+| `deflate_constants.h` | constants, verbatim | `mod.rs` | `4e35dc5c` |
+| `:761-814` | `heapify_subtree` / `heapify_array` / `heap_sort` | `heap.rs` | `4e35dc5c` |
+| `:848` | `sort_symbols` (counting sort + heapsort tail) | `huffman.rs` | `bb0d4d47` |
+| `:941` | `build_tree` (Van Leeuwen two-queue) | `huffman.rs` | `65d60dd2` |
+| `:1024` | `compute_length_counts` (heuristic length limiter) | `huffman.rs` | `17a3297d` |
+| `:1105/:1146`, `:1179` | `reverse_codeword`, `gen_codewords` | `huffman.rs` | `71829415` |
+| `:1320` | `deflate_make_huffman_code` | `huffman.rs` | `475ae4d5` |
+| `:238-320` | the six RFC 1951 tables | `tables.rs` | `9fabdda8` |
+| `:1455` | `deflate_get_offset_slot` | `tables.rs` | `9fabdda8` |
+| `:325-350` | `deflate_{codewords,lens,codes,freqs}` | `codes.rs` | `9fabdda8` |
+| `:1416`, `:1433` | `deflate_make_huffman_codes`, `_init_static_codes` | `codes.rs` | `9fabdda8` |
+| `:1484`, `:1572` | `deflate_compute_precode_items`, `_precompute_huffman_header` | `precode.rs` | `9fabdda8` |
+| `:1640` | `deflate_compute_full_len_codewords` | `length.rs` | `9fabdda8` |
+| `:667-750` | output bitstream, `ADD_BITS`, `FLUSH_BITS`, `CAN_BUFFER` | `bitstream.rs` | `21cac499` |
+| `:354`, `:1662`, `:1708` | `deflate_sequence`, `WRITE_MATCH`, **`deflate_flush_block`** | `flush.rs` | `21cac499` |
 
-The Huffman construction chain is COMPLETE and verified: Kraft equality, prefix-free
-+ complete codespace, exhaustive `reverse_codeword` check (2^16 x 16 cases) against
-the C's own table variant, and all three degenerate `num_used_syms < 2` variants
-pinned explicitly.
+Verified by: Kraft equality; prefix-free AND complete codespace; an exhaustive
+`reverse_codeword` differential (2^16 x 16 cases) against the C's own table variant;
+all three degenerate `num_used_syms < 2` variants; the offset-slot map checked over
+the WHOLE range 1..=32768; precode items round-tripped through an independent RFC
+1951 decoder; and **whole DEFLATE streams round-tripped through flate2** (literals,
+matches at lengths 3..258, offsets 1..32768, stored-block splitting at 65535, a
+short-buffer overflow, and two blocks sharing a partial byte).
+
+**The cost model is self-checking and the check is PROVEN LIVE.** The C's closing
+`ASSERT(8 * (out_next - os->next) + bitcount - os->bitcount == best_cost)` drives the
+single output-buffer bounds check for a whole block. Perturbing `best_cost` by one
+bit fails 6 of the 7 flush tests — verified by doing it, not by assuming the
+assertion compiles in.
+
+### Three things the port had to get exactly right, each pinned by a test
+
+1. `deflate_get_offset_slot`'s `n = (256 - offset) >> 29` is an **unsigned wrap**.
+   Signed, it gives -1 instead of 7 and every offset above 256 lands in the wrong slot.
+2. `DeflateLens` must be `#[repr(C)]` with `offset` at byte 288, because
+   `deflate_precompute_huffman_header` memmoves the offset lengths down and RLEs
+   ACROSS the join — a zero run spanning the boundary is ONE precode item.
+3. The precode's nonzero-run threshold is `>= 4`, not `>= 3`.
+
+### Two known-and-pinned faithful oddities
+
+* **The header restore leaves residue.** `deflate_precompute_huffman_header`'s second
+  memmove does not erase the copy the first one made, so litlen lengths
+  `[num_litlen_syms, +num_offset_syms)` hold stale offset lengths on return. The C
+  does the same. Unobservable for two separately-checked reasons (those symbols have
+  zero frequency by construction; the next block rewrites all 288 lengths). Pinned by
+  `precompute_leaves_the_same_residue_as_c` so a future tidy-up fails a test.
+* **The tie-break order is observable.** `MIN(dynamic, MIN(static, uncompressed))` then
+  `if (best == uncompressed) ... if (best == static)` sends ties to uncompressed, then
+  static, then dynamic. Reordering, or `<=` instead of `==`, is a different valid
+  stream.
+
+### Deliberate, behaviour-free divergences (all stated at the site)
+
+* The C's `union o { precode; length; }` is two separate types — storage economy, not
+  behaviour, and unioning it in Rust would need `unsafe` for nothing.
+* `deflate_init_static_codes` takes its scratch frequency table as a parameter rather
+  than aliasing the live one.
+* `next`/`end` are indices into a `&mut [u8]`, not raw pointers.
+* The live code table is a flag plus a clone, not a rebindable pointer — the borrow
+  checker cannot see that writing `c.o_length` does not alias the table being read.
 
 ## Next, in dependency order
 
-1. `:1455` `deflate_get_offset_slot`; `:1484` `deflate_compute_precode_items`;
-   `:1572` `deflate_precompute_huffman_header`; `:1640`
-   `deflate_compute_full_len_codewords`.
-2. `:1708` **`deflate_flush_block`** — 334 lines, the big one. **First point where a
-   real byte-level differential against libdeflate is possible.** Get here before
-   porting any parser; it is the oracle everything downstream needs.
-3. `:2094-2225` block-split stats. NOTE our `block_split.rs:192-200` computes the
+1. `:2043` `deflate_finish_block`; `:2224-2270` sequence store
+   (`deflate_begin_sequences` / `_choose_literal` / `_choose_match`).
+2. `:2094-2225` block-split stats. NOTE our `block_split.rs:192-200` computes the
    cutoff in `u64` where the C uses `u32` AND WRAPS — port the C's widths here.
-4. `:2224-2270` sequence store (`deflate_begin_sequences` / `_choose_literal` /
-   `_choose_match`); `:2272-2392` the min-match-len helpers.
-5. Matchfinders: `ht_matchfinder.h` FIRST (it is the 15-cell L1 gap). **Note our
+3. `:2272-2392` the min-match-len helpers.
+4. Matchfinders: `ht_matchfinder.h` FIRST (it is the 15-cell L1 gap). **Note our
    `matchfinder/ht.rs` is NOT a port of it** — it adds a length-3 table the C
    explicitly refuses (`ht_matchfinder.h:38-40`) and imports `HT_MAX_LEN3_OFFSET`
    from a different C function. Read the binding FALSIFY at `parse/mod.rs:540` before
    touching this: both prior attempts are already recorded.
-6. `:2394-2843` the four compressors: `_none` / `_fastest` / `_greedy` /
-   `_lazy_generic`.
-7. `:2845-3853` near-optimal (costs, `deflate_find_min_cost_path`).
-8. `:3874` `libdeflate_alloc_compressor_ex` — the level->config map, ported verbatim.
+5. `:2394-2843` the four compressors: `_none` / `_fastest` / `_greedy` /
+   `_lazy_generic`. **First point an end-to-end sha256 differential against
+   `libdeflate-gzip` is possible.**
+6. `:2845-3853` near-optimal (costs, `deflate_find_min_cost_path`). This also supplies
+   `deflate_flush_block`'s missing `sequences == NULL` arm (`:1935`), which walks
+   `optimum_nodes` — deliberately left out of the signature rather than stubbed.
+7. `:3874` `libdeflate_alloc_compressor_ex` — the level->config map, ported verbatim.
 
 ## Standing cautions
 
