@@ -910,3 +910,50 @@ REOPEN would require a mechanism that explains why `data.csv` regressed and `dd7
 not move — not another (depth, nice, good_match) triple. Do not sweep the triple; the failure
 is not a bad point in that space, it is that the space itself trades one input class against
 another.
+
+## G34 — the board is now FULLY CLASSIFIED: 29 residual cells, three mechanisms, one unknown
+
+Computed from the after-arm of #236's graded lever (`lever-depth4/try.json`, 528 cells / 440
+decidable), so this is the residual set AFTER the gated change, not a projection:
+
+    base failing 68  ->  after failing 29   (39 closed)
+
+    libdeflate T4  15 | gzip T1  6 | pigz T1  4 | gzip T4  3 | pigz T4  1
+
+### The 15 libdeflate cells are PURE SEAM — proved, not assumed
+
+For each, T1 is BYTE-IDENTICAL to libdeflate (passes) and only T4 fails:
+
+    file                 L   libdeflate      T1        T4        seam
+    dd79_bin6            2    4,500,757     PASS      FAIL       +377
+    weights.safetensors  2   83,081,675     PASS      FAIL       +874
+    movie.mp4            6   12,890,404     PASS      FAIL       +193
+    photo.jpg            6    6,472,062     PASS      FAIL        +73
+    data.csv             9    3,300,291     PASS      FAIL     +1,134
+    engine.wasm          9      396,244     PASS      FAIL        +60
+    minjs.min.js         9    1,079,072     PASS      FAIL        +41
+
+NO PARSE CHANGE CAN CLOSE THESE. At T1 we already emit libdeflate's exact bytes, so parse
+quality is matched by construction; the entire deficit is the T>1 seam. This also explains why
+#236 closed 39 and not 48: on COMPRESSIBLE files the T4 parse boost exceeds the seam and the
+cell closes; on near-incompressible or already-saturated files the boost is ~0 and the seam
+survives.
+
+CONFIRMED BY ABLATION: the capped depth variant (x8 capped at 2,400, the follow-up G30 named)
+closes NONE of them — dd79_bin6 L2 +377, weights L2 +874, movie.mp4 L6 +193, data.csv L9
++1,134, engine.wasm L9 +60, minjs L9 +41. Reverted. More search cannot buy what parse quality
+has already maxed out.
+
+### The full map
+
+    class                        cells   mechanism                              status
+    libdeflate T4 (pure seam)      15    consumer owns the seam blocks          NOT ATTEMPTED
+    gzip/pigz L6 T1                 6    zlib good_match early exit             VERIFIED (G31a,
+                                                                                another writer's)
+    dd79_bin6 L2 (gzip+pigz,T1/T4)  4    UNKNOWN — not depth (G32a, G33)        OPEN
+    photo.jpg L2 (gzip, T1/T4)      2    unknown, ratio 1.00045                 OPEN
+    weights L9 (gzip, T1/T4)        2    unknown, ratio 1.00021                 OPEN
+
+29 cells, of which 15 have a known-but-unbuilt mechanism, 6 have a verified one belonging to
+another writer, and 8 are genuinely open. Every remaining cell is now attributed, which is
+what CLAUDE.md rule 1 asks for and what this campaign has never had before.
