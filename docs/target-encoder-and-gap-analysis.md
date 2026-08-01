@@ -1582,3 +1582,41 @@ not the problem, the block structure is.
 
 Four mechanisms, four classes, no residue. That is the first time this campaign has had every
 failing cell attributed to a named, measured cause.
+
+### G37a — WHY we under-split: our block-end check has no SPARSITY term, only a drift detector
+
+`block_split.rs` is a port of libdeflate's `do_end_block_check`, which fires on DISTRIBUTION
+DRIFT — it compares the symbol distribution of recent observations against older ones and ends
+the block when they diverge. Verified: `grep -c 'sparse|literal_frac|match_frac|matches_per'
+src/compress/deflate/block_split.rs` returns **0**. There is no sparsity term anywhere.
+
+ON NEAR-INCOMPRESSIBLE DATA THE DISTRIBUTION DOES NOT DRIFT. photo.jpg and weights.safetensors
+are close to uniform, so recent and older observations look alike, the detector never fires,
+and we emit very few blocks — 15,374 header bits on photo.jpg against gzip's 103,925.
+
+gzip carries a SECOND, independent rule that fires on SPARSITY rather than drift: every 4096
+symbols (`(last_lit & 0xfff) == 0`, level > 2) it ends the block early if matches are sparse
+and the estimated output is under half the input (`vendor/gzip/trees.c:995-1005`). That rule is
+exactly what covers the case libdeflate's drift detector cannot see, and it is why gzip buys
+7-9x our header mass and wins on total.
+
+`fulcrum candidates` lists this as **[D3] Periodic estimated-cost early flush — Ours: NO (we
+have D2 instead, which subsumes it)**. THE "SUBSUMES" CLAIM IS FALSE, and this is the
+measurement that shows it: D2 is the drift detector, and drift is precisely the signal that
+goes silent on the inputs where D3 fires.
+
+NOT BLOCKED BY THE EXISTING FALSIFY RECORDS, and this matters because `candidates` surfaces
+three of them next to [D3]. All three (`parse/mod.rs:1431` batched-flush, `:1564` amortized
+running bit-budget flush, `:1646` per-group static flush) are about BITWRITER FLUSH CADENCE and
+the ICF/emit representation — instruction-count and wall concerns, measured in bits committed
+per `flush_word_unchecked` call. gzip's [D3] is a BLOCK-BOUNDARY heuristic for SIZE. They share
+the word "flush" and nothing else. Any implementation must say so explicitly in its commit
+rather than relying on this note.
+
+SUPPORTED BY AN EARLIER FALSIFICATION OF MINE: the tail-guard probe suppressed splits near
+chunk ends and made every file monotonically WORSE, because well-placed splits earn their
+headers. That result and this one agree — we split too little, not too much.
+
+IMPLEMENTATION NOTE: this changes T1 output on every file, so it needs the full graded gate,
+and the tied-file caution from G33 applies — the cells where we are byte-identical to
+libdeflate have zero tolerance and must be checked first.
