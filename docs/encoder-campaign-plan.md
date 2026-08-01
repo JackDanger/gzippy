@@ -681,3 +681,71 @@ across aarch64/Zen2/Intel — verified — so size needs one box only. Neither r
 currently passes the full Gate-0 suite (`profile rss` fails on both, `lib levelsweep` on
 solvency) and `make deploy` correctly refuses to certify them; fix those two gates
 before trusting a fresh instrument there.
+
+## WHY EVERY SIZE LEVER DIES: clause 5's budget permits ~1% of self-slowdown
+
+Three independent size levers were measured this session. All three had strong,
+verified SIZE results and all three died on the WALL, in the same clause, by a similar
+factor. Put side by side (all `fulcrum ab paired --mode compress`, n=15, /dev/null both
+arms, A/A clean, trainer — SCREENS, `freeze_checked=false`, no frozen-box claim):
+
+```
+lever                        cell                        base -> new     erosion   budget  over
+ht_fast@256 (L1)             gzip:minjs.min.js:T4       0.1949 -> 0.2090  0.0141   0.0050  2.8x
+L4 Lazy(12,30)               gzip:dickens:L4:T1         0.4619 -> 0.5507  0.0888   0.0050 17.8x
+(recorded) L1 synthesis      gzip:data.json:T1          0.4549 -> 0.6861  0.2312   0.0050 46.2x
+```
+
+**The mechanism is arithmetic, and it is worth stating plainly.** Clause 5's budget is
+an ABSOLUTE 0.0050 on the ratio `ours / rival`. On a cell where we are already ~2x
+faster than gzip (ratio ~0.46), a 1% self-slowdown moves the ratio by 0.0046 — the
+entire budget. On a T4 cell where we are 5x faster (ratio ~0.19), 2.5% of self-slowdown
+spends it. **No parse-strengthening change costs less than that.** Lazy searches more
+than greedy; a 2-way bucket probes more than one; a deeper chain walks further. The
+cheapest of the three above still cost 11%.
+
+So the binding constraint on the SIZE board is not any particular mechanism — it is
+that clause 5, as configured, prices any wall cost against a rival we are already
+beating several times over. A cell can stay comfortably PASSING (dickens L4 T1 goes
+0.4619 -> 0.5507, still 1.8x faster than gzip) and still fail the clause by 17.8x.
+
+**This is recorded as an OBSERVATION, not a proposal.** `CLAUDE.md`: "One rule per
+change, declared once. If a promotion rule fails, the change is reverted or the change
+is fixed. Re-writing the rule to fit the result is not allowed." Nothing here rewrites
+it. But the pattern is now 3-for-3 and the next session should know that "the size
+lever failed" has meant "it cost more than 1-2% of wall" every time, not "the size was
+not there".
+
+### Candidate 1 (L4 Lazy(12,30)) — the full verified result
+
+SIZE, local arm64, vanilla release, T1, 11 TUNE members:
+  * per-label vs libdeflate -4: **11/11 EXACT BYTE TIES -> 11/11 WINS**
+    (dickens -66,099 B; data.csv -200,488 B; tool.bin -357,471 B; movie.mp4 -615 B)
+  * P4 monotonicity violations across 11 files x L2..L9: **13 -> 4**. It fixes 9 of the
+    10 L3->L4 inversions and shrinks the tenth 99% (movie.mp4 +1,099 -> +10 B). The 3
+    remaining are L8->L9, PRE-EXISTING and untouched by this change.
+  * CORRECTNESS: 0 failures in 84 checks (7 files x L3,L4,L5 x T1,T4 x gzip -dc AND
+    libdeflate-gzip -dc, sha256 vs original).
+
+WALL, measured directly (not derived), dickens L4 T1:
+  * gzip: 0.4619 -> 0.5507 — PASSING both sides, erosion 0.0888, **17.8x over budget**
+  * libdeflate: 1.0239 -> 1.1953 — **the cell was ALREADY FAILING at 1.0239**, so this
+    is not a clause-3 flip; it makes an already-lost cell worse.
+  * self-tax: T1 1.1844, T4 1.1137 (dickens); T1 1.1203, T4 1.1232 (data.csv)
+
+VERDICT: NO-SHIP as-is on clause 5. The size case stands and does not expire — this is
+the monotone T1 headroom the seam class needs, and it is the first change measured this
+session that converts the L4 tie cage into wins on every file.
+
+### Correction to the sub-agent analysis that proposed it
+
+An Opus sub-agent proposed this candidate and reported "P4 clean 11/11". **Re-verified by
+execution: it is 10/11.** movie.mp4 still inverts at L3->L4 by +10 B (L3 12,890,766 ->
+L4 12,890,776), and the agent's movie.mp4 figure (12,890,519) does not reproduce on a
+vanilla table edit (12,890,776). The likely cause is method: `ladder_tune::apply` is
+called from `params()` for EVERY level, so a `GZIPPY_LADDER=lazy:12:30` override makes
+all levels identical and P4 hold trivially. The agent's own §1 baseline table is
+per-level and looks sound; only the candidate rows are suspect.
+Per the adversarial-review lesson — re-verify every reviewer finding by execution; one
+was confidently wrong — the numbers above are all from a real table edit on a vanilla
+build.
