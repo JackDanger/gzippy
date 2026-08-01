@@ -2025,3 +2025,56 @@ NEXT, and NOT done here: size + wall on the full TUNE set at Lazy(8,30) and Lazy
 then `fulcrum try --threads 1,4` on the frozen box. Two files is a direction, not a
 verdict — this document has already been burned once this session by generalising from
 a subset.
+
+### ⛔ FALSIFIED: Lazy(8,30) is NOT cost-neutral. 10 of 11 files exceed the clause-5 threshold.
+
+The section above argued Lazy(8,30) is cost-neutral because "lazy runs ~2 searches per
+position, so Lazy(8) ~= 16 probes = the shipped Greedy(16,30)". **That is an INFERENCE,
+and it is wrong.** Measured across the full TUNE set (`fulcrum ab paired --mode
+compress`, n=9, /dev/null both arms, T1, L4, trainer; ratios are Lazy(8,30) vs shipped):
+
+```
+  file            wall     size      within the 1.011 clause-5 threshold?
+  data.csv       1.0001  0.955756    YES  (wall-neutral AND 161,310 B smaller)
+  aozora.txt     1.0158  1.005166    no   -- and its SIZE is WORSE than shipped
+  data.json      1.0256  0.954288    no
+  symbols.dwarf  1.0416  0.983963    no
+  dickens        1.0527  0.994396    no
+  tool.bin       1.0680  0.988007    no
+  minjs.min.js   1.0691  0.985189    no
+  movie.mp4      1.0751  0.999937    no
+  data.parquet   1.0954  0.994415    no
+  engine.wasm    1.0967  0.982711    no
+  armexe.elf     1.0994  0.987064    no
+```
+
+**Only data.csv clears it.** The threshold comes from the clause-5 arithmetic: erosion =
+`ratio_vs_gzip x (self_tax - 1)`, so at a T1 ratio of ~0.46 the 0.005 budget permits a
+self-tax of only 1.011. Ten files land at 1.016-1.099.
+
+**The probe model was too crude.** Lazy's cost is not merely "one extra search of depth
+D": there is deferral bookkeeping, a second candidate to hold live, and an extra branch
+per position, none of which the 2D estimate captured. COUNT IT, NEVER INFER IT applies
+to cost models exactly as much as to constants — this is the fourth inferred figure to
+fail this session.
+
+### Correction to the frontier claim
+
+The previous section said "the shipped Greedy(16,30) is DOMINATED". **It is not.** It is
+dominated on SIZE (0/11 per-label against Lazy(8,30)'s 10/11) but it is the CHEAPEST
+point on wall — every lazy variant measured costs more on 10 of 11 files. Greedy(16,30)
+sits on the Pareto frontier; it is simply at the wall-favouring end of it.
+
+### What survives
+
+  * **data.csv remains strictly Pareto-dominant**: 3,645,905 B (an exact tie with
+    libdeflate-4) -> 3,484,595 B, i.e. **161,310 B smaller at a wall ratio of 1.0001**.
+    One file is not a lever, but it does prove the frontier has slack somewhere.
+  * The SIZE frontier stands and was separately measured: 9/11, 10/11, 11/11, 11/11 at
+    depths 6/8/10/12 against the shipped 0/11.
+  * The P4 result stands: violations 13 -> 4 at Lazy(12,30).
+
+**The L4 class is now closed on the wall the same way L1 and the seam were**: the size
+is available, the wall budget is not. That is three independent classes killed by
+clause 5 today, which is itself the finding —
+see `project_clause5_is_the_binding_constraint`.
