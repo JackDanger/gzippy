@@ -916,6 +916,42 @@ fn bsr32(x: u32) -> u32 {
 /// Emit the accumulated block, choosing the cheapest of stored / static-Huffman
 /// / dynamic-Huffman. `block_start` is the absolute offset of the block's first
 /// byte in `buf`.
+/// PARKED 2026-08-01 — RLE-shaped histogram, gated to the T>1 path. A STRICT SIZE
+/// WIN that dies on clause 5, not on the encoder. Branch `lever/rle-shape-t4`
+/// (`b9cf59ef`), adjudicated NO-SHIP; artifact
+/// `~/www/gzippy-bench/campaign/lever-lever-rle-shape-t4/try.json`.
+///
+/// THE MECHANISM. Beside the true histogram, cost a second one shaped the way zopfli's
+/// `TryOptimizeHuffmanForRle` shapes it, and keep it only when the header comes out
+/// STRICTLY smaller. A `HeaderBudget` enum threaded to this function makes it
+/// `Generous` on the T>1 path and `Lean` everywhere else, so T1 never pays.
+///
+/// WHAT IT BOUGHT (deterministic, both censuses over the same 792 comparable cells):
+///     23 size cells CLOSED, 0 opened — all `libdeflate_T4`, spread over 7 levels
+///     T1 output byte-identical to main: 198/198 (22 corpus files x levels 1-9)
+///     T4 strictly smaller on every file checked (-151 .. -208 B on armexe.elf)
+/// It cannot make a block bigger: the shaped code is adopted only when it is cheaper.
+///
+/// WHAT IT COST. `make lever ARGS="--threads 1,4"`, NO-SHIP on clause 5 with 25 cells
+/// over the 0.005 erosion budget: 18 at T4, 12 of them against pigz. `Generous` runs a
+/// second symbol-sort + package-merge per block, which is real work on the exact path
+/// it is gated to. That is the FOURTH size lever to die in this clause.
+///
+/// ⚠ THE EROSION MAGNITUDES ARE NOT TRUSTWORTHY AND MUST NOT BE QUOTED. 7 of the 25
+/// cells were T1, where the output is provably byte-identical, so those readings are
+/// impossible and the run was contaminated: ~12 `fulcrum ab paired` jobs were run on
+/// the same laptop during rows 176-264 of it, and `scripts/campaign/lever.sh` invokes
+/// no box-freeze guard. The VERDICT stands (18 T4 cells, real mechanism, 4-8x over
+/// budget); the NUMBERS need an idle re-run before any successor prices against them.
+///
+/// WHAT WOULD REVIVE IT. Not a re-run, and not tuning the shaping. Only a way to
+/// obtain the shaped candidate for materially less than a second package-merge —
+/// or a clause-5 budget argument made at a coordinate where T4 wall slack is real
+/// rather than assumed. Compose it with a T4 wall win before re-adjudicating; on its
+/// own the size case is already proven and already insufficient.
+///
+/// Do not re-derive the size win. It is measured, it is 23 cells, and it is not the
+/// part that fails.
 fn emit_block(
     bw: &mut BitWriter,
     buf: &[u8],
