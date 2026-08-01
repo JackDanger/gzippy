@@ -62,7 +62,10 @@ Over the shallow regime d=6..16, `T = F + depth * P`:
 | libdeflate | 82.5 ms | 3.171 ms/depth-unit |
 
     dF = +8.5 ms   we pay 10.3% MORE fixed cost per pass
-    dP = -0.550    our chain walk is 17.3% CHEAPER per node
+    dP = -0.550    our chain walk is 17.3% cheaper per node IN MILLISECONDS
+                   ONLY — at L9 we execute 26% MORE matchfinder INSTRUCTIONS
+                   than libdeflate and still win that cell. Never quote `P` as
+                   an instruction count. See the CORRECTION below.
 
 **8.5 ms over 12.17 MB = 0.70 ns/byte, about 2.2 cycles/byte, that libdeflate
 does not pay.** It is per-position work that is not chain walking: hashing,
@@ -79,7 +82,7 @@ The crossover was NOT used in the fit. Observed: ratio 1.0200 at d=12 and
 0.9981 at d=16, i.e. the curve crosses 1.0 between 12 and 16. The prediction
 lands inside that interval.
 
-## Why this is the whole failing class
+## Why this is the whole failing class  ⛔ RETRACTED — SEE THE END OF THIS FILE
 
 From the wall board (169 graded rows, 3 files): every losing wall cell is
 `libdeflate @ T1`, and every one is at L1-L5. Their depths:
@@ -136,7 +139,64 @@ This is the campaign's standing rule ("instruction counts LOCATE, they never
 predict the wall") applied to this file's own conclusion.
 
 The `F` term survives and is CORROBORATED: see
-`docs/board/l2-instruction-attribution.md`, where `block_split.rs` (33.0M Ir)
-and libc `memcpy` (18.3M Ir) are FLAT in absolute instructions from L2 (depth 6)
-to L9 (depth 600) while the total triples — a depth-independent per-pass cost
+`docs/board/l2-instruction-attribution.md`, where `block_split.rs` (33.0M Ir
+at T1) is FLAT in absolute instructions from L2 (depth 6) to L9 (depth 600)
+while the total triples.
+⛔ The libc `memcpy` half of this sentence is RETRACTED: 18.3M Ir was a T16
+profile. At `-p1` it is 261,274 Ir (0.03%) and it is the T>1 BUF_PAD copy
+already recorded in #210 — not a T1 cost — a depth-independent per-pass cost
 found by a second instrument, on a second box, on a second architecture.
+
+---
+
+# ⛔⛔ RETRACTED: "L6–L9 are clean" and "this is a SHALLOW-LEVEL class"
+
+**This file's section "Why this is the whole failing class" is WRONG on the
+authority box.** Retracted 2026-08-01, same day, by the banked board it should
+have been reconciled against before the claim was written.
+
+`/root/wallboard-L6/` (commit `e6e6ad30`, **solvency = AMD Zen2 = THE
+frozen-wall AUTHORITY box**, 19 corpus files) records **19 LOSS cells, all
+`libdeflate@T1`, ALL AT L6.** Not on files my sample lacked — on the SAME three
+files, at the SAME level, rival and thread count:
+
+| L06 T01 vs libdeflate | banked (solvency, AMD Zen2) | this file's claim (local M1) |
+|---|---|---|
+| aozora.txt | **1.0810 LOSS** | 0.9059 WIN |
+| dickens | **1.0661 LOSS** | (claimed clean) |
+| data.json | **1.0754 LOSS** | 0.9550 WIN |
+
+A **15–17 percentage-point swing** on identical coordinates. So the level
+distribution reported here (L1–L5 fail, L6–L9 clean) is a property of the LOCAL
+M1, not of the encoder.
+
+## Two candidate mechanisms, NEITHER established
+
+1. **Architecture.** AMD Zen2 vs Apple M1. The wall is the only axis in this
+   campaign that is arch-exposed (size is arch-invariant by construction).
+2. **Commit drift.** The banked board is `e6e6ad30`; this claim is `ce5506a8`.
+   Many commits apart, including parse and T>1 changes.
+
+Discriminating them needs the SAME commit measured on BOTH boxes. Until then
+nothing about the LEVEL distribution of this class may be planned from.
+
+## What SURVIVES the retraction
+
+- **The class is `libdeflate @ T1`.** Both boards agree: every LOSS cell on
+  both is libdeflate at T1, and both show zero LOSS against gzip/pigz/igzip
+  and zero against libdeflate at T4.
+- **The L2/T1 component map** (`docs/board/l2-component-map.md`) — measured on
+  trainer/Intel with position counts at Δ0.00% and 0.4% unaccounted. It is a
+  statement about where instructions go at one coordinate, and it does not
+  depend on the level distribution being what this file claimed.
+
+## What this cost, and the rule that would have caught it
+
+MEMORY.md carries the rule verbatim: **"a result contradicting a banked one is
+MEASUREMENT ERROR until reconciled."** I had the banked artifact's path in my
+own notes (`/root/wallboard-L6/`, quoted in
+`project_t_gt_1_serial_term.md`) and treated it as "L6 only, therefore narrow"
+— when the correct reading was "L6 only, and it DISAGREES with me at L6."
+
+A banked result that covers less than yours is not thereby weaker. **On the
+overlap it is a direct test, and this one failed.** Check the overlap FIRST.
