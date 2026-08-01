@@ -115,3 +115,28 @@ single number seen twice.
 Any lever aimed at making our chain walk faster. It is already 17.3% cheaper
 per node than the vendor's, measured at matched depth on byte-identical output.
 Per-node work is not where the failing cells are.
+
+---
+
+## ⚠ CORRECTION (same day) — "our chain walk is 17.3% CHEAPER per node" is a
+## MILLISECOND statement and is FALSE in instructions
+
+Callgrind on trainer (Intel), dickens, L9 `lazy2(600,MAX)`, byte-identical
+output:
+
+    ours   hc.rs:lazy::run_resumable                1,866,549,864 Ir
+    theirs hc_matchfinder.h:deflate_compress_lazy2  1,480,691,091 Ir   ours +26.1%
+
+We execute 26% MORE instructions in the matchfinder and win that wall cell by
+12.3%. The `P` term above is real as a TIME-per-depth-unit; it is not an
+instruction count, and it must never be quoted as one. We issue more and stall
+less — consistent with `project_encoder_deficit_is_loads_not_stalls`.
+
+This is the campaign's standing rule ("instruction counts LOCATE, they never
+predict the wall") applied to this file's own conclusion.
+
+The `F` term survives and is CORROBORATED: see
+`docs/board/l2-instruction-attribution.md`, where `block_split.rs` (33.0M Ir)
+and libc `memcpy` (18.3M Ir) are FLAT in absolute instructions from L2 (depth 6)
+to L9 (depth 600) while the total triples — a depth-independent per-pass cost
+found by a second instrument, on a second box, on a second architecture.
