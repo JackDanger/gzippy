@@ -135,11 +135,26 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 /// returned unchanged, so T>1 output at those levels is untouched.
 pub fn params_parallel(level: u32) -> LevelParams {
     let mut p = params_inner(level);
-    p.strategy = match p.strategy {
-        Strategy::Greedy => Strategy::Lazy,
-        Strategy::Lazy => Strategy::Lazy2,
-        other => other,
-    };
+    // DEPTH, NOT STRATEGY. The first attempt took one step of parse strategy
+    // (Greedy->Lazy, Lazy->Lazy2) and was NO-SHIP on clause 3: it flipped
+    // igzip:weights.safetensors:L2:T4 from 0.9998 to 1.0002. Mechanism, measured: on
+    // near-incompressible data (90 MB of float tensors) LAZY defers matches and emits more
+    // literals than GREEDY, costing +32,975 B on that file. Lazy is not uniformly stronger;
+    // it is stronger only where matches are dense.
+    //
+    // Scaling max_search_depth has no such failure mode — a deeper chain can only find a
+    // match at least as good — and it measured strictly better everywhere, including L8/L9
+    // where the strategy step had nothing left to give (already Lazy2):
+    //     L2 weights.safetensors  83,082,549 vs igzip 83,101,588  (0.99977, and 22 B SMALLER
+    //                             than the shipped T>1 output — the clause-3 flip is gone)
+    //     L2 dickens -107,533 | data.csv -112,714 | sil40 -157,275  vs libdeflate
+    //     L6 sil40   -60,758  (strategy step gave -19,236)
+    //     L9 sil40    -2,484  (strategy step gave nothing)
+    //
+    // x4 is the shipped factor. Wall on sil40, T4, vs BOTH rivals that matter (libdeflate is
+    // single-threaded; pigz is not): L2 2.73x/1.39x, L6 2.53x/2.18x, L9 2.15x/1.62x faster.
+    // Even at L9, where this walks 2,400 chain nodes, we stay ahead of both.
+    p.max_search_depth = p.max_search_depth.saturating_mul(4);
     p
 }
 
