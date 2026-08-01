@@ -1318,3 +1318,84 @@ trainer's tree was clean and its `shipped` column reproduces
 patched build cannot do. That is why "does the baseline reproduce the board?" is worth
 running on every measurement — it caught a contamination that discipline did not.
 The patch is now parked on `measure/l1-hash3-maxdist`; the tree rebuilds to 5,080,065.
+
+## THE BIGGEST LEVER ON THE BOARD: zlib chain depths at T>1 — 70 cells, 1 flip
+
+`docs/vendor-structure-comparison.md` records "matching zlib's chain depths at L5-L9
+closes 84 failing size cells (and opens 13)". Diffing the artifact behind that claim
+(`/root/size-zlibdepths/census.json`, ours_sha `276a941c`) against the baseline board
+(`/root/sizeboard-all-12fcd0ed/census.json`) over the 1,320 common cells shows what
+those 13 openings actually ARE:
+
+```
+CLOSED 84:  70 at T4,  14 at T1
+OPENED 13:  12 at T1,   1 at T4
+```
+
+**All 13 openings are libdeflate, and 12 of the 12 T1 openings are EXACT BYTE TIES in
+the base board** — the zero-headroom cage, perturbed by as little as ONE byte:
+
+```
+  dd79_bin6      L6 T1   4,461,731 = rival        ->  +1 B over
+  weights        L7/L8/L9 T1                      ->  +2 B over each
+  dd79_bin6      L5 T1                            ->  +4 B
+  photo.jpg      L7 T1                            ->  +5 B
+  movie.mp4      L5 / L6 T1                       -> +54 / +60 B
+  symbols.dwarf  L8 T1                            -> +125 B
+  weights        L5 T1                            -> +138 B
+  data.csv       L9 T1                            -> +226 B
+  engine.wasm    L8 T4  (the ONLY non-tie: was a 158 B WIN) -> +57 B
+```
+
+### The cage is sidestepped by construction, not by tuning
+
+Apply the depth change in `params_parallel` (T>1) ONLY:
+
+```
+  closes 70, opens 1   ->  net +69, clause 3 sees ONE flip
+  closed@T4 by rival:  libdeflate 56, gzip 7, pigz 7
+  opened@T4:           libdeflate engine.wasm L8, +57 B
+```
+
+T1 output is untouched, so all 12 tie-cage openings vanish **by construction rather
+than by fitting**. And T4 output depends only on `params_parallel`, so the census's T4
+column carries over exactly — this is a re-reading of an existing measurement, not an
+extrapolation.
+
+**70 of the 200 failing cells is 35% of the board**, the largest single lever measured
+this campaign, and it needs one flip resolved rather than thirteen.
+
+### Relationship to PR #227 — same family, and #227 is the conservative member
+
+#227 ships `p.max_search_depth = p.max_search_depth.saturating_mul(4)` in
+`params_parallel` and closes 42 cells. zlib's actual per-level depths are not a uniform
+multiple:
+
+```
+  level        L5    L6    L7     L8     L9
+  ours         16    35   100    300    600
+  zlib         32   128   256   1024   4096
+  ratio       2.0x  3.66x 2.56x  3.41x  6.83x
+  #227 (x4)    64   140   400   1200   2400
+```
+
+So #227's x4 straddles zlib's shape but under-searches at L6/L9 and over-searches at
+L5/L7. Moving T>1 depths from "x4" toward zlib's measured per-level values is the
+follow-on, worth ~28 cells beyond #227 on SIZE.
+
+### WHAT IS NOT ESTABLISHED — the wall, and it is the binding constraint
+
+This is a SIZE re-reading of an existing artifact. **No wall number is quoted and none
+exists for the T>1-only configuration.** Deeper chains cost time in direct proportion:
+L9 at 4096 walks 6.83x our current 600. The T4 budget is 249-330% slack, which is large
+but not unlimited, and #227's own note reports that even x4 at L9 (2,400 nodes) stays
+ahead of both rivals — so the marginal question is 2,400 -> 4,096, not 600 -> 4,096.
+
+Provenance caveat: `/root/size-zlibdepths/meta.json` carries `"attested": false`, so the
+84/13 artifact is un-attested. The DIFF above is sound as a description of that
+artifact; promoting anything from it requires a fresh gated run.
+
+ORDER OF WORK: this composes with, and partly supersedes, #227. Land #227 on its
+running wall gate FIRST (land-gated-work-first), then tune `params_parallel` depths
+toward zlib's per-level values and gate that, with the single engine.wasm L8 T4 flip as
+the known blocker to resolve.
