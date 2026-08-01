@@ -741,3 +741,56 @@ NOT CHANGED HERE. #236's x4 is under graded adjudication on the frozen box with 
 already banked on the size axis (39 cells closed, 0 opened). Hard stop #5 says land gated work
 before starting new work; changing the constant now would void that run. The cap is the
 follow-up, and it must be re-gated on its own.
+
+## G31 — the gzip/pigz class is a DEPTH deficit against zlib, and zlib affords its depth with `good_match`
+
+The frozen-box census (G28) splits the 68 failures by rival. The gzip and pigz cells have a
+completely different signature from the libdeflate ones, and they come in T1/T4 PAIRS with
+near-identical deltas — so they are parse-quality deficits, not seam:
+
+    rival  file                 L   T1 delta   T4 delta   ratio
+    pigz   monorepo.tar         6   +53,495    +53,896    1.0054
+    pigz   dd79_bin6            2   +36,101    +36,570    1.0082
+    gzip   aozora.txt           6   +23,082    +23,338    1.0057
+    pigz   aozora.txt           6   +18,327    +18,583    1.0046
+    gzip   weights.safetensors  9   +17,815    +18,139    1.0002
+    gzip   minjs.min.js         6    +3,719     +3,574    1.0034
+    gzip   photo.jpg            2    +2,905     +2,963    1.0005
+
+0.3-0.8% deficits, against libdeflate's 0.001-0.05%. Different magnitude, different cause.
+
+VENDOR DIFF, read from `vendor/zlib-ng/deflate.c`'s `configuration_table` (gzip and pigz are
+both zlib-family):
+
+    level   zlib-ng: good lazy nice chain        ours (libdeflate port): depth nice
+    L6            8   16  128   128                              35   65
+    L7            8   32  128   256                             100  130
+    L8           32  128  258  1024                             300  258
+
+AT L6 THEY SEARCH 128 CHAIN NODES TO OUR 35 — 3.66x deeper, with nice 128 vs our 65. That is
+the mechanism behind the whole 0.5%-class, and it is a direct consequence of inheriting
+libdeflate's table (G15) rather than choosing our own: libdeflate trades depth for speed at L6,
+and against the zlib family that trade loses on size.
+
+CONFIRMATION FROM THE SHIPPED FIX. #236 scales T>1 depth x4, putting L6 at 140 — essentially
+zlib's 128. The graded lever closed exactly the T4 halves of this class:
+`gzip:aozora.txt:L6:T4`, `gzip:minjs.min.js:L6:T4`, `gzip:monorepo.tar:L6:T4` and the three
+matching `pigz:` cells. The prediction and the result agree, which is what makes this a
+mechanism rather than a correlation.
+
+### The T1 halves need a different lever, and zlib names it
+
+The T1 twins of those cells are untouched, because at T1 the binding wall constraint is
+libdeflate (4.4% slack at L6 on sil40), and going from depth 35 to 128 costs far more than that.
+
+But zlib runs chain=128 at L6 and is still not slow, because it also sets `good_match = 8`: the
+chain walk STOPS EARLY once a match of at least `good_match` length is found. Deep chains are
+therefore cheap on average and expensive only where they pay. We have no such early exit — our
+depth is a hard loop bound.
+
+So the T1 class is not "we cannot afford depth". It is "we buy depth at full price and they buy
+it at a discount". The lever is the early exit, not the bound.
+
+NOT ATTEMPTED HERE. Note that an uncommitted `good_match` implementation was found in this
+checkout belonging to no branch (see the contamination note in G29) — another writer is
+already on this. Coordinate before duplicating it.
