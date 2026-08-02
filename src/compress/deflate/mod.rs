@@ -633,6 +633,13 @@ pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>
         reader.read_to_end(&mut input)?;
         let logical_len = input.len();
         input.resize(logical_len + INPLACE_TAIL_PAD, 0);
+        // The input-sized buffer this fallback exists to apologise for. It was
+        // the ONE allocation site the anatomy counters missed — which let the
+        // L1-streaming lever's falsifier pass while the mechanism it guards
+        // (7,644 vs 1,496 minor faults against the vendor) was fully present.
+        // An instrument that skips the largest allocation certifies the bug.
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, input.capacity());
         let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
         writer.write_all(&gz)?;
         return Ok(logical_len as u64);

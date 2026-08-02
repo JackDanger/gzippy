@@ -442,3 +442,60 @@ fn fast_path_reconciliation_invariants_hold_at_l0() {
         "L0 can never defer (no lazy peek to defer through)"
     );
 }
+
+// ============================================================================
+// THE L1 STREAMING LEVER'S FALSIFIER — RED TODAY, GREEN WHEN `fast` STREAMS.
+//
+// The mechanism, measured 2026-08-02 (both sides, trainer + M1):
+//   * T1 levels 2-9 stream through resumable parsers: bounded reused buffers
+//     (L6 RSS 8.6 MB on a 12 MB input).
+//   * L1 (`Strategy::Fast`) has no resumable runner, so
+//     `encode_gzip_reader_to_writer_chunked` falls back to `read_to_end` plus
+//     an input-sized padded copy — every 4 KB page of a FRESH anonymous
+//     buffer minor-faults, every run. Counted against the vendor on the same
+//     job: 7,644 minor faults vs libdeflate-gzip's 1,496 at EQUAL ~31 MB RSS
+//     (they mmap; THP is madvise-mode so nobody gets huge pages). The fault
+//     handling is ~11 ms of the 41.5 ms L1/T1 wall gap on trainer.
+//
+// The fix this test defines DONE for: a resumable `fast` (and `ht_fast`)
+// runner — lookahead-margin pattern like `greedy::run_resumable`, matchfinder
+// tables carried in `ParseState` and rebased on slide, `is_last` resolving
+// the final block's `in_end` dependence — after which `level_streams(1)` is
+// true and L1's allocation profile matches the streaming levels'.
+//
+// GREEN CONDITION: L1's allocated bytes on an 8 MiB stdin input are within
+// 2x of L6's on the same input (both stream => both are bounded by the
+// fixed-window arithmetic in `encode_gzip_single_pass`, not by input size).
+// The 2x headroom covers parser-specific table sizes, NOT an input-sized
+// buffer: today L1 allocates the whole input + input/2 reservation and sits
+// ~3x over this bar by construction.
+//
+// Byte-correctness is already pinned elsewhere: `tests/streaming_identity.rs`
+// asserts stream-vs-whole-buffer identity per level, and the fingerprint
+// suite pins L1's output shape. This test is ONLY the memory contract.
+// ============================================================================
+
+#[test]
+#[ignore = "RED by design: Strategy::Fast cannot stream yet — this is the L1 streaming lever's definition of done (see block comment)"]
+fn l1_streams_with_bounded_buffers() {
+    // Compressible-but-unrepetitive input so no level degenerates to stored.
+    let mut data = Vec::with_capacity(8 << 20);
+    let mut x: u64 = 0x1157_3417_2026_0802;
+    while data.len() < 8 << 20 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        data.extend_from_slice(format!("record {:016x} field {}\n", x, x % 997).as_bytes());
+    }
+    let (_o1, c1) = compress_with_counters(&data, 1);
+    let (_o6, c6) = compress_with_counters(&data, 6);
+    let l1 = c1.get("alloc_bytes").copied().unwrap_or(0);
+    let l6 = c6.get("alloc_bytes").copied().unwrap_or(0);
+    assert!(l6 > 0, "L6 must report alloc_bytes (streaming baseline)");
+    assert!(
+        l1 <= l6 * 2,
+        "L1 allocated {l1} B vs L6's {l6} B on identical 8 MiB input — the whole-buffer \
+         fallback is still routing (fault mechanism in the block comment above); \
+         DONE means a resumable `fast` runner, not a bigger tolerance"
+    );
+}
