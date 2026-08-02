@@ -197,11 +197,103 @@ pub fn params_parallel(level: u32) -> LevelParams {
     //     L8 excluded (this)        closes 26, opens 0
     //     try_exact_huffman alone   closes  5, opens 0
     // The exclusion costs 4 cells at L8 and removes the only clause-3 violation.
-    p.max_search_depth = if level == 8 {
-        p.max_search_depth
+    // SINGLE-VARIABLE TEST: L4 parser only, depth UNCHANGED at 16 so `choose_min_match_len`
+    // is not clamped (its `< 16` threshold forces min_len <= 7 and that was the confound
+    // in the Lazy(12,30) attempt).
+    if level == 4 {
+        p.strategy = Strategy::Lazy;
+        p.max_search_depth = p.max_search_depth.saturating_mul(4);
     } else {
-        p.max_search_depth.saturating_mul(4)
-    };
+        p.max_search_depth = if level == 8 {
+            p.max_search_depth
+        } else {
+            p.max_search_depth.saturating_mul(4)
+        };
+    }
+    // L4 AT T>1 IS THE STRATEGY STEP **COMPOSED WITH** THIS BRANCH'S DEPTH SCALING.
+    //
+    // Measured against this branch, L4, 22 files: OPENED 0, CLOSED 5 at both T4 and T16,
+    // T1 byte-identical, and **4,284,357 B smaller in total**. The parser step ALONE
+    // (`Lazy` at depth 16, no scaling) also closed 5 and opened 0 but was only 3,151,510 B
+    // smaller and made FOUR files worse — ecoli.fastq +114,871, access.log +53,268,
+    // aozora.txt +28,452, weights.safetensors +31,651. Composing with the x4 recovers
+    // three of those and beats this branch on them: ecoli -18,542, access.log -59,432,
+    // aozora -71,994.
+    //
+    // The one file still worse is `weights.safetensors`, +31,516 — and that is the case
+    // this file ALREADY documents above: "on near-incompressible data LAZY defers matches
+    // and emits more literals than GREEDY, costing +32,975 B on that file". Measuring
+    // +31,516 independently reproduces that +32,975. The cell is ALREADY FAILING vs
+    // libdeflate on this branch (83,082,305 vs 83,082,171), and clause 3 does not protect
+    // an already-failing cell — so it is a size cost, not a promotion blocker. Naming it
+    // because a cell count hides it.
+    //
+    // ⛔ AND L4 IS THE MAXIMUM CLEAN SUBSET — extending this to every eligible level was
+    // BUILT AND MEASURED, and it is NO-SHIP. The strategy step composed with the depth
+    // scaling, applied wherever a stronger parser exists (Greedy->Lazy, Lazy->Lazy2), at
+    // T4 vs this branch: **9 closed, 3 OPENED**. Per level:
+    //
+    //     L2   closed 3   OPENED 1   <- weights.safetensors vs igzip
+    //     L4   closed 5   OPENED 0   <- THIS ARM
+    //     L5   closed 0   OPENED 0   <- adds nothing
+    //     L6   closed 0   OPENED 1   <- weights.safetensors vs libdeflate. strictly worse.
+    //     L7   closed 1   OPENED 1   <- weights.safetensors vs libdeflate. net zero, NO-SHIP.
+    //
+    // **All three opens are the SAME FILE**, and it is the one this file already names:
+    // on near-incompressible float tensors Lazy defers matches and emits more literals.
+    // So the L4-only scope here is NOT a partial application waiting to be generalised —
+    // it is the OPTIMUM of the family. Every other level either opens a cell or adds
+    // nothing. Do not re-derive this by extending the arm.
+    //
+    // (superseded note kept for the reasoning chain)
+    // L4 IS A STRATEGY STEP AT T>1, NOT A DEPTH STEP — measured, clause 3 clean.
+    //
+    // L4 is the only `Greedy` above L2 (L3 and L5 are both `Lazy`), so it enters T>1 with
+    // no size margin at all, and the T>1 seam then costs it cells by 55-370 B. Stepping
+    // the PARSER while holding depth at 16 gives it margin. Measured against this branch
+    // as baseline, L4, all 22 corpus files, gzip/pigz/libdeflate:
+    //
+    //     T2   OPENED 0   CLOSED 4        T4  OPENED 0  CLOSED 5    T16  OPENED 0  CLOSED 5
+    //     T1   byte-identical (198/198)   — `params_parallel` is T>1-only by construction
+    //
+    //   closed: data.sqlite vs gzip AND pigz (14,798,391 -> 12,352,596), plus dd79_bin6
+    //           (-258 B margin), movie.mp4 (-370) and photo.jpg (-55) vs libdeflate — all
+    //           zero-headroom seam cells.
+    //
+    // ⛔ FALSIFY 2026-08-01, KEPT because its VERDICT stands and its CAUSE was wrong:
+    // `Lazy(12,30)` was tried first and was NO-SHIP — it closed 5 but OPENED
+    // `ecoli.fastq` vs libdeflate (4,432,143 -> 4,592,250, rival 4,568,588). I attributed
+    // that to "Lazy is not uniformly stronger; it is stronger only where matches are
+    // dense" (the record above, from the L2 attempt). **That attribution was wrong.**
+    //
+    // ⛔ AND THEN I GOT THE CAUSE WRONG A SECOND TIME. I first blamed the parser; then I
+    // blamed `choose_min_match_len`'s clamp (it caps min_len at <=7 below depth 16, and
+    // 16 -> 12 crosses that). I posted that, THEN tested it, and the predicted second
+    // consequence FALSIFIED it: if the clamp bound, depth 15 -> 16 would show a
+    // DISCONTINUOUS jump on low-variety data. Measured, it does not — every step is
+    // smooth:
+    //     ecoli.fastq  d14 4,581,294  d15 4,575,025  d16 4,568,588  d17 4,561,876
+    //                  15->16 = -6,437   vs   14->15 = -6,269
+    //     dickens, markup.xml, dd79_bin6: same, no discontinuity.
+    // The clamp only binds when `min_lens[]` returns ABOVE the cap, i.e. on genuinely
+    // low-variety data. `ecoli.fastq` is FASTQ — bases PLUS quality scores PLUS headers —
+    // so its literal alphabet is wide and the table already returns a low min_len. The
+    // clamp is INERT on this corpus at these depths.
+    //
+    // THE ACTUAL CAUSE IS THE PLAIN ONE: depth 12 searches less than depth 16. That is
+    // all. `Lazy(12,30)` was a parser step AND a depth REDUCTION; this arm is the parser
+    // step alone.
+    //
+    // Three wrong mechanism stories for one correct measurement. The measurements never
+    // moved — Lazy(12,30) opens ecoli, Lazy(16,30) does not, this gate is clean — only my
+    // explanations did. "One measurement supports one claim" is the rule that keeps being
+    // broken here by generalising a code read into a claim about behaviour.
+    //
+    // ⚠ THE WALL LEG IS UNMEASURED AND IS THE ONLY REMAINING GATE. Lazy does roughly twice
+    // greedy's matchfinder calls at the same depth, so this spends wall BY CONSTRUCTION.
+    // Clause 5 is an erosion budget; the earlier parked L4 work (`level.rs`, `Lazy(10,30)`)
+    // died on exactly this leg at a CHEAPER depth. Needs `fulcrum ab paired` at T4 on
+    // solvency with aa_bias reported. Size alone cannot promote this.
     // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
     // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
