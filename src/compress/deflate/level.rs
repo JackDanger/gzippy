@@ -202,6 +202,35 @@ pub fn params_parallel(level: u32) -> LevelParams {
     } else {
         p.max_search_depth.saturating_mul(4)
     };
+    // ⛔ FALSIFY 2026-08-01 — L4 -> `Lazy(12,30)` AT T>1 WAS BUILT AND MEASURED. NO-SHIP.
+    // Clause 3: it CLOSES 5 and OPENS 1, at every thread count tried.
+    //
+    //   vs THIS branch as baseline, L4, all 22 corpus files, gzip/pigz/libdeflate:
+    //     T2  closed 4, OPENED 1     T4  closed 5, OPENED 1     T16  closed 5, OPENED 1
+    //   closed: data.sqlite vs gzip AND pigz (14,798,391 -> 12,372,018), plus dd79_bin6,
+    //           movie.mp4 and photo.jpg vs libdeflate — all seam-margin cells that were
+    //           losing by 55-370 B, i.e. exactly the zero-headroom class.
+    //   OPENED: ecoli.fastq vs libdeflate  4,432,143 -> 4,592,250  (rival 4,568,588)
+    //
+    // THE MECHANISM IS THE ONE RECORDED ABOVE, and it generalises further than I argued:
+    // "Lazy is not uniformly stronger; it is stronger only where matches are dense."
+    // `ecoli.fastq` is DNA sequencing data — sparse matches — so Lazy defers and emits
+    // more literals, exactly as on `weights.safetensors`. Depth x4 is strictly better
+    // there (4.43 MB vs 4.59 MB).
+    //
+    // I had distinguished this from the recorded L2 failure on the grounds that igzip's
+    // real ladder is L0-L3 (verified: `-4`+ emit nothing) so there is no igzip L4 cell.
+    // That is TRUE and it was NOT ENOUGH: the killer at L4 is a different FILE (ecoli,
+    // not weights) against a different RIVAL (libdeflate, not igzip). **Scoping a
+    // falsification to the cell that happened to catch it is too narrow — this mechanism
+    // is about the DATA, not the cell.**
+    //
+    // The T1 leg was clean (198/198 byte-identical; `params_parallel` is T>1-only) and
+    // the ladder motivation is real — L4 is the only `Greedy` above L2, which at T1 costs
+    // monotonicity on 17 of 22 files (docs/board/our-L3-win-causes-the-L4-sag.md). Neither
+    // rescues a clause-3 violation. REOPEN needs a parse step that is monotone on
+    // SPARSE-MATCH data, which Lazy is not.
+    //
     // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
     // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
