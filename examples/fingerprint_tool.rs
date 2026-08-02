@@ -195,6 +195,21 @@ fn main() {
     match cmd.as_str() {
         "pin-ours" => {
             let ours = ours_fingerprints();
+            for &fixture in fixtures::NAMES {
+                for &level in LEVELS {
+                    let t1 = ours.get(&(fixture.to_string(), level, 1, "gzippy".into()));
+                    let t4 = ours.get(&(fixture.to_string(), level, 4, "gzippy".into()));
+                    if let (Some(a), Some(b)) = (t1, t4) {
+                        if a == b && level > 0 {
+                            eprintln!(
+                                "note: {fixture} L{level} T1==T4 byte-identical — either the T>1 \
+                                 route did not engage (the stdin trap: verify with a file input) \
+                                 or seams have been eliminated (the bit-splice goal). Know which."
+                            );
+                        }
+                    }
+                }
+            }
             write_pins(
                 &format!("{PIN_DIR}/ours.tsv"),
                 "# OUR fingerprints on the frozen fixtures. Regenerate ONLY when a lever\n\
@@ -246,10 +261,39 @@ fn main() {
                     eprintln!("warn: rival '{name}' not on this box — not pinned");
                 }
             }
+            let versions: Vec<String> = covered
+                .iter()
+                .map(|name| {
+                    let (bin, vflag) = match *name {
+                        // libdeflate-gzip has no --version; -V is its version flag.
+                        "libdeflate" => ("libdeflate-gzip", "-V"),
+                        b => (b, "--version"),
+                    };
+                    let v = Command::new(bin)
+                        .arg(vflag)
+                        .output()
+                        .ok()
+                        .map(|o| {
+                            String::from_utf8_lossy(if o.stdout.is_empty() {
+                                &o.stderr
+                            } else {
+                                &o.stdout
+                            })
+                            .lines()
+                            .next()
+                            .unwrap_or("?")
+                            .trim()
+                            .to_string()
+                        })
+                        .unwrap_or_else(|| "?".into());
+                    format!("#   {name}: {v}\n")
+                })
+                .collect();
             let prov = format!(
                 "# Rival fingerprints on the frozen fixtures. Regenerate on a box with all\n\
                  # rivals: cargo run --release --example fingerprint_tool -- pin-rivals\n\
-                 # covered: {}\n",
+                 # A pin is only comparable at these rival versions:\n{}# covered: {}\n",
+                versions.join(""),
                 covered.join(",")
             );
             write_pins(&format!("{PIN_DIR}/rivals.tsv"), &prov, &rows);
