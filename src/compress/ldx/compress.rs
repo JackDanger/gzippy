@@ -21,6 +21,7 @@
 
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::{deflate_compress_fastest, FastestState};
+use super::compress_greedy::{deflate_compress_greedy, GreedyState};
 use super::flush::Compressor;
 use super::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 
@@ -94,8 +95,11 @@ pub(crate) struct LdxCompressor {
     pub(crate) max_passthrough_size: usize,
     /// C: `c->nice_match_length`
     pub(crate) nice_match_length: u32,
+    /// C: `c->max_search_depth`
+    pub(crate) max_search_depth: u32,
     pub(crate) c: Compressor,
     pub(crate) p_f: FastestState,
+    pub(crate) p_g: GreedyState,
 }
 
 impl LdxCompressor {
@@ -103,28 +107,33 @@ impl LdxCompressor {
     pub(crate) fn new(compression_level: u32) -> Option<Self> {
         // C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919)
         let mut max_passthrough_size = 55usize.wrapping_sub(compression_level as usize * 4);
-        let nice_match_length;
-
-        match compression_level {
+        // C: the level -> config map at :3919-3990, ported verbatim for the levels whose
+        // compressor exists. CLAUDE.md clause 5: no test pins these VALUES; the
+        // invariant test lives in `compress_greedy` and checks that effort RISES.
+        let (max_search_depth, nice_match_length) = match compression_level {
             0 => {
                 // C: `c->impl = NULL; c->max_passthrough_size = SIZE_MAX;` (:3922)
                 max_passthrough_size = usize::MAX;
-                nice_match_length = 0;
+                (0, 0)
             }
-            1 => {
-                // C: `c->impl = deflate_compress_fastest;` (:3926)
-                // `max_search_depth` is unused at this level.
-                nice_match_length = 32;
-            }
+            // C: `c->impl = deflate_compress_fastest;` (:3926). `max_search_depth` is
+            // unused at this level — it is hardcoded in ht_matchfinder.h.
+            1 => (0, 32),
+            // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
+            2 => (6, 10),
+            3 => (12, 14),
+            4 => (16, 30),
             _ => return None,
-        }
+        };
 
         Some(Self {
             compression_level,
             max_passthrough_size,
+            max_search_depth,
             nice_match_length,
             c: Compressor::new(),
             p_f: FastestState::new(),
+            p_g: GreedyState::new(),
         })
     }
 
@@ -141,16 +150,27 @@ impl LdxCompressor {
         // Initialize the output bitstream structure.
         let mut os = DeflateOutputBitstream::new(out);
 
-        // Call the actual compression function.
-        debug_assert_eq!(self.compression_level, 1, "only level 1 has a ported impl");
-        deflate_compress_fastest(
-            &mut self.c,
-            &mut self.p_f,
-            r#in,
-            in_nbytes,
-            &mut os,
-            self.nice_match_length,
-        );
+        // Call the actual compression function. C: `(*c->impl)(c, in, in_nbytes, &os);`
+        match self.compression_level {
+            1 => deflate_compress_fastest(
+                &mut self.c,
+                &mut self.p_f,
+                r#in,
+                in_nbytes,
+                &mut os,
+                self.nice_match_length,
+            ),
+            2..=4 => deflate_compress_greedy(
+                &mut self.c,
+                &mut self.p_g,
+                r#in,
+                in_nbytes,
+                &mut os,
+                self.max_search_depth,
+                self.nice_match_length,
+            ),
+            _ => unreachable!("`new` refuses unported levels"),
+        }
 
         // Return 0 if the output buffer is too small.
         if os.overflow {
@@ -303,7 +323,7 @@ mod tests {
     /// algorithm.
     #[test]
     fn unported_levels_refuse() {
-        for level in 2..=12u32 {
+        for level in 5..=12u32 {
             assert!(
                 LdxCompressor::new(level).is_none(),
                 "level {level} is not ported yet and must not pretend otherwise"
