@@ -1,4 +1,31 @@
-# L4 → `Lazy(12,30)`, gated to T>1: **13 cells closed, 0 opened** (size leg)
+# L4 → `Lazy(12,30)`, gated to T>1 — **AT MOST 5 incremental cells, not 13**
+
+> ## ⛔ CORRECTION (same day, before anyone acts on this)
+>
+> **The 13 below was measured against `main`. That is the WRONG BASELINE** — #227 is in
+> flight, MERGEABLE, and closes 91 cells including 9 at L4. Re-checked against #227:
+>
+> ```
+> already closed by #227 : 8 of the 11 libdeflate cells
+> still open on #227     : photo.jpg (-55 B), movie.mp4 (-370), dd79_bin6 (-258)
+>                          data.sqlite vs gzip (-13,790) and vs pigz (-18,487)
+> ```
+>
+> **So the incremental value is AT MOST 5 cells, not 13.** This is precisely the trap the
+> rulebook names — "optimising a PASSING cell closes nothing" — and I walked into it by
+> using `main` as the baseline while a 91-cell PR sat open.
+>
+> **AND EVEN THE 5 IS NOT VERIFIED.** I could not build #227 + this change: the
+> `ladder-tune` binary is built from `main`, so `GZIPPY_LADDER=lazy:12:30` gives
+> *main + Lazy*, not *#227 + Lazy*. #227's `params_parallel` already scales
+> `max_search_depth` x4 at T>1, so the true combination is Lazy at depth 48, which is a
+> DIFFERENT configuration from anything measured here. **The clause-3 check against the
+> #227 baseline has NOT been run.** Do not treat 5 as a result; treat it as a ceiling.
+>
+> What DOES survive scrutiny is the mechanism and the falsification-distinction below.
+
+## The original measurement (baseline: `main`)
+
 
 **Measured 2026-08-01.** Size only — arch-invariant, load-immune. **Not a wall claim; the
 wall leg is unmeasured and is the only remaining gate.**
@@ -42,6 +69,23 @@ monotone T1 size wins that buy headroom to spend"* — demonstrated on 13 cells.
 same mechanism the L3 arm already relies on (see
 `parity-at-T1-is-a-liability-at-T4.md`), applied at the level that currently has none.
 
+## Why the recorded `params_parallel` falsification does NOT apply at L4
+
+`params_parallel` records that a strategy step (Greedy->Lazy) was tried at T>1 and was
+**NO-SHIP on clause 3**, killed by `igzip:weights.safetensors:L2:T4`, because *"Lazy is
+not uniformly stronger; it is stronger only where matches are dense."* That is the same
+mechanism as this lever. It does not recur here for a nameable reason:
+
+* **igzip's real ladder is L0-L3** (verified: `-4` and above produce nothing). **There is
+  no igzip L4 cell**, so the cell that killed it cannot exist at this level.
+* Checked the named file directly at L4/T4: `weights.safetensors` **fails vs libdeflate
+  both before and after** (83,082,305 and 83,114,206 against 83,082,171). It is an
+  already-failing cell, which clause 3 does not protect. Against gzip and pigz it passes
+  both ways.
+
+Same mechanism, different level, and the level is the one where the killer rival has no
+cell. That is a REOPEN distinction, not a hope.
+
 ## Why this is a different proposition from the parked L4 lever
 
 `level.rs:267` parks `Lazy(10,30)` and closes the family on clause 5 at T4. Three things
@@ -56,9 +100,11 @@ have changed:
    the 2 T1 opens entirely and puts the wall question at T4, where the recorded slack is
    249-330% instead of T1's 0-8%.
 
-## What is still required, and it is the only thing
+## What is still required
 
-**A `fulcrum ab paired` wall run at T4 on solvency, with aa_bias reported.** Clause 5 is
+1. **Rebase onto #227 and re-run the size gate there.** The number above is a ceiling
+   measured against the wrong tree, and #227's depth x4 changes the configuration.
+2. **A `fulcrum ab paired` wall run at T4 on solvency, with aa_bias reported.** Clause 5 is
 an erosion budget and this lever spends wall by construction (lazy does roughly twice the
 matchfinder work of greedy; depth 12 vs 16 partly offsets it). **The size leg above does
 not and cannot answer that.**
