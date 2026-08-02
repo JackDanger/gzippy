@@ -9,6 +9,18 @@ LEVEL THE USER TYPED, and less wall time — on their machine, at their thread c
 DECOMPRESSION IS DONE AND WON (four months, PR #116, merged 2026-07-18). Do not
 revisit it, re-measure it, or optimise it. This file is about the encoder.
 
+**Where everything is.** This file is the charter; it is not the state and it is not
+the toolbox. `~/.claude/.../memory/MEMORY.md` holds the measured board structure —
+read it first. The four commands you will actually use:
+
+    make falsified                        # every FALSIFY and PARK record in src/
+    CAMPAIGN_LEVELS=1-9 make board-size    # the deterministic size board, all levels
+    make lever REF=<ref> ARGS="--threads 1,4"   # the promotion adjudicator
+    scripts/campaign/tie-guard.sh          # 2 min; the T1 tie cage, before any T1 edit
+
+`make lever` grades levels 2,6,9 and threads 1 BY DEFAULT. Both defaults have shipped
+a wrong verdict; pass the level and thread range the change actually acts on.
+
 ## Build order — this is the plan, in this order
 
 **STEP 1 — T=1, beating every other implementation.** One code path. Read the input
@@ -133,18 +145,35 @@ any claim about what the SHIPPED BINARY DOES must be proven by executing it (rou
 assertion, output sha, build-both-ways diff). The compression routing table in this
 file was once a careful code read and was wrong in every particular.
 
-Fulcrum finds where the time goes and proves a change worked. **It is never the
-deliverable.** A new instrument requires a named failing cell and the blocking
-question in its commit message.
+Fulcrum finds where the time goes and proves a change worked. **An instrument that
+reveals STRUCTURE is the cure, not the cost.** The user's diagnosis (2026-07-31):
+decompression took months because the strategy was reading and reasoning, and "once
+we built measurement tools that revealed structure we optimized that structure right
+away." Never hesitate to build one. Fear reasoning, not instruments.
+
+What IS forbidden is an instrument with no blocked question behind it. The test is
+not "is this a tool?" but "does a NAMED failing cell need an answer this tool gives?"
+Name that cell and the blocking question in the commit message. A tool that ships
+without closing or unblocking a named cell is a docs commit wearing a tool's costume.
+(This paragraph previously read "It is never the deliverable," which inverts the
+user's causation and chills the one technique with the best track record here.)
 
 **The only progress metric is failing cells closed, by name.** Report it every
-session, and report zero as zero.
+session, and report zero as zero. A zero is information, not a verdict on the
+session — the sessions that close zero are often the ones that correctly falsified
+something expensive.
 
-**Two consecutive sessions at zero BLOCKS optimisation edits.** Not "should
-prompt reflection" — blocked. Only profiling, measurement, vendor-structure-diff,
-or landing-already-gated-work commits are allowed until a named worst cell and
-its blocking metric are recorded. The soft version of this rule was in force all
-session and was ignored eight times.
+⛔ **DELETED 2026-08-01: "two consecutive sessions at zero BLOCKS optimisation
+edits."** It mandated the failure mode it was written to prevent. The activities it
+PERMITTED on a blocked session were "profiling, measurement, vendor-structure-diff,
+or landing already-gated work" — precisely the docs-and-measurement churn that
+produces zero-cell sessions. Receipt: of the 13 PRs merged in the #224-#238 range,
+11 are `docs(…)`/`measure(…)`/`tools(…)` and 0 closed a failing cell; under the rule
+as written every one of those 11 was legal, while the one PR carrying a measured
+42-cell win (#227) sat OPEN the whole time and was the one act the rule discouraged.
+It also could not fail closed — nothing reads it — so its only function was to
+license another audit document. Do not reinstate it without a receipt showing a
+blocked session that a ban on optimisation edits would have improved.
 
 ## Hard stops
 
@@ -163,6 +192,16 @@ least once in a single session.
    `REOPEN:` line in the commit message naming a NEW mechanism and what would
    falsify it. "Different code shape now" is not a mechanism. Two attempts this
    session were variants of an already-recorded falsification.
+
+   **THE BINDING RECORDS LIVE IN `src/`. SEARCH THEM BEFORE PROPOSING ANYTHING:**
+
+       git fetch origin && make falsified      # indexes FALSIFY *and* PARK (#240)
+
+   A checkout 26 commits behind once made `make falsified` look like it did not
+   exist, and a whole session on 2026-08-01 was spent re-deriving three findings
+   already written down — two in `level.rs` and one in a memory file whose opening
+   sentence was a warning not to re-derive it. **A prose warning did not work; the
+   command is the fix.**
 
 3. **Never generalise a measurement across levels — AND THIS APPLIES TO RECORDS, NOT
    ONLY TO CHANGES.** The hard stops are enforced against edits: a commit hook reads
