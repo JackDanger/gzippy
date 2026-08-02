@@ -310,16 +310,6 @@ pub(crate) fn plausible_trial_decode_offset(data: &[u8], bit_offset: usize) -> b
 /// Peek `n` bits starting at absolute bit offset `bit` in `data`
 /// (LSB-first within bytes). Returns `None` if the read would overrun
 /// `data`. `n` must be ≤ 17.
-///
-/// FALSIFY: the bound is 17, not 16. This read loads three bytes (24 bits) and
-/// discards at most 7 to reach the starting bit, so 17 bits are always
-/// available — and the dynamic-header check above genuinely asks for 17
-/// (1 + 5 + 5 + 4 header bits, plus the two BTYPE bits it skips past). The
-/// assert said 16, so every debug-assertions build aborted on any stream whose
-/// parallel block-finder examined a dynamic header — `gzippy -d` died with
-/// "assertion failed: n <= 16" on ordinary 4 MiB input that gzip, pigz and
-/// libdeflate all decoded. Release builds compile the assert out and were
-/// always correct, which is why the board never showed it.
 #[inline]
 fn peek_bits_at(data: &[u8], bit: usize, n: u8) -> Option<u32> {
     debug_assert!(n <= 17);

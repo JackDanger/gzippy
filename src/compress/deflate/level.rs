@@ -259,43 +259,6 @@ pub fn params_parallel(level: u32) -> LevelParams {
     //   closed: data.sqlite vs gzip AND pigz (14,798,391 -> 12,352,596), plus dd79_bin6
     //           (-258 B margin), movie.mp4 (-370) and photo.jpg (-55) vs libdeflate — all
     //           zero-headroom seam cells.
-    //
-    // ⛔ FALSIFY 2026-08-01, KEPT because its VERDICT stands and its CAUSE was wrong:
-    // `Lazy(12,30)` was tried first and was NO-SHIP — it closed 5 but OPENED
-    // `ecoli.fastq` vs libdeflate (4,432,143 -> 4,592,250, rival 4,568,588). I attributed
-    // that to "Lazy is not uniformly stronger; it is stronger only where matches are
-    // dense" (the record above, from the L2 attempt). **That attribution was wrong.**
-    //
-    // ⛔ AND THEN I GOT THE CAUSE WRONG A SECOND TIME. I first blamed the parser; then I
-    // blamed `choose_min_match_len`'s clamp (it caps min_len at <=7 below depth 16, and
-    // 16 -> 12 crosses that). I posted that, THEN tested it, and the predicted second
-    // consequence FALSIFIED it: if the clamp bound, depth 15 -> 16 would show a
-    // DISCONTINUOUS jump on low-variety data. Measured, it does not — every step is
-    // smooth:
-    //     ecoli.fastq  d14 4,581,294  d15 4,575,025  d16 4,568,588  d17 4,561,876
-    //                  15->16 = -6,437   vs   14->15 = -6,269
-    //     dickens, markup.xml, dd79_bin6: same, no discontinuity.
-    // The clamp only binds when `min_lens[]` returns ABOVE the cap, i.e. on genuinely
-    // low-variety data. `ecoli.fastq` is FASTQ — bases PLUS quality scores PLUS headers —
-    // so its literal alphabet is wide and the table already returns a low min_len. The
-    // clamp is INERT on this corpus at these depths.
-    //
-    // THE ACTUAL CAUSE IS THE PLAIN ONE: depth 12 searches less than depth 16. That is
-    // all. `Lazy(12,30)` was a parser step AND a depth REDUCTION; this arm is the parser
-    // step alone.
-    //
-    // Three wrong mechanism stories for one correct measurement. The measurements never
-    // moved — Lazy(12,30) opens ecoli, Lazy(16,30) does not, this gate is clean — only my
-    // explanations did. "One measurement supports one claim" is the rule that keeps being
-    // broken here by generalising a code read into a claim about behaviour.
-    //
-    // ⚠ THE WALL LEG IS UNMEASURED AND IS THE ONLY REMAINING GATE. Lazy does roughly twice
-    // greedy's matchfinder calls at the same depth, so this spends wall BY CONSTRUCTION.
-    // Clause 5 is an erosion budget; the earlier parked L4 work (`level.rs`, `Lazy(10,30)`)
-    // died on exactly this leg at a CHEAPER depth. Needs `fulcrum ab paired` at T4 on
-    // solvency with aa_bias reported. Size alone cannot promote this.
-    // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
-    // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
     p
 }

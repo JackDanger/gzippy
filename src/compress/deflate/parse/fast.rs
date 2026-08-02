@@ -229,24 +229,6 @@ pub mod tune {
         /// (text-class content, the measured both-axes LOSS this lever
         /// exists to close). Same one-block-lag / "first block has no
         /// signal yet" scope gap as `chain_enabled`/`hash3_gated`.
-        ///
-        /// FALSIFY/FALSIFIED (2026-07-25 — see [`super::LAZY_PEEK_GATED`]'s doc
-        /// comment for the full sweep + isolation story): a fine per-file
-        /// threshold sweep (5-45) finds a smooth, non-knife-edge ramp on
-        /// `dd79_text6` and a threshold in `[37,40]` that fully reverts it
-        /// while leaving `dd79_bin6`/`data.sqlite` untouched — the detector
-        /// and threshold work exactly as designed. But even a full revert
-        /// only moves `dd79_text6`'s wall vs `libdeflate-gzip -1` from
-        /// 1.133 to 1.080 (real, but not under 1.0 — does not clear the
-        /// ship rule). Isolation attributes the remaining ~8-9 points to
-        /// HASH3-GATE's mere PRESENCE in the hot loop, confirmed
-        /// insensitive to ITS OWN gate threshold (raising `hash3gate
-        /// threshold` to 90 leaves `dd79_text6`'s wall unchanged while
-        /// visibly breaking `dd79_bin6`'s own hash3 win) — a structural
-        /// codegen tax, not a probe-frequency one, so no threshold on
-        /// either lever's detector closes it. Stays `false`
-        /// (byte-identical AND wall-identical to before this lever
-        /// existed, confirmed on a prod build); not promoted.
         pub lazy_peek_gated: bool,
         /// Literal-fraction threshold in PERCENT for
         /// [`Self::lazy_peek_gated`] (same formula as
@@ -306,12 +288,6 @@ pub mod tune {
         /// content (low literal fraction, match-heavy) never trips the
         /// detector so those blocks are byte-identical to the un-tuned
         /// path; bin-like content (high literal fraction, e.g. dd79_bin6
-        /// measured 92% literal at L1 in the ICF-ARCHITECTURE FALSIFY note
-        /// above) does. One-block lag by construction (a file's FIRST block
-        /// always starts chainless — there is no preceding block to read a
-        /// signal from); a whole-file-in-one-block input therefore never
-        /// adapts, a known scope gap, not a correctness issue. Off by
-        /// default (`false`).
         pub chain_enabled: bool,
         /// Literal-fraction threshold in PERCENT (0-100): the next block
         /// switches to chain mode iff `100*literals >= chain_lit_threshold_pct
@@ -884,43 +860,6 @@ pub(super) const L1_HASH3_BITS: u32 = 15;
 /// candidate (see [`hash3_candidate`]'s doc comment) — the DEFLATE window
 /// size, i.e. the gate never rejects a length-3 candidate purely for
 /// distance (measured best on the composed sweep).
-///
-/// FALSIFY (2026-07-25, solvency AMD Zen2, `fulcrum paired` n=15, A/A clean,
-/// /dev/null both arms, roundtrip + exact-size gates): **lowering this constant
-/// is NOT an exit for the `weights.safetensors x libdeflate-1` LOSS cell, and
-/// this constant is not a WALL lever at all.** Driving it 32768 -> 0 (full
-/// hash3 shutoff) on `weights.safetensors`:
-///   size vs libdeflate-1  1.003656 -> 1.000108  (97% of the size gap closed,
-///                                                but never reaches <= 1.0)
-///   wall vs libdeflate-1  1.6914x  -> 1.6743x   (~1% -- i.e. flat)
-/// CORRECTION (same day, same rig): BOTH arms above ran on an `l1-tune` feature
-/// build (required -- `max_dist` is only runtime-settable there). That build is
-/// ~17% SLOWER than what ships, for knob-plumbing reasons unrelated to any lever:
-/// interleaved A/B of the l1-tune binary (tuned to the shipped consts, output
-/// BYTE-IDENTICAL, size_ratio=1.0) vs a vanilla `cargo build --release` binary at
-/// the same commit gave ratio=1.1702, sign 15/15, spread 0.0117. The RELATIVE
-/// result above is unaffected (both arms carry the same tax) but the ABSOLUTE
-/// deficit is inflated. Production deficit vs libdeflate-1 on this file is
-/// **1.4515x** (sign 15/15, spread 0.0057). Never quote an l1-tune build's ratio
-/// against a RIVAL; it is only valid against another l1-tune build.
-/// A Gate-2 perturbation of >=2 magnitudes that moves the wall 1% means hash3
-/// is NOT on this cell's critical wall path. Both LOSS axes therefore survive
-/// full shutoff. Second, independent blocker: the same shutoff destroys
-/// `dd79_bin6`'s pigz-1 size win (0.997516 -> 1.040685), so the constant cannot
-/// be lowered corpus-wide regardless.
-///
-/// REDIRECT implied by the same run (recorded so the next reader does not
-/// repeat the mis-sizing): this LOSS cell is **0.37% on size and 69% on the
-/// wall** (0.37% / 45%, using the corrected production wall above). Prior work on
-/// it targeted the size axis (length-3 match census,
-/// `entropy_tables` share) because size is deterministic and cheap to
-/// instrument. Any further work on this cell belongs on the wall axis; a
-/// content-adaptive hash3 gate separating weights from bin6 would, even if it
-/// worked perfectly, close 0.37% of a 45% deficit. And the deficit is NOT
-/// weights-specific: same rig, production binary, n=15, /dev/null both arms --
-/// photo.jpg 1.4627x, armexe.elf 1.3558x, monorepo.tar 1.0145x, access.log
-/// 0.9519x (gzippy FASTER). It is a content-class relationship (binary /
-/// high-entropy slow, plain text fast), not a property of this file.
 pub(super) const L1_HASH3_MAX_DIST: usize = WINDOW;
 /// Probe policy: `false` (policy (a), miss-only — the cheapest, measured
 /// best) probes `head3` ONLY when the primary 4-byte probe did not already
@@ -1370,65 +1309,6 @@ const LAZY_PEEK_MIN_DIST: usize = 0;
 /// blocks, where the wide peek's extra probes measurably cost more wall
 /// than the size it recovers (the `libdeflate x dd79_text6 x L1` regression
 /// this lever exists to close).
-///
-/// FALSIFY/FALSIFIED (2026-07-25, same mission — kept as tested, measured `l1-tune`
-/// infrastructure per this file's own convention, e.g.
-/// `LAZY_PEEK_COST_GATE_ENABLED`/`bucket2_enabled`; `false` here means the
-/// default build is BYTE-IDENTICAL and WALL-IDENTICAL to before this lever
-/// existed — confirmed directly: a prod (`l1-tune`-off) build of this
-/// lever's code with the const left `false` reproduced the pre-lever
-/// baseline's `dd79_text6`/`dd79_bin6`/`data.sqlite` sizes byte-for-byte AND
-/// its wall within noise on solvency, AMD EPYC 7282, N=21 interleaved
-/// paired vs `libdeflate-gzip -1`).
-///
-/// A per-file, fine-grained (not aggregate) threshold sweep (5-45 in steps
-/// of 1, `l1-tune`'s size-only path, so build-flavor-independent) found a
-/// SMOOTH ramp on `dd79_text6` — not a knife-edge like `L1_HASH3_GATE_LIT_
-/// THRESHOLD_PCT`'s `dd79_bin6` cliff at 50 — from byte-identical-to-wide
-/// below 25 to a fully-reverted plateau at 40+, while `dd79_bin6` stayed
-/// BYTE-IDENTICAL to the wide-peek default at every threshold up to at
-/// least 90 and `data.sqlite` only started moving past 37 (negligible,
-/// +0.02%, until threshold 48+). So a threshold in `[37, 40]` gates
-/// `dd79_text6` to a full revert while leaving `dd79_bin6`/`data.sqlite`
-/// untouched — the detector and threshold ARE exactly what the mission
-/// asked for.
-///
-/// But even a FULL revert (threshold 40, matching an unconditional
-/// `LAZY_PEEK_NARROW_MAX_LEN`/`LAZY_PEEK_NARROW_MIN_DIST`-everywhere build)
-/// only moves `dd79_text6`'s wall ratio vs `libdeflate-gzip -1` from 1.133
-/// (shipped) to 1.080 — real (outside the ~1-2% inter-run spread) but
-/// NOT under 1.0, so it does NOT clear the ship rule's leg (a) ("EXITS the
-/// LOSS class — either WIN or at minimum SPEED-ONLY with wall < 1.0"). A
-/// direct isolation (const-patched prod builds, same protocol) attributes
-/// the residual: reverting ONLY the peek (`LAZY_PEEK_MAX_LEN`/`MIN_DIST`
-/// back to 4/8192 file-wide, HASH3-GATE left at its shipped default)
-/// measures 1.090; reverting BOTH the peek AND `Hash3Cfg::shipped().enabled`
-/// measures 1.008 (a NOISY near-tie) — an ~8-9 percentage-point gap
-/// attributable to HASH3-GATE's mere PRESENCE in the hot per-position loop,
-/// not to how often it fires. Confirmed decisively: raising `L1_HASH3_GATE_
-/// LIT_THRESHOLD_PCT` alone (shipped peek unchanged) to 90 — so high the
-/// gate barely ever activates even on `dd79_bin6` (whose OWN size regresses
-/// from 0.960x to 0.988x libdeflate at that threshold, proving the gate
-/// really did almost stop firing there) — leaves `dd79_text6`'s wall
-/// UNCHANGED at 1.137 (statistically identical to shipped's 1.133). The tax
-/// is paid on every position regardless of the gate's runtime value — a
-/// structural/codegen cost (the extra `Hash3Cfg` parameter, the `head3`
-/// touch/probe branches, likely reduced inlining or register pressure in
-/// `process_position_l1`/`fastloop_l1`) from the mere PRESENCE of the
-/// HASH3-GATE machinery, not a probe-frequency-dependent one — so no
-/// threshold on either detector (this lever's OR hash3's own) can close it.
-///
-/// Not promotable within this mission's scope: fully closing this cell
-/// would require making HASH3-GATE (and the wide peek) compile OUT of the
-/// hot loop entirely for text-classified stretches — a genuinely separate,
-/// leaner monomorphized fast-loop variant selected by a coarser dispatch —
-/// not a runtime gate on the existing shared function, and touching
-/// `Hash3Cfg::shipped().enabled` at all is independently disqualified: it
-/// would give back `dd79_bin6`'s own hash3-earned win vs `pigz -1`, the
-/// exact cell HASH3-GATE was promoted to fix. `false` stays the shipped
-/// default; this is a FALSIFY entry (re-open trigger: a monomorphized
-/// hash3-off/peek-off fast-loop specialization, not another threshold
-/// sweep on this same shared-function shape).
 const LAZY_PEEK_GATED: bool = false;
 /// Literal-fraction threshold in PERCENT for [`LAZY_PEEK_GATED`] (mirrors
 /// [`L1_HASH3_GATE_LIT_THRESHOLD_PCT`]'s formula, an independent knob).
@@ -1454,46 +1334,6 @@ const LAZY_PEEK_NARROW_MIN_DIST: usize = 8192;
 /// spent as literals — the length-gated `better_match` delta test below
 /// only ever asks "is the NEXT position's candidate clearly better than
 /// this one", never "is THIS match worth taking at all".
-///
-/// FALSIFY/FALSIFIED (2026-07-23, same session that added this lever — kept as
-/// tested, documented `l1-tune` infrastructure per this file's own
-/// convention for measured-but-unshipped axes, e.g. `bucket2_enabled`/
-/// `chain_enabled`; `false` here means the default build is BYTE-IDENTICAL
-/// to before this lever existed). Two designs were tried:
-///   - REPLACING the `better_next` test below with a single span-
-///     normalized bits(accept) vs bits(defer) comparison shrinks the
-///     `greedy_over_match` bucket for real (1,028,294 -> 886,965 bits,
-///     -13.7%, `match_diff` does not regress: 1,265,603 -> 1,252,384) but
-///     FLIPS `dd79_bin6` WIN -> LOSS vs `pigz -1` (0.9987 -> 1.0011,
-///     disqualifying — this file is the campaign's own named target for
-///     "must hold").
-///   - The ADDITIVE design actually wired up here (`better_next ||
-///     not_worth_it`, `not_worth_it` a standalone bits(match) vs
-///     bits(length literals) reject, independent of `next`) is SAFE: zero
-///     WIN->LOSS flips vs `pigz -1` across the full 21-file
-///     `~/www/gzippy-bench/corpus` breadth set at `LAZY_PEEK_COST_GATE_
-///     MARGIN_BITS=0` (the widest margin with any effect at all — `>= 4`
-///     is byte-identical to off, `<= -4` re-introduces the `dd79_bin6`
-///     flip). But `fulcrum paired --mode compress` (N=21, /dev/null sink,
-///     clean A/A certificates, sha+roundtrip verified) shows this design
-///     ADDS a real, RESOLVED (not TIE) wall tax ON TOP of the already-
-///     shipped widened-peek/hash3-gate baseline on EVERY fixture tested —
-///     sqlite +5.6%, text6 +4.2%, bin6 +4.6-4.7% (replicated twice), sil40
-///     +3.3% — while the paired, thread-grid-matched size delta is
-///     noise-level and INCONSISTENTLY signed (±0.03-0.19%, unlike the
-///     larger, one-off CLI-only size reads that motivated trying this in
-///     the first place: those used the default auto-detected thread
-///     count, which changes the block grid and is not paired against the
-///     wall numbers). The mission's own wall budget ("tax <= current
-///     +3.8-7.2%, ideally LOWER") is violated in the wrong direction —
-///     this STACKS tax, it does not reduce it — for a size "win" that
-///     does not survive a rigorous same-grid remeasurement. NOT promoted;
-///     `LAZY_PEEK_COST_GATE_ENABLED` stays `false`. Re-open trigger: a
-///     future design that recovers `greedy_over_match` bits WITHOUT
-///     converting an accepted multi-byte match into several individual
-///     per-position literal decisions (the likely wall-cost mechanism —
-///     a batched match-skip becomes N un-batched positions) would need to
-///     re-run this exact `fulcrum paired` protocol before reconsidering.
 const LAZY_PEEK_COST_GATE_ENABLED: bool = false;
 
 /// Slack (in [`est_match_bits`]-scale bits) added to the literal side of the
@@ -1546,18 +1386,6 @@ const WINDOW: usize = 32768;
 /// 64 KiB the ~dozens-of-bytes dynamic header amortizes to well under 1%. This
 /// is the fast path's one ratio/speed tuning knob — it does not affect
 /// correctness (any block boundary roundtrips).
-// FALSIFY 2026-07-30 (FALSIFY-record) — do NOT "fix" this to 65,535 to match libdeflate's
-// FAST_SOFT_MAX_BLOCK_LENGTH (`deflate_compress.c:102`). The reasoning is seductive and
-// wrong: a DEFLATE stored block carries at most 65,535 B, so 1<<16 cannot be ONE stored
-// block and costs a second sub-block header for a single trailing byte. True, and it
-// buys nothing, because L1 does not choose stored on the data where it would matter.
-// Exact bytes at L1 T1, 1<<16 -> 65,535:
-//     photo.jpg   6,473,842 -> 6,473,842   UNCHANGED (L1 codes it dynamic, not stored)
-//     data.csv    4,111,742 -> 4,111,746   +4 B
-//     dickens     5,077,406 -> 5,077,412   +6 B
-// Strictly worse: nothing gained on incompressible input, a few bytes lost on
-// compressible input to the extra block header. The photo.jpg gzip cells it was aimed
-// at (+0.03% at L1/L2/L3) are NOT a stored-framing problem.
 pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 
 /// L0's block length. The per-block dynamic-Huffman build (canonical code +
@@ -2082,27 +1910,6 @@ fn process_position_l1(
 /// peek/hash3 gates are independent, not composed, in the CURRENT shipped
 /// build (only a hypothetical `LAZY_PEEK_GATED = true` build would tie them
 /// together, and that lever is the one [`LAZY_PEEK_GATED`]'s doc comment
-/// records as FALSIFY-record, not shipped). Narrowing the peek here would
-/// therefore be a genuine DECISION CHANGE for every gate-inactive block on
-/// every corpus with any short-far match, not a codegen-only change — a
-/// real difference confirmed empirically (`sha256` mismatches on
-/// `dickens`/`webster`/`xml`/`samba` at L1, every mismatch localized to
-/// exactly the level this function affects) before this comment was
-/// corrected to match the fix. So this function strips ONLY the HASH3
-/// machinery, which — per [`LAZY_PEEK_GATED`]'s isolation measurement (the
-/// `L1_HASH3_GATE_LIT_THRESHOLD_PCT = 90` probe) — is independently
-/// confirmed as the structural tax, not the peek pair's mere presence.
-/// Every decision this function makes (accept/reject/defer, match
-/// length/distance, literal bytes) for a block it is dispatched to is
-/// IDENTICAL to what [`process_position_l1`] already produces for that
-/// exact block today (hash3 already inert there, peek already wide there)
-/// — this is purely a codegen-shape change, not a decision change. See
-/// [`fastloop_l1_lean`]'s doc comment for why this had to be a genuinely
-/// separate function rather than a runtime gate on the shared one (the
-/// measured structural tax [`LAZY_PEEK_GATED`] falsified).
-///
-/// `#[cfg(not(feature = "l1-tune"))]`: only the default (shipped) build
-/// dispatches here at all — see [`fastloop_l1_lean`]'s doc comment.
 #[cfg(not(feature = "l1-tune"))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]

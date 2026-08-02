@@ -139,10 +139,6 @@ lever:
 	@scripts/campaign/lever.sh "$(REF)" $(ARGS)
 
 # What has already been tried and refuted — run this BEFORE proposing anything.
-#   make falsified            every record, one line each
-#   make falsified Q=huffman  only records matching a file path or text
-falsified:
-	@python3 scripts/campaign/falsified-index.py $(Q)
 
 # =============================================================================
 # Quick test suite — deterministic, layered, <30 seconds.

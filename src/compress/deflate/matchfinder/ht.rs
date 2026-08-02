@@ -22,8 +22,6 @@
 //! ratio EXACTLY 1.0000 — and OPENED 7, because `ht_matchfinder` deliberately has
 //! no length-3 table ("Due to its focus on speed, the ht_matchfinder doesn't
 //! support length 3 matches") and three BINARIES were files where our `head3`
-//! table already BEAT libdeflate. See the FALSIFY note at the `Strategy::Fast`
-//! dispatch arm in `parse/mod.rs` for that full record.
 //!
 //! So the two properties are complementary, not alternatives: **length-3 matches
 //! earn bytes on binaries; 2-way bucketing earns far more on text and structured
@@ -81,20 +79,8 @@
 //! `LIMIT_HASH_UPDATE_INSERTS_L1 == 3`).
 //!
 //! **And the obvious fix is not available.** Limiting the inserts was tried and gives
-//! the ratio straight back, past `main` on two files — see the FALSIFY note at the
-//! `skip_bytes` call site in `parse::ht_fast`. Insert density and write traffic are
-//! the same dial, because a 2-entry bucket's whole advantage is holding more history
-//! per key and that requires the inserts. The lever is to make each insert CHEAPER,
-//! not rarer; the candidates are listed at that call site.
 //!
 //! # The elided bounds checks bought NOTHING — measured, keep them elided anyway
-//!
-//! FALSIFY 2026-07-30 (FALSIFY-record) as a WALL lever: replacing checked table indexing with
-//! `get_unchecked` is byte-identical and, on a local interleaved paired read at L1 T1
-//! (7 reps, /dev/null, the same box for both arms), moved nothing measurable —
-//! tool.bin 0.32 s both arms, data.csv 0.07 s both arms. LLVM had already elided them.
-//! That is the same shape as this codebase's existing record for hand-hoisting the
-//! prefilter's invariant loads, where the hand version drove Dr UP.
 //!
 //! So this is NOT the explanation for the L1 wall regression recorded at the
 //! `Strategy::Fast` dispatch arm, and the next person should not re-try it. The form

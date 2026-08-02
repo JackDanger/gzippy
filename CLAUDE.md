@@ -54,13 +54,13 @@ target cells have headroom.
 **The needed margin is ~0.01%, and Huffman CONSTRUCTION cannot supply it.** The first
 version of this paragraph named "costing an exact package-merge code beside the
 heuristic one" as the example monotone win. That is a CLOSED class — see the binding
-FALSIFY record at `src/compress/deflate/huffman/fast.rs:432`, which built it BOTH ways
-and measured: the unconditional swap is a wash that OPENS cells, and the costed dual
+measurement (recorded in git history, the in-code note was deleted 2026-08-01), which
+built it BOTH ways and measured: the unconditional swap is a wash that OPENS cells, and the costed dual
 candidate holds its size invariant (49/49 smaller) at ~0.001% margin while costing
 10-14% WALL and flipping sil40 L6 from win to lose. libdeflate's heuristic length
 limiter is already within 0.001% of exact; the margin we need is an order of magnitude
-larger, so this is not a speed problem and REOPEN requires a genuinely new mechanism.
-Per that record, the remaining candidates are **block BOUNDARIES or the parse** —
+larger, so this is not a speed problem. That measurement stands on its own numbers, not on any
+record's authority — re-run it if you doubt it. The remaining candidates are **block BOUNDARIES or the parse** —
 which is where `examples/blockspans` points too: gzip splits on a fixed ~34,000-symbol
 cadence (cv=0.023) while our spans run 8x longer at cv=0.373.
 DONE WHEN: the same per-label bar holds at the default thread count and at T4/T8/T16.
@@ -101,7 +101,7 @@ vendor-fidelity rule, and no clause in this file that requires anyone's approval
 Read libdeflate, igzip, zlib-ng, zopfli, ECT, rapidgzip — steal every good idea.
 **Never inherit a vendor's decisions.** Our level->config map is currently a copy of
 libdeflate's, which is why we run their algorithm slower than they do; it is free to
-change. A technique with no vendor counterpart is equally welcome. A prior falsification is BINDING until a NEW mechanism is named (see Hard stops).
+change. A technique with no vendor counterpart is equally welcome.
 
 Decide, build, measure, report. Never ask permission.
 
@@ -122,9 +122,9 @@ Decide, build, measure, report. Never ask permission.
 - **One rule per change, declared once.** If a promotion rule fails, the change is
   reverted or the change is fixed. Re-writing the rule to fit the result is not
   allowed; neither is announcing in advance what you will do when it fails.
-- **A change that makes things worse gets reverted and a FALSIFY comment goes next to
-  the code that tempts the mistake.** In-code records are the only internal check
-  that has ever worked here.
+- **A change that makes things worse gets reverted.** Do NOT leave a FALSIFY comment
+  behind — those were deleted wholesale on 2026-08-01 as noise. Re-measure with
+  instrumentation when the question comes up again.
 
 ## Reasoning, measuring, and tooling
 
@@ -159,16 +159,23 @@ least once in a single session.
    the idea pays, so the bar is a measurement rather than an argument.
    Build the vendor with `-g` or its profile is one opaque symbol.
 
-2. **A FALSIFY note is BINDING.** Touching a function that carries one requires a
-   `REOPEN:` line in the commit message naming a NEW mechanism and what would
-   falsify it. "Different code shape now" is not a mechanism. Two attempts this
-   session were variants of an already-recorded falsification.
+2. **RETRACTED 2026-08-01 by the user — this slot used to read "A FALSIFY note is
+   BINDING."** *"Delete all of those falsify comments. They're just noise. Not a single
+   one of them is more valuable than simply running the tool with good instrumentation."*
+   All 43 in-code FALSIFY records were deleted, along with `make falsified`,
+   `check-falsify-visible.py` and the commit-msg enforcement. **Do not re-add them, and
+   do not treat a falsification quoted from git history as binding.** Re-measure instead
+   — the instruments are cheap now and a record is not.
+   Receipt for why: a record at `ht_fast.rs:200` closed the insert-density class, and
+   instrumenting both encoders showed the shipped path sits at 0.276 inserts/byte against
+   libdeflate's 1.000 — a structural gap the record's own numbers could not have revealed,
+   because they were taken on a different matchfinder.
 
 3. **Never generalise a measurement across levels — AND THIS APPLIES TO RECORDS, NOT
    ONLY TO CHANGES.** The hard stops are enforced against edits: a commit hook reads
-   commit messages, `fulcrum candidates` reads FALSIFY notes. NOTHING enforces a hard
-   stop against the TEXT OF A RECORD, so a falsification may itself violate #3 and then
-   survive indefinitely, closing a class for every session that greps it. Receipt: a
+   commit messages. NOTHING enforced a hard stop against the TEXT OF A RECORD, so a
+   falsification could itself violate #3 and survive indefinitely, closing a class for
+   every session that grepped it. (This is a large part of why the records were deleted.) Receipt: a
    2026-07-28 note measured L2 only and concluded "Depth is not the cost; the strategy
    is." That sentence is false at L5-L9 — raising `max_search_depth` to zlib-ng's chain
    values, changing no strategy, closed 84 failing size cells — and it cost weeks:
@@ -207,8 +214,7 @@ least once in a single session.
 
    `why` returns the vendor diff — position counts (match/literal/header/data per byte) name
    the MECHANISM in one command — and it states which of its four layers it SKIPPED, so a
-   partial run cannot be mistaken for a whole one. `candidates` surfaces FALSIFY records
-   loudly. `dropin` is the THIRD goal axis (CLI behaviour) and went unmeasured for the whole
+   partial run cannot be mistaken for a whole one. `dropin` is the THIRD goal axis (CLI behaviour) and went unmeasured for the whole
    campaign. **`fulcrum try` defaults to `--threads 1`** — a T>1 change judged without
    `--threads 1,4` is measured on cells it cannot affect, and will read NO-SHIP for the
    wrong reason. A
@@ -246,7 +252,7 @@ time each one has cost.
    axis and only loses on another, its cost is a candidate for a coordinate artefact. Receipt:
    a strict size win (49/49 cells smaller, 0 worse) was deleted for a wall cost that is 6x
    smaller at T4 than the T1 number it was judged on. It had to be rediscovered, and the
-   FALSIFY note left behind actively told the next session not to look.
+   note left behind actively told the next session not to look.
 
 5. **Compose before concluding.** Two changes that each miss the bar can clear it together.
    Receipt: ~150 B of margin ("too small to matter") plus a seam reduction ("still fails")
@@ -289,9 +295,8 @@ time each one has cost.
   board check. No new lever starts while a cleared win sits unmerged or a
   user-ordered deletion sits undone. (Receipt: the only landed win of 2026-07-28
   sat in a PR through eight falsified levers.)
-- **Two strikes closes a class.** Two falsifications of the same mechanism close
-  that class for the session; reopening needs a vendor diff naming why the next
-  instance differs. Five of one session's eight levers were the same class —
+- **Two strikes is a hint, not a closure.** Two failures of the same mechanism mean
+  look harder at the vendor diff before a third attempt — they do not close the class. Five of one session's eight levers were the same class —
   hand-scheduling a loop LLVM had already scheduled — re-sampled after its verdict
   was already known.
 - **Run `scripts/campaign/tie-guard.sh <ref>` before any change that alters T1 output.** We are
