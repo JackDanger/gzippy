@@ -276,6 +276,45 @@ fn params_inner(level: u32) -> LevelParams {
         //     4 => Strategy::Lazy, max_search_depth: 10, nice_match_length: 30
         // symbols.dwarf is strictly Pareto-dominant there: 6,553 B smaller AND 4.8%
         // faster at T4 (wall ratio 0.9519).
+        //
+        // ⚠ CORRECTION 2026-08-01 — THE CANDIDATE ABOVE DOES NOT FIX THE LADDER, AND THE
+        // LADDER IS WHY L4 IS BROKEN. `Lazy(10,30)` was selected on TOTAL SIZE ("wins
+        // 11/11 TUNE"). Scored instead on MONOTONICITY — L4 must be <= L3 on every file
+        // — it still SAGS on 5 of 22 corpus files: aozora.txt +15,237, dickens +13,865,
+        // dd79_text6 +8,511, engine.wasm +363, movie.mp4 +74. Full 22-file sweep, size
+        // only, via the `ladder-tune` feature:
+        //
+        //     candidate       total size      sags vs L3   overtakes L5
+        //     Greedy(16,30)   213,942,000       17/22          1/22   <- SHIPS TODAY
+        //     Lazy(10,30)     210,447,579        5/22          1/22   <- the PARK above
+        //     Lazy(12,30)     210,178,695        0/22          0/22   <- the right one
+        //     Lazy(14,30)     209,984,635        0/22          1/22
+        //     Lazy(16,30)     209,808,452        0/22          0/22   <- identical to L5
+        //
+        // `Lazy(12,30)` is ALSO 268,884 B smaller in total than the parked point, so it
+        // wins on this record's own objective too; and depth 12 matches L3's own depth,
+        // making it the least depth that does not downgrade search strength going UP the
+        // ladder. The note above says "depths 6/8/10/12 all measured … no interior point
+        // exists — do not re-sweep": depth 12 WAS measured, but the ranking was by total
+        // size, so NOBODY SCORED THESE FOR MONOTONICITY. Monotonicity is not a board
+        // cell, which is why the whole campaign walked past it.
+        //
+        // THIS DOES NOT UNBLOCK THE LEVER. `Lazy(12,30)` costs MORE wall than
+        // `Lazy(10,30)`, which already failed clause 5 on 9/11 — the wall problem is now
+        // HARDER, not easier. What changes is the TARGET: **if a solvency wall run is
+        // ever spent on this family it must measure `Lazy(12,30)`**, because
+        // re-measuring `Lazy(10,30)` would burn a run on a candidate that does not solve
+        // the problem it was parked for.
+        //
+        // Root cause of the sag itself, measured the same day: OUR L3 IS `Lazy(12,14)`
+        // WHERE LIBDEFLATE'S IS `Greedy(12,14)`, and L4 is the only `Greedy` above L2 —
+        // so L3->L4 DOWNGRADES THE PARSER. Our L4 output is byte-identical to
+        // libdeflate's L4; only L3 moved. libdeflate's own ladder sags on 3/22 by
+        // 25-117 B; ours on 17/22 at L4. Our L3 win is 3,556,831 B and the sag it creates
+        // costs 2,836,732 B — NET 720,099 B. Reverting L3 to `Greedy(12,14)` measures
+        // 22/22 BYTE-TIES with libdeflate -3 and 21/22 monotone. See
+        // docs/board/our-L3-win-causes-the-L4-sag.md and
+        // docs/board/the-parked-L4-candidate-does-not-fix-the-ladder.md.
         4 => LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 16,
