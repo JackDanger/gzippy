@@ -27,9 +27,39 @@ And of those three encoder files, only one is on the shipping L0-L9 path:
 | `parse/ultra/squeeze.rs` | real AVX + NEON kernels | **no** — `ultra` is reached only via explicit `--zopfli-*` flags (`src/compress/mod.rs:110-133`), never from `-1`..`-9` |
 | `parse/mod.rs:1223,1241` | the strings "avx2"/"aarch64" **inside doc comments** | n/a — no code |
 
-**So on every level a user can actually type, our encoder does zero SIMD compute.** The
-decoder — which is done and won — has 18 files of it: `asm_kernel.rs`, `bmi2.rs`,
-`simd_copy.rs`, `simd_huffman.rs`, `lut_huffman.rs`, `crc32.rs`, and more.
+⚠ **CORRECTION — I first wrote "the encoder does zero SIMD compute" here. That is
+FALSE, and I proved it false by disassembling the shipped binary.** The correct claim is
+narrower: the encoder has almost no *explicit* arch-specific code. **Autovectorisation
+supplies real SIMD anyway.**
+
+**Open question O-8 — "we never measured whether rustc actually vectorizes [our
+rebase]" — is now ANSWERED: YES.** The shipped binary contains **132 `smax.8h` + 132
+`orr.8h`**, in exactly our idiom, 4-way unrolled at 32 `i16` lanes per iteration:
+
+```
+ldp   q1, q2, [x16, #-0x20]      ldp   q3, q4, [x16]
+smax.8h v1,v1,v0   smax.8h v2,v2,v0   smax.8h v3,v3,v0   smax.8h v4,v4,v0
+orr.8h  v1,#0x80,lsl #8   (x4)
+stp   q1, q2, [x16, #-0x20]      stp   q3, q4, [x16], #0x40
+```
+
+`smax` against zero then `orr 0x8000` is precisely `(0x8000) | (v & !(v >> 15))`. So
+**[G3] SIMD slide_hash is effectively ACHIEVED on aarch64 via autovectorisation** — we
+match zlib-ng's technique without writing an intrinsic.
+
+**A METHOD WARNING WORTH MORE THAN THE RESULT:** `cargo rustc --emit asm` produced a
+`.s` with **zero** `smax.8h`, and I nearly reported "the shipped binary does not
+vectorise". That `.s` is emitted **pre-LTO** and does not reflect the shipped artifact.
+The release profile is `lto = "fat"`. **Disassemble the BINARY (`otool -tv`), never
+trust `--emit asm`, when the claim is about what ships.**
+
+The decoder — done and won — has 18 files of *explicit* SIMD: `asm_kernel.rs`,
+`bmi2.rs`, `simd_copy.rs`, `simd_huffman.rs`, `lut_huffman.rs`, `crc32.rs`.
+
+**So the real leg-1 question is sharper than "add SIMD":** which encoder hot loops
+autovectorise and which do not? That is measurable the same way — disassemble and look.
+The vendors' remaining edge is in the loops autovectorisation CANNOT reach: igzip's
+histogram (a scatter), its `vpmaddwd` hash, and CRC32-instruction hashing.
 
 ### What the vendors do that we do not
 
@@ -131,7 +161,7 @@ Measured with `/usr/bin/time -l` peak RSS; full detail in `memory-is-o-n-not-o-1
 
 | leg | state |
 |---|---|
-| arch-specific approaches | **not started** in the encoder — one prefetch hint on the shipping path |
+| arch-specific approaches | **no DELIBERATE arch work** in the encoder (one prefetch hint) — but autovectorisation is real and verified: the rebase ships as 132 `smax.8h`+`orr.8h`. **O-8 answered YES.** The open question is now *which loops fail to vectorise* |
 | smooth level curve | **broken** — 18/22 files sag, 26 events, worst is −16.8% |
 | cache / memory tuning | **not started** — O(input) memory, no cacheline grouping, no table sizing |
 
