@@ -20,7 +20,6 @@ pub const NUM_OBSERVATIONS_PER_BLOCK_CHECK: u32 = 512;
 /// Minimum input bytes before/around a candidate split (`MIN_BLOCK_LENGTH`).
 pub const MIN_BLOCK_LENGTH: usize = 5000;
 
-
 #[derive(Clone)]
 pub struct BlockSplitStats {
     new_observations: [u32; NUM_OBSERVATION_TYPES],
