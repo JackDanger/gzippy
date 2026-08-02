@@ -468,12 +468,9 @@ impl HtMatchfinder {
         // HT_REQUIRED_NBYTES 5 rather than 4. Both keys come from ONE 4-byte load
         // of `in_next + 1`, so the length-3 table costs no extra input read.
         let hash = *next_hash as usize;
-        let hash3 = *next_hash3 as usize;
         let next_seq = unsafe { load_u32(base, in_next + 1) };
         *next_hash = lz_hash(next_seq, HT_HASH_ORDER);
-        *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
         debug_assert!((*next_hash as usize) < HT_TAB_LEN);
-        debug_assert!((*next_hash3 as usize) < HT_HASH3_SIZE);
         // Prefetch the bucket the NEXT position will touch, matching
         // libdeflate's `prefetchw(&mf->hash_tab[*next_hash])`.
         // SAFETY: `lz_hash(_, HT_HASH_ORDER)` returns < 1 << 15 == HT_TAB_LEN,
@@ -498,8 +495,18 @@ impl HtMatchfinder {
         // table stale for a later enabled block; stale entries are sound (every
         // candidate is re-validated against `cutoff` and by the 3-byte compare)
         // and the offset guard discards most carried-over entries anyway.
-        debug_assert!(hash3 < HT_HASH3_SIZE);
+        // The COMPUTATION of the 3-byte key is gated too — the banked ablation
+        // priced maintenance + key computation together at ~50M Ir on 6 MB, and
+        // "instructions are the binding cost in this finder" (see the packed-store
+        // record in `skip_bytes`). On a disabled block `*next_hash3` goes stale;
+        // at the first position of a re-enabled block the stale key probes one
+        // wrong bucket — the same "harmless wrong hash" convention libdeflate
+        // itself uses for `next_hash = 0` at stream start (see `ht_fast::run`),
+        // made safe by the same 3-byte compare.
         let cur_node3 = if self.allow_len3 {
+            let hash3 = *next_hash3 as usize;
+            *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
+            debug_assert!(hash3 < HT_HASH3_SIZE && (*next_hash3 as usize) < HT_HASH3_SIZE);
             // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
             let n = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
             unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
@@ -641,6 +648,9 @@ impl HtMatchfinder {
         // <= in_end - in_next`, so every `pos` reached below satisfies
         // `pos + 4 <= in_next + count + 5 <= in_end <= buf.len()`.
         let base = buf.as_ptr();
+        // One register-resident copy per call: the flag cannot change mid-call, and
+        // reading the field inside the loop measurably re-loads it per position.
+        let len3 = self.allow_len3;
         let mut hash = *next_hash as usize;
         let mut hash3 = *next_hash3 as usize;
         let mut pos = in_next;
@@ -676,14 +686,13 @@ impl HtMatchfinder {
             // Gated with acceptance, same as `longest_match` — see the comment
             // there. Dictionary seeding at T>1 runs with `allow_len3` forced on
             // (see `ht_fast::run`) so an enabled first block sees a full table.
-            if self.allow_len3 {
-                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
-            }
-
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
             hash = lz_hash(seq, HT_HASH_ORDER) as usize;
-            hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
+            if len3 {
+                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+                hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
+            }
             cur_pos += 1;
             remaining -= 1;
             if remaining == 0 {
@@ -695,7 +704,9 @@ impl HtMatchfinder {
             prefetch_write(self.hash_tab.as_ptr().add(hash) as *const u8);
         }
         *next_hash = hash as u32;
-        *next_hash3 = hash3 as u32;
+        if len3 {
+            *next_hash3 = hash3 as u32;
+        }
     }
 }
 
