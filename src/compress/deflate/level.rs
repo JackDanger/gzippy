@@ -231,6 +231,22 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // rescues a clause-3 violation. REOPEN needs a parse step that is monotone on
     // SPARSE-MATCH data, which Lazy is not.
     //
+    // ⭐ CONFOUND FOUND AFTER THE FACT — the candidate above changed TWO things, and the
+    // next attempt should change one. `choose_min_match_len` CLAMPS min_len by
+    // `max_search_depth`: below 16 it forces min_len <= 7 (`min_match.rs`, ported from
+    // libdeflate `:2299`). Going Greedy(16,30) -> Lazy(12,30) crosses that threshold, so
+    // it did not only swap the parser — it also LOWERED the minimum match length, letting
+    // shorter matches through on precisely the sparse-match data where that is wrong.
+    // libdeflate's own comment names the case: "some data (e.g. DNA sequencing data)
+    // benefits greatly from a longer minimum length".
+    //
+    // So `ecoli.fastq` may have died from the min_len clamp rather than from Lazy. The
+    // clean single-variable test is **`Lazy(16,30)`** — same depth as today, so min_len is
+    // unclamped, and only the parser changes. Measured on size alone it is 0/22 sags and
+    // 0/22 overtakes of L5 (the best of the sweep), but it was never gated against this
+    // branch and it makes L4 identical to L5 at T>1, which is its own question. **Do not
+    // re-run `Lazy(12,30)`; run `Lazy(16,30)`.**
+    //
     // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
     // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
