@@ -258,6 +258,22 @@ pub struct HtMatchfinder {
     /// documented reason it "doesn't support length 3 matches" — and adding it is
     /// the whole point of this variant. See the module doc.
     hash3_tab: [i16; HT_HASH3_SIZE],
+    /// Whether length-3 matches may be ACCEPTED for the block being parsed.
+    ///
+    /// Set per block by the parser from libdeflate's own literal-count rule
+    /// ([`super::super::parse::choose_min_match_len`]): a length-3 match is worth
+    /// taking only when literals are expensive, and the number of DISTINCT
+    /// literals in the data is libdeflate's proxy for that. Their
+    /// `deflate_compress_fastest` needs no such rule because its matchfinder has
+    /// no length-3 table to govern; we have one, so we need the rule they apply
+    /// at levels 2-9.
+    ///
+    /// The table is MAINTAINED regardless of this flag, so a block that re-enables
+    /// length-3 matching sees a fully populated table. Entries surviving from a
+    /// disabled block are still sound: every candidate is re-validated against
+    /// `cutoff` and by the 3-byte compare, so a stale entry can only produce a
+    /// genuine match or no match at all.
+    allow_len3: bool,
 }
 
 thread_local! {
@@ -323,6 +339,12 @@ impl HtMatchfinder {
             for i in 0..HT_HASH3_SIZE {
                 t3.add(i).write(MATCHFINDER_INITVAL);
             }
+            // MUST be written before `assume_init`: `new_uninit` gives uninitialised
+            // memory and a `bool` holding anything other than 0 or 1 is UB the moment
+            // it is read. `false` is the conservative arm — a parser that forgets to
+            // call `set_allow_len3` gets libdeflate's own no-length-3 behaviour, not
+            // a coin flip.
+            core::ptr::addr_of_mut!((*p).allow_len3).write(false);
             boxed.assume_init()
         }
     }
@@ -366,6 +388,15 @@ impl HtMatchfinder {
         let mut mf = existing.unwrap_or_else(Self::new);
         mf.reset();
         PooledHt(Some(mf))
+    }
+
+    /// Set whether [`Self::longest_match`] may return a length-3 match.
+    ///
+    /// Called once per DEFLATE block by the parser, which owns the bit-cost
+    /// question; the matchfinder only enforces the answer. See the field's doc.
+    #[inline]
+    pub fn set_allow_len3(&mut self, allow: bool) {
+        self.allow_len3 = allow;
     }
 
     /// `ht_matchfinder_slide_window`: rebase every stored position by one window.
@@ -528,7 +559,13 @@ impl HtMatchfinder {
         // parser a faithful `deflate_compress_fastest` (which accepts any match the
         // finder returns) and puts the bit-cost knowledge where the length-3
         // candidate is produced.
-        if best_len == 0 && cur_node3 > cutoff {
+        //
+        // `allow_len3` is the SECOND half of that bit-cost question, and the offset
+        // guard alone cannot answer it: distance decides what a length-3 match
+        // COSTS, while the literal distribution decides what the three literals it
+        // replaces WOULD have cost. Measured on the corpus, the two questions split
+        // the files cleanly and in opposite directions — see the field's doc.
+        if best_len == 0 && self.allow_len3 && cur_node3 > cutoff {
             let mp = in_base_now + cur_node3 as usize;
             let off = (in_next - mp) as u32;
             if off <= HT_MAX_LEN3_OFFSET {
