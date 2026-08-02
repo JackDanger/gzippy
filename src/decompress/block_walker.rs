@@ -233,6 +233,19 @@ fn decode_block_body(
     litlen_lens: &[u8],
     dist_lens: &[u8],
 ) -> std::io::Result<usize> {
+    decode_block_body_obs(bits, litlen_lens, dist_lens, &mut |_, _| {})
+}
+
+/// [`decode_block_body`] with a per-token observer: called with
+/// `(length, distance)` for every match and `(0, 0)` for every literal.
+/// The fingerprint layer counts tokens through this without a second
+/// decode loop existing to rot.
+fn decode_block_body_obs(
+    bits: &mut BitWalker,
+    litlen_lens: &[u8],
+    dist_lens: &[u8],
+    observe: &mut impl FnMut(u16, u16),
+) -> std::io::Result<usize> {
     let lit_lookup = build_canonical_lookup(litlen_lens, 15)?;
     let dist_lookup = build_canonical_lookup(dist_lens, 15)?;
     const LENGTH_BASE: [u16; 29] = [
@@ -256,6 +269,7 @@ fn decode_block_body(
         let (sym, len) = lookup_symbol(bits, &lit_lookup, 15)?;
         bits.bit_pos += len as u64;
         if sym < 256 {
+            observe(0, 0);
             out_count += 1;
         } else if sym == 256 {
             return Ok(out_count);
@@ -271,7 +285,8 @@ fn decode_block_body(
                     format!("invalid distance symbol {di}"),
                 ));
             }
-            let _distance = DIST_BASE[di] as usize + bits.read(DIST_EXTRA[di]) as usize;
+            let distance = DIST_BASE[di] as usize + bits.read(DIST_EXTRA[di]) as usize;
+            observe(length as u16, distance as u16);
             out_count += length;
         }
     }
@@ -596,4 +611,279 @@ mod tests {
             assert!(line.contains("\"decoded_bytes\""));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mechanism fingerprints
+// ---------------------------------------------------------------------------
+
+/// A structural fingerprint of a gzip stream, decomposed along the axes this
+/// campaign has measured to be the real mechanisms: parse decisions (tokens),
+/// entropy coding (header vs data bits), framing (empty seam blocks), and
+/// shape (block types, members). Every field is deterministic — no timing —
+/// so a fingerprint diff is a machine-behavior diff that runs anywhere.
+///
+/// The point is not any single field. A regression or a vendor gap shows up
+/// as a per-axis delta ("literals +14%, header_bits +2,384, framing
+/// unchanged"), which names the mechanism before any profiler runs. See
+/// `tests/fingerprint_suite.rs` for the ledger/frontier tests built on this
+/// and `examples/fingerprint_tool.rs` for pinning and gap reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamFingerprint {
+    /// Whole-file compressed size in bytes (gzip framing included).
+    pub file_bytes: u64,
+    /// Total decoded (uncompressed) bytes.
+    pub decoded_bytes: u64,
+    /// gzip members in the file (pigz/igzip may emit >1).
+    pub members: u32,
+    /// DEFLATE blocks by type.
+    pub blocks_stored: u32,
+    pub blocks_fixed: u32,
+    pub blocks_dynamic: u32,
+    /// Blocks that decode to ZERO bytes — seam/framing padding, not data.
+    pub empty_blocks: u32,
+    /// Bits spent on block headers (3-bit prelude + stored LEN/NLEN incl.
+    /// alignment, or the whole dynamic Huffman table description).
+    pub header_bits: u64,
+    /// Bits spent on symbol data (everything after each block's header).
+    pub data_bits: u64,
+    /// Parse decisions.
+    pub literals: u64,
+    pub matches: u64,
+    pub match_bytes: u64,
+    /// Match-length histogram: 3, 4-7, 8-15, 16-31, 32-257, 258 (max-match).
+    pub len3: u64,
+    pub len4_7: u64,
+    pub len8_15: u64,
+    pub len16_31: u64,
+    pub len32_257: u64,
+    pub len258: u64,
+    /// Matches whose distance exceeds 4096 (the length-3 offset-guard line).
+    pub dist_gt4096: u64,
+}
+
+impl StreamFingerprint {
+    /// Stable TSV column order. `parse_row` accepts exactly this shape, so
+    /// pinned files regenerate byte-identically when nothing changed.
+    pub const TSV_FIELDS: &'static [&'static str] = &[
+        "file_bytes",
+        "decoded_bytes",
+        "members",
+        "blocks_stored",
+        "blocks_fixed",
+        "blocks_dynamic",
+        "empty_blocks",
+        "header_bits",
+        "data_bits",
+        "literals",
+        "matches",
+        "match_bytes",
+        "len3",
+        "len4_7",
+        "len8_15",
+        "len16_31",
+        "len32_257",
+        "len258",
+        "dist_gt4096",
+    ];
+
+    pub fn tsv_values(&self) -> Vec<u64> {
+        vec![
+            self.file_bytes,
+            self.decoded_bytes,
+            self.members as u64,
+            self.blocks_stored as u64,
+            self.blocks_fixed as u64,
+            self.blocks_dynamic as u64,
+            self.empty_blocks as u64,
+            self.header_bits,
+            self.data_bits,
+            self.literals,
+            self.matches,
+            self.match_bytes,
+            self.len3,
+            self.len4_7,
+            self.len8_15,
+            self.len16_31,
+            self.len32_257,
+            self.len258,
+            self.dist_gt4096,
+        ]
+    }
+
+    pub fn from_tsv_values(vals: &[u64]) -> Option<Self> {
+        if vals.len() != Self::TSV_FIELDS.len() {
+            return None;
+        }
+        Some(Self {
+            file_bytes: vals[0],
+            decoded_bytes: vals[1],
+            members: vals[2] as u32,
+            blocks_stored: vals[3] as u32,
+            blocks_fixed: vals[4] as u32,
+            blocks_dynamic: vals[5] as u32,
+            empty_blocks: vals[6] as u32,
+            header_bits: vals[7],
+            data_bits: vals[8],
+            literals: vals[9],
+            matches: vals[10],
+            match_bytes: vals[11],
+            len3: vals[12],
+            len4_7: vals[13],
+            len8_15: vals[14],
+            len16_31: vals[15],
+            len32_257: vals[16],
+            len258: vals[17],
+            dist_gt4096: vals[18],
+        })
+    }
+
+    /// Per-axis diff against another fingerprint (typically: ours vs a rival,
+    /// or current vs pinned). Returns (field, self_value, other_value) for
+    /// every differing field, largest relative delta first — the failure
+    /// message IS the first measurement of the investigation.
+    pub fn diff(&self, other: &Self) -> Vec<(&'static str, u64, u64)> {
+        let a = self.tsv_values();
+        let b = other.tsv_values();
+        let mut out: Vec<(&'static str, u64, u64)> = Self::TSV_FIELDS
+            .iter()
+            .zip(a.iter().zip(b.iter()))
+            .filter(|(_, (x, y))| x != y)
+            .map(|(f, (x, y))| (*f, *x, *y))
+            .collect();
+        out.sort_by(|l, r| {
+            let rel = |(_, x, y): &(&str, u64, u64)| {
+                let m = (*x).max(*y).max(1) as f64;
+                ((*x as f64) - (*y as f64)).abs() / m
+            };
+            rel(r).partial_cmp(&rel(l)).unwrap()
+        });
+        out
+    }
+}
+
+/// Fingerprint a complete gzip file (multi-member aware). Exact bit-level
+/// walk of every DEFLATE block; no output is materialized.
+pub fn fingerprint_gzip(gz: &[u8]) -> std::io::Result<StreamFingerprint> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let mut fp = StreamFingerprint {
+        file_bytes: gz.len() as u64,
+        ..Default::default()
+    };
+    let mut off = 0usize;
+    while off < gz.len() {
+        if gz.len() - off < 18 || gz[off] != 0x1f || gz[off + 1] != 0x8b || gz[off + 2] != 0x08 {
+            return Err(bad("not a gzip member"));
+        }
+        let flg = gz[off + 3];
+        let mut h = off + 10;
+        if flg & 0x04 != 0 {
+            let xlen = u16::from_le_bytes([gz[h], gz[h + 1]]) as usize;
+            h += 2 + xlen;
+        }
+        if flg & 0x08 != 0 {
+            while h < gz.len() && gz[h] != 0 {
+                h += 1;
+            }
+            h += 1;
+        }
+        if flg & 0x10 != 0 {
+            while h < gz.len() && gz[h] != 0 {
+                h += 1;
+            }
+            h += 1;
+        }
+        if flg & 0x02 != 0 {
+            h += 2;
+        }
+        let deflate = &gz[h..];
+        let mut bits = BitWalker {
+            buf: deflate,
+            bit_pos: 0,
+        };
+        loop {
+            let start_bit = bits.bit_pos;
+            let bfinal = bits.read(1) as u8;
+            let btype = bits.read(2) as u8;
+            let mut observe = |len: u16, dist: u16| {
+                if len == 0 {
+                    fp.literals += 1;
+                } else {
+                    fp.matches += 1;
+                    fp.match_bytes += len as u64;
+                    match len {
+                        3 => fp.len3 += 1,
+                        4..=7 => fp.len4_7 += 1,
+                        8..=15 => fp.len8_15 += 1,
+                        16..=31 => fp.len16_31 += 1,
+                        258 => fp.len258 += 1,
+                        _ => fp.len32_257 += 1,
+                    }
+                    if dist > 4096 {
+                        fp.dist_gt4096 += 1;
+                    }
+                }
+            };
+            let decoded = match btype {
+                0 => {
+                    bits.byte_align();
+                    let len = bits.read(16) as usize;
+                    let _nlen = bits.read(16);
+                    let header_end = bits.bit_pos;
+                    fp.header_bits += header_end - start_bit;
+                    bits.bit_pos += (len as u64) * 8;
+                    fp.data_bits += bits.bit_pos - header_end;
+                    fp.blocks_stored += 1;
+                    len
+                }
+                1 => {
+                    let mut litlen = [0u8; 288];
+                    for e in litlen.iter_mut().take(144) {
+                        *e = 8;
+                    }
+                    for e in litlen.iter_mut().take(256).skip(144) {
+                        *e = 9;
+                    }
+                    for e in litlen.iter_mut().take(280).skip(256) {
+                        *e = 7;
+                    }
+                    for e in litlen.iter_mut().take(288).skip(280) {
+                        *e = 8;
+                    }
+                    let dist = [5u8; 30];
+                    let header_end = bits.bit_pos;
+                    fp.header_bits += header_end - start_bit;
+                    let n = decode_block_body_obs(&mut bits, &litlen[..], &dist[..], &mut observe)?;
+                    fp.data_bits += bits.bit_pos - header_end;
+                    fp.blocks_fixed += 1;
+                    n
+                }
+                2 => {
+                    let (litlen, dist, _ll, _d) = parse_dynamic_header(&mut bits)?;
+                    let header_end = bits.bit_pos;
+                    fp.header_bits += header_end - start_bit;
+                    let n = decode_block_body_obs(&mut bits, &litlen[..], &dist[..], &mut observe)?;
+                    fp.data_bits += bits.bit_pos - header_end;
+                    fp.blocks_dynamic += 1;
+                    n
+                }
+                _ => return Err(bad("reserved BTYPE=11")),
+            };
+            if decoded == 0 {
+                fp.empty_blocks += 1;
+            }
+            fp.decoded_bytes += decoded as u64;
+            if bfinal == 1 {
+                break;
+            }
+        }
+        // Byte-align past the deflate stream, then the 8-byte trailer.
+        let deflate_bytes = bits.bit_pos.div_ceil(8) as usize;
+        off = h + deflate_bytes + 8;
+        if off > gz.len() {
+            return Err(bad("truncated gzip trailer"));
+        }
+        fp.members += 1;
+    }
+    Ok(fp)
 }
