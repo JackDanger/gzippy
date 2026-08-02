@@ -197,56 +197,55 @@ pub fn params_parallel(level: u32) -> LevelParams {
     //     L8 excluded (this)        closes 26, opens 0
     //     try_exact_huffman alone   closes  5, opens 0
     // The exclusion costs 4 cells at L8 and removes the only clause-3 violation.
-    p.max_search_depth = if level == 8 {
-        p.max_search_depth
+    // SINGLE-VARIABLE TEST: L4 parser only, depth UNCHANGED at 16 so `choose_min_match_len`
+    // is not clamped (its `< 16` threshold forces min_len <= 7 and that was the confound
+    // in the Lazy(12,30) attempt).
+    if level == 4 {
+        p.strategy = Strategy::Lazy;
     } else {
-        p.max_search_depth.saturating_mul(4)
-    };
-    // ⛔ FALSIFY 2026-08-01 — L4 -> `Lazy(12,30)` AT T>1 WAS BUILT AND MEASURED. NO-SHIP.
-    // Clause 3: it CLOSES 5 and OPENS 1, at every thread count tried.
+        p.max_search_depth = if level == 8 {
+            p.max_search_depth
+        } else {
+            p.max_search_depth.saturating_mul(4)
+        };
+    }
+    // L4 IS A STRATEGY STEP AT T>1, NOT A DEPTH STEP — measured, clause 3 clean.
     //
-    //   vs THIS branch as baseline, L4, all 22 corpus files, gzip/pigz/libdeflate:
-    //     T2  closed 4, OPENED 1     T4  closed 5, OPENED 1     T16  closed 5, OPENED 1
-    //   closed: data.sqlite vs gzip AND pigz (14,798,391 -> 12,372,018), plus dd79_bin6,
-    //           movie.mp4 and photo.jpg vs libdeflate — all seam-margin cells that were
-    //           losing by 55-370 B, i.e. exactly the zero-headroom class.
-    //   OPENED: ecoli.fastq vs libdeflate  4,432,143 -> 4,592,250  (rival 4,568,588)
+    // L4 is the only `Greedy` above L2 (L3 and L5 are both `Lazy`), so it enters T>1 with
+    // no size margin at all, and the T>1 seam then costs it cells by 55-370 B. Stepping
+    // the PARSER while holding depth at 16 gives it margin. Measured against this branch
+    // as baseline, L4, all 22 corpus files, gzip/pigz/libdeflate:
     //
-    // THE MECHANISM IS THE ONE RECORDED ABOVE, and it generalises further than I argued:
-    // "Lazy is not uniformly stronger; it is stronger only where matches are dense."
-    // `ecoli.fastq` is DNA sequencing data — sparse matches — so Lazy defers and emits
-    // more literals, exactly as on `weights.safetensors`. Depth x4 is strictly better
-    // there (4.43 MB vs 4.59 MB).
+    //     T2   OPENED 0   CLOSED 4        T4  OPENED 0  CLOSED 5    T16  OPENED 0  CLOSED 5
+    //     T1   byte-identical (198/198)   — `params_parallel` is T>1-only by construction
     //
-    // I had distinguished this from the recorded L2 failure on the grounds that igzip's
-    // real ladder is L0-L3 (verified: `-4`+ emit nothing) so there is no igzip L4 cell.
-    // That is TRUE and it was NOT ENOUGH: the killer at L4 is a different FILE (ecoli,
-    // not weights) against a different RIVAL (libdeflate, not igzip). **Scoping a
-    // falsification to the cell that happened to catch it is too narrow — this mechanism
-    // is about the DATA, not the cell.**
+    //   closed: data.sqlite vs gzip AND pigz (14,798,391 -> 12,352,596), plus dd79_bin6
+    //           (-258 B margin), movie.mp4 (-370) and photo.jpg (-55) vs libdeflate — all
+    //           zero-headroom seam cells.
     //
-    // The T1 leg was clean (198/198 byte-identical; `params_parallel` is T>1-only) and
-    // the ladder motivation is real — L4 is the only `Greedy` above L2, which at T1 costs
-    // monotonicity on 17 of 22 files (docs/board/our-L3-win-causes-the-L4-sag.md). Neither
-    // rescues a clause-3 violation. REOPEN needs a parse step that is monotone on
-    // SPARSE-MATCH data, which Lazy is not.
+    // ⛔ FALSIFY 2026-08-01, KEPT because its VERDICT stands and its CAUSE was wrong:
+    // `Lazy(12,30)` was tried first and was NO-SHIP — it closed 5 but OPENED
+    // `ecoli.fastq` vs libdeflate (4,432,143 -> 4,592,250, rival 4,568,588). I attributed
+    // that to "Lazy is not uniformly stronger; it is stronger only where matches are
+    // dense" (the record above, from the L2 attempt). **That attribution was wrong.**
     //
-    // ⭐ CONFOUND FOUND AFTER THE FACT — the candidate above changed TWO things, and the
-    // next attempt should change one. `choose_min_match_len` CLAMPS min_len by
-    // `max_search_depth`: below 16 it forces min_len <= 7 (`min_match.rs`, ported from
-    // libdeflate `:2299`). Going Greedy(16,30) -> Lazy(12,30) crosses that threshold, so
-    // it did not only swap the parser — it also LOWERED the minimum match length, letting
-    // shorter matches through on precisely the sparse-match data where that is wrong.
-    // libdeflate's own comment names the case: "some data (e.g. DNA sequencing data)
-    // benefits greatly from a longer minimum length".
+    // THE REAL CAUSE WAS A SECOND VARIABLE I CHANGED WITHOUT NOTICING.
+    // `choose_min_match_len` CLAMPS min_len by `max_search_depth`: below 16 it forces
+    // min_len <= 7 (`min_match.rs`, libdeflate `:2299`). Going 16 -> 12 crossed that
+    // threshold, so the candidate did not only swap the parser — it also LOWERED the
+    // minimum match length, admitting short matches on sparse-match DNA data. libdeflate's
+    // own comment names the case: "some data (e.g. DNA sequencing data) benefits greatly
+    // from a longer minimum length".
     //
-    // So `ecoli.fastq` may have died from the min_len clamp rather than from Lazy. The
-    // clean single-variable test is **`Lazy(16,30)`** — same depth as today, so min_len is
-    // unclamped, and only the parser changes. Measured on size alone it is 0/22 sags and
-    // 0/22 overtakes of L5 (the best of the sweep), but it was never gated against this
-    // branch and it makes L4 identical to L5 at T>1, which is its own question. **Do not
-    // re-run `Lazy(12,30)`; run `Lazy(16,30)`.**
+    // Holding depth at 16 and changing ONLY the parser, the same file PASSES: ecoli.fastq
+    // 4,547,014 vs rival 4,568,588. **One variable at a time. A falsification that names
+    // the wrong cause closes the wrong class.**
     //
+    // ⚠ THE WALL LEG IS UNMEASURED AND IS THE ONLY REMAINING GATE. Lazy does roughly twice
+    // greedy's matchfinder calls at the same depth, so this spends wall BY CONSTRUCTION.
+    // Clause 5 is an erosion budget; the earlier parked L4 work (`level.rs`, `Lazy(10,30)`)
+    // died on exactly this leg at a CHEAPER depth. Needs `fulcrum ab paired` at T4 on
+    // solvency with aa_bias reported. Size alone cannot promote this.
     // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
     // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
     p.try_exact_huffman = true;
