@@ -365,7 +365,7 @@ fn params_inner(level: u32) -> LevelParams {
         // values only so the struct is populated.
         1 => LevelParams {
             try_exact_huffman: false,
-            strategy: Strategy::Fast,
+            strategy: Strategy::HtFast, // PROBE BRANCH ONLY — measurement routing, never merge
             max_search_depth: 1,
             nice_match_length: 32,
             near_optimal: NONE_NO,
