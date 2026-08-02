@@ -118,8 +118,19 @@ campaign_rival_args() {
 # path of least resistance, which is how the undeclared-corpus falsifications happened.
 # Receipt (G5): "we once spent weeks measuring a binary CI wasn't shipping."
 campaign_preflight() {
+  # Name the OVERRIDE, not just the build command. Every other path refusal in
+  # this file says which env var fixes it ("set CAMPAIGN_CORPUS_ROOT"); this one
+  # said only "build it", so on a box whose layout differs the message sends you
+  # to rebuild a binary that already exists and is fine.
+  #
+  # Receipt (2026-08-01): re-gating #227 on solvency hit three path refusals in a
+  # row. The corpus one named CAMPAIGN_CORPUS_ROOT and was fixed in one step;
+  # this one did not, and cost an extra round trip — fulcrum lives at
+  # /root/fulcrum there, not ~/www/fulcrum. A refusal that withholds its own
+  # remedy is a guard that charges for being right.
   [ -x "$CAMPAIGN_FULCRUM" ] || die "no fulcrum at $CAMPAIGN_FULCRUM" \
-    "build it: (cd ~/www/fulcrum && cargo build --release)"
+    "set CAMPAIGN_FULCRUM=/path/to/fulcrum   (this box may not use ~/www/fulcrum)" \
+    "or build it: (cd ~/www/fulcrum && cargo build --release)"
   local fv; fv="$("$CAMPAIGN_FULCRUM" version --json 2>/dev/null)" || die "fulcrum version failed"
   python3 "$CAMPAIGN_LIB_DIR/instrument.py" <<<"$fv" || exit 2
   CAMPAIGN_FULCRUM_SHA="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["commit"])' <<<"$fv")"
