@@ -107,6 +107,11 @@ pub(super) fn run(
 
     let mut in_next = data_start;
     if data_start > 0 {
+        // Dictionary seeding runs BEFORE the first block's `allow_len3` verdict
+        // exists, and `HtMatchfinder::acquire` arms the flag `false`. Force
+        // maintenance ON for the seed so an enabled first block sees a fully
+        // populated length-3 table; the per-block verdict re-arms it below.
+        mf.set_allow_len3(true);
         mf.skip_bytes(
             buf,
             &mut in_base,

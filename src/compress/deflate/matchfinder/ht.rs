@@ -488,10 +488,27 @@ impl HtMatchfinder {
         // happens exactly once per position on every control-flow path — the
         // 4-byte search below has several early exits, and a table that skips
         // inserts on some of them would silently degrade over the file.
+        //
+        // MAINTENANCE IS GATED WITH ACCEPTANCE. On a block where `allow_len3` is
+        // false no candidate this table proposes can be accepted, so the read and
+        // the write are pure D1 traffic to a 64 KiB table — measured (cachegrind,
+        // both arms, 6 MB data.csv, L1 T1): this finder issued 2.68x libdeflate's
+        // data writes and 70% of its D1 write misses, and the length-3 singleton
+        // was the excess. Entries NOT written during a disabled block leave the
+        // table stale for a later enabled block; stale entries are sound (every
+        // candidate is re-validated against `cutoff` and by the 3-byte compare)
+        // and the offset guard discards most carried-over entries anyway.
         debug_assert!(hash3 < HT_HASH3_SIZE);
-        // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
-        let cur_node3 = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
-        unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+        let cur_node3 = if self.allow_len3 {
+            // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
+            let n = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            n
+        } else {
+            // Sentinel that can never pass the `> cutoff` acceptance test below
+            // (which is also gated on `allow_len3`, so this value is never read).
+            cutoff
+        };
 
         // The 4-byte search. `break 'four` rather than `return`, so that a miss
         // falls through to the length-3 check instead of discarding it.
@@ -655,7 +672,13 @@ impl HtMatchfinder {
             // `hc_matchfinder_skip_positions` does for its `hash3_tab`. Skipping this
             // insert would leave the length-3 table blind to every position inside a
             // match, which is most of the input on compressible data.
-            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            //
+            // Gated with acceptance, same as `longest_match` — see the comment
+            // there. Dictionary seeding at T>1 runs with `allow_len3` forced on
+            // (see `ht_fast::run`) so an enabled first block sees a full table.
+            if self.allow_len3 {
+                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            }
 
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
