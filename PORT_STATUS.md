@@ -27,29 +27,28 @@ divergence, consistent with L2/L4-L9 being 154/154 byte ties.
 27 wins, 17 losses). **15 of the 17 are L1.** So L1 — where we ship igzip's chainless
 finder instead of their `ht_matchfinder` — is essentially the entire phase-1 gap.
 
-## ⭐ RUNG 3 IS GREEN FOR LEVELS 0 AND 1 — 23/23 BYTE-IDENTICAL
+## ⭐⭐ RUNG 3 IS GREEN FOR EVERY NON-EXOTIC LEVEL — L0-L9, 23/23 EACH
 
 ```
-$ scripts/campaign/ldx-differential.sh 0 1
-L0: byte-identical 23/23
-L1: byte-identical 23/23
+$ scripts/campaign/ldx-differential.sh 0 1 2 3 4 5 6 7 8 9
+L0: 23/23   L2: 23/23   L4: 23/23   L6: 23/23   L8: 23/23
+L1: 23/23   L3: 23/23   L5: 23/23   L7: 23/23   L9: 23/23
 ```
 
 Raw DEFLATE, sha256, all 22 corpus files plus the empty input, against libdeflate's
 own `libdeflate_deflate_compress` linked from `vendor/libdeflate/build/libdeflate.a`.
 `wc -c` never counts — two streams of equal length can differ in every bit.
 
-**This closes ZERO cells.** Nothing is routed and no shipped byte changed. Routing L1
-here is governed by the binding record at `src/compress/deflate/parse/mod.rs:540`
-(attempt 1 died on size with 7 clause-3 flips; attempt 2 died on the T1 wall at
-1.2662x on a cell `main` already ties). What is new is that a third attempt can be
-measured against the REAL algorithm rather than against `matchfinder/ht.rs`, which is
-a derivative of it.
+**`ldx` is now a complete, exact, pure-Rust reimplementation of libdeflate's compressor
+for every level a user reaches without asking for -10 or above.** Only the exotic
+levels (10-12, near-optimal parsing) remain unported.
 
-**Level 1 is 15 of our 17 T1 losses** and the only level where our encoder is not
-libdeflate's at all, so this is very nearly the whole phase-1 parity gap reproduced.
+**This closes ZERO cells.** Nothing is routed; `src/compress/deflate` is untouched and
+every shipped byte is unchanged. Routing is a PROMOTION-RULE question (clause 3 on 154
+tied cells, clause 5 on the wall), and the binding record at
+`src/compress/deflate/parse/mod.rs:540` still governs L1 specifically.
 
-## Done (11 commits, 81 tests passing)
+## Done (15 commits, 101 tests passing)
 
 | C | item | file | commit |
 |---|---|---|---|
@@ -121,26 +120,20 @@ assertion compiles in.
 * The live code table is a flag plus a clone, not a rebindable pointer — the borrow
   checker cannot see that writing `c.o_length` does not alias the table being read.
 
-## Next, in dependency order — every step now has a byte-exact gate
+## Next
 
-Run `scripts/campaign/ldx-differential.sh <level>` after each. It should go green for
-the newly ported level and STAY green for 0 and 1.
-
-1. `hc_matchfinder.h` + `:2272-2392` the min-match-len helpers + `:2524`
-   `deflate_compress_greedy` -> gates **L2 and L3**. (Note L3 is the one level where
-   libdeflate is GREEDY and we are LAZY, and ours wins 20/22 files — expect the
-   differential to go green against THEIR choice, and treat our L3 as a phase-2 win to
-   re-layer afterwards, not as a regression.)
-2. `:2600` `deflate_compress_lazy_generic` -> gates **L4-L9**.
-3. `bt_matchfinder.h` + `:2845-3853` near-optimal -> gates **L10-L12**. This also
+1. `bt_matchfinder.h` + `:2845-3853` near-optimal -> gates **L10-L12**. This also
    supplies `deflate_flush_block`'s missing `sequences == NULL` arm (`:1935`), which
    walks `optimum_nodes` — deliberately left out of the signature rather than stubbed.
-4. `:3874` `libdeflate_alloc_compressor_ex` in full — `LdxCompressor::new` currently
-   refuses every level except 0 and 1 rather than guessing.
+   `LdxCompressor::new` refuses 10-12 today rather than guessing.
+2. Then the ROUTING question, which is NOT a port question. It is clause 3 on 154 tied
+   cells and clause 5 on the wall, per level, and it needs `fulcrum try --threads 1,4`
+   rather than this differential.
 
-Only once every level is byte-exact does the ROUTING question arise, and that is a
-promotion-rule question (clause 3 on 154 tied cells, clause 5 on the wall), not a
-port question.
+**L3 is the one level where we deliberately diverge and we WIN.** Our shipping L3 is
+LAZY(12,14) against libdeflate's GREEDY(12,14) — same knobs, different parser — and
+ours is smaller on 20 of 22 files, median ~44 KB. `ldx` matching THEIR choice is phase 1
+succeeding; our lazy L3 is a phase-2 win to re-layer. Do not "fix" the port to keep it.
 
 ## Standing cautions
 
