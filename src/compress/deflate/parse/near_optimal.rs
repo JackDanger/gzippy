@@ -456,6 +456,7 @@ impl Optimizer {
             is_final,
             &mut self.header_scratch,
             &mut self.code_scratch,
+            false,
         );
 
         used_only_literals

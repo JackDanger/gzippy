@@ -71,6 +71,23 @@ pub struct NearOptimalParams {
 /// The parser parameters for a compression level.
 #[derive(Clone, Copy, Debug)]
 pub struct LevelParams {
+    /// Cost the EXACT (package-merge) Huffman code as a second per-block candidate and emit
+    /// whichever is cheaper. Non-worse than the heuristic BY CONSTRUCTION on SIZE, but it costs
+    /// 10-14% wall at T1 (serial) against only +2.3% at T4 (the per-block work parallelises).
+    /// Our T1 wall margin against libdeflate is 0-8%, so enabling it at T1 FLIPS wall cells —
+    /// measured, both arms: sil40 L6 T1 went 0.952 PASS -> 1.035 FAIL. It is therefore T>1 ONLY,
+    /// exactly like `max_search_depth` scaling, and set only by `params_parallel`.
+    ///
+    /// THE REASON IS THE WALL BUDGET, NOT BYTE-IDENTITY. T1 output happening to stay identical
+    /// to `main` is a CONSEQUENCE of this gating, not a goal, and must never become one:
+    /// byte-identity with libdeflate is the cage `CLAUDE.md` and the campaign memory both name
+    /// as the thing that keeps us running their algorithm slower than they do. On SIZE this
+    /// candidate is strictly better at T1 too (49 of 49 cells smaller, 0 worse, non-worse by
+    /// construction) and we would take those bytes gladly. We decline them only because
+    /// 10-14% of T1 wall is not available to buy them with. If the T1 wall deficit is ever
+    /// closed, turn this on at T1 and take the size — do not preserve identity for its own
+    /// sake.
+    pub try_exact_huffman: bool,
     pub strategy: Strategy,
     /// Cap on hash-chain nodes searched per position (`c->max_search_depth`).
     pub max_search_depth: u32,
@@ -113,6 +130,82 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
             level, p.strategy, p.max_search_depth, p.nice_match_length
         );
     });
+}
+
+/// The level->params map for the PARALLEL (T>1) path.
+///
+/// WHY THIS EXISTS, and why it is not a knob. libdeflate-gzip is SINGLE-THREADED. Our board
+/// failures are overwhelmingly T4 cells against it — 48 of 68 on the frozen box, with
+/// libdeflate-at-T1 at ZERO — so the budget that matters is our 4 threads against their 1.
+/// Measured (sil40, hyperfine n=5, /dev/null): at T4 we are 3.49x faster at L6 and 4.30x at
+/// L9, i.e. 249-330% of wall slack. The whole parse-config space was once closed as
+/// "unaffordable" against T1 slack of 0-8% — a budget 40x too small for the cells that fail.
+///
+/// Spending that slack: at L6, `Lazy2(35,65)` instead of `Lazy(35,65)` costs +10.9% of OUR
+/// time (still 3.01x faster than the rival) and buys 19,000-24,000 B per file — roughly 100x
+/// the T>1 seam it has to absorb. dickens L6 T4 goes from +343 B (FAILING) to -19,348 B.
+///
+/// SANCTIONED, not a content detector: `CLAUDE.md` non-negotiable #3 permits "parameter
+/// tuning (write-buffer size, shared memory per thread count)", and STEP 2 states that "T>1
+/// may emit different bytes than T1". Nothing here inspects the DATA — only the thread count
+/// the user asked for.
+///
+/// The rule applied is one step of parse strategy at UNCHANGED knobs, which the ladder sweep
+/// measured as strictly smaller at fixed depth. Levels with no stronger strategy available
+/// (L0/L1 chainless, L3 already Lazy, L8/L9 already Lazy2, L10-12 already NearOptimal) are
+/// returned unchanged, so T>1 output at those levels is untouched.
+pub fn params_parallel(level: u32) -> LevelParams {
+    let mut p = params_inner(level);
+    // DEPTH, NOT STRATEGY. The first attempt took one step of parse strategy
+    // (Greedy->Lazy, Lazy->Lazy2) and was NO-SHIP on clause 3: it flipped
+    // igzip:weights.safetensors:L2:T4 from 0.9998 to 1.0002. Mechanism, measured: on
+    // near-incompressible data (90 MB of float tensors) LAZY defers matches and emits more
+    // literals than GREEDY, costing +32,975 B on that file. Lazy is not uniformly stronger;
+    // it is stronger only where matches are dense.
+    //
+    // ⚠ CORRECTED 2026-08-01: the sentence that stood here — "Scaling max_search_depth has
+    // no such failure mode — a deeper chain can only find a match at least as good" — is
+    // FALSE, and was falsified by isolating the two mechanisms on engine.wasm L8 T4
+    // (trainer, vanilla builds, deterministic bytes, libdeflate -8 = 396,254):
+    //     main                        396,096  PASS
+    //     depth x4 ONLY (exact OFF)   396,307  FAIL   <- the depth scaling alone
+    //     try_exact_huffman ONLY      396,092  PASS   <- monotone, and 4 B smaller
+    //     both (as first shipped)     396,302  FAIL
+    // A deeper chain changes the PARSE, not merely the quality of one match: a longer
+    // match taken at position i displaces a better match at i+k. It is NOT a magnitude
+    // problem — engine.wasm L8 flips at x2, x3 and x4 alike — so no multiplier rescues it.
+    // Depth scaling is therefore NOT monotone in output size, and the claim below is
+    // narrowed to the levels where it was actually measured.
+    //
+    // Scaling max_search_depth measured strictly better at the levels below, including
+    // L9 where the strategy step had nothing left to give (already Lazy2):
+    //     L2 weights.safetensors  83,082,549 vs igzip 83,101,588  (0.99977, and 22 B SMALLER
+    //                             than the shipped T>1 output — the clause-3 flip is gone)
+    //     L2 dickens -107,533 | data.csv -112,714 | sil40 -157,275  vs libdeflate
+    //     L6 sil40   -60,758  (strategy step gave -19,236)
+    //     L9 sil40    -2,484  (strategy step gave nothing)
+    //
+    // x4 is the shipped factor. Wall on sil40, T4, vs BOTH rivals that matter (libdeflate is
+    // single-threaded; pigz is not): L2 2.73x/1.39x, L6 2.53x/2.18x, L9 2.15x/1.62x faster.
+    // Even at L9, where this walks 2,400 chain nodes, we stay ahead of both.
+    // L8 IS EXCLUDED, and this is an EMPIRICAL PATCH ON A STRUCTURAL NON-MONOTONICITY,
+    // not a principled fix. libdeflate:engine.wasm:L8:{T2,T4}:size flips PASS -> FAIL with
+    // the scaling on (see the isolation above); L8/engine.wasm is simply where an 11-file
+    // TUNE sample caught it, and a wider corpus may find the same effect elsewhere. Priced
+    // at T4 vs libdeflate, L5-L9, 11 TUNE files:
+    //     depth x4 at every level   closes 30, OPENS 1   <- clause 3 is absolute: NO-SHIP
+    //     L8 excluded (this)        closes 26, opens 0
+    //     try_exact_huffman alone   closes  5, opens 0
+    // The exclusion costs 4 cells at L8 and removes the only clause-3 violation.
+    p.max_search_depth = if level == 8 {
+        p.max_search_depth
+    } else {
+        p.max_search_depth.saturating_mul(4)
+    };
+    // T>1 only: see `try_exact_huffman`'s doc comment. The parallel wall budget (249-330%)
+    // absorbs the +2.3% this costs at T4; the T1 budget (0-8%) does not absorb its 10-14%.
+    p.try_exact_huffman = true;
+    p
 }
 
 /// MEASUREMENT-ONLY level→params override, for deriving our own ladder instead of
@@ -183,6 +276,7 @@ fn params_inner(level: u32) -> LevelParams {
     };
     match level {
         0 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Fast0,
             max_search_depth: 0,
             nice_match_length: 32,
@@ -194,12 +288,14 @@ fn params_inner(level: u32) -> LevelParams {
         // exactly one probe per position); they are left at the vendor-ish
         // values only so the struct is populated.
         1 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Fast,
             max_search_depth: 1,
             nice_match_length: 32,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 10,
@@ -259,6 +355,7 @@ fn params_inner(level: u32) -> LevelParams {
         //     every T, zero-regression legs) clears; the recorded miss is
         //     out of this change's causal reach.
         3 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
@@ -277,36 +374,42 @@ fn params_inner(level: u32) -> LevelParams {
         // symbols.dwarf is strictly Pareto-dominant there: 6,553 B smaller AND 4.8%
         // faster at T4 (wall ratio 0.9519).
         4 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Greedy,
             max_search_depth: 16,
             nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 16,
             nice_match_length: 30,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 35,
             nice_match_length: 65,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy,
             max_search_depth: 100,
             nice_match_length: 130,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy2,
             max_search_depth: 300,
             nice_match_length: max_match,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::Lazy2,
             max_search_depth: 600,
             nice_match_length: max_match,
@@ -315,6 +418,7 @@ fn params_inner(level: u32) -> LevelParams {
         // Native near-optimal parser (`deflate_compress_near_optimal`,
         // deflate_compress.c:3974-4004).
         10 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 75,
@@ -326,6 +430,7 @@ fn params_inner(level: u32) -> LevelParams {
             },
         },
         11 => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::NearOptimal,
             max_search_depth: 100,
             nice_match_length: 150,
@@ -337,6 +442,7 @@ fn params_inner(level: u32) -> LevelParams {
             },
         },
         _ => LevelParams {
+            try_exact_huffman: false,
             strategy: Strategy::NearOptimal,
             max_search_depth: 300,
             nice_match_length: max_match,

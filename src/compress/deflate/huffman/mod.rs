@@ -27,7 +27,7 @@ pub mod fast;
 pub mod header;
 pub mod optimal;
 
-pub use fast::{make_huffman_code, make_huffman_code_into};
+pub use fast::{make_huffman_code, make_huffman_code_exact_into, make_huffman_code_into};
 pub use header::{build_dynamic_header, HeaderScratch};
 
 /// A canonical Huffman code: per-symbol length (0 = unused) and bit-reversed
@@ -51,4 +51,7 @@ pub struct HuffmanCode {
 pub struct CodeScratch {
     pub litcode: HuffmanCode,
     pub offcode: HuffmanCode,
+    pub alt_litcode: HuffmanCode,
+    pub alt_offcode: HuffmanCode,
+    pub alt_header: HeaderScratch,
 }

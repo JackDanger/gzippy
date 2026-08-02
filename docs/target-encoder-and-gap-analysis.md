@@ -712,6 +712,204 @@ the full 22-file board at T1 and T4. Wall: must stay under the L6 erosion budget
 gzip/pigz AND not flip any libdeflate cell — the depth lever died on exactly that leg, so
 wall is not optional here and a size-only argument is insufficient (3 for 3 in this class).
 
+## G30 — the depth/size curve SATURATES, and the saturation point is absolute, not relative
+
+The shipped T>1 change (#236) scales `max_search_depth` x4. That factor was a first guess.
+Measuring the curve rather than sweeping for a better number (sil40, T4, exact bytes):
+
+    level      x2           x4           x8           x16          libdeflate
+    L2    15,964,129   15,901,805   15,869,951   15,849,165   16,059,080
+    L6    15,516,055   15,494,305   15,482,185   15,477,116   15,555,063
+    L9    15,451,122   15,450,182   15,450,724   15,450,696   15,452,666
+                        ^ best       ^ WORSE
+
+L9 SATURATES AT x4 AND REGRESSES BEYOND IT. L2 and L6 are still improving at x16 (L2 gains
+another 52,640 B from x4 to x16; L6 another 17,189 B).
+
+The mechanism is that saturation is roughly constant in ABSOLUTE depth, not in the multiplier.
+L9 already searches 600 nodes; x4 puts it at 2,400, past the point where another chain node
+finds a better match often enough to pay for itself — and past it, the extra work can pick a
+different (slightly worse) match at equal length. L2 searches 6; even x16 leaves it at 96,
+still shallow.
+
+So a uniform multiplier is the wrong SHAPE: it over-spends at deep levels and under-spends at
+shallow ones. The structurally right form is a multiplier with an ABSOLUTE CAP — around x8
+capped near 2,400 would take L2 to 48 and L6 to 280 (both at their x8 sizes) while leaving L9
+at its x4 optimum, i.e. strictly better than the shipped x4 on all three.
+
+NOT CHANGED HERE. #236's x4 is under graded adjudication on the frozen box with a SHIP verdict
+already banked on the size axis (39 cells closed, 0 opened). Hard stop #5 says land gated work
+before starting new work; changing the constant now would void that run. The cap is the
+follow-up, and it must be re-gated on its own.
+
+## G31 — the gzip/pigz class is a DEPTH deficit against zlib, and zlib affords its depth with `good_match`
+
+The frozen-box census (G28) splits the 68 failures by rival. The gzip and pigz cells have a
+completely different signature from the libdeflate ones, and they come in T1/T4 PAIRS with
+near-identical deltas — so they are parse-quality deficits, not seam:
+
+    rival  file                 L   T1 delta   T4 delta   ratio
+    pigz   monorepo.tar         6   +53,495    +53,896    1.0054
+    pigz   dd79_bin6            2   +36,101    +36,570    1.0082
+    gzip   aozora.txt           6   +23,082    +23,338    1.0057
+    pigz   aozora.txt           6   +18,327    +18,583    1.0046
+    gzip   weights.safetensors  9   +17,815    +18,139    1.0002
+    gzip   minjs.min.js         6    +3,719     +3,574    1.0034
+    gzip   photo.jpg            2    +2,905     +2,963    1.0005
+
+0.3-0.8% deficits, against libdeflate's 0.001-0.05%. Different magnitude, different cause.
+
+VENDOR DIFF, read from `vendor/zlib-ng/deflate.c`'s `configuration_table` (gzip and pigz are
+both zlib-family):
+
+    level   zlib-ng: good lazy nice chain        ours (libdeflate port): depth nice
+    L6            8   16  128   128                              35   65
+    L7            8   32  128   256                             100  130
+    L8           32  128  258  1024                             300  258
+
+AT L6 THEY SEARCH 128 CHAIN NODES TO OUR 35 — 3.66x deeper, with nice 128 vs our 65. That is
+the mechanism behind the whole 0.5%-class, and it is a direct consequence of inheriting
+libdeflate's table (G15) rather than choosing our own: libdeflate trades depth for speed at L6,
+and against the zlib family that trade loses on size.
+
+CONFIRMATION FROM THE SHIPPED FIX. #236 scales T>1 depth x4, putting L6 at 140 — essentially
+zlib's 128. The graded lever closed exactly the T4 halves of this class:
+`gzip:aozora.txt:L6:T4`, `gzip:minjs.min.js:L6:T4`, `gzip:monorepo.tar:L6:T4` and the three
+matching `pigz:` cells. The prediction and the result agree, which is what makes this a
+mechanism rather than a correlation.
+
+### The T1 halves need a different lever, and zlib names it
+
+The T1 twins of those cells are untouched, because at T1 the binding wall constraint is
+libdeflate (4.4% slack at L6 on sil40), and going from depth 35 to 128 costs far more than that.
+
+But zlib runs chain=128 at L6 and is still not slow, because it also sets `good_match = 8`: the
+chain walk STOPS EARLY once a match of at least `good_match` length is found. Deep chains are
+therefore cheap on average and expensive only where they pay. We have no such early exit — our
+depth is a hard loop bound.
+
+So the T1 class is not "we cannot afford depth". It is "we buy depth at full price and they buy
+it at a discount". The lever is the early exit, not the bound.
+
+NOT ATTEMPTED HERE. Note that an uncommitted `good_match` implementation was found in this
+checkout belonging to no branch (see the contamination note in G29) — another writer is
+already on this. Coordinate before duplicating it.
+
+## G31a — the `good_match` work (ANOTHER WRITER'S, not mine) closes the T1 gzip/pigz class
+
+G31 predicted that the T1 halves of the gzip/pigz class need zlib's `good_match` early exit
+rather than more depth. There is an uncommitted `good_match` implementation in this checkout
+belonging to no branch (found as contamination, G29). Its level table is `4,4,4,8,8,8,32,32` —
+zlib-ng's `good` column exactly, so it is a direct port of the mechanism G31 named.
+
+TESTED WITHOUT TOUCHING THE OTHER WRITER'S TREE: applied to a detached worktree off `main`
+(`git worktree add --detach`), vendor symlinked, built vanilla. Sizes are deterministic, T1,
+local M1. This measures THEIR work; it is recorded here only so the result is not lost.
+
+    file           L  rival   rival bytes   main T1      +good_match   verdict
+    aozora.txt     6  gzip      4,049,212   4,072,294    4,013,389     CLOSES (-35,823)
+    aozora.txt     6  pigz      4,053,967   4,072,294    4,013,389     CLOSES
+    monorepo.tar   6  pigz      9,898,201   9,951,696    9,870,485     CLOSES (-27,716)
+    minjs.min.js   6  gzip      1,088,768   1,092,487    1,087,222     CLOSES
+    dd79_bin6      2  pigz      4,464,656   4,500,757    4,500,757     unchanged
+
+FOUR OF FIVE CLOSE, and they are the four the mechanism predicts: all L6, where zlib walks 128
+chain nodes to our 35 and pays for it with the early exit. `dd79_bin6` at L2 is untouched —
+a separate cell needing a separate mechanism, and it should not be attributed to this lever.
+
+This is the second prediction from the G31 vendor diff to be confirmed by execution (the first
+was #236's depth x4 closing exactly the T4 halves of the same class). The two levers are
+complementary, not competing: depth-at-T>1 closes the T4 halves, `good_match` closes the T1
+halves, and together they cover the class.
+
+COORDINATION, not a claim: this work is not mine, is not on a branch, and is not gated. It
+needs its owner to land it through `fulcrum try` like anything else. Recorded so that (a) the
+measurement exists, and (b) nobody re-implements it.
+
+## G32 — the worst cell on the board (dd79_bin6 L2, ratio 1.0082): we are WEAKER at L2 than zlib
+
+`pigz:dd79_bin6:L2` is the largest ratio deficit on the frozen board (+36,101 B, 1.0082).
+Profiled across levels (6,291,456 B input, T1, exact bytes, local M1):
+
+    L    pigz         ours         delta        libdeflate    ours-vs-ld
+    1    4,491,598    4,480,440    -11,158      4,667,981     -187,541
+    2    4,464,656    4,500,757    +36,101      4,500,757            0   <- THE CELL
+    3    4,441,970    4,461,737    +19,767      4,500,874      -39,137
+    4    4,527,176    4,500,874    -26,302      4,500,874            0
+    6    4,493,254    4,461,731    -31,523      4,461,731            0
+    9    4,493,254    4,452,384    -40,870      4,452,384            0
+
+THREE FACTS, none of which is "we need a better parser":
+
+1. WE ARE BYTE-IDENTICAL TO LIBDEFLATE AT L2, L4, L6 AND L9 on this file (delta exactly 0).
+   The cage (G15) again: at those labels we ARE libdeflate, so we inherit their L2 weakness.
+
+2. PIGZ IS NON-MONOTONIC HERE: its L4 (4,527,176) is WORSE than its L2 (4,464,656), and its
+   L6 and L9 are identical (4,493,254). zlib's own ladder is not ordered on this input.
+
+3. OUR L3 ALREADY BEATS PIGZ'S L2 — 4,461,737 vs 4,464,656. The capability exists in our own
+   ladder; it is on the wrong label.
+
+VENDOR DIFF (stock zlib, which pigz uses — note this differs from zlib-ng's table read in
+G31): zlib L2 is `good=4 lazy=5 nice=16 chain=8`; ours is `Greedy depth=6 nice=10`. At L2 we
+search SHALLOWER (6 vs 8) with a lower nice-length (10 vs 16). We are weaker at L2, and the
+G31 story (we are shallower than zlib) holds at L2 as well as L6 — the numbers are just
+smaller.
+
+### Why this cell is the hardest one on the board
+
+L2 at T1 is the one place both constraints bind at once. On SIZE we need a STRONGER L2 (zlib's
+8/16 rather than our 6/10). On WALL we are already LOSING at L2 T1 — 1.044 against libdeflate
+on sil40 — so we cannot simply spend more search. Stronger and faster, simultaneously.
+
+That is exactly the shape `good_match` fixes, and it is why the tested `good_match` patch
+(G31a) did NOT move this cell: it adds the early exit at L2 but leaves depth at 6 and nice at
+10. The proposal that follows from both diffs is the PAIR — early exit AND zlib's L2 knobs
+(depth 8, nice 16) — where the exit pays for the extra depth. Neither half alone does it,
+which is the composition rule from `CLAUDE.md`'s rule 5 stated in advance rather than after.
+
+NOT ATTEMPTED. It touches the T1 table, so it must clear T1 wall against libdeflate, which is
+the tightest budget on the board.
+
+## G32a — FALSIFIED, and I predicted it in advance: `good_match` + zlib's L2 knobs does NOT close the worst cell
+
+G32 proposed the PAIR — the `good_match` early exit plus zlib's L2 knobs (depth 8, nice 16) —
+on the argument that neither half alone moves `pigz:dd79_bin6:L2` and the exit would pay for
+the extra depth. Built and measured (detached worktree off `main`, the foreign `good_match`
+patch plus the knob change, vanilla build, T1, exact bytes):
+
+    file          pigz         libdeflate   main         composed     verdict
+    dd79_bin6     4,464,656    4,500,757    4,500,757    4,500,804    WORSE than main (+47)
+    data.csv      4,425,984    3,923,216    3,923,216    3,941,022    OPENS a cell (+17,806)
+    dickens       5,167,504    4,772,260    4,772,260    4,737,378    beats both
+    winexe.exe    1,637,306    1,569,179    1,569,179    1,561,372    beats both
+    photo.jpg     6,480,485    6,473,516    6,473,516    6,473,492    beats both
+    sil40        16,869,300   16,059,080   16,059,080   15,972,405    beats both
+
+THE TARGET CELL DID NOT MOVE — it got 47 B worse — and `data.csv` REGRESSED by 17,806 B,
+turning a passing cell into a failing one. The proposal is dead as stated.
+
+WHY, and it is a correction to G32's reading of the vendor. zlib's `good_match` does not
+merely exist alongside the chain bound; it SHORTENS THE SEARCH when a good-enough match is
+found (zlib reduces `chain_length` once `len >= good_match`). At L2 with `good_match = 4`, a
+4-byte match is found almost immediately on binary data, so the exit fires at once and the
+EFFECTIVE depth drops BELOW the nominal 8 — which is why raising the bound to 8 bought
+nothing on `dd79_bin6` and why a file that depends on longer searches (`data.csv`) lost.
+
+So `good_match` is not a free way to buy depth. It is a trade: cheaper on inputs where short
+matches are good enough, WORSE on inputs where they are not. That is a data-dependent effect
+in a static parameter — the same shape as the Greedy/Lazy failure in #236, where lazy helped
+dense-match data and hurt sparse-match data.
+
+WHAT SURVIVES. G31a's measurement stands on its own terms: the foreign `good_match` patch
+UNCHANGED (depth 6, nice 10) closes four L6 T1 cells. That is its owner's result and this
+falsification does not touch it. What is falsified is MY proposal to combine it with raised L2
+knobs.
+
+REOPEN would require a mechanism that explains why `data.csv` regressed and `dd79_bin6` did
+not move — not another (depth, nice, good_match) triple. Do not sweep the triple; the failure
+is not a bad point in that space, it is that the space itself trades one input class against
+another.
 ## G14 — 77% OF THE FAILING BOARD IS THE T>1 PATH, NOT THE PARSE (2026-07-31)
 
 The single most useful cut of the banked board, and it was available all along. Failing size
@@ -1457,6 +1655,420 @@ That is the design the evidence supports: NOT "the consumer emits everything", b
 consumer owns only the seam blocks". Still unattempted, and still the only route to the 109
 cells — but it is now a bounded change to the boundary handling rather than a rewrite of the
 emission path.
+
+## G25 — "recover the grid cost by scheduling" is NOT available: 8 chunks is already the optimum
+
+#226's next-step list said the one-chunk-per-thread grid's ~11.4% wall could be recovered by
+scheduling rather than by widening the grid back. Measured (sil40 40,000,000 B, L9, T4,
+hyperfine n=5 warmup 1, /dev/null, local M1):
+
+    grid                    wall       user       CPU% (user/wall)
+    8 chunks (default)     0.3258 s   1.5386 s      472%
+    4 chunks (1/thread)    0.3639 s   1.5763 s      433%
+    16 chunks (-b 2.5M)    0.3585 s   1.5708 s      438%
+
+USER TIME IS FLAT (+2.4% from 8 to 4 chunks) while WALL rises 11.7%, so the regression is
+parallel efficiency, not extra work — that much of the #226 framing was right.
+
+BUT 8 CHUNKS IS ALREADY THE OPTIMUM, IN BOTH DIRECTIONS. 16 chunks is also slower (0.3585)
+than 8 (0.3258): past a point, per-chunk matchfinder warm-up costs more than the balance it
+buys. And below it, four uneven work units cannot be balanced across four threads by ANY
+scheduler — there is nothing to steal. `CHUNKS_PER_THREAD = 2` is not an untuned default; it
+is the measured peak.
+
+So the seam/balance conflict is structural, not a scheduling bug:
+  - few chunks  -> few seams, poor balance   (4 chunks: -66 B but +11.7% wall)
+  - many chunks -> good balance, many seams  (8 chunks: +1,115 B, best wall)
+and no chunk COUNT escapes it, because the chunk is simultaneously the scheduling unit and
+the coding unit.
+
+### Everything now converges on the same fix
+
+Three independent lines have arrived at the same place:
+  G24  grid tuning cannot reach a zero seam residual
+  G25  scheduling cannot recover the cost of a low chunk count (this section)
+  G24a the naive "consumer emits everything" is disqualified (11.2% serial -> T16 caps 5.96x)
+
+What survives all three is the NARROW form: keep the 8-chunk grid for scheduling, and have the
+CONSUMER own only the ~(T-1) blocks that span a chunk boundary — 3 of 916 blocks at T4, a
+~0.3% serial fraction. That decouples the scheduling unit from the coding unit, which is the
+single assumption every dead end above shares.
+
+Combined with the #226 composition (dual-candidate Huffman margin), the arithmetic then reads:
+seam ~0 instead of +62 B, and 122-166 B of margin still in hand — with the 8-chunk grid's
+wall, not the 4-chunk grid's.
+
+NOT ATTEMPTED. It is the only route left to the 109 zero-headroom cells.
+
+## G26 — RETRACTION of G-note #226's headline: "closes 4 of 6" was chunk-placement luck
+
+#226 reported that dual-candidate Huffman + one-chunk-per-thread closes 4 of 6 test cells.
+Those numbers came from hand-picked `-b` values, and THE SHIPPED GRID CANNOT PRODUCE THEM:
+`pipelined_block_size` rounds (dickens is 12,174,519 B, so one-chunk-per-thread is 3,000,000
+after rounding, not the 3,043,630 I passed to `-b`), and different rounding lands on different
+block boundaries.
+
+Baked in as a shippable default (`CHUNKS_PER_THREAD = 1`, no env, no `-b`):
+
+    file      L   libdeflate(=T1)   T4 shipped   delta   verdict
+    dickens   6      4,539,505       4,539,692    +187   fails
+    dickens   9      4,480,689       4,480,684      -5   CLOSES
+    data.csv  6      3,372,612       3,372,359    -253   CLOSES
+    data.csv  9      3,300,291       3,300,815    +524   fails
+    sil40     6     15,555,063      15,555,612    +549   fails
+    sil40     9     15,452,666      15,452,762     +96   fails
+
+TWO of six, not four — and a DIFFERENT two. The outcome is governed by where chunk boundaries
+fall, not by a mechanism: the margin (122-166 B) is the same order as the seam's variance
+across placements (hundreds of bytes). G24 already showed this (dickens L9: `-b 4M` -41 B but
+`-b 3.04M` +325 B) and I read it as noise rather than as the governing term.
+
+WHAT SURVIVES IS CHEAPER. At the DEFAULT grid (`CHUNKS_PER_THREAD = 2`, the measured wall
+optimum per G25) the Huffman margin ALONE closes the same count:
+
+    data.csv L6   3,372,268 vs  3,372,612  = -344  CLOSES
+    sil40    L6  15,554,873 vs 15,555,063  = -190  CLOSES
+
+2 of 6 for +2.3% wall, against 2 of 6 for +13.7% with the grid change. The grid half costs 6x
+the wall and buys nothing net. CHUNKS_PER_THREAD stays at 2.
+
+The structural point that resurrected the Huffman half still holds — G16 deleted a strict size
+win (49/49 smaller, 0 worse) over a wall cost that is 6x smaller at T4 than the T1 number it
+was judged on. What does NOT hold is the inference that COMPOSITION WITH THE GRID was the
+mechanism. It was placement.
+
+This strengthens G25's conclusion rather than weakening it: a margin this small cannot ride on
+a seam whose size swings by hundreds of bytes with placement. The seam has to be ~0, not merely
+smaller — the narrow "consumer owns the seam blocks" form.
+
+## G27 — the next size lever is BLOCK COUNT: headers are 2.07% of output, 2,600x the Huffman margin
+
+Measured with `anatomy-counters` (sil40 40,000,000 B, L9, T1, local M1), plus the per-header
+cost already established by the G14 seam accounting (+3 dynamic blocks cost ~1,050 B, i.e.
+~350 B per header):
+
+    blocks_emitted_dynamic       913
+    blocks_emitted_fixed           1
+    blocks_emitted_stored          0
+    huffman_exact_code_chosen    145      (15.9% of dynamic blocks)
+
+    header mass  ~= 913 x 350 B = 319,550 B = 2.07% of the 15,452,666 B output
+    Huffman dual-candidate margin = 122 B = 0.0008% of output
+    ratio                                     ~2,600x
+
+The exact-code candidate WINS OFTEN (145 of 913 blocks) but each win is worth ~0.84 B. That is
+why it closes only the cells whose seam happens to be small: it is a real mechanism with a tiny
+amplitude.
+
+BLOCK COUNT IS THE LEVER WITH ACTUAL AMPLITUDE. Every dynamic block pays ~350 B to transmit
+its own literal/length and offset code lengths, RLE-coded through a precode. 913 of them is
+2.07% of the file. Cutting the block count 20% without worsening the data coding would be
+~0.4% — four hundred times what the Huffman candidate delivered, and comfortably more than any
+seam on the board.
+
+The catch is the same one the splitter already trades against: fewer blocks means each table
+fits its span worse, so data bits rise as header bits fall. Our splitter is a faithful port of
+libdeflate's (`block_split.rs` vs `deflate_should_end_block`/`do_end_block_check`), which is
+exactly why we tie their bytes — so we are currently making THEIR trade, not a better one.
+zopfli and ECT both beat that trade with real block-splitting search, which is where their 1-3%
+comes from.
+
+NOT ATTEMPTED. The candidate pattern that worked for the Huffman code applies directly and is
+non-worse by construction: cost the accumulated block as ONE block against the same tokens as
+TWO blocks split at a chosen point, and emit whichever is cheaper. Cost is per block, not per
+position — the affordable shape (G16/G17). Unlike the Huffman candidate, the amplitude is large
+enough to matter on its own.
+
+CAVEAT: 350 B/header is inferred from the G14 seam accounting, not from a direct sum of
+`header_bits()`. Before this gates anything, add that sum as a counter and measure it — a
+header-mass claim built on an inferred constant is exactly the kind of number this campaign has
+been burned by.
+
+## G27a — CORRECTION: header mass is 0.634%, not 2.07%. The seam is BAD PLACEMENT, not headers
+
+G27 argued block count was the next lever using ~350 B/header INFERRED from the seam
+accounting, and flagged that the inference had to be replaced by a direct sum before it gated
+anything. Done — `dynamic_header_bits_total` sums `header_bits()` over every dynamic block
+actually emitted (sil40 40,000,000 B and dickens, L9, T1, anatomy-counters build):
+
+    file      blocks   header bits   bytes    per header   share of output
+    sil40       913       783,318    97,914     107.2 B       0.634%
+    dickens      49        31,745     3,968      81.0 B       0.089%
+
+THE INFERRED 350 B/HEADER WAS 3.3x TOO HIGH, and header mass is 0.634% of sil40, not 2.07%.
+G27's headline number is withdrawn.
+
+WHY THE INFERENCE FAILED, and it is the useful part. The seam accounting measured that 3 EXTRA
+BLOCKS cost ~1,050 B (~350 B each). Only ~107 B of that is the header. The remaining ~240 B per
+extra block is the cost of splitting AT A FORCED CHUNK BOUNDARY instead of where the parse
+wanted to split — a worse-fitted pair of tables on both sides.
+
+So the T>1 seam is NOT primarily a header-count problem. It is a BOUNDARY-PLACEMENT problem,
+and ~70% of its cost is the misplacement rather than the extra header. That is consistent with
+the tail-guard falsification (G-note: suppressing late splits made every file WORSE, because
+well-placed splits earn their headers) and it explains why grid tuning moved the seam so much
+(G24: +1,115 B at 7 boundaries down to +6 B at 0) — fewer forced boundaries, not fewer headers.
+
+### What this does to the two candidate levers
+
+  BLOCK COUNT (fewer, larger blocks): headers are 0.634% of output, so a 20% cut is at most
+  0.13% BEFORE the data-bit penalty of worse-fitted tables. Still ~160x the Huffman margin
+  (0.0008%) and still far above the ~0.01% the zero-headroom cells need — but it is a
+  0.13% ceiling, not the 0.4% G27 claimed.
+
+  BOUNDARY PLACEMENT: ~70% of the seam is misplacement. This is the same conclusion G25 reached
+  from the scheduling side and G24 from the grid side, now from the byte accounting: what the
+  T>1 path needs is for chunk boundaries to stop FORCING block boundaries — the narrow
+  "consumer owns the seam blocks" form — not fewer or cheaper headers.
+
+Three independent accountings now name the same fix. That is the one to build.
+
+METHOD NOTE. This is the fifth claim of mine this session that measurement retracted, and the
+second where an INFERRED constant stood in for a measured one. The rule that caught it is the
+one already in CLAUDE.md — a gate may only cite a dataset that exists — and the fix each time
+was to add the counter rather than to argue about the constant.
+
+## G28 — the decomposition CONFIRMED on the frozen box (first authoritative board data this session)
+
+Every board number above this line was measured on the local M1. The base arm of the solvency
+wall run re-measures `origin/main` on the frozen authority, and the structure holds:
+
+    440 decidable cells (22 files x L2/L6/L9 x T1/T4 x 4 rivals; 88 ABSENT = igzip gaps)
+     68 failing on size (15.5%; the full L1-9 board is 200/1320 = 15.2% — consistent)
+
+    failing by rival and thread count:
+      libdeflate  T4   48      <- 70.6% of ALL failures
+      gzip        T1    6      gzip  T4   6
+      pigz        T1    4      pigz  T4   4
+      libdeflate  T1    0      <- we tie or beat libdeflate at EVERY T1 cell here
+
+`libdeflate T1 = 0` and `libdeflate T4 = 48` is the zero-headroom structure stated directly:
+at T1 we match or beat them everywhere in this level set, and every libdeflate failure is a
+T>1 cell where the seam pushes us over a tie. That is G15's finding, re-derived on the
+authority box from an independent run rather than inherited from the frozen census.
+
+It also sets the honest scale for what has been achieved: the T>1-vs-libdeflate class is
+70.6% of the board, the Huffman margin closes the handful of its cells whose seam is small
+enough (5 on the LOCAL corpus; the solvency verdict is still pending and already disagrees on
+at least one — `movie.mp4 L9 T4` shows us 19 B BIGGER there), and the remaining ~43 need the
+seam itself to go to zero.
+
+## G29 — THE FRONTIER RESULT WAS MEASURED AT THE WRONG COORDINATE. T4 has 249-330% wall slack
+
+G17 concluded that we sit ON libdeflate's size/wall frontier and that no parse configuration
+can win both axes. That conclusion measured WALL SLACK AT T1, where it is 0-8%. It is wrong
+for the cells that actually fail.
+
+libdeflate-gzip is SINGLE-THREADED. Our failures are overwhelmingly T4 (G28: 48 of 68, and
+libdeflate T1 = 0). At T4 the comparison is our 4 threads against their 1:
+
+    sil40, vanilla build, hyperfine n=5 warmup 1, /dev/null sink, local M1
+      L6   gzippy T4 0.1185 s   libdeflate 0.4135 s   we are 3.49x FASTER   slack 249%
+      L9   gzippy T4 0.3197 s   libdeflate 1.3742 s   we are 4.30x FASTER   slack 330%
+
+Every parse configuration G17 priced and rejected was rejected against a 0-8% budget. The
+budget where the cells fail is 249-330%.
+
+### What that buys, measured
+
+`lazy2:35:65` at L6 (the config G17 rejected at +9.29% against 4.4% of T1 slack), run at T4 on
+a clean tree (HEAD 05dda708, `ladder-tune` build, all four files):
+
+    file          libdeflate-6    ours T4 default      ours T4 lazy2:35:65
+    sil40         15,555,063      15,554,873  (-190)   15,535,712  (-19,351)
+    dickens        4,539,505       4,539,848  (+343)    4,520,157  (-19,348)   <- default FAILS
+    data.csv       3,372,612       3,372,268  (-344)    3,348,563  (-24,049)
+    winexe.exe     1,510,118       1,509,934  (-184)    1,510,071  (-47)
+
+    wall, sil40 L6:  libdeflate 0.4153 s | ours T4 default 0.1244 s (3.34x) |
+                     ours T4 lazy2 0.1380 s (3.01x, i.e. +10.9% of OUR time)
+
+19,000-24,000 B of margin — about 100x the seam it needs to absorb — while remaining 3x faster
+than the rival. This is the libdeflate-T4 class, 48 of the 68 failures on the frozen box.
+
+### The change this implies is SANCTIONED, not a knob
+
+The level->config map must become THREAD-COUNT-AWARE: keep today's config at T1 (little slack),
+spend the parallel slack at T>1. That is not an env var and not content detection — CLAUDE.md
+non-negotiable #3 explicitly permits "parameter tuning (write-buffer size, shared memory per
+thread count)", and STEP 2 states outright that "T>1 may emit different bytes than T1".
+
+### THE METHOD LESSON, which is the important part
+
+This was found by asking: when something is "measured dead with receipts", how do we know it
+was not a good idea whose co-parameter was simply unoptimised?
+
+The answer is a SIGNATURE. A verdict is coordinate-dependent, not intrinsic, when:
+  * the benefit is MONOTONE (non-worse by construction on some axis), and
+  * the cost is NOT intrinsic — it depends on a coordinate (thread count, level, what else is
+    enabled) that was held fixed and unexamined.
+
+Two receipts from this session alone:
+  * G16 killed the dual-candidate Huffman as "0.001% for 10-14% wall". Both halves were
+    coordinate artefacts: the cost is +2.3% at T4 (the work parallelises), and the 0.001% is
+    not a size win but SEAM ABSORPTION. It now has a SHIP verdict.
+  * G17 killed the whole parse-config space against a T1 budget. The cells fail at T4, where
+    the budget is 40x larger. This section.
+
+So a FALSIFY note must record the COORDINATE it was measured at and separate an INTRINSIC
+CEILING from a COORDINATE-DEPENDENT VERDICT. "libdeflate's heuristic is within 0.001% of the
+mathematical optimum" is intrinsic and permanent. "Therefore it is dead" was neither. And
+structurally-right-but-currently-losing work should be PARKED WITH ITS COORDINATE, never
+deleted — deleting it is what made G16 need rediscovering.
+
+## G38 — after the 42-cell composition: 26 residual cells, and 6 of them belong to work already verified
+
+Residual computed from the AFTER arm of the combined lever
+(`lever-combined2/try.json`, 528 cells / 440 decidable) — measured, not projected.
+
+    base failing 68  ->  after failing 26   (42 closed)
+
+    libdeflate T4  12 | gzip T1 6 | pigz T1 4 | gzip T4 3 | pigz T4 1
+
+    worst first
+      gzip  T4  dd79_bin6           L2  1.00935      libdeflate T4 data.csv    L9  1.00034
+      gzip  T1  dd79_bin6           L2  1.00927      libdeflate T4 data.json   L9  1.00022
+      pigz  T4  dd79_bin6           L2  1.00818      gzip       T4 weights     L9  1.00022
+      pigz  T1  dd79_bin6           L2  1.00809      gzip       T1 weights     L9  1.00021
+      gzip  T1  monorepo.tar        L6  1.00592      libdeflate T4 engine.wasm L9  1.00014
+      gzip  T1  aozora.txt          L6  1.00568      libdeflate T4 dd79_bin6   L2  1.00008
+      pigz  T1  monorepo.tar        L6  1.00540      libdeflate T4 dd79_bin6   L9  1.00006
+      pigz  T1  aozora.txt          L6  1.00450      libdeflate T4 minjs       L9  1.00003
+      gzip  T1  minjs.min.js        L6  1.00341      libdeflate T4 photo.jpg   L9  1.00001
+      pigz  T1  minjs.min.js        L6  1.00311      libdeflate T4 movie.mp4   L6  1.00001
+      gzip  T4  photo.jpg           L2  1.00046      libdeflate T4 photo.jpg   L6  1.00001
+      gzip  T1  photo.jpg           L2  1.00045      libdeflate T4 weights     L2  1.00001
+                                                     libdeflate T4 photo.jpg   L2  1.00001
+                                                     libdeflate T4 weights     L9  1.00000
+
+### Three groups, and only one of them is open work for me
+
+**(a) SIX L6 T1 CELLS — already solved by someone else.** monorepo.tar, aozora.txt and
+minjs.min.js against BOTH gzip and pigz. G31a measured the foreign `good_match` patch closing
+exactly these (aozora -35,823 B, monorepo -27,716 B, minjs to 1,087,222 vs gzip's 1,088,768).
+They are T1 cells and the composed change is T>1-only, so the two are disjoint and should ADD:
+26 - 6 = 20 residual. THIS IS NOT MINE TO LAND. Its owner should gate it; I have only measured
+it. Duplicating it would be the worse outcome.
+
+**(b) TWELVE libdeflate T4 CELLS AT RATIO <= 1.00034, most at 1.00001.** One part in 100,000 —
+on a 6.4 MB file that is ~64 B. These are the pure-seam cells (G34): T1 already ties libdeflate
+byte-for-byte, so the entire deficit is the T>1 seam and the margin needed is tiny. Every
+mechanism that could supply it cheaply has now been measured: parse depth (saturates, G30),
+block count (dead at matched counts, G37e), exact Huffman (already in the composed change).
+What is left for them is the seam itself.
+
+**(c) EIGHT CELLS ON dd79_bin6 / photo.jpg / weights.safetensors.** dd79_bin6 L2 is the worst
+on the board (1.00935) and G36 attributed it to SHORT-MATCH DISCOVERY — gzip finds 319,260 more
+matches, concentrated in the shortest bucket, because our hash3 is a one-deep singleton.
+photo.jpg and weights are the per-block-COST class whose count-based readings are all falsified
+(G37e); their remaining unknown is gzip's BTYPE mix, which no tool currently reports.
+
+So of 26: 6 belong to work already verified and owned elsewhere, 12 need the seam
+re-architecture, and 8 need either hash3 chaining (attributed, 4 cells) or a per-block cost
+measurement that does not yet exist (4 cells).
+
+## G40 — the T>1 seam DECOMPOSED per cell: three terms, and no single one dominates
+
+The 12 residual libdeflate T4 cells fail by ~40-1,400 B. Measured what that is actually made
+of, T1 vs T4, with the block-type counters (anatomy-counters build, exact bytes):
+
+    file             L   T1 dyn/stored   T4 dyn/stored   seam    stored x5 B   unexplained
+    photo.jpg        6      25 / 0          25 / 10       +70         50           ~20
+    engine.wasm      9      17 / 0          17 /  2       +61         10           ~51
+    minjs.min.js     9      66 / 0          69 / 11       +39         55           -16
+    movie.mp4        6      54 / 0          55 /  9      +195         45          ~150
+
+THREE TERMS, NONE DOMINANT:
+  1. SYNC-FLUSH overhead — the stored blocks, 5 B each, one per chunk seam.
+  2. EXTRA DYNAMIC HEADERS — 0 on photo.jpg and engine.wasm, +3 on minjs, +1 on movie.mp4.
+  3. A RESIDUAL that neither explains — +150 B on movie.mp4 with only 9 flushes and 1 extra
+     header; NEGATIVE on minjs (its 11 flushes and 3 headers "should" cost 55+ B, yet the
+     total seam is only 39 B, so something at T4 is SMALLER).
+
+Term 3 is boundary MISPLACEMENT: a chunk edge forces a block to end where the parse did not
+want one, so the tables either side fit worse — and occasionally BETTER, which is why minjs
+comes out under its own overhead.
+
+### An overclaim caught by checking a second file
+
+photo.jpg alone reads as "the seam is ENTIRELY sync flushes": same dynamic count, 10 stored
+blocks, +70 B against 50 B of flush overhead. That reading would have justified building
+bit-level concatenation to remove the flushes, on the strength of one file. engine.wasm
+refutes it immediately — same dynamic count, only 2 flushes (10 B), and still +61 B.
+
+So REMOVING THE SYNC FLUSHES ALONE WOULD NOT CLOSE MOST OF THESE CELLS. It would close
+photo.jpg L6 (+70 -> ~+20, and our T1 is 6,472,061 against libdeflate's 6,472,062) and leave
+engine.wasm, movie.mp4 and the rest failing. That is worth knowing BEFORE building it: the
+bit-shift concatenation is real work and it buys one cell of this class, not twelve.
+
+### What this does to the re-architecture estimate
+
+G24a scoped "consumer owns the seam blocks" as the fix, on the assumption the seam is headers.
+It is not, on this class: headers are 0 extra on half the cells measured. The consumer-owned
+seam block would fix term 2 and term 3 (it removes the forced boundary entirely) but NOT term
+1 unless the concatenation also goes bit-level. Both halves are needed for this class, and the
+cheaper half alone was about to be built on a one-file reading.
+
+### G40a — FALSIFIED before building: a small-file parallel bypass would cost 2-3x wall
+
+L0 at T>1 already bypasses the parallel pipeline entirely (`pipelined.rs`) because chunking made
+T>1 larger than T1 and L0 is memory-bandwidth-bound, so the parallelism bought nothing. The
+obvious extension for the seam class is a size threshold: below some input size, skip chunking
+and pay no seam. Measured the premise first (hyperfine n=8 warmup 2, vanilla build):
+
+    file             input bytes   T1        T4        speedup
+    engine.wasm          868,202   0.0233s   0.0120s    1.94x
+    minjs.min.js       3,598,158   0.0670s   0.0227s    2.96x
+    photo.jpg          6,511,067   0.0759s   0.0257s    2.95x
+
+THE PREMISE IS FALSE. These files parallelise well — 1.94x to 2.96x at T4 — so a bypass would
+trade 2-3x of wall for ~40-70 B of size. The L0 precedent does not extend: L0 is
+memory-bandwidth-bound and genuinely gains nothing from threads, while these are CPU-bound and
+scale nearly linearly.
+
+Recorded so the next session does not re-derive it: the smallest failing file in this class is
+868 KB and still hits 1.94x. There is no size floor below which the seam is free.
+
+## G42 — the T1 front needs a lever 20-900x bigger than anything we have, and it must not flip a tie
+
+Byte-identity is NOT a goal — it is the cage. So the right question about the T>1 gating of the
+exact-Huffman candidate is not "does T1 stay identical" but "do we LOSE anything by declining
+those bytes at T1". Measured from the after-arm of the gated change:
+
+    every failing T1 cell, and the margin it needs
+      gzip  dd79_bin6           L2  1.00927   needs 0.927%
+      pigz  dd79_bin6           L2  1.00809   needs 0.809%
+      gzip  monorepo.tar        L6  1.00592   needs 0.592%
+      gzip  aozora.txt          L6  1.00570   needs 0.570%
+      pigz  monorepo.tar        L6  1.00540   needs 0.540%
+      pigz  aozora.txt          L6  1.00452   needs 0.452%
+      gzip  minjs.min.js        L6  1.00342   needs 0.342%
+      pigz  minjs.min.js        L6  1.00311   needs 0.311%
+      gzip  photo.jpg           L2  1.00045   needs 0.045%
+      gzip  weights.safetensors L9  1.00021   needs 0.021%
+
+    exact-Huffman candidate: ~0.001% (122-166 B on 15.4 MB)
+
+THE SMALLEST T1 DEFICIT IS 20x THE LARGEST T1 LEVER WE HAVE. So declining those bytes at T1
+costs ZERO cells — the gating is right on cell-closing grounds as well as on the wall budget,
+which are independent arguments reaching the same place.
+
+### What the T1 front actually requires
+
+A size lever worth 0.02% to 0.93% — twenty to nine hundred times the Huffman candidate — that
+ALSO does not flip any of the 66 tied cells. Those two requirements are in tension, and that
+tension is the whole T1 problem:
+
+  * `good_match` has the right MAGNITUDE (0.5-1.4%: aozora -35,823 B, monorepo -27,716 B) and
+    fails the tie test (17 flips, data.csv L2 1.0000 -> 1.0431).
+  * hash3 chaining likewise: right direction, 12 flips.
+  * The exact-Huffman candidate passes the tie test BY CONSTRUCTION and is 20x too small.
+
+Nothing measured so far is both big enough and safe enough. A lever for this front must be
+sized against 0.02%-0.93% AND run through `scripts/campaign/tie-guard.sh` before anything else.
+Note the two cheapest cells — photo.jpg L2 (0.045%) and weights.safetensors L9 (0.021%) — are a
+different, much lower bar than the 0.3-0.9% cluster, and may be reachable by something the
+larger cells are not.
 ## G35 — the DROP-IN axis was never measured, and it is GREEN against the contract
 
 `fulcrum dropin` describes itself as "the missing half of the goal scoreboard: level x rival x
