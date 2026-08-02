@@ -1140,7 +1140,7 @@ fn hc_catchup(
 /// -0.3% vs `LIMIT_HASH_UPDATE_INSERTS_L0`). Higher values (4, 8, MAX) give
 /// more ratio but blow well past a 10% L1 wall budget — not shipped, see the
 /// commit message for the measured numbers.
-pub(super) const LIMIT_HASH_UPDATE_INSERTS_L1: usize = 3;
+pub(super) const LIMIT_HASH_UPDATE_INSERTS_L1: usize = usize::MAX;
 
 /// Sentinel head-table entry meaning "no position stored yet". Any position we
 /// store is `< in_end <= u32::MAX`, so the sentinel never collides with a real
