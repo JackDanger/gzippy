@@ -224,38 +224,6 @@ impl HcMatchfinder {
     /// returned length is `best_len_in` and the offset is meaningless (0). The
     /// caller must ensure `buf` is padded so 4-byte loads up to
     /// `in_next + best_len + 1` stay in bounds.
-    // FALSIFY (2026-07-31): `#[inline(never)]` HERE IS SLOWER AT EVERY LEVEL, even though
-    // it removes a QUARTER of the data reads at L9. Do not re-try it, and do not treat this
-    // function's spill traffic as the wall deficit without re-reading this record.
-    //
-    // Motivation was measured, not guessed: callgrind showed 24,099,848 Dr inside hc.rs with
-    // NO SOURCE LINE (42.4% of this file's reads, 20.7% of the program's) against libdeflate's
-    // ZERO such reads, and the top line-0 instructions disassemble to loop-carried stack
-    // reloads (`mov 0x18(%rsp),%r12` 2,722,806 Dr; `mov 0x80(%rsp),%rax`, `mov 0x14(%rsp),%esi`,
-    // `mov 0x58(%rsp),%r11` 1,725,480 each; `cmpl $0x3,0x10(%rsp)` 1,545,657; and more —
-    // 13.4M reads across eight instructions in seven frame slots). Our frame is 1,976 B against
-    // libdeflate's 184 B and 76% of our memory operands are stack-relative against their 48%.
-    // Giving the chain walk its own frame should have relieved exactly that.
-    //
-    // IT DID, AND IT STILL LOST. Cachegrind, trainer, T1, output byte-IDENTICAL at L2/L6/L9:
-    //     L2 (8 MB)  Ir 562,981,991 -> 577,918,803 (+2.65%)  Dr 116,446,149 -> 118,093,512 (+1.4%)
-    //     L9 (2 MB)  Ir 449,743,993 -> 450,076,251 (+0.07%)  Dr 106,693,133 ->  81,059,242 (-24.0%)
-    // and the WALL (hyperfine n=7, 58 MB text, both arms to /dev/null) got WORSE everywhere:
-    //     L2 1.0078s -> 1.0639s (1.0557)   L6 2.0238 -> 2.0910 (1.0332)   L9 5.5427 -> 5.6406 (1.0177)
-    //
-    // At L9 we deleted 25,633,891 data reads and LOST 1.77% of wall. Dw rose 27.9% (arguments
-    // spilled for the call) and each position gained call/return dependent latency. So the
-    // spill READS are largely absorbed by the machine — consistent with the banked profile
-    // where our IPC, stalls, L1D miss rate and branch behaviour all BEAT libdeflate's.
-    //
-    // CORRECTION THIS FORCES on docs G19/G20: the Dr excess LOCATES the deficit to this
-    // function, it does NOT establish that reads are the wall-blocking quantity. One route
-    // that removed a quarter of them made the wall worse. "Instruction counts LOCATE, they
-    // never predict the wall" now has a receipt inside this campaign, not just in memory.
-    //
-    // REOPEN requires a mechanism that lowers reads WITHOUT adding a call per position and
-    // WITHOUT raising Dw — e.g. fewer simultaneously-live values in the caller — plus a wall
-    // measurement at a shallow AND a deep level. Ir/Dr alone may not move the wall at all.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub fn longest_match(
@@ -395,35 +363,6 @@ impl HcMatchfinder {
                     if (cur_node4 as i32) <= cutoff {
                         break 'search;
                     }
-                    // FALSIFY/FALSIFIED 2026-07-28 — DO NOT de-pipeline this. The hoist
-                    // looks vestigial: the prefetch it was written to feed was
-                    // measured as a loss and deleted, so "it now keeps a value
-                    // live for nothing" is the obvious reading. It is WRONG. The
-                    // hoist independently hides the DEPENDENT-LOAD LATENCY of the
-                    // pointer chase — `next_tab[cur_node4 & MASK]` feeds the next
-                    // iteration's address, so reading it at the loop bottom
-                    // serialises load->use on the chain's critical path.
-                    // De-pipelining both walks, frozen Zen2, n=31, output
-                    // byte-identical, vs its exact parent:
-                    //     L1 1.0016 noisy   L2 1.0131   L6 1.0624   L9 1.0992
-                    // all RESOLVED SLOWER, and worse the deeper the chain — the
-                    // signature of exposed load latency. It went the wrong way
-                    // even though it REMOVED instructions (L2 Ir -1.77%, L6
-                    // -2.91%) and cut L2 reads (Dr -3.87%). Fewer instructions,
-                    // far more wall: instruction and read counts LOCATE, they do
-                    // not predict.
-                    //
-                    // Software-pipelined chain walk (Increment 5b). Hoist the NEXT
-                    // chain node one step ahead so this iteration can prefetch the
-                    // FOLLOWING candidate's match data — the second, reducible
-                    // dependent load, which sits off the chain's critical path —
-                    // while the current node's compare runs. `next_tab` is never
-                    // mutated during a walk, so reading a node early yields the
-                    // identical value the un-pipelined form read at the loop bottom;
-                    // the sequence of `cur_node4` visited, every cutoff/depth check,
-                    // and the resulting match are byte-identical (pinned by
-                    // `matches_equal_scalar_*`). The prefetch is a pure hint.
-                    // SAFETY: `(cur_node4 as u16 & WINDOW_MASK) < WINDOW_SIZE == next_tab.len()`.
                     let mut next_node = unsafe {
                         *self
                             .next_tab
@@ -452,25 +391,6 @@ impl HcMatchfinder {
                     // form produced, whose bounds the SAFETY note there covers.
                     let chain_base = base.wrapping_add(in_base_v);
                     loop {
-                        // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
-                        // A `prefetch_read` of the next chain node used to sit
-                        // here, one iteration ahead. It was a net LOSS: it cost
-                        // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
-                        // removed) to buy misses we were not taking. Against
-                        // libdeflate on identical output we were MISSING LESS
-                        // (7.0% vs their 16.4%) while executing 70% MORE loads
-                        // — the signature of over-prefetching. Removing it:
-                        // Intel -5.1% wall / -5.2% cycles, M1 geomean 0.9610
-                        // (-10% at L6/L9), AMD Zen2 frozen geomean 0.9993.
-                        // Gate was pre-registered before measuring: no cell
-                        // above 1.02 and geomean <= 1.0, across 4 entropy
-                        // classes x L1/6/9 x 3 microarchitectures. Output
-                        // byte-identical throughout. The hardware prefetcher
-                        // already covers this access pattern on every core we
-                        // ship to.
-                        // SAFETY: `cutoff < cur_node4` so `matchptr < in_next`, thus
-                        // `matchptr + 4 <= in_next + 4 <= buf.len()`.
-                        // SAFETY: as the chain_base note above.
                         let cand = unsafe {
                             #[cfg(debug_assertions)]
                             {
@@ -554,162 +474,9 @@ impl HcMatchfinder {
                 {
                     local.chain_reads += 1;
                 }
-                // FALSIFY 2026-07-30 (FALSIFIED) — do NOT apply the `chain_base` hoist to
-                // THIS walk. It WINS on the length-4 walk above and LOSES here, and the
-                // difference is instructive.
-                //
-                // Same transformation, one loop lower: hoist `base + in_base_v` out, index
-                // the candidate by `cur_node4`, materialise `matchptr` only on a hit.
-                // Output byte-identical. Measured, 6,000,000 B of dickens at L6 T1:
-                //     hc.rs Dr    108,282,726 -> 86,198,253    (-20.4%)
-                //     program Dr  161,009,178 -> 142,887,715   (-11.3%)
-                //     program Dw   52,744,347 -> 58,688,632    (+11.3%)   <- the tell
-                // Frozen paired wall (solvency, n=15, /dev/null both arms) came back
-                // SLOWER: photo.jpg 1.0567, armexe.elf 1.0119, tool.bin 1.0095, dickens
-                // 1.0085, geomean ~1.012. photo.jpg is the file the length-4 hoist made
-                // 5.6% FASTER, so this is not noise and not the same effect twice.
-                //
-                // MECHANISM, legible in the counters: the reads did not vanish, they became
-                // STORES. Deferring `matchptr` keeps `cur_node4` live across a longer region
-                // in a loop that ALREADY needs `best_len`, `off`, `n_hi` and `n_lo`, and the
-                // allocator paid for it in spill writes. The length-4 walk has a much
-                // smaller live set, which is exactly why the identical change wins there.
-                // The transformation is not what matters; the live-set budget of the
-                // specific loop is.
-                //
-                // ⚠ PROVENANCE CORRECTION 2026-07-31, applies to BOTH verdicts above and
-                // to the length-4 hoist that shipped: `photo.jpg` is a GATE member
-                // (`corpus_split.json`), not TUNE. It was quoted as the headline for the
-                // shipped win ("0.9443", "our worst wall cell 1.2274 -> 1.159") and again
-                // here as the tell. No parameter was fitted to it, so no promotion is
-                // void — but the win is WEAKER than it was reported. Recomputed on TUNE
-                // members only: armexe.elf 0.9849, symbols.dwarf 0.9969, aozora.txt
-                // 0.9983, dickens 1.0023, data.csv 1.0081 => geomean 0.9981, i.e. 0.19%,
-                // INSIDE this rig's ~1.5% A/A noise floor, with only armexe.elf arguably
-                // outside it. The 0.9889 figure was carried by the gate file.
-                // Select and headline on TUNE; let GATE only ever confirm.
-                //
-                // GENERAL: a -20% READ count in a matchfinder does not imply a faster wall.
-                // Two independent instances now — this, and the u32-packed bucket in
-                // `matchfinder::ht` (-26.7% writes, zero wall movement). Any counter-only
-                // argument here needs a frozen paired wall run before it is believed.
-                //
-                // FALSIFY 2026-07-31 (FALSIFIED) — THE ADDRESSING-MODE FIX BELOW WAS BUILT
-                // AND IT IS THE SAME CHANGE AS THE DEFERRAL FALSIFIED ONE LOOP LOWER.
-                // This is the most useful result in this file, so read it before writing
-                // any new mechanism argument here.
-                //
-                // BUILT: `mp_base = base + in_base_v` and `in_ptr = base + in_next` hoisted
-                // once out of the walk; candidate loads become `mp_base + cur_node4` (one
-                // add) and `in_ptr + off`, taking `base` out of the inner loop. `matchptr`
-                // was still materialised IMMEDIATELY every iteration — the timing that was
-                // falsified was deliberately left alone. Output byte-identical to main at
-                // L2/L6/L9 on five corpus members (15/15 sha256 equal).
-                //
-                // GATE, pre-registered BEFORE measuring: Dr down AND Dw not up.
-                // Cachegrind, Intel i7-13700T (trainer), 6,000,000 B of dickens, -p1:
-                //     L2   Ir -3.36%   Dr +1.11%   Dw -0.80%   FAIL (Dr UP)
-                //     L6   Ir -0.05%   Dr -11.26%  Dw +11.27%  FAIL (Dw UP)
-                //     L9   Ir -3.66%   Dr -22.54%  Dw +15.25%  FAIL (Dw UP)
-                //
-                // THE FINDING: at L6 these counters reproduce the DEFERRAL falsification
-                // recorded below to within 0.004%:
-                //     deferral  Dr 161,009,178 -> 142,887,715   Dw 52,744,347 -> 58,688,632
-                //     this one  Dr 161,004,537 -> 142,882,856   Dw 52,742,337 -> 58,686,403
-                // Two source forms I argued were DIFFERENT MECHANISMS ("change the type,
-                // not the timing") compile to the same machine code. LLVM canonicalises
-                // both to the same schedule, and the spill trade is a property of the
-                // LOOP'S LIVE SET, not of how the address is spelled. The distinction was
-                // real in the source and absent in the object file.
-                //
-                // GENERAL, and this is the fourth receipt in this project: source-level
-                // cost is not machine-level cost — extended here to say that two source
-                // mechanisms can be ONE machine-level change. A mechanism argument that
-                // cannot be distinguished in the emitted code is not a new mechanism, and
-                // "it is a different transformation" does not reopen a falsification.
-                // To reopen this, first show the two forms differ in the DISASSEMBLY.
-                //
-                // Do not be tempted by L9's -22.54% Dr / -66.4M reads against +9.0M writes
-                // ("net memory ops are way down"): the identical counter profile already
-                // LOST a frozen paired wall run (geomean ~1.012, photo.jpg 1.0567). Net-ops
-                // is the wrong quantity; the banked profile says this cell is governed by
-                // dependent LOADS ISSUED and by spills.
-                //
-                // THE VENDOR DIFF THAT MOTIVATED IT still stands and is still unexplained:
-                // The prefilter below is TERM-FOR-TERM libdeflate's (`hc_matchfinder.h`,
-                // "Check for matches of length >= 5"): same four u32 loads, same two
-                // comparisons, same order. So the 1.88x read excess (ours 108,282,726 Dr
-                // vs their 57,593,044, identical D1 misses) is NOT in the comparison
-                // shape. It is in the ADDRESSING MODE one level down:
-                //     libdeflate:  matchptr = &in_base[cur_node4];   // a real pointer
-                //                  load_u32_unaligned(matchptr + best_len - 3)
-                //     ours:        matchptr: usize                  // an INDEX
-                //                  load_u32(base, matchptr + off)  => base.add(idx + off)
-                // Ours keeps `base` live across the ENTIRE walk and pays a two-register
-                // add per load where libdeflate pays one register plus a displacement.
-                // That is the same defect the shipped `chain_base` hoist removed from the
-                // length-4 walk, which is why that hoist won.
-                //
-                // WHAT IS LEFT OF IT. The addressing difference is real in the SOURCE and
-                // was erased by the compiler, so it is not the lever. The 1.88x read excess
-                // therefore remains UNEXPLAINED by anything visible in this function, and
-                // three separate source-level attacks on it have now failed. The next
-                // honest step is not another rewrite of these loops: it is to diff the
-                // DISASSEMBLY of our walk against libdeflate's compiled walk and find where
-                // the extra loads actually are. Until that diff exists, a change here has
-                // no named vendor difference and the bar is a measurement, not an argument.
                 loop {
                     loop {
                         matchptr = (in_base_v as isize + cur_node4 as isize) as usize;
-                        // FALSIFY/FALSIFIED 2026-07-28 — DO NOT RE-ADD WITHOUT MEASURING.
-                        // A `prefetch_read` of the next chain node used to sit
-                        // here, one iteration ahead. It was a net LOSS: it cost
-                        // 103M L1 loads on dickens L6 (412.6M -> 309.4M when
-                        // removed) to buy misses we were not taking. Against
-                        // libdeflate on identical output we were MISSING LESS
-                        // (7.0% vs their 16.4%) while executing 70% MORE loads
-                        // — the signature of over-prefetching. Removing it:
-                        // Intel -5.1% wall / -5.2% cycles, M1 geomean 0.9610
-                        // (-10% at L6/L9), AMD Zen2 frozen geomean 0.9993.
-                        // Gate was pre-registered before measuring: no cell
-                        // above 1.02 and geomean <= 1.0, across 4 entropy
-                        // classes x L1/6/9 x 3 microarchitectures. Output
-                        // byte-identical throughout. The hardware prefetcher
-                        // already covers this access pattern on every core we
-                        // ship to.
-                        //
-                        // FALSIFY/FALSIFIED 2026-07-28 (second time, different change) —
-                        // DO NOT hand-hoist the two operands below that describe
-                        // the CURRENT position. It looks like free money: this
-                        // prefilter reads four values per candidate, and two of
-                        // them (`in_next + off`, `in_next`) are loop-invariant
-                        // across the rejection walk — `in_next` does not move and
-                        // `best_len` only changes on acceptance, which exits the
-                        // loop. `load_u32(base, in_next)` is even just `seq4`,
-                        // already in a variable.
-                        //
-                        // LLVM ALREADY HOISTS THEM. Doing it by hand made things
-                        // WORSE, measured on the shipped build shape at L2 on 8 MB
-                        // of silesia:
-                        //     Ir  555,124,179 -> 552,722,907  (-0.43%)
-                        //     Dr  103,975,406 -> 104,103,912  (+0.12%)  <-- UP
-                        // Data reads went UP after removing two source-level loads
-                        // per candidate, which only happens if the loads were never
-                        // being issued and the extra live values cost spill
-                        // reloads. L6 regressed too: 916,724,493 -> 921,418,528
-                        // Ir (+0.51%).
-                        //
-                        // The lesson is general and cost this project two reverts
-                        // in one session: SOURCE-LEVEL LOAD COUNT IS NOT MACHINE-
-                        // LEVEL LOAD COUNT. The 1.30x load ratio against libdeflate
-                        // is real and measured (perf stat, worst cell), but it
-                        // cannot be attacked by reading this function and deleting
-                        // loads that look redundant — the compiler has already
-                        // taken those. Any future attempt here must show a Dr
-                        // DECREASE, not a source-level one.
-                        //
-                        // Prefilter: compare the last 4 and the first 4 bytes before
-                        // attempting a full extension.
                         let off = best_len as usize - 3;
                         // SAFETY: `matchptr < in_next` (cutoff guard). `off = best_len-3`
                         // with `best_len <= max_len`, so `in_next + off + 4 <=
@@ -828,33 +595,6 @@ impl HcMatchfinder {
         let mut hash3 = next_hashes[0] as usize;
         let mut hash4 = next_hashes[1] as usize;
         let mut remaining = count;
-        // FALSIFY — hoisting this wrap test out of the loop is a TRAP. It looks
-        // free: the test costs 2 Ir on every position but can only fire once per
-        // WINDOW_SIZE (32768) of them, which is 12.5M Ir, 2.26% of the whole
-        // program, at L2 on 8 MB of silesia. Two ways of removing it were built
-        // and measured on the shipped build shape (lto=fat, cgu=1); BOTH lost.
-        //
-        //                        L2 Ir                 L6 Ir
-        //   this loop        555,127,066            916,724,493
-        //   chunked runs     541,600,498 (-2.44%)   920,416,350 (+0.40%)
-        //   one test/call    552,888,310 (-0.40%)   925,234,382 (+0.93%)
-        //
-        // "chunked runs" = `while remaining > 0 { run = min(remaining,
-        // WINDOW_SIZE - cur_pos); ... }`. On frozen Zen2 it measured wall 0.9765
-        // at L2 (RESOLVED) but 1.0103 at L6 and 1.0070 at L9 — both RESOLVED
-        // SLOWER. "one test/call" hoists the test to a single per-call check
-        // with a macro'd body; it is worse than chunking at BOTH levels, because
-        // duplicating the body costs more than the branch it removes.
-        //
-        // Do not retry either without an explanation for the DEEP-level loss.
-        // Mine was "lazy skips in short runs so the outer loop cannot amortise"
-        // — and that is WRONG: lazy runs a larger nice_len (65 vs 10), so its
-        // skips are LONGER, and chunking should have helped L6 more, not less.
-        // The regression is real (Ir is deterministic) but unexplained; suspect
-        // inlining/layout, since this body inlines into both greedy's and lazy's
-        // run_block. Measure Ir at L2 AND a deep level before believing any fix:
-        // measuring only L2 and generalising is exactly what produced the
-        // regression above.
         loop {
             if cur_pos == WINDOW_SIZE {
                 self.slide_window();

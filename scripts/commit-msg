@@ -16,43 +16,21 @@ say() { printf '\033[1;31mcommit-msg: %s\033[0m\n' "$1" >&2; FAIL=1; }
 # Files staged in this commit.
 STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
 
-# ── Rule 1: a FALSIFY note is BINDING ────────────────────────────────────────
-# Touching a function that carries a FALSIFY record requires naming a NEW
-# mechanism. Receipt: two of eight levers in one session were variants of an
-# already-recorded falsification, licensed by a CLAUDE.md line since deleted.
+# ── Rule 1: a PARK record is BINDING ──────────────────────────────────
+# A PARK is a MEASURED win that did not ship ("PARK monotone work; never DELETE
+# it"), so touching one silently discards a result someone paid for.
+#
+# FALSIFY enforcement was REMOVED 2026-08-01 on the user's instruction: "delete all
+# of those falsify comments — they're just noise. Not a single one of them is more
+# valuable than simply running the tool with good instrumentation." Do not re-add it.
 if [ -n "$STAGED" ]; then
     for f in $STAGED; do
         case "$f" in *.rs) ;; *) continue ;; esac
         [ -f "$f" ] || continue
-        # Does this commit's diff touch a hunk within 40 lines of a FALSIFY note?
-        # Match the STEM, not the exact word. A 2026-07-30 audit found the session's
-        # most important falsification records written as "FALSIFIED <date>" — and
-        # `grep -q "FALSIFY"` does not match "FALSIFIED" (the 7th character differs:
-        # Y vs I). Two whole files, `pipelined.rs` and `block_split.rs`, carried
-        # falsifications that were invisible to this hook AND to `fulcrum candidates`.
-        # The checker and the data it checks were written in the same session and never
-        # run against each other. Matching the stem makes the family unbreakable.
-        # ...and PARKED records too. A PARK is a MEASURED result that did not ship
-        # ("PARK monotone work; never DELETE it"), so touching one silently is the
-        # same failure as touching a falsification silently. Receipt 2026-08-01: the
-        # L4 `Lazy(depth 10)` PARK at `level.rs:267-278` — depths 6/8/10/12 all
-        # measured, no interior point satisfies clauses 3 and 5 together — was
-        # re-derived from scratch over most of a session. `make falsified` could not
-        # see it either (fixed in the same PR). Same lesson as the FALSIFY/FALSIFIED
-        # stem bug above: the checker and the records it checks must cover the same
-        # vocabulary, or the gap is invisible from both sides.
-        if git diff --cached -U40 -- "$f" | grep -qE "FALSIF(Y|IED|IES)|PARKED"; then
-            # A REVERT toward the recorded-safe value is what the FALSIFY note
-            # WANTS, but this check only sees proximity to the comment, not
-            # direction — so it blocked a legitimate revert on 2026-07-29.
-            # `RESTORE:` is the escape for that case: still explicit, still
-            # auditable, but it does not demand a "new mechanism" for going back.
+        if git diff --cached -U40 -- "$f" | grep -q "PARKED"; then
             if ! printf '%s' "$MSG" | grep -qE '^(REOPEN|RESTORE):'; then
-                say "touches a FALSIFY or PARK record in $f without a 'REOPEN:' line."
-                say "  A prior falsification or PARK is BINDING. State the NEW mechanism and its"
-                say "  falsifier: 'REOPEN: <mechanism> — falsified by <measurement>'."
-                say "  If you are RESTORING the recorded-safe value, say 'RESTORE: <what>'."
-                say "  'Different code shape now' is not a mechanism."
+                say "touches a PARK record in $f without a 'REOPEN:' line."
+                say "  A PARK is a measured result that did not ship. State what changed."
             fi
             break
         fi

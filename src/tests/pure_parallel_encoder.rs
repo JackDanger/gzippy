@@ -110,19 +110,6 @@ fn mixed_corpus(len: usize) -> Vec<u8> {
 }
 
 /// Every thread count produces VALID GZIP that roundtrips to the exact input.
-///
-/// FALSIFY: this test used to assert `t1 == t4 == t16` byte-for-byte. That is
-/// NOT a requirement and asserting it is a cage. The only correctness rule is
-/// that the output is valid gzip content — it decodes back to the exact input
-/// through any conformant decoder. Cross-thread byte-identity was only ever a
-/// cheap total oracle (if T4 bytes equal T1 bytes and T1 is correct, T4 is
-/// correct for free); the roundtrip below is a stronger oracle and costs little.
-///
-/// Enforcing it actively BLOCKED a win: scaling chunk size with level cut the
-/// T4 size penalty by up to 87% (L8 +3,228 -> +429 bytes on 40 MB silesia) and
-/// made T4 SMALLER than T1 at L2/L6 — which this assertion rejected purely for
-/// producing different bytes. pigz's output likewise varies with its thread
-/// count.
 #[test]
 fn every_thread_count_is_valid_gzip() {
     // Two sizes so BOTH block-grid regimes are exercised for T-invariance:

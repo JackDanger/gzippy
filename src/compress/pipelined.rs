@@ -77,48 +77,6 @@ const MAX_PARALLEL_BLOCK_SIZE: usize = 512 * 1024;
 /// parallel path still has work to hand out.
 const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 
-/// FALSIFY 2026-07-30 (FALSIFY-record) — NO chunk-grid change can pass promotion clause 3, and this is
-/// now established across FIVE shapes, not inferred from one:
-///
-/// | shape | flips of the 9 near-tie T4 cells |
-/// |---|---|
-/// | plain 1 MiB fixed (no thread-awareness at all) | 8 |
-/// | T-aware, 4 chunks/thread, 8 MiB cap | 9 |
-/// | T-aware + seam aligned DOWN to the block budget | 9 |
-/// | T-aware + seam aligned UP to the block budget | 7 |
-/// | T-aware, 8 chunks/thread, 2 MiB cap | 7 |
-///
-/// The plain-1-MiB row is the load-bearing one: it has no thread term, so the flips are
-/// NOT caused by thread-awareness or by seam alignment. They are caused by CHANGING THE
-/// CHUNK SIZE AT ALL. A handful of T4 cells (winexe.exe L9 +55..74 B on 1.5 MB,
-/// aozora.txt L2 +20 B, data.csv L8 +102 B) are won by the SPECIFIC 512 KiB grid rather
-/// than by anything robust, and every alternative grid loses some of them.
-///
-/// So the trade is fixed and known: ~29 cells closed against ~9 opened, all nine under
-/// 0.02%. That is a question about clause 3's absolute no-flip bar applied to sub-noise
-/// SIZE ties, not an engineering question — and `docs/promotion-rule.md` requires a rule
-/// change to land separately, before the change it would affect, and never from the
-/// session whose result it would rescue. Do not re-sweep grid constants hoping for a
-/// shape with zero flips; five have been tried.
-///
-/// Chunks handed to each thread by the thread-aware grid.
-///
-/// The structurally-pure value is 1 — one chunk per thread is the minimum number of
-/// seams that still uses every thread, and seams are what cost bytes. It is not 1
-/// because the scheduler hands chunks out from an atomic queue and a thread that draws
-/// an incompressible chunk must be able to pick up another; at k=1 the whole job is as
-/// slow as its unluckiest chunk, which is exactly how the level-scaled-grid attempt died
-/// (2-4% wall to imbalance).
-///
-/// 2 is the smallest oversubscription that keeps that safety valve. Measured T4-T1 seam
-/// cost at L6, exact bytes, k=4 -> k=2 -> k=1:
-///     dickens        787 ->  373 ->  221
-///     data.sqlite    671 ->  482 ->  346
-///     monorepo.tar  1206 ->  401 ->  130
-///     access.log     926 ->  675 ->  565
-///     tool.bin      -659 ->   68 -> 1186   <- k=1 is NON-MONOTONIC here
-/// k=1 wins on three files and loses badly on tool.bin, and it removes the balancing
-/// margin entirely. k=2 halves the seam cost against k=4 while keeping the valve.
 const CHUNKS_PER_THREAD: usize = 2;
 
 /// MEASUREMENT-ONLY override, resolved once per process.
@@ -144,60 +102,6 @@ fn chunks_per_thread() -> usize {
 /// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
 const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
-/// FALSIFY 2026-07-29 (FALSIFY-record) — scaling this with LEVEL buys size and LOSES wall.
-///
-/// The T>1 size penalty is real and level-dependent: T4 minus T1 on a 40 MB
-/// silesia slice is +1,034 bytes at L6 and +3,228 at L8, because every chunk is
-/// coded independently and deeper levels forfeit a better-fitted Huffman table.
-/// Scaling the grid (L5-6 x2, L7+ x4) fixed most of it — L6 +1,034 -> -728,
-/// L8 +3,228 -> +429, reproduced byte-for-byte on M1 and Zen2.
-///
-/// It is still not worth it. Frozen Zen2, paired at T4, n=21, /dev/null both
-/// arms, both RESOLVED with tight CIs:
-///     L6  ratio 1.0212  (+2.12% wall)   for 1,762 bytes, 0.011%
-///     L8  ratio 1.0371  (+3.71% wall)   for 2,799 bytes, 0.018%
-/// A 0.01% size gain costs 2-4% wall. Per-label needs BOTH legs, so this trades
-/// failing size cells for failing wall cells at a ruinous rate.
-///
-/// Do not retry by tuning the multipliers. The mechanism is that fewer, larger
-/// chunks reduce parallel slack — the cost scales with how much work a chunk
-/// holds, so any multiplier big enough to recover the size is big enough to cost
-/// the wall. A fix must make chunks CHEAPER TO CODE INDEPENDENTLY (a shared or
-/// pre-trained Huffman table across chunks, or seams that fall on block
-/// boundaries the splitter would have chosen anyway), not make them bigger.
-///
-/// Block size for the parallel pipelined chunk grid.
-///
-/// **Currently a pure function of `input_len` (and `level`) only; `_num_threads` is
-/// unused.** This is a PRODUCT CHOICE, not an invariant — corrected 2026-07-30.
-///
-/// This comment previously read "HARD INVARIANT … NEVER `num_threads`", justified by
-/// "byte-identical output at every thread count". **That justification was retracted by
-/// the user on 2026-07-28, and `CLAUDE.md` STEP 2 now states the opposite:** "THE ONLY
-/// CORRECTNESS BAR, at every thread count, is VALID GZIP … T>1 may emit different bytes
-/// than T1 … Byte-identity to a vendor, to our own T1, or to our own previous run is never
-/// a goal and never a gate." The user had to state that three times, because each
-/// correction landed in a leaf document while sites like this one kept regenerating the
-/// cage. This was the fourth such site, and it was load-bearing: making T-invariance a
-/// "HARD INVARIANT" here is what forbade the thread-aware grid (campaign plan A2), which
-/// is the main structural lever against per-chunk overhead — about half the T4 board.
-///
-/// So a thread-aware grid is LEGAL to build. It is simply not built yet, and it is not
-/// free: read the FALSIFY-record note above first. That falsification killed a LEVEL-scaled
-/// grid, which divided the per-chunk constant without buying any size slack and paid 2-4%
-/// wall to imbalance. A T-aware grid (`input/(k*T)` with a split tail) is a different
-/// shape and is unmeasured — but the same mechanism applies, so it needs a wall gate, not
-/// just a size win.
-///
-/// What must NOT come back is the old `get_optimal_block_size` trap on its own terms: a
-/// grid that varies with T for no measured reason, discovered by accident. Vary it
-/// deliberately, gate it on both axes, or leave it alone.
-///
-/// [`MAX_PARALLEL_BLOCK_SIZE`] (512KB) is now the FLOOR rather than the size: the grid
-/// grows from there with available parallelism, so no input is ever split more finely
-/// than the old fixed grid split it. `SMALL_FILE_TARGET_CHUNKS` is gone — the small-file
-/// case is subsumed, because `input_len / (threads * CHUNKS_PER_THREAD)` already falls
-/// below the floor for small inputs and the `.max()` pins it there.
 #[inline]
 fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
     // THREAD-AWARE. Chunk COUNT is what costs size: every chunk restarts the block
@@ -235,18 +139,6 @@ fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> us
         .min(input_len.max(MIN_PARALLEL_BLOCK_SIZE));
 
     // ALIGN THE SEAM TO A BLOCK BOUNDARY THE SPLITTER WOULD HAVE CHOSEN ANYWAY.
-    //
-    // This is the fix the FALSIFY-record note above asks for by name. Chunk count is only
-    // half the per-chunk cost; the other half is that a chunk's LAST block is ragged —
-    // it ends because the chunk ended, not because the block budget or the drift
-    // detector said so — and a short final block pays a full dynamic header for a
-    // fraction of the symbols that would amortise it. Rounding the chunk down to a
-    // whole number of `SOFT_MAX_BLOCK_LENGTH` budgets makes the seam land exactly where
-    // a block was going to end regardless, so the ragged tail disappears instead of
-    // being merely rarer.
-    //
-    // Rounding DOWN, never up: up could exceed MAX_T_AWARE_BLOCK_SIZE and the RSS bound
-    // it enforces. If the input is too small for even one budget, keep `raw`.
     let budget = crate::compress::deflate::parse::SOFT_MAX_BLOCK_LENGTH;
     let aligned = (raw / budget) * budget;
     if aligned >= MIN_PARALLEL_BLOCK_SIZE {
