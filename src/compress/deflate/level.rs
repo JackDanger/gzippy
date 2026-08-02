@@ -258,6 +258,42 @@ fn params_inner(level: u32) -> LevelParams {
         //     shipped default, size vs ld-3, wall vs both real rivals at
         //     every T, zero-regression legs) clears; the recorded miss is
         //     out of this change's causal reach.
+        // ⛔ FALSIFY 2026-08-01 (local M1; SIZE ONLY, which is arch-invariant and
+        // load-immune, so the coordinate that matters here is THREAD COUNT, not the box)
+        // — DO NOT "RESTORE PARITY" BY REVERTING THIS ARM TO libdeflate's `Greedy(12,14)`.
+        //
+        // It is extremely tempting: at T1 that revert measures 22/22 BYTE-TIES with
+        // libdeflate -3 on the full corpus, OPENS 0 cells and CLOSES 3 (ecoli.fastq and
+        // weights.safetensors vs libdeflate, weights vs igzip — the two files where this
+        // Lazy arm is actually WORSE than Greedy). It also removes the L4 ladder sag on
+        // 17 of 22 files. Every one of those numbers is real.
+        //
+        // AT T4 THE SAME REVERT OPENS 12 CELLS. Measured, `-p4`, same corpus:
+        // access.log, data.json, data.parquet, data.sqlite, dd79_bin6, dd79_text6,
+        // dickens, markup.xml, monorepo.tar, movie.mp4, photo.jpg, sil40 — all vs
+        // libdeflate. Clause 3 is absolute, so that is a NO-SHIP.
+        //
+        // MECHANISM, and it generalises far beyond this arm: a BYTE-TIE AT T1 HAS ZERO
+        // HEADROOM, and the T>1 seam costs a couple of hundred bytes. On access.log the
+        // reverted arm is delta 0 at T1 and +224 B at T4 -> FAIL. This arm is -26,874 B
+        // at T1 and still -26,633 B at T4 -> PASS, because its margin ABSORBS the same
+        // ~241 B seam tax.
+        //
+        // So this Lazy deviation is NOT a phase-2 indulgence sitting in front of phase-1
+        // parity. It is a monotone T1 size win BUYING HEADROOM THAT IS SPENT AT T4 —
+        // exactly the mechanism CLAUDE.md prescribes for the seam class ("closed by
+        // monotone T1 size wins that buy headroom to spend"). It is load-bearing for 12
+        // T4 cells, and the L4 sag is its PRICE, not a separate defect.
+        //
+        // Corollary worth carrying: "tie libdeflate on every cell" is, at T4, in TENSION
+        // with the board. Parity means zero margin and the seam eats the margin. Where
+        // we already tie libdeflate at T1, 109 T4 cells sit at zero headroom for this
+        // same reason.
+        //
+        // REOPEN requires a NEW mechanism that removes the T>1 seam tax itself — not a
+        // different L3 config, and not a re-run at T1. See
+        // docs/board/our-L3-win-causes-the-L4-sag.md and
+        // docs/board/parity-at-T1-is-a-liability-at-T4.md.
         3 => LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 12,
