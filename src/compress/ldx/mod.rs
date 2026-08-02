@@ -84,10 +84,14 @@
 
 mod bitstream;
 mod codes;
+pub mod compress;
+mod compress_fastest;
 mod flush;
 mod heap;
+mod ht_matchfinder;
 mod huffman;
 mod length;
+mod matchfinder_common;
 mod precode;
 mod sequences;
 mod split;
@@ -207,6 +211,24 @@ pub const DEFLATE_MAX_LENS_OVERRUN: usize = 137;
 
 pub const DEFLATE_MAX_EXTRA_LENGTH_BITS: u32 = 5;
 pub const DEFLATE_MAX_EXTRA_OFFSET_BITS: u32 = 13;
+
+/// Compress `input` at `level` through the ported path and return the raw DEFLATE
+/// bytes, or `None` if that level is not ported yet.
+///
+/// **This is a test/differential entry point, not a shipping one.** It exists so the
+/// port's rung-3 gate — byte-for-byte against libdeflate's own
+/// `libdeflate_deflate_compress` — can be run from `examples/ldxdump.rs`. Nothing in
+/// `src/compress/deflate` calls it, and nothing routes here.
+pub fn compress_for_diff(level: u32, input: &[u8]) -> Option<Vec<u8>> {
+    let mut c = compress::LdxCompressor::new(level)?;
+    let mut out = vec![0u8; input.len() * 2 + 65536];
+    let n = c.compress(input, input.len(), &mut out);
+    if n == 0 {
+        return None;
+    }
+    out.truncate(n);
+    Some(out)
+}
 
 #[cfg(test)]
 mod tests {
