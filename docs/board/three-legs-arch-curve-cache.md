@@ -58,8 +58,38 @@ The decoder — done and won — has 18 files of *explicit* SIMD: `asm_kernel.rs
 
 **So the real leg-1 question is sharper than "add SIMD":** which encoder hot loops
 autovectorise and which do not? That is measurable the same way — disassemble and look.
-The vendors' remaining edge is in the loops autovectorisation CANNOT reach: igzip's
-histogram (a scatter), its `vpmaddwd` hash, and CRC32-instruction hashing.
+
+### First case examined: the histogram — and it is ARCHITECTURE, not a missing intrinsic
+
+igzip hand-wrote `isal_update_histogram` in assembly, which means they judged that
+autovectorisation could not reach it. Ours (`parse/mod.rs:378-383`, `:404-413`):
+
+```rust
+*self.litlen_freqs.get_unchecked_mut(lit as usize) += 1;   // once per literal
+```
+
+**This is a scatter-increment FUSED INTO THE PARSE LOOP**, executed one literal at a
+time as tokens are produced. igzip's is a **separate bulk pass over a buffer**. A fused
+scatter cannot vectorise by construction: consecutive literals may target the same
+bucket, so the increments carry a possible loop-carried dependency the compiler must
+assume. No intrinsic fixes that — the loop shape forbids it.
+
+The vendor technique is therefore not "SIMD the increment" but **"make the histogram a
+separate bulk pass so it CAN be vectorised (typically with N partial histograms summed
+at the end to break the dependency)"**. That is a real approach to steal, and it has a
+real cost: a second pass over the literals, i.e. more memory traffic — which is
+presumably why libdeflate does not do it either.
+
+**Not yet measured, and it must be before this is attempted:** the histogram's share of
+encoder time. The tree already has the instrument — `anatomy_count!(histogram_updates)`
+and a `bucket-oracle-no-histogram` Cargo feature that ABLATES it. **Use the existing
+ablation; do not hand-roll a substitute.** The share needs an Ir or wall run (trainer or
+solvency), not this box.
+
+The other two vendor edges autovectorisation cannot reach are `vpmaddwd` hashing [H4]
+and CRC32-instruction hashing [H2]. **Both CHANGE THE HASH, hence which candidates are
+found, hence output bytes** — so neither is output-neutral and both need the full
+promotion gate, not just a wall number.
 
 ### What the vendors do that we do not
 
