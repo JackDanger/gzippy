@@ -1,0 +1,18 @@
+# Instruction budgets (Ir per input byte, cachegrind, -p1, frozen fixtures).
+# CALIBRATION that makes this proxy trustworthy (2026-08-02, trainer):
+#   cutting Ir 21% on the ht_fast carrier moved the paired T1 wall 5.4%
+#   (ab paired, sign 25/25); cutting data WRITES 27% at flat Ir moved it 0.
+#   Ir/B predicts wall on this workload; store counts do not. Re-calibrate
+#   before porting these budgets to a new arch.
+# Pinned on trainer (i7-13700T), gzippy @ tools/ir-budget branch of main 9a253acd.
+# RATCHET: an optimization re-pins LOWER in its own PR; never raise a budget
+# without a paired-wall receipt showing the wall did not regress.
+fixture	level	ir_per_b
+text	1	36.92
+text	6	148.63
+tabular	1	29.63
+tabular	6	89.21
+binary	1	45.06
+binary	6	102.57
+noise	1	57.50
+noise	6	116.43
