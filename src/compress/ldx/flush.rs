@@ -68,6 +68,8 @@ pub(crate) struct Compressor {
     pub(crate) o_precode: Precode,
     /// C: `c->o.length`
     pub(crate) o_length: FullLengthCodewords,
+    /// C: `c->split_stats` (:486)
+    pub(crate) split_stats: super::split::BlockSplitStats,
 }
 
 impl Compressor {
@@ -82,6 +84,7 @@ impl Compressor {
             static_codes,
             o_precode: Precode::new(),
             o_length: FullLengthCodewords::new(),
+            split_stats: super::split::BlockSplitStats::new(),
         }
     }
 }

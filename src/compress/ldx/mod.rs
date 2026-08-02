@@ -89,6 +89,8 @@ mod heap;
 mod huffman;
 mod length;
 mod precode;
+mod sequences;
+mod split;
 mod tables;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,62 @@ pub const MAX_OFFSET_CODEWORD_LEN: usize = DEFLATE_MAX_OFFSET_CODEWORD_LEN as us
 
 /// C: `#define MAX_PRE_CODEWORD_LEN DEFLATE_MAX_PRE_CODEWORD_LEN` (:120)
 pub const MAX_PRE_CODEWORD_LEN: usize = DEFLATE_MAX_PRE_CODEWORD_LEN as usize;
+
+// ---------------------------------------------------------------------------
+// C: deflate_compress.c:44-115 — block and sequence-store lengths.
+//
+// These are the parameters CLAUDE.md clause 5 is about: test the INVARIANT, not
+// the VALUE. Nothing here asserts a specific number except where the number is
+// a consequence of the others (MAX_BLOCK_LENGTH) or of RFC 1951 (65535).
+// ---------------------------------------------------------------------------
+
+/// C: `#define MIN_BLOCK_LENGTH 5000` (:67)
+///
+/// Defining a fixed minimum block length is needed in order to guarantee a
+/// reasonable upper bound on the compressed size. It's also needed because the block
+/// splitting algorithm doesn't work well on very short blocks.
+pub const MIN_BLOCK_LENGTH: usize = 5000;
+
+/// C: `#define SOFT_MAX_BLOCK_LENGTH 300000` (:82)
+///
+/// For the greedy, lazy, lazy2, and near-optimal compressors: the soft maximum block
+/// length, in uncompressed bytes. The compressor will try to end blocks at this
+/// length, but it may go slightly past it if there is a match that straddles this
+/// limit or if the input data ends soon after this limit.
+pub const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
+
+/// C: `#define SEQ_STORE_LENGTH 50000` (:94)
+///
+/// The maximum number of matches that can be used in a block. If the sequence store
+/// fills up, the compressor is forced to end the block early.
+pub const SEQ_STORE_LENGTH: usize = 50_000;
+
+/// C: `#define FAST_SOFT_MAX_BLOCK_LENGTH 65535` (:103)
+///
+/// `deflate_compress_fastest` doesn't use the regular block splitting algorithm; it
+/// only ends blocks when they reach this many bytes or `FAST_SEQ_STORE_LENGTH`
+/// matches.
+pub const FAST_SOFT_MAX_BLOCK_LENGTH: usize = 65_535;
+
+/// C: `#define FAST_SEQ_STORE_LENGTH 8192` (:109)
+pub const FAST_SEQ_STORE_LENGTH: usize = 8192;
+
+/// C: `#define MAX_BLOCK_LENGTH ...` (:188)
+///
+/// `MAX(SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1, SOFT_MAX_BLOCK_LENGTH + 1 +
+/// DEFLATE_MAX_MATCH_LEN)` — the two ways a block can overrun its soft maximum.
+pub const MAX_BLOCK_LENGTH: usize = {
+    let a = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH - 1;
+    let b = SOFT_MAX_BLOCK_LENGTH + 1 + DEFLATE_MAX_MATCH_LEN as usize;
+    if a > b {
+        a
+    } else {
+        b
+    }
+};
+
+/// C: `#define NUM_OBSERVATIONS_PER_BLOCK_CHECK 512` (:444)
+pub const NUM_OBSERVATIONS_PER_BLOCK_CHECK: u32 = 512;
 
 // ---------------------------------------------------------------------------
 // C: vendor/libdeflate/lib/deflate_constants.h
