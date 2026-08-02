@@ -87,6 +87,7 @@ mod codes;
 pub mod compress;
 mod compress_fastest;
 mod compress_greedy;
+mod compress_lazy;
 mod flush;
 mod hc_matchfinder;
 mod heap;

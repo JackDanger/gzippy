@@ -22,8 +22,9 @@
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::{deflate_compress_fastest, FastestState};
 use super::compress_greedy::{deflate_compress_greedy, GreedyState};
+use super::compress_lazy::deflate_compress_lazy_generic;
 use super::flush::Compressor;
-use super::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
+use super::{DEFLATE_BLOCKTYPE_UNCOMPRESSED, DEFLATE_MAX_MATCH_LEN};
 
 /// C: `deflate_compress_none(const u8 *in, size_t in_nbytes, u8 *out,
 /// size_t out_nbytes_avail)` (:2393)
@@ -123,6 +124,13 @@ impl LdxCompressor {
             2 => (6, 10),
             3 => (12, 14),
             4 => (16, 30),
+            // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
+            5 => (16, 30),
+            6 => (35, 65),
+            7 => (100, 130),
+            // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
+            8 => (300, DEFLATE_MAX_MATCH_LEN),
+            9 => (600, DEFLATE_MAX_MATCH_LEN),
             _ => return None,
         };
 
@@ -168,6 +176,18 @@ impl LdxCompressor {
                 &mut os,
                 self.max_search_depth,
                 self.nice_match_length,
+            ),
+            // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
+            // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
+            5..=9 => deflate_compress_lazy_generic(
+                &mut self.c,
+                &mut self.p_g,
+                r#in,
+                in_nbytes,
+                &mut os,
+                self.max_search_depth,
+                self.nice_match_length,
+                self.compression_level >= 8,
             ),
             _ => unreachable!("`new` refuses unported levels"),
         }
@@ -323,7 +343,7 @@ mod tests {
     /// algorithm.
     #[test]
     fn unported_levels_refuse() {
-        for level in 5..=12u32 {
+        for level in 10..=12u32 {
             assert!(
                 LdxCompressor::new(level).is_none(),
                 "level {level} is not ported yet and must not pretend otherwise"
