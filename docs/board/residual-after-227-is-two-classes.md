@@ -1,5 +1,12 @@
 # The residual after #227 is TWO disjoint classes, and one of them is not ours
 
+> **UPDATE, same day:** extended to ALL NINE LEVELS at T4 (594 cells). **#227 closes 91
+> and opens 0** — the title's 91 reproduced exactly. **49 of the 91 are at levels the
+> promotion gate cannot see** (1/3/4/5/7/8), so the gate would have scored this PR at 42.
+> "0 opened" is now verified at those six levels too, where a clause-3 violation would
+> have been structurally invisible. 60 cells still fail at T4 across all levels; the
+> two-class decomposition below is of the 16 that survive at the GRADED levels.
+
 **Measured 2026-08-01**, deterministic size, T4, levels 2/6/9 × 22 corpus files × 3
 rivals = 198 cells. main `120bfa9c` (clean worktree build, sha256 `bbddb09b…`) vs #227
 `669e9a0c` (sha256 `9e98a177…`). Not a wall claim. **igzip is not installed on this box
