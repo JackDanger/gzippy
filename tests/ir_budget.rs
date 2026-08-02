@@ -34,22 +34,22 @@ fn cachegrind_ir(bin: &str, args: &[&str]) -> Option<u64> {
         .output()
         .ok()?;
     let err = String::from_utf8_lossy(&out.stderr);
-    err.lines()
-        .find(|l| l.contains("I refs:"))
-        .and_then(|l| {
-            l.split("I refs:")
-                .nth(1)?
-                .trim()
-                .replace(',', "")
-                .parse()
-                .ok()
-        })
+    err.lines().find(|l| l.contains("I refs:")).and_then(|l| {
+        l.split("I refs:")
+            .nth(1)?
+            .trim()
+            .replace(',', "")
+            .parse()
+            .ok()
+    })
 }
 
 #[test]
 fn instruction_budgets_hold() {
     if Command::new("valgrind").arg("--version").output().is_err() {
-        eprintln!("ir_budget: valgrind not on this host — MEASURED NOTHING (not a pass of the budgets)");
+        eprintln!(
+            "ir_budget: valgrind not on this host — MEASURED NOTHING (not a pass of the budgets)"
+        );
         return;
     }
     let pins = std::fs::read_to_string("tests/fingerprints/ir_budget.tsv")
@@ -70,9 +70,17 @@ fn instruction_budgets_hold() {
         std::fs::write(&path, &data).unwrap();
         let Some(ir) = cachegrind_ir(
             bin,
-            &[&format!("-{level}"), "-p", "1", "-c", path.to_str().unwrap()],
+            &[
+                &format!("-{level}"),
+                "-p",
+                "1",
+                "-c",
+                path.to_str().unwrap(),
+            ],
         ) else {
-            failures.push(format!("{fixture} L{level}: cachegrind produced no I-refs line"));
+            failures.push(format!(
+                "{fixture} L{level}: cachegrind produced no I-refs line"
+            ));
             continue;
         };
         let ir_per_b = ir as f64 / data.len() as f64;
@@ -108,7 +116,13 @@ fn print_current() {
         for level in [1u32, 6] {
             if let Some(ir) = cachegrind_ir(
                 bin,
-                &[&format!("-{level}"), "-p", "1", "-c", path.to_str().unwrap()],
+                &[
+                    &format!("-{level}"),
+                    "-p",
+                    "1",
+                    "-c",
+                    path.to_str().unwrap(),
+                ],
             ) {
                 println!("{fixture}\t{level}\t{:.2}", ir as f64 / data.len() as f64);
             }
