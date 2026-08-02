@@ -27,7 +27,29 @@ divergence, consistent with L2/L4-L9 being 154/154 byte ties.
 27 wins, 17 losses). **15 of the 17 are L1.** So L1 — where we ship igzip's chainless
 finder instead of their `ht_matchfinder` — is essentially the entire phase-1 gap.
 
-## Done (9 commits, 47 tests passing) — **`ldx` NOW EMITS VALID DEFLATE BYTES**
+## ⭐ RUNG 3 IS GREEN FOR LEVELS 0 AND 1 — 23/23 BYTE-IDENTICAL
+
+```
+$ scripts/campaign/ldx-differential.sh 0 1
+L0: byte-identical 23/23
+L1: byte-identical 23/23
+```
+
+Raw DEFLATE, sha256, all 22 corpus files plus the empty input, against libdeflate's
+own `libdeflate_deflate_compress` linked from `vendor/libdeflate/build/libdeflate.a`.
+`wc -c` never counts — two streams of equal length can differ in every bit.
+
+**This closes ZERO cells.** Nothing is routed and no shipped byte changed. Routing L1
+here is governed by the binding record at `src/compress/deflate/parse/mod.rs:540`
+(attempt 1 died on size with 7 clause-3 flips; attempt 2 died on the T1 wall at
+1.2662x on a cell `main` already ties). What is new is that a third attempt can be
+measured against the REAL algorithm rather than against `matchfinder/ht.rs`, which is
+a derivative of it.
+
+**Level 1 is 15 of our 17 T1 losses** and the only level where our encoder is not
+libdeflate's at all, so this is very nearly the whole phase-1 parity gap reproduced.
+
+## Done (11 commits, 81 tests passing)
 
 | C | item | file | commit |
 |---|---|---|---|
@@ -46,6 +68,12 @@ finder instead of their `ht_matchfinder` — is essentially the entire phase-1 g
 | `:1640` | `deflate_compute_full_len_codewords` | `length.rs` | `9fabdda8` |
 | `:667-750` | output bitstream, `ADD_BITS`, `FLUSH_BITS`, `CAN_BUFFER` | `bitstream.rs` | `21cac499` |
 | `:354`, `:1662`, `:1708` | `deflate_sequence`, `WRITE_MATCH`, **`deflate_flush_block`** | `flush.rs` | `21cac499` |
+| `:440-449`, `:2104-2222` | block split stats, `should_end_block` | `split.rs` | `3d503360` |
+| `:2042`, `:2224-2270` | `deflate_finish_block`, the sequence store | `sequences.rs` | `3d503360` |
+| `matchfinder_common.h` | `mf_pos_t`, rebase, `lz_hash`, `lz_extend` | `matchfinder_common.rs` | `5f5d0420` |
+| `ht_matchfinder.h` | the whole header | `ht_matchfinder.rs` | `5f5d0420` |
+| `:2381`, `:2452` | `choose_max_block_end`, **`deflate_compress_fastest`** | `compress_fastest.rs` | `5f5d0420` |
+| `:2393`, `:4050` | `deflate_compress_none`, **`libdeflate_deflate_compress`** | `compress.rs` | `5f5d0420` |
 
 Verified by: Kraft equality; prefix-free AND complete codespace; an exhaustive
 `reverse_codeword` differential (2^16 x 16 cases) against the C's own table variant;
@@ -93,25 +121,26 @@ assertion compiles in.
 * The live code table is a flag plus a clone, not a rebindable pointer — the borrow
   checker cannot see that writing `c.o_length` does not alias the table being read.
 
-## Next, in dependency order
+## Next, in dependency order — every step now has a byte-exact gate
 
-1. `:2043` `deflate_finish_block`; `:2224-2270` sequence store
-   (`deflate_begin_sequences` / `_choose_literal` / `_choose_match`).
-2. `:2094-2225` block-split stats. NOTE our `block_split.rs:192-200` computes the
-   cutoff in `u64` where the C uses `u32` AND WRAPS — port the C's widths here.
-3. `:2272-2392` the min-match-len helpers.
-4. Matchfinders: `ht_matchfinder.h` FIRST (it is the 15-cell L1 gap). **Note our
-   `matchfinder/ht.rs` is NOT a port of it** — it adds a length-3 table the C
-   explicitly refuses (`ht_matchfinder.h:38-40`) and imports `HT_MAX_LEN3_OFFSET`
-   from a different C function. Read the binding FALSIFY at `parse/mod.rs:540` before
-   touching this: both prior attempts are already recorded.
-5. `:2394-2843` the four compressors: `_none` / `_fastest` / `_greedy` /
-   `_lazy_generic`. **First point an end-to-end sha256 differential against
-   `libdeflate-gzip` is possible.**
-6. `:2845-3853` near-optimal (costs, `deflate_find_min_cost_path`). This also supplies
-   `deflate_flush_block`'s missing `sequences == NULL` arm (`:1935`), which walks
-   `optimum_nodes` — deliberately left out of the signature rather than stubbed.
-7. `:3874` `libdeflate_alloc_compressor_ex` — the level->config map, ported verbatim.
+Run `scripts/campaign/ldx-differential.sh <level>` after each. It should go green for
+the newly ported level and STAY green for 0 and 1.
+
+1. `hc_matchfinder.h` + `:2272-2392` the min-match-len helpers + `:2524`
+   `deflate_compress_greedy` -> gates **L2 and L3**. (Note L3 is the one level where
+   libdeflate is GREEDY and we are LAZY, and ours wins 20/22 files — expect the
+   differential to go green against THEIR choice, and treat our L3 as a phase-2 win to
+   re-layer afterwards, not as a regression.)
+2. `:2600` `deflate_compress_lazy_generic` -> gates **L4-L9**.
+3. `bt_matchfinder.h` + `:2845-3853` near-optimal -> gates **L10-L12**. This also
+   supplies `deflate_flush_block`'s missing `sequences == NULL` arm (`:1935`), which
+   walks `optimum_nodes` — deliberately left out of the signature rather than stubbed.
+4. `:3874` `libdeflate_alloc_compressor_ex` in full — `LdxCompressor::new` currently
+   refuses every level except 0 and 1 rather than guessing.
+
+Only once every level is byte-exact does the ROUTING question arise, and that is a
+promotion-rule question (clause 3 on 154 tied cells, clause 5 on the wall), not a
+port question.
 
 ## Standing cautions
 
