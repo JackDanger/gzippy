@@ -202,6 +202,7 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // in the Lazy(12,30) attempt).
     if level == 4 {
         p.strategy = Strategy::Lazy;
+        p.max_search_depth = p.max_search_depth.saturating_mul(4);
     } else {
         p.max_search_depth = if level == 8 {
             p.max_search_depth
@@ -209,6 +210,25 @@ pub fn params_parallel(level: u32) -> LevelParams {
             p.max_search_depth.saturating_mul(4)
         };
     }
+    // L4 AT T>1 IS THE STRATEGY STEP **COMPOSED WITH** THIS BRANCH'S DEPTH SCALING.
+    //
+    // Measured against this branch, L4, 22 files: OPENED 0, CLOSED 5 at both T4 and T16,
+    // T1 byte-identical, and **4,284,357 B smaller in total**. The parser step ALONE
+    // (`Lazy` at depth 16, no scaling) also closed 5 and opened 0 but was only 3,151,510 B
+    // smaller and made FOUR files worse — ecoli.fastq +114,871, access.log +53,268,
+    // aozora.txt +28,452, weights.safetensors +31,651. Composing with the x4 recovers
+    // three of those and beats this branch on them: ecoli -18,542, access.log -59,432,
+    // aozora -71,994.
+    //
+    // The one file still worse is `weights.safetensors`, +31,516 — and that is the case
+    // this file ALREADY documents above: "on near-incompressible data LAZY defers matches
+    // and emits more literals than GREEDY, costing +32,975 B on that file". Measuring
+    // +31,516 independently reproduces that +32,975. The cell is ALREADY FAILING vs
+    // libdeflate on this branch (83,082,305 vs 83,082,171), and clause 3 does not protect
+    // an already-failing cell — so it is a size cost, not a promotion blocker. Naming it
+    // because a cell count hides it.
+    //
+    // (superseded note kept for the reasoning chain)
     // L4 IS A STRATEGY STEP AT T>1, NOT A DEPTH STEP — measured, clause 3 clean.
     //
     // L4 is the only `Greedy` above L2 (L3 and L5 are both `Lazy`), so it enters T>1 with
