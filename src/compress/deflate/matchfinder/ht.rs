@@ -62,6 +62,12 @@
 
 //! # MEASURED COST PROFILE — the wall regression is WRITE traffic
 //!
+//! ⚠ **READ THE VENDOR SECTION BELOW BEFORE USING THIS TABLE.** Both arms here are
+//! OURS. This table compares this finder against `parse::fast`, our own previous
+//! path — it is not, and never was, a comparison against libdeflate. It says how
+//! much more this finder costs THAN US. It cannot say whether that cost is
+//! intrinsic to the algorithm, and it was read that way for two falsifications.
+//!
 //! Cachegrind, 6,000,000 B of data.csv at L1 T1 on Zen2, shipped `parse::fast` vs this
 //! finder:
 //!
@@ -71,6 +77,110 @@
 //! | D reads | 17,484,786 | 33,552,458 | 1.92x |
 //! | **D writes** | **7,320,227** | **26,927,232** | **3.68x** |
 //! | D1 misses | 799,400 | 2,065,774 | 2.58x |
+//!
+//! # THE VENDOR COMPARISON, measured 2026-08-01
+//!
+//! The dispatch arm in `parse/mod.rs` cites "the 2.19x instruction gap". **That number
+//! IS defined and IS correct**: commit `df475791` (#194) measured "the finder executes
+//! 201,359,346 instructions against `parse::fast`'s 92,057,657 — 2.19x, from probing
+//! twice and hashing a third table" (201,359,346 / 92,057,657 = 2.1873).
+//!
+//! ⚠ RETRACTED, same day: an earlier version of this section said "**That number had
+//! no defining measurement anywhere in `src/` or `docs/`** — grep it." That is FALSE,
+//! and the way it went wrong is worth more than the claim was: **the grep covered the
+//! WORKING TREE, and this project keeps its receipts in COMMIT MESSAGES.** `git log
+//! -S2.19 --all` finds it in two seconds. Before asserting that a record does not
+//! exist, search the history, not just `src/` and `docs/`.
+//!
+//! What is true, and is the only reason this section exists: 2.19x is `ht` against
+//! `parse::fast` — OURS against OURS, like the 2.07x table above. No comparison
+//! against libdeflate had been run. That is what follows.
+//!
+//! And #194 named the MECHANISM correctly at the time — "probing twice and hashing a
+//! third table". The ablation below confirms it exactly: the third table is
+//! 54,690,301 Ir. #194 was right; it simply never priced the alternative.
+//!
+//! Cachegrind, the SAME 6,000,000 B of data.csv, L1, `-p1` (see the
+//! thread trap below), trainer/Intel, `libdeflate-gzip` built with `-g`:
+//!
+//! | arm | total Ir | output |
+//! |---|---|---|
+//! | this finder, `HT_MAX_LEN3_OFFSET = 4096` | 196,854,205 | 881,712 |
+//! | this finder, `HT_MAX_LEN3_OFFSET = 0` | 198,467,459 | 881,550 |
+//! | **this finder, off=0 AND hash3 MAINTENANCE ablated** | **143,777,158** | **881,550** |
+//! | **libdeflate `-1`** | **146,098,195** | **881,550** |
+//!
+//! **THERE IS NO IMPLEMENTATION GAP. Our faithful `ht_matchfinder` port executes 1.6%
+//! FEWER instructions than the vendor's C, on byte-identical output.** The entire
+//! excess is one feature: the length-3 table costs **54,690,301 Ir, 104% of the whole
+//! 52.4M difference**. `lz_hash` costs 2.0 Ir/call on BOTH sides (libdeflate
+//! 11,999,974 Ir / 5,999,987 calls; ours 24.38M / 11,999,974 calls) — we simply call
+//! it twice per position, once for the 4-byte key and once for the 3-byte key.
+//!
+//! ⚠ THE ABLATION IS THE ONLY VALID WAY TO PRICE THIS TABLE, and the reason is the
+//! trap that produced a false record here on 2026-08-01 (retracted below):
+//! `HT_MAX_LEN3_OFFSET = 0` disables length-3 ACCEPTANCE, not MAINTENANCE. At off=0
+//! the second `lz_hash`, the load, the store and the extra 64 KiB rebase per window
+//! slide are all still paid, for a table that is never read. Only removing the
+//! maintenance prices the feature, and doing it AT off=0 keeps the output identical
+//! by construction, so the ablation cannot change what is being compared.
+//!
+//! ⚠ RETRACTED, same day, by the ablation above: this note previously said "**The
+//! length-3 table is not the tax.** Turning it off made us 1.6M instructions SLOWER
+//! (198.47M vs 196.85M) ... Any future note blaming hash3 for the L1 wall must beat
+//! this measurement first." That is FALSE, and it is false for a nameable reason
+//! rather than by bad luck: off=0 was read as "hash3 off" when it only means "hash3
+//! unused". The 1.6M is real but it measures the cost of length-3 matches NOT BEING
+//! TAKEN while still being maintained; it says nothing about the table's cost. The
+//! table's cost is 54.69M.
+//!
+//! It also previously claimed the gap was "1.35x total and 1.60x in the matchfinder,
+//! 89% of it inside the matchfinder". The 1.60x was not apples-to-apples: libdeflate's
+//! matchfinder is `ht_matchfinder.h` 77.02M PLUS `matchfinder_common.h` 18.87M,
+//! `common_defs.h` 2.81M, `x86/matchfinder_impl.h` 2.64M and `emmintrin.h` 3.00M =
+//! 104.34M, against our 151.17M across `ht.rs`, `common.rs`, `uint_macros.rs`,
+//! `ptr/mod.rs`, `sse.rs` and `slice/iter/macros.rs`. Like for like that is 1.45x,
+//! and the ablation shows even that is the feature and not the implementation.
+//!
+//! What DOES survive: at `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to
+//! libdeflate's — sha256 `62a4e450aca4b522`, full 6 MB multi-block file. Insert counts
+//! match exactly (5,507,374 both sides), confirming an identical parse. That is why
+//! the ablation is sound, and it is the one claim here that was never in doubt.
+//!
+//! # THE WALL IS NOT THE INSTRUCTIONS — it is LLC traffic, and `main` already wins
+//!
+//! `perf stat`, FULL data.csv (26,500,039 B), `taskset -c 2`, L1 T1:
+//!
+//! | arm | Ir | cycles | IPC | LLC miss | wall |
+//! |---|---|---|---|---|---|
+//! | this finder, ablated (byte-identical to libdeflate) | 678.1M | 287.2M | 2.36 | **1.366M** | 209.6 ms |
+//! | `main` (`parse::fast`) | 444.6M | 242.4M | 1.83 | 1.346M | **176.4 ms** |
+//! | libdeflate `-1` | 657.4M | 242.1M | 2.71 | **0.579M** | 176.2 ms |
+//!
+//! At 1.032x libdeflate's instructions we take 1.186x their cycles, on 2.36x their LLC
+//! misses. **`main` is ALREADY at wall parity with libdeflate on this cell**, so routing
+//! this finder converts a PASSING wall cell into a ~1.19-1.29x failure — clause 3 is
+//! absolute, and closing every instruction named above still leaves ~213 ms against
+//! `main`'s 177 ms. Instruction elasticity here is ~0.22, not 1: adding the 53M hash3
+//! instructions RAISED IPC to 2.89 and cost only 8% wall.
+//!
+//! The excess LLC misses scale linearly with input (~2 extra input-sized passes:
+//! armexe 3.35, data.csv 1.94, tool.bin 2.15 excess bytes per input byte) and `main`
+//! carries the SAME fixed excess. So the L1 wall deficit lives in the buffering/IO
+//! path that both arms share — not in the matchfinder, and not in this finder.
+//!
+//! ⚠ THREAD TRAP: `gzippy -1 -c FILE` with no `-p` uses `num_cpus`. On the 16-core
+//! trainer that silently measures T16. Both arms above are `-p1`; the T16 output on
+//! the same slice is 881,816, not 881,712, which is how the trap announces itself.
+//!
+//! ⚠ INSTRUMENT: `fulcrum why`'s layer [2] callgrind reported 2,406,284,393 Ir for
+//! the first arm — **12.22x the cachegrind figure** (2,406,284,393 / 196,854,205),
+//! matching the recorded parser inflation bug, with `Dr 0` on every row as the
+//! corroborating tell. Layer [1] (position counts) is independent of that path and
+//! was used; layer [2] was not. (This said "12.66x the cachegrind figure", which is
+//! the ratio against the BANKED 190,151,913, not against the cachegrind run it names.
+//! Corrected rather than left, because a mislabelled ratio inside a record-hygiene
+//! note is the same defect the note exists to fix.)
 //!
 //! Reads at 1.92x are the expected price of a second candidate. **Writes at 3.68x are
 //! the regression**: a 2-entry bucket costs TWO stores per insert (shift + head) and

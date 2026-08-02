@@ -727,6 +727,42 @@ fn bsr32(x: u32) -> u32 {
 /// Emit the accumulated block, choosing the cheapest of stored / static-Huffman
 /// / dynamic-Huffman. `block_start` is the absolute offset of the block's first
 /// byte in `buf`.
+/// PARKED 2026-08-01 — RLE-shaped histogram, gated to the T>1 path. A STRICT SIZE
+/// WIN that dies on clause 5, not on the encoder. Branch `lever/rle-shape-t4`
+/// (`b9cf59ef`), adjudicated NO-SHIP; artifact
+/// `~/www/gzippy-bench/campaign/lever-lever-rle-shape-t4/try.json`.
+///
+/// THE MECHANISM. Beside the true histogram, cost a second one shaped the way zopfli's
+/// `TryOptimizeHuffmanForRle` shapes it, and keep it only when the header comes out
+/// STRICTLY smaller. A `HeaderBudget` enum threaded to this function makes it
+/// `Generous` on the T>1 path and `Lean` everywhere else, so T1 never pays.
+///
+/// WHAT IT BOUGHT (deterministic, both censuses over the same 792 comparable cells):
+///     23 size cells CLOSED, 0 opened — all `libdeflate_T4`, spread over 7 levels
+///     T1 output byte-identical to main: 198/198 (22 corpus files x levels 1-9)
+///     T4 strictly smaller on every file checked (-151 .. -208 B on armexe.elf)
+/// It cannot make a block bigger: the shaped code is adopted only when it is cheaper.
+///
+/// WHAT IT COST. `make lever ARGS="--threads 1,4"`, NO-SHIP on clause 5 with 25 cells
+/// over the 0.005 erosion budget: 18 at T4, 12 of them against pigz. `Generous` runs a
+/// second symbol-sort + package-merge per block, which is real work on the exact path
+/// it is gated to. That is the FOURTH size lever to die in this clause.
+///
+/// ⚠ THE EROSION MAGNITUDES ARE NOT TRUSTWORTHY AND MUST NOT BE QUOTED. 7 of the 25
+/// cells were T1, where the output is provably byte-identical, so those readings are
+/// impossible and the run was contaminated: ~12 `fulcrum ab paired` jobs were run on
+/// the same laptop during rows 176-264 of it, and `scripts/campaign/lever.sh` invokes
+/// no box-freeze guard. The VERDICT stands (18 T4 cells, real mechanism, 4-8x over
+/// budget); the NUMBERS need an idle re-run before any successor prices against them.
+///
+/// WHAT WOULD REVIVE IT. Not a re-run, and not tuning the shaping. Only a way to
+/// obtain the shaped candidate for materially less than a second package-merge —
+/// or a clause-5 budget argument made at a coordinate where T4 wall slack is real
+/// rather than assumed. Compose it with a T4 wall win before re-adjudicating; on its
+/// own the size case is already proven and already insufficient.
+///
+/// Do not re-derive the size win. It is measured, it is 23 cells, and it is not the
+/// part that fails.
 fn emit_block(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -1587,5 +1623,271 @@ mod emit_tests {
             &statics.offcode,
         );
         assert_eq!(a.finish(), b.finish());
+    }
+}
+
+#[cfg(test)]
+mod l1_bakeoff {
+    //! A ONE-BLOCK, SUB-SECOND optimisation loop for the L1 matchfinder.
+    //!
+    //! WHY THIS EXISTS. The L1 deficit is the largest remaining SIZE class on the
+    //! board (16 of 37 residual cells after #227, and the largest level in the
+    //! 22-file census at 35 cells). `fulcrum why` established that it is
+    //! ALGORITHMIC, not implementation — at `data.csv:L01:T01` we emit
+    //! **741,183 literals against libdeflate's 256,099 (2.89x)** and find 4.4%
+    //! fewer matches, while header bits are near-identical. Every other level
+    //! reports POSITION COUNTS MATCH at delta 0.00%; L1 is the one that parses
+    //! differently.
+    //!
+    //! Iterating on that through the board is hopeless: a census is hours and a
+    //! wall run needs a quiet box. But match quality is DETERMINISTIC — it does
+    //! not care about load, arch, or thread count — so one block through both
+    //! matchfinders answers "did that change find more matches?" in under a
+    //! second, on any machine, with no instrument between the code and the number.
+    //!
+    //! ⚠ WHAT THIS RATCHET GUARDS. `ht_fast` is **NOT ROUTED IN PRODUCTION** —
+    //! its only call site in the whole tree is this test (`grep -rn 'ht_fast::run'
+    //! src/`). So the `ht_fast` column is what we COULD ship, not what we do, and
+    //! nothing measured here can change the shipped binary. The SHIPPED L1 is the
+    //! `Fast` column, and it is +1.634% vs libdeflate — that gap IS the L1 class.
+    //! The ratchet exists to keep the candidate honest until the routing lands
+    //! (blocked on #227's `params_parallel`, since it must be gated T>1).
+    //!
+    //! `Strategy::Fast` (shipped) is igzip-class chainless SINGLE-PROBE.
+    //! `ht_fast` is the libdeflate-class 2-ENTRY-BUCKET synthesis that also keeps
+    //! our length-3 table. Both are already in the tree and both are
+    //! `fulcrum verify`-clean; only the ROUTING was reverted (see the FALSIFY at
+    //! the `Strategy::Fast` dispatch arm).
+    //!
+    //! HOW TO USE IT:
+    //!     cargo test --release l1_bakeoff -- --nocapture
+    //! Smaller `ht_fast` bytes = the 2-way bucket is finding matches the single
+    //! probe misses. This is a SIZE proxy only — it says nothing about the wall,
+    //! and the routing decision needs a frozen paired wall run either way.
+
+    use super::*;
+
+    /// Real corpus, never synthetic: a synthetic input once said "+1 byte" where
+    /// the real corpus said "+2.02%".
+    fn corpus_roots() -> Vec<std::path::PathBuf> {
+        let mut v = vec![];
+        if let Ok(h) = std::env::var("HOME") {
+            v.push(std::path::PathBuf::from(&h).join("www/gzippy-bench/corpus"));
+        }
+        v.push(std::path::PathBuf::from("/root/gzippy-bench/corpus"));
+        v
+    }
+
+    /// Compress ONE block with the shipped L1 path and with `ht_fast`, and
+    /// return (fast_bytes, ht_bytes). Both get the identical padded buffer.
+    fn bakeoff_one(block: &[u8]) -> (usize, usize) {
+        let mut buf = Vec::with_capacity(block.len() + BUF_PAD);
+        buf.extend_from_slice(block);
+        buf.resize(block.len() + BUF_PAD, 0);
+        let in_end = block.len();
+        let statics = StaticCodes::get();
+
+        let params = crate::compress::deflate::level::params(1);
+        let mut a = BitWriter::new();
+        compress(&buf, 0, in_end, &params, true, &mut a);
+        let fast_bytes = a.finish().len();
+
+        let mut b = BitWriter::new();
+        ht_fast::run(&buf, 0, in_end, &params, statics, &mut b, true);
+        let ht_bytes = b.finish().len();
+
+        (fast_bytes, ht_bytes)
+    }
+
+    /// The FOUR rivals the board actually grades against, at L1.
+    /// `-c` to stdout; thread-capable ones pinned to 1 so this is a T1 statement.
+    const RIVALS: &[(&str, &[&str])] = &[
+        ("libdeflate", &["-1", "-c"]),
+        ("gzip", &["-1", "-c"]),
+        ("pigz", &["-1", "-p", "1", "-c"]),
+        ("igzip", &["-1", "-T", "1", "-c"]),
+    ];
+
+    /// Resolve a rival binary. igzip is usually NOT on PATH but IS built in the
+    /// vendor tree — `scripts/campaign/lib.sh` checks exactly there first, and a
+    /// test that silently omits a rival has not evaluated the goal (the shipped
+    /// size census once measured three rivals and said nothing about the fourth).
+    fn rival_bin(name: &str) -> String {
+        if name == "igzip" {
+            for c in [
+                "vendor/isa-l/build/igzip",
+                "/root/gzippy/vendor/isa-l/build/igzip",
+            ] {
+                if std::path::Path::new(c).is_file() {
+                    return c.to_string();
+                }
+            }
+        }
+        match name {
+            "libdeflate" => "libdeflate-gzip".into(),
+            "gzip" => "gzip".into(),
+            "pigz" => "pigz".into(),
+            _ => "igzip".into(),
+        }
+    }
+
+    /// One rival's L1 output on the same bytes — the DEFLATE payload (gzip frame
+    /// minus its 10-byte header and 8-byte trailer) so it is comparable to the
+    /// raw-block sizes. `None` if that rival is not on this box; the file is then
+    /// reported without it rather than inventing a reference.
+    fn rival_l1(name: &str, args: &[&str], block: &[u8]) -> Option<usize> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new(rival_bin(name))
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        // TAKE the handle: dropping it closes the pipe and delivers EOF.
+        // Borrowing hangs forever — that bug cost two stalled runs elsewhere.
+        {
+            let mut si = c.stdin.take()?;
+            si.write_all(block).ok()?;
+        }
+        let out = c.wait_with_output().ok()?;
+        if !out.status.success() || out.stdout.len() < 18 {
+            return None;
+        }
+        Some(out.stdout.len() - 18)
+    }
+
+    /// THE RATCHET. One number per file: the worst `ht_fast - libdeflate` delta
+    /// we are willing to accept, in bytes, on the first `BLOCK` bytes.
+    /// **Negative means we are SMALLER than libdeflate and must stay that way.**
+    ///
+    /// This encodes the GOAL — non-negotiable #2, "at level N we beat their
+    /// level N", per file, never a curve or a total — and nothing about the
+    /// implementation. Any matchfinder, any hash, any bucket geometry is fair
+    /// game; the test only asks that no file gets worse. When a change improves
+    /// a file the test SAYS SO and prints the new number to paste in. Tighten
+    /// freely; loosening one needs a reason in the commit message.
+    ///
+    /// Seeded 2026-08-01 from `ht_fast` as it stands. `Strategy::Fast` (shipped)
+    /// is far worse on 7 of these 8 — that gap is the L1 class, and it is why
+    /// this file exists.
+    /// Re-seeded 2026-08-01 from the WORST-OF-FOUR-RIVALS measurement. The first
+    /// seed used libdeflate only and was therefore wrong on `armexe.elf`, whose
+    /// binding rival is **pigz** (-3863) not libdeflate (-4013) — the ratchet
+    /// fired REGRESSION on its own seed data, which is the guard working.
+    ///
+    /// libdeflate is the binding rival on 7 of 8; gzip/pigz/igzip trail by
+    /// 2,600-11,600 B at L1. But "usually libdeflate" is not "always", and the
+    /// one exception is exactly the file the FALSIFY at `parse/mod.rs` warned
+    /// about losing.
+    const RATCHET: &[(&str, i64)] = &[
+        ("armexe.elf", -3863),
+        ("data.parquet", -984),
+        ("data.csv", -210),
+        ("engine.wasm", 61),
+        ("minjs.min.js", 313),
+        ("data.json", 449),
+        ("aozora.txt", 550),
+        ("dickens", 644),
+    ];
+
+    #[test]
+    fn l1_bakeoff() {
+        const BLOCK: usize = 256 * 1024;
+        let Some(root) = corpus_roots().into_iter().find(|p| p.is_dir()) else {
+            eprintln!("l1_bakeoff: no corpus dir — SKIPPED (this is a real-corpus test)");
+            return;
+        };
+
+        println!();
+        println!("L1 RATCHET — first {BLOCK} bytes, ALL FOUR RIVALS, deterministic");
+        println!("  corpus: {}", root.display());
+        println!();
+        println!(
+            "  {:<16} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
+            "file", "ht_fast", "libdefl", "gzip", "pigz", "igzip", "WORST", "allowed"
+        );
+
+        let mut regressions: Vec<String> = vec![];
+        let mut improvements: Vec<String> = vec![];
+        let mut measured = 0usize;
+        let (mut wins, mut ties, mut losses) = (0usize, 0usize, 0usize);
+
+        for (f, allowed) in RATCHET {
+            let Ok(data) = std::fs::read(root.join(f)) else {
+                continue;
+            };
+            if data.len() < BLOCK {
+                continue;
+            }
+            let block = &data[..BLOCK];
+            let (_fa, ht) = bakeoff_one(block);
+
+            let mut cells: Vec<String> = vec![];
+            let mut worst: Option<i64> = None;
+            let mut worst_name = "";
+            for (name, args) in RIVALS {
+                match rival_l1(name, args, block) {
+                    Some(r) => {
+                        let d = ht as i64 - r as i64;
+                        cells.push(format!("{d:>+9}"));
+                        if worst.is_none_or(|w| d > w) {
+                            worst = Some(d);
+                            worst_name = name;
+                        }
+                    }
+                    None => cells.push(format!("{:>9}", "-")),
+                }
+            }
+            let Some(w) = worst else { continue };
+            measured += 1;
+            match w.cmp(&0) {
+                std::cmp::Ordering::Less => wins += 1,
+                std::cmp::Ordering::Equal => ties += 1,
+                std::cmp::Ordering::Greater => losses += 1,
+            }
+            let mark = if w > *allowed {
+                regressions.push(format!(
+                    "{f}: worst {w:+} (vs {worst_name}) exceeds allowed {allowed:+}"
+                ));
+                " <- REGRESSION"
+            } else if w < *allowed {
+                improvements.push(format!("(\"{f}\", {w}),"));
+                " <- improved"
+            } else {
+                ""
+            };
+            println!(
+                "  {f:<16} {ht:>9} {} {w:>+9} {allowed:>+8}{mark}",
+                cells.join(" ")
+            );
+            println!("L1SWEEP file={f} ht={ht} worst={w} worst_rival={worst_name}");
+        }
+
+        if measured == 0 {
+            eprintln!("l1_bakeoff: nothing measurable — SKIPPED");
+            return;
+        }
+        println!();
+        println!("  ACROSS ALL FOUR RIVALS: {wins} win, {ties} tie, {losses} LOSE");
+        println!("L1SWEEP TOTAL win={wins} tie={ties} lose={losses}");
+        if !improvements.is_empty() {
+            println!();
+            println!("  RATCHET DOWN — paste into RATCHET:");
+            for i in &improvements {
+                println!("      {i}");
+            }
+        }
+        println!();
+
+        assert!(
+            regressions.is_empty(),
+            "L1 ratchet regressed on {} file(s):\n  {}\n\
+             The bar is the WORST rival per file — losing to ANY of the four fails \
+             the cell. If a regression is intended, say why in the commit message.",
+            regressions.len(),
+            regressions.join("\n  ")
+        );
     }
 }

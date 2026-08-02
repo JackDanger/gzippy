@@ -1233,6 +1233,34 @@ const SHORTEST_MATCH3: u32 = 3;
 /// probing a second candidate on every lookup (hit AND miss) is the tax, and
 /// no gating threshold got it below ~15-20%.
 ///
+/// **COORDINATE OF THOSE WALL NUMBERS, from `e0e4c44d`'s own message: "Wall
+/// (M1, -p1, 60MB corpus, hyperfine mean of 25 runs post-warmup)".** So: T1
+/// only, on an Apple M1 only, by hyperfine rather than `fulcrum ab paired`
+/// (no aa_bias exists for them). Recorded per hard stop #3, which says to
+/// scope a falsification to the levels AND machine it was measured at, and
+/// notes that NOTHING enforces that against the text of a record — so an
+/// unscoped number closes a class for every session that greps it.
+///
+/// What is INTRINSIC and stays: the second lookup costs on every probe, hit
+/// AND miss, and pays only on the hits — and the gate failed specifically
+/// because "bin-class data's first candidate is weak often enough that the
+/// gate rarely skips the second lookup".
+///
+/// What is COORDINATE-DEPENDENT: "+33.6% exceeds the <=10% L1 wall budget".
+/// That budget is the T1 one (0-8% slack). At T4 the rival is
+/// single-threaded and the recorded slack is 249-330%. CLAUDE.md's own
+/// receipt is this exact error — an entire parse-config space closed as
+/// "unaffordable" against T1 slack when the failing cells were T4, a 40x
+/// budget error. **The T4 coordinate for this lever is UNMEASURED.**
+///
+/// Two things that must not be read into the above. It is NOT permission to
+/// rebuild: `super::ht_fast` already exists, compiled and unrouted, and two
+/// attempts are on record. And the SIZE leg of a head3-preserving 2-way
+/// bucket is also unmeasured — do not assume it inherits the plain-`ht`
+/// result, which is 14 closed / 6 opened at BOTH T1 and T4 (measured
+/// 2026-08-01, `docs/board/after-227-the-whole-real-deficit-is-L1.md`).
+/// Any reopen needs `fulcrum ab paired` at T4 on solvency, aa_bias reported.
+///
 /// This lever tries the SAME idea far more narrowly: instead of a second
 /// candidate at THIS position on every lookup, peek at the SAME single-probe
 /// candidate ONE position ahead (`pos + 1`) — but ONLY after a match is

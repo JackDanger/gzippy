@@ -79,8 +79,66 @@ esac
 
 OUT="${CAMPAIGN_OUT:-$(campaign_outdir "wall-${SET_NAME}-$(git -C "$CAMPAIGN_REPO" rev-parse --short HEAD)")}"
 
+# --- W4: FROZEN BINARY ------------------------------------------------------------
+# W2 and W3 verify `$CAMPAIGN_REPO/target/release/gzippy` ONCE, here, and then the run
+# spends HOURS reading that same path out of a checkout that stays fully writable. A
+# single `cargo build --release` anywhere in the tree silently swaps the subject
+# mid-board, and nothing downstream notices: the launch banner still says
+# "vanilla: verified", the log lines carry no binary identity, and the rows before and
+# after the swap are indistinguishable.
+#
+# RECEIPT (2026-08-01). A wall board launched against a vanilla main build
+# (sha 54079f43) was 242 rows into ~792 when a doc-comment edit was build-checked with
+# `cargo build --release` in the same checkout — which was sitting on a LEVER branch,
+# 307 insertions across 11 files of `src/` ahead of main. The subject binary became
+# 1c812b24, a different compressor, with no error and no log line. The whole run had to
+# be discarded because the contamination BOUNDARY could not be recovered from the log.
+# This is the same class as the CAMPAIGN_REPO trap caught earlier the same day: a guard
+# that reads an input once and then trusts the world to hold still.
+#
+# The fix is to stop measuring a path that someone else can write. Copy the verified
+# binary into the run's own output directory and measure THAT. Three properties follow:
+# the subject is immutable for the run (nothing in the repo can reach it), the artifact
+# carries the exact binary that produced its numbers (hard stop #7 satisfied by
+# construction rather than by a note), and the checkout is free for ordinary work while
+# a multi-hour board runs — which is what will actually happen, so the guard has to
+# assume it.
+mkdir -p "$OUT" || die "cannot create out dir $OUT"
+OUT_ABS="$(cd "$OUT" && pwd)" || die "cannot resolve out dir $OUT"
+GZ_FROZEN="$OUT_ABS/gzippy-subject"
+
+# A previous run of the SAME commit leaves a read-only snapshot here, and `cp`
+# onto a mode-444 file fails — the guard then refuses every re-run, which is how
+# it behaved the first time a killed board was relaunched. Fail closed is right;
+# refusing forever is not. Clear the stale snapshot first, under the rm
+# discipline: the path is RESOLVED ABSOLUTE above, is asserted to sit strictly
+# inside the campaign artifact root, and names exactly one file (never a tree,
+# never a glob).
+# The assert gates the REMOVAL, not the run: a fresh out dir has nothing to
+# delete, so an explicit CAMPAIGN_OUT (smoke runs, scratch dirs) must still work.
+if [ -e "$GZ_FROZEN" ]; then
+  [ -f "$GZ_FROZEN" ] || die "snapshot path exists and is not a regular file: $GZ_FROZEN"
+  CAMPAIGN_ARTIFACT_ROOT="$(cd "$CAMPAIGN_REPO/.." && pwd)/gzippy-bench/campaign"
+  case "$GZ_FROZEN" in
+    "$CAMPAIGN_ARTIFACT_ROOT"/*/gzippy-subject|/private/tmp/*/gzippy-subject|/tmp/*/gzippy-subject) : ;;
+    *) die "refusing to remove a snapshot outside the campaign artifact root" \
+           "path: $GZ_FROZEN" \
+           "root: $CAMPAIGN_ARTIFACT_ROOT" ;;
+  esac
+  rm -f "$GZ_FROZEN" || die "cannot clear stale snapshot $GZ_FROZEN"
+fi
+
+cp "$GZ" "$GZ_FROZEN" || die "cannot snapshot subject binary into $OUT_ABS"
+chmod a-w "$GZ_FROZEN" || die "cannot make snapshot read-only"
+FROZEN_SHA="$(shasum -a 256 "$GZ_FROZEN" | cut -d' ' -f1)"
+[ "$FROZEN_SHA" = "$GZ_SHA" ] || die "snapshot sha != verified sha" \
+    "verified=$GZ_SHA snapshot=$FROZEN_SHA" \
+    "The copy did not reproduce the binary that passed W2/W3."
+GZ="$GZ_FROZEN"
+
 # --- W3: IDENTIFIED BINARY --------------------------------------------------------
 note "binary" "gzippy sha256=${GZ_SHA:0:16} commit=$CAMPAIGN_GZIPPY_SHA (vanilla: verified)"
+note "subject" "frozen copy at $GZ_FROZEN (read-only; repo rebuilds cannot reach it)"
 note "method" "levels=$LEVELS threads=$THREADS n=$N sink=/dev/null (BOTH arms)"
 note "out" "$OUT"
 
