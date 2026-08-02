@@ -229,17 +229,28 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // that to "Lazy is not uniformly stronger; it is stronger only where matches are
     // dense" (the record above, from the L2 attempt). **That attribution was wrong.**
     //
-    // THE REAL CAUSE WAS A SECOND VARIABLE I CHANGED WITHOUT NOTICING.
-    // `choose_min_match_len` CLAMPS min_len by `max_search_depth`: below 16 it forces
-    // min_len <= 7 (`min_match.rs`, libdeflate `:2299`). Going 16 -> 12 crossed that
-    // threshold, so the candidate did not only swap the parser — it also LOWERED the
-    // minimum match length, admitting short matches on sparse-match DNA data. libdeflate's
-    // own comment names the case: "some data (e.g. DNA sequencing data) benefits greatly
-    // from a longer minimum length".
+    // ⛔ AND THEN I GOT THE CAUSE WRONG A SECOND TIME. I first blamed the parser; then I
+    // blamed `choose_min_match_len`'s clamp (it caps min_len at <=7 below depth 16, and
+    // 16 -> 12 crosses that). I posted that, THEN tested it, and the predicted second
+    // consequence FALSIFIED it: if the clamp bound, depth 15 -> 16 would show a
+    // DISCONTINUOUS jump on low-variety data. Measured, it does not — every step is
+    // smooth:
+    //     ecoli.fastq  d14 4,581,294  d15 4,575,025  d16 4,568,588  d17 4,561,876
+    //                  15->16 = -6,437   vs   14->15 = -6,269
+    //     dickens, markup.xml, dd79_bin6: same, no discontinuity.
+    // The clamp only binds when `min_lens[]` returns ABOVE the cap, i.e. on genuinely
+    // low-variety data. `ecoli.fastq` is FASTQ — bases PLUS quality scores PLUS headers —
+    // so its literal alphabet is wide and the table already returns a low min_len. The
+    // clamp is INERT on this corpus at these depths.
     //
-    // Holding depth at 16 and changing ONLY the parser, the same file PASSES: ecoli.fastq
-    // 4,547,014 vs rival 4,568,588. **One variable at a time. A falsification that names
-    // the wrong cause closes the wrong class.**
+    // THE ACTUAL CAUSE IS THE PLAIN ONE: depth 12 searches less than depth 16. That is
+    // all. `Lazy(12,30)` was a parser step AND a depth REDUCTION; this arm is the parser
+    // step alone.
+    //
+    // Three wrong mechanism stories for one correct measurement. The measurements never
+    // moved — Lazy(12,30) opens ecoli, Lazy(16,30) does not, this gate is clean — only my
+    // explanations did. "One measurement supports one claim" is the rule that keeps being
+    // broken here by generalising a code read into a claim about behaviour.
     //
     // ⚠ THE WALL LEG IS UNMEASURED AND IS THE ONLY REMAINING GATE. Lazy does roughly twice
     // greedy's matchfinder calls at the same depth, so this spends wall BY CONSTRUCTION.
