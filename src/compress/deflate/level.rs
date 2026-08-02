@@ -228,6 +228,23 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // an already-failing cell — so it is a size cost, not a promotion blocker. Naming it
     // because a cell count hides it.
     //
+    // ⛔ AND L4 IS THE MAXIMUM CLEAN SUBSET — extending this to every eligible level was
+    // BUILT AND MEASURED, and it is NO-SHIP. The strategy step composed with the depth
+    // scaling, applied wherever a stronger parser exists (Greedy->Lazy, Lazy->Lazy2), at
+    // T4 vs this branch: **9 closed, 3 OPENED**. Per level:
+    //
+    //     L2   closed 3   OPENED 1   <- weights.safetensors vs igzip
+    //     L4   closed 5   OPENED 0   <- THIS ARM
+    //     L5   closed 0   OPENED 0   <- adds nothing
+    //     L6   closed 0   OPENED 1   <- weights.safetensors vs libdeflate. strictly worse.
+    //     L7   closed 1   OPENED 1   <- weights.safetensors vs libdeflate. net zero, NO-SHIP.
+    //
+    // **All three opens are the SAME FILE**, and it is the one this file already names:
+    // on near-incompressible float tensors Lazy defers matches and emits more literals.
+    // So the L4-only scope here is NOT a partial application waiting to be generalised —
+    // it is the OPTIMUM of the family. Every other level either opens a cell or adds
+    // nothing. Do not re-derive this by extending the arm.
+    //
     // (superseded note kept for the reasoning chain)
     // L4 IS A STRATEGY STEP AT T>1, NOT A DEPTH STEP — measured, clause 3 clean.
     //
