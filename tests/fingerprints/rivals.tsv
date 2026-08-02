@@ -1,5 +1,10 @@
 # Rival fingerprints on the frozen fixtures. Regenerate on a box with all
 # rivals: cargo run --release --example fingerprint_tool -- pin-rivals
+# A pin is only comparable at these rival versions:
+#   gzip: gzip 1.13
+#   pigz: pigz 2.8
+#   libdeflate: gzip compression program v1.23
+#   igzip: igzip command line interface 2.31.1
 # covered: gzip,pigz,libdeflate,igzip
 fixture	level	threads	impl	file_bytes	decoded_bytes	members	blocks_stored	blocks_fixed	blocks_dynamic	empty_blocks	header_bits	data_bits	literals	matches	match_bytes	len3	len4_7	len8_15	len16_31	len32_257	len258	dist_gt4096
 binary	1	1	gzip	673938	1048576	1	0	0	19	0	10417	5380882	564570	47034	484006	13617	2599	21317	8095	1406	0	5380
