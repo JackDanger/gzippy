@@ -628,8 +628,87 @@ pub(super) fn compress(
         // G1 NOT ROUTED — the finder is correct and its size verdict is strong, and it
         // is 1.08-1.37x SLOWER on the frozen paired wall at L1 (data.csv 1.3709,
         // tool.bin 1.1805, aozora 1.1481, dickens 1.1329, armexe.elf 1.0802, n=15,
-        // /dev/null both arms). See `matchfinder::ht` for why micro-optimising it is a
-        // closed search and what the 2.19x instruction gap actually is.
+        // /dev/null both arms).
+        //
+        // ⚠ RETRACTED 2026-08-01 — this comment used to end "See `matchfinder::ht` for
+        // why micro-optimising it is a closed search and what the 2.19x instruction gap
+        // actually is." BOTH halves of that sentence were wrong, and the wall numbers
+        // above are measured against `parse::fast`, i.e. OURS, not against libdeflate.
+        //
+        //   * ⚠ AND THE FIRST HALF WAS RETRACTED THE SAME DAY. This briefly said "the
+        //     2.19x instruction gap HAD NO DEFINING MEASUREMENT — grep 2.19 across
+        //     `src/` and `docs/`". FALSE: `df475791` (#194) measured it — "the finder
+        //     executes 201,359,346 instructions against `parse::fast`'s 92,057,657 —
+        //     2.19x, from probing twice and hashing a third table". The grep covered
+        //     the WORKING TREE; this project keeps receipts in COMMIT MESSAGES, and
+        //     `git log -S2.19 --all` finds it instantly. Search the history before
+        //     asserting a record does not exist.
+        //   * #194 also named the MECHANISM correctly — "hashing a third table" — and
+        //     the ablation below prices it at 54,690,301 Ir, confirming #194 rather
+        //     than overturning it. What #194 never did was price the ALTERNATIVE.
+        //   * What survives: 2.19x is `ht` vs `parse::fast`, ours vs ours, exactly like
+        //     `matchfinder::ht`'s 2.07x. No comparison against libdeflate had been run.
+        //   * Measured 2026-08-01 (cachegrind, 6 MB data.csv, L1, -p1, libdeflate built
+        //     with -g): ours 196,854,205 Ir vs libdeflate 146,098,195.
+        //   * At `HT_MAX_LEN3_OFFSET = 0` our payload is BYTE-IDENTICAL to libdeflate's
+        //     (sha256 `62a4e450aca4b522`, full 6 MB multi-block file) and insert counts
+        //     match exactly (5,507,374 both sides), so the parse is identical.
+        //
+        // ⚠ AND THE CONCLUSION DRAWN FROM THAT, THE SAME DAY, WAS WRONG. This comment
+        // briefly said the excess "is the same work priced 1.60x higher — an
+        // implementation gap with a vendor reference implementation to diff against".
+        // An output-preserving ablation (off=0, hash3 MAINTENANCE removed, so the bytes
+        // cannot move) measured 143,777,158 Ir against libdeflate's 146,098,195:
+        // **our port is 1.6% FASTER than the vendor's C, and the whole 52.4M excess is
+        // the length-3 table at 54,690,301 Ir.** There is no implementation gap to
+        // close. See `matchfinder::ht` for the full table and for why off=0 is NOT
+        // "hash3 off" — it disables acceptance, not maintenance, which is exactly the
+        // misreading that produced the retracted claim.
+        //
+        // PARKED, NOT FALSIFIED — branch `lever/l1-ht-minmatch` (31198766). It governs
+        // length-3 ACCEPTANCE with libdeflate's own `choose_min_match_len` (min match
+        // length from the count of distinct literals), which we already ship at levels
+        // 2-9, instead of a fixed offset. That is the rule attempt 1 lacked when it
+        // OPENED 7 cells on binaries. Size, full files, -p1, vs libdeflate:
+        // access.log +10.284%->+0.000%, monorepo.tar +5.650%->-0.002%, data.csv
+        // +4.560%->+0.000%, dickens +2.106%->+0.000%, markup.xml +2.471%->+0.000%,
+        // data.json +1.775%->+0.000%, ecoli.fastq +2.817%->+0.000%, minjs
+        // +2.263%->-0.014%, aozora +4.048%->+0.045%, armexe -3.421%->-3.604%,
+        // symbols.dwarf -0.331%->-0.911%, data.parquet +0.263%->-0.084%. 13 of 14
+        // improve; tie-guard at ALL NINE levels probed 198 cells, 154 tied, 0 flipped;
+        // roundtrip 48/48 sha256-exact. It is a MONOTONE size win.
+        //
+        // It is parked because it rides on `ht_fast`, and the wall numbers below kill
+        // the CARRIER, not the rule. Do NOT re-measure its size leg to revive it — that
+        // leg is banked and deterministic. UNPARK CONDITION: the shared buffering-path
+        // LLC excess is closed, at which point re-measure the WALL leg only.
+        //
+        // ⚠ THE RULE HAS THREE MEASURED EXCEPTIONS, and its own stated falsifier was
+        // "any corpus file where the rule's verdict and the measured sign of the
+        // length-3 delta disagree". That falsifier FIRES. Isolated with a forced
+        // `set_allow_len3(false)` build, which reproduces libdeflate byte-exactly:
+        //   * engine.wasm  — 99 distinct literals, rule says ENABLE, length-3 COSTS
+        //                    +922 B (421,935 vs 421,013). Verdict and sign disagree.
+        //   * weights.safetensors — length-3 costs +89,205 B; the cell improves
+        //                    (+0.366% -> +0.107%) but does NOT close.
+        //   * aozora.txt   — whole-file count says DISABLE, but the shipped code samples
+        //                    the first 4 KiB PER BLOCK, so some blocks enable it:
+        //                    +2,061 B vs libdeflate. THE COUNTED QUANTITY IS NOT THE
+        //                    SHIPPED QUANTITY — a whole-file statistic was used to
+        //                    predict a per-block decision. "COUNT it; never INFER it."
+        // Also unrecorded until now: data.sqlite gives back 1.81 MB of MARGIN
+        // (-15.91% -> -4.35% vs libdeflate; still passing), and photo.jpg's margin
+        // erodes 4,816 -> 736 B. sil40 and dd79_text6 CLOSE.
+        // So the rule is directionally right and NOT exact; any unpark must re-derive
+        // it per block, on TUNE only, and re-check the sign on every file.
+        //
+        // So BOTH FALSIFY notes above stand, and the wall verdict now stands on a
+        // vendor measurement rather than on an inference: `main` (`parse::fast`) runs
+        // data.csv L1 T1 in 176.4 ms against libdeflate's 176.2 ms — ALREADY PARITY —
+        // while this finder, even with the length-3 table ablated entirely, takes
+        // 209.6 ms. Routing it turns a passing wall cell into a ~1.19x failure, and
+        // clause 3 is absolute. The deficit is 2.36x LLC misses, not instructions
+        // (elasticity ~0.22), and it lives in the buffering path that BOTH arms share.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => fast::run::<false>(
             buf,
