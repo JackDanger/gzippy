@@ -166,34 +166,46 @@ where
         // Returns the writer so caller can write trailer
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
-            for slot in slots.iter() {
+            for (slot_idx, slot) in slots.iter().enumerate() {
                 let wait_start = Instant::now();
+                let t0 = crate::infra::trace_spans::now_us();
                 wait_for_slot_ready(slot);
+                crate::infra::trace_spans::record("write_wait", 0, t0, slot_idx, 0);
                 total_wait_ns.fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                 let write_start = Instant::now();
+                let t1 = crate::infra::trace_spans::now_us();
                 if w.write_all(slot.data()).is_err() {
                     write_error.store(true, Ordering::Relaxed);
                     break;
                 }
+                crate::infra::trace_spans::record("write", 0, t1, slot_idx, slot.data().len());
                 total_write_ns
                     .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             w
         });
 
-        // Spawn N compress worker threads
-        for _ in 0..num_threads {
-            scope.spawn(|| {
+        // Spawn N compress worker threads. Shadow every capture as a
+        // reference first so the `move` (needed to give each worker its own
+        // `wid`) moves ONLY these references, not the values.
+        let compress_fn = &compress_fn;
+        let slots_ref = &slots;
+        let next_block_ref = &next_block;
+        let total_compress_ns_ref = &total_compress_ns;
+        let blocks_compressed_ref = &blocks_compressed;
+        for wid in 0..num_threads {
+            scope.spawn(move || {
                 worker_loop_timed(
                     input,
                     block_size,
                     num_blocks,
-                    &slots,
-                    &next_block,
-                    &compress_fn,
-                    &total_compress_ns,
-                    &blocks_compressed,
+                    slots_ref,
+                    next_block_ref,
+                    compress_fn,
+                    total_compress_ns_ref,
+                    blocks_compressed_ref,
+                    wid as u32 + 1,
                 );
             });
         }
@@ -209,6 +221,7 @@ where
     });
     let thread_time = thread_start.elapsed();
     let total_time = start.elapsed();
+    crate::infra::trace_spans::flush();
 
     if debug {
         let compress_ms = total_compress_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -252,6 +265,7 @@ fn worker_loop_timed<F>(
     compress_fn: &F,
     total_compress_ns: &AtomicU64,
     blocks_compressed: &AtomicUsize,
+    trace_tid: u32,
 ) where
     F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>),
 {
@@ -283,7 +297,9 @@ fn worker_loop_timed<F>(
 
         // Time the compression
         let compress_start = Instant::now();
+        let t0 = crate::infra::trace_spans::now_us();
         compress_fn(block_idx, block, dict, is_last, output);
+        crate::infra::trace_spans::record("chunk_compress", trace_tid, t0, block_idx, block.len());
         total_compress_ns.fetch_add(
             compress_start.elapsed().as_nanos() as u64,
             Ordering::Relaxed,

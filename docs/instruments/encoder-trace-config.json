@@ -1,0 +1,15 @@
+{
+  "progress_point": "chunk_compress",
+  "regions": [],
+  "consumer": {
+    "thread_prefix": "write",
+    "output": { "exact": ["write"] },
+    "wait": { "exact": ["write_wait"] }
+  },
+  "stages": [
+    { "name": "compress", "exact": ["chunk_compress"] },
+    { "name": "write_wait", "exact": ["write_wait"] },
+    { "name": "write", "exact": ["write"] }
+  ],
+  "inner_blockers": ["chunk_compress"]
+}
