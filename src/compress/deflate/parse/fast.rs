@@ -2626,6 +2626,13 @@ fn acquire_head_table(
 ) -> Vec<u32> {
     let mut v = pool.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     v.clear();
+    // Anatomy: charge only a GENUINE allocation (first use on this thread, or
+    // a growth), never a pooled reuse — `alloc_bytes` is a real-allocation
+    // meter, and the L1-streaming falsifier compares it across levels.
+    if v.capacity() < len {
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, len * std::mem::size_of::<u32>());
+    }
     v.resize(len, NO_POS);
     v
 }
@@ -2637,6 +2644,124 @@ fn release_head_table(
     v: Vec<u32>,
 ) {
     pool.with(|cell| *cell.borrow_mut() = v);
+}
+
+/// The TAIL loop of one internal block: the last <= [`DEFLATE_MAX_MATCH_LEN`]
+/// positions of the input (or of the block), where `max_len` must be clamped
+/// per position because a match may not run past `in_end`. Pure code motion
+/// out of [`run`]'s per-block body (byte-identical decisions by construction)
+/// so the resumable runner ([`run_resumable`]) shares ONE copy of this logic
+/// instead of a drifting duplicate. Returns the cursor after `block_end_target`
+/// is reached (a straddling match may overrun it slightly).
+#[allow(clippy::too_many_arguments)]
+fn parse_tail(
+    mut pos: usize,
+    block_end_target: usize,
+    in_end: usize,
+    buf: &[u8],
+    base: *const u8,
+    head: &mut [u32],
+    sink: &mut Sink,
+    limit_hash_update_inserts: usize,
+    #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
+) -> usize {
+    while pos < block_end_target {
+        let remaining = in_end - pos;
+        let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
+            DEFLATE_MAX_MATCH_LEN
+        } else {
+            remaining as u32
+        };
+
+        if max_len >= SHORTEST_MATCH {
+            // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
+            let seq = unsafe { load_u32(base, pos) };
+            let h = lz_hash(seq, HASH_BITS) as usize;
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.hash_computations += 1;
+            }
+            let cand = head[h];
+            head[h] = pos as u32;
+            #[cfg(feature = "anatomy-counters")]
+            {
+                local.head_table_reads += 1;
+                local.probe_attempts += 1;
+            }
+
+            // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
+            // the window range instead of panicking on underflow.
+            let dist = pos.wrapping_sub(cand as usize);
+            if (1..=WINDOW).contains(&dist) {
+                let cand_pos = cand as usize;
+                // Byte-exact extend (never trusts the hash): a spurious
+                // candidate simply yields length < SHORTEST_MATCH -> literal.
+                let length = lz_extend(buf, pos, cand_pos, 0, max_len);
+                if length >= SHORTEST_MATCH {
+                    #[cfg(feature = "anatomy-counters")]
+                    {
+                        local.probe_outcome_accepted += 1;
+                        local.positions_processed_matches += length as u64;
+                    }
+                    // LIMIT_HASH_UPDATE: insert the hash for the first
+                    // LIMIT_HASH_UPDATE_INSERTS match-interior positions
+                    // (igzip inserts ~3), then jump the cursor over the whole
+                    // match. usize::MAX means "insert every interior position"
+                    // (zlib-ng style). length >= 4 guarantees at least the
+                    // first interior positions are inside the match; the
+                    // `.min(match_end)` clamp keeps every insert inside it.
+                    let match_end = pos + length as usize;
+                    let insert_end = if limit_hash_update_inserts == usize::MAX {
+                        match_end
+                    } else {
+                        (pos + 1 + limit_hash_update_inserts).min(match_end)
+                    };
+                    let mut nh = pos + 1;
+                    while nh < insert_end {
+                        // SAFETY: nh < match_end = pos+length <= in_end, and
+                        // buf's pad covers the 4-byte load past in_end.
+                        let s = unsafe { load_u32(base, nh) };
+                        head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
+                        #[cfg(feature = "anatomy-counters")]
+                        {
+                            local.hash_computations += 1;
+                            local.interior_writes += 1;
+                        }
+                        nh += 1;
+                    }
+
+                    sink.push_match_fast(length, dist as u32);
+                    pos += length as usize;
+                    continue;
+                }
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.probe_outcome_too_short += 1;
+                }
+            } else {
+                #[cfg(feature = "anatomy-counters")]
+                {
+                    local.probe_outcome_miss += 1;
+                }
+            }
+        }
+
+        // Literal. When `max_len >= SHORTEST_MATCH`, this position was
+        // probed and already landed in `probe_outcome_miss`/`_too_short`
+        // above — its "+1 processed" is DERIVED at flush (see
+        // `FastLocalCounters::flush`'s doc comment), no explicit count
+        // needed here. The one case with NO outcome bucket at all is
+        // near-EOF `max_len < SHORTEST_MATCH` (not enough lookahead to
+        // probe, the `if` above never ran) — `no_probe_literals` is
+        // exactly that case, and only that case.
+        #[cfg(feature = "anatomy-counters")]
+        if max_len < SHORTEST_MATCH {
+            local.no_probe_literals += 1;
+        }
+        sink.push_literal_fast(buf[pos]);
+        pos += 1;
+    }
+    pos
 }
 
 /// Run the one-pass fast encoder over `buf[data_start..in_end]`, appending one
@@ -3015,102 +3140,18 @@ pub(super) fn run<const ACCEL: bool>(
 
             // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
             // block), where `max_len` must be clamped per position.
-            while pos < block_end_target {
-                let remaining = in_end - pos;
-                let max_len = if remaining > DEFLATE_MAX_MATCH_LEN as usize {
-                    DEFLATE_MAX_MATCH_LEN
-                } else {
-                    remaining as u32
-                };
-
-                if max_len >= SHORTEST_MATCH {
-                    // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
-                    let seq = unsafe { load_u32(base, pos) };
-                    let h = lz_hash(seq, HASH_BITS) as usize;
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.hash_computations += 1;
-                    }
-                    let cand = head[h];
-                    head[h] = pos as u32;
-                    #[cfg(feature = "anatomy-counters")]
-                    {
-                        local.head_table_reads += 1;
-                        local.probe_attempts += 1;
-                    }
-
-                    // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
-                    // the window range instead of panicking on underflow.
-                    let dist = pos.wrapping_sub(cand as usize);
-                    if (1..=WINDOW).contains(&dist) {
-                        let cand_pos = cand as usize;
-                        // Byte-exact extend (never trusts the hash): a spurious
-                        // candidate simply yields length < SHORTEST_MATCH -> literal.
-                        let length = lz_extend(buf, pos, cand_pos, 0, max_len);
-                        if length >= SHORTEST_MATCH {
-                            #[cfg(feature = "anatomy-counters")]
-                            {
-                                local.probe_outcome_accepted += 1;
-                                local.positions_processed_matches += length as u64;
-                            }
-                            // LIMIT_HASH_UPDATE: insert the hash for the first
-                            // LIMIT_HASH_UPDATE_INSERTS match-interior positions
-                            // (igzip inserts ~3), then jump the cursor over the whole
-                            // match. usize::MAX means "insert every interior position"
-                            // (zlib-ng style). length >= 4 guarantees at least the
-                            // first interior positions are inside the match; the
-                            // `.min(match_end)` clamp keeps every insert inside it.
-                            let match_end = pos + length as usize;
-                            let insert_end = if limit_hash_update_inserts == usize::MAX {
-                                match_end
-                            } else {
-                                (pos + 1 + limit_hash_update_inserts).min(match_end)
-                            };
-                            let mut nh = pos + 1;
-                            while nh < insert_end {
-                                // SAFETY: nh < match_end = pos+length <= in_end, and
-                                // buf's pad covers the 4-byte load past in_end.
-                                let s = unsafe { load_u32(base, nh) };
-                                head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
-                                #[cfg(feature = "anatomy-counters")]
-                                {
-                                    local.hash_computations += 1;
-                                    local.interior_writes += 1;
-                                }
-                                nh += 1;
-                            }
-
-                            sink.push_match_fast(length, dist as u32);
-                            pos += length as usize;
-                            continue;
-                        }
-                        #[cfg(feature = "anatomy-counters")]
-                        {
-                            local.probe_outcome_too_short += 1;
-                        }
-                    } else {
-                        #[cfg(feature = "anatomy-counters")]
-                        {
-                            local.probe_outcome_miss += 1;
-                        }
-                    }
-                }
-
-                // Literal. When `max_len >= SHORTEST_MATCH`, this position was
-                // probed and already landed in `probe_outcome_miss`/`_too_short`
-                // above — its "+1 processed" is DERIVED at flush (see
-                // `FastLocalCounters::flush`'s doc comment), no explicit count
-                // needed here. The one case with NO outcome bucket at all is
-                // near-EOF `max_len < SHORTEST_MATCH` (not enough lookahead to
-                // probe, the `if` above never ran) — `no_probe_literals` is
-                // exactly that case, and only that case.
+            pos = parse_tail(
+                pos,
+                block_end_target,
+                in_end,
+                buf,
+                base,
+                &mut head,
+                &mut sink,
+                limit_hash_update_inserts,
                 #[cfg(feature = "anatomy-counters")]
-                if max_len < SHORTEST_MATCH {
-                    local.no_probe_literals += 1;
-                }
-                sink.push_literal_fast(buf[pos]);
-                pos += 1;
-            }
+                &mut local,
+            );
         }); // end anatomy_wall_time!(parse_match_ns, ...)
 
         // The fast-path pushes skip per-push `block_length` bookkeeping; the
@@ -3214,4 +3255,263 @@ pub(super) fn run<const ACCEL: bool>(
     // One flush for the whole call — see `FastLocalCounters`'s doc comment.
     #[cfg(feature = "anatomy-counters")]
     local.flush();
+}
+
+/// Everything the FAST (L1) parser must carry from one streaming chunk to the
+/// next — the fast-strategy sibling of the hc matchfinder inside
+/// [`super::ParseState`], created lazily by [`run_resumable`] on its first
+/// call and owned by the `ParseState` for the rest of the file.
+///
+/// * `head`/`head3` hold ABSOLUTE buffer positions (`pos as u32`, exactly as
+///   the whole-buffer [`run`] writes them), so the hot loops are untouched;
+///   the slide cost is paid once per buffer slide in [`Self::rebase`], not
+///   per position.
+/// * `hash3_active_next`/`peek_active_next` are the one-block-lag gate
+///   decisions (see [`Hash3Cfg`]'s and [`LAZY_PEEK_GATED`]'s doc comments).
+///   Carrying them here is what makes a resumed call's first block see
+///   exactly the gate state a whole-buffer run's same-numbered block would —
+///   resetting them per call would re-run the `gate_initial_active` warmup at
+///   every refill and change bytes.
+// `l1-tune` builds never construct one (`new` is cfg'd out with
+// `run_resumable`), so the gate fields are dead there — not in a default build.
+#[cfg_attr(feature = "l1-tune", allow(dead_code))]
+pub(in crate::compress::deflate) struct FastResume {
+    head: Vec<u32>,
+    /// Empty (never allocated) when the hash3 lever is disabled — mirrors
+    /// [`run`]'s conditional acquisition.
+    head3: Vec<u32>,
+    hash3_active_next: bool,
+    peek_active_next: bool,
+}
+
+impl FastResume {
+    #[cfg(not(feature = "l1-tune"))]
+    fn new(hash3: Hash3Cfg) -> Self {
+        FastResume {
+            head: acquire_head_table(&HEAD_POOL, HASH_SIZE),
+            head3: if hash3.enabled {
+                acquire_head_table(&HEAD3_POOL, 1usize << hash3.bits)
+            } else {
+                Vec::new()
+            },
+            hash3_active_next: !hash3.gated || hash3.gate_initial_active,
+            peek_active_next: !LAZY_PEEK_GATED || LAZY_PEEK_GATE_INITIAL_ACTIVE,
+        }
+    }
+
+    /// Tell the state the caller moved buffer contents down by `shift` bytes.
+    ///
+    /// The tables store absolute buffer positions, so unlike the hc
+    /// matchfinder's O(1) `in_base` rebase this is a real sweep — but it runs
+    /// once per multi-megabyte buffer slide, not per position. Entries that
+    /// pointed below `shift` refer to discarded history more than a full
+    /// window behind every future position (the caller's `max_shift` contract
+    /// keeps one whole window behind `in_base`); they become [`NO_POS`], which
+    /// is DECISION-IDENTICAL to the stale-but-present entry a whole-buffer
+    /// run would still hold: every consumer (`process_position_l1`, the tail
+    /// loop, [`hash3_candidate`]) range-checks `pos - cand` against the
+    /// window BEFORE dereferencing a candidate, so out-of-window and
+    /// `NO_POS` reject through the same branch.
+    pub(super) fn rebase(&mut self, shift: usize) {
+        debug_assert!(shift <= u32::MAX as usize);
+        let s = shift as u32;
+        for e in self.head.iter_mut().chain(self.head3.iter_mut()) {
+            *e = if *e != NO_POS && *e >= s {
+                *e - s
+            } else {
+                NO_POS
+            };
+        }
+    }
+}
+
+impl Drop for FastResume {
+    fn drop(&mut self) {
+        // Same pooling contract as `run`'s own release path: `head` always
+        // goes back; `head3` only when it was genuinely acquired (returning
+        // the empty placeholder would stomp a real pooled buffer).
+        release_head_table(&HEAD_POOL, std::mem::take(&mut self.head));
+        if self.head3.capacity() > 0 {
+            release_head_table(&HEAD3_POOL, std::mem::take(&mut self.head3));
+        }
+    }
+}
+
+/// [`run`] with the head tables and per-block gate state supplied by the
+/// caller (inside [`super::ParseState`]), so one parse can span several calls
+/// over a sliding buffer — `Strategy::Fast`'s (L1's) resumable runner, the
+/// fast-parser counterpart of `greedy::run_resumable`.
+///
+/// Returns the position after the last COMPLETE block emitted. See
+/// `greedy::run_resumable` for the `input_mode` / `role` distinction; the
+/// [`STREAM_BLOCK_LOOKAHEAD`] margin argument is SIMPLER here than for
+/// greedy: fast blocks end after a fixed `block_length` input bytes
+/// (position arithmetic, not a content decision), so the only `in_end`
+/// dependences a mid-file block could see are the `fast_end` clamp and the
+/// tail loop's `max_len` clamp — and with at least `STREAM_BLOCK_LOOKAHEAD`
+/// (305 KB, versus `block_length + DEFLATE_MAX_MATCH_LEN` < 66 KB needed)
+/// bytes in hand past the block start, neither clamp engages, byte-for-byte
+/// matching a whole-buffer parse of the same stream. The final (Drain) call
+/// sees the true end of input, so its clamps and BFINAL match whole-buffer
+/// trivially.
+///
+/// `l1-tune` builds do not stream L1 at all (see
+/// [`super::level_has_resumable_parser`]): the dev search harness's levers
+/// (bucket2, chain-mode) carry per-`run`-call state this resume path does not
+/// preserve, and it is measurement-only by charter.
+#[cfg(not(feature = "l1-tune"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_resumable(
+    buf: &[u8],
+    state: &mut super::ParseState,
+    from: usize,
+    in_end: usize,
+    statics: &StaticCodes,
+    bw: &mut BitWriter,
+    role: super::BlockRole,
+    input_mode: super::InputMode,
+    block_length: usize,
+    use_dynamic: bool,
+    limit_hash_update_inserts: usize,
+) -> usize {
+    debug_assert!(in_end >= from);
+    debug_assert!(buf.len() >= in_end + super::BUF_PAD);
+
+    let hash3 = Hash3Cfg::shipped();
+    let (peek_gated, peek_gate_threshold_pct) = (LAZY_PEEK_GATED, LAZY_PEEK_GATE_LIT_THRESHOLD_PCT);
+    // First call of the file creates the carried state (all-NO_POS tables +
+    // the gates' initial-active values — exactly the whole-buffer `run`'s
+    // starting state); every later call resumes it.
+    let fr = state.fast.get_or_insert_with(|| FastResume::new(hash3));
+    let base = buf.as_ptr();
+
+    #[cfg(feature = "anatomy-counters")]
+    let mut local = FastLocalCounters::default();
+    let mut sink = Sink::acquire();
+    let mut header_scratch = HeaderScratch::new();
+    let mut code_scratch = CodeScratch::default();
+    let mut pos = from;
+
+    loop {
+        // A non-drain caller refills; stop at the last block boundary that
+        // still had the full lookahead margin behind it (see the doc comment
+        // above for why that margin makes the seam invisible).
+        if !input_mode.must_drain() && in_end - pos < super::STREAM_BLOCK_LOOKAHEAD {
+            break;
+        }
+        if pos == in_end {
+            // Drain call whose input ends exactly on a block boundary from a
+            // PREVIOUS iteration of this same loop: everything already
+            // emitted. (The caller guards the empty-call case itself.)
+            break;
+        }
+        // Start a new block — same shape as [`run`]'s loop, with the carried
+        // state read out of `fr` instead of per-call locals.
+        let block_begin = pos;
+        sink.begin();
+        let block_end_target = (block_begin + block_length).min(in_end);
+        let hash3_active = fr.hash3_active_next;
+        let peek_active = fr.peek_active_next;
+        let fast_end = block_end_target.min(in_end.saturating_sub(DEFLATE_MAX_MATCH_LEN as usize));
+
+        // One `parse_match` timer per internal block, matching [`run`].
+        crate::anatomy_wall_time!(parse_match_ns, parse_match_calls, {
+            // Same monomorphized dispatch as [`run`]'s `!ACCEL` arm
+            // (L1-only path; L0 never streams through a parser — the
+            // streaming encoder handles level 0 as stored blocks itself).
+            pos = if hash3_active {
+                fastloop_l1(
+                    pos,
+                    fast_end,
+                    buf,
+                    base,
+                    &mut fr.head,
+                    &mut sink,
+                    limit_hash_update_inserts,
+                    #[cfg(feature = "anatomy-counters")]
+                    &mut local,
+                    &mut fr.head3,
+                    hash3,
+                    hash3_active,
+                    peek_active,
+                )
+            } else {
+                fastloop_l1_lean(
+                    pos,
+                    fast_end,
+                    buf,
+                    base,
+                    &mut fr.head,
+                    &mut sink,
+                    limit_hash_update_inserts,
+                    #[cfg(feature = "anatomy-counters")]
+                    &mut local,
+                )
+            };
+            pos = parse_tail(
+                pos,
+                block_end_target,
+                in_end,
+                buf,
+                base,
+                &mut fr.head,
+                &mut sink,
+                limit_hash_update_inserts,
+                #[cfg(feature = "anatomy-counters")]
+                &mut local,
+            );
+        });
+
+        sink.block_length = pos - block_begin;
+        let is_final = role.is_final() && pos == in_end;
+        if use_dynamic {
+            emit_block(
+                bw,
+                buf,
+                block_begin,
+                &sink,
+                statics,
+                is_final,
+                &mut header_scratch,
+                &mut code_scratch,
+                false,
+            );
+        } else {
+            emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+        }
+
+        // One-block-lag gate recompute, identical to [`run`]'s chainless arm —
+        // stored into the carried state so the NEXT block sees it whether it
+        // runs in this call or after a refill.
+        {
+            let literal_count: u32 = sink.litlen_freqs[..NUM_LITERALS].iter().sum();
+            let match_count: u32 = sink.litlen_freqs[DEFLATE_FIRST_LEN_SYM..].iter().sum();
+            let total = literal_count + match_count;
+            fr.hash3_active_next = !hash3.gated
+                || (total > 0
+                    && (literal_count as u64 * 100)
+                        >= (hash3.gate_lit_threshold_pct as u64 * total as u64));
+            fr.peek_active_next = !peek_gated
+                || (total > 0
+                    && (literal_count as u64 * 100)
+                        >= (peek_gate_threshold_pct as u64 * total as u64));
+        }
+
+        if pos == in_end {
+            break;
+        }
+    }
+
+    // Keep `ParseState`'s slide invariant (`in_base` a multiple of the window
+    // with `in_next - in_base` in `0..WINDOW`): the fast tables store
+    // absolute positions, so `in_base` is not consulted during the parse —
+    // it exists purely to drive the caller's `max_shift`/`shift_down`
+    // arithmetic, which slides the buffer in whole-window steps and then
+    // rebases the tables (see [`FastResume::rebase`]).
+    state.in_base = pos & !(WINDOW - 1);
+
+    // One flush per call — see `FastLocalCounters`'s doc comment.
+    #[cfg(feature = "anatomy-counters")]
+    local.flush();
+    pos
 }

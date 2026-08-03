@@ -516,9 +516,16 @@ pub(super) struct ParseState {
     pub mf: crate::compress::deflate::matchfinder::hc::PooledHc,
     /// Base offset the matchfinder's stored positions are relative to.
     /// ALWAYS a multiple of [`WINDOW_SIZE`], with `in_next - in_base` in
-    /// `0..WINDOW_SIZE` — see `HcMatchfinder`'s slide condition.
+    /// `0..WINDOW_SIZE` — see `HcMatchfinder`'s slide condition. The FAST
+    /// (L1) strategy stores absolute positions instead and only maintains
+    /// this field for the caller's slide arithmetic — see
+    /// `fast::run_resumable`'s closing comment.
     pub in_base: usize,
     pub next_hashes: [u32; 2],
+    /// The FAST (L1) strategy's carried state (head tables + block gates),
+    /// created lazily by `fast::run_resumable` on its first call. `None` for
+    /// every other strategy — they carry their state in `mf` above.
+    pub fast: Option<fast::FastResume>,
 }
 
 impl ParseState {
@@ -529,6 +536,7 @@ impl ParseState {
             }),
             in_base: 0,
             next_hashes: [0u32; 2],
+            fast: None,
         }
     }
 
@@ -560,6 +568,11 @@ impl ParseState {
         debug_assert_eq!(shift % WINDOW_SIZE, 0, "shift must be whole windows");
         debug_assert!(shift <= self.in_base, "shift would push in_base negative");
         self.in_base -= shift;
+        // The FAST tables store absolute positions (not `pos - in_base`), so
+        // they need a real rebase sweep — once per multi-megabyte slide.
+        if let Some(f) = self.fast.as_mut() {
+            f.rebase(shift);
+        }
     }
 }
 
@@ -583,10 +596,23 @@ pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLO
 /// same level — the T>1 == T1 invariant. It does NOT mean identical to
 /// libdeflate's, and must never be read that way.
 pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
-    matches!(
-        super::level::params(level).strategy,
+    let strategy = super::level::params(level).strategy;
+    if matches!(
+        strategy,
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
-    )
+    ) {
+        return true;
+    }
+    // `Strategy::Fast` (L1) streams via `fast::run_resumable` — but only in a
+    // default build. The `l1-tune` dev search harness carries per-`run`-call
+    // lever state (bucket2's `head2`, chain-mode's lazy hc) that the resume
+    // path does not preserve, so tune builds keep the whole-buffer fallback;
+    // they are measurement-only and never ship.
+    #[cfg(not(feature = "l1-tune"))]
+    if matches!(strategy, Strategy::Fast) {
+        return true;
+    }
+    false
 }
 
 /// Resume a parse over `buf[from..in_end]` using caller-owned `state`.
@@ -609,6 +635,24 @@ pub(super) fn parse_resumable(
 ) -> usize {
     let statics = StaticCodes::get();
     match params.strategy {
+        // Same const arguments as `parse()`'s whole-buffer `Strategy::Fast`
+        // arm (block length / dynamic emitter / insert depth); `params`
+        // carries nothing the fast parser reads. Default builds only — see
+        // `level_has_resumable_parser` for why `l1-tune` never routes here.
+        #[cfg(not(feature = "l1-tune"))]
+        Strategy::Fast => fast::run_resumable(
+            buf,
+            state,
+            from,
+            in_end,
+            statics,
+            bw,
+            role,
+            input_mode,
+            fast::FAST_BLOCK_LENGTH,
+            true,
+            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
+        ),
         Strategy::Greedy => greedy::run_resumable(
             buf, state, from, in_end, params, statics, bw, role, input_mode,
         ),

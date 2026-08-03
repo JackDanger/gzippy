@@ -560,9 +560,9 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
 /// the streaming path without a proof that its bytes could not change.
 ///
 /// This is a level branch, not content detection — it reads only the number
-/// the user typed. It should shrink by making more parsers resumable (Fast for
-/// L1, NearOptimal for L10-12, and L3 once its content detector is gone), not
-/// by relaxing the rule.
+/// the user typed. It should shrink by making more parsers resumable (Fast
+/// landed for L1 2026-08-02 via `fast::run_resumable`; NearOptimal for
+/// L10-12 remains), not by relaxing the rule.
 #[inline]
 pub fn level_streams(level: u32) -> bool {
     level == 0 || parse::level_has_resumable_parser(level)
@@ -614,12 +614,13 @@ pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
 /// [`encode_gzip_reader_to_writer`] with an optional input-size hint.
 ///
 /// The hint matters only on the whole-buffer FALLBACK levels (see
-/// [`level_streams`]): without it, `read_to_end` grows the input buffer by
-/// doubling, so an 8 MiB input touches ~21 MB of fresh anonymous pages
-/// (measured by the L1-streaming falsifier in tests/anatomy_counters.rs) —
-/// every page a minor fault. With the hint the buffer is sized once. This is
-/// palliative, not the fix: the fix is a resumable `fast` parser, and the
-/// falsifier stays RED until that lands. Streaming levels ignore the hint.
+/// [`level_streams`] — L10-12 today, plus L1 in an `l1-tune` dev build):
+/// without it, `read_to_end` grows the input buffer by doubling, so an 8 MiB
+/// input touches ~21 MB of fresh anonymous pages — every page a minor fault.
+/// That mechanism was measured at L1 by the L1-streaming falsifier in
+/// tests/anatomy_counters.rs, which went GREEN when `fast::run_resumable`
+/// took L1 off this fallback entirely; the hint remains as the palliative for
+/// the levels still on it. Streaming levels ignore the hint.
 pub fn encode_gzip_reader_to_writer_sized<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
