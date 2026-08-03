@@ -689,8 +689,19 @@ impl HtMatchfinder {
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
             hash = lz_hash(seq, HT_HASH_ORDER) as usize;
-            if len3 {
+            // STRIDE-2 length-3 maintenance inside skip runs (match interiors).
+            // The encoder trace emitter's first case (PR #255) measured the
+            // len3 singleton's write traffic costing ~25% per chunk under
+            // CONCURRENT T4 execution on rule-ON files — write contention that
+            // vanishes serialized — and skip runs are where most of those
+            // writes happen while carrying the least valuable candidates (a
+            // position deep inside a covered match). Halving them halves the
+            // contended traffic; the size effect is judged by the census, and
+            // the 4-byte bucket maintenance below is untouched.
+            if len3 && cur_pos & 1 == 0 {
                 unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            }
+            if len3 {
                 hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
             }
             cur_pos += 1;
