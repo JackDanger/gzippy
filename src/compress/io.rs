@@ -232,6 +232,19 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         args.zopfli_iterations.is_some() || args.zopfli_no_split || args.zopfli_split_max.is_some();
     let use_pure_parallel = use_mmap && !args.rsyncable && !explicit_zopfli;
 
+    // T1 FILE inputs above the same threshold: mmap and parse whole-buffer
+    // style over the map. The vendor's answer to input-side fault cost is
+    // mmap, not streaming (libdeflate-gzip maps its input —
+    // vendor/libdeflate/programs/gzip.c); our streaming path's
+    // copy-through-window traffic measured +3-7% wall on L1 file cells on
+    // Zen2 (PR #256), so streaming is kept ONLY for non-seekable inputs
+    // (stdin/pipes), where its fixed memory footprint is the point. Output is
+    // byte-identical to the Read-based T1 route at every level.
+    let use_t1_mmap = opt_config.thread_count == 1
+        && file_size > 128 * 1024
+        && !args.rsyncable
+        && !explicit_zopfli;
+
     if let Some(ref output_path) = output_path {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
     }
@@ -292,6 +305,44 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             encoder
                 .compress_buffer_pure(&mmap, output_file)
                 .map_err(|e| e.into())
+        }
+    } else if use_t1_mmap {
+        if args.verbosity >= 2 {
+            eprintln!(
+                "gzippy: using pure-Rust DEFLATE encoder (T1 mmap L{})",
+                args.compression_level
+            );
+        }
+        // SAFETY: the input file is opened read-only and mapped for the
+        // duration of this compression; it is not mutated concurrently by
+        // gzippy, matching every other mmap read path in this module.
+        let mmap = unsafe { memmap2::Mmap::map(&input_file)? };
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        // Gate-4 route assertion at the call site of the encoder about to run
+        // (both writer arms below invoke the same function unconditionally).
+        crate::compress::route::emit(
+            crate::compress::route::PURE_T1_MMAP,
+            args.compression_level as u32,
+            1,
+        );
+        let encode = |mut w: &mut dyn Write| -> GzippyResult<u64> {
+            let bytes = crate::anatomy_wall_cli!({
+                crate::compress::deflate::encode_gzip_unpadded_slice_to_writer(
+                    &mmap,
+                    &mut w,
+                    args.compression_level as u32,
+                )?
+            });
+            w.flush()?;
+            Ok(bytes)
+        };
+        if args.stdout {
+            let mut out = BufWriter::with_capacity(1024 * 1024, stdout());
+            encode(&mut out)
+        } else {
+            let mut out = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
+            encode(&mut out)
         }
     } else if args.stdout {
         let out = BufWriter::with_capacity(1024 * 1024, stdout());
