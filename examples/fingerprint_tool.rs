@@ -586,9 +586,43 @@ fn main() {
                 seam_rows.len()
             );
         }
+        "fp" => {
+            // Fingerprint arbitrary .gz files (paths as trailing args) and, with
+            // exactly two paths, print the per-axis diff. This is the Step-0 /
+            // before-after instrument for stream-shape work (e.g. seam levers):
+            // it answers "is the T4-vs-T1 delta exactly framing?" in one command.
+            let paths: Vec<String> = std::env::args().skip(2).collect();
+            assert!(
+                !paths.is_empty(),
+                "usage: fingerprint_tool fp <a.gz> [b.gz]"
+            );
+            let fps: Vec<StreamFingerprint> = paths
+                .iter()
+                .map(|p| {
+                    let gz = std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+                    fingerprint_gzip(&gz).unwrap_or_else(|e| panic!("fingerprint {p}: {e}"))
+                })
+                .collect();
+            for (p, fp) in paths.iter().zip(&fps) {
+                println!("{p}");
+                for (f, v) in StreamFingerprint::TSV_FIELDS.iter().zip(fp.tsv_values()) {
+                    println!("  {f:<14} {v}");
+                }
+            }
+            if let [a, b] = &fps[..] {
+                println!("== diff ({} vs {}) ==", paths[0], paths[1]);
+                let d = a.diff(b);
+                if d.is_empty() {
+                    println!("  byte-shape identical on every axis");
+                }
+                for (axis, x, y) in d {
+                    println!("  {axis:<14} {x:>12} vs {y:>12}");
+                }
+            }
+        }
         other => {
             eprintln!(
-                "usage: fingerprint_tool pin-ours | pin-rivals | ledger | report | blocks <file.gz> | pin-blocks | pin-t4 (got '{other}')"
+                "usage: fingerprint_tool pin-ours | pin-rivals | ledger | report | blocks <file.gz> | pin-blocks | pin-t4 | fp (got '{other}')"
             );
             std::process::exit(2);
         }

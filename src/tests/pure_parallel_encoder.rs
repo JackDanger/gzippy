@@ -168,14 +168,66 @@ fn empty_input_valid() {
     assert_three_oracle(&gz, &[], "empty");
 }
 
-/// Input smaller than one chunk still routes cleanly (single is_last chunk).
+/// Input smaller than one chunk still routes cleanly (single is_last chunk),
+/// including the stored-sub-block boundary sizes 65535/65536.
 #[test]
 fn sub_chunk_input_valid() {
-    for len in [1usize, 37, 4096, 65_000] {
+    for len in [1usize, 37, 4096, 65_000, 65_535, 65_536] {
         let input = mixed_corpus(len);
         for level in [1u32, 9, 12] {
             let gz = compress_pure(&input, level, 4);
             assert_three_oracle(&gz, &input, &format!("subchunk len={len} L{level}"));
+        }
+    }
+}
+
+/// THE BIT-SPLICE SIZE INVARIANT: the spliced T>1 stream is never larger than
+/// the old per-chunk sync-flush construction — the seam bytes are DELETED
+/// (compressible chunks) or re-created only where a stored-block chunk lands
+/// on an unaligned offset (never more often than the old always-on seam).
+///
+/// The reference is built exactly as the pre-splice worker+writer pair did:
+/// same grid, same 32 KiB dictionary, `encode_deflate_segment_to_sink` with
+/// its byte-aligning sync-flush on every non-final chunk, byte concatenation.
+#[test]
+fn spliced_never_larger_than_seamed() {
+    use crate::compress::deflate::encode_deflate_segment_to_sink;
+    use crate::compress::pipelined::pipelined_block_size;
+
+    for &name in crate::fixtures::NAMES {
+        let input = crate::fixtures::generate(name);
+        for level in [1u32, 2, 6, 9] {
+            for threads in [4usize, 8] {
+                let block_size = pipelined_block_size(input.len(), threads, level);
+                let num_blocks = input.len().div_ceil(block_size);
+                let mut seamed_body = Vec::new();
+                for i in 0..num_blocks {
+                    let start = i * block_size;
+                    let end = (start + block_size).min(input.len());
+                    let dict_start = start.saturating_sub(32768);
+                    let mut chunk = Vec::new();
+                    encode_deflate_segment_to_sink(
+                        &input[start..end],
+                        &input[dict_start..start],
+                        level,
+                        i == num_blocks - 1,
+                        &mut chunk,
+                        true,
+                    );
+                    seamed_body.extend_from_slice(&chunk);
+                }
+                let seamed_total = 10 + seamed_body.len() + 8; // header + body + trailer
+
+                let spliced = compress_pure(&input, level, threads);
+                assert!(
+                    spliced.len() <= seamed_total,
+                    "{name} L{level} T{threads}: spliced {} B > seamed {} B — \
+                     bit-splicing must never grow the stream",
+                    spliced.len(),
+                    seamed_total,
+                );
+                assert_three_oracle(&spliced, &input, &format!("{name} L{level} T{threads}"));
+            }
         }
     }
 }
