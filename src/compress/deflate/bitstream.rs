@@ -432,7 +432,22 @@ impl BitSplicer {
         self.shift_buf.clear();
         self.shift_buf.reserve(data.len());
         let mut carry = self.pending;
-        for &b in data {
+        // Word-wise shift: 8 bytes per iteration through a u64 lane. The v1
+        // byte-at-a-time loop serialized megabytes of single-byte work on the
+        // writer thread's critical path — adjudicated as the confirmed
+        // pigz:tool.bin:L4:T4 wall flip (0.9815 -> 1.0129, 22 MB output,
+        // corpus tool.bin; try.json in lever-origin-lever-t4-bitsplice).
+        // Little-endian u64 keeps DEFLATE's LSB-first order: within the lane,
+        // byte k's low bits receive byte k-1's high bits, exactly as the
+        // byte loop did; the lane's top `inv` bits carry into the next lane.
+        let mut chunks = data.chunks_exact(8);
+        for ch in &mut chunks {
+            let lane = u64::from_le_bytes(ch.try_into().unwrap());
+            let shifted = (lane << shift) | carry as u64;
+            self.shift_buf.extend_from_slice(&shifted.to_le_bytes());
+            carry = (lane >> (64 - shift as u64)) as u8;
+        }
+        for &b in chunks.remainder() {
             self.shift_buf.push(carry | (b << shift));
             carry = b >> inv;
         }
