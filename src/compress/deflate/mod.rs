@@ -599,12 +599,34 @@ pub fn level_streams(level: u32) -> bool {
 /// BFINAL *while encoding it*, and "did the reader end exactly on a chunk
 /// boundary" is not knowable otherwise. Reading one byte past a full chunk
 /// answers it; that byte becomes the first byte of the next chunk.
+// The bin target compiles this module tree directly, where these two lib-API
+// entry points have no caller (the CLI routes through the _sized variant);
+// tests/streaming_identity.rs and library consumers use them.
+#[allow(dead_code)]
 pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
 ) -> std::io::Result<u64> {
-    encode_gzip_reader_to_writer_chunked(reader, writer, level, STREAM_CHUNK)
+    encode_gzip_reader_to_writer_sized(reader, writer, level, None)
+}
+
+/// [`encode_gzip_reader_to_writer`] with an optional input-size hint.
+///
+/// The hint matters only on the whole-buffer FALLBACK levels (see
+/// [`level_streams`]): without it, `read_to_end` grows the input buffer by
+/// doubling, so an 8 MiB input touches ~21 MB of fresh anonymous pages
+/// (measured by the L1-streaming falsifier in tests/anatomy_counters.rs) —
+/// every page a minor fault. With the hint the buffer is sized once. This is
+/// palliative, not the fix: the fix is a resumable `fast` parser, and the
+/// falsifier stays RED until that lands. Streaming levels ignore the hint.
+pub fn encode_gzip_reader_to_writer_sized<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    size_hint: Option<usize>,
+) -> std::io::Result<u64> {
+    encode_gzip_reader_to_writer_chunked_sized(reader, writer, level, STREAM_CHUNK, size_hint)
 }
 
 /// [`encode_gzip_reader_to_writer`] with the chunk size supplied by the caller.
@@ -616,11 +638,25 @@ pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
 /// boundaries cost ratio), and that curve has to be measured to pick the
 /// constant rather than guessed. `chunk` should be a multiple of
 /// [`MAX_STORED_SUBBLOCK`] to keep level 0 byte-identical.
+// The bin target compiles this module tree directly, where these two lib-API
+// entry points have no caller (the CLI routes through the _sized variant);
+// tests/streaming_identity.rs and library consumers use them.
+#[allow(dead_code)]
 pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
     chunk: usize,
+) -> std::io::Result<u64> {
+    encode_gzip_reader_to_writer_chunked_sized(reader, writer, level, chunk, None)
+}
+
+fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    chunk: usize,
+    size_hint: Option<usize>,
 ) -> std::io::Result<u64> {
     if !level_streams(level) {
         // This level cannot yet stream without changing its bytes (see
@@ -629,7 +665,9 @@ pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>
         // CLI — have exactly one function to call and never a level-dependent
         // branch of their own. The memory cost is real and is tracked as the
         // reason to make the remaining parsers resumable, not as an API wart.
-        let mut input = Vec::new();
+        // Size the buffer ONCE when the caller knows the input length —
+        // `read_to_end` keeps a pre-reserved capacity instead of doubling.
+        let mut input = Vec::with_capacity(size_hint.map_or(0, |h| h + INPLACE_TAIL_PAD));
         reader.read_to_end(&mut input)?;
         let logical_len = input.len();
         input.resize(logical_len + INPLACE_TAIL_PAD, 0);
