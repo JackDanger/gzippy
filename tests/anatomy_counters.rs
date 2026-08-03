@@ -397,7 +397,26 @@ fn fast_path_reconciliation_invariants_hold_at_l1() {
 }
 
 #[test]
-fn fast_path_reconciliation_invariants_hold_at_l0() {
+fn l0_is_stored_only_and_touches_no_matchfinder() {
+    // REWRITTEN 2026-08-02: this test used to assert Fast0's probe/ramp
+    // counters reconciled at L0 — but production L0 has been STORED-ONLY
+    // since the ratio-hole fix (`deflate_into`'s `level == 0` branch:
+    // "`Strategy::Fast0`/`fast::run::<true>` ... are no longer reachable
+    // from this production call path"). The old assertions targeted an
+    // unreachable path, so the test failed on main from the day of that
+    // routing change — invisibly, because this suite is feature-gated and
+    // CI never runs it. A test whose fixture cannot reach the code it
+    // asserts about certifies nothing (the FIXTURE_CALLGRIND lesson, again).
+    //
+    // What the SHIPPED L0 contract actually is, asserted here:
+    //   * valid gzip that roundtrips byte-exactly,
+    //   * stored framing only: output = input + gzip header/trailer +
+    //     5 bytes per <=65,535-byte stored sub-block (no entropy coding),
+    //   * ZERO matchfinder work — every fast_* counter silent. That is the
+    //     unreachability proof, replacing the old "ramp armed at least
+    //     once" liveness claim (which now lives nowhere in production; the
+    //     Fast0 unit tests via `level::params(0)` keep the code compiling
+    //     and correct should routing ever bring it back).
     let data = low_redundancy_corpus(900_000);
     let (compressed, c) = compress_with_counters(&data, 0);
 
@@ -410,35 +429,33 @@ fn fast_path_reconciliation_invariants_hold_at_l0() {
     }
     assert_eq!(decoded, data, "roundtrip sanity check failed");
 
-    assert_fast_common_invariants(&c, data.len() as u64);
-
-    let get = |k: &str| *c.get(k).unwrap_or_else(|| panic!("missing counter {k}"));
-
-    // L0 (`Strategy::Fast0`, `ACCEL == true`) is the ramp's ONLY caller; a
-    // low-redundancy fixture with long miss runs must arm it at least once —
-    // proving `fast_positions_skipped` is a live counter, not a permanent
-    // zero (mirrored by the L1 test's assertion that it's ALWAYS zero there).
+    // Stored framing arithmetic: header(10) + trailer(8) + 5 B per sub-block.
+    let subblocks = data.len().div_ceil(65_535);
+    let expected = data.len() + 10 + 8 + 5 * subblocks;
     assert!(
-        get("fast_positions_skipped") > 0,
-        "expected the ACCEL ramp to skip at least one position on a low-redundancy fixture"
+        compressed.len() >= data.len() && compressed.len() <= expected + 16,
+        "L0 output {} B is not stored-shaped for {} B input (expected ~{} B)",
+        compressed.len(),
+        data.len(),
+        expected
     );
 
-    // L0 shares NEITHER the lazy peek NOR the SF2 batch pipeline with L1 —
-    // `fastloop_l0` is a dedicated, non-generic function that never calls
-    // `process_position_l1` (see fast.rs's module doc comment on why).
-    assert_eq!(
-        get("fast_lazy_peek_events"),
-        0,
-        "L0 must never attempt a lazy peek (L1-only mechanism)"
-    );
-    assert_eq!(
-        get("fast_k2_batch_iterations"),
-        0,
-        "L0 must never engage the SF2 batch pipeline (L1-only mechanism)"
-    );
-    assert_eq!(
-        get("fast_probe_outcome_deferred"),
-        0,
-        "L0 can never defer (no lazy peek to defer through)"
-    );
+    let get = |k: &str| c.get(k).copied().unwrap_or(0);
+    for k in [
+        "fast_positions_processed",
+        "fast_positions_skipped",
+        "fast_probe_attempts",
+        "fast_head_table_writes",
+        "matches_emitted_fast",
+        "fast_lazy_peek_events",
+        "fast_k2_batch_iterations",
+    ] {
+        assert_eq!(
+            get(k),
+            0,
+            "L0 is stored-only: {k} must be ZERO (a nonzero value means the \
+             unreachable Fast0 path came back into routing — re-assert its \
+             invariants if that is ever intentional)"
+        );
+    }
 }
