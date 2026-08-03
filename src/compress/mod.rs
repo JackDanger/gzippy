@@ -161,10 +161,11 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         // every inner region reported normally.
         let mut writer = writer;
         let bytes = crate::anatomy_wall_cli!({
-            crate::compress::deflate::encode_gzip_reader_to_writer(
+            crate::compress::deflate::encode_gzip_reader_to_writer_sized(
                 &mut reader,
                 &mut writer,
                 args.compression_level as u32,
+                size_hint,
             )?
         });
         writer.flush()?;
