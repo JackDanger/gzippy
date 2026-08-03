@@ -184,6 +184,82 @@ pub fn encode_deflate_segment_to_sink(
     *out = bw.finish();
 }
 
+/// Compress `data` into a raw DEFLATE FRAGMENT for the T>1 bit-splicing
+/// writer, appending to `out` and returning the [`bitstream::ChunkMeta`] the
+/// splicer needs.
+///
+/// Differences from [`encode_deflate_segment_to_sink`], which this replaces on
+/// the T>1 chunk path:
+///
+/// * a non-final chunk gets NO sync-flush seam and NO byte-align padding —
+///   the returned `pad_bits` tells the writer thread exactly where the
+///   fragment's bitstream ends, and the writer bit-splices the next fragment
+///   directly onto it. The ~5-byte-per-chunk framing floor disappears from
+///   the output entirely;
+/// * `needs_alignment` reports whether the fragment contains a stored
+///   (BTYPE=00) block. Stored LEN/NLEN byte-alignment is relative to the
+///   fragment's own start, so such a fragment must be placed byte-aligned:
+///   the splicer re-creates the old-style seam at that one boundary instead
+///   of shifting the fragment. Detection is structural — the [`BitWriter`]
+///   records whether `align_to_byte` ever ran — so EVERY stored emitter
+///   (the parser's stored-escape, `emit_stored_block`, ultra's
+///   `add_non_compressed_block`) is covered without threading a flag through
+///   each parse path.
+///
+/// The final chunk (`is_last`) still sets BFINAL on its last block; its
+/// trailing pad, if any, is reported like any other so the splicer can shift
+/// it too, then zero-pad the whole stream once at the very end.
+pub fn encode_deflate_splice_chunk_to_sink(
+    data: &[u8],
+    dict: &[u8],
+    level: u32,
+    is_last: bool,
+    out: &mut Vec<u8>,
+    parallel: bool,
+) -> bitstream::ChunkMeta {
+    let mut bw = BitWriter::from_vec(std::mem::take(out));
+
+    if dict.is_empty() {
+        let cap = data.len() + parse::BUF_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut buf = Vec::with_capacity(cap);
+        buf.extend_from_slice(data);
+        buf.resize(data.len() + parse::BUF_PAD, 0);
+        deflate_into(
+            &mut bw,
+            &buf,
+            0,
+            data.len(),
+            level,
+            is_last,
+            false,
+            parallel,
+        );
+    } else {
+        let dict_len = dict.len();
+        let in_end = dict_len + data.len();
+        let cap = in_end + parse::BUF_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut buf = Vec::with_capacity(cap);
+        buf.extend_from_slice(dict);
+        buf.extend_from_slice(data);
+        buf.resize(in_end + parse::BUF_PAD, 0);
+        deflate_into(
+            &mut bw, &buf, dict_len, in_end, level, is_last, false, parallel,
+        );
+    }
+
+    let needs_alignment = bw.is_align_sensitive();
+    let (bytes, pad_bits) = bw.finish_unaligned();
+    *out = bytes;
+    bitstream::ChunkMeta {
+        pad_bits,
+        needs_alignment,
+    }
+}
+
 /// Shared parse core: encode `buf[data_start..in_end]` into `bw`, treating
 /// `buf[..data_start]` as a seeded (but un-emitted) preset-dictionary window.
 ///
