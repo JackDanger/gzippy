@@ -278,6 +278,12 @@ define_counters!(
     fast_hash_computations,
     fast_head_table_reads,
     fast_head_table_writes,
+    // `ht` length-3 singleton table refs BY SITE (the PR #251 contention
+    // question: which site carries the concurrent write traffic on rule-ON
+    // files — the per-literal-position read+write in `longest_match`, or the
+    // per-skipped-position write in `skip_bytes`?).
+    ht_len3_refs_longest_match,
+    ht_len3_refs_skip,
     fast_probe_attempts,
     fast_probe_outcome_miss,
     fast_probe_outcome_too_short,

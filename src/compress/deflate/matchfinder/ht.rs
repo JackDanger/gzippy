@@ -507,6 +507,7 @@ impl HtMatchfinder {
             let hash3 = *next_hash3 as usize;
             *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
             debug_assert!(hash3 < HT_HASH3_SIZE && (*next_hash3 as usize) < HT_HASH3_SIZE);
+            crate::anatomy_count!(ht_len3_refs_longest_match);
             // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
             let n = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
             unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
@@ -690,6 +691,7 @@ impl HtMatchfinder {
             let seq = unsafe { load_u32(base, pos) };
             hash = lz_hash(seq, HT_HASH_ORDER) as usize;
             if len3 {
+                crate::anatomy_count!(ht_len3_refs_skip);
                 unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
                 hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
             }
