@@ -461,9 +461,11 @@ fn l0_is_stored_only_and_touches_no_matchfinder() {
 }
 
 // ============================================================================
-// THE L1 STREAMING LEVER'S FALSIFIER — RED TODAY, GREEN WHEN `fast` STREAMS.
+// THE L1 STREAMING LEVER'S FALSIFIER — armed RED 2026-08-02, GREEN since
+// `fast::run_resumable` landed (same date): `Strategy::Fast` now streams and
+// this test is the standing memory contract that keeps it streaming.
 //
-// The mechanism, measured 2026-08-02 (both sides, trainer + M1):
+// The mechanism, measured 2026-08-02 (both sides, trainer + M1), while RED:
 //   * T1 levels 2-9 stream through resumable parsers: bounded reused buffers
 //     (L6 RSS 8.6 MB on a 12 MB input).
 //   * L1 (`Strategy::Fast`) has no resumable runner, so
@@ -474,18 +476,19 @@ fn l0_is_stored_only_and_touches_no_matchfinder() {
 //     (they mmap; THP is madvise-mode so nobody gets huge pages). The fault
 //     handling is ~11 ms of the 41.5 ms L1/T1 wall gap on trainer.
 //
-// The fix this test defines DONE for: a resumable `fast` (and `ht_fast`)
-// runner — lookahead-margin pattern like `greedy::run_resumable`, matchfinder
-// tables carried in `ParseState` and rebased on slide, `is_last` resolving
-// the final block's `in_end` dependence — after which `level_streams(1)` is
-// true and L1's allocation profile matches the streaming levels'.
+// The fix this test defined DONE for, now shipped: `fast::run_resumable` —
+// lookahead-margin pattern like `greedy::run_resumable`, head tables carried
+// in `ParseState::fast` (`FastResume`) and rebased on slide, the Drain-call
+// `in_end` resolving the final block's clamps — after which `level_streams(1)`
+// is true and L1's allocation profile matches the streaming levels'.
 //
 // GREEN CONDITION: L1's allocated bytes on an 8 MiB stdin input are within
 // 2x of L6's on the same input (both stream => both are bounded by the
 // fixed-window arithmetic in `encode_gzip_single_pass`, not by input size).
-// The 2x headroom covers parser-specific table sizes, NOT an input-sized
-// buffer: today L1 allocates the whole input + input/2 reservation and sits
-// ~3x over this bar by construction.
+// The 2x headroom covers parser-specific table sizes (L1's 256 KB `head` +
+// 128 KB `head3` are counted at `acquire_head_table`), NOT an input-sized
+// buffer: the pre-lever fallback allocated the whole input + input/2
+// reservation and sat ~3x over this bar by construction.
 //
 // Byte-correctness is already pinned elsewhere: `tests/streaming_identity.rs`
 // asserts stream-vs-whole-buffer identity per level, and the fingerprint
@@ -493,7 +496,6 @@ fn l0_is_stored_only_and_touches_no_matchfinder() {
 // ============================================================================
 
 #[test]
-#[ignore = "RED by design: Strategy::Fast cannot stream yet — this is the L1 streaming lever's definition of done (see block comment)"]
 fn l1_streams_with_bounded_buffers() {
     // Compressible-but-unrepetitive input so no level degenerates to stored.
     let mut data = Vec::with_capacity(8 << 20);
@@ -508,6 +510,7 @@ fn l1_streams_with_bounded_buffers() {
     let (_o6, c6) = compress_with_counters(&data, 6);
     let l1 = c1.get("alloc_bytes").copied().unwrap_or(0);
     let l6 = c6.get("alloc_bytes").copied().unwrap_or(0);
+    eprintln!("alloc_bytes on the 8 MiB stdin fixture: L1={l1} L6={l6}");
     assert!(l6 > 0, "L6 must report alloc_bytes (streaming baseline)");
     assert!(
         l1 <= l6 * 2,
