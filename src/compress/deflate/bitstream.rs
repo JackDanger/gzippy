@@ -28,17 +28,20 @@ pub struct BitWriter {
     /// Number of valid bits currently held in `bitbuf` (0..=BITBUF_NBITS).
     bitcount: u32,
     out: Vec<u8>,
-    /// Whether [`align_to_byte`](Self::align_to_byte) was ever called on this
-    /// stream. Every stored (BTYPE=00) block byte-aligns its LEN/NLEN fields
-    /// relative to the START of this writer's stream, so a stream where this is
-    /// set cannot be bit-shifted to a new bit offset without corrupting those
-    /// alignments — the T>1 bit-splicer must place it byte-aligned instead.
-    /// Both stored-block emitters (`deflate::write_stored_subblock` and
-    /// `parse::ultra::deflate::add_non_compressed_block`) call `align_to_byte`,
-    /// and nothing else on the encode path does, so this flag is exactly
-    /// "this chunk contains a stored block".
-    align_sensitive: bool,
 }
+
+// LAYOUT IS LOAD-BEARING (bisect receipt, 2026-08-03). This struct sits on the
+// T1 hot path at every level, and the first bit-splice substrate added an
+// `align_sensitive: bool` field here plus a store in `align_to_byte()`. That
+// alone — with the splicer never running — moved armexe.elf L1/T1 from ratio
+// 0.576 to 0.615 wall vs gzip on the frozen Zen2 box (3-arm bisect: pristine
+// main / substrate-only / full branch = 0.576 / 0.615 / 0.612; fulcrum ab
+// paired n=25, artifacts solvency:/root/bs2-*.json). Binary-class files (dense
+// short matches, the most emit calls per byte) pay the most. Stored-block
+// detection for the T>1 splicer therefore lives OFF this struct — a
+// thread-local in `deflate::mod` set by the two cold stored-block emitters —
+// and this struct must stay byte-for-byte as main has it. Do not add fields or
+// hot-method writes here for bookkeeping that can have a cold home.
 
 impl Default for BitWriter {
     fn default() -> Self {
@@ -53,7 +56,6 @@ impl BitWriter {
             bitbuf: 0,
             bitcount: 0,
             out: Vec::new(),
-            align_sensitive: false,
         }
     }
 
@@ -69,15 +71,7 @@ impl BitWriter {
             bitbuf: 0,
             bitcount: 0,
             out,
-            align_sensitive: false,
         }
-    }
-
-    /// Whether this stream contains any byte-alignment-sensitive structure
-    /// (i.e. [`align_to_byte`](Self::align_to_byte) ran — see the field doc).
-    #[inline]
-    pub fn is_align_sensitive(&self) -> bool {
-        self.align_sensitive
     }
 
     /// Number of complete bytes already flushed to the sink. Diagnostics
@@ -247,7 +241,6 @@ impl BitWriter {
     /// remaining `< 8` pending bits as one zero-padded byte directly.
     #[inline]
     pub fn align_to_byte(&mut self) {
-        self.align_sensitive = true;
         self.flush_bits();
         if self.bitcount > 0 {
             debug_assert!(self.bitcount < 8);
@@ -642,17 +635,6 @@ mod tests {
                 "pad wrong at {nbits} bits"
             );
         }
-    }
-
-    /// `align_to_byte` is the one alignment-sensitivity tripwire: fresh
-    /// writers are insensitive, and both stored-block emitters run through it.
-    #[test]
-    fn align_sensitivity_flag() {
-        let mut w = BitWriter::new();
-        w.add_bits(0x15, 5);
-        assert!(!w.is_align_sensitive());
-        w.align_to_byte();
-        assert!(w.is_align_sensitive());
     }
 
     #[test]

@@ -200,11 +200,15 @@ pub fn encode_deflate_segment_to_sink(
 ///   (BTYPE=00) block. Stored LEN/NLEN byte-alignment is relative to the
 ///   fragment's own start, so such a fragment must be placed byte-aligned:
 ///   the splicer re-creates the old-style seam at that one boundary instead
-///   of shifting the fragment. Detection is structural — the [`BitWriter`]
-///   records whether `align_to_byte` ever ran — so EVERY stored emitter
-///   (the parser's stored-escape, `emit_stored_block`, ultra's
-///   `add_non_compressed_block`) is covered without threading a flag through
-///   each parse path.
+///   of shifting the fragment. Detection is [`STORED_BLOCK_EMITTED`], a
+///   thread-local set by the two cold stored-block emitters
+///   ([`write_stored_subblock`], which the parser's stored-escape and
+///   `emit_stored_block` both route through, and ultra's
+///   `add_non_compressed_block`) — NOT a field on [`BitWriter`]: the first
+///   version put it there and eroded T1 wall broadly (see the layout note in
+///   `bitstream.rs`). Emission always happens on the thread running this
+///   function (ultra's scoped threads squeeze LZ77 stores and join BEFORE
+///   `add_lz77_block` writes bits), so reset-encode-read here is race-free.
 ///
 /// The final chunk (`is_last`) still sets BFINAL on its last block; its
 /// trailing pad, if any, is reported like any other so the splicer can shift
@@ -217,6 +221,7 @@ pub fn encode_deflate_splice_chunk_to_sink(
     out: &mut Vec<u8>,
     parallel: bool,
 ) -> bitstream::ChunkMeta {
+    STORED_BLOCK_EMITTED.with(|f| f.set(false));
     let mut bw = BitWriter::from_vec(std::mem::take(out));
 
     if dict.is_empty() {
@@ -251,13 +256,46 @@ pub fn encode_deflate_splice_chunk_to_sink(
         );
     }
 
-    let needs_alignment = bw.is_align_sensitive();
+    let needs_alignment = STORED_BLOCK_EMITTED.with(|f| f.get());
     let (bytes, pad_bits) = bw.finish_unaligned();
     *out = bytes;
     bitstream::ChunkMeta {
         pad_bits,
         needs_alignment,
     }
+}
+
+thread_local! {
+    /// Set whenever a stored (BTYPE=00) block is emitted on this thread; the
+    /// T>1 splice-chunk encoder resets it before encoding and reads it after,
+    /// because a fragment containing a stored block byte-aligns LEN/NLEN
+    /// relative to its own start and therefore cannot be bit-shifted by the
+    /// writer-thread splicer.
+    ///
+    /// WHY A THREAD-LOCAL AND NOT A `BitWriter` FIELD (bisect receipt,
+    /// 2026-08-03): the first substrate version carried this as
+    /// `align_sensitive: bool` on `BitWriter` with a store in
+    /// `align_to_byte()`. `BitWriter` is on the T1 hot path at every level,
+    /// and that change ALONE (splicer never invoked) moved armexe.elf L1/T1
+    /// from wall ratio 0.576 to 0.615 vs gzip on the frozen Zen2 box. The two
+    /// set-sites here are per-STORED-BLOCK cold paths (a TLS store apiece),
+    /// and the reset/read run once per T>1 chunk — nothing on the per-token
+    /// emit path is touched.
+    ///
+    /// Correctness relies on emission being single-threaded per chunk: both
+    /// set-sites ([`write_stored_subblock`] and ultra's
+    /// `add_non_compressed_block`) run on the thread that called
+    /// [`encode_deflate_splice_chunk_to_sink`] (ultra's scoped threads
+    /// produce LZ77 stores and join before any bit is written).
+    static STORED_BLOCK_EMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Cold set-site hook for [`STORED_BLOCK_EMITTED`]. `pub(crate)` so ultra's
+/// direct stored-block emitter (`add_non_compressed_block`, which bypasses
+/// [`emit_stored_block`]) can report too.
+#[inline]
+pub(crate) fn note_stored_block_emitted() {
+    STORED_BLOCK_EMITTED.with(|f| f.set(true));
 }
 
 /// Shared parse core: encode `buf[data_start..in_end]` into `bw`, treating
@@ -960,6 +998,12 @@ fn write_stored_subblock(bw: &mut BitWriter, sub: &[u8], bfinal: bool) {
     // `emit_stored_block` -> here, so counting there too would double-count)
     // reconciles exactly against the token-level count on every path.
     crate::anatomy_count!(blocks_emitted_stored);
+    // Same single-site property makes this the right hook for the T>1
+    // splicer's stored-block tripwire (see `STORED_BLOCK_EMITTED`): one cold
+    // TLS store per physical stored block, nothing on the per-token path.
+    // (Ultra's `add_non_compressed_block` is the one emitter that bypasses
+    // this function; it calls `note_stored_block_emitted` itself.)
+    note_stored_block_emitted();
     debug_assert!(sub.len() <= MAX_STORED_SUBBLOCK);
     bw.add_bits(bfinal as u64, 1);
     bw.add_bits(DEFLATE_BLOCKTYPE_UNCOMPRESSED as u64, 2);

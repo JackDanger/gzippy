@@ -202,6 +202,10 @@ fn add_non_compressed_block(
     inend: usize,
     w: &mut BitWriter,
 ) {
+    // The one stored-block emitter that bypasses `deflate::emit_stored_block`;
+    // report to the T>1 splicer's stored-block tripwire (a fragment containing
+    // a stored block must start byte-aligned — see `STORED_BLOCK_EMITTED`).
+    crate::compress::deflate::note_stored_block_emitted();
     let mut pos = instart;
     loop {
         let mut blocksize: u16 = 65535;
