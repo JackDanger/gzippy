@@ -31,6 +31,15 @@
 //!       output. (Equivalent: UPDATE_BLOCK_PINS=1 cargo test --release
 //!       --test block_pins.)
 //!
+//!   cargo run --release --example fingerprint_tool -- pin-t4
+//!       Recompute OUR T4 (-p 4) fingerprints on every fixture x level
+//!       {1,2,6,9} and rewrite tests/fingerprints/ours_t4.tsv AND
+//!       tests/fingerprints/seam_tax.tsv (the derived size_t4 - size_t1 per
+//!       cell — the campaign's T>1 seam class as an exact laptop number).
+//!       Same discipline as pin-ours; a lever that touches T>1 output
+//!       regenerates ours.tsv, ours_t4.tsv and seam_tax.tsv in the same PR.
+//!       (Equivalent: UPDATE_T4_PINS=1 cargo test --release --test t4_pins.)
+//!
 //! Ours is invoked through the REAL binary (GZIPPY_BIN, default
 //! target/release/gzippy) — the shipped quantity, not a library shortcut.
 
@@ -258,6 +267,77 @@ fn block_pins_body(rows: &BTreeMap<(String, u32), Vec<BlockFingerprint>>) -> Str
     s
 }
 
+/// The exact bytes of tests/fingerprints/ours_t4.tsv. MUST stay
+/// byte-identical to `t4_pins_body` in tests/t4_pins.rs — the test's
+/// UPDATE_T4_PINS=1 mode and this tool's pin-t4 write the same file.
+fn t4_pins_body(rows: &BTreeMap<(String, u32), StreamFingerprint>) -> String {
+    let mut s = String::from(
+        "# OUR T4 (-p 4) whole-stream fingerprints on the frozen fixtures, levels\n\
+         # {1,2,6,9}. T>1 output legally differs from T1 (byte-identity is a cage,\n\
+         # not a goal) but it IS deterministic — verified on every regeneration —\n\
+         # so these rows pin the PARALLEL path the way ours.tsv pins each cell.\n\
+         # Regenerate ONLY when a lever intentionally changes output, in the same\n\
+         # PR as ours.tsv (which also carries T4 rows):\n\
+         #   UPDATE_T4_PINS=1 cargo test --release --test t4_pins\n\
+         #   (or: cargo run --release --example fingerprint_tool -- pin-t4)\n",
+    );
+    s.push_str(&tsv_header());
+    for ((f, l), fp) in rows {
+        s.push_str(&tsv_row(f, *l, 4, "gzippy", fp));
+    }
+    s
+}
+
+/// One seam-tax row: the derived T>1 size cost of a cell. MUST stay identical
+/// to `SeamRow` in tests/t4_pins.rs.
+struct SeamRow {
+    size_t1: u64,
+    size_t4: u64,
+    /// size_t4 - size_t1. MAY BE NEGATIVE: the body term is negative on some
+    /// inputs; only the per-chunk framing term is always positive.
+    tax_bytes: i64,
+    members_t1: u32,
+    members_t4: u32,
+    blocks_t1: u32,
+    blocks_t4: u32,
+}
+
+fn seam_row(t1: &StreamFingerprint, t4: &StreamFingerprint) -> SeamRow {
+    let blocks = |fp: &StreamFingerprint| fp.blocks_stored + fp.blocks_fixed + fp.blocks_dynamic;
+    SeamRow {
+        size_t1: t1.file_bytes,
+        size_t4: t4.file_bytes,
+        tax_bytes: t4.file_bytes as i64 - t1.file_bytes as i64,
+        members_t1: t1.members,
+        members_t4: t4.members,
+        blocks_t1: blocks(t1),
+        blocks_t4: blocks(t4),
+    }
+}
+
+/// The exact bytes of tests/fingerprints/seam_tax.tsv. MUST stay
+/// byte-identical to `seam_tax_body` in tests/t4_pins.rs.
+fn seam_tax_body(rows: &BTreeMap<(String, u32), SeamRow>) -> String {
+    let mut s = String::from(
+        "# THE SEAM TAX, pinned: size_t4 - size_t1 per fixture x level {1,2,6,9} —\n\
+         # the campaign's T>1 seam class as an exact laptop number. tax_bytes MAY BE\n\
+         # NEGATIVE (the body term is negative on some inputs; only per-chunk framing\n\
+         # is always positive). A SHRINKING tax is an improvement to bank, not a\n\
+         # failure to silence. Regenerate ONLY when a lever intentionally changes\n\
+         # output:\n\
+         #   UPDATE_T4_PINS=1 cargo test --release --test t4_pins\n\
+         #   (or: cargo run --release --example fingerprint_tool -- pin-t4)\n\
+         fixture\tlevel\tsize_t1\tsize_t4\ttax_bytes\tmembers_t1\tmembers_t4\tblocks_t1\tblocks_t4\n",
+    );
+    for ((f, l), r) in rows {
+        s.push_str(&format!(
+            "{f}\t{l}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            r.size_t1, r.size_t4, r.tax_bytes, r.members_t1, r.members_t4, r.blocks_t1, r.blocks_t4
+        ));
+    }
+    s
+}
+
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
@@ -475,9 +555,40 @@ fn main() {
             std::fs::write(&path, body).unwrap();
             println!("wrote {path} ({} cells, {n} block rows)", rows.len());
         }
+        "pin-t4" => {
+            let ours = ours_fingerprints();
+            let mut t4_rows = BTreeMap::new();
+            let mut seam_rows = BTreeMap::new();
+            for &fixture in fixtures::NAMES {
+                for &level in LEVELS {
+                    let t1 = &ours[&(fixture.to_string(), level, 1, "gzippy".into())];
+                    let t4 = &ours[&(fixture.to_string(), level, 4, "gzippy".into())];
+                    if t1 == t4 {
+                        eprintln!(
+                            "note: {fixture} L{level} T1==T4 byte-identical — either the T>1 \
+                             route did not engage (the stdin trap: verify with a file input) \
+                             or seams have been eliminated (the bit-splice goal). Know which."
+                        );
+                    }
+                    t4_rows.insert((fixture.to_string(), level), t4.clone());
+                    seam_rows.insert((fixture.to_string(), level), seam_row(t1, t4));
+                }
+            }
+            std::fs::create_dir_all(PIN_DIR).unwrap();
+            let t4_path = format!("{PIN_DIR}/ours_t4.tsv");
+            std::fs::write(&t4_path, t4_pins_body(&t4_rows)).unwrap();
+            println!("wrote {t4_path} ({} cells)", t4_rows.len());
+            let seam_path = format!("{PIN_DIR}/seam_tax.tsv");
+            std::fs::write(&seam_path, seam_tax_body(&seam_rows)).unwrap();
+            let total: i64 = seam_rows.values().map(|r| r.tax_bytes).sum();
+            println!(
+                "wrote {seam_path} ({} cells, total tax {total:+} B)",
+                seam_rows.len()
+            );
+        }
         other => {
             eprintln!(
-                "usage: fingerprint_tool pin-ours | pin-rivals | ledger | report | blocks <file.gz> | pin-blocks (got '{other}')"
+                "usage: fingerprint_tool pin-ours | pin-rivals | ledger | report | blocks <file.gz> | pin-blocks | pin-t4 (got '{other}')"
             );
             std::process::exit(2);
         }
