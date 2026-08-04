@@ -6,6 +6,13 @@
 pub mod deflate;
 pub mod deflate64;
 pub mod io;
+/// A faithful pure-Rust port of libdeflate's compressor. Not routed into any
+/// shipping path — it exists as a per-decision oracle (see
+/// `examples/ldx_divergence.rs`) and for whole-file byte differentials.
+pub mod ldx;
+/// Per-decision divergence oracle between the shipped encoder and `ldx`.
+/// Tooling only — see `examples/ldx_divergence.rs`.
+pub mod ldx_oracle;
 pub mod optimization;
 pub mod parallel;
 pub mod pipelined;
