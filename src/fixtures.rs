@@ -29,10 +29,21 @@ impl XorShift {
     }
 }
 
-/// Generate a fixture by name. Panics on an unknown name (test-support code;
-/// a typo should fail loudly).
+/// Generate a fixture by name at the standard [`LEN`]. Panics on an unknown
+/// name (test-support code; a typo should fail loudly).
 pub fn generate(name: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(LEN + 128);
+    generate_sized(name, LEN)
+}
+
+/// Generate a fixture by name at an arbitrary `len` — the SAME seeded
+/// generator as [`generate`], run longer or shorter. For any two lengths the
+/// shorter output is a byte-exact prefix of the longer one (each generator
+/// only ever appends), so size-scaling tests (tests/perf_shape.rs) vary ONLY
+/// the input length, never the content class. `generate(name)` ==
+/// `generate_sized(name, LEN)` byte-for-byte; the frozen-hash test below
+/// guards that identity against generator drift.
+pub fn generate_sized(name: &str, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 128);
     match name {
         // Prose-ish: words from a small lexicon, sentence structure, newlines.
         // Match-rich with a wide-ish literal alphabet — the aozora/dickens class.
@@ -47,7 +58,7 @@ pub fn generate(name: &str) -> Vec<u8> {
             ];
             let mut rng = XorShift(0x74657874_00000001);
             let mut words_in_sentence = 0u32;
-            while out.len() < LEN {
+            while out.len() < len {
                 let w = WORDS[(rng.next() % WORDS.len() as u64) as usize];
                 if words_in_sentence == 0 {
                     let mut c = w.as_bytes().to_vec();
@@ -79,7 +90,7 @@ pub fn generate(name: &str) -> Vec<u8> {
             let mut rng = XorShift(0x74616275_00000002);
             let mut id = 100_000u64;
             out.extend_from_slice(b"id,timestamp,region,status,value,flag\n");
-            while out.len() < LEN {
+            while out.len() < len {
                 id += 1;
                 let ts = 1_700_000_000 + (rng.next() % 86_400);
                 let region = (rng.next() % 4) as usize;
@@ -101,7 +112,7 @@ pub fn generate(name: &str) -> Vec<u8> {
         // the length-3 rule says ENABLE and earns real bytes).
         "binary" => {
             let mut rng = XorShift(0x62696e61_00000003);
-            while out.len() < LEN {
+            while out.len() < len {
                 out.extend_from_slice(&[0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]);
                 out.extend_from_slice(&(rng.next() as u32).to_le_bytes());
                 out.extend_from_slice(&((out.len() as u32) ^ 0xdeadbeef).to_le_bytes());
@@ -116,13 +127,13 @@ pub fn generate(name: &str) -> Vec<u8> {
         // blocks, framing dominates).
         "noise" => {
             let mut rng = XorShift(0x6e6f6973_00000004);
-            while out.len() < LEN {
+            while out.len() < len {
                 out.extend_from_slice(&rng.next().to_le_bytes());
             }
         }
         other => panic!("unknown fixture '{other}' (declared: {NAMES:?})"),
     }
-    out.truncate(LEN);
+    out.truncate(len);
     out
 }
 
