@@ -20,10 +20,23 @@
 //!       Per-axis fingerprint diff for every cell we LOSE, worst first, plus
 //!       a class aggregation across cells ("literals moved on 5 cells").
 //!
+//!   cargo run --release --example fingerprint_tool -- blocks <file.gz>
+//!       Print the per-block fingerprint table for one gzip file: index,
+//!       member, btype, final, header/data bits, token counts, span.
+//!
+//!   cargo run --release --example fingerprint_tool -- pin-blocks
+//!       Recompute OUR per-block rows on every fixture x level {1,2,6,9} at
+//!       T1 and rewrite tests/fingerprints/ours_blocks.tsv. Same discipline
+//!       as pin-ours: regenerate ONLY when a lever intentionally changes
+//!       output. (Equivalent: UPDATE_BLOCK_PINS=1 cargo test --release
+//!       --test block_pins.)
+//!
 //! Ours is invoked through the REAL binary (GZIPPY_BIN, default
 //! target/release/gzippy) — the shipped quantity, not a library shortcut.
 
-use gzippy::decompress::block_walker::{fingerprint_gzip, StreamFingerprint};
+use gzippy::decompress::block_walker::{
+    fingerprint_gzip, fingerprint_gzip_blocks, BlockFingerprint, StreamFingerprint,
+};
 use gzippy::fixtures;
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -188,6 +201,61 @@ fn write_pins(path: &str, provenance: &str, rows: &BTreeMap<Cell, StreamFingerpr
     }
     std::fs::write(path, s).unwrap();
     println!("wrote {path} ({} cells)", rows.len());
+}
+
+/// Per-block rows for every fixture x level at T1, through the real binary.
+/// Keyed (fixture, level); T is pinned to 1 — the per-block table is a T1
+/// mechanism instrument (T>1 may legally emit different bytes per run config,
+/// so its block grid is not a stable pin surface).
+fn ours_block_rows() -> BTreeMap<(String, u32), Vec<BlockFingerprint>> {
+    let bin = gzippy_bin();
+    let mut out = BTreeMap::new();
+    for (name, path, data) in staged_fixtures() {
+        for &level in LEVELS {
+            let argv: Vec<String> = vec![
+                bin.clone(),
+                format!("-{level}"),
+                "-p".into(),
+                "1".into(),
+                "-c".into(),
+            ];
+            let gz = run_compressor(&argv, &path)
+                .unwrap_or_else(|| panic!("{bin} failed on {name} L{level} T1"));
+            let (fp, rows) = fingerprint_gzip_blocks(&gz)
+                .unwrap_or_else(|e| panic!("fingerprint {name} L{level} T1: {e}"));
+            assert_eq!(
+                fp.decoded_bytes,
+                data.len() as u64,
+                "decoded size mismatch on {name} L{level} T1 — corrupt stream?"
+            );
+            out.insert((name.to_string(), level), rows);
+        }
+    }
+    out
+}
+
+/// The exact bytes of tests/fingerprints/ours_blocks.tsv. MUST stay
+/// byte-identical to `pins_body` in tests/block_pins.rs — the test's
+/// UPDATE_BLOCK_PINS=1 mode and this tool's pin-blocks write the same file.
+fn block_pins_body(rows: &BTreeMap<(String, u32), Vec<BlockFingerprint>>) -> String {
+    let mut s = String::from(
+        "# OUR per-block fingerprints on the frozen fixtures, levels {1,2,6,9}, T1.\n\
+         # One row per DEFLATE block; any size change names the exact block that\n\
+         # moved. Regenerate ONLY when a lever intentionally changes output:\n\
+         #   UPDATE_BLOCK_PINS=1 cargo test --release --test block_pins\n\
+         #   (or: cargo run --release --example fingerprint_tool -- pin-blocks)\n",
+    );
+    s.push_str(&format!(
+        "fixture\tlevel\t{}\n",
+        BlockFingerprint::TSV_FIELDS.join("\t")
+    ));
+    for ((f, l), blocks) in rows {
+        for b in blocks {
+            let vals: Vec<String> = b.tsv_values().iter().map(|v| v.to_string()).collect();
+            s.push_str(&format!("{f}\t{l}\t{}\n", vals.join("\t")));
+        }
+    }
+    s
 }
 
 fn main() {
@@ -376,9 +444,40 @@ fn main() {
                 println!("no losing cells on the fixture grid.");
             }
         }
+        "blocks" => {
+            let Some(path) = std::env::args().nth(2) else {
+                eprintln!("usage: fingerprint_tool blocks <file.gz>");
+                std::process::exit(2);
+            };
+            let gz = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let (fp, rows) = fingerprint_gzip_blocks(&gz)
+                .unwrap_or_else(|e| panic!("cannot fingerprint {path}: {e}"));
+            println!("{}", BlockFingerprint::TSV_FIELDS.join("\t"));
+            for b in &rows {
+                let vals: Vec<String> = b.tsv_values().iter().map(|v| v.to_string()).collect();
+                println!("{}", vals.join("\t"));
+            }
+            eprintln!(
+                "{}: {} blocks in {} member(s), {} -> {} bytes",
+                path,
+                rows.len(),
+                fp.members,
+                fp.decoded_bytes,
+                fp.file_bytes
+            );
+        }
+        "pin-blocks" => {
+            let rows = ours_block_rows();
+            std::fs::create_dir_all(PIN_DIR).unwrap();
+            let path = format!("{PIN_DIR}/ours_blocks.tsv");
+            let body = block_pins_body(&rows);
+            let n: usize = rows.values().map(|v| v.len()).sum();
+            std::fs::write(&path, body).unwrap();
+            println!("wrote {path} ({} cells, {n} block rows)", rows.len());
+        }
         other => {
             eprintln!(
-                "usage: fingerprint_tool pin-ours | pin-rivals | ledger | report (got '{other}')"
+                "usage: fingerprint_tool pin-ours | pin-rivals | ledger | report | blocks <file.gz> | pin-blocks (got '{other}')"
             );
             std::process::exit(2);
         }
