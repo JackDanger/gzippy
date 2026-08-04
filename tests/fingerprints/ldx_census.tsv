@@ -1,0 +1,35 @@
+# ldx_census.tsv — per-class divergence census of the shipped T1 encoder vs the
+# exact libdeflate port (src/compress/ldx/), via the oracle in
+# src/compress/ldx_oracle.rs.
+#
+# Grid: src/fixtures.rs synthetic fixtures x levels {1, 2, 6, 9} at T1.
+# Levels 2/6/9 are byte-tie levels: their rows pin divergence == 0.
+# ours_bytes / ldx_bytes are raw DEFLATE stream sizes (no gzip framing).
+# first_pos is the uncompressed position of the first divergent decision
+# ('-' when the token streams are decision-identical).
+#
+# These are SNAPSHOT pins, not aspirations. We need NOT converge to
+# libdeflate's parse — the goal is size <= theirs, not identity — and a
+# changed census is not automatically bad. The pin exists so that
+# parse-structure movement is DELIBERATE and visible in the diff of this
+# file, reviewed next to the size delta it bought.
+#
+# Regenerate after an intentional change (commit the diff in the same PR):
+#   UPDATE_LDX_CENSUS=1 cargo test --release --test ldx_census
+fixture	level	first_pos	total_divergent	we_literal_they_match	we_match_they_literal	both_match_different_len	both_match_different_dist	misaligned_starts	block_boundary	ours_bytes	ldx_bytes
+text	1	14	205756	27308	377	14616	7181	156235	39	373196	359332
+text	2	-	0	0	0	0	0	0	0	348841	348841
+text	6	-	0	0	0	0	0	0	0	322092	322092
+text	9	-	0	0	0	0	0	0	0	306737	306737
+tabular	1	20	185345	25720	9129	5120	4932	140422	22	298077	306208
+tabular	2	-	0	0	0	0	0	0	0	281308	281308
+tabular	6	-	0	0	0	0	0	0	0	247827	247827
+tabular	9	-	0	0	0	0	0	0	0	236183	236183
+binary	1	69	59233	3736	12629	2147	3112	37579	30	666974	673068
+binary	2	-	0	0	0	0	0	0	0	666094	666094
+binary	6	-	0	0	0	0	0	0	0	651535	651535
+binary	9	-	0	0	0	0	0	0	0	637063	637063
+noise	1	65536	45	0	0	0	0	0	45	1048736	1048661
+noise	2	-	0	0	0	0	0	0	0	1048666	1048666
+noise	6	-	0	0	0	0	0	0	0	1048666	1048666
+noise	9	-	0	0	0	0	0	0	0	1048666	1048666
