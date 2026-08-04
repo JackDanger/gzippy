@@ -595,6 +595,47 @@ mod tests {
         assert_eq!(total, payload.len() as u64);
     }
 
+    /// The per-block rows must fold back to the whole-stream aggregate on
+    /// every shared axis, and be contiguous in index/span space. This is the
+    /// contract `tests/block_pins.rs` leans on: a per-block diff and a
+    /// whole-stream diff can never disagree.
+    #[test]
+    fn block_rows_fold_to_stream_fingerprint() {
+        let payload: Vec<u8> = (0..60_000u32)
+            .map(|i| (i.wrapping_mul(0x9e37) >> 6) as u8)
+            .collect();
+        let gz = gzip_at_level(&payload, 6);
+        let (fp, rows) = fingerprint_gzip_blocks(&gz).unwrap();
+        assert_eq!(fp, fingerprint_gzip(&gz).unwrap());
+        assert!(!rows.is_empty());
+        assert_eq!(
+            rows.iter().map(|r| r.header_bits).sum::<u64>(),
+            fp.header_bits
+        );
+        assert_eq!(rows.iter().map(|r| r.data_bits).sum::<u64>(), fp.data_bits);
+        assert_eq!(rows.iter().map(|r| r.literals).sum::<u64>(), fp.literals);
+        assert_eq!(rows.iter().map(|r| r.matches).sum::<u64>(), fp.matches);
+        assert_eq!(
+            rows.iter().map(|r| r.span_bytes).sum::<u64>(),
+            fp.decoded_bytes
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.is_final).count() as u32,
+            fp.members,
+            "exactly one BFINAL block per member"
+        );
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(r.block_index, i as u32, "block_index is the row index");
+        }
+        // TSV round-trip is lossless.
+        for r in &rows {
+            assert_eq!(
+                BlockFingerprint::from_tsv_values(&r.tsv_values()).as_ref(),
+                Some(r)
+            );
+        }
+    }
+
     #[test]
     fn jsonl_writer_emits_lines() {
         let gz = gzip_at_level(b"hello world", 6);
@@ -762,14 +803,119 @@ impl StreamFingerprint {
     }
 }
 
+/// One row of the per-block fingerprint table. The whole-stream
+/// [`StreamFingerprint`] localizes a size change to a FILE; these rows
+/// localize it to the exact BLOCK that moved. Axes mirror the aggregate:
+/// header vs data bits (entropy coding), literal/match counts (parse), and
+/// the uncompressed span (block boundaries — a boundary shift shows up as
+/// span-length changes cascading from the first moved block onward).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockFingerprint {
+    /// Block index within the whole FILE (monotone across members).
+    pub block_index: u32,
+    /// gzip member this block belongs to (0-based).
+    pub member_index: u32,
+    /// BTYPE: 0=stored, 1=fixed-Huffman, 2=dynamic-Huffman.
+    pub btype: u8,
+    /// BFINAL flag of this block.
+    pub is_final: bool,
+    /// Bits spent on this block's header (3-bit prelude + stored LEN/NLEN
+    /// incl. alignment, or the whole dynamic Huffman table description).
+    pub header_bits: u64,
+    /// Bits spent on this block's symbol data.
+    pub data_bits: u64,
+    /// Literal tokens emitted by this block.
+    pub literals: u64,
+    /// Match tokens emitted by this block.
+    pub matches: u64,
+    /// Uncompressed bytes this block decodes to (the block's span).
+    pub span_bytes: u64,
+}
+
+impl BlockFingerprint {
+    /// Stable TSV column order for the per-block pin file
+    /// (`tests/fingerprints/ours_blocks.tsv`). `from_tsv_values` accepts
+    /// exactly this shape.
+    pub const TSV_FIELDS: &'static [&'static str] = &[
+        "block",
+        "member",
+        "btype",
+        "final",
+        "header_bits",
+        "data_bits",
+        "literals",
+        "matches",
+        "span_bytes",
+    ];
+
+    pub fn tsv_values(&self) -> Vec<u64> {
+        vec![
+            self.block_index as u64,
+            self.member_index as u64,
+            self.btype as u64,
+            self.is_final as u64,
+            self.header_bits,
+            self.data_bits,
+            self.literals,
+            self.matches,
+            self.span_bytes,
+        ]
+    }
+
+    pub fn from_tsv_values(vals: &[u64]) -> Option<Self> {
+        if vals.len() != Self::TSV_FIELDS.len() {
+            return None;
+        }
+        Some(Self {
+            block_index: vals[0] as u32,
+            member_index: vals[1] as u32,
+            btype: vals[2] as u8,
+            is_final: vals[3] != 0,
+            header_bits: vals[4],
+            data_bits: vals[5],
+            literals: vals[6],
+            matches: vals[7],
+            span_bytes: vals[8],
+        })
+    }
+
+    /// Differing axes vs another row: (axis, self_value, other_value).
+    /// Row-identity fields (`block`) are included so an index drift is
+    /// visible too; order is the TSV order (structural axes first would
+    /// hide which one is which).
+    pub fn diff(&self, other: &Self) -> Vec<(&'static str, u64, u64)> {
+        let a = self.tsv_values();
+        let b = other.tsv_values();
+        Self::TSV_FIELDS
+            .iter()
+            .zip(a.iter().zip(b.iter()))
+            .filter(|(_, (x, y))| x != y)
+            .map(|(f, (x, y))| (*f, *x, *y))
+            .collect()
+    }
+}
+
 /// Fingerprint a complete gzip file (multi-member aware). Exact bit-level
 /// walk of every DEFLATE block; no output is materialized.
+///
+/// This is the aggregate view of [`fingerprint_gzip_blocks`]; the two can
+/// never disagree because this one is defined as the fold of the other.
 pub fn fingerprint_gzip(gz: &[u8]) -> std::io::Result<StreamFingerprint> {
+    fingerprint_gzip_blocks(gz).map(|(fp, _)| fp)
+}
+
+/// Fingerprint a complete gzip file AND return the per-block rows the
+/// aggregate is folded from. Same exact bit-level walk as
+/// [`fingerprint_gzip`]; observer-only, never on the shipped decode path.
+pub fn fingerprint_gzip_blocks(
+    gz: &[u8],
+) -> std::io::Result<(StreamFingerprint, Vec<BlockFingerprint>)> {
     let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     let mut fp = StreamFingerprint {
         file_bytes: gz.len() as u64,
         ..Default::default()
     };
+    let mut rows: Vec<BlockFingerprint> = Vec::new();
     let mut off = 0usize;
     while off < gz.len() {
         if gz.len() - off < 18 || gz[off] != 0x1f || gz[off + 1] != 0x8b || gz[off + 2] != 0x08 {
@@ -805,6 +951,13 @@ pub fn fingerprint_gzip(gz: &[u8]) -> std::io::Result<StreamFingerprint> {
             let start_bit = bits.bit_pos;
             let bfinal = bits.read(1) as u8;
             let btype = bits.read(2) as u8;
+            // Snapshot the aggregate axes so this block's contribution is
+            // the delta — the per-block rows fold back to the aggregate by
+            // construction.
+            let header_bits_before = fp.header_bits;
+            let data_bits_before = fp.data_bits;
+            let literals_before = fp.literals;
+            let matches_before = fp.matches;
             let mut observe = |len: u16, dist: u16| {
                 if len == 0 {
                     fp.literals += 1;
@@ -873,6 +1026,17 @@ pub fn fingerprint_gzip(gz: &[u8]) -> std::io::Result<StreamFingerprint> {
                 fp.empty_blocks += 1;
             }
             fp.decoded_bytes += decoded as u64;
+            rows.push(BlockFingerprint {
+                block_index: rows.len() as u32,
+                member_index: fp.members,
+                btype,
+                is_final: bfinal == 1,
+                header_bits: fp.header_bits - header_bits_before,
+                data_bits: fp.data_bits - data_bits_before,
+                literals: fp.literals - literals_before,
+                matches: fp.matches - matches_before,
+                span_bytes: decoded as u64,
+            });
             if bfinal == 1 {
                 break;
             }
@@ -885,5 +1049,5 @@ pub fn fingerprint_gzip(gz: &[u8]) -> std::io::Result<StreamFingerprint> {
         }
         fp.members += 1;
     }
-    Ok(fp)
+    Ok((fp, rows))
 }
