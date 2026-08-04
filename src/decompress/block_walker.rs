@@ -393,6 +393,108 @@ pub fn walk_deflate_tokens(
     }
 }
 
+/// Per-block Huffman code lengths plus exact bit spans — the inputs needed to
+/// cost any token of that block from its REAL tables (litlen/dist code length
+/// + extra bits), which is what turns a token-stream diff into an exact bit
+/// accounting. Consumed by `crate::compress::ldx_oracle::account` and
+/// `examples/divergence_accounting.rs`. Observer-only; never on the shipped
+/// decode path.
+///
+/// `start_bit..body_start_bit` is the header (3-bit prelude plus the dynamic
+/// table description, or the stored block's alignment + LEN/NLEN);
+/// `body_start_bit..end_bit` is the symbol data. For BTYPE=1 the arrays hold
+/// the RFC 1951 fixed lengths; for BTYPE=0 they are all zero (stored bytes
+/// cost exactly 8 bits each).
+#[derive(Debug, Clone)]
+pub struct BlockLens {
+    pub start_bit: u64,
+    pub body_start_bit: u64,
+    pub end_bit: u64,
+    /// BTYPE: 0=stored, 1=fixed-Huffman, 2=dynamic-Huffman.
+    pub btype: u8,
+    pub is_final: bool,
+    pub litlen: [u8; 288],
+    pub dist: [u8; 32],
+}
+
+/// Walk a RAW DEFLATE stream (RFC 1951, no gzip framing) and return every
+/// block's [`BlockLens`]. Bit-exact: the same walk as
+/// [`walk_deflate_tokens`], sharing [`decode_block_body`] /
+/// [`parse_dynamic_header`] so no second decode loop exists to rot.
+pub fn walk_deflate_block_lens(deflate: &[u8]) -> std::io::Result<Vec<BlockLens>> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let mut bits = BitWalker {
+        buf: deflate,
+        bit_pos: 0,
+    };
+    let mut blocks = Vec::new();
+    loop {
+        if (bits.bit_pos / 8) as usize >= deflate.len() {
+            return Err(bad("truncated deflate stream (no final block)"));
+        }
+        let start_bit = bits.bit_pos;
+        let bfinal = bits.read(1) as u8;
+        let btype = bits.read(2) as u8;
+        let mut b = BlockLens {
+            start_bit,
+            body_start_bit: 0,
+            end_bit: 0,
+            btype,
+            is_final: bfinal == 1,
+            litlen: [0u8; 288],
+            dist: [0u8; 32],
+        };
+        match btype {
+            0 => {
+                bits.byte_align();
+                let len = bits.read(16) as usize;
+                let nlen = bits.read(16) as usize;
+                if len != (!nlen & 0xffff) {
+                    return Err(bad("stored block LEN/NLEN mismatch"));
+                }
+                b.body_start_bit = bits.bit_pos;
+                if ((bits.bit_pos / 8) as usize) + len > deflate.len() {
+                    return Err(bad("truncated stored block"));
+                }
+                bits.bit_pos += (len as u64) * 8;
+            }
+            1 => {
+                // Fixed litlen/dist lengths from RFC 1951 §3.2.6.
+                for e in b.litlen.iter_mut().take(144) {
+                    *e = 8;
+                }
+                for e in b.litlen.iter_mut().take(256).skip(144) {
+                    *e = 9;
+                }
+                for e in b.litlen.iter_mut().take(280).skip(256) {
+                    *e = 7;
+                }
+                for e in b.litlen.iter_mut().take(288).skip(280) {
+                    *e = 8;
+                }
+                for e in b.dist.iter_mut().take(30) {
+                    *e = 5;
+                }
+                b.body_start_bit = bits.bit_pos;
+                decode_block_body(&mut bits, &b.litlen[..], &b.dist[..30])?;
+            }
+            2 => {
+                let (litlen, dist, _ll, _d) = parse_dynamic_header(&mut bits)?;
+                b.litlen = litlen;
+                b.dist = dist;
+                b.body_start_bit = bits.bit_pos;
+                decode_block_body(&mut bits, &b.litlen[..], &b.dist[..])?;
+            }
+            _ => return Err(bad("reserved BTYPE=11")),
+        }
+        b.end_bit = bits.bit_pos;
+        blocks.push(b);
+        if bfinal == 1 {
+            return Ok(blocks);
+        }
+    }
+}
+
 /// Canonical Huffman lookup: 2^max_bits entries, each (symbol, length).
 /// length == 0 means no code at this key.
 fn build_canonical_lookup(code_lengths: &[u8], max_bits: u8) -> std::io::Result<Vec<(u16, u8)>> {
