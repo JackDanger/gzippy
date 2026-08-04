@@ -416,6 +416,16 @@ panic = "abort"       # Smaller binary, no unwinding overhead
 opt-level = 3         # Maximum optimization
 strip = true          # Remove symbols for smaller binary
 
+# Symbol-visible twin of the SHIPPED release profile, for tests/symbol_canary.rs
+# (the hot-symbol size canary). `strip` is post-link symbol-table removal, so
+# this binary's __text/.text bytes are IDENTICAL to the release binary's — the
+# canary verifies that identity at runtime before trusting any symbol size, so
+# a stale or divergent release-syms build fails closed instead of lying.
+# Nothing ships from this profile.
+[profile.release-syms]
+inherits = "release"
+strip = false
+
 # iai-callgrind requires debug symbols to find its instrumented sentinels;
 # the stripped release profile breaks it. Keep release-grade optimization
 # but retain full debug info for cachegrind output parsing.
