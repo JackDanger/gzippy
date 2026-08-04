@@ -4,11 +4,15 @@
 //! startup, file read, and allocator behaviour — the only difference cachegrind
 //! sees is the encoder itself. Nothing ships from here.
 //!
-//! Known asymmetry, deliberate and conservative: `ours` is the shipped T1 gzip
-//! path (header + crc32 + trailer via `compress_with_threads(_, _, 1)`), while
-//! `ldx` is raw DEFLATE (`compress_for_diff`, no framing, no crc). The ldx
-//! number is therefore a FLOOR for libdeflate's real cost, which makes every
-//! margin pinned against it slightly harder than the true goal, never easier.
+//! Known asymmetry, deliberate: `ours` is the shipped T1 gzip path (header +
+//! crc32 + trailer via `compress_with_threads(_, _, 1)`), while `ldx` is raw
+//! DEFLATE (`compress_for_diff`, no framing, no crc), so the framing term
+//! counts against us. Do NOT read ldx as a stand-in for the libdeflate C
+//! binary's cost: the rustc build of the port spends ~1.5x the Ir of the C
+//! build (trainer, 2026-08-04: text L1 ldx 62.02 Ir/B vs libdeflate-gzip
+//! 40.60 Ir/B — 65.0M vs 42.6M instructions on the 1 MiB fixture). This is a
+//! SAME-TOOLCHAIN algorithm comparison; the real-binary goal is the rival leg
+//! in tests/fingerprints/rivals_ir.tsv.
 fn main() {
     let mut args = std::env::args().skip(1);
     let usage = "usage: ir_runner <ours|ldx> <level> <file>";

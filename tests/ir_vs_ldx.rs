@@ -14,7 +14,10 @@
 //!    cachegrind in the same test invocation, so the ratio is same-host,
 //!    same-build, same-startup — host drift cancels. Every pinned margin > 1.0
 //!    is a NAMED OPEN GAP (we spend more Ir than the algorithm we ported);
-//!    margins <= 1.0 are held wins. The ratchet only tightens.
+//!    margins <= 1.0 are held wins. The ratchet only tightens. Beating ldx is
+//!    NOT beating the libdeflate C binary — the rustc build of the port costs
+//!    ~1.5x the C build's Ir (trainer, 2026-08-04) — that harder, real-binary
+//!    goal is leg 2's.
 //!
 //! 2. **ours vs rival binaries** (tests/fingerprints/rivals_ir.tsv): gzip,
 //!    pigz -p1, libdeflate-gzip, igzip, measured end-to-end under cachegrind
@@ -350,8 +353,11 @@ fn update_ldx_pins() {
          # port of libdeflate v1.23, byte-identical L0-L9), as Ir/B under cachegrind.\n\
          # Both engines run through examples/ir_runner.rs on the same host in the same\n\
          # test invocation, so the RATIO is what is pinned and host drift cancels.\n\
-         # ldx runs raw DEFLATE (no gzip framing/crc) — a FLOOR for libdeflate's cost,\n\
-         # so every margin here is slightly HARDER than the true goal, never easier.\n\
+         # ldx runs raw DEFLATE (no gzip framing/crc; that term counts against us).\n\
+         # ldx is NOT the libdeflate C binary's cost: the rustc build of the port\n\
+         # spends ~1.5x the C build's Ir (trainer 2026-08-04, text L1: ldx 62.02 vs\n\
+         # libdeflate-gzip 40.60 Ir/B). Same-toolchain algorithm comparison only;\n\
+         # the real-binary goal is rivals_ir.tsv.\n\
          # margin > 1.0 = NAMED OPEN PERF GAP (goal is <=1.0): do not raise it, close it.\n\
          # margin <= 1.0 = held win; the ratchet only TIGHTENS, in the improving PR.\n\
          # ours_ir_per_b / ldx_ir_per_b are the seed-time absolutes (provenance, not asserted).\n\
