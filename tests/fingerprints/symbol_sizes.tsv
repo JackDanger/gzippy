@@ -1,0 +1,33 @@
+# symbol_sizes.tsv — machine-code sizes of load-bearing hot-path symbols,
+# pinned per target triple. Guarded by tests/symbol_canary.rs (default
+# features): each symbol's current size must be within +/-20% of its pin —
+# a laptop-visible tripwire for accidental inlining/outlining flips, which
+# trigger the layout lottery that erodes wall cells on the frozen boxes.
+# The +/-20% band is a first guess; tune it with experience.
+#
+# Sizes are successive `nm -n` address deltas over the release-syms build
+# (profile `release-syms` = release + strip=false; deterministic — two
+# builds across different target dirs measured byte-identical). The shipped
+# stripped binary's exact layout differs slightly (-C strip reseeds fat-LTO
+# layout; measured same function count, ~10% of boundaries shifted by tens
+# of bytes), so these pins track the deterministic sibling — an inlining
+# flip moves both together. See tests/symbol_canary.rs module doc.
+#
+# Rows exist only for triples pinned on their own box; other triples SKIP.
+# x86_64-unknown-linux-gnu rows should be generated on the trainer box with
+# the same command. Regenerate for the current triple (others preserved):
+#   cargo build --profile release-syms
+#   UPDATE_SYMBOL_SIZES=1 cargo test --release --test symbol_canary
+triple	substring	size	symbol
+aarch64-apple-darwin	MatchFinder>::get_matches	1540	<gzippy::compress::deflate::matchfinder::lzfind::MatchFinder>::get_matches
+aarch64-apple-darwin	build_dynamic_header	1596	gzippy::compress::deflate::huffman::header::build_dynamic_header
+aarch64-apple-darwin	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>	5808	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>
+aarch64-apple-darwin	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>	5896	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>
+aarch64-apple-darwin	deflate_into	7916	gzippy::compress::deflate::deflate_into
+aarch64-apple-darwin	emit_block	3456	gzippy::compress::deflate::parse::emit_block
+aarch64-apple-darwin	emit_sequences	2032	gzippy::compress::deflate::parse::emit_sequences
+aarch64-apple-darwin	greedy::run_resumable	3416	gzippy::compress::deflate::parse::greedy::run_resumable
+aarch64-apple-darwin	lazy::run_resumable	9980	gzippy::compress::deflate::parse::lazy::run_resumable
+aarch64-apple-darwin	make_huffman_code_into	676	gzippy::compress::deflate::huffman::fast::make_huffman_code_into
+aarch64-apple-darwin	optimize_and_flush	7988	<gzippy::compress::deflate::parse::near_optimal::Optimizer>::optimize_and_flush
+aarch64-apple-darwin	parse::fast::run	19396	gzippy::compress::deflate::parse::fast::run::<false>
