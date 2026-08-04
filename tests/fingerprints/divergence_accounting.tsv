@@ -1,0 +1,25 @@
+# divergence_accounting.tsv — EXACT per-class bit attribution of the L1 size
+# gap between the shipped T1 encoder and the exact libdeflate port (ldx),
+# via src/compress/ldx_oracle.rs::account. The deep companion to
+# ldx_census.tsv: the census counts divergent positions, this pins where
+# the bytes go.
+#
+# Grid: {text, tabular, binary} x L1 at T1. All *_bits columns are SIGNED
+# bit deltas (ours - ldx); they sum EXACTLY to gap_bits = 8 x (ours_bytes -
+# ldx_bytes) — the residual-zero invariant in tests/divergence_accounting.rs
+# proves the attribution is exact, not estimated. Classes:
+#   we_lit_they_match / diff_len / diff_dist / we_match_they_lit — bits
+#     spent inside divergent token regions, keyed by the region's first
+#     divergent decision;
+#   table_drift — bits both sides spent on IDENTICAL tokens (pure Huffman
+#     table drift);
+#   headers_eob — block headers + EOB symbols + final-byte padding.
+#
+# SNAPSHOT pins, not aspirations: a moved attribution is not automatically
+# bad (byte-identity to libdeflate is a cage, not an asset); it must merely
+# be deliberate. Regenerate and commit the diff in the same PR:
+#   UPDATE_DIVERGENCE_ACCOUNTING=1 cargo test --release --test divergence_accounting
+fixture	level	ours_bytes	ldx_bytes	gap_bits	we_lit_they_match	diff_len	diff_dist	we_match_they_lit	table_drift	headers_eob
+text	1	373196	359332	110912	57397	31304	12647	-775	14138	-3799
+tabular	1	298077	306208	-65048	-89290	9564	4822	8323	1535	-2
+binary	1	666974	673068	-48752	-15889	5104	17636	-59269	3386	280
