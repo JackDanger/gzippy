@@ -7,6 +7,10 @@
 # - Zopfli corpus oracle (byte-for-byte vs vendored C zopfli)
 # - Integration suite on the built binary (edge cases, large files, multi-member,
 #   cross-tool gzip/pigz, CRC/ISIZE/truncation integrity, filesystem edge cases)
+# - Anatomy pin suites (anatomy-counters feature) + symbol canary (#260 — the
+#   feature-gated suites CI used to skip entirely) — REQUIRED via `build`
+# - Ir ratchets under valgrind — INFORMATIONAL (trainer-pinned absolutes are
+#   not portable to shared runners; see that job's header)
 # - Lint (fmt, clippy, version consistency)
 #
 # Performance benchmarks + perf guards live in benchmarks.yml (nightly cron +
@@ -352,6 +356,124 @@ jobs:
           diff /tmp/fs/so.txt /tmp/fs/so.out
           echo "filesystem edge cases OK"
 
+  # ===========================================================================
+  # Feature-gated suites (#260). A third of the repo's test product was
+  # invisible to this gate because CI never built its features:
+  # fast_path_reconciliation_invariants failed on main for weeks, silently,
+  # until found by hand (#254). One job per feature flavor closes the class.
+  #
+  # anatomy-counters: the 724+ pin rows (anatomy_pins, startup_cost,
+  # perf_shape ceilings) plus the closed-loop reconciliation suite
+  # (anatomy_counters). Counters are exact semantic work volume — the pin
+  # files' own contract is "same input, same level, same counts, on every
+  # platform" — so one Linux x86_64 + one macOS arm64 runner cover both
+  # arches. DELIBERATELY no isal-compression here: that feature routes T1
+  # L0-L3 through ISA-L in the spawned binary, which would zero the pure-Rust
+  # encoder counters the reconciliation test reads; the pins were generated
+  # against the pure-encoder flavor this job builds.
+  #
+  # symbol_canary rides along (default features, no anatomy build): it grades
+  # hot-symbol sizes from the release-syms twin on pinned triples
+  # (aarch64-apple-darwin today) and self-skips with a notice on unpinned
+  # ones — the Linux leg builds the twin so future x86_64 pins grade here
+  # with no workflow change.
+  # ===========================================================================
+  anatomy:
+    name: Anatomy & canary ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.os }}-${{ matrix.arch }}-anatomy-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Anatomy pin suites (anatomy-counters flavor)
+        run: >
+          cargo test --release --features gzippy-native,anatomy-counters
+          --test anatomy_pins --test anatomy_counters
+          --test perf_shape --test startup_cost
+
+      - name: Symbol canary (release-syms twin, default features)
+        run: |
+          cargo build --profile release-syms
+          cargo test --release --test symbol_canary -- --nocapture
+
+  # ===========================================================================
+  # Ir ratchets under valgrind (#260) — INFORMATIONAL, on purpose. Not in the
+  # `build` aggregate and continue-on-error, because the pins are not portable
+  # to shared runners:
+  #   * ir_budget.tsv pins ABSOLUTE Ir/B measured on trainer (i7-13700T),
+  #     TOLERANCE 1.03, and its own header says "re-calibrate before porting
+  #     these budgets to a new arch". Shared runners land on varying
+  #     Intel/AMD parts and the encoder runtime-dispatches on CPUID
+  #     (BMI2/AVX2), so the executed instruction stream — and therefore Ir —
+  #     is CPU-dependent; a different rustc shifts codegen a few % more. The
+  #     suites have no assert-disabled report mode, so the JOB is the
+  #     informational layer; loosening the pin tolerance instead would
+  #     silently weaken the trainer ratchet and is refused.
+  #   * ir_vs_ldx leg 1 is a same-host same-build RATIO (host drift cancels)
+  #     but its 1.02 tolerance still assumes one toolchain's codegen; leg 2's
+  #     rival rows self-skip unless the runner's rival versions match the
+  #     trainer pins exactly.
+  # Read a red X here as "re-measure on trainer", never as a merge verdict;
+  # green is corroboration, not certification. If this job proves stably
+  # green across runner generations, promoting it to required is a one-line
+  # change to the `build` aggregate below.
+  # ===========================================================================
+  valgrind-ir:
+    name: Ir ratchets (valgrind, informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-x86_64-valgrind-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Ir budgets + ours-vs-ldx margins
+        run: cargo test --release --test ir_budget --test ir_vs_ldx -- --nocapture
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -404,17 +526,21 @@ jobs:
   # on this one name, immune to matrix/job renames. It passes only if every
   # upstream job succeeded.
   # ---------------------------------------------------------------------------
+  # `anatomy` is required (#260: a pin suite that never runs in the gate is a
+  # doc with worse ergonomics); `valgrind-ir` is deliberately absent — see its
+  # header for why it stays informational.
   build:
     name: build
     runs-on: ubuntu-latest
-    needs: [test, integration, lint]
+    needs: [test, integration, anatomy, lint]
     if: always()
     steps:
       - name: Require all CI jobs to have succeeded
         run: |
-          echo "test=${{ needs.test.result }} integration=${{ needs.integration.result }} lint=${{ needs.lint.result }}"
+          echo "test=${{ needs.test.result }} integration=${{ needs.integration.result }} anatomy=${{ needs.anatomy.result }} lint=${{ needs.lint.result }}"
           if [ "${{ needs.test.result }}" != "success" ] \
           || [ "${{ needs.integration.result }}" != "success" ] \
+          || [ "${{ needs.anatomy.result }}" != "success" ] \
           || [ "${{ needs.lint.result }}" != "success" ]; then
             echo "::error::One or more required CI jobs did not succeed."
             exit 1
