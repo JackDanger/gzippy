@@ -21,7 +21,7 @@ use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
 use super::encode_types::{BlockRole, HeaderBudget, InputMode};
 use super::huffman::{
     build_dynamic_header, make_huffman_code, make_huffman_code_exact_into, make_huffman_code_into,
-    CodeScratch, HeaderScratch, HuffmanCode,
+    CodeScratch, DynamicHeader, HeaderScratch, HuffmanCode,
 };
 use super::level::{LevelParams, Strategy};
 use super::matchfinder::hc::WINDOW_SIZE;
@@ -953,20 +953,86 @@ fn emit_block(
             // unconditionally would both pay for work T1 must not pay for and read
             // `alt_*code` scratch that was never filled. Strict `<` keeps the heuristic on
             // ties, so a tie emits today's bytes.
+            //
+            // At T>1 with RLE shaping enabled, also try package-merge on the SAME shaped
+            // histogram the heuristic used (`build_lit`/`build_off`). True-frequency
+            // exact and shaped-frequency exact are both costed with true token counts;
+            // take the cheaper. T1 never shapes, so only the true-frequency arm runs.
             let (header, dynamic_bits) = if try_exact {
-                let exact_header =
+                let exact_header_true =
                     build_dynamic_header(&alt_litcode.lens, &alt_offcode.lens, alt_header);
-                let exact_bits = 3
-                    + exact_header.header_bits()
+                let exact_bits_true = 3
+                    + exact_header_true.header_bits()
                     + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, alt_litcode, alt_offcode);
-                if exact_bits < heur_bits {
-                    crate::anatomy_count!(huffman_exact_code_chosen);
-                    std::mem::swap(litcode, alt_litcode);
-                    std::mem::swap(offcode, alt_offcode);
-                    (exact_header, exact_bits)
+
+                enum Pick<'a> {
+                    Heuristic(DynamicHeader<'a>, u64),
+                    ExactTrue(DynamicHeader<'a>, u64),
+                    ExactShaped(DynamicHeader<'a>, u64),
+                }
+
+                let mut pick = if exact_bits_true < heur_bits {
+                    Pick::ExactTrue(exact_header_true, exact_bits_true)
                 } else {
-                    drop(exact_header);
-                    (heur_header, heur_bits)
+                    drop(exact_header_true);
+                    Pick::Heuristic(heur_header, heur_bits)
+                };
+
+                if shaped.is_some() {
+                    make_huffman_code_exact_into(
+                        &mut shape.cand_litcode,
+                        DEFLATE_NUM_LITLEN_SYMS,
+                        MAX_LITLEN_CODEWORD_LEN,
+                        build_lit,
+                    );
+                    make_huffman_code_exact_into(
+                        &mut shape.cand_offcode,
+                        DEFLATE_NUM_OFFSET_SYMS,
+                        MAX_OFFSET_CODEWORD_LEN,
+                        build_off,
+                    );
+                    let exact_header_shaped = build_dynamic_header(
+                        &shape.cand_litcode.lens,
+                        &shape.cand_offcode.lens,
+                        &mut shape.raw_header,
+                    );
+                    let exact_bits_shaped = 3
+                        + exact_header_shaped.header_bits()
+                        + cost_from_freqs(
+                            &litlen_freqs,
+                            &sink.offset_freqs,
+                            &shape.cand_litcode,
+                            &shape.cand_offcode,
+                        );
+                    let better = match &pick {
+                        Pick::Heuristic(_, b) | Pick::ExactTrue(_, b) | Pick::ExactShaped(_, b) => {
+                            exact_bits_shaped < *b
+                        }
+                    };
+                    if better {
+                        if let Pick::ExactTrue(h, _) | Pick::ExactShaped(h, _) = pick {
+                            drop(h);
+                        }
+                        pick = Pick::ExactShaped(exact_header_shaped, exact_bits_shaped);
+                    } else {
+                        drop(exact_header_shaped);
+                    }
+                }
+
+                match pick {
+                    Pick::Heuristic(h, b) => (h, b),
+                    Pick::ExactTrue(h, b) => {
+                        crate::anatomy_count!(huffman_exact_code_chosen);
+                        std::mem::swap(litcode, alt_litcode);
+                        std::mem::swap(offcode, alt_offcode);
+                        (h, b)
+                    }
+                    Pick::ExactShaped(h, b) => {
+                        crate::anatomy_count!(huffman_exact_code_chosen);
+                        std::mem::swap(litcode, &mut shape.cand_litcode);
+                        std::mem::swap(offcode, &mut shape.cand_offcode);
+                        (h, b)
+                    }
                 }
             } else {
                 (heur_header, heur_bits)
