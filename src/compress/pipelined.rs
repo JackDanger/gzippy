@@ -261,30 +261,45 @@ impl PipelinedGzEncoder {
             return Ok(0);
         }
         if self.num_threads > 1
-            && self.compression_level == 8
+            && (self.compression_level == 8 || self.compression_level == 9)
             && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
         {
-            // L8 T>1: the pipelined chunk grid pays a seam tax on tabular/text
+            // L8/L9 T>1: the pipelined chunk grid pays a seam tax on tabular/text
             // inputs (per-chunk `skip_bytes` dict seed + forced block restarts) that
-            // a continuous `ParseState` path avoids — but that whole-file path
-            // regresses a few already-passing binary cells. Pick the smaller of the
-            // two gzip outputs (monotone non-worse vs chunked main by construction).
+            // a continuous `ParseState` path avoids — but the parallel-knob whole-file
+            // path regresses a few already-passing binary cells. A third T1-knob
+            // continuous candidate ties libdeflate on the tabular cells where the seam
+            // tax equals the gap exactly (e.g. data.csv L9). Pick the smallest gzip
+            // of the three (monotone non-worse vs chunked main by construction).
+            let level = self.compression_level;
+            let header = self.gzip_header_bytes();
+
             let mut chunked = Vec::new();
             self.compress_parallel_pipeline_pure(data, &mut chunked)?;
 
-            let mut whole = Vec::with_capacity(chunked.len());
-            whole.extend_from_slice(&self.gzip_header_bytes());
-            crate::compress::deflate::encode_deflate_stateful_parallel_to_writer(
+            let mut whole_parallel = Vec::with_capacity(chunked.len());
+            whole_parallel.extend_from_slice(&header);
+            crate::compress::deflate::encode_deflate_stateful_to_writer(
                 data,
-                &mut whole,
-                self.compression_level,
+                &mut whole_parallel,
+                level,
+                true,
             )?;
 
-            if whole.len() < chunked.len() {
-                writer.write_all(&whole)?;
-            } else {
-                writer.write_all(&chunked)?;
-            }
+            let mut whole_t1 = Vec::with_capacity(chunked.len());
+            whole_t1.extend_from_slice(&header);
+            crate::compress::deflate::encode_deflate_stateful_to_writer(
+                data,
+                &mut whole_t1,
+                level,
+                false,
+            )?;
+
+            let best = [chunked, whole_parallel, whole_t1]
+                .into_iter()
+                .min_by_key(|v| v.len())
+                .expect("three candidates");
+            writer.write_all(&best)?;
             return Ok(data.len() as u64);
         }
         if self.compression_level == 0 {
