@@ -9,7 +9,7 @@
 fixture	level	size_t1	size_t4	tax_bytes	members_t1	members_t4	blocks_t1	blocks_t4
 binary	1	666379	666475	96	1	1	16	18
 binary	2	666112	665373	-739	1	1	4	4
-binary	6	651553	640695	-10858	1	1	4	4
+binary	6	651553	640694	-10859	1	1	4	4
 binary	9	637081	636010	-1071	1	1	4	4
 noise	1	1048754	1048760	6	1	1	32	32
 noise	2	1048684	1048690	6	1	1	18	18
