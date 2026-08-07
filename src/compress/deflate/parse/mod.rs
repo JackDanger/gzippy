@@ -453,6 +453,7 @@ pub(super) fn compress(
             true,
             fast::LIMIT_HASH_UPDATE_INSERTS_L0,
             fast::Bucket2Cfg::DISABLED,
+            fast::LazyPeekCostGateCfg::DISABLED,
         ),
         // `l1-tune` (2026-07-22 L1-band search campaign, OFF by default):
         // block length and insert-depth are already plain runtime params to
@@ -466,6 +467,10 @@ pub(super) fn compress(
                 enabled: params.fast_bucket2,
                 gate_max_len: params.fast_bucket2_gate_max_len,
             };
+            let cost_gate = fast::LazyPeekCostGateCfg {
+                enabled: params.fast_lazy_peek_cost_gate,
+                margin_bits: params.fast_lazy_peek_cost_margin_bits,
+            };
             fast::run::<false>(
                 buf,
                 data_start,
@@ -477,6 +482,7 @@ pub(super) fn compress(
                 true,
                 fast::LIMIT_HASH_UPDATE_INSERTS_L1,
                 bucket2,
+                cost_gate,
             )
         }
         #[cfg(feature = "l1-tune")]
@@ -485,6 +491,10 @@ pub(super) fn compress(
             let bucket2 = fast::Bucket2Cfg {
                 enabled: params.fast_bucket2,
                 gate_max_len: params.fast_bucket2_gate_max_len,
+            };
+            let cost_gate = fast::LazyPeekCostGateCfg {
+                enabled: params.fast_lazy_peek_cost_gate,
+                margin_bits: params.fast_lazy_peek_cost_margin_bits,
             };
             fast::run::<false>(
                 buf,
@@ -497,6 +507,7 @@ pub(super) fn compress(
                 true,
                 t.insert_depth,
                 bucket2,
+                cost_gate,
             )
         }
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),

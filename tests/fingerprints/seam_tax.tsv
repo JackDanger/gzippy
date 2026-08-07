@@ -7,7 +7,7 @@
 #   UPDATE_T4_PINS=1 cargo test --release --test t4_pins
 #   (or: cargo run --release --example fingerprint_tool -- pin-t4)
 fixture	level	size_t1	size_t4	tax_bytes	members_t1	members_t4	blocks_t1	blocks_t4
-binary	1	666992	666132	-860	1	1	16	18
+binary	1	666992	666119	-873	1	1	16	18
 binary	2	666112	665373	-739	1	1	4	4
 binary	6	651553	640695	-10858	1	1	4	4
 binary	9	637081	636010	-1071	1	1	4	4
@@ -15,7 +15,7 @@ noise	1	1048754	1048760	6	1	1	32	32
 noise	2	1048684	1048690	6	1	1	18	18
 noise	6	1048684	1048690	6	1	1	18	18
 noise	9	1048684	1048690	6	1	1	18	18
-tabular	1	298095	294259	-3836	1	1	16	18
+tabular	1	298095	293676	-4419	1	1	16	18
 tabular	2	281326	277791	-3535	1	1	4	5
 tabular	6	247845	242781	-5064	1	1	5	7
 tabular	9	236201	235475	-726	1	1	4	6
