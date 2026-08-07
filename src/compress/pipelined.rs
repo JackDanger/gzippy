@@ -260,6 +260,18 @@ impl PipelinedGzEncoder {
             writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
             return Ok(0);
         }
+        if self.num_threads > 1
+            && self.compression_level == 8
+            && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
+        {
+            writer.write_all(&self.gzip_header_bytes())?;
+            crate::compress::deflate::encode_deflate_stateful_parallel_to_writer(
+                data,
+                &mut writer,
+                self.compression_level,
+            )?;
+            return Ok(data.len() as u64);
+        }
         if self.compression_level == 0 {
             // Genuine STORED mode (see `deflate::deflate_into`'s `level == 0`
             // branch) has no compute to parallelize — it is a memcpy plus a

@@ -649,6 +649,15 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
     false
 }
 
+/// Greedy/Lazy/Lazy2 only — the T>1 stateful path uses `parse_resumable` with
+/// `params_parallel`, which must not be applied to L1's parallel fast knobs.
+pub(crate) fn level_uses_stateful_t4(level: u32) -> bool {
+    matches!(
+        super::level::params(level).strategy,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    )
+}
+
 /// Resume a parse over `buf[from..in_end]` using caller-owned `state`.
 ///
 /// See `greedy::run_resumable` for the `consume_all` / `is_last` distinction
@@ -665,6 +674,7 @@ pub(super) fn parse_resumable(
     params: &LevelParams,
     role: BlockRole,
     input_mode: InputMode,
+    budget: super::encode_types::HeaderBudget,
     bw: &mut BitWriter,
 ) -> usize {
     let statics = StaticCodes::get();
@@ -686,19 +696,10 @@ pub(super) fn parse_resumable(
             input_mode,
             fast::FAST_BLOCK_LENGTH,
             true,
-            super::encode_types::HeaderBudget::Lean,
+            budget,
         ),
         Strategy::Greedy => greedy::run_resumable(
-            buf,
-            state,
-            from,
-            in_end,
-            params,
-            statics,
-            bw,
-            role,
-            input_mode,
-            super::encode_types::HeaderBudget::Lean,
+            buf, state, from, in_end, params, statics, bw, role, input_mode, budget,
         ),
         Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
             buf,
@@ -711,7 +712,7 @@ pub(super) fn parse_resumable(
             matches!(params.strategy, Strategy::Lazy2),
             role,
             input_mode,
-            super::encode_types::HeaderBudget::Lean,
+            budget,
         ),
         other => unreachable!("parse_resumable called for non-resumable strategy {other:?}"),
     }
