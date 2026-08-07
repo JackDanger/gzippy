@@ -118,6 +118,16 @@ pub struct LevelParams {
     pub near_optimal: NearOptimalParams,
 }
 
+/// L1 parse knobs shared by T1 (`params`) and T>1 (`params_parallel`).
+fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
+    p.fast_bucket2 = true;
+    p.fast_bucket2_gate_max_len = 64;
+    p.fast_bucket2_probe_on_miss = true;
+    p.fast_hash_update_inserts = 8;
+    p.fast_lazy_peek_cost_gate = true;
+    p.fast_lazy_peek_cost_margin_bits = 0;
+}
+
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
 ///
 /// The `max_search_depth`/`nice_match_length` values transliterate the vendor
@@ -137,6 +147,9 @@ pub fn params(level: u32) -> LevelParams {
     // executed. Feature-gated (default OFF) and compiles to nothing when off.
     #[cfg(feature = "anatomy-counters")]
     emit_declared_once(level, &p);
+    if level == 1 {
+        apply_l1_fast_parallel_knobs(&mut p);
+    }
     p
 }
 
@@ -285,12 +298,7 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // (b) from the L1-band mission brief, gated to short accepts). Keeps lazy
     // peek/defer — unlike `ht_fast`'s greedy accept-all, which flipped tabular.
     if level == 1 {
-        p.fast_bucket2 = true;
-        p.fast_bucket2_gate_max_len = 64;
-        p.fast_bucket2_probe_on_miss = true;
-        p.fast_hash_update_inserts = 8;
-        p.fast_lazy_peek_cost_gate = true;
-        p.fast_lazy_peek_cost_margin_bits = 0;
+        apply_l1_fast_parallel_knobs(&mut p);
     }
     p
 }

@@ -1140,6 +1140,9 @@ fn hc_catchup(
 /// -0.3% vs `LIMIT_HASH_UPDATE_INSERTS_L0`). Higher values (4, 8, MAX) give
 /// more ratio but blow well past a 10% L1 wall budget — not shipped, see the
 /// commit message for the measured numbers.
+/// Default L1 insert depth (vendor `deflate_compress.c`); T>1 overrides via
+/// [`super::super::level::LevelParams::fast_hash_update_inserts`].
+#[cfg_attr(not(feature = "l1-tune"), allow(dead_code))]
 pub(super) const LIMIT_HASH_UPDATE_INSERTS_L1: usize = 3;
 
 /// Sentinel head-table entry meaning "no position stored yet". Any position we
@@ -3391,11 +3394,16 @@ pub(super) fn run<const ACCEL: bool>(
 #[cfg_attr(feature = "l1-tune", allow(dead_code))]
 pub(in crate::compress::deflate) struct FastResume {
     head: Vec<u32>,
+    /// Empty when the 2-way bucket lever is disabled — mirrors [`run`]'s `head2`.
+    head2: Vec<u32>,
     /// Empty (never allocated) when the hash3 lever is disabled — mirrors
     /// [`run`]'s conditional acquisition.
     head3: Vec<u32>,
     hash3_active_next: bool,
     peek_active_next: bool,
+    /// One-block-lag COST-GATE arm, carried like `hash3_active_next`.
+    cost_gate_active_next: bool,
+    cost_gate_seeded: bool,
 }
 
 impl FastResume {
@@ -3403,6 +3411,7 @@ impl FastResume {
     fn new(hash3: Hash3Cfg) -> Self {
         FastResume {
             head: acquire_head_table(&HEAD_POOL, HASH_SIZE),
+            head2: Vec::new(),
             head3: if hash3.enabled {
                 acquire_head_table(&HEAD3_POOL, 1usize << hash3.bits)
             } else {
@@ -3410,6 +3419,8 @@ impl FastResume {
             },
             hash3_active_next: !hash3.gated || hash3.gate_initial_active,
             peek_active_next: !LAZY_PEEK_GATED || LAZY_PEEK_GATE_INITIAL_ACTIVE,
+            cost_gate_active_next: false,
+            cost_gate_seeded: false,
         }
     }
 
@@ -3429,7 +3440,12 @@ impl FastResume {
     pub(super) fn rebase(&mut self, shift: usize) {
         debug_assert!(shift <= u32::MAX as usize);
         let s = shift as u32;
-        for e in self.head.iter_mut().chain(self.head3.iter_mut()) {
+        for e in self
+            .head
+            .iter_mut()
+            .chain(self.head2.iter_mut())
+            .chain(self.head3.iter_mut())
+        {
             *e = if *e != NO_POS && *e >= s {
                 *e - s
             } else {
@@ -3480,25 +3496,42 @@ pub(super) fn run_resumable(
     state: &mut super::ParseState,
     from: usize,
     in_end: usize,
+    params: &super::super::level::LevelParams,
     statics: &StaticCodes,
     bw: &mut BitWriter,
     role: super::BlockRole,
     input_mode: super::InputMode,
     block_length: usize,
     use_dynamic: bool,
-    limit_hash_update_inserts: usize,
 ) -> usize {
     debug_assert!(in_end >= from);
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
 
+    let bucket2 = Bucket2Cfg {
+        enabled: params.fast_bucket2,
+        gate_max_len: params.fast_bucket2_gate_max_len,
+        probe_on_miss: params.fast_bucket2_probe_on_miss,
+    };
+    let cost_gate_cfg = LazyPeekCostGateCfg {
+        enabled: params.fast_lazy_peek_cost_gate,
+        margin_bits: params.fast_lazy_peek_cost_margin_bits,
+        lit_threshold_pct: 98,
+    };
+    let limit_hash_update_inserts = params.fast_hash_update_inserts;
+
     let hash3 = Hash3Cfg::shipped();
-    let bucket2 = Bucket2Cfg::DISABLED;
-    let mut head2: Vec<u32> = Vec::new();
     let (peek_gated, peek_gate_threshold_pct) = (LAZY_PEEK_GATED, LAZY_PEEK_GATE_LIT_THRESHOLD_PCT);
     // First call of the file creates the carried state (all-NO_POS tables +
     // the gates' initial-active values — exactly the whole-buffer `run`'s
     // starting state); every later call resumes it.
     let fr = state.fast.get_or_insert_with(|| FastResume::new(hash3));
+    if bucket2.enabled && fr.head2.is_empty() {
+        fr.head2 = vec![NO_POS; HASH_SIZE];
+    }
+    if cost_gate_cfg.enabled && !fr.cost_gate_seeded {
+        fr.cost_gate_active_next = true;
+        fr.cost_gate_seeded = true;
+    }
     let base = buf.as_ptr();
 
     #[cfg(feature = "anatomy-counters")]
@@ -3528,6 +3561,7 @@ pub(super) fn run_resumable(
         let block_end_target = (block_begin + block_length).min(in_end);
         let hash3_active = fr.hash3_active_next;
         let peek_active = fr.peek_active_next;
+        let cost_gate_block_active = fr.cost_gate_active_next;
         let fast_end = block_end_target.min(in_end.saturating_sub(DEFLATE_MAX_MATCH_LEN as usize));
 
         // One `parse_match` timer per internal block, matching [`run`].
@@ -3535,7 +3569,7 @@ pub(super) fn run_resumable(
             // Same monomorphized dispatch as [`run`]'s `!ACCEL` arm
             // (L1-only path; L0 never streams through a parser — the
             // streaming encoder handles level 0 as stored blocks itself).
-            pos = if hash3_active {
+            pos = if hash3_active || bucket2.enabled {
                 fastloop_l1(
                     pos,
                     fast_end,
@@ -3546,14 +3580,14 @@ pub(super) fn run_resumable(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     &mut local,
-                    &mut head2,
+                    &mut fr.head2,
                     &mut fr.head3,
                     bucket2,
                     hash3,
                     hash3_active,
                     peek_active,
-                    false,
-                    LazyPeekCostGateCfg::DISABLED,
+                    cost_gate_block_active,
+                    cost_gate_cfg,
                 )
             } else {
                 fastloop_l1_lean(
@@ -3566,7 +3600,7 @@ pub(super) fn run_resumable(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     &mut local,
-                    LazyPeekCostGateCfg::DISABLED,
+                    cost_gate_cfg,
                 )
             };
             pos = parse_tail(
@@ -3616,6 +3650,10 @@ pub(super) fn run_resumable(
                 || (total > 0
                     && (literal_count as u64 * 100)
                         >= (peek_gate_threshold_pct as u64 * total as u64));
+            fr.cost_gate_active_next = cost_gate_cfg.enabled
+                && total > 0
+                && (literal_count as u64 * 100)
+                    >= (cost_gate_cfg.lit_threshold_pct as u64 * total as u64);
         }
 
         if pos == in_end {
