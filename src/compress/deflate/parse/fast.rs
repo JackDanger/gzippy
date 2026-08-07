@@ -1433,12 +1433,17 @@ pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 pub(super) struct Bucket2Cfg {
     pub enabled: bool,
     pub gate_max_len: u32,
+    /// When set (T>1 only), consult `cand2` on a primary miss — libdeflate's
+    /// `ht_matchfinder` probes both bucket slots on every lookup; our gated
+    /// upgrade only ran on short accepts, leaving miss-path literals.
+    pub probe_on_miss: bool,
 }
 
 impl Bucket2Cfg {
     pub const DISABLED: Self = Self {
         enabled: false,
         gate_max_len: 8,
+        probe_on_miss: false,
     };
 }
 
@@ -1472,6 +1477,34 @@ fn bucket2_upgrade(
         }
     }
     (length, dist)
+}
+
+/// Libdeflate `ht_matchfinder` probes both bucket slots every lookup; take the
+/// longer valid match (min length 4). No-op when bucket2 is off.
+#[inline(always)]
+fn bucket2_best_of_two(
+    pos: usize,
+    buf: &[u8],
+    cand: u32,
+    cand2: u32,
+    bucket2: Bucket2Cfg,
+) -> Option<(u32, usize)> {
+    if !bucket2.enabled || !bucket2.probe_on_miss {
+        return None;
+    }
+    let mut best: Option<(u32, usize)> = None;
+    for c in [cand, cand2] {
+        let dist = pos.wrapping_sub(c as usize);
+        if (1..=WINDOW).contains(&dist) {
+            let length = lz_extend(buf, pos, c as usize, 0, DEFLATE_MAX_MATCH_LEN);
+            if length >= SHORTEST_MATCH {
+                if best.map_or(true, |(bl, _)| length > bl) {
+                    best = Some((length, dist));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// HASH3-PROBE lever (see [`Hash3Cfg`]'s doc comment for the full story):
@@ -1660,7 +1693,13 @@ fn process_position_l1(
     // set to `Some` in this same `if`), this flag is never consulted.
     #[cfg(feature = "anatomy-counters")]
     let mut primary_too_short = false;
-    if (1..=WINDOW).contains(&dist) {
+    if bucket2.enabled && bucket2.probe_on_miss {
+        accepted = bucket2_best_of_two(pos, buf, cand, cand2, bucket2);
+        #[cfg(feature = "anatomy-counters")]
+        if accepted.is_none() {
+            primary_too_short = false; // charged below as miss
+        }
+    } else if (1..=WINDOW).contains(&dist) {
         let cand_pos = cand as usize;
         // Byte-exact extend (never trusts the hash): a spurious
         // candidate simply yields length < SHORTEST_MATCH -> literal.
@@ -1724,7 +1763,11 @@ fn process_position_l1(
         // bucket2 finds something longer; a no-op (returns the inputs
         // unchanged) when the feature is off, the lever is disabled, or
         // the gate/candidate doesn't pay off.
-        let (length, dist) = bucket2_upgrade(pos, buf, cand2, length, dist, bucket2);
+        let (length, dist) = if bucket2.probe_on_miss {
+            (length, dist)
+        } else {
+            bucket2_upgrade(pos, buf, cand2, length, dist, bucket2)
+        };
         // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
         // short accepted matches only, so this branch is rare (most
         // matches are longer, or the position is a miss and never
@@ -2829,6 +2872,7 @@ pub(super) fn run<const ACCEL: bool>(
                 } else {
                     bucket2_cfg.gate_max_len
                 },
+                probe_on_miss: bucket2_cfg.probe_on_miss,
             }
         }
         #[cfg(not(feature = "l1-tune"))]

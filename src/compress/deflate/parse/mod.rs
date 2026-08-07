@@ -465,6 +465,7 @@ pub(super) fn compress(
             let bucket2 = fast::Bucket2Cfg {
                 enabled: params.fast_bucket2,
                 gate_max_len: params.fast_bucket2_gate_max_len,
+                probe_on_miss: params.fast_bucket2_probe_on_miss,
             };
             fast::run::<false>(
                 buf,
@@ -485,6 +486,7 @@ pub(super) fn compress(
             let bucket2 = fast::Bucket2Cfg {
                 enabled: params.fast_bucket2,
                 gate_max_len: params.fast_bucket2_gate_max_len,
+                probe_on_miss: params.fast_bucket2_probe_on_miss,
             };
             fast::run::<false>(
                 buf,
