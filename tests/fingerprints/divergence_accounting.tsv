@@ -20,6 +20,6 @@
 # be deliberate. Regenerate and commit the diff in the same PR:
 #   UPDATE_DIVERGENCE_ACCOUNTING=1 cargo test --release --test divergence_accounting
 fixture	level	ours_bytes	ldx_bytes	gap_bits	we_lit_they_match	diff_len	diff_dist	we_match_they_lit	table_drift	headers_eob
-text	1	373196	359332	110912	57397	31304	12647	-775	14138	-3799
-tabular	1	298077	306208	-65048	-89290	9564	4822	8323	1535	-2
-binary	1	666974	673068	-48752	-15889	5104	17636	-59269	3386	280
+text	1	364911	359332	44632	21333	10685	4853	-1489	13008	-3758
+tabular	1	288253	306208	-143640	-135588	-4954	2900	-731	-5002	-265
+binary	1	666361	673068	-53656	-8865	-5684	17287	-59411	2843	174
