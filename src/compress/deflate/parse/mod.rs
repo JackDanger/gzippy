@@ -476,7 +476,7 @@ pub(super) fn compress(
                 is_last,
                 fast::FAST_BLOCK_LENGTH,
                 true,
-                fast::LIMIT_HASH_UPDATE_INSERTS_L1,
+                params.fast_hash_update_inserts,
                 bucket2,
             )
         }
@@ -497,7 +497,7 @@ pub(super) fn compress(
                 is_last,
                 t.block_length,
                 true,
-                t.insert_depth,
+                params.fast_hash_update_inserts,
                 bucket2,
             )
         }
