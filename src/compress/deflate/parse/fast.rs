@@ -1497,10 +1497,8 @@ fn bucket2_best_of_two(
         let dist = pos.wrapping_sub(c as usize);
         if (1..=WINDOW).contains(&dist) {
             let length = lz_extend(buf, pos, c as usize, 0, DEFLATE_MAX_MATCH_LEN);
-            if length >= SHORTEST_MATCH {
-                if best.map_or(true, |(bl, _)| length > bl) {
-                    best = Some((length, dist));
-                }
+            if length >= SHORTEST_MATCH && best.is_none_or(|(bl, _)| length > bl) {
+                best = Some((length, dist));
             }
         }
     }
