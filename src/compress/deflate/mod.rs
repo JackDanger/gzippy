@@ -609,6 +609,7 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
                     } else {
                         encode_types::InputMode::Bounded
                     },
+                    encode_types::HeaderBudget::Lean,
                     &mut bw,
                 )
             });
@@ -840,7 +841,7 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     writer: &mut W,
     level: u32,
 ) -> std::io::Result<u64> {
-    use encode_types::{BlockRole, InputMode};
+    use encode_types::{BlockRole, HeaderBudget, InputMode};
 
     if !level_streams(level) {
         let logical_len = data.len();
@@ -907,6 +908,7 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
                     &params,
                     BlockRole::Interior,
                     InputMode::Bounded,
+                    HeaderBudget::Lean,
                     &mut bw,
                 )
             });
@@ -946,12 +948,100 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
                     &params,
                     BlockRole::Final,
                     InputMode::Drain,
+                    HeaderBudget::Lean,
                     &mut bw,
                 )
             });
         }
         crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
     }
+
+    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
+    let mut tail = bw.finish();
+    tail.extend_from_slice(&crc.to_le_bytes());
+    tail.extend_from_slice(&(len as u32).to_le_bytes());
+    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
+    Ok(len as u64)
+}
+
+/// Gzip-compress `data` with ONE continuous [`ParseState`] and [`BitWriter`],
+/// using [`level::params_parallel`] and [`HeaderBudget::Generous`]. The caller
+/// must have already written the gzip header; this appends the DEFLATE body and
+/// CRC32/ISIZE trailer.
+///
+/// Block boundaries match the T1 streaming encoder at the same input because the
+/// matchfinder is never rebuilt at artificial chunk seams — the pipelined
+/// per-chunk `compress()` path does rebuild it, which is what costs the six
+/// remaining libdeflate T4 cells on tabular/text corpora.
+pub fn encode_deflate_stateful_parallel_to_writer<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+    level: u32,
+) -> std::io::Result<u64> {
+    use encode_types::{BlockRole, HeaderBudget, InputMode};
+
+    debug_assert!(parse::level_uses_stateful_t4(level));
+
+    let len = data.len();
+    let out_cap = estimate_output_cap(len, level, 32);
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, out_cap);
+    let out = Vec::with_capacity(out_cap);
+    let mut bw = BitWriter::from_vec(out);
+
+    let params = level::params_parallel(level);
+    let budget = HeaderBudget::Generous;
+    let mut state = parse::ParseState::new();
+    let mut in_next = 0usize;
+
+    if len > INPLACE_TAIL_PAD {
+        let avail = len - INPLACE_TAIL_PAD;
+        in_next = crate::anatomy_wall_root!({
+            parse::parse_resumable(
+                data,
+                &mut state,
+                0,
+                avail,
+                &params,
+                BlockRole::Interior,
+                InputMode::Bounded,
+                budget,
+                &mut bw,
+            )
+        });
+        crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
+    }
+
+    let shift = state.max_shift();
+    let tail_len = len - shift;
+    let tail_cap = tail_len + INPLACE_TAIL_PAD;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, tail_cap);
+    let mut tbuf = Vec::with_capacity(tail_cap);
+    tbuf.extend_from_slice(&data[shift..]);
+    tbuf.resize(tail_cap, 0);
+    if shift > 0 {
+        state.shift_down(shift);
+        in_next -= shift;
+    }
+    if in_next == tail_len {
+        emit_stored_block(&mut bw, &[], true);
+    } else {
+        crate::anatomy_wall_root!({
+            parse::parse_resumable(
+                &tbuf,
+                &mut state,
+                in_next,
+                tail_len,
+                &params,
+                BlockRole::Final,
+                InputMode::Drain,
+                budget,
+                &mut bw,
+            )
+        });
+    }
+    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
 
     let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
     let mut tail = bw.finish();

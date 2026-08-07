@@ -260,6 +260,33 @@ impl PipelinedGzEncoder {
             writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
             return Ok(0);
         }
+        if self.num_threads > 1
+            && self.compression_level == 8
+            && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
+        {
+            // L8 T>1: the pipelined chunk grid pays a seam tax on tabular/text
+            // inputs (per-chunk `skip_bytes` dict seed + forced block restarts) that
+            // a continuous `ParseState` path avoids — but that whole-file path
+            // regresses a few already-passing binary cells. Pick the smaller of the
+            // two gzip outputs (monotone non-worse vs chunked main by construction).
+            let mut chunked = Vec::new();
+            self.compress_parallel_pipeline_pure(data, &mut chunked)?;
+
+            let mut whole = Vec::with_capacity(chunked.len());
+            whole.extend_from_slice(&self.gzip_header_bytes());
+            crate::compress::deflate::encode_deflate_stateful_parallel_to_writer(
+                data,
+                &mut whole,
+                self.compression_level,
+            )?;
+
+            if whole.len() < chunked.len() {
+                writer.write_all(&whole)?;
+            } else {
+                writer.write_all(&chunked)?;
+            }
+            return Ok(data.len() as u64);
+        }
         if self.compression_level == 0 {
             // Genuine STORED mode (see `deflate::deflate_into`'s `level == 0`
             // branch) has no compute to parallelize — it is a memcpy plus a
