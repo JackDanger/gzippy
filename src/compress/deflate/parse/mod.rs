@@ -18,7 +18,7 @@
 
 use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
-use super::encode_types::{BlockRole, InputMode};
+use super::encode_types::{BlockRole, HeaderBudget, InputMode};
 use super::huffman::{
     build_dynamic_header, make_huffman_code, make_huffman_code_exact_into, make_huffman_code_into,
     CodeScratch, HeaderScratch, HuffmanCode,
@@ -434,6 +434,7 @@ pub(super) fn compress(
     in_end: usize,
     params: &LevelParams,
     is_last: bool,
+    budget: HeaderBudget,
     bw: &mut BitWriter,
 ) {
     let statics = StaticCodes::get();
@@ -454,6 +455,7 @@ pub(super) fn compress(
             fast::LIMIT_HASH_UPDATE_INSERTS_L0,
             fast::Bucket2Cfg::DISABLED,
             fast::LazyPeekCostGateCfg::DISABLED,
+            budget,
         ),
         // `l1-tune` (2026-07-22 L1-band search campaign, OFF by default):
         // block length and insert-depth are already plain runtime params to
@@ -485,6 +487,7 @@ pub(super) fn compress(
                 params.fast_hash_update_inserts,
                 bucket2,
                 cost_gate,
+                budget,
             )
         }
         #[cfg(feature = "l1-tune")]
@@ -512,17 +515,24 @@ pub(super) fn compress(
                 params.fast_hash_update_inserts,
                 bucket2,
                 cost_gate,
+                budget,
             )
         }
-        Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),
-        Strategy::Lazy => lazy::run(buf, data_start, in_end, params, statics, bw, false, is_last),
-        Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, statics, bw, true, is_last),
+        Strategy::Greedy => greedy::run(
+            buf, data_start, in_end, params, statics, bw, is_last, budget,
+        ),
+        Strategy::Lazy => lazy::run(
+            buf, data_start, in_end, params, statics, bw, false, is_last, budget,
+        ),
+        Strategy::Lazy2 => lazy::run(
+            buf, data_start, in_end, params, statics, bw, true, is_last, budget,
+        ),
         // DETECTOR-GATED LAZY-L3 (`l3-tune` feature): see `gated.rs`'s module
         // doc comment. `level.rs`'s L3 arm is the only producer of this
         // strategy; not reachable from a default (non-`l3-tune`) build.
-        Strategy::NearOptimal => {
-            near_optimal::run(buf, data_start, in_end, params, statics, bw, is_last)
-        }
+        Strategy::NearOptimal => near_optimal::run(
+            buf, data_start, in_end, params, statics, bw, is_last, budget,
+        ),
     }
 }
 
@@ -676,9 +686,19 @@ pub(super) fn parse_resumable(
             input_mode,
             fast::FAST_BLOCK_LENGTH,
             true,
+            super::encode_types::HeaderBudget::Lean,
         ),
         Strategy::Greedy => greedy::run_resumable(
-            buf, state, from, in_end, params, statics, bw, role, input_mode,
+            buf,
+            state,
+            from,
+            in_end,
+            params,
+            statics,
+            bw,
+            role,
+            input_mode,
+            super::encode_types::HeaderBudget::Lean,
         ),
         Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
             buf,
@@ -691,6 +711,7 @@ pub(super) fn parse_resumable(
             matches!(params.strategy, Strategy::Lazy2),
             role,
             input_mode,
+            super::encode_types::HeaderBudget::Lean,
         ),
         other => unreachable!("parse_resumable called for non-resumable strategy {other:?}"),
     }
@@ -860,7 +881,10 @@ fn emit_block(
         alt_litcode,
         alt_offcode,
         alt_header,
+        shape,
+        budget,
     } = code_scratch;
+    let budget = *budget;
     let (header, dynamic_bits, static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
@@ -868,17 +892,27 @@ fn emit_block(
             let mut litlen_freqs = sink.litlen_freqs;
             litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
+            let shaped = if budget.may_shape() {
+                shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs, shape)
+            } else {
+                None
+            };
+            let (build_lit, build_off): (&[u32], &[u32]) = match shaped {
+                Some((ref l, ref o)) => (l, o),
+                None => (&litlen_freqs, &sink.offset_freqs),
+            };
+
             make_huffman_code_into(
                 litcode,
                 DEFLATE_NUM_LITLEN_SYMS,
                 MAX_LITLEN_CODEWORD_LEN,
-                &litlen_freqs,
+                build_lit,
             );
             make_huffman_code_into(
                 offcode,
                 DEFLATE_NUM_OFFSET_SYMS,
                 MAX_OFFSET_CODEWORD_LEN,
-                &sink.offset_freqs,
+                build_off,
             );
 
             // SECOND DYNAMIC CANDIDATE: the same two codes under the EXACT
@@ -1058,6 +1092,100 @@ fn emit_block_static_or_stored(
 /// litlen/offset code. `litlen_freqs[DEFLATE_END_OF_BLOCK]` must already include
 /// the one EOB symbol.
 ///
+/// Returns shaped histograms to build the block's codes from when strictly cheaper.
+fn shaped_freqs_if_smaller(
+    litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
+    offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+    shape: &mut super::huffman::ShapeScratch,
+) -> Option<(
+    [u32; DEFLATE_NUM_LITLEN_SYMS],
+    [u32; DEFLATE_NUM_OFFSET_SYMS],
+)> {
+    use super::huffman::optimal::optimize_huffman_for_rle_into;
+
+    let mut s_lit = [0usize; DEFLATE_NUM_LITLEN_SYMS];
+    for (d, &s) in s_lit.iter_mut().zip(litlen_freqs.iter()) {
+        *d = s as usize;
+    }
+    let mut s_off = [0usize; DEFLATE_NUM_OFFSET_SYMS];
+    for (d, &s) in s_off.iter_mut().zip(offset_freqs.iter()) {
+        *d = s as usize;
+    }
+    optimize_huffman_for_rle_into(&mut s_lit, &mut shape.rle_flags);
+    optimize_huffman_for_rle_into(&mut s_off, &mut shape.rle_flags);
+
+    let mut shaped_lit = [0u32; DEFLATE_NUM_LITLEN_SYMS];
+    for (d, &s) in shaped_lit.iter_mut().zip(s_lit.iter()) {
+        *d = s as u32;
+    }
+    let mut shaped_off = [0u32; DEFLATE_NUM_OFFSET_SYMS];
+    for (d, &s) in shaped_off.iter_mut().zip(s_off.iter()) {
+        *d = s as u32;
+    }
+
+    if shaped_lit == *litlen_freqs && shaped_off == *offset_freqs {
+        return None;
+    }
+
+    make_huffman_code_into(
+        &mut shape.cand_litcode,
+        DEFLATE_NUM_LITLEN_SYMS,
+        MAX_LITLEN_CODEWORD_LEN,
+        &shaped_lit,
+    );
+    make_huffman_code_into(
+        &mut shape.cand_offcode,
+        DEFLATE_NUM_OFFSET_SYMS,
+        MAX_OFFSET_CODEWORD_LEN,
+        &shaped_off,
+    );
+    let cand_bits = {
+        let h = build_dynamic_header(
+            &shape.cand_litcode.lens,
+            &shape.cand_offcode.lens,
+            &mut shape.cand_header,
+        );
+        h.header_bits()
+    } + cost_from_freqs(
+        litlen_freqs,
+        offset_freqs,
+        &shape.cand_litcode,
+        &shape.cand_offcode,
+    );
+
+    make_huffman_code_into(
+        &mut shape.cand_litcode,
+        DEFLATE_NUM_LITLEN_SYMS,
+        MAX_LITLEN_CODEWORD_LEN,
+        litlen_freqs,
+    );
+    make_huffman_code_into(
+        &mut shape.cand_offcode,
+        DEFLATE_NUM_OFFSET_SYMS,
+        MAX_OFFSET_CODEWORD_LEN,
+        offset_freqs,
+    );
+    let raw_bits = {
+        let h = build_dynamic_header(
+            &shape.cand_litcode.lens,
+            &shape.cand_offcode.lens,
+            &mut shape.raw_header,
+        );
+        h.header_bits()
+    } + cost_from_freqs(
+        litlen_freqs,
+        offset_freqs,
+        &shape.cand_litcode,
+        &shape.cand_offcode,
+    );
+
+    if cand_bits < raw_bits {
+        Some((shaped_lit, shaped_off))
+    } else {
+        None
+    }
+}
+
 /// Port of the cost half of `deflate_compute_true_cost`
 /// (`deflate_compress.c:2889-2921`) — the frequency-array × code-length sum. This
 /// replaces walking every token twice (once per candidate code) with two passes
@@ -1761,11 +1889,20 @@ mod l1_bakeoff {
 
         let params = crate::compress::deflate::level::params(1);
         let mut a = BitWriter::new();
-        compress(&buf, 0, in_end, &params, true, &mut a);
+        compress(&buf, 0, in_end, &params, true, HeaderBudget::Lean, &mut a);
         let fast_bytes = a.finish().len();
 
         let mut b = BitWriter::new();
-        ht_fast::run(&buf, 0, in_end, &params, statics, &mut b, true);
+        ht_fast::run(
+            &buf,
+            0,
+            in_end,
+            &params,
+            statics,
+            &mut b,
+            true,
+            HeaderBudget::Lean,
+        );
         let ht_bytes = b.finish().len();
 
         (fast_bytes, ht_bytes)

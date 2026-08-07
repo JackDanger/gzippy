@@ -48,6 +48,7 @@
 //! This parser is bounded TWICE — 65,535 input bytes and 8,192 sequences per
 
 use super::super::bitstream::BitWriter;
+use super::super::encode_types::HeaderBudget;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::ht::{HtMatchfinder, HT_REQUIRED_NBYTES};
@@ -86,6 +87,7 @@ pub(super) fn run(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
+    budget: HeaderBudget,
 ) {
     let mut mf = HtMatchfinder::acquire();
     let mut in_base = 0usize;
@@ -103,7 +105,10 @@ pub(super) fn run(
     // One dynamic-header scratch for the WHOLE call, reused across every
     // internal block, instead of `build_dynamic_header` allocating per block.
     let mut header_scratch = HeaderScratch::new();
-    let mut code_scratch = CodeScratch::default();
+    let mut code_scratch = CodeScratch {
+        budget,
+        ..Default::default()
+    };
 
     let mut in_next = data_start;
     if data_start > 0 {
