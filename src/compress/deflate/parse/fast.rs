@@ -1427,6 +1427,21 @@ pub(super) const FAST_BLOCK_LENGTH: usize = 1 << 16;
 /// which gave up ~20%+ on text).
 pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 
+/// Shipped 2-way-bucket config for `parse::fast`. T>1 L1 sets `enabled` via
+/// `level::params_parallel`; T1 and L0 pass [`Self::DISABLED`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Bucket2Cfg {
+    pub enabled: bool,
+    pub gate_max_len: u32,
+}
+
+impl Bucket2Cfg {
+    pub const DISABLED: Self = Self {
+        enabled: false,
+        gate_max_len: 8,
+    };
+}
+
 /// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
 /// (2026-07-22 campaign): a conditional second-bucket probe. `head2[h]` holds
 /// the position ONE GENERATION behind `head[h]` (see the `cand2` capture at
@@ -1436,9 +1451,7 @@ pub(super) const FAST0_BLOCK_LENGTH: usize = 1 << 20;
 /// every position, which is the always-2-bucket shape the mission brief
 /// measured too costly). Returns `(length, dist)` upgraded to the second
 /// candidate's match iff it is both a valid, in-window distance AND strictly
-/// longer than the primary; otherwise returns the inputs unchanged. Does not
-/// exist in the shipped path (`l1-tune` is a non-default Cargo feature).
-#[cfg(feature = "l1-tune")]
+/// longer than the primary; otherwise returns the inputs unchanged.
 #[inline(always)]
 fn bucket2_upgrade(
     pos: usize,
@@ -1446,9 +1459,9 @@ fn bucket2_upgrade(
     cand2: u32,
     length: u32,
     dist: usize,
-    tune: tune::L1Tune,
+    bucket2: Bucket2Cfg,
 ) -> (u32, usize) {
-    if !tune.bucket2_enabled || length > tune.bucket2_gate_max_len {
+    if !bucket2.enabled || length > bucket2.gate_max_len {
         return (length, dist);
     }
     let dist2 = pos.wrapping_sub(cand2 as usize);
@@ -1545,8 +1558,9 @@ fn process_position_l1(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
-    #[cfg(feature = "l1-tune")] head2: &mut [u32],
+    head2: &mut [u32],
     head3: &mut [u32],
+    bucket2: Bucket2Cfg,
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
     // HASH3-GATE composition lever config (see [`Hash3Cfg`]'s doc comment):
     // shipped consts in a default build, `tune::L1Tune`-derived (dev search
@@ -1576,15 +1590,10 @@ fn process_position_l1(
     // per-call bumps out of the hottest inlined body trims two field writes
     // from the common (miss/too-short) path without losing any count.
 
-    // `l1-tune` bucket2 lever (search-only, OFF the shipped path): `head2`
-    // holds the position ONE GENERATION behind `head` per hash slot. Read the
-    // current occupant (the candidate a bucket2 probe would consult) then
-    // shift `cand` — the value `head[h]` is about to be overwritten WITH —
-    // down into `head2[h]`, keeping the one-generation-behind invariant.
-    // Zero cost when the feature is off (the whole binding doesn't exist).
-    #[cfg(feature = "l1-tune")]
-    let cand2 = if tune.bucket2_enabled {
-        // SAFETY: `h < HASH_SIZE == head2.len()`.
+    // 2-way bucket: `head2` holds the position ONE GENERATION behind `head` per
+    // hash slot. Read the current occupant then shift `cand` down into `head2`.
+    let cand2 = if bucket2.enabled {
+        // SAFETY: `h < HASH_SIZE == head2.len()` when bucket2 is enabled.
         let c2 = unsafe { *head2.get_unchecked(h) };
         unsafe { *head2.get_unchecked_mut(h) = cand };
         c2
@@ -1715,8 +1724,7 @@ fn process_position_l1(
         // bucket2 finds something longer; a no-op (returns the inputs
         // unchanged) when the feature is off, the lever is disabled, or
         // the gate/candidate doesn't pay off.
-        #[cfg(feature = "l1-tune")]
-        let (length, dist) = bucket2_upgrade(pos, buf, cand2, length, dist, tune);
+        let (length, dist) = bucket2_upgrade(pos, buf, cand2, length, dist, bucket2);
         // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
         // short accepted matches only, so this branch is rare (most
         // matches are longer, or the position is a miss and never
@@ -2273,8 +2281,9 @@ fn fastloop_l1(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
-    #[cfg(feature = "l1-tune")] head2: &mut [u32],
+    head2: &mut [u32],
     head3: &mut [u32],
+    bucket2: Bucket2Cfg,
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
     hash3: Hash3Cfg,
     // HASH3-GATE composition lever: this BLOCK's gate decision (see
@@ -2349,9 +2358,9 @@ fn fastloop_l1(
                 limit_hash_update_inserts,
                 #[cfg(feature = "anatomy-counters")]
                 local,
-                #[cfg(feature = "l1-tune")]
                 head2,
                 head3,
+                bucket2,
                 #[cfg(feature = "l1-tune")]
                 tune,
                 hash3,
@@ -2388,9 +2397,9 @@ fn fastloop_l1(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     local,
-                    #[cfg(feature = "l1-tune")]
                     head2,
                     head3,
+                    bucket2,
                     #[cfg(feature = "l1-tune")]
                     tune,
                     hash3,
@@ -2440,9 +2449,9 @@ fn fastloop_l1(
             limit_hash_update_inserts,
             #[cfg(feature = "anatomy-counters")]
             local,
-            #[cfg(feature = "l1-tune")]
             head2,
             head3,
+            bucket2,
             #[cfg(feature = "l1-tune")]
             tune,
             hash3,
@@ -2796,6 +2805,7 @@ pub(super) fn run<const ACCEL: bool>(
     block_length: usize,
     use_dynamic: bool,
     limit_hash_update_inserts: usize,
+    bucket2_cfg: Bucket2Cfg,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -2807,20 +2817,30 @@ pub(super) fn run<const ACCEL: bool>(
     let mut head = acquire_head_table(&HEAD_POOL, HASH_SIZE);
     let base = buf.as_ptr();
 
-    // `l1-tune` bucket2 lever's second table (search-only; see `tune`'s doc
-    // comment). `ACCEL` is a const generic so `if !ACCEL` folds away at each
-    // monomorphization: L0's (`ACCEL == true`) instantiation never allocates
-    // this (empty `Vec`, zero cost), matching how `fastloop_l0` never
-    // receives it. `tune::get()` reads env vars ONCE per `run()` call (cached
-    // after the first call via its own `OnceLock`).
     #[cfg(feature = "l1-tune")]
-    let mut head2: Vec<u32> = if !ACCEL {
+    let l1_tune = tune::get();
+    let bucket2 = {
+        #[cfg(feature = "l1-tune")]
+        {
+            Bucket2Cfg {
+                enabled: bucket2_cfg.enabled || l1_tune.bucket2_enabled,
+                gate_max_len: if l1_tune.bucket2_enabled {
+                    l1_tune.bucket2_gate_max_len
+                } else {
+                    bucket2_cfg.gate_max_len
+                },
+            }
+        }
+        #[cfg(not(feature = "l1-tune"))]
+        {
+            bucket2_cfg
+        }
+    };
+    let mut head2: Vec<u32> = if !ACCEL && bucket2.enabled {
         vec![NO_POS; HASH_SIZE]
     } else {
         Vec::new()
     };
-    #[cfg(feature = "l1-tune")]
-    let l1_tune = tune::get();
     // HASH3-GATE composition lever config: shipped consts in a default
     // build (this IS `Strategy::Fast`'s default behavior as of the
     // 2026-07-24 ship decision — see [`Hash3Cfg`]'s doc comment), or
@@ -3086,6 +3106,8 @@ pub(super) fn run<const ACCEL: bool>(
                         &mut local,
                         &mut head2,
                         &mut head3,
+                        bucket2,
+                        #[cfg(feature = "l1-tune")]
                         l1_tune,
                         hash3,
                         hash3_active,
@@ -3107,7 +3129,7 @@ pub(super) fn run<const ACCEL: bool>(
                         #[cfg(feature = "anatomy-counters")]
                         &mut local,
                     )
-                } else if hash3_active {
+                } else if hash3_active || bucket2.enabled {
                     fastloop_l1(
                         pos,
                         fast_end,
@@ -3118,7 +3140,9 @@ pub(super) fn run<const ACCEL: bool>(
                         limit_hash_update_inserts,
                         #[cfg(feature = "anatomy-counters")]
                         &mut local,
+                        &mut head2,
                         &mut head3,
+                        bucket2,
                         hash3,
                         hash3_active,
                         peek_active,
@@ -3378,6 +3402,8 @@ pub(super) fn run_resumable(
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
 
     let hash3 = Hash3Cfg::shipped();
+    let bucket2 = Bucket2Cfg::DISABLED;
+    let mut head2: Vec<u32> = Vec::new();
     let (peek_gated, peek_gate_threshold_pct) = (LAZY_PEEK_GATED, LAZY_PEEK_GATE_LIT_THRESHOLD_PCT);
     // First call of the file creates the carried state (all-NO_POS tables +
     // the gates' initial-active values — exactly the whole-buffer `run`'s
@@ -3430,7 +3456,9 @@ pub(super) fn run_resumable(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     &mut local,
+                    &mut head2,
                     &mut fr.head3,
+                    bucket2,
                     hash3,
                     hash3_active,
                     peek_active,

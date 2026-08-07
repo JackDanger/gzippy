@@ -93,6 +93,12 @@ pub struct LevelParams {
     /// closed, turn this on at T1 and take the size — do not preserve identity for its own
     /// sake.
     pub try_exact_huffman: bool,
+    /// T>1-only: libdeflate's 2-way hash bucket (second candidate on short-match
+    /// acceptance). Set only by `params_parallel`; T1 stays single-probe.
+    pub fast_bucket2: bool,
+    /// Gate paired with [`Self::fast_bucket2`]: consult the second bucket only when
+    /// the primary probe already accepted a match no longer than this length.
+    pub fast_bucket2_gate_max_len: u32,
     pub strategy: Strategy,
     /// Cap on hash-chain nodes searched per position (`c->max_search_depth`).
     pub max_search_depth: u32,
@@ -265,6 +271,12 @@ pub fn params_parallel(level: u32) -> LevelParams {
     //           (-258 B margin), movie.mp4 (-370) and photo.jpg (-55) vs libdeflate — all
     //           zero-headroom seam cells.
     p.try_exact_huffman = true;
+    // L1 AT T>1: enable the 2-way bucket inside `parse::fast` (search-only lever
+    // (b) from the L1-band mission brief, gated to short accepts). Keeps lazy
+    // peek/defer — unlike `ht_fast`'s greedy accept-all, which flipped tabular.
+    if level == 1 {
+        p.fast_bucket2 = true;
+    }
     p
 }
 
@@ -334,9 +346,12 @@ fn params_inner(level: u32) -> LevelParams {
         min_bits_to_use_nonfinal_path: 0,
         max_len_to_optimize_static_block: 0,
     };
+    const BUCKET2_OFF: (bool, u32) = (false, 8);
     match level {
         0 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Fast0,
             max_search_depth: 0,
             nice_match_length: 32,
@@ -349,6 +364,8 @@ fn params_inner(level: u32) -> LevelParams {
         // values only so the struct is populated.
         1 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Fast,
             max_search_depth: 1,
             nice_match_length: 32,
@@ -356,6 +373,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         2 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 10,
@@ -416,6 +435,8 @@ fn params_inner(level: u32) -> LevelParams {
         //     out of this change's causal reach.
         3 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
@@ -435,6 +456,8 @@ fn params_inner(level: u32) -> LevelParams {
         // faster at T4 (wall ratio 0.9519).
         4 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Greedy,
             max_search_depth: 16,
             nice_match_length: 30,
@@ -442,6 +465,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         5 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 16,
             nice_match_length: 30,
@@ -449,6 +474,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         6 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 35,
             nice_match_length: 65,
@@ -456,6 +483,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         7 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 100,
             nice_match_length: 130,
@@ -463,6 +492,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         8 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Lazy2,
             max_search_depth: 300,
             nice_match_length: max_match,
@@ -470,6 +501,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         9 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::Lazy2,
             max_search_depth: 600,
             nice_match_length: max_match,
@@ -479,6 +512,8 @@ fn params_inner(level: u32) -> LevelParams {
         // deflate_compress.c:3974-4004).
         10 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 75,
@@ -491,6 +526,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         11 => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::NearOptimal,
             max_search_depth: 100,
             nice_match_length: 150,
@@ -503,6 +540,8 @@ fn params_inner(level: u32) -> LevelParams {
         },
         _ => LevelParams {
             try_exact_huffman: false,
+            fast_bucket2: BUCKET2_OFF.0,
+            fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             strategy: Strategy::NearOptimal,
             max_search_depth: 300,
             nice_match_length: max_match,
