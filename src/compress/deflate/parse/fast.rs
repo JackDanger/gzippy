@@ -1447,6 +1447,26 @@ impl Bucket2Cfg {
     };
 }
 
+/// Lazy-peek COST-GATE config (`LAZY_PEEK_COST_GATE_*`). T>1 L1 may enable
+/// via `level::params_parallel`; T1 passes [`Self::DISABLED`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LazyPeekCostGateCfg {
+    pub enabled: bool,
+    pub margin_bits: i32,
+    /// Per-block literal-fraction threshold (percent) for the COST-GATE
+    /// reject test — stricter than HASH3-GATE's 80% so compressible blocks
+    /// (armexe) keep matches while near-incompressible blocks (movie) fire.
+    pub lit_threshold_pct: u32,
+}
+
+impl LazyPeekCostGateCfg {
+    pub const DISABLED: Self = Self {
+        enabled: LAZY_PEEK_COST_GATE_ENABLED,
+        margin_bits: LAZY_PEEK_COST_GATE_MARGIN_BITS,
+        lit_threshold_pct: 100,
+    };
+}
+
 /// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
 /// (2026-07-22 campaign): a conditional second-bucket probe. `head2[h]` holds
 /// the position ONE GENERATION behind `head[h]` (see the `cand2` capture at
@@ -1611,6 +1631,8 @@ fn process_position_l1(
     // irrelevant when the gate itself is off (see the `peek_max_len`/
     // `peek_min_dist` derivation below).
     peek_active: bool,
+    cost_gate_block_active: bool,
+    cost_gate_cfg: LazyPeekCostGateCfg,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
     unsafe { *head.get_unchecked_mut(h) = pos as u32 };
@@ -1830,11 +1852,10 @@ fn process_position_l1(
             };
 
             #[cfg(not(feature = "l1-tune"))]
-            let (cost_gate, cost_margin) =
-                (LAZY_PEEK_COST_GATE_ENABLED, LAZY_PEEK_COST_GATE_MARGIN_BITS);
+            let (cost_gate, cost_margin) = (cost_gate_cfg.enabled, cost_gate_cfg.margin_bits);
             #[cfg(feature = "l1-tune")]
             let (cost_gate, cost_margin) = (
-                tune.lazy_peek_cost_gate_enabled,
+                tune.lazy_peek_cost_gate_enabled || cost_gate_cfg.enabled,
                 tune.lazy_peek_cost_margin_bits,
             );
 
@@ -1870,6 +1891,7 @@ fn process_position_l1(
             // apples-to-apples bit-cost comparison over the SAME `length`
             // bytes on both sides.
             let not_worth_it = cost_gate
+                && cost_gate_block_active
                 && est_match_bits(length, dist) as i32
                     > (EST_LITERAL_BITS * length) as i32 + cost_margin;
 
@@ -2000,6 +2022,7 @@ fn process_position_l1_lean(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
+    cost_gate_cfg: LazyPeekCostGateCfg,
 ) -> usize {
     // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
     unsafe { *head.get_unchecked_mut(h) = pos as u32 };
@@ -2073,8 +2096,7 @@ fn process_position_l1_lean(
                 None
             };
 
-            let (cost_gate, cost_margin) =
-                (LAZY_PEEK_COST_GATE_ENABLED, LAZY_PEEK_COST_GATE_MARGIN_BITS);
+            let _ = cost_gate_cfg; // lean path: block's `hash3_active == false`
 
             // Original `better_match`-style delta test, UNCHANGED (see
             // `process_position_l1`'s matching comment).
@@ -2087,9 +2109,7 @@ fn process_position_l1_lean(
                 _ => false,
             };
 
-            let not_worth_it = cost_gate
-                && est_match_bits(length, dist) as i32
-                    > (EST_LITERAL_BITS * length) as i32 + cost_margin;
+            let not_worth_it = false;
 
             if better_next || not_worth_it {
                 // Defer: emit `pos` as a literal; the caller discovers
@@ -2335,6 +2355,8 @@ fn fastloop_l1(
     // LAZY-PEEK-GATE lever: this BLOCK's gate decision, same shape as
     // `hash3_active` (own independent detector instance).
     peek_active: bool,
+    cost_gate_block_active: bool,
+    cost_gate_cfg: LazyPeekCostGateCfg,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline: warm the head-table line for the
@@ -2407,6 +2429,8 @@ fn fastloop_l1(
                 hash3,
                 hash3_active,
                 peek_active,
+                cost_gate_block_active,
+                cost_gate_cfg,
             );
             #[cfg(feature = "anatomy-counters")]
             {
@@ -2446,6 +2470,8 @@ fn fastloop_l1(
                     hash3,
                     hash3_active,
                     peek_active,
+                    cost_gate_block_active,
+                    cost_gate_cfg,
                 );
                 #[cfg(feature = "anatomy-counters")]
                 {
@@ -2498,6 +2524,8 @@ fn fastloop_l1(
             hash3,
             hash3_active,
             peek_active,
+            cost_gate_block_active,
+            cost_gate_cfg,
         );
         #[cfg(feature = "anatomy-counters")]
         {
@@ -2539,6 +2567,7 @@ fn fastloop_l1_lean(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
+    cost_gate_cfg: LazyPeekCostGateCfg,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline prefetch — see [`fastloop_l1`]'s matching
@@ -2582,6 +2611,7 @@ fn fastloop_l1_lean(
                 limit_hash_update_inserts,
                 #[cfg(feature = "anatomy-counters")]
                 local,
+                cost_gate_cfg,
             );
             #[cfg(feature = "anatomy-counters")]
             {
@@ -2602,6 +2632,7 @@ fn fastloop_l1_lean(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     local,
+                    cost_gate_cfg,
                 );
                 #[cfg(feature = "anatomy-counters")]
                 {
@@ -2638,6 +2669,7 @@ fn fastloop_l1_lean(
             limit_hash_update_inserts,
             #[cfg(feature = "anatomy-counters")]
             local,
+            cost_gate_cfg,
         );
         #[cfg(feature = "anatomy-counters")]
         {
@@ -2847,6 +2879,7 @@ pub(super) fn run<const ACCEL: bool>(
     use_dynamic: bool,
     limit_hash_update_inserts: usize,
     bucket2_cfg: Bucket2Cfg,
+    cost_gate_cfg: LazyPeekCostGateCfg,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -2991,6 +3024,7 @@ pub(super) fn run<const ACCEL: bool>(
     // `hash3_active_next`, independent threshold/initial-state knobs (see
     // `LAZY_PEEK_GATED`'s doc comment).
     let mut peek_active_next: bool = !peek_gated || peek_gate_initial_active;
+    let mut cost_gate_block_active_next: bool = cost_gate_cfg.enabled;
 
     loop {
         // Start a new block. It ends after `block_length` input bytes (a match
@@ -3006,6 +3040,7 @@ pub(super) fn run<const ACCEL: bool>(
         // This block's LAZY-PEEK-GATE decision (see `hash3_active`'s doc
         // comment above — same capture-before-recompute shape).
         let peek_active = peek_active_next;
+        let cost_gate_block_active = cost_gate_block_active_next;
 
         // `!ACCEL` is a compile-time-constant branch (ACCEL is a const
         // generic) so L0's monomorphization never carries this dead code —
@@ -3069,6 +3104,10 @@ pub(super) fn run<const ACCEL: bool>(
                 || (total > 0
                     && (literal_count as u64 * 100)
                         >= (peek_gate_threshold_pct as u64 * total as u64));
+            cost_gate_block_active_next = cost_gate_cfg.enabled
+                && total > 0
+                && (literal_count as u64 * 100)
+                    >= (cost_gate_cfg.lit_threshold_pct as u64 * total as u64);
             if pos == in_end {
                 break;
             }
@@ -3154,6 +3193,8 @@ pub(super) fn run<const ACCEL: bool>(
                         hash3,
                         hash3_active,
                         peek_active,
+                        cost_gate_block_active,
+                        cost_gate_cfg,
                     )
                 };
             }
@@ -3188,6 +3229,8 @@ pub(super) fn run<const ACCEL: bool>(
                         hash3,
                         hash3_active,
                         peek_active,
+                        cost_gate_block_active,
+                        cost_gate_cfg,
                     )
                 } else {
                     fastloop_l1_lean(
@@ -3200,6 +3243,7 @@ pub(super) fn run<const ACCEL: bool>(
                         limit_hash_update_inserts,
                         #[cfg(feature = "anatomy-counters")]
                         &mut local,
+                        cost_gate_cfg,
                     )
                 };
             }
@@ -3266,6 +3310,10 @@ pub(super) fn run<const ACCEL: bool>(
                 || (total > 0
                     && (literal_count as u64 * 100)
                         >= (peek_gate_threshold_pct as u64 * total as u64));
+            cost_gate_block_active_next = cost_gate_cfg.enabled
+                && total > 0
+                && (literal_count as u64 * 100)
+                    >= (cost_gate_cfg.lit_threshold_pct as u64 * total as u64);
         }
 
         // CONTENT-ADAPTIVE CHAIN MATCHING bookkeeping for a block that just
@@ -3504,6 +3552,8 @@ pub(super) fn run_resumable(
                     hash3,
                     hash3_active,
                     peek_active,
+                    false,
+                    LazyPeekCostGateCfg::DISABLED,
                 )
             } else {
                 fastloop_l1_lean(
@@ -3516,6 +3566,7 @@ pub(super) fn run_resumable(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     &mut local,
+                    LazyPeekCostGateCfg::DISABLED,
                 )
             };
             pos = parse_tail(
