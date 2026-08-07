@@ -103,7 +103,7 @@ fn chunks_per_thread() -> usize {
 const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
 #[inline]
-fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
+pub(crate) fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
     // THREAD-AWARE. Chunk COUNT is what costs size: every chunk restarts the block
     // grid and pays its own dynamic-header mass plus a seam, so a 26 MB file cut into
     // 512 KiB chunks pays that ~50 times whether it is running on 4 threads or 32.
@@ -466,6 +466,9 @@ impl PipelinedGzEncoder {
                 unsafe {
                     *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
                 }
+                // flate2 sync-flush chunks are complete byte-aligned streams:
+                // written verbatim, never bit-shifted.
+                crate::compress::deflate::bitstream::ChunkMeta::ALIGNED
             },
         )?;
 
@@ -528,14 +531,20 @@ impl PipelinedGzEncoder {
             self.num_threads,
             writer,
             |block_idx, block, dict, is_last, output| {
-                // Compress this chunk with the pure-Rust engine. A non-final
-                // chunk is closed with a sync-flush marker inside the callee.
+                // Compress this chunk with the pure-Rust engine as a raw
+                // SPLICE FRAGMENT: no sync-flush seam, no byte-align padding.
+                // The writer thread bit-splices fragments into one continuous
+                // DEFLATE stream, so the old ~5-byte-per-chunk framing floor
+                // never reaches the output (except ahead of a fragment that
+                // contains a stored block, which must start byte-aligned —
+                // the returned ChunkMeta says so and the splicer re-creates
+                // the seam at exactly those boundaries).
                 output.clear();
                 // `parallel = true`: this IS the T>1 chunk worker, so it uses
                 // `level::params_parallel` — the stronger parse the T4 wall slack pays for.
                 // The T1 path (`encode_gzip_slack_padded_to_vec`) never reaches here and is
                 // byte-unchanged.
-                deflate::encode_deflate_segment_to_sink(
+                let meta = deflate::encode_deflate_splice_chunk_to_sink(
                     block,
                     dict.unwrap_or(&[]),
                     level,
@@ -551,6 +560,7 @@ impl PipelinedGzEncoder {
                 unsafe {
                     *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
                 }
+                meta
             },
         )?;
 

@@ -61,6 +61,8 @@ mod infra; // thread_pool, scheduler, io_thread
 
 // ── Test infrastructure ───────────────────────────────────────────────────────
 #[cfg(test)]
+mod fixtures; // frozen mechanism fixtures (the lib exports these as `gzippy::fixtures`)
+#[cfg(test)]
 mod tests;
 
 use cli::GzippyArgs;

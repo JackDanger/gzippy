@@ -30,6 +30,19 @@ pub struct BitWriter {
     out: Vec<u8>,
 }
 
+// LAYOUT IS LOAD-BEARING (bisect receipt, 2026-08-03). This struct sits on the
+// T1 hot path at every level, and the first bit-splice substrate added an
+// `align_sensitive: bool` field here plus a store in `align_to_byte()`. That
+// alone — with the splicer never running — moved armexe.elf L1/T1 from ratio
+// 0.576 to 0.615 wall vs gzip on the frozen Zen2 box (3-arm bisect: pristine
+// main / substrate-only / full branch = 0.576 / 0.615 / 0.612; fulcrum ab
+// paired n=25, artifacts solvency:/root/bs2-*.json). Binary-class files (dense
+// short matches, the most emit calls per byte) pay the most. Stored-block
+// detection for the T>1 splicer therefore lives OFF this struct — a
+// thread-local in `deflate::mod` set by the two cold stored-block emitters —
+// and this struct must stay byte-for-byte as main has it. Do not add fields or
+// hot-method writes here for bookkeeping that can have a cold home.
+
 impl Default for BitWriter {
     fn default() -> Self {
         Self::new()
@@ -286,11 +299,343 @@ impl BitWriter {
         }
         self.out
     }
+
+    /// Finish the stream WITHOUT losing its exact bit length: flush full
+    /// bytes, emit any final partial byte zero-padded exactly as
+    /// [`finish`](Self::finish) does, and return `(bytes, pad_bits)` where
+    /// `pad_bits` (0..=7) is how many high bits of the LAST byte are padding
+    /// rather than stream. The bytes are identical to `finish`'s; the extra
+    /// return value is what lets the T>1 writer thread bit-splice this chunk
+    /// onto the tail of the previous one instead of treating the pad as real.
+    pub fn finish_unaligned(mut self) -> (Vec<u8>, u8) {
+        self.flush_bits();
+        let pad = if self.bitcount > 0 {
+            debug_assert!(self.bitcount < 8);
+            self.out.push(self.bitbuf as u8);
+            (8 - self.bitcount) as u8
+        } else {
+            0
+        };
+        self.bitbuf = 0;
+        self.bitcount = 0;
+        (self.out, pad)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T>1 bit-splicing: joining independently encoded chunk streams into ONE
+// continuous DEFLATE bitstream with no byte-align seams between them.
+// ---------------------------------------------------------------------------
+
+/// What the T>1 writer thread needs to know about one chunk's DEFLATE
+/// fragment in order to splice it onto the stream so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkMeta {
+    /// High bits of the fragment's LAST byte that are zero padding, not
+    /// stream (0..=7). 0 means the fragment ends exactly on a byte boundary.
+    pub pad_bits: u8,
+    /// The fragment contains structure whose byte alignment is relative to
+    /// its own start (a stored block's LEN/NLEN + payload), so it must be
+    /// placed at a byte-aligned offset — it cannot be bit-shifted.
+    pub needs_alignment: bool,
+}
+
+impl ChunkMeta {
+    /// A fragment that is a complete byte-aligned stream in its own right
+    /// (e.g. the old sync-flushed chunks, or opaque passthrough data). Safe
+    /// default: written verbatim at what is guaranteed to be an aligned
+    /// offset, never shifted.
+    pub const ALIGNED: ChunkMeta = ChunkMeta {
+        pad_bits: 0,
+        needs_alignment: true,
+    };
+}
+
+/// Streaming bit-splicer: joins chunk fragments produced by independent
+/// [`BitWriter`]s into one continuous DEFLATE bitstream.
+///
+/// Holds at most one partial byte between fragments. For each fragment:
+///
+/// * offset byte-aligned and fragment unshifted — verbatim write (fast path);
+/// * otherwise — shift the whole fragment left by the current bit offset,
+///   OR-ing its first byte into the pending partial byte (byte-at-a-time;
+///   runs on the otherwise-waiting writer thread);
+/// * a fragment that [`ChunkMeta::needs_alignment`] while the offset is
+///   unaligned is preceded by a standard empty stored block
+///   (`BFINAL=0`,`BTYPE=00`,pad,`LEN=0`,`NLEN=0xFFFF`) — exactly the old
+///   per-chunk sync-flush seam, paid only at the boundaries that need it.
+///
+/// [`finish`](Self::finish) zero-pads the trailing partial byte; pad bits
+/// after the final BFINAL block are normal DEFLATE.
+pub struct BitSplicer {
+    /// Pending partial byte (low `bitpos` bits valid, high bits zero).
+    pending: u8,
+    /// Bit offset within the pending byte (0..=7). 0 == byte-aligned.
+    bitpos: u32,
+    /// Scratch for the shift path, reused across chunks.
+    shift_buf: Vec<u8>,
+}
+
+impl Default for BitSplicer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BitSplicer {
+    pub fn new() -> Self {
+        BitSplicer {
+            pending: 0,
+            bitpos: 0,
+            shift_buf: Vec::new(),
+        }
+    }
+
+    /// Splice one fragment onto the stream, writing every completed byte to `w`.
+    pub fn splice_to<W: std::io::Write>(
+        &mut self,
+        w: &mut W,
+        data: &[u8],
+        meta: ChunkMeta,
+    ) -> std::io::Result<()> {
+        debug_assert!(meta.pad_bits < 8);
+        if data.is_empty() {
+            debug_assert_eq!(meta.pad_bits, 0, "pad bits on an empty fragment");
+            return Ok(());
+        }
+        if meta.needs_alignment && self.bitpos != 0 {
+            self.emit_alignment_seam(w)?;
+        }
+        if self.bitpos == 0 {
+            // Fast path: verbatim write; a trailing partial byte becomes pending.
+            if meta.pad_bits == 0 {
+                w.write_all(data)?;
+            } else {
+                w.write_all(&data[..data.len() - 1])?;
+                self.pending = data[data.len() - 1];
+                self.bitpos = 8 - meta.pad_bits as u32;
+            }
+            return Ok(());
+        }
+        // Shift path: move the fragment up by `bitpos` bits, OR-ing its first
+        // byte into the pending partial byte. DEFLATE is LSB-first, so "later
+        // in the stream" is "higher bit position within the byte".
+        let shift = self.bitpos;
+        let inv = 8 - shift;
+        self.shift_buf.clear();
+        self.shift_buf.reserve(data.len());
+        let mut carry = self.pending;
+        // Word-wise shift: 8 bytes per iteration through a u64 lane. The v1
+        // byte-at-a-time loop serialized megabytes of single-byte work on the
+        // writer thread's critical path — adjudicated as the confirmed
+        // pigz:tool.bin:L4:T4 wall flip (0.9815 -> 1.0129, 22 MB output,
+        // corpus tool.bin; try.json in lever-origin-lever-t4-bitsplice).
+        // Little-endian u64 keeps DEFLATE's LSB-first order: within the lane,
+        // byte k's low bits receive byte k-1's high bits, exactly as the
+        // byte loop did; the lane's top `inv` bits carry into the next lane.
+        let mut chunks = data.chunks_exact(8);
+        for ch in &mut chunks {
+            let lane = u64::from_le_bytes(ch.try_into().unwrap());
+            let shifted = (lane << shift) | carry as u64;
+            self.shift_buf.extend_from_slice(&shifted.to_le_bytes());
+            carry = (lane >> (64 - shift as u64)) as u8;
+        }
+        for &b in chunks.remainder() {
+            self.shift_buf.push(carry | (b << shift));
+            carry = b >> inv;
+        }
+        let total_bits = shift as usize + data.len() * 8 - meta.pad_bits as usize;
+        let full = total_bits / 8;
+        let rem = (total_bits % 8) as u32;
+        if full < self.shift_buf.len() {
+            debug_assert_eq!(full + 1, self.shift_buf.len());
+            debug_assert!(rem > 0);
+            w.write_all(&self.shift_buf[..full])?;
+            self.pending = self.shift_buf[full];
+            self.bitpos = rem;
+        } else {
+            debug_assert_eq!(full, self.shift_buf.len());
+            w.write_all(&self.shift_buf)?;
+            // rem may be 0, in which case carry holds only pad zeros.
+            debug_assert!(rem != 0 || carry == 0);
+            self.pending = carry;
+            self.bitpos = rem;
+        }
+        if self.bitpos == 0 {
+            self.pending = 0;
+        }
+        Ok(())
+    }
+
+    /// Close the stream so far on a byte boundary with a standard empty stored
+    /// block — the same 5-byte `Z_SYNC_FLUSH` marker the old per-chunk seam
+    /// used, now emitted ONLY when an alignment-sensitive fragment follows an
+    /// unaligned offset. Precondition: `bitpos != 0`.
+    fn emit_alignment_seam<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        debug_assert!(self.bitpos != 0);
+        crate::anatomy_count!(blocks_emitted_stored);
+        // BFINAL=0 + BTYPE=00 are three ZERO bits, and the byte-align pad is
+        // zero bits too — the pending byte already has zeros above `bitpos`,
+        // so it goes out as-is; if the 3 header bits spill past the byte
+        // boundary (bitpos 6 or 7) the spill byte is all pad, i.e. 0x00.
+        w.write_all(&[self.pending])?;
+        if self.bitpos + 3 > 8 {
+            w.write_all(&[0u8])?;
+        }
+        w.write_all(&[0x00, 0x00, 0xFF, 0xFF])?; // LEN=0, NLEN=!0
+        self.pending = 0;
+        self.bitpos = 0;
+        Ok(())
+    }
+
+    /// Flush the trailing partial byte (zero-padded). Call exactly once, after
+    /// the final fragment.
+    pub fn finish<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        if self.bitpos > 0 {
+            w.write_all(&[self.pending])?;
+            self.pending = 0;
+            self.bitpos = 0;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── BitSplicer: joining independently written fragments must be
+    // bit-exact with writing the same bits through ONE BitWriter. ──
+
+    /// Deterministic op sequence: (value, nbits) pairs from an LCG.
+    fn splice_ops(seed: u32, count: usize) -> Vec<(u64, u32)> {
+        let mut s = seed;
+        let mut next = move || {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            s
+        };
+        (0..count)
+            .map(|_| {
+                let mut r = next();
+                let n = (r % 16) + 1; // 1..=16 bits
+                r = next();
+                ((r as u64) & ((1u64 << n) - 1), n)
+            })
+            .collect()
+    }
+
+    /// Splicing arbitrary fragment boundaries (every intermediate bit
+    /// offset 0..=7 occurs across the sweep) reproduces the single-writer
+    /// stream byte-for-byte.
+    #[test]
+    fn splicer_matches_single_writer() {
+        let ops = splice_ops(0xC0FFEE, 300);
+        let reference = {
+            let mut w = BitWriter::new();
+            for &(v, n) in &ops {
+                w.add_bits(v, n);
+            }
+            w.finish()
+        };
+        // Sweep several fragmentations, including single-op fragments.
+        for &nfrags in &[1usize, 2, 3, 7, 30, 300] {
+            let per = ops.len().div_ceil(nfrags);
+            let mut spliced = Vec::new();
+            let mut sp = BitSplicer::new();
+            for frag in ops.chunks(per) {
+                let mut w = BitWriter::new();
+                for &(v, n) in frag {
+                    w.add_bits(v, n);
+                }
+                let (bytes, pad_bits) = w.finish_unaligned();
+                sp.splice_to(
+                    &mut spliced,
+                    &bytes,
+                    ChunkMeta {
+                        pad_bits,
+                        needs_alignment: false,
+                    },
+                )
+                .unwrap();
+            }
+            sp.finish(&mut spliced).unwrap();
+            assert_eq!(
+                spliced, reference,
+                "splice of {nfrags} fragments diverged from the single-writer stream"
+            );
+        }
+    }
+
+    /// A fragment that needs byte alignment while the offset is unaligned is
+    /// preceded by exactly the empty-stored sync seam the old per-chunk path
+    /// emitted — verified against a single BitWriter that emits the same seam
+    /// explicitly. Sweeps every unaligned bit offset 1..=7 (6 and 7 spill the
+    /// 3 header bits into a second pad byte).
+    #[test]
+    fn splicer_alignment_seam_matches_explicit_sync_flush() {
+        for lead_bits in 1u32..=7 {
+            let tail: &[u8] = &[0xDE, 0xAD, 0xBE];
+            let reference = {
+                let mut w = BitWriter::new();
+                w.add_bits((1 << lead_bits) - 1, lead_bits);
+                // Empty stored block: BFINAL=0, BTYPE=00, align, LEN=0, NLEN=!0.
+                w.add_bits(0, 1);
+                w.add_bits(0, 2);
+                w.align_to_byte();
+                w.write_u16_le(0);
+                w.write_u16_le(!0);
+                w.write_aligned_bytes(tail);
+                w.finish()
+            };
+            let spliced = {
+                let mut out = Vec::new();
+                let mut sp = BitSplicer::new();
+                let (lead, pad) = {
+                    let mut w = BitWriter::new();
+                    w.add_bits((1 << lead_bits) - 1, lead_bits);
+                    w.finish_unaligned()
+                };
+                sp.splice_to(
+                    &mut out,
+                    &lead,
+                    ChunkMeta {
+                        pad_bits: pad,
+                        needs_alignment: false,
+                    },
+                )
+                .unwrap();
+                sp.splice_to(&mut out, tail, ChunkMeta::ALIGNED).unwrap();
+                sp.finish(&mut out).unwrap();
+                out
+            };
+            assert_eq!(
+                spliced, reference,
+                "seam mismatch at bit offset {lead_bits}"
+            );
+        }
+    }
+
+    /// `finish_unaligned` returns the same bytes `finish` would, plus the pad.
+    #[test]
+    fn finish_unaligned_matches_finish() {
+        for nbits in 0u32..=40 {
+            let build = || {
+                let mut w = BitWriter::new();
+                for i in 0..nbits {
+                    w.add_bits((i % 2) as u64, 1);
+                }
+                w
+            };
+            let finished = build().finish();
+            let (bytes, pad) = build().finish_unaligned();
+            assert_eq!(bytes, finished, "bytes diverged at {nbits} bits");
+            assert_eq!(
+                pad as u32,
+                (8 - (nbits % 8)) % 8,
+                "pad wrong at {nbits} bits"
+            );
+        }
+    }
 
     #[test]
     fn can_buffer_matches_definition() {

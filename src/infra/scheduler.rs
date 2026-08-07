@@ -12,6 +12,7 @@
 //!
 //! Set GZIPPY_DEBUG=1 to enable timing diagnostics.
 
+use crate::compress::deflate::bitstream::{BitSplicer, ChunkMeta};
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -29,6 +30,10 @@ pub struct BlockSlot {
     ready: AtomicBool,
     /// The compressed data for this block
     data: UnsafeCell<Vec<u8>>,
+    /// Splice metadata for this block's fragment (bit length + alignment
+    /// need), written by the same worker that fills `data`, before
+    /// `mark_ready`. See [`ChunkMeta`].
+    meta: UnsafeCell<ChunkMeta>,
 }
 
 /// Efficient spin-wait for slot readiness
@@ -53,6 +58,7 @@ impl BlockSlot {
         Self {
             ready: AtomicBool::new(false),
             data: UnsafeCell::new(Vec::with_capacity(capacity)),
+            meta: UnsafeCell::new(ChunkMeta::ALIGNED),
         }
     }
 
@@ -88,6 +94,22 @@ impl BlockSlot {
     pub fn data(&self) -> &[u8] {
         unsafe { &*self.data.get() }
     }
+
+    /// Record this block's splice metadata (called by the single worker
+    /// assigned to this block, before `mark_ready`).
+    ///
+    /// # Safety
+    /// Same single-writer contract as [`data_mut`](Self::data_mut).
+    #[inline]
+    pub unsafe fn set_meta(&self, meta: ChunkMeta) {
+        *self.meta.get() = meta;
+    }
+
+    /// Get this block's splice metadata (writer thread, after `is_ready`).
+    #[inline]
+    pub fn meta(&self) -> ChunkMeta {
+        unsafe { *self.meta.get() }
+    }
 }
 
 /// Compress blocks in parallel with dedicated writer thread (pigz model)
@@ -110,7 +132,7 @@ pub fn compress_parallel<W, F>(
 ) -> io::Result<W>
 where
     W: Write + Send,
-    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) + Sync,
+    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) -> ChunkMeta + Sync,
 {
     let debug = is_debug_enabled();
     let start = Instant::now();
@@ -166,6 +188,12 @@ where
         // Returns the writer so caller can write trailer
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
+            // Bit-splice each block's fragment onto one continuous DEFLATE
+            // stream. Fragments produced byte-aligned with pad_bits=0 (the
+            // `ChunkMeta::ALIGNED` case) degrade to plain in-order
+            // `write_all`s, so non-DEFLATE users of this scheduler are
+            // unaffected.
+            let mut splicer = BitSplicer::new();
             for (slot_idx, slot) in slots.iter().enumerate() {
                 let wait_start = Instant::now();
                 let t0 = crate::infra::trace_spans::now_us();
@@ -175,13 +203,18 @@ where
 
                 let write_start = Instant::now();
                 let t1 = crate::infra::trace_spans::now_us();
-                if w.write_all(slot.data()).is_err() {
+                if splicer.splice_to(&mut w, slot.data(), slot.meta()).is_err() {
                     write_error.store(true, Ordering::Relaxed);
                     break;
                 }
                 crate::infra::trace_spans::record("write", 0, t1, slot_idx, slot.data().len());
                 total_write_ns
                     .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            // Zero-pad the trailing partial byte (normal DEFLATE padding
+            // after the final BFINAL block).
+            if splicer.finish(&mut w).is_err() {
+                write_error.store(true, Ordering::Relaxed);
             }
             w
         });
@@ -267,7 +300,7 @@ fn worker_loop_timed<F>(
     blocks_compressed: &AtomicUsize,
     trace_tid: u32,
 ) where
-    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>),
+    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) -> ChunkMeta,
 {
     loop {
         // Claim next block atomically
@@ -298,8 +331,9 @@ fn worker_loop_timed<F>(
         // Time the compression
         let compress_start = Instant::now();
         let t0 = crate::infra::trace_spans::now_us();
-        compress_fn(block_idx, block, dict, is_last, output);
+        let meta = compress_fn(block_idx, block, dict, is_last, output);
         crate::infra::trace_spans::record("chunk_compress", trace_tid, t0, block_idx, block.len());
+        unsafe { slots[block_idx].set_meta(meta) };
         total_compress_ns.fetch_add(
             compress_start.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -404,6 +438,7 @@ mod tests {
                 // Simple "compression": just copy
                 out.clear();
                 out.extend_from_slice(block);
+                ChunkMeta::ALIGNED
             },
         )
         .unwrap();
@@ -427,6 +462,7 @@ mod tests {
                 // (In real use, compression time varies)
                 out.clear();
                 out.extend_from_slice(block);
+                ChunkMeta::ALIGNED
             },
         )
         .unwrap();
@@ -447,6 +483,7 @@ mod tests {
             |_idx, block, _dict, _is_last, out| {
                 out.clear();
                 out.extend_from_slice(block);
+                ChunkMeta::ALIGNED
             },
         )
         .unwrap();
