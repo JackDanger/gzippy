@@ -452,6 +452,7 @@ pub(super) fn compress(
             fast::FAST0_BLOCK_LENGTH,
             true,
             fast::LIMIT_HASH_UPDATE_INSERTS_L0,
+            fast::Bucket2Cfg::DISABLED,
         ),
         // `l1-tune` (2026-07-22 L1-band search campaign, OFF by default):
         // block length and insert-depth are already plain runtime params to
@@ -460,20 +461,31 @@ pub(super) fn compress(
         // change to `fast::run`'s signature needed. Byte-identical to the
         // `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
         #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => fast::run::<false>(
-            buf,
-            data_start,
-            in_end,
-            statics,
-            bw,
-            is_last,
-            fast::FAST_BLOCK_LENGTH,
-            true,
-            fast::LIMIT_HASH_UPDATE_INSERTS_L1,
-        ),
+        Strategy::Fast => {
+            let bucket2 = fast::Bucket2Cfg {
+                enabled: params.fast_bucket2,
+                gate_max_len: params.fast_bucket2_gate_max_len,
+            };
+            fast::run::<false>(
+                buf,
+                data_start,
+                in_end,
+                statics,
+                bw,
+                is_last,
+                fast::FAST_BLOCK_LENGTH,
+                true,
+                fast::LIMIT_HASH_UPDATE_INSERTS_L1,
+                bucket2,
+            )
+        }
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
             let t = fast::tune::get();
+            let bucket2 = fast::Bucket2Cfg {
+                enabled: params.fast_bucket2,
+                gate_max_len: params.fast_bucket2_gate_max_len,
+            };
             fast::run::<false>(
                 buf,
                 data_start,
@@ -484,6 +496,7 @@ pub(super) fn compress(
                 t.block_length,
                 true,
                 t.insert_depth,
+                bucket2,
             )
         }
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),
