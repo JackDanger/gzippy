@@ -282,7 +282,7 @@ pub fn params_parallel(level: u32) -> LevelParams {
         p.fast_bucket2 = true;
         p.fast_bucket2_gate_max_len = 64;
         p.fast_lazy_peek_cost_gate = true;
-        p.fast_lazy_peek_cost_margin_bits = -4;
+        p.fast_lazy_peek_cost_margin_bits = 0;
     }
     p
 }
