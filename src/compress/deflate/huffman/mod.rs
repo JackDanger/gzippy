@@ -54,4 +54,23 @@ pub struct CodeScratch {
     pub alt_litcode: HuffmanCode,
     pub alt_offcode: HuffmanCode,
     pub alt_header: HeaderScratch,
+    /// Scratch for the RLE-shaped header candidate (zopfli
+    /// `TryOptimizeHuffmanForRle`): candidate codes, header buffers, and the
+    /// `good_for_rle` flag buffer. Caller-owned and reused per parser call.
+    pub shape: ShapeScratch,
+    /// What this encode path can afford to spend on the header. Defaults to
+    /// [`HeaderBudget::Lean`], so a site that never threads it keeps T1
+    /// behaviour byte-identical.
+    pub budget: crate::compress::deflate::encode_types::HeaderBudget,
+}
+
+/// Per-block working set for the RLE-shaped Huffman candidate. Held inside
+/// [`CodeScratch`] so it lives for a whole parser invocation.
+#[derive(Default)]
+pub struct ShapeScratch {
+    pub cand_litcode: HuffmanCode,
+    pub cand_offcode: HuffmanCode,
+    pub raw_header: HeaderScratch,
+    pub cand_header: HeaderScratch,
+    pub rle_flags: Vec<bool>,
 }

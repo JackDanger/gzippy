@@ -352,7 +352,12 @@ fn deflate_into(
         } else {
             level::params(level)
         };
-        parse::compress(buf, data_start, in_end, &params, is_last, bw);
+        let budget = if parallel {
+            encode_types::HeaderBudget::Generous
+        } else {
+            encode_types::HeaderBudget::Lean
+        };
+        parse::compress(buf, data_start, in_end, &params, is_last, budget, bw);
     }
 
     // Non-final chunk in a CONCATENATED stream: close on a clean byte boundary

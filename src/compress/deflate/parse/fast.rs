@@ -2883,6 +2883,7 @@ pub(super) fn run<const ACCEL: bool>(
     limit_hash_update_inserts: usize,
     bucket2_cfg: Bucket2Cfg,
     cost_gate_cfg: LazyPeekCostGateCfg,
+    budget: super::super::encode_types::HeaderBudget,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -2990,7 +2991,10 @@ pub(super) fn run<const ACCEL: bool>(
     // One dynamic-header scratch buffer for the WHOLE `run()` call (see
     // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
     let mut header_scratch = HeaderScratch::new();
-    let mut code_scratch = CodeScratch::default();
+    let mut code_scratch = CodeScratch {
+        budget,
+        ..Default::default()
+    };
     let mut pos = data_start;
 
     // CONTENT-ADAPTIVE CHAIN MATCHING state (`l1-tune` only; see
@@ -3503,6 +3507,7 @@ pub(super) fn run_resumable(
     input_mode: super::InputMode,
     block_length: usize,
     use_dynamic: bool,
+    budget: super::super::encode_types::HeaderBudget,
 ) -> usize {
     debug_assert!(in_end >= from);
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
@@ -3538,7 +3543,10 @@ pub(super) fn run_resumable(
     let mut local = FastLocalCounters::default();
     let mut sink = Sink::acquire();
     let mut header_scratch = HeaderScratch::new();
-    let mut code_scratch = CodeScratch::default();
+    let mut code_scratch = CodeScratch {
+        budget,
+        ..Default::default()
+    };
     let mut pos = from;
 
     loop {

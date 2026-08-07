@@ -53,3 +53,26 @@ impl InputMode {
         matches!(self, InputMode::Drain)
     }
 }
+
+/// How much wall time this encode path can afford to spend shrinking a block
+/// header. A property of the PATH, not of the level — which is why it is not a
+/// field on [`LevelParams`](super::level::LevelParams).
+///
+/// `Lean` is the DEFAULT so that any construction site nobody threads fails
+/// SAFE (shaping off, T1 bytes unchanged) rather than silently opting in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HeaderBudget {
+    /// Wall-critical path (T1). Build codes from the true histogram only.
+    #[default]
+    Lean,
+    /// Wall-slack path (T>1). Also try the RLE-shaped histogram, keep it when
+    /// strictly cheaper.
+    Generous,
+}
+
+impl HeaderBudget {
+    #[inline]
+    pub fn may_shape(self) -> bool {
+        matches!(self, HeaderBudget::Generous)
+    }
+}

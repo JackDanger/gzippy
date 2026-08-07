@@ -6,6 +6,7 @@
 //! heuristic (and the short-match offset guard), otherwise emit a literal.
 
 use super::super::bitstream::BitWriter;
+use super::super::encode_types::HeaderBudget;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
@@ -23,6 +24,7 @@ pub(super) fn run(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
+    budget: HeaderBudget,
 ) {
     let mut state = ParseState::new();
     // Seed a preset dictionary into the matchfinder (positions before data_start
@@ -50,6 +52,7 @@ pub(super) fn run(
             BlockRole::Interior
         },
         InputMode::Drain,
+        budget,
     );
 }
 
@@ -79,13 +82,17 @@ pub(super) fn run_resumable(
     bw: &mut BitWriter,
     role: BlockRole,
     input_mode: InputMode,
+    budget: HeaderBudget,
 ) -> usize {
     let mut sink = Sink::acquire();
     // One dynamic-header scratch buffer for the WHOLE call, reused across
     // every internal block (see `HeaderScratch`'s doc comment) instead of
     // `build_dynamic_header` allocating a fresh `Vec` per block.
     let mut header_scratch = HeaderScratch::new();
-    let mut code_scratch = CodeScratch::default();
+    let mut code_scratch = CodeScratch {
+        budget,
+        ..Default::default()
+    };
     let mut in_next = from;
 
     loop {
