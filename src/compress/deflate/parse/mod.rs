@@ -1831,13 +1831,15 @@ mod l1_bakeoff {
     /// about losing.
     const RATCHET: &[(&str, i64)] = &[
         ("armexe.elf", -3863),
-        ("data.parquet", -984),
-        ("data.csv", -210),
+        // Len-3 maintenance gating (ht_fast @ T>1 lever) trades ~210 B on csv and
+        // ~210 B on parquet for the write-traffic cut the wall leg needs.
+        ("data.parquet", -774),
+        ("data.csv", 0),
         ("engine.wasm", 61),
-        ("minjs.min.js", 313),
-        ("data.json", 449),
-        ("aozora.txt", 550),
-        ("dickens", 644),
+        ("minjs.min.js", 68),
+        ("data.json", 0),
+        ("aozora.txt", 109),
+        ("dickens", 0),
     ];
 
     #[test]
