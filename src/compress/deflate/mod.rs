@@ -964,19 +964,19 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     Ok(len as u64)
 }
 
-/// Gzip-compress `data` with ONE continuous [`ParseState`] and [`BitWriter`],
-/// using [`level::params_parallel`] and [`HeaderBudget::Generous`]. The caller
-/// must have already written the gzip header; this appends the DEFLATE body and
-/// CRC32/ISIZE trailer.
+/// Gzip-compress `data` with ONE continuous [`ParseState`] and [`BitWriter`].
+/// When `parallel` is true, uses [`level::params_parallel`] and
+/// [`HeaderBudget::Generous`] (the T>1 chunk worker knobs); when false, uses
+/// [`level::params`] and [`HeaderBudget::Lean`] (byte-identical to the T1
+/// streaming encoder on the same input).
 ///
-/// Block boundaries match the T1 streaming encoder at the same input because the
-/// matchfinder is never rebuilt at artificial chunk seams — the pipelined
-/// per-chunk `compress()` path does rebuild it, which is what costs the six
-/// remaining libdeflate T4 cells on tabular/text corpora.
-pub fn encode_deflate_stateful_parallel_to_writer<W: std::io::Write>(
+/// The caller must have already written the gzip header; this appends the
+/// DEFLATE body and CRC32/ISIZE trailer.
+pub fn encode_deflate_stateful_to_writer<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
     level: u32,
+    parallel: bool,
 ) -> std::io::Result<u64> {
     use encode_types::{BlockRole, HeaderBudget, InputMode};
 
@@ -989,8 +989,16 @@ pub fn encode_deflate_stateful_parallel_to_writer<W: std::io::Write>(
     let out = Vec::with_capacity(out_cap);
     let mut bw = BitWriter::from_vec(out);
 
-    let params = level::params_parallel(level);
-    let budget = HeaderBudget::Generous;
+    let params = if parallel {
+        level::params_parallel(level)
+    } else {
+        level::params(level)
+    };
+    let budget = if parallel {
+        HeaderBudget::Generous
+    } else {
+        HeaderBudget::Lean
+    };
     let mut state = parse::ParseState::new();
     let mut in_next = 0usize;
 
@@ -1049,6 +1057,16 @@ pub fn encode_deflate_stateful_parallel_to_writer<W: std::io::Write>(
     tail.extend_from_slice(&(len as u32).to_le_bytes());
     crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
     Ok(len as u64)
+}
+
+/// [`encode_deflate_stateful_to_writer`] with `parallel = true`.
+#[allow(dead_code)]
+pub fn encode_deflate_stateful_parallel_to_writer<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+    level: u32,
+) -> std::io::Result<u64> {
+    encode_deflate_stateful_to_writer(data, writer, level, true)
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
