@@ -276,6 +276,7 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // peek/defer — unlike `ht_fast`'s greedy accept-all, which flipped tabular.
     if level == 1 {
         p.fast_bucket2 = true;
+        p.fast_bucket2_gate_max_len = 64;
     }
     p
 }
