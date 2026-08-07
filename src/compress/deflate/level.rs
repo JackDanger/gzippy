@@ -35,6 +35,11 @@ pub enum Strategy {
     /// Huffman coding. No hash chains, no depth loop
     /// (`vendor/isa-l/igzip/igzip_base.c:isal_deflate_body_base`).
     Fast,
+    /// Level 1, T>1 path only: libdeflate's `deflate_compress_fastest` over the
+    /// 2-way-bucket `HtMatchfinder` synthesis (bucket pair + literal-count-
+    /// governed length-3 table). Routed exclusively from [`params_parallel`];
+    /// no `params()` level maps here, so the T1 output is untouched.
+    HtFast,
     /// Greedy parse: always take the longest match at each position.
     Greedy,
     /// Lazy parse: defer a match one byte to check for a longer one.
@@ -265,6 +270,16 @@ pub fn params_parallel(level: u32) -> LevelParams {
     //           (-258 B margin), movie.mp4 (-370) and photo.jpg (-55) vs libdeflate — all
     //           zero-headroom seam cells.
     p.try_exact_huffman = true;
+    // L1 AT T>1 ROUTES TO `ht_fast` — the synthesis finder (2-way bucket + literal-count-
+    // governed length-3 table), T>1-ONLY. This is the coordinate move
+    // `docs/board/l1-next-lever.md` pre-registered: both prior wall verdicts against
+    // `ht_fast` were taken at T1, where slack vs single-threaded libdeflate is 0-8%; the
+    // failing L1 size cells are concentrated at T4, where slack is 249-330%. T1 keeps
+    // `Strategy::Fast` via `params()` and is byte-identical by construction — this
+    // function is only reached from `deflate_into(parallel=true)`.
+    if level == 1 {
+        p.strategy = Strategy::HtFast;
+    }
     p
 }
 
@@ -304,6 +319,7 @@ pub mod ladder_tune {
             let strategy = match it.next()? {
                 "fast0" => Strategy::Fast0,
                 "fast" => Strategy::Fast,
+                "htfast" => Strategy::HtFast,
                 "greedy" => Strategy::Greedy,
                 "lazy" => Strategy::Lazy,
                 "lazy2" => Strategy::Lazy2,

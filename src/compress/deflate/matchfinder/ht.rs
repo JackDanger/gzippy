@@ -258,6 +258,22 @@ pub struct HtMatchfinder {
     /// documented reason it "doesn't support length 3 matches" — and adding it is
     /// the whole point of this variant. See the module doc.
     hash3_tab: [i16; HT_HASH3_SIZE],
+    /// Whether length-3 matches may be ACCEPTED for the block being parsed.
+    ///
+    /// Set per block by the parser from libdeflate's own literal-count rule
+    /// ([`super::super::parse::choose_min_match_len`]): a length-3 match is worth
+    /// taking only when literals are expensive, and the number of DISTINCT
+    /// literals in the data is libdeflate's proxy for that. Their
+    /// `deflate_compress_fastest` needs no such rule because its matchfinder has
+    /// no length-3 table to govern; we have one, so we need the rule they apply
+    /// at levels 2-9.
+    ///
+    /// The table is MAINTAINED regardless of this flag, so a block that re-enables
+    /// length-3 matching sees a fully populated table. Entries surviving from a
+    /// disabled block are still sound: every candidate is re-validated against
+    /// `cutoff` and by the 3-byte compare, so a stale entry can only produce a
+    /// genuine match or no match at all.
+    allow_len3: bool,
 }
 
 thread_local! {
@@ -323,6 +339,12 @@ impl HtMatchfinder {
             for i in 0..HT_HASH3_SIZE {
                 t3.add(i).write(MATCHFINDER_INITVAL);
             }
+            // MUST be written before `assume_init`: `new_uninit` gives uninitialised
+            // memory and a `bool` holding anything other than 0 or 1 is UB the moment
+            // it is read. `false` is the conservative arm — a parser that forgets to
+            // call `set_allow_len3` gets libdeflate's own no-length-3 behaviour, not
+            // a coin flip.
+            core::ptr::addr_of_mut!((*p).allow_len3).write(false);
             boxed.assume_init()
         }
     }
@@ -366,6 +388,15 @@ impl HtMatchfinder {
         let mut mf = existing.unwrap_or_else(Self::new);
         mf.reset();
         PooledHt(Some(mf))
+    }
+
+    /// Set whether [`Self::longest_match`] may return a length-3 match.
+    ///
+    /// Called once per DEFLATE block by the parser, which owns the bit-cost
+    /// question; the matchfinder only enforces the answer. See the field's doc.
+    #[inline]
+    pub fn set_allow_len3(&mut self, allow: bool) {
+        self.allow_len3 = allow;
     }
 
     /// `ht_matchfinder_slide_window`: rebase every stored position by one window.
@@ -437,12 +468,9 @@ impl HtMatchfinder {
         // HT_REQUIRED_NBYTES 5 rather than 4. Both keys come from ONE 4-byte load
         // of `in_next + 1`, so the length-3 table costs no extra input read.
         let hash = *next_hash as usize;
-        let hash3 = *next_hash3 as usize;
         let next_seq = unsafe { load_u32(base, in_next + 1) };
         *next_hash = lz_hash(next_seq, HT_HASH_ORDER);
-        *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
         debug_assert!((*next_hash as usize) < HT_TAB_LEN);
-        debug_assert!((*next_hash3 as usize) < HT_HASH3_SIZE);
         // Prefetch the bucket the NEXT position will touch, matching
         // libdeflate's `prefetchw(&mf->hash_tab[*next_hash])`.
         // SAFETY: `lz_hash(_, HT_HASH_ORDER)` returns < 1 << 15 == HT_TAB_LEN,
@@ -457,10 +485,37 @@ impl HtMatchfinder {
         // happens exactly once per position on every control-flow path — the
         // 4-byte search below has several early exits, and a table that skips
         // inserts on some of them would silently degrade over the file.
-        debug_assert!(hash3 < HT_HASH3_SIZE);
-        // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
-        let cur_node3 = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
-        unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+        //
+        // MAINTENANCE IS GATED WITH ACCEPTANCE. On a block where `allow_len3` is
+        // false no candidate this table proposes can be accepted, so the read and
+        // the write are pure D1 traffic to a 64 KiB table — measured (cachegrind,
+        // both arms, 6 MB data.csv, L1 T1): this finder issued 2.68x libdeflate's
+        // data writes and 70% of its D1 write misses, and the length-3 singleton
+        // was the excess. Entries NOT written during a disabled block leave the
+        // table stale for a later enabled block; stale entries are sound (every
+        // candidate is re-validated against `cutoff` and by the 3-byte compare)
+        // and the offset guard discards most carried-over entries anyway.
+        // The COMPUTATION of the 3-byte key is gated too — the banked ablation
+        // priced maintenance + key computation together at ~50M Ir on 6 MB, and
+        // "instructions are the binding cost in this finder" (see the packed-store
+        // record in `skip_bytes`). On a disabled block `*next_hash3` goes stale;
+        // at the first position of a re-enabled block the stale key probes one
+        // wrong bucket — the same "harmless wrong hash" convention libdeflate
+        // itself uses for `next_hash = 0` at stream start (see `ht_fast::run`),
+        // made safe by the same 3-byte compare.
+        let cur_node3 = if self.allow_len3 {
+            let hash3 = *next_hash3 as usize;
+            *next_hash3 = lz_hash(next_seq & 0xFF_FFFF, HT_HASH3_ORDER);
+            debug_assert!(hash3 < HT_HASH3_SIZE && (*next_hash3 as usize) < HT_HASH3_SIZE);
+            // SAFETY: `hash3 < HT_HASH3_SIZE` — see the module doc's soundness section.
+            let n = unsafe { *self.hash3_tab.get_unchecked(hash3) } as i32;
+            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+            n
+        } else {
+            // Sentinel that can never pass the `> cutoff` acceptance test below
+            // (which is also gated on `allow_len3`, so this value is never read).
+            cutoff
+        };
 
         // The 4-byte search. `break 'four` rather than `return`, so that a miss
         // falls through to the length-3 check instead of discarding it.
@@ -528,7 +583,13 @@ impl HtMatchfinder {
         // parser a faithful `deflate_compress_fastest` (which accepts any match the
         // finder returns) and puts the bit-cost knowledge where the length-3
         // candidate is produced.
-        if best_len == 0 && cur_node3 > cutoff {
+        //
+        // `allow_len3` is the SECOND half of that bit-cost question, and the offset
+        // guard alone cannot answer it: distance decides what a length-3 match
+        // COSTS, while the literal distribution decides what the three literals it
+        // replaces WOULD have cost. Measured on the corpus, the two questions split
+        // the files cleanly and in opposite directions — see the field's doc.
+        if best_len == 0 && self.allow_len3 && cur_node3 > cutoff {
             let mp = in_base_now + cur_node3 as usize;
             let off = (in_next - mp) as u32;
             if off <= HT_MAX_LEN3_OFFSET {
@@ -587,6 +648,9 @@ impl HtMatchfinder {
         // <= in_end - in_next`, so every `pos` reached below satisfies
         // `pos + 4 <= in_next + count + 5 <= in_end <= buf.len()`.
         let base = buf.as_ptr();
+        // One register-resident copy per call: the flag cannot change mid-call, and
+        // reading the field inside the loop measurably re-loads it per position.
+        let len3 = self.allow_len3;
         let mut hash = *next_hash as usize;
         let mut hash3 = *next_hash3 as usize;
         let mut pos = in_next;
@@ -618,12 +682,17 @@ impl HtMatchfinder {
             // `hc_matchfinder_skip_positions` does for its `hash3_tab`. Skipping this
             // insert would leave the length-3 table blind to every position inside a
             // match, which is most of the input on compressible data.
-            unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
-
+            //
+            // Gated with acceptance, same as `longest_match` — see the comment
+            // there. Dictionary seeding at T>1 runs with `allow_len3` forced on
+            // (see `ht_fast::run`) so an enabled first block sees a full table.
             pos += 1;
             let seq = unsafe { load_u32(base, pos) };
             hash = lz_hash(seq, HT_HASH_ORDER) as usize;
-            hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
+            if len3 {
+                unsafe { *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16 };
+                hash3 = lz_hash(seq & 0xFF_FFFF, HT_HASH3_ORDER) as usize;
+            }
             cur_pos += 1;
             remaining -= 1;
             if remaining == 0 {
@@ -635,7 +704,9 @@ impl HtMatchfinder {
             prefetch_write(self.hash_tab.as_ptr().add(hash) as *const u8);
         }
         *next_hash = hash as u32;
-        *next_hash3 = hash3 as u32;
+        if len3 {
+            *next_hash3 = hash3 as u32;
+        }
     }
 }
 

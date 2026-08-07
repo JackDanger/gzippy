@@ -70,7 +70,7 @@ const T1_MAX_SLACK: usize = 75;
 /// slack is measured separately — 90 B max at L1 (issue #266's 75 B plus
 /// seam framing), 20 B at L2-L9, 0 B at L0. Ratchets down like
 /// [`T1_MAX_SLACK`].
-const T4_MAX_SLACK: usize = 90;
+const T4_MAX_SLACK: usize = 20;
 
 /// Compress in-process at T1 through the production whole-buffer entry point.
 fn compress_t1(data: &[u8], level: u32) -> Vec<u8> {

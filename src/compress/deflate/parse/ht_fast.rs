@@ -107,6 +107,11 @@ pub(super) fn run(
 
     let mut in_next = data_start;
     if data_start > 0 {
+        // Dictionary seeding runs BEFORE the first block's `allow_len3` verdict
+        // exists, and `HtMatchfinder::acquire` arms the flag `false`. Force
+        // maintenance ON for the seed so an enabled first block sees a fully
+        // populated length-3 table; the per-block verdict re-arms it below.
+        mf.set_allow_len3(true);
         mf.skip_bytes(
             buf,
             &mut in_base,
@@ -152,6 +157,27 @@ pub(super) fn run(
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end_fast(in_next, in_end);
         sink.begin();
+
+        // Whether length-3 matches pay FOR THIS BLOCK, by libdeflate's own rule
+        // (`calculate_min_match_len` -> `choose_min_match_len`), which we already
+        // ship at levels 2-9 in `greedy`/`lazy`. It reads the number of distinct
+        // literals as a proxy for how expensive a literal is: many distinct
+        // literals means expensive literals means a 3-byte match beats the three
+        // literals it replaces, and few means the reverse.
+        //
+        // libdeflate does not need this at level 1 only because its
+        // `ht_matchfinder` has no length-3 table at all ("Due to its focus on
+        // speed, the ht_matchfinder doesn't support length 3 matches"). We added
+        // one, so we inherit the question they answer at 2-9, and this is their
+        // answer rather than a constant fitted to our corpus.
+        //
+        // The `max_search_depth` clamp inside `choose_min_match_len` cannot change
+        // this decision: it only ever lowers `min_len` to 4, 5 or 7, and `min(x, 4)`
+        // is <= 3 exactly when x is already 3. So the test below is the pure
+        // literal-count rule regardless of what level 1 declares for depth.
+        mf.set_allow_len3(
+            super::calculate_min_match_len(&buf[block_begin..in_end], params.max_search_depth) <= 3,
+        );
 
         // `anatomy-wall` region `parse_match`: one timer per INTERNAL BLOCK,
         // matching the convention in `fast.rs` and `greedy.rs` — probe and

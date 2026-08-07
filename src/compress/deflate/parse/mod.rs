@@ -486,6 +486,10 @@ pub(super) fn compress(
                 t.insert_depth,
             )
         }
+        // T>1 path only, set by `level::params_parallel(1)` — see the routing record
+        // there. The two FALSIFY verdicts above judged T1 replacement routing; this arm
+        // is unreachable at T1 because no `level::params()` level maps to `HtFast`.
+        Strategy::HtFast => ht_fast::run(buf, data_start, in_end, params, statics, bw, is_last),
         Strategy::Greedy => greedy::run(buf, data_start, in_end, params, statics, bw, is_last),
         Strategy::Lazy => lazy::run(buf, data_start, in_end, params, statics, bw, false, is_last),
         Strategy::Lazy2 => lazy::run(buf, data_start, in_end, params, statics, bw, true, is_last),
