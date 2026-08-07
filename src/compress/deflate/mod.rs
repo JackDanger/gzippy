@@ -560,9 +560,9 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
 /// the streaming path without a proof that its bytes could not change.
 ///
 /// This is a level branch, not content detection — it reads only the number
-/// the user typed. It should shrink by making more parsers resumable (Fast for
-/// L1, NearOptimal for L10-12, and L3 once its content detector is gone), not
-/// by relaxing the rule.
+/// the user typed. It should shrink by making more parsers resumable (Fast
+/// landed for L1 2026-08-02 via `fast::run_resumable`; NearOptimal for
+/// L10-12 remains), not by relaxing the rule.
 #[inline]
 pub fn level_streams(level: u32) -> bool {
     level == 0 || parse::level_has_resumable_parser(level)
@@ -599,12 +599,35 @@ pub fn level_streams(level: u32) -> bool {
 /// BFINAL *while encoding it*, and "did the reader end exactly on a chunk
 /// boundary" is not knowable otherwise. Reading one byte past a full chunk
 /// answers it; that byte becomes the first byte of the next chunk.
+// The bin target compiles this module tree directly, where these two lib-API
+// entry points have no caller (the CLI routes through the _sized variant);
+// tests/streaming_identity.rs and library consumers use them.
+#[allow(dead_code)]
 pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
 ) -> std::io::Result<u64> {
-    encode_gzip_reader_to_writer_chunked(reader, writer, level, STREAM_CHUNK)
+    encode_gzip_reader_to_writer_sized(reader, writer, level, None)
+}
+
+/// [`encode_gzip_reader_to_writer`] with an optional input-size hint.
+///
+/// The hint matters only on the whole-buffer FALLBACK levels (see
+/// [`level_streams`] — L10-12 today, plus L1 in an `l1-tune` dev build):
+/// without it, `read_to_end` grows the input buffer by doubling, so an 8 MiB
+/// input touches ~21 MB of fresh anonymous pages — every page a minor fault.
+/// That mechanism was measured at L1 by the L1-streaming falsifier in
+/// tests/anatomy_counters.rs, which went GREEN when `fast::run_resumable`
+/// took L1 off this fallback entirely; the hint remains as the palliative for
+/// the levels still on it. Streaming levels ignore the hint.
+pub fn encode_gzip_reader_to_writer_sized<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    size_hint: Option<usize>,
+) -> std::io::Result<u64> {
+    encode_gzip_reader_to_writer_chunked_sized(reader, writer, level, STREAM_CHUNK, size_hint)
 }
 
 /// [`encode_gzip_reader_to_writer`] with the chunk size supplied by the caller.
@@ -616,11 +639,25 @@ pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
 /// boundaries cost ratio), and that curve has to be measured to pick the
 /// constant rather than guessed. `chunk` should be a multiple of
 /// [`MAX_STORED_SUBBLOCK`] to keep level 0 byte-identical.
+// The bin target compiles this module tree directly, where these two lib-API
+// entry points have no caller (the CLI routes through the _sized variant);
+// tests/streaming_identity.rs and library consumers use them.
+#[allow(dead_code)]
 pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
     chunk: usize,
+) -> std::io::Result<u64> {
+    encode_gzip_reader_to_writer_chunked_sized(reader, writer, level, chunk, None)
+}
+
+fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    chunk: usize,
+    size_hint: Option<usize>,
 ) -> std::io::Result<u64> {
     if !level_streams(level) {
         // This level cannot yet stream without changing its bytes (see
@@ -629,7 +666,9 @@ pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>
         // CLI — have exactly one function to call and never a level-dependent
         // branch of their own. The memory cost is real and is tracked as the
         // reason to make the remaining parsers resumable, not as an API wart.
-        let mut input = Vec::new();
+        // Size the buffer ONCE when the caller knows the input length —
+        // `read_to_end` keeps a pre-reserved capacity instead of doubling.
+        let mut input = Vec::with_capacity(size_hint.map_or(0, |h| h + INPLACE_TAIL_PAD));
         reader.read_to_end(&mut input)?;
         let logical_len = input.len();
         input.resize(logical_len + INPLACE_TAIL_PAD, 0);
@@ -639,6 +678,168 @@ pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>
     }
     let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
     encode_gzip_single_pass(reader, writer, level, stream_chunk)
+}
+
+/// Gzip-compress `data` — a borrowed slice that CANNOT carry trailing pad
+/// bytes — into `writer`, byte-identical to the whole-buffer encoder
+/// ([`encode_gzip_bytes_to_vec`]) at every level.
+///
+/// The intended caller is the T1 FILE route in `compress/io.rs`, where `data`
+/// is a read-only mmap of the input file. The vendor's answer to input-side
+/// page-fault cost is exactly this — libdeflate-gzip maps its input
+/// (`vendor/libdeflate/programs/gzip.c`) — while our first streaming L1
+/// (`encode_gzip_single_pass`) paid for its fixed window with per-byte
+/// copy-through-window traffic that a solvency bisect measured at +3-7% wall
+/// on L1 file cells (PR #256). An mmap cannot take the whole-buffer entry
+/// points directly because they demand [`INPLACE_TAIL_PAD`] readable bytes
+/// past the logical end, and reading past an mmap's final page is SIGBUS
+/// territory. This function closes that gap without copying the bulk:
+///
+/// * **Levels with a resumable parser** ([`level_streams`], L1-L9): PASS 1
+///   parses `data[..len - INPLACE_TAIL_PAD]` IN PLACE over the mmap in
+///   `InputMode::Bounded` — the parser stops at the last block boundary that
+///   still has [`parse::STREAM_BLOCK_LOOKAHEAD`] bytes of lookahead, so every
+///   boundary and match decision is identical to a whole-buffer parse (the
+///   same argument `encode_gzip_single_pass` streams on), and no read ever
+///   reaches the unpadded final bytes. PASS 2 copies the small remainder —
+///   at most ~2 windows of history plus the lookahead margin, a bounded
+///   constant regardless of input size — into a padded scratch buffer and
+///   drains it with the SAME [`parse::ParseState`] and the SAME continuous
+///   [`BitWriter`], exactly one slide of the streaming loop. No sync-flush,
+///   no seam, no boundary moved: byte-identity is inherited, not re-argued.
+/// * **Level 0**: stored blocks are emitted straight off the mmap (no pad
+///   requirement), drained every [`STREAM_CHUNK`] bytes — a multiple of
+///   [`MAX_STORED_SUBBLOCK`], so sub-block boundaries land exactly where the
+///   whole-buffer encoder puts them.
+/// * **Levels without a resumable parser** (L10-12, NearOptimal): the one
+///   copy the pad problem genuinely forces. The input is copied once into a
+///   padded buffer — the identical allocation the Read-based fallback in
+///   [`encode_gzip_reader_to_writer_chunked_sized`] makes today, with the
+///   copy sourced from the page cache instead of a `read(2)` loop.
+pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+    level: u32,
+) -> std::io::Result<u64> {
+    use encode_types::{BlockRole, InputMode};
+
+    if !level_streams(level) {
+        let logical_len = data.len();
+        let cap = logical_len + INPLACE_TAIL_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut input = Vec::with_capacity(cap);
+        input.extend_from_slice(data);
+        input.resize(cap, 0);
+        let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
+        writer.write_all(&gz)?;
+        return Ok(logical_len as u64);
+    }
+
+    let len = data.len();
+    let out_cap = if level == 0 {
+        // Drained per STREAM_CHUNK stored slice below — the output buffer
+        // peaks at one chunk plus its framing instead of input-sized.
+        STREAM_CHUNK + (STREAM_CHUNK / MAX_STORED_SUBBLOCK) * 5 + 1024
+    } else {
+        estimate_output_cap(len, level, 32)
+    };
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, out_cap);
+    let mut out = Vec::with_capacity(out_cap);
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    let mut bw = BitWriter::from_vec(out);
+
+    if level == 0 {
+        if len == 0 {
+            emit_stored_block(&mut bw, &[], true);
+            bw.drain_to(writer)?;
+        } else {
+            let mut off = 0usize;
+            while off < len {
+                let end = (off + STREAM_CHUNK).min(len);
+                emit_stored_block(&mut bw, &data[off..end], end == len);
+                crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
+                off = end;
+            }
+        }
+    } else {
+        let params = level::params(level);
+        let mut state = parse::ParseState::new();
+        let mut in_next = 0usize;
+
+        // PASS 1 — the bulk, parsed IN PLACE over the caller's slice. The
+        // logical end handed to the parser is INPLACE_TAIL_PAD short of the
+        // slice end, so `buf.len() >= in_end + BUF_PAD` holds using REAL
+        // bytes as the pad region. Bounded mode never reads it: the parser
+        // stops STREAM_BLOCK_LOOKAHEAD (~305 KB) before `in_end`, and no
+        // read for a parsed position reaches more than a match length past
+        // it — which is also why those non-zero "pad" bytes cannot leak
+        // into any decision (the streamed-equals-whole-buffer proof already
+        // requires that nothing past `in_end` does).
+        if len > INPLACE_TAIL_PAD {
+            let avail = len - INPLACE_TAIL_PAD;
+            in_next = crate::anatomy_wall_root!({
+                parse::parse_resumable(
+                    data,
+                    &mut state,
+                    0,
+                    avail,
+                    &params,
+                    BlockRole::Interior,
+                    InputMode::Bounded,
+                    &mut bw,
+                )
+            });
+            crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
+        }
+
+        // PASS 2 — the tail, through a small padded copy. `max_shift` leaves
+        // the matchfinder its full window (whole-window granularity), so the
+        // copy is [history | unconsumed | zero pad]: at most ~2*WINDOW_SIZE +
+        // STREAM_BLOCK_LOOKAHEAD + INPLACE_TAIL_PAD bytes (~375 KB), never
+        // input-sized. `shift_down` rebases the carried state exactly as the
+        // streaming loop's slide does.
+        let shift = state.max_shift();
+        let tail_len = len - shift;
+        let tail_cap = tail_len + INPLACE_TAIL_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, tail_cap);
+        let mut tbuf = Vec::with_capacity(tail_cap);
+        tbuf.extend_from_slice(&data[shift..]);
+        tbuf.resize(tail_cap, 0);
+        if shift > 0 {
+            state.shift_down(shift);
+            in_next -= shift;
+        }
+        if in_next == tail_len {
+            // Only reachable when `data` is empty (pass 1 always leaves the
+            // parser short of `len`): close the stream the way the
+            // whole-buffer encoder's empty branch does.
+            emit_stored_block(&mut bw, &[], true);
+        } else {
+            crate::anatomy_wall_root!({
+                parse::parse_resumable(
+                    &tbuf,
+                    &mut state,
+                    in_next,
+                    tail_len,
+                    &params,
+                    BlockRole::Final,
+                    InputMode::Drain,
+                    &mut bw,
+                )
+            });
+        }
+        crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
+    }
+
+    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
+    let mut tail = bw.finish();
+    tail.extend_from_slice(&crc.to_le_bytes());
+    tail.extend_from_slice(&(len as u32).to_le_bytes());
+    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
+    Ok(len as u64)
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
@@ -924,6 +1125,98 @@ mod inplace_tests {
             // Larger mixed buffer.
             proptest::collection::vec(any::<u8>(), 0..2048),
         ]
+    }
+}
+
+#[cfg(test)]
+mod unpadded_slice_tests {
+    use super::*;
+
+    /// Deterministic bytes with tunable redundancy (same generator family as
+    /// tests/streaming_identity.rs): small `period` = compressible, huge
+    /// `period` = literal-dominated.
+    fn corpus(len: usize, period: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        let mut s: u32 = 0x1234_5678;
+        for i in 0..len {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let r = (s >> 16) as u8;
+            v.push(if (i as u32) % period < period / 2 {
+                b'a' + (r % 26)
+            } else {
+                r
+            });
+        }
+        v
+    }
+
+    fn unpadded(data: &[u8], level: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let n = encode_gzip_unpadded_slice_to_writer(data, &mut out, level)
+            .expect("unpadded-slice encode");
+        assert_eq!(n, data.len() as u64, "reported input length");
+        out
+    }
+
+    /// The mmap-route encoder must be BYTE-IDENTICAL to the whole-buffer
+    /// encoder at every level, on lengths chosen to hit each internal seam:
+    /// empty; below/at/above INPLACE_TAIL_PAD (pass 1 skipped vs. a no-op
+    /// pass 1); below the STREAM_BLOCK_LOOKAHEAD margin (pass 1 runs but
+    /// consumes nothing); just above it (pass 1 emits its first block); and
+    /// large enough that `max_shift` > 0 so pass 2 exercises the state
+    /// rebase. L10-12 cover the padded-copy fallback arm.
+    #[test]
+    fn unpadded_slice_is_byte_identical_to_whole_buffer() {
+        let lookahead = parse::STREAM_BLOCK_LOOKAHEAD;
+        let sizes = [
+            0usize,
+            1,
+            INPLACE_TAIL_PAD - 1,
+            INPLACE_TAIL_PAD,
+            INPLACE_TAIL_PAD + 1,
+            4096,
+            lookahead - 1,
+            lookahead + INPLACE_TAIL_PAD + 1,
+            700_000,
+        ];
+        for &len in &sizes {
+            for period in [8u32, 96, 1 << 30] {
+                let data = corpus(len, period);
+                for level in [0u32, 1, 2, 3, 6, 9] {
+                    assert_eq!(
+                        unpadded(&data, level),
+                        encode_gzip_bytes_to_vec(&data, level),
+                        "L{level} len={len} period={period}: unpadded-slice \
+                         output diverged from whole-buffer"
+                    );
+                }
+                // Fallback arm (no resumable parser): keep it to one modest
+                // size per period — the mechanism is a copy, not a parse.
+                if len == 4096 || len == 700_000 {
+                    for level in [10u32, 12] {
+                        assert_eq!(
+                            unpadded(&data, level),
+                            encode_gzip_bytes_to_vec(&data, level),
+                            "L{level} len={len} period={period}: fallback arm diverged"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Multi-megabyte inputs: several fast/lazy blocks in pass 1, a
+    /// guaranteed pass-2 slide, and (at L0) several drain cycles.
+    #[test]
+    fn unpadded_slice_matches_whole_buffer_on_multi_chunk_inputs() {
+        let data = corpus(STREAM_CHUNK + 100_003, 64);
+        for level in [0u32, 1, 6] {
+            assert_eq!(
+                unpadded(&data, level),
+                encode_gzip_bytes_to_vec(&data, level),
+                "L{level} multi-chunk: unpadded-slice output diverged"
+            );
+        }
     }
 }
 

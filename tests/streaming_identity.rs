@@ -126,6 +126,46 @@ fn level_0_is_byte_identical_to_the_whole_buffer_encoder() {
     }
 }
 
+/// Level 1 (`Strategy::Fast`) streams through `fast::run_resumable`: ONE set
+/// of head tables and one gate state span the whole file, blocks end at the
+/// same fixed `FAST_BLOCK_LENGTH` boundaries a whole-buffer parse uses, and
+/// the `STREAM_BLOCK_LOOKAHEAD` margin keeps every near-end `max_len` clamp
+/// decision identical — so the bar is strict BYTE-IDENTITY, not a size bound.
+/// The multi-chunk cases here are the ones that force buffer slides (and thus
+/// the head-table rebase) and carry the one-block-lag hash3/peek gate state
+/// across refill seams; a single flipped gate or one rebased entry landing
+/// back inside the window would change bytes and fail this.
+#[test]
+fn level_1_is_byte_identical_to_the_whole_buffer_encoder() {
+    for (name, data) in cases() {
+        assert_eq!(
+            streamed(&data, 1),
+            whole_buffer(&data, 1),
+            "L1 {name}: streamed and whole-buffer output differ"
+        );
+    }
+
+    // A gate-flipping fixture the shared cases don't provide: alternating
+    // ~192 KB compressible-text and incompressible-noise segments, sized so
+    // the hash3/peek literal-fraction gates flip repeatedly INCLUDING across
+    // refill seams on a 2.5-chunk input. A gate state reset (instead of
+    // carried) at any seam changes the very next block's parse and fails
+    // here.
+    let mut data = Vec::with_capacity(2 * CHUNK + CHUNK / 2);
+    let mut s: u32 = 0x9E37_79B9;
+    while data.len() < 2 * CHUNK + CHUNK / 2 {
+        let noise = (data.len() / (192 * 1024)) % 2 == 1;
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let r = (s >> 16) as u8;
+        data.push(if noise { r } else { b'a' + (r % 16) });
+    }
+    assert_eq!(
+        streamed(&data, 1),
+        whole_buffer(&data, 1),
+        "L1 alternating text/noise: streamed and whole-buffer output differ"
+    );
+}
+
 /// For levels 1-12 the two encoders legitimately disagree: the streaming one
 /// ends a block at each chunk seam, so block-splitting decisions differ. The
 /// cost of that is real but must stay negligible — measured at the shipped

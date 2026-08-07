@@ -42,6 +42,13 @@ pub(crate) mod route {
     pub const ZOPFLI: &str = "Zopfli";
     /// T1 pure-Rust single-member DEFLATE (`deflate::encode_gzip_slack_padded_to_vec`).
     pub const PURE_T1: &str = "PureT1";
+    /// T1 FILE inputs above the mmap threshold: whole-buffer-equivalent parse
+    /// directly over a read-only mmap of the input
+    /// (`deflate::encode_gzip_unpadded_slice_to_writer`, called from `io.rs`),
+    /// byte-identical to `PURE_T1` at every level. Non-seekable T1 inputs
+    /// (stdin/pipes) keep `PURE_T1`'s streaming route, where the sliding
+    /// window is a memory-correctness win rather than a copy tax.
+    pub const PURE_T1_MMAP: &str = "PureT1Mmap";
     /// T>1 pure-Rust parallel pipeline (`PipelinedGzEncoder::compress_buffer_pure`).
     /// Reached from two call sites (the `io.rs` mmap fast path and the
     /// `compress_with_pipeline_sized` fallback) that both invoke the same
@@ -168,10 +175,11 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         // every inner region reported normally.
         let mut writer = writer;
         let bytes = crate::anatomy_wall_cli!({
-            crate::compress::deflate::encode_gzip_reader_to_writer(
+            crate::compress::deflate::encode_gzip_reader_to_writer_sized(
                 &mut reader,
                 &mut writer,
                 args.compression_level as u32,
+                size_hint,
             )?
         });
         writer.flush()?;

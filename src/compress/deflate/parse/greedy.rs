@@ -32,6 +32,7 @@ pub(super) fn run(
             mf,
             in_base,
             next_hashes,
+            ..
         } = &mut state;
         mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
     }
@@ -164,6 +165,7 @@ pub(super) fn run_block(
         mf,
         in_base,
         next_hashes,
+        ..
     } = state;
     let mf: &mut HcMatchfinder = mf;
     let in_base: &mut usize = in_base;
