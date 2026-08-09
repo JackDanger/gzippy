@@ -162,6 +162,15 @@ pub fn encode_deflate_segment_to_sink(
         let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
+        if !parallel
+            && level_uses_t1_zlib_pick_min(level)
+            && is_last
+            && bw.byte_len() == 0
+            && !data.is_empty()
+        {
+            *out = deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), level, true, true);
+            return;
+        }
         deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true, parallel);
     } else {
         // Preset-dictionary chunk: prepend the dictionary into one padded buffer
@@ -329,6 +338,45 @@ pub(crate) fn note_stored_block_emitted() {
 /// so aligning at it would both waste ~5 bytes per chunk and, more
 /// importantly, make the output depend on the chunk size — destroying
 /// byte-identity with the whole-buffer encoder.
+/// Levels where the T1 mmap / whole-buffer path runs zlib pick-min.
+#[inline]
+fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
+    matches!(level, 5..=7)
+}
+
+/// One whole-buffer DEFLATE encode: cheaper of libdeflate baseline vs zlib-ng
+/// knobs. Only for single-shot T1 gzip (not segmented chunk concat).
+fn deflate_one_shot_t1_zlib_pick_min(
+    buf: &[u8],
+    data_start: usize,
+    in_end: usize,
+    level: u32,
+    is_last: bool,
+    sync_flush: bool,
+) -> Vec<u8> {
+    debug_assert!(level_uses_t1_zlib_pick_min(level));
+    let budget = encode_types::HeaderBudget::Lean;
+    let baseline = level::params_baseline(level);
+    let zlib = level::params_zlib_t1(level);
+
+    let encode = |params: &level::LevelParams| -> Vec<u8> {
+        let mut bw = BitWriter::from_vec(Vec::new());
+        parse::compress(buf, data_start, in_end, params, is_last, budget, &mut bw);
+        if !is_last && sync_flush {
+            emit_stored_block(&mut bw, &[], false);
+        }
+        bw.finish()
+    };
+
+    let base = encode(&baseline);
+    let zlib_out = encode(&zlib);
+    if zlib_out.len() < base.len() {
+        zlib_out
+    } else {
+        base
+    }
+}
+
 fn deflate_into(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -344,44 +392,6 @@ fn deflate_into(
         emit_stored_block(bw, &[], is_last);
     } else if level == 0 {
         emit_stored_block(bw, &buf[data_start..in_end], is_last);
-    } else if !parallel && matches!(level, 5 | 6) {
-        // T1 L5-L6: zlib chain depth closes gzip/pigz text cells but flips
-        // libdeflate ties on incompressible inputs. Pick the cheaper of the
-        // libdeflate baseline and the zlib-ng knobs (non-worse on ties BY
-        // CONSTRUCTION when the baseline arm is always a candidate).
-        let budget = encode_types::HeaderBudget::Lean;
-        let baseline = level::params_baseline(level);
-        let zlib = level::params_zlib_t1(level);
-        let mut bw_base = BitWriter::from_vec(Vec::new());
-        parse::compress(
-            buf,
-            data_start,
-            in_end,
-            &baseline,
-            is_last,
-            budget,
-            &mut bw_base,
-        );
-        let base = bw_base.finish();
-        let mut bw_zlib = BitWriter::from_vec(Vec::new());
-        parse::compress(
-            buf,
-            data_start,
-            in_end,
-            &zlib,
-            is_last,
-            budget,
-            &mut bw_zlib,
-        );
-        let zlib_out = bw_zlib.finish();
-        let chosen = if zlib_out.len() < base.len() {
-            zlib_out
-        } else {
-            base
-        };
-        let mut prefixed = std::mem::replace(bw, BitWriter::from_vec(Vec::new())).finish();
-        prefixed.extend_from_slice(&chosen);
-        *bw = BitWriter::from_vec(prefixed);
     } else {
         // T>1 spends its parallel wall slack on a stronger parse — see
         // `level::params_parallel`. T1 is untouched.
@@ -425,6 +435,17 @@ pub fn encode_deflate_slack_padded_to_sink(
         buf.len() >= logical_len + INPLACE_TAIL_PAD,
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
+    if level_uses_t1_zlib_pick_min(level) && logical_len > 0 {
+        out.extend_from_slice(&deflate_one_shot_t1_zlib_pick_min(
+            buf,
+            0,
+            logical_len,
+            level,
+            true,
+            true,
+        ));
+        return;
+    }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
     deflate_into(&mut bw, buf, 0, logical_len, level, true, true, false);
     *out = bw.finish();
@@ -895,10 +916,10 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     }
 
     let len = data.len();
-    // T1 mmap L5-L6: pick-min lives in `encode_gzip_slack_padded_to_vec` /
+    // T1 mmap L5-L7: pick-min lives in `encode_gzip_slack_padded_to_vec` /
     // `deflate_into`; route through the padded whole-buffer encoder so the
     // streaming two-pass path does not need a second implementation.
-    if matches!(level, 5 | 6) {
+    if matches!(level, 5..=7) && len > 0 {
         let cap = len + INPLACE_TAIL_PAD;
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);

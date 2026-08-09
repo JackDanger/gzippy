@@ -138,8 +138,10 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
 /// presets exactly; the strategy mapping substitutes a fallback for the two
 /// strategies not yet implemented in this increment (see the module docs).
 pub fn params(level: u32) -> LevelParams {
-    let mut p = params_baseline(level);
-    apply_zlib_t1_search_knobs(level, &mut p);
+    let p = params_baseline(level);
+    // zlib-ng knobs apply only on the T1 whole-buffer pick-min path — see
+    // [`deflate_one_shot_t1_zlib_pick_min`]. Segmented/streaming encode must
+    // keep libdeflate depths so chunk bitstreams concatenate correctly.
     // Report the knobs that were ACTUALLY RESOLVED by the production path, once
     // per process. `fulcrum explain` reads this and asserts it against observed
     // behaviour; without it, the tool would have to keep its own copy of this
@@ -151,7 +153,7 @@ pub fn params(level: u32) -> LevelParams {
     p
 }
 
-/// libdeflate-table knobs before the T1 zlib chain override (L5-L6 pick-min baseline).
+/// libdeflate-table knobs before the T1 zlib chain override (pick-min baseline).
 pub(crate) fn params_baseline(level: u32) -> LevelParams {
     #[allow(unused_mut)]
     let mut p = params_inner(level);
@@ -392,6 +394,10 @@ fn apply_zlib_t1_search_knobs(level: u32, p: &mut LevelParams) {
         6 => {
             p.good_match = 8;
             p.max_search_depth = 128;
+        }
+        7 => {
+            p.good_match = 8;
+            p.max_search_depth = 256;
         }
         _ => {}
     }
@@ -752,11 +758,6 @@ mod tests {
         for l in 2..=9u32 {
             let prev = params(l - 1);
             let cur = params(l);
-            // L5-L6 carry zlib-ng chain depths (32, 128) that can exceed libdeflate's
-            // L7 base (100). Monotonic holds from L7 onward; skip the L6→L7 step only.
-            if l == 7 && prev.max_search_depth > cur.max_search_depth {
-                continue;
-            }
             assert!(
                 cur.max_search_depth >= prev.max_search_depth,
                 "L{l} searches less deeply than L{}: {} < {}",
