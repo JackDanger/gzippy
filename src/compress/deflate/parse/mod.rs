@@ -818,6 +818,113 @@ fn bsr32(x: u32) -> u32 {
 
 // ---- block emission ----
 
+/// Coalesces CONSECUTIVE parse blocks that each chose STORED into one deferred
+/// span, so the physical BTYPE=00 sub-block grid over that span is maximal
+/// (all 65,535-byte sub-blocks, the last takes the remainder).
+///
+/// THE DEFECT THIS REMOVES (issue #266): the fast path parses in
+/// [`fast::FAST_BLOCK_LENGTH`] = 65,536-byte blocks, and `emit_stored_block`
+/// splits each block's payload independently — `ceil(65536/65535)` = 2
+/// sub-blocks of 65,535 + 1 bytes. On incompressible input every parse block
+/// goes stored, so a 1 MiB file emitted a 65535/1 ALTERNATING grid: 32 stored
+/// blocks where libdeflate (whose fast path parses in 65,535-byte blocks)
+/// emits 17. Each extra sub-block is 5 bytes of pure framing (3-bit header +
+/// byte-align pad + LEN/NLEN).
+///
+/// MONOTONE BY CONSTRUCTION: the per-block stored/static/dynamic DECISION is
+/// unchanged (same costs, same inputs); only already-chosen-stored payloads
+/// are repacked, and `ceil((a+b)/65535) <= ceil(a/65535) + ceil(b/65535)`,
+/// so the framing count can only shrink. A Huffman block or end-of-call
+/// flushes the pending span first, preserving byte order.
+///
+/// Callers that pass `None` to [`emit_block`] /
+/// [`emit_block_static_or_stored`] keep today's emit-immediately behavior
+/// byte-for-byte (greedy/lazy/near_optimal/ht_fast are tie-locked to
+/// libdeflate's block grid; only the fast path opts in).
+///
+/// EMISSION IS EAGER, NOT LAZY: `push` writes every full 65,535-byte
+/// sub-block the moment the span covers it, holding back only a 1..=65,535
+/// byte remainder (never zero while a span is open, so the eventual `flush`
+/// always has a sub-block to carry BFINAL). Two properties depend on this:
+///
+/// * **Identical bytes to a whole-span lazy flush** — the sub-block grid over
+///   a span is `start + k*65535` either way; eager just writes each piece as
+///   soon as its bytes cannot change.
+/// * **Bounded carry** — the pending remainder is <= 65,535 bytes, so the
+///   streaming path ([`fast::run_resumable`]) can carry it across input
+///   refills in `FastResume` (keeping streamed L1 byte-identical to the
+///   whole-buffer encoder, the invariant `tests/streaming_identity.rs` pins)
+///   while the slide only has to retain a bounded window of unemitted input.
+#[derive(Default)]
+pub(super) struct StoredCoalescer {
+    /// Absolute offset in `buf` of the pending remainder's first byte.
+    start: usize,
+    /// Pending remainder length, always <= 65,535 after `push`; 0 means empty.
+    len: usize,
+}
+
+impl StoredCoalescer {
+    /// Append a block that chose STORED to the pending span, eagerly writing
+    /// every completed maximal sub-block (see the struct doc). Blocks arrive
+    /// in input order and are contiguous, so the span only grows rightward.
+    fn push(&mut self, bw: &mut BitWriter, buf: &[u8], block_start: usize, block_len: usize) {
+        debug_assert!(block_len > 0, "empty blocks never price stored cheapest");
+        if self.len == 0 {
+            self.start = block_start;
+        }
+        debug_assert_eq!(
+            self.start + self.len,
+            block_start,
+            "non-contiguous stored blocks"
+        );
+        self.len += block_len;
+        // `>` not `>=`: keep at least one byte pending so BFINAL always has
+        // a carrier sub-block at the final `flush`.
+        while self.len > super::MAX_STORED_SUBBLOCK {
+            super::emit_stored_block(
+                bw,
+                &buf[self.start..self.start + super::MAX_STORED_SUBBLOCK],
+                false,
+            );
+            self.start += super::MAX_STORED_SUBBLOCK;
+            self.len -= super::MAX_STORED_SUBBLOCK;
+        }
+    }
+
+    /// Write the pending remainder (if any) as one stored sub-block and clear
+    /// it. No-op when empty. `is_final` marks it BFINAL.
+    pub(super) fn flush(&mut self, bw: &mut BitWriter, buf: &[u8], is_final: bool) {
+        if self.len == 0 {
+            return;
+        }
+        debug_assert!(self.len <= super::MAX_STORED_SUBBLOCK);
+        super::emit_stored_block(bw, &buf[self.start..self.start + self.len], is_final);
+        self.len = 0;
+    }
+
+    /// Whether a remainder is pending (streaming: it must survive the slide).
+    pub(super) fn is_pending(&self) -> bool {
+        self.len > 0
+    }
+
+    /// Absolute buffer offset of the pending remainder (meaningless when
+    /// [`Self::is_pending`] is false).
+    pub(super) fn pending_start(&self) -> usize {
+        self.start
+    }
+
+    /// The caller slid `buf` down by `shift` bytes; keep the pending
+    /// remainder pointing at the same bytes. The slide contract
+    /// ([`fast::run_resumable`]'s `in_base` accounting) guarantees the
+    /// remainder is retained, so `start` cannot underflow.
+    pub(super) fn rebase(&mut self, shift: usize) {
+        if self.len > 0 {
+            debug_assert!(shift <= self.start, "slide discarded a pending stored span");
+            self.start -= shift;
+        }
+    }
+}
+
 /// Emit the accumulated block, choosing the cheapest of stored / static-Huffman
 /// / dynamic-Huffman. `block_start` is the absolute offset of the block's first
 /// byte in `buf`.
@@ -857,6 +964,7 @@ fn bsr32(x: u32) -> u32 {
 ///
 /// Do not re-derive the size win. It is measured, it is 23 cells, and it is not the
 /// part that fails.
+#[allow(clippy::too_many_arguments)]
 fn emit_block(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -867,6 +975,7 @@ fn emit_block(
     header_scratch: &mut HeaderScratch,
     code_scratch: &mut CodeScratch,
     try_exact: bool,
+    pending_stored: Option<&mut StoredCoalescer>,
 ) {
     // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
     // this block, before any bit is written: both candidate Huffman codes,
@@ -1058,12 +1167,27 @@ fn emit_block(
         // at all (no Huffman machinery involved) — its byte-copy cost
         // lands in RESIDUAL, which is correct: it genuinely isn't Huffman
         // encoding time.
-        super::emit_stored_block(
-            bw,
-            &buf[block_start..block_start + sink.block_length],
-            is_final,
-        );
+        match pending_stored {
+            // Coalescing caller: defer, so an adjacent stored block can share
+            // a maximal sub-block grid (see `StoredCoalescer`).
+            Some(pending) => {
+                pending.push(bw, buf, block_start, sink.block_length);
+                if is_final {
+                    pending.flush(bw, buf, true);
+                }
+            }
+            None => super::emit_stored_block(
+                bw,
+                &buf[block_start..block_start + sink.block_length],
+                is_final,
+            ),
+        }
     } else if static_bits <= dynamic_bits {
+        // A pending stored span (coalescing callers only) precedes this
+        // block in input order — write it before the first Huffman bit.
+        if let Some(pending) = pending_stored {
+            pending.flush(bw, buf, false);
+        }
         crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);
@@ -1084,6 +1208,10 @@ fn emit_block(
             );
         });
     } else {
+        // Same ordering rule as the static arm above.
+        if let Some(pending) = pending_stored {
+            pending.flush(bw, buf, false);
+        }
         crate::anatomy_count!(blocks_emitted_dynamic);
         crate::anatomy_count!(dynamic_header_bits_total, header.header_bits());
         bw.add_bits(is_final as u64, 1);
@@ -1113,6 +1241,7 @@ fn emit_block_static_or_stored(
     sink: &Sink,
     statics: &StaticCodes,
     is_final: bool,
+    pending_stored: Option<&mut StoredCoalescer>,
 ) {
     let (static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
@@ -1132,12 +1261,27 @@ fn emit_block_static_or_stored(
     if stored_bits <= static_bits {
         // See the sibling `emit_block`'s comment: counted in
         // `write_stored_subblock`, not here.
-        super::emit_stored_block(
-            bw,
-            &buf[block_start..block_start + sink.block_length],
-            is_final,
-        );
+        match pending_stored {
+            // Coalescing caller: defer for a maximal sub-block grid (see
+            // `StoredCoalescer`).
+            Some(pending) => {
+                pending.push(bw, buf, block_start, sink.block_length);
+                if is_final {
+                    pending.flush(bw, buf, true);
+                }
+            }
+            None => super::emit_stored_block(
+                bw,
+                &buf[block_start..block_start + sink.block_length],
+                is_final,
+            ),
+        }
     } else {
+        // A pending stored span (coalescing callers only) precedes this
+        // block in input order — write it before the first Huffman bit.
+        if let Some(pending) = pending_stored {
+            pending.flush(bw, buf, false);
+        }
         crate::anatomy_count!(blocks_emitted_fixed);
         bw.add_bits(is_final as u64, 1);
         bw.add_bits(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN as u64, 2);

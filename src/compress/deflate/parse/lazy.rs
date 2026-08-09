@@ -144,6 +144,7 @@ pub(super) fn run_resumable(
             &mut header_scratch,
             &mut code_scratch,
             params.try_exact_huffman,
+            None,
         );
         if in_next == in_end {
             return in_next;
