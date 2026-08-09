@@ -218,6 +218,7 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
         None
     });
     encoder.set_header_info(header_info.clone());
+    encoder.set_minimal_gzip_header(args.stdout);
     encoder.compress_buffer_pure(&input, writer)?;
     Ok(bytes)
 }

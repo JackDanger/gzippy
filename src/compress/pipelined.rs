@@ -170,6 +170,9 @@ pub struct PipelinedGzEncoder {
     /// `None` MUST keep the computed grid: `block_size` carries a 128 KiB default, so
     /// honouring it unconditionally would silently change every existing T>1 output.
     block_size_override: Option<usize>,
+    /// When true, emit the 10-byte libdeflate-style header (no FNAME). Set for
+    /// `-c` / stdout so T>1 matches T1 mmap and libdeflate-gzip on `-c`.
+    minimal_gzip_header: bool,
 }
 
 impl PipelinedGzEncoder {
@@ -179,7 +182,13 @@ impl PipelinedGzEncoder {
             num_threads,
             header_info: GzipHeaderInfo::default(),
             block_size_override: None,
+            minimal_gzip_header: false,
         }
+    }
+
+    /// `-c` / stdout: omit FNAME so size matches libdeflate-gzip on `-c`.
+    pub fn set_minimal_gzip_header(&mut self, minimal: bool) {
+        self.minimal_gzip_header = minimal;
     }
 
     /// Honour the user's `-b`. Pass `None` (the default) to keep the computed grid.
@@ -198,10 +207,12 @@ impl PipelinedGzEncoder {
         self.header_info = info;
     }
 
-    /// Raw gzip header bytes (magic, CM=8, FLG, MTIME, XFL=0, OS=255, then any
-    /// FNAME/FCOMMENT) matching the layout written by the parallel/sequential
-    /// paths below.
+    /// Gzip header for this encode. File output keeps FNAME for `gzip -N` drop-in;
+    /// stdout (`-c`) uses the minimal header that libdeflate-gzip emits.
     fn gzip_header_bytes(&self) -> Vec<u8> {
+        if self.minimal_gzip_header {
+            return vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        }
         let mut header = Vec::with_capacity(64);
         let mut flags: u8 = 0x00;
         if self.header_info.filename.is_some() {
