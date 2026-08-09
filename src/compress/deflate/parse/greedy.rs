@@ -191,11 +191,13 @@ pub(super) fn run_block(
 
     loop {
         if in_next >= next_recalc {
-            far_len3 = FarLen3Gate::recalc(
-                &sink.litlen_freqs,
-                &sink.offset_freqs,
-                far_len3::GREEDY_MARGIN_EIGHTH_BITS,
-            );
+            if params.far_len3_gate {
+                far_len3 = FarLen3Gate::recalc(
+                    &sink.litlen_freqs,
+                    &sink.offset_freqs,
+                    far_len3::GREEDY_MARGIN_EIGHTH_BITS,
+                );
+            }
             next_recalc += (in_end - next_recalc).min(in_next - block_begin);
         }
 
