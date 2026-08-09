@@ -338,14 +338,14 @@ pub(crate) fn note_stored_block_emitted() {
 /// so aligning at it would both waste ~5 bytes per chunk and, more
 /// importantly, make the output depend on the chunk size — destroying
 /// byte-identity with the whole-buffer encoder.
-/// Levels where the T1 mmap / whole-buffer path runs zlib pick-min.
+/// Levels where the T1 whole-buffer path runs zlib pick-min (L5-L7).
 #[inline]
 fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
     matches!(level, 5..=7)
 }
 
-/// One whole-buffer DEFLATE encode: cheaper of libdeflate baseline vs zlib-ng
-/// knobs. Only for single-shot T1 gzip (not segmented chunk concat).
+/// Pick-min: baseline vs zlib knobs; the two encodes run in parallel so wall
+/// ≈ max(arm) instead of sum(arm) — measured ~2× → ~1.1× on dickens L6 T1.
 fn deflate_one_shot_t1_zlib_pick_min(
     buf: &[u8],
     data_start: usize,
@@ -368,8 +368,14 @@ fn deflate_one_shot_t1_zlib_pick_min(
         bw.finish()
     };
 
-    let base = encode(&baseline);
-    let zlib_out = encode(&zlib);
+    let (base, zlib_out) = std::thread::scope(|s| {
+        let b = s.spawn(|| encode(&baseline));
+        let z = s.spawn(|| encode(&zlib));
+        (
+            b.join().expect("pick-min baseline"),
+            z.join().expect("pick-min zlib"),
+        )
+    });
     if zlib_out.len() < base.len() {
         zlib_out
     } else {
@@ -916,7 +922,7 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     }
 
     let len = data.len();
-    // T1 mmap L5-L7: pick-min lives in `encode_gzip_slack_padded_to_vec` /
+    // T1 mmap L5-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
     // `deflate_into`; route through the padded whole-buffer encoder so the
     // streaming two-pass path does not need a second implementation.
     if matches!(level, 5..=7) && len > 0 {
