@@ -344,6 +344,44 @@ fn deflate_into(
         emit_stored_block(bw, &[], is_last);
     } else if level == 0 {
         emit_stored_block(bw, &buf[data_start..in_end], is_last);
+    } else if !parallel && matches!(level, 5 | 6) {
+        // T1 L5-L6: zlib chain depth closes gzip/pigz text cells but flips
+        // libdeflate ties on incompressible inputs. Pick the cheaper of the
+        // libdeflate baseline and the zlib-ng knobs (non-worse on ties BY
+        // CONSTRUCTION when the baseline arm is always a candidate).
+        let budget = encode_types::HeaderBudget::Lean;
+        let baseline = level::params_baseline(level);
+        let zlib = level::params_zlib_t1(level);
+        let mut bw_base = BitWriter::from_vec(Vec::new());
+        parse::compress(
+            buf,
+            data_start,
+            in_end,
+            &baseline,
+            is_last,
+            budget,
+            &mut bw_base,
+        );
+        let base = bw_base.finish();
+        let mut bw_zlib = BitWriter::from_vec(Vec::new());
+        parse::compress(
+            buf,
+            data_start,
+            in_end,
+            &zlib,
+            is_last,
+            budget,
+            &mut bw_zlib,
+        );
+        let zlib_out = bw_zlib.finish();
+        let chosen = if zlib_out.len() < base.len() {
+            zlib_out
+        } else {
+            base
+        };
+        let mut prefixed = std::mem::replace(bw, BitWriter::from_vec(Vec::new())).finish();
+        prefixed.extend_from_slice(&chosen);
+        *bw = BitWriter::from_vec(prefixed);
     } else {
         // T>1 spends its parallel wall slack on a stronger parse — see
         // `level::params_parallel`. T1 is untouched.
@@ -857,6 +895,21 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     }
 
     let len = data.len();
+    // T1 mmap L5-L6: pick-min lives in `encode_gzip_slack_padded_to_vec` /
+    // `deflate_into`; route through the padded whole-buffer encoder so the
+    // streaming two-pass path does not need a second implementation.
+    if matches!(level, 5 | 6) {
+        let cap = len + INPLACE_TAIL_PAD;
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        let mut input = Vec::with_capacity(cap);
+        input.extend_from_slice(data);
+        input.resize(cap, 0);
+        let gz = encode_gzip_slack_padded_to_vec(&input, len, level);
+        writer.write_all(&gz)?;
+        return Ok(len as u64);
+    }
+
     let out_cap = if level == 0 {
         // Drained per STREAM_CHUNK stored slice below — the output buffer
         // peaks at one chunk plus its framing instead of input-sized.

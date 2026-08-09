@@ -114,6 +114,10 @@ pub struct LevelParams {
     pub max_search_depth: u32,
     /// Stop searching once a match this long is found (`c->nice_match_length`).
     pub nice_match_length: u32,
+    /// zlib `good_length`: quarter the chain walk once `best_len_in >= good_match`
+    /// (`vendor/zlib-ng/match_tpl.h:75-77`). Set only on the T1 path — see
+    /// [`apply_zlib_t1_search_knobs`].
+    pub good_match: u32,
     /// Near-optimal-only knobs (meaningful iff `strategy == NearOptimal`).
     pub near_optimal: NearOptimalParams,
 }
@@ -134,11 +138,8 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
 /// presets exactly; the strategy mapping substitutes a fallback for the two
 /// strategies not yet implemented in this increment (see the module docs).
 pub fn params(level: u32) -> LevelParams {
-    #[allow(unused_mut)]
-    let mut p = params_inner(level);
-    // Measurement-only frontier override; compiles to nothing when the feature is off.
-    #[cfg(feature = "ladder-tune")]
-    ladder_tune::apply(&mut p);
+    let mut p = params_baseline(level);
+    apply_zlib_t1_search_knobs(level, &mut p);
     // Report the knobs that were ACTUALLY RESOLVED by the production path, once
     // per process. `fulcrum explain` reads this and asserts it against observed
     // behaviour; without it, the tool would have to keep its own copy of this
@@ -147,9 +148,25 @@ pub fn params(level: u32) -> LevelParams {
     // executed. Feature-gated (default OFF) and compiles to nothing when off.
     #[cfg(feature = "anatomy-counters")]
     emit_declared_once(level, &p);
+    p
+}
+
+/// libdeflate-table knobs before the T1 zlib chain override (L5-L6 pick-min baseline).
+pub(crate) fn params_baseline(level: u32) -> LevelParams {
+    #[allow(unused_mut)]
+    let mut p = params_inner(level);
+    #[cfg(feature = "ladder-tune")]
+    ladder_tune::apply(&mut p);
     if level == 1 {
         apply_l1_fast_parallel_knobs(&mut p);
     }
+    p
+}
+
+/// zlib-ng chain depth + `good_match` for the T1 pick-min challenger arm.
+pub(crate) fn params_zlib_t1(level: u32) -> LevelParams {
+    let mut p = params_baseline(level);
+    apply_zlib_t1_search_knobs(level, &mut p);
     p
 }
 
@@ -300,6 +317,7 @@ pub fn params_parallel(level: u32) -> LevelParams {
     if level == 1 {
         apply_l1_fast_parallel_knobs(&mut p);
     }
+    p.good_match = 0;
     p
 }
 
@@ -360,6 +378,25 @@ pub mod ladder_tune {
     }
 }
 
+/// zlib-ng `configuration_table` chain depth + `good_length` for the T1 path
+/// (G31/G31a). libdeflate's map gives shallow chains with no early exit; gzip
+/// runs deep chains BECAUSE `good_match` quarters the walk once a match is long
+/// enough. Applied only in [`params`], not [`params_parallel`], so T>1 keeps
+/// libdeflate depths ×4.
+fn apply_zlib_t1_search_knobs(level: u32, p: &mut LevelParams) {
+    match level {
+        5 => {
+            p.good_match = 8;
+            p.max_search_depth = 32;
+        }
+        6 => {
+            p.good_match = 8;
+            p.max_search_depth = 128;
+        }
+        _ => {}
+    }
+}
+
 fn params_inner(level: u32) -> LevelParams {
     let max_match = DEFLATE_MAX_MATCH_LEN;
     // Placeholder near-optimal knobs for the non-near-optimal levels (unused).
@@ -382,6 +419,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Fast0,
             max_search_depth: 0,
             nice_match_length: 32,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         // Native L1 is the igzip-class one-pass FAST path (Increment 4):
@@ -400,6 +438,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Fast,
             max_search_depth: 1,
             nice_match_length: 32,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
@@ -413,6 +452,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 10,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
@@ -479,6 +519,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
@@ -504,6 +545,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Greedy,
             max_search_depth: 16,
             nice_match_length: 30,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
@@ -517,6 +559,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 16,
             nice_match_length: 30,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
@@ -530,6 +573,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 35,
             nice_match_length: 65,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
@@ -543,6 +587,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Lazy,
             max_search_depth: 100,
             nice_match_length: 130,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
@@ -556,6 +601,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Lazy2,
             max_search_depth: 300,
             nice_match_length: max_match,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
@@ -569,6 +615,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::Lazy2,
             max_search_depth: 600,
             nice_match_length: max_match,
+            good_match: 0,
             near_optimal: NONE_NO,
         },
         // Native near-optimal parser (`deflate_compress_near_optimal`,
@@ -584,6 +631,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 75,
+            good_match: 0,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 2,
                 min_improvement_to_continue: 32,
@@ -602,6 +650,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::NearOptimal,
             max_search_depth: 100,
             nice_match_length: 150,
+            good_match: 0,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 4,
                 min_improvement_to_continue: 16,
@@ -620,6 +669,7 @@ fn params_inner(level: u32) -> LevelParams {
             strategy: Strategy::NearOptimal,
             max_search_depth: 300,
             nice_match_length: max_match,
+            good_match: 0,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 10,
                 min_improvement_to_continue: 1,
@@ -702,6 +752,11 @@ mod tests {
         for l in 2..=9u32 {
             let prev = params(l - 1);
             let cur = params(l);
+            // L5-L6 carry zlib-ng chain depths (32, 128) that can exceed libdeflate's
+            // L7 base (100). Monotonic holds from L7 onward; skip the L6→L7 step only.
+            if l == 7 && prev.max_search_depth > cur.max_search_depth {
+                continue;
+            }
             assert!(
                 cur.max_search_depth >= prev.max_search_depth,
                 "L{l} searches less deeply than L{}: {} < {}",

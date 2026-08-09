@@ -235,6 +235,7 @@ impl HcMatchfinder {
         max_len: u32,
         nice_len: u32,
         max_search_depth: u32,
+        good_match: u32,
         next_hashes: &mut [u32; 2],
     ) -> (u32, u32) {
         // `bucket-oracle-null-mf` (Cargo.toml doc comment): the CEILING
@@ -258,6 +259,7 @@ impl HcMatchfinder {
                 max_len,
                 nice_len,
                 max_search_depth,
+                good_match,
                 next_hashes,
             );
             return (best_len_in, 1);
@@ -266,7 +268,11 @@ impl HcMatchfinder {
         {
             debug_assert!(max_search_depth >= 1, "max_search_depth must be >= 1");
             let mut best_len = best_len_in;
-            let mut depth_remaining = max_search_depth;
+            let mut depth_remaining = if good_match != 0 && best_len >= good_match {
+                (max_search_depth >> 2).max(1)
+            } else {
+                max_search_depth
+            };
             let mut best_matchptr = in_next; // absolute offset into `buf`
 
             let mut cur_pos = in_next - *in_base;
@@ -699,10 +705,15 @@ mod tests {
             max_len: u32,
             nice_len: u32,
             max_search_depth: u32,
+            good_match: u32,
             next_hashes: &mut [u32; 2],
         ) -> (u32, u32) {
             let mut best_len = best_len_in;
-            let mut depth_remaining = max_search_depth;
+            let mut depth_remaining = if good_match != 0 && best_len >= good_match {
+                (max_search_depth >> 2).max(1)
+            } else {
+                max_search_depth
+            };
             let mut best_matchptr = in_next;
 
             let mut cur_pos = in_next - *in_base;
@@ -915,6 +926,7 @@ mod tests {
                 max_len,
                 nice_len,
                 max_search_depth,
+                0,
                 &mut nh_new,
             );
             let (l_ref, o_ref) = mf_ref.longest_match(
@@ -925,6 +937,7 @@ mod tests {
                 max_len,
                 nice_len,
                 max_search_depth,
+                0,
                 &mut nh_ref,
             );
             // Offset is only meaningful when a real match was found (len > 2);
@@ -1120,6 +1133,7 @@ mod tests {
             (in_end - 12) as u32,
             258,
             32,
+            0,
             &mut next_hashes,
         );
         assert!(len >= 4, "expected a match, got len {len}");
@@ -1150,6 +1164,7 @@ mod tests {
                 (in_end - pos) as u32,
                 258,
                 32,
+                0,
                 &mut next_hashes,
             );
             if len >= 3 {
