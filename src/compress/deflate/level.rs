@@ -153,7 +153,7 @@ pub fn params(level: u32) -> LevelParams {
     p
 }
 
-/// libdeflate-table knobs before the T1 zlib chain override (pick-min baseline).
+/// libdeflate-table knobs (streaming / segmented / pick-min baseline).
 pub(crate) fn params_baseline(level: u32) -> LevelParams {
     #[allow(unused_mut)]
     let mut p = params_inner(level);
@@ -165,7 +165,7 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
     p
 }
 
-/// zlib-ng chain depth + `good_match` for the T1 pick-min challenger arm.
+/// zlib-ng chain depth + `good_match` for the T1 whole-buffer L5-L7 path.
 pub(crate) fn params_zlib_t1(level: u32) -> LevelParams {
     let mut p = params_baseline(level);
     apply_zlib_t1_search_knobs(level, &mut p);
