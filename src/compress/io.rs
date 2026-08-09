@@ -295,6 +295,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         // so passing it unconditionally would change every existing T>1 output.
         encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
         encoder.set_header_info(header_info.clone());
+        encoder.set_minimal_gzip_header(args.stdout);
         if args.stdout {
             let out = BufWriter::with_capacity(1024 * 1024, stdout());
             encoder
@@ -479,6 +480,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             );
             encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
             encoder.set_header_info(header_info.clone());
+            encoder.set_minimal_gzip_header(true);
             encoder.compress_buffer_pure(input_data, &mut counted)?;
             counted.flush()?;
             if verbose {
