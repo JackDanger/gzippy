@@ -102,8 +102,12 @@ pub struct LevelParams {
     /// T>1-only: probe the second bucket slot on a primary miss (vendor
     /// `ht_matchfinder` probes both slots every lookup).
     pub fast_bucket2_probe_on_miss: bool,
-    /// T>1-only: hash inserts per accepted match interior (vendor shifts the
-    /// full bucket every skipped byte; default L1 is 3).
+    /// Hash inserts per accepted match interior. L1 (both T1 and T>1, via
+    /// [`apply_l1_fast_parallel_knobs`]) ships `usize::MAX` — insert EVERY
+    /// skipped byte, exactly libdeflate's `ht_matchfinder_skip_bytes` — since
+    /// the interleaved-bucket lever made full maintenance one cache line per
+    /// insert. Non-L1 levels keep the igzip-style small cap (only the fast
+    /// path reads this).
     pub fast_hash_update_inserts: usize,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
@@ -135,7 +139,15 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     p.fast_bucket2 = true;
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
-    p.fast_hash_update_inserts = 8;
+    // Insert EVERY interior (match-skip) byte, shifting the 2-slot bucket on
+    // each write — vendor `ht_matchfinder_skip_bytes` semantics. The old cap
+    // of 8 plus shift-free interior overwrites left the bucket holding stale
+    // generations; measured on solvency (2026-08-09, L1, main@03200049) the
+    // pair of fixes flips access.log (-70,953 B vs libdeflate) and
+    // ecoli.fastq (-7,579 B) and collapses the diff_dist divergence class to
+    // exactly 0. See `parse/fast.rs`'s `L1_HEAD_ENTRIES` for the layout that
+    // makes this affordable.
+    p.fast_hash_update_inserts = usize::MAX;
     p.fast_lazy_peek_cost_gate = true;
     p.fast_lazy_peek_cost_margin_bits = 0;
 }

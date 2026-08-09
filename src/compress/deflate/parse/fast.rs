@@ -896,6 +896,16 @@ pub(super) const L1_HASH3_GATE_WARM_INSERT: bool = false;
 /// on a 6MB file at T4+. `true` closes that T>1 regression while keeping the
 /// T1 win; see this module's `Hash3Cfg` doc comment.
 pub(super) const L1_HASH3_GATE_INITIAL_ACTIVE: bool = true;
+/// Interior (match-skip) insert cap for the HASH3 table, in positions past
+/// `pos + 1`. Before the interleaved-bucket lever this was COUPLED to the
+/// primary table's `fast_hash_update_inserts` knob (both loops shared one
+/// `insert_end`, and L1 shipped `8`). That lever makes the PRIMARY table
+/// insert every interior byte (vendor `ht_matchfinder_skip_bytes`
+/// semantics), which must NOT drag the hash3 table along with it — the
+/// hash3 lever's shipped behavior was measured at cap 8 and this lever's
+/// charter is bucket MAINTENANCE only, one mechanism per lever. This const
+/// freezes the hash3 interior cap at the pre-lever value.
+pub(super) const L1_HASH3_INTERIOR_INSERTS: usize = 8;
 
 // FROZEN SHIP GATE: PASSED (2026-07-24, solvency root@10.0.2.240, AMD EPYC
 // 7282, RUSTFLAGS="-C target-cpu=native", commit `c7274688` built fresh in
@@ -1002,6 +1012,17 @@ impl Hash3Cfg {
 /// one load, one compare per position). See Lever 1.
 const HASH_BITS: u32 = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
+/// The L1 head table's element count: [`HASH_SIZE`] INTERLEAVED 2-slot
+/// buckets — bucket `h` is `head[2h]` (newest position) and `head[2h + 1]`
+/// (one generation behind), ADJACENT so a shift-insert (read slot 0, store
+/// both slots) touches exactly one cache line. This is the vendor
+/// `ht_matchfinder` bucket shape (`hash_tab[1 << HASH_ORDER][2]`, see
+/// `matchfinder/ht.rs` and `ldx/ht_matchfinder.rs`) and the whole point of
+/// the interleaved-bucket lever: the earlier two-array `head`/`head2`
+/// layout paid a SECOND cache line per insert for the same semantics
+/// (+34%/+16% T1 wall on the solvency probe, informational timer). L0
+/// (`ACCEL`) keeps a single-slot [`HASH_SIZE`] table.
+const L1_HEAD_ENTRIES: usize = HASH_SIZE * 2;
 
 /// Software-pipeline distance for the head-table prefetch (SF1-C). Each fastloop
 /// iteration prefetches the head slot for the position it will probe `PF_DIST`
@@ -1480,9 +1501,10 @@ impl LazyPeekCostGateCfg {
 }
 
 /// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
-/// (2026-07-22 campaign): a conditional second-bucket probe. `head2[h]` holds
-/// the position ONE GENERATION behind `head[h]` (see the `cand2` capture at
-/// the top of [`process_position_l1`]); this helper is consulted ONLY when
+/// (2026-07-22 campaign): a conditional second-bucket probe. Bucket slot 1
+/// (`head[2h + 1]`) holds the position ONE GENERATION behind slot 0 (see the
+/// `cand2` capture at the top of [`process_position_l1`], and
+/// [`L1_HEAD_ENTRIES`] for the interleaved layout); this helper is consulted ONLY when
 /// the primary probe already produced an ACCEPTED match no longer than
 /// `tune.bucket2_gate_max_len` (the "short-match acceptance" gate — never on
 /// every position, which is the always-2-bucket shape the mission brief
@@ -1621,7 +1643,6 @@ fn process_position_l1(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
-    head2: &mut [u32],
     head3: &mut [u32],
     bucket2: Bucket2Cfg,
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
@@ -1646,25 +1667,31 @@ fn process_position_l1(
     cost_gate_block_active: bool,
     cost_gate_cfg: LazyPeekCostGateCfg,
 ) -> usize {
-    // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
-    unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+    // INTERLEAVED 2-slot bucket insert (vendor `ht_matchfinder` shape): the
+    // bucket for hash `h` is `head[2h]` (newest) and `head[2h + 1]` (one
+    // generation behind), ADJACENT so the read+shift+write below all land in
+    // one cache line — this is the layout that makes vendor-exact bucket
+    // maintenance affordable (the reverted two-array `head`/`head2` layout
+    // paid a second cache line per insert). Shift the old occupant (`cand`,
+    // already read by the caller) into slot 1, capture ITS old occupant as
+    // the second probe candidate, then write `pos` into slot 0 — exactly
+    // `ht_matchfinder_longest_match`'s maintenance order.
+    // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`, so
+    // `2h + 1 < 2 * HASH_SIZE == head.len()` (the L1 table is allocated at
+    // `L1_HEAD_ENTRIES`).
+    let cand2 = unsafe {
+        let b = head.as_mut_ptr().add(h << 1);
+        let c2 = *b.add(1);
+        *b.add(1) = cand;
+        *b = pos as u32;
+        c2
+    };
     // `head_table_writes`/`probe_attempts`'s "1 per call" contribution is
     // counted by the CALLER instead of here (see `fastloop_l1`'s call
     // sites) — the caller already knows statically how many times it is
     // about to invoke this function, so folding these two unconditional
     // per-call bumps out of the hottest inlined body trims two field writes
     // from the common (miss/too-short) path without losing any count.
-
-    // 2-way bucket: `head2` holds the position ONE GENERATION behind `head` per
-    // hash slot. Read the current occupant then shift `cand` down into `head2`.
-    let cand2 = if bucket2.enabled {
-        // SAFETY: `h < HASH_SIZE == head2.len()` when bucket2 is enabled.
-        let c2 = unsafe { *head2.get_unchecked(h) };
-        unsafe { *head2.get_unchecked_mut(h) = cand };
-        c2
-    } else {
-        NO_POS
-    };
 
     // HASH3-GATE composition lever: whether `head3` is touched AT ALL this
     // position — either the block is actively probing (`hash3_active`) or
@@ -1840,11 +1867,13 @@ fn process_position_l1(
             {
                 local.hash_computations += 1;
             }
-            // SAFETY: same as the primary lookup above; this is a
-            // READ ONLY -- the peek does not insert `pos + 1` into
-            // `head`, so the caller's next position (whether this
-            // match is deferred or taken) is not a double-insert.
-            let cand1 = unsafe { *head.get_unchecked(h1) };
+            // SAFETY: same as the primary lookup above (`2*h1 <
+            // L1_HEAD_ENTRIES`); this is a READ ONLY -- the peek does not
+            // insert `pos + 1` into `head`, so the caller's next position
+            // (whether this match is deferred or taken) is not a
+            // double-insert. Slot 0 (newest) only, as before the
+            // interleaved-bucket lever.
+            let cand1 = unsafe { *head.get_unchecked(h1 << 1) };
             #[cfg(feature = "anatomy-counters")]
             {
                 local.head_table_reads += 1;
@@ -1933,7 +1962,11 @@ fn process_position_l1(
             local.probe_outcome_accepted += 1;
             local.positions_processed_matches += length as u64;
         }
-        // LIMIT_HASH_UPDATE (see the tail loop for the full note).
+        // LIMIT_HASH_UPDATE (see the tail loop for the full note). L1 ships
+        // `usize::MAX` (insert EVERY skipped byte, vendor
+        // `ht_matchfinder_skip_bytes` semantics — see
+        // `level::apply_l1_fast_parallel_knobs`); the knob still exists so
+        // the dev-search harness can sweep it.
         let match_end = pos + length as usize;
         let insert_end = if limit_hash_update_inserts == usize::MAX {
             match_end
@@ -1945,17 +1978,32 @@ fn process_position_l1(
             // SAFETY: nh < match_end = pos+length <= in_end, and
             // buf's pad covers the 4-byte load past in_end.
             let s = unsafe { load_u32(base, nh) };
-            // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-            unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+            // Interior SHIFT-insert, same 2-slot protocol as the probe
+            // position above (`slot1 <- slot0; slot0 <- nh`) — the second
+            // maintenance defect this lever fixes: overwriting slot 0
+            // WITHOUT the shift left slot 1 holding stale generations
+            // instead of the second-newest occurrence. One cache line per
+            // bucket, so the shift is a same-line read+2 stores.
+            // SAFETY: `lz_hash` output `< HASH_SIZE`, so `2h + 1 <
+            // L1_HEAD_ENTRIES == head.len()`, as above.
+            unsafe {
+                let b = head.as_mut_ptr().add((lz_hash(s, HASH_BITS) as usize) << 1);
+                *b.add(1) = *b;
+                *b = nh as u32;
+            }
             nh += 1;
         }
         // HASH3-PROBE interior insert (gated the SAME as the top-of-function
         // insert policy: only under `hash3.insert_always` — under the sparse
         // policy, a match's interior positions never enter `head3`, matching
-        // "insert only on literal emit" literally).
+        // "insert only on literal emit" literally). Capped at the FROZEN
+        // pre-lever depth [`L1_HASH3_INTERIOR_INSERTS`], NOT the primary
+        // table's `insert_end` — see that const's doc comment (this lever
+        // must not change hash3 semantics).
         if hash3_touch && hash3.insert_always {
+            let hash3_insert_end = (pos + 1 + L1_HASH3_INTERIOR_INSERTS).min(match_end);
             let mut nh3 = pos + 1;
-            while nh3 < insert_end {
+            while nh3 < hash3_insert_end {
                 // SAFETY: same bound as the `head` interior loop above.
                 let s3 = unsafe { load_u24(base, nh3) };
                 let h3i = lz_hash(s3, hash3.bits) as usize;
@@ -2036,8 +2084,19 @@ fn process_position_l1_lean(
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
     cost_gate_cfg: LazyPeekCostGateCfg,
 ) -> usize {
-    // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
-    unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+    // INTERLEAVED 2-slot bucket insert — the SAME maintenance protocol as
+    // [`process_position_l1`] (slot 1 <- slot 0 <- pos, one cache line), so
+    // the ONE L1 head-table layout and its invariant (slot 1 is one
+    // generation behind slot 0) hold no matter which per-block
+    // specialization ran. This lean path never READS slot 1 (it exists for
+    // blocks with the probe levers inert), only maintains it.
+    // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`, so
+    // `2h + 1 < 2 * HASH_SIZE == head.len()` (`L1_HEAD_ENTRIES`).
+    unsafe {
+        let b = head.as_mut_ptr().add(h << 1);
+        *b.add(1) = *b;
+        *b = pos as u32;
+    }
 
     // `pos - cand`; a wrapping sub keeps a sentinel/stale entry out of
     // the window range instead of panicking on underflow.
@@ -2089,11 +2148,12 @@ fn process_position_l1_lean(
             {
                 local.hash_computations += 1;
             }
-            // SAFETY: same as the primary lookup above; this is a
-            // READ ONLY -- the peek does not insert `pos + 1` into
-            // `head`, so the caller's next position (whether this
-            // match is deferred or taken) is not a double-insert.
-            let cand1 = unsafe { *head.get_unchecked(h1) };
+            // SAFETY: same as the primary lookup above (`2*h1 <
+            // L1_HEAD_ENTRIES`); this is a READ ONLY -- the peek does not
+            // insert `pos + 1` into `head`, so the caller's next position
+            // (whether this match is deferred or taken) is not a
+            // double-insert. Slot 0 (newest) only.
+            let cand1 = unsafe { *head.get_unchecked(h1 << 1) };
             #[cfg(feature = "anatomy-counters")]
             {
                 local.head_table_reads += 1;
@@ -2155,8 +2215,15 @@ fn process_position_l1_lean(
             // SAFETY: nh < match_end = pos+length <= in_end, and
             // buf's pad covers the 4-byte load past in_end.
             let s = unsafe { load_u32(base, nh) };
-            // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-            unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+            // Interior SHIFT-insert — same protocol as
+            // [`process_position_l1`]'s interior loop (see the comment
+            // there). SAFETY: `lz_hash` output `< HASH_SIZE`, so `2h + 1 <
+            // L1_HEAD_ENTRIES == head.len()`, as above.
+            unsafe {
+                let b = head.as_mut_ptr().add((lz_hash(s, HASH_BITS) as usize) << 1);
+                *b.add(1) = *b;
+                *b = nh as u32;
+            }
             nh += 1;
         }
         // No HASH3-PROBE interior insert here (see this function's doc
@@ -2354,7 +2421,6 @@ fn fastloop_l1(
     sink: &mut Sink,
     limit_hash_update_inserts: usize,
     #[cfg(feature = "anatomy-counters")] local: &mut FastLocalCounters,
-    head2: &mut [u32],
     head3: &mut [u32],
     bucket2: Bucket2Cfg,
     #[cfg(feature = "l1-tune")] tune: tune::L1Tune,
@@ -2376,11 +2442,12 @@ fn fastloop_l1(
         // past it); a wrong prefetch only wastes bandwidth. SAFETY:
         // `pos < fast_end <= in_end - 258` and `PF_DIST` is small, so
         // `pos + PF_DIST + 4 <= in_end`, in bounds for the 4-byte load;
-        // the prefetch address is a pure hint that never faults.
+        // the prefetch address is a pure hint that never faults (bucket
+        // base `2*fh0` — both slots share the line).
         unsafe {
             let fseq0 = load_u32(base, pos + PF_DIST);
             let fh0 = lz_hash(fseq0, HASH_BITS) as usize;
-            prefetch_write(head.as_ptr().add(fh0) as *const u8);
+            prefetch_write(head.as_ptr().add(fh0 << 1) as *const u8);
         }
 
         // SF2 (this lever): gated to `pos + 1 < fast_end` so position
@@ -2399,7 +2466,7 @@ fn fastloop_l1(
             unsafe {
                 let fseq1 = load_u32(base, pos + 1 + PF_DIST);
                 let fh1 = lz_hash(fseq1, HASH_BITS) as usize;
-                prefetch_write(head.as_ptr().add(fh1) as *const u8);
+                prefetch_write(head.as_ptr().add(fh1 << 1) as *const u8);
             }
             // SAFETY: `pos + 1 < fast_end <= in_end - 258`, so both
             // `pos + 4 <= in_end` and `pos + 1 + 4 <= in_end`.
@@ -2407,14 +2474,15 @@ fn fastloop_l1(
             let h0 = lz_hash(seq0, HASH_BITS) as usize;
             let seq1 = unsafe { load_u32(base, pos + 1) };
             let h1 = lz_hash(seq1, HASH_BITS) as usize;
-            // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE.
+            // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE,
+            // so `2h < L1_HEAD_ENTRIES` (slot 0 of the interleaved bucket).
             // Two independent loads, issued back to back with no
             // intervening write, so a superscalar core can have both
             // outstanding misses in flight at once (unlike the serial
             // read-modify-write-then-read-next-slot the single-position
             // loop forced).
-            let cand0 = unsafe { *head.get_unchecked(h0) };
-            let cand1_raw = unsafe { *head.get_unchecked(h1) };
+            let cand0 = unsafe { *head.get_unchecked(h0 << 1) };
+            let cand1_raw = unsafe { *head.get_unchecked(h1 << 1) };
             #[cfg(feature = "anatomy-counters")]
             {
                 local.hash_computations += 2;
@@ -2433,7 +2501,6 @@ fn fastloop_l1(
                 limit_hash_update_inserts,
                 #[cfg(feature = "anatomy-counters")]
                 local,
-                head2,
                 head3,
                 bucket2,
                 #[cfg(feature = "l1-tune")]
@@ -2453,15 +2520,17 @@ fn fastloop_l1(
                 // match, including a lazy-peek DEFER) — exactly the case
                 // where the ORIGINAL serial loop's next iteration would
                 // process `pos + 1` next, so `cand1_raw` is reusable
-                // PROVIDED it still reflects `head[h1]` as of right now.
-                // `process_position_l1(pos, h0, cand0, ...)` performed
-                // exactly one write, `head[h0] = pos`. If `h1 != h0` that
-                // write didn't touch bucket `h1`, so `cand1_raw` (read
-                // BEFORE the write, in parallel with `cand0`) still equals
-                // `head[h1]` — identical to what a fresh read would return.
-                // If `h1 == h0`, the write just set `head[h1]` to `pos`, so
-                // the up-to-date value is `pos` itself, not the stale
-                // pre-write `cand1_raw`.
+                // PROVIDED it still reflects `head[2*h1]` (slot 0) as of
+                // right now. `process_position_l1(pos, h0, cand0, ...)`
+                // wrote exactly one BUCKET, `2*h0` (slot 0 = `pos`, slot 1 =
+                // `cand0` — the slot-1 store sits at the ODD index
+                // `2*h0 + 1`, so it can never alias ANY slot-0 read). If
+                // `h1 != h0` that bucket write didn't touch bucket `h1`, so
+                // `cand1_raw` (read BEFORE the write, in parallel with
+                // `cand0`) still equals `head[2*h1]` — identical to what a
+                // fresh read would return. If `h1 == h0`, the write just set
+                // slot 0 to `pos`, so the up-to-date value is `pos` itself,
+                // not the stale pre-write `cand1_raw`.
                 let cand1 = if h1 == h0 { pos as u32 } else { cand1_raw };
                 pos = process_position_l1(
                     after0,
@@ -2474,7 +2543,6 @@ fn fastloop_l1(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     local,
-                    head2,
                     head3,
                     bucket2,
                     #[cfg(feature = "l1-tune")]
@@ -2503,7 +2571,7 @@ fn fastloop_l1(
 
         // Boundary: exactly one position left in the fast region
         // (`pos + 1 == fast_end`) — process it scalar, byte-for-byte the
-        // pre-SF2 loop body (fresh single `head[h]` read).
+        // pre-SF2 loop body (fresh single slot-0 read).
         // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
         let seq = unsafe { load_u32(base, pos) };
         let h = lz_hash(seq, HASH_BITS) as usize;
@@ -2511,8 +2579,9 @@ fn fastloop_l1(
         {
             local.hash_computations += 1;
         }
-        // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
-        let cand = unsafe { *head.get_unchecked(h) };
+        // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`,
+        // so `2h < L1_HEAD_ENTRIES`.
+        let cand = unsafe { *head.get_unchecked(h << 1) };
         #[cfg(feature = "anatomy-counters")]
         {
             local.head_table_reads += 1;
@@ -2528,7 +2597,6 @@ fn fastloop_l1(
             limit_hash_update_inserts,
             #[cfg(feature = "anatomy-counters")]
             local,
-            head2,
             head3,
             bucket2,
             #[cfg(feature = "l1-tune")]
@@ -2583,18 +2651,19 @@ fn fastloop_l1_lean(
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline prefetch — see [`fastloop_l1`]'s matching
-        // comment for the mechanism and safety argument (identical here).
+        // comment for the mechanism and safety argument (identical here;
+        // bucket base `2*fh0`).
         unsafe {
             let fseq0 = load_u32(base, pos + PF_DIST);
             let fh0 = lz_hash(fseq0, HASH_BITS) as usize;
-            prefetch_write(head.as_ptr().add(fh0) as *const u8);
+            prefetch_write(head.as_ptr().add(fh0 << 1) as *const u8);
         }
 
         if pos + 1 < fast_end {
             unsafe {
                 let fseq1 = load_u32(base, pos + 1 + PF_DIST);
                 let fh1 = lz_hash(fseq1, HASH_BITS) as usize;
-                prefetch_write(head.as_ptr().add(fh1) as *const u8);
+                prefetch_write(head.as_ptr().add(fh1 << 1) as *const u8);
             }
             // SAFETY: `pos + 1 < fast_end <= in_end - 258`, so both
             // `pos + 4 <= in_end` and `pos + 1 + 4 <= in_end`.
@@ -2602,9 +2671,10 @@ fn fastloop_l1_lean(
             let h0 = lz_hash(seq0, HASH_BITS) as usize;
             let seq1 = unsafe { load_u32(base, pos + 1) };
             let h1 = lz_hash(seq1, HASH_BITS) as usize;
-            // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE.
-            let cand0 = unsafe { *head.get_unchecked(h0) };
-            let cand1_raw = unsafe { *head.get_unchecked(h1) };
+            // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE,
+            // so `2h < L1_HEAD_ENTRIES` (slot 0 of the interleaved bucket).
+            let cand0 = unsafe { *head.get_unchecked(h0 << 1) };
+            let cand1_raw = unsafe { *head.get_unchecked(h1 << 1) };
             #[cfg(feature = "anatomy-counters")]
             {
                 local.hash_computations += 2;
@@ -2664,8 +2734,9 @@ fn fastloop_l1_lean(
         {
             local.hash_computations += 1;
         }
-        // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`.
-        let cand = unsafe { *head.get_unchecked(h) };
+        // SAFETY: `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`,
+        // so `2h < L1_HEAD_ENTRIES`.
+        let cand = unsafe { *head.get_unchecked(h << 1) };
         #[cfg(feature = "anatomy-counters")]
         {
             local.head_table_reads += 1;
@@ -2747,8 +2818,18 @@ fn release_head_table(
 /// so the resumable runner ([`run_resumable`]) shares ONE copy of this logic
 /// instead of a drifting duplicate. Returns the cursor after `block_end_target`
 /// is reached (a straddling match may overrun it slightly).
+///
+/// `ACCEL` mirrors [`run`]'s: L1 (`ACCEL == false`) uses the interleaved
+/// 2-slot bucket layout (`L1_HEAD_ENTRIES`, slot 0 at `2h`) and every insert
+/// shifts slot 0 into slot 1; L0 (`ACCEL == true`) keeps the single-slot
+/// `HASH_SIZE` table and plain overwrites. A const generic (not a runtime
+/// `bool`) for the same monomorphization reason as [`run`]'s `ACCEL` (and
+/// because `parse_tail::<{ !ACCEL }>` is not expressible on stable Rust —
+/// the caller's own `ACCEL` is passed straight through). The tail's PROBE
+/// stays slot-0-only on both layouts — only bucket MAINTENANCE differs
+/// (this lever's scope).
 #[allow(clippy::too_many_arguments)]
-fn parse_tail(
+fn parse_tail<const ACCEL: bool>(
     mut pos: usize,
     block_end_target: usize,
     in_end: usize,
@@ -2778,14 +2859,31 @@ fn parse_tail(
             // Elided bounds (measured as live runtime-len panic guards in the
             // release binary's `parse_tail` — the fastloop bodies already
             // elide the identical accesses, this tail loop was the leftover):
-            // `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE ==
-            // head.len()` — the same proof as `fastloop_l1`'s head accesses.
-            // Callers ([`run`], [`run_resumable`]) always pass the
-            // HASH_SIZE-element table from `acquire_head_table`.
-            debug_assert!(h < head.len());
-            // SAFETY: `h < HASH_SIZE == head.len()` per the lz_hash bound.
-            let cand = unsafe { *head.get_unchecked(h) };
-            unsafe { *head.get_unchecked_mut(h) = pos as u32 };
+            // `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE`; the L1
+            // interleaved layout's table has `2 * HASH_SIZE == L1_HEAD_ENTRIES`
+            // entries so `2h + 1 < head.len()` by the same proof. Callers
+            // ([`run`], [`run_resumable`]) always pass the table from
+            // `acquire_head_table` sized for the layout.
+            let cand = if !ACCEL {
+                // Interleaved 2-slot bucket: shift-insert (slot 1 <- slot 0
+                // <- pos), same protocol as `process_position_l1`.
+                debug_assert!((h << 1) + 1 < head.len());
+                // SAFETY: `2h + 1 < 2 * HASH_SIZE == head.len()`.
+                unsafe {
+                    let c = *head.get_unchecked(h << 1);
+                    *head.get_unchecked_mut((h << 1) + 1) = c;
+                    *head.get_unchecked_mut(h << 1) = pos as u32;
+                    c
+                }
+            } else {
+                debug_assert!(h < head.len());
+                // SAFETY: `h < HASH_SIZE == head.len()` per the lz_hash bound.
+                unsafe {
+                    let c = *head.get_unchecked(h);
+                    *head.get_unchecked_mut(h) = pos as u32;
+                    c
+                }
+            };
             #[cfg(feature = "anatomy-counters")]
             {
                 local.head_table_reads += 1;
@@ -2824,11 +2922,20 @@ fn parse_tail(
                         // SAFETY: nh < match_end = pos+length <= in_end, and
                         // buf's pad covers the 4-byte load past in_end.
                         let s = unsafe { load_u32(base, nh) };
-                        // SAFETY: `lz_hash(_, HASH_BITS)` output is
-                        // `< HASH_SIZE == head.len()`, as above.
-                        unsafe {
-                            *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32
-                        };
+                        let hh = lz_hash(s, HASH_BITS) as usize;
+                        if !ACCEL {
+                            // Interior SHIFT-insert (see `process_position_l1`).
+                            // SAFETY: `2*hh + 1 < 2*HASH_SIZE == head.len()`,
+                            // as above.
+                            unsafe {
+                                *head.get_unchecked_mut((hh << 1) + 1) =
+                                    *head.get_unchecked(hh << 1);
+                                *head.get_unchecked_mut(hh << 1) = nh as u32;
+                            }
+                        } else {
+                            // SAFETY: `hh < HASH_SIZE == head.len()`, as above.
+                            unsafe { *head.get_unchecked_mut(hh) = nh as u32 };
+                        }
                         #[cfg(feature = "anatomy-counters")]
                         {
                             local.hash_computations += 1;
@@ -2913,11 +3020,15 @@ pub(super) fn run<const ACCEL: bool>(
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
 
-    // Chainless head table: one slot per hash, holding the most recent
-    // position. Pulled from a thread-local pool (see `acquire_head_table`'s
-    // doc comment) instead of freshly allocated every `run()` call — same
-    // per-chunk-vs-per-thread rationale as `HcMatchfinder::acquire`.
-    let mut head = acquire_head_table(&HEAD_POOL, HASH_SIZE);
+    // Chainless head table, pulled from a thread-local pool (see
+    // `acquire_head_table`'s doc comment) instead of freshly allocated every
+    // `run()` call — same per-chunk-vs-per-thread rationale as
+    // `HcMatchfinder::acquire`. L1 (`!ACCEL`) uses INTERLEAVED 2-slot
+    // buckets (see [`L1_HEAD_ENTRIES`]'s doc comment); L0 keeps the
+    // single-slot [`HASH_SIZE`] layout. The pool hands back whichever
+    // capacity was last released — `acquire_head_table` re-sizes to the
+    // requested length either way.
+    let mut head = acquire_head_table(&HEAD_POOL, if ACCEL { HASH_SIZE } else { L1_HEAD_ENTRIES });
     let base = buf.as_ptr();
 
     #[cfg(feature = "l1-tune")]
@@ -2939,11 +3050,6 @@ pub(super) fn run<const ACCEL: bool>(
         {
             bucket2_cfg
         }
-    };
-    let mut head2: Vec<u32> = if !ACCEL && bucket2.enabled {
-        vec![NO_POS; HASH_SIZE]
-    } else {
-        Vec::new()
     };
     // HASH3-GATE composition lever config: shipped consts in a default
     // build (this IS `Strategy::Fast`'s default behavior as of the
@@ -2972,9 +3078,9 @@ pub(super) fn run<const ACCEL: bool>(
         l1_tune.lazy_peek_gate_initial_active,
     );
     // HASH3-PROBE lever's table. Sized dynamically off `hash3.bits` (the
-    // size-sweep axis) rather than a fixed const like `head`/`head2` — only
-    // allocated (and only non-empty) when both `!ACCEL` (L1-only, mirrors
-    // `head2`) AND the lever is actually on, so L0 (`ACCEL == true`) and any
+    // size-sweep axis) rather than a fixed const like `head` — only
+    // allocated (and only non-empty) when both `!ACCEL` (L1-only) AND the
+    // lever is actually on, so L0 (`ACCEL == true`) and any
     // dev-search config with the lever explicitly OFF pay zero extra
     // allocation. No longer `l1-tune`-only: this table backs the DEFAULT L1
     // path now.
@@ -3002,7 +3108,14 @@ pub(super) fn run<const ACCEL: bool>(
         // SAFETY: p < data_start <= in_end, and buf has BUF_PAD >= 16 bytes past
         // in_end, so [p, p+4) is in bounds.
         let seq = unsafe { load_u32(base, p) };
-        head[lz_hash(seq, HASH_BITS) as usize] = p as u32;
+        let h = lz_hash(seq, HASH_BITS) as usize;
+        if ACCEL {
+            head[h] = p as u32;
+        } else {
+            // Interleaved shift-insert, same protocol as the hot loops.
+            head[(h << 1) + 1] = head[h << 1];
+            head[h << 1] = p as u32;
+        }
         #[cfg(feature = "anatomy-counters")]
         {
             local.hash_computations += 1;
@@ -3232,7 +3345,6 @@ pub(super) fn run<const ACCEL: bool>(
                         limit_hash_update_inserts,
                         #[cfg(feature = "anatomy-counters")]
                         &mut local,
-                        &mut head2,
                         &mut head3,
                         bucket2,
                         #[cfg(feature = "l1-tune")]
@@ -3270,7 +3382,6 @@ pub(super) fn run<const ACCEL: bool>(
                         limit_hash_update_inserts,
                         #[cfg(feature = "anatomy-counters")]
                         &mut local,
-                        &mut head2,
                         &mut head3,
                         bucket2,
                         hash3,
@@ -3297,7 +3408,7 @@ pub(super) fn run<const ACCEL: bool>(
 
             // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
             // block), where `max_len` must be clamped per position.
-            pos = parse_tail(
+            pos = parse_tail::<ACCEL>(
                 pos,
                 block_end_target,
                 in_end,
@@ -3453,8 +3564,6 @@ pub(super) fn run<const ACCEL: bool>(
 #[cfg_attr(feature = "l1-tune", allow(dead_code))]
 pub(in crate::compress::deflate) struct FastResume {
     head: Vec<u32>,
-    /// Empty when the 2-way bucket lever is disabled — mirrors [`run`]'s `head2`.
-    head2: Vec<u32>,
     /// Empty (never allocated) when the hash3 lever is disabled — mirrors
     /// [`run`]'s conditional acquisition.
     head3: Vec<u32>,
@@ -3475,8 +3584,9 @@ impl FastResume {
     #[cfg(not(feature = "l1-tune"))]
     fn new(hash3: Hash3Cfg) -> Self {
         FastResume {
-            head: acquire_head_table(&HEAD_POOL, HASH_SIZE),
-            head2: Vec::new(),
+            // L1-only path: the interleaved 2-slot bucket table (see
+            // [`L1_HEAD_ENTRIES`]'s doc comment).
+            head: acquire_head_table(&HEAD_POOL, L1_HEAD_ENTRIES),
             head3: if hash3.enabled {
                 acquire_head_table(&HEAD3_POOL, 1usize << hash3.bits)
             } else {
@@ -3510,12 +3620,7 @@ impl FastResume {
         // it (asserted inside).
         self.stored_pending.rebase(shift);
         let s = shift as u32;
-        for e in self
-            .head
-            .iter_mut()
-            .chain(self.head2.iter_mut())
-            .chain(self.head3.iter_mut())
-        {
+        for e in self.head.iter_mut().chain(self.head3.iter_mut()) {
             *e = if *e != NO_POS && *e >= s {
                 *e - s
             } else {
@@ -3596,9 +3701,6 @@ pub(super) fn run_resumable(
     // the gates' initial-active values — exactly the whole-buffer `run`'s
     // starting state); every later call resumes it.
     let fr = state.fast.get_or_insert_with(|| FastResume::new(hash3));
-    if bucket2.enabled && fr.head2.is_empty() {
-        fr.head2 = vec![NO_POS; HASH_SIZE];
-    }
     if cost_gate_cfg.enabled && !fr.cost_gate_seeded {
         fr.cost_gate_active_next = true;
         fr.cost_gate_seeded = true;
@@ -3654,7 +3756,6 @@ pub(super) fn run_resumable(
                     limit_hash_update_inserts,
                     #[cfg(feature = "anatomy-counters")]
                     &mut local,
-                    &mut fr.head2,
                     &mut fr.head3,
                     bucket2,
                     hash3,
@@ -3677,7 +3778,7 @@ pub(super) fn run_resumable(
                     cost_gate_cfg,
                 )
             };
-            pos = parse_tail(
+            pos = parse_tail::<false>(
                 pos,
                 block_end_target,
                 in_end,
