@@ -11,7 +11,7 @@ use super::super::encode_types::HeaderBudget;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
-use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
+use super::super::tables::DEFLATE_MAX_MATCH_LEN;
 use super::{
     adjust_max_and_nice_len, bsr32, calculate_min_match_len, choose_max_block_end, continue_block,
     emit_block, recalculate_min_match_len, BlockRole, InputMode, ParseState, Sink, StaticCodes,
@@ -210,7 +210,7 @@ pub(super) fn run_block(
             next_hashes,
         );
 
-        if cur_len < min_len || (cur_len == DEFLATE_MIN_MATCH_LEN && cur_offset > 8192) {
+        if cur_len < min_len {
             // No (usable) match — emit a literal.
             sink.push_literal(buf[in_next]);
             in_next += 1;

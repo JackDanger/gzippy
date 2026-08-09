@@ -10,7 +10,7 @@ use super::super::encode_types::HeaderBudget;
 use super::super::huffman::{CodeScratch, HeaderScratch};
 use super::super::level::LevelParams;
 use super::super::matchfinder::hc::HcMatchfinder;
-use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
+use super::super::tables::DEFLATE_MAX_MATCH_LEN;
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
     emit_block, BlockRole, InputMode, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
@@ -195,7 +195,7 @@ pub(super) fn run_block(
             next_hashes,
         );
 
-        if length >= min_len && (length > DEFLATE_MIN_MATCH_LEN || offset <= 4096) {
+        if length >= min_len {
             sink.push_match(length, offset);
             mf.skip_bytes(
                 buf,
