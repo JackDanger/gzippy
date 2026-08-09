@@ -71,7 +71,7 @@ level	threads	counter	value
 1	1	match_length_bytes_total	0
 1	1	matches_emitted	0
 1	1	matches_emitted_fast	0
-1	4	alloc_bytes	393492
+1	4	alloc_bytes	655636
 1	4	alloc_events	4
 1	4	bitstream_flush_word_calls	2
 1	4	block_split_observations	0
