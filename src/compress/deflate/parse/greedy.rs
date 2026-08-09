@@ -13,8 +13,8 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, far_len3_allowed, far_len3_slot_mask, BlockRole, InputMode, ParseState, Sink,
-    StaticCodes, STREAM_BLOCK_LOOKAHEAD,
+    emit_block, BlockRole, FarLen3Gate, InputMode, ParseState, Sink, StaticCodes,
+    STREAM_BLOCK_LOOKAHEAD,
 };
 
 pub(super) fn run(
@@ -183,14 +183,15 @@ pub(super) fn run_block(
     let min_len = calculate_min_match_len(&buf[in_next..in_end], params.max_search_depth);
     // Far-len-3 cost gate: recomputed from the block's running frequencies at
     // the same cadence the lazy parser refreshes `min_len` (10 KB, then
-    // doubling). Starts 0 (= the shipped fixed guard) — the mask only opens
-    // once this block's own statistics prove a far len-3 beats 3 literals.
-    let mut far_len3_mask = 0u32;
+    // doubling). Starts inert (= the shipped fixed guard) — it only opens
+    // once this block's own statistics prove a far len-3 beats the three
+    // literals it replaces.
+    let mut far_len3 = FarLen3Gate::INERT;
     let mut next_recalc = in_next + (in_end - in_next).min(10000);
 
     loop {
         if in_next >= next_recalc {
-            far_len3_mask = far_len3_slot_mask(&sink.litlen_freqs, &sink.offset_freqs);
+            far_len3 = FarLen3Gate::recalc(&sink.litlen_freqs, &sink.offset_freqs);
             next_recalc += (in_end - next_recalc).min(in_next - block_begin);
         }
 
@@ -210,7 +211,7 @@ pub(super) fn run_block(
         if length >= min_len
             && (length > DEFLATE_MIN_MATCH_LEN
                 || offset <= 4096
-                || far_len3_allowed(far_len3_mask, offset))
+                || far_len3.allows(offset, buf[in_next], buf[in_next + 1], buf[in_next + 2]))
         {
             sink.push_match(length, offset);
             mf.skip_bytes(
